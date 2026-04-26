@@ -37,7 +37,18 @@ const (
 	// busy-poll, while bounding stale-poll latency to a value clients
 	// already tolerate from network round-trips.
 	redisStreamWaitFallback = 100 * time.Millisecond
-	redisKeywordCount       = "COUNT"
+	// redisKeyWaitFallback is the safety-net poll interval that fires
+	// in blocking command wait loops (BZPOPMIN today; BLPOP / BRPOP /
+	// BLMOVE in follow-ups) when no in-process write signal arrives.
+	// The signal path covers all in-process ZADD / ZINCRBY on the
+	// same node; the fallback covers paths that bypass Signal (Lua
+	// flush, follower-applied entries — both addressed by the FSM
+	// ApplyObserver follow-up tracked in
+	// docs/design/2026_04_26_proposed_fsm_apply_observer.md).
+	// Same shape and value as redisStreamWaitFallback; kept distinct
+	// so the two blocking-command families can tune independently.
+	redisKeyWaitFallback = 100 * time.Millisecond
+	redisKeywordCount    = "COUNT"
 
 	// setWideColOverhead is the number of extra elements reserved in a set
 	// wide-column mutation slice beyond the per-member elements: one for the
@@ -3328,13 +3339,34 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		})
 	}
 
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key)
+}
+
+// dispatchAndSignalZSet dispatches the elems through the coordinator
+// and, on success, wakes any BZPOPMIN waiter on the same node.
+// coordinator.Dispatch blocks until the FSM applies locally, so by
+// the time Signal fires the new members are visible at the readTS
+// the woken waiter will pick on its next iteration. Pulled out of
+// zaddTxn / zincrbyTxn so the parents stay under the cyclop budget
+// — the signal step would otherwise add an extra branch on the
+// dispatch error path.
+func (r *RedisServer) dispatchAndSignalZSet(
+	ctx context.Context,
+	readTS, commitTS uint64,
+	elems []*kv.Elem[kv.OP],
+	zsetKey []byte,
+) error {
+	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
 		Elems:    elems,
 	})
-	return added, cockerrors.WithStack(dispatchErr)
+	if err != nil {
+		return cockerrors.WithStack(err)
+	}
+	r.zsetWaiters.Signal(zsetKey)
+	return nil
 }
 
 // zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
@@ -3386,13 +3418,10 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 			Value: deltaVal,
 		})
 	}
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  normalizeStartTS(readTS),
-		CommitTS: commitTS,
-		Elems:    elems,
-	})
-	return newScore, cockerrors.WithStack(dispatchErr)
+	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key); err != nil {
+		return 0, err
+	}
+	return newScore, nil
 }
 
 func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
@@ -3727,29 +3756,85 @@ func (r *RedisServer) bzpopmin(conn redcon.Conn, cmd redcon.Command) {
 	}
 	deadline := time.Now().Add(time.Duration(timeoutSeconds * float64(time.Second)))
 
-	for {
-		for _, key := range cmd.Args[1 : len(cmd.Args)-1] {
-			result, err := r.tryBZPopMin(key)
-			if err != nil {
-				conn.WriteError(err.Error())
-				return
-			}
-			if result == nil {
-				continue
-			}
+	keys := cmd.Args[1 : len(cmd.Args)-1]
+	r.bzpopminWaitLoop(conn, keys, deadline)
+}
 
-			conn.WriteArray(redisTripletWidth)
-			conn.WriteBulk(result.key)
-			conn.WriteBulkString(result.entry.Member)
-			conn.WriteBulkString(formatRedisFloat(result.entry.Score))
+// bzpopminWaitLoop runs the BLOCK-window wait loop. Extracted from
+// bzpopmin so the parent function stays under the cyclop budget.
+// Uses an event-driven signal from the in-process ZADD / ZINCRBY
+// path with a fallback timer for paths that bypass the signal.
+//
+// Registration happens BEFORE the first tryBZPopMin so a signal that
+// fires between the check and the wait cannot be lost: the buffered
+// channel holds it, and the next select wakes immediately.
+func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline time.Time) {
+	handlerCtx := r.handlerContext()
+	w, release := r.zsetWaiters.Register(keys)
+	defer release()
+	for {
+		if handlerCtx.Err() != nil {
+			conn.WriteNull()
 			return
 		}
-
+		if r.bzpopminTryAllKeys(conn, keys) {
+			return
+		}
 		if !time.Now().Before(deadline) {
 			conn.WriteNull()
 			return
 		}
-		time.Sleep(redisBusyPollBackoff)
+		waitForKeyUpdate(handlerCtx, w.C, deadline)
+	}
+}
+
+// bzpopminTryAllKeys runs one tryBZPopMin pass across keys. Returns
+// true when a result was written (success or terminal error) and the
+// caller should stop the loop, false to continue waiting.
+func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte) bool {
+	for _, key := range keys {
+		result, err := r.tryBZPopMin(key)
+		if err != nil {
+			conn.WriteError(err.Error())
+			return true
+		}
+		if result == nil {
+			continue
+		}
+		conn.WriteArray(redisTripletWidth)
+		conn.WriteBulk(result.key)
+		conn.WriteBulkString(result.entry.Member)
+		conn.WriteBulkString(formatRedisFloat(result.entry.Score))
+		return true
+	}
+	return false
+}
+
+// waitForKeyUpdate blocks until one of: a write signal arrives, the
+// fallback poll tick fires, the parent handlerCtx is cancelled, or
+// the BLOCK deadline elapses — whichever happens first. The fallback
+// bounds latency for write paths that do not signal (Lua flush,
+// follower-applied entries); it cannot exceed the remaining BLOCK
+// window so the deadline branch in the caller's loop top always
+// gets a chance to fire when the BLOCK expires.
+func waitForKeyUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) {
+	fallback := redisKeyWaitFallback
+	if remaining := time.Until(deadline); remaining < fallback {
+		fallback = remaining
+	}
+	timer := time.NewTimer(fallback)
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+	select {
+	case <-waiterC:
+	case <-timer.C:
+	case <-handlerCtx.Done():
 	}
 }
 
