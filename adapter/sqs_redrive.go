@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -125,11 +126,28 @@ func (s *SQSServer) redriveCandidateToDLQ(
 	if err != nil {
 		return false, err
 	}
-	dlqRec, dlqRecordBytes, err := buildDLQRecord(srcRec, dlqMeta, srcArn)
+	// FIFO DLQs require the redrive write to participate in the
+	// per-queue SequenceNumber sequence, otherwise the DLQ record
+	// is committed with SequenceNumber=0 (AWS surfaces this
+	// verbatim, and 0 violates AWS's invariant that sequences
+	// start at 1) and the next normal FIFO send to the DLQ assigns
+	// a number lower than the redriven message — non-monotonic to
+	// consumers. Load the seq snapshot at readTS, increment, and
+	// pass it into both buildDLQRecord (encoded onto the record)
+	// and buildRedriveOps (Put + ReadKeys fence).
+	var dlqSeq uint64
+	if dlqMeta.IsFIFO {
+		prevSeq, err := s.loadFifoSequence(ctx, policy.DLQName, readTS)
+		if err != nil {
+			return false, err
+		}
+		dlqSeq = prevSeq + 1
+	}
+	dlqRec, dlqRecordBytes, err := buildDLQRecord(srcRec, dlqMeta, srcArn, dlqSeq)
 	if err != nil {
 		return false, err
 	}
-	req, err := s.buildRedriveOps(ctx, srcQueueName, srcGen, cand, srcDataKey, srcRec, policy, dlqMeta, dlqRec, dlqRecordBytes, readTS)
+	req, err := s.buildRedriveOps(ctx, srcQueueName, srcGen, cand, srcDataKey, srcRec, policy, dlqMeta, dlqRec, dlqRecordBytes, dlqSeq, readTS)
 	if err != nil {
 		return false, err
 	}
@@ -200,7 +218,16 @@ func (s *SQSServer) validateRedriveTargets(
 // buildDLQRecord assembles the DLQ-side message record. Reset
 // ReceiveCount and FirstReceiveMillis so the DLQ consumer sees a
 // fresh delivery, not the source's bounce history.
-func buildDLQRecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta, srcArn string) (*sqsMessageRecord, []byte, error) {
+//
+// dlqSeq is the SequenceNumber to assign on the DLQ record, computed
+// by the caller as `loadFifoSequence(dlq) + 1` for FIFO DLQs and
+// passed as 0 for Standard DLQs (the field is unused in that case).
+// The seq must be the same value the caller will Put into the DLQ's
+// sqsQueueSeqKey inside the same OCC transaction (see buildRedriveOps);
+// otherwise the redriven message and the on-disk counter disagree
+// and a later FIFO send to the DLQ produces a non-monotonic
+// SequenceNumber.
+func buildDLQRecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta, srcArn string, dlqSeq uint64) (*sqsMessageRecord, []byte, error) {
 	dlqMsgID, err := newMessageIDHex()
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
@@ -227,6 +254,7 @@ func buildDLQRecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta, srcArn stri
 		MessageGroupId:         srcRec.MessageGroupId,
 		MessageDeduplicationId: srcRec.MessageDeduplicationId,
 		DeadLetterSourceArn:    srcArn,
+		SequenceNumber:         dlqSeq,
 	}
 	body, err := encodeSQSMessageRecord(rec)
 	if err != nil {
@@ -239,6 +267,14 @@ func buildDLQRecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta, srcArn stri
 // atomically removes the source's keyspace and writes the DLQ
 // version. The FIFO group-lock release branch lives here so the
 // caller stays under the cyclomatic budget.
+//
+// dlqSeq is non-zero only when the DLQ is FIFO (per the caller's
+// pre-load via loadFifoSequence). When non-zero, the txn additionally
+// reads sqsQueueSeqKey(policy.DLQName) — guarding against a
+// concurrent FIFO send / redrive racing for the same sequence — and
+// writes the new value back. dlqRec.SequenceNumber is already set to
+// dlqSeq inside buildDLQRecord; this function is responsible only for
+// the OCC plumbing.
 func (s *SQSServer) buildRedriveOps(
 	ctx context.Context,
 	srcQueueName string,
@@ -250,6 +286,7 @@ func (s *SQSServer) buildRedriveOps(
 	dlqMeta *sqsQueueMeta,
 	dlqRec *sqsMessageRecord,
 	dlqRecordBytes []byte,
+	dlqSeq uint64,
 	readTS uint64,
 ) (*kv.OperationGroup[kv.OP], error) {
 	now := dlqRec.SendTimestampMillis
@@ -269,6 +306,15 @@ func (s *SQSServer) buildRedriveOps(
 		{Op: kv.Put, Key: dlqDataKey, Value: dlqRecordBytes},
 		{Op: kv.Put, Key: dlqVisKey, Value: []byte(dlqRec.MessageID)},
 		{Op: kv.Put, Key: dlqByAgeKey, Value: []byte(dlqRec.MessageID)},
+	}
+	if dlqMeta.IsFIFO {
+		seqKey := sqsQueueSeqKey(policy.DLQName)
+		readKeys = append(readKeys, seqKey)
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   seqKey,
+			Value: []byte(strconv.FormatUint(dlqSeq, 10)),
+		})
 	}
 	if srcRec.MessageGroupId != "" {
 		lockKey := sqsMsgGroupKey(srcQueueName, srcGen, srcRec.MessageGroupId)

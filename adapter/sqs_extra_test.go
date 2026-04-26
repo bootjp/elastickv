@@ -1746,3 +1746,164 @@ func TestSQSServer_TagQueueRequiresTags(t *testing.T) {
 		t.Fatalf("untag without TagKeys: %d %v", status, out)
 	}
 }
+
+// TestSQSServer_FifoFifoRedriveAssignsSequenceNumber pins the round-N
+// Codex P1 fix on `cdb3c87` redrive: a FIFO source whose RedrivePolicy
+// targets a FIFO DLQ used to commit the DLQ record with
+// SequenceNumber = 0 (zero-value, not even AWS's "starts at 1"
+// invariant), and the DLQ's per-queue sequence counter
+// (sqsQueueSeqKey) was never advanced. Consumers reading the DLQ saw
+// 0 verbatim, and a normal FIFO send to the DLQ later produced a
+// number lower than the redriven message — non-monotonic per AWS's
+// FIFO contract. The fix loads the DLQ seq at readTS, increments it,
+// stamps it onto the DLQ record, and includes the seq Put in the OCC
+// transaction. This test asserts both halves: (a) the redriven DLQ
+// record carries SequenceNumber = 1, (b) a subsequent FIFO send to
+// the DLQ carries SequenceNumber = 2.
+func TestSQSServer_FifoFifoRedriveAssignsSequenceNumber(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	// FIFO DLQ.
+	_, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "dlq-fifo.fifo",
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	dlqURL, _ := out["QueueUrl"].(string)
+	if dlqURL == "" {
+		t.Fatalf("FIFO DLQ create failed: %v", out)
+	}
+
+	// FIFO source pointing at the FIFO DLQ. Both queues are FIFO so
+	// the type-equality guard added in cdb3c87 lets the redrive
+	// proceed; this test exercises the SequenceNumber assignment that
+	// became reachable only with that change.
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-fifo.fifo","maxReceiveCount":1}`
+	_, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "src-fifo.fifo",
+		"Attributes": map[string]string{
+			"FifoQueue":     "true",
+			"RedrivePolicy": policy,
+		},
+	})
+	srcURL, _ := out["QueueUrl"].(string)
+
+	// Send a poison message to the FIFO source.
+	_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl":               srcURL,
+		"MessageBody":            "poison",
+		"MessageGroupId":         "g1",
+		"MessageDeduplicationId": "d-poison",
+	})
+
+	// First receive bumps ReceiveCount to 1 == maxReceiveCount;
+	// second receive (after visibility expiry) triggers the redrive.
+	_, _ = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            srcURL,
+		"MaxNumberOfMessages": 1,
+		"VisibilityTimeout":   1,
+	})
+	time.Sleep(1100 * time.Millisecond)
+	_, _ = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            srcURL,
+		"MaxNumberOfMessages": 1,
+	})
+
+	// DLQ now has the moved message. SequenceNumber must be > 0;
+	// pre-fix it was 0 (zero-value, never set).
+	_, out = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
+		"QueueUrl":            dlqURL,
+		"MaxNumberOfMessages": 1,
+		"VisibilityTimeout":   60,
+	})
+	msgs, _ := out["Messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("DLQ expected 1 redriven message, got %d (%v)", len(msgs), out)
+	}
+	moved, _ := msgs[0].(map[string]any)
+	movedAttrs, _ := moved["Attributes"].(map[string]any)
+	movedSeqStr, _ := movedAttrs["SequenceNumber"].(string)
+	movedSeq, _ := strconv.ParseUint(movedSeqStr, 10, 64)
+	if movedSeq == 0 {
+		t.Fatalf("redriven DLQ message has SequenceNumber=0 (regression: counter not advanced); attrs=%v", movedAttrs)
+	}
+
+	// Second half: a normal FIFO send to the DLQ must observe the
+	// advanced counter and assign movedSeq + 1, not start over from
+	// 1 (which would put two messages with the same sequence on the
+	// queue, the exact bug the fix is preventing).
+	follow := sendFifoMessage(t, node, dlqURL, "g-dlq", "d-follow", "follow")
+	if follow != movedSeq+1 {
+		t.Fatalf("DLQ FIFO send after redrive: SequenceNumber=%d, want %d (= %d + 1)", follow, movedSeq+1, movedSeq)
+	}
+}
+
+// TestSQSServer_SendMessageRejectsBinaryWithStringValue pins the
+// round-N Codex P2 fix: AWS requires a MessageAttributeValue to
+// populate exactly one of {StringValue, BinaryValue}. The previous
+// validator only checked that BinaryValue was non-empty for Binary
+// types; an attribute carrying both fields would be persisted into
+// the record (and round-tripped on ReceiveMessage), which is not
+// AWS behavior and would surface mismatched MD5 hashes downstream.
+// The symmetric String/Number + non-empty BinaryValue case is also
+// asserted.
+func TestSQSServer_SendMessageRejectsBinaryWithStringValue(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	queueURL := createSQSQueueForTest(t, node, "binary-string-mix")
+
+	cases := []struct {
+		name  string
+		attrs map[string]any
+	}{
+		{
+			name: "Binary with non-empty StringValue",
+			attrs: map[string]any{
+				"X": map[string]any{
+					"DataType":    "Binary",
+					"BinaryValue": []byte{0x01, 0x02, 0x03},
+					"StringValue": "stowaway",
+				},
+			},
+		},
+		{
+			name: "String with non-empty BinaryValue",
+			attrs: map[string]any{
+				"X": map[string]any{
+					"DataType":    "String",
+					"StringValue": "ok",
+					"BinaryValue": []byte{0x01},
+				},
+			},
+		},
+		{
+			name: "Number with non-empty BinaryValue",
+			attrs: map[string]any{
+				"X": map[string]any{
+					"DataType":    "Number",
+					"StringValue": "1",
+					"BinaryValue": []byte{0x01},
+				},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, out := callSQS(t, node, sqsSendMessageTarget, map[string]any{
+				"QueueUrl":          queueURL,
+				"MessageBody":       "body",
+				"MessageAttributes": tc.attrs,
+			})
+			if status != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d (%v)", status, out)
+			}
+			if got, _ := out["__type"].(string); got != sqsErrInvalidAttributeValue {
+				t.Fatalf("error type: %q want %q (%v)", got, sqsErrInvalidAttributeValue, out)
+			}
+		})
+	}
+}

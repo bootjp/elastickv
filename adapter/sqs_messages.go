@@ -1514,16 +1514,36 @@ func validateOneMessageAttribute(name string, v sqsMessageAttributeValue) error 
 	if i := strings.Index(v.DataType, "."); i >= 0 {
 		base = v.DataType[:i]
 	}
+	return validateMessageAttributeValuePair(name, base, v)
+}
+
+// validateMessageAttributeValuePair enforces "exactly one value field
+// populated, matching the DataType" on a MessageAttributeValue. AWS
+// rejects an attribute that carries both StringValue and BinaryValue
+// (or that carries the wrong one for its DataType); without these
+// guards a malformed client could persist bytes into the record that
+// then round-trip on ReceiveMessage, producing mismatched MD5 hashes
+// downstream. Pulled out of validateOneMessageAttribute so that
+// function stays under the cyclop budget.
+func validateMessageAttributeValuePair(name, base string, v sqsMessageAttributeValue) error {
 	switch base {
 	case "String", "Number":
 		if v.StringValue == "" {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 				"MessageAttribute "+name+" requires StringValue")
 		}
+		if len(v.BinaryValue) > 0 {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"MessageAttribute "+name+" must not include BinaryValue for "+base+" type")
+		}
 	case sqsAttributeBaseTypeBinary:
 		if len(v.BinaryValue) == 0 {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 				"MessageAttribute "+name+" requires BinaryValue")
+		}
+		if v.StringValue != "" {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"MessageAttribute "+name+" must not include StringValue for Binary type")
 		}
 	default:
 		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
