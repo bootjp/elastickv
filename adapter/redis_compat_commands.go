@@ -3651,12 +3651,35 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) tryBZPopMin(key []byte) (*bzpopminResult, error) {
+	return r.tryBZPopMinWithMode(key, false)
+}
+
+// tryBZPopMinFast is the signal-driven-wake variant of tryBZPopMin.
+// It uses keyTypeAtExpectFast (no slow-path fallback, no wrongType
+// detection) on the assumption that the only mutation since the
+// caller's previous full check is a ZADD/ZINCRBY — the only writes
+// that fire zsetWaiters.Signal. A wrongType write that arrived since
+// the last full check would not have signalled, so this fast path
+// would treat the key as "still empty" and return nil; the
+// fallback-timer wake in bzpopminWaitLoop, which uses the full
+// tryBZPopMin path, detects such cases within ~redisBlockWaitFallback.
+func (r *RedisServer) tryBZPopMinFast(key []byte) (*bzpopminResult, error) {
+	return r.tryBZPopMinWithMode(key, true)
+}
+
+func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+		var typ redisValueType
+		var err error
+		if fast {
+			typ, err = r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
+		} else {
+			typ, err = r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+		}
 		if err != nil {
 			return err
 		}
@@ -3763,28 +3786,47 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 	handlerCtx := r.handlerContext()
 	w, release := r.zsetWaiters.Register(keys)
 	defer release()
+	// fast tracks whether the previous wake came from a Signal (true)
+	// or the fallback timer / shutdown (false). The first iteration
+	// always runs the full tryBZPopMin so an existing wrongType key
+	// surfaces an immediate WRONGTYPE; subsequent iterations after a
+	// signal-driven wake skip the wrongType detection because the
+	// only writes that fire zsetWaiters.Signal are ZADD / ZINCRBY,
+	// neither of which can introduce a wrongType. Fallback-timer
+	// wakes always re-run the full check so a HSET / SET / etc. that
+	// arrived between iterations is detected within ~one
+	// redisBlockWaitFallback (100ms).
+	fast := false
 	for {
 		if handlerCtx.Err() != nil {
 			conn.WriteNull()
 			return
 		}
-		if r.bzpopminTryAllKeys(conn, keys) {
+		if r.bzpopminTryAllKeys(conn, keys, fast) {
 			return
 		}
 		if !time.Now().Before(deadline) {
 			conn.WriteNull()
 			return
 		}
-		waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
+		fast = waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
 	}
 }
 
 // bzpopminTryAllKeys runs one tryBZPopMin pass across keys. Returns
 // true when a result was written (success or terminal error) and the
-// caller should stop the loop, false to continue waiting.
-func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte) bool {
+// caller should stop the loop, false to continue waiting. The fast
+// flag selects tryBZPopMinFast (signal-driven wake, skips wrongType
+// detection) over tryBZPopMin (full check).
+func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast bool) bool {
 	for _, key := range keys {
-		result, err := r.tryBZPopMin(key)
+		var result *bzpopminResult
+		var err error
+		if fast {
+			result, err = r.tryBZPopMinFast(key)
+		} else {
+			result, err = r.tryBZPopMin(key)
+		}
 		if err != nil {
 			conn.WriteError(err.Error())
 			return true
@@ -3812,7 +3854,16 @@ func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte) bool {
 // BRPOP / BLMOVE in follow-ups) — the keyWaiterRegistry that produces
 // waiterC is per-domain (streamWaiters vs zsetWaiters), but the
 // timer-and-select shape is identical.
-func waitForBlockedCommandUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) {
+//
+// Returns true iff the wake came from waiterC (i.e., a producer
+// Signal). False on fallback-timer fire or handlerCtx cancellation.
+// Callers that have a signal-implied invariant (e.g., "only ZADD /
+// ZINCRBY fires zsetWaiters.Signal") can use the return value to
+// pick a faster re-check on the next iteration; fallback wakes
+// always need the full check because writes that bypass Signal
+// (Lua flush, follower-applied entries, wrongType-introducing
+// commands) only become observable through the timer branch.
+func waitForBlockedCommandUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) bool {
 	fallback := redisBlockWaitFallback
 	if remaining := time.Until(deadline); remaining < fallback {
 		fallback = remaining
@@ -3832,8 +3883,11 @@ func waitForBlockedCommandUpdate(handlerCtx context.Context, waiterC <-chan stru
 	}()
 	select {
 	case <-waiterC:
+		return true
 	case <-timer.C:
+		return false
 	case <-handlerCtx.Done():
+		return false
 	}
 }
 
