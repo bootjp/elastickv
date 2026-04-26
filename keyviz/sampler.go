@@ -82,6 +82,15 @@ const (
 	DefaultMaxMemberRoutesPerSlot = 256
 )
 
+// MaxHistoryColumns is the upper bound on opts.HistoryColumns. The
+// ring buffer pre-allocates a slice of capacity HistoryColumns at
+// construction; misconfiguration (e.g. an operator typo of
+// 100_000_000) would otherwise reserve gigabytes up front. 100 000
+// columns at the default 60s Step is ~70 days of history — longer
+// retention is the Phase 3 persistence path's job, not the in-memory
+// ring's.
+const MaxHistoryColumns = 100_000
+
 // MemSamplerOptions configures NewMemSampler. Zero values fall back to
 // the Default* constants above; passing a struct literal with only the
 // fields you care about is the expected call style.
@@ -307,6 +316,9 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	}
 	if opts.HistoryColumns <= 0 {
 		opts.HistoryColumns = DefaultHistoryColumns
+	}
+	if opts.HistoryColumns > MaxHistoryColumns {
+		opts.HistoryColumns = MaxHistoryColumns
 	}
 	if opts.MaxTrackedRoutes <= 0 {
 		opts.MaxTrackedRoutes = DefaultMaxTrackedRoutes
@@ -796,6 +808,17 @@ func (s *MemSampler) Step() time.Duration {
 		return DefaultStep
 	}
 	return s.opts.Step
+}
+
+// HistoryColumns returns the configured ring-buffer length after
+// applying defaults and the MaxHistoryColumns clamp. Wiring tests use
+// this to verify --keyvizHistoryColumns is forwarded end-to-end
+// without exposing the internal opts struct.
+func (s *MemSampler) HistoryColumns() int {
+	if s == nil {
+		return DefaultHistoryColumns
+	}
+	return s.opts.HistoryColumns
 }
 
 // appendDrainedRow swaps the slot's counters to zero and appends a

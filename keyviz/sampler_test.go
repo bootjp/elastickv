@@ -869,6 +869,31 @@ func TestNonPositiveOptionsFallBackToDefaults(t *testing.T) {
 	}
 }
 
+// TestHistoryColumnsClampedAboveMax pins the upper bound on
+// HistoryColumns. The ring buffer pre-allocates a slice of capacity
+// HistoryColumns at construction; an operator typo (e.g.
+// 100_000_000) would otherwise reserve gigabytes up front. Confirm
+// that values above MaxHistoryColumns are silently clamped to
+// MaxHistoryColumns instead of trusted as-is.
+func TestHistoryColumnsClampedAboveMax(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:           time.Second,
+		HistoryColumns: MaxHistoryColumns * 10,
+	})
+	if s.opts.HistoryColumns != MaxHistoryColumns {
+		t.Fatalf("HistoryColumns clamp = %d, want %d", s.opts.HistoryColumns, MaxHistoryColumns)
+	}
+	// At the cap exactly: preserved.
+	s2, _ := newTestSampler(t, MemSamplerOptions{
+		Step:           time.Second,
+		HistoryColumns: MaxHistoryColumns,
+	})
+	if s2.opts.HistoryColumns != MaxHistoryColumns {
+		t.Fatalf("HistoryColumns at cap = %d, want %d", s2.opts.HistoryColumns, MaxHistoryColumns)
+	}
+}
+
 // TestStepAccessor pins the Step() accessor contract: returns the
 // configured Step (after defaulting) for a constructed sampler, and
 // returns DefaultStep for a typed nil so callers wiring RunFlusher

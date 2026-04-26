@@ -980,6 +980,13 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 // pre-commit, so a mutation that subsequently fails its Raft
 // proposal is still recorded — the heatmap reflects offered load,
 // not just committed writes (intentional for traffic visualisation).
+//
+// TODO(keyviz Phase 2): the design (§5.1, §10) calls for read
+// sampling on the node that serves the read (LeaseRead /
+// LinearizableRead / follower reads). Until that wiring lands the
+// matrix's Reads / ReadBytes series stay zero. Tracked as a Phase-2
+// milestone in docs/admin_ui_key_visualizer_design.md — not a
+// regression for the writes-first slice this method covers.
 func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 	if c.sampler == nil {
 		return
