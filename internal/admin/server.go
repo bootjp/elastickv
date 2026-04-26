@@ -168,13 +168,17 @@ func buildDynamoHandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handle
 }
 
 // buildS3HandlerForDeps is the parallel constructor for the S3
-// admin handler. Slice 1 is read-only; the next slice will plumb a
-// MapRoleStore and the LeaderForwarder through the same shape.
+// admin handler. Wires the live RoleStore so write endpoints
+// re-validate the principal on every request — mirrors the Dynamo
+// side. The future LeaderForwarder integration will plumb through
+// the same shape.
 func buildS3HandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
 	if deps.Buckets == nil {
 		return nil
 	}
-	return NewS3Handler(deps.Buckets).WithLogger(logger)
+	return NewS3Handler(deps.Buckets).
+		WithLogger(logger).
+		WithRoleStore(MapRoleStore(deps.Roles))
 }
 
 // Handler returns an http.Handler that serves the full admin surface.
