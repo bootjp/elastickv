@@ -28,10 +28,10 @@ import "sync"
 //
 // The registry is intentionally generic — the same type instance can
 // be reused for any Redis blocking command. RedisServer holds one
-// registry per domain (zsetWaiters today; streamWaiters when the
-// independent perf/redis-event-driven-block PR consolidates) so a
-// signal on a zset key does not iterate over stream waiters and vice
-// versa.
+// registry per command domain (streamWaiters for XREAD BLOCK,
+// zsetWaiters for BZPOPMIN; BLPOP / BRPOP / BLMOVE in follow-ups)
+// so a signal on a zset key does not iterate over stream waiters and
+// vice versa.
 type keyWaiterRegistry struct {
 	mu      sync.Mutex
 	waiters map[string]map[*keyWaiter]struct{}
