@@ -248,13 +248,22 @@ The throttling configuration is **non-AWS** — there is no `ThrottleSendCapacit
    - Sleep 2s, send → 200 (refill happened).
    - Same shape for `ReceiveMessage`.
 
-3. **Configuration round-trip**: `SetQueueAttributes` with throttle config → `GetQueueAttributes` returns the same values for an admin principal; returns 400 `InvalidAttributeName` for a standard principal.
+3. **Immediate bucket invalidation on `SetQueueAttributes`** (`adapter/sqs_throttle_invalidation_test.go`): pins the §3.1 cache-invalidation contract so the `buckets.Delete` call after the Raft commit cannot be silently dropped during a refactor.
+   - Configure a queue with `SendCapacity=10 SendRefillPerSecond=1`.
+   - Send 10 messages back-to-back to exhaust the bucket.
+   - Send 1 more → 400 `Throttling` (sanity check that the bucket really is empty).
+   - Call `SetQueueAttributes` to raise `SendCapacity=20 SendRefillPerSecond=20`.
+   - **Immediately** (no sleep) send 1 more message → 200. Without the invalidation step the request would still be rejected for the next ≈19 seconds (or up to 1 h, until the idle-eviction sweep removes the stale entry).
+   - Same shape for `ReceiveMessage` (raise `RecvCapacity` after exhausting the Recv bucket).
+   - Same shape for `DeleteQueue` lifecycle: send 10 to exhaust → `DeleteQueue` → `CreateQueue` with the same name and `SendCapacity=10` → first `SendMessage` returns 200 (full-capacity fresh bucket), not the stale empty bucket from the previous incarnation.
 
-4. **Cross-protocol parity**: throttled JSON and Query requests both surface `Throttling` (different envelope, same code).
+4. **Configuration round-trip**: `SetQueueAttributes` with throttle config → `GetQueueAttributes` returns the same values for an admin principal; returns 400 `InvalidAttributeName` for a standard principal.
 
-5. **Failover behaviour** (3-node cluster): kill the current leader after 3 messages, confirm the next leader starts the bucket fresh and accepts up to capacity again. Log line records the failover so operators can correlate.
+5. **Cross-protocol parity**: throttled JSON and Query requests both surface `Throttling` (different envelope, same code).
 
-6. **Lint + race**: `go test -race ./adapter/...` must stay clean. The bucket store uses `sync.Mutex` (no atomic-only tricks); the race detector should have nothing to find.
+6. **Failover behaviour** (3-node cluster): kill the current leader after 3 messages, confirm the next leader starts the bucket fresh and accepts up to capacity again. Log line records the failover so operators can correlate.
+
+7. **Lint + race**: `go test -race ./adapter/...` must stay clean. The bucket store uses `sync.Mutex` (no atomic-only tricks); the race detector should have nothing to find.
 
 ---
 

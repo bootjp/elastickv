@@ -227,7 +227,7 @@ Per-call atomicity for the entire queue is **not** preserved — a Purge that fa
 
 ### 4.4 ChangeMessageVisibility / DeleteMessage
 
-These take a `ReceiptHandle` which already encodes the partition index (the receipt-handle codec adds an 8-byte segment for `partitionIndex` after the existing version byte). The handler decodes the partition from the handle and dispatches against the right shard. No fanout — these are single-partition operations.
+These take a `ReceiptHandle` which already encodes the partition index. The receipt-handle codec adds a **4-byte big-endian segment** for `partitionIndex` after the existing version byte — `partitionIndex` is `uint32` everywhere in this design (`partitionFor` returns `uint32`, `PartitionCount` is `uint32`), so 4 bytes is the natural fixed-width encoding (an 8-byte encoding would waste 4 bytes per handle and double this field's contribution to the base64-encoded handle length the SDK exposes to operators). The handler decodes the partition from the handle and dispatches against the right shard. No fanout — these are single-partition operations.
 
 ---
 
@@ -315,9 +315,16 @@ This is out of scope here.
 
 3. **Receipt-handle round-trip**: v1 handle (legacy) on single-partition queue, v2 handle (with partition) on partitioned queue, both decode + ChangeMessageVisibility / DeleteMessage correctly. Cross-version handle rejection (v1 handle against partitioned queue → 400 `ReceiptHandleIsInvalid`).
 
-4. **Jepsen** (`jepsen/sqs/htfifo/`): a new workload that stresses cross-partition delivery — many groups, many consumers, network partition mid-burst — and verifies (a) within-group ordering and (b) no message loss.
+4. **`SetQueueAttributes` immutability enforcement** (`adapter/sqs_partitioned_immutability_test.go`): pins the §3.2 enforcement rule against silent regressions during a validator refactor.
+   - Create a partitioned queue with `PartitionCount = 4`, `FifoThroughputLimit = "perMessageGroupId"`, `DeduplicationScope = "messageGroup"`.
+   - For each of the three attributes, call `SetQueueAttributes` attempting to change just that attribute (e.g. `PartitionCount = 8`); each call must return 400 `InvalidAttributeValue` and the response message must name the attribute that was rejected so the operator sees the cause.
+   - Combined-change variant: a single `SetQueueAttributes` request that touches all three immutable attributes simultaneously rejects with the same error code (no partial application).
+   - Touching a *mutable* attribute alongside (e.g. `VisibilityTimeout` plus an attempted `PartitionCount` change) still rejects — no partial commit of the mutable changes when an immutable one is invalid.
+   - Same-value "no-op": `SetQueueAttributes` with `PartitionCount = 4` (matching the stored meta) succeeds; only differing values are rejected.
 
-5. **Metrics / observability**: new `sqs_partition_messages_total{queue, partition, action}` counter so dashboards can spot hot partitions.
+5. **Jepsen** (`jepsen/sqs/htfifo/`): a new workload that stresses cross-partition delivery — many groups, many consumers, network partition mid-burst — and verifies (a) within-group ordering and (b) no message loss.
+
+6. **Metrics / observability**: new `sqs_partition_messages_total{queue, partition, action}` counter so dashboards can spot hot partitions.
 
 ---
 
