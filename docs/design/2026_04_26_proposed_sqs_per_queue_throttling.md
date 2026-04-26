@@ -172,10 +172,17 @@ On rejection:
 
 | Protocol | Response |
 |---|---|
-| JSON | HTTP 400, body `{"__type":"Throttling","message":"Rate exceeded for queue '<name>' action '<action>'"}`, header `x-amzn-ErrorType: Throttling`, header `Retry-After: 1` |
+| JSON | HTTP 400, body `{"__type":"Throttling","message":"Rate exceeded for queue '<name>' action '<action>'"}`, header `x-amzn-ErrorType: Throttling`, header `Retry-After: <seconds>` (computed per below) |
 | Query | HTTP 400, body `<ErrorResponse><Error><Type>Sender</Type><Code>Throttling</Code><Message>...</Message></Error><RequestId>...</RequestId></ErrorResponse>`, headers as above |
 
-`Retry-After: 1` is the conservative default — at the configured refill rate, one second is enough for at least one fresh token. A future iteration could compute the precise wait from `(1 - currentTokens) / refillRate` but the constant is enough for SDK backoff logic.
+`Retry-After` is computed from the *actual* refill rate so a slow-refill queue does not cause a busy-loop of premature retries (Claude review on PR #664 caught the prior `Retry-After: 1` constant — it lies for queues configured with sub-1-RPS refill, e.g. `SendRefillPerSecond = 0.1` would need 10 s for the next token, so the SDK would burn 9 unnecessary 400s before getting through):
+
+```text
+secondsToNextToken := math.Ceil((1.0 - currentTokens) / refillRate)
+retryAfter := max(1, int(secondsToNextToken))   // never less than 1
+```
+
+The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1 §10.2.3) and means a queue with `refillRate >= 1.0 RPS` always sees `Retry-After: 1`, preserving the existing fast-refill behaviour. A queue with `refillRate = 0.1` correctly sees `Retry-After: 10`. The validator (§3.2) keeps `refillRate > 0` so the divide-by-zero guard is unnecessary in the formula above.
 
 ---
 

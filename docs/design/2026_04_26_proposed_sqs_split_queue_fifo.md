@@ -51,19 +51,25 @@ A partition is identified by the tuple `(queueName, partitionIndex)` where `part
 - **Legacy / `PartitionCount = 0` / Standard queues** keep today's `!sqs|msg|data|<queue>|<gen>|<msgID>` byte-for-byte. No partition segment is written or read. Existing data on disk is unaffected; existing key constructors stay unchanged on this code path.
 - **Partitioned FIFO queues (`PartitionCount > 1`)** use a *new* keyspace prefix that explicitly includes the partition: `!sqs|msg|data|p|<queue>|<partition>|<gen>|<msgID>` (note the extra `p|` discriminator after `data|`). The discriminator is what guarantees no collision with the legacy prefix even when `<partition> = 0` happens to match the first 8 bytes of a legacy `<gen>`.
 
-Concretely, the `sqsMsgDataKey` constructor (and friends) become:
+The `p|` discriminator is **safe by name-validator construction**, not by accident: AWS SQS queue names (and elastickv's `validateQueueName`) admit only `[A-Za-z0-9_-]` plus the optional `.fifo` suffix, so no queue name can contain `|`. The existing `!sqs|msg|data|<queue>|...` segment is therefore terminated by a `|` that no queue name can produce, and the new `!sqs|msg|data|p|<queue>|...` segment starts with a literal byte sequence (`p|`) that cannot appear at the same position in any legacy key (it would require a queue name of `p`, which would still be followed by a `|` from the *segment* terminator, not from the queue name itself — but the prefix routing reads the bytes as `data|p|` vs `data|<segment>|`, and `<segment>` is base32-encoded so it never starts with the literal ASCII `p`). The implementation PR's name validator must continue to reject `|` in queue names; any future relaxation of that rule has to revisit this prefix scheme first.
+
+Concretely, the implementation PR exposes **two named constructors** rather than a variadic dispatcher (Claude review on PR #664 flagged the variadic form as a footgun: `sqsMsgDataKey(q, gen, id, p0, p1)` would silently ignore `p1` and the compiler would not catch it). The dispatch lives at the call site, where `meta.PartitionCount` is already in scope:
 
 ```go
-func sqsMsgDataKey(queueName string, gen uint64, messageID string, partitions ...uint32) []byte {
-    if len(partitions) == 0 {
-        // Legacy single-partition path — byte-identical to today.
-        return legacyDataKey(queueName, gen, messageID)
-    }
-    return partitionedDataKey(queueName, partitions[0], gen, messageID)
+// Two distinct constructors, one per keyspace.
+func legacyMsgDataKey(queueName string, gen uint64, messageID string) []byte
+func partitionedMsgDataKey(queueName string, partition uint32, gen uint64, messageID string) []byte
+
+// Dispatch at the call site. No variadic, no silent argument loss.
+var dataKey []byte
+if meta.PartitionCount > 1 {
+    dataKey = partitionedMsgDataKey(queueName, partition, gen, msgID)
+} else {
+    dataKey = legacyMsgDataKey(queueName, gen, msgID)
 }
 ```
 
-The send / receive path picks the constructor based on `meta.PartitionCount > 1`. The reaper enumerates **both** prefixes when reaping a queue, so a queue that was created legacy and later (in a hypothetical future migration) gains partitions does not strand its old data — out of scope today, but the prefix choice keeps that door open.
+The reaper enumerates **both** prefixes when reaping a queue, so a queue that was created legacy and later (in a hypothetical future migration) gains partitions does not strand its old data — out of scope today, but the prefix choice keeps that door open.
 
 Scans on a partitioned queue use `!sqs|msg|data|p|<queue>|<partition>|` so a worker handling partition `k` never sees keys for partition `k+1`. Scans on a legacy queue use `!sqs|msg|data|<queue>|`, identical to today.
 
@@ -241,7 +247,7 @@ This is out of scope here.
 
 ## 8. Failure Modes and Edge Cases
 
-1. **Consumer never sees a partition's leader**: a consumer that always lands on node A sees only the partitions whose leader is A. If partitions are spread evenly, this is `1/N` of the queue. Mitigation: AWS SDK consumers naturally distribute across endpoints; for elastickv, document that clients should round-robin endpoints when consuming a partitioned FIFO.
+1. **Proxy RTT under spread deployment**: ReceiveMessage on a queue whose partitions are spread across multiple Raft groups pays one extra round-trip per non-local-leader partition (§4.2 proxies them server-side, so a consumer pinned to one endpoint still sees every partition's messages — no false-empty failure). The cost is bounded: a request for `MaxNumberOfMessages = 1` short-circuits as soon as the first non-empty partition responds, so the *typical* extra hop count is one. The pathological case is a queue with N partitions where the consumer is asking "is anything here?" against an empty queue — that costs N proxy round-trips before returning empty. Mitigation: long-poll (`WaitTimeSeconds`) extends each call's budget so the cost amortises; latency-sensitive deployments can co-locate partitions on fewer Raft groups (at the cost of less throughput parallelism). A single-partition or co-located deployment pays nothing.
 
 2. **Partition-leader churn**: a leader change on partition 3 causes that partition's ReceiveMessage to fail-over while partitions 0–2 and 4–7 keep serving. Existing `proxyToLeader` machinery handles the transition.
 
@@ -249,7 +255,9 @@ This is out of scope here.
 
 4. **Receipt-handle from old version**: existing receipt handles encode no partition. When this feature lands, the receipt-handle codec gains a version byte distinguishing v1 (no partition) from v2 (with partition). v1 handles still work for single-partition queues forever; partitioned queues issue v2 only. ChangeMessageVisibility / DeleteMessage check the version before decoding the partition field.
 
-5. **Mixed-version cluster**: a rolling upgrade where some nodes have HT-FIFO and others don't. The new feature gates on the queue's `PartitionCount > 1` field, which is set at create time; old nodes that try to scan a partitioned queue's keyspace will simply not find anything (the prefix has changed). The catalog rejects `CreateQueue` with `PartitionCount > 1` until every node in the cluster reports the new feature flag, mirroring the §3.3.2 admin-forwarding upgrade gate from the admin dashboard design.
+5. **Mixed-version cluster**: a rolling upgrade where some nodes have HT-FIFO and others don't. The new feature gates on the queue's `PartitionCount > 1` field, which is set at create time; old nodes that try to scan a partitioned queue's keyspace will simply not find anything (the prefix has changed). The catalog rejects `CreateQueue` with `PartitionCount > 1` until every node in the cluster reports the new feature flag.
+
+   **The capability advertisement mechanism**: each node's existing `/sqs_health` endpoint (`adapter/sqs.go: serveSQSHealthz`) gains a new field in its JSON body — `capabilities: ["htfifo"]` once this PR's code is in the binary. The catalog's CreateQueue handler reads the live node set from the distribution layer's node registry (the same registry used by `proxyToLeader` to locate leaders), polls `/sqs_health` on each, and gates `PartitionCount > 1` on every node reporting the `htfifo` capability. Nodes that don't respond within a short timeout are treated as not-yet-upgraded — a deliberate fail-closed default so a network blip does not let a partitioned queue land in a partially-upgraded cluster. This mirrors the §3.3.2 admin-forwarding upgrade gate from the admin dashboard design (PR #644), which uses the same "all-nodes-must-report" pattern for `AdminForward`.
 
 ---
 
