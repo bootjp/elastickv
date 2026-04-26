@@ -73,12 +73,17 @@ type adminForwardServerDeps struct {
 
 // readyForRegistration reports whether the bundle has enough
 // collaborators to construct + register a ForwardServer.
-// TablesSource and RoleStore are both required: the registered
-// service would 500 every Dynamo forwarded call without them.
-// BucketsSource is optional — when nil, the leader-side dispatcher
-// rejects S3 operations with 501, but Dynamo forwarding still works.
+// RoleStore is always required (the principal re-evaluation step
+// has no fallback). At least one of TablesSource or BucketsSource
+// must be present — registering with neither would respond 501 to
+// every operation, which is functionally identical to not
+// registering at all. The dispatcher emits 501 for whichever
+// source is nil so an S3-only or Dynamo-only build still serves
+// its half of the admin surface (Codex P1 on PR #673: an S3-only
+// cluster previously skipped registration entirely and surfaced
+// follower forwards as gRPC Unimplemented / 503).
 func (d adminForwardServerDeps) readyForRegistration() bool {
-	return d.tables != nil && d.roles != nil
+	return d.roles != nil && (d.tables != nil || d.buckets != nil)
 }
 
 // registerAdminForwardServer attaches the leader-side gRPC
