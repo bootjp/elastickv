@@ -55,10 +55,13 @@ func newKeyWaiterRegistry() *keyWaiterRegistry {
 // fn is safe to invoke multiple times. Nil-safe: returns a never-
 // fires waiter and a no-op release if the registry is nil (the
 // caller's select still gets a well-typed channel and the fallback
-// timer drives the loop).
+// timer drives the loop). The nil path uses a buffered-1 channel
+// for consistency with the non-nil path so any code that hand-sends
+// into w.C on a nil-registry waiter (test stubs only, in practice)
+// coalesces the same way instead of deadlocking.
 func (reg *keyWaiterRegistry) Register(keys [][]byte) (*keyWaiter, func()) {
 	if reg == nil {
-		return &keyWaiter{C: make(chan struct{})}, func() {}
+		return &keyWaiter{C: make(chan struct{}, 1)}, func() {}
 	}
 	w := &keyWaiter{
 		C:    make(chan struct{}, 1),

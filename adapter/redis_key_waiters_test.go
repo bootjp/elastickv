@@ -143,6 +143,21 @@ func TestKeyWaiterRegistry_NilRegistryIsNoOp(t *testing.T) {
 	if w.C == nil {
 		t.Fatal("nil registry waiter must have a non-nil channel")
 	}
+	// Buffered-1 invariant: a non-blocking direct send must succeed
+	// without deadlocking. (In production, Signal is a no-op for nil
+	// registries; this only matters for test stubs that hand-send
+	// into w.C — but the contract is documented as buffered-1 either
+	// way, and an unbuffered channel would deadlock here.)
+	select {
+	case w.C <- struct{}{}:
+	default:
+		t.Fatal("nil-registry waiter channel must be buffered (size 1)")
+	}
+	select {
+	case <-w.C:
+	default:
+		t.Fatal("nil-registry waiter channel did not deliver the manual send")
+	}
 	reg.Signal([]byte("k"))
 }
 
