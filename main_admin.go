@@ -134,7 +134,13 @@ func startAdminFromFlags(
 // only builds; that's handled higher up by ServerDeps.Tables == nil.
 func buildAdminLeaderForwarder(coordinate kv.Coordinator, connCache *kv.GRPCConnCache, nodeID string) (admin.LeaderForwarder, error) {
 	if coordinate == nil || connCache == nil {
-		return nil, nil //nolint:nilnil // explicit "no forwarder" signal — the handler falls back to 503 + Retry-After:1.
+		// Returning (nil, nil) is the explicit "no forwarder" signal
+		// — the handler falls back to 503 + Retry-After:1 on
+		// ErrTablesNotLeader. The function-level doc comment above
+		// describes this contract; the nilnil linter is not enabled
+		// in .golangci.yaml so no suppression directive is needed
+		// (Claude review on #648).
+		return nil, nil
 	}
 	if nodeID == "" {
 		// admin.NewGRPCForwardClient enforces this too; surfacing

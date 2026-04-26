@@ -654,18 +654,40 @@ func startServers(in serversInput) error {
 	if err != nil {
 		return err
 	}
-	// roleStore is parsed from flags up-front so the leader-side gRPC
-	// AdminForward registration in startRaftServers (which runs from
-	// runner.start() below, before startAdminFromFlags has a chance
-	// to parse the admin config) can re-use the same access-key map
-	// the HTTP path will eventually populate.
-	roleStore := roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
-	// connCache is shared between the follower-side LeaderForwarder
-	// (built inside startAdminFromFlags) and any future bridge that
-	// dials the leader's gRPC ports. Keeping a single instance per
-	// process means the two paths re-use TLS / HTTP/2 connections
-	// rather than each maintaining a parallel pool.
-	connCache := &kv.GRPCConnCache{}
+	// roleStore + connCache are gated on *adminEnabled. With admin
+	// disabled, building either is wasted work AND a security
+	// regression risk: a non-empty -adminFullAccessKeys flag would
+	// otherwise still flip forwardDeps.readyForRegistration() to
+	// true, registering the leader-side gRPC AdminForward service
+	// and re-exposing the table-write surface a follower-direct
+	// admin call could reach (Codex P1, CodeRabbit Major on #648).
+	// The HTTP admin listener already short-circuits in
+	// startAdminFromFlags when *adminEnabled is false; the gRPC path
+	// must do the same.
+	var (
+		roleStore admin.RoleStore
+		connCache *kv.GRPCConnCache
+	)
+	if *adminEnabled {
+		roleStore = roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
+		// connCache is shared between the follower-side LeaderForwarder
+		// (built inside startAdminFromFlags) and any future bridge that
+		// dials the leader's gRPC ports. Keeping a single instance per
+		// process means the two paths re-use TLS / HTTP/2 connections
+		// rather than each maintaining a parallel pool. The shutdown
+		// goroutine drains the cache on context cancellation so the
+		// accumulated HTTP/2 connections are not leaked when the
+		// process exits gracefully (Claude review on #648).
+		connCache = &kv.GRPCConnCache{}
+		cache := connCache
+		in.eg.Go(func() error {
+			<-in.ctx.Done()
+			if err := cache.Close(); err != nil {
+				return errors.Wrap(err, "close admin gRPC connection cache")
+			}
+			return nil
+		})
+	}
 	runner := runtimeServerRunner{
 		ctx:             in.ctx,
 		lc:              in.lc,

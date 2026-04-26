@@ -124,6 +124,59 @@ func TestAdminForwardServerDeps_ReadyForRegistration(t *testing.T) {
 	}.readyForRegistration())
 }
 
+func TestBuildAdminLeaderForwarder_NilGateReturnsNoForwarder(t *testing.T) {
+	// buildAdminLeaderForwarder is the wrapper in main_admin.go that
+	// short-circuits to (nil, nil) when either coordinate or
+	// connCache is nil — the explicit "no forwarder" path for
+	// single-node / leader-only deployments. A future refactor that
+	// drops the guard would silently pass a nil collaborator into
+	// buildLeaderForwarder, which would either crash on the nil
+	// resolver / cache deref or build a forwarder that panics on
+	// the first request. Locking this down keeps the contract intact
+	// (Claude review on #648).
+	cases := []struct {
+		name      string
+		coord     kv.Coordinator
+		cache     *kv.GRPCConnCache
+		nodeID    string
+		wantNil   bool
+		wantError string
+	}{
+		{name: "nil coordinator", cache: &kv.GRPCConnCache{}, nodeID: "n1", wantNil: true},
+		{name: "nil conn cache", coord: &kv.Coordinate{}, nodeID: "n1", wantNil: true},
+		{name: "both nil", nodeID: "n1", wantNil: true},
+		{
+			name:      "complete deps but empty node id",
+			coord:     &kv.Coordinate{},
+			cache:     &kv.GRPCConnCache{},
+			wantError: "--raftId is required",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fwd, err := buildAdminLeaderForwarder(tc.coord, tc.cache, tc.nodeID)
+			if tc.wantError != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantError)
+				require.Nil(t, fwd)
+				return
+			}
+			require.NoError(t, err)
+			if tc.wantNil {
+				require.Nil(t, fwd)
+			} else {
+				require.NotNil(t, fwd)
+			}
+		})
+	}
+}
+
+func TestBuildAdminLeaderForwarder_HappyPathReturnsForwarder(t *testing.T) {
+	fwd, err := buildAdminLeaderForwarder(&kv.Coordinate{}, &kv.GRPCConnCache{}, "n1")
+	require.NoError(t, err)
+	require.NotNil(t, fwd)
+}
+
 // dummyTablesSource is the smallest concrete admin.TablesSource for
 // the readyForRegistration gate test — no method body needs to
 // execute, so every method just panics. Using a real implementation
