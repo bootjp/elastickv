@@ -30,14 +30,14 @@ import (
 // path: an in-process XADD on the leader's redis adapter must wake an
 // XREAD BLOCK waiter on the same node so the reader returns the new
 // entry before its BLOCK deadline. The wake comes through
-// streamWaiterRegistry's signal channel — the prior 10 ms time.Sleep
+// keyWaiterRegistry's signal channel — the prior 10 ms time.Sleep
 // busy-poll loop would have exhibited the same end-to-end behaviour, so
 // this is an end-to-end sanity test rather than a wall-clock latency
 // gate (the latency gate is impractical under -race + parallel CI load,
 // where xreadOnce's Pebble seek alone can exceed any tight budget).
 //
 // Both client connections target the same node so they share the same
-// streamWaiterRegistry — the signal path is intentionally in-process
+// keyWaiterRegistry — the signal path is intentionally in-process
 // only (Lua and follower-side applies fall through to the fallback
 // timer; see xreadBusyPoll).
 func TestRedis_StreamXReadBlockWakesOnXAdd(t *testing.T) {
@@ -75,14 +75,14 @@ func TestRedis_StreamXReadBlockWakesOnXAdd(t *testing.T) {
 	}()
 
 	// Give the reader a moment to enter xreadBusyPoll and register a
-	// waiter on streamWaiterRegistry before XADD. If XADD landed first
+	// waiter on keyWaiterRegistry before XADD. If XADD landed first
 	// the entry would already be visible by the time the reader runs
 	// xreadOnce, so the registration race is benign — but waiting also
 	// gates out a different source of flake where the goroutine has not
 	// yet dialed redis.
 	//
 	// TODO: replace the time.Sleep with explicit synchronization (e.g.
-	// poll streamWaiterRegistry until the test's stream key shows up,
+	// poll keyWaiterRegistry until the test's stream key shows up,
 	// or expose a hook from RedisServer that fires when registration
 	// completes). Under -race on a slow CI runner the 50 ms pause may
 	// be insufficient — the test then exercises the
@@ -917,7 +917,7 @@ func TestRedis_StreamXReadShutdownShortCircuits(t *testing.T) {
 	// pre-fix this would happily run for the full 5 s after Close()
 	// because iterCtx was rooted in context.Background(). Post-fix the
 	// handlerCtx.Err() guard at the top of each loop iteration kicks
-	// in within ~one redisBusyPollBackoff (10 ms) and we reply null.
+	// in within ~one redisBlockWaitFallback (100 ms) and we reply null.
 	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: "stream-shutdown",
 		ID:     "1-0",

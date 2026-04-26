@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-func TestStreamWaiterRegistry_SignalWakesRegisteredWaiter(t *testing.T) {
+func TestKeyWaiterRegistry_SignalWakesRegisteredWaiter(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
-	w, release := reg.Register([][]byte{[]byte("stream-a")})
+	reg := newKeyWaiterRegistry()
+	w, release := reg.Register([][]byte{[]byte("z-a")})
 	defer release()
 
-	reg.Signal([]byte("stream-a"))
+	reg.Signal([]byte("z-a"))
 
 	select {
 	case <-w.C:
@@ -22,13 +22,13 @@ func TestStreamWaiterRegistry_SignalWakesRegisteredWaiter(t *testing.T) {
 	}
 }
 
-func TestStreamWaiterRegistry_SignalUnrelatedKeyDoesNotWake(t *testing.T) {
+func TestKeyWaiterRegistry_SignalUnrelatedKeyDoesNotWake(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
-	w, release := reg.Register([][]byte{[]byte("stream-a")})
+	reg := newKeyWaiterRegistry()
+	w, release := reg.Register([][]byte{[]byte("z-a")})
 	defer release()
 
-	reg.Signal([]byte("stream-b"))
+	reg.Signal([]byte("z-b"))
 
 	select {
 	case <-w.C:
@@ -37,9 +37,9 @@ func TestStreamWaiterRegistry_SignalUnrelatedKeyDoesNotWake(t *testing.T) {
 	}
 }
 
-func TestStreamWaiterRegistry_MultiKeyWaiterWokenByAnyKey(t *testing.T) {
+func TestKeyWaiterRegistry_MultiKeyWaiterWokenByAnyKey(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
+	reg := newKeyWaiterRegistry()
 	w, release := reg.Register([][]byte{[]byte("a"), []byte("b"), []byte("c")})
 	defer release()
 
@@ -52,38 +52,25 @@ func TestStreamWaiterRegistry_MultiKeyWaiterWokenByAnyKey(t *testing.T) {
 	}
 }
 
-func TestStreamWaiterRegistry_DuplicateKeysDeduplicated(t *testing.T) {
+func TestKeyWaiterRegistry_DuplicateKeysDeduplicated(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
-	// Same key twice in the request; the dedup pass should record one
-	// registration so a single Signal does not double-send into the
-	// waiter's channel.
+	reg := newKeyWaiterRegistry()
 	w, release := reg.Register([][]byte{[]byte("dup"), []byte("dup")})
 	defer release()
 
 	reg.Signal([]byte("dup"))
 
-	// First select drains the (single) buffered signal.
 	select {
 	case <-w.C:
 	case <-time.After(time.Second):
 		t.Fatal("dedup waiter not signaled")
 	}
-	// Without dedup, the same Signal would have tried twice to send into
-	// a buffer of size 1 — the second send would still drop (default
-	// branch) so the channel would have only one item — but the buffer
-	// would be re-filled if the first drain had not happened yet. The
-	// stronger guarantee we test here is that registry.waiters only
-	// recorded one membership, so a *second* Signal (after drain) wakes
-	// exactly once, not twice.
 	reg.Signal([]byte("dup"))
 	select {
 	case <-w.C:
 	case <-time.After(time.Second):
 		t.Fatal("post-drain Signal failed to wake waiter")
 	}
-	// After draining both signals, no further signal is in flight; the
-	// channel must be empty.
 	select {
 	case <-w.C:
 		t.Fatal("waiter received a phantom third wake")
@@ -91,16 +78,12 @@ func TestStreamWaiterRegistry_DuplicateKeysDeduplicated(t *testing.T) {
 	}
 }
 
-func TestStreamWaiterRegistry_CoalescesPreDrainSignals(t *testing.T) {
+func TestKeyWaiterRegistry_CoalescesPreDrainSignals(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
+	reg := newKeyWaiterRegistry()
 	w, release := reg.Register([][]byte{[]byte("k")})
 	defer release()
 
-	// Three signals fire before the waiter has a chance to drain — the
-	// channel buffer is 1, so the latter two must drop on the
-	// non-blocking send. A correctly-coalescing waiter sees exactly one
-	// wake.
 	reg.Signal([]byte("k"))
 	reg.Signal([]byte("k"))
 	reg.Signal([]byte("k"))
@@ -117,12 +100,11 @@ func TestStreamWaiterRegistry_CoalescesPreDrainSignals(t *testing.T) {
 	}
 }
 
-func TestStreamWaiterRegistry_ReleaseStopsFurtherSignals(t *testing.T) {
+func TestKeyWaiterRegistry_ReleaseStopsFurtherSignals(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
+	reg := newKeyWaiterRegistry()
 	w, release := reg.Register([][]byte{[]byte("k")})
 	release()
-	// Drain the channel just in case it got buffered before release.
 	select {
 	case <-w.C:
 	default:
@@ -135,24 +117,24 @@ func TestStreamWaiterRegistry_ReleaseStopsFurtherSignals(t *testing.T) {
 	}
 }
 
-func TestStreamWaiterRegistry_ReleaseIsIdempotent(t *testing.T) {
+func TestKeyWaiterRegistry_ReleaseIsIdempotent(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
+	reg := newKeyWaiterRegistry()
 	_, release := reg.Register([][]byte{[]byte("k")})
 	release()
-	release() // second call must not panic / double-delete
+	release()
 	reg.Signal([]byte("k"))
 }
 
-func TestStreamWaiterRegistry_SignalWithNoWaiterIsNoOp(t *testing.T) {
+func TestKeyWaiterRegistry_SignalWithNoWaiterIsNoOp(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
+	reg := newKeyWaiterRegistry()
 	reg.Signal([]byte("nobody-here"))
 }
 
-func TestStreamWaiterRegistry_NilRegistry(t *testing.T) {
+func TestKeyWaiterRegistry_NilRegistryIsNoOp(t *testing.T) {
 	t.Parallel()
-	var reg *streamWaiterRegistry
+	var reg *keyWaiterRegistry
 	w, release := reg.Register([][]byte{[]byte("k")})
 	defer release()
 	if w == nil {
@@ -163,7 +145,7 @@ func TestStreamWaiterRegistry_NilRegistry(t *testing.T) {
 	}
 	// Buffered-1 invariant: a non-blocking direct send must succeed
 	// without deadlocking. (In production, Signal is a no-op for nil
-	// registries; this only matters for test stubs that hand-write
+	// registries; this only matters for test stubs that hand-send
 	// into w.C — but the contract is documented as buffered-1 either
 	// way, and an unbuffered channel would deadlock here.)
 	select {
@@ -171,21 +153,19 @@ func TestStreamWaiterRegistry_NilRegistry(t *testing.T) {
 	default:
 		t.Fatal("nil-registry waiter channel must be buffered (size 1)")
 	}
-	// And it must drain.
 	select {
 	case <-w.C:
 	default:
 		t.Fatal("nil-registry waiter channel did not deliver the manual send")
 	}
-	// Signal on nil registry is a no-op.
 	reg.Signal([]byte("k"))
 }
 
-func TestStreamWaiterRegistry_ManyWaitersFanOut(t *testing.T) {
+func TestKeyWaiterRegistry_ManyWaitersFanOut(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
+	reg := newKeyWaiterRegistry()
 	const n = 10
-	waiters := make([]*streamWaiter, 0, n)
+	waiters := make([]*keyWaiter, 0, n)
 	releases := make([]func(), 0, n)
 	for range n {
 		w, rel := reg.Register([][]byte{[]byte("fan")})
@@ -209,13 +189,9 @@ func TestStreamWaiterRegistry_ManyWaitersFanOut(t *testing.T) {
 	}
 }
 
-// TestStreamWaiterRegistry_ConcurrentRegisterSignal exercises the lock to
-// catch ordering bugs in Register/Signal/release: parallel registers and
-// signals on the same key must always either reach the waiter or have
-// happened before its registration window closed.
-func TestStreamWaiterRegistry_ConcurrentRegisterSignal(t *testing.T) {
+func TestKeyWaiterRegistry_ConcurrentRegisterSignal(t *testing.T) {
 	t.Parallel()
-	reg := newStreamWaiterRegistry()
+	reg := newKeyWaiterRegistry()
 	const goroutines = 64
 	const iterations = 100
 	var wokeOrTimedOut atomic.Int64
