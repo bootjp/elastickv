@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -219,6 +218,19 @@ type Engine struct {
 	runErr  error
 	closed  bool
 	applied uint64
+	// voterCount is the count of nodes in the latest applied
+	// ConfState.Voters (including self if voter). isLearnerNode is the
+	// matching set membership lookup keyed by node ID. Both are written
+	// only from the apply loop after rawNode.ApplyConfChange returns
+	// the new ConfState; both are read under e.mu on the lease-read /
+	// quorum-ack hot path. The cache exists to keep
+	// followerQuorumForClusterSize and the singleNodeLeaderAckMonoNs
+	// fast path from inflating the denominator with learners. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6. Rebuilt
+	// from scratch on each conf change — never patched — so promotion
+	// of a learner cannot leak a stale isLearnerNode[id]==true entry.
+	voterCount    int
+	isLearnerNode map[uint64]bool
 	// appliedIndex mirrors the current applied-entry index for
 	// lock-free readers on the lease-read fast path. Writers inside
 	// the Raft run loop update both `applied` (protected by the run
@@ -446,6 +458,8 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		startedCh:        make(chan struct{}),
 		leaderReady:      make(chan struct{}),
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
+		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
+		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
 		applied:          maxAppliedIndex(prepared.disk.LocalSnap),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
@@ -1487,11 +1501,21 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	if _, ok := e.peers[msg.From]; !ok {
 		return
 	}
-	clusterSize := len(e.peers)
-	if clusterSize <= 1 {
+	// Reject acks from learners. A learner does not vote and must not
+	// contribute to the voter-majority denominator on the lease-read
+	// fast path. See docs/design/2026_04_26_proposed_raft_learner.md
+	// §4.6. Both e.peers and e.isLearnerNode are written from the
+	// apply loop (single writer for both), so reading here under the
+	// run-loop goroutine is race-free for the same reason as e.peers
+	// above.
+	if e.isLearnerNode[msg.From] {
 		return
 	}
-	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(clusterSize))
+	voterCount := e.voterCount
+	if voterCount <= 1 {
+		return
+	}
+	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(voterCount))
 }
 
 // followerQuorumForClusterSize returns the number of non-self peer
@@ -1742,7 +1766,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
 				return err
 			}
-			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
+			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index, *confState)
 			e.setApplied(entry.Index)
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
@@ -1754,7 +1778,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
 				return err
 			}
-			e.applyConfigChangeV2(cc, entry.Index)
+			e.applyConfigChangeV2(cc, entry.Index, *confState)
 			e.setApplied(entry.Index)
 		default:
 			e.setApplied(entry.Index)
@@ -1800,33 +1824,76 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 	}
 }
 
-func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64) {
+// applyConfigChange runs the four-step apply-loop sequence from
+// docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 4:
+//  1. recompute e.voterCount, e.isLearnerNode from confState
+//  2. upsertPeer / removePeer (mutates e.peers; may read e.voterCount)
+//  3. rebuild e.config.Servers via configurationFromConfState(e.peers, confState)
+//  4. configIndex / pending-config bookkeeping
+//
+// All four steps run on the single-threaded apply loop, so no extra
+// synchronization is needed.
+func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64, confState raftpb.ConfState) {
+	e.refreshVoterCache(confState)
 	e.applyConfigPeerChange(changeType, nodeID, context)
+	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, context)
 }
 
-func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64) {
+func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
+	e.refreshVoterCache(confState)
 	for _, change := range cc.Changes {
 		e.applyConfigPeerChange(change.Type, change.NodeID, cc.Context)
 	}
+	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, cc.Context)
+}
+
+// refreshVoterCache rebuilds the voterCount / isLearnerNode cache
+// from the post-change ConfState. Called from the apply loop only.
+// The map is rebuilt from scratch — never patched — so promotion of a
+// learner cannot leak a stale isLearnerNode[id]==true entry. See
+// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+func (e *Engine) refreshVoterCache(confState raftpb.ConfState) {
+	e.mu.Lock()
+	e.voterCount = len(confState.Voters)
+	e.isLearnerNode = learnerSetFromConfState(confState)
+	e.mu.Unlock()
+}
+
+// refreshConfigServers rebuilds e.config.Servers from the post-change
+// ConfState and the current address-cache map. Called after the
+// per-peer cleanup helpers (upsertPeer / removePeer) so that
+// configurationFromConfState observes the post-cleanup e.peers map.
+func (e *Engine) refreshConfigServers(confState raftpb.ConfState) {
+	e.mu.Lock()
+	e.config = configurationFromConfState(e.peers, confState)
+	e.mu.Unlock()
 }
 
 func (e *Engine) applyConfigPeerChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
 	peer, ok := decodeConfChangePeerContext(nodeID, context)
 	switch changeType {
 	case raftpb.ConfChangeAddNode:
+		// Promotion of an existing learner also lands here as
+		// ConfChangeAddNode for a node already in e.peers; the upsert
+		// is idempotent on (nodeID -> addr) so it is safe to take
+		// the same path. The voter / learner role swap is reflected
+		// in the post-change ConfState, which the apply loop has
+		// already used to refresh the voter cache and which it will
+		// use to rebuild e.config.Servers.
 		e.applyAddedPeer(nodeID, peer, ok)
 	case raftpb.ConfChangeRemoveNode:
 		e.applyRemovedPeer(nodeID, peer, ok)
 	case raftpb.ConfChangeUpdateNode:
 		e.applyUpdatedPeer(peer, ok)
 	case raftpb.ConfChangeAddLearnerNode:
-		// Phase 3 only exposes voter membership changes. Ignore learner metadata
-		// if it appears in a replayed log; startup validation still rejects joint
-		// consensus snapshots and learner-only cluster states for now.
+		// A learner joins the address cache the same way a voter does;
+		// suffrage is an attribute of ConfState, not of e.peers. See
+		// docs/design/2026_04_26_proposed_raft_learner.md §4.2.
+		e.applyAddedPeer(nodeID, peer, ok)
 	}
 }
 
@@ -2160,7 +2227,11 @@ func (e *Engine) refreshStatus() {
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 	}
-	clusterSize := len(e.peers)
+	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
+	// cluster correctly hits the leader-of-1 fast path: a learner does
+	// not vote and is not part of the lease-read denominator. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	voterCount := e.voterCount
 	e.mu.Unlock()
 
 	// Keep the lock-free single-node fast path in sync with the current
@@ -2173,7 +2244,7 @@ func (e *Engine) refreshStatus() {
 	// could publish a ack instant while isLeader is still false.
 	e.isLeader.Store(status.State == raftengine.StateLeader)
 
-	if status.State == raftengine.StateLeader && clusterSize <= 1 {
+	if status.State == raftengine.StateLeader && voterCount <= 1 {
 		e.singleNodeLeaderAckMonoNs.Store(monoclock.Now().Nanos())
 	} else {
 		e.singleNodeLeaderAckMonoNs.Store(0)
@@ -2642,28 +2713,47 @@ func maxUint64(left uint64, right uint64) uint64 {
 }
 
 func configurationFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) raftengine.Configuration {
-	if len(conf.Voters) == 0 {
+	if len(conf.Voters) == 0 && len(conf.Learners) == 0 {
 		return raftengine.Configuration{}
 	}
 
-	servers := make([]raftengine.Server, 0, len(conf.Voters))
+	servers := make([]raftengine.Server, 0, len(conf.Voters)+len(conf.Learners))
 	for _, nodeID := range conf.Voters {
-		peer, ok := peers[nodeID]
-		if ok {
-			servers = append(servers, raftengine.Server{
-				ID:       peer.ID,
-				Address:  peer.Address,
-				Suffrage: "voter",
-			})
-			continue
-		}
-		servers = append(servers, raftengine.Server{
-			ID:       strconv.FormatUint(nodeID, 10),
-			Address:  "",
-			Suffrage: "voter",
-		})
+		servers = append(servers, configServerForNode(peers, nodeID, SuffrageVoter))
+	}
+	for _, nodeID := range conf.Learners {
+		servers = append(servers, configServerForNode(peers, nodeID, SuffrageLearner))
 	}
 	return raftengine.Configuration{Servers: servers}
+}
+
+func configServerForNode(peers map[uint64]Peer, nodeID uint64, suffrage string) raftengine.Server {
+	if peer, ok := peers[nodeID]; ok {
+		return raftengine.Server{
+			ID:       peer.ID,
+			Address:  peer.Address,
+			Suffrage: suffrage,
+		}
+	}
+	return raftengine.Server{
+		ID:       strconv.FormatUint(nodeID, 10),
+		Address:  "",
+		Suffrage: suffrage,
+	}
+}
+
+// learnerSetFromConfState builds the apply-loop-owned isLearnerNode
+// cache from a ConfState. Returns nil for an empty / voter-only conf
+// state (callers treat nil as "no learners").
+func learnerSetFromConfState(conf raftpb.ConfState) map[uint64]bool {
+	if len(conf.Learners) == 0 {
+		return nil
+	}
+	out := make(map[uint64]bool, len(conf.Learners))
+	for _, nodeID := range conf.Learners {
+		out[nodeID] = true
+	}
+	return out
 }
 
 func numRemoteServers(servers []raftengine.Server, localID string) uint64 {
@@ -3077,6 +3167,13 @@ func (e *Engine) namedTransferTargetLocked(target Peer) (Peer, error) {
 	return Peer{}, errors.Wrapf(errTransportPeerUnknown, "address=%q", target.Address)
 }
 
+// upsertPeer updates the address cache for a peer. It deliberately
+// does NOT touch e.config.Servers — suffrage is determined by the
+// post-change ConfState which the apply loop threads through
+// refreshConfigServers. Today's call sites are the apply-loop helpers
+// applyAddedPeer / applyUpdatedPeer (both reached from
+// applyConfigPeerChange) which run before refreshConfigServers within
+// the same apply iteration.
 func (e *Engine) upsertPeer(peer Peer) {
 	if peer.NodeID == 0 {
 		peer.NodeID = DeriveNodeID(peer.ID)
@@ -3090,11 +3187,6 @@ func (e *Engine) upsertPeer(peer Peer) {
 		e.peers = make(map[uint64]Peer)
 	}
 	e.peers[peer.NodeID] = peer
-	e.config.Servers = upsertConfigServer(e.peers, e.config.Servers, raftengine.Server{
-		ID:       peer.ID,
-		Address:  peer.Address,
-		Suffrage: "voter",
-	})
 	e.mu.Unlock()
 
 	if e.transport != nil {
@@ -3129,26 +3221,31 @@ func (e *Engine) removePeer(nodeID uint64) {
 	}
 
 	e.mu.Lock()
-	peer, ok := e.peers[nodeID]
-	if ok {
+	if _, ok := e.peers[nodeID]; ok {
 		delete(e.peers, nodeID)
 	}
-	e.config.Servers = removeConfigServer(e.peers, e.config.Servers, nodeID, peer.ID)
-	postRemovalClusterSize := len(e.peers)
+	// e.voterCount has already been refreshed for the post-change
+	// ConfState by refreshVoterCache earlier in the apply iteration
+	// (see applyConfigChange / applyConfigChangeV2). The ack tracker
+	// quorum threshold below uses the voter count, not the address
+	// cache size, because a learner ack must not contribute to the
+	// voter-majority denominator. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	postRemovalVoterCount := e.voterCount
 	e.mu.Unlock()
 
 	// Drop the peer's recorded ack so a reconfiguration cannot leave a
 	// stale entry that falsely satisfies the new cluster's majority.
-	// followerQuorum is computed against the POST-removal cluster; a
+	// followerQuorum is computed against the POST-removal voter count; a
 	// shrink to <=1 would otherwise pass 0 here, which
 	// quorumAckTracker.removePeer treats as "keep the current instant"
 	// and would surface stale liveness to LastQuorumAck if the cluster
 	// subsequently grew back. Clear the tracker explicitly in that
 	// case so any future multi-node membership starts fresh.
-	if postRemovalClusterSize <= 1 {
+	if postRemovalVoterCount <= 1 {
 		e.ackTracker.reset()
 	} else {
-		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalClusterSize))
+		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalVoterCount))
 	}
 
 	if e.transport != nil {
@@ -3433,57 +3530,6 @@ func peerFromServer(peers map[uint64]Peer, server raftengine.Server) Peer {
 		ID:      server.ID,
 		Address: server.Address,
 	}
-}
-
-func upsertConfigServer(peers map[uint64]Peer, servers []raftengine.Server, server raftengine.Server) []raftengine.Server {
-	out := append([]raftengine.Server(nil), servers...)
-	for i := range out {
-		if out[i].ID != server.ID {
-			continue
-		}
-		out[i] = server
-		sortConfigServers(peers, out)
-		return out
-	}
-	out = append(out, server)
-	sortConfigServers(peers, out)
-	return out
-}
-
-func removeConfigServer(peers map[uint64]Peer, servers []raftengine.Server, nodeID uint64, serverID string) []raftengine.Server {
-	if len(servers) == 0 {
-		return nil
-	}
-	out := make([]raftengine.Server, 0, len(servers))
-	for _, server := range servers {
-		if serverID != "" && server.ID == serverID {
-			continue
-		}
-		if nodeID != 0 && serverNodeID(peers, server) == nodeID {
-			continue
-		}
-		out = append(out, server)
-	}
-	sortConfigServers(peers, out)
-	return out
-}
-
-func sortConfigServers(peers map[uint64]Peer, servers []raftengine.Server) {
-	sort.Slice(servers, func(i, j int) bool {
-		left := serverNodeID(peers, servers[i])
-		right := serverNodeID(peers, servers[j])
-		if left == right {
-			return servers[i].ID < servers[j].ID
-		}
-		return left < right
-	})
-}
-
-func serverNodeID(peers map[uint64]Peer, server raftengine.Server) uint64 {
-	if nodeID, ok := configServerNodeID(peers, server); ok {
-		return nodeID
-	}
-	return DeriveNodeID(server.ID)
 }
 
 func configServerNodeID(peers map[uint64]Peer, server raftengine.Server) (uint64, bool) {
