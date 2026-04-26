@@ -261,9 +261,15 @@ func (s *ForwardServer) handleCreateBucket(ctx context.Context, principal AuthPr
 		return rejectForward(http.StatusBadRequest, "invalid_body",
 			"create-bucket payload has trailing data")
 	}
-	if strings.TrimSpace(body.BucketName) == "" {
-		return rejectForward(http.StatusBadRequest, "invalid_body",
-			"bucket_name is required")
+	// Reuse the HTTP handler's validateCreateBucketRequest so the
+	// forwarded path enforces identical rules — empty / whitespace-
+	// padded bucket_name produces the same 400 message a leader-
+	// direct call would, instead of slipping through here and
+	// hitting the adapter's lower-level validateS3BucketName with
+	// a less actionable error (Gemini security-high + Claude #2 on
+	// PR #673).
+	if err := validateCreateBucketRequest(body); err != nil {
+		return rejectForward(http.StatusBadRequest, "invalid_body", err.Error())
 	}
 	summary, err := s.buckets.AdminCreateBucket(ctx, principal, body)
 	if err != nil {
@@ -503,12 +509,18 @@ func forwardErrorResponse(op string, err error) *pb.AdminForwardResponse {
 // regressions, and logging them at LevelError would drown the
 // operational signal. The HTTP path's writeTablesError applies
 // the same policy (Codex P2 on PR #635 flagged the silent path).
-func (s *ForwardServer) logUnexpectedSourceError(ctx context.Context, op, table, forwardedFrom string, err error) {
+//
+// The resource argument carries either a Dynamo table name or an
+// S3 bucket name, depending on op. The slog key is "resource" so
+// log queries do not have to know which resource family produced a
+// given line — Claude review on PR #673 caught the prior "table"
+// key, which made bucket-error queries miss the audit entries.
+func (s *ForwardServer) logUnexpectedSourceError(ctx context.Context, op, resource, forwardedFrom string, err error) {
 	if isStructuredSourceError(err) {
 		return
 	}
 	s.logger.LogAttrs(ctx, slog.LevelError, "admin_forward_"+op+"_failed",
-		slog.String("table", table),
+		slog.String("resource", resource),
 		slog.String("forwarded_from", forwardedFrom),
 		slog.String("error", err.Error()),
 	)
