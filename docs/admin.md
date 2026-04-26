@@ -335,6 +335,7 @@ to populate the embedded `dist` directory, then rebuild the binary.
 
 ## Cross-references
 
+- Deployment runbook: [docs/admin_deployment.md](admin_deployment.md) (login flow, rollout via `scripts/rolling-update.sh`, key/TLS rotation, failure-mode runbooks)
 - Design rationale: [docs/design/2026_04_24_proposed_admin_dashboard.md](design/2026_04_24_proposed_admin_dashboard.md) (renamed to `_partial_` in PR #675; this link will follow once that lands)
 - Architecture overview: [docs/architecture_overview.md](architecture_overview.md)
 - AdminForward RPC contract: `proto/admin_forward.proto`

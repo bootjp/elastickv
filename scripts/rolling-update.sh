@@ -74,6 +74,44 @@ Optional environment:
     cascading to host processes (e.g. qemu-guest-agent, systemd). Paired with
     GOMEMLIMIT=1800MiB so Go GC preempts the kill. Set to "" to disable.
 
+  Admin dashboard (opt-in; ADMIN_ENABLED=true turns the listener on)
+  ADMIN_ENABLED
+    Master switch (default false). When true, the listener is configured
+    using the rest of the ADMIN_* variables and the script bind-mounts the
+    referenced files (signing key, optional previous key, TLS pair) into
+    the container read-only. Required when enabled:
+    ADMIN_SESSION_SIGNING_KEY_FILE plus at least one of ADMIN_FULL_ACCESS_KEYS
+    / ADMIN_READ_ONLY_ACCESS_KEYS.
+  ADMIN_ADDRESS
+    host:port for the admin listener (default: daemon-internal 127.0.0.1:8080).
+    Set to a reachable bind only with ADMIN_TLS_CERT_FILE/_KEY_FILE.
+  ADMIN_FULL_ACCESS_KEYS, ADMIN_READ_ONLY_ACCESS_KEYS
+    Comma-separated allow-lists. Same key must NOT appear in both. Sessions
+    re-validate against this list on every state-changing request, so
+    revoking a key takes effect on the next admin write rather than
+    waiting for the JWT to expire.
+  ADMIN_SESSION_SIGNING_KEY_FILE
+    Required. Path on the remote host to the base64-encoded HS256 key
+    (exactly 64 raw bytes — 88 base64 chars with standard padding, or 86
+    with RawURLEncoding). Bind-mounted read-only at the same path inside
+    the container. Must be identical on every node.
+  ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE
+    Optional. Path to the previous HS256 key, used only for verification
+    during a rotation window. New tokens always sign with the primary key.
+  ADMIN_TLS_CERT_FILE, ADMIN_TLS_KEY_FILE
+    Optional PEM cert + key for the admin listener. Both must be set
+    together. Required when ADMIN_ADDRESS is non-loopback unless
+    ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK=true.
+  ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK
+    Default false. When true, allows the admin listener on a non-loopback
+    bind without TLS. Strongly discouraged. See docs/admin.md for the
+    interaction with ADMIN_ALLOW_INSECURE_DEV_COOKIE — without the
+    latter, the dashboard mints Secure cookies the browser will refuse
+    to send over plaintext, breaking sessions end-to-end.
+  ADMIN_ALLOW_INSECURE_DEV_COOKIE
+    Default false. When true, mints session cookies without the Secure
+    attribute (for local plaintext development only).
+
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
@@ -125,6 +163,23 @@ SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
+
+# Admin dashboard knobs. ADMIN_ENABLED is the master switch; the
+# remaining variables only take effect when ADMIN_ENABLED=true.
+# Required when enabled: ADMIN_SESSION_SIGNING_KEY_FILE plus at
+# least one of ADMIN_FULL_ACCESS_KEYS / ADMIN_READ_ONLY_ACCESS_KEYS.
+# See docs/admin.md and docs/admin_deployment.md for the contract.
+ADMIN_ENABLED="${ADMIN_ENABLED:-false}"
+ADMIN_ADDRESS="${ADMIN_ADDRESS:-}"
+ADMIN_FULL_ACCESS_KEYS="${ADMIN_FULL_ACCESS_KEYS:-}"
+ADMIN_READ_ONLY_ACCESS_KEYS="${ADMIN_READ_ONLY_ACCESS_KEYS:-}"
+ADMIN_SESSION_SIGNING_KEY_FILE="${ADMIN_SESSION_SIGNING_KEY_FILE:-}"
+ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE="${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE:-}"
+ADMIN_TLS_CERT_FILE="${ADMIN_TLS_CERT_FILE:-}"
+ADMIN_TLS_KEY_FILE="${ADMIN_TLS_KEY_FILE:-}"
+ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
+ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
+
 # Container OOM defenses. See usage() for rationale. Empty string disables.
 DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
 CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
@@ -732,6 +787,18 @@ run_container() {
     memory_flags=(--memory "$CONTAINER_MEMORY_LIMIT")
   fi
 
+  # Admin dashboard plumbing. The admin listener is opt-in; when
+  # ADMIN_ENABLED=false the build_admin_flags helper produces no
+  # arguments and no extra bind-mounts, so existing deployments keep
+  # behaving identically. When enabled, the helper also validates that
+  # every referenced file exists on the remote host (signing key,
+  # optional previous key, optional TLS pair) before docker run, so a
+  # missing path fails fast on this node instead of silently leaving a
+  # node with auth disabled.
+  local admin_flags=()
+  local admin_volumes=()
+  build_admin_flags admin_flags admin_volumes
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
@@ -739,6 +806,7 @@ run_container() {
     "${memory_flags[@]}" \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
+    "${admin_volumes[@]}" \
     "${extra_env_flags[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
     --address "${NODE_HOST}:${RAFT_PORT}" \
@@ -748,7 +816,97 @@ run_container() {
     --raftEngine "$RAFT_ENGINE" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
-    "${s3_flags[@]}" >/dev/null
+    "${s3_flags[@]}" \
+    "${admin_flags[@]}" >/dev/null
+}
+
+# build_admin_flags emits the --admin* flag list and bind-mount list
+# the docker run needs to expose the admin dashboard listener. Both
+# output arrays are populated by-reference (bash 4.3+ namerefs) so
+# run_container can compose them with the rest of the docker
+# arguments without globals leaking between rollout iterations. When
+# ADMIN_ENABLED is anything other than the literal string "true",
+# both arrays are left empty and the function returns silently — the
+# admin listener stays off, matching the daemon's hard default.
+#
+# The validation pass is intentional: a missing signing-key file or
+# missing TLS pair on a remote host is the kind of misconfiguration
+# that would otherwise hard-error the daemon at startup AFTER the
+# previous container was already stopped, leaving the node
+# unhealthy. Failing here aborts before stop_container fires.
+build_admin_flags() {
+  local -n _flags="$1"
+  local -n _volumes="$2"
+
+  if [[ "${ADMIN_ENABLED}" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ -z "${ADMIN_SESSION_SIGNING_KEY_FILE}" ]]; then
+    echo "ADMIN_ENABLED=true requires ADMIN_SESSION_SIGNING_KEY_FILE; aborting" >&2
+    exit 1
+  fi
+  if [[ -z "${ADMIN_FULL_ACCESS_KEYS}" && -z "${ADMIN_READ_ONLY_ACCESS_KEYS}" ]]; then
+    echo "ADMIN_ENABLED=true requires at least one of ADMIN_FULL_ACCESS_KEYS / ADMIN_READ_ONLY_ACCESS_KEYS; aborting" >&2
+    exit 1
+  fi
+  if [[ ! -f "$ADMIN_SESSION_SIGNING_KEY_FILE" || ! -r "$ADMIN_SESSION_SIGNING_KEY_FILE" ]]; then
+    echo "ADMIN_SESSION_SIGNING_KEY_FILE='$ADMIN_SESSION_SIGNING_KEY_FILE' is missing or unreadable on this host; aborting" >&2
+    exit 1
+  fi
+
+  _flags+=(--adminEnabled)
+  _flags+=(--adminSessionSigningKeyFile "$ADMIN_SESSION_SIGNING_KEY_FILE")
+  _volumes+=(-v "${ADMIN_SESSION_SIGNING_KEY_FILE}:${ADMIN_SESSION_SIGNING_KEY_FILE}:ro")
+
+  if [[ -n "${ADMIN_ADDRESS}" ]]; then
+    _flags+=(--adminListen "$ADMIN_ADDRESS")
+  fi
+  if [[ -n "${ADMIN_FULL_ACCESS_KEYS}" ]]; then
+    _flags+=(--adminFullAccessKeys "$ADMIN_FULL_ACCESS_KEYS")
+  fi
+  if [[ -n "${ADMIN_READ_ONLY_ACCESS_KEYS}" ]]; then
+    _flags+=(--adminReadOnlyAccessKeys "$ADMIN_READ_ONLY_ACCESS_KEYS")
+  fi
+
+  if [[ -n "${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE}" ]]; then
+    if [[ ! -f "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" || ! -r "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" ]]; then
+      echo "ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE='$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    _flags+=(--adminSessionSigningKeyPreviousFile "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE")
+    _volumes+=(-v "${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE}:${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE}:ro")
+  fi
+
+  # TLS pair must be set together. The daemon already rejects partial
+  # configs at startup, but failing earlier here gives the operator a
+  # script-level error pointing at the variable name, instead of the
+  # daemon's "exactly one of cert/key" message after the container is
+  # already running.
+  if [[ -n "${ADMIN_TLS_CERT_FILE}" || -n "${ADMIN_TLS_KEY_FILE}" ]]; then
+    if [[ -z "${ADMIN_TLS_CERT_FILE}" || -z "${ADMIN_TLS_KEY_FILE}" ]]; then
+      echo "ADMIN_TLS_CERT_FILE and ADMIN_TLS_KEY_FILE must be set together; aborting" >&2
+      exit 1
+    fi
+    if [[ ! -f "$ADMIN_TLS_CERT_FILE" || ! -r "$ADMIN_TLS_CERT_FILE" ]]; then
+      echo "ADMIN_TLS_CERT_FILE='$ADMIN_TLS_CERT_FILE' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    if [[ ! -f "$ADMIN_TLS_KEY_FILE" || ! -r "$ADMIN_TLS_KEY_FILE" ]]; then
+      echo "ADMIN_TLS_KEY_FILE='$ADMIN_TLS_KEY_FILE' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    _flags+=(--adminTLSCertFile "$ADMIN_TLS_CERT_FILE" --adminTLSKeyFile "$ADMIN_TLS_KEY_FILE")
+    _volumes+=(-v "${ADMIN_TLS_CERT_FILE}:${ADMIN_TLS_CERT_FILE}:ro")
+    _volumes+=(-v "${ADMIN_TLS_KEY_FILE}:${ADMIN_TLS_KEY_FILE}:ro")
+  fi
+
+  if [[ "${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK}" == "true" ]]; then
+    _flags+=(--adminAllowPlaintextNonLoopback)
+  fi
+  if [[ "${ADMIN_ALLOW_INSECURE_DEV_COOKIE}" == "true" ]]; then
+    _flags+=(--adminAllowInsecureDevCookie)
+  fi
 }
 
 require_passwordless_sudo() {
