@@ -139,7 +139,11 @@ function Heatmap({ matrix }: HeatmapProps) {
     const rect = e.currentTarget.getBoundingClientRect();
     const y = e.clientY - rect.top;
     const idx = Math.floor(y / cellH);
-    if (idx >= 0 && idx < matrix.rows.length) setHoverRow(idx);
+    if (idx < 0 || idx >= matrix.rows.length) return;
+    // mousemove fires per-pixel; the functional update form lets React
+    // bail out cheaply on intra-row movement so we only schedule a
+    // re-render when the cursor actually crosses into a new row.
+    setHoverRow((prev) => (prev === idx ? prev : idx));
   };
 
   const onLeave = () => setHoverRow(null);

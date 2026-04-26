@@ -72,9 +72,9 @@ contains:
   `ColumnUnixMs`. Cell colour intensity is normalised against the
   per-matrix max so a quiet column does not look identical to a hot
   one.
-- A row-detail flyout: clicking a row reveals `bucket_id`, `start`,
-  `end`, `aggregate`, `route_count`, and (when present) `route_ids`
-  with a `route_ids_truncated` indicator.
+- A row-detail flyout: hovering over a row reveals `bucket_id`,
+  `start`, `end`, `aggregate`, `route_count`, and (when present)
+  `route_ids` with a `route_ids_truncated` indicator.
 
 The page is read-only and does not need the `full` role; both
 `read_only` and `full` sessions can view it.
@@ -161,18 +161,25 @@ Cell width: `min(8 px, container_width / column_count)`. Cell height:
 `min(4 px, container_height / row_count)`. Cap row count at 1024 so
 the canvas height stays under ~4096 px even at the maximum budget.
 
-Time axis labels: every Nth column where `N = ceil(column_count / 10)`,
-formatted as `HH:mm:ss` from `column_unix_ms[i]`.
+Time axis labels are formatted as `HH:mm:ss` from `column_unix_ms[i]`.
+The stride between rendered ticks is `max(ceil(column_count / 10),
+ceil(56 px / cellW))` so adjacent labels never overlap at small cell
+widths — at `cellW = 2 px` a naive every-tenth stride would pack
+~54 px of monospace label into 2 px of horizontal space.
 
 Route axis labels: `bucket_id` truncated to 12 chars with a tooltip
 on hover. The full row data is available in the row-detail flyout.
 
 ### 4.3 Performance budget
 
-Phase 2 §10 sets ≤120 ms render budget for a 1024×500 matrix. Our
-single-pass `ImageData.data` write fits under that on every browser
-we've tested with similar sizes. We do **not** use SVG (one element
-per cell would be 500k DOM nodes at the max).
+Phase 2 §10 sets ≤120 ms render budget for a 1024×500 matrix. We
+issue one `ctx.fillRect` per non-zero cell — the colour ramp runs
+once per cell rather than per pixel, and zero-value cells short-circuit
+so the only work on a quiet matrix is the initial `clearRect`. We do
+**not** use SVG (one element per cell would be 500k DOM nodes at the
+max), and we do **not** build an `ImageData` buffer (a single
+`putImageData` would force per-pixel iteration over the larger axis,
+which is the opposite of what we want for a sparse matrix).
 
 ### 4.4 Refresh
 
