@@ -28,7 +28,16 @@ const (
 	pubsubPatternArgMin  = 3
 	pubsubFirstChannel   = 2
 	redisBusyPollBackoff = 10 * time.Millisecond
-	redisKeywordCount    = "COUNT"
+	// redisStreamWaitFallback is the safety-net poll interval that fires
+	// in xreadBusyPoll when no XADD signal arrives. The signal path covers
+	// all in-process XADDs on the same node; the fallback only matters
+	// when the entry was applied via a path that does not call Signal
+	// (e.g. follower-side FSM apply, future direct mutation paths).
+	// 100 ms keeps the fallback CPU at roughly 1/10th of the prior
+	// busy-poll, while bounding stale-poll latency to a value clients
+	// already tolerate from network round-trips.
+	redisStreamWaitFallback = 100 * time.Millisecond
+	redisKeywordCount       = "COUNT"
 
 	// setWideColOverhead is the number of extra elements reserved in a set
 	// wide-column mutation slice beyond the per-member elements: one for the
@@ -4071,7 +4080,28 @@ func (r *RedisServer) xaddTxn(ctx context.Context, key []byte, req xaddRequest) 
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.StreamMetaKey(key), Value: metaBytes})
 
-	return id, r.dispatchElems(ctx, true, readTS, elems)
+	return id, r.dispatchAndSignalStream(ctx, true, readTS, elems, key)
+}
+
+// dispatchAndSignalStream dispatches the elems through the coordinator
+// and, on success, wakes any XREAD BLOCK waiter on the same node.
+// dispatchElems blocks until the FSM applies locally, so by the time
+// Signal fires the new entries are visible at the readTS the woken
+// waiter will pick on its next iteration. Pulled out of xaddTxn so the
+// parent function stays under the cyclop budget — the signal step
+// would otherwise add an extra branch on the dispatch error path.
+func (r *RedisServer) dispatchAndSignalStream(
+	ctx context.Context,
+	isTxn bool,
+	startTS uint64,
+	elems []*kv.Elem[kv.OP],
+	streamKey []byte,
+) error {
+	if err := r.dispatchElems(ctx, isTxn, startTS, elems); err != nil {
+		return err
+	}
+	r.streamWaiters.Signal(streamKey)
+	return nil
 }
 
 // appendMaxLenZeroSelfDel handles the MAXLEN 0 edge case. The trim loop
@@ -4825,18 +4855,26 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	r.xreadBusyPoll(conn, req, deadline)
 }
 
-// xreadBusyPoll runs the BLOCK-window busy-poll loop. Extracted from xread
-// so the parent function stays under the cyclop budget.
+// xreadBusyPoll runs the BLOCK-window wait loop. Extracted from xread so
+// the parent function stays under the cyclop budget. Uses an event-driven
+// signal from the in-process XADD path with a fallback timer for paths
+// that bypass the signal (Lua flush, follower-side FSM apply).
+//
+// Registration happens BEFORE the first xreadOnce so a signal that fires
+// between the check and the wait cannot be lost: the buffered channel
+// holds it, and the next select wakes immediately.
 func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline time.Time) {
 	handlerCtx := r.handlerContext()
+	w, release := r.streamWaiters.Register(req.keys)
+	defer release()
 	for {
 		// Server-shutdown short-circuit: if the parent handlerContext
-		// has been cancelled, abandon the busy-poll immediately rather
-		// than spin until the BLOCK deadline. iterCtx below is rooted
+		// has been cancelled, abandon the wait loop immediately rather
+		// than block until the BLOCK deadline. iterCtx below is rooted
 		// in handlerCtx, so it would cancel-on-call too — but routing
 		// through isXReadIterCtxError silently translates that into an
-		// empty iteration and the loop would burn CPU at
-		// redisBusyPollBackoff cadence until the deadline.
+		// empty iteration and the loop would otherwise wait at
+		// redisStreamWaitFallback cadence until the deadline.
 		if handlerCtx.Err() != nil {
 			conn.WriteNull()
 			return
@@ -4888,7 +4926,44 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 			conn.WriteNull()
 			return
 		}
-		time.Sleep(redisBusyPollBackoff)
+		waitForStreamUpdate(handlerCtx, w.C, deadline)
+	}
+}
+
+// waitForStreamUpdate blocks until one of: an XADD signal arrives,
+// the fallback poll tick fires, the parent handlerCtx is cancelled,
+// or the BLOCK deadline elapses — whichever happens first. The
+// fallback bounds latency for write paths that do not signal (Lua
+// flush, follower-applied entries); it cannot exceed the remaining
+// BLOCK window so the deadline branch in the caller's loop top
+// always gets a chance to fire when the BLOCK expires.
+//
+// Extracted to keep xreadBusyPoll under the cyclop budget — the
+// timer cleanup pattern (Stop + drain on miss) is awkward inline
+// and the helper lets the caller stay focused on the poll-result
+// branch.
+func waitForStreamUpdate(handlerCtx context.Context, waiterC <-chan struct{}, deadline time.Time) {
+	fallback := redisStreamWaitFallback
+	if remaining := time.Until(deadline); remaining < fallback {
+		fallback = remaining
+	}
+	timer := time.NewTimer(fallback)
+	defer func() {
+		if !timer.Stop() {
+			// The timer either fired (its case won and the channel
+			// was drained inline by select) or is still buffering
+			// the tick (waiter / handlerCtx won the race); drain
+			// the channel non-blocking so timer GC is clean.
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+	select {
+	case <-waiterC:
+	case <-timer.C:
+	case <-handlerCtx.Done():
 	}
 }
 

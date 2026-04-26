@@ -26,6 +26,80 @@ import (
 // the `iterTimeout <= 0` early-return path. This test covers the
 // distinct mid-call path where iterTimeout starts > 0 but the iter ctx
 // then expires inside xreadOnce.
+// TestRedis_StreamXReadBlockWakesOnXAdd verifies the event-driven wake
+// path: an in-process XADD on the leader's redis adapter must wake an
+// XREAD BLOCK waiter on the same node so the reader returns the new
+// entry before its BLOCK deadline. The wake comes through
+// streamWaiterRegistry's signal channel — the prior 10 ms time.Sleep
+// busy-poll loop would have exhibited the same end-to-end behaviour, so
+// this is an end-to-end sanity test rather than a wall-clock latency
+// gate (the latency gate is impractical under -race + parallel CI load,
+// where xreadOnce's Pebble seek alone can exceed any tight budget).
+//
+// Both client connections target the same node so they share the same
+// streamWaiterRegistry — the signal path is intentionally in-process
+// only (Lua and follower-side applies fall through to the fallback
+// timer; see xreadBusyPoll).
+func TestRedis_StreamXReadBlockWakesOnXAdd(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdbReader := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbReader.Close() }()
+	rdbWriter := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbWriter.Close() }()
+	ctx := context.Background()
+
+	// Seed one entry so the stream meta exists; XREAD with afterID="$"
+	// will resolve to the seeded ID and then BLOCK for any strictly-newer
+	// entry. This isolates the wake path from the cold-stream branch.
+	_, err := rdbWriter.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-wake",
+		ID:     "1-0",
+		Values: []string{"k", "v0"},
+	}).Result()
+	require.NoError(t, err)
+
+	type readResult struct {
+		streams []redis.XStream
+		err     error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		streams, err := rdbReader.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{"stream-wake", "$"},
+			Block:   5 * time.Second,
+		}).Result()
+		resultCh <- readResult{streams: streams, err: err}
+	}()
+
+	// Give the reader a moment to enter xreadBusyPoll and register a
+	// waiter on streamWaiterRegistry before XADD. If XADD landed first
+	// the entry would already be visible by the time the reader runs
+	// xreadOnce, so the registration race is benign — but waiting also
+	// gates out a different source of flake where the goroutine has not
+	// yet dialed redis.
+	time.Sleep(50 * time.Millisecond)
+
+	_, err = rdbWriter.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-wake",
+		ID:     "2-0",
+		Values: []string{"k", "v1"},
+	}).Result()
+	require.NoError(t, err)
+
+	select {
+	case res := <-resultCh:
+		require.NoError(t, res.err)
+		require.Len(t, res.streams, 1)
+		require.Len(t, res.streams[0].Messages, 1)
+		require.Equal(t, "2-0", res.streams[0].Messages[0].ID)
+	case <-time.After(6 * time.Second):
+		t.Fatal("XREAD BLOCK did not return after XADD signal")
+	}
+}
+
 func TestRedis_StreamXReadIterCtxDeadlineReturnsNull(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)

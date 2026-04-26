@@ -221,6 +221,11 @@ type RedisServer struct {
 	// Exposed via HELLO / CLIENT ID.
 	connIDSeq atomic.Uint64
 
+	// streamWaiters lets XADD wake an XREAD BLOCK waiting on the same
+	// node, replacing what was a 10 ms time.Sleep busy-poll. See
+	// redis_stream_waiters.go.
+	streamWaiters *streamWaiterRegistry
+
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
@@ -348,6 +353,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 		baseCtx:         baseCtx,
 		baseCancel:      baseCancel,
+		streamWaiters:   newStreamWaiterRegistry(),
 	}
 	r.relay.Bind(r.publishLocal)
 
