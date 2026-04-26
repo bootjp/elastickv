@@ -474,19 +474,65 @@ func TestForwardServer_CreateBucket_HappyPath(t *testing.T) {
 	require.Equal(t, "public-assets", summary.Name)
 }
 
-func TestForwardServer_CreateBucket_NoBucketsSourceReturns501(t *testing.T) {
+func TestForwardServer_BucketOps_NoBucketsSourceReturns501(t *testing.T) {
 	// Builds without S3 do not call WithBucketsSource; the leader
-	// must still reject CREATE_BUCKET cleanly with 501 instead of
-	// reaching for a nil receiver and panicking.
-	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
+	// must still reject every bucket operation cleanly with 501
+	// instead of reaching for a nil receiver and panicking. Sweep
+	// over all three operations so a future op added without a
+	// nil-receiver guard fails CI immediately (Claude review on
+	// PR #673 caught the original test only covering CREATE_BUCKET).
+	cases := []struct {
+		name    string
+		op      pb.AdminOperation
+		payload []byte
+	}{
+		{
+			name:    "create",
+			op:      pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
+			payload: mustJSON(t, CreateBucketRequest{BucketName: "x"}),
+		},
+		{
+			name:    "delete",
+			op:      pb.AdminOperation_ADMIN_OP_DELETE_BUCKET,
+			payload: []byte(`{"name":"x"}`),
+		},
+		{
+			name:    "put_acl",
+			op:      pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL,
+			payload: []byte(`{"name":"x","acl":"private"}`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
+			resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+				Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+				Operation: tc.op,
+				Payload:   tc.payload,
+			})
+			require.NoError(t, err)
+			require.Equal(t, int32(http.StatusNotImplemented), resp.GetStatusCode())
+			require.Contains(t, string(resp.GetPayload()), "not_implemented")
+		})
+	}
+}
+
+func TestForwardServer_CreateBucket_RejectsWhitespacePaddedName(t *testing.T) {
+	// Validation parity with the HTTP path's
+	// validateCreateBucketRequest: a name like " bucket " must
+	// produce the same 400 invalid_body the leader-direct path
+	// emits, instead of slipping through and hitting the lower-
+	// level adapter validator with a less actionable error
+	// (Gemini security-high + Claude #2 on PR #673).
+	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
 	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
 		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
 		Operation: pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
-		Payload:   mustJSON(t, CreateBucketRequest{BucketName: "x"}),
+		Payload:   mustJSON(t, CreateBucketRequest{BucketName: " padded "}),
 	})
 	require.NoError(t, err)
-	require.Equal(t, int32(http.StatusNotImplemented), resp.GetStatusCode())
-	require.Contains(t, string(resp.GetPayload()), "not_implemented")
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "leading or trailing whitespace")
 }
 
 func TestForwardServer_CreateBucket_BadJSONReturns400(t *testing.T) {
