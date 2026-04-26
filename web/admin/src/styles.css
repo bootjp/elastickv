@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+    --surface: 250 250 252;
+    --surface-2: 240 242 247;
+    --ink: 17 24 39;
+    --muted: 100 116 139;
+    --accent: 37 99 235;
+    --danger: 220 38 38;
+    --border: 226 232 240;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: 15 23 42;
+      --surface-2: 24 33 54;
+      --ink: 226 232 240;
+      --muted: 148 163 184;
+      --accent: 96 165 250;
+      --danger: 248 113 113;
+      --border: 51 65 85;
+    }
+  }
+
+  html, body, #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-surface text-ink font-sans antialiased;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:opacity-90 disabled:opacity-50;
+  }
+  .btn-secondary {
+    @apply btn border border-border bg-surface-2 hover:bg-surface;
+  }
+  .btn-danger {
+    @apply btn border border-danger text-danger hover:bg-danger hover:text-white;
+  }
+  .input {
+    @apply w-full rounded-md border border-border bg-surface px-3 py-1.5 text-sm
+      focus:outline-none focus:ring-2 focus:ring-accent;
+  }
+  .label {
+    @apply block text-xs font-medium text-muted mb-1;
+  }
+  .card {
+    @apply rounded-lg border border-border bg-surface-2 p-4;
+  }
+  .table {
+    @apply w-full text-sm;
+  }
+  .table th {
+    @apply text-left text-xs font-medium uppercase tracking-wide text-muted py-2 px-3 border-b border-border;
+  }
+  .table td {
+    @apply py-2 px-3 border-b border-border;
+  }
+  .pill {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+  .pill-accent {
+    @apply pill bg-accent/10 text-accent;
+  }
+  .pill-muted {
+    @apply pill bg-surface text-muted border border-border;
+  }
+}

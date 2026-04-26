@@ -445,6 +445,10 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 	if err != nil {
 		return nil, errors.Wrap(err, "build admin verifier")
 	}
+	staticFS, err := admin.StaticFS()
+	if err != nil {
+		return nil, errors.Wrap(err, "open embedded admin SPA")
+	}
 	server, err := admin.NewServer(admin.ServerDeps{
 		Signer:      signer,
 		Verifier:    verifier,
@@ -453,7 +457,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		ClusterInfo: cluster,
 		Tables:      tables,
 		Forwarder:   forwarder,
-		StaticFS:    nil,
+		StaticFS:    staticFS,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
