@@ -60,6 +60,12 @@ const (
 	sqsErrQueueDoesNotExist     = "AWS.SimpleQueueService.NonExistentQueue"
 	sqsErrInvalidAttributeName  = "InvalidAttributeName"
 	sqsErrInvalidAttributeValue = "InvalidAttributeValue"
+	// sqsErrInvalidParameterValue is the AWS code for incoherent
+	// parameter combinations (vs malformed individual values, which
+	// use sqsErrInvalidAttributeValue). HT-FIFO uses this for the
+	// {PartitionCount > 1, DeduplicationScope = "queue"} cross-
+	// attribute rejection.
+	sqsErrInvalidParameterValue = "InvalidParameterValue"
 )
 
 var sqsQueueNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}(\.fifo)?$`)
@@ -99,6 +105,36 @@ type sqsQueueMeta struct {
 	// Persisted on the meta so a leader failover loads the configuration
 	// along with the rest of the queue.
 	Throttle *sqsQueueThrottle `json:"throttle,omitempty"`
+	// PartitionCount is the number of FIFO partitions for this queue
+	// (Phase 3.D HT-FIFO, see docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md).
+	// Zero or 1 means the legacy single-partition layout — no schema
+	// change. Greater than 1 enables HT-FIFO. Set at CreateQueue time
+	// and immutable thereafter (SetQueueAttributes rejects any change).
+	// Power-of-two values only (validator rejects others). PR 2 of the
+	// rollout introduces this field but a temporary CreateQueue gate
+	// rejects PartitionCount > 1 until PR 5 lifts the gate atomically
+	// with the data-plane fanout — so the schema exists but no
+	// partitioned data can land before the data plane is wired.
+	PartitionCount uint32 `json:"partition_count,omitempty"`
+	// FifoThroughputLimit mirrors the AWS attribute. "perMessageGroupId"
+	// (default for HT-FIFO) keeps the §3.3 hash-by-MessageGroupId
+	// routing; "perQueue" activates the partition-0 short-circuit so
+	// every group ID routes to one partition (effectively N=1).
+	// Set at CreateQueue time and immutable thereafter — flipping it
+	// live would re-route in-flight messages and silently violate
+	// within-group FIFO ordering (see §3.2 of the design).
+	FifoThroughputLimit string `json:"fifo_throughput_limit,omitempty"`
+	// DeduplicationScope mirrors the AWS attribute. "messageGroup"
+	// (default for HT-FIFO) means the dedup window is per
+	// (queue, partition, MessageGroupId, dedupId); "queue" is the
+	// legacy single-window behaviour. Set at CreateQueue time and
+	// immutable thereafter — changing live can resurrect or suppress
+	// messages depending on the direction of the change. The
+	// validator additionally rejects {PartitionCount > 1,
+	// DeduplicationScope = "queue"} at CreateQueue time because the
+	// dedup key cannot be globally unique across partitions without
+	// a cross-partition OCC transaction.
+	DeduplicationScope string `json:"deduplication_scope,omitempty"`
 }
 
 // sqsQueueThrottle is the per-queue token-bucket configuration. Three
@@ -334,6 +370,14 @@ func parseAttributesIntoMeta(name string, attrs map[string]string) (*sqsQueueMet
 	if meta.ContentBasedDedup && !meta.IsFIFO {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
 	}
+	// HT-FIFO validation runs after resolveFifoQueueFlag so the
+	// IsFIFO-only checks see the post-resolution flag. The temporary
+	// dormancy gate (§11 PR 2) runs separately in createQueue so
+	// SetQueueAttributes paths share the schema validator without
+	// re-rejecting on the gate.
+	if err := validatePartitionConfig(meta); err != nil {
+		return nil, err
+	}
 	return meta, nil
 }
 
@@ -421,6 +465,42 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 		m.ContentBasedDedup = b
 		return nil
 	},
+	// PartitionCount enables HT-FIFO when > 1 (Phase 3.D, see
+	// docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md). Set
+	// at CreateQueue time; SetQueueAttributes attempts to change it
+	// reject via the immutability check in trySetQueueAttributesOnce.
+	// PR 2 of the rollout introduces the field but the temporary
+	// dormancy gate in tryCreateQueueOnce rejects PartitionCount > 1
+	// until PR 5 lifts the gate atomically with the data plane.
+	"PartitionCount": func(m *sqsQueueMeta, v string) error {
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		if err != nil {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"PartitionCount must be a non-negative integer")
+		}
+		m.PartitionCount = uint32(n) //nolint:gosec // bounded by ParseUint(_, _, 32) above.
+		return nil
+	},
+	"FifoThroughputLimit": func(m *sqsQueueMeta, v string) error {
+		v = strings.TrimSpace(v)
+		switch v {
+		case "", htfifoThroughputPerMessageGroupID, htfifoThroughputPerQueue:
+			m.FifoThroughputLimit = v
+			return nil
+		}
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"FifoThroughputLimit must be 'perMessageGroupId' or 'perQueue'")
+	},
+	"DeduplicationScope": func(m *sqsQueueMeta, v string) error {
+		v = strings.TrimSpace(v)
+		switch v {
+		case "", htfifoDedupeScopeMessageGroup, htfifoDedupeScopeQueue:
+			m.DeduplicationScope = v
+			return nil
+		}
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"DeduplicationScope must be 'messageGroup' or 'queue'")
+	},
 	// Throttle* are non-AWS extensions for per-queue rate limiting,
 	// see docs/design/2026_04_26_proposed_sqs_per_queue_throttling.md.
 	// Each accepts a non-negative float64; the cross-attribute
@@ -478,6 +558,12 @@ func applyAttributes(meta *sqsQueueMeta, attrs map[string]string) error {
 	if err := validateThrottleConfig(meta); err != nil {
 		return err
 	}
+	// HT-FIFO partition validation runs in parseAttributesIntoMeta /
+	// trySetQueueAttributesOnce, AFTER resolveFifoQueueFlag, so the
+	// IsFIFO-only checks see the post-resolution flag. Running here
+	// would reject a valid CreateQueue with FifoQueue=true +
+	// FifoThroughputLimit=perMessageGroupId because IsFIFO is still
+	// false at this point in the flow.
 	return nil
 }
 
@@ -640,7 +726,9 @@ func attributesEqual(a, b *sqsQueueMeta) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return baseAttributesEqual(a, b) && throttleConfigEqual(a.Throttle, b.Throttle)
+	return baseAttributesEqual(a, b) &&
+		throttleConfigEqual(a.Throttle, b.Throttle) &&
+		htfifoAttributesEqual(a, b)
 }
 
 // baseAttributesEqual compares the pre-Phase-3.C/3.D attribute set.
@@ -676,6 +764,13 @@ func throttleConfigEqual(a, b *sqsQueueThrottle) bool {
 		a.RecvRefillPerSecond == b.RecvRefillPerSecond &&
 		a.DefaultCapacity == b.DefaultCapacity &&
 		a.DefaultRefillPerSecond == b.DefaultRefillPerSecond
+}
+
+// htfifoAttributesEqual compares the Phase 3.D HT-FIFO fields.
+func htfifoAttributesEqual(a, b *sqsQueueMeta) bool {
+	return a.PartitionCount == b.PartitionCount &&
+		a.FifoThroughputLimit == b.FifoThroughputLimit &&
+		a.DeduplicationScope == b.DeduplicationScope
 }
 
 // ------------------------ storage primitives ------------------------
@@ -742,6 +837,16 @@ func (s *SQSServer) createQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	requested, err := parseAttributesIntoMeta(in.QueueName, in.Attributes)
 	if err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
+	}
+	// Temporary dormancy gate (Phase 3.D §11 PR 2). PartitionCount > 1
+	// must reject until PR 5 wires the data plane atomically with the
+	// gate-lift. Without this, accepting a partitioned-queue create
+	// would let SendMessage write under the legacy single-partition
+	// prefix; the PR 5 reader would never find those messages and the
+	// reaper would not enumerate them — silent message loss.
+	if err := validatePartitionDormancyGate(requested); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
@@ -1196,6 +1301,10 @@ func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection, 
 	// keys. Extracted into a helper so queueMetaToAttributes stays
 	// under the cyclop ceiling.
 	addThrottleAttributes(all, meta.Throttle)
+	// HT-FIFO attributes (Phase 3.D). Same omission rule as Throttle*:
+	// only present when configured. Extracted into a helper so this
+	// function stays under the cyclop ceiling.
+	addHTFIFOAttributes(all, meta)
 	if selection.expandAll {
 		return all
 	}
@@ -1280,7 +1389,17 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	if !exists {
 		return false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
+	// Snapshot the on-disk values of the immutable HT-FIFO fields
+	// before applying the request so the immutability check has a
+	// clean before/after pair. SetQueueAttributes is all-or-nothing
+	// per §3.2: if any immutable attribute carries a differing value,
+	// the entire request is rejected before any attribute is
+	// persisted (including mutable attributes in the same call).
+	preApply := snapshotImmutableHTFIFO(meta)
 	if err := applyAttributes(meta, attrs); err != nil {
+		return false, err
+	}
+	if err := validatePartitionImmutability(preApply, meta); err != nil {
 		return false, err
 	}
 	// ContentBasedDeduplication is FIFO-only; a Standard queue
@@ -1288,6 +1407,13 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	// clients. Same rule enforced on CreateQueue.
 	if meta.ContentBasedDedup && !meta.IsFIFO {
 		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
+	}
+	// HT-FIFO schema validator runs after applyAttributes so the
+	// FIFO-only checks see the post-apply state. IsFIFO comes from
+	// the loaded meta record (immutable from CreateQueue) so the
+	// validator sees the same flag CreateQueue set.
+	if err := validatePartitionConfig(meta); err != nil {
+		return false, err
 	}
 	meta.LastModifiedAtMillis = time.Now().UnixMilli()
 	metaBytes, err := encodeSQSQueueMeta(meta)
