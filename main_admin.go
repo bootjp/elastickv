@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
@@ -77,6 +78,7 @@ func startAdminFromFlags(
 	s3Server *adapter.S3Server,
 	coordinate kv.Coordinator,
 	connCache *kv.GRPCConnCache,
+	keyvizSampler *keyviz.MemSampler,
 ) error {
 	if !*adminEnabled {
 		return nil
@@ -123,7 +125,7 @@ func startAdminFromFlags(
 	if err != nil {
 		return errors.Wrap(err, "build admin leader forwarder")
 	}
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, forwarder, buildVersion())
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, forwarder, keyvizSampler, buildVersion())
 	return err
 }
 
@@ -449,6 +451,7 @@ func startAdminServer(
 	tables admin.TablesSource,
 	buckets admin.BucketsSource,
 	forwarder admin.LeaderForwarder,
+	keyvizSampler *keyviz.MemSampler,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -456,7 +459,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, forwarder)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, forwarder, keyvizSampler)
 	if err != nil {
 		return "", err
 	}
@@ -496,7 +499,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, forwarder admin.LeaderForwarder) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, forwarder admin.LeaderForwarder, keyvizSampler *keyviz.MemSampler) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -522,6 +525,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		Tables:      tables,
 		Buckets:     buckets,
 		Forwarder:   forwarder,
+		KeyViz:      keyvizSourceFromSampler(keyvizSampler),
 		StaticFS:    staticFS,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
@@ -639,6 +643,20 @@ func resolveSigningKey(flagValue, filePath, envVar string) (string, error) {
 		return v, nil
 	}
 	return strings.TrimSpace(flagValue), nil
+}
+
+// keyvizSourceFromSampler boxes a *keyviz.MemSampler into the
+// admin.KeyVizSource interface understood by ServerDeps. Returning a
+// nil interface (not a typed-nil) when the sampler is disabled is
+// load-bearing: the admin handler's "keyviz disabled → 503" branch
+// only fires on an interface-nil; a typed-nil *MemSampler stored as
+// a non-nil interface would silently return an empty matrix instead
+// of the explicit "feature off" signal the SPA expects.
+func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
+	if s == nil {
+		return nil
+	}
+	return s
 }
 
 // parseCSV splits a flag value like "a,b,c" into a slice with empty and

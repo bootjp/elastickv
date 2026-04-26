@@ -54,6 +54,13 @@ type ServerDeps struct {
 	// builds.
 	Buckets BucketsSource
 
+	// KeyViz exposes the keyviz heatmap matrix to the dashboard via
+	// /admin/api/v1/keyviz/matrix. Optional: a nil value (or a node
+	// started without --keyvizEnabled) makes the route return 503
+	// codes "keyviz_disabled" so the SPA can render a clear "feature
+	// off" state instead of an empty matrix.
+	KeyViz KeyVizSource
+
 	// StaticFS is the embed.FS (or any fs.FS) backing the SPA. May be
 	// nil during early development; the router renders 404 for
 	// /admin/assets/* and the SPA fallback in that case.
@@ -101,7 +108,11 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	cluster := NewClusterHandler(deps.ClusterInfo).WithLogger(logger)
 	dynamo := buildDynamoHandlerForDeps(deps, logger)
 	s3 := buildS3HandlerForDeps(deps, logger)
-	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, logger)
+	// KeyViz handler is always registered: even when the source is
+	// nil it serves a 503 keyviz_disabled, which the SPA renders as
+	// a clearer "feature off" state than an unknown_endpoint 404.
+	keyviz := NewKeyVizHandler(deps.KeyViz).WithLogger(logger)
+	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, logger)
 	router := NewRouter(mux, deps.StaticFS)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
 }
@@ -206,7 +217,11 @@ func (s *Server) APIHandler() http.Handler {
 // dynamoHandler / s3Handler may be nil; in that case the corresponding
 // paths fall through to the unknown-endpoint 404, matching the
 // behaviour of any other unregistered admin path.
-func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, s3Handler http.Handler, logger *slog.Logger) http.Handler {
+//
+// keyvizHandler is always non-nil even when the sampler is disabled —
+// it serves 503 keyviz_disabled itself so the SPA gets a clearer
+// signal than an unknown_endpoint 404 from the catch-all.
+func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, s3Handler, keyvizHandler http.Handler, logger *slog.Logger) http.Handler {
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
 
@@ -256,6 +271,7 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	loginChain := publicAuth(loginHandler)
 	logoutChain := protectNoAudit(logoutHandler)
 	clusterChain := protect(clusterHandler)
+	keyvizChain := protect(keyvizHandler)
 	// Dynamo endpoints (reads and writes) share the protect chain
 	// so a missing session or CSRF token 401s/403s the same way
 	// regardless of method. The Audit middleware is a no-op for
@@ -280,6 +296,7 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 		cluster: clusterChain,
 		dynamo:  dynamoChain,
 		s3:      s3Chain,
+		keyviz:  keyvizChain,
 	}
 	return http.HandlerFunc(routes.dispatch)
 }
@@ -292,6 +309,7 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 type apiRouteTable struct {
 	login, logout, cluster http.Handler
 	dynamo, s3             http.Handler
+	keyviz                 http.Handler
 }
 
 // dispatch is the receiver method httpHandlerFunc adapts. Logic is
@@ -304,6 +322,8 @@ func (t apiRouteTable) dispatch(w http.ResponseWriter, r *http.Request) {
 		t.logout.ServeHTTP(w, r)
 	case r.URL.Path == "/admin/api/v1/cluster":
 		t.cluster.ServeHTTP(w, r)
+	case r.URL.Path == "/admin/api/v1/keyviz/matrix":
+		t.keyviz.ServeHTTP(w, r)
 	case t.dynamo != nil && isDynamoPath(r.URL.Path):
 		t.dynamo.ServeHTTP(w, r)
 	case t.s3 != nil && isS3Path(r.URL.Path):
