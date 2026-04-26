@@ -255,10 +255,21 @@ CR and LF in `forwarded_from` are stripped at the entry point — a
 hostile follower cannot split a single audit line into two by
 smuggling control characters into its node ID.
 
-Login and logout emit their own `admin_audit` lines with
-`action=login` / `action=logout` (plus `actor`, `claimed_actor`,
-`remote`, `status`) so the JWT's lifetime can be correlated with the
-mutations it authorised.
+Login and logout emit their own `admin_audit` lines so the JWT's
+lifetime can be correlated with the mutations it authorised. The
+two shapes differ on a single field — login carries `claimed_actor`
+because the access key the operator typed is distinct from the
+authenticated `actor` (a successful login proves they match; a
+failed login records what was claimed), while logout has no claim
+to verify and omits the field:
+
+```
+admin_audit action=login  actor=AKIA_ADMIN claimed_actor=AKIA_ADMIN remote=10.0.0.7:51234 status=200
+admin_audit action=logout actor=AKIA_ADMIN remote=10.0.0.7:51234 status=200
+```
+
+Log parsers consuming this shape should treat `claimed_actor` as
+present-only-on-login.
 
 ## Troubleshooting
 
