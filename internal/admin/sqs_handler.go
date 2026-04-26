@@ -24,11 +24,19 @@ const (
 // Mirrors adapter.AdminQueueSummary 1:1; the bridge in main_admin.go
 // translates between the two so the admin package stays free of the
 // adapter dependency tree.
+//
+// CreatedAt is a pointer so omitempty actually drops the field when
+// the underlying queue has no wall-clock creation timestamp. Both
+// encoding/json and goccy/go-json serialise a zero time.Time value
+// as "0001-01-01T00:00:00Z" rather than dropping it, so the SPA
+// would render an ancient date instead of the "—" placeholder its
+// `created_at ? formatted : "—"` guard implies. The pointer makes
+// the absent-vs-zero distinction explicit on the wire.
 type QueueSummary struct {
 	Name       string            `json:"name"`
 	IsFIFO     bool              `json:"is_fifo"`
 	Generation uint64            `json:"generation"`
-	CreatedAt  time.Time         `json:"created_at,omitempty"`
+	CreatedAt  *time.Time        `json:"created_at,omitempty"`
 	Attributes map[string]string `json:"attributes,omitempty"`
 	Counters   QueueCounters     `json:"counters"`
 }

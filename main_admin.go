@@ -179,15 +179,26 @@ func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.
 // admin.QueueSummary. Counter fields are int64 on both sides; if
 // either side grows a field, this function should be extended in the
 // same commit so a compile error catches the drift.
+//
+// CreatedAt collapses a zero time.Time on the adapter side (queues
+// stored before CreatedAtMillis was populated, or never populated)
+// to a nil pointer on the admin side so omitempty actually drops the
+// field at the wire layer. Without this collapse the SPA would see
+// "0001-01-01T00:00:00Z" and render an ancient date.
 func convertAdminQueueSummary(in *adapter.AdminQueueSummary) *admin.QueueSummary {
 	if in == nil {
 		return nil
+	}
+	var createdAt *time.Time
+	if !in.CreatedAt.IsZero() {
+		t := in.CreatedAt
+		createdAt = &t
 	}
 	return &admin.QueueSummary{
 		Name:       in.Name,
 		IsFIFO:     in.IsFIFO,
 		Generation: in.Generation,
-		CreatedAt:  in.CreatedAt,
+		CreatedAt:  createdAt,
 		Attributes: in.Attributes,
 		Counters: admin.QueueCounters{
 			Visible:    in.Counters.Visible,

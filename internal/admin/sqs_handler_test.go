@@ -170,6 +170,32 @@ func TestSqsHandler_ListQueues_EmptyArrayNotNull(t *testing.T) {
 		"empty catalog must serialise as [] not null; body=%s", rec.Body.String())
 }
 
+// TestSqsHandler_DescribeQueue_ZeroCreatedAtIsOmittedOnTheWire pins
+// the wire-level fix for the Codex P2 finding on PR #670: time.Time
+// with `omitempty` does NOT get dropped by encoding/json or
+// goccy/go-json when zero — it serialises as "0001-01-01T00:00:00Z"
+// and the SPA renders an ancient date instead of "—". The fix
+// switched QueueSummary.CreatedAt to *time.Time and the bridge
+// converts a zero time.Time to nil. This test exercises the wire
+// representation, not the Go-side IsZero() check the adapter unit
+// test already pins.
+func TestSqsHandler_DescribeQueue_ZeroCreatedAtIsOmittedOnTheWire(t *testing.T) {
+	// AdminDescribeQueue stub returns a QueueSummary with no CreatedAt
+	// set (nil pointer, the post-bridge representation of an unknown
+	// CreatedAtMillis).
+	src := &stubQueuesSource{queues: []string{"orders"}}
+	h := NewSqsHandler(src)
+	req := httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	require.NotContains(t, body, "0001-01-01T00:00:00Z",
+		"a queue with no wall-clock timestamp must not surface the Go zero time on the wire; body=%s", body)
+	require.NotContains(t, body, `"created_at":`,
+		"created_at must be omitted entirely when the queue has no wall-clock timestamp so the SPA renders the placeholder; body=%s", body)
+}
+
 // helper to silence the unused-import warning when errors is only
 // referenced inside one of the test functions.
 var _ = errors.New

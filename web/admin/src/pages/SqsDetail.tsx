@@ -1,19 +1,24 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
-import { useAuth } from "../auth";
 import { Modal } from "../components/Modal";
 import { formatApiError, useApiQuery } from "../lib/useApi";
 
 export function SqsDetailPage() {
   const { name = "" } = useParams<{ name: string }>();
-  const { session } = useAuth();
   const detail = useApiQuery((signal) => api.describeQueue(name, signal), [name]);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const navigate = useNavigate();
-  const writeAllowed = session?.role === "full";
+  // The delete button is gated by the backend's live-role check
+  // (internal/admin/sqs_handler.go principalForWrite), not the JWT
+  // role cached in this session. A JWT minted as read_only stays
+  // read_only in the cookie until logout, but the operator may have
+  // been promoted to full in the live role store after login — so
+  // gating the button on session.role would hide it for users who
+  // are currently authorized. A read_only operator who clicks delete
+  // gets a 403 from the backend, surfaced in the modal's error area.
 
   const onDelete = async () => {
     setDeleting(true);
@@ -37,7 +42,7 @@ export function SqsDetailPage() {
             {detail.data.is_fifo ? "FIFO" : "Standard"}
           </span>
         )}
-        {writeAllowed && detail.data && (
+        {detail.data && (
           <button
             type="button"
             className="btn-danger ml-auto"
