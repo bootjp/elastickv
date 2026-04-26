@@ -112,7 +112,7 @@ type sqsQueueMeta struct {
 
 The pattern is the same: each attribute participates in a routing or dedup decision whose correctness depends on every existing message having been written under a single, consistent value. Live mutation creates a "before" set and an "after" set with incompatible invariants that the runtime cannot reconcile without a full drain.
 
-**Enforcement (gate is `CreateQueue`, not first send)**: when `SetQueueAttributes` is called, the validator loads the current `sqsQueueMeta` (one Raft-consistent point read against the catalog — already required for the OCC compare-and-set) and rejects with `InvalidAttributeValue` if any of the three attributes in the request differs from the value already on the meta. No range scan over the message keyspace is required; no `firstSendAt` timestamp needs to be added; no concurrent-send race exists, because the meta value is set once at `CreateQueue` commit and never changes thereafter. This matches AWS's published behaviour ("you can't change the queue type after you create it" extends to `FifoThroughputLimit` and `DeduplicationScope` in HT-FIFO queues), so SDK clients see the same rejection envelope on the same request as on AWS proper. Picking the create-time gate over a first-send gate is also defensible from a correctness lens: the corner case "operator creates a queue with `PartitionCount=8` and changes their mind to `PartitionCount=4` before any producer connects" is rare and can be solved by `DeleteQueue`+`CreateQueue` (which the operator can also do post-first-send for any other reason). The simplicity of a stateless validator is worth more than the vanishingly small set of operators who would benefit from a brief mutability window.
+**Enforcement (gate is `CreateQueue`, not first send)**: when `SetQueueAttributes` is called, the validator loads the current `sqsQueueMeta` (one Raft-consistent point read against the catalog — already required for the OCC compare-and-set) and rejects with `InvalidAttributeValue` if any of the three attributes in the request differs from the value already on the meta. **`SetQueueAttributes` is all-or-nothing**: if any immutable attribute in the request carries a differing value, the entire request is rejected before any attribute is persisted — including the *mutable* attributes in the same call (e.g. `VisibilityTimeout` paired with an attempted `PartitionCount` change is rejected as a whole; the `VisibilityTimeout` change does not commit on its own). The §9 immutability test pins this rule. No range scan over the message keyspace is required; no `firstSendAt` timestamp needs to be added; no concurrent-send race exists, because the meta value is set once at `CreateQueue` commit and never changes thereafter. This matches AWS's published behaviour ("you can't change the queue type after you create it" extends to `FifoThroughputLimit` and `DeduplicationScope` in HT-FIFO queues), so SDK clients see the same rejection envelope on the same request as on AWS proper. Picking the create-time gate over a first-send gate is also defensible from a correctness lens: the corner case "operator creates a queue with `PartitionCount=8` and changes their mind to `PartitionCount=4` before any producer connects" is rare and can be solved by `DeleteQueue`+`CreateQueue` (which the operator can also do post-first-send for any other reason). The simplicity of a stateless validator is worth more than the vanishingly small set of operators who would benefit from a brief mutability window.
 
 ### 3.3 Routing
 
@@ -194,11 +194,19 @@ ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under par
 3. Set deadline := start + WaitTimeSeconds (capped at the AWS-defined
    maximum of 20s). All sub-calls share this deadline.
 4. For each partitionIndex in partitionOrder, until MaxNumberOfMessages
-   are collected, the deadline expires, or every partition has been
-   tried:
+   are collected or every partition has been tried:
      a. Compute remainingWait := max(0, deadline - now()). Pass it as
         WaitTimeSeconds to the sub-call (so the per-partition long-poll
-        is bounded by the remaining global budget).
+        is bounded by the remaining global budget). When remainingWait
+        reaches 0, **continue iterating remaining unvisited partitions
+        with WaitTimeSeconds=0 (non-blocking point-read)** rather than
+        breaking immediately — a consumer must not miss a message that
+        is already visible on an unvisited partition simply because the
+        long-poll budget ran out mid-loop. The loop terminates only on
+        the two conditions named above (MaxNumberOfMessages collected,
+        or every partition tried even non-blockingly). The "deadline
+        expires" condition therefore degrades long-poll calls to point
+        reads, it does not cut the fanout short.
      b. Resolve the leader for (queue, partitionIndex).
      c. If this node is the leader: scan locally, deliver candidates,
         long-polling for at most remainingWait.
