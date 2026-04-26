@@ -13,7 +13,7 @@ import (
 // stubQueuesSource is the in-memory test double for SqsHandler.
 // Mirrors stubTablesSource in dynamo_handler_test.go: records the
 // principal that flowed through to the source so tests can assert
-// live-role forwarding (Codex P2 + Claude P1 on PR #670).
+// live-role forwarding.
 type stubQueuesSource struct {
 	queues              []string
 	describeErr         error
@@ -54,7 +54,7 @@ func (s *stubQueuesSource) AdminDeleteQueue(_ context.Context, principal AuthPri
 }
 
 // TestSqsHandler_DeleteQueue_LivePromotion pins the live-role
-// forwarding fix for PR #670: a JWT minted while the access key was
+// forwarding contract: a JWT minted while the access key was
 // read_only must, after the operator promotes the key to full in
 // the live RoleStore, be allowed to delete *and* the principal
 // arriving at AdminDeleteQueue must carry the live role (full),
@@ -157,8 +157,9 @@ func TestSqsHandler_DeleteQueue_NoRoleStore(t *testing.T) {
 }
 
 // TestSqsHandler_ListQueues_EmptyArrayNotNull pins the nil→[]
-// normalisation added in the Gemini PR #670 medium fix. Without it
-// the SPA crashes on `queues.length` access against null.
+// normalisation in the list handler. Without it the empty-catalog
+// case serialises as `{"queues": null}` and the SPA crashes on
+// `queues.length` against null.
 func TestSqsHandler_ListQueues_EmptyArrayNotNull(t *testing.T) {
 	src := &stubQueuesSource{queues: nil}
 	h := NewSqsHandler(src)
@@ -171,8 +172,9 @@ func TestSqsHandler_ListQueues_EmptyArrayNotNull(t *testing.T) {
 }
 
 // TestSqsHandler_DescribeQueue_ZeroCreatedAtIsOmittedOnTheWire pins
-// the wire-level fix for the Codex P2 finding on PR #670: time.Time
-// with `omitempty` does NOT get dropped by encoding/json or
+// the wire-level contract that a queue with no wall-clock creation
+// timestamp does not surface a Go-zero time.Time on the wire.
+// time.Time with `omitempty` is NOT dropped by encoding/json or
 // goccy/go-json when zero — it serialises as "0001-01-01T00:00:00Z"
 // and the SPA renders an ancient date instead of "—". The fix
 // switched QueueSummary.CreatedAt to *time.Time and the bridge
