@@ -764,7 +764,7 @@ func startServers(in serversInput) error {
 	// the handler hands ErrTablesNotLeader writes to the forwarder
 	// which dials the leader over the cached gRPC pool. Without these
 	// the handler falls back to 503 + Retry-After:1.
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, in.coordinate, connCache, in.keyvizSampler); err != nil {
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -1309,6 +1309,12 @@ type runtimeServerRunner struct {
 	// 404, mirroring the dynamoServer == nil contract.
 	s3Server *adapter.S3Server
 
+	// sqsServer plays the same role for the SQS admin entrypoints
+	// (adapter/sqs_admin.go). Nil when --sqsAddress is empty; the
+	// admin listener then leaves /admin/api/v1/sqs/* off the wire
+	// (the mux 404s those paths).
+	sqsServer *adapter.SQSServer
+
 	// roleStore is the access-key → role index the leader-side
 	// gRPC AdminForward service uses to re-validate the principal
 	// on every forwarded write. Mirrors what admin.Config.RoleIndex
@@ -1362,9 +1368,11 @@ func (r *runtimeServerRunner) start() error {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	r.s3Server = s3Server
-	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile); err != nil {
+	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile)
+	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
+	r.sqsServer = sqsServer
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
