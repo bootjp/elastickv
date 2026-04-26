@@ -237,6 +237,29 @@ flagged as a structural prerequisite.
    `len(conf.Learners) > 0` is no longer rejected. Joint-consensus
    markers (`VotersOutgoing`, `LearnersNext`, `AutoLeave`) stay rejected
    — learner add/promote uses the simple V1 path which never sets them.
+
+   The voter-count comparison inside `validateConfState`
+   (`len(conf.Voters) != len(expected.Voters)`) currently builds
+   `expected` via `confStateForPeers(peers)`, which emits **every**
+   `Peer` as a voter. Once a learner has been persisted to the v2 peers
+   file, the peers slice passed in by `validateOpenPeers` is mixed
+   voter + learner. Without a fix, `expected.Voters` would be longer
+   than `conf.Voters` and the node would refuse to restart with
+   `errClusterMismatch`. Two valid resolutions, both kept inside
+   `wal_store.go`:
+
+   - **(a) Filter at the comparison.** `validateConfState` builds its
+     own `expected` voter set from `peers` filtered by
+     `Suffrage != "learner"`, and compares both `Voters` and
+     `Learners` element-wise against the snapshot's `ConfState`.
+   - **(b) Add a sibling helper.** Introduce
+     `confStateWithLearners(peers []Peer) raftpb.ConfState` used only
+     by `validateConfState`; leave `confStateForPeers` voters-only as
+     §4.3 documents.
+
+   Resolution (a) is preferred: it keeps the cold-bootstrap helper
+   minimal and isolates the validation-time peer-filtering logic next
+   to the comparison that needs it.
 4. **`upsertPeer` stops owning `e.config.Servers`.** Today it does two
    jobs: refresh the address cache `e.peers`, and stamp a
    `raftengine.Server{Suffrage: "voter"}` into `e.config.Servers`. Once
@@ -477,15 +500,40 @@ moment any cluster has a single learner attached.
 #### Voter-count cache
 
 Introduce a single event-loop-owned field `e.voterCount int` (and a
-companion `e.isLearnerNode map[uint64]bool` keyed by node ID). Both are
-**only written from the apply loop** in `applyConfigChange` /
-`applyConfigChangeV2`, **after** `rawNode.ApplyConfChange(...)` returns
-the new `ConfState`. They are derived directly from
-`conf.Voters` / `conf.Learners`. This piggybacks on the existing
-single-writer invariant for the apply loop: no extra mutex needed, no
-type-assertion contortion. Readers on the lease hot path read these
-fields under the same `e.mu` they already take for `e.peers`, so the
-critical section grows by one int load.
+companion `e.isLearnerNode map[uint64]bool` keyed by node ID).
+
+**Initialization at Open time.** `refreshStatus()` runs once during
+`Open` before the apply loop processes any entry, so the cache must
+have a correct value before that call. Wire it up adjacent to the
+existing `e.config` initialization that already reads
+`prepared.disk.LocalSnap.Metadata.ConfState`:
+
+```go
+// existing
+config: configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
+// added
+voterCount:    len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
+isLearnerNode: learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
+```
+
+Without this, a 3-voter cluster boots with `voterCount == 0`, which
+would falsely activate the single-node fast path in `refreshStatus`
+on the very first tick.
+
+**Steady-state writes.** After Open, both fields are **only written
+from the apply loop** in `applyConfigChange` /
+`applyConfigChangeV2`, **after** `rawNode.ApplyConfChange(...)`
+returns the new `ConfState`. They are derived directly from
+`conf.Voters` / `conf.Learners` and **rebuilt from scratch** on each
+conf change — not incrementally patched. A patched form
+(`e.isLearnerNode[nodeID] = true`) would leak stale `true` entries
+after a learner is promoted; a full rebuild from `conf.Learners` is
+the only safe form. This piggybacks on the existing single-writer
+invariant for the apply loop: no extra mutex needed.
+
+Readers on the lease hot path read these fields under the same
+`e.mu` they already take for `e.peers`, so the critical section
+grows by one int load and one map lookup.
 
 #### Call-site fixes (all four `len(e.peers)` overloads)
 
@@ -791,7 +839,7 @@ After Milestone 3, rename
    absolute form is simpler to validate; the tolerance form is easier
    for an operator to choose. Current proposal: absolute, with a
    helper in the runbook that computes "current leader commit minus N".
-2a. **`min_applied_index = 0` footgun.** The proposal accepts `0` as
+3. **`min_applied_index = 0` footgun.** The proposal accepts `0` as
    "skip the precondition" to stay symmetric with `prevIndex` on the
    same RPC family. But `prevIndex == 0` is a common no-op skip
    pattern, while `min_applied_index == 0` semantically *removes the
