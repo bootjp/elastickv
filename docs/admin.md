@@ -174,32 +174,53 @@ should look at Raft leader-churn logs first.
 
 ## Audit log
 
-Every state-changing admin request emits a structured slog line at
-`INFO` level on the leader's stdout (or wherever the process slog
-handler is wired). Two shapes:
+Every state-changing admin request emits structured slog lines at
+`INFO` level under the `admin_audit` key on the leader's stdout (or
+wherever the process slog handler is wired). A single state-changing
+request typically produces **two** audit lines: one operation-specific
+line from the source that performed the mutation, plus one generic
+HTTP-shaped line from the `Audit` middleware. The shapes differ by
+source — log parsers should treat the `admin_audit` key as a union
+and dispatch on the fields present.
 
-**Leader-direct write** (`DynamoHandler` / `S3Handler` after a
-successful mutation):
+**`Audit` middleware** — emitted for every non-GET/HEAD/OPTIONS
+request that reaches the admin mux on this node, regardless of which
+handler served it. Always present on the node that received the HTTP
+request (which may be a follower if the request was then forwarded):
+
+```
+admin_audit actor=AKIA_ADMIN role=full method=POST path=/admin/api/v1/buckets status=201 remote=10.0.0.7:51234 duration=8.2ms
+```
+
+**`S3Handler` operation line** — emitted on the leader after a
+successful bucket mutation. Only the S3 admin path emits these; the
+DynamoDB admin path relies on the middleware line plus the forwarded
+line below for its audit trail:
 
 ```
 admin_audit actor=AKIA_ADMIN role=full operation=create_bucket bucket=my-bucket
-admin_audit actor=AKIA_ADMIN role=full operation=delete_table table=orders
+admin_audit actor=AKIA_ADMIN role=full operation=put_bucket_acl bucket=my-bucket acl=public-read
+admin_audit actor=AKIA_ADMIN role=full operation=delete_bucket bucket=my-bucket
 ```
 
-**Forwarded write** (logged by the leader's `ForwardServer` after a
-follower handed the request off):
+**`ForwardServer` operation line** — emitted on the leader when a
+follower forwarded the request via `AdminForward`. Carries the
+originating follower's node ID in `forwarded_from`. Covers both
+DynamoDB and S3 admin operations:
 
 ```
+admin_audit actor=AKIA_ADMIN role=full forwarded_from=n2 operation=create_table table=orders
+admin_audit actor=AKIA_ADMIN role=full forwarded_from=n2 operation=delete_table table=orders
 admin_audit actor=AKIA_ADMIN role=full forwarded_from=n2 operation=put_bucket_acl bucket=my-bucket acl=public-read
 ```
 
-`forwarded_from` is the originating follower's node ID. CR and LF
-in that field are stripped at the entry point — a hostile follower
-cannot split a single audit line into two by smuggling control
-characters into its node ID.
+CR and LF in `forwarded_from` are stripped at the entry point — a
+hostile follower cannot split a single audit line into two by
+smuggling control characters into its node ID.
 
-Login and logout emit their own audit lines (`action=login` /
-`action=logout`) so the JWT's lifetime can be correlated with the
+Login and logout emit their own `admin_audit` lines with
+`action=login` / `action=logout` (plus `actor`, `claimed_actor`,
+`remote`, `status`) so the JWT's lifetime can be correlated with the
 mutations it authorised.
 
 ## Troubleshooting
@@ -220,11 +241,21 @@ read the TLS section above before doing so).
 
 ### Login returns 401 invalid_credentials
 
-The access key + secret pair did not match the credentials file, or
-the key is not listed in `-adminFullAccessKeys` /
-`-adminReadOnlyAccessKeys`. The dashboard does not distinguish the
-two cases on the wire — both produce 401 — but the leader's audit
-log shows the precise reason.
+The access key + secret pair did not match an entry in
+`-s3CredentialsFile`. Either the access key is unknown or the secret
+is wrong. Verify the credentials file is the one the running process
+loaded (it is read once at startup) and that the secret matches
+exactly — secrets are compared with `subtle.ConstantTimeCompare`, so
+trailing whitespace counts.
+
+### Login returns 403 forbidden
+
+The credentials matched, but the access key is not listed in either
+`-adminFullAccessKeys` or `-adminReadOnlyAccessKeys`. This is a
+distinct case from the 401 above: the operator has valid SigV4
+credentials for the data plane but no admin role assignment. Add the
+key to one of the role flags and **restart every node** so each
+node's live role index picks up the change.
 
 ### Write returns 403 forbidden
 
