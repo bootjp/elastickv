@@ -700,6 +700,141 @@ func TestS3Handler_WriteEndpoints_ValidationErrorReturns400(t *testing.T) {
 	})
 }
 
+// notLeaderBucketsSource simulates a follower's BucketsSource — every
+// write path returns ErrBucketsNotLeader. Used to exercise the
+// tryForward* integration path on S3Handler.
+type notLeaderBucketsSource struct {
+	stubBucketsSource
+}
+
+func (s *notLeaderBucketsSource) AdminCreateBucket(_ context.Context, _ AuthPrincipal, _ CreateBucketRequest) (*BucketSummary, error) {
+	return nil, ErrBucketsNotLeader
+}
+
+func (s *notLeaderBucketsSource) AdminPutBucketAcl(_ context.Context, _ AuthPrincipal, _ string, _ string) error {
+	return ErrBucketsNotLeader
+}
+
+func (s *notLeaderBucketsSource) AdminDeleteBucket(_ context.Context, _ AuthPrincipal, _ string) error {
+	return ErrBucketsNotLeader
+}
+
+func TestS3Handler_CreateBucket_ForwardsOnNotLeader(t *testing.T) {
+	src := &notLeaderBucketsSource{}
+	fwd := &stubLeaderForwarder{createBucketRes: &ForwardResult{
+		StatusCode:  http.StatusCreated,
+		Payload:     []byte(`{"bucket_name":"public-assets","acl":"public-read"}`),
+		ContentType: "application/json; charset=utf-8",
+	}}
+	h := NewS3Handler(src).WithLeaderForwarder(fwd)
+	req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
+		strings.NewReader(validCreateBucketBody()))
+	req = withFullPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.Equal(t, "public-assets", fwd.lastCreateBucketInput.BucketName,
+		"forwarder must be invoked when source returns ErrBucketsNotLeader")
+	require.JSONEq(t, `{"bucket_name":"public-assets","acl":"public-read"}`, rec.Body.String())
+}
+
+func TestS3Handler_DeleteBucket_ForwardsOnNotLeader(t *testing.T) {
+	src := &notLeaderBucketsSource{}
+	fwd := &stubLeaderForwarder{deleteBucketRes: &ForwardResult{
+		StatusCode:  http.StatusNoContent,
+		ContentType: "application/json; charset=utf-8",
+	}}
+	h := NewS3Handler(src).WithLeaderForwarder(fwd)
+	req := httptest.NewRequest(http.MethodDelete, pathS3Buckets+"/orders", nil)
+	req = withFullPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, "orders", fwd.lastDeleteBucketName)
+}
+
+func TestS3Handler_PutBucketAcl_ForwardsOnNotLeader(t *testing.T) {
+	src := &notLeaderBucketsSource{}
+	fwd := &stubLeaderForwarder{putACLRes: &ForwardResult{
+		StatusCode:  http.StatusNoContent,
+		ContentType: "application/json; charset=utf-8",
+	}}
+	h := NewS3Handler(src).WithLeaderForwarder(fwd)
+	req := httptest.NewRequest(http.MethodPut, pathS3Buckets+"/orders/acl",
+		strings.NewReader(`{"acl":"public-read"}`))
+	req = withFullPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, "orders", fwd.lastPutACLBucket)
+	require.Equal(t, "public-read", fwd.lastPutACLValue)
+}
+
+func TestS3Handler_CreateBucket_ForwarderLeaderUnavailableReturns503(t *testing.T) {
+	// ErrLeaderUnavailable from the forwarder layer maps to 503 +
+	// Retry-After:1 — the SPA's retry contract is uniform whether
+	// the leader is briefly absent or the network hiccupped.
+	src := &notLeaderBucketsSource{}
+	fwd := &stubLeaderForwarder{createBucketErr: ErrLeaderUnavailable}
+	h := NewS3Handler(src).WithLeaderForwarder(fwd)
+	req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
+		strings.NewReader(validCreateBucketBody()))
+	req = withFullPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+	require.Contains(t, rec.Body.String(), "leader_unavailable")
+}
+
+func TestS3Handler_CreateBucket_ForwarderTransportErrorReturns503(t *testing.T) {
+	// Generic gRPC error → 503 + Retry-After. The error is logged
+	// on the server but never surfaces to the SPA.
+	src := &notLeaderBucketsSource{}
+	fwd := &stubLeaderForwarder{createBucketErr: errors.New("gRPC sentinel TX-1")}
+	h := NewS3Handler(src).WithLeaderForwarder(fwd)
+	req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
+		strings.NewReader(validCreateBucketBody()))
+	req = withFullPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+	require.NotContains(t, rec.Body.String(), "TX-1",
+		"transport error detail must not leak to the client")
+}
+
+func TestS3Handler_CreateBucket_ForwarderNotInvokedForNonNotLeader(t *testing.T) {
+	// The forwarder gate must run ONLY on ErrBucketsNotLeader; a
+	// generic source error or AlreadyExists must fall through to
+	// writeBucketsError. Otherwise a leader-direct 409 would be
+	// silently re-applied at the leader.
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+	}{
+		{"already_exists", ErrBucketsAlreadyExists, http.StatusConflict},
+		{"forbidden", ErrBucketsForbidden, http.StatusForbidden},
+		{"generic", errors.New("opaque storage failure"), http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fwd := &stubLeaderForwarder{}
+			src := &stubBucketsSource{createErr: tc.err}
+			h := NewS3Handler(src).WithLeaderForwarder(fwd)
+			req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
+				strings.NewReader(validCreateBucketBody()))
+			req = withFullPrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, tc.wantCode, rec.Code)
+			require.Empty(t, fwd.lastCreateBucketInput.BucketName,
+				"forwarder must not be invoked for source error: %s", tc.name)
+		})
+	}
+}
+
 func TestS3Handler_WriteEndpoints_RejectMissingPrincipal(t *testing.T) {
 	// Without a session principal in the context, writes must
 	// 401 — SessionAuth normally enforces this; principalForWrite

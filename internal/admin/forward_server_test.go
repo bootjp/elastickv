@@ -445,3 +445,174 @@ func TestForwardServer_DoesNotLogStructuredSourceErrors(t *testing.T) {
 		})
 	}
 }
+
+// newForwardServerWithBucketsForTest is the slice 2b counterpart of
+// newForwardServerForTest: wires both a TablesSource (zero-value) and
+// a BucketsSource so the bucket-side dispatch tests can mutate the
+// inputs without rebuilding the role-lookup boilerplate.
+func newForwardServerWithBucketsForTest(buckets BucketsSource, roles MapRoleStore) *ForwardServer {
+	return NewForwardServer(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, roles, nil).
+		WithBucketsSource(buckets)
+}
+
+func TestForwardServer_CreateBucket_HappyPath(t *testing.T) {
+	buckets := &stubBucketsSource{}
+	srv := newForwardServerWithBucketsForTest(buckets, fullPrincipalRoleStore())
+	body := CreateBucketRequest{BucketName: "public-assets", ACL: "public-read"}
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal:     &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation:     pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
+		Payload:       mustJSON(t, body),
+		ForwardedFrom: "node-2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusCreated), resp.GetStatusCode())
+	require.Equal(t, "public-assets", buckets.lastCreateInput.BucketName)
+	require.Equal(t, RoleFull, buckets.lastCreatePrincipal.Role)
+	var summary BucketSummary
+	require.NoError(t, json.Unmarshal(resp.GetPayload(), &summary))
+	require.Equal(t, "public-assets", summary.Name)
+}
+
+func TestForwardServer_CreateBucket_NoBucketsSourceReturns501(t *testing.T) {
+	// Builds without S3 do not call WithBucketsSource; the leader
+	// must still reject CREATE_BUCKET cleanly with 501 instead of
+	// reaching for a nil receiver and panicking.
+	srv := newForwardServerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}}, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
+		Payload:   mustJSON(t, CreateBucketRequest{BucketName: "x"}),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusNotImplemented), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "not_implemented")
+}
+
+func TestForwardServer_CreateBucket_BadJSONReturns400(t *testing.T) {
+	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
+		Payload:   []byte("{not json"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "invalid_body")
+}
+
+func TestForwardServer_CreateBucket_AlreadyExistsReturns409(t *testing.T) {
+	buckets := &stubBucketsSource{
+		buckets:   map[string]BucketSummary{"existing": {Name: "existing"}},
+		createErr: ErrBucketsAlreadyExists,
+	}
+	srv := newForwardServerWithBucketsForTest(buckets, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
+		Payload:   mustJSON(t, CreateBucketRequest{BucketName: "existing"}),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusConflict), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "already_exists")
+}
+
+func TestForwardServer_DeleteBucket_HappyPath(t *testing.T) {
+	buckets := &stubBucketsSource{
+		buckets: map[string]BucketSummary{"orders": {Name: "orders"}},
+	}
+	srv := newForwardServerWithBucketsForTest(buckets, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_BUCKET,
+		Payload:   []byte(`{"name":"orders"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusNoContent), resp.GetStatusCode())
+	require.Equal(t, "orders", buckets.lastDeleteName)
+}
+
+func TestForwardServer_DeleteBucket_NotEmptyReturns409(t *testing.T) {
+	buckets := &stubBucketsSource{deleteErr: ErrBucketsNotEmpty}
+	srv := newForwardServerWithBucketsForTest(buckets, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_BUCKET,
+		Payload:   []byte(`{"name":"orders"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusConflict), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "bucket_not_empty")
+}
+
+func TestForwardServer_DeleteBucket_RejectsSlashInName(t *testing.T) {
+	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_DELETE_BUCKET,
+		Payload:   []byte(`{"name":"foo/bar"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "must not contain")
+}
+
+func TestForwardServer_PutBucketAcl_HappyPath(t *testing.T) {
+	buckets := &stubBucketsSource{
+		buckets: map[string]BucketSummary{"orders": {Name: "orders", ACL: "private"}},
+	}
+	srv := newForwardServerWithBucketsForTest(buckets, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL,
+		Payload:   []byte(`{"name":"orders","acl":"public-read"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusNoContent), resp.GetStatusCode())
+	require.Equal(t, "orders", buckets.lastPutACLBucket)
+	require.Equal(t, "public-read", buckets.lastPutACLValue)
+}
+
+func TestForwardServer_PutBucketAcl_RejectsMissingACL(t *testing.T) {
+	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL,
+		Payload:   []byte(`{"name":"orders"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+	require.Contains(t, string(resp.GetPayload()), "missing acl")
+}
+
+func TestForwardServer_PutBucketAcl_RejectsSlashInName(t *testing.T) {
+	srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
+	resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+		Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+		Operation: pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL,
+		Payload:   []byte(`{"name":"foo/bar","acl":"private"}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusBadRequest), resp.GetStatusCode())
+}
+
+func TestForwardServer_BucketOps_PayloadTooLargeReturns413(t *testing.T) {
+	cases := []pb.AdminOperation{
+		pb.AdminOperation_ADMIN_OP_CREATE_BUCKET,
+		pb.AdminOperation_ADMIN_OP_DELETE_BUCKET,
+		pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL,
+	}
+	for _, op := range cases {
+		t.Run(op.String(), func(t *testing.T) {
+			srv := newForwardServerWithBucketsForTest(&stubBucketsSource{}, fullPrincipalRoleStore())
+			big := make([]byte, adminForwardPayloadLimit+1)
+			resp, err := srv.Forward(context.Background(), &pb.AdminForwardRequest{
+				Principal: &pb.AdminPrincipal{AccessKey: "AKIA_FULL", Role: "full"},
+				Operation: op,
+				Payload:   big,
+			})
+			require.NoError(t, err)
+			require.Equal(t, int32(http.StatusRequestEntityTooLarge), resp.GetStatusCode())
+		})
+	}
+}

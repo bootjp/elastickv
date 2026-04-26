@@ -20,11 +20,28 @@ type stubLeaderForwarder struct {
 	createErr error
 	deleteRes *ForwardResult
 	deleteErr error
+	// Bucket-side counterparts ship with P2 slice 2b. Tests that
+	// only exercise Dynamo behaviour leave these zero values; the
+	// stub honours the same nil-result-and-no-error contract the
+	// table side uses on a "did not call us" path.
+	createBucketRes *ForwardResult
+	createBucketErr error
+	deleteBucketRes *ForwardResult
+	deleteBucketErr error
+	putACLRes       *ForwardResult
+	putACLErr       error
 
-	lastCreatePrincipal AuthPrincipal
-	lastCreateInput     CreateTableRequest
-	lastDeletePrincipal AuthPrincipal
-	lastDeleteName      string
+	lastCreatePrincipal       AuthPrincipal
+	lastCreateInput           CreateTableRequest
+	lastDeletePrincipal       AuthPrincipal
+	lastDeleteName            string
+	lastCreateBucketPrincipal AuthPrincipal
+	lastCreateBucketInput     CreateBucketRequest
+	lastDeleteBucketPrincipal AuthPrincipal
+	lastDeleteBucketName      string
+	lastPutACLPrincipal       AuthPrincipal
+	lastPutACLBucket          string
+	lastPutACLValue           string
 }
 
 func (s *stubLeaderForwarder) ForwardCreateTable(_ context.Context, principal AuthPrincipal, in CreateTableRequest) (*ForwardResult, error) {
@@ -43,6 +60,34 @@ func (s *stubLeaderForwarder) ForwardDeleteTable(_ context.Context, principal Au
 		return nil, s.deleteErr
 	}
 	return s.deleteRes, nil
+}
+
+func (s *stubLeaderForwarder) ForwardCreateBucket(_ context.Context, principal AuthPrincipal, in CreateBucketRequest) (*ForwardResult, error) {
+	s.lastCreateBucketPrincipal = principal
+	s.lastCreateBucketInput = in
+	if s.createBucketErr != nil {
+		return nil, s.createBucketErr
+	}
+	return s.createBucketRes, nil
+}
+
+func (s *stubLeaderForwarder) ForwardDeleteBucket(_ context.Context, principal AuthPrincipal, name string) (*ForwardResult, error) {
+	s.lastDeleteBucketPrincipal = principal
+	s.lastDeleteBucketName = name
+	if s.deleteBucketErr != nil {
+		return nil, s.deleteBucketErr
+	}
+	return s.deleteBucketRes, nil
+}
+
+func (s *stubLeaderForwarder) ForwardPutBucketAcl(_ context.Context, principal AuthPrincipal, name, acl string) (*ForwardResult, error) {
+	s.lastPutACLPrincipal = principal
+	s.lastPutACLBucket = name
+	s.lastPutACLValue = acl
+	if s.putACLErr != nil {
+		return nil, s.putACLErr
+	}
+	return s.putACLRes, nil
 }
 
 // notLeaderSource is a TablesSource that always returns

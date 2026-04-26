@@ -37,19 +37,33 @@ const adminForwardPayloadLimit = 64 << 10
 type ForwardServer struct {
 	pb.UnimplementedAdminForwardServer
 
-	source TablesSource
-	roles  RoleStore
-	logger *slog.Logger
+	source  TablesSource
+	buckets BucketsSource
+	roles   RoleStore
+	logger  *slog.Logger
 }
 
 // NewForwardServer wires a TablesSource and a RoleStore behind the
 // gRPC AdminForward service. logger may be nil; defaults to
-// slog.Default().
+// slog.Default(). The S3 BucketsSource is plumbed via WithBucketsSource
+// so deployments that ship without the S3 adapter can still register
+// the gRPC service for Dynamo forwarding.
 func NewForwardServer(source TablesSource, roles RoleStore, logger *slog.Logger) *ForwardServer {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &ForwardServer{source: source, roles: roles, logger: logger}
+}
+
+// WithBucketsSource enables S3 admin operation forwarding. Returns
+// the receiver so wiring code can chain the call:
+// `NewForwardServer(...).WithBucketsSource(...)`. A nil BucketsSource
+// leaves S3 forwarding disabled — the Forward dispatcher rejects
+// CREATE_BUCKET / DELETE_BUCKET / PUT_BUCKET_ACL with 501 in that
+// case so a follower can detect the missing capability.
+func (s *ForwardServer) WithBucketsSource(b BucketsSource) *ForwardServer {
+	s.buckets = b
+	return s
 }
 
 // Forward is the gRPC entrypoint. It performs the principal
@@ -86,11 +100,25 @@ func (s *ForwardServer) Forward(ctx context.Context, req *pb.AdminForwardRequest
 		return rejectForward(http.StatusForbidden, "forbidden",
 			"this endpoint requires a full-access role")
 	}
+	return s.dispatchForward(ctx, principal, forwardedFrom, req)
+}
+
+// dispatchForward routes the validated request to the per-operation
+// handler. Pulled out so Forward stays under the cyclomatic ceiling
+// as the operation enum grows; the principal-validation +
+// forwarded_from sanitisation logic stays in Forward where it belongs.
+func (s *ForwardServer) dispatchForward(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
 	switch req.GetOperation() {
 	case pb.AdminOperation_ADMIN_OP_CREATE_TABLE:
 		return s.handleCreate(ctx, principal, forwardedFrom, req)
 	case pb.AdminOperation_ADMIN_OP_DELETE_TABLE:
 		return s.handleDelete(ctx, principal, forwardedFrom, req)
+	case pb.AdminOperation_ADMIN_OP_CREATE_BUCKET:
+		return s.handleCreateBucket(ctx, principal, forwardedFrom, req)
+	case pb.AdminOperation_ADMIN_OP_DELETE_BUCKET:
+		return s.handleDeleteBucket(ctx, principal, forwardedFrom, req)
+	case pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL:
+		return s.handlePutBucketAcl(ctx, principal, forwardedFrom, req)
 	case pb.AdminOperation_ADMIN_OP_UNSPECIFIED:
 		return rejectForward(http.StatusBadRequest, "invalid_request", "unknown admin operation")
 	default:
@@ -203,6 +231,211 @@ func (s *ForwardServer) handleDelete(ctx context.Context, principal AuthPrincipa
 	return &pb.AdminForwardResponse{StatusCode: http.StatusNoContent}, nil
 }
 
+// handleCreateBucket dispatches a forwarded POST /s3/buckets call.
+// Mirrors handleCreate (Dynamo) but decodes a CreateBucketRequest
+// and routes through BucketsSource. Returns 501 NotImplemented when
+// no BucketsSource is wired so a follower whose S3 surface was
+// disabled gets a deterministic error instead of a generic 500.
+func (s *ForwardServer) handleCreateBucket(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
+	if s.buckets == nil {
+		return rejectForward(http.StatusNotImplemented, "not_implemented",
+			"S3 admin forwarding is not configured on this leader")
+	}
+	payload := req.GetPayload()
+	if len(payload) > adminForwardPayloadLimit {
+		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
+			"forwarded payload exceeds the 64 KiB admin limit")
+	}
+	if bytes.IndexByte(payload, 0) >= 0 {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"create-bucket payload contains a NUL byte")
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	var body CreateBucketRequest
+	if err := dec.Decode(&body); err != nil {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"create-bucket payload is not valid JSON")
+	}
+	if dec.More() {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"create-bucket payload has trailing data")
+	}
+	if strings.TrimSpace(body.BucketName) == "" {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"bucket_name is required")
+	}
+	summary, err := s.buckets.AdminCreateBucket(ctx, principal, body)
+	if err != nil {
+		s.logUnexpectedSourceError(ctx, "create_bucket", body.BucketName, forwardedFrom, err)
+		return forwardBucketsErrorResponse("create", err), nil
+	}
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
+		slog.String("actor", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("forwarded_from", forwardedFrom),
+		slog.String("operation", "create_bucket"),
+		slog.String("bucket", body.BucketName),
+	)
+	return jsonForwardResponse(http.StatusCreated, summary)
+}
+
+// handleDeleteBucket dispatches a forwarded DELETE
+// /s3/buckets/{name} call. Same payload shape as the Dynamo delete:
+// a JSON object with a single "name" field, which the bridge
+// generates from the URL path.
+func (s *ForwardServer) handleDeleteBucket(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
+	if s.buckets == nil {
+		return rejectForward(http.StatusNotImplemented, "not_implemented",
+			"S3 admin forwarding is not configured on this leader")
+	}
+	payload := req.GetPayload()
+	if len(payload) > adminForwardPayloadLimit {
+		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
+			"forwarded payload exceeds the 64 KiB admin limit")
+	}
+	if bytes.IndexByte(payload, 0) >= 0 {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"delete-bucket payload contains a NUL byte")
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := dec.Decode(&body); err != nil {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"delete-bucket payload is not valid JSON")
+	}
+	if dec.More() {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"delete-bucket payload has trailing data")
+	}
+	if body.Name == "" {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"delete-bucket payload missing name")
+	}
+	if strings.ContainsRune(body.Name, '/') {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"delete-bucket payload name must not contain '/'")
+	}
+	if err := s.buckets.AdminDeleteBucket(ctx, principal, body.Name); err != nil {
+		s.logUnexpectedSourceError(ctx, "delete_bucket", body.Name, forwardedFrom, err)
+		return forwardBucketsErrorResponse("delete", err), nil
+	}
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
+		slog.String("actor", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("forwarded_from", forwardedFrom),
+		slog.String("operation", "delete_bucket"),
+		slog.String("bucket", body.Name),
+	)
+	return &pb.AdminForwardResponse{StatusCode: http.StatusNoContent}, nil
+}
+
+// handlePutBucketAcl dispatches a forwarded PUT
+// /s3/buckets/{name}/acl call. The bridge encodes both the bucket
+// name and the new ACL into the payload so the proto stays
+// operation-agnostic — same approach handleDeleteBucket takes for
+// the bucket name.
+func (s *ForwardServer) handlePutBucketAcl(ctx context.Context, principal AuthPrincipal, forwardedFrom string, req *pb.AdminForwardRequest) (*pb.AdminForwardResponse, error) {
+	if s.buckets == nil {
+		return rejectForward(http.StatusNotImplemented, "not_implemented",
+			"S3 admin forwarding is not configured on this leader")
+	}
+	payload := req.GetPayload()
+	if len(payload) > adminForwardPayloadLimit {
+		return rejectForward(http.StatusRequestEntityTooLarge, "payload_too_large",
+			"forwarded payload exceeds the 64 KiB admin limit")
+	}
+	if bytes.IndexByte(payload, 0) >= 0 {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"put-bucket-acl payload contains a NUL byte")
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	var body struct {
+		Name string `json:"name"`
+		ACL  string `json:"acl"`
+	}
+	if err := dec.Decode(&body); err != nil {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"put-bucket-acl payload is not valid JSON")
+	}
+	if dec.More() {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"put-bucket-acl payload has trailing data")
+	}
+	if body.Name == "" {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"put-bucket-acl payload missing name")
+	}
+	if strings.ContainsRune(body.Name, '/') {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"put-bucket-acl payload name must not contain '/'")
+	}
+	if strings.TrimSpace(body.ACL) == "" {
+		return rejectForward(http.StatusBadRequest, "invalid_body",
+			"put-bucket-acl payload missing acl")
+	}
+	if err := s.buckets.AdminPutBucketAcl(ctx, principal, body.Name, body.ACL); err != nil {
+		s.logUnexpectedSourceError(ctx, "put_bucket_acl", body.Name, forwardedFrom, err)
+		return forwardBucketsErrorResponse("put_acl", err), nil
+	}
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
+		slog.String("actor", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("forwarded_from", forwardedFrom),
+		slog.String("operation", "put_bucket_acl"),
+		slog.String("bucket", body.Name),
+		slog.String("acl", body.ACL),
+	)
+	return &pb.AdminForwardResponse{StatusCode: http.StatusNoContent}, nil
+}
+
+// forwardBucketsErrorResponse re-encodes a BucketsSource error into
+// the structured shape the follower's bridge can re-emit verbatim.
+// Mirrors forwardErrorResponse on the Dynamo side: the same status
+// codes and JSON envelopes the leader-direct HTTP path produces in
+// writeBucketsError.
+func forwardBucketsErrorResponse(op string, err error) *pb.AdminForwardResponse {
+	switch {
+	case errors.Is(err, ErrBucketsForbidden):
+		return mustForwardJSON(http.StatusForbidden,
+			errorResponse{Error: "forbidden", Message: "this endpoint requires a full-access role"})
+	case errors.Is(err, ErrBucketsNotLeader):
+		// Should never happen on the leader path — the leader just
+		// verified itself — but a leadership transfer racing with
+		// the dispatch makes this theoretically reachable. Carry
+		// retry_after_seconds=1 so the follower's bridge translates
+		// it back into an HTTP Retry-After header.
+		resp := mustForwardJSON(http.StatusServiceUnavailable,
+			errorResponse{Error: "leader_unavailable", Message: "leader stepped down mid-request"})
+		resp.RetryAfterSeconds = 1
+		return resp
+	case errors.Is(err, ErrBucketsNotFound):
+		return mustForwardJSON(http.StatusNotFound,
+			errorResponse{Error: "not_found", Message: "bucket does not exist"})
+	case errors.Is(err, ErrBucketsAlreadyExists):
+		return mustForwardJSON(http.StatusConflict,
+			errorResponse{Error: "already_exists", Message: "bucket already exists"})
+	case errors.Is(err, ErrBucketsNotEmpty):
+		return mustForwardJSON(http.StatusConflict,
+			errorResponse{Error: "bucket_not_empty",
+				Message: "bucket still has objects; remove them and retry"})
+	}
+	var verr *ValidationError
+	if errors.As(err, &verr) {
+		return mustForwardJSON(http.StatusBadRequest,
+			errorResponse{Error: "invalid_request", Message: verr.Error()})
+	}
+	return mustForwardJSON(http.StatusInternalServerError,
+		errorResponse{
+			Error:   "s3_" + op + "_failed",
+			Message: "failed to " + op + " bucket; see leader logs",
+		})
+}
+
 // sanitiseForwardedFrom strips CR/LF from a follower-supplied
 // node id so a malicious value cannot split a single audit log
 // line into two when slog is using a text-format handler. JSON
@@ -290,7 +523,12 @@ func isStructuredSourceError(err error) bool {
 	case errors.Is(err, ErrTablesForbidden),
 		errors.Is(err, ErrTablesNotLeader),
 		errors.Is(err, ErrTablesNotFound),
-		errors.Is(err, ErrTablesAlreadyExists):
+		errors.Is(err, ErrTablesAlreadyExists),
+		errors.Is(err, ErrBucketsForbidden),
+		errors.Is(err, ErrBucketsNotLeader),
+		errors.Is(err, ErrBucketsNotFound),
+		errors.Is(err, ErrBucketsAlreadyExists),
+		errors.Is(err, ErrBucketsNotEmpty):
 		return true
 	}
 	var verr *ValidationError
