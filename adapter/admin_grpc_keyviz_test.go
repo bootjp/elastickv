@@ -126,7 +126,7 @@ func TestGetKeyVizMatrixSeriesSelection(t *testing.T) {
 		series pb.KeyVizSeries
 		want   uint64
 	}{
-		{"unspecified defaults to reads", pb.KeyVizSeries_KEYVIZ_SERIES_UNSPECIFIED, 11},
+		{"unspecified defaults to writes", pb.KeyVizSeries_KEYVIZ_SERIES_UNSPECIFIED, 22},
 		{"reads", pb.KeyVizSeries_KEYVIZ_SERIES_READS, 11},
 		{"writes", pb.KeyVizSeries_KEYVIZ_SERIES_WRITES, 22},
 		{"read_bytes", pb.KeyVizSeries_KEYVIZ_SERIES_READ_BYTES, 333},
@@ -212,6 +212,35 @@ func TestGetKeyVizMatrixSurfacesRouteCountTruncation(t *testing.T) {
 	require.Equal(t, uint64(9), r.RouteCount, "route_count must reflect MemberRoutesTotal")
 	require.True(t, r.RouteIdsTruncated, "route_ids_truncated must signal capped membership")
 	require.Equal(t, []uint64{2, 3}, r.RouteIds)
+}
+
+// TestGetKeyVizMatrixClampsRowsBudgetToCap pins design §4.1's
+// upper-bound: rows requests above the keyVizRowBudgetCap are
+// silently clamped down to the cap so a pathological client cannot
+// force the server to materialise an unbounded payload.
+func TestGetKeyVizMatrixClampsRowsBudgetToCap(t *testing.T) {
+	t.Parallel()
+	rows := make([]keyviz.MatrixRow, keyVizRowBudgetCap+5)
+	for i := range rows {
+		idx := uint64(i + 1) //nolint:gosec // i is bounded by keyVizRowBudgetCap+5
+		rows[i] = keyviz.MatrixRow{
+			RouteID: idx,
+			Start:   []byte{byte(i / 256), byte(i % 256)},
+			End:     []byte{byte((i + 1) / 256), byte((i + 1) % 256)},
+			Writes:  idx,
+		}
+	}
+	srv := newAdminServerWithFakeSampler(t, []keyviz.MatrixColumn{{
+		At:   time.Unix(1_700_000_000, 0),
+		Rows: rows,
+	}})
+
+	resp, err := srv.GetKeyVizMatrix(context.Background(), &pb.GetKeyVizMatrixRequest{
+		Series: pb.KeyVizSeries_KEYVIZ_SERIES_WRITES,
+		Rows:   uint32(keyVizRowBudgetCap + 1000),
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Rows, keyVizRowBudgetCap, "rows must be clamped to keyVizRowBudgetCap")
 }
 
 // TestGetKeyVizMatrixHonorsRowsBudget pins Codex round-1 P1 on
