@@ -99,24 +99,30 @@ func TestShardedCoordinatorObservesEveryDispatchedMutation(t *testing.T) {
 // TestShardedCoordinatorWithoutSamplerStaysSafe pins the nil-safe
 // contract: a coordinator without WithSampler (interface-nil
 // c.sampler) and one wired with a typed-nil *MemSampler must both
-// dispatch successfully without observing anything.
+// dispatch successfully without observing anything. The "no
+// WithSampler" subcase additionally asserts c.sampler stays the
+// zero interface value so a future refactor that silently
+// initialises the field would fail this guard.
 func TestShardedCoordinatorWithoutSamplerStaysSafe(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
 	for _, tc := range []struct {
-		name string
-		opt  func(*ShardedCoordinator) *ShardedCoordinator
+		name         string
+		opt          func(*ShardedCoordinator) *ShardedCoordinator
+		wantNilField bool
 	}{
 		{
-			name: "no WithSampler call",
-			opt:  func(c *ShardedCoordinator) *ShardedCoordinator { return c },
+			name:         "no WithSampler call",
+			opt:          func(c *ShardedCoordinator) *ShardedCoordinator { return c },
+			wantNilField: true,
 		},
 		{
 			name: "typed-nil *MemSampler",
 			opt: func(c *ShardedCoordinator) *ShardedCoordinator {
 				return c.WithSampler((*keyviz.MemSampler)(nil))
 			},
+			wantNilField: false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,6 +137,10 @@ func TestShardedCoordinatorWithoutSamplerStaysSafe(t *testing.T) {
 				1: {Engine: r1, Store: s1, Txn: NewLeaderProxyWithEngine(r1)},
 			}
 			coord := tc.opt(NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups)))
+
+			if tc.wantNilField {
+				require.Nil(t, coord.sampler, "expected sampler field to be unset when WithSampler is never called")
+			}
 
 			ops := &OperationGroup[OP]{
 				Elems: []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("v")}},

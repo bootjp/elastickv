@@ -975,13 +975,8 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
 }
 
-// observeMutation records a single dispatched mutation with the
-// keyviz sampler, if one is wired. All operations reaching this
-// point are writes (Put, Del); reads are served outside Dispatch via
-// the lease-read / linearizable-read paths.
-//
-// Nil-safe: a nil-interface c.sampler skips with a single branch,
-// keeping the dispatch loop allocation-free when keyviz is disabled.
+// observeMutation: reads never reach this path; the early return
+// keeps the disabled-keyviz hot path allocation-free.
 func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 	if c.sampler == nil {
 		return
