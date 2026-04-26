@@ -5,6 +5,7 @@ import { RequireAuth } from "./components/RequireAuth";
 import { DashboardPage } from "./pages/Dashboard";
 import { DynamoDetailPage } from "./pages/DynamoDetail";
 import { DynamoListPage } from "./pages/DynamoList";
+import { KeyVizPage } from "./pages/KeyViz";
 import { LoginPage } from "./pages/Login";
 import { NotFoundPage } from "./pages/NotFound";
 import { S3DetailPage } from "./pages/S3Detail";
@@ -31,6 +32,7 @@ export function App() {
           <Route path="sqs/:name" element={<SqsDetailPage />} />
           <Route path="s3" element={<S3ListPage />} />
           <Route path="s3/:name" element={<S3DetailPage />} />
+          <Route path="keyviz" element={<KeyVizPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Routes>
