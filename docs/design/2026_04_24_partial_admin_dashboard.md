@@ -1,9 +1,9 @@
 # elastickv Admin Dashboard Design
 
-**Status:** Partial — P1, P2, and P3 of the implementation plan have shipped; P4 ships its operator documentation alongside this rename.
+**Status:** Partial — P1 and P3 have shipped in full; P2 has shipped its read-only slice with the write path still in flight; P4 has shipped TLS / role / CSRF and lands its operator documentation alongside this rename. See the status table below for the per-phase breakdown.
 **Author:** bootjp
 **Date:** 2026-04-24
-**Last updated:** 2026-04-26 (renamed from `_proposed_` to `_partial_` after P1 + P2 + P3 landed)
+**Last updated:** 2026-04-26 (renamed from `_proposed_` to `_partial_` after P1, P3, and the read-only slice of P2 landed)
 
 ## Implementation status (as of 2026-04-26)
 
