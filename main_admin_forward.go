@@ -62,19 +62,21 @@ func buildLeaderForwarder(coordinate kv.Coordinator, connCache *kv.GRPCConnCache
 // adminForwardServerDeps is the small bundle the gRPC ForwardServer
 // needs to be reachable from a follower's bridge. Collecting them in
 // a struct keeps startRaftServers' signature tractable as the wiring
-// surface grows. All fields are required; a missing one means the
-// ForwardServer is not registered (single-node / leader-only build).
+// surface grows. tables + roles are required; buckets is optional
+// (a build that ships without the S3 adapter sets it to nil and the
+// ForwardServer's S3 dispatch returns 501 for those operations).
 type adminForwardServerDeps struct {
-	tables admin.TablesSource
-	roles  admin.RoleStore
+	tables  admin.TablesSource
+	buckets admin.BucketsSource
+	roles   admin.RoleStore
 }
 
 // readyForRegistration reports whether the bundle has enough
-// collaborators to construct + register a ForwardServer. Both fields
-// must be non-nil; a nil TablesSource means the build ships without
-// the dynamo adapter, and a nil RoleStore means admin auth is not
-// configured. Either way, registering the gRPC service would 500
-// every forwarded call, so we silently skip registration instead.
+// collaborators to construct + register a ForwardServer.
+// TablesSource and RoleStore are both required: the registered
+// service would 500 every Dynamo forwarded call without them.
+// BucketsSource is optional — when nil, the leader-side dispatcher
+// rejects S3 operations with 501, but Dynamo forwarding still works.
 func (d adminForwardServerDeps) readyForRegistration() bool {
 	return d.tables != nil && d.roles != nil
 }
@@ -89,7 +91,11 @@ func registerAdminForwardServer(gs *grpc.Server, deps adminForwardServerDeps, lo
 	if !deps.readyForRegistration() {
 		return
 	}
-	pb.RegisterAdminForwardServer(gs, admin.NewForwardServer(deps.tables, deps.roles, logger))
+	srv := admin.NewForwardServer(deps.tables, deps.roles, logger)
+	if deps.buckets != nil {
+		srv = srv.WithBucketsSource(deps.buckets)
+	}
+	pb.RegisterAdminForwardServer(gs, srv)
 }
 
 // roleStoreFromFlags builds the same access-key → role map that

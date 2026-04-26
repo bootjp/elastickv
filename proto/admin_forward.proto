@@ -45,6 +45,12 @@ enum AdminOperation {
   ADMIN_OP_UNSPECIFIED = 0;
   ADMIN_OP_CREATE_TABLE = 1;
   ADMIN_OP_DELETE_TABLE = 2;
+  // S3 bucket admin operations (P2 slice 2b). New values appended
+  // after the Dynamo block so the wire-format integers for the
+  // existing operations stay stable.
+  ADMIN_OP_CREATE_BUCKET = 3;
+  ADMIN_OP_DELETE_BUCKET = 4;
+  ADMIN_OP_PUT_BUCKET_ACL = 5;
 }
 
 message AdminForwardRequest {

@@ -55,9 +55,10 @@ const pathSuffixACL = "/acl"
 // continue mutating until the token expires (Codex P1 on PR #635
 // applied the same fix on the Dynamo side).
 type S3Handler struct {
-	source BucketsSource
-	logger *slog.Logger
-	roles  RoleStore
+	source    BucketsSource
+	logger    *slog.Logger
+	roles     RoleStore
+	forwarder LeaderForwarder
 }
 
 // NewS3Handler wires a BucketsSource into the HTTP handler. Returns
@@ -88,6 +89,15 @@ func (h *S3Handler) WithLogger(logger *slog.Logger) *S3Handler {
 // when ServerDeps.Buckets is wired).
 func (h *S3Handler) WithRoleStore(roles RoleStore) *S3Handler {
 	h.roles = roles
+	return h
+}
+
+// WithLeaderForwarder wires the LeaderForwarder used to hand
+// follower-side ErrBucketsNotLeader writes off to the leader.
+// nil keeps forwarding disabled (the handler falls back to
+// 503 + Retry-After:1 directly, mirroring DynamoHandler's contract).
+func (h *S3Handler) WithLeaderForwarder(f LeaderForwarder) *S3Handler {
+	h.forwarder = f
 	return h
 }
 
@@ -280,6 +290,9 @@ func (h *S3Handler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	summary, err := h.source.AdminCreateBucket(r.Context(), principal, body)
 	if err != nil {
+		if h.tryForwardCreateBucket(w, r, principal, body, err) {
+			return
+		}
 		h.writeBucketsError(w, r, "create", err)
 		return
 	}
@@ -311,6 +324,9 @@ func (h *S3Handler) handlePutACL(w http.ResponseWriter, r *http.Request, name st
 		return
 	}
 	if err := h.source.AdminPutBucketAcl(r.Context(), principal, name, body.ACL); err != nil {
+		if h.tryForwardPutBucketAcl(w, r, principal, name, body.ACL, err) {
+			return
+		}
 		h.writeBucketsError(w, r, "put_acl", err)
 		return
 	}
@@ -330,6 +346,9 @@ func (h *S3Handler) handleDelete(w http.ResponseWriter, r *http.Request, name st
 		return
 	}
 	if err := h.source.AdminDeleteBucket(r.Context(), principal, name); err != nil {
+		if h.tryForwardDeleteBucket(w, r, principal, name, err) {
+			return
+		}
 		h.writeBucketsError(w, r, "delete", err)
 		return
 	}
@@ -483,6 +502,89 @@ func decodeAdminS3JSONBody[T any](body io.Reader) (T, error) {
 		return zero, errors.New("request body has trailing data after the first JSON value")
 	}
 	return out, nil
+}
+
+// tryForwardCreateBucket / tryForwardPutBucketAcl /
+// tryForwardDeleteBucket mirror the Dynamo handler's forwarding
+// pattern: only the ErrBucketsNotLeader source error triggers
+// forwarding, and only when a forwarder is configured. Each helper
+// owns the leader-response replay so the per-method handlers stay
+// short.
+func (h *S3Handler) tryForwardCreateBucket(w http.ResponseWriter, r *http.Request, principal AuthPrincipal, body CreateBucketRequest, sourceErr error) bool {
+	if !errors.Is(sourceErr, ErrBucketsNotLeader) || h.forwarder == nil {
+		return false
+	}
+	res, err := h.forwarder.ForwardCreateBucket(r.Context(), principal, body)
+	if err != nil {
+		h.writeForwardFailure(w, r, "create", err)
+		return true
+	}
+	h.writeForwardResult(w, r, res)
+	return true
+}
+
+func (h *S3Handler) tryForwardPutBucketAcl(w http.ResponseWriter, r *http.Request, principal AuthPrincipal, name, acl string, sourceErr error) bool {
+	if !errors.Is(sourceErr, ErrBucketsNotLeader) || h.forwarder == nil {
+		return false
+	}
+	res, err := h.forwarder.ForwardPutBucketAcl(r.Context(), principal, name, acl)
+	if err != nil {
+		h.writeForwardFailure(w, r, "put_acl", err)
+		return true
+	}
+	h.writeForwardResult(w, r, res)
+	return true
+}
+
+func (h *S3Handler) tryForwardDeleteBucket(w http.ResponseWriter, r *http.Request, principal AuthPrincipal, name string, sourceErr error) bool {
+	if !errors.Is(sourceErr, ErrBucketsNotLeader) || h.forwarder == nil {
+		return false
+	}
+	res, err := h.forwarder.ForwardDeleteBucket(r.Context(), principal, name)
+	if err != nil {
+		h.writeForwardFailure(w, r, "delete", err)
+		return true
+	}
+	h.writeForwardResult(w, r, res)
+	return true
+}
+
+// writeForwardResult re-emits the leader's structured response
+// verbatim. Mirrors DynamoHandler.writeForwardResult — same headers
+// and 503-+-Retry-After contract.
+func (h *S3Handler) writeForwardResult(w http.ResponseWriter, r *http.Request, res *ForwardResult) {
+	w.Header().Set("Content-Type", res.ContentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	if res.StatusCode == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "1")
+	}
+	w.WriteHeader(res.StatusCode)
+	if len(res.Payload) > 0 {
+		if _, err := w.Write(res.Payload); err != nil {
+			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 forward response write failed",
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+}
+
+// writeForwardFailure handles forwarder-side errors that did not
+// produce a structured leader response: ErrLeaderUnavailable
+// (election in flight) and gRPC transport errors. Both surface as
+// 503 + Retry-After: 1 so the SPA's retry contract is uniform.
+// ErrLeaderUnavailable is intentionally NOT logged at LevelError
+// — elections are routine; transport errors get logged so
+// operators can investigate.
+func (h *S3Handler) writeForwardFailure(w http.ResponseWriter, r *http.Request, op string, err error) {
+	if !errors.Is(err, ErrLeaderUnavailable) {
+		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" forward failed",
+			slog.String("error", err.Error()),
+		)
+	}
+	w.Header().Set("Retry-After", "1")
+	writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
+		"raft leader currently unavailable; retry shortly")
 }
 
 // paginateBuckets slices `buckets` (already lex-sorted by the
