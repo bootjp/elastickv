@@ -46,10 +46,26 @@ This document is the proposal that unblocks the implementation. It is **not the 
 
 Each partitioned FIFO queue has `N` partitions where `N ∈ {1, 2, 4, 8, 16, 32}`. The `N=1` case is the existing single-partition layout, unchanged. Powers of two only so the hash → partition step is a `hash & (N-1)` (cheap and consistent) and so future `N` changes via offline rebuild stay tractable.
 
-A partition is identified by the tuple `(queueName, partitionIndex)` where `partitionIndex ∈ [0, N)`. Every existing message-keyspace key gains the `partitionIndex` as a fixed-width segment immediately after the queue name. Concretely, today's `!sqs|msg|data|<queue>|<gen>|<msgID>` becomes `!sqs|msg|data|<queue>|<partition>|<gen>|<msgID>`. The `<partition>` segment is `appendU64(partitionIndex)` (fixed 8 bytes BE), so:
+A partition is identified by the tuple `(queueName, partitionIndex)` where `partitionIndex ∈ [0, N)`. The key shape is **conditional on whether the queue is partitioned** (Codex P1 + Gemini high on PR #664 — naively inserting a `<partition>` segment into every key would shift offsets for `<gen>` and `<msgID>` and break readback of every existing message on disk):
 
-- Single-partition FIFOs (and all Standard queues) write `partitionIndex = 0` and read with the same prefix as today — the schema is byte-identical for `N=1`.
-- Multi-partition FIFOs use `partitionIndex ∈ [0, N)`. Scans key off the partition prefix so a worker handling partition `k` never sees keys for partition `k+1`.
+- **Legacy / `PartitionCount = 0` / Standard queues** keep today's `!sqs|msg|data|<queue>|<gen>|<msgID>` byte-for-byte. No partition segment is written or read. Existing data on disk is unaffected; existing key constructors stay unchanged on this code path.
+- **Partitioned FIFO queues (`PartitionCount > 1`)** use a *new* keyspace prefix that explicitly includes the partition: `!sqs|msg|data|p|<queue>|<partition>|<gen>|<msgID>` (note the extra `p|` discriminator after `data|`). The discriminator is what guarantees no collision with the legacy prefix even when `<partition> = 0` happens to match the first 8 bytes of a legacy `<gen>`.
+
+Concretely, the `sqsMsgDataKey` constructor (and friends) become:
+
+```go
+func sqsMsgDataKey(queueName string, gen uint64, messageID string, partitions ...uint32) []byte {
+    if len(partitions) == 0 {
+        // Legacy single-partition path — byte-identical to today.
+        return legacyDataKey(queueName, gen, messageID)
+    }
+    return partitionedDataKey(queueName, partitions[0], gen, messageID)
+}
+```
+
+The send / receive path picks the constructor based on `meta.PartitionCount > 1`. The reaper enumerates **both** prefixes when reaping a queue, so a queue that was created legacy and later (in a hypothetical future migration) gains partitions does not strand its old data — out of scope today, but the prefix choice keeps that door open.
+
+Scans on a partitioned queue use `!sqs|msg|data|p|<queue>|<partition>|` so a worker handling partition `k` never sees keys for partition `k+1`. Scans on a legacy queue use `!sqs|msg|data|<queue>|`, identical to today.
 
 ### 3.2 Queue meta extensions
 
@@ -137,23 +153,31 @@ Steps 1–2 are unchanged; step 3 is the new routing call (~10 lines); steps 4�
 
 ### 4.2 ReceiveMessage on a partitioned FIFO
 
-ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under partitioning that becomes a scan **per partition** — which means the receive handler gains a partition-fanout step:
+ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under partitioning that becomes a scan **per partition** with **leader proxying for the partitions whose leader lives on a different node**:
 
 ```
 1. Decode → sqsReceiveMessageInput (existing).
-2. For each partitionIndex in [0, meta.PartitionCount):
+2. Compute partitionOrder := starting offset chosen by hashing the
+   request's RequestId (or random when absent) so successive calls
+   from the same consumer rotate which partition they hit first.
+   This avoids head-of-line bias toward partition 0 under load.
+3. For each partitionIndex in partitionOrder, until MaxNumberOfMessages
+   are collected or every partition has been tried:
      a. Resolve the leader for (queue, partitionIndex).
-     b. If this node is not the leader for that partition, skip (the
-        consumer's next call will land on a different node and that
-        leader will serve its partition).
-     c. Otherwise scan visibility index, deliver candidates, just
-        like today's single-partition path.
-3. Aggregate the per-partition results, cap at MaxNumberOfMessages.
+     b. If this node is the leader: scan locally, deliver candidates.
+     c. Otherwise: forward the request to the leader-of-partition via
+        the existing leader-proxy machinery (proxyToLeader, extended
+        to accept a partition argument so the proxy target is the
+        right shard, not just "the queue's leader"). The proxied call
+        carries an `X-Elastickv-Receive-Partition: <k>` header so the
+        downstream handler knows to skip its own partition fanout and
+        scan only partition k.
+4. Aggregate the per-partition results, cap at MaxNumberOfMessages.
 ```
 
-A consumer making one ReceiveMessage call sees results from **only the partitions whose leader is the local node**. For a deployment where every partition has its own leader, a single client's ReceiveMessage hits one partition's worth of messages per call. This matches AWS HT-FIFO behaviour: clients are expected to spread their consumer pool across partitions, and an idle partition does not block a busy one.
+The point is that a consumer pinned to a single endpoint **must still see messages from every partition**, even partitions whose leader is elsewhere — otherwise the SDK's "ReceiveMessage returned nothing, sleep and retry" assumption silently leaks messages forever (Codex P1 + Gemini medium on PR #664). The cost is one extra hop per non-local-leader partition; for the common deployment where partitions are co-located on one Raft group, every partition's leader is the same node and there is no fanout. For deployments that spread partitions across nodes, the proxy fanout is exactly what AWS does internally — clients see uniform behaviour regardless of topology.
 
-For deployments that co-locate partitions on one Raft group, all partitions' leaders are the same node and a single ReceiveMessage scans all partitions in sequence. The scan is bounded by `MaxNumberOfMessages` and the existing per-partition page limit — no separate budget.
+The proxy fanout is bounded: `partitionOrder` short-circuits as soon as `MaxNumberOfMessages` are collected, so a consumer asking for 1 message touches at most 1 remote leader (the one for the first non-empty partition in their rotation order). A FIFO with no in-flight messages costs N proxy round-trips to confirm empty, but FIFO consumers are expected to use long-poll (`WaitTimeSeconds`), which extends each call's budget.
 
 ### 4.3 PurgeQueue / DeleteQueue on a partitioned FIFO
 

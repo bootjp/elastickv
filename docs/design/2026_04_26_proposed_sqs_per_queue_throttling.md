@@ -75,8 +75,17 @@ A `bucketStore` instance hangs off `*SQSServer`. Internally:
 ```go
 // adapter/sqs_throttle.go (new in implementation PR)
 type bucketStore struct {
-    mu      sync.Mutex
-    buckets map[bucketKey]*tokenBucket  // (queueName, action) -> bucket
+    // sync.Map rather than a single mu+map so the hot SendMessage /
+    // ReceiveMessage path does not contend on a process-wide lock.
+    // sync.Map's read-mostly optimisation matches the access pattern:
+    // bucket lookup is overwhelmingly read (the bucket already exists),
+    // and the rare insert-on-first-use happens once per (queue, action)
+    // pair. Each bucket's own mutation (charge / refill) is guarded by
+    // a per-bucket sync.Mutex inside *tokenBucket, scoped to one queue,
+    // so cross-queue traffic never serialises on the same lock.
+    // (Gemini medium on PR #664 flagged a single-mutex bucket store as
+    // a hot-path contention point; this design avoids that.)
+    buckets sync.Map  // map[bucketKey]*tokenBucket
     clock   func() time.Time
 }
 
@@ -86,12 +95,21 @@ type bucketKey struct {
 }
 
 type tokenBucket struct {
-    capacity   float64  // burst size
-    refillRate float64  // tokens per second
-    tokens     float64  // current credit
+    mu         sync.Mutex  // per-bucket; never held across the bucketStore
+    capacity   float64     // burst size
+    refillRate float64     // tokens per second
+    tokens     float64     // current credit
     lastRefill time.Time
 }
 ```
+
+The `charge` operation:
+
+1. `bucketStore.buckets.Load(key)` (lock-free read).
+2. On miss, build the bucket from queue meta and `LoadOrStore` it (one-shot insert race tolerated — both racers will agree on the same configuration).
+3. Acquire the bucket's own `mu`, refill based on elapsed time, take or reject the requested tokens, release `mu`.
+
+No global lock is held during step 3; concurrent traffic on different queues runs in parallel.
 
 The bucket map is per-process. On leader failover, a fresh bucket starts at full capacity on the new leader — there is no Raft replication of bucket state. **Why this is correct**: the worst-case behaviour of "fresh bucket on failover" is that a noisy queue gets one extra burst worth of bandwidth right after a leader change. Replicating bucket state would cost a Raft commit per token decrement, which would defeat the entire point of the token bucket. AWS's own rate limiter has the same property at region failover boundaries.
 
@@ -172,7 +190,7 @@ On rejection:
 | `adapter/sqs.go` | After `authorizeSQSRequest`, call `bucketStore.charge(queueName, action, count)`. On reject, write the `Throttling` envelope and return. |
 | `adapter/sqs_throttle_test.go` (new) | Unit tests for bucket math (edge cases: idle drift, burst, partial refill, batch over-charge, default-off). ~300 lines. |
 | `adapter/sqs_throttle_integration_test.go` (new) | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. ~150 lines. |
-| `monitoring/registry.go` | Two new counter vectors: `sqs_throttled_requests_total{queue, action}` and `sqs_throttle_tokens_remaining{queue, action}`. |
+| `monitoring/registry.go` | New counter `sqs_throttled_requests_total{queue, action}` and new **gauge** `sqs_throttle_tokens_remaining{queue, action}`. (Codex P2 on PR #664: tokens go up *and* down so a counter is the wrong instrument.) |
 | `docs/design/2026_04_24_partial_sqs_compatible_adapter.md` §16.5 | Status update once this lands: TODO → Landed. |
 
 ### 4.2 OCC interaction
@@ -227,10 +245,10 @@ The throttling configuration is **non-AWS** — there is no `ThrottleSendCapacit
 
 No new flags. Limits are per-queue, set via `SetQueueAttributes`. Defaults are zero (disabled).
 
-Two new Prometheus counters (Section 4.1) expose the throttling activity. Suggested Grafana dashboard:
+Two new Prometheus instruments (Section 4.1) expose the throttling activity:
 
-- `rate(sqs_throttled_requests_total[1m])` per queue → spot the noisy tenant.
-- `sqs_throttle_tokens_remaining` → the bucket level; trending toward zero is the early warning sign.
+- `sqs_throttled_requests_total{queue, action}` — **counter**. Use `rate(...)` per queue in Grafana to spot the noisy tenant.
+- `sqs_throttle_tokens_remaining{queue, action}` — **gauge** (Codex P2 on PR #664: token budgets go up *and* down over time, so a counter would mask the depletion that operators most need to see). Sample directly; trending toward zero is the early warning sign.
 
 ---
 
