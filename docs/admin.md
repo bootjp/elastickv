@@ -52,7 +52,7 @@ with the access key + secret pair from the credentials file.
 |---|---|
 | `-adminListen` | host:port for the admin listener. Defaults to `127.0.0.1:8080`. |
 | `-adminTLSCertFile` / `-adminTLSKeyFile` | PEM cert + key. Both must be set together; a partial config fails validation at startup. |
-| `-adminAllowPlaintextNonLoopback` | Explicit opt-out for the non-loopback-without-TLS startup hard-error. **Strongly discouraged** — enables the dashboard to mint cookies without the `Secure` attribute and ship session JWTs over plaintext. Use only for short-lived test rigs you control. |
+| `-adminAllowPlaintextNonLoopback` | Explicit opt-out for the non-loopback-without-TLS startup hard-error. **Strongly discouraged** — lets the listener accept plaintext on a non-loopback bind. **Does not** affect the cookie `Secure` attribute (that is `-adminAllowInsecureDevCookie` below); a deployment that sets only this flag will mint `Secure` cookies that the browser refuses to send over the plaintext channel, breaking session lifetime end-to-end. Pair it with `-adminAllowInsecureDevCookie` if the goal is a working plaintext rig. |
 | `-adminSessionSigningKeyPrevious` *or* `-adminSessionSigningKeyPreviousFile` *or* `ELASTICKV_ADMIN_SESSION_SIGNING_KEY_PREVIOUS` | Previous HS256 key used only for verification during a rotation window. New tokens always use the primary key; existing tokens minted under the previous key continue to verify until they expire. |
 | `-adminAllowInsecureDevCookie` | Mints session cookies without `Secure` for local plaintext development. Do not set on any deployment that touches a network. |
 
@@ -76,10 +76,14 @@ Two supported topologies:
 
 ### A. Loopback only (`127.0.0.1` / `::1`)
 
-No TLS required. The dashboard cookies still carry `Secure=false`
-when `-adminAllowInsecureDevCookie` is set; in normal loopback
-operation cookies are minted with `Secure` regardless and rely on
-the browser's loopback-is-trusted policy.
+No TLS required. By default the dashboard mints cookies with
+`Secure=true`, which most modern browsers accept on the loopback
+origin even without TLS (the loopback-is-trusted policy). If a
+specific browser refuses the cookie in this configuration, set
+`-adminAllowInsecureDevCookie` to mint without `Secure` — the flag
+is intentionally distinct from `-adminAllowPlaintextNonLoopback`
+because the listener can be plaintext for entirely separate
+reasons (loopback) than the cookie needing to drop `Secure`.
 
 ### B. Reachable address with TLS
 
@@ -98,6 +102,14 @@ short-lived test deployments. The session JWT and its bearer cookie
 travel in clear text in this mode; anyone on the path can replay
 the token until it expires. Do not enable on a long-running
 deployment.
+
+A working plaintext rig also needs `-adminAllowInsecureDevCookie` —
+otherwise the dashboard mints cookies with `Secure=true` and the
+browser refuses to send them back over plaintext, so login appears
+to succeed but every subsequent request 401s. The two flags are
+deliberately separate so a misconfigured deployment fails closed
+on either axis (TLS guard or cookie attribute) rather than
+silently downgrading both at once.
 
 ## Roles
 
@@ -168,9 +180,14 @@ each node after editing the access-key flags.
 When the leader steps down mid-write (or has not yet been elected
 after a fresh start), the forwarder cannot reach a leader and the
 SPA receives `503 Service Unavailable` with a `Retry-After: 1`
-header. The SPA's API client honours `Retry-After` and re-issues
-the request once. Operators investigating "intermittent 503s"
-should look at Raft leader-churn logs first.
+header. The current SPA client (`web/admin/src/api/client.ts`)
+makes a single `fetch` call with no automatic retry, so the user
+sees the 503 surfaced directly and must re-issue the action. The
+`Retry-After: 1` header is still emitted so a future client (or an
+external operator script driving the JSON API) can implement the
+one-second back-off the server is asking for. Operators
+investigating "intermittent 503s" should look at Raft leader-churn
+logs first.
 
 ## Audit log
 
