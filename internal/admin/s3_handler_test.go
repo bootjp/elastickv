@@ -440,6 +440,86 @@ func TestS3Handler_CreateBucket_ReadOnlyRoleRejected(t *testing.T) {
 		"role gate must short-circuit before the source is reached")
 }
 
+// TestS3Handler_PrincipalForWrite_JWTGateFiresWithRoleStore pins the
+// fix for Codex P2 + coderabbitai Minor on PR #669: the previous
+// shape skipped the JWT role check whenever h.roles != nil
+// (production wiring), so a session whose token was minted as
+// read-only could mutate buckets if the live role index had since
+// promoted the key to full. Aligning with DynamoHandler, the JWT
+// gate now fires unconditionally — the live store can only narrow
+// the JWT's role, never widen it.
+//
+// All three S3 admin write endpoints exercise the same
+// principalForWrite, so the table sweeps each one to lock down
+// the contract per-endpoint (a future op that forgets to call
+// principalForWrite would fail the relevant row immediately).
+func TestS3Handler_PrincipalForWrite_JWTGateFiresWithRoleStore(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"create_bucket", http.MethodPost, pathS3Buckets, validCreateBucketBody()},
+		{"put_bucket_acl", http.MethodPut, pathS3Buckets + "/x/acl", `{"acl":"private"}`},
+		{"delete_bucket", http.MethodDelete, pathS3Buckets + "/x", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &stubBucketsSource{}
+			// Live RoleStore says AKIA_RO is full — exactly the
+			// pre-fix escalation window. JWT carries read-only
+			// (the "freeze at login" contract). Handler must reject.
+			roles := MapRoleStore{"AKIA_RO": RoleFull}
+			h := NewS3Handler(src).WithRoleStore(roles)
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
+			req = withReadOnlyPrincipalForS3(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusForbidden, rec.Code,
+				"JWT read-only must reject even when live role index says full")
+			require.Empty(t, src.lastCreateInput.BucketName,
+				"role gate must short-circuit before the source is reached")
+			require.Empty(t, src.lastDeleteName,
+				"role gate must short-circuit before the source is reached")
+		})
+	}
+}
+
+// TestS3Handler_PrincipalForWrite_LiveRoleNarrowsJWT covers the
+// other half of the contract: a JWT minted as full is rejected
+// when the live role index has demoted the key to read-only or
+// removed it entirely. Already covered conceptually by the
+// existing "ReadOnlyRoleRejected" tests for the h.roles == nil
+// path, but those leave the live-role-narrowing branch unproven.
+func TestS3Handler_PrincipalForWrite_LiveRoleNarrowsJWT(t *testing.T) {
+	cases := []struct {
+		name  string
+		roles MapRoleStore
+	}{
+		{"live role demoted to read-only", MapRoleStore{"AKIA_FULL": RoleReadOnly}},
+		{"live role removed from index", MapRoleStore{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &stubBucketsSource{}
+			h := NewS3Handler(src).WithRoleStore(tc.roles)
+			req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
+				strings.NewReader(validCreateBucketBody()))
+			req = withFullPrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusForbidden, rec.Code)
+			require.Empty(t, src.lastCreateInput.BucketName,
+				"live role gate must short-circuit before the source is reached")
+		})
+	}
+}
+
 func TestS3Handler_CreateBucket_AlreadyExistsReturns409(t *testing.T) {
 	src := &stubBucketsSource{
 		buckets:   map[string]BucketSummary{"public-assets": {Name: "public-assets"}},

@@ -362,11 +362,16 @@ func (h *S3Handler) handleDelete(w http.ResponseWriter, r *http.Request, name st
 }
 
 // principalForWrite mirrors DynamoHandler.principalForWrite: pull
-// the JWT principal out of the request context, re-resolve the role
-// against the live RoleStore, and reject anything below Full. Even
-// a still-valid JWT with role=full does not get a free pass —
-// operators who revoke an access key get the change picked up on
-// the next admin write rather than waiting for the JWT to expire.
+// the JWT principal out of the request context, enforce the
+// JWT-embedded role first (defence-in-depth — a token minted as
+// read-only never escalates, even if the live role index says
+// `full` after a recent promotion), and — when a RoleStore is
+// configured — re-validate the access key against the live role
+// index so a key downgraded or revoked since login cannot keep
+// mutating with a still-valid JWT. Even a still-valid JWT with
+// role=full does not get a free pass — operators who revoke an
+// access key get the change picked up on the next admin write
+// rather than waiting for the JWT to expire.
 func (h *S3Handler) principalForWrite(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
@@ -374,24 +379,36 @@ func (h *S3Handler) principalForWrite(w http.ResponseWriter, r *http.Request) (A
 			"no session principal")
 		return AuthPrincipal{}, false
 	}
-	if h.roles == nil {
-		// Production wiring always sets a RoleStore; nil is a test
-		// fallthrough we accept so single-handler unit tests can
-		// reach the source without standing up the auth chain.
-		if !principal.Role.AllowsWrite() {
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this endpoint requires a full-access role")
-			return AuthPrincipal{}, false
-		}
-		return principal, true
-	}
-	role, found := h.roles.LookupRole(principal.AccessKey)
-	if !found || !role.AllowsWrite() {
+	// JWT role gate fires unconditionally so a session whose token
+	// was minted as read-only cannot perform writes even if the
+	// live role index later promotes the key to full. The previous
+	// shape skipped this check whenever h.roles != nil, which made
+	// it the only authorisation gate in production wiring — a
+	// security regression vs DynamoHandler that Codex P2 +
+	// coderabbitai flagged on PR #669 (the JWT freezes the role
+	// at login, the live role index can only constrain further).
+	if !principal.Role.AllowsWrite() {
 		writeJSONError(w, http.StatusForbidden, "forbidden",
 			"this endpoint requires a full-access role")
 		return AuthPrincipal{}, false
 	}
-	return AuthPrincipal{AccessKey: principal.AccessKey, Role: role}, true
+	// Live re-validation. Skipped when no RoleStore is configured
+	// (single-handler unit tests where wiring up the role index
+	// would obscure the source-level behaviour the test is
+	// exercising); production wiring always sets one.
+	if h.roles != nil {
+		liveRole, found := h.roles.LookupRole(principal.AccessKey)
+		if !found || !liveRole.AllowsWrite() {
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this endpoint requires a full-access role")
+			return AuthPrincipal{}, false
+		}
+		// Use the live role downstream; the JWT may carry a stale
+		// value but the live one is authoritative once both gates
+		// agree the request is allowed.
+		principal.Role = liveRole
+	}
+	return principal, true
 }
 
 // writeBucketsError translates a BucketsSource error into the

@@ -358,6 +358,30 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 // authorisation contract as the other admin write methods. The
 // bucket-must-be-empty rule mirrors the SigV4 deleteBucket path —
 // the dashboard cannot force a recursive delete, by design.
+//
+// Known orphan-race limitation (coderabbitai 🔴 / 🟠 on PR #669):
+// the empty-bucket probe (ScanAt with limit=1 on
+// ObjectManifestPrefixForBucket) reads at readTS but the
+// subsequent BucketMetaKey delete only carries that single point
+// key in its ReadKeys set. A concurrent PutObject that inserts a
+// manifest key in the scanned prefix between readTS and the
+// delete's commitTS will not conflict — the OCC validator only
+// inspects keys that appear in ReadKeys, and there is no
+// ReadRanges mechanism today. The object's manifest key survives
+// under a now-deleted bucket meta and becomes orphaned.
+//
+// This race exists pre-existing in the SigV4 path
+// (adapter/s3.go:deleteBucket — same shape, same limitation), so
+// AdminDeleteBucket inherits the contract; closing the gap
+// requires either (a) bumping BucketGenerationKey on every
+// PutObject so it can serve as an OCC token in this read set, or
+// (b) extending OperationGroup with ReadRanges and teaching the
+// FSM to validate range emptiness atomically with commit. Both
+// are larger changes outside this PR's scope; tracked in
+// docs/design/2026_04_24_partial_admin_dashboard.md under the
+// Outstanding open items section. Operators concerned about the
+// orphan window today should pause writes against the target
+// bucket before issuing the admin delete.
 func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincipal, name string) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
