@@ -14,16 +14,20 @@ import (
 // TestBuildKeyVizSamplerHonorsEnabledFlag pins the on/off contract:
 // --keyvizEnabled=false returns nil (so coordinator/admin server take
 // the disabled paths), and --keyvizEnabled=true with explicit options
-// returns a configured sampler.
+// returns a configured sampler whose options match every flag.
 func TestBuildKeyVizSamplerHonorsEnabledFlag(t *testing.T) {
 	t.Parallel()
-	withFlags(t, false, time.Second, 5, 7, func() {
+	withFlags(t, false, time.Second, 5, 7, 16, func() {
 		require.Nil(t, buildKeyVizSampler())
 	})
-	withFlags(t, true, 250*time.Millisecond, 5, 7, func() {
+	withFlags(t, true, 250*time.Millisecond, 5, 7, 16, func() {
 		s := buildKeyVizSampler()
 		require.NotNil(t, s)
 		require.Equal(t, 250*time.Millisecond, s.Step())
+		// Pin the --keyvizHistoryColumns forwarding so a future
+		// refactor that drops the flag from buildKeyVizSampler is
+		// caught here, not at runtime.
+		require.Equal(t, 16, s.HistoryColumns())
 	})
 }
 
@@ -95,7 +99,7 @@ func withFlags(
 	t *testing.T,
 	enabled bool,
 	step time.Duration,
-	maxTracked, maxMembers int,
+	maxTracked, maxMembers, historyColumns int,
 	fn func(),
 ) {
 	t.Helper()
@@ -103,15 +107,18 @@ func withFlags(
 	prevStep := *keyvizStep
 	prevMaxTracked := *keyvizMaxTrackedRoutes
 	prevMaxMembers := *keyvizMaxMemberRoutesPerSlot
+	prevHistoryColumns := *keyvizHistoryColumns
 	*keyvizEnabled = enabled
 	*keyvizStep = step
 	*keyvizMaxTrackedRoutes = maxTracked
 	*keyvizMaxMemberRoutesPerSlot = maxMembers
+	*keyvizHistoryColumns = historyColumns
 	defer func() {
 		*keyvizEnabled = prevEnabled
 		*keyvizStep = prevStep
 		*keyvizMaxTrackedRoutes = prevMaxTracked
 		*keyvizMaxMemberRoutesPerSlot = prevMaxMembers
+		*keyvizHistoryColumns = prevHistoryColumns
 	}()
 	fn()
 }

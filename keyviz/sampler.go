@@ -774,6 +774,17 @@ func (s *MemSampler) Step() time.Duration {
 	return s.opts.Step
 }
 
+// HistoryColumns returns the configured ring-buffer length after
+// applying defaults and the MaxHistoryColumns clamp. Wiring tests use
+// this to verify --keyvizHistoryColumns is forwarded end-to-end
+// without exposing the internal opts struct.
+func (s *MemSampler) HistoryColumns() int {
+	if s == nil {
+		return DefaultHistoryColumns
+	}
+	return s.opts.HistoryColumns
+}
+
 // appendDrainedRow swaps the slot's counters to zero and appends a
 // MatrixRow when any counter was non-zero. Idle slots are skipped.
 // Metadata is read under the slot's metaMu so a concurrent
