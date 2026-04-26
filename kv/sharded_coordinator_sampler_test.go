@@ -82,10 +82,11 @@ func TestShardedCoordinatorObservesEveryDispatchedMutation(t *testing.T) {
 	require.Len(t, calls, 2, "expected one Observe per mutation")
 
 	// groupMutations iterates reqs in order, so call[i] matches
-	// elem[i]. Verify each: OpWrite, exact key/value lengths, and
-	// the RouteID the engine resolved for that key.
+	// elem[i]. Resolve via routeKey(elem.Key) so the test mirrors
+	// production's routing transform — important for keys that
+	// normalize through internal-prefix handling.
 	for i, elem := range ops.Elems {
-		route, ok := engine.GetRoute(elem.Key)
+		route, ok := engine.GetRoute(routeKey(elem.Key))
 		require.True(t, ok)
 		require.Equal(t, sampleCall{
 			routeID:  route.RouteID,
