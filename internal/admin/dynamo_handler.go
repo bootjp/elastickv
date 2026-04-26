@@ -3,7 +3,6 @@ package admin
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"log/slog"
@@ -265,14 +264,8 @@ type dynamoListResponse struct {
 }
 
 func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
-	limit, err := parseDynamoListLimit(r.URL.Query().Get("limit"))
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid_limit", err.Error())
-		return
-	}
-	startAfter, err := decodeDynamoNextToken(r.URL.Query().Get("next_token"))
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid_next_token", err.Error())
+	limit, startAfter, ok := parseListPaginationParams(w, r, defaultDynamoListLimit, dynamoListLimitMax)
+	if !ok {
 		return
 	}
 
@@ -306,7 +299,7 @@ func (h *DynamoHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	page, next := paginateDynamoTableNames(names, startAfter, limit)
 	resp := dynamoListResponse{Tables: page}
 	if next != "" {
-		resp.NextToken = encodeDynamoNextToken(next)
+		resp.NextToken = encodeListNextToken(next)
 	}
 	// paginateDynamoTableNames is total over its input — it always
 	// returns a non-nil slice (an empty []string{} on the
@@ -714,47 +707,6 @@ func (h *DynamoHandler) handleDescribe(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 	writeAdminJSON(w, r.Context(), h.logger, summary)
-}
-
-// parseDynamoListLimit translates the ?limit= query parameter into a
-// concrete page size. Empty falls back to the design-doc default;
-// negatives or non-numerics are an outright client error; values past
-// the ceiling are silently clamped (not an error) so the SPA's
-// "request the maximum" pattern works without a probe round-trip.
-func parseDynamoListLimit(raw string) (int, error) {
-	if raw == "" {
-		return defaultDynamoListLimit, nil
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, errors.New("limit must be an integer")
-	}
-	if n <= 0 {
-		return 0, errors.New("limit must be positive")
-	}
-	if n > dynamoListLimitMax {
-		return dynamoListLimitMax, nil
-	}
-	return n, nil
-}
-
-// decodeDynamoNextToken reverses encodeDynamoNextToken. We base64-wrap
-// the raw last-table-name so the wire token is opaque from the
-// client's perspective and we can change the cursor representation
-// later without breaking the API contract.
-func decodeDynamoNextToken(raw string) (string, error) {
-	if raw == "" {
-		return "", nil
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return "", errors.New("next_token is not valid base64url")
-	}
-	return string(decoded), nil
-}
-
-func encodeDynamoNextToken(name string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(name))
 }
 
 // paginateDynamoTableNames slices `names` (already lex-sorted by the

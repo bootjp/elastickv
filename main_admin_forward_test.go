@@ -177,6 +177,30 @@ func TestBuildAdminLeaderForwarder_HappyPathReturnsForwarder(t *testing.T) {
 	require.NotNil(t, fwd)
 }
 
+// TestAdminHLCPhysicalShiftMatchesKVLogicalBits guards against
+// silent drift between admin.FormatBucketCreatedAt's shift constant
+// (currently 16) and kv.HLCLogicalBits, the upstream truth the
+// timestamp encoding obeys. If a future HLC format change
+// re-partitions the wire layout in kv and the admin formatter is
+// not updated, this test fails immediately rather than letting
+// every CreatedAt render at the wrong hour silently (Claude
+// Issue 4 on PR #658).
+//
+// admin cannot import kv (it is a low-level dependency the admin
+// package stays decoupled from), so the assertion lives in main
+// where both packages are already in scope.
+func TestAdminHLCPhysicalShiftMatchesKVLogicalBits(t *testing.T) {
+	// FormatBucketCreatedAt(hlc) shifts hlc right by 16 to recover
+	// the wall-clock millis. Shift a known wall-clock value left by
+	// kv.HLCLogicalBits and confirm the formatter recovers exactly
+	// the right RFC3339 string — if the two constants drift apart,
+	// the round-trip produces a wrong year / hour and the test
+	// fails.
+	const wallMillis = int64(1_777_874_400_000) // 2026-05-04T06:00:00Z
+	hlc := uint64(wallMillis) << kv.HLCLogicalBits
+	require.Equal(t, "2026-05-04T06:00:00Z", admin.FormatBucketCreatedAt(hlc))
+}
+
 // dummyTablesSource is the smallest concrete admin.TablesSource for
 // the readyForRegistration gate test — no method body needs to
 // execute, so every method just panics. Using a real implementation

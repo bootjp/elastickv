@@ -764,7 +764,7 @@ func startServers(in serversInput) error {
 	// the handler hands ErrTablesNotLeader writes to the forwarder
 	// which dials the leader over the cached gRPC pool. Without these
 	// the handler falls back to 503 + Retry-After:1.
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, in.coordinate, connCache); err != nil {
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, in.coordinate, connCache); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -1303,6 +1303,12 @@ type runtimeServerRunner struct {
 	// not a public API. Nil until start() reaches the dynamo step.
 	dynamoServer *adapter.DynamoDBServer
 
+	// s3Server is the parallel field for the S3 admin endpoints
+	// (read-only in this slice). Nil when --s3Address is empty,
+	// in which case the admin handler answers /s3/buckets* with
+	// 404, mirroring the dynamoServer == nil contract.
+	s3Server *adapter.S3Server
+
 	// roleStore is the access-key → role index the leader-side
 	// gRPC AdminForward service uses to re-validate the principal
 	// on every forwarded write. Mirrors what admin.Config.RoleIndex
@@ -1351,9 +1357,11 @@ func (r *runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
+	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
+	r.s3Server = s3Server
 	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
