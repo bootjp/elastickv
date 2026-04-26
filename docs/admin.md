@@ -193,17 +193,37 @@ logs first.
 
 Every state-changing admin request emits structured slog lines at
 `INFO` level under the `admin_audit` key on the leader's stdout (or
-wherever the process slog handler is wired). A single state-changing
-request typically produces **two** audit lines: one operation-specific
-line from the source that performed the mutation, plus one generic
-HTTP-shaped line from the `Audit` middleware. The shapes differ by
-source — log parsers should treat the `admin_audit` key as a union
-and dispatch on the fields present.
+wherever the process slog handler is wired). A protected-chain
+mutation (Dynamo / S3 / cluster / keyviz writes) typically produces
+**two** audit lines: one operation-specific line from the source
+that performed the mutation, plus one generic HTTP-shaped line from
+the `Audit` middleware. Auth endpoints (`/auth/login`, `/auth/logout`)
+produce **one** line — the action-specific one from `AuthService` —
+because the generic middleware is intentionally not wrapped around
+them (see the per-shape section below for why). The shapes differ
+by source — log parsers should treat the `admin_audit` key as a
+union and dispatch on the fields present.
 
-**`Audit` middleware** — emitted for every non-GET/HEAD/OPTIONS
-request that reaches the admin mux on this node, regardless of which
-handler served it. Always present on the node that received the HTTP
-request (which may be a follower if the request was then forwarded):
+**`Audit` middleware** — emitted for non-GET/HEAD/OPTIONS requests
+on the **protected mux chain** (Dynamo, S3, cluster, keyviz) after
+`SessionAuth` accepts the session, but **before** `CSRFDoubleSubmit`
+runs. That ordering is deliberate: a CSRF-rejected protected
+request still produces an audit line because the actor is already
+known, but an unauthenticated request (no / invalid session) is
+rejected at `SessionAuth` and never reaches the middleware. The
+following endpoints are **not** wrapped by this middleware and rely
+on their own `admin_audit` emission instead:
+
+- `/auth/login` — runs without a pre-existing session, so the
+  generic middleware cannot identify the actor; `AuthService`
+  emits `admin_audit action=login` (success and failure) directly.
+- `/auth/logout` — runs through `protectNoAudit` so logout produces
+  exactly one `admin_audit action=logout` line from `AuthService`
+  rather than two (a generic line plus the action-specific one).
+
+For requests that *do* reach the middleware, the line is always
+present on the node that received the HTTP request — which may be
+a follower if the request was then forwarded:
 
 ```
 admin_audit actor=AKIA_ADMIN role=full method=POST path=/admin/api/v1/buckets status=201 remote=10.0.0.7:51234 duration=8.2ms
