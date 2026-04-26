@@ -134,6 +134,7 @@ var (
 	keyvizStep                   = flag.Duration("keyvizStep", keyviz.DefaultStep, "Flush interval / matrix-column resolution for the keyviz sampler")
 	keyvizMaxTrackedRoutes       = flag.Int("keyvizMaxTrackedRoutes", keyviz.DefaultMaxTrackedRoutes, "Maximum routes tracked individually before excess routes coarsen into virtual buckets")
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
+	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
 )
 
 const adminTokenMaxBytes = 4 << 10
@@ -1309,6 +1310,7 @@ func buildKeyVizSampler() *keyviz.MemSampler {
 	}
 	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
 		Step:                   *keyvizStep,
+		HistoryColumns:         *keyvizHistoryColumns,
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
 	})
@@ -1344,9 +1346,13 @@ func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 // startKeyVizFlusher launches RunFlusher in the supplied errgroup
 // and harvests the in-progress step with a final Flush after the
 // goroutine returns, so a graceful shutdown does not lose the most
-// recent partial column. Nil-safe: a disabled sampler reduces the
-// goroutine to ctx-wait + a no-op Flush.
+// recent partial column. Skip the goroutine entirely when the
+// sampler is disabled — RunFlusher would just park on ctx.Done with
+// no work to do, which is a free goroutine but adds no signal.
 func startKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler) {
+	if s == nil {
+		return
+	}
 	eg.Go(func() error {
 		keyviz.RunFlusher(ctx, s, s.Step())
 		s.Flush()
