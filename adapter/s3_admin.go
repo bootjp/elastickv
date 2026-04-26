@@ -1,12 +1,23 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"sort"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
+
+// adminBucketScanPage is the per-iteration ScanAt page size used by
+// AdminListBuckets. Smaller than s3MaxKeys is unnecessary —
+// ScanAt's per-call memory budget is already this size on the
+// SigV4 listBuckets path — but we use it as a named constant so the
+// loop's intent is explicit. AdminListBuckets accumulates pages
+// until the prefix is exhausted, so the total returned size is
+// bounded by the cluster's bucket count rather than this knob.
+const adminBucketScanPage = 1000
 
 // AdminBucketSummary is the bucket-level information the admin
 // dashboard surfaces. It deliberately projects only the fields the
@@ -30,8 +41,15 @@ type AdminBucketSummary struct {
 // AdminListBuckets returns every S3-style bucket this server knows
 // about, in lexicographic order (the metadata-prefix scan natural
 // ordering). Intended for the in-process admin listener as the
-// SigV4-free counterpart to the listBuckets HTTP handler; both
-// share the same underlying ScanAt so the two views cannot drift.
+// SigV4-free counterpart to the listBuckets HTTP handler.
+//
+// Unlike the SigV4 path (which intentionally caps each call at
+// s3MaxKeys = 1000 because the AWS API is page-based), the admin
+// dashboard's pagination is implemented at the handler layer, which
+// expects this method to return the full set. We loop the per-page
+// ScanAt until the metadata prefix is exhausted — same pattern as
+// scanAllByPrefixAt on the Dynamo side (Codex P1 + Claude Issue 1
+// on PR #658).
 //
 // Returns an empty slice (not nil) when no buckets exist so JSON
 // callers see `[]` instead of `null`.
@@ -39,35 +57,82 @@ func (s *S3Server) AdminListBuckets(ctx context.Context) ([]AdminBucketSummary, 
 	readTS := s.readTS()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
-	kvs, err := s.store.ScanAt(ctx,
-		[]byte(s3keys.BucketMetaPrefix),
-		prefixScanEnd([]byte(s3keys.BucketMetaPrefix)),
-		s3MaxKeys, readTS)
-	if err != nil {
-		return nil, errors.Wrap(err, "admin list buckets: scan metadata")
+	prefix := []byte(s3keys.BucketMetaPrefix)
+	end := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+	out := make([]AdminBucketSummary, 0, adminBucketScanPage)
+	for {
+		kvs, err := s.store.ScanAt(ctx, start, end, adminBucketScanPage, readTS)
+		if err != nil {
+			return nil, errors.Wrap(err, "admin list buckets: scan metadata")
+		}
+		if len(kvs) == 0 {
+			break
+		}
+		appended, halt, err := appendAdminBucketSummaries(out, kvs, prefix)
+		if err != nil {
+			return nil, err
+		}
+		out = appended
+		if halt {
+			// A key outside the metadata prefix means the
+			// table-of-contents layout changed mid-scan; returning
+			// what we have is safer than fabricating a summary
+			// from an unrelated key.
+			return finaliseAdminBucketList(out), nil
+		}
+		if len(kvs) < adminBucketScanPage {
+			break
+		}
+		start = nextScanCursor(kvs[len(kvs)-1].Key)
+		if end != nil && bytes.Compare(start, end) > 0 {
+			break
+		}
 	}
-	out := make([]AdminBucketSummary, 0, len(kvs))
+	return finaliseAdminBucketList(out), nil
+}
+
+// appendAdminBucketSummaries projects one ScanAt page into the
+// accumulating result slice. Returns the extended slice plus a halt
+// flag the caller uses to short-circuit when ScanAt yielded a key
+// outside the bucket-meta prefix (a defensive check that should not
+// trigger in practice but locks the contract). Splitting this out
+// keeps AdminListBuckets under the cyclomatic ceiling without
+// hiding the per-row decode + skip logic.
+func appendAdminBucketSummaries(out []AdminBucketSummary, kvs []*store.KVPair, prefix []byte) ([]AdminBucketSummary, bool, error) {
 	for _, kvp := range kvs {
+		if !bytes.HasPrefix(kvp.Key, prefix) {
+			return out, true, nil
+		}
 		bucket, ok := s3keys.ParseBucketMetaKey(kvp.Key)
 		if !ok {
 			continue
 		}
 		meta, err := decodeS3BucketMeta(kvp.Value)
 		if err != nil {
-			return nil, errors.Wrapf(err, "admin list buckets: decode metadata for %q", bucket)
+			return nil, false, errors.Wrapf(err, "admin list buckets: decode metadata for %q", bucket)
 		}
 		if meta == nil {
 			continue
 		}
 		out = append(out, summaryFromBucketMeta(bucket, meta))
 	}
-	// ScanAt returns metadata-prefix order which is already
-	// lexicographic by escaped name. The escape preserves byte
-	// ordering for the ASCII bucket-name alphabet, so a final
-	// sort is a defensive no-op rather than a correction — kept
-	// to lock the contract in case the encoding changes.
+	return out, false, nil
+}
+
+// finaliseAdminBucketList sorts the accumulated summaries and
+// returns the result. Pulled out because the scan loop has two
+// early-exit branches (prefix-mismatch defensive return + the
+// natural end-of-prefix exit) and both must guarantee
+// lexicographic ordering — one place to enforce it is safer than
+// two near-identical sort.Slice calls.
+func finaliseAdminBucketList(out []AdminBucketSummary) []AdminBucketSummary {
+	// ScanAt yields metadata-prefix order, which is already
+	// lexicographic by escaped name on the ASCII bucket-name
+	// alphabet. The final sort is defensive against a future
+	// key-encoding change rather than a correction today.
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return out
 }
 
 // AdminDescribeBucket returns the bucket-level snapshot for name.

@@ -193,7 +193,12 @@ type bucketsBridge struct {
 func (b *bucketsBridge) AdminListBuckets(ctx context.Context) ([]admin.BucketSummary, error) {
 	rows, err := b.server.AdminListBuckets(ctx)
 	if err != nil {
-		return nil, err //nolint:wrapcheck // adapter wraps internally with cockroachdb/errors.
+		// Wrap with the bridge frame so an operator debugging a 500
+		// from /admin/api/v1/s3/buckets sees the bridge in the error
+		// chain (Claude Issue 5 on PR #658). cockroachdb/errors
+		// already preserves the adapter's stack trace; this just
+		// adds the call-site context.
+		return nil, errors.Wrap(err, "admin buckets bridge: list")
 	}
 	out := make([]admin.BucketSummary, len(rows))
 	for i, r := range rows {
@@ -205,7 +210,7 @@ func (b *bucketsBridge) AdminListBuckets(ctx context.Context) ([]admin.BucketSum
 func (b *bucketsBridge) AdminDescribeBucket(ctx context.Context, name string) (*admin.BucketSummary, bool, error) {
 	row, exists, err := b.server.AdminDescribeBucket(ctx, name)
 	if err != nil {
-		return nil, false, err //nolint:wrapcheck // adapter wraps internally.
+		return nil, false, errors.Wrapf(err, "admin buckets bridge: describe %q", name)
 	}
 	if !exists || row == nil {
 		return nil, false, nil

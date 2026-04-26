@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -96,4 +97,39 @@ func TestS3Server_AdminDescribeBucket_Missing(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, exists)
 	require.Nil(t, got)
+}
+
+// TestS3Server_AdminListBuckets_PaginatesPastSinglePage pins the
+// fix for the truncation bug Codex P1 / Claude Issue 1 / Gemini
+// flagged on PR #658: AdminListBuckets must walk the metadata
+// prefix until exhausted, not stop at adminBucketScanPage. The
+// test exceeds the per-iteration page by 100 buckets (1100 total)
+// so a regression that re-introduces a single-call ScanAt would
+// silently drop the tail and the assertion fails.
+//
+// Total bucket count (1100) is small enough to keep the test
+// O(seconds) on the in-memory MVCC store. Names are zero-padded to
+// 4 digits so lexicographic order matches numeric order — the test
+// pins both the count AND the ordering contract.
+func TestS3Server_AdminListBuckets_PaginatesPastSinglePage(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	const total = adminBucketScanPage + 100
+	for i := range total {
+		name := fmt.Sprintf("bucket-%04d", i)
+		rec := httptest.NewRecorder()
+		req := newS3TestRequest(http.MethodPut, "/"+name, nil)
+		server.handle(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, "create %s", name)
+	}
+
+	got, err := server.AdminListBuckets(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, total,
+		"AdminListBuckets must continue past adminBucketScanPage; truncating here is the regression")
+	require.Equal(t, "bucket-0000", got[0].Name)
+	require.Equal(t, fmt.Sprintf("bucket-%04d", total-1), got[total-1].Name)
 }

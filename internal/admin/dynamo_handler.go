@@ -709,12 +709,6 @@ func (h *DynamoHandler) handleDescribe(w http.ResponseWriter, r *http.Request, n
 	writeAdminJSON(w, r.Context(), h.logger, summary)
 }
 
-// parseDynamoListLimit translates the ?limit= query parameter into a
-// concrete page size. The shared parseListLimit lives in
-// list_pagination.go; this comment is preserved here only because
-// it documents the historical rationale for the default / clamp
-// policy that the shared helper inherited.
-//
 // paginateDynamoTableNames slices `names` (already lex-sorted by the
 // adapter) into a single page starting strictly after `startAfter`.
 // The second return is the opaque cursor the client should pass back

@@ -118,6 +118,16 @@ func (h *S3Handler) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	buckets, err := h.source.AdminListBuckets(r.Context())
 	if err != nil {
+		// Map ErrBucketsForbidden to 403 here too so the contract
+		// stays symmetric with handleDescribe — when slice 2 wires
+		// a role gate on the source, the SPA gets the same 403 it
+		// would on the describe path rather than a generic 500
+		// (Gemini medium on PR #658).
+		if errors.Is(err, ErrBucketsForbidden) {
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this endpoint requires a full-access role")
+			return
+		}
 		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 list buckets failed",
 			slog.String("error", err.Error()),
 		)
@@ -203,12 +213,13 @@ func paginateBuckets(buckets []BucketSummary, startAfter string, limit int) ([]B
 	if end > len(buckets) {
 		end = len(buckets)
 	}
+	// A slice expression on a non-nil slice is itself non-nil even
+	// when its length is zero, so the result already produces the
+	// `"buckets":[]` JSON shape the SPA expects without an extra
+	// nil-guard (Claude Issue 2 on PR #658).
 	page := buckets[start:end]
 	if end < len(buckets) && len(page) > 0 {
 		return page, page[len(page)-1].Name
-	}
-	if page == nil {
-		return []BucketSummary{}, ""
 	}
 	return page, ""
 }
