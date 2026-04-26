@@ -211,7 +211,10 @@ func (s *Server) APIHandler() http.Handler {
 //	GET    /admin/api/v1/dynamo/tables/{name}       (auth required)
 //	DELETE /admin/api/v1/dynamo/tables/{name}       (auth required, full role)
 //	GET    /admin/api/v1/s3/buckets                 (auth required)
+//	POST   /admin/api/v1/s3/buckets                 (auth required, full role)
 //	GET    /admin/api/v1/s3/buckets/{name}          (auth required)
+//	DELETE /admin/api/v1/s3/buckets/{name}          (auth required, full role)
+//	PUT    /admin/api/v1/s3/buckets/{name}/acl      (auth required, full role)
 //	GET    /admin/api/v1/keyviz/matrix              (auth required)
 //
 // Body limit applies uniformly. CSRF and Audit middleware apply to

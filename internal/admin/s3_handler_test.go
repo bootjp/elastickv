@@ -648,6 +648,58 @@ func TestS3Handler_DeleteBucket_NotLeaderReturns503(t *testing.T) {
 	require.Equal(t, "1", rec.Header().Get("Retry-After"))
 }
 
+func TestS3Handler_WriteEndpoints_ValidationErrorReturns400(t *testing.T) {
+	// Pin the writeBucketsError *ValidationError arm — exercised
+	// end-to-end via the bridge (adapter ErrAdminInvalid* →
+	// translateAdminBucketsError → &ValidationError{...}) but
+	// previously had no handler-level coverage. Locking the arm
+	// down protects against a future refactor that drops the
+	// errors.As branch and silently downgrades typed validation
+	// failures to 500 (Claude review on PR #669).
+	const msg = "invalid bucket name: uppercase letters not allowed"
+	t.Run("create", func(t *testing.T) {
+		src := &stubBucketsSource{createErr: &ValidationError{Message: msg}}
+		h := newS3HandlerForTest(src)
+		req := httptest.NewRequest(http.MethodPost, pathS3Buckets,
+			strings.NewReader(validCreateBucketBody()))
+		req = withFullPrincipal(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Contains(t, rec.Body.String(), "invalid_request")
+		require.Contains(t, rec.Body.String(), msg)
+	})
+	t.Run("put_acl", func(t *testing.T) {
+		src := &stubBucketsSource{
+			buckets:   map[string]BucketSummary{"orders": {Name: "orders"}},
+			putACLErr: &ValidationError{Message: msg},
+		}
+		h := newS3HandlerForTest(src)
+		req := httptest.NewRequest(http.MethodPut, pathS3Buckets+"/orders/acl",
+			strings.NewReader(`{"acl":"public-read"}`))
+		req = withFullPrincipal(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Contains(t, rec.Body.String(), "invalid_request")
+		require.Contains(t, rec.Body.String(), msg)
+	})
+	t.Run("delete", func(t *testing.T) {
+		src := &stubBucketsSource{
+			buckets:   map[string]BucketSummary{"orders": {Name: "orders"}},
+			deleteErr: &ValidationError{Message: msg},
+		}
+		h := newS3HandlerForTest(src)
+		req := httptest.NewRequest(http.MethodDelete, pathS3Buckets+"/orders", nil)
+		req = withFullPrincipal(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.Contains(t, rec.Body.String(), "invalid_request")
+		require.Contains(t, rec.Body.String(), msg)
+	})
+}
+
 func TestS3Handler_WriteEndpoints_RejectMissingPrincipal(t *testing.T) {
 	// Without a session principal in the context, writes must
 	// 401 — SessionAuth normally enforces this; principalForWrite

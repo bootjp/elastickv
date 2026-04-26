@@ -437,6 +437,17 @@ func decodeAdminS3JSONBody[T any](body io.Reader) (T, error) {
 	if body == nil {
 		return zero, errors.New("request body is empty")
 	}
+	// nil ResponseWriter is safe here: MaxBytesReader's only use of
+	// the writer is the connection-close optimisation (sets the
+	// requestTooLarger flag on the writer when the cap is hit); the
+	// nil-check inside is a comma-ok type assertion, so passing nil
+	// just skips the optimisation. The cap itself is still enforced
+	// and surfaces as *http.MaxBytesError on the read, which the
+	// errors.As below catches and translates to errAdminS3BodyTooLarge.
+	// We do not have access to the *http.Request's writer at this
+	// layer (the helper takes only an io.Reader so the same code is
+	// reusable from non-HTTP entry points like AdminForward decode).
+	// Claude review on PR #669 flagged the nil as undocumented.
 	limited := http.MaxBytesReader(nil, io.NopCloser(body), adminS3CreateBodyLimit)
 	raw, err := io.ReadAll(limited)
 	if err != nil {
