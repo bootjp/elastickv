@@ -177,8 +177,18 @@ func (h *KeyVizHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cols := h.source.Snapshot(params.from, params.to)
 	matrix := pivotKeyVizColumns(cols, params.series, params.rows)
 	matrix.GeneratedAt = h.now()
-	if h.fanout != nil {
-		matrix = h.fanout.Run(r.Context(), params, matrix)
+	if h.fanout != nil && r.Header.Get(keyVizFanoutPeerHeader) == "" {
+		// Forward the inbound user's cookies so the peer's SessionAuth
+		// middleware sees a valid principal. Cluster nodes share
+		// --adminSessionSigningKey for HA, so a cookie minted on this
+		// node verifies on any peer. nil cookies make peers 401,
+		// which surfaces as ok=false in the per-node status.
+		//
+		// Skip the fan-out when keyVizFanoutPeerHeader is present:
+		// the request is itself a peer call and recursing would
+		// generate O(N²) HTTP calls per browser poll on a symmetric
+		// cluster (Claude bot P1 on PR #692).
+		matrix = h.fanout.Run(r.Context(), params, matrix, r.Cookies())
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -113,12 +114,6 @@ func TestRedis_BZPopMinWakesOnZIncrBy(t *testing.T) {
 	}
 }
 
-// TestRedis_BZPopMinTimesOutOnEmptyKey locks down the BLOCK-timeout
-// contract: when no ZADD arrives within the BLOCK window, BZPOPMIN
-// returns redis.Nil rather than a protocol error. This guards a
-// regression in the wait-loop refactor where the new
-// waitForBlockedCommandUpdate timer or context-cancel branch could otherwise
-// leak a -ERR reply.
 // TestRedis_BZPopMinRejectsInitialWrongType locks down the
 // first-iteration full-check invariant: when BZPOPMIN is issued
 // against a key that already holds a wrongType encoding (e.g. a
@@ -195,6 +190,99 @@ func TestRedis_BZPopMinDetectsMidBlockWrongType(t *testing.T) {
 	}
 }
 
+// TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad locks down the
+// periodic full-check invariant under sustained signal pressure
+// (Codex P1 / Claude bot review on 6173f584).
+//
+// The fast-path optimisation skips the wrongType slow probe on
+// signal-driven wakes. If `fast` is set directly from
+// waitForBlockedCommandUpdate's return value, sustained ZADD/ZINCRBY
+// signals can keep `fast=true` indefinitely — the 100 ms fallback
+// timer never fires because waiterC is constantly refilled. A
+// mid-block wrongType write on one of the registered keys then goes
+// undetected for the entire BLOCK window.
+//
+// Trigger: directly drive zsetWaiters.Signal in a tight loop on
+// bzpop-press-hot while the reader BZPOPMINs on
+// [bzpop-press-cold, bzpop-press-hot]. The reader's waiter is
+// registered on both keys, so each signal wakes it; the empty hot
+// key fast-probe returns nil, the loop continues with fast=true.
+// Driving Signal directly (rather than through a real producer)
+// removes the OCC-race non-determinism a stealer goroutine would
+// introduce. After the reader settles into fast mode, SET a string
+// at bzpop-press-cold. Without a wall-time-based forced full check,
+// the reader's fast probe on bzpop-press-cold never detects the
+// wrongType and the command times out at the BLOCK deadline
+// instead of returning WRONGTYPE.
+//
+// The fix maintains a lastFullCheck wall time inside bzpopminWaitLoop
+// and demotes `fast` back to false when more than redisBlockWaitFallback
+// has elapsed since the last full check, restoring the #666 ceiling.
+func TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdbReader := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbReader.Close() }()
+	rdbWriter := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbWriter.Close() }()
+
+	stealerCtx, stealerCancel := context.WithCancel(context.Background())
+	defer stealerCancel()
+
+	// Synthetic signal generator: tight loop calling
+	// zsetWaiters.Signal on bzpop-press-hot. The reader's waiter is
+	// registered on both bzpop-press-cold and bzpop-press-hot, so
+	// any signal on either key wakes it. No actual zset rows are
+	// written — the fast-path probe on bzpop-press-hot finds
+	// nothing and the reader stays blocked. runtime.Gosched lets
+	// the reader's goroutine make forward progress between
+	// signals.
+	signalServer := nodes[0].redisServer
+	go func() {
+		key := []byte("bzpop-press-hot")
+		for stealerCtx.Err() == nil {
+			signalServer.zsetWaiters.Signal(key)
+			runtime.Gosched()
+		}
+	}()
+
+	type popResult struct {
+		zwk *redis.ZWithKey
+		err error
+	}
+	resultCh := make(chan popResult, 1)
+	go func() {
+		zwk, err := rdbReader.BZPopMin(context.Background(), 3*time.Second,
+			"bzpop-press-cold", "bzpop-press-hot").Result()
+		resultCh <- popResult{zwk: zwk, err: err}
+	}()
+
+	// Let the reader complete several signal-driven wakes before we
+	// introduce the wrongType. 200 ms is well above the 100 ms
+	// fallback budget; with the fix in place a forced full check
+	// has run during this window.
+	time.Sleep(200 * time.Millisecond)
+
+	require.NoError(t, rdbWriter.Set(context.Background(), "bzpop-press-cold",
+		"I am a string", 0).Err())
+
+	select {
+	case res := <-resultCh:
+		require.Error(t, res.err, "BZPOPMIN must surface WRONGTYPE on bzpop-press-cold under signal load (zwk=%v)", res.zwk)
+		require.Contains(t, res.err.Error(), "WRONGTYPE")
+	case <-time.After(3500 * time.Millisecond):
+		t.Fatal("BZPOPMIN did not return WRONGTYPE under sustained signal load — fast mode likely sticky")
+	}
+}
+
+// TestRedis_BZPopMinTimesOutOnEmptyKey locks down the BLOCK-timeout
+// contract: when no ZADD arrives within the BLOCK window, BZPOPMIN
+// returns redis.Nil rather than a protocol error. This guards a
+// regression in the wait-loop refactor where the new
+// waitForBlockedCommandUpdate timer or context-cancel branch could otherwise
+// leak a -ERR reply.
 func TestRedis_BZPopMinTimesOutOnEmptyKey(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
