@@ -643,10 +643,17 @@ func validateThrottleConfig(meta *sqsQueueMeta) error {
 	if err := validateThrottlePair("ThrottleRecv", t.RecvCapacity, t.RecvRefillPerSecond, true); err != nil {
 		return err
 	}
-	// Default* covers any future non-Send/Recv verb that gets wired
-	// into the throttle path — no batch verb is in scope today, so the
-	// minimum-batch-capacity check is off for this bucket.
-	if err := validateThrottlePair("ThrottleDefault", t.DefaultCapacity, t.DefaultRefillPerSecond, false); err != nil {
+	// Default* gets the same batch-capacity floor as Send*/Recv*
+	// because resolveActionConfig in sqs_throttle.go falls Send and
+	// Receive traffic through to Default whenever the corresponding
+	// Send*/Recv* pair is unset. Without the floor, a config like
+	// `ThrottleDefaultCapacity=5, ThrottleDefaultRefillPerSecond=1`
+	// would be accepted but make every full SendMessageBatch /
+	// DeleteMessageBatch (charge=10) permanently unserviceable —
+	// the bucket can never accumulate the 10 tokens. Codex P1 on
+	// PR #679 round 5 caught the gap; the design doc note in §3.2
+	// claiming Default* is exempt was wrong about the fall-through.
+	if err := validateThrottlePair("ThrottleDefault", t.DefaultCapacity, t.DefaultRefillPerSecond, true); err != nil {
 		return err
 	}
 	if t.IsEmpty() {

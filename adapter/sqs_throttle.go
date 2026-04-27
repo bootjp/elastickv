@@ -321,19 +321,41 @@ func (b *bucketStore) runSweepLoop(ctx context.Context) {
 // evictedAfter. Called from runSweepLoop on a background ticker —
 // the ticker is the only caller, so sweep() does not need its own
 // serialisation. Bucket lookups stay O(1) on the hot path; sweep
-// iterates every entry under the per-bucket lock (held briefly for
-// the timestamp read) so it never blocks a charge() that already has
-// the bucket.
+// iterates every entry under the per-bucket lock so it can re-check
+// idle and the map entry atomically.
+//
+// Eviction race (Codex P2 on PR #679 round 5): an earlier version
+// computed idle, released the lock, then unconditionally Deleted —
+// a concurrent charge() running in that window could refill +
+// take a token, the subsequent Delete would evict the just-used
+// bucket, and the next request would get a fresh full-capacity
+// bucket so the deduction was effectively undone. The fix has two
+// parts:
+//  1. Hold bucket.mu across the Delete so the idle observation
+//     cannot be invalidated between check and delete. A concurrent
+//     charge() that wants the bucket either runs to completion
+//     before sweep acquires mu (sweep then sees the updated
+//     lastRefill and skips delete), or waits for sweep to release
+//     mu (charge then takes the bucket — but sweep has already
+//     removed it from the map, so the charge succeeds against an
+//     orphan bucket and only the next-after-charge request gets
+//     the full-cap rebuild — bounded one-token leak).
+//  2. CompareAndDelete with v ensures sweep does not evict a
+//     replacement bucket inserted by invalidateQueue or a future
+//     reconciliation path.
+//
+// Holding bucket.mu across sync.Map.Delete is safe — sync.Map.Load
+// is wait-free on the read-only path and never blocks waiting for
+// bucket.mu, so there is no AB-BA cycle with charge().
 func (b *bucketStore) sweep() {
 	cutoff := b.clock().Add(-b.evictedAfter)
 	b.buckets.Range(func(k, v any) bool {
 		bucket, _ := v.(*tokenBucket)
 		bucket.mu.Lock()
-		idle := bucket.lastRefill.Before(cutoff)
-		bucket.mu.Unlock()
-		if idle {
-			b.buckets.Delete(k)
+		if bucket.lastRefill.Before(cutoff) {
+			b.buckets.CompareAndDelete(k, v)
 		}
+		bucket.mu.Unlock()
 		return true
 	})
 }

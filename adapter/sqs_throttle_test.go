@@ -307,6 +307,72 @@ func TestBucketStore_ConcurrentReconciliationRespectsNewCapacity(t *testing.T) {
 		"exactly cfgNew.SendCapacity successes; a Delete-after-replace race would let some past the cap")
 }
 
+// TestBucketStore_SweepDoesNotEvictRecentlyUsedBucket pins the
+// Codex P2 fix on PR #679 round 5: an earlier version of sweep
+// computed idle, released bucket.mu, then unconditionally Deleted.
+// A charge() running in that window could refill+take a token; the
+// Delete then evicted the just-used bucket and the next request
+// got a fresh full-capacity bucket — the just-taken token was
+// effectively undone, allowing excess throughput.
+//
+// The test forces this exact race: pre-build a bucket with a stale
+// lastRefill (well past cutoff), then in two paired goroutines
+//
+//	(A) advance the clock, run sweep
+//	(B) run charge concurrently with sweep
+//
+// charge() acquires bucket.mu, refills, takes a token, releases.
+// sweep() acquires bucket.mu after charge, observes the freshened
+// lastRefill, and skips the delete. After both finish, the bucket
+// must still be in the store with `tokens = capacity - 1`.
+func TestBucketStore_SweepDoesNotEvictRecentlyUsedBucket(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	clk := now
+	store := newBucketStore(func() time.Time { return clk }, time.Hour)
+	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
+	// Build the bucket via a single charge so it lands in the store.
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	// Backdate the bucket's lastRefill 2 hours so it's idle relative
+	// to the 1h evict window.
+	key := bucketKey{queue: "orders", action: bucketActionSend}
+	v, ok := store.buckets.Load(key)
+	require.True(t, ok)
+	bucket, _ := v.(*tokenBucket)
+	bucket.mu.Lock()
+	bucket.lastRefill = now.Add(-2 * time.Hour)
+	bucket.mu.Unlock()
+	// Race sweep against charge. The "advanced clock" makes lastRefill
+	// older than cutoff so sweep would delete unconditionally; the
+	// concurrent charge must update lastRefill before sweep observes
+	// it.
+	clk = now.Add(2 * time.Hour)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		store.sweep()
+	}()
+	go func() {
+		defer wg.Done()
+		// Hammer the same bucket so at least one charge interleaves
+		// with sweep's bucket.mu acquisition.
+		for range 50 {
+			store.charge(cfg, "orders", bucketActionSend, 1)
+		}
+	}()
+	wg.Wait()
+	// The bucket must still be in the store: at least one of the 50
+	// charges updated lastRefill within the sweep window, so the
+	// re-check under bucket.mu sees the freshened timestamp and
+	// CompareAndDelete is skipped. If the old code (compute-then-
+	// delete-without-recheck) regresses, the bucket may be evicted
+	// and the assertion fails.
+	_, stillThere := store.buckets.Load(key)
+	require.True(t, stillThere,
+		"sweep must not evict a bucket that was used during the sweep window")
+}
+
 // TestComputeRetryAfter_CapsAtMaximum pins the Gemini medium fix on
 // PR #679: a tiny refillRate (e.g. 1e-9) plus a large requested
 // count would otherwise compute a multi-day Retry-After and
@@ -456,13 +522,28 @@ func TestValidateThrottleConfig_CapacityGEMaxBatchCharge(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestValidateThrottleConfig_DefaultBucketExempt confirms the §3.2
-// "Default* is exempt" rule: the catch-all bucket has no batch verb
-// in scope today, so it can take a smaller capacity.
-func TestValidateThrottleConfig_DefaultBucketExempt(t *testing.T) {
+// TestValidateThrottleConfig_DefaultBucketBatchFloor pins the
+// Codex P1 fix on PR #679 round 5: Default* gets the same batch-
+// capacity ≥ 10 floor as Send/Recv because resolveActionConfig
+// falls Send/Recv traffic through to Default when the dedicated
+// pair is unset. Without the floor a Default-only config of
+// {capacity=5, refill=1} would accept SendMessageBatch entries=10
+// requests at the validator and reject them forever at the bucket.
+func TestValidateThrottleConfig_DefaultBucketBatchFloor(t *testing.T) {
 	t.Parallel()
+	// Capacity 1 (below the batch floor) must reject.
 	err := validateThrottleConfig(&sqsQueueMeta{
 		Throttle: &sqsQueueThrottle{DefaultCapacity: 1, DefaultRefillPerSecond: 1},
+	})
+	require.Error(t, err)
+	// Capacity below batch floor at 5 must also reject.
+	err = validateThrottleConfig(&sqsQueueMeta{
+		Throttle: &sqsQueueThrottle{DefaultCapacity: 5, DefaultRefillPerSecond: 1},
+	})
+	require.Error(t, err)
+	// Capacity exactly at the batch floor is accepted.
+	err = validateThrottleConfig(&sqsQueueMeta{
+		Throttle: &sqsQueueThrottle{DefaultCapacity: 10, DefaultRefillPerSecond: 1},
 	})
 	require.NoError(t, err)
 }
