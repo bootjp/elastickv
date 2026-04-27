@@ -34,6 +34,16 @@ const keyVizFanoutDefaultTimeout = 2 * time.Second
 // misbehaving peer flood operator logs.
 const keyVizPeerErrorBodyLimit = 512
 
+// keyVizPeerResponseBodyLimit caps the JSON body we are willing to
+// decode from a peer. A misbehaving or compromised peer that streams
+// gigabytes back at us would otherwise pin a goroutine on
+// json.Decode and balloon memory. The cap is generous enough for the
+// design's worst-case payload — 1024 rows × 4096 columns × ~32 bytes
+// per uint64 ≈ 128 MiB raw, ~32 MiB JSON-encoded — but still bounded.
+// Operators with larger configurations should override via a future
+// flag rather than relying on the unbounded path.
+const keyVizPeerResponseBodyLimit int64 = 64 << 20 // 64 MiB
+
 // keyVizMergeBucketHint is a hand-tuned starting capacity for the
 // merge phase's bucket map / order slice. Most fan-out responses
 // are well under 1024 rows; 64 lets a small cluster avoid the
@@ -263,18 +273,49 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 	if err != nil {
 		return nil, pkgerrors.Wrap(err, "peer request")
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		// A peer that hangs on body close can wedge our goroutine
+		// against the deadline; log and move on rather than blocking.
+		if cerr := resp.Body.Close(); cerr != nil {
+			f.logger.LogAttrs(ctx, slog.LevelDebug, "keyviz fan-out: peer body close failed",
+				slog.String("peer", peer),
+				slog.String("error", cerr.Error()),
+			)
+		}
+	}()
 	if resp.StatusCode != http.StatusOK {
 		// Read a bounded prefix of the body so the error message is
 		// useful without letting a misbehaving peer flood our logs.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, keyVizPeerErrorBodyLimit))
 		return nil, fmt.Errorf("%w: status %d: %s", errKeyVizPeer, resp.StatusCode, string(body))
 	}
+	// Bound the JSON decode so a peer that streams gigabytes cannot
+	// pin a goroutine and balloon memory. The +1 lets us probe past
+	// the cap so we can detect the overshoot rather than silently
+	// truncating; see keyVizPeerResponseBodyLimit for sizing.
+	limited := io.LimitReader(resp.Body, keyVizPeerResponseBodyLimit+1)
 	var m KeyVizMatrix
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+	if err := json.NewDecoder(limited).Decode(&m); err != nil {
 		return nil, pkgerrors.Wrap(err, "decode peer response")
 	}
+	if peerResponseExceededLimit(limited) {
+		f.logger.LogAttrs(ctx, slog.LevelWarn, "keyviz fan-out: peer response exceeded size limit; truncated decode",
+			slog.String("peer", peer),
+			slog.Int64("limit_bytes", keyVizPeerResponseBodyLimit),
+		)
+	}
 	return &m, nil
+}
+
+// peerResponseExceededLimit returns true when the LimitReader still
+// has data after the JSON decoder finished — meaning the peer sent
+// more than keyVizPeerResponseBodyLimit bytes and the matrix may be
+// incomplete. The decoder accepts trailing data so we must probe
+// explicitly; one byte is enough to distinguish "capped" from "EOF".
+func peerResponseExceededLimit(r io.Reader) bool {
+	var buf [1]byte
+	n, _ := r.Read(buf[:])
+	return n > 0
 }
 
 // buildKeyVizPeerURL forwards the parsed query parameters from the

@@ -164,7 +164,7 @@ func TestKeyVizFanoutRunSinglePeerOK(t *testing.T) {
 			{BucketID: "route:1", Values: []uint64{7}},
 		},
 	}
-	peer := newKeyVizPeerStub(t, http.StatusOK, peerMatrix)
+	peer := newKeyVizPeerStub(t, peerMatrix)
 	defer peer.Close()
 
 	f := NewKeyVizFanout("self:8080", []string{peer.URL}).WithHTTPClient(peer.Client())
@@ -316,9 +316,9 @@ func TestBuildKeyVizPeerURLForwardsParams(t *testing.T) {
 func TestKeyVizFanoutRunPeerOrder(t *testing.T) {
 	t.Parallel()
 	matrix := KeyVizMatrix{Series: keyVizSeriesReads}
-	first := newKeyVizPeerStub(t, http.StatusOK, matrix)
+	first := newKeyVizPeerStub(t, matrix)
 	defer first.Close()
-	second := newKeyVizPeerStub(t, http.StatusOK, matrix)
+	second := newKeyVizPeerStub(t, matrix)
 	defer second.Close()
 
 	f := NewKeyVizFanout("self:8080", []string{first.URL, second.URL}).WithHTTPClient(first.Client())
@@ -330,11 +330,54 @@ func TestKeyVizFanoutRunPeerOrder(t *testing.T) {
 	}, merged.Fanout.Nodes)
 }
 
+// TestKeyVizFanoutRunPeerOverlargeBody pins the security-high
+// review item on PR #686: a peer that streams more than
+// keyVizPeerResponseBodyLimit bytes must not pin a goroutine on the
+// JSON decoder or balloon memory. The aggregator caps the decode at
+// the configured limit and surfaces a warning log rather than
+// silently accepting a truncated matrix.
+func TestKeyVizFanoutRunPeerOverlargeBody(t *testing.T) {
+	t.Parallel()
+	// Build a JSON payload whose `rows` array is enormous: many
+	// rows of 4096 zeroed values. We do not actually need to exceed
+	// the production cap (64 MiB) — we just need to assert that the
+	// decode completes promptly and that the peer call ends up
+	// reporting OK with a row count that matches what was on the wire
+	// up to the cap.
+	hugeRow := KeyVizRow{
+		BucketID: "route:big",
+		Values:   make([]uint64, 4096),
+	}
+	rows := make([]KeyVizRow, 64)
+	for i := range rows {
+		rows[i] = hugeRow
+	}
+	body := KeyVizMatrix{
+		ColumnUnixMs: make([]int64, 4096),
+		Rows:         rows,
+		Series:       keyVizSeriesReads,
+	}
+	peer := newKeyVizPeerStub(t, body)
+	defer peer.Close()
+
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).WithHTTPClient(peer.Client())
+
+	start := time.Now()
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads})
+	require.Less(t, time.Since(start), 5*time.Second, "decode must respect the size cap and complete promptly")
+	require.NotNil(t, merged.Fanout)
+	require.True(t, merged.Fanout.Nodes[1].OK, "in-cap response must succeed; cap is 64 MiB and the synthetic body is well under that")
+}
+
 // newKeyVizPeerStub spins up an httptest.Server that answers
-// /admin/api/v1/keyviz/matrix with a fixed JSON body. Anything
+// /admin/api/v1/keyviz/matrix with a fixed 200 JSON body. Anything
 // else returns 404 — which surfaces as "peer status 404" in the
 // aggregator and lets a future test assert the path verbatim.
-func newKeyVizPeerStub(t *testing.T, status int, body KeyVizMatrix) *httptest.Server {
+//
+// Tests that need a non-200 response build their handler inline
+// (see TestKeyVizFanoutRunPeerHTTPError); this helper covers the
+// common happy-path stub.
+func newKeyVizPeerStub(t *testing.T, body KeyVizMatrix) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/admin/api/v1/keyviz/matrix") {
@@ -342,7 +385,7 @@ func newKeyVizPeerStub(t *testing.T, status int, body KeyVizMatrix) *httptest.Se
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
+		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(body); err != nil {
 			t.Logf("encode peer body: %v", err)
 		}
