@@ -79,27 +79,33 @@ func partitionFor(meta *sqsQueueMeta, messageGroupID string) uint32 {
 	if messageGroupID == "" {
 		return 0
 	}
-	// Inlined FNV-1a over the string to avoid the []byte allocation
-	// hash/fnv.New64a + h.Write would force (Gemini medium on PR
-	// #681). MessageGroupId is capped at 128 chars by validation, so
-	// this loop bounds at 128 iterations of integer arithmetic per
+	// Inlined FNV-1a 32-bit over the string to avoid the []byte
+	// allocation hash/fnv.New32a + h.Write would force (Gemini medium
+	// on PR #681). MessageGroupId is capped at 128 chars by validation,
+	// so this loop bounds at 128 iterations of integer arithmetic per
 	// SendMessage — measurably faster than the hash.Hash interface
-	// path on the routing hot path.
+	// path on the routing hot path. The 32-bit variant keeps the
+	// computation in uint32 throughout, sidestepping the uint64 →
+	// uint32 narrowing that the 64-bit variant would have required for
+	// the partition mask AND (CodeRabbit nit on PR #664 round 7 — the
+	// previous implementation needed `//nolint:gosec G115` to silence
+	// a false positive on the safe-by-construction narrow). PartitionCount
+	// ≤ htfifoMaxPartitions = 32 so log2(PartitionCount) ≤ 5; only the
+	// low 5 bits of the hash ever survive the mask, and 32-bit FNV-1a
+	// is more than enough entropy to spread MessageGroupId values
+	// uniformly across that range.
 	const (
-		fnv64Offset uint64 = 14695981039346656037
-		fnv64Prime  uint64 = 1099511628211
+		fnv32Offset uint32 = 2166136261
+		fnv32Prime  uint32 = 16777619
 	)
-	hash := fnv64Offset
+	hash := fnv32Offset
 	for i := 0; i < len(messageGroupID); i++ {
-		hash ^= uint64(messageGroupID[i])
-		hash *= fnv64Prime
+		hash ^= uint32(messageGroupID[i])
+		hash *= fnv32Prime
 	}
 	// PartitionCount is a power of two (validator-enforced); mod is
 	// equivalent to mask-AND. The mask is meta.PartitionCount - 1.
-	// Computing the mask in uint64 first then narrowing to uint32 is
-	// safe because htfifoMaxPartitions == 32 fits in uint32 trivially.
-	mask := uint64(meta.PartitionCount - 1)
-	return uint32(hash & mask) //nolint:gosec // masked by (PartitionCount - 1) ≤ htfifoMaxPartitions − 1, fits in uint32.
+	return hash & (meta.PartitionCount - 1)
 }
 
 // isPowerOfTwo returns true when n is a positive power of two.

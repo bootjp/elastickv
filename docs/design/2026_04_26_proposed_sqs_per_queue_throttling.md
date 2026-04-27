@@ -26,7 +26,7 @@ This document proposes per-queue token-bucket throttling, configured per-queue i
 
 1. **Per-queue rate limits** that an operator can set via `SetQueueAttributes` and read back via `GetQueueAttributes`. Limits are persisted on the queue meta record (one Raft commit, no separate keyspace).
 2. **Per-action granularity** — `SendMessage` and `ReceiveMessage` have independent buckets so a slow consumer cannot pin the producer or vice versa. Batch verbs charge by entry count, not by call count.
-3. **AWS-shape errors**: throttled requests return HTTP `400` + body `<Code>Throttling</Code>` with a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code.
+3. **AWS-shape errors**: throttled requests return HTTP `400` with the `Throttling` error code in whichever envelope the request protocol uses (`{"__type":"Throttling", ...}` for the JSON path, `<Code>Throttling</Code>` for the query/XML path — see §3.4 for the exact wire shape per protocol) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code.
 4. **Default-off**. Queues created before this feature, and queues created without explicit limits, are not throttled. Operators opt in per queue.
 5. **No coordination per request**. Token replenishment is local to whichever node owns the bucket (the leader for the queue's shard); there is no Raft round-trip on the throttling check.
 6. **Observable**: per-queue throttle counters are exposed via the existing Prometheus registry so dashboards can spot throttling before users do.
@@ -227,11 +227,11 @@ Once Phase 3.D (split-queue FIFO) lands, a single queue may span multiple shards
 
 ## 5. AWS-Compatibility Surface
 
-The throttling configuration is **non-AWS** — there is no `ThrottleSendCapacity` attribute in AWS SQS. Operators see it only when they explicitly read or set it via `GetQueueAttributes` / `SetQueueAttributes`. SDKs that strictly validate the attribute set will reject our extension on read; we mitigate by:
+The throttling configuration is **non-AWS** — there is no `ThrottleSendCapacity` attribute in AWS SQS. The `Throttle*` names are exposed alongside the AWS-defined queue attributes; any principal whose SigV4 credentials grant `SetQueueAttributes` / `GetQueueAttributes` on the queue can read or modify them, the same access model the rest of the queue meta uses. Operators control who can mutate throttle config the same way they control any other queue attribute — at the credential / IAM-policy boundary, not via a separate role inside the SQS adapter.
 
-1. Adding the `Throttle*` names to `applyAttributes` only when the call is authenticated as an admin principal (the existing access-key-to-role mapping). Standard SQS clients see a 400 `InvalidAttributeName` when they try to set a `Throttle*` field, matching AWS's behaviour for unknown attributes.
-2. Stripping `Throttle*` from the `GetQueueAttributes` response when the requesting principal is not an admin. Standard SQS clients see only the AWS-defined attribute set.
-3. The throttling enforcement itself runs for every principal — admin or not. The configuration plane is admin-only; the data plane is universal.
+Strict-validation SDKs that reject unknown attribute names will reject `Throttle*` on read (or balk at the `Set*` call); operators using such SDKs either set the attribute through a non-strict client (the AWS CLI, `awscurl`, the elastickv admin RPC) or whitelist the names in their SDK config. The throttling enforcement itself runs for every authenticated principal — the cost of the bucket check is independent of which SigV4 key signed the request.
+
+(An earlier draft of this proposal scoped throttle config to an "admin principal" backed by an access-key-to-role mapping. The mapping does not exist at the SQS HTTP layer — only the operator-only admin RPCs (`AdminDeleteQueue`, etc.) carry an `AdminPrincipal`, and HTTP requests authenticate via the static credentials map (`WithSQSStaticCredentials`) which is access-key → secret only. Adding a role layer would be a separable change with its own design — see future work / §11.)
 
 ---
 
@@ -260,7 +260,7 @@ The throttling configuration is **non-AWS** — there is no `ThrottleSendCapacit
    - Same shape for `ReceiveMessage` (raise `RecvCapacity` after exhausting the Recv bucket).
    - Same shape for `DeleteQueue` lifecycle: send 10 to exhaust → `DeleteQueue` → `CreateQueue` with the same name and `SendCapacity=10` → first `SendMessage` returns 200 (full-capacity fresh bucket), not the stale empty bucket from the previous incarnation.
 
-4. **Configuration round-trip**: `SetQueueAttributes` with throttle config → `GetQueueAttributes` returns the same values for an admin principal; returns 400 `InvalidAttributeName` for a standard principal.
+4. **Configuration round-trip**: `SetQueueAttributes` with throttle config → `GetQueueAttributes` returns the same values; an unknown `Throttle*` attribute name is rejected with 400 `InvalidAttributeName` (matching AWS behaviour for unrecognised attributes).
 
 5. **Cross-protocol parity**: throttled JSON and Query requests both surface `Throttling` (different envelope, same code).
 

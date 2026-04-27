@@ -161,7 +161,7 @@ For deployments that don't want one Raft group per partition (e.g. a small clust
 
 ### 4.1 SendMessage on a partitioned FIFO
 
-```
+```text
 1. Decode → sqsSendMessageInput (existing).
 2. validateSendFIFOParams: same as today (MessageGroupId required).
 3. partitionIndex := partitionFor(meta, in.MessageGroupId).
@@ -189,7 +189,7 @@ Steps 1–2 are unchanged; step 3 is the new routing call (~10 lines); steps 4�
 
 ReceiveMessage today scans `sqsMsgVisPrefixForQueue(queue, gen)` once. Under partitioning that becomes a scan **per partition** with **leader proxying for the partitions whose leader lives on a different node**:
 
-```
+```text
 1. Decode → sqsReceiveMessageInput (existing).
 2. Compute partitionOrder := starting offset chosen by hashing the
    request's RequestId (or random when absent) so successive calls
@@ -247,7 +247,7 @@ These take a `ReceiptHandle` which already encodes the partition index. The rece
 
 `kv/shard_router.go` today routes by queue name. With partitions, the routing key becomes `(queueName, partitionIndex)`. The partition-to-Raft-group assignment lands on a **new dedicated flag** rather than overloading the existing `--raftSqsMap` (Claude P1 on PR #664 caught the original proposal to extend `--raftSqsMap` syntax — that flag already maps `raftAddr=sqsAddr` for `proxyToLeader`'s endpoint resolution, and overloading the same parser with partition assignments creates a parsing ambiguity that could silently produce the wrong proxy target in §4.2's fanout):
 
-```
+```text
 --sqsFifoPartitionMap "orders.fifo:8=group-7,group-8,group-9,group-10,group-11,group-12,group-13,group-14"
 ```
 
