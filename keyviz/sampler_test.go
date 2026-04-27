@@ -1102,19 +1102,21 @@ func BenchmarkObserveMiss(b *testing.B) {
 // global counter) on the hot path will show up as a sharp drop in
 // ns/op as parallelism rises.
 //
-// The earlier draft used a per-worker `var i uint64` counter which
-// always started at zero, so all workers walked the same route
-// sequence in lockstep — that defeated the "distinct slot" claim
-// and the benchmark would have masked false-sharing regressions
-// (Codex P2 / Gemini medium on PR #682).
+// numRoutes is sized for numRoutes / routesPerShard >= 64
+// disjoint shards so the benchmark stays meaningful up to
+// GOMAXPROCS = 64. The previous draft (numRoutes = 64,
+// routesPerShard = 4) only had 16 shards and silently regressed
+// to shared-counter contention on bigger CI runners — the very
+// regression class this benchmark exists to detect (Claude bot
+// round-2 P2 on PR #682).
 func BenchmarkObserveParallel(b *testing.B) {
 	const (
-		numRoutes      = 64
+		numRoutes      = 256
 		routesPerShard = 4
 	)
 	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, MaxTrackedRoutes: numRoutes})
 	for r := uint64(1); r <= numRoutes; r++ {
-		if !s.RegisterRoute(r, []byte{byte(r)}, []byte{byte(r) + 1}) {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
 			b.Fatalf("RegisterRoute(%d) returned false", r)
 		}
 	}
@@ -1312,13 +1314,20 @@ func TestObserveExactCountUnderConcurrentBurst(t *testing.T) {
 // runConcurrentBurst spawns numRoutes×writersPerRoute goroutines and
 // releases them simultaneously so every route sees genuinely
 // concurrent Observe traffic. Returns once every writer has finished.
-func runConcurrentBurst(s *MemSampler, numRoutes, writersPerRoute, opsPerWriter, keyLen, valueLen int) {
+//
+// numRoutes is uint64 so the loop iterates in the same type the
+// sampler uses for RouteID; the earlier `int` form needed a
+// per-iteration `uint64(r)` cast that triggered gosec G115 and a
+// nolint suppression CLAUDE.md tells us to refactor instead of
+// suppress (Claude bot round-2 P1 on PR #682).
+func runConcurrentBurst(s *MemSampler, numRoutes uint64, writersPerRoute, opsPerWriter, keyLen, valueLen int) {
 	var ready, start, done sync.WaitGroup
-	ready.Add(numRoutes * writersPerRoute)
-	done.Add(numRoutes * writersPerRoute)
+	total := int(numRoutes) * writersPerRoute
+	ready.Add(total)
+	done.Add(total)
 	start.Add(1)
-	for r := 1; r <= numRoutes; r++ {
-		routeID := uint64(r) //nolint:gosec // r bounded by numRoutes
+	for r := uint64(1); r <= numRoutes; r++ {
+		routeID := r
 		for w := 0; w < writersPerRoute; w++ {
 			go func() {
 				defer done.Done()
