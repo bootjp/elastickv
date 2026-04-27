@@ -249,6 +249,64 @@ func TestBucketStore_ReconcilesBucketOnConfigChange(t *testing.T) {
 	require.False(t, store.charge(cfgNew, "orders", bucketActionSend, 1).allowed)
 }
 
+// TestBucketStore_ConcurrentReconciliationRespectsNewCapacity pins
+// the CompareAndDelete fix on PR #679 round 4: two concurrent
+// goroutines hitting a stale bucket must not race each other into
+// double-replacing the map entry. Without CompareAndDelete the
+// second goroutine's unconditional Delete would evict the first
+// goroutine's fresh bucket, leaving the second's fresh bucket
+// behind — but the first's bucket is already being charged, so
+// total charges across the mismatch window can exceed the new
+// capacity.
+//
+// Race the test by having N goroutines each invoke charge() with
+// the new config (post-mismatch) on the same (queue, action). The
+// first one through builds the fresh bucket; every later one must
+// observe the same fresh bucket and share its capacity. After all
+// goroutines finish, total successful charges must equal exactly
+// the new capacity — anything more means a Delete-after-replace
+// orphaned a fresh bucket.
+func TestBucketStore_ConcurrentReconciliationRespectsNewCapacity(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Hour)
+
+	// Seed the store with a stale bucket from cfgOld.
+	cfgOld := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
+	for range 5 {
+		require.True(t, store.charge(cfgOld, "orders", bucketActionSend, 1).allowed)
+	}
+
+	// Now race many goroutines through the new config. Each charge
+	// triggers reconciliation against cfgNew. The race window is
+	// between Load detecting the stale bucket and CompareAndDelete +
+	// LoadOrStore committing the replacement; without
+	// CompareAndDelete, two racers can each Delete + LoadOrStore and
+	// the loser's fresh bucket may end up orphaned while still being
+	// charged through a leaked pointer.
+	cfgNew := &sqsQueueThrottle{SendCapacity: 50, SendRefillPerSecond: 1}
+	const goroutines = 200
+	var (
+		wg        sync.WaitGroup
+		successes int64
+		mu        sync.Mutex
+	)
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if store.charge(cfgNew, "orders", bucketActionSend, 1).allowed {
+				mu.Lock()
+				successes++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	require.EqualValues(t, 50, successes,
+		"exactly cfgNew.SendCapacity successes; a Delete-after-replace race would let some past the cap")
+}
+
 // TestComputeRetryAfter_CapsAtMaximum pins the Gemini medium fix on
 // PR #679: a tiny refillRate (e.g. 1e-9) plus a large requested
 // count would otherwise compute a multi-day Retry-After and

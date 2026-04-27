@@ -249,7 +249,19 @@ func (b *bucketStore) loadOrInit(queue, action string, capacity, refill float64)
 		if matches {
 			return bucket
 		}
-		b.buckets.Delete(key)
+		// CompareAndDelete is mandatory here: an unconditional Delete
+		// races against a concurrent goroutine that already detected
+		// the same mismatch and replaced the entry with its own fresh
+		// bucket — our Delete would evict its fresh entry, then our
+		// LoadOrStore would put another fresh bucket. The map ends up
+		// holding our bucket, but the racer's bucket might have
+		// already been handed out via LoadOrStore to a third
+		// goroutine that is now charging a bucket no longer in the
+		// map, while later requests get a different fresh bucket at
+		// full capacity. CompareAndDelete makes our Delete a no-op
+		// when the map already holds someone else's fresh bucket.
+		// (Claude P1 on PR #679 round 4 caught this.)
+		b.buckets.CompareAndDelete(key, v)
 		// fall through to LoadOrStore — a concurrent racer might
 		// have already inserted a fresh bucket with the current
 		// config, in which case LoadOrStore picks it up and the new
