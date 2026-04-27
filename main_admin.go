@@ -135,8 +135,47 @@ func startAdminFromFlags(
 	if err != nil {
 		return errors.Wrap(err, "build admin leader forwarder")
 	}
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, keyvizSampler, keyvizFanoutCfg, buildVersion())
+	leaderProbe := newAdminLeaderProbe(coordinate)
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg, buildVersion())
 	return err
+}
+
+// newAdminLeaderProbe builds the LeaderProbe consumed by
+// /admin/healthz/leader. It mirrors the verified-leader pattern S3 and
+// DynamoDB use on their own /healthz/leader endpoints
+// (adapter/s3.go:isVerifiedS3Leader,
+// adapter/dynamodb.go:isVerifiedDynamoLeader): a cheap IsLeader check
+// short-circuits non-leaders, and only nodes claiming leadership pay
+// the ReadIndex round-trip that confirms the claim is still valid.
+//
+// Crucially the probe is scoped to the **default Raft group** (via
+// coordinate.IsLeader / coordinate.VerifyLeader) — the same group the
+// admin write paths key off (kv/sharded_coordinator.go), which the
+// AdminForward proxy and the SQS admin write path
+// (adapter/sqs_admin.go) both treat as authoritative. An earlier
+// design returned true on any local-group leadership; in a multi-group
+// deployment that could surface 200 on a node leading only a non-
+// default group while admin writes there still 503'd or forwarded.
+// Codex P1 on PR #689 caught this; using the coordinator keeps the
+// healthz contract aligned with the actual admin-write leader.
+//
+// Returns nil when no coordinator is wired so the router answers
+// /admin/healthz/leader with the standard JSON 404 (matches the
+// "feature off" pattern Tables / Buckets / Queues already use).
+func newAdminLeaderProbe(coordinate kv.Coordinator) admin.LeaderProbe {
+	if coordinate == nil {
+		return nil
+	}
+	return admin.LeaderProbeFunc(func() bool {
+		if !coordinate.IsLeader() {
+			return false
+		}
+		// VerifyLeader is the same ReadIndex round-trip lease reads
+		// use; under the hood it carries an engine-bounded deadline,
+		// so a stalled cluster surfaces 503 here on its own without
+		// the probe needing an outer timeout.
+		return coordinate.VerifyLeader() == nil
+	})
 }
 
 // newSqsQueuesSource adapts *adapter.SQSServer to admin.QueuesSource.
@@ -637,6 +676,7 @@ func startAdminServer(
 	buckets admin.BucketsSource,
 	queues admin.QueuesSource,
 	forwarder admin.LeaderForwarder,
+	leaderProbe admin.LeaderProbe,
 	keyvizSampler *keyviz.MemSampler,
 	keyvizFanoutCfg keyVizFanoutConfig,
 	version string,
@@ -646,7 +686,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, keyvizSampler, keyvizFanoutCfg)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg)
 	if err != nil {
 		return "", err
 	}
@@ -686,7 +726,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg keyVizFanoutConfig) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, leaderProbe admin.LeaderProbe, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg keyVizFanoutConfig) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -716,6 +756,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		KeyViz:       keyvizSourceFromSampler(keyvizSampler),
 		KeyVizFanout: buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
 		StaticFS:     staticFS,
+		LeaderProbe:  leaderProbe,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
