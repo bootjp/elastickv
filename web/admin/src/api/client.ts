@@ -231,6 +231,33 @@ export interface KeyVizRow {
   route_ids_truncated?: boolean;
   route_count: number;
   values: number[];
+  // Phase 2-C row-level conflict flag (always present on the wire,
+  // defaults to false). True when ≥2 nodes reported a non-zero
+  // value for the same cell — typically a leadership flip mid-
+  // window. Per design 4.2 / PR-1, this is a row-level signal; it
+  // moves to per-cell when the proto extension lands in 2-C+.
+  conflict?: boolean;
+}
+
+// Per-node entry in the KeyVizMatrix.fanout block. OK=true means
+// the node returned a parseable matrix; OK=false carries the
+// reason (timeout, refused, 5xx body, JSON decode failure). Self
+// always reports ok=true since the local matrix is computed in-
+// process.
+export interface KeyVizFanoutNode {
+  node: string;
+  ok: boolean;
+  error?: string;
+}
+
+// Per-response fan-out summary attached to KeyVizMatrix.fanout
+// when the operator configured --keyvizFanoutNodes. Absent when
+// fan-out is disabled. nodes is ordered self-first, then in
+// --keyvizFanoutNodes order. Responded counts ok=true entries.
+export interface KeyVizFanoutResult {
+  nodes: KeyVizFanoutNode[];
+  responded: number;
+  expected: number;
 }
 
 export interface KeyVizMatrix {
@@ -238,6 +265,7 @@ export interface KeyVizMatrix {
   rows: KeyVizRow[];
   series: KeyVizSeries;
   generated_at: string;
+  fanout?: KeyVizFanoutResult;
 }
 
 export interface KeyVizParams {
