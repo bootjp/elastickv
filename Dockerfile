@@ -11,12 +11,14 @@ WORKDIR /spa
 COPY web/admin/package.json web/admin/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/admin/ ./
-# vite.config.ts targets `../../internal/admin/dist` relative to
-# web/admin, but inside this stage we flatten the layout: emit
-# straight to /spa/dist and copy it across to the Go build stage.
-RUN npx vite build --outDir /spa/dist --emptyOutDir
+# Use `npm run build` (not `npx vite build`) so the package.json
+# script's `tsc -b && vite build` chain runs in full -- a TypeScript
+# error that would fail a local build must also fail the image build,
+# not silently slip through. vite.config.ts already sets
+# emptyOutDir=true, so only --outDir is forwarded here.
+RUN npm run build -- --outDir /spa/dist
 
-FROM golang:latest AS build
+FROM golang:1.25 AS build
 WORKDIR $GOPATH/src/app
 COPY . .
 # Replace the placeholder dist/ with the real Vite bundle BEFORE the
