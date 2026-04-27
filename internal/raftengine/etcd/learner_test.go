@@ -368,6 +368,63 @@ func TestLinearizableReadOnLearnerForwardsToLeader(t *testing.T) {
 	require.True(t, errors.Is(err, raftengine.ErrNotLeader), "expected ErrNotLeader, got %v", err)
 }
 
+// TestJoinAsLearnerAlarmFiresAtStartupForPersistedVoterRole is the
+// regression for the codex Round 4 finding: when a node previously
+// mis-joined as voter, then restarts with --raftJoinAsLearner=true,
+// the alarm needs to fire even though no apply event happens — Open
+// loads the post-mis-join ConfState from disk and never replays it.
+// Verifies that JoinRoleViolationCount increments on the second
+// Open and that the joiner stays running.
+func TestJoinAsLearnerAlarmFiresAtStartupForPersistedVoterRole(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+
+	// First open with joinAsLearner=false (the misuse): leader
+	// AddVoter the joiner, conf change persists to disk.
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+	_, err := leader.engine.AddVoter(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	// Drive a write so the conf change snapshot lands on the joiner's
+	// disk before we close it.
+	require.Eventually(t, func() bool {
+		return leader.engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 20*time.Millisecond)
+	_, err = leader.engine.Propose(context.Background(), []byte("warm"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return len(nodes[1].fsm.Applied()) >= 1
+	}, 5*time.Second, 20*time.Millisecond)
+
+	// Close the joiner, then reopen with joinAsLearner=true. The
+	// persisted snapshot encodes the local node in ConfState.Voters.
+	require.NoError(t, nodes[1].engine.Close())
+
+	before := JoinRoleViolationCount()
+	engine, err := Open(ctx, OpenConfig{
+		NodeID:        nodes[1].peer.NodeID,
+		LocalID:       nodes[1].peer.ID,
+		LocalAddress:  nodes[1].peer.Address,
+		DataDir:       nodes[1].dir,
+		JoinAsLearner: true,
+		Transport:     nodes[1].transport,
+		StateMachine:  nodes[1].fsm,
+	})
+	require.NoError(t, err)
+	nodes[1].engine = engine
+	require.Greater(t, JoinRoleViolationCount(), before, "expected join-as-learner alarm to fire on startup")
+	require.NotEqual(t, raftengine.StateShutdown, engine.State())
+}
+
 // TestRemovePeerLearnerKeepsSingleNodeFastPath is the §4.6 lease-read
 // regression: with 1 voter + 1 learner, removing the learner must
 // leave the leader on the single-node fast path. The complementary

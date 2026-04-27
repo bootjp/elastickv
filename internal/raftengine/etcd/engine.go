@@ -526,6 +526,17 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
+	// Fire the join-as-learner alarm against the persisted snapshot's
+	// ConfState. Without this, a node that mis-joined as voter and is
+	// then restarted with --raftJoinAsLearner=true would never emit
+	// the alarm: applyConfigChange / applyConfigChangeV2 /
+	// applyReadySnapshot are the only other call sites and a clean
+	// open path bypasses all three (the snapshot is loaded from disk,
+	// not replayed). The alarm latch
+	// (joinAlarmFired.CompareAndSwap) guarantees it fires at most
+	// once per process even if a later snapshot or conf change
+	// reapplies the same role assignment. See learner design doc §4.5.
+	engine.alarmIfJoinedAsVoter(prepared.disk.LocalSnap.Metadata.ConfState)
 	// Surface a misconfiguration where the tick settings produce a
 	// non-positive lease window: lease reads would never hit the fast
 	// path. Don't fail Open -- the engine is still functional via the
