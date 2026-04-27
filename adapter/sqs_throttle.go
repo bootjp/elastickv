@@ -73,15 +73,18 @@ const throttleHardCeilingPerSecond = 100_000.0
 const throttleMinBatchCapacity = float64(sqsBatchMaxEntries)
 
 // throttleIdleEvictAfter is the idle window after which a quiet bucket
-// is dropped from the in-memory store. The evictor fires lazily — there
-// is no goroutine; lookups call sweep() opportunistically. A queue that
-// resumes activity rebuilds its bucket from the meta record at full
-// capacity, matching the failover semantics documented in §3.1.
+// is dropped from the in-memory store. A background goroutine
+// (runSweepLoop) fires the eviction sweep on each
+// throttleEvictSweepEvery tick; the hot path never calls sweep().
+// A queue that resumes activity rebuilds its bucket from the meta
+// record at full capacity, matching the failover semantics
+// documented in §3.1.
 const throttleIdleEvictAfter = time.Hour
 
-// throttleEvictSweepEvery bounds how often the sweep runs from the hot
-// path so a flood of misses on a many-queue cluster cannot turn the
-// idle-evict cost into a per-request hot path.
+// throttleEvictSweepEvery is the interval at which runSweepLoop fires
+// the idle-evict sweep in its background goroutine. The hot-path
+// charge() never calls into the sweep so a many-queue cluster pays
+// the O(N) cost only on the goroutine's tick, never on a request.
 const throttleEvictSweepEvery = time.Minute
 
 // bucketKey is the in-memory map key.
