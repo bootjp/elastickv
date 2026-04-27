@@ -574,6 +574,13 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
 	}
+	// Annotate suffrage from the persisted snapshot's ConfState before
+	// saving the peers file. The operator-supplied peer list has no
+	// suffrage info; without this, savePersistedPeers would write
+	// every peer as a voter, then a learner's restart would land on
+	// a peers file that contradicts the snapshot's ConfState.Learners
+	// and validateConfState would reject the cluster on next open.
+	annotatePeerSuffrageInSlice(peers, disk.LocalSnap.Metadata.ConfState)
 	if err := savePersistedPeers(cfg.DataDir, maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index), peers); err != nil {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
@@ -1860,7 +1867,34 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	// voterCache first, then config.Servers.
 	e.refreshVoterCache(snapshot.Metadata.ConfState)
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
+	// Persist the post-snapshot peers file with suffrage drawn from
+	// the snapshot's ConfState so a learner that received catch-up
+	// state via snapshot (the common case for fresh joiners) writes
+	// a peers file that round-trips correctly across restart. The
+	// snapshot path bypasses the apply-loop's nextPeersAfterConfigChange
+	// hook, so without this the joiner's peers file would carry the
+	// pre-AddLearner suffrage forever. See learner design doc §4.3.
+	if err := e.savePeersFileForSnapshot(snapshot); err != nil {
+		return err
+	}
 	e.alarmIfJoinedAsVoter(snapshot.Metadata.ConfState)
+	return nil
+}
+
+// savePeersFileForSnapshot writes the v2 peers file with suffrage
+// drawn from the snapshot's ConfState. Idempotent: savePersistedPeers
+// short-circuits when the on-disk index already covers `index`.
+func (e *Engine) savePeersFileForSnapshot(snapshot raftpb.Snapshot) error {
+	e.mu.RLock()
+	peers := sortedPeerList(e.peers)
+	e.mu.RUnlock()
+	if len(peers) == 0 {
+		return nil
+	}
+	annotatePeerSuffrageInSlice(peers, snapshot.Metadata.ConfState)
+	if err := savePersistedPeers(e.dataDir, snapshot.Metadata.Index, peers); err != nil {
+		return errors.Wrapf(err, "save peers file from snapshot index=%d", snapshot.Metadata.Index)
+	}
 	return nil
 }
 
@@ -3428,22 +3462,90 @@ func (e *Engine) upsertPeer(peer Peer) {
 	}
 }
 
-func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, _ raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, confState raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	applyConfigPeerChangeToMap(next, changeType, nodeID, context)
+	annotatePeerSuffrageFromConfState(next, confState)
 	return sortedPeerList(next)
 }
 
-func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, _ raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, confState raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	for _, change := range cc.Changes {
 		applyConfigPeerChangeToMap(next, change.Type, change.NodeID, cc.Context)
 	}
+	annotatePeerSuffrageFromConfState(next, confState)
 	return sortedPeerList(next)
+}
+
+// annotatePeerSuffrageInSlice is the slice form of
+// annotatePeerSuffrageFromConfState used at bootstrap-time, where
+// `peers` is a sorted operator-provided slice rather than the apply
+// loop's clone of e.peers.
+func annotatePeerSuffrageInSlice(peers []Peer, conf raftpb.ConfState) {
+	if len(peers) == 0 {
+		return
+	}
+	learners := make(map[uint64]bool, len(conf.Learners))
+	for _, id := range conf.Learners {
+		learners[id] = true
+	}
+	voters := make(map[uint64]bool, len(conf.Voters))
+	for _, id := range conf.Voters {
+		voters[id] = true
+	}
+	for i := range peers {
+		switch {
+		case learners[peers[i].NodeID]:
+			peers[i].Suffrage = SuffrageLearner
+		case voters[peers[i].NodeID]:
+			peers[i].Suffrage = SuffrageVoter
+		}
+	}
+}
+
+// annotatePeerSuffrageFromConfState stamps each peer's Suffrage from
+// the post-change ConfState so the v2 peers file written by
+// persistConfigState round-trips suffrage across restarts. Without
+// this, every Peer in the persist path carries Suffrage="" (the
+// ConfChange context bytes do not encode suffrage; e.peers
+// deliberately stores only nodeID/ID/address), and
+// persistedSuffrageByte("") writes voter — which on restart causes
+// validateConfState to see a learner-as-voter peer list and reject
+// startup with errClusterMismatch. See learner design doc §4.3
+// "Authoritative source of suffrage during recovery".
+//
+// The map is mutated in place. Peers not present in either
+// confState.Voters or confState.Learners (transient state during a
+// removal) keep whatever Suffrage they had — they will fall out of
+// the persisted peers list on the next conf change anyway.
+func annotatePeerSuffrageFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) {
+	if len(peers) == 0 {
+		return
+	}
+	learners := make(map[uint64]bool, len(conf.Learners))
+	for _, id := range conf.Learners {
+		learners[id] = true
+	}
+	voters := make(map[uint64]bool, len(conf.Voters))
+	for _, id := range conf.Voters {
+		voters[id] = true
+	}
+	for id, peer := range peers {
+		switch {
+		case learners[id]:
+			peer.Suffrage = SuffrageLearner
+		case voters[id]:
+			peer.Suffrage = SuffrageVoter
+		default:
+			continue
+		}
+		peers[id] = peer
+	}
 }
 
 func (e *Engine) removePeer(nodeID uint64) {

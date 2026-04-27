@@ -149,6 +149,86 @@ func TestPromoteLearnerRejectsNonLearner(t *testing.T) {
 	require.True(t, errors.Is(err, errPromoteLearnerNotLearner), "expected errPromoteLearnerNotLearner, got %v", err)
 }
 
+// TestLearnerPeersFilePersistsSuffrageAcrossRestart locks down the
+// design doc §4.3 contract that the v2 peers file round-trips
+// suffrage across restarts. Without this, AddLearner writes the
+// learner peer with Suffrage="" (the ConfChange context bytes do
+// not carry suffrage and e.peers stores only nodeID/ID/address);
+// persistedSuffrageByte("") writes voter; on restart
+// validateConfState sees a learner-as-voter peers list and rejects
+// startup with errClusterMismatch. The fix is that
+// nextPeersAfterConfigChange annotates Peer.Suffrage from the
+// post-change ConfState before persistConfigState writes the file.
+func TestLearnerPeersFilePersistsSuffrageAcrossRestart(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	_, err := leader.engine.AddLearner(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	// Drive a write so the learner has applied something — without
+	// this the engines may race close vs. apply on the bootstrap
+	// snapshot and surface unrelated errors.
+	require.Eventually(t, func() bool {
+		return leader.engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 20*time.Millisecond)
+	_, err = leader.engine.Propose(context.Background(), []byte("warm"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return len(nodes[1].fsm.Applied()) >= 1
+	}, 5*time.Second, 20*time.Millisecond)
+
+	// Verify the v2 peers file actually carries the learner's suffrage.
+	// Both nodes must have flushed the post-AddLearner config, so check
+	// each persisted file directly.
+	for _, n := range nodes {
+		persisted, ok, err := LoadPersistedPeers(n.dir)
+		require.NoError(t, err, "load persisted peers for %s", n.peer.ID)
+		require.True(t, ok, "persisted peers exist for %s", n.peer.ID)
+		var sawLearner bool
+		for _, p := range persisted {
+			if p.NodeID == nodes[1].peer.NodeID {
+				require.Equal(t, SuffrageLearner, p.Suffrage,
+					"learner persisted as %q in %s", p.Suffrage, n.peer.ID)
+				sawLearner = true
+			}
+		}
+		require.True(t, sawLearner, "learner peer missing from %s peers file", n.peer.ID)
+	}
+
+	// Close both engines and reopen them. Without the suffrage
+	// round-trip, validateConfState would reject startup because
+	// the persisted peers file would list the learner as a voter
+	// while the snapshot ConfState lists it as a learner.
+	require.NoError(t, leader.engine.Close())
+	require.NoError(t, nodes[1].engine.Close())
+
+	for _, n := range nodes {
+		// Stale fsm state from the earlier run does not matter; we
+		// only care that Open() does not fail with errClusterMismatch.
+		engine, err := Open(ctx, OpenConfig{
+			NodeID:       n.peer.NodeID,
+			LocalID:      n.peer.ID,
+			LocalAddress: n.peer.Address,
+			DataDir:      n.dir,
+			Transport:    n.transport,
+			StateMachine: n.fsm,
+		})
+		require.NoError(t, err, "reopen failed for %s", n.peer.ID)
+		n.engine = engine
+	}
+}
+
 // TestPromoteLearnerRejectsZeroMinAppliedWithoutSkip is the §8 open
 // question 3 fix: passing min_applied_index=0 without
 // skip_min_applied_check returns a clean FailedPrecondition rather

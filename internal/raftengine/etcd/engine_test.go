@@ -1069,9 +1069,13 @@ func TestNextPeersAfterConfigChangeKeepsLearnerMetadata(t *testing.T) {
 		},
 	)
 
+	// nextPeersAfterConfigChange now annotates Suffrage from the
+	// post-change ConfState so persistConfigState can write a v2
+	// peers file that round-trips correctly across restarts. See
+	// learner design doc §4.3.
 	require.Equal(t, []Peer{
-		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
-		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageLearner},
 	}, next)
 }
 
@@ -1094,9 +1098,9 @@ func TestNextPeersAfterConfigChangeV2IgnoresMismatchedPeerContext(t *testing.T) 
 	}, raftpb.ConfState{Voters: []uint64{1, 2, 3}})
 
 	require.Equal(t, []Peer{
-		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
-		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
-		{NodeID: 3, ID: "3", Address: ""},
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
+		{NodeID: 3, ID: "3", Address: "", Suffrage: SuffrageVoter},
 	}, next)
 }
 
@@ -1115,8 +1119,8 @@ func TestNextPeersAfterConfigChangeV2PreservesExistingPeerWithoutContext(t *test
 	}, raftpb.ConfState{Voters: []uint64{1, 2}})
 
 	require.Equal(t, []Peer{
-		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
-		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002", Suffrage: SuffrageVoter},
 	}, next)
 }
 
