@@ -34,6 +34,14 @@ const keyVizFanoutDefaultTimeout = 2 * time.Second
 // misbehaving peer flood operator logs.
 const keyVizPeerErrorBodyLimit = 512
 
+// keyVizFanoutPeerHeader marks a request as originating from another
+// node's fan-out aggregator. The receiving handler skips its own
+// fan-out step when this header is set, breaking the
+// every-node-fans-to-every-node recursion that would otherwise turn
+// a single browser poll into O(N²) peer HTTP calls in a symmetric
+// cluster (Claude bot P1 on PR #692).
+const keyVizFanoutPeerHeader = "X-Admin-Fanout-Peer"
+
 // keyVizPeerResponseBodyLimit caps the JSON body we are willing to
 // decode from a peer. A misbehaving or compromised peer that streams
 // gigabytes back at us would otherwise pin a goroutine on
@@ -190,6 +198,25 @@ func (f *KeyVizFanout) WithTimeout(d time.Duration) *KeyVizFanout {
 	return f
 }
 
+// attachAdminCookies forwards only the admin session and CSRF
+// cookies to a peer request. We whitelist rather than passing every
+// inbound cookie through: a logged-in operator may have unrelated
+// cookies for other services on the same domain (analytics, feature
+// flags, dev-tooling sessions), and the fan-out should not blast
+// those across the cluster's internal network. The peer's
+// SessionAuth middleware only inspects admin_session, and the CSRF
+// double-submit cookie pairs with the X-Admin-CSRF header (which
+// fan-out doesn't send because all peer calls are GETs); the cookie
+// is forwarded for parity with browser-issued requests but not
+// load-bearing. (Gemini security-medium on PR #692.)
+func attachAdminCookies(req *http.Request, cookies []*http.Cookie) {
+	for _, c := range cookies {
+		if c.Name == sessionCookieName || c.Name == csrfCookieName {
+			req.AddCookie(c)
+		}
+	}
+}
+
 // peerResult is the per-peer outcome the goroutine pool collects
 // before the synchronous merge phase. Either matrix is non-nil or
 // err is non-nil; never both.
@@ -205,9 +232,17 @@ type peerResult struct {
 // cluster (peers empty) Run returns local with a Fanout block that
 // reports Expected=1, Responded=1.
 //
+// cookies are attached to every peer request so the receiving node's
+// SessionAuth middleware sees a valid admin session. Production
+// passes the inbound request's cookies; nil disables cookie
+// forwarding (peers will 401 unless they have their own bypass).
+// All cluster nodes must share the same --adminSessionSigningKey for
+// the cookie minted by node A to be verifiable on node B; the
+// existing HA setup already requires this.
+//
 // Run never returns an error: peer-level failures surface in the
 // FanoutResult; aggregation is best-effort.
-func (f *KeyVizFanout) Run(ctx context.Context, params keyVizParams, local KeyVizMatrix) KeyVizMatrix {
+func (f *KeyVizFanout) Run(ctx context.Context, params keyVizParams, local KeyVizMatrix, cookies []*http.Cookie) KeyVizMatrix {
 	if f == nil || len(f.peers) == 0 {
 		merged := local
 		merged.Fanout = &FanoutResult{
@@ -218,7 +253,7 @@ func (f *KeyVizFanout) Run(ctx context.Context, params keyVizParams, local KeyVi
 		return merged
 	}
 
-	results := f.fetchPeersParallel(ctx, params)
+	results := f.fetchPeersParallel(ctx, params, cookies)
 
 	matrices := []KeyVizMatrix{local}
 	statuses := []FanoutNodeStatus{{Node: f.selfName(), OK: true}}
@@ -260,7 +295,7 @@ func countOK(statuses []FanoutNodeStatus) int {
 	return n
 }
 
-func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizParams) []peerResult {
+func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizParams, cookies []*http.Cookie) []peerResult {
 	// Cap per-peer wall time so a single slow node cannot hold the
 	// SPA poll open beyond the configured timeout. The parent
 	// context is preserved as the cancellation root so an early
@@ -274,7 +309,7 @@ func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizPara
 		wg.Add(1)
 		go func(i int, peer string) {
 			defer wg.Done()
-			matrix, err := f.fetchPeer(callCtx, peer, params)
+			matrix, err := f.fetchPeer(callCtx, peer, params, cookies)
 			results[i] = peerResult{node: peer, matrix: matrix, err: err}
 		}(i, peer)
 	}
@@ -282,7 +317,7 @@ func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizPara
 	return results
 }
 
-func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyVizParams) (*KeyVizMatrix, error) {
+func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyVizParams, cookies []*http.Cookie) (*KeyVizMatrix, error) {
 	target, err := buildKeyVizPeerURL(peer, params)
 	if err != nil {
 		return nil, pkgerrors.Wrap(err, "build peer url")
@@ -292,6 +327,14 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 		return nil, pkgerrors.Wrap(err, "new request")
 	}
 	req.Header.Set("Accept", "application/json")
+	// Mark this request as a peer fan-out call so the receiving
+	// handler does not recursively fan out to every other peer —
+	// without this header, a symmetric cluster (every node lists
+	// every other node) generates O(N²) peer HTTP calls per
+	// browser poll. The check on the receiving side is in
+	// KeyVizHandler.ServeHTTP. (Claude bot P1 on PR #692.)
+	req.Header.Set(keyVizFanoutPeerHeader, "1")
+	attachAdminCookies(req, cookies)
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return nil, pkgerrors.Wrap(err, "peer request")

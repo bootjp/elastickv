@@ -132,22 +132,45 @@ elastickv \
   network); the HTTP client uses `http://`. A follow-up will
   introduce `--keyvizFanoutTLS` once the rest of the admin path
   has TLS too.
-- **Auth (Phase 2-C MVP)**: the fan-out path is anonymous — the
-  aggregator issues unauthenticated GETs to peers. This is only
-  acceptable on a fully-private intra-cluster network, which is
-  the contract `--keyvizFanoutNodes` documents. **Do NOT enable
-  fan-out across an untrusted network until Phase 2-C+ ships
-  proper auth.** Per-call timeout: 2 s default, override via
-  `--keyvizFanoutTimeout`.
-- **Auth (Phase 2-C+)**: a follow-up extends the fan-out path with
-  a short-lived signed token derived from the existing admin
-  session-signing key (`ELASTICKV_ADMIN_SESSION_SIGNING_KEY`).
-  Pre-shared inter-node token, NOT a replay of the browser's
-  session cookie — re-using the cookie would couple browser session
-  TTL to inter-node call validity, and a compromised browser
-  session would gain peer-call authority. The two paths are
-  intentionally distinct. The earlier draft of this section
-  conflated them; this paragraph supersedes it.
+- **Auth (Phase 2-C MVP)**: the aggregator forwards a whitelist of
+  the inbound user's cookies (`admin_session` + `admin_csrf` only)
+  on every peer call. The peer's `SessionAuth` middleware verifies
+  `admin_session` against its own `--adminSessionSigningKey`;
+  cluster nodes already share that key for HA, so a cookie minted
+  on node A is verifiable on node B without any new infrastructure.
+  Unrelated cookies the browser may carry (analytics, feature
+  flags, other-app sessions on the same domain) are dropped at the
+  fan-out boundary so they are not leaked across the internal
+  network (Gemini security-medium on PR #692).
+- **Recursion guard**: peer requests carry an `X-Admin-Fanout-Peer`
+  header. The receiving handler short-circuits its own fan-out
+  when this header is set; without the guard, a symmetric
+  configuration (every node lists every other node) would generate
+  O(N²) HTTP calls per browser poll as each peer recursively
+  fanned out. (Claude bot P1 on PR #692.)
+  - The earlier draft of this paragraph said "anonymous on a
+    private network" — that was wrong: the receiving side enforces
+    session auth, so anonymous calls are rejected with 401 and the
+    cluster heatmap collapses to "1 of N nodes responded". The
+    cookie-forwarding scheme above is what actually works.
+  - **Trust model**: forwarding a session cookie to peers is safe
+    when (a) every peer is operator-configured and trusted, and
+    (b) the network is private (cookies are HttpOnly but ride
+    plaintext HTTP for now). `--keyvizFanoutNodes` is the
+    operator's explicit trust list. **Do NOT point
+    `--keyvizFanoutNodes` at an untrusted host** — the user's
+    admin session would be replayed there.
+  - Per-call timeout: 2 s default, override via
+    `--keyvizFanoutTimeout`.
+- **Auth (Phase 2-C+)**: a follow-up replaces cookie forwarding
+  with a short-lived **inter-node** token derived from
+  `ELASTICKV_ADMIN_SESSION_SIGNING_KEY`. Pre-shared, NOT a replay
+  of the browser cookie — re-using the cookie couples browser
+  session TTL to inter-node call validity, and a compromised
+  browser session gains peer-call authority. The follow-up
+  decouples the two paths so the inter-node call survives a
+  browser-session expiry and a compromised cookie doesn't extend
+  laterally.
 
 ## 4. Merge rules
 

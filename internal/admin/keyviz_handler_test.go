@@ -450,3 +450,51 @@ func TestKeyVizHandlerAggregateFallbackWhenTotalZero(t *testing.T) {
 	require.True(t, matrix.Rows[0].Aggregate)
 	require.Equal(t, uint64(2), matrix.Rows[0].RouteCount, "fallback to len(MemberRoutes)")
 }
+
+// TestKeyVizHandlerSkipsFanoutForPeerCall pins the recursion guard
+// added on PR #692 (Claude bot P1): when the inbound request carries
+// the X-Admin-Fanout-Peer header, the handler must serve the local
+// view without invoking its own KeyVizFanout — otherwise a
+// symmetric cluster (every node lists every peer) would generate
+// O(N²) HTTP calls per browser poll. The test uses a recording
+// fanout that fails the test if Run is ever called.
+func TestKeyVizHandlerSkipsFanoutForPeerCall(t *testing.T) {
+	t.Parallel()
+	src := &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{At: time.Unix(1_700_000_000, 0), Rows: []keyviz.MatrixRow{
+			{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 5},
+		}},
+	}}
+	// A real *KeyVizFanout pointed at a peer URL that, if dialled,
+	// would record the call. We assert the call-count stays at zero
+	// because the handler's recursion guard short-circuits before
+	// Run runs the parallel-fetch step.
+	var peerHits int
+	peer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		peerHits++
+	}))
+	defer peer.Close()
+
+	fanout := NewKeyVizFanout("self", []string{peer.URL}).WithHTTPClient(peer.Client())
+	h := NewKeyVizHandler(src).
+		WithClock(func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }).
+		WithFanout(fanout)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	req.Header.Set(keyVizFanoutPeerHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var matrix KeyVizMatrix
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+	require.Len(t, matrix.Rows, 1, "local matrix served directly")
+	require.Nil(t, matrix.Fanout,
+		"peer-marked request must not produce a Fanout block — fan-out was skipped, no aggregator metadata to surface")
+	require.Equal(t, 0, peerHits,
+		"recursion guard violated: handler dialled a peer despite X-Admin-Fanout-Peer being set")
+}
