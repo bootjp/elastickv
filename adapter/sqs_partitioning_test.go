@@ -275,3 +275,39 @@ func TestHTFIFOAttributesPresent(t *testing.T) {
 	require.True(t, htfifoAttributesPresent(map[string]string{"FifoThroughputLimit": htfifoThroughputPerMessageGroupID}))
 	require.True(t, htfifoAttributesPresent(map[string]string{"DeduplicationScope": htfifoDedupeScopeMessageGroup}))
 }
+
+// TestHTFIFOAttributesEqual_PartitionCountZeroAndOneEquivalent pins
+// the Codex P2 fix on PR #679 round 6.1: validatePartitionConfig
+// documents PartitionCount=0 (unset) and =1 (explicit single
+// partition) as semantically identical legacy/single-partition
+// routing, so CreateQueue idempotency must treat them as equal —
+// otherwise a queue created without PartitionCount (stored as 0) is
+// rejected as "different attributes" by a retry that explicitly
+// passes PartitionCount=1.
+func TestHTFIFOAttributesEqual_PartitionCountZeroAndOneEquivalent(t *testing.T) {
+	t.Parallel()
+	a := &sqsQueueMeta{PartitionCount: 0}
+	b := &sqsQueueMeta{PartitionCount: 1}
+	require.True(t, htfifoAttributesEqual(a, b),
+		"PartitionCount 0 (unset) and 1 (explicit single partition) must compare equal")
+	require.True(t, htfifoAttributesEqual(b, a),
+		"equality must be symmetric")
+	// Real divergence (>1 vs 0/1) still rejects.
+	c := &sqsQueueMeta{PartitionCount: 2}
+	require.False(t, htfifoAttributesEqual(a, c),
+		"PartitionCount=2 must differ from unset")
+	require.False(t, htfifoAttributesEqual(b, c),
+		"PartitionCount=2 must differ from explicit 1")
+	// Same > 1 value still equal.
+	d := &sqsQueueMeta{PartitionCount: 2}
+	require.True(t, htfifoAttributesEqual(c, d),
+		"identical PartitionCount > 1 must compare equal")
+}
+
+func TestNormalisePartitionCount(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, uint32(1), normalisePartitionCount(0))
+	require.Equal(t, uint32(1), normalisePartitionCount(1))
+	require.Equal(t, uint32(2), normalisePartitionCount(2))
+	require.Equal(t, uint32(8), normalisePartitionCount(8))
+}

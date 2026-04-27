@@ -768,10 +768,30 @@ func throttleConfigEqual(a, b *sqsQueueThrottle) bool {
 }
 
 // htfifoAttributesEqual compares the Phase 3.D HT-FIFO fields.
+//
+// PartitionCount normalisation: validatePartitionConfig documents 0
+// and 1 as equivalent ("unset" / "single-partition"); a queue created
+// without PartitionCount is stored as 0 while a queue created with
+// explicit PartitionCount=1 is stored as 1, so strict equality would
+// have CreateQueue reject the second call as "different attributes"
+// even though the queues are semantically identical (Codex P2 on
+// PR #679 round 6.1). normalisePartitionCount maps both to 1 for the
+// idempotency check.
 func htfifoAttributesEqual(a, b *sqsQueueMeta) bool {
-	return a.PartitionCount == b.PartitionCount &&
+	return normalisePartitionCount(a.PartitionCount) == normalisePartitionCount(b.PartitionCount) &&
 		a.FifoThroughputLimit == b.FifoThroughputLimit &&
 		a.DeduplicationScope == b.DeduplicationScope
+}
+
+// normalisePartitionCount collapses the two "single-partition" forms
+// (0 = unset, 1 = explicit) into a single canonical value so equality
+// checks treat them as identical. Any value > 1 is returned unchanged
+// — those cases must already match exactly to be considered equal.
+func normalisePartitionCount(n uint32) uint32 {
+	if n == 0 {
+		return 1
+	}
+	return n
 }
 
 // ------------------------ storage primitives ------------------------
