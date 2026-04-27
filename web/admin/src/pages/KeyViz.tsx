@@ -89,6 +89,23 @@ interface HeatmapProps {
 function Heatmap({ matrix }: HeatmapProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [hoverRow, setHoverRow] = useState<number | null>(null);
+  // dprTick re-runs the canvas effect when the user drags the window
+  // between displays of different pixel densities or changes the
+  // browser zoom; window.devicePixelRatio is not reactive on its own,
+  // so we listen via matchMedia and bump a tick. The tick is in the
+  // canvas effect's dep list further down.
+  const [dprTick, setDprTick] = useState(0);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return undefined;
+    // The matched DPR changes every time the browser hops between
+    // densities; a single MQ fires on each crossing of the resolution
+    // floor we list. Use the current dpr as the floor so the listener
+    // fires reliably on the *next* change in either direction.
+    const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    const onChange = () => setDprTick((t) => t + 1);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [dprTick]);
 
   // maxValue is computed once per matrix and used to normalise every
   // cell. A zero max means no traffic at all → render the canvas as
@@ -112,26 +129,31 @@ function Heatmap({ matrix }: HeatmapProps) {
     const canvas = canvasRef.current;
     if (!canvas) return;
     // Scale the backing buffer to physical pixels and keep CSS at
-    // logical pixels: on a 2× display every cell edge is otherwise
+    // logical pixels: on a 2x display every cell edge is otherwise
     // rendered against a half-resolution buffer and reads as blurry.
     // We clamp the ratio so a future browser quirk reporting an
     // absurd value (e.g. Firefox's experimental zoom-aware DPR > 8)
-    // does not balloon canvas memory beyond reason — at the maximum
-    // matrix size 4 × dpr is already 16384 × 16384 px of buffer.
+    // does not balloon canvas memory beyond reason; at the maximum
+    // matrix size 4 x dpr is already 16384 x 16384 px of buffer.
     const dpr = Math.min(window.devicePixelRatio || 1, 4);
     canvas.width = Math.max(1, Math.floor(width * dpr));
     canvas.height = Math.max(1, Math.floor(height * dpr));
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    // setTransform (not scale) so the matrix is reset cleanly on
-    // every render — repeated useEffect runs would otherwise stack
-    // scales on top of the previous one.
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Use the buffer/logical ratio as the transform so a fractional
+    // DPR (1.25x, 1.5x) maps logical coordinates exactly onto the
+    // floored buffer. Setting the transform from the raw `dpr`
+    // could draw at a fractional pixel that the buffer cannot
+    // represent, leaving sub-pixel blur at the edges. setTransform
+    // also resets the matrix so repeated runs do not stack scales.
+    const sx = width > 0 ? canvas.width / width : dpr;
+    const sy = height > 0 ? canvas.height / height : dpr;
+    ctx.setTransform(sx, 0, 0, sy, 0, 0);
     ctx.clearRect(0, 0, width, height);
     if (matrix.rows.length === 0 || matrix.column_unix_ms.length === 0) return;
 
     // One fillRect per cell keeps render under the §10 budget at
-    // 1024 × 500: the colour ramp runs once per cell rather than per
+    // 1024 x 500: the colour ramp runs once per cell rather than per
     // pixel, and zero-value cells are skipped so the only work on a
     // quiet matrix is the initial clearRect.
     // The `v === 0` short-circuit guarantees `maxValue > 0` by the
@@ -148,7 +170,7 @@ function Heatmap({ matrix }: HeatmapProps) {
         ctx.fillRect(j * cellW, i * cellH, cellW, cellH);
       }
     }
-  }, [matrix, maxValue, width, height, cellW, cellH]);
+  }, [matrix, maxValue, width, height, cellW, cellH, dprTick]);
 
   const onMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
