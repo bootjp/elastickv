@@ -180,6 +180,24 @@ ADMIN_TLS_KEY_FILE="${ADMIN_TLS_KEY_FILE:-}"
 ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
 ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 
+# Validate the three boolean ADMIN_* flags must be the literal "true"
+# or "false" — they are forwarded to the remote shell unquoted (no
+# printf %q) for readability, which is only safe when the value is
+# already metacharacter-free. Reject anything else here so an operator
+# who typed "True", "1", or a stray quote sees a script-level error
+# pointing at the variable name instead of an inscrutable failure
+# inside the SSH heredoc.
+for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE; do
+  case "${!_bool_var}" in
+    true|false) ;;
+    *)
+      echo "rolling-update: ${_bool_var} must be 'true' or 'false', got '${!_bool_var}'" >&2
+      exit 1
+      ;;
+  esac
+done
+unset _bool_var
+
 # Container OOM defenses. See usage() for rationale. Empty string disables.
 DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
 CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
@@ -498,6 +516,16 @@ update_one_node() {
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
       EXTRA_ENV="$EXTRA_ENV_Q" \
       CONTAINER_MEMORY_LIMIT="$CONTAINER_MEMORY_LIMIT_Q" \
+      ADMIN_ENABLED="$ADMIN_ENABLED" \
+      ADMIN_ADDRESS="$ADMIN_ADDRESS_Q" \
+      ADMIN_FULL_ACCESS_KEYS="$ADMIN_FULL_ACCESS_KEYS_Q" \
+      ADMIN_READ_ONLY_ACCESS_KEYS="$ADMIN_READ_ONLY_ACCESS_KEYS_Q" \
+      ADMIN_SESSION_SIGNING_KEY_FILE="$ADMIN_SESSION_SIGNING_KEY_FILE_Q" \
+      ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE="$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE_Q" \
+      ADMIN_TLS_CERT_FILE="$ADMIN_TLS_CERT_FILE_Q" \
+      ADMIN_TLS_KEY_FILE="$ADMIN_TLS_KEY_FILE_Q" \
+      ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" \
+      ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -838,44 +866,65 @@ build_admin_flags() {
   local -n _flags="$1"
   local -n _volumes="$2"
 
-  if [[ "${ADMIN_ENABLED}" != "true" ]]; then
+  # `:-` defaults are defense-in-depth: build_admin_flags runs inside
+  # the remote SSH heredoc with `set -u` active, and every ADMIN_*
+  # variable is forwarded explicitly via the env block in
+  # update_one_node. If a future refactor ever drops one of the
+  # forwarded variables, the operator gets the targeted "ADMIN_*
+  # required" error below instead of an opaque "unbound variable"
+  # crash with no hint at which variable. All nine ADMIN_* values
+  # are read into locals once at the top so the rest of the helper
+  # cannot accidentally re-fetch a global and bypass the safety net
+  # (gemini medium on PR #678 caught the original three-boolean gap).
+  local enabled="${ADMIN_ENABLED:-false}"
+  if [[ "$enabled" != "true" ]]; then
     return 0
   fi
 
-  if [[ -z "${ADMIN_SESSION_SIGNING_KEY_FILE}" ]]; then
+  local signing_key="${ADMIN_SESSION_SIGNING_KEY_FILE:-}"
+  local full_keys="${ADMIN_FULL_ACCESS_KEYS:-}"
+  local read_only_keys="${ADMIN_READ_ONLY_ACCESS_KEYS:-}"
+  local previous_key="${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE:-}"
+  local admin_listen="${ADMIN_ADDRESS:-}"
+  local tls_cert="${ADMIN_TLS_CERT_FILE:-}"
+  local tls_key="${ADMIN_TLS_KEY_FILE:-}"
+  local allow_plaintext="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
+  local insecure_cookie="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
+
+  if [[ -z "$signing_key" ]]; then
     echo "ADMIN_ENABLED=true requires ADMIN_SESSION_SIGNING_KEY_FILE; aborting" >&2
     exit 1
   fi
-  if [[ -z "${ADMIN_FULL_ACCESS_KEYS}" && -z "${ADMIN_READ_ONLY_ACCESS_KEYS}" ]]; then
+  if [[ -z "$full_keys" && -z "$read_only_keys" ]]; then
     echo "ADMIN_ENABLED=true requires at least one of ADMIN_FULL_ACCESS_KEYS / ADMIN_READ_ONLY_ACCESS_KEYS; aborting" >&2
     exit 1
   fi
-  if [[ ! -f "$ADMIN_SESSION_SIGNING_KEY_FILE" || ! -r "$ADMIN_SESSION_SIGNING_KEY_FILE" ]]; then
-    echo "ADMIN_SESSION_SIGNING_KEY_FILE='$ADMIN_SESSION_SIGNING_KEY_FILE' is missing or unreadable on this host; aborting" >&2
+  if [[ ! -f "$signing_key" || ! -r "$signing_key" ]]; then
+    echo "ADMIN_SESSION_SIGNING_KEY_FILE='$signing_key' is missing or unreadable on this host; aborting" >&2
     exit 1
   fi
 
   _flags+=(--adminEnabled)
-  _flags+=(--adminSessionSigningKeyFile "$ADMIN_SESSION_SIGNING_KEY_FILE")
-  _volumes+=(-v "${ADMIN_SESSION_SIGNING_KEY_FILE}:${ADMIN_SESSION_SIGNING_KEY_FILE}:ro")
+  _flags+=(--adminSessionSigningKeyFile "$signing_key")
+  _volumes+=(-v "${signing_key}:${signing_key}:ro")
 
-  if [[ -n "${ADMIN_ADDRESS}" ]]; then
-    _flags+=(--adminListen "$ADMIN_ADDRESS")
+  if [[ -n "$admin_listen" ]]; then
+    _flags+=(--adminListen "$admin_listen")
   fi
-  if [[ -n "${ADMIN_FULL_ACCESS_KEYS}" ]]; then
-    _flags+=(--adminFullAccessKeys "$ADMIN_FULL_ACCESS_KEYS")
+  if [[ -n "$full_keys" ]]; then
+    _flags+=(--adminFullAccessKeys "$full_keys")
   fi
-  if [[ -n "${ADMIN_READ_ONLY_ACCESS_KEYS}" ]]; then
-    _flags+=(--adminReadOnlyAccessKeys "$ADMIN_READ_ONLY_ACCESS_KEYS")
+  if [[ -n "$read_only_keys" ]]; then
+    _flags+=(--adminReadOnlyAccessKeys "$read_only_keys")
   fi
 
-  if [[ -n "${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE}" ]]; then
-    if [[ ! -f "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" || ! -r "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" ]]; then
-      echo "ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE='$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE' is missing or unreadable; aborting" >&2
+  if [[ -n "$previous_key" ]]; then
+    if [[ ! -f "$previous_key" || ! -r "$previous_key" ]]; then
+      echo "ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE='$previous_key' is missing or unreadable; aborting" >&2
       exit 1
     fi
-    _flags+=(--adminSessionSigningKeyPreviousFile "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE")
-    _volumes+=(-v "${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE}:${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE}:ro")
+    _flags+=(--adminSessionSigningKeyPreviousFile "$previous_key")
+    _volumes+=(-v "${previous_key}:${previous_key}:ro")
   fi
 
   # TLS pair must be set together. The daemon already rejects partial
@@ -883,28 +932,28 @@ build_admin_flags() {
   # script-level error pointing at the variable name, instead of the
   # daemon's "exactly one of cert/key" message after the container is
   # already running.
-  if [[ -n "${ADMIN_TLS_CERT_FILE}" || -n "${ADMIN_TLS_KEY_FILE}" ]]; then
-    if [[ -z "${ADMIN_TLS_CERT_FILE}" || -z "${ADMIN_TLS_KEY_FILE}" ]]; then
+  if [[ -n "$tls_cert" || -n "$tls_key" ]]; then
+    if [[ -z "$tls_cert" || -z "$tls_key" ]]; then
       echo "ADMIN_TLS_CERT_FILE and ADMIN_TLS_KEY_FILE must be set together; aborting" >&2
       exit 1
     fi
-    if [[ ! -f "$ADMIN_TLS_CERT_FILE" || ! -r "$ADMIN_TLS_CERT_FILE" ]]; then
-      echo "ADMIN_TLS_CERT_FILE='$ADMIN_TLS_CERT_FILE' is missing or unreadable; aborting" >&2
+    if [[ ! -f "$tls_cert" || ! -r "$tls_cert" ]]; then
+      echo "ADMIN_TLS_CERT_FILE='$tls_cert' is missing or unreadable; aborting" >&2
       exit 1
     fi
-    if [[ ! -f "$ADMIN_TLS_KEY_FILE" || ! -r "$ADMIN_TLS_KEY_FILE" ]]; then
-      echo "ADMIN_TLS_KEY_FILE='$ADMIN_TLS_KEY_FILE' is missing or unreadable; aborting" >&2
+    if [[ ! -f "$tls_key" || ! -r "$tls_key" ]]; then
+      echo "ADMIN_TLS_KEY_FILE='$tls_key' is missing or unreadable; aborting" >&2
       exit 1
     fi
-    _flags+=(--adminTLSCertFile "$ADMIN_TLS_CERT_FILE" --adminTLSKeyFile "$ADMIN_TLS_KEY_FILE")
-    _volumes+=(-v "${ADMIN_TLS_CERT_FILE}:${ADMIN_TLS_CERT_FILE}:ro")
-    _volumes+=(-v "${ADMIN_TLS_KEY_FILE}:${ADMIN_TLS_KEY_FILE}:ro")
+    _flags+=(--adminTLSCertFile "$tls_cert" --adminTLSKeyFile "$tls_key")
+    _volumes+=(-v "${tls_cert}:${tls_cert}:ro")
+    _volumes+=(-v "${tls_key}:${tls_key}:ro")
   fi
 
-  if [[ "${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK}" == "true" ]]; then
+  if [[ "$allow_plaintext" == "true" ]]; then
     _flags+=(--adminAllowPlaintextNonLoopback)
   fi
-  if [[ "${ADMIN_ALLOW_INSECURE_DEV_COOKIE}" == "true" ]]; then
+  if [[ "$insecure_cookie" == "true" ]]; then
     _flags+=(--adminAllowInsecureDevCookie)
   fi
 }
@@ -1139,6 +1188,24 @@ RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
 RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
 RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
+
+# ADMIN_* values may contain commas (allow-lists), spaces (paths with
+# spaces, though discouraged), or other shell metacharacters. The
+# remote bash -s reparses the whole `env KEY=value … bash` line through
+# the login shell once, so every value the operator might set has to
+# survive that pass intact. printf %q is the same hardening every
+# other forwarded path-like variable above gets.
+# The two boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*) are validated
+# at the top of the local script to be the literal "true" or "false",
+# so they need no extra escaping — kept unquoted at the env site for
+# readability.
+ADMIN_ADDRESS_Q="$(printf '%q' "$ADMIN_ADDRESS")"
+ADMIN_FULL_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_FULL_ACCESS_KEYS")"
+ADMIN_READ_ONLY_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_READ_ONLY_ACCESS_KEYS")"
+ADMIN_SESSION_SIGNING_KEY_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_FILE")"
+ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE")"
+ADMIN_TLS_CERT_FILE_Q="$(printf '%q' "$ADMIN_TLS_CERT_FILE")"
+ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
