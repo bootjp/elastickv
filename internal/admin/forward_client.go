@@ -32,6 +32,17 @@ type LeaderForwarder interface {
 	ForwardCreateTable(ctx context.Context, principal AuthPrincipal, in CreateTableRequest) (*ForwardResult, error)
 	// ForwardDeleteTable is the delete-side counterpart.
 	ForwardDeleteTable(ctx context.Context, principal AuthPrincipal, name string) (*ForwardResult, error)
+	// ForwardCreateBucket issues a forwarded POST /s3/buckets on
+	// the leader's behalf. The leader echoes back the same JSON
+	// envelope a leader-direct call would produce.
+	ForwardCreateBucket(ctx context.Context, principal AuthPrincipal, in CreateBucketRequest) (*ForwardResult, error)
+	// ForwardDeleteBucket is the delete-side counterpart.
+	ForwardDeleteBucket(ctx context.Context, principal AuthPrincipal, name string) (*ForwardResult, error)
+	// ForwardPutBucketAcl issues a forwarded PUT
+	// /s3/buckets/{name}/acl. Both the bucket name and the
+	// new ACL travel inside the proto payload — see the leader-side
+	// handlePutBucketAcl for the JSON shape.
+	ForwardPutBucketAcl(ctx context.Context, principal AuthPrincipal, name, acl string) (*ForwardResult, error)
 }
 
 // ForwardResult is the leader's response replayed for the SPA. The
@@ -140,6 +151,43 @@ func (c *gRPCForwardClient) ForwardDeleteTable(ctx context.Context, principal Au
 		return nil, pkgerrors.Wrap(err, "admin forward: marshal delete-table request")
 	}
 	return c.forward(ctx, pb.AdminOperation_ADMIN_OP_DELETE_TABLE, principal, payload)
+}
+
+// ForwardCreateBucket serialises `in` as JSON and dispatches the
+// CreateBucket operation. Same contract as ForwardCreateTable —
+// gRPC errors are wrapped, ErrLeaderUnavailable on no-leader.
+func (c *gRPCForwardClient) ForwardCreateBucket(ctx context.Context, principal AuthPrincipal, in CreateBucketRequest) (*ForwardResult, error) {
+	payload, err := json.Marshal(in)
+	if err != nil {
+		return nil, pkgerrors.Wrap(err, "admin forward: marshal create-bucket request")
+	}
+	return c.forward(ctx, pb.AdminOperation_ADMIN_OP_CREATE_BUCKET, principal, payload)
+}
+
+// ForwardDeleteBucket serialises the bucket name as `{"name":"..."}`
+// to match the leader-side handleDeleteBucket contract.
+func (c *gRPCForwardClient) ForwardDeleteBucket(ctx context.Context, principal AuthPrincipal, name string) (*ForwardResult, error) {
+	payload, err := json.Marshal(struct {
+		Name string `json:"name"`
+	}{Name: name})
+	if err != nil {
+		return nil, pkgerrors.Wrap(err, "admin forward: marshal delete-bucket request")
+	}
+	return c.forward(ctx, pb.AdminOperation_ADMIN_OP_DELETE_BUCKET, principal, payload)
+}
+
+// ForwardPutBucketAcl carries both the bucket name (from the URL
+// path) and the new ACL (from the request body) in the proto
+// payload — see handlePutBucketAcl for the leader-side decode.
+func (c *gRPCForwardClient) ForwardPutBucketAcl(ctx context.Context, principal AuthPrincipal, name, acl string) (*ForwardResult, error) {
+	payload, err := json.Marshal(struct {
+		Name string `json:"name"`
+		ACL  string `json:"acl"`
+	}{Name: name, ACL: acl})
+	if err != nil {
+		return nil, pkgerrors.Wrap(err, "admin forward: marshal put-bucket-acl request")
+	}
+	return c.forward(ctx, pb.AdminOperation_ADMIN_OP_PUT_BUCKET_ACL, principal, payload)
 }
 
 func (c *gRPCForwardClient) forward(ctx context.Context, op pb.AdminOperation, principal AuthPrincipal, payload []byte) (*ForwardResult, error) {

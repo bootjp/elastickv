@@ -97,6 +97,7 @@ var (
 	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
 	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
+	raftJoinAsLearner    = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_proposed_raft_learner.md §4.5.")
 	raftGroups           = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
 	shardRanges          = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
 	raftRedisMap         = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
@@ -136,7 +137,18 @@ var (
 	keyvizMaxTrackedRoutes       = flag.Int("keyvizMaxTrackedRoutes", keyviz.DefaultMaxTrackedRoutes, "Maximum routes tracked individually before excess routes coarsen into virtual buckets")
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
+	// Phase 2-C cluster fan-out: comma-separated list of admin
+	// HTTP endpoints (host:port or scheme://host:port). When set,
+	// the admin keyviz handler aggregates the local matrix with
+	// peer responses; when empty, behaviour is unchanged
+	// (single-node view). See docs/design/2026_04_27_proposed_keyviz_cluster_fanout.md.
+	keyvizFanoutNodes   = flag.String("keyvizFanoutNodes", "", "Comma-separated peer admin endpoints (host:port) for keyviz cluster-wide fan-out; empty disables")
+	keyvizFanoutTimeout = flag.Duration("keyvizFanoutTimeout", keyvizFanoutDefaultTimeout, "Per-peer timeout for keyviz fan-out HTTP calls")
 )
+
+// keyvizFanoutDefaultTimeout matches design 9 open-question 2: 2 s
+// per peer call. Operators on weird networks override via the flag.
+const keyvizFanoutDefaultTimeout = 2 * time.Second
 
 const adminTokenMaxBytes = 4 << 10
 
@@ -528,7 +540,7 @@ func buildShardGroups(
 		// Each shard FSM shares the same HLC so any shard's lease renewal advances
 		// the global physicalCeiling. The logical counter remains in-memory only.
 		sm := kv.NewKvFSMWithHLC(st, clock)
-		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory)
+		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {
 				rt.Close()
@@ -764,7 +776,11 @@ func startServers(in serversInput) error {
 	// the handler hands ErrTablesNotLeader writes to the forwarder
 	// which dials the leader over the cached gRPC pool. Without these
 	// the handler falls back to 503 + Retry-After:1.
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, in.coordinate, connCache); err != nil {
+	fanoutCfg := keyVizFanoutConfig{
+		Nodes:   parseCSV(*keyvizFanoutNodes),
+		Timeout: *keyvizFanoutTimeout,
+	}
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler, fanoutCfg); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil
@@ -1303,6 +1319,18 @@ type runtimeServerRunner struct {
 	// not a public API. Nil until start() reaches the dynamo step.
 	dynamoServer *adapter.DynamoDBServer
 
+	// s3Server is the parallel field for the S3 admin endpoints
+	// (read-only in this slice). Nil when --s3Address is empty,
+	// in which case the admin handler answers /s3/buckets* with
+	// 404, mirroring the dynamoServer == nil contract.
+	s3Server *adapter.S3Server
+
+	// sqsServer plays the same role for the SQS admin entrypoints
+	// (adapter/sqs_admin.go). Nil when --sqsAddress is empty; the
+	// admin listener then leaves /admin/api/v1/sqs/* off the wire
+	// (the mux 404s those paths).
+	sqsServer *adapter.SQSServer
+
 	// roleStore is the access-key → role index the leader-side
 	// gRPC AdminForward service uses to re-validate the principal
 	// on every forwarded write. Mirrors what admin.Config.RoleIndex
@@ -1317,21 +1345,28 @@ func (r *runtimeServerRunner) start() error {
 	if err := startRedisServer(r.ctx, r.lc, r.eg, r.redisAddress, r.shardStore, r.coordinate, r.leaderRedis, r.pubsubRelay, r.metricsRegistry, r.readTracker); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	// startDynamoDBServer must run BEFORE startRaftServers so the
-	// resulting DynamoDBServer is available to the leader-side gRPC
-	// AdminForward registration in startRaftServers (design 3.3).
-	// Both servers listen on different addresses; the dynamo HTTP
-	// listener accepting traffic before raft TCP listeners are up
-	// is no different from the existing startup-race semantics — a
-	// hit in that window already returned 503 before this reorder.
+	// startDynamoDBServer + startS3Server must run BEFORE
+	// startRaftServers so the resulting *DynamoDBServer / *S3Server
+	// are available to the leader-side gRPC AdminForward registration
+	// in startRaftServers (design 3.3, P2 slice 2b). Each server
+	// listens on its own address; them accepting traffic before the
+	// raft TCP listeners are up is no different from the existing
+	// startup-race semantics — a hit in that window already returned
+	// 503 before this reorder.
 	dynamoServer, err := startDynamoDBServer(r.ctx, r.lc, r.eg, r.dynamoAddress, r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
 	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	r.dynamoServer = dynamoServer
+	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	if err != nil {
+		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
+	}
+	r.s3Server = s3Server
 	forwardDeps := adminForwardServerDeps{
-		tables: newDynamoTablesSource(r.dynamoServer),
-		roles:  r.roleStore,
+		tables:  newDynamoTablesSource(r.dynamoServer),
+		buckets: newBucketsSource(r.s3Server),
+		roles:   r.roleStore,
 	}
 	if err := startRaftServers(
 		r.ctx,
@@ -1351,12 +1386,11 @@ func (r *runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker); err != nil {
+	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile)
+	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	if err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile); err != nil {
-		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
-	}
+	r.sqsServer = sqsServer
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}

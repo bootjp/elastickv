@@ -193,6 +193,88 @@ export interface CreateBucketRequest {
   acl?: "private" | "public-read";
 }
 
+// SQS queue admin DTOs (Section 16.2 of the SQS partial design doc).
+// `attributes` mirrors the AWS GetQueueAttributes "All" set with
+// snake_case keys; `counters` is the typed projection of the three
+// Approximate* counters added in Phase 3.A.
+export interface SqsQueueCounters {
+  visible: number;
+  not_visible: number;
+  delayed: number;
+}
+
+export interface SqsQueueSummary {
+  name: string;
+  is_fifo: boolean;
+  generation: number;
+  created_at?: string;
+  attributes?: Record<string, string>;
+  counters: SqsQueueCounters;
+}
+
+export interface SqsQueueList {
+  queues: string[];
+}
+
+// KeyViz wire shapes mirror internal/admin/keyviz_handler.go
+// (KeyVizMatrix / KeyVizRow). Go []byte fields arrive as
+// base64-encoded strings via encoding/json — keep them as `string` on
+// the client and decode lazily where preview labels need raw bytes.
+export type KeyVizSeries = "reads" | "writes" | "read_bytes" | "write_bytes";
+
+export interface KeyVizRow {
+  bucket_id: string;
+  start: string;
+  end: string;
+  aggregate: boolean;
+  route_ids?: number[];
+  route_ids_truncated?: boolean;
+  route_count: number;
+  values: number[];
+  // Phase 2-C row-level conflict flag (always present on the wire,
+  // defaults to false). True when ≥2 nodes reported a non-zero
+  // value for the same cell — typically a leadership flip mid-
+  // window. Per design 4.2 / PR-1, this is a row-level signal; it
+  // moves to per-cell when the proto extension lands in 2-C+.
+  conflict?: boolean;
+}
+
+// Per-node entry in the KeyVizMatrix.fanout block. OK=true means
+// the node returned a parseable matrix; OK=false carries the
+// reason (timeout, refused, 5xx body, JSON decode failure). Self
+// always reports ok=true since the local matrix is computed in-
+// process.
+export interface KeyVizFanoutNode {
+  node: string;
+  ok: boolean;
+  error?: string;
+}
+
+// Per-response fan-out summary attached to KeyVizMatrix.fanout
+// when the operator configured --keyvizFanoutNodes. Absent when
+// fan-out is disabled. nodes is ordered self-first, then in
+// --keyvizFanoutNodes order. Responded counts ok=true entries.
+export interface KeyVizFanoutResult {
+  nodes: KeyVizFanoutNode[];
+  responded: number;
+  expected: number;
+}
+
+export interface KeyVizMatrix {
+  column_unix_ms: number[];
+  rows: KeyVizRow[];
+  series: KeyVizSeries;
+  generated_at: string;
+  fanout?: KeyVizFanoutResult;
+}
+
+export interface KeyVizParams {
+  series?: KeyVizSeries;
+  from_unix_ms?: number;
+  to_unix_ms?: number;
+  rows?: number;
+}
+
 export const api = {
   login: (access_key: string, secret_key: string) =>
     apiFetch<LoginResponse>("/auth/login", {
@@ -223,4 +305,20 @@ export const api = {
     }),
   deleteBucket: (name: string) =>
     apiFetch<void>(`/s3/buckets/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  listQueues: (signal?: AbortSignal) =>
+    apiFetch<SqsQueueList>("/sqs/queues", { signal }),
+  describeQueue: (name: string, signal?: AbortSignal) =>
+    apiFetch<SqsQueueSummary>(`/sqs/queues/${encodeURIComponent(name)}`, { signal }),
+  deleteQueue: (name: string) =>
+    apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  keyVizMatrix: (params: KeyVizParams, signal?: AbortSignal) =>
+    apiFetch<KeyVizMatrix>("/keyviz/matrix", {
+      query: {
+        series: params.series,
+        from_unix_ms: params.from_unix_ms,
+        to_unix_ms: params.to_unix_ms,
+        rows: params.rows,
+      },
+      signal,
+    }),
 };

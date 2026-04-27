@@ -74,6 +74,44 @@ Optional environment:
     cascading to host processes (e.g. qemu-guest-agent, systemd). Paired with
     GOMEMLIMIT=1800MiB so Go GC preempts the kill. Set to "" to disable.
 
+  Admin dashboard (opt-in; ADMIN_ENABLED=true turns the listener on)
+  ADMIN_ENABLED
+    Master switch (default false). When true, the listener is configured
+    using the rest of the ADMIN_* variables and the script bind-mounts the
+    referenced files (signing key, optional previous key, TLS pair) into
+    the container read-only. Required when enabled:
+    ADMIN_SESSION_SIGNING_KEY_FILE plus at least one of ADMIN_FULL_ACCESS_KEYS
+    / ADMIN_READ_ONLY_ACCESS_KEYS.
+  ADMIN_ADDRESS
+    host:port for the admin listener (default: daemon-internal 127.0.0.1:8080).
+    Set to a reachable bind only with ADMIN_TLS_CERT_FILE/_KEY_FILE.
+  ADMIN_FULL_ACCESS_KEYS, ADMIN_READ_ONLY_ACCESS_KEYS
+    Comma-separated allow-lists. Same key must NOT appear in both. Sessions
+    re-validate against this list on every state-changing request, so
+    revoking a key takes effect on the next admin write rather than
+    waiting for the JWT to expire.
+  ADMIN_SESSION_SIGNING_KEY_FILE
+    Required. Path on the remote host to the base64-encoded HS256 key
+    (exactly 64 raw bytes — 88 base64 chars with standard padding, or 86
+    with RawURLEncoding). Bind-mounted read-only at the same path inside
+    the container. Must be identical on every node.
+  ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE
+    Optional. Path to the previous HS256 key, used only for verification
+    during a rotation window. New tokens always sign with the primary key.
+  ADMIN_TLS_CERT_FILE, ADMIN_TLS_KEY_FILE
+    Optional PEM cert + key for the admin listener. Both must be set
+    together. Required when ADMIN_ADDRESS is non-loopback unless
+    ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK=true.
+  ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK
+    Default false. When true, allows the admin listener on a non-loopback
+    bind without TLS. Strongly discouraged. See docs/admin.md for the
+    interaction with ADMIN_ALLOW_INSECURE_DEV_COOKIE — without the
+    latter, the dashboard mints Secure cookies the browser will refuse
+    to send over plaintext, breaking sessions end-to-end.
+  ADMIN_ALLOW_INSECURE_DEV_COOKIE
+    Default false. When true, mints session cookies without the Secure
+    attribute (for local plaintext development only).
+
 Notes:
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
@@ -125,6 +163,41 @@ SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
+
+# Admin dashboard knobs. ADMIN_ENABLED is the master switch; the
+# remaining variables only take effect when ADMIN_ENABLED=true.
+# Required when enabled: ADMIN_SESSION_SIGNING_KEY_FILE plus at
+# least one of ADMIN_FULL_ACCESS_KEYS / ADMIN_READ_ONLY_ACCESS_KEYS.
+# See docs/admin.md and docs/admin_deployment.md for the contract.
+ADMIN_ENABLED="${ADMIN_ENABLED:-false}"
+ADMIN_ADDRESS="${ADMIN_ADDRESS:-}"
+ADMIN_FULL_ACCESS_KEYS="${ADMIN_FULL_ACCESS_KEYS:-}"
+ADMIN_READ_ONLY_ACCESS_KEYS="${ADMIN_READ_ONLY_ACCESS_KEYS:-}"
+ADMIN_SESSION_SIGNING_KEY_FILE="${ADMIN_SESSION_SIGNING_KEY_FILE:-}"
+ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE="${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE:-}"
+ADMIN_TLS_CERT_FILE="${ADMIN_TLS_CERT_FILE:-}"
+ADMIN_TLS_KEY_FILE="${ADMIN_TLS_KEY_FILE:-}"
+ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
+ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
+
+# Validate the three boolean ADMIN_* flags must be the literal "true"
+# or "false" — they are forwarded to the remote shell unquoted (no
+# printf %q) for readability, which is only safe when the value is
+# already metacharacter-free. Reject anything else here so an operator
+# who typed "True", "1", or a stray quote sees a script-level error
+# pointing at the variable name instead of an inscrutable failure
+# inside the SSH heredoc.
+for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE; do
+  case "${!_bool_var}" in
+    true|false) ;;
+    *)
+      echo "rolling-update: ${_bool_var} must be 'true' or 'false', got '${!_bool_var}'" >&2
+      exit 1
+      ;;
+  esac
+done
+unset _bool_var
+
 # Container OOM defenses. See usage() for rationale. Empty string disables.
 DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
 CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
@@ -443,6 +516,16 @@ update_one_node() {
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
       EXTRA_ENV="$EXTRA_ENV_Q" \
       CONTAINER_MEMORY_LIMIT="$CONTAINER_MEMORY_LIMIT_Q" \
+      ADMIN_ENABLED="$ADMIN_ENABLED" \
+      ADMIN_ADDRESS="$ADMIN_ADDRESS_Q" \
+      ADMIN_FULL_ACCESS_KEYS="$ADMIN_FULL_ACCESS_KEYS_Q" \
+      ADMIN_READ_ONLY_ACCESS_KEYS="$ADMIN_READ_ONLY_ACCESS_KEYS_Q" \
+      ADMIN_SESSION_SIGNING_KEY_FILE="$ADMIN_SESSION_SIGNING_KEY_FILE_Q" \
+      ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE="$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE_Q" \
+      ADMIN_TLS_CERT_FILE="$ADMIN_TLS_CERT_FILE_Q" \
+      ADMIN_TLS_KEY_FILE="$ADMIN_TLS_KEY_FILE_Q" \
+      ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" \
+      ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -732,6 +815,18 @@ run_container() {
     memory_flags=(--memory "$CONTAINER_MEMORY_LIMIT")
   fi
 
+  # Admin dashboard plumbing. The admin listener is opt-in; when
+  # ADMIN_ENABLED=false the build_admin_flags helper produces no
+  # arguments and no extra bind-mounts, so existing deployments keep
+  # behaving identically. When enabled, the helper also validates that
+  # every referenced file exists on the remote host (signing key,
+  # optional previous key, optional TLS pair) before docker run, so a
+  # missing path fails fast on this node instead of silently leaving a
+  # node with auth disabled.
+  local admin_flags=()
+  local admin_volumes=()
+  build_admin_flags admin_flags admin_volumes
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
@@ -739,6 +834,7 @@ run_container() {
     "${memory_flags[@]}" \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
+    "${admin_volumes[@]}" \
     "${extra_env_flags[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
     --address "${NODE_HOST}:${RAFT_PORT}" \
@@ -748,7 +844,118 @@ run_container() {
     --raftEngine "$RAFT_ENGINE" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
-    "${s3_flags[@]}" >/dev/null
+    "${s3_flags[@]}" \
+    "${admin_flags[@]}" >/dev/null
+}
+
+# build_admin_flags emits the --admin* flag list and bind-mount list
+# the docker run needs to expose the admin dashboard listener. Both
+# output arrays are populated by-reference (bash 4.3+ namerefs) so
+# run_container can compose them with the rest of the docker
+# arguments without globals leaking between rollout iterations. When
+# ADMIN_ENABLED is anything other than the literal string "true",
+# both arrays are left empty and the function returns silently — the
+# admin listener stays off, matching the daemon's hard default.
+#
+# The validation pass is intentional: a missing signing-key file or
+# missing TLS pair on a remote host is the kind of misconfiguration
+# that would otherwise hard-error the daemon at startup AFTER the
+# previous container was already stopped, leaving the node
+# unhealthy. Failing here aborts before stop_container fires.
+build_admin_flags() {
+  local -n _flags="$1"
+  local -n _volumes="$2"
+
+  # `:-` defaults are defense-in-depth: build_admin_flags runs inside
+  # the remote SSH heredoc with `set -u` active, and every ADMIN_*
+  # variable is forwarded explicitly via the env block in
+  # update_one_node. If a future refactor ever drops one of the
+  # forwarded variables, the operator gets the targeted "ADMIN_*
+  # required" error below instead of an opaque "unbound variable"
+  # crash with no hint at which variable. All nine ADMIN_* values
+  # are read into locals once at the top so the rest of the helper
+  # cannot accidentally re-fetch a global and bypass the safety net
+  # (gemini medium on PR #678 caught the original three-boolean gap).
+  local enabled="${ADMIN_ENABLED:-false}"
+  if [[ "$enabled" != "true" ]]; then
+    return 0
+  fi
+
+  local signing_key="${ADMIN_SESSION_SIGNING_KEY_FILE:-}"
+  local full_keys="${ADMIN_FULL_ACCESS_KEYS:-}"
+  local read_only_keys="${ADMIN_READ_ONLY_ACCESS_KEYS:-}"
+  local previous_key="${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE:-}"
+  local admin_listen="${ADMIN_ADDRESS:-}"
+  local tls_cert="${ADMIN_TLS_CERT_FILE:-}"
+  local tls_key="${ADMIN_TLS_KEY_FILE:-}"
+  local allow_plaintext="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
+  local insecure_cookie="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
+
+  if [[ -z "$signing_key" ]]; then
+    echo "ADMIN_ENABLED=true requires ADMIN_SESSION_SIGNING_KEY_FILE; aborting" >&2
+    exit 1
+  fi
+  if [[ -z "$full_keys" && -z "$read_only_keys" ]]; then
+    echo "ADMIN_ENABLED=true requires at least one of ADMIN_FULL_ACCESS_KEYS / ADMIN_READ_ONLY_ACCESS_KEYS; aborting" >&2
+    exit 1
+  fi
+  if [[ ! -f "$signing_key" || ! -r "$signing_key" ]]; then
+    echo "ADMIN_SESSION_SIGNING_KEY_FILE='$signing_key' is missing or unreadable on this host; aborting" >&2
+    exit 1
+  fi
+
+  _flags+=(--adminEnabled)
+  _flags+=(--adminSessionSigningKeyFile "$signing_key")
+  _volumes+=(-v "${signing_key}:${signing_key}:ro")
+
+  if [[ -n "$admin_listen" ]]; then
+    _flags+=(--adminListen "$admin_listen")
+  fi
+  if [[ -n "$full_keys" ]]; then
+    _flags+=(--adminFullAccessKeys "$full_keys")
+  fi
+  if [[ -n "$read_only_keys" ]]; then
+    _flags+=(--adminReadOnlyAccessKeys "$read_only_keys")
+  fi
+
+  if [[ -n "$previous_key" ]]; then
+    if [[ ! -f "$previous_key" || ! -r "$previous_key" ]]; then
+      echo "ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE='$previous_key' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    _flags+=(--adminSessionSigningKeyPreviousFile "$previous_key")
+    _volumes+=(-v "${previous_key}:${previous_key}:ro")
+  fi
+
+  # TLS pair must be set together. The daemon already rejects partial
+  # configs at startup, but failing earlier here gives the operator a
+  # script-level error pointing at the variable name, instead of the
+  # daemon's "exactly one of cert/key" message after the container is
+  # already running.
+  if [[ -n "$tls_cert" || -n "$tls_key" ]]; then
+    if [[ -z "$tls_cert" || -z "$tls_key" ]]; then
+      echo "ADMIN_TLS_CERT_FILE and ADMIN_TLS_KEY_FILE must be set together; aborting" >&2
+      exit 1
+    fi
+    if [[ ! -f "$tls_cert" || ! -r "$tls_cert" ]]; then
+      echo "ADMIN_TLS_CERT_FILE='$tls_cert' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    if [[ ! -f "$tls_key" || ! -r "$tls_key" ]]; then
+      echo "ADMIN_TLS_KEY_FILE='$tls_key' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    _flags+=(--adminTLSCertFile "$tls_cert" --adminTLSKeyFile "$tls_key")
+    _volumes+=(-v "${tls_cert}:${tls_cert}:ro")
+    _volumes+=(-v "${tls_key}:${tls_key}:ro")
+  fi
+
+  if [[ "$allow_plaintext" == "true" ]]; then
+    _flags+=(--adminAllowPlaintextNonLoopback)
+  fi
+  if [[ "$insecure_cookie" == "true" ]]; then
+    _flags+=(--adminAllowInsecureDevCookie)
+  fi
 }
 
 require_passwordless_sudo() {
@@ -981,6 +1188,24 @@ RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
 RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
 RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
+
+# ADMIN_* values may contain commas (allow-lists), spaces (paths with
+# spaces, though discouraged), or other shell metacharacters. The
+# remote bash -s reparses the whole `env KEY=value … bash` line through
+# the login shell once, so every value the operator might set has to
+# survive that pass intact. printf %q is the same hardening every
+# other forwarded path-like variable above gets.
+# The two boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*) are validated
+# at the top of the local script to be the literal "true" or "false",
+# so they need no extra escaping — kept unquoted at the env site for
+# readability.
+ADMIN_ADDRESS_Q="$(printf '%q' "$ADMIN_ADDRESS")"
+ADMIN_FULL_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_FULL_ACCESS_KEYS")"
+ADMIN_READ_ONLY_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_READ_ONLY_ACCESS_KEYS")"
+ADMIN_SESSION_SIGNING_KEY_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_FILE")"
+ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE")"
+ADMIN_TLS_CERT_FILE_Q="$(printf '%q' "$ADMIN_TLS_CERT_FILE")"
+ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do

@@ -65,6 +65,135 @@ func TestRouter_HealthzRejectsPost(t *testing.T) {
 	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
 }
 
+// TestRouter_HealthzLeader_ReturnsOKWhenLeader locks down the
+// happy path on /admin/healthz/leader: a verified leader probe
+// produces 200 + "ok\n" + text/plain. Mirrors the S3 / Dynamo
+// /healthz/leader contract so a multi-protocol load balancer
+// sees identical semantics.
+func TestRouter_HealthzLeader_ReturnsOKWhenLeader(t *testing.T) {
+	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return true }))
+	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "text/plain")
+	require.Equal(t, "ok\n", rec.Body.String())
+	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+}
+
+// TestRouter_HealthzLeader_Returns503WhenNotLeader locks down the
+// non-leader contract: 503 Service Unavailable + "not leader\n".
+// A load balancer probing this endpoint takes the node out of
+// rotation when it loses leadership; the body string is informative
+// for operators reading curl output.
+func TestRouter_HealthzLeader_Returns503WhenNotLeader(t *testing.T) {
+	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return false }))
+	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "text/plain")
+	require.Equal(t, "not leader\n", rec.Body.String())
+}
+
+// TestRouter_HealthzLeader_HeadOmitsBody mirrors the existing
+// healthz HEAD test. The status code must still indicate the
+// leader state; only the body is suppressed.
+func TestRouter_HealthzLeader_HeadOmitsBody(t *testing.T) {
+	rLeader := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return true }))
+	req := httptest.NewRequest(http.MethodHead, "/admin/healthz/leader", nil)
+	rec := httptest.NewRecorder()
+	rLeader.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "", rec.Body.String())
+
+	rFollower := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return false }))
+	req = httptest.NewRequest(http.MethodHead, "/admin/healthz/leader", nil)
+	rec = httptest.NewRecorder()
+	rFollower.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "", rec.Body.String())
+}
+
+// TestRouter_HealthzLeader_RejectsPost guards the method allowlist:
+// only GET / HEAD are accepted. Mirrors TestRouter_HealthzRejectsPost.
+// Also asserts the Allow: GET, HEAD header required by RFC 7231
+// §6.5.5 — load balancers and synthetic-monitor tools key off this
+// header to discover supported verbs.
+func TestRouter_HealthzLeader_RejectsPost(t *testing.T) {
+	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return true }))
+	req := httptest.NewRequest(http.MethodPost, "/admin/healthz/leader", strings.NewReader(""))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	require.Equal(t, "GET, HEAD", rec.Header().Get("Allow"))
+}
+
+// TestRouter_405_AllowHeader sweeps every router-served path that
+// rejects non-GET/HEAD verbs and asserts each emits the
+// RFC-required Allow header. Locks down the writeMethodNotAllowed
+// invariant — a future handler that bypasses the helper would
+// regress this test rather than silently shipping a non-compliant
+// 405.
+func TestRouter_405_AllowHeader(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"healthz", "/admin/healthz"},
+		{"healthz_leader", "/admin/healthz/leader"},
+		{"asset", "/admin/assets/app.js"},
+		{"spa", "/admin/somewhere"},
+	}
+	r := NewRouterWithLeaderProbe(nil, newTestStatic(), LeaderProbeFunc(func() bool { return true }))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(""))
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+			require.Equal(t, "GET, HEAD", rec.Header().Get("Allow"),
+				"path %s missing RFC 7231 Allow header on 405", tc.path)
+		})
+	}
+}
+
+// TestRouter_HealthzLeader_NilProbeReturns404 locks down the
+// "feature off" pattern: when the LeaderProbe is not wired, the
+// router answers /admin/healthz/leader with the standard JSON 404
+// — distinct from the operational 503 (which means "wired, not
+// leader"). Single-node dev runs and admin builds without runtime
+// access fall here.
+func TestRouter_HealthzLeader_NilProbeReturns404(t *testing.T) {
+	r := NewRouter(nil, newTestStatic()) // NewRouter passes nil probe to NewRouterWithLeaderProbe
+	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+	require.Contains(t, rec.Body.String(), "not_found")
+}
+
+// TestRouter_HealthzLeader_NotSwallowedBySPA locks down the
+// classify ordering: /admin/healthz/leader must reach the leader
+// handler (200/503) — not the SPA fallback that would otherwise
+// answer with index.html. A regression here would cause a load
+// balancer probing the path to see HTML 200 forever and never
+// detect a leadership change.
+func TestRouter_HealthzLeader_NotSwallowedBySPA(t *testing.T) {
+	probe := LeaderProbeFunc(func() bool { return false })
+	r := NewRouterWithLeaderProbe(nil, newTestStatic(), probe)
+	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.NotContains(t, rec.Body.String(), "<html")
+}
+
 func TestRouter_StaticAssetServed(t *testing.T) {
 	r := NewRouter(nil, newTestStatic())
 	req := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)

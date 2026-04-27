@@ -198,7 +198,7 @@ func TestStartAdminServer_DisabledNoOp(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
 	defer func() { _ = eg.Wait() }()
 	var lc net.ListenConfig
-	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, nil, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, adminListenerConfig{enabled: false}, nil, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.NoError(t, err)
 }
 
@@ -211,7 +211,7 @@ func TestStartAdminServer_InvalidConfigRejected(t *testing.T) {
 		listen:  "127.0.0.1:0",
 		// missing signing key
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.Error(t, err)
 }
 
@@ -224,7 +224,7 @@ func TestStartAdminServer_NonLoopbackWithoutTLSRejected(t *testing.T) {
 		listen:            "0.0.0.0:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "TLS")
 }
@@ -238,7 +238,7 @@ func TestStartAdminServer_RejectsMissingClusterSource(t *testing.T) {
 		listen:            "127.0.0.1:0",
 		sessionSigningKey: freshKey(),
 	}
-	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, "")
+	_, err := startAdminServer(ctx, &lc, eg, cfg, map[string]string{}, nil, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cluster info source")
 }
@@ -261,7 +261,7 @@ func TestStartAdminServer_ServesHealthz(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n1", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, "test")
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "test")
 	require.NoError(t, err)
 
 	// Poll /admin/healthz until success or the test deadline.
@@ -304,7 +304,7 @@ func TestStartAdminServer_ServesTLS(t *testing.T) {
 	cluster := admin.ClusterInfoFunc(func(_ context.Context) (admin.ClusterInfo, error) {
 		return admin.ClusterInfo{NodeID: "n-tls", Version: "test"}, nil
 	})
-	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, "test")
+	addr, err := startAdminServer(eCtx, &lc, eg, cfg, map[string]string{}, cluster, nil, nil, nil, nil, nil, nil, keyVizFanoutConfig{}, "test")
 	require.NoError(t, err)
 
 	transport := &http.Transport{TLSClientConfig: &tls.Config{
@@ -424,5 +424,64 @@ func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
 	// Falls through to default — same error returned, NOT
 	// ErrTablesNotLeader.
 	require.NotErrorIs(t, out, admin.ErrTablesNotLeader)
+	require.Equal(t, in, out)
+}
+
+// TestTranslateAdminQueuesError_LeaderChurn is the SQS counterpart of
+// TestTranslateAdminTablesError_LeaderChurn. AdminDeleteQueue clears
+// the upfront isVerifiedSQSLeader check but the kv coordinator can
+// still drop leadership inside deleteQueueWithRetry's Dispatch; the
+// resulting ErrLeaderNotFound / ErrNotLeader / wrapped suffixes must
+// classify as 503 leader_unavailable, not the generic 500 fallthrough.
+func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
+	cases := []struct {
+		name string
+		in   error
+	}{
+		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
+		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
+		{"wrapped not leader", errors.New("dispatch failed: not leader")},
+		{"wrapped leader not found", errors.New("dispatch: leader not found")},
+		{"wrapped leadership lost", errors.New("commit aborted: leadership lost")},
+		{"wrapped leadership transfer", errors.New("retry exhausted: leadership transfer in progress")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := translateAdminQueuesError(tc.in)
+			require.ErrorIs(t, out, admin.ErrQueuesNotLeader,
+				"input %q must map to ErrQueuesNotLeader", tc.in)
+		})
+	}
+}
+
+// TestTranslateAdminQueuesError_LeaderPhraseInMiddleOfMessage is the
+// SQS counterpart of the same Tables test — pins that the HasSuffix
+// matcher in isLeaderChurnError does not false-positive on
+// user-supplied error messages that happen to mention a leader
+// phrase mid-string (e.g. a queue name or attribute value that
+// happens to contain "not leader").
+func TestTranslateAdminQueuesError_LeaderPhraseInMiddleOfMessage(t *testing.T) {
+	cases := []string{
+		"not leader: actually a downstream error",
+		"leader not found, but recovered automatically",
+		"leadership lost mid-snapshot, retried successfully",
+	}
+	for _, msg := range cases {
+		t.Run(msg, func(t *testing.T) {
+			out := translateAdminQueuesError(errors.New(msg))
+			require.NotErrorIs(t, out, admin.ErrQueuesNotLeader,
+				"mid-message leader phrase %q must not classify as leader-churn", msg)
+		})
+	}
+}
+
+// TestTranslateAdminQueuesError_UnrelatedErrorPassesThrough confirms
+// the leader-churn detector does not swallow unrelated errors that
+// happen to mention the word "leader" outside the canonical phrases.
+func TestTranslateAdminQueuesError_UnrelatedErrorPassesThrough(t *testing.T) {
+	in := errors.New("team leader misconfigured")
+	out := translateAdminQueuesError(in)
+	require.NotErrorIs(t, out, admin.ErrQueuesNotLeader)
 	require.Equal(t, in, out)
 }

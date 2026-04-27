@@ -47,10 +47,47 @@ type ServerDeps struct {
 	// node clusters wire the production gRPC client.
 	Forwarder LeaderForwarder
 
+	// Buckets is the S3 admin source — read-only in this slice
+	// (list + describe). Optional: a nil value disables
+	// /admin/api/v1/s3/buckets{,/{name}} (the mux answers them
+	// with 404). Mirrors the Tables nil contract for cluster-only
+	// builds.
+	Buckets BucketsSource
+
+	// KeyViz exposes the keyviz heatmap matrix to the dashboard via
+	// /admin/api/v1/keyviz/matrix. Optional: a nil value (or a node
+	// started without --keyvizEnabled) makes the route return 503
+	// codes "keyviz_disabled" so the SPA can render a clear "feature
+	// off" state instead of an empty matrix.
+	KeyViz KeyVizSource
+
+	// KeyVizFanout enables Phase 2-C cluster-wide aggregation. When
+	// non-nil, the keyviz handler merges the local matrix with the
+	// configured peer set on every request. Optional: leaving it nil
+	// preserves the legacy single-node behaviour.
+	KeyVizFanout *KeyVizFanout
+
+	// Queues is the SQS admin source — covers list, describe, and
+	// delete via QueuesSource. Optional: a nil value disables
+	// /admin/api/v1/sqs/queues{,/{name}} (the mux answers them
+	// with 404). Same opt-in shape as Tables / Buckets; deployments
+	// that don't run the SQS adapter omit this without breaking the
+	// rest of the admin surface.
+	Queues QueuesSource
+
 	// StaticFS is the embed.FS (or any fs.FS) backing the SPA. May be
 	// nil during early development; the router renders 404 for
 	// /admin/assets/* and the SPA fallback in that case.
 	StaticFS fs.FS
+
+	// LeaderProbe drives /admin/healthz/leader: 200 when probe.
+	// IsVerifiedLeader() is true, 503 otherwise. A nil probe keeps the
+	// path unrouted (returns the standard JSON 404), matching the
+	// "feature off" pattern Tables / Buckets / Queues already use.
+	// Production wires this to the default group's IsLeader +
+	// VerifyLeader pair so a stale-leader follower in the middle of a
+	// silent leadership change cannot return 200.
+	LeaderProbe LeaderProbe
 
 	// AuthOpts configures cookie attributes and rate limiting. Zero
 	// values pick production-appropriate defaults.
@@ -74,24 +111,8 @@ type Server struct {
 // dependencies are inconsistent enough to be unusable; otherwise it is
 // total over its configuration space.
 func NewServer(deps ServerDeps) (*Server, error) {
-	if deps.Signer == nil {
-		return nil, errMissing("Signer")
-	}
-	if deps.Verifier == nil {
-		return nil, errMissing("Verifier")
-	}
-	if isNilCredentialStore(deps.Credentials) {
-		return nil, errMissing("Credentials")
-	}
-	if deps.Roles == nil {
-		// A nil role index would silently 403 every login. Treat it
-		// as a wiring bug rather than a valid "admin is locked down"
-		// state: operators who really want zero admin access can
-		// set admin.enabled=false or pass an empty (non-nil) map.
-		return nil, errMissing("Roles")
-	}
-	if deps.ClusterInfo == nil {
-		return nil, errMissing("ClusterInfo")
+	if err := validateServerDeps(deps); err != nil {
+		return nil, err
 	}
 	logger := deps.Logger
 	if logger == nil {
@@ -108,27 +129,99 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	}
 	auth := NewAuthService(deps.Signer, deps.Credentials, deps.Roles, authOpts)
 	cluster := NewClusterHandler(deps.ClusterInfo).WithLogger(logger)
-	var dynamo http.Handler
-	if deps.Tables != nil {
-		// Re-evaluate the principal's role on every state-
-		// changing request against the live role map (Codex P1
-		// on PR #635). MapRoleStore wraps the same map the auth
-		// layer uses for login, so a config reload that updates
-		// deps.Roles does NOT automatically propagate here —
-		// operators must restart the listener for revocation to
-		// take effect, but the JWT no longer extends a revoked
-		// key past the next request.
-		dynamoHandler := NewDynamoHandler(deps.Tables).
-			WithLogger(logger).
-			WithRoleStore(MapRoleStore(deps.Roles))
-		if deps.Forwarder != nil {
-			dynamoHandler = dynamoHandler.WithLeaderForwarder(deps.Forwarder)
-		}
-		dynamo = dynamoHandler
-	}
-	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, logger)
-	router := NewRouter(mux, deps.StaticFS)
+	dynamo := buildDynamoHandlerForDeps(deps, logger)
+	s3 := buildS3HandlerForDeps(deps, logger)
+	// KeyViz handler is always registered: even when the source is
+	// nil it serves a 503 keyviz_disabled, which the SPA renders as
+	// a clearer "feature off" state than an unknown_endpoint 404.
+	// Fan-out is opt-in: nil leaves the handler in single-node mode.
+	keyviz := NewKeyVizHandler(deps.KeyViz).WithLogger(logger).WithFanout(deps.KeyVizFanout)
+	sqs := buildSqsHandlerForDeps(deps, logger)
+	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, sqs, logger)
+	router := NewRouterWithLeaderProbe(mux, deps.StaticFS, deps.LeaderProbe)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
+}
+
+// validateServerDeps centralises the wiring-bug guards that NewServer
+// applies before constructing anything. Pulled out so NewServer's own
+// body can stay under the cyclomatic-complexity ceiling without
+// hiding the contract — every required field is enumerated here.
+func validateServerDeps(deps ServerDeps) error {
+	switch {
+	case deps.Signer == nil:
+		return errMissing("Signer")
+	case deps.Verifier == nil:
+		return errMissing("Verifier")
+	case isNilCredentialStore(deps.Credentials):
+		return errMissing("Credentials")
+	case deps.Roles == nil:
+		// A nil role index would silently 403 every login. Treat
+		// it as a wiring bug rather than a valid "admin is locked
+		// down" state: operators who really want zero admin
+		// access can set admin.enabled=false or pass an empty
+		// (non-nil) map.
+		return errMissing("Roles")
+	case deps.ClusterInfo == nil:
+		return errMissing("ClusterInfo")
+	}
+	return nil
+}
+
+// buildDynamoHandlerForDeps assembles the Dynamo HTTP handler from
+// ServerDeps when Tables is wired, threading the logger and the
+// optional LeaderForwarder. Returns nil when Tables is nil so the
+// router falls through to the unknown-endpoint 404.
+//
+// Re-evaluates the principal's role on every state-changing request
+// against the live role map (Codex P1 on PR #635). MapRoleStore
+// wraps the same map the auth layer uses for login, so a config
+// reload that updates deps.Roles does NOT automatically propagate
+// here — operators must restart the listener for revocation to take
+// effect, but the JWT no longer extends a revoked key past the next
+// request.
+func buildDynamoHandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
+	if deps.Tables == nil {
+		return nil
+	}
+	h := NewDynamoHandler(deps.Tables).
+		WithLogger(logger).
+		WithRoleStore(MapRoleStore(deps.Roles))
+	if deps.Forwarder != nil {
+		h = h.WithLeaderForwarder(deps.Forwarder)
+	}
+	return h
+}
+
+// buildS3HandlerForDeps is the parallel constructor for the S3
+// admin handler. Wires the live RoleStore so write endpoints
+// re-validate the principal on every request, plus the
+// LeaderForwarder so a follower hands ErrBucketsNotLeader writes
+// off to the leader transparently — both mirror the Dynamo side.
+func buildS3HandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
+	if deps.Buckets == nil {
+		return nil
+	}
+	h := NewS3Handler(deps.Buckets).
+		WithLogger(logger).
+		WithRoleStore(MapRoleStore(deps.Roles))
+	if deps.Forwarder != nil {
+		h = h.WithLeaderForwarder(deps.Forwarder)
+	}
+	return h
+}
+
+// buildSqsHandlerForDeps is the parallel constructor for the SQS
+// admin handler. Read paths are open to any session; the DELETE
+// path re-evaluates the principal's role against the live MapRoleStore
+// on every request, so a downgraded key cannot keep mutating with a
+// still-valid JWT.
+func buildSqsHandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
+	if deps.Queues == nil {
+		return nil
+	}
+	return NewSqsHandler(deps.Queues).
+		WithLogger(logger).
+		WithRoleStore(MapRoleStore(deps.Roles))
 }
 
 // Handler returns an http.Handler that serves the full admin surface.
@@ -160,16 +253,26 @@ func (s *Server) APIHandler() http.Handler {
 //	POST   /admin/api/v1/dynamo/tables              (auth required, full role)
 //	GET    /admin/api/v1/dynamo/tables/{name}       (auth required)
 //	DELETE /admin/api/v1/dynamo/tables/{name}       (auth required, full role)
+//	GET    /admin/api/v1/s3/buckets                 (auth required)
+//	POST   /admin/api/v1/s3/buckets                 (auth required, full role)
+//	GET    /admin/api/v1/s3/buckets/{name}          (auth required)
+//	DELETE /admin/api/v1/s3/buckets/{name}          (auth required, full role)
+//	PUT    /admin/api/v1/s3/buckets/{name}/acl      (auth required, full role)
+//	GET    /admin/api/v1/keyviz/matrix              (auth required)
 //
 // Body limit applies uniformly. CSRF and Audit middleware apply to
 // write-capable protected endpoints; login and logout carry their own
 // audit path inside AuthService because the generic Audit middleware
 // cannot see the claimed actor at that point in the chain.
 //
-// dynamoHandler may be nil; in that case the dynamo paths fall through
-// to the unknown-endpoint 404, matching the behaviour of any other
-// unregistered admin path.
-func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler http.Handler, logger *slog.Logger) http.Handler {
+// dynamoHandler / s3Handler / sqsHandler may be nil; in that case
+// the corresponding paths fall through to the unknown-endpoint 404,
+// matching the behaviour of any other unregistered admin path.
+//
+// keyvizHandler is always non-nil even when the sampler is disabled —
+// it serves 503 keyviz_disabled itself so the SPA gets a clearer
+// signal than an unknown_endpoint 404 from the catch-all.
+func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, s3Handler, keyvizHandler, sqsHandler http.Handler, logger *slog.Logger) http.Handler {
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
 
@@ -219,6 +322,7 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	loginChain := publicAuth(loginHandler)
 	logoutChain := protectNoAudit(logoutHandler)
 	clusterChain := protect(clusterHandler)
+	keyvizChain := protect(keyvizHandler)
 	// Dynamo endpoints (reads and writes) share the protect chain
 	// so a missing session or CSRF token 401s/403s the same way
 	// regardless of method. The Audit middleware is a no-op for
@@ -228,23 +332,104 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	if dynamoHandler != nil {
 		dynamoChain = protect(dynamoHandler)
 	}
+	// S3 endpoints (read-only in this slice) share the protect chain
+	// for the same reason: even GETs need a session + CSRF cookie so
+	// a cross-site page cannot enumerate bucket names by tricking a
+	// logged-in browser into a fetch with credentials.
+	var s3Chain http.Handler
+	if s3Handler != nil {
+		s3Chain = protect(s3Handler)
+	}
+	// SQS endpoints share the same protect chain rationale: GET
+	// reads are session-gated to keep cross-site fetches from
+	// enumerating queue names; DELETE goes through CSRF + the
+	// in-handler RoleFull check inside SqsHandler.
+	var sqsChain http.Handler
+	if sqsHandler != nil {
+		sqsChain = protect(sqsHandler)
+	}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/admin/api/v1/auth/login":
-			loginChain.ServeHTTP(w, r)
-		case r.URL.Path == "/admin/api/v1/auth/logout":
-			logoutChain.ServeHTTP(w, r)
-		case r.URL.Path == "/admin/api/v1/cluster":
-			clusterChain.ServeHTTP(w, r)
-		case dynamoChain != nil && (r.URL.Path == pathDynamoTables ||
-			strings.HasPrefix(r.URL.Path, pathPrefixDynamoTables)):
-			dynamoChain.ServeHTTP(w, r)
-		default:
-			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
-				"no admin API handler is registered for this path")
-		}
-	})
+	routes := apiRouteTable{
+		login:   loginChain,
+		logout:  logoutChain,
+		cluster: clusterChain,
+		dynamo:  dynamoChain,
+		s3:      s3Chain,
+		keyviz:  keyvizChain,
+		sqs:     sqsChain,
+	}
+	return http.HandlerFunc(routes.dispatch)
+}
+
+// apiRouteTable bundles the precomposed middleware chains for each
+// admin API path family. Pulled into a type so the dispatch switch
+// keeps buildAPIMux under the cyclop ceiling — every additional
+// resource family (S3 buckets here, future SQS / queues / etc.)
+// would otherwise push buildAPIMux's branch count past the limit.
+type apiRouteTable struct {
+	login, logout, cluster http.Handler
+	dynamo, s3, sqs        http.Handler
+	keyviz                 http.Handler
+}
+
+// dispatch is the receiver method httpHandlerFunc adapts. Logic is
+// the same path-prefix switch the call site previously inlined; the
+// resource-prefix half of it lives in resourceHandlerFor so this
+// function stays under the cyclop ceiling as new resources land.
+func (t apiRouteTable) dispatch(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/admin/api/v1/auth/login":
+		t.login.ServeHTTP(w, r)
+		return
+	case "/admin/api/v1/auth/logout":
+		t.logout.ServeHTTP(w, r)
+		return
+	case "/admin/api/v1/cluster":
+		t.cluster.ServeHTTP(w, r)
+		return
+	}
+	if h := t.resourceHandlerFor(r.URL.Path); h != nil {
+		h.ServeHTTP(w, r)
+		return
+	}
+	writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+		"no admin API handler is registered for this path")
+}
+
+// resourceHandlerFor returns the handler that owns the URL path's
+// resource family, or nil when no resource matches. Pulled out of
+// dispatch so dispatch stays under cyclop=10 even as new admin
+// resources (Dynamo, S3, SQS, KeyViz, future) get added.
+//
+// KeyViz is *always* registered (the constructor wires a non-nil
+// handler that itself emits 503 keyviz_disabled when the underlying
+// sampler is nil), so the switch matches against an exact path
+// equality and never against a nil receiver.
+func (t apiRouteTable) resourceHandlerFor(path string) http.Handler {
+	switch {
+	case t.keyviz != nil && path == "/admin/api/v1/keyviz/matrix":
+		return t.keyviz
+	case t.dynamo != nil && isDynamoPath(path):
+		return t.dynamo
+	case t.s3 != nil && isS3Path(path):
+		return t.s3
+	case t.sqs != nil && isSqsPath(path):
+		return t.sqs
+	default:
+		return nil
+	}
+}
+
+func isDynamoPath(p string) bool {
+	return p == pathDynamoTables || strings.HasPrefix(p, pathPrefixDynamoTables)
+}
+
+func isS3Path(p string) bool {
+	return p == pathS3Buckets || strings.HasPrefix(p, pathPrefixS3Buckets)
+}
+
+func isSqsPath(p string) bool {
+	return p == pathSqsQueues || strings.HasPrefix(p, pathPrefixSqsQueues)
 }
 
 func errMissing(field string) error {

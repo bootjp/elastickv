@@ -11,6 +11,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// startSQSServer stands up the SQS adapter on sqsAddr and returns the
+// running *adapter.SQSServer so the admin listener can call SigV4-bypass
+// admin entrypoints against it (see adapter/sqs_admin.go). Returns
+// (nil, nil) when sqsAddr is empty — that is the "SQS disabled" branch
+// and the admin listener leaves /admin/api/v1/sqs/* off the wire.
 func startSQSServer(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -21,19 +26,19 @@ func startSQSServer(
 	leaderSQS map[string]string,
 	region string,
 	credentialsFile string,
-) error {
+) (*adapter.SQSServer, error) {
 	sqsAddr = strings.TrimSpace(sqsAddr)
 	if sqsAddr == "" {
-		return nil
+		return nil, nil
 	}
 	sqsL, err := lc.Listen(ctx, "tcp", sqsAddr)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on %s", sqsAddr)
+		return nil, errors.Wrapf(err, "failed to listen on %s", sqsAddr)
 	}
 	staticCreds, err := loadSigV4StaticCredentialsFile(credentialsFile, "sqs")
 	if err != nil {
 		_ = sqsL.Close()
-		return err
+		return nil, err
 	}
 	sqsServer := adapter.NewSQSServer(
 		sqsL,
@@ -63,5 +68,5 @@ func startSQSServer(
 		}
 		return errors.WithStack(err)
 	})
-	return nil
+	return sqsServer, nil
 }
