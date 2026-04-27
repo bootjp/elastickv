@@ -872,8 +872,12 @@ build_admin_flags() {
   # update_one_node. If a future refactor ever drops one of the
   # forwarded variables, the operator gets the targeted "ADMIN_*
   # required" error below instead of an opaque "unbound variable"
-  # crash with no hint at which variable.
-  if [[ "${ADMIN_ENABLED:-false}" != "true" ]]; then
+  # crash with no hint at which variable. All nine ADMIN_* values
+  # are read into locals once at the top so the rest of the helper
+  # cannot accidentally re-fetch a global and bypass the safety net
+  # (gemini medium on PR #678 caught the original three-boolean gap).
+  local enabled="${ADMIN_ENABLED:-false}"
+  if [[ "$enabled" != "true" ]]; then
     return 0
   fi
 
@@ -884,6 +888,8 @@ build_admin_flags() {
   local admin_listen="${ADMIN_ADDRESS:-}"
   local tls_cert="${ADMIN_TLS_CERT_FILE:-}"
   local tls_key="${ADMIN_TLS_KEY_FILE:-}"
+  local allow_plaintext="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
+  local insecure_cookie="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 
   if [[ -z "$signing_key" ]]; then
     echo "ADMIN_ENABLED=true requires ADMIN_SESSION_SIGNING_KEY_FILE; aborting" >&2
@@ -944,10 +950,10 @@ build_admin_flags() {
     _volumes+=(-v "${tls_key}:${tls_key}:ro")
   fi
 
-  if [[ "${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}" == "true" ]]; then
+  if [[ "$allow_plaintext" == "true" ]]; then
     _flags+=(--adminAllowPlaintextNonLoopback)
   fi
-  if [[ "${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}" == "true" ]]; then
+  if [[ "$insecure_cookie" == "true" ]]; then
     _flags+=(--adminAllowInsecureDevCookie)
   fi
 }
