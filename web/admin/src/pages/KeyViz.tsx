@@ -140,17 +140,21 @@ function Heatmap({ matrix }: HeatmapProps) {
     canvas.height = Math.max(1, Math.floor(height * dpr));
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    if (matrix.rows.length === 0 || matrix.column_unix_ms.length === 0) {
+      // Nothing to draw — reset the transform on the off-chance the
+      // canvas was reused between renders, then clear and bail.
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
     // Use the buffer/logical ratio as the transform so a fractional
     // DPR (1.25x, 1.5x) maps logical coordinates exactly onto the
     // floored buffer. Setting the transform from the raw `dpr`
     // could draw at a fractional pixel that the buffer cannot
     // represent, leaving sub-pixel blur at the edges. setTransform
     // also resets the matrix so repeated runs do not stack scales.
-    const sx = width > 0 ? canvas.width / width : dpr;
-    const sy = height > 0 ? canvas.height / height : dpr;
-    ctx.setTransform(sx, 0, 0, sy, 0, 0);
+    ctx.setTransform(canvas.width / width, 0, 0, canvas.height / height, 0, 0);
     ctx.clearRect(0, 0, width, height);
-    if (matrix.rows.length === 0 || matrix.column_unix_ms.length === 0) return;
 
     // One fillRect per cell keeps render under the §10 budget at
     // 1024 x 500: the colour ramp runs once per cell rather than per
