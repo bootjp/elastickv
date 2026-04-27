@@ -265,6 +265,47 @@ func TestValidatePartitionImmutability_RejectsAnyChange(t *testing.T) {
 	}
 }
 
+// TestValidatePartitionImmutability_PartitionCountZeroAndOneEquivalent
+// pins the Claude Low fix on PR #679 round 6.2 / 6.3. The on-disk
+// PartitionCount=0 ("unset") is canonical-equivalent to an explicit
+// PartitionCount=1 ("single partition"), so a SetQueueAttributes
+// that reaffirms the default ought to be a no-op rather than a hard
+// "PartitionCount is immutable" rejection. validatePartitionImmutability
+// uses normalisePartitionCount on both sides for exactly this case.
+func TestValidatePartitionImmutability_PartitionCountZeroAndOneEquivalent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		current uint32
+		req     uint32
+		wantErr bool
+	}{
+		{"stored 0, requested 1 (no-op)", 0, 1, false},
+		{"stored 1, requested 0 (no-op)", 1, 0, false},
+		{"stored 0, requested 0 (no-op)", 0, 0, false},
+		{"stored 1, requested 1 (no-op)", 1, 1, false},
+		{"stored 0, requested 2 (real change)", 0, 2, true},
+		{"stored 1, requested 2 (real change)", 1, 2, true},
+		{"stored 2, requested 1 (real change)", 2, 1, true},
+		{"stored 2, requested 0 (real change)", 2, 0, true},
+		{"stored 4, requested 8 (real change)", 4, 8, true},
+		{"stored 8, requested 8 (no-op)", 8, 8, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cur := &sqsQueueMeta{PartitionCount: tc.current}
+			req := &sqsQueueMeta{PartitionCount: tc.req}
+			err := validatePartitionImmutability(cur, req)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 // --- htfifoAttributesPresent ---
 
 func TestHTFIFOAttributesPresent(t *testing.T) {

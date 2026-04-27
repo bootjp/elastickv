@@ -201,11 +201,18 @@ func validatePartitionDormancyGate(meta *sqsQueueMeta) error {
 // If any of the three immutable fields differs, the validator
 // returns InvalidAttributeValue naming the attribute so the
 // operator sees the cause directly. A same-value "no-op" succeeds.
+//
+// PartitionCount uses normalisePartitionCount so a SetQueueAttributes
+// request that passes the canonical-equivalent value (e.g. 1 on a
+// queue stored with 0, or 0 on a queue stored with 1) is treated as
+// the no-op it semantically is — strict equality would reject with
+// "PartitionCount is immutable" even though the partition layout
+// hasn't changed (Claude Low on PR #679 round 6.2).
 func validatePartitionImmutability(current, requested *sqsQueueMeta) error {
 	if current == nil || requested == nil {
 		return nil
 	}
-	if current.PartitionCount != requested.PartitionCount {
+	if normalisePartitionCount(current.PartitionCount) != normalisePartitionCount(requested.PartitionCount) {
 		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 			"PartitionCount is immutable; SetQueueAttributes cannot change it (DeleteQueue + CreateQueue to reconfigure)")
 	}
