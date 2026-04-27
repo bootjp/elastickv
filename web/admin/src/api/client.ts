@@ -216,6 +216,37 @@ export interface SqsQueueList {
   queues: string[];
 }
 
+// KeyViz wire shapes mirror internal/admin/keyviz_handler.go
+// (KeyVizMatrix / KeyVizRow). Go []byte fields arrive as
+// base64-encoded strings via encoding/json — keep them as `string` on
+// the client and decode lazily where preview labels need raw bytes.
+export type KeyVizSeries = "reads" | "writes" | "read_bytes" | "write_bytes";
+
+export interface KeyVizRow {
+  bucket_id: string;
+  start: string;
+  end: string;
+  aggregate: boolean;
+  route_ids?: number[];
+  route_ids_truncated?: boolean;
+  route_count: number;
+  values: number[];
+}
+
+export interface KeyVizMatrix {
+  column_unix_ms: number[];
+  rows: KeyVizRow[];
+  series: KeyVizSeries;
+  generated_at: string;
+}
+
+export interface KeyVizParams {
+  series?: KeyVizSeries;
+  from_unix_ms?: number;
+  to_unix_ms?: number;
+  rows?: number;
+}
+
 export const api = {
   login: (access_key: string, secret_key: string) =>
     apiFetch<LoginResponse>("/auth/login", {
@@ -252,4 +283,14 @@ export const api = {
     apiFetch<SqsQueueSummary>(`/sqs/queues/${encodeURIComponent(name)}`, { signal }),
   deleteQueue: (name: string) =>
     apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  keyVizMatrix: (params: KeyVizParams, signal?: AbortSignal) =>
+    apiFetch<KeyVizMatrix>("/keyviz/matrix", {
+      query: {
+        series: params.series,
+        from_unix_ms: params.from_unix_ms,
+        to_unix_ms: params.to_unix_ms,
+        rows: params.rows,
+      },
+      signal,
+    }),
 };

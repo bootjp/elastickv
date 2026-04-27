@@ -6,6 +6,7 @@ const navItems: { to: string; label: string; end?: boolean }[] = [
   { to: "/dynamo", label: "DynamoDB" },
   { to: "/sqs", label: "SQS" },
   { to: "/s3", label: "S3" },
+  { to: "/keyviz", label: "Key Visualizer" },
 ];
 
 export function Layout() {
