@@ -294,10 +294,10 @@ type sqsChangeVisibilityInput struct {
 
 // ------------------------ handlers ------------------------
 
-// prepareSendMessage decodes the SendMessage payload, resolves the
-// queue name, and runs the throttle charge. Returning early on any
-// failure keeps sendMessage under the cyclop ceiling — without this
-// extraction the throttle branch pushes the function over the limit.
+// prepareSendMessage decodes the SendMessage payload and resolves
+// the queue name. Throttle charging happens after the meta load in
+// validateSend so we don't pay an extra meta read just to discover
+// throttling is off (Gemini high on PR #679).
 func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (sqsSendMessageInput, string, bool) {
 	var in sqsSendMessageInput
 	if err := decodeSQSJSONInput(r, &in); err != nil {
@@ -309,19 +309,27 @@ func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (
 		writeSQSErrorFromErr(w, err)
 		return in, "", false
 	}
-	if !s.chargeQueue(w, r, queueName, bucketActionSend, 1) {
-		return in, queueName, false
-	}
 	return in, queueName, true
 }
 
-// validateSend loads queue meta, validates message attributes / FIFO
-// params, and resolves the delay. Returns ok=false if any validation
-// step has already written the error response.
+// validateSend loads queue meta, runs the throttle charge against
+// the loaded throttle config (no extra meta read), then validates
+// message attributes / FIFO params and resolves the delay. Returns
+// ok=false if any step has already written the error response.
+//
+// Throttle check sits AFTER the meta load (so we have the throttle
+// config) and AFTER the QueueDoesNotExist branch (so a missing
+// queue is reported as 400 QueueDoesNotExist, not as a Throttling
+// 400 against a non-existent bucket). It still sits OUTSIDE the
+// OCC transaction (§4.2): a rejected request never reaches the
+// coordinator.
 func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueName string, in sqsSendMessageInput) (*sqsQueueMeta, uint64, int64, bool) {
 	meta, readTS, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
+		return nil, 0, 0, false
+	}
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle) {
 		return nil, 0, 0, false
 	}
 	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
@@ -535,9 +543,6 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if !s.chargeQueue(w, r, queueName, bucketActionReceive, 1) {
-		return
-	}
 	ctx := r.Context()
 
 	// Use LeaseRead to fence this scan against a leader that silently lost
@@ -557,6 +562,13 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if !exists {
 		writeSQSError(w, http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return
+	}
+	// Throttle check uses the loaded meta's throttle config so we
+	// don't pay an extra meta read just to discover throttling is off
+	// (Gemini high on PR #679). Sits AFTER the QueueDoesNotExist
+	// branch — a missing queue should not consume a Recv token.
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle) {
 		return
 	}
 	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)

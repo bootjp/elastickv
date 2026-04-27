@@ -143,6 +143,10 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 
 func (s *SQSServer) Run() error {
 	s.startReaper(s.reaperCtx)
+	// Throttle bucket idle-evict runs on a background ticker so the
+	// request hot path never pays the O(N) sweep cost. Cleaned up by
+	// the same reaperCtx cancellation that stops the message reaper.
+	go s.throttle.runSweepLoop(s.reaperCtx)
 	if err := s.httpServer.Serve(s.listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.WithStack(err)
 	}

@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"math"
 	"net/http"
 	"sync"
@@ -29,6 +30,34 @@ const (
 // new bucket cannot land in production with one site forgetting to
 // invalidate it.
 var throttleAllActions = []string{bucketActionSend, bucketActionReceive, bucketActionAny}
+
+// throttleAttributeNames is the wire-side set of Throttle*
+// attributes a SetQueueAttributes request can carry. Used by the
+// invalidation gate in setQueueAttributes so an unrelated update
+// (e.g. VisibilityTimeout only) does not pay the cache invalidation
+// cost or, worse, give the caller a way to silently reset bucket
+// state via a no-op SetQueueAttributes (Codex P1 on PR #679).
+var throttleAttributeNames = []string{
+	"ThrottleSendCapacity",
+	"ThrottleSendRefillPerSecond",
+	"ThrottleRecvCapacity",
+	"ThrottleRecvRefillPerSecond",
+	"ThrottleDefaultCapacity",
+	"ThrottleDefaultRefillPerSecond",
+}
+
+// throttleAttributesPresent reports whether attrs carries any
+// Throttle* key. Cheap O(6) check; the throttleAttributeNames slice
+// is the source of truth so a future Throttle* attribute name added
+// in one place automatically participates in the gate.
+func throttleAttributesPresent(attrs map[string]string) bool {
+	for _, k := range throttleAttributeNames {
+		if _, ok := attrs[k]; ok {
+			return true
+		}
+	}
+	return false
+}
 
 // throttleHardCeilingPerSecond bounds any user-supplied capacity or
 // refill rate. A typo like SendCapacity=1e9 silently meaning "no limit"
@@ -147,7 +176,6 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, count 
 	if count < 1 {
 		count = 1
 	}
-	b.maybeSweep()
 	// Bucket key uses the *resolved* action so Send-falls-through-to-
 	// Default and Recv-falls-through-to-Default share the same Default
 	// bucket. Without the resolution, an operator who configures only
@@ -191,12 +219,40 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, count 
 // safe because both racers compute identical (capacity, refillRate)
 // from the same meta snapshot — the bucket they would build is
 // behaviourally interchangeable.
+//
+// Reconciliation against stale config (Codex P1 on PR #679): if a
+// cached bucket's capacity/refillRate differ from the cfg's current
+// values, the bucket is replaced with a fresh one built from the
+// current config. Without this check, a node that lost leadership
+// during a SetQueueAttributes commit and then regained leadership
+// later would keep enforcing the prior leader-term's limits — the
+// SetQueueAttributes invalidation only runs on the leader that
+// processed the commit, so a different leader's stale buckets
+// survive. The reconciliation also covers the case where the
+// invalidation gate in setQueueAttributes is bypassed (e.g. by a
+// future admin path that mutates throttle config without touching
+// SetQueueAttributes).
 func (b *bucketStore) loadOrInit(queue, action string, capacity, refill float64) *tokenBucket {
 	key := bucketKey{queue: queue, action: action}
 	if v, ok := b.buckets.Load(key); ok {
 		// type assertion is sound: only tokenBucket pointers are stored.
 		bucket, _ := v.(*tokenBucket)
-		return bucket
+		// Cheap field comparison under the bucket's own lock — if the
+		// cached bucket matches the current config we return it
+		// directly. A mismatch means the on-disk meta moved while
+		// this node held a stale bucket; rebuild from the current
+		// config (full capacity, matching the failover semantics).
+		bucket.mu.Lock()
+		matches := bucket.capacity == capacity && bucket.refillRate == refill
+		bucket.mu.Unlock()
+		if matches {
+			return bucket
+		}
+		b.buckets.Delete(key)
+		// fall through to LoadOrStore — a concurrent racer might
+		// have already inserted a fresh bucket with the current
+		// config, in which case LoadOrStore picks it up and the new
+		// bucket below is discarded.
 	}
 	now := b.clock()
 	fresh := &tokenBucket{
@@ -225,20 +281,38 @@ func (b *bucketStore) invalidateQueue(queue string) {
 	}
 }
 
-// maybeSweep walks the bucket store dropping any bucket idle longer
-// than evictedAfter. Runs at most once per sweepEvery from the hot
-// path so a many-queue cluster does not pay the O(N) cost on every
-// request.
-func (b *bucketStore) maybeSweep() {
-	if b.evictedAfter <= 0 {
+// runSweepLoop runs the idle-evict sweep on a background ticker so
+// the request hot path never pays the O(N) sync.Map.Range cost
+// (Gemini high on PR #679: a many-queue cluster would see latency
+// spikes on whichever request was unlucky enough to trigger the
+// per-minute on-hot-path sweep). Returns when ctx is done — the
+// SQSServer wires this to s.reaperCtx so a Stop() call cleans the
+// goroutine up alongside the existing reaper.
+func (b *bucketStore) runSweepLoop(ctx context.Context) {
+	if b == nil || b.evictedAfter <= 0 || b.sweepEvery <= 0 {
 		return
 	}
-	b.sweepMu.Lock()
+	t := time.NewTicker(b.sweepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			b.sweep()
+		}
+	}
+}
+
+// sweep walks the bucket store dropping any bucket idle longer than
+// evictedAfter. Called from runSweepLoop on a background ticker.
+// Bucket lookups are still O(1) on the hot path; sweep iterates
+// every entry under the per-bucket lock (held briefly for the
+// timestamp read) so it never blocks a charge() that already has
+// the bucket.
+func (b *bucketStore) sweep() {
 	now := b.clock()
-	if now.Sub(b.lastSweep) < b.sweepEvery {
-		b.sweepMu.Unlock()
-		return
-	}
+	b.sweepMu.Lock()
 	b.lastSweep = now
 	b.sweepMu.Unlock()
 	cutoff := now.Add(-b.evictedAfter)
@@ -277,6 +351,17 @@ func resolveActionConfig(cfg *sqsQueueThrottle, action string) (string, float64,
 	return action, 0, 0
 }
 
+// throttleRetryAfterCap bounds the Retry-After value the client sees
+// (Gemini medium on PR #679). Without a cap, a tiny refillRate plus
+// a large requested count would compute a multi-day wait — and
+// time.Duration arithmetic can overflow at the upper end. One hour
+// matches the bucket store's idle-evict window: by the time the
+// suggested retry would otherwise expire, the bucket would have
+// been evicted and rebuilt at full capacity anyway, so a longer
+// suggestion is meaningless. Producers that hit the cap are also
+// strongly mis-configured; capping is a guard rail, not a feature.
+const throttleRetryAfterCap = time.Hour
+
 // computeRetryAfter implements the §3.4 formula:
 //
 //	needed              := requested - currentTokens
@@ -287,6 +372,9 @@ func resolveActionConfig(cfg *sqsQueueThrottle, action string) (string, float64,
 // verbs, len(Entries) for batch verbs). The min-1 floor matches the
 // HTTP/1.1 §10.2.3 integer-second granularity. The validator keeps
 // refillRate > 0 so no divide-by-zero guard is needed.
+//
+// Capped at throttleRetryAfterCap to bound time.Duration arithmetic
+// against pathologically small refillRate / large requested values.
 func computeRetryAfter(requested, current, refillRate float64) time.Duration {
 	needed := requested - current
 	if needed <= 0 {
@@ -298,6 +386,12 @@ func computeRetryAfter(requested, current, refillRate float64) time.Duration {
 	secs := math.Ceil(needed / refillRate)
 	if secs < 1 {
 		secs = 1
+	}
+	// Cap before multiplying to avoid time.Duration overflow on
+	// pathological inputs (e.g. refillRate just above zero).
+	const capSecs = float64(throttleRetryAfterCap / time.Second)
+	if secs > capSecs {
+		secs = capSecs
 	}
 	return time.Duration(secs) * time.Second
 }
@@ -314,13 +408,15 @@ func throttleChargeCount(entries int) int {
 	return entries
 }
 
-// chargeQueue is the per-handler entry point. It loads the queue meta
-// at a fresh read timestamp (Pebble cache makes this cheap) and runs
-// the bucket store's charge against the queue's Throttle config. On
-// rejection it writes the Throttling envelope (400 + Retry-After +
-// AWS-shaped JSON body) and returns false; the caller short-circuits.
-// On allow it returns true and the caller continues with the existing
-// OCC dispatch.
+// chargeQueue is the per-handler entry point used by handlers that
+// do not already load the queue meta themselves (deleteMessage,
+// changeMessageVisibility, and their batch siblings). It loads the
+// meta at a fresh read timestamp (Pebble cache makes this cheap) and
+// runs the bucket store's charge against the queue's Throttle config.
+//
+// Handlers that DO load the meta themselves (sendMessage,
+// sendMessageBatch, receiveMessage) should use chargeQueueWithThrottle
+// to avoid the redundant load (Gemini high on PR #679).
 //
 // chargeQueue intentionally swallows missing-queue errors: the caller
 // is going to discover that the queue does not exist a few lines
@@ -336,6 +432,18 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 		return true
 	}
 	throttle := s.queueThrottleConfig(r, queueName)
+	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle)
+}
+
+// chargeQueueWithThrottle is the variant for handlers that already
+// have the throttle config in hand from their own meta load. Drops
+// the per-request meta load chargeQueue does, addressing the Gemini
+// high finding on PR #679 about redundant storage reads on the hot
+// path.
+func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle) bool {
+	if s.throttle == nil {
+		return true
+	}
 	outcome := s.throttle.charge(throttle, queueName, action, count)
 	if outcome.allowed {
 		return true

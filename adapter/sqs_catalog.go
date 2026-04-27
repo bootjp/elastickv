@@ -640,6 +640,13 @@ func attributesEqual(a, b *sqsQueueMeta) bool {
 	if a == nil || b == nil {
 		return false
 	}
+	return baseAttributesEqual(a, b) && throttleConfigEqual(a.Throttle, b.Throttle)
+}
+
+// baseAttributesEqual compares the pre-Phase-3.C/3.D attribute set.
+// Split from attributesEqual so adding fields per phase does not
+// push the function over the cyclop ceiling.
+func baseAttributesEqual(a, b *sqsQueueMeta) bool {
 	return a.IsFIFO == b.IsFIFO &&
 		a.ContentBasedDedup == b.ContentBasedDedup &&
 		a.VisibilityTimeoutSeconds == b.VisibilityTimeoutSeconds &&
@@ -648,6 +655,27 @@ func attributesEqual(a, b *sqsQueueMeta) bool {
 		a.ReceiveMessageWaitSeconds == b.ReceiveMessageWaitSeconds &&
 		a.MaximumMessageSize == b.MaximumMessageSize &&
 		a.RedrivePolicy == b.RedrivePolicy
+}
+
+// throttleConfigEqual compares two Throttle configs for the
+// CreateQueue idempotency check. Without including the throttle
+// fields in attributesEqual, a re-create with different limits would
+// be treated as idempotent and silently keep the old limits.
+func throttleConfigEqual(a, b *sqsQueueThrottle) bool {
+	aEmpty := a.IsEmpty()
+	bEmpty := b.IsEmpty()
+	if aEmpty && bEmpty {
+		return true
+	}
+	if aEmpty != bEmpty {
+		return false
+	}
+	return a.SendCapacity == b.SendCapacity &&
+		a.SendRefillPerSecond == b.SendRefillPerSecond &&
+		a.RecvCapacity == b.RecvCapacity &&
+		a.RecvRefillPerSecond == b.RecvRefillPerSecond &&
+		a.DefaultCapacity == b.DefaultCapacity &&
+		a.DefaultRefillPerSecond == b.DefaultRefillPerSecond
 }
 
 // ------------------------ storage primitives ------------------------
@@ -1205,13 +1233,18 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	}
 	// Drop the in-memory bucket entries belonging to this queue *after*
 	// the Raft commit so the next request rebuilds from the freshly
-	// committed throttle config. Without this step the old limits keep
-	// being enforced until the idle-evict sweep removes the stale
-	// entry — defeating the operator's intent to throttle a noisy
-	// tenant in real time. The LoadOrStore race a concurrent in-flight
-	// request might run with the stale bucket is benign: the rebuilt
-	// bucket starts at full capacity, same as failover semantics.
-	s.throttle.invalidateQueue(name)
+	// committed throttle config. Gated on whether the request actually
+	// touched a Throttle* attribute — an unconditional invalidate
+	// would reset the bucket on every unrelated SetQueueAttributes
+	// (e.g. VisibilityTimeout-only update), giving any caller a way to
+	// silently restore a noisy tenant's burst capacity by writing a
+	// no-op SetQueueAttributes (Codex P1 on PR #679). The bucket
+	// reconciliation in loadOrInit also catches a stale bucket if a
+	// throttle change slips past this gate (e.g. via a future admin
+	// path), so the gating here is purely a hot-path optimisation.
+	if throttleAttributesPresent(in.Attributes) {
+		s.throttle.invalidateQueue(name)
+	}
 	writeSQSJSON(w, map[string]any{})
 }
 

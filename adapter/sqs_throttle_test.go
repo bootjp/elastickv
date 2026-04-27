@@ -218,6 +218,61 @@ func TestBucketStore_DefaultBucketCovers(t *testing.T) {
 	}
 }
 
+// TestBucketStore_ReconcilesBucketOnConfigChange pins the Codex P1
+// fix on PR #679: a cached bucket whose capacity/refillRate no
+// longer match the queue's current Throttle config gets rebuilt on
+// the next charge() call. Without this, a node that loses leadership
+// during a SetQueueAttributes commit and regains it later would keep
+// enforcing the prior leader-term's limits — the SetQueueAttributes
+// invalidation only runs on the leader that processed the commit,
+// so a different leader's stale buckets survive.
+func TestBucketStore_ReconcilesBucketOnConfigChange(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Hour)
+	cfgOld := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
+	// Drain the old bucket entirely.
+	for range 10 {
+		require.True(t, store.charge(cfgOld, "orders", bucketActionSend, 1).allowed)
+	}
+	require.False(t, store.charge(cfgOld, "orders", bucketActionSend, 1).allowed,
+		"sanity: old config bucket exhausted")
+	// Now charge with a NEW config — capacity 100, refill 50. The
+	// bucket reconciliation must spot the cap/refill mismatch and
+	// rebuild a fresh bucket at the new full capacity.
+	cfgNew := &sqsQueueThrottle{SendCapacity: 100, SendRefillPerSecond: 50}
+	for range 100 {
+		require.True(t, store.charge(cfgNew, "orders", bucketActionSend, 1).allowed,
+			"new config charge must succeed against a fresh bucket; stale-bucket bug would reject")
+	}
+	// 101st must reject under the new cap.
+	require.False(t, store.charge(cfgNew, "orders", bucketActionSend, 1).allowed)
+}
+
+// TestComputeRetryAfter_CapsAtMaximum pins the Gemini medium fix on
+// PR #679: a tiny refillRate (e.g. 1e-9) plus a large requested
+// count would otherwise compute a multi-day Retry-After and
+// time.Duration arithmetic could overflow. Capped at
+// throttleRetryAfterCap so the client always sees a sane value.
+func TestComputeRetryAfter_CapsAtMaximum(t *testing.T) {
+	t.Parallel()
+	got := computeRetryAfter(1, 0, 1e-9)
+	require.Equal(t, throttleRetryAfterCap, got,
+		"computeRetryAfter must cap at throttleRetryAfterCap regardless of input")
+}
+
+// TestThrottleAttributesPresent covers the request-gate helper used
+// by setQueueAttributes to skip cache invalidation on unrelated
+// updates (Codex P1 on PR #679).
+func TestThrottleAttributesPresent(t *testing.T) {
+	t.Parallel()
+	require.False(t, throttleAttributesPresent(map[string]string{}))
+	require.False(t, throttleAttributesPresent(map[string]string{"VisibilityTimeout": "30"}))
+	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleSendCapacity": "10"}))
+	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleRecvRefillPerSecond": "5"}))
+	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleDefaultCapacity": "5"}))
+}
+
 // TestBucketStore_InvalidateQueueDropsAllActions pins the §3.1 cache
 // invalidation contract for SetQueueAttributes / DeleteQueue: every
 // bucket belonging to the queue is dropped, even ones not currently
