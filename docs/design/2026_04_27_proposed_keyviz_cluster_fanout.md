@@ -61,11 +61,17 @@ extension §9.1 calls for.
   - **Reads**: sum across nodes (each node serves distinct local
     follower reads).
   - **Writes**: max across nodes, with a row-level `conflict=true`
-    flag raised when *any* per-node values disagreed for *any* cell
-    in the row (best-effort dedup; correct under stable leadership,
-    conservative under leadership flip). The flag is row-level for
-    Phase 2-C and moves to per-cell when the proto extension lands
-    in Phase 2-C+ — see §4.2 and §5 for the wire-format implication.
+    flag raised when **two or more nodes report a non-zero value
+    for the same cell** in the row. Follower zeros against the
+    leader's non-zero value do **not** count as disagreement —
+    that is the steady-state shape of stable leadership. Correct
+    under stable leadership (the current leader is the sole
+    non-zero reporter; conflict stays false), conservative under a
+    leadership flip mid-window (both leaders report > 0 for the
+    same cell; max wins and conflict fires). The flag is row-level
+    for Phase 2-C and moves to per-cell when the proto extension
+    lands in Phase 2-C+ — see §4.2 and §5 for the wire-format
+    implication.
 - Degraded-mode response: when N nodes respond and M < N succeed,
   the response carries `{node, ok, error}` per node and the SPA
   shows a banner.
@@ -167,14 +173,18 @@ not also served by node B. Summation is exact.
 Under stable leadership, exactly one node (the current leader for
 the route's group) records writes for any given window; other
 nodes report 0. `max` returns the leader's count; non-leader
-zeros do not perturb it.
+zeros do not perturb it **and do not raise the conflict flag**.
+The conflict predicate is "≥ 2 nodes report a value > 0 for the
+same cell", not "any two values differ" — a leader-says-5 vs.
+follower-says-0 split is the steady-state shape, not a conflict.
 
 Under a leadership flip mid-window, both the ex-leader and the
 new leader may report non-zero counts for the same
 `(bucketID, windowStart)`:
 
 - If the ex-leader's local cache has not yet expired its
-  pre-transfer increment, both nodes report values.
+  pre-transfer increment, both nodes report values > 0 for the
+  same cell. The conflict predicate fires.
 - `max` returns the larger count and surfaces `conflict=true` so
   the SPA can hatch the cell.
 - This is **conservative** — it understates the true window
