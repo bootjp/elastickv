@@ -1230,10 +1230,10 @@ RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 # the login shell once, so every value the operator might set has to
 # survive that pass intact. printf %q is the same hardening every
 # other forwarded path-like variable above gets.
-# The two boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*) are validated
-# at the top of the local script to be the literal "true" or "false",
-# so they need no extra escaping — kept unquoted at the env site for
-# readability.
+# The boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*, KEYVIZ_ENABLED)
+# are validated at the top of the local script to be the literal
+# "true" or "false", so they need no extra escaping — kept unquoted
+# at the env site for readability.
 ADMIN_ADDRESS_Q="$(printf '%q' "$ADMIN_ADDRESS")"
 ADMIN_FULL_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_FULL_ACCESS_KEYS")"
 ADMIN_READ_ONLY_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_READ_ONLY_ACCESS_KEYS")"
