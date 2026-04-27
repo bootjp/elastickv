@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"hash/fnv"
 	"net/http"
 	"strconv"
 )
@@ -80,14 +79,27 @@ func partitionFor(meta *sqsQueueMeta, messageGroupID string) uint32 {
 	if messageGroupID == "" {
 		return 0
 	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(messageGroupID))
+	// Inlined FNV-1a over the string to avoid the []byte allocation
+	// hash/fnv.New64a + h.Write would force (Gemini medium on PR
+	// #681). MessageGroupId is capped at 128 chars by validation, so
+	// this loop bounds at 128 iterations of integer arithmetic per
+	// SendMessage — measurably faster than the hash.Hash interface
+	// path on the routing hot path.
+	const (
+		fnv64Offset uint64 = 14695981039346656037
+		fnv64Prime  uint64 = 1099511628211
+	)
+	hash := fnv64Offset
+	for i := 0; i < len(messageGroupID); i++ {
+		hash ^= uint64(messageGroupID[i])
+		hash *= fnv64Prime
+	}
 	// PartitionCount is a power of two (validator-enforced); mod is
 	// equivalent to mask-AND. The mask is meta.PartitionCount - 1.
 	// Computing the mask in uint64 first then narrowing to uint32 is
 	// safe because htfifoMaxPartitions == 32 fits in uint32 trivially.
 	mask := uint64(meta.PartitionCount - 1)
-	return uint32(h.Sum64() & mask) //nolint:gosec // masked by (PartitionCount - 1) ≤ htfifoMaxPartitions − 1, fits in uint32.
+	return uint32(hash & mask) //nolint:gosec // masked by (PartitionCount - 1) ≤ htfifoMaxPartitions − 1, fits in uint32.
 }
 
 // isPowerOfTwo returns true when n is a positive power of two.
@@ -140,7 +152,10 @@ func validatePartitionConfig(meta *sqsQueueMeta) error {
 		}
 	}
 	if meta.PartitionCount > 1 && meta.DeduplicationScope == htfifoDedupeScopeQueue {
-		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidParameterValue,
+		// sqsErrValidation is "InvalidParameterValue" (Gemini medium
+		// on PR #681 — uses the existing constant rather than a
+		// duplicate-value alias).
+		return newSQSAPIError(http.StatusBadRequest, sqsErrValidation,
 			"queue-scoped deduplication is incompatible with multi-partition FIFO because the dedup key cannot be globally unique across partitions without a cross-partition OCC transaction")
 	}
 	return nil

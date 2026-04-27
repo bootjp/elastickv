@@ -60,12 +60,6 @@ const (
 	sqsErrQueueDoesNotExist     = "AWS.SimpleQueueService.NonExistentQueue"
 	sqsErrInvalidAttributeName  = "InvalidAttributeName"
 	sqsErrInvalidAttributeValue = "InvalidAttributeValue"
-	// sqsErrInvalidParameterValue is the AWS code for incoherent
-	// parameter combinations (vs malformed individual values, which
-	// use sqsErrInvalidAttributeValue). HT-FIFO uses this for the
-	// {PartitionCount > 1, DeduplicationScope = "queue"} cross-
-	// attribute rejection.
-	sqsErrInvalidParameterValue = "InvalidParameterValue"
 )
 
 var sqsQueueNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}(\.fifo)?$`)
@@ -1376,6 +1370,42 @@ func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName s
 	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "set queue attributes retry attempts exhausted")
 }
 
+// applyAndValidateSetAttributes runs the apply + cross-validator
+// chain for a SetQueueAttributes request. Extracted from
+// trySetQueueAttributesOnce so that function stays under the cyclop
+// ceiling once HT-FIFO immutability + Throttle validators were
+// added. Returns nil on success; on rejection returns the typed
+// sqsAPIError the caller forwards to writeSQSErrorFromErr.
+//
+// preApply snapshot allocation is gated on htfifoAttributesPresent
+// so the common "mutable-only update" path stays alloc-free per the
+// Gemini medium feedback on PR #681.
+func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) error {
+	var preApply *sqsQueueMeta
+	if htfifoAttributesPresent(attrs) {
+		preApply = snapshotImmutableHTFIFO(meta)
+	}
+	if err := applyAttributes(meta, attrs); err != nil {
+		return err
+	}
+	if preApply != nil {
+		if err := validatePartitionImmutability(preApply, meta); err != nil {
+			return err
+		}
+	}
+	// ContentBasedDeduplication is FIFO-only; a Standard queue
+	// silently accepting it would advertise unsupported behavior to
+	// clients. Same rule enforced on CreateQueue.
+	if meta.ContentBasedDedup && !meta.IsFIFO {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
+	}
+	// HT-FIFO schema validator runs after applyAttributes so the
+	// FIFO-only checks see the post-apply state. IsFIFO comes from
+	// the loaded meta record (immutable from CreateQueue) so the
+	// validator sees the same flag CreateQueue set.
+	return validatePartitionConfig(meta)
+}
+
 // trySetQueueAttributesOnce is one read-validate-commit pass. The first
 // return reports whether the caller should stop retrying (the attrs
 // are now committed); an error means either a non-retryable failure
@@ -1389,30 +1419,7 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	if !exists {
 		return false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
-	// Snapshot the on-disk values of the immutable HT-FIFO fields
-	// before applying the request so the immutability check has a
-	// clean before/after pair. SetQueueAttributes is all-or-nothing
-	// per §3.2: if any immutable attribute carries a differing value,
-	// the entire request is rejected before any attribute is
-	// persisted (including mutable attributes in the same call).
-	preApply := snapshotImmutableHTFIFO(meta)
-	if err := applyAttributes(meta, attrs); err != nil {
-		return false, err
-	}
-	if err := validatePartitionImmutability(preApply, meta); err != nil {
-		return false, err
-	}
-	// ContentBasedDeduplication is FIFO-only; a Standard queue
-	// silently accepting it would advertise unsupported behavior to
-	// clients. Same rule enforced on CreateQueue.
-	if meta.ContentBasedDedup && !meta.IsFIFO {
-		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
-	}
-	// HT-FIFO schema validator runs after applyAttributes so the
-	// FIFO-only checks see the post-apply state. IsFIFO comes from
-	// the loaded meta record (immutable from CreateQueue) so the
-	// validator sees the same flag CreateQueue set.
-	if err := validatePartitionConfig(meta); err != nil {
+	if err := applyAndValidateSetAttributes(meta, attrs); err != nil {
 		return false, err
 	}
 	meta.LastModifiedAtMillis = time.Now().UnixMilli()

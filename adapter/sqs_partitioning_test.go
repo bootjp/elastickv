@@ -187,8 +187,8 @@ func TestValidatePartitionConfig_RejectsQueueScopedDedupOnPartitioned(t *testing
 	require.Error(t, err)
 	var apiErr *sqsAPIError
 	require.True(t, errors.As(err, &apiErr), "expected sqsAPIError, got %T", err)
-	require.Equal(t, sqsErrInvalidParameterValue, apiErr.errorType,
-		"the cross-attribute rejection must use InvalidParameterValue (incoherent params), not InvalidAttributeValue (malformed individual value)")
+	require.Equal(t, sqsErrValidation, apiErr.errorType,
+		"the cross-attribute rejection must use InvalidParameterValue (incoherent params, sqsErrValidation), not InvalidAttributeValue (malformed individual value)")
 	// Single-partition + queue-scoped dedup is fine (legacy behaviour).
 	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{
 		IsFIFO:             true,
