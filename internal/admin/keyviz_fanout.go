@@ -352,7 +352,15 @@ type countingReader struct {
 func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
-	return n, err //nolint:wrapcheck // pure pass-through; underlying reader owns the error.
+	// CLAUDE.md says "avoid //nolint — refactor instead", but the
+	// io.Reader contract is one place where the suppression is
+	// correct rather than lazy: json.Decoder uses `err == io.EOF`
+	// (pointer compare, not errors.Is) to decide whether to keep
+	// pulling, so wrapping the error with %w would silently break
+	// the decoder's stop condition. Refactoring is impossible
+	// here — the only options are pass-through-and-suppress (this)
+	// or wrap-and-break-the-decoder.
+	return n, err //nolint:wrapcheck // see comment above; cannot wrap io.Reader sentinels.
 }
 
 // responseBodyLimit returns the per-peer JSON body cap. Tests can

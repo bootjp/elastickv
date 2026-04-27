@@ -381,6 +381,50 @@ func TestKeyVizFanoutRunPeerExceedsBodyLimit(t *testing.T) {
 	// is fine — what we are pinning is the bound, not the outcome.
 }
 
+// TestKeyVizFanoutRunPeerNearCapSucceedsWithWarning pins the
+// warning-fires path Claude bot round-2 flagged on PR #686. A body
+// whose JSON ends within the cap but whose total length (with
+// trailing whitespace) overruns the cap exercises the case where
+// the decoder returns success but countingReader.n > cap. The
+// peer entry surfaces ok=true; the warning log is emitted by the
+// aggregator (best-effort, not asserted from the test).
+//
+// Construction: minimal JSON envelope (~30 B) + 256 B of trailing
+// whitespace, against a 100 B cap. json.Decoder reads in bufio
+// chunks, so the LimitReader hands it cap+1 = 101 bytes; the
+// decoder sees the complete object and returns nil, leaving
+// cr.n == 101 > 100 → the warning condition is true.
+func TestKeyVizFanoutRunPeerNearCapSucceedsWithWarning(t *testing.T) {
+	t.Parallel()
+	tiny := KeyVizMatrix{Series: keyVizSeriesReads}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/admin/api/v1/keyviz/matrix") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(tiny); err != nil {
+			t.Fatalf("encode tiny: %v", err)
+		}
+		_, _ = io.WriteString(w, strings.Repeat(" ", 256))
+	}))
+	defer peer.Close()
+
+	const testCap int64 = 100
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithResponseBodyLimit(testCap)
+
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads})
+	require.NotNil(t, merged.Fanout)
+	require.Len(t, merged.Fanout.Nodes, 2)
+	require.True(t, merged.Fanout.Nodes[0].OK, "self always reports ok")
+	require.True(t, merged.Fanout.Nodes[1].OK,
+		"near-cap success path: small JSON with trailing whitespace must decode despite the cap; got error %q",
+		merged.Fanout.Nodes[1].Error)
+}
+
 // TestKeyVizFanoutRunPeerOverlargeBody pins the security-high
 // review item on PR #686: a peer that streams more than
 // keyVizPeerResponseBodyLimit bytes must not pin a goroutine on the
