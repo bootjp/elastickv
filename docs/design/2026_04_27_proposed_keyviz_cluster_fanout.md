@@ -100,11 +100,26 @@ elastickv \
   --keyvizFanoutNodes=10.0.0.1:8080,10.0.0.2:8080,10.0.0.3:8080
 ```
 
-- Self is included implicitly: `internal/admin` resolves
-  `--adminAddress` and skips the network round-trip for the local
-  entry. This keeps the configuration symmetric across all nodes
-  (every node lists every node, including itself) so an operator
-  can stamp the same flag onto every host.
+- Self is included implicitly: `internal/admin` matches each
+  `--keyvizFanoutNodes` entry against `--adminAddress` and skips the
+  network round-trip for the local entry. This keeps the
+  configuration symmetric across all nodes (every node lists every
+  node, including itself) so an operator can stamp the same flag
+  onto every host. The matching rule is:
+  - **Exact host:port equality** to `--adminAddress` is the primary
+    case (e.g. both say `10.0.0.1:8080`).
+  - **Wildcard-bind handling**: when the listener bound to
+    `0.0.0.0` / `::`, an entry with the same port and a loopback
+    host (`127.0.0.1` / `localhost` / `::1`) also counts as self.
+    Operators who bind `--adminAddress=0.0.0.0:8080` but stamp
+    `127.0.0.1:8080` into every node's flag still get the
+    skip-fires behavior.
+  - **Anything else** is treated as a peer. A reverse-proxy or
+    DNS-aliased entry that names the same node by a different host
+    will not match — the fan-out makes a loopback HTTP call to
+    itself. This is harmless (it degrades to one extra round-trip
+    per request) but wasteful; operators should prefer the literal
+    `--adminAddress` value in the flag.
 - Empty (or unset) flag → fan-out disabled, current behaviour.
 - Each entry is a host:port. TLS is out of scope for Phase 2-C
   (intra-cluster admin traffic is assumed to ride a private
@@ -205,6 +220,11 @@ of a second apart still land on the same merged column. Without
 the alignment step a 50 ms NTP skew would split each window into
 two adjacent merged columns, halving the displayed traffic in each.
 
+In the rules below, `keyvizStep_ms` denotes the step duration in
+milliseconds — i.e. `time.Duration(--keyvizStep) / time.Millisecond`.
+The wire form already carries timestamps as `column_unix_ms` so
+millisecond-quantum arithmetic falls out naturally.
+
 Specifics:
 
 - Both sides round `column_unix_ms[i]` down to the nearest
@@ -261,6 +281,15 @@ themselves the new code. (Codex round-1 PR #685.)
 `conflict` is per row — a coarser signal than parent §9.1's
 per-cell flag. The cell-level flag will land with the
 `leaderTerm`-based merge.
+
+The field is **always present** on every row in the response — even
+when fan-out is disabled (single-node mode), `conflict` defaults to
+`false` and is emitted on the wire. This is wire-stable: an SPA
+that pattern-matches `"conflict" in row` rather than checking the
+value will not regress when the operator toggles
+`--keyvizFanoutNodes`. Only the fan-out aggregator ever sets
+`conflict = true`; in local-only mode the field's value is
+identically false.
 
 ## 6. SPA changes
 
@@ -326,9 +355,14 @@ PR 3 (Phase 2-C+):
    streams gigabytes back at us would otherwise pin a goroutine
    on the JSON decoder and balloon memory. Sizing: at the design
    ceiling of 1024 rows × 4096 columns × 8 B/uint64 the raw binary
-   payload is ~32 MiB; JSON encodes uint64 traffic counters at a
-   similar size for typical small values, so 64 MiB gives ≥2×
-   headroom. Beyond that, note that `MaxHistoryColumns` in the
+   payload is ~32 MiB. For sparse heatmaps where most counters are
+   ≤ 4 decimal digits (the common case), JSON's decimal text form
+   is **smaller** than the 8-byte raw binary, so the 64 MiB cap
+   gives comfortable headroom over the raw-binary ceiling. The cap
+   does become a real ceiling for traffic-saturated heatmaps where
+   counters routinely encode to ~20 digits, but those sit well
+   above the realistic operational range. Beyond that, note that
+   `MaxHistoryColumns` in the
    sampler is **100 000** at the upper bound; a peer that returns
    the full ring (~1024 rows × 100 000 cols ≈ 800 MiB raw) would
    trip the cap. The cap firing surfaces as a JSON-decode error
