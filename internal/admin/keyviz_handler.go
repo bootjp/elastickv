@@ -178,7 +178,12 @@ func (h *KeyVizHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	matrix := pivotKeyVizColumns(cols, params.series, params.rows)
 	matrix.GeneratedAt = h.now()
 	if h.fanout != nil {
-		matrix = h.fanout.Run(r.Context(), params, matrix)
+		// Forward the inbound user's cookies so the peer's SessionAuth
+		// middleware sees a valid principal. Cluster nodes share
+		// --adminSessionSigningKey for HA, so a cookie minted on this
+		// node verifies on any peer. nil cookies make peers 401,
+		// which surfaces as ok=false in the per-node status.
+		matrix = h.fanout.Run(r.Context(), params, matrix, r.Cookies())
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

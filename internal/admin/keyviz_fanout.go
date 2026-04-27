@@ -205,9 +205,17 @@ type peerResult struct {
 // cluster (peers empty) Run returns local with a Fanout block that
 // reports Expected=1, Responded=1.
 //
+// cookies are attached to every peer request so the receiving node's
+// SessionAuth middleware sees a valid admin session. Production
+// passes the inbound request's cookies; nil disables cookie
+// forwarding (peers will 401 unless they have their own bypass).
+// All cluster nodes must share the same --adminSessionSigningKey for
+// the cookie minted by node A to be verifiable on node B; the
+// existing HA setup already requires this.
+//
 // Run never returns an error: peer-level failures surface in the
 // FanoutResult; aggregation is best-effort.
-func (f *KeyVizFanout) Run(ctx context.Context, params keyVizParams, local KeyVizMatrix) KeyVizMatrix {
+func (f *KeyVizFanout) Run(ctx context.Context, params keyVizParams, local KeyVizMatrix, cookies []*http.Cookie) KeyVizMatrix {
 	if f == nil || len(f.peers) == 0 {
 		merged := local
 		merged.Fanout = &FanoutResult{
@@ -218,7 +226,7 @@ func (f *KeyVizFanout) Run(ctx context.Context, params keyVizParams, local KeyVi
 		return merged
 	}
 
-	results := f.fetchPeersParallel(ctx, params)
+	results := f.fetchPeersParallel(ctx, params, cookies)
 
 	matrices := []KeyVizMatrix{local}
 	statuses := []FanoutNodeStatus{{Node: f.selfName(), OK: true}}
@@ -260,7 +268,7 @@ func countOK(statuses []FanoutNodeStatus) int {
 	return n
 }
 
-func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizParams) []peerResult {
+func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizParams, cookies []*http.Cookie) []peerResult {
 	// Cap per-peer wall time so a single slow node cannot hold the
 	// SPA poll open beyond the configured timeout. The parent
 	// context is preserved as the cancellation root so an early
@@ -274,7 +282,7 @@ func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizPara
 		wg.Add(1)
 		go func(i int, peer string) {
 			defer wg.Done()
-			matrix, err := f.fetchPeer(callCtx, peer, params)
+			matrix, err := f.fetchPeer(callCtx, peer, params, cookies)
 			results[i] = peerResult{node: peer, matrix: matrix, err: err}
 		}(i, peer)
 	}
@@ -282,7 +290,7 @@ func (f *KeyVizFanout) fetchPeersParallel(ctx context.Context, params keyVizPara
 	return results
 }
 
-func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyVizParams) (*KeyVizMatrix, error) {
+func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyVizParams, cookies []*http.Cookie) (*KeyVizMatrix, error) {
 	target, err := buildKeyVizPeerURL(peer, params)
 	if err != nil {
 		return nil, pkgerrors.Wrap(err, "build peer url")
@@ -292,6 +300,18 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 		return nil, pkgerrors.Wrap(err, "new request")
 	}
 	req.Header.Set("Accept", "application/json")
+	// Forward the inbound user's admin session cookie so the peer's
+	// SessionAuth middleware sees a valid principal. Without this
+	// the peer rejects every fan-out request with 401 — the missing
+	// piece in the Phase 2-C MVP design (#685 §3 said "anonymous on
+	// a private network" but the receiving side still enforces
+	// session auth, so anonymous calls don't actually go through).
+	// Forwarding the cookie works because all admin nodes share
+	// --adminSessionSigningKey for HA; a cookie minted by node A is
+	// verifiable on node B.
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return nil, pkgerrors.Wrap(err, "peer request")
