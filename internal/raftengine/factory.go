@@ -10,6 +10,16 @@ type FactoryConfig struct {
 	Peers        []Server
 	Bootstrap    bool
 	StateMachine StateMachine
+	// JoinAsLearner records the operator-stated expectation that the
+	// local node will be added to the cluster via AddLearner, never
+	// AddVoter. The flag is purely an alarm: if a post-apply ConfState
+	// lists this node as a voter instead of a learner, the engine
+	// emits an ERROR-level structured log and increments a metric.
+	// The node keeps running -- by the time the conf change has
+	// applied, the node already counts toward quorum and an unilateral
+	// shutdown would shrink the cluster's effective fault tolerance.
+	// See docs/design/2026_04_26_proposed_raft_learner.md §4.5.
+	JoinAsLearner bool
 }
 
 // FactoryResult holds the output of Factory.Create.

@@ -80,6 +80,34 @@ func (s *Server) AddVoter(ctx context.Context, req *pb.RaftAdminAddVoterRequest)
 	return &pb.RaftAdminConfigurationChangeResponse{Index: index}, nil
 }
 
+func (s *Server) AddLearner(ctx context.Context, req *pb.RaftAdminAddLearnerRequest) (*pb.RaftAdminConfigurationChangeResponse, error) {
+	if s == nil || s.admin == nil {
+		return nil, grpcStatus(codes.Unimplemented, "add learner is not supported by this raft engine")
+	}
+	if req == nil || req.Id == "" || req.Address == "" {
+		return nil, grpcStatus(codes.InvalidArgument, "id and address are required")
+	}
+	index, err := s.admin.AddLearner(ctx, req.Id, req.Address, req.PreviousIndex)
+	if err != nil {
+		return nil, adminError(err)
+	}
+	return &pb.RaftAdminConfigurationChangeResponse{Index: index}, nil
+}
+
+func (s *Server) PromoteLearner(ctx context.Context, req *pb.RaftAdminPromoteLearnerRequest) (*pb.RaftAdminConfigurationChangeResponse, error) {
+	if s == nil || s.admin == nil {
+		return nil, grpcStatus(codes.Unimplemented, "promote learner is not supported by this raft engine")
+	}
+	if req == nil || req.Id == "" {
+		return nil, grpcStatus(codes.InvalidArgument, "id is required")
+	}
+	index, err := s.admin.PromoteLearner(ctx, req.Id, req.PreviousIndex, req.MinAppliedIndex, req.SkipMinAppliedCheck)
+	if err != nil {
+		return nil, adminError(err)
+	}
+	return &pb.RaftAdminConfigurationChangeResponse{Index: index}, nil
+}
+
 func (s *Server) RemoveServer(ctx context.Context, req *pb.RaftAdminRemoveServerRequest) (*pb.RaftAdminConfigurationChangeResponse, error) {
 	if s == nil || s.admin == nil {
 		return nil, grpcStatus(codes.Unimplemented, "remove server is not supported by this raft engine")

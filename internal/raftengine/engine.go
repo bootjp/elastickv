@@ -172,6 +172,26 @@ type Admin interface {
 	StatusReader
 	ConfigReader
 	AddVoter(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
+	// AddLearner attaches a non-voting replica that receives MsgApp /
+	// MsgSnap and applies log entries locally but does not contribute
+	// to the voter quorum. Use this instead of AddVoter when joining
+	// a fresh node so the cluster's effective fault tolerance is not
+	// reduced during catch-up. Promote with PromoteLearner once the
+	// learner has caught up. See
+	// docs/design/2026_04_26_proposed_raft_learner.md.
+	AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
+	// PromoteLearner promotes an existing learner to voter. The
+	// minAppliedIndex precondition is enforced against the leader's
+	// Progress[nodeID].Match before the conf change is proposed: if
+	// the learner has not yet caught up to that index, the call
+	// returns FailedPrecondition.
+	//
+	// minAppliedIndex == 0 is REJECTED unless skipMinAppliedCheck is
+	// also true, so an operator running a copy-pasted script that
+	// omits the catch-up check gets a clean FailedPrecondition
+	// instead of a silent quorum stall. Set skipMinAppliedCheck only
+	// when the catch-up has been confirmed out-of-band.
+	PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error)
 	RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 	TransferLeadership(ctx context.Context) error
 	TransferLeadershipToServer(ctx context.Context, id string, address string) error

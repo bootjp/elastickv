@@ -606,6 +606,8 @@ const (
 	RaftAdmin_Status_FullMethodName             = "/RaftAdmin/Status"
 	RaftAdmin_Configuration_FullMethodName      = "/RaftAdmin/Configuration"
 	RaftAdmin_AddVoter_FullMethodName           = "/RaftAdmin/AddVoter"
+	RaftAdmin_AddLearner_FullMethodName         = "/RaftAdmin/AddLearner"
+	RaftAdmin_PromoteLearner_FullMethodName     = "/RaftAdmin/PromoteLearner"
 	RaftAdmin_RemoveServer_FullMethodName       = "/RaftAdmin/RemoveServer"
 	RaftAdmin_TransferLeadership_FullMethodName = "/RaftAdmin/TransferLeadership"
 )
@@ -617,6 +619,8 @@ type RaftAdminClient interface {
 	Status(ctx context.Context, in *RaftAdminStatusRequest, opts ...grpc.CallOption) (*RaftAdminStatusResponse, error)
 	Configuration(ctx context.Context, in *RaftAdminConfigurationRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationResponse, error)
 	AddVoter(ctx context.Context, in *RaftAdminAddVoterRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationChangeResponse, error)
+	AddLearner(ctx context.Context, in *RaftAdminAddLearnerRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationChangeResponse, error)
+	PromoteLearner(ctx context.Context, in *RaftAdminPromoteLearnerRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationChangeResponse, error)
 	RemoveServer(ctx context.Context, in *RaftAdminRemoveServerRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationChangeResponse, error)
 	TransferLeadership(ctx context.Context, in *RaftAdminTransferLeadershipRequest, opts ...grpc.CallOption) (*RaftAdminTransferLeadershipResponse, error)
 }
@@ -659,6 +663,26 @@ func (c *raftAdminClient) AddVoter(ctx context.Context, in *RaftAdminAddVoterReq
 	return out, nil
 }
 
+func (c *raftAdminClient) AddLearner(ctx context.Context, in *RaftAdminAddLearnerRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationChangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RaftAdminConfigurationChangeResponse)
+	err := c.cc.Invoke(ctx, RaftAdmin_AddLearner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *raftAdminClient) PromoteLearner(ctx context.Context, in *RaftAdminPromoteLearnerRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationChangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RaftAdminConfigurationChangeResponse)
+	err := c.cc.Invoke(ctx, RaftAdmin_PromoteLearner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *raftAdminClient) RemoveServer(ctx context.Context, in *RaftAdminRemoveServerRequest, opts ...grpc.CallOption) (*RaftAdminConfigurationChangeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RaftAdminConfigurationChangeResponse)
@@ -686,6 +710,8 @@ type RaftAdminServer interface {
 	Status(context.Context, *RaftAdminStatusRequest) (*RaftAdminStatusResponse, error)
 	Configuration(context.Context, *RaftAdminConfigurationRequest) (*RaftAdminConfigurationResponse, error)
 	AddVoter(context.Context, *RaftAdminAddVoterRequest) (*RaftAdminConfigurationChangeResponse, error)
+	AddLearner(context.Context, *RaftAdminAddLearnerRequest) (*RaftAdminConfigurationChangeResponse, error)
+	PromoteLearner(context.Context, *RaftAdminPromoteLearnerRequest) (*RaftAdminConfigurationChangeResponse, error)
 	RemoveServer(context.Context, *RaftAdminRemoveServerRequest) (*RaftAdminConfigurationChangeResponse, error)
 	TransferLeadership(context.Context, *RaftAdminTransferLeadershipRequest) (*RaftAdminTransferLeadershipResponse, error)
 	mustEmbedUnimplementedRaftAdminServer()
@@ -706,6 +732,12 @@ func (UnimplementedRaftAdminServer) Configuration(context.Context, *RaftAdminCon
 }
 func (UnimplementedRaftAdminServer) AddVoter(context.Context, *RaftAdminAddVoterRequest) (*RaftAdminConfigurationChangeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AddVoter not implemented")
+}
+func (UnimplementedRaftAdminServer) AddLearner(context.Context, *RaftAdminAddLearnerRequest) (*RaftAdminConfigurationChangeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddLearner not implemented")
+}
+func (UnimplementedRaftAdminServer) PromoteLearner(context.Context, *RaftAdminPromoteLearnerRequest) (*RaftAdminConfigurationChangeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PromoteLearner not implemented")
 }
 func (UnimplementedRaftAdminServer) RemoveServer(context.Context, *RaftAdminRemoveServerRequest) (*RaftAdminConfigurationChangeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveServer not implemented")
@@ -788,6 +820,42 @@ func _RaftAdmin_AddVoter_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftAdmin_AddLearner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RaftAdminAddLearnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftAdminServer).AddLearner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftAdmin_AddLearner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftAdminServer).AddLearner(ctx, req.(*RaftAdminAddLearnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RaftAdmin_PromoteLearner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RaftAdminPromoteLearnerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftAdminServer).PromoteLearner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftAdmin_PromoteLearner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftAdminServer).PromoteLearner(ctx, req.(*RaftAdminPromoteLearnerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RaftAdmin_RemoveServer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RaftAdminRemoveServerRequest)
 	if err := dec(in); err != nil {
@@ -842,6 +910,14 @@ var RaftAdmin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AddVoter",
 			Handler:    _RaftAdmin_AddVoter_Handler,
+		},
+		{
+			MethodName: "AddLearner",
+			Handler:    _RaftAdmin_AddLearner_Handler,
+		},
+		{
+			MethodName: "PromoteLearner",
+			Handler:    _RaftAdmin_PromoteLearner_Handler,
 		},
 		{
 			MethodName: "RemoveServer",

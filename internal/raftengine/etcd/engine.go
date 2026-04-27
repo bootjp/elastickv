@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,7 +122,26 @@ var (
 	errLeadershipTransferNotLeader  = errors.Mark(errors.New("etcd raft leadership transfer requires the local node to be leader"), raftengine.ErrNotLeader)
 	errLeadershipTransferInProgress = errors.Mark(errors.New("etcd raft leadership transfer is in progress"), raftengine.ErrLeadershipTransferInProgress)
 	errTooManyPendingConfigs        = errors.New("etcd raft engine has too many pending config changes")
+	errPromoteLearnerNotLearner     = errors.New("etcd raft promote-learner target is not a learner")
+	errPromoteLearnerNoProgress     = errors.New("etcd raft promote-learner target has no leader-side progress entry")
+	errPromoteLearnerNotCaughtUp    = errors.New("etcd raft promote-learner target has not caught up to min_applied_index")
+	errPromoteLearnerMinAppliedZero = errors.New("etcd raft promote-learner requires min_applied_index>0 unless skip_min_applied_check is set")
 )
+
+// joinRoleViolationCount counts the number of times the join-as-learner
+// alarm has fired across all engine instances in this process. Surfaced
+// via JoinRoleViolationCount() so callers (monitoring) can read it
+// without holding any engine lock; the latch on Engine.joinAlarmFired
+// keeps each individual engine from contributing more than once per
+// process lifetime.
+var joinRoleViolationCount atomic.Uint64
+
+// JoinRoleViolationCount returns the cumulative count of
+// --raftJoinAsLearner alarms that have fired since process start. See
+// docs/design/2026_04_26_proposed_raft_learner.md §4.5.
+func JoinRoleViolationCount() uint64 {
+	return joinRoleViolationCount.Load()
+}
 
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
 type Snapshot = raftengine.Snapshot
@@ -132,12 +150,18 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID        uint64
-	LocalID       string
-	LocalAddress  string
-	DataDir       string
-	Peers         []Peer
-	Bootstrap     bool
+	NodeID       uint64
+	LocalID      string
+	LocalAddress string
+	DataDir      string
+	Peers        []Peer
+	Bootstrap    bool
+	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
+	// engine watches every post-apply ConfState and emits an
+	// ERROR-level alarm whenever the local node is in Voters while
+	// JoinAsLearner is true. The check is post-apply only; the node
+	// continues running.
+	JoinAsLearner bool
 	Transport     *GRPCTransport
 	TickInterval  time.Duration
 	ElectionTick  int
@@ -161,6 +185,16 @@ type Engine struct {
 	fsmSnapDir   string
 	tickInterval time.Duration
 	electionTick int
+	// joinAsLearner is captured from OpenConfig; consulted by
+	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
+	// the learner design doc.
+	joinAsLearner bool
+	// joinAlarmFired latches the join-as-learner alarm so the
+	// structured ERROR log fires once per process lifetime. Without
+	// the latch, every conf change after the misbehaving join would
+	// re-emit the log even though the operator has already been
+	// alerted by the metric counter. Stored as int32 for atomic CAS.
+	joinAlarmFired atomic.Bool
 
 	storage   *etcdraft.MemoryStorage
 	rawNode   *etcdraft.RawNode
@@ -219,6 +253,19 @@ type Engine struct {
 	runErr  error
 	closed  bool
 	applied uint64
+	// voterCount is the count of nodes in the latest applied
+	// ConfState.Voters (including self if voter). isLearnerNode is the
+	// matching set membership lookup keyed by node ID. Both are written
+	// only from the apply loop after rawNode.ApplyConfChange returns
+	// the new ConfState; both are read under e.mu on the lease-read /
+	// quorum-ack hot path. The cache exists to keep
+	// followerQuorumForClusterSize and the singleNodeLeaderAckMonoNs
+	// fast path from inflating the denominator with learners. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6. Rebuilt
+	// from scratch on each conf change — never patched — so promotion
+	// of a learner cannot leak a stale isLearnerNode[id]==true entry.
+	voterCount    int
+	isLearnerNode map[uint64]bool
 	// appliedIndex mirrors the current applied-entry index for
 	// lock-free readers on the lease-read fast path. Writers inside
 	// the Raft run loop update both `applied` (protected by the run
@@ -305,15 +352,26 @@ const (
 	adminActionAddVoter adminAction = iota + 1
 	adminActionRemoveServer
 	adminActionTransferLeadership
+	adminActionAddLearner
+	adminActionPromoteLearner
 )
 
 type adminRequest struct {
-	ctx       context.Context
-	id        uint64
-	action    adminAction
-	peer      Peer
-	prevIndex uint64
-	done      chan adminResult
+	ctx context.Context
+	id  uint64
+	// minAppliedIndex is the PromoteLearner precondition: the learner's
+	// Progress.Match on the leader must reach this index before the
+	// promotion proposal is submitted.
+	minAppliedIndex uint64
+	// skipMinAppliedCheck explicitly opts out of the precondition.
+	// Required when minAppliedIndex == 0; otherwise the engine
+	// rejects the request with errPromoteLearnerMinAppliedZero so a
+	// missing argument cannot silently disable the safety check.
+	skipMinAppliedCheck bool
+	action              adminAction
+	peer                Peer
+	prevIndex           uint64
+	done                chan adminResult
 }
 
 type adminResult struct {
@@ -430,6 +488,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
 		tickInterval:     prepared.cfg.TickInterval,
 		electionTick:     prepared.cfg.ElectionTick,
+		joinAsLearner:    prepared.cfg.JoinAsLearner,
 		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
 		persist:          prepared.disk.Persist,
@@ -446,6 +505,8 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		startedCh:        make(chan struct{}),
 		leaderReady:      make(chan struct{}),
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
+		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
+		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
 		applied:          maxAppliedIndex(prepared.disk.LocalSnap),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
@@ -465,6 +526,17 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
+	// Fire the join-as-learner alarm against the persisted snapshot's
+	// ConfState. Without this, a node that mis-joined as voter and is
+	// then restarted with --raftJoinAsLearner=true would never emit
+	// the alarm: applyConfigChange / applyConfigChangeV2 /
+	// applyReadySnapshot are the only other call sites and a clean
+	// open path bypasses all three (the snapshot is loaded from disk,
+	// not replayed). The alarm latch
+	// (joinAlarmFired.CompareAndSwap) guarantees it fires at most
+	// once per process even if a later snapshot or conf change
+	// reapplies the same role assignment. See learner design doc §4.5.
+	engine.alarmIfJoinedAsVoter(prepared.disk.LocalSnap.Metadata.ConfState)
 	// Surface a misconfiguration where the tick settings produce a
 	// non-positive lease window: lease reads would never hit the fast
 	// path. Don't fail Open -- the engine is still functional via the
@@ -513,6 +585,13 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
 	}
+	// Annotate suffrage from the persisted snapshot's ConfState before
+	// saving the peers file. The operator-supplied peer list has no
+	// suffrage info; without this, savePersistedPeers would write
+	// every peer as a voter, then a learner's restart would land on
+	// a peers file that contradicts the snapshot's ConfState.Learners
+	// and validateConfState would reject the cluster on next open.
+	annotatePeerSuffrageInSlice(peers, disk.LocalSnap.Metadata.ConfState)
 	if err := savePersistedPeers(cfg.DataDir, maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index), peers); err != nil {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
@@ -1004,6 +1083,51 @@ func (e *Engine) AddVoter(ctx context.Context, id string, address string, prevIn
 	return result.index, nil
 }
 
+// AddLearner attaches a non-voting replica. The learner is added via
+// V1 ConfChangeAddLearnerNode and starts receiving log entries
+// immediately, but does not contribute to the voter quorum until
+// promoted with PromoteLearner.
+func (e *Engine) AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error) {
+	peer, err := e.resolveAdminPeer(id, address)
+	if err != nil {
+		return 0, err
+	}
+	result, err := e.submitAdmin(ctx, adminActionAddLearner, peer, prevIndex)
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
+// PromoteLearner promotes an existing learner to voter via V1
+// ConfChangeAddNode. The minAppliedIndex precondition rejects the
+// call if the learner's leader-side Progress.Match has not reached
+// that index yet, so an operator who promotes too eagerly gets a
+// clean FailedPrecondition error instead of a silent quorum stall.
+//
+// minAppliedIndex == 0 is rejected unless skipMinAppliedCheck is
+// also true. Set skipMinAppliedCheck only when the catch-up has
+// been confirmed out-of-band.
+func (e *Engine) PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error) {
+	if id == "" {
+		return 0, errors.WithStack(errPeerIDRequired)
+	}
+	if minAppliedIndex == 0 && !skipMinAppliedCheck {
+		return 0, errors.WithStack(errPromoteLearnerMinAppliedZero)
+	}
+	result, err := e.submitAdminEx(ctx, adminRequest{
+		action:              adminActionPromoteLearner,
+		peer:                Peer{ID: id},
+		prevIndex:           prevIndex,
+		minAppliedIndex:     minAppliedIndex,
+		skipMinAppliedCheck: skipMinAppliedCheck,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
 func (e *Engine) RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error) {
 	result, err := e.submitAdmin(ctx, adminActionRemoveServer, Peer{ID: id}, prevIndex)
 	if err != nil {
@@ -1029,20 +1153,28 @@ func (e *Engine) TransferLeadershipToServer(ctx context.Context, id string, addr
 }
 
 func (e *Engine) submitAdmin(ctx context.Context, action adminAction, peer Peer, prevIndex uint64) (adminResult, error) {
+	return e.submitAdminEx(ctx, adminRequest{
+		action:    action,
+		peer:      peer,
+		prevIndex: prevIndex,
+	})
+}
+
+// submitAdminEx is the underlying admin submit path. The caller
+// populates action, peer, prevIndex, and (for PromoteLearner)
+// minAppliedIndex; ctx, id, and done are filled in here so the
+// request integrates with the engine event loop the same way the
+// existing AddVoter / RemoveServer paths do.
+func (e *Engine) submitAdminEx(ctx context.Context, req adminRequest) (adminResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return adminResult{}, err
 	}
 	if e == nil {
 		return adminResult{}, errors.WithStack(errNilEngine)
 	}
-	req := adminRequest{
-		ctx:       ctx,
-		id:        e.nextID(),
-		action:    action,
-		peer:      peer,
-		prevIndex: prevIndex,
-		done:      make(chan adminResult, 1),
-	}
+	req.ctx = ctx
+	req.id = e.nextID()
+	req.done = make(chan adminResult, 1)
 
 	select {
 	case <-ctx.Done():
@@ -1303,9 +1435,17 @@ func (e *Engine) handleAdmin(req adminRequest) {
 		return
 	}
 
+	e.dispatchAdminAction(req)
+}
+
+func (e *Engine) dispatchAdminAction(req adminRequest) {
 	switch req.action {
 	case adminActionAddVoter:
 		e.handleAddVoter(req)
+	case adminActionAddLearner:
+		e.handleAddLearner(req)
+	case adminActionPromoteLearner:
+		e.handlePromoteLearner(req)
 	case adminActionRemoveServer:
 		e.handleRemoveServer(req)
 	case adminActionTransferLeadership:
@@ -1316,14 +1456,74 @@ func (e *Engine) handleAdmin(req adminRequest) {
 }
 
 func (e *Engine) handleAddVoter(req adminRequest) {
-	contextBytes, err := encodeConfChangeContext(req.id, req.peer)
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddNode, req.peer)
+}
+
+// handleAddLearner submits a ConfChangeAddLearnerNode for a fresh
+// non-voting peer. It runs on the single-threaded admin loop.
+func (e *Engine) handleAddLearner(req adminRequest) {
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddLearnerNode, req.peer)
+}
+
+// handlePromoteLearner promotes an existing learner to voter via
+// ConfChangeAddNode. The two preconditions both run synchronously
+// here, before the propose, so a failed precondition does not enter
+// the log:
+//  1. the peer must currently be a learner (in ConfState.Learners,
+//     not in ConfState.Voters);
+//  2. when minAppliedIndex is non-zero, the leader-side
+//     Progress[nodeID].Match must already be >= minAppliedIndex.
+func (e *Engine) handlePromoteLearner(req adminRequest) {
+	peer, ok := e.peerForID(req.peer.ID)
+	if !ok {
+		req.done <- adminResult{err: errors.Wrapf(errTransportPeerUnknown, "id=%q", req.peer.ID)}
+		return
+	}
+	e.mu.RLock()
+	isLearner := e.isLearnerNode[peer.NodeID]
+	e.mu.RUnlock()
+	if !isLearner {
+		req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNotLearner, "id=%q", req.peer.ID)}
+		return
+	}
+	// PromoteLearner gates on a minAppliedIndex catch-up check by
+	// default; only an explicit skipMinAppliedCheck disables it. The
+	// engine-side guard in PromoteLearner already rejects
+	// minAppliedIndex == 0 without skipMinAppliedCheck, so by the
+	// time we reach the apply-loop handler one of these is true:
+	//   * minAppliedIndex > 0  -> verify against Progress.Match
+	//   * skipMinAppliedCheck  -> caller has confirmed out-of-band
+	if !req.skipMinAppliedCheck {
+		// rawNode.Status() is safe here: handlePromoteLearner runs on
+		// the same goroutine that owns rawNode, so no clone or lock
+		// is required.
+		status := e.rawNode.Status()
+		progress, ok := status.Progress[peer.NodeID]
+		if !ok {
+			req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNoProgress, "id=%q node=%d", peer.ID, peer.NodeID)}
+			return
+		}
+		if progress.Match < req.minAppliedIndex {
+			req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNotCaughtUp, "id=%q match=%d want>=%d", peer.ID, progress.Match, req.minAppliedIndex)}
+			return
+		}
+	}
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddNode, peer)
+}
+
+// proposeMembershipChange wraps the encode + storePendingConfig +
+// ProposeConfChange dance shared by AddVoter / AddLearner /
+// PromoteLearner. The caller has already validated the leader and
+// prevIndex preconditions in handleAdmin.
+func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.ConfChangeType, peer Peer) {
+	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {
 		req.done <- adminResult{err: err}
 		return
 	}
 	cc := raftpb.ConfChange{
-		Type:    raftpb.ConfChangeAddNode,
-		NodeID:  req.peer.NodeID,
+		Type:    changeType,
+		NodeID:  peer.NodeID,
 		Context: contextBytes,
 	}
 	if err := e.storePendingConfig(req); err != nil {
@@ -1487,11 +1687,21 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	if _, ok := e.peers[msg.From]; !ok {
 		return
 	}
-	clusterSize := len(e.peers)
-	if clusterSize <= 1 {
+	// Reject acks from learners. A learner does not vote and must not
+	// contribute to the voter-majority denominator on the lease-read
+	// fast path. See docs/design/2026_04_26_proposed_raft_learner.md
+	// §4.6. Both e.peers and e.isLearnerNode are written from the
+	// apply loop (single writer for both), so reading here under the
+	// run-loop goroutine is race-free for the same reason as e.peers
+	// above.
+	if e.isLearnerNode[msg.From] {
 		return
 	}
-	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(clusterSize))
+	voterCount := e.voterCount
+	if voterCount <= 1 {
+		return
+	}
+	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(voterCount))
 }
 
 // followerQuorumForClusterSize returns the number of non-self peer
@@ -1660,7 +1870,42 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	}
 	e.applied = snapshot.Metadata.Index
 	e.appliedIndex.Store(snapshot.Metadata.Index)
+	// Refresh the voter-cache from the snapshot's ConfState so
+	// downstream apply-loop reads (recordQuorumAck, refreshStatus,
+	// removePeer) see the post-snapshot voter set even before any
+	// further conf-change entries arrive. Mirrors the apply-loop
+	// sequence in applyConfigChange. The order matches §4.6:
+	// voterCache first, then config.Servers.
+	e.refreshVoterCache(snapshot.Metadata.ConfState)
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
+	// Persist the post-snapshot peers file with suffrage drawn from
+	// the snapshot's ConfState so a learner that received catch-up
+	// state via snapshot (the common case for fresh joiners) writes
+	// a peers file that round-trips correctly across restart. The
+	// snapshot path bypasses the apply-loop's nextPeersAfterConfigChange
+	// hook, so without this the joiner's peers file would carry the
+	// pre-AddLearner suffrage forever. See learner design doc §4.3.
+	if err := e.savePeersFileForSnapshot(snapshot); err != nil {
+		return err
+	}
+	e.alarmIfJoinedAsVoter(snapshot.Metadata.ConfState)
+	return nil
+}
+
+// savePeersFileForSnapshot writes the v2 peers file with suffrage
+// drawn from the snapshot's ConfState. Idempotent: savePersistedPeers
+// short-circuits when the on-disk index already covers `index`.
+func (e *Engine) savePeersFileForSnapshot(snapshot raftpb.Snapshot) error {
+	e.mu.RLock()
+	peers := sortedPeerList(e.peers)
+	e.mu.RUnlock()
+	if len(peers) == 0 {
+		return nil
+	}
+	annotatePeerSuffrageInSlice(peers, snapshot.Metadata.ConfState)
+	if err := savePersistedPeers(e.dataDir, snapshot.Metadata.Index, peers); err != nil {
+		return errors.Wrapf(err, "save peers file from snapshot index=%d", snapshot.Metadata.Index)
+	}
 	return nil
 }
 
@@ -1742,7 +1987,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
 				return err
 			}
-			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
+			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index, *confState)
 			e.setApplied(entry.Index)
 		case raftpb.EntryConfChangeV2:
 			var cc raftpb.ConfChangeV2
@@ -1754,7 +1999,7 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
 				return err
 			}
-			e.applyConfigChangeV2(cc, entry.Index)
+			e.applyConfigChangeV2(cc, entry.Index, *confState)
 			e.setApplied(entry.Index)
 		default:
 			e.setApplied(entry.Index)
@@ -1800,33 +2045,114 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 	}
 }
 
-func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64) {
+// applyConfigChange runs the four-step apply-loop sequence from
+// docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 4:
+//  1. recompute e.voterCount, e.isLearnerNode from confState
+//  2. upsertPeer / removePeer (mutates e.peers; may read e.voterCount)
+//  3. rebuild e.config.Servers via configurationFromConfState(e.peers, confState)
+//  4. configIndex / pending-config bookkeeping
+//
+// All four steps run on the single-threaded apply loop, so no extra
+// synchronization is needed.
+func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64, confState raftpb.ConfState) {
+	e.refreshVoterCache(confState)
 	e.applyConfigPeerChange(changeType, nodeID, context)
+	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, context)
+	e.alarmIfJoinedAsVoter(confState)
 }
 
-func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64) {
+func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
+	e.refreshVoterCache(confState)
 	for _, change := range cc.Changes {
 		e.applyConfigPeerChange(change.Type, change.NodeID, cc.Context)
 	}
+	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, cc.Context)
+	e.alarmIfJoinedAsVoter(confState)
+}
+
+// alarmIfJoinedAsVoter implements the operator-alarm semantics from
+// docs/design/2026_04_26_proposed_raft_learner.md §4.5: when the
+// operator passed --raftJoinAsLearner but a post-apply ConfState
+// lists this node as a voter, surface a one-shot ERROR-level
+// structured log and bump a metric. The node continues running --
+// shutting down would shrink the cluster's effective fault tolerance
+// since by the time the conf change has applied, the local node
+// already counts toward the voter quorum.
+func (e *Engine) alarmIfJoinedAsVoter(confState raftpb.ConfState) {
+	if !e.joinAsLearner {
+		return
+	}
+	if !nodeInVoters(confState, e.nodeID) {
+		return
+	}
+	if !e.joinAlarmFired.CompareAndSwap(false, true) {
+		return
+	}
+	joinRoleViolationCount.Add(1)
+	slog.Error("etcd raft join-as-learner alarm: local node was added as voter, expected learner",
+		slog.String("local_id", e.localID),
+		slog.Uint64("node_id", e.nodeID),
+		slog.Any("voters", confState.Voters),
+		slog.Any("learners", confState.Learners),
+	)
+}
+
+func nodeInVoters(confState raftpb.ConfState, nodeID uint64) bool {
+	for _, id := range confState.Voters {
+		if id == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshVoterCache rebuilds the voterCount / isLearnerNode cache
+// from the post-change ConfState. Called from the apply loop only.
+// The map is rebuilt from scratch — never patched — so promotion of a
+// learner cannot leak a stale isLearnerNode[id]==true entry. See
+// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+func (e *Engine) refreshVoterCache(confState raftpb.ConfState) {
+	e.mu.Lock()
+	e.voterCount = len(confState.Voters)
+	e.isLearnerNode = learnerSetFromConfState(confState)
+	e.mu.Unlock()
+}
+
+// refreshConfigServers rebuilds e.config.Servers from the post-change
+// ConfState and the current address-cache map. Called after the
+// per-peer cleanup helpers (upsertPeer / removePeer) so that
+// configurationFromConfState observes the post-cleanup e.peers map.
+func (e *Engine) refreshConfigServers(confState raftpb.ConfState) {
+	e.mu.Lock()
+	e.config = configurationFromConfState(e.peers, confState)
+	e.mu.Unlock()
 }
 
 func (e *Engine) applyConfigPeerChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
 	peer, ok := decodeConfChangePeerContext(nodeID, context)
 	switch changeType {
 	case raftpb.ConfChangeAddNode:
+		// Promotion of an existing learner also lands here as
+		// ConfChangeAddNode for a node already in e.peers; the upsert
+		// is idempotent on (nodeID -> addr) so it is safe to take
+		// the same path. The voter / learner role swap is reflected
+		// in the post-change ConfState, which the apply loop has
+		// already used to refresh the voter cache and which it will
+		// use to rebuild e.config.Servers.
 		e.applyAddedPeer(nodeID, peer, ok)
 	case raftpb.ConfChangeRemoveNode:
 		e.applyRemovedPeer(nodeID, peer, ok)
 	case raftpb.ConfChangeUpdateNode:
 		e.applyUpdatedPeer(peer, ok)
 	case raftpb.ConfChangeAddLearnerNode:
-		// Phase 3 only exposes voter membership changes. Ignore learner metadata
-		// if it appears in a replayed log; startup validation still rejects joint
-		// consensus snapshots and learner-only cluster states for now.
+		// A learner joins the address cache the same way a voter does;
+		// suffrage is an attribute of ConfState, not of e.peers. See
+		// docs/design/2026_04_26_proposed_raft_learner.md §4.2.
+		e.applyAddedPeer(nodeID, peer, ok)
 	}
 }
 
@@ -2160,7 +2486,11 @@ func (e *Engine) refreshStatus() {
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 	}
-	clusterSize := len(e.peers)
+	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
+	// cluster correctly hits the leader-of-1 fast path: a learner does
+	// not vote and is not part of the lease-read denominator. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	voterCount := e.voterCount
 	e.mu.Unlock()
 
 	// Keep the lock-free single-node fast path in sync with the current
@@ -2173,7 +2503,7 @@ func (e *Engine) refreshStatus() {
 	// could publish a ack instant while isLeader is still false.
 	e.isLeader.Store(status.State == raftengine.StateLeader)
 
-	if status.State == raftengine.StateLeader && clusterSize <= 1 {
+	if status.State == raftengine.StateLeader && voterCount <= 1 {
 		e.singleNodeLeaderAckMonoNs.Store(monoclock.Now().Nanos())
 	} else {
 		e.singleNodeLeaderAckMonoNs.Store(0)
@@ -2465,8 +2795,25 @@ func (e *Engine) currentConfigIndex() uint64 {
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {
+	// Count VOTERS in the current configuration, not all servers --
+	// a learner does not vote and must not block the single-voter
+	// fast-path Campaign(). After learner support landed,
+	// len(cfg.Servers) includes learners, so the previous check
+	// would skip Campaign() in a 1-voter + N-learner cluster on
+	// restart and incur a full electionTimeout latency for no
+	// reason. See docs/design/2026_04_26_proposed_raft_learner.md
+	// §4.6 / §3.3 (the audit of len(e.peers) overloads).
 	cfg := e.currentConfiguration()
-	return len(cfg.Servers) == 1 && cfg.Servers[0].ID == e.localID
+	var soleVoter raftengine.Server
+	voterCount := 0
+	for _, s := range cfg.Servers {
+		if s.Suffrage != SuffrageVoter {
+			continue
+		}
+		voterCount++
+		soleVoter = s
+	}
+	return voterCount == 1 && soleVoter.ID == e.localID
 }
 
 func (e *Engine) resolveAdminPeer(id string, address string) (Peer, error) {
@@ -2642,28 +2989,47 @@ func maxUint64(left uint64, right uint64) uint64 {
 }
 
 func configurationFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) raftengine.Configuration {
-	if len(conf.Voters) == 0 {
+	if len(conf.Voters) == 0 && len(conf.Learners) == 0 {
 		return raftengine.Configuration{}
 	}
 
-	servers := make([]raftengine.Server, 0, len(conf.Voters))
+	servers := make([]raftengine.Server, 0, len(conf.Voters)+len(conf.Learners))
 	for _, nodeID := range conf.Voters {
-		peer, ok := peers[nodeID]
-		if ok {
-			servers = append(servers, raftengine.Server{
-				ID:       peer.ID,
-				Address:  peer.Address,
-				Suffrage: "voter",
-			})
-			continue
-		}
-		servers = append(servers, raftengine.Server{
-			ID:       strconv.FormatUint(nodeID, 10),
-			Address:  "",
-			Suffrage: "voter",
-		})
+		servers = append(servers, configServerForNode(peers, nodeID, SuffrageVoter))
+	}
+	for _, nodeID := range conf.Learners {
+		servers = append(servers, configServerForNode(peers, nodeID, SuffrageLearner))
 	}
 	return raftengine.Configuration{Servers: servers}
+}
+
+func configServerForNode(peers map[uint64]Peer, nodeID uint64, suffrage string) raftengine.Server {
+	if peer, ok := peers[nodeID]; ok {
+		return raftengine.Server{
+			ID:       peer.ID,
+			Address:  peer.Address,
+			Suffrage: suffrage,
+		}
+	}
+	return raftengine.Server{
+		ID:       strconv.FormatUint(nodeID, 10),
+		Address:  "",
+		Suffrage: suffrage,
+	}
+}
+
+// learnerSetFromConfState builds the apply-loop-owned isLearnerNode
+// cache from a ConfState. Returns nil for an empty / voter-only conf
+// state (callers treat nil as "no learners").
+func learnerSetFromConfState(conf raftpb.ConfState) map[uint64]bool {
+	if len(conf.Learners) == 0 {
+		return nil
+	}
+	out := make(map[uint64]bool, len(conf.Learners))
+	for _, nodeID := range conf.Learners {
+		out[nodeID] = true
+	}
+	return out
 }
 
 func numRemoteServers(servers []raftengine.Server, localID string) uint64 {
@@ -3077,6 +3443,13 @@ func (e *Engine) namedTransferTargetLocked(target Peer) (Peer, error) {
 	return Peer{}, errors.Wrapf(errTransportPeerUnknown, "address=%q", target.Address)
 }
 
+// upsertPeer updates the address cache for a peer. It deliberately
+// does NOT touch e.config.Servers — suffrage is determined by the
+// post-change ConfState which the apply loop threads through
+// refreshConfigServers. Today's call sites are the apply-loop helpers
+// applyAddedPeer / applyUpdatedPeer (both reached from
+// applyConfigPeerChange) which run before refreshConfigServers within
+// the same apply iteration.
 func (e *Engine) upsertPeer(peer Peer) {
 	if peer.NodeID == 0 {
 		peer.NodeID = DeriveNodeID(peer.ID)
@@ -3090,11 +3463,6 @@ func (e *Engine) upsertPeer(peer Peer) {
 		e.peers = make(map[uint64]Peer)
 	}
 	e.peers[peer.NodeID] = peer
-	e.config.Servers = upsertConfigServer(e.peers, e.config.Servers, raftengine.Server{
-		ID:       peer.ID,
-		Address:  peer.Address,
-		Suffrage: "voter",
-	})
 	e.mu.Unlock()
 
 	if e.transport != nil {
@@ -3105,22 +3473,90 @@ func (e *Engine) upsertPeer(peer Peer) {
 	}
 }
 
-func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, _ raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, confState raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	applyConfigPeerChangeToMap(next, changeType, nodeID, context)
+	annotatePeerSuffrageFromConfState(next, confState)
 	return sortedPeerList(next)
 }
 
-func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, _ raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, confState raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	for _, change := range cc.Changes {
 		applyConfigPeerChangeToMap(next, change.Type, change.NodeID, cc.Context)
 	}
+	annotatePeerSuffrageFromConfState(next, confState)
 	return sortedPeerList(next)
+}
+
+// annotatePeerSuffrageInSlice is the slice form of
+// annotatePeerSuffrageFromConfState used at bootstrap-time, where
+// `peers` is a sorted operator-provided slice rather than the apply
+// loop's clone of e.peers.
+func annotatePeerSuffrageInSlice(peers []Peer, conf raftpb.ConfState) {
+	if len(peers) == 0 {
+		return
+	}
+	learners := make(map[uint64]bool, len(conf.Learners))
+	for _, id := range conf.Learners {
+		learners[id] = true
+	}
+	voters := make(map[uint64]bool, len(conf.Voters))
+	for _, id := range conf.Voters {
+		voters[id] = true
+	}
+	for i := range peers {
+		switch {
+		case learners[peers[i].NodeID]:
+			peers[i].Suffrage = SuffrageLearner
+		case voters[peers[i].NodeID]:
+			peers[i].Suffrage = SuffrageVoter
+		}
+	}
+}
+
+// annotatePeerSuffrageFromConfState stamps each peer's Suffrage from
+// the post-change ConfState so the v2 peers file written by
+// persistConfigState round-trips suffrage across restarts. Without
+// this, every Peer in the persist path carries Suffrage="" (the
+// ConfChange context bytes do not encode suffrage; e.peers
+// deliberately stores only nodeID/ID/address), and
+// persistedSuffrageByte("") writes voter — which on restart causes
+// validateConfState to see a learner-as-voter peer list and reject
+// startup with errClusterMismatch. See learner design doc §4.3
+// "Authoritative source of suffrage during recovery".
+//
+// The map is mutated in place. Peers not present in either
+// confState.Voters or confState.Learners (transient state during a
+// removal) keep whatever Suffrage they had — they will fall out of
+// the persisted peers list on the next conf change anyway.
+func annotatePeerSuffrageFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) {
+	if len(peers) == 0 {
+		return
+	}
+	learners := make(map[uint64]bool, len(conf.Learners))
+	for _, id := range conf.Learners {
+		learners[id] = true
+	}
+	voters := make(map[uint64]bool, len(conf.Voters))
+	for _, id := range conf.Voters {
+		voters[id] = true
+	}
+	for id, peer := range peers {
+		switch {
+		case learners[id]:
+			peer.Suffrage = SuffrageLearner
+		case voters[id]:
+			peer.Suffrage = SuffrageVoter
+		default:
+			continue
+		}
+		peers[id] = peer
+	}
 }
 
 func (e *Engine) removePeer(nodeID uint64) {
@@ -3129,26 +3565,29 @@ func (e *Engine) removePeer(nodeID uint64) {
 	}
 
 	e.mu.Lock()
-	peer, ok := e.peers[nodeID]
-	if ok {
-		delete(e.peers, nodeID)
-	}
-	e.config.Servers = removeConfigServer(e.peers, e.config.Servers, nodeID, peer.ID)
-	postRemovalClusterSize := len(e.peers)
+	delete(e.peers, nodeID)
+	// e.voterCount has already been refreshed for the post-change
+	// ConfState by refreshVoterCache earlier in the apply iteration
+	// (see applyConfigChange / applyConfigChangeV2). The ack tracker
+	// quorum threshold below uses the voter count, not the address
+	// cache size, because a learner ack must not contribute to the
+	// voter-majority denominator. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	postRemovalVoterCount := e.voterCount
 	e.mu.Unlock()
 
 	// Drop the peer's recorded ack so a reconfiguration cannot leave a
 	// stale entry that falsely satisfies the new cluster's majority.
-	// followerQuorum is computed against the POST-removal cluster; a
+	// followerQuorum is computed against the POST-removal voter count; a
 	// shrink to <=1 would otherwise pass 0 here, which
 	// quorumAckTracker.removePeer treats as "keep the current instant"
 	// and would surface stale liveness to LastQuorumAck if the cluster
 	// subsequently grew back. Clear the tracker explicitly in that
 	// case so any future multi-node membership starts fresh.
-	if postRemovalClusterSize <= 1 {
+	if postRemovalVoterCount <= 1 {
 		e.ackTracker.reset()
 	} else {
-		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalClusterSize))
+		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalVoterCount))
 	}
 
 	if e.transport != nil {
@@ -3433,57 +3872,6 @@ func peerFromServer(peers map[uint64]Peer, server raftengine.Server) Peer {
 		ID:      server.ID,
 		Address: server.Address,
 	}
-}
-
-func upsertConfigServer(peers map[uint64]Peer, servers []raftengine.Server, server raftengine.Server) []raftengine.Server {
-	out := append([]raftengine.Server(nil), servers...)
-	for i := range out {
-		if out[i].ID != server.ID {
-			continue
-		}
-		out[i] = server
-		sortConfigServers(peers, out)
-		return out
-	}
-	out = append(out, server)
-	sortConfigServers(peers, out)
-	return out
-}
-
-func removeConfigServer(peers map[uint64]Peer, servers []raftengine.Server, nodeID uint64, serverID string) []raftengine.Server {
-	if len(servers) == 0 {
-		return nil
-	}
-	out := make([]raftengine.Server, 0, len(servers))
-	for _, server := range servers {
-		if serverID != "" && server.ID == serverID {
-			continue
-		}
-		if nodeID != 0 && serverNodeID(peers, server) == nodeID {
-			continue
-		}
-		out = append(out, server)
-	}
-	sortConfigServers(peers, out)
-	return out
-}
-
-func sortConfigServers(peers map[uint64]Peer, servers []raftengine.Server) {
-	sort.Slice(servers, func(i, j int) bool {
-		left := serverNodeID(peers, servers[i])
-		right := serverNodeID(peers, servers[j])
-		if left == right {
-			return servers[i].ID < servers[j].ID
-		}
-		return left < right
-	})
-}
-
-func serverNodeID(peers map[uint64]Peer, server raftengine.Server) uint64 {
-	if nodeID, ok := configServerNodeID(peers, server); ok {
-		return nodeID
-	}
-	return DeriveNodeID(server.ID)
 }
 
 func configServerNodeID(peers map[uint64]Peer, server raftengine.Server) (uint64, bool) {

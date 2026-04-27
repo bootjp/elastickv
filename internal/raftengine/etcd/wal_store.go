@@ -407,19 +407,71 @@ func validateConfState(conf raftpb.ConfState, peers []Peer) error {
 	if len(peers) == 0 {
 		return nil
 	}
-	expected := confStateForPeers(peers)
-	if len(conf.Voters) != len(expected.Voters) {
-		return errors.Wrapf(errClusterMismatch, "expected %d voters got %d", len(expected.Voters), len(conf.Voters))
-	}
-	for i, voter := range conf.Voters {
-		if voter != expected.Voters[i] {
-			return errors.Wrapf(errClusterMismatch, "voter[%d]=%d expected %d", i, voter, expected.Voters[i])
-		}
-	}
-	if len(conf.VotersOutgoing) > 0 || len(conf.Learners) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
+	// Joint consensus markers are still rejected: learner add/promote
+	// uses the simple V1 single-step ConfChange path which never sets
+	// these. See docs/design/2026_04_26_proposed_raft_learner.md §4.2.
+	if len(conf.VotersOutgoing) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
 		return errors.Wrap(errClusterMismatch, "joint consensus state is not supported")
 	}
+	expectedVoters, learnerSet := splitPeersBySuffrage(peers)
+	if err := validateConfStateVoters(conf, expectedVoters); err != nil {
+		return err
+	}
+	return validateConfStateLearners(conf, learnerSet)
+}
+
+// validateConfStateVoters checks that conf.Voters matches the voter
+// peers element-wise. The element-wise comparison relies on the
+// well-established voter ordering invariant: persistConfigState
+// writes voters in ConfState.Voters order and normalizePeers
+// preserves it.
+func validateConfStateVoters(conf raftpb.ConfState, expectedVoters []uint64) error {
+	if len(conf.Voters) != len(expectedVoters) {
+		return errors.Wrapf(errClusterMismatch, "expected %d voters got %d", len(expectedVoters), len(conf.Voters))
+	}
+	for i, voter := range conf.Voters {
+		if voter != expectedVoters[i] {
+			return errors.Wrapf(errClusterMismatch, "voter[%d]=%d expected %d", i, voter, expectedVoters[i])
+		}
+	}
 	return nil
+}
+
+// validateConfStateLearners is set-based, not element-wise. There is
+// no prior writer-side ordering invariant for learners, so we do not
+// pin one in the reader. A set comparison rejects both
+// same-count-member-divergence and conf-learner-not-in-peers cases —
+// see docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 3.
+func validateConfStateLearners(conf raftpb.ConfState, expected map[uint64]struct{}) error {
+	if len(conf.Learners) != len(expected) {
+		return errors.Wrapf(errClusterMismatch, "expected %d learners got %d", len(expected), len(conf.Learners))
+	}
+	for _, nodeID := range conf.Learners {
+		if _, ok := expected[nodeID]; !ok {
+			return errors.Wrapf(errClusterMismatch, "learner %d not present in peers", nodeID)
+		}
+	}
+	return nil
+}
+
+// splitPeersBySuffrage partitions a peers list into the ordered voter
+// node-ID slice (preserving input order, which encodes the
+// well-established voter ordering invariant) and a learner set
+// (unordered).
+func splitPeersBySuffrage(peers []Peer) ([]uint64, map[uint64]struct{}) {
+	voters := make([]uint64, 0, len(peers))
+	var learners map[uint64]struct{}
+	for _, peer := range peers {
+		if peer.Suffrage == SuffrageLearner {
+			if learners == nil {
+				learners = make(map[uint64]struct{})
+			}
+			learners[peer.NodeID] = struct{}{}
+			continue
+		}
+		voters = append(voters, peer.NodeID)
+	}
+	return voters, learners
 }
 
 func loadLegacyOrSplitState(dataDir string) (persistedState, error) {
