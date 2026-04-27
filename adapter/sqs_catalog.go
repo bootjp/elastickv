@@ -939,6 +939,15 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
 		return false, errors.WithStack(err)
 	}
+	// Drop any throttle bucket that survived a delete-then-create race
+	// (Codex P2 on PR #679 round 5). DeleteQueue invalidates after its
+	// commit, but a sendMessage holding pre-delete meta can recreate
+	// a bucket between that invalidate and this CreateQueue commit;
+	// invalidating again here on a genuine create (not the idempotent
+	// return path above, which exits before this point) guarantees
+	// the new queue starts with a fresh full-capacity bucket
+	// regardless of in-flight traffic to the prior incarnation.
+	s.throttle.invalidateQueue(requested.Name)
 	return true, nil
 }
 

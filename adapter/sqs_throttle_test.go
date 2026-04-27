@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -307,70 +308,145 @@ func TestBucketStore_ConcurrentReconciliationRespectsNewCapacity(t *testing.T) {
 		"exactly cfgNew.SendCapacity successes; a Delete-after-replace race would let some past the cap")
 }
 
-// TestBucketStore_SweepDoesNotEvictRecentlyUsedBucket pins the
-// Codex P2 fix on PR #679 round 5: an earlier version of sweep
-// computed idle, released bucket.mu, then unconditionally Deleted.
-// A charge() running in that window could refill+take a token; the
-// Delete then evicted the just-used bucket and the next request
-// got a fresh full-capacity bucket — the just-taken token was
-// effectively undone, allowing excess throughput.
+// TestBucketStore_SweepRaceDoesNotInflateBudget pins the Codex P2
+// fix on PR #679 rounds 5 and 6. The earlier code path was:
 //
-// The test forces this exact race: pre-build a bucket with a stale
-// lastRefill (well past cutoff), then in two paired goroutines
+//	sweep computes idle under mu, releases mu, then Deletes.
+//	A concurrent charge() that loaded the same bucket pre-Delete
+//	would refill+take after sweep released mu, then later requests
+//	would miss the map and create a fresh full-capacity bucket —
+//	a one-time burst of up to 2× capacity per evict cycle.
 //
-//	(A) advance the clock, run sweep
-//	(B) run charge concurrently with sweep
+// Round 5 closed half the window by holding mu across the Delete.
+// Round 6 closes the rest by setting evicted=true under mu so the
+// goroutines that loaded the bucket *before* sweep removed it from
+// the map see the flag on their mu acquisition and retry against
+// the live entry instead of charging the orphan.
 //
-// charge() acquires bucket.mu, refills, takes a token, releases.
-// sweep() acquires bucket.mu after charge, observes the freshened
-// lastRefill, and skips the delete. After both finish, the bucket
-// must still be in the store with `tokens = capacity - 1`.
-func TestBucketStore_SweepDoesNotEvictRecentlyUsedBucket(t *testing.T) {
+// The test is a -race stress test: race sweep against many chargers
+// hammering the same bucket. The integrity assertion is on the total
+// successful-charge count: with a fully-refilled idle bucket of
+// capacity=N entering the race, the maximum tokens any sequence of
+// charges should observe is N. The old buggy code could yield up to
+// 2N when the race triggered the orphan path.
+func TestBucketStore_SweepRaceDoesNotInflateBudget(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	clk := now
 	store := newBucketStore(func() time.Time { return clk }, time.Hour)
-	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
-	// Build the bucket via a single charge so it lands in the store.
+	const capacity = 10
+	cfg := &sqsQueueThrottle{SendCapacity: capacity, SendRefillPerSecond: 1}
+	// Build the bucket via a single charge so it lands in the store,
+	// then backdate it past the evict cutoff. The clock is then frozen
+	// so refill cannot top up tokens during the race — every charge
+	// either spends an existing token or fails, making the total-
+	// success count a tight bound on the burst budget.
 	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
-	// Backdate the bucket's lastRefill 2 hours so it's idle relative
-	// to the 1h evict window.
 	key := bucketKey{queue: "orders", action: bucketActionSend}
 	v, ok := store.buckets.Load(key)
 	require.True(t, ok)
 	bucket, _ := v.(*tokenBucket)
 	bucket.mu.Lock()
 	bucket.lastRefill = now.Add(-2 * time.Hour)
+	bucket.tokens = capacity
 	bucket.mu.Unlock()
-	// Race sweep against charge. The "advanced clock" makes lastRefill
-	// older than cutoff so sweep would delete unconditionally; the
-	// concurrent charge must update lastRefill before sweep observes
-	// it.
 	clk = now.Add(2 * time.Hour)
+
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		store.sweep()
-	}()
-	go func() {
-		defer wg.Done()
-		// Hammer the same bucket so at least one charge interleaves
-		// with sweep's bucket.mu acquisition.
-		for range 50 {
-			store.charge(cfg, "orders", bucketActionSend, 1)
-		}
-	}()
+	var successes atomic.Int64
+	const chargers = 64
+	const sweeps = 4
+	wg.Add(chargers + sweeps)
+	for range sweeps {
+		go func() {
+			defer wg.Done()
+			store.sweep()
+		}()
+	}
+	for range chargers {
+		go func() {
+			defer wg.Done()
+			if store.charge(cfg, "orders", bucketActionSend, 1).allowed {
+				successes.Add(1)
+			}
+		}()
+	}
 	wg.Wait()
-	// The bucket must still be in the store: at least one of the 50
-	// charges updated lastRefill within the sweep window, so the
-	// re-check under bucket.mu sees the freshened timestamp and
-	// CompareAndDelete is skipped. If the old code (compute-then-
-	// delete-without-recheck) regresses, the bucket may be evicted
-	// and the assertion fails.
+
+	// Old code: a charger that loaded the pre-Delete bucket could take
+	// a token, then later chargers would create a fresh full-capacity
+	// bucket — total successes could climb to 2*capacity. With the
+	// evicted-flag retry, every charger converges on a single live
+	// bucket and total successes are bounded by capacity.
+	require.LessOrEqualf(t, successes.Load(), int64(capacity),
+		"sweep race must not let total successful charges exceed capacity (got %d, capacity %d)",
+		successes.Load(), capacity)
+}
+
+// TestBucketStore_OrphanedBucketRetriesToLiveEntry exercises the
+// evicted-flag retry path in chargeBucket directly. The race the
+// stress test above tries to trigger probabilistically is forced
+// here deterministically by interleaving the charge / sweep steps
+// by hand.
+func TestBucketStore_OrphanedBucketRetriesToLiveEntry(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	clk := now
+	store := newBucketStore(func() time.Time { return clk }, time.Hour)
+	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	key := bucketKey{queue: "orders", action: bucketActionSend}
+	v, ok := store.buckets.Load(key)
+	require.True(t, ok)
+	original, _ := v.(*tokenBucket)
+	// Backdate the bucket and advance the clock so sweep evicts it.
+	original.mu.Lock()
+	original.lastRefill = now.Add(-2 * time.Hour)
+	original.mu.Unlock()
+	clk = now.Add(2 * time.Hour)
+
+	store.sweep()
+
+	// Sweep must have evicted the bucket from the map and marked it.
 	_, stillThere := store.buckets.Load(key)
-	require.True(t, stillThere,
-		"sweep must not evict a bucket that was used during the sweep window")
+	require.False(t, stillThere, "sweep must remove the idle bucket from the map")
+	original.mu.Lock()
+	require.True(t, original.evicted, "sweep must mark the dropped bucket evicted")
+	original.mu.Unlock()
+
+	// A charge against the live store reaches a fresh bucket via the
+	// loadOrInit path; any goroutine still holding the orphan would
+	// retry through chargeBucket's evicted check and converge here.
+	out := store.charge(cfg, "orders", bucketActionSend, 1)
+	require.True(t, out.allowed)
+	v2, ok := store.buckets.Load(key)
+	require.True(t, ok)
+	live, _ := v2.(*tokenBucket)
+	require.NotSame(t, original, live, "post-eviction charge must allocate a fresh bucket")
+}
+
+// TestBucketStore_InvalidateMarksOrphanEvicted pins the round-6 fix
+// to invalidateQueue: dropped buckets must flip evicted=true under mu
+// so a sendMessage that loaded meta pre-invalidation and is racing
+// against DeleteQueue / SetQueueAttributes / CreateQueue retries
+// rather than charging the orphan.
+func TestBucketStore_InvalidateMarksOrphanEvicted(t *testing.T) {
+	t.Parallel()
+	store := newBucketStoreDefault()
+	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	key := bucketKey{queue: "orders", action: bucketActionSend}
+	v, ok := store.buckets.Load(key)
+	require.True(t, ok)
+	original, _ := v.(*tokenBucket)
+
+	store.invalidateQueue("orders")
+
+	_, stillThere := store.buckets.Load(key)
+	require.False(t, stillThere, "invalidateQueue must remove the bucket from the map")
+	original.mu.Lock()
+	require.True(t, original.evicted, "invalidateQueue must mark the dropped bucket evicted")
+	original.mu.Unlock()
 }
 
 // TestComputeRetryAfter_CapsAtMaximum pins the Gemini medium fix on
