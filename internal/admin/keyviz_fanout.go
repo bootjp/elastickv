@@ -37,11 +37,17 @@ const keyVizPeerErrorBodyLimit = 512
 // keyVizPeerResponseBodyLimit caps the JSON body we are willing to
 // decode from a peer. A misbehaving or compromised peer that streams
 // gigabytes back at us would otherwise pin a goroutine on
-// json.Decode and balloon memory. The cap is generous enough for the
-// design's worst-case payload — 1024 rows × 4096 columns × ~32 bytes
-// per uint64 ≈ 128 MiB raw, ~32 MiB JSON-encoded — but still bounded.
-// Operators with larger configurations should override via a future
-// flag rather than relying on the unbounded path.
+// json.Decode and balloon memory.
+//
+// Sizing: 1024 rows × 4096 columns = ~4M uint64 cells. JSON encoding
+// of a uint64 ranges from 1 byte ("0") to 20 bytes (max uint64), with
+// realistic heatmap traffic skewing low (most cells are 0 or small).
+// At a worst-case 20 bytes/value the raw values alone would reach
+// ~80 MiB, slightly over the 64 MiB cap. That is intentional: the
+// operator-visible failure mode is "warning logged, matrix may be
+// truncated", not "DoS". Operators on extreme-traffic deployments
+// who hit the cap should override via a future flag once the need
+// is real.
 const keyVizPeerResponseBodyLimit int64 = 64 << 20 // 64 MiB
 
 // keyVizMergeBucketHint is a hand-tuned starting capacity for the
@@ -99,11 +105,12 @@ type FanoutNodeStatus struct {
 //     during a leadership flip; the canonical (raftGroupID, leaderTerm)
 //     dedup lands in Phase 2-C+ when we extend the wire format).
 type KeyVizFanout struct {
-	self    string
-	peers   []string
-	client  *http.Client
-	timeout time.Duration
-	logger  *slog.Logger
+	self      string
+	peers     []string
+	client    *http.Client
+	timeout   time.Duration
+	logger    *slog.Logger
+	bodyLimit int64 // per-peer JSON cap; 0 falls back to keyVizPeerResponseBodyLimit.
 }
 
 // NewKeyVizFanout wires the aggregator. self is the local node's
@@ -150,6 +157,22 @@ func (f *KeyVizFanout) WithHTTPClient(c *http.Client) *KeyVizFanout {
 		return f
 	}
 	f.client = c
+	return f
+}
+
+// WithResponseBodyLimit overrides the per-peer JSON decode cap.
+// Production leaves this unset; tests use it to drive the over-cap
+// path with a small synthetic body. Values <= 0 reset to the
+// default.
+func (f *KeyVizFanout) WithResponseBodyLimit(n int64) *KeyVizFanout {
+	if f == nil {
+		return f
+	}
+	if n <= 0 {
+		f.bodyLimit = 0
+		return f
+	}
+	f.bodyLimit = n
 	return f
 }
 
@@ -290,32 +313,57 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 		return nil, fmt.Errorf("%w: status %d: %s", errKeyVizPeer, resp.StatusCode, string(body))
 	}
 	// Bound the JSON decode so a peer that streams gigabytes cannot
-	// pin a goroutine and balloon memory. The +1 lets us probe past
-	// the cap so we can detect the overshoot rather than silently
-	// truncating; see keyVizPeerResponseBodyLimit for sizing.
-	limited := io.LimitReader(resp.Body, keyVizPeerResponseBodyLimit+1)
+	// pin a goroutine and balloon memory. The countingReader wraps a
+	// LimitReader so:
+	//   - The hard cap is enforced by io.LimitReader (security
+	//     bound: at most cap+1 bytes ever pulled off the wire).
+	//   - The byte counter is incremented on every Read, including
+	//     the chunks json.NewDecoder buffers internally — so the
+	//     post-decode `n > cap` check fires reliably even when the
+	//     decoder consumed the trailing byte itself rather than
+	//     leaving it for an external probe (Claude bot round-2 on
+	//     PR #686 flagged the bufio false-negative).
+	cr := &countingReader{r: io.LimitReader(resp.Body, f.responseBodyLimit()+1)}
 	var m KeyVizMatrix
-	if err := json.NewDecoder(limited).Decode(&m); err != nil {
+	if err := json.NewDecoder(cr).Decode(&m); err != nil {
 		return nil, pkgerrors.Wrap(err, "decode peer response")
 	}
-	if peerResponseExceededLimit(limited) {
+	if cr.n > f.responseBodyLimit() {
 		f.logger.LogAttrs(ctx, slog.LevelWarn, "keyviz fan-out: peer response exceeded size limit; truncated decode",
 			slog.String("peer", peer),
-			slog.Int64("limit_bytes", keyVizPeerResponseBodyLimit),
+			slog.Int64("limit_bytes", f.responseBodyLimit()),
+			slog.Int64("read_bytes", cr.n),
 		)
 	}
 	return &m, nil
 }
 
-// peerResponseExceededLimit returns true when the LimitReader still
-// has data after the JSON decoder finished — meaning the peer sent
-// more than keyVizPeerResponseBodyLimit bytes and the matrix may be
-// incomplete. The decoder accepts trailing data so we must probe
-// explicitly; one byte is enough to distinguish "capped" from "EOF".
-func peerResponseExceededLimit(r io.Reader) bool {
-	var buf [1]byte
-	n, _ := r.Read(buf[:])
-	return n > 0
+// countingReader wraps an io.Reader and tracks total bytes read.
+// It is the only reliable way to detect that a JSON decoder
+// consumed past a LimitReader cap, since json.NewDecoder uses
+// internal buffering and an external one-byte probe of the
+// LimitReader can return EOF even when the decoder pulled past
+// the cap into its own buffer.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err //nolint:wrapcheck // pure pass-through; underlying reader owns the error.
+}
+
+// responseBodyLimit returns the per-peer JSON body cap. Tests can
+// override the limit by assigning the unexported field directly via
+// a constructor option (see WithResponseBodyLimit). Production keeps
+// the default keyVizPeerResponseBodyLimit.
+func (f *KeyVizFanout) responseBodyLimit() int64 {
+	if f.bodyLimit > 0 {
+		return f.bodyLimit
+	}
+	return keyVizPeerResponseBodyLimit
 }
 
 // buildKeyVizPeerURL forwards the parsed query parameters from the

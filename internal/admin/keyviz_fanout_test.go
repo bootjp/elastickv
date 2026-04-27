@@ -330,6 +330,57 @@ func TestKeyVizFanoutRunPeerOrder(t *testing.T) {
 	}, merged.Fanout.Nodes)
 }
 
+// TestKeyVizFanoutRunPeerExceedsBodyLimit pins the over-cap path
+// (Claude bot round-2 on PR #686). Lowering the per-peer limit to a
+// small test value lets us drive the path without serving 64 MiB.
+// The peer streams a body deliberately larger than the cap; the
+// aggregator's countingReader must:
+//   - Bound how many bytes are pulled off the wire (the LimitReader
+//     enforces the security property).
+//   - Detect the overshoot reliably even when the json.Decoder
+//     buffers the trailing bytes internally.
+//
+// What we assert: the call returns within the test timeout (no hang),
+// the per-node status surfaces, and the response carries the
+// expected number of node entries. The warning log is best-effort
+// and not asserted directly — the reliability of the byte-counting
+// is the load-bearing invariant.
+func TestKeyVizFanoutRunPeerExceedsBodyLimit(t *testing.T) {
+	t.Parallel()
+	bigRow := KeyVizRow{
+		BucketID: "route:overshoot",
+		Values:   []uint64{1, 2, 3, 4},
+	}
+	rows := make([]KeyVizRow, 256)
+	for i := range rows {
+		rows[i] = bigRow
+	}
+	body := KeyVizMatrix{
+		ColumnUnixMs: []int64{1_700_000_000_000, 1_700_000_001_000, 1_700_000_002_000, 1_700_000_003_000},
+		Rows:         rows,
+		Series:       keyVizSeriesReads,
+	}
+	peer := newKeyVizPeerStub(t, body)
+	defer peer.Close()
+
+	const testCap int64 = 1024
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithResponseBodyLimit(testCap)
+
+	start := time.Now()
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads})
+	require.Less(t, time.Since(start), 5*time.Second, "decode must respect the size cap and complete promptly")
+	require.NotNil(t, merged.Fanout)
+	require.Equal(t, 2, merged.Fanout.Expected)
+	require.Len(t, merged.Fanout.Nodes, 2)
+	require.Equal(t, "self:8080", merged.Fanout.Nodes[0].Node)
+	require.True(t, merged.Fanout.Nodes[0].OK, "self always reports ok")
+	// Peer status: decode either errored on the truncated body
+	// (ok=false) or succeeded on a partial matrix (ok=true). Either
+	// is fine — what we are pinning is the bound, not the outcome.
+}
+
 // TestKeyVizFanoutRunPeerOverlargeBody pins the security-high
 // review item on PR #686: a peer that streams more than
 // keyVizPeerResponseBodyLimit bytes must not pin a goroutine on the
