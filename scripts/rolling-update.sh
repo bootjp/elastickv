@@ -870,13 +870,16 @@ run_container() {
 # When KEYVIZ_ENABLED != "true" the array is left empty and the helper
 # returns silently — existing deploys see no behaviour change.
 build_keyviz_flags() {
-  local -n _flags=$1
-  if [[ "${KEYVIZ_ENABLED:-false}" != "true" ]]; then
+  local -n _flags="$1"
+  local enabled="${KEYVIZ_ENABLED:-false}"
+  if [[ "$enabled" != "true" ]]; then
     return 0
   fi
+
+  local fanout_nodes="${KEYVIZ_FANOUT_NODES:-}"
   _flags+=(--keyvizEnabled)
-  if [[ -n "${KEYVIZ_FANOUT_NODES:-}" ]]; then
-    _flags+=(--keyvizFanoutNodes "$KEYVIZ_FANOUT_NODES")
+  if [[ -n "$fanout_nodes" ]]; then
+    _flags+=(--keyvizFanoutNodes "$fanout_nodes")
   fi
 }
 
