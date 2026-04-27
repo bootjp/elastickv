@@ -80,6 +80,15 @@ type ServerDeps struct {
 	// /admin/assets/* and the SPA fallback in that case.
 	StaticFS fs.FS
 
+	// LeaderProbe drives /admin/healthz/leader: 200 when probe.
+	// IsVerifiedLeader() is true, 503 otherwise. A nil probe keeps the
+	// path unrouted (returns the standard JSON 404), matching the
+	// "feature off" pattern Tables / Buckets / Queues already use.
+	// Production wires this to the default group's IsLeader +
+	// VerifyLeader pair so a stale-leader follower in the middle of a
+	// silent leadership change cannot return 200.
+	LeaderProbe LeaderProbe
+
 	// AuthOpts configures cookie attributes and rate limiting. Zero
 	// values pick production-appropriate defaults.
 	AuthOpts AuthServiceOpts
@@ -129,7 +138,7 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	keyviz := NewKeyVizHandler(deps.KeyViz).WithLogger(logger).WithFanout(deps.KeyVizFanout)
 	sqs := buildSqsHandlerForDeps(deps, logger)
 	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, sqs, logger)
-	router := NewRouter(mux, deps.StaticFS)
+	router := NewRouterWithLeaderProbe(mux, deps.StaticFS, deps.LeaderProbe)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
 }
 

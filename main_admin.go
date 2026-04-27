@@ -135,8 +135,56 @@ func startAdminFromFlags(
 	if err != nil {
 		return errors.Wrap(err, "build admin leader forwarder")
 	}
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, keyvizSampler, keyvizFanoutCfg, buildVersion())
+	leaderProbe := newAdminLeaderProbe(runtimes)
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg, buildVersion())
 	return err
+}
+
+// adminLeaderProbeTimeout caps the per-runtime VerifyLeader ReadIndex
+// round-trip the /admin/healthz/leader handler triggers. Keep it short:
+// a load balancer that probes every few seconds wants a fast "yes / no"
+// even when the cluster is mid-election; surfacing 503 on a stalled
+// ReadIndex is the right answer for routing.
+const adminLeaderProbeTimeout = 2 * time.Second
+
+// newAdminLeaderProbe builds the LeaderProbe consumed by
+// /admin/healthz/leader. It mirrors the verified-leader pattern S3 and
+// DynamoDB use on their own /healthz/leader endpoints
+// (adapter/s3.go:isVerifiedS3Leader,
+// adapter/dynamodb.go:isVerifiedDynamoLeader): a cheap Status check
+// short-circuits non-leaders, and only nodes claiming leadership pay
+// the ReadIndex round-trip that confirms the claim is still valid.
+//
+// "Leader of any local Raft group" is treated as "yes" so a multi-group
+// deployment that distributes leadership across nodes still surfaces a
+// useful answer to a load balancer that wants to skip the
+// AdminForward proxy hop. In the common single-group / co-located
+// deployment, this collapses to "is this node THE leader".
+//
+// Returns nil for an empty runtimes slice so the router answers
+// /admin/healthz/leader with the standard JSON 404 (matches the
+// "feature off" pattern Tables / Buckets / Queues already use).
+func newAdminLeaderProbe(runtimes []*raftGroupRuntime) admin.LeaderProbe {
+	if len(runtimes) == 0 {
+		return nil
+	}
+	return admin.LeaderProbeFunc(func() bool {
+		for _, rt := range runtimes {
+			if rt == nil || rt.engine == nil {
+				continue
+			}
+			if rt.engine.Status().State != raftengine.StateLeader {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), adminLeaderProbeTimeout)
+			err := rt.engine.VerifyLeader(ctx)
+			cancel()
+			if err == nil {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // newSqsQueuesSource adapts *adapter.SQSServer to admin.QueuesSource.
@@ -637,6 +685,7 @@ func startAdminServer(
 	buckets admin.BucketsSource,
 	queues admin.QueuesSource,
 	forwarder admin.LeaderForwarder,
+	leaderProbe admin.LeaderProbe,
 	keyvizSampler *keyviz.MemSampler,
 	keyvizFanoutCfg keyVizFanoutConfig,
 	version string,
@@ -646,7 +695,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, keyvizSampler, keyvizFanoutCfg)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg)
 	if err != nil {
 		return "", err
 	}
@@ -686,7 +735,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg keyVizFanoutConfig) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, leaderProbe admin.LeaderProbe, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg keyVizFanoutConfig) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -716,6 +765,7 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		KeyViz:       keyvizSourceFromSampler(keyvizSampler),
 		KeyVizFanout: buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
 		StaticFS:     staticFS,
+		LeaderProbe:  leaderProbe,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
