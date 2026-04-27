@@ -119,14 +119,26 @@ fallback: a miss is silently dropped. This is intentional —
 `RegisterRoute` pre-creates every slot before traffic arrives, so
 the hot path never needs to allocate. We keep that invariant by
 making `RegisterRoute` **pre-create one slot per known label** at
-registration time. The label set is the canonical
-`keyviz/labels.go` constants (§9 Q2); register-time slot
-count is `len(routes) × len(labels) + 1` (the +1 is the empty-
-label legacy slot, kept so callers that pass `label=""` still hit
-a slot). New labels added after a route is registered are not
-auto-bound; an operator deploying a new adapter must restart the
-sampler (matching the current "ApplySplit / ApplyMerge in a
-future PR" semantics for the static route catalog).
+registration time, but only on the individual-tracking path. The
+label set is the canonical `keyviz/labels.go` constants (§9 Q2);
+register-time slot count is `len(routes) × len(labels) + 1` (the
++1 is the empty-label legacy slot, kept so callers that pass
+`label=""` still hit a slot).
+
+When `RegisterRoute` decides a route will be coarsened into a
+virtual bucket (i.e. it returns `false`), **no labeled slots are
+created** for that route — the `tbl.virtualForRoute[routeID]`
+fallback in `Observe` already handles all labels uniformly per
+§6.5 (virtual buckets always emit `Label = ""`). Pre-creating
+labeled slots that would never be hit would just burn allocator
+work.
+
+New labels added after a route is registered are not auto-bound;
+an operator deploying a new adapter must **deploy a new binary**
+that includes the new constant (a process restart alone does
+nothing — the canonical set lives at compile time). Matches the
+current "ApplySplit / ApplyMerge in a future PR" semantics for
+the static route catalog.
 
 `routeSlot` gains a `Label string` field so `Flush` /
 `appendDrainedRow` can read the label off the slot rather than
@@ -292,7 +304,7 @@ Virtual-bucket rows in the heatmap render as
 |---|---|
 | **PR-A** | Land this design doc. |
 | **PR-B** | Sampler API extension: `Observe(... label string)`, `routeSlot.Label`, `RegisterRoute` pre-creates one slot per known label (§4.1.1). `MatrixRow.Label`. `reclaimRetiredSlot` dedupes on `(RouteID, Label)`. Update existing tests to pass empty labels. |
-| **PR-C** | Adapter wiring: each adapter sets its own label at the dispatch entry into `ShardedCoordinator.Observe…`. Canonical constants live in `keyviz/labels.go` (NOT `adapter/keyviz_labels.go` — sampler-side imports must not climb back to the adapter package; sampler's `RegisterRoute` reads the canonical set at registration time). **Operator note**: with N labels, slot count grows from M routes to ~N×M; raise `--keyvizMaxTrackedRoutes` proportionally before deploying or hot routes will fold into the virtual bucket and lose per-label breakdown silently. PR-C should refuse to start with a warning when `len(routes) × len(labels) > MaxTrackedRoutes`. |
+| **PR-C** | Adapter wiring: each adapter sets its own label at the dispatch entry into `ShardedCoordinator.Observe…`. Canonical constants live in `keyviz/labels.go` (NOT `adapter/keyviz_labels.go` — sampler-side imports must not climb back to the adapter package; sampler's `RegisterRoute` reads the canonical set at registration time). **Operator note**: with N labels, slot count grows from M routes to ~N×M; raise `--keyvizMaxTrackedRoutes` proportionally or hot routes will fold into the virtual bucket and lose per-label breakdown. PR-C emits a structured `slog.Warn` from inside `RegisterRoute` at the moment a route is coarsened — `slog.Warn("route folded into virtual bucket", route_id=…, slots_used=…, max_tracked_routes=…)` — so the operator sees the symptom in the log when it actually fires. A startup-time check would not catch this because routes are added dynamically (the catalog watcher calls `RegisterRoute` whenever a `SplitRange` lands), so a process that started below the cap can cross it later. |
 | **PR-D+E** | **Ship together.** Wire-format extension (proto + JSON `bucket_id` composite + optional `label`) in the same PR as the SPA `route:N / label` rendering AND the `pivotKeyVizColumns` pivot-key widening from `RouteID` to `(RouteID, Label)` in `internal/admin/keyviz_handler.go`. Splitting these creates a window where `pivotKeyVizColumns` collapses labelled rows back into a single row in the JSON response — exactly the bug this feature is fixing. The fan-out aggregator picks up the new behaviour for free because the merge key uses `bucketID` (now composite). |
 
 PRs B and C are independent of the wire format; the heatmap will
@@ -323,6 +335,19 @@ extension is "switch on the field". (Reviewer notes from PR
    sees the label-collapsed view; new SPA against old server
    sees the legacy view; both are coherent.
 5. **Test coverage** — New test categories:
+   - **Slot pre-creation count**: register 1 route, assert
+     `len(tbl.slots) == len(labels) + 1` (N labeled + 1 legacy
+     empty-label slot). Catches a PR-B regression that skips a
+     label constant in the pre-creation loop — without this the
+     missing slot only surfaces when that adapter fires traffic.
+   - **`reclaimRetiredSlot` (RouteID, Label) dedupe**: retire
+     `(routeID, "dynamo")`, re-register `(routeID, "dynamo")`,
+     assert reclaim succeeds; then retire `(routeID, "dynamo")`
+     again, re-register as `(routeID, "redis")`, assert reclaim
+     does **not** fire — the dynamo slot must stay in the
+     retired list to be drained by its own grace window. Catches
+     a PR-B regression where the implementor forgets to widen
+     the dedupe key from `RouteID` alone.
    - `Observe(label="dynamo")` and `Observe(label="redis")`
      against the same routeID produce two distinct rows in
      `Snapshot`.
@@ -333,6 +358,9 @@ extension is "switch on the field". (Reviewer notes from PR
    - Aggregator merge: same route, two labels, two nodes —
      each label dedupes correctly without bleeding into the
      other.
+   - Coarsened-route + label: a route folded into the virtual
+     bucket emits `Label = ""` regardless of which label the
+     `Observe` carries (§6.5).
 
 ## 9. Open questions
 
