@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { KeyVizMatrix, KeyVizRow, KeyVizSeries } from "../api/client";
+import type { KeyVizFanoutResult, KeyVizMatrix, KeyVizRow, KeyVizSeries } from "../api/client";
 import { api } from "../api/client";
 import { ramp } from "../lib/colorRamp";
 import { formatApiError, useApiQuery } from "../lib/useApi";
@@ -55,6 +55,8 @@ export function KeyVizPage() {
           </button>
         </div>
       </header>
+
+      {matrix.data?.fanout && <FanoutBanner fanout={matrix.data.fanout} />}
 
       <section className="card">
         {matrix.loading && !matrix.data && (
@@ -196,6 +198,14 @@ function Heatmap({ matrix }: HeatmapProps) {
           {matrix.rows.length} rows × {matrix.column_unix_ms.length} columns ·
           series <code className="font-mono">{matrix.series}</code> · max ={" "}
           {maxValue.toLocaleString()}
+          {matrix.fanout && (
+            <>
+              {" · "}
+              <span>
+                cluster view ({matrix.fanout.responded} of {matrix.fanout.expected} nodes)
+              </span>
+            </>
+          )}
         </span>
         <span>{new Date(matrix.generated_at).toLocaleString()}</span>
       </div>
@@ -209,13 +219,14 @@ function Heatmap({ matrix }: HeatmapProps) {
         // canvas as the user scrolls horizontally. Putting it outside
         // would freeze the labels under the left edge whenever the
         // canvas overflows.
-        <div className="overflow-auto border border-border rounded">
+        <div className="overflow-auto border border-border rounded relative">
           <canvas
             ref={canvasRef}
             onMouseMove={onMove}
             onMouseLeave={onLeave}
             style={{ display: "block", width, height }}
           />
+          <ConflictOverlay rows={matrix.rows} cellH={cellH} width={width} />
           <TimeAxis columnUnixMs={matrix.column_unix_ms} cellW={cellW} />
         </div>
       )}
@@ -223,6 +234,107 @@ function Heatmap({ matrix }: HeatmapProps) {
         <RowDetail row={matrix.rows[hoverRow]} index={hoverRow} />
       )}
     </div>
+  );
+}
+
+// FanoutBanner renders the degraded-mode strip above the heatmap when
+// at least one peer failed to respond. Hidden when responded ===
+// expected so a healthy cluster keeps the page clean. Lists every
+// failed node with its error so operators can debug without checking
+// per-node logs.
+interface FanoutBannerProps {
+  fanout: KeyVizFanoutResult;
+}
+
+function FanoutBanner({ fanout }: FanoutBannerProps) {
+  if (fanout.responded >= fanout.expected) return null;
+  const failed = fanout.nodes.filter((n) => !n.ok);
+  return (
+    <div className="card border-danger/40">
+      <div className="text-sm font-semibold text-danger mb-2">
+        Cluster view degraded — {fanout.responded} of {fanout.expected} nodes responded
+      </div>
+      <ul className="text-xs text-muted space-y-0.5">
+        {failed.map((n) => (
+          <li key={n.node} className="font-mono">
+            <span className="text-danger">×</span> {n.node}
+            {n.error && <span className="text-muted"> — {n.error}</span>}
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs text-muted mt-2">
+        The heatmap reflects the {fanout.responded} responding node{fanout.responded === 1 ? "" : "s"} only;
+        traffic served by the failed peers is not shown until they recover.
+      </p>
+    </div>
+  );
+}
+
+// ConflictOverlay layers a thin striped pattern over rows whose
+// merge produced disagreeing per-node values (Phase 2-C row-level
+// conflict flag). Per design 4.2, this is the SPA's signal that the
+// row's totals are best-effort dedup during a leadership flip and
+// may understate the true window. The overlay is an SVG layered
+// inside the scroll container so it tracks the canvas's scroll
+// position (same idiom as TimeAxis).
+//
+// Patterns rather than colour because the underlying canvas already
+// uses colour for intensity; a hatch communicates "soft data here"
+// without competing with the heatmap signal. SVG sized to (width,
+// rows.length × cellH) mirrors the canvas exactly.
+interface ConflictOverlayProps {
+  rows: KeyVizRow[];
+  cellH: number;
+  width: number;
+}
+
+function ConflictOverlay({ rows, cellH, width }: ConflictOverlayProps) {
+  const conflictRows = useMemo(() => {
+    const out: number[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].conflict) out.push(i);
+    }
+    return out;
+  }, [rows]);
+  if (conflictRows.length === 0) return null;
+  const totalH = rows.length * cellH;
+  return (
+    <svg
+      width={width}
+      height={totalH}
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        pointerEvents: "none",
+      }}
+      aria-hidden="true"
+    >
+      <defs>
+        {/* Diagonal hatch — 4px stride, 1px lines. The stroke uses
+            currentColor so the overlay inherits the text colour and
+            stays visible against both light and dark themes. */}
+        <pattern
+          id="keyviz-conflict-hatch"
+          width={4}
+          height={4}
+          patternUnits="userSpaceOnUse"
+          patternTransform="rotate(45)"
+        >
+          <line x1={0} y1={0} x2={0} y2={4} stroke="currentColor" strokeWidth={1} opacity={0.45} />
+        </pattern>
+      </defs>
+      {conflictRows.map((i) => (
+        <rect
+          key={i}
+          x={0}
+          y={i * cellH}
+          width={width}
+          height={cellH}
+          fill="url(#keyviz-conflict-hatch)"
+        />
+      ))}
+    </svg>
   );
 }
 
@@ -284,10 +396,18 @@ function RowDetail({ row, index }: RowDetailProps) {
   const total = row.values.reduce((a, b) => a + b, 0);
   return (
     <div className="card text-sm">
-      <div className="flex items-center gap-2 mb-2">
+      <div className="flex items-center gap-2 mb-2 flex-wrap">
         <span className="text-xs text-muted">Row {index}</span>
         <span className="font-mono">{row.bucket_id}</span>
         {row.aggregate && <span className="pill-muted text-xs">aggregate</span>}
+        {row.conflict && (
+          <span
+            className="pill-muted text-xs"
+            title="Two or more nodes reported a non-zero value for the same cell — typical during a leadership flip mid-window. Displayed totals may understate the true count by up to one leader's pre-transfer slice."
+          >
+            conflict
+          </span>
+        )}
       </div>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
         <dt className="text-muted">Start</dt>
