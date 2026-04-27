@@ -17,11 +17,11 @@
 Outstanding open items (kept here so future readers know what is still owed against the original proposal):
 
 - **AdminForward acceptance criterion 5** — rolling-upgrade compatibility flag (`admin.leader_forward_v2`). Deferred behind a cluster-version bump; not blocking dashboard usability today because every node forwards through the same `pb.AdminOperation` enum.
-- AdminDeleteBucket TOCTOU — A race condition exists where AdminDeleteBucket scans ObjectManifestPrefixForBucket at readTS, but the transaction only includes the BucketMetaKey in its read set. A concurrent PutObject inserting a manifest key in the scanned prefix between readTS and commitTS will not trigger a conflict, leading to orphaned objects. This pre-existing race is also present in the SigV4 path (adapter/s3.go:deleteBucket). Potential fixes include (a) using a bucket-level version key as an OCC token (noting the significant performance trade-off for write-heavy buckets), or (b) extending OperationGroup with ReadRanges for atomic range validation at commit time. This is tracked for a future fix; while the current operator-side workaround is to pause writes, the design should investigate mitigation strategies like a temporary proxy or bridge mode to avoid service interruption during this state.
+- ~~AdminDeleteBucket TOCTOU~~ — **fixed**. The empty-probe → commit race is now covered by a `DEL_PREFIX` safety net on the same `OperationGroup`: `AdminDeleteBucket` and `s3.go:deleteBucket` both wipe every per-bucket key family (manifest / upload-meta / upload-part / blob / gc-upload / route) at the shared commitTS, so objects that landed in the race window are tombstoned together with `BucketMetaKey` instead of orphaning. Trade-off: a `PutObject` that returned 200 OK during the race window can be swept by the concurrent delete — operators should pause writes before bucket delete (now documented in `docs/admin_deployment.md` §4.6). See [`2026_04_28_proposed_admin_delete_bucket_safety_net.md`](2026_04_28_proposed_admin_delete_bucket_safety_net.md) for the design.
 - **S3 object browser** — explicitly called out as "next phase" in Section 2 Non-goals; no work item yet.
 - **Operator-visible TLS cert reload** — out of scope; restart-to-rotate is the documented model in `docs/admin.md`.
 
-When the rolling-upgrade flag and the TOCTOU are both addressed, this doc is renamed `2026_04_24_implemented_admin_dashboard.md` per `docs/design/README.md`'s lifecycle convention.
+When the rolling-upgrade flag (the only remaining functional blocker after the TOCTOU fix landed) is addressed, this doc is renamed `2026_04_24_implemented_admin_dashboard.md` per `docs/design/README.md`'s lifecycle convention.
 
 ---
 
