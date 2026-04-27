@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -359,34 +360,46 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 // bucket-must-be-empty rule mirrors the SigV4 deleteBucket path —
 // the dashboard cannot force a recursive delete, by design.
 //
-// The empty-probe (ScanAt with limit=1 on the manifest prefix) is
-// the operator-facing UX: a non-empty bucket returns 409 with
-// ErrAdminBucketNotEmpty. The probe is racy on its own — a
-// PutObject that commits between readTS and the delete's commitTS
-// is not visible to the probe and would have left orphan keys
-// under a deleted bucket meta. See design doc
-// 2026_04_28_proposed_admin_delete_bucket_safety_net.md for the
-// race analysis. The DEL_PREFIX ops appended to the dispatch
-// below close that window: the same OperationGroup wipes every
-// per-bucket prefix at the shared commitTS, so anything that
-// snuck in during the race is tombstoned together with the
-// bucket meta.
+// The dispatch happens in two phases because the production
+// coordinator (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast)
+// rejects DEL_PREFIX inside a transaction and rejects DEL_PREFIX
+// mixed with Del or Put in the same OperationGroup:
+//
+//	Phase 1: Del BucketMetaKey in a txn (OCC-protected against
+//	         a concurrent AdminCreateBucket landing between our
+//	         readTS and commitTS).
+//	Phase 2: DEL_PREFIX over every per-bucket key family in a
+//	         non-txn broadcast — the safety net that sweeps
+//	         orphans left by any PutObject that committed
+//	         chunks/manifest between the empty-probe and the
+//	         Phase-1 commit. See design doc
+//	         2026_04_28_proposed_admin_delete_bucket_safety_net.md
+//	         §6.2 for the original single-OperationGroup design
+//	         and the dispatch-shape rejection that forced the
+//	         two-phase split.
+//
+// Phase 2 is best-effort: a Phase-2 failure leaves the bucket meta
+// already deleted (Phase 1 succeeded) but per-bucket prefixes
+// possibly still containing orphans. That state is no worse than
+// the pre-fix behaviour on main and recovers on operator-driven
+// re-cleanup. We log a warning rather than propagate the error so
+// the operator-visible delete reports success — the bucket really
+// is gone from the API surface, and a retry would 404 because
+// loadBucketMetaAt no longer finds the meta.
 //
 // BucketGenerationKey is intentionally NOT deleted. Re-creating
-// the bucket bumps the generation; orphan blobs that escaped
-// this delete (e.g. on an older generation from a previous
-// delete-recreate cycle) stay isolated under the old generation
-// prefix and never surface in the new bucket. Removing the
-// generation key would lose this property — pinned by
-// TestS3Server_AdminDeleteBucket_BucketGenerationKeySurvives.
+// the bucket bumps the generation; orphan blobs that escaped this
+// delete (e.g. on an older generation) stay isolated under the
+// old generation prefix and never surface in the new bucket.
+// Pinned by TestS3Server_AdminDeleteBucket_BucketGenerationKeySurvives.
 //
-// The contract change for clients: a PutObject that returned
-// 200 OK during the race window can have its data swept by the
-// concurrent delete. Operators are advised to pause writes
-// before AdminDeleteBucket; the alternative (orphan objects
-// that no API can enumerate or remove) is strictly worse.
+// The contract change for clients: a PutObject that returned 200
+// OK during the race window can have its data swept by the
+// concurrent delete. Operators are advised to pause writes before
+// AdminDeleteBucket; the alternative (orphan objects that no API
+// can enumerate or remove) is strictly worse.
 //
-// The same DEL_PREFIX shape is mirrored on the SigV4 path
+// The same shape is mirrored on the SigV4 path
 // (adapter/s3.go:deleteBucket) so both delete entrypoints share
 // the same race-window guarantees.
 func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincipal, name string) error {
@@ -397,6 +410,7 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 		return ErrAdminNotLeader
 	}
 
+	var deletedGeneration uint64
 	err := s.retryS3Mutation(ctx, func() error {
 		readTS := s.readTS()
 		startTS := s.txnStartTS(readTS)
@@ -418,45 +432,73 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 		if len(kvs) > 0 {
 			return ErrAdminBucketNotEmpty
 		}
+		// Phase 1: Del BucketMetaKey in a txn so a concurrent
+		// AdminCreateBucket racing the delete is rejected by OCC.
+		// retryS3Mutation handles ErrWriteConflict / ErrTxnLocked
+		// by re-running this whole closure.
 		_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
-			Elems:   bucketDeleteOperationGroupElems(name, meta.Generation),
+			Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(name)}},
 		})
-		return errors.WithStack(err)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		deletedGeneration = meta.Generation
+		return nil
 	})
 	if err != nil {
 		return err //nolint:wrapcheck // sentinel errors propagate as-is.
 	}
+	// Phase 2: best-effort safety-net DEL_PREFIX. Outside the
+	// retryS3Mutation closure because retrying after Phase 1
+	// committed would 404 at loadBucketMetaAt; we want the error
+	// (if any) logged but not propagated to the operator.
+	s.runBucketDeleteSafetyNet(ctx, name, deletedGeneration)
 	return nil
 }
 
-// bucketDeleteOperationGroupElems returns the OperationGroup elem
-// list for a bucket delete: a Del on BucketMetaKey followed by
-// DEL_PREFIX over each per-bucket key family. Shared between
-// AdminDeleteBucket and the SigV4 deleteBucket path so both
-// entrypoints sweep the same set of orphan-prone prefixes; if a
-// future per-bucket key family is added, updating this one helper
-// covers both delete paths in lockstep.
+// bucketDeleteSafetyNetElems returns the DEL_PREFIX elem list for
+// the Phase-2 safety-net dispatch shared between AdminDeleteBucket
+// and the SigV4 deleteBucket path. One helper so a future
+// per-bucket key family added to the data plane covers both delete
+// entrypoints in lockstep.
 //
 // BucketGenerationKey is intentionally not in the list — see the
 // AdminDeleteBucket doc comment for the orphan-isolation rationale.
 //
 // The 6 DEL_PREFIX ops broadcast across every shard
 // (kv/sharded_coordinator.go: DEL_PREFIX cannot be routed to a
-// single shard). This is acceptable because (a) the empty-probe
-// already confirmed the manifest prefix is empty in the common
-// case, so per-shard scans return 0 keys, (b) AdminDeleteBucket /
-// SigV4 deleteBucket are operator-frequency, not data-plane.
-func bucketDeleteOperationGroupElems(bucket string, generation uint64) []*kv.Elem[kv.OP] {
+// single shard). Acceptable because (a) the empty-probe already
+// confirmed the manifest prefix is empty in the common case, so
+// per-shard scans return 0 keys, (b) bucket delete is operator-
+// frequency, not data-plane.
+func bucketDeleteSafetyNetElems(bucket string, generation uint64) []*kv.Elem[kv.OP] {
 	return []*kv.Elem[kv.OP]{
-		{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)},
 		{Op: kv.DelPrefix, Key: s3keys.ObjectManifestPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.UploadMetaPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.UploadPartPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.BlobPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.GCUploadPrefixForBucket(bucket, generation)},
 		{Op: kv.DelPrefix, Key: s3keys.RoutePrefixForBucket(bucket, generation)},
+	}
+}
+
+// runBucketDeleteSafetyNet runs the Phase-2 DEL_PREFIX dispatch
+// and swallows transport / cluster errors after logging — the
+// caller has already deleted the bucket meta and the operator-
+// visible state is consistent with that. Shared between admin and
+// SigV4 paths.
+func (s *S3Server) runBucketDeleteSafetyNet(ctx context.Context, bucket string, generation uint64) {
+	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		Elems: bucketDeleteSafetyNetElems(bucket, generation),
+	}); err != nil {
+		slog.WarnContext(ctx,
+			"bucket delete safety-net DEL_PREFIX failed; bucket meta is gone but orphan sweep incomplete",
+			slog.String("bucket", bucket),
+			slog.Uint64("generation", generation),
+			slog.String("error", err.Error()),
+		)
 	}
 }
 

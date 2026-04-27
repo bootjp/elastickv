@@ -170,21 +170,75 @@ identical to the existing `ObjectManifestPrefixForBucket`.
 
 ### 6.2 `AdminDeleteBucket` (and `s3.go:deleteBucket`) commit shape
 
+The original revision of this design proposed a **single
+OperationGroup** carrying both the `Del BucketMetaKey` and the
+six `DelPrefix` ops, relying on the FSM to apply them all at one
+commitTS. That shape is rejected by the production coordinator
+(Codex P1 on PR #695):
+
+- `kv/sharded_coordinator.go:dispatchDelPrefixBroadcast` rejects
+  any `OperationGroup` containing `DelPrefix` when `IsTxn` is
+  true: *"DEL_PREFIX not supported in transactions"*.
+- The same broadcast path runs `validateDelPrefixOnly` and rejects
+  mixed `Del` / `Put` + `DelPrefix` groups: *"DEL_PREFIX cannot be
+  mixed with other operations"*.
+
+Together those two rules forbid the single-group shape. The
+implementation splits into two `Dispatch` calls:
+
 ```go
-elems := []*kv.Elem[kv.OP]{
-    {Op: kv.Del,       Key: BucketMetaKey(name)},
-    {Op: kv.DelPrefix, Key: ObjectManifestPrefixForBucket(name, gen)},
-    {Op: kv.DelPrefix, Key: UploadMetaPrefixForBucket(name, gen)},
-    {Op: kv.DelPrefix, Key: UploadPartPrefixForBucket(name, gen)},
-    {Op: kv.DelPrefix, Key: BlobPrefixForBucket(name, gen)},
-    {Op: kv.DelPrefix, Key: GCUploadPrefixForBucket(name, gen)},
-    {Op: kv.DelPrefix, Key: RoutePrefixForBucket(name, gen)},
-}
+// Phase 1: Del BucketMetaKey in a txn (OCC-protected against
+// concurrent AdminCreateBucket racing this delete).
+s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+    IsTxn:   true,
+    StartTS: startTS,
+    Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: BucketMetaKey(name)}},
+})
+
+// Phase 2: DEL_PREFIX safety net broadcast (non-txn). Only runs
+// after Phase 1 commits; failure here is best-effort and logged
+// rather than propagated.
+s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+    Elems: []*kv.Elem[kv.OP]{
+        {Op: kv.DelPrefix, Key: ObjectManifestPrefixForBucket(name, gen)},
+        {Op: kv.DelPrefix, Key: UploadMetaPrefixForBucket(name, gen)},
+        {Op: kv.DelPrefix, Key: UploadPartPrefixForBucket(name, gen)},
+        {Op: kv.DelPrefix, Key: BlobPrefixForBucket(name, gen)},
+        {Op: kv.DelPrefix, Key: GCUploadPrefixForBucket(name, gen)},
+        {Op: kv.DelPrefix, Key: RoutePrefixForBucket(name, gen)},
+    },
+})
 ```
 
 The empty-probe stays as the operator-facing UX: when the bucket
 is genuinely non-empty (no race), the operator still sees 409 and
-the `DEL_PREFIX` ops never run.
+neither phase runs.
+
+**Phase-2 failure semantics**: Phase 1 is the point of no return.
+If Phase 2's `Dispatch` returns an error (transport blip,
+cluster transient, etc.), the bucket meta is already gone but
+the per-bucket prefixes may still contain orphans. The operator-
+visible delete reports success (the bucket really is gone from
+the API surface, and a retry would 404 at `loadBucketMetaAt`) and
+the failure is recorded via `slog.WarnContext`. The resulting
+state is no worse than the pre-fix behaviour on main — orphans
+were already the failure mode the original race produced. A
+future cluster-wide sweep tool (when one exists) can recover the
+disk space.
+
+**Why not Phase 2 first?** A "DEL_PREFIX before Del" ordering
+would wipe per-bucket data while the bucket meta still exists. If
+Phase 1 then fails (concurrent recreate races the OCC), readers
+see "bucket exists" but their chunks/manifests don't — confusing
+state with no clean recovery. Phase-1-first localises any partial
+failure to "bucket gone, orphan data may persist", which has a
+well-defined audit trail in slog.
+
+**Test-coordinator parity**: `adapter/dynamodb_migration_test.go`
+mirrors the production rejection rules in `localAdapterCoordinator.
+validateDispatchShape`. Without that, the original single-group
+shape passed local tests while production rejected every bucket
+delete with `ErrInvalidRequest` — exactly the gap Codex P1 caught.
 
 ### 6.3 Apply-time cost
 

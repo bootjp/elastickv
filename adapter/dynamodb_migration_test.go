@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,6 +28,9 @@ func (c *localAdapterCoordinator) Dispatch(ctx context.Context, req *kv.Operatio
 	if req == nil {
 		return &kv.CoordinateResponse{}, nil
 	}
+	if err := c.validateDispatchShape(req); err != nil {
+		return nil, err
+	}
 	commitTS, err := c.commitTSForRequest(req)
 	if err != nil {
 		return nil, err
@@ -35,6 +39,45 @@ func (c *localAdapterCoordinator) Dispatch(ctx context.Context, req *kv.Operatio
 		return nil, err
 	}
 	return &kv.CoordinateResponse{}, nil
+}
+
+// validateDispatchShape mirrors the production coordinator's
+// dispatch-time rejection rules so tests catch the same class of
+// bug that real clusters would reject. Specifically:
+//
+//   - DEL_PREFIX cannot be in a transactional OperationGroup
+//     (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast
+//     refuses IsTxn=true).
+//   - DEL_PREFIX cannot be mixed with Put or Del in the same
+//     OperationGroup (validateDelPrefixOnly enforces all-or-none).
+//
+// Without these checks, a regression that ships
+// `IsTxn:true with [Del, DelPrefix...]` (Codex P1 on PR #695)
+// would silently pass the local coordinator while production
+// rejected every bucket delete with ErrInvalidRequest.
+func (c *localAdapterCoordinator) validateDispatchShape(req *kv.OperationGroup[kv.OP]) error {
+	hasDelPrefix := false
+	hasOther := false
+	for _, elem := range req.Elems {
+		if elem == nil {
+			continue
+		}
+		if elem.Op == kv.DelPrefix {
+			hasDelPrefix = true
+		} else {
+			hasOther = true
+		}
+	}
+	if !hasDelPrefix {
+		return nil
+	}
+	if req.IsTxn {
+		return errors.Wrap(kv.ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
+	}
+	if hasOther {
+		return errors.Wrap(kv.ErrInvalidRequest, "DEL_PREFIX cannot be mixed with other operations")
+	}
+	return nil
 }
 
 func (c *localAdapterCoordinator) commitTSForRequest(req *kv.OperationGroup[kv.OP]) (uint64, error) {
