@@ -49,6 +49,7 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 		DataDir:        cfg.DataDir,
 		Peers:          peers,
 		Bootstrap:      cfg.Bootstrap,
+		JoinAsLearner:  cfg.JoinAsLearner,
 		Transport:      transport,
 		StateMachine:   cfg.StateMachine,
 		TickInterval:   f.cfg.TickInterval,

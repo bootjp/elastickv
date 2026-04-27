@@ -207,6 +207,7 @@ func buildRuntimeForGroup(
 	st store.MVCCStore,
 	sm raftengine.StateMachine,
 	factory raftengine.Factory,
+	joinAsLearner bool,
 ) (*raftGroupRuntime, error) {
 	dir := groupDataDir(baseDir, raftID, group.id, multi)
 	engineType := raftEngineType(factory.EngineType())
@@ -215,12 +216,13 @@ func buildRuntimeForGroup(
 	}
 
 	result, err := factory.Create(raftengine.FactoryConfig{
-		LocalID:      raftID,
-		LocalAddress: group.address,
-		DataDir:      dir,
-		Peers:        bootstrapServers,
-		Bootstrap:    bootstrap,
-		StateMachine: sm,
+		LocalID:       raftID,
+		LocalAddress:  group.address,
+		DataDir:       dir,
+		Peers:         bootstrapServers,
+		Bootstrap:     bootstrap,
+		StateMachine:  sm,
+		JoinAsLearner: joinAsLearner,
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)

@@ -127,6 +127,21 @@ var (
 	errPromoteLearnerNotCaughtUp    = errors.New("etcd raft promote-learner target has not caught up to min_applied_index")
 )
 
+// joinRoleViolationCount counts the number of times the join-as-learner
+// alarm has fired across all engine instances in this process. Surfaced
+// via JoinRoleViolationCount() so callers (monitoring) can read it
+// without holding any engine lock; the latch on Engine.joinAlarmFired
+// keeps each individual engine from contributing more than once per
+// process lifetime.
+var joinRoleViolationCount atomic.Uint64
+
+// JoinRoleViolationCount returns the cumulative count of
+// --raftJoinAsLearner alarms that have fired since process start. See
+// docs/design/2026_04_26_proposed_raft_learner.md §4.5.
+func JoinRoleViolationCount() uint64 {
+	return joinRoleViolationCount.Load()
+}
+
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
 type Snapshot = raftengine.Snapshot
 
@@ -134,12 +149,18 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID        uint64
-	LocalID       string
-	LocalAddress  string
-	DataDir       string
-	Peers         []Peer
-	Bootstrap     bool
+	NodeID       uint64
+	LocalID      string
+	LocalAddress string
+	DataDir      string
+	Peers        []Peer
+	Bootstrap    bool
+	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
+	// engine watches every post-apply ConfState and emits an
+	// ERROR-level alarm whenever the local node is in Voters while
+	// JoinAsLearner is true. The check is post-apply only; the node
+	// continues running.
+	JoinAsLearner bool
 	Transport     *GRPCTransport
 	TickInterval  time.Duration
 	ElectionTick  int
@@ -163,6 +184,16 @@ type Engine struct {
 	fsmSnapDir   string
 	tickInterval time.Duration
 	electionTick int
+	// joinAsLearner is captured from OpenConfig; consulted by
+	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
+	// the learner design doc.
+	joinAsLearner bool
+	// joinAlarmFired latches the join-as-learner alarm so the
+	// structured ERROR log fires once per process lifetime. Without
+	// the latch, every conf change after the misbehaving join would
+	// re-emit the log even though the operator has already been
+	// alerted by the metric counter. Stored as int32 for atomic CAS.
+	joinAlarmFired atomic.Bool
 
 	storage   *etcdraft.MemoryStorage
 	rawNode   *etcdraft.RawNode
@@ -451,6 +482,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
 		tickInterval:     prepared.cfg.TickInterval,
 		electionTick:     prepared.cfg.ElectionTick,
+		joinAsLearner:    prepared.cfg.JoinAsLearner,
 		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
 		persist:          prepared.disk.Persist,
@@ -1800,7 +1832,15 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	}
 	e.applied = snapshot.Metadata.Index
 	e.appliedIndex.Store(snapshot.Metadata.Index)
+	// Refresh the voter-cache from the snapshot's ConfState so
+	// downstream apply-loop reads (recordQuorumAck, refreshStatus,
+	// removePeer) see the post-snapshot voter set even before any
+	// further conf-change entries arrive. Mirrors the apply-loop
+	// sequence in applyConfigChange. The order matches §4.6:
+	// voterCache first, then config.Servers.
+	e.refreshVoterCache(snapshot.Metadata.ConfState)
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
+	e.alarmIfJoinedAsVoter(snapshot.Metadata.ConfState)
 	return nil
 }
 
@@ -1955,6 +1995,7 @@ func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, context)
+	e.alarmIfJoinedAsVoter(confState)
 }
 
 func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
@@ -1965,6 +2006,43 @@ func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confS
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, cc.Context)
+	e.alarmIfJoinedAsVoter(confState)
+}
+
+// alarmIfJoinedAsVoter implements the operator-alarm semantics from
+// docs/design/2026_04_26_proposed_raft_learner.md §4.5: when the
+// operator passed --raftJoinAsLearner but a post-apply ConfState
+// lists this node as a voter, surface a one-shot ERROR-level
+// structured log and bump a metric. The node continues running --
+// shutting down would shrink the cluster's effective fault tolerance
+// since by the time the conf change has applied, the local node
+// already counts toward the voter quorum.
+func (e *Engine) alarmIfJoinedAsVoter(confState raftpb.ConfState) {
+	if !e.joinAsLearner {
+		return
+	}
+	if !nodeInVoters(confState, e.nodeID) {
+		return
+	}
+	if !e.joinAlarmFired.CompareAndSwap(false, true) {
+		return
+	}
+	joinRoleViolationCount.Add(1)
+	slog.Error("etcd raft join-as-learner alarm: local node was added as voter, expected learner",
+		slog.String("local_id", e.localID),
+		slog.Uint64("node_id", e.nodeID),
+		slog.Any("voters", confState.Voters),
+		slog.Any("learners", confState.Learners),
+	)
+}
+
+func nodeInVoters(confState raftpb.ConfState, nodeID uint64) bool {
+	for _, id := range confState.Voters {
+		if id == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 // refreshVoterCache rebuilds the voterCount / isLearnerNode cache

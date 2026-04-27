@@ -2,11 +2,11 @@ package etcd
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -168,6 +168,93 @@ func TestPromoteLearnerRejectsNotCaughtUp(t *testing.T) {
 	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, unreachableIndex)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errPromoteLearnerNotCaughtUp), "expected errPromoteLearnerNotCaughtUp, got %v", err)
+}
+
+// TestJoinAsLearnerAlarmFiresWhenAddedAsVoter exercises the §4.5
+// post-apply local alarm: a node booted with JoinAsLearner=true that
+// then sees itself in ConfState.Voters logs an ERROR and bumps the
+// process-wide JoinRoleViolationCount counter, but keeps running.
+func TestJoinAsLearnerAlarmFiresWhenAddedAsVoter(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+
+	// Boot the joiner with the alarm flag set, then add it as a VOTER
+	// (not a learner) — that's the misuse the alarm catches.
+	nodes[1].joinAsLearner = true
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	before := JoinRoleViolationCount()
+	_, err := leader.engine.AddVoter(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	require.Eventually(t, func() bool {
+		return JoinRoleViolationCount() > before
+	}, 5*time.Second, 20*time.Millisecond, "expected join-as-learner alarm to fire")
+
+	// Joiner stays running -- §4.5: shutdown is explicitly rejected.
+	require.NotEqual(t, raftengine.StateShutdown, nodes[1].engine.State())
+}
+
+// TestLinearizableReadOnLearnerForwardsToLeader is the §4.6 / §5.5
+// behaviour test: LinearizableRead on a learner forwards to the
+// leader's ReadIndex and returns once local apply catches up. A
+// learner must NOT serve LinearizableRead from a leader-local fast
+// path (it isn't leader; LeaderView guards return errNotLeader).
+// Until follower-served reads land in a separate proposal,
+// "learner LinearizableRead" is the same code path as a voter
+// follower's: it forwards to the leader.
+func TestLinearizableReadOnLearnerForwardsToLeader(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	_, err := leader.engine.AddLearner(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+	waitForConfigSize(t, nodes[1].engine, 2)
+
+	require.Eventually(t, func() bool {
+		return leader.engine.State() == raftengine.StateLeader
+	}, 5*time.Second, 20*time.Millisecond)
+
+	// Drive a write through the leader. This commits at the leader's
+	// next index; the learner replicates and applies.
+	_, err = leader.engine.Propose(context.Background(), []byte("payload"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return len(nodes[1].fsm.Applied()) >= 1
+	}, 5*time.Second, 20*time.Millisecond)
+
+	// LinearizableRead on the leader returns the latest commit index.
+	leaderIdx, err := leader.engine.LinearizableRead(ctx)
+	require.NoError(t, err)
+	require.NotZero(t, leaderIdx)
+
+	// LinearizableRead on the learner: today we return errNotLeader
+	// (the learner is a follower, and follower-served reads are an
+	// explicit non-goal of this milestone). Guarantee that surface
+	// with a typed error so any future regression that lets the
+	// learner accidentally answer LinearizableRead from local FSM
+	// gets caught here.
+	_, err = nodes[1].engine.LinearizableRead(ctx)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, raftengine.ErrNotLeader), "expected ErrNotLeader, got %v", err)
 }
 
 // TestRemovePeerLearnerKeepsSingleNodeFastPath is the §4.6 lease-read

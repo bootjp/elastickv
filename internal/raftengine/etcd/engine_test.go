@@ -118,13 +118,14 @@ type countingSnapshotStateMachine struct {
 }
 
 type transportTestNode struct {
-	peer      Peer
-	lis       net.Listener
-	server    *grpc.Server
-	transport *GRPCTransport
-	fsm       *testStateMachine
-	engine    *Engine
-	dir       string
+	peer          Peer
+	lis           net.Listener
+	server        *grpc.Server
+	transport     *GRPCTransport
+	fsm           *testStateMachine
+	engine        *Engine
+	dir           string
+	joinAsLearner bool
 }
 
 func (s *testSnapshot) WriteTo(w io.Writer) (int64, error) {
@@ -1508,14 +1509,15 @@ func cleanupTransportTestNodes(t *testing.T, nodes []*transportTestNode) {
 
 func openTransportTestNode(ctx context.Context, node *transportTestNode, peers []Peer, bootstrap bool) error {
 	engine, err := Open(ctx, OpenConfig{
-		NodeID:       node.peer.NodeID,
-		LocalID:      node.peer.ID,
-		LocalAddress: node.peer.Address,
-		DataDir:      node.dir,
-		Peers:        peers,
-		Bootstrap:    bootstrap,
-		Transport:    node.transport,
-		StateMachine: node.fsm,
+		NodeID:        node.peer.NodeID,
+		LocalID:       node.peer.ID,
+		LocalAddress:  node.peer.Address,
+		DataDir:       node.dir,
+		Peers:         peers,
+		Bootstrap:     bootstrap,
+		JoinAsLearner: node.joinAsLearner,
+		Transport:     node.transport,
+		StateMachine:  node.fsm,
 	})
 	if err != nil {
 		return err
