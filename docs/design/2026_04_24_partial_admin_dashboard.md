@@ -1,26 +1,27 @@
 # elastickv Admin Dashboard Design
 
-**Status:** Partial — P1 and P3 have shipped in full; P2 has shipped its read-only slice with the write path still in flight; P4 has shipped TLS / role / CSRF and lands its operator documentation alongside this rename. See the status table below for the per-phase breakdown.
+**Status:** Partial — every phase of the original P1–P4 plan has shipped. The doc stays at `_partial_` (rather than `_implemented_`) because AdminForward acceptance criterion 5 (rolling-upgrade compatibility flag) is explicitly deferred and the AdminDeleteBucket TOCTOU caught during PR #669 review is tracked here as a pre-existing limitation. See the status table for the per-phase breakdown and Outstanding open items below.
 **Author:** bootjp
 **Date:** 2026-04-24
-**Last updated:** 2026-04-26 (renamed from `_proposed_` to `_partial_` after P1, P3, and the read-only slice of P2 landed)
+**Last updated:** 2026-04-27 (P2 write paths + P4 operator doc landed; status table refreshed)
 
-## Implementation status (as of 2026-04-26)
+## Implementation status (as of 2026-04-27)
 
 | Phase | Status | Landed via |
 |---|---|---|
 | **P1** — `internal/admin/` skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–4 + 6; criterion 5 deferred — see outstanding items) | ✅ shipped | #634, #635, #644, #648 |
-| **P2** — S3 bucket list/create/delete/ACL, DescribeTable | 🟡 partial — read-only slice 1 landed in #658; write paths (slice 2a, #669) and AdminForward integration (slice 2b, #673) are still in flight |
+| **P2** — S3 bucket list/create/delete/ACL, DescribeTable | ✅ shipped | #658 (read-only slice 1) + #669 (writes, slice 2a) + #673 (AdminForward integration, slice 2b) |
 | **P3** — React SPA + embed | ✅ shipped | #649, #650 |
-| **P4** — TLS, read-only role, CSRF, `docs/admin.md` | 🟡 mostly shipped — TLS / role / CSRF are live in P1, operator doc in #674 |
+| **P4** — TLS, read-only role, CSRF, `docs/admin.md`, deployment runbook + `scripts/rolling-update.sh` admin support | ✅ shipped | TLS / role / CSRF live in P1; operator doc + runbook + script wiring in #674 / #669 / #678 |
 
 Outstanding open items (kept here so future readers know what is still owed against the original proposal):
 
 - **AdminForward acceptance criterion 5** — rolling-upgrade compatibility flag (`admin.leader_forward_v2`). Deferred behind a cluster-version bump; not blocking dashboard usability today because every node forwards through the same `pb.AdminOperation` enum.
+- AdminDeleteBucket TOCTOU — A race condition exists where AdminDeleteBucket scans ObjectManifestPrefixForBucket at readTS, but the transaction only includes the BucketMetaKey in its read set. A concurrent PutObject inserting a manifest key in the scanned prefix between readTS and commitTS will not trigger a conflict, leading to orphaned objects. This pre-existing race is also present in the SigV4 path (adapter/s3.go:deleteBucket). Potential fixes include (a) using a bucket-level version key as an OCC token (noting the significant performance trade-off for write-heavy buckets), or (b) extending OperationGroup with ReadRanges for atomic range validation at commit time. This is tracked for a future fix; while the current operator-side workaround is to pause writes, the design should investigate mitigation strategies like a temporary proxy or bridge mode to avoid service interruption during this state.
 - **S3 object browser** — explicitly called out as "next phase" in Section 2 Non-goals; no work item yet.
 - **Operator-visible TLS cert reload** — out of scope; restart-to-rotate is the documented model in `docs/admin.md`.
 
-When the rolling-upgrade flag lands, this doc is renamed `2026_04_24_implemented_admin_dashboard.md` per `docs/design/README.md`'s lifecycle convention.
+When the rolling-upgrade flag and the TOCTOU are both addressed, this doc is renamed `2026_04_24_implemented_admin_dashboard.md` per `docs/design/README.md`'s lifecycle convention.
 
 ---
 
