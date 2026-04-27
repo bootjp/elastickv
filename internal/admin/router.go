@@ -26,17 +26,48 @@ import (
 // versions (`/admin/api`, `/admin/api/v2`, ...) return a JSON 404
 // instead of being silently answered with the SPA HTML.
 const (
-	pathPrefixAdmin   = "/admin"
-	pathAPIRoot       = "/admin/api"
-	pathPrefixAPI     = pathAPIRoot + "/"
-	pathAPIv1Root     = "/admin/api/v1"
-	pathPrefixAPIv1   = pathAPIv1Root + "/"
-	pathHealthz       = "/admin/healthz"
+	pathPrefixAdmin = "/admin"
+	pathAPIRoot     = "/admin/api"
+	pathPrefixAPI   = pathAPIRoot + "/"
+	pathAPIv1Root   = "/admin/api/v1"
+	pathPrefixAPIv1 = pathAPIv1Root + "/"
+	pathHealthz     = "/admin/healthz"
+	// pathHealthzLeader is a sibling of pathHealthz for load balancers
+	// that want to route admin traffic only to the current Raft leader
+	// (so admin writes do not bounce through the AdminForward proxy on
+	// followers). Mirrors the /healthz/leader endpoints already shipped
+	// on the S3 and DynamoDB adapters: returns 200 only when this node
+	// is the verified leader of the default Raft group; 503 otherwise.
+	// classify() routes this path before the SPA catch-all so it cannot
+	// be silently answered with index.html.
+	pathHealthzLeader = "/admin/healthz/leader"
 	pathAssetsRoot    = "/admin/assets"
 	pathPrefixAssets  = pathAssetsRoot + "/"
 	pathRootAssetsDir = "assets"
 	pathIndexHTML     = "index.html"
 )
+
+// LeaderProbe is the cheap healthz contract used by /admin/healthz/leader.
+// Implementations should return true only when this node is the verified
+// Raft leader — a stale-leader follower returning true during a silent
+// leadership change defeats the load balancer's purpose. Production wires
+// this to the default group's coordinator IsLeader + VerifyLeader pair;
+// tests use a stub returning a fixed bool.
+//
+// A nil LeaderProbe makes /admin/healthz/leader unavailable — the router
+// answers it with the standard JSON 404, distinguishing "not enabled" from
+// the operational "503 not leader" state. Mirrors the S3/DynamoDB
+// /healthz/leader contract.
+type LeaderProbe interface {
+	IsVerifiedLeader() bool
+}
+
+// LeaderProbeFunc is a convenience adapter for wiring a plain function
+// without defining an interface implementation. Mirrors ClusterInfoFunc.
+type LeaderProbeFunc func() bool
+
+// IsVerifiedLeader implements LeaderProbe.
+func (f LeaderProbeFunc) IsVerifiedLeader() bool { return f() }
 
 // APIHandler is the bridge between the router and all JSON API endpoints.
 // Everything under /admin/api/v1/ resolves through it; individual endpoint
@@ -51,6 +82,7 @@ type APIHandler http.Handler
 type Router struct {
 	api      http.Handler
 	static   fs.FS
+	leader   LeaderProbe
 	notFound http.Handler
 }
 
@@ -62,10 +94,24 @@ type Router struct {
 //     SPA catch-all (which always serves index.html). A nil static FS
 //     causes 404s for asset and SPA routes, which is the expected state
 //     while the SPA has not been built yet.
+//
+// /admin/healthz/leader is wired via NewRouterWithLeaderProbe; this
+// constructor leaves it unrouted (404) for callers that do not need the
+// leader healthz endpoint.
 func NewRouter(api http.Handler, static fs.FS) *Router {
+	return NewRouterWithLeaderProbe(api, static, nil)
+}
+
+// NewRouterWithLeaderProbe is the long-form constructor used by
+// production wiring (see ServerDeps.LeaderProbe). The probe drives
+// /admin/healthz/leader: 200 when probe.IsVerifiedLeader() is true, 503
+// otherwise. A nil probe behaves identically to NewRouter — the path
+// returns the standard JSON 404.
+func NewRouterWithLeaderProbe(api http.Handler, static fs.FS, leader LeaderProbe) *Router {
 	return &Router{
 		api:      api,
 		static:   static,
+		leader:   leader,
 		notFound: http.HandlerFunc(writeJSONNotFound),
 	}
 }
@@ -90,6 +136,7 @@ const (
 	routeAPIv1 routeKind = iota
 	routeAPIOther
 	routeHealthz
+	routeHealthzLeader
 	routeAssetsRoot
 	routeAsset
 	routeSPA
@@ -102,6 +149,14 @@ func (rt *Router) classify(p string) routeKind {
 	}
 	if k, ok := classifyAssets(p); ok {
 		return k
+	}
+	// Both /admin/healthz and /admin/healthz/leader are exact-match
+	// equality checks — relative ordering between them does not affect
+	// correctness, but BOTH must run before the SPA prefix branch
+	// below; otherwise the catch-all "anything under /admin/" resolves
+	// these paths to index.html.
+	if p == pathHealthzLeader {
+		return routeHealthzLeader
 	}
 	if p == pathHealthz {
 		return routeHealthz
@@ -146,6 +201,11 @@ func (rt *Router) dispatch(k routeKind) http.Handler {
 		return rt.api
 	case routeHealthz:
 		return http.HandlerFunc(rt.serveHealth)
+	case routeHealthzLeader:
+		if rt.leader == nil {
+			return rt.notFound
+		}
+		return http.HandlerFunc(rt.serveLeaderHealth)
 	case routeAsset:
 		return http.HandlerFunc(rt.serveAsset)
 	case routeSPA:
@@ -156,9 +216,27 @@ func (rt *Router) dispatch(k routeKind) http.Handler {
 	return rt.notFound
 }
 
+// allowGetHead is the canonical Allow value for read-only handlers
+// (healthz / SPA / static assets). RFC 7231 §6.5.5 requires every 405
+// to advertise the supported methods; load balancers and synthetic-
+// monitor tools key off this header to discover the right verbs
+// without scraping the body. Mirrors the value the S3 and DynamoDB
+// /healthz/leader handlers already set
+// (adapter/s3.go:2404, adapter/dynamodb.go:399).
+const allowGetHead = "GET, HEAD"
+
+// writeMethodNotAllowed centralises the read-only 405 response shape
+// for router-served paths. The Allow header is set BEFORE
+// writeJSONError because writeJSONError calls w.WriteHeader, after
+// which header mutations would silently no-op.
+func writeMethodNotAllowed(w http.ResponseWriter) {
+	w.Header().Set("Allow", allowGetHead)
+	writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+}
+
 func (rt *Router) serveHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		writeMethodNotAllowed(w)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -166,6 +244,33 @@ func (rt *Router) serveHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
 		_, _ = w.Write([]byte("ok\n"))
+	}
+}
+
+// serveLeaderHealth answers /admin/healthz/leader. 200 + "ok" only when
+// the LeaderProbe reports a verified leader; 503 + "not leader"
+// otherwise. The body shape and method-allowlist mirror the S3 / Dynamo
+// /healthz/leader endpoints (adapter/s3.go:serveS3LeaderHealthz,
+// adapter/dynamodb.go:serveDynamoLeaderHealthz) so an upstream load
+// balancer that probes any of the three sees identical semantics.
+//
+// Precondition: rt.leader is non-nil. dispatch() short-circuits the
+// nil case to rt.notFound before this handler is ever invoked, so a
+// belt-and-braces nil check inside this body would be dead code.
+func (rt *Router) serveLeaderHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeMethodNotAllowed(w)
+		return
+	}
+	status, body := http.StatusOK, "ok\n"
+	if !rt.leader.IsVerifiedLeader() {
+		status, body = http.StatusServiceUnavailable, "not leader\n"
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write([]byte(body))
 	}
 }
 
@@ -177,7 +282,7 @@ func (rt *Router) serveAsset(w http.ResponseWriter, r *http.Request) {
 	// the file body for a write request) or surface as a confusing
 	// 404 — neither matches the API contract for assets.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		writeMethodNotAllowed(w)
 		return
 	}
 	if rt.static == nil {
@@ -254,7 +359,7 @@ func (rt *Router) serveSPA(w http.ResponseWriter, r *http.Request) {
 	// /admin/something returned a JSON 404 with a nil static and a
 	// JSON 405 with a populated static — same URL, different answer.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		writeMethodNotAllowed(w)
 		return
 	}
 	if rt.static == nil {
