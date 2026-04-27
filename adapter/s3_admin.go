@@ -359,29 +359,36 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 // bucket-must-be-empty rule mirrors the SigV4 deleteBucket path —
 // the dashboard cannot force a recursive delete, by design.
 //
-// Known orphan-race limitation (coderabbitai 🔴 / 🟠 on PR #669):
-// the empty-bucket probe (ScanAt with limit=1 on
-// ObjectManifestPrefixForBucket) reads at readTS but the
-// subsequent BucketMetaKey delete only carries that single point
-// key in its ReadKeys set. A concurrent PutObject that inserts a
-// manifest key in the scanned prefix between readTS and the
-// delete's commitTS will not conflict — the OCC validator only
-// inspects keys that appear in ReadKeys, and there is no
-// ReadRanges mechanism today. The object's manifest key survives
-// under a now-deleted bucket meta and becomes orphaned.
+// The empty-probe (ScanAt with limit=1 on the manifest prefix) is
+// the operator-facing UX: a non-empty bucket returns 409 with
+// ErrAdminBucketNotEmpty. The probe is racy on its own — a
+// PutObject that commits between readTS and the delete's commitTS
+// is not visible to the probe and would have left orphan keys
+// under a deleted bucket meta. See design doc
+// 2026_04_28_proposed_admin_delete_bucket_safety_net.md for the
+// race analysis. The DEL_PREFIX ops appended to the dispatch
+// below close that window: the same OperationGroup wipes every
+// per-bucket prefix at the shared commitTS, so anything that
+// snuck in during the race is tombstoned together with the
+// bucket meta.
 //
-// This race exists pre-existing in the SigV4 path
-// (adapter/s3.go:deleteBucket — same shape, same limitation), so
-// AdminDeleteBucket inherits the contract; closing the gap
-// requires either (a) bumping BucketGenerationKey on every
-// PutObject so it can serve as an OCC token in this read set, or
-// (b) extending OperationGroup with ReadRanges and teaching the
-// FSM to validate range emptiness atomically with commit. Both
-// are larger changes outside this PR's scope; tracked in
-// docs/design/2026_04_24_partial_admin_dashboard.md under the
-// Outstanding open items section. Operators concerned about the
-// orphan window today should pause writes against the target
-// bucket before issuing the admin delete.
+// BucketGenerationKey is intentionally NOT deleted. Re-creating
+// the bucket bumps the generation; orphan blobs that escaped
+// this delete (e.g. on an older generation from a previous
+// delete-recreate cycle) stay isolated under the old generation
+// prefix and never surface in the new bucket. Removing the
+// generation key would lose this property — pinned by
+// TestS3Server_AdminDeleteBucket_BucketGenerationKeySurvives.
+//
+// The contract change for clients: a PutObject that returned
+// 200 OK during the race window can have its data swept by the
+// concurrent delete. Operators are advised to pause writes
+// before AdminDeleteBucket; the alternative (orphan objects
+// that no API can enumerate or remove) is strictly worse.
+//
+// The same DEL_PREFIX shape is mirrored on the SigV4 path
+// (adapter/s3.go:deleteBucket) so both delete entrypoints share
+// the same race-window guarantees.
 func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincipal, name string) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
@@ -414,9 +421,7 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 		_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: s3keys.BucketMetaKey(name)},
-			},
+			Elems:   bucketDeleteOperationGroupElems(name, meta.Generation),
 		})
 		return errors.WithStack(err)
 	})
@@ -424,6 +429,35 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 		return err //nolint:wrapcheck // sentinel errors propagate as-is.
 	}
 	return nil
+}
+
+// bucketDeleteOperationGroupElems returns the OperationGroup elem
+// list for a bucket delete: a Del on BucketMetaKey followed by
+// DEL_PREFIX over each per-bucket key family. Shared between
+// AdminDeleteBucket and the SigV4 deleteBucket path so both
+// entrypoints sweep the same set of orphan-prone prefixes; if a
+// future per-bucket key family is added, updating this one helper
+// covers both delete paths in lockstep.
+//
+// BucketGenerationKey is intentionally not in the list — see the
+// AdminDeleteBucket doc comment for the orphan-isolation rationale.
+//
+// The 6 DEL_PREFIX ops broadcast across every shard
+// (kv/sharded_coordinator.go: DEL_PREFIX cannot be routed to a
+// single shard). This is acceptable because (a) the empty-probe
+// already confirmed the manifest prefix is empty in the common
+// case, so per-shard scans return 0 keys, (b) AdminDeleteBucket /
+// SigV4 deleteBucket are operator-frequency, not data-plane.
+func bucketDeleteOperationGroupElems(bucket string, generation uint64) []*kv.Elem[kv.OP] {
+	return []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)},
+		{Op: kv.DelPrefix, Key: s3keys.ObjectManifestPrefixForBucket(bucket, generation)},
+		{Op: kv.DelPrefix, Key: s3keys.UploadMetaPrefixForBucket(bucket, generation)},
+		{Op: kv.DelPrefix, Key: s3keys.UploadPartPrefixForBucket(bucket, generation)},
+		{Op: kv.DelPrefix, Key: s3keys.BlobPrefixForBucket(bucket, generation)},
+		{Op: kv.DelPrefix, Key: s3keys.GCUploadPrefixForBucket(bucket, generation)},
+		{Op: kv.DelPrefix, Key: s3keys.RoutePrefixForBucket(bucket, generation)},
+	}
 }
 
 // adminCanonicalACL normalises an empty input to the canned

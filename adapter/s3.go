@@ -669,12 +669,17 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 			}
 		}
 
+		// Same DEL_PREFIX safety net as AdminDeleteBucket — see
+		// design doc 2026_04_28_proposed_admin_delete_bucket_safety_net.md
+		// for the race analysis. The empty-probe above is racy
+		// against concurrent PutObject; the DEL_PREFIX ops in the
+		// shared OperationGroup tombstone every per-bucket prefix
+		// at the commit timestamp so anything that snuck in after
+		// readTS is swept along with BucketMetaKey.
 		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)},
-			},
+			Elems:   bucketDeleteOperationGroupElems(bucket, meta.Generation),
 		})
 		return errors.WithStack(err)
 	})
