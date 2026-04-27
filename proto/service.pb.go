@@ -1902,12 +1902,19 @@ type RaftAdminPromoteLearnerRequest struct {
 	PreviousIndex uint64                 `protobuf:"varint,2,opt,name=previous_index,json=previousIndex,proto3" json:"previous_index,omitempty"`
 	// min_applied_index is the catch-up precondition: the learner's
 	// leader-side Progress.Match must be >= min_applied_index for the
-	// promote conf change to be proposed. 0 skips the check (kept for
-	// symmetry with previous_index but discouraged in production -- the
-	// operator runbook recommends passing a recent leader commit index).
+	// promote conf change to be proposed. The server REJECTS
+	// min_applied_index == 0 unless skip_min_applied_check is also
+	// set, so an operator who copy-pastes a script that omits the
+	// catch-up check gets a clean FailedPrecondition instead of a
+	// silent quorum stall. See learner runbook step 5.
 	MinAppliedIndex uint64 `protobuf:"varint,3,opt,name=min_applied_index,json=minAppliedIndex,proto3" json:"min_applied_index,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// skip_min_applied_check explicitly opts out of the catch-up
+	// precondition. Strongly discouraged in production -- only set
+	// when promoting a learner that the operator has independently
+	// confirmed is up to date (e.g., bootstrap-time scaffolding).
+	SkipMinAppliedCheck bool `protobuf:"varint,4,opt,name=skip_min_applied_check,json=skipMinAppliedCheck,proto3" json:"skip_min_applied_check,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *RaftAdminPromoteLearnerRequest) Reset() {
@@ -1959,6 +1966,13 @@ func (x *RaftAdminPromoteLearnerRequest) GetMinAppliedIndex() uint64 {
 		return x.MinAppliedIndex
 	}
 	return 0
+}
+
+func (x *RaftAdminPromoteLearnerRequest) GetSkipMinAppliedCheck() bool {
+	if x != nil {
+		return x.SkipMinAppliedCheck
+	}
+	return false
 }
 
 type RaftAdminRemoveServerRequest struct {
@@ -2262,11 +2276,12 @@ const file_service_proto_rawDesc = "" +
 	"\x1aRaftAdminAddLearnerRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12%\n" +
-	"\x0eprevious_index\x18\x03 \x01(\x04R\rpreviousIndex\"\x83\x01\n" +
+	"\x0eprevious_index\x18\x03 \x01(\x04R\rpreviousIndex\"\xb8\x01\n" +
 	"\x1eRaftAdminPromoteLearnerRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0eprevious_index\x18\x02 \x01(\x04R\rpreviousIndex\x12*\n" +
-	"\x11min_applied_index\x18\x03 \x01(\x04R\x0fminAppliedIndex\"U\n" +
+	"\x11min_applied_index\x18\x03 \x01(\x04R\x0fminAppliedIndex\x123\n" +
+	"\x16skip_min_applied_check\x18\x04 \x01(\bR\x13skipMinAppliedCheck\"U\n" +
 	"\x1cRaftAdminRemoveServerRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0eprevious_index\x18\x02 \x01(\x04R\rpreviousIndex\"<\n" +

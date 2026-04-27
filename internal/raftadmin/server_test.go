@@ -38,9 +38,10 @@ type fakeAddVoterCall struct {
 }
 
 type fakePromoteLearnerCall struct {
-	id              string
-	prevIndex       uint64
-	minAppliedIndex uint64
+	id                  string
+	prevIndex           uint64
+	minAppliedIndex     uint64
+	skipMinAppliedCheck bool
 }
 
 type fakeRemoveServerCall struct {
@@ -110,10 +111,15 @@ func (f *fakeEngine) AddLearner(_ context.Context, id string, address string, pr
 	return 33, nil
 }
 
-func (f *fakeEngine) PromoteLearner(_ context.Context, id string, prevIndex uint64, minAppliedIndex uint64) (uint64, error) {
+func (f *fakeEngine) PromoteLearner(_ context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.promoteLearnerCalls = append(f.promoteLearnerCalls, fakePromoteLearnerCall{id: id, prevIndex: prevIndex, minAppliedIndex: minAppliedIndex})
+	f.promoteLearnerCalls = append(f.promoteLearnerCalls, fakePromoteLearnerCall{
+		id:                  id,
+		prevIndex:           prevIndex,
+		minAppliedIndex:     minAppliedIndex,
+		skipMinAppliedCheck: skipMinAppliedCheck,
+	})
 	return 44, nil
 }
 

@@ -125,6 +125,7 @@ var (
 	errPromoteLearnerNotLearner     = errors.New("etcd raft promote-learner target is not a learner")
 	errPromoteLearnerNoProgress     = errors.New("etcd raft promote-learner target has no leader-side progress entry")
 	errPromoteLearnerNotCaughtUp    = errors.New("etcd raft promote-learner target has not caught up to min_applied_index")
+	errPromoteLearnerMinAppliedZero = errors.New("etcd raft promote-learner requires min_applied_index>0 unless skip_min_applied_check is set")
 )
 
 // joinRoleViolationCount counts the number of times the join-as-learner
@@ -360,12 +361,17 @@ type adminRequest struct {
 	id  uint64
 	// minAppliedIndex is the PromoteLearner precondition: the learner's
 	// Progress.Match on the leader must reach this index before the
-	// promotion proposal is submitted. Zero means skip the check.
+	// promotion proposal is submitted.
 	minAppliedIndex uint64
-	action          adminAction
-	peer            Peer
-	prevIndex       uint64
-	done            chan adminResult
+	// skipMinAppliedCheck explicitly opts out of the precondition.
+	// Required when minAppliedIndex == 0; otherwise the engine
+	// rejects the request with errPromoteLearnerMinAppliedZero so a
+	// missing argument cannot silently disable the safety check.
+	skipMinAppliedCheck bool
+	action              adminAction
+	peer                Peer
+	prevIndex           uint64
+	done                chan adminResult
 }
 
 type adminResult struct {
@@ -1076,20 +1082,27 @@ func (e *Engine) AddLearner(ctx context.Context, id string, address string, prev
 }
 
 // PromoteLearner promotes an existing learner to voter via V1
-// ConfChangeAddNode. The minAppliedIndex precondition (when non-zero)
-// rejects the call if the learner's leader-side Progress.Match has
-// not reached that index yet, so an operator who promotes too eagerly
-// gets a clean FailedPrecondition error instead of a silent quorum
-// stall.
-func (e *Engine) PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64) (uint64, error) {
+// ConfChangeAddNode. The minAppliedIndex precondition rejects the
+// call if the learner's leader-side Progress.Match has not reached
+// that index yet, so an operator who promotes too eagerly gets a
+// clean FailedPrecondition error instead of a silent quorum stall.
+//
+// minAppliedIndex == 0 is rejected unless skipMinAppliedCheck is
+// also true. Set skipMinAppliedCheck only when the catch-up has
+// been confirmed out-of-band.
+func (e *Engine) PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error) {
 	if id == "" {
 		return 0, errors.WithStack(errPeerIDRequired)
 	}
+	if minAppliedIndex == 0 && !skipMinAppliedCheck {
+		return 0, errors.WithStack(errPromoteLearnerMinAppliedZero)
+	}
 	result, err := e.submitAdminEx(ctx, adminRequest{
-		action:          adminActionPromoteLearner,
-		peer:            Peer{ID: id},
-		prevIndex:       prevIndex,
-		minAppliedIndex: minAppliedIndex,
+		action:              adminActionPromoteLearner,
+		peer:                Peer{ID: id},
+		prevIndex:           prevIndex,
+		minAppliedIndex:     minAppliedIndex,
+		skipMinAppliedCheck: skipMinAppliedCheck,
 	})
 	if err != nil {
 		return 0, err
@@ -1455,7 +1468,14 @@ func (e *Engine) handlePromoteLearner(req adminRequest) {
 		req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNotLearner, "id=%q", req.peer.ID)}
 		return
 	}
-	if req.minAppliedIndex != 0 {
+	// PromoteLearner gates on a minAppliedIndex catch-up check by
+	// default; only an explicit skipMinAppliedCheck disables it. The
+	// engine-side guard in PromoteLearner already rejects
+	// minAppliedIndex == 0 without skipMinAppliedCheck, so by the
+	// time we reach the apply-loop handler one of these is true:
+	//   * minAppliedIndex > 0  -> verify against Progress.Match
+	//   * skipMinAppliedCheck  -> caller has confirmed out-of-band
+	if !req.skipMinAppliedCheck {
 		// rawNode.Status() is safe here: handlePromoteLearner runs on
 		// the same goroutine that owns rawNode, so no clone or lock
 		// is required.
@@ -2730,8 +2750,25 @@ func (e *Engine) currentConfigIndex() uint64 {
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {
+	// Count VOTERS in the current configuration, not all servers --
+	// a learner does not vote and must not block the single-voter
+	// fast-path Campaign(). After learner support landed,
+	// len(cfg.Servers) includes learners, so the previous check
+	// would skip Campaign() in a 1-voter + N-learner cluster on
+	// restart and incur a full electionTimeout latency for no
+	// reason. See docs/design/2026_04_26_proposed_raft_learner.md
+	// §4.6 / §3.3 (the audit of len(e.peers) overloads).
 	cfg := e.currentConfiguration()
-	return len(cfg.Servers) == 1 && cfg.Servers[0].ID == e.localID
+	var soleVoter raftengine.Server
+	voterCount := 0
+	for _, s := range cfg.Servers {
+		if s.Suffrage != SuffrageVoter {
+			continue
+		}
+		voterCount++
+		soleVoter = s
+	}
+	return voterCount == 1 && soleVoter.ID == e.localID
 }
 
 func (e *Engine) resolveAdminPeer(id string, address string) (Peer, error) {

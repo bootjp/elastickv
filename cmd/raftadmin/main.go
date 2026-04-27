@@ -20,21 +20,22 @@ import (
 )
 
 const (
-	defaultRPCTimeoutSeconds = 5
-	minCommandArgs           = 2
-	addVoterArgCount         = 2
-	addLearnerArgCount       = 2
-	promoteLearnerArgCount   = 1
-	transferArgCount         = 2
-	addVoterPrevIndex        = 2
-	addLearnerPrevIndex      = 2
-	promoteLearnerPrevIndex  = 1
-	promoteLearnerMinApplied = 2
-	removePrevIndex          = 1
-	timeoutEnv               = "RAFTADMIN_RPC_TIMEOUT_SECONDS"
-	allowInsecureEnv         = "RAFTADMIN_ALLOW_INSECURE"
-	tlsEnv                   = "RAFTADMIN_TLS"
-	tlsCACertEnv             = "RAFTADMIN_TLS_CA_CERT"
+	defaultRPCTimeoutSeconds   = 5
+	minCommandArgs             = 2
+	addVoterArgCount           = 2
+	addLearnerArgCount         = 2
+	promoteLearnerArgCount     = 1
+	transferArgCount           = 2
+	addVoterPrevIndex          = 2
+	addLearnerPrevIndex        = 2
+	promoteLearnerPrevIndex    = 1
+	promoteLearnerMinApplied   = 2
+	promoteLearnerSkipCheckArg = 3
+	removePrevIndex            = 1
+	timeoutEnv                 = "RAFTADMIN_RPC_TIMEOUT_SECONDS"
+	allowInsecureEnv           = "RAFTADMIN_ALLOW_INSECURE"
+	tlsEnv                     = "RAFTADMIN_TLS"
+	tlsCACertEnv               = "RAFTADMIN_TLS_CA_CERT"
 )
 
 func main() {
@@ -294,7 +295,7 @@ func addLearner(ctx context.Context, client pb.RaftAdminClient, args []string) e
 }
 
 func promoteLearner(ctx context.Context, client pb.RaftAdminClient, args []string) error {
-	if len(args) < promoteLearnerArgCount || len(args) > promoteLearnerArgCount+2 {
+	if len(args) < promoteLearnerArgCount || len(args) > promoteLearnerArgCount+3 {
 		return usageError("promote_learner")
 	}
 	prevIndex, err := parseOptionalUint64(args, promoteLearnerPrevIndex)
@@ -305,16 +306,35 @@ func promoteLearner(ctx context.Context, client pb.RaftAdminClient, args []strin
 	if err != nil {
 		return err
 	}
+	skipMinApplied, err := parseOptionalBool(args, promoteLearnerSkipCheckArg)
+	if err != nil {
+		return err
+	}
 	resp, err := client.PromoteLearner(ctx, &pb.RaftAdminPromoteLearnerRequest{
-		Id:              args[0],
-		PreviousIndex:   prevIndex,
-		MinAppliedIndex: minApplied,
+		Id:                  args[0],
+		PreviousIndex:       prevIndex,
+		MinAppliedIndex:     minApplied,
+		SkipMinAppliedCheck: skipMinApplied,
 	})
 	if err != nil {
 		return errors.Wrap(err, "promote learner")
 	}
 	fmt.Printf("index: %d\n", resp.Index)
 	return nil
+}
+
+func parseOptionalBool(args []string, index int) (bool, error) {
+	if len(args) <= index {
+		return false, nil
+	}
+	switch args[index] {
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no", "":
+		return false, nil
+	default:
+		return false, errors.Errorf("invalid bool argument %q (want true/false)", args[index])
+	}
 }
 
 func removeServer(ctx context.Context, client pb.RaftAdminClient, args []string) error {
@@ -402,7 +422,7 @@ var usageStrings = map[string]string{
 	"config":                        "raftadmin <addr> configuration",
 	"add_voter":                     "raftadmin <addr> add_voter <id> <address> [previous_index]",
 	"add_learner":                   "raftadmin <addr> add_learner <id> <address> [previous_index]",
-	"promote_learner":               "raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index]",
+	"promote_learner":               "raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index] [skip_min_applied_check]",
 	"remove_server":                 "raftadmin <addr> remove_server <id> [previous_index]",
 	"leadership_transfer":           "raftadmin <addr> leadership_transfer",
 	"leadership_transfer_to_server": "raftadmin <addr> leadership_transfer_to_server <id> <address>",

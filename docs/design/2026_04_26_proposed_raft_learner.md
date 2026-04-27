@@ -16,7 +16,7 @@
 
 Today every member of an Elastickv Raft group is a voter. The only membership
 mutations exposed by the engine are `AddVoter` and `RemoveServer`
-(`internal/raftengine/engine.go:174`). That has three concrete consequences:
+(the `Admin` interface in `internal/raftengine/engine.go`). That has three concrete consequences:
 
 1. **Membership change is unsafe under load.** Adding a fresh node directly as a
    voter shrinks the effective fault tolerance of the group during catch-up:
@@ -57,7 +57,9 @@ dormant support on.
   CLI.
 - Report learner suffrage end-to-end. `Configuration.Servers[i].Suffrage`
   must be `"learner"` for learners and `"voter"` for voters; today it is
-  hard-coded to `"voter"` in two places (`engine.go:2656`, `engine.go:3096`).
+  hard-coded to `"voter"` in two places (`configurationFromConfState` and
+  `upsertPeer` in `internal/raftengine/etcd/engine.go`, where the helper
+  emits `Suffrage: "voter"` for every server).
 - Persist learner membership across restarts. The
   `etcd-raft-peers.bin` peer-metadata file must round-trip suffrage so that
   a node restarting from disk does not silently re-promote itself or
@@ -887,7 +889,8 @@ After Milestone 3, rename
    strongly recommends a non-zero value.
 4. **Learner cannot become leader by accident.** etcd/raft already
    enforces this; we inherit the property. The rejection path in
-   `handleTransferLeadership` (`engine.go:1387`) already documents it.
+   `handleTransferLeadership` already documents it (rejects transfer to
+   a learner via `errLeadershipTransferRejected`).
 5. **Cold bootstrap with a learner-only member list.** Reject explicitly
    with a typed error rather than relying on the underlying library to
    refuse. Otherwise an operator who specifies a learner-only bootstrap
@@ -906,15 +909,16 @@ After Milestone 3, rename
    absolute form is simpler to validate; the tolerance form is easier
    for an operator to choose. Current proposal: absolute, with a
    helper in the runbook that computes "current leader commit minus N".
-3. **`min_applied_index = 0` footgun.** The proposal accepts `0` as
-   "skip the precondition" to stay symmetric with `prevIndex` on the
-   same RPC family. But `prevIndex == 0` is a common no-op skip
-   pattern, while `min_applied_index == 0` semantically *removes the
-   primary safety check* of the promote operation. If a future
-   reviewer wants the safer ergonomics, the alternative is a separate
-   `bool skip_min_applied_check` field with a default of `false`,
-   forcing operators to opt in explicitly. Tracked here so it is not
-   discovered post-implementation.
+3. ~~**`min_applied_index = 0` footgun.**~~ **Resolved in M2.** The
+   `RaftAdminPromoteLearnerRequest` and the `Admin.PromoteLearner`
+   engine API both carry an explicit `skip_min_applied_check`
+   boolean. The engine rejects `min_applied_index == 0` with
+   `errPromoteLearnerMinAppliedZero` unless the skip flag is also
+   set, so a script that omits the catch-up bound gets a clean
+   `FailedPrecondition` instead of silently disabling the safety
+   check. The `prevIndex == 0` symmetry is preserved (it remains a
+   no-op skip — which is benign since `prevIndex` is just a
+   sequencing guard, not a safety check).
 4. Do we want a `--raftBootstrapMembers` syntax extension to mark
    bootstrap members as learners? Current proposal: **no**. Cold
    bootstrap is voter-only; learners enter exclusively via

@@ -134,10 +134,11 @@ a busy cluster, allow more slack.
 ### 5. Promote the learner to voter
 
 ```sh
-raftadmin <leader-addr> promote_learner <id> [previous_index] [min_applied_index]
+raftadmin <leader-addr> promote_learner <id> [previous_index] [min_applied_index] [skip_min_applied_check]
 ```
 
-The recommended invocation **always** passes `min_applied_index`:
+The recommended invocation **always** passes a non-zero
+`min_applied_index`:
 
 ```sh
 LEADER_COMMIT=$(...)              # latest leader commit_index
@@ -154,10 +155,19 @@ The leader runs both preconditions on the single-threaded admin loop
    If the learner has not caught up, the leader returns
    `FailedPrecondition: ... target has not caught up to min_applied_index`.
 
-`min_applied_index = 0` skips the catch-up check. **Do not use 0 in
-production.** It is accepted for symmetry with `previous_index` on
-the same RPC family but it removes the primary safety check of
-promote (see design §8 open question 3).
+If `min_applied_index = 0` and `skip_min_applied_check` is not set,
+the engine rejects the request with
+`FailedPrecondition: ... requires min_applied_index>0 unless skip_min_applied_check is set`.
+This is intentional: it forces an operator who copy-pastes a script
+that forgets the catch-up bound to make an explicit decision, rather
+than silently disabling the primary safety check of the promote
+operation.
+
+The `skip_min_applied_check=true` escape hatch exists for bootstrap-
+time scaffolding where the operator has confirmed catch-up
+out-of-band (e.g., by inspecting `raftadmin <learner-addr> state`).
+**Do not use it in normal production runs** — pass a real
+`min_applied_index` instead.
 
 After a successful promote, `raftadmin configuration` shows the peer
 with `suffrage: "voter"` and the cluster's voter count has grown by

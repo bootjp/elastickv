@@ -101,7 +101,7 @@ func (s *Server) PromoteLearner(ctx context.Context, req *pb.RaftAdminPromoteLea
 	if req == nil || req.Id == "" {
 		return nil, grpcStatus(codes.InvalidArgument, "id is required")
 	}
-	index, err := s.admin.PromoteLearner(ctx, req.Id, req.PreviousIndex, req.MinAppliedIndex)
+	index, err := s.admin.PromoteLearner(ctx, req.Id, req.PreviousIndex, req.MinAppliedIndex, req.SkipMinAppliedCheck)
 	if err != nil {
 		return nil, adminError(err)
 	}

@@ -101,7 +101,11 @@ func TestPromoteLearnerSwapsRoleToVoter(t *testing.T) {
 		return len(nodes[1].fsm.Applied()) == 1
 	}, 5*time.Second, 20*time.Millisecond)
 
-	promoteIndex, err := leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, 0)
+	// We just propagated "warm" to the learner; use that committed
+	// commit index as the catch-up bar so promotion is gated on the
+	// learner having actually applied something.
+	leaderStatus := leader.engine.Status()
+	promoteIndex, err := leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, leaderStatus.CommitIndex, false)
 	require.NoError(t, err)
 	require.Greater(t, promoteIndex, addIndex)
 
@@ -140,9 +144,36 @@ func TestPromoteLearnerRejectsNonLearner(t *testing.T) {
 	require.NoError(t, err)
 	waitForConfigSize(t, leader.engine, 2)
 
-	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, 0, 0)
+	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, 0, 0, true)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errPromoteLearnerNotLearner), "expected errPromoteLearnerNotLearner, got %v", err)
+}
+
+// TestPromoteLearnerRejectsZeroMinAppliedWithoutSkip is the §8 open
+// question 3 fix: passing min_applied_index=0 without
+// skip_min_applied_check returns a clean FailedPrecondition rather
+// than silently disabling the catch-up safety check.
+func TestPromoteLearnerRejectsZeroMinAppliedWithoutSkip(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 2)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+	require.NoError(t, openTransportTestNode(ctx, nodes[1], peers, false))
+
+	addIndex, err := leader.engine.AddLearner(ctx, nodes[1].peer.ID, nodes[1].peer.Address, 0)
+	require.NoError(t, err)
+	waitForConfigSize(t, leader.engine, 2)
+
+	// minApplied=0, skip=false  ->  rejected up-front before any
+	// rawNode interaction.
+	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, 0, false)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errPromoteLearnerMinAppliedZero), "expected errPromoteLearnerMinAppliedZero, got %v", err)
 }
 
 // TestPromoteLearnerRejectsNotCaughtUp ensures the
@@ -165,7 +196,7 @@ func TestPromoteLearnerRejectsNotCaughtUp(t *testing.T) {
 
 	// Demand catch-up to a future index that has not been committed.
 	const unreachableIndex = uint64(1 << 60)
-	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, unreachableIndex)
+	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, unreachableIndex, false)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errPromoteLearnerNotCaughtUp), "expected errPromoteLearnerNotCaughtUp, got %v", err)
 }

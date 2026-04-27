@@ -183,12 +183,15 @@ type Admin interface {
 	// PromoteLearner promotes an existing learner to voter. The
 	// minAppliedIndex precondition is enforced against the leader's
 	// Progress[nodeID].Match before the conf change is proposed: if
-	// non-zero and the learner has not yet caught up to that index,
-	// the call returns FailedPrecondition. minAppliedIndex == 0 skips
-	// the precondition (kept for symmetry with prevIndex on this RPC
-	// family but is a footgun — operators should pass a recent leader
-	// commit index in normal use).
-	PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64) (uint64, error)
+	// the learner has not yet caught up to that index, the call
+	// returns FailedPrecondition.
+	//
+	// minAppliedIndex == 0 is REJECTED unless skipMinAppliedCheck is
+	// also true, so an operator running a copy-pasted script that
+	// omits the catch-up check gets a clean FailedPrecondition
+	// instead of a silent quorum stall. Set skipMinAppliedCheck only
+	// when the catch-up has been confirmed out-of-band.
+	PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error)
 	RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 	TransferLeadership(ctx context.Context) error
 	TransferLeadershipToServer(ctx context.Context, id string, address string) error

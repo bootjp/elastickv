@@ -84,14 +84,17 @@ func writeV1PeerEntry(w io.Writer, peer Peer) error {
 	return writeString(w, peer.Address)
 }
 
-func TestPersistedPeersV2RewritesAfterV1Read(t *testing.T) {
+// TestPersistedPeersWriterAlwaysEmitsV2 pins the writer-side
+// invariant that savePersistedPeers writes the v2 header and per-peer
+// suffrage byte even when the input peers carry no explicit
+// Suffrage. There is no v1->v2 read-side migration step in this
+// path; the writer is unconditionally v2.
+func TestPersistedPeersWriterAlwaysEmitsV2(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, savePersistedPeers(dir, 1, []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
 	}))
 
-	// First saved file is already v2 because the writer always emits v2.
-	// Verify by reading the version field directly.
 	file, err := os.Open(filepath.Join(dir, peersFileName))
 	require.NoError(t, err)
 	defer func() { _ = file.Close() }()
@@ -100,6 +103,50 @@ func TestPersistedPeersV2RewritesAfterV1Read(t *testing.T) {
 	version, err := readPeersFileHeader(reader)
 	require.NoError(t, err)
 	require.Equal(t, peersFileVersionV2, version)
+}
+
+// TestPersistedPeersV2UnknownSuffrageRejected pins the validation in
+// readPersistedPeer that rejects suffrage bytes outside the known
+// (0=voter, 1=learner) set, so a future binary that introduces a new
+// suffrage variant cannot silently coerce its peers to voter on a
+// build that does not understand the new value.
+func TestPersistedPeersV2UnknownSuffrageRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := peersFilePath(dir)
+
+	require.NoError(t, replaceFile(path, func(w io.Writer) error {
+		writer := bufio.NewWriter(w)
+		if _, err := writer.Write(peersFileMagic[:]); err != nil {
+			return err
+		}
+		if err := writeU32(writer, peersFileVersionV2); err != nil {
+			return err
+		}
+		if err := writeU64(writer, 1); err != nil {
+			return err
+		}
+		if err := writeU32(writer, 1); err != nil {
+			return err
+		}
+		// peer entry with an unknown suffrage byte.
+		if err := writeU64(writer, 1); err != nil {
+			return err
+		}
+		if err := writeU8(writer, 0xFF); err != nil {
+			return err
+		}
+		if err := writeString(writer, "n1"); err != nil {
+			return err
+		}
+		if err := writeString(writer, "127.0.0.1:7001"); err != nil {
+			return err
+		}
+		return writer.Flush()
+	}))
+
+	_, _, err := LoadPersistedPeers(dir)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown peer suffrage byte")
 }
 
 func TestPersistedPeersUnknownVersionRejected(t *testing.T) {
