@@ -18,7 +18,7 @@ func TestBucketStore_DefaultOff_ShortCircuit(t *testing.T) {
 	t.Parallel()
 	store := newBucketStoreDefault()
 	for range 100 {
-		out := store.charge(nil, "orders", bucketActionSend, 1)
+		out := store.charge(nil, "orders", bucketActionSend, 1, 1)
 		require.True(t, out.allowed)
 		require.False(t, out.bucketPresent, "nil cfg must not allocate a bucket")
 	}
@@ -31,7 +31,7 @@ func TestBucketStore_DefaultOff_ShortCircuit(t *testing.T) {
 func TestBucketStore_Empty_ShortCircuit(t *testing.T) {
 	t.Parallel()
 	store := newBucketStoreDefault()
-	out := store.charge(&sqsQueueThrottle{}, "orders", bucketActionSend, 1)
+	out := store.charge(&sqsQueueThrottle{}, "orders", bucketActionSend, 1, 1)
 	require.True(t, out.allowed)
 	require.False(t, out.bucketPresent)
 }
@@ -47,10 +47,10 @@ func TestBucketStore_FreshAllowsUpToCapacity(t *testing.T) {
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	for i := range 10 {
-		out := store.charge(cfg, "orders", bucketActionSend, 1)
+		out := store.charge(cfg, "orders", bucketActionSend, 1, 1)
 		require.True(t, out.allowed, "send %d must be allowed", i+1)
 	}
-	out := store.charge(cfg, "orders", bucketActionSend, 1)
+	out := store.charge(cfg, "orders", bucketActionSend, 1, 1)
 	require.False(t, out.allowed, "11th send must be rejected")
 	require.Equal(t, time.Second, out.retryAfter, "Retry-After floor is 1s")
 }
@@ -66,17 +66,17 @@ func TestBucketStore_RefillBetweenChargesUsesElapsed(t *testing.T) {
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	// Drain.
 	for range 10 {
-		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	}
-	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	// Advance 1.5s → 7.5 tokens accrued (capped under capacity 10).
 	now = now.Add(1500 * time.Millisecond)
 	for range 7 {
-		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed,
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
 			"after 1.5s refill at 5 RPS, 7 sends must succeed")
 	}
 	// 8th must reject — only 7.5 tokens accrued, charged 7, leaves 0.5.
-	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 }
 
 // TestBucketStore_RefillCapsAtCapacity pins the upper bound on
@@ -87,12 +87,12 @@ func TestBucketStore_RefillCapsAtCapacity(t *testing.T) {
 	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, 2*time.Hour)
-	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	now = now.Add(time.Hour) // 3600 seconds, would be 3600 tokens uncapped
 	for range 10 {
-		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	}
-	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed,
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
 		"refill capped at capacity: 11th send post-idle must reject")
 }
 
@@ -109,16 +109,16 @@ func TestBucketStore_BatchRejectsWholeBatchWhenShort(t *testing.T) {
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	// Drain to 3.
 	for range 7 {
-		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	}
 	// Try a 10-entry batch — should reject without consuming the 3.
-	out := store.charge(cfg, "orders", bucketActionSend, 10)
+	out := store.charge(cfg, "orders", bucketActionSend, 1, 10)
 	require.False(t, out.allowed)
 	require.Equal(t, 7*time.Second, out.retryAfter,
 		"Retry-After computed from (10-3)/1 = 7s")
 	// The 3 leftover tokens are still spendable.
 	for range 3 {
-		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed,
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
 			"the rejected batch must not have drained the leftover credit")
 	}
 }
@@ -134,10 +134,10 @@ func TestBucketStore_RetryAfterUsesRequestedCount(t *testing.T) {
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	for range 10 {
-		store.charge(cfg, "orders", bucketActionSend, 1)
+		store.charge(cfg, "orders", bucketActionSend, 1, 1)
 	}
 	// Now batch of 10 against an empty bucket: needs 10s to refill.
-	out := store.charge(cfg, "orders", bucketActionSend, 10)
+	out := store.charge(cfg, "orders", bucketActionSend, 1, 10)
 	require.False(t, out.allowed)
 	require.Equal(t, 10*time.Second, out.retryAfter)
 }
@@ -152,9 +152,9 @@ func TestBucketStore_RetryAfterFloorWithSlowRefill(t *testing.T) {
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	for range 10 {
-		store.charge(cfg, "orders", bucketActionSend, 1)
+		store.charge(cfg, "orders", bucketActionSend, 1, 1)
 	}
-	out := store.charge(cfg, "orders", bucketActionSend, 1)
+	out := store.charge(cfg, "orders", bucketActionSend, 1, 1)
 	require.False(t, out.allowed)
 	require.Equal(t, 10*time.Second, out.retryAfter)
 }
@@ -172,12 +172,12 @@ func TestBucketStore_ActionsHaveSeparateBuckets(t *testing.T) {
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	// Drain Send.
 	for range 10 {
-		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	}
-	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	// Recv must still have full capacity.
 	for range 10 {
-		require.True(t, store.charge(cfg, "orders", bucketActionReceive, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionReceive, 1, 1).allowed)
 	}
 }
 
@@ -189,12 +189,12 @@ func TestBucketStore_QueuesHaveSeparateBuckets(t *testing.T) {
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	for range 10 {
-		store.charge(cfg, "orders", bucketActionSend, 1)
+		store.charge(cfg, "orders", bucketActionSend, 1, 1)
 	}
-	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	// Other queue, same cfg → fresh bucket.
 	for range 10 {
-		require.True(t, store.charge(cfg, "events", bucketActionSend, 1).allowed)
+		require.True(t, store.charge(cfg, "events", bucketActionSend, 1, 1).allowed)
 	}
 }
 
@@ -209,12 +209,12 @@ func TestBucketStore_DefaultBucketCovers(t *testing.T) {
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	for range 5 {
-		require.True(t, store.charge(cfg, "orders", bucketActionAny, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionAny, 1, 1).allowed)
 	}
-	require.False(t, store.charge(cfg, "orders", bucketActionAny, 1).allowed)
+	require.False(t, store.charge(cfg, "orders", bucketActionAny, 1, 1).allowed)
 	// And Send falls through to Default too when only Default is set.
 	for range 5 {
-		require.False(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed,
+		require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
 			"Send falls through to Default which is empty")
 	}
 }
@@ -234,20 +234,20 @@ func TestBucketStore_ReconcilesBucketOnConfigChange(t *testing.T) {
 	cfgOld := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
 	// Drain the old bucket entirely.
 	for range 10 {
-		require.True(t, store.charge(cfgOld, "orders", bucketActionSend, 1).allowed)
+		require.True(t, store.charge(cfgOld, "orders", bucketActionSend, 1, 1).allowed)
 	}
-	require.False(t, store.charge(cfgOld, "orders", bucketActionSend, 1).allowed,
+	require.False(t, store.charge(cfgOld, "orders", bucketActionSend, 1, 1).allowed,
 		"sanity: old config bucket exhausted")
 	// Now charge with a NEW config — capacity 100, refill 50. The
 	// bucket reconciliation must spot the cap/refill mismatch and
 	// rebuild a fresh bucket at the new full capacity.
 	cfgNew := &sqsQueueThrottle{SendCapacity: 100, SendRefillPerSecond: 50}
 	for range 100 {
-		require.True(t, store.charge(cfgNew, "orders", bucketActionSend, 1).allowed,
+		require.True(t, store.charge(cfgNew, "orders", bucketActionSend, 1, 1).allowed,
 			"new config charge must succeed against a fresh bucket; stale-bucket bug would reject")
 	}
 	// 101st must reject under the new cap.
-	require.False(t, store.charge(cfgNew, "orders", bucketActionSend, 1).allowed)
+	require.False(t, store.charge(cfgNew, "orders", bucketActionSend, 1, 1).allowed)
 }
 
 // TestBucketStore_ConcurrentReconciliationRespectsNewCapacity pins
@@ -275,7 +275,7 @@ func TestBucketStore_ConcurrentReconciliationRespectsNewCapacity(t *testing.T) {
 	// Seed the store with a stale bucket from cfgOld.
 	cfgOld := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
 	for range 5 {
-		require.True(t, store.charge(cfgOld, "orders", bucketActionSend, 1).allowed)
+		require.True(t, store.charge(cfgOld, "orders", bucketActionSend, 1, 1).allowed)
 	}
 
 	// Now race many goroutines through the new config. Each charge
@@ -296,7 +296,7 @@ func TestBucketStore_ConcurrentReconciliationRespectsNewCapacity(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if store.charge(cfgNew, "orders", bucketActionSend, 1).allowed {
+			if store.charge(cfgNew, "orders", bucketActionSend, 1, 1).allowed {
 				mu.Lock()
 				successes++
 				mu.Unlock()
@@ -341,8 +341,8 @@ func TestBucketStore_SweepRaceDoesNotInflateBudget(t *testing.T) {
 	// so refill cannot top up tokens during the race — every charge
 	// either spends an existing token or fails, making the total-
 	// success count a tight bound on the burst budget.
-	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
-	key := bucketKey{queue: "orders", action: bucketActionSend}
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
+	key := bucketKey{queue: "orders", action: bucketActionSend, generation: 1}
 	v, ok := store.buckets.Load(key)
 	require.True(t, ok)
 	bucket, _ := v.(*tokenBucket)
@@ -366,7 +366,7 @@ func TestBucketStore_SweepRaceDoesNotInflateBudget(t *testing.T) {
 	for range chargers {
 		go func() {
 			defer wg.Done()
-			if store.charge(cfg, "orders", bucketActionSend, 1).allowed {
+			if store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed {
 				successes.Add(1)
 			}
 		}()
@@ -394,8 +394,8 @@ func TestBucketStore_OrphanedBucketRetriesToLiveEntry(t *testing.T) {
 	clk := now
 	store := newBucketStore(func() time.Time { return clk }, time.Hour)
 	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
-	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
-	key := bucketKey{queue: "orders", action: bucketActionSend}
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
+	key := bucketKey{queue: "orders", action: bucketActionSend, generation: 1}
 	v, ok := store.buckets.Load(key)
 	require.True(t, ok)
 	original, _ := v.(*tokenBucket)
@@ -417,7 +417,7 @@ func TestBucketStore_OrphanedBucketRetriesToLiveEntry(t *testing.T) {
 	// A charge against the live store reaches a fresh bucket via the
 	// loadOrInit path; any goroutine still holding the orphan would
 	// retry through chargeBucket's evicted check and converge here.
-	out := store.charge(cfg, "orders", bucketActionSend, 1)
+	out := store.charge(cfg, "orders", bucketActionSend, 1, 1)
 	require.True(t, out.allowed)
 	v2, ok := store.buckets.Load(key)
 	require.True(t, ok)
@@ -434,8 +434,8 @@ func TestBucketStore_InvalidateMarksOrphanEvicted(t *testing.T) {
 	t.Parallel()
 	store := newBucketStoreDefault()
 	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
-	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
-	key := bucketKey{queue: "orders", action: bucketActionSend}
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
+	key := bucketKey{queue: "orders", action: bucketActionSend, generation: 1}
 	v, ok := store.buckets.Load(key)
 	require.True(t, ok)
 	original, _ := v.(*tokenBucket)
@@ -475,7 +475,7 @@ func TestBucketStore_InvalidateUnderConcurrencyIsRaceFree(t *testing.T) {
 	cfg := &sqsQueueThrottle{SendCapacity: capacity, SendRefillPerSecond: 1}
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
-	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 
 	var wg sync.WaitGroup
 	const chargers = 64
@@ -490,7 +490,7 @@ func TestBucketStore_InvalidateUnderConcurrencyIsRaceFree(t *testing.T) {
 	for range chargers {
 		go func() {
 			defer wg.Done()
-			store.charge(cfg, "orders", bucketActionSend, 1)
+			store.charge(cfg, "orders", bucketActionSend, 1, 1)
 		}()
 	}
 	wg.Wait()
@@ -525,6 +525,81 @@ func TestThrottleAttributesPresent(t *testing.T) {
 // bucket belonging to the queue is dropped, even ones not currently
 // being charged. A future verb that grows a new bucket can't sneak
 // past invalidation by being wired into one site only.
+// TestBucketStore_GenerationKeyedDoesNotReuseAcrossIncarnations pins
+// the Codex P1 fix on PR #664: bucketKey includes generation so a
+// DeleteQueue+CreateQueue cycle (or a leadership move to a node
+// holding a stale per-process cache) lands the new incarnation under
+// a different map entry and starts from a fresh full bucket. Without
+// generation in the key, the recreated queue would inherit the
+// drained token state from the previous incarnation.
+//
+// charge signature is (cfg, queue, action, generation, count).
+func TestBucketStore_GenerationKeyedDoesNotReuseAcrossIncarnations(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Hour)
+	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
+	// Drain generation 1 entirely (5 successful charges of 1 token).
+	for range 5 {
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
+	}
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
+		"sanity: gen=1 bucket drained")
+	// Generation 2 (recreate) must start from a fresh full bucket
+	// regardless of what gen=1 left in cache. Stale-key code would
+	// keep rejecting on the same drained bucket.
+	for range 5 {
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 2, 1).allowed,
+			"gen=2 charge must succeed against a fresh bucket; "+
+				"shared-key bug would reuse gen=1's drained state")
+	}
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 2, 1).allowed,
+		"gen=2 bucket must enforce its own capacity once drained")
+	// gen=1's bucket should still be drained — the two incarnations
+	// must not cross-pollinate.
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
+		"gen=1 must remain drained; gen=2 charges must not refill gen=1")
+}
+
+// TestBucketStore_InvalidateQueueClearsAllGenerations pins that
+// invalidateQueue ranges by queue prefix and removes every cached
+// generation, not just one. Required because the leader's view of
+// "current generation" can drift from a follower's during a
+// failover-mid-CreateQueue, and an invalidate that only hit one
+// generation would leave the other side stale.
+func TestBucketStore_InvalidateQueueClearsAllGenerations(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Hour)
+	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
+	// Populate orders@gen=1, orders@gen=2, events@gen=1.
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 2, 1).allowed)
+	require.True(t, store.charge(cfg, "events", bucketActionSend, 1, 1).allowed)
+	require.Equal(t, 3, countBuckets(store))
+
+	store.invalidateQueue("orders")
+
+	// Both orders generations gone, events untouched.
+	require.Equal(t, 1, countBuckets(store),
+		"invalidateQueue must drop every generation belonging to the queue")
+	_, hasOrdersGen1 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, generation: 1})
+	_, hasOrdersGen2 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, generation: 2})
+	_, hasEvents := store.buckets.Load(bucketKey{queue: "events", action: bucketActionSend, generation: 1})
+	require.False(t, hasOrdersGen1)
+	require.False(t, hasOrdersGen2)
+	require.True(t, hasEvents, "unrelated queue must not be evicted")
+}
+
+func countBuckets(b *bucketStore) int {
+	n := 0
+	b.buckets.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
 func TestBucketStore_InvalidateQueueDropsAllActions(t *testing.T) {
 	t.Parallel()
 	cfg := &sqsQueueThrottle{
@@ -535,17 +610,17 @@ func TestBucketStore_InvalidateQueueDropsAllActions(t *testing.T) {
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	// Drain both buckets.
 	for range 10 {
-		store.charge(cfg, "orders", bucketActionSend, 1)
-		store.charge(cfg, "orders", bucketActionReceive, 1)
+		store.charge(cfg, "orders", bucketActionSend, 1, 1)
+		store.charge(cfg, "orders", bucketActionReceive, 1, 1)
 	}
-	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
-	require.False(t, store.charge(cfg, "orders", bucketActionReceive, 1).allowed)
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
+	require.False(t, store.charge(cfg, "orders", bucketActionReceive, 1, 1).allowed)
 	// Invalidate.
 	store.invalidateQueue("orders")
 	// Both buckets must now be at full capacity again.
 	for range 10 {
-		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
-		require.True(t, store.charge(cfg, "orders", bucketActionReceive, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
+		require.True(t, store.charge(cfg, "orders", bucketActionReceive, 1, 1).allowed)
 	}
 }
 
@@ -568,7 +643,7 @@ func TestBucketStore_ConcurrentChargesPreserveCount(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if store.charge(cfg, "orders", bucketActionSend, 1).allowed {
+			if store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed {
 				mu.Lock()
 				successes++
 				mu.Unlock()

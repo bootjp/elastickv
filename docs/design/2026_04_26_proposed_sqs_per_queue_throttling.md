@@ -90,8 +90,9 @@ type bucketStore struct {
 }
 
 type bucketKey struct {
-    queue  string
-    action string  // "Send" | "Receive" | "*"
+    queue      string
+    action     string // "Send" | "Receive" | "*"
+    generation uint64 // sqsQueueMeta.Generation; isolates incarnations.
 }
 
 type tokenBucket struct {
@@ -113,9 +114,11 @@ No global lock is held during step 3; concurrent traffic on different queues run
 
 **Cache invalidation on `SetQueueAttributes`**: when an operator updates the throttle config via `SetQueueAttributes`, the handler — *after* the Raft commit that persists the new `sqsQueueThrottle` — calls `buckets.Delete(key)` for every `bucketKey` belonging to the updated queue (`Send`, `Receive`, `*` — the canonical action values from the `bucketKey` struct above). Without this step the in-memory bucket would keep enforcing the old limits until the idle-eviction sweep removes the stale entry (default 1 h window), defeating the operator's intent to throttle a noisy tenant in real time. The `LoadOrStore` race with the `Delete` call is benign: the next request rebuilds from the freshly-committed meta, and the rebuilt bucket starts at full capacity (same semantics as the failover case documented below). Claude P1 on PR #664 caught the gap.
 
-**Cache invalidation on `DeleteQueue`**: when a queue is deleted, the handler — *after* the Raft commit that purges the queue meta — calls `buckets.Delete(key)` for every `bucketKey` belonging to the deleted queue (`Send`, `Receive`, `*` — the canonical action values from the `bucketKey` struct above), mirroring the `SetQueueAttributes` path above. Without this step, a `DeleteQueue` immediately followed by `CreateQueue` with the same name would inherit the previous incarnation's in-memory bucket (current token balance, capacity, refill rate) until the 1 h idle-eviction sweep removes the stale entry — so an operator using `DeleteQueue`+`CreateQueue` to reset a noisy queue's state would be surprised to see the old throttle still in effect. (Alternative considered: include the queue `generation` in `bucketKey` so old and new incarnations cannot collide structurally; the explicit `Delete` is cheaper and matches the `SetQueueAttributes` pattern, so for Phase 3.C we keep `bucketKey = (queueName, action)` per the struct definition above — the `partition` field is added later by Phase 3.D, see §4.3 — and document the lifecycle requirement here.) Claude P1 on PR #664 fifth-round review.
+**Cache invalidation on `DeleteQueue` / `CreateQueue`**: when a queue is deleted, the handler — *after* the Raft commit that purges the queue meta — calls `buckets.invalidateQueue(name)`, which ranges the map and drops every `bucketKey` whose `queue` matches (regardless of generation), mirroring the `SetQueueAttributes` path above. The `CreateQueue` handler invokes the same call after a genuine create commit (the idempotent-return path skips it) so a same-name recreate that races with in-flight stale-meta traffic still resets the bucket. Generation participates in the key (Codex P1 on PR #664 sixth-round review): a `DeleteQueue`+`CreateQueue` cycle bumps `sqsQueueMeta.Generation`, so the new incarnation lands at a different `bucketKey` and starts from a fresh full bucket regardless of any per-process cache the previous incarnation left behind on this or any other node. The two mechanisms are complementary — `invalidateQueue` is the cheap hot-path optimisation that keeps the in-memory map small, and the generation-keyed structure is the cross-leader correctness guarantee.
 
 The bucket map is per-process. On leader failover, a fresh bucket starts at full capacity on the new leader — there is no Raft replication of bucket state. **Why this is correct**: the worst-case behaviour of "fresh bucket on failover" is that a noisy queue gets one extra burst worth of bandwidth right after a leader change. Replicating bucket state would cost a Raft commit per token decrement, which would defeat the entire point of the token bucket. AWS's own rate limiter has the same property at region failover boundaries.
+
+**Cross-leader incarnation isolation**: a node that previously led a queue could keep an old `(queue, action, gen=N)` bucket in cache until idle eviction. After a `DeleteQueue`+`CreateQueue` cycle that bumps the generation to `N+1`, leadership for the recreated queue could move back to that node. With generation in `bucketKey`, the new incarnation lands at `(queue, action, gen=N+1)` — a key the cache has never seen, so the charge path mints a fresh bucket. The stale `gen=N` entry is unreachable (no traffic uses it any more) and falls out via the idle-eviction sweep. Without generation in the key, the old leader's stale bucket would silently service the new incarnation's traffic.
 
 Buckets are created lazily on first request. They self-evict after a configurable idle window (default 1h) so a queue that goes silent does not keep its bucket entry forever.
 
