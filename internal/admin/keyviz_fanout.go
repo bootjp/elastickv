@@ -353,14 +353,20 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 	// CLAUDE.md says "avoid //nolint — refactor instead", but the
-	// io.Reader contract is one place where the suppression is
-	// correct rather than lazy: json.Decoder uses `err == io.EOF`
-	// (pointer compare, not errors.Is) to decide whether to keep
-	// pulling, so wrapping the error with %w would silently break
-	// the decoder's stop condition. Refactoring is impossible
-	// here — the only options are pass-through-and-suppress (this)
-	// or wrap-and-break-the-decoder.
-	return n, err //nolint:wrapcheck // see comment above; cannot wrap io.Reader sentinels.
+	// io.Reader contract is the rare place where the suppression
+	// is correct rather than lazy: implementations are required to
+	// pass io.EOF through unwrapped so any caller that does
+	// `err == io.EOF` (pointer compare) keeps working. Wrapping
+	// with %w produces a different error value that pointer
+	// compare will not match, even though errors.Is would. The
+	// stdlib `encoding/json` historically did pointer compare;
+	// modern alternatives (`goccy/go-json` is the one this
+	// package uses) may use errors.Is, but the io.Reader contract
+	// holds independent of which consumer is in scope. Refactoring
+	// is impossible here — the only options are
+	// pass-through-and-suppress (this) or
+	// wrap-and-break-anyone-doing-pointer-compare.
+	return n, err //nolint:wrapcheck // io.Reader contract requires unwrapped sentinels.
 }
 
 // responseBodyLimit returns the per-peer JSON body cap. Tests can
