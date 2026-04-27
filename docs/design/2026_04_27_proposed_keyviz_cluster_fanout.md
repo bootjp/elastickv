@@ -20,8 +20,30 @@ writes.
 Parent design §9.1 defines the desired end state: the admin layer
 fans out to every node, merges responses with rules that respect
 Raft leadership, and renders one combined heatmap with degraded-node
-status surfaced inline. This proposal scopes a **minimum-viable
-Phase 2-C** that ships the operator-visible value (cluster-wide
+status surfaced inline.
+
+**Rollout notes** (Gemini round-1 PR #685 asked for explicit
+rolling-upgrade and zero-downtime cutover plans). This change is
+**off by default** (`--keyvizFanoutNodes` empty) and lives entirely
+on the admin path — no data-plane impact, no schema migration, no
+state stored on disk by this feature. Mixed-version clusters mid-
+rollout are correct by construction:
+
+- Wire format additions (§5) are forwards-compatible: an old node
+  that does not know about `Fanout` / `conflict` simply omits them
+  and the new aggregator treats the missing values as the merge-rule
+  identity. An old SPA against a new server ignores the extra
+  fields and renders the local view it always did.
+- Operators flip `--keyvizFanoutNodes` per-node during the rollout.
+  Until every node has the new binary AND the flag set, some peer
+  HTTP calls will 404 — that surfaces as `ok=false` in the
+  per-node status array, not as a failed user request.
+- No dual-write proxy / blue-green required because there is no
+  state to migrate; the worst-case partial deploy is "node X
+  reports `ok=false`", not data loss.
+
+This proposal scopes a **minimum-viable Phase 2-C** that ships the
+operator-visible value (cluster-wide
 heatmap, degraded-node banner) without requiring the full proto
 extension §9.1 calls for.
 
@@ -38,10 +60,12 @@ extension §9.1 calls for.
 - Two merge rules, justified in §4:
   - **Reads**: sum across nodes (each node serves distinct local
     follower reads).
-  - **Writes**: max across nodes, with a `conflict=true` flag on
-    cells where the per-node values disagree (best-effort dedup;
-    correct under stable leadership, conservative under leadership
-    flip).
+  - **Writes**: max across nodes, with a row-level `conflict=true`
+    flag raised when *any* per-node values disagreed for *any* cell
+    in the row (best-effort dedup; correct under stable leadership,
+    conservative under leadership flip). The flag is row-level for
+    Phase 2-C and moves to per-cell when the proto extension lands
+    in Phase 2-C+ — see §4.2 and §5 for the wire-format implication.
 - Degraded-mode response: when N nodes respond and M < N succeed,
   the response carries `{node, ok, error}` per node and the SPA
   shows a banner.
@@ -87,13 +111,22 @@ elastickv \
   network); the HTTP client uses `http://`. A follow-up will
   introduce `--keyvizFanoutTLS` once the rest of the admin path
   has TLS too.
-- The fan-out caller authenticates with the same admin session
-  cookie the upstream request carried. The `internal/admin`
-  middleware mints a short-lived inter-node token signed with the
-  shared admin secret (already used for browser sessions) so a
-  compromised browser cookie cannot be replayed beyond its TTL on
-  a peer node. Per-call timeout: `2 × keyvizStep` (default 2 s)
-  with `5 s` ceiling so a slow peer cannot hold the SPA poll open.
+- **Auth (Phase 2-C MVP)**: the fan-out path is anonymous — the
+  aggregator issues unauthenticated GETs to peers. This is only
+  acceptable on a fully-private intra-cluster network, which is
+  the contract `--keyvizFanoutNodes` documents. **Do NOT enable
+  fan-out across an untrusted network until Phase 2-C+ ships
+  proper auth.** Per-call timeout: 2 s default, override via
+  `--keyvizFanoutTimeout`.
+- **Auth (Phase 2-C+)**: a follow-up extends the fan-out path with
+  a short-lived signed token derived from the existing admin
+  session-signing key (`ELASTICKV_ADMIN_SESSION_SIGNING_KEY`).
+  Pre-shared inter-node token, NOT a replay of the browser's
+  session cookie — re-using the cookie would couple browser session
+  TTL to inter-node call validity, and a compromised browser
+  session would gain peer-call authority. The two paths are
+  intentionally distinct. The earlier draft of this section
+  conflated them; this paragraph supersedes it.
 
 ## 4. Merge rules
 
@@ -160,13 +193,24 @@ response.
 
 ### 4.5 Time alignment
 
-All nodes use `keyvizStep` (default 1 s) so `column_unix_ms`
-arrays line up modulo clock skew. The aggregator pivots on
-`column_unix_ms[i]` exactly: a column present in node A but
-absent in node B contributes only A's values for that timestamp,
-with B's missing column treated as zero. Operators with NTP
-drift > Step should fix NTP — the heatmap is not designed to
-hide clock skew.
+All nodes use `keyvizStep` (default 1 s). The aggregator **bucket-
+aligns** column timestamps to the nearest `keyvizStep` boundary
+before pivoting, so two nodes whose flush goroutines fire fractions
+of a second apart still land on the same merged column. Without
+the alignment step a 50 ms NTP skew would split each window into
+two adjacent merged columns, halving the displayed traffic in each.
+
+Specifics:
+
+- Both sides round `column_unix_ms[i]` down to the nearest
+  multiple of `keyvizStep_ms` before merging.
+- A column present in node A but absent in node B contributes
+  only A's values for that bucket — B's missing column reads as
+  zero (the merge-rule identity).
+- Drift larger than `keyvizStep / 2` between nodes is still an
+  operator problem (the heatmap should not paper over NTP issues
+  that big), but routine sub-step jitter no longer causes column
+  fragmentation. (Gemini round-1 PR #685.)
 
 ## 5. Wire format
 
@@ -190,15 +234,24 @@ no breaking changes — old SPA versions keep working):
   // NEW fan-out metadata; absent when fan-out is disabled.
   "fanout": {
     "nodes": [
-      {"node": "10.0.0.1:8080", "ok": true,  "error": ""},
-      {"node": "10.0.0.2:8080", "ok": true,  "error": ""},
-      {"node": "10.0.0.3:8080", "ok": false, "error": "context deadline exceeded"}
+      {"node": "10.0.0.1:8080", "ok": true,  "error": "", "warnings": []},
+      {"node": "10.0.0.2:8080", "ok": true,  "error": "",
+        "warnings": [{"code": "catalog_divergence", "bucket_id": "route:42",
+                      "detail": "start/end disagree with prior node"}]},
+      {"node": "10.0.0.3:8080", "ok": false, "error": "context deadline exceeded", "warnings": []}
     ],
     "responded": 2,
     "expected": 3
   }
 }
 ```
+
+`warnings` is a per-node array of structured non-fatal signals.
+Today the only emitter is `catalog_divergence` (§4.4 — `Start`/`End`
+disagree across nodes for the same `BucketID`). Adding a new
+warning code is a wire-format extension, not a breaking change:
+old SPAs render the entry as a generic warning until they teach
+themselves the new code. (Codex round-1 PR #685.)
 
 `conflict` is per row — a coarser signal than parent §9.1's
 per-cell flag. The cell-level flag will land with the
@@ -262,7 +315,14 @@ PR 3 (Phase 2-C+):
    budget × 3 nodes × 60 columns this is ~180k cells per
    request — well below the SPA's existing render budget. No
    coordinated round trip per `Observe`; the existing hot path is
-   not touched.
+   not touched. **Per-peer response body is capped at 64 MiB**
+   via `io.LimitReader` — a misbehaving or compromised peer that
+   streams gigabytes back at us would otherwise pin a goroutine
+   on the JSON decoder and balloon memory; the cap is generous
+   enough for the worst-case design payload (1024 rows × 4096
+   columns × ~32 B per uint64 ≈ 128 MiB raw, ~32 MiB
+   JSON-encoded). Over-cap responses log a warning rather than
+   silently truncating. (Gemini security-medium PR #685.)
 4. **Data consistency** — Merge rules are conservative under
    leadership transitions (under-count + conflict flag, never
    over-count). Reads are exact in steady state and during
@@ -279,9 +339,15 @@ PR 3 (Phase 2-C+):
 1. Should `--keyvizFanoutNodes` accept hostnames that resolve via
    DNS (so a Kubernetes headless service like
    `elastickv-admin:8080` works), or require pre-resolved
-   addresses? Proposing **DNS lookups happen on every fan-out
-   request** (no caching) — small clusters that this MVP targets
-   do not need a resolver cache.
+   addresses? **Resolved as: DNS allowed; resolution rides the Go
+   stdlib resolver's process-wide cache plus the kernel's nscd
+   cache when configured — no resolver cache local to the
+   aggregator.** A transient DNS failure surfaces as a per-peer
+   `ok=false`, not a hung request, because the `http.Client` honors
+   the per-call deadline. Operators on networks with flaky DNS
+   should colocate a caching resolver (the standard fix for any
+   short-lived HTTP client, not specific to this feature).
+   (Gemini round-1 PR #685.)
 2. Should the per-node call budget be `2 × keyvizStep` or a fixed
    2 s? Tying it to `keyvizStep` means a 60-second-step config
    would let a slow peer hold the request for ~2 minutes. Fixed
