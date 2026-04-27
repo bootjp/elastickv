@@ -135,55 +135,46 @@ func startAdminFromFlags(
 	if err != nil {
 		return errors.Wrap(err, "build admin leader forwarder")
 	}
-	leaderProbe := newAdminLeaderProbe(runtimes)
+	leaderProbe := newAdminLeaderProbe(coordinate)
 	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg, buildVersion())
 	return err
 }
-
-// adminLeaderProbeTimeout caps the per-runtime VerifyLeader ReadIndex
-// round-trip the /admin/healthz/leader handler triggers. Keep it short:
-// a load balancer that probes every few seconds wants a fast "yes / no"
-// even when the cluster is mid-election; surfacing 503 on a stalled
-// ReadIndex is the right answer for routing.
-const adminLeaderProbeTimeout = 2 * time.Second
 
 // newAdminLeaderProbe builds the LeaderProbe consumed by
 // /admin/healthz/leader. It mirrors the verified-leader pattern S3 and
 // DynamoDB use on their own /healthz/leader endpoints
 // (adapter/s3.go:isVerifiedS3Leader,
-// adapter/dynamodb.go:isVerifiedDynamoLeader): a cheap Status check
+// adapter/dynamodb.go:isVerifiedDynamoLeader): a cheap IsLeader check
 // short-circuits non-leaders, and only nodes claiming leadership pay
 // the ReadIndex round-trip that confirms the claim is still valid.
 //
-// "Leader of any local Raft group" is treated as "yes" so a multi-group
-// deployment that distributes leadership across nodes still surfaces a
-// useful answer to a load balancer that wants to skip the
-// AdminForward proxy hop. In the common single-group / co-located
-// deployment, this collapses to "is this node THE leader".
+// Crucially the probe is scoped to the **default Raft group** (via
+// coordinate.IsLeader / coordinate.VerifyLeader) — the same group the
+// admin write paths key off (kv/sharded_coordinator.go), which the
+// AdminForward proxy and the SQS admin write path
+// (adapter/sqs_admin.go) both treat as authoritative. An earlier
+// design returned true on any local-group leadership; in a multi-group
+// deployment that could surface 200 on a node leading only a non-
+// default group while admin writes there still 503'd or forwarded.
+// Codex P1 on PR #689 caught this; using the coordinator keeps the
+// healthz contract aligned with the actual admin-write leader.
 //
-// Returns nil for an empty runtimes slice so the router answers
+// Returns nil when no coordinator is wired so the router answers
 // /admin/healthz/leader with the standard JSON 404 (matches the
 // "feature off" pattern Tables / Buckets / Queues already use).
-func newAdminLeaderProbe(runtimes []*raftGroupRuntime) admin.LeaderProbe {
-	if len(runtimes) == 0 {
+func newAdminLeaderProbe(coordinate kv.Coordinator) admin.LeaderProbe {
+	if coordinate == nil {
 		return nil
 	}
 	return admin.LeaderProbeFunc(func() bool {
-		for _, rt := range runtimes {
-			if rt == nil || rt.engine == nil {
-				continue
-			}
-			if rt.engine.Status().State != raftengine.StateLeader {
-				continue
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), adminLeaderProbeTimeout)
-			err := rt.engine.VerifyLeader(ctx)
-			cancel()
-			if err == nil {
-				return true
-			}
+		if !coordinate.IsLeader() {
+			return false
 		}
-		return false
+		// VerifyLeader is the same ReadIndex round-trip lease reads
+		// use; under the hood it carries an engine-bounded deadline,
+		// so a stalled cluster surfaces 503 here on its own without
+		// the probe needing an outer timeout.
+		return coordinate.VerifyLeader() == nil
 	})
 }
 

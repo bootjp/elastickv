@@ -150,9 +150,11 @@ func (rt *Router) classify(p string) routeKind {
 	if k, ok := classifyAssets(p); ok {
 		return k
 	}
-	// /admin/healthz/leader must be checked before /admin/healthz so
-	// the longer path does not fall through the equality check and
-	// resolve to the SPA fallback.
+	// Both /admin/healthz and /admin/healthz/leader are exact-match
+	// equality checks — relative ordering between them does not affect
+	// correctness, but BOTH must run before the SPA prefix branch
+	// below; otherwise the catch-all "anything under /admin/" resolves
+	// these paths to index.html.
 	if p == pathHealthzLeader {
 		return routeHealthzLeader
 	}
@@ -214,9 +216,27 @@ func (rt *Router) dispatch(k routeKind) http.Handler {
 	return rt.notFound
 }
 
+// allowGetHead is the canonical Allow value for read-only handlers
+// (healthz / SPA / static assets). RFC 7231 §6.5.5 requires every 405
+// to advertise the supported methods; load balancers and synthetic-
+// monitor tools key off this header to discover the right verbs
+// without scraping the body. Mirrors the value the S3 and DynamoDB
+// /healthz/leader handlers already set
+// (adapter/s3.go:2404, adapter/dynamodb.go:399).
+const allowGetHead = "GET, HEAD"
+
+// writeMethodNotAllowed centralises the read-only 405 response shape
+// for router-served paths. The Allow header is set BEFORE
+// writeJSONError because writeJSONError calls w.WriteHeader, after
+// which header mutations would silently no-op.
+func writeMethodNotAllowed(w http.ResponseWriter) {
+	w.Header().Set("Allow", allowGetHead)
+	writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+}
+
 func (rt *Router) serveHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		writeMethodNotAllowed(w)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -233,13 +253,17 @@ func (rt *Router) serveHealth(w http.ResponseWriter, r *http.Request) {
 // /healthz/leader endpoints (adapter/s3.go:serveS3LeaderHealthz,
 // adapter/dynamodb.go:serveDynamoLeaderHealthz) so an upstream load
 // balancer that probes any of the three sees identical semantics.
+//
+// Precondition: rt.leader is non-nil. dispatch() short-circuits the
+// nil case to rt.notFound before this handler is ever invoked, so a
+// belt-and-braces nil check inside this body would be dead code.
 func (rt *Router) serveLeaderHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		writeMethodNotAllowed(w)
 		return
 	}
 	status, body := http.StatusOK, "ok\n"
-	if rt.leader == nil || !rt.leader.IsVerifiedLeader() {
+	if !rt.leader.IsVerifiedLeader() {
 		status, body = http.StatusServiceUnavailable, "not leader\n"
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -258,7 +282,7 @@ func (rt *Router) serveAsset(w http.ResponseWriter, r *http.Request) {
 	// the file body for a write request) or surface as a confusing
 	// 404 — neither matches the API contract for assets.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		writeMethodNotAllowed(w)
 		return
 	}
 	if rt.static == nil {
@@ -335,7 +359,7 @@ func (rt *Router) serveSPA(w http.ResponseWriter, r *http.Request) {
 	// /admin/something returned a JSON 404 with a nil static and a
 	// JSON 405 with a populated static — same URL, different answer.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or HEAD supported")
+		writeMethodNotAllowed(w)
 		return
 	}
 	if rt.static == nil {

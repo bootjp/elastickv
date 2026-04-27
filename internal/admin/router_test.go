@@ -119,12 +119,47 @@ func TestRouter_HealthzLeader_HeadOmitsBody(t *testing.T) {
 
 // TestRouter_HealthzLeader_RejectsPost guards the method allowlist:
 // only GET / HEAD are accepted. Mirrors TestRouter_HealthzRejectsPost.
+// Also asserts the Allow: GET, HEAD header required by RFC 7231
+// §6.5.5 — load balancers and synthetic-monitor tools key off this
+// header to discover supported verbs.
 func TestRouter_HealthzLeader_RejectsPost(t *testing.T) {
 	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return true }))
 	req := httptest.NewRequest(http.MethodPost, "/admin/healthz/leader", strings.NewReader(""))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	require.Equal(t, "GET, HEAD", rec.Header().Get("Allow"))
+}
+
+// TestRouter_405_AllowHeader sweeps every router-served path that
+// rejects non-GET/HEAD verbs and asserts each emits the
+// RFC-required Allow header. Locks down the writeMethodNotAllowed
+// invariant — a future handler that bypasses the helper would
+// regress this test rather than silently shipping a non-compliant
+// 405.
+func TestRouter_405_AllowHeader(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"healthz", "/admin/healthz"},
+		{"healthz_leader", "/admin/healthz/leader"},
+		{"asset", "/admin/assets/app.js"},
+		{"spa", "/admin/somewhere"},
+	}
+	r := NewRouterWithLeaderProbe(nil, newTestStatic(), LeaderProbeFunc(func() bool { return true }))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(""))
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+			require.Equal(t, "GET, HEAD", rec.Header().Get("Allow"),
+				"path %s missing RFC 7231 Allow header on 405", tc.path)
+		})
+	}
 }
 
 // TestRouter_HealthzLeader_NilProbeReturns404 locks down the
