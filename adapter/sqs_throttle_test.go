@@ -449,6 +449,53 @@ func TestBucketStore_InvalidateMarksOrphanEvicted(t *testing.T) {
 	original.mu.Unlock()
 }
 
+// TestBucketStore_InvalidateUnderConcurrencyIsRaceFree pins the Codex
+// P2 fix on PR #679 round 6.1. The earlier invalidateQueue used
+// LoadAndDelete-then-lock, which let a concurrent charger that loaded
+// the pointer pre-LoadAndDelete acquire bucket.mu first and observe
+// evicted=false on a bucket that had already been removed from the
+// map. The fix mirrors sweep's lock-then-CompareAndDelete-then-flag
+// ordering, so any charger blocked on mu sees evicted=true the moment
+// it unblocks and retries against the live entry.
+//
+// Bounding the *successful charge count* across an invalidate race is
+// not meaningful: invalidate is supposed to reset the bucket, so the
+// post-invalidate fresh bucket can absorb up to capacity additional
+// tokens by design — that 2× window is structural, not a bug. What
+// the fix guarantees instead is that the race is data-race-clean
+// (-race detector finds nothing) and that any bucket the store
+// removed is observably evicted=true under mu when the next charger
+// acquires it. The deterministic
+// TestBucketStore_InvalidateMarksOrphanEvicted pins that property
+// directly; this stress test exists to surface any new -race finding
+// the new lock ordering might introduce.
+func TestBucketStore_InvalidateUnderConcurrencyIsRaceFree(t *testing.T) {
+	t.Parallel()
+	const capacity = 10
+	cfg := &sqsQueueThrottle{SendCapacity: capacity, SendRefillPerSecond: 1}
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Hour)
+	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1).allowed)
+
+	var wg sync.WaitGroup
+	const chargers = 64
+	const invalidates = 4
+	wg.Add(chargers + invalidates)
+	for range invalidates {
+		go func() {
+			defer wg.Done()
+			store.invalidateQueue("orders")
+		}()
+	}
+	for range chargers {
+		go func() {
+			defer wg.Done()
+			store.charge(cfg, "orders", bucketActionSend, 1)
+		}()
+	}
+	wg.Wait()
+}
+
 // TestComputeRetryAfter_CapsAtMaximum pins the Gemini medium fix on
 // PR #679: a tiny refillRate (e.g. 1e-9) plus a large requested
 // count would otherwise compute a multi-day Retry-After and

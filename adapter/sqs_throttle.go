@@ -330,23 +330,38 @@ func (b *bucketStore) loadOrInit(queue, action string, capacity, refill float64)
 // invalidateQueue drops every bucket belonging to the named queue.
 // Called *after* the Raft commit on SetQueueAttributes / DeleteQueue /
 // CreateQueue so the next request rebuilds from the freshly committed
-// meta. Marks each dropped bucket evicted=true under mu so concurrent
-// in-flight chargers retry against the live entry rather than
-// continuing to spend tokens against the orphan — matching the same
-// signal sweep emits, see chargeBucket.
+// meta. Mirrors sweep's lock-then-delete-then-flag ordering:
+//
+//  1. Load the pointer from the map (without deleting).
+//  2. Acquire bucket.mu so any concurrent charger either runs to
+//     completion before us (and we observe its updated lastRefill
+//     but still proceed — invalidation is unconditional) or blocks
+//     on mu until we set evicted=true.
+//  3. CompareAndDelete with the loaded v to avoid evicting a
+//     replacement bucket inserted by a concurrent reconciliation.
+//  4. Set evicted=true under mu so the next mu acquirer sees the
+//     orphan signal and retries against the live entry.
+//
+// LoadAndDelete-then-lock would let a concurrent charger that
+// loaded the pointer pre-LoadAndDelete acquire mu first and charge
+// while evicted is still false, then later requests would create a
+// fresh full-capacity bucket — a 2x burst on every invalidation
+// event (Codex P2 on PR #679 round 6).
 func (b *bucketStore) invalidateQueue(queue string) {
 	if b == nil {
 		return
 	}
 	for _, action := range throttleAllActions {
 		key := bucketKey{queue: queue, action: action}
-		v, ok := b.buckets.LoadAndDelete(key)
+		v, ok := b.buckets.Load(key)
 		if !ok {
 			continue
 		}
 		bucket, _ := v.(*tokenBucket)
 		bucket.mu.Lock()
-		bucket.evicted = true
+		if b.buckets.CompareAndDelete(key, v) {
+			bucket.evicted = true
+		}
 		bucket.mu.Unlock()
 	}
 }
