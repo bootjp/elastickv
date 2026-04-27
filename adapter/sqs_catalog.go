@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -92,6 +93,72 @@ type sqsQueueMeta struct {
 	// commit time and trust HLC monotonicity to keep ordering sane.
 	CreatedAtMillis      int64 `json:"created_at_millis,omitempty"`
 	LastModifiedAtMillis int64 `json:"last_modified_at_millis,omitempty"`
+	// Throttle is the per-queue rate-limit configuration. nil disables
+	// throttling (default). Set via SetQueueAttributes with the AWS-style
+	// names ThrottleSendCapacity / ThrottleSendRefillPerSecond / etc.
+	// Persisted on the meta so a leader failover loads the configuration
+	// along with the rest of the queue.
+	Throttle *sqsQueueThrottle `json:"throttle,omitempty"`
+	// PartitionCount is the number of FIFO partitions for this queue
+	// (Phase 3.D HT-FIFO, see docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md).
+	// Zero or 1 means the legacy single-partition layout — no schema
+	// change. Greater than 1 enables HT-FIFO. Set at CreateQueue time
+	// and immutable thereafter (SetQueueAttributes rejects any change).
+	// Power-of-two values only (validator rejects others). PR 2 of the
+	// rollout introduces this field but a temporary CreateQueue gate
+	// rejects PartitionCount > 1 until PR 5 lifts the gate atomically
+	// with the data-plane fanout — so the schema exists but no
+	// partitioned data can land before the data plane is wired.
+	PartitionCount uint32 `json:"partition_count,omitempty"`
+	// FifoThroughputLimit mirrors the AWS attribute. "perMessageGroupId"
+	// (default for HT-FIFO) keeps the §3.3 hash-by-MessageGroupId
+	// routing; "perQueue" activates the partition-0 short-circuit so
+	// every group ID routes to one partition (effectively N=1).
+	// Set at CreateQueue time and immutable thereafter — flipping it
+	// live would re-route in-flight messages and silently violate
+	// within-group FIFO ordering (see §3.2 of the design).
+	FifoThroughputLimit string `json:"fifo_throughput_limit,omitempty"`
+	// DeduplicationScope mirrors the AWS attribute. "messageGroup"
+	// (default for HT-FIFO) means the dedup window is per
+	// (queue, partition, MessageGroupId, dedupId); "queue" is the
+	// legacy single-window behaviour. Set at CreateQueue time and
+	// immutable thereafter — changing live can resurrect or suppress
+	// messages depending on the direction of the change. The
+	// validator additionally rejects {PartitionCount > 1,
+	// DeduplicationScope = "queue"} at CreateQueue time because the
+	// dedup key cannot be globally unique across partitions without
+	// a cross-partition OCC transaction.
+	DeduplicationScope string `json:"deduplication_scope,omitempty"`
+}
+
+// sqsQueueThrottle is the per-queue token-bucket configuration. Three
+// independent buckets per queue: Send (SendMessage[Batch]), Recv
+// (ReceiveMessage / DeleteMessage[Batch] / ChangeMessageVisibility[Batch],
+// charged on the consumer side), Default (catch-all for any future
+// non-Send/Recv verb that gets wired into the throttle path).
+//
+// Field-name vocabulary uses short forms (Send*, Recv*, Default*) for the
+// JSON contract and AWS-style attribute names; the in-memory bucketKey
+// uses the canonical action vocabulary ("Send" | "Receive" | "*").
+// throttleConfigToBucketAction and bucketActionForCharge bridge the two.
+type sqsQueueThrottle struct {
+	SendCapacity           float64 `json:"send_capacity,omitempty"`
+	SendRefillPerSecond    float64 `json:"send_refill_per_second,omitempty"`
+	RecvCapacity           float64 `json:"recv_capacity,omitempty"`
+	RecvRefillPerSecond    float64 `json:"recv_refill_per_second,omitempty"`
+	DefaultCapacity        float64 `json:"default_capacity,omitempty"`
+	DefaultRefillPerSecond float64 `json:"default_refill_per_second,omitempty"`
+}
+
+// IsEmpty reports whether the configuration is the no-op (all six
+// fields zero), in which case throttling is disabled for the queue.
+func (t *sqsQueueThrottle) IsEmpty() bool {
+	if t == nil {
+		return true
+	}
+	return t.SendCapacity == 0 && t.SendRefillPerSecond == 0 &&
+		t.RecvCapacity == 0 && t.RecvRefillPerSecond == 0 &&
+		t.DefaultCapacity == 0 && t.DefaultRefillPerSecond == 0
 }
 
 var storedSQSMetaPrefix = []byte{0x00, 'S', 'Q', 0x01}
@@ -297,6 +364,14 @@ func parseAttributesIntoMeta(name string, attrs map[string]string) (*sqsQueueMet
 	if meta.ContentBasedDedup && !meta.IsFIFO {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
 	}
+	// HT-FIFO validation runs after resolveFifoQueueFlag so the
+	// IsFIFO-only checks see the post-resolution flag. The temporary
+	// dormancy gate (§11 PR 2) runs separately in createQueue so
+	// SetQueueAttributes paths share the schema validator without
+	// re-rejecting on the gate.
+	if err := validatePartitionConfig(meta); err != nil {
+		return nil, err
+	}
 	return meta, nil
 }
 
@@ -384,6 +459,55 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 		m.ContentBasedDedup = b
 		return nil
 	},
+	// PartitionCount enables HT-FIFO when > 1 (Phase 3.D, see
+	// docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md). Set
+	// at CreateQueue time; SetQueueAttributes attempts to change it
+	// reject via the immutability check in trySetQueueAttributesOnce.
+	// PR 2 of the rollout introduces the field but the temporary
+	// dormancy gate in tryCreateQueueOnce rejects PartitionCount > 1
+	// until PR 5 lifts the gate atomically with the data plane.
+	"PartitionCount": func(m *sqsQueueMeta, v string) error {
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		if err != nil {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"PartitionCount must be a non-negative integer")
+		}
+		m.PartitionCount = uint32(n) //nolint:gosec // bounded by ParseUint(_, _, 32) above.
+		return nil
+	},
+	"FifoThroughputLimit": func(m *sqsQueueMeta, v string) error {
+		v = strings.TrimSpace(v)
+		switch v {
+		case "", htfifoThroughputPerMessageGroupID, htfifoThroughputPerQueue:
+			m.FifoThroughputLimit = v
+			return nil
+		}
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"FifoThroughputLimit must be 'perMessageGroupId' or 'perQueue'")
+	},
+	"DeduplicationScope": func(m *sqsQueueMeta, v string) error {
+		v = strings.TrimSpace(v)
+		switch v {
+		case "", htfifoDedupeScopeMessageGroup, htfifoDedupeScopeQueue:
+			m.DeduplicationScope = v
+			return nil
+		}
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"DeduplicationScope must be 'messageGroup' or 'queue'")
+	},
+	// Throttle* are non-AWS extensions for per-queue rate limiting,
+	// see docs/design/2026_04_26_proposed_sqs_per_queue_throttling.md.
+	// Each accepts a non-negative float64; the cross-attribute
+	// validation that enforces both-zero-or-both-positive on each
+	// (capacity, refill) pair, capacity ≥ refill, hard ceiling, and
+	// the capacity ≥ 10 floor for batch-charging buckets runs in
+	// validateThrottleConfig after every Throttle* applier has fired.
+	"ThrottleSendCapacity":           applyThrottleField(throttleSetSendCapacity),
+	"ThrottleSendRefillPerSecond":    applyThrottleField(throttleSetSendRefill),
+	"ThrottleRecvCapacity":           applyThrottleField(throttleSetRecvCapacity),
+	"ThrottleRecvRefillPerSecond":    applyThrottleField(throttleSetRecvRefill),
+	"ThrottleDefaultCapacity":        applyThrottleField(throttleSetDefaultCapacity),
+	"ThrottleDefaultRefillPerSecond": applyThrottleField(throttleSetDefaultRefill),
 	"RedrivePolicy": func(m *sqsQueueMeta, v string) error {
 		// Validate the policy at attribute-apply time so a malformed
 		// RedrivePolicy never makes it onto the queue meta record. The
@@ -419,6 +543,169 @@ func applyAttributes(meta *sqsQueueMeta, attrs map[string]string) error {
 			return err
 		}
 	}
+	// Throttle* validation has to run after every applier so the
+	// pair-wise rules (both-zero-or-both-positive, capacity ≥ refill,
+	// capacity ≥ 10 for batch buckets) see the post-update meta as a
+	// whole. Running per-applier would reject a valid two-attribute
+	// update (e.g. SendCapacity + SendRefillPerSecond) on the first
+	// applier because the second value is not yet present.
+	if err := validateThrottleConfig(meta); err != nil {
+		return err
+	}
+	// HT-FIFO partition validation runs in parseAttributesIntoMeta /
+	// trySetQueueAttributesOnce, AFTER resolveFifoQueueFlag, so the
+	// IsFIFO-only checks see the post-resolution flag. Running here
+	// would reject a valid CreateQueue with FifoQueue=true +
+	// FifoThroughputLimit=perMessageGroupId because IsFIFO is still
+	// false at this point in the flow.
+	return nil
+}
+
+// applyThrottleField wraps a setter that writes one Throttle* field
+// into meta.Throttle, allocating the struct lazily on first use. The
+// per-field setter does the float parse + non-negative + hard-ceiling
+// check; cross-field rules run later in validateThrottleConfig.
+func applyThrottleField(set func(*sqsQueueThrottle, float64)) attributeApplier {
+	return func(m *sqsQueueMeta, v string) error {
+		f, err := parseThrottleFloat(v)
+		if err != nil {
+			return err
+		}
+		if m.Throttle == nil {
+			m.Throttle = &sqsQueueThrottle{}
+		}
+		set(m.Throttle, f)
+		return nil
+	}
+}
+
+// parseThrottleFloat parses the wire string into a non-negative float
+// bounded by the hard ceiling. Any malformed or out-of-range value
+// turns into InvalidAttributeValue with a self-describing message so
+// the operator sees the cause without grepping the server log.
+func parseThrottleFloat(value string) (float64, error) {
+	v := strings.TrimSpace(value)
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"throttle attribute must be a non-negative number")
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return 0, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"throttle attribute must be finite and non-negative")
+	}
+	if f > throttleHardCeilingPerSecond {
+		return 0, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"throttle attribute exceeds hard ceiling 100000")
+	}
+	return f, nil
+}
+
+// Per-field setters keep applyThrottleField a one-liner per attribute
+// and let validateThrottleConfig stay outside the applier dispatch
+// table. Defined as functions (not closures) so a future caller from
+// outside applyAttributes — e.g. a programmatic admin surface — can
+// reuse them without recreating the closure boilerplate.
+func throttleSetSendCapacity(t *sqsQueueThrottle, f float64)    { t.SendCapacity = f }
+func throttleSetSendRefill(t *sqsQueueThrottle, f float64)      { t.SendRefillPerSecond = f }
+func throttleSetRecvCapacity(t *sqsQueueThrottle, f float64)    { t.RecvCapacity = f }
+func throttleSetRecvRefill(t *sqsQueueThrottle, f float64)      { t.RecvRefillPerSecond = f }
+func throttleSetDefaultCapacity(t *sqsQueueThrottle, f float64) { t.DefaultCapacity = f }
+func throttleSetDefaultRefill(t *sqsQueueThrottle, f float64)   { t.DefaultRefillPerSecond = f }
+
+// validateThrottleConfig enforces the §3.2 cross-attribute rules on
+// the post-applier meta. The single-field constraints (non-negative,
+// hard ceiling) are already enforced inside parseThrottleFloat;
+// what's left is pair-wise:
+//
+//   - Each (capacity, refill) pair must be both zero (action disabled)
+//     or both positive. A capacity-without-refill bucket would never
+//     refill; a refill-without-capacity bucket has no burst headroom.
+//   - capacity ≥ refill, otherwise the bucket can never burst above
+//     steady state (the bucket can only ever hold one second's worth).
+//   - For action buckets that cover a batch verb (Send, Recv) the
+//     capacity must be ≥ throttleMinBatchCapacity (== 10). A capacity
+//     below the largest single charge is permanently unserviceable
+//     for full batches.
+//
+// If meta.Throttle is empty (the IsEmpty short-circuit) the function
+// also drops the empty struct so a round-trip GetQueueAttributes
+// reports the queue as untrothttled rather than zero-valued. Mirrors
+// how nil throttle on the meta means "not configured".
+func validateThrottleConfig(meta *sqsQueueMeta) error {
+	if meta.Throttle == nil {
+		return nil
+	}
+	t := meta.Throttle
+	if err := validateThrottlePair("ThrottleSend", t.SendCapacity, t.SendRefillPerSecond, true); err != nil {
+		return err
+	}
+	if err := validateThrottlePair("ThrottleRecv", t.RecvCapacity, t.RecvRefillPerSecond, true); err != nil {
+		return err
+	}
+	// Default* gets the same batch-capacity floor as Send*/Recv*
+	// because resolveActionConfig in sqs_throttle.go falls Send and
+	// Receive traffic through to Default whenever the corresponding
+	// Send*/Recv* pair is unset. Without the floor, a config like
+	// `ThrottleDefaultCapacity=5, ThrottleDefaultRefillPerSecond=1`
+	// would be accepted but make every full SendMessageBatch /
+	// DeleteMessageBatch (charge=10) permanently unserviceable —
+	// the bucket can never accumulate the 10 tokens. Codex P1 on
+	// PR #679 round 5 caught the gap; the design doc note in §3.2
+	// claiming Default* is exempt was wrong about the fall-through.
+	if err := validateThrottlePair("ThrottleDefault", t.DefaultCapacity, t.DefaultRefillPerSecond, true); err != nil {
+		return err
+	}
+	if t.IsEmpty() {
+		// All-zero post-apply means the operator wrote a "disable"
+		// command; canonicalise to nil so downstream code hits the
+		// nil-throttle short-circuit rather than the IsEmpty branch.
+		meta.Throttle = nil
+	}
+	return nil
+}
+
+// addThrottleAttributes renders the non-zero Throttle* pairs into out.
+// Per §3.2 the wire-side vocabulary stays Send*/Recv*/Default*; the
+// canonical bucket-action vocabulary is internal to the bucket store.
+func addThrottleAttributes(out map[string]string, t *sqsQueueThrottle) {
+	if t.IsEmpty() {
+		return
+	}
+	if t.SendCapacity > 0 {
+		out["ThrottleSendCapacity"] = strconv.FormatFloat(t.SendCapacity, 'g', -1, 64)
+		out["ThrottleSendRefillPerSecond"] = strconv.FormatFloat(t.SendRefillPerSecond, 'g', -1, 64)
+	}
+	if t.RecvCapacity > 0 {
+		out["ThrottleRecvCapacity"] = strconv.FormatFloat(t.RecvCapacity, 'g', -1, 64)
+		out["ThrottleRecvRefillPerSecond"] = strconv.FormatFloat(t.RecvRefillPerSecond, 'g', -1, 64)
+	}
+	if t.DefaultCapacity > 0 {
+		out["ThrottleDefaultCapacity"] = strconv.FormatFloat(t.DefaultCapacity, 'g', -1, 64)
+		out["ThrottleDefaultRefillPerSecond"] = strconv.FormatFloat(t.DefaultRefillPerSecond, 'g', -1, 64)
+	}
+}
+
+// validateThrottlePair runs the per-(action, capacity, refill) checks.
+// requireBatchCapacity gates the capacity ≥ 10 rule so the catch-all
+// Default* bucket (no batch verbs in scope today) does not get the
+// extra constraint.
+func validateThrottlePair(prefix string, capacity, refill float64, requireBatchCapacity bool) error {
+	if capacity == 0 && refill == 0 {
+		return nil
+	}
+	if capacity == 0 || refill == 0 {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			prefix+"Capacity and "+prefix+"RefillPerSecond must both be zero (disabled) or both positive")
+	}
+	if capacity < refill {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			prefix+"Capacity must be ≥ "+prefix+"RefillPerSecond (capacity is the burst cap; below refill the bucket cannot accumulate)")
+	}
+	if requireBatchCapacity && capacity < throttleMinBatchCapacity {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			prefix+"Capacity must be ≥ 10 — batch verbs (SendMessageBatch / DeleteMessageBatch) charge up to 10 tokens per call; a smaller capacity makes every full batch permanently unserviceable")
+	}
 	return nil
 }
 
@@ -440,6 +727,15 @@ func attributesEqual(a, b *sqsQueueMeta) bool {
 	if a == nil || b == nil {
 		return false
 	}
+	return baseAttributesEqual(a, b) &&
+		throttleConfigEqual(a.Throttle, b.Throttle) &&
+		htfifoAttributesEqual(a, b)
+}
+
+// baseAttributesEqual compares the pre-Phase-3.C/3.D attribute set.
+// Split from attributesEqual so adding fields per phase does not
+// push the function over the cyclop ceiling.
+func baseAttributesEqual(a, b *sqsQueueMeta) bool {
 	return a.IsFIFO == b.IsFIFO &&
 		a.ContentBasedDedup == b.ContentBasedDedup &&
 		a.VisibilityTimeoutSeconds == b.VisibilityTimeoutSeconds &&
@@ -448,6 +744,54 @@ func attributesEqual(a, b *sqsQueueMeta) bool {
 		a.ReceiveMessageWaitSeconds == b.ReceiveMessageWaitSeconds &&
 		a.MaximumMessageSize == b.MaximumMessageSize &&
 		a.RedrivePolicy == b.RedrivePolicy
+}
+
+// throttleConfigEqual compares two Throttle configs for the
+// CreateQueue idempotency check. Without including the throttle
+// fields in attributesEqual, a re-create with different limits would
+// be treated as idempotent and silently keep the old limits.
+func throttleConfigEqual(a, b *sqsQueueThrottle) bool {
+	aEmpty := a.IsEmpty()
+	bEmpty := b.IsEmpty()
+	if aEmpty && bEmpty {
+		return true
+	}
+	if aEmpty != bEmpty {
+		return false
+	}
+	return a.SendCapacity == b.SendCapacity &&
+		a.SendRefillPerSecond == b.SendRefillPerSecond &&
+		a.RecvCapacity == b.RecvCapacity &&
+		a.RecvRefillPerSecond == b.RecvRefillPerSecond &&
+		a.DefaultCapacity == b.DefaultCapacity &&
+		a.DefaultRefillPerSecond == b.DefaultRefillPerSecond
+}
+
+// htfifoAttributesEqual compares the Phase 3.D HT-FIFO fields.
+//
+// PartitionCount normalisation: validatePartitionConfig documents 0
+// and 1 as equivalent ("unset" / "single-partition"); a queue created
+// without PartitionCount is stored as 0 while a queue created with
+// explicit PartitionCount=1 is stored as 1, so strict equality would
+// have CreateQueue reject the second call as "different attributes"
+// even though the queues are semantically identical (Codex P2 on
+// PR #679 round 6.1). normalisePartitionCount maps both to 1 for the
+// idempotency check.
+func htfifoAttributesEqual(a, b *sqsQueueMeta) bool {
+	return normalisePartitionCount(a.PartitionCount) == normalisePartitionCount(b.PartitionCount) &&
+		a.FifoThroughputLimit == b.FifoThroughputLimit &&
+		a.DeduplicationScope == b.DeduplicationScope
+}
+
+// normalisePartitionCount collapses the two "single-partition" forms
+// (0 = unset, 1 = explicit) into a single canonical value so equality
+// checks treat them as identical. Any value > 1 is returned unchanged
+// — those cases must already match exactly to be considered equal.
+func normalisePartitionCount(n uint32) uint32 {
+	if n == 0 {
+		return 1
+	}
+	return n
 }
 
 // ------------------------ storage primitives ------------------------
@@ -514,6 +858,16 @@ func (s *SQSServer) createQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	requested, err := parseAttributesIntoMeta(in.QueueName, in.Attributes)
 	if err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
+	}
+	// Temporary dormancy gate (Phase 3.D §11 PR 2). PartitionCount > 1
+	// must reject until PR 5 wires the data plane atomically with the
+	// gate-lift. Without this, accepting a partitioned-queue create
+	// would let SendMessage write under the legacy single-partition
+	// prefix; the PR 5 reader would never find those messages and the
+	// reaper would not enumerate them — silent message loss.
+	if err := validatePartitionDormancyGate(requested); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
@@ -605,6 +959,15 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
 		return false, errors.WithStack(err)
 	}
+	// Drop any throttle bucket that survived a delete-then-create race
+	// (Codex P2 on PR #679 round 5). DeleteQueue invalidates after its
+	// commit, but a sendMessage holding pre-delete meta can recreate
+	// a bucket between that invalidate and this CreateQueue commit;
+	// invalidating again here on a genuine create (not the idempotent
+	// return path above, which exits before this point) guarantees
+	// the new queue starts with a fresh full-capacity bucket
+	// regardless of in-flight traffic to the prior incarnation.
+	s.throttle.invalidateQueue(requested.Name)
 	return true, nil
 }
 
@@ -623,6 +986,14 @@ func (s *SQSServer) deleteQueue(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	// Drop in-memory throttle buckets belonging to this queue so a
+	// same-name CreateQueue immediately after this delete starts with
+	// a fresh full-capacity bucket, not the stale balance from the
+	// previous incarnation. Without this step the old throttle would
+	// keep enforcing for up to the idle-evict window (default 1 h),
+	// surprising operators who use DeleteQueue+CreateQueue to reset
+	// queue state.
+	s.throttle.invalidateQueue(name)
 	// SQS DeleteQueue returns 200 with an empty body.
 	writeSQSJSON(w, map[string]any{})
 }
@@ -954,6 +1325,16 @@ func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection, 
 	if meta.RedrivePolicy != "" {
 		all["RedrivePolicy"] = meta.RedrivePolicy
 	}
+	// Throttle* are non-AWS extensions. Surfacing them in
+	// GetQueueAttributes lets operators read back what they set; SDKs
+	// that strictly validate the attribute set will ignore unknown
+	// keys. Extracted into a helper so queueMetaToAttributes stays
+	// under the cyclop ceiling.
+	addThrottleAttributes(all, meta.Throttle)
+	// HT-FIFO attributes (Phase 3.D). Same omission rule as Throttle*:
+	// only present when configured. Extracted into a helper so this
+	// function stays under the cyclop ceiling.
+	addHTFIFOAttributes(all, meta)
 	if selection.expandAll {
 		return all
 	}
@@ -989,6 +1370,20 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	// Drop the in-memory bucket entries belonging to this queue *after*
+	// the Raft commit so the next request rebuilds from the freshly
+	// committed throttle config. Gated on whether the request actually
+	// touched a Throttle* attribute — an unconditional invalidate
+	// would reset the bucket on every unrelated SetQueueAttributes
+	// (e.g. VisibilityTimeout-only update), giving any caller a way to
+	// silently restore a noisy tenant's burst capacity by writing a
+	// no-op SetQueueAttributes (Codex P1 on PR #679). The bucket
+	// reconciliation in loadOrInit also catches a stale bucket if a
+	// throttle change slips past this gate (e.g. via a future admin
+	// path), so the gating here is purely a hot-path optimisation.
+	if throttleAttributesPresent(in.Attributes) {
+		s.throttle.invalidateQueue(name)
+	}
 	writeSQSJSON(w, map[string]any{})
 }
 
@@ -1011,6 +1406,42 @@ func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName s
 	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "set queue attributes retry attempts exhausted")
 }
 
+// applyAndValidateSetAttributes runs the apply + cross-validator
+// chain for a SetQueueAttributes request. Extracted from
+// trySetQueueAttributesOnce so that function stays under the cyclop
+// ceiling once HT-FIFO immutability + Throttle validators were
+// added. Returns nil on success; on rejection returns the typed
+// sqsAPIError the caller forwards to writeSQSErrorFromErr.
+//
+// preApply snapshot allocation is gated on htfifoAttributesPresent
+// so the common "mutable-only update" path stays alloc-free per the
+// Gemini medium feedback on PR #681.
+func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) error {
+	var preApply *sqsQueueMeta
+	if htfifoAttributesPresent(attrs) {
+		preApply = snapshotImmutableHTFIFO(meta)
+	}
+	if err := applyAttributes(meta, attrs); err != nil {
+		return err
+	}
+	if preApply != nil {
+		if err := validatePartitionImmutability(preApply, meta); err != nil {
+			return err
+		}
+	}
+	// ContentBasedDeduplication is FIFO-only; a Standard queue
+	// silently accepting it would advertise unsupported behavior to
+	// clients. Same rule enforced on CreateQueue.
+	if meta.ContentBasedDedup && !meta.IsFIFO {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
+	}
+	// HT-FIFO schema validator runs after applyAttributes so the
+	// FIFO-only checks see the post-apply state. IsFIFO comes from
+	// the loaded meta record (immutable from CreateQueue) so the
+	// validator sees the same flag CreateQueue set.
+	return validatePartitionConfig(meta)
+}
+
 // trySetQueueAttributesOnce is one read-validate-commit pass. The first
 // return reports whether the caller should stop retrying (the attrs
 // are now committed); an error means either a non-retryable failure
@@ -1024,14 +1455,8 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	if !exists {
 		return false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
-	if err := applyAttributes(meta, attrs); err != nil {
+	if err := applyAndValidateSetAttributes(meta, attrs); err != nil {
 		return false, err
-	}
-	// ContentBasedDeduplication is FIFO-only; a Standard queue
-	// silently accepting it would advertise unsupported behavior to
-	// clients. Same rule enforced on CreateQueue.
-	if meta.ContentBasedDedup && !meta.IsFIFO {
-		return false, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
 	}
 	meta.LastModifiedAtMillis = time.Now().UnixMilli()
 	metaBytes, err := encodeSQSQueueMeta(meta)

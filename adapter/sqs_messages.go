@@ -294,33 +294,67 @@ type sqsChangeVisibilityInput struct {
 
 // ------------------------ handlers ------------------------
 
-func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
+// prepareSendMessage decodes the SendMessage payload and resolves
+// the queue name. Throttle charging happens after the meta load in
+// validateSend so we don't pay an extra meta read just to discover
+// throttling is off (Gemini high on PR #679).
+func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (sqsSendMessageInput, string, bool) {
 	var in sqsSendMessageInput
 	if err := decodeSQSJSONInput(r, &in); err != nil {
 		writeSQSErrorFromErr(w, err)
-		return
+		return in, "", false
 	}
 	queueName, err := queueNameFromURL(in.QueueUrl)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
-		return
+		return in, "", false
 	}
+	return in, queueName, true
+}
+
+// validateSend loads queue meta, runs the throttle charge against
+// the loaded throttle config (no extra meta read), then validates
+// message attributes / FIFO params and resolves the delay. Returns
+// ok=false if any step has already written the error response.
+//
+// Throttle check sits AFTER the meta load (so we have the throttle
+// config) and AFTER the QueueDoesNotExist branch (so a missing
+// queue is reported as 400 QueueDoesNotExist, not as a Throttling
+// 400 against a non-existent bucket). It still sits OUTSIDE the
+// OCC transaction (§4.2): a rejected request never reaches the
+// coordinator.
+func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueName string, in sqsSendMessageInput) (*sqsQueueMeta, uint64, int64, bool) {
 	meta, readTS, apiErr := s.loadQueueMetaForSend(r.Context(), queueName, []byte(in.MessageBody))
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return
+		return nil, 0, 0, false
+	}
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle) {
+		return nil, 0, 0, false
 	}
 	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return
+		return nil, 0, 0, false
 	}
 	if apiErr := validateSendFIFOParams(meta, in); apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
-		return
+		return nil, 0, 0, false
 	}
 	delay, apiErr := resolveSendDelay(meta, in.DelaySeconds)
 	if apiErr != nil {
 		writeSQSErrorFromErr(w, apiErr)
+		return nil, 0, 0, false
+	}
+	return meta, readTS, delay, true
+}
+
+func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
+	in, queueName, ok := s.prepareSendMessage(w, r)
+	if !ok {
+		return
+	}
+	meta, readTS, delay, ok := s.validateSend(w, r, queueName, in)
+	if !ok {
 		return
 	}
 	if meta.IsFIFO {
@@ -528,6 +562,13 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if !exists {
 		writeSQSError(w, http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return
+	}
+	// Throttle check uses the loaded meta's throttle config so we
+	// don't pay an extra meta read just to discover throttling is off
+	// (Gemini high on PR #679). Sits AFTER the QueueDoesNotExist
+	// branch — a missing queue should not consume a Recv token.
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle) {
 		return
 	}
 	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)
@@ -1106,6 +1147,9 @@ func (s *SQSServer) deleteMessage(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	if !s.chargeQueue(w, r, queueName, bucketActionReceive, 1) {
+		return
+	}
 	if err := s.deleteMessageWithRetry(r.Context(), queueName, handle); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
@@ -1256,6 +1300,9 @@ func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Reque
 	queueName, handle, err := s.parseQueueAndReceipt(in.QueueUrl, in.ReceiptHandle)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
+		return
+	}
+	if !s.chargeQueue(w, r, queueName, bucketActionReceive, 1) {
 		return
 	}
 	if err := s.changeVisibilityWithRetry(r.Context(), queueName, handle, timeout); err != nil {
