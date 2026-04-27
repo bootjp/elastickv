@@ -48,8 +48,18 @@ RUN CGO_ENABLED=0 go build -o /app .
 # the container. Either chown them to 65532:65532 or relax permissions
 # to mode 0444 on the host. The host's bootjp group is no longer
 # sufficient because UID 65532 is in no host group by default.
-FROM gcr.io/distroless/static@sha256:e3f945647ffb95b5839c07038d64f9811adf17308b9121d8a2b87b6a22a80a39
-USER nonroot:nonroot
+# Tag + digest combo: the digest pin is the reproducibility guard,
+# the :nonroot tag in front is human-readable so a glance at the
+# Dockerfile says which variant we're on without cross-referencing
+# the digest or reading the comment block above.
+FROM gcr.io/distroless/static:nonroot@sha256:e3f945647ffb95b5839c07038d64f9811adf17308b9121d8a2b87b6a22a80a39
+# Numeric UID/GID: 65532 is the canonical distroless nonroot user.
+# K8s Pod Security Standards (`runAsNonRoot: true`) and admission
+# controllers like Gatekeeper validate the runtime user by integer,
+# without parsing /etc/passwd — using the name instead would force
+# them to consult image internals to decide if the container counts
+# as non-root.
+USER 65532:65532
 COPY --from=build /app /app
 
 CMD ["/app"]
