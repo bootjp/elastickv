@@ -163,10 +163,22 @@ func TestValidatePartitionConfig_RejectsAboveMax(t *testing.T) {
 // the §3.2 FIFO-only rule: HT-FIFO attributes on a non-FIFO queue
 // reject with InvalidAttributeValue. Setting them silently on a
 // Standard queue would advertise unsupported behaviour.
+//
+// PartitionCount > 1 is also FIFO-only (Claude review on PR #681
+// round 2 caught the gap) — without the guard a Standard queue
+// with PartitionCount=2 would slip past the validator after PR 5
+// lifts the dormancy gate. PartitionCount 0/1 are still accepted
+// on Standard queues because both mean "single-partition layout".
 func TestValidatePartitionConfig_StandardQueueRejectsHTFIFOAttrs(t *testing.T) {
 	t.Parallel()
 	require.Error(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: false, FifoThroughputLimit: htfifoThroughputPerQueue}))
 	require.Error(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: false, DeduplicationScope: htfifoDedupeScopeMessageGroup}))
+	for _, n := range []uint32{2, 4, 8, 16, 32} {
+		require.Error(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: false, PartitionCount: n}),
+			"PartitionCount=%d on Standard queue must reject", n)
+	}
+	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: false, PartitionCount: 0}))
+	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: false, PartitionCount: 1}))
 	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: true, FifoThroughputLimit: htfifoThroughputPerMessageGroupID, PartitionCount: 8}))
 }
 

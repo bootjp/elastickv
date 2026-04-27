@@ -142,6 +142,17 @@ func validatePartitionConfig(meta *sqsQueueMeta) error {
 		}
 	}
 	if !meta.IsFIFO {
+		// PartitionCount > 1 only makes sense on FIFO queues (HT-FIFO
+		// is by definition a FIFO feature). Without this guard a
+		// Standard queue with PartitionCount=2 would slip past the
+		// validator once PR 5 lifts the dormancy gate (Claude review
+		// on PR #681 round 2 caught this). PartitionCount=0 and 1
+		// are accepted because both mean "single-partition layout"
+		// which is valid on Standard queues.
+		if meta.PartitionCount > 1 {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"PartitionCount > 1 is only valid on FIFO queues")
+		}
 		if meta.FifoThroughputLimit != "" {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 				"FifoThroughputLimit is only valid on FIFO queues")

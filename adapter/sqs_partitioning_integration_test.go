@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -32,7 +33,7 @@ func TestSQSServer_HTFIFO_DormancyGate_RejectsPartitionedCreate(t *testing.T) {
 			t.Fatalf("PartitionCount=%s: __type=%q (expected InvalidAttributeValue)", n, got)
 		}
 		msg, _ := out["message"].(string)
-		if msg == "" || !contains(msg, "not yet enabled") {
+		if msg == "" || !strings.Contains(msg, "not yet enabled") {
 			t.Fatalf("PartitionCount=%s: message %q must mention the gate reason", n, msg)
 		}
 	}
@@ -80,7 +81,7 @@ func TestSQSServer_HTFIFO_RejectsNonPowerOfTwoPartitionCount(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("PartitionCount=3 must reject: status %d", status)
 	}
-	if msg, _ := out["message"].(string); msg == "" || !contains(msg, "power of two") {
+	if msg, _ := out["message"].(string); msg == "" || !strings.Contains(msg, "power of two") {
 		t.Fatalf("expected 'power of two' in message, got %q", msg)
 	}
 }
@@ -109,24 +110,24 @@ func TestSQSServer_HTFIFO_RejectsHTFIFOAttrsOnStandardQueue(t *testing.T) {
 
 // TestSQSServer_HTFIFO_RejectsQueueScopedDedupOnPartitioned pins
 // the §3.2 cross-attribute control-plane gate at the wire layer.
-// {PartitionCount > 1, DeduplicationScope = "queue"} would land
-// fine if dormancy were lifted but the validator rejects it before
-// dormancy runs. Test sets PartitionCount=1 to bypass dormancy and
-// exercise the cross-attr rule alone — when dormancy is lifted in
-// PR 5 the equivalent test with PartitionCount > 1 will exercise
-// the same path end-to-end.
+// {PartitionCount > 1, DeduplicationScope = "queue"} is rejected by
+// validatePartitionConfig (the schema validator) which runs inside
+// parseAttributesIntoMeta — that is, BEFORE validatePartitionDormancyGate
+// runs in createQueue. So the cross-attr rejection is what the wire
+// layer sees today, even though the dormancy gate would also reject
+// the same input on its own. After PR 5 lifts the dormancy gate the
+// cross-attr rule remains the sole rejection path.
+//
+// The test only checks the 400 status to stay agnostic about which
+// validator fires first — both are correct behaviour, and a future
+// reordering of the createQueue control flow does not need to break
+// this test.
 func TestSQSServer_HTFIFO_RejectsQueueScopedDedupOnPartitioned(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
 
-	// Direct unit-test of the validator: dormancy gate runs after
-	// the schema validator, but in the wire path PartitionCount > 1
-	// is rejected by dormancy first, so we cover the cross-attr
-	// rejection via the unit test in sqs_partitioning_test.go and
-	// the wire test exercises only the dormancy path while PR 2-4
-	// are in production.
 	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
 		"QueueName": "htfifo-bad-dedup.fifo",
 		"Attributes": map[string]string{
@@ -138,9 +139,6 @@ func TestSQSServer_HTFIFO_RejectsQueueScopedDedupOnPartitioned(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("PartitionCount=2 + DeduplicationScope=queue must reject: status %d body %v", status, out)
 	}
-	// During PR 2-4 the dormancy gate fires first (PartitionCount > 1);
-	// after PR 5 lifts the gate, the cross-attr rule fires instead.
-	// Either rejection is correct so the test only checks the 400.
 }
 
 // TestSQSServer_HTFIFO_ImmutabilitySetQueueAttributesRejects pins
@@ -268,20 +266,4 @@ func mustCreateFIFOWithThroughputLimit(t *testing.T, node Node, name, limit stri
 	}
 	url, _ := out["QueueUrl"].(string)
 	return url
-}
-
-// contains is a tiny helper used by the dormancy-gate test to check
-// for a substring in the operator-facing message without pulling in
-// strings just for one call.
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && indexOf(s, sub) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
