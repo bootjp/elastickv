@@ -105,15 +105,13 @@ type tokenBucket struct {
 // bucketStore holds every active bucket for an SQS server process.
 // sync.Map matches the read-mostly access pattern: lookups are nearly
 // always Load hits; LoadOrStore pays the write cost only on first use.
+//
+// The idle-evict sweep runs from runSweepLoop on a background ticker
+// — there is no hot-path serialisation primitive because the only
+// caller of sweep() is the sole goroutine the ticker drives.
 type bucketStore struct {
-	buckets sync.Map // map[bucketKey]*tokenBucket
-	clock   func() time.Time
-	// sweepMu serialises the lazy idle-evict sweep so concurrent first
-	// requests cannot all run a full sweep in parallel. The sweep itself
-	// acquires per-bucket mu briefly, so it never blocks a lookup that
-	// already has the bucket.
-	sweepMu      sync.Mutex
-	lastSweep    time.Time
+	buckets      sync.Map // map[bucketKey]*tokenBucket
+	clock        func() time.Time
 	evictedAfter time.Duration
 	sweepEvery   time.Duration
 }
@@ -305,17 +303,14 @@ func (b *bucketStore) runSweepLoop(ctx context.Context) {
 }
 
 // sweep walks the bucket store dropping any bucket idle longer than
-// evictedAfter. Called from runSweepLoop on a background ticker.
-// Bucket lookups are still O(1) on the hot path; sweep iterates
-// every entry under the per-bucket lock (held briefly for the
-// timestamp read) so it never blocks a charge() that already has
+// evictedAfter. Called from runSweepLoop on a background ticker —
+// the ticker is the only caller, so sweep() does not need its own
+// serialisation. Bucket lookups stay O(1) on the hot path; sweep
+// iterates every entry under the per-bucket lock (held briefly for
+// the timestamp read) so it never blocks a charge() that already has
 // the bucket.
 func (b *bucketStore) sweep() {
-	now := b.clock()
-	b.sweepMu.Lock()
-	b.lastSweep = now
-	b.sweepMu.Unlock()
-	cutoff := now.Add(-b.evictedAfter)
+	cutoff := b.clock().Add(-b.evictedAfter)
 	b.buckets.Range(func(k, v any) bool {
 		bucket, _ := v.(*tokenBucket)
 		bucket.mu.Lock()
