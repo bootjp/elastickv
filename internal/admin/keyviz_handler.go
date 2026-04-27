@@ -53,17 +53,31 @@ const keyVizRowBudgetCap = 1024
 // /admin/api/v1/keyviz/matrix. Mirrors the proto GetKeyVizMatrixResponse
 // shape so a future refactor can share a single pivot helper across
 // the adapter (gRPC) and admin (JSON) paths.
+//
+// Fanout is non-nil when the handler is configured for cluster-wide
+// fan-out (Phase 2-C): it carries per-node status so the SPA can
+// surface degraded responses inline (see design 2026_04_27_proposed_keyviz_cluster_fanout.md).
+// The field is omitted from the wire form when fan-out is disabled
+// so old clients keep working unchanged.
 type KeyVizMatrix struct {
-	ColumnUnixMs []int64      `json:"column_unix_ms"`
-	Rows         []KeyVizRow  `json:"rows"`
-	Series       KeyVizSeries `json:"series"`
-	GeneratedAt  time.Time    `json:"generated_at"`
+	ColumnUnixMs []int64       `json:"column_unix_ms"`
+	Rows         []KeyVizRow   `json:"rows"`
+	Series       KeyVizSeries  `json:"series"`
+	GeneratedAt  time.Time     `json:"generated_at"`
+	Fanout       *FanoutResult `json:"fanout,omitempty"`
 }
 
 // KeyVizRow is one route's worth of activity across the column window,
 // matching the proto KeyVizRow layout. Values is parallel to
 // KeyVizMatrix.ColumnUnixMs — Values[j] is the counter for that route
 // at column j.
+//
+// Conflict is true when the Phase 2-C max-merge collapsed disagreeing
+// values from multiple nodes for the same row (see fan-out design 4.2);
+// the SPA hatches such rows so operators know the displayed total may
+// understate the true per-window count during a leadership flip. The
+// flag is row-level for now and will move to per-cell when the proto
+// extension lands in Phase 2-C+.
 type KeyVizRow struct {
 	BucketID          string   `json:"bucket_id"`
 	Start             []byte   `json:"start"`
@@ -73,6 +87,7 @@ type KeyVizRow struct {
 	RouteIDsTruncated bool     `json:"route_ids_truncated,omitempty"`
 	RouteCount        uint64   `json:"route_count"`
 	Values            []uint64 `json:"values"`
+	Conflict          bool     `json:"conflict,omitempty"`
 	// total accumulates the sum of Values during pivot so the
 	// rowBudget sort is O(N log N) on a precomputed key rather
 	// than O(N log N × M) recomputing the sum per comparison.
@@ -99,6 +114,11 @@ type KeyVizHandler struct {
 	source KeyVizSource
 	now    func() time.Time
 	logger *slog.Logger
+	// fanout is non-nil when the operator configured
+	// --keyvizFanoutNodes. When set, ServeHTTP merges the local
+	// matrix with peer responses before encoding the JSON body.
+	// nil keeps the legacy single-node behaviour.
+	fanout *KeyVizFanout
 }
 
 // NewKeyVizHandler wires a KeyVizSource into the HTTP handler.
@@ -131,6 +151,14 @@ func (h *KeyVizHandler) WithClock(now func() time.Time) *KeyVizHandler {
 	return h
 }
 
+// WithFanout enables cluster-wide fan-out aggregation. Pass nil to
+// disable; passing a configured aggregator switches the handler to
+// merge the local matrix with peer responses on every request.
+func (h *KeyVizHandler) WithFanout(f *KeyVizFanout) *KeyVizHandler {
+	h.fanout = f
+	return h
+}
+
 func (h *KeyVizHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET")
@@ -149,6 +177,9 @@ func (h *KeyVizHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cols := h.source.Snapshot(params.from, params.to)
 	matrix := pivotKeyVizColumns(cols, params.series, params.rows)
 	matrix.GeneratedAt = h.now()
+	if h.fanout != nil {
+		matrix = h.fanout.Run(r.Context(), params, matrix)
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)

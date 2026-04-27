@@ -61,6 +61,12 @@ type ServerDeps struct {
 	// off" state instead of an empty matrix.
 	KeyViz KeyVizSource
 
+	// KeyVizFanout enables Phase 2-C cluster-wide aggregation. When
+	// non-nil, the keyviz handler merges the local matrix with the
+	// configured peer set on every request. Optional: leaving it nil
+	// preserves the legacy single-node behaviour.
+	KeyVizFanout *KeyVizFanout
+
 	// Queues is the SQS admin source — covers list, describe, and
 	// delete via QueuesSource. Optional: a nil value disables
 	// /admin/api/v1/sqs/queues{,/{name}} (the mux answers them
@@ -119,7 +125,8 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	// KeyViz handler is always registered: even when the source is
 	// nil it serves a 503 keyviz_disabled, which the SPA renders as
 	// a clearer "feature off" state than an unknown_endpoint 404.
-	keyviz := NewKeyVizHandler(deps.KeyViz).WithLogger(logger)
+	// Fan-out is opt-in: nil leaves the handler in single-node mode.
+	keyviz := NewKeyVizHandler(deps.KeyViz).WithLogger(logger).WithFanout(deps.KeyVizFanout)
 	sqs := buildSqsHandlerForDeps(deps, logger)
 	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, sqs, logger)
 	router := NewRouter(mux, deps.StaticFS)
