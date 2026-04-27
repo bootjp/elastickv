@@ -160,9 +160,22 @@ func TestMergeKeyVizMatricesDistinctRowsPreserveOrder(t *testing.T) {
 // this, peers reject every fan-out call with 401 missing-session-
 // cookie and the cluster heatmap collapses to "1 of N nodes
 // responded".
+//
+// Pins both halves of the cookie contract:
+//   - admin_session and admin_csrf are forwarded with their values
+//     verbatim.
+//   - Unrelated cookies present on the inbound request are
+//     **dropped** rather than leaked to peer nodes (Gemini
+//     security-medium on PR #692).
+//   - The peer call carries the X-Admin-Fanout-Peer header so the
+//     receiving handler can short-circuit its own fan-out (Claude
+//     bot P1 on PR #692; the receiving check is in
+//     KeyVizHandler.ServeHTTP and is exercised by
+//     TestKeyVizHandlerSkipsFanoutForPeerCall in
+//     keyviz_handler_test.go).
 func TestKeyVizFanoutRunForwardsCookies(t *testing.T) {
 	t.Parallel()
-	var seenCookies [][]*http.Cookie
+	var seenRequests []*http.Request
 	var seenMu sync.Mutex
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/admin/api/v1/keyviz/matrix") {
@@ -170,7 +183,7 @@ func TestKeyVizFanoutRunForwardsCookies(t *testing.T) {
 			return
 		}
 		seenMu.Lock()
-		seenCookies = append(seenCookies, r.Cookies())
+		seenRequests = append(seenRequests, r.Clone(context.Background()))
 		seenMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -182,19 +195,27 @@ func TestKeyVizFanoutRunForwardsCookies(t *testing.T) {
 	cookies := []*http.Cookie{
 		{Name: "admin_session", Value: "session-token-abc"},
 		{Name: "admin_csrf", Value: "csrf-token-def"},
+		{Name: "unrelated_app_session", Value: "should-not-leak"},
 	}
 	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads}, cookies)
+	require.NotNil(t, merged.Fanout, "fan-out result must be present")
+	require.Len(t, merged.Fanout.Nodes, 2, "self + 1 peer = 2 nodes (Claude bot P2 on PR #692)")
 	require.True(t, merged.Fanout.Nodes[1].OK)
+
 	seenMu.Lock()
 	defer seenMu.Unlock()
-	require.Len(t, seenCookies, 1)
-	got := seenCookies[0]
+	require.Len(t, seenRequests, 1)
+	got := seenRequests[0].Cookies()
 	names := make(map[string]string, len(got))
 	for _, c := range got {
 		names[c.Name] = c.Value
 	}
 	require.Equal(t, "session-token-abc", names["admin_session"], "session cookie must be forwarded verbatim")
-	require.Equal(t, "csrf-token-def", names["admin_csrf"], "all inbound cookies forwarded; CSRF is innocuous on a GET")
+	require.Equal(t, "csrf-token-def", names["admin_csrf"], "csrf cookie forwarded; harmless on a GET but kept for parity")
+	require.NotContains(t, names, "unrelated_app_session",
+		"unrelated cookies must be dropped; only admin_session/admin_csrf are whitelisted")
+	require.Equal(t, "1", seenRequests[0].Header.Get(keyVizFanoutPeerHeader),
+		"peer marker header must be set so the receiver short-circuits its own fan-out")
 }
 
 // TestKeyVizFanoutRunSinglePeerOK exercises the end-to-end happy

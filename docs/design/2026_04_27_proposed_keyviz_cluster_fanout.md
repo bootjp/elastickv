@@ -132,12 +132,22 @@ elastickv \
   network); the HTTP client uses `http://`. A follow-up will
   introduce `--keyvizFanoutTLS` once the rest of the admin path
   has TLS too.
-- **Auth (Phase 2-C MVP)**: the aggregator forwards the inbound
-  user's `admin_session` cookie (and any other cookies the request
-  carries) on every peer call. The peer's `SessionAuth` middleware
-  verifies the cookie against its own `--adminSessionSigningKey`;
+- **Auth (Phase 2-C MVP)**: the aggregator forwards a whitelist of
+  the inbound user's cookies (`admin_session` + `admin_csrf` only)
+  on every peer call. The peer's `SessionAuth` middleware verifies
+  `admin_session` against its own `--adminSessionSigningKey`;
   cluster nodes already share that key for HA, so a cookie minted
   on node A is verifiable on node B without any new infrastructure.
+  Unrelated cookies the browser may carry (analytics, feature
+  flags, other-app sessions on the same domain) are dropped at the
+  fan-out boundary so they are not leaked across the internal
+  network (Gemini security-medium on PR #692).
+- **Recursion guard**: peer requests carry an `X-Admin-Fanout-Peer`
+  header. The receiving handler short-circuits its own fan-out
+  when this header is set; without the guard, a symmetric
+  configuration (every node lists every other node) would generate
+  O(N²) HTTP calls per browser poll as each peer recursively
+  fanned out. (Claude bot P1 on PR #692.)
   - The earlier draft of this paragraph said "anonymous on a
     private network" — that was wrong: the receiving side enforces
     session auth, so anonymous calls are rejected with 401 and the
