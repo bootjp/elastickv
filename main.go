@@ -137,7 +137,18 @@ var (
 	keyvizMaxTrackedRoutes       = flag.Int("keyvizMaxTrackedRoutes", keyviz.DefaultMaxTrackedRoutes, "Maximum routes tracked individually before excess routes coarsen into virtual buckets")
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
+	// Phase 2-C cluster fan-out: comma-separated list of admin
+	// HTTP endpoints (host:port or scheme://host:port). When set,
+	// the admin keyviz handler aggregates the local matrix with
+	// peer responses; when empty, behaviour is unchanged
+	// (single-node view). See docs/design/2026_04_27_proposed_keyviz_cluster_fanout.md.
+	keyvizFanoutNodes   = flag.String("keyvizFanoutNodes", "", "Comma-separated peer admin endpoints (host:port) for keyviz cluster-wide fan-out; empty disables")
+	keyvizFanoutTimeout = flag.Duration("keyvizFanoutTimeout", keyvizFanoutDefaultTimeout, "Per-peer timeout for keyviz fan-out HTTP calls")
 )
+
+// keyvizFanoutDefaultTimeout matches design 9 open-question 2: 2 s
+// per peer call. Operators on weird networks override via the flag.
+const keyvizFanoutDefaultTimeout = 2 * time.Second
 
 const adminTokenMaxBytes = 4 << 10
 
@@ -765,7 +776,11 @@ func startServers(in serversInput) error {
 	// the handler hands ErrTablesNotLeader writes to the forwarder
 	// which dials the leader over the cached gRPC pool. Without these
 	// the handler falls back to 503 + Retry-After:1.
-	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler); err != nil {
+	fanoutCfg := keyVizFanoutConfig{
+		Nodes:   parseCSV(*keyvizFanoutNodes),
+		Timeout: *keyvizFanoutTimeout,
+	}
+	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler, fanoutCfg); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
 	return nil

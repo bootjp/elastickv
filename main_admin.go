@@ -65,6 +65,13 @@ type adminListenerConfig struct {
 // up the admin listener. It owns the flag → config translation and the
 // credentials loading so run() does not inherit that complexity.
 //
+// keyVizFanoutConfig bundles the operator-supplied fan-out flags.
+// Empty Nodes leaves the keyviz handler in single-node mode.
+type keyVizFanoutConfig struct {
+	Nodes   []string
+	Timeout time.Duration
+}
+
 // When admin is disabled (the default) the function returns immediately
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
@@ -80,6 +87,7 @@ func startAdminFromFlags(
 	coordinate kv.Coordinator,
 	connCache *kv.GRPCConnCache,
 	keyvizSampler *keyviz.MemSampler,
+	keyvizFanoutCfg keyVizFanoutConfig,
 ) error {
 	if !*adminEnabled {
 		return nil
@@ -127,7 +135,7 @@ func startAdminFromFlags(
 	if err != nil {
 		return errors.Wrap(err, "build admin leader forwarder")
 	}
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, keyvizSampler, buildVersion())
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, keyvizSampler, keyvizFanoutCfg, buildVersion())
 	return err
 }
 
@@ -630,6 +638,7 @@ func startAdminServer(
 	queues admin.QueuesSource,
 	forwarder admin.LeaderForwarder,
 	keyvizSampler *keyviz.MemSampler,
+	keyvizFanoutCfg keyVizFanoutConfig,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -637,7 +646,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, keyvizSampler)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, keyvizSampler, keyvizFanoutCfg)
 	if err != nil {
 		return "", err
 	}
@@ -677,7 +686,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, keyvizSampler *keyviz.MemSampler) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg keyVizFanoutConfig) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -695,17 +704,18 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		return nil, errors.Wrap(err, "open embedded admin SPA")
 	}
 	server, err := admin.NewServer(admin.ServerDeps{
-		Signer:      signer,
-		Verifier:    verifier,
-		Credentials: admin.MapCredentialStore(creds),
-		Roles:       adminCfg.RoleIndex(),
-		ClusterInfo: cluster,
-		Tables:      tables,
-		Buckets:     buckets,
-		Queues:      queues,
-		Forwarder:   forwarder,
-		KeyViz:      keyvizSourceFromSampler(keyvizSampler),
-		StaticFS:    staticFS,
+		Signer:       signer,
+		Verifier:     verifier,
+		Credentials:  admin.MapCredentialStore(creds),
+		Roles:        adminCfg.RoleIndex(),
+		ClusterInfo:  cluster,
+		Tables:       tables,
+		Buckets:      buckets,
+		Queues:       queues,
+		Forwarder:    forwarder,
+		KeyViz:       keyvizSourceFromSampler(keyvizSampler),
+		KeyVizFanout: buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
+		StaticFS:     staticFS,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
@@ -836,6 +846,80 @@ func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
 		return nil
 	}
 	return s
+}
+
+// buildKeyVizFanout assembles the Phase 2-C fan-out aggregator from
+// the operator-supplied flag values. selfListen is the local admin
+// listener address (used to filter the local node out of the peer
+// list so symmetric `--keyvizFanoutNodes=node1,node2,node3` configs
+// stamped onto every host do not loop back over HTTP). Returns nil
+// when no peers remain after filtering, leaving the keyviz handler
+// in single-node mode.
+//
+// The matching rule is conservative: a peer is treated as "self"
+// when its host:port equals selfListen literally OR when it equals
+// selfListen with the host normalised to 127.0.0.1 (operators
+// commonly bind admin to 0.0.0.0 but list 127.0.0.1 as the
+// per-host fan-out entry). Anything else is treated as a peer.
+func buildKeyVizFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizFanout {
+	if len(cfg.Nodes) == 0 {
+		return nil
+	}
+	peers := make([]string, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		if isSelfFanoutNode(selfListen, n) {
+			continue
+		}
+		peers = append(peers, n)
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	f := admin.NewKeyVizFanout(selfListen, peers)
+	if cfg.Timeout > 0 {
+		f = f.WithTimeout(cfg.Timeout)
+	}
+	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.fanout")))
+}
+
+// isSelfFanoutNode returns true when n names this node's own admin
+// listener. A relaxed match handles the common bind-vs-advertise
+// asymmetry: bind on 0.0.0.0:8080 but advertise (and list) as
+// 127.0.0.1:8080.
+func isSelfFanoutNode(selfListen, n string) bool {
+	n = strings.TrimSpace(n)
+	if n == "" {
+		return true
+	}
+	stripped := stripScheme(n)
+	if stripped == selfListen {
+		return true
+	}
+	host, port, err := net.SplitHostPort(stripped)
+	if err != nil {
+		return false
+	}
+	selfHost, selfPort, err := net.SplitHostPort(selfListen)
+	if err != nil || port != selfPort {
+		return false
+	}
+	if isWildcardHost(selfHost) {
+		return isLoopbackHost(host)
+	}
+	return host == selfHost
+}
+
+func isWildcardHost(h string) bool { return h == "0.0.0.0" || h == "::" || h == "" }
+
+func isLoopbackHost(h string) bool {
+	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+func stripScheme(raw string) string {
+	if i := strings.Index(raw, "://"); i >= 0 {
+		return raw[i+3:]
+	}
+	return raw
 }
 
 // parseCSV splits a flag value like "a,b,c" into a slice with empty and
