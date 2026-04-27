@@ -182,10 +182,15 @@ respectively (sum and max). Same justification.
 ### 4.4 Row identity
 
 Two rows from different nodes belong to the same logical row when
-their `BucketID` matches. `Start` / `End` / `Aggregate` /
-`RouteCount` / `RouteIDs` are taken from the **first non-empty
-node response** (deterministic by node order in
-`--keyvizFanoutNodes`). If two nodes disagree on `Start`/`End`
+their `BucketID` matches. After the aggregator has collected **all**
+per-node responses (i.e. waited for every peer's deadline to
+resolve), `Start` / `End` / `Aggregate` / `RouteCount` / `RouteIDs`
+are taken from the **lowest-indexed node in `--keyvizFanoutNodes`
+whose response is non-empty for the row**. Selection by config-list
+position rather than wall-clock arrival order is the load-bearing
+property: peers respond in non-deterministic order, so picking on
+first arrival would let `Start`/`End` flap between polls for the
+same bucket. If two nodes disagree on `Start`/`End`
 for the same `BucketID`, that indicates a routing-catalog
 divergence the operator should investigate; we surface it as a
 warning in the per-node status payload but do not block the
@@ -306,7 +311,8 @@ PR 3 (Phase 2-C+):
    would invent traffic) and the conflict flag tells operators
    when the data is soft.
 2. **Concurrency / distributed** — Per-node calls are issued in
-   parallel with a 5-second ceiling per node. The aggregator
+   parallel with the configured per-call timeout (default 2 s,
+   override via `--keyvizFanoutTimeout` per §3). The aggregator
    itself is single-goroutine (waits for all peer responses then
    merges). No shared mutable state between concurrent fan-out
    requests.
@@ -318,21 +324,31 @@ PR 3 (Phase 2-C+):
    not touched. **Per-peer response body is capped at 64 MiB**
    via `io.LimitReader` — a misbehaving or compromised peer that
    streams gigabytes back at us would otherwise pin a goroutine
-   on the JSON decoder and balloon memory; the cap is generous
-   enough for the worst-case design payload (1024 rows × 4096
-   columns × ~32 B per uint64 ≈ 128 MiB raw, ~32 MiB
-   JSON-encoded). Over-cap responses log a warning rather than
-   silently truncating. (Gemini security-medium PR #685.)
+   on the JSON decoder and balloon memory. Sizing: at the design
+   ceiling of 1024 rows × 4096 columns × 8 B/uint64 the raw binary
+   payload is ~32 MiB; JSON encodes uint64 traffic counters at a
+   similar size for typical small values, so 64 MiB gives ≥2×
+   headroom. Beyond that, note that `MaxHistoryColumns` in the
+   sampler is **100 000** at the upper bound; a peer that returns
+   the full ring (~1024 rows × 100 000 cols ≈ 800 MiB raw) would
+   trip the cap. The cap firing surfaces as a JSON-decode error
+   from the peer (the LimitReader returns EOF mid-stream), which
+   the aggregator records as `ok=false` with the decode error in
+   that node's status entry plus a `WARN`-level server log. No
+   partial data is accepted. Operators who actually want >64 MiB
+   peer responses should override via a future flag; for now the
+   conservative default is the correct trade. (Gemini PR #685.)
 4. **Data consistency** — Merge rules are conservative under
    leadership transitions (under-count + conflict flag, never
    over-count). Reads are exact in steady state and during
    transitions. The §9.1 canonical rule is preserved as a Phase
    2-C+ contract once we extend the wire format.
 5. **Test coverage** — `internal/admin/keyviz_fanout_test.go`
-   table-driven across the four scenarios in §7 PR-1. Existing
-   handler tests unchanged when fan-out is disabled (the default).
-   The synthetic-burst test at `keyviz/sampler_test.go` is
-   unaffected.
+   table-driven across the §7 PR-1 scenarios (stable-leader,
+   leadership-flip, partial failure) plus url-builder variants,
+   per-node order, and the over-cap path. Existing handler tests
+   unchanged when fan-out is disabled (the default). The
+   synthetic-burst test at `keyviz/sampler_test.go` is unaffected.
 
 ## 9. Open questions
 
@@ -348,11 +364,11 @@ PR 3 (Phase 2-C+):
    should colocate a caching resolver (the standard fix for any
    short-lived HTTP client, not specific to this feature).
    (Gemini round-1 PR #685.)
-2. Should the per-node call budget be `2 × keyvizStep` or a fixed
-   2 s? Tying it to `keyvizStep` means a 60-second-step config
-   would let a slow peer hold the request for ~2 minutes. Fixed
-   2 s with a `--keyvizFanoutTimeout` override for operators on
-   weird networks is probably the right shape — proposing this.
+2. **Resolved**: per-node call budget is a fixed 2 s default with
+   `--keyvizFanoutTimeout` operator override. Tying the timeout to
+   `keyvizStep` would let a 60-second-step config hold the request
+   for ~2 minutes against a slow peer; the fixed default decouples
+   the fan-out wall time from the sampling cadence. See §3.
 3. Should the fan-out response include each node's `generated_at`
    so the SPA can detect skew? Probably yes — adds one timestamp
    per node entry, no real cost. Defer the SPA UI to PR 2.
