@@ -687,9 +687,16 @@ func addThrottleAttributes(out map[string]string, t *sqsQueueThrottle) {
 }
 
 // validateThrottlePair runs the per-(action, capacity, refill) checks.
-// requireBatchCapacity gates the capacity ≥ 10 rule so the catch-all
-// Default* bucket (no batch verbs in scope today) does not get the
-// extra constraint.
+// requireBatchCapacity gates the capacity ≥ 10 rule. All three action
+// sets (Send*, Recv*, Default*) currently pass requireBatchCapacity =
+// true: an earlier draft exempted Default* on the assumption that the
+// catch-all bucket had no batch verb in scope, but resolveActionConfig
+// in sqs_throttle.go falls Send/Receive traffic through to Default
+// whenever the dedicated pair is unset, so batch verbs (SendMessageBatch
+// charges up to 10, DeleteMessageBatch charges up to 10) can still
+// land on the Default bucket. The flag stays a parameter so a future
+// caller that has a true non-batch action can opt out, but no
+// production caller does today.
 func validateThrottlePair(prefix string, capacity, refill float64, requireBatchCapacity bool) error {
 	if capacity == 0 && refill == 0 {
 		return nil
