@@ -1095,44 +1095,74 @@ func BenchmarkObserveMiss(b *testing.B) {
 }
 
 // BenchmarkObserveParallel pins the contention profile of the hot
-// path. Each goroutine hits a distinct slot so the only shared work
-// is the atomic.Pointer load of the route table; per-slot atomic
-// adds do not contend across goroutines. A regression that adds a
-// shared mutex (or a global counter) on the hot path will show up
-// as a sharp drop in ns/op as the parallelism rises.
+// path. Each goroutine is shard-pinned to a disjoint range of route
+// IDs so per-slot atomic adds genuinely never contend across
+// goroutines and the only shared work is the atomic.Pointer load of
+// the route table. A regression that adds a shared mutex (or a
+// global counter) on the hot path will show up as a sharp drop in
+// ns/op as parallelism rises.
+//
+// The earlier draft used a per-worker `var i uint64` counter which
+// always started at zero, so all workers walked the same route
+// sequence in lockstep — that defeated the "distinct slot" claim
+// and the benchmark would have masked false-sharing regressions
+// (Codex P2 / Gemini medium on PR #682).
 func BenchmarkObserveParallel(b *testing.B) {
-	const numRoutes = 64
+	const (
+		numRoutes      = 64
+		routesPerShard = 4
+	)
 	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, MaxTrackedRoutes: numRoutes})
 	for r := uint64(1); r <= numRoutes; r++ {
 		if !s.RegisterRoute(r, []byte{byte(r)}, []byte{byte(r) + 1}) {
 			b.Fatalf("RegisterRoute(%d) returned false", r)
 		}
 	}
+	var nextShard atomic.Uint64
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
+		shardIndex := nextShard.Add(1) - 1
+		shardBase := (shardIndex * routesPerShard) % numRoutes
 		var i uint64
 		for pb.Next() {
+			s.Observe(shardBase+(i%routesPerShard)+1, OpWrite, 16, 64)
 			i++
-			s.Observe((i%numRoutes)+1, OpWrite, 16, 64)
 		}
 	})
 }
 
 // BenchmarkRegisterRoute pins the route-mutation path: each call
 // takes routesMu, deep-copies the immutable routeTable, mutates, and
-// republishes via atomic.Store. The b.N route IDs grow monotonically
-// so each iteration sees the previous Register's larger table — the
-// shape that exercises the COW cost. A regression that switches to
-// a shared mutable map shows up as a flat ns/op (no growth with N).
+// republishes via atomic.Store. The benchmark holds a fixed-size
+// table (registerBenchTableSize routes pre-loaded) and toggles a
+// route in/out on each iteration so b.N controls the iteration count
+// only — not the table size. The earlier draft made b.N drive both
+// the iteration count and the MaxTrackedRoutes cap, which produced an
+// O(N²) total cost and made ns/op (which Go derives by dividing total
+// time by b.N) read as growing-with-N even though per-call cost was
+// constant (Gemini medium on PR #682).
 func BenchmarkRegisterRoute(b *testing.B) {
-	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, MaxTrackedRoutes: b.N + 1})
+	const registerBenchTableSize = 1024
+	s := NewMemSampler(MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: registerBenchTableSize + 1,
+	})
+	for r := uint64(1); r <= registerBenchTableSize; r++ {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
+			b.Fatalf("seed RegisterRoute(%d) returned false", r)
+		}
+	}
+	churnID := uint64(registerBenchTableSize + 1)
+	startKey := []byte{byte(churnID >> 8), byte(churnID & 0xFF)}
+	endKey := []byte{byte((churnID + 1) >> 8), byte((churnID + 1) & 0xFF)}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		id := uint64(i + 1) //nolint:gosec // i bounded by b.N
-		if !s.RegisterRoute(id, []byte{byte(id)}, []byte{byte(id) + 1}) {
-			b.Fatalf("RegisterRoute(%d) returned false at i=%d", id, i)
+		s.RemoveRoute(churnID)
+		if !s.RegisterRoute(churnID, startKey, endKey) {
+			b.Fatalf("RegisterRoute(%d) returned false at i=%d", churnID, i)
 		}
 	}
 }
@@ -1143,6 +1173,12 @@ func BenchmarkRegisterRoute(b *testing.B) {
 // race with this drain (atomic-only for both sides), but Flush itself
 // scales with the live route count — pin its cost so we notice if
 // a future change adds e.g. an O(N²) slot scan.
+//
+// b.StopTimer brackets the per-iteration reseed loop so the reported
+// ns/op reflects the Flush cost only. Including the 1024 Observe
+// calls in the timed range inflated the number by ~25% and let a
+// real Flush regression hide behind Observe variance (Gemini medium
+// on PR #682).
 func BenchmarkFlush(b *testing.B) {
 	const numRoutes = 1024
 	clk := &fakeClock{now: time.Unix(1_700_000_000, 0)}
@@ -1156,18 +1192,20 @@ func BenchmarkFlush(b *testing.B) {
 		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
 			b.Fatalf("RegisterRoute(%d) returned false", r)
 		}
-		// Pre-seed every slot with traffic so Flush has work to swap.
+		// Pre-seed every slot with traffic so the first Flush has work to swap.
 		s.Observe(r, OpWrite, 16, 64)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		s.Flush()
+		b.StopTimer()
 		clk.Advance(time.Second)
 		// Reseed so the next Flush still has counters to drain.
 		for r := uint64(1); r <= numRoutes; r++ {
 			s.Observe(r, OpWrite, 16, 64)
 		}
+		b.StartTimer()
 	}
 }
 
@@ -1245,7 +1283,21 @@ func TestObserveExactCountUnderConcurrentBurst(t *testing.T) {
 	}
 	const expectedPerRoute = uint64(writersPerRoute * opsPerWriter)
 	const expectedBytesPerRoute = expectedPerRoute * uint64(keyLen+valueLen)
+
+	// Codex P1 on PR #682: assert every registered route appears in
+	// the column. Without this index, a future Flush regression that
+	// silently drops a route's row would still pass the per-row
+	// counter checks below — the loop would just iterate fewer times.
+	rowsByRoute := make(map[uint64]MatrixRow, numRoutes)
 	for _, row := range cols[0].Rows {
+		rowsByRoute[row.RouteID] = row
+	}
+	for r := uint64(1); r <= numRoutes; r++ {
+		row, ok := rowsByRoute[r]
+		if !ok {
+			t.Errorf("route %d: missing from Snapshot rows; Flush must not silently drop a registered route under burst", r)
+			continue
+		}
 		if row.Writes != expectedPerRoute {
 			t.Errorf("route %d: writes = %d, want exactly %d (no counts must be lost under concurrent burst)",
 				row.RouteID, row.Writes, expectedPerRoute)
