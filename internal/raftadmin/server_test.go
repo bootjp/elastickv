@@ -185,6 +185,22 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(11), addResp.Index)
 
+	addLearnerResp, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{
+		Id:            "node-4",
+		Address:       "127.0.0.1:50054",
+		PreviousIndex: 6,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(33), addLearnerResp.Index)
+
+	promoteResp, err := server.PromoteLearner(context.Background(), &pb.RaftAdminPromoteLearnerRequest{
+		Id:              "node-4",
+		PreviousIndex:   7,
+		MinAppliedIndex: 99,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(44), promoteResp.Index)
+
 	removeResp, err := server.RemoveServer(context.Background(), &pb.RaftAdminRemoveServerRequest{
 		Id:            "node-2",
 		PreviousIndex: 5,
@@ -203,6 +219,8 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	require.Equal(t, []fakeAddVoterCall{{id: "node-3", address: "127.0.0.1:50053", prevIndex: 4}}, engine.addVoterCalls)
+	require.Equal(t, []fakeAddVoterCall{{id: "node-4", address: "127.0.0.1:50054", prevIndex: 6}}, engine.addLearnerCalls)
+	require.Equal(t, []fakePromoteLearnerCall{{id: "node-4", prevIndex: 7, minAppliedIndex: 99}}, engine.promoteLearnerCalls)
 	require.Equal(t, []fakeRemoveServerCall{{id: "node-2", prevIndex: 5}}, engine.removeServerCalls)
 	require.Equal(t, 1, engine.transferCalls)
 	require.Equal(t, []fakeTransferCall{{id: "node-2", address: "127.0.0.1:50052"}}, engine.targetTransferCalls)

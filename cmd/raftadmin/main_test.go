@@ -35,6 +35,14 @@ func (fakeRaftAdminClient) AddVoter(context.Context, *pb.RaftAdminAddVoterReques
 	return &pb.RaftAdminConfigurationChangeResponse{Index: 1}, nil
 }
 
+func (fakeRaftAdminClient) AddLearner(context.Context, *pb.RaftAdminAddLearnerRequest, ...grpc.CallOption) (*pb.RaftAdminConfigurationChangeResponse, error) {
+	return &pb.RaftAdminConfigurationChangeResponse{Index: 2}, nil
+}
+
+func (fakeRaftAdminClient) PromoteLearner(context.Context, *pb.RaftAdminPromoteLearnerRequest, ...grpc.CallOption) (*pb.RaftAdminConfigurationChangeResponse, error) {
+	return &pb.RaftAdminConfigurationChangeResponse{Index: 3}, nil
+}
+
 func (fakeRaftAdminClient) RemoveServer(context.Context, *pb.RaftAdminRemoveServerRequest, ...grpc.CallOption) (*pb.RaftAdminConfigurationChangeResponse, error) {
 	return &pb.RaftAdminConfigurationChangeResponse{Index: 1}, nil
 }
@@ -79,13 +87,32 @@ func TestRPCTimeoutRejectsInvalidEnv(t *testing.T) {
 
 func TestUsageErrorForCommand(t *testing.T) {
 	require.EqualError(t, usageError("add_voter"), "usage: raftadmin <addr> add_voter <id> <address> [previous_index]")
+	require.EqualError(t, usageError("add_learner"), "usage: raftadmin <addr> add_learner <id> <address> [previous_index]")
+	require.EqualError(t, usageError("promote_learner"), "usage: raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index]")
 	require.EqualError(t, usageError("remove_server"), "usage: raftadmin <addr> remove_server <id> [previous_index]")
 	require.EqualError(t, usageError("leadership_transfer_to_server"), "usage: raftadmin <addr> leadership_transfer_to_server <id> <address>")
 }
 
 func TestUsageErrorFallback(t *testing.T) {
-	require.EqualError(t, usageError(""), "usage: raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]")
-	require.EqualError(t, usageError("unknown"), "usage: raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]")
+	want := "usage: raftadmin <addr> <leader|state|configuration|add_voter|add_learner|promote_learner|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
+	require.EqualError(t, usageError(""), want)
+	require.EqualError(t, usageError("unknown"), want)
+}
+
+func TestExecuteCommandAddLearnerPrintsIndex(t *testing.T) {
+	client := fakeRaftAdminClient{}
+	out := captureStdout(t, func() {
+		require.NoError(t, executeCommand(context.Background(), client, "add_learner", []string{"node-X", "127.0.0.1:50099", "5"}))
+	})
+	require.Equal(t, "index: 2\n", out)
+}
+
+func TestExecuteCommandPromoteLearnerPrintsIndex(t *testing.T) {
+	client := fakeRaftAdminClient{}
+	out := captureStdout(t, func() {
+		require.NoError(t, executeCommand(context.Background(), client, "promote_learner", []string{"node-X", "5", "100"}))
+	})
+	require.Equal(t, "index: 3\n", out)
 }
 
 func TestAllowInsecurePlaintextLoopbackByDefault(t *testing.T) {

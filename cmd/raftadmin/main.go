@@ -23,8 +23,13 @@ const (
 	defaultRPCTimeoutSeconds = 5
 	minCommandArgs           = 2
 	addVoterArgCount         = 2
+	addLearnerArgCount       = 2
+	promoteLearnerArgCount   = 1
 	transferArgCount         = 2
 	addVoterPrevIndex        = 2
+	addLearnerPrevIndex      = 2
+	promoteLearnerPrevIndex  = 1
+	promoteLearnerMinApplied = 2
 	removePrevIndex          = 1
 	timeoutEnv               = "RAFTADMIN_RPC_TIMEOUT_SECONDS"
 	allowInsecureEnv         = "RAFTADMIN_ALLOW_INSECURE"
@@ -179,16 +184,26 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func readOnlyCommands() map[string]func(context.Context, pb.RaftAdminClient) error {
+	return map[string]func(context.Context, pb.RaftAdminClient) error{
+		"leader":        printLeader,
+		"state":         printState,
+		"configuration": printConfiguration,
+		"config":        printConfiguration,
+	}
+}
+
 func executeCommand(ctx context.Context, client pb.RaftAdminClient, command string, commandArgs []string) error {
+	if handler, ok := readOnlyCommands()[command]; ok {
+		return handler(ctx, client)
+	}
 	switch command {
-	case "leader":
-		return printLeader(ctx, client)
-	case "state":
-		return printState(ctx, client)
-	case "configuration", "config":
-		return printConfiguration(ctx, client)
 	case "add_voter":
 		return addVoter(ctx, client, commandArgs)
+	case "add_learner":
+		return addLearner(ctx, client, commandArgs)
+	case "promote_learner":
+		return promoteLearner(ctx, client, commandArgs)
 	case "remove_server":
 		return removeServer(ctx, client, commandArgs)
 	case "leadership_transfer":
@@ -253,6 +268,50 @@ func addVoter(ctx context.Context, client pb.RaftAdminClient, args []string) err
 	})
 	if err != nil {
 		return errors.Wrap(err, "add voter")
+	}
+	fmt.Printf("index: %d\n", resp.Index)
+	return nil
+}
+
+func addLearner(ctx context.Context, client pb.RaftAdminClient, args []string) error {
+	if len(args) < addLearnerArgCount || len(args) > addLearnerArgCount+1 {
+		return usageError("add_learner")
+	}
+	prevIndex, err := parseOptionalUint64(args, addLearnerPrevIndex)
+	if err != nil {
+		return err
+	}
+	resp, err := client.AddLearner(ctx, &pb.RaftAdminAddLearnerRequest{
+		Id:            args[0],
+		Address:       args[1],
+		PreviousIndex: prevIndex,
+	})
+	if err != nil {
+		return errors.Wrap(err, "add learner")
+	}
+	fmt.Printf("index: %d\n", resp.Index)
+	return nil
+}
+
+func promoteLearner(ctx context.Context, client pb.RaftAdminClient, args []string) error {
+	if len(args) < promoteLearnerArgCount || len(args) > promoteLearnerArgCount+2 {
+		return usageError("promote_learner")
+	}
+	prevIndex, err := parseOptionalUint64(args, promoteLearnerPrevIndex)
+	if err != nil {
+		return err
+	}
+	minApplied, err := parseOptionalUint64(args, promoteLearnerMinApplied)
+	if err != nil {
+		return err
+	}
+	resp, err := client.PromoteLearner(ctx, &pb.RaftAdminPromoteLearnerRequest{
+		Id:              args[0],
+		PreviousIndex:   prevIndex,
+		MinAppliedIndex: minApplied,
+	})
+	if err != nil {
+		return errors.Wrap(err, "promote learner")
 	}
 	fmt.Printf("index: %d\n", resp.Index)
 	return nil
@@ -336,23 +395,24 @@ func usageError(command string) error {
 	return fmt.Errorf("usage: %s", usage(command))
 }
 
+var usageStrings = map[string]string{
+	"leader":                        "raftadmin <addr> leader",
+	"state":                         "raftadmin <addr> state",
+	"configuration":                 "raftadmin <addr> configuration",
+	"config":                        "raftadmin <addr> configuration",
+	"add_voter":                     "raftadmin <addr> add_voter <id> <address> [previous_index]",
+	"add_learner":                   "raftadmin <addr> add_learner <id> <address> [previous_index]",
+	"promote_learner":               "raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index]",
+	"remove_server":                 "raftadmin <addr> remove_server <id> [previous_index]",
+	"leadership_transfer":           "raftadmin <addr> leadership_transfer",
+	"leadership_transfer_to_server": "raftadmin <addr> leadership_transfer_to_server <id> <address>",
+}
+
+const usageFallback = "raftadmin <addr> <leader|state|configuration|add_voter|add_learner|promote_learner|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
+
 func usage(command string) string {
-	switch command {
-	case "leader":
-		return "raftadmin <addr> leader"
-	case "state":
-		return "raftadmin <addr> state"
-	case "configuration", "config":
-		return "raftadmin <addr> configuration"
-	case "add_voter":
-		return "raftadmin <addr> add_voter <id> <address> [previous_index]"
-	case "remove_server":
-		return "raftadmin <addr> remove_server <id> [previous_index]"
-	case "leadership_transfer":
-		return "raftadmin <addr> leadership_transfer"
-	case "leadership_transfer_to_server":
-		return "raftadmin <addr> leadership_transfer_to_server <id> <address>"
-	default:
-		return "raftadmin <addr> <leader|state|configuration|add_voter|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
+	if u, ok := usageStrings[command]; ok {
+		return u
 	}
+	return usageFallback
 }
