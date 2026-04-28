@@ -128,12 +128,19 @@ Claude bot round-11.)
 
 #### 4.1.1 Slot lifecycle and the lockless invariant
 
-The current `Observe` is `Load → map-lookup → atomic.Add` with no
-fallback: a miss is silently dropped. This is intentional —
-`RegisterRoute` pre-creates every slot before traffic arrives, so
-the hot path never needs to allocate. We keep that invariant by
-making `RegisterRoute` **pre-create one slot per known label** at
-registration time, but only on the individual-tracking path. The
+The current `Observe` is a lockless `Load → lookup → atomic.Add`
+hot path. On a miss in `tbl.slots[...]`, it may fall back to
+`tbl.virtualForRoute[...]`; if both lookups miss, the sample is
+silently dropped. The invariant is **not** "no fallback" — it is
+"`Observe` never allocates and never creates slots on the hot
+path". `RegisterRoute` pre-creates every slot before traffic
+arrives, so the hot path never needs to allocate. We keep that
+invariant by making `RegisterRoute` **pre-create one slot per
+known label** at registration time, but only on the
+individual-tracking path. (Copilot round-15-3rd-pass caught the
+earlier "no fallback" wording — the fallback exists today and
+must be preserved; what stays unchanged is the no-allocate
+property.) The
 label set is the canonical `keyviz/labels.go` constants (§9 Q2);
 per-route slot count is `len(labels) + 1` (the +1 is the empty-
 label legacy slot, kept so callers that pass `label=""` still hit
@@ -561,11 +568,16 @@ Codex round-10.)
    in the routesMu COW path; the hot-path Load + map lookup keeps
    the same shape (one lookup, one atomic add). Burst test
    updates: parametrise on (route, label) instead of just route.
-3. **Performance** — One extra map lookup per Observe via the
-   wider key. `BenchmarkObserveParallel` already pins the hot-path
-   cost; the new bench should land within run-to-run variance of
-   the current 4 ns/op. If it doesn't, the design is wrong and we
-   fall back to Option 4.2.
+3. **Performance** — The hot path still does one map lookup per
+   `Observe` (same as today); the only extra work is wider hash
+   and equality on the `{uint64, Label}` key vs the current
+   `uint64` key. `BenchmarkObserveParallel` already pins the
+   hot-path cost; the new bench should land within run-to-run
+   variance of the current 4 ns/op. If it doesn't, the design is
+   wrong and we fall back to Option 4.2. (Copilot round-15-3rd-
+   pass caught the earlier "one extra map lookup" wording, which
+   contradicted §4.1's correctly-described "same lookup count,
+   wider key shape".)
 4. **Data consistency** — Cluster fan-out merge gains a tuple
    field; the dedup invariant (per-cell, per-(route, label,
    group, term, window)) still holds. Old SPA against new server
