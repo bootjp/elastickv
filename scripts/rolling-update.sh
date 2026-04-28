@@ -180,6 +180,13 @@ ADMIN_TLS_KEY_FILE="${ADMIN_TLS_KEY_FILE:-}"
 ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
 ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 
+# KeyViz heatmap sampler. KEYVIZ_ENABLED is the master switch; the
+# remaining variables only take effect when KEYVIZ_ENABLED=true. The
+# sampler is ungated when admin is disabled (it's read-only in-memory
+# state); it just produces no callers without --adminEnabled.
+KEYVIZ_ENABLED="${KEYVIZ_ENABLED:-false}"
+KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
+
 # Validate the three boolean ADMIN_* flags must be the literal "true"
 # or "false" — they are forwarded to the remote shell unquoted (no
 # printf %q) for readability, which is only safe when the value is
@@ -187,7 +194,7 @@ ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 # who typed "True", "1", or a stray quote sees a script-level error
 # pointing at the variable name instead of an inscrutable failure
 # inside the SSH heredoc.
-for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE; do
+for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED; do
   case "${!_bool_var}" in
     true|false) ;;
     *)
@@ -526,6 +533,8 @@ update_one_node() {
       ADMIN_TLS_KEY_FILE="$ADMIN_TLS_KEY_FILE_Q" \
       ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" \
       ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
+      KEYVIZ_ENABLED="$KEYVIZ_ENABLED" \
+      KEYVIZ_FANOUT_NODES="$KEYVIZ_FANOUT_NODES_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -827,6 +836,12 @@ run_container() {
   local admin_volumes=()
   build_admin_flags admin_flags admin_volumes
 
+  # KeyViz heatmap sampler. Same opt-in shape as admin: a false
+  # KEYVIZ_ENABLED leaves keyviz_flags empty so existing deploys are
+  # unchanged.
+  local keyviz_flags=()
+  build_keyviz_flags keyviz_flags
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
@@ -845,7 +860,27 @@ run_container() {
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
     "${s3_flags[@]}" \
-    "${admin_flags[@]}" >/dev/null
+    "${admin_flags[@]}" \
+    "${keyviz_flags[@]}" >/dev/null
+}
+
+# build_keyviz_flags emits the --keyviz* flag list. Mirrors
+# build_admin_flags' nameref pattern so additional knobs (Step,
+# HistoryColumns, etc.) can drop in without touching run_container.
+# When KEYVIZ_ENABLED != "true" the array is left empty and the helper
+# returns silently — existing deploys see no behaviour change.
+build_keyviz_flags() {
+  local -n _flags="$1"
+  local enabled="${KEYVIZ_ENABLED:-false}"
+  if [[ "$enabled" != "true" ]]; then
+    return 0
+  fi
+
+  local fanout_nodes="${KEYVIZ_FANOUT_NODES:-}"
+  _flags+=(--keyvizEnabled)
+  if [[ -n "$fanout_nodes" ]]; then
+    _flags+=(--keyvizFanoutNodes "$fanout_nodes")
+  fi
 }
 
 # build_admin_flags emits the --admin* flag list and bind-mount list
@@ -1195,10 +1230,10 @@ RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 # the login shell once, so every value the operator might set has to
 # survive that pass intact. printf %q is the same hardening every
 # other forwarded path-like variable above gets.
-# The two boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*) are validated
-# at the top of the local script to be the literal "true" or "false",
-# so they need no extra escaping — kept unquoted at the env site for
-# readability.
+# The boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*, KEYVIZ_ENABLED)
+# are validated at the top of the local script to be the literal
+# "true" or "false", so they need no extra escaping — kept unquoted
+# at the env site for readability.
 ADMIN_ADDRESS_Q="$(printf '%q' "$ADMIN_ADDRESS")"
 ADMIN_FULL_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_FULL_ACCESS_KEYS")"
 ADMIN_READ_ONLY_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_READ_ONLY_ACCESS_KEYS")"
@@ -1206,6 +1241,11 @@ ADMIN_SESSION_SIGNING_KEY_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_FILE
 ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE")"
 ADMIN_TLS_CERT_FILE_Q="$(printf '%q' "$ADMIN_TLS_CERT_FILE")"
 ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
+
+# KEYVIZ_FANOUT_NODES is a comma-separated host:port list; commas
+# survive an unquoted env pass but pre-quoting keeps the pattern
+# uniform with the ADMIN_* set above.
+KEYVIZ_FANOUT_NODES_Q="$(printf '%q' "$KEYVIZ_FANOUT_NODES")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
