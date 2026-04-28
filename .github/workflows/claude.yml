@@ -30,6 +30,34 @@ jobs:
         with:
           fetch-depth: 1
 
+      # TEMPORARY diagnostic step. Verifies whether the OAuth token works
+      # against `claude --print` directly on the runner (i.e., bypassing the
+      # action / agent SDK entirely). If this step succeeds but `Run Claude
+      # Code` still fails, the bug is isolated to how the agent SDK forwards
+      # auth to its spawned child process.
+      #
+      # Token-leak hardening:
+      #   - never enables `set -x`; explicit `set +x` defends against
+      #     ACTIONS_STEP_DEBUG also enabling xtrace
+      #   - token is only referenced via env, never expanded into a command line
+      #   - install.sh stdout/stderr are dropped; no --debug / --verbose on claude
+      #   - HOME is a fresh tmp dir so cached creds are out of scope and gone
+      #     when the runner is destroyed
+      #   - GitHub Actions secret-masking covers any literal occurrence anyway
+      #
+      # Remove this step (and rotate CLAUDE_CODE_OAUTH_TOKEN) once the
+      # diagnostic question is answered.
+      - name: Sanity-check OAuth on the runner (diag only)
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +x
+          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.119 >/dev/null 2>&1
+          export PATH="$HOME/.local/bin:$PATH"
+          TMPHOME="$(mktemp -d)"
+          HOME="$TMPHOME" ANTHROPIC_API_KEY="" claude --print "ok"
+
       - name: Run Claude Code
         id: claude
         # Pinned to v1.0.107 + explicit env. As of 2026-04-28, the OAuth token
