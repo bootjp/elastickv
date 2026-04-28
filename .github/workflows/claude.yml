@@ -32,7 +32,12 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        # Pinned to v1.0.107 because v1.0.108 (auto-pulled via the `v1` rolling
+        # tag on 2026-04-28) regressed OAuth-token auth: the agent SDK throws
+        # `Could not resolve [authentication]` from validateHeaders before any
+        # work runs. Refreshing CLAUDE_CODE_OAUTH_TOKEN does not help. Bump back
+        # to `@v1` once upstream ships a fix.
+        uses: anthropics/claude-code-action@7eab1296cc65117d50ac2a2fa5f00a30ec84d3d5 # v1.0.107
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
