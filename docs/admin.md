@@ -2,7 +2,7 @@
 
 This document covers configuration and day-2 operation of the admin
 HTTP listener. Architecture and design rationale live in
-[docs/design/2026_04_24_proposed_admin_dashboard.md](design/2026_04_24_proposed_admin_dashboard.md);
+[docs/design/2026_04_24_implemented_admin_dashboard.md](design/2026_04_24_implemented_admin_dashboard.md);
 read that first if you're touching the code.
 
 ## What the admin dashboard is
@@ -336,6 +336,6 @@ to populate the embedded `dist` directory, then rebuild the binary.
 ## Cross-references
 
 - Deployment runbook: [docs/admin_deployment.md](admin_deployment.md) (login flow, rollout via `scripts/rolling-update.sh`, key/TLS rotation, failure-mode runbooks)
-- Design rationale: [docs/design/2026_04_24_proposed_admin_dashboard.md](design/2026_04_24_proposed_admin_dashboard.md) (renamed to `_partial_` in PR #675; this link will follow once that lands)
+- Design rationale: [docs/design/2026_04_24_implemented_admin_dashboard.md](design/2026_04_24_implemented_admin_dashboard.md)
 - Architecture overview: [docs/architecture_overview.md](architecture_overview.md)
 - AdminForward RPC contract: `proto/admin_forward.proto`

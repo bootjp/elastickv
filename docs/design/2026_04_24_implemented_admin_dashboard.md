@@ -1,27 +1,28 @@
 # elastickv Admin Dashboard Design
 
-**Status:** Partial — every phase of the original P1–P4 plan has shipped. The doc stays at `_partial_` (rather than `_implemented_`) because AdminForward acceptance criterion 5 (rolling-upgrade compatibility flag) is explicitly deferred and the AdminDeleteBucket TOCTOU caught during PR #669 review is tracked here as a pre-existing limitation. See the status table for the per-phase breakdown and Outstanding open items below.
+**Status:** Implemented — every phase of the original P1–P4 plan has shipped, the AdminDeleteBucket TOCTOU caught during PR #669 review is fixed (PR #695 with the two-phase split required by the production coordinator's dispatch validation), and operator documentation + deployment tooling are in place. The remaining items in §"Out-of-scope follow-ups" below are either explicitly deferred at design time or were called out as Non-goals in §2.2; none block dashboard usability today.
 **Author:** bootjp
 **Date:** 2026-04-24
-**Last updated:** 2026-04-27 (P2 write paths + P4 operator doc landed; status table refreshed)
+**Last updated:** 2026-04-28 (renamed from `_partial_` to `_implemented_` after PR #695 landed the TOCTOU safety-net fix)
 
-## Implementation status (as of 2026-04-27)
+## Implementation status (as of 2026-04-28)
 
 | Phase | Status | Landed via |
 |---|---|---|
-| **P1** — `internal/admin/` skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–4 + 6; criterion 5 deferred — see outstanding items) | ✅ shipped | #634, #635, #644, #648 |
-| **P2** — S3 bucket list/create/delete/ACL, DescribeTable | ✅ shipped | #658 (read-only slice 1) + #669 (writes, slice 2a) + #673 (AdminForward integration, slice 2b) |
+| **P1** — `internal/admin/` skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–4 + 6; criterion 5 deferred — see [follow-ups](#out-of-scope-follow-ups)) | ✅ shipped | #634, #635, #644, #648 |
+| **P2** — S3 bucket list/create/delete/ACL, DescribeTable | ✅ shipped | #658 (read-only slice 1) + #669 (writes, slice 2a) + #673 (AdminForward integration, slice 2b) + #695 (AdminDeleteBucket TOCTOU safety net) |
 | **P3** — React SPA + embed | ✅ shipped | #649, #650 |
 | **P4** — TLS, read-only role, CSRF, `docs/admin.md`, deployment runbook + `scripts/rolling-update.sh` admin support | ✅ shipped | TLS / role / CSRF live in P1; operator doc + runbook + script wiring in #674 / #669 / #678 |
 
-Outstanding open items (kept here so future readers know what is still owed against the original proposal):
+The AdminDeleteBucket TOCTOU is fully resolved: see [`2026_04_28_proposed_admin_delete_bucket_safety_net.md`](2026_04_28_proposed_admin_delete_bucket_safety_net.md) for the safety-net design and [`docs/admin_deployment.md`](../admin_deployment.md) §4.6 for the operator-side contract (a `PutObject` 200-OK landing during the race window can be swept by the concurrent admin delete; pause writes before delete to retain in-flight writes).
 
-- **AdminForward acceptance criterion 5** — rolling-upgrade compatibility flag (`admin.leader_forward_v2`). Deferred behind a cluster-version bump; not blocking dashboard usability today because every node forwards through the same `pb.AdminOperation` enum.
-- ~~AdminDeleteBucket TOCTOU~~ — **fixed**. The empty-probe → commit race is now covered by a `DEL_PREFIX` safety net on the same `OperationGroup`: `AdminDeleteBucket` and `s3.go:deleteBucket` both wipe every per-bucket key family (manifest / upload-meta / upload-part / blob / gc-upload / route) at the shared commitTS, so objects that landed in the race window are tombstoned together with `BucketMetaKey` instead of orphaning. Trade-off: a `PutObject` that returned 200 OK during the race window can be swept by the concurrent delete — operators should pause writes before bucket delete (now documented in `docs/admin_deployment.md` §4.6). See [`2026_04_28_proposed_admin_delete_bucket_safety_net.md`](2026_04_28_proposed_admin_delete_bucket_safety_net.md) for the design.
-- **S3 object browser** — explicitly called out as "next phase" in Section 2 Non-goals; no work item yet.
+### Out-of-scope follow-ups
+
+_Recorded so future readers know what was deliberately deferred._
+
+- **AdminForward acceptance criterion 5** — rolling-upgrade compatibility flag (`admin.leader_forward_v2`). Deferred at design time behind a cluster-version bump that does not exist yet; not blocking dashboard usability today because every node forwards through the same `pb.AdminOperation` enum.
+- **S3 object browser** — explicitly called out as "next phase" in §2.2 Non-goals; no work item yet.
 - **Operator-visible TLS cert reload** — out of scope; restart-to-rotate is the documented model in `docs/admin.md`.
-
-When the rolling-upgrade flag (the only remaining functional blocker after the TOCTOU fix landed) is addressed, this doc is renamed `2026_04_24_implemented_admin_dashboard.md` per `docs/design/README.md`'s lifecycle convention.
 
 ---
 
