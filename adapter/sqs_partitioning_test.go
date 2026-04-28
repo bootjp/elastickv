@@ -209,6 +209,50 @@ func TestValidatePartitionConfig_RejectsQueueScopedDedupOnPartitioned(t *testing
 	}))
 }
 
+// TestValidatePartitionConfig_PerMessageGroupIDRequiresExplicitPartitionCount
+// pins the CodeRabbit Major fix on PR #664 round 11: an HT-FIFO
+// CreateQueue request that sets FifoThroughputLimit=perMessageGroupId
+// without an explicit PartitionCount > 1 must be rejected. Earlier
+// drafts of §7.2 proposed inferring a server-side default (e.g. 8),
+// but a hidden default would make CreateQueue idempotency depend on
+// deployment state — the same wire payload could resolve to a
+// 4-partition queue today and an 8-partition queue tomorrow.
+func TestValidatePartitionConfig_PerMessageGroupIDRequiresExplicitPartitionCount(t *testing.T) {
+	t.Parallel()
+	// FIFO + perMessageGroupId + PartitionCount=0 (or 1): reject.
+	for _, n := range []uint32{0, 1} {
+		err := validatePartitionConfig(&sqsQueueMeta{
+			IsFIFO:              true,
+			FifoThroughputLimit: htfifoThroughputPerMessageGroupID,
+			PartitionCount:      n,
+		})
+		require.Errorf(t, err, "PartitionCount=%d must reject under perMessageGroupId", n)
+		var apiErr *sqsAPIError
+		require.True(t, errors.As(err, &apiErr))
+		require.Equal(t, sqsErrInvalidAttributeValue, apiErr.errorType)
+	}
+	// FIFO + perMessageGroupId + PartitionCount=8: accept (the
+	// dormancy gate runs separately on CreateQueue and rejects this
+	// at the wire today, but the cross-attribute validator on its
+	// own does not).
+	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{
+		IsFIFO:              true,
+		FifoThroughputLimit: htfifoThroughputPerMessageGroupID,
+		PartitionCount:      8,
+	}))
+	// FIFO + perQueue + PartitionCount=0: accept (legitimate
+	// single-partition FIFO with explicit per-queue throughput).
+	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{
+		IsFIFO:              true,
+		FifoThroughputLimit: htfifoThroughputPerQueue,
+	}))
+	// FIFO + no FifoThroughputLimit + PartitionCount=0: accept
+	// (legitimate legacy FIFO, AWS behaviour).
+	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{
+		IsFIFO: true,
+	}))
+}
+
 // --- validatePartitionDormancyGate unit tests ---
 
 // TestValidatePartitionDormancyGate_RejectsAboveOne pins the §11

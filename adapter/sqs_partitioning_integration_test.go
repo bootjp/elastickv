@@ -153,13 +153,16 @@ func TestSQSServer_HTFIFO_ImmutabilitySetQueueAttributesRejects(t *testing.T) {
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
 
-	url := mustCreateFIFOWithThroughputLimit(t, node, "htfifo-immutable.fifo", htfifoThroughputPerMessageGroupID)
+	url := mustCreateFIFOWithThroughputLimit(t, node, "htfifo-immutable.fifo", htfifoThroughputPerQueue)
 
-	// Try to flip FifoThroughputLimit. Must reject.
+	// Try to flip FifoThroughputLimit. Must reject (immutability +
+	// the round-12 rule that perMessageGroupId requires
+	// PartitionCount > 1 both fire on this attempt; either one
+	// rejecting is the correct outcome from the wire).
 	status, out := callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
 		"QueueUrl": url,
 		"Attributes": map[string]string{
-			"FifoThroughputLimit": htfifoThroughputPerQueue,
+			"FifoThroughputLimit": htfifoThroughputPerMessageGroupID,
 		},
 	})
 	if status != http.StatusBadRequest {
@@ -169,7 +172,7 @@ func TestSQSServer_HTFIFO_ImmutabilitySetQueueAttributesRejects(t *testing.T) {
 	status, _ = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
 		"QueueUrl": url,
 		"Attributes": map[string]string{
-			"FifoThroughputLimit": htfifoThroughputPerMessageGroupID,
+			"FifoThroughputLimit": htfifoThroughputPerQueue,
 		},
 	})
 	if status != http.StatusOK {
@@ -188,7 +191,7 @@ func TestSQSServer_HTFIFO_ImmutabilityAllOrNothing(t *testing.T) {
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
 
-	url := mustCreateFIFOWithThroughputLimit(t, node, "htfifo-allornothing.fifo", htfifoThroughputPerMessageGroupID)
+	url := mustCreateFIFOWithThroughputLimit(t, node, "htfifo-allornothing.fifo", htfifoThroughputPerQueue)
 
 	// Combined: mutable VisibilityTimeout + immutable FifoThroughputLimit
 	// change. Must reject as a whole, mutable change must not commit.
@@ -196,7 +199,7 @@ func TestSQSServer_HTFIFO_ImmutabilityAllOrNothing(t *testing.T) {
 		"QueueUrl": url,
 		"Attributes": map[string]string{
 			"VisibilityTimeout":   "60",
-			"FifoThroughputLimit": htfifoThroughputPerQueue,
+			"FifoThroughputLimit": htfifoThroughputPerMessageGroupID,
 		},
 	})
 	if status != http.StatusBadRequest {
@@ -226,7 +229,7 @@ func TestSQSServer_HTFIFO_GetQueueAttributesRoundTrip(t *testing.T) {
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
 
-	url := mustCreateFIFOWithThroughputLimit(t, node, "htfifo-roundtrip.fifo", htfifoThroughputPerMessageGroupID)
+	url := mustCreateFIFOWithThroughputLimit(t, node, "htfifo-roundtrip.fifo", htfifoThroughputPerQueue)
 	status, out := callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
 		"QueueUrl":       url,
 		"AttributeNames": []string{"All"},
@@ -235,8 +238,8 @@ func TestSQSServer_HTFIFO_GetQueueAttributesRoundTrip(t *testing.T) {
 		t.Fatalf("GetQueueAttributes: status %d", status)
 	}
 	attrs, _ := out["Attributes"].(map[string]any)
-	if got, _ := attrs["FifoThroughputLimit"].(string); got != htfifoThroughputPerMessageGroupID {
-		t.Fatalf("FifoThroughputLimit round-trip: got %q want %q", got, htfifoThroughputPerMessageGroupID)
+	if got, _ := attrs["FifoThroughputLimit"].(string); got != htfifoThroughputPerQueue {
+		t.Fatalf("FifoThroughputLimit round-trip: got %q want %q", got, htfifoThroughputPerQueue)
 	}
 	if _, present := attrs["DeduplicationScope"]; present {
 		t.Fatalf("DeduplicationScope must be omitted when not set; attrs=%v", attrs)

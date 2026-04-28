@@ -215,10 +215,22 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarn
 			return outcome
 		}
 	}
-	// Should not happen — the for-loop drained without ever finding a
-	// live bucket. Treat as allowed=true (fail-open) so misconfiguration
-	// of the bucket store cannot produce a hard 429 storm.
-	return chargeOutcome{allowed: true, bucketPresent: false}
+	// Loop exhaustion means we kept finding a freshly-evicted bucket
+	// for four passes without ever landing on a live one — pathological
+	// (sweep / reconciliation cannot repeatedly evict the same fresh
+	// bucket without time advancing past evictedAfter). Fail closed
+	// rather than allow the request: a fail-open here would turn the
+	// invalidate/reconcile race into a throttle bypass on the exact
+	// path that is supposed to enforce limits (CodeRabbit Major on
+	// PR #664 round 11). Returning a Throttling response with a
+	// non-zero retryAfter gives the client a normal back-off cue
+	// rather than a hard 500 — the next attempt will almost certainly
+	// land on the now-stable bucket.
+	return chargeOutcome{
+		allowed:       false,
+		retryAfter:    time.Second,
+		bucketPresent: false,
+	}
 }
 
 // chargeBucket runs the under-mu refill+take for a single bucket and

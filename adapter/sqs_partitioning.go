@@ -137,35 +137,12 @@ func isPowerOfTwo(n uint32) bool {
 //     exercise the full schema path. Production CreateQueue calls
 //     both validators.
 func validatePartitionConfig(meta *sqsQueueMeta) error {
-	if meta.PartitionCount > 0 {
-		if !isPowerOfTwo(meta.PartitionCount) {
-			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-				"PartitionCount must be a power of two")
-		}
-		if meta.PartitionCount > htfifoMaxPartitions {
-			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-				"PartitionCount exceeds the per-queue cap of "+strconv.FormatUint(uint64(htfifoMaxPartitions), 10))
-		}
+	if err := validatePartitionShape(meta); err != nil {
+		return err
 	}
 	if !meta.IsFIFO {
-		// PartitionCount > 1 only makes sense on FIFO queues (HT-FIFO
-		// is by definition a FIFO feature). Without this guard a
-		// Standard queue with PartitionCount=2 would slip past the
-		// validator once PR 5 lifts the dormancy gate (Claude review
-		// on PR #681 round 2 caught this). PartitionCount=0 and 1
-		// are accepted because both mean "single-partition layout"
-		// which is valid on Standard queues.
-		if meta.PartitionCount > 1 {
-			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-				"PartitionCount > 1 is only valid on FIFO queues")
-		}
-		if meta.FifoThroughputLimit != "" {
-			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-				"FifoThroughputLimit is only valid on FIFO queues")
-		}
-		if meta.DeduplicationScope != "" {
-			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-				"DeduplicationScope is only valid on FIFO queues")
+		if err := validateStandardQueueRejectsHTFIFO(meta); err != nil {
+			return err
 		}
 	}
 	if meta.PartitionCount > 1 && meta.DeduplicationScope == htfifoDedupeScopeQueue {
@@ -174,6 +151,64 @@ func validatePartitionConfig(meta *sqsQueueMeta) error {
 		// duplicate-value alias).
 		return newSQSAPIError(http.StatusBadRequest, sqsErrValidation,
 			"queue-scoped deduplication is incompatible with multi-partition FIFO because the dedup key cannot be globally unique across partitions without a cross-partition OCC transaction")
+	}
+	// FifoThroughputLimit=perMessageGroupId requires an explicit
+	// PartitionCount > 1 (CodeRabbit Major on PR #664 round 11). §7.2
+	// of the design used to suggest "infer a sensible default, e.g.
+	// 8" for HT-FIFO callers that omit PartitionCount, but a hidden
+	// default makes CreateQueue idempotency depend on deployment
+	// state — the same wire payload could resolve to a 4-partition
+	// queue today and an 8-partition queue tomorrow if an operator
+	// changed the default. The rest of this design treats
+	// PartitionCount as immutable create-time state, so reject the
+	// underspecified request to keep the operator's intent always
+	// explicit on the wire.
+	if meta.IsFIFO && meta.FifoThroughputLimit == htfifoThroughputPerMessageGroupID && meta.PartitionCount <= 1 {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"FifoThroughputLimit=perMessageGroupId requires an explicit PartitionCount > 1; set PartitionCount or omit FifoThroughputLimit to use the legacy single-partition layout")
+	}
+	return nil
+}
+
+// validatePartitionShape enforces the structural rules on
+// PartitionCount: power-of-two and within the per-queue cap. Split
+// out of validatePartitionConfig to keep that function under the
+// cyclop ceiling once the round-12 perMessageGroupId-requires-explicit
+// rule landed.
+func validatePartitionShape(meta *sqsQueueMeta) error {
+	if meta.PartitionCount == 0 {
+		return nil
+	}
+	if !isPowerOfTwo(meta.PartitionCount) {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"PartitionCount must be a power of two")
+	}
+	if meta.PartitionCount > htfifoMaxPartitions {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"PartitionCount exceeds the per-queue cap of "+strconv.FormatUint(uint64(htfifoMaxPartitions), 10))
+	}
+	return nil
+}
+
+// validateStandardQueueRejectsHTFIFO enforces the FIFO-only rule on
+// the HT-FIFO attributes. PartitionCount > 1 only makes sense on FIFO
+// queues (HT-FIFO is by definition a FIFO feature). Without this guard
+// a Standard queue with PartitionCount=2 would slip past the validator
+// once PR 5 lifts the dormancy gate (Claude review on PR #681 round 2
+// caught this). PartitionCount=0 and 1 are accepted because both mean
+// "single-partition layout" which is valid on Standard queues.
+func validateStandardQueueRejectsHTFIFO(meta *sqsQueueMeta) error {
+	if meta.PartitionCount > 1 {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"PartitionCount > 1 is only valid on FIFO queues")
+	}
+	if meta.FifoThroughputLimit != "" {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"FifoThroughputLimit is only valid on FIFO queues")
+	}
+	if meta.DeduplicationScope != "" {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"DeduplicationScope is only valid on FIFO queues")
 	}
 	return nil
 }
