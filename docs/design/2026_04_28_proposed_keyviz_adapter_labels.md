@@ -217,18 +217,25 @@ for _, label := range labelsToCreate {
 `allLabelsWithLegacy()` is an unexported helper in
 **`keyviz/labels.go`** (same package as `sampler.go`) that returns
 a **freshly allocated slice** containing `AllLabels` followed by
-`LabelLegacy`. Concretely: allocate a new `[]Label` of length
-`len(AllLabels)+1`, copy `AllLabels` into it, then append
-`LabelLegacy`. Naively returning `append(AllLabels, LabelLegacy)`
-would be a footgun — Go's `append` may reuse the backing array of
-`AllLabels`, which would then visibly mutate when a future caller
-appends to `AllLabels` directly (the previously written legacy
-entry could be overwritten). Co-locating the helper with
-`AllLabels` keeps the canonical set in one file and avoids
-`sampler.go` reconstructing the same expansion at every call site.
-The function is unexported because no caller outside `package
-keyviz` needs it. (Claude bot round-9 minor; Copilot
-round-15-4th-pass added the fresh-slice safety requirement.)
+`LabelLegacy`. Concretely: `result := make([]Label,
+len(AllLabels), len(AllLabels)+1); copy(result, AllLabels);
+result = append(result, LabelLegacy)` — pre-size the backing
+array via the capacity hint so the final length is exactly
+`len(AllLabels)+1` with one allocation. Naively returning
+`append(AllLabels, LabelLegacy)` would be a footgun — Go's
+`append` may reuse the backing array of `AllLabels`, which would
+then visibly mutate when a future caller appends to `AllLabels`
+directly (the previously written legacy entry could be
+overwritten). Co-locating the helper with `AllLabels` keeps the
+canonical set in one file and avoids `sampler.go` reconstructing
+the same expansion at every call site. The function is
+unexported because no caller outside `package keyviz` needs it.
+(Claude bot round-9 minor; Copilot round-15-4th-pass added the
+fresh-slice safety requirement; Copilot round-19 caught the
+off-by-one in the prior "length len(AllLabels)+1, then append"
+phrasing — that produced length `len(AllLabels)+2`. Now uses
+length `len(AllLabels)`, capacity `len(AllLabels)+1`, then
+append, yielding the intended length `len(AllLabels)+1`.)
 
 When `RegisterRoute` decides a route will be coarsened into a
 virtual bucket (i.e. it returns `false`), **no labeled slots are
@@ -406,11 +413,16 @@ adapter at the catalog layer. The sampler stays single-keyed.
   identity bakes a different separation into the route topology.
   Reverses the multi-group startup-flag story.
 
-**Recommendation: Option 4.1.** Lowest plumbing weight, smallest
-hot-path delta (one map lookup), and the label originates where
-it is most naturally available (the adapter's dispatch entry).
-The `routeSlot` map shape changes from `map[uint64]*routeSlot` to
-`map[slotKey]*routeSlot` with `slotKey = {uint64, string}`.
+**Recommendation: Option 4.1.** Lowest plumbing weight, and the
+label originates where it is most naturally available (the
+adapter's dispatch entry). The hot path remains a **single** map
+lookup per `Observe`; only the lookup key widens (so the change
+is wider hash and equality work, not an additional lookup). The
+`routeSlot` map shape changes from `map[uint64]*routeSlot` to
+`map[slotKey]*routeSlot` with `slotKey = {uint64, Label}`.
+(Copilot round-19 caught the earlier "smallest hot-path delta
+(one map lookup)" wording, which could be misread as adding an
+extra lookup.)
 
 ## 5. Wire format extension
 
