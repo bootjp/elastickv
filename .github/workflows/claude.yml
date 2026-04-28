@@ -30,60 +30,30 @@ jobs:
         with:
           fetch-depth: 1
 
-      # TEMPORARY diagnostic. Verifies whether the OAuth token works against
-      # `claude --print` directly on the runner (i.e., bypassing the action /
-      # agent SDK entirely), so we can localize the failure to either:
-      #   - SDK auth-forwarding (diag passes, main fails), or
-      #   - runner ↔ Anthropic OAuth backend (diag fails, main fails).
-      #
-      # Split into two steps so the OAuth token is never present in the env
-      # of `curl | bash` or its subprocesses (Codex P2): the installer runs
-      # without the secret; only the verify step has it, and only for the
-      # single claude invocation. Both diagnostic steps are
-      # `continue-on-error: true` so neither a transient install failure nor
-      # a runner-side OAuth failure can short-circuit `Run Claude Code` —
-      # both step results need to be observed for the isolation logic to
-      # work, and temporary diagnostic infrastructure must not block normal
-      # `@claude` handling (Codex P1, both rounds).
-      #
-      # Token-leak hardening:
-      #   - secret is scoped to the verify step only
-      #   - never enables `set -x`; explicit `set +x` defends against
-      #     ACTIONS_STEP_DEBUG also enabling xtrace
-      #   - token reaches `claude` only via env, never as a command-line arg
-      #   - no --debug / --verbose on `claude`
-      #   - HOME is an ephemeral tmp dir; runner is destroyed after the job
-      #   - GitHub Actions secret-masking covers any literal occurrence anyway
-      #
-      # Remove these two steps (and rotate CLAUDE_CODE_OAUTH_TOKEN) once the
-      # diagnostic question is answered.
-      - name: Install Claude CLI for diag (no secrets in env)
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          set +x
-          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.119 >/dev/null 2>&1
-
-      - name: Verify OAuth on the runner (diag only)
-        continue-on-error: true
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: |
-          set -euo pipefail
-          set +x
-          export PATH="$HOME/.local/bin:$PATH"
-          TMPHOME="$(mktemp -d)"
-          HOME="$TMPHOME" ANTHROPIC_API_KEY="" claude --print "ok"
-
       - name: Run Claude Code
         id: claude
-        # Pinned to v1.0.107 + explicit env. As of 2026-04-28, the OAuth token
-        # passed only via the `with:` input is not reaching the Claude Code
-        # child process spawned by the agent SDK's query() — the SDK throws
-        # `Could not resolve [authentication]` even though the same token
-        # works locally with `claude --print`. Setting CLAUDE_CODE_OAUTH_TOKEN
-        # in the step's env: forces it onto process.env so parse-sdk-options
-        # forwards it to the child. Revisit once upstream ships a fix.
+        # Pinned to v1.0.107 + explicit env, awaiting upstream fix.
+        # As of 2026-04-28 this step fails with `Could not resolve
+        # [authentication]` from the agent SDK on every @claude run.
+        #
+        # The temporary diagnostic in run 25057882769 isolated the bug:
+        # on the same runner, in the same job, with the same OAuth token,
+        # `claude --print` (CLI direct) authenticated successfully and got
+        # a normal response, while the action's agent-SDK-mediated child
+        # claude process threw the auth error. So the token, the Anthropic
+        # OAuth backend, the runner network, and the env-forwarding to the
+        # step are all healthy — only `anthropics/claude-code-action` /
+        # `@anthropic-ai/claude-agent-sdk` fails to forward auth to the
+        # spawned child.
+        #
+        # Workaround attempts that did NOT help:
+        #   - rotating CLAUDE_CODE_OAUTH_TOKEN
+        #   - pinning the action SHA (v1.0.107)
+        #   - duplicating the secret onto the step's env: in addition to
+        #     `with:` (kept anyway because it does no harm)
+        #
+        # Lift the pin and the env: duplication once upstream ships a fix,
+        # or switch to ANTHROPIC_API_KEY auth if recovery is urgent.
         uses: anthropics/claude-code-action@7eab1296cc65117d50ac2a2fa5f00a30ec84d3d5 # v1.0.107
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
