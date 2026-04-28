@@ -136,6 +136,29 @@ func TestSQSServer_CatalogCreateIsIdempotent(t *testing.T) {
 	if got, _ := out3["__type"].(string); got != sqsErrQueueNameExists {
 		t.Fatalf("differing-attrs error type: got %q want %q", got, sqsErrQueueNameExists)
 	}
+
+	// Fourth call: same name, same non-throttle attrs as the original
+	// create, but different Throttle* values. The original create had
+	// no Throttle config; this one adds one. throttleConfigEqual must
+	// notice the diff and the call must reject as QueueNameExists.
+	// Without this case a bug in throttleConfigEqual (e.g. always
+	// returning true) would slip past the existing VisibilityTimeout-
+	// only test.
+	withThrottle := map[string]any{
+		"QueueName": "idempotent",
+		"Attributes": map[string]string{
+			"VisibilityTimeout":           "60",
+			"ThrottleSendCapacity":        "10",
+			"ThrottleSendRefillPerSecond": "1",
+		},
+	}
+	status4, out4 := callSQS(t, node, sqsCreateQueueTarget, withThrottle)
+	if status4 != http.StatusBadRequest {
+		t.Fatalf("re-create with added Throttle*: got %d want 400; body %v", status4, out4)
+	}
+	if got, _ := out4["__type"].(string); got != sqsErrQueueNameExists {
+		t.Fatalf("Throttle*-diff error type: got %q want %q", got, sqsErrQueueNameExists)
+	}
 }
 
 func TestSQSServer_CatalogGetAndSetAttributes(t *testing.T) {

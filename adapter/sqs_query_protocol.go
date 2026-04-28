@@ -147,9 +147,9 @@ func readQueryForm(r *http.Request) (url.Values, error) {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrMalformedRequest, "missing request URL")
 	}
 	// r.URL.Query() returns a fresh map on each call so we can adopt
-	// it directly as the base instead of copying entries one-by-one
-	// (Gemini high-priority on PR #662). On GET we are done; on POST
-	// the body's form values are merged into the same map.
+	// it directly as the base instead of copying entries one-by-one.
+	// On GET we are done; on POST the body's form values are merged
+	// into the same map.
 	values := r.URL.Query()
 	if r.Method == http.MethodGet {
 		return values, nil
@@ -508,8 +508,8 @@ func errorTypeForStatus(status int) string {
 // like the AWS RequestId: 22 chars of base32 (no padding). Base32
 // emits 1 char per 5 input bits, so 22 chars require ceil(22*5/8)=14
 // random bytes (110 bits, comfortably more entropy than a UUID-v4).
-// Gemini medium on PR #662 flagged the prior 16-byte source — that
-// produces a 26-char ID, not 22, and the comment was a lie.
+// A 16-byte source would produce a 26-char ID, not 22, so the byte
+// count is pinned at 14 to match the documented length.
 func newQueryRequestID() string {
 	var raw [14]byte
 	if _, err := rand.Read(raw[:]); err != nil {
