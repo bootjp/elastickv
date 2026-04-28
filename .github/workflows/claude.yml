@@ -39,10 +39,12 @@ jobs:
       # Split into two steps so the OAuth token is never present in the env
       # of `curl | bash` or its subprocesses (Codex P2): the installer runs
       # without the secret; only the verify step has it, and only for the
-      # single claude invocation. The verify step is `continue-on-error: true`
-      # so a runner-side OAuth failure does not skip `Run Claude Code` —
+      # single claude invocation. Both diagnostic steps are
+      # `continue-on-error: true` so neither a transient install failure nor
+      # a runner-side OAuth failure can short-circuit `Run Claude Code` —
       # both step results need to be observed for the isolation logic to
-      # work (Codex P1).
+      # work, and temporary diagnostic infrastructure must not block normal
+      # `@claude` handling (Codex P1, both rounds).
       #
       # Token-leak hardening:
       #   - secret is scoped to the verify step only
@@ -56,6 +58,7 @@ jobs:
       # Remove these two steps (and rotate CLAUDE_CODE_OAUTH_TOKEN) once the
       # diagnostic question is answered.
       - name: Install Claude CLI for diag (no secrets in env)
+        continue-on-error: true
         run: |
           set -euo pipefail
           set +x
