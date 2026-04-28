@@ -30,30 +30,44 @@ jobs:
         with:
           fetch-depth: 1
 
-      # TEMPORARY diagnostic step. Verifies whether the OAuth token works
-      # against `claude --print` directly on the runner (i.e., bypassing the
-      # action / agent SDK entirely). If this step succeeds but `Run Claude
-      # Code` still fails, the bug is isolated to how the agent SDK forwards
-      # auth to its spawned child process.
+      # TEMPORARY diagnostic. Verifies whether the OAuth token works against
+      # `claude --print` directly on the runner (i.e., bypassing the action /
+      # agent SDK entirely), so we can localize the failure to either:
+      #   - SDK auth-forwarding (diag passes, main fails), or
+      #   - runner ↔ Anthropic OAuth backend (diag fails, main fails).
+      #
+      # Split into two steps so the OAuth token is never present in the env
+      # of `curl | bash` or its subprocesses (Codex P2): the installer runs
+      # without the secret; only the verify step has it, and only for the
+      # single claude invocation. The verify step is `continue-on-error: true`
+      # so a runner-side OAuth failure does not skip `Run Claude Code` —
+      # both step results need to be observed for the isolation logic to
+      # work (Codex P1).
       #
       # Token-leak hardening:
+      #   - secret is scoped to the verify step only
       #   - never enables `set -x`; explicit `set +x` defends against
       #     ACTIONS_STEP_DEBUG also enabling xtrace
-      #   - token is only referenced via env, never expanded into a command line
-      #   - install.sh stdout/stderr are dropped; no --debug / --verbose on claude
-      #   - HOME is a fresh tmp dir so cached creds are out of scope and gone
-      #     when the runner is destroyed
+      #   - token reaches `claude` only via env, never as a command-line arg
+      #   - no --debug / --verbose on `claude`
+      #   - HOME is an ephemeral tmp dir; runner is destroyed after the job
       #   - GitHub Actions secret-masking covers any literal occurrence anyway
       #
-      # Remove this step (and rotate CLAUDE_CODE_OAUTH_TOKEN) once the
+      # Remove these two steps (and rotate CLAUDE_CODE_OAUTH_TOKEN) once the
       # diagnostic question is answered.
-      - name: Sanity-check OAuth on the runner (diag only)
+      - name: Install Claude CLI for diag (no secrets in env)
+        run: |
+          set -euo pipefail
+          set +x
+          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.119 >/dev/null 2>&1
+
+      - name: Verify OAuth on the runner (diag only)
+        continue-on-error: true
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           set -euo pipefail
           set +x
-          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.119 >/dev/null 2>&1
           export PATH="$HOME/.local/bin:$PATH"
           TMPHOME="$(mktemp -d)"
           HOME="$TMPHOME" ANTHROPIC_API_KEY="" claude --print "ok"
