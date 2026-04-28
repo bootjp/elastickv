@@ -368,7 +368,7 @@ PR-B replaces it with a check on the legacy slot:
 `if _, ok := cur.slots[slotKey{RouteID: routeID}]; ok { return true }`
 — the legacy slot's presence implies the labeled siblings were
 already created by an earlier `RegisterRoute` call (the
-pre-creation loop is atomic with respect to the routesMu lock).
+pre-creation loop runs under the `routesMu` lock).
 
 Two alternatives we explicitly reject:
 
