@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -342,4 +344,154 @@ func TestS3Server_AdminListBuckets_PaginatesPastSinglePage(t *testing.T) {
 		"AdminListBuckets must continue past adminBucketScanPage; truncating here is the regression")
 	require.Equal(t, "bucket-0000", got[0].Name)
 	require.Equal(t, fmt.Sprintf("bucket-%04d", total-1), got[total-1].Name)
+}
+
+// TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes
+// is the regression test for the AdminDeleteBucket TOCTOU race
+// (design doc 2026_04_28_proposed_admin_delete_bucket_safety_net.md;
+// coderabbitai 🔴/🟠 on PR #669). The race lands when a concurrent
+// PutObject inserts data between AdminDeleteBucket's empty-probe
+// scan (at readTS) and its commit (at a later commitTS). Without
+// the DEL_PREFIX safety net, the BucketMetaKey delete commits but
+// the concurrent write's manifest, blob chunks, upload metadata,
+// upload parts, GC entries, and route key all survive — orphaned
+// under a now-deleted bucket meta with no API visibility.
+//
+// This test plants orphan keys directly in the store across the
+// 5 non-manifest per-bucket prefixes (the empty-probe only scans
+// the manifest prefix; orphans in the other 5 are exactly what
+// can leak through the race window). It then calls
+// AdminDeleteBucket and asserts every per-bucket prefix is empty
+// at a post-commit readTS. The manifest prefix is covered
+// indirectly by the symmetric assertion (the safety net wipes
+// it whether or not orphans landed there).
+//
+// Without the fix, the assertions for upload-meta / upload-part /
+// blob / gc / route fail because AdminDeleteBucket's commit only
+// touched BucketMetaKey. With the fix, the DEL_PREFIX ops in the
+// same OperationGroup tombstone every per-bucket prefix at the
+// shared commitTS.
+func TestS3Server_AdminDeleteBucket_SweepsOrphansAcrossAllPerBucketPrefixes(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	server := NewS3Server(nil, "", st, coord, nil)
+	ctx := context.Background()
+
+	const bucket = "race-target"
+	summary, err := server.AdminCreateBucket(ctx,
+		fullAdminBucketsPrincipal(), bucket, s3AclPrivate)
+	require.NoError(t, err)
+	gen := summary.Generation
+	require.NotZero(t, gen)
+
+	// Plant orphan keys across the 5 non-manifest per-bucket
+	// prefixes. Each entry is what a concurrent PutObject (or its
+	// in-flight multipart upload state) would leave behind if it
+	// committed in the AdminDeleteBucket race window. The values
+	// are arbitrary — DEL_PREFIX tombstones key-by-key at the
+	// commit timestamp, so the body content does not matter for
+	// the assertion.
+	const (
+		objectName = "race/object.bin"
+		uploadID   = "upload-race"
+	)
+	planted := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: s3keys.UploadMetaKey(bucket, gen, objectName, uploadID), Value: []byte("orphan-upload-meta")},
+		{Op: kv.Put, Key: s3keys.UploadPartKey(bucket, gen, objectName, uploadID, 1), Value: []byte("orphan-part")},
+		{Op: kv.Put, Key: s3keys.BlobKey(bucket, gen, objectName, uploadID, 1, 0), Value: []byte("orphan-chunk")},
+		{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, gen, objectName, uploadID), Value: []byte("orphan-gc")},
+		{Op: kv.Put, Key: s3keys.RouteKey(bucket, gen, objectName), Value: []byte("orphan-route")},
+	}
+	_, err = coord.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: planted})
+	require.NoError(t, err)
+
+	// Sanity check: every planted key is visible BEFORE the delete.
+	postPlantTS := coord.Clock().Next()
+	for _, elem := range planted {
+		got, err := st.GetAt(ctx, elem.Key, postPlantTS)
+		require.NoError(t, err)
+		require.NotNil(t, got, "planted key %q must be visible before AdminDeleteBucket", string(elem.Key))
+	}
+
+	// Empty-probe sees the bucket as empty (no manifest keys
+	// planted) so the delete proceeds and the safety net runs.
+	require.NoError(t, server.AdminDeleteBucket(ctx,
+		fullAdminBucketsPrincipal(), bucket))
+
+	// After the delete commits, every per-bucket prefix must be
+	// empty at any post-commit readTS. ScanAt at the latest clock
+	// tick covers all visible commits.
+	postDeleteTS := coord.Clock().Next()
+	prefixes := []struct {
+		name   string
+		prefix []byte
+	}{
+		{"object_manifest", s3keys.ObjectManifestPrefixForBucket(bucket, gen)},
+		{"upload_meta", s3keys.UploadMetaPrefixForBucket(bucket, gen)},
+		{"upload_part", s3keys.UploadPartPrefixForBucket(bucket, gen)},
+		{"blob", s3keys.BlobPrefixForBucket(bucket, gen)},
+		{"gc_upload", s3keys.GCUploadPrefixForBucket(bucket, gen)},
+		{"route", s3keys.RoutePrefixForBucket(bucket, gen)},
+	}
+	for _, p := range prefixes {
+		t.Run(p.name, func(t *testing.T) {
+			kvs, err := st.ScanAt(ctx, p.prefix, prefixScanEnd(p.prefix), 100, postDeleteTS)
+			require.NoError(t, err)
+			require.Empty(t, kvs,
+				"AdminDeleteBucket must sweep the %s prefix; orphans here mean the DEL_PREFIX safety net regressed", p.name)
+		})
+	}
+
+	// BucketMetaKey is also gone (existing contract; pinned here
+	// alongside the new prefix assertions so a refactor that
+	// replaces the Del with the wrong shape still triggers a
+	// failure). MVCCStore returns ErrKeyNotFound for tombstoned
+	// keys; we match on that explicitly so a future refactor that
+	// changes the absence shape still fails the assertion.
+	_, err = st.GetAt(ctx, s3keys.BucketMetaKey(bucket), postDeleteTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+// TestS3Server_AdminDeleteBucket_BucketGenerationKeySurvives pins
+// the orphan-isolation property the design doc relies on:
+// AdminDeleteBucket must NOT delete BucketGenerationKey. Re-creating
+// a bucket with the same name bumps the generation, and any blobs
+// or manifests that ever escaped under the old generation prefix
+// stay invisible to the new bucket. Removing the generation key
+// would lose that property — a regression here would let a
+// recreate land back at generation=1 and accidentally pick up
+// pre-existing orphans.
+func TestS3Server_AdminDeleteBucket_BucketGenerationKeySurvives(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newLocalAdapterCoordinator(st)
+	server := NewS3Server(nil, "", st, coord, nil)
+	ctx := context.Background()
+
+	const bucket = "gen-survives"
+	summary, err := server.AdminCreateBucket(ctx,
+		fullAdminBucketsPrincipal(), bucket, s3AclPrivate)
+	require.NoError(t, err)
+	originalGen := summary.Generation
+
+	require.NoError(t, server.AdminDeleteBucket(ctx,
+		fullAdminBucketsPrincipal(), bucket))
+
+	// BucketGenerationKey must still be readable after delete.
+	postDeleteTS := coord.Clock().Next()
+	got, err := st.GetAt(ctx, s3keys.BucketGenerationKey(bucket), postDeleteTS)
+	require.NoError(t, err)
+	require.NotNil(t, got,
+		"BucketGenerationKey must NOT be deleted; orphan isolation across recreate depends on it")
+
+	// Re-create lands at a strictly higher generation.
+	recreated, err := server.AdminCreateBucket(ctx,
+		fullAdminBucketsPrincipal(), bucket, s3AclPrivate)
+	require.NoError(t, err)
+	require.Greater(t, recreated.Generation, originalGen,
+		"recreate must bump generation; if it ever lands back at the original generation, "+
+			"orphan isolation breaks and old pre-existing data could surface in the new bucket")
 }
