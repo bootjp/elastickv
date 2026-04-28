@@ -403,7 +403,7 @@ mean the cluster has lost quorum.
 - [`docs/admin.md`](admin.md) — per-flag configuration reference,
   audit log shapes, troubleshooting catalogue.
 - [`docs/design/2026_04_24_implemented_admin_dashboard.md`](design/2026_04_24_implemented_admin_dashboard.md) —
-  design rationale, acceptance criteria, outstanding items.
+  design rationale, acceptance criteria, out-of-scope follow-ups.
 - [`scripts/rolling-update.sh`](../scripts/rolling-update.sh) —
   the rollout driver this doc references throughout.
 - [`scripts/rolling-update.env.example`](../scripts/rolling-update.env.example) —

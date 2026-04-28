@@ -7,10 +7,10 @@
 ## 1. Background
 
 `AdminDeleteBucket` and the SigV4 `s3.go:deleteBucket` share a known
-TOCTOU race documented in
-[`docs/design/2026_04_24_implemented_admin_dashboard.md`](2026_04_24_implemented_admin_dashboard.md)
-under Out-of-scope follow-ups. coderabbitai 🔴/🟠 flagged it during PR
-#669 review.
+TOCTOU race resolved by this design and recorded in the
+implementation-status block of
+[`docs/design/2026_04_24_implemented_admin_dashboard.md`](2026_04_24_implemented_admin_dashboard.md).
+coderabbitai 🔴/🟠 flagged it during PR #669 review.
 
 The current shape:
 
