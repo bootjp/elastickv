@@ -485,12 +485,20 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 	// dormancy gate in tryCreateQueueOnce rejects PartitionCount > 1
 	// until PR 5 lifts the gate atomically with the data plane.
 	"PartitionCount": func(m *sqsQueueMeta, v string) error {
-		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32)
+		// Parse at uint64 width and bound-check explicitly so the
+		// uint32 narrowing is gosec-clean without a //nolint comment
+		// (CLAUDE.md asks us to refactor rather than suppress; Claude
+		// medium on PR #664 round 12 flagged the suppression).
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
 		if err != nil {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 				"PartitionCount must be a non-negative integer")
 		}
-		m.PartitionCount = uint32(n) //nolint:gosec // bounded by ParseUint(_, _, 32) above.
+		if n > math.MaxUint32 {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"PartitionCount is out of range")
+		}
+		m.PartitionCount = uint32(n)
 		return nil
 	},
 	"FifoThroughputLimit": func(m *sqsQueueMeta, v string) error {
