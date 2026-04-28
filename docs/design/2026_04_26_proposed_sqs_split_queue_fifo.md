@@ -56,16 +56,20 @@ The `p|` discriminator is **safe by name-validator construction**, not by accide
 Concretely, the implementation PR exposes **two named constructors** rather than a variadic dispatcher (Claude review on PR #664 flagged the variadic form as a footgun: `sqsMsgDataKey(q, gen, id, p0, p1)` would silently ignore `p1` and the compiler would not catch it). The dispatch lives at the call site, where `meta.PartitionCount` is already in scope:
 
 ```go
-// Two distinct constructors, one per keyspace.
-func legacyMsgDataKey(queueName string, gen uint64, messageID string) []byte
-func partitionedMsgDataKey(queueName string, partition uint32, gen uint64, messageID string) []byte
+// Two distinct constructors, one per keyspace. Implemented in
+// adapter/sqs_keys.go as part of Phase 3.D PR 3:
+func sqsMsgDataKey(queueName string, gen uint64, messageID string) []byte             // legacy
+func sqsPartitionedMsgDataKey(queueName string, partition uint32, gen uint64, messageID string) []byte
 
 // Dispatch at the call site. No variadic, no silent argument loss.
+// PR 5 wires this dispatch at every call site that today calls
+// sqsMsgDataKey directly; PR 3 only adds the partitioned constructor
+// so PR 5 stays a small change.
 var dataKey []byte
 if meta.PartitionCount > 1 {
-    dataKey = partitionedMsgDataKey(queueName, partition, gen, msgID)
+    dataKey = sqsPartitionedMsgDataKey(queueName, partition, gen, msgID)
 } else {
-    dataKey = legacyMsgDataKey(queueName, gen, msgID)
+    dataKey = sqsMsgDataKey(queueName, gen, msgID)
 }
 ```
 
@@ -181,13 +185,13 @@ For deployments that don't want one Raft group per partition (e.g. a small clust
    constructor for this queue's PartitionCount (named constructors
    per §3.1; no variadic):
      if meta.PartitionCount > 1 {
-       dataKey  = partitionedMsgDataKey(queue, partitionIndex, gen, msgID)
-       visKey   = partitionedMsgVisKey(queue, partitionIndex, gen, ...)
-       groupKey = partitionedMsgGroupKey(queue, partitionIndex, gen, MessageGroupId)
+       dataKey  = sqsPartitionedMsgDataKey(queue, partitionIndex, gen, msgID)
+       visKey   = sqsPartitionedMsgVisKey(queue, partitionIndex, gen, ...)
+       groupKey = sqsPartitionedMsgGroupKey(queue, partitionIndex, gen, MessageGroupId)
      } else {
-       dataKey  = legacyMsgDataKey(queue, gen, msgID)
-       visKey   = legacyMsgVisKey(queue, gen, ...)
-       groupKey = legacyMsgGroupKey(queue, gen, MessageGroupId)
+       dataKey  = sqsMsgDataKey(queue, gen, msgID)
+       visKey   = sqsMsgVisKey(queue, gen, ...)
+       groupKey = sqsMsgGroupKey(queue, gen, MessageGroupId)
      }
 6. Dispatch through the leader of the resolved partition (existing
    leader-proxy path, unchanged).
