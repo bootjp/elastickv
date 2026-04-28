@@ -30,6 +30,51 @@ jobs:
         with:
           fetch-depth: 1
 
+      # TEMPORARY diagnostic. Verifies whether the OAuth token works against
+      # `claude --print` directly on the runner (i.e., bypassing the action /
+      # agent SDK entirely), so we can localize the failure to either:
+      #   - SDK auth-forwarding (diag passes, main fails), or
+      #   - runner ↔ Anthropic OAuth backend (diag fails, main fails).
+      #
+      # Split into two steps so the OAuth token is never present in the env
+      # of `curl | bash` or its subprocesses (Codex P2): the installer runs
+      # without the secret; only the verify step has it, and only for the
+      # single claude invocation. Both diagnostic steps are
+      # `continue-on-error: true` so neither a transient install failure nor
+      # a runner-side OAuth failure can short-circuit `Run Claude Code` —
+      # both step results need to be observed for the isolation logic to
+      # work, and temporary diagnostic infrastructure must not block normal
+      # `@claude` handling (Codex P1, both rounds).
+      #
+      # Token-leak hardening:
+      #   - secret is scoped to the verify step only
+      #   - never enables `set -x`; explicit `set +x` defends against
+      #     ACTIONS_STEP_DEBUG also enabling xtrace
+      #   - token reaches `claude` only via env, never as a command-line arg
+      #   - no --debug / --verbose on `claude`
+      #   - HOME is an ephemeral tmp dir; runner is destroyed after the job
+      #   - GitHub Actions secret-masking covers any literal occurrence anyway
+      #
+      # Remove these two steps (and rotate CLAUDE_CODE_OAUTH_TOKEN) once the
+      # diagnostic question is answered.
+      - name: Install Claude CLI for diag (no secrets in env)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          set +x
+          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.119 >/dev/null 2>&1
+
+      - name: Verify OAuth on the runner (diag only)
+        continue-on-error: true
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +x
+          export PATH="$HOME/.local/bin:$PATH"
+          TMPHOME="$(mktemp -d)"
+          HOME="$TMPHOME" ANTHROPIC_API_KEY="" claude --print "ok"
+
       - name: Run Claude Code
         id: claude
         # Pinned to v1.0.107 + explicit env. As of 2026-04-28, the OAuth token
