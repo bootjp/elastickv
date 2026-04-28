@@ -9,7 +9,7 @@
 
 | Phase | Status | Landed via |
 |---|---|---|
-| **P1** — internal/admin/ skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–4 + 6; criterion 5 deferred — see [follow-ups](#out-of-scope-follow-ups)) | ✅ shipped | #634, #635, #644, #648 |
+| **P1** — `internal/admin/` skeleton, auth, DynamoDB list/create/describe/delete, AdminForward (Section 3.3 acceptance criteria 1–4 + 6; criterion 5 deferred — see [follow-ups](#out-of-scope-follow-ups)) | ✅ shipped | #634, #635, #644, #648 |
 | **P2** — S3 bucket list/create/delete/ACL, DescribeTable | ✅ shipped | #658 (read-only slice 1) + #669 (writes, slice 2a) + #673 (AdminForward integration, slice 2b) + #695 (AdminDeleteBucket TOCTOU safety net) |
 | **P3** — React SPA + embed | ✅ shipped | #649, #650 |
 | **P4** — TLS, read-only role, CSRF, `docs/admin.md`, deployment runbook + `scripts/rolling-update.sh` admin support | ✅ shipped | TLS / role / CSRF live in P1; operator doc + runbook + script wiring in #674 / #669 / #678 |
