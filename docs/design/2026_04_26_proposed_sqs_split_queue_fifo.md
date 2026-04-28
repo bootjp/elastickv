@@ -34,7 +34,7 @@ This document is the proposal that unblocks the implementation. It is **not the 
 1. **Auto-rebalancing**. A queue's partition count is set at create time and never changes. AWS's HT-FIFO works the same way; resharding a live FIFO queue while preserving order is fundamentally hard and is not in this proposal.
 2. **Cross-partition transactions**. Operations on a partitioned queue still touch one partition per request. There is no "atomic delete from all partitions"; admin operations like PurgeQueue iterate partitions and tolerate partial progress.
 3. **Group-level throttling**. The §16.5 (per-queue throttling) proposal is forward-compatible with this design, but the per-`MessageGroupId` rate limit is its own follow-up.
-4. **Pluggable partition assignment**. The hash function is fixed (FNV-1a 64 over the UTF-8 bytes of `MessageGroupId`); operators do not get a knob.
+4. **Pluggable partition assignment**. The hash function is fixed (FNV-1a 32 over the UTF-8 bytes of `MessageGroupId`); operators do not get a knob.
 5. **Migration of existing single-partition `.fifo` queues to N partitions**. Out of scope. Operators who want HT-FIFO on an existing workload create a new queue, drain the old one, and switch producers.
 6. **Standard (non-FIFO) queue partitioning**. Standard queues already parallelize across the consumer pool because they have no ordering contract; partitioning them adds complexity for no win.
 
@@ -142,12 +142,22 @@ if messageGroupId == "" {
     // out across every partition.
     return 0
 }
-hash := fnv.New64a()
-_, _ = hash.Write([]byte(messageGroupId))
-return uint32(hash.Sum64()) & (meta.PartitionCount - 1)
+// Inlined FNV-1a 32-bit (sidesteps a uint64 → uint32 narrowing the
+// 64-bit variant would require for the partition mask AND, which
+// gosec G115 would otherwise flag and force a //nolint comment).
+const (
+    fnv32Offset uint32 = 2166136261
+    fnv32Prime  uint32 = 16777619
+)
+hash := fnv32Offset
+for i := 0; i < len(messageGroupId); i++ {
+    hash ^= uint32(messageGroupId[i])
+    hash *= fnv32Prime
+}
+return hash & (meta.PartitionCount - 1)
 ```
 
-The choice of FNV-1a is deliberate: it is fast (no SIMD setup), has no key, and is identical across Go versions and architectures. Operators do not need this to be cryptographically strong — they need it to be deterministic and well-distributed, both of which FNV-1a satisfies.
+The choice of FNV-1a 32-bit is deliberate. FNV-1a is fast (no SIMD setup), has no key, and is identical across Go versions and architectures. The 32-bit variant gives ample entropy for the `PartitionCount ≤ htfifoMaxPartitions = 32` regime — only the low `log2(PartitionCount)` bits (≤ 5) survive the mask, so the upper 32 bits the 64-bit variant would have produced are wasted work that costs a `uint64 → uint32` narrowing on the routing hot path. Operators do not need this to be cryptographically strong — they need it to be deterministic and well-distributed, both of which FNV-1a satisfies.
 
 ### 3.4 Cross-shard placement
 

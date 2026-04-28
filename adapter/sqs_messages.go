@@ -329,7 +329,7 @@ func (s *SQSServer) validateSend(w http.ResponseWriter, r *http.Request, queueNa
 		writeSQSErrorFromErr(w, apiErr)
 		return nil, 0, 0, false
 	}
-	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle, meta.Generation) {
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionSend, 1, meta.Throttle, meta.Incarnation) {
 		return nil, 0, 0, false
 	}
 	if apiErr := validateMessageAttributes(in.MessageAttributes); apiErr != nil {
@@ -568,7 +568,7 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 	// don't pay an extra meta read just to discover throttling is off
 	// (Gemini high on PR #679). Sits AFTER the QueueDoesNotExist
 	// branch — a missing queue should not consume a Recv token.
-	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle, meta.Generation) {
+	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation) {
 		return
 	}
 	max, maxErr := resolveReceiveMaxMessages(in.MaxNumberOfMessages)

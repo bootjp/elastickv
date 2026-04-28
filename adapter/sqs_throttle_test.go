@@ -342,7 +342,7 @@ func TestBucketStore_SweepRaceDoesNotInflateBudget(t *testing.T) {
 	// either spends an existing token or fails, making the total-
 	// success count a tight bound on the burst budget.
 	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
-	key := bucketKey{queue: "orders", action: bucketActionSend, generation: 1}
+	key := bucketKey{queue: "orders", action: bucketActionSend, incarnation: 1}
 	v, ok := store.buckets.Load(key)
 	require.True(t, ok)
 	bucket, _ := v.(*tokenBucket)
@@ -395,7 +395,7 @@ func TestBucketStore_OrphanedBucketRetriesToLiveEntry(t *testing.T) {
 	store := newBucketStore(func() time.Time { return clk }, time.Hour)
 	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
 	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
-	key := bucketKey{queue: "orders", action: bucketActionSend, generation: 1}
+	key := bucketKey{queue: "orders", action: bucketActionSend, incarnation: 1}
 	v, ok := store.buckets.Load(key)
 	require.True(t, ok)
 	original, _ := v.(*tokenBucket)
@@ -435,7 +435,7 @@ func TestBucketStore_InvalidateMarksOrphanEvicted(t *testing.T) {
 	store := newBucketStoreDefault()
 	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
 	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
-	key := bucketKey{queue: "orders", action: bucketActionSend, generation: 1}
+	key := bucketKey{queue: "orders", action: bucketActionSend, incarnation: 1}
 	v, ok := store.buckets.Load(key)
 	require.True(t, ok)
 	original, _ := v.(*tokenBucket)
@@ -525,54 +525,54 @@ func TestThrottleAttributesPresent(t *testing.T) {
 // bucket belonging to the queue is dropped, even ones not currently
 // being charged. A future verb that grows a new bucket can't sneak
 // past invalidation by being wired into one site only.
-// TestBucketStore_GenerationKeyedDoesNotReuseAcrossIncarnations pins
-// the Codex P1 fix on PR #664: bucketKey includes generation so a
-// DeleteQueue+CreateQueue cycle (or a leadership move to a node
+// TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations
+// pins the Codex P1 fix on PR #664: bucketKey includes incarnation
+// so a DeleteQueue+CreateQueue cycle (or a leadership move to a node
 // holding a stale per-process cache) lands the new incarnation under
 // a different map entry and starts from a fresh full bucket. Without
-// generation in the key, the recreated queue would inherit the
+// incarnation in the key, the recreated queue would inherit the
 // drained token state from the previous incarnation.
 //
-// charge signature is (cfg, queue, action, generation, count).
-func TestBucketStore_GenerationKeyedDoesNotReuseAcrossIncarnations(t *testing.T) {
+// charge signature is (cfg, queue, action, incarnation, count).
+func TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
-	// Drain generation 1 entirely (5 successful charges of 1 token).
+	// Drain incarnation 1 entirely (5 successful charges of 1 token).
 	for range 5 {
 		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	}
 	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
-		"sanity: gen=1 bucket drained")
-	// Generation 2 (recreate) must start from a fresh full bucket
-	// regardless of what gen=1 left in cache. Stale-key code would
-	// keep rejecting on the same drained bucket.
+		"sanity: incarnation=1 bucket drained")
+	// Incarnation 2 (recreate) must start from a fresh full bucket
+	// regardless of what incarnation=1 left in cache. Stale-key code
+	// would keep rejecting on the same drained bucket.
 	for range 5 {
 		require.True(t, store.charge(cfg, "orders", bucketActionSend, 2, 1).allowed,
-			"gen=2 charge must succeed against a fresh bucket; "+
-				"shared-key bug would reuse gen=1's drained state")
+			"incarnation=2 charge must succeed against a fresh bucket; "+
+				"shared-key bug would reuse incarnation=1's drained state")
 	}
 	require.False(t, store.charge(cfg, "orders", bucketActionSend, 2, 1).allowed,
-		"gen=2 bucket must enforce its own capacity once drained")
-	// gen=1's bucket should still be drained — the two incarnations
-	// must not cross-pollinate.
+		"incarnation=2 bucket must enforce its own capacity once drained")
+	// incarnation=1's bucket should still be drained — the two
+	// incarnations must not cross-pollinate.
 	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed,
-		"gen=1 must remain drained; gen=2 charges must not refill gen=1")
+		"incarnation=1 must remain drained; incarnation=2 charges must not refill incarnation=1")
 }
 
-// TestBucketStore_InvalidateQueueClearsAllGenerations pins that
+// TestBucketStore_InvalidateQueueClearsAllIncarnations pins that
 // invalidateQueue ranges by queue prefix and removes every cached
-// generation, not just one. Required because the leader's view of
-// "current generation" can drift from a follower's during a
+// incarnation, not just one. Required because the leader's view of
+// "current incarnation" can drift from a follower's during a
 // failover-mid-CreateQueue, and an invalidate that only hit one
-// generation would leave the other side stale.
-func TestBucketStore_InvalidateQueueClearsAllGenerations(t *testing.T) {
+// incarnation would leave the other side stale.
+func TestBucketStore_InvalidateQueueClearsAllIncarnations(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Hour)
 	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
-	// Populate orders@gen=1, orders@gen=2, events@gen=1.
+	// Populate orders@incarnation=1, orders@incarnation=2, events@incarnation=1.
 	require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	require.True(t, store.charge(cfg, "orders", bucketActionSend, 2, 1).allowed)
 	require.True(t, store.charge(cfg, "events", bucketActionSend, 1, 1).allowed)
@@ -580,15 +580,48 @@ func TestBucketStore_InvalidateQueueClearsAllGenerations(t *testing.T) {
 
 	store.invalidateQueue("orders")
 
-	// Both orders generations gone, events untouched.
+	// Both orders incarnations gone, events untouched.
 	require.Equal(t, 1, countBuckets(store),
-		"invalidateQueue must drop every generation belonging to the queue")
-	_, hasOrdersGen1 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, generation: 1})
-	_, hasOrdersGen2 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, generation: 2})
-	_, hasEvents := store.buckets.Load(bucketKey{queue: "events", action: bucketActionSend, generation: 1})
-	require.False(t, hasOrdersGen1)
-	require.False(t, hasOrdersGen2)
+		"invalidateQueue must drop every incarnation belonging to the queue")
+	_, hasOrdersInc1 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, incarnation: 1})
+	_, hasOrdersInc2 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, incarnation: 2})
+	_, hasEvents := store.buckets.Load(bucketKey{queue: "events", action: bucketActionSend, incarnation: 1})
+	require.False(t, hasOrdersInc1)
+	require.False(t, hasOrdersInc2)
 	require.True(t, hasEvents, "unrelated queue must not be evicted")
+}
+
+// TestBucketStore_PurgeQueueDoesNotResetBucket pins the Codex P2 fix
+// on PR #664 round 9: PurgeQueue bumps sqsQueueMeta.Generation but
+// preserves Incarnation, and the throttle bucket keys by Incarnation.
+// Earlier code keyed by Generation, which let a caller bypass the
+// rate limit by repeatedly purging — every purge re-keyed the bucket
+// and the next charge minted a fresh full-capacity replacement. The
+// 60s AWS-spec PurgeQueue rate-limit bounded the bypass but it was
+// real. This test simulates the purge by keeping the same
+// incarnation across two charges with different generation values
+// (which the throttle layer doesn't see, but would be the upstream
+// signal — the API contract is "incarnation only changes on
+// CreateQueue").
+func TestBucketStore_PurgeQueueDoesNotResetBucket(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Hour)
+	cfg := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
+	const incarnation uint64 = 1
+	for range 5 {
+		require.True(t, store.charge(cfg, "orders", bucketActionSend, incarnation, 1).allowed)
+	}
+	// Bucket fully drained.
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, incarnation, 1).allowed)
+	// "Purge" — in the real wire path, sqsQueueMeta.Generation bumps
+	// here but sqsQueueMeta.Incarnation does not. The throttle layer
+	// only sees incarnation, so the very next charge must still find
+	// the same drained bucket — not a fresh one.
+	require.False(t, store.charge(cfg, "orders", bucketActionSend, incarnation, 1).allowed,
+		"PurgeQueue (which preserves Incarnation) must not reset the throttle bucket; "+
+			"a Generation-keyed bucket would be re-keyed and let a caller "+
+			"bypass the rate limit by repeatedly purging")
 }
 
 func countBuckets(b *bucketStore) int {

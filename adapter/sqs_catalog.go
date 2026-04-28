@@ -68,8 +68,26 @@ var sqsQueueNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}(\.fifo)?$`)
 // !sqs|queue|meta|<queue>. Serialized as JSON with a short magic prefix so
 // future schema migrations can switch encoding without reading back garbage.
 type sqsQueueMeta struct {
-	Name                      string            `json:"name"`
-	Generation                uint64            `json:"generation"`
+	Name string `json:"name"`
+	// Generation bumps on CreateQueue, DeleteQueue, and PurgeQueue —
+	// every operation that needs to invalidate the message keyspace
+	// (msg keys are prefixed with the generation so old data becomes
+	// unreachable). NOT suitable as a throttle-bucket key because a
+	// PurgeQueue would re-key the bucket and let a caller bypass the
+	// rate limit by repeatedly purging.
+	Generation uint64 `json:"generation"`
+	// Incarnation bumps on CreateQueue only; PurgeQueue and
+	// SetQueueAttributes preserve the prior value (the read-modify-
+	// write of the meta record carries it forward), and DeleteQueue
+	// removes the meta entirely. The next CreateQueue computes
+	// Incarnation = lastGen + 1, which is monotonic across delete /
+	// recreate cycles thanks to the persistent generation counter
+	// (sqsQueueGenKey survives DeleteQueue, see deleteQueueWithRetry).
+	// This is the throttle-bucket-key field — keying by Incarnation
+	// instead of Generation prevents PurgeQueue from resetting the
+	// in-memory token bucket while still isolating delete+recreate
+	// incarnations from each other (Codex P2 on PR #664 round 9).
+	Incarnation               uint64            `json:"incarnation,omitempty"`
 	CreatedAtHLC              uint64            `json:"created_at_hlc,omitempty"`
 	IsFIFO                    bool              `json:"is_fifo,omitempty"`
 	ContentBasedDedup         bool              `json:"content_based_dedup,omitempty"`
@@ -945,6 +963,12 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 		return false, errors.WithStack(err)
 	}
 	requested.Generation = lastGen + 1
+	// Incarnation == Generation at create time (both monotonic from
+	// the persistent gen counter), but it stops moving on PurgeQueue
+	// and SetQueueAttributes — those paths preserve meta.Incarnation
+	// while bumping or leaving Generation. The throttle bucket key
+	// hangs off Incarnation so a Purge cannot reset the bucket.
+	requested.Incarnation = requested.Generation
 	if clock := s.coordinator.Clock(); clock != nil {
 		requested.CreatedAtHLC = clock.Current()
 	}
@@ -1405,44 +1429,53 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Attributes is required")
 		return
 	}
-	if err := s.setQueueAttributesWithRetry(r.Context(), name, in.Attributes); err != nil {
+	throttleChanged, err := s.setQueueAttributesWithRetry(r.Context(), name, in.Attributes)
+	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
 	// Drop the in-memory bucket entries belonging to this queue *after*
 	// the Raft commit so the next request rebuilds from the freshly
 	// committed throttle config. Gated on whether the request actually
-	// touched a Throttle* attribute — an unconditional invalidate
-	// would reset the bucket on every unrelated SetQueueAttributes
-	// (e.g. VisibilityTimeout-only update), giving any caller a way to
+	// changed a Throttle* value — an unconditional invalidate would
+	// reset the bucket on every unrelated SetQueueAttributes (e.g.
+	// VisibilityTimeout-only update), giving any caller a way to
 	// silently restore a noisy tenant's burst capacity by writing a
-	// no-op SetQueueAttributes (Codex P1 on PR #679). The bucket
-	// reconciliation in loadOrInit also catches a stale bucket if a
-	// throttle change slips past this gate (e.g. via a future admin
-	// path), so the gating here is purely a hot-path optimisation.
-	if throttleAttributesPresent(in.Attributes) {
+	// no-op SetQueueAttributes (Codex P1 on PR #679, refined on PR
+	// #664 round 9). Gating on key-presence alone is not enough either
+	// — a same-value Throttle* write would still pass the presence
+	// check and invalidate, so a caller could repeat their own current
+	// throttle config to bump the bucket back to full capacity (Codex
+	// P1 on PR #664 round 9). trySetQueueAttributesOnce therefore
+	// compares the old and new throttle configs under the same Raft
+	// read snapshot used for the commit and reports whether the values
+	// actually moved. The bucket reconciliation in loadOrInit also
+	// catches a stale bucket if a throttle change slips past this gate
+	// (e.g. via a future admin path), so the gating here is purely a
+	// hot-path optimisation plus a no-op-bypass guard.
+	if throttleChanged {
 		s.throttle.invalidateQueue(name)
 	}
 	writeSQSJSON(w, map[string]any{})
 }
 
-func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName string, attrs map[string]string) error {
+func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName string, attrs map[string]string) (bool, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		done, err := s.trySetQueueAttributesOnce(ctx, queueName, attrs)
+		throttleChanged, done, err := s.trySetQueueAttributesOnce(ctx, queueName, attrs)
 		if err == nil && done {
-			return nil
+			return throttleChanged, nil
 		}
 		if err != nil && !isRetryableTransactWriteError(err) {
-			return err
+			return false, err
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
-			return errors.WithStack(err)
+			return false, errors.WithStack(err)
 		}
 		backoff = nextTransactRetryBackoff(backoff)
 	}
-	return newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "set queue attributes retry attempts exhausted")
+	return false, newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "set queue attributes retry attempts exhausted")
 }
 
 // applyAndValidateSetAttributes runs the apply + cross-validator
@@ -1481,26 +1514,37 @@ func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) 
 	return validatePartitionConfig(meta)
 }
 
-// trySetQueueAttributesOnce is one read-validate-commit pass. The first
-// return reports whether the caller should stop retrying (the attrs
-// are now committed); an error means either a non-retryable failure
-// (propagate) or a retryable write conflict (retry after backoff).
-func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, error) {
+// trySetQueueAttributesOnce is one read-validate-commit pass. The
+// returns are (throttleChanged, done, err). done reports whether the
+// caller should stop retrying (the attrs are now committed); an error
+// means either a non-retryable failure (propagate) or a retryable
+// write conflict (retry after backoff). throttleChanged is true iff
+// the post-apply meta's Throttle config differs from the pre-apply
+// snapshot — the caller uses it to gate the cache invalidation so
+// that a no-op same-value SetQueueAttributes does not reset the
+// bucket to full capacity (Codex P1 on PR #664 round 9).
+func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, bool, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return false, errors.WithStack(err)
+		return false, false, errors.WithStack(err)
 	}
 	if !exists {
-		return false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return false, false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
+	// Snapshot the throttle config under the same read TS used for the
+	// commit so the comparison sees the value the writer is racing
+	// against, not a later one. Cheap because the value is small (six
+	// floats wrapped in a struct).
+	preThrottle := snapshotThrottle(meta.Throttle)
 	if err := applyAndValidateSetAttributes(meta, attrs); err != nil {
-		return false, err
+		return false, false, err
 	}
+	throttleChanged := !throttleConfigEqual(preThrottle, meta.Throttle)
 	meta.LastModifiedAtMillis = time.Now().UnixMilli()
 	metaBytes, err := encodeSQSQueueMeta(meta)
 	if err != nil {
-		return false, errors.WithStack(err)
+		return false, false, errors.WithStack(err)
 	}
 	metaKey := sqsQueueMetaKey(queueName)
 	// StartTS + ReadKeys prevent two concurrent SetQueueAttributes from
@@ -1515,9 +1559,22 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 		},
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		return false, errors.WithStack(err)
+		return false, false, errors.WithStack(err)
 	}
-	return true, nil
+	return throttleChanged, true, nil
+}
+
+// snapshotThrottle returns a value-copy of the Throttle config so a
+// later mutation of meta.Throttle (via applyAttributes) does not
+// retroactively change the snapshot. throttleConfigEqual handles the
+// nil-vs-empty case, so the snapshot can be the typed zero value
+// when meta.Throttle was nil.
+func snapshotThrottle(t *sqsQueueThrottle) *sqsQueueThrottle {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	return &cp
 }
 
 // sqsApproxCounterScanLimit caps a single GetQueueAttributes scan. AWS

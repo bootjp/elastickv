@@ -308,6 +308,62 @@ func mustCreateQueue(t *testing.T, node Node, name string) string {
 	return url
 }
 
+// TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket pins
+// the Codex P1 fix on PR #664 round 9. Earlier code invalidated the
+// throttle bucket whenever any Throttle* attribute appeared in a
+// SetQueueAttributes request — including same-value writes. A caller
+// could therefore force the bucket back to full capacity by
+// re-submitting their own current throttle config in a tight loop,
+// effectively bypassing the rate limit. The fix gates the
+// invalidation on a real value change (snapshot before applyAttributes,
+// throttleConfigEqual after), so a no-op SetQueueAttributes leaves
+// the in-memory bucket alone.
+func TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	url := mustCreateQueue(t, node, "throttle-noop-set")
+	mustSetQueueAttributes(t, node, url, map[string]string{
+		"ThrottleSendCapacity":        "10",
+		"ThrottleSendRefillPerSecond": "1",
+	})
+	// Drain the bucket so the next charge would only succeed if the
+	// bucket was reset to a fresh full-capacity replacement.
+	for range 10 {
+		status, _ := callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl": url, "MessageBody": "drain",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("drain send: status %d", status)
+		}
+	}
+	// Sanity-check: drained bucket rejects.
+	status, _ := callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl": url, "MessageBody": "should-throttle",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("expected throttle, got %d", status)
+	}
+	// Re-submit identical Throttle* values. Old code invalidated on
+	// key presence and the next send would have been allowed against
+	// a fresh full bucket.
+	mustSetQueueAttributes(t, node, url, map[string]string{
+		"ThrottleSendCapacity":        "10",
+		"ThrottleSendRefillPerSecond": "1",
+	})
+	// Bucket must still be drained — no-op SetQueueAttributes must not
+	// reset the rate limiter.
+	status, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
+		"QueueUrl": url, "MessageBody": "post-noop-set",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("post-no-op SetQueueAttributes send: status %d (expected 400; "+
+			"no-op invalidate-bypass regression)", status)
+	}
+}
+
 func mustSetQueueAttributes(t *testing.T, node Node, url string, attrs map[string]string) {
 	t.Helper()
 	status, out := callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{

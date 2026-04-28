@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 // Per-queue throttling — token-bucket store that hangs off *SQSServer.
@@ -81,19 +83,22 @@ const throttleIdleEvictAfter = time.Hour
 // the O(N) cost only on the goroutine's tick, never on a request.
 const throttleEvictSweepEvery = time.Minute
 
-// bucketKey is the in-memory map key. generation is the queue's
-// monotonically-increasing incarnation counter (sqsQueueMeta.Generation,
-// bumped on each successful CreateQueue): including it isolates token
-// state across DeleteQueue+CreateQueue cycles and across leader changes
-// where a different node holds an in-memory bucket from an earlier
-// incarnation. Without generation in the key, two queues that share a
-// name but differ in incarnation would silently share token balance,
-// so the recreated queue could start already drained or unexpectedly
-// bursty (Codex P1 on PR #664 — review of `2edf9d49`).
+// bucketKey is the in-memory map key. incarnation is the queue's
+// CreateQueue-only counter (sqsQueueMeta.Incarnation): it bumps on
+// each successful CreateQueue and is preserved across PurgeQueue and
+// SetQueueAttributes. Including it isolates token state across
+// DeleteQueue+CreateQueue cycles and across leader changes where a
+// different node holds an in-memory bucket from an earlier
+// incarnation. Using Incarnation rather than Generation also blocks
+// a PurgeQueue-driven reset bypass: Generation bumps on every Purge,
+// so a (queue, action, incarnation)-keyed bucket would be re-keyed
+// on each purge and the next request would mint a fresh full bucket
+// — letting a caller exceed the configured rate by repeatedly
+// purging (Codex P2 on PR #664 round 9).
 type bucketKey struct {
-	queue      string
-	action     string
-	generation uint64
+	queue       string
+	action      string
+	incarnation uint64
 }
 
 // tokenBucket is one bucket's mutable state. mu is per-bucket so
@@ -165,16 +170,16 @@ type chargeOutcome struct {
 }
 
 // charge takes count tokens from the bucket identified by (queue,
-// action, generation) using cfg as the source-of-truth for capacity /
+// action, incarnation) using cfg as the source-of-truth for capacity /
 // refillRate. cfg may be nil — in which case throttling is disabled for
 // the queue and charge returns allowed=true without touching the map.
-// generation is sqsQueueMeta.Generation so a same-name recreate or
+// incarnation is sqsQueueMeta.Generation so a same-name recreate or
 // cross-leader failover never reuses an older incarnation's tokens.
 //
 // count must be ≥ 1; the caller has already validated batch size at
 // the request layer (sqs_messages_batch.go bounds it to
 // sqsBatchMaxEntries).
-func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, generation uint64, count int) chargeOutcome {
+func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarnation uint64, count int) chargeOutcome {
 	if b == nil || cfg == nil || cfg.IsEmpty() {
 		// Throttling disabled (default): every request allowed, no
 		// bucket allocated. The hot path stays a single nil-check.
@@ -204,7 +209,7 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, genera
 	// evictedAfter); the cap keeps a pathological invariant violation
 	// from spinning the goroutine.
 	for range 4 {
-		bucket := b.loadOrInit(queue, resolvedAction, generation, capacity, refill)
+		bucket := b.loadOrInit(queue, resolvedAction, incarnation, capacity, refill)
 		outcome, retry := chargeBucket(bucket, b.clock(), count)
 		if !retry {
 			return outcome
@@ -256,7 +261,7 @@ func chargeBucket(bucket *tokenBucket, now time.Time, count int) (chargeOutcome,
 }
 
 // loadOrInit handles the first-use insert race. Two concurrent first
-// requests for the same (queue, action, generation) both arrive at
+// requests for the same (queue, action, incarnation) both arrive at
 // LoadOrStore; one wins and the loser's freshly-built bucket is
 // discarded. This is safe because both racers compute identical
 // (capacity, refillRate) from the same meta snapshot — the bucket
@@ -275,13 +280,13 @@ func chargeBucket(bucket *tokenBucket, now time.Time, count int) (chargeOutcome,
 // future admin path that mutates throttle config without touching
 // SetQueueAttributes).
 //
-// generation participates in the key (Codex P1 on PR #664): a
+// incarnation participates in the key (Codex P1 on PR #664): a
 // DeleteQueue+CreateQueue cycle bumps Generation, so the new
 // incarnation lands in a different map entry and starts from a
 // fresh full bucket regardless of what stale per-process cache
 // the prior incarnation left on this or any other node.
-func (b *bucketStore) loadOrInit(queue, action string, generation uint64, capacity, refill float64) *tokenBucket {
-	key := bucketKey{queue: queue, action: action, generation: generation}
+func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capacity, refill float64) *tokenBucket {
+	key := bucketKey{queue: queue, action: action, incarnation: incarnation}
 	if v, ok := b.buckets.Load(key); ok {
 		// type assertion is sound: only tokenBucket pointers are stored.
 		bucket, _ := v.(*tokenBucket)
@@ -363,11 +368,11 @@ func (b *bucketStore) invalidateQueue(queue string) {
 		return
 	}
 	// Generation participates in the key (Codex P1 on PR #664): we do
-	// not know which generations have buckets cached, so range the map
+	// not know which incarnations have buckets cached, so range the map
 	// and remove any entry whose queue matches. A SetQueueAttributes
-	// invalidation on the same generation must drop the same-gen
+	// invalidation on the same incarnation must drop the same-gen
 	// bucket so the new throttle config takes effect; a DeleteQueue /
-	// CreateQueue cycle would also drop any pre-existing generation's
+	// CreateQueue cycle would also drop any pre-existing incarnation's
 	// bucket here, although those entries also fall out via idle
 	// eviction since the new incarnation lands under a different key
 	// and the old key never sees traffic again.
@@ -556,24 +561,40 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 	if s.throttle == nil {
 		return true
 	}
-	throttle, generation := s.queueThrottleConfig(r, queueName)
-	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle, generation)
+	throttle, incarnation, err := s.queueThrottleConfig(r, queueName)
+	if err != nil {
+		// Fail closed on a transient storage error (Codex P2 on PR
+		// #664 round 9). Earlier code converted the error to (nil, 0)
+		// which made the throttle check short-circuit to "allowed";
+		// if the same storage hiccup did not also break the OCC
+		// commit a few lines later, the request would be processed
+		// unthrottled — a silent rate-limit bypass under storage
+		// instability. 500 here matches what the OCC layer would
+		// also surface for a meta read failure.
+		writeSQSError(w, http.StatusInternalServerError, sqsErrInternalFailure,
+			"throttle config read failed: "+err.Error())
+		return false
+	}
+	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle, incarnation)
 }
 
 // chargeQueueWithThrottle is the variant for handlers that already
 // have the throttle config in hand from their own meta load. Drops
 // the per-request meta load chargeQueue does, addressing the Gemini
 // high finding on PR #679 about redundant storage reads on the hot
-// path. generation is sqsQueueMeta.Generation: it must come from the
-// same meta snapshot the throttle config was read from so a recreate
-// committed mid-request lands in a fresh bucket on the next call
-// rather than mixing tokens with the prior incarnation (Codex P1 on
-// PR #664).
-func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, generation uint64) bool {
+// path. incarnation is sqsQueueMeta.Incarnation: it must come from
+// the same meta snapshot the throttle config was read from so a
+// recreate committed mid-request lands in a fresh bucket on the next
+// call rather than mixing tokens with the prior incarnation (Codex
+// P1 on PR #664). NOTE: meta.Incarnation, NOT meta.Generation —
+// PurgeQueue bumps Generation but preserves Incarnation, so keying
+// the bucket by Generation would let a caller bypass the rate limit
+// by repeatedly purging (Codex P2 on PR #664 round 9).
+func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64) bool {
 	if s.throttle == nil {
 		return true
 	}
-	outcome := s.throttle.charge(throttle, queueName, action, generation, count)
+	outcome := s.throttle.charge(throttle, queueName, action, incarnation, count)
 	if outcome.allowed {
 		return true
 	}
@@ -584,21 +605,32 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 // queueThrottleConfig loads the Throttle config and Generation off a
 // queue's meta record. Generation participates in the bucket key, so
 // it must travel with the throttle snapshot to avoid a stale-meta
-// read that mints a fresh bucket under the wrong incarnation. Returns
-// (nil, 0) on any error or missing-queue — the surrounding handler is
-// responsible for surfacing those, and a nil throttle config
-// short-circuits the charge to "allowed".
+// read that mints a fresh bucket under the wrong incarnation.
+//
+// Returns:
+//   - (cfg, gen, nil) on a successful read of an existing queue.
+//   - (nil, 0, nil) when the queue does not exist — the caller's
+//     handler will surface QueueDoesNotExist a few lines later, and a
+//     nil throttle config short-circuits the charge to "allowed".
+//   - (nil, 0, err) on a storage-layer error. The caller MUST fail
+//     the request closed; converting an error to (nil, 0) silently
+//     would let traffic bypass the throttle check during a transient
+//     storage outage if the OCC commit later succeeded (Codex P2 on
+//     PR #664 round 9).
 //
 // Held as a method on *SQSServer so a test can swap the meta loader
 // via the existing nextTxnReadTS / loadQueueMetaAt seam.
-func (s *SQSServer) queueThrottleConfig(r *http.Request, queueName string) (*sqsQueueThrottle, uint64) {
+func (s *SQSServer) queueThrottleConfig(r *http.Request, queueName string) (*sqsQueueThrottle, uint64, error) {
 	if s.store == nil {
-		return nil, 0
+		return nil, 0, nil
 	}
 	readTS := s.nextTxnReadTS(r.Context())
 	meta, exists, err := s.loadQueueMetaAt(r.Context(), queueName, readTS)
-	if err != nil || !exists || meta == nil {
-		return nil, 0
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
 	}
-	return meta.Throttle, meta.Generation
+	if !exists || meta == nil {
+		return nil, 0, nil
+	}
+	return meta.Throttle, meta.Incarnation, nil
 }
