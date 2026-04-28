@@ -425,6 +425,62 @@ func TestBucketStore_OrphanedBucketRetriesToLiveEntry(t *testing.T) {
 	require.NotSame(t, original, live, "post-eviction charge must allocate a fresh bucket")
 }
 
+// TestBucketStore_LoadOrInitReconciliationMarksOrphanEvictedUnderMu
+// pins the Codex P1 fix on PR #664 round 11. The earlier
+// loadOrInit reconciliation path used:
+//
+//	bucket.mu.Lock(); matches := ...; bucket.mu.Unlock()
+//	if !matches { CompareAndDelete; bucket.mu.Lock(); evicted=true; Unlock }
+//
+// which left an unlocked window between CompareAndDelete success
+// and the re-lock. A concurrent charger that already held the
+// stale bucket pointer could acquire bucket.mu in that window,
+// observe evicted=false, and spend tokens against the orphaned
+// bucket. The fix holds bucket.mu across the matches check, the
+// CompareAndDelete, and the evicted=true assignment — matching
+// the lock-then-delete-then-flag ordering sweep / invalidateQueue
+// already use. This deterministic test replicates the post-
+// reconciliation orphan check by forcing a config mismatch and
+// verifying the orphan bucket is evicted=true after the
+// reconciler's call returns.
+func TestBucketStore_LoadOrInitReconciliationMarksOrphanEvictedUnderMu(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
+	store := newBucketStore(func() time.Time { return now }, time.Hour)
+	// Seed with a bucket built from cfgOld.
+	cfgOld := &sqsQueueThrottle{SendCapacity: 5, SendRefillPerSecond: 1}
+	require.True(t, store.charge(cfgOld, "orders", bucketActionSend, 1, 1).allowed)
+	key := bucketKey{queue: "orders", action: bucketActionSend, incarnation: 1}
+	v, ok := store.buckets.Load(key)
+	require.True(t, ok)
+	original, _ := v.(*tokenBucket)
+
+	// Trigger reconciliation with a different config — loadOrInit
+	// must spot the cap/refill mismatch, evict the original bucket,
+	// and mark it evicted=true under the same mu acquisition.
+	cfgNew := &sqsQueueThrottle{SendCapacity: 50, SendRefillPerSecond: 50}
+	require.True(t, store.charge(cfgNew, "orders", bucketActionSend, 1, 1).allowed)
+
+	// The map should now hold a fresh bucket (different pointer).
+	v2, ok := store.buckets.Load(key)
+	require.True(t, ok)
+	live, _ := v2.(*tokenBucket)
+	require.NotSame(t, original, live,
+		"reconciliation must replace the stale bucket with a fresh one")
+
+	// The original (orphan) bucket must be evicted=true. With the
+	// pre-fix unlock-between-CompareAndDelete-and-flag ordering, a
+	// concurrent charger could observe evicted=false in the gap and
+	// spend a token before the flag flipped.
+	original.mu.Lock()
+	require.True(t, original.evicted,
+		"reconciliation must set evicted=true on the orphan bucket "+
+			"under the same mu it held for the matches check, so a "+
+			"concurrent charger blocked on mu sees the flag on entry "+
+			"and retries against the live bucket")
+	original.mu.Unlock()
+}
+
 // TestBucketStore_InvalidateMarksOrphanEvicted pins the round-6 fix
 // to invalidateQueue: dropped buckets must flip evicted=true under mu
 // so a sendMessage that loaded meta pre-invalidation and is racing

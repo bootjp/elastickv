@@ -295,10 +295,25 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 		// directly. A mismatch means the on-disk meta moved while
 		// this node held a stale bucket; rebuild from the current
 		// config (full capacity, matching the failover semantics).
+		//
+		// Hold mu across the matches check, the CompareAndDelete, and
+		// the evicted=true flag (Codex P1 on PR #664 round 11). The
+		// earlier ordering — unlock-after-matches, CompareAndDelete,
+		// re-lock-and-flag — left a window between the
+		// CompareAndDelete success and the re-lock during which a
+		// concurrent charger blocked on bucket.mu could acquire it,
+		// see evicted=false (the flag is only set on the next-but-one
+		// statement), and spend tokens against the orphaned bucket.
+		// Subsequent requests would mint a fresh full-capacity bucket
+		// via LoadOrStore — a one-time burst above the configured
+		// limit right after a config reconciliation. Holding mu
+		// across the whole sequence makes the lock-then-delete-then-
+		// flag ordering match sweep / invalidateQueue, so a charger
+		// blocked on mu sees evicted=true on entry and retries.
 		bucket.mu.Lock()
 		matches := bucket.capacity == capacity && bucket.refillRate == refill
-		bucket.mu.Unlock()
 		if matches {
+			bucket.mu.Unlock()
 			return bucket
 		}
 		// CompareAndDelete is mandatory here: an unconditional Delete
@@ -312,20 +327,12 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 		// map, while later requests get a different fresh bucket at
 		// full capacity. CompareAndDelete makes our Delete a no-op
 		// when the map already holds someone else's fresh bucket.
-		// (Claude P1 on PR #679 round 4 caught this.)
-		//
-		// Setting evicted=true after a successful CompareAndDelete
-		// signals any in-flight charger holding the stale bucket to
-		// retry against the live entry; without it, a goroutine that
-		// loaded the stale bucket and is now blocked on its mu would
-		// charge against the orphaned (wrong-capacity) bucket after
-		// we release. Done under mu so the charger sees evicted=true
-		// the moment it acquires the lock.
+		// (Claude P1 on PR #679 round 4 caught the original race;
+		// PR #664 round 11 closed the lock-gap above.)
 		if b.buckets.CompareAndDelete(key, v) {
-			bucket.mu.Lock()
 			bucket.evicted = true
-			bucket.mu.Unlock()
 		}
+		bucket.mu.Unlock()
 		// fall through to LoadOrStore — a concurrent racer might
 		// have already inserted a fresh bucket with the current
 		// config, in which case LoadOrStore picks it up and the new
