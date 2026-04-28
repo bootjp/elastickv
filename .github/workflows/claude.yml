@@ -32,12 +32,16 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        # Pinned to v1.0.107 because v1.0.108 (auto-pulled via the `v1` rolling
-        # tag on 2026-04-28) regressed OAuth-token auth: the agent SDK throws
-        # `Could not resolve [authentication]` from validateHeaders before any
-        # work runs. Refreshing CLAUDE_CODE_OAUTH_TOKEN does not help. Bump back
-        # to `@v1` once upstream ships a fix.
+        # Pinned to v1.0.107 + explicit env. As of 2026-04-28, the OAuth token
+        # passed only via the `with:` input is not reaching the Claude Code
+        # child process spawned by the agent SDK's query() — the SDK throws
+        # `Could not resolve [authentication]` even though the same token
+        # works locally with `claude --print`. Setting CLAUDE_CODE_OAUTH_TOKEN
+        # in the step's env: forces it onto process.env so parse-sdk-options
+        # forwards it to the child. Revisit once upstream ships a fix.
         uses: anthropics/claude-code-action@7eab1296cc65117d50ac2a2fa5f00a30ec84d3d5 # v1.0.107
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
