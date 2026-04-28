@@ -7,6 +7,10 @@ date: 2026-04-28
 
 # KeyViz adapter / namespace labels
 
+Status: Proposed
+Author: bootjp
+Date: 2026-04-28
+
 ## 1. Background
 
 Phase 2-A through 2-C ship a fully functional KeyViz heatmap, but
@@ -377,18 +381,26 @@ upstream still on PR-C never sees a wire shape mismatch:
  // proto/admin.proto — wire form, PR-D+E.
  //
  // Reuse the **existing** field 4 (`string label`), which is
- // already declared on KeyVizRow but currently unused — no
- // schema migration, no field-number bump. The existing comment
- // already reserves it for "future per-Observe label", which is
- // exactly this proposal's payload. (CodeRabbit critical on PR
- // #694 caught this — an earlier draft proposed adding a
- // duplicate `string label = 13;` which would have collided.)
+ // already declared on KeyVizRow but currently unused and
+ // uncommented — no schema migration, no field-number bump.
+ // The current proto declares `string label = 4;` with no
+ // doc comment, and the nearby `bucket_id` comment only mentions
+ // the legacy `route:<id>` / `virtual:<id>` forms. PR-D+E starts
+ // filling the field AND updates the proto comments in the same
+ // commit (both the new label-field doc comment and the
+ // `bucket_id` comment so it lists the composite
+ // `route:<id>:<label>` form). (CodeRabbit critical on PR
+ // #694 caught the duplicate-field-13 mistake — an earlier draft
+ // proposed adding `string label = 13;` which would have collided
+ // with the existing field 4. Copilot review surfaced the
+ // related "comment already reserves it" misstatement — there is
+ // no such reserving comment yet; PR-D+E adds it.)
  message KeyVizRow {
    string bucket_id = 1;
    bytes start = 2;
    bytes end = 3;
--  string label = 4;        // currently unused
-+  string label = 4;        // PR-D+E: filled with the per-Observe label
+-  string label = 4;        // (no doc comment today)
++  string label = 4;        // PR-D+E: per-Observe label; empty for legacy / virtual rows
    …
  }
 
