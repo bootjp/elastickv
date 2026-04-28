@@ -148,8 +148,8 @@ func TestCollectIndexedKVPairs_Empty(t *testing.T) {
 }
 
 // TestNewQueryRequestID_Length pins the AWS shape: 22 base32 chars.
-// Gemini medium on PR #662 caught the prior 26-char output that
-// contradicted the function's own doc comment.
+// A regression where this function returned 26 chars contradicted
+// its own doc comment, so the length is asserted explicitly.
 func TestNewQueryRequestID_Length(t *testing.T) {
 	t.Parallel()
 	for i := 0; i < 64; i++ {
