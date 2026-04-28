@@ -539,14 +539,21 @@ func throttleChargeCount(entries int) int {
 }
 
 // chargeQueue is the per-handler entry point used by handlers that
-// do not already load the queue meta themselves (deleteMessage,
-// changeMessageVisibility, and their batch siblings). It loads the
-// meta at a fresh read timestamp (Pebble cache makes this cheap) and
-// runs the bucket store's charge against the queue's Throttle config.
+// do not pre-load the queue meta before the throttle check
+// (deleteMessage, changeMessageVisibility, sendMessageBatch,
+// receiveMessageBatch, deleteMessageBatch — the batch handlers run
+// the throttle check OUTSIDE their per-entry OCC retry loop, so the
+// meta they later load inside the loop is not in scope here). It
+// loads the meta at a fresh read timestamp (Pebble cache makes this
+// cheap) and runs the bucket store's charge against the queue's
+// Throttle config.
 //
-// Handlers that DO load the meta themselves (sendMessage,
-// sendMessageBatch, receiveMessage) should use chargeQueueWithThrottle
-// to avoid the redundant load (Gemini high on PR #679).
+// Handlers that DO pre-load the meta before charging — sendMessage
+// and receiveMessage — should use chargeQueueWithThrottle to avoid
+// the redundant load (Gemini high on PR #679). The batch handlers
+// could be refactored similarly but each entry-loop iteration would
+// then need its own lookup, defeating the savings; the single
+// throttle-time meta load there pays for the whole batch.
 //
 // chargeQueue intentionally swallows missing-queue errors: the caller
 // is going to discover that the queue does not exist a few lines
