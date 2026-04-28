@@ -315,6 +315,42 @@ no admin bind-mounts; the daemon comes up with the listener off.
 The signing key file and TLS material can stay on disk — they
 only have effect when `--adminEnabled` is passed.
 
+### 4.6 Deleting an S3 bucket
+
+`AdminDeleteBucket` (and the SigV4 `DeleteBucket` path) follows
+the standard S3 contract: the bucket must be empty. The dashboard
+returns `409 BucketNotEmpty` if any object exists.
+
+**Race-window contract change**: a `PutObject` that returns 200
+OK during the empty-probe → commit window of an `AdminDeleteBucket`
+running concurrently can have its data swept along with the
+bucket meta. The delete commits a `DEL_PREFIX` safety net across
+every per-bucket key family in the same atomic
+`OperationGroup`, so any object that landed in the race window
+is tombstoned at the same `commitTS` rather than left as an
+unreachable orphan. The behaviour is intentional — the
+alternative was orphan objects that no API can enumerate or
+remove. See
+[`docs/design/2026_04_28_proposed_admin_delete_bucket_safety_net.md`](design/2026_04_28_proposed_admin_delete_bucket_safety_net.md)
+for the full race analysis.
+
+Operationally:
+
+- For **planned bucket deletes**, pause writes against the bucket
+  before issuing the delete. The 5-second window between the
+  empty-probe and the commit is small but non-zero; pausing
+  writes guarantees no in-flight `PutObject` is swept.
+- For **emergency bucket deletes** (e.g. cleaning up a
+  compromised bucket while traffic is still live), the safety
+  net guarantees the cluster reaches a clean state immediately
+  — but accept that any client whose `PutObject` was in flight
+  may have received `200 OK` for data that no longer exists.
+- Re-creating a bucket with the same name after delete is safe.
+  `BucketGenerationKey` survives the delete, so the new bucket
+  starts at a strictly higher generation; any object that ever
+  escaped a previous delete (under the old generation prefix)
+  stays invisible to the new bucket.
+
 ---
 
 ## 5. Failure-mode runbooks

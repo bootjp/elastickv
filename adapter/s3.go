@@ -636,6 +636,7 @@ func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket str
 }
 
 func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	var deletedGeneration uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
 		startTS := s.txnStartTS(readTS)
@@ -669,19 +670,32 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 			}
 		}
 
+		// Phase 1: Del BucketMetaKey in a txn (OCC-protected
+		// against concurrent createBucket racing this delete).
+		// Phase 2 (DEL_PREFIX safety net) runs outside the txn
+		// because the production coordinator rejects DEL_PREFIX
+		// inside transactions and rejects mixed Del+DelPrefix
+		// groups (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast).
+		// See AdminDeleteBucket's doc comment for the full
+		// rationale.
 		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)},
-			},
+			Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)}},
 		})
-		return errors.WithStack(err)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		deletedGeneration = meta.Generation
+		return nil
 	})
 	if err != nil {
 		writeS3MutationError(w, err, bucket, "")
 		return
 	}
+	// Phase 2: best-effort DEL_PREFIX safety net. See
+	// AdminDeleteBucket / runBucketDeleteSafetyNet for the contract.
+	s.runBucketDeleteSafetyNet(r.Context(), bucket, deletedGeneration)
 	w.WriteHeader(http.StatusNoContent)
 }
 

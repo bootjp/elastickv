@@ -190,8 +190,46 @@ func RouteKey(bucket string, generation uint64, object string) []byte {
 }
 
 func ObjectManifestPrefixForBucket(bucket string, generation uint64) []byte {
-	out := make([]byte, 0, len(ObjectManifestPrefix)+len(bucket)+u64Bytes+segmentEscapeOverhead)
-	out = append(out, objectManifestPrefixBytes...)
+	return bucketScopedPrefix(objectManifestPrefixBytes, bucket, generation)
+}
+
+// UploadMetaPrefixForBucket / UploadPartPrefixForBucket /
+// BlobPrefixForBucket / GCUploadPrefixForBucket / RoutePrefixForBucket
+// each isolate to a single bucket+generation tuple. Used by
+// AdminDeleteBucket's DEL_PREFIX safety net (design doc
+// 2026_04_28_proposed_admin_delete_bucket_safety_net.md): the bucket-
+// must-be-empty empty-probe is racy against concurrent PutObject, so
+// the delete commit also DEL_PREFIXes every per-bucket key family to
+// sweep anything that snuck in during the readTS → commitTS window.
+//
+// Each prefix encodes the bucket segment then the generation u64 in
+// the same shape as the per-key constructors that build entries
+// under each family. Re-creating the bucket bumps generation so old
+// orphans under the old generation prefix stay isolated from the
+// new bucket.
+func UploadMetaPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(uploadMetaPrefixBytes, bucket, generation)
+}
+
+func UploadPartPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(uploadPartPrefixBytes, bucket, generation)
+}
+
+func BlobPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(blobPrefixBytes, bucket, generation)
+}
+
+func GCUploadPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(gcUploadPrefixBytes, bucket, generation)
+}
+
+func RoutePrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(routePrefixBytes, bucket, generation)
+}
+
+func bucketScopedPrefix(prefix []byte, bucket string, generation uint64) []byte {
+	out := make([]byte, 0, len(prefix)+len(bucket)+u64Bytes+segmentEscapeOverhead)
+	out = append(out, prefix...)
 	out = append(out, EncodeSegment([]byte(bucket))...)
 	out = appendU64(out, generation)
 	return out
