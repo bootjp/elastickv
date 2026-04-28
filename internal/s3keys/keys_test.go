@@ -204,3 +204,103 @@ func TestBlobPrefixForUpload_IsPrefixOfBlobKeys(t *testing.T) {
 	otherKey := BlobKey(bucket, generation, object, "other-upload", 1, 0)
 	require.False(t, bytes.HasPrefix(otherKey, prefix))
 }
+
+// TestPerBucketPrefixes_IsolateByBucketAndGeneration covers the
+// new *PrefixForBucket helpers used by AdminDeleteBucket's
+// DEL_PREFIX safety net (design doc
+// 2026_04_28_proposed_admin_delete_bucket_safety_net.md). For each
+// of the six per-bucket key families, the test pins three
+// invariants:
+//
+//  1. Every key constructed under (bucket, gen) starts with the
+//     prefix — DEL_PREFIX would actually wipe the data.
+//  2. Keys under (other-bucket, gen) DO NOT match — sibling
+//     buckets are not collateral damage.
+//  3. Keys under (bucket, other-gen) DO NOT match — re-creating
+//     the bucket bumps generation; orphans under the old
+//     generation stay invisible to the new bucket. Pinning this
+//     contract prevents a future encoding change that put
+//     generation BEFORE bucket from silently breaking the
+//     orphan-isolation property.
+func TestPerBucketPrefixes_IsolateByBucketAndGeneration(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bucket   = "bucket-a"
+		other    = "bucket-b"
+		object   = "key/object"
+		uploadID = "upload-x"
+		gen      = uint64(7)
+		otherGen = uint64(8)
+	)
+
+	cases := []struct {
+		name   string
+		prefix []byte
+		key    []byte
+		// keyOther uses bucket=other, gen=gen.
+		keyOther []byte
+		// keyOtherGen uses bucket=bucket, gen=otherGen.
+		keyOtherGen []byte
+	}{
+		{
+			name:        "manifest",
+			prefix:      ObjectManifestPrefixForBucket(bucket, gen),
+			key:         ObjectManifestKey(bucket, gen, object),
+			keyOther:    ObjectManifestKey(other, gen, object),
+			keyOtherGen: ObjectManifestKey(bucket, otherGen, object),
+		},
+		{
+			name:        "upload_meta",
+			prefix:      UploadMetaPrefixForBucket(bucket, gen),
+			key:         UploadMetaKey(bucket, gen, object, uploadID),
+			keyOther:    UploadMetaKey(other, gen, object, uploadID),
+			keyOtherGen: UploadMetaKey(bucket, otherGen, object, uploadID),
+		},
+		{
+			name:        "upload_part",
+			prefix:      UploadPartPrefixForBucket(bucket, gen),
+			key:         UploadPartKey(bucket, gen, object, uploadID, 1),
+			keyOther:    UploadPartKey(other, gen, object, uploadID, 1),
+			keyOtherGen: UploadPartKey(bucket, otherGen, object, uploadID, 1),
+		},
+		{
+			name:        "blob",
+			prefix:      BlobPrefixForBucket(bucket, gen),
+			key:         BlobKey(bucket, gen, object, uploadID, 1, 0),
+			keyOther:    BlobKey(other, gen, object, uploadID, 1, 0),
+			keyOtherGen: BlobKey(bucket, otherGen, object, uploadID, 1, 0),
+		},
+		{
+			name:        "gc_upload",
+			prefix:      GCUploadPrefixForBucket(bucket, gen),
+			key:         GCUploadKey(bucket, gen, object, uploadID),
+			keyOther:    GCUploadKey(other, gen, object, uploadID),
+			keyOtherGen: GCUploadKey(bucket, otherGen, object, uploadID),
+		},
+		{
+			name:        "route",
+			prefix:      RoutePrefixForBucket(bucket, gen),
+			key:         RouteKey(bucket, gen, object),
+			keyOther:    RouteKey(other, gen, object),
+			keyOtherGen: RouteKey(bucket, otherGen, object),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.True(t, bytes.HasPrefix(tc.key, tc.prefix),
+				"%s key under (bucket=%q, gen=%d) must match its bucket prefix",
+				tc.name, bucket, gen)
+			require.False(t, bytes.HasPrefix(tc.keyOther, tc.prefix),
+				"%s key under (bucket=%q, gen=%d) must NOT match (bucket=%q, gen=%d) prefix",
+				tc.name, other, gen, bucket, gen)
+			require.False(t, bytes.HasPrefix(tc.keyOtherGen, tc.prefix),
+				"%s key under (bucket=%q, gen=%d) must NOT match (bucket=%q, gen=%d) prefix — "+
+					"orphans from old generation must stay isolated when bucket is recreated",
+				tc.name, bucket, otherGen, bucket, gen)
+		})
+	}
+}
