@@ -163,6 +163,14 @@ for _, label := range allLabelsWithLegacy() { // AllLabels ∪ {""}
 }
 ```
 
+`allLabelsWithLegacy()` is an unexported helper in
+**`keyviz/labels.go`** (same package as `sampler.go`) that returns
+`append(AllLabels, LabelLegacy)`. Co-locating it with `AllLabels`
+keeps the canonical set in one file and avoids `sampler.go`
+reconstructing the same expansion at every call site. The
+function is unexported because no caller outside `package
+keyviz` needs it. (Claude bot round-9 minor.)
+
 When `RegisterRoute` decides a route will be coarsened into a
 virtual bucket (i.e. it returns `false`), **no labeled slots are
 created** for that route — the `tbl.virtualForRoute[routeID]`
@@ -557,6 +565,18 @@ extension is "switch on the field". (Reviewer notes from PR
      turning red. Pins the §5 hard constraint at compile time; a
      future "redis:db0" would otherwise silently break
      `bucket_id` parsing.
+   - **All declared label constants are in `AllLabels`**
+     (PR-C regression guard, written in PR-B): range over the
+     named constants (`LabelDynamo`, `LabelRedis`, …) and assert
+     each appears in `AllLabels`. Catches the symmetric mistake
+     where PR-C adds `LabelNewAdapter = "newadapter"` to
+     `keyviz/labels.go` but forgets to append it to `AllLabels`
+     — the slot pre-creation loop wouldn't iterate over it,
+     `Observe(... LabelNewAdapter)` would miss `tbl.slots`, and
+     all KeyViz samples for that adapter would silently drop
+     in production. Skip when `len(AllLabels) == 0` (matching
+     the avoid-`:` test's pre-PR-C no-op pattern). (Claude bot
+     round-9.)
    - **`reclaimRetiredSlot` (RouteID, Label) dedupe**: retire
      `(routeID, "dynamo")`, re-register `(routeID, "dynamo")`,
      assert reclaim succeeds; then retire `(routeID, "dynamo")`
