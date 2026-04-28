@@ -576,18 +576,13 @@ func TestThrottleAttributesPresent(t *testing.T) {
 	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleDefaultCapacity": "5"}))
 }
 
-// TestBucketStore_InvalidateQueueDropsAllActions pins the §3.1 cache
-// invalidation contract for SetQueueAttributes / DeleteQueue: every
-// bucket belonging to the queue is dropped, even ones not currently
-// being charged. A future verb that grows a new bucket can't sneak
-// past invalidation by being wired into one site only.
-// TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations
-// pins the Codex P1 fix on PR #664: bucketKey includes incarnation
-// so a DeleteQueue+CreateQueue cycle (or a leadership move to a node
-// holding a stale per-process cache) lands the new incarnation under
-// a different map entry and starts from a fresh full bucket. Without
-// incarnation in the key, the recreated queue would inherit the
-// drained token state from the previous incarnation.
+// TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations pins
+// the Codex P1 fix on PR #664: bucketKey includes incarnation so a
+// DeleteQueue+CreateQueue cycle (or a leadership move to a node holding
+// a stale per-process cache) lands the new incarnation under a different
+// map entry and starts from a fresh full bucket. Without incarnation in
+// the key, the recreated queue would inherit the drained token state
+// from the previous incarnation.
 //
 // charge signature is (cfg, queue, action, incarnation, count).
 func TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations(t *testing.T) {

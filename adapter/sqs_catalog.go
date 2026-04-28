@@ -648,7 +648,7 @@ func throttleSetDefaultRefill(t *sqsQueueThrottle, f float64)   { t.DefaultRefil
 //
 // If meta.Throttle is empty (the IsEmpty short-circuit) the function
 // also drops the empty struct so a round-trip GetQueueAttributes
-// reports the queue as untrothttled rather than zero-valued. Mirrors
+// reports the queue as unthrottled rather than zero-valued. Mirrors
 // how nil throttle on the meta means "not configured".
 func validateThrottleConfig(meta *sqsQueueMeta) error {
 	if meta.Throttle == nil {

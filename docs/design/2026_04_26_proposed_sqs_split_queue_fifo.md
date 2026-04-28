@@ -285,7 +285,7 @@ Every queue created before this feature has `PartitionCount = 0` (zero value); t
 
 ### 7.2 New queues opt in
 
-`CreateQueue` accepts the AWS-style attribute `FifoThroughputLimit = perMessageGroupId` plus a non-AWS `PartitionCount` attribute (or, for AWS-shape compatibility, infer the partition count from `DeduplicationScope = messageGroup` + a fixed default, e.g. 8). The doc proposes accepting both: AWS-shape callers can omit `PartitionCount` and get a sensible default; advanced callers can specify.
+`CreateQueue` accepts the AWS-style attribute `FifoThroughputLimit = perMessageGroupId` plus a non-AWS `PartitionCount` attribute. **`PartitionCount` is required** whenever multi-partition FIFO is requested — a `CreateQueue` that carries `FifoThroughputLimit = perMessageGroupId` or `DeduplicationScope = messageGroup` but omits `PartitionCount` is rejected with `InvalidAttributeValue`. There is no server-side default: allowing omission would make `CreateQueue` idempotency depend on hidden deployment state (an operator who changes the server's default between two identical `CreateQueue` calls gets a different queue shape each time), and `PartitionCount` is immutable from creation onward (§3.2), so a wrong inferred value requires a `DeleteQueue`+`CreateQueue` cycle to fix.
 
 ### 7.3 No live re-partitioning
 

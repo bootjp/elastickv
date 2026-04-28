@@ -173,7 +173,7 @@ type chargeOutcome struct {
 // action, incarnation) using cfg as the source-of-truth for capacity /
 // refillRate. cfg may be nil — in which case throttling is disabled for
 // the queue and charge returns allowed=true without touching the map.
-// incarnation is sqsQueueMeta.Generation so a same-name recreate or
+// incarnation is sqsQueueMeta.Incarnation so a same-name recreate or
 // cross-leader failover never reuses an older incarnation's tokens.
 //
 // count must be ≥ 1; the caller has already validated batch size at
@@ -374,10 +374,10 @@ func (b *bucketStore) invalidateQueue(queue string) {
 	if b == nil {
 		return
 	}
-	// Generation participates in the key (Codex P1 on PR #664): we do
+	// Incarnation participates in the key (Codex P1 on PR #664): we do
 	// not know which incarnations have buckets cached, so range the map
 	// and remove any entry whose queue matches. A SetQueueAttributes
-	// invalidation on the same incarnation must drop the same-gen
+	// invalidation on the same incarnation must drop the same-incarnation
 	// bucket so the new throttle config takes effect; a DeleteQueue /
 	// CreateQueue cycle would also drop any pre-existing incarnation's
 	// bucket here, although those entries also fall out via idle
@@ -585,8 +585,7 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 		// unthrottled — a silent rate-limit bypass under storage
 		// instability. 500 here matches what the OCC layer would
 		// also surface for a meta read failure.
-		writeSQSError(w, http.StatusInternalServerError, sqsErrInternalFailure,
-			"throttle config read failed: "+err.Error())
+		writeSQSErrorFromErr(w, err)
 		return false
 	}
 	return s.chargeQueueWithThrottle(w, queueName, action, count, throttle, incarnation)
@@ -616,13 +615,13 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 	return false
 }
 
-// queueThrottleConfig loads the Throttle config and Generation off a
-// queue's meta record. Generation participates in the bucket key, so
+// queueThrottleConfig loads the Throttle config and Incarnation off a
+// queue's meta record. Incarnation participates in the bucket key, so
 // it must travel with the throttle snapshot to avoid a stale-meta
 // read that mints a fresh bucket under the wrong incarnation.
 //
 // Returns:
-//   - (cfg, gen, nil) on a successful read of an existing queue.
+//   - (cfg, incarnation, nil) on a successful read of an existing queue.
 //   - (nil, 0, nil) when the queue does not exist — the caller's
 //     handler will surface QueueDoesNotExist a few lines later, and a
 //     nil throttle config short-circuits the charge to "allowed".
