@@ -486,9 +486,7 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 	// until PR 5 lifts the gate atomically with the data plane.
 	"PartitionCount": func(m *sqsQueueMeta, v string) error {
 		// Parse at uint64 width and bound-check explicitly so the
-		// uint32 narrowing is gosec-clean without a //nolint comment
-		// (CLAUDE.md asks us to refactor rather than suppress; Claude
-		// medium on PR #664 round 12 flagged the suppression).
+		// uint32 narrowing below is gosec-clean.
 		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
 		if err != nil {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,

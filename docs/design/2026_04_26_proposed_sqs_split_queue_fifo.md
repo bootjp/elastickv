@@ -352,9 +352,15 @@ This is out of scope here.
    - Assert it returns in **≤ 3 s** (2 s budget + reasonable overhead), not in 4 × 2 = 8 s. A naive implementation that drops the `remainingWait` threading and passes the original `WaitTimeSeconds` to every sub-call will time out at 8 s and the test will fail.
    - Companion variant: send no messages, call `ReceiveMessage(WaitTimeSeconds = 0)` — the loop must still iterate every partition with a non-blocking point-read (per §4.2 step 4a) and return promptly with empty.
 
-6. **Jepsen** (`jepsen/sqs/htfifo/`): a new workload that stresses cross-partition delivery — many groups, many consumers, network partition mid-burst — and verifies (a) within-group ordering and (b) no message loss.
+6. **`X-Elastickv-Receive-Partition` ingress strip** (`adapter/sqs_partitioned_internal_header_test.go`): pins the §4.2 security invariant that the partition hop hint is internal-only. A direct client request must not be able to bypass the fan-out.
+   - Create a partitioned queue with `PartitionCount = 4`. Send 4 messages whose `MessageGroupId` values hash to 4 different partitions (one per partition).
+   - Call `ReceiveMessage(MaxNumberOfMessages = 4)` from a direct client with `X-Elastickv-Receive-Partition: 0` set in the request headers (i.e. simulating a malicious client trying to skip the fan-out).
+   - Assert the response carries messages from **all four partitions**, identical to a call without the header. A regression that trusts the client-supplied header would return at most one message (only the partition-0 entry) and a malicious client could observe false-empty results for the other three groups.
+   - Companion variant: same request without the header — the response must be byte-identical to the variant above (same message set), so the strip path cannot accidentally introduce a divergence.
 
-7. **Metrics / observability**: new `sqs_partition_messages_total{queue, partition, action}` counter so dashboards can spot hot partitions.
+7. **Jepsen** (`jepsen/sqs/htfifo/`): a new workload that stresses cross-partition delivery — many groups, many consumers, network partition mid-burst — and verifies (a) within-group ordering and (b) no message loss.
+
+8. **Metrics / observability**: new `sqs_partition_messages_total{queue, partition, action}` counter so dashboards can spot hot partitions.
 
 ---
 
