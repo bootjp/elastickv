@@ -1,15 +1,12 @@
 ---
 status: proposed
-phase: keyviz / follow-up
+phase: 2-C+
 parent_design: docs/admin_ui_key_visualizer_design.md
+author: bootjp
 date: 2026-04-28
 ---
 
 # KeyViz adapter / namespace labels
-
-Status: Proposed
-Author: bootjp
-Date: 2026-04-28
 
 ## 1. Background
 
@@ -106,10 +103,20 @@ Empty `label` → existing behaviour, single row per route. Adapters
 set their own constant string (`"dynamo"`, `"redis"`, …) at the
 dispatch site they already own.
 
-Cost on hot path: one extra map lookup per Observe — slot is now
-keyed by `(routeID, label)` instead of just `routeID`. The map
-key is a struct of `{uint64, string}`; the `label` is a small
-interned constant (`"dynamo"`), so allocation should be zero.
+Cost on hot path: still one `slots` map lookup per `Observe` on
+the hit path (the existing code already does a single
+`tbl.slots[routeID]` lookup, with a fallback into
+`virtualForRoute` only on miss). What changes is the **key
+shape**: `(routeID, label)` instead of just `routeID`, so the
+map key is a `{uint64, Label}` struct — slightly wider hash and
+equality work per lookup. `label` is a small interned constant
+(`"dynamo"`), so the lookup itself allocates nothing. The miss
+rate is unchanged because PR-C+D+E pre-creates a slot for every
+member of `AllLabels` at `RegisterRoute` time, so labeled
+`Observe` calls hit the same way today's unlabeled calls do.
+(Copilot round-15 caught the earlier "one extra map lookup"
+phrasing — the lookup count is unchanged; only the key shape
+widens.)
 
 Storage: each (route, label) gets its own `routeSlot`. Total
 slot memory is `MaxTrackedRoutes × (len(AllLabels)+1)` — bounded
