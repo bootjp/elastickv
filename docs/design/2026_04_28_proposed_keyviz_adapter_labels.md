@@ -490,13 +490,27 @@ The fan-out aggregator's per-cell merge key gains the label:
   same-route different-label rows correctly.
 
 Reads still sum, writes still max-with-conflict; nothing about
-the merge rules changes other than the wire shape of `bucketID`.
-The aggregator's merge logic does not need to change at all once
-`bucketID` is composite; that's why PR-D and PR-E are described
-as **a single PR-D+E** in §7 rather than two separate PRs. (An
-earlier draft of this section claimed they were "shippable in
-either order" — that contradicted §7's "ship together"
-requirement; resolved in favour of §7. Codex round-6.)
+the merge **rules** changes other than the wire shape of
+`bucketID`. The merge **key** logic is unchanged: composite
+`bucketID` already separates same-route different-label rows
+correctly, so the aggregator's bucketing/grouping path needs no
+edits.
+
+The merge **value** path, however, still needs one explicit
+field copy: `mergeRowInto` (`internal/admin/keyviz_fanout.go:509`)
+must add `dst.Label = row.Label` so the label propagates from the
+per-node `KeyVizRow` into the merged output. Without that copy,
+labels work on single-node responses but are silently dropped
+(`Label = ""`) after fan-out merge — the feature would be invisible
+in clustered deployments. This is item (d) ("second-level Label
+copy") in §7 PR-C+D+E. PR-D and PR-E are still bundled as a single
+PR-D+E because the wire-format and pivot-key changes are
+inseparable; the `mergeRowInto` value copy is part of the same
+bundle. (An earlier draft claimed PR-D and PR-E were "shippable in
+either order" — contradicted §7's "ship together" requirement;
+resolved in favour of §7. Codex round-6. Codex round-13 caught
+the related "merge logic needs no changes" wording, which had
+implied no `mergeRowInto` edit at all.)
 
 ### 6.5 Virtual buckets and labels
 
