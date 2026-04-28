@@ -297,7 +297,7 @@ type sqsChangeVisibilityInput struct {
 // prepareSendMessage decodes the SendMessage payload and resolves
 // the queue name. Throttle charging happens after the meta load in
 // validateSend so we don't pay an extra meta read just to discover
-// throttling is off (Gemini high on PR #679).
+// throttling is off.
 func (s *SQSServer) prepareSendMessage(w http.ResponseWriter, r *http.Request) (sqsSendMessageInput, string, bool) {
 	var in sqsSendMessageInput
 	if err := decodeSQSJSONInput(r, &in); err != nil {
@@ -565,9 +565,9 @@ func (s *SQSServer) receiveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Throttle check uses the loaded meta's throttle config so we
-	// don't pay an extra meta read just to discover throttling is off
-	// (Gemini high on PR #679). Sits AFTER the QueueDoesNotExist
-	// branch — a missing queue should not consume a Recv token.
+	// don't pay an extra meta read just to discover throttling is
+	// off. Sits AFTER the QueueDoesNotExist branch — a missing queue
+	// should not consume a Recv token.
 	if !s.chargeQueueWithThrottle(w, queueName, bucketActionReceive, 1, meta.Throttle, meta.Incarnation) {
 		return
 	}

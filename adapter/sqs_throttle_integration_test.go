@@ -309,7 +309,7 @@ func mustCreateQueue(t *testing.T, node Node, name string) string {
 }
 
 // TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket pins
-// the Codex P1 fix on PR #664 round 9. Earlier code invalidated the
+// the no-op gate. Earlier code invalidated the
 // throttle bucket whenever any Throttle* attribute appeared in a
 // SetQueueAttributes request — including same-value writes. A caller
 // could therefore force the bucket back to full capacity by

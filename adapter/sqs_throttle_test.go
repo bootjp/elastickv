@@ -144,8 +144,7 @@ func TestBucketStore_RetryAfterUsesRequestedCount(t *testing.T) {
 
 // TestBucketStore_RetryAfterFloorWithSlowRefill pins the §3.4 rule
 // for sub-1-RPS rates: SendRefillPerSecond=0.1 with 0 tokens needs
-// 10s for the next single token, not 1s. This was the second of two
-// Claude reviews caught on PR #664.
+// 10s for the next single token, not 1s.
 func TestBucketStore_RetryAfterFloorWithSlowRefill(t *testing.T) {
 	t.Parallel()
 	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 0.1}
@@ -219,10 +218,10 @@ func TestBucketStore_DefaultBucketCovers(t *testing.T) {
 	}
 }
 
-// TestBucketStore_ReconcilesBucketOnConfigChange pins the Codex P1
-// fix on PR #679: a cached bucket whose capacity/refillRate no
-// longer match the queue's current Throttle config gets rebuilt on
-// the next charge() call. Without this, a node that loses leadership
+// TestBucketStore_ReconcilesBucketOnConfigChange pins the
+// reconciliation contract: a cached bucket whose capacity/refillRate
+// no longer match the queue's current Throttle config gets rebuilt
+// on the next charge() call. Without this, a node that loses leadership
 // during a SetQueueAttributes commit and regains it later would keep
 // enforcing the prior leader-term's limits — the SetQueueAttributes
 // invalidation only runs on the leader that processed the commit,
@@ -251,7 +250,7 @@ func TestBucketStore_ReconcilesBucketOnConfigChange(t *testing.T) {
 }
 
 // TestBucketStore_ConcurrentReconciliationRespectsNewCapacity pins
-// the CompareAndDelete fix on PR #679 round 4: two concurrent
+// the CompareAndDelete fix: two concurrent
 // goroutines hitting a stale bucket must not race each other into
 // double-replacing the map entry. Without CompareAndDelete the
 // second goroutine's unconditional Delete would evict the first
@@ -308,8 +307,8 @@ func TestBucketStore_ConcurrentReconciliationRespectsNewCapacity(t *testing.T) {
 		"exactly cfgNew.SendCapacity successes; a Delete-after-replace race would let some past the cap")
 }
 
-// TestBucketStore_SweepRaceDoesNotInflateBudget pins the Codex P2
-// fix on PR #679 rounds 5 and 6. The earlier code path was:
+// TestBucketStore_SweepRaceDoesNotInflateBudget pins the sweep
+// race fix. The earlier code path was:
 //
 //	sweep computes idle under mu, releases mu, then Deletes.
 //	A concurrent charge() that loaded the same bucket pre-Delete
@@ -317,11 +316,11 @@ func TestBucketStore_ConcurrentReconciliationRespectsNewCapacity(t *testing.T) {
 //	would miss the map and create a fresh full-capacity bucket —
 //	a one-time burst of up to 2× capacity per evict cycle.
 //
-// Round 5 closed half the window by holding mu across the Delete.
-// Round 6 closes the rest by setting evicted=true under mu so the
-// goroutines that loaded the bucket *before* sweep removed it from
-// the map see the flag on their mu acquisition and retry against
-// the live entry instead of charging the orphan.
+// Two complementary guards close it: holding mu across the Delete
+// closes half the window, and setting evicted=true under mu closes
+// the rest — goroutines that loaded the bucket *before* sweep
+// removed it from the map see the flag on their mu acquisition and
+// retry against the live entry instead of charging the orphan.
 //
 // The test is a -race stress test: race sweep against many chargers
 // hammering the same bucket. The integrity assertion is on the total
@@ -426,7 +425,7 @@ func TestBucketStore_OrphanedBucketRetriesToLiveEntry(t *testing.T) {
 }
 
 // TestBucketStore_LoadOrInitReconciliationMarksOrphanEvictedUnderMu
-// pins the Codex P1 fix on PR #664 round 11. The earlier
+// pins the lock-then-delete-then-flag ordering. The earlier
 // loadOrInit reconciliation path used:
 //
 //	bucket.mu.Lock(); matches := ...; bucket.mu.Unlock()
@@ -481,8 +480,8 @@ func TestBucketStore_LoadOrInitReconciliationMarksOrphanEvictedUnderMu(t *testin
 	original.mu.Unlock()
 }
 
-// TestBucketStore_InvalidateMarksOrphanEvicted pins the round-6 fix
-// to invalidateQueue: dropped buckets must flip evicted=true under mu
+// TestBucketStore_InvalidateMarksOrphanEvicted pins the
+// invalidateQueue contract: dropped buckets must flip evicted=true under mu
 // so a sendMessage that loaded meta pre-invalidation and is racing
 // against DeleteQueue / SetQueueAttributes / CreateQueue retries
 // rather than charging the orphan.
@@ -505,8 +504,8 @@ func TestBucketStore_InvalidateMarksOrphanEvicted(t *testing.T) {
 	original.mu.Unlock()
 }
 
-// TestBucketStore_InvalidateUnderConcurrencyIsRaceFree pins the Codex
-// P2 fix on PR #679 round 6.1. The earlier invalidateQueue used
+// TestBucketStore_InvalidateUnderConcurrencyIsRaceFree pins the
+// invalidateQueue lock ordering. The earlier invalidateQueue used
 // LoadAndDelete-then-lock, which let a concurrent charger that loaded
 // the pointer pre-LoadAndDelete acquire bucket.mu first and observe
 // evicted=false on a bucket that had already been removed from the
@@ -552,8 +551,8 @@ func TestBucketStore_InvalidateUnderConcurrencyIsRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
-// TestComputeRetryAfter_CapsAtMaximum pins the Gemini medium fix on
-// PR #679: a tiny refillRate (e.g. 1e-9) plus a large requested
+// TestComputeRetryAfter_CapsAtMaximum pins the overflow guard:
+// a tiny refillRate (e.g. 1e-9) plus a large requested
 // count would otherwise compute a multi-day Retry-After and
 // time.Duration arithmetic could overflow. Capped at
 // throttleRetryAfterCap so the client always sees a sane value.
@@ -566,7 +565,7 @@ func TestComputeRetryAfter_CapsAtMaximum(t *testing.T) {
 
 // TestThrottleAttributesPresent covers the request-gate helper used
 // by setQueueAttributes to skip cache invalidation on unrelated
-// updates (Codex P1 on PR #679).
+// updates.
 func TestThrottleAttributesPresent(t *testing.T) {
 	t.Parallel()
 	require.False(t, throttleAttributesPresent(map[string]string{}))
@@ -576,9 +575,9 @@ func TestThrottleAttributesPresent(t *testing.T) {
 	require.True(t, throttleAttributesPresent(map[string]string{"ThrottleDefaultCapacity": "5"}))
 }
 
-// TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations pins
-// the Codex P1 fix on PR #664: bucketKey includes incarnation so a
-// DeleteQueue+CreateQueue cycle (or a leadership move to a node holding
+// TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations
+// pins the incarnation-keyed contract: bucketKey includes incarnation
+// so a DeleteQueue+CreateQueue cycle (or a leadership move to a node holding
 // a stale per-process cache) lands the new incarnation under a different
 // map entry and starts from a fresh full bucket. Without incarnation in
 // the key, the recreated queue would inherit the drained token state
@@ -642,9 +641,9 @@ func TestBucketStore_InvalidateQueueClearsAllIncarnations(t *testing.T) {
 	require.True(t, hasEvents, "unrelated queue must not be evicted")
 }
 
-// TestBucketStore_PurgeQueueDoesNotResetBucket pins the Codex P2 fix
-// on PR #664 round 9: PurgeQueue bumps sqsQueueMeta.Generation but
-// preserves Incarnation, and the throttle bucket keys by Incarnation.
+// TestBucketStore_PurgeQueueDoesNotResetBucket pins the
+// PurgeQueue-bypass guard: PurgeQueue bumps sqsQueueMeta.Generation
+// but preserves Incarnation, and the throttle bucket keys by Incarnation.
 // Earlier code keyed by Generation, which let a caller bypass the
 // rate limit by repeatedly purging — every purge re-keyed the bucket
 // and the next charge minted a fresh full-capacity replacement. The
@@ -805,8 +804,8 @@ func TestValidateThrottleConfig_CapacityGEMaxBatchCharge(t *testing.T) {
 }
 
 // TestValidateThrottleConfig_DefaultBucketBatchFloor pins the
-// Codex P1 fix on PR #679 round 5: Default* gets the same batch-
-// capacity ≥ 10 floor as Send/Recv because resolveActionConfig
+// Default* batch floor: Default* gets the same batch-capacity ≥ 10
+// floor as Send/Recv because resolveActionConfig
 // falls Send/Recv traffic through to Default when the dedicated
 // pair is unset. Without the floor a Default-only config of
 // {capacity=5, refill=1} would accept SendMessageBatch entries=10

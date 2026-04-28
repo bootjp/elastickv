@@ -80,16 +80,16 @@ func partitionFor(meta *sqsQueueMeta, messageGroupID string) uint32 {
 		return 0
 	}
 	// Inlined FNV-1a 32-bit over the string to avoid the []byte
-	// allocation hash/fnv.New32a + h.Write would force (Gemini medium
-	// on PR #681). MessageGroupId is capped at 128 chars by validation,
+	// allocation hash/fnv.New32a + h.Write would force.
+	// MessageGroupId is capped at 128 chars by validation,
 	// so this loop bounds at 128 iterations of integer arithmetic per
 	// SendMessage — measurably faster than the hash.Hash interface
 	// path on the routing hot path. The 32-bit variant keeps the
 	// computation in uint32 throughout, sidestepping the uint64 →
-	// uint32 narrowing that the 64-bit variant would have required for
-	// the partition mask AND (CodeRabbit nit on PR #664 round 7 — the
-	// previous implementation needed `//nolint:gosec G115` to silence
-	// a false positive on the safe-by-construction narrow). PartitionCount
+	// uint32 narrowing that the 64-bit variant would have required
+	// for the partition mask AND (which gosec G115 would otherwise
+	// flag and force a //nolint suppression on a safe-by-construction
+	// narrow). PartitionCount
 	// ≤ htfifoMaxPartitions = 32 so log2(PartitionCount) ≤ 5; only the
 	// low 5 bits of the hash ever survive the mask, and 32-bit FNV-1a
 	// is more than enough entropy to spread MessageGroupId values
@@ -146,15 +146,14 @@ func validatePartitionConfig(meta *sqsQueueMeta) error {
 		}
 	}
 	if meta.PartitionCount > 1 && meta.DeduplicationScope == htfifoDedupeScopeQueue {
-		// sqsErrValidation is "InvalidParameterValue" (Gemini medium
-		// on PR #681 — uses the existing constant rather than a
-		// duplicate-value alias).
+		// sqsErrValidation is "InvalidParameterValue"; uses the
+		// existing constant rather than a duplicate-value alias.
 		return newSQSAPIError(http.StatusBadRequest, sqsErrValidation,
 			"queue-scoped deduplication is incompatible with multi-partition FIFO because the dedup key cannot be globally unique across partitions without a cross-partition OCC transaction")
 	}
 	// FifoThroughputLimit=perMessageGroupId requires an explicit
-	// PartitionCount > 1 (CodeRabbit Major on PR #664 round 11). §7.2
-	// of the design used to suggest "infer a sensible default, e.g.
+	// PartitionCount > 1. §7.2 of the design used to suggest
+	// "infer a sensible default, e.g.
 	// 8" for HT-FIFO callers that omit PartitionCount, but a hidden
 	// default makes CreateQueue idempotency depend on deployment
 	// state — the same wire payload could resolve to a 4-partition
@@ -173,8 +172,8 @@ func validatePartitionConfig(meta *sqsQueueMeta) error {
 // validatePartitionShape enforces the structural rules on
 // PartitionCount: power-of-two and within the per-queue cap. Split
 // out of validatePartitionConfig to keep that function under the
-// cyclop ceiling once the round-12 perMessageGroupId-requires-explicit
-// rule landed.
+// cyclop ceiling once the perMessageGroupId-requires-explicit rule
+// landed.
 func validatePartitionShape(meta *sqsQueueMeta) error {
 	if meta.PartitionCount == 0 {
 		return nil
@@ -194,8 +193,8 @@ func validatePartitionShape(meta *sqsQueueMeta) error {
 // the HT-FIFO attributes. PartitionCount > 1 only makes sense on FIFO
 // queues (HT-FIFO is by definition a FIFO feature). Without this guard
 // a Standard queue with PartitionCount=2 would slip past the validator
-// once PR 5 lifts the dormancy gate (Claude review on PR #681 round 2
-// caught this). PartitionCount=0 and 1 are accepted because both mean
+// once PR 5 lifts the dormancy gate. PartitionCount=0 and 1 are
+// accepted because both mean
 // "single-partition layout" which is valid on Standard queues.
 func validateStandardQueueRejectsHTFIFO(meta *sqsQueueMeta) error {
 	if meta.PartitionCount > 1 {
@@ -248,7 +247,7 @@ func validatePartitionDormancyGate(meta *sqsQueueMeta) error {
 // queue stored with 0, or 0 on a queue stored with 1) is treated as
 // the no-op it semantically is — strict equality would reject with
 // "PartitionCount is immutable" even though the partition layout
-// hasn't changed (Claude Low on PR #679 round 6.2).
+// hasn't changed.
 func validatePartitionImmutability(current, requested *sqsQueueMeta) error {
 	if current == nil || requested == nil {
 		return nil

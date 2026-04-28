@@ -86,7 +86,7 @@ type sqsQueueMeta struct {
 	// This is the throttle-bucket-key field — keying by Incarnation
 	// instead of Generation prevents PurgeQueue from resetting the
 	// in-memory token bucket while still isolating delete+recreate
-	// incarnations from each other (Codex P2 on PR #664 round 9).
+	// incarnations from each other.
 	Incarnation               uint64            `json:"incarnation,omitempty"`
 	CreatedAtHLC              uint64            `json:"created_at_hlc,omitempty"`
 	IsFIFO                    bool              `json:"is_fifo,omitempty"`
@@ -674,9 +674,7 @@ func validateThrottleConfig(meta *sqsQueueMeta) error {
 	// `ThrottleDefaultCapacity=5, ThrottleDefaultRefillPerSecond=1`
 	// would be accepted but make every full SendMessageBatch /
 	// DeleteMessageBatch (charge=10) permanently unserviceable —
-	// the bucket can never accumulate the 10 tokens. Codex P1 on
-	// PR #679 round 5 caught the gap; the design doc note in §3.2
-	// claiming Default* is exempt was wrong about the fall-through.
+	// the bucket can never accumulate the 10 tokens.
 	if err := validateThrottlePair("ThrottleDefault", t.DefaultCapacity, t.DefaultRefillPerSecond, true); err != nil {
 		return err
 	}
@@ -805,9 +803,8 @@ func throttleConfigEqual(a, b *sqsQueueThrottle) bool {
 // without PartitionCount is stored as 0 while a queue created with
 // explicit PartitionCount=1 is stored as 1, so strict equality would
 // have CreateQueue reject the second call as "different attributes"
-// even though the queues are semantically identical (Codex P2 on
-// PR #679 round 6.1). normalisePartitionCount maps both to 1 for the
-// idempotency check.
+// even though the queues are semantically identical.
+// normalisePartitionCount maps both to 1 for the idempotency check.
 func htfifoAttributesEqual(a, b *sqsQueueMeta) bool {
 	return normalisePartitionCount(a.PartitionCount) == normalisePartitionCount(b.PartitionCount) &&
 		a.FifoThroughputLimit == b.FifoThroughputLimit &&
@@ -1006,8 +1003,8 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
 		return false, errors.WithStack(err)
 	}
-	// Drop any throttle bucket that survived a delete-then-create race
-	// (Codex P2 on PR #679 round 5). DeleteQueue invalidates after its
+	// Drop any throttle bucket that survived a delete-then-create
+	// race. DeleteQueue invalidates after its
 	// commit, but a sendMessage holding pre-delete meta can recreate
 	// a bucket between that invalidate and this CreateQueue commit;
 	// invalidating again here on a genuine create (not the idempotent
@@ -1447,12 +1444,11 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	// reset the bucket on every unrelated SetQueueAttributes (e.g.
 	// VisibilityTimeout-only update), giving any caller a way to
 	// silently restore a noisy tenant's burst capacity by writing a
-	// no-op SetQueueAttributes (Codex P1 on PR #679, refined on PR
-	// #664 round 9). Gating on key-presence alone is not enough either
-	// — a same-value Throttle* write would still pass the presence
-	// check and invalidate, so a caller could repeat their own current
-	// throttle config to bump the bucket back to full capacity (Codex
-	// P1 on PR #664 round 9). trySetQueueAttributesOnce therefore
+	// no-op SetQueueAttributes. Gating on key-presence alone is not
+	// enough either — a same-value Throttle* write would still pass
+	// the presence check and invalidate, so a caller could repeat
+	// their own current throttle config to bump the bucket back to
+	// full capacity. trySetQueueAttributesOnce therefore
 	// compares the old and new throttle configs under the same Raft
 	// read snapshot used for the commit and reports whether the values
 	// actually moved. The bucket reconciliation in loadOrInit also
@@ -1492,8 +1488,7 @@ func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName s
 // sqsAPIError the caller forwards to writeSQSErrorFromErr.
 //
 // preApply snapshot allocation is gated on htfifoAttributesPresent
-// so the common "mutable-only update" path stays alloc-free per the
-// Gemini medium feedback on PR #681.
+// so the common "mutable-only update" path stays alloc-free.
 func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) error {
 	var preApply *sqsQueueMeta
 	if htfifoAttributesPresent(attrs) {
@@ -1528,7 +1523,7 @@ func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) 
 // the post-apply meta's Throttle config differs from the pre-apply
 // snapshot — the caller uses it to gate the cache invalidation so
 // that a no-op same-value SetQueueAttributes does not reset the
-// bucket to full capacity (Codex P1 on PR #664 round 9).
+// bucket to full capacity.
 func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, bool, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)

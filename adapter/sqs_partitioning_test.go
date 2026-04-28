@@ -164,10 +164,10 @@ func TestValidatePartitionConfig_RejectsAboveMax(t *testing.T) {
 // reject with InvalidAttributeValue. Setting them silently on a
 // Standard queue would advertise unsupported behaviour.
 //
-// PartitionCount > 1 is also FIFO-only (Claude review on PR #681
-// round 2 caught the gap) — without the guard a Standard queue
-// with PartitionCount=2 would slip past the validator after PR 5
-// lifts the dormancy gate. PartitionCount 0/1 are still accepted
+// PartitionCount > 1 is also FIFO-only — without the guard a
+// Standard queue with PartitionCount=2 would slip past the validator
+// after PR 5 lifts the dormancy gate. PartitionCount 0/1 are still
+// accepted
 // on Standard queues because both mean "single-partition layout".
 func TestValidatePartitionConfig_StandardQueueRejectsHTFIFOAttrs(t *testing.T) {
 	t.Parallel()
@@ -210,7 +210,7 @@ func TestValidatePartitionConfig_RejectsQueueScopedDedupOnPartitioned(t *testing
 }
 
 // TestValidatePartitionConfig_PerMessageGroupIDRequiresExplicitPartitionCount
-// pins the CodeRabbit Major fix on PR #664 round 11: an HT-FIFO
+// pins the no-implicit-default rule: an HT-FIFO
 // CreateQueue request that sets FifoThroughputLimit=perMessageGroupId
 // without an explicit PartitionCount > 1 must be rejected. Earlier
 // drafts of §7.2 proposed inferring a server-side default (e.g. 8),
@@ -310,7 +310,7 @@ func TestValidatePartitionImmutability_RejectsAnyChange(t *testing.T) {
 }
 
 // TestValidatePartitionImmutability_PartitionCountZeroAndOneEquivalent
-// pins the Claude Low fix on PR #679 round 6.2 / 6.3. The on-disk
+// pins the 0/1 normalisation: the on-disk
 // PartitionCount=0 ("unset") is canonical-equivalent to an explicit
 // PartitionCount=1 ("single partition"), so a SetQueueAttributes
 // that reaffirms the default ought to be a no-op rather than a hard
@@ -362,8 +362,8 @@ func TestHTFIFOAttributesPresent(t *testing.T) {
 }
 
 // TestHTFIFOAttributesEqual_PartitionCountZeroAndOneEquivalent pins
-// the Codex P2 fix on PR #679 round 6.1: validatePartitionConfig
-// documents PartitionCount=0 (unset) and =1 (explicit single
+// the idempotency normalisation: validatePartitionConfig documents
+// PartitionCount=0 (unset) and =1 (explicit single
 // partition) as semantically identical legacy/single-partition
 // routing, so CreateQueue idempotency must treat them as equal —
 // otherwise a queue created without PartitionCount (stored as 0) is

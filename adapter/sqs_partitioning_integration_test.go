@@ -155,10 +155,10 @@ func TestSQSServer_HTFIFO_ImmutabilitySetQueueAttributesRejects(t *testing.T) {
 
 	url := mustCreateFIFOWithThroughputLimit(t, node, "htfifo-immutable.fifo", htfifoThroughputPerQueue)
 
-	// Try to flip FifoThroughputLimit. Must reject (immutability +
-	// the round-12 rule that perMessageGroupId requires
-	// PartitionCount > 1 both fire on this attempt; either one
-	// rejecting is the correct outcome from the wire).
+	// Try to flip FifoThroughputLimit. Must reject — both the
+	// immutability rule and the rule that perMessageGroupId requires
+	// PartitionCount > 1 fire on this attempt; either one rejecting
+	// is the correct outcome from the wire.
 	status, out := callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
 		"QueueUrl": url,
 		"Attributes": map[string]string{

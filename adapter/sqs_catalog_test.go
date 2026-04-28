@@ -143,7 +143,7 @@ func TestSQSServer_CatalogCreateIsIdempotent(t *testing.T) {
 	// notice the diff and the call must reject as QueueNameExists.
 	// Without this case a bug in throttleConfigEqual (e.g. always
 	// returning true) would slip past the existing VisibilityTimeout-
-	// only test (Claude review on PR #679 round 2).
+	// only test.
 	withThrottle := map[string]any{
 		"QueueName": "idempotent",
 		"Attributes": map[string]string{

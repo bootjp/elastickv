@@ -32,7 +32,7 @@ const (
 // invalidation gate in setQueueAttributes so an unrelated update
 // (e.g. VisibilityTimeout only) does not pay the cache invalidation
 // cost or, worse, give the caller a way to silently reset bucket
-// state via a no-op SetQueueAttributes (Codex P1 on PR #679).
+// state via a no-op SetQueueAttributes.
 var throttleAttributeNames = []string{
 	"ThrottleSendCapacity",
 	"ThrottleSendRefillPerSecond",
@@ -57,8 +57,8 @@ func throttleAttributesPresent(attrs map[string]string) bool {
 
 // throttleHardCeilingPerSecond bounds any user-supplied capacity or
 // refill rate. A typo like SendCapacity=1e9 silently meaning "no limit"
-// is more dangerous than an explicit InvalidAttributeValue (Codex P1 on
-// PR #664: a wide-open queue masks itself as "throttled").
+// is more dangerous than an explicit InvalidAttributeValue: a
+// wide-open queue masks itself as "throttled".
 const throttleHardCeilingPerSecond = 100_000.0
 
 // throttleMinBatchCapacity is the smallest acceptable per-action
@@ -94,7 +94,7 @@ const throttleEvictSweepEvery = time.Minute
 // so a (queue, action, incarnation)-keyed bucket would be re-keyed
 // on each purge and the next request would mint a fresh full bucket
 // — letting a caller exceed the configured rate by repeatedly
-// purging (Codex P2 on PR #664 round 9).
+// purging.
 type bucketKey struct {
 	queue       string
 	action      string
@@ -111,7 +111,7 @@ type bucketKey struct {
 // the live entry. Without that retry, sweep racing N concurrent chargers
 // could let them drain up to one full capacity from the orphan while
 // later requests get a fresh full-capacity bucket — a one-time burst
-// of up to 2× capacity per evict cycle (Codex P2 on PR #679 round 5).
+// of up to 2× capacity per evict cycle.
 // Never held across the bucketStore's sync.Map.
 type tokenBucket struct {
 	mu         sync.Mutex
@@ -221,8 +221,8 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarn
 	// bucket without time advancing past evictedAfter). Fail closed
 	// rather than allow the request: a fail-open here would turn the
 	// invalidate/reconcile race into a throttle bypass on the exact
-	// path that is supposed to enforce limits (CodeRabbit Major on
-	// PR #664 round 11). Returning a Throttling response with a
+	// path that is supposed to enforce limits. Returning a Throttling
+	// response with a
 	// non-zero retryAfter gives the client a normal back-off cue
 	// rather than a hard 500 — the next attempt will almost certainly
 	// land on the now-stable bucket.
@@ -279,7 +279,7 @@ func chargeBucket(bucket *tokenBucket, now time.Time, count int) (chargeOutcome,
 // (capacity, refillRate) from the same meta snapshot — the bucket
 // they would build is behaviourally interchangeable.
 //
-// Reconciliation against stale config (Codex P1 on PR #679): if a
+// Reconciliation against stale config: if a
 // cached bucket's capacity/refillRate differ from the cfg's current
 // values, the bucket is replaced with a fresh one built from the
 // current config. Without this check, a node that lost leadership
@@ -292,7 +292,7 @@ func chargeBucket(bucket *tokenBucket, now time.Time, count int) (chargeOutcome,
 // future admin path that mutates throttle config without touching
 // SetQueueAttributes).
 //
-// incarnation participates in the key (Codex P1 on PR #664): a
+// incarnation participates in the key: a
 // DeleteQueue+CreateQueue cycle bumps Generation, so the new
 // incarnation lands in a different map entry and starts from a
 // fresh full bucket regardless of what stale per-process cache
@@ -309,7 +309,7 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 		// config (full capacity, matching the failover semantics).
 		//
 		// Hold mu across the matches check, the CompareAndDelete, and
-		// the evicted=true flag (Codex P1 on PR #664 round 11). The
+		// the evicted=true flag. The
 		// earlier ordering — unlock-after-matches, CompareAndDelete,
 		// re-lock-and-flag — left a window between the
 		// CompareAndDelete success and the re-lock during which a
@@ -339,8 +339,6 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 		// map, while later requests get a different fresh bucket at
 		// full capacity. CompareAndDelete makes our Delete a no-op
 		// when the map already holds someone else's fresh bucket.
-		// (Claude P1 on PR #679 round 4 caught the original race;
-		// PR #664 round 11 closed the lock-gap above.)
 		if b.buckets.CompareAndDelete(key, v) {
 			bucket.evicted = true
 		}
@@ -381,12 +379,12 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 // loaded the pointer pre-LoadAndDelete acquire mu first and charge
 // while evicted is still false, then later requests would create a
 // fresh full-capacity bucket — a 2x burst on every invalidation
-// event (Codex P2 on PR #679 round 6).
+// event.
 func (b *bucketStore) invalidateQueue(queue string) {
 	if b == nil {
 		return
 	}
-	// Incarnation participates in the key (Codex P1 on PR #664): we do
+	// Incarnation participates in the key: we do
 	// not know which incarnations have buckets cached, so range the map
 	// and remove any entry whose queue matches. A SetQueueAttributes
 	// invalidation on the same incarnation must drop the same-incarnation
@@ -411,10 +409,10 @@ func (b *bucketStore) invalidateQueue(queue string) {
 }
 
 // runSweepLoop runs the idle-evict sweep on a background ticker so
-// the request hot path never pays the O(N) sync.Map.Range cost
-// (Gemini high on PR #679: a many-queue cluster would see latency
-// spikes on whichever request was unlucky enough to trigger the
-// per-minute on-hot-path sweep). Returns when ctx is done — the
+// the request hot path never pays the O(N) sync.Map.Range cost: a
+// many-queue cluster would otherwise see latency spikes on whichever
+// request was unlucky enough to trigger the per-minute on-hot-path
+// sweep. Returns when ctx is done — the
 // SQSServer wires this to s.reaperCtx so a Stop() call cleans the
 // goroutine up alongside the existing reaper.
 func (b *bucketStore) runSweepLoop(ctx context.Context) {
@@ -440,7 +438,7 @@ func (b *bucketStore) runSweepLoop(ctx context.Context) {
 // iterates every entry under the per-bucket lock so it can re-check
 // idle and the map entry atomically.
 //
-// Eviction race (Codex P2 on PR #679 round 5 and round 6): three
+// Eviction race: three
 // guards work together to keep idle eviction from inflating the burst
 // budget for a queue:
 //  1. Hold bucket.mu across the Delete so the idle observation
@@ -500,8 +498,8 @@ func resolveActionConfig(cfg *sqsQueueThrottle, action string) (string, float64,
 	return action, 0, 0
 }
 
-// throttleRetryAfterCap bounds the Retry-After value the client sees
-// (Gemini medium on PR #679). Without a cap, a tiny refillRate plus
+// throttleRetryAfterCap bounds the Retry-After value the client sees.
+// Without a cap, a tiny refillRate plus
 // a large requested count would compute a multi-day wait — and
 // time.Duration arithmetic can overflow at the upper end. One hour
 // matches the bucket store's idle-evict window: by the time the
@@ -569,7 +567,7 @@ func throttleChargeCount(entries int) int {
 //
 // Handlers that DO pre-load the meta before charging — sendMessage
 // and receiveMessage — should use chargeQueueWithThrottle to avoid
-// the redundant load (Gemini high on PR #679). The batch handlers
+// the redundant load. The batch handlers
 // could be refactored similarly but each entry-loop iteration would
 // then need its own lookup, defeating the savings; the single
 // throttle-time meta load there pays for the whole batch.
@@ -589,8 +587,8 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 	}
 	throttle, incarnation, err := s.queueThrottleConfig(r, queueName)
 	if err != nil {
-		// Fail closed on a transient storage error (Codex P2 on PR
-		// #664 round 9). Earlier code converted the error to (nil, 0)
+		// Fail closed on a transient storage error. Earlier code
+		// converted the error to (nil, 0)
 		// which made the throttle check short-circuit to "allowed";
 		// if the same storage hiccup did not also break the OCC
 		// commit a few lines later, the request would be processed
@@ -605,16 +603,15 @@ func (s *SQSServer) chargeQueue(w http.ResponseWriter, r *http.Request, queueNam
 
 // chargeQueueWithThrottle is the variant for handlers that already
 // have the throttle config in hand from their own meta load. Drops
-// the per-request meta load chargeQueue does, addressing the Gemini
-// high finding on PR #679 about redundant storage reads on the hot
-// path. incarnation is sqsQueueMeta.Incarnation: it must come from
-// the same meta snapshot the throttle config was read from so a
-// recreate committed mid-request lands in a fresh bucket on the next
-// call rather than mixing tokens with the prior incarnation (Codex
-// P1 on PR #664). NOTE: meta.Incarnation, NOT meta.Generation —
-// PurgeQueue bumps Generation but preserves Incarnation, so keying
-// the bucket by Generation would let a caller bypass the rate limit
-// by repeatedly purging (Codex P2 on PR #664 round 9).
+// the per-request meta load chargeQueue does, avoiding redundant
+// storage reads on the hot path. incarnation is
+// sqsQueueMeta.Incarnation: it must come from the same meta snapshot
+// the throttle config was read from so a recreate committed
+// mid-request lands in a fresh bucket on the next call rather than
+// mixing tokens with the prior incarnation. NOTE: meta.Incarnation,
+// NOT meta.Generation — PurgeQueue bumps Generation but preserves
+// Incarnation, so keying the bucket by Generation would let a caller
+// bypass the rate limit by repeatedly purging.
 func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, action string, count int, throttle *sqsQueueThrottle, incarnation uint64) bool {
 	if s.throttle == nil {
 		return true
@@ -640,8 +637,7 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 //   - (nil, 0, err) on a storage-layer error. The caller MUST fail
 //     the request closed; converting an error to (nil, 0) silently
 //     would let traffic bypass the throttle check during a transient
-//     storage outage if the OCC commit later succeeded (Codex P2 on
-//     PR #664 round 9).
+//     storage outage if the OCC commit later succeeded.
 //
 // Held as a method on *SQSServer so a test can swap the meta loader
 // via the existing nextTxnReadTS / loadQueueMetaAt seam.
