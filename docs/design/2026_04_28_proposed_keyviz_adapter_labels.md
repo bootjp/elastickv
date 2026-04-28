@@ -95,7 +95,7 @@ one based on hot-path cost vs. plumbing weight.
 Extend the sampler signature:
 
 ```go
-Observe(routeID uint64, op Op, keyLen, valueLen int, label string)
+Observe(routeID uint64, op Op, keyLen, valueLen int, label Label)
 ```
 
 Empty `label` → existing behaviour, single row per route. Adapters
@@ -173,7 +173,7 @@ work.
 
 #### `MaxTrackedRoutes` semantics: count routes, not slots
 
-After the slot-key widens to `slotKey{uint64, string}`, the live
+After the slot-key widens to `slotKey{uint64, Label}`, the live
 table contains `len(AllLabels) + 1` slots per individually-tracked
 route — bare `len(next.slots)` no longer equals "number of
 routes." We pick **Option A (route-counting)**: the coarsening
@@ -234,7 +234,7 @@ threading it through a separate channel:
 type routeSlot struct {
     metaMu  sync.RWMutex
     RouteID uint64
-    Label   string         // new — empty for the legacy unlabeled slot
+    Label   Label          // new — empty for the legacy unlabeled slot, typed via keyviz/labels.go
     GroupID uint64         // Phase 2-C+, see PR-3a
     Start, End []byte
     ...
@@ -345,10 +345,17 @@ Three layers gain a label field. They are kept in sync at PR-D+E
 upstream still on PR-C never sees a wire shape mismatch:
 
 ```diff
- // keyviz/sampler.go — internal type, available from PR-B
+ // keyviz/sampler.go — internal type, available from PR-B.
+ // MatrixRow.Label uses the typed `keyviz.Label` so adapters
+ // referencing it via the `Sampler` interface can't accidentally
+ // hand-write a string literal that drifts from the canonical
+ // constant set. The proto and JSON shapes below use plain `string`
+ // because the wire form is operator-visible and we want to allow
+ // unknown labels through without a schema bump (an old binary
+ // returning a label a new SPA hasn't seen yet still renders).
  type MatrixRow struct {
    RouteID      uint64
-+  Label        string  // empty for legacy unlabeled traffic
++  Label        Label   // typed; see keyviz/labels.go
    Start, End   []byte
    …
  }
@@ -484,7 +491,7 @@ Virtual-bucket rows in the heatmap render as
 | PR | Scope |
 |---|---|
 | **PR-A** | Land this design doc. |
-| **PR-B** | Sampler API extension: extend the `Sampler` interface declaration (`keyviz/sampler.go:74`) AND the `MemSampler.Observe` implementation to `Observe(routeID uint64, op Op, keyLen, valueLen int, label string)` (Claude bot round-8 minor: surfaces immediately as a compile error if any mock implementer is missed, but naming it keeps the scope complete). `routeSlot.Label`, slot-key type widens to `slotKey{uint64, string}`. **`RegisterRoute` only pre-creates the legacy empty-label slot** — labeled-sibling pre-creation lands in PR-C so PR-B is a behavior-neutral refactor (per-route slot count is unchanged at 1). **PR-B creates `keyviz/labels.go`** with the `slotKey` struct, the `LabelDynamo`/`LabelRedis`/etc. **constants** (declared but unused — adapters wire them in PR-C), and a **deliberately-empty `AllLabels []string`**. The constants must exist at compile time so `RemoveRoute`'s `allLabelsWithLegacy()` teardown loop and `RegisterRoute`'s pre-creation loop both compile; with `AllLabels` empty their bodies are no-ops over (Claude bot round-6). `MatrixRow.Label` field present. **L0 label copy** (Claude bot round-8 moderate): update `appendDrainedRow` (`keyviz/sampler.go:828`) to include `Label: slot.Label` in the `MatrixRow` struct literal — `slot.Label` is set once at `RegisterRoute` time and immutable, so read it directly rather than threading through `snapshotMeta`. This is the first link in the propagation chain: `slot.Label` → `MatrixRow.Label` (L0, here) → `KeyVizRow.Label` via `newKeyVizRowFrom` (L1, PR-D+E) → merged `KeyVizRow.Label` via `mergeRowInto` (L2, PR-D+E). Missing L0 silently truncates the chain and leaves `MatrixRow.Label = ""` even after PR-C populates `AllLabels`; L1 and L2 then faithfully copy the empty string and the feature collapses. With PR-B's empty-only slots, `slot.Label` is `""` so the emitted row is `""`-labeled (identical to today's behavior), but the wiring is in place for PR-C. `reclaimRetiredSlot` dedupes on `(RouteID, Label)` (forward-prep; only `Label=""` exists). The `MaxTrackedRoutes` coarsening check (`keyviz/sampler.go:416`) divides by `len(AllLabels)+1` so the cap continues to count **routes**, not slots; with `AllLabels` empty in PR-B the divisor is 1 and behavior is identical to today. Update existing tests **and the coordinator call sites in `kv/sharded_coordinator.go`** (the only non-test caller of `Sampler.Observe`) to pass `label = ""`. |
+| **PR-B** | Sampler API extension: extend the `Sampler` interface declaration (`keyviz/sampler.go:74`) AND the `MemSampler.Observe` implementation to `Observe(routeID uint64, op Op, keyLen, valueLen int, label Label)` (Claude bot round-8 minor: surfaces immediately as a compile error if any mock implementer is missed, but naming it keeps the scope complete). `routeSlot.Label`, slot-key type widens to `slotKey{uint64, Label}`. **`RegisterRoute` only pre-creates the legacy empty-label slot** — labeled-sibling pre-creation lands in PR-C so PR-B is a behavior-neutral refactor (per-route slot count is unchanged at 1). **PR-B creates `keyviz/labels.go`** with the `slotKey` struct, the `type Label string` definition, the `LabelLegacy`/`LabelDynamo`/`LabelRedis`/etc. **typed constants** (declared but unused outside the sampler — adapters wire them in PR-C), and a **deliberately-empty `AllLabels []Label`**. The constants must exist at compile time so `RemoveRoute`'s `allLabelsWithLegacy()` teardown loop and `RegisterRoute`'s pre-creation loop both compile; with `AllLabels` empty their bodies are no-ops over (Claude bot round-6). `MatrixRow.Label` field present. **L0 label copy** (Claude bot round-8 moderate): update `appendDrainedRow` (`keyviz/sampler.go:828`) to include `Label: slot.Label` in the `MatrixRow` struct literal — `slot.Label` is set once at `RegisterRoute` time and immutable, so read it directly rather than threading through `snapshotMeta`. This is the first link in the propagation chain: `slot.Label` → `MatrixRow.Label` (L0, here) → `KeyVizRow.Label` via `newKeyVizRowFrom` (L1, PR-D+E) → merged `KeyVizRow.Label` via `mergeRowInto` (L2, PR-D+E). Missing L0 silently truncates the chain and leaves `MatrixRow.Label = ""` even after PR-C populates `AllLabels`; L1 and L2 then faithfully copy the empty string and the feature collapses. With PR-B's empty-only slots, `slot.Label` is `""` so the emitted row is `""`-labeled (identical to today's behavior), but the wiring is in place for PR-C. `reclaimRetiredSlot` dedupes on `(RouteID, Label)` (forward-prep; only `Label=""` exists). The `MaxTrackedRoutes` coarsening check (`keyviz/sampler.go:416`) divides by `len(AllLabels)+1` so the cap continues to count **routes**, not slots; with `AllLabels` empty in PR-B the divisor is 1 and behavior is identical to today. Update existing tests **and the coordinator call sites in `kv/sharded_coordinator.go`** (the only non-test caller of `Sampler.Observe`) to pass `label = ""`. |
 | **PR-C** | Adapter wiring: each adapter sets its own label at the dispatch entry into `ShardedCoordinator.Observe…`. PR-C **populates** `AllLabels` in `keyviz/labels.go` (the file itself was created in PR-B with an empty slice — see PR-B above) with the five adapter constants (`LabelDynamo`, `LabelRedis`, `LabelS3`, `LabelSQS`, `LabelRawKV`). Extends `RegisterRoute` to pre-create the labeled siblings (one slot per `AllLabels` member) alongside the legacy empty-label slot. **MaxTrackedRoutes is unchanged in semantics** — the §4.1.1 coarsening check divides slot count by `len(AllLabels)+1`, so the existing operator-set cap continues to mean "individually-tracked routes" exactly as before; **operators do not need to raise `--keyvizMaxTrackedRoutes`** at PR-C deploy. (Earlier drafts told operators to scale the cap by `× (len(labels)+1)` — that was correct under Option B's slot-counting semantics but redundant under the chosen Option A. Codex round-6.) Memory growth: `MaxTrackedRoutes × (len(AllLabels) + 1)` slots, documented but not capped. PR-C also emits a structured `slog.Warn` from inside `RegisterRoute` at the moment a route is coarsened — `slog.Warn("route folded into virtual bucket", route_id=…, slots_used=…, max_tracked_routes=…)` — so a misconfigured cap surfaces in logs when it actually bites. A startup-time check would not catch this because routes are added dynamically (the catalog watcher calls `RegisterRoute` whenever a `SplitRange` lands), so a process that started below the cap can cross it later. |
 | **PR-D+E** | **Ship together.** Wire-format extension (proto + JSON `bucket_id` composite + optional `label`) plus the SPA `route:N / label` rendering AND the **five** code changes the labeled wire format requires across the three response paths: <br>**Single-node JSON path (`internal/admin/keyviz_handler.go`)**: <br>(a) `pivotKeyVizColumns` `rowsByID` map AND `order` slice both widen from `uint64` to the composite `BucketID string` — widening only the map without the `order` slice is a compile error and an obvious mismatch, but worth naming; <br>(b) `newKeyVizRowFrom` (`keyviz_handler.go:368`) copies `mr.Label → row.Label` — **first-level** Label copy, affects single-node and cluster deployments alike (every JSON response goes through this constructor); <br>(c) `bucketIDFor` (`keyviz_handler.go:383`) returns the composite `"route:<id>:<label>"` when `mr.Label != ""`, falling back to the legacy `"route:<id>"` for empty labels — without this `BucketID` is non-unique and `applyKeyVizRowBudget` / `sortKeyVizRowsByStart` lose their deterministic tiebreak; <br>**Fan-out JSON path (`internal/admin/keyviz_fanout.go`)**: <br>(d) `mergeRowInto` (`keyviz_fanout.go:509`) adds `dst.Label = row.Label` — **second-level** Label copy, only the cluster fan-out path touches this; <br>**gRPC path (`adapter/admin_grpc.go`)**: <br>(e) `matrixToProto` (`admin_grpc.go:599`) and the per-row conversion it drives: (e1) **widen `rowsByID` (line 603) and `order` (line 604) from `uint64` to the composite `BucketID string` key** — same pivot-key widening as item (a) for the JSON handler; without it `(routeID=1, label="dynamo")` and `(routeID=1, label="redis")` collapse to the same map entry and the second labeled row overwrites the first in the gRPC response, exactly mirroring the JSON handler bug item (a) prevents (Claude bot round-8 moderate); (e2) copy `MatrixRow.Label → KeyVizRow.label` (proto field 4); (e3) emit composite `bucket_id` (`"route:<id>:<label>"`). Without (e1)–(e3), `GetKeyVizMatrix` gRPC clients receive collapsed unlabeled rows even though HTTP/SPA responses now show per-label rows — an API inconsistency for production users of the admin RPC. (Codex P2 on round-7 + Claude bot round-8.) <br>All five copies are required; missing any one leaves a flavour of deployment with empty labels. Splitting any subset leaves a window where labeled rows collapse — they're a single PR. (Claude bot moderate on PR #694 round-4 + round-5.) |
 
@@ -584,19 +591,50 @@ extension is "switch on the field". (Reviewer notes from PR
    without parser ambiguity (split on the *first* `:` after
    `route`). (Gemini round-1 minor on PR #694.)
 2. **Label allocation discipline** — who owns the canonical label
-   set? Proposal: `keyviz/labels.go` exports `LabelDynamo`,
-   `LabelRedis`, `LabelS3`, `LabelSQS`, `LabelRawKV` constants
-   alongside an `AllLabels []string` slice that ranges over them
-   in stable order. `RegisterRoute` iterates `AllLabels` to
-   pre-allocate the labeled slots — exposing the slice (rather
-   than reflecting over the file) keeps the iteration deterministic
-   and the test surface small. Constants live in the `keyviz`
-   package (not `adapter/`) so the sampler can read the full set
-   at registration time without an import cycle back to `adapter`.
-   Adapters refer to these constants; nothing stops a future
-   adapter from inventing its own label, but the review burden
-   of adding to the central file catches accidental variants
-   like `"DynamoDB"` vs `"dynamo"`.
+   set? Proposal: `keyviz/labels.go` defines a **typed string**
+   `type Label string` and exports the canonical constants of that
+   type:
+
+   ```go
+   type Label string
+   const (
+       LabelLegacy Label = ""        // legacy / unlabelled traffic, coordinator default
+       LabelDynamo Label = "dynamo"
+       LabelRedis  Label = "redis"
+       LabelS3     Label = "s3"
+       LabelSQS    Label = "sqs"
+       LabelRawKV  Label = "rawkv"
+   )
+   var AllLabels = []Label{LabelDynamo, LabelRedis, LabelS3, LabelSQS, LabelRawKV}
+   ```
+
+   `Observe` takes `label Label` (not `string`) and `RegisterRoute`
+   iterates `AllLabels` for pre-allocation. Constants live in the
+   `keyviz` package (not `adapter/`) so the sampler can read the
+   full set at registration time without an import cycle back to
+   `adapter`.
+
+   **Why a typed `Label` rather than plain `string`** (Codex round-9):
+   slot pre-creation iterates `AllLabels`, and `Observe` drops slot
+   misses silently — so any adapter that emits a label not in
+   `AllLabels` would silently lose its KeyViz samples. Earlier
+   drafts said "review burden catches accidental variants
+   (`DynamoDB` vs `dynamo`)" — that's a social contract, exactly
+   the kind of invariant a type system should enforce. With
+   `Label` as a named type, the natural call shape is
+   `s.Observe(..., keyviz.LabelDynamo)`; a typo
+   `keyviz.LabelDynamoDB` is a compile error because no such
+   constant exists. (Untyped string literals still auto-convert
+   to `Label`, so `s.Observe(..., "dynamo")` still compiles —
+   the type system doesn't fully prevent that path. Closing it
+   completely needs an additional vet-style static check that
+   greps `Observe(...)` call sites for non-constant labels; that
+   is a Phase-2-C+-or-later follow-up, not blocking PR-B.)
+
+   The result: typo'd constants fail at compile time (the high-
+   probability mistake), and the `AllLabels` slice acts as the
+   single source of truth for both `RegisterRoute`'s pre-creation
+   loop and any future "is this label known?" check.
 3. **Should the aggregator collapse same-route different-label
    rows for operators who don't want the breakdown?** Proposal:
    no — the SPA already lets operators pick which row to
