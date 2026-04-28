@@ -121,9 +121,40 @@ the hot path never needs to allocate. We keep that invariant by
 making `RegisterRoute` **pre-create one slot per known label** at
 registration time, but only on the individual-tracking path. The
 label set is the canonical `keyviz/labels.go` constants (§9 Q2);
-register-time slot count is `len(routes) × len(labels) + 1` (the
-+1 is the empty-label legacy slot, kept so callers that pass
-`label=""` still hit a slot).
+per-route slot count is `len(labels) + 1` (the +1 is the empty-
+label legacy slot, kept so callers that pass `label=""` still hit
+a slot). Total individual slots in the table is therefore
+`len(routes) × (len(labels) + 1)`.
+
+#### Pre-allocation is gated on PR-C, not PR-B
+
+PR-B alone changes the slot-key type from `uint64` to `slotKey`
+but still only pre-creates the **legacy empty-label slot**. The
+labeled siblings are created by PR-C, when adapters actually
+start passing non-empty labels. This split is deliberate and
+preserves PR-B as a behavior-neutral refactor:
+
+- After PR-B alone, slot count per route is **1** (just the
+  legacy slot, identical to today's `routeID`-only behavior).
+  A deployment running 1024 routes today still supports 1024
+  routes after PR-B — no early coarsening, no virtual-bucket
+  fold, no per-operator action required. (Codex P1 on round-5.)
+- After PR-C, slot count per route grows to `len(labels) + 1`.
+  Operators raise `--keyvizMaxTrackedRoutes` before deploying
+  PR-C per the §7 rollout note.
+
+Concretely PR-B's `RegisterRoute` body looks like:
+
+```go
+// PR-B body:
+slot := newSlot(routeID, "", start, end, groupID)
+next.slots[slotKey{RouteID: routeID, Label: ""}] = slot
+
+// PR-C extends to:
+for _, label := range allLabelsWithLegacy() { // AllLabels ∪ {""}
+    next.slots[slotKey{RouteID: routeID, Label: label}] = newSlot(routeID, label, start, end, groupID)
+}
+```
 
 When `RegisterRoute` decides a route will be coarsened into a
 virtual bucket (i.e. it returns `false`), **no labeled slots are
@@ -408,8 +439,8 @@ Virtual-bucket rows in the heatmap render as
 | PR | Scope |
 |---|---|
 | **PR-A** | Land this design doc. |
-| **PR-B** | Sampler API extension: `Observe(... label string)`, `routeSlot.Label`, `RegisterRoute` pre-creates one slot per known label (§4.1.1). `MatrixRow.Label`. `reclaimRetiredSlot` dedupes on `(RouteID, Label)`. Update existing tests **and the coordinator call sites in `kv/sharded_coordinator.go`** (the only non-test caller of `Sampler.Observe`) to pass `label = ""` — until PR-C lands the legacy unlabeled behaviour is preserved. |
-| **PR-C** | Adapter wiring: each adapter sets its own label at the dispatch entry into `ShardedCoordinator.Observe…`. Canonical constants live in `keyviz/labels.go` (NOT `adapter/keyviz_labels.go` — sampler-side imports must not climb back to the adapter package; sampler's `RegisterRoute` reads the canonical set at registration time). **Operator note**: with N labels, slot count grows from M routes to ~N×M; raise `--keyvizMaxTrackedRoutes` proportionally or hot routes will fold into the virtual bucket and lose per-label breakdown. PR-C emits a structured `slog.Warn` from inside `RegisterRoute` at the moment a route is coarsened — `slog.Warn("route folded into virtual bucket", route_id=…, slots_used=…, max_tracked_routes=…)` — so the operator sees the symptom in the log when it actually fires. A startup-time check would not catch this because routes are added dynamically (the catalog watcher calls `RegisterRoute` whenever a `SplitRange` lands), so a process that started below the cap can cross it later. **Rollout discipline**: raise `--keyvizMaxTrackedRoutes` to at least `current_routes × len(labels)` *before* deploying the PR-C binary, otherwise an already-misconfigured node prints a wave of warnings on startup as the watcher re-registers every catalog route — loud but not incorrect, only painful for log retention. |
+| **PR-B** | Sampler API extension: `Observe(... label string)`, `routeSlot.Label`, slot-key type widens to `slotKey{uint64, string}`. **`RegisterRoute` only pre-creates the legacy empty-label slot** — labeled-sibling pre-creation lands in PR-C so PR-B is a behavior-neutral refactor (per-route slot count is unchanged at 1). `MatrixRow.Label` field present but always empty. `reclaimRetiredSlot` dedupes on `(RouteID, Label)` (forward-prep; only `Label=""` exists). Update existing tests **and the coordinator call sites in `kv/sharded_coordinator.go`** (the only non-test caller of `Sampler.Observe`) to pass `label = ""`. |
+| **PR-C** | Adapter wiring: each adapter sets its own label at the dispatch entry into `ShardedCoordinator.Observe…`. Extends `RegisterRoute` to pre-create the labeled siblings (one slot per `AllLabels` member) alongside the legacy empty-label slot from PR-B. Canonical constants live in `keyviz/labels.go` (NOT `adapter/keyviz_labels.go` — sampler-side imports must not climb back to the adapter package; sampler's `RegisterRoute` reads the canonical set at registration time). **Operator note**: with N labels, slot count grows from M routes to ~N×M; raise `--keyvizMaxTrackedRoutes` proportionally or hot routes will fold into the virtual bucket and lose per-label breakdown. PR-C emits a structured `slog.Warn` from inside `RegisterRoute` at the moment a route is coarsened — `slog.Warn("route folded into virtual bucket", route_id=…, slots_used=…, max_tracked_routes=…)` — so the operator sees the symptom in the log when it actually fires. A startup-time check would not catch this because routes are added dynamically (the catalog watcher calls `RegisterRoute` whenever a `SplitRange` lands), so a process that started below the cap can cross it later. **Rollout discipline**: raise `--keyvizMaxTrackedRoutes` to at least `current_routes × (len(labels) + 1)` *before* deploying the PR-C binary — the `+ 1` accounts for the legacy empty-label slot that lives alongside the N labeled siblings on every individually-tracked route. Operators sizing only with `× len(labels)` (one short per route) hit coarsening immediately and lose labeled breakdown anyway. (Codex P2 on round-5.) Otherwise an already-misconfigured node prints a wave of warnings on startup as the watcher re-registers every catalog route — loud but not incorrect, only painful for log retention. |
 | **PR-D+E** | **Ship together.** Wire-format extension (proto + JSON `bucket_id` composite + optional `label`) in the same PR as the SPA `route:N / label` rendering AND the `pivotKeyVizColumns` pivot-key widening from `RouteID` to `(RouteID, Label)` in `internal/admin/keyviz_handler.go`. Splitting these creates a window where `pivotKeyVizColumns` collapses labeled rows back into a single row in the JSON response — exactly the bug this feature is fixing. The fan-out aggregator picks up most of the new behaviour for free because `mergeKeyVizMatrices` keys on composite `BucketID`, but **`mergeRowInto` (`internal/admin/keyviz_fanout.go:509`) constructs new `KeyVizRow` entries from scratch and does NOT currently copy `Label`** — PR-D+E must add the explicit `dst.Label = row.Label` copy, or every cluster-merged row emits `Label = ""` and the SPA falls back to parsing `bucket_id`, defeating Option B. (Claude bot moderate on PR #694 round-4.) |
 
 PRs B and C are independent of the wire format; the heatmap will
