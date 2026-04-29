@@ -125,15 +125,18 @@ backup-<utc-timestamp>-<cluster-id>-<commit-ts>/
 ├── dynamodb/
 │   └── <table-name>/
 │       ├── _schema.json
+│       ├── KEYMAP.jsonl                            # per-scope (omitted when empty)
 │       └── items/
 │           └── <pk-segment>/[<sk-segment>.]json
 ├── s3/
 │   └── <bucket-name>/
 │       ├── _bucket.json
+│       ├── KEYMAP.jsonl                            # per-scope (omitted when empty)
 │       ├── <object-key-path>                       # original object bytes
 │       └── <object-key-path>.elastickv-meta.json   # sidecar (reserved suffix)
 ├── redis/
 │   └── db_<n>/
+│       ├── KEYMAP.jsonl                            # per-scope (omitted when empty)
 │       ├── strings/<key>.bin
 │       ├── strings_ttl.jsonl
 │       ├── hashes/<key>.json
@@ -146,6 +149,7 @@ backup-<utc-timestamp>-<cluster-id>-<commit-ts>/
 └── sqs/
     └── <queue-name>/
         ├── _queue.json
+        ├── KEYMAP.jsonl                            # per-scope (omitted when empty)
         └── messages.jsonl
 ```
 
@@ -754,6 +758,25 @@ The sweeper logs a structured warning (`backup_pin_expired`) when it
 drops a stuck registration so operators see crashed-producer cases in
 their existing log pipeline.
 
+**Cluster-wide propagation.** Each elastickv node owns its own
+`ActiveTimestampTracker` (`main.go:294`) and its compactor only
+consults the local instance (`main.go:335`). For a multi-node
+deployment, a pin recorded on the node receiving the admin RPC is not
+sufficient — the producer's `BackupScanner` reads from group leaders
+that may live on different nodes whose compactors are oblivious to the
+local pin. Pins are therefore **propagated through each Raft group's
+log** as `BackupPin{pin_id, read_ts, deadline}` / `BackupExtend` /
+`BackupRelease` FSM commands. Every replica applies these to its
+local tracker on log apply, so the pin set is replicated and durable
+across leader changes (a newly-elected leader inherits the pin from
+the same log it just applied). Compaction on each replica continues to
+consult only the local tracker; the only new ingredient is the FSM
+plumbing that keeps every replica's tracker in sync. The backup
+admin server (the node receiving `BeginBackup`) is responsible for
+fan-out: it submits the per-group entry through the existing
+`ShardGroup.Propose` path and waits for commit before returning to the
+producer.
+
 **Bound on concurrent active backup pins.** To prevent a misbehaving
 or malicious caller from issuing unbounded `BeginBackup` requests and
 holding the compactor open across the whole MVCC retention horizon,
@@ -794,22 +817,51 @@ dumps with retention pressure.
    reach the threshold within the deadline, `BeginBackup` returns
    `FailedPrecondition` and the producer aborts — the dump is
    not started until every group can serve `read_ts` consistently.
-3. **Pin `read_ts`** with `PinWithDeadline(read_ts, now+ttl_ms)`; return
-   the resulting `pin_token` to the producer.
+3. **Pin `read_ts` cluster-wide**, not just on the node that received
+   the RPC. `kv/active_timestamp_tracker.go` is per-process
+   (`main.go:294` constructs one tracker per node and wires it
+   exclusively to that node's compactor at `main.go:335`). A pin
+   recorded on the receiving node would gate only its own compactor;
+   compactors on other nodes — including any group leader serving the
+   producer's `BackupScanner` — would be free to retire MVCC versions
+   at `read_ts`. The pin therefore fans out to **every replica that
+   could compact**, propagated via the Raft log of each group:
+   `BeginBackup` proposes a `BackupPin{pin_id, read_ts, deadline}`
+   entry through every group involved in the dump; each replica's
+   FSM, on apply, calls `PinWithDeadline(read_ts, deadline)` on its
+   local tracker. The pin is therefore replicated and durable across
+   leader changes — a new leader applies the same entry from the log
+   and inherits the pin. `BeginBackup` returns the resulting
+   `pin_token = (pin_id, []group_id)` to the producer only after every
+   group has committed the entry; if any group's leader is unreachable
+   or fails to commit within `--begin-backup-deadline`, `BeginBackup`
+   proposes a matching `BackupRelease{pin_id}` to every group that
+   *did* commit and returns `Unavailable` so the operator retries
+   cleanly without leaving stranded pins.
 4. **Producer scans** all configured adapter scopes via
    `BackupScanner.Next(at_ts=read_ts)`.
 5. **Renew on long dumps**: the producer calls
-   `RenewBackup(pin_token, ttl_ms)` every `ttl_ms / 3` to extend the
-   deadline. The `read_ts` is preserved across renewals; only the
-   deadline shifts. A multi-hour dump never relies on a single
-   30-minute pin. Renewals are cheap (in-memory map update), and the
+   `RenewBackup(pin_token, ttl_ms)` every `ttl_ms / 3`. The admin
+   server proposes `BackupExtend{pin_id, deadline}` on every group
+   recorded in `pin_token`. The `read_ts` is preserved across
+   renewals; only the deadline shifts. A multi-hour dump never relies
+   on a single 30-minute pin. Renewals are cheap (one Raft entry per
+   group per renewal — at `ttl_ms/3 = 10 min`, that is 6 entries per
+   hour per group, negligible alongside production traffic). The
    producer's renewal goroutine logs a critical alert and aborts the
    dump if a renewal call fails — letting the dump continue past the
    TTL would silently produce a corrupted artifact (the compactor
    would have already retired versions the in-flight scan still
-   depends on).
-6. **`EndBackup(pin_token)`** releases the tracker entry. A producer
-   crash before EndBackup leaves the entry to be reaped by the sweeper.
+   depends on). If renewal succeeds on some groups but fails on
+   others, the producer aborts and issues `EndBackup` (which itself
+   tolerates partial state — see step 6).
+6. **`EndBackup(pin_token)`** proposes `BackupRelease{pin_id}` on
+   every group recorded in `pin_token`. The release is idempotent: a
+   group that has already swept the pin via deadline expiry treats
+   the release as a no-op. A producer crash before EndBackup leaves
+   the pin to be reaped by each replica's sweeper goroutine
+   independently — the per-replica deadline ensures liveness even if
+   no group ever sees a `BackupRelease`.
 
 The dump is therefore a **point-in-time snapshot** of the user-visible
 keyspace, not a streaming tail.
@@ -1005,9 +1057,11 @@ parser, the format has failed its goal.
     sound way to splice mid-stream without losing the original IDs.
     Operators who need merge-into-non-empty pass
     `--stream-merge-strategy=auto-id`, which falls back to `XADD *`
-    and records the original-to-new ID mapping in a
-    `_id_remap.jsonl` log so referential integrity can be patched
-    out-of-band.
+    and records the original-to-new ID mapping next to the source
+    file at `redis/db_<n>/streams/<key>._id_remap.jsonl` (one
+    `{"original_id":"…","new_id":"…"}` line per entry) so referential
+    integrity can be patched out-of-band by tools that find the dump
+    on disk.
 
 ### Risks and Mitigations
 
@@ -1093,6 +1147,9 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestSQSDumpFifoOrderPreserved` | Messages with interleaved `MessageGroupId` are emitted in `(send_ts, sequence_number, message_id)` order; visibility-state fields zeroed by default |
 | `TestManifestVersionGate` | Restore with `format_version > current` fails fast with a typed error; same-major-newer-minor allowed; older-major refused with a clear message |
 | `TestBeginBackupBlocksCompactor` | Open a `BeginBackup`, force a compaction round, confirm MVCC versions for the registered `read_ts` are retained |
+| `TestBeginBackupPinFanOutAllNodes` | A 3-node cluster: `BeginBackup` issued to node A; verify nodes B and C have applied the `BackupPin` Raft entry and their compactors retain MVCC versions at `read_ts`. Compactor on B forced to run mid-dump must not retire pinned versions |
+| `TestBeginBackupPinSurvivesLeaderChange` | After `BeginBackup` on node A, force a leadership change on a group; the new leader still honors the pin (its FSM applied the same entry); subsequent `BackupScanner.Next` calls succeed |
+| `TestBeginBackupGroupUnreachable` | If one group cannot commit `BackupPin` within `--begin-backup-deadline`, `BeginBackup` returns `Unavailable` and proposes `BackupRelease` on every group that did commit; no stranded pins remain |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
 | `TestBackupScannerPaging` | A range with > pageSize keys is returned across multiple `ScanAt` pages with no overlap, no gaps; iteration tolerates concurrent writes by completing at the pinned `read_ts` |
@@ -1117,7 +1174,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestRedisStreamMergeRejectsNonEmpty` | `--mode merge` on a non-empty target stream errors out; `--stream-merge-strategy=auto-id` falls back to `XADD *` and writes `_id_remap.jsonl` |
 | `TestRedisStreamTTLRoundTrip` | A stream with `PEXPIREAT` round-trips through dump and restore: `expire_at_ms` is captured in the `_meta` line and re-applied so the restored stream expires at the original epoch |
 | `TestRedisHLLTTLRoundTrip` | A TTL'd HLL key surfaces in `hll_ttl.jsonl` and is re-applied on restore via the same `EXPIREAT` path used for strings; no-TTL HLLs leave `hll_ttl.jsonl` absent |
-| `TestRedisStreamSkipExistingHandlesERR` | The restore tool's `skip-existing` path tolerates `ERR The ID specified in XADD is equal or smaller` without aborting the dump; entries with non-conflicting IDs are still applied |
+| `TestRedisStreamSkipExistingHandlesERR` | The restore tool's `skip-existing` path tolerates `ERR The ID specified in XADD is equal or smaller` without aborting the restore; entries with non-conflicting IDs are still applied |
 
 ### P2
 
