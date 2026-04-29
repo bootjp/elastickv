@@ -189,7 +189,9 @@ Rules:
     byte.
   - If the resulting segment exceeds 240 bytes, the segment is replaced with
     `<sha256-hex-prefix-32>__<truncated-original>` and the full original
-    bytes are recorded in `<adapter>/<scope>/_long_keys.jsonl`.
+    bytes are recorded in `<adapter>/<scope>/KEYMAP.jsonl` (the same
+    KEYMAP file used for filename round-trip — long-key fallback and
+    encoded-name reverse-lookup share one append-only stream).
 - **DynamoDB binary partition / sort keys** (the `B` attribute type) are
   rendered as `b64.<base64url>` so a binary key never collides with a
   string key whose hex encoding happens to look like base64.
@@ -800,24 +802,69 @@ without hitting the corner case. Beyond that, a snapshot triggered
 by a freshly-restarted follower can quietly unprotect a replica.
 
 `BeginBackup` enforces a soft form of this invariant: it reads each
-group's `Status.AppliedIndex` and `firstIndex` (the oldest log entry
-still on the leader), and refuses to start if any group's
-`appliedIndex - firstIndex` is below a configurable margin
-(`--snapshot-headroom-entries`, default 10000). Operators dumping a
-cluster running close to its snapshot threshold receive
-`FailedPrecondition` rather than a silent corruption, and either
-retry once the headroom widens or extend `mvcc_retention_horizon`
-upstream of the dump.
+group's `Status.AppliedIndex` and `Status.LastSnapshotIndex`
+(`internal/raftengine/engine.go:53-69` — there is no `FirstIndex`
+field; `firstIndex == LastSnapshotIndex + 1`) and refuses to start if
+any group's *remaining headroom before the next snapshot* is below a
+configurable margin:
+
+```
+entries_since_last_snapshot = AppliedIndex - LastSnapshotIndex
+remaining_headroom          = SnapshotEvery - entries_since_last_snapshot
+refuse if: remaining_headroom < --snapshot-headroom-entries
+```
+
+`SnapshotEvery` is the per-engine snapshot trigger (default
+`defaultSnapshotEvery = 10000` from `internal/raftengine/etcd/engine.go:92`).
+`BeginBackup` reads it from each group's engine config rather than
+hardcoding the default, so an operator who tuned `--raftSnapshotEvery`
+sees consistent behavior. With `SnapshotEvery = 10000` and
+`--snapshot-headroom-entries = 1000` (default; one-tenth of
+SnapshotEvery), the check refuses backups when fewer than 1000 entries
+remain before the next snapshot fires — i.e. when an in-flight backup
+is at risk of triggering the snapshot-installation corner case. A
+freshly-snapshotted cluster has the *largest* remaining headroom and
+is the *safest* moment to start a backup; the check correctly allows
+it. Operators receiving `FailedPrecondition` either retry once the
+group has snapshotted (their headroom resets to `SnapshotEvery`) or
+extend `mvcc_retention_horizon` upstream of the dump.
 
 The failure mode for replicas that go through `Restore` mid-backup is
 documented explicitly: the replica's `ScanAt(at_ts=read_ts)` results
 become eventually-consistent (versions at `read_ts` may already have
 been compacted on that replica), and the producer surfaces the
-inconsistency as a `ScanAt` returning fewer keys than the
-`applied_index` baseline implied. The producer's per-scope
-`expected_keys` heuristic — already needed for
-`TestBeginBackupPinSurvivesLeaderChange` — catches it and fails the
-dump rather than emitting a corrupted artifact.
+inconsistency via a per-scope **expected-keys baseline**:
+
+> **Expected-keys baseline.** During step 1 of `BeginBackup`, before
+> the pin is installed, the admin server runs a *count-only* scan of
+> each adapter scope at `read_ts` (`ShardStore.ScanAt` with
+> `keys_only=true`, returning per-scope `(scope_id, key_count,
+> applied_index_at_count)`). The result is returned in
+> `BeginBackupResponse` and used as the contractual lower bound for
+> the producer's subsequent `BackupScanner.Next` traversal of the
+> same scope.
+>
+> The cost is one full forward scan per scope at backup time, but
+> count-only mode skips value materialization (`*store.KVPair` with
+> `Value == nil`); on Pebble this is a SST iterator with payload
+> trimmed at the block layer, so the additional pass is roughly 10×
+> cheaper than the data-bearing scan that follows. For a 100M-key
+> scope the baseline pass adds seconds, not minutes.
+>
+> If the producer's actual key count for a scope is `< 99% × baseline
+> ± sqrt(baseline)` (binomial-noise tolerance for legitimate
+> compaction of TTL'd keys between baseline and dump), the dump fails
+> with `ErrCompactionDuringDump` and the partial directory tree is
+> rejected by the restore tool (no `MANIFEST.json` is written). The
+> 1% threshold is large enough to absorb routine TTL expiry and small
+> enough to catch the "snapshot wiped pins on one replica" failure
+> mode, which would typically produce shortfalls of 5–50% on the
+> affected key range.
+>
+> Sparse legitimate ranges are not a false positive because the
+> baseline measures the *same scope at the same `read_ts`* — there
+> is no comparison against a structural expectation, only against the
+> producer's own count from a few seconds prior.
 
 A heavier mitigation that would let dumps run longer than the
 retention horizon — snapshotting the tracker state alongside the
@@ -872,7 +919,13 @@ dumps with retention pressure.
    and the producer aborts — the dump is not started until every
    group can serve `read_ts` consistently.
 3. **Pin `read_ts` cluster-wide**, not just on the node that received
-   the RPC. `kv/active_timestamp_tracker.go` is per-process
+   the RPC. **Per-group `BackupPin` proposals are issued concurrently**
+   — one goroutine per group — so a 100-shard cluster does not pay
+   100× serial Raft round-trips at the start of every backup. The
+   handler blocks until every goroutine has reported commit (or the
+   deadline fires); on error it cancels siblings and proceeds to the
+   compensating-release path described below.
+   `kv/active_timestamp_tracker.go` is per-process
    (`main.go:294` constructs one tracker per node and wires it
    exclusively to that node's compactor at `main.go:335`). A pin
    recorded on the receiving node would gate only its own compactor;
@@ -1182,7 +1235,15 @@ written.
 - New `kv/backup_scan.go` — `BackupScanner` iterator wrapping the
   existing `ShardStore.ScanAt` (`kv/shard_store.go:106`) so multi-
   million-key ranges page through `ScanAt` calls of `--scan-page-size`
-  rather than materializing in one call.
+  rather than materializing in one call. Phase 1 also extends
+  `MVCCStore.ScanAt` / `ShardStore.ScanAt` with a `keys_only bool`
+  parameter so the expected-keys baseline pass can iterate without
+  materializing values (Pebble iterator with payload trimmed at the
+  block layer; ~10× cheaper than a value-bearing scan).
+- Add `BeginBackupResponse.expected_keys` per scope (the count
+  produced by the baseline pass at `read_ts` before the pin is
+  installed) and `ErrCompactionDuringDump` in the producer when the
+  actual count falls below `99% × baseline ± sqrt(baseline)`.
 - New tool `cmd/elastickv-backup/` performing
   `BeginBackup → ListAdaptersAndScopes → BackupScanner.Next* (per scope)
   → encode → write directory tree → CHECKSUMS → MANIFEST.json
@@ -1242,8 +1303,10 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestBeginBackupPinSurvivesLeaderChange` | After `BeginBackup` on node A, force a leadership change on a group; the new leader still honors the pin (its FSM applied the same entry); subsequent `BackupScanner.Next` calls succeed |
 | `TestBeginBackupGroupUnreachable` | If one group cannot commit `BackupPin` within `--begin-backup-deadline`, `BeginBackup` returns `Unavailable` and proposes `BackupRelease` on every group that did commit; no stranded pins remain |
 | `TestBackupPinFSMCodecRoundTrip` | `BackupPin` / `BackupExtend` / `BackupRelease` byte layouts (33 / 25 / 17 bytes) round-trip through the FSM apply path; unknown tag bytes return `ErrUnknownRequestType` rather than panicking |
-| `TestRestoreWipesLocalPins` | A replica that installs a Raft snapshot during a backup loses its `BackupPin`; the producer's per-scope `expected_keys` heuristic detects the resulting `ScanAt` shortfall and fails the dump rather than emitting a corrupted artifact |
-| `TestBeginBackupRefusesNearSnapshotThreshold` | When any group's `appliedIndex - firstIndex < snapshot_headroom_entries`, `BeginBackup` returns `FailedPrecondition` rather than starting a dump that risks the snapshot-installation path |
+| `TestRestoreWipesLocalPins` | A replica that installs a Raft snapshot during a backup loses its `BackupPin`; the producer's per-scope expected-keys baseline detects the resulting `ScanAt` shortfall (count below `99% × baseline ± sqrt(baseline)`) and fails the dump with `ErrCompactionDuringDump` rather than emitting a corrupted artifact |
+| `TestBeginBackupRefusesNearSnapshotThreshold` | When any group's `SnapshotEvery - (AppliedIndex - LastSnapshotIndex) < --snapshot-headroom-entries`, `BeginBackup` returns `FailedPrecondition` rather than starting a dump that risks the snapshot-installation path. Verify a freshly-snapshotted cluster (largest remaining headroom) is allowed |
+| `TestExpectedKeysBaselineToleratesTTLExpiry` | Routine TTL expiry between baseline and dump (1% of keys gone) does NOT trigger `ErrCompactionDuringDump`; a 5% drop DOES |
+| `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses `ScanAt` with `keys_only=true`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
