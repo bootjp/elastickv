@@ -39,7 +39,7 @@ The FSM snapshot path (`store/snapshot_pebble.go`, see
 `2026_04_14_implemented_etcd_snapshot_disk_offload.md`) writes the entire
 keyspace as a single opaque stream:
 
-```
+```text
 [magic "EKVPBBL1" :8]
 [lastCommitTS    :8]
 ([keyLen:8][key][valLen:8][val])*
@@ -145,7 +145,7 @@ or migrate the data **without elastickv being part of the recovery path**.
 
 ## Top-Level Layout
 
-```
+```text
 backup-<utc-timestamp>-<cluster-id>-<commit-ts>/
 ├── MANIFEST.json
 ├── CHECKSUMS                         # sha256sum(1)-compatible: "<64-hex>  <relative-path>" per line
@@ -227,14 +227,26 @@ Rules:
   `messages.jsonl`. Same rationale for Redis stream entries.
 
 `KEYMAP.jsonl` at each adapter scope root translates the encoded
-filename back to the exact original bytes, in case the user needs to
+filename back to the exact original bytes when the user needs to
 feed the data into a system that requires the verbatim key. JSONL
-(one mapping per line, never loaded fully) is used so the file scales
-to millions of keys without becoming a memory bottleneck on either the
-producer or a downstream consumer. The translation is also losslessly
-recoverable from the encoded filename alone — `KEYMAP.jsonl` is a
-convenience, not a correctness dependency. A consumer that does not
-need it can ignore it entirely.
+(one mapping per line, never loaded fully) is used so the file
+scales to millions of keys without becoming a memory bottleneck.
+Reversibility depends on the encoding path (Phase 1 follows the
+same rules Phase 0 defines):
+
+- **`%HH` percent-encoded segments and `b64.<base64url>` segments**
+  are losslessly reversible from the filename alone — `KEYMAP.jsonl`
+  is **convenience only** for these.
+- **SHA-fallback segments** (`<sha256-prefix-32>__<truncated-original>`
+  for keys exceeding 240 bytes) and **S3 path-collision renames**
+  (`<obj>.elastickv-leaf-data`) carry insufficient information in
+  the filename alone. For those entries `KEYMAP.jsonl` is a
+  **correctness dependency** — exact-byte recovery is impossible
+  without it.
+
+A consumer that does not need original-byte recovery on SHA-
+fallback or collision-renamed entries can ignore `KEYMAP.jsonl`
+entirely.
 
 ### S3 path collisions (file vs. directory)
 
@@ -262,7 +274,7 @@ can spot dataset shapes that benefit from object-key normalization.
 
 ### DynamoDB
 
-```
+```text
 dynamodb/
 └── orders/                                        # composite-key table (hash + range)
     ├── _schema.json
@@ -351,7 +363,7 @@ with `--dynamodb-bundle-size 64MiB`, defaulting to that value) that
 emits items as `items/data-<part-id>.jsonl` instead, packed up to the
 configurable per-file size budget:
 
-```
+```text
 dynamodb/orders/
 ├── _schema.json
 └── items/
@@ -383,7 +395,7 @@ restore-side OCC, see "Read-Side Consistency".)
 
 ### S3
 
-```
+```text
 s3/
 └── photos/
     ├── _bucket.json
@@ -455,7 +467,7 @@ elastickv would resurrect deleted state. They land under
 
 ### Redis
 
-```
+```text
 redis/
 └── db_0/
     ├── strings/
@@ -550,7 +562,7 @@ raw bytes.
 
 ### SQS
 
-```
+```text
 sqs/
 └── orders-fifo.fifo/
     ├── _queue.json
@@ -575,7 +587,7 @@ sqs/
 `messages.jsonl` — one record per line, ordered by `(SendTimestampMillis,
 SequenceNumber, MessageId)`:
 
-```
+```text
 {"message_id":"abc-1","body":"hello","md5_of_body":"…","sender_id":"…","send_timestamp_millis":1714400000000,"available_at_millis":1714400000000,"visible_at_millis":0,"receive_count":0,"first_receive_millis":0,"current_receipt_token":null,"queue_generation":7,"message_group_id":"orders","message_deduplication_id":"abc-1","sequence_number":42,"dead_letter_source_arn":null,"message_attributes":{}}
 ```
 
@@ -865,7 +877,7 @@ field; `firstIndex == LastSnapshotIndex + 1`) and refuses to start if
 any group's *remaining headroom before the next snapshot* is below a
 configurable margin:
 
-```
+```text
 entries_since_last_snapshot = AppliedIndex - LastSnapshotIndex
 remaining_headroom          = SnapshotEvery - entries_since_last_snapshot
 refuse if: remaining_headroom < --snapshot-headroom-entries
@@ -1079,9 +1091,9 @@ Internal keys are partitioned into three classes:
 
 | Class | Examples | Backup behavior |
 |---|---|---|
-| **Re-derivable from user data + config** | DynamoDB GSI rows; S3 route catalog (`!s3route|`); Redis TTL scan index (`!redis|ttl|`); SQS visibility / age / dedup / group / tombstone indexes; route catalog under default group | Excluded by default. Restore re-builds them as user data is replayed. |
+| **Re-derivable from user data + config** | DynamoDB GSI rows; S3 route catalog (`!s3route\|`); Redis TTL scan index (`!redis\|ttl\|`); SQS visibility / age / dedup / group / tombstone indexes; route catalog under default group | Excluded by default. Restore re-builds them as user data is replayed. |
 | **Per-cluster operational state** | HLC physical ceiling; Raft term/index/conf state; FSM marker files (`raft-engine`, `EKVR`/`EKVM`/`EKVW` magic files in `internal/raftengine/etcd/persistence.go`); write conflict counter | Never dumped. They belong to the cluster, not the data. A restore initializes them fresh. |
-| **In-flight transactional state** | `!txn|` intent / lock / resolver records (`kv/txn_keys.go`, `kv/txn_codec.go`); pending S3 multipart uploads | Excluded by default. Optionally dumped under `_internals/` for forensics, but never re-applied by the restore path — replaying intents from a stale read_ts can resurrect aborted transactions. |
+| **In-flight transactional state** | `!txn\|` intent / lock / resolver records (`kv/txn_keys.go`, `kv/txn_codec.go`); pending S3 multipart uploads | Excluded by default. Optionally dumped under `_internals/` for forensics, but never re-applied by the restore path — replaying intents from a stale read_ts can resurrect aborted transactions. |
 
 This split is what makes the backup safe across versions: the only thing
 encoded in the dump is information the user could in principle have
@@ -1096,7 +1108,7 @@ A new CLI under `cmd/elastickv-backup/`. Streams the dump out as a
 directory tree on local disk, or as `tar` / `tar+zstd` to stdout for
 piping straight to S3 / GCS / a tape device.
 
-```
+```text
 elastickv-backup dump \
   --address     127.0.0.1:50051 \
   --output-dir  /backups/2026-04-29 \
@@ -1119,7 +1131,7 @@ elastickv-backup dump \
 
 Internally it runs:
 
-```
+```text
 BeginBackup(ttl_ms=1800000) → ListAdaptersAndScopes
                             → BackupScanner.Next* (per scope, at read_ts)
                             → encode-and-write per adapter
@@ -1133,7 +1145,7 @@ deployments it scans groups in parallel.
 
 ### Consumer: `cmd/elastickv-restore`
 
-```
+```text
 elastickv-restore apply \
   --address    127.0.0.1:50051 \
   --input-dir  /backups/2026-04-29 \

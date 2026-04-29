@@ -10,7 +10,7 @@ The existing FSM snapshot path (`store/snapshot_pebble.go`, see
 `2026_04_14_implemented_etcd_snapshot_disk_offload.md`) writes the
 entire keyspace as a single opaque stream:
 
-```
+```text
 [magic "EKVPBBL1" :8]
 [lastCommitTS    :8]
 ([keyLen:8][key][valLen:8][val])*
@@ -105,7 +105,7 @@ record schemas, and `MANIFEST.json` are all defined here.
 
 ### Top-level layout
 
-```
+```text
 backup-<utc-timestamp>-<cluster-id>-<applied-index>/
 ├── MANIFEST.json
 ├── CHECKSUMS                         # sha256sum(1)-compatible
@@ -176,10 +176,32 @@ Rules:
 `KEYMAP.jsonl` at each adapter scope root translates encoded
 filenames back to original bytes when needed. JSONL (one mapping per
 line) so the file scales to millions of keys without becoming a
-memory bottleneck. The translation is also losslessly recoverable
-from the encoded filename alone — `KEYMAP.jsonl` is a convenience,
-not a correctness dependency. A consumer that does not need it can
-ignore it entirely.
+memory bottleneck.
+
+Reversibility depends on the encoding path:
+
+- **`%HH` percent-encoded segments and `b64.<base64url>` segments**
+  (DynamoDB binary keys) are losslessly reversible from the filename
+  alone. `KEYMAP.jsonl` is **convenience only** for these — a
+  consumer that operates on encoded keys, or that needs only the
+  human-recognizable subset, can ignore it.
+- **SHA-fallback segments** (`<sha256-prefix-32>__<truncated-original>`,
+  used when a key segment exceeds 240 bytes) carry only the truncated
+  prefix and a hash. The full original bytes are recoverable only via
+  `KEYMAP.jsonl`. For these entries `KEYMAP.jsonl` is a
+  **correctness dependency** — without it, a consumer can identify
+  *which* record a file came from but cannot reproduce the exact
+  original key bytes.
+- **S3 path-collision renames** (`<obj>.elastickv-leaf-data` for the
+  shorter key when both `path/to` and `path/to/obj` exist) similarly
+  require `KEYMAP.jsonl` to reverse — the renamed filename does not
+  by itself encode that the original key was the un-suffixed form.
+
+A consumer that does not need original-byte recovery for SHA-
+fallback or collision-renamed entries (e.g., a migration tool that
+preserves keys as-encoded into the destination system) can ignore
+`KEYMAP.jsonl` entirely. A consumer that needs exact round-trip on
+arbitrary inputs must consult it.
 
 #### S3 path collisions (file vs. directory)
 
@@ -206,7 +228,7 @@ this case at scan time:
 
 #### DynamoDB
 
-```
+```text
 dynamodb/
 └── orders/                                        # composite-key table (hash + range)
     ├── _schema.json
@@ -417,7 +439,7 @@ depending on elastickv's internal physics stays in elastickv.
 
 ### Decoder: `cmd/elastickv-snapshot-decode`
 
-```
+```text
 elastickv-snapshot-decode \
   --input  <fsm-file>          # or --input-snap-dir <data-dir>/fsm-snap/
   --output <directory-root> \
@@ -435,7 +457,7 @@ elastickv-snapshot-decode \
 
 Pipeline:
 
-```
+```text
 open .fsm                                       # verifies CRC32C footer
 parse EKVPBBL1 magic + lastCommitTS
 stream ([keyLen:8][key][valLen:8][val])* entries:
@@ -469,7 +491,7 @@ current.
 
 ### Encoder: `cmd/elastickv-snapshot-encode`
 
-```
+```text
 elastickv-snapshot-encode \
   --input  <directory-root> \
   --output <fsm-file> \
@@ -478,7 +500,7 @@ elastickv-snapshot-encode \
 
 Pipeline:
 
-```
+```text
 read MANIFEST.json (refuse on unknown major format_version)
 walk per-adapter subtrees:
   DynamoDB → emit !ddb|meta|table| then !ddb|item| KV pairs
