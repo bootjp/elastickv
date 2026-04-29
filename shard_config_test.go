@@ -153,8 +153,8 @@ func TestParseSQSFifoPartitionMap(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, m, 1)
 		require.Equal(t, sqsFifoQueueRouting{
-			PartitionCount: 8,
-			Groups:         []string{"10", "11", "12", "13", "14", "15", "16", "17"},
+			partitionCount: 8,
+			groups:         []string{"10", "11", "12", "13", "14", "15", "16", "17"},
 		}, m["orders.fifo"])
 	})
 
@@ -163,15 +163,15 @@ func TestParseSQSFifoPartitionMap(t *testing.T) {
 		m, err := parseSQSFifoPartitionMap("orders.fifo:2=1,2;events.fifo:4=3,4,5,6")
 		require.NoError(t, err)
 		require.Len(t, m, 2)
-		require.Equal(t, uint32(2), m["orders.fifo"].PartitionCount)
-		require.Equal(t, []string{"3", "4", "5", "6"}, m["events.fifo"].Groups)
+		require.Equal(t, uint32(2), m["orders.fifo"].partitionCount)
+		require.Equal(t, []string{"3", "4", "5", "6"}, m["events.fifo"].groups)
 	})
 
 	t.Run("trims whitespace", func(t *testing.T) {
 		t.Parallel()
 		m, err := parseSQSFifoPartitionMap(" orders.fifo : 2 = 1 , 2 ")
 		require.NoError(t, err)
-		require.Equal(t, []string{"1", "2"}, m["orders.fifo"].Groups)
+		require.Equal(t, []string{"1", "2"}, m["orders.fifo"].groups)
 	})
 
 	t.Run("normalizes leading-zero group IDs", func(t *testing.T) {
@@ -183,7 +183,7 @@ func TestParseSQSFifoPartitionMap(t *testing.T) {
 		// q.fifo:2=01,02" would be rejected as group-not-found.
 		m, err := parseSQSFifoPartitionMap("q.fifo:2=01,002")
 		require.NoError(t, err)
-		require.Equal(t, []string{"1", "2"}, m["q.fifo"].Groups)
+		require.Equal(t, []string{"1", "2"}, m["q.fifo"].groups)
 	})
 
 	t.Run("rejects non-uint64 group reference", func(t *testing.T) {
@@ -275,7 +275,7 @@ func TestValidateSQSFifoPartitionMap(t *testing.T) {
 	t.Run("all groups present passes", func(t *testing.T) {
 		t.Parallel()
 		m := map[string]sqsFifoQueueRouting{
-			"q.fifo": {PartitionCount: 2, Groups: []string{"1", "2"}},
+			"q.fifo": {partitionCount: 2, groups: []string{"1", "2"}},
 		}
 		groups := map[string]struct{}{"1": {}, "2": {}}
 		require.NoError(t, validateSQSFifoPartitionMap(m, groups))
@@ -287,7 +287,7 @@ func TestValidateSQSFifoPartitionMap(t *testing.T) {
 		// The validator must surface the queue and partition index so
 		// the operator can fix the typo without re-counting.
 		m := map[string]sqsFifoQueueRouting{
-			"orders.fifo": {PartitionCount: 4, Groups: []string{"1", "99", "3", "4"}},
+			"orders.fifo": {partitionCount: 4, groups: []string{"1", "99", "3", "4"}},
 		}
 		groups := map[string]struct{}{
 			"1": {}, "2": {}, "3": {}, "4": {},

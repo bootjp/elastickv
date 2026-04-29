@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -52,8 +54,8 @@ const sqsFifoPartitionMaxPartitions = 32
 // (validateSQSFifoPartitionMap) checks that PartitionCount matches
 // len(Groups), is a power of two, and is within the per-queue cap.
 type sqsFifoQueueRouting struct {
-	PartitionCount uint32
-	Groups         []string
+	partitionCount uint32
+	groups         []string
 }
 
 func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
@@ -214,7 +216,7 @@ func parseSQSFifoPartitionMapEntry(entry string) (string, sqsFifoQueueRouting, e
 	if err != nil {
 		return "", sqsFifoQueueRouting{}, err
 	}
-	return queue, sqsFifoQueueRouting{PartitionCount: count, Groups: groups}, nil
+	return queue, sqsFifoQueueRouting{partitionCount: count, groups: groups}, nil
 }
 
 // parseSQSFifoPartitionCount validates the N in `queue.fifo:N=...`.
@@ -226,7 +228,7 @@ func parseSQSFifoPartitionCount(entry, countStr string) (uint32, error) {
 	count64, err := strconv.ParseUint(countStr, 10, 32)
 	if err != nil {
 		return 0, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
-			"%q: PartitionCount %q is not a non-negative integer", entry, countStr)
+			"%q: PartitionCount %q must be a positive decimal integer", entry, countStr)
 	}
 	if count64 == 0 {
 		return 0, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
@@ -304,8 +306,14 @@ func parseSQSFifoGroupList(entry, groupRaw string, count uint32) ([]string, erro
 // the same canonical form by parseSQSFifoGroupList, so the lookup is
 // a plain set-membership check.
 func validateSQSFifoPartitionMap(m map[string]sqsFifoQueueRouting, raftGroupIDs map[string]struct{}) error {
-	for queue, routing := range m {
-		for partition, group := range routing.Groups {
+	// Sort the queue names so a config with multiple misconfigured
+	// queues always reports the lexicographically-first failure —
+	// otherwise Go's randomised map iteration would surface a
+	// different queue on each run, which makes operator triage
+	// (and golden-test asserts) flaky for no benefit.
+	for _, queue := range slices.Sorted(maps.Keys(m)) {
+		routing := m[queue]
+		for partition, group := range routing.groups {
 			if _, ok := raftGroupIDs[group]; !ok {
 				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
 					"queue %q partition %d: group %q is not in --raftGroups",
