@@ -419,16 +419,45 @@ bytes consumed match `len` exactly.
 
 Read path (`ReadSnapshotHeader`):
 
-1. Read the 8-byte magic.
-2. If it equals `hlcSnapshotMagic` (`EKVTHLC1`): parse the next
-   8 bytes as `ceiling`, return `cutover = 0`.
-3. If it equals `hlcSnapshotMagicV2` (`EKVTHLC2`): read `len`,
-   then exactly `len` payload bytes; parse `ceiling` from the
-   first 8, `cutover` from the next 8, ignore any trailing
-   bytes (forward-compat within v2).
-4. Otherwise refuse the snapshot with
-   `ErrSnapshotHeaderUnknownMagic`. Restoring a snapshot whose
-   format we cannot identify is never safe.
+1. Peek the 8-byte magic **without consuming it from the
+   underlying stream** (`bufio.Reader.Peek` or equivalent), so
+   the bytes can be replayed back into the payload reader if
+   they turn out not to be a magic.
+2. If it equals `hlcSnapshotMagicV2` (`EKVTHLC2`): consume the
+   8 magic bytes, read `len`, then exactly `len` payload
+   bytes; parse `ceiling` from the first 8, `cutover` from the
+   next 8, ignore any trailing bytes (forward-compat within v2).
+3. Else if it equals `hlcSnapshotMagic` (`EKVTHLC1`): consume
+   the 8 magic bytes, parse the next 8 bytes as `ceiling`,
+   return `cutover = 0`.
+4. **Else — headerless legacy snapshot.** Today's
+   `kv/fsm.go::Restore` already supports pre-HLC snapshots
+   that have no header at all and treat the entire stream as
+   inner store payload (`TestFSMSnapshotRestoreOldFormat` /
+   `TestFSMSnapshotRestoreSmallLegacy` in `kv/snapshot_test.go`
+   are the regression tests). Preserve that compatibility:
+   leave the peeked 8 bytes in the underlying stream (do not
+   consume them), return `ceiling = 0` and `cutover = 0`, and
+   pass the entire byte sequence — including the 8 peeked
+   bytes — to the inner store-payload restore path. The
+   restore path is responsible for whatever framing the
+   legacy snapshot used internally.
+
+   This case is **not** an error and **must not** return
+   `ErrSnapshotHeaderUnknownMagic`. The error variant is
+   reserved for future-version snapshots whose magic is in
+   the `EKVTHLC*` family but with a version byte we do not
+   recognise (e.g., a hypothetical `EKVTHLC3` written by a
+   newer build); those are genuinely unsafe to restore under
+   the current binary.
+
+   Concretely the discriminator for "headerless vs.
+   future-incompatible" is whether the 8 peeked bytes start
+   with the 7-byte prefix `"EKVTHLC"`. If they do and the
+   version byte is unknown → `ErrSnapshotHeaderUnknownMagic`.
+   If they do not match the prefix at all → headerless legacy
+   fallback per step 4. The existing v1 regression tests must
+   continue to pass under the new reader.
 
 Write path (`WriteSnapshotHeader`):
 
@@ -501,10 +530,18 @@ Two-tier hierarchy:
   No default. If `--encryption-enabled` is set without a KEK source,
   the process refuses to start.
 
-- **DEK (Data Encryption Key).** 32-byte AES key generated locally
-  with `crypto/rand`. Two DEKs are issued in v1: `dek_storage` (used
-  by §4.1) and `dek_raft` (used by §4.2). Both are wrapped by the KEK
-  and persisted in a sidecar file:
+- **DEK (Data Encryption Key).** 32-byte AES key. Two DEKs are
+  issued in v1: `dek_storage` (used by §4.1) and `dek_raft`
+  (used by §4.2). DEKs are **generated on the leader with
+  `crypto/rand` and committed via Raft** — never independently
+  on each node — so every replica observes the same `key_id`
+  for the same DEK at the same log index. The bootstrap and
+  rotation flow that enforces this is in §5.6; locally
+  generating a DEK without going through Raft would let
+  different replicas pick different `key_id`s for what is
+  conceptually the same key, breaking
+  snapshot/catch-up decryption. Each node persists the
+  KEK-wrapped DEK in a sidecar file:
 
   ```text
   <dataDir>/encryption/keys.json
@@ -836,6 +873,68 @@ section only protects against the narrower failure of "DEK was
 rotated cluster-wide but this one node missed the sidecar
 rewrite."
 
+### 5.6 Initial DEK bootstrap
+
+Both rotation (§5.2) and the writer registry (§4.1) assume that
+every replica observes the same `(active_storage_dek_id,
+active_raft_dek_id)` tuple at every Raft log index. If each
+node generated its initial DEKs locally with `crypto/rand` at
+process start, three replicas would pick three different
+`key_id`s for what should be one cluster-wide active DEK.
+Storage encryption would then start producing values whose
+ciphertext is decryptable only on the writing node; snapshot
+streaming and follower catch-up would fail with
+`unknown_key_id` the moment the first encrypted write left the
+writing node. Bootstrap is therefore **never** a local-only
+operation — the first DEKs are always created via Raft, the
+same way as every subsequent rotation:
+
+1. **Trigger.** The bootstrap is implicit in
+   `enable-storage-envelope` (§7.1 Phase 1). The admin command,
+   on the leader, checks whether the sidecar's `active.storage`
+   and `active.raft` fields are unset (`key_id == 0`). If so, it
+   first proposes a `bootstrap-encryption` Raft entry containing
+   freshly-generated `dek_storage` + `dek_raft` (CSPRNG via
+   `crypto/rand`, wrapped under the current KEK), then proposes
+   the actual `enable-storage-envelope` flag entry. The two
+   entries are pipelined but not atomic; the order is fixed
+   so the flag entry is always preceded by a bootstrap that
+   has already populated every node's sidecar.
+2. **Idempotency.** `bootstrap-encryption` is **rejected** by
+   FSM apply if the sidecar already has an active storage DEK
+   (the leader's pre-check above is a fast path; the FSM check
+   is the load-bearing one). This prevents an operator who
+   accidentally re-runs `enable-storage-envelope` from
+   replacing the existing DEKs with a fresh pair and orphaning
+   every value already encrypted under the old DEKs.
+3. **Phase 2 reuse.** `enable-raft-envelope` does **not**
+   re-bootstrap — it relies on `dek_raft` being already
+   present from step 1. If the operator somehow skips Phase 1
+   and tries Phase 2 directly, the leader-side pre-check
+   refuses with `ErrEncryptionNotBootstrapped`.
+4. **Writer registry interaction.** A node performs its first
+   `RegisterEncryptionWriter` (§4.1) **after** it has
+   observed both the bootstrap entry and the
+   `enable-storage-envelope` flag entry in its applied log,
+   not at process start. Until both are present the storage
+   layer writes cleartext (`encryption_state = 0b00`) and the
+   registry is untouched. This prevents a brand-new node from
+   trying to register against a DEK that does not yet exist
+   cluster-wide.
+5. **Sidecar reconciliation interaction.** The
+   `bootstrap-encryption` entry is `isEncryptionRelevant()`
+   per §5.5, so the sidecar lag check covers it; a node that
+   crashes between Raft apply and sidecar fsync of the
+   bootstrap entry refuses to start with
+   `ErrSidecarBehindRaftLog` and recovers via the same
+   automatic-leader-rewrap or manual `resync-sidecar` paths.
+
+The asymmetry with §5.2 rotation is deliberate. Rotation
+appends a *new* DEK to a non-empty `keys` map (and shifts
+`active`); bootstrap creates the *first* DEK in an empty map.
+They share the FSM apply path but the leader-side
+pre-conditions and idempotency rules are different.
+
 ---
 
 ## 6. Implementation plan
@@ -1134,12 +1233,23 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
 
 4. Operator runs `elastickv-admin encryption enable-storage-envelope`.
    The leader rechecks the membership-snapshot capability gate
-   from step 3 and then proposes a single Raft entry with the
-   cluster-wide flag `storage_envelope_active = true`. This
-   entry's `Data []byte` is the **legacy framing** (i.e., the
-   existing `kv/fsm.go` first-byte tag space; see Phase 2's note
-   below) so every replica — even one that somehow missed the
-   capability advert — can still decode and apply it.
+   from step 3, then performs the **DEK bootstrap if necessary**
+   per §5.6: if the leader's sidecar shows `active.storage == 0`
+   / `active.raft == 0`, it first proposes a
+   `bootstrap-encryption` Raft entry that creates the initial
+   `(dek_storage, dek_raft)` pair and commits them to every
+   node's sidecar through the standard FSM apply path. Only
+   after that bootstrap entry has been applied does the leader
+   propose the actual `enable-storage-envelope` flag entry.
+   This sequencing is mandatory — flipping the flag without a
+   committed cluster-wide DEK pair would let each replica
+   encrypt under its own locally-generated `key_id` and break
+   snapshot/catch-up decryption. The flag entry's `Data []byte`
+   is the **legacy framing** (i.e., the existing `kv/fsm.go`
+   first-byte tag space; see Phase 2's note below) so every
+   replica — even one that somehow missed the capability
+   advert — can still decode and apply it. The bootstrap entry
+   is similarly in legacy framing for the same reason.
 5. From the apply index of that flag entry onward, every storage
    layer Put writes `encryption_state = 0b01` and the §4.1
    envelope. MVCC versions written before that index keep
@@ -1400,6 +1510,11 @@ The process refuses to start if any of the following hold:
   that joined mid-Phase-2 from a snapshot taken before Phase 2
   was enabled, then later replayed Raft entries that crossed
   the cutover; resolved by `encryption resync-sidecar`.
+- `enable-raft-envelope` was issued before the §5.6
+  `bootstrap-encryption` entry committed (`ErrEncryptionNotBootstrapped`).
+  Operator must run `enable-storage-envelope` first; the
+  bootstrap is implicit in that command and creates both the
+  storage and raft DEKs in a single Raft entry.
 
 Each refusal logs a single, unambiguous error pointing at the
 relevant flag and runbook section.
