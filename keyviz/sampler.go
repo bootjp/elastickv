@@ -160,6 +160,13 @@ type MemSampler struct {
 	// twice in the same column — once as an aggregate row, once as
 	// an individual row — even under register/remove churn.
 	virtualIDCounter atomic.Uint64
+
+	// groupTermsMu guards groupTerms. SetLeaderTerm and Flush both
+	// touch the map; Observe never does. The lock is fine-grained
+	// enough that contention is bounded by leader-term flips, which
+	// happen at most a few times per second across the whole cluster.
+	groupTermsMu sync.RWMutex
+	groupTerms   map[uint64]uint64
 }
 
 // retiredSlot tracks a removed slot through its post-removal grace
@@ -237,6 +244,14 @@ type routeTable struct {
 type routeSlot struct {
 	metaMu  sync.RWMutex
 	RouteID uint64
+	// GroupID is the Raft group this route belongs to. Phase 2-C+
+	// stamps this on every emitted MatrixRow so the cluster fan-out
+	// aggregator can dedupe write samples by (raftGroupID,
+	// leaderTerm) instead of the conservative max-merge that may
+	// undercount during a leadership flip. 0 means "no group
+	// attached" (legacy single-group deployments and the synthetic
+	// virtual-bucket slots both use 0).
+	GroupID uint64
 	Start   []byte
 	End     []byte
 	// Aggregate marks virtual buckets that fold multiple coarsened
@@ -266,7 +281,7 @@ type routeSlot struct {
 // Start/End/MemberRoutes with the live slot (which a later
 // RegisterRoute may extend, and which the snapshot API exports to
 // external consumers that may mutate the bounds).
-func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members []uint64, membersTotal uint64) {
+func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members []uint64, membersTotal, groupID uint64) {
 	s.metaMu.RLock()
 	defer s.metaMu.RUnlock()
 	start = cloneBytes(s.Start)
@@ -276,6 +291,7 @@ func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members [
 		members = append([]uint64(nil), s.MemberRoutes...)
 	}
 	membersTotal = s.MemberRoutesTotal
+	groupID = s.GroupID
 	return
 }
 
@@ -298,6 +314,16 @@ type MatrixRow struct {
 	// Snapshot consumers should treat MemberRoutes as the visible
 	// prefix of this list when MemberRoutesTotal > len(MemberRoutes).
 	MemberRoutesTotal uint64
+
+	// RaftGroupID + LeaderTerm carry the route's Raft identity at the
+	// time the column was flushed. Stamped from the per-group term
+	// snapshot SetLeaderTerm publishes (Phase 2-C+ fan-out merge
+	// uses (RouteID/BucketID, RaftGroupID, LeaderTerm, columnAt) as
+	// the dedupe key). Zero values mean "term not tracked" — emitted
+	// when no SetLeaderTerm call has been made for the group yet, or
+	// for synthetic virtual-bucket slots that span groups.
+	RaftGroupID uint64
+	LeaderTerm  uint64
 
 	Reads      uint64
 	Writes     uint64
@@ -331,12 +357,47 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 		now = time.Now
 	}
 	s := &MemSampler{
-		opts:    opts,
-		now:     now,
-		history: newRingBuffer(opts.HistoryColumns),
+		opts:       opts,
+		now:        now,
+		history:    newRingBuffer(opts.HistoryColumns),
+		groupTerms: map[uint64]uint64{},
 	}
 	s.table.Store(newEmptyRouteTable())
 	return s
+}
+
+// SetLeaderTerm publishes the current Raft leader term for the given
+// group. Called by main.go on a periodic ticker that polls the engine
+// Status, and on every term-change observed via the engine. Phase 2-C+
+// stamps each MatrixRow's LeaderTerm from this snapshot at Flush time.
+//
+// Calling with term == 0 is allowed but treated as "term unknown"
+// during merge — the canonical (groupID, term) dedupe key collapses
+// to the legacy max-merge for cells whose LeaderTerm is 0. This lets
+// nodes that have not finished engine startup contribute partial data
+// without poisoning the merge.
+//
+// nil-receiver-safe.
+func (s *MemSampler) SetLeaderTerm(groupID, term uint64) {
+	if s == nil {
+		return
+	}
+	s.groupTermsMu.Lock()
+	defer s.groupTermsMu.Unlock()
+	s.groupTerms[groupID] = term
+}
+
+// snapshotGroupTerms returns a copy of the per-group term map. Called
+// at the top of Flush so the column built below sees a stable view
+// of the term mapping even if SetLeaderTerm fires concurrently.
+func (s *MemSampler) snapshotGroupTerms() map[uint64]uint64 {
+	s.groupTermsMu.RLock()
+	defer s.groupTermsMu.RUnlock()
+	out := make(map[uint64]uint64, len(s.groupTerms))
+	for g, t := range s.groupTerms {
+		out[g] = t
+	}
+	return out
 }
 
 func newEmptyRouteTable() *routeTable {
@@ -385,10 +446,18 @@ func (s *MemSampler) Observe(routeID uint64, op Op, keyLen, valueLen int) {
 }
 
 // RegisterRoute adds a (RouteID, [Start, End)) pair to the tracking
-// set. Returns true when the route gets its own slot, false when the
+// set. groupID is the Raft group the route belongs to; it is stamped
+// onto every MatrixRow this slot eventually emits so the Phase 2-C+
+// fan-out merge can dedupe write samples by (groupID, leaderTerm).
+// Pass 0 when the deployment doesn't use multiple groups (legacy /
+// single-group setups); the legacy max-merge fallback handles those.
+//
+// Returns true when the route gets its own slot, false when the
 // MaxTrackedRoutes cap was hit and the route was folded into a
 // virtual aggregate bucket. Idempotent: calling twice with the same
-// RouteID is a no-op (the original slot stays in place).
+// RouteID is a no-op (the original slot stays in place; a different
+// groupID on the second call is silently ignored — RegisterRoute is
+// not the right API to retag a slot, RemoveRoute + RegisterRoute is).
 //
 // If a previous RemoveRoute(routeID) queued a deferred member-prune
 // and the route is now re-registered into the SAME bucket inside the
@@ -397,7 +466,7 @@ func (s *MemSampler) Observe(routeID uint64, op Op, keyLen, valueLen int) {
 // attributing fresh traffic to it. Prunes for different buckets (or
 // when the route rejoins as an individual slot) are left alone so
 // the old bucket's MemberRoutes is correctly cleaned up.
-func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
+func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID uint64) bool {
 	if s == nil {
 		return false
 	}
@@ -418,6 +487,7 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 		if slot == nil {
 			slot = &routeSlot{
 				RouteID:           routeID,
+				GroupID:           groupID,
 				Start:             cloneBytes(start),
 				End:               cloneBytes(end),
 				MemberRoutesTotal: 1,
@@ -431,6 +501,7 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte) bool {
 			// counts split across them. Refresh the metadata fields to
 			// match the new registration; counters are preserved.
 			slot.metaMu.Lock()
+			slot.GroupID = groupID
 			slot.Start = cloneBytes(start)
 			slot.End = cloneBytes(end)
 			slot.MemberRoutesTotal = 1
@@ -601,14 +672,21 @@ func (s *MemSampler) Flush() {
 		return
 	}
 	col := MatrixColumn{At: s.now()}
+	// Snapshot the per-group leader-term map once at the top of
+	// Flush so every row in this column sees a consistent view, even
+	// if SetLeaderTerm fires concurrently. Later rows can never
+	// observe a *newer* term than earlier rows in the same column,
+	// which preserves the merge-side invariant that all rows in a
+	// (groupID, columnAt) tuple share a single leaderTerm value.
+	terms := s.snapshotGroupTerms()
 	tbl := s.table.Load()
 	for _, slot := range tbl.sortedSlots {
-		col.Rows = appendDrainedRow(col.Rows, slot)
+		col.Rows = appendDrainedRow(col.Rows, slot, terms)
 	}
 
 	grace := s.graceWindow()
 	s.retiredMu.Lock()
-	s.retiredSlots = drainRetiredSlots(s.retiredSlots, &col.Rows, col.At, grace)
+	s.retiredSlots = drainRetiredSlots(s.retiredSlots, &col.Rows, col.At, grace, terms)
 	s.pendingPrunes = advancePendingPrunes(s.pendingPrunes, col.At, grace)
 	s.retiredMu.Unlock()
 
@@ -628,10 +706,10 @@ func (s *MemSampler) Flush() {
 // this final drain. The dropped tail of the backing array is zeroed
 // so released *routeSlot pointers do not stay GC-reachable through
 // the reused capacity.
-func drainRetiredSlots(retired []retiredSlot, rows *[]MatrixRow, now time.Time, grace time.Duration) []retiredSlot {
+func drainRetiredSlots(retired []retiredSlot, rows *[]MatrixRow, now time.Time, grace time.Duration, terms map[uint64]uint64) []retiredSlot {
 	keep := retired[:0]
 	for _, r := range retired {
-		*rows = appendDrainedRow(*rows, r.slot)
+		*rows = appendDrainedRow(*rows, r.slot, terms)
 		if now.Sub(r.retiredAt) < grace {
 			keep = append(keep, r)
 		}
@@ -825,7 +903,7 @@ func (s *MemSampler) HistoryColumns() int {
 // MatrixRow when any counter was non-zero. Idle slots are skipped.
 // Metadata is read under the slot's metaMu so a concurrent
 // RegisterRoute fold cannot race with the row materialisation.
-func appendDrainedRow(rows []MatrixRow, slot *routeSlot) []MatrixRow {
+func appendDrainedRow(rows []MatrixRow, slot *routeSlot, terms map[uint64]uint64) []MatrixRow {
 	reads := slot.reads.Swap(0)
 	writes := slot.writes.Swap(0)
 	readBytes := slot.readBytes.Swap(0)
@@ -833,9 +911,11 @@ func appendDrainedRow(rows []MatrixRow, slot *routeSlot) []MatrixRow {
 	if reads == 0 && writes == 0 && readBytes == 0 && writeBytes == 0 {
 		return rows
 	}
-	start, end, aggregate, members, membersTotal := slot.snapshotMeta()
+	start, end, aggregate, members, membersTotal, groupID := slot.snapshotMeta()
 	return append(rows, MatrixRow{
 		RouteID:           slot.RouteID,
+		RaftGroupID:       groupID,
+		LeaderTerm:        terms[groupID],
 		Start:             start,
 		End:               end,
 		Aggregate:         aggregate,
