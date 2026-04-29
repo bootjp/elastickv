@@ -180,10 +180,21 @@ Envelope format (single byte stream, stored as the Pebble value):
   +-------------+----------------+----------------+
   ```
 
-  - `node_id` — the 16-bit Raft member ID assigned at cluster
-    bootstrap. Never reused for a different node within the
-    cluster's lifetime; verified at process start against the
-    membership snapshot.
+  - `node_id` — the lower 16 bits of
+    `internal/raftengine/etcd/peers.go::DeriveNodeID(--raftId)`,
+    which today returns the FNV-64a hash of the raft-id string
+    as a `uint64`. Truncation rule: `node_id := uint16(DeriveNodeID(raftID))`.
+    On every process start the encryption package reads the
+    current Raft membership snapshot and asserts that **no two
+    voting members share the same lower-16-bit value of their
+    derived node ID** — refuses to start with
+    `ErrNodeIDCollision` otherwise (see §9.1). The check is at
+    most O(num_voting_members²) comparisons (single-digit
+    cluster sizes today); the cost is paid once at boot. For
+    elastickv's current `"n1"`/`"n2"`/`"n3"` ID convention the
+    16-bit values are well-distributed and collisions are
+    practically impossible, but the assertion makes the nonce
+    uniqueness invariant unconditional rather than statistical.
   - `local_epoch` — 16-bit per-DEK process-load counter,
     persisted in the local sidecar (§5.1). Incremented and
     fsync'd **before** the new process performs any encryption,
@@ -193,7 +204,16 @@ Envelope format (single byte stream, stored as the Pebble value):
     triggers (§5.2) reset it to 0 with the new DEK. The
     encryption package logs a warning when `local_epoch >
     0xff00` so an operator has a 256-restart cushion to rotate
-    before wrap.
+    before wrap; if the operator ignores all 256 warnings and the
+    epoch reaches `0xFFFF`, the process **refuses to start**
+    with `ErrLocalEpochExhausted` (see §9.1). The hard stop is
+    load-bearing: a wrap to 0 would re-issue the nonce
+    `node_id ‖ 0 ‖ 0` for the current DEK's first write of the
+    new process load, exactly matching the very first nonce ever
+    issued under that DEK — a catastrophic AES-GCM nonce reuse
+    (key recovery + plaintext XOR). DEK rotation (§5.2) is the
+    only recovery; it allocates a new DEK with a fresh
+    `local_epoch = 0`.
   - `write_count` — 64-bit `atomic.Uint64`, incremented per
     write within the current process. Resets to 0 on process
     start (the `local_epoch` bump is what makes that safe).
@@ -407,14 +427,22 @@ Two-tier hierarchy:
   written under a DEK whose wrap is then lost, the sidecar write
   protocol is:
 
-  1. Write the new contents to `<dataDir>/encryption/keys.json.tmp`.
-  2. `file.Sync()` on the temp file (fsync the data + metadata).
+  1. Build the new sidecar contents in memory, including
+     `raft_applied_index = <log index of the rotation entry being
+     applied right now>` — this is part of the same JSON payload
+     as the new wrapped DEKs, written in the same step 2 below.
+  2. Write the new contents to `<dataDir>/encryption/keys.json.tmp`,
+     then `file.Sync()` (fsync the data + metadata).
   3. `os.Rename` to `keys.json`.
   4. `dir.Sync()` on `<dataDir>/encryption/` (fsync the directory
      entry so the rename is durable).
   5. Only after step 4 does the FSM acknowledge the rotation entry
-     as applied (and update `raft_applied_index` in memory; that
-     value is then persisted on the next sidecar write).
+     as applied. The in-memory `raft_applied_index` matches the
+     value that has just been durably written; **no deferred-write
+     window** in which the on-disk sidecar carries new DEKs but a
+     stale index. This eliminates the spurious-`ErrSidecarBehindRaftLog`
+     race that an "update on next write" scheme would create on a
+     crash between steps 4 and the next rotation.
 
   Skipping step 2 or 4 turns a power loss into permanent data loss
   for any value written under the new DEK; the §10 self-review
@@ -643,9 +671,17 @@ rewrite."
 - `kek/` subpackage — pluggable KEK providers (`file.go`, `awskms.go`,
   `gcpkms.go`, `vault.go`, `env.go`). Each implements
   `Wrap(dek []byte) (wrapped []byte, error)` and `Unwrap(wrapped
-  []byte) (dek []byte, error)`.
-- `sidecar.go` — atomic read/write of `keys.json` (write to
-  `keys.json.tmp` + `os.Rename`).
+  []byte) (dek []byte, error)`. The `env.go` provider must call
+  `os.Unsetenv("ELASTICKV_KEK_BASE64")` immediately after reading
+  and decoding the value to narrow the window during which the
+  raw KEK material is visible via `/proc/<pid>/environ` /
+  container env inspection. (The recommendation in §5.1 stands:
+  `env.go` is for tests and CI only, not production.)
+- `sidecar.go` — read/write of `keys.json` per the **§5.1
+  crash-durable write protocol** (write tmp → `file.Sync()` →
+  `os.Rename` → `dir.Sync()` → ack). Skipping any of these
+  fsyncs is a data-loss-class bug per §10 lens 1; do not
+  shortcut to a plain `os.Rename`.
 
 ### 6.2 Hooks into the storage layer
 
@@ -666,11 +702,23 @@ coordinator does not pre-encrypt; the FSM does not bypass this path.
   (`[tombstone(1)] [expireAt(8)] [user_value...]`, see
   `encodeValue`) is extended so the leading byte encodes both the
   tombstone bit (bit 0) and the encryption-state bits (bits 1–2),
-  matching the 2-bit field in §7.1. Existing builds use only bit 0,
-  so an old build reading a value written by an encryption-enabled
-  build sees an unrecognised tombstone byte and refuses to serve it
-  rather than returning ciphertext as cleartext. `valueHeaderSize`
-  stays at 9 bytes; no on-disk layout shift.
+  matching the 2-bit field in §7.1. `valueHeaderSize` stays at 9
+  bytes; no on-disk layout shift. Note: today's `decodeValue`
+  reads `tombstone := data[0] != 0`, so an encrypted live value
+  (`data[0] = 0b00000010`) seen by an unmodified pre-encryption
+  build would silently appear as a tombstone (key-not-found),
+  not an error. The 3-phase rollout in §7.1 prevents this from
+  ever happening on a real cluster — encrypted writes only begin
+  after every replica has applied the
+  `enable-storage-envelope` cluster-flag entry, which by
+  precondition requires every voting member to be on a binary
+  that knows the new bit layout. The §9.1 startup refusal "data
+  dir contains a sidecar but `--encryption-enabled` is not set"
+  is the second backstop. The implementation PR must add a
+  comment to `encodeValue` / `decodeValue` pinning bit 0 =
+  tombstone, bits 1–2 = `encryption_state`, bits 3–7 reserved,
+  so future bit additions don't accidentally clobber the
+  layout.
 - `store/snapshot_pebble.go` — no change. It iterates Pebble values
   byte-for-byte, which are already ciphertext (with the
   `encryption_state` bit travelling in the value header).
@@ -859,13 +907,29 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    cleartext Raft entries (raft envelope is gated on a separate
    flag in Phase 2).
 2. Each upgraded node advertises `encryption_capable = true` in
-   its periodic Raft heartbeat metadata (a new field on the
-   peer-metadata payload added by `peer_metadata.go`). The flag
-   is purely informational at this point.
-3. When the membership snapshot of every Raft group shows
-   `encryption_capable = true` for every voting member, Phase 0
-   is complete. `encryption status` reports the capability
-   coverage so the operator can wait for it before moving on.
+   the **peer-metadata extension** that today already piggy-backs
+   on the etcd-raft heartbeat path
+   (`internal/raftengine/etcd/peer_metadata.go`). A new
+   `encryption_capable bool` field is added to the existing
+   `PeerMetadata` proto; old binaries omit the field, which
+   protobuf decodes as the zero value (`false`), so unscanned
+   non-upgraded peers default to `not capable` without any
+   special handling. The flag is purely informational at this
+   point.
+3. The Phase-1 and Phase-2 cutover commands
+   (`enable-storage-envelope`, `enable-raft-envelope`) **do not**
+   read cached `encryption_capable` state from the local
+   keystore. Instead they force a fresh poll: the leader sends a
+   heartbeat to every voting member of every Raft group and
+   blocks until it has received a heartbeat response carrying
+   `encryption_capable = true` from every member, all within one
+   election timeout (configurable; default the existing
+   `RaftElectionTimeout`). If any member is unreachable or
+   reports `false` within the window, the command returns
+   `ErrCapabilityCheckFailed` with the offending node IDs and
+   the operator must re-run after fixing them. Stale cached
+   capability state therefore cannot trigger a premature
+   cutover.
 
 **Phase 1 — Storage envelope cluster-flag flip.**
 
@@ -903,14 +967,33 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    Replicas dispatch on the **Raft log index** of the entry
    relative to the persisted `raft_envelope_cutover_index` (the
    apply index of the flag entry, recorded in the local sidecar
-   on apply). Entries below the cutover index are decoded via
-   the existing first-byte tag space (`0x00` single-request,
-   `0x01` batch, `0x02` HLC-lease, etc.); entries at-or-above
-   the cutover index are unwrapped through the raft envelope
-   first. This explicitly avoids re-using `kv/fsm.go`'s existing
-   first-byte tag values for the "is this an envelope?"
-   discriminator — that re-use would make pre-cutover batch
-   entries (`0x01`) ambiguous during WAL replay.
+   on apply). Concretely, the FSM apply path becomes:
+
+   ```text
+   Apply(index, data):
+     if index >= raft_envelope_cutover_index:
+       data = raftDEK.Unwrap(data)         // strip §4.2 envelope
+     // existing dispatch on data[0], unchanged from today:
+     switch data[0] {
+     case raftEncodeSingle    (0x00): decodeRaftRequests(data)
+     case raftEncodeBatch     (0x01): decodeRaftRequests(data)
+     case raftEncodeHLCLease  (0x02): applyHLCLease(data)
+     }
+   ```
+
+   The unwrap happens **before** the existing
+   `kv/fsm.go::Apply` dispatch on `raftEncodeSingle` /
+   `raftEncodeBatch` / `raftEncodeHLCLease`, so HLC ceiling
+   proposals (§4.5) are transparently decrypted then routed
+   through the existing HLC path with no special-casing in the
+   HLC handler. Crucially, this dispatch scheme **does not
+   reuse any of the existing `kv/fsm.go` first-byte tag
+   values** for the encryption discriminator — an earlier
+   draft proposed `0x00`/`0x01` framing tags but those collide
+   with `raftEncodeSingle` / `raftEncodeBatch` and would make
+   every pre-cutover batch entry (`0x01`) look like a raft
+   envelope to the FSM. Index gating sidesteps that collision
+   by construction.
 9. Snapshots taken during Phase 2 carry the cutover index in
    their metadata header so a fresh follower joining
    mid-Phase-2 reconstructs the same dispatch boundary on
@@ -1058,6 +1141,16 @@ The process refuses to start if any of the following hold:
 - The encryption package's startup membership check fails to
   resolve a stable 16-bit `node_id` (the §4.1 nonce construction
   needs one; without it nonce uniqueness cannot be guaranteed).
+- Two voting members of any Raft group share the same
+  `uint16(DeriveNodeID(raftID))` (`ErrNodeIDCollision`). One of
+  them must be re-bootstrapped under a different `--raftId` whose
+  hash truncates differently before encryption can be enabled on
+  the cluster.
+- Any active DEK in the sidecar has `local_epoch == 0xFFFF`
+  (`ErrLocalEpochExhausted`). The DEK must be rotated (§5.2)
+  before the process can resume; without rotation the next
+  `local_epoch` would wrap to 0 and re-issue a nonce that has
+  already been used under the same DEK.
 - The local sidecar's `raft_envelope_cutover_index` disagrees
   with the value carried in the most-recent ingested snapshot
   header (`ErrEnvelopeCutoverDivergence`). This catches a node
