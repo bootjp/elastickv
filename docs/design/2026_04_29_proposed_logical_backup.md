@@ -703,7 +703,26 @@ message BeginBackupResponse {
   uint64 read_ts            = 1;
   bytes  pin_token          = 2;  // opaque, must be passed back to RenewBackup / EndBackup
   uint64 ttl_ms_effective   = 3;
-  repeated ShardApplied shards = 4;  // group_id, applied_index at pin time
+  repeated ShardApplied shards = 4;  // applied_index per group at pin time
+  // Per-scope count produced by the count-only baseline scan at read_ts
+  // (see "Expected-keys baseline" below). The producer compares its
+  // own scope-level traversal count against expected_keys[i].key_count
+  // and aborts with ErrCompactionDuringDump on shortfall.
+  repeated ScopeKeyCount expected_keys = 5;
+}
+
+message ShardApplied {
+  string group_id      = 1;  // distribution.GroupID stringified
+  uint64 applied_index = 2;
+}
+
+message ScopeKeyCount {
+  // scope_id is "<adapter>/<scope-name>" e.g. "dynamodb/orders" or
+  // "s3/photos". Producer matches it against the directory it is
+  // about to write into.
+  string scope_id                = 1;
+  uint64 key_count               = 2;
+  uint64 applied_index_at_count  = 3;
 }
 
 // RenewBackup extends the deadline for an existing pin. A long-running
@@ -835,14 +854,22 @@ become eventually-consistent (versions at `read_ts` may already have
 been compacted on that replica), and the producer surfaces the
 inconsistency via a per-scope **expected-keys baseline**:
 
-> **Expected-keys baseline.** During step 1 of `BeginBackup`, before
-> the pin is installed, the admin server runs a *count-only* scan of
-> each adapter scope at `read_ts` (`ShardStore.ScanAt` with
-> `keys_only=true`, returning per-scope `(scope_id, key_count,
-> applied_index_at_count)`). The result is returned in
-> `BeginBackupResponse` and used as the contractual lower bound for
-> the producer's subsequent `BackupScanner.Next` traversal of the
-> same scope.
+> **Expected-keys baseline.** **After step 2 (every shard has applied
+> through `read_ts`) and before step 3 (the pin is installed)**, the
+> admin server runs a *count-only* scan of each adapter scope at
+> `read_ts` (`ShardStore.ScanKeysAt`, returning
+> per-scope `(scope_id, key_count, applied_index_at_count)`). The
+> ordering matters: a count-only scan run before step 2 would return
+> 0 (or a partial count) for any shard still lagging through
+> `read_ts`, producing an undercount on exactly the shards most at
+> risk of the snapshot-pin-loss corner case — and silently disabling
+> `ErrCompactionDuringDump` on those shards. Running after step 2
+> guarantees every shard has the data at `read_ts` and the count is
+> a true lower bound.
+>
+> The result is returned in `BeginBackupResponse.expected_keys` and
+> used as the contractual lower bound for the producer's subsequent
+> `BackupScanner.Next` traversal of the same scope.
 >
 > The cost is one full forward scan per scope at backup time, but
 > count-only mode skips value materialization (`*store.KVPair` with
@@ -1026,7 +1053,7 @@ elastickv-backup dump \
   [--checksums sha256] \
   [--ttl-ms 1800000] \
   [--begin-backup-deadline 5s] \
-  [--snapshot-headroom-entries 10000] \
+  [--snapshot-headroom-entries 1000] \
   [--scan-page-size 1024] \
   [--dynamodb-bundle-mode per-item|jsonl] \
   [--dynamodb-bundle-size 64MiB] \
@@ -1235,11 +1262,18 @@ written.
 - New `kv/backup_scan.go` — `BackupScanner` iterator wrapping the
   existing `ShardStore.ScanAt` (`kv/shard_store.go:106`) so multi-
   million-key ranges page through `ScanAt` calls of `--scan-page-size`
-  rather than materializing in one call. Phase 1 also extends
-  `MVCCStore.ScanAt` / `ShardStore.ScanAt` with a `keys_only bool`
-  parameter so the expected-keys baseline pass can iterate without
-  materializing values (Pebble iterator with payload trimmed at the
-  block layer; ~10× cheaper than a value-bearing scan).
+  rather than materializing in one call.
+- New `MVCCStore.ScanKeysAt` / `ShardStore.ScanKeysAt` overload
+  (returning `[][]byte` rather than `[]*KVPair`) so the expected-keys
+  baseline pass can iterate without materializing values. **Adding a
+  `keys_only bool` to the existing `ScanAt` signature would be a
+  source-incompatible Go change touching every caller** —
+  `kv/shard_store.go` alone has ~10 sites (e.g. lines 308, 326, 855)
+  plus call sites across adapters. The overload approach leaves every
+  existing caller untouched and keeps the new path obviously named
+  for what it does. Internally `ScanKeysAt` delegates to a private
+  helper that takes a `keysOnly` flag, sharing the route-resolution
+  and merge logic with the existing path.
 - Add `BeginBackupResponse.expected_keys` per scope (the count
   produced by the baseline pass at `read_ts` before the pin is
   installed) and `ErrCompactionDuringDump` in the producer when the
@@ -1306,7 +1340,8 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestRestoreWipesLocalPins` | A replica that installs a Raft snapshot during a backup loses its `BackupPin`; the producer's per-scope expected-keys baseline detects the resulting `ScanAt` shortfall (count below `99% × baseline ± sqrt(baseline)`) and fails the dump with `ErrCompactionDuringDump` rather than emitting a corrupted artifact |
 | `TestBeginBackupRefusesNearSnapshotThreshold` | When any group's `SnapshotEvery - (AppliedIndex - LastSnapshotIndex) < --snapshot-headroom-entries`, `BeginBackup` returns `FailedPrecondition` rather than starting a dump that risks the snapshot-installation path. Verify a freshly-snapshotted cluster (largest remaining headroom) is allowed |
 | `TestExpectedKeysBaselineToleratesTTLExpiry` | Routine TTL expiry between baseline and dump (1% of keys gone) does NOT trigger `ErrCompactionDuringDump`; a 5% drop DOES |
-| `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses `ScanAt` with `keys_only=true`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope |
+| `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses the new `ShardStore.ScanKeysAt`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope and that existing `ScanAt` callers are bytewise-unchanged |
+| `TestExpectedKeysBaselineRunsAfterShardCatchup` | Force shard B to lag at `BeginBackup` time; verify the baseline scan blocks until step 2 (catch-up) completes for B, so B's `expected_keys[i].key_count` is the true count at `read_ts` rather than the partial-pre-catch-up count |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
