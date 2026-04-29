@@ -1314,7 +1314,7 @@ pre-conditions and idempotency rules are different.
     string build_sha          = 2;
     bool   sidecar_present    = 3;
     uint64 full_node_id       = 4;  // for §5.6 batch registry
-    uint32 local_epoch        = 5;  // for §5.6 batch registry
+    uint32 local_epoch        = 5;  // 16-bit value -- see decode rule
   }
   message SidecarStateReport {
     map<uint32, bytes>  wrapped_deks_by_id        = 1; // every unretired DEK
@@ -1323,11 +1323,25 @@ pre-conditions and idempotency rules are different.
     bool                storage_envelope_active    = 4;
     uint64              raft_envelope_cutover_index = 5;
     uint64              latest_applied_index       = 6;
-    map<uint32, uint32> writer_registry_for_caller = 7; // dek_id → last_seen_local_epoch for caller's uint16(node_id), used by §5.5 to forbid local_epoch rollback after resync
+    map<uint32, uint32> writer_registry_for_caller = 7; // dek_id → last_seen_local_epoch for caller's uint16(node_id), 16-bit value
   }
   rpc GetCapability(Empty) returns (CapabilityReport);
   rpc GetSidecarState(Empty) returns (SidecarStateReport);
   ```
+
+  **`local_epoch` wire-type rule.** The §4.1 nonce field
+  reserves 16 bits for `local_epoch`; protobuf has no native
+  `uint16`, so the wire type is `uint32` to keep the schema
+  language-portable. Every decode site MUST validate `value
+  <= 0xFFFF` and return `ErrLocalEpochOutOfRange` otherwise.
+  Without this validation, a corrupted or maliciously-crafted
+  RPC response carrying a value above `0xFFFF` would silently
+  truncate when copied into the 16-bit nonce field, breaking
+  the §4.1 monotonicity invariant and re-issuing previously-
+  used nonces — exactly the rollback failure mode that
+  `ErrLocalEpochRollback` was added to prevent. The rule
+  applies symmetrically to `CapabilityReport.local_epoch` and
+  to every value in `SidecarStateReport.writer_registry_for_caller`.
 
   `GetSidecarState` is the §5.5 compaction-fallback RPC: any
   node can request the leader's full encryption state to
@@ -1797,17 +1811,35 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
 
    ```text
    leader_enable_raft_envelope():
-     1. block new proposal intake at the engine.Propose entrypoint
-        (return ErrEnvelopeCutoverInProgress to coordinator)
+     1. block new USER proposal intake at engine.Propose
+        (return ErrEnvelopeCutoverInProgress to client coordinators).
+        The block is keyed on a per-call "source" tag the
+        coordinator already passes; the encryption-admin path that
+        proposes the cutover entry below uses source = "encryption_admin"
+        and bypasses the gate. Without this exemption, step 3 below
+        would reject its own cutover proposal and the cluster would
+        stay stuck in a write-rejecting barrier forever.
      2. wait for the in-flight proposal queue to drain (all
         previously-accepted proposals committed and applied)
-     3. propose the enable-raft-envelope entry (raftEncodeEncryptionRotation
-        = 0x05, NOT raft-DEK-wrapped — see below)
+     3. encryption-admin path proposes the enable-raft-envelope
+        entry (raftEncodeEncryptionRotation = 0x05, NOT
+        raft-DEK-wrapped — see below). Because this call carries
+        source = "encryption_admin" the step-1 gate lets it
+        through.
      4. wait for that entry to commit AND for the local FSM
         apply to set raft_envelope_cutover_index in the sidecar
      5. flip the leader's "wrap on Propose" switch to true
-     6. unblock proposal intake
+     6. unblock USER proposal intake
    ```
+
+   The narrower "user vs encryption-admin" gate (rather than a
+   global Propose mutex) is the load-bearing detail: a global
+   gate would deadlock the cluster on its own cutover proposal.
+   The same source-tag exemption applies to any future internal
+   proposal that must be issued during a quiesced cutover —
+   for example, a `RegisterEncryptionWriter` triggered by
+   `ConfChangeAddLearner` mid-cutover (§4.1 fourth path) also
+   uses `source = "encryption_admin"` and bypasses the gate.
 
    Without the barrier, in a busy leader cleartext proposals
    accepted between step 3 (proposing the cutover entry) and
@@ -2152,6 +2184,14 @@ The process refuses to start if any of the following hold:
   already been used under the same DEK. Recovery is either a
   manual `local_epoch` bump above the registry record or a
   DEK rotation (which retires the registry slice).
+- Any `local_epoch` value received over the
+  `EncryptionAdmin.GetCapability` or
+  `EncryptionAdmin.GetSidecarState` RPCs exceeds `0xFFFF`
+  (`ErrLocalEpochOutOfRange`). The wire type is `uint32` for
+  language portability per §6.1, but the §4.1 nonce field
+  reserves only 16 bits; silently truncating a larger value
+  would break the monotonic-epoch invariant that prevents
+  nonce reuse.
 - The local sidecar's `raft_envelope_cutover_index` disagrees
   with the value carried in the most-recent ingested snapshot
   header (`ErrEnvelopeCutoverDivergence`). This catches a node
