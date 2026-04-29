@@ -280,11 +280,28 @@ Envelope format (single byte stream, stored as the Pebble value):
     1. If no entry exists at the registry key → insert,
        allowing the registration. The node may now write under
        this DEK.
-    2. If an entry exists with the **same** `full_node_id` →
-       this is a re-registration (post-restart). Bump
-       `last_seen_local_epoch` and allow. The node was already
-       a legitimate writer.
-    3. If an entry exists with a **different** `full_node_id`
+    2. If an entry exists with the **same** `full_node_id`
+       AND the proposed `local_epoch` is **strictly greater
+       than** the registry's `last_seen_local_epoch` → this is
+       a legitimate re-registration (post-restart with a
+       freshly-incremented epoch per §5.1). Bump
+       `last_seen_local_epoch` to the proposed value and allow.
+    3. If an entry exists with the **same** `full_node_id` but
+       the proposed `local_epoch` is **less than or equal to**
+       the registry's `last_seen_local_epoch` → reject with
+       `ErrLocalEpochRollback` and the proposing node refuses
+       to start. This is the load-bearing check against
+       restoring a node from a stale disk / backup snapshot:
+       without it, the restored node would re-issue nonces
+       `node_id ‖ stale_local_epoch ‖ {0,1,2,...}` that have
+       already been used under the same DEK in the cluster's
+       lifetime — a catastrophic AES-GCM nonce reuse. Recovery
+       requires either (a) the operator manually re-fsyncs the
+       sidecar's `local_epoch` to a value above the registry
+       record, or (b) DEK rotation, which retires the registry
+       slice and starts the per-(node, DEK) counter at a fresh
+       baseline.
+    4. If an entry exists with a **different** `full_node_id`
        → reject the registration with `ErrNodeIDCollision`.
        The proposing node refuses to start; the operator must
        choose a different `--raftId` whose hash truncates
@@ -1058,22 +1075,52 @@ To detect and repair sidecar-vs-log divergence:
        active_storage_id (uint32), active_raft_id (uint32),
        storage_envelope_active (bool),
        raft_envelope_cutover_index (uint64),
-       latest_applied_index (uint64) }`
+       latest_applied_index (uint64),
+       writer_registry_for_caller (map<uint32, uint16>) }`
      against the current leader. The leader serializes its
      in-memory keystore (every unretired DEK, all wrapped
      under the current KEK) plus the active flags and the
      cutover index, and the recovering follower writes that
      full snapshot into its sidecar via the §5.1 crash-
-     durable protocol. The fallback is **authoritative** —
-     any local divergence is overwritten — which is safe
+     durable protocol.
+
+     **Per-DEK `local_epoch` is NOT taken from the response —
+     it is re-derived locally to forbid rollback.** The
+     leader's `local_epoch` values are its own and have no
+     bearing on the follower's nonce uniqueness. For each DEK
+     `D` in the response, the recovering follower computes:
+
+     ```text
+     new_local_epoch[D] = max(
+         existing_sidecar.local_epoch[D],     // pre-resync state, may be 0 if D is new to this follower
+         response.writer_registry_for_caller[D],  // last_seen_local_epoch the leader recorded for THIS follower under D
+     ) + 1
+     ```
+
+     and writes that as the new sidecar `local_epoch[D]`. The
+     `+1` increment is the same crash-safe step §5.1 performs
+     on every process start; layering it on top of the
+     leader-recorded `last_seen_local_epoch` guarantees the
+     post-resync value is **strictly above** any nonce ever
+     issued by this follower under `D` in the cluster's
+     lifetime, even if the local sidecar was rolled back to
+     before resync. The §4.1 re-registration check (case 3,
+     `ErrLocalEpochRollback`) then enforces this monotonicity
+     at the next `RegisterEncryptionWriter` round-trip.
+
+     The fallback is **authoritative for the wrapped-DEK and
+     cluster-flag fields** — any local divergence there is
+     overwritten — but `local_epoch` is computed
+     monotonically from both sides as above. This is safe
      because the recovering node was already behind and has
-     no committed-but-unapplied state to lose. The recovered
-     `raft_applied_index` is set to `latest_applied_index`
-     from the response so the next startup check passes.
-     Without this fallback an operator who left a node
-     offline through a snapshot retention window would see
-     `ErrSidecarBehindRaftLog` with no recovery path short
-     of re-bootstrapping the data dir.
+     no committed-but-unapplied writes to lose; new writes
+     after resync are guaranteed never to repeat a previous
+     nonce. The recovered `raft_applied_index` is set to
+     `latest_applied_index` from the response so the next
+     startup check passes. Without this fallback an operator
+     who left a node offline through a snapshot retention
+     window would see `ErrSidecarBehindRaftLog` with no
+     recovery path short of re-bootstrapping the data dir.
    Refusing to start until recovery completes is deliberate:
    silently serving with an incomplete sidecar would let the
    node write under one `key_id` while failing to decrypt
@@ -1219,12 +1266,13 @@ pre-conditions and idempotency rules are different.
     uint32 local_epoch        = 5;  // for §5.6 batch registry
   }
   message SidecarStateReport {
-    map<uint32, bytes> wrapped_deks_by_id    = 1; // every unretired DEK
-    uint32             active_storage_id      = 2;
-    uint32             active_raft_id         = 3;
-    bool               storage_envelope_active = 4;
-    uint64             raft_envelope_cutover_index = 5;
-    uint64             latest_applied_index   = 6;
+    map<uint32, bytes>  wrapped_deks_by_id        = 1; // every unretired DEK
+    uint32              active_storage_id          = 2;
+    uint32              active_raft_id             = 3;
+    bool                storage_envelope_active    = 4;
+    uint64              raft_envelope_cutover_index = 5;
+    uint64              latest_applied_index       = 6;
+    map<uint32, uint32> writer_registry_for_caller = 7; // dek_id → last_seen_local_epoch for caller's uint16(node_id), used by §5.5 to forbid local_epoch rollback after resync
   }
   rpc GetCapability(Empty) returns (CapabilityReport);
   rpc GetSidecarState(Empty) returns (SidecarStateReport);
@@ -1652,22 +1700,62 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
 **Phase 2 — Raft envelope cluster-flag flip.**
 
 7. Operator runs `elastickv-admin encryption enable-raft-envelope`.
-   The leader rechecks the same capability gate, then proposes a
-   single Raft entry with the cluster-wide flag
-   `raft_envelope_active = true` carried in the
-   `raftEncodeEncryptionRotation = 0x05` payload. This entry is
-   sent **without the §4.2 raft envelope wrapping** — Phase 2
-   has not yet started for it (the engine hook in §6.3 fires
-   only when `index > raft_envelope_cutover_index`, and the
-   cutover index is set to this entry's own index by its FSM
-   apply, so the comparison is false at exactly this index).
-   It is therefore not "decodable by any replica that has
-   applied entries up to it" — that earlier wording was
-   misleading because old binaries cannot decode `0x05` at
-   all. The actual safety guarantee is the Phase 0 capability
-   gate from step 3: every member (voters and learners) must
-   already be on a binary that knows the `0x04`/`0x05` tag
-   space before this entry is proposed.
+   The leader rechecks the same capability gate, then enters a
+   **proposal-quiescence barrier** before proposing the cutover
+   entry:
+
+   ```text
+   leader_enable_raft_envelope():
+     1. block new proposal intake at the engine.Propose entrypoint
+        (return ErrEnvelopeCutoverInProgress to coordinator)
+     2. wait for the in-flight proposal queue to drain (all
+        previously-accepted proposals committed and applied)
+     3. propose the enable-raft-envelope entry (raftEncodeEncryptionRotation
+        = 0x05, NOT raft-DEK-wrapped — see below)
+     4. wait for that entry to commit AND for the local FSM
+        apply to set raft_envelope_cutover_index in the sidecar
+     5. flip the leader's "wrap on Propose" switch to true
+     6. unblock proposal intake
+   ```
+
+   Without the barrier, in a busy leader cleartext proposals
+   accepted between step 3 (proposing the cutover entry) and
+   step 5 (flipping the wrap-on-propose switch) could be
+   appended at indexes `> raft_envelope_cutover_index` without
+   being raft-DEK-wrapped. Followers would then dispatch them
+   through the `index > cutover` branch of the engine hook
+   (§6.3), attempt `raftDEK.Unwrap` on cleartext, and fail
+   every apply with a GCM verification error. The barrier is
+   the only place in the design that intentionally blocks the
+   proposal path; expected duration is one Raft commit RTT
+   (single-digit milliseconds in a healthy cluster).
+
+   The Phase 1 `enable-storage-envelope` cutover does **not**
+   need the same barrier because storage encryption is decided
+   at **FSM apply time** (each replica's own
+   `lsm_store.go::PutAt` checks the local sidecar's
+   `storage_envelope_active` flag) rather than at proposal
+   time. Every replica deterministically applies the cutover
+   entry before any later entry, so the per-Put encryption
+   decision is consistent across the cluster without an
+   intake-side barrier. The asymmetry follows from where each
+   envelope is applied: storage envelope at apply (per-Put,
+   per-replica), raft envelope at propose (per-proposal,
+   leader-only).
+
+   The cutover entry itself is sent **without the §4.2 raft
+   envelope wrapping** — Phase 2 has not yet started for it
+   (the engine hook in §6.3 fires only when `index >
+   raft_envelope_cutover_index`, and the cutover index is set
+   to this entry's own index by its FSM apply, so the
+   comparison is false at exactly this index). It is therefore
+   not "decodable by any replica that has applied entries up
+   to it" — that earlier wording was misleading because old
+   binaries cannot decode `0x05` at all. The actual safety
+   guarantee is the Phase 0 capability gate from step 3:
+   every member (voters and learners) must already be on a
+   binary that knows the `0x04`/`0x05` tag space before this
+   entry is proposed.
 8. From the **next** entry after the flag entry's apply index
    onward, every leader wraps new proposal `Data []byte` with
    the raft DEK (§4.2). The flag entry itself is **not**
@@ -1954,6 +2042,17 @@ The process refuses to start if any of the following hold:
   before the process can resume; without rotation the next
   `local_epoch` would wrap to 0 and re-issue a nonce that has
   already been used under the same DEK.
+- The local sidecar's `local_epoch` for any active DEK is
+  **less than or equal to** the writer-registry's
+  `last_seen_local_epoch` for this node under that DEK
+  (`ErrLocalEpochRollback`, surfaced from §4.1 re-registration
+  case 3). This catches a node restored from a stale disk or
+  backup snapshot whose `local_epoch` has rolled back; without
+  the check the node would re-issue
+  `node_id ‖ stale_local_epoch ‖ {0,1,...}` nonces that have
+  already been used under the same DEK. Recovery is either a
+  manual `local_epoch` bump above the registry record or a
+  DEK rotation (which retires the registry slice).
 - The local sidecar's `raft_envelope_cutover_index` disagrees
   with the value carried in the most-recent ingested snapshot
   header (`ErrEnvelopeCutoverDivergence`). This catches a node
