@@ -1389,12 +1389,21 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    This sequencing is mandatory — flipping the flag without a
    committed cluster-wide DEK pair would let each replica
    encrypt under its own locally-generated `key_id` and break
-   snapshot/catch-up decryption. The flag entry's `Data []byte`
-   is the **legacy framing** (i.e., the existing `kv/fsm.go`
-   first-byte tag space; see Phase 2's note below) so every
-   replica — even one that somehow missed the capability
-   advert — can still decode and apply it. The bootstrap entry
-   is similarly in legacy framing for the same reason.
+   snapshot/catch-up decryption. Both the `bootstrap-encryption`
+   entry (`raftEncodeEncryptionBootstrap = 0x04`) and the
+   `enable-storage-envelope` flag entry
+   (`raftEncodeEncryptionRotation = 0x05`) are sent **without
+   the §4.2 raft envelope wrapping** because Phase 2 has not
+   started — the cutover index is still 0, so the `index >
+   raft_envelope_cutover_index` engine hook (§6.3) never fires
+   for these entries. They reach `kv/fsm.go::Apply` as plaintext
+   bytes and dispatch through the encryption-internal cases.
+   Decoding them still requires a binary that knows the
+   `0x04`/`0x05` tag values, so the safety here is **entirely**
+   the Phase 0 capability gate from step 3 — there is no
+   "an old binary that somehow missed the advert can still
+   apply this" fallback, because old binaries fall through the
+   existing first-byte switch with no matching case.
 5. From the apply index of that flag entry onward, every storage
    layer Put writes `encryption_state = 0b01` and the §4.1
    envelope. MVCC versions written before that index keep
@@ -1412,20 +1421,30 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
 7. Operator runs `elastickv-admin encryption enable-raft-envelope`.
    The leader rechecks the same capability gate, then proposes a
    single Raft entry with the cluster-wide flag
-   `raft_envelope_active = true`. This entry itself uses the
-   legacy first-byte tag space so it remains decodable by any
-   replica that has applied entries up to it.
+   `raft_envelope_active = true` carried in the
+   `raftEncodeEncryptionRotation = 0x05` payload. This entry is
+   sent **without the §4.2 raft envelope wrapping** — Phase 2
+   has not yet started for it (the engine hook in §6.3 fires
+   only when `index > raft_envelope_cutover_index`, and the
+   cutover index is set to this entry's own index by its FSM
+   apply, so the comparison is false at exactly this index).
+   It is therefore not "decodable by any replica that has
+   applied entries up to it" — that earlier wording was
+   misleading because old binaries cannot decode `0x05` at
+   all. The actual safety guarantee is the Phase 0 capability
+   gate from step 3: every voting member must already be on a
+   binary that knows the `0x04`/`0x05` tag space before this
+   entry is proposed.
 8. From the **next** entry after the flag entry's apply index
    onward, every leader wraps new proposal `Data []byte` with
    the raft DEK (§4.2). The flag entry itself is **not**
-   wrapped — step 7 wrote it in legacy first-byte framing so
-   every replica (including a defensive non-upgraded one) can
-   still apply it. **There is no in-band format tag in the
-   proposal payload.** Replicas dispatch on the **Raft log
-   index** of the entry relative to the persisted
-   `raft_envelope_cutover_index` (the apply index of the flag
-   entry, recorded in the local sidecar on apply). Concretely,
-   the FSM apply path becomes:
+   wrapped — step 7 wrote it un-wrapped so the engine hook can
+   pass it straight to FSM apply. **There is no in-band
+   format tag in the proposal payload.** Replicas dispatch on
+   the **Raft log index** of the entry relative to the
+   persisted `raft_envelope_cutover_index` (the apply index of
+   the flag entry, recorded in the local sidecar on apply).
+   Concretely, the FSM apply path becomes:
 
    ```text
    // Lives in internal/raftengine/etcd/engine.go (§6.3 hook).
