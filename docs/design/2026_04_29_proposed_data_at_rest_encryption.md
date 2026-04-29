@@ -169,16 +169,45 @@ Envelope format (single byte stream, stored as the Pebble value):
 - `key_id` — 32-bit identifier of the DEK that produced this
   ciphertext. Required so a rotated DEK can decrypt entries written
   before the rotation (see §5.2).
-- `nonce` — 12-byte AES-GCM nonce. To stay clear of the NIST SP
-  800-38D limit on randomly-generated 96-bit nonces (§5.2 derives
-  the budget), elastickv issues nonces from a **per-DEK 96-bit
-  counter** rather than a fresh `crypto/rand.Reader` draw per write.
-  The counter's high 32 bits are a per-process random prefix
-  (re-drawn whenever the DEK is loaded, so two processes that share
-  a DEK never collide), and the low 64 bits are an `atomic.Uint64`
-  incremented per write. This makes nonce reuse impossible within
-  the lifetime of a (DEK, process-load) pair and removes the
-  birthday-bound budget entirely.
+- `nonce` — 12-byte AES-GCM nonce, structured as **three
+  deterministic fields** to eliminate the birthday bound entirely.
+  No bits of the nonce are random; nonce uniqueness is by
+  construction across `(node, process_load, write)`:
+
+  ```text
+  +-------------+----------------+----------------+
+  | node_id(2B) | local_epoch(2B)| write_count(8B)|
+  +-------------+----------------+----------------+
+  ```
+
+  - `node_id` — the 16-bit Raft member ID assigned at cluster
+    bootstrap. Never reused for a different node within the
+    cluster's lifetime; verified at process start against the
+    membership snapshot.
+  - `local_epoch` — 16-bit per-DEK process-load counter,
+    persisted in the local sidecar (§5.1). Incremented and
+    fsync'd **before** the new process performs any encryption,
+    so a crash between increment and the first write still leaves
+    the on-disk counter ahead of any nonce ever used. Wraps at
+    65,536 process restarts per node per DEK lifetime; rotation
+    triggers (§5.2) reset it to 0 with the new DEK. The
+    encryption package logs a warning when `local_epoch >
+    0xff00` so an operator has a 256-restart cushion to rotate
+    before wrap.
+  - `write_count` — 64-bit `atomic.Uint64`, incremented per
+    write within the current process. Resets to 0 on process
+    start (the `local_epoch` bump is what makes that safe).
+    Wrap is unreachable in any realistic deployment (2⁶⁴ ≈
+    1.8 × 10¹⁹ writes per process-load).
+
+  An earlier draft used a 32-bit CSPRNG-drawn prefix for the
+  high half of the nonce; that has been retracted because a
+  random 32-bit value across N process loads carries an N²/2³³
+  birthday-collision probability (~1 in 10⁷ at N=30 over a
+  multi-year DEK lifetime), and a single nonce collision under
+  one DEK is a catastrophic AES-GCM failure (key-recovery + XOR
+  of two plaintexts). The deterministic construction above has
+  zero collision probability under its preconditions.
 - `ciphertext` — AES-256-GCM(plaintext, nonce, AAD = envelope_version
   ‖ flag ‖ key_id). AAD binds the ciphertext to the **entire**
   envelope header — including the compression flag — so a
@@ -332,9 +361,11 @@ Two-tier hierarchy:
     "active": { "storage": 305419896, "raft": 2596069104 },
     "keys": {
       "305419896":  { "purpose": "storage", "wrapped": "<base64>",
-                      "created": "2026-04-29T10:00:00Z" },
+                      "created": "2026-04-29T10:00:00Z",
+                      "local_epoch": 7 },
       "2596069104": { "purpose": "raft",    "wrapped": "<base64>",
-                      "created": "2026-04-29T10:00:00Z" }
+                      "created": "2026-04-29T10:00:00Z",
+                      "local_epoch": 7 }
     }
   }
   ```
@@ -352,6 +383,35 @@ Two-tier hierarchy:
     recent rotation entry that has been persisted into this
     sidecar. It is the load-bearing field for the
     sidecar/log-index reconciliation protocol in §5.5.
+  - `local_epoch` is the per-DEK process-load counter consumed by
+    the §4.1 nonce construction. Bumped and durably persisted on
+    every process start before any encryption happens with that
+    DEK; reset to 0 when the DEK is created.
+
+  **Crash-durable write protocol.** `os.Rename` is atomic for
+  visibility but not crash-durable on its own — a power loss after
+  the rename can roll back the file via the file system's metadata
+  journal, leaving stale wrapped DEKs on disk while the rotation's
+  Raft entry is already committed. To avoid stranding ciphertext
+  written under a DEK whose wrap is then lost, the sidecar write
+  protocol is:
+
+  1. Write the new contents to `<dataDir>/encryption/keys.json.tmp`.
+  2. `file.Sync()` on the temp file (fsync the data + metadata).
+  3. `os.Rename` to `keys.json`.
+  4. `dir.Sync()` on `<dataDir>/encryption/` (fsync the directory
+     entry so the rename is durable).
+  5. Only after step 4 does the FSM acknowledge the rotation entry
+     as applied (and update `raft_applied_index` in memory; that
+     value is then persisted on the next sidecar write).
+
+  Skipping step 2 or 4 turns a power loss into permanent data loss
+  for any value written under the new DEK; the §10 self-review
+  treats sidecar non-durability as a data-loss-class bug. On
+  filesystems that lack `dir.Sync()` semantics (NFS, some FUSE
+  mounts) the encryption package refuses to start with
+  `ErrUnsupportedFilesystem` rather than silently degrading the
+  durability guarantee.
 
   The sidecar is **safe to leak**: every entry in `keys` is wrapped
   by the KEK. Without the KEK, the file unwraps to nothing.
@@ -666,6 +726,11 @@ elastickv-admin encryption rewrap-deks
 elastickv-admin encryption rewrite --rate=10MiB/s
 elastickv-admin encryption retire-dek --key-id=<uint32>
 elastickv-admin encryption resync-sidecar    # §5.5 follower repair
+elastickv-admin encryption enable-raft-envelope
+                                              # §7.1 Phase 2 cutover;
+                                              # refuses unless every
+                                              # voting member reports
+                                              # encryption_capable
 elastickv-admin encryption disable           # refuses; documents the
                                               # dump-and-reload path
 elastickv-admin backup verify --backup-dir=...
@@ -719,34 +784,93 @@ envelope) is impossible by construction — the header layout is
 fixed and the encryption state is read before the value bytes are
 ever interpreted.
 
-#### Rolling enablement
+#### Rolling enablement: two phases, not one
 
-1. Operator provisions the KEK in their KMS.
+The §4.1 storage envelope and the §4.2 raft envelope have very
+different rollout constraints:
+
+- **§4.1 (storage envelope)** is per-version, dispatched on the
+  per-MVCC-version `encryption_state` bit. A node that has not yet
+  been upgraded continues to serve old cleartext versions; only
+  upgraded nodes write encrypted versions. Mixed-mode is safe.
+- **§4.2 (raft envelope)** wraps **every** committed Raft entry's
+  `Data []byte`. **Every replica must be able to decrypt every
+  committed entry** because Raft apply is deterministic and runs
+  on every node — there is no "skip this entry on this node"
+  escape hatch. If an upgraded leader proposes an encrypted
+  entry while a non-upgraded follower is still in the cluster,
+  the follower's `Apply` fails for every such entry. The
+  follower stops making progress, drifts behind on commit index,
+  and eventually triggers leader-side throttling.
+
+This rules out enabling §4.2 at the same instant as §4.1. The
+rollout is therefore explicitly two-phase, controlled by separate
+flags / Raft-replicated cluster state:
+
+**Phase 1 — Storage envelope only.**
+
+1. Operator provisions the KEK in the KMS.
 2. Operator restarts each node with `--encryption-enabled --kekUri=...`.
-   Restart is rolling; mixed-mode clusters are supported because
-   each MVCC version carries its own `encryption_state` bit and
-   reads dispatch on that bit, not on the value bytes.
-3. New writes from the upgraded node are encrypted (`encryption_state
-   = 0b01`). Old MVCC versions retain `encryption_state = 0b00` and
-   continue to be returned as cleartext to the storage layer's
-   decryption shim, which short-circuits when the bit is `0b00`.
-4. Operator runs `elastickv-admin encryption rewrite` to walk the
-   MVCC versions and re-encrypt every `encryption_state = 0b00`
-   version in place (per §5.4: same-`commit_ts` rewrite, MVCC
-   history preserved, rate-limited, resumable). The cursor lives at
-   `!encryption|rewrite|cursor|cleartext`.
-5. When `encryption status --verify` reports zero `encryption_state
-   = 0b00` versions across every node (NOT counting tombstones)
-   AND `minRetainedTS` has advanced past the youngest cleartext
-   `commit_ts`, the migration is complete and the cleartext code
-   path can be retired in a follow-up release.
+   Restart is rolling; mixed-mode is safe under §4.1 because each
+   MVCC version carries its own `encryption_state` bit and reads
+   dispatch on that bit, not on the value bytes.
+3. Upgraded nodes write encrypted MVCC versions (`encryption_state
+   = 0b01`). Old MVCC versions retain `encryption_state = 0b00`
+   and continue to be returned as cleartext.
+4. Raft proposals during Phase 1 carry **cleartext** `Data []byte`
+   — i.e., §4.2 is not yet active. Lookup keys and operation tags
+   in the WAL are still cleartext during this window.
+5. Operator runs `elastickv-admin encryption rewrite` to convert
+   all `encryption_state = 0b00` MVCC versions in place
+   (per §5.4). When `encryption status --verify` reports zero
+   cleartext versions across every node AND `minRetainedTS` has
+   advanced past the youngest cleartext `commit_ts`, Phase 1 is
+   complete.
+
+**Phase 2 — Raft envelope.**
+
+6. Operator runs `elastickv-admin encryption enable-raft-envelope`.
+   The admin client RPCs into the leader, which:
+   - Verifies via the route catalog / membership snapshot that
+     **every** voting member of every Raft group has reported
+     `encryption_capable = true` in its periodic heartbeat
+     metadata (a new field). Refuses to proceed otherwise.
+   - Proposes a single Raft entry with the cluster-wide flag
+     `raft_envelope_active = true`. This entry itself is sent
+     **cleartext** so non-upgraded replicas (defensive: should
+     not exist after step 6's check, but treated as a safety
+     net) can still apply it.
+7. From the apply index of that entry onward, every leader
+   wraps new proposal `Data []byte` with the raft DEK (§4.2).
+   Replicas dispatch on a 1-byte format tag at the start of the
+   `Data` payload — `0x00` = cleartext (pre-flag entry, found
+   only in WAL/snapshot history), `0x01` = raft envelope. The
+   discriminator lives **at the start of the application-level
+   payload**, never as the first byte of an arbitrary user
+   value, so the §7.1 byte-collision argument does not apply
+   here: every value the storage layer sees is opaque bytes
+   from a known framing, not raw user input.
+8. Snapshots taken during Phase 2 carry the new flag in their
+   metadata header so a fresh follower joining mid-Phase-2 sees
+   the right framing for every entry it will ever receive.
+
+#### Why §4.2 cannot be turned off again
+
+Once `raft_envelope_active = true` has been committed, the WAL on
+every node interleaves cleartext (pre-flag) and raft-envelope
+(post-flag) entries. Disabling §4.2 would require rewriting WAL
+entries, which etcd raft does not support. The flag is therefore
+one-way; the only way back is dump-and-reload (§7.2).
 
 #### Compatibility with snapshot streaming during migration
 
-A leader streaming a Pebble snapshot to a new follower mid-migration
-will ship a mix of `encryption_state = 0b00` and `0b01` versions.
-Followers ingest both correctly because the MVCC metadata travels
-with each version. No special handling at the snapshot layer.
+A leader streaming a Pebble snapshot to a new follower mid-Phase-1
+ships a mix of `encryption_state = 0b00` and `0b01` MVCC versions;
+the receiving follower ingests both correctly because the
+metadata travels per-version. A snapshot taken in Phase 2 ships
+only encryption-state-`0b01` MVCC versions plus a Phase-2-flagged
+header so the receiver knows to expect raft envelopes from there
+on.
 
 ### 7.2 Why we will not support encrypted → cleartext
 
@@ -866,6 +990,12 @@ The process refuses to start if any of the following hold:
   persisted applied index AND the gap covers any rotation entries
   (see §5.5: `ErrSidecarBehindRaftLog`, recovered via
   `encryption resync-sidecar`).
+- The sidecar is on a filesystem whose `dir.Sync()` does not
+  guarantee crash durability of the rename (`ErrUnsupportedFilesystem`,
+  see §5.1's crash-durable write protocol).
+- The encryption package's startup membership check fails to
+  resolve a stable 16-bit `node_id` (the §4.1 nonce construction
+  needs one; without it nonce uniqueness cannot be guaranteed).
 
 Each refusal logs a single, unambiguous error pointing at the
 relevant flag and runbook section.
@@ -924,10 +1054,20 @@ eventual code change.
    value bytes — see §7.1 on why a leading byte is unsafe), so a
    half-migrated database stays fully readable and a legacy value
    that happens to start with `0x01` cannot be misclassified as an
-   envelope. The largest risk is a buggy `compress-then-encrypt`
-   path that mis-frames the compressed payload; mitigation is a
-   round-trip property test in `store/` using `pgregory.net/rapid`
-   over arbitrary byte slices.
+   envelope. Two specific data-loss-class failure modes are
+   addressed by hard preconditions rather than by recovery code:
+   (a) sidecar non-durability — the §5.1 write protocol fsyncs
+   the file *and* the parent directory before the rotation is
+   acknowledged, so a power loss cannot strand ciphertext under a
+   wrap that has rolled back; (b) AES-GCM nonce reuse — the §4.1
+   nonce is built from `node_id ‖ local_epoch ‖ write_count`,
+   each field deterministic, the epoch persisted-and-fsynced
+   before any encryption, so even a crash-restart loop cannot
+   cause two writes under one DEK to share a nonce. The remaining
+   open risk is a buggy `compress-then-encrypt` path that
+   mis-frames the compressed payload; mitigation is a round-trip
+   property test in `store/` using `pgregory.net/rapid` over
+   arbitrary byte slices.
 
 2. **Concurrency / distributed failures.** DEK rotation goes through
    Raft so every replica observes the new DEK at the same log index.
@@ -941,7 +1081,14 @@ eventual code change.
    unaffected because the bytes are already ciphertext; the
    receiving node's keystore must contain the relevant DEK before
    it can read the ingested data, which is guaranteed by the Raft
-   ordering of the rotation entry.
+   ordering of the rotation entry. The two-phase rollout in §7.1 is
+   the load-bearing piece for "node not yet upgraded" cases:
+   Phase 1 keeps Raft proposals cleartext so a non-upgraded
+   follower can still apply, and Phase 2 only flips on after a
+   membership-snapshot check confirms every voting member is
+   encryption-capable. Skipping the membership check would let
+   one upgraded leader produce raft envelopes that lock every
+   non-upgraded follower out of apply.
 
 3. **Performance.** AES-NI puts encryption CPU below the existing
    FSM apply CPU. The compress pass recovers most of Pebble's lost
