@@ -97,17 +97,20 @@ After (adapters tag their traffic):
 Four ways to get the label from the adapter to the sampler. Pick
 one based on hot-path cost vs. plumbing weight.
 
-### 4.1 (Recommended) Per-Observe label string
+### 4.1 (Recommended) Per-Observe label
 
-Extend the sampler signature:
+Extend the sampler signature with a typed `Label` (defined as
+`type Label string` in `keyviz/labels.go`, see §9 Q2):
 
 ```go
 Observe(routeID uint64, op Op, keyLen, valueLen int, label Label)
 ```
 
-Empty `label` → existing behaviour, single row per route. Adapters
-set their own constant string (`"dynamo"`, `"redis"`, …) at the
-dispatch site they already own.
+Empty `label` (`LabelLegacy`) → existing behaviour, single row
+per route. Adapters set their own canonical constant
+(`LabelDynamo`, `LabelRedis`, …) at the dispatch site they
+already own — typed constants prevent typos like `"DynamoDB"` /
+`"dynamo"` drift at compile time.
 
 Cost on hot path: still one `slots` map lookup per `Observe` on
 the hit path (the existing code already does a single
@@ -626,12 +629,13 @@ Codex round-10.)
    `Observe` (same as today); the only extra work is wider hash
    and equality on the `{uint64, Label}` key vs the current
    `uint64` key. `BenchmarkObserveParallel` already pins the
-   hot-path cost; the new bench should land within run-to-run
-   variance of the current 4 ns/op. If it doesn't, the design is
-   wrong and we fall back to Option 4.2. (Copilot round-15-3rd-
-   pass caught the earlier "one extra map lookup" wording, which
-   contradicted §4.1's correctly-described "same lookup count,
-   wider key shape".)
+   hot-path cost. The acceptance check is **no statistically
+   significant regression** versus a same-run baseline (or a
+   recorded benchmark run attached to the PR), not an absolute
+   ns/op target — `BenchmarkObserveParallel` results vary by
+   machine, Go version, and CPU thermal state. If the benchmark
+   regresses materially, the design is wrong and we fall back to
+   Option 4.2.
 4. **Data consistency** — Cluster fan-out merge gains a tuple
    field; the dedup invariant (per-cell, per-(route, label,
    group, term, window)) still holds. Old SPA against new server
