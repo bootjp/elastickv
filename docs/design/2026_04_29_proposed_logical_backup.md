@@ -141,7 +141,8 @@ backup-<utc-timestamp>-<cluster-id>-<commit-ts>/
 │       ├── sets/<key>.json
 │       ├── zsets/<key>.json
 │       ├── streams/<key>.jsonl
-│       └── hll/<key>.bin                           # HyperLogLog opaque sketch (!redis|hll|<key>)
+│       ├── hll/<key>.bin                           # HyperLogLog opaque sketch (!redis|hll|<key>)
+│       └── hll_ttl.jsonl                           # HLL TTL sidecar (omitted when empty)
 └── sqs/
     └── <queue-name>/
         ├── _queue.json
@@ -438,8 +439,9 @@ redis/
     │   └── leaderboard.json
     ├── streams/
     │   └── events.jsonl
-    └── hll/
-        └── pfcount%3Auniques.bin
+    ├── hll/
+    │   └── pfcount%3Auniques.bin
+    └── hll_ttl.jsonl                         # one line per TTL'd HLL key
 ```
 
 Redis values are encoded so that `redis-cli --pipe` (or the equivalent in
@@ -486,14 +488,29 @@ any client library) can replay them without elastickv.
   ```
   followed (optionally) by a trailing meta line:
   ```
-  {"_meta": true, "length": 2, "last_ms": 1714400000001, "last_seq": 0}
+  {"_meta": true, "length": 2, "last_ms": 1714400000001, "last_seq": 0, "expire_at_ms": null}
   ```
   The meta line lets a restore tool seed `XADD` IDs without re-deriving
-  them from the entries.
+  them from the entries. `expire_at_ms` is null when the stream has no
+  TTL and is the absolute Unix-millis expiry otherwise — Redis streams
+  can have TTLs set with `EXPIRE` / `PEXPIRE` / `PEXPIREAT`, kept in the
+  `!redis|ttl|` scan index by `buildTTLElems` (`adapter/redis.go:2471`).
+  Without `expire_at_ms` here, restoring a TTL'd stream would silently
+  produce a permanent stream.
 - HyperLogLog (`!redis|hll|<key>`) is a binary opaque sketch; written under
   `hll/<key>.bin` byte-for-byte. A non-elastickv consumer that does not
   know HLL can still copy the bytes; a restore back into elastickv (or a
-  Redis-compatible HLL implementation) reads them as-is.
+  Redis-compatible HLL implementation) reads them as-is. HLL keys can
+  also carry a TTL — the adapter reports HLL as `redisTypeString` but
+  stores the TTL in `!redis|ttl|` rather than inline (see comment at
+  `adapter/redis.go:2319-2320`). The TTL therefore lives in a
+  `hll_ttl.jsonl` sidecar at the `db_<n>` root, in the same shape as
+  `strings_ttl.jsonl`:
+  ```
+  {"key":"pfcount%3Auniques","expire_at_ms":1735689600000}
+  ```
+  A key with no TTL has no entry in the sidecar; the sidecar file is
+  absent entirely when no HLL key in the database has a TTL.
 
 Bitmaps and binary strings flow through the `strings/` path and remain
 raw bytes.
@@ -843,6 +860,7 @@ elastickv-backup dump \
   [--include-sqs-side-records] \
   [--checksums sha256] \
   [--ttl-ms 1800000] \
+  [--begin-backup-deadline 5s] \
   [--scan-page-size 1024] \
   [--dynamodb-bundle-mode per-item|jsonl] \
   [--dynamodb-bundle-size 64MiB] \
@@ -971,8 +989,17 @@ parser, the format has failed its goal.
   The restore tool's stream behavior:
   - `--mode replace` — `DEL` the stream, then `XADD` every entry with
     the original ID (matches the dump's `_meta` line).
-  - `--mode skip-existing` — `XADD NOMKSTREAM` only entries whose ID
-    is not already present.
+  - `--mode skip-existing` — for each entry, attempt
+    `XADD <key> <id> ...` and treat the
+    `ERR The ID specified in XADD is equal or smaller than the target
+    stream top item` response as "already present, skip." `NOMKSTREAM`
+    is **not** a skip-existing mechanism — it only suppresses stream
+    creation; it does not skip entries by ID. A `XRANGE <key> <id>
+    <id> COUNT 1` probe per entry is an alternative implementation,
+    but is the same number of round-trips for the worst case (full
+    overlap) and is slower for the common case (small overlap), so
+    the `XADD`-and-handle-error form is preferred. The cost is O(N)
+    in the entry count regardless.
   - `--mode merge` — refuses to operate on streams unless the target
     is empty; emits an error pointing at the conflict. There is no
     sound way to splice mid-stream without losing the original IDs.
@@ -1088,6 +1115,9 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestSQSPreserveVisibilityFlag` | Default leaves messages immediately visible on restore; `--preserve-visibility` retains in-flight receipts |
 | `TestRedisTTLExpiredKeySkippedByDefault` | A key whose `expire_at_ms` is in the past at restore time is not re-applied without `--preserve-ttl`; with the flag it is re-applied with the original epoch |
 | `TestRedisStreamMergeRejectsNonEmpty` | `--mode merge` on a non-empty target stream errors out; `--stream-merge-strategy=auto-id` falls back to `XADD *` and writes `_id_remap.jsonl` |
+| `TestRedisStreamTTLRoundTrip` | A stream with `PEXPIREAT` round-trips through dump and restore: `expire_at_ms` is captured in the `_meta` line and re-applied so the restored stream expires at the original epoch |
+| `TestRedisHLLTTLRoundTrip` | A TTL'd HLL key surfaces in `hll_ttl.jsonl` and is re-applied on restore via the same `EXPIREAT` path used for strings; no-TTL HLLs leave `hll_ttl.jsonl` absent |
+| `TestRedisStreamSkipExistingHandlesERR` | The restore tool's `skip-existing` path tolerates `ERR The ID specified in XADD is equal or smaller` without aborting the dump; entries with non-conflicting IDs are still applied |
 
 ### P2
 
