@@ -136,33 +136,47 @@ the way out.
 Envelope format (single byte stream, stored as the Pebble value):
 
 ```text
-+--------+---------+----------+----------------+--------+
-| 0x01   | key_id  | nonce    | ciphertext     | tag    |
-| 1 byte | 4 bytes | 12 bytes | N bytes        | 16 B   |
-+--------+---------+----------+----------------+--------+
++--------+------+---------+----------+----------------+--------+
+| 0x01   | flag | key_id  | nonce    | ciphertext     | tag    |
+| 1 byte | 1 B  | 4 bytes | 12 bytes | N bytes        | 16 B   |
++--------+------+---------+----------+----------------+--------+
 ```
 
-- `0x01` — envelope-version byte. `0x00` is reserved to mean
-  "cleartext, written by a pre-encryption build" so the read path can
-  detect a partially-migrated database (see §5).
+- `0x01` — envelope-version byte. Future authenticated formats reserve
+  `0x02..0x0F` (see §11.3). The byte itself is **not** used to
+  discriminate cleartext from ciphertext on the read path — that
+  decision lives in MVCC metadata, not in the value bytes (see §7.1).
+- `flag` — bit 0: `1` if `ciphertext` is the encryption of a
+  Snappy-compressed plaintext, `0` if the plaintext was stored
+  uncompressed. Bits 1–7 are reserved (`0`).
 - `key_id` — 32-bit identifier of the DEK that produced this
   ciphertext. Required so a rotated DEK can decrypt entries written
   before the rotation (see §5.2).
-- `nonce` — 12-byte AES-GCM nonce, freshly drawn from
-  `crypto/rand.Reader` for every value. Random 96-bit nonces are safe
-  up to ~2⁴⁸ writes per DEK; we rotate DEKs well before that bound
-  (see §5.2).
-- `ciphertext` — AES-256-GCM(plaintext, nonce, AAD = key_id ‖
-  envelope_version). AAD binds the ciphertext to the envelope header,
-  so a header-rewrite attack (e.g., re-tagging a ciphertext to a
-  different DEK) is rejected on decrypt.
+- `nonce` — 12-byte AES-GCM nonce. To stay clear of the NIST SP
+  800-38D limit on randomly-generated 96-bit nonces (§5.2 derives
+  the budget), elastickv issues nonces from a **per-DEK 96-bit
+  counter** rather than a fresh `crypto/rand.Reader` draw per write.
+  The counter's high 32 bits are a per-process random prefix
+  (re-drawn whenever the DEK is loaded, so two processes that share
+  a DEK never collide), and the low 64 bits are an `atomic.Uint64`
+  incremented per write. This makes nonce reuse impossible within
+  the lifetime of a (DEK, process-load) pair and removes the
+  birthday-bound budget entirely.
+- `ciphertext` — AES-256-GCM(plaintext, nonce, AAD = envelope_version
+  ‖ flag ‖ key_id). AAD binds the ciphertext to the **entire**
+  envelope header — including the compression flag — so a
+  header-rewrite attack (re-tagging a ciphertext to a different DEK,
+  or flipping the compression bit so the decrypted plaintext is
+  passed back through Snappy and crashes the decompressor) is
+  rejected on decrypt.
 - `tag` — 16-byte GCM authentication tag; mismatched tag → read
   returns a typed `ErrEncryptedReadIntegrity` error, **never** silent
   zero or empty bytes.
 
-Per-value overhead is 33 bytes. For typical workloads (KV values >256
-B, Redis blobs in the kilobytes, S3 object bodies in the megabytes)
-this is in the noise.
+Per-value overhead is 34 bytes (1 version + 1 flag + 4 key_id + 12
+nonce + 16 tag). For typical workloads (KV values >256 B, Redis
+blobs in the kilobytes, S3 object bodies in the megabytes) this is
+in the noise.
 
 ### 4.2 Raft proposal payloads
 
@@ -309,14 +323,29 @@ rotation in v1.
   their old `key_id` until the next rewrite (compaction does not
   re-encrypt — it just shuffles ciphertext). A separate
   `elastickv-admin encryption rewrite` job can sweep the keyspace
-  over time to retire old DEKs; until that job has completed and the
-  retired DEK has zero references, the operator must keep the old
-  DEK loaded.
+  over time to retire old DEKs (see §5.4 for the MVCC-history
+  interaction that controls when retirement is actually safe); until
+  that job has completed and the retired DEK has zero references,
+  the operator must keep the old DEK loaded.
 
-  Rotation cadence target: every 90 days, or on suspicion of
-  compromise. AES-GCM with random 96-bit nonces tolerates up to ~2⁴⁸
-  writes per key under standard guidance; a 90-day rotation is well
-  under that bound for any realistic write rate.
+  Rotation cadence is bounded by **two** triggers, whichever fires
+  first:
+
+  1. **Time:** every 90 days or on suspicion of compromise.
+  2. **Writes-per-DEK:** a hard ceiling of 2³² writes per `(DEK,
+     process-load)` pair, in line with NIST SP 800-38D §8.3 for
+     authenticated encryption. The per-DEK write counter is exported
+     as `elastickv_encryption_writes_per_dek{key_id}`; admission
+     control refuses new writes once 90% of the ceiling is reached
+     and the cluster auto-proposes a `rotate-dek` entry. With
+     counter-based nonces (see §4.1) the cryptographic safety budget
+     is far higher than 2³², but we keep the conservative limit so
+     we are not relying on a single number being correct everywhere
+     in the codebase. (Earlier drafts cited the 2⁴⁸ random-nonce
+     birthday bound; that figure was wrong — it is the
+     50%-collision boundary, not a safe operating point — and has
+     been retracted in favour of the counter-nonce + 2³² ceiling
+     design above.)
 
 - **KEK rotation.** Performed entirely outside elastickv via the KMS
   provider. The cluster sees no change because the wrapped DEKs in
@@ -330,6 +359,66 @@ rotation in v1.
 Out of scope for v1. The DEK pair is cluster-wide. A future revision
 can split DEKs per Raft group or per logical tenant; the envelope
 already carries `key_id` so the on-disk format does not change.
+
+### 5.4 MVCC history, rewrite job, and DEK retirement
+
+The rewrite job (`elastickv-admin encryption rewrite`) is not a
+single-pass conversion of "the live value of every key" — Pebble
+holds **MVCC history**, and the snapshot/lease-read paths can read
+back any version newer than `minRetainedTS`. A naive rewrite that
+only touches the live version would leave older versions encrypted
+under the retiring DEK and quietly break snapshot reads as soon as
+that DEK is unloaded. The rewrite must therefore be MVCC-aware:
+
+1. **Iteration unit is `(user_key, version_ts)`, not `user_key`.**
+   The job scans every retained MVCC version and re-encrypts those
+   whose `key_id` matches the retiring DEK (or whose MVCC metadata
+   bit says cleartext, during the cleartext→encrypted migration of
+   §7.1). Tombstones do not carry value bytes and are skipped.
+2. **Re-encryption is a same-`commit_ts` rewrite, not a new
+   version.** The job opens a Pebble batch, writes the new ciphertext
+   at the **same** internal key (preserving `commit_ts`), and
+   commits — no new MVCC version, no OCC conflict, no visible
+   change to readers. Readers that picked up the old ciphertext
+   before the batch landed continue to decrypt under the still-loaded
+   old DEK; readers after see the new ciphertext.
+3. **Bounded write amplification.** The job's `--rate=N MiB/s`
+   throttle sets a Pebble write-rate budget; the implementation
+   yields between batches when the rate is exceeded. Compaction is
+   left alone — Pebble already amplifies the rewritten bytes
+   exactly as if a normal write had landed.
+4. **DEK retirement criterion.** A DEK is safe to unload only when
+   **both** of the following are true cluster-wide:
+   - The rewrite cursor for that DEK has reached the end of the
+     keyspace AND `elastickv_encryption_values_per_dek{key_id} == 0`
+     across every node (verified by `encryption status --verify`).
+   - `minRetainedTS` on every node is greater than the largest
+     `commit_ts` ever written under the retiring DEK. Until this
+     holds, a snapshot or lease read can still legitimately ask for
+     a version that was written under the old DEK.
+
+   The admin command `encryption retire-dek --key-id=...` checks
+   both conditions and refuses to unload the DEK otherwise. There
+   is no override flag — overriding is silently equivalent to
+   "lose data on the next snapshot read."
+5. **Bridge / proxy mode is unnecessary.** The mixed-format read
+   path in §4.1 already handles "some versions encrypted under
+   DEK_old, some under DEK_new, some still cleartext" without any
+   client-visible cutover. The rewrite job runs as a background
+   convergence step; reads and writes continue throughout. The
+   only operator-visible event is the eventual `retire-dek`, which
+   is a no-op for clients.
+6. **Crash safety.** The rewrite cursor (a Pebble key under
+   `!encryption|rewrite|cursor|<key_id>`) is updated in the same
+   Pebble batch as the rewritten value, so a crash mid-batch
+   either re-runs that batch on restart or skips it cleanly. There
+   is no window in which the cursor advances past values that
+   were not actually rewritten.
+
+The same machinery is what powers the cleartext→encrypted
+migration in §7.1; the only difference is that the source DEK is
+the synthetic "no DEK / cleartext" sentinel rather than a real
+retiring DEK.
 
 ---
 
@@ -377,11 +466,15 @@ already carries `key_id` so the on-disk format does not change.
 
 Add a Snappy compression pass in front of the encryption envelope
 inside `store/`. Order matters: ciphertext is high-entropy and
-compresses to ~1.0×; cleartext compresses normally. The envelope
-gains a 1-byte "compressed?" flag immediately after the version byte
-so we can skip the compress pass for already-incompressible values
-(images, video, pre-compressed S3 objects) and avoid paying the CPU
-twice.
+compresses to ~1.0×; cleartext compresses normally. The envelope's
+`flag` byte (§4.1) records whether the plaintext was Snappy-encoded
+before encryption, so the decrypt path can decide whether to run
+Snappy on the way out. Plaintexts that grow under Snappy (already
+compressed media — images, video, gzip'd archives, pre-compressed
+S3 objects) are stored uncompressed and the flag is left at zero,
+so we never pay CPU twice. Because the flag is part of the AES-GCM
+AAD (§4.1), an attacker cannot flip it post-hoc to crash the
+decompressor.
 
 This is also the reason we cannot rely on Pebble's built-in block
 compression alone: by the time bytes reach Pebble's block writer they
@@ -424,20 +517,69 @@ rotation timestamp.
 
 ### 7.1 Cleartext → encrypted on a running cluster
 
+#### Why the read path cannot dispatch on a value byte
+
+An earlier draft proposed using a leading version byte (`0x00`
+cleartext, `0x01` encrypted) to discriminate legacy values from
+encrypted envelopes on read. That is unsafe: pre-encryption values
+on disk are arbitrary user payloads with no header, and any legacy
+value whose first byte happens to equal `0x01` would be
+mis-parsed as an envelope, fail GCM verification (or worse, decode
+into garbage that happens to verify with probability 2⁻¹²⁸), and
+take the value offline. The same applies to any other in-band
+discriminator — Redis blobs, S3 object bodies, and DynamoDB
+attribute values are all "arbitrary bytes from the client."
+
+The discriminator therefore lives **out of band**, in MVCC
+metadata, never in the value bytes.
+
+#### Per-version `encryption_state` bit in MVCC metadata
+
+Each MVCC version already carries a small metadata header (commit
+ts, deletion bit, etc.) alongside the value bytes. We add a 2-bit
+`encryption_state` field to that header:
+
+| Value | Meaning |
+|---|---|
+| `0b00` | Cleartext. Value bytes are the user payload verbatim. Pre-encryption versions are read as this even though they have no flag on disk, because absent header bits decode to zero. |
+| `0b01` | Encrypted under the envelope format of §4.1. Value bytes are an envelope. |
+| `0b10`–`0b11` | Reserved. Read path errors out (forward-compat trip wire). |
+
+The MVCC encoder/decoder are the only call sites that touch this
+field. The bit is **inside** the MVCC metadata header, so the
+attacker scenario (a legacy value happening to look like an
+envelope) is impossible by construction — the header layout is
+fixed and the encryption state is read before the value bytes are
+ever interpreted.
+
+#### Rolling enablement
+
 1. Operator provisions the KEK in their KMS.
 2. Operator restarts each node with `--encryption-enabled --kekUri=...`.
-   Restart is rolling; mixed-mode clusters are supported because the
-   envelope-version byte (`0x00` = cleartext, `0x01` = encrypted) lets
-   any node read either format.
-3. New writes are encrypted immediately by the new build. Old
-   cleartext values remain readable (the read path branches on the
-   first byte).
+   Restart is rolling; mixed-mode clusters are supported because
+   each MVCC version carries its own `encryption_state` bit and
+   reads dispatch on that bit, not on the value bytes.
+3. New writes from the upgraded node are encrypted (`encryption_state
+   = 0b01`). Old MVCC versions retain `encryption_state = 0b00` and
+   continue to be returned as cleartext to the storage layer's
+   decryption shim, which short-circuits when the bit is `0b00`.
 4. Operator runs `elastickv-admin encryption rewrite` to walk the
-   keyspace and rewrite cleartext values into encrypted form. The job
-   is rate-limited and resumable; it stores its checkpoint in a
-   reserved Pebble key under `!encryption|rewrite|cursor`.
-5. When `encryption status --verify` reports zero cleartext values
-   across all nodes, the migration is complete.
+   MVCC versions and re-encrypt every `encryption_state = 0b00`
+   version in place (per §5.4: same-`commit_ts` rewrite, MVCC
+   history preserved, rate-limited, resumable). The cursor lives at
+   `!encryption|rewrite|cursor|cleartext`.
+5. When `encryption status --verify` reports zero `encryption_state
+   = 0b00` versions across every node (NOT counting tombstones)
+   AND `minRetainedTS` has advanced past the youngest cleartext
+   `commit_ts`, the migration is complete and the cleartext code
+   path can be retired in a follow-up release.
+
+#### Compatibility with snapshot streaming during migration
+
+A leader streaming a Pebble snapshot to a new follower mid-migration
+will ship a mix of `encryption_state = 0b00` and `0b01` versions.
+Followers ingest both correctly because the MVCC metadata travels
+with each version. No special handling at the snapshot layer.
 
 ### 7.2 Why we will not support encrypted → cleartext
 
@@ -567,9 +709,12 @@ eventual code change.
    failure inside `MVCCStore.Get` returns a typed error;
    `kv/fsm.go::Apply` propagates decrypt failures rather than
    returning `nil`. Snapshot restore validates the envelope on
-   ingest, not just on read. The migration path branches on the
-   envelope-version byte, so a half-migrated database stays fully
-   readable. The largest risk is a buggy `compress-then-encrypt`
+   ingest, not just on read. The migration path dispatches on the
+   per-version `encryption_state` bit in MVCC metadata (not on the
+   value bytes — see §7.1 on why a leading byte is unsafe), so a
+   half-migrated database stays fully readable and a legacy value
+   that happens to start with `0x01` cannot be misclassified as an
+   envelope. The largest risk is a buggy `compress-then-encrypt`
    path that mis-frames the compressed payload; mitigation is a
    round-trip property test in `store/` using `pgregory.net/rapid`
    over arbitrary byte slices.
@@ -646,6 +791,9 @@ eventual code change.
    (e.g., AES-256-GCM-SIV if nonce-misuse resistance matters,
    ChaCha20-Poly1305 for non-AES-NI hosts). The decrypt path
    dispatches on the version byte; anything unknown errors loudly.
+   Note: this dispatch only runs when the MVCC `encryption_state`
+   bit (§7.1) already says the version is encrypted — the version
+   byte is **not** how we tell cleartext from ciphertext.
 
 4. **Audit / compliance hooks.** Some compliance regimes (PCI, HIPAA,
    FIPS-140) require attestation of the cryptographic module. We use
