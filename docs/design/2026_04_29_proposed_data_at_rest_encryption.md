@@ -225,25 +225,38 @@ Envelope format (single byte stream, stored as the Pebble value):
       `RegisterEncryptionWriter` round-trip is required for
       the initial cohort, and the registry covers every
       replica that will run FSM apply.
-    - **Process start under an existing DEK.** A node that
-      restarts (or joins a cluster that already has active
-      DEKs) proposes `RegisterEncryptionWriter(dek_id,
-      full_node_id, local_epoch)` from the coordinator
-      **before the coordinator accepts any client write** that
-      would land as an encrypted entry. The trigger fires only
-      after the node has observed both the
-      `bootstrap-encryption` and `enable-storage-envelope`
-      entries in its applied log (per §5.6 step 4); a node
+    - **Process start under an existing DEK.** This trigger
+      fires **only on a fresh process load whose §5.1
+      `local_epoch` bump has just persisted a value strictly
+      greater than the registry's current
+      `last_seen_local_epoch` for this `(node, DEK)` pair**.
+      In that case the node proposes
+      `RegisterEncryptionWriter(dek_id, full_node_id,
+      local_epoch)` from the coordinator **before the
+      coordinator accepts any client write** that would land
+      as an encrypted entry. The trigger does **NOT** fire on
+      the bootstrap cohort's first observation of the
+      `enable-storage-envelope` entry — those nodes were
+      already registered by the §5.6 step 1a batch (with
+      their `local_epoch` from the capability pre-check), so
+      a duplicate registration with an unchanged `local_epoch`
+      would be rejected by §4.1 case 3
+      (`ErrLocalEpochRollback`) and break the cluster-wide
+      rollout even when every node is healthy. The
+      implementation should check the registry on
+      coordinator-startup and skip the propose if its slot
+      already contains the current `local_epoch`. A node
       booting in Phase 0 — sidecar present from a future
       pre-provisioning workflow but `storage_envelope_active`
-      still false — defers registration until those entries
-      commit, because the registry keys themselves do not yet
-      exist cluster-wide. FSM apply may run on Raft entries
-      proposed by the leader during this window (those are
-      decrypted using DEKs the node already has from its
-      sidecar), but no self-originated encrypted entry can be
-      queued by the local coordinator until registration
-      commits.
+      still false — defers registration until both the
+      `bootstrap-encryption` and `enable-storage-envelope`
+      entries commit, because the registry keys themselves
+      do not yet exist cluster-wide. FSM apply may run on
+      Raft entries proposed by the leader during this window
+      (those are decrypted using DEKs the node already has
+      from its sidecar), but no self-originated encrypted
+      entry can be queued by the local coordinator until
+      registration commits.
     - **Post-rotation.** When a node observes a `rotate-dek`
       apply, it proposes `RegisterEncryptionWriter` against
       the new DEK with the same coordinator-side gate as the
@@ -912,20 +925,58 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
    yields between batches when the rate is exceeded. Compaction is
    left alone — Pebble already amplifies the rewritten bytes
    exactly as if a normal write had landed.
-4. **DEK retirement criterion.** A DEK is safe to unload only when
-   **both** of the following are true cluster-wide:
-   - The rewrite cursor for that DEK has reached the end of the
-     keyspace AND `elastickv_encryption_values_per_dek{key_id} == 0`
-     across every node (verified by `encryption status --verify`).
-   - `minRetainedTS` on every node is greater than the largest
-     `commit_ts` ever written under the retiring DEK. Until this
-     holds, a snapshot or lease read can still legitimately ask for
-     a version that was written under the old DEK.
+4. **DEK retirement criterion.** Different `purpose` DEKs have
+   different retention needs because their ciphertext lives in
+   different places (Pebble for `storage`, the etcd raft WAL +
+   snapshot for `raft`). The `encryption retire-dek
+   --key-id=...` admin command refuses to unload the DEK
+   unless **all** of the criteria below for the matching
+   `purpose` are true cluster-wide. There is no override flag
+   — overriding is silently equivalent to "lose data on the
+   next read or replay."
 
-   The admin command `encryption retire-dek --key-id=...` checks
-   both conditions and refuses to unload the DEK otherwise. There
-   is no override flag — overriding is silently equivalent to
-   "lose data on the next snapshot read."
+   **Storage-purpose DEKs** must satisfy both of:
+   - The rewrite cursor for that DEK has reached the end of
+     the keyspace AND
+     `elastickv_encryption_values_per_dek{key_id} == 0`
+     across every node (verified by `encryption status
+     --verify`).
+   - `minRetainedTS` on every node is greater than the
+     largest `commit_ts` ever written under the retiring DEK.
+     Until this holds, a snapshot or lease read can still
+     legitimately ask for a version that was written under
+     the old DEK.
+
+   **Raft-purpose DEKs** must satisfy a different,
+   WAL-driven criterion because retaining MVCC versions does
+   not cover their use sites — the raft envelope ciphertext
+   lives in the etcd raft WAL and in raft snapshots, not in
+   Pebble values. Specifically:
+   - Every node's persisted Raft log start index (the lower
+     bound of un-truncated entries; advances with snapshot
+     installs and `wal.purge`) must be **strictly greater
+     than** the largest log index that was ever proposed
+     under the retiring raft DEK. The encryption package
+     tracks the latter as
+     `elastickv_encryption_last_proposed_index_per_raft_dek{key_id}`,
+     updated on every leader Wrap. The former is exposed as
+     `etcd_raft_log_compact_index` per node.
+   - Every node's last committed Raft snapshot must have
+     been **taken under the new raft DEK** (i.e., its FSM
+     snapshot header §4.4 carries
+     `raft_envelope_cutover_index` past the rotation entry).
+     A node restored from an older snapshot would replay
+     entries that still need the retiring DEK to decode.
+
+   Without the WAL guard, retiring a raft DEK while the WAL
+   still contains entries encrypted under it would cause
+   `unknown_key_id` apply failures on the next process
+   restart (replay from disk) or on a lagging follower's
+   catch-up — exactly the failure mode the writer registry
+   and capability gate were added to prevent. The raft path
+   therefore has its own retention contract, surfaced as
+   `ErrRaftDEKWALStillReferences` if the operator runs
+   `retire-dek --purpose=raft` early.
 5. **Bridge / proxy mode is unnecessary.** The mixed-format read
    path in §4.1 already handles "some versions encrypted under
    DEK_old, some under DEK_new, some still cleartext" without any
@@ -2079,6 +2130,10 @@ New metrics:
   `bad_version`. Any non-zero value is a paging-grade signal.
 - `elastickv_encryption_writes_per_dek{key_id}` — counter; drives
   the §5.2 writes-based rotation trigger.
+- `elastickv_encryption_last_proposed_index_per_raft_dek{key_id}`
+  — gauge; updated on every leader Wrap. Used by §5.4
+  `retire-dek --purpose=raft` to verify the WAL guard before
+  unloading a raft DEK.
 - `elastickv_encryption_value_overhead_bytes` — histogram of
   `payload_size - plaintext_size` per write. **Note:** when
   compression is enabled (§6.4) this histogram leaks information
