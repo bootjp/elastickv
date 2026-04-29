@@ -1262,15 +1262,34 @@ written.
   populated by the admin handler via `GetNodeVersion(leader)` for
   UI-side visibility (not used for the rolling-upgrade gate, which
   fans out `GetNodeVersion` to every member directly).
-- New field on `AdminServer` (`adapter/admin_grpc.go:62`): a
-  `*kv.ShardStore` reference, wired in `main.go` so the
-  `BeginBackup` / `BackupScanner` plumbing can reach `ScanAt` and
-  `ScanKeysAt`. There is no existing `AdminServer → ShardStore`
-  connection — the prior round-2 statement that
-  `NewBackupScanner` is reachable "via the existing wiring used by
-  `GetRaftGroups`" was wrong; `GetRaftGroups` only calls
-  `AdminGroup.Status()` and `AdminGroup.Configuration()`, never
-  `ShardStore`.
+- New fields on `AdminServer` (`adapter/admin_grpc.go:62`):
+  - `*kv.ShardStore` reference, wired in `main.go` so the
+    `BeginBackup` / `BackupScanner` plumbing can reach `ScanAt` and
+    `ScanKeysAt`. There is no existing `AdminServer → ShardStore`
+    connection — the prior round-2 statement that
+    `NewBackupScanner` is reachable "via the existing wiring used by
+    `GetRaftGroups`" was wrong; `GetRaftGroups` only calls
+    `AdminGroup.Status()` and `AdminGroup.Configuration()`, never
+    `ShardStore`.
+  - `*kv.GRPCConnCache` for outbound admin-to-admin peer dials
+    (`GetNodeVersion` fan-out from `BeginBackup`, `GetNodeVersion`
+    leader probes from `GetRaftGroups`). Reuses
+    `kv/grpc_conn_cache.go` and dials with `internal.GRPCDialOptions()`,
+    matching how `kv.ShardStore` and the etcd-raft gRPC transport
+    obtain peer connections today (`internal/raftengine/etcd/grpc_transport.go:469`).
+    Keeping it in a **separate cache from** `ShardStore.connCache`
+    is intentional: the data-plane cache is keyed on
+    Raft-group-leader addresses (which can move between nodes on
+    leader change), while the admin cache is keyed on node identity
+    (`NodeIdentity.GRPCAddress` from `snapshotMembers`); mixing the
+    two would conflate moving and stable address spaces.
+  - `versionCache map[string]struct{ version string; fetchedAt time.Time }`
+    (or `sync.Map` equivalent) protecting the 10 s
+    `leader_node_version` cache used by `GetRaftGroups`'s async
+    leader probes. Populated by the same async dials; read by
+    `GetRaftGroups` synchronously when fresh, returning empty
+    string on cache-miss-or-dial-still-in-flight to keep the RPC
+    latency contract intact.
 - Extend `AdminGroup` interface (`adapter/admin_grpc.go:41`) with a
   `SnapshotEvery() uint64` method matching the `StatusReader`
   addition. Without this, the `BeginBackup` handler on
@@ -1512,6 +1531,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestBeginBackupGatesOnMinVersion` | The `BeginBackup` handler derives its fan-out target from `snapshotMembers` (live `Configuration()` union, not the static `AdminServer.members` seed) and issues `GetNodeVersion` per peer concurrently. If any peer returns `node_version < N` or is unreachable within `--begin-backup-deadline`, the call returns `FailedPrecondition` with an error message that distinguishes the two cases ("reports version vX" vs. "did not respond within Ns") and proposes no `BackupPin` entries on any group; once every live member reports `node_version ≥ N`, the same call succeeds |
 | `TestBeginBackupGatesIncludesDynamicallyAddedNodes` | Start a 3-node cluster, add a 4th node at `v(N-1)` via `AddVoter` after `AdminServer` startup (so it is NOT in the bootstrap `members` seed), then call `BeginBackup`; the gate fails with the new node identified in the error. The previous seed-only design would have falsely passed |
 | `TestGetRaftGroupsLeaderVersionAsync` | `GetRaftGroups` returns within local-snapshot latency even when a leader is unreachable; `leader_node_version` is empty string in that case. Verify the 500 ms per-leader timeout and the 10 s response cache prevent repeated fan-outs across rapid polls |
+| `TestAdminGRPCConnCacheReuse` | Two consecutive `BeginBackup` calls dialing the same peer share one underlying `*grpc.ClientConn` (verified via the cache size); shutdown of a peer evicts only that entry, not the whole cache; admin cache is independent of `ShardStore.connCache` (no cross-cache eviction) |
 | `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
