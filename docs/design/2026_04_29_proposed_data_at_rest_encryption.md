@@ -184,17 +184,68 @@ Envelope format (single byte stream, stored as the Pebble value):
     `internal/raftengine/etcd/peers.go::DeriveNodeID(--raftId)`,
     which today returns the FNV-64a hash of the raft-id string
     as a `uint64`. Truncation rule: `node_id := uint16(DeriveNodeID(raftID))`.
-    On every process start the encryption package reads the
-    current Raft membership snapshot and asserts that **no two
-    voting members share the same lower-16-bit value of their
-    derived node ID** — refuses to start with
-    `ErrNodeIDCollision` otherwise (see §9.1). The check is at
-    most O(num_voting_members²) comparisons (single-digit
-    cluster sizes today); the cost is paid once at boot. For
-    elastickv's current `"n1"`/`"n2"`/`"n3"` ID convention the
-    16-bit values are well-distributed and collisions are
-    practically impossible, but the assertion makes the nonce
-    uniqueness invariant unconditional rather than statistical.
+
+    **Cluster-wide, lifetime-wide uniqueness via a Raft-replicated
+    writer registry.** Checking only the current voting
+    membership at boot is not enough — learners also apply
+    writes (so they encrypt under the storage DEK), and
+    membership churn during a DEK's lifetime can let a new
+    node share a truncated `node_id` with a former member that
+    already wrote under the same DEK. With `local_epoch` and
+    `write_count` both restarting from low values on the new
+    node, that overlap reuses `(DEK, nonce)` pairs the former
+    member already produced — catastrophic AES-GCM failure.
+
+    To make the uniqueness invariant unconditional, the
+    encryption package maintains a Raft-replicated **writer
+    registry** keyed per DEK:
+
+    ```text
+    !encryption|writers|<dek_id>|<uint16(node_id)>  →
+        { full_node_id: uint64,
+          first_seen_local_epoch: uint16,
+          last_seen_local_epoch:  uint16 }
+    ```
+
+    Before a node performs **its first write under a DEK**
+    (whether at process start under an existing DEK, or
+    immediately after a rotation that created a new active
+    DEK), it proposes a `RegisterEncryptionWriter(dek_id,
+    full_node_id, local_epoch)` Raft entry. FSM apply checks:
+
+    1. If no entry exists at the registry key → insert,
+       allowing the registration. The node may now write under
+       this DEK.
+    2. If an entry exists with the **same** `full_node_id` →
+       this is a re-registration (post-restart). Bump
+       `last_seen_local_epoch` and allow. The node was already
+       a legitimate writer.
+    3. If an entry exists with a **different** `full_node_id`
+       → reject the registration with `ErrNodeIDCollision`.
+       The proposing node refuses to start; the operator must
+       choose a different `--raftId` whose hash truncates
+       differently before the node can join the cluster as a
+       writer.
+
+    Retiring a DEK (per §5.4 retirement criterion) drops the
+    entire `!encryption|writers|<dek_id>|*` slice in the same
+    Raft entry that retires the DEK, so the registry never
+    grows unboundedly. The check covers voters, learners,
+    historical members, and any future replica that ever
+    applies a write under any unretired DEK.
+
+    The startup membership-snapshot check is retained as a
+    fast pre-check (one O(num_members²) comparison at boot to
+    catch obvious operator mistakes before the first
+    `RegisterEncryptionWriter` round-trip), but the registry
+    is the load-bearing mechanism for the safety guarantee.
+
+    For elastickv's current `"n1"`/`"n2"`/`"n3"` ID convention
+    the 16-bit values are well-distributed and registry
+    collisions are practically impossible — the registry's
+    role is to make the impossibility audit-able and to fail
+    safely in the rare event that ID strings happen to
+    collide.
   - `local_epoch` — 16-bit per-DEK process-load counter,
     persisted in the local sidecar (§5.1). Incremented and
     fsync'd **before** the new process performs any encryption,
@@ -310,56 +361,74 @@ layer.
 #### Snapshot header format evolution (versioned)
 
 Today's `kv/snapshot.go` writes a fixed 16-byte header — 8-byte
-`pebbleSnapshotMagic` + 8-byte `lastCommitTS` (HLC ceiling). To
-carry the §7.1 Phase 2 `raft_envelope_cutover_index` (and to leave
-room for later metadata) without breaking restore on existing
-clusters, the header is versioned **explicitly** rather than
-silently lengthened. Layout going forward:
+`hlcSnapshotMagic` (`EKVTHLC1`) followed by an 8-byte
+`lastCommitTS` (HLC ceiling). To carry the §7.1 Phase 2
+`raft_envelope_cutover_index` (and to leave room for later
+metadata) without breaking restore on existing clusters, the
+header is versioned via a **distinct magic per version** rather
+than a value-range heuristic on a shared magic. Discrimination is
+then unambiguous: read the 8 magic bytes, switch on the exact
+match. No "is this small value a ceiling-high-byte or a version
+number?" guesswork — that heuristic was retracted because HLC
+ceilings can legitimately have a low high-byte (e.g. an early-
+epoch cluster), which would misclassify v1 streams as v2.
+
+Layout going forward:
 
 ```text
-+------------+--------+--------+----------+----------+----------+
-| magic(8)   | ver(1) | len(2) | ceiling  | cutover  | reserved |
-| EKVPBBL1   |  0x02  |  0x40  |   8B     |   8B     |  ...     |
-+------------+--------+--------+----------+----------+----------+
+v1 (legacy, unchanged):
++------------+----------+
+| magic(8)   | ceiling  |
+| EKVTHLC1   |   8B     |
++------------+----------+
+
+v2 (Phase-2-aware):
++------------+--------+----------+----------+
+| magic(8)   | len(2) | ceiling  | cutover  |
+| EKVTHLC2   |  0x10  |   8B     |   8B     |
++------------+--------+----------+----------+
 ```
 
-- `magic` — unchanged 8-byte `pebbleSnapshotMagic` (`EKVPBBL1`)
-  so a v1 reader still recognises the stream.
-- `ver` — header format version. `0x01` is the implicit v1
-  format that has no `ver`/`len` fields and is exactly 16 bytes
-  total (legacy detection: read 9 bytes, if byte 8 looks like
-  the high byte of a plausible HLC `ceiling` rather than a
-  small version number, fall back to v1 reader). `0x02` is the
-  versioned format above.
-- `len` — uint16 little-endian total payload length **after**
-  the `len` field itself, so a v3+ reader can skip unknown
-  trailing fields without a forward-compat fault.
+- v1 magic remains the byte-for-byte
+  `hlcSnapshotMagic = EKVTHLC1` defined in `kv/snapshot.go`, so
+  every existing snapshot file restores under the new build with
+  no migration step.
+- v2 introduces a new constant `hlcSnapshotMagicV2 = EKVTHLC2`
+  (last byte bumped from `'1'` to `'2'`). The two magics share
+  no overlap, so a `bytes.Equal` of the leading 8 bytes
+  unambiguously selects the format.
+- `len` is uint16 big-endian, total payload length **after** the
+  `len` field itself. v2 ships with the two defined fields
+  (`ceiling`, `cutover`) for `len = 0x0010` (16 bytes); a future
+  v2 writer may extend the payload by appending fields and
+  bumping `len`. Older v2 readers ignore any bytes past the
+  fields they understand (i.e., they read the first 16 bytes
+  of payload and skip the rest using `len`). This is the
+  forward-compat hatch within v2.
 - `ceiling` — same 8-byte HLC ceiling as v1; preserves the
   existing field semantics so the v2 path is a strict superset.
-- `cutover` — `raft_envelope_cutover_index` as a fixed
-  big-endian uint64. `0` means "Phase 2 not yet enabled at
-  snapshot time", which is the correct value for a snapshot
-  taken in Phase 0 or Phase 1.
-- `reserved` — zero-padded for alignment / future fields. Any
-  v2 reader that sees non-zero bytes here errors with
-  `ErrSnapshotHeaderReserved` rather than silently ignoring
-  them.
+- `cutover` — `raft_envelope_cutover_index` as a big-endian
+  uint64. `0` means "Phase 2 not yet enabled at snapshot time",
+  which is the correct value for a snapshot taken in Phase 0
+  or Phase 1.
+
+There is no `reserved`-bytes field; the earlier draft's
+`len = 0x40` (64 bytes) was a documentation error with no
+matching field count. The implementation must validate that the
+bytes consumed match `len` exactly.
 
 Read path (`ReadSnapshotHeader`):
 
-1. Read the 8-byte magic. Mismatch → `ErrSnapshotMagic`.
-2. Peek the next byte. If it falls in the documented v1
-   `ceiling` high-byte range (i.e., the implicit-v1 detection
-   above) treat the stream as v1, parse the remaining 8 bytes
-   as `ceiling`, and return `cutover = 0`.
-3. Otherwise read it as `ver`. If `ver == 0x02`, read `len`
-   and exactly that many bytes; parse `ceiling`, `cutover`.
-   Trailing reserved bytes are validated as zero.
-4. If `ver` is unknown (`> 0x02` from a future writer), refuse
-   the snapshot with `ErrSnapshotHeaderVersion` — restoring a
-   forward-version snapshot under an older binary is **never**
-   safe because we cannot prove the unknown extension is not
-   semantically required.
+1. Read the 8-byte magic.
+2. If it equals `hlcSnapshotMagic` (`EKVTHLC1`): parse the next
+   8 bytes as `ceiling`, return `cutover = 0`.
+3. If it equals `hlcSnapshotMagicV2` (`EKVTHLC2`): read `len`,
+   then exactly `len` payload bytes; parse `ceiling` from the
+   first 8, `cutover` from the next 8, ignore any trailing
+   bytes (forward-compat within v2).
+4. Otherwise refuse the snapshot with
+   `ErrSnapshotHeaderUnknownMagic`. Restoring a snapshot whose
+   format we cannot identify is never safe.
 
 Write path (`WriteSnapshotHeader`):
 
@@ -376,8 +445,9 @@ Write path (`WriteSnapshotHeader`):
 This evolution rule keeps every existing v1 snapshot file
 restorable under the new build with no migration step, makes
 v2 the steady state once Phase 2 is enabled, and pushes
-forward-compat decisions to a hard error rather than silent
-data corruption.
+forward-compat decisions to a hard error on unknown magic
+rather than silent data corruption from a misclassified
+heuristic.
 
 ### 4.5 Distribution catalog and HLC ceiling entries
 
@@ -736,12 +806,19 @@ To detect and repair sidecar-vs-log divergence:
      sidecar to the full set in one apply.
    - **Manual on a stuck follower** — operator runs
      `elastickv-admin encryption resync-sidecar`. The command
-     replays *all* rotation and `rewrap-deks` entries between
-     the sidecar's `raft_applied_index` and the FSM's applied
-     index into the local sidecar (not just the most recent
-     one), then exits. Replaying only the active DEK would
-     leave intermediate `key_id`s missing and silently break
-     historical reads on that node — explicitly rejected.
+     replays **every entry that satisfies the
+     `isEncryptionRelevant()` predicate** (the same set used by
+     the §5.5 lag check above: `rotate-dek`, `rewrap-deks`,
+     `enable-storage-envelope`, `enable-raft-envelope`,
+     `retire-dek`) between the sidecar's `raft_applied_index`
+     and the FSM's applied index into the local sidecar (not
+     just the most recent rotation, and not just rotation /
+     rewrap entries). Restricting the replay to a subset would
+     leave intermediate `key_id`s missing OR leave the
+     `raft_envelope_cutover_index` unset — silently breaking
+     historical reads or causing post-cutover Raft entries to
+     be decoded through the legacy first-byte tag space.
+     Explicitly rejected.
    Refusing to start until recovery completes is deliberate:
    silently serving with an incomplete sidecar would let the
    node write under one `key_id` while failing to decrypt
