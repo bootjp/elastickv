@@ -1,8 +1,35 @@
-# Logical Backup: Per-Adapter Decomposed Snapshot Format
+# Logical Backup: Live Cluster, PIT-Consistent Extraction (Phase 1)
 
 Status: Proposed
 Author: bootjp
 Date: 2026-04-29
+
+## Phasing
+
+This proposal is split into two phases. Each phase has its own
+design doc; both produce dumps in the **same on-disk format** so
+restorers and external tools do not care which phase produced a
+given dump.
+
+| Phase | Doc | Scope |
+|-------|-----|-------|
+| **Phase 0** | [`2026_04_29_proposed_snapshot_logical_decoder.md`](./2026_04_29_proposed_snapshot_logical_decoder.md) | Offline `.fsm` ↔ logical-format directory tree converter. No live cluster, no admin RPCs, no FSM/Raft changes. **Owns the format definition.** Sufficient for single-shard clusters, one-time exports off elastickv, and any use case where the latest available snapshot is a good-enough recovery point. |
+| **Phase 1 (this doc)** | This file | Live, running-cluster extraction with cluster-wide point-in-time consistency across multiple Raft groups. Adds `BeginBackup` / `RenewBackup` / `EndBackup` admin RPCs, replicated `BackupPin` / `Extend` / `Release` Raft FSM commands, version-gated rolling-upgrade safety, expected-keys baseline. Required only when cross-shard PIT consistency or "snapshot now" cadence is needed. |
+
+The format details (per-adapter directory layout, filename encoding,
+`MANIFEST.json` schema, per-adapter record shapes) are defined in the
+Phase 0 doc and **referenced** here. Phase 1 produces the same
+records into the same tree — the only difference is the source of
+the data (a live cluster pinned at a chosen `read_ts`, vs. a
+historical snapshot file) and the `MANIFEST.phase` discriminator
+(`"phase1-live-pinned"` vs. `"phase0-snapshot-decode"`).
+
+This doc focuses on the **live-cluster machinery** unique to
+Phase 1: the read_ts pinning protocol, cross-shard catch-up,
+expected-keys baseline, fan-out version gate, and the FSM-level pin
+propagation that keeps every replica's compactor honest. Format
+content sections are kept here for reviewer convenience but are
+authoritative only as cross-references — Phase 0 owns the format.
 
 ## Background and Problem
 
