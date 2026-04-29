@@ -51,21 +51,25 @@ A partition is identified by the tuple `(queueName, partitionIndex)` where `part
 - **Legacy / `PartitionCount = 0` / Standard queues** keep today's `!sqs|msg|data|<queue>|<gen>|<msgID>` byte-for-byte. No partition segment is written or read. Existing data on disk is unaffected; existing key constructors stay unchanged on this code path.
 - **Partitioned FIFO queues (`PartitionCount > 1`)** use a *new* keyspace prefix that explicitly includes the partition: `!sqs|msg|data|p|<queue>|<partition>|<gen>|<msgID>` (note the extra `p|` discriminator after `data|`). The discriminator is what guarantees no collision with the legacy prefix even when `<partition> = 0` happens to match the first 8 bytes of a legacy `<gen>`.
 
-The `p|` discriminator is **safe by name-validator construction**, not by accident: AWS SQS queue names (and elastickv's `validateQueueName`) admit only `[A-Za-z0-9_-]` plus the optional `.fifo` suffix, so no queue name can contain `|`. The existing `!sqs|msg|data|<queue>|...` segment is therefore terminated by a `|` that no queue name can produce, and the new `!sqs|msg|data|p|<queue>|...` segment starts with a literal byte sequence (`p|`) that cannot appear at the same position in any legacy key (it would require a queue name of `p`, which would still be followed by a `|` from the *segment* terminator, not from the queue name itself — but the prefix routing reads the bytes as `data|p|` vs `data|<segment>|`, and `<segment>` is base32-encoded so it never starts with the literal ASCII `p`). The implementation PR's name validator must continue to reject `|` in queue names; any future relaxation of that rule has to revisit this prefix scheme first.
+The `p|` discriminator is **safe by name-validator construction**, not by accident: AWS SQS queue names (and elastickv's `validateQueueName`) admit only `[A-Za-z0-9_-]` plus the optional `.fifo` suffix, so no queue name can contain `|`. The existing `!sqs|msg|data|<queue>|...` segment is therefore terminated by a `|` that no queue name can produce, and the new `!sqs|msg|data|p|<queue>|...` segment starts with a literal byte sequence (`p|`) that cannot appear at the same position in any legacy key. The on-disk queue segment is `base64.RawURLEncoding(<queue>)` (alphabet `A-Za-z0-9-_`), and `|` is outside that alphabet, so an encoded queue segment can never produce the literal three bytes `p|` that the discriminator relies on. **Each partitioned constructor terminates the variable-length encoded queue segment with a `|` byte before the fixed-width partition `uint32`** — without that terminator, a prefix scan for queue `q` would also match queue `q1` because `base64("q")` is a strict byte prefix of `base64("q1")`. The implementation PR's name validator must continue to reject `|` in queue names; any future relaxation of that rule has to revisit this prefix scheme first.
 
 Concretely, the implementation PR exposes **two named constructors** rather than a variadic dispatcher (Claude review on PR #664 flagged the variadic form as a footgun: `sqsMsgDataKey(q, gen, id, p0, p1)` would silently ignore `p1` and the compiler would not catch it). The dispatch lives at the call site, where `meta.PartitionCount` is already in scope:
 
 ```go
-// Two distinct constructors, one per keyspace.
-func legacyMsgDataKey(queueName string, gen uint64, messageID string) []byte
-func partitionedMsgDataKey(queueName string, partition uint32, gen uint64, messageID string) []byte
+// Two distinct constructors, one per keyspace. Implemented in
+// adapter/sqs_keys.go as part of Phase 3.D PR 3:
+func sqsMsgDataKey(queueName string, gen uint64, messageID string) []byte             // legacy
+func sqsPartitionedMsgDataKey(queueName string, partition uint32, gen uint64, messageID string) []byte
 
 // Dispatch at the call site. No variadic, no silent argument loss.
+// PR 5 wires this dispatch at every call site that today calls
+// sqsMsgDataKey directly; PR 3 only adds the partitioned constructor
+// so PR 5 stays a small change.
 var dataKey []byte
 if meta.PartitionCount > 1 {
-    dataKey = partitionedMsgDataKey(queueName, partition, gen, msgID)
+    dataKey = sqsPartitionedMsgDataKey(queueName, partition, gen, msgID)
 } else {
-    dataKey = legacyMsgDataKey(queueName, gen, msgID)
+    dataKey = sqsMsgDataKey(queueName, gen, msgID)
 }
 ```
 
@@ -181,13 +185,13 @@ For deployments that don't want one Raft group per partition (e.g. a small clust
    constructor for this queue's PartitionCount (named constructors
    per §3.1; no variadic):
      if meta.PartitionCount > 1 {
-       dataKey  = partitionedMsgDataKey(queue, partitionIndex, gen, msgID)
-       visKey   = partitionedMsgVisKey(queue, partitionIndex, gen, ...)
-       groupKey = partitionedMsgGroupKey(queue, partitionIndex, gen, MessageGroupId)
+       dataKey  = sqsPartitionedMsgDataKey(queue, partitionIndex, gen, msgID)
+       visKey   = sqsPartitionedMsgVisKey(queue, partitionIndex, gen, ...)
+       groupKey = sqsPartitionedMsgGroupKey(queue, partitionIndex, gen, MessageGroupId)
      } else {
-       dataKey  = legacyMsgDataKey(queue, gen, msgID)
-       visKey   = legacyMsgVisKey(queue, gen, ...)
-       groupKey = legacyMsgGroupKey(queue, gen, MessageGroupId)
+       dataKey  = sqsMsgDataKey(queue, gen, msgID)
+       visKey   = sqsMsgVisKey(queue, gen, ...)
+       groupKey = sqsMsgGroupKey(queue, gen, MessageGroupId)
      }
 6. Dispatch through the leader of the resolved partition (existing
    leader-proxy path, unchanged).
