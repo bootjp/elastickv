@@ -783,6 +783,15 @@ rewrite."
   `os.Rename` → `dir.Sync()` → ack). Skipping any of these
   fsyncs is a data-loss-class bug per §10 lens 1; do not
   shortcut to a plain `os.Rename`.
+- `admin.go` — gRPC server for the new `proto.EncryptionAdmin`
+  service. v1 surface: `GetCapability(Empty) → CapabilityReport
+  { encryption_capable bool, build_sha string,
+    sidecar_present bool }`. Used by the §7.1 cutover commands
+  to fan-out a fresh capability poll across every voting
+  member of every Raft group; reuses the existing admin-listener
+  TLS configuration. The RPC is read-only and side-effect-free,
+  so it can be served unconditionally on every node regardless
+  of leadership state.
 
 ### 6.2 Hooks into the storage layer
 
@@ -1007,30 +1016,42 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    envelope is gated on the cluster flag below) and proposes
    cleartext Raft entries (raft envelope is gated on a separate
    flag in Phase 2).
-2. Each upgraded node advertises `encryption_capable = true` in
-   the **peer-metadata extension** that today already piggy-backs
-   on the etcd-raft heartbeat path
-   (`internal/raftengine/etcd/peer_metadata.go`). A new
-   `encryption_capable bool` field is added to the existing
-   `PeerMetadata` proto; old binaries omit the field, which
-   protobuf decodes as the zero value (`false`), so unscanned
-   non-upgraded peers default to `not capable` without any
-   special handling. The flag is purely informational at this
-   point.
+2. Each upgraded node advertises `encryption_capable = true`
+   via an **out-of-band gRPC** rather than by piggybacking on
+   the raft heartbeat path. (An earlier draft of this doc
+   referenced `internal/raftengine/etcd/peer_metadata.go` as
+   the extension point; that file is the on-disk peers-file
+   persistence layer for `etcd-raft-peers.bin`, not a
+   heartbeat extension. The reference has been retracted.) The
+   capability advert lives on a new
+   `EncryptionAdmin.GetCapability` unary RPC served by every
+   node (`proto.EncryptionAdmin`, see §6.1). The RPC returns a
+   `CapabilityReport { encryption_capable bool, build_sha
+   string, sidecar_present bool }` so the operator can
+   distinguish "binary supports encryption but flag not yet
+   set" from "binary is too old to support encryption at all".
 3. The Phase-1 and Phase-2 cutover commands
    (`enable-storage-envelope`, `enable-raft-envelope`) **do not**
-   read cached `encryption_capable` state from the local
-   keystore. Instead they force a fresh poll: the leader sends a
-   heartbeat to every voting member of every Raft group and
-   blocks until it has received a heartbeat response carrying
-   `encryption_capable = true` from every member, all within one
-   election timeout (configurable; default the existing
+   read cached capability state. Instead they force a fresh
+   poll: the leader of the default Raft group fans out a
+   `GetCapability` call to every voting member of every Raft
+   group in the route catalog and blocks until it has received
+   `encryption_capable = true` from every member, all within
+   one election timeout (configurable; default the existing
    `RaftElectionTimeout`). If any member is unreachable or
    reports `false` within the window, the command returns
    `ErrCapabilityCheckFailed` with the offending node IDs and
    the operator must re-run after fixing them. Stale cached
    capability state therefore cannot trigger a premature
    cutover.
+
+   The fan-out reuses the existing admin connection pool
+   (already TLS-authenticated for `--adminTLSCertFile` setups)
+   so no new transport machinery is required. Choosing the
+   out-of-band RPC over a heartbeat-context extension keeps
+   the cutover decision a control-plane operation rather than
+   a steady-state hot-path payload, and avoids changing the
+   etcd-raft message wire format.
 
 **Phase 1 — Storage envelope cluster-flag flip.**
 
@@ -1062,17 +1083,27 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    `raft_envelope_active = true`. This entry itself uses the
    legacy first-byte tag space so it remains decodable by any
    replica that has applied entries up to it.
-8. From the apply index of that flag entry onward, every leader
-   wraps new proposal `Data []byte` with the raft DEK (§4.2).
-   **There is no in-band format tag in the proposal payload.**
-   Replicas dispatch on the **Raft log index** of the entry
-   relative to the persisted `raft_envelope_cutover_index` (the
-   apply index of the flag entry, recorded in the local sidecar
-   on apply). Concretely, the FSM apply path becomes:
+8. From the **next** entry after the flag entry's apply index
+   onward, every leader wraps new proposal `Data []byte` with
+   the raft DEK (§4.2). The flag entry itself is **not**
+   wrapped — step 7 wrote it in legacy first-byte framing so
+   every replica (including a defensive non-upgraded one) can
+   still apply it. **There is no in-band format tag in the
+   proposal payload.** Replicas dispatch on the **Raft log
+   index** of the entry relative to the persisted
+   `raft_envelope_cutover_index` (the apply index of the flag
+   entry, recorded in the local sidecar on apply). Concretely,
+   the FSM apply path becomes:
 
    ```text
    Apply(index, data):
-     if index >= raft_envelope_cutover_index:
+     // Strict greater-than: the flag entry at index ==
+     // raft_envelope_cutover_index is itself in legacy framing.
+     // Unwrapping it as a raft envelope would fail GCM
+     // verification and either error the apply or, on
+     // best-effort handlers, silently drop the cutover update
+     // and leave the local sidecar in Phase 1 forever.
+     if index > raft_envelope_cutover_index:
        data = raftDEK.Unwrap(data)         // strip §4.2 envelope
      // existing dispatch on data[0], unchanged from today:
      switch data[0] {
@@ -1117,6 +1148,40 @@ metadata travels per-version. A snapshot taken in Phase 2 ships
 only encryption-state-`0b01` MVCC versions plus a Phase-2-flagged
 header so the receiver knows to expect raft envelopes from there
 on.
+
+#### Post-cutover membership gate
+
+The Phase 0/1/2 capability check guards the **initial** rollout,
+but operators routinely add or replace voters after the cluster is
+in production. A new voter brought up on an old binary without
+`--encryption-enabled` would, post-cutover, hit two distinct
+silent failure modes:
+
+- *At the storage layer:* MVCC versions arriving via Raft
+  replication or snapshot ingest carry `encryption_state = 0b01`
+  in `data[0]`. The old binary reads `data[0] != 0` as a
+  tombstone and silently drops every live value from reads.
+- *At the raft layer:* every Phase-2 entry is a raft envelope.
+  Apply on the new voter fails immediately and the voter never
+  catches up.
+
+Both modes happen with no operator-visible error until clients
+start seeing missing data on reads routed to the new node.
+
+To prevent this, the control plane (the leader of the default
+Raft group) **rejects `AddVoter` / `ConfChange` / learner
+promotion** for any peer whose `EncryptionAdmin.GetCapability`
+RPC does not return `encryption_capable = true`, once
+`storage_envelope_active` or `raft_envelope_active` has been
+applied locally. The `Distribution` admin RPC layer surfaces this
+as `ErrPeerNotEncryptionCapable` so the operator sees a clear
+refusal at the moment they issue the membership change, not on
+the first failed read.
+
+The same gate applies to learners promoted to voters: a learner
+that joined before cutover but never restarted with the
+encryption flag must be restarted (or `EncryptionAdmin.GetCapability`
+must report capable) before promotion succeeds.
 
 ### 7.2 Why we will not support encrypted → cleartext
 
