@@ -660,8 +660,13 @@ field — only `engine`, `router`, `groups`, `clock`, and a raw
 force either an awkward extra field plus `main.go` wiring or a
 roundabout coordinator → router → ShardStore lookup. Putting it on
 `*ShardStore` keeps the scan primitive cohesive with `ScanAt` and
-lets the admin server reach it directly via the existing
-`AdminServer` → `ShardStore` wiring used by `GetRaftGroups`.
+lets the admin server reach it directly. There is **no existing**
+`AdminServer → ShardStore` wiring today — `AdminServer`
+(`adapter/admin_grpc.go:62-82`) holds `self`, `members`, `groups`,
+`now`, and `sampler`, with no `*kv.ShardStore` field; `GetRaftGroups`
+calls `AdminGroup.Status()` and `Configuration()`, never `ShardStore`.
+Phase 1 adds a `*kv.ShardStore` field to `AdminServer` and wires it
+in `main.go` (listed in Phase 1 scope below).
 
 > **Phase 1 also updates `ScanAt`'s doc comment**
 > (`kv/shard_store.go:101–105`) which today warns _"this method is
@@ -1249,12 +1254,31 @@ trustworthy off-cluster artifact even before the restore tool is fully
 written.
 
 - New admin RPCs on `proto/admin.proto`: `BeginBackup` (with `ttl_ms`),
-  `EndBackup`, `RenewBackup`, `ListAdaptersAndScopes` (signatures in
-  "Read-Side Consistency"). Plus a one-field extension to the existing
-  `RaftGroupState` message (`proto/admin.proto:38`): add
-  `string node_version = 7;` populated by each admin handler from the
-  build-time version constant. The `BeginBackup` rolling-upgrade gate
-  reads this field; without it the gate cannot be implemented.
+  `EndBackup`, `RenewBackup`, `ListAdaptersAndScopes`,
+  `GetNodeVersion` (signatures in "Read-Side Consistency" and the
+  "Two-version rolling-upgrade plan" subsection). Plus a one-field
+  extension to the existing `RaftGroupState` message
+  (`proto/admin.proto:38`): add `string leader_node_version = 7;`
+  populated by the admin handler via `GetNodeVersion(leader)` for
+  UI-side visibility (not used for the rolling-upgrade gate, which
+  fans out `GetNodeVersion` to every member directly).
+- New field on `AdminServer` (`adapter/admin_grpc.go:62`): a
+  `*kv.ShardStore` reference, wired in `main.go` so the
+  `BeginBackup` / `BackupScanner` plumbing can reach `ScanAt` and
+  `ScanKeysAt`. There is no existing `AdminServer → ShardStore`
+  connection — the prior round-2 statement that
+  `NewBackupScanner` is reachable "via the existing wiring used by
+  `GetRaftGroups`" was wrong; `GetRaftGroups` only calls
+  `AdminGroup.Status()` and `AdminGroup.Configuration()`, never
+  `ShardStore`.
+- Extend `AdminGroup` interface (`adapter/admin_grpc.go:41`) with a
+  `SnapshotEvery() uint64` method matching the `StatusReader`
+  addition. Without this, the `BeginBackup` handler on
+  `AdminServer` cannot reach `SnapshotEvery()` through the
+  `s.groups[id]` map without a typed assertion fallback. Tests
+  that mock `AdminGroup` (e.g. `adapter/admin_grpc_test.go`) gain
+  one extra method to implement; they can return
+  `defaultSnapshotEvery = 10000` for parity with production.
 - Extend `kv/active_timestamp_tracker.go` with `PinWithDeadline`,
   `Extend`, and the per-second sweeper goroutine that reaps expired
   pins and emits the `backup_pin_expired` structured warning.
@@ -1296,30 +1320,47 @@ written.
        release N before the next step is enabled.
     2. **Release N+1 (BackupPin enabled).** The actual `applyBackupPin`
        / `Extend` / `Release` handlers ship and the admin RPCs are
-       activated. `BeginBackup` itself **gates on every group member
-       reporting `node_version ≥ N`** via `Admin.GetRaftGroups`. The
-       version field does not exist today: `RaftGroupState` in
-       `proto/admin.proto:38-49` carries only `raft_group_id`,
-       `leader_node_id`, `leader_term`, `commit_index`,
-       `applied_index`, and `last_contact_unix_ms`. Phase 1 therefore
-       adds:
+       activated. `BeginBackup` itself **gates on every cluster
+       member reporting `node_version ≥ N`**. The naïve approach of
+       reading versions from `Admin.GetRaftGroups` does **not** work:
+       `GetRaftGroups` (`adapter/admin_grpc.go:382-416`) iterates the
+       *local* `AdminServer`'s registered groups and populates each
+       row from the local engine's `Status()`. A `node_version` field
+       added to `RaftGroupState` would therefore only ever report the
+       admin server's own version — followers on other nodes would
+       not be reflected, and the gate would falsely pass on a
+       partially-upgraded cluster.
+
+       Phase 1 adds a small dedicated RPC that fans out:
        ```protobuf
-       message RaftGroupState {
-         // ... existing fields 1-6 unchanged ...
-         // node_version is the semver of the binary running on this
-         // member, populated from the build-time version stamp.
-         // Empty string on members reporting from a release older
-         // than the field was introduced (treated as "below N" by
-         // the BeginBackup gate so old members force a refusal).
-         string node_version = 7;
+       service Admin {
+         // ... existing RPCs ...
+         rpc GetNodeVersion(GetNodeVersionRequest)
+             returns (GetNodeVersionResponse) {}
        }
+       message GetNodeVersionRequest  {}
+       message GetNodeVersionResponse { string node_version = 1; }
        ```
-       The admin handler populates `node_version` from the local
-       binary's compiled-in version constant; follower versions are
-       surfaced via the existing membership-state propagation path
-       used by `GetRaftGroups`. If any member reports a version older
-       than N, `BeginBackup` returns `FailedPrecondition` with a clear
-       message ("upgrade node X to vN before backups can be taken").
+       The admin server handling `BeginBackup` issues `GetNodeVersion`
+       to every peer in `AdminServer.members` (and to itself); each
+       peer responds with its compiled-in version constant. The
+       handler refuses `BeginBackup` if any peer returns a version
+       below N or fails to respond within `--begin-backup-deadline`.
+       This avoids restructuring `GetRaftGroups` (which today returns
+       one row per *group* keyed by local engine, not per *member*),
+       while still giving `BeginBackup` a fleet-wide view.
+
+       For visibility, `RaftGroupState` is also extended with a
+       `string leader_node_version = 7;` field populated from
+       `GetNodeVersion(leader)` so the admin UI can surface mixed-
+       version groups directly. This field is informational and not
+       used for the gate decision (the gate uses the dedicated fan-
+       out so it covers followers too).
+
+       If any member reports a version older than N or is
+       unreachable, `BeginBackup` returns `FailedPrecondition` with a
+       clear message ("upgrade node X to vN before backups can be
+       taken").
 
     Releases N and N+1 may be the same calendar release if the
     operator is willing to enforce a fleet-wide upgrade window
@@ -1434,7 +1475,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses the new `ShardStore.ScanKeysAt`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope and that existing `ScanAt` callers are bytewise-unchanged |
 | `TestExpectedKeysBaselineRunsAfterShardCatchup` | Force shard B to lag at `BeginBackup` time; verify the baseline scan blocks until step 2 (catch-up) completes for B, so B's `expected_keys[i].key_count` is the true count at `read_ts` rather than the partial-pre-catch-up count |
 | `TestForwardCompatUnknownFSMTag` | A release-N FSM receiving a synthetic `0x03`-tagged entry (representing a future `BackupPin` from a release-N+1 leader) returns nil from `Apply` and emits an `unknown_fsm_tag` warning, with no apply-loop stall and no FSM mutation. Tags `0x10+` (outside the reserved range) still error so the forward-compat door is bounded |
-| `TestBeginBackupGatesOnMinVersion` | If any group member's `RaftGroupState.node_version` is `< N` (or empty), `BeginBackup` returns `FailedPrecondition` and proposes no `BackupPin` entries on any group; once all members report `node_version ≥ N`, the same call succeeds. Verify the `proto/admin.proto` `node_version = 7` field is populated from the build-time version constant on every node |
+| `TestBeginBackupGatesOnMinVersion` | The `BeginBackup` handler fans out `GetNodeVersion` to every peer in `AdminServer.members`. If any peer returns `node_version < N` (or is unreachable within `--begin-backup-deadline`), the call returns `FailedPrecondition` and proposes no `BackupPin` entries on any group; once every peer reports `node_version ≥ N`, the same call succeeds. A 3-node cluster where node B is at v(N-1) while A and C are at vN is the canonical fixture |
 | `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
