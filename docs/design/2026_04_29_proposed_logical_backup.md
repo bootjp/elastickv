@@ -312,9 +312,10 @@ item table emits 50 million inodes. On most modern filesystems
 slow for live filesystem operations.
 
 For tables where the inode count is the binding constraint, the
-producer accepts an opt-in `--dynamodb-bundle-mode jsonl[:size=64MiB]`
-that emits items as `items/data-<part-id>.jsonl` instead, packed up
-to a configurable per-file size budget:
+producer accepts an opt-in `--dynamodb-bundle-mode jsonl` (paired
+with `--dynamodb-bundle-size 64MiB`, defaulting to that value) that
+emits items as `items/data-<part-id>.jsonl` instead, packed up to the
+configurable per-file size budget:
 
 ```
 dynamodb/orders/
@@ -435,8 +436,10 @@ redis/
     │   └── tags%3Apost1.json
     ├── zsets/
     │   └── leaderboard.json
-    └── streams/
-        └── events.jsonl
+    ├── streams/
+    │   └── events.jsonl
+    └── hll/
+        └── pfcount%3Auniques.bin
 ```
 
 Redis values are encoded so that `redis-cli --pipe` (or the equivalent in
@@ -611,7 +614,7 @@ the proposal does add is a thin **iterator wrapper** so a multi-million
 key range does not need to be materialized in one call:
 
 ```go
-// kv/backup_scan.go (new)
+// kv/shard_store.go (new method on *ShardStore — same file as ScanAt)
 type BackupScanner interface {
     // Next advances the iterator. Returns (nil, false, nil) at end-of-range.
     // The returned KVPair is owned by the caller until the next call to Next.
@@ -620,11 +623,35 @@ type BackupScanner interface {
 }
 
 // NewBackupScanner returns a forward iterator over [start, end) at ts.
-// Internally calls ShardStore.ScanAt in pages of pageSize, chaining
+// Internally calls ScanAt in pages of pageSize, chaining
 // `start = lastReturnedKey + \x00` between pages so no lock is held
 // across pages and the compactor's MVCC retention budget is bounded.
-func (c *ShardedCoordinator) NewBackupScanner(start, end []byte, ts uint64, pageSize int) BackupScanner
+func (s *ShardStore) NewBackupScanner(start, end []byte, ts uint64, pageSize int) BackupScanner
 ```
+
+`NewBackupScanner` lives on `*ShardStore` (its natural home, sharing a
+file with `ScanAt`) rather than `*ShardedCoordinator`. The coordinator
+type today (`kv/sharded_coordinator.go:124`) has no `*ShardStore`
+field — only `engine`, `router`, `groups`, `clock`, and a raw
+`store.MVCCStore` — so placing the scanner on the coordinator would
+force either an awkward extra field plus `main.go` wiring or a
+roundabout coordinator → router → ShardStore lookup. Putting it on
+`*ShardStore` keeps the scan primitive cohesive with `ScanAt` and
+lets the admin server reach it directly via the existing
+`AdminServer` → `ShardStore` wiring used by `GetRaftGroups`.
+
+> **Phase 1 also updates `ScanAt`'s doc comment**
+> (`kv/shard_store.go:101–105`) which today warns _"this method is
+> NOT a globally consistent snapshot; the caller must implement a
+> cross-shard snapshot fence"_. Under the backup contract the caller
+> *is* fencing — `BeginBackup` waits for `applied_index ≥ f(ts)` on
+> every group before any `Next` call. The new comment must say
+> something like: _"consistent across groups when the caller has
+> fenced `applied_index ≥ f(ts)` cluster-wide before calling, as
+> `BeginBackup` does. Without that fence, results are eventually-
+> consistent across groups."_ Without this comment update, code
+> review of the Phase 1 producer will flag the `ScanAt` use as
+> contradicting the warning.
 
 `pageSize` is the same `ScanAt` `limit` parameter; the producer's
 default is 1024 and is exposed as a `--scan-page-size` CLI flag.
@@ -660,17 +687,29 @@ message BeginBackupResponse {
 // dump calls this every ttl_ms/3 (producer default) so a multi-hour
 // scan never relies on a single TTL window. The read_ts is preserved
 // across renewals; only the deadline shifts.
-message RenewBackupRequest  { bytes pin_token = 1; uint64 ttl_ms = 2; }
+message RenewBackupRequest {
+  bytes  pin_token = 1;
+  // Same range constraint as BeginBackupRequest.ttl_ms:
+  // 60s–24h, bounded above by backup_max_ttl_ms. Out-of-range values
+  // are rejected with InvalidArgument.
+  uint64 ttl_ms    = 2;
+}
 message RenewBackupResponse { uint64 ttl_ms_effective = 1; }
 
 message EndBackupRequest  { bytes pin_token = 1; }
 message EndBackupResponse {}
 
+// ListAdaptersAndScopes runs the per-adapter metadata-prefix scan at
+// the read_ts associated with pin_token, so the returned scope list
+// is a precise match for what BackupScanner will surface. A new scope
+// created by a concurrent client between BeginBackup and this call is
+// invisible at the pinned read_ts and therefore not listed.
+message ListAdaptersAndScopesRequest  { bytes pin_token = 1; }
 message ListAdaptersAndScopesResponse {
-  repeated string dynamodb_tables = 1;  // from !ddb|meta|table| scan
-  repeated string s3_buckets       = 2;  // from !s3|bucket|meta| scan
+  repeated string dynamodb_tables = 1;  // from !ddb|meta|table| scan at read_ts
+  repeated string s3_buckets       = 2;  // from !s3|bucket|meta| scan at read_ts
   repeated uint32 redis_databases  = 3;  // {0} until multi-db lands
-  repeated string sqs_queues       = 4;  // from !sqs|queue|meta| scan
+  repeated string sqs_queues       = 4;  // from !sqs|queue|meta| scan at read_ts
 }
 ```
 
@@ -833,7 +872,10 @@ elastickv-restore apply \
   [--adapter dynamodb,s3,redis,sqs] \
   [--scope    dynamodb=orders] \
   [--mode replace|merge|skip-existing] \
-  [--rate-limit 5000ops/s]
+  [--rate-limit 5000ops/s] \
+  [--preserve-ttl] \
+  [--preserve-visibility] \
+  [--stream-merge-strategy reject|auto-id]
 ```
 
 `replace` deletes the target scope before re-importing; `merge`
@@ -1031,6 +1073,8 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestS3PathFileVsDirectoryCollision` | Bucket holds both `path/to` (object) and `path/to/obj`; producer renames the shorter key to `path/to.elastickv-leaf-data` and records it in `KEYMAP.jsonl`; restore tool reverses it via `MANIFEST.s3_collision_strategy` |
 | `TestBeginBackupTooManyActiveBackups` | Reaching `max_active_backup_pins` returns `ResourceExhausted`; releasing one pin frees a slot for the next request |
 | `TestRenewBackupExtendsDeadline` | `RenewBackup` shifts the deadline; producer's failed-renewal path aborts the dump with a critical log line rather than continuing past the TTL |
+| `TestRenewBackupTTLRangeValidation` | `RenewBackup` with `ttl_ms < 60s` or `ttl_ms > backup_max_ttl_ms` returns `InvalidArgument`; in-range values succeed |
+| `TestListAdaptersAndScopesAtPinTS` | A scope created (e.g. CreateTable) after `BeginBackup` is not surfaced by `ListAdaptersAndScopes(pin_token)`; pre-existing scopes are |
 
 ### P1
 
