@@ -1240,10 +1240,11 @@ pre-conditions and idempotency rules are different.
   response.
 
   Used by the §7.1 cutover commands to fan-out a fresh
-  capability poll across every voting member of every Raft
-  group; the leader uses `(full_node_id, local_epoch)` from
-  every response to populate the batch writer registry inside
-  the `bootstrap-encryption` Raft entry per §5.6 step 1a.
+  capability poll across **every member (voters and learners)
+  of every Raft group** in the route catalog; the leader uses
+  `(full_node_id, local_epoch)` from every response to populate
+  the batch writer registry inside the `bootstrap-encryption`
+  Raft entry per §5.6 step 1a.
   Reuses the existing admin-listener TLS configuration. The
   RPC is read-only and side-effect-free, so it can be served
   unconditionally on every node regardless of leadership state.
@@ -1281,8 +1282,8 @@ coordinator does not pre-encrypt; the FSM does not bypass this path.
   ever happening on a real cluster — encrypted writes only begin
   after every replica has applied the
   `enable-storage-envelope` cluster-flag entry, which by
-  precondition requires every voting member to be on a binary
-  that knows the new bit layout. The §9.1 startup refusal "data
+  precondition requires every member (voters AND learners) to
+  be on a binary that knows the new bit layout. The §9.1 startup refusal "data
   dir contains a sidecar but `--encryption-enabled` is not set"
   is the second backstop. The implementation PR must add a
   comment to `encodeValue` / `decodeValue` pinning bit 0 =
@@ -1363,7 +1364,8 @@ coordinator does not pre-encrypt; the FSM does not bypass this path.
   - `raftEncodeEncryptionBootstrap   = 0x04` — body is the
     `bootstrap-encryption` payload per §5.6 (initial wrapped
     DEK pair plus the batch writer registry covering every
-    voting member that passed the capability pre-check).
+    member — voters and learners — that passed the capability
+    pre-check).
   - `raftEncodeEncryptionRotation    = 0x05` — body is the
     rotate / rewrap-deks / retire-dek / enable-storage-envelope /
     enable-raft-envelope payload per §5.2 / §5.4 / §7.1 with
@@ -1446,11 +1448,22 @@ elastickv-admin encryption resync-sidecar    # §5.5 follower repair
 elastickv-admin encryption enable-storage-envelope
                                               # §7.1 Phase 1 cutover;
                                               # refuses unless every
-                                              # voting member reports
-                                              # encryption_capable
+                                              # member of every Raft
+                                              # group -- voters AND
+                                              # learners (Voters ∪
+                                              # Learners) -- reports
+                                              # encryption_capable.
+                                              # Learners apply the
+                                              # same FSM path; a
+                                              # stale learner left
+                                              # outside the gate
+                                              # would mis-handle
+                                              # encrypted entries
+                                              # post-cutover.
 elastickv-admin encryption enable-raft-envelope
                                               # §7.1 Phase 2 cutover;
-                                              # same capability gate;
+                                              # same Voters ∪ Learners
+                                              # capability gate;
                                               # records cutover index
                                               # in the sidecar
 elastickv-admin encryption disable           # refuses; documents the
@@ -1535,8 +1548,9 @@ the per-version `encryption_state` bit — is broken at two layers:
 Both problems share one fix: **gate the encryption-active state on
 a Raft-replicated cluster flag, not on a per-node startup flag.**
 The cluster-flag flip happens only after a membership-snapshot
-check confirms every voting member is running an
-encryption-capable binary. The per-node `--encryption-enabled`
+check confirms every member (voters and learners both — learners
+run the same FSM apply path) is running an encryption-capable
+binary. The per-node `--encryption-enabled`
 flag becomes a *capability* assertion, not a *behaviour* trigger.
 
 **Phase 0 — Capability rollout.**
@@ -1651,9 +1665,9 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    applied entries up to it" — that earlier wording was
    misleading because old binaries cannot decode `0x05` at
    all. The actual safety guarantee is the Phase 0 capability
-   gate from step 3: every voting member must already be on a
-   binary that knows the `0x04`/`0x05` tag space before this
-   entry is proposed.
+   gate from step 3: every member (voters and learners) must
+   already be on a binary that knows the `0x04`/`0x05` tag
+   space before this entry is proposed.
 8. From the **next** entry after the flag entry's apply index
    onward, every leader wraps new proposal `Data []byte` with
    the raft DEK (§4.2). The flag entry itself is **not**
