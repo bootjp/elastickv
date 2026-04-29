@@ -1482,7 +1482,7 @@ func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 		return
 	}
 	for _, r := range engine.Stats() {
-		s.RegisterRoute(r.RouteID, r.Start, r.End)
+		s.RegisterRoute(r.RouteID, r.Start, r.End, r.GroupID)
 	}
 }
 

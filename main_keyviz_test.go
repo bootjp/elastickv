@@ -73,7 +73,7 @@ func TestSeedKeyVizRoutesNoOpOnNilSampler(t *testing.T) {
 func TestStartKeyVizFlusherReturnsAfterCancel(t *testing.T) {
 	t.Parallel()
 	s := keyviz.NewMemSampler(keyviz.MemSamplerOptions{Step: time.Millisecond, HistoryColumns: 4})
-	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("b")))
+	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("b"), 0))
 	s.Observe(1, keyviz.OpRead, 0, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
