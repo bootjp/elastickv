@@ -1250,7 +1250,11 @@ written.
 
 - New admin RPCs on `proto/admin.proto`: `BeginBackup` (with `ttl_ms`),
   `EndBackup`, `RenewBackup`, `ListAdaptersAndScopes` (signatures in
-  "Read-Side Consistency").
+  "Read-Side Consistency"). Plus a one-field extension to the existing
+  `RaftGroupState` message (`proto/admin.proto:38`): add
+  `string node_version = 7;` populated by each admin handler from the
+  build-time version constant. The `BeginBackup` rolling-upgrade gate
+  reads this field; without it the gate cannot be implemented.
 - Extend `kv/active_timestamp_tracker.go` with `PinWithDeadline`,
   `Extend`, and the per-second sweeper goroutine that reaps expired
   pins and emits the `backup_pin_expired` structured warning.
@@ -1279,19 +1283,43 @@ written.
     1. **Release N (forward-compat handler only).** `kvFSM.Apply` is
        extended so unknown tags in the reserved range
        `[0x03, 0x0F]` are treated as no-ops with a structured
-       `unknown_fsm_tag` warning — no error returned. No new admin
-       RPCs, no producer, no `BackupPin` entries are ever written
-       at this version. Operators upgrade their clusters fleet-wide
-       to release N before the next step is enabled.
+       `unknown_fsm_tag` warning — no error returned. The new check
+       is added in `kvFSM.Apply` (`kv/fsm.go:60`) **immediately after
+       the `raftEncodeHLCLease` guard and before the call to
+       `decodeRaftRequests`**, so all leading-byte dispatch lives in
+       one place rather than splitting the table between `Apply` and
+       `decodeRaftRequests`'s `default:` case. Tags `0x10` and above
+       still fall through to `decodeRaftRequests` and error as
+       before, bounding the forward-compat door. No new admin RPCs,
+       no producer, no `BackupPin` entries are ever written at this
+       version. Operators upgrade their clusters fleet-wide to
+       release N before the next step is enabled.
     2. **Release N+1 (BackupPin enabled).** The actual `applyBackupPin`
        / `Extend` / `Release` handlers ship and the admin RPCs are
        activated. `BeginBackup` itself **gates on every group member
-       reporting `min_backup_version ≥ N`** — verified through the
-       existing `Admin.GetRaftGroups` membership view, which already
-       carries per-node version metadata. If any member reports a
-       version older than N, `BeginBackup` returns
-       `FailedPrecondition` with a clear message ("upgrade
-       node X to vN before backups can be taken").
+       reporting `node_version ≥ N`** via `Admin.GetRaftGroups`. The
+       version field does not exist today: `RaftGroupState` in
+       `proto/admin.proto:38-49` carries only `raft_group_id`,
+       `leader_node_id`, `leader_term`, `commit_index`,
+       `applied_index`, and `last_contact_unix_ms`. Phase 1 therefore
+       adds:
+       ```protobuf
+       message RaftGroupState {
+         // ... existing fields 1-6 unchanged ...
+         // node_version is the semver of the binary running on this
+         // member, populated from the build-time version stamp.
+         // Empty string on members reporting from a release older
+         // than the field was introduced (treated as "below N" by
+         // the BeginBackup gate so old members force a refusal).
+         string node_version = 7;
+       }
+       ```
+       The admin handler populates `node_version` from the local
+       binary's compiled-in version constant; follower versions are
+       surfaced via the existing membership-state propagation path
+       used by `GetRaftGroups`. If any member reports a version older
+       than N, `BeginBackup` returns `FailedPrecondition` with a clear
+       message ("upgrade node X to vN before backups can be taken").
 
     Releases N and N+1 may be the same calendar release if the
     operator is willing to enforce a fleet-wide upgrade window
@@ -1319,7 +1347,8 @@ written.
     `BeginBackup` time and echoed in every subsequent `BackupExtend`
     / `BackupRelease` so the FSM can target the right tracker entry.
     Hand-coded binary (vs. proto) keeps the entry small enough to
-    stay within the existing `MaxEntryBytes` budget and avoids
+    stay well within the `MaxSizePerMsg` limit (default 1 MiB,
+    `internal/raftengine/etcd/engine.go:55`) and avoids
     pulling proto codegen into the FSM apply hot path.
 - New `kv/backup_scan.go` — `BackupScanner` iterator wrapping the
   existing `ShardStore.ScanAt` (`kv/shard_store.go:106`) so multi-
@@ -1405,7 +1434,7 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses the new `ShardStore.ScanKeysAt`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope and that existing `ScanAt` callers are bytewise-unchanged |
 | `TestExpectedKeysBaselineRunsAfterShardCatchup` | Force shard B to lag at `BeginBackup` time; verify the baseline scan blocks until step 2 (catch-up) completes for B, so B's `expected_keys[i].key_count` is the true count at `read_ts` rather than the partial-pre-catch-up count |
 | `TestForwardCompatUnknownFSMTag` | A release-N FSM receiving a synthetic `0x03`-tagged entry (representing a future `BackupPin` from a release-N+1 leader) returns nil from `Apply` and emits an `unknown_fsm_tag` warning, with no apply-loop stall and no FSM mutation. Tags `0x10+` (outside the reserved range) still error so the forward-compat door is bounded |
-| `TestBeginBackupGatesOnMinVersion` | If any group member reports `version < N`, `BeginBackup` returns `FailedPrecondition` and proposes no `BackupPin` entries on any group; once all members report `version ≥ N`, the same call succeeds |
+| `TestBeginBackupGatesOnMinVersion` | If any group member's `RaftGroupState.node_version` is `< N` (or empty), `BeginBackup` returns `FailedPrecondition` and proposes no `BackupPin` entries on any group; once all members report `node_version ≥ N`, the same call succeeds. Verify the `proto/admin.proto` `node_version = 7` field is populated from the build-time version constant on every node |
 | `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
