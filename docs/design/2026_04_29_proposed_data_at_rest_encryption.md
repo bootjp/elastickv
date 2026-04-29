@@ -248,6 +248,32 @@ Envelope format (single byte stream, stored as the Pebble value):
       apply, it proposes `RegisterEncryptionWriter` against
       the new DEK with the same coordinator-side gate as the
       process-start case above.
+    - **ConfChange-time (post-bootstrap learner / voter).**
+      Learners do not serve client writes, so they have **no
+      coordinator gate** to defer the first encrypted FSM
+      apply behind a `RegisterEncryptionWriter` round-trip. A
+      learner added after the §5.6 bootstrap batch would
+      otherwise apply encrypted entries from the leader before
+      it appears in the writer registry — a 16-bit `node_id`
+      collision with a historical writer under the same DEK
+      would then cause AES-GCM nonce reuse on the very first
+      FSM-apply Put. The fix is to **batch the registration
+      with the membership change**: the leader processing
+      `ConfChangeAddLearner` (or `ConfChangeAddNode`) for a
+      capability-checked candidate proposes a paired
+      `RegisterEncryptionWriter(dek_id, candidate_full_node_id,
+      candidate_local_epoch)` Raft entry **before** the
+      conf-change is committed, using the
+      `(full_node_id, local_epoch)` already collected by the
+      §7.1 post-cutover gate's `EncryptionAdmin.GetCapability`
+      call. The conf-change is rejected with
+      `ErrPeerNotEncryptionRegistered` if the registration
+      apply fails (e.g., on collision). By the time the
+      candidate first sees a committed entry under any
+      unretired DEK, its registry slot is already in place.
+      Same rule applies to learner→voter promotion: the
+      promotion conf-change is gated on a fresh registration
+      check.
 
     For each path, FSM apply checks:
 
@@ -423,6 +449,50 @@ deliberately do not protect lookup keys at the storage layer
 is dense and easy to inspect. Wrapping the proposal payload means
 the etcd raft WAL on disk is opaque except for Raft metadata (term,
 index, type).
+
+#### Raft envelope wire format
+
+The raft envelope reuses the §4.1 layout so the AES-GCM call site
+is shared, but the AAD differs:
+
+```text
++--------+------+---------+----------+----------------+--------+
+| 0x01   | 0x00 | key_id  | nonce    | ciphertext     | tag    |
+| 1 byte | 1 B  | 4 bytes | 12 bytes | N bytes        | 16 B   |
++--------+------+---------+----------+----------------+--------+
+```
+
+- `flag` is fixed at `0x00` — there is no compress-then-encrypt
+  pass for raft proposals (the proposal payload is small and
+  high-entropy already, and the FSM apply path is latency-
+  sensitive). Reserved for future use.
+- `key_id` references the **raft DEK** (`purpose: "raft"` in the
+  sidecar), not the storage DEK. The two DEKs are rotated
+  independently and have separate `local_epoch` counters in the
+  sidecar (`keys[<id>].local_epoch` per §5.1).
+- `nonce` is built with the same deterministic
+  `node_id ‖ local_epoch ‖ write_count` construction as §4.1,
+  drawing from the **raft DEK's own** `local_epoch` and a
+  separate `atomic.Uint64` for the write counter. The two
+  envelope kinds therefore never share a nonce even if the
+  underlying DEK material were the same. Only the leader calls
+  Wrap (because only the leader proposes), so `write_count` is
+  trivially monotonic.
+- `ciphertext` — AES-256-GCM(plaintext, nonce, AAD =
+  `purpose("raft") ‖ envelope_version ‖ key_id`). The
+  `purpose("raft")` literal byte (`0x52`, ASCII `'R'`)
+  distinguishes raft envelopes from storage envelopes (whose
+  AAD starts implicitly with the `pebble_key` per §4.1). A
+  storage-layer ciphertext replayed into the raft layer (or
+  vice versa) fails GCM verification because the AAD prefix
+  does not match. There is no `pebble_key` field in the raft
+  AAD because the raft envelope is location-independent — it
+  is identified by `entry.Index`, which the engine hook
+  already uses to gate the unwrap (§6.3).
+- `tag` — same 16-byte GCM authentication tag as §4.1.
+
+Per-payload overhead is the same 34 bytes as the storage
+envelope.
 
 This costs one decrypt + one encrypt per write on the apply path
 (decrypt the raft envelope; encrypt the value into the storage
@@ -957,12 +1027,12 @@ To detect and repair sidecar-vs-log divergence:
      `rewrap-deks` entry that serialises **all** unretired
      wrapped DEKs (active + retiring), bringing every node's
      sidecar to the full set in one apply.
-   - **Manual on a stuck follower** — operator runs
-     `elastickv-admin encryption resync-sidecar`. The command
-     replays **every entry that satisfies the
-     `isEncryptionRelevant()` predicate** (the same six-entry
-     set used by the §5.5 lag check above: `rotate-dek`,
-     `rewrap-deks`, `bootstrap-encryption`,
+   - **Manual on a stuck follower — log replay path.** Operator
+     runs `elastickv-admin encryption resync-sidecar`. The
+     command first attempts to replay **every entry that
+     satisfies the `isEncryptionRelevant()` predicate** (the
+     same six-entry set used by the §5.5 lag check above:
+     `rotate-dek`, `rewrap-deks`, `bootstrap-encryption`,
      `enable-storage-envelope`, `enable-raft-envelope`,
      `retire-dek`) between the sidecar's `raft_applied_index`
      and the FSM's applied index into the local sidecar (not
@@ -975,6 +1045,35 @@ To detect and repair sidecar-vs-log divergence:
      entries to be decoded through the legacy first-byte tag
      space, or producing `unknown_key_id` failures on the
      first encrypted read. Explicitly rejected.
+   - **Manual on a stuck follower — full-state fallback when
+     the log has been compacted.** Long downtime can cause
+     the missing encryption-relevant entries to be truncated
+     out of the Raft log entirely (etcd raft compacts the log
+     after a snapshot is taken). In that case the log-replay
+     path returns `ErrLogCompactedPastSidecar` and the command
+     automatically falls back to a leader-side full-state
+     fetch: it issues
+     `EncryptionAdmin.GetSidecarState(Empty) → SidecarStateReport
+     { wrapped_deks_by_id (map<uint32, bytes>),
+       active_storage_id (uint32), active_raft_id (uint32),
+       storage_envelope_active (bool),
+       raft_envelope_cutover_index (uint64),
+       latest_applied_index (uint64) }`
+     against the current leader. The leader serializes its
+     in-memory keystore (every unretired DEK, all wrapped
+     under the current KEK) plus the active flags and the
+     cutover index, and the recovering follower writes that
+     full snapshot into its sidecar via the §5.1 crash-
+     durable protocol. The fallback is **authoritative** —
+     any local divergence is overwritten — which is safe
+     because the recovering node was already behind and has
+     no committed-but-unapplied state to lose. The recovered
+     `raft_applied_index` is set to `latest_applied_index`
+     from the response so the next startup check passes.
+     Without this fallback an operator who left a node
+     offline through a snapshot retention window would see
+     `ErrSidecarBehindRaftLog` with no recovery path short
+     of re-bootstrapping the data dir.
    Refusing to start until recovery completes is deliberate:
    silently serving with an incomplete sidecar would let the
    node write under one `key_id` while failing to decrypt
@@ -1119,8 +1218,26 @@ pre-conditions and idempotency rules are different.
     uint64 full_node_id       = 4;  // for §5.6 batch registry
     uint32 local_epoch        = 5;  // for §5.6 batch registry
   }
+  message SidecarStateReport {
+    map<uint32, bytes> wrapped_deks_by_id    = 1; // every unretired DEK
+    uint32             active_storage_id      = 2;
+    uint32             active_raft_id         = 3;
+    bool               storage_envelope_active = 4;
+    uint64             raft_envelope_cutover_index = 5;
+    uint64             latest_applied_index   = 6;
+  }
   rpc GetCapability(Empty) returns (CapabilityReport);
+  rpc GetSidecarState(Empty) returns (SidecarStateReport);
   ```
+
+  `GetSidecarState` is the §5.5 compaction-fallback RPC: any
+  node can request the leader's full encryption state to
+  rebuild a sidecar that fell behind a Raft-log compaction
+  window. Returns the full unretired DEK set wrapped under
+  the current KEK so the response is leakage-safe (same
+  property as the on-disk sidecar). Served on every node but
+  the cutover-recovery flow only consults the leader's
+  response.
 
   Used by the §7.1 cutover commands to fan-out a fresh
   capability poll across every voting member of every Raft
@@ -1647,19 +1764,39 @@ Both modes happen with no operator-visible error until clients
 start seeing missing data on reads routed to the new node.
 
 To prevent this, the control plane (the leader of the default
-Raft group) **rejects `AddVoter` / `ConfChange` / learner
-promotion** for any peer whose `EncryptionAdmin.GetCapability`
-RPC does not return `encryption_capable = true`, once
-`storage_envelope_active` or `raft_envelope_active` has been
-applied locally. The `Distribution` admin RPC layer surfaces this
-as `ErrPeerNotEncryptionCapable` so the operator sees a clear
+Raft group) **rejects `ConfChangeAddVoter` /
+`ConfChangeAddLearner` / learner promotion** for any peer whose
+`EncryptionAdmin.GetCapability` RPC does not return
+`encryption_capable = true`, once `storage_envelope_active` or
+`raft_envelope_active` has been applied locally. The
+`Distribution` admin RPC layer surfaces this as
+`ErrPeerNotEncryptionCapable` so the operator sees a clear
 refusal at the moment they issue the membership change, not on
 the first failed read.
+
+**The capability check is paired with a writer-registry
+registration in the same flow.** The same `GetCapability` call
+that proves the candidate is encryption-capable also returns
+`(full_node_id, local_epoch)` (per §6.1's `CapabilityReport`).
+The leader uses those values to propose a
+`RegisterEncryptionWriter(dek_id, full_node_id, local_epoch)`
+Raft entry **for every unretired DEK** before it commits the
+conf-change. If any of those registrations fail (e.g., a
+`uint16(node_id)` collision with a historical writer), the
+conf-change is rejected with `ErrPeerNotEncryptionRegistered`.
+This closes the §4.1 fourth-path window for learners (which
+have no client-facing coordinator to gate their first
+encrypted FSM apply behind a registration round-trip): by the
+time the candidate first observes any committed entry under
+any active DEK, its registry slot is already in place.
 
 The same gate applies to learners promoted to voters: a learner
 that joined before cutover but never restarted with the
 encryption flag must be restarted (or `EncryptionAdmin.GetCapability`
-must report capable) before promotion succeeds.
+must report capable) before promotion succeeds. The promotion
+conf-change re-runs the registration check too, since a long-
+running learner may have rotated through new DEKs that need
+fresh registry entries.
 
 ### 7.2 Why we will not support encrypted → cleartext
 
