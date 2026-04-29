@@ -843,7 +843,6 @@ func TestReRegisterDuringPruneGraceCancelsPrune(t *testing.T) {
 	}
 }
 
-// TestNonPositiveOptionsFallBackToDefaults pins Codex round-8 P2: a
 // TestRegisterRouteCarriesGroupID pins the Phase 2-C+ contract that
 // MatrixRow.RaftGroupID echoes the groupID supplied at RegisterRoute,
 // independent of leader-term tracking. A route registered with
@@ -906,6 +905,109 @@ func TestSetLeaderTermNilSafe(t *testing.T) {
 	t.Parallel()
 	var s *MemSampler
 	s.SetLeaderTerm(1, 42) // must not panic
+}
+
+// TestSetLeaderTermZeroGroupIDDoesNotPolluteVirtualBucket pins the
+// invariant that virtual aggregate buckets (which span multiple real
+// groups and stamp RaftGroupID=0) must always emit LeaderTerm=0.
+// Without the SetLeaderTerm groupID==0 guard, a caller that mistakenly
+// publishes a term for groupID=0 would cause appendDrainedRow's
+// `terms[groupID]` lookup to stamp the virtual bucket with that
+// non-zero term, breaking the fan-out merge's max-merge fallback for
+// cross-group cells.
+func TestSetLeaderTermZeroGroupIDDoesNotPolluteVirtualBucket(t *testing.T) {
+	t.Parallel()
+	s, _ := setupOneIndividualPlusVirtualBucket(t)
+	s.SetLeaderTerm(0, 999) // bug case: caller passes the reserved groupID
+	s.Observe(2, OpWrite, 16, 64)
+	s.Flush()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) == 0 {
+		t.Fatalf("expected at least one column")
+	}
+	var virtualRow *MatrixRow
+	for i := range cols[0].Rows {
+		if cols[0].Rows[i].Aggregate {
+			virtualRow = &cols[0].Rows[i]
+			break
+		}
+	}
+	if virtualRow == nil {
+		t.Fatalf("expected an aggregate row in column 0; rows=%+v", cols[0].Rows)
+	}
+	if virtualRow.RaftGroupID != 0 {
+		t.Errorf("virtual bucket RaftGroupID = %d, want 0", virtualRow.RaftGroupID)
+	}
+	if virtualRow.LeaderTerm != 0 {
+		t.Errorf("virtual bucket LeaderTerm = %d, want 0 (groupID=0 is reserved for aggregate buckets)", virtualRow.LeaderTerm)
+	}
+}
+
+// TestVirtualBucketRaftGroupIDIsZero pins that an over-budget route
+// folded into a virtual aggregate bucket emits RaftGroupID=0 even
+// when the member routes themselves were registered with non-zero
+// groupIDs. The fan-out aggregator relies on this to fall back to
+// max-merge for aggregate rows; without it, propagating a member's
+// groupID into the bucket would silently re-engage per-term dedupe
+// on rows that span multiple Raft groups.
+func TestVirtualBucketRaftGroupIDIsZero(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 1,
+	})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 42) {
+		t.Fatal("route 1 should fit (group 42)")
+	}
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 42) {
+		t.Fatal("route 2 should fold into virtual bucket (group 42, over budget)")
+	}
+	s.Observe(2, OpWrite, 16, 64)
+	s.Flush()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) == 0 {
+		t.Fatalf("expected at least one column")
+	}
+	var virtualRow *MatrixRow
+	for i := range cols[0].Rows {
+		if cols[0].Rows[i].Aggregate {
+			virtualRow = &cols[0].Rows[i]
+			break
+		}
+	}
+	if virtualRow == nil {
+		t.Fatalf("expected an aggregate row in column 0; rows=%+v", cols[0].Rows)
+	}
+	if virtualRow.RaftGroupID != 0 {
+		t.Errorf("virtual bucket RaftGroupID = %d, want 0 (member groupID=42 must not propagate)", virtualRow.RaftGroupID)
+	}
+}
+
+// TestRegisterRouteSecondCallIgnoresGroupID pins the live-slot
+// idempotency contract documented on RegisterRoute: when the slot is
+// already live, a second RegisterRoute call returns true without
+// updating the slot's metadata, including GroupID. Callers that need
+// to change a live slot's GroupID must RemoveRoute + RegisterRoute,
+// not call RegisterRoute again with a different groupID.
+func TestRegisterRouteSecondCallIgnoresGroupID(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 10) {
+		t.Fatal("first RegisterRoute returned false")
+	}
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 99) {
+		t.Fatal("second RegisterRoute should be a no-op returning true")
+	}
+	s.Observe(1, OpWrite, 16, 64)
+	s.Flush()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) != 1 || len(cols[0].Rows) != 1 {
+		t.Fatalf("unexpected snapshot: %+v", cols)
+	}
+	if got := cols[0].Rows[0].RaftGroupID; got != 10 {
+		t.Errorf("RaftGroupID = %d, want 10 (second call's groupID=99 must be ignored)", got)
+	}
 }
 
 // negative MaxTrackedRoutes used to bypass the zero-check and force

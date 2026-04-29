@@ -377,9 +377,15 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 // nodes that have not finished engine startup contribute partial data
 // without poisoning the merge.
 //
+// groupID == 0 is reserved for virtual aggregate buckets (which span
+// multiple real groups). Calls with groupID == 0 are silently ignored
+// so a future caller cannot accidentally stamp a non-zero term on
+// aggregate rows — they must remain LeaderTerm == 0 so the fan-out
+// merge falls back to max-merge for cross-group cells.
+//
 // nil-receiver-safe.
 func (s *MemSampler) SetLeaderTerm(groupID, term uint64) {
-	if s == nil {
+	if s == nil || groupID == 0 {
 		return
 	}
 	s.groupTermsMu.Lock()
@@ -390,9 +396,15 @@ func (s *MemSampler) SetLeaderTerm(groupID, term uint64) {
 // snapshotGroupTerms returns a copy of the per-group term map. Called
 // at the top of Flush so the column built below sees a stable view
 // of the term mapping even if SetLeaderTerm fires concurrently.
+// Returns nil when no terms have been published yet — `nil[k]` returns
+// the zero value in Go, so the row-builder hot path needs no nil guard
+// and avoids one allocation per Flush before SetLeaderTerm is wired.
 func (s *MemSampler) snapshotGroupTerms() map[uint64]uint64 {
 	s.groupTermsMu.RLock()
 	defer s.groupTermsMu.RUnlock()
+	if len(s.groupTerms) == 0 {
+		return nil
+	}
 	out := make(map[uint64]uint64, len(s.groupTerms))
 	for g, t := range s.groupTerms {
 		out[g] = t
