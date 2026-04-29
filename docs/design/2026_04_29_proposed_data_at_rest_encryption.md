@@ -823,12 +823,20 @@ must cover is therefore broader than just rotation:
 - `rewrap-deks` — re-wraps existing DEKs under the current KEK
   (full-set, per §5.5 step 3); also the auto-recovery proposal
   the leader uses to bring drifted nodes back in sync.
+- `bootstrap-encryption` — creates the **initial** wrapped DEK
+  pair (`dek_storage` + `dek_raft`) and writes the batch
+  writer registry per §5.6. Missing it on restart leaves the
+  sidecar with `active.storage == 0` / `active.raft == 0`
+  while `enable-storage-envelope` may already have committed,
+  which would let the storage layer try to encrypt without any
+  loaded DEK and produce `unknown_key_id` failures on the
+  first read of any post-flag value.
 - `enable-storage-envelope` — flips the §7.1 Phase 1 cluster
   flag and persists `storage_envelope_active = true` into the
   sidecar.
 - `enable-raft-envelope` — flips the §7.1 Phase 2 cluster flag
   AND persists the `raft_envelope_cutover_index` into the
-  sidecar. This entry is the highest-stakes of the four:
+  sidecar. This entry is the highest-stakes of the set:
   missing it on restart causes the FSM to decode every
   post-cutover entry through the legacy first-byte tag space
   (treating an opaque raft envelope as if it were an
@@ -873,18 +881,21 @@ To detect and repair sidecar-vs-log divergence:
    - **Manual on a stuck follower** — operator runs
      `elastickv-admin encryption resync-sidecar`. The command
      replays **every entry that satisfies the
-     `isEncryptionRelevant()` predicate** (the same set used by
-     the §5.5 lag check above: `rotate-dek`, `rewrap-deks`,
+     `isEncryptionRelevant()` predicate** (the same six-entry
+     set used by the §5.5 lag check above: `rotate-dek`,
+     `rewrap-deks`, `bootstrap-encryption`,
      `enable-storage-envelope`, `enable-raft-envelope`,
      `retire-dek`) between the sidecar's `raft_applied_index`
      and the FSM's applied index into the local sidecar (not
      just the most recent rotation, and not just rotation /
      rewrap entries). Restricting the replay to a subset would
      leave intermediate `key_id`s missing OR leave the
-     `raft_envelope_cutover_index` unset — silently breaking
-     historical reads or causing post-cutover Raft entries to
-     be decoded through the legacy first-byte tag space.
-     Explicitly rejected.
+     `raft_envelope_cutover_index` unset OR leave
+     `active.storage` / `active.raft` at zero — silently
+     breaking historical reads, causing post-cutover Raft
+     entries to be decoded through the legacy first-byte tag
+     space, or producing `unknown_key_id` failures on the
+     first encrypted read. Explicitly rejected.
    Refusing to start until recovery completes is deliberate:
    silently serving with an incomplete sidecar would let the
    node write under one `key_id` while failing to decrypt
