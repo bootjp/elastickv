@@ -60,9 +60,26 @@ const (
 // The literal "p|" segment is the discriminator. validateQueueName
 // rejects "|" in queue names, so a legacy "!sqs|msg|data|<queue>|..."
 // can never collide with a partitioned "!sqs|msg|data|p|<queue>|..."
-// — the queue-name segment is base32-encoded and cannot start with
-// the literal ASCII byte 'p' followed by '|'.
+// — the queue-name segment is base64-raw-URL-encoded (see
+// encodeSQSSegment) and cannot start with the literal ASCII byte 'p'
+// followed by '|'.
+//
+// Each partitioned constructor terminates the variable-length
+// queue-name segment with a '|' before the fixed-width partition
+// uint32. Without that delimiter, a prefix scan for queue "q" would
+// also match queue "q1" because base64("q") is a strict byte prefix
+// of base64("q1"). The discriminator inserts the '|' into the prefix
+// itself; the per-constructor terminator inserts it after the queue.
 const sqsPartitionedDiscriminator = "p|"
+
+// sqsPartitionedQueueTerminator is appended after the encoded queue
+// name in every partitioned key. It mirrors the role the fixed-width
+// generation suffix plays in tombstone keys: a hard end-of-segment
+// marker that prevents queue-name prefix collisions during scans.
+// '|' is safe by construction — validateQueueName rejects raw '|',
+// and base64.RawURLEncoding never emits '|' (it uses A-Z, a-z, 0-9,
+// '-', '_').
+const sqsPartitionedQueueTerminator = '|'
 
 // SqsPartitionedMsg*Prefix mirrors each legacy SqsMsg*Prefix with the
 // partitioned-keyspace discriminator inserted. Defined as full string
@@ -260,6 +277,7 @@ func sqsPartitionedMsgDataKey(queueName string, partition uint32, gen uint64, me
 	buf := make([]byte, 0, len(SqsPartitionedMsgDataPrefix)+sqsKeyCapLarge)
 	buf = append(buf, SqsPartitionedMsgDataPrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	buf = append(buf, encodeSQSSegment(messageID)...)
@@ -272,6 +290,7 @@ func sqsPartitionedMsgVisKey(queueName string, partition uint32, gen uint64, vis
 	buf := make([]byte, 0, len(SqsPartitionedMsgVisPrefix)+sqsKeyCapLarge)
 	buf = append(buf, SqsPartitionedMsgVisPrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	buf = appendU64(buf, uint64MaxZero(visibleAtMillis))
@@ -286,6 +305,7 @@ func sqsPartitionedMsgVisPrefixForQueue(queueName string, partition uint32, gen 
 	buf := make([]byte, 0, len(SqsPartitionedMsgVisPrefix)+sqsKeyCapSmall)
 	buf = append(buf, SqsPartitionedMsgVisPrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	return buf
@@ -301,6 +321,7 @@ func sqsPartitionedMsgDedupKey(queueName string, partition uint32, gen uint64, d
 	buf := make([]byte, 0, len(SqsPartitionedMsgDedupPrefix)+sqsKeyCapLarge)
 	buf = append(buf, SqsPartitionedMsgDedupPrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	buf = append(buf, encodeSQSSegment(dedupID)...)
@@ -316,6 +337,7 @@ func sqsPartitionedMsgGroupKey(queueName string, partition uint32, gen uint64, g
 	buf := make([]byte, 0, len(SqsPartitionedMsgGroupPrefix)+sqsKeyCapLarge)
 	buf = append(buf, SqsPartitionedMsgGroupPrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	buf = append(buf, encodeSQSSegment(groupID)...)
@@ -332,6 +354,7 @@ func sqsPartitionedMsgByAgeKey(queueName string, partition uint32, gen uint64, s
 	buf := make([]byte, 0, len(SqsPartitionedMsgByAgePrefix)+sqsKeyCapLarge)
 	buf = append(buf, SqsPartitionedMsgByAgePrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	buf = appendU64(buf, uint64MaxZero(sendTimestampMs))
@@ -348,6 +371,7 @@ func sqsPartitionedMsgByAgePrefixForQueueAllPartitions(queueName string) []byte 
 	buf := make([]byte, 0, len(SqsPartitionedMsgByAgePrefix)+sqsKeyCapSmall)
 	buf = append(buf, SqsPartitionedMsgByAgePrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	return buf
 }
 

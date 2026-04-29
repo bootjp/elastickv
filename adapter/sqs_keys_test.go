@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ import (
 // family prefix is what makes this true; this test fails if the
 // constant ever loses the trailing "|" or the discriminator changes
 // shape such that a partition value (a fixed-width uint32) could
-// align with a base32-encoded queue segment.
+// align with a base64-encoded queue segment.
 func TestSqsPartitionedMsgKeys_DistinctFromLegacy(t *testing.T) {
 	t.Parallel()
 	const (
@@ -109,6 +110,68 @@ func TestSqsPartitionedMsgKeys_PartitionsAreDistinct(t *testing.T) {
 	require.NotEqual(t, a, d, "different queue names must produce different keys")
 }
 
+// TestSqsPartitionedMsgKeys_QueueNamePrefixIsolation pins the
+// queue-name terminator contract: a queue whose encoded name is a
+// strict byte prefix of another queue's encoded name must NOT have
+// its prefix match the longer queue's keys. base64.RawURLEncoding is
+// variable-length and aligned on 3-byte input groups, so for an
+// input length that is a multiple of 3, appending one extra byte
+// extends (without changing) the encoded prefix: base64("queue") =
+// "cXVldWU" is a strict byte prefix of base64("queue1") = "cXVldWUx".
+// Without the trailing '|' terminator after the queue segment, a
+// reaper scan of "queue"'s prefix would surface "queue1"'s entries
+// (and vice versa for the all-partitions byage prefix). This test
+// would have caught the missing-delimiter bug from gemini's review.
+func TestSqsPartitionedMsgKeys_QueueNamePrefixIsolation(t *testing.T) {
+	t.Parallel()
+	const (
+		shortQ    = "queue"  // base64 → "cXVldWU"
+		longQ     = "queue1" // base64 → "cXVldWUx" (strict superstring)
+		gen       = uint64(1)
+		partition = uint32(0)
+		// Distinct from the ts used in other tests so unparam is
+		// satisfied that vis-key callers exercise more than one
+		// timestamp value across the suite.
+		ts    = int64(1234567890)
+		msgID = "id"
+	)
+	// Confirm the precondition: base64(shortQ) is a strict byte
+	// prefix of base64(longQ). If this ever stops being true, the
+	// test still holds the contract but loses its motivating example.
+	require.True(t,
+		bytes.HasPrefix([]byte(encodeSQSSegment(longQ)), []byte(encodeSQSSegment(shortQ))),
+		"sanity: base64(%q) must be a byte prefix of base64(%q)", shortQ, longQ)
+	require.NotEqual(t, encodeSQSSegment(shortQ), encodeSQSSegment(longQ),
+		"sanity: encodings must differ in length")
+
+	// Per-(queue, partition) vis prefix must not leak across queue
+	// names that share an encoded prefix.
+	shortVisPrefix := sqsPartitionedMsgVisPrefixForQueue(shortQ, partition, gen)
+	longVisKey := sqsPartitionedMsgVisKey(longQ, partition, gen, ts, msgID)
+	require.False(t, bytes.HasPrefix(longVisKey, shortVisPrefix),
+		"vis prefix for queue %q must not match keys for queue %q", shortQ, longQ)
+
+	// All-partitions byage prefix must not leak across queue names
+	// — this is what the reaper scans, so a leak would let the
+	// reaper for the shorter queue enumerate (and potentially
+	// delete) the longer queue's orphan records.
+	shortByagePrefix := sqsPartitionedMsgByAgePrefixForQueueAllPartitions(shortQ)
+	longByageKey := sqsPartitionedMsgByAgeKey(longQ, partition, gen, ts, msgID)
+	require.False(t, bytes.HasPrefix(longByageKey, shortByagePrefix),
+		"byage prefix for queue %q must not match keys for queue %q", shortQ, longQ)
+
+	// Spot-check the data and group families too — the same
+	// terminator argument applies to every partitioned constructor.
+	shortDataKey := sqsPartitionedMsgDataKey(shortQ, partition, gen, msgID)
+	longDataKey := sqsPartitionedMsgDataKey(longQ, partition, gen, msgID)
+	require.False(t, bytes.HasPrefix(longDataKey, shortDataKey),
+		"data key for %q must not be a prefix of %q's", shortQ, longQ)
+	shortGroupKey := sqsPartitionedMsgGroupKey(shortQ, partition, gen, "g")
+	longGroupKey := sqsPartitionedMsgGroupKey(longQ, partition, gen, "g")
+	require.False(t, bytes.HasPrefix(longGroupKey, shortGroupKey),
+		"group key for %q must not be a prefix of %q's", shortQ, longQ)
+}
+
 // TestSqsPartitionedMsgKeys_Deterministic pins the determinism
 // contract: the same inputs always produce the same key bytes. The
 // FIFO group lock and dedup lookups depend on byte-exact equality
@@ -171,7 +234,7 @@ func TestParseSqsPartitionedMsgByAgeKey_RoundTrip(t *testing.T) {
 		{"q-with-dash.fifo", 31, 999, 0, "x"},
 	}
 	for _, tc := range cases {
-		t.Run(tc.queue+"/p"+stringer(tc.partition), func(t *testing.T) {
+		t.Run(tc.queue+"/p"+strconv.FormatUint(uint64(tc.partition), 10), func(t *testing.T) {
 			t.Parallel()
 			key := sqsPartitionedMsgByAgeKey(tc.queue, tc.partition, tc.gen, tc.ts, tc.msgID)
 			parsed, ok := parseSqsPartitionedMsgByAgeKey(key, tc.queue)
@@ -229,20 +292,15 @@ func TestSqsMsgByAgePrefixesForQueue_CoversBothKeyspaces(t *testing.T) {
 // contain "|" (validateQueueName rejects it), so the literal "p|"
 // after the family prefix cannot collide with a legacy queue-name
 // segment. This test asserts that no legacy key built from a name
-// that begins with the literal byte 'p' (followed by base32-encoded
+// that begins with the literal byte 'p' (followed by base64-encoded
 // trailing chars) starts with the partitioned prefix.
 func TestSqsPartitionedMsgPrefixes_TerminatedByQueueSegment(t *testing.T) {
 	t.Parallel()
-	// A queue name that base32-encodes to a string starting with 'p'
-	// would be the worst case if the discriminator were just "p"
-	// without the trailing "|". Pick the name "p" itself; its
-	// base32-raw-URL encoding is "cA" (the first base32 char of
-	// 0x70 0x00... is 'c'), but try one whose encoding starts with
-	// 'p' too: a 5-byte input whose first 5 bits are 'p'==0x70's
-	// base32 mapping gives an encoded char set that starts with 'p'.
-	// Rather than hand-craft such a string, exhaustively check that
-	// the family prefix terminates before the partitioned prefix
-	// can match.
+	// The discriminator is the literal three bytes "p|" — note '|'
+	// is outside the base64-raw-URL alphabet (A-Z, a-z, 0-9, '-',
+	// '_'), so an encoded queue segment can never produce 'p'
+	// followed immediately by '|'. The family prefix therefore
+	// terminates before the partitioned prefix can match.
 	legacy := sqsMsgDataKey("p", 1, "id")
 	partitionedPrefixOnly := []byte("!sqs|msg|data|p|")
 	require.False(t, bytes.HasPrefix(legacy, partitionedPrefixOnly),
@@ -250,7 +308,7 @@ func TestSqsPartitionedMsgPrefixes_TerminatedByQueueSegment(t *testing.T) {
 			"the trailing | in the discriminator is what makes this true — "+
 			"if the legacy key starts with `!sqs|msg|data|p|...`, the queue "+
 			"name's encoded segment would have to start with `p|` which "+
-			"base32-raw-URL never produces")
+			"base64-raw-URL never produces")
 	// Also assert the partitioned prefix constants do not lose the
 	// trailing "|".
 	for _, p := range []string{
@@ -263,19 +321,4 @@ func TestSqsPartitionedMsgPrefixes_TerminatedByQueueSegment(t *testing.T) {
 		require.True(t, strings.HasSuffix(p, "p|"),
 			"partitioned prefix %q must end with the p| discriminator", p)
 	}
-}
-
-// stringer is a tiny helper to build subtest names with uint32
-// values; using strconv directly inflates the import list of this
-// test file with a single-call dependency.
-func stringer(v uint32) string {
-	if v == 0 {
-		return "0"
-	}
-	var out []byte
-	for v > 0 {
-		out = append([]byte{byte('0' + v%10)}, out...)
-		v /= 10
-	}
-	return string(out)
 }
