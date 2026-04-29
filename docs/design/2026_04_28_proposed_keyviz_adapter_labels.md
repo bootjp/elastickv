@@ -275,16 +275,21 @@ slotsPerRoute` (i.e. `MaxTrackedRoutes × (len(AllLabels) + 1)`
 when labels are enabled, `MaxTrackedRoutes × 1` when off), which
 we document but never count against the cap.
 
-```go
-// keyviz/sampler.go:416
-//
-// PR-B body: slotsPerRoute is the literal `1`; the
-// flag-honoring branch lands in PR-C+D+E (Codex round-26 P2 —
-// PR-B is unconditionally legacy-slot-only regardless of the
-// flag).
-slotsPerRoute := 1 // PR-B body stops here
+PR-B body (unconditional, no flag check — Codex round-26 P2):
 
-// PR-C+D+E extends to (Codex round-15-4th-pass P1):
+```go
+// keyviz/sampler.go:416 — PR-B body
+slotsPerRoute := 1 // legacy slot only; unconditional in PR-B
+if len(next.slots) / slotsPerRoute < s.opts.MaxTrackedRoutes {
+    // ... pre-create slot(s) for this route
+}
+```
+
+PR-C+D+E replaces the literal `1` with the flag-gated
+conditional (Codex round-15-4th-pass P1):
+
+```go
+// keyviz/sampler.go:416 — PR-C+D+E body (replaces PR-B body above)
 slotsPerRoute := 1 // legacy slot only (when flag off)
 if s.opts.KeyVizLabelsEnabled {
     slotsPerRoute = len(AllLabels) + 1 // 6 with flag on (in-package, no keyviz. qualifier)
@@ -293,6 +298,11 @@ if len(next.slots) / slotsPerRoute < s.opts.MaxTrackedRoutes {
     // ... pre-create slot(s) for this route
 }
 ```
+
+(Two separate code blocks — the dual `slotsPerRoute :=` form
+in a single Go scope is a compile error, "no new variables on
+left side of `:=`"; Claude round-27 minor caught the
+single-block presentation.)
 
 The alternative (Option B: `MaxTrackedRoutes` redefined as
 "slots") would silently halve the route capacity at PR-C
@@ -831,13 +841,18 @@ atomic deploy. (Reviewer notes from PR #694: Claude bot critical
    **PR sequencing note**: §7 PR-B previously declared `AllLabels`
    as a *deliberately-empty slice* (`var AllLabels []Label{}`) to
    make the pre-creation loop a no-op until PR-C populated it.
-   With the round-23 array form, AllLabels is non-empty from PR-B
-   onward — but the round-17 flag-gating means PR-B's
-   `RegisterRoute` only pre-creates labeled siblings when
-   `--keyvizLabelsEnabled=true`, which defaults to false. So
-   PR-B remains behavior-neutral via the flag, not via an empty
-   slice. The §7 PR-B row already mentions the flag default; this
-   is the same mechanism reused.
+   With the round-23 array form, `AllLabels` is non-empty from PR-B
+   onward, AND with the round-26 unconditional model, PR-B's
+   `RegisterRoute` always pre-creates only the legacy slot
+   regardless of the flag — the flag-honoring pre-creation loop
+   is simply not present in PR-B (it lands in PR-C+D+E along with
+   the adapter wiring and wire-format changes). So PR-B remains
+   behavior-neutral **unconditionally**, not via a flag default
+   or an empty slice. The flag is introduced in PR-B for option
+   plumbing only (`KeyVizLabelsEnabled bool` on `Opts`), so
+   PR-C+D+E can read it without an Opts-API change in PR-C+D+E
+   itself; in PR-B the flag's read-site doesn't exist yet, so its
+   value has no observable effect. (Codex round-25 P2 + round-26 P2.)
 
    **Why a typed `Label` rather than plain `string`** (Codex round-9):
    slot pre-creation iterates `AllLabels`, and `Observe` drops slot
