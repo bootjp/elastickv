@@ -372,14 +372,48 @@ retracted because it forces a "skip-on-already-encrypted" branch in
 `lsm_store.PutAt` and makes the storage-layer Keystore a sometimes-
 optional dependency, both of which are easy to get wrong.
 
-What the Raft layer adds on top is a separate **proposal envelope**
-that wraps the **entire `Data []byte`** of each Raft entry — the
-operation tag, the lookup key bytes, and the cleartext value — using
-a distinct `raft` DEK (held in the same Keystore as the storage DEK,
-but with a different `purpose`). On apply, the FSM unwraps the
-proposal envelope, recovers the cleartext operation, and dispatches
-to the existing storage handlers; the storage layer then encrypts
-the value with the storage DEK on the way to Pebble.
+What the Raft layer adds on top is a separate **raft envelope**
+that wraps the **FSM payload** — the operation tag, the lookup key
+bytes, and the cleartext value — using a distinct `raft` DEK (held
+in the same Keystore as the storage DEK, but with a different
+`purpose`). The wrapping happens **inside** the existing engine
+proposal envelope, not around it. Concretely, today's
+`internal/raftengine/etcd/engine.go` builds every Raft entry as
+
+```text
+entry.Data = encodeProposalEnvelope(id, fsm_payload)
+           = [0x01 proposalEnvelopeVersion] [uint64 id] [fsm_payload]
+```
+
+so the leading `0x01` is what `resolveProposal` /
+`decodeProposalEnvelope` use to recover the per-proposal `id` and
+deliver the response back to the originating coordinator. Phase 2
+of §7.1 changes the **inner `fsm_payload`** to be the raft envelope
+of the cleartext payload:
+
+```text
+entry.Data = encodeProposalEnvelope(id,
+                  raft_envelope( cleartext_payload ))
+           = [0x01] [uint64 id] [raft envelope bytes]
+```
+
+The proposal envelope itself is untouched — `entry.Data[0]` is still
+`0x01`, so `decodeProposalEnvelope` and `resolveProposal` continue
+to work unchanged, the `id` is still recoverable, and the response
+delivery path is preserved. If the raft envelope wrapped
+`entry.Data` (instead of `fsm_payload`) the first byte would be
+ciphertext, `decodeProposalEnvelope` would return `ok=false`, and
+**every coordinator write would time out forever** after Phase 2 —
+that scoping mistake was caught in PR review and is called out here
+so an implementor cannot reintroduce it.
+
+On apply, the engine hook (§6.3) runs `decodeProposalEnvelope(entry.Data)`
+first to extract `(id, maybe_encrypted_payload)`, then — only if
+`index > raft_envelope_cutover_index` — runs
+`raftDEK.Unwrap(maybe_encrypted_payload)` to recover the cleartext
+payload, and finally hands the cleartext to `fsm.Apply`. The storage
+layer then encrypts the value with the storage DEK on the way to
+Pebble (§6.2).
 
 Why a separate raft envelope at all, given the value will be
 encrypted again at the storage layer? Because the proposal `Data`
@@ -1145,35 +1179,63 @@ coordinator does not pre-encrypt; the FSM does not bypass this path.
 ### 6.3 Hooks into the Raft path
 
 - `kv/sharded_coordinator.go` and `kv/coordinator.go` — wrap the
-  proposal `Data []byte` (operation tag + key + cleartext value)
-  before submitting to `raftengine`. The coordinator does **not**
-  pre-encrypt the value with the storage DEK; that happens
-  exclusively at §6.2.
+  proposal payload (operation tag + key + cleartext value) with
+  the raft DEK **before** handing it to `raftengine`'s submit
+  path. The engine then runs its existing
+  `encodeProposalEnvelope(id, raftDEK_env(payload))`, so
+  `entry.Data` retains its leading `0x01 proposalEnvelopeVersion`
+  byte and `resolveProposal`'s ID-tracking continues to work
+  unchanged. The coordinator does **not** pre-encrypt the value
+  with the storage DEK; that happens exclusively at §6.2.
 - `kv/fsm.go` — unwrap the raft envelope on apply, recover the
   cleartext operation, and dispatch to the existing storage
   handlers (which then encrypt the value via §6.2). On unwrap
   failure, return an error from `Apply` so the entry is not
   silently skipped (consistency invariant — see CLAUDE.md self-
   review item 1).
-- `internal/raftengine/etcd/engine.go` — **one change required**:
-  the engine already knows the Raft log index of every entry it
-  is about to apply (`engine.applyNormalEntry` receives the
-  `raftpb.Entry` which carries `Index`). The engine grows a
-  thin pre-apply hook that, when `index > raft_envelope_cutover_index`
-  (read from a callback installed by the encryption package at
-  engine construction), invokes `raftDEK.Unwrap(data)` on the
-  entry's `Data []byte` and substitutes the unwrapped bytes
-  before calling the FSM `Apply`. The FSM contract therefore
-  stays at `Apply(data []byte)` — no signature change — and
-  the FSM never sees a raft envelope. Earlier drafts of this
-  section claimed "no changes" to `engine.go`; that was wrong
-  because the FSM has no way to learn the entry index from
-  `data` alone, and re-introducing a byte-tag discriminator
-  would collide with the existing `kv/fsm.go` first-byte tags
-  (the §7.1 Phase 2 design explicitly rejected that approach).
-  The hook is the only viable place for the index-gated
-  unwrap. Unwrap failure (tag mismatch) propagates as an
-  `Apply` error so the entry is not silently skipped.
+- `internal/raftengine/etcd/engine.go` — **one change required**,
+  applied inside the existing `applyNormalEntry`. The engine
+  already knows the Raft log index (`raftpb.Entry.Index`) and
+  already calls `decodeProposalEnvelope(entry.Data)` to recover
+  the per-proposal `(id, fsm_payload)` for `resolveProposal`'s
+  response delivery. The hook adds **one step between
+  `decodeProposalEnvelope` and `fsm.Apply`**: when
+  `entry.Index > raft_envelope_cutover_index` (read from a
+  callback installed by the encryption package at engine
+  construction), invoke `raftDEK.Unwrap(fsm_payload)` and pass
+  the decrypted bytes to `fsm.Apply` instead. The flow becomes:
+
+  ```text
+  applyNormalEntry(entry):
+    id, maybe_enc_payload, ok := decodeProposalEnvelope(entry.Data)
+    if !ok: return nil                           // unchanged
+    payload := maybe_enc_payload
+    // Strict greater-than: the enable-raft-envelope flag entry
+    // at index == cutover is itself NOT raft-DEK-wrapped (§7.1).
+    if entry.Index > raft_envelope_cutover_index:
+      payload = raftDEK.Unwrap(maybe_enc_payload)
+    response := fsm.Apply(payload)               // contract unchanged
+    resolveProposal(entry.Index, entry.Data, response)
+  ```
+
+  The FSM contract stays at `Apply(data []byte)` — no
+  signature change — and the FSM never sees a raft envelope.
+  `resolveProposal` continues to receive the original
+  `entry.Data` so its proposal-ID lookup keeps working
+  unchanged.
+
+  Earlier drafts of this section claimed "no changes" to
+  `engine.go` (wrong: the FSM has no way to learn the entry
+  index from `data` alone) and a later draft proposed
+  unwrapping `entry.Data` itself (also wrong: that would
+  destroy the leading `0x01 proposalEnvelopeVersion` byte
+  that `decodeProposalEnvelope` checks, breaking
+  `resolveProposal` so every coordinator write would time out
+  forever). The version above — unwrap the **payload extracted
+  by `decodeProposalEnvelope`**, not the raw entry bytes — is
+  the only correct layering. Unwrap failure (GCM tag mismatch)
+  propagates as an `Apply` error so the entry is not silently
+  skipped.
 - **Encryption-internal Raft entry types added to `kv/fsm.go`.**
   Three new tag constants extend the existing
   `raftEncodeSingle` / `raftEncodeBatch` / `raftEncodeHLCLease`
@@ -1487,33 +1549,45 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    Concretely, the FSM apply path becomes:
 
    ```text
-   // Lives in internal/raftengine/etcd/engine.go (§6.3 hook).
-   // The engine knows the entry index; the FSM does not.
-   onEntry(index, entry):
-     data := entry.Data
-     // Strict greater-than: the flag entry at index ==
-     // raft_envelope_cutover_index is itself in legacy framing.
-     // Unwrapping it as a raft envelope would fail GCM
-     // verification and either error the apply or, on
-     // best-effort handlers, silently drop the cutover update
-     // and leave the local sidecar in Phase 1 forever.
-     if index > raft_envelope_cutover_index:
-       data = raftDEK.Unwrap(data)         // strip §4.2 envelope
-     fsm.Apply(data)                       // contract unchanged
+   // Lives in internal/raftengine/etcd/engine.go::applyNormalEntry
+   // (§6.3 hook). The engine knows entry.Index; the FSM does not.
+   //
+   // CRITICAL: the raft envelope wraps the FSM payload that lives
+   // INSIDE the existing proposal envelope (entry.Data starts with
+   // 0x01 proposalEnvelopeVersion, then 8-byte id, then the
+   // payload). decodeProposalEnvelope must run FIRST so the
+   // proposal-ID handoff to resolveProposal stays intact and so
+   // we have the right bytes to unwrap. Wrapping/unwrapping
+   // entry.Data itself would clobber the 0x01 byte and break
+   // resolveProposal (every coordinator write times out forever).
+   applyNormalEntry(entry):
+     id, maybe_enc_payload, ok := decodeProposalEnvelope(entry.Data)
+     if !ok: return nil
+     payload := maybe_enc_payload
+     // Strict greater-than: the enable-raft-envelope flag entry at
+     // index == raft_envelope_cutover_index is itself NOT
+     // raft-DEK-wrapped (§7.1 step 7); unwrapping it would fail GCM
+     // verification and either error the apply or silently drop
+     // the cutover update, leaving the local sidecar in Phase 1
+     // forever.
+     if entry.Index > raft_envelope_cutover_index:
+       payload = raftDEK.Unwrap(maybe_enc_payload)  // strip §4.2 envelope
+     response := fsm.Apply(payload)                 // contract unchanged
+     resolveProposal(entry.Index, entry.Data, response)
 
-   // Lives in kv/fsm.go::Apply (data is already unwrapped if
+   // Lives in kv/fsm.go::Apply (payload is already unwrapped if
    // the engine hook fired). Dispatch order matches §6.3:
    // encryption-internal tags (0x03..0x05) are checked BEFORE
    // the existing HLC-lease (0x02) and request-decode tags so
    // they cannot be misrouted.
-   Apply(data):
-     switch data[0] {
-     case raftEncodeEncryptionRegistration (0x03): encryptionApplyRegister(data)
-     case raftEncodeEncryptionBootstrap    (0x04): encryptionApplyBootstrap(data)
-     case raftEncodeEncryptionRotation     (0x05): encryptionApplyRotation(data)
-     case raftEncodeHLCLease               (0x02): applyHLCLease(data)
-     case raftEncodeSingle                 (0x00): decodeRaftRequests(data)
-     case raftEncodeBatch                  (0x01): decodeRaftRequests(data)
+   Apply(payload):
+     switch payload[0] {
+     case raftEncodeEncryptionRegistration (0x03): encryptionApplyRegister(payload)
+     case raftEncodeEncryptionBootstrap    (0x04): encryptionApplyBootstrap(payload)
+     case raftEncodeEncryptionRotation     (0x05): encryptionApplyRotation(payload)
+     case raftEncodeHLCLease               (0x02): applyHLCLease(payload)
+     case raftEncodeSingle                 (0x00): decodeRaftRequests(payload)
+     case raftEncodeBatch                  (0x01): decodeRaftRequests(payload)
      }
    ```
 
