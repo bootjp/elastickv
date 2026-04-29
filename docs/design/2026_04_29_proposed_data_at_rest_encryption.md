@@ -215,13 +215,16 @@ Envelope format (single byte stream, stored as the Pebble value):
     - **Bootstrap (Phase 1 cluster-wide activation).** When
       the leader proposes the `bootstrap-encryption` Raft entry
       (§5.6 step 1a), the entry body carries a batch
-      registration set covering every voting member that
-      passed the capability pre-check. FSM apply inserts the
-      registry entries in the same Pebble batch as the
-      bootstrap. This handles the common case where the
-      whole cluster transitions from cleartext to encrypted
-      at once — no per-node `RegisterEncryptionWriter`
-      round-trip is required for the initial cohort.
+      registration set covering **every member that passed the
+      capability pre-check — voters and learners both** (the
+      pre-check itself is cluster-wide per §7.1 Phase 0
+      step 3). FSM apply inserts the registry entries in the
+      same Pebble batch as the bootstrap. This handles the
+      common case where the whole cluster transitions from
+      cleartext to encrypted at once — no per-node
+      `RegisterEncryptionWriter` round-trip is required for
+      the initial cohort, and the registry covers every
+      replica that will run FSM apply.
     - **Process start under an existing DEK.** A node that
       restarts (or joins a cluster that already has active
       DEKs) proposes `RegisterEncryptionWriter(dek_id,
@@ -315,12 +318,40 @@ Envelope format (single byte stream, stored as the Pebble value):
   of two plaintexts). The deterministic construction above has
   zero collision probability under its preconditions.
 - `ciphertext` — AES-256-GCM(plaintext, nonce, AAD = envelope_version
-  ‖ flag ‖ key_id). AAD binds the ciphertext to the **entire**
-  envelope header — including the compression flag — so a
-  header-rewrite attack (re-tagging a ciphertext to a different DEK,
-  or flipping the compression bit so the decrypted plaintext is
-  passed back through Snappy and crashes the decompressor) is
-  rejected on decrypt.
+  ‖ flag ‖ key_id ‖ **pebble_key**). AAD binds the ciphertext to the
+  envelope header **and** to the Pebble key it lives under (i.e.,
+  `encodeKey(user_key, commit_ts)` from `store/lsm_store.go`).
+  Three classes of tamper are rejected on decrypt as a result:
+
+  1. **Header rewrite.** Re-tagging a ciphertext to a different
+     `key_id`, or flipping the compression bit so the decrypted
+     plaintext is passed back through Snappy and crashes the
+     decompressor, fails GCM verification because the header
+     bytes participate in the AAD.
+  2. **Cut-and-paste / blob relocation.** A disk attacker who
+     copies a valid encrypted value from one MVCC record
+     (`encodeKey(key_a, ts_1)`) into another
+     (`encodeKey(key_b, ts_2)`) cannot make the relocated
+     ciphertext verify under the target key — the AAD that the
+     decrypt path computes uses the target's
+     `encodeKey(key_b, ts_2)`, which differs from the
+     `encodeKey(key_a, ts_1)` the ciphertext was sealed
+     against. Without this binding, AES-GCM authenticates the
+     bytes but not their location, and a relocated blob would
+     silently return the wrong plaintext under the target
+     key.
+  3. **MVCC version substitution.** The same protection covers
+     "swap version V_n with version V_m of the same key" since
+     `commit_ts` is part of the encoded Pebble key.
+
+  Note: the Pebble key (which contains the cleartext user key
+  and `commit_ts`) is **not** secret — both are visible on disk
+  per §2.2. Including them in the AAD adds no confidentiality;
+  it adds **integrity binding** so the ciphertext can only be
+  decrypted at its original location. Compaction does not
+  relocate the Pebble key, so it is invisible to the
+  encryption layer; snapshot transfer ships the same key and
+  same ciphertext together, so it is also invisible.
 - `tag` — 16-byte GCM authentication tag; mismatched tag → read
   returns a typed `ErrEncryptedReadIntegrity` error, **never** silent
   zero or empty bytes.
@@ -965,10 +996,11 @@ same way as every subsequent rotation:
        deterministic, so it cannot block for a Raft round-trip
        to register itself. The leader closes that window by
        collecting `(full_node_id, local_epoch_at_capability_check)`
-       from every voting member during the §7.1 Phase 0 / Phase 1
-       capability pre-check (the same `EncryptionAdmin.GetCapability`
-       fan-out) and including the resulting batch as a field
-       on the `bootstrap-encryption` Raft entry body. The FSM
+       from every member (voters AND learners) during the §7.1
+       Phase 0 / Phase 1 capability pre-check (the same
+       `EncryptionAdmin.GetCapability` fan-out) and including
+       the resulting batch as a field on the
+       `bootstrap-encryption` Raft entry body. The FSM
        handler atomically writes the new wrapped DEKs to the
        sidecar AND inserts the registry entries
        `!encryption|writers|<dek_storage_id>|<uint16(node_id)>`
@@ -1355,16 +1387,24 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
    (`enable-storage-envelope`, `enable-raft-envelope`) **do not**
    read cached capability state. Instead they force a fresh
    poll: the leader of the default Raft group fans out a
-   `GetCapability` call to every voting member of every Raft
-   group in the route catalog and blocks until it has received
-   `encryption_capable = true` from every member, all within
-   one election timeout (configurable; default the existing
-   `RaftElectionTimeout`). If any member is unreachable or
-   reports `false` within the window, the command returns
-   `ErrCapabilityCheckFailed` with the offending node IDs and
-   the operator must re-run after fixing them. Stale cached
-   capability state therefore cannot trigger a premature
-   cutover.
+   `GetCapability` call to **every member of every Raft group in
+   the route catalog — `ConfState.Voters ∪ ConfState.Learners`,
+   not voters alone**. Learners apply committed entries via
+   `kv/fsm.go::Apply` exactly like voters do; a learner on an
+   old binary, post-cutover, would silently mis-handle
+   encrypted state (storage-header tombstone misread in
+   Phase 1; raft-envelope apply failure in Phase 2), leaving
+   the cluster with broken replication on the learner until
+   manual repair. The leader blocks until it has received
+   `encryption_capable = true` from every voter and every
+   learner, all within one election timeout (configurable;
+   default the existing `RaftElectionTimeout`). If any member
+   (voter or learner) is unreachable or reports `false` within
+   the window, the command returns `ErrCapabilityCheckFailed`
+   with the offending node IDs and the operator must re-run
+   after fixing them. Stale cached capability state therefore
+   cannot trigger a premature cutover, and a stale learner
+   cannot slip through the gate.
 
    The fan-out reuses the existing admin connection pool
    (already TLS-authenticated for `--adminTLSCertFile` setups)
@@ -1792,8 +1832,11 @@ eventual code change.
    `data[0] != 0` tombstone test on old code can never see a
    value with `encryption_state` bits set; Phase 1 (storage
    cluster-flag) only flips after a membership-snapshot check
-   confirms every voting member is `encryption_capable`; Phase 2
-   (raft cluster-flag) reuses the same gate. The membership
+   confirms every member — voters AND learners — is
+   `encryption_capable` (learners apply via the same FSM path
+   so an old-binary learner would silently drop encrypted
+   live values as tombstones); Phase 2 (raft cluster-flag)
+   reuses the same gate. The membership
    check is **not** advisory — skipping it would let one
    upgraded leader produce raft envelopes that lock every
    non-upgraded follower out of apply, or produce
