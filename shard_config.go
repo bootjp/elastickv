@@ -249,6 +249,16 @@ func parseSQSFifoPartitionCount(entry, countStr string) (uint32, error) {
 // parseSQSFifoGroupList validates the comma-separated group list and
 // asserts its length matches the parsed PartitionCount. Extracted for
 // the same cyclop reason as parseSQSFifoPartitionCount.
+//
+// Group tokens are canonicalized as uint64 (parsed via strconv.ParseUint
+// then re-formatted via strconv.FormatUint) so they line up with the
+// canonical IDs parseRaftGroups produces. This drops leading-zero
+// formatting (e.g. "01" → "1") and rejects non-numeric group references
+// at parse time — without this round-trip, a config like
+// --raftGroups "01=a" with --sqsFifoPartitionMap "q.fifo:1=01" would
+// fail validation because raftGroups becomes {"1": ...} while the
+// partition map keeps "01". Catching the bad shape at parse time keeps
+// the validator's error free to point at the missing group.
 func parseSQSFifoGroupList(entry, groupRaw string, count uint32) ([]string, error) {
 	groupRaw = strings.TrimSpace(groupRaw)
 	if groupRaw == "" {
@@ -262,7 +272,13 @@ func parseSQSFifoGroupList(entry, groupRaw string, count uint32) ([]string, erro
 			return nil, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
 				"%q: empty group name in list", entry)
 		}
-		groups = append(groups, g)
+		id, err := strconv.ParseUint(g, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+				"%q: group %q is not a uint64 ID (raftGroups uses numeric IDs)",
+				entry, g)
+		}
+		groups = append(groups, strconv.FormatUint(id, 10))
 	}
 	// Compare lengths in int rather than narrowing len(groups) to
 	// uint32 — the narrowing would trip gosec G115 even though the
@@ -283,13 +299,14 @@ func parseSQSFifoGroupList(entry, groupRaw string, count uint32) ([]string, erro
 // the operator has typed a group ID that does not exist and the
 // runtime would route partition traffic to a non-existent shard.
 //
-// raftGroupsByName is the {ID-as-string -> address} map produced by
-// parseRaftGroups; the partition-map flag uses the same string IDs
-// the operator supplied to --raftGroups so this lookup is direct.
-func validateSQSFifoPartitionMap(m map[string]sqsFifoQueueRouting, raftGroupsByName map[string]string) error {
+// raftGroupIDs is the canonical-uint64-string set of IDs produced by
+// parseRaftGroups; partition-map group references are normalized to
+// the same canonical form by parseSQSFifoGroupList, so the lookup is
+// a plain set-membership check.
+func validateSQSFifoPartitionMap(m map[string]sqsFifoQueueRouting, raftGroupIDs map[string]struct{}) error {
 	for queue, routing := range m {
 		for partition, group := range routing.Groups {
-			if _, ok := raftGroupsByName[group]; !ok {
+			if _, ok := raftGroupIDs[group]; !ok {
 				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
 					"queue %q partition %d: group %q is not in --raftGroups",
 					queue, partition, group)

@@ -489,11 +489,11 @@ func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFif
 	if len(parsed) == 0 {
 		return parsed, nil
 	}
-	groupsByName := make(map[string]string, len(groups))
+	groupIDs := make(map[string]struct{}, len(groups))
 	for _, g := range groups {
-		groupsByName[strconv.FormatUint(g.id, 10)] = g.address
+		groupIDs[strconv.FormatUint(g.id, 10)] = struct{}{}
 	}
-	if err := validateSQSFifoPartitionMap(parsed, groupsByName); err != nil {
+	if err := validateSQSFifoPartitionMap(parsed, groupIDs); err != nil {
 		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
 	}
 	return parsed, nil
