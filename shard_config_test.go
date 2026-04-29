@@ -138,6 +138,173 @@ func TestParseRaftS3Map(t *testing.T) {
 	})
 }
 
+func TestParseSQSFifoPartitionMap(t *testing.T) {
+	t.Parallel()
+	t.Run("empty input yields empty map", func(t *testing.T) {
+		t.Parallel()
+		m, err := parseSQSFifoPartitionMap("")
+		require.NoError(t, err)
+		require.Empty(t, m)
+	})
+
+	t.Run("single queue", func(t *testing.T) {
+		t.Parallel()
+		m, err := parseSQSFifoPartitionMap("orders.fifo:8=10,11,12,13,14,15,16,17")
+		require.NoError(t, err)
+		require.Len(t, m, 1)
+		require.Equal(t, sqsFifoQueueRouting{
+			partitionCount: 8,
+			groups:         []string{"10", "11", "12", "13", "14", "15", "16", "17"},
+		}, m["orders.fifo"])
+	})
+
+	t.Run("multiple queues separated by ;", func(t *testing.T) {
+		t.Parallel()
+		m, err := parseSQSFifoPartitionMap("orders.fifo:2=1,2;events.fifo:4=3,4,5,6")
+		require.NoError(t, err)
+		require.Len(t, m, 2)
+		require.Equal(t, uint32(2), m["orders.fifo"].partitionCount)
+		require.Equal(t, []string{"3", "4", "5", "6"}, m["events.fifo"].groups)
+	})
+
+	t.Run("trims whitespace", func(t *testing.T) {
+		t.Parallel()
+		m, err := parseSQSFifoPartitionMap(" orders.fifo : 2 = 1 , 2 ")
+		require.NoError(t, err)
+		require.Equal(t, []string{"1", "2"}, m["orders.fifo"].groups)
+	})
+
+	t.Run("normalizes leading-zero group IDs", func(t *testing.T) {
+		t.Parallel()
+		// "01" must be canonicalized to "1" so the validator's lookup
+		// against parseRaftGroups output (which already canonicalizes
+		// via strconv.FormatUint) succeeds. Without normalization the
+		// operator's "--raftGroups 01=a;...; --sqsFifoPartitionMap
+		// q.fifo:2=01,02" would be rejected as group-not-found.
+		m, err := parseSQSFifoPartitionMap("q.fifo:2=01,002")
+		require.NoError(t, err)
+		require.Equal(t, []string{"1", "2"}, m["q.fifo"].groups)
+	})
+
+	t.Run("rejects non-uint64 group reference", func(t *testing.T) {
+		t.Parallel()
+		// raftGroups uses uint64 IDs (parseRaftGroups calls ParseUint),
+		// so a partition map referencing a string like "g0" can never
+		// match — reject at parse time with a clear pointer rather
+		// than later as group-not-found.
+		_, err := parseSQSFifoPartitionMap("q.fifo:2=g0,g1")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+		require.Contains(t, err.Error(), "uint64 ID")
+	})
+
+	t.Run("PartitionCount must be > 0", func(t *testing.T) {
+		t.Parallel()
+		_, err := parseSQSFifoPartitionMap("q.fifo:0=")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+	})
+
+	t.Run("PartitionCount must be a power of two", func(t *testing.T) {
+		t.Parallel()
+		// 3 partitions is a power-of-two violation; the partitionFor
+		// mask-AND optimisation in §3.1 only works for powers of two,
+		// and the validator rejects it at config time so a typo
+		// cannot land a half-shaped queue.
+		_, err := parseSQSFifoPartitionMap("q.fifo:3=1,2,3")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+		require.Contains(t, err.Error(), "power of two")
+	})
+
+	t.Run("PartitionCount within cap", func(t *testing.T) {
+		t.Parallel()
+		// 64 exceeds the per-queue cap of 32 from §3.1.
+		_, err := parseSQSFifoPartitionMap("q.fifo:64=" +
+			"1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16," +
+			"17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32," +
+			"33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48," +
+			"49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+		require.Contains(t, err.Error(), "exceeds the per-queue cap")
+	})
+
+	t.Run("count and group-list length must agree", func(t *testing.T) {
+		t.Parallel()
+		// PartitionCount says 4 but only 2 groups listed — the parser
+		// rejects rather than silently routing partitions 2-3 to a
+		// nil/wrap-around group.
+		_, err := parseSQSFifoPartitionMap("q.fifo:4=1,2")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+		require.Contains(t, err.Error(), "groups listed")
+	})
+
+	t.Run("malformed entry rejects", func(t *testing.T) {
+		t.Parallel()
+		// Missing '=' — the operator typed a queue spec without the
+		// group-list separator.
+		_, err := parseSQSFifoPartitionMap("orders.fifo:2 1,2")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+	})
+
+	t.Run("empty queue name rejects", func(t *testing.T) {
+		t.Parallel()
+		_, err := parseSQSFifoPartitionMap(":2=1,2")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+	})
+
+	t.Run("empty group entry rejects", func(t *testing.T) {
+		t.Parallel()
+		// Trailing comma without a group name — easy typo to make in
+		// a long group list, and would otherwise produce a
+		// silently-shorter list that mismatches PartitionCount.
+		_, err := parseSQSFifoPartitionMap("q.fifo:2=1,")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+	})
+
+	t.Run("duplicate queue rejects", func(t *testing.T) {
+		t.Parallel()
+		// Two entries for the same queue — the second would
+		// silently overwrite the first under a naive map insertion,
+		// hiding the operator's mistake. Reject explicitly.
+		_, err := parseSQSFifoPartitionMap("q.fifo:2=1,2;q.fifo:4=3,4,5,6")
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+		require.Contains(t, err.Error(), "duplicate queue")
+	})
+}
+
+func TestValidateSQSFifoPartitionMap(t *testing.T) {
+	t.Parallel()
+	t.Run("all groups present passes", func(t *testing.T) {
+		t.Parallel()
+		m := map[string]sqsFifoQueueRouting{
+			"q.fifo": {partitionCount: 2, groups: []string{"1", "2"}},
+		}
+		groups := map[string]struct{}{"1": {}, "2": {}}
+		require.NoError(t, validateSQSFifoPartitionMap(m, groups))
+	})
+
+	t.Run("missing group fails with partition pointer", func(t *testing.T) {
+		t.Parallel()
+		// Operator typed "99" but only IDs 1-4 exist in --raftGroups.
+		// The validator must surface the queue and partition index so
+		// the operator can fix the typo without re-counting.
+		m := map[string]sqsFifoQueueRouting{
+			"orders.fifo": {partitionCount: 4, groups: []string{"1", "99", "3", "4"}},
+		}
+		groups := map[string]struct{}{
+			"1": {}, "2": {}, "3": {}, "4": {},
+		}
+		err := validateSQSFifoPartitionMap(m, groups)
+		require.ErrorIs(t, err, ErrInvalidSQSFifoPartitionMapEntry)
+		require.Contains(t, err.Error(), "orders.fifo")
+		require.Contains(t, err.Error(), "partition 1")
+		require.Contains(t, err.Error(), "99")
+	})
+
+	t.Run("empty map passes", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, validateSQSFifoPartitionMap(nil, nil))
+	})
+}
+
 func TestParseRaftBootstrapMembers(t *testing.T) {
 	t.Run("parses members", func(t *testing.T) {
 		members, err := parseRaftBootstrapMembers("n1=10.0.0.11:50051, n2=10.0.0.12:50051")

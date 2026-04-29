@@ -104,6 +104,19 @@ var (
 	raftS3Map            = flag.String("raftS3Map", "", "Map of Raft address to S3 address (raftAddr=s3Addr,...)")
 	raftDynamoMap        = flag.String("raftDynamoMap", "", "Map of Raft address to DynamoDB address (raftAddr=dynamoAddr,...)")
 	raftSqsMap           = flag.String("raftSqsMap", "", "Map of Raft address to SQS address (raftAddr=sqsAddr,...)")
+	// HT-FIFO partition assignment (Phase 3.D §5). Distinct from
+	// --raftSqsMap (which maps raftAddr=sqsAddr for the
+	// proxyToLeader endpoint resolution). The grammar is
+	// `queue.fifo:N=group_0,...,group_{N-1}` with multiple queues
+	// separated by `;`. Empty by default — leaving the flag empty
+	// means no FIFO queue is partitioned and the legacy
+	// single-partition layout applies to every queue. PR 5 of the
+	// rollout plan consumes this map to dispatch SendMessage and
+	// fan out ReceiveMessage; the §11 PR 2 dormancy gate currently
+	// rejects PartitionCount > 1 on CreateQueue regardless of this
+	// flag, so populating it has no effect on production traffic
+	// until PR 5 lands.
+	sqsFifoPartitionMap = flag.String("sqsFifoPartitionMap", "", "HT-FIFO partition map (queue.fifo:N=group_0,...,group_{N-1};...)")
 	// Admin gRPC service flags (this PR — wired into the per-group raft
 	// listeners; consumed by cmd/elastickv-admin via the bearer-token
 	// gateway). These are independent of the admin HTTP listener flags
@@ -369,7 +382,7 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raftengine.Server,
 		return runtimeConfig{}, "", nil, false, err
 	}
 
-	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *dynamoAddr, *sqsAddr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap, *raftSqsMap)
+	cfg, err := parseRuntimeConfig(*myAddr, *redisAddr, *s3Addr, *dynamoAddr, *sqsAddr, *raftGroups, *shardRanges, *raftRedisMap, *raftS3Map, *raftDynamoMap, *raftSqsMap, *sqsFifoPartitionMap)
 	if err != nil {
 		return runtimeConfig{}, "", nil, false, err
 	}
@@ -383,17 +396,18 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raftengine.Server,
 }
 
 type runtimeConfig struct {
-	groups       []groupSpec
-	defaultGroup uint64
-	engine       *distribution.Engine
-	leaderRedis  map[string]string
-	leaderS3     map[string]string
-	leaderDynamo map[string]string
-	leaderSQS    map[string]string
-	multi        bool
+	groups              []groupSpec
+	defaultGroup        uint64
+	engine              *distribution.Engine
+	leaderRedis         map[string]string
+	leaderS3            map[string]string
+	leaderDynamo        map[string]string
+	leaderSQS           map[string]string
+	sqsFifoPartitionMap map[string]sqsFifoQueueRouting
+	multi               bool
 }
 
-func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGroups, shardRanges, raftRedisMap, raftS3Map, raftDynamoMap, raftSqsMap string) (runtimeConfig, error) {
+func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGroups, shardRanges, raftRedisMap, raftS3Map, raftDynamoMap, raftSqsMap, sqsFifoPartitionMapRaw string) (runtimeConfig, error) {
 	groups, err := parseRaftGroups(raftGroups, myAddr)
 	if err != nil {
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft groups")
@@ -425,15 +439,21 @@ func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGrou
 		return runtimeConfig{}, errors.Wrapf(err, "failed to parse raft sqs map")
 	}
 
+	sqsFifoPartitionMap, err := buildSQSFifoPartitionMap(groups, sqsFifoPartitionMapRaw)
+	if err != nil {
+		return runtimeConfig{}, err
+	}
+
 	return runtimeConfig{
-		groups:       groups,
-		defaultGroup: defaultGroup,
-		engine:       engine,
-		leaderRedis:  leaderRedis,
-		leaderS3:     leaderS3,
-		leaderDynamo: leaderDynamo,
-		leaderSQS:    leaderSQS,
-		multi:        len(groups) > 1,
+		groups:              groups,
+		defaultGroup:        defaultGroup,
+		engine:              engine,
+		leaderRedis:         leaderRedis,
+		leaderS3:            leaderS3,
+		leaderDynamo:        leaderDynamo,
+		leaderSQS:           leaderSQS,
+		sqsFifoPartitionMap: sqsFifoPartitionMap,
+		multi:               len(groups) > 1,
 	}, nil
 }
 
@@ -455,6 +475,28 @@ func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[str
 
 func buildLeaderSQS(groups []groupSpec, sqsAddr string, raftSqsMap string) (map[string]string, error) {
 	return buildLeaderAddrMap(groups, sqsAddr, raftSqsMap, parseRaftSQSMap)
+}
+
+// buildSQSFifoPartitionMap parses and validates the
+// --sqsFifoPartitionMap flag against the configured Raft groups.
+// Extracted from parseRuntimeConfig so that function stays under the
+// cyclop ceiling once the SQS HT-FIFO config plumbing landed.
+func buildSQSFifoPartitionMap(groups []groupSpec, raw string) (map[string]sqsFifoQueueRouting, error) {
+	parsed, err := parseSQSFifoPartitionMap(raw)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to parse sqs fifo partition map")
+	}
+	if len(parsed) == 0 {
+		return parsed, nil
+	}
+	groupIDs := make(map[string]struct{}, len(groups))
+	for _, g := range groups {
+		groupIDs[strconv.FormatUint(g.id, 10)] = struct{}{}
+	}
+	if err := validateSQSFifoPartitionMap(parsed, groupIDs); err != nil {
+		return nil, errors.Wrapf(err, "invalid sqs fifo partition map")
+	}
+	return parsed, nil
 }
 
 func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -33,8 +35,28 @@ var (
 	ErrInvalidRaftS3MapEntry            = errors.New("invalid raftS3Map entry")
 	ErrInvalidRaftDynamoMapEntry        = errors.New("invalid raftDynamoMap entry")
 	ErrInvalidRaftSQSMapEntry           = errors.New("invalid raftSqsMap entry")
+	ErrInvalidSQSFifoPartitionMapEntry  = errors.New("invalid sqsFifoPartitionMap entry")
 	ErrInvalidRaftBootstrapMembersEntry = errors.New("invalid raftBootstrapMembers entry")
 )
+
+// sqsFifoPartitionMaxPartitions caps the per-queue partition count so
+// the partitionFor mask + bucket-store sizing arguments in
+// docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md §3.1 stay
+// honest: 32 partitions × ~1k RPS per shard ≈ 30k aggregate RPS per
+// queue, which matches the design's stated ceiling. Operators who
+// need more should split the workload across queues rather than
+// raising this value.
+const sqsFifoPartitionMaxPartitions = 32
+
+// sqsFifoQueueRouting captures the operator-supplied partition-to-
+// group assignment for a single FIFO queue. Groups are listed in
+// partition-index order — Groups[k] owns partition k. The validator
+// (validateSQSFifoPartitionMap) checks that PartitionCount matches
+// len(Groups), is a power of two, and is within the per-queue cap.
+type sqsFifoQueueRouting struct {
+	partitionCount uint32
+	groups         []string
+}
 
 func parseRaftGroups(raw, defaultAddr string) ([]groupSpec, error) {
 	if raw == "" {
@@ -131,6 +153,175 @@ func parseRaftDynamoMap(raw string) (map[string]string, error) {
 
 func parseRaftSQSMap(raw string) (map[string]string, error) {
 	return parseRaftAddressMap(raw, ErrInvalidRaftSQSMapEntry)
+}
+
+// parseSQSFifoPartitionMap reads the `--sqsFifoPartitionMap` operator
+// flag. The grammar is:
+//
+//	queue1.fifo:N=group_0,group_1,...,group_{N-1}
+//	;queue2.fifo:M=group_0,...,group_{M-1}
+//
+// Multiple queue entries are separated by ';' (commas are reserved for
+// the per-queue group list). Each queue's PartitionCount must equal
+// len(Groups) — a mismatch is rejected at parse time so a config error
+// cannot silently produce a wrong-shaped routing map at runtime.
+//
+// This function does not validate that referenced Raft groups exist
+// or that the queue exists in the catalog; that's
+// validateSQSFifoPartitionMap's job and runs against the parsed
+// runtime config after both --raftGroups and --sqsFifoPartitionMap
+// have been parsed.
+func parseSQSFifoPartitionMap(raw string) (map[string]sqsFifoQueueRouting, error) {
+	out := make(map[string]sqsFifoQueueRouting)
+	if raw == "" {
+		return out, nil
+	}
+	entries := strings.SplitSeq(raw, ";")
+	for entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		queue, routing, err := parseSQSFifoPartitionMapEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := out[queue]; dup {
+			return nil, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+				"duplicate queue %q", queue)
+		}
+		out[queue] = routing
+	}
+	return out, nil
+}
+
+func parseSQSFifoPartitionMapEntry(entry string) (string, sqsFifoQueueRouting, error) {
+	// Shape: queue.fifo:N=g0,g1,...,g{N-1}
+	colonIdx := strings.Index(entry, ":")
+	eqIdx := strings.Index(entry, "=")
+	if colonIdx <= 0 || eqIdx <= colonIdx+1 {
+		return "", sqsFifoQueueRouting{}, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: expected queue.fifo:N=group_0,...,group_{N-1}", entry)
+	}
+	queue := strings.TrimSpace(entry[:colonIdx])
+	if queue == "" {
+		return "", sqsFifoQueueRouting{}, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: empty queue name", entry)
+	}
+	count, err := parseSQSFifoPartitionCount(entry, entry[colonIdx+1:eqIdx])
+	if err != nil {
+		return "", sqsFifoQueueRouting{}, err
+	}
+	groups, err := parseSQSFifoGroupList(entry, entry[eqIdx+1:], count)
+	if err != nil {
+		return "", sqsFifoQueueRouting{}, err
+	}
+	return queue, sqsFifoQueueRouting{partitionCount: count, groups: groups}, nil
+}
+
+// parseSQSFifoPartitionCount validates the N in `queue.fifo:N=...`.
+// Extracted from parseSQSFifoPartitionMapEntry to keep that function
+// under the cyclop ceiling once the validation surface grew to four
+// distinct rejections (parse error, zero, overflow cap, non-power-of-2).
+func parseSQSFifoPartitionCount(entry, countStr string) (uint32, error) {
+	countStr = strings.TrimSpace(countStr)
+	count64, err := strconv.ParseUint(countStr, 10, 32)
+	if err != nil {
+		return 0, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: PartitionCount %q must be a positive decimal integer", entry, countStr)
+	}
+	if count64 == 0 {
+		return 0, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: PartitionCount must be > 0", entry)
+	}
+	if count64 > sqsFifoPartitionMaxPartitions {
+		return 0, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: PartitionCount %d exceeds the per-queue cap of %d",
+			entry, count64, sqsFifoPartitionMaxPartitions)
+	}
+	if count64&(count64-1) != 0 {
+		return 0, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: PartitionCount %d must be a power of two", entry, count64)
+	}
+	// count64 is bounded by sqsFifoPartitionMaxPartitions (32) — well
+	// inside uint32 range — so the narrowing is safe by construction.
+	return uint32(count64), nil
+}
+
+// parseSQSFifoGroupList validates the comma-separated group list and
+// asserts its length matches the parsed PartitionCount. Extracted for
+// the same cyclop reason as parseSQSFifoPartitionCount.
+//
+// Group tokens are canonicalized as uint64 (parsed via strconv.ParseUint
+// then re-formatted via strconv.FormatUint) so they line up with the
+// canonical IDs parseRaftGroups produces. This drops leading-zero
+// formatting (e.g. "01" → "1") and rejects non-numeric group references
+// at parse time — without this round-trip, a config like
+// --raftGroups "01=a" with --sqsFifoPartitionMap "q.fifo:1=01" would
+// fail validation because raftGroups becomes {"1": ...} while the
+// partition map keeps "01". Catching the bad shape at parse time keeps
+// the validator's error free to point at the missing group.
+func parseSQSFifoGroupList(entry, groupRaw string, count uint32) ([]string, error) {
+	groupRaw = strings.TrimSpace(groupRaw)
+	if groupRaw == "" {
+		return nil, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: empty group list", entry)
+	}
+	groups := make([]string, 0, count)
+	for g := range strings.SplitSeq(groupRaw, ",") {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			return nil, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+				"%q: empty group name in list", entry)
+		}
+		id, err := strconv.ParseUint(g, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+				"%q: group %q is not a uint64 ID (raftGroups uses numeric IDs)",
+				entry, g)
+		}
+		groups = append(groups, strconv.FormatUint(id, 10))
+	}
+	// Compare lengths in int rather than narrowing len(groups) to
+	// uint32 — the narrowing would trip gosec G115 even though the
+	// per-queue cap (32) keeps the value well in range. count is at
+	// most sqsFifoPartitionMaxPartitions (32) so the int(count)
+	// widening is safe and exact.
+	if len(groups) != int(count) {
+		return nil, errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+			"%q: PartitionCount=%d but %d groups listed; both must agree",
+			entry, count, len(groups))
+	}
+	return groups, nil
+}
+
+// validateSQSFifoPartitionMap checks the parsed map against the
+// configured Raft groups. Every group named in any queue's routing
+// must appear in the --raftGroups list with a matching ID — otherwise
+// the operator has typed a group ID that does not exist and the
+// runtime would route partition traffic to a non-existent shard.
+//
+// raftGroupIDs is the canonical-uint64-string set of IDs produced by
+// parseRaftGroups; partition-map group references are normalized to
+// the same canonical form by parseSQSFifoGroupList, so the lookup is
+// a plain set-membership check.
+func validateSQSFifoPartitionMap(m map[string]sqsFifoQueueRouting, raftGroupIDs map[string]struct{}) error {
+	// Sort the queue names so a config with multiple misconfigured
+	// queues always reports the lexicographically-first failure —
+	// otherwise Go's randomised map iteration would surface a
+	// different queue on each run, which makes operator triage
+	// (and golden-test asserts) flaky for no benefit.
+	for _, queue := range slices.Sorted(maps.Keys(m)) {
+		routing := m[queue]
+		for partition, group := range routing.groups {
+			if _, ok := raftGroupIDs[group]; !ok {
+				return errors.Wrapf(ErrInvalidSQSFifoPartitionMapEntry,
+					"queue %q partition %d: group %q is not in --raftGroups",
+					queue, partition, group)
+			}
+		}
+	}
+	return nil
 }
 
 func parseRaftAddressMap(raw string, invalidEntry error) (map[string]string, error) {
