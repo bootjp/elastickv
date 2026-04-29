@@ -1342,10 +1342,40 @@ written.
        message GetNodeVersionResponse { string node_version = 1; }
        ```
        The admin server handling `BeginBackup` issues `GetNodeVersion`
-       to every peer in `AdminServer.members` (and to itself); each
-       peer responds with its compiled-in version constant. The
-       handler refuses `BeginBackup` if any peer returns a version
-       below N or fails to respond within `--begin-backup-deadline`.
+       to **the live cluster member set, not the static
+       `AdminServer.members` bootstrap seed**. `AdminServer.members`
+       (`adapter/admin_grpc.go:64`) is set once at construction
+       (`NewAdminServer(self, members)` at line 89) and never updated
+       — a node added later via `AddVoter` would not appear in it,
+       so a fan-out limited to the seed silently misses
+       dynamically-added nodes (which during a rolling upgrade are
+       exactly the ones likely to be running an older version).
+
+       `BeginBackup` instead reuses the existing `snapshotMembers`
+       helper (`adapter/admin_grpc.go:158`) — the same path
+       `GetClusterOverview` uses today — which unions the seed with
+       members discovered from each group's `Configuration()`. The
+       fan-out target is therefore the live cluster, not the
+       startup snapshot.
+
+       Each `GetNodeVersion` dial uses `--begin-backup-deadline` as
+       a **per-peer** budget (the fan-out is concurrent, one
+       goroutine per peer), so a 100-node cluster with one slow peer
+       delays by one deadline period, not N × deadline. Each peer
+       responds with its compiled-in version constant. The handler
+       refuses `BeginBackup` if any peer returns a version below N
+       or fails to respond within the deadline.
+
+       The two failure cases — "old version" and "unreachable" —
+       both block backups, but the error message must
+       **distinguish** them in its detail string so operators can
+       diagnose without out-of-band investigation:
+
+       - `FailedPrecondition: node X reports version v0.9.0; minimum is v1.0.0`
+         (gate triggered by an old version)
+       - `FailedPrecondition: node X did not respond within 5s`
+         (gate triggered by unreachability)
+
        This avoids restructuring `GetRaftGroups` (which today returns
        one row per *group* keyed by local engine, not per *member*),
        while still giving `BeginBackup` a fleet-wide view.
@@ -1355,12 +1385,16 @@ written.
        `GetNodeVersion(leader)` so the admin UI can surface mixed-
        version groups directly. This field is informational and not
        used for the gate decision (the gate uses the dedicated fan-
-       out so it covers followers too).
-
-       If any member reports a version older than N or is
-       unreachable, `BeginBackup` returns `FailedPrecondition` with a
-       clear message ("upgrade node X to vN before backups can be
-       taken").
+       out so it covers followers too). To keep `GetRaftGroups`
+       responsive — it is a synchronous local-state read today
+       (`adapter/admin_grpc.go:382-416`) — the per-leader
+       `GetNodeVersion` dial is made **asynchronously** with a
+       500 ms timeout per leader; failures (unreachable leader,
+       deadline hit) populate `leader_node_version = ""` rather than
+       blocking the response. The version is also cached locally
+       on the admin server with a short TTL (default 10 s) so
+       repeated `GetRaftGroups` calls within a polling window do not
+       fan out repeatedly.
 
     Releases N and N+1 may be the same calendar release if the
     operator is willing to enforce a fleet-wide upgrade window
@@ -1475,7 +1509,9 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses the new `ShardStore.ScanKeysAt`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope and that existing `ScanAt` callers are bytewise-unchanged |
 | `TestExpectedKeysBaselineRunsAfterShardCatchup` | Force shard B to lag at `BeginBackup` time; verify the baseline scan blocks until step 2 (catch-up) completes for B, so B's `expected_keys[i].key_count` is the true count at `read_ts` rather than the partial-pre-catch-up count |
 | `TestForwardCompatUnknownFSMTag` | A release-N FSM receiving a synthetic `0x03`-tagged entry (representing a future `BackupPin` from a release-N+1 leader) returns nil from `Apply` and emits an `unknown_fsm_tag` warning, with no apply-loop stall and no FSM mutation. Tags `0x10+` (outside the reserved range) still error so the forward-compat door is bounded |
-| `TestBeginBackupGatesOnMinVersion` | The `BeginBackup` handler fans out `GetNodeVersion` to every peer in `AdminServer.members`. If any peer returns `node_version < N` (or is unreachable within `--begin-backup-deadline`), the call returns `FailedPrecondition` and proposes no `BackupPin` entries on any group; once every peer reports `node_version ≥ N`, the same call succeeds. A 3-node cluster where node B is at v(N-1) while A and C are at vN is the canonical fixture |
+| `TestBeginBackupGatesOnMinVersion` | The `BeginBackup` handler derives its fan-out target from `snapshotMembers` (live `Configuration()` union, not the static `AdminServer.members` seed) and issues `GetNodeVersion` per peer concurrently. If any peer returns `node_version < N` or is unreachable within `--begin-backup-deadline`, the call returns `FailedPrecondition` with an error message that distinguishes the two cases ("reports version vX" vs. "did not respond within Ns") and proposes no `BackupPin` entries on any group; once every live member reports `node_version ≥ N`, the same call succeeds |
+| `TestBeginBackupGatesIncludesDynamicallyAddedNodes` | Start a 3-node cluster, add a 4th node at `v(N-1)` via `AddVoter` after `AdminServer` startup (so it is NOT in the bootstrap `members` seed), then call `BeginBackup`; the gate fails with the new node identified in the error. The previous seed-only design would have falsely passed |
+| `TestGetRaftGroupsLeaderVersionAsync` | `GetRaftGroups` returns within local-snapshot latency even when a leader is unreachable; `leader_node_version` is empty string in that case. Verify the 500 ms per-leader timeout and the 10 s response cache prevent repeated fan-outs across rapid polls |
 | `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
