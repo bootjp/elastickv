@@ -52,6 +52,20 @@ threat surfaces and are explicitly out of scope.
   even though every value is encrypted. Tenants encoding sensitive
   data into key bytes (e.g., user IDs as part of the key) must be
   warned in the operator docs.
+- **Per-version write history.** MVCC encodes `commit_ts` into the
+  Pebble key (`encodeKey(user_key, commit_ts)`), not into the value
+  body, so the **timestamp of every write** for every key is
+  visible from raw SST inspection regardless of value encryption.
+  This in turn exposes write-rate-per-key and per-key version
+  counts (a rough access pattern), even though the actual values
+  remain ciphertext. Same compliance call-out as the lookup-key
+  bullet above.
+- **TTL and tombstone bits.** The 9-byte value header
+  (§6.2: `[tombstone+enc_state(1)] [expireAt(8)]`) is intentionally
+  cleartext so the GC sweep and TTL expiry can run without
+  decrypting every value. This leaks "this key has TTL T" and
+  "this key was deleted at version V". Accepted given the lookup-
+  key admission above; flagged here for completeness.
 - **Pebble metadata.** Manifest, bloom filters, OPTIONS file, and
   block index expose row counts, key-size distributions, and
   approximate cardinality. They are not encrypted in v1.
@@ -95,14 +109,17 @@ SST / WAL / MANIFEST through it. CockroachDB and TiKV do this.
 
 ### (b) Storage value boundary + Raft proposal envelope (chosen)
 
-Encrypt every user value once at the coordinator/storage boundary, and
-ensure the same ciphertext flows through Raft proposals, the etcd raft
-WAL, snapshots, and Pebble SSTs. The cleartext value never touches
-disk.
+Encrypt every user value exactly once at the storage layer (§4.1).
+Wrap the entire Raft proposal `Data []byte` — operation tag, lookup
+key, and cleartext value — with a separate raft DEK envelope (§4.2).
+Cleartext user values never touch disk: the WAL holds the raft
+envelope, Pebble holds the storage envelope, and the two are
+**different** ciphertexts of the same plaintext under different
+DEKs (see §4.2 for why this is one encrypt/decrypt per write at
+apply time, not two layers of stored ciphertext).
 
-- **Pro:** Single ciphertext object — no double-encryption — across
-  every persistent surface (Raft WAL, Pebble SST, FSM snapshot,
-  snapshot streaming).
+- **Pro:** Exactly one value-encryption site (the storage layer);
+  no "is this already encrypted?" branch in the write path.
 - **Pro:** AES-256-GCM at the value boundary gives authenticated
   encryption per value: a tampered SST block is rejected on read with
   a clear error, not silently returned as garbage.
@@ -180,25 +197,49 @@ in the noise.
 
 ### 4.2 Raft proposal payloads
 
-The operation/key/value bytes that the coordinator hands to
-`raftengine` already include the ciphertext value from §4.1 (because
-the coordinator encrypts before building the proposal). The proposal
-envelope itself — i.e., the entire `Data []byte` of each Raft entry —
-is **also** wrapped in the same envelope format using a separate
-`raft` DEK derived from the same KEK.
+There is exactly **one** value-encryption site in the system, and it
+is the storage layer (§4.1 / §6.2). The coordinator does **not**
+pre-encrypt values before building a proposal, and the FSM does
+**not** call a "raw" Pebble write that bypasses storage encryption.
+Pre-encryption was floated in an earlier draft and has been
+retracted because it forces a "skip-on-already-encrypted" branch in
+`lsm_store.PutAt` and makes the storage-layer Keystore a sometimes-
+optional dependency, both of which are easy to get wrong.
 
-Why both? Because the proposal `Data` carries cleartext **lookup
-keys** and operation tags. We do not protect lookup keys at the
-storage layer (§2.2), but we *can* protect them in the WAL, where the
-key history is dense and easy to inspect. Wrapping the proposal
-payload means the etcd raft WAL on disk is opaque except for Raft
-metadata (term, index, type).
+What the Raft layer adds on top is a separate **proposal envelope**
+that wraps the **entire `Data []byte`** of each Raft entry — the
+operation tag, the lookup key bytes, and the cleartext value — using
+a distinct `raft` DEK (held in the same Keystore as the storage DEK,
+but with a different `purpose`). On apply, the FSM unwraps the
+proposal envelope, recovers the cleartext operation, and dispatches
+to the existing storage handlers; the storage layer then encrypts
+the value with the storage DEK on the way to Pebble.
 
-On apply, the FSM unwraps the proposal envelope to recover the
-cleartext operation, then calls into the storage layer, which
-re-encrypts the value into Pebble. This is one extra
-encrypt/decrypt per write, paid only on the apply path; benchmarks in
-§6 must confirm the cost is below the existing FSM apply budget.
+Why a separate raft envelope at all, given the value will be
+encrypted again at the storage layer? Because the proposal `Data`
+carries **cleartext lookup keys** and operation tags. We
+deliberately do not protect lookup keys at the storage layer
+(§2.2), but we *can* protect them in the WAL, where the key history
+is dense and easy to inspect. Wrapping the proposal payload means
+the etcd raft WAL on disk is opaque except for Raft metadata (term,
+index, type).
+
+This costs one decrypt + one encrypt per write on the apply path
+(decrypt the raft envelope; encrypt the value into the storage
+envelope). It does **not** mean two layers of value encryption are
+written to disk — the WAL stores only the raft envelope; Pebble
+stores only the storage envelope. The two ciphertexts are
+**different** byte sequences with different DEKs and different
+nonces; they share a plaintext but never share a representation. If
+you are tracing a value through the system, expect distinct
+ciphertexts at the WAL boundary and at the Pebble boundary —
+phrases like "the same ciphertext flows through Raft → WAL → Pebble"
+that appeared in earlier drafts of this doc were imprecise. The
+correct invariant is: **every persistent surface holds ciphertext;
+no persistent surface holds cleartext user values.**
+
+Benchmarks in §6 must confirm the apply-path cost stays inside the
+existing FSM apply budget.
 
 ### 4.3 etcd raft WAL files
 
@@ -287,15 +328,30 @@ Two-tier hierarchy:
   ```json
   {
     "version": 1,
-    "active": { "storage": "k1a2", "raft": "k7c9" },
+    "raft_applied_index": 184273,
+    "active": { "storage": 305419896, "raft": 2596069104 },
     "keys": {
-      "k1a2": { "purpose": "storage", "wrapped": "<base64>",
-                "created": "2026-04-29T10:00:00Z" },
-      "k7c9": { "purpose": "raft",    "wrapped": "<base64>",
-                "created": "2026-04-29T10:00:00Z" }
+      "305419896":  { "purpose": "storage", "wrapped": "<base64>",
+                      "created": "2026-04-29T10:00:00Z" },
+      "2596069104": { "purpose": "raft",    "wrapped": "<base64>",
+                      "created": "2026-04-29T10:00:00Z" }
     }
   }
   ```
+
+  - **`key_id` is a 32-bit unsigned integer**, the same value that
+    appears in the §4.1 envelope `key_id` field. It is generated by
+    a CSPRNG draw on the leader at the moment a new DEK is created;
+    the leader retries on the (negligibly rare) collision with an
+    existing `key_id` so the FSM apply on every node observes the
+    same ID. The sidecar uses the decimal string form of the ID as
+    the JSON object key — JSON object keys must be strings, but the
+    on-disk envelope and the in-memory keystore always work in the
+    binary uint32 form. Decode is a single `strconv.ParseUint`.
+  - `raft_applied_index` records the Raft log index of the most
+    recent rotation entry that has been persisted into this
+    sidecar. It is the load-bearing field for the
+    sidecar/log-index reconciliation protocol in §5.5.
 
   The sidecar is **safe to leak**: every entry in `keys` is wrapped
   by the KEK. Without the KEK, the file unwraps to nothing.
@@ -414,11 +470,78 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
    either re-runs that batch on restart or skips it cleanly. There
    is no window in which the cursor advances past values that
    were not actually rewritten.
+7. **Rewrite cursor key bootstrapping.** The cursor is itself a
+   user-keyspace value, so it goes through §4.1 / §6.2 like any
+   other write — it carries a `key_id` and is encrypted under the
+   active storage DEK. To avoid the chicken-and-egg case where the
+   job cannot read its own cursor because the cursor's `key_id`
+   references a DEK that has just been retired, the
+   `encryption retire-dek` precondition in step 4 also requires
+   that **no rewrite cursor key references the DEK being retired**.
+   In practice the rewrite job rewrites its cursor key under the
+   active DEK every checkpoint, so this is automatically true once
+   the job has made any progress under the new active DEK; the
+   precondition just prevents an operator from racing
+   `retire-dek` against a stalled job.
+8. **Reserved-key namespace.** All encryption-internal keys live
+   under the reserved prefix `!encryption|...`. The implementation
+   PR must check this prefix against the existing reserved
+   namespaces in `distribution/` (route catalog), `store/` (Redis
+   collection helpers — `!redis|stream|...`, `!redis|hash|...`,
+   etc.), and the HLC ceiling key, and pick a different prefix if
+   any of them already use the same root. The expected outcome is
+   no collision (`!redis|...` and `!encryption|...` are
+   disjoint), but it must be confirmed in code review, not
+   assumed.
 
 The same machinery is what powers the cleartext→encrypted
 migration in §7.1; the only difference is that the source DEK is
 the synthetic "no DEK / cleartext" sentinel rather than a real
 retiring DEK.
+
+### 5.5 Sidecar / Raft-log reconciliation
+
+The DEK rotation flow in §5.2 says the FSM apply persists the new
+wrapped DEK into `keys.json` on every node. That apply is two
+operations on the local node — a Pebble write of the rotation log
+entry, then a sidecar file rewrite — and they are **not** atomic
+with respect to crash. A node that crashes between the two
+restarts with the rotation entry committed in its Raft log but the
+sidecar still on the previous generation, which would make a
+freshly-active DEK unloadable on that node.
+
+To detect and repair this:
+
+1. The sidecar carries `raft_applied_index` (§5.1), updated in the
+   same `os.WriteFile` + `os.Rename` that persists the new wrapped
+   DEKs.
+2. On startup, the encryption package reads the sidecar's
+   `raft_applied_index`, then reads the raftengine's persisted
+   applied index. If the raftengine has progressed past the
+   sidecar's index AND the gap covers any rotation entries, the
+   node refuses to start with `ErrSidecarBehindRaftLog`,
+   pointing at the operator runbook.
+3. Recovery is **automatic on the leader** (it re-proposes a
+   "rewrap current active DEK" entry that brings every node's
+   sidecar back in sync) and **manual on a stuck follower**
+   (operator runs `elastickv-admin encryption resync-sidecar`
+   which replays the rotation entries from the Raft log into the
+   local sidecar, then exits). Refusing to start is deliberate:
+   silently serving with a stale sidecar would let the node
+   write under an old `key_id` while peers write under a new one,
+   which is exactly the split-brain key state DEK rotation is
+   designed to prevent.
+4. The reverse case — sidecar ahead of the raft log — cannot
+   happen because the sidecar is only written from inside an FSM
+   apply; an apply implies the entry is already in the Raft log.
+   The startup check still asserts this invariant and aborts on
+   violation as a defence against on-disk corruption.
+
+Note: this is local-node integrity, not a substitute for KEK
+custody (§9.3). A lost KEK still makes data unrecoverable; this
+section only protects against the narrower failure of "DEK was
+rotated cluster-wide but this one node missed the sidecar
+rewrite."
 
 ---
 
@@ -439,25 +562,45 @@ retiring DEK.
 
 ### 6.2 Hooks into the storage layer
 
+This is the **only** value-encryption site in the system. The
+coordinator does not pre-encrypt; the FSM does not bypass this path.
+
 - `store/lsm_store.go` — `pebbleStore` gains an optional
-  `*encryption.Keystore`. `Put` paths wrap before
-  `pebble.Batch.Set`; `Get` / iterators unwrap on the way out.
+  `*encryption.Keystore`. `Put` paths wrap the cleartext value (and
+  set the per-version `encryption_state` bit, see §7.1) before
+  `pebble.Batch.Set`; `Get` / iterators dispatch on
+  `encryption_state` and unwrap when the bit says encrypted.
 - `store/mvcc_store.go` — same hook applied to MVCC value bytes; the
-  MVCC ts and version metadata are **not** encrypted (they're keys,
-  not values, and are needed for visibility computation).
+  MVCC `commit_ts` and version metadata are **not** encrypted
+  (they're keys, not values, and are needed for visibility
+  computation — see §2.2 and §11.6 on what this exposes).
+- `store/lsm_store.go` value-header layout extension — the existing
+  9-byte header
+  (`[tombstone(1)] [expireAt(8)] [user_value...]`, see
+  `encodeValue`) is extended so the leading byte encodes both the
+  tombstone bit (bit 0) and the encryption-state bits (bits 1–2),
+  matching the 2-bit field in §7.1. Existing builds use only bit 0,
+  so an old build reading a value written by an encryption-enabled
+  build sees an unrecognised tombstone byte and refuses to serve it
+  rather than returning ciphertext as cleartext. `valueHeaderSize`
+  stays at 9 bytes; no on-disk layout shift.
 - `store/snapshot_pebble.go` — no change. It iterates Pebble values
-  byte-for-byte, which are already ciphertext.
+  byte-for-byte, which are already ciphertext (with the
+  `encryption_state` bit travelling in the value header).
 
 ### 6.3 Hooks into the Raft path
 
 - `kv/sharded_coordinator.go` and `kv/coordinator.go` — wrap the
-  `Data` bytes before submitting to `raftengine`; keep the cleartext
-  in the request struct so the coordinator's response path does not
-  pay for a redundant decrypt.
-- `kv/fsm.go` — unwrap on apply before dispatching to the existing
-  storage handlers. On unwrap failure, return an error from `Apply`
-  so the entry is not silently skipped (consistency invariant — see
-  CLAUDE.md self-review item 1).
+  proposal `Data []byte` (operation tag + key + cleartext value)
+  before submitting to `raftengine`. The coordinator does **not**
+  pre-encrypt the value with the storage DEK; that happens
+  exclusively at §6.2.
+- `kv/fsm.go` — unwrap the raft envelope on apply, recover the
+  cleartext operation, and dispatch to the existing storage
+  handlers (which then encrypt the value via §6.2). On unwrap
+  failure, return an error from `Apply` so the entry is not
+  silently skipped (consistency invariant — see CLAUDE.md self-
+  review item 1).
 - `internal/raftengine/etcd/engine.go` — no changes. It transports
   opaque bytes; whether they are cleartext or ciphertext is
   invisible to it.
@@ -488,13 +631,31 @@ NoCompression`) when encryption is enabled.
 --encryption-enabled                    Default: false
 --kekUri=...                            Mutually exclusive with --kekFile
 --kekFile=/etc/elastickv/kek.bin        32 bytes raw
---encryption-rotate-on-startup=false    Force a DEK rotation at boot
+--encryption-rotate-on-startup=false    Request a DEK rotation at boot
                                         (used by ops scripts; not for
                                         normal restarts)
 ```
 
 Existing clusters keep working unchanged because `--encryption-enabled`
 defaults off.
+
+`--encryption-rotate-on-startup` is a **request**, not a guarantee:
+the rotation can only be proposed by the leader. A node booting
+with the flag set:
+
+1. Waits for `raftengine` to report a stable leader (with the
+   existing leader-election timeout; no extra waiting loop).
+2. If this node is the leader, proposes the rotation entry and
+   blocks until it commits before the gRPC / Redis / DynamoDB
+   listeners open.
+3. If this node is a follower, **does not block**. The flag is
+   recorded as a pending request in memory; once a leader change
+   makes this node leader within the same uptime window, the
+   pending request is auto-fired. If leadership never moves to
+   this node, the request quietly expires at process exit. This
+   keeps `--encryption-rotate-on-startup` safe inside a rolling
+   restart loop where every node is briefly started with the flag
+   — only the eventual leader actually rotates.
 
 ### 6.6 New admin commands (in `cmd/elastickv-admin/`)
 
@@ -503,8 +664,14 @@ elastickv-admin encryption status
 elastickv-admin encryption rotate-dek --purpose=storage|raft
 elastickv-admin encryption rewrap-deks
 elastickv-admin encryption rewrite --rate=10MiB/s
+elastickv-admin encryption retire-dek --key-id=<uint32>
+elastickv-admin encryption resync-sidecar    # §5.5 follower repair
 elastickv-admin encryption disable           # refuses; documents the
                                               # dump-and-reload path
+elastickv-admin backup verify --backup-dir=...
+                                              # rejects backups
+                                              # missing the sidecar
+                                              # (§7.3)
 ```
 
 `status` reports active DEK ids per purpose, count of values per DEK
@@ -603,17 +770,43 @@ Backup tooling must capture the `<dataDir>/encryption/keys.json`
 sidecar alongside the data dir. Without it, even the right KEK cannot
 recover the data because the wrapped DEKs are gone.
 
+To make this hard to get wrong:
+
+- `elastickv-admin backup verify --backup-dir=...` (added in §6.6)
+  rejects a backup that contains encrypted SST files but no
+  sidecar, with `ErrBackupMissingSidecar`. Operators should run
+  this in their backup-pipeline post-step.
+- On restore, the startup checks in §9.1 already refuse to open a
+  data dir whose sidecar is absent or whose wrapped DEKs do not
+  unwrap under the configured KEK. A backup restored without its
+  sidecar therefore fails fast at process start, not silently
+  later when a read attempts to decrypt.
+
 ---
 
 ## 8. Performance
 
 ### 8.1 CPU
 
-AES-256-GCM with AES-NI runs at 3–5 GB/s per core on the x86_64 hosts
-we target. For a typical write workload (~10k writes/s of ~1 KiB
-values per node = 10 MiB/s) the encryption CPU is well under 1% of
-one core. The compress-then-encrypt path (§6.4) doubles that, still
-negligible.
+The numbers below are for hosts with **AES-NI** (or ARMv8 Crypto
+Extensions), which is the deployment target. Go's `crypto/aes` uses
+the hardware path automatically on those CPUs; `runtime/cpu`
+exposes detection via `cpu.X86.HasAES` / `cpu.ARM64.HasAES` and the
+encryption package logs the detected backend at startup.
+
+- **AES-NI / ARMv8 Crypto path:** AES-256-GCM runs at 3–5 GB/s per
+  core. For a typical write workload (~10k writes/s of ~1 KiB
+  values per node = 10 MiB/s) the encryption CPU is well under 1%
+  of one core. The compress-then-encrypt path (§6.4) doubles that,
+  still negligible.
+- **Software-fallback path:** older ARM, RISC-V, or virtualised
+  hosts that do not surface AES instructions to the guest get the
+  Go software AES — typically 200–400 MB/s per core, a 10–15×
+  penalty. The §8.3 benchmark gate (≤ 10% throughput regression)
+  cannot be met on those hosts; deployments that target them must
+  re-benchmark and either tighten the throughput budget or accept
+  the regression. The startup log line lets operators see which
+  path they are on without re-reading the kernel cpuflags.
 
 The write-amplification path (Pebble compaction) does **not** touch
 encryption — it shuffles ciphertext around. Compaction CPU is
@@ -625,10 +818,12 @@ above the cache. Cache effectiveness is unchanged.
 
 ### 8.2 Disk
 
-Per-value overhead: 33 bytes (envelope) + up to 1 byte
-(compress flag) = 34 bytes per stored value. For Redis hashes /
-streams stored as one blob per key this is one envelope per blob, not
-per element.
+Per-value overhead: 34 bytes per stored value
+(1 version + 1 flag + 4 key_id + 12 nonce + 16 tag), per the §4.1
+diagram. The 9-byte `lsm_store.go` value header (tombstone /
+encryption-state / `expireAt`) is unchanged. For Redis hashes /
+streams stored as one blob per key this is one envelope per blob,
+not per element.
 
 Compression ratio on text-shaped workloads (logs, JSON) drops from
 ~3× (Pebble-side Snappy) to ~2.5× (storage-side Snappy on cleartext
@@ -667,6 +862,10 @@ The process refuses to start if any of the following hold:
 - `--encryption-enabled` **not** set, but the data dir contains a
   sidecar (refusing prevents accidental downgrade to cleartext
   reads, which would silently bypass encryption on new writes).
+- The sidecar's `raft_applied_index` is behind the raftengine's
+  persisted applied index AND the gap covers any rotation entries
+  (see §5.5: `ErrSidecarBehindRaftLog`, recovered via
+  `encryption resync-sidecar`).
 
 Each refusal logs a single, unambiguous error pointing at the
 relevant flag and runbook section.
@@ -680,10 +879,21 @@ New metrics:
 - `elastickv_encryption_decrypt_failures_total{reason}` — counter;
   `reason` is `tag_mismatch`, `unknown_key_id`, `truncated`,
   `bad_version`. Any non-zero value is a paging-grade signal.
-- `elastickv_encryption_value_overhead_bytes` — histogram, payload
-  size minus plaintext size, per write.
+- `elastickv_encryption_writes_per_dek{key_id}` — counter; drives
+  the §5.2 writes-based rotation trigger.
+- `elastickv_encryption_value_overhead_bytes` — histogram of
+  `payload_size - plaintext_size` per write. **Note:** when
+  compression is enabled (§6.4) this histogram leaks information
+  about plaintext compressibility, which in turn correlates with
+  plaintext size. Deployments where that correlation is itself
+  considered sensitive (high-security tenants) should suppress the
+  metric via the existing Prometheus relabel config rather than
+  ship it to a shared collector.
 - `elastickv_encryption_kek_unwrap_seconds` — KMS round-trip
   histogram; alerting threshold for KMS outages.
+- `elastickv_encryption_sidecar_raft_index` — gauge of the
+  sidecar's `raft_applied_index`. A persistent gap between this
+  and the FSM applied index is the §5.5 split signal.
 
 Logging: structured `slog` with `key_id` (never the key bytes),
 `purpose`, and `data_dir`. Never log the DEK or KEK material.
@@ -756,18 +966,22 @@ eventual code change.
 
 5. **Test coverage.** New tests required:
    - `internal/encryption/cipher_test.go` — envelope round-trip,
-     tag-tamper rejection, AAD-tamper rejection, version-byte
-     rejection, unknown-`key_id` rejection.
+     tag-tamper rejection, AAD-tamper rejection (including
+     compress-flag flip), version-byte rejection, unknown-`key_id`
+     rejection, counter-nonce monotonicity.
    - `internal/encryption/sidecar_test.go` — atomic write,
-     concurrent rotate, corrupted-sidecar refusal.
+     concurrent rotate, corrupted-sidecar refusal,
+     `raft_applied_index` reconciliation per §5.5.
    - `internal/encryption/kek/*_test.go` — one per provider, with
      KMS faked at the SDK boundary.
    - `store/lsm_store_encryption_test.go` — Put/Get round trip,
-     rotation mid-write, mixed cleartext/ciphertext during
-     migration.
-   - `kv/fsm_encryption_test.go` — apply with valid envelope, apply
-     with truncated envelope (must error, not skip), apply across
-     a rotation boundary.
+     rotation mid-write, mixed cleartext/ciphertext via the MVCC
+     `encryption_state` bit, including a legacy value whose first
+     byte is `0x01` (regression test for the migration P1).
+   - `kv/fsm_encryption_test.go` — apply with valid raft envelope,
+     apply with truncated envelope (must error, not skip), apply
+     across a rotation boundary, follower with stale sidecar
+     refuses to start.
    - Jepsen Redis + DynamoDB suites against an encrypted 3-node
      cluster as the acceptance gate.
 
