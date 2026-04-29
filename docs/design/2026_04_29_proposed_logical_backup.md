@@ -777,6 +777,55 @@ fan-out: it submits the per-group entry through the existing
 `ShardGroup.Propose` path and waits for commit before returning to the
 producer.
 
+**Snapshot installation invalidates a replica's pin set.**
+`kvFSM.Restore` (`kv/fsm.go:264-287`) installs a Raft snapshot by
+rebuilding the Pebble store from the snapshot stream — and then *only*
+the Pebble store. The in-memory `ActiveTimestampTracker` is not part
+of the snapshot, so a replica that installs a snapshot during a
+backup window loses every `BackupPin` that was recorded before the
+snapshot's `Metadata.Index`. Once the leader has compacted the log
+past the original `BackupPin` entry index, that entry is gone — a
+follower catching up via snapshot will never replay it. The replica's
+compactor (now bounded only by other live pins, or unbounded) becomes
+free to retire MVCC versions at `read_ts`.
+
+This bounds when the design is safe:
+
+> **Safe-bound invariant**:
+> `backup_duration + worst_case_compaction_lag < mvcc_retention_horizon`.
+
+Concretely, with a 1-hour MVCC retention and a 10-minute Raft
+snapshot interval, the design tolerates dumps up to ~50 minutes
+without hitting the corner case. Beyond that, a snapshot triggered
+by a freshly-restarted follower can quietly unprotect a replica.
+
+`BeginBackup` enforces a soft form of this invariant: it reads each
+group's `Status.AppliedIndex` and `firstIndex` (the oldest log entry
+still on the leader), and refuses to start if any group's
+`appliedIndex - firstIndex` is below a configurable margin
+(`--snapshot-headroom-entries`, default 10000). Operators dumping a
+cluster running close to its snapshot threshold receive
+`FailedPrecondition` rather than a silent corruption, and either
+retry once the headroom widens or extend `mvcc_retention_horizon`
+upstream of the dump.
+
+The failure mode for replicas that go through `Restore` mid-backup is
+documented explicitly: the replica's `ScanAt(at_ts=read_ts)` results
+become eventually-consistent (versions at `read_ts` may already have
+been compacted on that replica), and the producer surfaces the
+inconsistency as a `ScanAt` returning fewer keys than the
+`applied_index` baseline implied. The producer's per-scope
+`expected_keys` heuristic — already needed for
+`TestBeginBackupPinSurvivesLeaderChange` — catches it and fails the
+dump rather than emitting a corrupted artifact.
+
+A heavier mitigation that would let dumps run longer than the
+retention horizon — snapshotting the tracker state alongside the
+Pebble snapshot, or having `Restore` query siblings for active pins
+— is intentionally **out of scope for Phase 1**. The Phase 1 contract
+is "your dump completes within the retention horizon"; longer dumps
+are a Phase 3 problem (see Incremental Backups).
+
 **Bound on concurrent active backup pins.** To prevent a misbehaving
 or malicious caller from issuing unbounded `BeginBackup` requests and
 holding the compactor open across the whole MVCC retention horizon,
@@ -813,10 +862,15 @@ dumps with retention pressure.
    group's `Status.AppliedIndex` (already exposed via the existing
    raftengine status interface used by `AdminServer.GetRaftGroups`)
    with a 500 ms tick and a configurable deadline (default 5 s; surfaced
-   as `--begin-backup-deadline` on the CLI). If any group fails to
-   reach the threshold within the deadline, `BeginBackup` returns
-   `FailedPrecondition` and the producer aborts — the dump is
-   not started until every group can serve `read_ts` consistently.
+   as `--begin-backup-deadline` on the CLI). **This is the binding wait
+   in practice** — a healthy group commits a Raft entry in <100 ms,
+   while a lagging shard recovering from a leader change or restart
+   can take seconds. Operators tuning `--begin-backup-deadline` are
+   adjusting tolerance for shard lag; it does not need to scale with
+   pin-fan-out latency. If any group fails to reach the threshold
+   within the deadline, `BeginBackup` returns `FailedPrecondition`
+   and the producer aborts — the dump is not started until every
+   group can serve `read_ts` consistently.
 3. **Pin `read_ts` cluster-wide**, not just on the node that received
    the RPC. `kv/active_timestamp_tracker.go` is per-process
    (`main.go:294` constructs one tracker per node and wires it
@@ -847,14 +901,20 @@ dumps with retention pressure.
    renewals; only the deadline shifts. A multi-hour dump never relies
    on a single 30-minute pin. Renewals are cheap (one Raft entry per
    group per renewal — at `ttl_ms/3 = 10 min`, that is 6 entries per
-   hour per group, negligible alongside production traffic). The
-   producer's renewal goroutine logs a critical alert and aborts the
-   dump if a renewal call fails — letting the dump continue past the
-   TTL would silently produce a corrupted artifact (the compactor
-   would have already retired versions the in-flight scan still
-   depends on). If renewal succeeds on some groups but fails on
-   others, the producer aborts and issues `EndBackup` (which itself
-   tolerates partial state — see step 6).
+   hour per group, negligible alongside production traffic).
+
+   **Per-group renewal retry**: `BackupExtend` proposes through
+   `ShardGroup.Propose`, which fails transiently during a leader
+   election (typically <1 s under etcd/raft defaults). The admin
+   server retries each per-group proposal **up to 3 times with 500 ms
+   backoff** before declaring that group's renewal failed. Only after
+   the retry budget is exhausted does the producer's renewal goroutine
+   log a critical alert and abort the dump — letting the dump continue
+   past the TTL would silently produce a corrupted artifact (the
+   compactor would have already retired versions the in-flight scan
+   still depends on). If renewal succeeds on some groups but fails on
+   others after retries, the producer aborts and issues `EndBackup`
+   (which itself tolerates partial state — see step 6).
 6. **`EndBackup(pin_token)`** proposes `BackupRelease{pin_id}` on
    every group recorded in `pin_token`. The release is idempotent: a
    group that has already swept the pin via deadline expiry treats
@@ -913,6 +973,7 @@ elastickv-backup dump \
   [--checksums sha256] \
   [--ttl-ms 1800000] \
   [--begin-backup-deadline 5s] \
+  [--snapshot-headroom-entries 10000] \
   [--scan-page-size 1024] \
   [--dynamodb-bundle-mode per-item|jsonl] \
   [--dynamodb-bundle-size 64MiB] \
@@ -1083,11 +1144,41 @@ trustworthy off-cluster artifact even before the restore tool is fully
 written.
 
 - New admin RPCs on `proto/admin.proto`: `BeginBackup` (with `ttl_ms`),
-  `EndBackup`, `ListAdaptersAndScopes` (signatures in "Read-Side
-  Consistency").
-- Extend `kv/active_timestamp_tracker.go` with `PinWithDeadline` plus
-  the per-second sweeper goroutine that reaps expired pins and emits
-  the `backup_pin_expired` structured warning.
+  `EndBackup`, `RenewBackup`, `ListAdaptersAndScopes` (signatures in
+  "Read-Side Consistency").
+- Extend `kv/active_timestamp_tracker.go` with `PinWithDeadline`,
+  `Extend`, and the per-second sweeper goroutine that reaps expired
+  pins and emits the `backup_pin_expired` structured warning.
+- **FSM plumbing for cluster-wide pins** (the propagation described
+  in "Cluster-wide propagation" only works if these land):
+  - New byte tag constants in `kv/fsm.go` alongside the existing
+    `raftEncodeHLCLease = 0x02` (`kv/fsm.go:116`):
+    `raftEncodeBackupPin = 0x03`, `raftEncodeBackupExtend = 0x04`,
+    `raftEncodeBackupRelease = 0x05`. New
+    `applyBackupPin` / `applyBackupExtend` / `applyBackupRelease`
+    handlers on `kvFSM`, dispatched from `kvFSM.Apply`
+    (`kv/fsm.go:60`) in the same shape as `applyHLCLease`.
+  - New `*ActiveTimestampTracker` field on `kvFSM` (`kv/fsm.go:26`),
+    wired via a new `NewKvFSMWithHLCAndTracker(store, hlc, tracker)`
+    constructor — analogous to how `*HLC` is shared today via
+    `NewKvFSMWithHLC`. The coordinator and the FSM must share the
+    same tracker instance so `applyBackupPin` and the local
+    compactor consult the same map. This invariant goes alongside
+    the HLC-sharing invariant in `CLAUDE.md`.
+  - New `kv/backup_codec.go` — wire encoding for the three entry
+    types. Hand-coded fixed-layout binary (matching the HLC lease
+    style):
+    ```
+    BackupPin     : [tag:1][pin_id:16][read_ts:8][deadline_ms:8]   = 33 bytes
+    BackupExtend  : [tag:1][pin_id:16][deadline_ms:8]              = 25 bytes
+    BackupRelease : [tag:1][pin_id:16]                             = 17 bytes
+    ```
+    `pin_id` is a UUIDv4 generated by the admin server at
+    `BeginBackup` time and echoed in every subsequent `BackupExtend`
+    / `BackupRelease` so the FSM can target the right tracker entry.
+    Hand-coded binary (vs. proto) keeps the entry small enough to
+    stay within the existing `MaxEntryBytes` budget and avoids
+    pulling proto codegen into the FSM apply hot path.
 - New `kv/backup_scan.go` — `BackupScanner` iterator wrapping the
   existing `ShardStore.ScanAt` (`kv/shard_store.go:106`) so multi-
   million-key ranges page through `ScanAt` calls of `--scan-page-size`
@@ -1150,6 +1241,10 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestBeginBackupPinFanOutAllNodes` | A 3-node cluster: `BeginBackup` issued to node A; verify nodes B and C have applied the `BackupPin` Raft entry and their compactors retain MVCC versions at `read_ts`. Compactor on B forced to run mid-dump must not retire pinned versions |
 | `TestBeginBackupPinSurvivesLeaderChange` | After `BeginBackup` on node A, force a leadership change on a group; the new leader still honors the pin (its FSM applied the same entry); subsequent `BackupScanner.Next` calls succeed |
 | `TestBeginBackupGroupUnreachable` | If one group cannot commit `BackupPin` within `--begin-backup-deadline`, `BeginBackup` returns `Unavailable` and proposes `BackupRelease` on every group that did commit; no stranded pins remain |
+| `TestBackupPinFSMCodecRoundTrip` | `BackupPin` / `BackupExtend` / `BackupRelease` byte layouts (33 / 25 / 17 bytes) round-trip through the FSM apply path; unknown tag bytes return `ErrUnknownRequestType` rather than panicking |
+| `TestRestoreWipesLocalPins` | A replica that installs a Raft snapshot during a backup loses its `BackupPin`; the producer's per-scope `expected_keys` heuristic detects the resulting `ScanAt` shortfall and fails the dump rather than emitting a corrupted artifact |
+| `TestBeginBackupRefusesNearSnapshotThreshold` | When any group's `appliedIndex - firstIndex < snapshot_headroom_entries`, `BeginBackup` returns `FailedPrecondition` rather than starting a dump that risks the snapshot-installation path |
+| `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
 | `TestBackupScannerPaging` | A range with > pageSize keys is returned across multiple `ScanAt` pages with no overlap, no gaps; iteration tolerates concurrent writes by completing at the pinned `read_ts` |
