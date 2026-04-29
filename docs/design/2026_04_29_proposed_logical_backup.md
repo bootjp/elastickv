@@ -717,9 +717,15 @@ message ShardApplied {
 }
 
 message ScopeKeyCount {
-  // scope_id is "<adapter>/<scope-name>" e.g. "dynamodb/orders" or
-  // "s3/photos". Producer matches it against the directory it is
-  // about to write into.
+  // scope_id is the canonical "<adapter>/<scope-name>" string, used
+  // by the producer to match each baseline against the directory it
+  // is about to write. Mapping per adapter:
+  //   - DynamoDB: "dynamodb/<table>"        e.g. "dynamodb/orders"
+  //   - S3      : "s3/<bucket>"             e.g. "s3/photos"
+  //   - Redis   : "redis/db_<n>"            e.g. "redis/db_0"
+  //                (n is the uint32 from
+  //                 ListAdaptersAndScopesResponse.redis_databases)
+  //   - SQS     : "sqs/<queue-name>"        e.g. "sqs/orders-fifo.fifo"
   string scope_id                = 1;
   uint64 key_count               = 2;
   uint64 applied_index_at_count  = 3;
@@ -834,10 +840,29 @@ refuse if: remaining_headroom < --snapshot-headroom-entries
 ```
 
 `SnapshotEvery` is the per-engine snapshot trigger (default
-`defaultSnapshotEvery = 10000` from `internal/raftengine/etcd/engine.go:92`).
-`BeginBackup` reads it from each group's engine config rather than
-hardcoding the default, so an operator who tuned `--raftSnapshotEvery`
-sees consistent behavior. With `SnapshotEvery = 10000` and
+`defaultSnapshotEvery = 10000` from `internal/raftengine/etcd/engine.go:92`,
+overridden via the `ELASTICKV_RAFT_SNAPSHOT_COUNT` env var — there is
+no `--raftSnapshotEvery` CLI flag). The value is currently a private
+field on the etcd `Engine` struct (`internal/raftengine/etcd/engine.go:224`)
+with no accessor on the `raftengine.Engine` interface
+(`internal/raftengine/engine.go:200`, composing `Proposer` /
+`LeaderView` / `StatusReader` / `ConfigReader`). Phase 1 therefore
+adds a new accessor:
+
+```go
+// internal/raftengine/engine.go (extended)
+type StatusReader interface {
+    Status() Status
+    SnapshotEvery() uint64  // new in Phase 1
+}
+```
+
+implemented on the etcd backend by returning the
+`snapshotEveryFromEnv()` value cached at `Open` time. With this in
+place, `BeginBackup` reads each group's `SnapshotEvery` rather than
+hardcoding `defaultSnapshotEvery`, so an operator who tuned
+`ELASTICKV_RAFT_SNAPSHOT_COUNT` sees consistent behavior. With
+`SnapshotEvery = 10000` and
 `--snapshot-headroom-entries = 1000` (default; one-tenth of
 SnapshotEvery), the check refuses backups when fewer than 1000 entries
 remain before the next snapshot fires — i.e. when an in-flight backup
@@ -1238,6 +1263,43 @@ written.
     `applyBackupPin` / `applyBackupExtend` / `applyBackupRelease`
     handlers on `kvFSM`, dispatched from `kvFSM.Apply`
     (`kv/fsm.go:60`) in the same shape as `applyHLCLease`.
+
+  - **Two-version rolling-upgrade plan.** Today, an unknown leading
+    tag falls through `decodeRaftRequests` (`kv/fsm.go:140`) into
+    `decodeLegacyRaftRequest` (`kv/fsm.go:145`), which calls
+    `proto.Unmarshal` on the raw bytes. A `BackupPin` entry with
+    leading byte `0x03` would fail the unmarshal and surface as an
+    error from `Apply`, stalling the apply loop on any node that
+    hasn't been upgraded. Introducing the new tags in a single
+    release would therefore corrupt apply on old replicas the moment
+    the first `BeginBackup` lands during a rolling upgrade.
+
+    Phase 1 ships in **two releases** to avoid this:
+
+    1. **Release N (forward-compat handler only).** `kvFSM.Apply` is
+       extended so unknown tags in the reserved range
+       `[0x03, 0x0F]` are treated as no-ops with a structured
+       `unknown_fsm_tag` warning — no error returned. No new admin
+       RPCs, no producer, no `BackupPin` entries are ever written
+       at this version. Operators upgrade their clusters fleet-wide
+       to release N before the next step is enabled.
+    2. **Release N+1 (BackupPin enabled).** The actual `applyBackupPin`
+       / `Extend` / `Release` handlers ship and the admin RPCs are
+       activated. `BeginBackup` itself **gates on every group member
+       reporting `min_backup_version ≥ N`** — verified through the
+       existing `Admin.GetRaftGroups` membership view, which already
+       carries per-node version metadata. If any member reports a
+       version older than N, `BeginBackup` returns
+       `FailedPrecondition` with a clear message ("upgrade
+       node X to vN before backups can be taken").
+
+    Releases N and N+1 may be the same calendar release if the
+    operator is willing to enforce a fleet-wide upgrade window
+    before the first backup; the gate check still runs and
+    short-circuits if upgrade is incomplete. The reserved tag range
+    `[0x03, 0x0F]` lets future entry types (e.g. CDC tags for the
+    Phase 3 incremental backup) follow the same forward-compat
+    path without re-running the full upgrade dance.
   - New `*ActiveTimestampTracker` field on `kvFSM` (`kv/fsm.go:26`),
     wired via a new `NewKvFSMWithHLCAndTracker(store, hlc, tracker)`
     constructor — analogous to how `*HLC` is shared today via
@@ -1342,6 +1404,9 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestExpectedKeysBaselineToleratesTTLExpiry` | Routine TTL expiry between baseline and dump (1% of keys gone) does NOT trigger `ErrCompactionDuringDump`; a 5% drop DOES |
 | `TestExpectedKeysBaselineCountOnlyScan` | The baseline pass uses the new `ShardStore.ScanKeysAt`; verify per-key allocation is bounded (no value materialization) on a 1M-key scope and that existing `ScanAt` callers are bytewise-unchanged |
 | `TestExpectedKeysBaselineRunsAfterShardCatchup` | Force shard B to lag at `BeginBackup` time; verify the baseline scan blocks until step 2 (catch-up) completes for B, so B's `expected_keys[i].key_count` is the true count at `read_ts` rather than the partial-pre-catch-up count |
+| `TestForwardCompatUnknownFSMTag` | A release-N FSM receiving a synthetic `0x03`-tagged entry (representing a future `BackupPin` from a release-N+1 leader) returns nil from `Apply` and emits an `unknown_fsm_tag` warning, with no apply-loop stall and no FSM mutation. Tags `0x10+` (outside the reserved range) still error so the forward-compat door is bounded |
+| `TestBeginBackupGatesOnMinVersion` | If any group member reports `version < N`, `BeginBackup` returns `FailedPrecondition` and proposes no `BackupPin` entries on any group; once all members report `version ≥ N`, the same call succeeds |
+| `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
