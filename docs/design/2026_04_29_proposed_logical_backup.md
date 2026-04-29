@@ -135,7 +135,7 @@ backup-<utc-timestamp>-<cluster-id>-<commit-ts>/
 ├── redis/
 │   └── db_<n>/
 │       ├── strings/<key>.bin
-│       ├── strings_ttl.json
+│       ├── strings_ttl.jsonl
 │       ├── hashes/<key>.json
 │       ├── lists/<key>.json
 │       ├── sets/<key>.json
@@ -192,11 +192,37 @@ Rules:
   per message (would be millions of small files); they live in a single
   `messages.jsonl`. Same rationale for Redis stream entries.
 
-A single `KEYMAP` file at each adapter scope root translates the encoded
-filename back to the exact original bytes, in case the user needs to feed
-the data into a system that requires the verbatim key. The translation is
-also losslessly recoverable from the encoded filename alone — `KEYMAP` is a
-convenience, not a correctness dependency.
+`KEYMAP.jsonl` at each adapter scope root translates the encoded
+filename back to the exact original bytes, in case the user needs to
+feed the data into a system that requires the verbatim key. JSONL
+(one mapping per line, never loaded fully) is used so the file scales
+to millions of keys without becoming a memory bottleneck on either the
+producer or a downstream consumer. The translation is also losslessly
+recoverable from the encoded filename alone — `KEYMAP.jsonl` is a
+convenience, not a correctness dependency. A consumer that does not
+need it can ignore it entirely.
+
+### S3 path collisions (file vs. directory)
+
+S3 permits two objects whose keys are `path/to` and `path/to/obj`
+simultaneously. POSIX filesystems cannot represent both — `path/to`
+cannot be both a regular file and a directory. The dump producer
+detects this case at scan time:
+
+- **Pure-leaf case** (the more common case): the key without `/obj`
+  suffix is the only object → write at the natural path, no collision.
+- **Collision case**: both `path/to` and `path/to/obj` exist in the
+  same bucket at the same generation. The shorter key (the one that
+  would force a regular file on a path that must also be a directory)
+  is renamed to `path/to.elastickv-leaf-data`, with the rename
+  recorded in `s3/<bucket>/KEYMAP.jsonl`. The sidecar follows the
+  same renamed base: `path/to.elastickv-leaf-data.elastickv-meta.json`.
+- The collision-handling rule is documented at dump time in
+  `MANIFEST.json` (`s3_collision_strategy: "leaf-data-suffix"`) so a
+  restore tool reverses it without guessing.
+
+The producer emits a structured warning per collision so operators
+can spot dataset shapes that benefit from object-key normalization.
 
 ## Per-Adapter Format
 
@@ -273,6 +299,44 @@ This is the **wire-format DynamoDB item** — the same shape `GetItem` returns
 to a real DynamoDB SDK. Restoring into AWS DynamoDB is a literal
 `PutItem` per file. A failed table can be partially recovered by hand-
 editing one item and re-feeding it.
+
+#### One-file-per-item vs. bundle mode
+
+The default — one item per file under `items/<pk>/<sk>.json` — is a
+**deliberate, requirement-driven choice**, not an oversight. It is
+what makes "recover one row by editing one file and running one
+PutItem" trivially true, which is the whole point of a
+vendor-independent dump. The cost is filesystem overhead: a 50-million-
+item table emits 50 million inodes. On most modern filesystems
+(ext4/xfs/zfs/apfs) this is fine for write-once-and-tar dumps but
+slow for live filesystem operations.
+
+For tables where the inode count is the binding constraint, the
+producer accepts an opt-in `--dynamodb-bundle-mode jsonl[:size=64MiB]`
+that emits items as `items/data-<part-id>.jsonl` instead, packed up
+to a configurable per-file size budget:
+
+```
+dynamodb/orders/
+├── _schema.json
+└── items/
+    ├── data-00001.jsonl   # one item per line, items/data-00001.jsonl ≤ 64 MiB
+    ├── data-00002.jsonl
+    └── data-00003.jsonl
+```
+
+`MANIFEST.json` records the choice (`dynamodb_layout: "per-item" |
+"jsonl"`) so a restore tool dispatches the right reader. The bundle
+mode is an explicit operational decision; the default stays per-file
+because that is the layout the user asked for and the layout that
+makes one-line recovery scripts trivial. Operators are also free to
+post-process a per-item dump into bundles (`find … | xargs cat`)
+without losing any information, so the choice is not load-bearing on
+the format itself.
+
+The producer emits a structured warning when an unbundled scope
+exceeds 1 million items so operators can decide whether to switch
+modes for that table.
 
 GSIs are **not materialized** under the dump because they are derivable
 from `_schema.json` plus the base item set. Re-creating the table from
@@ -362,7 +426,7 @@ redis/
     ├── strings/
     │   ├── session%3Aabc123.bin             # SET session:abc123 …
     │   └── counter%3Aglobal.bin             # SET counter:global "42"
-    ├── strings_ttl.json                     # { "session%3Aabc123": 1735689600000, ... }
+    ├── strings_ttl.jsonl                     # one line per TTL'd key
     ├── hashes/
     │   └── user%3A1.json
     ├── lists/
@@ -381,9 +445,17 @@ any client library) can replay them without elastickv.
 - `strings/<key>.bin` is the **raw value bytes** — Redis strings are
   binary-safe, so JSON wrapping would force base64 and lose the property
   that `cat strings/<key>.bin` produces the original payload. TTL is in
-  the sidecar `strings_ttl.json` keyed by the same encoded filename;
-  values are absolute Unix-millis expirations to avoid clock skew on
-  restore.
+  the sidecar `strings_ttl.jsonl`, one record per line:
+  ```
+  {"key":"session%3Aabc123","expire_at_ms":1735689600000}
+  {"key":"cache%3Akv99","expire_at_ms":1735689610500}
+  ```
+  Values are absolute Unix-millis expirations to avoid clock skew on
+  restore. JSONL (not a single JSON object) is used so producers and
+  consumers stream the file line-by-line; a Redis instance with tens
+  of millions of TTL'd strings would exceed practical memory limits
+  for a single-object form, and Redis itself has no upper bound on
+  the number of TTL'd keys.
 - `hashes/<key>.json`:
   ```json
   {"format_version": 1, "fields": {"name": "alice", "age": "30"}, "expire_at_ms": null}
@@ -505,7 +577,10 @@ emits an `_internals/` subdirectory of newline-delimited records.
   "encoded_filename_charset": "rfc3986-unreserved-plus-percent",
   "key_segment_max_bytes": 240,
   "backup_ts_ttl_ms":   1800000,
-  "s3_meta_suffix":     ".elastickv-meta.json"
+  "s3_meta_suffix":     ".elastickv-meta.json",
+  "s3_collision_strategy": "leaf-data-suffix",
+  "dynamodb_layout":    "per-item",
+  "max_active_backup_pins": 4
 }
 ```
 
@@ -563,22 +638,30 @@ Per-adapter encoders consume `BackupScanner` and emit one record per
 service Admin {
   rpc BeginBackup(BeginBackupRequest) returns (BeginBackupResponse) {}
   rpc EndBackup(EndBackupRequest) returns (EndBackupResponse) {}
+  rpc RenewBackup(RenewBackupRequest) returns (RenewBackupResponse) {}
   rpc ListAdaptersAndScopes(ListAdaptersAndScopesRequest)
       returns (ListAdaptersAndScopesResponse) {}
 }
 
 message BeginBackupRequest {
   // Time-to-live for the read_ts pin on the active timestamp tracker.
-  // If EndBackup is not called within this window the pin is auto-released.
-  // Range: 60s–24h. Default: 30m.
+  // If neither EndBackup nor RenewBackup is called within this window
+  // the pin is auto-released. Range: 60s–24h. Default: 30m.
   uint64 ttl_ms = 1;
 }
 message BeginBackupResponse {
   uint64 read_ts            = 1;
-  bytes  pin_token          = 2;  // opaque, must be passed back to EndBackup
+  bytes  pin_token          = 2;  // opaque, must be passed back to RenewBackup / EndBackup
   uint64 ttl_ms_effective   = 3;
   repeated ShardApplied shards = 4;  // group_id, applied_index at pin time
 }
+
+// RenewBackup extends the deadline for an existing pin. A long-running
+// dump calls this every ttl_ms/3 (producer default) so a multi-hour
+// scan never relies on a single TTL window. The read_ts is preserved
+// across renewals; only the deadline shifts.
+message RenewBackupRequest  { bytes pin_token = 1; uint64 ttl_ms = 2; }
+message RenewBackupResponse { uint64 ttl_ms_effective = 1; }
 
 message EndBackupRequest  { bytes pin_token = 1; }
 message EndBackupResponse {}
@@ -602,7 +685,8 @@ extends the tracker:
 
 ```go
 // kv/active_timestamp_tracker.go (extended)
-func (t *ActiveTimestampTracker) PinWithDeadline(ts uint64, deadline time.Time) *ActiveTimestampToken
+func (t *ActiveTimestampTracker) PinWithDeadline(ts uint64, deadline time.Time) (*ActiveTimestampToken, error)
+func (t *ActiveTimestampToken) Extend(newDeadline time.Time) error
 ```
 
 `PinWithDeadline` records `(id → ts, deadline)`. A single sweeper
@@ -613,6 +697,30 @@ expiry) and is unaffected; only `BeginBackup` uses the deadline path.
 The sweeper logs a structured warning (`backup_pin_expired`) when it
 drops a stuck registration so operators see crashed-producer cases in
 their existing log pipeline.
+
+**Bound on concurrent active backup pins.** To prevent a misbehaving
+or malicious caller from issuing unbounded `BeginBackup` requests and
+holding the compactor open across the whole MVCC retention horizon,
+the tracker carries a hard cap (default `max_active_backup_pins = 4`,
+configurable). When the cap is reached, `PinWithDeadline` returns
+`ErrTooManyActiveBackups` and the admin RPC surfaces it as
+`ResourceExhausted`. Operators raising this cap should size it
+against the GC/compaction headroom — each held pin clamps the
+compactor's `Oldest()` timestamp until released. The cap is
+intentionally small because backups are an operator action, not
+end-user traffic; if four are not enough, something is wrong with
+the orchestration layer and adding pins compounds the underlying
+problem rather than fixing it.
+
+**TTL ceiling and back-pressure.** `ttl_ms` is bounded above by
+`backup_max_ttl_ms` (default 1 h) — a single pin cannot block
+compaction beyond that window even if a buggy caller asks for it.
+For dumps that legitimately need to run longer (e.g. a 50 TiB
+warehouse), the producer renews via `RenewBackup` every `ttl_ms/3`,
+so total dump duration is bounded only by overall MVCC retention
+budget, not by any single TTL choice. The producer surfaces a
+`pin_renewals_total` metric so operators can correlate long-running
+dumps with retention pressure.
 
 ### BeginBackup → EndBackup flow
 
@@ -634,10 +742,16 @@ their existing log pipeline.
    the resulting `pin_token` to the producer.
 4. **Producer scans** all configured adapter scopes via
    `BackupScanner.Next(at_ts=read_ts)`.
-5. **Renew on long dumps**: the producer calls `BeginBackup` again with
-   the same `read_ts` (carrying the existing token) every `ttl_ms / 3`
-   to extend the deadline. A multi-hour dump never relies on a single
-   30-minute pin.
+5. **Renew on long dumps**: the producer calls
+   `RenewBackup(pin_token, ttl_ms)` every `ttl_ms / 3` to extend the
+   deadline. The `read_ts` is preserved across renewals; only the
+   deadline shifts. A multi-hour dump never relies on a single
+   30-minute pin. Renewals are cheap (in-memory map update), and the
+   producer's renewal goroutine logs a critical alert and aborts the
+   dump if a renewal call fails — letting the dump continue past the
+   TTL would silently produce a corrupted artifact (the compactor
+   would have already retired versions the in-flight scan still
+   depends on).
 6. **`EndBackup(pin_token)`** releases the tracker entry. A producer
    crash before EndBackup leaves the entry to be reaped by the sweeper.
 
@@ -688,7 +802,12 @@ elastickv-backup dump \
   [--include-orphans] \
   [--preserve-sqs-visibility] \
   [--include-sqs-side-records] \
-  [--checksums sha256]
+  [--checksums sha256] \
+  [--ttl-ms 1800000] \
+  [--scan-page-size 1024] \
+  [--dynamodb-bundle-mode per-item|jsonl] \
+  [--dynamodb-bundle-size 64MiB] \
+  [--rename-collisions]
 ```
 
 Internally it runs:
@@ -908,7 +1027,10 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
 | `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
 | `TestBackupScannerPaging` | A range with > pageSize keys is returned across multiple `ScanAt` pages with no overlap, no gaps; iteration tolerates concurrent writes by completing at the pinned `read_ts` |
-| `TestS3SidecarSuffixCollision` | A user S3 object key ending in `.elastickv-meta.json` is rejected without `--rename-collisions`; with the flag, the rename is recorded in `KEYMAP` |
+| `TestS3SidecarSuffixCollision` | A user S3 object key ending in `.elastickv-meta.json` is rejected without `--rename-collisions`; with the flag, the rename is recorded in `KEYMAP.jsonl` |
+| `TestS3PathFileVsDirectoryCollision` | Bucket holds both `path/to` (object) and `path/to/obj`; producer renames the shorter key to `path/to.elastickv-leaf-data` and records it in `KEYMAP.jsonl`; restore tool reverses it via `MANIFEST.s3_collision_strategy` |
+| `TestBeginBackupTooManyActiveBackups` | Reaching `max_active_backup_pins` returns `ResourceExhausted`; releasing one pin frees a slot for the next request |
+| `TestRenewBackupExtendsDeadline` | `RenewBackup` shifts the deadline; producer's failed-renewal path aborts the dump with a critical log line rather than continuing past the TTL |
 
 ### P1
 
