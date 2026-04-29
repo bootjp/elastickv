@@ -207,11 +207,38 @@ Envelope format (single byte stream, stored as the Pebble value):
           last_seen_local_epoch:  uint16 }
     ```
 
-    Before a node performs **its first write under a DEK**
-    (whether at process start under an existing DEK, or
-    immediately after a rotation that created a new active
-    DEK), it proposes a `RegisterEncryptionWriter(dek_id,
-    full_node_id, local_epoch)` Raft entry. FSM apply checks:
+    Before a node performs **its first write under a DEK** it
+    must appear in the registry for that DEK. Three
+    registration paths exist, each closing a distinct rollout
+    window:
+
+    - **Bootstrap (Phase 1 cluster-wide activation).** When
+      the leader proposes the `bootstrap-encryption` Raft entry
+      (§5.6 step 1a), the entry body carries a batch
+      registration set covering every voting member that
+      passed the capability pre-check. FSM apply inserts the
+      registry entries in the same Pebble batch as the
+      bootstrap. This handles the common case where the
+      whole cluster transitions from cleartext to encrypted
+      at once — no per-node `RegisterEncryptionWriter`
+      round-trip is required for the initial cohort.
+    - **Process start under an existing DEK.** A node that
+      restarts (or joins a cluster that already has active
+      DEKs) proposes `RegisterEncryptionWriter(dek_id,
+      full_node_id, local_epoch)` from the coordinator
+      **before the coordinator accepts any client write** that
+      would land as an encrypted entry. FSM apply may run on
+      Raft entries proposed by the leader during this window
+      (those are decrypted using DEKs the node already has from
+      its sidecar), but no self-originated encrypted entry can
+      be queued by the local coordinator until registration
+      commits.
+    - **Post-rotation.** When a node observes a `rotate-dek`
+      apply, it proposes `RegisterEncryptionWriter` against
+      the new DEK with the same coordinator-side gate as the
+      process-start case above.
+
+    For each path, FSM apply checks:
 
     1. If no entry exists at the registry key → insert,
        allowing the registration. The node may now write under
@@ -498,7 +525,9 @@ For absolute clarity, the following remain unencrypted:
 - Raft metadata: term, index, entry type, configuration changes.
   (Membership changes carry node IDs and addresses, which are
   topology, not user data.)
-- The `pebbleSnapshotMagic` header on FSM snapshot streams.
+- The `hlcSnapshotMagic` / `hlcSnapshotMagicV2` header on FSM
+  snapshot streams (v1/v2 respectively; see §4.4 for the
+  versioned format).
 - The encryption sidecar file itself (§5.1) — it stores **wrapped**
   DEKs only; the wrap key (KEK) is held externally.
 
@@ -895,11 +924,40 @@ same way as every subsequent rotation:
    and `active.raft` fields are unset (`key_id == 0`). If so, it
    first proposes a `bootstrap-encryption` Raft entry containing
    freshly-generated `dek_storage` + `dek_raft` (CSPRNG via
-   `crypto/rand`, wrapped under the current KEK), then proposes
-   the actual `enable-storage-envelope` flag entry. The two
-   entries are pipelined but not atomic; the order is fixed
-   so the flag entry is always preceded by a bootstrap that
-   has already populated every node's sidecar.
+   `crypto/rand`, wrapped under the current KEK) **plus the
+   batch writer registry** described in step 1a below, then
+   proposes the actual `enable-storage-envelope` flag entry.
+   The two entries are pipelined but not atomic; the order is
+   fixed so the flag entry is always preceded by a bootstrap
+   that has already populated every node's sidecar and the
+   writer registry.
+
+   1a. **Batch writer registry in the same bootstrap entry.**
+       Without this step, the FSM apply path on every node
+       would start encrypting from the first post-flag entry
+       before any node had a `RegisterEncryptionWriter`
+       proposal in flight — and FSM apply is synchronous and
+       deterministic, so it cannot block for a Raft round-trip
+       to register itself. The leader closes that window by
+       collecting `(full_node_id, local_epoch_at_capability_check)`
+       from every voting member during the §7.1 Phase 0 / Phase 1
+       capability pre-check (the same `EncryptionAdmin.GetCapability`
+       fan-out) and including the resulting batch as a field
+       on the `bootstrap-encryption` Raft entry body. The FSM
+       handler atomically writes the new wrapped DEKs to the
+       sidecar AND inserts the registry entries
+       `!encryption|writers|<dek_storage_id>|<uint16(node_id)>`
+       and `!encryption|writers|<dek_raft_id>|<uint16(node_id)>`
+       in the same Pebble batch as the bootstrap apply. From
+       the next Raft index onward, every encrypting node is
+       already in the registry, so the §4.1 collision check
+       has its full input cluster-wide. Nodes added to the
+       cluster *after* bootstrap fall back to the
+       process-start trigger described in §4.1 (their first
+       `RegisterEncryptionWriter` is proposed before they
+       accept any encrypted write at the coordinator, before
+       the FSM apply path can be called for a self-originated
+       proposal).
 2. **Idempotency.** `bootstrap-encryption` is **rejected** by
    FSM apply if the sidecar already has an active storage DEK
    (the leader's pre-check above is a fast path; the FSM check
@@ -1025,6 +1083,34 @@ coordinator does not pre-encrypt; the FSM does not bypass this path.
 - `internal/raftengine/etcd/engine.go` — no changes. It transports
   opaque bytes; whether they are cleartext or ciphertext is
   invisible to it.
+- **Encryption-internal Raft entry types added to `kv/fsm.go`.**
+  Three new tag constants extend the existing
+  `raftEncodeSingle` / `raftEncodeBatch` / `raftEncodeHLCLease`
+  space:
+  - `raftEncodeEncryptionRegistration = 0x03` — body is a
+    single `RegisterEncryptionWriter(dek_id, full_node_id,
+    local_epoch)` per §4.1.
+  - `raftEncodeEncryptionBootstrap   = 0x04` — body is the
+    `bootstrap-encryption` payload per §5.6 (initial wrapped
+    DEK pair plus the batch writer registry covering every
+    voting member that passed the capability pre-check).
+  - `raftEncodeEncryptionRotation    = 0x05` — body is the
+    rotate / rewrap-deks / retire-dek / enable-storage-envelope /
+    enable-raft-envelope payload per §5.2 / §5.4 / §7.1 with
+    a sub-tag in the body distinguishing them.
+
+  FSM `Apply` dispatches in this order: (1) raft envelope
+  unwrap if `index > raft_envelope_cutover_index`; (2)
+  encryption-internal tags above (`0x03..0x05`) handled by
+  `internal/encryption/` package via a callback registered at
+  FSM construction; (3) HLC-lease (`0x02`); (4) regular
+  `decodeRaftRequests` (`0x00`/`0x01`). Encryption-internal
+  entries write to Pebble keys under `!encryption|...` and to
+  the sidecar (for the `0x04`/`0x05` cases). They are
+  replayed naturally via the Raft log on restart, so the
+  `RegisterEncryptionWriter` entries themselves are NOT in
+  the §5.5 `isEncryptionRelevant()` predicate (only the
+  `0x04`/`0x05` family is, because those mutate `keys.json`).
 
 ### 6.4 Compress-then-encrypt
 
