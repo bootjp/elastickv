@@ -1450,9 +1450,49 @@ coordinator does not pre-encrypt; the FSM does not bypass this path.
   `resolveProposal` so every coordinator write would time out
   forever). The version above — unwrap the **payload extracted
   by `decodeProposalEnvelope`**, not the raw entry bytes — is
-  the only correct layering. Unwrap failure (GCM tag mismatch)
-  propagates as an `Apply` error so the entry is not silently
-  skipped.
+  the only correct layering.
+
+  **Unwrap failure is a process-fatal event, not a return
+  value.** The current `StateMachine.Apply` contract is
+  `Apply(data []byte) any` (no `error`), and
+  `engine.go::applyCommitted` advances `setApplied(entry.Index)`
+  unconditionally on the Apply return — so an earlier draft's
+  promise "propagates as an `Apply` error" was incorrect: the
+  engine would silently mark the entry applied, the
+  recovering node would skip ahead to the next entry, and the
+  storage state would diverge from the rest of the cluster.
+  GCM tag mismatch on a raft envelope means either (a) the
+  required raft DEK is not loaded in the local keystore
+  (sidecar / Raft-log divergence per §5.5) or (b) on-disk
+  corruption / active tampering. Both demand operator
+  attention before any further apply.
+
+  The hook therefore implements the failure path as:
+
+  ```text
+  if entry.Index > raft_envelope_cutover_index:
+    payload, err := raftDEK.Unwrap(maybe_enc_payload)
+    if err != nil {
+      // Log key_id, entry.Index, and the GCM error class.
+      // Do NOT call fsm.Apply.
+      // Do NOT call setApplied — the next restart must replay
+      // this same entry, not skip it.
+      log.Error("raft envelope unwrap failed; halting apply",
+                key_id, entry.Index, err)
+      return ErrRaftUnwrapFailed   // engine treats this as fatal
+    }
+  ```
+
+  `engine.go::applyCommitted` is extended to recognise
+  `ErrRaftUnwrapFailed` (and its bootstrap-recovery sibling
+  `ErrEncryptionApply` for `0x03/0x04/0x05` apply errors) and
+  to **stop the apply loop without advancing `setApplied`** —
+  the process exits via the existing fatal-error path so an
+  operator-supervised restart can take over (sidecar resync
+  per §5.5, or KEK custody investigation per §9.3). Silent
+  skip is never an option: a divergent FSM after a missed
+  apply is exactly the safety property the integrity tag was
+  added to detect.
 - **Encryption-internal Raft entry types added to `kv/fsm.go`.**
   Three new tag constants extend the existing
   `raftEncodeSingle` / `raftEncodeBatch` / `raftEncodeHLCLease`
@@ -1841,7 +1881,15 @@ flag becomes a *capability* assertion, not a *behaviour* trigger.
      // the cutover update, leaving the local sidecar in Phase 1
      // forever.
      if entry.Index > raft_envelope_cutover_index:
-       payload = raftDEK.Unwrap(maybe_enc_payload)  // strip §4.2 envelope
+       var err error
+       payload, err = raftDEK.Unwrap(maybe_enc_payload)
+       if err != nil {
+         // GCM tag mismatch = sidecar/keystore divergence or
+         // on-disk corruption. Halt apply WITHOUT setApplied so
+         // the next restart replays this entry under a corrected
+         // keystore. Silent skip would diverge the FSM.
+         return ErrRaftUnwrapFailed   // engine treats as fatal
+       }
      response := fsm.Apply(payload)                 // contract unchanged
      resolveProposal(entry.Index, entry.Data, response)
 
@@ -2169,9 +2217,15 @@ eventual code change.
 
 1. **Data loss.** The dangerous path is "decrypt fails →
    value disappears." The design forbids silent skips: any decrypt
-   failure inside `MVCCStore.Get` returns a typed error;
-   `kv/fsm.go::Apply` propagates decrypt failures rather than
-   returning `nil`. Snapshot restore validates the envelope on
+   failure inside `MVCCStore.Get` returns a typed error.
+   Raft-envelope unwrap failure in the engine hook (§6.3) does
+   **not** flow through `Apply` (which can only return `any`);
+   instead the hook returns `ErrRaftUnwrapFailed` directly to
+   `applyCommitted`, which halts the apply loop **without**
+   advancing `setApplied` so the entry is replayed on the next
+   restart rather than silently skipped. Process exits via the
+   existing fatal-error path; operator restarts under a
+   corrected keystore. Snapshot restore validates the envelope on
    ingest, not just on read. The migration path dispatches on the
    per-version `encryption_state` bit in MVCC metadata (not on the
    value bytes — see §7.1 on why a leading byte is unsafe), so a
