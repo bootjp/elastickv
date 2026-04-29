@@ -121,7 +121,7 @@ or migrate the data **without elastickv being part of the recovery path**.
 ```
 backup-<utc-timestamp>-<cluster-id>-<commit-ts>/
 ├── MANIFEST.json
-├── CHECKSUMS                         # SHA-256 of every regular file under the root
+├── CHECKSUMS                         # sha256sum(1)-compatible: "<64-hex>  <relative-path>" per line
 ├── dynamodb/
 │   └── <table-name>/
 │       ├── _schema.json
@@ -130,20 +130,34 @@ backup-<utc-timestamp>-<cluster-id>-<commit-ts>/
 ├── s3/
 │   └── <bucket-name>/
 │       ├── _bucket.json
-│       └── <object-key-path>          # original object bytes, original hierarchy
+│       ├── <object-key-path>                       # original object bytes
+│       └── <object-key-path>.elastickv-meta.json   # sidecar (reserved suffix)
 ├── redis/
 │   └── db_<n>/
 │       ├── strings/<key>.bin
+│       ├── strings_ttl.json
 │       ├── hashes/<key>.json
 │       ├── lists/<key>.json
 │       ├── sets/<key>.json
 │       ├── zsets/<key>.json
-│       └── streams/<key>.jsonl
+│       ├── streams/<key>.jsonl
+│       └── hll/<key>.bin                           # HyperLogLog opaque sketch (!redis|hll|<key>)
 └── sqs/
     └── <queue-name>/
         ├── _queue.json
         └── messages.jsonl
 ```
+
+`CHECKSUMS` is exact `sha256sum(1)` output so verification works without
+elastickv: `sha256sum -c CHECKSUMS` from the dump root succeeds on a
+clean dump and fails (with file-level diagnostics) on tampering.
+
+The `.elastickv-meta.json` suffix is **reserved**: a user S3 object
+whose key happens to end in `.elastickv-meta.json` is rejected at dump
+time with a typed error rather than silently colliding with its own
+sidecar. Operators who hold such keys pass `--rename-collisions` to have
+them emitted as `<obj>.elastickv-meta.json.user-data` (the rename is
+recorded in `KEYMAP`).
 
 The directory **is** the index. There is no other side-table that must be
 parsed before the user can find a record.
@@ -190,15 +204,21 @@ convenience, not a correctness dependency.
 
 ```
 dynamodb/
-└── orders/
+└── orders/                                        # composite-key table (hash + range)
     ├── _schema.json
     └── items/
-        ├── customer-7421/
-        │   ├── 2026-04-29T12:00:00Z.json
+        ├── customer-7421/                          # <pk>/
+        │   ├── 2026-04-29T12:00:00Z.json           # <sk>.json
         │   └── 2026-04-29T13:15:42Z.json
         ├── customer-7422/
         │   └── 2026-04-29T09:00:00Z.json
-        └── b64.AAECAw../single.json     # binary partition key
+        └── b64.AAECAw../                           # binary partition key (B attribute)
+            └── 2026-04-29T10:00:00Z.json
+└── sessions/                                      # hash-only table
+    ├── _schema.json
+    └── items/
+        ├── sess-abc123.json                        # <pk>.json directly under items/
+        └── sess-def456.json
 ```
 
 `_schema.json`:
@@ -272,22 +292,26 @@ s3/
     │   └── 04/
     │       └── 29/
     │           ├── img.jpg
-    │           ├── img.jpg.metadata.json
+    │           ├── img.jpg.elastickv-meta.json
     │           ├── thumbnails/
-    │           │   └── img-128x128.jpg
-    │           └── thumbnails/img-128x128.jpg.metadata.json
+    │           │   ├── img-128x128.jpg
+    │           │   └── img-128x128.jpg.elastickv-meta.json
     └── archive/
-        └── manifest.csv
+        ├── manifest.csv
+        └── manifest.csv.elastickv-meta.json
 ```
 
 The S3 object body sits at its natural path — every byte that the
 elastickv S3 adapter would have streamed through `streamObjectChunks` for a
 GET is reassembled in order and written out as a single regular file.
 
-A sidecar `<object>.metadata.json` carries the parts of `s3ObjectManifest`
-that S3 itself exposes via headers (`Content-Type`, `Content-Encoding`,
-`Cache-Control`, `Content-Disposition`, user-defined `x-amz-meta-*`,
-`ETag`, `LastModified`):
+A sidecar `<object>.elastickv-meta.json` carries the parts of
+`s3ObjectManifest` that S3 itself exposes via headers (`Content-Type`,
+`Content-Encoding`, `Cache-Control`, `Content-Disposition`, user-defined
+`x-amz-meta-*`, `ETag`, `LastModified`). The suffix is reserved (see
+"Top-Level Layout" above): a user S3 object whose key ends in
+`.elastickv-meta.json` is rejected at dump time unless
+`--rename-collisions` is passed.
 
 ```json
 {
@@ -477,8 +501,11 @@ emits an `_internals/` subdirectory of newline-delimited records.
     "include_sqs_side_records":   false
   },
   "checksum_algorithm": "sha256",
+  "checksum_format":    "sha256sum",
   "encoded_filename_charset": "rfc3986-unreserved-plus-percent",
-  "key_segment_max_bytes": 240
+  "key_segment_max_bytes": 240,
+  "backup_ts_ttl_ms":   1800000,
+  "s3_meta_suffix":     ".elastickv-meta.json"
 }
 ```
 
@@ -498,39 +525,134 @@ The dump must capture state at a single cluster-wide commit-ts so that:
 - An SQS message's `data` row and its `vis`/`byage` index entries
   (when included) reflect the same FIFO sequence number.
 
-Implementation:
+### Scan primitive
 
-1. The backup tool calls a new admin RPC `Admin.BeginBackup` that returns
-   a cluster-wide `read_ts` chosen by the same path that lease reads use
-   (`kv/lease_state.go`, see also
-   `2026_04_20_implemented_lease_read.md`). The `read_ts` is held open
-   for the duration of the dump by registering it with the **active
-   timestamp tracker** (`kv/active_timestamp_tracker.go`) so
-   `kv/compactor.go` cannot retire MVCC versions the dump still depends
-   on.
-2. Every per-adapter scan (`kv.ShardedCoordinator.ScanRange`) is issued
-   `at_ts = read_ts`. This is exactly the path
-   lease reads already use; no new code path through MVCC is introduced.
-3. `Admin.EndBackup` releases the tracker registration. A
-   tool-side crash leaves the tracker entry behind for at most
-   `backup_ts_ttl` (default 30 minutes, configurable via the same admin
-   RPC), after which the registration auto-expires so the compactor is
-   not blocked indefinitely.
+`ShardStore.ScanAt(ctx, start, end, limit, ts)` already exists today
+(`kv/shard_store.go:106`, returning `[]*store.KVPair`); it shards the
+range across `RouteEngine` routes and runs `MVCCStore.ScanAt`
+(`store/store.go:117`) on the resulting per-group sub-ranges. The
+backup producer reuses it as-is — there is no new MVCC code path. What
+the proposal does add is a thin **iterator wrapper** so a multi-million
+key range does not need to be materialized in one call:
+
+```go
+// kv/backup_scan.go (new)
+type BackupScanner interface {
+    // Next advances the iterator. Returns (nil, false, nil) at end-of-range.
+    // The returned KVPair is owned by the caller until the next call to Next.
+    Next(ctx context.Context) (*store.KVPair, bool, error)
+    Close() error
+}
+
+// NewBackupScanner returns a forward iterator over [start, end) at ts.
+// Internally calls ShardStore.ScanAt in pages of pageSize, chaining
+// `start = lastReturnedKey + \x00` between pages so no lock is held
+// across pages and the compactor's MVCC retention budget is bounded.
+func (c *ShardedCoordinator) NewBackupScanner(start, end []byte, ts uint64, pageSize int) BackupScanner
+```
+
+`pageSize` is the same `ScanAt` `limit` parameter; the producer's
+default is 1024 and is exposed as a `--scan-page-size` CLI flag.
+Per-adapter encoders consume `BackupScanner` and emit one record per
+`Next` (or batch records into the same JSONL file for SQS / streams).
+
+### BeginBackup / EndBackup RPCs
+
+```protobuf
+// proto/admin.proto additions
+service Admin {
+  rpc BeginBackup(BeginBackupRequest) returns (BeginBackupResponse) {}
+  rpc EndBackup(EndBackupRequest) returns (EndBackupResponse) {}
+  rpc ListAdaptersAndScopes(ListAdaptersAndScopesRequest)
+      returns (ListAdaptersAndScopesResponse) {}
+}
+
+message BeginBackupRequest {
+  // Time-to-live for the read_ts pin on the active timestamp tracker.
+  // If EndBackup is not called within this window the pin is auto-released.
+  // Range: 60s–24h. Default: 30m.
+  uint64 ttl_ms = 1;
+}
+message BeginBackupResponse {
+  uint64 read_ts            = 1;
+  bytes  pin_token          = 2;  // opaque, must be passed back to EndBackup
+  uint64 ttl_ms_effective   = 3;
+  repeated ShardApplied shards = 4;  // group_id, applied_index at pin time
+}
+
+message EndBackupRequest  { bytes pin_token = 1; }
+message EndBackupResponse {}
+
+message ListAdaptersAndScopesResponse {
+  repeated string dynamodb_tables = 1;  // from !ddb|meta|table| scan
+  repeated string s3_buckets       = 2;  // from !s3|bucket|meta| scan
+  repeated uint32 redis_databases  = 3;  // {0} until multi-db lands
+  repeated string sqs_queues       = 4;  // from !sqs|queue|meta| scan
+}
+```
+
+`ListAdaptersAndScopes` is a thin wrapper over per-adapter metadata
+prefix scans run at `read_ts`; it has no new state of its own.
+
+### TTL on the active timestamp tracker
+
+`kv/active_timestamp_tracker.go` today exposes only `Pin(ts) → token`
+and `token.Release()`. To support BeginBackup's deadline, this design
+extends the tracker:
+
+```go
+// kv/active_timestamp_tracker.go (extended)
+func (t *ActiveTimestampTracker) PinWithDeadline(ts uint64, deadline time.Time) *ActiveTimestampToken
+```
+
+`PinWithDeadline` records `(id → ts, deadline)`. A single sweeper
+goroutine started by `NewActiveTimestampTracker` wakes once per second
+(or when notified by `PinWithDeadline`) and drops entries whose deadline
+has passed. `Pin(ts)` keeps its current zero-deadline behavior (no
+expiry) and is unaffected; only `BeginBackup` uses the deadline path.
+The sweeper logs a structured warning (`backup_pin_expired`) when it
+drops a stuck registration so operators see crashed-producer cases in
+their existing log pipeline.
+
+### BeginBackup → EndBackup flow
+
+1. **Pick `read_ts`**: `BeginBackup` reads the lease-read timestamp
+   pipeline (`kv/lease_state.go`, see
+   `2026_04_20_implemented_lease_read.md`) and snapshots
+   `applied_index` per Raft group.
+2. **Wait for shards to catch up**: every group is required to report
+   `applied_index ≥ commit_index_at_pin` for the default group's HLC
+   ceiling proposal that produced `read_ts`. `BeginBackup` polls each
+   group's `Status.AppliedIndex` (already exposed via the existing
+   raftengine status interface used by `AdminServer.GetRaftGroups`)
+   with a 500 ms tick and a configurable deadline (default 5 s; surfaced
+   as `--begin-backup-deadline` on the CLI). If any group fails to
+   reach the threshold within the deadline, `BeginBackup` returns
+   `FailedPrecondition` and the producer aborts — the dump is
+   not started until every group can serve `read_ts` consistently.
+3. **Pin `read_ts`** with `PinWithDeadline(read_ts, now+ttl_ms)`; return
+   the resulting `pin_token` to the producer.
+4. **Producer scans** all configured adapter scopes via
+   `BackupScanner.Next(at_ts=read_ts)`.
+5. **Renew on long dumps**: the producer calls `BeginBackup` again with
+   the same `read_ts` (carrying the existing token) every `ttl_ms / 3`
+   to extend the deadline. A multi-hour dump never relies on a single
+   30-minute pin.
+6. **`EndBackup(pin_token)`** releases the tracker entry. A producer
+   crash before EndBackup leaves the entry to be reaped by the sweeper.
 
 The dump is therefore a **point-in-time snapshot** of the user-visible
 keyspace, not a streaming tail.
 
 ### Cross-shard consistency
 
-A multi-shard deployment serves different key ranges from different Raft
-groups. `BeginBackup` propagates the same `read_ts` to every group;
-`ScanRange` at `read_ts` is the same OCC visibility check on every group.
-Because HLC physical ceilings are coordinated through the default group
-(`kv/hlc.go`), the chosen `read_ts` is admissible on every group as long
-as it is below each group's last-applied commit-ts at the moment of the
-call — which `BeginBackup` enforces by re-reading
-`max(group_commit_ts)` and adding a small skew buffer (default 50 ms)
-matching the existing TSO buffer.
+Step 2 above is the mechanism. Without it, picking `read_ts` from
+`max(group_commit_ts) + 50 ms` is only a *liveness* assertion: a
+lagging shard might not yet have applied through `read_ts`, and
+`ScanAt(at_ts=read_ts)` on that shard would either block forever or
+return a partial view. The `applied_index` poll-and-wait in
+`BeginBackup` makes the constraint explicit and bounded — every shard
+provably has the data at `read_ts` before any scan begins.
 
 ## Internal-State Handling
 
@@ -572,9 +694,11 @@ elastickv-backup dump \
 Internally it runs:
 
 ```
-BeginBackup → ListAdaptersAndScopes → ScanRange (per scope, at read_ts)
-            → encode-and-write per adapter → CHECKSUMS → MANIFEST.json
-            → EndBackup
+BeginBackup(ttl_ms=1800000) → ListAdaptersAndScopes
+                            → BackupScanner.Next* (per scope, at read_ts)
+                            → encode-and-write per adapter
+                            → CHECKSUMS → MANIFEST.json
+                            → EndBackup(pin_token)
 ```
 
 The producer **does not need access to the leader** — it issues lease
@@ -609,9 +733,11 @@ The format is designed to be extractable without elastickv:
 
 - DynamoDB: `aws dynamodb create-table --cli-input-json _schema.json` and
   then `aws dynamodb put-item --item @items/<pk>/<sk>.json` per file.
-- S3: `aws s3 sync s3/<bucket>/ s3://target-bucket/`. The metadata
-  sidecars are reapplied with a one-pass script that maps
-  `<obj>.metadata.json` to `--metadata` / `--content-type` / etc.
+- S3: `aws s3 sync --exclude '*.elastickv-meta.json' s3/<bucket>/ s3://target-bucket/`.
+  The metadata sidecars are reapplied with a one-pass script that maps
+  `<obj>.elastickv-meta.json` to `--metadata` / `--content-type` / etc.
+  The `--exclude` is mandatory — without it, `aws s3 sync` would upload
+  every sidecar as if it were a user object.
 - Redis: a 100-line shell script over `find redis/db_0/strings -name '*.bin' -exec redis-cli -x SET …`,
   with similar one-liners per type.
 - SQS: `jq -c . messages.jsonl | xargs -n1 aws sqs send-message --message-body …`.
@@ -658,6 +784,42 @@ parser, the format has failed its goal.
   containing percent-signs has its filename percent-encoded twice. The
   `KEYMAP` file mitigates, and JSONL/JSON record contents always carry
   the original key bytes.
+- **SQS FIFO deduplication window resets on restore.** Side records
+  (`!sqs|msg|dedup|`) are intentionally not dumped, so a queue restored
+  on a fresh cluster will accept message-deduplication-IDs that were
+  previously suppressed by the live queue's dedup window. For
+  `ContentBasedDeduplication=true` this reset is harmless on a clean
+  restore (the body hash drives dedup; replaying the dump produces the
+  same hashes). For ID-based dedup, callers replaying messages from
+  the dump *and* from a still-live source concurrently can produce
+  duplicates. Operators who depend on exact dedup state across a
+  restore use `--include-sqs-side-records` to opt in to the
+  `_internals/dedup.jsonl` artifact, then replay it through a
+  follow-up tool that re-seeds the dedup keys.
+- **Redis TTL keys may already be expired by the time of restore.**
+  TTLs are dumped as absolute Unix-millis (`expire_at_ms`). The
+  default restore behavior is **skip-expired**: keys whose
+  `expire_at_ms` is in the past at restore time are not re-applied
+  (they would be deleted by the TTL reaper on the next pass anyway).
+  `--preserve-ttl` forces re-application with the original epoch,
+  which makes sense when the goal is auditability (verifying the
+  exact TTL state at backup time) rather than getting a working
+  cache back.
+- **Redis stream restore in `--mode merge`** can collide on entry IDs.
+  `XADD <id>` fails when an entry with a higher ID already exists.
+  The restore tool's stream behavior:
+  - `--mode replace` — `DEL` the stream, then `XADD` every entry with
+    the original ID (matches the dump's `_meta` line).
+  - `--mode skip-existing` — `XADD NOMKSTREAM` only entries whose ID
+    is not already present.
+  - `--mode merge` — refuses to operate on streams unless the target
+    is empty; emits an error pointing at the conflict. There is no
+    sound way to splice mid-stream without losing the original IDs.
+    Operators who need merge-into-non-empty pass
+    `--stream-merge-strategy=auto-id`, which falls back to `XADD *`
+    and records the original-to-new ID mapping in a
+    `_id_remap.jsonl` log so referential integrity can be patched
+    out-of-band.
 
 ### Risks and Mitigations
 
@@ -678,11 +840,20 @@ Scope: backup-side only. No restore. Targeted at giving operators a
 trustworthy off-cluster artifact even before the restore tool is fully
 written.
 
-- New admin RPC pair `BeginBackup` / `EndBackup` on `proto/admin.proto`
-  registering with `kv/active_timestamp_tracker.go`.
-- New tool `cmd/elastickv-backup/` performing `BeginBackup` →
-  per-adapter `ScanRange(at_ts)` → encode → write directory tree → emit
-  `MANIFEST.json` and `CHECKSUMS` last → `EndBackup`.
+- New admin RPCs on `proto/admin.proto`: `BeginBackup` (with `ttl_ms`),
+  `EndBackup`, `ListAdaptersAndScopes` (signatures in "Read-Side
+  Consistency").
+- Extend `kv/active_timestamp_tracker.go` with `PinWithDeadline` plus
+  the per-second sweeper goroutine that reaps expired pins and emits
+  the `backup_pin_expired` structured warning.
+- New `kv/backup_scan.go` — `BackupScanner` iterator wrapping the
+  existing `ShardStore.ScanAt` (`kv/shard_store.go:106`) so multi-
+  million-key ranges page through `ScanAt` calls of `--scan-page-size`
+  rather than materializing in one call.
+- New tool `cmd/elastickv-backup/` performing
+  `BeginBackup → ListAdaptersAndScopes → BackupScanner.Next* (per scope)
+  → encode → write directory tree → CHECKSUMS → MANIFEST.json
+  → EndBackup`.
 - Per-adapter encoders:
   - `internal/backup/dynamodb.go` — items + `_schema.json`.
   - `internal/backup/s3.go` — manifest reassembly into single object
@@ -734,6 +905,10 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestSQSDumpFifoOrderPreserved` | Messages with interleaved `MessageGroupId` are emitted in `(send_ts, sequence_number, message_id)` order; visibility-state fields zeroed by default |
 | `TestManifestVersionGate` | Restore with `format_version > current` fails fast with a typed error; same-major-newer-minor allowed; older-major refused with a clear message |
 | `TestBeginBackupBlocksCompactor` | Open a `BeginBackup`, force a compaction round, confirm MVCC versions for the registered `read_ts` are retained |
+| `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
+| `TestBeginBackupWaitsForLaggingShard` | Force shard B's `applied_index` to lag; `BeginBackup` polls until it catches up or times out with `FailedPrecondition`; no scan starts in the timeout case |
+| `TestBackupScannerPaging` | A range with > pageSize keys is returned across multiple `ScanAt` pages with no overlap, no gaps; iteration tolerates concurrent writes by completing at the pinned `read_ts` |
+| `TestS3SidecarSuffixCollision` | A user S3 object key ending in `.elastickv-meta.json` is rejected without `--rename-collisions`; with the flag, the rename is recorded in `KEYMAP` |
 
 ### P1
 
@@ -745,6 +920,8 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestExternalToolReplay` | Generated `aws s3 sync` / `aws dynamodb put-item` / `redis-cli --pipe` scripts (run in CI against MinIO / a local DynamoDB / a real Redis) reproduce the dumped state on a non-elastickv target |
 | `TestLongKeySHA256Fallback` | A 1 KiB key encodes to `<sha256-prefix-32>__<truncated>`; `KEYMAP` records the original; round-trip restore still hits the right key |
 | `TestSQSPreserveVisibilityFlag` | Default leaves messages immediately visible on restore; `--preserve-visibility` retains in-flight receipts |
+| `TestRedisTTLExpiredKeySkippedByDefault` | A key whose `expire_at_ms` is in the past at restore time is not re-applied without `--preserve-ttl`; with the flag it is re-applied with the original epoch |
+| `TestRedisStreamMergeRejectsNonEmpty` | `--mode merge` on a non-empty target stream errors out; `--stream-merge-strategy=auto-id` falls back to `XADD *` and writes `_id_remap.jsonl` |
 
 ### P2
 
