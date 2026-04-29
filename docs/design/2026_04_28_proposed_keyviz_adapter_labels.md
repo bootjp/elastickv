@@ -270,7 +270,7 @@ we document but never count against the cap.
 // keyviz/sampler.go:416 (PR-B + PR-C+D+E flag-gated, Codex round-15-4th-pass P1)
 slotsPerRoute := 1 // legacy slot only (PR-B, or PR-C+D+E with flag off)
 if s.opts.KeyVizLabelsEnabled {
-    slotsPerRoute = len(keyviz.AllLabels) + 1 // 6 after PR-C with flag on
+    slotsPerRoute = len(AllLabels) + 1 // 6 after PR-C with flag on (in-package, no keyviz. qualifier)
 }
 if len(next.slots) / slotsPerRoute < s.opts.MaxTrackedRoutes {
     // ... pre-create slot(s) for this route
@@ -531,8 +531,7 @@ file with a `func TestAllLabelsAvoidSeparator(t *testing.T)` test
 that asserts `!strings.ContainsRune(string(l), ':')` for every member of
 `AllLabels`. Without this constraint a future label like
 `"redis:db0"` would silently break `bucket_id` parsing — the
-parser would split at the wrong `:`. (CodeRabbit major on PR
-#694.)
+parser would split at the wrong `:`. (CodeRabbit major on PR `#694`.)
 
 `route_ids` / `aggregate` / virtual-bucket semantics from §5 of
 the parent design are unchanged — labels are an orthogonal axis
