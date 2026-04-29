@@ -307,9 +307,77 @@ ciphertext from §4.1, the FSM snapshot stream is ciphertext by
 construction. No additional wrapping is required at the snapshot
 layer.
 
-The snapshot file header (the `pebbleSnapshotMagic` 8-byte magic plus
-`lastCommitTS`) stays cleartext so a snapshot reader can identify the
-format before attempting decryption. This is metadata, not user data.
+#### Snapshot header format evolution (versioned)
+
+Today's `kv/snapshot.go` writes a fixed 16-byte header — 8-byte
+`pebbleSnapshotMagic` + 8-byte `lastCommitTS` (HLC ceiling). To
+carry the §7.1 Phase 2 `raft_envelope_cutover_index` (and to leave
+room for later metadata) without breaking restore on existing
+clusters, the header is versioned **explicitly** rather than
+silently lengthened. Layout going forward:
+
+```text
++------------+--------+--------+----------+----------+----------+
+| magic(8)   | ver(1) | len(2) | ceiling  | cutover  | reserved |
+| EKVPBBL1   |  0x02  |  0x40  |   8B     |   8B     |  ...     |
++------------+--------+--------+----------+----------+----------+
+```
+
+- `magic` — unchanged 8-byte `pebbleSnapshotMagic` (`EKVPBBL1`)
+  so a v1 reader still recognises the stream.
+- `ver` — header format version. `0x01` is the implicit v1
+  format that has no `ver`/`len` fields and is exactly 16 bytes
+  total (legacy detection: read 9 bytes, if byte 8 looks like
+  the high byte of a plausible HLC `ceiling` rather than a
+  small version number, fall back to v1 reader). `0x02` is the
+  versioned format above.
+- `len` — uint16 little-endian total payload length **after**
+  the `len` field itself, so a v3+ reader can skip unknown
+  trailing fields without a forward-compat fault.
+- `ceiling` — same 8-byte HLC ceiling as v1; preserves the
+  existing field semantics so the v2 path is a strict superset.
+- `cutover` — `raft_envelope_cutover_index` as a fixed
+  big-endian uint64. `0` means "Phase 2 not yet enabled at
+  snapshot time", which is the correct value for a snapshot
+  taken in Phase 0 or Phase 1.
+- `reserved` — zero-padded for alignment / future fields. Any
+  v2 reader that sees non-zero bytes here errors with
+  `ErrSnapshotHeaderReserved` rather than silently ignoring
+  them.
+
+Read path (`ReadSnapshotHeader`):
+
+1. Read the 8-byte magic. Mismatch → `ErrSnapshotMagic`.
+2. Peek the next byte. If it falls in the documented v1
+   `ceiling` high-byte range (i.e., the implicit-v1 detection
+   above) treat the stream as v1, parse the remaining 8 bytes
+   as `ceiling`, and return `cutover = 0`.
+3. Otherwise read it as `ver`. If `ver == 0x02`, read `len`
+   and exactly that many bytes; parse `ceiling`, `cutover`.
+   Trailing reserved bytes are validated as zero.
+4. If `ver` is unknown (`> 0x02` from a future writer), refuse
+   the snapshot with `ErrSnapshotHeaderVersion` — restoring a
+   forward-version snapshot under an older binary is **never**
+   safe because we cannot prove the unknown extension is not
+   semantically required.
+
+Write path (`WriteSnapshotHeader`):
+
+- Snapshots produced in Phase 0 / Phase 1 with no Phase-2
+  cluster flag observed locally write **v1** for byte-for-byte
+  compatibility with existing readers.
+- Snapshots produced after the local node has applied the
+  `enable-raft-envelope` entry (i.e., the sidecar's
+  `raft_envelope_cutover_index != 0`) write **v2**.
+- Once `enable-raft-envelope` has been observed once,
+  subsequent snapshots stay on v2 forever; the writer never
+  silently downgrades.
+
+This evolution rule keeps every existing v1 snapshot file
+restorable under the new build with no migration step, makes
+v2 the steady state once Phase 2 is enabled, and pushes
+forward-compat decisions to a hard error rather than silent
+data corruption.
 
 ### 4.5 Distribution catalog and HLC ceiling entries
 
@@ -600,26 +668,59 @@ retiring DEK.
 
 ### 5.5 Sidecar / Raft-log reconciliation
 
-The DEK rotation flow in §5.2 says the FSM apply persists the new
-wrapped DEK into `keys.json` on every node. That apply is two
-operations on the local node — a Pebble write of the rotation log
-entry, then a sidecar file rewrite — and they are **not** atomic
-with respect to crash. A node that crashes between the two
-restarts with the rotation entry committed in its Raft log but the
-sidecar still on the previous generation, which would make a
-freshly-active DEK unloadable on that node.
+The DEK rotation flow in §5.2 (and the format-cutover entries in
+§7.1) says the FSM apply persists new encryption state — wrapped
+DEKs and the `raft_envelope_cutover_index` — into `keys.json` on
+every node. That apply is two operations on the local node — a
+Pebble write of the log entry, then a sidecar file rewrite — and
+they are **not** atomic with respect to crash. A node that
+crashes between the two restarts with the entry committed in its
+Raft log but the sidecar still on the previous generation, which
+would make a freshly-active DEK unloadable on that node, or
+worse, would make the node decode post-cutover Raft entries with
+the wrong format.
 
-To detect and repair this:
+The set of "encryption-relevant" Raft entries that the lag check
+must cover is therefore broader than just rotation:
 
-1. The sidecar carries `raft_applied_index` (§5.1), updated in the
-   same `os.WriteFile` + `os.Rename` that persists the new wrapped
-   DEKs.
+- `rotate-dek` — adds a new wrapped DEK to the sidecar.
+- `rewrap-deks` — re-wraps existing DEKs under the current KEK
+  (full-set, per §5.5 step 3); also the auto-recovery proposal
+  the leader uses to bring drifted nodes back in sync.
+- `enable-storage-envelope` — flips the §7.1 Phase 1 cluster
+  flag and persists `storage_envelope_active = true` into the
+  sidecar.
+- `enable-raft-envelope` — flips the §7.1 Phase 2 cluster flag
+  AND persists the `raft_envelope_cutover_index` into the
+  sidecar. This entry is the highest-stakes of the four:
+  missing it on restart causes the FSM to decode every
+  post-cutover entry through the legacy first-byte tag space
+  (treating an opaque raft envelope as if it were an
+  `0x00`/`0x01`/`0x02` tagged operation), which is a
+  guaranteed mis-dispatch leading to apply failure or, worse,
+  silent wrong-answer on `0x02`-shaped envelope bytes.
+- `retire-dek` — drops a DEK from the sidecar's `keys` map.
+
+Any entry that mutates `keys.json` content is in this set. The
+implementation should derive the set from a single
+`isEncryptionRelevant(entry)` predicate so a future encryption
+admin command cannot quietly slip past the lag check.
+
+To detect and repair sidecar-vs-log divergence:
+
+1. The sidecar carries `raft_applied_index` (§5.1), updated in
+   the same `os.WriteFile` + `os.Rename` that persists every
+   encryption-relevant entry above.
 2. On startup, the encryption package reads the sidecar's
    `raft_applied_index`, then reads the raftengine's persisted
    applied index. If the raftengine has progressed past the
-   sidecar's index AND the gap covers any rotation entries, the
-   node refuses to start with `ErrSidecarBehindRaftLog`,
-   pointing at the operator runbook.
+   sidecar's index AND **the gap covers any encryption-relevant
+   entry** (per the list above — not just rotation), the node
+   refuses to start with `ErrSidecarBehindRaftLog`, pointing at
+   the operator runbook. Restricting the check to rotations
+   only would let a missed `enable-raft-envelope` slip past
+   and cause silent mis-dispatch on the next post-cutover
+   entry.
 3. Recovery rewraps **every unretired DEK**, not just the active
    one. A node that missed multiple rotations needs *every*
    intermediate `key_id` to decrypt MVCC history that still
