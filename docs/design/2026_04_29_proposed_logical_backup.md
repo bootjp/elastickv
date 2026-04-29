@@ -1283,13 +1283,18 @@ written.
     leader change), while the admin cache is keyed on node identity
     (`NodeIdentity.GRPCAddress` from `snapshotMembers`); mixing the
     two would conflate moving and stable address spaces.
-  - `versionCache map[string]struct{ version string; fetchedAt time.Time }`
-    (or `sync.Map` equivalent) protecting the 10 s
-    `leader_node_version` cache used by `GetRaftGroups`'s async
-    leader probes. Populated by the same async dials; read by
-    `GetRaftGroups` synchronously when fresh, returning empty
-    string on cache-miss-or-dial-still-in-flight to keep the RPC
-    latency contract intact.
+  - `versionCache sync.Map` (key `string` node-id, value
+    `versionCacheEntry{ version string; fetchedAt time.Time }`)
+    backing the 10 s `leader_node_version` cache used by
+    `GetRaftGroups`'s async leader probes. `sync.Map` is chosen
+    over `map + RWMutex` so the cache's lock is independent of
+    `groupsMu`; mixing them would force the async write goroutine
+    to wait on every `GetRaftGroups` reader holding `groupsMu.RLock`,
+    or — worse — produce a data race if the implementor reuses
+    `groupsMu.RLock` for writes. The cache is populated by the
+    async dials; read by `GetRaftGroups` synchronously, returning
+    `""` when the entry is missing-or-expired so the RPC latency
+    contract stays intact regardless of dial state.
 - Extend `AdminGroup` interface (`adapter/admin_grpc.go:41`) with a
   `SnapshotEvery() uint64` method matching the `StatusReader`
   addition. Without this, the `BeginBackup` handler on
@@ -1384,6 +1389,29 @@ written.
        responds with its compiled-in version constant. The handler
        refuses `BeginBackup` if any peer returns a version below N
        or fails to respond within the deadline.
+
+       **Auth metadata propagation.** The `Admin` service is
+       gated by `AdminTokenAuth` (`adapter/admin_grpc.go:455-505`)
+       on every method, including `GetNodeVersion`. Since
+       `GetNodeVersion` is itself an `Admin` method, the outbound
+       fan-out from `BeginBackup` must carry the same bearer token
+       that authenticated the inbound call — otherwise every peer
+       returns `Unauthenticated` and the gate misreports the
+       failure as "node X did not respond" on every auth-enabled
+       cluster. The `BeginBackup` handler propagates the inbound
+       metadata to outbound calls explicitly:
+
+       ```go
+       inMD, _ := metadata.FromIncomingContext(ctx)
+       outCtx := metadata.NewOutgoingContext(context.Background(), inMD)
+       // every per-peer GetNodeVersion dial uses outCtx
+       ```
+
+       This pattern is also used by the async `GetNodeVersion(leader)`
+       probes in `GetRaftGroups`. The forwarded token must be the
+       inbound caller's, not a server-stored value, so the
+       authorization decision remains the operator's bearer token,
+       not a privilege escalation by the admin server.
 
        The two failure cases — "old version" and "unreachable" —
        both block backups, but the error message must
@@ -1532,6 +1560,8 @@ Scope: out of this proposal; mentioned only to draw the boundary.
 | `TestBeginBackupGatesIncludesDynamicallyAddedNodes` | Start a 3-node cluster, add a 4th node at `v(N-1)` via `AddVoter` after `AdminServer` startup (so it is NOT in the bootstrap `members` seed), then call `BeginBackup`; the gate fails with the new node identified in the error. The previous seed-only design would have falsely passed |
 | `TestGetRaftGroupsLeaderVersionAsync` | `GetRaftGroups` returns within local-snapshot latency even when a leader is unreachable; `leader_node_version` is empty string in that case. Verify the 500 ms per-leader timeout and the 10 s response cache prevent repeated fan-outs across rapid polls |
 | `TestAdminGRPCConnCacheReuse` | Two consecutive `BeginBackup` calls dialing the same peer share one underlying `*grpc.ClientConn` (verified via the cache size); shutdown of a peer evicts only that entry, not the whole cache; admin cache is independent of `ShardStore.connCache` (no cross-cache eviction) |
+| `TestBeginBackupPropagatesAdminAuthToken` | A cluster booted with `--adminToken` accepts a `BeginBackup` call carrying `authorization: Bearer <token>`; the handler propagates the same metadata via `metadata.NewOutgoingContext` to every `GetNodeVersion` fan-out dial, so peers return their version (not `Unauthenticated`). A `BeginBackup` call without the token is itself rejected before any fan-out happens |
+| `TestVersionCacheRaceUnderLoad` | `go test -race` with 50 concurrent `GetRaftGroups` callers and async `GetNodeVersion` probe goroutines writing the cache simultaneously emits no data-race report; the `sync.Map` choice is enforced by the lack of a separate `versionCacheMu` field on `AdminServer` |
 | `TestSnapshotEveryReadsFromEngine` | A node started with `ELASTICKV_RAFT_SNAPSHOT_COUNT=5000` reports `Engine.SnapshotEvery() == 5000`; `BeginBackup` uses 5000 (not the default 10000) when computing remaining headroom |
 | `TestRenewBackupRetriesLeaderElection` | Force a leader election mid-`RenewBackup`; the admin server retries `BackupExtend` up to 3 times with 500ms backoff and succeeds once the new leader is established, without aborting the dump |
 | `TestPinWithDeadlineExpiry` | `PinWithDeadline(ts, now+100ms)` is auto-released by the sweeper after the deadline; compactor unblocked; `backup_pin_expired` log emitted |
