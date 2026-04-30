@@ -411,14 +411,25 @@ func (s *S3Encoder) HandleObjectManifest(key, value []byte) error {
 
 // HandleBlob spills a !s3|blob| record to a per-chunk scratch file
 // and registers it under the (bucket, object, gen, uploadID, partNo,
-// chunkNo, partVersion) routing key.
+// chunkNo, partVersion) routing key. EncodeSegment percent-encodes
+// `/` so a multi-segment object key like `../../tmp/pwn` collapses
+// into one filename, but a literal `..` (or `.`) survives unchanged
+// because both `.` chars are RFC3986-unreserved. Without explicit
+// validation, a crafted bucket+object pair like `bucket="..",
+// object=".."` would resolve to filepath.Join(scratchRoot, "..",
+// "..") = the parent of scratchRoot, letting writeFileAtomic
+// land outside the decoder's controlled directory before
+// safeJoinUnderRoot ever runs at output time. Codex P1 round 11.
 func (s *S3Encoder) HandleBlob(key, value []byte) error {
 	bucket, gen, object, uploadID, partNo, chunkNo, partVersion, ok := s3keys.ParseBlobKey(key)
 	if !ok {
 		return errors.Wrapf(ErrS3MalformedKey, "blob key: %q", key)
 	}
 	st := s.objectState(bucket, gen, object)
-	dir := filepath.Join(s.scratchRoot, EncodeSegment([]byte(bucket)), EncodeSegment([]byte(object)))
+	dir, err := scratchDirForBlob(s.scratchRoot, bucket, object)
+	if err != nil {
+		return err
+	}
 	if !st.scratchDirCreated {
 		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 			return errors.WithStack(err)
@@ -432,6 +443,27 @@ func (s *S3Encoder) HandleBlob(key, value []byte) error {
 	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
 	st.chunkPaths[s3ChunkKey{uploadID: uploadID, partNo: partNo, chunkNo: chunkNo, partVersion: partVersion}] = path
 	return nil
+}
+
+// scratchDirForBlob builds the per-(bucket,object) scratch path and
+// validates it stays under scratchRoot. A bucket or object name of
+// `.` / `..` would let `filepath.Join` resolve out of scratchRoot
+// before anything else gets a chance to refuse the key. Reject the
+// dot-component case at the encoder boundary so the spill-to-disk
+// step inherits the same containment invariant the final output
+// path enforces via safeJoinUnderRoot.
+func scratchDirForBlob(scratchRoot, bucket, object string) (string, error) {
+	for _, seg := range [...]string{bucket, object} {
+		switch seg {
+		case ".", "..":
+			return "", errors.Wrapf(ErrS3MalformedKey,
+				"bucket or object key %q is a dot segment (would escape scratch root)", seg)
+		case "":
+			return "", errors.Wrapf(ErrS3MalformedKey,
+				"bucket or object key is empty (cannot construct scratch path)")
+		}
+	}
+	return filepath.Join(scratchRoot, EncodeSegment([]byte(bucket)), EncodeSegment([]byte(object))), nil
 }
 
 // HandleIncompleteUpload routes !s3|upload|meta|/!s3|upload|part|
@@ -681,6 +713,10 @@ func (s *S3Encoder) flushOrphanObject(b *s3BucketState, bucketDir string, obj *s
 	}
 	if len(obj.chunkPaths) == 0 {
 		return nil
+	}
+	if obj.object == "." || obj.object == ".." || obj.object == "" {
+		return errors.Wrapf(ErrS3MalformedKey,
+			"orphan object key %q is a dot segment (would escape orphan dir)", obj.object)
 	}
 	dir := filepath.Join(bucketDir, "_orphans", EncodeSegment([]byte(obj.object)))
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode

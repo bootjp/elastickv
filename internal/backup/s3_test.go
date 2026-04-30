@@ -584,14 +584,81 @@ func TestS3_StalePartVersionExcludedFromAssembledBody(t *testing.T) {
 	}
 }
 
+// TestS3_HandleBlobRejectsScratchEscape is the regression for Codex
+// P1 round 11: HandleBlob composed scratch paths with EncodeSegment,
+// which preserves `.` and `..` (RFC3986 unreserved). A bucket or
+// object literal of `..` would resolve to `<scratchRoot>/../...`,
+// letting writeFileAtomic land outside the decoder's scratch tree
+// before safeJoinUnderRoot ever ran at Finalize. The encoder now
+// refuses dot-component bucket/object names at HandleBlob.
+func TestS3_HandleBlobRejectsScratchEscape(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name           string
+		bucket, object string
+	}{
+		{"object_dotdot", "b", ".."},
+		{"object_dot", "b", "."},
+		{"bucket_dotdot", "..", "x"},
+		{"bucket_dot", ".", "x"},
+		{"both_dotdot", "..", ".."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			enc, _ := newS3Encoder(t)
+			err := enc.HandleBlob(
+				s3keys.BlobKey(tc.bucket, 1, tc.object, "u-1", 1, 0),
+				[]byte("payload"),
+			)
+			if !errors.Is(err, ErrS3MalformedKey) {
+				t.Fatalf("err=%v want ErrS3MalformedKey for bucket=%q object=%q", err, tc.bucket, tc.object)
+			}
+		})
+	}
+}
+
 func TestS3_DotSegmentObjectKeyRejected(t *testing.T) {
 	t.Parallel()
 	cases := []string{"a/../b", "a/./b", "..", "."}
 	for _, key := range cases {
 		t.Run(key, func(t *testing.T) {
+			t.Parallel()
 			enc, _ := newS3Encoder(t)
-			emitObject(t, enc, "b", 1, key, []byte("x"), "")
-			err := enc.Finalize()
+			// Refusal must happen at OR BEFORE Finalize. The
+			// scratch-path guard (Codex P1 round 11) catches sole-
+			// dot keys at HandleBlob time; multi-segment dot keys
+			// like "a/../b" pass through to Finalize where
+			// safeJoinUnderRoot rejects them. Either point is
+			// acceptable as long as ErrS3MalformedKey surfaces.
+			err := enc.HandleBucketMeta(
+				s3keys.BucketMetaKey("b"),
+				encodeS3BucketMetaValue(t, map[string]any{"bucket_name": "b", "generation": 1}),
+			)
+			if err != nil {
+				t.Fatalf("HandleBucketMeta: %v", err)
+			}
+			err = enc.HandleObjectManifest(
+				s3keys.ObjectManifestKey("b", 1, key),
+				encodeS3ManifestValue(t, map[string]any{
+					"upload_id": "u-1", "size_bytes": int64(1),
+					"parts": []map[string]any{{"part_no": 1, "size_bytes": int64(1), "chunk_count": 1}},
+				}),
+			)
+			if err != nil {
+				if errors.Is(err, ErrS3MalformedKey) {
+					return
+				}
+				t.Fatalf("HandleObjectManifest: %v", err)
+			}
+			err = enc.HandleBlob(s3keys.BlobKey("b", 1, key, "u-1", 1, 0), []byte("x"))
+			if err != nil {
+				if errors.Is(err, ErrS3MalformedKey) {
+					return
+				}
+				t.Fatalf("HandleBlob: %v", err)
+			}
+			err = enc.Finalize()
 			if !errors.Is(err, ErrS3MalformedKey) {
 				t.Fatalf("err=%v want ErrS3MalformedKey for key %q", err, key)
 			}
