@@ -137,6 +137,14 @@ type sqsInternalRecord struct {
 // sqsQueueMetaPublic is the dump-format projection of the live
 // adapter/sqs_catalog.go sqsQueueMeta. Field names match the AWS-style
 // vocabulary an external restore tool would use.
+//
+// PartitionCount, FifoThroughputLimit, and DeduplicationScope mirror
+// the HT-FIFO attributes captured at CreateQueue time. The adapter
+// rejects mutating these via SetQueueAttributes (they are immutable
+// per AWS contract), so dropping them at backup would silently
+// recreate single-partition / default-routing / queue-scoped-dedup
+// queues on restore — non-fidelity-preserving for any partitioned
+// FIFO workload. Codex P1 round 12.
 type sqsQueueMetaPublic struct {
 	FormatVersion             uint32 `json:"format_version"`
 	Name                      string `json:"name"`
@@ -148,6 +156,9 @@ type sqsQueueMetaPublic struct {
 	ReceiveMessageWaitSeconds int64  `json:"receive_message_wait_seconds,omitempty"`
 	MaximumMessageSize        int64  `json:"maximum_message_size,omitempty"`
 	RedrivePolicy             string `json:"redrive_policy,omitempty"`
+	PartitionCount            uint32 `json:"partition_count,omitempty"`
+	FifoThroughputLimit       string `json:"fifo_throughput_limit,omitempty"`
+	DeduplicationScope        string `json:"deduplication_scope,omitempty"`
 }
 
 // sqsMessageBody is the dump-format projection's body field. It marshals
@@ -643,6 +654,10 @@ func decodeSQSQueueMetaValue(value []byte) (*sqsQueueMetaPublic, error) {
 		ReceiveMessageWaitSeconds int64  `json:"receive_message_wait_seconds"`
 		MaximumMessageSize        int64  `json:"maximum_message_size"`
 		RedrivePolicy             string `json:"redrive_policy"`
+		// HT-FIFO immutable attributes — see adapter/sqs_catalog.go.
+		PartitionCount      uint32 `json:"partition_count"`
+		FifoThroughputLimit string `json:"fifo_throughput_limit"`
+		DeduplicationScope  string `json:"deduplication_scope"`
 	}
 	if err := json.Unmarshal(body, &live); err != nil {
 		return nil, errors.Wrap(ErrSQSInvalidQueueMeta, err.Error())
@@ -658,6 +673,9 @@ func decodeSQSQueueMetaValue(value []byte) (*sqsQueueMetaPublic, error) {
 		ReceiveMessageWaitSeconds: live.ReceiveMessageWaitSeconds,
 		MaximumMessageSize:        live.MaximumMessageSize,
 		RedrivePolicy:             live.RedrivePolicy,
+		PartitionCount:            live.PartitionCount,
+		FifoThroughputLimit:       live.FifoThroughputLimit,
+		DeduplicationScope:        live.DeduplicationScope,
 	}, nil
 }
 
