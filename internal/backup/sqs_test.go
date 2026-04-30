@@ -374,6 +374,73 @@ func TestSQS_ParseMessageDataKey_RejectsEmptyMsgIDSegment(t *testing.T) {
 	}
 }
 
+// TestSQS_ParsePartitionedMessageDataKey is the regression for Codex
+// P1 round 9: HT-FIFO partitioned msg-data keys carry the literal "p|"
+// discriminator before the queue segment and a fixed-width partition
+// uint32 between the queue terminator and the gen. The parser must
+// recognise this shape — the legacy heuristic would otherwise read "p"
+// as the queue segment, fail base64 decode, and abort backup decoding
+// for any cluster running partitioned FIFO queues.
+func TestSQS_ParsePartitionedMessageDataKey(t *testing.T) {
+	t.Parallel()
+	encQueue := "cXVldWUx"   // base64url("queue1")
+	encMsgID := "bXNnLTAwMQ" // base64url("msg-001")
+	// Layout: !sqs|msg|data|p|<encQueue>|<part 4B><gen 8B><encMsgID>
+	key := []byte(SQSMsgDataPrefix + sqsPartitionedDiscriminator + encQueue + "|")
+	key = append(key, 0x00, 0x00, 0x00, 0x07)                         // partition = 7
+	key = append(key, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01) // gen
+	key = append(key, []byte(encMsgID)...)
+	got, err := parseSQSMessageDataKey(key)
+	if err != nil {
+		t.Fatalf("parseSQSMessageDataKey: %v", err)
+	}
+	if got != encQueue {
+		t.Fatalf("got %q want %q", got, encQueue)
+	}
+}
+
+// TestSQS_ParsePartitionedSideRecordKey covers parseSQSGenericKey for
+// every partitioned side-record family (Codex P2 round 9).
+func TestSQS_ParsePartitionedSideRecordKey(t *testing.T) {
+	t.Parallel()
+	encQueue := "cXVldWUy" // base64url("queue2")
+	cases := []string{
+		SQSMsgVisPrefix,
+		SQSMsgByAgePrefix,
+		SQSMsgDedupPrefix,
+		SQSMsgGroupPrefix,
+	}
+	for _, prefix := range cases {
+		t.Run(prefix, func(t *testing.T) {
+			t.Parallel()
+			key := []byte(prefix + sqsPartitionedDiscriminator + encQueue + "|")
+			key = append(key, 0x00, 0x00, 0x00, 0x03)                         // partition
+			key = append(key, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01) // gen
+			got, err := parseSQSGenericKey(key, prefix)
+			if err != nil {
+				t.Fatalf("parseSQSGenericKey(%q): %v", prefix, err)
+			}
+			if got != encQueue {
+				t.Fatalf("prefix %q: got %q want %q", prefix, got, encQueue)
+			}
+		})
+	}
+}
+
+// TestSQS_ParsePartitionedMessageDataKey_RejectsTruncatedTrailer
+// guards against a partitioned key whose trailer is too short to
+// carry partition + gen + msg-id.
+func TestSQS_ParsePartitionedMessageDataKey_RejectsTruncatedTrailer(t *testing.T) {
+	t.Parallel()
+	encQueue := "cQ"
+	key := []byte(SQSMsgDataPrefix + sqsPartitionedDiscriminator + encQueue + "|")
+	// Only 4 partition bytes, no gen, no msg-id.
+	key = append(key, 0x00, 0x00, 0x00, 0x01)
+	if _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
+		t.Fatalf("err=%v want ErrSQSMalformedKey for truncated partitioned trailer", err)
+	}
+}
+
 func TestSQS_ParseGenericKey_RejectsTrailerlessKey(t *testing.T) {
 	t.Parallel()
 	// Side-record key whose entire suffix is base64url-clean (no
