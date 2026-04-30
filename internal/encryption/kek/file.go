@@ -73,6 +73,11 @@ func (w *FileWrapper) Wrap(dek []byte) ([]byte, error) {
 	}
 	out := make([]byte, 0, fileNonceSize+fileKEKSize+fileTagSize)
 	out = append(out, nonce...)
+	// AAD is intentionally nil. Key-ID binding at the KEK layer (so a
+	// wrapped DEK from one key_id cannot be replayed under another) is
+	// deferred to Stage 9, when the KMS-backed providers add their own
+	// AAD scheme. Adding AAD here in isolation would silently break
+	// every persisted wrapped-DEK blob.
 	out = w.aead.Seal(out, nonce, dek, nil)
 	return out, nil
 }

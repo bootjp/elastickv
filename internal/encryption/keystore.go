@@ -11,14 +11,12 @@ import (
 
 // keyEntry holds a single DEK plus its pre-initialized AEAD instance. The
 // AEAD is built once at Set time so the hot path (Cipher.Encrypt /
-// Cipher.Decrypt) never pays for aes.NewCipher / cipher.NewGCM —
-// per-call key expansion would be a measurable regression in any
-// production-realistic write rate (gemini-code-assist review on PR #719).
+// Cipher.Decrypt) never pays for aes.NewCipher / cipher.NewGCM on every
+// call.
 //
 // dek is stored as a fixed-size array rather than a slice so the type
-// system enforces immutability: callers of DEK() get a value copy, not a
-// pointer into the live map. This closes the "Get returns mutable slice"
-// hazard flagged by claude[bot] review.
+// system enforces immutability: callers of DEK() receive a value copy,
+// not a pointer into the live map.
 type keyEntry struct {
 	dek  [KeySize]byte
 	aead cipher.AEAD
@@ -32,6 +30,11 @@ type keyEntry struct {
 //
 // Per §10 self-review lens 2: this avoids contending a mutex on the hot
 // path while keeping rotation atomic with respect to readers.
+//
+// The zero value is NOT safe to use — `var ks Keystore` panics on the
+// first method call because the internal atomic.Pointer is nil. Always
+// construct with NewKeystore. Code that embeds a Keystore in another
+// struct must invoke NewKeystore explicitly before any read or write.
 type Keystore struct {
 	snap atomic.Pointer[map[uint32]*keyEntry]
 }
