@@ -155,6 +155,11 @@ func NewKeymapReader(r io.Reader) *KeymapReader {
 // (zero, false, nil) at end of stream, and (zero, false, err) on parse
 // failure or I/O error. Once an error is returned the reader is sticky:
 // subsequent calls return the same error.
+//
+// The base64-encoded `original` field is validated at parse time rather
+// than lazily: a malformed dump must surface on the first read of the
+// affected line, not propagate silently until a much later
+// rec.Original() call. Same error class either way.
 func (r *KeymapReader) Next() (KeymapRecord, bool, error) {
 	if r.err != nil {
 		return KeymapRecord{}, false, r.err
@@ -174,6 +179,10 @@ func (r *KeymapReader) Next() (KeymapRecord, bool, error) {
 	}
 	if rec.Encoded == "" || rec.Kind == "" {
 		r.err = errors.Wrap(ErrInvalidKeymapRecord, "missing encoded or kind")
+		return KeymapRecord{}, false, r.err
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(rec.OriginalB64); err != nil {
+		r.err = errors.Wrap(ErrInvalidKeymapRecord, err.Error())
 		return KeymapRecord{}, false, r.err
 	}
 	return rec, true, nil
