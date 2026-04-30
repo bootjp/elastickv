@@ -61,11 +61,20 @@ func TestBuildSQSPartitionResolver_NonEmptyReturnsResolver(t *testing.T) {
 }
 
 // requireNilInterface accepts a kv.PartitionResolver and asserts
-// the interface value (NOT just the underlying pointer) is nil.
-// The function-parameter conversion forces a typed-nil pointer to
-// be wrapped into a non-nil interface, which is exactly the
+// the INTERFACE value is nil — both type AND value tags must be
+// nil. The function-parameter conversion forces a typed-nil
+// pointer to be wrapped into a non-nil interface, which is the
 // failure mode the regression test guards against.
+//
+// Uses Go's `==` operator on the interface, NOT testify's
+// require.Nil. require.Nil reflects through to the underlying
+// pointer and considers a nil pointer wrapped in a non-nil
+// interface as "nil", so it would pass even with the typed-nil
+// regression present. require.True(t, r == nil, ...) uses Go's
+// native interface comparison, which only returns true when the
+// interface's type tag is also nil — that is the exact invariant
+// this test was designed to catch (round 3 review on PR #715).
 func requireNilInterface(t *testing.T, r kv.PartitionResolver, msg string) {
 	t.Helper()
-	require.Nil(t, r, msg)
+	require.True(t, r == nil, msg)
 }

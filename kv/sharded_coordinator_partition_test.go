@@ -51,18 +51,18 @@ func (s *stubResolver) callKeys() [][]byte {
 	return out
 }
 
-// TestShardedCoordinator_DispatchHonoursPartitionResolver pins the
-// Gemini-HIGH fix: ShardedCoordinator's groupMutations path now
-// calls c.router.ResolveGroup, so a Dispatch whose key is claimed
-// by the partition resolver MUST land on the resolver's group, not
-// the engine's default group. Before the fix the coordinator
-// bypassed the resolver entirely and partitioned-FIFO traffic
-// silently mis-routed through 2PC.
+// TestShardedCoordinator_DispatchHonoursPartitionResolver pins
+// resolver wiring at the coordinator level: a Dispatch whose key
+// is claimed by the partition resolver must land on the
+// resolver's group, not the engine's default group.
 //
-// Two-group setup: engine routes everything to group 1; resolver
-// claims one specific key for group 42. Dispatch on that key must
-// hit group 42's recordingTransactional, leaving group 1's
-// recorder empty.
+// NOTE (round 4 review): for a single-mutation batch, this test
+// passes even if groupMutations bypasses the resolver — rawLogs
+// produces one request, and router.Commit's groupRequests
+// re-routes by raw key. This test pins the WithPartitionResolver
+// fluent wiring + raw-key dispatch, NOT the groupMutations bypass
+// regression. The 2-mutation test below is the actual regression
+// for groupMutations (codex P1 + gemini HIGH).
 func TestShardedCoordinator_DispatchHonoursPartitionResolver(t *testing.T) {
 	t.Parallel()
 	engine := distribution.NewEngine()
@@ -113,6 +113,86 @@ func TestShardedCoordinator_DispatchHonoursPartitionResolver(t *testing.T) {
 	calls := resolver.callKeys()
 	require.NotEmpty(t, calls)
 	require.Equal(t, []byte("!sqs|msg|data|p|partitioned-key"), calls[0])
+}
+
+// TestShardedCoordinator_DispatchSplitsMutationsByResolverGroup is
+// the genuine regression for the Gemini-HIGH groupMutations
+// bypass: a Dispatch with mutations belonging to TWO different
+// partitions must split into two requests, one per group.
+//
+// Pre-fix path (groupMutations called c.engine.GetRoute directly):
+//   - groupMutations → engine route → both mutations bundled under
+//     the engine default group.
+//   - rawLogs → ONE pb.Request with both mutations.
+//   - router.Commit → groupRequests routes by Mutations[0].Key only
+//     → request goes to group A only; group B receives nothing.
+//
+// Post-fix path (groupMutations consults c.router.ResolveGroup):
+//   - groupMutations → resolver → mut0→A, mut1→B; grouped split.
+//   - rawLogs → TWO pb.Requests, one per group.
+//   - Each group receives its own request.
+//
+// The assertion is that BOTH groups receive a request — pre-fix,
+// only one would. This is the test the round 4 review asked for.
+func TestShardedCoordinator_DispatchSplitsMutationsByResolverGroup(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	g1 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+	g42 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+	g43 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1:  {Txn: g1, Store: store.NewMVCCStore()},
+		42: {Txn: g42, Store: store.NewMVCCStore()},
+		43: {Txn: g43, Store: store.NewMVCCStore()},
+	}, 1, NewHLC(), nil)
+
+	keyP0 := []byte("!sqs|msg|data|p|partition-0-key")
+	keyP1 := []byte("!sqs|msg|data|p|partition-1-key")
+	coord.WithPartitionResolver(&stubResolver{claim: map[string]uint64{
+		string(keyP0): 42,
+		string(keyP1): 43,
+	}})
+
+	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: keyP0, Value: []byte("v0")},
+			{Op: Put, Key: keyP1, Value: []byte("v1")},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	g1.mu.Lock()
+	g42.mu.Lock()
+	g43.mu.Lock()
+	defer g1.mu.Unlock()
+	defer g42.mu.Unlock()
+	defer g43.mu.Unlock()
+
+	require.Zero(t, len(g1.requests),
+		"engine default group must not receive a request — both "+
+			"keys are partitioned-resolver claims")
+	require.Equal(t, 1, len(g42.requests),
+		"partition-0 group must receive exactly one request "+
+			"(pre-groupMutations-fix: would receive both mutations "+
+			"in one request because router.Commit routes by "+
+			"Mutations[0].Key only)")
+	require.Equal(t, 1, len(g43.requests),
+		"partition-1 group must receive exactly one request "+
+			"(pre-groupMutations-fix: would receive ZERO requests "+
+			"because both mutations were bundled under the "+
+			"engine-route group). This is the genuine regression "+
+			"for the Gemini HIGH bypass — the fix splits "+
+			"mutations across groups via c.router.ResolveGroup.")
 }
 
 // TestShardedCoordinator_DispatchFallsThroughForUnclaimedKeys pins
