@@ -132,19 +132,24 @@ type Exclusions struct {
 // Manifest is the on-disk MANIFEST.json structure. Field tags match the
 // spec in docs/design/2026_04_29_proposed_snapshot_logical_decoder.md.
 type Manifest struct {
-	FormatVersion     uint32     `json:"format_version"`
-	Phase             string     `json:"phase"`
-	ElastickvVersion  string     `json:"elastickv_version,omitempty"`
-	ClusterID         string     `json:"cluster_id,omitempty"`
-	SnapshotIndex     uint64     `json:"snapshot_index,omitempty"`
-	LastCommitTS      uint64     `json:"last_commit_ts,omitempty"`
-	WallTimeISO       string     `json:"wall_time_iso"`
-	Source            *Source    `json:"source,omitempty"`
-	Live              *Live      `json:"live,omitempty"`
-	Adapters          Adapters   `json:"adapters"`
-	Exclusions        Exclusions `json:"exclusions"`
-	ChecksumAlgorithm string     `json:"checksum_algorithm"`
-	ChecksumFormat    string     `json:"checksum_format"`
+	FormatVersion    uint32  `json:"format_version"`
+	Phase            string  `json:"phase"`
+	ElastickvVersion string  `json:"elastickv_version,omitempty"`
+	ClusterID        string  `json:"cluster_id,omitempty"`
+	SnapshotIndex    uint64  `json:"snapshot_index,omitempty"`
+	LastCommitTS     uint64  `json:"last_commit_ts,omitempty"`
+	WallTimeISO      string  `json:"wall_time_iso"`
+	Source           *Source `json:"source,omitempty"`
+	Live             *Live   `json:"live,omitempty"`
+	// Adapters and Exclusions are pointer types so ReadManifest can
+	// distinguish "section omitted entirely" (a corrupted or
+	// truncated dump that should fail validation) from "section
+	// present but populated with default values" (legitimate
+	// scope-everything-excluded). Codex P2 #146 (round 3).
+	Adapters          *Adapters   `json:"adapters"`
+	Exclusions        *Exclusions `json:"exclusions"`
+	ChecksumAlgorithm string      `json:"checksum_algorithm"`
+	ChecksumFormat    string      `json:"checksum_format"`
 
 	EncodedFilenameCharset string `json:"encoded_filename_charset"`
 	KeySegmentMaxBytes     uint32 `json:"key_segment_max_bytes"`
@@ -163,12 +168,17 @@ var ErrInvalidManifest = errors.New("backup: manifest invalid")
 
 // NewPhase0SnapshotManifest seeds a manifest with the Phase 0a defaults.
 // Callers fill in scope (Adapters), Source/wall time and exclusions before
-// passing it to WriteManifest.
+// passing it to WriteManifest. Adapters and Exclusions are seeded to
+// non-nil zero values so the resulting manifest passes the
+// "section-present" validation; callers populating individual scopes
+// reach in via the now-non-nil pointer.
 func NewPhase0SnapshotManifest(now time.Time) Manifest {
 	return Manifest{
 		FormatVersion:          CurrentFormatVersion,
 		Phase:                  PhasePhase0SnapshotDecode,
 		WallTimeISO:            now.UTC().Format(time.RFC3339Nano),
+		Adapters:               &Adapters{},
+		Exclusions:             &Exclusions{},
 		ChecksumAlgorithm:      ChecksumAlgorithmSHA256,
 		ChecksumFormat:         ChecksumFormatSha256sum,
 		EncodedFilenameCharset: EncodedFilenameCharsetRFC3986,
@@ -265,6 +275,15 @@ func (m Manifest) validateRequiredFields() error {
 	}
 	if _, err := time.Parse(time.RFC3339Nano, m.WallTimeISO); err != nil {
 		return errors.Wrapf(ErrInvalidManifest, "wall_time_iso unparseable: %v", err)
+	}
+	// Adapters and Exclusions are required structural sections.
+	// A manifest that omits either is treated as truncated/corrupted
+	// (Codex P2 #146 round 3).
+	if m.Adapters == nil {
+		return errors.Wrap(ErrInvalidManifest, "adapters section missing")
+	}
+	if m.Exclusions == nil {
+		return errors.Wrap(ErrInvalidManifest, "exclusions section missing")
 	}
 	return nil
 }
