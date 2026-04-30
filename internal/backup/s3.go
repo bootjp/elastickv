@@ -660,12 +660,24 @@ func (s *S3Encoder) flushOrphanObject(b *s3BucketState, bucketDir string, obj *s
 // NUL bytes are also refused: POSIX cannot represent them in a
 // path component, and they have no legitimate meaning in S3 keys
 // transmitted over HTTP.
+//
+// Backslashes are refused for the same reason: filepath.Join treats
+// '\' as a separator on Windows, so a key like `a\..\b` would bypass
+// the '/'-based dot-segment scan below and normalise to `b`,
+// silently merging two distinct S3 keys (Codex P1 round 6). Dumps
+// must produce identical output regardless of the host OS, so we
+// refuse '\' on every platform; operators with such keys must
+// rename them in S3 first.
 func safeJoinUnderRoot(root, rel string) (string, error) {
 	if rel == "" {
 		return "", errors.Wrap(ErrS3MalformedKey, "empty object name")
 	}
 	if strings.ContainsRune(rel, 0) {
 		return "", errors.Wrapf(ErrS3MalformedKey, "object name contains NUL: %q", rel)
+	}
+	if strings.ContainsRune(rel, '\\') {
+		return "", errors.Wrapf(ErrS3MalformedKey,
+			"object name contains backslash %q (treated as a separator on Windows; rename in S3 first)", rel)
 	}
 	// Split on "/" and inspect every segment. S3 treats "a/", "a",
 	// and "a//b" as three distinct keys, but filepath.Join collapses

@@ -284,6 +284,33 @@ func TestS3_PathTraversalAttemptRejected(t *testing.T) {
 	}
 }
 
+// TestS3_BackslashObjectKeyRejected is the regression for Codex P1
+// round 6: filepath.Join treats '\' as a separator on Windows, so
+// keys like `a\..\b` would bypass the '/'-based dot-segment scan
+// and normalise to `b`. Dumps must produce identical output
+// regardless of host OS, so backslashes are refused on every
+// platform.
+func TestS3_BackslashObjectKeyRejected(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`a\..\b`,
+		`leading\path`,
+		`trailing\`,
+		`\absolute-windows`,
+	}
+	for _, key := range cases {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			enc, _ := newS3Encoder(t)
+			emitObject(t, enc, "b", 1, key, []byte("x"), "")
+			err := enc.Finalize()
+			if !errors.Is(err, ErrS3MalformedKey) {
+				t.Fatalf("err=%v want ErrS3MalformedKey for backslash key %q", err, key)
+			}
+		})
+	}
+}
+
 func TestS3_LeadingSlashObjectKeyRejected(t *testing.T) {
 	t.Parallel()
 	// Codex P1 round 5: S3 treats "/a" and "a" as two distinct keys
