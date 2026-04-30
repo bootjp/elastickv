@@ -170,6 +170,77 @@ func TestReadManifest_RejectsZeroFormatVersion(t *testing.T) {
 	}
 }
 
+// TestReadManifest_RejectsMissingFormatVersion is the regression for
+// Codex P2 round 8: an absent `format_version` unmarshals into uint32
+// zero, which the version gate would otherwise misclassify as
+// ErrUnsupportedFormatVersion ("upgrade required"). A truncated /
+// malformed manifest that dropped the field belongs in the
+// ErrInvalidManifest branch instead.
+func TestReadManifest_RejectsMissingFormatVersion(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+	if errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("missing format_version must not surface as upgrade-required: %v", err)
+	}
+}
+
+// TestReadManifest_RejectsNullFormatVersion mirrors the missing-field
+// case for `"format_version": null`.
+func TestReadManifest_RejectsNullFormatVersion(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": null,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+// TestWriteManifest_RejectsFutureFormatVersion is the regression for
+// Codex P2 round 8: WriteManifest must refuse manifests advertising
+// a version this build cannot produce. Without this gate, a caller
+// mutating m.FormatVersion = CurrentFormatVersion + 1 writes a
+// manifest that the same package's ReadManifest then refuses,
+// producing self-incompatible backup metadata.
+func TestWriteManifest_RejectsFutureFormatVersion(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.FormatVersion = CurrentFormatVersion + 1
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("WriteManifest err=%v want ErrInvalidManifest for future format_version", err)
+	}
+}
+
 func TestReadManifest_AcceptsUnknownFieldsForSameMajorMinorEvolution(t *testing.T) {
 	t.Parallel()
 	// Same-major minor evolution: a newer producer adds an optional
@@ -383,6 +454,63 @@ func TestReadManifest_RejectsMissingExclusions(t *testing.T) {
 	_, err := ReadManifest(strings.NewReader(body))
 	if !errors.Is(err, ErrInvalidManifest) {
 		t.Fatalf("err=%v want ErrInvalidManifest for missing exclusions", err)
+	}
+}
+
+// TestReadManifest_RejectsMissingExclusionFlag is the regression for
+// Codex P2 round 7: each Exclusions sub-field must be explicitly
+// present in the JSON. Boolean fields default to `false` in Go, so an
+// omitted `preserve_sqs_visibility` would otherwise pass the strict
+// decode and silently look "off" — losing producer-side provenance.
+func TestReadManifest_RejectsMissingExclusionFlag(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		excl string
+	}{
+		{
+			"missing include_incomplete_uploads",
+			`{"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing include_orphans",
+			`{"include_incomplete_uploads":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing preserve_sqs_visibility",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing include_sqs_side_records",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false}`,
+		},
+		{
+			"explicit-null preserve_sqs_visibility",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":null,"include_sqs_side_records":false}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := `{
+				"format_version": 1,
+				"phase": "phase0-snapshot-decode",
+				"wall_time_iso": "2026-04-29T00:00:00Z",
+				"adapters": {},
+				"exclusions": ` + tc.excl + `,
+				"checksum_algorithm": "sha256",
+				"checksum_format": "sha256sum",
+				"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+				"key_segment_max_bytes": 240,
+				"s3_meta_suffix": ".elastickv-meta.json",
+				"s3_collision_strategy": "leaf-data-suffix",
+				"dynamodb_layout": "per-item"
+			}`
+			_, err := ReadManifest(strings.NewReader(body))
+			if !errors.Is(err, ErrInvalidManifest) {
+				t.Fatalf("err=%v want ErrInvalidManifest", err)
+			}
+		})
 	}
 }
 

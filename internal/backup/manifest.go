@@ -224,21 +224,8 @@ func ReadManifest(r io.Reader) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
 	}
-	// Phase 1: probe format_version with a relaxed shape that tolerates
-	// arbitrary types on every other field.
-	var probe struct {
-		FormatVersion uint32 `json:"format_version"`
-	}
-	if err := json.Unmarshal(payload, &probe); err != nil {
-		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
-	}
-	if probe.FormatVersion == 0 {
-		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
-			"format_version is zero")
-	}
-	if probe.FormatVersion > CurrentFormatVersion {
-		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
-			"format_version %d > current %d (newer producer)", probe.FormatVersion, CurrentFormatVersion)
+	if err := probeManifestFormatVersion(payload); err != nil {
+		return Manifest{}, err
 	}
 	// Phase 2: strict struct decode on a known-supported version.
 	var m Manifest
@@ -268,10 +255,103 @@ func ReadManifest(r io.Reader) (Manifest, error) {
 		return Manifest{}, errors.Wrap(ErrInvalidManifest,
 			"trailing bytes after manifest JSON object")
 	}
+	if err := validateExclusionsFieldsPresent(payload); err != nil {
+		return Manifest{}, err
+	}
 	if err := m.validate(); err != nil {
 		return Manifest{}, err
 	}
 	return m, nil
+}
+
+// probeManifestFormatVersion runs the relaxed-shape format_version
+// gate that ReadManifest applies before the strict struct decode.
+// Splitting it into its own function keeps ReadManifest under the
+// project's cyclomatic-complexity ceiling. The contract:
+//
+//   - missing or null `format_version` -> ErrInvalidManifest
+//     (truncated/malformed file; Codex P2 round 8). Without this
+//     branch json.Unmarshal would collapse absence to zero and the
+//     version gate would misclassify as upgrade-required.
+//   - `format_version` = 0 -> ErrUnsupportedFormatVersion (the
+//     reserved sentinel for "no version assigned").
+//   - `format_version` > CurrentFormatVersion ->
+//     ErrUnsupportedFormatVersion (newer producer; upgrade-required).
+//   - within range -> nil; the strict struct decode runs next.
+func probeManifestFormatVersion(payload []byte) error {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &top); err != nil {
+		return errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	rawFV, hasFV := top["format_version"]
+	if !hasFV {
+		return errors.Wrap(ErrInvalidManifest, "format_version missing")
+	}
+	if bytes.Equal(rawFV, jsonNullLiteral) {
+		return errors.Wrap(ErrInvalidManifest, "format_version is null")
+	}
+	var probe struct {
+		FormatVersion uint32 `json:"format_version"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	if probe.FormatVersion == 0 {
+		return errors.Wrap(ErrUnsupportedFormatVersion, "format_version is zero")
+	}
+	if probe.FormatVersion > CurrentFormatVersion {
+		return errors.Wrapf(ErrUnsupportedFormatVersion,
+			"format_version %d > current %d (newer producer)", probe.FormatVersion, CurrentFormatVersion)
+	}
+	return nil
+}
+
+// validateExclusionsFieldsPresent rejects manifests whose `exclusions`
+// section omits any of the required boolean flags. Go's
+// json.Unmarshal silently fills missing booleans with `false`, so a
+// truncated or partially-corrupted manifest would otherwise pass with
+// altered exclusion semantics — losing the producer-side provenance
+// the section is meant to capture (Codex P2 round 7). Each flag must
+// be present and not the JSON `null` literal; type validation already
+// runs as part of the strict struct decode.
+func validateExclusionsFieldsPresent(payload []byte) error {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &top); err != nil {
+		return errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	rawExcl, ok := top["exclusions"]
+	if !ok {
+		// validateRequiredFields surfaces the absent-section error
+		// with a clearer message; defer to it.
+		return nil
+	}
+	var excl map[string]json.RawMessage
+	if err := json.Unmarshal(rawExcl, &excl); err != nil {
+		return errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	for _, name := range exclusionsRequiredFields {
+		raw, present := excl[name]
+		if !present {
+			return errors.Wrapf(ErrInvalidManifest,
+				"exclusions.%s missing (cannot infer producer-side default)", name)
+		}
+		if bytes.Equal(raw, jsonNullLiteral) {
+			return errors.Wrapf(ErrInvalidManifest,
+				"exclusions.%s is null", name)
+		}
+	}
+	return nil
+}
+
+// exclusionsRequiredFields lists the JSON tag names of every
+// Exclusions field that must be explicitly present in the manifest.
+// Kept in sync with the struct definition above; a missing entry
+// here would silently re-introduce the omitted-flag bug.
+var exclusionsRequiredFields = [...]string{
+	"include_incomplete_uploads",
+	"include_orphans",
+	"preserve_sqs_visibility",
+	"include_sqs_side_records",
 }
 
 func (m Manifest) validate() error {
@@ -287,6 +367,16 @@ func (m Manifest) validate() error {
 func (m Manifest) validateRequiredFields() error {
 	if m.FormatVersion == 0 {
 		return errors.Wrap(ErrInvalidManifest, "format_version is zero")
+	}
+	// WriteManifest must refuse manifests advertising a version this
+	// build cannot produce — without this gate, a caller mutating
+	// `m.FormatVersion = CurrentFormatVersion + 1` would write a
+	// manifest that ReadManifest in the same package then rejects as
+	// ErrUnsupportedFormatVersion, producing self-incompatible
+	// backup metadata. Codex P2 round 8.
+	if m.FormatVersion > CurrentFormatVersion {
+		return errors.Wrapf(ErrInvalidManifest,
+			"format_version %d > current %d (this build cannot produce that)", m.FormatVersion, CurrentFormatVersion)
 	}
 	switch m.Phase {
 	case PhasePhase0SnapshotDecode, PhasePhase1LivePinned:
