@@ -397,6 +397,113 @@ func TestS3_OrphanChunksWrittenWhenIncludeOrphans(t *testing.T) {
 	}
 }
 
+func TestS3_StalePartVersionExcludedFromAssembledBody(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	bucket := "b"
+	gen := uint64(1)
+	object := "obj"
+	uploadID := "u"
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Manifest declares partNo=1 partVersion=9. A stale chunk at
+	// partVersion=7 (a previous overwrite still uncleaned) must NOT
+	// be merged — Codex P1 #619.
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": uploadID, "size_bytes": 5, "parts": []map[string]any{
+			{"part_no": 1, "size_bytes": 5, "chunk_count": 1, "part_version": 9},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.VersionedBlobKey(bucket, gen, object, uploadID, 1, 0, 7), []byte("STALE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.VersionedBlobKey(bucket, gen, object, uploadID, 1, 0, 9), []byte("OKBYE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "s3", bucket, object)) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "OKBYE" {
+		t.Fatalf("body=%q want %q (stale partVersion leaked)", got, "OKBYE")
+	}
+}
+
+func TestS3_DotSegmentObjectKeyRejected(t *testing.T) {
+	t.Parallel()
+	cases := []string{"a/../b", "a/./b", "..", "."}
+	for _, key := range cases {
+		t.Run(key, func(t *testing.T) {
+			enc, _ := newS3Encoder(t)
+			emitObject(t, enc, "b", 1, key, []byte("x"), "")
+			err := enc.Finalize()
+			if !errors.Is(err, ErrS3MalformedKey) {
+				t.Fatalf("err=%v want ErrS3MalformedKey for key %q", err, key)
+			}
+		})
+	}
+}
+
+// emitObjectAtGen is a helper for cross-generation tests: emits a
+// manifest + single chunk under an explicit (gen, uploadID) instead
+// of the bucket's active gen.
+func emitObjectAtGen(t *testing.T, enc *S3Encoder, bucket string, gen uint64, object, uploadID string, body []byte) {
+	t.Helper()
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": uploadID, "size_bytes": int64(len(body)), "parts": []map[string]any{
+			{"part_no": 1, "size_bytes": int64(len(body)), "chunk_count": 1},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 0), body); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestS3_StaleGenerationObjectExcluded(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	var events []string
+	enc.WithWarnSink(func(e string, _ ...any) { events = append(events, e) })
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey("b"), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": "b", "generation": 7,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	emitObjectAtGen(t, enc, "b", 6, "stale-obj", "us", []byte("STALE"))
+	emitObjectAtGen(t, enc, "b", 7, "live-obj", "ul", []byte("LIVE"))
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "s3", "b", "live-obj")); err != nil {
+		t.Fatalf("live-gen object missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "s3", "b", "stale-obj")); !os.IsNotExist(err) {
+		t.Fatalf("stale-gen object must NOT flush, stat err=%v", err)
+	}
+	if !sliceContains(events, "s3_stale_generation_objects") {
+		t.Fatalf("expected s3_stale_generation_objects warning, got %v", events)
+	}
+}
+
+func sliceContains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func TestS3_VersionedBlobAssembledByPartVersionOrder(t *testing.T) {
 	t.Parallel()
 	enc, root := newS3Encoder(t)

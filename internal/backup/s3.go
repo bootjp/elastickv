@@ -89,8 +89,14 @@ type S3Encoder struct {
 }
 
 type s3BucketState struct {
-	name      string
-	meta      *s3PublicBucket
+	name string
+	meta *s3PublicBucket
+	// activeGen is the bucket's current generation, captured from the
+	// bucket-meta record. Used at flush time to suppress objects
+	// belonging to older incarnations of the same bucket name (Codex
+	// P2 #521). Zero means "no bucket meta seen yet"; in that state
+	// every object flushes (the prior orphan-warning path covers it).
+	activeGen uint64
 	objects   map[string]*s3ObjectState // keyed by "object\x00generation"
 	keymap    *KeymapWriter
 	keymapDir string
@@ -114,6 +120,13 @@ type s3ObjectState struct {
 	// window) cannot be merged into the active body — Codex P1 #500,
 	// Gemini HIGH #106/#476/#504.
 	uploadID string
+	// declaredParts is the set of (partNo, partVersion) tuples the
+	// manifest claims belong to this object. When non-nil, the body
+	// assembler restricts chunkPaths to entries matching this set —
+	// Codex P1 #619. nil means "no filter" (used only in tests that
+	// pre-date the manifest-parts feature; production callers always
+	// receive a non-nil set via HandleObjectManifest).
+	declaredParts map[s3PartKey]struct{}
 	// scratchDirCreated avoids the per-blob MkdirAll syscall flagged
 	// by Gemini MEDIUM #285. The scratch directory for this object is
 	// created exactly once on the first HandleBlob call.
@@ -128,6 +141,16 @@ type s3ChunkKey struct {
 	uploadID    string
 	partNo      uint64
 	chunkNo     uint64
+	partVersion uint64
+}
+
+// s3PartKey is the manifest-declared part identifier: a (partNo,
+// partVersion) tuple. ChunkNo is excluded because the manifest's
+// per-part chunk_count + chunk_sizes drive how many chunks to expect
+// per part, but the manifest doesn't enumerate (chunkNo) tuples
+// directly.
+type s3PartKey struct {
+	partNo      uint64
 	partVersion uint64
 }
 
@@ -245,6 +268,7 @@ func (s *S3Encoder) HandleBucketMeta(key, value []byte) error {
 		Region:        live.Region,
 		ACL:           live.Acl,
 	}
+	st.activeGen = live.Generation
 	return nil
 }
 
@@ -282,10 +306,16 @@ func (s *S3Encoder) HandleObjectManifest(key, value []byte) error {
 	}
 	// Capture the manifest's uploadID so assembleObjectBody can
 	// filter blob chunks belonging to other (stale or in-flight)
-	// upload attempts. The live parts list is purely structural —
-	// the public sidecar has no need for it, but its uploadID is
-	// the load-bearing detail.
+	// upload attempts. Also capture the manifest's declared
+	// (partNo, partVersion) set so the assembler restricts itself
+	// to canonically-declared parts — older partVersions left
+	// behind by overwrite-then-async-cleanup must NOT be merged
+	// into the body (Codex P1 #619).
 	st.uploadID = live.UploadID
+	st.declaredParts = make(map[s3PartKey]struct{}, len(live.Parts))
+	for _, p := range live.Parts {
+		st.declaredParts[s3PartKey{partNo: p.PartNo, partVersion: p.PartVersion}] = struct{}{}
+	}
 	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
 	return nil
 }
@@ -384,10 +414,16 @@ func (s *S3Encoder) flushBucket(b *s3BucketState) error {
 			return err
 		}
 	}
-	for _, obj := range b.objects {
-		if err := s.flushObject(b, bucketDir, obj); err != nil {
-			return err
-		}
+	staleCount, err := s.flushBucketObjects(b, bucketDir)
+	if err != nil {
+		return err
+	}
+	if staleCount > 0 {
+		s.emitWarn("s3_stale_generation_objects",
+			"bucket", b.name,
+			"active_generation", b.activeGen,
+			"stale_count", staleCount,
+			"hint", "stale-gen objects excluded; restore would otherwise emit them under the new bucket")
 	}
 	// closeJSONL errors must surface — they are the canonical "data
 	// did not flush to disk" signal for a writable resource (Gemini
@@ -401,6 +437,37 @@ func (s *S3Encoder) flushBucket(b *s3BucketState) error {
 		}
 	}
 	return nil
+}
+
+// flushBucketObjects walks the bucket's object set, routes stale-gen
+// objects to the orphan path (under --include-orphans) or drops them
+// with a warning counter, and flushes active-gen objects normally.
+// Split out of flushBucket to keep cyclomatic complexity within the
+// package cap.
+func (s *S3Encoder) flushBucketObjects(b *s3BucketState, bucketDir string) (int, error) {
+	stale := 0
+	for _, obj := range b.objects {
+		// Suppress objects from older bucket incarnations: when a
+		// bucket is deleted and recreated the generation bumps, but
+		// snapshots taken mid-cleanup can still carry the previous
+		// generation's manifests + chunks. Routing both to the same
+		// natural path is non-deterministic last-write-wins (Codex
+		// P2 #521). When a bucket-meta record is present, only its
+		// active generation flushes.
+		if b.activeGen != 0 && obj.generation != b.activeGen {
+			stale++
+			if s.includeOrphans {
+				if err := s.flushOrphanObject(b, bucketDir, obj); err != nil {
+					return stale, err
+				}
+			}
+			continue
+		}
+		if err := s.flushObject(b, bucketDir, obj); err != nil {
+			return stale, err
+		}
+	}
+	return stale, nil
 }
 
 // closeBucketKeymap closes the per-bucket KEYMAP.jsonl writer (if
@@ -484,15 +551,42 @@ func (s *S3Encoder) flushOrphanObject(b *s3BucketState, bucketDir string, obj *s
 
 // safeJoinUnderRoot composes <root>/<rel> and asserts the result is
 // still rooted under <root>. S3 object keys are user-controlled and
-// can contain "..", absolute paths, or NUL bytes; without this guard
-// a key like "../etc/passwd" would escape the dump tree and overwrite
-// host files (Codex P1 #425).
+// can contain "..", absolute paths, NUL bytes, or "." segments;
+// without this guard a key like "../etc/passwd" would escape the
+// dump tree and overwrite host files (Codex P1 #425).
+//
+// We refuse keys whose path-segment components include "." or ".."
+// rather than filepath.Clean'ing them. S3 treats those bytes
+// literally — `aws s3 put-object` accepts a key like "a/../b" as
+// distinct from "b" — so collapsing them via filepath.Clean would
+// silently merge two distinct user keys into one output file
+// (Codex P2 #497). Operators with such keys must rename them in
+// S3, then re-take the dump; the spec's rename-collisions path
+// does not currently cover this.
+//
+// NUL bytes are also refused: POSIX cannot represent them in a
+// path component, and they have no legitimate meaning in S3 keys
+// transmitted over HTTP.
 func safeJoinUnderRoot(root, rel string) (string, error) {
 	if rel == "" {
 		return "", errors.Wrap(ErrS3MalformedKey, "empty object name")
 	}
+	if strings.ContainsRune(rel, 0) {
+		return "", errors.Wrapf(ErrS3MalformedKey, "object name contains NUL: %q", rel)
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		switch seg {
+		case ".", "..":
+			return "", errors.Wrapf(ErrS3MalformedKey,
+				"object name has dot segment %q (S3 treats it literally; rename in S3 first)", rel)
+		}
+	}
 	cleanRoot := filepath.Clean(root)
-	joined := filepath.Clean(filepath.Join(cleanRoot, rel))
+	// Use filepath.Join here — its only behavioural change vs. raw
+	// concatenation after the dot-segment guard above is normalising
+	// a leading "/" off `rel` (which is what we want: absolute-path
+	// keys collapse safely under bucketDir).
+	joined := filepath.Join(cleanRoot, rel)
 	rootSep := cleanRoot + string(filepath.Separator)
 	if joined != cleanRoot && !strings.HasPrefix(joined, rootSep) {
 		return "", errors.Wrapf(ErrS3MalformedKey,
@@ -579,14 +673,17 @@ func assembleObjectBody(outPath string, obj *s3ObjectState) error {
 			_ = os.Remove(tmpPath)
 		}
 	}()
-	// Filter chunks by the manifest's uploadID. A snapshot taken
-	// during a delete/recreate or a retry-after-failed-CompleteUpload
-	// can legitimately contain blob chunks for multiple upload
-	// attempts under the same (bucket, generation, object). Mixing
-	// them produces corrupted bytes — Codex P1 #500 / Gemini HIGH
-	// #504. The manifest is the single source of truth; only its
-	// uploadID's chunks belong in the assembled body.
-	chunks := filterChunksForManifest(obj.chunkPaths, obj.uploadID)
+	// Filter chunks by the manifest's uploadID AND its declared
+	// (partNo, partVersion) set. A snapshot taken during
+	// delete/recreate, retry-after-failed-CompleteUpload, or
+	// part-overwrite-before-cleanup can legitimately contain blob
+	// chunks for multiple upload attempts and/or multiple part
+	// versions under the same (bucket, generation, object). Mixing
+	// them produces corrupted bytes — Codex P1 #500 (uploadID),
+	// Codex P1 #619 (partVersion). The manifest is the single source
+	// of truth; only its uploadID + declaredParts make it into the
+	// assembled body.
+	chunks := filterChunksForManifest(obj.chunkPaths, obj.uploadID, obj.declaredParts)
 	for _, k := range chunks {
 		path := obj.chunkPaths[k]
 		if err := appendFile(tmp, path); err != nil {
@@ -606,15 +703,24 @@ func assembleObjectBody(outPath string, obj *s3ObjectState) error {
 }
 
 // filterChunksForManifest returns the chunk keys belonging to
-// manifestUploadID, sorted by (partNo, partVersion, chunkNo). An empty
-// manifestUploadID matches every chunk — useful for tests that
-// pre-date the uploadID feature, but production callers always have a
-// non-empty uploadID via HandleObjectManifest.
-func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string) []s3ChunkKey {
+// manifestUploadID AND whose (partNo, partVersion) appears in
+// declaredParts. Returned keys are sorted by (partNo, partVersion,
+// chunkNo) for byte-deterministic body assembly.
+//
+// An empty manifestUploadID and a nil declaredParts both mean "no
+// filter" — used by tests that pre-date these features. Production
+// callers always pass non-empty/non-nil values via
+// HandleObjectManifest.
+func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string, declaredParts map[s3PartKey]struct{}) []s3ChunkKey {
 	keys := make([]s3ChunkKey, 0, len(m))
 	for k := range m {
 		if manifestUploadID != "" && k.uploadID != manifestUploadID {
 			continue
+		}
+		if declaredParts != nil {
+			if _, ok := declaredParts[s3PartKey{partNo: k.partNo, partVersion: k.partVersion}]; !ok {
+				continue
+			}
 		}
 		keys = append(keys, k)
 	}
