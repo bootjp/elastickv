@@ -375,6 +375,61 @@ func TestDDB_MigrationSourceGenerationItemsAreEmitted(t *testing.T) {
 	}
 }
 
+// TestDDB_DotSegmentKeyRejected is the regression for Codex P1
+// round 12: DynamoDB S/N key values can legitimately hold "." or
+// "..". EncodeSegment preserves both as RFC3986-unreserved, so the
+// resulting filename would let filepath.Join collapse / escape the
+// items/ subtree — an item with hash=".." range="_schema" would be
+// written as `<table>/_schema.json`, overwriting the schema sidecar.
+// writeDDBItem now refuses sole-dot encoded segments for both
+// hash and range keys.
+func TestDDB_DotSegmentKeyRejected(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		hashAttr  *pb.DynamoAttributeValue
+		rangeAttr *pb.DynamoAttributeValue
+	}{
+		{"hash_dot", sAttr("."), nil},
+		{"hash_dotdot", sAttr(".."), nil},
+		{"range_dot", sAttr("ok"), sAttr(".")},
+		{"range_dotdot", sAttr("ok"), sAttr("..")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			enc, _ := newDDBEncoder(t)
+			schema := &pb.DynamoTableSchema{
+				TableName:            "t",
+				PrimaryKey:           &pb.DynamoKeySchema{HashKey: "h", RangeKey: ""},
+				AttributeDefinitions: map[string]string{"h": "S", "r": "S"},
+				Generation:           1,
+			}
+			if tc.rangeAttr != nil {
+				schema.PrimaryKey.RangeKey = "r"
+			}
+			attrs := map[string]*pb.DynamoAttributeValue{"h": tc.hashAttr}
+			hashRaw := tc.hashAttr.GetS()
+			rangeRaw := ""
+			if tc.rangeAttr != nil {
+				attrs["r"] = tc.rangeAttr
+				rangeRaw = tc.rangeAttr.GetS()
+			}
+			item := &pb.DynamoItem{Attributes: attrs}
+			if err := enc.HandleItem(EncodeDDBItemKey("t", 1, hashRaw, rangeRaw), encodeItemValue(t, item)); err != nil {
+				t.Fatal(err)
+			}
+			if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+				t.Fatal(err)
+			}
+			err := enc.Finalize()
+			if !errors.Is(err, ErrDDBInvalidItem) {
+				t.Fatalf("err=%v want ErrDDBInvalidItem for dot-segment key", err)
+			}
+		})
+	}
+}
+
 // TestDDB_CanonicalNumberKeySegment is the regression for Codex P1
 // round 9: DynamoDB N equality is numeric, not lexical, but the key
 // segment was emitted as `EncodeSegment([]byte(v.N))`. In migration

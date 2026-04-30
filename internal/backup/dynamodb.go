@@ -332,6 +332,15 @@ func parseDDBItemKey(key []byte) (string, uint64, error) {
 // A missing hash-key attribute on an item is a structural error (the
 // item could never have been GetItem-able without one) and surfaces
 // as ErrDDBInvalidItem.
+//
+// The encoded hash/range filename segments may legitimately be "." or
+// ".." (DynamoDB S/N keys can hold any string, and EncodeSegment
+// preserves both `.` chars as RFC3986-unreserved). filepath.Join
+// would then either collapse `<itemsDir>/.` back to itemsDir or
+// resolve `<itemsDir>/..` to the parent — letting an item like
+// hash=".." range="_schema" overwrite the table-level _schema.json.
+// Reject sole-dot segments at this boundary so the items/ subtree
+// cannot escape via key-controlled paths. Codex P1 round 12.
 func writeDDBItem(itemsDir, hashKey, rangeKey string, item *pb.DynamoItem) error {
 	attrs := item.GetAttributes()
 	hashVal, ok := attrs[hashKey]
@@ -341,6 +350,9 @@ func writeDDBItem(itemsDir, hashKey, rangeKey string, item *pb.DynamoItem) error
 	}
 	hashFilename, err := ddbKeyAttrToSegment(hashVal)
 	if err != nil {
+		return err
+	}
+	if err := refuseDotSegmentFilename(hashFilename, "hash"); err != nil {
 		return err
 	}
 	publicItem := itemToPublic(item)
@@ -360,11 +372,25 @@ func writeDDBItem(itemsDir, hashKey, rangeKey string, item *pb.DynamoItem) error
 	if err != nil {
 		return err
 	}
+	if err := refuseDotSegmentFilename(rangeFilename, "range"); err != nil {
+		return err
+	}
 	dir := filepath.Join(itemsDir, hashFilename)
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return errors.WithStack(err)
 	}
 	return writeFileAtomic(filepath.Join(dir, rangeFilename+".json"), body)
+}
+
+// refuseDotSegmentFilename blocks hash/range segments that filepath
+// resolution would collapse or escape on (".", ".."). Both are
+// reachable from valid DynamoDB N/S key values.
+func refuseDotSegmentFilename(seg, role string) error {
+	if seg == "." || seg == ".." {
+		return errors.Wrapf(ErrDDBInvalidItem,
+			"%s-key segment %q is a dot path (would escape items dir)", role, seg)
+	}
+	return nil
 }
 
 // ddbKeyAttrToSegment encodes a primary-key attribute (S, N, or B) to
