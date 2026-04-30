@@ -335,6 +335,87 @@ func TestDDB_BundleJSONLNotImplementedYet(t *testing.T) {
 	}
 }
 
+func TestDDB_MigrationSourceGenerationItemsAreEmitted(t *testing.T) {
+	t.Parallel()
+	enc, root := newDDBEncoder(t)
+	// During a live migration, schema.Generation is the new gen and
+	// schema.MigratingFromGeneration carries the source gen. The live
+	// read path falls back to the source for items not yet copied.
+	// The dump must include both — Codex P1 #227.
+	schema := &pb.DynamoTableSchema{
+		TableName:               "t",
+		PrimaryKey:              &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions:    map[string]string{"id": "S"},
+		Generation:              7,
+		MigratingFromGeneration: 6,
+	}
+	newRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("a"), "v": sAttr("new"),
+	}}
+	migratingRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("b"), "v": sAttr("not-yet-migrated"),
+	}}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 7, "a", ""), encodeItemValue(t, newRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 6, "b", ""), encodeItemValue(t, migratingRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "a.json")); err != nil {
+		t.Fatalf("active-gen item missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "b.json")); err != nil {
+		t.Fatalf("migrating-from-gen item must be emitted during live migration: %v", err)
+	}
+}
+
+func TestDDB_NewGenerationWinsOverMigrationSourceForSameKey(t *testing.T) {
+	t.Parallel()
+	enc, root := newDDBEncoder(t)
+	schema := &pb.DynamoTableSchema{
+		TableName:               "t",
+		PrimaryKey:              &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions:    map[string]string{"id": "S"},
+		Generation:              7,
+		MigratingFromGeneration: 6,
+	}
+	// Same primary key in both generations. The live read path
+	// prefers the new gen; the dump must do the same.
+	newRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("k"), "v": sAttr("new-version"),
+	}}
+	oldRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("k"), "v": sAttr("old-version"),
+	}}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 6, "k", ""), encodeItemValue(t, oldRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 7, "k", ""), encodeItemValue(t, newRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "dynamodb", "t", "items", "k.json")) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readItemMap(t, filepath.Join(root, "dynamodb", "t", "items", "k.json"))
+	v := mustSubMap(t, got, "v")
+	if v["S"] != "new-version" {
+		t.Fatalf("body = %s; new gen must win on conflict, got v.S=%v", body, v["S"])
+	}
+}
+
 func TestDDB_StaleGenerationItemsExcludedAndWarned(t *testing.T) {
 	t.Parallel()
 	enc, root := newDDBEncoder(t)
