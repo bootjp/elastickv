@@ -9,7 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"syscall"
+	"strings"
 
 	cockroachdberr "github.com/cockroachdb/errors"
 )
@@ -300,7 +300,19 @@ func intToDecimal(v int) string {
 
 // ensureDir runs MkdirAll once per directory and remembers the result
 // in r.dirsCreated, so repeated calls on the hot path (one per blob
-// record) collapse to a map lookup.
+// record) collapse to a map lookup. After MkdirAll succeeds, every
+// path component under outRoot is Lstat-checked: a pre-existing
+// directory symlink at e.g. `<outRoot>/redis/db_0/strings` would
+// otherwise let `os.MkdirAll` succeed without creating anything,
+// then steer subsequent writes outside outRoot. Codex P1 round 9.
+//
+// This guard is best-effort against TOCTOU (an adversary that can
+// swap a directory for a symlink between this check and the open
+// races us either way); it closes the much more common case of a
+// stale symlink left in the output tree from a prior run or
+// configuration mistake. Hardening to fully race-free traversal
+// would require os.Root / openat-style traversal, which is a
+// larger refactor for marginal benefit at this layer.
 func (r *RedisDB) ensureDir(dir string) error {
 	if _, ok := r.dirsCreated[dir]; ok {
 		return nil
@@ -308,7 +320,69 @@ func (r *RedisDB) ensureDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return cockroachdberr.WithStack(err)
 	}
+	if err := assertNoSymlinkAncestors(r.outRoot, dir); err != nil {
+		return err
+	}
 	r.dirsCreated[dir] = struct{}{}
+	return nil
+}
+
+// assertNoSymlinkAncestors walks every path component from rootDir up
+// to (and including) target, Lstat'ing each. Returns ErrSymlinkInPath
+// if any component is a symbolic link. rootDir itself is also
+// Lstat'd: if the dump root is a symlink to somewhere else, all bets
+// are off.
+func assertNoSymlinkAncestors(rootDir, target string) error {
+	cleanRoot := filepath.Clean(rootDir)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil {
+		return cockroachdberr.WithStack(err)
+	}
+	// Defensive: if target escapes rootDir (which the callers' path
+	// construction already prevents), refuse rather than silently
+	// validate an unrelated path.
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return cockroachdberr.WithStack(cockroachdberr.Newf(
+			"backup: target %s escapes root %s", target, rootDir))
+	}
+	if err := lstatRefuseSymlink(cleanRoot); err != nil {
+		return err
+	}
+	cur := cleanRoot
+	if rel == "." {
+		return nil
+	}
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if seg == "" {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		if err := lstatRefuseSymlink(cur); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// lstatRefuseSymlink returns an error wrapped over the underlying
+// stat call when path is a symbolic link. A non-existent path is
+// treated as fine: the caller has just MkdirAll'd it, so a missing
+// component is impossible — but if it were, the symlink-check
+// contract is "if it exists, it must not be a symlink", and we
+// return nil rather than synthesize a false positive.
+func lstatRefuseSymlink(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return cockroachdberr.WithStack(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return cockroachdberr.WithStack(cockroachdberr.Newf(
+			"backup: refusing to traverse symlinked ancestor at %s", path))
+	}
 	return nil
 }
 
@@ -546,11 +620,14 @@ func IsBlobAtomicWriteRetriable(err error) bool {
 
 // IsBlobAtomicWriteOutOfSpace reports whether err from writeFileAtomic
 // (or any os.File write the master pipeline issues) was driven by a
-// full disk. Tested via syscall.ENOSPC + os.PathError unwrap, which
-// matches what os.File.Write returns on POSIX and Windows.
+// full disk. The platform-specific error codes (POSIX ENOSPC vs.
+// Windows ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL) live in
+// disk_full_{unix,windows}.go so retry/alarm logic in callers
+// classifies disk-full uniformly across operating systems
+// (Codex P2 round 9).
 func IsBlobAtomicWriteOutOfSpace(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, syscall.ENOSPC)
+	return isDiskFullError(err)
 }
