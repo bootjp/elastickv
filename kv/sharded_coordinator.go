@@ -845,11 +845,11 @@ func (c *ShardedCoordinator) Clock() *HLC {
 }
 
 func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return nil, false
 	}
-	g, ok := c.groups[route.GroupID]
+	g, ok := c.groups[gid]
 	return g, ok
 }
 
@@ -859,24 +859,36 @@ func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
 // Leadership-only callers (IsLeaderForKey / VerifyLeaderForKey /
 // RaftLeaderForKey) keep using groupForKey because they don't need
 // the route ID.
+//
+// The gid comes from the partition-aware router (resolver-first,
+// engine-fallback) so partitioned-FIFO traffic lands on the
+// operator-chosen group. RouteID is read from the engine on the
+// normalized key; the resolver does not have a notion of catalog
+// RouteID, so partition-resolved keys observe under the engine's
+// catalog RouteID for !sqs|route|global. Partition-aware keyviz
+// is a Phase 3.D follow-up.
 func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGroup, bool) {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return 0, nil, false
 	}
-	g, ok := c.groups[route.GroupID]
+	g, ok := c.groups[gid]
 	if !ok {
 		return 0, nil, false
 	}
-	return route.RouteID, g, true
+	var routeID uint64
+	if route, found := c.engine.GetRoute(routeKey(key)); found {
+		routeID = route.RouteID
+	}
+	return routeID, g, true
 }
 
 func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return 0
 	}
-	return route.GroupID
+	return gid
 }
 
 func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint64][][]byte {
@@ -1052,12 +1064,19 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 			return nil, nil, ErrInvalidRequest
 		}
 		mut := elemToMutation(req)
-		route, ok := c.engine.GetRoute(routeKey(mut.Key))
+		gid, ok := c.router.ResolveGroup(mut.Key)
 		if !ok {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 		}
-		c.observeMutation(route.RouteID, mut)
-		grouped[route.GroupID] = append(grouped[route.GroupID], mut)
+		// Engine RouteID for keyviz observation; partition-resolved
+		// keys observe under the !sqs|route|global RouteID until
+		// partition-aware keyviz lands.
+		var routeID uint64
+		if route, found := c.engine.GetRoute(routeKey(mut.Key)); found {
+			routeID = route.RouteID
+		}
+		c.observeMutation(routeID, mut)
+		grouped[gid] = append(grouped[gid], mut)
 	}
 	gids := make([]uint64, 0, len(grouped))
 	for gid := range grouped {

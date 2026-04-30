@@ -1,7 +1,9 @@
 package kv
 
 import (
+	"bytes"
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -129,6 +131,51 @@ func TestShardRouter_NilPartitionResolverIsNoOp(t *testing.T) {
 		"nil resolver must leave the engine in charge")
 }
 
+// TestShardRouter_ResolverSeesRawKeyNotNormalized pins the codex-P1
+// fix on PR #715: resolveGroup MUST consult the resolver with the
+// pre-normalization (raw) key, not the post-normalization key. SQS
+// keys in particular collapse to !sqs|route|global via routeKey, so
+// a resolver that only saw the normalized form would never match
+// any partitioned-prefix key — the resolver would be a no-op for
+// every Commit/Abort/Get on a partitioned-FIFO queue.
+//
+// The fake resolver here records every key it was asked about; the
+// post-condition asserts the recorded key is the raw key the caller
+// supplied, not whatever routeKey normalized it to.
+func TestShardRouter_ResolverSeesRawKeyNotNormalized(t *testing.T) {
+	t.Parallel()
+	e := distribution.NewEngine()
+	e.UpdateRoute([]byte(""), nil, 1)
+
+	router := NewShardRouter(e)
+
+	rawKey := []byte("!sqs|msg|data|p|raw-test-key")
+	resolver := &recordingResolver{match: rawKey, gid: 42}
+	router.WithPartitionResolver(resolver)
+
+	var sink atomic.Uint64
+	router.Register(1, &fakeTxn{id: 1, sink: &sink}, store.NewMVCCStore())
+	router.Register(42, &fakeTxn{id: 42, sink: &sink}, store.NewMVCCStore())
+
+	resp, err := router.Commit([]*pb.Request{
+		{IsTxn: false, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: rawKey, Value: []byte("v")}}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, uint64(42), sink.Load(),
+		"resolver must claim the raw partitioned-prefix key; "+
+			"if the router collapsed it via routeKey first, this "+
+			"would route to the engine's default group (1)")
+
+	// The resolver MUST have been called with the raw key, not the
+	// !sqs|route|global collapse. This is the codex P1 invariant.
+	seen := resolver.seenKeys()
+	require.Len(t, seen, 1)
+	require.Equal(t, rawKey, seen[0],
+		"resolver received normalized key — routeKey ran before "+
+			"resolver, contrary to the §3.D PR 4-B-2 design")
+}
+
 // TestShardRouter_GetUsesResolver pins that the resolver-first path
 // applies to Get as well as Commit/Abort. A regression that fixed
 // only Commit's path would silently route reads through the engine
@@ -156,6 +203,36 @@ func TestShardRouter_GetUsesResolver(t *testing.T) {
 	v, err := router.Get(context.Background(), []byte("resolver-key"))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v"), v)
+}
+
+// recordingResolver is a PartitionResolver that records every key
+// it was asked about and returns gid for keys equal to match. The
+// recorded list is the test's evidence that the router consulted
+// the resolver with the raw (pre-routeKey-normalisation) key.
+type recordingResolver struct {
+	match []byte
+	gid   uint64
+	mu    sync.Mutex
+	seen  [][]byte
+}
+
+func (r *recordingResolver) ResolveGroup(key []byte) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	keyCopy := append([]byte(nil), key...)
+	r.seen = append(r.seen, keyCopy)
+	if bytes.Equal(key, r.match) {
+		return r.gid, true
+	}
+	return 0, false
+}
+
+func (r *recordingResolver) seenKeys() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([][]byte, len(r.seen))
+	copy(out, r.seen)
+	return out
 }
 
 // fakeTxn is a Transactional double that records its own id into a

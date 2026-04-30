@@ -204,12 +204,12 @@ func TestSQSPartitionResolver_NilReceiverIsSafe(t *testing.T) {
 // stop resolving keys for the new family.
 func TestSQSPartitionResolver_PrefixesAlign(t *testing.T) {
 	t.Parallel()
-	want := []string{
-		SqsPartitionedMsgDataPrefix,
-		SqsPartitionedMsgVisPrefix,
-		SqsPartitionedMsgDedupPrefix,
-		SqsPartitionedMsgGroupPrefix,
-		SqsPartitionedMsgByAgePrefix,
+	want := [][]byte{
+		[]byte(SqsPartitionedMsgDataPrefix),
+		[]byte(SqsPartitionedMsgVisPrefix),
+		[]byte(SqsPartitionedMsgDedupPrefix),
+		[]byte(SqsPartitionedMsgGroupPrefix),
+		[]byte(SqsPartitionedMsgByAgePrefix),
 	}
 	require.Equal(t, want, sqsResolverFamilyPrefixes,
 		"sqsResolverFamilyPrefixes must mirror the constants in "+
@@ -217,7 +217,7 @@ func TestSQSPartitionResolver_PrefixesAlign(t *testing.T) {
 			"be added here too, or the resolver silently stops "+
 			"matching keys in that family")
 	for _, p := range sqsResolverFamilyPrefixes {
-		require.True(t, strings.HasSuffix(p, "p|"),
+		require.True(t, strings.HasSuffix(string(p), "p|"),
 			"every partitioned prefix must end with the p| discriminator")
 	}
 }

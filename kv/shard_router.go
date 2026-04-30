@@ -59,29 +59,50 @@ func NewShardRouter(e *distribution.Engine) *ShardRouter {
 // nil resolver clears any previously-installed resolver. Returns
 // the receiver so callers can chain.
 //
-// Setting the resolver is idempotent — re-installing the same value
-// is a no-op. Concurrent reads against ResolveGroup remain safe
-// because both the read in resolveGroup and the assignment here
-// happen against the same field; routine startup wires the resolver
-// once before any request lands, so the rare write does not need a
-// lock.
+// Intended for use during startup, before the router begins handling
+// requests. Interface assignment in Go is not atomic, so a call that
+// races with a concurrent ResolveGroup in resolveGroup may produce a
+// torn read; callers must wire the resolver once during construction
+// (parseRuntimeConfig → NewShardedCoordinator → WithPartitionResolver)
+// and treat any post-startup re-assignment as undefined behaviour.
 func (s *ShardRouter) WithPartitionResolver(r PartitionResolver) *ShardRouter {
 	s.partitionResolver = r
 	return s
 }
 
-// resolveGroup tries the partition resolver first (when installed),
-// then falls through to the byte-range engine. Returns the resolved
-// Raft group ID and a found flag; (0, false) means no route in either
-// the resolver or the engine — the caller surfaces this as an
-// "unknown group" error.
-func (s *ShardRouter) resolveGroup(key []byte) (uint64, bool) {
+// ResolveGroup tries the partition resolver first (when installed),
+// then falls through to the byte-range engine. Exposed at package
+// scope so ShardedCoordinator's per-key helpers (groupForKey,
+// routeAndGroupForKey, engineGroupIDForKey, groupMutations) can
+// consult the same dispatch path Commit / Abort / Get use — without
+// it those helpers would bypass the resolver and partitioned-FIFO
+// traffic would silently mis-route through 2PC and the read paths.
+//
+// The resolver runs on the RAW key before any user-key
+// normalization. SQS keys in particular are collapsed to
+// !sqs|route|global by routeKey to keep the engine's per-shard
+// layout simple, but that collapse hides the partitioned-prefix
+// information the resolver needs (issue: codex P1 / gemini high on
+// PR #715). The engine still sees the post-normalization key, so
+// legacy routing (catalog → !sqs|route|global → default group)
+// stays unchanged.
+//
+// Returns (0, false) when neither the resolver nor the engine
+// recognises the key. Caller surfaces this as an "unknown group"
+// error so a partitioned-prefix key whose queue is missing from the
+// resolver map fails closed rather than landing on whichever
+// engine-default group happens to cover the raw bytes.
+func (s *ShardRouter) ResolveGroup(rawKey []byte) (uint64, bool) {
 	if s.partitionResolver != nil {
-		if gid, ok := s.partitionResolver.ResolveGroup(key); ok {
+		if gid, ok := s.partitionResolver.ResolveGroup(rawKey); ok {
 			return gid, true
 		}
 	}
-	route, ok := s.engine.GetRoute(key)
+	// Engine routes against the user-key view of the byte-range
+	// space; routeKey may rewrite SQS / DynamoDB / Redis-internal
+	// keys to a stable per-table or per-namespace route key so the
+	// engine sees one route per logical entity.
+	route, ok := s.engine.GetRoute(routeKey(rawKey))
 	if !ok {
 		return 0, false
 	}
@@ -174,13 +195,13 @@ func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Reques
 		if len(r.Mutations) == 0 || r.Mutations[0] == nil {
 			return nil, ErrInvalidRequest
 		}
-		key := routeKey(r.Mutations[0].Key)
-		if len(key) == 0 {
+		rawKey := r.Mutations[0].Key
+		if len(rawKey) == 0 {
 			return nil, ErrInvalidRequest
 		}
-		gid, ok := s.resolveGroup(key)
+		gid, ok := s.ResolveGroup(rawKey)
 		if !ok {
-			return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
+			return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", rawKey)
 		}
 		batches[gid] = append(batches[gid], r)
 	}
@@ -189,7 +210,7 @@ func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Reques
 
 // Get retrieves a key routed to the correct shard.
 func (s *ShardRouter) Get(ctx context.Context, key []byte) ([]byte, error) {
-	gid, ok := s.resolveGroup(routeKey(key))
+	gid, ok := s.ResolveGroup(key)
 	if !ok {
 		return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
 	}

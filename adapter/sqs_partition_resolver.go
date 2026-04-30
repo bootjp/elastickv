@@ -47,16 +47,18 @@ func NewSQSPartitionResolver(routes map[string][]uint64) *SQSPartitionResolver {
 }
 
 // sqsResolverFamilyPrefixes is the set of partitioned-SQS family
-// prefixes ResolveGroup recognises. Kept package-internal so any
-// future renamed prefix touches both this list and the constant
+// prefixes ResolveGroup recognises. Pre-converted to []byte so the
+// hot-path bytes.HasPrefix call avoids an allocation per check
+// (gemini medium on PR #715). Kept package-internal so any future
+// renamed prefix touches both this list and the constant
 // declaration in sqs_keys.go — TestSQSPartitionResolver_PrefixesAlign
 // pins the alignment.
-var sqsResolverFamilyPrefixes = []string{
-	SqsPartitionedMsgDataPrefix,
-	SqsPartitionedMsgVisPrefix,
-	SqsPartitionedMsgDedupPrefix,
-	SqsPartitionedMsgGroupPrefix,
-	SqsPartitionedMsgByAgePrefix,
+var sqsResolverFamilyPrefixes = [][]byte{
+	[]byte(SqsPartitionedMsgDataPrefix),
+	[]byte(SqsPartitionedMsgVisPrefix),
+	[]byte(SqsPartitionedMsgDedupPrefix),
+	[]byte(SqsPartitionedMsgGroupPrefix),
+	[]byte(SqsPartitionedMsgByAgePrefix),
 }
 
 // ResolveGroup decodes the (queue, partition) embedded in a
@@ -126,7 +128,7 @@ func parsePartitionedSQSKey(key []byte) (string, uint32, bool) {
 // partitioned family prefixes.
 func stripPartitionedFamilyPrefix(key []byte) ([]byte, bool) {
 	for _, prefix := range sqsResolverFamilyPrefixes {
-		if bytes.HasPrefix(key, []byte(prefix)) {
+		if bytes.HasPrefix(key, prefix) {
 			return key[len(prefix):], true
 		}
 	}
