@@ -46,10 +46,12 @@ func NewCipher(ks *Keystore) (*Cipher, error) {
 // CRITICAL: callers MUST NOT reuse the same (keyID, nonce) pair with
 // any two distinct plaintexts. Nonce reuse under AES-GCM is
 // catastrophic: it leaks the XOR of the two plaintexts and enables
-// authentication-key recovery. The §4.1 nonce construction
-// (node_id ‖ local_epoch ‖ write_count) is designed to make reuse
-// impossible by construction; do not bypass it with crypto/rand or
-// external counters without re-deriving the same uniqueness proof.
+// authentication-key recovery. The §4.1 storage-layer integration
+// uses the nonce construction (node_id ‖ local_epoch ‖ write_count)
+// to guarantee uniqueness by construction; do not substitute a
+// different nonce scheme in that layer without a corresponding
+// uniqueness proof. (For tests / benchmarks, fresh crypto/rand
+// nonces are perfectly safe.)
 //
 // The returned slice has length len(plaintext) + TagSize. It is
 // freshly allocated; the caller may retain it indefinitely.
