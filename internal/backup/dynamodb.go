@@ -212,31 +212,48 @@ func (d *DDBEncoder) flushTable(st *ddbTableState) error {
 	hashKey := st.schema.GetPrimaryKey().GetHashKey()
 	rangeKey := st.schema.GetPrimaryKey().GetRangeKey()
 	activeGen := st.schema.GetGeneration()
-	// Only items belonging to the schema's active generation are
-	// emitted. Older-gen rows (in-flight delete/recreate cleanup) are
-	// counted into a structured warning so the operator can correlate
-	// orphans to the cluster's state, but never written under the
-	// current schema where they would resurrect deleted data.
-	if stale := totalStaleItems(st.itemsByGen, activeGen); stale > 0 {
+	migrationSourceGen := st.schema.GetMigratingFromGeneration()
+	// During a generation migration the live read path falls back to
+	// migration_source_generation for items not yet copied to the new
+	// generation (see adapter/dynamodb.go readLogicalItemAt). Both
+	// generations therefore carry items the user can read at this
+	// moment, so a backup must include both. Codex P1 #227.
+	//
+	// Items present in BOTH generations: the new-gen row is the
+	// authoritative one (the live code prefers it on read). We emit
+	// migration-source first, then active gen LAST, so writeFileAtomic's
+	// tmp+rename leaves the active-gen content on disk per (pk,sk).
+	emitOrder := []uint64{}
+	if migrationSourceGen != 0 && migrationSourceGen != activeGen {
+		emitOrder = append(emitOrder, migrationSourceGen)
+	}
+	emitOrder = append(emitOrder, activeGen)
+	if stale := totalStaleItemsExcluding(st.itemsByGen, emitOrder); stale > 0 {
 		d.emitWarn("ddb_stale_generation_items",
 			"table", st.name,
 			"active_generation", activeGen,
+			"migration_source_generation", migrationSourceGen,
 			"stale_count", stale,
-			"hint", "stale-gen rows are excluded from the dump; restore would otherwise emit them under the new schema")
+			"hint", "stale-gen rows excluded; restore would otherwise emit them under the new schema")
 	}
-	active := st.itemsByGen[activeGen]
-	for _, item := range active {
-		if err := writeDDBItem(itemsDir, hashKey, rangeKey, item); err != nil {
-			return err
+	for _, gen := range emitOrder {
+		for _, item := range st.itemsByGen[gen] {
+			if err := writeDDBItem(itemsDir, hashKey, rangeKey, item); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func totalStaleItems(m map[uint64][]*pb.DynamoItem, activeGen uint64) int {
+func totalStaleItemsExcluding(m map[uint64][]*pb.DynamoItem, included []uint64) int {
+	includedSet := make(map[uint64]struct{}, len(included))
+	for _, g := range included {
+		includedSet[g] = struct{}{}
+	}
 	stale := 0
 	for gen, items := range m {
-		if gen != activeGen {
+		if _, ok := includedSet[gen]; !ok {
 			stale += len(items)
 		}
 	}
