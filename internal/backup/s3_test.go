@@ -452,10 +452,10 @@ func TestS3_DotSegmentObjectKeyRejected(t *testing.T) {
 	}
 }
 
-// emitObjectAtGen is a helper for cross-generation tests: emits a
-// manifest + single chunk under an explicit (gen, uploadID) instead
-// of the bucket's active gen.
-func emitObjectAtGen(t *testing.T, enc *S3Encoder, bucket string, gen uint64, object, uploadID string, body []byte) {
+// emitObjectAtGen is a helper for cross-generation and collision
+// tests: emits a manifest + single chunk under an explicit
+// (bucket, gen, uploadID).
+func emitObjectAtGen(t *testing.T, enc *S3Encoder, bucket string, gen uint64, object, uploadID string, body []byte) { //nolint:unparam // bucket varies in newer tests via this helper
 	t.Helper()
 	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
 		"upload_id": uploadID, "size_bytes": int64(len(body)), "parts": []map[string]any{
@@ -502,6 +502,67 @@ func sliceContains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// readKeymapFirstRecord reads the per-bucket KEYMAP.jsonl and returns
+// the first decoded record. Test helper consolidating the JSON+base64
+// dance so individual tests stay under the cyclop cap.
+func readKeymapFirstRecord(t *testing.T, path string) KeymapRecord {
+	t.Helper()
+	body, err := os.ReadFile(path) //nolint:gosec // test path
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var rec KeymapRecord
+	if err := json.Unmarshal(bytes.TrimRight(body, "\n"), &rec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return rec
+}
+
+func TestS3_FileVsDirectoryKeyCollisionGetsLeafDataRename(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	bucket := "b"
+	gen := uint64(1)
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Two objects whose keys are file-vs-directory siblings: S3
+	// permits both, POSIX cannot. Codex P1 #615.
+	emitObjectAtGen(t, enc, bucket, gen, "path/to", "u1", []byte("LEAF"))
+	emitObjectAtGen(t, enc, bucket, gen, "path/to/sub", "u2", []byte("CHILD"))
+	if err := enc.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if string(readBytesFile(t, filepath.Join(root, "s3", bucket, "path/to/sub"))) != "CHILD" {
+		t.Fatalf("child body mismatch")
+	}
+	if string(readBytesFile(t, filepath.Join(root, "s3", bucket, "path/to.elastickv-leaf-data"))) != "LEAF" {
+		t.Fatalf("leaf body mismatch")
+	}
+	rec := readKeymapFirstRecord(t, filepath.Join(root, "s3", bucket, "KEYMAP.jsonl"))
+	if rec.Kind != KindS3LeafData {
+		t.Fatalf("kind=%q", rec.Kind)
+	}
+	orig, err := rec.Original()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(orig) != "path/to" {
+		t.Fatalf("original=%q", orig)
+	}
+}
+
+func readBytesFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path) //nolint:gosec // test path
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return b
 }
 
 func TestS3_VersionedBlobAssembledByPartVersionOrder(t *testing.T) {

@@ -445,6 +445,17 @@ func (s *S3Encoder) flushBucket(b *s3BucketState) error {
 // Split out of flushBucket to keep cyclomatic complexity within the
 // package cap.
 func (s *S3Encoder) flushBucketObjects(b *s3BucketState, bucketDir string) (int, error) {
+	// Pre-compute the set of "directory prefixes" required by the
+	// union of active-gen object keys: for an object "a/b/c" the
+	// directory prefixes "a" and "a/b" are mandatory parent dirs on
+	// the filesystem. An object whose key IS one of those prefixes
+	// (e.g., bucket holds both "a/b" and "a/b/c") cannot share the
+	// natural path with the longer key — POSIX requires that path
+	// be a directory. The design's documented strategy is to rename
+	// the shorter key to "<key>.elastickv-leaf-data" and record the
+	// rename in KEYMAP.jsonl so restore can reverse it. Codex P1
+	// #615.
+	dirPrefixes := s.computeDirPrefixes(b)
 	stale := 0
 	for _, obj := range b.objects {
 		// Suppress objects from older bucket incarnations: when a
@@ -463,11 +474,34 @@ func (s *S3Encoder) flushBucketObjects(b *s3BucketState, bucketDir string) (int,
 			}
 			continue
 		}
-		if err := s.flushObject(b, bucketDir, obj); err != nil {
+		needsLeafDataRename := dirPrefixes[obj.object]
+		if err := s.flushObjectWithCollision(b, bucketDir, obj, needsLeafDataRename); err != nil {
 			return stale, err
 		}
 	}
 	return stale, nil
+}
+
+// computeDirPrefixes returns the set of directory prefixes the union
+// of active-gen object keys requires. For object key "a/b/c" the
+// prefixes are {"a", "a/b"}. The set is consulted at flush time to
+// detect file-vs-directory collisions.
+func (s *S3Encoder) computeDirPrefixes(b *s3BucketState) map[string]bool {
+	out := make(map[string]bool)
+	for _, obj := range b.objects {
+		if b.activeGen != 0 && obj.generation != b.activeGen {
+			continue
+		}
+		key := obj.object
+		// Walk parent directories: split on "/" and accumulate.
+		for i := 0; i < len(key); i++ {
+			if key[i] != '/' {
+				continue
+			}
+			out[key[:i]] = true
+		}
+	}
+	return out
 }
 
 // closeBucketKeymap closes the per-bucket KEYMAP.jsonl writer (if
@@ -485,11 +519,11 @@ func closeBucketKeymap(b *s3BucketState) error {
 	return nil
 }
 
-func (s *S3Encoder) flushObject(b *s3BucketState, bucketDir string, obj *s3ObjectState) error {
+func (s *S3Encoder) flushObjectWithCollision(b *s3BucketState, bucketDir string, obj *s3ObjectState, needsLeafDataRename bool) error {
 	if obj.manifest == nil {
 		return s.flushOrphanObject(b, bucketDir, obj)
 	}
-	objectName, kind, err := s.resolveObjectFilename(b, obj)
+	objectName, kind, err := s.resolveObjectFilename(b, obj, needsLeafDataRename)
 	if err != nil {
 		return err
 	}
@@ -598,7 +632,13 @@ func safeJoinUnderRoot(root, rel string) (string, error) {
 // resolveObjectFilename returns the relative path of the assembled
 // body within the bucket directory, plus the keymap "kind" when a
 // rename took place ("" when the object writes at its natural path).
-func (s *S3Encoder) resolveObjectFilename(b *s3BucketState, obj *s3ObjectState) (string, string, error) {
+//
+// needsLeafDataRename is set by the caller when another active-gen
+// object's key would force this object's natural path to be a
+// directory (e.g., bucket holds both "a/b" and "a/b/c"). The shorter
+// key is renamed to "<key>.elastickv-leaf-data" and recorded in
+// KEYMAP.jsonl with KindS3LeafData. Codex P1 #615.
+func (s *S3Encoder) resolveObjectFilename(b *s3BucketState, obj *s3ObjectState, needsLeafDataRename bool) (string, string, error) {
 	if strings.HasSuffix(obj.object, S3MetaSuffixReserved) {
 		if !s.renameCollisions {
 			return "", "", errors.Wrapf(ErrS3MetaSuffixCollision,
@@ -606,12 +646,12 @@ func (s *S3Encoder) resolveObjectFilename(b *s3BucketState, obj *s3ObjectState) 
 		}
 		return obj.object + ".user-data", KindMetaCollision, nil
 	}
-	// Object path taken at face value. Path collisions (`path/to`
-	// vs `path/to/sub`) are deferred until the master pipeline
-	// detects them across multiple manifests; this PR's per-object
-	// flush trusts the caller's collision detection. Path-traversal
-	// sanitisation runs in safeJoinUnderRoot, downstream of this
-	// function, where the bucket-directory root is in scope.
+	if needsLeafDataRename {
+		return obj.object + S3LeafDataSuffix, KindS3LeafData, nil
+	}
+	// Object path taken at face value. Path-traversal sanitisation
+	// runs in safeJoinUnderRoot, downstream of this function, where
+	// the bucket-directory root is in scope.
 	return obj.object, "", nil
 }
 
