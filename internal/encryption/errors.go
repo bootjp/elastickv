@@ -39,4 +39,20 @@ var (
 	// Surfaced at construction time so a wiring mistake is caught
 	// before the first Encrypt/Decrypt would otherwise nil-deref panic.
 	ErrNilKeystore = errors.New("encryption: keystore is nil")
+
+	// ErrUnsupportedFilesystem indicates the parent directory of the
+	// sidecar cannot guarantee crash-durability of os.Rename via
+	// fsync (typical on NFS, some FUSE mounts). Per §5.1 the
+	// encryption package refuses to start in that situation rather
+	// than silently degrading the durability guarantee. WriteSidecar
+	// wraps any fsync-on-directory failure with this sentinel so the
+	// Stage 5+ startup integration can errors.Is-match it.
+	ErrUnsupportedFilesystem = errors.New("encryption: filesystem does not support durable directory sync (NFS, some FUSE mounts are unsupported)")
+
+	// ErrSidecarActiveKeyMissing indicates the Sidecar has a non-zero
+	// Active.{Storage,Raft} key_id that does not appear in the Keys
+	// map. The two halves are written together by every rotation /
+	// bootstrap path; an Active id without a corresponding wrapped
+	// DEK is malformed input.
+	ErrSidecarActiveKeyMissing = errors.New("encryption: sidecar active key_id has no entry in keys map")
 )
