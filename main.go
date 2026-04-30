@@ -318,7 +318,8 @@ func run() error {
 	sampler := buildKeyVizSampler()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
-		WithSampler(keyVizSamplerForCoordinator(sampler))
+		WithSampler(keyVizSamplerForCoordinator(sampler)).
+		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {
 		return err
@@ -475,6 +476,65 @@ func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[str
 
 func buildLeaderSQS(groups []groupSpec, sqsAddr string, raftSqsMap string) (map[string]string, error) {
 	return buildLeaderAddrMap(groups, sqsAddr, raftSqsMap, parseRaftSQSMap)
+}
+
+// buildSQSPartitionResolver flattens the operator-supplied partition
+// map into the {queue → []groupID} shape adapter consumes and
+// returns a ResolveGroup-capable resolver. Returns nil on an empty
+// map so the coordinator's resolver field stays unset on a non-
+// partitioned cluster — kv.ShardRouter.WithPartitionResolver(nil)
+// is a documented no-op, so the request hot path keeps the existing
+// engine-only dispatch.
+//
+// Return type is the kv.PartitionResolver interface, NOT the
+// concrete *adapter.SQSPartitionResolver, because Go wraps a typed
+// nil pointer into a NON-NIL interface value when the function
+// signature is the concrete type. With a concrete return type, a
+// non-partitioned cluster would carry a non-nil interface whose
+// underlying pointer is nil, the resolver-first short-circuit
+// `s.partitionResolver != nil` would always pass, and every request
+// would pay an extra ResolveGroup call (which the nil-receiver
+// guard makes safe but not free). The interface return type makes
+// the untyped `nil` propagate as a true nil interface.
+//
+// The group-reference parsing here cannot fail in practice because
+// parseSQSFifoGroupList already canonicalized each entry as a
+// uint64 string at flag-parse time; the conversion is repeated
+// defensively so a future caller that bypasses parseSQSFifoGroupList
+// (e.g. a test seeding the map programmatically) gets a clear panic
+// instead of a silent route-to-group-zero.
+func buildSQSPartitionResolver(partitionMap map[string]sqsFifoQueueRouting) kv.PartitionResolver {
+	if len(partitionMap) == 0 {
+		return nil
+	}
+	flat := make(map[string][]uint64, len(partitionMap))
+	for queue, routing := range partitionMap {
+		ids := make([]uint64, 0, len(routing.groups))
+		for _, groupRef := range routing.groups {
+			id, err := strconv.ParseUint(groupRef, 10, 64)
+			if err != nil {
+				// parseSQSFifoGroupList canonicalized this; a
+				// non-uint64 string here means a programmer skipped
+				// the validator. Panic loudly rather than silently
+				// route to group 0.
+				panic(errors.Wrapf(err,
+					"queue %q: bypassed group-ref canonicalisation, %q is not uint64",
+					queue, groupRef))
+			}
+			ids = append(ids, id)
+		}
+		flat[queue] = ids
+	}
+	r := adapter.NewSQSPartitionResolver(flat)
+	if r == nil {
+		// Defensive: NewSQSPartitionResolver returns nil on an
+		// empty input. The len-check above already short-circuits
+		// for empty partitionMap, so reaching this branch means
+		// the canonicalisation collapsed every entry — surface as
+		// a true nil interface, not a typed-nil pointer wrapper.
+		return nil
+	}
+	return r
 }
 
 // buildSQSFifoPartitionMap parses and validates the
