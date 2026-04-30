@@ -411,21 +411,34 @@ func TestWriteSidecar_RejectsActiveKeyMissing(t *testing.T) {
 }
 
 func TestReadSidecar_RejectsActiveKeyMissing(t *testing.T) {
-	path := sidecarPath(t)
-	raw := []byte(`{
+	cases := []struct {
+		name string
+		// active is the JSON object dropped in for "active".
+		active string
+	}{
+		{"storage active without entry", `{"storage": 12345, "raft": 0}`},
+		{"raft active without entry", `{"storage": 0, "raft": 67890}`},
+		{"both active without entries", `{"storage": 11111, "raft": 22222}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := sidecarPath(t)
+			raw := []byte(`{
         "version": 1,
         "raft_applied_index": 0,
         "storage_envelope_active": false,
         "raft_envelope_cutover_index": 0,
-        "active": {"storage": 12345, "raft": 0},
+        "active": ` + tc.active + `,
         "keys": {}
     }`)
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	_, err := encryption.ReadSidecar(path)
-	if !errors.Is(err, encryption.ErrSidecarActiveKeyMissing) {
-		t.Fatalf("expected ErrSidecarActiveKeyMissing, got %v", err)
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			_, err := encryption.ReadSidecar(path)
+			if !errors.Is(err, encryption.ErrSidecarActiveKeyMissing) {
+				t.Fatalf("expected ErrSidecarActiveKeyMissing, got %v", err)
+			}
+		})
 	}
 }
 
