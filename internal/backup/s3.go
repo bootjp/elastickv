@@ -57,11 +57,17 @@ var (
 )
 
 // verifyChunkCompleteness checks every (partNo, partVersion) entry in
-// declaredParts has the right number of chunkNo values present in
-// chunks. Chunks are expected at chunkNo in [0, chunk_count); a
-// missing index in that range surfaces as
+// declaredParts has exactly the set of chunkNo values {0, 1, …,
+// chunk_count-1} present in chunks. Chunks are expected at chunkNo in
+// [0, chunk_count); a missing index in that range surfaces as
 // ErrS3IncompleteBlobChunks rather than letting the assembler emit a
 // truncated body.
+//
+// We track the actual set of seen chunk indexes (not just count and
+// maxIndex) because count + maxIndex alone admits false positives:
+// for declared chunk_count=3, observed `{0, 2, 2}` produces count=3
+// and maxIndex=2 but is missing chunkNo=1, which would silently
+// assemble a corrupted body. Codex P1 round 12.
 //
 // declaredParts == nil means "no contract to verify" — used by tests
 // that pre-date the manifest-parts feature; production callers
@@ -70,31 +76,30 @@ func verifyChunkCompleteness(chunks []s3ChunkKey, declaredParts map[s3PartKey]s3
 	if declaredParts == nil {
 		return nil
 	}
-	// Count present chunks per (partNo, partVersion).
-	type observed struct {
-		count    uint64
-		maxIndex uint64
-	}
-	got := make(map[s3PartKey]observed, len(declaredParts))
+	got := make(map[s3PartKey]map[uint64]struct{}, len(declaredParts))
 	for _, k := range chunks {
 		pk := s3PartKey{partNo: k.partNo, partVersion: k.partVersion}
-		o := got[pk]
-		o.count++
-		if k.chunkNo > o.maxIndex {
-			o.maxIndex = k.chunkNo
+		if got[pk] == nil {
+			got[pk] = make(map[uint64]struct{})
 		}
-		got[pk] = o
+		got[pk][k.chunkNo] = struct{}{}
 	}
 	for pk, want := range declaredParts {
-		o := got[pk]
-		// We accept o.count == want.chunkCount AND
-		// o.maxIndex == chunkCount-1, because a snapshot with N
-		// duplicates of chunkNo=0 would satisfy the count check
-		// alone. Both the count and the highest index must match.
-		if want.chunkCount > 0 && (o.count != want.chunkCount || o.maxIndex+1 != want.chunkCount) {
+		if want.chunkCount == 0 {
+			continue
+		}
+		seen := got[pk]
+		if uint64(len(seen)) != want.chunkCount { //nolint:gosec // bounded
 			return errors.Wrapf(ErrS3IncompleteBlobChunks,
-				"partNo=%d partVersion=%d declared chunks=%d, observed count=%d maxIndex=%d",
-				pk.partNo, pk.partVersion, want.chunkCount, o.count, o.maxIndex)
+				"partNo=%d partVersion=%d declared chunks=%d, observed unique=%d",
+				pk.partNo, pk.partVersion, want.chunkCount, len(seen))
+		}
+		for i := uint64(0); i < want.chunkCount; i++ {
+			if _, ok := seen[i]; !ok {
+				return errors.Wrapf(ErrS3IncompleteBlobChunks,
+					"partNo=%d partVersion=%d declared chunks=%d, missing chunkNo=%d",
+					pk.partNo, pk.partVersion, want.chunkCount, i)
+			}
 		}
 	}
 	return nil

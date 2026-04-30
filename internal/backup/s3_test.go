@@ -779,6 +779,49 @@ func readBytesFile(t *testing.T, path string) []byte {
 	return b
 }
 
+// TestS3_DuplicateChunksWithMissingIndexRejected is the regression
+// for Codex P1 round 12: the previous count-and-maxIndex check
+// admitted false positives. For declared chunk_count=3, observed
+// `{0, 2, 2}` produced count=3 and maxIndex=2 satisfying both
+// thresholds while chunk_no=1 was missing. The set-based check now
+// detects the absent index and surfaces ErrS3IncompleteBlobChunks
+// before assembleObjectBody can emit a corrupted body.
+func TestS3_DuplicateChunksWithMissingIndexRejected(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	bucket := "b"
+	gen := uint64(1)
+	object := "obj"
+	uploadID := "u"
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": uploadID, "size_bytes": 9, "parts": []map[string]any{
+			{"part_no": 1, "size_bytes": 9, "chunk_count": 3},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Drive `{0, 2, 2}`: count satisfies, maxIndex satisfies, but
+	// chunk_no=1 is missing. The set-based validator must reject.
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 0), []byte("AAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 2), []byte("CC1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 2), []byte("CC2")); err != nil {
+		t.Fatal(err)
+	}
+	err := enc.Finalize()
+	if !errors.Is(err, ErrS3IncompleteBlobChunks) {
+		t.Fatalf("err=%v want ErrS3IncompleteBlobChunks for chunk-set with duplicate+missing", err)
+	}
+}
+
 func TestS3_IncompleteChunksRejected(t *testing.T) {
 	t.Parallel()
 	enc, _ := newS3Encoder(t)
