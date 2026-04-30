@@ -2,7 +2,6 @@ package backup
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -104,16 +103,16 @@ type RedisDB struct {
 	stringsTTL *jsonlFile
 	hllTTL     *jsonlFile
 
-	// pendingWideColumnTTL accumulates !redis|ttl| records whose user key
-	// has not been claimed by HandleString / HandleHLL. These are
-	// candidates for hashes/lists/sets/zsets/streams (handled in a
-	// follow-up PR) — for now Finalize logs them via the warning hook
-	// rather than dropping silently. Bounded by maxPendingWideColumnTTL
-	// so a malformed snapshot with millions of orphan TTL records cannot
-	// drive the encoder OOM; the bound is high enough that real
-	// production state (where wide-column type encoders eventually
-	// claim every TTL) is never affected.
-	pendingWideColumnTTL []redisTTLPending
+	// orphanTTLCount counts !redis|ttl| records whose user key has not
+	// been claimed by HandleString / HandleHLL. These are candidates
+	// for hashes/lists/sets/zsets/streams (handled in a follow-up PR)
+	// — for now Finalize logs the count via the warning hook rather
+	// than dropping silently. We deliberately track only the count
+	// (not the keys themselves) because the keys are unused before
+	// the wide-column encoders land; buffering full keys would
+	// allocate proportional to user-key size (up to 1 MiB per key),
+	// and the warning sink only ever reads len(). Codex P2 round 6.
+	orphanTTLCount int
 
 	// dirsCreated caches the per-encoder directories writeBlob and
 	// appendTTL have already MkdirAll'd. Avoids the per-record syscalls
@@ -138,19 +137,6 @@ type RedisDB struct {
 	// care about warnings.
 	warn func(event string, fields ...any)
 }
-
-type redisTTLPending struct {
-	UserKey    []byte
-	ExpireAtMs uint64
-}
-
-// maxPendingWideColumnTTL caps the orphan-TTL buffer. 1M entries is well
-// past anything a real Redis instance produces under normal operation
-// (each entry is ~50 bytes, so the cap is ~50 MiB) but small enough that
-// a snapshot loaded with a billion synthetic !redis|ttl| records cannot
-// drive the encoder OOM. When the cap is hit, HandleTTL drops further
-// orphans and surfaces a structured warning at Finalize.
-const maxPendingWideColumnTTL = 1_000_000
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
 // dbIndex selects <n>; today the producer always passes 0, but accepting
@@ -214,8 +200,8 @@ func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 //   - redisKindHLL    -> hll_ttl.jsonl
 //   - redisKindString -> strings_ttl.jsonl (legacy strings, whose TTL
 //     lives in !redis|ttl| rather than the inline magic-prefix header)
-//   - redisKindUnknown -> buffered as pendingWideColumnTTL; reported via
-//     the warn sink on Finalize because Phase 0a's wide-column encoders
+//   - redisKindUnknown -> counted in orphanTTLCount; reported via the
+//     warn sink on Finalize because Phase 0a's wide-column encoders
 //     have not landed yet.
 func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	expireAtMs, err := decodeRedisTTLValue(value)
@@ -237,17 +223,11 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		}
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 	case redisKindUnknown:
-		// Bounded to prevent OOM on a snapshot that contains a
-		// runaway number of orphan TTL records (e.g., many wide-
-		// column types whose meta records were dropped). After the
-		// cap, additional records are tracked only as a counter via
-		// the warning sink at Finalize.
-		if len(r.pendingWideColumnTTL) < maxPendingWideColumnTTL {
-			r.pendingWideColumnTTL = append(r.pendingWideColumnTTL, redisTTLPending{
-				UserKey:    bytes.Clone(userKey),
-				ExpireAtMs: expireAtMs,
-			})
-		}
+		// Track orphan TTL counts only — keys are unused before the
+		// wide-column encoders land, and buffering them allocates
+		// proportional to user-key size (up to 1 MiB per key) for
+		// no benefit. Codex P2 round 6.
+		r.orphanTTLCount++
 		return nil
 	}
 	return nil
@@ -265,9 +245,9 @@ func (r *RedisDB) Finalize() error {
 	if err := closeJSONL(r.hllTTL); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if r.warn != nil && len(r.pendingWideColumnTTL) > 0 {
+	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
-			"count", len(r.pendingWideColumnTTL),
+			"count", r.orphanTTLCount,
 			"hint", "wide-column type encoders (hash/list/set/zset/stream) have not landed yet")
 	}
 	return firstErr
@@ -408,16 +388,26 @@ func openJSONL(path string) (*jsonlFile, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return nil, cockroachdberr.WithStack(err)
 	}
-	// Refuse to clobber a symlink at the sidecar path. os.Create
-	// follows symlinks and would truncate the target outside the
-	// dump tree. writeFileAtomic already defends blob writes the
-	// same way; sidecar creation must mirror that boundary. Codex P2
-	// round 5.
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, cockroachdberr.WithStack(cockroachdberr.Newf("backup: refusing to overwrite symlink at %s", path))
-	}
-	f, err := os.Create(path) //nolint:gosec // path is composed from output-root + fixed file name
+	// Refuse to clobber a symlink at the sidecar path. The earlier
+	// Lstat-then-Create pattern was a TOCTOU race: a process that
+	// could write the output directory could swap the path to a
+	// symlink between the two syscalls and still get the target
+	// truncated (Codex P1 round 6, follow-up to round 5). Use
+	// O_NOFOLLOW so the open syscall itself refuses symlinks
+	// atomically — no race window exists. On platforms where the
+	// kernel supports it (Linux, macOS, BSD) this returns ELOOP for
+	// a symlink path. On Windows syscall.O_NOFOLLOW is 0 (no-op),
+	// matching Windows's different filesystem-permission model.
+	const flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | syscall.O_NOFOLLOW
+	f, err := os.OpenFile(path, flag, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode for sidecar files
 	if err != nil {
+		// errors.Is(err, syscall.ELOOP) catches symlink rejection
+		// on Linux/macOS/BSD; wrap rather than replace so the
+		// caller can still inspect the underlying syscall error.
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, cockroachdberr.WithStack(cockroachdberr.Wrapf(err,
+				"backup: refusing to overwrite symlink at %s", path))
+		}
 		return nil, cockroachdberr.WithStack(err)
 	}
 	bw := bufio.NewWriterSize(f, redisJSONLBufSize)

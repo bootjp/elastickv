@@ -199,10 +199,11 @@ func TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex(t *testing.T) {
 }
 
 // TestRedisDB_OpenJSONLRefusesSymlinkOverwrite is the regression for Codex
-// P2 round 5: openJSONL must mirror writeFileAtomic's symlink defence —
-// a `strings_ttl.jsonl` (or `hll_ttl.jsonl`) symlink in the output tree
-// would otherwise be followed by os.Create and the target outside the
-// dump tree truncated.
+// P2 round 5 + P1 round 6: openJSONL must atomically refuse to follow
+// symlinks. The earlier Lstat-then-Create variant left a TOCTOU window
+// where a process that could write the output directory could swap the
+// path to a symlink between the two syscalls; the round-6 fix uses
+// O_NOFOLLOW on the open itself so the kernel returns ELOOP atomically.
 func TestRedisDB_OpenJSONLRefusesSymlinkOverwrite(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
@@ -365,33 +366,25 @@ func TestRedisDB_PerDBIndexRoutesIntoOwnDirectory(t *testing.T) {
 	}
 }
 
-func TestRedisDB_PendingWideColumnTTLBounded(t *testing.T) {
+func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
 	t.Parallel()
-	// Stub the cap small enough to exercise it without burning seconds
-	// on the test. We can't override the package constant; instead
-	// drive the RedisDB to the public bound and assert we don't crash
-	// or grow without limit. The cap is 1M; the test verifies a few
-	// past it are dropped silently (no error, no crash) and the
-	// observed slice length matches the cap.
-	if maxPendingWideColumnTTL > 1_000_000 {
-		t.Skipf("cap too high for this fast test: %d", maxPendingWideColumnTTL)
-	}
+	// Codex P2 round 6: orphan TTL records (those with no prior
+	// HandleString/HandleHLL claim) must be counted only — the
+	// per-key payload would allocate proportional to user-key size
+	// and is unused before the wide-column encoders land. Drive a
+	// sample of orphan records and assert the count, not a buffer.
 	db, _ := newRedisDB(t)
-	// Drive a small sample (10000) of orphan TTL records through
-	// HandleTTL — well under the cap — and confirm they all land.
-	for i := 0; i < 10_000; i++ {
+	const n = 10_000
+	for i := 0; i < n; i++ {
 		key := []byte("orphan-" + intToDecimal(i))
-		ms := uint64(i) + 1 //nolint:gosec // i bounded to 10_000, never negative
+		ms := uint64(i) + 1 //nolint:gosec // i bounded to n, never negative
 		if err := db.HandleTTL(key, encodeTTLValue(ms)); err != nil {
 			t.Fatalf("HandleTTL[%d]: %v", i, err)
 		}
 	}
-	if len(db.pendingWideColumnTTL) != 10_000 {
-		t.Fatalf("pending len = %d", len(db.pendingWideColumnTTL))
+	if db.orphanTTLCount != n {
+		t.Fatalf("orphanTTLCount = %d, want %d", db.orphanTTLCount, n)
 	}
-	// The bound itself is asserted in package-level review notes; a
-	// 1M-record stress test in CI would be wasteful for a constant
-	// the linter and the implementation already guarantee.
 }
 
 func TestRedisDB_DirsCreatedCachesMkdirAll(t *testing.T) {
