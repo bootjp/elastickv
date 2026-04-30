@@ -173,6 +173,62 @@ func assertTTLSidecar(t *testing.T, path string, wantKey string, wantMs uint64) 
 	}
 }
 
+// TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex is the regression
+// for Codex P1 round 5: the live Redis encoder emits both `!redis|str|<k>`
+// (with TTL embedded inline in the magic-prefix header) and the scan-index
+// `!redis|ttl|<k>` for every expiring string. The backup decoder must
+// recognise that HandleString already wrote the strings_ttl.jsonl record
+// and drop the redundant !redis|ttl| record. Otherwise the same expiring
+// string is duplicated in the sidecar, breaking the one-record-per-key
+// contract.
+func TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	mustNoErr := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Snapshot lex order: !redis|str|<k> comes before !redis|ttl|<k>
+	// (because 's' < 't'). Mirror that sequence here.
+	mustNoErr(db.HandleString([]byte("expiring"), encodeNewStringValue(t, []byte("v"), fixedExpireMs)))
+	mustNoErr(db.HandleTTL([]byte("expiring"), encodeTTLValue(fixedExpireMs)))
+	mustNoErr(db.Finalize())
+	assertTTLSidecar(t, filepath.Join(root, "redis", "db_0", "strings_ttl.jsonl"), "expiring", fixedExpireMs)
+}
+
+// TestRedisDB_OpenJSONLRefusesSymlinkOverwrite is the regression for Codex
+// P2 round 5: openJSONL must mirror writeFileAtomic's symlink defence —
+// a `strings_ttl.jsonl` (or `hll_ttl.jsonl`) symlink in the output tree
+// would otherwise be followed by os.Create and the target outside the
+// dump tree truncated.
+func TestRedisDB_OpenJSONLRefusesSymlinkOverwrite(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	dir := filepath.Join(root, "redis", "db_0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bait := filepath.Join(root, "bait-jsonl")
+	if err := os.WriteFile(bait, []byte("stay-out"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bait, filepath.Join(dir, redisStringsTTLFile)); err != nil {
+		t.Fatal(err)
+	}
+	// HandleString with TTL triggers the first openJSONL on
+	// strings_ttl.jsonl, which must refuse the symlink rather than
+	// truncate the bait target.
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), fixedExpireMs))
+	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite symlink") {
+		t.Fatalf("expected symlink-refusal error from openJSONL, got %v", err)
+	}
+	if got, _ := os.ReadFile(bait); string(got) != "stay-out" { //nolint:gosec // test path
+		t.Fatalf("bait file written through symlink: %q", got)
+	}
+}
+
 func TestRedisDB_HandleTTL_RoutesByPriorTypeObservation(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
