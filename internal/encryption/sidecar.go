@@ -130,12 +130,36 @@ func ReadSidecar(path string) (*Sidecar, error) {
 }
 
 // validateSidecar enforces the constraints ReadSidecar applies after
-// successful JSON unmarshal.
+// successful JSON unmarshal. Same predicate is run by WriteSidecar
+// before the on-disk write so a malformed sidecar cannot land on disk
+// via this package.
 func validateSidecar(sc *Sidecar) error {
 	for idStr, k := range sc.Keys {
 		if err := validateSidecarKey(idStr, k); err != nil {
 			return err
 		}
+	}
+	// Active.Storage / Active.Raft, when non-zero, must reference an
+	// entry that actually exists in Keys. Rotation and bootstrap paths
+	// always write the wrapped DEK and the Active pointer together; an
+	// Active id without a corresponding entry is malformed input.
+	if err := requireActiveKey(sc, "storage", sc.Active.Storage); err != nil {
+		return err
+	}
+	if err := requireActiveKey(sc, "raft", sc.Active.Raft); err != nil {
+		return err
+	}
+	return nil
+}
+
+func requireActiveKey(sc *Sidecar, purpose string, id uint32) error {
+	if id == ReservedKeyID {
+		return nil // not bootstrapped for this purpose; nothing to check
+	}
+	idStr := strconv.FormatUint(uint64(id), 10)
+	if _, ok := sc.Keys[idStr]; !ok {
+		return pkgerrors.Wrapf(ErrSidecarActiveKeyMissing,
+			"active.%s=%d not present in keys map", purpose, id)
 	}
 	return nil
 }
@@ -177,12 +201,17 @@ func WriteSidecar(path string, sc *Sidecar) (retErr error) {
 	if sc == nil {
 		return pkgerrors.New("encryption: WriteSidecar: sc is nil")
 	}
-	sc.Version = SidecarVersion
-	if err := validateSidecar(sc); err != nil {
+	// Operate on a shallow copy so the caller's Version field (and any
+	// other future field WriteSidecar might fill in) is not mutated as
+	// a side effect. Sidecar.Keys is a map and is shared by the copy,
+	// but validateSidecar / json.Marshal are read-only over it.
+	scCopy := *sc
+	scCopy.Version = SidecarVersion
+	if err := validateSidecar(&scCopy); err != nil {
 		return pkgerrors.Wrap(err, "encryption: validate before write")
 	}
 
-	data, err := json.MarshalIndent(sc, "", "  ")
+	data, err := json.MarshalIndent(&scCopy, "", "  ")
 	if err != nil {
 		return pkgerrors.Wrap(err, "encryption: marshal sidecar")
 	}
@@ -190,36 +219,62 @@ func WriteSidecar(path string, sc *Sidecar) (retErr error) {
 	dir := filepath.Dir(path)
 	tmpPath := filepath.Join(dir, filepath.Base(path)+".tmp")
 
-	if err := writeTmpAndFsync(tmpPath, data); err != nil {
-		return err
-	}
-	// Best-effort cleanup of the tmp file if anything below fails. On
-	// the success path it has already been renamed and removal is a
-	// no-op.
+	// Best-effort cleanup of the tmp file if anything below fails. The
+	// defer is registered BEFORE writeTmpAndFsync so a write/fsync
+	// failure inside that helper does not leak the .tmp file. On the
+	// success path the tmp has already been renamed and os.Remove is
+	// a no-op (ENOENT, ignored).
 	defer func() {
 		if retErr != nil {
 			_ = os.Remove(tmpPath)
 		}
 	}()
 
+	if err := writeTmpAndFsync(tmpPath, data); err != nil {
+		return err
+	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return pkgerrors.Wrapf(err, "encryption: rename %q -> %q", tmpPath, path)
 	}
 	if err := syncDir(dir); err != nil {
-		return pkgerrors.Wrapf(err, "encryption: fsync dir %q", dir)
+		return err
 	}
 	return nil
 }
 
-// writeTmpAndFsync writes data into tmpPath and fsyncs the file.
-// Helper exists so WriteSidecar does not nest its own defer-on-error
-// inside the rename block.
-func writeTmpAndFsync(tmpPath string, data []byte) error {
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, sidecarFileMode)
+// writeTmpAndFsync writes data into tmpPath at sidecarFileMode and
+// fsyncs the file before returning. The function is responsible for
+// the per-step §5.1 durability sequence; WriteSidecar handles the
+// rename and parent-directory fsync that come after.
+//
+// Security note (PR #722 codex P2): pre-existing tmp files are
+// removed before opening, then re-created with O_EXCL so the mode is
+// guaranteed to be sidecarFileMode (0o600). Without this, a
+// pre-existing tmp file at 0o666 (e.g., from older tooling, manual
+// poking, or a crash that left perm bits broader than expected)
+// would carry its permissive mode through os.Rename into the
+// production keys.json, defeating the wrapped-DEK file-mode
+// guarantee documented in §5.1.
+//
+// Close errors are propagated via the named return: f.Close failing
+// after a successful Sync is rare but still reported, so an FD-leak
+// or write-back failure is not silently dropped.
+func writeTmpAndFsync(tmpPath string, data []byte) (retErr error) {
+	// Defence-in-depth: drop any pre-existing tmp before O_EXCL so
+	// the new file is created fresh with our mode and ownership.
+	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return pkgerrors.Wrapf(err, "encryption: remove stale tmp %q", tmpPath)
+	}
+	f, err := os.OpenFile(tmpPath,
+		os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_EXCL, sidecarFileMode)
 	if err != nil {
 		return pkgerrors.Wrapf(err, "encryption: open %q", tmpPath)
 	}
-	defer func() { _ = f.Close() }()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && retErr == nil {
+			retErr = pkgerrors.Wrapf(closeErr, "encryption: close %q", tmpPath)
+		}
+	}()
 
 	if _, err := f.Write(data); err != nil {
 		return pkgerrors.Wrapf(err, "encryption: write %q", tmpPath)
@@ -234,9 +289,10 @@ func writeTmpAndFsync(tmpPath string, data []byte) error {
 //
 // On most POSIX filesystems this is what makes os.Rename durable. Some
 // environments (NFS, certain FUSE mounts) return an error rather than
-// silently treating it as a no-op; the caller must surface that error
-// — the §5.1 protocol explicitly refuses to start on filesystems that
-// cannot guarantee durability of the rename.
+// silently treating it as a no-op; per §5.1 the encryption package
+// refuses to start on those filesystems. syncDir wraps the underlying
+// fsync error with ErrUnsupportedFilesystem so the Stage 5+ startup
+// integration can errors.Is-match it without parsing strings.
 func syncDir(dir string) error {
 	f, err := os.Open(dir) //nolint:gosec // dir comes from operator config
 	if err != nil {
@@ -244,7 +300,9 @@ func syncDir(dir string) error {
 	}
 	defer func() { _ = f.Close() }()
 	if err := f.Sync(); err != nil {
-		return pkgerrors.Wrapf(err, "encryption: fsync dir %q", dir)
+		return pkgerrors.Wrapf(
+			pkgerrors.WithSecondaryError(ErrUnsupportedFilesystem, err),
+			"encryption: fsync dir %q", dir)
 	}
 	return nil
 }
