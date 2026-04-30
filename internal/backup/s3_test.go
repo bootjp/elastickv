@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/cockroachdb/errors"
@@ -282,6 +283,95 @@ func TestS3_PathTraversalAttemptRejected(t *testing.T) {
 	err := enc.Finalize()
 	if !errors.Is(err, ErrS3MalformedKey) {
 		t.Fatalf("err=%v want ErrS3MalformedKey for path-traversal key", err)
+	}
+}
+
+// TestS3_LeafDataRenameRejectsCollidingUserKey is the regression for
+// Codex P1 round 9: when a bucket holds both `path/to` and
+// `path/to/sub`, the leaf-data rename strategy rewrites `path/to` to
+// `path/to.elastickv-leaf-data`. If a third real object key
+// `path/to.elastickv-leaf-data` also exists in the same bucket, the
+// rename target collides and finalize would last-flush-wins one of
+// the two distinct objects without a KEYMAP record. resolveObjectFilename
+// now refuses the rename and surfaces ErrS3MetaSuffixCollision.
+func TestS3_LeafDataRenameRejectsCollidingUserKey(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	emitObject(t, enc, "b", 1, "path/to", []byte("a"), "")
+	emitObject(t, enc, "b", 1, "path/to/sub", []byte("b"), "")
+	emitObject(t, enc, "b", 1, "path/to.elastickv-leaf-data", []byte("c"), "")
+	err := enc.Finalize()
+	if !errors.Is(err, ErrS3MetaSuffixCollision) {
+		t.Fatalf("err=%v want ErrS3MetaSuffixCollision (leaf-data rename target collides with real key)", err)
+	}
+}
+
+// TestS3_MetaSuffixRenameRejectsCollidingUserKey is the regression
+// for Codex P1 round 9 (sibling case): rename-collisions mode rewrites
+// `evil.elastickv-meta.json` to `evil.elastickv-meta.json.user-data`.
+// If `evil.elastickv-meta.json.user-data` is itself a real key in
+// the same bucket the rename target collides and one object is
+// silently lost. The rename now refuses with ErrS3MetaSuffixCollision.
+func TestS3_MetaSuffixRenameRejectsCollidingUserKey(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	enc.WithRenameCollisions(true)
+	emitObject(t, enc, "b", 1, "evil.elastickv-meta.json", []byte("a"), "")
+	emitObject(t, enc, "b", 1, "evil.elastickv-meta.json.user-data", []byte("b"), "")
+	err := enc.Finalize()
+	if !errors.Is(err, ErrS3MetaSuffixCollision) {
+		t.Fatalf("err=%v want ErrS3MetaSuffixCollision (meta-suffix rename target collides)", err)
+	}
+}
+
+// TestS3_LastModifiedSidecarPopulated is the regression for Codex P2
+// round 9: the live manifest's last_modified_hlc was being decoded
+// but never copied into s3PublicManifest.LastModified. The sidecar
+// JSON now carries the millisecond half of the HLC formatted as
+// RFC3339Nano UTC, matching S3 HEAD `Last-Modified` semantics.
+func TestS3_LastModifiedSidecarPopulated(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	bucket := "b"
+	gen := uint64(1)
+	object := "obj"
+	uploadID := "u"
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	const ms = uint64(1_745_884_800_000) // 2025-04-28T20:00:00Z
+	hlc := ms << 16
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id":         uploadID,
+		"size_bytes":        4,
+		"last_modified_hlc": hlc,
+		"parts": []map[string]any{
+			{"part_no": 1, "size_bytes": 4, "chunk_count": 1},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 0), []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	sidecarPath := filepath.Join(root, "s3", bucket, object+S3MetaSuffixReserved)
+	raw, err := os.ReadFile(sidecarPath) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sidecar map[string]any
+	if err := json.Unmarshal(raw, &sidecar); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := sidecar["last_modified"].(string)
+	want := time.UnixMilli(int64(ms)).UTC().Format(time.RFC3339Nano) //nolint:gosec // test fixture
+	if got != want {
+		t.Fatalf("last_modified = %q want %q", got, want)
 	}
 }
 

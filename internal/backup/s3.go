@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/cockroachdb/errors"
@@ -250,6 +251,28 @@ type s3PublicManifest struct {
 // just enough to decode the JSON value. Fields the dump format
 // drops are still parsed (so unknown-fields default-tolerance is
 // preserved) but elided from the public sidecar.
+// formatHLCAsRFC3339Nano renders the millisecond half of an HLC
+// (the upper 48 bits, see kv/hlc.go) as an RFC3339Nano UTC string
+// for the `last_modified` sidecar field. Restore tools compare
+// these timestamps to S3 HEAD `Last-Modified` semantics, which is
+// millisecond-resolution UTC. HLC zero (no last_modified_hlc on
+// the live record) maps to "" so omitempty drops the field rather
+// than emitting "1970-01-01T00:00:00Z" — which would mislead
+// consumers about the object's age. Codex P2 round 9.
+func formatHLCAsRFC3339Nano(hlc uint64) string {
+	if hlc == 0 {
+		return ""
+	}
+	ms := int64(hlc >> hlcLogicalBitsForBackupS3) //nolint:gosec // bit-shift is safe; HLC is bounded
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano)
+}
+
+// hlcLogicalBitsForBackupS3 mirrors kv/hlc.go:hlcLogicalBits. We keep
+// the literal here (and in a single place via this name) rather than
+// importing the kv package because the backup package is meant to
+// stay decoupled from the live cluster's internals.
+const hlcLogicalBitsForBackupS3 = 16
+
 type s3LiveManifest struct {
 	UploadID           string            `json:"upload_id"`
 	ETag               string            `json:"etag"`
@@ -361,6 +384,7 @@ func (s *S3Encoder) HandleObjectManifest(key, value []byte) error {
 		FormatVersion:      1,
 		ETag:               live.ETag,
 		SizeBytes:          live.SizeBytes,
+		LastModified:       formatHLCAsRFC3339Nano(live.LastModifiedHLC),
 		ContentType:        live.ContentType,
 		ContentEncoding:    live.ContentEncoding,
 		CacheControl:       live.CacheControl,
@@ -521,6 +545,7 @@ func (s *S3Encoder) flushBucketObjects(b *s3BucketState, bucketDir string) (int,
 	// rename in KEYMAP.jsonl so restore can reverse it. Codex P1
 	// #615.
 	dirPrefixes := s.computeDirPrefixes(b)
+	objectKeys := s.computeActiveGenObjectKeys(b)
 	stale := 0
 	for _, obj := range b.objects {
 		// Suppress objects from older bucket incarnations: when a
@@ -540,11 +565,28 @@ func (s *S3Encoder) flushBucketObjects(b *s3BucketState, bucketDir string) (int,
 			continue
 		}
 		needsLeafDataRename := dirPrefixes[obj.object]
-		if err := s.flushObjectWithCollision(b, bucketDir, obj, needsLeafDataRename); err != nil {
+		if err := s.flushObjectWithCollision(b, bucketDir, obj, needsLeafDataRename, objectKeys); err != nil {
 			return stale, err
 		}
 	}
 	return stale, nil
+}
+
+// computeActiveGenObjectKeys returns the set of every active-gen
+// object key in the bucket. resolveObjectFilename consults this set
+// so a rename target (`.user-data` or `.elastickv-leaf-data`) that
+// happens to match a real object key surfaces an error instead of
+// silently merging two distinct objects onto one filesystem path
+// (Codex P1 round 9).
+func (s *S3Encoder) computeActiveGenObjectKeys(b *s3BucketState) map[string]bool {
+	out := make(map[string]bool, len(b.objects))
+	for _, obj := range b.objects {
+		if b.activeGen != 0 && obj.generation != b.activeGen {
+			continue
+		}
+		out[obj.object] = true
+	}
+	return out
 }
 
 // computeDirPrefixes returns the set of directory prefixes the union
@@ -593,11 +635,11 @@ func closeBucketKeymap(b *s3BucketState) error {
 	return flushErr
 }
 
-func (s *S3Encoder) flushObjectWithCollision(b *s3BucketState, bucketDir string, obj *s3ObjectState, needsLeafDataRename bool) error {
+func (s *S3Encoder) flushObjectWithCollision(b *s3BucketState, bucketDir string, obj *s3ObjectState, needsLeafDataRename bool, objectKeys map[string]bool) error {
 	if obj.manifest == nil {
 		return s.flushOrphanObject(b, bucketDir, obj)
 	}
-	objectName, kind, err := s.resolveObjectFilename(b, obj, needsLeafDataRename)
+	objectName, kind, err := s.resolveObjectFilename(b, obj, needsLeafDataRename, objectKeys)
 	if err != nil {
 		return err
 	}
@@ -740,16 +782,37 @@ func safeJoinUnderRoot(root, rel string) (string, error) {
 // directory (e.g., bucket holds both "a/b" and "a/b/c"). The shorter
 // key is renamed to "<key>.elastickv-leaf-data" and recorded in
 // KEYMAP.jsonl with KindS3LeafData. Codex P1 #615.
-func (s *S3Encoder) resolveObjectFilename(b *s3BucketState, obj *s3ObjectState, needsLeafDataRename bool) (string, string, error) {
+//
+// objectKeys is the set of every active-gen object key in the bucket
+// (including obj.object itself). Both rename strategies — meta-suffix
+// `.user-data` and leaf-data `.elastickv-leaf-data` — must refuse to
+// emit if their target collides with an existing real object key in
+// the same bucket: otherwise two distinct keys would map to one
+// filesystem path and finalize would last-flush-wins one of them
+// without a KEYMAP record that could reverse the merge. Codex P1
+// round 9.
+func (s *S3Encoder) resolveObjectFilename(b *s3BucketState, obj *s3ObjectState, needsLeafDataRename bool, objectKeys map[string]bool) (string, string, error) {
 	if strings.HasSuffix(obj.object, S3MetaSuffixReserved) {
 		if !s.renameCollisions {
 			return "", "", errors.Wrapf(ErrS3MetaSuffixCollision,
 				"bucket %q object %q", b.name, obj.object)
 		}
-		return obj.object + ".user-data", KindMetaCollision, nil
+		target := obj.object + ".user-data"
+		if objectKeys[target] {
+			return "", "", errors.Wrapf(ErrS3MetaSuffixCollision,
+				"bucket %q object %q rename target %q is also a real object key (rename in S3 first)",
+				b.name, obj.object, target)
+		}
+		return target, KindMetaCollision, nil
 	}
 	if needsLeafDataRename {
-		return obj.object + S3LeafDataSuffix, KindS3LeafData, nil
+		target := obj.object + S3LeafDataSuffix
+		if objectKeys[target] {
+			return "", "", errors.Wrapf(ErrS3MetaSuffixCollision,
+				"bucket %q object %q leaf-data rename target %q is also a real object key (rename in S3 first)",
+				b.name, obj.object, target)
+		}
+		return target, KindS3LeafData, nil
 	}
 	// Object path taken at face value. Path-traversal sanitisation
 	// runs in safeJoinUnderRoot, downstream of this function, where
