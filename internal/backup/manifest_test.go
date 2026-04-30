@@ -141,10 +141,13 @@ func TestReadManifest_RejectsZeroFormatVersion(t *testing.T) {
 	}
 }
 
-func TestReadManifest_RejectsUnknownFields(t *testing.T) {
+func TestReadManifest_AcceptsUnknownFieldsForSameMajorMinorEvolution(t *testing.T) {
 	t.Parallel()
-	// Format drift safety: an unknown field surfaces loudly rather than
-	// being silently ignored.
+	// Same-major minor evolution: a newer producer adds an optional
+	// field; older readers must silently ignore it rather than fail
+	// the read. Codex P1 #205 (round 2) caught the earlier
+	// DisallowUnknownFields strictness which broke the documented
+	// same-major compatibility model.
 	body := `{
 		"format_version": 1,
 		"phase": "phase0-snapshot-decode",
@@ -158,11 +161,14 @@ func TestReadManifest_RejectsUnknownFields(t *testing.T) {
 		"s3_meta_suffix": ".elastickv-meta.json",
 		"s3_collision_strategy": "leaf-data-suffix",
 		"dynamodb_layout": "per-item",
-		"unknown_field": "ahoy"
+		"future_optional_field": "added in v1.minor"
 	}`
-	_, err := ReadManifest(strings.NewReader(body))
-	if !errors.Is(err, ErrInvalidManifest) {
-		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	got, err := ReadManifest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("unknown optional field must be silently accepted: %v", err)
+	}
+	if got.FormatVersion != 1 {
+		t.Fatalf("format_version = %d", got.FormatVersion)
 	}
 }
 

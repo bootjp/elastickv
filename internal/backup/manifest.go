@@ -202,7 +202,17 @@ func WriteManifest(w io.Writer, m Manifest) error {
 func ReadManifest(r io.Reader) (Manifest, error) {
 	var m Manifest
 	dec := json.NewDecoder(r)
-	dec.DisallowUnknownFields() // surface format drift loudly
+	// We intentionally do NOT call DisallowUnknownFields here.
+	// The format-version contract (Codex P1, follow-up) is:
+	//   - format_version > CurrentFormatVersion -> hard refuse
+	//     (the major break signal)
+	//   - format_version == CurrentFormatVersion AND extra unknown
+	//     fields appear -> a newer minor version added them; the
+	//     older reader silently ignores. That's the documented
+	//     same-major minor-evolution path.
+	// Rejecting unknown fields outright would turn every minor
+	// optional-field addition into a hard read failure during
+	// mixed-version operation.
 	if err := dec.Decode(&m); err != nil {
 		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
 	}
