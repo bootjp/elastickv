@@ -274,6 +274,129 @@ func TestS3_DefaultDoesNotEmitIncompleteUploads(t *testing.T) {
 	}
 }
 
+func TestS3_PathTraversalAttemptRejected(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	emitObject(t, enc, "b", 1, "../../../etc/passwd-attack", []byte("evil"), "")
+	err := enc.Finalize()
+	if !errors.Is(err, ErrS3MalformedKey) {
+		t.Fatalf("err=%v want ErrS3MalformedKey for path-traversal key", err)
+	}
+}
+
+func TestS3_AbsolutePathObjectKeyConfinedUnderBucket(t *testing.T) {
+	t.Parallel()
+	// filepath.Join normalises a leading "/" on the second arg, so
+	// "/etc/host" becomes "<bucketDir>/etc/host" — under the bucket
+	// root, not at filesystem root. This is safe (the user gets a
+	// surprising-but-confined path) and matches what `aws s3 sync`
+	// would round-trip back. We assert the safe outcome rather than
+	// rejecting; rejection would surprise operators with legitimate
+	// keys whose first byte is '/'.
+	enc, root := newS3Encoder(t)
+	emitObject(t, enc, "b", 1, "/etc/host-confined", []byte("ok"), "")
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "s3", "b", "etc", "host-confined")) //nolint:gosec
+	if err != nil {
+		t.Fatalf("absolute-path key must end up under the bucket dir: %v", err)
+	}
+	if string(got) != "ok" {
+		t.Fatalf("body=%q", got)
+	}
+}
+
+func TestS3_StaleUploadIDChunksFilteredFromAssembledBody(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	bucket := "b"
+	gen := uint64(1)
+	object := "obj"
+	uploadActive := "u-active"
+	uploadStale := "u-stale"
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": uploadActive, "size_bytes": 5, "parts": []map[string]any{
+			{"part_no": 1, "size_bytes": 5, "chunk_count": 1},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Stale chunk from a prior upload attempt — must NOT be merged
+	// into the assembled body.
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadStale, 1, 0), []byte("STALE")); err != nil {
+		t.Fatal(err)
+	}
+	// Active chunk for the manifest's uploadID.
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadActive, 1, 0), []byte("OKBYE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "s3", bucket, object)) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "OKBYE" {
+		t.Fatalf("body = %q want %q (stale upload-id chunk leaked into body)", got, "OKBYE")
+	}
+}
+
+func TestS3_IncompleteUploadsAppendsAcrossCalls(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	enc.WithIncludeIncompleteUploads(true)
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey("b"), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": "b", "generation": 1,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		key := s3keys.UploadMetaKey("b", 1, "obj", "u-"+string(rune('a'+i)))
+		if err := enc.HandleIncompleteUpload(S3UploadMetaPrefix, key, []byte("payload")); err != nil {
+			t.Fatalf("HandleIncompleteUpload[%d]: %v", i, err)
+		}
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "s3", "b", "_incomplete_uploads", "records.jsonl")) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Count(body, []byte("\n"))
+	if lines != 3 {
+		t.Fatalf("records.jsonl has %d lines want 3 — re-open per call truncated previous records", lines)
+	}
+}
+
+func TestS3_OrphanChunksWrittenWhenIncludeOrphans(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	enc.WithIncludeOrphans(true)
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey("b"), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": "b", "generation": 1,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey("b", 1, "ghost", "u", 1, 0), []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "s3", "b", "_orphans", EncodeSegment([]byte("ghost")))
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("expected _orphans dir under --include-orphans: %v", err)
+	}
+}
+
 func TestS3_VersionedBlobAssembledByPartVersionOrder(t *testing.T) {
 	t.Parallel()
 	enc, root := newS3Encoder(t)

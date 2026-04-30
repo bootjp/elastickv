@@ -94,14 +94,33 @@ type s3BucketState struct {
 	objects   map[string]*s3ObjectState // keyed by "object\x00generation"
 	keymap    *KeymapWriter
 	keymapDir string
+	// incompleteUploadsJL is opened lazily on the first
+	// !s3|upload|meta or !s3|upload|part record under
+	// --include-incomplete-uploads, then reused for every subsequent
+	// record in the same bucket and closed in flushBucket. Without
+	// this caching, the prior code re-opened (truncating!) the file
+	// on every record, leaving only the last record on disk and
+	// silently losing forensic data — flagged as Codex P2 #318.
+	incompleteUploadsJL *jsonlFile
 }
 
 type s3ObjectState struct {
 	bucket     string
 	generation uint64
 	object     string
-	manifest   *s3PublicManifest
-	// chunkPaths maps (uploadID, partNo, chunkNo) -> scratch path.
+	// uploadID is the manifest's `upload_id`. Set by HandleObjectManifest;
+	// consumed by assembleObjectBody to filter chunkPaths so a stale
+	// upload's blob chunks (still in the snapshot during a delete/retry
+	// window) cannot be merged into the active body — Codex P1 #500,
+	// Gemini HIGH #106/#476/#504.
+	uploadID string
+	// scratchDirCreated avoids the per-blob MkdirAll syscall flagged
+	// by Gemini MEDIUM #285. The scratch directory for this object is
+	// created exactly once on the first HandleBlob call.
+	scratchDirCreated bool
+	manifest          *s3PublicManifest
+	// chunkPaths maps (uploadID, partNo, chunkNo, partVersion) ->
+	// scratch path.
 	chunkPaths map[s3ChunkKey]string
 }
 
@@ -261,12 +280,13 @@ func (s *S3Encoder) HandleObjectManifest(key, value []byte) error {
 		ContentDisposition: live.ContentDisposition,
 		UserMetadata:       live.UserMetadata,
 	}
-	// Persist the parts list on the object state so Finalize knows
-	// what to assemble. We attach the live parts directly because
-	// that's purely structural data — the public sidecar has no need
-	// for them.
+	// Capture the manifest's uploadID so assembleObjectBody can
+	// filter blob chunks belonging to other (stale or in-flight)
+	// upload attempts. The live parts list is purely structural —
+	// the public sidecar has no need for it, but its uploadID is
+	// the load-bearing detail.
+	st.uploadID = live.UploadID
 	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
-	st.attachManifestParts(live.UploadID, live.Parts)
 	return nil
 }
 
@@ -280,8 +300,11 @@ func (s *S3Encoder) HandleBlob(key, value []byte) error {
 	}
 	st := s.objectState(bucket, gen, object)
 	dir := filepath.Join(s.scratchRoot, EncodeSegment([]byte(bucket)), EncodeSegment([]byte(object)))
-	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
-		return errors.WithStack(err)
+	if !st.scratchDirCreated {
+		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
+			return errors.WithStack(err)
+		}
+		st.scratchDirCreated = true
 	}
 	path := filepath.Join(dir, blobScratchName(uploadID, partNo, chunkNo, partVersion))
 	if err := writeFileAtomic(path, value); err != nil {
@@ -293,8 +316,14 @@ func (s *S3Encoder) HandleBlob(key, value []byte) error {
 }
 
 // HandleIncompleteUpload routes !s3|upload|meta|/!s3|upload|part|
-// records to <bucket>/_incomplete_uploads/ when the include flag is
-// on; otherwise drops them.
+// records to <bucket>/_incomplete_uploads/records.jsonl when the
+// include flag is on; otherwise drops them.
+//
+// The output writer is opened once per bucket on the first record and
+// cached on s3BucketState. Re-opening per record (the prior
+// implementation) used create/truncate semantics, so each call wiped
+// the file and only the last record survived — Codex P2 #318 / Gemini
+// HIGH+MEDIUM #318.
 func (s *S3Encoder) HandleIncompleteUpload(prefix string, key, value []byte) error {
 	if !s.includeIncompleteUploads {
 		return nil
@@ -303,25 +332,24 @@ func (s *S3Encoder) HandleIncompleteUpload(prefix string, key, value []byte) err
 	if !ok {
 		return errors.Wrapf(ErrS3MalformedKey, "upload-family key: %q", key)
 	}
-	dir := filepath.Join(s.outRoot, "s3", EncodeSegment([]byte(bucket)), "_incomplete_uploads")
-	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
-		return errors.WithStack(err)
+	b := s.bucketState(bucket)
+	if b.incompleteUploadsJL == nil {
+		dir := filepath.Join(s.outRoot, "s3", EncodeSegment([]byte(bucket)), "_incomplete_uploads")
+		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
+			return errors.WithStack(err)
+		}
+		jl, err := openJSONL(filepath.Join(dir, "records.jsonl"))
+		if err != nil {
+			return err
+		}
+		b.incompleteUploadsJL = jl
 	}
-	// Phase 0a stores upload-family records as opaque key/value pairs
-	// (one JSON line per record) rather than reconstructing the
-	// in-flight upload state. Restoring incomplete uploads is itself
-	// a follow-up; this artifact preserves the bytes for forensics.
-	jl, err := openJSONL(filepath.Join(dir, "records.jsonl"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = closeJSONL(jl) }()
 	rec := struct {
 		Prefix   string `json:"prefix"`
 		KeyB64   []byte `json:"key"`
 		ValueB64 []byte `json:"value"`
 	}{Prefix: prefix, KeyB64: key, ValueB64: value}
-	if err := jl.enc.Encode(rec); err != nil {
+	if err := b.incompleteUploadsJL.enc.Encode(rec); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -361,34 +389,47 @@ func (s *S3Encoder) flushBucket(b *s3BucketState) error {
 			return err
 		}
 	}
-	if b.keymap != nil {
-		if err := b.keymap.Close(); err != nil {
+	// closeJSONL errors must surface — they are the canonical "data
+	// did not flush to disk" signal for a writable resource (Gemini
+	// MEDIUM #318).
+	if err := closeBucketKeymap(b); err != nil {
+		return err
+	}
+	if b.incompleteUploadsJL != nil {
+		if err := closeJSONL(b.incompleteUploadsJL); err != nil {
 			return err
 		}
-		// If no rename was recorded, drop the empty file so the
-		// dump tree omits it (per the spec: keymaps are absent when
-		// empty).
-		if b.keymap.Count() == 0 && b.keymapDir != "" {
-			_ = os.Remove(filepath.Join(b.keymapDir, "KEYMAP.jsonl"))
-		}
+	}
+	return nil
+}
+
+// closeBucketKeymap closes the per-bucket KEYMAP.jsonl writer (if
+// opened) and removes the file when no rename was recorded.
+func closeBucketKeymap(b *s3BucketState) error {
+	if b.keymap == nil {
+		return nil
+	}
+	if err := b.keymap.Close(); err != nil {
+		return err
+	}
+	if b.keymap.Count() == 0 && b.keymapDir != "" {
+		_ = os.Remove(filepath.Join(b.keymapDir, "KEYMAP.jsonl"))
 	}
 	return nil
 }
 
 func (s *S3Encoder) flushObject(b *s3BucketState, bucketDir string, obj *s3ObjectState) error {
 	if obj.manifest == nil {
-		s.emitWarn("s3_orphan_chunks",
-			"bucket", b.name,
-			"object", obj.object,
-			"chunks", len(obj.chunkPaths),
-			"hint", "blob chunks present but no !s3|obj|head record matched")
-		return nil
+		return s.flushOrphanObject(b, bucketDir, obj)
 	}
 	objectName, kind, err := s.resolveObjectFilename(b, obj)
 	if err != nil {
 		return err
 	}
-	bodyPath := filepath.Join(bucketDir, objectName)
+	bodyPath, err := safeJoinUnderRoot(bucketDir, objectName)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return errors.WithStack(err)
 	}
@@ -407,6 +448,59 @@ func (s *S3Encoder) flushObject(b *s3BucketState, bucketDir string, obj *s3Objec
 	return nil
 }
 
+// flushOrphanObject handles objects with chunks but no manifest. By
+// default they emit only a warning. With --include-orphans on, the
+// chunks are written under <bucket>/_orphans/<encoded-object>/ as
+// per-chunk .bin files so the operator can recover bytes manually
+// (Gemini MEDIUM #386).
+func (s *S3Encoder) flushOrphanObject(b *s3BucketState, bucketDir string, obj *s3ObjectState) error {
+	s.emitWarn("s3_orphan_chunks",
+		"bucket", b.name,
+		"object", obj.object,
+		"chunks", len(obj.chunkPaths),
+		"hint", "blob chunks present but no !s3|obj|head record matched")
+	if !s.includeOrphans {
+		return nil
+	}
+	if len(obj.chunkPaths) == 0 {
+		return nil
+	}
+	dir := filepath.Join(bucketDir, "_orphans", EncodeSegment([]byte(obj.object)))
+	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
+		return errors.WithStack(err)
+	}
+	for k, scratchPath := range obj.chunkPaths {
+		out := filepath.Join(dir, blobScratchName(k.uploadID, k.partNo, k.chunkNo, k.partVersion))
+		body, err := os.ReadFile(scratchPath) //nolint:gosec // scratchPath composed from scratch root
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if err := writeFileAtomic(out, body); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// safeJoinUnderRoot composes <root>/<rel> and asserts the result is
+// still rooted under <root>. S3 object keys are user-controlled and
+// can contain "..", absolute paths, or NUL bytes; without this guard
+// a key like "../etc/passwd" would escape the dump tree and overwrite
+// host files (Codex P1 #425).
+func safeJoinUnderRoot(root, rel string) (string, error) {
+	if rel == "" {
+		return "", errors.Wrap(ErrS3MalformedKey, "empty object name")
+	}
+	cleanRoot := filepath.Clean(root)
+	joined := filepath.Clean(filepath.Join(cleanRoot, rel))
+	rootSep := cleanRoot + string(filepath.Separator)
+	if joined != cleanRoot && !strings.HasPrefix(joined, rootSep) {
+		return "", errors.Wrapf(ErrS3MalformedKey,
+			"object name %q escapes bucket directory", rel)
+	}
+	return joined, nil
+}
+
 // resolveObjectFilename returns the relative path of the assembled
 // body within the bucket directory, plus the keymap "kind" when a
 // rename took place ("" when the object writes at its natural path).
@@ -421,7 +515,9 @@ func (s *S3Encoder) resolveObjectFilename(b *s3BucketState, obj *s3ObjectState) 
 	// Object path taken at face value. Path collisions (`path/to`
 	// vs `path/to/sub`) are deferred until the master pipeline
 	// detects them across multiple manifests; this PR's per-object
-	// flush trusts the caller's collision detection.
+	// flush trusts the caller's collision detection. Path-traversal
+	// sanitisation runs in safeJoinUnderRoot, downstream of this
+	// function, where the bucket-directory root is in scope.
 	return obj.object, "", nil
 }
 
@@ -464,17 +560,6 @@ func (s *S3Encoder) objectState(bucket string, gen uint64, object string) *s3Obj
 	return st
 }
 
-// attachManifestParts is a placeholder that records the part list on
-// the object state. The current implementation walks the manifest's
-// part order at Finalize time, so this method just memoises the upload
-// ID for reference; future extensions (e.g., versioned parts) can
-// surface here.
-func (st *s3ObjectState) attachManifestParts(_ string, _ []s3LivePart) {
-	// Intentionally empty: assembleObjectBody consumes the manifest
-	// directly via st.manifest at Finalize. Kept as a hook so the
-	// callsite reads symmetrically with HandleBlob.
-}
-
 // assembleObjectBody concatenates the blob chunks per the manifest's
 // (PartNo, ChunkNo) order into outPath. The encoder buffers chunks on
 // disk during the scan, so this copy walk is bounded by the object's
@@ -494,11 +579,20 @@ func assembleObjectBody(outPath string, obj *s3ObjectState) error {
 			_ = os.Remove(tmpPath)
 		}
 	}()
-	chunks := sortChunkKeys(obj.chunkPaths)
+	// Filter chunks by the manifest's uploadID. A snapshot taken
+	// during a delete/recreate or a retry-after-failed-CompleteUpload
+	// can legitimately contain blob chunks for multiple upload
+	// attempts under the same (bucket, generation, object). Mixing
+	// them produces corrupted bytes — Codex P1 #500 / Gemini HIGH
+	// #504. The manifest is the single source of truth; only its
+	// uploadID's chunks belong in the assembled body.
+	chunks := filterChunksForManifest(obj.chunkPaths, obj.uploadID)
 	for _, k := range chunks {
 		path := obj.chunkPaths[k]
 		if err := appendFile(tmp, path); err != nil {
-			_ = tmp.Close()
+			if closeErr := tmp.Close(); closeErr != nil {
+				return errors.Wrap(err, "tmp.Close after appendFile failure: "+closeErr.Error())
+			}
 			return err
 		}
 	}
@@ -511,6 +605,33 @@ func assembleObjectBody(outPath string, obj *s3ObjectState) error {
 	return nil
 }
 
+// filterChunksForManifest returns the chunk keys belonging to
+// manifestUploadID, sorted by (partNo, partVersion, chunkNo). An empty
+// manifestUploadID matches every chunk — useful for tests that
+// pre-date the uploadID feature, but production callers always have a
+// non-empty uploadID via HandleObjectManifest.
+func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string) []s3ChunkKey {
+	keys := make([]s3ChunkKey, 0, len(m))
+	for k := range m {
+		if manifestUploadID != "" && k.uploadID != manifestUploadID {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		switch {
+		case a.partNo != b.partNo:
+			return a.partNo < b.partNo
+		case a.partVersion != b.partVersion:
+			return a.partVersion < b.partVersion
+		default:
+			return a.chunkNo < b.chunkNo
+		}
+	})
+	return keys
+}
+
 func appendFile(dst io.Writer, srcPath string) error {
 	f, err := os.Open(srcPath) //nolint:gosec // srcPath composed from scratch root
 	if err != nil {
@@ -521,25 +642,6 @@ func appendFile(dst io.Writer, srcPath string) error {
 		return errors.WithStack(err)
 	}
 	return nil
-}
-
-func sortChunkKeys(m map[s3ChunkKey]string) []s3ChunkKey {
-	out := make([]s3ChunkKey, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		switch {
-		case a.partNo != b.partNo:
-			return a.partNo < b.partNo
-		case a.partVersion != b.partVersion:
-			return a.partVersion < b.partVersion
-		default:
-			return a.chunkNo < b.chunkNo
-		}
-	})
-	return out
 }
 
 func ensureChunkPaths(m map[s3ChunkKey]string) map[s3ChunkKey]string {
