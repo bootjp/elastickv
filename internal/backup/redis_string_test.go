@@ -199,6 +199,41 @@ func TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex(t *testing.T) {
 	assertTTLSidecar(t, filepath.Join(root, "redis", "db_0", "strings_ttl.jsonl"), "expiring", fixedExpireMs)
 }
 
+// TestRedisDB_RefusesSymlinkedAncestor is the regression for Codex P1
+// round 9: O_NOFOLLOW only blocks the final-component symlink. A
+// pre-existing directory symlink anywhere up the path (e.g.
+// `<outRoot>/redis/db_0/strings -> /tmp/outside`) lets MkdirAll
+// silently honor it and steers writeFileAtomic / openSidecarFile
+// outside outRoot. ensureDir now Lstat-walks each ancestor under
+// outRoot and refuses if any is a symlink.
+func TestRedisDB_RefusesSymlinkedAncestor(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	// Pre-place the symlink trap before constructing the encoder so
+	// the directory tree contains a poisoned ancestor at
+	// <root>/redis/db_0/strings.
+	bait := filepath.Join(root, "bait-tree")
+	if err := os.MkdirAll(bait, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "redis", "db_0")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bait, filepath.Join(parent, "strings")); err != nil {
+		t.Fatal(err)
+	}
+	db := NewRedisDB(root, 0)
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), 0))
+	if err == nil || !strings.Contains(err.Error(), "refusing to traverse symlinked ancestor") {
+		t.Fatalf("expected symlinked-ancestor refusal, got %v", err)
+	}
+	// The symlink target must be untouched: no `k.bin` written.
+	if _, statErr := os.Stat(filepath.Join(bait, "k.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("blob written through ancestor symlink: stat err=%v", statErr)
+	}
+}
+
 // TestRedisDB_OpenJSONLRefusesHardLinkClobber is the regression for
 // Codex P2 round 9: O_NOFOLLOW only blocks symlinks; an adversary
 // who can write the output directory could pre-create
