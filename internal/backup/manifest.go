@@ -87,14 +87,27 @@ type Live struct {
 	PinTokenSHA256 string `json:"pin_token_sha256,omitempty"`
 }
 
-// Adapters lists which scopes were dumped per adapter. An empty slice
-// means "no scopes for this adapter were dumped"; a nil slice means
-// "this adapter was not in the dump's scope filter."
+// Adapters lists which scopes were dumped per adapter. The pointer
+// values express two distinguishable on-disk states:
+//
+//   - nil   -> the adapter was excluded from this dump (e.g.
+//     `--adapter dynamodb,s3` filtered it out). The corresponding
+//     JSON key is absent.
+//   - non-nil pointer to Adapter{}  -> the adapter was in scope but
+//     no scopes for it were emitted (no tables, no buckets, etc.).
+//     The JSON key is present with an empty object.
+//   - non-nil pointer to a populated Adapter -> the listed scopes
+//     were emitted.
+//
+// Storing pointers (rather than zero-value Adapter structs) is what
+// keeps "excluded by filter" distinguishable from "included but
+// empty" through json.Marshal — non-pointer fields would collapse
+// both states into the same on-disk shape.
 type Adapters struct {
-	DynamoDB Adapter `json:"dynamodb"`
-	S3       Adapter `json:"s3"`
-	Redis    Adapter `json:"redis"`
-	SQS      Adapter `json:"sqs"`
+	DynamoDB *Adapter `json:"dynamodb,omitempty"`
+	S3       *Adapter `json:"s3,omitempty"`
+	Redis    *Adapter `json:"redis,omitempty"`
+	SQS      *Adapter `json:"sqs,omitempty"`
 }
 
 // Adapter holds the scope identifiers for one adapter. Field names are
@@ -192,6 +205,17 @@ func ReadManifest(r io.Reader) (Manifest, error) {
 	dec.DisallowUnknownFields() // surface format drift loudly
 	if err := dec.Decode(&m); err != nil {
 		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	// MANIFEST.json is exactly one JSON object. Trailing bytes
+	// (a second object, junk, even whitespace-only padding) point at
+	// concatenation bugs or partial-write corruption — both of which
+	// must surface here rather than be silently discarded. We use
+	// io.Discard rather than parsing because we only care that
+	// nothing-decodable is present; structural validation lives in
+	// validate().
+	if dec.More() {
+		return Manifest{}, errors.Wrap(ErrInvalidManifest,
+			"trailing bytes after manifest JSON object")
 	}
 	if m.FormatVersion == 0 {
 		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
