@@ -172,20 +172,47 @@ func (r *KeymapReader) Next() (KeymapRecord, bool, error) {
 		return KeymapRecord{}, false, nil
 	}
 	line := r.sc.Bytes()
-	var rec KeymapRecord
-	if err := json.Unmarshal(line, &rec); err != nil {
-		r.err = errors.Wrap(ErrInvalidKeymapRecord, err.Error())
-		return KeymapRecord{}, false, r.err
-	}
-	if rec.Encoded == "" || rec.Kind == "" {
-		r.err = errors.Wrap(ErrInvalidKeymapRecord, "missing encoded or kind")
-		return KeymapRecord{}, false, r.err
-	}
-	if _, err := base64.RawURLEncoding.DecodeString(rec.OriginalB64); err != nil {
-		r.err = errors.Wrap(ErrInvalidKeymapRecord, err.Error())
+	rec, err := decodeKeymapLine(line)
+	if err != nil {
+		r.err = err
 		return KeymapRecord{}, false, r.err
 	}
 	return rec, true, nil
+}
+
+// decodeKeymapLine parses one JSONL record. It enforces three properties:
+//
+//  1. The record must contain `encoded`, `original`, and `kind` fields —
+//     a missing `original` would otherwise be silently rewritten to empty
+//     bytes by base64.RawURLEncoding.DecodeString(""). Codex P2 round 5.
+//  2. `encoded` and `kind` must be non-empty strings.
+//  3. `original` (the base64) must be parseable at parse time so a
+//     corrupted dump fails on first read rather than at later
+//     Original() call. Codex P1 #179.
+func decodeKeymapLine(line []byte) (KeymapRecord, error) {
+	// Two-phase decode: first into a presence-aware map so we can
+	// distinguish "field absent" from "field present and empty
+	// string"; then into the typed struct for value extraction.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(line, &fields); err != nil {
+		return KeymapRecord{}, errors.Wrap(ErrInvalidKeymapRecord, err.Error())
+	}
+	for _, name := range [...]string{"encoded", "original", "kind"} {
+		if _, ok := fields[name]; !ok {
+			return KeymapRecord{}, errors.Wrapf(ErrInvalidKeymapRecord, "missing field %q", name)
+		}
+	}
+	var rec KeymapRecord
+	if err := json.Unmarshal(line, &rec); err != nil {
+		return KeymapRecord{}, errors.Wrap(ErrInvalidKeymapRecord, err.Error())
+	}
+	if rec.Encoded == "" || rec.Kind == "" {
+		return KeymapRecord{}, errors.Wrap(ErrInvalidKeymapRecord, "missing encoded or kind")
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(rec.OriginalB64); err != nil {
+		return KeymapRecord{}, errors.Wrap(ErrInvalidKeymapRecord, err.Error())
+	}
+	return rec, nil
 }
 
 // LoadKeymap reads every record from r into an in-memory map keyed by

@@ -19,13 +19,13 @@ func TestManifest_Phase0RoundTrip(t *testing.T) {
 	m.SnapshotIndex = 18432021
 	m.LastCommitTS = 4517352099840000
 	m.Source = &Source{FSMPath: "/data/fsm-snap/0000000000000064.fsm", FSMCRC32C: "deadbeef"}
-	m.Adapters = Adapters{
+	m.Adapters = &Adapters{
 		DynamoDB: &Adapter{Tables: []string{"orders", "users"}},
 		S3:       &Adapter{Buckets: []string{"photos"}},
 		Redis:    &Adapter{Databases: []uint32{0}},
 		SQS:      &Adapter{Queues: []string{"orders-fifo.fifo"}},
 	}
-	m.Exclusions = Exclusions{} // all defaults
+	m.Exclusions = &Exclusions{} // all defaults
 
 	var buf bytes.Buffer
 	if err := WriteManifest(&buf, m); err != nil {
@@ -127,6 +127,35 @@ func TestReadManifest_RejectsFutureFormatVersion(t *testing.T) {
 	_, err := ReadManifest(bytes.NewReader(body))
 	if !errors.Is(err, ErrUnsupportedFormatVersion) {
 		t.Fatalf("err=%v want ErrUnsupportedFormatVersion", err)
+	}
+}
+
+// TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch is the
+// regression test for Codex P2 round 5: a newer-major manifest that also
+// changes the JSON type of a known field (e.g. `phase` from string to int)
+// must surface as ErrUnsupportedFormatVersion, not ErrInvalidManifest. The
+// version-branching contract advertised to callers (errors.Is(err,
+// ErrUnsupportedFormatVersion) means "upgrade required") only holds if the
+// format_version probe runs before the strict struct decode.
+func TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 999,
+		"phase": 42,
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {"dynamodb":{}, "s3":{}, "redis":{}, "sqs":{}},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("err=%v want ErrUnsupportedFormatVersion (must precede strict decode)", err)
 	}
 }
 
@@ -308,6 +337,52 @@ func TestAdaptersStruct_NilVsEmptyDistinguishedOnDisk(t *testing.T) {
 	}
 	if strings.Contains(out, `"s3"`) || strings.Contains(out, `"redis"`) || strings.Contains(out, `"sqs"`) {
 		t.Fatalf("excluded adapters must be omitted, got %s", out)
+	}
+}
+
+func TestReadManifest_RejectsMissingAdapters(t *testing.T) {
+	t.Parallel()
+	// Adapters section omitted from the JSON entirely — Codex P2
+	// #146 round 3. With Adapters as a pointer the omission decodes
+	// as nil; validation must surface ErrInvalidManifest rather than
+	// treat an empty zero-value section as valid.
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for missing adapters", err)
+	}
+}
+
+func TestReadManifest_RejectsMissingExclusions(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for missing exclusions", err)
 	}
 }
 

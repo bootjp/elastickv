@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"time"
@@ -132,19 +133,24 @@ type Exclusions struct {
 // Manifest is the on-disk MANIFEST.json structure. Field tags match the
 // spec in docs/design/2026_04_29_proposed_snapshot_logical_decoder.md.
 type Manifest struct {
-	FormatVersion     uint32     `json:"format_version"`
-	Phase             string     `json:"phase"`
-	ElastickvVersion  string     `json:"elastickv_version,omitempty"`
-	ClusterID         string     `json:"cluster_id,omitempty"`
-	SnapshotIndex     uint64     `json:"snapshot_index,omitempty"`
-	LastCommitTS      uint64     `json:"last_commit_ts,omitempty"`
-	WallTimeISO       string     `json:"wall_time_iso"`
-	Source            *Source    `json:"source,omitempty"`
-	Live              *Live      `json:"live,omitempty"`
-	Adapters          Adapters   `json:"adapters"`
-	Exclusions        Exclusions `json:"exclusions"`
-	ChecksumAlgorithm string     `json:"checksum_algorithm"`
-	ChecksumFormat    string     `json:"checksum_format"`
+	FormatVersion    uint32  `json:"format_version"`
+	Phase            string  `json:"phase"`
+	ElastickvVersion string  `json:"elastickv_version,omitempty"`
+	ClusterID        string  `json:"cluster_id,omitempty"`
+	SnapshotIndex    uint64  `json:"snapshot_index,omitempty"`
+	LastCommitTS     uint64  `json:"last_commit_ts,omitempty"`
+	WallTimeISO      string  `json:"wall_time_iso"`
+	Source           *Source `json:"source,omitempty"`
+	Live             *Live   `json:"live,omitempty"`
+	// Adapters and Exclusions are pointer types so ReadManifest can
+	// distinguish "section omitted entirely" (a corrupted or
+	// truncated dump that should fail validation) from "section
+	// present but populated with default values" (legitimate
+	// scope-everything-excluded). Codex P2 #146 (round 3).
+	Adapters          *Adapters   `json:"adapters"`
+	Exclusions        *Exclusions `json:"exclusions"`
+	ChecksumAlgorithm string      `json:"checksum_algorithm"`
+	ChecksumFormat    string      `json:"checksum_format"`
 
 	EncodedFilenameCharset string `json:"encoded_filename_charset"`
 	KeySegmentMaxBytes     uint32 `json:"key_segment_max_bytes"`
@@ -163,12 +169,17 @@ var ErrInvalidManifest = errors.New("backup: manifest invalid")
 
 // NewPhase0SnapshotManifest seeds a manifest with the Phase 0a defaults.
 // Callers fill in scope (Adapters), Source/wall time and exclusions before
-// passing it to WriteManifest.
+// passing it to WriteManifest. Adapters and Exclusions are seeded to
+// non-nil zero values so the resulting manifest passes the
+// "section-present" validation; callers populating individual scopes
+// reach in via the now-non-nil pointer.
 func NewPhase0SnapshotManifest(now time.Time) Manifest {
 	return Manifest{
 		FormatVersion:          CurrentFormatVersion,
 		Phase:                  PhasePhase0SnapshotDecode,
 		WallTimeISO:            now.UTC().Format(time.RFC3339Nano),
+		Adapters:               &Adapters{},
+		Exclusions:             &Exclusions{},
 		ChecksumAlgorithm:      ChecksumAlgorithmSHA256,
 		ChecksumFormat:         ChecksumFormatSha256sum,
 		EncodedFilenameCharset: EncodedFilenameCharsetRFC3986,
@@ -200,8 +211,38 @@ func WriteManifest(w io.Writer, m Manifest) error {
 // error is wrapped as ErrUnsupportedFormatVersion or ErrInvalidManifest so
 // callers can branch on errors.Is.
 func ReadManifest(r io.Reader) (Manifest, error) {
+	// Read the entire payload once so we can pre-decode just the
+	// format_version before strict struct decoding. Without this
+	// two-phase approach, a manifest produced by a newer major version
+	// that also changed the JSON type of a known field (e.g. `phase`
+	// switched from string to int) would surface as
+	// ErrInvalidManifest instead of ErrUnsupportedFormatVersion,
+	// breaking the documented version-branching contract for callers
+	// that key off errors.Is(err, ErrUnsupportedFormatVersion). See
+	// Codex P2, round 5.
+	payload, err := io.ReadAll(r)
+	if err != nil {
+		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	// Phase 1: probe format_version with a relaxed shape that tolerates
+	// arbitrary types on every other field.
+	var probe struct {
+		FormatVersion uint32 `json:"format_version"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	if probe.FormatVersion == 0 {
+		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
+			"format_version is zero")
+	}
+	if probe.FormatVersion > CurrentFormatVersion {
+		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
+			"format_version %d > current %d (newer producer)", probe.FormatVersion, CurrentFormatVersion)
+	}
+	// Phase 2: strict struct decode on a known-supported version.
 	var m Manifest
-	dec := json.NewDecoder(r)
+	dec := json.NewDecoder(bytes.NewReader(payload))
 	// We intentionally do NOT call DisallowUnknownFields here.
 	// The format-version contract (Codex P1, follow-up) is:
 	//   - format_version > CurrentFormatVersion -> hard refuse
@@ -226,14 +267,6 @@ func ReadManifest(r io.Reader) (Manifest, error) {
 	if dec.More() {
 		return Manifest{}, errors.Wrap(ErrInvalidManifest,
 			"trailing bytes after manifest JSON object")
-	}
-	if m.FormatVersion == 0 {
-		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
-			"format_version is zero")
-	}
-	if m.FormatVersion > CurrentFormatVersion {
-		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
-			"format_version %d > current %d (newer producer)", m.FormatVersion, CurrentFormatVersion)
 	}
 	if err := m.validate(); err != nil {
 		return Manifest{}, err
@@ -265,6 +298,15 @@ func (m Manifest) validateRequiredFields() error {
 	}
 	if _, err := time.Parse(time.RFC3339Nano, m.WallTimeISO); err != nil {
 		return errors.Wrapf(ErrInvalidManifest, "wall_time_iso unparseable: %v", err)
+	}
+	// Adapters and Exclusions are required structural sections.
+	// A manifest that omits either is treated as truncated/corrupted
+	// (Codex P2 #146 round 3).
+	if m.Adapters == nil {
+		return errors.Wrap(ErrInvalidManifest, "adapters section missing")
+	}
+	if m.Exclusions == nil {
+		return errors.Wrap(ErrInvalidManifest, "exclusions section missing")
 	}
 	return nil
 }
