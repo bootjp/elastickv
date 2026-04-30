@@ -410,6 +410,63 @@ func TestSQS_SideRecordsFlushedEvenWhenZeroMessages(t *testing.T) {
 	}
 }
 
+// TestSQS_OrphanQueueSideRecordsPreserved is the regression for Codex
+// P2 round 8: when a queue's !sqs|queue|meta record is missing (e.g.
+// after DeleteQueue left tombstones but the meta row was removed) and
+// --include-sqs-side-records is on, side records were silently dropped
+// alongside any orphan messages. The opt-in contract is the opposite:
+// side records exist precisely so deletion-era state is recoverable.
+// Now those records flush to a `<encoded>.orphan` directory while the
+// orphan-messages warning fires.
+func TestSQS_OrphanQueueSideRecordsPreserved(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	enc.WithIncludeSideRecords(true)
+	var events []string
+	enc.WithWarnSink(func(event string, _ ...any) { events = append(events, event) })
+	// Side record arrives without a meta row first (deletion-era).
+	encQueue := "ZGVsZXRlZA" // base64url("deleted")
+	visKey := append([]byte(SQSMsgVisPrefix), []byte(encQueue)...)
+	visKey = append(visKey, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+	if err := enc.HandleSideRecord(SQSMsgVisPrefix, visKey, []byte("vis-record")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 || events[0] != "sqs_orphan_messages" {
+		t.Fatalf("expected sqs_orphan_messages warning, got %v", events)
+	}
+	want := filepath.Join(root, "sqs", encQueue+".orphan", "_internals", "side_records.jsonl")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("expected orphan side-records file at %s: %v", want, err)
+	}
+}
+
+// TestSQS_OrphanQueueSideRecordsSuppressedWhenOptOut asserts that the
+// orphan-side-records branch is gated on --include-sqs-side-records:
+// without the flag, the warning still fires but no .orphan dir is
+// created (consistent with the default-off contract for side records).
+func TestSQS_OrphanQueueSideRecordsSuppressedWhenOptOut(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	// includeSideRecords is off by default — HandleSideRecord drops
+	// the record at intake, so the buffer is empty by Finalize. We
+	// exercise the path anyway to confirm no .orphan dir is created.
+	encQueue := "b3B0LW91dA" // base64url("opt-out")
+	visKey := append([]byte(SQSMsgVisPrefix), []byte(encQueue)...)
+	visKey = append(visKey, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02)
+	if err := enc.HandleSideRecord(SQSMsgVisPrefix, visKey, []byte("vis")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sqs", encQueue+".orphan")); !os.IsNotExist(err) {
+		t.Fatalf("orphan dir created without --include-sqs-side-records: stat err=%v", err)
+	}
+}
+
 func TestSQS_DefaultDoesNotEmitInternals(t *testing.T) {
 	t.Parallel()
 	enc, root := newSQSEncoder(t)

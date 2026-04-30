@@ -252,18 +252,23 @@ func (s *SQSEncoder) HandleSideRecord(prefix string, key, value []byte) error {
 }
 
 // Finalize flushes every queue's _queue.json and messages.jsonl. Queues
-// with buffered messages but no meta record (orphans) emit a warning and
-// are skipped — restoring orphan messages without a queue config would
-// silently create a queue with default settings, which is rarely what
-// the operator wants.
+// with buffered messages but no meta record (orphans) emit a warning
+// and have their messages dropped — restoring orphan messages without
+// a queue config would silently create a queue with default settings,
+// which is rarely what the operator wants. However, if
+// --include-sqs-side-records is on and this orphan queue has buffered
+// side records (vis/byage/dedup/group/tombstone), those are still
+// flushed under the encoded-prefix directory: the most common reason
+// for a missing meta is a DeleteQueue that left tombstones, and
+// dropping exactly those records is the opposite of what the operator
+// asked for. Codex P2 round 8.
 func (s *SQSEncoder) Finalize() error {
 	var firstErr error
 	for _, st := range s.queues {
 		if st.meta == nil {
-			s.emitWarn("sqs_orphan_messages",
-				"encoded_queue", st.encoded,
-				"buffered_messages", len(st.messages),
-				"hint", "no !sqs|queue|meta record matched this encoded prefix; messages dropped from the dump")
+			if err := s.flushOrphanQueueSideRecords(st); err != nil && firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		if err := s.flushQueue(st); err != nil && firstErr == nil {
@@ -271,6 +276,30 @@ func (s *SQSEncoder) Finalize() error {
 		}
 	}
 	return firstErr
+}
+
+// flushOrphanQueueSideRecords emits buffered side records for a queue
+// whose !sqs|queue|meta row never arrived. Without this branch,
+// --include-sqs-side-records silently drops the post-DeleteQueue
+// tombstones and dedup-window history operators most often opt in
+// for. The orphan dir is named by the encoded prefix because no
+// decoded queue name is available; restore tools can join it with
+// the messages-dropped warning to reconstruct context.
+func (s *SQSEncoder) flushOrphanQueueSideRecords(st *sqsQueueState) error {
+	s.emitWarn("sqs_orphan_messages",
+		"encoded_queue", st.encoded,
+		"buffered_messages", len(st.messages),
+		"buffered_side_records", len(st.internalBuf),
+		"hint", "no !sqs|queue|meta record matched this encoded prefix; messages dropped from the dump")
+	if !s.includeSideRecords || len(st.internalBuf) == 0 {
+		return nil
+	}
+	// Use the encoded prefix as the directory name — it's the only
+	// stable identifier available when meta is missing. Suffix it
+	// with `.orphan` so a restore tool cannot mistake it for a real
+	// queue dir produced from a successful meta flush.
+	dir := filepath.Join(s.outRoot, "sqs", st.encoded+".orphan")
+	return s.flushInternals(dir, st.internalBuf)
 }
 
 func (s *SQSEncoder) flushQueue(st *sqsQueueState) error {
