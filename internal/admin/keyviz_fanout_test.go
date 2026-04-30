@@ -70,6 +70,36 @@ func TestMergeKeyVizMatricesWritesMaxStableLeader(t *testing.T) {
 	require.False(t, merged.Rows[0].Conflict, "stable-leader merge must not raise conflict")
 }
 
+// TestMergeKeyVizMatricesPreservesRaftIdentity pins the Phase 2-C+
+// wire extension on the fan-out merge path: when mergeRowInto seeds
+// the destination row from the first source, RaftGroupID and
+// LeaderTerm are copied through. PR-3c will use these fields to
+// switch from §4.2's row-level max-merge to §9.1's per-cell
+// (group, term) dedupe; this PR ensures the fields survive the
+// merge so PR-3c has data to act on.
+func TestMergeKeyVizMatricesPreservesRaftIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{30}, RaftGroupID: 7, LeaderTerm: 42},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{0}, RaftGroupID: 7, LeaderTerm: 42},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, uint64(7), merged.Rows[0].RaftGroupID, "RaftGroupID must survive mergeRowInto")
+	require.Equal(t, uint64(42), merged.Rows[0].LeaderTerm, "LeaderTerm must survive mergeRowInto")
+}
+
 // TestMergeKeyVizMatricesWritesMaxLeadershipFlip pins §4.2 under a
 // mid-window flip: two nodes report non-zero, disagreeing values
 // for the same cell. The merge keeps the larger value and raises

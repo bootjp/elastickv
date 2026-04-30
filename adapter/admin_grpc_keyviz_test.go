@@ -273,3 +273,36 @@ func TestGetKeyVizMatrixHonorsRowsBudget(t *testing.T) {
 	require.Equal(t, "route:2", resp.Rows[0].BucketId)
 	require.Equal(t, "route:4", resp.Rows[1].BucketId)
 }
+
+// TestGetKeyVizMatrixStampsRaftIdentity pins the Phase 2-C+ wire
+// extension: MatrixRow.RaftGroupID and MatrixRow.LeaderTerm propagate
+// through matrixToProto into the proto KeyVizRow's
+// raft_group_id (field 13) and leader_term (field 14). The fan-out
+// aggregator's per-term dedupe key requires both fields on the wire.
+func TestGetKeyVizMatrixStampsRaftIdentity(t *testing.T) {
+	t.Parallel()
+	t0 := time.Unix(1_700_000_000, 0)
+	srv := newAdminServerWithFakeSampler(t, []keyviz.MatrixColumn{
+		{
+			At: t0,
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 5, RaftGroupID: 7, LeaderTerm: 42},
+				{RouteID: 2, Start: []byte("b"), End: []byte("c"), Writes: 9, RaftGroupID: 0, LeaderTerm: 0},
+			},
+		},
+	})
+
+	resp, err := srv.GetKeyVizMatrix(context.Background(), &pb.GetKeyVizMatrixRequest{
+		Series: pb.KeyVizSeries_KEYVIZ_SERIES_WRITES,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Rows, 2)
+	// route:1 — non-zero identity propagated.
+	require.Equal(t, "route:1", resp.Rows[0].BucketId)
+	require.Equal(t, uint64(7), resp.Rows[0].RaftGroupId, "RaftGroupID must propagate to proto field 13")
+	require.Equal(t, uint64(42), resp.Rows[0].LeaderTerm, "LeaderTerm must propagate to proto field 14")
+	// route:2 — zero values stay zero (legacy max-merge fallback).
+	require.Equal(t, "route:2", resp.Rows[1].BucketId)
+	require.Equal(t, uint64(0), resp.Rows[1].RaftGroupId)
+	require.Equal(t, uint64(0), resp.Rows[1].LeaderTerm)
+}

@@ -498,3 +498,37 @@ func TestKeyVizHandlerSkipsFanoutForPeerCall(t *testing.T) {
 	require.Equal(t, 0, peerHits,
 		"recursion guard violated: handler dialled a peer despite X-Admin-Fanout-Peer being set")
 }
+
+// TestKeyVizHandlerStampsRaftIdentity pins the Phase 2-C+ wire
+// extension on the JSON path: MatrixRow.RaftGroupID and
+// MatrixRow.LeaderTerm propagate through newKeyVizRowFrom into the
+// JSON KeyVizRow's raft_group_id and leader_term fields.
+func TestKeyVizHandlerStampsRaftIdentity(t *testing.T) {
+	t.Parallel()
+	t0 := time.Unix(1_700_000_000, 0)
+	srv := newKeyVizTestServer(t, &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{
+			At: t0,
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 5, RaftGroupID: 7, LeaderTerm: 42},
+				{RouteID: 2, Start: []byte("b"), End: []byte("c"), Writes: 9},
+			},
+		},
+	}})
+	defer srv.Close()
+
+	resp := keyVizGet(t, srv.URL)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var matrix KeyVizMatrix
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+	require.Len(t, matrix.Rows, 2)
+	r1, r2 := matrix.Rows[0], matrix.Rows[1]
+	require.Equal(t, "route:1", r1.BucketID)
+	require.Equal(t, uint64(7), r1.RaftGroupID, "RaftGroupID must propagate to JSON raft_group_id")
+	require.Equal(t, uint64(42), r1.LeaderTerm, "LeaderTerm must propagate to JSON leader_term")
+	// route:2 — zero values stay zero.
+	require.Equal(t, "route:2", r2.BucketID)
+	require.Equal(t, uint64(0), r2.RaftGroupID)
+	require.Equal(t, uint64(0), r2.LeaderTerm)
+}

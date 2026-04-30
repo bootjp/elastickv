@@ -525,6 +525,8 @@ func mergeRowInto(
 			RouteIDs:          append([]uint64(nil), row.RouteIDs...),
 			RouteIDsTruncated: row.RouteIDsTruncated,
 			RouteCount:        row.RouteCount,
+			RaftGroupID:       row.RaftGroupID,
+			LeaderTerm:        row.LeaderTerm,
 			Values:            make([]uint64, mergedWidth),
 		}
 		rowsByBucket[row.BucketID] = dst

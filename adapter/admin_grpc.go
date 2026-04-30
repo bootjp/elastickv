@@ -675,6 +675,8 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *pb.KeyVizRow {
 		Aggregate:         mr.Aggregate,
 		RouteCount:        total,
 		RouteIdsTruncated: mr.Aggregate && total > uint64(len(mr.MemberRoutes)),
+		RaftGroupId:       mr.RaftGroupID,
+		LeaderTerm:        mr.LeaderTerm,
 		Values:            make([]uint64, numCols),
 	}
 	if mr.Aggregate {

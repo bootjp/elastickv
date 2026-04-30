@@ -88,6 +88,17 @@ type KeyVizRow struct {
 	RouteCount        uint64   `json:"route_count"`
 	Values            []uint64 `json:"values"`
 	Conflict          bool     `json:"conflict,omitempty"`
+	// RaftGroupID and LeaderTerm carry the route's Raft identity at
+	// flush time. Phase 2-C+ fan-out uses
+	// (bucket_id, raft_group_id, leader_term, column) as the dedupe
+	// key so writes from a leader and the previous leader can be
+	// summed across terms instead of conservatively max-merged.
+	// Zero values mean "term not tracked" (legacy single-group
+	// deployments, virtual aggregate buckets, or nodes that have
+	// not wired the leader-term publisher) — the aggregator falls
+	// back to the legacy max-merge for those cells.
+	RaftGroupID uint64 `json:"raft_group_id,omitempty"`
+	LeaderTerm  uint64 `json:"leader_term,omitempty"`
 	// total accumulates the sum of Values during pivot so the
 	// rowBudget sort is O(N log N) on a precomputed key rather
 	// than O(N log N × M) recomputing the sum per comparison.
@@ -372,6 +383,8 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *KeyVizRow {
 		Aggregate:         mr.Aggregate,
 		RouteCount:        total,
 		RouteIDsTruncated: mr.Aggregate && total > uint64(len(mr.MemberRoutes)),
+		RaftGroupID:       mr.RaftGroupID,
+		LeaderTerm:        mr.LeaderTerm,
 		Values:            make([]uint64, numCols),
 	}
 	if mr.Aggregate {
