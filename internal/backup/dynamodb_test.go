@@ -177,6 +177,7 @@ func TestDDB_BinaryHashKeyRendersAsB64Prefix(t *testing.T) {
 			HashKey: "id",
 		},
 		AttributeDefinitions: map[string]string{"id": "B"},
+		Generation:           1,
 	}
 	item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
 		"id":   bAttr([]byte{0x00, 0x01, 0x02}),
@@ -242,6 +243,7 @@ func TestDDB_RejectsItemMissingHashKeyAttribute(t *testing.T) {
 	schema := &pb.DynamoTableSchema{
 		TableName: "t", PrimaryKey: &pb.DynamoKeySchema{HashKey: "id"},
 		AttributeDefinitions: map[string]string{"id": "S"},
+		Generation:           1,
 	}
 	item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
 		// "id" is missing
@@ -273,6 +275,7 @@ func TestDDB_AllAttributeKindsRoundTripThroughJSON(t *testing.T) {
 	schema := &pb.DynamoTableSchema{
 		TableName: "kitchensink", PrimaryKey: &pb.DynamoKeySchema{HashKey: "id"},
 		AttributeDefinitions: map[string]string{"id": "S"},
+		Generation:           1,
 	}
 	item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
 		"id":     sAttr("k"),
@@ -329,6 +332,80 @@ func TestDDB_BundleJSONLNotImplementedYet(t *testing.T) {
 	err := enc.Finalize()
 	if err == nil {
 		t.Fatalf("expected not-implemented error from Finalize on bundle mode")
+	}
+}
+
+func TestDDB_StaleGenerationItemsExcludedAndWarned(t *testing.T) {
+	t.Parallel()
+	enc, root := newDDBEncoder(t)
+	var events []string
+	enc.WithWarnSink(func(e string, _ ...any) { events = append(events, e) })
+
+	schema := &pb.DynamoTableSchema{
+		TableName:            "t",
+		PrimaryKey:           &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions: map[string]string{"id": "S"},
+		Generation:           5,
+	}
+	live := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("alive"), "v": sAttr("active"),
+	}}
+	stale := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("ghost"), "v": sAttr("from-prev-gen"),
+	}}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 5, "alive", ""), encodeItemValue(t, live)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 4, "ghost", ""), encodeItemValue(t, stale)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "alive.json")); err != nil {
+		t.Fatalf("expected active-gen item: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "ghost.json")); !os.IsNotExist(err) {
+		t.Fatalf("stale-gen item must NOT be emitted, stat err=%v", err)
+	}
+	if len(events) != 1 || events[0] != "ddb_stale_generation_items" {
+		t.Fatalf("events=%v want [ddb_stale_generation_items]", events)
+	}
+}
+
+func TestDDB_EmptyStringSetSerializesAsEmptyArrayNotNull(t *testing.T) {
+	t.Parallel()
+	// Per Gemini #442 — a set attribute with no members must
+	// serialize as `[]` rather than `null` so downstream tools
+	// see a present-but-empty set, not a missing field.
+	got := setAttributeValueToPublic(&pb.DynamoAttributeValue{
+		Value: &pb.DynamoAttributeValue_Ss{Ss: &pb.DynamoStringSet{Values: nil}},
+	})
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != `{"SS":[]}` {
+		t.Fatalf("got %s want {\"SS\":[]}", body)
+	}
+}
+
+func TestDDB_ParseItemKeyExtractsGeneration(t *testing.T) {
+	t.Parallel()
+	enc, gen, err := parseDDBItemKey(EncodeDDBItemKey("orders", 42, "pk", "sk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen != 42 {
+		t.Fatalf("gen=%d want 42", gen)
+	}
+	want := "b3JkZXJz" // base64url("orders")
+	if enc != want {
+		t.Fatalf("enc=%q want %q", enc, want)
 	}
 }
 
