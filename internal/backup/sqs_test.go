@@ -3,9 +3,11 @@ package backup
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -372,6 +374,94 @@ func TestSQS_ParseMessageDataKey_RejectsEmptyMsgIDSegment(t *testing.T) {
 	key = append(key, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
 	if _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
 		t.Fatalf("err=%v want ErrSQSMalformedKey for empty msg-id", err)
+	}
+}
+
+// TestSQS_StaleGenerationMessagesDropped is the regression for Codex
+// P1 round 10: PurgeQueue and DeleteQueue bump the queue's generation
+// but the affected !sqs|msg|data|<oldGen>|... rows are removed
+// asynchronously by the reaper. A snapshot taken mid-cleanup would
+// otherwise resurrect those purged messages on restore. The encoder
+// now consults the !sqs|queue|gen| record and drops messages whose
+// QueueGeneration does not match the active gen, emitting an
+// `sqs_stale_generation_messages_dropped` warning for visibility.
+func TestSQS_StaleGenerationMessagesDropped(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	var events []string
+	enc.WithWarnSink(func(event string, _ ...any) { events = append(events, event) })
+	queue := "q"
+	if err := enc.HandleQueueMeta(EncodeQueueMetaKey(queue), encodeQueueMetaValue(t, map[string]any{
+		"name": queue, "visibility_timeout_seconds": 30, "message_retention_seconds": 60,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	encQueue := base64.RawURLEncoding.EncodeToString([]byte(queue))
+	genKey := append([]byte(SQSQueueGenPrefix), []byte(encQueue)...)
+	if err := enc.HandleQueueGen(genKey, []byte("7")); err != nil {
+		t.Fatal(err)
+	}
+	live := encodeMessageValue(t, map[string]any{
+		"message_id":            "live",
+		"body":                  []byte("ok"),
+		"send_timestamp_millis": 100,
+		"queue_generation":      7,
+	})
+	if err := enc.HandleMessageData(EncodeMsgDataKey(queue, 7, "live"), live); err != nil {
+		t.Fatal(err)
+	}
+	stale := encodeMessageValue(t, map[string]any{
+		"message_id":            "ghost",
+		"body":                  []byte("from-prev-gen"),
+		"send_timestamp_millis": 50,
+		"queue_generation":      6,
+	})
+	if err := enc.HandleMessageData(EncodeMsgDataKey(queue, 6, "ghost"), stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	recs := readMessagesJSONL(t, filepath.Join(root, "sqs", queue, "messages.jsonl"))
+	if len(recs) != 1 {
+		t.Fatalf("messages = %d want 1 (stale gen must drop)", len(recs))
+	}
+	if recs[0]["message_id"] != "live" {
+		t.Fatalf("survived msg = %v want live", recs[0]["message_id"])
+	}
+	if !slices.Contains(events, "sqs_stale_generation_messages_dropped") {
+		t.Fatalf("expected sqs_stale_generation_messages_dropped warning, got %v", events)
+	}
+}
+
+// TestSQS_StaleGenerationFilterDisabledWithoutGenRecord asserts the
+// safe fallback: a queue with no !sqs|queue|gen| record observed
+// keeps the legacy behavior (no filter), so a backup that lacks the
+// gen record does not silently lose every message.
+func TestSQS_StaleGenerationFilterDisabledWithoutGenRecord(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	queue := "q"
+	if err := enc.HandleQueueMeta(EncodeQueueMetaKey(queue), encodeQueueMetaValue(t, map[string]any{
+		"name": queue, "visibility_timeout_seconds": 30, "message_retention_seconds": 60,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	val := encodeMessageValue(t, map[string]any{
+		"message_id":            "m1",
+		"body":                  []byte("payload"),
+		"send_timestamp_millis": 1000,
+		"queue_generation":      99,
+	})
+	if err := enc.HandleMessageData(EncodeMsgDataKey(queue, 99, "m1"), val); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	recs := readMessagesJSONL(t, filepath.Join(root, "sqs", queue, "messages.jsonl"))
+	if len(recs) != 1 {
+		t.Fatalf("messages = %d want 1 (no gen record => no filter)", len(recs))
 	}
 }
 
