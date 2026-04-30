@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
@@ -281,6 +282,40 @@ func TestS3_PathTraversalAttemptRejected(t *testing.T) {
 	err := enc.Finalize()
 	if !errors.Is(err, ErrS3MalformedKey) {
 		t.Fatalf("err=%v want ErrS3MalformedKey for path-traversal key", err)
+	}
+}
+
+// TestS3_KeymapRefusesSymlinkAtFinalize is the regression for Codex
+// P2 round 9 on PR #718: the S3 encoder's recordKeymap was using
+// os.Create directly, which follows symlinks. A bucket whose
+// KEYMAP.jsonl path is a pre-existing symlink (from a stale prior
+// run or a local adversary) would have its target truncated when
+// the first rename was recorded. recordKeymap now goes through
+// openSidecarFile, mirroring the redis encoder's guarded open.
+func TestS3_KeymapRefusesSymlinkAtFinalize(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	bucket := "b"
+	bucketDir := filepath.Join(root, "s3", bucket)
+	if err := os.MkdirAll(bucketDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bait := filepath.Join(root, "bait-keymap")
+	if err := os.WriteFile(bait, []byte("stay-out"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bait, filepath.Join(bucketDir, "KEYMAP.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	// Drive a meta-suffix-collision rename so recordKeymap fires.
+	enc.WithRenameCollisions(true)
+	emitObject(t, enc, bucket, 1, "evil.elastickv-meta.json", []byte("payload"), "")
+	err := enc.Finalize()
+	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite symlink") {
+		t.Fatalf("expected symlink-refusal error from KEYMAP open, got %v", err)
+	}
+	if got, _ := os.ReadFile(bait); string(got) != "stay-out" { //nolint:gosec // test path
+		t.Fatalf("bait file written through KEYMAP symlink: %q", got)
 	}
 }
 

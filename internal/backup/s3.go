@@ -147,8 +147,14 @@ type s3BucketState struct {
 	// every object flushes (the prior orphan-warning path covers it).
 	activeGen uint64
 	objects   map[string]*s3ObjectState // keyed by "object\x00generation"
-	keymap    *KeymapWriter
-	keymapDir string
+	// keymap / keymapFile / keymapDir are lazily set on the first
+	// rename. KeymapWriter.Close only flushes the bufio buffer, so
+	// the *os.File is tracked separately to be closed at finalize —
+	// otherwise a dump that produces keymaps for many buckets
+	// accumulates descriptors until EMFILE (Codex P1 round 9).
+	keymap     *KeymapWriter
+	keymapFile *os.File
+	keymapDir  string
 	// incompleteUploadsJL is opened lazily on the first
 	// !s3|upload|meta or !s3|upload|part record under
 	// --include-incomplete-uploads, then reused for every subsequent
@@ -564,18 +570,27 @@ func (s *S3Encoder) computeDirPrefixes(b *s3BucketState) map[string]bool {
 }
 
 // closeBucketKeymap closes the per-bucket KEYMAP.jsonl writer (if
-// opened) and removes the file when no rename was recorded.
+// opened) and removes the file when no rename was recorded. The
+// *os.File is closed separately because KeymapWriter.Close only
+// flushes its bufio buffer; without explicit fd close, dumps that
+// produce keymaps for many buckets leak descriptors until EMFILE
+// (Codex P1 round 9).
 func closeBucketKeymap(b *s3BucketState) error {
 	if b.keymap == nil {
 		return nil
 	}
-	if err := b.keymap.Close(); err != nil {
-		return err
+	flushErr := b.keymap.Close()
+	var closeErr error
+	if b.keymapFile != nil {
+		closeErr = b.keymapFile.Close()
+	}
+	if flushErr == nil && closeErr != nil {
+		flushErr = errors.WithStack(closeErr)
 	}
 	if b.keymap.Count() == 0 && b.keymapDir != "" {
 		_ = os.Remove(filepath.Join(b.keymapDir, "KEYMAP.jsonl"))
 	}
-	return nil
+	return flushErr
 }
 
 func (s *S3Encoder) flushObjectWithCollision(b *s3BucketState, bucketDir string, obj *s3ObjectState, needsLeafDataRename bool) error {
@@ -744,12 +759,17 @@ func (s *S3Encoder) resolveObjectFilename(b *s3BucketState, obj *s3ObjectState, 
 
 func (s *S3Encoder) recordKeymap(b *s3BucketState, bucketDir, encodedFilename string, original []byte, kind string) error {
 	if b.keymap == nil {
-		path := filepath.Join(bucketDir, "KEYMAP.jsonl")
-		f, err := os.Create(path) //nolint:gosec // path composed from output root
+		// openSidecarFile (per-platform) refuses both symlinks and
+		// hard-link clobber attacks. The previous os.Create here
+		// followed both, leaving an arbitrary-write primitive if a
+		// stale prior run or local adversary placed a link at the
+		// path. Codex P2 round 9.
+		f, err := openSidecarFile(filepath.Join(bucketDir, "KEYMAP.jsonl"))
 		if err != nil {
-			return errors.WithStack(err)
+			return err
 		}
 		b.keymap = NewKeymapWriter(f)
+		b.keymapFile = f
 		b.keymapDir = bucketDir
 	}
 	return b.keymap.WriteOriginal(encodedFilename, original, kind)
