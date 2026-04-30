@@ -130,6 +130,35 @@ func TestReadManifest_RejectsFutureFormatVersion(t *testing.T) {
 	}
 }
 
+// TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch is the
+// regression test for Codex P2 round 5: a newer-major manifest that also
+// changes the JSON type of a known field (e.g. `phase` from string to int)
+// must surface as ErrUnsupportedFormatVersion, not ErrInvalidManifest. The
+// version-branching contract advertised to callers (errors.Is(err,
+// ErrUnsupportedFormatVersion) means "upgrade required") only holds if the
+// format_version probe runs before the strict struct decode.
+func TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 999,
+		"phase": 42,
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {"dynamodb":{}, "s3":{}, "redis":{}, "sqs":{}},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("err=%v want ErrUnsupportedFormatVersion (must precede strict decode)", err)
+	}
+}
+
 func TestReadManifest_RejectsZeroFormatVersion(t *testing.T) {
 	t.Parallel()
 	m := NewPhase0SnapshotManifest(time.Now())
