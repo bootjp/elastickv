@@ -180,6 +180,31 @@ func TestCipher_Decrypt_UnknownKeyID(t *testing.T) {
 	}
 }
 
+func TestCipher_Decrypt_RejectsReservedKeyID(t *testing.T) {
+	ks := encryption.NewKeystore()
+	c := encryption.NewCipher(ks)
+	nonce := newRandomNonce(t)
+	// Provide enough bytes to look like a valid envelope body so the
+	// length check is not the failure cause.
+	body := make([]byte, encryption.TagSize+1)
+	_, err := c.Decrypt(body, nil, encryption.ReservedKeyID, nonce)
+	if !errors.Is(err, encryption.ErrReservedKeyID) {
+		t.Fatalf("expected ErrReservedKeyID, got %v", err)
+	}
+}
+
+func TestCipher_Decrypt_RejectsBadNonceSize(t *testing.T) {
+	ks, keyID := newKeystoreWithKey(t)
+	c := encryption.NewCipher(ks)
+	body := make([]byte, encryption.TagSize+1)
+	for _, nonceLen := range []int{0, 1, 11, 13, 16} {
+		_, err := c.Decrypt(body, nil, keyID, make([]byte, nonceLen))
+		if !errors.Is(err, encryption.ErrBadNonceSize) {
+			t.Fatalf("nonce=%d: expected ErrBadNonceSize, got %v", nonceLen, err)
+		}
+	}
+}
+
 func TestCipher_DistinctNoncesProduceDistinctCiphertexts(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
 	c := encryption.NewCipher(ks)

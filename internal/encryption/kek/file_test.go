@@ -174,8 +174,9 @@ func TestFileWrapper_Name(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileWrapper: %v", err)
 	}
-	if w.Name() != "file" {
-		t.Fatalf("Name() = %q, want %q", w.Name(), "file")
+	want := "file:" + path
+	if w.Name() != want {
+		t.Fatalf("Name() = %q, want %q", w.Name(), want)
 	}
 }
 

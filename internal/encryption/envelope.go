@@ -9,8 +9,11 @@ import (
 // Public constants for the §4.1 wire format.
 const (
 	// EnvelopeVersionV1 is the current envelope format version. §11.3
-	// reserves 0x02..0x0F for future authenticated formats; values
-	// outside that range cause DecodeEnvelope to return ErrEnvelopeVersion.
+	// reserves 0x02..0x0F for future authenticated formats. The current
+	// build only understands 0x01; ANY other version byte (including the
+	// 0x02..0x0F reserved range) causes DecodeEnvelope to return
+	// ErrEnvelopeVersion. Future decoders that know how to handle the
+	// reserved range will widen this check.
 	EnvelopeVersionV1 byte = 0x01
 
 	// FlagCompressed (bit 0) is set when ciphertext encrypts a Snappy-
@@ -74,14 +77,30 @@ type Envelope struct {
 
 // Encode serialises the envelope into a single byte slice using the §4.1
 // wire format. The returned slice is freshly allocated.
-func (e *Envelope) Encode() []byte {
+//
+// Encode validates the envelope at build time so a programmer error
+// (uninitialised Version, truncated Body) fails here with a clear
+// stack trace, rather than surfacing later as a confusing
+// DecodeEnvelope or Cipher.Decrypt failure on the read side. Returns:
+//   - ErrEnvelopeVersion if Version is not EnvelopeVersionV1.
+//   - ErrEnvelopeShort   if Body is shorter than TagSize (every valid
+//     body must contain at least the GCM tag).
+func (e *Envelope) Encode() ([]byte, error) {
+	if e.Version != EnvelopeVersionV1 {
+		return nil, errors.Wrapf(ErrEnvelopeVersion,
+			"encode: got 0x%02x, want 0x%02x", e.Version, EnvelopeVersionV1)
+	}
+	if len(e.Body) < TagSize {
+		return nil, errors.Wrapf(ErrEnvelopeShort,
+			"encode: body %d bytes, want >= %d", len(e.Body), TagSize)
+	}
 	out := make([]byte, HeaderSize+len(e.Body))
 	out[versionOffset] = e.Version
 	out[flagOffset] = e.Flag
-	binary.BigEndian.PutUint32(out[keyIDOffset:keyIDOffset+4], e.KeyID)
+	binary.BigEndian.PutUint32(out[keyIDOffset:keyIDOffset+keyIDBytes], e.KeyID)
 	copy(out[nonceOffset:nonceOffset+NonceSize], e.Nonce[:])
 	copy(out[HeaderSize:], e.Body)
-	return out
+	return out, nil
 }
 
 // DecodeEnvelope parses an envelope. It does NOT verify the GCM tag —
@@ -116,12 +135,22 @@ func DecodeEnvelope(src []byte) (*Envelope, error) {
 // "R" ‖ version ‖ key_id, computed by raft-layer callers in a later
 // stage).
 //
-// The function is exported so storage/ and raftengine/ callers can compose
-// the right AAD without re-implementing the byte order.
+// Allocates HeaderAADSize bytes. Hot-path callers should prefer
+// AppendHeaderAADBytes to reuse a buffer.
 func HeaderAADBytes(version, flag byte, keyID uint32) []byte {
-	out := make([]byte, HeaderAADSize)
-	out[0] = version
-	out[1] = flag
-	binary.BigEndian.PutUint32(out[2:HeaderAADSize], keyID)
-	return out
+	return AppendHeaderAADBytes(make([]byte, 0, HeaderAADSize), version, flag, keyID)
+}
+
+// AppendHeaderAADBytes appends the same 6-byte header prefix (version,
+// flag, key_id) onto dst and returns the extended slice. Allocation-free
+// when dst already has HeaderAADSize spare capacity, which lets storage
+// callers in later stages write the AAD directly into a pooled buffer
+// alongside the per-record context (e.g., pebble_key) without an
+// intermediate make().
+func AppendHeaderAADBytes(dst []byte, version, flag byte, keyID uint32) []byte {
+	var hdr [HeaderAADSize]byte
+	hdr[0] = version
+	hdr[1] = flag
+	binary.BigEndian.PutUint32(hdr[2:], keyID)
+	return append(dst, hdr[:]...)
 }

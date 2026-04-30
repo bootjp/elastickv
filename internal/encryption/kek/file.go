@@ -81,6 +81,10 @@ func (w *FileWrapper) Wrap(dek []byte) ([]byte, error) {
 // the AEAD library (the parent encryption package's ErrIntegrity is the
 // caller's responsibility to wrap, since this package must stay
 // dependency-free of the parent).
+//
+// The post-Open length check that earlier drafts had was unreachable —
+// the strict-length input check above guarantees Open returns exactly
+// fileKEKSize bytes on success — and has been removed.
 func (w *FileWrapper) Unwrap(wrapped []byte) ([]byte, error) {
 	if len(wrapped) != fileNonceSize+fileKEKSize+fileTagSize {
 		return nil, errors.Errorf("kek: wrapped DEK is %d bytes, want %d",
@@ -92,12 +96,10 @@ func (w *FileWrapper) Unwrap(wrapped []byte) ([]byte, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "kek: AES-GCM Open")
 	}
-	if len(plain) != fileKEKSize {
-		return nil, errors.Errorf("kek: unwrapped DEK is %d bytes, want %d",
-			len(plain), fileKEKSize)
-	}
 	return plain, nil
 }
 
-// Name implements Wrapper.
-func (*FileWrapper) Name() string { return "file" }
+// Name returns the provider id plus the file path so log lines and the
+// EncryptionAdmin status RPC let an operator distinguish multiple
+// configured KEKs without grepping config.
+func (w *FileWrapper) Name() string { return "file:" + w.path }

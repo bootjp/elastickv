@@ -1,7 +1,6 @@
 package encryption
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
 
 	"github.com/cockroachdb/errors"
@@ -13,6 +12,10 @@ import (
 // internal/raftengine/etcd/ (§4.2 AAD) supply the full AAD bytes. This
 // keeps the cipher narrow and lets each layer choose the right AAD
 // without baking storage/raft assumptions into the foundation package.
+//
+// AES key expansion and GCM initialization happen once per DEK at
+// Keystore.Set time; the hot path only needs an atomic.Pointer load
+// and a Seal/Open call.
 type Cipher struct {
 	keystore *Keystore
 }
@@ -29,6 +32,14 @@ func NewCipher(ks *Keystore) *Cipher {
 //   - keyID must not be ReservedKeyID; otherwise ErrReservedKeyID.
 //   - nonce must be NonceSize bytes; otherwise ErrBadNonceSize.
 //   - keyID must be present in the Keystore; otherwise ErrUnknownKeyID.
+//
+// CRITICAL: callers MUST NOT reuse the same (keyID, nonce) pair with
+// any two distinct plaintexts. Nonce reuse under AES-GCM is
+// catastrophic: it leaks the XOR of the two plaintexts and enables
+// authentication-key recovery. The §4.1 nonce construction
+// (node_id ‖ local_epoch ‖ write_count) is designed to make reuse
+// impossible by construction; do not bypass it with crypto/rand or
+// external counters without re-deriving the same uniqueness proof.
 //
 // The returned slice has length len(plaintext) + TagSize. It is
 // freshly allocated; the caller may retain it indefinitely.
@@ -67,8 +78,10 @@ func (c *Cipher) Decrypt(ciphertextAndTag, aad []byte, keyID uint32, nonce []byt
 	return plaintext, nil
 }
 
-// aeadFor returns a per-call AEAD bound to the DEK looked up from the
-// keystore, after validating keyID and nonce length.
+// aeadFor validates keyID and nonce length, then returns the
+// pre-initialized AEAD from the keystore. The hot path here is a single
+// atomic.Pointer load + a map lookup; AES key expansion happened once
+// at Keystore.Set time.
 func (c *Cipher) aeadFor(keyID uint32, nonce []byte) (cipher.AEAD, error) {
 	if keyID == ReservedKeyID {
 		return nil, errors.WithStack(ErrReservedKeyID)
@@ -76,17 +89,9 @@ func (c *Cipher) aeadFor(keyID uint32, nonce []byte) (cipher.AEAD, error) {
 	if len(nonce) != NonceSize {
 		return nil, errors.Wrapf(ErrBadNonceSize, "got %d bytes, want %d", len(nonce), NonceSize)
 	}
-	dek, ok := c.keystore.Get(keyID)
+	aead, ok := c.keystore.AEAD(keyID)
 	if !ok {
 		return nil, errors.Wrapf(ErrUnknownKeyID, "key_id=%d", keyID)
-	}
-	block, err := aes.NewCipher(dek)
-	if err != nil {
-		return nil, errors.Wrap(err, "encryption: aes.NewCipher")
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, errors.Wrap(err, "encryption: cipher.NewGCM")
 	}
 	return aead, nil
 }

@@ -10,7 +10,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func TestKeystore_SetGet(t *testing.T) {
+func TestKeystore_SetDEK(t *testing.T) {
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
 	if _, err := rand.Read(dek); err != nil {
@@ -19,12 +19,58 @@ func TestKeystore_SetGet(t *testing.T) {
 	if err := ks.Set(42, dek); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	got, ok := ks.Get(42)
+	got, ok := ks.DEK(42)
 	if !ok {
-		t.Fatal("Get(42) reported not found")
+		t.Fatal("DEK(42) reported not found")
 	}
-	if !bytes.Equal(got, dek) {
-		t.Fatal("Get(42) returned different bytes")
+	if !bytes.Equal(got[:], dek) {
+		t.Fatal("DEK(42) returned different bytes")
+	}
+}
+
+// TestKeystore_DEK_ValueCopy confirms DEK returns an array by value, so a
+// caller mutating the result cannot leak back into the live keystore.
+// This is the type-safe alternative to a defensive []byte copy: the
+// signature itself enforces immutability of the live entry.
+func TestKeystore_DEK_ValueCopy(t *testing.T) {
+	ks := encryption.NewKeystore()
+	dek := make([]byte, encryption.KeySize)
+	dek[0] = 0xAA
+	if err := ks.Set(1, dek); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got, ok := ks.DEK(1)
+	if !ok {
+		t.Fatal("DEK(1) not found")
+	}
+	// Mutate the value copy via copy() so we don't take &got[0] directly
+	// — gosec G602 is over-cautious about [N]byte indexing in tests.
+	corruptor := [1]byte{0xCC}
+	copy(got[:], corruptor[:])
+	got2, ok := ks.DEK(1)
+	if !ok {
+		t.Fatal("DEK(1) not found on second call")
+	}
+	wantPrefix := [1]byte{0xAA}
+	if !bytes.Equal(got2[:1], wantPrefix[:]) {
+		t.Fatalf("keystore was mutated via value copy: got2[:1]=%x, want %x", got2[:1], wantPrefix[:])
+	}
+}
+
+func TestKeystore_AEAD_FoundAndMissing(t *testing.T) {
+	ks := encryption.NewKeystore()
+	dek := make([]byte, encryption.KeySize)
+	if _, err := rand.Read(dek); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	if err := ks.Set(99, dek); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if aead, ok := ks.AEAD(99); !ok || aead == nil {
+		t.Fatal("AEAD(99) should return a non-nil AEAD")
+	}
+	if _, ok := ks.AEAD(123); ok {
+		t.Fatal("AEAD(123) should report not found")
 	}
 }
 
@@ -59,12 +105,13 @@ func TestKeystore_Set_CopiesInput(t *testing.T) {
 	}
 	// Mutate caller's slice; the keystore copy must be unaffected.
 	dek[0] = 0xBB
-	got, ok := ks.Get(1)
+	got, ok := ks.DEK(1)
 	if !ok {
-		t.Fatal("Get(1) reported not found")
+		t.Fatal("DEK(1) reported not found")
 	}
-	if got[0] != 0xAA {
-		t.Fatalf("keystore aliased input: got[0]=0x%02x, want 0xAA", got[0])
+	wantPrefix := [1]byte{0xAA}
+	if !bytes.Equal(got[:1], wantPrefix[:]) {
+		t.Fatalf("keystore aliased input: got[:1]=%x, want %x", got[:1], wantPrefix[:])
 	}
 }
 
@@ -158,7 +205,8 @@ func TestKeystore_Concurrent(t *testing.T) {
 			defer wg.Done()
 			for i := uint32(0); i < iterations; i++ {
 				_ = ks.IDs()
-				_, _ = ks.Get(1)
+				_, _ = ks.DEK(1)
+				_, _ = ks.AEAD(1)
 			}
 		}()
 	}

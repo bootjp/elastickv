@@ -59,7 +59,10 @@ func checkEnvelopeRoundTrip(t *testing.T, env encryption.Envelope) {
 	for i := range env.Nonce {
 		env.Nonce[i] = byte(i + 1)
 	}
-	encoded := env.Encode()
+	encoded, err := env.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
 	checkEncodedHeader(t, encoded, env)
 
 	decoded, err := encryption.DecodeEnvelope(encoded)
@@ -148,5 +151,50 @@ func TestHeaderAADBytes_Layout(t *testing.T) {
 	want := []byte{0x01, 0x01, 0x12, 0x34, 0x56, 0x78}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("HeaderAADBytes layout mismatch:\n  got  %x\n  want %x", got, want)
+	}
+}
+
+func TestAppendHeaderAADBytes_AppendsAndAllocFree(t *testing.T) {
+	// Append onto an existing buffer. The result should be the original
+	// bytes followed by the 6-byte header.
+	prefix := []byte{0xCA, 0xFE}
+	got := encryption.AppendHeaderAADBytes(prefix, encryption.EnvelopeVersionV1, encryption.FlagCompressed, 0x12345678)
+	want := []byte{0xCA, 0xFE, 0x01, 0x01, 0x12, 0x34, 0x56, 0x78}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("AppendHeaderAADBytes mismatch:\n  got  %x\n  want %x", got, want)
+	}
+
+	// With cap >= len(prefix)+HeaderAADSize, append should reuse the
+	// backing array (no allocation). This is the storage-layer hot-path
+	// expectation.
+	buf := make([]byte, 0, 32)
+	buf = append(buf, 0xAA, 0xBB)
+	out := encryption.AppendHeaderAADBytes(buf, 0x01, 0x00, 0xDEADBEEF)
+	if &out[0] != &buf[0] {
+		t.Fatal("AppendHeaderAADBytes allocated when input had spare capacity")
+	}
+}
+
+func TestEnvelope_Encode_RejectsBadVersion(t *testing.T) {
+	env := encryption.Envelope{
+		Version: 0x02, // not EnvelopeVersionV1
+		Body:    bytes.Repeat([]byte{0xAA}, encryption.TagSize),
+	}
+	_, err := env.Encode()
+	if !errors.Is(err, encryption.ErrEnvelopeVersion) {
+		t.Fatalf("expected ErrEnvelopeVersion, got %v", err)
+	}
+}
+
+func TestEnvelope_Encode_RejectsShortBody(t *testing.T) {
+	for _, n := range []int{0, 1, encryption.TagSize - 1} {
+		env := encryption.Envelope{
+			Version: encryption.EnvelopeVersionV1,
+			Body:    make([]byte, n),
+		}
+		_, err := env.Encode()
+		if !errors.Is(err, encryption.ErrEnvelopeShort) {
+			t.Fatalf("body=%d: expected ErrEnvelopeShort, got %v", n, err)
+		}
 	}
 }
