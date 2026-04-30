@@ -284,26 +284,21 @@ func TestS3_PathTraversalAttemptRejected(t *testing.T) {
 	}
 }
 
-func TestS3_AbsolutePathObjectKeyConfinedUnderBucket(t *testing.T) {
+func TestS3_LeadingSlashObjectKeyRejected(t *testing.T) {
 	t.Parallel()
-	// filepath.Join normalises a leading "/" on the second arg, so
-	// "/etc/host" becomes "<bucketDir>/etc/host" — under the bucket
-	// root, not at filesystem root. This is safe (the user gets a
-	// surprising-but-confined path) and matches what `aws s3 sync`
-	// would round-trip back. We assert the safe outcome rather than
-	// rejecting; rejection would surprise operators with legitimate
-	// keys whose first byte is '/'.
-	enc, root := newS3Encoder(t)
-	emitObject(t, enc, "b", 1, "/etc/host-confined", []byte("ok"), "")
-	if err := enc.Finalize(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(filepath.Join(root, "s3", "b", "etc", "host-confined")) //nolint:gosec
-	if err != nil {
-		t.Fatalf("absolute-path key must end up under the bucket dir: %v", err)
-	}
-	if string(got) != "ok" {
-		t.Fatalf("body=%q", got)
+	// Codex P1 round 5: S3 treats "/a" and "a" as two distinct keys
+	// (the literal byte '/' is part of the key). filepath.Join would
+	// silently strip the leading "/" and collapse both onto the same
+	// output path, so a bucket containing both objects would produce
+	// last-flush-wins corruption with no KEYMAP record. The encoder
+	// must refuse any key whose first segment is empty rather than
+	// "confine and merge" them. Operators with such keys must rename
+	// in S3 first.
+	enc, _ := newS3Encoder(t)
+	emitObject(t, enc, "b", 1, "/etc/host-attack", []byte("ok"), "")
+	err := enc.Finalize()
+	if !errors.Is(err, ErrS3MalformedKey) {
+		t.Fatalf("err=%v want ErrS3MalformedKey for leading-slash key", err)
 	}
 }
 

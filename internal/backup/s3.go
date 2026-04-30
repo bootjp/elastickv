@@ -672,23 +672,22 @@ func safeJoinUnderRoot(root, rel string) (string, error) {
 	// them onto one filesystem path; without explicit rejection,
 	// distinct user keys would silently overwrite each other at
 	// finalize (Codex P1 #614).
+	//
+	// Empty segments are rejected wherever they appear — including
+	// the leading position. A leading "/" produces an initial empty
+	// segment (segs[0] == "") which filepath.Join would otherwise
+	// strip, collapsing "/a" onto the same output path as "a".
+	// Because S3 treats those as two distinct keys, last-flush wins
+	// and silently overwrites the other (Codex P1 round 5).
 	segs := strings.Split(rel, "/")
-	for i, seg := range segs {
+	for _, seg := range segs {
 		switch seg {
 		case ".", "..":
 			return "", errors.Wrapf(ErrS3MalformedKey,
 				"object name has dot segment %q (S3 treats it literally; rename in S3 first)", rel)
 		case "":
-			// A leading "/" produces an initial empty segment
-			// (segs[0] == ""); filepath.Join handles that case
-			// safely by stripping the prefix, matching the
-			// already-tested "absolute path collapses under
-			// bucket dir" behaviour. Reject empty segments
-			// anywhere else (mid-path "//" or trailing "/").
-			if i != 0 {
-				return "", errors.Wrapf(ErrS3MalformedKey,
-					"object name has empty path segment %q", rel)
-			}
+			return "", errors.Wrapf(ErrS3MalformedKey,
+				"object name has empty path segment %q", rel)
 		}
 	}
 	cleanRoot := filepath.Clean(root)
