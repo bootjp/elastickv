@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -63,12 +64,34 @@ type HTFIFOCapabilityPeerStatus struct {
 }
 
 // defaultSQSCapabilityPollTimeout caps how long the poller waits on
-// any single peer. The §8.5 design's "fail-closed default for
-// nodes that don't respond within a short timeout" turns into a
-// concrete bound here. Operators wanting a longer wait can pass
-// their own context with a deadline; the per-peer cap is enforced
-// in addition so a single slow peer cannot stall the whole poll.
+// any single peer when PollerConfig.PerPeerTimeout is zero. The
+// §8.5 design's "fail-closed default for nodes that don't respond
+// within a short timeout" turns into a concrete bound here.
+// Operators wanting a longer or shorter wait can override via
+// PollerConfig; the cap is enforced in addition to any
+// caller-supplied context deadline so a single slow peer cannot
+// stall the whole poll.
 const defaultSQSCapabilityPollTimeout = 3 * time.Second
+
+// PollerConfig tunes PollSQSHTFIFOCapability for a specific call
+// site. All fields are optional — the zero value picks safe
+// defaults. Tests use the explicit PerPeerTimeout to exercise the
+// per-peer cap independently of any caller-supplied context
+// deadline.
+type PollerConfig struct {
+	// HTTPClient is the client used for /sqs_health GETs. Nil
+	// falls back to http.DefaultClient. Callers wanting connection
+	// pooling, custom Transport, or shorter Client.Timeout pass
+	// their own.
+	HTTPClient *http.Client
+
+	// PerPeerTimeout caps how long any single peer's poll runs
+	// before being abandoned. Zero defaults to
+	// defaultSQSCapabilityPollTimeout (3s). Tests pass a small
+	// value (e.g. 100ms) so the per-peer cap path can be
+	// exercised quickly without a parent context deadline.
+	PerPeerTimeout time.Duration
+}
 
 // PollSQSHTFIFOCapability polls each peer's /sqs_health endpoint
 // concurrently and reports whether all advertise htfifo. The
@@ -90,12 +113,18 @@ const defaultSQSCapabilityPollTimeout = 3 * time.Second
 // Concurrency: peers are polled in goroutines; results land via
 // an indexed channel so the slice writes are obviously race-free.
 //
-// Timeouts: each peer poll is bounded by min(ctx.Deadline(),
-// defaultSQSCapabilityPollTimeout). A long ctx deadline does not
-// extend the per-peer cap.
-func PollSQSHTFIFOCapability(ctx context.Context, client *http.Client, peers []string) *HTFIFOCapabilityReport {
+// Timeouts: each peer poll is bounded by
+// min(ctx.Deadline(), now+cfg.PerPeerTimeout). A long ctx deadline
+// does not extend the per-peer cap, and an absent ctx deadline
+// still triggers fail-closed at the per-peer cap.
+func PollSQSHTFIFOCapability(ctx context.Context, peers []string, cfg PollerConfig) *HTFIFOCapabilityReport {
+	client := cfg.HTTPClient
 	if client == nil {
 		client = http.DefaultClient
+	}
+	perPeerTimeout := cfg.PerPeerTimeout
+	if perPeerTimeout <= 0 {
+		perPeerTimeout = defaultSQSCapabilityPollTimeout
 	}
 	report := &HTFIFOCapabilityReport{
 		Peers: make([]HTFIFOCapabilityPeerStatus, len(peers)),
@@ -119,7 +148,7 @@ func PollSQSHTFIFOCapability(ctx context.Context, client *http.Client, peers []s
 			defer wg.Done()
 			results <- indexedStatus{
 				idx:    idx,
-				status: pollOneSQSPeerForHTFIFO(ctx, client, addr),
+				status: pollOneSQSPeerForHTFIFO(ctx, client, addr, perPeerTimeout),
 			}
 		}(i, peer)
 	}
@@ -142,7 +171,7 @@ func PollSQSHTFIFOCapability(ctx context.Context, client *http.Client, peers []s
 // returned struct's Error field — this function never returns a
 // Go error itself so the caller can map peers to results in one
 // pass without checking len(errors).
-func pollOneSQSPeerForHTFIFO(ctx context.Context, client *http.Client, peer string) HTFIFOCapabilityPeerStatus {
+func pollOneSQSPeerForHTFIFO(ctx context.Context, client *http.Client, peer string, perPeerTimeout time.Duration) HTFIFOCapabilityPeerStatus {
 	status := HTFIFOCapabilityPeerStatus{Address: peer}
 
 	if peer == "" {
@@ -150,7 +179,7 @@ func pollOneSQSPeerForHTFIFO(ctx context.Context, client *http.Client, peer stri
 		return status
 	}
 
-	pollCtx, cancel := context.WithTimeout(ctx, defaultSQSCapabilityPollTimeout)
+	pollCtx, cancel := context.WithTimeout(ctx, perPeerTimeout)
 	defer cancel()
 
 	url := buildSQSHealthURL(peer)
@@ -166,9 +195,24 @@ func pollOneSQSPeerForHTFIFO(ctx context.Context, client *http.Client, peer stri
 		status.Error = errors.Wrapf(err, "GET %q", url).Error()
 		return status
 	}
-	defer func() { _ = resp.Body.Close() }()
+	// Close the body via a deferred closure so a non-nil close
+	// error surfaces in the cluster logs rather than being
+	// dropped — masking it could hide leaking connections under
+	// load (gemini medium on PR #721). Body is also drained on
+	// every early return below so the http.Transport can reuse
+	// the underlying TCP connection (claude minor on PR #721).
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			slog.Warn("sqs capability poller: response body close failed",
+				"peer", peer, "err", cerr)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
+		// Drain the body before returning so the transport can
+		// reuse the connection. Non-200 bodies under our 1 KiB
+		// LimitReader are tiny, so the discard cost is negligible.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, sqsCapabilityMaxBodyBytes))
 		status.Error = fmt.Sprintf("%s returned HTTP %d", url, resp.StatusCode)
 		return status
 	}

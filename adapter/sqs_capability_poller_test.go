@@ -46,7 +46,7 @@ func TestPollSQSHTFIFOCapability_AllAdvertise(t *testing.T) {
 	_, addr1 := newSQSHealthServer(t, sqsHealthBody{Status: "ok", Capabilities: []string{sqsCapabilityHTFIFO}})
 	_, addr2 := newSQSHealthServer(t, sqsHealthBody{Status: "ok", Capabilities: []string{sqsCapabilityHTFIFO}})
 
-	report := PollSQSHTFIFOCapability(context.Background(), nil, []string{addr1, addr2})
+	report := PollSQSHTFIFOCapability(context.Background(), []string{addr1, addr2}, PollerConfig{})
 	require.True(t, report.AllAdvertise,
 		"all peers advertise → AllAdvertise must be true")
 	require.Len(t, report.Peers, 2)
@@ -66,7 +66,7 @@ func TestPollSQSHTFIFOCapability_OneMissingFailsClosed(t *testing.T) {
 	_, addrGood := newSQSHealthServer(t, sqsHealthBody{Status: "ok", Capabilities: []string{sqsCapabilityHTFIFO}})
 	_, addrOld := newSQSHealthServer(t, sqsHealthBody{Status: "ok", Capabilities: []string{}})
 
-	report := PollSQSHTFIFOCapability(context.Background(), nil, []string{addrGood, addrOld})
+	report := PollSQSHTFIFOCapability(context.Background(), []string{addrGood, addrOld}, PollerConfig{})
 	require.False(t, report.AllAdvertise,
 		"one peer without the capability must drop AllAdvertise")
 	require.Len(t, report.Peers, 2)
@@ -105,8 +105,8 @@ func TestPollSQSHTFIFOCapability_HTTPErrorFailsClosed(t *testing.T) {
 	t.Cleanup(garbageSrv.Close)
 	addrGarbage := strings.TrimPrefix(garbageSrv.URL, "http://")
 
-	report := PollSQSHTFIFOCapability(context.Background(), nil,
-		[]string{addr500, addrUnreachable, addrGarbage})
+	report := PollSQSHTFIFOCapability(context.Background(),
+		[]string{addr500, addrUnreachable, addrGarbage}, PollerConfig{})
 
 	require.False(t, report.AllAdvertise,
 		"any transport / parse failure must fail closed")
@@ -121,15 +121,13 @@ func TestPollSQSHTFIFOCapability_HTTPErrorFailsClosed(t *testing.T) {
 	require.Contains(t, report.Peers[2].Error, "malformed JSON")
 }
 
-// TestPollSQSHTFIFOCapability_TimeoutFailsClosed pins the
-// "fail-closed default for nodes that don't respond within a short
-// timeout" rule from §8.5: a peer that hangs past the per-peer
-// timeout must drop AllAdvertise without holding up the entire
-// poll for longer than that bound.
-func TestPollSQSHTFIFOCapability_TimeoutFailsClosed(t *testing.T) {
+// TestPollSQSHTFIFOCapability_ParentContextDeadlineFailsClosed
+// pins that an expiring parent ctx cancels the request — the
+// poll respects whichever bound (parent ctx or per-peer cap)
+// fires first.
+func TestPollSQSHTFIFOCapability_ParentContextDeadlineFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	// Peer that delays past the test's timeout.
 	hangSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
@@ -141,20 +139,52 @@ func TestPollSQSHTFIFOCapability_TimeoutFailsClosed(t *testing.T) {
 	t.Cleanup(hangSrv.Close)
 	addrHang := strings.TrimPrefix(hangSrv.URL, "http://")
 
-	// Use a context with a short bound to force the per-peer
-	// timeout path quickly. The test should finish in well under
-	// the 5s the server would have waited.
+	// Parent ctx expires before the per-peer cap (default 3s).
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	report := PollSQSHTFIFOCapability(ctx, nil, []string{addrHang})
+	report := PollSQSHTFIFOCapability(ctx, []string{addrHang}, PollerConfig{})
 	elapsed := time.Since(start)
 
 	require.False(t, report.AllAdvertise)
 	require.Less(t, elapsed, 4*time.Second,
-		"poll must respect the per-peer timeout — a hung peer must "+
-			"not stall for the full server-side delay")
+		"poll must respect the parent ctx deadline")
+	require.NotEmpty(t, report.Peers[0].Error)
+}
+
+// TestPollSQSHTFIFOCapability_PerPeerTimeoutFailsClosed pins the
+// per-peer cap independently of any parent ctx deadline. With
+// context.Background() (no deadline) and PollerConfig.PerPeerTimeout
+// set short, the poll MUST still abandon a hung peer at the cap —
+// otherwise a missing parent deadline would let a single slow peer
+// stall a CreateQueue gate indefinitely (claude nit on PR #721
+// round 1).
+func TestPollSQSHTFIFOCapability_PerPeerTimeoutFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	hangSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(5 * time.Second):
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(hangSrv.Close)
+	addrHang := strings.TrimPrefix(hangSrv.URL, "http://")
+
+	// No parent deadline; per-peer cap is the only bound.
+	start := time.Now()
+	report := PollSQSHTFIFOCapability(context.Background(), []string{addrHang},
+		PollerConfig{PerPeerTimeout: 100 * time.Millisecond})
+	elapsed := time.Since(start)
+
+	require.False(t, report.AllAdvertise)
+	require.Less(t, elapsed, 2*time.Second,
+		"poll must respect the per-peer cap when there is no "+
+			"parent ctx deadline — a missing deadline must NOT let "+
+			"a hung peer stall the CreateQueue gate")
 	require.NotEmpty(t, report.Peers[0].Error)
 }
 
@@ -165,7 +195,7 @@ func TestPollSQSHTFIFOCapability_TimeoutFailsClosed(t *testing.T) {
 // report.
 func TestPollSQSHTFIFOCapability_EmptyPeersIsVacuouslyTrue(t *testing.T) {
 	t.Parallel()
-	report := PollSQSHTFIFOCapability(context.Background(), nil, nil)
+	report := PollSQSHTFIFOCapability(context.Background(), nil, PollerConfig{})
 	require.True(t, report.AllAdvertise)
 	require.Empty(t, report.Peers)
 }
@@ -176,7 +206,7 @@ func TestPollSQSHTFIFOCapability_EmptyPeersIsVacuouslyTrue(t *testing.T) {
 // a malformed URL and a confusing transport error.
 func TestPollSQSHTFIFOCapability_EmptyPeerAddressFailsClosed(t *testing.T) {
 	t.Parallel()
-	report := PollSQSHTFIFOCapability(context.Background(), nil, []string{""})
+	report := PollSQSHTFIFOCapability(context.Background(), []string{""}, PollerConfig{})
 	require.False(t, report.AllAdvertise)
 	require.Len(t, report.Peers, 1)
 	require.Equal(t, "empty peer address", report.Peers[0].Error)
@@ -191,7 +221,7 @@ func TestPollSQSHTFIFOCapability_FullURLPeer(t *testing.T) {
 	srv, _ := newSQSHealthServer(t, sqsHealthBody{
 		Status: "ok", Capabilities: []string{sqsCapabilityHTFIFO},
 	})
-	report := PollSQSHTFIFOCapability(context.Background(), nil, []string{srv.URL})
+	report := PollSQSHTFIFOCapability(context.Background(), []string{srv.URL}, PollerConfig{})
 	require.True(t, report.AllAdvertise)
 	require.True(t, report.Peers[0].HasHTFIFO)
 }
@@ -225,7 +255,7 @@ func TestPollSQSHTFIFOCapability_ConcurrentPolling(t *testing.T) {
 	}
 
 	start := time.Now()
-	report := PollSQSHTFIFOCapability(context.Background(), nil, peers)
+	report := PollSQSHTFIFOCapability(context.Background(), peers, PollerConfig{})
 	elapsed := time.Since(start)
 
 	require.True(t, report.AllAdvertise)
@@ -252,6 +282,18 @@ func TestBuildSQSHealthURL(t *testing.T) {
 		{"http://node.example:5050", "http://node.example:5050" + sqsHealthPath},
 		{"http://node.example:5050/", "http://node.example:5050" + sqsHealthPath},
 		{"https://node.example", "https://node.example" + sqsHealthPath},
+		// Caller passing a URL that ALREADY includes the health
+		// path: documented behaviour is that the helper appends
+		// the path again (claude minor on PR #721 round 1). The
+		// contract is "pass a base URL or a host:port, never a
+		// full request URL". This case pins the behaviour so a
+		// future refactor can either keep it (and reject misuse
+		// via CreateQueue input validation) or change the
+		// contract intentionally.
+		{
+			"http://node.example:5050" + sqsHealthPath,
+			"http://node.example:5050" + sqsHealthPath + sqsHealthPath,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.peer, func(t *testing.T) {
@@ -282,7 +324,7 @@ func TestPollSQSHTFIFOCapability_RespectsBodyLimit(t *testing.T) {
 	t.Cleanup(bigSrv.Close)
 	addr := strings.TrimPrefix(bigSrv.URL, "http://")
 
-	report := PollSQSHTFIFOCapability(context.Background(), nil, []string{addr})
+	report := PollSQSHTFIFOCapability(context.Background(), []string{addr}, PollerConfig{})
 	require.False(t, report.AllAdvertise)
 	require.Contains(t, report.Peers[0].Error, "malformed JSON",
 		"truncated body must surface as JSON parse error, not as "+
