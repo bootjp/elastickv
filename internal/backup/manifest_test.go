@@ -19,13 +19,13 @@ func TestManifest_Phase0RoundTrip(t *testing.T) {
 	m.SnapshotIndex = 18432021
 	m.LastCommitTS = 4517352099840000
 	m.Source = &Source{FSMPath: "/data/fsm-snap/0000000000000064.fsm", FSMCRC32C: "deadbeef"}
-	m.Adapters = Adapters{
+	m.Adapters = &Adapters{
 		DynamoDB: &Adapter{Tables: []string{"orders", "users"}},
 		S3:       &Adapter{Buckets: []string{"photos"}},
 		Redis:    &Adapter{Databases: []uint32{0}},
 		SQS:      &Adapter{Queues: []string{"orders-fifo.fifo"}},
 	}
-	m.Exclusions = Exclusions{} // all defaults
+	m.Exclusions = &Exclusions{} // all defaults
 
 	var buf bytes.Buffer
 	if err := WriteManifest(&buf, m); err != nil {
@@ -47,6 +47,51 @@ func TestManifest_Phase0RoundTrip(t *testing.T) {
 	}
 	if got.Live != nil {
 		t.Fatalf("phase0 manifest must not set Live, got %+v", got.Live)
+	}
+}
+
+func TestManifest_Phase1MustSetLive(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	// Live deliberately omitted -- the gap Codex P1 #295 caught.
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestManifest_Phase1RejectsZeroReadTS(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	m.Live = &Live{ReadTS: 0}
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for zero read_ts", err)
+	}
+}
+
+func TestManifest_Phase1WithLiveAndNonZeroReadTSIsValid(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	m.Live = &Live{ReadTS: 12345}
+	var buf bytes.Buffer
+	if err := WriteManifest(&buf, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	got, err := ReadManifest(&buf)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if got.Live == nil || got.Live.ReadTS != 12345 {
+		t.Fatalf("Live mismatch: %+v", got.Live)
 	}
 }
 
@@ -85,6 +130,35 @@ func TestReadManifest_RejectsFutureFormatVersion(t *testing.T) {
 	}
 }
 
+// TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch is the
+// regression test for Codex P2 round 5: a newer-major manifest that also
+// changes the JSON type of a known field (e.g. `phase` from string to int)
+// must surface as ErrUnsupportedFormatVersion, not ErrInvalidManifest. The
+// version-branching contract advertised to callers (errors.Is(err,
+// ErrUnsupportedFormatVersion) means "upgrade required") only holds if the
+// format_version probe runs before the strict struct decode.
+func TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 999,
+		"phase": 42,
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {"dynamodb":{}, "s3":{}, "redis":{}, "sqs":{}},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("err=%v want ErrUnsupportedFormatVersion (must precede strict decode)", err)
+	}
+}
+
 func TestReadManifest_RejectsZeroFormatVersion(t *testing.T) {
 	t.Parallel()
 	m := NewPhase0SnapshotManifest(time.Now())
@@ -96,10 +170,13 @@ func TestReadManifest_RejectsZeroFormatVersion(t *testing.T) {
 	}
 }
 
-func TestReadManifest_RejectsUnknownFields(t *testing.T) {
+func TestReadManifest_AcceptsUnknownFieldsForSameMajorMinorEvolution(t *testing.T) {
 	t.Parallel()
-	// Format drift safety: an unknown field surfaces loudly rather than
-	// being silently ignored.
+	// Same-major minor evolution: a newer producer adds an optional
+	// field; older readers must silently ignore it rather than fail
+	// the read. Codex P1 #205 (round 2) caught the earlier
+	// DisallowUnknownFields strictness which broke the documented
+	// same-major compatibility model.
 	body := `{
 		"format_version": 1,
 		"phase": "phase0-snapshot-decode",
@@ -113,11 +190,14 @@ func TestReadManifest_RejectsUnknownFields(t *testing.T) {
 		"s3_meta_suffix": ".elastickv-meta.json",
 		"s3_collision_strategy": "leaf-data-suffix",
 		"dynamodb_layout": "per-item",
-		"unknown_field": "ahoy"
+		"future_optional_field": "added in v1.minor"
 	}`
-	_, err := ReadManifest(strings.NewReader(body))
-	if !errors.Is(err, ErrInvalidManifest) {
-		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	got, err := ReadManifest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("unknown optional field must be silently accepted: %v", err)
+	}
+	if got.FormatVersion != 1 {
+		t.Fatalf("format_version = %d", got.FormatVersion)
 	}
 }
 
@@ -257,6 +337,52 @@ func TestAdaptersStruct_NilVsEmptyDistinguishedOnDisk(t *testing.T) {
 	}
 	if strings.Contains(out, `"s3"`) || strings.Contains(out, `"redis"`) || strings.Contains(out, `"sqs"`) {
 		t.Fatalf("excluded adapters must be omitted, got %s", out)
+	}
+}
+
+func TestReadManifest_RejectsMissingAdapters(t *testing.T) {
+	t.Parallel()
+	// Adapters section omitted from the JSON entirely — Codex P2
+	// #146 round 3. With Adapters as a pointer the omission decodes
+	// as nil; validation must surface ErrInvalidManifest rather than
+	// treat an empty zero-value section as valid.
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for missing adapters", err)
+	}
+}
+
+func TestReadManifest_RejectsMissingExclusions(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for missing exclusions", err)
 	}
 }
 

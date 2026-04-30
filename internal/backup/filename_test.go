@@ -309,6 +309,44 @@ func TestEncodeBinarySegment_FuzzRoundTripIfNotShaFallback(t *testing.T) {
 	})
 }
 
+func TestEncodeSegment_LongUnreservedASCIIEncodesAsIs(t *testing.T) {
+	t.Parallel()
+	// 200 ASCII letters are all unreserved; the percent-encoding is
+	// 1:1 (200 bytes), well under the 240-byte ceiling. The encoder
+	// must NOT take the SHA fallback for such inputs — Codex P1 #100.
+	raw := []byte(strings.Repeat("a", 200))
+	enc := EncodeSegment(raw)
+	if IsShaFallback(enc) {
+		t.Fatalf("200-byte ASCII unreserved input must NOT take SHA fallback")
+	}
+	dec, err := DecodeSegment(enc)
+	if err != nil {
+		t.Fatalf("DecodeSegment: %v", err)
+	}
+	if string(dec) != string(raw) {
+		t.Fatalf("round-trip failed for 200-byte ASCII")
+	}
+}
+
+func TestEncodeSegment_KeyStartingWithBinaryPrefixIsPromotedToFallback(t *testing.T) {
+	t.Parallel()
+	// A user STRING key like "b64.foo" passed naively through
+	// EncodeSegment returns "b64.foo" (all unreserved). DecodeSegment
+	// then sees the b64. prefix, treats it as a binary segment, and
+	// decodes the base64 — producing the wrong bytes. Codex P1 #146.
+	// EncodeSegment must promote any input whose encoded form starts
+	// with the binary prefix to a real SHA fallback so KEYMAP.jsonl
+	// carries the original.
+	raw := []byte("b64.foo")
+	enc := EncodeSegment(raw)
+	if !IsShaFallback(enc) {
+		t.Fatalf("expected SHA fallback for b64.-prefixed input, got %q", enc)
+	}
+	if _, err := DecodeSegment(enc); !errors.Is(err, ErrShaFallbackNeedsKeymap) {
+		t.Fatalf("decode err=%v want ErrShaFallbackNeedsKeymap", err)
+	}
+}
+
 func TestEncodeSegment_KeyMatchingShaFallbackShapeIsPromotedToFallback(t *testing.T) {
 	t.Parallel()
 	// A user key that is itself made of 32 hex chars + "__" + suffix
