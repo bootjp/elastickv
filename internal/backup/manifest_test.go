@@ -386,6 +386,63 @@ func TestReadManifest_RejectsMissingExclusions(t *testing.T) {
 	}
 }
 
+// TestReadManifest_RejectsMissingExclusionFlag is the regression for
+// Codex P2 round 7: each Exclusions sub-field must be explicitly
+// present in the JSON. Boolean fields default to `false` in Go, so an
+// omitted `preserve_sqs_visibility` would otherwise pass the strict
+// decode and silently look "off" — losing producer-side provenance.
+func TestReadManifest_RejectsMissingExclusionFlag(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		excl string
+	}{
+		{
+			"missing include_incomplete_uploads",
+			`{"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing include_orphans",
+			`{"include_incomplete_uploads":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing preserve_sqs_visibility",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing include_sqs_side_records",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false}`,
+		},
+		{
+			"explicit-null preserve_sqs_visibility",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":null,"include_sqs_side_records":false}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := `{
+				"format_version": 1,
+				"phase": "phase0-snapshot-decode",
+				"wall_time_iso": "2026-04-29T00:00:00Z",
+				"adapters": {},
+				"exclusions": ` + tc.excl + `,
+				"checksum_algorithm": "sha256",
+				"checksum_format": "sha256sum",
+				"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+				"key_segment_max_bytes": 240,
+				"s3_meta_suffix": ".elastickv-meta.json",
+				"s3_collision_strategy": "leaf-data-suffix",
+				"dynamodb_layout": "per-item"
+			}`
+			_, err := ReadManifest(strings.NewReader(body))
+			if !errors.Is(err, ErrInvalidManifest) {
+				t.Fatalf("err=%v want ErrInvalidManifest", err)
+			}
+		})
+	}
+}
+
 func TestWriteManifest_ProducesPrettyJSON(t *testing.T) {
 	t.Parallel()
 	m := NewPhase0SnapshotManifest(time.Now())

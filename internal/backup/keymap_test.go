@@ -218,6 +218,34 @@ func TestKeymapReader_RejectsMalformedBase64AtParseTime(t *testing.T) {
 	}
 }
 
+// TestKeymapReader_RejectsExplicitNullField is the regression for
+// Codex P1 round 7-follow-up: `"original": null` round-trips through
+// json.Unmarshal into rec.OriginalB64 == "", which base64.DecodeString
+// then accepts as empty bytes — silently rewriting the mapping. The
+// presence-aware decode must also reject the JSON `null` literal for
+// each required field.
+func TestKeymapReader_RejectsExplicitNullField(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"null original", `{"encoded":"x","original":null,"kind":"sha-fallback"}`},
+		{"null encoded", `{"encoded":null,"original":"AA","kind":"sha-fallback"}`},
+		{"null kind", `{"encoded":"x","original":"AA","kind":null}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := NewKeymapReader(strings.NewReader(tc.body + "\n"))
+			_, _, err := r.Next()
+			if !errors.Is(err, ErrInvalidKeymapRecord) {
+				t.Fatalf("err=%v want ErrInvalidKeymapRecord on null field", err)
+			}
+		})
+	}
+}
+
 // TestKeymapReader_RejectsMissingOriginalField exercises Codex P2 round 5:
 // a record that omits `original` entirely must not be accepted as if the
 // original key were empty bytes, because base64.DecodeString("") succeeds
