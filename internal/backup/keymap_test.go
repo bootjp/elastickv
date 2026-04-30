@@ -242,6 +242,43 @@ func TestKeymapReader_RejectsMissingOriginalField(t *testing.T) {
 	}
 }
 
+// TestKeymapReader_AcceptsMaxSizedOriginal is the regression for Codex
+// P1 round 6: a record whose `original` is the source store's maximum
+// allowed key (1 MiB, per store/mvcc_store.go maxSnapshotKeySize) must
+// round-trip cleanly. Before the bump the scanner cap was 1 MiB, but
+// base64url expands the value to ~1.33 MiB; KeymapReader.Next failed
+// with `bufio.Scanner: token too long` and the dump could not be
+// loaded back. Test reads the largest legitimate KEYMAP line we will
+// ever produce.
+func TestKeymapReader_AcceptsMaxSizedOriginal(t *testing.T) {
+	t.Parallel()
+	const maxSnapshotKeyBytes = 1 << 20
+	original := make([]byte, maxSnapshotKeyBytes)
+	for i := range original {
+		original[i] = byte(i % 251) //nolint:mnd // arbitrary byte spread
+	}
+	var buf bytes.Buffer
+	w := NewKeymapWriter(&buf)
+	if err := w.WriteOriginal("encoded-x", original, KindSHAFallback); err != nil {
+		t.Fatalf("WriteOriginal: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	rd := NewKeymapReader(&buf)
+	rec, ok, err := rd.Next()
+	if err != nil || !ok {
+		t.Fatalf("Next: ok=%v err=%v", ok, err)
+	}
+	got, err := rec.Original()
+	if err != nil {
+		t.Fatalf("Original: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("Original round-trip lost data: len got=%d want=%d", len(got), len(original))
+	}
+}
+
 // TestKeymapReader_AcceptsExplicitEmptyOriginal sanity-checks that an
 // explicitly-empty `original` (the field is present, value is "") still
 // parses. The contract is that absence is rejected, not emptiness.
