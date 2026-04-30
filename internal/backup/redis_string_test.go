@@ -199,6 +199,37 @@ func TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex(t *testing.T) {
 	assertTTLSidecar(t, filepath.Join(root, "redis", "db_0", "strings_ttl.jsonl"), "expiring", fixedExpireMs)
 }
 
+// TestRedisDB_OpenJSONLRefusesHardLinkClobber is the regression for
+// Codex P2 round 9: O_NOFOLLOW only blocks symlinks; an adversary
+// who can write the output directory could pre-create
+// strings_ttl.jsonl as a hard link to a file outside the dump tree
+// (e.g. /etc/passwd) and the open's O_TRUNC would clobber that
+// inode. openSidecarFile now opens WITHOUT O_TRUNC, fstat()s the
+// descriptor, refuses if Nlink > 1, and only calls Truncate(0) on
+// the verified-single-link case.
+func TestRedisDB_OpenJSONLRefusesHardLinkClobber(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	dir := filepath.Join(root, "redis", "db_0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bait := filepath.Join(root, "bait-hardlink")
+	if err := os.WriteFile(bait, []byte("stay-out"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(bait, filepath.Join(dir, redisStringsTTLFile)); err != nil {
+		t.Fatal(err)
+	}
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), fixedExpireMs))
+	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite hard-linked file") {
+		t.Fatalf("expected hard-link refusal error from openSidecarFile, got %v", err)
+	}
+	if got, _ := os.ReadFile(bait); string(got) != "stay-out" { //nolint:gosec // test path
+		t.Fatalf("bait file written through hard link: %q", got)
+	}
+}
+
 // TestRedisDB_OpenJSONLRefusesSymlinkOverwrite is the regression for Codex
 // P2 round 5 + P1 round 6: openJSONL must atomically refuse to follow
 // symlinks. The earlier Lstat-then-Create variant left a TOCTOU window
