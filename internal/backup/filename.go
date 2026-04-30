@@ -80,30 +80,68 @@ var ErrShaFallbackNeedsKeymap = errors.New("backup: filename uses SHA fallback; 
 // filename component. It is the inverse of DecodeSegment for non-fallback
 // inputs.
 //
-// The encoding is deterministic and idempotent given the same input.
+// The encoding is deterministic given the same input.
 //
-// Two short-circuits ensure the encoder never trips its own invariants:
+// Three structural short-circuits ensure DecodeSegment cannot
+// misclassify a legitimate key:
 //
-//   - If raw is so large that percent-encoding it would always overflow
-//     maxSegmentBytes (3*len(raw) > maxSegmentBytes), we go straight to
-//     shaFallback without allocating the full expansion. Without this an
-//     adversarial caller could force a very large transient allocation
-//     just to discard it.
-//   - If the percent-encoded form happens to match the SHA-fallback shape
-//     (32 hex chars followed by "__"), we promote it to a real
+//   - If `raw` is longer than maxSegmentBytes, even a fully-unreserved
+//     encoding (1:1) cannot fit, so we go straight to shaFallback.
+//     This also caps the percent-encode allocation at
+//     ~maxSegmentBytes, preventing OOM on adversarial input.
+//   - If the percent-encoded form happens to match the SHA-fallback
+//     shape (32 hex chars followed by "__"), we promote it to a real
 //     SHA-fallback so DecodeSegment's structural detection cannot
-//     misclassify a legitimate key. Both isShaFallback and shaFallback
-//     are true on the resulting output, so KEYMAP.jsonl carries the
-//     original bytes for exact-byte recovery.
+//     fabricate a wrong original.
+//   - If the percent-encoded form starts with the binary "b64."
+//     prefix, we promote to SHA-fallback for the same reason: a
+//     plain string key like "b64.foo" would otherwise be decoded as
+//     base64 and produce different bytes on round-trip.
+//
+// Both promoted-fallback paths leave the original in KEYMAP.jsonl
+// (a correctness dependency, per the package doc), so exact-byte
+// recovery is preserved.
 func EncodeSegment(raw []byte) string {
-	if len(raw)*percentEncodeMaxExpansion > maxSegmentBytes {
+	if len(raw) > maxSegmentBytes {
+		// 1:1 lower bound on encoded length; cannot fit.
 		return shaFallback(raw)
 	}
-	encoded := percentEncode(raw)
-	if len(encoded) > maxSegmentBytes || isShaFallback(encoded) {
+	encoded, ok := percentEncodeBounded(raw, maxSegmentBytes)
+	if !ok || isShaFallback(encoded) || strings.HasPrefix(encoded, binaryPrefix) {
 		return shaFallback(raw)
 	}
 	return encoded
+}
+
+// percentEncodeBounded percent-encodes raw, bailing out as soon as the
+// in-progress output would exceed maxLen. Returns ("", false) on
+// overflow so the caller can take the SHA-fallback path without
+// having allocated the full 3*len(raw) buffer that the unbounded
+// variant would. Returns (encoded, true) on success.
+func percentEncodeBounded(raw []byte, maxLen int) (string, bool) {
+	const escapeBytes = 3 // len("%HH") -- one escape's worst-case width
+	cap := escapeBytes * len(raw)
+	if cap > maxLen+escapeBytes {
+		cap = maxLen + escapeBytes
+	}
+	var b strings.Builder
+	b.Grow(cap)
+	for _, c := range raw {
+		if isUnreserved(c) {
+			if b.Len()+1 > maxLen {
+				return "", false
+			}
+			b.WriteByte(c)
+			continue
+		}
+		if b.Len()+escapeBytes > maxLen {
+			return "", false
+		}
+		b.WriteByte('%')
+		b.WriteByte(hexUpper(c >> 4))   //nolint:mnd // 4 == nibble width
+		b.WriteByte(hexUpper(c & 0x0F)) //nolint:mnd // 0x0F == low-nibble mask
+	}
+	return b.String(), true
 }
 
 // EncodeBinarySegment encodes a DynamoDB B-attribute (binary) segment as
@@ -151,10 +189,6 @@ func DecodeSegment(seg string) ([]byte, error) {
 	}
 	return percentDecode(seg)
 }
-
-// percentEncodeMaxExpansion is the worst-case ratio of encoded length to
-// raw length for percentEncode (every byte expands to "%HH").
-const percentEncodeMaxExpansion = 3
 
 // IsShaFallback reports whether seg uses the SHA-prefix-and-truncated-original
 // form. Such segments cannot be reversed without KEYMAP.jsonl.
