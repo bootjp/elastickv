@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -378,12 +380,38 @@ func ddbKeyAttrToSegment(av *pb.DynamoAttributeValue) (string, error) {
 	case *pb.DynamoAttributeValue_S:
 		return EncodeSegment([]byte(v.S)), nil
 	case *pb.DynamoAttributeValue_N:
-		return EncodeSegment([]byte(v.N)), nil
+		// DynamoDB N equality is numeric, not lexical: "1" and
+		// "1.0" name the same primary-key item, and so do "5e-1"
+		// and "0.5". Without canonicalisation each text form
+		// produces a distinct filename, so in migration mode the
+		// "active generation wins" invariant breaks (both source
+		// and active rows survive at different paths and restore
+		// replays duplicates). Mirror the live adapter's
+		// canonicalNumberString (adapter/dynamodb.go:7651) which
+		// uses big.Rat — same canonical form keeps filename
+		// identity in lockstep with the live equality check.
+		// Codex P1 round 9.
+		return EncodeSegment([]byte(canonicalDDBNumber(v.N))), nil
 	case *pb.DynamoAttributeValue_B:
 		return EncodeBinarySegment(v.B), nil
 	}
 	return "", errors.Wrapf(ErrDDBInvalidItem,
 		"primary key has unsupported attribute kind %T", av.GetValue())
+}
+
+// canonicalDDBNumber returns the canonical decimal representation of
+// a DynamoDB N value. Equivalent inputs (`"1"`, `"1.0"`, `"0.5"`,
+// `"5e-1"`, …) collapse to the same string; malformed inputs fall
+// through to a trimmed copy so a downstream parse failure surfaces
+// the original bytes rather than a silently rewritten value. The
+// implementation matches adapter/dynamodb.go canonicalNumberString
+// byte-for-byte so backup filenames track live equality.
+func canonicalDDBNumber(v string) string {
+	rat := &big.Rat{}
+	if _, ok := rat.SetString(strings.TrimSpace(v)); !ok {
+		return strings.TrimSpace(v)
+	}
+	return rat.RatString()
 }
 
 // schemaToPublic projects DynamoTableSchema into the AWS-DescribeTable
@@ -407,8 +435,18 @@ func schemaToPublic(s *pb.DynamoTableSchema) ddbPublicSchema {
 	if pk.RangeKey.Name != "" {
 		pk.RangeKey.Type = defs[pk.RangeKey.Name]
 	}
-	gsis := make([]publicGSI, 0, len(s.GetGlobalSecondaryIndexes()))
-	for name, gsi := range s.GetGlobalSecondaryIndexes() {
+	// Build GSI list in deterministic name-sorted order. Ranging over
+	// the underlying map directly produced a different array order on
+	// every dump, undermining byte-for-byte reproducibility of
+	// _schema.json across runs of the same snapshot. Codex P2 round 9.
+	gsiNames := make([]string, 0, len(s.GetGlobalSecondaryIndexes()))
+	for name := range s.GetGlobalSecondaryIndexes() {
+		gsiNames = append(gsiNames, name)
+	}
+	sort.Strings(gsiNames)
+	gsis := make([]publicGSI, 0, len(gsiNames))
+	for _, name := range gsiNames {
+		gsi := s.GetGlobalSecondaryIndexes()[name]
 		g := publicGSI{
 			Name: name,
 			KeySchema: publicKeySchema{
@@ -426,9 +464,16 @@ func schemaToPublic(s *pb.DynamoTableSchema) ddbPublicSchema {
 		g.Projection.NonKeyAttributes = append([]string{}, gsi.GetProjection().GetNonKeyAttributes()...)
 		gsis = append(gsis, g)
 	}
-	attrDefs := make([]publicAttributeDefinition, 0, len(defs))
-	for name, ty := range defs {
-		attrDefs = append(attrDefs, publicAttributeDefinition{Name: name, Type: ty})
+	// AttributeDefinitions is also sorted by attribute name for the
+	// same determinism reason.
+	defNames := make([]string, 0, len(defs))
+	for name := range defs {
+		defNames = append(defNames, name)
+	}
+	sort.Strings(defNames)
+	attrDefs := make([]publicAttributeDefinition, 0, len(defNames))
+	for _, name := range defNames {
+		attrDefs = append(attrDefs, publicAttributeDefinition{Name: name, Type: defs[name]})
 	}
 	return ddbPublicSchema{
 		FormatVersion:          1,

@@ -375,6 +375,113 @@ func TestDDB_MigrationSourceGenerationItemsAreEmitted(t *testing.T) {
 	}
 }
 
+// TestDDB_CanonicalNumberKeySegment is the regression for Codex P1
+// round 9: DynamoDB N equality is numeric, not lexical, but the key
+// segment was emitted as `EncodeSegment([]byte(v.N))`. In migration
+// mode where source and active rows used different decimal text for
+// the same logical N value (e.g. "1" and "1.0"), both rows survived
+// at distinct paths and restore replayed duplicates. The encoder
+// must canonicalise via big.Rat — same canonical form as the live
+// adapter — so equivalent N literals collapse onto the same filename.
+func TestDDB_CanonicalNumberKeySegment(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		a, b string
+	}{
+		{"1", "1.0"},
+		{"100", "1e2"},
+		{"-0", "0"},
+		{"0.5", "5e-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.a+"_vs_"+tc.b, func(t *testing.T) {
+			t.Parallel()
+			gotA, errA := ddbKeyAttrToSegment(nAttr(tc.a))
+			gotB, errB := ddbKeyAttrToSegment(nAttr(tc.b))
+			if errA != nil || errB != nil {
+				t.Fatalf("err: %v / %v", errA, errB)
+			}
+			if gotA != gotB {
+				t.Fatalf("equivalent N values must canonicalise to the same segment: %q vs %q -> %q vs %q",
+					tc.a, tc.b, gotA, gotB)
+			}
+		})
+	}
+}
+
+// TestDDB_SchemaJSONIsDeterministic is the regression for Codex P2
+// round 9: schemaToPublic ranged over Go maps for both
+// global_secondary_indexes and attribute_definitions, so identical
+// snapshots produced different `_schema.json` byte output across
+// runs. The keys are now sorted before append.
+func TestDDB_SchemaJSONIsDeterministic(t *testing.T) {
+	t.Parallel()
+	schema := &pb.DynamoTableSchema{
+		TableName:  "t",
+		PrimaryKey: &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions: map[string]string{
+			"zeta": "S", "alpha": "S", "id": "S", "mu": "N",
+		},
+		GlobalSecondaryIndexes: map[string]*pb.DynamoGlobalSecondaryIndex{
+			"gZ": {KeySchema: &pb.DynamoKeySchema{HashKey: "zeta"}, Projection: &pb.DynamoGSIProjection{ProjectionType: "ALL"}},
+			"gA": {KeySchema: &pb.DynamoKeySchema{HashKey: "alpha"}, Projection: &pb.DynamoGSIProjection{ProjectionType: "ALL"}},
+			"gM": {KeySchema: &pb.DynamoKeySchema{HashKey: "mu"}, Projection: &pb.DynamoGSIProjection{ProjectionType: "ALL"}},
+		},
+		Generation: 1,
+	}
+	// Run schemaToPublic many times — Go's randomised map order
+	// would otherwise produce different array orders across calls.
+	want := schemaToPublic(schema)
+	for i := 0; i < 32; i++ {
+		got := schemaToPublic(schema)
+		if !attributeDefinitionsEqual(got.AttributeDefinitions, want.AttributeDefinitions) {
+			t.Fatalf("attribute_definitions order differs across calls: %+v vs %+v",
+				got.AttributeDefinitions, want.AttributeDefinitions)
+		}
+		if !gsiOrderEqual(got.GlobalSecondaryIndexes, want.GlobalSecondaryIndexes) {
+			t.Fatalf("global_secondary_indexes order differs across calls: %+v vs %+v",
+				got.GlobalSecondaryIndexes, want.GlobalSecondaryIndexes)
+		}
+	}
+	// Also assert the order itself is the documented sort-by-name.
+	wantAttrOrder := []string{"alpha", "id", "mu", "zeta"}
+	for i, ad := range want.AttributeDefinitions {
+		if ad.Name != wantAttrOrder[i] {
+			t.Fatalf("attribute_definitions[%d].Name = %q want %q", i, ad.Name, wantAttrOrder[i])
+		}
+	}
+	wantGSIOrder := []string{"gA", "gM", "gZ"}
+	for i, g := range want.GlobalSecondaryIndexes {
+		if g.Name != wantGSIOrder[i] {
+			t.Fatalf("global_secondary_indexes[%d].Name = %q want %q", i, g.Name, wantGSIOrder[i])
+		}
+	}
+}
+
+func attributeDefinitionsEqual(a, b []publicAttributeDefinition) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func gsiOrderEqual(a, b []publicGSI) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
 func TestDDB_NewGenerationWinsOverMigrationSourceForSameKey(t *testing.T) {
 	t.Parallel()
 	enc, root := newDDBEncoder(t)
