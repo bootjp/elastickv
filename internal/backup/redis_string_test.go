@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -363,6 +364,74 @@ func TestRedisDB_PerDBIndexRoutesIntoOwnDirectory(t *testing.T) {
 	}
 	if got := readBlob(t, filepath.Join(root, "redis", "db_3", "strings", "k.bin")); string(got) != "v3" {
 		t.Fatalf("db_3 blob = %q want %q", got, "v3")
+	}
+}
+
+// TestRedisDB_SHAFallbackKeymapped is the regression for Codex P1
+// round 7: when a Redis user key is long enough that EncodeSegment
+// takes its SHA-fallback path, the encoder must record a KEYMAP.jsonl
+// entry for it. Otherwise the encoded `*.bin` filename and the JSONL
+// TTL row's `key` are non-reversible and the original Redis user key
+// bytes are irrecoverable from a backup.
+func TestRedisDB_SHAFallbackKeymapped(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	// Drive a key whose length forces the fallback. EncodeSegment's
+	// length cap is 240 bytes; pad past it with characters that
+	// would percent-encode to 3× their length so we cannot
+	// accidentally fit even with all-unreserved bytes.
+	longKey := bytes.Repeat([]byte{'%'}, 300)
+	encoded := EncodeSegment(longKey)
+	if !IsShaFallback(encoded) {
+		t.Fatalf("test premise broken: encoded %q is not a SHA fallback", encoded)
+	}
+	if err := db.HandleString(longKey, encodeNewStringValue(t, []byte("v"), fixedExpireMs)); err != nil {
+		t.Fatalf("HandleString: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	keymapPath := filepath.Join(root, "redis", "db_0", "KEYMAP.jsonl")
+	f, err := os.Open(keymapPath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatalf("KEYMAP.jsonl missing for SHA-fallback key: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	got, err := LoadKeymap(f)
+	if err != nil {
+		t.Fatalf("LoadKeymap: %v", err)
+	}
+	rec, ok := got[encoded]
+	if !ok {
+		t.Fatalf("no keymap record for encoded %q; have %v", encoded, got)
+	}
+	if rec.Kind != KindSHAFallback {
+		t.Fatalf("kind = %q, want %q", rec.Kind, KindSHAFallback)
+	}
+	orig, err := rec.Original()
+	if err != nil {
+		t.Fatalf("Original: %v", err)
+	}
+	if !bytes.Equal(orig, longKey) {
+		t.Fatalf("Original mismatch: len got=%d want=%d", len(orig), len(longKey))
+	}
+}
+
+// TestRedisDB_NoKeymapWhenAllReversible asserts the converse: a dump
+// with only short keys produces no KEYMAP.jsonl. The empty-file
+// removal in closeKeymap matches the s3 encoder's policy.
+func TestRedisDB_NoKeymapWhenAllReversible(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleString([]byte("short"), encodeNewStringValue(t, []byte("v"), 0)); err != nil {
+		t.Fatalf("HandleString: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	keymapPath := filepath.Join(root, "redis", "db_0", "KEYMAP.jsonl")
+	if _, err := os.Stat(keymapPath); !os.IsNotExist(err) {
+		t.Fatalf("KEYMAP.jsonl present without any fallback keys: stat err=%v", err)
 	}
 }
 

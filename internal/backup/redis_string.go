@@ -136,6 +136,17 @@ type RedisDB struct {
 	// (fed by the decoder driver); nil in tests if the test does not
 	// care about warnings.
 	warn func(event string, fields ...any)
+
+	// keymap / keymapFile / keymapDir are lazily set on the first
+	// SHA-fallback (or other non-reversible) encoded segment. Without
+	// these records, the decoder cannot recover the original Redis
+	// user key from a fallback-encoded `*.bin` filename or from an
+	// `appendTTL` JSONL row keyed by the encoded form. Codex P1
+	// round 7. KeymapWriter.Close only flushes its bufio buffer, so
+	// the *os.File is tracked separately to be closed at Finalize.
+	keymap     *KeymapWriter
+	keymapFile *os.File
+	keymapDir  string
 }
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
@@ -245,6 +256,9 @@ func (r *RedisDB) Finalize() error {
 	if err := closeJSONL(r.hllTTL); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := r.closeKeymap(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
 			"count", r.orphanTTLCount,
@@ -300,6 +314,9 @@ func (r *RedisDB) ensureDir(dir string) error {
 
 func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
 	encoded := EncodeSegment(userKey)
+	if err := r.recordIfFallback(encoded, userKey); err != nil {
+		return err
+	}
 	dir := filepath.Join(r.dbDir(), subdir)
 	if err := r.ensureDir(dir); err != nil {
 		return err
@@ -319,17 +336,73 @@ func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, e
 		}
 		*slot = f
 	}
+	encoded := EncodeSegment(userKey)
+	if err := r.recordIfFallback(encoded, userKey); err != nil {
+		return err
+	}
 	rec := struct {
 		Key        string `json:"key"`
 		ExpireAtMs uint64 `json:"expire_at_ms"`
 	}{
-		Key:        EncodeSegment(userKey),
+		Key:        encoded,
 		ExpireAtMs: expireAtMs,
 	}
 	if err := (*slot).enc.Encode(rec); err != nil {
 		return cockroachdberr.WithStack(err)
 	}
 	return nil
+}
+
+// recordIfFallback writes a KEYMAP.jsonl entry when EncodeSegment took
+// the SHA-fallback path for userKey. Without this, the encoded
+// filename / JSONL key is non-reversible and the decoder cannot
+// recover the original Redis user key bytes. The keymap writer is
+// lazily opened on first use; an empty KEYMAP file is removed at
+// Finalize so dumps without any fallback keys carry no spurious file.
+// Idempotent: a duplicate (encoded, original) pair is harmless because
+// LoadKeymap's "last record wins" behaviour leaves the same mapping.
+func (r *RedisDB) recordIfFallback(encoded string, userKey []byte) error {
+	if !IsShaFallback(encoded) {
+		return nil
+	}
+	if r.keymap == nil {
+		dir := r.dbDir()
+		if err := r.ensureDir(dir); err != nil {
+			return err
+		}
+		const flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | syscall.O_NOFOLLOW
+		f, err := os.OpenFile(filepath.Join(dir, "KEYMAP.jsonl"), flag, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode
+		if err != nil {
+			if errors.Is(err, syscall.ELOOP) {
+				return cockroachdberr.WithStack(cockroachdberr.Wrapf(err,
+					"backup: refusing to overwrite symlink at KEYMAP.jsonl"))
+			}
+			return cockroachdberr.WithStack(err)
+		}
+		r.keymap = NewKeymapWriter(f)
+		r.keymapFile = f
+		r.keymapDir = dir
+	}
+	return r.keymap.WriteOriginal(encoded, userKey, KindSHAFallback)
+}
+
+// closeKeymap flushes and closes the per-encoder KEYMAP.jsonl writer
+// if it was opened. When no SHA-fallback records were emitted the
+// file is removed so dumps without any non-reversible keys carry no
+// spurious empty file (matches the s3 encoder's keymap policy).
+func (r *RedisDB) closeKeymap() error {
+	if r.keymap == nil {
+		return nil
+	}
+	flushErr := r.keymap.Close()
+	closeErr := r.keymapFile.Close()
+	if flushErr == nil && closeErr != nil {
+		flushErr = cockroachdberr.WithStack(closeErr)
+	}
+	if r.keymap.Count() == 0 && r.keymapDir != "" {
+		_ = os.Remove(filepath.Join(r.keymapDir, "KEYMAP.jsonl"))
+	}
+	return flushErr
 }
 
 // decodeRedisStringValue strips the redis-string magic-prefix TTL header
