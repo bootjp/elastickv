@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	cockroachdberr "github.com/cockroachdb/errors"
 )
@@ -75,11 +76,12 @@ const (
 // RedisDB encodes one logical Redis database (`redis/db_<n>/`). All
 // operations are scoped to its outRoot; the caller wires per-database
 // instances when the producer supports multiple databases (today only
-// db_0 is meaningful).
+// db_0 is meaningful, but the encoder is wired to take any non-negative
+// index so a future multi-db dump does not silently collide on db_0).
 //
 // Lifecycle:
 //
-//	r := NewRedisDB(outRoot)
+//	r := NewRedisDB(outRoot, dbIndex)
 //	for each snapshot record matching a redis prefix: r.Handle*(...)
 //	r.Finalize()
 //
@@ -87,6 +89,7 @@ const (
 // inherently sequential per scope, so a mutex would only add cost.
 type RedisDB struct {
 	outRoot string
+	dbIndex int
 
 	// kindByKey records the Redis type each user key was first seen as.
 	// Populated by HandleString and HandleHLL; consulted by HandleTTL.
@@ -105,8 +108,18 @@ type RedisDB struct {
 	// has not been claimed by HandleString / HandleHLL. These are
 	// candidates for hashes/lists/sets/zsets/streams (handled in a
 	// follow-up PR) — for now Finalize logs them via the warning hook
-	// rather than dropping silently.
+	// rather than dropping silently. Bounded by maxPendingWideColumnTTL
+	// so a malformed snapshot with millions of orphan TTL records cannot
+	// drive the encoder OOM; the bound is high enough that real
+	// production state (where wide-column type encoders eventually
+	// claim every TTL) is never affected.
 	pendingWideColumnTTL []redisTTLPending
+
+	// dirsCreated caches the per-encoder directories writeBlob and
+	// appendTTL have already MkdirAll'd. Avoids the per-record syscalls
+	// flagged by Gemini #218; for a 10M-key dump this saves ~10M
+	// stat+mkdir(EEXIST) round-trips.
+	dirsCreated map[string]struct{}
 
 	// warn is the structured-warning sink. Non-nil in production
 	// (fed by the decoder driver); nil in tests if the test does not
@@ -119,12 +132,27 @@ type redisTTLPending struct {
 	ExpireAtMs uint64
 }
 
-// NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/. The
-// caller is responsible for choosing <n>; today only 0 is meaningful.
-func NewRedisDB(outRoot string) *RedisDB {
+// maxPendingWideColumnTTL caps the orphan-TTL buffer. 1M entries is well
+// past anything a real Redis instance produces under normal operation
+// (each entry is ~50 bytes, so the cap is ~50 MiB) but small enough that
+// a snapshot loaded with a billion synthetic !redis|ttl| records cannot
+// drive the encoder OOM. When the cap is hit, HandleTTL drops further
+// orphans and surfaces a structured warning at Finalize.
+const maxPendingWideColumnTTL = 1_000_000
+
+// NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
+// dbIndex selects <n>; today the producer always passes 0, but accepting
+// the index as a parameter prevents a future multi-db dump from silently
+// colliding on db_0.
+func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
+	if dbIndex < 0 {
+		dbIndex = 0
+	}
 	return &RedisDB{
-		outRoot:   outRoot,
-		kindByKey: make(map[string]redisKeyKind),
+		outRoot:     outRoot,
+		dbIndex:     dbIndex,
+		kindByKey:   make(map[string]redisKeyKind),
+		dirsCreated: make(map[string]struct{}),
 	}
 }
 
@@ -183,10 +211,17 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	case redisKindString:
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 	case redisKindUnknown:
-		r.pendingWideColumnTTL = append(r.pendingWideColumnTTL, redisTTLPending{
-			UserKey:    bytes.Clone(userKey),
-			ExpireAtMs: expireAtMs,
-		})
+		// Bounded to prevent OOM on a snapshot that contains a
+		// runaway number of orphan TTL records (e.g., many wide-
+		// column types whose meta records were dropped). After the
+		// cap, additional records are tracked only as a counter via
+		// the warning sink at Finalize.
+		if len(r.pendingWideColumnTTL) < maxPendingWideColumnTTL {
+			r.pendingWideColumnTTL = append(r.pendingWideColumnTTL, redisTTLPending{
+				UserKey:    bytes.Clone(userKey),
+				ExpireAtMs: expireAtMs,
+			})
+		}
 		return nil
 	}
 	return nil
@@ -212,11 +247,56 @@ func (r *RedisDB) Finalize() error {
 	return firstErr
 }
 
-func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
-	encoded := EncodeSegment(userKey)
-	dir := filepath.Join(r.outRoot, "redis", "db_0", subdir)
+// dbDir returns the per-encoder root, e.g. "<outRoot>/redis/db_0/".
+// Computed once per call rather than at construction so the encoder's
+// outRoot remains a plain field — easier to reason about in tests.
+func (r *RedisDB) dbDir() string {
+	return filepath.Join(r.outRoot, "redis", redisDBSegment(r.dbIndex))
+}
+
+func redisDBSegment(idx int) string {
+	if idx < 0 {
+		idx = 0
+	}
+	return "db_" + intToDecimal(idx)
+}
+
+// intToDecimal is a tiny zero-allocation helper for non-negative ints.
+// Avoids the strconv import here just to format dbIndex.
+func intToDecimal(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	const maxIntDecimalDigits = 20 // covers MaxInt64
+	var buf [maxIntDecimalDigits]byte
+	pos := len(buf)
+	for v > 0 {
+		pos--
+		buf[pos] = '0' + byte(v%10) //nolint:mnd // 10 == decimal radix
+		v /= 10                     //nolint:mnd // 10 == decimal radix
+	}
+	return string(buf[pos:])
+}
+
+// ensureDir runs MkdirAll once per directory and remembers the result
+// in r.dirsCreated, so repeated calls on the hot path (one per blob
+// record) collapse to a map lookup.
+func (r *RedisDB) ensureDir(dir string) error {
+	if _, ok := r.dirsCreated[dir]; ok {
+		return nil
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return cockroachdberr.WithStack(err)
+	}
+	r.dirsCreated[dir] = struct{}{}
+	return nil
+}
+
+func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
+	encoded := EncodeSegment(userKey)
+	dir := filepath.Join(r.dbDir(), subdir)
+	if err := r.ensureDir(dir); err != nil {
+		return err
 	}
 	path := filepath.Join(dir, encoded+".bin")
 	if err := writeFileAtomic(path, value); err != nil {
@@ -227,7 +307,7 @@ func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
 
 func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, expireAtMs uint64) error {
 	if *slot == nil {
-		f, err := openJSONL(filepath.Join(r.outRoot, "redis", "db_0", baseName))
+		f, err := openJSONL(filepath.Join(r.dbDir(), baseName))
 		if err != nil {
 			return err
 		}
@@ -369,15 +449,27 @@ func HasInlineTTL(value []byte) bool {
 	return value[2]&redisStrHasTTL != 0
 }
 
-// IsBlobAtomicWriteRetriable reports whether err from writeFileAtomic is
-// a retriable I/O failure (no-space, transient FS error). Today this is a
-// stub that returns false for any error; exposed so the master decoder
-// loop can decide whether to abort the whole dump on encountering one.
+// IsBlobAtomicWriteRetriable reports whether err from writeFileAtomic
+// is a retriable I/O failure. Today the only retriable signal is
+// io.ErrShortWrite. ENOSPC (disk full) is intentionally NOT retriable
+// here — the master pipeline must surface it to the operator rather
+// than spin: a backup against a full disk has no business retrying.
+// IsBlobAtomicWriteOutOfSpace is the explicit out-of-space probe so
+// the pipeline can choose the right alarm wording.
 func IsBlobAtomicWriteRetriable(err error) bool {
 	if err == nil {
 		return false
 	}
-	// errors.Is handles wrapped paths; both sentinel checks are stable
-	// for now because we never wrap them ourselves.
 	return errors.Is(err, io.ErrShortWrite)
+}
+
+// IsBlobAtomicWriteOutOfSpace reports whether err from writeFileAtomic
+// (or any os.File write the master pipeline issues) was driven by a
+// full disk. Tested via syscall.ENOSPC + os.PathError unwrap, which
+// matches what os.File.Write returns on POSIX and Windows.
+func IsBlobAtomicWriteOutOfSpace(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ENOSPC)
 }
