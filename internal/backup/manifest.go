@@ -294,6 +294,17 @@ func (m Manifest) validatePhaseSpecific() error {
 		if m.Source != nil {
 			return errors.Wrap(ErrInvalidManifest, "phase1 must not set source")
 		}
+		// A phase1 dump's whole point is the cluster-wide read_ts
+		// pin recorded under Live. A manifest that omits Live cannot
+		// describe its consistency point and downstream restore /
+		// audit logic must not silently accept it as valid (Codex
+		// P1 #295).
+		if m.Live == nil {
+			return errors.Wrap(ErrInvalidManifest, "phase1 must set live")
+		}
+		if m.Live.ReadTS == 0 {
+			return errors.Wrap(ErrInvalidManifest, "phase1 live.read_ts must be non-zero")
+		}
 	}
 	return nil
 }
