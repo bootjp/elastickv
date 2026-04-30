@@ -2,12 +2,19 @@ package backup
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io"
 
 	"github.com/cockroachdb/errors"
 )
+
+// jsonNullLiteral is the byte-for-byte JSON null token. We compare raw
+// json.RawMessage values against this rather than relying on
+// post-Unmarshal string emptiness, because `null` and `""` collapse to
+// the same Go-side value once Unmarshal'd into a typed field.
+var jsonNullLiteral = []byte("null")
 
 // KEYMAP.jsonl shape (one record per line):
 //
@@ -187,9 +194,11 @@ func (r *KeymapReader) Next() (KeymapRecord, bool, error) {
 
 // decodeKeymapLine parses one JSONL record. It enforces three properties:
 //
-//  1. The record must contain `encoded`, `original`, and `kind` fields —
-//     a missing `original` would otherwise be silently rewritten to empty
-//     bytes by base64.RawURLEncoding.DecodeString(""). Codex P2 round 5.
+//  1. The record must contain `encoded`, `original`, and `kind` fields,
+//     and none of them may be the JSON literal `null` — Go unmarshals
+//     a null string field into "", and base64.DecodeString("") would
+//     silently accept it as an empty original key, rewriting the
+//     mapping. Codex P2 round 5 + P1 round 7-follow-up.
 //  2. `encoded` and `kind` must be non-empty strings.
 //  3. `original` (the base64) must be parseable at parse time so a
 //     corrupted dump fails on first read rather than at later
@@ -203,8 +212,17 @@ func decodeKeymapLine(line []byte) (KeymapRecord, error) {
 		return KeymapRecord{}, errors.Wrap(ErrInvalidKeymapRecord, err.Error())
 	}
 	for _, name := range [...]string{"encoded", "original", "kind"} {
-		if _, ok := fields[name]; !ok {
+		raw, ok := fields[name]
+		if !ok {
 			return KeymapRecord{}, errors.Wrapf(ErrInvalidKeymapRecord, "missing field %q", name)
+		}
+		// `"original": null` round-trips to "" through json.Unmarshal
+		// into a `string` target, and base64.DecodeString("") would
+		// then silently accept it. Reject the JSON null literal
+		// explicitly so corrupted/truncated records don't slip
+		// through with empty-bytes mappings.
+		if bytes.Equal(raw, jsonNullLiteral) {
+			return KeymapRecord{}, errors.Wrapf(ErrInvalidKeymapRecord, "field %q is null", name)
 		}
 	}
 	var rec KeymapRecord
