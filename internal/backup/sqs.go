@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 )
@@ -28,6 +29,22 @@ const (
 	SQSMsgByAgePrefix       = "!sqs|msg|byage|"
 	SQSMsgDedupPrefix       = "!sqs|msg|dedup|"
 	SQSMsgGroupPrefix       = "!sqs|msg|group|"
+
+	// HT-FIFO partitioned-keyspace discriminator. Kept in sync with
+	// adapter/sqs_keys.go sqsPartitionedDiscriminator. The literal
+	// "p|" segment is inserted between the family and the queue
+	// segment in every partitioned key:
+	//
+	//	legacy:      !sqs|msg|<family>|<encQueue><gen><rest>
+	//	partitioned: !sqs|msg|<family>|p|<encQueue>|<partition u32><gen u64><rest>
+	//
+	// validateQueueName rejects raw '|' in queue names, so a legacy
+	// queue name can never start with the literal byte 'p' followed
+	// by '|'; the discriminator unambiguously selects the parser
+	// variant. Codex P1 round 9.
+	sqsPartitionedDiscriminator = "p|"
+	// partitionBytes is the fixed BE-uint32 partition field width.
+	sqsPartitionBytes = 4
 )
 
 // Stored value magic prefixes (mirrors adapter/sqs_catalog.go and
@@ -385,19 +402,26 @@ func stripPrefixSegment(key, prefix []byte) (string, error) {
 }
 
 // parseSQSMessageDataKey peels !sqs|msg|data|<encQueue><gen 8B><encMsgID>
-// and returns encQueue. The gen and msgID are not surfaced because the
-// dump format pulls QueueGeneration / MessageID out of the value record.
+// (or its partitioned variant !sqs|msg|data|p|<encQueue>|<part 4B><gen 8B><encMsgID>)
+// and returns encQueue. The gen, partition, and msgID are not surfaced
+// because the dump format pulls those fields out of the value record.
 //
-// Boundary detection: encQueue is base64url-no-padding, alphabet
+// Boundary detection (legacy): encQueue is base64url-no-padding, alphabet
 // [A-Za-z0-9-_]. The gen is 8 raw bytes. For any production gen value
 // (< 2^56), the first byte is 0x00, which is not in the base64url
 // alphabet, so the first non-alphabet byte is the gen-start. We document
 // this assumption rather than build a more elaborate prober — gens
 // approaching 2^56 would have already wrapped many other invariants.
+//
+// Boundary detection (partitioned): the queue segment is terminated by
+// a literal '|' before the fixed-width partition u32. Codex P1 round 9.
 func parseSQSMessageDataKey(key []byte) (string, error) {
 	rest, err := stripPrefixSegment(key, []byte(SQSMsgDataPrefix))
 	if err != nil {
 		return "", err
+	}
+	if isPartitionedRest(rest) {
+		return parseSQSPartitionedQueueAndTrailer(rest, true /*hasMsgID*/, key)
 	}
 	idx := scanBase64URLBoundary(rest)
 	// idx == 0 -> no queue segment; idx+genBytes >= len(rest) -> no
@@ -426,11 +450,15 @@ func parseSQSMessageDataKey(key []byte) (string, error) {
 // (vis/byage/dedup/group/tombstone). Callers in this PR only need to
 // know the encoded queue segment for routing; full structural parsing
 // of side-record keys is deferred until Phase 0a's reaper-aware mode
-// lands.
+// lands. Both the legacy and partitioned (`p|<queue>|...`) shapes are
+// recognised — Codex P2 round 9.
 func parseSQSGenericKey(key []byte, prefix string) (string, error) {
 	rest, err := stripPrefixSegment(key, []byte(prefix))
 	if err != nil {
 		return "", err
+	}
+	if isPartitionedRest(rest) {
+		return parseSQSPartitionedQueueAndTrailer(rest, false /*hasMsgID*/, key)
 	}
 	idx := scanBase64URLBoundary(rest)
 	// All side-record key shapes (vis / byage / dedup / group /
@@ -443,6 +471,58 @@ func parseSQSGenericKey(key []byte, prefix string) (string, error) {
 			"queue segment not found after prefix %q", prefix)
 	}
 	return rest[:idx], nil
+}
+
+// isPartitionedRest reports whether `rest` (the suffix after a
+// !sqs|msg|<family>| prefix has been stripped) starts with the
+// HT-FIFO partitioned discriminator "p|".
+func isPartitionedRest(rest string) bool {
+	return strings.HasPrefix(rest, sqsPartitionedDiscriminator)
+}
+
+// parseSQSPartitionedQueueAndTrailer parses the partitioned suffix
+// `p|<encQueue>|<partition 4B><gen 8B>[<encMsgID>]`. Returns the
+// encoded queue segment when the structural invariants hold:
+//
+//   - the discriminator is followed by a non-empty queue segment
+//   - the queue segment is terminated by a literal '|'
+//   - the trailer carries at least partition u32 + gen u64 bytes
+//   - if hasMsgID == true, an additional non-empty base64url
+//     msg-id segment follows the trailer.
+//
+// Anything else surfaces ErrSQSMalformedKey rather than emitting
+// records under a wrong queue.
+func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey []byte) (string, error) {
+	body := rest[len(sqsPartitionedDiscriminator):]
+	terminator := strings.IndexByte(body, '|')
+	if terminator <= 0 {
+		return "", errors.Wrapf(ErrSQSMalformedKey,
+			"partitioned key missing queue terminator in %q", originalKey)
+	}
+	encQueue := body[:terminator]
+	if _, err := base64.RawURLEncoding.DecodeString(encQueue); err != nil {
+		return "", errors.Wrap(ErrSQSMalformedKey, err.Error())
+	}
+	trailer := body[terminator+1:]
+	const fixedTrailerBytes = sqsPartitionBytes + genBytes
+	if hasMsgID {
+		// Need partition+gen plus at least 1 byte of msg-id.
+		if len(trailer) <= fixedTrailerBytes {
+			return "", errors.Wrapf(ErrSQSMalformedKey,
+				"partitioned msg-data key missing message-id in %q", originalKey)
+		}
+		encMsgID := trailer[fixedTrailerBytes:]
+		if _, err := base64.RawURLEncoding.DecodeString(encMsgID); err != nil {
+			return "", errors.Wrap(ErrSQSMalformedKey, err.Error())
+		}
+		return encQueue, nil
+	}
+	// Side records: trailer must carry at least partition+gen.
+	if len(trailer) < fixedTrailerBytes {
+		return "", errors.Wrapf(ErrSQSMalformedKey,
+			"partitioned side-record key trailer truncated in %q", originalKey)
+	}
+	return encQueue, nil
 }
 
 // scanBase64URLBoundary returns the index of the first byte in s that is
