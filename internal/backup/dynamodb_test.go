@@ -490,6 +490,30 @@ func TestDDB_ParseItemKeyExtractsGeneration(t *testing.T) {
 	}
 }
 
+func TestDDB_RejectsTableMetaKeyWithEmptySegment(t *testing.T) {
+	t.Parallel()
+	enc, _ := newDDBEncoder(t)
+	// `!ddb|meta|table|` (no encoded segment) -- base64url-decodes to
+	// an empty name and would otherwise route the schema under "".
+	// Codex P2 #117.
+	err := enc.HandleTableMeta([]byte(DDBTableMetaPrefix), []byte("ignored"))
+	if !errors.Is(err, ErrDDBMalformedKey) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDDB_RejectsItemKeyWithEmptyPrimaryKeyPayload(t *testing.T) {
+	t.Parallel()
+	// `!ddb|item|<table>|7|` -- gen separator present but no
+	// primary-key payload. Codex P2 #303.
+	key := []byte(DDBItemPrefix)
+	key = append(key, []byte("dA")...) // base64url("t")
+	key = append(key, []byte("|7|")...)
+	if _, _, err := parseDDBItemKey(key); !errors.Is(err, ErrDDBMalformedKey) {
+		t.Fatalf("err=%v want ErrDDBMalformedKey for truncated item key", err)
+	}
+}
+
 func TestDDB_RejectsKeyWithMissingTableSegment(t *testing.T) {
 	t.Parallel()
 	enc, _ := newDDBEncoder(t)

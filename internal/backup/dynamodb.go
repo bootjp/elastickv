@@ -113,6 +113,13 @@ func (d *DDBEncoder) HandleTableMeta(key, value []byte) error {
 	if err != nil {
 		return errors.Wrap(ErrDDBMalformedKey, err.Error())
 	}
+	if encoded == "" {
+		// base64.RawURLEncoding.DecodeString("") succeeds with an
+		// empty slice, so without this guard a truncated key like
+		// `!ddb|meta|table|` would be routed under the empty table
+		// name. That hides corruption (Codex P2 #117).
+		return errors.Wrapf(ErrDDBMalformedKey, "empty table segment: %q", key)
+	}
 	rawName, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
 		return errors.Wrap(ErrDDBMalformedKey, err.Error())
@@ -304,6 +311,16 @@ func parseDDBItemKey(key []byte) (string, uint64, error) {
 	gen, err := strconv.ParseUint(afterTable[:genEnd], 10, 64) //nolint:mnd // 10 == decimal radix; 64 == uint64 width
 	if err != nil {
 		return "", 0, errors.Wrap(ErrDDBMalformedKey, err.Error())
+	}
+	// Item keys must carry a primary-key payload after the gen
+	// separator (the encoded hash + range bytes). A bare
+	// `!ddb|item|<table>|<gen>|` cannot identify any item; treating
+	// such a key as valid would let a truncated record slip past
+	// malformed-key detection and emit under value-side attributes
+	// only, masking snapshot corruption (Codex P2 #303).
+	if genEnd+1 == len(afterTable) {
+		return "", 0, errors.Wrapf(ErrDDBMalformedKey,
+			"item key missing primary-key payload: %q", key)
 	}
 	return enc, gen, nil
 }
