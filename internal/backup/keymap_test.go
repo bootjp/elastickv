@@ -217,3 +217,47 @@ func TestKeymapReader_RejectsMalformedBase64AtParseTime(t *testing.T) {
 		t.Fatalf("err=%v want ErrInvalidKeymapRecord on parse-time base64 validation", err)
 	}
 }
+
+// TestKeymapReader_RejectsMissingOriginalField exercises Codex P2 round 5:
+// a record that omits `original` entirely must not be accepted as if the
+// original key were empty bytes, because base64.DecodeString("") succeeds
+// silently. A truncated dump that drops `original` would otherwise rewrite
+// the encoded->original mapping to empty bytes and break exact key recovery
+// for SHA-fallback or collision-renamed entries.
+func TestKeymapReader_RejectsMissingOriginalField(t *testing.T) {
+	t.Parallel()
+	// All structural keys present except `original`. Without the
+	// presence check this passes, because rec.OriginalB64 defaults to
+	// "" and base64 decode of "" succeeds.
+	input := `{"encoded":"x","kind":"sha-fallback"}` + "\n"
+	r := NewKeymapReader(strings.NewReader(input))
+	_, _, err := r.Next()
+	if !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("err=%v want ErrInvalidKeymapRecord on missing `original` field", err)
+	}
+	// Sticky: a subsequent Next must keep returning the same error class.
+	_, _, err2 := r.Next()
+	if !errors.Is(err2, ErrInvalidKeymapRecord) {
+		t.Fatalf("non-sticky error: %v", err2)
+	}
+}
+
+// TestKeymapReader_AcceptsExplicitEmptyOriginal sanity-checks that an
+// explicitly-empty `original` (the field is present, value is "") still
+// parses. The contract is that absence is rejected, not emptiness.
+func TestKeymapReader_AcceptsExplicitEmptyOriginal(t *testing.T) {
+	t.Parallel()
+	input := `{"encoded":"x","original":"","kind":"sha-fallback"}` + "\n"
+	r := NewKeymapReader(strings.NewReader(input))
+	rec, ok, err := r.Next()
+	if err != nil || !ok {
+		t.Fatalf("err=%v ok=%v want a record", err, ok)
+	}
+	got, err := rec.Original()
+	if err != nil {
+		t.Fatalf("Original(): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Original = %q, want empty", got)
+	}
+}
