@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -108,6 +109,18 @@ type sqsQueueState struct {
 	name     string // decoded queue name; populated on meta arrival
 	meta     *sqsQueueMetaPublic
 	messages []sqsMessageRecord
+	// activeGen captures the queue's current generation, parsed
+	// from a !sqs|queue|gen|<encoded> record. PurgeQueue and
+	// DeleteQueue bump the generation so the reaper can later
+	// drop residual !sqs|msg|data|<queue><oldGen><...> rows; if
+	// the snapshot is taken before reaping completes those stale
+	// rows are still in the keyspace and must NOT be emitted to
+	// messages.jsonl. Zero means "no gen record observed yet" and
+	// disables the filter (the live cluster always writes a gen
+	// record on CreateQueue, so a missing gen at backup time
+	// means we have an orphan-only queue and the orphan branch
+	// already drops messages). Codex P1 round 10.
+	activeGen uint64
 	// internalBuf accumulates side records in their on-disk shape if
 	// includeSideRecords is on. Each line is the encoded prefix +
 	// hex(rest-of-key) + value (b64) — implementation-grade detail
@@ -254,6 +267,28 @@ func (s *SQSEncoder) HandleQueueMeta(key, value []byte) error {
 	return nil
 }
 
+// HandleQueueGen processes one !sqs|queue|gen|<encoded> record. The
+// value is a base-10 decimal string holding the queue's current
+// generation (mirrors adapter/sqs_catalog.go's CreateQueue Put: the
+// live cluster writes strconv.FormatUint(gen, 10)). Capturing
+// activeGen lets flushQueue drop messages tagged with older
+// generations — those are residual rows left by PurgeQueue /
+// DeleteQueue that the reaper has not yet cleaned, and emitting
+// them to messages.jsonl would resurrect purged messages on
+// restore. Codex P1 round 10.
+func (s *SQSEncoder) HandleQueueGen(key, value []byte) error {
+	encoded, err := stripPrefixSegment(key, []byte(SQSQueueGenPrefix))
+	if err != nil {
+		return err
+	}
+	gen, err := strconv.ParseUint(strings.TrimSpace(string(value)), 10, 64) //nolint:mnd // 10 == decimal radix
+	if err != nil {
+		return errors.Wrap(ErrSQSMalformedKey, err.Error())
+	}
+	s.queueState(encoded).activeGen = gen
+	return nil
+}
+
 // HandleMessageData processes one !sqs|msg|data|<encQueue><gen><encMsgID>
 // record. The encoded queue segment is parsed out of the key and used as
 // the per-queue routing key; the message is buffered until Finalize so it
@@ -359,19 +394,24 @@ func (s *SQSEncoder) flushQueue(st *sqsQueueState) error {
 	if err := writeFileAtomic(filepath.Join(dir, "_queue.json"), mustMarshalIndent(st.meta)); err != nil {
 		return err
 	}
-	if len(st.messages) > 0 {
-		sortMessagesForEmit(st.messages)
-		jl, err := openJSONL(filepath.Join(dir, "messages.jsonl"))
-		if err != nil {
-			return err
-		}
-		for i := range st.messages {
-			if err := jl.enc.Encode(st.messages[i]); err != nil {
-				_ = closeJSONL(jl)
-				return errors.WithStack(err)
-			}
-		}
-		if err := closeJSONL(jl); err != nil {
+	// Drop messages tagged with stale generations: PurgeQueue and
+	// DeleteQueue bump the queue's gen but the reaper deletes the
+	// affected !sqs|msg|data| rows asynchronously. A snapshot taken
+	// mid-reap would otherwise resurrect purged messages on restore.
+	// activeGen == 0 means we did not see a !sqs|queue|gen| record
+	// for this queue; preserving the legacy behaviour (no filter)
+	// is the safe fallback because every CreateQueue writes a gen.
+	// Codex P1 round 10.
+	visibleMessages, dropped := filterStaleGenMessages(st.messages, st.activeGen)
+	if dropped > 0 {
+		s.emitWarn("sqs_stale_generation_messages_dropped",
+			"queue", st.name,
+			"active_gen", st.activeGen,
+			"dropped", dropped,
+			"hint", "messages with mismatched queue_generation suppressed; reaper had not finished cleanup at snapshot time")
+	}
+	if len(visibleMessages) > 0 {
+		if err := writeMessagesJSONL(dir, visibleMessages); err != nil {
 			return err
 		}
 	}
@@ -675,6 +715,50 @@ func decodeSQSMessageValue(value []byte) (sqsMessageRecord, error) {
 		SequenceNumber:         live.SequenceNumber,
 		DeadLetterSourceArn:    live.DeadLetterSourceArn,
 	}, nil
+}
+
+// writeMessagesJSONL emits the buffered (visible) messages to
+// messages.jsonl in send-order. Split out of flushQueue to keep that
+// function's cyclomatic complexity under the project's linter ceiling.
+func writeMessagesJSONL(dir string, msgs []sqsMessageRecord) error {
+	sortMessagesForEmit(msgs)
+	jl, err := openJSONL(filepath.Join(dir, "messages.jsonl"))
+	if err != nil {
+		return err
+	}
+	for i := range msgs {
+		if err := jl.enc.Encode(msgs[i]); err != nil {
+			_ = closeJSONL(jl)
+			return errors.WithStack(err)
+		}
+	}
+	if err := closeJSONL(jl); err != nil {
+		return err
+	}
+	return nil
+}
+
+// filterStaleGenMessages partitions in into (visible, droppedCount).
+// A message is visible if activeGen is zero (no gen record observed
+// for this queue, which means we cannot make a confident call) OR
+// its QueueGeneration matches activeGen. Anything else is residual
+// state from a PurgeQueue / DeleteQueue that the reaper has not yet
+// removed; emitting it would resurrect purged messages on restore.
+// Codex P1 round 10.
+func filterStaleGenMessages(in []sqsMessageRecord, activeGen uint64) ([]sqsMessageRecord, int) {
+	if activeGen == 0 {
+		return in, 0
+	}
+	out := make([]sqsMessageRecord, 0, len(in))
+	dropped := 0
+	for _, m := range in {
+		if m.QueueGeneration == activeGen {
+			out = append(out, m)
+			continue
+		}
+		dropped++
+	}
+	return out, dropped
 }
 
 func sortMessagesForEmit(msgs []sqsMessageRecord) {
