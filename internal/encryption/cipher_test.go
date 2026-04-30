@@ -12,7 +12,7 @@ import (
 const testKeyID uint32 = 0xDEADBEEF
 
 // newKeystoreWithKey returns a Keystore with one freshly-drawn DEK at
-// testKeyID. Tests that need the raw DEK bytes can call ks.Get(testKeyID).
+// testKeyID. Tests that need the raw DEK bytes can call ks.DEK(testKeyID).
 func newKeystoreWithKey(t *testing.T) (*encryption.Keystore, uint32) {
 	t.Helper()
 	ks := encryption.NewKeystore()
