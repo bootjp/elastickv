@@ -157,13 +157,13 @@ func TestKeymapReader_RejectsRecordWithoutEncodedOrKind(t *testing.T) {
 	}
 }
 
-func TestKeymapReader_AcceptsBlankLinesByPolicy(t *testing.T) {
+func TestKeymapReader_RejectsBlankLines(t *testing.T) {
 	t.Parallel()
 	// bufio.Scanner skips trailing newline but emits an empty line when one
 	// is in the middle of the stream. We require strict JSONL — every
-	// non-empty line must be a record. An empty line in the middle should
-	// surface as ErrInvalidKeymapRecord rather than silently skipped, so
-	// truncated dumps are recognised.
+	// non-empty line must be a record. An empty line in the middle must
+	// surface as ErrInvalidKeymapRecord rather than be silently skipped,
+	// so truncated dumps are recognised.
 	input := `{"encoded":"x","original":"AA","kind":"sha-fallback"}` + "\n\n" +
 		`{"encoded":"y","original":"AA","kind":"sha-fallback"}` + "\n"
 	r := NewKeymapReader(strings.NewReader(input))
@@ -201,5 +201,19 @@ func TestKeymapRecord_OriginalRejectsBadBase64(t *testing.T) {
 	rec := KeymapRecord{Encoded: "x", OriginalB64: "!!!", Kind: KindSHAFallback}
 	if _, err := rec.Original(); !errors.Is(err, ErrInvalidKeymapRecord) {
 		t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+	}
+}
+
+func TestKeymapReader_RejectsMalformedBase64AtParseTime(t *testing.T) {
+	t.Parallel()
+	// JSON parses fine; the structural fields are present; only the
+	// `original` base64 is malformed. The reader must catch this on
+	// the first Next() rather than defer it to a later Original()
+	// call — Codex P1 #179.
+	input := `{"encoded":"x","original":"!!!","kind":"sha-fallback"}` + "\n"
+	r := NewKeymapReader(strings.NewReader(input))
+	_, _, err := r.Next()
+	if !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("err=%v want ErrInvalidKeymapRecord on parse-time base64 validation", err)
 	}
 }
