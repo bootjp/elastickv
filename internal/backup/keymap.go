@@ -41,13 +41,18 @@ const (
 // without holding pathological amounts of memory.
 const keymapBufSizeWriter = 64 << 10
 
-// keymapBufSizeReader bounds bufio.Scanner's per-line buffer. KEYMAP records
-// carry a ~240-byte encoded segment plus a base64'd original key (which can
-// itself be arbitrarily large but is bounded by the practical maximum key
-// size on the source store). 1 MiB per line is generous; if a record
-// genuinely exceeds it the reader returns a typed error rather than
-// silently truncating.
-const keymapBufSizeReader = 1 << 20
+// keymapBufSizeReader bounds bufio.Scanner's per-line buffer. KEYMAP
+// records carry a ~240-byte encoded segment plus a base64url-encoded
+// original key. The source store (store/mvcc_store.go
+// maxSnapshotKeySize) caps a single key at 1 MiB; base64url expansion
+// is ~4/3 (1 MiB → ~1.33 MiB), and the surrounding JSON object adds a
+// fixed ~80 bytes of field names / brackets / commas. A 1 MiB cap was
+// therefore not enough to cover a maximum-sized valid key — Codex P1
+// round 6 (commit 2cd58a93). 4 MiB carries 2× margin over the
+// theoretical worst case while still bounding pathological lines, and
+// matches the doubling cadence we'd want if the upstream key cap were
+// ever raised.
+const keymapBufSizeReader = 4 << 20
 
 // ErrInvalidKeymapRecord is returned by Reader.Next when a line does not
 // parse as a KeymapRecord (malformed JSON, missing field, malformed
