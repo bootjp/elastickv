@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"time"
@@ -210,8 +211,38 @@ func WriteManifest(w io.Writer, m Manifest) error {
 // error is wrapped as ErrUnsupportedFormatVersion or ErrInvalidManifest so
 // callers can branch on errors.Is.
 func ReadManifest(r io.Reader) (Manifest, error) {
+	// Read the entire payload once so we can pre-decode just the
+	// format_version before strict struct decoding. Without this
+	// two-phase approach, a manifest produced by a newer major version
+	// that also changed the JSON type of a known field (e.g. `phase`
+	// switched from string to int) would surface as
+	// ErrInvalidManifest instead of ErrUnsupportedFormatVersion,
+	// breaking the documented version-branching contract for callers
+	// that key off errors.Is(err, ErrUnsupportedFormatVersion). See
+	// Codex P2, round 5.
+	payload, err := io.ReadAll(r)
+	if err != nil {
+		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	// Phase 1: probe format_version with a relaxed shape that tolerates
+	// arbitrary types on every other field.
+	var probe struct {
+		FormatVersion uint32 `json:"format_version"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return Manifest{}, errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	if probe.FormatVersion == 0 {
+		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
+			"format_version is zero")
+	}
+	if probe.FormatVersion > CurrentFormatVersion {
+		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
+			"format_version %d > current %d (newer producer)", probe.FormatVersion, CurrentFormatVersion)
+	}
+	// Phase 2: strict struct decode on a known-supported version.
 	var m Manifest
-	dec := json.NewDecoder(r)
+	dec := json.NewDecoder(bytes.NewReader(payload))
 	// We intentionally do NOT call DisallowUnknownFields here.
 	// The format-version contract (Codex P1, follow-up) is:
 	//   - format_version > CurrentFormatVersion -> hard refuse
@@ -236,14 +267,6 @@ func ReadManifest(r io.Reader) (Manifest, error) {
 	if dec.More() {
 		return Manifest{}, errors.Wrap(ErrInvalidManifest,
 			"trailing bytes after manifest JSON object")
-	}
-	if m.FormatVersion == 0 {
-		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
-			"format_version is zero")
-	}
-	if m.FormatVersion > CurrentFormatVersion {
-		return Manifest{}, errors.Wrapf(ErrUnsupportedFormatVersion,
-			"format_version %d > current %d (newer producer)", m.FormatVersion, CurrentFormatVersion)
 	}
 	if err := m.validate(); err != nil {
 		return Manifest{}, err
