@@ -20,10 +20,10 @@ func TestManifest_Phase0RoundTrip(t *testing.T) {
 	m.LastCommitTS = 4517352099840000
 	m.Source = &Source{FSMPath: "/data/fsm-snap/0000000000000064.fsm", FSMCRC32C: "deadbeef"}
 	m.Adapters = Adapters{
-		DynamoDB: Adapter{Tables: []string{"orders", "users"}},
-		S3:       Adapter{Buckets: []string{"photos"}},
-		Redis:    Adapter{Databases: []uint32{0}},
-		SQS:      Adapter{Queues: []string{"orders-fifo.fifo"}},
+		DynamoDB: &Adapter{Tables: []string{"orders", "users"}},
+		S3:       &Adapter{Buckets: []string{"photos"}},
+		Redis:    &Adapter{Databases: []uint32{0}},
+		SQS:      &Adapter{Queues: []string{"orders-fifo.fifo"}},
 	}
 	m.Exclusions = Exclusions{} // all defaults
 
@@ -202,6 +202,61 @@ func TestNewPhase0SnapshotManifest_DefaultsArePopulated(t *testing.T) {
 	}
 	if m.KeySegmentMaxBytes != KeySegmentMaxBytesDefault {
 		t.Fatalf("KeySegmentMaxBytes = %d, want %d", m.KeySegmentMaxBytes, KeySegmentMaxBytesDefault)
+	}
+}
+
+func TestReadManifest_RejectsTrailingBytes(t *testing.T) {
+	t.Parallel()
+	// Two manifests concatenated; the second must surface as a
+	// trailing-bytes error rather than be silently discarded — Codex
+	// P2 #194.
+	m := NewPhase0SnapshotManifest(time.Now())
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bad := append([]byte{}, body...)
+	bad = append(bad, body...)
+	_, err = ReadManifest(bytes.NewReader(bad))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest on trailing bytes", err)
+	}
+}
+
+func TestReadManifest_RejectsTrailingNonWhitespace(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bad := append([]byte{}, body...)
+	bad = append(bad, []byte("garbage")...)
+	_, err = ReadManifest(bytes.NewReader(bad))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest on trailing garbage", err)
+	}
+}
+
+func TestAdaptersStruct_NilVsEmptyDistinguishedOnDisk(t *testing.T) {
+	t.Parallel()
+	// Gemini #98: an excluded adapter (nil pointer) must serialize
+	// differently from an included-but-empty adapter (non-nil pointer
+	// to Adapter{}).
+	excluded := Adapters{
+		DynamoDB: &Adapter{}, // present, no scopes
+		// S3 / Redis / SQS left nil — out of scope
+	}
+	body, err := json.Marshal(excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(body)
+	if !strings.Contains(out, `"dynamodb":{}`) {
+		t.Fatalf("included-empty must serialise as `dynamodb:{}`, got %s", out)
+	}
+	if strings.Contains(out, `"s3"`) || strings.Contains(out, `"redis"`) || strings.Contains(out, `"sqs"`) {
+		t.Fatalf("excluded adapters must be omitted, got %s", out)
 	}
 }
 

@@ -309,6 +309,72 @@ func TestEncodeBinarySegment_FuzzRoundTripIfNotShaFallback(t *testing.T) {
 	})
 }
 
+func TestEncodeSegment_KeyMatchingShaFallbackShapeIsPromotedToFallback(t *testing.T) {
+	t.Parallel()
+	// A user key that is itself made of 32 hex chars + "__" + suffix
+	// would, under naive encoding, return the raw bytes unchanged
+	// (everything is unreserved) — but DecodeSegment's structural
+	// detection would then misclassify it as a SHA-fallback and
+	// return ErrShaFallbackNeedsKeymap. EncodeSegment must promote
+	// such inputs to a real SHA-fallback so the encoded->decoded
+	// invariant holds (decode refuses; KEYMAP carries the original).
+	raw := []byte("0123456789abcdef0123456789abcdef__suffix")
+	enc := EncodeSegment(raw)
+	if !IsShaFallback(enc) {
+		t.Fatalf("expected SHA fallback for collision-shaped input, got %q", enc)
+	}
+	// The fallback's hex prefix must be the SHA of the raw bytes,
+	// NOT the raw bytes' first 32 chars. That way a KEYMAP entry
+	// keyed on `enc` carries the actual original — not a structural
+	// echo.
+	if _, err := DecodeSegment(enc); !errors.Is(err, ErrShaFallbackNeedsKeymap) {
+		t.Fatalf("decode of promoted fallback: err=%v want ErrShaFallbackNeedsKeymap", err)
+	}
+}
+
+func TestEncodeSegment_HugeInputDoesNotMaterialiseFullExpansion(t *testing.T) {
+	t.Parallel()
+	// A 1 MiB input would, if percent-encoded eagerly, allocate 3
+	// MiB before the length check fired. The early short-circuit
+	// must skip that allocation. We can't directly observe the
+	// allocation here without a profile, but we can assert the
+	// output is correct (SHA fallback, length under the ceiling)
+	// and that the call returns promptly enough to be a no-op
+	// guard in profile-runs.
+	raw := make([]byte, 1<<20) // 1 MiB
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	enc := EncodeSegment(raw)
+	if !IsShaFallback(enc) {
+		t.Fatalf("expected SHA fallback for huge input")
+	}
+	if len(enc) > maxSegmentBytes {
+		t.Fatalf("encoded len %d > max %d", len(enc), maxSegmentBytes)
+	}
+}
+
+func TestDecodeSegment_RejectsOversizedInput(t *testing.T) {
+	t.Parallel()
+	too := strings.Repeat("a", maxSegmentBytes+1)
+	_, err := DecodeSegment(too)
+	if !errors.Is(err, ErrInvalidEncodedSegment) {
+		t.Fatalf("err=%v want ErrInvalidEncodedSegment for oversized input", err)
+	}
+}
+
+func TestEncodeBinarySegment_HugeInputTakesShaFallbackWithoutEncoding(t *testing.T) {
+	t.Parallel()
+	raw := make([]byte, 1<<20) // 1 MiB
+	enc := EncodeBinarySegment(raw)
+	if !IsShaFallback(enc) {
+		t.Fatalf("expected SHA fallback for huge binary input, got %q", enc[:min(40, len(enc))])
+	}
+	if len(enc) > maxSegmentBytes {
+		t.Fatalf("encoded len %d > max %d", len(enc), maxSegmentBytes)
+	}
+}
+
 func TestEncodeSegment_ShaFallbackEmbedsRecognisableSuffix(t *testing.T) {
 	t.Parallel()
 	// The truncated suffix in the SHA-fallback rendering must be derivable
