@@ -50,6 +50,51 @@ func TestManifest_Phase0RoundTrip(t *testing.T) {
 	}
 }
 
+func TestManifest_Phase1MustSetLive(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	// Live deliberately omitted -- the gap Codex P1 #295 caught.
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestManifest_Phase1RejectsZeroReadTS(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	m.Live = &Live{ReadTS: 0}
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for zero read_ts", err)
+	}
+}
+
+func TestManifest_Phase1WithLiveAndNonZeroReadTSIsValid(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	m.Live = &Live{ReadTS: 12345}
+	var buf bytes.Buffer
+	if err := WriteManifest(&buf, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	got, err := ReadManifest(&buf)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if got.Live == nil || got.Live.ReadTS != 12345 {
+		t.Fatalf("Live mismatch: %+v", got.Live)
+	}
+}
+
 func TestManifest_Phase1MustNotSetSource(t *testing.T) {
 	t.Parallel()
 	m := NewPhase0SnapshotManifest(time.Now())
