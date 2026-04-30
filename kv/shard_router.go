@@ -21,9 +21,28 @@ import (
 // Implementations must be safe for concurrent use — ResolveGroup is
 // called on the request hot path. Returning (0, false) for a key
 // the resolver does not recognise lets the router fall through to
-// the engine.
+// the engine. Returning (0, false) for a key the resolver DOES
+// recognise (the partitioned shape matches but the queue is not
+// in the map, or the partition is out of range) is also valid;
+// the router uses RecognisesPartitionedKey to distinguish "not
+// partitioned, fall through" from "partitioned but unresolved,
+// fail closed".
+//
+// The fail-closed split matters under partition-map drift / a
+// partial rollout: without it, an unresolved partitioned key
+// would silently land on the engine's SQS-catalog default group
+// (because routeKey normalises every !sqs|... key to
+// !sqs|route|global) instead of surfacing a routing error.
 type PartitionResolver interface {
 	ResolveGroup(key []byte) (uint64, bool)
+
+	// RecognisesPartitionedKey reports whether the key SHAPE is
+	// one this resolver is responsible for. Implementations
+	// answer based on prefix / structural inspection only — the
+	// answer must NOT depend on any in-memory mapping that could
+	// drift out of sync, otherwise the router cannot reliably
+	// fail-closed for unresolved-but-recognised keys.
+	RecognisesPartitionedKey(key []byte) bool
 }
 
 // ShardRouter routes requests to multiple raft groups based on key ranges.
@@ -87,6 +106,15 @@ func (s *ShardRouter) WithPartitionResolver(r PartitionResolver) *ShardRouter {
 // legacy routing (catalog → !sqs|route|global → default group)
 // stays unchanged.
 //
+// Fail-closed for recognised-but-unresolved keys: when the resolver
+// recognises a partitioned shape (RecognisesPartitionedKey == true)
+// but cannot resolve the queue/partition pair (ResolveGroup returns
+// ok=false), the router refuses to fall through to the engine.
+// Otherwise the engine would route the partitioned key to
+// !sqs|route|global's default group, silently mis-routing HT-FIFO
+// traffic during partition-map drift or partial rollout (codex P1
+// round 2 on PR #715).
+//
 // Returns (0, false) when neither the resolver nor the engine
 // recognises the key. Caller surfaces this as an "unknown group"
 // error so a partitioned-prefix key whose queue is missing from the
@@ -96,6 +124,14 @@ func (s *ShardRouter) ResolveGroup(rawKey []byte) (uint64, bool) {
 	if s.partitionResolver != nil {
 		if gid, ok := s.partitionResolver.ResolveGroup(rawKey); ok {
 			return gid, true
+		}
+		if s.partitionResolver.RecognisesPartitionedKey(rawKey) {
+			// Partitioned shape, but the resolver cannot map it
+			// (unknown queue, out-of-range partition). Fail closed
+			// — the engine's catalog-level default route would
+			// silently misroute this through routeKey's
+			// !sqs|route|global collapse.
+			return 0, false
 		}
 	}
 	// Engine routes against the user-key view of the byte-range

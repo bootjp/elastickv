@@ -13,10 +13,16 @@ import (
 // stubResolver routes any key in claim to the named group; everything
 // else returns (0, false). Used by the coordinator-level resolver
 // regression tests so they don't depend on the adapter package.
+//
+// recognisedPrefix simulates the "recognised but unresolved" path
+// (codex round-2 P1 on PR #715) — keys with this prefix that miss
+// claim cause RecognisesPartitionedKey to return true so the
+// router fails closed instead of falling through to the engine.
 type stubResolver struct {
-	mu    sync.Mutex
-	claim map[string]uint64
-	calls [][]byte
+	mu               sync.Mutex
+	claim            map[string]uint64
+	recognisedPrefix []byte
+	calls            [][]byte
 }
 
 func (s *stubResolver) ResolveGroup(key []byte) (uint64, bool) {
@@ -27,6 +33,14 @@ func (s *stubResolver) ResolveGroup(key []byte) (uint64, bool) {
 		return gid, true
 	}
 	return 0, false
+}
+
+func (s *stubResolver) RecognisesPartitionedKey(key []byte) bool {
+	if len(s.recognisedPrefix) == 0 {
+		return false
+	}
+	return len(key) >= len(s.recognisedPrefix) &&
+		string(key[:len(s.recognisedPrefix)]) == string(s.recognisedPrefix)
 }
 
 func (s *stubResolver) callKeys() [][]byte {

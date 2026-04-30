@@ -17,13 +17,29 @@ import (
 // router-side tests — keeps the tests free of any adapter-package
 // dependency so the routing contract is verified at the kv layer in
 // isolation.
+//
+// recognisedPrefix lets a test simulate the "recognised but
+// unresolved" failure mode (codex round-2 P1 on PR #715): keys
+// that start with this prefix and miss the routes map cause
+// ResolveGroup to return (0, false) AND
+// RecognisesPartitionedKey to return true, so the router fails
+// closed instead of falling through to the engine.
 type fakePartitionResolver struct {
-	routes map[string]uint64
+	routes           map[string]uint64
+	recognisedPrefix []byte
 }
 
 func (f *fakePartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
 	gid, ok := f.routes[string(key)]
 	return gid, ok
+}
+
+func (f *fakePartitionResolver) RecognisesPartitionedKey(key []byte) bool {
+	if len(f.recognisedPrefix) == 0 {
+		return false
+	}
+	return len(key) >= len(f.recognisedPrefix) &&
+		bytes.HasPrefix(key, f.recognisedPrefix)
 }
 
 // TestShardRouter_PartitionResolverWins pins that when the resolver
@@ -176,6 +192,45 @@ func TestShardRouter_ResolverSeesRawKeyNotNormalized(t *testing.T) {
 			"resolver, contrary to the §3.D PR 4-B-2 design")
 }
 
+// TestShardRouter_FailClosedOnRecognisedButUnresolved pins the
+// codex round-2 P1 fix on PR #715: a key the resolver recognises
+// (partitioned shape) but cannot resolve (unknown queue / OOR
+// partition) must NOT fall through to the engine. Without the
+// fail-closed branch, the engine's routeKey-collapsed
+// !sqs|route|global default would silently swallow the misroute
+// during partition-map drift / partial rollout.
+func TestShardRouter_FailClosedOnRecognisedButUnresolved(t *testing.T) {
+	t.Parallel()
+	e := distribution.NewEngine()
+	e.UpdateRoute([]byte(""), nil, 1) // engine would route everything to group 1
+
+	router := NewShardRouter(e)
+	// Resolver claims nothing but RECOGNISES the partitioned shape
+	// for any key starting with "!sqs|msg|data|p|".
+	router.WithPartitionResolver(&fakePartitionResolver{
+		routes:           map[string]uint64{},
+		recognisedPrefix: []byte("!sqs|msg|data|p|"),
+	})
+
+	// A partitioned-shaped key the resolver recognises but cannot
+	// resolve. Without fail-closed this would silently route to
+	// group 1 via the engine's default.
+	_, ok := router.ResolveGroup([]byte("!sqs|msg|data|p|unknown-queue"))
+	require.False(t, ok,
+		"recognised-but-unresolved partitioned key must fail closed; "+
+			"engine fall-through would silently mis-route HT-FIFO "+
+			"traffic to the !sqs|route|global default group during "+
+			"partition-map drift")
+
+	// A non-partitioned key is NOT recognised → must still fall
+	// through to the engine. This pins that fail-closed only fires
+	// for the recognised-but-unresolved case.
+	gid, ok := router.ResolveGroup([]byte("legacy-key"))
+	require.True(t, ok)
+	require.Equal(t, uint64(1), gid,
+		"non-recognised key must fall through to engine default")
+}
+
 // TestShardRouter_GetUsesResolver pins that the resolver-first path
 // applies to Get as well as Commit/Abort. A regression that fixed
 // only Commit's path would silently route reads through the engine
@@ -225,6 +280,14 @@ func (r *recordingResolver) ResolveGroup(key []byte) (uint64, bool) {
 		return r.gid, true
 	}
 	return 0, false
+}
+
+// RecognisesPartitionedKey returns false unconditionally — these
+// router-side tests use the resolver-wins / fall-through paths
+// only; the recognised-but-unresolved path is exercised separately
+// via fakePartitionResolver.recognisedPrefix.
+func (r *recordingResolver) RecognisesPartitionedKey([]byte) bool {
+	return false
 }
 
 func (r *recordingResolver) seenKeys() [][]byte {

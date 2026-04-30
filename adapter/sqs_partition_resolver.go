@@ -68,6 +68,14 @@ var sqsResolverFamilyPrefixes = [][]byte{
 // family prefix (legacy SQS, KV, S3, DynamoDB, queue-meta records,
 // …) so kv.ShardRouter falls through to its byte-range engine for
 // default routing.
+//
+// Returns (0, false) for a partitioned-shaped key whose queue is
+// not in the routes map or whose partition index is beyond
+// len(routes[queue]). The router pairs this with
+// RecognisesPartitionedKey to fail closed instead of falling
+// through — silently routing through the engine's
+// !sqs|route|global default would mis-route HT-FIFO traffic during
+// partition-map drift (codex P1 round 2 on PR #715).
 func (r *SQSPartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
 	if r == nil || len(key) == 0 {
 		return 0, false
@@ -88,6 +96,26 @@ func (r *SQSPartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
 		return 0, false
 	}
 	return groups[partition], true
+}
+
+// RecognisesPartitionedKey reports whether key has the structural
+// shape of a partitioned-SQS key — a partitioned family prefix
+// followed by an encoded queue segment, a '|' terminator, and a
+// fixed-width uint32 partition index. Implementations of
+// kv.PartitionResolver must answer purely on shape so the router
+// can use the predicate to decide between fall-through (not
+// partitioned) and fail-closed (partitioned but unresolved); see
+// kv.PartitionResolver doc and codex P1 round 2 on PR #715.
+//
+// A nil receiver returns false so kv.ShardRouter's typed-nil case
+// (ResolveGroup(nil) == (0, false)) pairs with an honest "I don't
+// recognise anything" answer instead of falsely claiming a shape.
+func (r *SQSPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
+	if r == nil || len(key) == 0 {
+		return false
+	}
+	_, _, ok := parsePartitionedSQSKey(key)
+	return ok
 }
 
 // parsePartitionedSQSKey extracts the (queue, partition) pair from

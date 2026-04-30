@@ -147,13 +147,14 @@ func TestSQSPartitionResolver_LegacyKeyFallsThrough(t *testing.T) {
 	}
 }
 
-// TestSQSPartitionResolver_UnknownQueueFallsThrough pins that a
-// well-formed partitioned key for a queue that is NOT in the
-// partition map returns (0, false). This shape can only happen if
-// the cluster lost partition-map entries between writer and reader
-// (an operational misconfiguration); routing through the byte-range
-// engine is the correct fail-closed behaviour.
-func TestSQSPartitionResolver_UnknownQueueFallsThrough(t *testing.T) {
+// TestSQSPartitionResolver_UnknownQueueRecognisedButUnresolved
+// pins the round-5 fail-closed contract: a well-formed partitioned
+// key for a queue that is NOT in the partition map returns
+// ResolveGroup=(0, false) AND RecognisesPartitionedKey=true. The
+// router pairs these so the request fails closed — engine
+// fall-through would silently route the misconfiguration through
+// the SQS catalog default group (codex round-2 P1 on PR #715).
+func TestSQSPartitionResolver_UnknownQueueRecognisedButUnresolved(t *testing.T) {
 	t.Parallel()
 	r := NewSQSPartitionResolver(map[string][]uint64{
 		"known.fifo": {10, 11},
@@ -162,15 +163,17 @@ func TestSQSPartitionResolver_UnknownQueueFallsThrough(t *testing.T) {
 	gid, ok := r.ResolveGroup(key)
 	require.False(t, ok)
 	require.Equal(t, uint64(0), gid)
+	require.True(t, r.RecognisesPartitionedKey(key),
+		"unknown-queue partitioned key must still be recognised — "+
+			"the router pairs Recognised=true with ok=false to fail "+
+			"closed instead of falling through to the engine")
 }
 
-// TestSQSPartitionResolver_OutOfRangePartitionFallsThrough pins
-// that a partition value beyond the configured PartitionCount
-// returns (0, false). Same fail-closed argument as the unknown-
-// queue case — if a writer produced a key with partition 4 but the
-// resolver's view only has partitions [0, 3], routing through the
-// engine surfaces the disagreement at the request boundary.
-func TestSQSPartitionResolver_OutOfRangePartitionFallsThrough(t *testing.T) {
+// TestSQSPartitionResolver_OutOfRangePartitionRecognisedButUnresolved
+// pins the round-5 fail-closed contract for a partition value
+// beyond the configured PartitionCount. Same router-side
+// fail-closed argument as the unknown-queue case.
+func TestSQSPartitionResolver_OutOfRangePartitionRecognisedButUnresolved(t *testing.T) {
 	t.Parallel()
 	r := NewSQSPartitionResolver(map[string][]uint64{
 		"q.fifo": {10, 11},
@@ -182,6 +185,10 @@ func TestSQSPartitionResolver_OutOfRangePartitionFallsThrough(t *testing.T) {
 	gid, ok := r.ResolveGroup(key)
 	require.False(t, ok)
 	require.Equal(t, uint64(0), gid)
+	require.True(t, r.RecognisesPartitionedKey(key),
+		"OOR-partition key must still be recognised — the router "+
+			"pairs Recognised=true with ok=false to fail closed "+
+			"instead of falling through to the engine")
 }
 
 // TestSQSPartitionResolver_NilReceiverIsSafe pins defensive
@@ -195,6 +202,82 @@ func TestSQSPartitionResolver_NilReceiverIsSafe(t *testing.T) {
 	gid, ok := r.ResolveGroup([]byte("any-key"))
 	require.False(t, ok)
 	require.Equal(t, uint64(0), gid)
+}
+
+// TestSQSPartitionResolver_RecognisesPartitionedKey pins the
+// shape-only predicate the router uses to decide between
+// fall-through and fail-closed (codex round-2 P1 on PR #715).
+// RecognisesPartitionedKey MUST answer purely on the structural
+// shape — partitioned family prefix + queue + '|' terminator +
+// be32 partition — independent of whether the queue is in the
+// routes map. Otherwise the router could not reliably fail-closed
+// for unresolved-but-recognised keys.
+func TestSQSPartitionResolver_RecognisesPartitionedKey(t *testing.T) {
+	t.Parallel()
+	r := NewSQSPartitionResolver(map[string][]uint64{
+		"known.fifo": {10, 11},
+	})
+	cases := []struct {
+		name string
+		key  []byte
+		want bool
+	}{
+		{
+			name: "data family + known queue",
+			key:  sqsPartitionedMsgDataKey("known.fifo", 0, 1, "id"),
+			want: true,
+		},
+		{
+			name: "vis family + unknown queue (recognised, unresolved)",
+			key:  sqsPartitionedMsgVisKey("not-in-routes.fifo", 0, 1, 1, "id"),
+			want: true,
+		},
+		{
+			name: "byage family + OOR partition (recognised, unresolved)",
+			key:  sqsPartitionedMsgByAgeKey("known.fifo", 99, 1, 1, "id"),
+			want: true,
+		},
+		{
+			name: "legacy SQS key — not partitioned",
+			key:  sqsMsgDataKey("known.fifo", 1, "id"),
+			want: false,
+		},
+		{
+			name: "non-SQS key",
+			key:  []byte("/foo/bar"),
+			want: false,
+		},
+		{
+			name: "queue meta key",
+			key:  sqsQueueMetaKey("known.fifo"),
+			want: false,
+		},
+		{
+			name: "empty",
+			key:  []byte{},
+			want: false,
+		},
+		{
+			name: "nil",
+			key:  nil,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, r.RecognisesPartitionedKey(tc.key))
+		})
+	}
+}
+
+// TestSQSPartitionResolver_RecognisesPartitionedKey_NilReceiver
+// pins the typed-nil-safe branch — same as ResolveGroup, but for
+// the new predicate.
+func TestSQSPartitionResolver_RecognisesPartitionedKey_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var r *SQSPartitionResolver
+	require.False(t, r.RecognisesPartitionedKey([]byte("any-key")))
 }
 
 // TestSQSPartitionResolver_PrefixesAlign pins that the resolver's
