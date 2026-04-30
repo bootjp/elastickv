@@ -339,6 +339,24 @@ type Engine struct {
 	leaderLossCbsMu sync.Mutex
 	leaderLossCbs   []leaderLossSlot
 
+	// leaderAcquiredCbsMu guards the slice of callbacks invoked when
+	// the node transitions INTO the leader role. Callbacks fire
+	// synchronously from refreshStatus on the previous!=Leader →
+	// status==Leader edge. The MUST-be-non-blocking contract is the
+	// same as leaderLossCbs — a slow callback would stall every
+	// other holder of the same engine. See
+	// RegisterLeaderAcquiredCallback for the full contract.
+	//
+	// The acquired-side mirror exists so per-shard policy hooks
+	// (SQS HT-FIFO leadership-refusal in §8 of the split-queue FIFO
+	// design) can audit "we just became leader, are we still
+	// allowed to be?" without polling. Pairing the slot with a
+	// sentinel pointer mirrors the leader-loss design and lets
+	// deregister identify THIS registration when the same fn is
+	// registered multiple times.
+	leaderAcquiredCbsMu sync.Mutex
+	leaderAcquiredCbs   []leaderAcquiredSlot
+
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
 	pendingConfigs   map[uint64]adminRequest
@@ -931,44 +949,15 @@ func (e *Engine) RegisterLeaderLossCallback(fn func()) (deregister func()) {
 	if e == nil || fn == nil {
 		return func() {}
 	}
-	// Allocate a unique sentinel pointer so the deregister closure can
-	// identify THIS specific registration even if the same fn is
-	// registered multiple times.
-	slot := &struct{ fn func() }{fn: fn}
-	e.leaderLossCbsMu.Lock()
-	e.leaderLossCbs = append(e.leaderLossCbs, leaderLossSlot{id: slot, fn: fn})
-	e.leaderLossCbsMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			e.leaderLossCbsMu.Lock()
-			defer e.leaderLossCbsMu.Unlock()
-			for i, c := range e.leaderLossCbs {
-				if c.id != slot {
-					continue
-				}
-				// Remove without leaving a dangling reference at the
-				// tail of the underlying array. The removed slot's fn
-				// typically captures a *Coordinate; a plain
-				// `append(cbs[:i], cbs[i+1:]...)` would keep the old
-				// backing cell alive and prevent GC of the associated
-				// Coordinate until the engine itself is dropped.
-				last := len(e.leaderLossCbs) - 1
-				copy(e.leaderLossCbs[i:], e.leaderLossCbs[i+1:])
-				e.leaderLossCbs[last] = leaderLossSlot{}
-				e.leaderLossCbs = e.leaderLossCbs[:last]
-				return
-			}
-		})
-	}
+	return registerLeaderCallback(&e.leaderLossCbsMu, &e.leaderLossCbs, fn)
 }
 
 // leaderLossSlot pairs a registered callback with an id-only sentinel
-// pointer so deregister can distinguish identical fn values.
-type leaderLossSlot struct {
-	id *struct{ fn func() }
-	fn func()
-}
+// pointer so deregister can distinguish identical fn values. Aliased
+// to leaderCallbackSlot so the leader-loss and leader-acquired slices
+// share the same in-memory shape — the register / fire helpers are
+// generic over this single slot type.
+type leaderLossSlot = leaderCallbackSlot
 
 // fireLeaderLossCallbacks invokes all registered callbacks
 // synchronously. The registered-callback contract requires each fn
@@ -981,15 +970,129 @@ type leaderLossSlot struct {
 // invokeLeaderLossCallback) so a bug in one holder cannot break
 // subsequent callbacks or crash the process.
 func (e *Engine) fireLeaderLossCallbacks() {
-	e.leaderLossCbsMu.Lock()
-	cbs := make([]func(), len(e.leaderLossCbs))
-	for i, c := range e.leaderLossCbs {
-		cbs[i] = c.fn
-	}
-	e.leaderLossCbsMu.Unlock()
-	for _, fn := range cbs {
+	for _, fn := range gatherLeaderCallbacks(&e.leaderLossCbsMu, e.leaderLossCbs) {
 		e.invokeLeaderLossCallback(fn)
 	}
+}
+
+// leaderCallbackSlot is the shared on-disk shape for leader-loss
+// and leader-acquired callback registrations. The id pointer is a
+// per-registration sentinel so deregister can target THIS specific
+// entry even when the same fn is registered multiple times.
+type leaderCallbackSlot struct {
+	id *struct{ fn func() }
+	fn func()
+}
+
+// registerLeaderCallback installs fn into the (mu, cbs) callback
+// slice and returns a deregister closure. Shared by leader-loss
+// and leader-acquired registration so the slot-management /
+// dangling-reference / sync.Once-deregister logic lives in one
+// place. The two callback families differ only in which (mu, slice)
+// pair they target — the firing semantics, the sentinel-pointer
+// disambiguation, and the GC-safe slice truncation are identical.
+func registerLeaderCallback(mu *sync.Mutex, cbs *[]leaderCallbackSlot, fn func()) (deregister func()) {
+	// Allocate a unique sentinel pointer so the deregister closure
+	// can identify THIS specific registration even if the same fn
+	// is registered multiple times.
+	slot := &struct{ fn func() }{fn: fn}
+	mu.Lock()
+	*cbs = append(*cbs, leaderCallbackSlot{id: slot, fn: fn})
+	mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for i, c := range *cbs {
+				if c.id != slot {
+					continue
+				}
+				// Remove without leaving a dangling reference at
+				// the tail of the underlying array. The removed
+				// slot's fn typically captures a *Coordinate; a
+				// plain `append(cbs[:i], cbs[i+1:]...)` would keep
+				// the old backing cell alive and prevent GC of the
+				// associated Coordinate until the engine itself is
+				// dropped.
+				last := len(*cbs) - 1
+				copy((*cbs)[i:], (*cbs)[i+1:])
+				(*cbs)[last] = leaderCallbackSlot{}
+				*cbs = (*cbs)[:last]
+				return
+			}
+		})
+	}
+}
+
+// gatherLeaderCallbacks copies the live fn list out from under the
+// mutex so callers can fire them without holding the lock.
+// Mirrors the snapshot-then-fire pattern used by the per-callback
+// invoke helpers.
+func gatherLeaderCallbacks(mu *sync.Mutex, cbs []leaderCallbackSlot) []func() {
+	mu.Lock()
+	out := make([]func(), len(cbs))
+	for i, c := range cbs {
+		out[i] = c.fn
+	}
+	mu.Unlock()
+	return out
+}
+
+// RegisterLeaderAcquiredCallback registers fn to fire every time
+// the local node's Raft state transitions INTO leader (initial
+// election win, re-election after partition heal, leadership
+// transfer target completion). Callbacks fire on the
+// previous!=Leader → status==Leader edge in refreshStatus, after
+// e.isLeader has been published, so a callback that reads
+// engine.State() observes StateLeader.
+//
+// Use case: per-shard policy that needs to audit a freshly-acquired
+// leadership ("am I still allowed to be leader of this group?").
+// SQS HT-FIFO leadership-refusal (§8 of the split-queue FIFO
+// design) hangs off this hook to TransferLeadership when the
+// binary lacks the htfifo capability but a partitioned queue is
+// mapped to this Raft group.
+//
+// Callbacks run synchronously from refreshStatus and MUST be
+// non-blocking — same contract as RegisterLeaderLossCallback. A
+// callback wanting to do real work (e.g. enumerate the catalog,
+// call TransferLeadership) MUST offload to a goroutine.
+//
+// A panic inside a callback is contained and logged so a bug in
+// one holder cannot crash the engine or break other callbacks.
+//
+// The returned deregister function removes this specific
+// registration and is safe to call multiple times.
+func (e *Engine) RegisterLeaderAcquiredCallback(fn func()) (deregister func()) {
+	if e == nil || fn == nil {
+		return func() {}
+	}
+	return registerLeaderCallback(&e.leaderAcquiredCbsMu, &e.leaderAcquiredCbs, fn)
+}
+
+// leaderAcquiredSlot is the leader-acquired companion to
+// leaderLossSlot — both alias the shared leaderCallbackSlot so a
+// single set of register / fire helpers serves both transitions.
+type leaderAcquiredSlot = leaderCallbackSlot
+
+// fireLeaderAcquiredCallbacks invokes all registered callbacks
+// synchronously. Same panic-containment + non-blocking contract
+// as fireLeaderLossCallbacks.
+func (e *Engine) fireLeaderAcquiredCallbacks() {
+	for _, fn := range gatherLeaderCallbacks(&e.leaderAcquiredCbsMu, e.leaderAcquiredCbs) {
+		e.invokeLeaderAcquiredCallback(fn)
+	}
+}
+
+func (e *Engine) invokeLeaderAcquiredCallback(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("etcd raft engine: leader-acquired callback panic",
+				"recover", r)
+		}
+	}()
+	fn()
 }
 
 func (e *Engine) invokeLeaderLossCallback(fn func()) {
@@ -2511,6 +2614,14 @@ func (e *Engine) refreshStatus() {
 
 	if status.State == raftengine.StateLeader {
 		e.leaderOnce.Do(func() { close(e.leaderReady) })
+	}
+	if previous != raftengine.StateLeader && status.State == raftengine.StateLeader {
+		// Edge: the node has just acquired leadership. Fire the
+		// leader-acquired callbacks so per-shard policy hooks
+		// (SQS HT-FIFO leadership-refusal §8) can audit the
+		// transition before any client request lands. Same
+		// non-blocking contract as fireLeaderLossCallbacks.
+		e.fireLeaderAcquiredCallbacks()
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
 		e.failPending(errors.WithStack(errNotLeader))
