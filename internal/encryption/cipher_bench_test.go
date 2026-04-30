@@ -2,6 +2,7 @@ package encryption_test
 
 import (
 	"crypto/rand"
+	"strconv"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -112,28 +113,14 @@ func BenchmarkKeystore_AEAD(b *testing.B) {
 }
 
 // name returns a sub-benchmark label scaling with size for readable
-// benchstat output ("64B", "1.0KiB", "16KiB", "64KiB").
+// benchstat output ("64B", "1KiB", "16KiB", "64KiB").
 func name(size int) string {
 	switch {
 	case size < 1024:
-		return formatBytes(size, "B")
+		return strconv.Itoa(size) + "B"
 	case size < 1024*1024:
-		return formatBytes(size/1024, "KiB")
+		return strconv.Itoa(size/1024) + "KiB"
 	default:
-		return formatBytes(size/(1024*1024), "MiB")
+		return strconv.Itoa(size/(1024*1024)) + "MiB"
 	}
-}
-
-func formatBytes(n int, unit string) string {
-	// Avoid fmt.Sprintf to keep the benchmark file self-contained on
-	// the smallest possible import surface.
-	digits := []byte{}
-	if n == 0 {
-		digits = append(digits, '0')
-	}
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	return string(digits) + unit
 }
