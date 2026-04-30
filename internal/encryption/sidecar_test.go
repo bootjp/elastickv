@@ -122,15 +122,16 @@ func TestWriteSidecar_TmpFileMode(t *testing.T) {
 	}
 }
 
-func TestWriteSidecar_SetsVersion(t *testing.T) {
+// TestWriteSidecar_OnDiskVersion confirms WriteSidecar writes
+// SidecarVersion to disk regardless of the caller's struct value, so a
+// caller that builds a Sidecar with Version=0 still produces a
+// well-formed on-disk file.
+func TestWriteSidecar_OnDiskVersion(t *testing.T) {
 	path := sidecarPath(t)
 	sc := fixtureSidecar()
 	sc.Version = 0 // caller forgot to set
 	if err := encryption.WriteSidecar(path, sc); err != nil {
 		t.Fatalf("WriteSidecar: %v", err)
-	}
-	if sc.Version != encryption.SidecarVersion {
-		t.Fatalf("WriteSidecar did not set Version: got %d", sc.Version)
 	}
 	got, err := encryption.ReadSidecar(path)
 	if err != nil {
@@ -138,6 +139,28 @@ func TestWriteSidecar_SetsVersion(t *testing.T) {
 	}
 	if got.Version != encryption.SidecarVersion {
 		t.Fatalf("on-disk Version = %d, want %d", got.Version, encryption.SidecarVersion)
+	}
+}
+
+// TestWriteSidecar_DoesNotMutateCaller confirms WriteSidecar does NOT
+// rewrite the caller's struct in place. A caller that reuses the same
+// *Sidecar across rotations must see its Version field preserved
+// (including a deliberately-zero value used as a "build me" marker).
+// The mutation-as-side-effect behaviour was retracted in PR #722
+// review round 1 because it surprised callers that reuse the struct.
+func TestWriteSidecar_DoesNotMutateCaller(t *testing.T) {
+	path := sidecarPath(t)
+	sc := fixtureSidecar()
+	sc.Version = 0
+	sc.RaftAppliedIndex = 42
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	if sc.Version != 0 {
+		t.Fatalf("WriteSidecar mutated caller.Version: got %d, want 0 (preserved)", sc.Version)
+	}
+	if sc.RaftAppliedIndex != 42 {
+		t.Fatalf("WriteSidecar mutated caller.RaftAppliedIndex: got %d, want 42", sc.RaftAppliedIndex)
 	}
 }
 
@@ -349,6 +372,136 @@ func TestWriteSidecar_PartialWriteCleanup(t *testing.T) {
 	tmpPath := path + ".tmp"
 	if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("tmp file leaked after write failure: stat err=%v", statErr)
+	}
+}
+
+// TestWriteSidecar_RejectsActiveKeyMissing confirms validateSidecar
+// closes the gap raised by gemini and claude[bot] reviewers in PR #722:
+// a sidecar pointing Active.Storage at a key_id that does not appear
+// in the Keys map is malformed input and must not land on disk.
+func TestWriteSidecar_RejectsActiveKeyMissing(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*encryption.Sidecar)
+	}{
+		{
+			name: "storage active without entry",
+			mut: func(sc *encryption.Sidecar) {
+				sc.Active.Storage = 999999
+			},
+		},
+		{
+			name: "raft active without entry",
+			mut: func(sc *encryption.Sidecar) {
+				sc.Active.Raft = 888888
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := sidecarPath(t)
+			sc := fixtureSidecar()
+			tc.mut(sc)
+			err := encryption.WriteSidecar(path, sc)
+			if !errors.Is(err, encryption.ErrSidecarActiveKeyMissing) {
+				t.Fatalf("expected ErrSidecarActiveKeyMissing, got %v", err)
+			}
+		})
+	}
+}
+
+func TestReadSidecar_RejectsActiveKeyMissing(t *testing.T) {
+	path := sidecarPath(t)
+	raw := []byte(`{
+        "version": 1,
+        "raft_applied_index": 0,
+        "storage_envelope_active": false,
+        "raft_envelope_cutover_index": 0,
+        "active": {"storage": 12345, "raft": 0},
+        "keys": {}
+    }`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := encryption.ReadSidecar(path)
+	if !errors.Is(err, encryption.ErrSidecarActiveKeyMissing) {
+		t.Fatalf("expected ErrSidecarActiveKeyMissing, got %v", err)
+	}
+}
+
+// TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode is the security
+// regression test for the codex P2 finding on PR #722: a pre-existing
+// keys.json.tmp file with a permissive mode (e.g. 0o666 from older
+// tooling, manual poking, or a partially-recovered crash) must not
+// carry its mode into the production keys.json via os.Rename. The
+// fix in writeTmpAndFsync removes any pre-existing tmp before
+// O_EXCL-creating it fresh at sidecarFileMode.
+func TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, encryption.SidecarFilename)
+	tmpPath := path + ".tmp"
+
+	// Plant a pre-existing tmp file. Write at restrictive mode first
+	// (gosec G306 forbids writing files at >0o600), then explicitly
+	// chmod broader so we can verify WriteSidecar does NOT carry the
+	// pre-existing mode into the production keys.json.
+	if err := os.WriteFile(tmpPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("seed stale tmp: %v", err)
+	}
+	const broadMode = 0o666
+	if err := os.Chmod(tmpPath, broadMode); err != nil {
+		t.Fatalf("chmod stale tmp broader: %v", err)
+	}
+	// Some umasks or strict filesystems may refuse the broader mode;
+	// confirm we actually achieved a group/other-readable file before
+	// asserting the security property.
+	st, err := os.Stat(tmpPath)
+	if err != nil {
+		t.Fatalf("Stat seeded tmp: %v", err)
+	}
+	if st.Mode().Perm()&0o077 == 0 {
+		t.Skipf("environment refused permissive seed (mode=%o)", st.Mode().Perm())
+	}
+
+	if err := encryption.WriteSidecar(path, fixtureSidecar()); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+
+	// keys.json must NOT inherit the seeded permissive mode.
+	finalSt, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat final: %v", err)
+	}
+	if finalSt.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("keys.json inherited permissive mode from stale tmp: mode=%o",
+			finalSt.Mode().Perm())
+	}
+}
+
+// TestWriteSidecar_StaleTmpFileIsCleanedOnWriteFailure exercises the
+// claude[bot] minor #1 finding on PR #722: if writeTmpAndFsync itself
+// fails (not just the rename), the .tmp file must still be cleaned up.
+// We force a write failure by making the parent directory read-only;
+// this makes os.OpenFile fail (file cannot be created), which is a
+// pre-tmp-creation failure path. The post-tmp-creation failure path
+// is harder to inject portably; this test covers the "no leftover on
+// failure" property at the next-easiest reproducible boundary.
+func TestWriteSidecar_StaleTmpFileIsCleanedOnWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, encryption.SidecarFilename)
+	// Make the dir read-only so OpenFile cannot create the tmp.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("Chmod ro: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	err := encryption.WriteSidecar(path, fixtureSidecar())
+	if err == nil {
+		t.Fatal("WriteSidecar succeeded with read-only dir")
+	}
+	tmpPath := path + ".tmp"
+	if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("tmp file leaked after write failure (stat err=%v)", statErr)
 	}
 }
 
