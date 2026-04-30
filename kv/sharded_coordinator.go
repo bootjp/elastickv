@@ -395,7 +395,13 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 
 	// Multi-shard path: group read keys by shard now. The result is passed
 	// directly to prewriteTxn to avoid a second iteration inside that function.
-	groupedReadKeys := c.groupReadKeysByShardID(readKeys)
+	// A routing failure here aborts the transaction before any prewrite —
+	// silently dropping unresolvable read keys would let OCC validation run
+	// with an incomplete read set and break SSI.
+	groupedReadKeys, err := c.groupReadKeysByShardID(readKeys)
+	if err != nil {
+		return nil, err
+	}
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys)
 	if err != nil {
 		return nil, err
@@ -891,19 +897,38 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 	return gid
 }
 
-func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint64][][]byte {
+// groupReadKeysByShardID groups txn read keys by their owning Raft
+// group. Returns an error when ANY read key cannot be routed —
+// silently skipping unresolvable keys would let a transaction
+// commit with an incomplete OCC read-set, which breaks SSI under
+// the §5 ShardRouter resolver-first dispatch (codex round-2 P1 on
+// PR #715).
+//
+// The fail-closed semantic the resolver gained in PR 4-B-2 makes
+// this path matter: a partitioned-shape read key whose queue is
+// missing from --sqsFifoPartitionMap (drift / partial rollout)
+// returns gid=0 from c.router.ResolveGroup. If we silently dropped
+// those keys, the prewrite Raft entry would carry an empty
+// ReadKeys slice for that key, the FSM's read-write conflict
+// validation would never see it, and a concurrent write could
+// commit alongside a stale read. Surface the routing failure as
+// an error so the transaction aborts before any FSM apply.
+func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint64][][]byte, error) {
 	if len(readKeys) == 0 {
-		return nil
+		return nil, nil
 	}
 	grouped := make(map[uint64][][]byte)
 	for _, key := range readKeys {
-		gid := c.engineGroupIDForKey(key)
-		if gid == 0 {
-			continue
+		gid, ok := c.router.ResolveGroup(key)
+		if !ok || gid == 0 {
+			return nil, errors.Wrapf(ErrInvalidRequest,
+				"no route for txn read key %q — recognised-but-"+
+					"unresolved partition keys must fail closed to "+
+					"preserve OCC read-set integrity", key)
 		}
 		grouped[gid] = append(grouped[gid], key)
 	}
-	return grouped
+	return grouped, nil
 }
 
 // validateReadOnlyShards checks read-write conflicts on shards that have

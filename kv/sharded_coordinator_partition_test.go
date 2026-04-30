@@ -195,6 +195,85 @@ func TestShardedCoordinator_DispatchSplitsMutationsByResolverGroup(t *testing.T)
 			"mutations across groups via c.router.ResolveGroup.")
 }
 
+// TestShardedCoordinator_TxnFailsClosedForUnresolvedReadKey pins
+// the codex round-2 P1 fix on PR #715: a transaction whose read
+// set contains a partitioned-shape key the resolver recognises
+// but cannot route (queue missing from --sqsFifoPartitionMap
+// during drift / partial rollout) MUST abort before prewrite.
+//
+// Pre-fix path: groupReadKeysByShardID silently skipped read keys
+// where engineGroupIDForKey returned 0 (which is what the
+// fail-closed resolver returns for recognised-but-unresolved
+// keys). The resulting prewrite Raft entry carried an empty
+// ReadKeys slice for that key, the FSM's read-write conflict
+// validation never saw it, and a concurrent write could commit
+// alongside the stale read — SSI violated.
+//
+// Post-fix path: groupReadKeysByShardID returns an error when
+// any read key cannot be routed; dispatchTxn propagates the
+// error and the transaction aborts.
+func TestShardedCoordinator_TxnFailsClosedForUnresolvedReadKey(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	g1 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+	g42 := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 1}},
+	}
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1:  {Txn: g1, Store: store.NewMVCCStore()},
+		42: {Txn: g42, Store: store.NewMVCCStore()},
+	}, 1, NewHLC(), nil)
+
+	// Resolver claims the WRITE key but RECOGNISES the read key as
+	// partitioned-shape and returns ok=false (simulating the
+	// queue-missing-from-map drift scenario). The router pairs
+	// Recognised=true with ok=false to fail closed.
+	writeKey := []byte("!sqs|msg|data|p|claimed-write-key")
+	readKey := []byte("!sqs|msg|data|p|drift-unresolved-read")
+	coord.WithPartitionResolver(&stubResolver{
+		claim:            map[string]uint64{string(writeKey): 42},
+		recognisedPrefix: []byte("!sqs|msg|data|p|"),
+	})
+
+	// Issue a transaction that reads the unresolvable partitioned
+	// key and writes the claimed key. The transaction MUST abort —
+	// pre-fix it would silently drop the read key and proceed.
+	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  100,
+		CommitTS: 200,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: writeKey, Value: []byte("v")},
+		},
+		ReadKeys: [][]byte{readKey},
+	})
+	require.Error(t, err,
+		"transaction with unresolvable partitioned read key MUST "+
+			"abort — silently dropping the key would let OCC "+
+			"validation run with an incomplete read set and "+
+			"break SSI")
+	require.Nil(t, resp)
+
+	// Neither group should have received a prepare — the routing
+	// failure surfaces before any prewrite.
+	g1.mu.Lock()
+	g42.mu.Lock()
+	defer g1.mu.Unlock()
+	defer g42.mu.Unlock()
+	require.Zero(t, len(g1.requests),
+		"engine default group must not see a prewrite — fail-closed "+
+			"happens before any RPC")
+	require.Zero(t, len(g42.requests),
+		"resolver-claimed group must not see a prewrite either — "+
+			"fail-closed aborts the txn before prewrite even though "+
+			"the write key is routable")
+}
+
 // TestShardedCoordinator_DispatchFallsThroughForUnclaimedKeys pins
 // the inverse: a key the resolver does NOT claim must continue to
 // route via the byte-range engine. Without this guard the resolver-
