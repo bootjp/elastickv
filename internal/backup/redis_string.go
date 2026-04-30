@@ -121,6 +121,18 @@ type RedisDB struct {
 	// stat+mkdir(EEXIST) round-trips.
 	dirsCreated map[string]struct{}
 
+	// inlineTTLEmitted tracks string keys whose TTL was already
+	// extracted from the inline magic-prefix header by HandleString and
+	// written to strings_ttl.jsonl. The live Redis encoder emits BOTH
+	// `!redis|str|<k>` (with inline TTL) and `!redis|ttl|<k>` (the
+	// scan-index entry the sweeper consumes) for an expiring string
+	// (see adapter/redis_lua_context.go stringCommitElems). Without
+	// this set, HandleTTL would route the redundant `!redis|ttl|`
+	// record back into the same sidecar, duplicating the entry and
+	// violating the one-record-per-key contract sidecar consumers
+	// rely on. Codex P1 round 5.
+	inlineTTLEmitted map[string]struct{}
+
 	// warn is the structured-warning sink. Non-nil in production
 	// (fed by the decoder driver); nil in tests if the test does not
 	// care about warnings.
@@ -149,10 +161,11 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		dbIndex = 0
 	}
 	return &RedisDB{
-		outRoot:     outRoot,
-		dbIndex:     dbIndex,
-		kindByKey:   make(map[string]redisKeyKind),
-		dirsCreated: make(map[string]struct{}),
+		outRoot:          outRoot,
+		dbIndex:          dbIndex,
+		kindByKey:        make(map[string]redisKeyKind),
+		dirsCreated:      make(map[string]struct{}),
+		inlineTTLEmitted: make(map[string]struct{}),
 	}
 }
 
@@ -179,6 +192,10 @@ func (r *RedisDB) HandleString(userKey, value []byte) error {
 	if expireAtMs == 0 {
 		return nil
 	}
+	// Mark the key as already emitted inline so HandleTTL can drop the
+	// redundant !redis|ttl| scan-index record; otherwise the same
+	// expiring string would be written to strings_ttl.jsonl twice.
+	r.inlineTTLEmitted[string(userKey)] = struct{}{}
 	return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 }
 
@@ -209,6 +226,15 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	case redisKindHLL:
 		return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
 	case redisKindString:
+		// New-format strings carry TTL inline in the magic-prefix
+		// header; HandleString already wrote the entry to
+		// strings_ttl.jsonl. The `!redis|ttl|` scan-index record
+		// the sweeper consumes is redundant for backup output. Only
+		// legacy strings (no inline TTL) reach the appendTTL call.
+		// Codex P1 round 5.
+		if _, ok := r.inlineTTLEmitted[string(userKey)]; ok {
+			return nil
+		}
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 	case redisKindUnknown:
 		// Bounded to prevent OOM on a snapshot that contains a
@@ -381,6 +407,14 @@ type jsonlFile struct {
 func openJSONL(path string) (*jsonlFile, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return nil, cockroachdberr.WithStack(err)
+	}
+	// Refuse to clobber a symlink at the sidecar path. os.Create
+	// follows symlinks and would truncate the target outside the
+	// dump tree. writeFileAtomic already defends blob writes the
+	// same way; sidecar creation must mirror that boundary. Codex P2
+	// round 5.
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return nil, cockroachdberr.WithStack(cockroachdberr.Newf("backup: refusing to overwrite symlink at %s", path))
 	}
 	f, err := os.Create(path) //nolint:gosec // path is composed from output-root + fixed file name
 	if err != nil {
