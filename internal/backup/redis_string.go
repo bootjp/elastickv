@@ -370,14 +370,9 @@ func (r *RedisDB) recordIfFallback(encoded string, userKey []byte) error {
 		if err := r.ensureDir(dir); err != nil {
 			return err
 		}
-		const flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | syscall.O_NOFOLLOW
-		f, err := os.OpenFile(filepath.Join(dir, "KEYMAP.jsonl"), flag, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode
+		f, err := openSidecarFile(filepath.Join(dir, "KEYMAP.jsonl"))
 		if err != nil {
-			if errors.Is(err, syscall.ELOOP) {
-				return cockroachdberr.WithStack(cockroachdberr.Wrapf(err,
-					"backup: refusing to overwrite symlink at KEYMAP.jsonl"))
-			}
-			return cockroachdberr.WithStack(err)
+			return err
 		}
 		r.keymap = NewKeymapWriter(f)
 		r.keymapFile = f
@@ -461,27 +456,16 @@ func openJSONL(path string) (*jsonlFile, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return nil, cockroachdberr.WithStack(err)
 	}
-	// Refuse to clobber a symlink at the sidecar path. The earlier
-	// Lstat-then-Create pattern was a TOCTOU race: a process that
-	// could write the output directory could swap the path to a
-	// symlink between the two syscalls and still get the target
-	// truncated (Codex P1 round 6, follow-up to round 5). Use
-	// O_NOFOLLOW so the open syscall itself refuses symlinks
-	// atomically — no race window exists. On platforms where the
-	// kernel supports it (Linux, macOS, BSD) this returns ELOOP for
-	// a symlink path. On Windows syscall.O_NOFOLLOW is 0 (no-op),
-	// matching Windows's different filesystem-permission model.
-	const flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | syscall.O_NOFOLLOW
-	f, err := os.OpenFile(path, flag, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode for sidecar files
+	// openSidecarFile encapsulates the per-platform symlink-refusal
+	// strategy: Linux/macOS/BSD use O_NOFOLLOW so the open syscall
+	// itself returns ELOOP atomically (no TOCTOU window); Windows
+	// uses Lstat-then-OpenFile, accepting the residual race because
+	// mounting a successful attack on the dump tree there already
+	// requires write access plus SeCreateSymbolicLinkPrivilege.
+	// Codex P1 round 6 (atomic open) + P2 round 7 (Windows build).
+	f, err := openSidecarFile(path)
 	if err != nil {
-		// errors.Is(err, syscall.ELOOP) catches symlink rejection
-		// on Linux/macOS/BSD; wrap rather than replace so the
-		// caller can still inspect the underlying syscall error.
-		if errors.Is(err, syscall.ELOOP) {
-			return nil, cockroachdberr.WithStack(cockroachdberr.Wrapf(err,
-				"backup: refusing to overwrite symlink at %s", path))
-		}
-		return nil, cockroachdberr.WithStack(err)
+		return nil, err
 	}
 	bw := bufio.NewWriterSize(f, redisJSONLBufSize)
 	enc := json.NewEncoder(bw)
