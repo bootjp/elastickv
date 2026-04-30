@@ -281,23 +281,28 @@ func (s *SQSEncoder) flushQueue(st *sqsQueueState) error {
 	if err := writeFileAtomic(filepath.Join(dir, "_queue.json"), mustMarshalIndent(st.meta)); err != nil {
 		return err
 	}
-	if len(st.messages) == 0 {
-		return nil
-	}
-	sortMessagesForEmit(st.messages)
-	jl, err := openJSONL(filepath.Join(dir, "messages.jsonl"))
-	if err != nil {
-		return err
-	}
-	for i := range st.messages {
-		if err := jl.enc.Encode(st.messages[i]); err != nil {
-			_ = closeJSONL(jl)
-			return errors.WithStack(err)
+	if len(st.messages) > 0 {
+		sortMessagesForEmit(st.messages)
+		jl, err := openJSONL(filepath.Join(dir, "messages.jsonl"))
+		if err != nil {
+			return err
+		}
+		for i := range st.messages {
+			if err := jl.enc.Encode(st.messages[i]); err != nil {
+				_ = closeJSONL(jl)
+				return errors.WithStack(err)
+			}
+		}
+		if err := closeJSONL(jl); err != nil {
+			return err
 		}
 	}
-	if err := closeJSONL(jl); err != nil {
-		return err
-	}
+	// Side records ("--include-sqs-side-records") flush regardless of
+	// whether the queue has any current messages. A purged or
+	// metadata-only queue can legitimately have side records (e.g.,
+	// dedup window history, vis/byage entries from in-flight reaper
+	// state) and dropping them when messages == 0 silently weakens
+	// the --include-sqs-side-records contract — flagged as Codex P2.
 	if len(st.internalBuf) > 0 {
 		if err := s.flushInternals(dir, st.internalBuf); err != nil {
 			return err
@@ -366,9 +371,13 @@ func parseSQSMessageDataKey(key []byte) (string, error) {
 		return "", err
 	}
 	idx := scanBase64URLBoundary(rest)
-	if idx == 0 || idx+genBytes > len(rest) {
+	// idx == 0 -> no queue segment; idx+genBytes >= len(rest) -> no
+	// room for any msg-id segment after the gen. Both are malformed.
+	// AWS SQS message IDs are non-empty by construction, so an empty
+	// msg-id segment can never be a legitimate snapshot record.
+	if idx == 0 || idx+genBytes >= len(rest) {
 		return "", errors.Wrapf(ErrSQSMalformedKey,
-			"queue segment boundary not found in %q", key)
+			"queue segment or message-id segment not found in %q", key)
 	}
 	encQueue := rest[:idx]
 	if _, err := base64.RawURLEncoding.DecodeString(encQueue); err != nil {
@@ -395,7 +404,12 @@ func parseSQSGenericKey(key []byte, prefix string) (string, error) {
 		return "", err
 	}
 	idx := scanBase64URLBoundary(rest)
-	if idx == 0 {
+	// All side-record key shapes (vis / byage / dedup / group /
+	// tombstone) terminate the encoded queue segment with at least
+	// one binary trailer (the gen u64), so idx must be strictly less
+	// than len(rest). idx == len(rest) means the trailer is missing —
+	// either a truncated key or the wrong prefix.
+	if idx == 0 || idx == len(rest) {
 		return "", errors.Wrapf(ErrSQSMalformedKey,
 			"queue segment not found after prefix %q", prefix)
 	}

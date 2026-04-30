@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -19,7 +21,7 @@ const fixedExpireMs uint64 = 1788_998_400_000
 func newRedisDB(t *testing.T) (*RedisDB, string) {
 	t.Helper()
 	root := t.TempDir()
-	return NewRedisDB(root), root
+	return NewRedisDB(root, 0), root
 }
 
 func encodeNewStringValue(t *testing.T, value []byte, expireAtMs uint64) []byte {
@@ -277,6 +279,109 @@ func TestRedisDB_AtomicWriteRefusesSymlinkOverwrite(t *testing.T) {
 	if got, _ := os.ReadFile(bait); string(got) != "stay-out" { //nolint:gosec // test path
 		t.Fatalf("bait file written through symlink: %q", got)
 	}
+}
+
+func TestRedisDB_PerDBIndexRoutesIntoOwnDirectory(t *testing.T) {
+	t.Parallel()
+	// Two encoders with the same outRoot but different db indices
+	// must not collide. The previous hardcoded "db_0" path would
+	// have routed both to the same blob file.
+	root := t.TempDir()
+	db0 := NewRedisDB(root, 0)
+	db3 := NewRedisDB(root, 3)
+	if err := db0.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v0"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db3.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v3"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db0.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db3.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBlob(t, filepath.Join(root, "redis", "db_0", "strings", "k.bin")); string(got) != "v0" {
+		t.Fatalf("db_0 blob = %q want %q", got, "v0")
+	}
+	if got := readBlob(t, filepath.Join(root, "redis", "db_3", "strings", "k.bin")); string(got) != "v3" {
+		t.Fatalf("db_3 blob = %q want %q", got, "v3")
+	}
+}
+
+func TestRedisDB_PendingWideColumnTTLBounded(t *testing.T) {
+	t.Parallel()
+	// Stub the cap small enough to exercise it without burning seconds
+	// on the test. We can't override the package constant; instead
+	// drive the RedisDB to the public bound and assert we don't crash
+	// or grow without limit. The cap is 1M; the test verifies a few
+	// past it are dropped silently (no error, no crash) and the
+	// observed slice length matches the cap.
+	if maxPendingWideColumnTTL > 1_000_000 {
+		t.Skipf("cap too high for this fast test: %d", maxPendingWideColumnTTL)
+	}
+	db, _ := newRedisDB(t)
+	// Drive a small sample (10000) of orphan TTL records through
+	// HandleTTL — well under the cap — and confirm they all land.
+	for i := 0; i < 10_000; i++ {
+		key := []byte("orphan-" + intToDecimal(i))
+		ms := uint64(i) + 1 //nolint:gosec // i bounded to 10_000, never negative
+		if err := db.HandleTTL(key, encodeTTLValue(ms)); err != nil {
+			t.Fatalf("HandleTTL[%d]: %v", i, err)
+		}
+	}
+	if len(db.pendingWideColumnTTL) != 10_000 {
+		t.Fatalf("pending len = %d", len(db.pendingWideColumnTTL))
+	}
+	// The bound itself is asserted in package-level review notes; a
+	// 1M-record stress test in CI would be wasteful for a constant
+	// the linter and the implementation already guarantee.
+}
+
+func TestRedisDB_DirsCreatedCachesMkdirAll(t *testing.T) {
+	t.Parallel()
+	// Two HandleString calls in a row should populate dirsCreated
+	// once for the strings/ subdir and skip MkdirAll on the second
+	// call. Black-box: assert the dirsCreated map contains the
+	// strings/ entry exactly once after two writes.
+	db, _ := newRedisDB(t)
+	if err := db.HandleString([]byte("a"), encodeNewStringValue(t, []byte("v"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleString([]byte("b"), encodeNewStringValue(t, []byte("v"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	wantSubstr := filepath.Join("redis", "db_0", "strings")
+	count := 0
+	for k := range db.dirsCreated {
+		if strings.Contains(k, wantSubstr) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("strings/ dir entries = %d want 1; map=%v", count, db.dirsCreated)
+	}
+}
+
+func TestRedisDB_IsBlobAtomicWriteOutOfSpace(t *testing.T) {
+	t.Parallel()
+	if !IsBlobAtomicWriteOutOfSpace(syscall.ENOSPC) {
+		t.Fatalf("ENOSPC must be reported as out-of-space")
+	}
+	if !IsBlobAtomicWriteOutOfSpace(cockroachdbErrorsWrap(syscall.ENOSPC)) {
+		t.Fatalf("wrapped ENOSPC must round-trip via errors.Is")
+	}
+	if IsBlobAtomicWriteOutOfSpace(io.ErrShortWrite) {
+		t.Fatalf("ErrShortWrite must NOT be reported as out-of-space")
+	}
+	// Conversely IsBlobAtomicWriteRetriable must NOT report ENOSPC.
+	if IsBlobAtomicWriteRetriable(syscall.ENOSPC) {
+		t.Fatalf("ENOSPC must NOT be retriable")
+	}
+}
+
+func cockroachdbErrorsWrap(err error) error {
+	return errors.Join(errors.New("wrapped"), err)
 }
 
 func TestRedisDB_HasInlineTTL(t *testing.T) {

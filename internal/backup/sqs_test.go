@@ -361,6 +361,55 @@ func TestSQS_IncludeSideRecordsBuffersBetweenFinalize(t *testing.T) {
 	}
 }
 
+func TestSQS_ParseMessageDataKey_RejectsEmptyMsgIDSegment(t *testing.T) {
+	t.Parallel()
+	// Synthesise a key whose msg-id segment is empty: prefix +
+	// base64url("q") + 8-byte gen, nothing after. AWS SQS message
+	// IDs are non-empty by construction; an empty trailer cannot be
+	// a legitimate snapshot record.
+	key := append([]byte(SQSMsgDataPrefix), []byte("cQ")...)
+	key = append(key, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+	if _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
+		t.Fatalf("err=%v want ErrSQSMalformedKey for empty msg-id", err)
+	}
+}
+
+func TestSQS_ParseGenericKey_RejectsTrailerlessKey(t *testing.T) {
+	t.Parallel()
+	// Side-record key whose entire suffix is base64url-clean (no
+	// trailer bytes). Must surface as malformed rather than treating
+	// the whole tail as the queue segment.
+	key := append([]byte(SQSMsgVisPrefix), []byte("cQQQ")...)
+	if _, err := parseSQSGenericKey(key, SQSMsgVisPrefix); !errors.Is(err, ErrSQSMalformedKey) {
+		t.Fatalf("err=%v want ErrSQSMalformedKey for trailerless side-record key", err)
+	}
+}
+
+func TestSQS_SideRecordsFlushedEvenWhenZeroMessages(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	enc.WithIncludeSideRecords(true)
+	queue := "purged"
+	if err := enc.HandleQueueMeta(EncodeQueueMetaKey(queue), encodeQueueMetaValue(t, map[string]any{
+		"name": queue, "visibility_timeout_seconds": 30, "message_retention_seconds": 60,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Side record only, no message-data records — purged queue scenario.
+	visKey := append([]byte(SQSMsgVisPrefix), []byte("cHVyZ2Vk")...) // base64url("purged")
+	visKey = append(visKey, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+	if err := enc.HandleSideRecord(SQSMsgVisPrefix, visKey, []byte("opaque")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "sqs", queue, "_internals", "side_records.jsonl")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("expected side-records file even with zero messages: %v", err)
+	}
+}
+
 func TestSQS_DefaultDoesNotEmitInternals(t *testing.T) {
 	t.Parallel()
 	enc, root := newSQSEncoder(t)
