@@ -94,13 +94,30 @@ func installSQSLeadershipRefusal(
 			}
 		}()
 	}
-	if admin.State() == raftengine.StateLeader {
-		// Startup: this node is already leader. Refuse now so
-		// the cluster picks an htfifo-capable peer immediately
-		// rather than waiting for a future re-election.
+	// TOCTOU safety: read State() BEFORE registering the
+	// observer, fire refuse() if already leader, then register,
+	// then re-check State() once more. Without the second check
+	// the engine could win a Raft election in the narrow window
+	// between the first State() read and RegisterLeaderAcquiredCallback
+	// returning — refreshStatus would fire fireLeaderAcquiredCallbacks
+	// before refuse is in the slice, the hook would miss that
+	// acquisition, and the node would stay leader of a
+	// partitioned-queue group until the next election (claude
+	// finding 2 on PR #723). The second check after registration
+	// closes the window: refuse() is idempotent (TransferLeadership
+	// is a no-op once a transfer is already in flight), so a
+	// double-invocation across the boundary is safe.
+	wasLeaderBefore := admin.State() == raftengine.StateLeader
+	if wasLeaderBefore {
 		refuse()
 	}
-	return admin.RegisterLeaderAcquiredCallback(refuse)
+	deregister := admin.RegisterLeaderAcquiredCallback(refuse)
+	if !wasLeaderBefore && admin.State() == raftengine.StateLeader {
+		// Election landed during the registration window.
+		// refuse() the post-registration state too.
+		refuse()
+	}
+	return deregister
 }
 
 // partitionedGroupSet flattens the operator's --sqsFifoPartitionMap

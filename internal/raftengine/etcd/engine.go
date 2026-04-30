@@ -970,7 +970,7 @@ type leaderLossSlot = leaderCallbackSlot
 // invokeLeaderLossCallback) so a bug in one holder cannot break
 // subsequent callbacks or crash the process.
 func (e *Engine) fireLeaderLossCallbacks() {
-	for _, fn := range gatherLeaderCallbacks(&e.leaderLossCbsMu, e.leaderLossCbs) {
+	for _, fn := range gatherLeaderCallbacks(&e.leaderLossCbsMu, &e.leaderLossCbs) {
 		e.invokeLeaderLossCallback(fn)
 	}
 }
@@ -1029,13 +1029,20 @@ func registerLeaderCallback(mu *sync.Mutex, cbs *[]leaderCallbackSlot, fn func()
 // mutex so callers can fire them without holding the lock.
 // Mirrors the snapshot-then-fire pattern used by the per-callback
 // invoke helpers.
-func gatherLeaderCallbacks(mu *sync.Mutex, cbs []leaderCallbackSlot) []func() {
+//
+// Takes a *pointer* to the slice (not the slice itself) so the
+// header (pointer, length, capacity) is read INSIDE the locked
+// section. Passing the slice by value would dereference the
+// header at the call site — i.e. before mu.Lock() — racing with
+// any concurrent registerLeaderCallback. The pointer parameter
+// closes that race (codex P1 / gemini high on PR #723).
+func gatherLeaderCallbacks(mu *sync.Mutex, cbs *[]leaderCallbackSlot) []func() {
 	mu.Lock()
-	out := make([]func(), len(cbs))
-	for i, c := range cbs {
+	defer mu.Unlock()
+	out := make([]func(), len(*cbs))
+	for i, c := range *cbs {
 		out[i] = c.fn
 	}
-	mu.Unlock()
 	return out
 }
 
@@ -1080,7 +1087,7 @@ type leaderAcquiredSlot = leaderCallbackSlot
 // synchronously. Same panic-containment + non-blocking contract
 // as fireLeaderLossCallbacks.
 func (e *Engine) fireLeaderAcquiredCallbacks() {
-	for _, fn := range gatherLeaderCallbacks(&e.leaderAcquiredCbsMu, e.leaderAcquiredCbs) {
+	for _, fn := range gatherLeaderCallbacks(&e.leaderAcquiredCbsMu, &e.leaderAcquiredCbs) {
 		e.invokeLeaderAcquiredCallback(fn)
 	}
 }
@@ -1088,8 +1095,18 @@ func (e *Engine) fireLeaderAcquiredCallbacks() {
 func (e *Engine) invokeLeaderAcquiredCallback(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("etcd raft engine: leader-acquired callback panic",
-				"recover", r)
+			// Mirror the leader-loss panic log shape so operator
+			// triage of either family produces the same fields.
+			// Without node identity and the stack, an SQS
+			// leadership-refusal hook panicking in production
+			// would leave only the recovered value to grep on
+			// (gemini medium / claude finding 1 on PR #723).
+			slog.Error("etcd raft engine: leader-acquired callback panicked",
+				slog.String("node_id", e.localID),
+				slog.Uint64("raft_node_id", e.nodeID),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
 		}
 	}()
 	fn()
