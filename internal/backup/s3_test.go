@@ -565,6 +565,55 @@ func readBytesFile(t *testing.T, path string) []byte {
 	return b
 }
 
+func TestS3_IncompleteChunksRejected(t *testing.T) {
+	t.Parallel()
+	enc, _ := newS3Encoder(t)
+	bucket := "b"
+	gen := uint64(1)
+	object := "obj"
+	uploadID := "u"
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Manifest declares 3 chunks for partNo=1 but the snapshot only
+	// has 2 (chunkNo=0 and chunkNo=2; chunkNo=1 missing). Codex P1
+	// #729.
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": uploadID, "size_bytes": 9, "parts": []map[string]any{
+			{"part_no": 1, "size_bytes": 9, "chunk_count": 3},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 0), []byte("AAA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 2), []byte("CCC")); err != nil {
+		t.Fatal(err)
+	}
+	err := enc.Finalize()
+	if !errors.Is(err, ErrS3IncompleteBlobChunks) {
+		t.Fatalf("err=%v want ErrS3IncompleteBlobChunks for missing chunk", err)
+	}
+}
+
+func TestS3_EmptySlashSegmentsRejected(t *testing.T) {
+	t.Parallel()
+	cases := []string{"a//b", "a/", "/a//", "x/"}
+	for _, key := range cases {
+		t.Run(key, func(t *testing.T) {
+			enc, _ := newS3Encoder(t)
+			emitObject(t, enc, "b", 1, key, []byte("x"), "")
+			err := enc.Finalize()
+			if !errors.Is(err, ErrS3MalformedKey) {
+				t.Fatalf("err=%v want ErrS3MalformedKey for key %q", err, key)
+			}
+		})
+	}
+}
+
 func TestS3_VersionedBlobAssembledByPartVersionOrder(t *testing.T) {
 	t.Parallel()
 	enc, root := newS3Encoder(t)

@@ -48,7 +48,56 @@ var (
 	// ErrS3MetaSuffixCollision is returned when a user object key
 	// collides with the reserved S3MetaSuffixReserved suffix.
 	ErrS3MetaSuffixCollision = errors.New("backup: user S3 object key collides with reserved sidecar suffix")
+	// ErrS3IncompleteBlobChunks is returned when a manifest declares
+	// N chunks for some part but the snapshot did not contain all N.
+	// Without this guard a partial / racy snapshot would silently
+	// emit a truncated body. Codex P1 #729.
+	ErrS3IncompleteBlobChunks = errors.New("backup: incomplete blob chunks for manifest-declared part")
 )
+
+// verifyChunkCompleteness checks every (partNo, partVersion) entry in
+// declaredParts has the right number of chunkNo values present in
+// chunks. Chunks are expected at chunkNo in [0, chunk_count); a
+// missing index in that range surfaces as
+// ErrS3IncompleteBlobChunks rather than letting the assembler emit a
+// truncated body.
+//
+// declaredParts == nil means "no contract to verify" — used by tests
+// that pre-date the manifest-parts feature; production callers
+// always populate it via HandleObjectManifest.
+func verifyChunkCompleteness(chunks []s3ChunkKey, declaredParts map[s3PartKey]s3DeclaredPart) error {
+	if declaredParts == nil {
+		return nil
+	}
+	// Count present chunks per (partNo, partVersion).
+	type observed struct {
+		count    uint64
+		maxIndex uint64
+	}
+	got := make(map[s3PartKey]observed, len(declaredParts))
+	for _, k := range chunks {
+		pk := s3PartKey{partNo: k.partNo, partVersion: k.partVersion}
+		o := got[pk]
+		o.count++
+		if k.chunkNo > o.maxIndex {
+			o.maxIndex = k.chunkNo
+		}
+		got[pk] = o
+	}
+	for pk, want := range declaredParts {
+		o := got[pk]
+		// We accept o.count == want.chunkCount AND
+		// o.maxIndex == chunkCount-1, because a snapshot with N
+		// duplicates of chunkNo=0 would satisfy the count check
+		// alone. Both the count and the highest index must match.
+		if want.chunkCount > 0 && (o.count != want.chunkCount || o.maxIndex+1 != want.chunkCount) {
+			return errors.Wrapf(ErrS3IncompleteBlobChunks,
+				"partNo=%d partVersion=%d declared chunks=%d, observed count=%d maxIndex=%d",
+				pk.partNo, pk.partVersion, want.chunkCount, o.count, o.maxIndex)
+		}
+	}
+	return nil
+}
 
 // S3Encoder emits per-bucket _bucket.json + assembled object bodies +
 // .elastickv-meta.json sidecars + KEYMAP.jsonl, per the Phase 0
@@ -120,13 +169,13 @@ type s3ObjectState struct {
 	// window) cannot be merged into the active body — Codex P1 #500,
 	// Gemini HIGH #106/#476/#504.
 	uploadID string
-	// declaredParts is the set of (partNo, partVersion) tuples the
-	// manifest claims belong to this object. When non-nil, the body
-	// assembler restricts chunkPaths to entries matching this set —
-	// Codex P1 #619. nil means "no filter" (used only in tests that
-	// pre-date the manifest-parts feature; production callers always
-	// receive a non-nil set via HandleObjectManifest).
-	declaredParts map[s3PartKey]struct{}
+	// declaredParts maps each manifest-declared (partNo, partVersion)
+	// to the metadata the assembler needs to validate completeness
+	// (chunk_count). When non-nil, the body assembler restricts
+	// chunkPaths to entries matching the keys AND verifies every
+	// chunk index in [0, chunk_count) is present — Codex P1 #619
+	// (filter) + #729 (completeness). nil means "no filter".
+	declaredParts map[s3PartKey]s3DeclaredPart
 	// scratchDirCreated avoids the per-blob MkdirAll syscall flagged
 	// by Gemini MEDIUM #285. The scratch directory for this object is
 	// created exactly once on the first HandleBlob call.
@@ -146,12 +195,20 @@ type s3ChunkKey struct {
 
 // s3PartKey is the manifest-declared part identifier: a (partNo,
 // partVersion) tuple. ChunkNo is excluded because the manifest's
-// per-part chunk_count + chunk_sizes drive how many chunks to expect
-// per part, but the manifest doesn't enumerate (chunkNo) tuples
-// directly.
+// per-part chunk_count drives how many chunks to expect per part;
+// that count is stored on the s3DeclaredPart value, not in the key.
 type s3PartKey struct {
 	partNo      uint64
 	partVersion uint64
+}
+
+// s3DeclaredPart captures what the manifest claims for a part: its
+// expected chunk_count. assembleObjectBody verifies that one chunk
+// per (partNo, partVersion, chunkNo) in [0, chunk_count) actually
+// arrived; a missing chunk surfaces as ErrS3IncompleteBlobChunks
+// rather than a silently-truncated body (Codex P1 #729).
+type s3DeclaredPart struct {
+	chunkCount uint64
 }
 
 // s3PublicBucket is the dump-format projection of s3BucketMeta.
@@ -312,9 +369,11 @@ func (s *S3Encoder) HandleObjectManifest(key, value []byte) error {
 	// behind by overwrite-then-async-cleanup must NOT be merged
 	// into the body (Codex P1 #619).
 	st.uploadID = live.UploadID
-	st.declaredParts = make(map[s3PartKey]struct{}, len(live.Parts))
+	st.declaredParts = make(map[s3PartKey]s3DeclaredPart, len(live.Parts))
 	for _, p := range live.Parts {
-		st.declaredParts[s3PartKey{partNo: p.PartNo, partVersion: p.PartVersion}] = struct{}{}
+		st.declaredParts[s3PartKey{partNo: p.PartNo, partVersion: p.PartVersion}] = s3DeclaredPart{
+			chunkCount: p.ChunkCount,
+		}
 	}
 	st.chunkPaths = ensureChunkPaths(st.chunkPaths)
 	return nil
@@ -608,11 +667,28 @@ func safeJoinUnderRoot(root, rel string) (string, error) {
 	if strings.ContainsRune(rel, 0) {
 		return "", errors.Wrapf(ErrS3MalformedKey, "object name contains NUL: %q", rel)
 	}
-	for _, seg := range strings.Split(rel, "/") {
+	// Split on "/" and inspect every segment. S3 treats "a/", "a",
+	// and "a//b" as three distinct keys, but filepath.Join collapses
+	// them onto one filesystem path; without explicit rejection,
+	// distinct user keys would silently overwrite each other at
+	// finalize (Codex P1 #614).
+	segs := strings.Split(rel, "/")
+	for i, seg := range segs {
 		switch seg {
 		case ".", "..":
 			return "", errors.Wrapf(ErrS3MalformedKey,
 				"object name has dot segment %q (S3 treats it literally; rename in S3 first)", rel)
+		case "":
+			// A leading "/" produces an initial empty segment
+			// (segs[0] == ""); filepath.Join handles that case
+			// safely by stripping the prefix, matching the
+			// already-tested "absolute path collapses under
+			// bucket dir" behaviour. Reject empty segments
+			// anywhere else (mid-path "//" or trailing "/").
+			if i != 0 {
+				return "", errors.Wrapf(ErrS3MalformedKey,
+					"object name has empty path segment %q", rel)
+			}
 		}
 	}
 	cleanRoot := filepath.Clean(root)
@@ -724,6 +800,10 @@ func assembleObjectBody(outPath string, obj *s3ObjectState) error {
 	// of truth; only its uploadID + declaredParts make it into the
 	// assembled body.
 	chunks := filterChunksForManifest(obj.chunkPaths, obj.uploadID, obj.declaredParts)
+	if err := verifyChunkCompleteness(chunks, obj.declaredParts); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	for _, k := range chunks {
 		path := obj.chunkPaths[k]
 		if err := appendFile(tmp, path); err != nil {
@@ -751,7 +831,7 @@ func assembleObjectBody(outPath string, obj *s3ObjectState) error {
 // filter" — used by tests that pre-date these features. Production
 // callers always pass non-empty/non-nil values via
 // HandleObjectManifest.
-func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string, declaredParts map[s3PartKey]struct{}) []s3ChunkKey {
+func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string, declaredParts map[s3PartKey]s3DeclaredPart) []s3ChunkKey {
 	keys := make([]s3ChunkKey, 0, len(m))
 	for k := range m {
 		if manifestUploadID != "" && k.uploadID != manifestUploadID {
