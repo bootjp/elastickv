@@ -10,6 +10,22 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// PartitionResolver maps a key to its owning Raft group when the
+// key belongs to a partition-scheme keyspace (e.g. SQS HT-FIFO,
+// where each (queue, partition) pair lives on a different group).
+// ShardRouter consults the resolver before falling through to the
+// byte-range engine, so partition routing can override the default
+// shard-range layout without breaking the engine's non-overlapping-
+// cover invariant.
+//
+// Implementations must be safe for concurrent use — ResolveGroup is
+// called on the request hot path. Returning (0, false) for a key
+// the resolver does not recognise lets the router fall through to
+// the engine.
+type PartitionResolver interface {
+	ResolveGroup(key []byte) (uint64, bool)
+}
+
 // ShardRouter routes requests to multiple raft groups based on key ranges.
 //
 // Cross-shard transactions are not supported. They require distributed
@@ -17,9 +33,10 @@ import (
 //
 // Non-transactional request batches may still partially succeed across shards.
 type ShardRouter struct {
-	engine *distribution.Engine
-	mu     sync.RWMutex
-	groups map[uint64]*routerGroup
+	engine            *distribution.Engine
+	partitionResolver PartitionResolver
+	mu                sync.RWMutex
+	groups            map[uint64]*routerGroup
 }
 
 var ErrCrossShardTransactionNotSupported = errors.New("cross-shard transactions are not supported")
@@ -35,6 +52,40 @@ func NewShardRouter(e *distribution.Engine) *ShardRouter {
 		engine: e,
 		groups: make(map[uint64]*routerGroup),
 	}
+}
+
+// WithPartitionResolver installs a partition-keyspace resolver that
+// is consulted before the byte-range engine on every dispatch. A
+// nil resolver clears any previously-installed resolver. Returns
+// the receiver so callers can chain.
+//
+// Setting the resolver is idempotent — re-installing the same value
+// is a no-op. Concurrent reads against ResolveGroup remain safe
+// because both the read in resolveGroup and the assignment here
+// happen against the same field; routine startup wires the resolver
+// once before any request lands, so the rare write does not need a
+// lock.
+func (s *ShardRouter) WithPartitionResolver(r PartitionResolver) *ShardRouter {
+	s.partitionResolver = r
+	return s
+}
+
+// resolveGroup tries the partition resolver first (when installed),
+// then falls through to the byte-range engine. Returns the resolved
+// Raft group ID and a found flag; (0, false) means no route in either
+// the resolver or the engine — the caller surfaces this as an
+// "unknown group" error.
+func (s *ShardRouter) resolveGroup(key []byte) (uint64, bool) {
+	if s.partitionResolver != nil {
+		if gid, ok := s.partitionResolver.ResolveGroup(key); ok {
+			return gid, true
+		}
+	}
+	route, ok := s.engine.GetRoute(key)
+	if !ok {
+		return 0, false
+	}
+	return route.GroupID, true
 }
 
 // Register associates a raft group ID with its transactional manager and store.
@@ -127,24 +178,24 @@ func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Reques
 		if len(key) == 0 {
 			return nil, ErrInvalidRequest
 		}
-		route, ok := s.engine.GetRoute(key)
+		gid, ok := s.resolveGroup(key)
 		if !ok {
 			return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
 		}
-		batches[route.GroupID] = append(batches[route.GroupID], r)
+		batches[gid] = append(batches[gid], r)
 	}
 	return batches, nil
 }
 
 // Get retrieves a key routed to the correct shard.
 func (s *ShardRouter) Get(ctx context.Context, key []byte) ([]byte, error) {
-	route, ok := s.engine.GetRoute(routeKey(key))
+	gid, ok := s.resolveGroup(routeKey(key))
 	if !ok {
 		return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
 	}
-	g, ok := s.getGroup(route.GroupID)
+	g, ok := s.getGroup(gid)
 	if !ok {
-		return nil, errors.Wrapf(ErrInvalidRequest, "unknown group %d", route.GroupID)
+		return nil, errors.Wrapf(ErrInvalidRequest, "unknown group %d", gid)
 	}
 	v, err := g.store.GetAt(ctx, key, ^uint64(0))
 	if err != nil {

@@ -171,6 +171,21 @@ func (c *ShardedCoordinator) WithSampler(s keyviz.Sampler) *ShardedCoordinator {
 	return c
 }
 
+// WithPartitionResolver wires a PartitionResolver onto the
+// coordinator's underlying ShardRouter. The resolver runs before
+// the byte-range engine on every dispatch, so partition-keyspace
+// schemes (e.g. SQS HT-FIFO) can override the default shard layout
+// without breaking the engine's non-overlapping-cover invariant.
+//
+// Applied after construction for the same reason as the other
+// With* options on this type — NewShardedCoordinator is already
+// heavily overloaded. Passing a nil resolver clears any previously-
+// installed resolver.
+func (c *ShardedCoordinator) WithPartitionResolver(r PartitionResolver) *ShardedCoordinator {
+	c.router.WithPartitionResolver(r)
+	return c
+}
+
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
