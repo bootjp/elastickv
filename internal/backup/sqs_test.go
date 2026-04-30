@@ -377,6 +377,45 @@ func TestSQS_ParseMessageDataKey_RejectsEmptyMsgIDSegment(t *testing.T) {
 	}
 }
 
+// TestSQS_QueueMetaPreservesHTFIFOAttributes is the regression for
+// Codex P1 round 12: PartitionCount, FifoThroughputLimit, and
+// DeduplicationScope are immutable HT-FIFO attributes captured at
+// CreateQueue and rejected by SetQueueAttributes. Dropping them at
+// backup time would silently recreate single-partition / default-
+// routing / queue-scoped-dedup queues on restore — non-fidelity
+// preserving for any partitioned FIFO workload.
+func TestSQS_QueueMetaPreservesHTFIFOAttributes(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	queue := "ht-fifo.fifo"
+	val := encodeQueueMetaValue(t, map[string]any{
+		"name":                       queue,
+		"is_fifo":                    true,
+		"content_based_dedup":        true,
+		"visibility_timeout_seconds": 30,
+		"message_retention_seconds":  345600,
+		"partition_count":            4,
+		"fifo_throughput_limit":      "perMessageGroupId",
+		"deduplication_scope":        "messageGroup",
+	})
+	if err := enc.HandleQueueMeta(EncodeQueueMetaKey(queue), val); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readQueueJSON(t, filepath.Join(root, "sqs", queue, "_queue.json"))
+	if floatField(t, got, "partition_count") != 4 {
+		t.Fatalf("partition_count = %v want 4", got["partition_count"])
+	}
+	if got["fifo_throughput_limit"] != "perMessageGroupId" {
+		t.Fatalf("fifo_throughput_limit = %v want perMessageGroupId", got["fifo_throughput_limit"])
+	}
+	if got["deduplication_scope"] != "messageGroup" {
+		t.Fatalf("deduplication_scope = %v want messageGroup", got["deduplication_scope"])
+	}
+}
+
 // TestSQS_StaleGenerationMessagesDropped is the regression for Codex
 // P1 round 10: PurgeQueue and DeleteQueue bump the queue's generation
 // but the affected !sqs|msg|data|<oldGen>|... rows are removed
