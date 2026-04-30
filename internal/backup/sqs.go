@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/cockroachdb/errors"
 )
@@ -136,6 +137,37 @@ type sqsQueueMetaPublic struct {
 	RedrivePolicy             string `json:"redrive_policy,omitempty"`
 }
 
+// sqsMessageBody is the dump-format projection's body field. It marshals
+// as a JSON string when the bytes are valid UTF-8 (the AWS SQS contract
+// — body is XML-text), so restorers can pipe each `body` straight into
+// SendMessage. For non-UTF-8 bytes the encoder falls back to a
+// `{"base64":"..."}` envelope so binary payloads still round-trip
+// without lossy replacement-character rewrites. Codex P1 round 9.
+type sqsMessageBody []byte
+
+// MarshalJSON implements json.Marshaler.
+func (b sqsMessageBody) MarshalJSON() ([]byte, error) {
+	if utf8.Valid(b) {
+		// Emit as a plain JSON string. json.Marshal handles
+		// escaping (`"`, `\`, control chars) — the bytes that
+		// reach this path are valid UTF-8, so no information is
+		// lost.
+		out, err := json.Marshal(string(b))
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return out, nil
+	}
+	envelope := struct {
+		Base64 string `json:"base64"`
+	}{Base64: base64.RawURLEncoding.EncodeToString(b)}
+	out, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return out, nil
+}
+
 // sqsMessageRecord is the dump-format projection. Mirrors the live
 // adapter/sqs_messages.go:80 record one-to-one — JSON tag names match so
 // a restorer can call SendMessage with each line as the input. Visibility
@@ -143,7 +175,7 @@ type sqsQueueMetaPublic struct {
 // round-trip; the encoder zeroes the visibility-state fields by default.
 type sqsMessageRecord struct {
 	MessageID              string                     `json:"message_id"`
-	Body                   []byte                     `json:"body"`
+	Body                   sqsMessageBody             `json:"body"`
 	MD5OfBody              string                     `json:"md5_of_body,omitempty"`
 	MD5OfMessageAttributes string                     `json:"md5_of_message_attributes,omitempty"`
 	MessageAttributes      map[string]json.RawMessage `json:"message_attributes,omitempty"`

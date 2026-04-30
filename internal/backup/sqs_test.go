@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -371,6 +372,83 @@ func TestSQS_ParseMessageDataKey_RejectsEmptyMsgIDSegment(t *testing.T) {
 	key = append(key, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
 	if _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
 		t.Fatalf("err=%v want ErrSQSMalformedKey for empty msg-id", err)
+	}
+}
+
+// TestSQS_MessageBodyEmittedAsTextForUTF8 is the regression for Codex
+// P1 round 9 on PR #714: `body` was a `[]byte` field, so json.Encoder
+// rendered it as base64 in messages.jsonl. Replaying that JSONL via
+// SendMessage would push the base64 string itself as the body
+// (e.g., `hello` becoming `aGVsbG8=`), corrupting application
+// payloads. The dump-format projection now emits valid UTF-8 bodies
+// as plain strings so the JSONL is restoration-equivalent.
+func TestSQS_MessageBodyEmittedAsTextForUTF8(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	queue := "q"
+	if err := enc.HandleQueueMeta(EncodeQueueMetaKey(queue), encodeQueueMetaValue(t, map[string]any{
+		"name": queue, "visibility_timeout_seconds": 30, "message_retention_seconds": 60,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	val := encodeMessageValue(t, map[string]any{
+		"message_id":            "m1",
+		"body":                  []byte("hello"),
+		"send_timestamp_millis": 1,
+		"queue_generation":      1,
+	})
+	if err := enc.HandleMessageData(EncodeMsgDataKey(queue, 1, "m1"), val); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "sqs", queue, "messages.jsonl")) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"body":"hello"`)) {
+		t.Fatalf("body must serialise as plain string, got %s", raw)
+	}
+	if bytes.Contains(raw, []byte("aGVsbG8")) {
+		t.Fatalf("body must NOT serialise as base64, got %s", raw)
+	}
+}
+
+// TestSQS_MessageBodyFallsBackToBase64ForBinary covers the binary
+// fallback: when the body is not valid UTF-8, the projection emits
+// a typed `{"base64":"..."}` envelope so restore tools can detect
+// the encoded form rather than receiving a lossy
+// replacement-character rewrite.
+func TestSQS_MessageBodyFallsBackToBase64ForBinary(t *testing.T) {
+	t.Parallel()
+	enc, root := newSQSEncoder(t)
+	queue := "qbin"
+	if err := enc.HandleQueueMeta(EncodeQueueMetaKey(queue), encodeQueueMetaValue(t, map[string]any{
+		"name": queue, "visibility_timeout_seconds": 30, "message_retention_seconds": 60,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// 0x80 is a continuation byte; a leading 0x80 makes the sequence
+	// invalid UTF-8.
+	val := encodeMessageValue(t, map[string]any{
+		"message_id":            "m1",
+		"body":                  []byte{0x80, 0xff, 0x01},
+		"send_timestamp_millis": 1,
+		"queue_generation":      1,
+	})
+	if err := enc.HandleMessageData(EncodeMsgDataKey(queue, 1, "m1"), val); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "sqs", queue, "messages.jsonl")) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"body":{"base64":`)) {
+		t.Fatalf("binary body must use base64 envelope, got %s", raw)
 	}
 }
 
