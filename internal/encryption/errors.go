@@ -34,4 +34,9 @@ var (
 	// ErrEnvelopeVersion indicates DecodeEnvelope saw a version byte the
 	// current build does not know how to parse. Reserved values per §11.3.
 	ErrEnvelopeVersion = errors.New("encryption: unknown envelope version")
+
+	// ErrNilKeystore indicates NewCipher was called with a nil Keystore.
+	// Surfaced at construction time so a wiring mistake is caught
+	// before the first Encrypt/Decrypt would otherwise nil-deref panic.
+	ErrNilKeystore = errors.New("encryption: keystore is nil")
 )

@@ -27,7 +27,10 @@ func TestCipher_RoundTripProperty(t *testing.T) {
 			t.Fatalf("ks.Set: %v", err)
 		}
 
-		c := encryption.NewCipher(ks)
+		c, err := encryption.NewCipher(ks)
+		if err != nil {
+			t.Fatalf("NewCipher: %v", err)
+		}
 		plaintext := rapid.SliceOfN(rapid.Byte(), 0, 4096).Draw(t, "plaintext")
 		aad := rapid.SliceOfN(rapid.Byte(), 0, 256).Draw(t, "aad")
 		nonce := make([]byte, encryption.NonceSize)
@@ -69,7 +72,10 @@ func TestCipher_AADTamperProperty(t *testing.T) {
 		if err := ks.Set(keyID, dek); err != nil {
 			t.Fatalf("ks.Set: %v", err)
 		}
-		c := encryption.NewCipher(ks)
+		c, err := encryption.NewCipher(ks)
+		if err != nil {
+			t.Fatalf("NewCipher: %v", err)
+		}
 
 		plaintext := rapid.SliceOfN(rapid.Byte(), 1, 256).Draw(t, "plaintext")
 		// AAD must be at least 1 byte so we can tamper.

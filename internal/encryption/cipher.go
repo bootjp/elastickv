@@ -21,8 +21,18 @@ type Cipher struct {
 }
 
 // NewCipher returns a Cipher backed by ks.
-func NewCipher(ks *Keystore) *Cipher {
-	return &Cipher{keystore: ks}
+//
+// Returns ErrNilKeystore if ks is nil. Catching this at construction
+// time turns a wiring mistake into a typed error during process
+// startup or DEK rotation, rather than a nil-deref panic on the first
+// Encrypt/Decrypt — important for the dynamic dependency-wiring paths
+// where the encryption stack may be re-initialised after a sidecar
+// resync (§5.5) or rotation (§5.2).
+func NewCipher(ks *Keystore) (*Cipher, error) {
+	if ks == nil {
+		return nil, errors.WithStack(ErrNilKeystore)
+	}
+	return &Cipher{keystore: ks}, nil
 }
 
 // Encrypt produces (ciphertext ‖ tag) for plaintext under the DEK

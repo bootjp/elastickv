@@ -35,9 +35,20 @@ func newRandomNonce(t *testing.T) []byte {
 	return n
 }
 
+// mustCipher wraps NewCipher's error return so test bodies stay
+// readable. The error path is exercised by TestNewCipher_RejectsNil.
+func mustCipher(t *testing.T, ks *encryption.Keystore) *encryption.Cipher {
+	t.Helper()
+	c, err := encryption.NewCipher(ks)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	return c
+}
+
 func TestCipher_RoundTrip(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	cases := []struct {
 		name      string
 		plaintext []byte
@@ -72,7 +83,7 @@ func TestCipher_RoundTrip(t *testing.T) {
 
 func TestCipher_Decrypt_TagTamper(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	ct, err := c.Encrypt([]byte("payload"), []byte("aad"), keyID, nonce)
 	if err != nil {
@@ -88,7 +99,7 @@ func TestCipher_Decrypt_TagTamper(t *testing.T) {
 
 func TestCipher_Decrypt_AADTamper(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	ct, err := c.Encrypt([]byte("payload"), []byte("original aad"), keyID, nonce)
 	if err != nil {
@@ -102,7 +113,7 @@ func TestCipher_Decrypt_AADTamper(t *testing.T) {
 
 func TestCipher_Decrypt_CiphertextTamper(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	ct, err := c.Encrypt([]byte("payload"), []byte("aad"), keyID, nonce)
 	if err != nil {
@@ -118,7 +129,7 @@ func TestCipher_Decrypt_CiphertextTamper(t *testing.T) {
 
 func TestCipher_Decrypt_NonceTamper(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	ct, err := c.Encrypt([]byte("payload"), []byte("aad"), keyID, nonce)
 	if err != nil {
@@ -135,7 +146,7 @@ func TestCipher_Decrypt_NonceTamper(t *testing.T) {
 
 func TestCipher_Encrypt_RejectsReservedKeyID(t *testing.T) {
 	ks := encryption.NewKeystore()
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	_, err := c.Encrypt([]byte("x"), nil, encryption.ReservedKeyID, nonce)
 	if !errors.Is(err, encryption.ErrReservedKeyID) {
@@ -145,7 +156,7 @@ func TestCipher_Encrypt_RejectsReservedKeyID(t *testing.T) {
 
 func TestCipher_Encrypt_RejectsBadNonceSize(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	for _, nonceLen := range []int{0, 1, 11, 13, 16} {
 		_, err := c.Encrypt([]byte("x"), nil, keyID, make([]byte, nonceLen))
 		if !errors.Is(err, encryption.ErrBadNonceSize) {
@@ -156,7 +167,7 @@ func TestCipher_Encrypt_RejectsBadNonceSize(t *testing.T) {
 
 func TestCipher_Encrypt_UnknownKeyID(t *testing.T) {
 	ks := encryption.NewKeystore()
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	_, err := c.Encrypt([]byte("x"), nil, 12345, nonce)
 	if !errors.Is(err, encryption.ErrUnknownKeyID) {
@@ -166,7 +177,7 @@ func TestCipher_Encrypt_UnknownKeyID(t *testing.T) {
 
 func TestCipher_Decrypt_UnknownKeyID(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	ct, err := c.Encrypt([]byte("x"), nil, keyID, nonce)
 	if err != nil {
@@ -182,7 +193,7 @@ func TestCipher_Decrypt_UnknownKeyID(t *testing.T) {
 
 func TestCipher_Decrypt_RejectsReservedKeyID(t *testing.T) {
 	ks := encryption.NewKeystore()
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	nonce := newRandomNonce(t)
 	// Provide enough bytes to look like a valid envelope body so the
 	// length check is not the failure cause.
@@ -195,7 +206,7 @@ func TestCipher_Decrypt_RejectsReservedKeyID(t *testing.T) {
 
 func TestCipher_Decrypt_RejectsBadNonceSize(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	body := make([]byte, encryption.TagSize+1)
 	for _, nonceLen := range []int{0, 1, 11, 13, 16} {
 		_, err := c.Decrypt(body, nil, keyID, make([]byte, nonceLen))
@@ -205,9 +216,19 @@ func TestCipher_Decrypt_RejectsBadNonceSize(t *testing.T) {
 	}
 }
 
+func TestNewCipher_RejectsNil(t *testing.T) {
+	c, err := encryption.NewCipher(nil)
+	if !errors.Is(err, encryption.ErrNilKeystore) {
+		t.Fatalf("expected ErrNilKeystore, got err=%v", err)
+	}
+	if c != nil {
+		t.Fatal("NewCipher(nil) returned non-nil Cipher")
+	}
+}
+
 func TestCipher_DistinctNoncesProduceDistinctCiphertexts(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
-	c := encryption.NewCipher(ks)
+	c := mustCipher(t, ks)
 	plaintext := []byte("same message")
 	aad := []byte("same aad")
 	n1 := newRandomNonce(t)
