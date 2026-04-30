@@ -280,6 +280,57 @@ func TestSQSPartitionResolver_RecognisesPartitionedKey_NilReceiver(t *testing.T)
 	require.False(t, r.RecognisesPartitionedKey([]byte("any-key")))
 }
 
+// TestSQSPartitionResolver_RecognisesMalformedPartitionedKey pins
+// the prefix-only check (round 5 nit on PR #715): a key with a
+// valid partitioned family prefix but a corrupt / truncated queue
+// or partition segment MUST still be recognised so the router
+// fails closed rather than falling through to engine routing
+// (which would silently mis-route to the SQS catalog default
+// group via routeKey's !sqs|route|global collapse).
+func TestSQSPartitionResolver_RecognisesMalformedPartitionedKey(t *testing.T) {
+	t.Parallel()
+	r := NewSQSPartitionResolver(map[string][]uint64{
+		"q.fifo": {10, 11},
+	})
+	cases := []struct {
+		name string
+		key  []byte
+	}{
+		{
+			// Prefix only, nothing after — parsePartitionedSQSKey
+			// would fail on the missing '|' terminator, but the
+			// shape IS recognised.
+			name: "prefix only",
+			key:  []byte(SqsPartitionedMsgDataPrefix),
+		},
+		{
+			// Prefix + base64 garbage that decodes invalidly.
+			// parsePartitionedSQSKey would fail at decodeSQSSegment.
+			name: "prefix + invalid base64",
+			key:  []byte(SqsPartitionedMsgDataPrefix + "!!!|"),
+		},
+		{
+			// Prefix + valid queue segment + '|' but no partition
+			// bytes (truncated).
+			name: "prefix + queue + truncated partition",
+			key:  []byte(SqsPartitionedMsgVisPrefix + encodeSQSSegment("q.fifo") + "|"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.True(t, r.RecognisesPartitionedKey(tc.key),
+				"malformed partitioned key MUST be recognised so "+
+					"the router fails closed rather than mis-routing "+
+					"through the engine's SQS catalog default")
+			gid, ok := r.ResolveGroup(tc.key)
+			require.False(t, ok,
+				"malformed key cannot resolve")
+			require.Equal(t, uint64(0), gid)
+		})
+	}
+}
+
 // TestSQSPartitionResolver_PrefixesAlign pins that the resolver's
 // family-prefix list matches the constants in sqs_keys.go exactly.
 // A future renamed prefix or added family that touches sqs_keys.go

@@ -99,13 +99,14 @@ func (r *SQSPartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
 }
 
 // RecognisesPartitionedKey reports whether key has the structural
-// shape of a partitioned-SQS key — a partitioned family prefix
-// followed by an encoded queue segment, a '|' terminator, and a
-// fixed-width uint32 partition index. Implementations of
-// kv.PartitionResolver must answer purely on shape so the router
-// can use the predicate to decide between fall-through (not
-// partitioned) and fail-closed (partitioned but unresolved); see
-// kv.PartitionResolver doc and codex P1 round 2 on PR #715.
+// shape of a partitioned-SQS key — i.e. starts with one of the
+// partitioned family prefixes. The check is PREFIX-ONLY, not a
+// full parse: a key with a partitioned prefix followed by a
+// malformed queue / partition segment still answers true, so the
+// router fails closed via kv.PartitionResolver semantics instead
+// of falling through to the engine and silently routing to the
+// SQS catalog default group via routeKey's !sqs|route|global
+// collapse (round 5 review nit on PR #715).
 //
 // A nil receiver returns false so kv.ShardRouter's typed-nil case
 // (ResolveGroup(nil) == (0, false)) pairs with an honest "I don't
@@ -114,7 +115,7 @@ func (r *SQSPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
 	if r == nil || len(key) == 0 {
 		return false
 	}
-	_, _, ok := parsePartitionedSQSKey(key)
+	_, ok := stripPartitionedFamilyPrefix(key)
 	return ok
 }
 
