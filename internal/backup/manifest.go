@@ -268,10 +268,61 @@ func ReadManifest(r io.Reader) (Manifest, error) {
 		return Manifest{}, errors.Wrap(ErrInvalidManifest,
 			"trailing bytes after manifest JSON object")
 	}
+	if err := validateExclusionsFieldsPresent(payload); err != nil {
+		return Manifest{}, err
+	}
 	if err := m.validate(); err != nil {
 		return Manifest{}, err
 	}
 	return m, nil
+}
+
+// validateExclusionsFieldsPresent rejects manifests whose `exclusions`
+// section omits any of the required boolean flags. Go's
+// json.Unmarshal silently fills missing booleans with `false`, so a
+// truncated or partially-corrupted manifest would otherwise pass with
+// altered exclusion semantics — losing the producer-side provenance
+// the section is meant to capture (Codex P2 round 7). Each flag must
+// be present and not the JSON `null` literal; type validation already
+// runs as part of the strict struct decode.
+func validateExclusionsFieldsPresent(payload []byte) error {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &top); err != nil {
+		return errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	rawExcl, ok := top["exclusions"]
+	if !ok {
+		// validateRequiredFields surfaces the absent-section error
+		// with a clearer message; defer to it.
+		return nil
+	}
+	var excl map[string]json.RawMessage
+	if err := json.Unmarshal(rawExcl, &excl); err != nil {
+		return errors.Wrap(ErrInvalidManifest, err.Error())
+	}
+	for _, name := range exclusionsRequiredFields {
+		raw, present := excl[name]
+		if !present {
+			return errors.Wrapf(ErrInvalidManifest,
+				"exclusions.%s missing (cannot infer producer-side default)", name)
+		}
+		if bytes.Equal(raw, jsonNullLiteral) {
+			return errors.Wrapf(ErrInvalidManifest,
+				"exclusions.%s is null", name)
+		}
+	}
+	return nil
+}
+
+// exclusionsRequiredFields lists the JSON tag names of every
+// Exclusions field that must be explicitly present in the manifest.
+// Kept in sync with the struct definition above; a missing entry
+// here would silently re-introduce the omitted-flag bug.
+var exclusionsRequiredFields = [...]string{
+	"include_incomplete_uploads",
+	"include_orphans",
+	"preserve_sqs_visibility",
+	"include_sqs_side_records",
 }
 
 func (m Manifest) validate() error {
