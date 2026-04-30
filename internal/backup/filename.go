@@ -81,33 +81,64 @@ var ErrShaFallbackNeedsKeymap = errors.New("backup: filename uses SHA fallback; 
 // inputs.
 //
 // The encoding is deterministic and idempotent given the same input.
+//
+// Two short-circuits ensure the encoder never trips its own invariants:
+//
+//   - If raw is so large that percent-encoding it would always overflow
+//     maxSegmentBytes (3*len(raw) > maxSegmentBytes), we go straight to
+//     shaFallback without allocating the full expansion. Without this an
+//     adversarial caller could force a very large transient allocation
+//     just to discard it.
+//   - If the percent-encoded form happens to match the SHA-fallback shape
+//     (32 hex chars followed by "__"), we promote it to a real
+//     SHA-fallback so DecodeSegment's structural detection cannot
+//     misclassify a legitimate key. Both isShaFallback and shaFallback
+//     are true on the resulting output, so KEYMAP.jsonl carries the
+//     original bytes for exact-byte recovery.
 func EncodeSegment(raw []byte) string {
-	encoded := percentEncode(raw)
-	if len(encoded) <= maxSegmentBytes {
-		return encoded
+	if len(raw)*percentEncodeMaxExpansion > maxSegmentBytes {
+		return shaFallback(raw)
 	}
-	return shaFallback(raw)
+	encoded := percentEncode(raw)
+	if len(encoded) > maxSegmentBytes || isShaFallback(encoded) {
+		return shaFallback(raw)
+	}
+	return encoded
 }
 
 // EncodeBinarySegment encodes a DynamoDB B-attribute (binary) segment as
 // "b64.<base64url-no-padding>" so that binary keys never collide with string
 // keys whose hex-encoding happens to look like base64.
 //
-// b64-encoded segments take the SHA fallback if they exceed maxSegmentBytes
-// after the base64 expansion (~4/3 of the raw length).
+// Short-circuits the SHA-fallback for inputs whose base64 expansion (~4/3 of
+// the raw length, plus the 4-byte "b64." prefix) would always overflow
+// maxSegmentBytes. As with EncodeSegment, this avoids an unnecessary large
+// allocation when the result would have been discarded anyway.
 func EncodeBinarySegment(raw []byte) string {
-	enc := binaryPrefix + base64.RawURLEncoding.EncodeToString(raw)
-	if len(enc) <= maxSegmentBytes {
-		return enc
+	if base64.RawURLEncoding.EncodedLen(len(raw))+len(binaryPrefix) > maxSegmentBytes {
+		return shaFallback(raw)
 	}
-	return shaFallback(raw)
+	enc := binaryPrefix + base64.RawURLEncoding.EncodeToString(raw)
+	if len(enc) > maxSegmentBytes {
+		return shaFallback(raw)
+	}
+	return enc
 }
 
 // DecodeSegment is the inverse of EncodeSegment for percent-encoded and
 // binary-prefixed inputs. SHA-fallback inputs return ErrShaFallbackNeedsKeymap
 // so the caller knows to consult KEYMAP.jsonl rather than treat the partial
 // suffix as the original key.
+//
+// As a defensive measure DecodeSegment refuses inputs longer than
+// maxSegmentBytes. EncodeSegment never produces such inputs, so any caller
+// passing one is either reading a corrupted dump or has a bug; either way the
+// percentDecode allocation should not run.
 func DecodeSegment(seg string) ([]byte, error) {
+	if len(seg) > maxSegmentBytes {
+		return nil, errors.Wrapf(ErrInvalidEncodedSegment,
+			"segment length %d exceeds maximum %d", len(seg), maxSegmentBytes)
+	}
 	if isShaFallback(seg) {
 		return nil, errors.WithStack(ErrShaFallbackNeedsKeymap)
 	}
@@ -120,6 +151,10 @@ func DecodeSegment(seg string) ([]byte, error) {
 	}
 	return percentDecode(seg)
 }
+
+// percentEncodeMaxExpansion is the worst-case ratio of encoded length to
+// raw length for percentEncode (every byte expands to "%HH").
+const percentEncodeMaxExpansion = 3
 
 // IsShaFallback reports whether seg uses the SHA-prefix-and-truncated-original
 // form. Such segments cannot be reversed without KEYMAP.jsonl.
