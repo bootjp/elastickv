@@ -14,7 +14,7 @@ require (
 	github.com/cockroachdb/errors v1.12.0
 	github.com/cockroachdb/pebble/v2 v2.1.4
 	github.com/emirpasic/gods v1.18.1
-	github.com/getsentry/sentry-go v0.45.1
+	github.com/getsentry/sentry-go v0.46.0
 	github.com/goccy/go-json v0.10.6
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.23.2
