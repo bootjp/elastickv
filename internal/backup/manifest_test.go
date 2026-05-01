@@ -1,0 +1,529 @@
+package backup
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/cockroachdb/errors"
+)
+
+func TestManifest_Phase0RoundTrip(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 4, 29, 15, 42, 11, 94_000_000, time.UTC)
+	m := NewPhase0SnapshotManifest(now)
+	m.ElastickvVersion = "v1.7.3"
+	m.ClusterID = "ek-prod-us-east-1"
+	m.SnapshotIndex = 18432021
+	m.LastCommitTS = 4517352099840000
+	m.Source = &Source{FSMPath: "/data/fsm-snap/0000000000000064.fsm", FSMCRC32C: "deadbeef"}
+	m.Adapters = &Adapters{
+		DynamoDB: &Adapter{Tables: []string{"orders", "users"}},
+		S3:       &Adapter{Buckets: []string{"photos"}},
+		Redis:    &Adapter{Databases: []uint32{0}},
+		SQS:      &Adapter{Queues: []string{"orders-fifo.fifo"}},
+	}
+	m.Exclusions = &Exclusions{} // all defaults
+
+	var buf bytes.Buffer
+	if err := WriteManifest(&buf, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+
+	got, err := ReadManifest(&buf)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if got.Phase != PhasePhase0SnapshotDecode {
+		t.Fatalf("Phase = %q, want %q", got.Phase, PhasePhase0SnapshotDecode)
+	}
+	if got.SnapshotIndex != m.SnapshotIndex {
+		t.Fatalf("SnapshotIndex = %d, want %d", got.SnapshotIndex, m.SnapshotIndex)
+	}
+	if got.Source == nil || got.Source.FSMPath != m.Source.FSMPath {
+		t.Fatalf("Source.FSMPath = %v, want %v", got.Source, m.Source)
+	}
+	if got.Live != nil {
+		t.Fatalf("phase0 manifest must not set Live, got %+v", got.Live)
+	}
+}
+
+func TestManifest_Phase1MustSetLive(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	// Live deliberately omitted -- the gap Codex P1 #295 caught.
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestManifest_Phase1RejectsZeroReadTS(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	m.Live = &Live{ReadTS: 0}
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for zero read_ts", err)
+	}
+}
+
+func TestManifest_Phase1WithLiveAndNonZeroReadTSIsValid(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = nil
+	m.Live = &Live{ReadTS: 12345}
+	var buf bytes.Buffer
+	if err := WriteManifest(&buf, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	got, err := ReadManifest(&buf)
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if got.Live == nil || got.Live.ReadTS != 12345 {
+		t.Fatalf("Live mismatch: %+v", got.Live)
+	}
+}
+
+func TestManifest_Phase1MustNotSetSource(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Phase = PhasePhase1LivePinned
+	m.Source = &Source{FSMPath: "ignored"}
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("WriteManifest err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestManifest_Phase0MustNotSetLive(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.Live = &Live{ReadTS: 12345}
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("WriteManifest err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestReadManifest_RejectsFutureFormatVersion(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.FormatVersion = CurrentFormatVersion + 1
+	// validate() runs before encoding, so go around it.
+	body, _ := json.Marshal(m)
+	_, err := ReadManifest(bytes.NewReader(body))
+	if !errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("err=%v want ErrUnsupportedFormatVersion", err)
+	}
+}
+
+// TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch is the
+// regression test for Codex P2 round 5: a newer-major manifest that also
+// changes the JSON type of a known field (e.g. `phase` from string to int)
+// must surface as ErrUnsupportedFormatVersion, not ErrInvalidManifest. The
+// version-branching contract advertised to callers (errors.Is(err,
+// ErrUnsupportedFormatVersion) means "upgrade required") only holds if the
+// format_version probe runs before the strict struct decode.
+func TestReadManifest_FutureMajorVersionTakesPrecedenceOverTypeMismatch(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 999,
+		"phase": 42,
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {"dynamodb":{}, "s3":{}, "redis":{}, "sqs":{}},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("err=%v want ErrUnsupportedFormatVersion (must precede strict decode)", err)
+	}
+}
+
+func TestReadManifest_RejectsZeroFormatVersion(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.FormatVersion = 0
+	body, _ := json.Marshal(m)
+	_, err := ReadManifest(bytes.NewReader(body))
+	if !errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("err=%v want ErrUnsupportedFormatVersion", err)
+	}
+}
+
+// TestReadManifest_RejectsMissingFormatVersion is the regression for
+// Codex P2 round 8: an absent `format_version` unmarshals into uint32
+// zero, which the version gate would otherwise misclassify as
+// ErrUnsupportedFormatVersion ("upgrade required"). A truncated /
+// malformed manifest that dropped the field belongs in the
+// ErrInvalidManifest branch instead.
+func TestReadManifest_RejectsMissingFormatVersion(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+	if errors.Is(err, ErrUnsupportedFormatVersion) {
+		t.Fatalf("missing format_version must not surface as upgrade-required: %v", err)
+	}
+}
+
+// TestReadManifest_RejectsNullFormatVersion mirrors the missing-field
+// case for `"format_version": null`.
+func TestReadManifest_RejectsNullFormatVersion(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": null,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+// TestWriteManifest_RejectsFutureFormatVersion is the regression for
+// Codex P2 round 8: WriteManifest must refuse manifests advertising
+// a version this build cannot produce. Without this gate, a caller
+// mutating m.FormatVersion = CurrentFormatVersion + 1 writes a
+// manifest that the same package's ReadManifest then refuses,
+// producing self-incompatible backup metadata.
+func TestWriteManifest_RejectsFutureFormatVersion(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.FormatVersion = CurrentFormatVersion + 1
+	var buf bytes.Buffer
+	err := WriteManifest(&buf, m)
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("WriteManifest err=%v want ErrInvalidManifest for future format_version", err)
+	}
+}
+
+func TestReadManifest_AcceptsUnknownFieldsForSameMajorMinorEvolution(t *testing.T) {
+	t.Parallel()
+	// Same-major minor evolution: a newer producer adds an optional
+	// field; older readers must silently ignore it rather than fail
+	// the read. Codex P1 #205 (round 2) caught the earlier
+	// DisallowUnknownFields strictness which broke the documented
+	// same-major compatibility model.
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {"dynamodb":{}, "s3":{}, "redis":{}, "sqs":{}},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item",
+		"future_optional_field": "added in v1.minor"
+	}`
+	got, err := ReadManifest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("unknown optional field must be silently accepted: %v", err)
+	}
+	if got.FormatVersion != 1 {
+		t.Fatalf("format_version = %d", got.FormatVersion)
+	}
+}
+
+func TestReadManifest_RejectsUnknownPhase(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 1,
+		"phase": "phase99-future",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {"dynamodb":{}, "s3":{}, "redis":{}, "sqs":{}},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestReadManifest_RejectsBadWallTime(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "not-a-date",
+		"adapters": {"dynamodb":{}, "s3":{}, "redis":{}, "sqs":{}},
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestReadManifest_RejectsUnsupportedDynamoDBLayout(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	m.DynamoDBLayout = "bogus"
+	body, _ := json.Marshal(m)
+	_, err := ReadManifest(bytes.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest", err)
+	}
+}
+
+func TestNewPhase0SnapshotManifest_DefaultsArePopulated(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	if m.FormatVersion != CurrentFormatVersion {
+		t.Fatalf("FormatVersion = %d, want %d", m.FormatVersion, CurrentFormatVersion)
+	}
+	if m.Phase != PhasePhase0SnapshotDecode {
+		t.Fatalf("Phase = %q, want %q", m.Phase, PhasePhase0SnapshotDecode)
+	}
+	if m.ChecksumAlgorithm != ChecksumAlgorithmSHA256 {
+		t.Fatalf("ChecksumAlgorithm = %q, want %q", m.ChecksumAlgorithm, ChecksumAlgorithmSHA256)
+	}
+	if m.ChecksumFormat != ChecksumFormatSha256sum {
+		t.Fatalf("ChecksumFormat = %q, want %q", m.ChecksumFormat, ChecksumFormatSha256sum)
+	}
+	if m.S3MetaSuffix != S3MetaSuffixDefault {
+		t.Fatalf("S3MetaSuffix = %q", m.S3MetaSuffix)
+	}
+	if m.S3CollisionStrategy != S3CollisionStrategyLeafDataSuffix {
+		t.Fatalf("S3CollisionStrategy = %q", m.S3CollisionStrategy)
+	}
+	if m.DynamoDBLayout != DynamoDBLayoutPerItem {
+		t.Fatalf("DynamoDBLayout = %q", m.DynamoDBLayout)
+	}
+	if m.KeySegmentMaxBytes != KeySegmentMaxBytesDefault {
+		t.Fatalf("KeySegmentMaxBytes = %d, want %d", m.KeySegmentMaxBytes, KeySegmentMaxBytesDefault)
+	}
+}
+
+func TestReadManifest_RejectsTrailingBytes(t *testing.T) {
+	t.Parallel()
+	// Two manifests concatenated; the second must surface as a
+	// trailing-bytes error rather than be silently discarded — Codex
+	// P2 #194.
+	m := NewPhase0SnapshotManifest(time.Now())
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bad := append([]byte{}, body...)
+	bad = append(bad, body...)
+	_, err = ReadManifest(bytes.NewReader(bad))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest on trailing bytes", err)
+	}
+}
+
+func TestReadManifest_RejectsTrailingNonWhitespace(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	bad := append([]byte{}, body...)
+	bad = append(bad, []byte("garbage")...)
+	_, err = ReadManifest(bytes.NewReader(bad))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest on trailing garbage", err)
+	}
+}
+
+func TestAdaptersStruct_NilVsEmptyDistinguishedOnDisk(t *testing.T) {
+	t.Parallel()
+	// Gemini #98: an excluded adapter (nil pointer) must serialize
+	// differently from an included-but-empty adapter (non-nil pointer
+	// to Adapter{}).
+	excluded := Adapters{
+		DynamoDB: &Adapter{}, // present, no scopes
+		// S3 / Redis / SQS left nil — out of scope
+	}
+	body, err := json.Marshal(excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(body)
+	if !strings.Contains(out, `"dynamodb":{}`) {
+		t.Fatalf("included-empty must serialise as `dynamodb:{}`, got %s", out)
+	}
+	if strings.Contains(out, `"s3"`) || strings.Contains(out, `"redis"`) || strings.Contains(out, `"sqs"`) {
+		t.Fatalf("excluded adapters must be omitted, got %s", out)
+	}
+}
+
+func TestReadManifest_RejectsMissingAdapters(t *testing.T) {
+	t.Parallel()
+	// Adapters section omitted from the JSON entirely — Codex P2
+	// #146 round 3. With Adapters as a pointer the omission decodes
+	// as nil; validation must surface ErrInvalidManifest rather than
+	// treat an empty zero-value section as valid.
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"exclusions": {"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for missing adapters", err)
+	}
+}
+
+func TestReadManifest_RejectsMissingExclusions(t *testing.T) {
+	t.Parallel()
+	body := `{
+		"format_version": 1,
+		"phase": "phase0-snapshot-decode",
+		"wall_time_iso": "2026-04-29T00:00:00Z",
+		"adapters": {},
+		"checksum_algorithm": "sha256",
+		"checksum_format": "sha256sum",
+		"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+		"key_segment_max_bytes": 240,
+		"s3_meta_suffix": ".elastickv-meta.json",
+		"s3_collision_strategy": "leaf-data-suffix",
+		"dynamodb_layout": "per-item"
+	}`
+	_, err := ReadManifest(strings.NewReader(body))
+	if !errors.Is(err, ErrInvalidManifest) {
+		t.Fatalf("err=%v want ErrInvalidManifest for missing exclusions", err)
+	}
+}
+
+// TestReadManifest_RejectsMissingExclusionFlag is the regression for
+// Codex P2 round 7: each Exclusions sub-field must be explicitly
+// present in the JSON. Boolean fields default to `false` in Go, so an
+// omitted `preserve_sqs_visibility` would otherwise pass the strict
+// decode and silently look "off" — losing producer-side provenance.
+func TestReadManifest_RejectsMissingExclusionFlag(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		excl string
+	}{
+		{
+			"missing include_incomplete_uploads",
+			`{"include_orphans":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing include_orphans",
+			`{"include_incomplete_uploads":false,"preserve_sqs_visibility":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing preserve_sqs_visibility",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"include_sqs_side_records":false}`,
+		},
+		{
+			"missing include_sqs_side_records",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":false}`,
+		},
+		{
+			"explicit-null preserve_sqs_visibility",
+			`{"include_incomplete_uploads":false,"include_orphans":false,"preserve_sqs_visibility":null,"include_sqs_side_records":false}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := `{
+				"format_version": 1,
+				"phase": "phase0-snapshot-decode",
+				"wall_time_iso": "2026-04-29T00:00:00Z",
+				"adapters": {},
+				"exclusions": ` + tc.excl + `,
+				"checksum_algorithm": "sha256",
+				"checksum_format": "sha256sum",
+				"encoded_filename_charset": "rfc3986-unreserved-plus-percent",
+				"key_segment_max_bytes": 240,
+				"s3_meta_suffix": ".elastickv-meta.json",
+				"s3_collision_strategy": "leaf-data-suffix",
+				"dynamodb_layout": "per-item"
+			}`
+			_, err := ReadManifest(strings.NewReader(body))
+			if !errors.Is(err, ErrInvalidManifest) {
+				t.Fatalf("err=%v want ErrInvalidManifest", err)
+			}
+		})
+	}
+}
+
+func TestWriteManifest_ProducesPrettyJSON(t *testing.T) {
+	t.Parallel()
+	m := NewPhase0SnapshotManifest(time.Now())
+	var buf bytes.Buffer
+	if err := WriteManifest(&buf, m); err != nil {
+		t.Fatalf("WriteManifest: %v", err)
+	}
+	out := buf.String()
+	// Pretty: contains newlines and the 2-space indent we configured.
+	if !strings.Contains(out, "\n  \"format_version\"") {
+		t.Fatalf("expected pretty 2-space indent in output:\n%s", out)
+	}
+}
