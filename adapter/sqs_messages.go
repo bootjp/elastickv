@@ -43,9 +43,27 @@ const (
 	// has <1% tail-latency overhead, large enough that an empty queue
 	// does not spin.
 	sqsLongPollInterval = 200 * time.Millisecond
-	// Version byte prefixed to encoded receipt handles. Bumped when the
-	// on-wire handle format changes so old handles fail to decode loudly.
-	sqsReceiptHandleVersion = byte(0x01)
+	// sqsReceiptHandleVersion1 is the version byte for the legacy
+	// (single-partition) receipt-handle layout — pre-PR-5 handles
+	// and post-PR-5 handles for queues with PartitionCount <= 1.
+	// Bumped when the on-wire handle format changes so old handles
+	// fail to decode loudly.
+	sqsReceiptHandleVersion1 = byte(0x01)
+	// sqsReceiptHandleVersion2 is the version byte for partitioned
+	// FIFO handles (PartitionCount > 1). v2 carries the partition
+	// index so DeleteMessage / ChangeMessageVisibility can dispatch
+	// to the right partition's keyspace without re-running the
+	// partitionFor hash. The version byte discriminates: a v1 handle
+	// against a partitioned queue is rejected, a v2 handle against
+	// a non-partitioned queue is rejected — both with
+	// ReceiptHandleIsInvalid (codex P1 round-2 on PR #715 documents
+	// the cross-version rejection contract).
+	sqsReceiptHandleVersion2 = byte(0x02)
+	// sqsReceiptHandleVersion is the legacy const name preserved as
+	// an alias of v1 so existing call sites in this file keep
+	// compiling. New call sites SHOULD use sqsReceiptHandleVersion1
+	// (or sqsReceiptHandleVersion2) explicitly.
+	sqsReceiptHandleVersion = sqsReceiptHandleVersion1
 	// Byte sizes used when pre-sizing key buffers. The exact value is not
 	// critical; it only avoids one append growth for typical queue/ID
 	// lengths.
@@ -213,16 +231,27 @@ func newReceiptToken() ([]byte, error) {
 	return buf, nil
 }
 
-// encodeReceiptHandle packs (queue_gen, message_id, receipt_token) into a
-// single opaque blob. Format:
+// sqsReceiptHandleV1Size is the on-wire byte length of a v1
+// receipt handle: 1 byte version + 8 byte queue_gen + 16 byte
+// message_id + 16 byte receipt_token = 41 bytes.
+const sqsReceiptHandleV1Size = 1 + 8 + sqsMessageIDBytes + sqsReceiptTokenBytes
+
+// sqsReceiptHandleV2Size is the on-wire byte length of a v2
+// (partitioned) receipt handle: v1 + 4 bytes for the partition
+// uint32 inserted between version and queue_gen = 45 bytes.
+const sqsReceiptHandleV2Size = 1 + 4 + 8 + sqsMessageIDBytes + sqsReceiptTokenBytes
+
+// encodeReceiptHandle packs (queue_gen, message_id, receipt_token) into
+// a single opaque v1 blob. Used by SendMessage on a NON-partitioned
+// FIFO queue and on Standard queues. Format:
 //
-//	[ 0 ] byte version = 0x01
+//	[ 0 ]    byte version = 0x01
 //	[ 1..9 ] uint64 queue_gen (BE)
 //	[ 9..25 ] 16 bytes message_id (raw bytes from hex decode)
 //	[ 25..41 ] 16 bytes receipt_token
 //
-// The result is base64-urlsafe (no padding) so it passes through JSON and
-// HTTP query parameters untouched.
+// The result is base64-urlsafe (no padding) so it passes through
+// JSON and HTTP query parameters untouched.
 func encodeReceiptHandle(queueGen uint64, messageIDHex string, receiptToken []byte) (string, error) {
 	if len(receiptToken) != sqsReceiptTokenBytes {
 		return "", errors.New("receipt token has wrong length")
@@ -231,35 +260,113 @@ func encodeReceiptHandle(queueGen uint64, messageIDHex string, receiptToken []by
 	if err != nil || len(idBytes) != sqsMessageIDBytes {
 		return "", errors.New("message id has wrong format")
 	}
-	buf := make([]byte, 0, 1+8+sqsMessageIDBytes+sqsReceiptTokenBytes)
-	buf = append(buf, sqsReceiptHandleVersion)
+	buf := make([]byte, 0, sqsReceiptHandleV1Size)
+	buf = append(buf, sqsReceiptHandleVersion1)
 	buf = appendU64(buf, queueGen)
 	buf = append(buf, idBytes...)
 	buf = append(buf, receiptToken...)
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
+// encodeReceiptHandleV2 packs (partition, queue_gen, message_id,
+// receipt_token) for partitioned FIFO queues. Used by SendMessage
+// on a partitioned queue (PartitionCount > 1). Format:
+//
+//	[ 0 ]      byte version = 0x02
+//	[ 1..5 ]   uint32 partition (BE)
+//	[ 5..13 ]  uint64 queue_gen (BE)
+//	[ 13..29 ] 16 bytes message_id
+//	[ 29..45 ] 16 bytes receipt_token
+//
+// DeleteMessage / ChangeMessageVisibility use the partition field
+// to route the operation to the right partition's keyspace
+// without re-running partitionFor (the original MessageGroupId is
+// not in the handle).
+func encodeReceiptHandleV2(partition uint32, queueGen uint64, messageIDHex string, receiptToken []byte) (string, error) {
+	if len(receiptToken) != sqsReceiptTokenBytes {
+		return "", errors.New("receipt token has wrong length")
+	}
+	idBytes, err := hex.DecodeString(messageIDHex)
+	if err != nil || len(idBytes) != sqsMessageIDBytes {
+		return "", errors.New("message id has wrong format")
+	}
+	buf := make([]byte, 0, sqsReceiptHandleV2Size)
+	buf = append(buf, sqsReceiptHandleVersion2)
+	buf = appendU32(buf, partition)
+	buf = appendU64(buf, queueGen)
+	buf = append(buf, idBytes...)
+	buf = append(buf, receiptToken...)
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// decodedReceiptHandle is the parsed shape of a receipt handle.
+// Version reports which on-wire format the handle was in:
+//   - 0x01 (sqsReceiptHandleVersion1): legacy single-partition
+//     handle. Partition is 0 by definition.
+//   - 0x02 (sqsReceiptHandleVersion2): partitioned-FIFO handle.
+//     Partition is the partition index the message was sent to.
+//
+// Callers that route by partition (DeleteMessage,
+// ChangeMessageVisibility on a partitioned queue) MUST inspect
+// Version before consulting Partition — a v1 handle's zero
+// Partition is the LEGACY meaning ("single partition"), not
+// "partition 0 of N". A queue's PartitionCount at the moment the
+// caller acts must agree with the handle's version, or the
+// dispatch is rejected with ReceiptHandleIsInvalid.
 type decodedReceiptHandle struct {
+	Version         byte
+	Partition       uint32
 	QueueGeneration uint64
 	MessageIDHex    string
 	ReceiptToken    []byte
 }
 
+// decodeReceiptHandle inspects the version byte to dispatch to
+// the v1 or v2 layout. Length and version mismatches both surface
+// as the same opaque error so a malicious caller cannot use the
+// error message to probe the format.
 func decodeReceiptHandle(raw string) (*decodedReceiptHandle, error) {
 	b, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	want := 1 + 8 + sqsMessageIDBytes + sqsReceiptTokenBytes
-	if len(b) != want || b[0] != sqsReceiptHandleVersion {
+	if len(b) == 0 {
 		return nil, errors.New("receipt handle length or version mismatch")
 	}
-	out := &decodedReceiptHandle{
+	switch b[0] {
+	case sqsReceiptHandleVersion1:
+		return decodeReceiptHandleV1(b)
+	case sqsReceiptHandleVersion2:
+		return decodeReceiptHandleV2(b)
+	default:
+		return nil, errors.New("receipt handle length or version mismatch")
+	}
+}
+
+func decodeReceiptHandleV1(b []byte) (*decodedReceiptHandle, error) {
+	if len(b) != sqsReceiptHandleV1Size {
+		return nil, errors.New("receipt handle length or version mismatch")
+	}
+	return &decodedReceiptHandle{
+		Version:         sqsReceiptHandleVersion1,
+		Partition:       0,
 		QueueGeneration: binary.BigEndian.Uint64(b[1:9]),
 		MessageIDHex:    hex.EncodeToString(b[9 : 9+sqsMessageIDBytes]),
 		ReceiptToken:    bytes.Clone(b[9+sqsMessageIDBytes:]),
+	}, nil
+}
+
+func decodeReceiptHandleV2(b []byte) (*decodedReceiptHandle, error) {
+	if len(b) != sqsReceiptHandleV2Size {
+		return nil, errors.New("receipt handle length or version mismatch")
 	}
-	return out, nil
+	return &decodedReceiptHandle{
+		Version:         sqsReceiptHandleVersion2,
+		Partition:       binary.BigEndian.Uint32(b[1:5]),
+		QueueGeneration: binary.BigEndian.Uint64(b[5:13]),
+		MessageIDHex:    hex.EncodeToString(b[13 : 13+sqsMessageIDBytes]),
+		ReceiptToken:    bytes.Clone(b[13+sqsMessageIDBytes:]),
+	}, nil
 }
 
 // ------------------------ input decoding ------------------------
