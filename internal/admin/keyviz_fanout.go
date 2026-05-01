@@ -525,9 +525,14 @@ func mergeRowInto(
 			RouteIDs:          append([]uint64(nil), row.RouteIDs...),
 			RouteIDsTruncated: row.RouteIDsTruncated,
 			RouteCount:        row.RouteCount,
-			RaftGroupID:       row.RaftGroupID,
-			LeaderTerm:        row.LeaderTerm,
 			Values:            make([]uint64, mergedWidth),
+			// Per-cell parallel arrays sized to the merged column
+			// width. Stamped per-cell in the loop below from the
+			// largest-source for that cell, so the identity always
+			// matches the value we kept (Gemini MEDIUM on PR #720
+			// resolved by going per-cell).
+			RaftGroupIDs: make([]uint64, mergedWidth),
+			LeaderTerms:  make([]uint64, mergedWidth),
 		}
 		rowsByBucket[row.BucketID] = dst
 		*bucketOrder = append(*bucketOrder, row.BucketID)
@@ -537,10 +542,25 @@ func mergeRowInto(
 		if !ok || j >= len(row.Values) {
 			continue
 		}
-		next, conflict := mergeFn(dst.Values[idx], row.Values[j])
+		prev := dst.Values[idx]
+		next, conflict := mergeFn(prev, row.Values[j])
 		dst.Values[idx] = next
 		if conflict {
 			dst.Conflict = true
+		}
+		// Identity belongs to the source whose value we kept. For
+		// sumMerge (reads) this is best-effort: prev+incoming has
+		// no single owner, so we keep whichever side contributed
+		// most recently — close-to-correct in the steady state.
+		// For maxMerge (writes), `next == row.Values[j]` exactly
+		// when the incoming source won the cell; in the tied
+		// (prev == incoming != 0) case `next == prev`, both sides
+		// agree on the value, and either identity is acceptable.
+		if next == row.Values[j] && j < len(row.RaftGroupIDs) {
+			dst.RaftGroupIDs[idx] = row.RaftGroupIDs[j]
+		}
+		if next == row.Values[j] && j < len(row.LeaderTerms) {
+			dst.LeaderTerms[idx] = row.LeaderTerms[j]
 		}
 	}
 }

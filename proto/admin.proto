@@ -103,17 +103,28 @@ message KeyVizRow {
   repeated uint64 values = 11;
   // soft_columns[j] is true when the j-th column missed the estimator SLO.
   repeated bool soft_columns = 12;
-  // raft_group_id and leader_term carry the route's Raft identity at
-  // the time the column was flushed. Phase 2-C+ fan-out uses
-  // (bucket_id, raft_group_id, leader_term, column) as the dedupe
-  // key so writes from a leader and the previous leader of the same
-  // group can be summed across terms instead of conservatively
-  // max-merged. Zero values mean "term not tracked" (single-group
-  // legacy deployments, virtual aggregate buckets, or nodes that
-  // have not yet wired the leader-term publisher) — the aggregator
-  // falls back to the legacy max-merge for those cells.
-  uint64 raft_group_id = 13;
-  uint64 leader_term = 14;
+  // raft_group_ids[j] and leader_terms[j] carry the route's Raft
+  // identity at the time column j was flushed. Phase 2-C+ fan-out
+  // uses (bucket_id, raft_group_id, leader_term, column) as the
+  // dedupe key, so writes from a leader and the previous leader of
+  // the same group can be summed across terms instead of
+  // conservatively max-merged. Per-cell representation (parallel to
+  // values[] and soft_columns[]) is required because leadership can
+  // flip within the requested window; a single row-level scalar
+  // would only capture the first column's identity and cause
+  // incorrect dedupe for later columns (Gemini HIGH on PR #720).
+  // Zero values mean "term not tracked" (single-group legacy
+  // deployments, virtual aggregate buckets, or nodes that have not
+  // yet wired the leader-term publisher) — the aggregator falls
+  // back to the legacy max-merge for those cells.
+  //
+  // Both slices are either empty (legacy server, no per-column
+  // identity to share — older clients reading the response can
+  // treat empty as "all zeros") or `len(raft_group_ids) ==
+  // len(leader_terms) == len(values)`. The server never emits a
+  // partial-length slice.
+  repeated uint64 raft_group_ids = 13;
+  repeated uint64 leader_terms = 14;
 }
 
 message GetKeyVizMatrixRequest {

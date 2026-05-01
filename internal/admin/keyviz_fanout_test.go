@@ -71,12 +71,15 @@ func TestMergeKeyVizMatricesWritesMaxStableLeader(t *testing.T) {
 }
 
 // TestMergeKeyVizMatricesPreservesRaftIdentity pins the Phase 2-C+
-// wire extension on the fan-out merge path: when mergeRowInto seeds
-// the destination row from the first source, RaftGroupID and
-// LeaderTerm are copied through. PR-3c will use these fields to
-// switch from §4.2's row-level max-merge to §9.1's per-cell
-// (group, term) dedupe; this PR ensures the fields survive the
-// merge so PR-3c has data to act on.
+// per-cell wire extension on the fan-out merge path: mergeRowInto
+// stamps the destination row's per-cell (RaftGroupIDs[idx],
+// LeaderTerms[idx]) from whichever source contributed the value
+// kept at that cell. Both sources reporting the same identity
+// for a writes-max merge is the steady-state shape — merged
+// identity matches regardless of source order. (Gemini HIGH on
+// PR #720 resolved by going per-cell; row-level scalars would
+// only capture the first column's identity and break the per-cell
+// dedupe goal.)
 func TestMergeKeyVizMatricesPreservesRaftIdentity(t *testing.T) {
 	t.Parallel()
 	col := []int64{1_700_000_000_000}
@@ -84,20 +87,51 @@ func TestMergeKeyVizMatricesPreservesRaftIdentity(t *testing.T) {
 		ColumnUnixMs: col,
 		Series:       keyVizSeriesWrites,
 		Rows: []KeyVizRow{
-			{BucketID: "route:5", Values: []uint64{30}, RaftGroupID: 7, LeaderTerm: 42},
+			{BucketID: "route:5", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
 		},
 	}
 	b := KeyVizMatrix{
 		ColumnUnixMs: col,
 		Series:       keyVizSeriesWrites,
 		Rows: []KeyVizRow{
-			{BucketID: "route:5", Values: []uint64{0}, RaftGroupID: 7, LeaderTerm: 42},
+			{BucketID: "route:5", Values: []uint64{0}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
 		},
 	}
 	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
 	require.Len(t, merged.Rows, 1)
-	require.Equal(t, uint64(7), merged.Rows[0].RaftGroupID, "RaftGroupID must survive mergeRowInto")
-	require.Equal(t, uint64(42), merged.Rows[0].LeaderTerm, "LeaderTerm must survive mergeRowInto")
+	require.Equal(t, []uint64{7}, merged.Rows[0].RaftGroupIDs, "RaftGroupIDs must survive mergeRowInto")
+	require.Equal(t, []uint64{42}, merged.Rows[0].LeaderTerms, "LeaderTerms must survive mergeRowInto")
+}
+
+// TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner pins the
+// Gemini MEDIUM fix: when maxMerge picks a value from one source,
+// the identity at that cell must come from the SAME source — not
+// from whoever happened to be processed first. Drives a leadership
+// flip across two consecutive columns with each leader winning
+// one cell.
+func TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	exLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50, 0}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	newLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{0, 80}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{43, 43}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{exLeader, newLeader}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50, 80}, merged.Rows[0].Values, "writes max-merge picks the larger per cell")
+	require.Equal(t, []uint64{7, 7}, merged.Rows[0].RaftGroupIDs, "groupID stays 7 across both cells")
+	require.Equal(t, []uint64{42, 43}, merged.Rows[0].LeaderTerms,
+		"col0's identity comes from exLeader (term 42, won 50 vs 0); col1's identity comes from newLeader (term 43, won 80 vs 0)")
 }
 
 // TestMergeKeyVizMatricesWritesMaxLeadershipFlip pins §4.2 under a

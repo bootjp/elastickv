@@ -1559,10 +1559,22 @@ type groupTermSnapshot struct {
 func publishLeaderTerms(s *keyviz.MemSampler, runtimes []*raftGroupRuntime) {
 	snaps := make([]groupTermSnapshot, 0, len(runtimes))
 	for _, rt := range runtimes {
-		if rt == nil || rt.engine == nil {
+		if rt == nil {
 			continue
 		}
-		snaps = append(snaps, groupTermSnapshot{groupID: rt.spec.id, term: rt.engine.Status().Term})
+		// Snapshot rt.engine into a local once so a concurrent
+		// rt.Close() (which sets rt.engine = nil) cannot race the
+		// nil-check and the Status() call. On startup-error paths
+		// that return before joining all goroutines (e.g.
+		// setupAdminService failing), this goroutine can otherwise
+		// observe rt.engine going nil between the two reads and
+		// panic / trigger a race-detector failure. (Codex P2 on
+		// PR #720.)
+		engine := rt.engine
+		if engine == nil {
+			continue
+		}
+		snaps = append(snaps, groupTermSnapshot{groupID: rt.spec.id, term: engine.Status().Term})
 	}
 	publishLeaderTermsFromSnapshots(s, snaps)
 }

@@ -717,17 +717,28 @@ type KeyVizRow struct {
 	Values []uint64 `protobuf:"varint,11,rep,packed,name=values,proto3" json:"values,omitempty"`
 	// soft_columns[j] is true when the j-th column missed the estimator SLO.
 	SoftColumns []bool `protobuf:"varint,12,rep,packed,name=soft_columns,json=softColumns,proto3" json:"soft_columns,omitempty"`
-	// raft_group_id and leader_term carry the route's Raft identity at
-	// the time the column was flushed. Phase 2-C+ fan-out uses
-	// (bucket_id, raft_group_id, leader_term, column) as the dedupe
-	// key so writes from a leader and the previous leader of the same
-	// group can be summed across terms instead of conservatively
-	// max-merged. Zero values mean "term not tracked" (single-group
-	// legacy deployments, virtual aggregate buckets, or nodes that
-	// have not yet wired the leader-term publisher) — the aggregator
-	// falls back to the legacy max-merge for those cells.
-	RaftGroupId   uint64 `protobuf:"varint,13,opt,name=raft_group_id,json=raftGroupId,proto3" json:"raft_group_id,omitempty"`
-	LeaderTerm    uint64 `protobuf:"varint,14,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
+	// raft_group_ids[j] and leader_terms[j] carry the route's Raft
+	// identity at the time column j was flushed. Phase 2-C+ fan-out
+	// uses (bucket_id, raft_group_id, leader_term, column) as the
+	// dedupe key, so writes from a leader and the previous leader of
+	// the same group can be summed across terms instead of
+	// conservatively max-merged. Per-cell representation (parallel to
+	// values[] and soft_columns[]) is required because leadership can
+	// flip within the requested window; a single row-level scalar
+	// would only capture the first column's identity and cause
+	// incorrect dedupe for later columns (Gemini HIGH on PR #720).
+	// Zero values mean "term not tracked" (single-group legacy
+	// deployments, virtual aggregate buckets, or nodes that have not
+	// yet wired the leader-term publisher) — the aggregator falls
+	// back to the legacy max-merge for those cells.
+	//
+	// Both slices are either empty (legacy server, no per-column
+	// identity to share — older clients reading the response can
+	// treat empty as "all zeros") or `len(raft_group_ids) ==
+	// len(leader_terms) == len(values)`. The server never emits a
+	// partial-length slice.
+	RaftGroupIds  []uint64 `protobuf:"varint,13,rep,packed,name=raft_group_ids,json=raftGroupIds,proto3" json:"raft_group_ids,omitempty"`
+	LeaderTerms   []uint64 `protobuf:"varint,14,rep,packed,name=leader_terms,json=leaderTerms,proto3" json:"leader_terms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -846,18 +857,18 @@ func (x *KeyVizRow) GetSoftColumns() []bool {
 	return nil
 }
 
-func (x *KeyVizRow) GetRaftGroupId() uint64 {
+func (x *KeyVizRow) GetRaftGroupIds() []uint64 {
 	if x != nil {
-		return x.RaftGroupId
+		return x.RaftGroupIds
 	}
-	return 0
+	return nil
 }
 
-func (x *KeyVizRow) GetLeaderTerm() uint64 {
+func (x *KeyVizRow) GetLeaderTerms() []uint64 {
 	if x != nil {
-		return x.LeaderTerm
+		return x.LeaderTerms
 	}
-	return 0
+	return nil
 }
 
 type GetKeyVizMatrixRequest struct {
@@ -1382,7 +1393,7 @@ const file_admin_proto_rawDesc = "" +
 	"\x06p99_ns\x18\t \x01(\x01R\x05p99Ns\"\x1a\n" +
 	"\x18GetAdapterSummaryRequest\"J\n" +
 	"\x19GetAdapterSummaryResponse\x12-\n" +
-	"\tsummaries\x18\x01 \x03(\v2\x0f.AdapterSummaryR\tsummaries\"\xc1\x03\n" +
+	"\tsummaries\x18\x01 \x03(\v2\x0f.AdapterSummaryR\tsummaries\"\xc5\x03\n" +
 	"\tKeyVizRow\x12\x1b\n" +
 	"\tbucket_id\x18\x01 \x01(\tR\bbucketId\x12\x14\n" +
 	"\x05start\x18\x02 \x01(\fR\x05start\x12\x10\n" +
@@ -1398,10 +1409,9 @@ const file_admin_proto_rawDesc = "" +
 	"lineage_id\x18\n" +
 	" \x01(\tR\tlineageId\x12\x16\n" +
 	"\x06values\x18\v \x03(\x04R\x06values\x12!\n" +
-	"\fsoft_columns\x18\f \x03(\bR\vsoftColumns\x12\"\n" +
-	"\rraft_group_id\x18\r \x01(\x04R\vraftGroupId\x12\x1f\n" +
-	"\vleader_term\x18\x0e \x01(\x04R\n" +
-	"leaderTerm\"\x93\x01\n" +
+	"\fsoft_columns\x18\f \x03(\bR\vsoftColumns\x12$\n" +
+	"\x0eraft_group_ids\x18\r \x03(\x04R\fraftGroupIds\x12!\n" +
+	"\fleader_terms\x18\x0e \x03(\x04R\vleaderTerms\"\x93\x01\n" +
 	"\x16GetKeyVizMatrixRequest\x12%\n" +
 	"\x06series\x18\x01 \x01(\x0e2\r.KeyVizSeriesR\x06series\x12 \n" +
 	"\ffrom_unix_ms\x18\x02 \x01(\x03R\n" +
