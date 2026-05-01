@@ -320,6 +320,20 @@ func run() error {
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
+
+	// SQS HT-FIFO §8 leadership-refusal: install per-group
+	// observers that step the local node down via
+	// TransferLeadership when it acquires (or already holds)
+	// leadership of a Raft group hosting a partitioned FIFO
+	// queue while the binary lacks the htfifo capability. The
+	// composite deregister flows through cleanup; it's a no-op
+	// when no group hosts a partitioned queue or when the
+	// binary advertises htfifo (the steady-state production
+	// case post-PR-4-B-3b).
+	leadershipRefusalDeregister := installSQSLeadershipRefusalAcrossGroups(
+		ctx, runtimes, cfg.sqsFifoPartitionMap,
+		sqsAdvertisesHTFIFO(), slog.Default())
+	cleanup.Add(leadershipRefusalDeregister)
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {
 		return err

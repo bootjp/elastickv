@@ -60,14 +60,40 @@ const (
 const sqsCapabilityHTFIFO = "htfifo"
 
 // htfifoCapabilityAdvertised gates whether this binary lists
-// "htfifo" on /sqs_health. The flag is set to true only when the
-// binary contains BOTH the routing-layer wiring AND the
-// leadership-refusal safeguard from §8 — the design's "marked
-// htfifo-eligible" bar (§11 PR 4). Lower-numbered PRs in the rollout
-// keep this false so a partial deploy never advertises a capability
-// it cannot safely back up. Phase 3.D PR 4-B flips this to true in
-// the same commit that wires routing + leadership-refusal together.
-const htfifoCapabilityAdvertised = false
+// "htfifo" on /sqs_health. The §11 PR 4 contract requires BOTH
+// the routing-layer wiring AND the leadership-refusal safeguard
+// from §8 to be in place before this flag is true:
+//
+//   - Routing wiring: kv.PartitionResolver +
+//     adapter.SQSPartitionResolver, merged via #715 (Phase 3.D
+//     PR 4-B-2). Partition-resolver-first dispatch in ShardRouter
+//     routes (queue, partition) keys to the operator-chosen Raft
+//     group; coordinator helpers (groupForKey,
+//     routeAndGroupForKey, groupMutations) consult the resolver
+//     before falling through to the byte-range engine; OCC read
+//     keys fail closed for recognised-but-unresolved partitioned
+//     keys.
+//   - Capability poller: PollSQSHTFIFOCapability, merged via
+//     #721 (Phase 3.D PR 4-B-3a). PR 5 will use this for the
+//     CreateQueue capability gate.
+//   - Leadership-refusal hook:
+//     raftengine.RegisterLeaderAcquiredCallback +
+//     main_sqs_leadership_refusal.go (Phase 3.D PR 4-B-3b, this
+//     PR). On startup AND on every leader-acquired transition,
+//     the hook refuses leadership of any Raft group hosting a
+//     partitioned queue when the binary lacks htfifo.
+//
+// Both pieces are now in the binary, so the flag flips to true.
+// PR 5 lifts the PartitionCount > 1 dormancy gate AND wires the
+// CreateQueue capability poll in the same commit, at which point
+// a partitioned queue can land in production and every node in
+// the cluster must report htfifo for the gate to allow it.
+//
+// Stays a const (not a var) because the flag is build-time. A
+// future runtime override (env var, --no-htfifo flag for
+// graceful degradation) would reroute through
+// adapter.AdvertisesHTFIFO() without changing the call sites.
+const htfifoCapabilityAdvertised = true
 
 // sqsAdvertisedCapabilities returns the capability list emitted on
 // /sqs_health (JSON mode). Stable iteration order is significant —
@@ -81,6 +107,20 @@ func sqsAdvertisedCapabilities() []string {
 		caps = append(caps, sqsCapabilityHTFIFO)
 	}
 	return caps
+}
+
+// AdvertisesHTFIFO reports whether this binary's /sqs_health
+// endpoint lists the htfifo capability. Mirror of the package-
+// internal htfifoCapabilityAdvertised constant, exposed for the
+// SQS leadership-refusal hook in main.go that uses this signal
+// to decide whether to refuse leadership of any Raft group hosting
+// a partitioned FIFO queue.
+//
+// Stays a function (not an exported constant) so a future runtime
+// override (env var, --no-htfifo flag for graceful degradation)
+// can be threaded through here without changing the call site.
+func AdvertisesHTFIFO() bool {
+	return htfifoCapabilityAdvertised
 }
 
 const (
