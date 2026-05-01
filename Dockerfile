@@ -4,7 +4,7 @@
 # placeholder index.html is committed for the embed pragma to find
 # during local `go build`/test runs that haven't run npm; the real
 # bundle replaces it inside the image.
-FROM node:22-alpine AS spa-build
+FROM node:24-alpine AS spa-build
 WORKDIR /spa
 # Bring just the package manifests first so the npm cache survives
 # unrelated source changes; the layer rebuilds only when deps shift.
