@@ -103,6 +103,44 @@ func TestMergeKeyVizMatricesPreservesRaftIdentity(t *testing.T) {
 	require.Equal(t, []uint64{42}, merged.Rows[0].LeaderTerms, "LeaderTerms must survive mergeRowInto")
 }
 
+// TestMergeKeyVizMatricesLegacyPeerWinnerResetsIdentity pins the
+// fail-closed semantic for mixed-version clusters (Codex P2
+// round-2): when a legacy peer that does not emit raft_group_ids /
+// leader_terms (empty slices) wins a cell, dst.RaftGroupIDs[idx]
+// and dst.LeaderTerms[idx] must be RESET to 0 (the documented
+// "term not tracked" sentinel) — leaving stale identity from a
+// previous higher-versioned source would mislabel an unknown-term
+// winning cell as a known term and break the per-cell
+// dedupe/summing in PR-3c.
+func TestMergeKeyVizMatricesLegacyPeerWinnerResetsIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	// Source 1 (modern): reports 30 with identity (group=7, term=42).
+	modern := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	// Source 2 (legacy): reports 50 with NO arrays (older server
+	// build). Wins maxMerge but cannot identify its term.
+	legacy := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{50}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{modern, legacy}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50}, merged.Rows[0].Values, "legacy peer's value wins maxMerge")
+	require.Equal(t, []uint64{0}, merged.Rows[0].RaftGroupIDs,
+		"legacy winner without metadata must reset dst identity to 0 sentinel — not inherit modern's 7")
+	require.Equal(t, []uint64{0}, merged.Rows[0].LeaderTerms,
+		"legacy winner without metadata must reset dst term to 0 sentinel — not inherit modern's 42")
+}
+
 // TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner pins the
 // Gemini MEDIUM fix: when maxMerge picks a value from one source,
 // the identity at that cell must come from the SAME source — not

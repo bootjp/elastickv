@@ -556,11 +556,27 @@ func mergeRowInto(
 		// when the incoming source won the cell; in the tied
 		// (prev == incoming != 0) case `next == prev`, both sides
 		// agree on the value, and either identity is acceptable.
-		if next == row.Values[j] && j < len(row.RaftGroupIDs) {
-			dst.RaftGroupIDs[idx] = row.RaftGroupIDs[j]
-		}
-		if next == row.Values[j] && j < len(row.LeaderTerms) {
-			dst.LeaderTerms[idx] = row.LeaderTerms[j]
+		if next == row.Values[j] {
+			// Mixed-version cluster: a legacy peer that does not
+			// emit raft_group_ids / leader_terms sends empty
+			// slices. When such a peer's value wins the cell, we
+			// must EXPLICITLY RESET dst.RaftGroupIDs[idx] /
+			// dst.LeaderTerms[idx] to 0 (the documented "term not
+			// tracked" sentinel) — leaving stale identity from a
+			// previous higher-versioned source would mislabel an
+			// unknown-term winning cell as a known term and break
+			// the per-cell dedupe/summing in PR-3c. (Codex P2
+			// round-2 on PR #720.)
+			if j < len(row.RaftGroupIDs) {
+				dst.RaftGroupIDs[idx] = row.RaftGroupIDs[j]
+			} else {
+				dst.RaftGroupIDs[idx] = 0
+			}
+			if j < len(row.LeaderTerms) {
+				dst.LeaderTerms[idx] = row.LeaderTerms[j]
+			} else {
+				dst.LeaderTerms[idx] = 0
+			}
 		}
 	}
 }
