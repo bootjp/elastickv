@@ -70,6 +70,7 @@ const (
 	redisKindUnknown redisKeyKind = iota
 	redisKindString
 	redisKindHLL
+	redisKindHash
 )
 
 // RedisDB encodes one logical Redis database (`redis/db_<n>/`). All
@@ -147,6 +148,15 @@ type RedisDB struct {
 	keymap     *KeymapWriter
 	keymapFile *os.File
 	keymapDir  string
+
+	// hashes buffers per-userKey hash state (declared length + the
+	// in-flight field map + inline TTL). The Phase 0a hash design
+	// emits one JSON file per hash at Finalize, which requires the
+	// full field set up front; we accumulate in memory because
+	// real-world Redis hashes are small (10s–100s of fields) and
+	// each meta record arriving without a key set must still emit
+	// the empty-hash file (HLEN==0, observable to clients).
+	hashes map[string]*redisHashState
 }
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
@@ -163,6 +173,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		kindByKey:        make(map[string]redisKeyKind),
 		dirsCreated:      make(map[string]struct{}),
 		inlineTTLEmitted: make(map[string]struct{}),
+		hashes:           make(map[string]*redisHashState),
 	}
 }
 
@@ -233,6 +244,14 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 			return nil
 		}
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
+	case redisKindHash:
+		// Wide-column types fold TTL into the per-hash JSON record
+		// (`expire_at_ms` field) so a restorer can replay the hash
+		// in one shot rather than chasing a separate sidecar.
+		st := r.hashState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+		return nil
 	case redisKindUnknown:
 		// Track orphan TTL counts only — keys are unused before the
 		// wide-column encoders land, and buffering them allocates
@@ -250,19 +269,20 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 // dispatched.
 func (r *RedisDB) Finalize() error {
 	var firstErr error
-	if err := closeJSONL(r.stringsTTL); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	if err := closeJSONL(r.hllTTL); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	if err := r.closeKeymap(); err != nil && firstErr == nil {
-		firstErr = err
+	for _, step := range []func() error{
+		r.flushHashes,
+		func() error { return closeJSONL(r.stringsTTL) },
+		func() error { return closeJSONL(r.hllTTL) },
+		r.closeKeymap,
+	} {
+		if err := step(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
 			"count", r.orphanTTLCount,
-			"hint", "wide-column type encoders (hash/list/set/zset/stream) have not landed yet")
+			"hint", "wide-column type encoders (list/set/zset/stream) have not landed yet")
 	}
 	return firstErr
 }
