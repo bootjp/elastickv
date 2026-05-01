@@ -160,6 +160,22 @@ func TestDecodeReceiptHandle_RejectsLengthMismatch(t *testing.T) {
 			},
 		},
 		{
+			name: "v2 oversized",
+			make: func() []byte {
+				out := make([]byte, sqsReceiptHandleV2Size+1)
+				out[0] = sqsReceiptHandleVersion2
+				return out
+			},
+		},
+		{
+			name: "v1 oversized",
+			make: func() []byte {
+				out := make([]byte, sqsReceiptHandleV1Size+1)
+				out[0] = sqsReceiptHandleVersion1
+				return out
+			},
+		},
+		{
 			name: "empty",
 			make: func() []byte { return nil },
 		},
@@ -229,9 +245,6 @@ func TestReceiptHandleVersionConstants_Distinct(t *testing.T) {
 		"v1 and v2 version bytes must differ for the dispatch to work")
 	require.Equal(t, byte(0x01), sqsReceiptHandleVersion1)
 	require.Equal(t, byte(0x02), sqsReceiptHandleVersion2)
-	require.Equal(t, sqsReceiptHandleVersion1, sqsReceiptHandleVersion,
-		"the legacy alias must continue to point at v1 so existing "+
-			"call sites stay on the v1 path")
 	// On-wire size constants must equal what the encoders write —
 	// pinning them keeps a future struct change from silently
 	// changing the wire format.

@@ -56,14 +56,10 @@ const (
 	// partitionFor hash. The version byte discriminates: a v1 handle
 	// against a partitioned queue is rejected, a v2 handle against
 	// a non-partitioned queue is rejected — both with
-	// ReceiptHandleIsInvalid (codex P1 round-2 on PR #715 documents
-	// the cross-version rejection contract).
+	// ReceiptHandleIsInvalid. Enforcement of the cross-version
+	// rejection contract is wired by Phase 3.D PR 5b together with
+	// the gate-and-lift; this scaffold PR adds the codec only.
 	sqsReceiptHandleVersion2 = byte(0x02)
-	// sqsReceiptHandleVersion is the legacy const name preserved as
-	// an alias of v1 so existing call sites in this file keep
-	// compiling. New call sites SHOULD use sqsReceiptHandleVersion1
-	// (or sqsReceiptHandleVersion2) explicitly.
-	sqsReceiptHandleVersion = sqsReceiptHandleVersion1
 	// Byte sizes used when pre-sizing key buffers. The exact value is not
 	// critical; it only avoids one append growth for typical queue/ID
 	// lengths.
@@ -231,15 +227,28 @@ func newReceiptToken() ([]byte, error) {
 	return buf, nil
 }
 
-// sqsReceiptHandleV1Size is the on-wire byte length of a v1
-// receipt handle: 1 byte version + 8 byte queue_gen + 16 byte
-// message_id + 16 byte receipt_token = 41 bytes.
-const sqsReceiptHandleV1Size = 1 + 8 + sqsMessageIDBytes + sqsReceiptTokenBytes
+// Per-field byte offsets and total sizes for the v1 / v2 receipt
+// handle layouts. Named constants so a future field-shape change
+// touches the offsets in one place instead of scattering numeric
+// arithmetic through encoders / decoders. Keep this aligned with
+// the table in encodeReceiptHandle / encodeReceiptHandleV2 doc
+// comments — the on-wire format is operator-visible.
+const (
+	// v1 layout: [version][queue_gen][message_id][receipt_token].
+	sqsReceiptHandleV1VersionOffset = 0
+	sqsReceiptHandleV1GenOffset     = sqsReceiptHandleV1VersionOffset + 1
+	sqsReceiptHandleV1IDOffset      = sqsReceiptHandleV1GenOffset + 8
+	sqsReceiptHandleV1TokenOffset   = sqsReceiptHandleV1IDOffset + sqsMessageIDBytes
+	sqsReceiptHandleV1Size          = sqsReceiptHandleV1TokenOffset + sqsReceiptTokenBytes
 
-// sqsReceiptHandleV2Size is the on-wire byte length of a v2
-// (partitioned) receipt handle: v1 + 4 bytes for the partition
-// uint32 inserted between version and queue_gen = 45 bytes.
-const sqsReceiptHandleV2Size = 1 + 4 + 8 + sqsMessageIDBytes + sqsReceiptTokenBytes
+	// v2 layout: [version][partition][queue_gen][message_id][receipt_token].
+	sqsReceiptHandleV2VersionOffset   = 0
+	sqsReceiptHandleV2PartitionOffset = sqsReceiptHandleV2VersionOffset + 1
+	sqsReceiptHandleV2GenOffset       = sqsReceiptHandleV2PartitionOffset + 4
+	sqsReceiptHandleV2IDOffset        = sqsReceiptHandleV2GenOffset + 8
+	sqsReceiptHandleV2TokenOffset     = sqsReceiptHandleV2IDOffset + sqsMessageIDBytes
+	sqsReceiptHandleV2Size            = sqsReceiptHandleV2TokenOffset + sqsReceiptTokenBytes
+)
 
 // encodeReceiptHandle packs (queue_gen, message_id, receipt_token) into
 // a single opaque v1 blob. Used by SendMessage on a NON-partitioned
@@ -348,11 +357,14 @@ func decodeReceiptHandleV1(b []byte) (*decodedReceiptHandle, error) {
 		return nil, errors.New("receipt handle length or version mismatch")
 	}
 	return &decodedReceiptHandle{
-		Version:         sqsReceiptHandleVersion1,
-		Partition:       0,
-		QueueGeneration: binary.BigEndian.Uint64(b[1:9]),
-		MessageIDHex:    hex.EncodeToString(b[9 : 9+sqsMessageIDBytes]),
-		ReceiptToken:    bytes.Clone(b[9+sqsMessageIDBytes:]),
+		Version:   sqsReceiptHandleVersion1,
+		Partition: 0,
+		QueueGeneration: binary.BigEndian.Uint64(
+			b[sqsReceiptHandleV1GenOffset:sqsReceiptHandleV1IDOffset]),
+		MessageIDHex: hex.EncodeToString(
+			b[sqsReceiptHandleV1IDOffset:sqsReceiptHandleV1TokenOffset]),
+		ReceiptToken: bytes.Clone(
+			b[sqsReceiptHandleV1TokenOffset:sqsReceiptHandleV1Size]),
 	}, nil
 }
 
@@ -361,11 +373,15 @@ func decodeReceiptHandleV2(b []byte) (*decodedReceiptHandle, error) {
 		return nil, errors.New("receipt handle length or version mismatch")
 	}
 	return &decodedReceiptHandle{
-		Version:         sqsReceiptHandleVersion2,
-		Partition:       binary.BigEndian.Uint32(b[1:5]),
-		QueueGeneration: binary.BigEndian.Uint64(b[5:13]),
-		MessageIDHex:    hex.EncodeToString(b[13 : 13+sqsMessageIDBytes]),
-		ReceiptToken:    bytes.Clone(b[13+sqsMessageIDBytes:]),
+		Version: sqsReceiptHandleVersion2,
+		Partition: binary.BigEndian.Uint32(
+			b[sqsReceiptHandleV2PartitionOffset:sqsReceiptHandleV2GenOffset]),
+		QueueGeneration: binary.BigEndian.Uint64(
+			b[sqsReceiptHandleV2GenOffset:sqsReceiptHandleV2IDOffset]),
+		MessageIDHex: hex.EncodeToString(
+			b[sqsReceiptHandleV2IDOffset:sqsReceiptHandleV2TokenOffset]),
+		ReceiptToken: bytes.Clone(
+			b[sqsReceiptHandleV2TokenOffset:sqsReceiptHandleV2Size]),
 	}, nil
 }
 
