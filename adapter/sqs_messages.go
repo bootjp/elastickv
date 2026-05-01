@@ -368,6 +368,48 @@ func decodeReceiptHandleV1(b []byte) (*decodedReceiptHandle, error) {
 	}, nil
 }
 
+// decodeClientReceiptHandle is the public-API entry point for
+// decoding a client-supplied receipt handle. It wraps
+// decodeReceiptHandle with the dormancy gate that keeps the v2
+// codec inert until Phase 3.D PR 5b wires the partitioned-FIFO
+// data plane.
+//
+// # Why the gate
+//
+// PR 5a adds the v2 codec to the binary but does NOT yet wire any
+// production path that produces v2 handles — SendMessage on a
+// partitioned queue is rejected by the §11 PR 2 dormancy gate
+// (PartitionCount > 1 → InvalidAttributeValue). Without this
+// helper, a client could craft a v2 handle (re-encoding a
+// legitimately-issued v1 handle's queue_gen / message_id /
+// receipt_token under the v2 layout) and DeleteMessage /
+// ChangeMessageVisibility would accept it, since the downstream
+// validation only checks queue_gen + receipt_token. The behaviour
+// is technically correct (the v1 keyspace lookup still finds the
+// message) but it leaks the new wire format before PR 5b lands —
+// breaking the "no behavior change yet" guarantee of this PR
+// (codex/coderabbit major on PR #724).
+//
+// PR 5b lifts this gate together with the rest of the data-plane
+// fanout: it replaces the != v1 check with a queue-aware version
+// (v1 required on non-partitioned queues, v2 required on
+// partitioned ones), so neither version leaks into the wrong
+// keyspace. Until then, any v2 handle on the public API surfaces
+// as ReceiptHandleIsInvalid.
+func decodeClientReceiptHandle(raw string) (*decodedReceiptHandle, error) {
+	handle, err := decodeReceiptHandle(raw)
+	if err != nil {
+		return nil, err
+	}
+	if handle.Version != sqsReceiptHandleVersion1 {
+		// v2 codec is added but dormant until PR 5b. Reject any
+		// non-v1 handle on the public API so the wire format
+		// does not leak.
+		return nil, errors.New("receipt handle version is not yet enabled on the public API")
+	}
+	return handle, nil
+}
+
 func decodeReceiptHandleV2(b []byte) (*decodedReceiptHandle, error) {
 	if len(b) != sqsReceiptHandleV2Size {
 		return nil, errors.New("receipt handle length or version mismatch")
@@ -1494,7 +1536,7 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 	if err != nil {
 		return "", nil, err
 	}
-	handle, err := decodeReceiptHandle(receiptHandle)
+	handle, err := decodeClientReceiptHandle(receiptHandle)
 	if err != nil {
 		return "", nil, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not parseable")
 	}
