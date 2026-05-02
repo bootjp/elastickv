@@ -404,7 +404,19 @@ func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
 
 func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, expireAtMs uint64) error {
 	if *slot == nil {
-		f, err := openJSONL(filepath.Join(r.dbDir(), baseName))
+		// Route the parent directory through ensureDir so the
+		// shared assertNoSymlinkAncestors guard fires before we
+		// open the sidecar. openJSONL alone only protects the
+		// final path element via openSidecarFile; without this
+		// a symlinked ancestor (e.g.
+		// `<outRoot>/redis/db_0 -> /tmp/outside`) would still
+		// redirect strings_ttl.jsonl / hll_ttl.jsonl writes
+		// outside the dump root. Codex P1 round 13 (PR #713).
+		dir := r.dbDir()
+		if err := r.ensureDir(dir); err != nil {
+			return err
+		}
+		f, err := openJSONL(filepath.Join(dir, baseName))
 		if err != nil {
 			return err
 		}
