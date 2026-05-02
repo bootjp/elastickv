@@ -612,6 +612,12 @@ func matrixToProto(cols []keyviz.MatrixColumn, pick func(keyviz.MatrixRow) uint6
 				order = append(order, mr.RouteID)
 			}
 			pr.Values[j] = pick(mr)
+			// Per-cell Raft identity stamped from this column's
+			// MatrixRow (Gemini HIGH on PR #720 — a row-level
+			// scalar would only capture the first column's
+			// identity and break the per-cell dedupe goal).
+			pr.RaftGroupIds[j] = mr.RaftGroupID
+			pr.LeaderTerms[j] = mr.LeaderTerm
 		}
 	}
 	resp.Rows = make([]*pb.KeyVizRow, len(order))
@@ -676,6 +682,11 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *pb.KeyVizRow {
 		RouteCount:        total,
 		RouteIdsTruncated: mr.Aggregate && total > uint64(len(mr.MemberRoutes)),
 		Values:            make([]uint64, numCols),
+		// Per-cell parallel arrays — populated in the column-loop
+		// above, not here, because the first MatrixRow seen for a
+		// route only carries that one column's identity.
+		RaftGroupIds: make([]uint64, numCols),
+		LeaderTerms:  make([]uint64, numCols),
 	}
 	if mr.Aggregate {
 		row.RouteIds = append([]uint64(nil), mr.MemberRoutes...)

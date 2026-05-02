@@ -117,6 +117,76 @@ func TestParseUploadPartKey_ZeroBytesInSegments(t *testing.T) {
 	require.Equal(t, uint64(3), partNo)
 }
 
+func TestParseBlobKey_UnversionedRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	bucket := "photos"
+	gen := uint64(7)
+	object := "2026/04/img.jpg"
+	uploadID := "u-abc"
+	partNo := uint64(3)
+	chunkNo := uint64(5)
+
+	key := BlobKey(bucket, gen, object, uploadID, partNo, chunkNo)
+	gotBucket, gotGen, gotObject, gotUpload, gotPart, gotChunk, gotVersion, ok := ParseBlobKey(key)
+	require.True(t, ok)
+	require.Equal(t, bucket, gotBucket)
+	require.Equal(t, gen, gotGen)
+	require.Equal(t, object, gotObject)
+	require.Equal(t, uploadID, gotUpload)
+	require.Equal(t, partNo, gotPart)
+	require.Equal(t, chunkNo, gotChunk)
+	require.Equal(t, uint64(0), gotVersion, "unversioned blob key must report partVersion=0")
+}
+
+func TestParseBlobKey_VersionedRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	key := VersionedBlobKey("b", 1, "o", "u", 2, 3, 9)
+	_, _, _, _, gotPart, gotChunk, gotVersion, ok := ParseBlobKey(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), gotPart)
+	require.Equal(t, uint64(3), gotChunk)
+	require.Equal(t, uint64(9), gotVersion)
+}
+
+func TestParseBlobKey_VersionedZeroFallsBackToUnversioned(t *testing.T) {
+	t.Parallel()
+
+	// VersionedBlobKey(partVersion=0) is documented to fall back to
+	// the un-versioned shape; ParseBlobKey must agree.
+	key := VersionedBlobKey("b", 1, "o", "u", 2, 3, 0)
+	require.True(t, bytes.Equal(key, BlobKey("b", 1, "o", "u", 2, 3)))
+	_, _, _, _, _, _, gotVersion, ok := ParseBlobKey(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(0), gotVersion)
+}
+
+func TestParseBlobKey_RejectsNonBlob(t *testing.T) {
+	t.Parallel()
+
+	cases := [][]byte{
+		BucketMetaKey("b"),
+		ObjectManifestKey("b", 1, "o"),
+		UploadPartKey("b", 1, "o", "u", 1),
+		[]byte("not-a-key"),
+	}
+	for _, k := range cases {
+		_, _, _, _, _, _, _, ok := ParseBlobKey(k)
+		require.False(t, ok, "expected ParseBlobKey to reject %q", k)
+	}
+}
+
+func TestParseBlobKey_RejectsTrailingGarbage(t *testing.T) {
+	t.Parallel()
+
+	key := BlobKey("b", 1, "o", "u", 2, 3)
+	bad := append([]byte{}, key...)
+	bad = append(bad, 0x00, 0x00, 0x00, 0x00) // 4 trailing bytes -- not 0 and not u64Bytes
+	_, _, _, _, _, _, _, ok := ParseBlobKey(bad)
+	require.False(t, ok)
+}
+
 func TestParseUploadPartKey_RejectsNonPartKeys(t *testing.T) {
 	t.Parallel()
 

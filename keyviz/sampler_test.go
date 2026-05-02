@@ -37,7 +37,7 @@ func TestNilSamplerObserveSafe(t *testing.T) {
 	t.Parallel()
 	var s *MemSampler // nil
 	s.Observe(1, OpRead, 10, 20)
-	if s.RegisterRoute(1, []byte("a"), []byte("b")) {
+	if s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		t.Fatal("nil RegisterRoute should return false")
 	}
 	s.RemoveRoute(1)
@@ -50,7 +50,7 @@ func TestNilSamplerObserveSafe(t *testing.T) {
 func TestObserveAndFlushBasic(t *testing.T) {
 	t.Parallel()
 	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
-	if !s.RegisterRoute(1, []byte("a"), []byte("c")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("c"), 0) {
 		t.Fatal("RegisterRoute(1) returned false")
 	}
 	s.Observe(1, OpRead, 5, 10)
@@ -90,7 +90,7 @@ func TestNoCountsLostAcrossFlush(t *testing.T) {
 		flushes   = 20
 	)
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Millisecond, HistoryColumns: 1024})
-	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		t.Fatal("Register failed")
 	}
 
@@ -159,13 +159,13 @@ func budgetSetup(t *testing.T) *MemSampler {
 		HistoryColumns:   4,
 		MaxTrackedRoutes: 2,
 	})
-	if !s.RegisterRoute(1, []byte("a"), []byte("c")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("c"), 0) {
 		t.Fatal("route 1 should fit")
 	}
-	if !s.RegisterRoute(2, []byte("c"), []byte("e")) {
+	if !s.RegisterRoute(2, []byte("c"), []byte("e"), 0) {
 		t.Fatal("route 2 should fit")
 	}
-	if s.RegisterRoute(3, []byte("e"), []byte("g")) {
+	if s.RegisterRoute(3, []byte("e"), []byte("g"), 0) {
 		t.Fatal("route 3 over budget should return false (folded into virtual bucket)")
 	}
 	return s
@@ -198,7 +198,7 @@ func findAggregateRow(t *testing.T, rows []MatrixRow) MatrixRow {
 func TestSnapshotRangeFilters(t *testing.T) {
 	t.Parallel()
 	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 8})
-	s.RegisterRoute(1, []byte("a"), []byte("b"))
+	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
 	for i := 0; i < 5; i++ {
 		s.Observe(1, OpRead, 0, 0)
 		s.Flush()
@@ -222,7 +222,7 @@ func TestSnapshotRangeFilters(t *testing.T) {
 func TestRingBufferDropsOldest(t *testing.T) {
 	t.Parallel()
 	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 3})
-	s.RegisterRoute(1, []byte("a"), []byte("b"))
+	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
 	for i := 0; i < 5; i++ {
 		s.Observe(1, OpRead, 0, 0)
 		s.Flush()
@@ -243,7 +243,7 @@ func TestRingBufferDropsOldest(t *testing.T) {
 func TestRemoveRouteSilencesObserve(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
-	s.RegisterRoute(1, []byte("a"), []byte("b"))
+	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
 	s.Observe(1, OpRead, 0, 0)
 	s.RemoveRoute(1)
 	s.Observe(1, OpRead, 0, 0) // silently dropped
@@ -264,7 +264,7 @@ func TestRemoveRouteSilencesObserve(t *testing.T) {
 func TestRemoveRouteHarvestsPendingCounts(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
-	s.RegisterRoute(1, []byte("a"), []byte("b"))
+	s.RegisterRoute(1, []byte("a"), []byte("b"), 0)
 	for i := 0; i < 7; i++ {
 		s.Observe(1, OpRead, 1, 0)
 	}
@@ -360,13 +360,13 @@ func setupOneIndividualPlusVirtualBucket(t *testing.T) (*MemSampler, *fakeClock)
 		HistoryColumns:   4,
 		MaxTrackedRoutes: 1,
 	})
-	if !s.RegisterRoute(1, []byte("a"), []byte("c")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("c"), 0) {
 		t.Fatal("route 1 should fit")
 	}
-	if s.RegisterRoute(2, []byte("c"), []byte("e")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("e"), 0) {
 		t.Fatal("route 2 should fold (over budget)")
 	}
-	if s.RegisterRoute(3, []byte("e"), []byte("g")) {
+	if s.RegisterRoute(3, []byte("e"), []byte("g"), 0) {
 		t.Fatal("route 3 should fold (over budget)")
 	}
 	return s, clk
@@ -383,11 +383,11 @@ func TestRegisterDoesNotRaceFlushOnVirtualBucket(t *testing.T) {
 		HistoryColumns:   1024,
 		MaxTrackedRoutes: 1,
 	})
-	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		t.Fatal("route 1 should fit")
 	}
 	// Seed a virtual bucket so subsequent Registers fold into it.
-	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 should fold")
 	}
 
@@ -402,7 +402,7 @@ func TestRegisterDoesNotRaceFlushOnVirtualBucket(t *testing.T) {
 				return
 			default:
 			}
-			s.RegisterRoute(uint64(n), []byte{byte(n)}, []byte{byte(n + 1)}) //nolint:gosec // bounded test loop.
+			s.RegisterRoute(uint64(n), []byte{byte(n)}, []byte{byte(n + 1)}, 0) //nolint:gosec // bounded test loop.
 		}
 	}()
 	wg.Add(1)
@@ -452,7 +452,7 @@ func TestConcurrentRegisterAndObserveRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := uint64(1); i <= routes; i++ {
-			s.RegisterRoute(i, []byte{byte('a' + i%26)}, []byte{byte('a' + (i+1)%26)})
+			s.RegisterRoute(i, []byte{byte('a' + i%26)}, []byte{byte('a' + (i+1)%26)}, 0)
 			time.Sleep(time.Microsecond)
 		}
 	}()
@@ -504,7 +504,7 @@ func TestRemoveLastVirtualMemberHarvestsBucket(t *testing.T) {
 		MaxTrackedRoutes: 1,
 	})
 	mustRegister(t, s, 1, "a", "b")
-	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 over budget should fold into virtual bucket")
 	}
 	s.Observe(2, OpRead, 5, 7)
@@ -548,7 +548,7 @@ func TestFlushSortsMixedLiveAndRetiredRows(t *testing.T) {
 func TestRetiredSlotGracePeriod(t *testing.T) {
 	t.Parallel()
 	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 8})
-	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		t.Fatal("RegisterRoute(1) returned false")
 	}
 	s.Observe(1, OpRead, 1, 2)
@@ -610,13 +610,13 @@ func TestRegisterFoldLowerStartReorders(t *testing.T) {
 	mustRegister(t, s, 1, "m", "n")
 	mustRegister(t, s, 2, "p", "q")
 	// Route 3 is over budget — creates a virtual bucket at Start=r.
-	if s.RegisterRoute(3, []byte("r"), []byte("s")) {
+	if s.RegisterRoute(3, []byte("r"), []byte("s"), 0) {
 		t.Fatal("route 3 over budget should fold into virtual bucket")
 	}
 	// Route 4 is over budget AND has a Start ("a") below the bucket's
 	// existing Start ("r"). The fold must lower bucket.Start to "a"
 	// AND reposition the bucket within sortedSlots.
-	if s.RegisterRoute(4, []byte("a"), []byte("b")) {
+	if s.RegisterRoute(4, []byte("a"), []byte("b"), 0) {
 		t.Fatal("route 4 over budget should fold into virtual bucket")
 	}
 	s.Observe(1, OpRead, 0, 0)
@@ -634,7 +634,7 @@ func TestRegisterFoldLowerStartReorders(t *testing.T) {
 
 func mustRegister(t *testing.T, s *MemSampler, routeID uint64, start, end string) {
 	t.Helper()
-	if !s.RegisterRoute(routeID, []byte(start), []byte(end)) {
+	if !s.RegisterRoute(routeID, []byte(start), []byte(end), 0) {
 		t.Fatalf("RegisterRoute(%d) returned false", routeID)
 	}
 }
@@ -662,7 +662,7 @@ func flushedRowsSorted(t *testing.T, s *MemSampler) []MatrixRow {
 func TestSnapshotReturnsDeepCopy(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
-	if !s.RegisterRoute(1, []byte("aaaa"), []byte("bbbb")) {
+	if !s.RegisterRoute(1, []byte("aaaa"), []byte("bbbb"), 0) {
 		t.Fatal("RegisterRoute(1) returned false")
 	}
 	s.Observe(1, OpRead, 1, 2)
@@ -699,7 +699,7 @@ func TestVirtualBucketRouteIDIsSynthetic(t *testing.T) {
 		MaxTrackedRoutes: 1,
 	})
 	mustRegister(t, s, 1, "a", "b")
-	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 should fold into a fresh virtual bucket")
 	}
 	s.Observe(2, OpRead, 0, 0)
@@ -733,10 +733,10 @@ func TestRejoinAsIndividualLetsBucketPruneFire(t *testing.T) {
 		MaxTrackedRoutes: 1,
 	})
 	mustRegister(t, s, 1, "a", "b")
-	if s.RegisterRoute(2, []byte("m"), []byte("n")) {
+	if s.RegisterRoute(2, []byte("m"), []byte("n"), 0) {
 		t.Fatal("route 2 should fold")
 	}
-	if s.RegisterRoute(3, []byte("y"), []byte("z")) {
+	if s.RegisterRoute(3, []byte("y"), []byte("z"), 0) {
 		t.Fatal("route 3 should fold (same bucket)")
 	}
 	s.Observe(2, OpRead, 0, 0)
@@ -746,7 +746,7 @@ func TestRejoinAsIndividualLetsBucketPruneFire(t *testing.T) {
 	// bucket alive in virtualForRoute.
 	s.RemoveRoute(1)
 	s.RemoveRoute(3)
-	if !s.RegisterRoute(3, []byte("y"), []byte("z")) {
+	if !s.RegisterRoute(3, []byte("y"), []byte("z"), 0) {
 		t.Fatal("route 3 should fit individually now")
 	}
 
@@ -815,11 +815,11 @@ func TestReRegisterDuringPruneGraceCancelsPrune(t *testing.T) {
 		MaxTrackedRoutes: 1,
 	})
 	mustRegister(t, s, 1, "a", "b")
-	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 should fold into virtual bucket")
 	}
 	s.RemoveRoute(2)
-	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 should still fold (over budget)")
 	}
 
@@ -843,7 +843,173 @@ func TestReRegisterDuringPruneGraceCancelsPrune(t *testing.T) {
 	}
 }
 
-// TestNonPositiveOptionsFallBackToDefaults pins Codex round-8 P2: a
+// TestRegisterRouteCarriesGroupID pins the Phase 2-C+ contract that
+// MatrixRow.RaftGroupID echoes the groupID supplied at RegisterRoute,
+// independent of leader-term tracking. A route registered with
+// groupID=42 must surface in every flushed row with RaftGroupID=42
+// so the fan-out aggregator's (groupID, leaderTerm) dedupe key is
+// well-defined.
+func TestRegisterRouteCarriesGroupID(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 42) {
+		t.Fatal("RegisterRoute returned false")
+	}
+	s.Observe(1, OpWrite, 16, 64)
+	s.Flush()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) != 1 || len(cols[0].Rows) != 1 {
+		t.Fatalf("unexpected snapshot: %+v", cols)
+	}
+	if got := cols[0].Rows[0].RaftGroupID; got != 42 {
+		t.Errorf("RaftGroupID = %d, want 42", got)
+	}
+}
+
+// TestSetLeaderTermStampsRows pins that SetLeaderTerm published before
+// Flush stamps the column's rows with the term, and that subsequent
+// SetLeaderTerm publications are visible to the next Flush only —
+// the per-flush term snapshot is taken at the top of Flush so
+// concurrent term flips do not mid-flush change the stamp.
+func TestSetLeaderTermStampsRows(t *testing.T) {
+	t.Parallel()
+	s, clk := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 7) {
+		t.Fatal("RegisterRoute returned false")
+	}
+	s.SetLeaderTerm(7, 100)
+	s.Observe(1, OpWrite, 16, 64)
+	s.Flush()
+	clk.Advance(time.Second)
+
+	s.SetLeaderTerm(7, 101)
+	s.Observe(1, OpWrite, 16, 64)
+	s.Flush()
+
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(cols))
+	}
+	if got := cols[0].Rows[0].LeaderTerm; got != 100 {
+		t.Errorf("col0 LeaderTerm = %d, want 100", got)
+	}
+	if got := cols[1].Rows[0].LeaderTerm; got != 101 {
+		t.Errorf("col1 LeaderTerm = %d, want 101", got)
+	}
+}
+
+// TestSetLeaderTermNilSafe asserts the typed-nil receiver contract
+// extends to SetLeaderTerm — main.go can wire the call before the
+// sampler is constructed and not panic.
+func TestSetLeaderTermNilSafe(t *testing.T) {
+	t.Parallel()
+	var s *MemSampler
+	s.SetLeaderTerm(1, 42) // must not panic
+}
+
+// TestSetLeaderTermZeroGroupIDDoesNotPolluteVirtualBucket pins the
+// invariant that virtual aggregate buckets (which span multiple real
+// groups and stamp RaftGroupID=0) must always emit LeaderTerm=0.
+// Without the SetLeaderTerm groupID==0 guard, a caller that mistakenly
+// publishes a term for groupID=0 would cause appendDrainedRow's
+// `terms[groupID]` lookup to stamp the virtual bucket with that
+// non-zero term, breaking the fan-out merge's max-merge fallback for
+// cross-group cells.
+func TestSetLeaderTermZeroGroupIDDoesNotPolluteVirtualBucket(t *testing.T) {
+	t.Parallel()
+	s, _ := setupOneIndividualPlusVirtualBucket(t)
+	s.SetLeaderTerm(0, 999) // bug case: caller passes the reserved groupID
+	s.Observe(2, OpWrite, 16, 64)
+	s.Flush()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) == 0 {
+		t.Fatalf("expected at least one column")
+	}
+	var virtualRow *MatrixRow
+	for i := range cols[0].Rows {
+		if cols[0].Rows[i].Aggregate {
+			virtualRow = &cols[0].Rows[i]
+			break
+		}
+	}
+	if virtualRow == nil {
+		t.Fatalf("expected an aggregate row in column 0; rows=%+v", cols[0].Rows)
+	}
+	if virtualRow.RaftGroupID != 0 {
+		t.Errorf("virtual bucket RaftGroupID = %d, want 0", virtualRow.RaftGroupID)
+	}
+	if virtualRow.LeaderTerm != 0 {
+		t.Errorf("virtual bucket LeaderTerm = %d, want 0 (groupID=0 is reserved for aggregate buckets)", virtualRow.LeaderTerm)
+	}
+}
+
+// TestVirtualBucketRaftGroupIDIsZero pins that an over-budget route
+// folded into a virtual aggregate bucket emits RaftGroupID=0 even
+// when the member routes themselves were registered with non-zero
+// groupIDs. The fan-out aggregator relies on this to fall back to
+// max-merge for aggregate rows; without it, propagating a member's
+// groupID into the bucket would silently re-engage per-term dedupe
+// on rows that span multiple Raft groups.
+func TestVirtualBucketRaftGroupIDIsZero(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{
+		Step:             time.Second,
+		HistoryColumns:   4,
+		MaxTrackedRoutes: 1,
+	})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 42) {
+		t.Fatal("route 1 should fit (group 42)")
+	}
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 42) {
+		t.Fatal("route 2 should fold into virtual bucket (group 42, over budget)")
+	}
+	s.Observe(2, OpWrite, 16, 64)
+	s.Flush()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) == 0 {
+		t.Fatalf("expected at least one column")
+	}
+	var virtualRow *MatrixRow
+	for i := range cols[0].Rows {
+		if cols[0].Rows[i].Aggregate {
+			virtualRow = &cols[0].Rows[i]
+			break
+		}
+	}
+	if virtualRow == nil {
+		t.Fatalf("expected an aggregate row in column 0; rows=%+v", cols[0].Rows)
+	}
+	if virtualRow.RaftGroupID != 0 {
+		t.Errorf("virtual bucket RaftGroupID = %d, want 0 (member groupID=42 must not propagate)", virtualRow.RaftGroupID)
+	}
+}
+
+// TestRegisterRouteSecondCallIgnoresGroupID pins the live-slot
+// idempotency contract documented on RegisterRoute: when the slot is
+// already live, a second RegisterRoute call returns true without
+// updating the slot's metadata, including GroupID. Callers that need
+// to change a live slot's GroupID must RemoveRoute + RegisterRoute,
+// not call RegisterRoute again with a different groupID.
+func TestRegisterRouteSecondCallIgnoresGroupID(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 10) {
+		t.Fatal("first RegisterRoute returned false")
+	}
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 99) {
+		t.Fatal("second RegisterRoute should be a no-op returning true")
+	}
+	s.Observe(1, OpWrite, 16, 64)
+	s.Flush()
+	cols := s.Snapshot(time.Time{}, time.Time{})
+	if len(cols) != 1 || len(cols[0].Rows) != 1 {
+		t.Fatalf("unexpected snapshot: %+v", cols)
+	}
+	if got := cols[0].Rows[0].RaftGroupID; got != 10 {
+		t.Errorf("RaftGroupID = %d, want 10 (second call's groupID=99 must be ignored)", got)
+	}
+}
+
 // negative MaxTrackedRoutes used to bypass the zero-check and force
 // every route into a virtual bucket. Confirm both zero and negative
 // inputs land on the documented defaults so a bad CLI/env value
@@ -925,7 +1091,7 @@ func TestMemberRoutesCappedAtConfiguredCap(t *testing.T) {
 	mustRegister(t, s, 1, "a", "b")
 	for i := uint64(2); i < 10; i++ {
 		key := []byte{byte('a' + i)}
-		if s.RegisterRoute(i, key, append(key, 'z')) {
+		if s.RegisterRoute(i, key, append(key, 'z'), 0) {
 			t.Fatalf("route %d should fold (over budget)", i)
 		}
 		s.Observe(i, OpRead, 1, 0)
@@ -961,13 +1127,13 @@ func TestPastCapMemberRejoinDoesNotInflateTotal(t *testing.T) {
 		MaxMemberRoutesPerSlot: 1, // visible cap=1; routes 3+4 land in hidden set
 	})
 	mustRegister(t, s, 1, "a", "b")
-	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 should fold (visible)")
 	}
-	if s.RegisterRoute(3, []byte("e"), []byte("f")) {
+	if s.RegisterRoute(3, []byte("e"), []byte("f"), 0) {
 		t.Fatal("route 3 should fold (hidden — past cap)")
 	}
-	if s.RegisterRoute(4, []byte("g"), []byte("h")) {
+	if s.RegisterRoute(4, []byte("g"), []byte("h"), 0) {
 		t.Fatal("route 4 should fold (hidden — past cap)")
 	}
 	s.Observe(2, OpRead, 0, 0)
@@ -980,7 +1146,7 @@ func TestPastCapMemberRejoinDoesNotInflateTotal(t *testing.T) {
 	// grace. Without the hidden-member dedup foldIntoBucket would
 	// increment MemberRoutesTotal again, drifting route_count up.
 	s.RemoveRoute(3)
-	if s.RegisterRoute(3, []byte("e"), []byte("f")) {
+	if s.RegisterRoute(3, []byte("e"), []byte("f"), 0) {
 		t.Fatal("route 3 should fold again")
 	}
 	s.Observe(2, OpRead, 0, 0)
@@ -1004,10 +1170,10 @@ func TestPastCapMemberPruneDecrementsTotal(t *testing.T) {
 		MaxMemberRoutesPerSlot: 1,
 	})
 	mustRegister(t, s, 1, "a", "b")
-	if s.RegisterRoute(2, []byte("c"), []byte("d")) {
+	if s.RegisterRoute(2, []byte("c"), []byte("d"), 0) {
 		t.Fatal("route 2 should fold (visible)")
 	}
-	if s.RegisterRoute(3, []byte("e"), []byte("f")) {
+	if s.RegisterRoute(3, []byte("e"), []byte("f"), 0) {
 		t.Fatal("route 3 should fold (hidden — past cap)")
 	}
 	s.Observe(2, OpRead, 0, 0)
@@ -1072,7 +1238,7 @@ func TestRetiredTailClearedAfterDrop(t *testing.T) {
 // catch regressions before they reach the coordinator wiring PR.
 func BenchmarkObserveHit(b *testing.B) {
 	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4})
-	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		b.Fatal("RegisterRoute(1) returned false")
 	}
 	b.ReportAllocs()
@@ -1116,7 +1282,7 @@ func BenchmarkObserveParallel(b *testing.B) {
 	)
 	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, MaxTrackedRoutes: numRoutes})
 	for r := uint64(1); r <= numRoutes; r++ {
-		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}, 0) {
 			b.Fatalf("RegisterRoute(%d) returned false", r)
 		}
 	}
@@ -1152,7 +1318,7 @@ func BenchmarkRegisterRoute(b *testing.B) {
 		MaxTrackedRoutes: registerBenchTableSize + 1,
 	})
 	for r := uint64(1); r <= registerBenchTableSize; r++ {
-		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}, 0) {
 			b.Fatalf("seed RegisterRoute(%d) returned false", r)
 		}
 	}
@@ -1163,7 +1329,7 @@ func BenchmarkRegisterRoute(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		s.RemoveRoute(churnID)
-		if !s.RegisterRoute(churnID, startKey, endKey) {
+		if !s.RegisterRoute(churnID, startKey, endKey, 0) {
 			b.Fatalf("RegisterRoute(%d) returned false at i=%d", churnID, i)
 		}
 	}
@@ -1191,7 +1357,7 @@ func BenchmarkFlush(b *testing.B) {
 		Now:              clk.Now,
 	})
 	for r := uint64(1); r <= numRoutes; r++ {
-		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}, 0) {
 			b.Fatalf("RegisterRoute(%d) returned false", r)
 		}
 		// Pre-seed every slot with traffic so the first Flush has work to swap.
@@ -1229,7 +1395,7 @@ func BenchmarkSnapshot(b *testing.B) {
 		Now:              clk.Now,
 	})
 	for r := uint64(1); r <= numRoutes; r++ {
-		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}) {
+		if !s.RegisterRoute(r, []byte{byte(r >> 8), byte(r)}, []byte{byte((r + 1) >> 8), byte(r + 1)}, 0) {
 			b.Fatalf("RegisterRoute(%d) returned false", r)
 		}
 	}
@@ -1270,7 +1436,7 @@ func TestObserveExactCountUnderConcurrentBurst(t *testing.T) {
 		MaxTrackedRoutes: numRoutes,
 	})
 	for r := uint64(1); r <= numRoutes; r++ {
-		if !s.RegisterRoute(r, []byte{byte(r)}, []byte{byte(r) + 1}) {
+		if !s.RegisterRoute(r, []byte{byte(r)}, []byte{byte(r) + 1}, 0) {
 			t.Fatalf("RegisterRoute(%d) returned false", r)
 		}
 	}
