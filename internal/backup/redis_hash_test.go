@@ -70,17 +70,43 @@ func hashFloat(t *testing.T, m map[string]any, key string) float64 {
 	return f
 }
 
-func hashSubMap(t *testing.T, m map[string]any, key string) map[string]any {
+// hashFieldArray fetches the `fields` JSON array from a decoded hash
+// JSON file and returns it as a slice of {name, value} maps. The
+// dump-format projection emits fields as an ARRAY of records (not a
+// JSON object) so binary-safe Redis field NAMES round-trip without
+// collision — see the comment on hashFieldRecord in redis_hash.go.
+func hashFieldArray(t *testing.T, m map[string]any) []map[string]any {
 	t.Helper()
-	v, ok := m[key]
+	v, ok := m["fields"]
 	if !ok {
-		t.Fatalf("field %q missing in %+v", key, m)
+		t.Fatalf("fields missing in %+v", m)
 	}
-	sub, ok := v.(map[string]any)
+	raw, ok := v.([]any)
 	if !ok {
-		t.Fatalf("field %q = %T(%v), want map[string]any", key, v, v)
+		t.Fatalf("fields = %T(%v), want []any", v, v)
 	}
-	return sub
+	out := make([]map[string]any, 0, len(raw))
+	for i, r := range raw {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			t.Fatalf("fields[%d] = %T(%v), want map[string]any", i, r, r)
+		}
+		out = append(out, rm)
+	}
+	return out
+}
+
+// hashFieldByName looks up a single field in the array shape and
+// returns its `value` element (UTF-8 string or base64 envelope).
+func hashFieldByName(t *testing.T, m map[string]any, name string) any {
+	t.Helper()
+	for _, f := range hashFieldArray(t, m) {
+		if f["name"] == name {
+			return f["value"]
+		}
+	}
+	t.Fatalf("field %q not found in %+v", name, m["fields"])
+	return nil
 }
 
 func TestRedisDB_HashRoundTripBasic(t *testing.T) {
@@ -105,12 +131,11 @@ func TestRedisDB_HashRoundTripBasic(t *testing.T) {
 	if got["expire_at_ms"] != nil {
 		t.Fatalf("expire_at_ms must be nil without TTL, got %v", got["expire_at_ms"])
 	}
-	fields := hashSubMap(t, got, "fields")
-	if fields["name"] != "alice" {
-		t.Fatalf("name = %v want alice", fields["name"])
+	if v := hashFieldByName(t, got, "name"); v != "alice" {
+		t.Fatalf("name = %v want alice", v)
 	}
-	if fields["age"] != "30" {
-		t.Fatalf("age = %v want 30", fields["age"])
+	if v := hashFieldByName(t, got, "age"); v != "30" {
+		t.Fatalf("age = %v want 30", v)
 	}
 }
 
@@ -126,9 +151,8 @@ func TestRedisDB_HashEmptyHashStillEmitsFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := readHashJSON(t, filepath.Join(root, "redis", "db_0", "hashes", "empty.json"))
-	fields := hashSubMap(t, got, "fields")
-	if len(fields) != 0 {
-		t.Fatalf("empty hash should emit empty fields object, got %v", fields)
+	if fields := hashFieldArray(t, got); len(fields) != 0 {
+		t.Fatalf("empty hash should emit empty fields array, got %v", fields)
 	}
 }
 
@@ -206,14 +230,89 @@ func TestRedisDB_HashBinaryFieldValueUsesBase64Envelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := readHashJSON(t, filepath.Join(root, "redis", "db_0", "hashes", "k.json"))
-	fields := hashSubMap(t, got, "fields")
-	envelope, ok := fields["blob"].(map[string]any)
+	v := hashFieldByName(t, got, "blob")
+	envelope, ok := v.(map[string]any)
 	if !ok {
-		t.Fatalf("expected base64 envelope for binary value, got %T(%v)", fields["blob"], fields["blob"])
+		t.Fatalf("expected base64 envelope for binary value, got %T(%v)", v, v)
 	}
 	if envelope["base64"] == "" {
 		t.Fatalf("base64 envelope missing payload: %v", envelope)
 	}
+}
+
+// TestRedisDB_HashBinaryFieldNameRoundTripsViaArray covers the Codex
+// P1 round-12 scenario: a UTF-8-literal field name `%FF` and a
+// 1-byte binary field name `0xFF` would collide if `fields` were a
+// JSON object, because EncodeSegment percent-encodes 0xFF to `%FF`.
+// With the array-of-records shape both names round-trip
+// independently — the binary name uses the typed base64 envelope
+// while the UTF-8 literal stays as a plain JSON string.
+func TestRedisDB_HashBinaryFieldNameRoundTripsViaArray(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleHashMeta(hashMetaKey("k"), encodeHashMetaValue(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleHashField(hashFieldKey("k", "%FF"), []byte("literal-percent-ff")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleHashField(append(hashFieldKey("k", ""), 0xff), []byte("binary-byte")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readHashJSON(t, filepath.Join(root, "redis", "db_0", "hashes", "k.json"))
+	fields := hashFieldArray(t, got)
+	if len(fields) != 2 {
+		t.Fatalf("len(fields) = %d, want 2 (binary and literal must be distinct)", len(fields))
+	}
+	literalSeen, binarySeen := classifyHashFieldShapes(t, fields)
+	if !literalSeen {
+		t.Fatalf("literal %%FF field missing from %+v", fields)
+	}
+	if !binarySeen {
+		t.Fatalf("binary 0xFF field missing from %+v", fields)
+	}
+}
+
+// classifyHashFieldShapes folds the binary-vs-literal field-shape
+// assertions out of the parent test so cyclomatic complexity stays
+// under the project linter's ceiling. Returns (sawUTF8Literal,
+// sawBase64Envelope).
+func classifyHashFieldShapes(t *testing.T, fields []map[string]any) (bool, bool) {
+	t.Helper()
+	var literalSeen, binarySeen bool
+	for _, f := range fields {
+		switch n := f["name"].(type) {
+		case string:
+			if n == "%FF" {
+				literalSeen = true
+				if f["value"] != "literal-percent-ff" {
+					t.Fatalf("literal value = %v", f["value"])
+				}
+			}
+		case map[string]any:
+			if n["base64"] == base64URLEncode(0xff) {
+				binarySeen = true
+				if f["value"] != "binary-byte" {
+					t.Fatalf("binary value = %v", f["value"])
+				}
+			}
+		default:
+			t.Fatalf("unexpected name type %T(%v)", f["name"], f["name"])
+		}
+	}
+	return literalSeen, binarySeen
+}
+
+func base64URLEncode(b byte) string {
+	// base64.RawURLEncoding of a single byte; matches what
+	// marshalRedisBinaryValue emits for non-UTF-8 content.
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	hi := alphabet[b>>2]
+	lo := alphabet[(b&0x3)<<4]
+	return string([]byte{hi, lo})
 }
 
 func TestRedisDB_HashRejectsMalformedMetaValueLength(t *testing.T) {
