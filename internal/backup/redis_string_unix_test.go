@@ -6,8 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestRedisDB_OpenJSONLRefusesFIFO is the regression for Codex P2
@@ -19,8 +20,13 @@ import (
 // socket, device). The symlink and hard-link guards alone do not
 // catch this — mkfifo produces nlink=1 and is not a symlink.
 //
-// Lives in a unix-only test file because syscall.Mkfifo is undefined
-// on Windows and js/wasm.
+// Lives in a unix-only test file because POSIX mkfifo is not
+// defined on Windows or js/wasm. We use golang.org/x/sys/unix.Mkfifo
+// rather than syscall.Mkfifo because the standard library's syscall
+// package does not define Mkfifo on every `unix`-tagged target
+// (notably Solaris); the x/sys/unix wrapper is consistent across
+// every platform the `unix` build tag covers. Codex P2 round 14
+// (PR #713 #12) caught the Solaris cross-compile failure.
 func TestRedisDB_OpenJSONLRefusesFIFO(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
@@ -29,7 +35,7 @@ func TestRedisDB_OpenJSONLRefusesFIFO(t *testing.T) {
 		t.Fatal(err)
 	}
 	fifoPath := filepath.Join(dir, redisStringsTTLFile)
-	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+	if err := unix.Mkfifo(fifoPath, 0o600); err != nil {
 		t.Skipf("mkfifo not supported on this platform: %v", err)
 	}
 	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), fixedExpireMs))
