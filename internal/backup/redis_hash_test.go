@@ -365,6 +365,44 @@ func TestRedisDB_HashRejectsMalformedMetaValueLength(t *testing.T) {
 	}
 }
 
+// TestRedisDB_HashHandleHashMetaSkipsDeltaKey is the regression for
+// Codex P1 round 14 (PR #725 #13): the delta prefix `!hs|meta|d|`
+// shares the base meta prefix `!hs|meta|`, so a snapshot dispatcher
+// that routes by "starts with RedisHashMetaPrefix" would land delta
+// records in HandleHashMeta. Phase 0a's output (an array of
+// observed fields) doesn't need to apply delta arithmetic — the
+// !hs|fld| records are the source of truth — so deltas are silently
+// skipped. The earlier behavior aborted with ErrRedisInvalidHashKey,
+// breaking valid snapshots that contain unresolved deltas.
+func TestRedisDB_HashHandleHashMetaSkipsDeltaKey(t *testing.T) {
+	t.Parallel()
+	db, _ := newRedisDB(t)
+	// Synthesise a !hs|meta|d|<len><userKey><commitTS><seqInTxn>
+	// key shape: prefix + 4-byte len + userKey + 8B commitTS + 4B
+	// seqInTxn trailer.
+	deltaKey := []byte(RedisHashMetaDeltaPrefix)
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len("k"))) //nolint:gosec
+	deltaKey = append(deltaKey, l[:]...)
+	deltaKey = append(deltaKey, "k"...)
+	deltaKey = append(deltaKey, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+	deltaKey = append(deltaKey, 0x00, 0x00, 0x00, 0x00)
+	// LenDelta value is a single signed int64; -1 here, encoded
+	// as the two's-complement uint64 0xFFFFFFFFFFFFFFFF.
+	deltaValue := make([]byte, 8)
+	binary.BigEndian.PutUint64(deltaValue, ^uint64(0))
+	if err := db.HandleHashMeta(deltaKey, deltaValue); err != nil {
+		t.Fatalf("delta key must not error: %v", err)
+	}
+	// And the parser-level guard returns !ok for delta keys so a
+	// later refactor that bypasses HandleHashMeta's prefix check
+	// still surfaces a parse failure rather than silent
+	// state-corruption.
+	if _, ok := parseHashMetaKey(deltaKey); ok {
+		t.Fatalf("parseHashMetaKey must reject delta-prefixed keys")
+	}
+}
+
 func TestRedisDB_HashRejectsTruncatedFieldKey(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)

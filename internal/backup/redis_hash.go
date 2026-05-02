@@ -51,7 +51,18 @@ type redisHashState struct {
 // the 8-byte BE field count. We park the state for finalize-time flush
 // and register the user key so a later !redis|ttl|<userKey> record
 // routes back to this hash state.
+//
+// Delta keys (!hs|meta|d|...) share the !hs|meta| string prefix, so a
+// snapshot dispatcher that routes by "starts with RedisHashMetaPrefix"
+// will land delta records here too. Phase 0a's output (an array of
+// observed fields) doesn't need to apply the delta arithmetic — the
+// !hs|fld|... records are the source of truth — so we silently skip
+// delta keys instead of returning ErrRedisInvalidHashKey. Codex P1
+// round 14 (PR #725 #13).
 func (r *RedisDB) HandleHashMeta(key, value []byte) error {
+	if bytes.HasPrefix(key, []byte(RedisHashMetaDeltaPrefix)) {
+		return nil
+	}
 	userKey, ok := parseHashMetaKey(key)
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidHashKey, "meta key: %q", key)
@@ -111,8 +122,17 @@ func (r *RedisDB) hashState(userKey []byte) *redisHashState {
 }
 
 // parseHashMetaKey strips !hs|meta| and the 4-byte BE userKeyLen prefix.
-// Returns (userKey, true) on success.
+// Returns (userKey, true) on success. Delta keys (!hs|meta|d|...)
+// share the meta string prefix and would otherwise be parsed as
+// base-meta with a garbage userKeyLen — refuse them at the boundary
+// so a misrouted delta surfaces a parse error rather than silent
+// state corruption. Callers that want delta-tolerant behavior
+// (HandleHashMeta) should detect the delta prefix BEFORE calling
+// this function. Codex P1 round 14 (PR #725 #13).
 func parseHashMetaKey(key []byte) ([]byte, bool) {
+	if bytes.HasPrefix(key, []byte(RedisHashMetaDeltaPrefix)) {
+		return nil, false
+	}
 	rest := bytes.TrimPrefix(key, []byte(RedisHashMetaPrefix))
 	if len(rest) == len(key) {
 		return nil, false
