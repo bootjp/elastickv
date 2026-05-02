@@ -199,6 +199,45 @@ func TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex(t *testing.T) {
 	assertTTLSidecar(t, filepath.Join(root, "redis", "db_0", "strings_ttl.jsonl"), "expiring", fixedExpireMs)
 }
 
+// TestRedisDB_EnsureDirRevalidatesAfterCachedSuccess is the regression
+// for Codex P1 round 13 follow-up (PR #713 review #11): ensureDir's
+// dirsCreated cache used to skip assertNoSymlinkAncestors on cache
+// hits, so a directory that was safe on the first write could be
+// swapped to a symlink between writes and subsequent HandleString
+// calls would silently traverse it, redirecting blobs outside
+// outRoot. The cache now short-circuits only MkdirAll; the ancestor
+// check runs on every call.
+func TestRedisDB_EnsureDirRevalidatesAfterCachedSuccess(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	bait := filepath.Join(root, "bait-tree")
+	if err := os.MkdirAll(bait, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db := NewRedisDB(root, 0)
+	// First write seeds dirsCreated for <root>/redis/db_0/strings.
+	if err := db.HandleString([]byte("k1"), encodeNewStringValue(t, []byte("v1"), 0)); err != nil {
+		t.Fatalf("first HandleString: %v", err)
+	}
+	// Adversary swaps the cached real dir for a symlink to outside
+	// outRoot. Without re-validation, the next write would follow
+	// it and land in <bait>/.
+	stringsDir := filepath.Join(root, "redis", "db_0", "strings")
+	if err := os.RemoveAll(stringsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bait, stringsDir); err != nil {
+		t.Fatal(err)
+	}
+	err := db.HandleString([]byte("k2"), encodeNewStringValue(t, []byte("v2"), 0))
+	if err == nil || !strings.Contains(err.Error(), "refusing to traverse symlinked ancestor") {
+		t.Fatalf("expected post-cache symlink refusal, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(bait, "k2.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("blob written through swapped-in symlink: stat err=%v", statErr)
+	}
+}
+
 // TestRedisDB_RefusesSymlinkedAncestorOnTTLSidecar is the regression
 // for Codex P1 round 13 (PR #713): writeBlob already routed through
 // ensureDir/assertNoSymlinkAncestors, but TTL sidecars (appendTTL ->
