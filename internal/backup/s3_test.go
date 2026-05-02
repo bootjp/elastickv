@@ -584,6 +584,35 @@ func TestS3_StalePartVersionExcludedFromAssembledBody(t *testing.T) {
 	}
 }
 
+// TestS3_HandleIncompleteUploadRejectsDotSegmentBucket is the
+// regression for Codex P1 round 13 follow-up (PR #716): the
+// flushBucket bucket-name guard runs at FINALIZE, but
+// HandleIncompleteUpload writes to disk earlier — every upload-
+// family record opens a per-bucket records.jsonl on first
+// arrival. Without an early dot-segment guard, a malformed
+// snapshot upload record with bucket="." or ".." would let
+// `filepath.Join` escape the s3/ subtree at
+// HandleIncompleteUpload time, before the flushBucket guard ever
+// runs. The same dot-segment refusal now runs in this earlier
+// code path.
+func TestS3_HandleIncompleteUploadRejectsDotSegmentBucket(t *testing.T) {
+	t.Parallel()
+	cases := []string{".", "..", ""}
+	for _, bucket := range cases {
+		t.Run(bucket, func(t *testing.T) {
+			t.Parallel()
+			enc, _ := newS3Encoder(t)
+			enc.WithIncludeIncompleteUploads(true)
+			err := enc.HandleIncompleteUpload(S3UploadMetaPrefix,
+				s3keys.UploadMetaKey(bucket, 1, "obj", "u"),
+				[]byte("payload"))
+			if !errors.Is(err, ErrS3MalformedKey) {
+				t.Fatalf("err=%v want ErrS3MalformedKey for bucket name %q", err, bucket)
+			}
+		})
+	}
+}
+
 // TestS3_FlushBucketRejectsDotSegmentBucketName is the regression for
 // Codex P1 round 13 (originally surfaced on PR #716's merged-in
 // s3.go): HandleBlob's dot-segment guard runs at the SCRATCH path,

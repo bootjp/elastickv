@@ -488,6 +488,21 @@ func (s *S3Encoder) HandleIncompleteUpload(prefix string, key, value []byte) err
 	if !ok {
 		return errors.Wrapf(ErrS3MalformedKey, "upload-family key: %q", key)
 	}
+	// Reject dot-segment / empty bucket names BEFORE the
+	// filesystem join — same fix as flushBucket (round 6) but for
+	// the --include-incomplete-uploads code path, which runs
+	// during HandleIncompleteUpload and so escapes outRoot before
+	// Finalize's bucket-name guard ever runs. EncodeSegment
+	// preserves "." and "..", so a malformed snapshot upload
+	// record with bucket="." or ".." would otherwise let
+	// `filepath.Join` collapse the s3/ subtree and write
+	// records.jsonl outside the dump root. Codex P1 round 13
+	// (PR #716, follow-up).
+	switch bucket {
+	case ".", "..", "":
+		return errors.Wrapf(ErrS3MalformedKey,
+			"bucket name %q in upload-family key is empty or a dot segment", bucket)
+	}
 	b := s.bucketState(bucket)
 	if b.incompleteUploadsJL == nil {
 		dir := filepath.Join(s.outRoot, "s3", EncodeSegment([]byte(bucket)), "_incomplete_uploads")
