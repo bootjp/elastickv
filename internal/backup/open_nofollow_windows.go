@@ -22,5 +22,9 @@ func openSidecarFile(path string) (*os.File, error) {
 		return nil, cockroachdberr.WithStack(cockroachdberr.Newf(
 			"backup: refusing to overwrite symlink at %s", path))
 	}
-	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode
+	if err != nil {
+		return nil, cockroachdberr.WithStack(err)
+	}
+	return f, nil
 }
