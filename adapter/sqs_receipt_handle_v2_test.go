@@ -278,53 +278,39 @@ func TestDecodeClientReceiptHandle_AcceptsV1(t *testing.T) {
 	require.Equal(t, uint64(7), back.QueueGeneration)
 }
 
-// TestDecodeClientReceiptHandle_RejectsV2 pins the codex/coderabbit
-// major fix on PR #724 round 1: the v2 codec is added but
-// dormant. A client-supplied v2 handle MUST be rejected at the
-// public API boundary so the wire format does not leak before
-// PR 5b wires the partitioned-FIFO data plane.
-//
-// Without this gate, a malicious / curious client could re-encode
-// a legitimately-issued v1 handle's (queue_gen, message_id,
-// receipt_token) under the v2 layout, and DeleteMessage /
-// ChangeMessageVisibility would accept it (since downstream
-// validation only checks queue_gen + receipt_token). PR 5b
-// replaces this gate with a queue-aware version (v1 required on
-// non-partitioned queues, v2 required on partitioned ones), so
-// the gate-removal lands together with the partitioned data plane.
-func TestDecodeClientReceiptHandle_RejectsV2(t *testing.T) {
+// TestDecodeClientReceiptHandle_AcceptsV2 pins the PR 5b-2 contract
+// shift: the public API wrapper no longer enforces the PR 5a
+// blanket v2 rejection. Version validation moved into
+// validateReceiptHandleVersion, which the meta-loading callers
+// (loadMessageForDelete / loadAndVerifyMessage) invoke once they
+// have the queue's PartitionCount in scope. The dormancy promise
+// is preserved by the queue-aware check downstream — v2 handles
+// against a non-partitioned queue still surface as
+// ReceiptHandleIsInvalid (see
+// TestValidateReceiptHandleVersion_RejectsV2OnNonPartitioned),
+// and the §11 PR 2 dormancy gate still rejects PartitionCount > 1
+// at CreateQueue, so no production queue can be in the
+// partitioned branch until PR 5b-3 lifts the gate atomically.
+func TestDecodeClientReceiptHandle_AcceptsV2(t *testing.T) {
 	t.Parallel()
 	token := make([]byte, sqsReceiptTokenBytes)
 	h, err := encodeReceiptHandleV2(3, 7, "deadbeefdeadbeefdeadbeefdeadbeef", token)
-	require.NoError(t, err,
-		"v2 encoder must succeed even though the public API "+
-			"wrapper rejects the result — the codec is dormant, "+
-			"not absent")
-
-	// Low-level decoder still accepts v2 (it's pure codec).
-	back, err := decodeReceiptHandle(h)
 	require.NoError(t, err)
-	require.Equal(t, sqsReceiptHandleVersion2, back.Version,
-		"low-level decodeReceiptHandle must keep working — the "+
-			"gate is at the public API boundary, not in the codec")
 
-	// Public API wrapper rejects v2.
-	_, err = decodeClientReceiptHandle(h)
-	require.Error(t, err,
-		"v2 handle on the public API must fail until PR 5b lifts "+
-			"the dormancy gate")
-	require.Contains(t, err.Error(), "not yet enabled")
+	back, err := decodeClientReceiptHandle(h)
+	require.NoError(t, err,
+		"v2 handle must decode at the public API; version "+
+			"validation moved to validateReceiptHandleVersion")
+	require.Equal(t, sqsReceiptHandleVersion2, back.Version)
+	require.Equal(t, uint32(3), back.Partition)
+	require.Equal(t, uint64(7), back.QueueGeneration)
 }
 
 // TestDecodeClientReceiptHandle_PassesThroughDecodeErrors pins
 // that decode-error propagation is unchanged — a malformed blob
-// still surfaces the underlying base64 / length error rather than
-// being masked by the dormancy-gate message.
+// still surfaces the underlying base64 / length error.
 func TestDecodeClientReceiptHandle_PassesThroughDecodeErrors(t *testing.T) {
 	t.Parallel()
 	_, err := decodeClientReceiptHandle("!!!" + strings.Repeat("?", 50))
 	require.Error(t, err)
-	require.NotContains(t, err.Error(), "not yet enabled",
-		"a decode-step error must NOT be reported as the "+
-			"dormancy-gate message")
 }

@@ -114,7 +114,7 @@ func shouldRedrive(rec *sqsMessageRecord, policy *parsedRedrivePolicy) bool {
 func (s *SQSServer) redriveCandidateToDLQ(
 	ctx context.Context,
 	srcQueueName string,
-	srcGen uint64,
+	srcMeta *sqsQueueMeta,
 	cand sqsMsgCandidate,
 	srcDataKey []byte,
 	srcRec *sqsMessageRecord,
@@ -147,7 +147,7 @@ func (s *SQSServer) redriveCandidateToDLQ(
 	if err != nil {
 		return false, err
 	}
-	req, err := s.buildRedriveOps(ctx, srcQueueName, srcGen, cand, srcDataKey, srcRec, policy, dlqMeta, dlqRec, dlqRecordBytes, dlqSeq, readTS)
+	req, err := s.buildRedriveOps(ctx, srcQueueName, srcMeta, cand, srcDataKey, srcRec, policy, dlqMeta, dlqRec, dlqRecordBytes, dlqSeq, readTS)
 	if err != nil {
 		return false, err
 	}
@@ -278,7 +278,7 @@ func buildDLQRecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta, srcArn stri
 func (s *SQSServer) buildRedriveOps(
 	ctx context.Context,
 	srcQueueName string,
-	srcGen uint64,
+	srcMeta *sqsQueueMeta,
 	cand sqsMsgCandidate,
 	srcDataKey []byte,
 	srcRec *sqsMessageRecord,
@@ -289,11 +289,17 @@ func (s *SQSServer) buildRedriveOps(
 	dlqSeq uint64,
 	readTS uint64,
 ) (*kv.OperationGroup[kv.OP], error) {
+	srcGen := srcMeta.Generation
 	now := dlqRec.SendTimestampMillis
-	dlqDataKey := sqsMsgDataKey(policy.DLQName, dlqMeta.Generation, dlqRec.MessageID)
-	dlqVisKey := sqsMsgVisKey(policy.DLQName, dlqMeta.Generation, now, dlqRec.MessageID)
-	dlqByAgeKey := sqsMsgByAgeKey(policy.DLQName, dlqMeta.Generation, now, dlqRec.MessageID)
-	srcByAgeKey := sqsMsgByAgeKey(srcQueueName, srcGen, srcRec.SendTimestampMillis, srcRec.MessageID)
+	// DLQ partition for FIFO sources: redrive carries the source's
+	// MessageGroupId forward, so the DLQ partition is the result of
+	// hashing that group through the DLQ's partitionFor. Standard
+	// DLQs (or any DLQ with PartitionCount <= 1) collapse this to 0.
+	dlqPartition := partitionFor(dlqMeta, dlqRec.MessageGroupId)
+	dlqDataKey := sqsMsgDataKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, dlqRec.MessageID)
+	dlqVisKey := sqsMsgVisKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, now, dlqRec.MessageID)
+	dlqByAgeKey := sqsMsgByAgeKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, now, dlqRec.MessageID)
+	srcByAgeKey := sqsMsgByAgeKeyDispatch(srcMeta, srcQueueName, cand.partition, srcGen, srcRec.SendTimestampMillis, srcRec.MessageID)
 	readKeys := [][]byte{
 		cand.visKey, srcDataKey,
 		sqsQueueMetaKey(srcQueueName), sqsQueueGenKey(srcQueueName),
@@ -317,8 +323,8 @@ func (s *SQSServer) buildRedriveOps(
 		})
 	}
 	if srcRec.MessageGroupId != "" {
-		lockKey := sqsMsgGroupKey(srcQueueName, srcGen, srcRec.MessageGroupId)
-		lock, err := s.loadFifoGroupLock(ctx, srcQueueName, srcGen, srcRec.MessageGroupId, readTS)
+		lockKey := sqsMsgGroupKeyDispatch(srcMeta, srcQueueName, cand.partition, srcGen, srcRec.MessageGroupId)
+		lock, err := s.loadFifoGroupLock(ctx, srcQueueName, srcMeta, cand.partition, srcGen, srcRec.MessageGroupId, readTS)
 		if err != nil {
 			return nil, err
 		}
