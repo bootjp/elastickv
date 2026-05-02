@@ -2,6 +2,7 @@ package backup
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -752,7 +753,16 @@ func (s *S3Encoder) flushOrphanObject(b *s3BucketState, bucketDir string, obj *s
 		return errors.Wrapf(ErrS3MalformedKey,
 			"orphan object key %q is a dot segment (would escape orphan dir)", obj.object)
 	}
-	dir := filepath.Join(bucketDir, "_orphans", EncodeSegment([]byte(obj.object)))
+	// Include the generation in the orphan path. Without this,
+	// two stale generations of the same object key sharing
+	// (uploadID, partNo, chunkNo, partVersion) — possible during
+	// delete/recreate cleanup windows where the live system
+	// recycled identifiers — would overwrite one another in
+	// `_orphans/<encoded-object>/`, silently dropping forensic
+	// data the operator opted in to preserve via
+	// --include-orphans. Codex P2 round 13 (PR #716).
+	genDir := fmt.Sprintf("gen-%d", obj.generation)
+	dir := filepath.Join(bucketDir, "_orphans", EncodeSegment([]byte(obj.object)), genDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return errors.WithStack(err)
 	}

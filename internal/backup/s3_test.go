@@ -538,9 +538,51 @@ func TestS3_OrphanChunksWrittenWhenIncludeOrphans(t *testing.T) {
 	if err := enc.Finalize(); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(root, "s3", "b", "_orphans", EncodeSegment([]byte("ghost")))
+	// Orphan chunks land in <bucket>/_orphans/<encoded-object>/gen-<N>/
+	// (round 13 follow-up: per-generation isolation). The chunk's
+	// generation == 1 here because we drove HandleBlob with gen=1.
+	dir := filepath.Join(root, "s3", "b", "_orphans", EncodeSegment([]byte("ghost")), "gen-1")
 	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("expected _orphans dir under --include-orphans: %v", err)
+		t.Fatalf("expected _orphans/<obj>/gen-N dir under --include-orphans: %v", err)
+	}
+}
+
+// TestS3_OrphanChunksPreservedAcrossGenerations is the regression for
+// Codex P2 round 13 (PR #716): two stale generations of the same
+// object that share (uploadID, partNo, chunkNo, partVersion) — for
+// example a delete/recreate cleanup window where the live system
+// recycled the upload identifier — would overwrite one another in a
+// single `_orphans/<encoded-object>/` dir, silently dropping
+// forensic data the operator opted in to preserve via
+// --include-orphans. The orphan path now embeds the generation so
+// each gen's chunks land in its own subdir.
+func TestS3_OrphanChunksPreservedAcrossGenerations(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	enc.WithIncludeOrphans(true)
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey("b"), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": "b", "generation": uint64(3), // active gen = 3
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Two stale generations sharing the same (uploadID, partNo,
+	// chunkNo, partVersion). Both must survive distinctly.
+	if err := enc.HandleBlob(s3keys.BlobKey("b", 1, "ghost", "u", 1, 0), []byte("g1-bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey("b", 2, "ghost", "u", 1, 0), []byte("g2-bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	gen1 := filepath.Join(root, "s3", "b", "_orphans", EncodeSegment([]byte("ghost")), "gen-1")
+	gen2 := filepath.Join(root, "s3", "b", "_orphans", EncodeSegment([]byte("ghost")), "gen-2")
+	if _, err := os.Stat(gen1); err != nil {
+		t.Fatalf("gen-1 orphan dir missing: %v", err)
+	}
+	if _, err := os.Stat(gen2); err != nil {
+		t.Fatalf("gen-2 orphan dir missing: %v", err)
 	}
 }
 
