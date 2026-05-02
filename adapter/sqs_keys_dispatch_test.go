@@ -27,11 +27,38 @@ func TestSQSKeysDispatch_LegacyMatchesLegacyConstructor(t *testing.T) {
 		dispatched []byte
 		legacy     []byte
 	}{
+		// meta=nil sub-cases — ratchet against accidentally
+		// dropping the nil-guard from any helper.
 		{"meta=nil data", sqsMsgDataKeyDispatch(nil, queue, 0, gen, msgID),
 			sqsMsgDataKey(queue, gen, msgID)},
+		{"meta=nil vis",
+			sqsMsgVisKeyDispatch(nil, queue, 0, gen, ts, msgID),
+			sqsMsgVisKey(queue, gen, ts, msgID)},
+		{"meta=nil dedup",
+			sqsMsgDedupKeyDispatch(nil, queue, 0, gen, dedupID),
+			sqsMsgDedupKey(queue, gen, dedupID)},
+		{"meta=nil group",
+			sqsMsgGroupKeyDispatch(nil, queue, 0, gen, groupID),
+			sqsMsgGroupKey(queue, gen, groupID)},
+		{"meta=nil byage",
+			sqsMsgByAgeKeyDispatch(nil, queue, 0, gen, ts, msgID),
+			sqsMsgByAgeKey(queue, gen, ts, msgID)},
+		{"meta=nil vis prefix",
+			sqsMsgVisPrefixForQueueDispatch(nil, queue, 0, gen),
+			sqsMsgVisPrefixForQueue(queue, gen)},
+		// meta.PartitionCount=0 sub-cases — ratchet against
+		// accidentally dropping the > 1 guard.
 		{"meta.PartitionCount=0 data",
 			sqsMsgDataKeyDispatch(&sqsQueueMeta{PartitionCount: 0}, queue, 0, gen, msgID),
 			sqsMsgDataKey(queue, gen, msgID)},
+		{"meta.PartitionCount=0 vis",
+			sqsMsgVisKeyDispatch(&sqsQueueMeta{PartitionCount: 0}, queue, 0, gen, ts, msgID),
+			sqsMsgVisKey(queue, gen, ts, msgID)},
+		{"meta.PartitionCount=0 vis prefix",
+			sqsMsgVisPrefixForQueueDispatch(&sqsQueueMeta{PartitionCount: 0}, queue, 0, gen),
+			sqsMsgVisPrefixForQueue(queue, gen)},
+		// meta.PartitionCount=1 sub-cases — ratchet that the > 1
+		// boundary is exclusive: 1 is still the legacy layout.
 		{"meta.PartitionCount=1 data",
 			sqsMsgDataKeyDispatch(&sqsQueueMeta{PartitionCount: 1}, queue, 0, gen, msgID),
 			sqsMsgDataKey(queue, gen, msgID)},
@@ -114,6 +141,32 @@ func TestSQSKeysDispatch_PartitionedMatchesPartitionedConstructor(t *testing.T) 
 	}
 }
 
+// TestSQSKeysDispatch_BoundaryAtPartitionCount2 pins the > 1
+// threshold: PartitionCount=2 is the smallest value that selects
+// the partitioned keyspace. An off-by-one in the dispatch
+// condition (e.g. >= 1 vs > 1) would not be caught by tests that
+// only exercise PartitionCount=4.
+func TestSQSKeysDispatch_BoundaryAtPartitionCount2(t *testing.T) {
+	t.Parallel()
+	meta := &sqsQueueMeta{PartitionCount: 2}
+	const (
+		queue = "boundary.fifo"
+		gen   = uint64(1)
+		msgID = "id"
+	)
+	got := sqsMsgDataKeyDispatch(meta, queue, 0, gen, msgID)
+	want := sqsPartitionedMsgDataKey(queue, 0, gen, msgID)
+	require.Equal(t, want, got,
+		"PartitionCount=2 must dispatch to the partitioned "+
+			"keyspace; an off-by-one in the > 1 threshold would "+
+			"silently put PR 5b's first-partitioned-queue traffic "+
+			"on the legacy keyspace")
+	// And it must NOT match the legacy constructor.
+	legacy := sqsMsgDataKey(queue, gen, msgID)
+	require.NotEqual(t, legacy, got,
+		"PartitionCount=2 must NOT route to the legacy keyspace")
+}
+
 // TestSQSKeysDispatch_LegacyAndPartitionedAreDistinct pins the
 // keyspace-isolation invariant at the dispatch level: a legacy
 // (PartitionCount=1) key and a partitioned (PartitionCount>1) key
@@ -153,6 +206,67 @@ func TestEffectivePartitionCount(t *testing.T) {
 	require.Equal(t, uint32(2), effectivePartitionCount(&sqsQueueMeta{PartitionCount: 2}))
 	require.Equal(t, uint32(8), effectivePartitionCount(&sqsQueueMeta{PartitionCount: 8}))
 	require.Equal(t, uint32(32), effectivePartitionCount(&sqsQueueMeta{PartitionCount: 32}))
+}
+
+// TestEffectivePartitionCount_PerQueueModeCollapsesToOne pins the
+// codex P2 round-1 fix on PR #731: when a queue is configured
+// with FifoThroughputLimit=perQueue, partitionFor's §3.3 short-
+// circuit forces every MessageGroupId to partition 0 regardless
+// of PartitionCount. The fanout helper MUST mirror that decision
+// — returning the literal PartitionCount would have
+// ReceiveMessage scan up to 31 guaranteed-empty partitions on
+// every poll for no correctness benefit.
+//
+// Without this ratchet, a future refactor that drops the
+// perQueue branch from effectivePartitionCount would silently
+// regress receive performance to "scan 32 empty partitions per
+// poll" with no test failure.
+func TestEffectivePartitionCount_PerQueueModeCollapsesToOne(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		meta *sqsQueueMeta
+		want uint32
+	}{
+		{
+			name: "perQueue + PartitionCount=4 → 1",
+			meta: &sqsQueueMeta{
+				PartitionCount:      4,
+				FifoThroughputLimit: htfifoThroughputPerQueue,
+			},
+			want: 1,
+		},
+		{
+			name: "perQueue + PartitionCount=32 (max) → 1",
+			meta: &sqsQueueMeta{
+				PartitionCount:      32,
+				FifoThroughputLimit: htfifoThroughputPerQueue,
+			},
+			want: 1,
+		},
+		{
+			name: "perMessageGroupId + PartitionCount=4 → 4",
+			meta: &sqsQueueMeta{
+				PartitionCount:      4,
+				FifoThroughputLimit: htfifoThroughputPerMessageGroupID,
+			},
+			want: 4,
+		},
+		{
+			name: "empty FifoThroughputLimit + PartitionCount=4 → 4",
+			meta: &sqsQueueMeta{
+				PartitionCount:      4,
+				FifoThroughputLimit: "",
+			},
+			want: 4,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, effectivePartitionCount(tc.meta))
+		})
+	}
 }
 
 // TestSQSKeysDispatch_PartitionIgnoredOnLegacy pins the contract

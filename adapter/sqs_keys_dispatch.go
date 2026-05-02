@@ -97,8 +97,21 @@ func sqsMsgVisPrefixForQueueDispatch(meta *sqsQueueMeta, queueName string, parti
 // fanout reader iterates. Treats meta.PartitionCount values 0 and
 // 1 as the legacy single-partition layout (one iteration on
 // partition 0).
+//
+// Honors the §3.3 perQueue short-circuit: when
+// meta.FifoThroughputLimit == "perQueue", partitionFor forces
+// every MessageGroupId to partition 0 regardless of
+// PartitionCount, so the only non-empty partition the fanout
+// reader will ever find is 0. Returning the literal
+// PartitionCount in that mode would have ReceiveMessage scan up
+// to 31 guaranteed-empty partitions on every poll, multiplying
+// read / CPU work for no correctness benefit (codex P2 round 1
+// on PR #731). Mirror the routing decision: collapse to 1.
 func effectivePartitionCount(meta *sqsQueueMeta) uint32 {
 	if meta == nil || meta.PartitionCount <= 1 {
+		return 1
+	}
+	if meta.FifoThroughputLimit == htfifoThroughputPerQueue {
 		return 1
 	}
 	return meta.PartitionCount
