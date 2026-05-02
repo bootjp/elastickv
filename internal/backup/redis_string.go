@@ -2,7 +2,6 @@ package backup
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 
 	cockroachdberr "github.com/cockroachdb/errors"
 )
@@ -75,11 +75,12 @@ const (
 // RedisDB encodes one logical Redis database (`redis/db_<n>/`). All
 // operations are scoped to its outRoot; the caller wires per-database
 // instances when the producer supports multiple databases (today only
-// db_0 is meaningful).
+// db_0 is meaningful, but the encoder is wired to take any non-negative
+// index so a future multi-db dump does not silently collide on db_0).
 //
 // Lifecycle:
 //
-//	r := NewRedisDB(outRoot)
+//	r := NewRedisDB(outRoot, dbIndex)
 //	for each snapshot record matching a redis prefix: r.Handle*(...)
 //	r.Finalize()
 //
@@ -87,6 +88,7 @@ const (
 // inherently sequential per scope, so a mutex would only add cost.
 type RedisDB struct {
 	outRoot string
+	dbIndex int
 
 	// kindByKey records the Redis type each user key was first seen as.
 	// Populated by HandleString and HandleHLL; consulted by HandleTTL.
@@ -101,30 +103,66 @@ type RedisDB struct {
 	stringsTTL *jsonlFile
 	hllTTL     *jsonlFile
 
-	// pendingWideColumnTTL accumulates !redis|ttl| records whose user key
-	// has not been claimed by HandleString / HandleHLL. These are
-	// candidates for hashes/lists/sets/zsets/streams (handled in a
-	// follow-up PR) — for now Finalize logs them via the warning hook
-	// rather than dropping silently.
-	pendingWideColumnTTL []redisTTLPending
+	// orphanTTLCount counts !redis|ttl| records whose user key has not
+	// been claimed by HandleString / HandleHLL. These are candidates
+	// for hashes/lists/sets/zsets/streams (handled in a follow-up PR)
+	// — for now Finalize logs the count via the warning hook rather
+	// than dropping silently. We deliberately track only the count
+	// (not the keys themselves) because the keys are unused before
+	// the wide-column encoders land; buffering full keys would
+	// allocate proportional to user-key size (up to 1 MiB per key),
+	// and the warning sink only ever reads len(). Codex P2 round 6.
+	orphanTTLCount int
+
+	// dirsCreated caches the per-encoder directories writeBlob and
+	// appendTTL have already MkdirAll'd. Avoids the per-record syscalls
+	// flagged by Gemini #218; for a 10M-key dump this saves ~10M
+	// stat+mkdir(EEXIST) round-trips.
+	dirsCreated map[string]struct{}
+
+	// inlineTTLEmitted tracks string keys whose TTL was already
+	// extracted from the inline magic-prefix header by HandleString and
+	// written to strings_ttl.jsonl. The live Redis encoder emits BOTH
+	// `!redis|str|<k>` (with inline TTL) and `!redis|ttl|<k>` (the
+	// scan-index entry the sweeper consumes) for an expiring string
+	// (see adapter/redis_lua_context.go stringCommitElems). Without
+	// this set, HandleTTL would route the redundant `!redis|ttl|`
+	// record back into the same sidecar, duplicating the entry and
+	// violating the one-record-per-key contract sidecar consumers
+	// rely on. Codex P1 round 5.
+	inlineTTLEmitted map[string]struct{}
 
 	// warn is the structured-warning sink. Non-nil in production
 	// (fed by the decoder driver); nil in tests if the test does not
 	// care about warnings.
 	warn func(event string, fields ...any)
+
+	// keymap / keymapFile / keymapDir are lazily set on the first
+	// SHA-fallback (or other non-reversible) encoded segment. Without
+	// these records, the decoder cannot recover the original Redis
+	// user key from a fallback-encoded `*.bin` filename or from an
+	// `appendTTL` JSONL row keyed by the encoded form. Codex P1
+	// round 7. KeymapWriter.Close only flushes its bufio buffer, so
+	// the *os.File is tracked separately to be closed at Finalize.
+	keymap     *KeymapWriter
+	keymapFile *os.File
+	keymapDir  string
 }
 
-type redisTTLPending struct {
-	UserKey    []byte
-	ExpireAtMs uint64
-}
-
-// NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/. The
-// caller is responsible for choosing <n>; today only 0 is meaningful.
-func NewRedisDB(outRoot string) *RedisDB {
+// NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
+// dbIndex selects <n>; today the producer always passes 0, but accepting
+// the index as a parameter prevents a future multi-db dump from silently
+// colliding on db_0.
+func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
+	if dbIndex < 0 {
+		dbIndex = 0
+	}
 	return &RedisDB{
-		outRoot:   outRoot,
-		kindByKey: make(map[string]redisKeyKind),
+		outRoot:          outRoot,
+		dbIndex:          dbIndex,
+		kindByKey:        make(map[string]redisKeyKind),
+		dirsCreated:      make(map[string]struct{}),
+		inlineTTLEmitted: make(map[string]struct{}),
 	}
 }
 
@@ -151,6 +189,10 @@ func (r *RedisDB) HandleString(userKey, value []byte) error {
 	if expireAtMs == 0 {
 		return nil
 	}
+	// Mark the key as already emitted inline so HandleTTL can drop the
+	// redundant !redis|ttl| scan-index record; otherwise the same
+	// expiring string would be written to strings_ttl.jsonl twice.
+	r.inlineTTLEmitted[string(userKey)] = struct{}{}
 	return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 }
 
@@ -169,8 +211,8 @@ func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 //   - redisKindHLL    -> hll_ttl.jsonl
 //   - redisKindString -> strings_ttl.jsonl (legacy strings, whose TTL
 //     lives in !redis|ttl| rather than the inline magic-prefix header)
-//   - redisKindUnknown -> buffered as pendingWideColumnTTL; reported via
-//     the warn sink on Finalize because Phase 0a's wide-column encoders
+//   - redisKindUnknown -> counted in orphanTTLCount; reported via the
+//     warn sink on Finalize because Phase 0a's wide-column encoders
 //     have not landed yet.
 func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	expireAtMs, err := decodeRedisTTLValue(value)
@@ -181,12 +223,22 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	case redisKindHLL:
 		return r.appendTTL(&r.hllTTL, redisHLLTTLFile, userKey, expireAtMs)
 	case redisKindString:
+		// New-format strings carry TTL inline in the magic-prefix
+		// header; HandleString already wrote the entry to
+		// strings_ttl.jsonl. The `!redis|ttl|` scan-index record
+		// the sweeper consumes is redundant for backup output. Only
+		// legacy strings (no inline TTL) reach the appendTTL call.
+		// Codex P1 round 5.
+		if _, ok := r.inlineTTLEmitted[string(userKey)]; ok {
+			return nil
+		}
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
 	case redisKindUnknown:
-		r.pendingWideColumnTTL = append(r.pendingWideColumnTTL, redisTTLPending{
-			UserKey:    bytes.Clone(userKey),
-			ExpireAtMs: expireAtMs,
-		})
+		// Track orphan TTL counts only — keys are unused before the
+		// wide-column encoders land, and buffering them allocates
+		// proportional to user-key size (up to 1 MiB per key) for
+		// no benefit. Codex P2 round 6.
+		r.orphanTTLCount++
 		return nil
 	}
 	return nil
@@ -204,19 +256,147 @@ func (r *RedisDB) Finalize() error {
 	if err := closeJSONL(r.hllTTL); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if r.warn != nil && len(r.pendingWideColumnTTL) > 0 {
+	if err := r.closeKeymap(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
-			"count", len(r.pendingWideColumnTTL),
+			"count", r.orphanTTLCount,
 			"hint", "wide-column type encoders (hash/list/set/zset/stream) have not landed yet")
 	}
 	return firstErr
 }
 
-func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
-	encoded := EncodeSegment(userKey)
-	dir := filepath.Join(r.outRoot, "redis", "db_0", subdir)
+// dbDir returns the per-encoder root, e.g. "<outRoot>/redis/db_0/".
+// Computed once per call rather than at construction so the encoder's
+// outRoot remains a plain field — easier to reason about in tests.
+func (r *RedisDB) dbDir() string {
+	return filepath.Join(r.outRoot, "redis", redisDBSegment(r.dbIndex))
+}
+
+func redisDBSegment(idx int) string {
+	if idx < 0 {
+		idx = 0
+	}
+	return "db_" + intToDecimal(idx)
+}
+
+// intToDecimal is a tiny zero-allocation helper for non-negative ints.
+// Avoids the strconv import here just to format dbIndex.
+func intToDecimal(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	const maxIntDecimalDigits = 20 // covers MaxInt64
+	var buf [maxIntDecimalDigits]byte
+	pos := len(buf)
+	for v > 0 {
+		pos--
+		buf[pos] = '0' + byte(v%10) //nolint:mnd // 10 == decimal radix
+		v /= 10                     //nolint:mnd // 10 == decimal radix
+	}
+	return string(buf[pos:])
+}
+
+// ensureDir runs MkdirAll once per directory and remembers the result
+// in r.dirsCreated, so repeated calls on the hot path (one per blob
+// record) collapse to one syscall instead of N. The
+// `assertNoSymlinkAncestors` check, however, runs on EVERY call —
+// not just the first — because a directory that was safe at first
+// write can later be replaced with a symlink and subsequent writes
+// would bypass the check, reintroducing the path-escape vector
+// (Codex P1 round 13 follow-up). The cache only short-circuits
+// MkdirAll, not the security check.
+//
+// This guard is best-effort against TOCTOU (an adversary that can
+// swap a directory for a symlink between this check and the open
+// races us either way); it closes the much more common case of a
+// stale symlink left in the output tree from a prior run or
+// configuration mistake. Hardening to fully race-free traversal
+// would require os.Root / openat-style traversal, which is a
+// larger refactor for marginal benefit at this layer.
+func (r *RedisDB) ensureDir(dir string) error {
+	// Always re-run the ancestor check; never skip on cache hit.
+	if err := assertNoSymlinkAncestors(r.outRoot, dir); err != nil {
+		return err
+	}
+	if _, ok := r.dirsCreated[dir]; ok {
+		return nil
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return cockroachdberr.WithStack(err)
+	}
+	r.dirsCreated[dir] = struct{}{}
+	return nil
+}
+
+// assertNoSymlinkAncestors walks every path component from rootDir up
+// to (and including) target, Lstat'ing each. Returns ErrSymlinkInPath
+// if any component is a symbolic link. rootDir itself is also
+// Lstat'd: if the dump root is a symlink to somewhere else, all bets
+// are off.
+func assertNoSymlinkAncestors(rootDir, target string) error {
+	cleanRoot := filepath.Clean(rootDir)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil {
+		return cockroachdberr.WithStack(err)
+	}
+	// Defensive: if target escapes rootDir (which the callers' path
+	// construction already prevents), refuse rather than silently
+	// validate an unrelated path.
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return cockroachdberr.WithStack(cockroachdberr.Newf(
+			"backup: target %s escapes root %s", target, rootDir))
+	}
+	if err := lstatRefuseSymlink(cleanRoot); err != nil {
+		return err
+	}
+	cur := cleanRoot
+	if rel == "." {
+		return nil
+	}
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if seg == "" {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		if err := lstatRefuseSymlink(cur); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// lstatRefuseSymlink returns an error wrapped over the underlying
+// stat call when path is a symbolic link. A non-existent path is
+// treated as fine: the caller has just MkdirAll'd it, so a missing
+// component is impossible — but if it were, the symlink-check
+// contract is "if it exists, it must not be a symlink", and we
+// return nil rather than synthesize a false positive.
+func lstatRefuseSymlink(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return cockroachdberr.WithStack(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return cockroachdberr.WithStack(cockroachdberr.Newf(
+			"backup: refusing to traverse symlinked ancestor at %s", path))
+	}
+	return nil
+}
+
+func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
+	encoded := EncodeSegment(userKey)
+	if err := r.recordIfFallback(encoded, userKey); err != nil {
+		return err
+	}
+	dir := filepath.Join(r.dbDir(), subdir)
+	if err := r.ensureDir(dir); err != nil {
+		return err
 	}
 	path := filepath.Join(dir, encoded+".bin")
 	if err := writeFileAtomic(path, value); err != nil {
@@ -227,23 +407,86 @@ func (r *RedisDB) writeBlob(subdir string, userKey, value []byte) error {
 
 func (r *RedisDB) appendTTL(slot **jsonlFile, baseName string, userKey []byte, expireAtMs uint64) error {
 	if *slot == nil {
-		f, err := openJSONL(filepath.Join(r.outRoot, "redis", "db_0", baseName))
+		// Route the parent directory through ensureDir so the
+		// shared assertNoSymlinkAncestors guard fires before we
+		// open the sidecar. openJSONL alone only protects the
+		// final path element via openSidecarFile; without this
+		// a symlinked ancestor (e.g.
+		// `<outRoot>/redis/db_0 -> /tmp/outside`) would still
+		// redirect strings_ttl.jsonl / hll_ttl.jsonl writes
+		// outside the dump root. Codex P1 round 13 (PR #713).
+		dir := r.dbDir()
+		if err := r.ensureDir(dir); err != nil {
+			return err
+		}
+		f, err := openJSONL(filepath.Join(dir, baseName))
 		if err != nil {
 			return err
 		}
 		*slot = f
 	}
+	encoded := EncodeSegment(userKey)
+	if err := r.recordIfFallback(encoded, userKey); err != nil {
+		return err
+	}
 	rec := struct {
 		Key        string `json:"key"`
 		ExpireAtMs uint64 `json:"expire_at_ms"`
 	}{
-		Key:        EncodeSegment(userKey),
+		Key:        encoded,
 		ExpireAtMs: expireAtMs,
 	}
 	if err := (*slot).enc.Encode(rec); err != nil {
 		return cockroachdberr.WithStack(err)
 	}
 	return nil
+}
+
+// recordIfFallback writes a KEYMAP.jsonl entry when EncodeSegment took
+// the SHA-fallback path for userKey. Without this, the encoded
+// filename / JSONL key is non-reversible and the decoder cannot
+// recover the original Redis user key bytes. The keymap writer is
+// lazily opened on first use; an empty KEYMAP file is removed at
+// Finalize so dumps without any fallback keys carry no spurious file.
+// Idempotent: a duplicate (encoded, original) pair is harmless because
+// LoadKeymap's "last record wins" behaviour leaves the same mapping.
+func (r *RedisDB) recordIfFallback(encoded string, userKey []byte) error {
+	if !IsShaFallback(encoded) {
+		return nil
+	}
+	if r.keymap == nil {
+		dir := r.dbDir()
+		if err := r.ensureDir(dir); err != nil {
+			return err
+		}
+		f, err := openSidecarFile(filepath.Join(dir, "KEYMAP.jsonl"))
+		if err != nil {
+			return err
+		}
+		r.keymap = NewKeymapWriter(f)
+		r.keymapFile = f
+		r.keymapDir = dir
+	}
+	return r.keymap.WriteOriginal(encoded, userKey, KindSHAFallback)
+}
+
+// closeKeymap flushes and closes the per-encoder KEYMAP.jsonl writer
+// if it was opened. When no SHA-fallback records were emitted the
+// file is removed so dumps without any non-reversible keys carry no
+// spurious empty file (matches the s3 encoder's keymap policy).
+func (r *RedisDB) closeKeymap() error {
+	if r.keymap == nil {
+		return nil
+	}
+	flushErr := r.keymap.Close()
+	closeErr := r.keymapFile.Close()
+	if flushErr == nil && closeErr != nil {
+		flushErr = cockroachdberr.WithStack(closeErr)
+	}
+	if r.keymap.Count() == 0 && r.keymapDir != "" {
+		_ = os.Remove(filepath.Join(r.keymapDir, "KEYMAP.jsonl"))
+	}
+	return flushErr
 }
 
 // decodeRedisStringValue strips the redis-string magic-prefix TTL header
@@ -302,9 +545,16 @@ func openJSONL(path string) (*jsonlFile, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return nil, cockroachdberr.WithStack(err)
 	}
-	f, err := os.Create(path) //nolint:gosec // path is composed from output-root + fixed file name
+	// openSidecarFile encapsulates the per-platform symlink-refusal
+	// strategy: Linux/macOS/BSD use O_NOFOLLOW so the open syscall
+	// itself returns ELOOP atomically (no TOCTOU window); Windows
+	// uses Lstat-then-OpenFile, accepting the residual race because
+	// mounting a successful attack on the dump tree there already
+	// requires write access plus SeCreateSymbolicLinkPrivilege.
+	// Codex P1 round 6 (atomic open) + P2 round 7 (Windows build).
+	f, err := openSidecarFile(path)
 	if err != nil {
-		return nil, cockroachdberr.WithStack(err)
+		return nil, err
 	}
 	bw := bufio.NewWriterSize(f, redisJSONLBufSize)
 	enc := json.NewEncoder(bw)
@@ -369,15 +619,30 @@ func HasInlineTTL(value []byte) bool {
 	return value[2]&redisStrHasTTL != 0
 }
 
-// IsBlobAtomicWriteRetriable reports whether err from writeFileAtomic is
-// a retriable I/O failure (no-space, transient FS error). Today this is a
-// stub that returns false for any error; exposed so the master decoder
-// loop can decide whether to abort the whole dump on encountering one.
+// IsBlobAtomicWriteRetriable reports whether err from writeFileAtomic
+// is a retriable I/O failure. Today the only retriable signal is
+// io.ErrShortWrite. ENOSPC (disk full) is intentionally NOT retriable
+// here — the master pipeline must surface it to the operator rather
+// than spin: a backup against a full disk has no business retrying.
+// IsBlobAtomicWriteOutOfSpace is the explicit out-of-space probe so
+// the pipeline can choose the right alarm wording.
 func IsBlobAtomicWriteRetriable(err error) bool {
 	if err == nil {
 		return false
 	}
-	// errors.Is handles wrapped paths; both sentinel checks are stable
-	// for now because we never wrap them ourselves.
 	return errors.Is(err, io.ErrShortWrite)
+}
+
+// IsBlobAtomicWriteOutOfSpace reports whether err from writeFileAtomic
+// (or any os.File write the master pipeline issues) was driven by a
+// full disk. The platform-specific error codes (POSIX ENOSPC vs.
+// Windows ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL) live in
+// disk_full_{unix,windows}.go so retry/alarm logic in callers
+// classifies disk-full uniformly across operating systems
+// (Codex P2 round 9).
+func IsBlobAtomicWriteOutOfSpace(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isDiskFullError(err)
 }

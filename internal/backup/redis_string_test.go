@@ -2,11 +2,14 @@ package backup
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -19,7 +22,7 @@ const fixedExpireMs uint64 = 1788_998_400_000
 func newRedisDB(t *testing.T) (*RedisDB, string) {
 	t.Helper()
 	root := t.TempDir()
-	return NewRedisDB(root), root
+	return NewRedisDB(root, 0), root
 }
 
 func encodeNewStringValue(t *testing.T, value []byte, expireAtMs uint64) []byte {
@@ -171,6 +174,205 @@ func assertTTLSidecar(t *testing.T, path string, wantKey string, wantMs uint64) 
 	}
 }
 
+// TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex is the regression
+// for Codex P1 round 5: the live Redis encoder emits both `!redis|str|<k>`
+// (with TTL embedded inline in the magic-prefix header) and the scan-index
+// `!redis|ttl|<k>` for every expiring string. The backup decoder must
+// recognise that HandleString already wrote the strings_ttl.jsonl record
+// and drop the redundant !redis|ttl| record. Otherwise the same expiring
+// string is duplicated in the sidecar, breaking the one-record-per-key
+// contract.
+func TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	mustNoErr := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Snapshot lex order: !redis|str|<k> comes before !redis|ttl|<k>
+	// (because 's' < 't'). Mirror that sequence here.
+	mustNoErr(db.HandleString([]byte("expiring"), encodeNewStringValue(t, []byte("v"), fixedExpireMs)))
+	mustNoErr(db.HandleTTL([]byte("expiring"), encodeTTLValue(fixedExpireMs)))
+	mustNoErr(db.Finalize())
+	assertTTLSidecar(t, filepath.Join(root, "redis", "db_0", "strings_ttl.jsonl"), "expiring", fixedExpireMs)
+}
+
+// TestRedisDB_EnsureDirRevalidatesAfterCachedSuccess is the regression
+// for Codex P1 round 13 follow-up (PR #713 review #11): ensureDir's
+// dirsCreated cache used to skip assertNoSymlinkAncestors on cache
+// hits, so a directory that was safe on the first write could be
+// swapped to a symlink between writes and subsequent HandleString
+// calls would silently traverse it, redirecting blobs outside
+// outRoot. The cache now short-circuits only MkdirAll; the ancestor
+// check runs on every call.
+func TestRedisDB_EnsureDirRevalidatesAfterCachedSuccess(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	bait := filepath.Join(root, "bait-tree")
+	if err := os.MkdirAll(bait, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db := NewRedisDB(root, 0)
+	// First write seeds dirsCreated for <root>/redis/db_0/strings.
+	if err := db.HandleString([]byte("k1"), encodeNewStringValue(t, []byte("v1"), 0)); err != nil {
+		t.Fatalf("first HandleString: %v", err)
+	}
+	// Adversary swaps the cached real dir for a symlink to outside
+	// outRoot. Without re-validation, the next write would follow
+	// it and land in <bait>/.
+	stringsDir := filepath.Join(root, "redis", "db_0", "strings")
+	if err := os.RemoveAll(stringsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bait, stringsDir); err != nil {
+		t.Fatal(err)
+	}
+	err := db.HandleString([]byte("k2"), encodeNewStringValue(t, []byte("v2"), 0))
+	if err == nil || !strings.Contains(err.Error(), "refusing to traverse symlinked ancestor") {
+		t.Fatalf("expected post-cache symlink refusal, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(bait, "k2.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("blob written through swapped-in symlink: stat err=%v", statErr)
+	}
+}
+
+// TestRedisDB_RefusesSymlinkedAncestorOnTTLSidecar is the regression
+// for Codex P1 round 13 (PR #713): writeBlob already routed through
+// ensureDir/assertNoSymlinkAncestors, but TTL sidecars (appendTTL ->
+// openJSONL) bypassed that guard because openJSONL only protected
+// the final path element via openSidecarFile. A symlinked ancestor
+// like `<outRoot>/redis/db_0 -> /tmp/outside` would then redirect
+// strings_ttl.jsonl writes outside the dump root. appendTTL now
+// calls ensureDir on the parent directory before opening the
+// sidecar.
+func TestRedisDB_RefusesSymlinkedAncestorOnTTLSidecar(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	bait := filepath.Join(root, "bait-tree")
+	if err := os.MkdirAll(bait, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "redis")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Symlink `<outRoot>/redis/db_0` to a directory outside the
+	// dump root. Without the ancestor guard, the first appendTTL
+	// would happily write strings_ttl.jsonl into <bait>/.
+	if err := os.Symlink(bait, filepath.Join(parent, "db_0")); err != nil {
+		t.Fatal(err)
+	}
+	db := NewRedisDB(root, 0)
+	// HandleString with a TTL-bearing value drives appendTTL.
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), fixedExpireMs))
+	if err == nil || !strings.Contains(err.Error(), "refusing to traverse symlinked ancestor") {
+		t.Fatalf("expected symlinked-ancestor refusal, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(bait, "strings_ttl.jsonl")); !os.IsNotExist(statErr) {
+		t.Fatalf("TTL sidecar written through ancestor symlink: stat err=%v", statErr)
+	}
+}
+
+// TestRedisDB_RefusesSymlinkedAncestor is the regression for Codex P1
+// round 9: O_NOFOLLOW only blocks the final-component symlink. A
+// pre-existing directory symlink anywhere up the path (e.g.
+// `<outRoot>/redis/db_0/strings -> /tmp/outside`) lets MkdirAll
+// silently honor it and steers writeFileAtomic / openSidecarFile
+// outside outRoot. ensureDir now Lstat-walks each ancestor under
+// outRoot and refuses if any is a symlink.
+func TestRedisDB_RefusesSymlinkedAncestor(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	// Pre-place the symlink trap before constructing the encoder so
+	// the directory tree contains a poisoned ancestor at
+	// <root>/redis/db_0/strings.
+	bait := filepath.Join(root, "bait-tree")
+	if err := os.MkdirAll(bait, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "redis", "db_0")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bait, filepath.Join(parent, "strings")); err != nil {
+		t.Fatal(err)
+	}
+	db := NewRedisDB(root, 0)
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), 0))
+	if err == nil || !strings.Contains(err.Error(), "refusing to traverse symlinked ancestor") {
+		t.Fatalf("expected symlinked-ancestor refusal, got %v", err)
+	}
+	// The symlink target must be untouched: no `k.bin` written.
+	if _, statErr := os.Stat(filepath.Join(bait, "k.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("blob written through ancestor symlink: stat err=%v", statErr)
+	}
+}
+
+// TestRedisDB_OpenJSONLRefusesHardLinkClobber is the regression for
+// Codex P2 round 9: O_NOFOLLOW only blocks symlinks; an adversary
+// who can write the output directory could pre-create
+// strings_ttl.jsonl as a hard link to a file outside the dump tree
+// (e.g. /etc/passwd) and the open's O_TRUNC would clobber that
+// inode. openSidecarFile now opens WITHOUT O_TRUNC, fstat()s the
+// descriptor, refuses if Nlink > 1, and only calls Truncate(0) on
+// the verified-single-link case.
+func TestRedisDB_OpenJSONLRefusesHardLinkClobber(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	dir := filepath.Join(root, "redis", "db_0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bait := filepath.Join(root, "bait-hardlink")
+	if err := os.WriteFile(bait, []byte("stay-out"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(bait, filepath.Join(dir, redisStringsTTLFile)); err != nil {
+		t.Fatal(err)
+	}
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), fixedExpireMs))
+	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite hard-linked file") {
+		t.Fatalf("expected hard-link refusal error from openSidecarFile, got %v", err)
+	}
+	if got, _ := os.ReadFile(bait); string(got) != "stay-out" { //nolint:gosec // test path
+		t.Fatalf("bait file written through hard link: %q", got)
+	}
+}
+
+// TestRedisDB_OpenJSONLRefusesSymlinkOverwrite is the regression for Codex
+// P2 round 5 + P1 round 6: openJSONL must atomically refuse to follow
+// symlinks. The earlier Lstat-then-Create variant left a TOCTOU window
+// where a process that could write the output directory could swap the
+// path to a symlink between the two syscalls; the round-6 fix uses
+// O_NOFOLLOW on the open itself so the kernel returns ELOOP atomically.
+func TestRedisDB_OpenJSONLRefusesSymlinkOverwrite(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	dir := filepath.Join(root, "redis", "db_0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bait := filepath.Join(root, "bait-jsonl")
+	if err := os.WriteFile(bait, []byte("stay-out"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bait, filepath.Join(dir, redisStringsTTLFile)); err != nil {
+		t.Fatal(err)
+	}
+	// HandleString with TTL triggers the first openJSONL on
+	// strings_ttl.jsonl, which must refuse the symlink rather than
+	// truncate the bait target.
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), fixedExpireMs))
+	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite symlink") {
+		t.Fatalf("expected symlink-refusal error from openJSONL, got %v", err)
+	}
+	if got, _ := os.ReadFile(bait); string(got) != "stay-out" { //nolint:gosec // test path
+		t.Fatalf("bait file written through symlink: %q", got)
+	}
+}
+
 func TestRedisDB_HandleTTL_RoutesByPriorTypeObservation(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
@@ -277,6 +479,169 @@ func TestRedisDB_AtomicWriteRefusesSymlinkOverwrite(t *testing.T) {
 	if got, _ := os.ReadFile(bait); string(got) != "stay-out" { //nolint:gosec // test path
 		t.Fatalf("bait file written through symlink: %q", got)
 	}
+}
+
+func TestRedisDB_PerDBIndexRoutesIntoOwnDirectory(t *testing.T) {
+	t.Parallel()
+	// Two encoders with the same outRoot but different db indices
+	// must not collide. The previous hardcoded "db_0" path would
+	// have routed both to the same blob file.
+	root := t.TempDir()
+	db0 := NewRedisDB(root, 0)
+	db3 := NewRedisDB(root, 3)
+	if err := db0.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v0"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db3.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v3"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db0.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db3.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBlob(t, filepath.Join(root, "redis", "db_0", "strings", "k.bin")); string(got) != "v0" {
+		t.Fatalf("db_0 blob = %q want %q", got, "v0")
+	}
+	if got := readBlob(t, filepath.Join(root, "redis", "db_3", "strings", "k.bin")); string(got) != "v3" {
+		t.Fatalf("db_3 blob = %q want %q", got, "v3")
+	}
+}
+
+// TestRedisDB_SHAFallbackKeymapped is the regression for Codex P1
+// round 7: when a Redis user key is long enough that EncodeSegment
+// takes its SHA-fallback path, the encoder must record a KEYMAP.jsonl
+// entry for it. Otherwise the encoded `*.bin` filename and the JSONL
+// TTL row's `key` are non-reversible and the original Redis user key
+// bytes are irrecoverable from a backup.
+func TestRedisDB_SHAFallbackKeymapped(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	// Drive a key whose length forces the fallback. EncodeSegment's
+	// length cap is 240 bytes; pad past it with characters that
+	// would percent-encode to 3× their length so we cannot
+	// accidentally fit even with all-unreserved bytes.
+	longKey := bytes.Repeat([]byte{'%'}, 300)
+	encoded := EncodeSegment(longKey)
+	if !IsShaFallback(encoded) {
+		t.Fatalf("test premise broken: encoded %q is not a SHA fallback", encoded)
+	}
+	if err := db.HandleString(longKey, encodeNewStringValue(t, []byte("v"), fixedExpireMs)); err != nil {
+		t.Fatalf("HandleString: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	keymapPath := filepath.Join(root, "redis", "db_0", "KEYMAP.jsonl")
+	f, err := os.Open(keymapPath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatalf("KEYMAP.jsonl missing for SHA-fallback key: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	got, err := LoadKeymap(f)
+	if err != nil {
+		t.Fatalf("LoadKeymap: %v", err)
+	}
+	rec, ok := got[encoded]
+	if !ok {
+		t.Fatalf("no keymap record for encoded %q; have %v", encoded, got)
+	}
+	if rec.Kind != KindSHAFallback {
+		t.Fatalf("kind = %q, want %q", rec.Kind, KindSHAFallback)
+	}
+	orig, err := rec.Original()
+	if err != nil {
+		t.Fatalf("Original: %v", err)
+	}
+	if !bytes.Equal(orig, longKey) {
+		t.Fatalf("Original mismatch: len got=%d want=%d", len(orig), len(longKey))
+	}
+}
+
+// TestRedisDB_NoKeymapWhenAllReversible asserts the converse: a dump
+// with only short keys produces no KEYMAP.jsonl. The empty-file
+// removal in closeKeymap matches the s3 encoder's policy.
+func TestRedisDB_NoKeymapWhenAllReversible(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleString([]byte("short"), encodeNewStringValue(t, []byte("v"), 0)); err != nil {
+		t.Fatalf("HandleString: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	keymapPath := filepath.Join(root, "redis", "db_0", "KEYMAP.jsonl")
+	if _, err := os.Stat(keymapPath); !os.IsNotExist(err) {
+		t.Fatalf("KEYMAP.jsonl present without any fallback keys: stat err=%v", err)
+	}
+}
+
+func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
+	t.Parallel()
+	// Codex P2 round 6: orphan TTL records (those with no prior
+	// HandleString/HandleHLL claim) must be counted only — the
+	// per-key payload would allocate proportional to user-key size
+	// and is unused before the wide-column encoders land. Drive a
+	// sample of orphan records and assert the count, not a buffer.
+	db, _ := newRedisDB(t)
+	const n = 10_000
+	for i := 0; i < n; i++ {
+		key := []byte("orphan-" + intToDecimal(i))
+		ms := uint64(i) + 1 //nolint:gosec // i bounded to n, never negative
+		if err := db.HandleTTL(key, encodeTTLValue(ms)); err != nil {
+			t.Fatalf("HandleTTL[%d]: %v", i, err)
+		}
+	}
+	if db.orphanTTLCount != n {
+		t.Fatalf("orphanTTLCount = %d, want %d", db.orphanTTLCount, n)
+	}
+}
+
+func TestRedisDB_DirsCreatedCachesMkdirAll(t *testing.T) {
+	t.Parallel()
+	// Two HandleString calls in a row should populate dirsCreated
+	// once for the strings/ subdir and skip MkdirAll on the second
+	// call. Black-box: assert the dirsCreated map contains the
+	// strings/ entry exactly once after two writes.
+	db, _ := newRedisDB(t)
+	if err := db.HandleString([]byte("a"), encodeNewStringValue(t, []byte("v"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleString([]byte("b"), encodeNewStringValue(t, []byte("v"), 0)); err != nil {
+		t.Fatal(err)
+	}
+	wantSubstr := filepath.Join("redis", "db_0", "strings")
+	count := 0
+	for k := range db.dirsCreated {
+		if strings.Contains(k, wantSubstr) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("strings/ dir entries = %d want 1; map=%v", count, db.dirsCreated)
+	}
+}
+
+func TestRedisDB_IsBlobAtomicWriteOutOfSpace(t *testing.T) {
+	t.Parallel()
+	if !IsBlobAtomicWriteOutOfSpace(syscall.ENOSPC) {
+		t.Fatalf("ENOSPC must be reported as out-of-space")
+	}
+	if !IsBlobAtomicWriteOutOfSpace(cockroachdbErrorsWrap(syscall.ENOSPC)) {
+		t.Fatalf("wrapped ENOSPC must round-trip via errors.Is")
+	}
+	if IsBlobAtomicWriteOutOfSpace(io.ErrShortWrite) {
+		t.Fatalf("ErrShortWrite must NOT be reported as out-of-space")
+	}
+	// Conversely IsBlobAtomicWriteRetriable must NOT report ENOSPC.
+	if IsBlobAtomicWriteRetriable(syscall.ENOSPC) {
+		t.Fatalf("ENOSPC must NOT be retriable")
+	}
+}
+
+func cockroachdbErrorsWrap(err error) error {
+	return errors.Join(errors.New("wrapped"), err)
 }
 
 func TestRedisDB_HasInlineTTL(t *testing.T) {
