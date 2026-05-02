@@ -584,6 +584,37 @@ func TestS3_StalePartVersionExcludedFromAssembledBody(t *testing.T) {
 	}
 }
 
+// TestS3_FlushBucketRejectsDotSegmentBucketName is the regression for
+// Codex P1 round 13 (originally surfaced on PR #716's merged-in
+// s3.go): HandleBlob's dot-segment guard runs at the SCRATCH path,
+// but the per-bucket FINAL output path went through
+// `filepath.Join(s.outRoot, "s3", EncodeSegment(b.name))` without
+// validating the bucket name. EncodeSegment preserves `.` and
+// `..`, so a crafted !s3|bucket|meta record with name="." would
+// drop `_bucket.json` directly under `<outRoot>/s3/` (instead of a
+// per-bucket subdir), and ".." would escape the s3/ subtree
+// entirely. flushBucket now rejects sole-dot and empty bucket
+// names before the join.
+func TestS3_FlushBucketRejectsDotSegmentBucketName(t *testing.T) {
+	t.Parallel()
+	cases := []string{".", "..", ""}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			enc, _ := newS3Encoder(t)
+			if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(name), encodeS3BucketMetaValue(t, map[string]any{
+				"bucket_name": name, "generation": uint64(1),
+			})); err != nil {
+				t.Fatal(err)
+			}
+			err := enc.Finalize()
+			if !errors.Is(err, ErrS3MalformedKey) {
+				t.Fatalf("err=%v want ErrS3MalformedKey for bucket name %q", err, name)
+			}
+		})
+	}
+}
+
 // TestS3_HandleBlobRejectsScratchEscape is the regression for Codex
 // P1 round 11: HandleBlob composed scratch paths with EncodeSegment,
 // which preserves `.` and `..` (RFC3986 unreserved). A bucket or

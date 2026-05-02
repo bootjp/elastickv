@@ -531,6 +531,20 @@ func (s *S3Encoder) Finalize() error {
 }
 
 func (s *S3Encoder) flushBucket(b *s3BucketState) error {
+	// Reject bucket-name dot segments before the filesystem join.
+	// `EncodeSegment(".") == "."` and `EncodeSegment("..") == ".."`
+	// (both are RFC3986-unreserved), so without this guard a
+	// crafted bucket meta record with name="." or ".." would let
+	// `filepath.Join` collapse `<outRoot>/s3/.` back to
+	// `<outRoot>/s3` or resolve `<outRoot>/s3/..` up to outRoot
+	// itself — `_bucket.json` would land outside the s3/ subtree
+	// and clobber dump-root files. Codex P1 round 13 (PR #716,
+	// finding originally surfaced on the merged-in s3.go).
+	switch b.name {
+	case ".", "..", "":
+		return errors.Wrapf(ErrS3MalformedKey,
+			"bucket name %q is empty or a dot segment (would escape s3/ subtree)", b.name)
+	}
 	bucketDir := filepath.Join(s.outRoot, "s3", EncodeSegment([]byte(b.name)))
 	if err := os.MkdirAll(bucketDir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return errors.WithStack(err)
