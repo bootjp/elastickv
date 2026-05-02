@@ -1012,7 +1012,22 @@ func filterChunksForManifest(m map[s3ChunkKey]string, manifestUploadID string, d
 			continue
 		}
 		if declaredParts != nil {
-			if _, ok := declaredParts[s3PartKey{partNo: k.partNo, partVersion: k.partVersion}]; !ok {
+			declared, ok := declaredParts[s3PartKey{partNo: k.partNo, partVersion: k.partVersion}]
+			if !ok {
+				continue
+			}
+			// Symmetric with verifyChunkCompleteness's
+			// `want.chunkCount == 0 → skip` branch: a
+			// manifest part declaring zero chunks must not
+			// contribute any bytes to the assembled body,
+			// even if stray chunks for that (partNo,
+			// partVersion) exist on disk. Without this
+			// filter the assembler would silently merge those
+			// stray chunks while the completeness check
+			// passed, producing a body that violates the
+			// declared-part contract. CodeRabbit Major round
+			// 13 (PR #716).
+			if declared.chunkCount == 0 {
 				continue
 			}
 		}

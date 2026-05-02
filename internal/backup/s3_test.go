@@ -881,6 +881,58 @@ func readBytesFile(t *testing.T, path string) []byte {
 	return b
 }
 
+// TestS3_ZeroChunkCountPartIgnoresStrayChunks is the regression for
+// CodeRabbit Major round 13 (PR #716): verifyChunkCompleteness skips
+// parts with `want.chunkCount == 0`, but filterChunksForManifest used
+// to include any chunks recorded for those parts in the assembled
+// body. The asymmetry let stray chunks for a manifest-declared
+// zero-count part bleed into the body while the completeness check
+// passed. filterChunksForManifest now also skips chunks whose
+// declared part has chunkCount == 0, so the assembled body
+// faithfully reflects the manifest contract.
+func TestS3_ZeroChunkCountPartIgnoresStrayChunks(t *testing.T) {
+	t.Parallel()
+	enc, root := newS3Encoder(t)
+	bucket := "b"
+	gen := uint64(1)
+	object := "obj"
+	uploadID := "u"
+	if err := enc.HandleBucketMeta(s3keys.BucketMetaKey(bucket), encodeS3BucketMetaValue(t, map[string]any{
+		"bucket_name": bucket, "generation": gen,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// Manifest declares two parts: part 1 with one chunk (the real
+	// content), and part 2 with chunk_count=0 (a logically-empty
+	// part). A stray chunk for part 2 must not contribute to the
+	// body — the manifest says that part has zero chunks.
+	if err := enc.HandleObjectManifest(s3keys.ObjectManifestKey(bucket, gen, object), encodeS3ManifestValue(t, map[string]any{
+		"upload_id": uploadID, "size_bytes": 5, "parts": []map[string]any{
+			{"part_no": 1, "size_bytes": 5, "chunk_count": 1},
+			{"part_no": 2, "size_bytes": 0, "chunk_count": 0},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 1, 0), []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	// Stray chunk for the zero-declared part 2 — must be filtered out.
+	if err := enc.HandleBlob(s3keys.BlobKey(bucket, gen, object, uploadID, 2, 0), []byte("STRAY")); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "s3", bucket, object)) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("body=%q want %q (stray chunk for zero-count part leaked into body)", got, "hello")
+	}
+}
+
 // TestS3_DuplicateChunksWithMissingIndexRejected is the regression
 // for Codex P1 round 12: the previous count-and-maxIndex check
 // admitted false positives. For declared chunk_count=3, observed
