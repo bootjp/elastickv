@@ -88,6 +88,20 @@ type KeyVizRow struct {
 	RouteCount        uint64   `json:"route_count"`
 	Values            []uint64 `json:"values"`
 	Conflict          bool     `json:"conflict,omitempty"`
+	// RaftGroupIDs[j] and LeaderTerms[j] carry the route's Raft
+	// identity at the time column j was flushed (parallel to
+	// Values[]). Phase 2-C+ fan-out uses
+	// (bucket_id, raft_group_id, leader_term, column) as the
+	// dedupe key. Per-cell representation is required because
+	// leadership can flip within the requested window; row-level
+	// scalars would only capture the first column's identity and
+	// cause incorrect dedupe for later columns (Gemini HIGH on
+	// PR #720). Zero values mean "term not tracked" — the
+	// aggregator falls back to the legacy max-merge for those
+	// cells. The slices are either nil (legacy server, no
+	// per-column identity to share) or len == len(Values).
+	RaftGroupIDs []uint64 `json:"raft_group_ids,omitempty"`
+	LeaderTerms  []uint64 `json:"leader_terms,omitempty"`
 	// total accumulates the sum of Values during pivot so the
 	// rowBudget sort is O(N log N) on a precomputed key rather
 	// than O(N log N × M) recomputing the sum per comparison.
@@ -322,6 +336,13 @@ func pivotKeyVizColumns(cols []keyviz.MatrixColumn, series KeyVizSeries, rowBudg
 			}
 			v := pick(mr)
 			row.Values[j] = v
+			// Per-cell Raft identity stamped from this column's
+			// MatrixRow. Each MatrixRow is emitted by Flush() with
+			// the term snapshot taken at that flush moment, so the
+			// j-th column's identity may differ from j-1 if a leader
+			// term flipped between flushes (Gemini HIGH on PR #720).
+			row.RaftGroupIDs[j] = mr.RaftGroupID
+			row.LeaderTerms[j] = mr.LeaderTerm
 			row.total += v
 		}
 	}
@@ -373,6 +394,11 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *KeyVizRow {
 		RouteCount:        total,
 		RouteIDsTruncated: mr.Aggregate && total > uint64(len(mr.MemberRoutes)),
 		Values:            make([]uint64, numCols),
+		// Per-cell parallel arrays — populated in the column-loop
+		// above, not here, because the first MatrixRow seen for a
+		// route only carries that one column's identity.
+		RaftGroupIDs: make([]uint64, numCols),
+		LeaderTerms:  make([]uint64, numCols),
 	}
 	if mr.Aggregate {
 		row.RouteIDs = append([]uint64(nil), mr.MemberRoutes...)

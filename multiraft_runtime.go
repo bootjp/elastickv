@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
@@ -14,12 +15,36 @@ import (
 )
 
 type raftGroupRuntime struct {
-	spec   groupSpec
-	engine raftengine.Engine
-	store  store.MVCCStore
+	spec groupSpec
+	// engineMu guards engine to allow concurrent readers
+	// (specifically the keyviz leader-term publisher goroutine that
+	// runs on a ticker independent of startup ordering) to coexist
+	// with Close() which clears the field on shutdown. Direct field
+	// reads from the startup path remain safe because they execute
+	// single-threaded before any goroutine is launched; long-lived
+	// goroutines that read after startup must go through
+	// snapshotEngine() (Codex P2 on PR #720).
+	engineMu sync.RWMutex
+	engine   raftengine.Engine
+
+	store store.MVCCStore
 
 	registerTransport func(grpc.ServiceRegistrar)
 	closeFactory      func() error // releases factory-created resources (transport, stores)
+}
+
+// snapshotEngine returns the current engine reference under engineMu.
+// Long-lived goroutines that may run while Close() executes (the
+// keyviz leader-term publisher; future racy readers as they're
+// migrated) MUST go through this accessor instead of reading the
+// engine field directly. nil-receiver-safe.
+func (r *raftGroupRuntime) snapshotEngine() raftengine.Engine {
+	if r == nil {
+		return nil
+	}
+	r.engineMu.RLock()
+	defer r.engineMu.RUnlock()
+	return r.engine
 }
 
 const raftEngineMarkerPerm = 0o600
@@ -50,11 +75,14 @@ func (r *raftGroupRuntime) Close() {
 	if r == nil {
 		return
 	}
-	if r.engine != nil {
-		if err := r.engine.Close(); err != nil {
+	r.engineMu.Lock()
+	engine := r.engine
+	r.engine = nil
+	r.engineMu.Unlock()
+	if engine != nil {
+		if err := engine.Close(); err != nil {
 			slog.Warn("failed to close raft engine", "error", err)
 		}
-		r.engine = nil
 	}
 	if r.closeFactory != nil {
 		if err := r.closeFactory(); err != nil {

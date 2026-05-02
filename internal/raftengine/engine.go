@@ -195,6 +195,29 @@ type Admin interface {
 	RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 	TransferLeadership(ctx context.Context) error
 	TransferLeadershipToServer(ctx context.Context, id string, address string) error
+	// RegisterLeaderAcquiredCallback registers fn to fire every
+	// time the local node's Raft state transitions INTO leader
+	// (initial election, re-election, transfer target completion).
+	// Callbacks fire on the previous!=Leader → status==Leader edge
+	// AFTER the engine has published isLeader, so a callback that
+	// calls engine.State() observes StateLeader.
+	//
+	// Use case: per-shard policy hooks that need to audit a
+	// freshly-acquired leadership ("am I still allowed to be
+	// leader of this group?"). The SQS HT-FIFO leadership-refusal
+	// hook (§8 of the split-queue FIFO design) hangs off this to
+	// TransferLeadership when the binary lacks the htfifo
+	// capability but a partitioned queue is mapped to this Raft
+	// group.
+	//
+	// Same non-blocking + panic-contained contract as
+	// LeaseProvider.RegisterLeaderLossCallback. A callback that
+	// needs to do real work (enumerate the catalog, call
+	// TransferLeadership) MUST offload to a goroutine.
+	//
+	// The returned function deregisters this specific registration
+	// and is safe to call multiple times.
+	RegisterLeaderAcquiredCallback(fn func()) (deregister func())
 }
 
 type Engine interface {

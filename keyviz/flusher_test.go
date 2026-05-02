@@ -9,7 +9,7 @@ import (
 func TestRunFlusherTicksUntilCancel(t *testing.T) {
 	t.Parallel()
 	s := NewMemSampler(MemSamplerOptions{Step: 5 * time.Millisecond, HistoryColumns: 16})
-	if !s.RegisterRoute(1, []byte("a"), []byte("b")) {
+	if !s.RegisterRoute(1, []byte("a"), []byte("b"), 0) {
 		t.Fatal("Register failed")
 	}
 	ctx, cancel := context.WithCancel(context.Background())

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -42,6 +43,85 @@ const (
 	sqsHealthPath       = "/sqs_health"
 	sqsLeaderHealthPath = "/sqs_leader_health"
 )
+
+// sqsCapabilityHTFIFO is the capability string a binary advertises on
+// /sqs_health (when Accept: application/json) once it has the runtime
+// pieces required to safely host a partitioned FIFO queue: the routing
+// layer is wired through --sqsFifoPartitionMap (see main.go), and the
+// leadership-refusal hook in kv refuses leadership for an SQS Raft
+// group that hosts a partitioned queue when the binary itself does
+// not advertise this string.
+//
+// CreateQueue's catalog-polling gate (Phase 3.D PR 5 lifts the
+// dormancy and starts checking) reads this list off /sqs_health on
+// every peer; a CreateQueue with PartitionCount > 1 is rejected
+// unless every peer reports "htfifo" — fail-closed against rolling
+// upgrades that have not yet finished.
+const sqsCapabilityHTFIFO = "htfifo"
+
+// htfifoCapabilityAdvertised gates whether this binary lists
+// "htfifo" on /sqs_health. The §11 PR 4 contract requires BOTH
+// the routing-layer wiring AND the leadership-refusal safeguard
+// from §8 to be in place before this flag is true:
+//
+//   - Routing wiring: kv.PartitionResolver +
+//     adapter.SQSPartitionResolver, merged via #715 (Phase 3.D
+//     PR 4-B-2). Partition-resolver-first dispatch in ShardRouter
+//     routes (queue, partition) keys to the operator-chosen Raft
+//     group; coordinator helpers (groupForKey,
+//     routeAndGroupForKey, groupMutations) consult the resolver
+//     before falling through to the byte-range engine; OCC read
+//     keys fail closed for recognised-but-unresolved partitioned
+//     keys.
+//   - Capability poller: PollSQSHTFIFOCapability, merged via
+//     #721 (Phase 3.D PR 4-B-3a). PR 5 will use this for the
+//     CreateQueue capability gate.
+//   - Leadership-refusal hook:
+//     raftengine.RegisterLeaderAcquiredCallback +
+//     main_sqs_leadership_refusal.go (Phase 3.D PR 4-B-3b, this
+//     PR). On startup AND on every leader-acquired transition,
+//     the hook refuses leadership of any Raft group hosting a
+//     partitioned queue when the binary lacks htfifo.
+//
+// Both pieces are now in the binary, so the flag flips to true.
+// PR 5 lifts the PartitionCount > 1 dormancy gate AND wires the
+// CreateQueue capability poll in the same commit, at which point
+// a partitioned queue can land in production and every node in
+// the cluster must report htfifo for the gate to allow it.
+//
+// Stays a const (not a var) because the flag is build-time. A
+// future runtime override (env var, --no-htfifo flag for
+// graceful degradation) would reroute through
+// adapter.AdvertisesHTFIFO() without changing the call sites.
+const htfifoCapabilityAdvertised = true
+
+// sqsAdvertisedCapabilities returns the capability list emitted on
+// /sqs_health (JSON mode). Stable iteration order is significant —
+// catalog peers may diff capability lists across nodes when checking
+// rollout uniformity, so the list is built deterministically. The
+// returned slice is freshly allocated per call so the caller may
+// mutate it without aliasing the package-level state.
+func sqsAdvertisedCapabilities() []string {
+	caps := make([]string, 0, 1)
+	if htfifoCapabilityAdvertised {
+		caps = append(caps, sqsCapabilityHTFIFO)
+	}
+	return caps
+}
+
+// AdvertisesHTFIFO reports whether this binary's /sqs_health
+// endpoint lists the htfifo capability. Mirror of the package-
+// internal htfifoCapabilityAdvertised constant, exposed for the
+// SQS leadership-refusal hook in main.go that uses this signal
+// to decide whether to refuse leadership of any Raft group hosting
+// a partitioned FIFO queue.
+//
+// Stays a function (not an exported constant) so a future runtime
+// override (env var, --no-htfifo flag for graceful degradation)
+// can be threaded through here without changing the call site.
+func AdvertisesHTFIFO() bool {
+	return htfifoCapabilityAdvertised
+}
 
 const (
 	sqsHealthMaxRequestBodyBytes = 1024
@@ -251,7 +331,68 @@ func serveSQSHealthz(w http.ResponseWriter, r *http.Request) {
 	if !writeSQSHealthMethod(w, r) {
 		return
 	}
+	if clientAcceptsSQSHealthJSON(r) {
+		writeSQSHealthJSONBody(w, r, http.StatusOK, sqsHealthBody{
+			Status:       "ok",
+			Capabilities: sqsAdvertisedCapabilities(),
+		})
+		return
+	}
 	writeSQSHealthBody(w, r, http.StatusOK, "ok\n")
+}
+
+// sqsHealthBody is the JSON shape returned by /sqs_health when the
+// caller passes Accept: application/json. Stable across binary
+// versions — catalog peers diff this body during the CreateQueue
+// gate (Phase 3.D PR 5).
+type sqsHealthBody struct {
+	Status       string   `json:"status"`
+	Capabilities []string `json:"capabilities"`
+}
+
+// clientAcceptsSQSHealthJSON reports whether the caller signalled
+// JSON in the Accept header. Treat the absence of an Accept header
+// (and a bare "*/*" wildcard) as the legacy "ok\n" client to keep
+// the existing health-check integrations (curl, k8s liveness probes)
+// byte-identical.
+//
+// A substring check for "application/json" is sufficient — q-factor
+// and parameter parsing would be overkill for a health endpoint, and
+// any JSON-aware client passes the literal token in a comma-separated
+// list. False matches against media types like "application/jsonseq"
+// are accepted: a client that explicitly types out a JSON-adjacent
+// media type is opting in to the JSON shape on purpose.
+func clientAcceptsSQSHealthJSON(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	for _, raw := range r.Header.Values("Accept") {
+		if raw == "" || raw == "*/*" {
+			continue
+		}
+		if strings.Contains(raw, "application/json") {
+			return true
+		}
+	}
+	return false
+}
+
+func writeSQSHealthJSONBody(w http.ResponseWriter, r *http.Request, statusCode int, body sqsHealthBody) {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		// json.Marshal of a fixed shape with a string + []string
+		// cannot realistically fail; fall back to the legacy text
+		// path so a misconfigured client still gets a 200.
+		writeSQSHealthBody(w, r, statusCode, "ok\n")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(statusCode)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(encoded)
+	_, _ = io.WriteString(w, "\n")
 }
 
 func (s *SQSServer) serveSQSLeaderHealthz(w http.ResponseWriter, r *http.Request) {

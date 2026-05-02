@@ -467,7 +467,7 @@ func (s *SQSServer) deleteMessageBatch(w http.ResponseWriter, r *http.Request) {
 		// retry-bound stale-is-success delete that single DeleteMessage
 		// uses. Per-entry isolation matches AWS, where a malformed
 		// handle in slot 3 must not poison slot 4.
-		handle, decodeErr := decodeReceiptHandle(entry.ReceiptHandle)
+		handle, decodeErr := decodeClientReceiptHandle(entry.ReceiptHandle)
 		if decodeErr != nil {
 			failed = append(failed, sqsBatchResultErrorEntry{
 				Id:          entry.Id,
@@ -567,7 +567,7 @@ func (s *SQSServer) applyChangeVisibilityBatchEntry(ctx context.Context, queueNa
 			SenderFault: true,
 		}
 	}
-	handle, decodeErr := decodeReceiptHandle(entry.ReceiptHandle)
+	handle, decodeErr := decodeClientReceiptHandle(entry.ReceiptHandle)
 	if decodeErr != nil {
 		return false, sqsBatchResultErrorEntry{
 			Id:          entry.Id,
