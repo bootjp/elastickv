@@ -273,3 +273,48 @@ func TestGetKeyVizMatrixHonorsRowsBudget(t *testing.T) {
 	require.Equal(t, "route:2", resp.Rows[0].BucketId)
 	require.Equal(t, "route:4", resp.Rows[1].BucketId)
 }
+
+// TestGetKeyVizMatrixStampsRaftIdentity pins the Phase 2-C+ per-cell
+// wire extension: MatrixRow.RaftGroupID and MatrixRow.LeaderTerm
+// propagate per-column through matrixToProto into the proto
+// KeyVizRow's raft_group_ids (field 13) and leader_terms (field 14)
+// parallel-to-values arrays. The fan-out aggregator's per-cell
+// dedupe key requires per-column identity (Gemini HIGH on PR #720
+// — row-level scalars only captured the first column's identity
+// and broke dedupe under mid-window leader flips).
+func TestGetKeyVizMatrixStampsRaftIdentity(t *testing.T) {
+	t.Parallel()
+	t0 := time.Unix(1_700_000_000, 0)
+	t1 := t0.Add(time.Minute)
+	srv := newAdminServerWithFakeSampler(t, []keyviz.MatrixColumn{
+		{
+			At: t0,
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 5, RaftGroupID: 7, LeaderTerm: 42},
+				{RouteID: 2, Start: []byte("b"), End: []byte("c"), Writes: 9, RaftGroupID: 0, LeaderTerm: 0},
+			},
+		},
+		// col 1: term flipped on route 1 mid-window; route 2 absent.
+		{
+			At: t1,
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 11, RaftGroupID: 7, LeaderTerm: 43},
+			},
+		},
+	})
+
+	resp, err := srv.GetKeyVizMatrix(context.Background(), &pb.GetKeyVizMatrixRequest{
+		Series: pb.KeyVizSeries_KEYVIZ_SERIES_WRITES,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Rows, 2)
+	// route:1 — per-cell identity captures the term flip.
+	require.Equal(t, "route:1", resp.Rows[0].BucketId)
+	require.Equal(t, []uint64{7, 7}, resp.Rows[0].RaftGroupIds, "raft_group_ids must be parallel to values")
+	require.Equal(t, []uint64{42, 43}, resp.Rows[0].LeaderTerms,
+		"leader_terms must capture per-column term so the aggregator can dedupe across the flip")
+	// route:2 — present only in col0; col1 zero is the "term not tracked" sentinel.
+	require.Equal(t, "route:2", resp.Rows[1].BucketId)
+	require.Equal(t, []uint64{0, 0}, resp.Rows[1].RaftGroupIds)
+	require.Equal(t, []uint64{0, 0}, resp.Rows[1].LeaderTerms)
+}

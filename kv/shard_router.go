@@ -10,6 +10,41 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// PartitionResolver maps a key to its owning Raft group when the
+// key belongs to a partition-scheme keyspace (e.g. SQS HT-FIFO,
+// where each (queue, partition) pair lives on a different group).
+// ShardRouter consults the resolver before falling through to the
+// byte-range engine, so partition routing can override the default
+// shard-range layout without breaking the engine's non-overlapping-
+// cover invariant.
+//
+// Implementations must be safe for concurrent use — ResolveGroup is
+// called on the request hot path. Returning (0, false) for a key
+// the resolver does not recognise lets the router fall through to
+// the engine. Returning (0, false) for a key the resolver DOES
+// recognise (the partitioned shape matches but the queue is not
+// in the map, or the partition is out of range) is also valid;
+// the router uses RecognisesPartitionedKey to distinguish "not
+// partitioned, fall through" from "partitioned but unresolved,
+// fail closed".
+//
+// The fail-closed split matters under partition-map drift / a
+// partial rollout: without it, an unresolved partitioned key
+// would silently land on the engine's SQS-catalog default group
+// (because routeKey normalises every !sqs|... key to
+// !sqs|route|global) instead of surfacing a routing error.
+type PartitionResolver interface {
+	ResolveGroup(key []byte) (uint64, bool)
+
+	// RecognisesPartitionedKey reports whether the key SHAPE is
+	// one this resolver is responsible for. Implementations
+	// answer based on prefix / structural inspection only — the
+	// answer must NOT depend on any in-memory mapping that could
+	// drift out of sync, otherwise the router cannot reliably
+	// fail-closed for unresolved-but-recognised keys.
+	RecognisesPartitionedKey(key []byte) bool
+}
+
 // ShardRouter routes requests to multiple raft groups based on key ranges.
 //
 // Cross-shard transactions are not supported. They require distributed
@@ -17,9 +52,10 @@ import (
 //
 // Non-transactional request batches may still partially succeed across shards.
 type ShardRouter struct {
-	engine *distribution.Engine
-	mu     sync.RWMutex
-	groups map[uint64]*routerGroup
+	engine            *distribution.Engine
+	partitionResolver PartitionResolver
+	mu                sync.RWMutex
+	groups            map[uint64]*routerGroup
 }
 
 var ErrCrossShardTransactionNotSupported = errors.New("cross-shard transactions are not supported")
@@ -35,6 +71,78 @@ func NewShardRouter(e *distribution.Engine) *ShardRouter {
 		engine: e,
 		groups: make(map[uint64]*routerGroup),
 	}
+}
+
+// WithPartitionResolver installs a partition-keyspace resolver that
+// is consulted before the byte-range engine on every dispatch. A
+// nil resolver clears any previously-installed resolver. Returns
+// the receiver so callers can chain.
+//
+// Intended for use during startup, before the router begins handling
+// requests. Interface assignment in Go is not atomic, so a call that
+// races with a concurrent ResolveGroup in resolveGroup may produce a
+// torn read; callers must wire the resolver once during construction
+// (parseRuntimeConfig → NewShardedCoordinator → WithPartitionResolver)
+// and treat any post-startup re-assignment as undefined behaviour.
+func (s *ShardRouter) WithPartitionResolver(r PartitionResolver) *ShardRouter {
+	s.partitionResolver = r
+	return s
+}
+
+// ResolveGroup tries the partition resolver first (when installed),
+// then falls through to the byte-range engine. Exposed at package
+// scope so ShardedCoordinator's per-key helpers (groupForKey,
+// routeAndGroupForKey, engineGroupIDForKey, groupMutations) can
+// consult the same dispatch path Commit / Abort / Get use — without
+// it those helpers would bypass the resolver and partitioned-FIFO
+// traffic would silently mis-route through 2PC and the read paths.
+//
+// The resolver runs on the RAW key before any user-key
+// normalization. SQS keys in particular are collapsed to
+// !sqs|route|global by routeKey to keep the engine's per-shard
+// layout simple, but that collapse hides the partitioned-prefix
+// information the resolver needs (issue: codex P1 / gemini high on
+// PR #715). The engine still sees the post-normalization key, so
+// legacy routing (catalog → !sqs|route|global → default group)
+// stays unchanged.
+//
+// Fail-closed for recognised-but-unresolved keys: when the resolver
+// recognises a partitioned shape (RecognisesPartitionedKey == true)
+// but cannot resolve the queue/partition pair (ResolveGroup returns
+// ok=false), the router refuses to fall through to the engine.
+// Otherwise the engine would route the partitioned key to
+// !sqs|route|global's default group, silently mis-routing HT-FIFO
+// traffic during partition-map drift or partial rollout (codex P1
+// round 2 on PR #715).
+//
+// Returns (0, false) when neither the resolver nor the engine
+// recognises the key. Caller surfaces this as an "unknown group"
+// error so a partitioned-prefix key whose queue is missing from the
+// resolver map fails closed rather than landing on whichever
+// engine-default group happens to cover the raw bytes.
+func (s *ShardRouter) ResolveGroup(rawKey []byte) (uint64, bool) {
+	if s.partitionResolver != nil {
+		if gid, ok := s.partitionResolver.ResolveGroup(rawKey); ok {
+			return gid, true
+		}
+		if s.partitionResolver.RecognisesPartitionedKey(rawKey) {
+			// Partitioned shape, but the resolver cannot map it
+			// (unknown queue, out-of-range partition). Fail closed
+			// — the engine's catalog-level default route would
+			// silently misroute this through routeKey's
+			// !sqs|route|global collapse.
+			return 0, false
+		}
+	}
+	// Engine routes against the user-key view of the byte-range
+	// space; routeKey may rewrite SQS / DynamoDB / Redis-internal
+	// keys to a stable per-table or per-namespace route key so the
+	// engine sees one route per logical entity.
+	route, ok := s.engine.GetRoute(routeKey(rawKey))
+	if !ok {
+		return 0, false
+	}
+	return route.GroupID, true
 }
 
 // Register associates a raft group ID with its transactional manager and store.
@@ -123,28 +231,28 @@ func (s *ShardRouter) groupRequests(reqs []*pb.Request) (map[uint64][]*pb.Reques
 		if len(r.Mutations) == 0 || r.Mutations[0] == nil {
 			return nil, ErrInvalidRequest
 		}
-		key := routeKey(r.Mutations[0].Key)
-		if len(key) == 0 {
+		rawKey := r.Mutations[0].Key
+		if len(rawKey) == 0 {
 			return nil, ErrInvalidRequest
 		}
-		route, ok := s.engine.GetRoute(key)
+		gid, ok := s.ResolveGroup(rawKey)
 		if !ok {
-			return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
+			return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", rawKey)
 		}
-		batches[route.GroupID] = append(batches[route.GroupID], r)
+		batches[gid] = append(batches[gid], r)
 	}
 	return batches, nil
 }
 
 // Get retrieves a key routed to the correct shard.
 func (s *ShardRouter) Get(ctx context.Context, key []byte) ([]byte, error) {
-	route, ok := s.engine.GetRoute(routeKey(key))
+	gid, ok := s.ResolveGroup(key)
 	if !ok {
 		return nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
 	}
-	g, ok := s.getGroup(route.GroupID)
+	g, ok := s.getGroup(gid)
 	if !ok {
-		return nil, errors.Wrapf(ErrInvalidRequest, "unknown group %d", route.GroupID)
+		return nil, errors.Wrapf(ErrInvalidRequest, "unknown group %d", gid)
 	}
 	v, err := g.store.GetAt(ctx, key, ^uint64(0))
 	if err != nil {
