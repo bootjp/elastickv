@@ -320,11 +320,13 @@ func intToDecimal(v int) string {
 
 // ensureDir runs MkdirAll once per directory and remembers the result
 // in r.dirsCreated, so repeated calls on the hot path (one per blob
-// record) collapse to a map lookup. After MkdirAll succeeds, every
-// path component under outRoot is Lstat-checked: a pre-existing
-// directory symlink at e.g. `<outRoot>/redis/db_0/strings` would
-// otherwise let `os.MkdirAll` succeed without creating anything,
-// then steer subsequent writes outside outRoot. Codex P1 round 9.
+// record) collapse to one syscall instead of N. The
+// `assertNoSymlinkAncestors` check, however, runs on EVERY call —
+// not just the first — because a directory that was safe at first
+// write can later be replaced with a symlink and subsequent writes
+// would bypass the check, reintroducing the path-escape vector
+// (Codex P1 round 13 follow-up). The cache only short-circuits
+// MkdirAll, not the security check.
 //
 // This guard is best-effort against TOCTOU (an adversary that can
 // swap a directory for a symlink between this check and the open
@@ -334,14 +336,15 @@ func intToDecimal(v int) string {
 // would require os.Root / openat-style traversal, which is a
 // larger refactor for marginal benefit at this layer.
 func (r *RedisDB) ensureDir(dir string) error {
+	// Always re-run the ancestor check; never skip on cache hit.
+	if err := assertNoSymlinkAncestors(r.outRoot, dir); err != nil {
+		return err
+	}
 	if _, ok := r.dirsCreated[dir]; ok {
 		return nil
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return cockroachdberr.WithStack(err)
-	}
-	if err := assertNoSymlinkAncestors(r.outRoot, dir); err != nil {
-		return err
 	}
 	r.dirsCreated[dir] = struct{}{}
 	return nil
