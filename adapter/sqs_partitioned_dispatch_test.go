@@ -316,3 +316,43 @@ func TestSQSServer_PartitionedFIFO_PerQueueCollapsesToPartitionZero(t *testing.T
 	require.Len(t, collected, len(groups),
 		"perQueue receive must surface every message in one fanout pass over partition 0")
 }
+
+// TestStartPartitionOffset_RotatesByReadTS pins the regression for
+// the Codex P1 finding on PR #732: with a fixed starting partition
+// of 0, a sustained backlog on partition 0 fills opts.Max before
+// the fanout reaches partition 1, so messages in higher-index
+// partitions are never observed under load. The rotation helper
+// distributes consecutive readTS values across all partitions.
+func TestStartPartitionOffset_RotatesByReadTS(t *testing.T) {
+	t.Parallel()
+
+	// Legacy / non-partitioned / perQueue queues collapse to 0.
+	require.Equal(t, uint32(0), startPartitionOffset(0, 12345))
+	require.Equal(t, uint32(0), startPartitionOffset(1, 12345))
+
+	// Partitioned queues spread consecutive readTS values across
+	// every partition. HLC advances per receive call, so over
+	// consecutive readTS values every partition appears at least
+	// once as the starting point — without that, partition 0 would
+	// permanently win the fanout race under sustained backlog.
+	const partitions uint32 = 4
+	seen := make(map[uint32]int, partitions)
+	for ts := uint64(1); ts <= 64; ts++ {
+		seen[startPartitionOffset(partitions, ts)]++
+	}
+	require.Len(t, seen, int(partitions),
+		"rotation must cover every partition across consecutive readTS; got %v", seen)
+	for p := uint32(0); p < partitions; p++ {
+		require.NotZero(t, seen[p],
+			"partition %d never selected as fanout start; got distribution %v", p, seen)
+	}
+
+	// The output must always fall inside [0, partitions). Validates
+	// the mask-AND contract — partitions is power-of-two, so the
+	// AND with (partitions-1) is equivalent to modulo.
+	for ts := uint64(0); ts < 1024; ts++ {
+		off := startPartitionOffset(partitions, ts)
+		require.Less(t, off, partitions,
+			"offset %d out of range [0, %d) for ts=%d", off, partitions, ts)
+	}
+}

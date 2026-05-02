@@ -869,14 +869,27 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	// scanned sequentially so the wall-clock + opts.Max budgets are
 	// shared across the whole receive call instead of being
 	// multiplied by N.
+	//
+	// Rotate the starting partition by readTS so a sustained backlog
+	// on a single partition cannot permanently starve the others: a
+	// fixed start at 0 lets opts.Max fill from partition 0 on every
+	// call, so messages in higher-index partitions are never observed
+	// while the head queue stays hot. readTS is HLC-derived and
+	// advances per call, giving a uniform-enough rotation without
+	// any per-server state. FIFO ordering is unaffected because a
+	// MessageGroupId hashes to exactly one partition (partitionFor is
+	// deterministic), so cross-partition iteration order does not
+	// reorder messages within any group.
 	partitions := effectivePartitionCount(meta)
-	for partition := uint32(0); partition < partitions; partition++ {
+	startOffset := startPartitionOffset(partitions, readTS)
+	for i := uint32(0); i < partitions; i++ {
 		if len(delivered) >= opts.Max {
 			break
 		}
 		if time.Now().After(deadline) {
 			return delivered, nil
 		}
+		partition := (startOffset + i) % partitions
 		fresh, err := s.scanAndDeliverPartition(ctx, queueName, meta, partition, readTS, deadline, pageSize, sqsReceiveOptions{
 			Max:                   opts.Max - len(delivered),
 			VisibilityTimeout:     opts.VisibilityTimeout,
@@ -889,6 +902,35 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 		delivered = append(delivered, fresh...)
 	}
 	return delivered, nil
+}
+
+// startPartitionOffset rotates the receive-fanout starting partition
+// by readTS so a sustained backlog on a single partition cannot
+// starve the others. With a fixed start at 0, opts.Max would fill
+// from partition 0 on every call and messages in higher-index
+// partitions would never be observed while the head queue stays
+// hot — the regression Codex flagged as P1 on PR #732. readTS is
+// HLC-derived and advances per call, so consecutive Receives land
+// on different partitions without any per-server state.
+//
+// Returns 0 on legacy / non-partitioned queues (partitions <= 1).
+//
+// PartitionCount is power-of-two by the validator invariant
+// (htfifoValidatePartitionCount), so mask-AND is equivalent to
+// modulo. The byte-slice fold spreads entropy from both halves of
+// readTS (HLC physical-ms in the upper bits, logical counter in the
+// lower bits) into the final uint32 without an explicit uint64 →
+// uint32 narrowing — which gosec G115 would flag on a safe-by-
+// construction conversion. Mirrors the entirely-in-uint32 pattern
+// in partitionFor (sqs_partitioning.go).
+func startPartitionOffset(partitions uint32, readTS uint64) uint32 {
+	if partitions <= 1 {
+		return 0
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], readTS)
+	folded := binary.BigEndian.Uint32(buf[0:4]) ^ binary.BigEndian.Uint32(buf[4:8])
+	return folded & (partitions - 1)
 }
 
 // scanAndDeliverPartition pages the visibility index for one
