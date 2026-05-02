@@ -137,6 +137,18 @@ func (f *fakeEngine) TransferLeadership(context.Context) error {
 	return nil
 }
 
+func (f *fakeEngine) RegisterLeaderAcquiredCallback(fn func()) func() {
+	// raftadmin doesn't exercise the leader-acquired observer (PR
+	// 4-B-3b's SQS leadership-refusal hook lives in main_sqs_*).
+	// The stub satisfies the raftengine.Admin interface so the
+	// type-assertion in NewServer succeeds; without this method
+	// the assertion would silently fall back to admin=nil and every
+	// admin RPC would return Unimplemented (regression caught by
+	// TestServerMapsEngineAdminMethods after Phase 3.D PR 4-B-3b
+	// extended the Admin interface).
+	return func() {}
+}
+
 func (f *fakeEngine) TransferLeadershipToServer(_ context.Context, id string, address string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

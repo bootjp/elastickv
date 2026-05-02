@@ -498,3 +498,50 @@ func TestKeyVizHandlerSkipsFanoutForPeerCall(t *testing.T) {
 	require.Equal(t, 0, peerHits,
 		"recursion guard violated: handler dialled a peer despite X-Admin-Fanout-Peer being set")
 }
+
+// TestKeyVizHandlerStampsRaftIdentity pins the Phase 2-C+ per-cell
+// wire extension on the JSON path: MatrixRow.RaftGroupID and
+// MatrixRow.LeaderTerm propagate per-column through the pivot into
+// the JSON KeyVizRow's raft_group_ids[] and leader_terms[] arrays
+// (parallel to values[]). A row that appears in only some columns
+// reports zero (the documented "term not tracked" sentinel) for
+// the columns where it's absent.
+func TestKeyVizHandlerStampsRaftIdentity(t *testing.T) {
+	t.Parallel()
+	t0 := time.Unix(1_700_000_000, 0)
+	t1 := t0.Add(time.Minute)
+	srv := newKeyVizTestServer(t, &fakeKeyVizSource{cols: []keyviz.MatrixColumn{
+		{
+			At: t0,
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 5, RaftGroupID: 7, LeaderTerm: 42},
+				{RouteID: 2, Start: []byte("b"), End: []byte("c"), Writes: 9},
+			},
+		},
+		// col 1: route 1 still active (term flipped to 43); route 2 absent.
+		{
+			At: t1,
+			Rows: []keyviz.MatrixRow{
+				{RouteID: 1, Start: []byte("a"), End: []byte("b"), Writes: 11, RaftGroupID: 7, LeaderTerm: 43},
+			},
+		},
+	}})
+	defer srv.Close()
+
+	resp := keyVizGet(t, srv.URL)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var matrix KeyVizMatrix
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&matrix))
+	require.Len(t, matrix.Rows, 2)
+	r1, r2 := matrix.Rows[0], matrix.Rows[1]
+	require.Equal(t, "route:1", r1.BucketID)
+	// Per-cell: col0 was term 42, col1 was term 43 (mid-window flip).
+	require.Equal(t, []uint64{7, 7}, r1.RaftGroupIDs, "raft_group_ids must be parallel to values")
+	require.Equal(t, []uint64{42, 43}, r1.LeaderTerms,
+		"leader_terms must capture per-column term so the aggregator can dedupe across the flip")
+	// route:2 — present only in col0; col1 zero is the "term not tracked" sentinel.
+	require.Equal(t, "route:2", r2.BucketID)
+	require.Equal(t, []uint64{0, 0}, r2.RaftGroupIDs)
+	require.Equal(t, []uint64{0, 0}, r2.LeaderTerms)
+}

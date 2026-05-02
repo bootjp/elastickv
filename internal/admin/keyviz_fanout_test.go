@@ -70,6 +70,108 @@ func TestMergeKeyVizMatricesWritesMaxStableLeader(t *testing.T) {
 	require.False(t, merged.Rows[0].Conflict, "stable-leader merge must not raise conflict")
 }
 
+// TestMergeKeyVizMatricesPreservesRaftIdentity pins the Phase 2-C+
+// per-cell wire extension on the fan-out merge path: mergeRowInto
+// stamps the destination row's per-cell (RaftGroupIDs[idx],
+// LeaderTerms[idx]) from whichever source contributed the value
+// kept at that cell. Both sources reporting the same identity
+// for a writes-max merge is the steady-state shape — merged
+// identity matches regardless of source order. (Gemini HIGH on
+// PR #720 resolved by going per-cell; row-level scalars would
+// only capture the first column's identity and break the per-cell
+// dedupe goal.)
+func TestMergeKeyVizMatricesPreservesRaftIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{0}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{7}, merged.Rows[0].RaftGroupIDs, "RaftGroupIDs must survive mergeRowInto")
+	require.Equal(t, []uint64{42}, merged.Rows[0].LeaderTerms, "LeaderTerms must survive mergeRowInto")
+}
+
+// TestMergeKeyVizMatricesLegacyPeerWinnerResetsIdentity pins the
+// fail-closed semantic for mixed-version clusters (Codex P2
+// round-2): when a legacy peer that does not emit raft_group_ids /
+// leader_terms (empty slices) wins a cell, dst.RaftGroupIDs[idx]
+// and dst.LeaderTerms[idx] must be RESET to 0 (the documented
+// "term not tracked" sentinel) — leaving stale identity from a
+// previous higher-versioned source would mislabel an unknown-term
+// winning cell as a known term and break the per-cell
+// dedupe/summing in PR-3c.
+func TestMergeKeyVizMatricesLegacyPeerWinnerResetsIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	// Source 1 (modern): reports 30 with identity (group=7, term=42).
+	modern := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	// Source 2 (legacy): reports 50 with NO arrays (older server
+	// build). Wins maxMerge but cannot identify its term.
+	legacy := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{50}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{modern, legacy}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50}, merged.Rows[0].Values, "legacy peer's value wins maxMerge")
+	require.Equal(t, []uint64{0}, merged.Rows[0].RaftGroupIDs,
+		"legacy winner without metadata must reset dst identity to 0 sentinel — not inherit modern's 7")
+	require.Equal(t, []uint64{0}, merged.Rows[0].LeaderTerms,
+		"legacy winner without metadata must reset dst term to 0 sentinel — not inherit modern's 42")
+}
+
+// TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner pins the
+// Gemini MEDIUM fix: when maxMerge picks a value from one source,
+// the identity at that cell must come from the SAME source — not
+// from whoever happened to be processed first. Drives a leadership
+// flip across two consecutive columns with each leader winning
+// one cell.
+func TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	exLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50, 0}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	newLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{0, 80}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{43, 43}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{exLeader, newLeader}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50, 80}, merged.Rows[0].Values, "writes max-merge picks the larger per cell")
+	require.Equal(t, []uint64{7, 7}, merged.Rows[0].RaftGroupIDs, "groupID stays 7 across both cells")
+	require.Equal(t, []uint64{42, 43}, merged.Rows[0].LeaderTerms,
+		"col0's identity comes from exLeader (term 42, won 50 vs 0); col1's identity comes from newLeader (term 43, won 80 vs 0)")
+}
+
 // TestMergeKeyVizMatricesWritesMaxLeadershipFlip pins §4.2 under a
 // mid-window flip: two nodes report non-zero, disagreeing values
 // for the same cell. The merge keeps the larger value and raises

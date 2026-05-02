@@ -526,6 +526,13 @@ func mergeRowInto(
 			RouteIDsTruncated: row.RouteIDsTruncated,
 			RouteCount:        row.RouteCount,
 			Values:            make([]uint64, mergedWidth),
+			// Per-cell parallel arrays sized to the merged column
+			// width. Stamped per-cell in the loop below from the
+			// largest-source for that cell, so the identity always
+			// matches the value we kept (Gemini MEDIUM on PR #720
+			// resolved by going per-cell).
+			RaftGroupIDs: make([]uint64, mergedWidth),
+			LeaderTerms:  make([]uint64, mergedWidth),
 		}
 		rowsByBucket[row.BucketID] = dst
 		*bucketOrder = append(*bucketOrder, row.BucketID)
@@ -535,10 +542,41 @@ func mergeRowInto(
 		if !ok || j >= len(row.Values) {
 			continue
 		}
-		next, conflict := mergeFn(dst.Values[idx], row.Values[j])
+		prev := dst.Values[idx]
+		next, conflict := mergeFn(prev, row.Values[j])
 		dst.Values[idx] = next
 		if conflict {
 			dst.Conflict = true
+		}
+		// Identity belongs to the source whose value we kept. For
+		// sumMerge (reads) this is best-effort: prev+incoming has
+		// no single owner, so we keep whichever side contributed
+		// most recently — close-to-correct in the steady state.
+		// For maxMerge (writes), `next == row.Values[j]` exactly
+		// when the incoming source won the cell; in the tied
+		// (prev == incoming != 0) case `next == prev`, both sides
+		// agree on the value, and either identity is acceptable.
+		if next == row.Values[j] {
+			// Mixed-version cluster: a legacy peer that does not
+			// emit raft_group_ids / leader_terms sends empty
+			// slices. When such a peer's value wins the cell, we
+			// must EXPLICITLY RESET dst.RaftGroupIDs[idx] /
+			// dst.LeaderTerms[idx] to 0 (the documented "term not
+			// tracked" sentinel) — leaving stale identity from a
+			// previous higher-versioned source would mislabel an
+			// unknown-term winning cell as a known term and break
+			// the per-cell dedupe/summing in PR-3c. (Codex P2
+			// round-2 on PR #720.)
+			if j < len(row.RaftGroupIDs) {
+				dst.RaftGroupIDs[idx] = row.RaftGroupIDs[j]
+			} else {
+				dst.RaftGroupIDs[idx] = 0
+			}
+			if j < len(row.LeaderTerms) {
+				dst.LeaderTerms[idx] = row.LeaderTerms[j]
+			} else {
+				dst.LeaderTerms[idx] = 0
+			}
 		}
 	}
 }

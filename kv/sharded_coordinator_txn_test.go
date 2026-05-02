@@ -309,7 +309,9 @@ func TestGroupReadKeysByShardID_NilReturnsNil(t *testing.T) {
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
-	require.Nil(t, coord.groupReadKeysByShardID(nil))
+	grouped, err := coord.groupReadKeysByShardID(nil)
+	require.NoError(t, err)
+	require.Nil(t, grouped)
 }
 
 func TestGroupReadKeysByShardID_EmptyReturnsNil(t *testing.T) {
@@ -317,7 +319,9 @@ func TestGroupReadKeysByShardID_EmptyReturnsNil(t *testing.T) {
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
-	require.Nil(t, coord.groupReadKeysByShardID([][]byte{}))
+	grouped, err := coord.groupReadKeysByShardID([][]byte{})
+	require.NoError(t, err)
+	require.Nil(t, grouped)
 }
 
 func TestGroupReadKeysByShardID_GroupsByShardID(t *testing.T) {
@@ -327,11 +331,12 @@ func TestGroupReadKeysByShardID_GroupsByShardID(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}, 2: {}}, 1, NewHLC(), nil)
 
-	grouped := coord.groupReadKeysByShardID([][]byte{
+	grouped, err := coord.groupReadKeysByShardID([][]byte{
 		[]byte("b"), // shard 1
 		[]byte("c"), // shard 1
 		[]byte("x"), // shard 2
 	})
+	require.NoError(t, err)
 	require.Len(t, grouped, 2)
 	require.Len(t, grouped[1], 2)
 	require.Equal(t, []byte("b"), grouped[1][0])
@@ -340,20 +345,34 @@ func TestGroupReadKeysByShardID_GroupsByShardID(t *testing.T) {
 	require.Equal(t, []byte("x"), grouped[2][0])
 }
 
-func TestGroupReadKeysByShardID_SkipsUnroutableKeys(t *testing.T) {
+// TestGroupReadKeysByShardID_FailsClosedOnUnroutable pins the
+// codex round-2 P1 fix on PR #715: a read key the resolver cannot
+// route (recognised-but-unresolved partition key during drift, or
+// any key outside the engine's range cover) MUST surface as an
+// error so the transaction aborts before any prewrite. Silently
+// skipping unroutable keys would let OCC validation run with an
+// incomplete read set and break SSI — a concurrent write to that
+// key could commit alongside a stale read.
+//
+// This test was previously TestGroupReadKeysByShardID_SkipsUnroutableKeys
+// and pinned the BUGGY skip-silently behaviour. Renamed and rewritten
+// to pin the new fail-closed contract.
+func TestGroupReadKeysByShardID_FailsClosedOnUnroutable(t *testing.T) {
 	t.Parallel()
 	// Only route "a"-"m" to shard 1. Keys outside this range are unroutable.
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
 
-	grouped := coord.groupReadKeysByShardID([][]byte{
+	grouped, err := coord.groupReadKeysByShardID([][]byte{
 		[]byte("b"),   // routable → shard 1
-		[]byte("zzz"), // unroutable → skipped
+		[]byte("zzz"), // unroutable → MUST surface as error
 	})
-	require.Len(t, grouped, 1)
-	require.Len(t, grouped[1], 1)
-	require.Equal(t, []byte("b"), grouped[1][0])
+	require.Error(t, err,
+		"unroutable read key MUST fail closed — silently skipping "+
+			"would drop the key from OCC validation and break SSI")
+	require.Nil(t, grouped)
+	require.ErrorIs(t, err, ErrInvalidRequest)
 }
 
 // ---------------------------------------------------------------------------

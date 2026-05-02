@@ -825,16 +825,22 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 	return admin.ClusterInfoFunc(func(ctx context.Context) (admin.ClusterInfo, error) {
 		groups := make([]admin.GroupInfo, 0, len(runtimes))
 		for _, rt := range runtimes {
-			if rt == nil || rt.engine == nil {
+			// snapshotEngine takes engineMu.RLock so this
+			// HTTP/gRPC handler running on its own goroutine
+			// cannot race rt.Close() clearing the field on
+			// shutdown. Same race class as the keyviz
+			// leader-term publisher (Codex P2 on PR #720).
+			engine := rt.snapshotEngine()
+			if engine == nil {
 				continue
 			}
-			status := rt.engine.Status()
+			status := engine.Status()
 			// Seed as an empty-but-non-nil slice so a
 			// Configuration() failure still JSON-encodes as `[]`
 			// rather than `null`; API consumers that treat
 			// members as an always-array field rely on this.
 			members := []string{}
-			if cfg, err := rt.engine.Configuration(ctx); err == nil {
+			if cfg, err := engine.Configuration(ctx); err == nil {
 				members = make([]string, 0, len(cfg.Servers))
 				for _, srv := range cfg.Servers {
 					members = append(members, srv.ID)

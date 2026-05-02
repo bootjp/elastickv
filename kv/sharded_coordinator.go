@@ -171,6 +171,21 @@ func (c *ShardedCoordinator) WithSampler(s keyviz.Sampler) *ShardedCoordinator {
 	return c
 }
 
+// WithPartitionResolver wires a PartitionResolver onto the
+// coordinator's underlying ShardRouter. The resolver runs before
+// the byte-range engine on every dispatch, so partition-keyspace
+// schemes (e.g. SQS HT-FIFO) can override the default shard layout
+// without breaking the engine's non-overlapping-cover invariant.
+//
+// Applied after construction for the same reason as the other
+// With* options on this type — NewShardedCoordinator is already
+// heavily overloaded. Passing a nil resolver clears any previously-
+// installed resolver.
+func (c *ShardedCoordinator) WithPartitionResolver(r PartitionResolver) *ShardedCoordinator {
+	c.router.WithPartitionResolver(r)
+	return c
+}
+
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
@@ -380,7 +395,13 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 
 	// Multi-shard path: group read keys by shard now. The result is passed
 	// directly to prewriteTxn to avoid a second iteration inside that function.
-	groupedReadKeys := c.groupReadKeysByShardID(readKeys)
+	// A routing failure here aborts the transaction before any prewrite —
+	// silently dropping unresolvable read keys would let OCC validation run
+	// with an incomplete read set and break SSI.
+	groupedReadKeys, err := c.groupReadKeysByShardID(readKeys)
+	if err != nil {
+		return nil, err
+	}
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys)
 	if err != nil {
 		return nil, err
@@ -830,11 +851,11 @@ func (c *ShardedCoordinator) Clock() *HLC {
 }
 
 func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return nil, false
 	}
-	g, ok := c.groups[route.GroupID]
+	g, ok := c.groups[gid]
 	return g, ok
 }
 
@@ -844,39 +865,70 @@ func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
 // Leadership-only callers (IsLeaderForKey / VerifyLeaderForKey /
 // RaftLeaderForKey) keep using groupForKey because they don't need
 // the route ID.
+//
+// The gid comes from the partition-aware router (resolver-first,
+// engine-fallback) so partitioned-FIFO traffic lands on the
+// operator-chosen group. RouteID is read from the engine on the
+// normalized key; the resolver does not have a notion of catalog
+// RouteID, so partition-resolved keys observe under the engine's
+// catalog RouteID for !sqs|route|global. Partition-aware keyviz
+// is a Phase 3.D follow-up.
 func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGroup, bool) {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return 0, nil, false
 	}
-	g, ok := c.groups[route.GroupID]
+	g, ok := c.groups[gid]
 	if !ok {
 		return 0, nil, false
 	}
-	return route.RouteID, g, true
+	var routeID uint64
+	if route, found := c.engine.GetRoute(routeKey(key)); found {
+		routeID = route.RouteID
+	}
+	return routeID, g, true
 }
 
 func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return 0
 	}
-	return route.GroupID
+	return gid
 }
 
-func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint64][][]byte {
+// groupReadKeysByShardID groups txn read keys by their owning Raft
+// group. Returns an error when ANY read key cannot be routed —
+// silently skipping unresolvable keys would let a transaction
+// commit with an incomplete OCC read-set, which breaks SSI under
+// the §5 ShardRouter resolver-first dispatch (codex round-2 P1 on
+// PR #715).
+//
+// The fail-closed semantic the resolver gained in PR 4-B-2 makes
+// this path matter: a partitioned-shape read key whose queue is
+// missing from --sqsFifoPartitionMap (drift / partial rollout)
+// returns gid=0 from c.router.ResolveGroup. If we silently dropped
+// those keys, the prewrite Raft entry would carry an empty
+// ReadKeys slice for that key, the FSM's read-write conflict
+// validation would never see it, and a concurrent write could
+// commit alongside a stale read. Surface the routing failure as
+// an error so the transaction aborts before any FSM apply.
+func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint64][][]byte, error) {
 	if len(readKeys) == 0 {
-		return nil
+		return nil, nil
 	}
 	grouped := make(map[uint64][][]byte)
 	for _, key := range readKeys {
-		gid := c.engineGroupIDForKey(key)
-		if gid == 0 {
-			continue
+		gid, ok := c.router.ResolveGroup(key)
+		if !ok || gid == 0 {
+			return nil, errors.Wrapf(ErrInvalidRequest,
+				"no route for txn read key %q — recognised-but-"+
+					"unresolved partition keys must fail closed to "+
+					"preserve OCC read-set integrity", key)
 		}
 		grouped[gid] = append(grouped[gid], key)
 	}
-	return grouped
+	return grouped, nil
 }
 
 // validateReadOnlyShards checks read-write conflicts on shards that have
@@ -1037,12 +1089,19 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 			return nil, nil, ErrInvalidRequest
 		}
 		mut := elemToMutation(req)
-		route, ok := c.engine.GetRoute(routeKey(mut.Key))
+		gid, ok := c.router.ResolveGroup(mut.Key)
 		if !ok {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 		}
-		c.observeMutation(route.RouteID, mut)
-		grouped[route.GroupID] = append(grouped[route.GroupID], mut)
+		// Engine RouteID for keyviz observation; partition-resolved
+		// keys observe under the !sqs|route|global RouteID until
+		// partition-aware keyviz lands.
+		var routeID uint64
+		if route, found := c.engine.GetRoute(routeKey(mut.Key)); found {
+			routeID = route.RouteID
+		}
+		c.observeMutation(routeID, mut)
+		grouped[gid] = append(grouped[gid], mut)
 	}
 	gids := make([]uint64, 0, len(grouped))
 	for gid := range grouped {

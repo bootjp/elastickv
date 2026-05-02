@@ -318,7 +318,22 @@ func run() error {
 	sampler := buildKeyVizSampler()
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
-		WithSampler(keyVizSamplerForCoordinator(sampler))
+		WithSampler(keyVizSamplerForCoordinator(sampler)).
+		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
+
+	// SQS HT-FIFO §8 leadership-refusal: install per-group
+	// observers that step the local node down via
+	// TransferLeadership when it acquires (or already holds)
+	// leadership of a Raft group hosting a partitioned FIFO
+	// queue while the binary lacks the htfifo capability. The
+	// composite deregister flows through cleanup; it's a no-op
+	// when no group hosts a partitioned queue or when the
+	// binary advertises htfifo (the steady-state production
+	// case post-PR-4-B-3b).
+	leadershipRefusalDeregister := installSQSLeadershipRefusalAcrossGroups(
+		ctx, runtimes, cfg.sqsFifoPartitionMap,
+		sqsAdvertisesHTFIFO(), slog.Default())
+	cleanup.Add(leadershipRefusalDeregister)
 	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
 	if err != nil {
 		return err
@@ -335,6 +350,7 @@ func run() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
 	})
 	startKeyVizFlusher(runCtx, eg, sampler)
+	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
 	startMemoryWatchdog(runCtx, eg, cancel)
 	distServer := adapter.NewDistributionServer(
 		cfg.engine,
@@ -475,6 +491,65 @@ func buildLeaderS3(groups []groupSpec, s3Addr string, raftS3Map string) (map[str
 
 func buildLeaderSQS(groups []groupSpec, sqsAddr string, raftSqsMap string) (map[string]string, error) {
 	return buildLeaderAddrMap(groups, sqsAddr, raftSqsMap, parseRaftSQSMap)
+}
+
+// buildSQSPartitionResolver flattens the operator-supplied partition
+// map into the {queue → []groupID} shape adapter consumes and
+// returns a ResolveGroup-capable resolver. Returns nil on an empty
+// map so the coordinator's resolver field stays unset on a non-
+// partitioned cluster — kv.ShardRouter.WithPartitionResolver(nil)
+// is a documented no-op, so the request hot path keeps the existing
+// engine-only dispatch.
+//
+// Return type is the kv.PartitionResolver interface, NOT the
+// concrete *adapter.SQSPartitionResolver, because Go wraps a typed
+// nil pointer into a NON-NIL interface value when the function
+// signature is the concrete type. With a concrete return type, a
+// non-partitioned cluster would carry a non-nil interface whose
+// underlying pointer is nil, the resolver-first short-circuit
+// `s.partitionResolver != nil` would always pass, and every request
+// would pay an extra ResolveGroup call (which the nil-receiver
+// guard makes safe but not free). The interface return type makes
+// the untyped `nil` propagate as a true nil interface.
+//
+// The group-reference parsing here cannot fail in practice because
+// parseSQSFifoGroupList already canonicalized each entry as a
+// uint64 string at flag-parse time; the conversion is repeated
+// defensively so a future caller that bypasses parseSQSFifoGroupList
+// (e.g. a test seeding the map programmatically) gets a clear panic
+// instead of a silent route-to-group-zero.
+func buildSQSPartitionResolver(partitionMap map[string]sqsFifoQueueRouting) kv.PartitionResolver {
+	if len(partitionMap) == 0 {
+		return nil
+	}
+	flat := make(map[string][]uint64, len(partitionMap))
+	for queue, routing := range partitionMap {
+		ids := make([]uint64, 0, len(routing.groups))
+		for _, groupRef := range routing.groups {
+			id, err := strconv.ParseUint(groupRef, 10, 64)
+			if err != nil {
+				// parseSQSFifoGroupList canonicalized this; a
+				// non-uint64 string here means a programmer skipped
+				// the validator. Panic loudly rather than silently
+				// route to group 0.
+				panic(errors.Wrapf(err,
+					"queue %q: bypassed group-ref canonicalisation, %q is not uint64",
+					queue, groupRef))
+			}
+			ids = append(ids, id)
+		}
+		flat[queue] = ids
+	}
+	r := adapter.NewSQSPartitionResolver(flat)
+	if r == nil {
+		// Defensive: NewSQSPartitionResolver returns nil on an
+		// empty input. The len-check above already short-circuits
+		// for empty partitionMap, so reaching this branch means
+		// the canonicalisation collapsed every entry — surface as
+		// a true nil interface, not a typed-nil pointer wrapper.
+		return nil
+	}
+	return r
 }
 
 // buildSQSFifoPartitionMap parses and validates the
@@ -1482,7 +1557,7 @@ func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 		return
 	}
 	for _, r := range engine.Stats() {
-		s.RegisterRoute(r.RouteID, r.Start, r.End)
+		s.RegisterRoute(r.RouteID, r.Start, r.End, r.GroupID)
 	}
 }
 
@@ -1501,4 +1576,89 @@ func startKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSa
 		s.Flush()
 		return nil
 	})
+}
+
+// startKeyVizLeaderTermPublisher polls each Raft group's current term
+// at the sampler's flush cadence and publishes it via
+// MemSampler.SetLeaderTerm so subsequent column flushes stamp
+// MatrixRow.LeaderTerm. The poll cadence is the same as the flush
+// step because every flush column should observe a fresh term —
+// publishing more often costs RLocks for no benefit; publishing less
+// often opens a window where the column inherits a stale term from
+// the previous flush.
+//
+// Skip the goroutine entirely when the sampler is disabled or when
+// no runtimes are wired (single-process tests / cmd/client). With no
+// publisher running, MatrixRow.LeaderTerm stays zero and the fan-out
+// aggregator falls back to the legacy max-merge — no behavior change
+// versus PR #709.
+func startKeyVizLeaderTermPublisher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler, runtimes []*raftGroupRuntime) {
+	if s == nil || len(runtimes) == 0 {
+		return
+	}
+	eg.Go(func() error {
+		step := s.Step()
+		if step <= 0 {
+			step = keyviz.DefaultStep
+		}
+		t := time.NewTicker(step)
+		defer t.Stop()
+		// Publish once immediately so the very first flush column sees
+		// a non-zero term — without this, the column built between
+		// startup and the first ticker fire would carry LeaderTerm=0
+		// for every group, which the fan-out merge interprets as the
+		// legacy max-merge fallback.
+		publishLeaderTerms(s, runtimes)
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-t.C:
+				publishLeaderTerms(s, runtimes)
+			}
+		}
+	})
+}
+
+// groupTermSnapshot pairs a Raft group ID with the term observed
+// from its engine at one publish moment. Pulled out as its own type
+// so publishLeaderTermsFromSnapshots can be tested without a real
+// raftengine.Engine fake (the interface is too wide to mock cheaply
+// for a unit test of this 5-line publication step).
+type groupTermSnapshot struct {
+	groupID uint64
+	term    uint64
+}
+
+func publishLeaderTerms(s *keyviz.MemSampler, runtimes []*raftGroupRuntime) {
+	snaps := make([]groupTermSnapshot, 0, len(runtimes))
+	for _, rt := range runtimes {
+		// snapshotEngine takes engineMu.RLock so a concurrent
+		// rt.Close() (which clears rt.engine while holding the
+		// write lock) cannot race the publisher's read. On
+		// startup-error paths that fire cleanup before
+		// joining all goroutines, this lock prevents the
+		// race-detector failure and the undefined-behavior
+		// nil-pointer dereference Codex round-1/round-2 P2
+		// flagged on PR #720.
+		engine := rt.snapshotEngine()
+		if engine == nil {
+			continue
+		}
+		snaps = append(snaps, groupTermSnapshot{groupID: rt.spec.id, term: engine.Status().Term})
+	}
+	publishLeaderTermsFromSnapshots(s, snaps)
+}
+
+// publishLeaderTermsFromSnapshots applies a precomputed
+// (groupID, term) set to the sampler. Split out of
+// publishLeaderTerms so unit tests can exercise the publish step
+// without standing up a full raftengine.Engine.
+func publishLeaderTermsFromSnapshots(s *keyviz.MemSampler, snaps []groupTermSnapshot) {
+	if s == nil {
+		return
+	}
+	for _, sn := range snaps {
+		s.SetLeaderTerm(sn.groupID, sn.term)
+	}
 }
