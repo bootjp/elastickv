@@ -5,8 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -63,10 +66,17 @@ type DDBEncoder struct {
 }
 
 type ddbTableState struct {
-	encoded string
-	name    string
-	schema  *pb.DynamoTableSchema
-	items   []*pb.DynamoItem
+	encoded    string
+	name       string
+	schema     *pb.DynamoTableSchema
+	itemsByGen map[uint64][]*pb.DynamoItem
+}
+
+func ensureItemsByGen(m map[uint64][]*pb.DynamoItem) map[uint64][]*pb.DynamoItem {
+	if m == nil {
+		return make(map[uint64][]*pb.DynamoItem)
+	}
+	return m
 }
 
 // NewDDBEncoder constructs an encoder rooted at <outRoot>/dynamodb/.
@@ -105,6 +115,13 @@ func (d *DDBEncoder) HandleTableMeta(key, value []byte) error {
 	if err != nil {
 		return errors.Wrap(ErrDDBMalformedKey, err.Error())
 	}
+	if encoded == "" {
+		// base64.RawURLEncoding.DecodeString("") succeeds with an
+		// empty slice, so without this guard a truncated key like
+		// `!ddb|meta|table|` would be routed under the empty table
+		// name. That hides corruption (Codex P2 #117).
+		return errors.Wrapf(ErrDDBMalformedKey, "empty table segment: %q", key)
+	}
 	rawName, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
 		return errors.Wrap(ErrDDBMalformedKey, err.Error())
@@ -124,15 +141,16 @@ func (d *DDBEncoder) HandleTableMeta(key, value []byte) error {
 }
 
 // HandleItem processes a !ddb|item|<encTable>|<gen>|<rest> record. The
-// encoded table segment is parsed out of the key (everything between
-// the first and second `|` after stripping `!ddb|item|`) and the item
-// proto is buffered until Finalize. We do NOT parse the rest of the
-// key here: every primary-key value the item could hold is also
-// present in the proto's attributes map, and the schema (which arrives
-// later in lex order) is what tells us which attributes are the hash
-// and range keys.
+// encoded table segment AND the item generation are parsed out of the
+// key; the proto is buffered keyed by generation so Finalize can emit
+// only the rows belonging to the schema's active generation.
+//
+// Stale-generation rows (left behind by an in-flight delete/recreate
+// before async cleanup finishes) would otherwise silently leak under
+// the new schema and either resurrect deleted data or fail Finalize
+// when primary-key names changed across generations — Codex P1 #237.
 func (d *DDBEncoder) HandleItem(key, value []byte) error {
-	encoded, err := parseDDBItemKey(key)
+	encoded, generation, err := parseDDBItemKey(key)
 	if err != nil {
 		return err
 	}
@@ -145,7 +163,8 @@ func (d *DDBEncoder) HandleItem(key, value []byte) error {
 		return errors.Wrap(ErrDDBInvalidItem, err.Error())
 	}
 	st := d.tableState(encoded)
-	st.items = append(st.items, item)
+	st.itemsByGen = ensureItemsByGen(st.itemsByGen)
+	st.itemsByGen[generation] = append(st.itemsByGen[generation], item)
 	return nil
 }
 
@@ -159,27 +178,35 @@ func (d *DDBEncoder) HandleGSIRow(_, _ []byte) error { return nil }
 func (d *DDBEncoder) HandleTableGen(_, _ []byte) error { return nil }
 
 // Finalize emits each table's _schema.json and per-item JSON files.
-// Tables with items but no schema (orphans — e.g., the schema record
-// was lost or excluded) emit a warning and are skipped. Tables with
-// a schema but no items emit a _schema.json and an empty items/
-// directory.
+// Tables with items but no schema (orphans) emit a warning and are
+// skipped — preserving the spec's lenient handling for incomplete
+// inputs. Real flush errors fail fast so corruption surfaces
+// immediately rather than being attributed to a later table (Gemini
+// MEDIUM #182).
 func (d *DDBEncoder) Finalize() error {
 	if d.bundleJSONL {
 		return errors.New("backup: dynamodb_layout=jsonl not implemented in this PR")
 	}
-	var firstErr error
 	for _, st := range d.tables {
 		if st.schema == nil {
 			d.emitWarn("ddb_orphan_items",
 				"encoded_table", st.encoded,
-				"buffered_items", len(st.items))
+				"buffered_items", totalItemsAcrossGens(st.itemsByGen))
 			continue
 		}
-		if err := d.flushTable(st); err != nil && firstErr == nil {
-			firstErr = err
+		if err := d.flushTable(st); err != nil {
+			return err
 		}
 	}
-	return firstErr
+	return nil
+}
+
+func totalItemsAcrossGens(m map[uint64][]*pb.DynamoItem) int {
+	total := 0
+	for _, items := range m {
+		total += len(items)
+	}
+	return total
 }
 
 func (d *DDBEncoder) flushTable(st *ddbTableState) error {
@@ -193,12 +220,53 @@ func (d *DDBEncoder) flushTable(st *ddbTableState) error {
 	}
 	hashKey := st.schema.GetPrimaryKey().GetHashKey()
 	rangeKey := st.schema.GetPrimaryKey().GetRangeKey()
-	for _, item := range st.items {
-		if err := writeDDBItem(itemsDir, hashKey, rangeKey, item); err != nil {
-			return err
+	activeGen := st.schema.GetGeneration()
+	migrationSourceGen := st.schema.GetMigratingFromGeneration()
+	// During a generation migration the live read path falls back to
+	// migration_source_generation for items not yet copied to the new
+	// generation (see adapter/dynamodb.go readLogicalItemAt). Both
+	// generations therefore carry items the user can read at this
+	// moment, so a backup must include both. Codex P1 #227.
+	//
+	// Items present in BOTH generations: the new-gen row is the
+	// authoritative one (the live code prefers it on read). We emit
+	// migration-source first, then active gen LAST, so writeFileAtomic's
+	// tmp+rename leaves the active-gen content on disk per (pk,sk).
+	emitOrder := []uint64{}
+	if migrationSourceGen != 0 && migrationSourceGen != activeGen {
+		emitOrder = append(emitOrder, migrationSourceGen)
+	}
+	emitOrder = append(emitOrder, activeGen)
+	if stale := totalStaleItemsExcluding(st.itemsByGen, emitOrder); stale > 0 {
+		d.emitWarn("ddb_stale_generation_items",
+			"table", st.name,
+			"active_generation", activeGen,
+			"migration_source_generation", migrationSourceGen,
+			"stale_count", stale,
+			"hint", "stale-gen rows excluded; restore would otherwise emit them under the new schema")
+	}
+	for _, gen := range emitOrder {
+		for _, item := range st.itemsByGen[gen] {
+			if err := writeDDBItem(itemsDir, hashKey, rangeKey, item); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func totalStaleItemsExcluding(m map[uint64][]*pb.DynamoItem, included []uint64) int {
+	includedSet := make(map[uint64]struct{}, len(included))
+	for _, g := range included {
+		includedSet[g] = struct{}{}
+	}
+	stale := 0
+	for gen, items := range m {
+		if _, ok := includedSet[gen]; !ok {
+			stale += len(items)
+		}
+	}
+	return stale
 }
 
 func (d *DDBEncoder) emitWarn(event string, fields ...any) {
@@ -217,24 +285,46 @@ func (d *DDBEncoder) tableState(encoded string) *ddbTableState {
 	return st
 }
 
-// parseDDBItemKey extracts the encoded table segment from
-// !ddb|item|<encTable>|<gen>|<rest>. base64url does not contain `|`,
-// so a strict `|` split between the prefix and the gen is unambiguous.
-func parseDDBItemKey(key []byte) (string, error) {
+// parseDDBItemKey extracts the encoded table segment AND the item
+// generation from !ddb|item|<encTable>|<gen>|<rest>. base64url does
+// not contain `|`, so the first two `|` after the prefix are
+// unambiguous separators between the table segment, the decimal
+// generation, and the rest of the key (hash/range encoding).
+func parseDDBItemKey(key []byte) (string, uint64, error) {
 	rest, err := stripPrefixSegment(key, []byte(DDBItemPrefix))
 	if err != nil {
-		return "", errors.Wrap(ErrDDBMalformedKey, err.Error())
+		return "", 0, errors.Wrap(ErrDDBMalformedKey, err.Error())
 	}
-	idx := strings.IndexByte(rest, '|')
-	if idx <= 0 {
-		return "", errors.Wrapf(ErrDDBMalformedKey,
+	tableEnd := strings.IndexByte(rest, '|')
+	if tableEnd <= 0 {
+		return "", 0, errors.Wrapf(ErrDDBMalformedKey,
 			"item key missing table/gen separator: %q", key)
 	}
-	enc := rest[:idx]
+	enc := rest[:tableEnd]
 	if _, err := base64.RawURLEncoding.DecodeString(enc); err != nil {
-		return "", errors.Wrap(ErrDDBMalformedKey, err.Error())
+		return "", 0, errors.Wrap(ErrDDBMalformedKey, err.Error())
 	}
-	return enc, nil
+	afterTable := rest[tableEnd+1:]
+	genEnd := strings.IndexByte(afterTable, '|')
+	if genEnd <= 0 {
+		return "", 0, errors.Wrapf(ErrDDBMalformedKey,
+			"item key missing gen/rest separator: %q", key)
+	}
+	gen, err := strconv.ParseUint(afterTable[:genEnd], 10, 64) //nolint:mnd // 10 == decimal radix; 64 == uint64 width
+	if err != nil {
+		return "", 0, errors.Wrap(ErrDDBMalformedKey, err.Error())
+	}
+	// Item keys must carry a primary-key payload after the gen
+	// separator (the encoded hash + range bytes). A bare
+	// `!ddb|item|<table>|<gen>|` cannot identify any item; treating
+	// such a key as valid would let a truncated record slip past
+	// malformed-key detection and emit under value-side attributes
+	// only, masking snapshot corruption (Codex P2 #303).
+	if genEnd+1 == len(afterTable) {
+		return "", 0, errors.Wrapf(ErrDDBMalformedKey,
+			"item key missing primary-key payload: %q", key)
+	}
+	return enc, gen, nil
 }
 
 // writeDDBItem emits one item under itemsDir/<pk>[/<sk>].json. The
@@ -242,6 +332,15 @@ func parseDDBItemKey(key []byte) (string, error) {
 // A missing hash-key attribute on an item is a structural error (the
 // item could never have been GetItem-able without one) and surfaces
 // as ErrDDBInvalidItem.
+//
+// The encoded hash/range filename segments may legitimately be "." or
+// ".." (DynamoDB S/N keys can hold any string, and EncodeSegment
+// preserves both `.` chars as RFC3986-unreserved). filepath.Join
+// would then either collapse `<itemsDir>/.` back to itemsDir or
+// resolve `<itemsDir>/..` to the parent — letting an item like
+// hash=".." range="_schema" overwrite the table-level _schema.json.
+// Reject sole-dot segments at this boundary so the items/ subtree
+// cannot escape via key-controlled paths. Codex P1 round 12.
 func writeDDBItem(itemsDir, hashKey, rangeKey string, item *pb.DynamoItem) error {
 	attrs := item.GetAttributes()
 	hashVal, ok := attrs[hashKey]
@@ -251,6 +350,9 @@ func writeDDBItem(itemsDir, hashKey, rangeKey string, item *pb.DynamoItem) error
 	}
 	hashFilename, err := ddbKeyAttrToSegment(hashVal)
 	if err != nil {
+		return err
+	}
+	if err := refuseDotSegmentFilename(hashFilename, "hash"); err != nil {
 		return err
 	}
 	publicItem := itemToPublic(item)
@@ -270,11 +372,25 @@ func writeDDBItem(itemsDir, hashKey, rangeKey string, item *pb.DynamoItem) error
 	if err != nil {
 		return err
 	}
+	if err := refuseDotSegmentFilename(rangeFilename, "range"); err != nil {
+		return err
+	}
 	dir := filepath.Join(itemsDir, hashFilename)
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:mnd // 0755 == standard dir mode
 		return errors.WithStack(err)
 	}
 	return writeFileAtomic(filepath.Join(dir, rangeFilename+".json"), body)
+}
+
+// refuseDotSegmentFilename blocks hash/range segments that filepath
+// resolution would collapse or escape on (".", ".."). Both are
+// reachable from valid DynamoDB N/S key values.
+func refuseDotSegmentFilename(seg, role string) error {
+	if seg == "." || seg == ".." {
+		return errors.Wrapf(ErrDDBInvalidItem,
+			"%s-key segment %q is a dot path (would escape items dir)", role, seg)
+	}
+	return nil
 }
 
 // ddbKeyAttrToSegment encodes a primary-key attribute (S, N, or B) to
@@ -290,12 +406,38 @@ func ddbKeyAttrToSegment(av *pb.DynamoAttributeValue) (string, error) {
 	case *pb.DynamoAttributeValue_S:
 		return EncodeSegment([]byte(v.S)), nil
 	case *pb.DynamoAttributeValue_N:
-		return EncodeSegment([]byte(v.N)), nil
+		// DynamoDB N equality is numeric, not lexical: "1" and
+		// "1.0" name the same primary-key item, and so do "5e-1"
+		// and "0.5". Without canonicalisation each text form
+		// produces a distinct filename, so in migration mode the
+		// "active generation wins" invariant breaks (both source
+		// and active rows survive at different paths and restore
+		// replays duplicates). Mirror the live adapter's
+		// canonicalNumberString (adapter/dynamodb.go:7651) which
+		// uses big.Rat — same canonical form keeps filename
+		// identity in lockstep with the live equality check.
+		// Codex P1 round 9.
+		return EncodeSegment([]byte(canonicalDDBNumber(v.N))), nil
 	case *pb.DynamoAttributeValue_B:
 		return EncodeBinarySegment(v.B), nil
 	}
 	return "", errors.Wrapf(ErrDDBInvalidItem,
 		"primary key has unsupported attribute kind %T", av.GetValue())
+}
+
+// canonicalDDBNumber returns the canonical decimal representation of
+// a DynamoDB N value. Equivalent inputs (`"1"`, `"1.0"`, `"0.5"`,
+// `"5e-1"`, …) collapse to the same string; malformed inputs fall
+// through to a trimmed copy so a downstream parse failure surfaces
+// the original bytes rather than a silently rewritten value. The
+// implementation matches adapter/dynamodb.go canonicalNumberString
+// byte-for-byte so backup filenames track live equality.
+func canonicalDDBNumber(v string) string {
+	rat := &big.Rat{}
+	if _, ok := rat.SetString(strings.TrimSpace(v)); !ok {
+		return strings.TrimSpace(v)
+	}
+	return rat.RatString()
 }
 
 // schemaToPublic projects DynamoTableSchema into the AWS-DescribeTable
@@ -319,8 +461,18 @@ func schemaToPublic(s *pb.DynamoTableSchema) ddbPublicSchema {
 	if pk.RangeKey.Name != "" {
 		pk.RangeKey.Type = defs[pk.RangeKey.Name]
 	}
-	gsis := make([]publicGSI, 0, len(s.GetGlobalSecondaryIndexes()))
-	for name, gsi := range s.GetGlobalSecondaryIndexes() {
+	// Build GSI list in deterministic name-sorted order. Ranging over
+	// the underlying map directly produced a different array order on
+	// every dump, undermining byte-for-byte reproducibility of
+	// _schema.json across runs of the same snapshot. Codex P2 round 9.
+	gsiNames := make([]string, 0, len(s.GetGlobalSecondaryIndexes()))
+	for name := range s.GetGlobalSecondaryIndexes() {
+		gsiNames = append(gsiNames, name)
+	}
+	sort.Strings(gsiNames)
+	gsis := make([]publicGSI, 0, len(gsiNames))
+	for _, name := range gsiNames {
+		gsi := s.GetGlobalSecondaryIndexes()[name]
 		g := publicGSI{
 			Name: name,
 			KeySchema: publicKeySchema{
@@ -338,9 +490,16 @@ func schemaToPublic(s *pb.DynamoTableSchema) ddbPublicSchema {
 		g.Projection.NonKeyAttributes = append([]string{}, gsi.GetProjection().GetNonKeyAttributes()...)
 		gsis = append(gsis, g)
 	}
-	attrDefs := make([]publicAttributeDefinition, 0, len(defs))
-	for name, ty := range defs {
-		attrDefs = append(attrDefs, publicAttributeDefinition{Name: name, Type: ty})
+	// AttributeDefinitions is also sorted by attribute name for the
+	// same determinism reason.
+	defNames := make([]string, 0, len(defs))
+	for name := range defs {
+		defNames = append(defNames, name)
+	}
+	sort.Strings(defNames)
+	attrDefs := make([]publicAttributeDefinition, 0, len(defNames))
+	for _, name := range defNames {
+		attrDefs = append(attrDefs, publicAttributeDefinition{Name: name, Type: defs[name]})
 	}
 	return ddbPublicSchema{
 		FormatVersion:          1,
@@ -430,13 +589,25 @@ func scalarAttributeValueToPublic(av *pb.DynamoAttributeValue) map[string]any {
 }
 
 func setAttributeValueToPublic(av *pb.DynamoAttributeValue) map[string]any {
+	// Ensure the destination slice is non-nil even when the source
+	// is nil/empty so json.Marshal renders [] rather than null.
+	// AWS DynamoDB JSON does NOT permit empty sets ([] is rejected
+	// by the live API), but the dump format intentionally accepts
+	// the structural empty case to avoid silently dropping a set
+	// attribute whose live representation drifted to nil.
 	switch v := av.GetValue().(type) {
 	case *pb.DynamoAttributeValue_Ss:
-		return map[string]any{"SS": append([]string{}, v.Ss.GetValues()...)}
+		out := make([]string, 0, len(v.Ss.GetValues()))
+		out = append(out, v.Ss.GetValues()...)
+		return map[string]any{"SS": out}
 	case *pb.DynamoAttributeValue_Ns:
-		return map[string]any{"NS": append([]string{}, v.Ns.GetValues()...)}
+		out := make([]string, 0, len(v.Ns.GetValues()))
+		out = append(out, v.Ns.GetValues()...)
+		return map[string]any{"NS": out}
 	case *pb.DynamoAttributeValue_Bs:
-		return map[string]any{"BS": append([][]byte{}, v.Bs.GetValues()...)}
+		out := make([][]byte, 0, len(v.Bs.GetValues()))
+		out = append(out, v.Bs.GetValues()...)
+		return map[string]any{"BS": out}
 	}
 	return nil
 }
