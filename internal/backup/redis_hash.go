@@ -68,14 +68,17 @@ func (r *RedisDB) HandleHashMeta(key, value []byte) error {
 
 // HandleHashField processes one !hs|fld|<userKey><fieldName> record.
 // The value is the raw field-value bytes (binary-safe).
+//
+// Note: Redis hash field names are binary-safe and may legitimately
+// be empty — `HSET k "" v` is a valid command and the live store
+// emits a key shaped exactly `!hs|fld|<len><userKey>` with no
+// trailing field bytes. We deliberately do NOT reject zero-length
+// field names here so backup decoding succeeds on real data created
+// via HSET with empty names. Codex P1 round 13 (PR #725).
 func (r *RedisDB) HandleHashField(key, value []byte) error {
 	userKey, fieldName, ok := parseHashFieldKey(key)
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidHashKey, "field key: %q", key)
-	}
-	if len(fieldName) == 0 {
-		return cockroachdberr.Wrapf(ErrRedisInvalidHashKey,
-			"empty field name in key %q", key)
 	}
 	st := r.hashState(userKey)
 	st.fields[string(fieldName)] = bytes.Clone(value)

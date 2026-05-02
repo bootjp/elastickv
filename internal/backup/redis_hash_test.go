@@ -315,6 +315,47 @@ func base64URLEncode(b byte) string {
 	return string([]byte{hi, lo})
 }
 
+// TestRedisDB_HashAcceptsEmptyFieldName is the regression for Codex
+// P1 round 13 (PR #725): Redis hash field names are binary-safe and
+// `HSET k "" v` is a valid command, so the live store emits a key
+// shaped exactly `!hs|fld|<len><userKey>` with no trailing field
+// bytes. The previous explicit zero-length rejection in
+// HandleHashField caused backup decoding to error out on real data.
+// Now an empty field name is accepted and emitted as one of the
+// hash record's `fields` entries with an empty-string `name`.
+func TestRedisDB_HashAcceptsEmptyFieldName(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleHashMeta(hashMetaKey("k"), encodeHashMetaValue(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleHashField(hashFieldKey("k", ""), []byte("empty-name-value")); err != nil {
+		t.Fatalf("empty field name must be accepted: %v", err)
+	}
+	if err := db.HandleHashField(hashFieldKey("k", "named"), []byte("named-value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readHashJSON(t, filepath.Join(root, "redis", "db_0", "hashes", "k.json"))
+	fields := hashFieldArray(t, got)
+	if len(fields) != 2 {
+		t.Fatalf("len(fields) = %d, want 2", len(fields))
+	}
+	// The empty-string name sorts before "named"; the array form
+	// preserves both as distinct records.
+	if fields[0]["name"] != "" {
+		t.Fatalf("fields[0].name = %v, want empty string", fields[0]["name"])
+	}
+	if fields[0]["value"] != "empty-name-value" {
+		t.Fatalf("empty-name field value = %v", fields[0]["value"])
+	}
+	if fields[1]["name"] != "named" {
+		t.Fatalf("fields[1].name = %v", fields[1]["name"])
+	}
+}
+
 func TestRedisDB_HashRejectsMalformedMetaValueLength(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
