@@ -199,6 +199,43 @@ func TestRedisDB_NewFormatStringTTLNotDuplicatedByScanIndex(t *testing.T) {
 	assertTTLSidecar(t, filepath.Join(root, "redis", "db_0", "strings_ttl.jsonl"), "expiring", fixedExpireMs)
 }
 
+// TestRedisDB_RefusesSymlinkedAncestorOnTTLSidecar is the regression
+// for Codex P1 round 13 (PR #713): writeBlob already routed through
+// ensureDir/assertNoSymlinkAncestors, but TTL sidecars (appendTTL ->
+// openJSONL) bypassed that guard because openJSONL only protected
+// the final path element via openSidecarFile. A symlinked ancestor
+// like `<outRoot>/redis/db_0 -> /tmp/outside` would then redirect
+// strings_ttl.jsonl writes outside the dump root. appendTTL now
+// calls ensureDir on the parent directory before opening the
+// sidecar.
+func TestRedisDB_RefusesSymlinkedAncestorOnTTLSidecar(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	bait := filepath.Join(root, "bait-tree")
+	if err := os.MkdirAll(bait, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "redis")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Symlink `<outRoot>/redis/db_0` to a directory outside the
+	// dump root. Without the ancestor guard, the first appendTTL
+	// would happily write strings_ttl.jsonl into <bait>/.
+	if err := os.Symlink(bait, filepath.Join(parent, "db_0")); err != nil {
+		t.Fatal(err)
+	}
+	db := NewRedisDB(root, 0)
+	// HandleString with a TTL-bearing value drives appendTTL.
+	err := db.HandleString([]byte("k"), encodeNewStringValue(t, []byte("v"), fixedExpireMs))
+	if err == nil || !strings.Contains(err.Error(), "refusing to traverse symlinked ancestor") {
+		t.Fatalf("expected symlinked-ancestor refusal, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(bait, "strings_ttl.jsonl")); !os.IsNotExist(statErr) {
+		t.Fatalf("TTL sidecar written through ancestor symlink: stat err=%v", statErr)
+	}
+}
+
 // TestRedisDB_RefusesSymlinkedAncestor is the regression for Codex P1
 // round 9: O_NOFOLLOW only blocks the final-component symlink. A
 // pre-existing directory symlink anywhere up the path (e.g.
