@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -355,37 +356,40 @@ func TestSQSServer_PartitionedFIFO_PerQueueCollapsesToPartitionZero(t *testing.T
 		"perQueue receive must surface every message in one fanout pass over partition 0")
 }
 
-// TestNextReceiveFanoutStart_RoundRobin pins the round-2 regression:
-// the original PR #732 round-1 fix derived the starting partition
-// from masked readTS bits (XOR-fold of the upper and lower 32-bit
-// halves). Codex P1 round 2 flagged that this can alias to a subset
-// of partitions when readTS advances by a structured stride — HLC
-// packs a 16-bit logical counter into the low bits and ReceiveMessage
-// commits a fixed number of per-message transactions per call, so
-// consecutive readTS deltas exhibit a structured stride.
+// TestNextReceiveFanoutStart_PerQueueRoundRobin pins the round-4
+// regression: the round-3 fix used a server-wide atomic counter,
+// which Codex P1 round 4 flagged because it aliases across queues
+// — when other queues' receives interleave with strides that share
+// a factor with PartitionCount, the queue's observed counter
+// subsequence cycles through only a subset of partitions, which can
+// starve the rest. Per-queue counters make each queue's rotation
+// depend only on its own receive cadence.
 //
-// nextReceiveFanoutStart replaces the bit-fold with a per-server
-// atomic counter, so consecutive calls walk every partition in
-// strict round-robin regardless of HLC behaviour. This test pins
-// both the round-robin contract and the explicit aliasing case
-// Codex flagged.
-func TestNextReceiveFanoutStart_RoundRobin(t *testing.T) {
+// This test pins:
+//   - legacy / non-partitioned queues collapse to 0 without
+//     perturbing any counter,
+//   - a single queue's consecutive calls walk every partition in
+//     strict round-robin,
+//   - interleaved calls across two queues do NOT cross-pollute each
+//     other's counter (the round-4 isolation contract),
+//   - concurrent receives across many queues remain atomic and
+//     in-range under -race.
+func TestNextReceiveFanoutStart_PerQueueRoundRobin(t *testing.T) {
 	t.Parallel()
 
 	s := &SQSServer{}
 
 	// Legacy / non-partitioned / perQueue queues collapse to 0 and
-	// must not perturb the counter.
-	require.Equal(t, uint32(0), s.nextReceiveFanoutStart(0))
-	require.Equal(t, uint32(0), s.nextReceiveFanoutStart(1))
+	// must not perturb any counter.
+	require.Equal(t, uint32(0), s.nextReceiveFanoutStart("legacy", 0))
+	require.Equal(t, uint32(0), s.nextReceiveFanoutStart("legacy", 1))
 
-	// Partitioned queues walk every partition in strict round-robin.
-	// 16 consecutive calls over 4 partitions must produce exactly
-	// 4 hits per partition.
+	// Single-queue strict round-robin: 16 consecutive calls over 4
+	// partitions must produce exactly 4 hits per partition.
 	const partitions uint32 = 4
 	seen := make(map[uint32]int, partitions)
 	for range 16 {
-		seen[s.nextReceiveFanoutStart(partitions)]++
+		seen[s.nextReceiveFanoutStart("queueA", partitions)]++
 	}
 	require.Len(t, seen, int(partitions),
 		"counter-driven rotation must cover every partition; got %v", seen)
@@ -395,17 +399,40 @@ func TestNextReceiveFanoutStart_RoundRobin(t *testing.T) {
 			p, seen[p])
 	}
 
+	// Per-queue isolation — the round-4 contract. Interleaving calls
+	// across queueB and queueC must not cross-pollute their counters:
+	// each queue must still see strict round-robin in the order ITS
+	// calls were issued. With a server-wide counter (round 3), B's
+	// consecutive calls would observe values 1, 3, 5, 7, … (every
+	// other tick because C is calling in between) — and 1,3,5,7 mod 4
+	// is 1,3,1,3 → partitions 0 and 2 never appear as B's start.
+	bSeen := make(map[uint32]int, partitions)
+	cSeen := make(map[uint32]int, partitions)
+	for range 16 {
+		bSeen[s.nextReceiveFanoutStart("queueB", partitions)]++
+		cSeen[s.nextReceiveFanoutStart("queueC", partitions)]++
+	}
+	for p := uint32(0); p < partitions; p++ {
+		require.Equal(t, 4, bSeen[p],
+			"queueB partition %d hit %d times; round-4 per-queue isolation broken (cross-queue stride aliasing)",
+			p, bSeen[p])
+		require.Equal(t, 4, cSeen[p],
+			"queueC partition %d hit %d times; round-4 per-queue isolation broken",
+			p, cSeen[p])
+	}
+
 	// The output must always fall inside [0, partitions). Validates
-	// the mask-AND contract — partitions is power-of-two, so the
-	// AND with (partitions-1) is equivalent to modulo.
+	// the mask-AND contract — partitions is power-of-two.
 	for range 1024 {
-		off := s.nextReceiveFanoutStart(partitions)
+		off := s.nextReceiveFanoutStart("queueA", partitions)
 		require.Less(t, off, partitions,
 			"offset %d out of range [0, %d)", off, partitions)
 	}
 
-	// Concurrent receivers must each get a valid offset (no torn
-	// reads, no out-of-range values). Atomicity check.
+	// Concurrent receivers across many queues must each get a valid
+	// offset (no torn reads, no out-of-range values, no nil-counter
+	// races on the LoadOrStore path). The race detector will catch
+	// any missed synchronisation on the sync.Map insert.
 	var wg sync.WaitGroup
 	const goroutines = 8
 	const perGoroutine = 256
@@ -415,8 +442,9 @@ func TestNextReceiveFanoutStart_RoundRobin(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			queueName := fmt.Sprintf("concurrent-%d", idx%3)
 			for j := 0; j < perGoroutine; j++ {
-				results[idx][j] = s.nextReceiveFanoutStart(partitions)
+				results[idx][j] = s.nextReceiveFanoutStart(queueName, partitions)
 			}
 		}(i)
 	}

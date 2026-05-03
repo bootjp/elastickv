@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -881,7 +882,7 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	// deterministic), so cross-partition iteration order does not
 	// reorder messages within any group.
 	partitions := effectivePartitionCount(meta)
-	startOffset := s.nextReceiveFanoutStart(partitions)
+	startOffset := s.nextReceiveFanoutStart(queueName, partitions)
 	for i := uint32(0); i < partitions; i++ {
 		if len(delivered) >= opts.Max {
 			break
@@ -904,35 +905,28 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	return delivered, nil
 }
 
-// nextReceiveFanoutStart advances the per-server atomic counter and
-// returns the starting partition index for this receive call. With
-// PartitionCount power-of-two (validator invariant), mask-AND is
-// equivalent to modulo, so consecutive receives walk every partition
-// in strict round-robin — no aliasing to a subset of partitions even
-// when readTS advances by a structured stride.
+// nextReceiveFanoutStart returns the starting partition index for a
+// partitioned ReceiveMessage call. The counter is keyed by queueName
+// so each queue's rotation depends only on its own receive cadence
+// — a server-wide counter (round 3) aliases when other queues
+// interleave with strides that share a factor with PartitionCount
+// (Codex P1 round 4).
 //
-// The round-1 fix used a readTS-bit fold for rotation. Codex P1
-// round 2 flagged a real aliasing concern: HLC packs a 16-bit logical
-// counter in the low bits of readTS and ReceiveMessage commits a
-// fixed number of per-message transactions per call, so consecutive
-// readTS deltas exhibit a structured stride. With partitions=4 and
-// stride=10 the masked fold alternates between two starts (0,2,0,2,…)
-// — partitions 1 and 3 never appear as the start. A per-server
-// counter sidesteps the entire HLC-bit-pattern question.
-//
-// Returns 0 on legacy / non-partitioned queues (partitions <= 1) so
-// the counter is not perturbed for non-partitioned receives — those
-// always start at the only partition that exists.
-//
-// The counter is per-server (not Raft-replicated) because fanout
-// distribution is a local-fairness property: every node already sees
-// every message via its own receive scans, and "this node's
-// distribution is balanced" is the only invariant that matters.
-func (s *SQSServer) nextReceiveFanoutStart(partitions uint32) uint32 {
+// PartitionCount is power-of-two (validator), so mask-AND is modulo;
+// consecutive receives on the same queue walk every partition in
+// strict round-robin. Returns 0 on legacy / non-partitioned queues
+// (partitions <= 1) without touching the map so unconfigured queues
+// pay no per-call allocation.
+func (s *SQSServer) nextReceiveFanoutStart(queueName string, partitions uint32) uint32 {
 	if partitions <= 1 {
 		return 0
 	}
-	return s.receiveFanoutCounter.Add(1) & (partitions - 1)
+	v, ok := s.receiveFanoutCounters.Load(queueName)
+	if !ok {
+		v, _ = s.receiveFanoutCounters.LoadOrStore(queueName, &atomic.Uint32{})
+	}
+	counter, _ := v.(*atomic.Uint32)
+	return counter.Add(1) & (partitions - 1)
 }
 
 // scanAndDeliverPartition pages the visibility index for one
