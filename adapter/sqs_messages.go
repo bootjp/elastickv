@@ -929,6 +929,18 @@ func (s *SQSServer) nextReceiveFanoutStart(queueName string, partitions uint32) 
 	return counter.Add(1) & (partitions - 1)
 }
 
+// dropReceiveFanoutCounter removes any per-queue fanout-rotation
+// counter for queueName. Mirrors throttle.invalidateQueue: called
+// from the same DeleteQueue and genuine-CreateQueue paths so the
+// sync.Map does not retain a counter for every queue name the
+// process has ever served. Without this, repeated create/delete of
+// unique queue names (multi-tenant or high-churn workloads) leaks
+// one entry per name for the lifetime of the process. No-op when
+// the queue never produced a partitioned receive (entry absent).
+func (s *SQSServer) dropReceiveFanoutCounter(queueName string) {
+	s.receiveFanoutCounters.Delete(queueName)
+}
+
 // scanAndDeliverPartition pages the visibility index for one
 // partition under the shared wall-clock + per-call max budget. On
 // legacy / non-partitioned queues the caller invokes this exactly

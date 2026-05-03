@@ -456,3 +456,61 @@ func TestNextReceiveFanoutStart_PerQueueRoundRobin(t *testing.T) {
 		}
 	}
 }
+
+// TestDropReceiveFanoutCounter_ClearsEntry pins the round-5
+// cleanup contract: a queue's per-queue fanout counter must be
+// removed from receiveFanoutCounters once dropReceiveFanoutCounter
+// is called, so repeated create/delete of unique queue names
+// cannot leak one sync.Map entry per name for the process
+// lifetime (Codex P2 on PR #732). The test also asserts the
+// no-op shape on absent / never-partitioned queues so the same
+// helper is safe to call from the catalog paths regardless of
+// whether the queue ever issued a partitioned receive.
+func TestDropReceiveFanoutCounter_ClearsEntry(t *testing.T) {
+	t.Parallel()
+
+	s := &SQSServer{}
+
+	// Drop on an absent queue must be a no-op (no panic, no
+	// allocation in the map). Calling it before any receive is
+	// the common path on legacy / non-partitioned queues that
+	// never populate the counter.
+	s.dropReceiveFanoutCounter("never-touched")
+	_, ok := s.receiveFanoutCounters.Load("never-touched")
+	require.False(t, ok, "no entry must exist for an unused queue name")
+
+	// Populate a counter via the public path, then verify it is
+	// observable in the underlying sync.Map.
+	const partitions uint32 = 4
+	_ = s.nextReceiveFanoutStart("queueA", partitions)
+	_, ok = s.receiveFanoutCounters.Load("queueA")
+	require.True(t, ok, "nextReceiveFanoutStart must populate the counter")
+
+	// Drop and verify removal. A stale entry surviving here is the
+	// leak Codex flagged.
+	s.dropReceiveFanoutCounter("queueA")
+	_, ok = s.receiveFanoutCounters.Load("queueA")
+	require.False(t, ok, "dropReceiveFanoutCounter must remove the queue's entry")
+
+	// Dropping an unrelated queue must not affect a different
+	// queue's counter (per-queue isolation contract from round 4
+	// must hold across cleanup).
+	_ = s.nextReceiveFanoutStart("queueB", partitions)
+	_ = s.nextReceiveFanoutStart("queueC", partitions)
+	s.dropReceiveFanoutCounter("queueB")
+	_, ok = s.receiveFanoutCounters.Load("queueB")
+	require.False(t, ok, "queueB entry must be removed")
+	_, ok = s.receiveFanoutCounters.Load("queueC")
+	require.True(t, ok, "queueC entry must survive an unrelated drop")
+
+	// After drop, a new receive on the same queue must allocate a
+	// fresh counter starting from 0+1 (the Add is unconditional),
+	// not pick up where the old counter left off. The first call's
+	// returned offset must be 1 (counter = 1, mask 3 → 1) on a
+	// fresh atomic.Uint32 — pinning this catches any regression
+	// that recycled the old pointer.
+	first := s.nextReceiveFanoutStart("queueA", partitions)
+	require.Equal(t, uint32(1), first,
+		"a queue recreated after drop must start from a zero counter (got first offset %d)",
+		first)
+}
