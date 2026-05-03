@@ -139,6 +139,34 @@ func TestValidateReceiptHandleVersion_NilHandle(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestValidateReceiptHandleVersion_RejectsOutOfRangePartition pins
+// the round-2 fix: handle.Partition is client-controlled once
+// decodeClientReceiptHandle accepts v2, so the queue-aware validator
+// must bounds-check it against meta.PartitionCount. Without this an
+// out-of-range partition would fall through to sqsMsg*KeyDispatch
+// and depend on downstream routing failure semantics rather than
+// returning ReceiptHandleIsInvalid at the validation choke point.
+func TestValidateReceiptHandleVersion_RejectsOutOfRangePartition(t *testing.T) {
+	t.Parallel()
+	meta := &sqsQueueMeta{PartitionCount: 4}
+	for _, partition := range []uint32{4, 5, 17, 1 << 30} {
+		err := validateReceiptHandleVersion(meta, &decodedReceiptHandle{
+			Version:   sqsReceiptHandleVersion2,
+			Partition: partition,
+		})
+		require.Error(t, err, "partition=%d on PartitionCount=4 must be rejected", partition)
+		require.True(t,
+			strings.Contains(err.Error(), "out of range"),
+			"error must reference out-of-range partition, got %v", err)
+	}
+	// Boundary: partition == count-1 is the last legal value.
+	err := validateReceiptHandleVersion(meta, &decodedReceiptHandle{
+		Version:   sqsReceiptHandleVersion2,
+		Partition: 3,
+	})
+	require.NoError(t, err)
+}
+
 // TestSQSMsgVisScanBoundsDispatch_LegacyMatchesLegacy pins that on
 // legacy / non-partitioned metas the dispatch helper produces the
 // same start/end pair as the legacy sqsMsgVisScanBounds — the

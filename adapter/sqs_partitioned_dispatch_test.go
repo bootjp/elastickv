@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
@@ -86,10 +87,24 @@ func TestSQSServer_PartitionedFIFO_SendReceiveDeleteRoundTrip(t *testing.T) {
 
 	installPartitionedMetaForTest(t, node, queueName, 4, htfifoThroughputPerMessageGroupID)
 
+	// Load meta once so the test can assert each handle lands on the
+	// partition partitionFor would compute for its group — a loose
+	// "Partition < 4" check would still pass if every group landed
+	// on partition 0, masking the dispatch regression this test is
+	// meant to catch.
+	ctx := context.Background()
+	readTS := node.sqsServer.nextTxnReadTS(ctx)
+	meta, exists, err := node.sqsServer.loadQueueMetaAt(ctx, queueName, readTS)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint32(4), meta.PartitionCount,
+		"meta override must have installed PartitionCount=4")
+
 	// Send a few messages spread across distinct group ids so
 	// partitionFor gets to actually pick different partitions.
 	groups := []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}
-	sent := make(map[string]string, len(groups)) // group -> messageID
+	sent := make(map[string]string, len(groups))        // group -> messageID
+	byMessageID := make(map[string]string, len(groups)) // messageID -> group
 	for i, g := range groups {
 		body := "body-" + g
 		dedup := "dedup-" + g
@@ -104,6 +119,7 @@ func TestSQSServer_PartitionedFIFO_SendReceiveDeleteRoundTrip(t *testing.T) {
 		msgID, _ := out["MessageId"].(string)
 		require.NotEmpty(t, msgID, "send #%d: empty MessageId", i)
 		sent[g] = msgID
+		byMessageID[msgID] = g
 	}
 
 	// Receive them all; the fanout walks all 4 partitions to find
@@ -135,8 +151,12 @@ func TestSQSServer_PartitionedFIFO_SendReceiveDeleteRoundTrip(t *testing.T) {
 			require.Equal(t, sqsReceiptHandleVersion2, parsed.Version,
 				"partitioned queue must produce v2 handles, got version=0x%02x for message=%s",
 				parsed.Version, id)
-			require.Less(t, parsed.Partition, uint32(4),
-				"v2 handle partition out of range")
+			group, ok := byMessageID[id]
+			require.True(t, ok, "received unknown messageId %s", id)
+			require.Equal(t,
+				partitionFor(meta, group),
+				parsed.Partition,
+				"message %s (group=%s) routed to wrong partition", id, group)
 
 			collected[id] = handle
 		}
@@ -157,11 +177,32 @@ func TestSQSServer_PartitionedFIFO_SendReceiveDeleteRoundTrip(t *testing.T) {
 			"delete (msg=%s): %v", id, out)
 	}
 
-	// Queue must now be empty even after the visibility timeout
-	// would have re-exposed it.
+	// Queue must now be empty. Probe the partitioned data keyspace
+	// directly so a regression that turned DeleteMessage into a
+	// "leave the record invisible but not removed" no-op cannot
+	// false-pass under the still-active 60s visibility window.
+	for p := uint32(0); p < meta.PartitionCount; p++ {
+		dataPrefix := sqsMsgDataKeyDispatch(meta, queueName, p, meta.Generation, "")
+		end := append([]byte(nil), dataPrefix...)
+		end = append(end, 0xFF, 0xFF, 0xFF, 0xFF)
+		page, err := node.sqsServer.store.ScanAt(ctx, dataPrefix, end, 32, node.sqsServer.nextTxnReadTS(ctx))
+		require.NoError(t, err, "post-delete scan partition %d: %v", p, err)
+		for _, kvp := range page {
+			require.False(t,
+				strings.HasPrefix(string(kvp.Key), string(dataPrefix)),
+				"partition %d still holds key %q after delete — DeleteMessage left a tombstone-less record",
+				p, string(kvp.Key))
+		}
+	}
+
+	// And the public API must agree: a fresh receive with a short
+	// visibility timeout (after sleeping past it, so any in-flight
+	// invisible record would re-expose) returns no messages.
+	time.Sleep(1100 * time.Millisecond)
 	status, out = callSQS(t, node, sqsReceiveMessageTarget, map[string]any{
 		"QueueUrl":            queueURL,
 		"MaxNumberOfMessages": 10,
+		"VisibilityTimeout":   1,
 	})
 	require.Equal(t, http.StatusOK, status, "post-delete receive: %v", out)
 	if msgs, _ := out["Messages"].([]any); len(msgs) > 0 {
@@ -172,11 +213,7 @@ func TestSQSServer_PartitionedFIFO_SendReceiveDeleteRoundTrip(t *testing.T) {
 	// this queue went to the partitioned keyspace, never the
 	// legacy one). We probe the legacy data prefix at this
 	// queue's generation: it must yield zero entries.
-	ctx := context.Background()
-	readTS := node.sqsServer.nextTxnReadTS(ctx)
-	meta, exists, err := node.sqsServer.loadQueueMetaAt(ctx, queueName, readTS)
-	require.NoError(t, err)
-	require.True(t, exists)
+	readTS = node.sqsServer.nextTxnReadTS(ctx)
 	legacyDataPrefix := sqsMsgDataKey(queueName, meta.Generation, "")
 	// Cap the prefix scan at the generation byte so we do not
 	// drag in unrelated queues.

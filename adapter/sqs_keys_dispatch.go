@@ -187,6 +187,13 @@ func validateReceiptHandleVersion(meta *sqsQueueMeta, handle *decodedReceiptHand
 		if handle.Version != sqsReceiptHandleVersion2 {
 			return errors.New("receipt handle version mismatch for partitioned queue")
 		}
+		// handle.Partition is client-controlled once decodeClientReceiptHandle
+		// accepts v2. Without this bound check, an out-of-range partition
+		// falls through to sqsMsg*KeyDispatch and depends on downstream
+		// routing failure semantics instead of returning ReceiptHandleIsInvalid.
+		if handle.Partition >= meta.PartitionCount {
+			return errors.New("receipt handle partition out of range for queue")
+		}
 		return nil
 	}
 	if handle.Version != sqsReceiptHandleVersion1 {
