@@ -53,12 +53,17 @@ func sqsMsgVisKeyDispatch(meta *sqsQueueMeta, queueName string, partition uint32
 }
 
 // sqsMsgDedupKeyDispatch builds the FIFO dedup key for either
-// keyspace. Dedup scope is per-partition on partitioned queues
-// (DeduplicationScope = messageGroup is enforced by the validator
-// on PartitionCount > 1).
-func sqsMsgDedupKeyDispatch(meta *sqsQueueMeta, queueName string, partition uint32, gen uint64, dedupID string) []byte {
+// keyspace. On a partitioned queue (DeduplicationScope = messageGroup
+// — enforced by the validator on PartitionCount > 1) the dedup window
+// must be per (queue, group, dedupID): two distinct MessageGroupIds
+// that FNV-collide onto the same partition must NOT share a dedup
+// namespace, otherwise a fresh send in group B is silently acked
+// with group A's MessageId. The legacy (non-partitioned) branch
+// keeps the legacy (queue, gen, dedupID) shape — there is only one
+// implicit "group" so no collision is possible there.
+func sqsMsgDedupKeyDispatch(meta *sqsQueueMeta, queueName string, partition uint32, gen uint64, groupID, dedupID string) []byte {
 	if meta != nil && meta.PartitionCount > 1 {
-		return sqsPartitionedMsgDedupKey(queueName, partition, gen, dedupID)
+		return sqsPartitionedMsgDedupKey(queueName, partition, gen, groupID, dedupID)
 	}
 	return sqsMsgDedupKey(queueName, gen, dedupID)
 }

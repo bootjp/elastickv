@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -354,42 +355,76 @@ func TestSQSServer_PartitionedFIFO_PerQueueCollapsesToPartitionZero(t *testing.T
 		"perQueue receive must surface every message in one fanout pass over partition 0")
 }
 
-// TestStartPartitionOffset_RotatesByReadTS pins the regression for
-// the Codex P1 finding on PR #732: with a fixed starting partition
-// of 0, a sustained backlog on partition 0 fills opts.Max before
-// the fanout reaches partition 1, so messages in higher-index
-// partitions are never observed under load. The rotation helper
-// distributes consecutive readTS values across all partitions.
-func TestStartPartitionOffset_RotatesByReadTS(t *testing.T) {
+// TestNextReceiveFanoutStart_RoundRobin pins the round-2 regression:
+// the original PR #732 round-1 fix derived the starting partition
+// from masked readTS bits (XOR-fold of the upper and lower 32-bit
+// halves). Codex P1 round 2 flagged that this can alias to a subset
+// of partitions when readTS advances by a structured stride — HLC
+// packs a 16-bit logical counter into the low bits and ReceiveMessage
+// commits a fixed number of per-message transactions per call, so
+// consecutive readTS deltas exhibit a structured stride.
+//
+// nextReceiveFanoutStart replaces the bit-fold with a per-server
+// atomic counter, so consecutive calls walk every partition in
+// strict round-robin regardless of HLC behaviour. This test pins
+// both the round-robin contract and the explicit aliasing case
+// Codex flagged.
+func TestNextReceiveFanoutStart_RoundRobin(t *testing.T) {
 	t.Parallel()
 
-	// Legacy / non-partitioned / perQueue queues collapse to 0.
-	require.Equal(t, uint32(0), startPartitionOffset(0, 12345))
-	require.Equal(t, uint32(0), startPartitionOffset(1, 12345))
+	s := &SQSServer{}
 
-	// Partitioned queues spread consecutive readTS values across
-	// every partition. HLC advances per receive call, so over
-	// consecutive readTS values every partition appears at least
-	// once as the starting point — without that, partition 0 would
-	// permanently win the fanout race under sustained backlog.
+	// Legacy / non-partitioned / perQueue queues collapse to 0 and
+	// must not perturb the counter.
+	require.Equal(t, uint32(0), s.nextReceiveFanoutStart(0))
+	require.Equal(t, uint32(0), s.nextReceiveFanoutStart(1))
+
+	// Partitioned queues walk every partition in strict round-robin.
+	// 16 consecutive calls over 4 partitions must produce exactly
+	// 4 hits per partition.
 	const partitions uint32 = 4
 	seen := make(map[uint32]int, partitions)
-	for ts := uint64(1); ts <= 64; ts++ {
-		seen[startPartitionOffset(partitions, ts)]++
+	for range 16 {
+		seen[s.nextReceiveFanoutStart(partitions)]++
 	}
 	require.Len(t, seen, int(partitions),
-		"rotation must cover every partition across consecutive readTS; got %v", seen)
+		"counter-driven rotation must cover every partition; got %v", seen)
 	for p := uint32(0); p < partitions; p++ {
-		require.NotZero(t, seen[p],
-			"partition %d never selected as fanout start; got distribution %v", p, seen)
+		require.Equal(t, 4, seen[p],
+			"partition %d hit %d times in 16 calls; round-robin must be exact",
+			p, seen[p])
 	}
 
 	// The output must always fall inside [0, partitions). Validates
 	// the mask-AND contract — partitions is power-of-two, so the
 	// AND with (partitions-1) is equivalent to modulo.
-	for ts := uint64(0); ts < 1024; ts++ {
-		off := startPartitionOffset(partitions, ts)
+	for range 1024 {
+		off := s.nextReceiveFanoutStart(partitions)
 		require.Less(t, off, partitions,
-			"offset %d out of range [0, %d) for ts=%d", off, partitions, ts)
+			"offset %d out of range [0, %d)", off, partitions)
+	}
+
+	// Concurrent receivers must each get a valid offset (no torn
+	// reads, no out-of-range values). Atomicity check.
+	var wg sync.WaitGroup
+	const goroutines = 8
+	const perGoroutine = 256
+	results := make([][]uint32, goroutines)
+	for i := 0; i < goroutines; i++ {
+		results[i] = make([]uint32, perGoroutine)
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < perGoroutine; j++ {
+				results[idx][j] = s.nextReceiveFanoutStart(partitions)
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, batch := range results {
+		for _, off := range batch {
+			require.Less(t, off, partitions,
+				"concurrent offset %d out of range", off)
+		}
 	}
 }

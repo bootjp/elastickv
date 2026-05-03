@@ -35,7 +35,7 @@ func TestSQSKeysDispatch_LegacyMatchesLegacyConstructor(t *testing.T) {
 			sqsMsgVisKeyDispatch(nil, queue, 0, gen, ts, msgID),
 			sqsMsgVisKey(queue, gen, ts, msgID)},
 		{"meta=nil dedup",
-			sqsMsgDedupKeyDispatch(nil, queue, 0, gen, dedupID),
+			sqsMsgDedupKeyDispatch(nil, queue, 0, gen, groupID, dedupID),
 			sqsMsgDedupKey(queue, gen, dedupID)},
 		{"meta=nil group",
 			sqsMsgGroupKeyDispatch(nil, queue, 0, gen, groupID),
@@ -66,7 +66,7 @@ func TestSQSKeysDispatch_LegacyMatchesLegacyConstructor(t *testing.T) {
 			sqsMsgVisKeyDispatch(&sqsQueueMeta{PartitionCount: 1}, queue, 0, gen, ts, msgID),
 			sqsMsgVisKey(queue, gen, ts, msgID)},
 		{"meta.PartitionCount=1 dedup",
-			sqsMsgDedupKeyDispatch(&sqsQueueMeta{PartitionCount: 1}, queue, 0, gen, dedupID),
+			sqsMsgDedupKeyDispatch(&sqsQueueMeta{PartitionCount: 1}, queue, 0, gen, groupID, dedupID),
 			sqsMsgDedupKey(queue, gen, dedupID)},
 		{"meta.PartitionCount=1 group",
 			sqsMsgGroupKeyDispatch(&sqsQueueMeta{PartitionCount: 1}, queue, 0, gen, groupID),
@@ -119,8 +119,8 @@ func TestSQSKeysDispatch_PartitionedMatchesPartitionedConstructor(t *testing.T) 
 			sqsMsgVisKeyDispatch(meta, queue, partition, gen, ts, msgID),
 			sqsPartitionedMsgVisKey(queue, partition, gen, ts, msgID)},
 		{"dedup",
-			sqsMsgDedupKeyDispatch(meta, queue, partition, gen, dedupID),
-			sqsPartitionedMsgDedupKey(queue, partition, gen, dedupID)},
+			sqsMsgDedupKeyDispatch(meta, queue, partition, gen, groupID, dedupID),
+			sqsPartitionedMsgDedupKey(queue, partition, gen, groupID, dedupID)},
 		{"group",
 			sqsMsgGroupKeyDispatch(meta, queue, partition, gen, groupID),
 			sqsPartitionedMsgGroupKey(queue, partition, gen, groupID)},
@@ -165,6 +165,47 @@ func TestSQSKeysDispatch_BoundaryAtPartitionCount2(t *testing.T) {
 	legacy := sqsMsgDataKey(queue, gen, msgID)
 	require.NotEqual(t, legacy, got,
 		"PartitionCount=2 must NOT route to the legacy keyspace")
+}
+
+// TestSQSDedupKeyDispatch_PartitionedScopesByMessageGroupId is the
+// regression for the round-3 P1 (Codex) on PR #732: with
+// DeduplicationScope=messageGroup on a partitioned queue the dedup
+// key MUST include MessageGroupId so two distinct groups that
+// FNV-collide onto the same partition do NOT share a dedup
+// namespace. Without the group segment, a fresh send in group "B"
+// reusing group "A"'s dedup-id would be silently acked with group
+// "A"'s MessageId — that is a data-loss outcome.
+func TestSQSDedupKeyDispatch_PartitionedScopesByMessageGroupId(t *testing.T) {
+	t.Parallel()
+	meta := &sqsQueueMeta{PartitionCount: 4}
+	const (
+		queue     = "events.fifo"
+		gen       = uint64(11)
+		partition = uint32(2)
+		dedupID   = "shared-token"
+	)
+	keyA := sqsMsgDedupKeyDispatch(meta, queue, partition, gen, "groupA", dedupID)
+	keyB := sqsMsgDedupKeyDispatch(meta, queue, partition, gen, "groupB", dedupID)
+	require.NotEqual(t, keyA, keyB,
+		"distinct MessageGroupIds on the same (queue, partition, dedupID) "+
+			"must produce distinct dedup keys — otherwise a fresh send in "+
+			"groupB is silently dropped as a duplicate of groupA")
+
+	// Same group + same dedupID must round-trip to the same key (the
+	// idempotency contract we DO want to keep).
+	keyA2 := sqsMsgDedupKeyDispatch(meta, queue, partition, gen, "groupA", dedupID)
+	require.Equal(t, keyA, keyA2,
+		"same (group, dedupID) must produce the same dedup key — "+
+			"AWS idempotent-by-design retries depend on this")
+
+	// Legacy (non-partitioned) path is unaffected: groupID is ignored
+	// because there is only one implicit group on a non-partitioned
+	// queue and the legacy key shape predates partitioning.
+	legacyA := sqsMsgDedupKeyDispatch(nil, queue, 0, gen, "groupA", dedupID)
+	legacyB := sqsMsgDedupKeyDispatch(nil, queue, 0, gen, "groupB", dedupID)
+	require.Equal(t, legacyA, legacyB,
+		"legacy keyspace ignores groupID — preserves the on-disk shape "+
+			"for queues created before partitioning landed")
 }
 
 // TestSQSKeysDispatch_LegacyAndPartitionedAreDistinct pins the

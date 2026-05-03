@@ -881,7 +881,7 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	// deterministic), so cross-partition iteration order does not
 	// reorder messages within any group.
 	partitions := effectivePartitionCount(meta)
-	startOffset := startPartitionOffset(partitions, readTS)
+	startOffset := s.nextReceiveFanoutStart(partitions)
 	for i := uint32(0); i < partitions; i++ {
 		if len(delivered) >= opts.Max {
 			break
@@ -904,33 +904,35 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	return delivered, nil
 }
 
-// startPartitionOffset rotates the receive-fanout starting partition
-// by readTS so a sustained backlog on a single partition cannot
-// starve the others. With a fixed start at 0, opts.Max would fill
-// from partition 0 on every call and messages in higher-index
-// partitions would never be observed while the head queue stays
-// hot — the regression Codex flagged as P1 on PR #732. readTS is
-// HLC-derived and advances per call, so consecutive Receives land
-// on different partitions without any per-server state.
+// nextReceiveFanoutStart advances the per-server atomic counter and
+// returns the starting partition index for this receive call. With
+// PartitionCount power-of-two (validator invariant), mask-AND is
+// equivalent to modulo, so consecutive receives walk every partition
+// in strict round-robin — no aliasing to a subset of partitions even
+// when readTS advances by a structured stride.
 //
-// Returns 0 on legacy / non-partitioned queues (partitions <= 1).
+// The round-1 fix used a readTS-bit fold for rotation. Codex P1
+// round 2 flagged a real aliasing concern: HLC packs a 16-bit logical
+// counter in the low bits of readTS and ReceiveMessage commits a
+// fixed number of per-message transactions per call, so consecutive
+// readTS deltas exhibit a structured stride. With partitions=4 and
+// stride=10 the masked fold alternates between two starts (0,2,0,2,…)
+// — partitions 1 and 3 never appear as the start. A per-server
+// counter sidesteps the entire HLC-bit-pattern question.
 //
-// PartitionCount is power-of-two by the validator invariant
-// (htfifoValidatePartitionCount), so mask-AND is equivalent to
-// modulo. The byte-slice fold spreads entropy from both halves of
-// readTS (HLC physical-ms in the upper bits, logical counter in the
-// lower bits) into the final uint32 without an explicit uint64 →
-// uint32 narrowing — which gosec G115 would flag on a safe-by-
-// construction conversion. Mirrors the entirely-in-uint32 pattern
-// in partitionFor (sqs_partitioning.go).
-func startPartitionOffset(partitions uint32, readTS uint64) uint32 {
+// Returns 0 on legacy / non-partitioned queues (partitions <= 1) so
+// the counter is not perturbed for non-partitioned receives — those
+// always start at the only partition that exists.
+//
+// The counter is per-server (not Raft-replicated) because fanout
+// distribution is a local-fairness property: every node already sees
+// every message via its own receive scans, and "this node's
+// distribution is balanced" is the only invariant that matters.
+func (s *SQSServer) nextReceiveFanoutStart(partitions uint32) uint32 {
 	if partitions <= 1 {
 		return 0
 	}
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], readTS)
-	folded := binary.BigEndian.Uint32(buf[0:4]) ^ binary.BigEndian.Uint32(buf[4:8])
-	return folded & (partitions - 1)
+	return s.receiveFanoutCounter.Add(1) & (partitions - 1)
 }
 
 // scanAndDeliverPartition pages the visibility index for one

@@ -91,8 +91,12 @@ func resolveFifoDedupID(meta *sqsQueueMeta, in sqsSendMessageInput) string {
 // or (nil, nil) when there is no live record for this dedup-id.
 // Expired records are surfaced as nil so a stale entry does not block
 // a fresh send within the same FIFO queue.
-func (s *SQSServer) loadFifoDedupRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, dedupID string, readTS uint64) (*sqsFifoDedupRecord, []byte, error) {
-	key := sqsMsgDedupKeyDispatch(meta, queueName, partition, gen, dedupID)
+//
+// groupID is the MessageGroupId; it participates in the partitioned
+// dedup key so that two groups colliding onto the same partition keep
+// disjoint dedup namespaces (the AWS messageGroup-scope contract).
+func (s *SQSServer) loadFifoDedupRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, groupID, dedupID string, readTS uint64) (*sqsFifoDedupRecord, []byte, error) {
+	key := sqsMsgDedupKeyDispatch(meta, queueName, partition, gen, groupID, dedupID)
 	raw, err := s.store.GetAt(ctx, key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -179,7 +183,7 @@ func (s *SQSServer) sendFifoMessage(
 	// perQueue throughput short-circuit, so the dispatch helpers
 	// round-trip to legacy output for those cases.
 	partition := partitionFor(meta, in.MessageGroupId)
-	dedup, dedupKey, err := s.loadFifoDedupRecord(ctx, queueName, meta, partition, meta.Generation, dedupID, readTS)
+	dedup, dedupKey, err := s.loadFifoDedupRecord(ctx, queueName, meta, partition, meta.Generation, in.MessageGroupId, dedupID, readTS)
 	if err != nil {
 		return nil, false, err
 	}

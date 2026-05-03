@@ -312,18 +312,25 @@ func sqsPartitionedMsgVisPrefixForQueue(queueName string, partition uint32, gen 
 }
 
 // sqsPartitionedMsgDedupKey builds the FIFO dedup key for a
-// partitioned queue. The dedup window is per-partition by design
-// (DeduplicationScope=messageGroup with PartitionCount>1) — the
-// validator in adapter/sqs_partitioning.go rejects the queue-scoped
-// scope on partitioned queues, so this key shape is always reachable
-// from the same partition that ran the dedup check.
-func sqsPartitionedMsgDedupKey(queueName string, partition uint32, gen uint64, dedupID string) []byte {
+// partitioned queue. DeduplicationScope=messageGroup (the only
+// scope reachable on partitioned queues — the validator in
+// adapter/sqs_partitioning.go rejects queue-scoped dedup) requires
+// the dedup window to be per (queue, group, dedupID): two distinct
+// MessageGroupIds that happen to FNV-collide onto the same partition
+// must NOT share a dedup namespace, otherwise a fresh send in group B
+// would be silently acked with group A's MessageId. Per design doc
+// §4.1 line 200, the dedup key keys on (queue, partition, group,
+// dedupID); partition is redundant given the deterministic group→
+// partition map but is kept for keyspace organization (every key
+// belonging to a group lives under the same partition prefix).
+func sqsPartitionedMsgDedupKey(queueName string, partition uint32, gen uint64, groupID, dedupID string) []byte {
 	buf := make([]byte, 0, len(SqsPartitionedMsgDedupPrefix)+sqsKeyCapLarge)
 	buf = append(buf, SqsPartitionedMsgDedupPrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
 	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
+	buf = append(buf, encodeSQSSegment(groupID)...)
 	buf = append(buf, encodeSQSSegment(dedupID)...)
 	return buf
 }

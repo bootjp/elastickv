@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -167,6 +168,15 @@ type SQSServer struct {
 	// throttle config so unconfigured queues pay one nil-check per
 	// request and nothing else (see sqs_throttle.go).
 	throttle *bucketStore
+	// receiveFanoutCounter advances once per partitioned receive call
+	// to pick the fanout starting partition. Using a per-server
+	// atomic counter (instead of the readTS-bit fold the round-1 fix
+	// shipped) guarantees true round-robin coverage across partitions
+	// even when readTS advances by a structured stride — the case
+	// Codex flagged as P1 round 2 (HLC's 16-bit logical counter +
+	// fixed per-receive transaction count can produce stride patterns
+	// that masked-AND alias to a subset of partitions).
+	receiveFanoutCounter atomic.Uint32
 }
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
