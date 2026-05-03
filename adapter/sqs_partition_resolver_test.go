@@ -69,7 +69,7 @@ func TestSQSPartitionResolver_ResolveByPartition(t *testing.T) {
 			for familyName, key := range map[string][]byte{
 				"data":  sqsPartitionedMsgDataKey(tc.queue, tc.partition, 1, "msg-id"),
 				"vis":   sqsPartitionedMsgVisKey(tc.queue, tc.partition, 1, 1700000000000, "msg-id"),
-				"dedup": sqsPartitionedMsgDedupKey(tc.queue, tc.partition, 1, "dedup-id"),
+				"dedup": sqsPartitionedMsgDedupKey(tc.queue, tc.partition, 1, "group-id", "dedup-id"),
 				"group": sqsPartitionedMsgGroupKey(tc.queue, tc.partition, 1, "group-id"),
 				"byage": sqsPartitionedMsgByAgeKey(tc.queue, tc.partition, 1, 1700000000000, "msg-id"),
 			} {

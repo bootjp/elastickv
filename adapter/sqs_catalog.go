@@ -1012,6 +1012,12 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// the new queue starts with a fresh full-capacity bucket
 	// regardless of in-flight traffic to the prior incarnation.
 	s.throttle.invalidateQueue(requested.Name)
+	// Mirror the throttle invalidate for the per-queue fanout-rotation
+	// counter. A delete-then-create race could otherwise leave the
+	// new queue starting partitioned receives at the previous
+	// incarnation's counter offset (harmless for correctness, but
+	// ties new-queue routing to old-queue history).
+	s.dropReceiveFanoutCounter(requested.Name)
 	return true, nil
 }
 
@@ -1038,6 +1044,12 @@ func (s *SQSServer) deleteQueue(w http.ResponseWriter, r *http.Request) {
 	// surprising operators who use DeleteQueue+CreateQueue to reset
 	// queue state.
 	s.throttle.invalidateQueue(name)
+	// Drop the per-queue fanout-rotation counter as well. Without
+	// this, repeated DeleteQueue of unique queue names retains one
+	// receiveFanoutCounters entry per name for the process lifetime
+	// — a leak in multi-tenant / high-churn deployments. Codex P2,
+	// PR #732 round 5.
+	s.dropReceiveFanoutCounter(name)
 	// SQS DeleteQueue returns 200 with an empty body.
 	writeSQSJSON(w, map[string]any{})
 }
