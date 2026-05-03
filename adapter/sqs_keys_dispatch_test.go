@@ -208,6 +208,75 @@ func TestSQSDedupKeyDispatch_PartitionedScopesByMessageGroupId(t *testing.T) {
 			"for queues created before partitioning landed")
 }
 
+// TestSqsPartitionedMsgDedupKey_GroupDedupSeparator pins the round-6
+// fix for the CodeRabbit major: encodeSQSSegment uses RawURLEncoding
+// (no padding, alphabet [A-Za-z0-9_-]), so when groupID and dedupID
+// segments are concatenated WITHOUT a separator, distinct (group,
+// dedup) pairs can collapse onto the same byte sequence — most
+// trivially when one of the two is empty (("", "abcd") vs ("abcd",
+// "") encode identically as base64). Even with non-empty inputs the
+// boundary is fragile because the per-segment length depends on the
+// input length mod 3. The fix is a single sqsPartitionedQueueTerminator
+// '|' between the two segments; '|' is outside RawURLEncoding's
+// alphabet so it cannot be produced by either encodeSQSSegment call,
+// making the boundary unambiguous regardless of input length.
+func TestSqsPartitionedMsgDedupKey_GroupDedupSeparator(t *testing.T) {
+	t.Parallel()
+	const (
+		queue     = "events.fifo"
+		gen       = uint64(11)
+		partition = uint32(2)
+	)
+
+	// (1) The empty-segment collision class. SQS validation
+	// rejects empty group / dedup IDs at the public API, but the
+	// key constructor must still be unambiguous on its own — a
+	// future code path that passes an empty string (intentionally
+	// or via a bug) must NOT silently merge keyspaces. Without the
+	// terminator: ("", "abcd") and ("abcd", "") produce the same
+	// "...QUJDRA" suffix.
+	keyEmptyGroup := sqsPartitionedMsgDedupKey(queue, partition, gen, "", "abcd")
+	keyEmptyDedup := sqsPartitionedMsgDedupKey(queue, partition, gen, "abcd", "")
+	require.NotEqual(t, keyEmptyGroup, keyEmptyDedup,
+		"('', 'abcd') and ('abcd', '') must produce distinct keys — "+
+			"the terminator is the only thing that disambiguates them")
+
+	// (2) The separator must appear AFTER the encoded groupID,
+	// BEFORE the encoded dedupID. Build the expected suffix
+	// "<b64(groupID)>|<b64(dedupID)>" and assert the key ends with
+	// it. RawURLEncoding's alphabet (A-Z a-z 0-9 - _) excludes '|'
+	// so neither segment can contribute one of its own — finding
+	// the literal "|" between them therefore proves the round-6
+	// terminator is in place. (We can't just count '|' because the
+	// SqsPartitionedMsgDedupPrefix constant itself contains '|'
+	// separators inside the family-name marker.)
+	key := sqsPartitionedMsgDedupKey(queue, partition, gen, "groupA", "dedup-token")
+	wantTail := append(append([]byte(encodeSQSSegment("groupA")), '|'), encodeSQSSegment("dedup-token")...)
+	require.True(t, bytes.HasSuffix(key, wantTail),
+		"key must end with <b64(group)>|<b64(dedup)>; got key=%q want suffix=%q",
+		key, wantTail)
+
+	// (3) Round-trip: two non-empty pairs whose b64 lengths align
+	// at the segment boundary must still produce distinct keys.
+	// Without a terminator, a regression that re-introduces back-
+	// to-back encoding could (for some lengths) make these match.
+	keyAB := sqsPartitionedMsgDedupKey(queue, partition, gen, "ab", "cd")
+	keyABCD := sqsPartitionedMsgDedupKey(queue, partition, gen, "abcd", "")
+	require.NotEqual(t, keyAB, keyABCD,
+		"('ab', 'cd') and ('abcd', '') must produce distinct keys")
+
+	// (4) Read-write symmetry: the dispatch helper used by
+	// loadFifoDedupRecord (read) and sendFifoMessage (write) MUST
+	// route to the same constructor so both sides observe the same
+	// new format simultaneously — no read/write skew window.
+	meta := &sqsQueueMeta{PartitionCount: 4}
+	viaDispatch := sqsMsgDedupKeyDispatch(meta, queue, partition, gen, "groupA", "dedup-token")
+	require.Equal(t, key, viaDispatch,
+		"dispatch helper must produce the same bytes as the underlying "+
+			"constructor — round-6 format change must be picked up "+
+			"symmetrically on read and write paths")
+}
+
 // TestSQSKeysDispatch_LegacyAndPartitionedAreDistinct pins the
 // keyspace-isolation invariant at the dispatch level: a legacy
 // (PartitionCount=1) key and a partitioned (PartitionCount>1) key

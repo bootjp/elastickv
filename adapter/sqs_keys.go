@@ -331,6 +331,16 @@ func sqsPartitionedMsgDedupKey(queueName string, partition uint32, gen uint64, g
 	buf = appendU32(buf, partition)
 	buf = appendU64(buf, gen)
 	buf = append(buf, encodeSQSSegment(groupID)...)
+	// Terminator between the variable-length groupID and dedupID
+	// segments. encodeSQSSegment uses base64.RawURLEncoding (no
+	// padding), so back-to-back segments are not unambiguously
+	// splittable and distinct (groupID, dedupID) pairs can collapse
+	// onto the same key — reintroducing the cross-group false-
+	// duplicate class the round-3 dedup-scoping fix closed. The
+	// terminator '|' is safe because RawURLEncoding never emits it
+	// (alphabet is A-Z a-z 0-9 - _; see sqsPartitionedQueueTerminator
+	// docs). CodeRabbit major, PR #732 round 6.
+	buf = append(buf, sqsPartitionedQueueTerminator)
 	buf = append(buf, encodeSQSSegment(dedupID)...)
 	return buf
 }
