@@ -254,6 +254,14 @@ func (s *SQSServer) sendFifoMessage(
 		}
 		return nil, false, errors.WithStack(err)
 	}
+	// Hot-partition observability (§11 PR 7): record the per-
+	// (queue, partition) send so dashboards can spot uneven
+	// MessageGroupId distributions. Only partitioned queues emit
+	// (PartitionCount > 1); for legacy queues partition is always
+	// 0 and the metric would be uninformative + cardinality cost.
+	if meta.PartitionCount > 1 {
+		s.observePartitionMessage(queueName, partition, SQSPartitionActionSend)
+	}
 	return map[string]string{
 		"MessageId":              rec.MessageID,
 		"MD5OfMessageBody":       rec.MD5OfBody,

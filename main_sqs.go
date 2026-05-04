@@ -27,6 +27,7 @@ func startSQSServer(
 	region string,
 	credentialsFile string,
 	partitionResolver *adapter.SQSPartitionResolver,
+	partitionObserver adapter.SQSPartitionObserver,
 ) (*adapter.SQSServer, error) {
 	sqsAddr = strings.TrimSpace(sqsAddr)
 	if sqsAddr == "" {
@@ -49,6 +50,7 @@ func startSQSServer(
 		adapter.WithSQSRegion(region),
 		adapter.WithSQSStaticCredentials(staticCreds),
 		adapter.WithSQSPartitionResolver(partitionResolver),
+		adapter.WithSQSPartitionObserver(partitionObserver),
 	)
 	// Two-goroutine shutdown pattern mirrors startS3Server: one goroutine waits
 	// on either ctx.Done() or Run completion to call Stop, the other runs the

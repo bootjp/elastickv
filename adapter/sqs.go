@@ -200,7 +200,35 @@ type SQSServer struct {
 	// check so partitioned queues can land on a single-shard
 	// cluster and route through the engine's default group.
 	partitionResolver *SQSPartitionResolver
+	// partitionObserver records the
+	// elastickv_sqs_partition_messages_total{queue, partition,
+	// action} counter for HT-FIFO operations (PR 7a). nil on
+	// non-monitored test fixtures and on single-binary CLI
+	// tools that build SQSServer without a monitoring registry.
+	// Increment call sites use a nil-receiver-safe call so the
+	// metrics path costs nothing when unwired.
+	partitionObserver SQSPartitionObserver
 }
+
+// SQSPartitionObserver is the metrics-package interface
+// (monitoring.SQSPartitionObserver) re-declared here so the
+// adapter does not import monitoring at the package boundary —
+// matches the existing observer pattern for DynamoDB / Redis.
+type SQSPartitionObserver interface {
+	ObservePartitionMessage(queue string, partition uint32, action string)
+}
+
+// SQSPartitionAction* mirror the action label values from
+// monitoring.SQSPartitionAction*. Re-declared so adapter call
+// sites do not need a monitoring import; the observer interface
+// validates the value at runtime so a drift between these
+// constants and the monitoring side surfaces as a dropped
+// observation rather than a wedge.
+const (
+	SQSPartitionActionSend    = "send"
+	SQSPartitionActionReceive = "receive"
+	SQSPartitionActionDelete  = "delete"
+)
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
 // forward requests from followers to the current leader. Format mirrors
@@ -212,6 +240,28 @@ func WithSQSLeaderMap(m map[string]string) SQSServerOption {
 			s.leaderSQS[k] = v
 		}
 	}
+}
+
+// WithSQSPartitionObserver installs the
+// elastickv_sqs_partition_messages_total counter observer on the
+// SQS server. Pass nil (the default) on non-monitored test
+// fixtures; the partitioned send / receive / delete paths then
+// observe via a nil interface and the metric stays at zero. The
+// monitoring registry's SQSPartitionObserver() returns the
+// concrete implementation in production.
+func WithSQSPartitionObserver(o SQSPartitionObserver) SQSServerOption {
+	return func(s *SQSServer) { s.partitionObserver = o }
+}
+
+// observePartitionMessage is a nil-receiver-safe wrapper around
+// the configured observer. Pulled into a helper so the call
+// sites in send / receive / delete each cost one branch instead
+// of repeating the nil check.
+func (s *SQSServer) observePartitionMessage(queue string, partition uint32, action string) {
+	if s == nil || s.partitionObserver == nil {
+		return
+	}
+	s.partitionObserver.ObservePartitionMessage(queue, partition, action)
 }
 
 // WithSQSPartitionResolver installs the cluster's partition
