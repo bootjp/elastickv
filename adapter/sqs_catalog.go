@@ -903,13 +903,15 @@ func (s *SQSServer) createQueueCore(ctx context.Context, in *sqsCreateQueueInput
 	if err != nil {
 		return "", err
 	}
-	// Temporary dormancy gate (Phase 3.D §11 PR 2). PartitionCount > 1
-	// must reject until PR 5 wires the data plane atomically with the
-	// gate-lift. Without this, accepting a partitioned-queue create
-	// would let SendMessage write under the legacy single-partition
-	// prefix; the PR 5 reader would never find those messages and the
-	// reaper would not enumerate them — silent message loss.
-	if err := validatePartitionDormancyGate(requested); err != nil {
+	// Cluster-wide htfifo capability gate (Phase 3.D §11 PR 5b-3,
+	// replaces the PR 2 dormancy reject). PartitionCount > 1 is
+	// rejected unless this binary AND every peer in s.leaderSQS
+	// advertise the htfifo capability via /sqs_health. The gate
+	// fails closed on any peer timeout, HTTP error, malformed body,
+	// or missing capability so a partitioned queue cannot land in a
+	// partially-upgraded cluster where some peer would silently
+	// store its records under the legacy single-partition keyspace.
+	if err := s.validateHTFIFOCapability(ctx, requested); err != nil {
 		return "", err
 	}
 	if len(in.Tags) > sqsMaxTagsPerQueue {

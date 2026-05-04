@@ -6,13 +6,16 @@ import (
 	"testing"
 )
 
-// TestSQSServer_HTFIFO_DormancyGate_RejectsPartitionedCreate pins
-// the §11 PR 2 dormancy gate at the wire layer: CreateQueue with
-// PartitionCount > 1 rejects with InvalidAttributeValue and the
-// gate's reason ("not yet enabled") makes it into the operator-
-// visible message. Removed in PR 5 in the same commit that wires
-// the data plane.
-func TestSQSServer_HTFIFO_DormancyGate_RejectsPartitionedCreate(t *testing.T) {
+// TestSQSServer_HTFIFO_CapabilityGate_AcceptsOnSingleNode pins the
+// §11 PR 5b-3 gate-lift at the wire layer on a single-node cluster:
+// CreateQueue with PartitionCount > 1 now succeeds because the local
+// binary advertises htfifo and there are no peers to poll. This test
+// replaces the prior PR 2 dormancy-reject test (which expected a 400
+// with "not yet enabled" — the dormancy gate has been removed). The
+// peer-rejection class is exercised in
+// sqs_capability_gate_test.go where a fake peer can be wired in
+// without a multi-node cluster.
+func TestSQSServer_HTFIFO_CapabilityGate_AcceptsOnSingleNode(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
@@ -26,24 +29,18 @@ func TestSQSServer_HTFIFO_DormancyGate_RejectsPartitionedCreate(t *testing.T) {
 				"PartitionCount": n,
 			},
 		})
-		if status != http.StatusBadRequest {
-			t.Fatalf("PartitionCount=%s: status %d (expected 400 from dormancy gate); body=%v", n, status, out)
-		}
-		if got, _ := out["__type"].(string); got != sqsErrInvalidAttributeValue {
-			t.Fatalf("PartitionCount=%s: __type=%q (expected InvalidAttributeValue)", n, got)
-		}
-		msg, _ := out["message"].(string)
-		if msg == "" || !strings.Contains(msg, "not yet enabled") {
-			t.Fatalf("PartitionCount=%s: message %q must mention the gate reason", n, msg)
+		if status != http.StatusOK {
+			t.Fatalf("PartitionCount=%s on single-node cluster: status %d (expected 200 after gate-lift); body=%v", n, status, out)
 		}
 	}
 }
 
-// TestSQSServer_HTFIFO_DormancyGate_AllowsPartitionCountOne pins
+// TestSQSServer_HTFIFO_CapabilityGate_AllowsPartitionCountOne pins
 // the no-op-partition-count path: PartitionCount=1 is the legacy
-// single-partition layout and must pass the dormancy gate even on
-// FIFO queues that explicitly set the field.
-func TestSQSServer_HTFIFO_DormancyGate_AllowsPartitionCountOne(t *testing.T) {
+// single-partition layout and bypasses the capability gate
+// entirely (validateHTFIFOCapability short-circuits on
+// PartitionCount <= 1).
+func TestSQSServer_HTFIFO_CapabilityGate_AllowsPartitionCountOne(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
@@ -62,9 +59,9 @@ func TestSQSServer_HTFIFO_DormancyGate_AllowsPartitionCountOne(t *testing.T) {
 }
 
 // TestSQSServer_HTFIFO_RejectsNonPowerOfTwoPartitionCount pins the
-// validator's power-of-two rule. The validator runs before the
-// dormancy gate so an invalid count (3) reports the validator's
-// reason, not the gate's.
+// validator's power-of-two rule. The schema validator runs before
+// the capability gate so an invalid count (3) reports the
+// validator's reason, not the gate's.
 func TestSQSServer_HTFIFO_RejectsNonPowerOfTwoPartitionCount(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -112,16 +109,13 @@ func TestSQSServer_HTFIFO_RejectsHTFIFOAttrsOnStandardQueue(t *testing.T) {
 // the §3.2 cross-attribute control-plane gate at the wire layer.
 // {PartitionCount > 1, DeduplicationScope = "queue"} is rejected by
 // validatePartitionConfig (the schema validator) which runs inside
-// parseAttributesIntoMeta — that is, BEFORE validatePartitionDormancyGate
-// runs in createQueue. So the cross-attr rejection is what the wire
-// layer sees today, even though the dormancy gate would also reject
-// the same input on its own. After PR 5 lifts the dormancy gate the
-// cross-attr rule remains the sole rejection path.
+// parseAttributesIntoMeta — that is, BEFORE the capability gate
+// (validateHTFIFOCapability) ever runs. The schema rejection is the
+// sole rejection path after the PR 5b-3 dormancy gate-lift.
 //
 // The test only checks the 400 status to stay agnostic about which
-// validator fires first — both are correct behaviour, and a future
-// reordering of the createQueue control flow does not need to break
-// this test.
+// validator fires first — a future reordering of the createQueue
+// control flow does not need to break this test.
 func TestSQSServer_HTFIFO_RejectsQueueScopedDedupOnPartitioned(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -145,8 +139,9 @@ func TestSQSServer_HTFIFO_RejectsQueueScopedDedupOnPartitioned(t *testing.T) {
 // the §3.2 immutability rule at the wire layer: SetQueueAttributes
 // attempts to change PartitionCount / FifoThroughputLimit /
 // DeduplicationScope reject with InvalidAttributeValue. Test creates
-// a single-partition FIFO queue (allowed by dormancy) with
-// FifoThroughputLimit set, then tries to change it.
+// a single-partition FIFO queue (which bypasses the capability
+// gate entirely) with FifoThroughputLimit set, then tries to
+// change it.
 func TestSQSServer_HTFIFO_ImmutabilitySetQueueAttributesRejects(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -252,9 +247,10 @@ func TestSQSServer_HTFIFO_GetQueueAttributesRoundTrip(t *testing.T) {
 // --- helpers ---
 
 // mustCreateFIFOWithThroughputLimit creates a single-partition FIFO
-// queue (allowed by the §11 PR 2 dormancy gate) with the requested
-// FifoThroughputLimit set. Used by the immutability tests so they
-// have a non-empty FifoThroughputLimit to attempt to change.
+// queue (PartitionCount=1 bypasses the §11 PR 5b-3 capability
+// gate) with the requested FifoThroughputLimit set. Used by the
+// immutability tests so they have a non-empty FifoThroughputLimit
+// to attempt to change.
 func mustCreateFIFOWithThroughputLimit(t *testing.T, node Node, name, limit string) string {
 	t.Helper()
 	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{

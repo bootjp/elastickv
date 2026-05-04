@@ -253,24 +253,6 @@ func TestValidatePartitionConfig_PerMessageGroupIDRequiresExplicitPartitionCount
 	}))
 }
 
-// --- validatePartitionDormancyGate unit tests ---
-
-// TestValidatePartitionDormancyGate_RejectsAboveOne pins the §11
-// PR 2 dormancy gate: PartitionCount > 1 must reject until PR 5
-// lifts the gate. PartitionCount 0 or 1 must pass (both are the
-// legacy single-partition layout).
-func TestValidatePartitionDormancyGate_RejectsAboveOne(t *testing.T) {
-	t.Parallel()
-	require.NoError(t, validatePartitionDormancyGate(&sqsQueueMeta{PartitionCount: 0}))
-	require.NoError(t, validatePartitionDormancyGate(&sqsQueueMeta{PartitionCount: 1}))
-	for _, n := range []uint32{2, 4, 8, 16, 32} {
-		err := validatePartitionDormancyGate(&sqsQueueMeta{PartitionCount: n})
-		require.Error(t, err, "PartitionCount=%d must reject under the dormancy gate", n)
-		require.Contains(t, err.Error(), "not yet enabled",
-			"the gate's reason must surface to the operator")
-	}
-}
-
 // --- validatePartitionImmutability unit tests ---
 
 // TestValidatePartitionImmutability_RejectsAnyChange pins the §3.2
