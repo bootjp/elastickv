@@ -86,11 +86,15 @@ func (m *SQSMetrics) ObservePartitionMessage(queue string, partition uint32, act
 		return
 	}
 	queueLabel := m.queueLabelForCardinalityBudget(queue)
-	m.partitionMessages.With(prometheus.Labels{
-		"queue":     queueLabel,
-		"partition": strconv.FormatUint(uint64(partition), 10),
-		"action":    action,
-	}).Inc()
+	// WithLabelValues avoids the prometheus.Labels map allocation
+	// on every observe call. Label order matches the
+	// NewCounterVec declaration: queue, partition, action.
+	// Mirrors DynamoDBMetrics.
+	m.partitionMessages.WithLabelValues(
+		queueLabel,
+		strconv.FormatUint(uint64(partition), 10),
+		action,
+	).Inc()
 }
 
 // queueLabelForCardinalityBudget returns queue if the metric has
