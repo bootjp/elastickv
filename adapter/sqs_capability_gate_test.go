@@ -112,10 +112,10 @@ func TestValidateHTFIFOCapability_RejectsWhenOnePeerLacksCapability(t *testing.T
 	require.True(t, ok, "must surface as sqsAPIError so the wire layer maps to InvalidAttributeValue, got %T", err)
 	require.Equal(t, http.StatusBadRequest, apiErr.status)
 	require.Equal(t, sqsErrInvalidAttributeValue, apiErr.errorType)
-	require.Contains(t, apiErr.message, "every cluster peer to advertise the htfifo capability",
-		"message must explain the gate so the operator knows what to fix")
-	require.Contains(t, apiErr.message, oldAddr,
-		"the offending peer must appear in the message, got %q", apiErr.message)
+	require.Equal(t, htfifoCapabilityRejectionPublic, apiErr.message,
+		"client message must be the sanitized constant — peer addresses live in server logs (CodeRabbit major)")
+	require.NotContains(t, apiErr.message, oldAddr,
+		"peer host:port MUST NOT leak through the wire-level rejection")
 }
 
 // TestValidateHTFIFOCapability_RejectsWhenPeerUnreachable pins
@@ -145,8 +145,10 @@ func TestValidateHTFIFOCapability_RejectsWhenPeerUnreachable(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, http.StatusBadRequest, apiErr.status)
 	require.Equal(t, sqsErrInvalidAttributeValue, apiErr.errorType)
-	require.Contains(t, apiErr.message, deadAddr,
-		"unreachable peer must be named in the rejection message")
+	require.Equal(t, htfifoCapabilityRejectionPublic, apiErr.message,
+		"client message must be the sanitized constant — transport error text lives in server logs (CodeRabbit major)")
+	require.NotContains(t, apiErr.message, deadAddr,
+		"peer host:port MUST NOT leak through the wire-level rejection")
 }
 
 // TestCollectSQSPeers_Deterministic pins the helper's order +
@@ -174,11 +176,15 @@ func TestCollectSQSPeers_Deterministic(t *testing.T) {
 	require.Empty(t, (&SQSServer{}).collectSQSPeers())
 }
 
-// TestBuildHTFIFOCapabilityRejection_ShapesOperatorMessage pins the
-// rejection-message shape so a future refactor cannot accidentally
-// truncate the per-peer detail. Each failing peer must contribute
-// a "(reason)" suffix; peers that pass do not appear at all.
-func TestBuildHTFIFOCapabilityRejection_ShapesOperatorMessage(t *testing.T) {
+// TestFormatHTFIFOCapabilityReportForLog_ShapesServerSideDetail
+// pins the SERVER-SIDE log helper's shape — never returned to the
+// client (CodeRabbit major review on PR #734: peer addresses + raw
+// poller errors leak cluster topology to authenticated callers).
+// Each failing peer must contribute a "(reason)" suffix so an
+// operator triaging a rolling-upgrade cluster can fix the lag from
+// the log lines without rerunning the poll out-of-band; peers that
+// pass do not appear.
+func TestFormatHTFIFOCapabilityReportForLog_ShapesServerSideDetail(t *testing.T) {
 	t.Parallel()
 
 	report := &HTFIFOCapabilityReport{
@@ -189,15 +195,41 @@ func TestBuildHTFIFOCapabilityRejection_ShapesOperatorMessage(t *testing.T) {
 		},
 	}
 
-	msg := buildHTFIFOCapabilityRejection(report)
-	require.Contains(t, msg, "every cluster peer to advertise the htfifo capability")
-	require.NotContains(t, msg, "ok:9000", "advertising peers must NOT appear in the rejection")
-	require.Contains(t, msg, "old:9000 (missing capability)")
-	require.Contains(t, msg, "down:9000 (dial tcp: refused)")
+	detail := formatHTFIFOCapabilityReportForLog(report)
+	require.NotContains(t, detail, "ok:9000", "advertising peers must NOT appear in the log detail")
+	require.Contains(t, detail, "old:9000 (missing capability)")
+	require.Contains(t, detail, "down:9000 (dial tcp: refused)")
 
 	// Defensive: nil report and "all-passing-but-AllAdvertise-false" path.
-	require.Contains(t, buildHTFIFOCapabilityRejection(nil), "no report")
+	require.Contains(t, formatHTFIFOCapabilityReportForLog(nil), "no report")
 	allPass := &HTFIFOCapabilityReport{Peers: []HTFIFOCapabilityPeerStatus{{Address: "x", HasHTFIFO: true}}}
-	require.Contains(t, buildHTFIFOCapabilityRejection(allPass), "unknown peer",
-		"never emit a truncated 'did not: ' tail when no peer details surface")
+	require.Contains(t, formatHTFIFOCapabilityReportForLog(allPass), "unknown peer",
+		"never emit an empty detail when no peer reasons surface")
+}
+
+// TestValidateHTFIFOCapability_PublicMessageDoesNotLeakPeerDetails
+// pins the CodeRabbit major review's redaction contract: the
+// client-visible InvalidAttributeValue message MUST NOT include
+// peer addresses or raw poller error text. The two failure-path
+// tests above check that the gate REJECTS; this test specifically
+// checks that the rejection message is the sanitized
+// htfifoCapabilityRejectionPublic constant — no host:port, no raw
+// transport error.
+func TestValidateHTFIFOCapability_PublicMessageDoesNotLeakPeerDetails(t *testing.T) {
+	t.Parallel()
+
+	old := htfifoCapabilityServer(t, []string{}) // no htfifo
+	oldAddr := strings.TrimPrefix(old.URL, "http://")
+	s := &SQSServer{leaderSQS: map[string]string{"raft1": oldAddr}}
+
+	err := s.validateHTFIFOCapability(context.Background(), &sqsQueueMeta{Name: "q.fifo", PartitionCount: 4})
+	require.Error(t, err)
+	var apiErr *sqsAPIError
+	require.True(t, errors.As(err, &apiErr))
+	require.Equal(t, htfifoCapabilityRejectionPublic, apiErr.message,
+		"client message must be the sanitized constant, never the per-peer detail")
+	require.NotContains(t, apiErr.message, oldAddr,
+		"peer host:port MUST NOT appear in the wire-level rejection — operator detail is server-side only")
+	require.Contains(t, apiErr.message, "see server logs for details",
+		"public message must point operators at the server-side detail")
 }

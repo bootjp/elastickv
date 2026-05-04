@@ -481,9 +481,10 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 	// docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md). Set
 	// at CreateQueue time; SetQueueAttributes attempts to change it
 	// reject via the immutability check in trySetQueueAttributesOnce.
-	// PR 2 of the rollout introduces the field but the temporary
-	// dormancy gate in tryCreateQueueOnce rejects PartitionCount > 1
-	// until PR 5 lifts the gate atomically with the data plane.
+	// PartitionCount > 1 is gated by validateHTFIFOCapability (the
+	// cluster-wide htfifo capability poll, PR 5b-3) which runs
+	// inside tryCreateQueueOnce after the existence check so
+	// idempotent retries do not pay the network cost.
 	"PartitionCount": func(m *sqsQueueMeta, v string) error {
 		// Parse at uint64 width and bound-check explicitly so the
 		// uint32 narrowing below is gosec-clean.
@@ -903,17 +904,12 @@ func (s *SQSServer) createQueueCore(ctx context.Context, in *sqsCreateQueueInput
 	if err != nil {
 		return "", err
 	}
-	// Cluster-wide htfifo capability gate (Phase 3.D §11 PR 5b-3,
-	// replaces the PR 2 dormancy reject). PartitionCount > 1 is
-	// rejected unless this binary AND every peer in s.leaderSQS
-	// advertise the htfifo capability via /sqs_health. The gate
-	// fails closed on any peer timeout, HTTP error, malformed body,
-	// or missing capability so a partitioned queue cannot land in a
-	// partially-upgraded cluster where some peer would silently
-	// store its records under the legacy single-partition keyspace.
-	if err := s.validateHTFIFOCapability(ctx, requested); err != nil {
-		return "", err
-	}
+	// The cluster-wide htfifo capability gate (Phase 3.D §11 PR 5b-3)
+	// runs INSIDE tryCreateQueueOnce after the existence check, not
+	// here. Idempotent CreateQueue retries on an already-existing
+	// partitioned queue must NOT pay the network poll cost or risk a
+	// transient peer-poll failure flipping a 200-OK retry into a 400
+	// (Codex P1 review on PR #734).
 	if len(in.Tags) > sqsMaxTagsPerQueue {
 		// AWS caps tags per queue at 50. CreateQueue must reject
 		// over-cap tag bundles up front; a silent slice-and-store
@@ -962,6 +958,23 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 			return true, nil
 		}
 		return false, newSQSAPIError(http.StatusBadRequest, sqsErrQueueNameExists, "queue already exists with different attributes")
+	}
+	// Cluster-wide htfifo capability gate (Phase 3.D §11 PR 5b-3,
+	// replaces the PR 2 dormancy reject). PartitionCount > 1 is
+	// rejected unless this binary AND every peer in s.leaderSQS
+	// advertise the htfifo capability via /sqs_health. Fails closed
+	// on any peer timeout, HTTP error, malformed body, or missing
+	// capability so a partitioned queue cannot land in a partially-
+	// upgraded cluster.
+	//
+	// Runs AFTER the existence check (so idempotent CreateQueue
+	// retries on an already-existing partitioned queue do not pay
+	// the network poll cost or risk a transient peer-poll failure
+	// flipping a 200-OK retry into a 400 — Codex P1 review on PR
+	// #734) and BEFORE the dispatch (so a rejected create does not
+	// burn an OCC commit).
+	if err := s.validateHTFIFOCapability(ctx, requested); err != nil {
+		return false, err
 	}
 	lastGen, err := s.loadQueueGenerationAt(ctx, requested.Name, readTS)
 	if err != nil {

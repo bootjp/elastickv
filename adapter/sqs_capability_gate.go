@@ -2,10 +2,20 @@ package adapter
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 )
+
+// htfifoCapabilityRejectionPublic is the sanitized client-facing
+// reason returned from validateHTFIFOCapability when the cluster
+// poll fails. Per CodeRabbit major review: peer addresses and raw
+// poller error text MUST NOT leak to authenticated clients (the
+// CreateQueue surface is part of the public AWS-shaped API), so
+// the wire-level message is intentionally generic and the per-peer
+// detail goes to slog.Warn for operator triage.
+const htfifoCapabilityRejectionPublic = "PartitionCount > 1 requires every cluster peer to advertise the htfifo capability via /sqs_health; one or more peers did not — see server logs for details"
 
 // validateHTFIFOCapability is the §11 PR 5b-3 gate that replaced the
 // PR 2 dormancy reject. CreateQueue calls this on every request; it
@@ -53,8 +63,18 @@ func (s *SQSServer) validateHTFIFOCapability(ctx context.Context, requested *sqs
 	}
 	report := PollSQSHTFIFOCapability(ctx, peers, PollerConfig{})
 	if report == nil || !report.AllAdvertise {
+		// Log the full per-peer detail for operator triage. The
+		// client-visible message stays generic (no peer addresses,
+		// no raw poller error text) so the CreateQueue surface
+		// does not leak cluster topology to authenticated callers
+		// — CodeRabbit major review on PR #734.
+		slog.Warn("sqs: htfifo capability gate rejected partitioned CreateQueue",
+			"queueName", requested.Name,
+			"partitionCount", requested.PartitionCount,
+			"peerCount", len(peers),
+			"detail", formatHTFIFOCapabilityReportForLog(report))
 		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			buildHTFIFOCapabilityRejection(report))
+			htfifoCapabilityRejectionPublic)
 	}
 	return nil
 }
@@ -86,15 +106,17 @@ func (s *SQSServer) collectSQSPeers() []string {
 	return peers
 }
 
-// buildHTFIFOCapabilityRejection composes the operator-facing message
-// for a failed capability poll. Lists the peers that did not
-// advertise htfifo (with the per-peer Error or "missing capability"
-// reason) so the operator can fix the rolling-upgrade lag without
-// rerunning the poll out-of-band. Order matches report.Peers, which
-// matches collectSQSPeers' sorted input order — deterministic.
-func buildHTFIFOCapabilityRejection(report *HTFIFOCapabilityReport) string {
+// formatHTFIFOCapabilityReportForLog composes the per-peer detail
+// surfaced to slog.Warn when the gate rejects. Lists each failing
+// peer's address and reason (per-peer Error or "missing capability")
+// so an operator triaging a partial-rolling-upgrade cluster can fix
+// the lag from the server logs without rerunning the poll
+// out-of-band. NEVER returned to the client — that path uses the
+// sanitized htfifoCapabilityRejectionPublic constant. Order matches
+// report.Peers, which matches collectSQSPeers' sorted input order —
+// deterministic so log lines diff cleanly across runs.
+func formatHTFIFOCapabilityReportForLog(report *HTFIFOCapabilityReport) string {
 	var b strings.Builder
-	b.WriteString("PartitionCount > 1 requires every cluster peer to advertise the htfifo capability via /sqs_health; the following peers did not: ")
 	if report == nil {
 		b.WriteString("(no report)")
 		return b.String()
@@ -120,7 +142,7 @@ func buildHTFIFOCapabilityRejection(report *HTFIFOCapabilityReport) string {
 	if first {
 		// Defensive: AllAdvertise was false but no peer surfaced a
 		// reason. Should never happen, but emit a non-empty hint
-		// rather than a truncated message ending in a colon.
+		// rather than a truncated empty string.
 		b.WriteString("(unknown peer)")
 	}
 	return b.String()

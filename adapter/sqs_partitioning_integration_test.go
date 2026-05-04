@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestSQSServer_HTFIFO_CapabilityGate_AcceptsOnSingleNode pins the
@@ -32,6 +34,74 @@ func TestSQSServer_HTFIFO_CapabilityGate_AcceptsOnSingleNode(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("PartitionCount=%s on single-node cluster: status %d (expected 200 after gate-lift); body=%v", n, status, out)
 		}
+	}
+}
+
+// TestSQSServer_HTFIFO_CapabilityGate_IsIdempotentOnExistingQueue
+// pins the Codex P1 review fix on PR #734: a CreateQueue retry on
+// an already-existing partitioned queue with identical attributes
+// MUST return 200 (idempotent) even when the cluster-wide
+// capability poll would now fail. Before the fix, the gate ran
+// before the existence check, so a transient peer outage during
+// a CreateQueue retry would flip a 200-OK idempotent response
+// into a 400. Now the gate runs INSIDE tryCreateQueueOnce after
+// the existence check; an existing queue with matching attrs
+// short-circuits to 200 and never touches the network.
+//
+// The test creates a partitioned queue on a single-node cluster
+// (gate passes vacuously), then poisons the SQSServer's peer
+// map with an unreachable address so any subsequent gate
+// invocation would reject. The second CreateQueue with identical
+// attrs must still succeed; only an actually-new partitioned
+// queue would now fail the gate.
+func TestSQSServer_HTFIFO_CapabilityGate_IsIdempotentOnExistingQueue(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	attrs := map[string]string{
+		"FifoQueue":      "true",
+		"PartitionCount": "4",
+	}
+
+	// First create — succeeds because the leaderSQS map is empty
+	// and the local binary advertises htfifo (vacuous gate).
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "htfifo-idempotent.fifo",
+		"Attributes": attrs,
+	})
+	require.Equal(t, http.StatusOK, status,
+		"first create on single-node cluster must succeed: body=%v", out)
+
+	// Poison the peer map with an unreachable address. Any gate
+	// invocation from this point would call PollSQSHTFIFOCapability
+	// against this dead peer and fail closed → 400. The
+	// post-fix code path skips the gate on an existing-queue
+	// match, so the next create must STILL succeed.
+	require.NotNil(t, node.sqsServer)
+	node.sqsServer.leaderSQS = map[string]string{
+		"raft-fake": "127.0.0.1:1", // unreachable: connection refused
+	}
+
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "htfifo-idempotent.fifo",
+		"Attributes": attrs,
+	})
+	require.Equal(t, http.StatusOK, status,
+		"second create with identical attrs must be idempotent (gate must NOT run on existing-queue match) — Codex P1 PR #734; body=%v", out)
+
+	// Sanity: the gate IS still in effect for genuinely new
+	// partitioned queues — a different name with the poisoned
+	// peer map must fail the gate.
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "htfifo-newqueue.fifo",
+		"Attributes": attrs,
+	})
+	require.Equal(t, http.StatusBadRequest, status,
+		"new partitioned queue must hit the gate when a peer is unreachable: body=%v", out)
+	if got, _ := out["__type"].(string); got != sqsErrInvalidAttributeValue {
+		t.Fatalf("new queue: __type=%q (expected InvalidAttributeValue)", got)
 	}
 }
 
