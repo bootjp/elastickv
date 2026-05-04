@@ -1074,7 +1074,7 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
 		readTS := s.nextTxnReadTS(ctx)
-		_, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
+		existing, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -1095,6 +1095,14 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 		metaKey := sqsQueueMetaKey(queueName)
 		genKey := sqsQueueGenKey(queueName)
 		tombstoneKey := sqsQueueTombstoneKey(queueName, lastGen)
+		// Encode the queue's PartitionCount in the tombstone value so
+		// the reaper can drive partition iteration off the tombstone
+		// alone — meta is gone by the time the reaper observes the
+		// tombstone (PR 6a). Legacy / non-partitioned queues fall
+		// through to the byte-identical []byte{1} sentinel via the
+		// PartitionCount<=1 branch in encodeQueueTombstoneValue, so
+		// existing on-disk tombstones are byte-identical to today.
+		tombstoneValue := encodeQueueTombstoneValue(existing.PartitionCount)
 		// StartTS + ReadKeys fence against a concurrent CreateQueue /
 		// SetQueueAttributes landing between our load and dispatch.
 		req := &kv.OperationGroup[kv.OP]{
@@ -1104,7 +1112,7 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.Del, Key: metaKey},
 				{Op: kv.Put, Key: genKey, Value: []byte(strconv.FormatUint(lastGen+1, 10))},
-				{Op: kv.Put, Key: tombstoneKey, Value: []byte{1}},
+				{Op: kv.Put, Key: tombstoneKey, Value: tombstoneValue},
 			},
 		}
 		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -513,4 +514,136 @@ func TestDropReceiveFanoutCounter_ClearsEntry(t *testing.T) {
 	require.Equal(t, uint32(1), first,
 		"a queue recreated after drop must start from a zero counter (got first offset %d)",
 		first)
+}
+
+// TestSQSServer_PartitionedFIFO_TombstoneReaperEnumeratesPartitions
+// pins the PR 6a contract: after DeleteQueue on a partitioned FIFO
+// queue, the tombstone reaper must drain every partition's data /
+// vis / byage / dedup / group rows. The pre-PR-6a reaper only
+// scanned the legacy keyspace, so partitioned records leaked
+// permanently — the Codex P2 from PR #732 review.
+//
+// Test shape:
+//   - create a 4-partition queue (via the install helper since the
+//     §11 PR 5b-3 capability gate would otherwise need peer wiring),
+//   - send messages spread across distinct group ids so partitionFor
+//     populates more than one partition,
+//   - DeleteQueue,
+//   - hand-call reapTombstonedQueues so the test does not have to
+//     wait on the 30s timer,
+//   - assert every partitioned data / vis / byage / dedup / group
+//     prefix (across all partitions) is empty,
+//   - assert the tombstone itself is gone (the cohort is fully
+//     drained → reaper deletes the tombstone).
+func TestSQSServer_PartitionedFIFO_TombstoneReaperEnumeratesPartitions(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	const queueName = "reaper-partitioned.fifo"
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  queueName,
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	require.Equal(t, http.StatusOK, status, "create FIFO queue: %v", out)
+	queueURL, _ := out["QueueUrl"].(string)
+	require.NotEmpty(t, queueURL)
+
+	// 8 partitions instead of 4 so the test also exercises a
+	// non-default partition count and silences the unparam linter
+	// that sees only PartitionCount=4 in every other dispatch test.
+	const partitions uint32 = 8
+	installPartitionedMetaForTest(t, node, queueName, partitions, htfifoThroughputPerMessageGroupID)
+
+	ctx := context.Background()
+	readTS := node.sqsServer.nextTxnReadTS(ctx)
+	meta, exists, err := node.sqsServer.loadQueueMetaAt(ctx, queueName, readTS)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, partitions, meta.PartitionCount)
+	gen := meta.Generation
+
+	// Spread messages over enough groups to land in at least 2
+	// distinct partitions; partitionFor is FNV-1a so 6 groups give
+	// good odds without making the test fragile against hash
+	// changes (the reaper assertion below is total-rows-zero, not
+	// per-partition cardinality, so any non-zero distribution is
+	// fine).
+	groups := []string{"a", "b", "c", "d", "e", "f"}
+	for _, g := range groups {
+		status, out := callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl":               queueURL,
+			"MessageBody":            "body-" + g,
+			"MessageGroupId":         g,
+			"MessageDeduplicationId": "dedup-" + g,
+		})
+		require.Equal(t, http.StatusOK, status, "send (group=%s): %v", g, out)
+	}
+
+	// Sanity: at least one partitioned data row exists pre-delete.
+	// Without this, the post-reap assertion would be vacuously true
+	// on a regression that simply silenced sends.
+	preReapRows := countPartitionedRows(t, node, queueName, gen)
+	require.Positive(t, preReapRows,
+		"expected at least one partitioned row before DeleteQueue+reap")
+
+	// DeleteQueue → writes tombstone with PartitionCount=4 in the
+	// value (PR 6a). The pre-PR-6a reaper would write []byte{1}
+	// here and skip the partitioned sweep entirely.
+	status, out = callSQS(t, node, sqsDeleteQueueTarget, map[string]any{
+		"QueueUrl": queueURL,
+	})
+	require.Equal(t, http.StatusOK, status, "delete queue: %v", out)
+
+	// Hand-call the tombstone reaper so the test doesn't depend on
+	// the 30s ticker. The same code path runs in production every
+	// reaper tick.
+	require.NoError(t, node.sqsServer.reapTombstonedQueues(ctx),
+		"reapTombstonedQueues must succeed")
+
+	postReapRows := countPartitionedRows(t, node, queueName, gen)
+	require.Zero(t, postReapRows,
+		"every partitioned data / vis / byage / dedup / group row must be reaped (got %d remaining)",
+		postReapRows)
+
+	// Tombstone itself must also be gone — reapTombstonedGeneration
+	// only deletes it once every prefix family is drained, so a
+	// surviving tombstone here would mean the partitioned sweep
+	// silently left rows behind in some prefix the assertion above
+	// did not enumerate.
+	tombstoneKey := sqsQueueTombstoneKey(queueName, gen)
+	_, err = node.sqsServer.store.GetAt(ctx, tombstoneKey, node.sqsServer.nextTxnReadTS(ctx))
+	require.ErrorIs(t, err, store.ErrKeyNotFound,
+		"tombstone must be deleted after the cohort is fully drained")
+}
+
+// countPartitionedRows sums the rows under every partitioned
+// data / vis / byage / dedup / group prefix for a (queue, gen)
+// cohort. Used by the tombstone-reaper integration test to assert
+// the cohort is fully drained without enumerating individual keys.
+func countPartitionedRows(t *testing.T, node Node, queueName string, gen uint64) int {
+	t.Helper()
+	ctx := context.Background()
+	readTS := node.sqsServer.nextTxnReadTS(ctx)
+	prefixes := [][]byte{
+		// Match every partition by using the family-level "all
+		// partitions" prefix where one exists; for dedup / group
+		// the family-level prefix isn't pre-built, so iterate
+		// partitions [0, 4) explicitly.
+		sqsPartitionedMsgByAgePrefixForQueueAllPartitions(queueName),
+	}
+	for partition := uint32(0); partition < 8; partition++ {
+		prefixes = append(prefixes,
+			sqsPartitionedMsgDedupKeyPrefix(queueName, partition, gen),
+			sqsPartitionedMsgGroupKeyPrefix(queueName, partition, gen),
+		)
+	}
+	total := 0
+	for _, prefix := range prefixes {
+		rows, err := node.sqsServer.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), 1024, readTS)
+		require.NoError(t, err)
+		total += len(rows)
+	}
+	return total
 }

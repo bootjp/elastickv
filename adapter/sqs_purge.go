@@ -96,6 +96,15 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 	// (which is keyed on the post-purge gen). reapDeadByAge filters
 	// by exact generation, so the older cohort is never visited.
 	tombstoneKey := sqsQueueTombstoneKey(queueName, lastGen)
+	// Encode the pre-purge generation's PartitionCount in the
+	// tombstone value so the reaper can enumerate partitioned
+	// dedup / group / byage prefixes for that cohort (PR 6a).
+	// PartitionCount is immutable across SetQueueAttributes /
+	// PurgeQueue (§3.2 immutability rule), so the post-purge meta
+	// and the pre-purge tombstone agree on the partition count.
+	// Legacy / non-partitioned queues still write []byte{1} via
+	// the encoder's PartitionCount<=1 branch.
+	tombstoneValue := encodeQueueTombstoneValue(meta.PartitionCount)
 	// StartTS + ReadKeys fence against a concurrent CreateQueue /
 	// DeleteQueue / SetQueueAttributes / PurgeQueue landing between
 	// our load and dispatch. ErrWriteConflict surfaces via the
@@ -107,7 +116,7 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 		Elems: []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: metaKey, Value: metaBytes},
 			{Op: kv.Put, Key: genKey, Value: []byte(strconv.FormatUint(meta.Generation, 10))},
-			{Op: kv.Put, Key: tombstoneKey, Value: []byte{1}},
+			{Op: kv.Put, Key: tombstoneKey, Value: tombstoneValue},
 		},
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {

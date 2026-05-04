@@ -133,6 +133,52 @@ func sqsQueueTombstoneKey(queueName string, gen uint64) []byte {
 	return buf
 }
 
+// encodeQueueTombstoneValue packs a queue's PartitionCount into the
+// tombstone value so the reaper can drive partition iteration off
+// the tombstone alone (the meta record is gone by the time the
+// reaper observes the tombstone). Eight bytes big-endian uint64
+// chosen so that a future encoding revision can co-exist (length
+// branches) without breaking the legacy-value fallback.
+//
+// Legacy tombstones written by pre-PR-6a binaries carry the
+// single-byte sentinel []byte{1}; decodeQueueTombstoneValue maps
+// every non-canonical length to PartitionCount=1, so the reaper
+// silently keeps the legacy single-partition behaviour for them.
+func encodeQueueTombstoneValue(partitionCount uint32) []byte {
+	if partitionCount <= 1 {
+		// Preserve the byte-identical legacy value for tombstones
+		// of non-partitioned queues so on-disk diffs stay small
+		// across the rollout. Reaper treats legacy and 1-partition
+		// shapes identically.
+		return []byte{1}
+	}
+	out := make([]byte, sqsGenerationSuffixLen)
+	binary.BigEndian.PutUint64(out, uint64(partitionCount))
+	return out
+}
+
+// decodeQueueTombstoneValue extracts the PartitionCount written by
+// encodeQueueTombstoneValue. Returns 1 for legacy values (the
+// single-byte sentinel []byte{1}, the empty value, or any other
+// non-8-byte payload) so a binary that has never written a
+// partitioned tombstone safely degrades to legacy reaper behaviour.
+// A canonical 8-byte value with PartitionCount==0 is also clamped
+// to 1 because partitionFor / effectivePartitionCount already
+// collapse 0 to 1 on the read side; uniform clamping keeps the
+// reaper's loop bound consistent.
+func decodeQueueTombstoneValue(value []byte) uint32 {
+	if len(value) != sqsGenerationSuffixLen {
+		return 1
+	}
+	pc := binary.BigEndian.Uint64(value)
+	if pc == 0 || pc > uint64(htfifoMaxPartitions) {
+		return 1
+	}
+	// Bounded by htfifoMaxPartitions (=32) immediately above, so
+	// the uint32 narrow cannot overflow.
+	return uint32(pc) //nolint:gosec // bounded by htfifoMaxPartitions
+}
+
 // sqsGenerationSuffixLen is the byte length of the trailing big-endian
 // uint64 generation segment in tombstone and byage keys.
 const sqsGenerationSuffixLen = 8
@@ -389,6 +435,50 @@ func sqsPartitionedMsgByAgePrefixForQueueAllPartitions(queueName string) []byte 
 	buf = append(buf, SqsPartitionedMsgByAgePrefix...)
 	buf = append(buf, encodeSQSSegment(queueName)...)
 	buf = append(buf, sqsPartitionedQueueTerminator)
+	return buf
+}
+
+// sqsPartitionedMsgByAgePrefixForPartition returns the byage scan
+// prefix bound to one (queue, partition, gen) cohort. Used by the
+// tombstone reaper to enumerate the partitioned byage keyspace one
+// partition at a time so the per-queue scan budget translates
+// cleanly to a per-partition budget — exactly the §6 split-queue-
+// FIFO design's "partitions × budget" reaper contract (PR 6).
+func sqsPartitionedMsgByAgePrefixForPartition(queueName string, partition uint32, gen uint64) []byte {
+	buf := make([]byte, 0, len(SqsPartitionedMsgByAgePrefix)+sqsKeyCapSmall)
+	buf = append(buf, SqsPartitionedMsgByAgePrefix...)
+	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
+	buf = appendU32(buf, partition)
+	buf = appendU64(buf, gen)
+	return buf
+}
+
+// sqsPartitionedMsgDedupKeyPrefix returns the dedup scan prefix
+// bound to one (queue, partition, gen) cohort. Tombstone reaper
+// pairs this with deleteAllPrefix to clean up partitioned dedup
+// records left behind by a deleted / purged partitioned queue
+// (the Codex P2 deferred from PR 5b-2 round 0).
+func sqsPartitionedMsgDedupKeyPrefix(queueName string, partition uint32, gen uint64) []byte {
+	buf := make([]byte, 0, len(SqsPartitionedMsgDedupPrefix)+sqsKeyCapSmall)
+	buf = append(buf, SqsPartitionedMsgDedupPrefix...)
+	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
+	buf = appendU32(buf, partition)
+	buf = appendU64(buf, gen)
+	return buf
+}
+
+// sqsPartitionedMsgGroupKeyPrefix returns the group-lock scan
+// prefix bound to one (queue, partition, gen) cohort. Mirrors
+// sqsPartitionedMsgDedupKeyPrefix.
+func sqsPartitionedMsgGroupKeyPrefix(queueName string, partition uint32, gen uint64) []byte {
+	buf := make([]byte, 0, len(SqsPartitionedMsgGroupPrefix)+sqsKeyCapSmall)
+	buf = append(buf, SqsPartitionedMsgGroupPrefix...)
+	buf = append(buf, encodeSQSSegment(queueName)...)
+	buf = append(buf, sqsPartitionedQueueTerminator)
+	buf = appendU32(buf, partition)
+	buf = appendU64(buf, gen)
 	return buf
 }
 
