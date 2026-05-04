@@ -21,6 +21,7 @@ type Registry struct {
 	hotPath       *HotPathMetrics
 	pebble        *PebbleMetrics
 	writeConflict *WriteConflictMetrics
+	sqs           *SQSMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -43,6 +44,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.hotPath = newHotPathMetrics(registerer)
 	r.pebble = newPebbleMetrics(registerer)
 	r.writeConflict = newWriteConflictMetrics(registerer)
+	r.sqs = newSQSMetrics(registerer)
 	return r
 }
 
@@ -156,6 +158,18 @@ func (r *Registry) SetFSMApplySyncMode(activeLabel string) {
 		return
 	}
 	r.pebble.SetFSMApplySyncMode(activeLabel)
+}
+
+// SQSPartitionObserver returns the HT-FIFO partition-messages
+// observer backed by this registry. Returns nil when the registry
+// itself is nil so adapter call sites can pass the result through
+// without checking; SQSMetrics.ObservePartitionMessage is also
+// nil-receiver safe.
+func (r *Registry) SQSPartitionObserver() SQSPartitionObserver {
+	if r == nil {
+		return nil
+	}
+	return r.sqs
 }
 
 // WriteConflictCollector returns a collector that polls each MVCC

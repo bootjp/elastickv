@@ -893,6 +893,10 @@ func startServers(in serversInput) error {
 		// which case validateHTFIFOCapability skips the routing-
 		// coverage check (Codex P1 review on PR #734, round 2).
 		sqsPartitionResolver: buildSQSPartitionResolverConcrete(in.cfg.sqsFifoPartitionMap),
+		// sqsPartitionObserver: the metrics registry's HT-FIFO
+		// partition counter observer. nil when --metricsAddress is
+		// empty (the adapter then no-ops the observe call).
+		sqsPartitionObserver: in.metricsRegistry.SQSPartitionObserver(),
 		metricsAddress:       *metricsAddr,
 		metricsToken:         *metricsToken,
 		pprofAddress:         *pprofAddr,
@@ -1480,6 +1484,13 @@ type runtimeServerRunner struct {
 	// the coverage check.
 	sqsPartitionResolver *adapter.SQSPartitionResolver
 
+	// sqsPartitionObserver records the
+	// elastickv_sqs_partition_messages_total counter (PR 7a) for
+	// HT-FIFO send / receive / delete operations. Sourced from
+	// the monitoring registry; nil-receiver-safe on the adapter
+	// side so a test fixture without a registry can omit it.
+	sqsPartitionObserver adapter.SQSPartitionObserver
+
 	// roleStore is the access-key → role index the leader-side
 	// gRPC AdminForward service uses to re-validate the principal
 	// on every forwarded write. Mirrors what admin.Config.RoleIndex
@@ -1535,7 +1546,7 @@ func (r *runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPartitionResolver)
+	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPartitionResolver, r.sqsPartitionObserver)
 	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}

@@ -1269,6 +1269,15 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 		}
 		return nil, false, errors.WithStack(err)
 	}
+	// Hot-partition observability (§11 PR 7): record the per-
+	// (queue, partition) receive-rotation. Same gating rule as
+	// the send path — only partitioned queues emit (the metric
+	// would be uninformative for legacy queues that always sit
+	// on partition 0). meta is dereferenced above, so we don't
+	// re-check for nil here.
+	if meta.PartitionCount > 1 {
+		s.observePartitionMessage(queueName, cand.partition, SQSPartitionActionReceive)
+	}
 
 	handle, err := encodeReceiptHandleDispatch(meta, cand.partition, gen, cand.messageID, newToken)
 	if err != nil {
@@ -1432,6 +1441,12 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 			return err
 		}
 		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+			// Hot-partition observability (§11 PR 7): record the
+			// successful delete on the partitioned commit branch
+			// only. Legacy queues stay off the metric.
+			if meta != nil && meta.PartitionCount > 1 {
+				s.observePartitionMessage(queueName, handle.Partition, SQSPartitionActionDelete)
+			}
 			return nil
 		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
