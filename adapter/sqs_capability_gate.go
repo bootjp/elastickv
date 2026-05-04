@@ -17,6 +17,15 @@ import (
 // detail goes to slog.Warn for operator triage.
 const htfifoCapabilityRejectionPublic = "PartitionCount > 1 requires every cluster peer to advertise the htfifo capability via /sqs_health; one or more peers did not — see server logs for details"
 
+// htfifoRoutingCoverageRejectionPublic is the sanitized client-
+// facing reason returned when the partition resolver does not
+// cover every partition of the requested queue. Same redaction
+// principle as htfifoCapabilityRejectionPublic: the operator
+// detail (which queue, how many partitions are missing) goes to
+// slog.Warn, the wire message is generic so an authenticated
+// caller cannot probe the operator's --sqsFifoPartitionMap shape.
+const htfifoRoutingCoverageRejectionPublic = "PartitionCount > 1 requires every requested partition to be covered by the cluster's partition routing map; one or more partitions are not routable — see server logs for details"
+
 // validateHTFIFOCapability is the §11 PR 5b-3 gate that replaced the
 // PR 2 dormancy reject. CreateQueue calls this on every request; it
 // is a no-op for legacy / single-partition meta and the full
@@ -55,6 +64,16 @@ func (s *SQSServer) validateHTFIFOCapability(ctx context.Context, requested *sqs
 		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 			"PartitionCount > 1 requires the htfifo capability, which this node does not advertise")
 	}
+	// Routing-coverage check runs INDEPENDENTLY of the peer poll
+	// (and BEFORE it) so the empty-peer-list short-circuit below
+	// does not bypass coverage. A single-node cluster with a
+	// partition resolver installed (rare but possible: operator
+	// pre-configures --sqsFifoPartitionMap before adding peers)
+	// must still reject a partitioned create whose partitions
+	// aren't all routable.
+	if err := s.validateHTFIFORoutingCoverage(requested); err != nil {
+		return err
+	}
 	peers := s.collectSQSPeers()
 	if len(peers) == 0 {
 		// Single-node deployment: the local check above is the
@@ -77,6 +96,49 @@ func (s *SQSServer) validateHTFIFOCapability(ctx context.Context, requested *sqs
 			htfifoCapabilityRejectionPublic)
 	}
 	return nil
+}
+
+// validateHTFIFORoutingCoverage rejects a partitioned CreateQueue
+// when the cluster's --sqsFifoPartitionMap does not cover every
+// requested partition. Without this, a queue could land with
+// PartitionCount=N but only K<N routes installed, and SendMessage
+// on the missing partitions would fail closed at the
+// kv.ShardRouter "no route for key" path → InternalFailure (Codex
+// P1 review on PR #734, round 2).
+//
+// resolver==nil short-circuits to "OK": the cluster has no
+// partitioned routing installed at all, so all keys (including
+// partitioned ones) fall through to the byte-range engine's
+// default group. This preserves the single-shard / no-flag
+// deployment as a working CreateQueue path; the dormancy promise
+// is upheld by the leadership-refusal hook on the catalog group.
+//
+// resolver!=nil + queue not in map → reject (the operator would
+// need to add the queue to --sqsFifoPartitionMap and restart
+// before the create can succeed).
+//
+// resolver!=nil + queue partially mapped (RoutedPartitionCount <
+// PartitionCount) → reject (the missing partitions would
+// fail-close on first SendMessage to a group ID they hash into).
+func (s *SQSServer) validateHTFIFORoutingCoverage(requested *sqsQueueMeta) error {
+	if s.partitionResolver == nil {
+		return nil
+	}
+	routed := s.partitionResolver.RoutedPartitionCount(requested.Name)
+	// Compare in int64 — both sides widen losslessly (int → int64
+	// and uint32 → int64 are always safe), avoiding the gosec G115
+	// narrowing flag we'd hit on int → uint32 even though
+	// PartitionCount is bounded by htfifoMaxPartitions (=32) at the
+	// schema validator before we get here.
+	if int64(routed) >= int64(requested.PartitionCount) {
+		return nil
+	}
+	slog.Warn("sqs: htfifo capability gate rejected partitioned CreateQueue — incomplete routing map",
+		"queueName", requested.Name,
+		"partitionCount", requested.PartitionCount,
+		"routedPartitionCount", routed)
+	return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+		htfifoRoutingCoverageRejectionPublic)
 }
 
 // collectSQSPeers returns every distinct, non-empty SQS-side address

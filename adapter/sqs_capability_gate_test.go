@@ -207,6 +207,129 @@ func TestFormatHTFIFOCapabilityReportForLog_ShapesServerSideDetail(t *testing.T)
 		"never emit an empty detail when no peer reasons surface")
 }
 
+// TestValidateHTFIFOCapability_RejectsWhenRoutingMapMissingQueue
+// pins the Codex P1 review fix on PR #734 round 2: when a partition
+// resolver is installed (--sqsFifoPartitionMap is configured) but
+// the requested queue is NOT in the map, CreateQueue must reject
+// before the meta record commits — silently accepting it would
+// land a queue whose SendMessage / ReceiveMessage calls fail
+// closed at the kv.ShardRouter "no route for key" path on first
+// use, surfacing as InternalFailure to the client.
+func TestValidateHTFIFOCapability_RejectsWhenRoutingMapMissingQueue(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewSQSPartitionResolver(map[string][]uint64{
+		"other-queue.fifo": {100, 101, 102, 103},
+	})
+	require.NotNil(t, resolver)
+	s := &SQSServer{partitionResolver: resolver}
+
+	err := s.validateHTFIFOCapability(context.Background(), &sqsQueueMeta{
+		Name:           "newqueue.fifo",
+		PartitionCount: 4,
+	})
+	require.Error(t, err)
+	var apiErr *sqsAPIError
+	require.True(t, errors.As(err, &apiErr))
+	require.Equal(t, http.StatusBadRequest, apiErr.status)
+	require.Equal(t, sqsErrInvalidAttributeValue, apiErr.errorType)
+	require.Equal(t, htfifoRoutingCoverageRejectionPublic, apiErr.message,
+		"client message must be the sanitized routing-coverage constant — operator detail is in the slog.Warn line")
+}
+
+// TestValidateHTFIFOCapability_RejectsWhenRoutingMapPartiallyCoversQueue
+// is the partial-coverage variant of the routing-map gate: the
+// queue is in the map but with FEWER routes than the requested
+// PartitionCount. SendMessage on the missing partitions would fail
+// closed at the router; the gate must reject before the create
+// commits.
+func TestValidateHTFIFOCapability_RejectsWhenRoutingMapPartiallyCoversQueue(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewSQSPartitionResolver(map[string][]uint64{
+		"queue.fifo": {100, 101}, // only 2 routes
+	})
+	s := &SQSServer{partitionResolver: resolver}
+
+	err := s.validateHTFIFOCapability(context.Background(), &sqsQueueMeta{
+		Name:           "queue.fifo",
+		PartitionCount: 4, // requesting 4 partitions
+	})
+	require.Error(t, err)
+	var apiErr *sqsAPIError
+	require.True(t, errors.As(err, &apiErr))
+	require.Equal(t, sqsErrInvalidAttributeValue, apiErr.errorType)
+	require.Equal(t, htfifoRoutingCoverageRejectionPublic, apiErr.message)
+}
+
+// TestValidateHTFIFOCapability_AcceptsWhenRoutingMapFullyCoversQueue
+// pins the happy path: queue is in the map with at least
+// PartitionCount entries → gate passes. ">=" rather than "=="
+// because over-allocating routes (operator preparing for a future
+// expansion) is harmless: the create only uses indices [0,
+// PartitionCount).
+func TestValidateHTFIFOCapability_AcceptsWhenRoutingMapFullyCoversQueue(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewSQSPartitionResolver(map[string][]uint64{
+		"queue.fifo": {100, 101, 102, 103, 104, 105}, // 6 routes
+	})
+	s := &SQSServer{partitionResolver: resolver}
+
+	require.NoError(t, s.validateHTFIFOCapability(context.Background(), &sqsQueueMeta{
+		Name:           "queue.fifo",
+		PartitionCount: 4, // requesting 4, under the 6 configured
+	}))
+}
+
+// TestValidateHTFIFOCapability_AcceptsWhenResolverNil pins the
+// backward-compat path: a single-shard / no-flag deployment has
+// no partition resolver wired (s.partitionResolver == nil), so
+// the gate's coverage check is skipped and the create proceeds
+// (provided the local + peer-poll checks above also pass). This
+// is what TestSQSServer_HTFIFO_CapabilityGate_AcceptsOnSingleNode
+// exercises end-to-end at the wire level; this unit test is the
+// narrower assertion that the partitionResolver==nil branch is
+// the one that bypasses the coverage check.
+func TestValidateHTFIFOCapability_AcceptsWhenResolverNil(t *testing.T) {
+	t.Parallel()
+	s := &SQSServer{} // partitionResolver implicitly nil
+	require.NoError(t, s.validateHTFIFOCapability(context.Background(), &sqsQueueMeta{
+		Name:           "queue.fifo",
+		PartitionCount: 4,
+	}))
+}
+
+// TestRoutedPartitionCount_NilReceiver pins the typed-nil safety
+// of the resolver method: a nil *SQSPartitionResolver returns 0
+// (no routes) so the gate's "len(routes) < PartitionCount" check
+// rejects naturally rather than panicking. Used by the
+// validateHTFIFORoutingCoverage short-circuit on resolver==nil
+// (the gate skips the coverage check entirely) but also documents
+// the safe-by-default behaviour for any other future caller.
+func TestRoutedPartitionCount_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var r *SQSPartitionResolver
+	require.Equal(t, 0, r.RoutedPartitionCount("anything"))
+}
+
+// TestRoutedPartitionCount_KnownAndUnknownQueue pins the basic
+// API: the count for a configured queue equals len(routes), and
+// 0 for any queue not in the map.
+func TestRoutedPartitionCount_KnownAndUnknownQueue(t *testing.T) {
+	t.Parallel()
+	r := NewSQSPartitionResolver(map[string][]uint64{
+		"a.fifo": {1, 2},
+		"b.fifo": {3, 4, 5, 6, 7, 8, 9, 10},
+	})
+	require.Equal(t, 2, r.RoutedPartitionCount("a.fifo"))
+	require.Equal(t, 8, r.RoutedPartitionCount("b.fifo"))
+	require.Equal(t, 0, r.RoutedPartitionCount("c.fifo"),
+		"unknown queue must return 0, not panic — gate routes that case to InvalidAttributeValue")
+	require.Equal(t, 0, r.RoutedPartitionCount(""),
+		"empty queue name must also return 0")
+}
+
 // TestValidateHTFIFOCapability_PublicMessageDoesNotLeakPeerDetails
 // pins the CodeRabbit major review's redaction contract: the
 // client-visible InvalidAttributeValue message MUST NOT include

@@ -184,6 +184,22 @@ type SQSServer struct {
 	// receives for in-process — bounded by the operator-controlled
 	// CreateQueue rate.
 	receiveFanoutCounters sync.Map
+	// partitionResolver, when non-nil, is the per-cluster resolver
+	// that maps (queue, partition) keys to operator-chosen Raft
+	// groups (built from --sqsFifoPartitionMap, see main.go). The
+	// CreateQueue capability gate (validateHTFIFOCapability) uses
+	// it to verify routing coverage on partitioned creates BEFORE
+	// the meta record commits — without that check, a queue could
+	// land with PartitionCount=N but only K<N routes installed,
+	// and SendMessage on the missing partitions would fail closed
+	// at the router with "no route for key" (Codex P1 review on
+	// PR #734).
+	//
+	// nil on single-shard / no---sqsFifoPartitionMap deployments;
+	// the gate's resolver==nil branch then skips the coverage
+	// check so partitioned queues can land on a single-shard
+	// cluster and route through the engine's default group.
+	partitionResolver *SQSPartitionResolver
 }
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
@@ -196,6 +212,22 @@ func WithSQSLeaderMap(m map[string]string) SQSServerOption {
 			s.leaderSQS[k] = v
 		}
 	}
+}
+
+// WithSQSPartitionResolver installs the cluster's partition
+// resolver on the SQS server so the CreateQueue capability gate
+// (validateHTFIFOCapability) can verify routing coverage before
+// admitting a partitioned create. Pass nil (the default) on
+// single-shard / no---sqsFifoPartitionMap deployments — the gate
+// then skips the coverage check.
+//
+// Callers must ensure the resolver passed here matches the one
+// installed on the kv coordinator via WithPartitionResolver,
+// otherwise the gate would admit a queue that the coordinator
+// then fails to route. main.go builds the resolver once and
+// hands the same pointer to both consumers.
+func WithSQSPartitionResolver(r *SQSPartitionResolver) SQSServerOption {
+	return func(s *SQSServer) { s.partitionResolver = r }
 }
 
 func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator, opts ...SQSServerOption) *SQSServer {

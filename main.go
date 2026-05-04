@@ -519,6 +519,28 @@ func buildLeaderSQS(groups []groupSpec, sqsAddr string, raftSqsMap string) (map[
 // (e.g. a test seeding the map programmatically) gets a clear panic
 // instead of a silent route-to-group-zero.
 func buildSQSPartitionResolver(partitionMap map[string]sqsFifoQueueRouting) kv.PartitionResolver {
+	r := buildSQSPartitionResolverConcrete(partitionMap)
+	if r == nil {
+		// Defensive typed-nil → untyped-nil interface conversion.
+		// The doc on this function explains the typed-nil hazard:
+		// a non-nil interface wrapping a nil concrete pointer
+		// would defeat kv.ShardRouter's `s.partitionResolver !=
+		// nil` short-circuit and cost every request an extra
+		// nil-receiver ResolveGroup call.
+		return nil
+	}
+	return r
+}
+
+// buildSQSPartitionResolverConcrete returns the concrete
+// *adapter.SQSPartitionResolver so the SQS server can install it
+// via WithSQSPartitionResolver and reuse the routing map for the
+// CreateQueue capability gate's coverage check (Codex P1 review
+// on PR #734, round 2). Returns nil when partitionMap is empty —
+// callers that need the kv.PartitionResolver interface must go
+// through buildSQSPartitionResolver to avoid the typed-nil
+// interface trap.
+func buildSQSPartitionResolverConcrete(partitionMap map[string]sqsFifoQueueRouting) *adapter.SQSPartitionResolver {
 	if len(partitionMap) == 0 {
 		return nil
 	}
@@ -540,16 +562,7 @@ func buildSQSPartitionResolver(partitionMap map[string]sqsFifoQueueRouting) kv.P
 		}
 		flat[queue] = ids
 	}
-	r := adapter.NewSQSPartitionResolver(flat)
-	if r == nil {
-		// Defensive: NewSQSPartitionResolver returns nil on an
-		// empty input. The len-check above already short-circuits
-		// for empty partitionMap, so reaching this branch means
-		// the canonicalisation collapsed every entry — surface as
-		// a true nil interface, not a typed-nil pointer wrapper.
-		return nil
-	}
-	return r
+	return adapter.NewSQSPartitionResolver(flat)
 }
 
 // buildSQSFifoPartitionMap parses and validates the
@@ -871,12 +884,21 @@ func startServers(in serversInput) error {
 		leaderSQS:       in.cfg.leaderSQS,
 		sqsRegion:       *sqsRegion,
 		sqsCredsFile:    *sqsCredsFile,
-		metricsAddress:  *metricsAddr,
-		metricsToken:    *metricsToken,
-		pprofAddress:    *pprofAddr,
-		pprofToken:      *pprofToken,
-		metricsRegistry: in.metricsRegistry,
-		roleStore:       roleStore,
+		// sqsPartitionResolver is rebuilt from the same config map
+		// the coordinator's WithPartitionResolver consumes (line
+		// ~328) so the SQS server's CreateQueue capability gate
+		// sees exactly the routes the coordinator will use to
+		// resolve SendMessage / ReceiveMessage / DeleteMessage
+		// dispatch. Returns nil on a non-partitioned cluster, in
+		// which case validateHTFIFOCapability skips the routing-
+		// coverage check (Codex P1 review on PR #734, round 2).
+		sqsPartitionResolver: buildSQSPartitionResolverConcrete(in.cfg.sqsFifoPartitionMap),
+		metricsAddress:       *metricsAddr,
+		metricsToken:         *metricsToken,
+		pprofAddress:         *pprofAddr,
+		pprofToken:           *pprofToken,
+		metricsRegistry:      in.metricsRegistry,
+		roleStore:            roleStore,
 	}
 	if err := runner.start(); err != nil {
 		return err
@@ -1448,6 +1470,16 @@ type runtimeServerRunner struct {
 	// (the mux 404s those paths).
 	sqsServer *adapter.SQSServer
 
+	// sqsPartitionResolver is the concrete pointer to the same
+	// resolver installed on the coordinator (line ~322). startSQSServer
+	// hands this through WithSQSPartitionResolver so the CreateQueue
+	// capability gate can verify routing coverage on partitioned
+	// creates without re-parsing --sqsFifoPartitionMap (Codex P1
+	// review on PR #734, round 2). Nil on single-shard / no-flag
+	// deployments — the gate's resolver==nil branch then skips
+	// the coverage check.
+	sqsPartitionResolver *adapter.SQSPartitionResolver
+
 	// roleStore is the access-key → role index the leader-side
 	// gRPC AdminForward service uses to re-validate the principal
 	// on every forwarded write. Mirrors what admin.Config.RoleIndex
@@ -1503,7 +1535,7 @@ func (r *runtimeServerRunner) start() error {
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
-	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile)
+	sqsServer, err := startSQSServer(r.ctx, r.lc, r.eg, r.sqsAddress, r.shardStore, r.coordinate, r.leaderSQS, r.sqsRegion, r.sqsCredsFile, r.sqsPartitionResolver)
 	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}

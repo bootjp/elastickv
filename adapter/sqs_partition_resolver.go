@@ -119,6 +119,28 @@ func (r *SQSPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
 	return ok
 }
 
+// RoutedPartitionCount returns the number of partition routes
+// configured for queueName, or 0 if the queue is not in the
+// routing map. Used by the CreateQueue capability gate
+// (validateHTFIFOCapability) to verify that EVERY partition of a
+// requested partitioned queue is routable BEFORE the create
+// commits — without this, a queue could land with PartitionCount=N
+// but only K<N routes, and SendMessage on the missing partitions
+// would fail closed at the router with "no route for key" (Codex
+// P1 review on PR #734).
+//
+// A nil receiver returns 0 so the gate's "resolver==nil → skip the
+// coverage check" branch kicks in cleanly: a single-shard /
+// no---sqsFifoPartitionMap deployment has no per-partition routing
+// to verify, and partitioned keys fall through to the engine's
+// default group.
+func (r *SQSPartitionResolver) RoutedPartitionCount(queueName string) int {
+	if r == nil {
+		return 0
+	}
+	return len(r.routes[queueName])
+}
+
 // parsePartitionedSQSKey extracts the (queue, partition) pair from
 // a partitioned-SQS key. Returns ok=false for any key that does not
 // match a partitioned family prefix or that has a malformed queue /
