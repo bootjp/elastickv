@@ -58,7 +58,7 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 		partitionMessages: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_sqs_partition_messages_total",
-				Help: "Total HT-FIFO partition operations by queue, partition, and action (send / receive / delete). Per the §11 PR 7 split-queue-FIFO design contract — gives dashboards a hot-partition signal so operators can spot uneven MessageGroupId distributions.",
+				Help: "Total HT-FIFO partition operations by queue, partition, and action (send / receive / delete). Non-zero only for queues with PartitionCount > 1; use to spot uneven MessageGroupId distributions across partitions.",
 			},
 			[]string{"queue", "partition", "action"},
 		),
