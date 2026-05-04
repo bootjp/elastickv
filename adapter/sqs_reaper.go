@@ -541,16 +541,17 @@ func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, meta *s
 
 // reapOneRecordPartitioned is a thin convenience wrapper around
 // reapOneRecord for the partitioned-byage enumeration: synthesises
-// a meta carrying the tombstone-encoded PartitionCount so the
-// dispatch helpers route to the partitioned key family. Existing
-// fields on the synthetic meta beyond PartitionCount are
-// irrelevant — the dispatch helpers only branch on meta.PartitionCount.
+// a meta carrying any value of PartitionCount > 1 so the dispatch
+// helpers route to the partitioned key family. The exact value is
+// not consulted by the reaper's per-key dispatch path — the
+// helpers only branch on the legacy-vs-partitioned bit
+// (PartitionCount > 1) — so we use the minimum legal partitioned
+// value as a sentinel rather than the queue's real count, which
+// would imply the synthetic meta carries information it actually
+// does not (Claude review on PR #735).
 func (s *SQSServer) reapOneRecordPartitioned(ctx context.Context, queueName string, partition uint32, gen uint64, byAgeKey []byte, messageID string, readTS uint64) error {
-	// PartitionCount > 1 forces the dispatch helpers down the
-	// partitioned branch; the actual count value is read by
-	// effectivePartitionCount on the read path but the reaper's
-	// per-key dispatch only needs the legacy/partitioned bit.
-	syntheticMeta := &sqsQueueMeta{PartitionCount: htfifoMaxPartitions}
+	const partitionedDispatchSentinel uint32 = 2
+	syntheticMeta := &sqsQueueMeta{PartitionCount: partitionedDispatchSentinel}
 	return s.reapOneRecord(ctx, queueName, syntheticMeta, partition, gen, byAgeKey, messageID, readTS)
 }
 

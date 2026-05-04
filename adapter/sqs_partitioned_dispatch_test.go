@@ -630,7 +630,8 @@ func countPartitionedRows(t *testing.T, node Node, queueName string, gen uint64)
 		// Match every partition by using the family-level "all
 		// partitions" prefix where one exists; for dedup / group
 		// the family-level prefix isn't pre-built, so iterate
-		// partitions [0, 4) explicitly.
+		// partitions [0, 8) explicitly to match the test queue's
+		// PartitionCount=8.
 		sqsPartitionedMsgByAgePrefixForQueueAllPartitions(queueName),
 	}
 	for partition := uint32(0); partition < 8; partition++ {

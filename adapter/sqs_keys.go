@@ -133,6 +133,15 @@ func sqsQueueTombstoneKey(queueName string, gen uint64) []byte {
 	return buf
 }
 
+// sqsTombstoneValueLen is the canonical length of the tombstone
+// value emitted by encodeQueueTombstoneValue when PartitionCount
+// > 1. Kept distinct from sqsGenerationSuffixLen (which describes
+// a key-layout constant) even though they both happen to equal 8
+// today — Claude review on PR #735 flagged the borrow as
+// confusing. A future encoding revision (e.g. a length-prefixed
+// version field) can change this without touching key parsers.
+const sqsTombstoneValueLen = 8
+
 // encodeQueueTombstoneValue packs a queue's PartitionCount into the
 // tombstone value so the reaper can drive partition iteration off
 // the tombstone alone (the meta record is gone by the time the
@@ -152,7 +161,7 @@ func encodeQueueTombstoneValue(partitionCount uint32) []byte {
 		// shapes identically.
 		return []byte{1}
 	}
-	out := make([]byte, sqsGenerationSuffixLen)
+	out := make([]byte, sqsTombstoneValueLen)
 	binary.BigEndian.PutUint64(out, uint64(partitionCount))
 	return out
 }
@@ -160,23 +169,31 @@ func encodeQueueTombstoneValue(partitionCount uint32) []byte {
 // decodeQueueTombstoneValue extracts the PartitionCount written by
 // encodeQueueTombstoneValue. Returns 1 for legacy values (the
 // single-byte sentinel []byte{1}, the empty value, or any other
-// non-8-byte payload) so a binary that has never written a
+// non-canonical payload) so a binary that has never written a
 // partitioned tombstone safely degrades to legacy reaper behaviour.
 // A canonical 8-byte value with PartitionCount==0 is also clamped
 // to 1 because partitionFor / effectivePartitionCount already
 // collapse 0 to 1 on the read side; uniform clamping keeps the
 // reaper's loop bound consistent.
+//
+// Reads the value as two big-endian uint32s rather than a single
+// uint64 so the function never narrows uint64→uint32 — gosec's
+// G115 flags every uint64→uint32 conversion regardless of bound,
+// and CLAUDE.md forbids //nolint annotations. The high half must
+// be zero because the encoder only ever writes
+// PartitionCount<=htfifoMaxPartitions (=32) into the low 32 bits;
+// a non-zero high half is therefore a corruption / future-format
+// signal and decodes to PartitionCount=1.
 func decodeQueueTombstoneValue(value []byte) uint32 {
-	if len(value) != sqsGenerationSuffixLen {
+	if len(value) != sqsTombstoneValueLen {
 		return 1
 	}
-	pc := binary.BigEndian.Uint64(value)
-	if pc == 0 || pc > uint64(htfifoMaxPartitions) {
+	highHalf := binary.BigEndian.Uint32(value[:4])
+	lowHalf := binary.BigEndian.Uint32(value[4:])
+	if highHalf != 0 || lowHalf == 0 || lowHalf > htfifoMaxPartitions {
 		return 1
 	}
-	// Bounded by htfifoMaxPartitions (=32) immediately above, so
-	// the uint32 narrow cannot overflow.
-	return uint32(pc) //nolint:gosec // bounded by htfifoMaxPartitions
+	return lowHalf
 }
 
 // sqsGenerationSuffixLen is the byte length of the trailing big-endian
