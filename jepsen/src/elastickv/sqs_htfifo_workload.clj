@@ -574,7 +574,7 @@
    [nil "--send-fraction F" "Probability a generator op is :send (rest are :recv)."
     :default 0.5
     :parse-fn #(Double/parseDouble %)]
-   [nil "--drain-time SECONDS" "Receive-only drain phase after the main generator finishes."
+   [nil "--drain-time SECONDS" "Receive-only drain phase after the main generator finishes (default: visibility-timeout + 10s = 40s)."
     :default nil
     :parse-fn #(Integer/parseInt %)]])
 
