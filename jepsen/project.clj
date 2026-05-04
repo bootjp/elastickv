@@ -13,5 +13,6 @@
                  [com.cognitect.aws/api "0.8.692"]
                  [com.cognitect.aws/endpoints "1.1.12.626"]
                  [com.cognitect.aws/dynamodb "847.2.1365.0"]
+                 [com.cognitect.aws/sqs "847.2.1365.0"]
                  [org.slf4j/slf4j-nop "2.0.9"]]
   :main elastickv.jepsen-test)

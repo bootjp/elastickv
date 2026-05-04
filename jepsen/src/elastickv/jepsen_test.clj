@@ -4,6 +4,7 @@
             [elastickv.dynamodb-workload :as dynamodb-workload]
             [elastickv.dynamodb-types-workload :as dynamodb-types-workload]
             [elastickv.s3-workload :as s3-workload]
+            [elastickv.sqs-htfifo-workload :as sqs-htfifo-workload]
             [jepsen.cli :as cli]))
 
 (defn elastickv-test []
@@ -18,6 +19,10 @@
 
 (defn elastickv-s3-test []
   (s3-workload/elastickv-s3-test {}))
+
+(defn elastickv-sqs-htfifo-test
+  ([] (elastickv-sqs-htfifo-test {}))
+  ([opts] (sqs-htfifo-workload/elastickv-sqs-htfifo-test opts)))
 
 (defn -main
   [& args]
