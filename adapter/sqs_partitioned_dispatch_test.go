@@ -752,3 +752,91 @@ func countPartitionedDedupRowsAcrossPartitions(t *testing.T, node Node, queueNam
 	}
 	return total
 }
+
+// TestClassifyPartitionedByAgeEntry pins every branch of the
+// classify helper that decides which partitioned byage rows the
+// live-queue reaper sweeps. The integration tests above cover
+// the orphan-gen path (tombstoned cohort) and the dedup-expiry
+// path; this unit test fills in the two live-queue paths that
+// have no integration coverage today: the retention-cutoff branch
+// (live gen, sendTs <= cutoff → reapable) and the future-gen
+// guard (parsed.gen > currentGen → not reapable, defensive
+// against a meta-vs-byage race).
+func TestClassifyPartitionedByAgeEntry(t *testing.T) {
+	t.Parallel()
+	const (
+		queueName  = "live-byage.fifo"
+		partition  = uint32(2)
+		currentGen = uint64(5)
+		cutoff     = int64(1_000_000)
+		messageID  = "msg-classify"
+	)
+
+	type want struct {
+		reapable        bool
+		expectedGen     uint64
+		expectedPartn   uint32
+		expectedSendTs  int64
+		expectedMsgID   string
+		assertParsedSet bool // expectedGen / Partition / SendTs / MsgID checked only when true
+	}
+	cases := []struct {
+		name string
+		key  []byte
+		want want
+	}{
+		{
+			name: "live gen within retention window — not reapable",
+			key:  sqsPartitionedMsgByAgeKey(queueName, partition, currentGen, cutoff+1, messageID),
+			want: want{reapable: false, expectedGen: currentGen, expectedPartn: partition, expectedSendTs: cutoff + 1, expectedMsgID: messageID, assertParsedSet: true},
+		},
+		{
+			name: "live gen past retention window — reapable (cutoff branch)",
+			key:  sqsPartitionedMsgByAgeKey(queueName, partition, currentGen, cutoff-1, messageID),
+			want: want{reapable: true, expectedGen: currentGen, expectedPartn: partition, expectedSendTs: cutoff - 1, expectedMsgID: messageID, assertParsedSet: true},
+		},
+		{
+			name: "live gen exactly at cutoff — reapable (>, not >=)",
+			key:  sqsPartitionedMsgByAgeKey(queueName, partition, currentGen, cutoff, messageID),
+			want: want{reapable: true, expectedGen: currentGen, expectedPartn: partition, expectedSendTs: cutoff, expectedMsgID: messageID, assertParsedSet: true},
+		},
+		{
+			name: "orphan generation (gen < currentGen) — reapable unconditionally",
+			key:  sqsPartitionedMsgByAgeKey(queueName, partition, currentGen-1, cutoff+1_000_000, messageID),
+			want: want{reapable: true, expectedGen: currentGen - 1, expectedPartn: partition, expectedSendTs: cutoff + 1_000_000, expectedMsgID: messageID, assertParsedSet: true},
+		},
+		{
+			name: "future generation (gen > currentGen) — not reapable (gen-race guard)",
+			key:  sqsPartitionedMsgByAgeKey(queueName, partition, currentGen+1, cutoff-1, messageID),
+			want: want{reapable: false, expectedGen: currentGen + 1, expectedPartn: partition, expectedSendTs: cutoff - 1, expectedMsgID: messageID, assertParsedSet: true},
+		},
+		{
+			name: "wrong partition — not reapable (page bleed defense)",
+			key:  sqsPartitionedMsgByAgeKey(queueName, partition+1, currentGen, cutoff-1, messageID),
+			want: want{reapable: false, assertParsedSet: false},
+		},
+		{
+			name: "wrong queue prefix — not reapable (parse fails)",
+			key:  sqsPartitionedMsgByAgeKey("different.fifo", partition, currentGen, cutoff-1, messageID),
+			want: want{reapable: false, assertParsedSet: false},
+		},
+		{
+			name: "legacy byage key — not reapable (parse fails)",
+			key:  sqsMsgByAgeKey(queueName, currentGen, cutoff-1, messageID),
+			want: want{reapable: false, assertParsedSet: false},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parsed, reapable := classifyPartitionedByAgeEntry(tc.key, queueName, partition, currentGen, cutoff)
+			require.Equal(t, tc.want.reapable, reapable, "reapable")
+			if tc.want.assertParsedSet {
+				require.Equal(t, tc.want.expectedGen, parsed.Generation, "Generation")
+				require.Equal(t, tc.want.expectedPartn, parsed.Partition, "Partition")
+				require.Equal(t, tc.want.expectedSendTs, parsed.SendTimestampMs, "SendTimestampMs")
+				require.Equal(t, tc.want.expectedMsgID, parsed.MessageID, "MessageID")
+			}
+		})
+	}
+}

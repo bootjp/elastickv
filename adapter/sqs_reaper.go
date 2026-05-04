@@ -619,10 +619,8 @@ func (s *SQSServer) reapPage(ctx context.Context, queueName string, currentGen u
 			// see meta caught up.
 			continue
 		}
-		// Live-queue retention reap currently iterates only the
-		// legacy byage keyspace; partitioned-byage live-queue
-		// retention is a follow-up to PR 6a (the tombstoned-cohort
-		// path is what this PR addresses).
+		// reapPage covers the legacy byage keyspace only; the
+		// partitioned twin is reapPartitionedPage.
 		if err := s.reapOneRecord(ctx, queueName, nil, 0, parsed.Generation, kvp.Key, parsed.MessageID, readTS); err != nil {
 			return true, processed, err
 		}
@@ -731,14 +729,23 @@ func (s *SQSServer) dispatchOrphanByAgeDrop(ctx context.Context, byAgeKey []byte
 //
 // On partitioned queues (meta.PartitionCount > 1), the dedup
 // records live under SqsPartitionedMsgDedupPrefix instead of
-// SqsMsgDedupPrefix, so the legacy scan would find zero records
-// and the leak would persist; reapExpiredDedupPartitioned takes
-// over for that case (PR 6b).
+// SqsMsgDedupPrefix, so the legacy scan alone would miss them;
+// reapExpiredDedupPartitioned covers that case (PR 6b).
+//
+// Mirrors reapQueue's both-scan policy: legacy always runs, and
+// the partitioned scan additionally runs for partitioned queues.
+// The data plane never writes legacy dedup on partitioned queues
+// today, but the legacy scan over an empty prefix is cheap, and
+// running it unconditionally keeps the two reaper paths symmetric
+// and defends against an unforeseen legacy-prefix leak.
 func (s *SQSServer) reapExpiredDedup(ctx context.Context, queueName string, meta *sqsQueueMeta, readTS uint64) error {
+	if err := s.reapExpiredDedupLegacy(ctx, queueName, readTS); err != nil {
+		return err
+	}
 	if meta != nil && meta.PartitionCount > 1 {
 		return s.reapExpiredDedupPartitioned(ctx, queueName, meta.PartitionCount, readTS)
 	}
-	return s.reapExpiredDedupLegacy(ctx, queueName, readTS)
+	return nil
 }
 
 // reapExpiredDedupLegacy is the legacy-keyspace dedup expiry walk,
