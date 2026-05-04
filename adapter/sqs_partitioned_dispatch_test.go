@@ -14,14 +14,12 @@ import (
 )
 
 // Integration tests for the PR 5b-2 partitioned-FIFO data plane
-// wiring. The §11 PR 2 dormancy gate still rejects PartitionCount
-// > 1 at CreateQueue (lifted atomically with the capability check
-// in PR 5b-3), so these tests reach below the public CreateQueue
-// surface to install a partitioned meta record directly. That
-// short-circuits the dormancy gate for the duration of the test
-// without disabling it for production CreateQueue calls — which
-// is the exact split the design doc envisaged for "data plane
-// landed but not user-creatable yet."
+// wiring. PR 5b-3 has since lifted the §11 PR 2 dormancy gate, so
+// CreateQueue with PartitionCount > 1 succeeds on a single-node
+// cluster. The helper below predates that gate-lift and overrides
+// the meta record directly to keep these tests independent of the
+// CreateQueue capability path; new partitioned-FIFO tests should
+// prefer the public CreateQueue surface.
 
 // installPartitionedMetaForTest overwrites the queue's meta record
 // with a partitioned shape (PartitionCount > 1) by dispatching a
@@ -30,11 +28,13 @@ import (
 // counters and the catalog index are populated correctly); only
 // the partition-shape attributes are mutated.
 //
-// The dormancy gate intercepts CreateQueue, not the data plane,
-// so once the meta record carries PartitionCount > 1 every
-// SendMessage / ReceiveMessage / DeleteMessage call routes
-// through the partitioned dispatch helpers exactly as it would
-// after PR 5b-3 lifts the gate.
+// Predates the PR 5b-3 gate-lift; still useful for tests that want
+// to bypass the capability poll (e.g. when CreateQueue would have
+// to negotiate over a fake peer list). Once the meta record
+// carries PartitionCount > 1, every SendMessage / ReceiveMessage /
+// DeleteMessage call routes through the partitioned dispatch
+// helpers exactly as it would after a normal partitioned-queue
+// CreateQueue.
 func installPartitionedMetaForTest(t *testing.T, node Node, queueName string, partitionCount uint32, throughputLimit string) {
 	t.Helper()
 	s := node.sqsServer

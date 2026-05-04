@@ -262,9 +262,9 @@ func queueNameFromMetaKey(key []byte) (string, bool) {
 // partition uint32 inserted between the queue segment and the
 // generation. The legacy keyspace is unchanged on disk, so existing
 // queues and Standard queues stay byte-identical — these helpers are
-// reachable only when meta.PartitionCount > 1, and the §11 PR 2
-// dormancy gate currently rejects that at CreateQueue. The data plane
-// dispatch lands together with the gate-lift in PR 5.
+// reachable only when meta.PartitionCount > 1, gated at CreateQueue
+// time by the cluster-wide htfifo capability check
+// (validateHTFIFOCapability, PR 5b-3).
 //
 // Each helper appends the partition as a fixed-width big-endian
 // uint32 so prefix scans `!sqs|msg|<family>|p|<queue>|<partition>|`

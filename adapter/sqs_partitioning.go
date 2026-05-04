@@ -48,11 +48,6 @@ const (
 	htfifoDedupeScopeQueue = "queue"
 )
 
-// htfifoTemporaryGateMessage is the operator-facing reason the
-// CreateQueue gate uses while PR 2-4 are in production. Removed in
-// PR 5 in the same commit that wires the data-plane fanout.
-const htfifoTemporaryGateMessage = "PartitionCount > 1 requires HT-FIFO data plane — not yet enabled"
-
 // partitionFor maps a (queue meta, MessageGroupId) pair to a
 // partition index in [0, PartitionCount). Edge cases:
 //
@@ -131,11 +126,9 @@ func isPowerOfTwo(n uint32) bool {
 //     with multi-partition FIFO because the dedup key cannot be
 //     globally unique across partitions without a cross-partition
 //     OCC transaction.
-//   - The §11 PR 2 dormancy gate (PartitionCount > 1 rejected at
-//     CreateQueue) lives in validatePartitionDormancyGate so the
-//     dormancy check can be turned off in unit tests that want to
-//     exercise the full schema path. Production CreateQueue calls
-//     both validators.
+//   - The §11 PR 2 dormancy gate has been lifted (Phase 3.D PR 5b-3);
+//     CreateQueue now gates PartitionCount > 1 on the cluster-wide
+//     htfifo capability via validateHTFIFOCapability instead.
 func validatePartitionConfig(meta *sqsQueueMeta) error {
 	if err := validatePartitionShape(meta); err != nil {
 		return err
@@ -208,23 +201,6 @@ func validateStandardQueueRejectsHTFIFO(meta *sqsQueueMeta) error {
 	if meta.DeduplicationScope != "" {
 		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 			"DeduplicationScope is only valid on FIFO queues")
-	}
-	return nil
-}
-
-// validatePartitionDormancyGate is the temporary §11 PR 2 gate. As
-// long as the data-plane fanout (PR 5) has not landed, accepting a
-// partitioned-queue CreateQueue would let SendMessage write under
-// the legacy single-partition prefix — the PR 5 reader would never
-// find those messages and the reaper would not enumerate them. This
-// gate makes the wrong-layout-data class of bug impossible.
-//
-// Removed in PR 5 in the same commit that wires the data plane so
-// the gate-and-lift land atomically.
-func validatePartitionDormancyGate(meta *sqsQueueMeta) error {
-	if meta.PartitionCount > 1 {
-		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			htfifoTemporaryGateMessage)
 	}
 	return nil
 }

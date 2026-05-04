@@ -166,9 +166,10 @@ func TestValidatePartitionConfig_RejectsAboveMax(t *testing.T) {
 //
 // PartitionCount > 1 is also FIFO-only — without the guard a
 // Standard queue with PartitionCount=2 would slip past the validator
-// after PR 5 lifts the dormancy gate. PartitionCount 0/1 are still
-// accepted
-// on Standard queues because both mean "single-partition layout".
+// (the capability gate that gates partitioned creates only fires on
+// FIFO queues, so the schema rule has to catch the Standard case).
+// PartitionCount 0/1 are still accepted on Standard queues because
+// both mean "single-partition layout".
 func TestValidatePartitionConfig_StandardQueueRejectsHTFIFOAttrs(t *testing.T) {
 	t.Parallel()
 	require.Error(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: false, FifoThroughputLimit: htfifoThroughputPerQueue}))
@@ -232,9 +233,10 @@ func TestValidatePartitionConfig_PerMessageGroupIDRequiresExplicitPartitionCount
 		require.Equal(t, sqsErrInvalidAttributeValue, apiErr.errorType)
 	}
 	// FIFO + perMessageGroupId + PartitionCount=8: accept (the
-	// dormancy gate runs separately on CreateQueue and rejects this
-	// at the wire today, but the cross-attribute validator on its
-	// own does not).
+	// cluster-wide capability gate runs separately on CreateQueue
+	// and may still reject this at the wire on a partially-upgraded
+	// cluster, but the cross-attribute validator on its own does
+	// not).
 	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{
 		IsFIFO:              true,
 		FifoThroughputLimit: htfifoThroughputPerMessageGroupID,
@@ -251,24 +253,6 @@ func TestValidatePartitionConfig_PerMessageGroupIDRequiresExplicitPartitionCount
 	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{
 		IsFIFO: true,
 	}))
-}
-
-// --- validatePartitionDormancyGate unit tests ---
-
-// TestValidatePartitionDormancyGate_RejectsAboveOne pins the §11
-// PR 2 dormancy gate: PartitionCount > 1 must reject until PR 5
-// lifts the gate. PartitionCount 0 or 1 must pass (both are the
-// legacy single-partition layout).
-func TestValidatePartitionDormancyGate_RejectsAboveOne(t *testing.T) {
-	t.Parallel()
-	require.NoError(t, validatePartitionDormancyGate(&sqsQueueMeta{PartitionCount: 0}))
-	require.NoError(t, validatePartitionDormancyGate(&sqsQueueMeta{PartitionCount: 1}))
-	for _, n := range []uint32{2, 4, 8, 16, 32} {
-		err := validatePartitionDormancyGate(&sqsQueueMeta{PartitionCount: n})
-		require.Error(t, err, "PartitionCount=%d must reject under the dormancy gate", n)
-		require.Contains(t, err.Error(), "not yet enabled",
-			"the gate's reason must surface to the operator")
-	}
 }
 
 // --- validatePartitionImmutability unit tests ---

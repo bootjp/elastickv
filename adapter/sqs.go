@@ -53,8 +53,8 @@ const (
 // group that hosts a partitioned queue when the binary itself does
 // not advertise this string.
 //
-// CreateQueue's catalog-polling gate (Phase 3.D PR 5 lifts the
-// dormancy and starts checking) reads this list off /sqs_health on
+// CreateQueue's cluster-wide capability gate (validateHTFIFOCapability,
+// landed in Phase 3.D PR 5b-3) reads this list off /sqs_health on
 // every peer; a CreateQueue with PartitionCount > 1 is rejected
 // unless every peer reports "htfifo" — fail-closed against rolling
 // upgrades that have not yet finished.
@@ -75,8 +75,8 @@ const sqsCapabilityHTFIFO = "htfifo"
 //     keys fail closed for recognised-but-unresolved partitioned
 //     keys.
 //   - Capability poller: PollSQSHTFIFOCapability, merged via
-//     #721 (Phase 3.D PR 4-B-3a). PR 5 will use this for the
-//     CreateQueue capability gate.
+//     #721 (Phase 3.D PR 4-B-3a) and now consumed by
+//     validateHTFIFOCapability in the CreateQueue gate (PR 5b-3).
 //   - Leadership-refusal hook:
 //     raftengine.RegisterLeaderAcquiredCallback +
 //     main_sqs_leadership_refusal.go (Phase 3.D PR 4-B-3b, this
@@ -84,11 +84,11 @@ const sqsCapabilityHTFIFO = "htfifo"
 //     the hook refuses leadership of any Raft group hosting a
 //     partitioned queue when the binary lacks htfifo.
 //
-// Both pieces are now in the binary, so the flag flips to true.
-// PR 5 lifts the PartitionCount > 1 dormancy gate AND wires the
-// CreateQueue capability poll in the same commit, at which point
-// a partitioned queue can land in production and every node in
-// the cluster must report htfifo for the gate to allow it.
+// Both pieces are in the binary and PR 5b-3 has lifted the
+// dormancy gate, so a partitioned queue can land in production —
+// CreateQueue's validateHTFIFOCapability gate refuses
+// PartitionCount > 1 unless every node in the cluster reports
+// htfifo on /sqs_health.
 //
 // Stays a const (not a var) because the flag is build-time. A
 // future runtime override (env var, --no-htfifo flag for
@@ -184,6 +184,22 @@ type SQSServer struct {
 	// receives for in-process — bounded by the operator-controlled
 	// CreateQueue rate.
 	receiveFanoutCounters sync.Map
+	// partitionResolver, when non-nil, is the per-cluster resolver
+	// that maps (queue, partition) keys to operator-chosen Raft
+	// groups (built from --sqsFifoPartitionMap, see main.go). The
+	// CreateQueue capability gate (validateHTFIFOCapability) uses
+	// it to verify routing coverage on partitioned creates BEFORE
+	// the meta record commits — without that check, a queue could
+	// land with PartitionCount=N but only K<N routes installed,
+	// and SendMessage on the missing partitions would fail closed
+	// at the router with "no route for key" (Codex P1 review on
+	// PR #734).
+	//
+	// nil on single-shard / no---sqsFifoPartitionMap deployments;
+	// the gate's resolver==nil branch then skips the coverage
+	// check so partitioned queues can land on a single-shard
+	// cluster and route through the engine's default group.
+	partitionResolver *SQSPartitionResolver
 }
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to
@@ -196,6 +212,22 @@ func WithSQSLeaderMap(m map[string]string) SQSServerOption {
 			s.leaderSQS[k] = v
 		}
 	}
+}
+
+// WithSQSPartitionResolver installs the cluster's partition
+// resolver on the SQS server so the CreateQueue capability gate
+// (validateHTFIFOCapability) can verify routing coverage before
+// admitting a partitioned create. Pass nil (the default) on
+// single-shard / no---sqsFifoPartitionMap deployments — the gate
+// then skips the coverage check.
+//
+// Callers must ensure the resolver passed here matches the one
+// installed on the kv coordinator via WithPartitionResolver,
+// otherwise the gate would admit a queue that the coordinator
+// then fails to route. main.go builds the resolver once and
+// hands the same pointer to both consumers.
+func WithSQSPartitionResolver(r *SQSPartitionResolver) SQSServerOption {
+	return func(s *SQSServer) { s.partitionResolver = r }
 }
 
 func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator, opts ...SQSServerOption) *SQSServer {
