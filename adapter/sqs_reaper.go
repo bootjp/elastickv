@@ -85,7 +85,7 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 		if err := s.reapQueue(ctx, name, meta, readTS); err != nil {
 			slog.Warn("sqs reaper queue pass failed", "queue", name, "err", err)
 		}
-		if err := s.reapExpiredDedup(ctx, name, readTS); err != nil {
+		if err := s.reapExpiredDedup(ctx, name, meta, readTS); err != nil {
 			slog.Warn("sqs dedup reaper pass failed", "queue", name, "err", err)
 		}
 	}
@@ -425,6 +425,39 @@ func (s *SQSServer) reapQueue(ctx context.Context, queueName string, meta *sqsQu
 		// for the live generation so we never delete live records.
 		cutoff = 0
 	}
+	// Legacy byage scan — always runs. For non-partitioned queues
+	// this is the only path; for partitioned queues this also
+	// catches any defensive legacy entry that might have leaked
+	// in (the data plane never writes here on partitioned queues
+	// today, but the sweep is idempotent and cheap).
+	if err := s.reapQueueLegacy(ctx, queueName, meta.Generation, cutoff, readTS); err != nil {
+		return err
+	}
+	// Partitioned byage scan — one per partition under its own
+	// per-partition budget. Per the §6 split-queue-FIFO design,
+	// the per-queue budget becomes a per-partition budget so a
+	// 32-partition queue cannot starve other queues; instead its
+	// reap completes in partitions × budget time per cycle, which
+	// at the 30s reaper interval is well within budget.
+	if meta.PartitionCount > 1 {
+		for partition := uint32(0); partition < meta.PartitionCount; partition++ {
+			if err := ctx.Err(); err != nil {
+				return errors.WithStack(err)
+			}
+			if err := s.reapQueuePartition(ctx, queueName, partition, meta.Generation, cutoff, readTS); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// reapQueueLegacy is the existing legacy-keyspace byage walk for
+// one queue, factored out of reapQueue so the partitioned twin
+// (reapQueuePartition) can sit alongside it under the same
+// per-budget contract. Behaviour for non-partitioned queues is
+// byte-identical to pre-PR-6b reapQueue.
+func (s *SQSServer) reapQueueLegacy(ctx context.Context, queueName string, currentGen uint64, cutoff int64, readTS uint64) error {
 	prefix := sqsMsgByAgePrefixAllGenerations(queueName)
 	upper := prefixScanEnd(prefix)
 	start := bytes.Clone(prefix)
@@ -438,7 +471,7 @@ func (s *SQSServer) reapQueue(ctx context.Context, queueName string, meta *sqsQu
 		if len(page) == 0 {
 			return nil
 		}
-		done, newProcessed, err := s.reapPage(ctx, queueName, meta.Generation, cutoff, page, readTS, processed)
+		done, newProcessed, err := s.reapPage(ctx, queueName, currentGen, cutoff, page, readTS, processed)
 		if err != nil {
 			return err
 		}
@@ -452,6 +485,108 @@ func (s *SQSServer) reapQueue(ctx context.Context, queueName string, meta *sqsQu
 		}
 	}
 	return nil
+}
+
+// reapQueuePartition is the partitioned-keyspace twin of
+// reapQueueLegacy. Walks one partition's byage prefix family
+// across all generations the partitioned-byage prefix matches
+// (parseSqsPartitionedMsgByAgeKey returns the gen embedded in
+// each key) and reaps each entry past the retention cutoff (live
+// gen) or unconditionally (any older gen — orphan from a prior
+// PurgeQueue).
+//
+// Per-partition budget rather than per-queue: a 32-partition
+// queue therefore allows up to 32 × sqsReaperPerQueueBudget
+// records per tick, which the 30s tick interval comfortably
+// absorbs (§6 design contract).
+func (s *SQSServer) reapQueuePartition(ctx context.Context, queueName string, partition uint32, currentGen uint64, cutoff int64, readTS uint64) error {
+	// Note: the partitioned-byage prefix embeds (queue, partition)
+	// but not the generation, so this scan walks every generation
+	// for that partition. reapPartitionedPage filters per-entry by
+	// the (currentGen, cutoff) live-vs-orphan rules, mirroring
+	// reapPage on the legacy path.
+	prefix := []byte{}
+	prefix = append(prefix, SqsPartitionedMsgByAgePrefix...)
+	prefix = append(prefix, encodeSQSSegment(queueName)...)
+	prefix = append(prefix, sqsPartitionedQueueTerminator)
+	prefix = appendU32(prefix, partition)
+	upper := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+
+	processed := 0
+	for processed < sqsReaperPerQueueBudget {
+		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		done, newProcessed, err := s.reapPartitionedPage(ctx, queueName, partition, currentGen, cutoff, page, readTS, processed)
+		if err != nil {
+			return err
+		}
+		processed = newProcessed
+		if done {
+			return nil
+		}
+		start = nextScanCursorAfter(page[len(page)-1].Key)
+		if bytes.Compare(start, upper) >= 0 {
+			return nil
+		}
+	}
+	return nil
+}
+
+// reapPartitionedPage is the partitioned twin of reapPage. Same
+// live-vs-orphan classification as reapPage, but parses each entry
+// as a partitioned byage key and routes the dispatch through
+// reapOneRecordPartitioned so the dispatch helpers build
+// partitioned data / vis / group keys instead of legacy ones.
+func (s *SQSServer) reapPartitionedPage(ctx context.Context, queueName string, partition uint32, currentGen uint64, cutoff int64, page []*store.KVPair, readTS uint64, processed int) (bool, int, error) {
+	for _, kvp := range page {
+		if err := ctx.Err(); err != nil {
+			return true, processed, errors.WithStack(err)
+		}
+		parsed, reapable := classifyPartitionedByAgeEntry(kvp.Key, queueName, partition, currentGen, cutoff)
+		if !reapable {
+			continue
+		}
+		if err := s.reapOneRecordPartitioned(ctx, queueName, partition, parsed.Generation, kvp.Key, parsed.MessageID, readTS); err != nil {
+			return true, processed, err
+		}
+		processed++
+		if processed >= sqsReaperPerQueueBudget {
+			return true, processed, nil
+		}
+	}
+	if len(page) < sqsReaperPageLimit {
+		return true, processed, nil
+	}
+	return false, processed, nil
+}
+
+// classifyPartitionedByAgeEntry parses a candidate partitioned
+// byage key and decides whether it should be reaped this pass.
+// Returns reapable=false for entries that do not match the
+// partition (page bleed across partitions, defensive), live
+// entries inside their retention window, or future-generation
+// rows from a meta read that hasn't caught up yet. Pulled out of
+// reapPartitionedPage so the loop body stays under the cyclop
+// ceiling.
+func classifyPartitionedByAgeEntry(key []byte, queueName string, partition uint32, currentGen uint64, cutoff int64) (sqsPartitionedMsgByAgeRecord, bool) {
+	parsed, ok := parseSqsPartitionedMsgByAgeKey(key, queueName)
+	if !ok || parsed.Partition != partition {
+		return sqsPartitionedMsgByAgeRecord{}, false
+	}
+	if parsed.Generation == currentGen && parsed.SendTimestampMs > cutoff {
+		return parsed, false
+	}
+	if parsed.Generation > currentGen {
+		// Defensive against gen-counter races; mirrors reapPage.
+		return parsed, false
+	}
+	return parsed, true
 }
 
 // reapPage walks one ScanAt page, dispatching a per-record reap
@@ -593,7 +728,24 @@ func (s *SQSServer) dispatchOrphanByAgeDrop(ctx context.Context, byAgeKey []byte
 // unique MessageDeduplicationIds would accumulate permanent
 // dedup-row leaks because the send path treats expired records as
 // misses but never removes them.
-func (s *SQSServer) reapExpiredDedup(ctx context.Context, queueName string, readTS uint64) error {
+//
+// On partitioned queues (meta.PartitionCount > 1), the dedup
+// records live under SqsPartitionedMsgDedupPrefix instead of
+// SqsMsgDedupPrefix, so the legacy scan would find zero records
+// and the leak would persist; reapExpiredDedupPartitioned takes
+// over for that case (PR 6b).
+func (s *SQSServer) reapExpiredDedup(ctx context.Context, queueName string, meta *sqsQueueMeta, readTS uint64) error {
+	if meta != nil && meta.PartitionCount > 1 {
+		return s.reapExpiredDedupPartitioned(ctx, queueName, meta.PartitionCount, readTS)
+	}
+	return s.reapExpiredDedupLegacy(ctx, queueName, readTS)
+}
+
+// reapExpiredDedupLegacy is the legacy-keyspace dedup expiry walk,
+// factored out of reapExpiredDedup so the partitioned twin can sit
+// alongside it. Behaviour for non-partitioned queues is byte-
+// identical to pre-PR-6b reapExpiredDedup.
+func (s *SQSServer) reapExpiredDedupLegacy(ctx context.Context, queueName string, readTS uint64) error {
 	prefix := []byte(SqsMsgDedupPrefix)
 	prefix = append(prefix, []byte(encodeSQSSegment(queueName))...)
 	upper := prefixScanEnd(prefix)
@@ -620,6 +772,56 @@ func (s *SQSServer) reapExpiredDedup(ctx context.Context, queueName string, read
 		start = nextScanCursorAfter(page[len(page)-1].Key)
 		if bytes.Compare(start, upper) >= 0 {
 			return nil
+		}
+	}
+	return nil
+}
+
+// reapExpiredDedupPartitioned is the partitioned-keyspace twin of
+// reapExpiredDedupLegacy. Walks every partition's dedup prefix
+// across all generations and removes records whose
+// ExpiresAtMillis has passed. Each partition gets its own
+// per-partition budget (per the §6 design contract — same as
+// reapQueuePartition).
+func (s *SQSServer) reapExpiredDedupPartitioned(ctx context.Context, queueName string, partitionCount uint32, readTS uint64) error {
+	now := time.Now().UnixMilli()
+	for partition := uint32(0); partition < partitionCount; partition++ {
+		if err := ctx.Err(); err != nil {
+			return errors.WithStack(err)
+		}
+		// Per-partition prefix (across all gens) — the partitioned
+		// dedup key embeds gen after partition, so a partition-only
+		// prefix walks every gen for that partition. The per-entry
+		// expiry check is unchanged from the legacy walk.
+		prefix := []byte{}
+		prefix = append(prefix, SqsPartitionedMsgDedupPrefix...)
+		prefix = append(prefix, encodeSQSSegment(queueName)...)
+		prefix = append(prefix, sqsPartitionedQueueTerminator)
+		prefix = appendU32(prefix, partition)
+		upper := prefixScanEnd(prefix)
+		start := bytes.Clone(prefix)
+
+		processed := 0
+		for processed < sqsReaperPerQueueBudget {
+			page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			done, newProcessed, err := s.reapDedupPage(ctx, page, now, readTS, processed)
+			if err != nil {
+				return err
+			}
+			processed = newProcessed
+			if done {
+				break
+			}
+			start = nextScanCursorAfter(page[len(page)-1].Key)
+			if bytes.Compare(start, upper) >= 0 {
+				break
+			}
 		}
 	}
 	return nil

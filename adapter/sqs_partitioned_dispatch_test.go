@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -642,6 +643,109 @@ func countPartitionedRows(t *testing.T, node Node, queueName string, gen uint64)
 	}
 	total := 0
 	for _, prefix := range prefixes {
+		rows, err := node.sqsServer.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), 1024, readTS)
+		require.NoError(t, err)
+		total += len(rows)
+	}
+	return total
+}
+
+// TestSQSServer_PartitionedFIFO_LiveQueueDedupReaperPartitions
+// pins the PR 6b contract for live queues: reapExpiredDedup must
+// walk the partitioned dedup keyspace too, otherwise expired
+// dedup records on partitioned FIFO queues leak forever (the
+// pre-PR-6b reaper only scanned SqsMsgDedupPrefix, which is empty
+// for partitioned queues). Closes the live-queue half of the
+// Codex P2 deferred from PR 5b-2 round 0.
+func TestSQSServer_PartitionedFIFO_LiveQueueDedupReaperPartitions(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	const queueName = "live-dedup-reap.fifo"
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  queueName,
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	require.Equal(t, http.StatusOK, status, "create queue: %v", out)
+	queueURL, _ := out["QueueUrl"].(string)
+	require.NotEmpty(t, queueURL)
+
+	const partitions uint32 = 4
+	installPartitionedMetaForTest(t, node, queueName, partitions, htfifoThroughputPerMessageGroupID)
+
+	// Send across distinct groups so dedup records land on more
+	// than one partition; partitionFor (FNV-1a) gives reasonable
+	// spread for these inputs.
+	groups := []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}
+	for _, g := range groups {
+		status, out := callSQS(t, node, sqsSendMessageTarget, map[string]any{
+			"QueueUrl":               queueURL,
+			"MessageBody":            "body-" + g,
+			"MessageGroupId":         g,
+			"MessageDeduplicationId": "dedup-" + g,
+		})
+		require.Equal(t, http.StatusOK, status, "send (group=%s): %v", g, out)
+	}
+
+	srv := node.sqsServer
+	ctx := t.Context()
+
+	// Sanity: at least one partitioned dedup row exists pre-reap.
+	preReap := countPartitionedDedupRowsAcrossPartitions(t, node, queueName, partitions)
+	require.Positive(t, preReap, "expected partitioned dedup rows after sends")
+
+	// Backdate every partitioned dedup record's ExpiresAtMillis
+	// so the reaper's value-based expiry filter trips on every
+	// row. Same approach as TestSQSServer_RetentionReaperDropsExpiredFifoDedup
+	// for the legacy keyspace; here applied per-partition prefix.
+	readTS := srv.nextTxnReadTS(ctx)
+	now := time.Now().UnixMilli()
+	for partition := uint32(0); partition < partitions; partition++ {
+		prefix := sqsPartitionedMsgDedupKeyPrefix(queueName, partition, 1)
+		rows, err := srv.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), 1024, readTS)
+		require.NoError(t, err)
+		for _, row := range rows {
+			rec, err := decodeFifoDedupRecord(row.Value)
+			require.NoError(t, err)
+			rec.ExpiresAtMillis = now - 1000
+			body, err := encodeFifoDedupRecord(rec)
+			require.NoError(t, err)
+			req := &kv.OperationGroup[kv.OP]{
+				IsTxn:   true,
+				StartTS: readTS,
+				Elems: []*kv.Elem[kv.OP]{
+					{Op: kv.Put, Key: bytes.Clone(row.Key), Value: body},
+				},
+			}
+			_, err = srv.coordinator.Dispatch(ctx, req)
+			require.NoError(t, err)
+		}
+	}
+
+	// Drive one reaper pass — the live-queue dedup walk now
+	// dispatches reapExpiredDedupPartitioned for partitioned
+	// queues (PR 6b).
+	require.NoError(t, srv.reapAllQueues(ctx), "reapAllQueues")
+
+	postReap := countPartitionedDedupRowsAcrossPartitions(t, node, queueName, partitions)
+	require.Zero(t, postReap,
+		"expired partitioned dedup records must be reaped (got %d remaining)",
+		postReap)
+}
+
+// countPartitionedDedupRowsAcrossPartitions sums the rows across
+// every partition's partitioned dedup prefix at gen=1 (the
+// generation a freshly-created queue lands on). Test-helper
+// twin of countPartitionedRows scoped to dedup.
+func countPartitionedDedupRowsAcrossPartitions(t *testing.T, node Node, queueName string, partitions uint32) int {
+	t.Helper()
+	ctx := context.Background()
+	readTS := node.sqsServer.nextTxnReadTS(ctx)
+	total := 0
+	for partition := uint32(0); partition < partitions; partition++ {
+		prefix := sqsPartitionedMsgDedupKeyPrefix(queueName, partition, 1)
 		rows, err := node.sqsServer.store.ScanAt(ctx, prefix, prefixScanEnd(prefix), 1024, readTS)
 		require.NoError(t, err)
 		total += len(rows)
