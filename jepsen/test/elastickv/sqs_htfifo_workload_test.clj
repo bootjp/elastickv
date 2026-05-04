@@ -39,11 +39,11 @@
   [history]
   (checker/check (workload/ht-fifo-checker) {} history {}))
 
-(defn- send-op [t group seq-num & {:keys [type] :or {type :ok}}]
-  {:type type :f :send :time t :value [group seq-num]})
+(defn- send-op [t group seq-num & {:keys [type process] :or {type :ok process 0}}]
+  {:type type :f :send :time t :process process :value [group seq-num]})
 
-(defn- recv-op [t tuples & {:keys [type] :or {type :ok}}]
-  {:type type :f :recv :time t :value tuples})
+(defn- recv-op [t tuples & {:keys [type process] :or {type :ok process 0}}]
+  {:type type :f :recv :time t :process process :value tuples})
 
 (deftest checker-clean-history-is-valid
   (let [hist [(send-op 100 "g0" 0)
@@ -134,3 +134,28 @@
         r    (check-history hist)]
     (is (:valid? r))
     (is (= 1 (:received r)))))
+
+(deftest checker-info-recv-is-ignored
+  ;; A :recv with :info status (delete failed mid-batch) is dropped by
+  ;; collect-receives. The message will be redelivered, the next :ok
+  ;; recv records it, and the checker sees no duplicate.
+  (let [hist [(send-op 100 "g0" 0)
+              (recv-op 200 [["g0" 0]] :type :info)
+              (recv-op 300 [["g0" 0]])]
+        r    (check-history hist)]
+    (is (:valid? r))
+    (is (= 1 (:received r)))
+    (is (empty? (:duplicates r)))))
+
+(deftest checker-same-time-batch-preserves-within-group-order
+  ;; A single :recv batch may carry multiple messages from the same
+  ;; group with the SAME completion time. The checker must respect
+  ;; the within-batch order (FIFO of the server's response) rather
+  ;; than reordering them by sort-by stability alone.
+  (let [hist [(send-op 100 "g0" 0)
+              (send-op 110 "g0" 1)
+              (send-op 120 "g0" 2)
+              (recv-op 200 [["g0" 0] ["g0" 1] ["g0" 2]])]
+        r    (check-history hist)]
+    (is (:valid? r) (str "got " (pr-str r)))
+    (is (empty? (:ordering-violations r)))))

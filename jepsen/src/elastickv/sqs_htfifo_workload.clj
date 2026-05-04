@@ -9,7 +9,10 @@
 
    1. Within-group ordering — for any MessageGroupId, the sequence of
       received seq values (sorted by global completion time across all
-      consumers) is monotonically non-decreasing.
+      consumers) is strictly increasing. Strict (rather than merely
+      non-decreasing) is what the checker enforces, since seqs are
+      assigned monotonically by next-seq! and equal seqs would already
+      be flagged as duplicates by contract 3.
    2. No loss — every (group, seq) successfully :sent eventually appears
       in the :recv history. Sends with :info status are treated as
       possibly-committed and not counted as lost.
@@ -25,7 +28,7 @@
   (:gen-class)
   (:require [clojure.set :as cset]
             [clojure.string :as str]
-            [clojure.tools.logging :refer [info]]
+            [clojure.tools.logging :refer [info warn]]
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
@@ -199,14 +202,33 @@
     (try
       (case (:f op)
         :send
+        ;; Compute (group, seq, body) BEFORE the SQS call so the
+        ;; op carries :value [group seq-num] regardless of whether
+        ;; the call succeeded — :info sends with their tuple intact
+        ;; let a future checker reason about in-flight messages
+        ;; (today's "lost" formula is committed-only, but matching
+        ;; Jepsen's standard convention keeps the history
+        ;; interpretable). Re-throw on send failure so the outer
+        ;; catch performs the existing error classification, but
+        ;; with the enriched op as context (passed via ex-data so
+        ;; the outer catch can pull it out).
         (let [group   (rand-nth groups)
               seq-num (next-seq! seq-counters group)
-              body    (encode-body group seq-num)]
-          (sqs-invoke! sqs :SendMessage
-                       {:QueueUrl      queue-url
-                        :MessageBody   body
-                        :MessageGroupId group})
-          (assoc op :type :ok :value [group seq-num]))
+              body    (encode-body group seq-num)
+              op'     (assoc op :value [group seq-num])]
+          (try
+            (sqs-invoke! sqs :SendMessage
+                         {:QueueUrl      queue-url
+                          :MessageBody   body
+                          :MessageGroupId group})
+            (assoc op' :type :ok)
+            (catch clojure.lang.ExceptionInfo e
+              ;; Re-raise with the enriched op stashed so the outer
+              ;; catch returns it instead of the bare op. The outer
+              ;; catch checks for :enriched-op in ex-data first.
+              (throw (ex-info (.getMessage e)
+                              (merge (ex-data e) {:enriched-op op'})
+                              e)))))
 
         :recv
         (let [resp (sqs-invoke! sqs :ReceiveMessage
@@ -221,25 +243,37 @@
                                       :receipt-handle (:ReceiptHandle m)
                                       :message-id     (:MessageId m))))
                            msgs)]
-          (doseq [{:keys [receipt-handle]} parsed]
-            (try
-              (sqs-invoke! sqs :DeleteMessage
-                           {:QueueUrl      queue-url
-                            :ReceiptHandle receipt-handle})
-              (catch clojure.lang.ExceptionInfo _
-                ;; A failed delete leaves the message visible after the
-                ;; visibility window — the next receive will see it again.
-                ;; The checker will count it as a duplicate, which is the
-                ;; correct signal: an at-least-once delivery on a FIFO
-                ;; queue indicates a delete-side bug.
-                nil)))
-          (assoc op :type :ok
-                    :value (mapv (fn [{:keys [group seq]}] [group seq]) parsed))))
+          ;; SQS contract: a message is "received" (and the duplicate-
+          ;; detection contract activates) only after a successful
+          ;; DeleteMessage acks it. A failed delete (transport fault,
+          ;; partition mid-ack) leaves the message visible — the next
+          ;; receive WILL see it again, and that re-delivery is correct
+          ;; SQS behaviour, not a duplicate the checker should flag.
+          ;; So: include only successfully-deleted tuples in :value.
+          ;; Tuples whose delete failed are dropped here and naturally
+          ;; reappear in a subsequent :recv. We log the failure so a
+          ;; spike in the warn rate (vs duplicate signal in the report)
+          ;; is the right triage cue.
+          (let [acked (volatile! [])]
+            (doseq [{:keys [group seq receipt-handle]} parsed]
+              (try
+                (sqs-invoke! sqs :DeleteMessage
+                             {:QueueUrl      queue-url
+                              :ReceiptHandle receipt-handle})
+                (vswap! acked conj [group seq])
+                (catch clojure.lang.ExceptionInfo e
+                  (warn e "DeleteMessage failed; tuple will be redelivered"
+                        {:group group :seq seq}))))
+            (assoc op :type :ok :value @acked))))
 
       (catch clojure.lang.ExceptionInfo e
         (let [data     (ex-data e)
               err-type (:type data)
-              category (:category data)]
+              category (:category data)
+              ;; If the :send branch attached an enriched op (with
+              ;; [group seq-num] :value), use it so the resulting :info
+              ;; / :fail op still carries the tuple the checker can see.
+              base     (or (:enriched-op data) op)]
           (cond
             ;; Transport faults (network partition, kill, peer down).
             ;; :info: the operation may or may not have committed.
@@ -247,21 +281,21 @@
                  (#{:cognitect.anomalies/fault
                     :cognitect.anomalies/unavailable
                     :cognitect.anomalies/interrupted} category))
-            (assoc op :type :info :error :network-error)
+            (assoc base :type :info :error :network-error)
 
             ;; Server-side InternalFailure / 5xx — possibly committed.
             (#{"InternalFailure" "InternalServerError" "ServiceUnavailable"} err-type)
-            (assoc op :type :info :error (str err-type))
+            (assoc base :type :info :error (str err-type))
 
             ;; Definite client-side rejection — operation did not commit.
             (#{"InvalidParameterValue" "QueueDoesNotExist"
                "ReceiptHandleIsInvalid" "InvalidIdFormat"} err-type)
-            (assoc op :type :fail :error (str err-type))
+            (assoc base :type :fail :error (str err-type))
 
             :else
-            (assoc op :type :info :error (or err-type
-                                              category
-                                              (.getMessage e))))))
+            (assoc base :type :info :error (or err-type
+                                                category
+                                                (.getMessage e))))))
 
       (catch Exception e
         (assoc op :type :info :error (.getMessage e))))))
@@ -286,18 +320,31 @@
                      set)}))
 
 (defn- collect-receives
-  "Return a list of {:group g :seq s :time t} maps in completion-time
-   order, one per (group, seq) tuple actually surfaced by a successful
-   :recv op. Each tuple carries the op's :time so per-group ordering can
-   be checked against a globally-consistent timeline."
+  "Return a list of {:group g :seq s :time t :process p :index i} maps
+   in completion-time order, one per (group, seq) tuple actually
+   surfaced by a successful :recv op. Each tuple carries the op's
+   :time / :process / its position within the batch so per-group
+   ordering can be checked against a globally-consistent timeline.
+
+   Sort key is (juxt :time :process :index) — :time is the primary,
+   :process tiebreaks two workers polling at the same nanosecond
+   (rare but possible), and :index preserves the within-batch order
+   the server returned (which is the FIFO order for messages in the
+   same batch). Without :index, sort-by would only be stable across
+   the input ordering and the per-group seqs from one batch could
+   appear out-of-order in the sorted output."
   [history]
   (->> history
        (filter #(and (= :recv (:f %)) (= :ok (:type %))))
        (mapcat (fn [op]
-                 (map (fn [[g s]]
-                        {:group g :seq s :time (:time op)})
-                      (:value op))))
-       (sort-by :time)))
+                 (map-indexed
+                   (fn [i [g s]]
+                     {:group g :seq s
+                      :time (:time op)
+                      :process (:process op)
+                      :index i})
+                   (:value op))))
+       (sort-by (juxt :time :process :index))))
 
 (defn- ordering-violations
   "For each group, return the list of out-of-order pairs in the
@@ -331,13 +378,18 @@
   (reify checker/Checker
     (check [_ _test history _opts]
       (let [{:keys [committed in-flight]} (collect-sends history)
+            ;; in-flight is reported in the result map for diagnostics
+            ;; (operators want to see how many sends were ambiguous);
+            ;; the loss formula does not subtract it because
+            ;; committed/in-flight are disjoint by construction.
             received-events (collect-receives history)
             received-tuples (set (map (fn [{:keys [group seq]}] [group seq])
                                       received-events))
-            ;; "lost" = committed sends that never arrived AND were not
-            ;; in-flight at the end. We exclude in-flight since their
-            ;; commit status is undefined.
-            lost (cset/difference committed received-tuples in-flight)
+            ;; "lost" = committed sends that never arrived. :info sends
+            ;; (in-flight) are excluded from `committed` at collection
+            ;; time, not subtracted here, so committed and in-flight are
+            ;; always disjoint.
+            lost (cset/difference committed received-tuples)
             dups (duplicate-receives received-events)
             ord  (ordering-violations received-events)]
         {:valid?              (and (empty? lost)
@@ -426,7 +478,15 @@
                                 :shard-ranges (:shard-ranges opts)}))
          rate       (double (or (:rate opts) 5))
          time-limit (or (:time-limit opts) 30)
-         drain-time (or (:drain-time opts) (max 5 (quot time-limit 6)))
+         ;; Drain must outlast the visibility-timeout window, otherwise
+         ;; a message that sat invisible past the main phase (worker
+         ;; killed mid-receive, delete that didn't commit) can never
+         ;; reappear before the checker runs and gets reported as :lost
+         ;; even though the server still owns it. Also keeps a floor of
+         ;; (max 5, time-limit/6) so short tests still drain meaningfully.
+         drain-time (or (:drain-time opts)
+                        (max visibility-timeout-seconds
+                             (max 5 (quot time-limit 6))))
          faults     (if local?
                       []
                       (cli/normalize-faults (or (:faults opts) [:partition :kill])))
