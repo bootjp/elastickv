@@ -177,6 +177,7 @@ func TestDDB_BinaryHashKeyRendersAsB64Prefix(t *testing.T) {
 			HashKey: "id",
 		},
 		AttributeDefinitions: map[string]string{"id": "B"},
+		Generation:           1,
 	}
 	item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
 		"id":   bAttr([]byte{0x00, 0x01, 0x02}),
@@ -242,6 +243,7 @@ func TestDDB_RejectsItemMissingHashKeyAttribute(t *testing.T) {
 	schema := &pb.DynamoTableSchema{
 		TableName: "t", PrimaryKey: &pb.DynamoKeySchema{HashKey: "id"},
 		AttributeDefinitions: map[string]string{"id": "S"},
+		Generation:           1,
 	}
 	item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
 		// "id" is missing
@@ -273,6 +275,7 @@ func TestDDB_AllAttributeKindsRoundTripThroughJSON(t *testing.T) {
 	schema := &pb.DynamoTableSchema{
 		TableName: "kitchensink", PrimaryKey: &pb.DynamoKeySchema{HashKey: "id"},
 		AttributeDefinitions: map[string]string{"id": "S"},
+		Generation:           1,
 	}
 	item := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
 		"id":     sAttr("k"),
@@ -329,6 +332,347 @@ func TestDDB_BundleJSONLNotImplementedYet(t *testing.T) {
 	err := enc.Finalize()
 	if err == nil {
 		t.Fatalf("expected not-implemented error from Finalize on bundle mode")
+	}
+}
+
+func TestDDB_MigrationSourceGenerationItemsAreEmitted(t *testing.T) {
+	t.Parallel()
+	enc, root := newDDBEncoder(t)
+	// During a live migration, schema.Generation is the new gen and
+	// schema.MigratingFromGeneration carries the source gen. The live
+	// read path falls back to the source for items not yet copied.
+	// The dump must include both — Codex P1 #227.
+	schema := &pb.DynamoTableSchema{
+		TableName:               "t",
+		PrimaryKey:              &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions:    map[string]string{"id": "S"},
+		Generation:              7,
+		MigratingFromGeneration: 6,
+	}
+	newRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("a"), "v": sAttr("new"),
+	}}
+	migratingRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("b"), "v": sAttr("not-yet-migrated"),
+	}}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 7, "a", ""), encodeItemValue(t, newRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 6, "b", ""), encodeItemValue(t, migratingRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "a.json")); err != nil {
+		t.Fatalf("active-gen item missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "b.json")); err != nil {
+		t.Fatalf("migrating-from-gen item must be emitted during live migration: %v", err)
+	}
+}
+
+// TestDDB_DotSegmentKeyRejected is the regression for Codex P1
+// round 12: DynamoDB S/N key values can legitimately hold "." or
+// "..". EncodeSegment preserves both as RFC3986-unreserved, so the
+// resulting filename would let filepath.Join collapse / escape the
+// items/ subtree — an item with hash=".." range="_schema" would be
+// written as `<table>/_schema.json`, overwriting the schema sidecar.
+// writeDDBItem now refuses sole-dot encoded segments for both
+// hash and range keys.
+func TestDDB_DotSegmentKeyRejected(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		hashAttr  *pb.DynamoAttributeValue
+		rangeAttr *pb.DynamoAttributeValue
+	}{
+		{"hash_dot", sAttr("."), nil},
+		{"hash_dotdot", sAttr(".."), nil},
+		{"range_dot", sAttr("ok"), sAttr(".")},
+		{"range_dotdot", sAttr("ok"), sAttr("..")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			enc, _ := newDDBEncoder(t)
+			schema := &pb.DynamoTableSchema{
+				TableName:            "t",
+				PrimaryKey:           &pb.DynamoKeySchema{HashKey: "h", RangeKey: ""},
+				AttributeDefinitions: map[string]string{"h": "S", "r": "S"},
+				Generation:           1,
+			}
+			if tc.rangeAttr != nil {
+				schema.PrimaryKey.RangeKey = "r"
+			}
+			attrs := map[string]*pb.DynamoAttributeValue{"h": tc.hashAttr}
+			hashRaw := tc.hashAttr.GetS()
+			rangeRaw := ""
+			if tc.rangeAttr != nil {
+				attrs["r"] = tc.rangeAttr
+				rangeRaw = tc.rangeAttr.GetS()
+			}
+			item := &pb.DynamoItem{Attributes: attrs}
+			if err := enc.HandleItem(EncodeDDBItemKey("t", 1, hashRaw, rangeRaw), encodeItemValue(t, item)); err != nil {
+				t.Fatal(err)
+			}
+			if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+				t.Fatal(err)
+			}
+			err := enc.Finalize()
+			if !errors.Is(err, ErrDDBInvalidItem) {
+				t.Fatalf("err=%v want ErrDDBInvalidItem for dot-segment key", err)
+			}
+		})
+	}
+}
+
+// TestDDB_CanonicalNumberKeySegment is the regression for Codex P1
+// round 9: DynamoDB N equality is numeric, not lexical, but the key
+// segment was emitted as `EncodeSegment([]byte(v.N))`. In migration
+// mode where source and active rows used different decimal text for
+// the same logical N value (e.g. "1" and "1.0"), both rows survived
+// at distinct paths and restore replayed duplicates. The encoder
+// must canonicalise via big.Rat — same canonical form as the live
+// adapter — so equivalent N literals collapse onto the same filename.
+func TestDDB_CanonicalNumberKeySegment(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		a, b string
+	}{
+		{"1", "1.0"},
+		{"100", "1e2"},
+		{"-0", "0"},
+		{"0.5", "5e-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.a+"_vs_"+tc.b, func(t *testing.T) {
+			t.Parallel()
+			gotA, errA := ddbKeyAttrToSegment(nAttr(tc.a))
+			gotB, errB := ddbKeyAttrToSegment(nAttr(tc.b))
+			if errA != nil || errB != nil {
+				t.Fatalf("err: %v / %v", errA, errB)
+			}
+			if gotA != gotB {
+				t.Fatalf("equivalent N values must canonicalise to the same segment: %q vs %q -> %q vs %q",
+					tc.a, tc.b, gotA, gotB)
+			}
+		})
+	}
+}
+
+// TestDDB_SchemaJSONIsDeterministic is the regression for Codex P2
+// round 9: schemaToPublic ranged over Go maps for both
+// global_secondary_indexes and attribute_definitions, so identical
+// snapshots produced different `_schema.json` byte output across
+// runs. The keys are now sorted before append.
+func TestDDB_SchemaJSONIsDeterministic(t *testing.T) {
+	t.Parallel()
+	schema := &pb.DynamoTableSchema{
+		TableName:  "t",
+		PrimaryKey: &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions: map[string]string{
+			"zeta": "S", "alpha": "S", "id": "S", "mu": "N",
+		},
+		GlobalSecondaryIndexes: map[string]*pb.DynamoGlobalSecondaryIndex{
+			"gZ": {KeySchema: &pb.DynamoKeySchema{HashKey: "zeta"}, Projection: &pb.DynamoGSIProjection{ProjectionType: "ALL"}},
+			"gA": {KeySchema: &pb.DynamoKeySchema{HashKey: "alpha"}, Projection: &pb.DynamoGSIProjection{ProjectionType: "ALL"}},
+			"gM": {KeySchema: &pb.DynamoKeySchema{HashKey: "mu"}, Projection: &pb.DynamoGSIProjection{ProjectionType: "ALL"}},
+		},
+		Generation: 1,
+	}
+	// Run schemaToPublic many times — Go's randomised map order
+	// would otherwise produce different array orders across calls.
+	want := schemaToPublic(schema)
+	for i := 0; i < 32; i++ {
+		got := schemaToPublic(schema)
+		if !attributeDefinitionsEqual(got.AttributeDefinitions, want.AttributeDefinitions) {
+			t.Fatalf("attribute_definitions order differs across calls: %+v vs %+v",
+				got.AttributeDefinitions, want.AttributeDefinitions)
+		}
+		if !gsiOrderEqual(got.GlobalSecondaryIndexes, want.GlobalSecondaryIndexes) {
+			t.Fatalf("global_secondary_indexes order differs across calls: %+v vs %+v",
+				got.GlobalSecondaryIndexes, want.GlobalSecondaryIndexes)
+		}
+	}
+	// Also assert the order itself is the documented sort-by-name.
+	wantAttrOrder := []string{"alpha", "id", "mu", "zeta"}
+	for i, ad := range want.AttributeDefinitions {
+		if ad.Name != wantAttrOrder[i] {
+			t.Fatalf("attribute_definitions[%d].Name = %q want %q", i, ad.Name, wantAttrOrder[i])
+		}
+	}
+	wantGSIOrder := []string{"gA", "gM", "gZ"}
+	for i, g := range want.GlobalSecondaryIndexes {
+		if g.Name != wantGSIOrder[i] {
+			t.Fatalf("global_secondary_indexes[%d].Name = %q want %q", i, g.Name, wantGSIOrder[i])
+		}
+	}
+}
+
+func attributeDefinitionsEqual(a, b []publicAttributeDefinition) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func gsiOrderEqual(a, b []publicGSI) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
+func TestDDB_NewGenerationWinsOverMigrationSourceForSameKey(t *testing.T) {
+	t.Parallel()
+	enc, root := newDDBEncoder(t)
+	schema := &pb.DynamoTableSchema{
+		TableName:               "t",
+		PrimaryKey:              &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions:    map[string]string{"id": "S"},
+		Generation:              7,
+		MigratingFromGeneration: 6,
+	}
+	// Same primary key in both generations. The live read path
+	// prefers the new gen; the dump must do the same.
+	newRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("k"), "v": sAttr("new-version"),
+	}}
+	oldRow := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("k"), "v": sAttr("old-version"),
+	}}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 6, "k", ""), encodeItemValue(t, oldRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 7, "k", ""), encodeItemValue(t, newRow)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "dynamodb", "t", "items", "k.json")) //nolint:gosec
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readItemMap(t, filepath.Join(root, "dynamodb", "t", "items", "k.json"))
+	v := mustSubMap(t, got, "v")
+	if v["S"] != "new-version" {
+		t.Fatalf("body = %s; new gen must win on conflict, got v.S=%v", body, v["S"])
+	}
+}
+
+func TestDDB_StaleGenerationItemsExcludedAndWarned(t *testing.T) {
+	t.Parallel()
+	enc, root := newDDBEncoder(t)
+	var events []string
+	enc.WithWarnSink(func(e string, _ ...any) { events = append(events, e) })
+
+	schema := &pb.DynamoTableSchema{
+		TableName:            "t",
+		PrimaryKey:           &pb.DynamoKeySchema{HashKey: "id"},
+		AttributeDefinitions: map[string]string{"id": "S"},
+		Generation:           5,
+	}
+	live := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("alive"), "v": sAttr("active"),
+	}}
+	stale := &pb.DynamoItem{Attributes: map[string]*pb.DynamoAttributeValue{
+		"id": sAttr("ghost"), "v": sAttr("from-prev-gen"),
+	}}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 5, "alive", ""), encodeItemValue(t, live)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleItem(EncodeDDBItemKey("t", 4, "ghost", ""), encodeItemValue(t, stale)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.HandleTableMeta(EncodeDDBTableMetaKey("t"), encodeSchemaValue(t, schema)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "alive.json")); err != nil {
+		t.Fatalf("expected active-gen item: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dynamodb", "t", "items", "ghost.json")); !os.IsNotExist(err) {
+		t.Fatalf("stale-gen item must NOT be emitted, stat err=%v", err)
+	}
+	if len(events) != 1 || events[0] != "ddb_stale_generation_items" {
+		t.Fatalf("events=%v want [ddb_stale_generation_items]", events)
+	}
+}
+
+func TestDDB_EmptyStringSetSerializesAsEmptyArrayNotNull(t *testing.T) {
+	t.Parallel()
+	// Per Gemini #442 — a set attribute with no members must
+	// serialize as `[]` rather than `null` so downstream tools
+	// see a present-but-empty set, not a missing field.
+	got := setAttributeValueToPublic(&pb.DynamoAttributeValue{
+		Value: &pb.DynamoAttributeValue_Ss{Ss: &pb.DynamoStringSet{Values: nil}},
+	})
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != `{"SS":[]}` {
+		t.Fatalf("got %s want {\"SS\":[]}", body)
+	}
+}
+
+func TestDDB_ParseItemKeyExtractsGeneration(t *testing.T) {
+	t.Parallel()
+	enc, gen, err := parseDDBItemKey(EncodeDDBItemKey("orders", 42, "pk", "sk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen != 42 {
+		t.Fatalf("gen=%d want 42", gen)
+	}
+	want := "b3JkZXJz" // base64url("orders")
+	if enc != want {
+		t.Fatalf("enc=%q want %q", enc, want)
+	}
+}
+
+func TestDDB_RejectsTableMetaKeyWithEmptySegment(t *testing.T) {
+	t.Parallel()
+	enc, _ := newDDBEncoder(t)
+	// `!ddb|meta|table|` (no encoded segment) -- base64url-decodes to
+	// an empty name and would otherwise route the schema under "".
+	// Codex P2 #117.
+	err := enc.HandleTableMeta([]byte(DDBTableMetaPrefix), []byte("ignored"))
+	if !errors.Is(err, ErrDDBMalformedKey) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDDB_RejectsItemKeyWithEmptyPrimaryKeyPayload(t *testing.T) {
+	t.Parallel()
+	// `!ddb|item|<table>|7|` -- gen separator present but no
+	// primary-key payload. Codex P2 #303.
+	key := []byte(DDBItemPrefix)
+	key = append(key, []byte("dA")...) // base64url("t")
+	key = append(key, []byte("|7|")...)
+	if _, _, err := parseDDBItemKey(key); !errors.Is(err, ErrDDBMalformedKey) {
+		t.Fatalf("err=%v want ErrDDBMalformedKey for truncated item key", err)
 	}
 }
 
