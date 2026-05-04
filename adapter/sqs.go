@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -167,6 +168,22 @@ type SQSServer struct {
 	// throttle config so unconfigured queues pay one nil-check per
 	// request and nothing else (see sqs_throttle.go).
 	throttle *bucketStore
+	// receiveFanoutCounters maps queueName → *atomic.Uint32 so each
+	// partitioned queue gets its own round-robin starting partition.
+	// Codex P1 round 4 flagged that a server-wide counter aliases
+	// across queues: when other queues' receives interleave with a
+	// stride that shares a factor with PartitionCount, the queue's
+	// observed counter subsequence cycles through only a subset of
+	// partitions, which can starve the rest under MaxNumberOfMessages
+	// pressure on the early-scanned ones. Per-queue isolation makes
+	// each queue's rotation depend solely on its own receive cadence.
+	//
+	// sync.Map is the right shape: lookups are read-mostly (the same
+	// queue keeps getting the same counter), and the keyset grows
+	// only with the number of distinct queues this server has handled
+	// receives for in-process — bounded by the operator-controlled
+	// CreateQueue rate.
+	receiveFanoutCounters sync.Map
 }
 
 // WithSQSLeaderMap configures the Raft-address-to-SQS-address mapping used to

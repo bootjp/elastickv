@@ -193,9 +193,14 @@ func (s *SQSServer) sendBatchStandardOnce(
 			failed = append(failed, batchErrorEntryFromAPIErr(entry.Id, apiErr))
 			continue
 		}
-		dataKey := sqsMsgDataKey(queueName, meta.Generation, rec.MessageID)
-		visKey := sqsMsgVisKey(queueName, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
-		byAgeKey := sqsMsgByAgeKey(queueName, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
+		// Standard batch send: PartitionCount > 1 is rejected on
+		// non-FIFO queues by the cross-attribute validator, so
+		// partition is always 0 and dispatch routes to legacy
+		// keys — byte-identical to the pre-PR-5b output.
+		const partition uint32 = 0
+		dataKey := sqsMsgDataKeyDispatch(meta, queueName, partition, meta.Generation, rec.MessageID)
+		visKey := sqsMsgVisKeyDispatch(meta, queueName, partition, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
+		byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, partition, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
 		elems = append(elems,
 			&kv.Elem[kv.OP]{Op: kv.Put, Key: dataKey, Value: recordBytes},
 			&kv.Elem[kv.OP]{Op: kv.Put, Key: visKey, Value: []byte(rec.MessageID)},

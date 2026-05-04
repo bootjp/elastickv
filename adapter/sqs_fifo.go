@@ -91,8 +91,12 @@ func resolveFifoDedupID(meta *sqsQueueMeta, in sqsSendMessageInput) string {
 // or (nil, nil) when there is no live record for this dedup-id.
 // Expired records are surfaced as nil so a stale entry does not block
 // a fresh send within the same FIFO queue.
-func (s *SQSServer) loadFifoDedupRecord(ctx context.Context, queueName string, gen uint64, dedupID string, readTS uint64) (*sqsFifoDedupRecord, []byte, error) {
-	key := sqsMsgDedupKey(queueName, gen, dedupID)
+//
+// groupID is the MessageGroupId; it participates in the partitioned
+// dedup key so that two groups colliding onto the same partition keep
+// disjoint dedup namespaces (the AWS messageGroup-scope contract).
+func (s *SQSServer) loadFifoDedupRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, groupID, dedupID string, readTS uint64) (*sqsFifoDedupRecord, []byte, error) {
+	key := sqsMsgDedupKeyDispatch(meta, queueName, partition, gen, groupID, dedupID)
 	raw, err := s.store.GetAt(ctx, key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -130,11 +134,11 @@ func (s *SQSServer) loadFifoSequence(ctx context.Context, queueName string, read
 
 // loadFifoGroupLock fetches the in-flight lock for a group, if any.
 // Returns nil when no lock is held. Callers that also need the key
-// can recompute it via sqsMsgGroupKey — the helper used to return it
-// alongside the lock, but every caller already had the key in scope
-// from a different code path.
-func (s *SQSServer) loadFifoGroupLock(ctx context.Context, queueName string, gen uint64, groupID string, readTS uint64) (*sqsFifoGroupLock, error) {
-	key := sqsMsgGroupKey(queueName, gen, groupID)
+// can recompute it via sqsMsgGroupKeyDispatch — the helper used to
+// return it alongside the lock, but every caller already had the
+// key in scope from a different code path.
+func (s *SQSServer) loadFifoGroupLock(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, groupID string, readTS uint64) (*sqsFifoGroupLock, error) {
+	key := sqsMsgGroupKeyDispatch(meta, queueName, partition, gen, groupID)
 	raw, err := s.store.GetAt(ctx, key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -172,7 +176,14 @@ func (s *SQSServer) sendFifoMessage(
 	delay int64,
 	readTS uint64,
 ) (map[string]string, bool, error) {
-	dedup, dedupKey, err := s.loadFifoDedupRecord(ctx, queueName, meta.Generation, dedupID, readTS)
+	// HT-FIFO: hash the MessageGroupId once at the entry point so
+	// every key built in this transaction (data, vis, byage, dedup,
+	// group-lock, sequence) lands in the same partition. partitionFor
+	// returns 0 on legacy / non-partitioned queues and on the
+	// perQueue throughput short-circuit, so the dispatch helpers
+	// round-trip to legacy output for those cases.
+	partition := partitionFor(meta, in.MessageGroupId)
+	dedup, dedupKey, err := s.loadFifoDedupRecord(ctx, queueName, meta, partition, meta.Generation, in.MessageGroupId, dedupID, readTS)
 	if err != nil {
 		return nil, false, err
 	}
@@ -216,9 +227,9 @@ func (s *SQSServer) sendFifoMessage(
 		return nil, false, errors.WithStack(err)
 	}
 
-	dataKey := sqsMsgDataKey(queueName, meta.Generation, rec.MessageID)
-	visKey := sqsMsgVisKey(queueName, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
-	byAgeKey := sqsMsgByAgeKey(queueName, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, partition, meta.Generation, rec.MessageID)
+	visKey := sqsMsgVisKeyDispatch(meta, queueName, partition, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
+	byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, partition, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
 	seqKey := sqsQueueSeqKey(queueName)
 	metaKey := sqsQueueMetaKey(queueName)
 	genKey := sqsQueueGenKey(queueName)
@@ -270,9 +281,9 @@ const (
 
 // classifyFifoGroupLock decides whether a FIFO candidate is eligible
 // for delivery. Standard queues bypass the function entirely.
-func (s *SQSServer) classifyFifoGroupLock(ctx context.Context, queueName string, gen uint64, rec *sqsMessageRecord, readTS uint64) (fifoCandidateLockState, []byte, error) {
-	lockKey := sqsMsgGroupKey(queueName, gen, rec.MessageGroupId)
-	lock, err := s.loadFifoGroupLock(ctx, queueName, gen, rec.MessageGroupId, readTS)
+func (s *SQSServer) classifyFifoGroupLock(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, rec *sqsMessageRecord, readTS uint64) (fifoCandidateLockState, []byte, error) {
+	lockKey := sqsMsgGroupKeyDispatch(meta, queueName, partition, gen, rec.MessageGroupId)
+	lock, err := s.loadFifoGroupLock(ctx, queueName, meta, partition, gen, rec.MessageGroupId, readTS)
 	if err != nil {
 		return fifoLockSkip, lockKey, err
 	}

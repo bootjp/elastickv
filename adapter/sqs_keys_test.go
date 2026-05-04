@@ -46,7 +46,7 @@ func TestSqsPartitionedMsgKeys_DistinctFromLegacy(t *testing.T) {
 		{
 			name:        "dedup",
 			legacy:      sqsMsgDedupKey(queue, gen, dedupID),
-			partitioned: sqsPartitionedMsgDedupKey(queue, partition, gen, dedupID),
+			partitioned: sqsPartitionedMsgDedupKey(queue, partition, gen, groupID, dedupID),
 		},
 		{
 			name:        "group",

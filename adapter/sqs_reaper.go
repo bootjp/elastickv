@@ -370,7 +370,13 @@ func (s *SQSServer) reapPage(ctx context.Context, queueName string, currentGen u
 // success — the message has just been touched (received, deleted,
 // redriven) by another path and is no longer ours to reap.
 func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, gen uint64, byAgeKey []byte, messageID string, readTS uint64) error {
-	dataKey := sqsMsgDataKey(queueName, gen, messageID)
+	// Reaper iterates legacy byAge entries only in PR 5b-2; the
+	// partitioned-byAge enumeration ships in a later PR. nil meta
+	// + partition 0 routes the dispatch helper to the legacy
+	// constructor so the data-key matches the pre-PR-5b layout
+	// byte-for-byte.
+	const partition uint32 = 0
+	dataKey := sqsMsgDataKeyDispatch(nil, queueName, partition, gen, messageID)
 	parsed, found, err := s.loadDataForReaper(ctx, dataKey, readTS)
 	if err != nil {
 		return err
@@ -513,7 +519,15 @@ func (s *SQSServer) dispatchDedupDelete(ctx context.Context, key []byte, readTS 
 }
 
 func (s *SQSServer) buildReapOps(ctx context.Context, queueName string, gen uint64, byAgeKey, dataKey []byte, parsed *sqsMessageRecord, readTS uint64) (*kv.OperationGroup[kv.OP], error) {
-	visKey := sqsMsgVisKey(queueName, gen, parsed.VisibleAtMillis, parsed.MessageID)
+	// Reaper currently iterates the legacy byAge keyspace only — the
+	// partitioned-byAge enumeration is wired in a later PR (Phase 3.D
+	// PR 6, partition-iterating reaper). Dispatch helpers receive
+	// nil meta + partition 0 so they deterministically route to the
+	// legacy constructor and produce byte-identical keys to the
+	// pre-PR-5b reaper. When PR 6 lands the caller switches to the
+	// real meta + parsed partition.
+	const partition uint32 = 0
+	visKey := sqsMsgVisKeyDispatch(nil, queueName, partition, gen, parsed.VisibleAtMillis, parsed.MessageID)
 	readKeys := [][]byte{byAgeKey, dataKey, visKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: byAgeKey},
@@ -521,8 +535,8 @@ func (s *SQSServer) buildReapOps(ctx context.Context, queueName string, gen uint
 		{Op: kv.Del, Key: visKey},
 	}
 	if parsed.MessageGroupId != "" {
-		lockKey := sqsMsgGroupKey(queueName, gen, parsed.MessageGroupId)
-		lock, err := s.loadFifoGroupLock(ctx, queueName, gen, parsed.MessageGroupId, readTS)
+		lockKey := sqsMsgGroupKeyDispatch(nil, queueName, partition, gen, parsed.MessageGroupId)
+		lock, err := s.loadFifoGroupLock(ctx, queueName, nil, partition, gen, parsed.MessageGroupId, readTS)
 		if err != nil {
 			return nil, err
 		}

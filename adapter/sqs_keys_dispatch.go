@@ -1,5 +1,11 @@
 package adapter
 
+import (
+	"bytes"
+
+	"github.com/cockroachdb/errors"
+)
+
 // Per-key dispatch helpers that route to the legacy single-partition
 // constructor or the partitioned-FIFO constructor based on
 // meta.PartitionCount. Phase 3.D PR 5b's central abstraction:
@@ -47,12 +53,17 @@ func sqsMsgVisKeyDispatch(meta *sqsQueueMeta, queueName string, partition uint32
 }
 
 // sqsMsgDedupKeyDispatch builds the FIFO dedup key for either
-// keyspace. Dedup scope is per-partition on partitioned queues
-// (DeduplicationScope = messageGroup is enforced by the validator
-// on PartitionCount > 1).
-func sqsMsgDedupKeyDispatch(meta *sqsQueueMeta, queueName string, partition uint32, gen uint64, dedupID string) []byte {
+// keyspace. On a partitioned queue (DeduplicationScope = messageGroup
+// — enforced by the validator on PartitionCount > 1) the dedup window
+// must be per (queue, group, dedupID): two distinct MessageGroupIds
+// that FNV-collide onto the same partition must NOT share a dedup
+// namespace, otherwise a fresh send in group B is silently acked
+// with group A's MessageId. The legacy (non-partitioned) branch
+// keeps the legacy (queue, gen, dedupID) shape — there is only one
+// implicit "group" so no collision is possible there.
+func sqsMsgDedupKeyDispatch(meta *sqsQueueMeta, queueName string, partition uint32, gen uint64, groupID, dedupID string) []byte {
 	if meta != nil && meta.PartitionCount > 1 {
-		return sqsPartitionedMsgDedupKey(queueName, partition, gen, dedupID)
+		return sqsPartitionedMsgDedupKey(queueName, partition, gen, groupID, dedupID)
 	}
 	return sqsMsgDedupKey(queueName, gen, dedupID)
 }
@@ -115,4 +126,83 @@ func effectivePartitionCount(meta *sqsQueueMeta) uint32 {
 		return 1
 	}
 	return meta.PartitionCount
+}
+
+// sqsMsgVisScanBoundsDispatch returns the start/end byte ranges that
+// ReceiveMessage's per-partition visibility-index scan iterates.
+// Mirrors sqsMsgVisScanBounds (legacy keyspace) but parametrises the
+// prefix on partition when the queue is partitioned. The bounds are
+// always [prefix||u64(0), prefix||u64(maxVisibleAtMillis+1)) so
+// messages with visible_at == maxVisibleAtMillis are included.
+func sqsMsgVisScanBoundsDispatch(meta *sqsQueueMeta, queueName string, partition uint32, gen uint64, maxVisibleAtMillis int64) (start, end []byte) {
+	prefix := sqsMsgVisPrefixForQueueDispatch(meta, queueName, partition, gen)
+	start = append(bytes.Clone(prefix), zeroU64()...)
+	upper := uint64MaxZero(maxVisibleAtMillis)
+	if upper < ^uint64(0) {
+		upper++
+	}
+	end = append(bytes.Clone(prefix), encodedU64(upper)...)
+	return start, end
+}
+
+// encodeReceiptHandleDispatch picks the receipt-handle wire format
+// based on meta.PartitionCount: v1 on legacy / non-partitioned
+// queues, v2 on partitioned ones. The partition argument is only
+// consulted on the v2 branch — callers may pass 0 on the legacy
+// branch.
+//
+// This is the single point where a fresh receipt handle commits to
+// a wire version. Pairing the choice with the same meta.PartitionCount
+// the dispatch helpers used to build keys keeps the handle's
+// recorded partition consistent with the partition the message was
+// stored under, so a later DeleteMessage / ChangeMessageVisibility
+// routes to the right keyspace.
+func encodeReceiptHandleDispatch(meta *sqsQueueMeta, partition uint32, queueGen uint64, messageIDHex string, receiptToken []byte) (string, error) {
+	if meta != nil && meta.PartitionCount > 1 {
+		return encodeReceiptHandleV2(partition, queueGen, messageIDHex, receiptToken)
+	}
+	return encodeReceiptHandle(queueGen, messageIDHex, receiptToken)
+}
+
+// validateReceiptHandleVersion enforces the queue-aware version
+// rule that replaced the dormancy gate from PR 5a:
+//
+//   - meta.PartitionCount <= 1 (legacy / non-partitioned queue):
+//     handle MUST be v1. A v2 handle on a non-partitioned queue
+//     is structurally impossible (SendMessage would never have
+//     produced one) and accepting it would let a malicious caller
+//     re-encode a v1 handle as v2 to probe / corrupt the v2 layout
+//     before any partitioned queue exists.
+//   - meta.PartitionCount > 1 (partitioned queue): handle MUST be
+//     v2. A v1 handle on a partitioned queue carries no partition
+//     index, so dispatch would default to partition 0 and the
+//     delete / change-visibility would silently miss messages on
+//     other partitions.
+//
+// Mismatches surface as ReceiptHandleIsInvalid (the same AWS error
+// shape used for malformed handles), so a misrouted client cannot
+// distinguish "wrong version" from "garbled bytes" — preserving the
+// PR 5a / PR 724 round 3 dormancy guarantee that the v2 wire format
+// is not probeable from the public API.
+func validateReceiptHandleVersion(meta *sqsQueueMeta, handle *decodedReceiptHandle) error {
+	if handle == nil {
+		return errors.New("receipt handle is nil")
+	}
+	if meta != nil && meta.PartitionCount > 1 {
+		if handle.Version != sqsReceiptHandleVersion2 {
+			return errors.New("receipt handle version mismatch for partitioned queue")
+		}
+		// handle.Partition is client-controlled once decodeClientReceiptHandle
+		// accepts v2. Without this bound check, an out-of-range partition
+		// falls through to sqsMsg*KeyDispatch and depends on downstream
+		// routing failure semantics instead of returning ReceiptHandleIsInvalid.
+		if handle.Partition >= meta.PartitionCount {
+			return errors.New("receipt handle partition out of range for queue")
+		}
+		return nil
+	}
+	if handle.Version != sqsReceiptHandleVersion1 {
+		return errors.New("receipt handle version mismatch for non-partitioned queue")
+	}
+	return nil
 }

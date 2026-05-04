@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -369,45 +370,28 @@ func decodeReceiptHandleV1(b []byte) (*decodedReceiptHandle, error) {
 }
 
 // decodeClientReceiptHandle is the public-API entry point for
-// decoding a client-supplied receipt handle. It wraps
-// decodeReceiptHandle with the dormancy gate that keeps the v2
-// codec inert until Phase 3.D PR 5b wires the partitioned-FIFO
-// data plane.
+// decoding a client-supplied receipt handle. It returns the parsed
+// shape without validating the version against the target queue —
+// PR 5a's blanket v2 rejection has been replaced with the queue-
+// aware check in validateReceiptHandleVersion, which the meta-
+// loading callers (loadMessageForDelete / loadAndVerifyMessage)
+// invoke once they have the queue's PartitionCount in scope.
 //
-// # Why the gate
+// Splitting decode from version validation lets DeleteMessage /
+// ChangeMessageVisibility produce a single ReceiptHandleIsInvalid
+// shape for both "garbled bytes" and "wrong version for this
+// queue" without leaking which one happened — preserving the
+// dormancy promise of PR 724 round 3 (no v2 wire-format
+// probability from the public API) under the new contract.
 //
-// PR 5a adds the v2 codec to the binary but does NOT yet wire any
-// production path that produces v2 handles — SendMessage on a
-// partitioned queue is rejected by the §11 PR 2 dormancy gate
-// (PartitionCount > 1 → InvalidAttributeValue). Without this
-// helper, a client could craft a v2 handle (re-encoding a
-// legitimately-issued v1 handle's queue_gen / message_id /
-// receipt_token under the v2 layout) and DeleteMessage /
-// ChangeMessageVisibility would accept it, since the downstream
-// validation only checks queue_gen + receipt_token. The behaviour
-// is technically correct (the v1 keyspace lookup still finds the
-// message) but it leaks the new wire format before PR 5b lands —
-// breaking the "no behavior change yet" guarantee of this PR
-// (codex/coderabbit major on PR #724).
-//
-// PR 5b lifts this gate together with the rest of the data-plane
-// fanout: it replaces the != v1 check with a queue-aware version
-// (v1 required on non-partitioned queues, v2 required on
-// partitioned ones), so neither version leaks into the wrong
-// keyspace. Until then, any v2 handle on the public API surfaces
-// as ReceiptHandleIsInvalid.
+// On partitioned queues (PartitionCount > 1) the §11 PR 2
+// dormancy gate is still in force in PR 5b-2 — CreateQueue
+// rejects PartitionCount > 1, so no production queue can be in
+// the partitioned branch yet, and validateReceiptHandleVersion
+// against a non-partitioned meta still rejects every v2 handle.
+// PR 5b-3 lifts the gate together with the capability check.
 func decodeClientReceiptHandle(raw string) (*decodedReceiptHandle, error) {
-	handle, err := decodeReceiptHandle(raw)
-	if err != nil {
-		return nil, err
-	}
-	if handle.Version != sqsReceiptHandleVersion1 {
-		// v2 codec is added but dormant until PR 5b. Reject any
-		// non-v1 handle on the public API so the wire format
-		// does not leak.
-		return nil, errors.New("receipt handle version is not yet enabled on the public API")
-	}
-	return handle, nil
+	return decodeReceiptHandle(raw)
 }
 
 func decodeReceiptHandleV2(b []byte) (*decodedReceiptHandle, error) {
@@ -533,9 +517,14 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dataKey := sqsMsgDataKey(queueName, meta.Generation, rec.MessageID)
-	visKey := sqsMsgVisKey(queueName, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
-	byAgeKey := sqsMsgByAgeKey(queueName, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
+	// Standard queues never have PartitionCount > 1 (the cross-
+	// attribute validator rejects it), so partition is always 0
+	// here and the dispatch helpers route to the legacy keyspace
+	// — byte-identical to the pre-PR-5b output.
+	const partition uint32 = 0
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, partition, meta.Generation, rec.MessageID)
+	visKey := sqsMsgVisKeyDispatch(meta, queueName, partition, meta.Generation, rec.AvailableAtMillis, rec.MessageID)
+	byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, partition, meta.Generation, rec.SendTimestampMillis, rec.MessageID)
 	metaKey := sqsQueueMetaKey(queueName)
 	genKey := sqsQueueGenKey(queueName)
 	// StartTS + ReadKeys fence against a concurrent DeleteQueue /
@@ -867,19 +856,106 @@ func (s *SQSServer) scanAndDeliverOnce(ctx context.Context, queueName string, op
 	if !exists {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
-	now := time.Now().UnixMilli()
-	start, end := sqsMsgVisScanBounds(queueName, meta.Generation, now)
 	pageSize := opts.Max * sqsReceiveScanOverfetchFactor
 	if pageSize > sqsVisScanPageLimit {
 		pageSize = sqsVisScanPageLimit
 	}
 	deadline := time.Now().Add(sqsVisScanWallClockBudget)
 	delivered := make([]map[string]any, 0, opts.Max)
+	// Per-partition fanout. effectivePartitionCount returns 1 on
+	// legacy / non-partitioned queues (and on perQueue throughput
+	// mode, where every group hashes to partition 0 — see
+	// effectivePartitionCount doc), so this loop is byte-identical
+	// to the pre-fanout path on those queues. Partitions are
+	// scanned sequentially so the wall-clock + opts.Max budgets are
+	// shared across the whole receive call instead of being
+	// multiplied by N.
+	//
+	// Rotate the starting partition by readTS so a sustained backlog
+	// on a single partition cannot permanently starve the others: a
+	// fixed start at 0 lets opts.Max fill from partition 0 on every
+	// call, so messages in higher-index partitions are never observed
+	// while the head queue stays hot. readTS is HLC-derived and
+	// advances per call, giving a uniform-enough rotation without
+	// any per-server state. FIFO ordering is unaffected because a
+	// MessageGroupId hashes to exactly one partition (partitionFor is
+	// deterministic), so cross-partition iteration order does not
+	// reorder messages within any group.
+	partitions := effectivePartitionCount(meta)
+	startOffset := s.nextReceiveFanoutStart(queueName, partitions)
+	for i := uint32(0); i < partitions; i++ {
+		if len(delivered) >= opts.Max {
+			break
+		}
+		if time.Now().After(deadline) {
+			return delivered, nil
+		}
+		partition := (startOffset + i) % partitions
+		fresh, err := s.scanAndDeliverPartition(ctx, queueName, meta, partition, readTS, deadline, pageSize, sqsReceiveOptions{
+			Max:                   opts.Max - len(delivered),
+			VisibilityTimeout:     opts.VisibilityTimeout,
+			WaitSeconds:           opts.WaitSeconds,
+			MessageAttributeNames: opts.MessageAttributeNames,
+		})
+		if err != nil {
+			return delivered, err
+		}
+		delivered = append(delivered, fresh...)
+	}
+	return delivered, nil
+}
+
+// nextReceiveFanoutStart returns the starting partition index for a
+// partitioned ReceiveMessage call. The counter is keyed by queueName
+// so each queue's rotation depends only on its own receive cadence
+// — a server-wide counter (round 3) aliases when other queues
+// interleave with strides that share a factor with PartitionCount
+// (Codex P1 round 4).
+//
+// PartitionCount is power-of-two (validator), so mask-AND is modulo;
+// consecutive receives on the same queue walk every partition in
+// strict round-robin. Returns 0 on legacy / non-partitioned queues
+// (partitions <= 1) without touching the map so unconfigured queues
+// pay no per-call allocation.
+func (s *SQSServer) nextReceiveFanoutStart(queueName string, partitions uint32) uint32 {
+	if partitions <= 1 {
+		return 0
+	}
+	v, ok := s.receiveFanoutCounters.Load(queueName)
+	if !ok {
+		v, _ = s.receiveFanoutCounters.LoadOrStore(queueName, &atomic.Uint32{})
+	}
+	counter, _ := v.(*atomic.Uint32)
+	return counter.Add(1) & (partitions - 1)
+}
+
+// dropReceiveFanoutCounter removes any per-queue fanout-rotation
+// counter for queueName. Mirrors throttle.invalidateQueue: called
+// from the same DeleteQueue and genuine-CreateQueue paths so the
+// sync.Map does not retain a counter for every queue name the
+// process has ever served. Without this, repeated create/delete of
+// unique queue names (multi-tenant or high-churn workloads) leaks
+// one entry per name for the lifetime of the process. No-op when
+// the queue never produced a partitioned receive (entry absent).
+func (s *SQSServer) dropReceiveFanoutCounter(queueName string) {
+	s.receiveFanoutCounters.Delete(queueName)
+}
+
+// scanAndDeliverPartition pages the visibility index for one
+// partition under the shared wall-clock + per-call max budget. On
+// legacy / non-partitioned queues the caller invokes this exactly
+// once with partition=0 and the bounds come from
+// sqsMsgVisScanBoundsDispatch's legacy branch — byte-identical to
+// the pre-fanout scanAndDeliverOnce body.
+func (s *SQSServer) scanAndDeliverPartition(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, readTS uint64, deadline time.Time, pageSize int, opts sqsReceiveOptions) ([]map[string]any, error) {
+	now := time.Now().UnixMilli()
+	start, end := sqsMsgVisScanBoundsDispatch(meta, queueName, partition, meta.Generation, now)
+	delivered := make([]map[string]any, 0, opts.Max)
 	for len(delivered) < opts.Max {
 		if time.Now().After(deadline) {
 			return delivered, nil
 		}
-		page, next, done, scanErr := s.scanOneVisibleMessagePage(ctx, start, end, pageSize, readTS)
+		page, next, done, scanErr := s.scanOneVisibleMessagePage(ctx, start, end, pageSize, readTS, partition)
 		if scanErr != nil {
 			return nil, scanErr
 		}
@@ -923,11 +999,15 @@ func resolveReceiveMaxMessages(requested *int) (int, error) {
 
 // scanVisibleMessageCandidates returns vis-index entries with
 // visible_at <= now, up to limit. Each entry carries the key (needed
-// for the delete-old-vis step) and the message_id pointed at by its
-// value.
+// for the delete-old-vis step), the message_id pointed at by its
+// value, and the partition the vis-index entry was found under (so
+// downstream rotate / delete / expire helpers can look up data /
+// byage / group-lock keys in the same partition the message was
+// originally stored under). On legacy queues partition is always 0.
 type sqsMsgCandidate struct {
 	visKey    []byte
 	messageID string
+	partition uint32
 }
 
 // sqsVisScanWallClockBudget caps how long the scan + deliver loop may
@@ -941,8 +1021,11 @@ const sqsVisScanWallClockBudget = 100 * time.Millisecond
 // scanOneVisibleMessagePage reads a single page of the visibility
 // index starting at `start`, returning the parsed candidates plus the
 // cursor for the next page. `done=true` means the scan range is
-// drained and the caller should stop paging.
-func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []byte, pageSize int, readTS uint64) ([]sqsMsgCandidate, []byte, bool, error) {
+// drained and the caller should stop paging. `partition` is stamped
+// onto every candidate so downstream rotate / delete / expire
+// helpers route to the same partition the vis-index entry was found
+// under (legacy queues always pass 0).
+func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []byte, pageSize int, readTS uint64, partition uint32) ([]sqsMsgCandidate, []byte, bool, error) {
 	kvs, err := s.store.ScanAt(ctx, start, end, pageSize, readTS)
 	if err != nil {
 		return nil, start, true, errors.WithStack(err)
@@ -952,7 +1035,7 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 	}
 	out := make([]sqsMsgCandidate, 0, len(kvs))
 	for _, kvp := range kvs {
-		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value)})
+		out = append(out, sqsMsgCandidate{visKey: bytes.Clone(kvp.Key), messageID: string(kvp.Value), partition: partition})
 	}
 	if len(kvs) < pageSize {
 		return out, start, true, nil
@@ -979,8 +1062,8 @@ func (s *SQSServer) scanOneVisibleMessagePage(ctx context.Context, start, end []
 //   - skip=true, err=nil : ErrKeyNotFound race; caller skips this one.
 //   - skip=false, err!=nil : non-retryable; propagate.
 //   - skip=false, err=nil : record loaded.
-func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, readTS uint64) (*sqsMessageRecord, []byte, bool, error) {
-	dataKey := sqsMsgDataKey(queueName, gen, cand.messageID)
+func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, gen uint64, cand sqsMsgCandidate, readTS uint64) (*sqsMessageRecord, []byte, bool, error) {
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, cand.partition, gen, cand.messageID)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -1002,8 +1085,8 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, g
 // no longer our responsibility either way. Any other error propagates
 // so a coordinator / storage failure does not silently fall through
 // to "delivered empty", matching the receive-error policy.
-func (s *SQSServer) expireMessage(ctx context.Context, queueName string, gen uint64, visKey, dataKey []byte, rec *sqsMessageRecord, readTS uint64) error {
-	byAgeKey := sqsMsgByAgeKey(queueName, gen, rec.SendTimestampMillis, rec.MessageID)
+func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, visKey, dataKey []byte, rec *sqsMessageRecord, readTS uint64) error {
+	byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, partition, gen, rec.SendTimestampMillis, rec.MessageID)
 	readKeys := [][]byte{visKey, dataKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: visKey},
@@ -1014,8 +1097,8 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, gen uin
 	// in the same group can become deliverable. This mirrors the delete
 	// and redrive paths.
 	if rec.MessageGroupId != "" {
-		lockKey := sqsMsgGroupKey(queueName, gen, rec.MessageGroupId)
-		lock, err := s.loadFifoGroupLock(ctx, queueName, gen, rec.MessageGroupId, readTS)
+		lockKey := sqsMsgGroupKeyDispatch(meta, queueName, partition, gen, rec.MessageGroupId)
+		lock, err := s.loadFifoGroupLock(ctx, queueName, meta, partition, gen, rec.MessageGroupId, readTS)
 		if err != nil {
 			return err
 		}
@@ -1061,7 +1144,7 @@ func (s *SQSServer) rotateMessagesForDelivery(
 		if len(delivered) >= opts.Max {
 			break
 		}
-		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, meta.Generation, cand, meta.MessageRetentionSeconds, readTS, opts, redrive)
+		msg, skip, err := s.tryDeliverCandidate(ctx, queueName, meta, cand, readTS, opts, redrive)
 		if err != nil {
 			return delivered, err
 		}
@@ -1087,18 +1170,18 @@ func (s *SQSServer) rotateMessagesForDelivery(
 func (s *SQSServer) tryDeliverCandidate(
 	ctx context.Context,
 	queueName string,
-	gen uint64,
+	meta *sqsQueueMeta,
 	cand sqsMsgCandidate,
-	retentionSeconds int64,
 	readTS uint64,
 	opts sqsReceiveOptions,
 	redrive *parsedRedrivePolicy,
 ) (map[string]any, bool, error) {
-	rec, dataKey, skip, err := s.loadCandidateRecord(ctx, queueName, gen, cand, readTS)
+	gen := meta.Generation
+	rec, dataKey, skip, err := s.loadCandidateRecord(ctx, queueName, meta, gen, cand, readTS)
 	if skip || err != nil {
 		return nil, skip, err
 	}
-	if expired, err := s.handleRetentionExpiry(ctx, queueName, gen, cand, dataKey, rec, retentionSeconds, readTS); expired || err != nil {
+	if expired, err := s.handleRetentionExpiry(ctx, queueName, meta, cand, dataKey, rec, meta.MessageRetentionSeconds, readTS); expired || err != nil {
 		return nil, expired, err
 	}
 	if shouldRedrive(rec, redrive) {
@@ -1107,7 +1190,7 @@ func (s *SQSServer) tryDeliverCandidate(
 		// receive response intentionally omits redriven messages —
 		// AWS does the same and consumers polling the source queue
 		// must not observe a poison message past the limit.
-		moved, err := s.redriveCandidateToDLQ(ctx, queueName, gen, cand, dataKey, rec, redrive, s.queueArn(queueName), readTS)
+		moved, err := s.redriveCandidateToDLQ(ctx, queueName, meta, cand, dataKey, rec, redrive, s.queueArn(queueName), readTS)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1119,7 +1202,7 @@ func (s *SQSServer) tryDeliverCandidate(
 	lockState := fifoLockAcquire
 	var lockKey []byte
 	if rec.MessageGroupId != "" {
-		state, key, err := s.classifyFifoGroupLock(ctx, queueName, gen, rec, readTS)
+		state, key, err := s.classifyFifoGroupLock(ctx, queueName, meta, cand.partition, gen, rec, readTS)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1129,7 +1212,7 @@ func (s *SQSServer) tryDeliverCandidate(
 		lockState = state
 		lockKey = key
 	}
-	return s.commitReceiveRotation(ctx, queueName, gen, cand, dataKey, rec, readTS, opts, lockKey, lockState)
+	return s.commitReceiveRotation(ctx, queueName, meta, cand, dataKey, rec, readTS, opts, lockKey, lockState)
 }
 
 // handleRetentionExpiry deletes the candidate inline when its
@@ -1137,7 +1220,7 @@ func (s *SQSServer) tryDeliverCandidate(
 // does not keep re-finding it. Returns (expired, err): expired=true
 // means the candidate has been (or is being) reaped and the caller
 // must skip.
-func (s *SQSServer) handleRetentionExpiry(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, retentionSeconds int64, readTS uint64) (bool, error) {
+func (s *SQSServer) handleRetentionExpiry(ctx context.Context, queueName string, meta *sqsQueueMeta, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, retentionSeconds int64, readTS uint64) (bool, error) {
 	if retentionSeconds <= 0 {
 		return false, nil
 	}
@@ -1145,7 +1228,7 @@ func (s *SQSServer) handleRetentionExpiry(ctx context.Context, queueName string,
 	if now-rec.SendTimestampMillis <= retentionSeconds*sqsMillisPerSecond {
 		return false, nil
 	}
-	if err := s.expireMessage(ctx, queueName, gen, cand.visKey, dataKey, rec, readTS); err != nil {
+	if err := s.expireMessage(ctx, queueName, meta, cand.partition, meta.Generation, cand.visKey, dataKey, rec, readTS); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1156,7 +1239,8 @@ func (s *SQSServer) handleRetentionExpiry(ctx context.Context, queueName string,
 // the candidate carries a MessageGroupId the transaction also
 // installs (or refreshes) the per-group lock so a later message in
 // the same group cannot overtake it on the next receive.
-func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string, gen uint64, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, readTS uint64, opts sqsReceiveOptions, lockKey []byte, lockState fifoCandidateLockState) (map[string]any, bool, error) {
+func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string, meta *sqsQueueMeta, cand sqsMsgCandidate, dataKey []byte, rec *sqsMessageRecord, readTS uint64, opts sqsReceiveOptions, lockKey []byte, lockState fifoCandidateLockState) (map[string]any, bool, error) {
+	gen := meta.Generation
 	newToken, err := newReceiptToken()
 	if err != nil {
 		return nil, false, err
@@ -1173,7 +1257,7 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 	if err != nil {
 		return nil, false, err
 	}
-	newVisKey := sqsMsgVisKey(queueName, gen, newVisibleAt, cand.messageID)
+	newVisKey := sqsMsgVisKeyDispatch(meta, queueName, cand.partition, gen, newVisibleAt, cand.messageID)
 	req, err := buildReceiveRotationOps(queueName, cand, dataKey, recordBytes, newVisKey, lockKey, lockState, newVisibleAt, readTS)
 	if err != nil {
 		return nil, false, err
@@ -1185,7 +1269,7 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 		return nil, false, errors.WithStack(err)
 	}
 
-	handle, err := encodeReceiptHandle(gen, cand.messageID, newToken)
+	handle, err := encodeReceiptHandleDispatch(meta, cand.partition, gen, cand.messageID, newToken)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1335,14 +1419,14 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		rec, dataKey, readTS, outcome, err := s.loadMessageForDelete(ctx, queueName, handle)
+		meta, rec, dataKey, readTS, outcome, err := s.loadMessageForDelete(ctx, queueName, handle)
 		if err != nil {
 			return err
 		}
 		if outcome == sqsDeleteNoOp {
 			return nil
 		}
-		req, err := s.buildDeleteOps(ctx, queueName, handle, rec, dataKey, readTS)
+		req, err := s.buildDeleteOps(ctx, queueName, meta, handle, rec, dataKey, readTS)
 		if err != nil {
 			return err
 		}
@@ -1362,9 +1446,9 @@ func (s *SQSServer) deleteMessageWithRetry(ctx context.Context, queueName string
 // buildDeleteOps assembles the OCC OperationGroup for a DeleteMessage
 // commit. The FIFO group-lock release branch lives here so the
 // retry-loop wrapper stays readable and within the cyclomatic budget.
-func (s *SQSServer) buildDeleteOps(ctx context.Context, queueName string, handle *decodedReceiptHandle, rec *sqsMessageRecord, dataKey []byte, readTS uint64) (*kv.OperationGroup[kv.OP], error) {
-	visKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
-	byAgeKey := sqsMsgByAgeKey(queueName, handle.QueueGeneration, rec.SendTimestampMillis, rec.MessageID)
+func (s *SQSServer) buildDeleteOps(ctx context.Context, queueName string, meta *sqsQueueMeta, handle *decodedReceiptHandle, rec *sqsMessageRecord, dataKey []byte, readTS uint64) (*kv.OperationGroup[kv.OP], error) {
+	visKey := sqsMsgVisKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+	byAgeKey := sqsMsgByAgeKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.SendTimestampMillis, rec.MessageID)
 	readKeys := [][]byte{dataKey, visKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: dataKey},
@@ -1372,8 +1456,8 @@ func (s *SQSServer) buildDeleteOps(ctx context.Context, queueName string, handle
 		{Op: kv.Del, Key: byAgeKey},
 	}
 	if rec.MessageGroupId != "" {
-		lockKey := sqsMsgGroupKey(queueName, handle.QueueGeneration, rec.MessageGroupId)
-		lock, err := s.loadFifoGroupLock(ctx, queueName, handle.QueueGeneration, rec.MessageGroupId, readTS)
+		lockKey := sqsMsgGroupKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.MessageGroupId)
+		lock, err := s.loadFifoGroupLock(ctx, queueName, meta, handle.Partition, handle.QueueGeneration, rec.MessageGroupId, readTS)
 		if err != nil {
 			return nil, err
 		}
@@ -1414,34 +1498,37 @@ const (
 // to a different (or recreated) queue and we reject it as a structural
 // error — silently succeeding would let misrouted deletes ack messages
 // that cannot possibly be deleted on this queue.
-func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, uint64, sqsDeleteOutcome, error) {
+func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, uint64, sqsDeleteOutcome, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return nil, nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	if meta.Generation != handle.QueueGeneration {
-		return nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
+		return nil, nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
 	}
-	dataKey := sqsMsgDataKey(queueName, handle.QueueGeneration, handle.MessageIDHex)
+	if err := validateReceiptHandleVersion(meta, handle); err != nil {
+		return nil, nil, nil, readTS, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
+	}
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, readTS, sqsDeleteNoOp, nil
+			return meta, nil, nil, readTS, sqsDeleteNoOp, nil
 		}
-		return nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
 	}
 	rec, err := decodeSQSMessageRecord(raw)
 	if err != nil {
-		return nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
+		return nil, nil, nil, readTS, sqsDeleteProceed, errors.WithStack(err)
 	}
 	if !bytes.Equal(rec.CurrentReceiptToken, handle.ReceiptToken) {
-		return nil, nil, readTS, sqsDeleteNoOp, nil
+		return meta, nil, nil, readTS, sqsDeleteNoOp, nil
 	}
-	return rec, dataKey, readTS, sqsDeleteProceed, nil
+	return meta, rec, dataKey, readTS, sqsDeleteProceed, nil
 }
 
 func (s *SQSServer) changeMessageVisibility(w http.ResponseWriter, r *http.Request) {
@@ -1485,7 +1572,7 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		rec, dataKey, readTS, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
+		meta, rec, dataKey, readTS, apiErr := s.loadAndVerifyMessage(ctx, queueName, handle)
 		if apiErr != nil {
 			return apiErr
 		}
@@ -1493,13 +1580,13 @@ func (s *SQSServer) changeVisibilityWithRetry(ctx context.Context, queueName str
 		if rec.VisibleAtMillis <= now {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrMessageNotInflight, "message is not currently in flight")
 		}
-		oldVisKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+		oldVisKey := sqsMsgVisKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
 		rec.VisibleAtMillis = now + newTimeout*sqsMillisPerSecond
 		recordBytes, err := encodeSQSMessageRecord(rec)
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		newVisKey := sqsMsgVisKey(queueName, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
+		newVisKey := sqsMsgVisKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.VisibleAtMillis, rec.MessageID)
 		// StartTS pins OCC to the snapshot; without it the coordinator
 		// would auto-assign a newer StartTS and a concurrent receive /
 		// delete that commits between our load and dispatch could slip
@@ -1555,34 +1642,37 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 // cleans them up, so a handle from a deleted / recreated queue must
 // be rejected with ReceiptHandleIsInvalid instead of silently
 // mutating the orphan record.
-func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsMessageRecord, []byte, uint64, error) {
+func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, handle *decodedReceiptHandle) (*sqsQueueMeta, *sqsMessageRecord, []byte, uint64, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
-		return nil, nil, readTS, errors.WithStack(err)
+		return nil, nil, nil, readTS, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
 	if meta.Generation != handle.QueueGeneration {
-		return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
+		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle does not belong to this queue")
 	}
-	dataKey := sqsMsgDataKey(queueName, handle.QueueGeneration, handle.MessageIDHex)
+	if err := validateReceiptHandleVersion(meta, handle); err != nil {
+		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
+	}
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
 	raw, err := s.store.GetAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")
+			return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")
 		}
-		return nil, nil, readTS, errors.WithStack(err)
+		return nil, nil, nil, readTS, errors.WithStack(err)
 	}
 	rec, err := decodeSQSMessageRecord(raw)
 	if err != nil {
-		return nil, nil, readTS, errors.WithStack(err)
+		return nil, nil, nil, readTS, errors.WithStack(err)
 	}
 	if !bytes.Equal(rec.CurrentReceiptToken, handle.ReceiptToken) {
-		return nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidReceiptHandle, "receipt handle token does not match")
+		return nil, nil, nil, readTS, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidReceiptHandle, "receipt handle token does not match")
 	}
-	return rec, dataKey, readTS, nil
+	return meta, rec, dataKey, readTS, nil
 }
 
 // ------------------------ small helpers ------------------------
