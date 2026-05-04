@@ -124,7 +124,12 @@ func (s *SQSServer) reapTombstonedQueues(ctx context.Context) error {
 			if !ok {
 				continue
 			}
-			s.reapTombstonedGeneration(ctx, queueName, gen, kvp.Key, readTS)
+			// PartitionCount is encoded in the tombstone value
+			// (PR 6a). decodeQueueTombstoneValue maps legacy /
+			// non-canonical values to 1 so pre-PR-6a tombstones
+			// retain their byte-identical legacy reaper path.
+			partitionCount := decodeQueueTombstoneValue(kvp.Value)
+			s.reapTombstonedGeneration(ctx, queueName, gen, partitionCount, kvp.Key, readTS)
 		}
 		if len(page) < sqsReaperPageLimit {
 			return nil
@@ -140,7 +145,21 @@ func (s *SQSServer) reapTombstonedQueues(ctx context.Context) error {
 // its own per-queue budget. Once every prefix the cohort can occupy
 // is empty, the tombstone itself is deleted; otherwise it stays so
 // the next tick can finish what was left.
-func (s *SQSServer) reapTombstonedGeneration(ctx context.Context, queueName string, gen uint64, tombstoneKey []byte, readTS uint64) {
+//
+// partitionCount drives partition-iterative cleanup: 1 (legacy /
+// non-partitioned queue, or pre-PR-6a tombstone whose value
+// decoded to the default) takes the byte-identical legacy path —
+// one byage / dedup / group sweep — and leaves the partitioned
+// keyspace untouched. Greater than 1 ALSO sweeps the partitioned
+// byage / dedup / group prefix family for each partition in
+// [0, partitionCount), which is the §6 "partitions × budget"
+// reaper contract from the split-queue-FIFO design.
+func (s *SQSServer) reapTombstonedGeneration(ctx context.Context, queueName string, gen uint64, partitionCount uint32, tombstoneKey []byte, readTS uint64) {
+	// Legacy keyspace is always swept — covers all pre-HT-FIFO
+	// queues plus any partitioned queue that briefly carried legacy
+	// records (defensive: data is nominally never written to the
+	// legacy keyspace for partitioned queues, but the sweep is
+	// idempotent and cheap).
 	dataDone, err := s.reapDeadByAge(ctx, queueName, gen, readTS)
 	if err != nil {
 		slog.Warn("sqs tombstone byage reap failed", "queue", queueName, "gen", gen, "err", err)
@@ -156,9 +175,57 @@ func (s *SQSServer) reapTombstonedGeneration(ctx context.Context, queueName stri
 		slog.Warn("sqs tombstone group reap failed", "queue", queueName, "gen", gen, "err", err)
 		return
 	}
-	if dataDone && dedupDone && groupDone {
+	allDone := dataDone && dedupDone && groupDone
+	// Partitioned sweep: one (byage, dedup, group) triple per
+	// partition. Each triple shares the per-queue budget with the
+	// legacy sweep, so a wide-fanout queue may need multiple reaper
+	// ticks to fully drain — same contract as the live-queue reap.
+	if partitionCount > 1 {
+		partDone, err := s.reapPartitionedGeneration(ctx, queueName, gen, partitionCount, readTS)
+		if err != nil {
+			slog.Warn("sqs tombstone partitioned reap failed",
+				"queue", queueName, "gen", gen, "partitionCount", partitionCount, "err", err)
+			return
+		}
+		allDone = allDone && partDone
+	}
+	if allDone {
 		_ = s.dispatchDedupDelete(ctx, tombstoneKey, readTS)
 	}
+}
+
+// reapPartitionedGeneration sweeps the partitioned byage, dedup,
+// and group prefix family for every partition of one tombstoned
+// (queue, gen) cohort. Returns done=true only when EVERY partition
+// AND every prefix family is fully drained — short-circuiting on
+// the first unfinished partition would leave the tombstone in
+// place but skip later partitions on this tick, starving them
+// under churn.
+func (s *SQSServer) reapPartitionedGeneration(ctx context.Context, queueName string, gen uint64, partitionCount uint32, readTS uint64) (bool, error) {
+	allDone := true
+	for partition := uint32(0); partition < partitionCount; partition++ {
+		if err := ctx.Err(); err != nil {
+			return false, errors.WithStack(err)
+		}
+		byageDone, err := s.reapDeadByAgePartition(ctx, queueName, gen, partition, readTS)
+		if err != nil {
+			return false, err
+		}
+		dedupDone, err := s.deleteAllPrefix(ctx,
+			sqsPartitionedMsgDedupKeyPrefix(queueName, partition, gen), readTS)
+		if err != nil {
+			return false, err
+		}
+		groupDone, err := s.deleteAllPrefix(ctx,
+			sqsPartitionedMsgGroupKeyPrefix(queueName, partition, gen), readTS)
+		if err != nil {
+			return false, err
+		}
+		if !byageDone || !dedupDone || !groupDone {
+			allDone = false
+		}
+	}
+	return allDone, nil
 }
 
 // reapDeadByAge walks the byage prefix for one (queue, gen) cohort
@@ -203,7 +270,73 @@ func (s *SQSServer) reapDeadByAgePage(ctx context.Context, queueName string, gen
 		if !ok || parsed.Generation != gen {
 			continue
 		}
-		if err := s.reapOneRecord(ctx, queueName, gen, kvp.Key, parsed.MessageID, readTS); err != nil {
+		// Legacy byage path: nil meta + partition 0 keeps the
+		// dispatch helpers on the legacy constructors (byte-
+		// identical to the pre-PR-5b reaper). The partitioned
+		// twin (reapDeadByAgePartitionPage) takes the meta-aware
+		// branch via reapOneRecordPartitioned.
+		if err := s.reapOneRecord(ctx, queueName, nil, 0, gen, kvp.Key, parsed.MessageID, readTS); err != nil {
+			return true, processed, err
+		}
+		processed++
+		if processed >= sqsReaperPerQueueBudget {
+			return true, processed, nil
+		}
+	}
+	if len(page) < sqsReaperPageLimit {
+		return true, processed, nil
+	}
+	return false, processed, nil
+}
+
+// reapDeadByAgePartition is the partitioned-keyspace twin of
+// reapDeadByAge. Each iteration scans one partition's byage prefix
+// for one (queue, gen) cohort, parses the partitioned byage key,
+// and dispatches the (data, vis, byage, optional group-lock)
+// quartet delete for the message. Threads partition through
+// reapOneRecord so the dispatch helpers route to the partitioned
+// data / vis keys, not the legacy ones.
+func (s *SQSServer) reapDeadByAgePartition(ctx context.Context, queueName string, gen uint64, partition uint32, readTS uint64) (bool, error) {
+	prefix := sqsPartitionedMsgByAgePrefixForPartition(queueName, partition, gen)
+	upper := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+	processed := 0
+	for processed < sqsReaperPerQueueBudget {
+		page, err := s.store.ScanAt(ctx, start, upper, sqsReaperPageLimit, readTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			return true, nil
+		}
+		done, newProcessed, err := s.reapDeadByAgePartitionPage(ctx, queueName, gen, partition, page, readTS, processed)
+		if err != nil {
+			return false, err
+		}
+		processed = newProcessed
+		if done {
+			return processed < sqsReaperPerQueueBudget, nil
+		}
+		start = nextScanCursorAfter(page[len(page)-1].Key)
+	}
+	return false, nil
+}
+
+// reapDeadByAgePartitionPage is the partitioned twin of
+// reapDeadByAgePage. Parses each entry as a partitioned byage key
+// (verifying the partition matches — defensive against page
+// boundaries that span partitions, which the prefix scan should
+// already prevent) and feeds the partition-aware reapOneRecord.
+func (s *SQSServer) reapDeadByAgePartitionPage(ctx context.Context, queueName string, gen uint64, partition uint32, page []*store.KVPair, readTS uint64, processed int) (bool, int, error) {
+	for _, kvp := range page {
+		if err := ctx.Err(); err != nil {
+			return true, processed, errors.WithStack(err)
+		}
+		parsed, ok := parseSqsPartitionedMsgByAgeKey(kvp.Key, queueName)
+		if !ok || parsed.Partition != partition || parsed.Generation != gen {
+			continue
+		}
+		if err := s.reapOneRecordPartitioned(ctx, queueName, partition, gen, kvp.Key, parsed.MessageID, readTS); err != nil {
 			return true, processed, err
 		}
 		processed++
@@ -351,7 +484,11 @@ func (s *SQSServer) reapPage(ctx context.Context, queueName string, currentGen u
 			// see meta caught up.
 			continue
 		}
-		if err := s.reapOneRecord(ctx, queueName, parsed.Generation, kvp.Key, parsed.MessageID, readTS); err != nil {
+		// Live-queue retention reap currently iterates only the
+		// legacy byage keyspace; partitioned-byage live-queue
+		// retention is a follow-up to PR 6a (the tombstoned-cohort
+		// path is what this PR addresses).
+		if err := s.reapOneRecord(ctx, queueName, nil, 0, parsed.Generation, kvp.Key, parsed.MessageID, readTS); err != nil {
 			return true, processed, err
 		}
 		processed++
@@ -369,14 +506,15 @@ func (s *SQSServer) reapPage(ctx context.Context, queueName string, currentGen u
 // quartet under a single OCC dispatch. ErrWriteConflict is treated as
 // success — the message has just been touched (received, deleted,
 // redriven) by another path and is no longer ours to reap.
-func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, gen uint64, byAgeKey []byte, messageID string, readTS uint64) error {
-	// Reaper iterates legacy byAge entries only in PR 5b-2; the
-	// partitioned-byAge enumeration ships in a later PR. nil meta
-	// + partition 0 routes the dispatch helper to the legacy
-	// constructor so the data-key matches the pre-PR-5b layout
-	// byte-for-byte.
-	const partition uint32 = 0
-	dataKey := sqsMsgDataKeyDispatch(nil, queueName, partition, gen, messageID)
+//
+// Legacy reaper callers pass nil meta + partition 0 so the dispatch
+// helpers route to the legacy constructors (byte-identical to the
+// pre-PR-5b layout). Partitioned reaper callers (PR 6a) pass a
+// synthetic *sqsQueueMeta carrying the tombstone-encoded
+// PartitionCount so the dispatch helpers route to the partitioned
+// constructors.
+func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, byAgeKey []byte, messageID string, readTS uint64) error {
+	dataKey := sqsMsgDataKeyDispatch(meta, queueName, partition, gen, messageID)
 	parsed, found, err := s.loadDataForReaper(ctx, dataKey, readTS)
 	if err != nil {
 		return err
@@ -388,7 +526,7 @@ func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, gen uin
 		s.dispatchOrphanByAgeDrop(ctx, byAgeKey, readTS)
 		return nil
 	}
-	req, err := s.buildReapOps(ctx, queueName, gen, byAgeKey, dataKey, parsed, readTS)
+	req, err := s.buildReapOps(ctx, queueName, meta, partition, gen, byAgeKey, dataKey, parsed, readTS)
 	if err != nil {
 		return err
 	}
@@ -399,6 +537,22 @@ func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, gen uin
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+// reapOneRecordPartitioned is a thin convenience wrapper around
+// reapOneRecord for the partitioned-byage enumeration: synthesises
+// a meta carrying any value of PartitionCount > 1 so the dispatch
+// helpers route to the partitioned key family. The exact value is
+// not consulted by the reaper's per-key dispatch path — the
+// helpers only branch on the legacy-vs-partitioned bit
+// (PartitionCount > 1) — so we use the minimum legal partitioned
+// value as a sentinel rather than the queue's real count, which
+// would imply the synthetic meta carries information it actually
+// does not (Claude review on PR #735).
+func (s *SQSServer) reapOneRecordPartitioned(ctx context.Context, queueName string, partition uint32, gen uint64, byAgeKey []byte, messageID string, readTS uint64) error {
+	const partitionedDispatchSentinel uint32 = 2
+	syntheticMeta := &sqsQueueMeta{PartitionCount: partitionedDispatchSentinel}
+	return s.reapOneRecord(ctx, queueName, syntheticMeta, partition, gen, byAgeKey, messageID, readTS)
 }
 
 // loadDataForReaper fetches and decodes the data record for a byage
@@ -518,16 +672,13 @@ func (s *SQSServer) dispatchDedupDelete(ctx context.Context, key []byte, readTS 
 	return nil
 }
 
-func (s *SQSServer) buildReapOps(ctx context.Context, queueName string, gen uint64, byAgeKey, dataKey []byte, parsed *sqsMessageRecord, readTS uint64) (*kv.OperationGroup[kv.OP], error) {
-	// Reaper currently iterates the legacy byAge keyspace only — the
-	// partitioned-byAge enumeration is wired in a later PR (Phase 3.D
-	// PR 6, partition-iterating reaper). Dispatch helpers receive
-	// nil meta + partition 0 so they deterministically route to the
-	// legacy constructor and produce byte-identical keys to the
-	// pre-PR-5b reaper. When PR 6 lands the caller switches to the
-	// real meta + parsed partition.
-	const partition uint32 = 0
-	visKey := sqsMsgVisKeyDispatch(nil, queueName, partition, gen, parsed.VisibleAtMillis, parsed.MessageID)
+func (s *SQSServer) buildReapOps(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, byAgeKey, dataKey []byte, parsed *sqsMessageRecord, readTS uint64) (*kv.OperationGroup[kv.OP], error) {
+	// meta + partition route the dispatch helpers to the right key
+	// family: nil meta + partition 0 is the legacy reaper path
+	// (byte-identical to pre-PR-5b layout); a synthetic meta with
+	// PartitionCount>1 + a real partition is the partitioned reaper
+	// path landed in PR 6a.
+	visKey := sqsMsgVisKeyDispatch(meta, queueName, partition, gen, parsed.VisibleAtMillis, parsed.MessageID)
 	readKeys := [][]byte{byAgeKey, dataKey, visKey, sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)}
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: byAgeKey},
@@ -535,8 +686,8 @@ func (s *SQSServer) buildReapOps(ctx context.Context, queueName string, gen uint
 		{Op: kv.Del, Key: visKey},
 	}
 	if parsed.MessageGroupId != "" {
-		lockKey := sqsMsgGroupKeyDispatch(nil, queueName, partition, gen, parsed.MessageGroupId)
-		lock, err := s.loadFifoGroupLock(ctx, queueName, nil, partition, gen, parsed.MessageGroupId, readTS)
+		lockKey := sqsMsgGroupKeyDispatch(meta, queueName, partition, gen, parsed.MessageGroupId)
+		lock, err := s.loadFifoGroupLock(ctx, queueName, meta, partition, gen, parsed.MessageGroupId, readTS)
 		if err != nil {
 			return nil, err
 		}
