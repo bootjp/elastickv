@@ -49,6 +49,7 @@ jobs:
           RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
           RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
           RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802,127.0.0.1:50053=127.0.0.1:63803"
+          RAFT_SQS_MAP="127.0.0.1:50051=127.0.0.1:63501,127.0.0.1:50052=127.0.0.1:63502,127.0.0.1:50053=127.0.0.1:63503"
 
           : > /tmp/elastickv-demo.pid
           for node in 1 2 3; do
@@ -57,6 +58,7 @@ jobs:
               --redisAddress "127.0.0.1:6379${node}" \
               --dynamoAddress "127.0.0.1:6380${node}" \
               --s3Address "127.0.0.1:6390${node}" \
+              --sqsAddress "127.0.0.1:6350${node}" \
               --metricsAddress "" \
               --pprofAddress "" \
               --raftId "n${node}" \
@@ -65,15 +67,17 @@ jobs:
               --raftRedisMap "$RAFT_REDIS_MAP" \
               --raftS3Map "$RAFT_S3_MAP" \
               --raftDynamoMap "$RAFT_DYNAMO_MAP" \
+              --raftSqsMap "$RAFT_SQS_MAP" \
               > "/tmp/elastickv-demo-n${node}.log" 2>&1 &
             echo $! >> /tmp/elastickv-demo.pid
           done
 
-          echo "Waiting for redis (63791-63793), dynamo (63801-63803), and s3 (63901-63903) listeners..."
+          echo "Waiting for redis (63791-63793), dynamo (63801-63803), s3 (63901-63903), and sqs (63501-63503) listeners..."
           for i in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
               && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
-              && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903; then
+              && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903 \
+              && nc -z 127.0.0.1 63501 && nc -z 127.0.0.1 63502 && nc -z 127.0.0.1 63503; then
               echo "Cluster is up"
               exit 0
             fi
@@ -142,6 +146,18 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 10 --concurrency 10 --s3-ports 63901,63902,63903 --host 127.0.0.1
+      - name: Run SQS HT-FIFO Jepsen workload against elastickv
+        working-directory: jepsen
+        # The HT-FIFO workload runs sends and receives across a 4-partition
+        # FIFO queue with content-based deduplication. The custom checker
+        # validates within-group ordering, no loss, and no duplicates.
+        # See jepsen/src/elastickv/sqs_htfifo_workload.clj.
+        timeout-minutes: 3
+        run: |
+          timeout 120 ~/lein run -m elastickv.sqs-htfifo-workload --local \
+            --time-limit 5 --rate 5 --concurrency 5 \
+            --partition-count 4 --group-count 6 \
+            --sqs-ports 63501,63502,63503 --host 127.0.0.1
       - name: Stop demo cluster
         if: always()
         run: |
