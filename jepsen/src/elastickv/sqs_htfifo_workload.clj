@@ -571,7 +571,7 @@
    [nil "--group-count N" "Number of distinct MessageGroupId values to spread sends across."
     :default default-group-count
     :parse-fn #(Integer/parseInt %)]
-   [nil "--send-fraction F" "Probability a generator op is :send (rest are :recv)."
+   [nil "--send-fraction F" "Probability a generator op is :send (rest are :recv). 0.0 and 1.0 still emit at least 1 op of each kind to prevent generator starvation; pass values in (0, 1) for a true mix."
     :default 0.5
     :parse-fn #(Double/parseDouble %)]
    [nil "--drain-time SECONDS" "Receive-only drain phase after the main generator finishes (default: visibility-timeout + 10s = 40s)."

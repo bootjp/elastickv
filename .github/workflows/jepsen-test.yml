@@ -152,11 +152,19 @@ jobs:
         # FIFO queue with content-based deduplication. The custom checker
         # validates within-group ordering, no loss, and no duplicates.
         # See jepsen/src/elastickv/sqs_htfifo_workload.clj.
+        #
+        # --drain-time 15: in --local mode the nemesis is a no-op, so no
+        # message can become invisible due to partition/kill — the 40s
+        # default drain (which protects against fault-induced
+        # visibility-timeout races) is overkill here. 15s leaves ample
+        # headroom under the 120s shell timeout against JVM startup and
+        # the 5s main phase.
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.sqs-htfifo-workload --local \
             --time-limit 5 --rate 5 --concurrency 5 \
             --partition-count 4 --group-count 6 \
+            --drain-time 15 \
             --sqs-ports 63501,63502,63503 --host 127.0.0.1
       - name: Stop demo cluster
         if: always()
