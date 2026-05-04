@@ -122,11 +122,10 @@ type sqsQueueMeta struct {
 	// Zero or 1 means the legacy single-partition layout — no schema
 	// change. Greater than 1 enables HT-FIFO. Set at CreateQueue time
 	// and immutable thereafter (SetQueueAttributes rejects any change).
-	// Power-of-two values only (validator rejects others). PR 2 of the
-	// rollout introduces this field but a temporary CreateQueue gate
-	// rejects PartitionCount > 1 until PR 5 lifts the gate atomically
-	// with the data-plane fanout — so the schema exists but no
-	// partitioned data can land before the data plane is wired.
+	// Power-of-two values only (validator rejects others). CreateQueue
+	// gates PartitionCount > 1 on the cluster-wide htfifo capability
+	// (validateHTFIFOCapability in tryCreateQueueOnce) so a
+	// partitioned queue cannot land in a partially-upgraded cluster.
 	PartitionCount uint32 `json:"partition_count,omitempty"`
 	// FifoThroughputLimit mirrors the AWS attribute. "perMessageGroupId"
 	// (default for HT-FIFO) keeps the §3.3 hash-by-MessageGroupId
@@ -383,10 +382,11 @@ func parseAttributesIntoMeta(name string, attrs map[string]string) (*sqsQueueMet
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication is only valid on FIFO queues")
 	}
 	// HT-FIFO validation runs after resolveFifoQueueFlag so the
-	// IsFIFO-only checks see the post-resolution flag. The temporary
-	// dormancy gate (§11 PR 2) runs separately in createQueue so
-	// SetQueueAttributes paths share the schema validator without
-	// re-rejecting on the gate.
+	// IsFIFO-only checks see the post-resolution flag. The
+	// cluster-wide capability gate (validateHTFIFOCapability) runs
+	// separately in tryCreateQueueOnce so SetQueueAttributes paths
+	// share the schema validator without paying the network poll
+	// cost (immutability also blocks PartitionCount changes there).
 	if err := validatePartitionConfig(meta); err != nil {
 		return nil, err
 	}

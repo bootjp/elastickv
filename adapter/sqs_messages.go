@@ -384,12 +384,13 @@ func decodeReceiptHandleV1(b []byte) (*decodedReceiptHandle, error) {
 // dormancy promise of PR 724 round 3 (no v2 wire-format
 // probability from the public API) under the new contract.
 //
-// On partitioned queues (PartitionCount > 1) the §11 PR 2
-// dormancy gate is still in force in PR 5b-2 — CreateQueue
-// rejects PartitionCount > 1, so no production queue can be in
-// the partitioned branch yet, and validateReceiptHandleVersion
-// against a non-partitioned meta still rejects every v2 handle.
-// PR 5b-3 lifts the gate together with the capability check.
+// On partitioned queues (PartitionCount > 1) the cluster-wide
+// htfifo capability gate (PR 5b-3) admits CreateQueue; v2 handles
+// then reach validateReceiptHandleVersion through the meta load
+// performed inside loadMessageForDelete / loadAndVerifyMessage,
+// which checks the version against the queue's PartitionCount and
+// rejects the v2-on-legacy and v1-on-partitioned mismatches with
+// ReceiptHandleIsInvalid.
 func decodeClientReceiptHandle(raw string) (*decodedReceiptHandle, error) {
 	return decodeReceiptHandle(raw)
 }

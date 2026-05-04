@@ -166,9 +166,10 @@ func TestValidatePartitionConfig_RejectsAboveMax(t *testing.T) {
 //
 // PartitionCount > 1 is also FIFO-only — without the guard a
 // Standard queue with PartitionCount=2 would slip past the validator
-// after PR 5 lifts the dormancy gate. PartitionCount 0/1 are still
-// accepted
-// on Standard queues because both mean "single-partition layout".
+// (the capability gate that gates partitioned creates only fires on
+// FIFO queues, so the schema rule has to catch the Standard case).
+// PartitionCount 0/1 are still accepted on Standard queues because
+// both mean "single-partition layout".
 func TestValidatePartitionConfig_StandardQueueRejectsHTFIFOAttrs(t *testing.T) {
 	t.Parallel()
 	require.Error(t, validatePartitionConfig(&sqsQueueMeta{IsFIFO: false, FifoThroughputLimit: htfifoThroughputPerQueue}))
@@ -232,9 +233,10 @@ func TestValidatePartitionConfig_PerMessageGroupIDRequiresExplicitPartitionCount
 		require.Equal(t, sqsErrInvalidAttributeValue, apiErr.errorType)
 	}
 	// FIFO + perMessageGroupId + PartitionCount=8: accept (the
-	// dormancy gate runs separately on CreateQueue and rejects this
-	// at the wire today, but the cross-attribute validator on its
-	// own does not).
+	// cluster-wide capability gate runs separately on CreateQueue
+	// and may still reject this at the wire on a partially-upgraded
+	// cluster, but the cross-attribute validator on its own does
+	// not).
 	require.NoError(t, validatePartitionConfig(&sqsQueueMeta{
 		IsFIFO:              true,
 		FifoThroughputLimit: htfifoThroughputPerMessageGroupID,
