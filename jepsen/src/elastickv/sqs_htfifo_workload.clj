@@ -49,7 +49,6 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private default-sqs-port 9324)
-(def ^:private queue-name "jepsen-htfifo.fifo")
 (def ^:private default-partition-count 4)
 (def ^:private default-group-count 8)
 (def ^:private receive-batch-size 10)
@@ -59,6 +58,17 @@
 ;; receive and the next pass even under partition.
 (def ^:private receive-wait-seconds 1)
 (def ^:private visibility-timeout-seconds 30)
+
+(defn- fresh-queue-name
+  "Build a per-run unique queue name. Includes a millisecond timestamp
+   so re-running the workload against an already-running cluster
+   (--no-rebuild --no-cluster) starts with a fresh queue: prior-run
+   messages cannot inflate :received, drift the per-group seq numbering,
+   or block sends via the 5-minute ContentBasedDeduplication window.
+   AWS SQS queue names admit [A-Za-z0-9_-] plus the .fifo suffix; the
+   timestamp sits inside that alphabet."
+  []
+  (str "jepsen-htfifo-" (System/currentTimeMillis) ".fifo"))
 
 ;; ---------------------------------------------------------------------------
 ;; SQS client construction
@@ -107,9 +117,10 @@
 
 (defn- create-htfifo-queue!
   "Idempotently create the HT-FIFO test queue. Returns the QueueUrl.
-   Tolerates QueueAlreadyExists (the test queue may survive across restarts
-   of the same workload run)."
-  [sqs partition-count]
+   Tolerates QueueAlreadyExists so concurrent workers calling setup!
+   in parallel converge on the same QueueUrl (each worker calls
+   setup! independently in Jepsen's lifecycle)."
+  [sqs queue-name partition-count]
   (let [attrs {"FifoQueue"                 "true"
                "ContentBasedDeduplication" "true"
                "PartitionCount"            (str partition-count)
@@ -164,7 +175,12 @@
    single failed assertion instead of crashing the checker."
   [body]
   (when (string? body)
-    (when-let [[group seq-str] (str/split body #":" 2)]
+    ;; str/split always returns a vector — never nil — so the
+    ;; nil-safety here lives in the str/blank? checks below, not
+    ;; in a when-let on the destructure. Plain let makes that
+    ;; explicit; "g0" with no colon binds seq-str=nil, which
+    ;; str/blank? treats as blank and the when guards skip.
+    (let [[group seq-str] (str/split body #":" 2)]
       (when (and (not (str/blank? group))
                  (not (str/blank? seq-str)))
         (try
@@ -176,7 +192,7 @@
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
 
-(defrecord HTFIFOClient [node->port region groups seq-counters sqs queue-url partition-count]
+(defrecord HTFIFOClient [node->port region groups seq-counters queue-name sqs queue-url partition-count]
   client/Client
 
   (open! [this test node]
@@ -185,7 +201,7 @@
       (assoc this :sqs (make-sqs-client host port region))))
 
   (setup! [this _test]
-    (let [url (create-htfifo-queue! sqs partition-count)]
+    (let [url (create-htfifo-queue! sqs queue-name partition-count)]
       (info "HT-FIFO test queue ready" url "partitions=" partition-count)
       (assoc this :queue-url url)))
 
@@ -438,19 +454,23 @@
 
 (defn sqs-htfifo-workload
   "Builds the HT-FIFO workload map with custom client, generator, and
-   checker. Shared seq-counters atom is constructed here so every client
-   worker increments the same per-group counter."
+   checker. Shared seq-counters atom and per-run queue name are
+   constructed here once so every client worker sees the same values
+   (workers fan out via Jepsen's open!/setup! lifecycle, all reading
+   the same record fields)."
   [opts]
   (let [partition-count (or (:partition-count opts) default-partition-count)
         group-count     (or (:group-count opts) default-group-count)
         send-fraction   (or (:send-fraction opts) 0.5)
         groups          (group-ids group-count)
         seq-counters    (fresh-seq-counters groups)
+        queue-name      (or (:queue-name opts) (fresh-queue-name))
         client          (->HTFIFOClient (or (:node->port opts)
                                             (zipmap default-nodes (repeat default-sqs-port)))
                                         (:sqs-region opts)
                                         groups
                                         seq-counters
+                                        queue-name
                                         nil  ; sqs (per-worker)
                                         nil  ; queue-url
                                         partition-count)]
@@ -478,15 +498,17 @@
                                 :shard-ranges (:shard-ranges opts)}))
          rate       (double (or (:rate opts) 5))
          time-limit (or (:time-limit opts) 30)
-         ;; Drain must outlast the visibility-timeout window, otherwise
-         ;; a message that sat invisible past the main phase (worker
-         ;; killed mid-receive, delete that didn't commit) can never
-         ;; reappear before the checker runs and gets reported as :lost
-         ;; even though the server still owns it. Also keeps a floor of
-         ;; (max 5, time-limit/6) so short tests still drain meaningfully.
+         ;; Drain must outlast the visibility-timeout window plus a
+         ;; safety buffer. Otherwise a message that becomes invisible
+         ;; right at drain start reappears at exactly drain-end (or
+         ;; later) and gen/time-limit can fire before the next :recv
+         ;; surfaces it — the checker would then report a :lost that
+         ;; the server still owns. visibility-timeout + 10s closes
+         ;; that race. The +10s also dominates the (max 5,
+         ;; time-limit/6) short-test floor at any reasonable
+         ;; time-limit, so the floor is no longer needed.
          drain-time (or (:drain-time opts)
-                        (max visibility-timeout-seconds
-                             (max 5 (quot time-limit 6))))
+                        (+ visibility-timeout-seconds 10))
          faults     (if local?
                       []
                       (cli/normalize-faults (or (:faults opts) [:partition :kill])))

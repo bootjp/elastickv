@@ -21,6 +21,10 @@
   (s3-workload/elastickv-s3-test {}))
 
 (defn elastickv-sqs-htfifo-test
+  "HT-FIFO Jepsen test (PR 7b). Run via the workload's own -main:
+   `lein run -m elastickv.sqs-htfifo-workload [opts]`. Same pattern
+   as elastickv-dynamodb-test / elastickv-s3-test — each workload
+   exposes its own -main so this -main only dispatches Redis."
   ([] (elastickv-sqs-htfifo-test {}))
   ([opts] (sqs-htfifo-workload/elastickv-sqs-htfifo-test opts)))
 
