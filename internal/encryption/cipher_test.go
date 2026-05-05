@@ -226,6 +226,46 @@ func TestNewCipher_RejectsNil(t *testing.T) {
 	}
 }
 
+// TestCipher_ZeroValueRejected covers the case where a caller bypasses
+// NewCipher and instantiates encryption.Cipher{} directly (or holds a
+// nil *Cipher). Encrypt/Decrypt must return ErrNilKeystore rather than
+// panic on the unset internal keystore pointer.
+func TestCipher_ZeroValueRejected(t *testing.T) {
+	t.Parallel()
+	nonce := make([]byte, encryption.NonceSize)
+	zero := encryption.Cipher{}
+	cases := []struct {
+		name string
+		fn   func() error
+	}{
+		{"zero-value Encrypt", func() error {
+			_, err := zero.Encrypt(nil, nil, 1, nonce)
+			return err
+		}},
+		{"zero-value Decrypt", func() error {
+			_, err := zero.Decrypt(nil, nil, 1, nonce)
+			return err
+		}},
+		{"nil receiver Encrypt", func() error {
+			var c *encryption.Cipher
+			_, err := c.Encrypt(nil, nil, 1, nonce)
+			return err
+		}},
+		{"nil receiver Decrypt", func() error {
+			var c *encryption.Cipher
+			_, err := c.Decrypt(nil, nil, 1, nonce)
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.fn(); !errors.Is(err, encryption.ErrNilKeystore) {
+				t.Fatalf("expected ErrNilKeystore, got err=%v", err)
+			}
+		})
+	}
+}
+
 func TestCipher_DistinctNoncesProduceDistinctCiphertexts(t *testing.T) {
 	ks, keyID := newKeystoreWithKey(t)
 	c := mustCipher(t, ks)

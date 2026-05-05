@@ -16,6 +16,10 @@ import (
 // AES key expansion and GCM initialization happen once per DEK at
 // Keystore.Set time; the hot path only needs an atomic.Pointer load
 // and a Seal/Open call.
+//
+// The zero value is NOT safe to use: Encrypt/Decrypt return
+// ErrNilKeystore for a zero-value or nil Cipher rather than nil-deref
+// panicking. Always construct via NewCipher.
 type Cipher struct {
 	keystore *Keystore
 }
@@ -94,7 +98,15 @@ func (c *Cipher) Decrypt(ciphertextAndTag, aad []byte, keyID uint32, nonce []byt
 // pre-initialized AEAD from the keystore. The hot path here is a single
 // atomic.Pointer load + a map lookup; AES key expansion happened once
 // at Keystore.Set time.
+//
+// A nil receiver or zero-value Cipher (i.e. c.keystore == nil) is
+// rejected with ErrNilKeystore so a caller that bypasses NewCipher and
+// uses var c encryption.Cipher gets a typed error instead of a
+// nil-deref panic on the first Encrypt/Decrypt.
 func (c *Cipher) aeadFor(keyID uint32, nonce []byte) (cipher.AEAD, error) {
+	if c == nil || c.keystore == nil {
+		return nil, errors.WithStack(ErrNilKeystore)
+	}
 	if keyID == ReservedKeyID {
 		return nil, errors.WithStack(ErrReservedKeyID)
 	}
