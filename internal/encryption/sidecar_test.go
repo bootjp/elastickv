@@ -99,13 +99,21 @@ func TestWriteSidecar_OverwriteExisting(t *testing.T) {
 }
 
 func TestWriteSidecar_TmpFileMode(t *testing.T) {
-	// Skip on Windows-style file systems where mode bits don't apply.
-	// The current test target is unix; we just verify the tmp path is
-	// 0o600 immediately after a write that we deliberately make fail
-	// at rename so the tmp file is left behind for inspection. Since
-	// we cannot easily make rename fail in a portable way here, we
-	// instead verify the final file's mode (which inherits from the
-	// tmp file).
+	// Windows does not preserve unix permission bits the way the
+	// mode&0o077 assertion expects (Go reports synthetic perm bits
+	// that commonly include group/other reads even on a freshly
+	// written file). The doc comment claimed a Windows skip but the
+	// guard was missing — codex P2 on PR #722 round-3 surfaced the
+	// gap. Skip the assertion path here; the equivalent inheritance
+	// is already covered by TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode.
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits are not preserved on Windows filesystems")
+	}
+	// We just verify the final file's mode (which inherits from the
+	// tmp file). The tmp's mode is set explicitly by writeTmpAndFsync
+	// to sidecarFileMode (0o600); we cannot easily make rename fail
+	// in a portable way here, so the tmp's mode is observed indirectly
+	// through the renamed-into-place keys.json.
 	path := sidecarPath(t)
 	if err := encryption.WriteSidecar(path, fixtureSidecar()); err != nil {
 		t.Fatalf("WriteSidecar: %v", err)
