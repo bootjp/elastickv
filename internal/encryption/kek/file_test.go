@@ -307,3 +307,36 @@ func TestFileWrapper_RejectsDirectory(t *testing.T) {
 		t.Fatalf("expected regular-file error, got: %v", err)
 	}
 }
+
+// TestFileWrapper_NilOrZeroValueRejected covers the PR #719 codex P2
+// finding: a wiring/configuration mistake in a bootstrap or rotation
+// path could hand callers a nil *FileWrapper or a zero-value
+// FileWrapper{}, and Wrap/Unwrap dereference w.aead unconditionally.
+// They now return ErrNilFileWrapper symmetrically with the
+// encryption.Cipher / encryption.Keystore zero-value contract.
+func TestFileWrapper_NilOrZeroValueRejected(t *testing.T) {
+	t.Parallel()
+	dek := make([]byte, 32)
+	wrapped := make([]byte, 60)
+	cases := []struct {
+		name string
+		w    *kek.FileWrapper
+	}{
+		{"nil receiver", (*kek.FileWrapper)(nil)},
+		{"zero-value", &kek.FileWrapper{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/Wrap", func(t *testing.T) {
+			_, err := tc.w.Wrap(dek)
+			if !errors.Is(err, kek.ErrNilFileWrapper) {
+				t.Fatalf("expected ErrNilFileWrapper, got %v", err)
+			}
+		})
+		t.Run(tc.name+"/Unwrap", func(t *testing.T) {
+			_, err := tc.w.Unwrap(wrapped)
+			if !errors.Is(err, kek.ErrNilFileWrapper) {
+				t.Fatalf("expected ErrNilFileWrapper, got %v", err)
+			}
+		})
+	}
+}

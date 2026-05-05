@@ -19,6 +19,15 @@ import (
 // (0o400 / 0o600) are accepted; anything with bits in 0o077 is not.
 var ErrInsecureKEKFile = errors.New("kek: file is group/world-accessible; require owner-only mode")
 
+// ErrNilFileWrapper is returned by Wrap/Unwrap when called on a nil
+// receiver or a zero-value FileWrapper (i.e. one whose internal AEAD
+// was never initialised by NewFileWrapper). Surfaced as a typed error
+// rather than a nil-deref panic so a wiring mistake during bootstrap
+// or rotation surfaces as a recoverable failure instead of a process
+// crash. Mirrors the encryption.Cipher / encryption.Keystore
+// zero-value contract.
+var ErrNilFileWrapper = errors.New("kek: FileWrapper is nil or uninitialised; construct with NewFileWrapper")
+
 const (
 	// fileKEKSize is the on-disk KEK length: 32 bytes for AES-256.
 	fileKEKSize = 32
@@ -39,6 +48,10 @@ const (
 // the KEK on a sealed tmpfs volume. Production deployments should
 // prefer a KMS-backed Wrapper (Stage 9: aws_kms.go, gcp_kms.go,
 // vault.go); see §5.1 for the recommended provider ordering.
+//
+// The zero value is NOT safe to use: Wrap/Unwrap return
+// ErrNilFileWrapper for a nil pointer or a FileWrapper whose internal
+// AEAD was never initialised. Always construct via NewFileWrapper.
 type FileWrapper struct {
 	aead cipher.AEAD
 	path string
@@ -130,7 +143,15 @@ func checkSecureKEKModeFD(f *os.File, path string) error {
 //	[nonce 12 bytes] [ciphertext 32 bytes] [tag 16 bytes]
 //
 // Total wrapped size: 60 bytes for a 32-byte DEK.
+//
+// Returns ErrNilFileWrapper if w is nil or the embedded AEAD was
+// never initialised by NewFileWrapper. A wiring/configuration
+// mistake during bootstrap or rotation surfaces as a typed error
+// rather than a nil-deref panic.
 func (w *FileWrapper) Wrap(dek []byte) ([]byte, error) {
+	if w == nil || w.aead == nil {
+		return nil, errors.WithStack(ErrNilFileWrapper)
+	}
 	if len(dek) != fileKEKSize {
 		return nil, errors.Errorf("kek: dek is %d bytes, want %d", len(dek), fileKEKSize)
 	}
@@ -157,7 +178,13 @@ func (w *FileWrapper) Wrap(dek []byte) ([]byte, error) {
 // The post-Open length check that earlier drafts had was unreachable —
 // the strict-length input check above guarantees Open returns exactly
 // fileKEKSize bytes on success — and has been removed.
+//
+// Returns ErrNilFileWrapper for a nil receiver or zero-value
+// FileWrapper, symmetric with Wrap.
 func (w *FileWrapper) Unwrap(wrapped []byte) ([]byte, error) {
+	if w == nil || w.aead == nil {
+		return nil, errors.WithStack(ErrNilFileWrapper)
+	}
 	if len(wrapped) != fileNonceSize+fileKEKSize+fileTagSize {
 		return nil, errors.Errorf("kek: wrapped DEK is %d bytes, want %d",
 			len(wrapped), fileNonceSize+fileKEKSize+fileTagSize)
