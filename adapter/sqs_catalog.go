@@ -118,7 +118,7 @@ type sqsQueueMeta struct {
 	// along with the rest of the queue.
 	Throttle *sqsQueueThrottle `json:"throttle,omitempty"`
 	// PartitionCount is the number of FIFO partitions for this queue
-	// (Phase 3.D HT-FIFO, see docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md).
+	// (Phase 3.D HT-FIFO, see docs/design/2026_04_26_partial_sqs_split_queue_fifo.md).
 	// Zero or 1 means the legacy single-partition layout — no schema
 	// change. Greater than 1 enables HT-FIFO. Set at CreateQueue time
 	// and immutable thereafter (SetQueueAttributes rejects any change).
@@ -478,7 +478,7 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 		return nil
 	},
 	// PartitionCount enables HT-FIFO when > 1 (Phase 3.D, see
-	// docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md). Set
+	// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md). Set
 	// at CreateQueue time; SetQueueAttributes attempts to change it
 	// reject via the immutability check in trySetQueueAttributesOnce.
 	// PartitionCount > 1 is gated by validateHTFIFOCapability (the

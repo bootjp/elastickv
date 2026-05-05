@@ -23,7 +23,7 @@ type sqsLeadershipController interface {
 // observer that refuses leadership of any Raft group hosting a
 // partitioned FIFO queue when this binary does NOT advertise the
 // htfifo capability. Implements §8 of
-// docs/design/2026_04_26_proposed_sqs_split_queue_fifo.md.
+// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md.
 //
 // # What it protects against
 //

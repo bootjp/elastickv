@@ -1,6 +1,6 @@
 # Split-Queue FIFO for the SQS Adapter
 
-**Status:** Proposed
+**Status:** Partial
 **Author:** bootjp
 **Date:** 2026-04-26
 
@@ -387,16 +387,18 @@ This is out of scope here.
 
 ## 11. Rollout Plan (Multi-PR)
 
-| PR | Content | Reviewable in isolation? |
-|---|---|---|
-| 1 | This proposal doc lands. Operators have time to flag concerns. | Yes |
-| 2 | Schema: `sqsQueueMeta.PartitionCount`, `DeduplicationScope`, `FifoThroughputLimit`. Routing function `partitionFor`. CreateQueue / SetQueueAttributes validation including the §3.2 cross-attribute rules. **Temporary feature gate** (see below): `CreateQueue` rejects `PartitionCount > 1` with `InvalidAttributeValue` ("PartitionCount > 1 requires HT-FIFO data plane — not yet enabled") so the schema field exists in the meta type but cannot land in production data. | Yes (catalog only) |
-| 3 | Keyspace: thread `partitionIndex` through every `sqsMsg*Key` constructor, defaulting to 0 so existing queues stay byte-identical. Gate from PR 2 still in place — `PartitionCount > 1` remains rejected. | Yes (mechanical) |
-| 4 | Routing layer: `kv/shard_router.go` accepts the `(queue, partition)` key. New `--sqsFifoPartitionMap` flag (separate from the existing `--raftSqsMap` endpoint-mapping flag). Mixed-version gate (§8.5 capability advertisement via `/sqs_health` + catalog polling for `CreateQueue` gating, **and** the §8 leadership-refusal hook in `kv/lease_state.go` that calls `TransferLeadership` when a non-`htfifo` binary discovers a partitioned queue in its shard on startup or leadership acquisition — both components are required before the binary is marked `htfifo`-eligible). PR 2's temporary `PartitionCount > 1` rejection still in place. | Yes (operator-config) |
-| 5 | Send / Receive partition fanout. Receipt-handle v2 codec. **Removes the PR 2 `PartitionCount > 1` rejection** in the same commit that wires the data-plane fanout — the gate and its lift land atomically so a half-deployed cluster can never accept a partitioned queue without the data plane to serve it. | Yes (data-plane) |
-| 6 | PurgeQueue / DeleteQueue partition iteration. Tombstone schema update. Reaper update. | Yes (control-plane) |
-| 7 | Jepsen HT-FIFO workload. Metrics. | Yes (testing) |
-| 8 | Partial-doc lifecycle bump: 3.D moves from TODO to Landed. Section 13 from §16.6 of the partial doc gets the as-built record. | Yes (docs) |
+**Status as of 2026-05-04**: PRs 1–7 are merged on `main`. The doc is being moved from `proposed` to `partial` in PR 8 (this rename) because every milestone in the rollout plan that produces shippable code has landed. The "partial" classification rather than "implemented" leaves room for future work tracked in §10 / §12 (e.g. operator-configurable hash, online resharding, cross-partition transactional admin) — none of which are in this proposal's scope but each of which would be an extension to the same surface.
+
+| PR | Content | Reviewable in isolation? | Status |
+|---|---|---|---|
+| 1 | This proposal doc lands. Operators have time to flag concerns. | Yes | ✅ Merged (#664) |
+| 2 | Schema: `sqsQueueMeta.PartitionCount`, `DeduplicationScope`, `FifoThroughputLimit`. Routing function `partitionFor`. CreateQueue / SetQueueAttributes validation including the §3.2 cross-attribute rules. **Temporary feature gate** (see below): `CreateQueue` rejects `PartitionCount > 1` with `InvalidAttributeValue` ("PartitionCount > 1 requires HT-FIFO data plane — not yet enabled") so the schema field exists in the meta type but cannot land in production data. | Yes (catalog only) | ✅ Merged (#681) |
+| 3 | Keyspace: thread `partitionIndex` through every `sqsMsg*Key` constructor, defaulting to 0 so existing queues stay byte-identical. Gate from PR 2 still in place — `PartitionCount > 1` remains rejected. | Yes (mechanical) | ✅ Merged (#703) |
+| 4 | Routing layer: `kv/shard_router.go` accepts the `(queue, partition)` key. New `--sqsFifoPartitionMap` flag (separate from the existing `--raftSqsMap` endpoint-mapping flag). Mixed-version gate (§8.5 capability advertisement via `/sqs_health` + catalog polling for `CreateQueue` gating, **and** the §8 leadership-refusal hook in `kv/lease_state.go` that calls `TransferLeadership` when a non-`htfifo` binary discovers a partitioned queue in its shard on startup or leadership acquisition — both components are required before the binary is marked `htfifo`-eligible). PR 2's temporary `PartitionCount > 1` rejection still in place. | Yes (operator-config) | ✅ Merged across 4-A / 4-B-1 / 4-B-2 / 4-B-3a / 4-B-3b (#704, #708, #715, #721, #723) |
+| 5 | Send / Receive partition fanout. Receipt-handle v2 codec. **Removes the PR 2 `PartitionCount > 1` rejection** in the same commit that wires the data-plane fanout — the gate and its lift land atomically so a half-deployed cluster can never accept a partitioned queue without the data plane to serve it. | Yes (data-plane) | ✅ Merged across 5a / 5b-1 / 5b-2 / 5b-3 (#724, #731, #732, #734) |
+| 6 | PurgeQueue / DeleteQueue partition iteration. Tombstone schema update. Reaper update. | Yes (control-plane) | ✅ Merged across 6a / 6b (#735, #736) |
+| 7 | Jepsen HT-FIFO workload. Metrics. | Yes (testing) | ✅ Merged across 7a / 7b (#737, #738) |
+| 8 | Partial-doc lifecycle bump: rename `proposed` → `partial`, annotate §11 with shipped PR anchors, update in-tree source references that point at the proposed-stage filename. | Yes (docs) | 🟡 In flight (this PR) |
 
 **Why the temporary gate** (Codex P1 on PR #664 tenth-round Codex review): without it, a cluster running PR 2–4 would accept a `CreateQueue` with `PartitionCount = 4` (the schema is in place, the validator only checks per-attribute validity) and then dispatch every subsequent `SendMessage` against the **legacy single-partition keyspace** with `partitionIndex = 0` — silently writing all messages under `!sqs|msg|data|<queue>|…` regardless of `PartitionCount`. When PR 5 lands and the new fanout reader looks for messages under the partitioned prefix `!sqs|msg|data|p|<queue>|<partition>|…`, every message written during the PR 2–4 window is invisible to it and to the partition-aware reaper scan. The gate-and-lift pattern (PR 2 rejects, PR 5 lifts in the same commit as the data-plane fanout) makes it impossible to land data under the wrong layout: any cluster that accepts `PartitionCount > 1` is, by construction, also running the partition-aware send path.
 
