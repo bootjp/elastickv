@@ -63,4 +63,12 @@ var (
 	// bootstrap path; an Active id without a corresponding wrapped
 	// DEK is malformed input.
 	ErrSidecarActiveKeyMissing = errors.New("encryption: sidecar active key_id has no entry in keys map")
+
+	// ErrSidecarActivePurposeMismatch indicates the Sidecar has a
+	// non-zero Active.{Storage,Raft} key_id pointing to a Keys entry
+	// whose Purpose does not match the slot. e.g., active.storage=7
+	// but Keys["7"].purpose == "raft". Crossed pointers would route
+	// the wrong DEK into a purpose-specific encryption path after
+	// restart or rotation, so the reader fails closed.
+	ErrSidecarActivePurposeMismatch = errors.New("encryption: sidecar active key_id references a key with mismatched purpose")
 )

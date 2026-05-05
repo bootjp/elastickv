@@ -442,6 +442,64 @@ func TestReadSidecar_RejectsActiveKeyMissing(t *testing.T) {
 	}
 }
 
+// TestSidecar_RejectsActivePurposeMismatch covers the codex P2 finding
+// on PR #722: a sidecar where Active.Storage points to a key entry with
+// purpose="raft" (or vice versa) is malformed input that would route
+// the wrong DEK into a purpose-specific path after restart. Both
+// WriteSidecar (in-memory validation) and ReadSidecar (post-unmarshal
+// validation) must reject the mismatch with ErrSidecarActivePurposeMismatch.
+func TestSidecar_RejectsActivePurposeMismatch(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*encryption.Sidecar)
+	}{
+		{
+			// active.storage points to the raft-purpose key
+			name: "storage points at raft entry",
+			mut: func(sc *encryption.Sidecar) {
+				sc.Active.Storage = 2596069104
+			},
+		},
+		{
+			// active.raft points to the storage-purpose key
+			name: "raft points at storage entry",
+			mut: func(sc *encryption.Sidecar) {
+				sc.Active.Raft = 305419896
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/Write", func(t *testing.T) {
+			sc := fixtureSidecar()
+			tc.mut(sc)
+			err := encryption.WriteSidecar(sidecarPath(t), sc)
+			if !errors.Is(err, encryption.ErrSidecarActivePurposeMismatch) {
+				t.Fatalf("expected ErrSidecarActivePurposeMismatch, got %v", err)
+			}
+		})
+		t.Run(tc.name+"/Read", func(t *testing.T) {
+			// Hand-roll the JSON so we bypass WriteSidecar's pre-write
+			// validation and verify ReadSidecar catches the same
+			// invariant on a sidecar that landed via some other path
+			// (older binary, manual edit, partial recovery).
+			sc := fixtureSidecar()
+			tc.mut(sc)
+			raw, err := json.MarshalIndent(sc, "", "  ")
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			path := sidecarPath(t)
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			_, err = encryption.ReadSidecar(path)
+			if !errors.Is(err, encryption.ErrSidecarActivePurposeMismatch) {
+				t.Fatalf("expected ErrSidecarActivePurposeMismatch, got %v", err)
+			}
+		})
+	}
+}
+
 // TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode is the security
 // regression test for the codex P2 finding on PR #722: a pre-existing
 // keys.json.tmp file with a permissive mode (e.g. 0o666 from older

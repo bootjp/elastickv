@@ -140,13 +140,16 @@ func validateSidecar(sc *Sidecar) error {
 		}
 	}
 	// Active.Storage / Active.Raft, when non-zero, must reference an
-	// entry that actually exists in Keys. Rotation and bootstrap paths
-	// always write the wrapped DEK and the Active pointer together; an
-	// Active id without a corresponding entry is malformed input.
-	if err := requireActiveKey(sc, "storage", sc.Active.Storage); err != nil {
+	// entry that actually exists in Keys AND whose Purpose matches the
+	// slot. Rotation and bootstrap paths always write the wrapped DEK
+	// and the Active pointer together with consistent purpose; an
+	// Active id pointing at a missing or wrong-purpose entry is
+	// malformed input that would route the wrong DEK into a
+	// purpose-specific encryption path after restart.
+	if err := requireActiveKey(sc, SidecarPurposeStorage, sc.Active.Storage); err != nil {
 		return err
 	}
-	if err := requireActiveKey(sc, "raft", sc.Active.Raft); err != nil {
+	if err := requireActiveKey(sc, SidecarPurposeRaft, sc.Active.Raft); err != nil {
 		return err
 	}
 	return nil
@@ -157,9 +160,14 @@ func requireActiveKey(sc *Sidecar, purpose string, id uint32) error {
 		return nil // not bootstrapped for this purpose; nothing to check
 	}
 	idStr := strconv.FormatUint(uint64(id), 10)
-	if _, ok := sc.Keys[idStr]; !ok {
+	k, ok := sc.Keys[idStr]
+	if !ok {
 		return pkgerrors.Wrapf(ErrSidecarActiveKeyMissing,
 			"active.%s=%d not present in keys map", purpose, id)
+	}
+	if k.Purpose != purpose {
+		return pkgerrors.Wrapf(ErrSidecarActivePurposeMismatch,
+			"active.%s=%d but keys[%q].purpose=%q", purpose, id, idStr, k.Purpose)
 	}
 	return nil
 }
