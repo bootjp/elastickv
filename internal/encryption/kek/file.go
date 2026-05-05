@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"io"
 	"os"
 	"runtime"
 
@@ -54,11 +55,22 @@ type FileWrapper struct {
 // boundary — NewFileWrapper fails closed with ErrInsecureKEKFile
 // rather than logging a warning. Windows has a fundamentally
 // different permission model and is not gated.
+//
+// The mode check and the key-bytes read share a single os.File so a
+// path swap (or symlink retarget) between checks cannot race the
+// load. f.Stat resolves the inode behind the open fd, not the path,
+// so what is validated is exactly what is read.
 func NewFileWrapper(path string) (*FileWrapper, error) {
-	if err := checkSecureKEKMode(path); err != nil {
+	f, err := os.Open(path) //nolint:gosec // path comes from operator config; mode is checked via f.Stat below
+	if err != nil {
+		return nil, errors.Wrapf(err, "kek: open %q", path)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := checkSecureKEKModeFD(f, path); err != nil {
 		return nil, err
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // path comes from operator config; mode pre-checked above
+	raw, err := io.ReadAll(f)
 	if err != nil {
 		return nil, errors.Wrapf(err, "kek: read %q", path)
 	}
@@ -77,14 +89,16 @@ func NewFileWrapper(path string) (*FileWrapper, error) {
 	return &FileWrapper{aead: aead, path: path}, nil
 }
 
-// checkSecureKEKMode rejects a KEK file whose permission bits permit
-// group or other access. Skipped on Windows, where the unix mode
-// model does not apply.
-func checkSecureKEKMode(path string) error {
+// checkSecureKEKModeFD rejects a KEK file whose permission bits permit
+// group or other access. Operates on an already-open *os.File so the
+// stat and the subsequent read share the same inode (closes the
+// TOCTOU window an os.Stat-then-ReadFile pair would leave open).
+// Skipped on Windows, where the unix mode model does not apply.
+func checkSecureKEKModeFD(f *os.File, path string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	st, err := os.Stat(path)
+	st, err := f.Stat()
 	if err != nil {
 		return errors.Wrapf(err, "kek: stat %q", path)
 	}
