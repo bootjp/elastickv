@@ -516,7 +516,18 @@ func TestSidecar_RejectsActivePurposeMismatch(t *testing.T) {
 // carry its mode into the production keys.json via os.Rename. The
 // fix in writeTmpAndFsync removes any pre-existing tmp before
 // O_EXCL-creating it fresh at sidecarFileMode.
+//
+// Skipped on Windows: os.Chmod there only honours the owner-writable
+// bit and other unix permission bits are reported as synthetic
+// values, so both the seed step and the final mode&0o077 assertion
+// can produce results that don't reflect the property under test.
+// The unix path covers the security invariant; Windows lacks the
+// matching threat model (multi-user shared filesystems with unix
+// mode bits as the access boundary).
 func TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix mode bits are not preserved by os.Chmod on Windows; threat model does not apply")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, encryption.SidecarFilename)
 	tmpPath := path + ".tmp"
