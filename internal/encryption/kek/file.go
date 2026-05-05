@@ -5,9 +5,18 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"os"
+	"runtime"
 
 	"github.com/cockroachdb/errors"
 )
+
+// ErrInsecureKEKFile is returned by NewFileWrapper when the KEK file
+// permission bits permit group or other access. Loading such a file
+// would silently weaken the at-rest encryption boundary on a
+// multi-user host (any local user could read the master key bytes),
+// so the wrapper fails closed rather than warning. Owner-only modes
+// (0o400 / 0o600) are accepted; anything with bits in 0o077 is not.
+var ErrInsecureKEKFile = errors.New("kek: file is group/world-accessible; require owner-only mode")
 
 const (
 	// fileKEKSize is the on-disk KEK length: 32 bytes for AES-256.
@@ -37,8 +46,19 @@ type FileWrapper struct {
 // NewFileWrapper reads a KEK from path. The file must contain exactly
 // 32 bytes (an AES-256 key). Any other length returns an error rather
 // than silently padding or truncating.
+//
+// On unix, the file's permission bits MUST be owner-only (no group or
+// other access bits set, i.e. mode & 0o077 == 0). A misconfigured
+// 0o644 or 0o666 KEK file would let any local user read the master
+// key on a multi-user host, defeating the entire at-rest encryption
+// boundary — NewFileWrapper fails closed with ErrInsecureKEKFile
+// rather than logging a warning. Windows has a fundamentally
+// different permission model and is not gated.
 func NewFileWrapper(path string) (*FileWrapper, error) {
-	raw, err := os.ReadFile(path)
+	if err := checkSecureKEKMode(path); err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // path comes from operator config; mode pre-checked above
 	if err != nil {
 		return nil, errors.Wrapf(err, "kek: read %q", path)
 	}
@@ -55,6 +75,23 @@ func NewFileWrapper(path string) (*FileWrapper, error) {
 		return nil, errors.Wrap(err, "kek: cipher.NewGCM")
 	}
 	return &FileWrapper{aead: aead, path: path}, nil
+}
+
+// checkSecureKEKMode rejects a KEK file whose permission bits permit
+// group or other access. Skipped on Windows, where the unix mode
+// model does not apply.
+func checkSecureKEKMode(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return errors.Wrapf(err, "kek: stat %q", path)
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		return errors.Wrapf(ErrInsecureKEKFile, "%q has mode %#o", path, perm)
+	}
+	return nil
 }
 
 // Wrap returns AES-GCM(KEK, dek) prefixed by a freshly-drawn random

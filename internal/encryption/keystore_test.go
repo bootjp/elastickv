@@ -212,3 +212,99 @@ func TestKeystore_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestKeystore_ZeroValueRead covers the nil-safe contract for the
+// read-side methods (PR #719 CodeRabbit Major: contradiction with the
+// Cipher zero-value pattern). A zero-value Keystore and a nil receiver
+// must both behave as the empty keystore rather than nil-deref panic.
+func TestKeystore_ZeroValueRead(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		k    *encryption.Keystore
+	}{
+		{"zero-value", &encryption.Keystore{}},
+		{"nil receiver", (*encryption.Keystore)(nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, ok := tc.k.AEAD(1); got != nil || ok {
+				t.Fatalf("AEAD: got=%v ok=%v, want nil/false", got, ok)
+			}
+			if got, ok := tc.k.DEK(1); got != ([encryption.KeySize]byte{}) || ok {
+				t.Fatalf("DEK: ok=%v, want zero/false", ok)
+			}
+			if tc.k.Has(1) {
+				t.Fatal("Has: got true, want false")
+			}
+			if got := tc.k.IDs(); got != nil {
+				t.Fatalf("IDs: got %v, want nil", got)
+			}
+			if got := tc.k.Len(); got != 0 {
+				t.Fatalf("Len: got %d, want 0", got)
+			}
+			tc.k.Delete(1) // must not panic
+		})
+	}
+}
+
+// TestKeystore_NilReceiverSet exercises the only mutating operation
+// where the nil-safety contract is "fail with typed error" rather
+// than "no-op": Set on a nil receiver cannot install a key, so it
+// reports ErrNilKeystore.
+func TestKeystore_NilReceiverSet(t *testing.T) {
+	t.Parallel()
+	var k *encryption.Keystore
+	dek := make([]byte, encryption.KeySize)
+	err := k.Set(1, dek)
+	if !errors.Is(err, encryption.ErrNilKeystore) {
+		t.Fatalf("expected ErrNilKeystore, got %v", err)
+	}
+}
+
+// TestKeystore_SetConflict locks down the PR #719 CodeRabbit Major
+// finding on Set: re-Set under an existing keyID with the same DEK
+// bytes is idempotent (returns nil), but a Set with DIFFERENT bytes
+// returns ErrKeyConflict instead of silently replacing live key
+// material — replacement would render every envelope already
+// persisted under that id undecryptable.
+func TestKeystore_SetConflict(t *testing.T) {
+	t.Parallel()
+	t.Run("idempotent same DEK", func(t *testing.T) {
+		ks := encryption.NewKeystore()
+		dek := make([]byte, encryption.KeySize)
+		dek[0] = 0xAA
+		if err := ks.Set(7, dek); err != nil {
+			t.Fatalf("first Set: %v", err)
+		}
+		if err := ks.Set(7, dek); err != nil {
+			t.Fatalf("second Set with identical bytes returned %v, want nil (idempotent)", err)
+		}
+		if ks.Len() != 1 {
+			t.Fatalf("Len after duplicate Set = %d, want 1", ks.Len())
+		}
+	})
+	t.Run("conflicting DEK rejected", func(t *testing.T) {
+		ks := encryption.NewKeystore()
+		dek1 := make([]byte, encryption.KeySize)
+		dek1[0] = 0xAA
+		if err := ks.Set(7, dek1); err != nil {
+			t.Fatalf("first Set: %v", err)
+		}
+		dek2 := make([]byte, encryption.KeySize)
+		dek2[0] = 0xBB // differs in first byte
+		err := ks.Set(7, dek2)
+		if !errors.Is(err, encryption.ErrKeyConflict) {
+			t.Fatalf("expected ErrKeyConflict, got %v", err)
+		}
+		// Original DEK must remain intact.
+		got, ok := ks.DEK(7)
+		if !ok {
+			t.Fatal("DEK(7) reported not found after conflict rejection")
+		}
+		if !bytes.Equal(got[:1], []byte{0xAA}) {
+			t.Fatalf("conflicting Set silently replaced bytes: got[:1]=%x want %x",
+				got[:1], []byte{0xAA})
+		}
+	})
+}

@@ -39,4 +39,12 @@ var (
 	// Surfaced at construction time so a wiring mistake is caught
 	// before the first Encrypt/Decrypt would otherwise nil-deref panic.
 	ErrNilKeystore = errors.New("encryption: keystore is nil")
+
+	// ErrKeyConflict indicates Keystore.Set was called with a keyID
+	// already loaded under DIFFERENT key material. Replacing live key
+	// bytes for an in-use key_id would render every envelope already
+	// persisted under that id undecryptable, so Set fails closed
+	// rather than silently overwriting. Set with the SAME bytes is
+	// idempotent (returns nil) and does not raise this error.
+	ErrKeyConflict = errors.New("encryption: key_id already loaded with different key material")
 )

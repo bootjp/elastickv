@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption/kek"
+	"github.com/cockroachdb/errors"
 )
 
 func writeKEK(t *testing.T, n int) string {
@@ -185,5 +187,81 @@ func TestFileWrapper_NewFileWrapper_MissingFile(t *testing.T) {
 	_, err := kek.NewFileWrapper(filepath.Join(dir, "does-not-exist.bin"))
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
+	}
+}
+
+// TestFileWrapper_RejectsInsecureMode covers the PR #719 CodeRabbit
+// Major finding: a 0o644 / 0o666 KEK file would still be loaded under
+// the previous implementation, weakening the at-rest encryption
+// boundary on a multi-user host. NewFileWrapper now stat()s the file
+// and refuses anything with bits in 0o077.
+func TestFileWrapper_RejectsInsecureMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits not enforced on Windows")
+	}
+	cases := []struct {
+		name string
+		mode os.FileMode
+	}{
+		{"group-readable 0o640", 0o640},
+		{"world-readable 0o644", 0o644},
+		{"group/world-writable 0o666", 0o666},
+		{"group-execute 0o610", 0o610},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "kek.bin")
+			buf := make([]byte, 32)
+			if _, err := rand.Read(buf); err != nil {
+				t.Fatalf("rand.Read: %v", err)
+			}
+			// Write at the secure mode first (gosec G306 forbids
+			// >0o600 in WriteFile), then chmod to the insecure target.
+			if err := os.WriteFile(path, buf, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatalf("Chmod %o: %v", tc.mode, err)
+			}
+			st, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("Stat: %v", err)
+			}
+			if st.Mode().Perm() != tc.mode {
+				t.Skipf("environment refused mode %o (got %o)", tc.mode, st.Mode().Perm())
+			}
+			_, err = kek.NewFileWrapper(path)
+			if !errors.Is(err, kek.ErrInsecureKEKFile) {
+				t.Fatalf("expected ErrInsecureKEKFile for mode %o, got %v", tc.mode, err)
+			}
+		})
+	}
+}
+
+func TestFileWrapper_AcceptsOwnerOnlyMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits not enforced on Windows")
+	}
+	for _, mode := range []os.FileMode{0o400, 0o600} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "kek.bin")
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			t.Fatalf("rand.Read: %v", err)
+		}
+		if err := os.WriteFile(path, buf, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("Chmod %o: %v", mode, err)
+		}
+		w, err := kek.NewFileWrapper(path)
+		if err != nil {
+			t.Fatalf("NewFileWrapper(mode=%o): %v", mode, err)
+		}
+		if w == nil {
+			t.Fatalf("nil wrapper for mode %o", mode)
+		}
 	}
 }

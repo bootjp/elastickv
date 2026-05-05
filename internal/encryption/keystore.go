@@ -31,10 +31,12 @@ type keyEntry struct {
 // Per §10 self-review lens 2: this avoids contending a mutex on the hot
 // path while keeping rotation atomic with respect to readers.
 //
-// The zero value is NOT safe to use — `var ks Keystore` panics on the
-// first method call because the internal atomic.Pointer is nil. Always
-// construct with NewKeystore. Code that embeds a Keystore in another
-// struct must invoke NewKeystore explicitly before any read or write.
+// Zero-value safety: a `var ks Keystore` (or a nil *Keystore) is
+// degraded but does not panic — read methods (AEAD, DEK, Has, IDs,
+// Len) treat it as the empty keystore, Delete is a no-op, and Set
+// returns ErrNilKeystore for a nil receiver. Always prefer NewKeystore
+// so an unwrap path that needs to install keys reports the wiring
+// mistake immediately.
 type Keystore struct {
 	snap atomic.Pointer[map[uint32]*keyEntry]
 }
@@ -47,16 +49,33 @@ func NewKeystore() *Keystore {
 	return ks
 }
 
+// loadMap returns the current snapshot map, or nil for a nil receiver
+// or zero-value Keystore (where snap.Load() returns nil because nothing
+// was Stored). Read methods treat a nil map as the empty keystore so a
+// caller that bypasses NewKeystore observes consistent (zero/false)
+// results instead of nil-deref panicking. Mirrors the defensive pattern
+// Cipher uses for ErrNilKeystore.
+func (k *Keystore) loadMap() map[uint32]*keyEntry {
+	if k == nil {
+		return nil
+	}
+	p := k.snap.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 // AEAD returns the pre-initialized cipher.AEAD for keyID, ready for
 // Seal/Open. The returned value is safe for concurrent use by multiple
 // goroutines (Go stdlib AEAD implementations are stateless after
 // initialization).
 //
 // Used by Cipher.Encrypt / Cipher.Decrypt on the hot path. Returns
-// (nil, false) if keyID is not loaded.
+// (nil, false) if keyID is not loaded, the receiver is nil, or the
+// Keystore is zero-valued.
 func (k *Keystore) AEAD(keyID uint32) (cipher.AEAD, bool) {
-	m := *k.snap.Load()
-	e, ok := m[keyID]
+	e, ok := k.loadMap()[keyID]
 	if !ok {
 		return nil, false
 	}
@@ -71,8 +90,7 @@ func (k *Keystore) AEAD(keyID uint32) (cipher.AEAD, bool) {
 // rotation / rewrap path that needs the raw key material to wrap it
 // under a new KEK.
 func (k *Keystore) DEK(keyID uint32) ([KeySize]byte, bool) {
-	m := *k.snap.Load()
-	e, ok := m[keyID]
+	e, ok := k.loadMap()[keyID]
 	if !ok {
 		return [KeySize]byte{}, false
 	}
@@ -81,8 +99,7 @@ func (k *Keystore) DEK(keyID uint32) ([KeySize]byte, bool) {
 
 // Has reports whether keyID is loaded.
 func (k *Keystore) Has(keyID uint32) bool {
-	m := *k.snap.Load()
-	_, ok := m[keyID]
+	_, ok := k.loadMap()[keyID]
 	return ok
 }
 
@@ -90,29 +107,34 @@ func (k *Keystore) Has(keyID uint32) bool {
 // dek must be exactly KeySize bytes; the reserved key_id 0 is rejected
 // with ErrReservedKeyID. The DEK bytes are copied into the keystore so
 // the caller is free to zero or reuse the source slice.
+//
+// Set is set-once with idempotent-same semantics: re-Set under an
+// existing keyID with byte-identical DEK is a no-op (returns nil), but
+// Set with DIFFERENT bytes for an already-loaded keyID returns
+// ErrKeyConflict. Replacing live key bytes for a keyID would render
+// every envelope already persisted under that id undecryptable.
+//
+// A nil receiver returns ErrNilKeystore; zero-value Keystores are
+// rejected at the same boundary as Cipher.
 func (k *Keystore) Set(keyID uint32, dek []byte) error {
-	if keyID == ReservedKeyID {
-		return errors.WithStack(ErrReservedKeyID)
+	if k == nil {
+		return errors.WithStack(ErrNilKeystore)
 	}
-	if len(dek) != KeySize {
-		return errors.Wrapf(ErrBadKeySize, "got %d bytes, want %d", len(dek), KeySize)
-	}
-	entry := &keyEntry{}
-	copy(entry.dek[:], dek)
-	block, err := aes.NewCipher(entry.dek[:])
+	entry, err := buildKeyEntry(keyID, dek)
 	if err != nil {
-		return errors.Wrap(err, "encryption: aes.NewCipher")
+		return err
 	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return errors.Wrap(err, "encryption: cipher.NewGCM")
-	}
-	entry.aead = aead
-
 	for {
 		cur := k.snap.Load()
-		m := make(map[uint32]*keyEntry, len(*cur)+1)
-		for id, v := range *cur {
+		var src map[uint32]*keyEntry
+		if cur != nil {
+			src = *cur
+		}
+		if done, err := checkExistingEntry(src, keyID, entry); done || err != nil {
+			return err
+		}
+		m := make(map[uint32]*keyEntry, len(src)+1)
+		for id, v := range src {
 			m[id] = v
 		}
 		m[keyID] = entry
@@ -122,10 +144,56 @@ func (k *Keystore) Set(keyID uint32, dek []byte) error {
 	}
 }
 
-// Delete removes the DEK for keyID. No-op if absent.
+// buildKeyEntry validates keyID/dek and pre-initializes the AEAD.
+// Hoisted out of Set so the CAS retry loop stays cyclomatically simple.
+func buildKeyEntry(keyID uint32, dek []byte) (*keyEntry, error) {
+	if keyID == ReservedKeyID {
+		return nil, errors.WithStack(ErrReservedKeyID)
+	}
+	if len(dek) != KeySize {
+		return nil, errors.Wrapf(ErrBadKeySize, "got %d bytes, want %d", len(dek), KeySize)
+	}
+	entry := &keyEntry{}
+	copy(entry.dek[:], dek)
+	block, err := aes.NewCipher(entry.dek[:])
+	if err != nil {
+		return nil, errors.Wrap(err, "encryption: aes.NewCipher")
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, errors.Wrap(err, "encryption: cipher.NewGCM")
+	}
+	entry.aead = aead
+	return entry, nil
+}
+
+// checkExistingEntry implements Set's set-once-with-idempotent-same
+// rule. Returns (done=true, nil) if keyID is already present with the
+// same DEK bytes (Set is a no-op), (true, ErrKeyConflict) if it is
+// present with different bytes, or (false, nil) to indicate the
+// caller should proceed with the CAS insert.
+func checkExistingEntry(src map[uint32]*keyEntry, keyID uint32, entry *keyEntry) (bool, error) {
+	existing, ok := src[keyID]
+	if !ok {
+		return false, nil
+	}
+	if existing.dek == entry.dek {
+		return true, nil
+	}
+	return true, errors.Wrapf(ErrKeyConflict, "key_id=%d", keyID)
+}
+
+// Delete removes the DEK for keyID. No-op if absent, the receiver is
+// nil, or the Keystore is zero-valued (no map ever Stored).
 func (k *Keystore) Delete(keyID uint32) {
+	if k == nil {
+		return
+	}
 	for {
 		cur := k.snap.Load()
+		if cur == nil {
+			return
+		}
 		if _, ok := (*cur)[keyID]; !ok {
 			return
 		}
@@ -142,8 +210,12 @@ func (k *Keystore) Delete(keyID uint32) {
 }
 
 // IDs returns a sorted snapshot of all currently-loaded key_ids.
+// Returns nil for a nil receiver or zero-value Keystore.
 func (k *Keystore) IDs() []uint32 {
-	m := *k.snap.Load()
+	m := k.loadMap()
+	if len(m) == 0 {
+		return nil
+	}
 	ids := make([]uint32, 0, len(m))
 	for id := range m {
 		ids = append(ids, id)
@@ -152,7 +224,8 @@ func (k *Keystore) IDs() []uint32 {
 	return ids
 }
 
-// Len reports the number of currently-loaded keys.
+// Len reports the number of currently-loaded keys. Returns 0 for a
+// nil receiver or zero-value Keystore.
 func (k *Keystore) Len() int {
-	return len(*k.snap.Load())
+	return len(k.loadMap())
 }
