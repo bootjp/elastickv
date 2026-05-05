@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -557,7 +558,20 @@ func TestWriteSidecar_StaleTmpDoesNotLeakPermissiveMode(t *testing.T) {
 // pre-tmp-creation failure path. The post-tmp-creation failure path
 // is harder to inject portably; this test covers the "no leftover on
 // failure" property at the next-easiest reproducible boundary.
+//
+// Skipped when running as root (CI containers, sysadmin rebuild
+// environments) because UID 0 — and any process with CAP_DAC_OVERRIDE
+// — bypasses the dir's permission bits, and OpenFile would still
+// succeed; the assertion below would then fire spuriously and the
+// suite would be nondeterministic across CI setups (codex P2 on PR
+// #722 round-3).
 func TestWriteSidecar_StaleTmpFileIsCleanedOnWriteFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("dir permission bits don't gate file creation on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("UID 0 bypasses dir permission bits; chmod-based failure injection is meaningless")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, encryption.SidecarFilename)
 	// Make the dir read-only so OpenFile cannot create the tmp.
