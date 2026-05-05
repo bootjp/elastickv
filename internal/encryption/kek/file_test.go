@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption/kek"
@@ -263,5 +264,46 @@ func TestFileWrapper_AcceptsOwnerOnlyMode(t *testing.T) {
 		if w == nil {
 			t.Fatalf("nil wrapper for mode %o", mode)
 		}
+	}
+}
+
+// TestFileWrapper_RejectsOversizedFile is the regression for the PR
+// #719 codex P2 finding: io.ReadAll without a size bound would read
+// gigabytes of garbage before checking length. NewFileWrapper now
+// caps the read at fileKEKSize+1 so a too-long file fails fast on
+// the length check without exhausting memory.
+func TestFileWrapper_RejectsOversizedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kek.bin")
+	// 64 KiB — large enough that an unbounded ReadAll would observably
+	// pull more than fileKEKSize+1; small enough to not be a real
+	// resource problem if the bound regresses.
+	buf := make([]byte, 64<<10)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := kek.NewFileWrapper(path)
+	if err == nil {
+		t.Fatal("NewFileWrapper accepted an oversized file")
+	}
+	if !strings.Contains(err.Error(), "want exactly 32") {
+		t.Fatalf("expected length error, got: %v", err)
+	}
+}
+
+// TestFileWrapper_RejectsDirectory is the lower-cost cousin to the
+// FIFO test: a directory is also a non-regular file. Works on every
+// platform (no syscall.Mkfifo dependency).
+func TestFileWrapper_RejectsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	_, err := kek.NewFileWrapper(dir)
+	if err == nil {
+		t.Fatal("NewFileWrapper accepted a directory path")
+	}
+	if !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("expected regular-file error, got: %v", err)
 	}
 }

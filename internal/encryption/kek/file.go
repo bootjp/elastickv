@@ -44,9 +44,9 @@ type FileWrapper struct {
 	path string
 }
 
-// NewFileWrapper reads a KEK from path. The file must contain exactly
-// 32 bytes (an AES-256 key). Any other length returns an error rather
-// than silently padding or truncating.
+// NewFileWrapper reads a KEK from path. The file must be a regular
+// file containing exactly 32 bytes (an AES-256 key). Any other length
+// returns an error rather than silently padding or truncating.
 //
 // On unix, the file's permission bits MUST be owner-only (no group or
 // other access bits set, i.e. mode & 0o077 == 0). A misconfigured
@@ -60,8 +60,13 @@ type FileWrapper struct {
 // path swap (or symlink retarget) between checks cannot race the
 // load. f.Stat resolves the inode behind the open fd, not the path,
 // so what is validated is exactly what is read.
+//
+// The read is bounded to fileKEKSize+1 bytes and is preceded by a
+// "regular file" stat check, so a misconfigured path pointing at a
+// FIFO, device, or huge file (a misaligned cluster bootstrap could
+// otherwise hang or OOM on /dev/zero) fails fast.
 func NewFileWrapper(path string) (*FileWrapper, error) {
-	f, err := os.Open(path) //nolint:gosec // path comes from operator config; mode is checked via f.Stat below
+	f, err := os.OpenFile(path, os.O_RDONLY|kekOpenExtraFlags, 0) //nolint:gosec // path comes from operator config; mode/type checked via f.Stat below
 	if err != nil {
 		return nil, errors.Wrapf(err, "kek: open %q", path)
 	}
@@ -70,7 +75,13 @@ func NewFileWrapper(path string) (*FileWrapper, error) {
 	if err := checkSecureKEKModeFD(f, path); err != nil {
 		return nil, err
 	}
-	raw, err := io.ReadAll(f)
+	// io.LimitReader caps the read at fileKEKSize+1: a well-formed KEK
+	// fits in fileKEKSize bytes, so a +1 budget is exactly enough to
+	// distinguish "right size" (read returns N == fileKEKSize, EOF)
+	// from "too long" (read returns N == fileKEKSize+1, no EOF). Any
+	// larger file or unbounded source (e.g. /dev/zero) is rejected at
+	// the same length-check site without first allocating a slab.
+	raw, err := io.ReadAll(io.LimitReader(f, fileKEKSize+1))
 	if err != nil {
 		return nil, errors.Wrapf(err, "kek: read %q", path)
 	}
@@ -90,17 +101,22 @@ func NewFileWrapper(path string) (*FileWrapper, error) {
 }
 
 // checkSecureKEKModeFD rejects a KEK file whose permission bits permit
-// group or other access. Operates on an already-open *os.File so the
-// stat and the subsequent read share the same inode (closes the
-// TOCTOU window an os.Stat-then-ReadFile pair would leave open).
-// Skipped on Windows, where the unix mode model does not apply.
+// group or other access, and rejects non-regular files (FIFO, device,
+// directory, etc.). Operates on an already-open *os.File so the stat
+// and the subsequent read share the same inode (closes the TOCTOU
+// window an os.Stat-then-ReadFile pair would leave open). The
+// non-regular reject is unix and Windows; the perm reject is unix
+// only.
 func checkSecureKEKModeFD(f *os.File, path string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
 	st, err := f.Stat()
 	if err != nil {
 		return errors.Wrapf(err, "kek: stat %q", path)
+	}
+	if !st.Mode().IsRegular() {
+		return errors.Errorf("kek: %q is not a regular file (mode=%v)", path, st.Mode())
+	}
+	if runtime.GOOS == "windows" {
+		return nil
 	}
 	if perm := st.Mode().Perm(); perm&0o077 != 0 {
 		return errors.Wrapf(ErrInsecureKEKFile, "%q has mode %#o", path, perm)
