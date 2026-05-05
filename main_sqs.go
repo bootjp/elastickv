@@ -11,11 +11,17 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// startSQSServer stands up the SQS adapter on sqsAddr and returns the
-// running *adapter.SQSServer so the admin listener can call SigV4-bypass
-// admin entrypoints against it (see adapter/sqs_admin.go). Returns
-// (nil, nil) when sqsAddr is empty — that is the "SQS disabled" branch
-// and the admin listener leaves /admin/api/v1/sqs/* off the wire.
+// startSQSServer constructs the SQS adapter and returns the running
+// *adapter.SQSServer. The admin listener calls SigV4-bypass admin
+// entrypoints against this server (see adapter/sqs_admin.go); those
+// admin methods only need the coordinator/store, NOT the public SQS
+// HTTP listener. So when sqsAddr is empty the function still
+// constructs the server (with a nil net.Listener) — Run() then skips
+// httpServer.Serve while the reaper and throttle-sweep goroutines
+// still run, keeping retention math behind the admin counters
+// correct. The admin bridge in main_admin.go therefore wires
+// /admin/api/v1/sqs/* on the wire even on builds that disabled the
+// public SigV4 endpoint.
 func startSQSServer(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -30,16 +36,19 @@ func startSQSServer(
 	partitionObserver adapter.SQSPartitionObserver,
 ) (*adapter.SQSServer, error) {
 	sqsAddr = strings.TrimSpace(sqsAddr)
-	if sqsAddr == "" {
-		return nil, nil
-	}
-	sqsL, err := lc.Listen(ctx, "tcp", sqsAddr)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to listen on %s", sqsAddr)
+	var sqsL net.Listener
+	if sqsAddr != "" {
+		var err error
+		sqsL, err = lc.Listen(ctx, "tcp", sqsAddr)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to listen on %s", sqsAddr)
+		}
 	}
 	staticCreds, err := loadSigV4StaticCredentialsFile(credentialsFile, "sqs")
 	if err != nil {
-		_ = sqsL.Close()
+		if sqsL != nil {
+			_ = sqsL.Close()
+		}
 		return nil, err
 	}
 	sqsServer := adapter.NewSQSServer(

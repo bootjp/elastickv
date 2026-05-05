@@ -205,3 +205,33 @@ func TestSQSServer_StopShutsDown(t *testing.T) {
 		t.Fatal("Run did not return within timeout after Stop")
 	}
 }
+
+// TestSQSServer_ListenlessRunStopRoundTrip pins the listenless
+// construction path used by startSQSServer when --sqsAddress is
+// empty: NewSQSServer must accept a nil net.Listener, Run() must
+// return cleanly when Stop() cancels the reaper context, and the
+// reaper / throttle-sweep goroutines must wind down with the same
+// cancellation. Regression guard for the admin-only deployment
+// shape — without this branch the SQS admin endpoints would be
+// dark on a build whose operator deliberately closed the public
+// SigV4 surface.
+func TestSQSServer_ListenlessRunStopRoundTrip(t *testing.T) {
+	t.Parallel()
+	srv := NewSQSServer(nil, nil, nil)
+	done := make(chan error, 1)
+	go func() { done <- srv.Run() }()
+	// Give Run() a tick to enter the reaperCtx.Done() block. Unlike
+	// the listening path there's no socket Accept loop to enter, so
+	// a shorter pause is enough.
+	time.Sleep(20 * time.Millisecond)
+	srv.Stop()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("listenless Run did not return within timeout after Stop")
+	}
+}

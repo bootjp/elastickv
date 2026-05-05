@@ -1469,9 +1469,11 @@ type runtimeServerRunner struct {
 	s3Server *adapter.S3Server
 
 	// sqsServer plays the same role for the SQS admin entrypoints
-	// (adapter/sqs_admin.go). Nil when --sqsAddress is empty; the
-	// admin listener then leaves /admin/api/v1/sqs/* off the wire
-	// (the mux 404s those paths).
+	// (adapter/sqs_admin.go). Always non-nil after startup —
+	// startSQSServer constructs a listenless SQSServer when
+	// --sqsAddress is empty (the public SigV4 listener is
+	// suppressed but the admin bridge stays wired since the admin
+	// handlers only need the coordinator/store, not the listener).
 	sqsServer *adapter.SQSServer
 
 	// sqsPartitionResolver is the concrete pointer to the same
