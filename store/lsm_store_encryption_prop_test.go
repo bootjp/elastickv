@@ -7,10 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
-
-	"github.com/bootjp/elastickv/internal/encryption"
 )
 
 // TestEncryption_Property_PutGet is a rapid-driven round-trip
