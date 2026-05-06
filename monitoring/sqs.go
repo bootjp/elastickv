@@ -267,9 +267,7 @@ func (m *SQSMetrics) ForgetQueue(queue string) {
 	overflowSetEmpty := overflow && len(m.overflowDepthQueues) == 0
 	m.mu.Unlock()
 	if tracked {
-		m.queueDepth.DeleteLabelValues(queue, sqsQueueStateVisible)
-		m.queueDepth.DeleteLabelValues(queue, sqsQueueStateNotVisible)
-		m.queueDepth.DeleteLabelValues(queue, sqsQueueStateDelayed)
+		m.dropGaugeStatesFor(queue)
 	}
 	if overflowSetEmpty {
 		// Last overflow queue forgotten — drop the shared _other
@@ -277,9 +275,7 @@ func (m *SQSMetrics) ForgetQueue(queue string) {
 		// queues that no longer exist. Safe because no remaining
 		// queue is mapped to this label; any future overflow
 		// queue will re-create the series via ObserveQueueDepth.
-		m.queueDepth.DeleteLabelValues(sqsQueueOverflow, sqsQueueStateVisible)
-		m.queueDepth.DeleteLabelValues(sqsQueueOverflow, sqsQueueStateNotVisible)
-		m.queueDepth.DeleteLabelValues(sqsQueueOverflow, sqsQueueStateDelayed)
+		m.dropGaugeStatesFor(sqsQueueOverflow)
 	}
 }
 
@@ -312,18 +308,49 @@ func (m *SQSMetrics) admitForCounterBudget(queue string) string {
 // ForgetQueue can ref-count them and tear down the shared _other
 // gauge once the last one disappears (otherwise the dashboard
 // pins phantom backlog for queues that no longer exist).
+//
+// Promotion path: when budget pressure eases (a slot opened up via
+// ForgetQueue) a previously-overflowed queue gets admitted under
+// its real name on the next observation. The stale overflow entry
+// must be cleaned up at the same moment — otherwise ForgetQueue's
+// ref-count is permanently off and the _other gauge can persist
+// after every live queue has been promoted off it. If the
+// promotion drains the overflow set entirely, drop the three
+// _other state series too: they're carrying this queue's last
+// overflow value but no queue maps to them anymore.
 func (m *SQSMetrics) admitForDepthBudget(queue string) string {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, ok := m.trackedDepthQueues[queue]; ok {
+		m.mu.Unlock()
 		return queue
 	}
 	if len(m.trackedDepthQueues) >= sqsMaxTrackedQueues {
 		m.overflowDepthQueues[queue] = struct{}{}
+		m.mu.Unlock()
 		return sqsQueueOverflow
 	}
 	m.trackedDepthQueues[queue] = struct{}{}
+	_, wasOverflow := m.overflowDepthQueues[queue]
+	if wasOverflow {
+		delete(m.overflowDepthQueues, queue)
+	}
+	overflowSetEmpty := wasOverflow && len(m.overflowDepthQueues) == 0
+	m.mu.Unlock()
+	if overflowSetEmpty {
+		m.dropGaugeStatesFor(sqsQueueOverflow)
+	}
 	return queue
+}
+
+// dropGaugeStatesFor removes the three state-labelled series for
+// label (a real queue name or sqsQueueOverflow) from the depth
+// gauge. Single-line caller-readability wrapper — prometheus
+// GaugeVec.DeleteLabelValues already does its own per-vector
+// locking, so this is safe to call without holding m.mu.
+func (m *SQSMetrics) dropGaugeStatesFor(label string) {
+	m.queueDepth.DeleteLabelValues(label, sqsQueueStateVisible)
+	m.queueDepth.DeleteLabelValues(label, sqsQueueStateNotVisible)
+	m.queueDepth.DeleteLabelValues(label, sqsQueueStateDelayed)
 }
 
 // sqsValidPartitionAction returns true iff action is one of the

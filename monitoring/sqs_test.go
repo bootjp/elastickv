@@ -260,6 +260,67 @@ func TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp(t *testing.T) {
 		"_other series must still carry the latest value (overflow-b)")
 }
 
+// TestSQSMetrics_AdmitForDepthBudget_PromotionClearsOverflow pins
+// the second P2 found in PR #743 review: admitForDepthBudget must
+// remove a queue from overflowDepthQueues when promoting it from
+// the shared _other label to a real-name label, AND drop the
+// _other gauge series if the overflow set becomes empty as a
+// result.
+//
+// Pre-fix bug: when budget pressure eased (a slot opened up via
+// ForgetQueue) and a previously-overflowed queue was re-observed,
+// admitForDepthBudget added it to trackedDepthQueues but left a
+// stale entry in overflowDepthQueues. Two consequences:
+//
+//  1. ForgetQueue's overflow ref-count was permanently off by one
+//     per stale entry — the _other gauge could persist even when
+//     no live queue mapped to it.
+//  2. The _other series itself still carried the queue's last
+//     value as overflow, even though that queue was now reporting
+//     under its real name. Dashboards see double-counted backlog.
+//
+// Post-fix expectation: a successful promotion both removes the
+// queue from overflowDepthQueues and (if that drained the set)
+// drops the three _other state series, mirroring ForgetQueue's
+// "last overflow gone" branch.
+func TestSQSMetrics_AdmitForDepthBudget_PromotionClearsOverflow(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	// Saturate the depth budget.
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObserveQueueDepth("real-"+strconv.Itoa(i)+".fifo", 1, 0, 0)
+	}
+
+	// Overflow queue X collapses to _other.
+	m.ObserveQueueDepth("overflow-x.fifo", 100, 0, 0)
+	require.InDelta(t, 100.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues(sqsQueueOverflow, sqsQueueStateVisible)),
+		0.001, "sanity: _other carries X's value while X is mapped to overflow")
+
+	// Free a slot so X can be promoted on the next observation.
+	m.ForgetQueue("real-0.fifo")
+
+	// Re-observe X. With room in the budget admitForDepthBudget
+	// must promote it to its real label AND clean up the stale
+	// overflowDepthQueues entry.
+	m.ObserveQueueDepth("overflow-x.fifo", 200, 0, 0)
+	require.InDelta(t, 200.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues("overflow-x.fifo", sqsQueueStateVisible)),
+		0.001, "X must now report under its real label after promotion")
+
+	// 3 state series per queue:
+	//   511 remaining tracked queues (real-1..real-511) + X promoted = 512 × 3 = 1536.
+	// Pre-fix the _other series persists with X's stale 100 value
+	// (1539 total). Post-fix the promotion drains the overflow set
+	// and drops _other.
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
+	require.NoError(t, err)
+	require.Equal(t, sqsMaxTrackedQueues*3, count,
+		"_other series must be dropped when promotion drains the overflow set")
+}
+
 // TestSQSMetrics_ForgetQueue_LastOverflowClearsOtherGauge pins the
 // P2 found in PR #743 review: when the depth budget is saturated
 // and queues collapse onto the shared sqsQueueOverflow ("_other")
