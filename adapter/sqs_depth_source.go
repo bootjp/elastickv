@@ -88,7 +88,21 @@ func (s *SQSServer) SnapshotQueueDepths(ctx context.Context) ([]SQSQueueDepth, b
 // snapshot rather than aborting the entire pass.
 func (s *SQSServer) snapshotOneQueueDepth(ctx context.Context, name string, readTS uint64) (SQSQueueDepth, bool) {
 	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
-	if err != nil || !exists {
+	if err != nil {
+		// Log meta-read errors symmetrically with the
+		// scanApproxCounters branch below — both the function-level
+		// comment and the SnapshotQueueDepths contract state that
+		// per-queue scan errors are logged. A flapping catalog read
+		// would otherwise show up as a dashboard gauge gap with
+		// nothing in the logs to explain it.
+		slog.Warn("sqs depth snapshot: loadQueueMetaAt failed", "queue", name, "err", err)
+		return SQSQueueDepth{}, false
+	}
+	if !exists {
+		// Queue is genuinely gone (DeleteQueue tombstoned, generation
+		// fully drained). No log: the observer's diff will
+		// ForgetQueue this gauge on its own and a stable steady-state
+		// "queue no longer exists" is not an error worth alerting on.
 		return SQSQueueDepth{}, false
 	}
 	counters, err := s.scanApproxCounters(ctx, name, meta.Generation, readTS)
