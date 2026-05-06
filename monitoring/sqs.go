@@ -1,8 +1,10 @@
 package monitoring
 
 import (
+	"context"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -43,15 +45,52 @@ type SQSPartitionObserver interface {
 	ObservePartitionMessage(queue string, partition uint32, action string)
 }
 
-// SQSMetrics owns the Prometheus counter for HT-FIFO partition
-// operations. Mirrors DynamoDBMetrics' shape: per-Registry
-// instance, label-cardinality-bounded by sqsMaxTrackedQueues.
+// SQSDepthSource is the contract a per-tick queue-depth source must
+// satisfy. Implemented by *adapter.SQSServer; SQSObserver.Start
+// calls SnapshotQueueDepths on every interval and writes the
+// returned slice to the elastickv_sqs_queue_messages gauges.
+//
+// Mirrors the Raft observer's StatusReader / ConfigReader pattern
+// (monitoring/raft.go): the source returns ready-to-use snapshots
+// and the observer owns the gauge state machine (forget-on-disappear,
+// cardinality cap). Implementations return an empty slice — not an
+// error — when this node is a follower, so the dashboard's gauge
+// set always mirrors what the leader's catalog scan would report.
+type SQSDepthSource interface {
+	SnapshotQueueDepths(ctx context.Context) []SQSQueueDepth
+}
+
+// SQSQueueDepth is one queue's depth-attribute snapshot. Mirrors
+// adapter.SQSQueueDepth byte-for-byte and is re-declared here to
+// keep the monitoring package free of an adapter import. A drift
+// between the two definitions surfaces as a compile error at the
+// SQSObserver call site.
+type SQSQueueDepth struct {
+	Queue      string
+	Visible    int64
+	NotVisible int64
+	Delayed    int64
+}
+
+// SQSMetrics owns the Prometheus collectors for the SQS adapter.
+// Mirrors DynamoDBMetrics' shape: per-Registry instance, label-
+// cardinality-bounded by sqsMaxTrackedQueues, and split between
+// counters (HT-FIFO partition activity) and gauges (queue depth).
 type SQSMetrics struct {
 	partitionMessages *prometheus.CounterVec
+	queueDepth        *prometheus.GaugeVec
 
 	mu            sync.Mutex
 	trackedQueues map[string]struct{}
 }
+
+// SQS depth gauge state-label values. Stable so dashboards / alerts
+// can hard-code state="visible" et al.
+const (
+	sqsQueueStateVisible    = "visible"
+	sqsQueueStateNotVisible = "not_visible"
+	sqsQueueStateDelayed    = "delayed"
+)
 
 func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 	m := &SQSMetrics{
@@ -62,9 +101,17 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 			},
 			[]string{"queue", "partition", "action"},
 		),
+		queueDepth: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_sqs_queue_messages",
+				Help: "Approximate number of messages in each SQS queue, broken down by state. visible = ApproximateNumberOfMessages, not_visible = ApproximateNumberOfMessagesNotVisible, delayed = ApproximateNumberOfMessagesDelayed. Updated periodically by the leader's queue-depth scraper; followers report no value.",
+			},
+			[]string{"queue", "state"},
+		),
 		trackedQueues: map[string]struct{}{},
 	}
 	registerer.MustRegister(m.partitionMessages)
+	registerer.MustRegister(m.queueDepth)
 	return m
 }
 
@@ -97,6 +144,45 @@ func (m *SQSMetrics) ObservePartitionMessage(queue string, partition uint32, act
 	).Inc()
 }
 
+// ObserveQueueDepth implements SQSDepthObserver. Updates the three
+// state-labelled gauges for queue. Negative values are clamped to 0
+// so a transient scan failure (returning -1 sentinel from a future
+// caller) cannot blast a fake backlog onto the dashboard.
+func (m *SQSMetrics) ObserveQueueDepth(queue string, visible, notVisible, delayed int64) {
+	if m == nil {
+		return
+	}
+	if queue == "" {
+		return
+	}
+	queueLabel := m.queueLabelForCardinalityBudget(queue)
+	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateVisible).Set(float64(maxInt64(0, visible)))
+	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateNotVisible).Set(float64(maxInt64(0, notVisible)))
+	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateDelayed).Set(float64(maxInt64(0, delayed)))
+}
+
+// ForgetQueue implements SQSDepthObserver: drops the three gauge
+// series for a queue. Called when DeleteQueue / Purge has wiped a
+// queue so dashboards stop showing a frozen backlog. The (queue,
+// partition, action) counter series stays — it's cumulative-by-
+// design and disappearing it would mask retention-period activity.
+func (m *SQSMetrics) ForgetQueue(queue string) {
+	if m == nil || queue == "" {
+		return
+	}
+	queueLabel := m.queueLabelForCardinalityBudget(queue)
+	m.queueDepth.DeleteLabelValues(queueLabel, sqsQueueStateVisible)
+	m.queueDepth.DeleteLabelValues(queueLabel, sqsQueueStateNotVisible)
+	m.queueDepth.DeleteLabelValues(queueLabel, sqsQueueStateDelayed)
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // queueLabelForCardinalityBudget returns queue if the metric has
 // already emitted a series for it OR there is room in the
 // tracked-queues set; returns sqsQueueOverflow otherwise. The
@@ -125,4 +211,89 @@ func sqsValidPartitionAction(action string) bool {
 		return true
 	}
 	return false
+}
+
+// sqsDepthObserveInterval is the default tick cadence for
+// SQSObserver. 30 s mirrors sqsReaperInterval — dashboards are
+// rarely refreshed faster, and tighter ticks just add catalog-scan
+// load on the leader for no observable benefit.
+const sqsDepthObserveInterval = 30 * time.Second
+
+// SQSObserver polls a SQSDepthSource on a fixed cadence and writes
+// the result into the SQSMetrics gauge. Same shape as RaftObserver
+// (monitoring/raft.go): the observer owns the state machine
+// (current-vs-previous queue diff for ForgetQueue) and the source
+// just returns ready-to-use snapshots. The observer is nil-tolerant
+// at every entrypoint so test fixtures and metrics-disabled
+// deployments can no-op without a defensive nil check.
+type SQSObserver struct {
+	metrics *SQSMetrics
+
+	mu       sync.Mutex
+	lastSeen map[string]struct{}
+}
+
+func newSQSObserver(metrics *SQSMetrics) *SQSObserver {
+	return &SQSObserver{
+		metrics:  metrics,
+		lastSeen: map[string]struct{}{},
+	}
+}
+
+// Start kicks off a background ticker that polls source every
+// interval (defaulting to sqsDepthObserveInterval when zero) until
+// ctx is canceled. The first observation runs synchronously so
+// /metrics has fresh data on the first scrape; subsequent ticks
+// run on the goroutine.
+func (o *SQSObserver) Start(ctx context.Context, source SQSDepthSource, interval time.Duration) {
+	if o == nil || source == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = sqsDepthObserveInterval
+	}
+	o.observeOnce(ctx, source)
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				o.observeOnce(ctx, source)
+			}
+		}
+	}()
+}
+
+// ObserveOnce captures the latest depth snapshot synchronously.
+// Mirrors RaftObserver.ObserveOnce; intended for tests that want
+// deterministic single-tick behaviour without spinning up a ticker.
+func (o *SQSObserver) ObserveOnce(source SQSDepthSource) {
+	o.observeOnce(context.Background(), source)
+}
+
+func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
+	if o == nil || o.metrics == nil || source == nil {
+		return
+	}
+	snaps := source.SnapshotQueueDepths(ctx)
+	current := make(map[string]struct{}, len(snaps))
+	for _, snap := range snaps {
+		o.metrics.ObserveQueueDepth(snap.Queue, snap.Visible, snap.NotVisible, snap.Delayed)
+		current[snap.Queue] = struct{}{}
+	}
+	// Diff against the previous tick: any queue that disappeared
+	// (DeleteQueue, tombstoned cohort fully drained, leader stepped
+	// down — source returned []) gets its gauge series dropped so
+	// dashboards don't show a frozen backlog.
+	o.mu.Lock()
+	for prev := range o.lastSeen {
+		if _, ok := current[prev]; !ok {
+			o.metrics.ForgetQueue(prev)
+		}
+	}
+	o.lastSeen = current
+	o.mu.Unlock()
 }
