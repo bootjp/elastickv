@@ -202,14 +202,16 @@ func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 
 	m.ObserveQueueDepth("orders.fifo", 3, 0, 0)
 	m.ObservePartitionMessage("orders.fifo", 0, SQSPartitionActionSend)
-	require.Len(t, m.trackedQueues, 1, "queue must have been added to the cardinality budget on Observe")
+	require.Len(t, m.trackedDepthQueues, 1, "queue must have been admitted to the depth budget on ObserveQueueDepth")
+	require.Len(t, m.trackedCounterQueues, 1, "queue must have been admitted to the counter budget on ObservePartitionMessage")
 
 	m.ForgetQueue("orders.fifo")
 
 	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "ForgetQueue must drop every state series for the queue")
-	require.Empty(t, m.trackedQueues, "ForgetQueue must free the cardinality-budget slot")
+	require.Empty(t, m.trackedDepthQueues, "ForgetQueue must free the depth-side cardinality slot")
+	require.Len(t, m.trackedCounterQueues, 1, "ForgetQueue must NOT free the counter-side slot (counters are cumulative)")
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.partitionMessages.WithLabelValues("orders.fifo", "0", SQSPartitionActionSend)), 0.001,
 		"counter must survive ForgetQueue (cumulative metric)")
 
@@ -238,7 +240,7 @@ func TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp(t *testing.T) {
 	for i := 0; i < sqsMaxTrackedQueues; i++ {
 		m.ObserveQueueDepth("real-"+strconv.Itoa(i)+".fifo", 1, 0, 0)
 	}
-	require.Len(t, m.trackedQueues, sqsMaxTrackedQueues)
+	require.Len(t, m.trackedDepthQueues, sqsMaxTrackedQueues)
 
 	// Two overflow queues — both share the _other label.
 	m.ObserveQueueDepth("overflow-a.fifo", 100, 0, 0)
@@ -250,12 +252,92 @@ func TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp(t *testing.T) {
 	// ForgetQueue on an overflow queue must leave the _other series
 	// (and the budget) untouched.
 	m.ForgetQueue("overflow-a.fifo")
-	require.Len(t, m.trackedQueues, sqsMaxTrackedQueues,
-		"ForgetQueue on an overflow queue must not change the budget")
+	require.Len(t, m.trackedDepthQueues, sqsMaxTrackedQueues,
+		"ForgetQueue on an overflow queue must not change the depth budget")
 	require.InDelta(t, 200.0,
 		testutil.ToFloat64(m.queueDepth.WithLabelValues(sqsQueueOverflow, sqsQueueStateVisible)),
 		0.001,
 		"_other series must still carry the latest value (overflow-b)")
+}
+
+// TestSQSMetrics_ForgetQueue_DoesNotReclaimCounterBudget pins the
+// P1 found in PR #743 review: ForgetQueue must NOT free a counter-
+// side cardinality budget slot. The (queue, partition, action)
+// counter series is cumulative and cannot be deleted from
+// Prometheus without losing its observed value, so once a queue
+// has been admitted to the counter budget the slot must stay
+// permanently consumed — even if the queue is dropped from the
+// gauge side.
+//
+// Pre-fix bug: trackedQueues was a single shared map. ForgetQueue
+// would delete the entry, freeing the slot. A subsequent
+// ObservePartitionMessage on a NEW queue then got admitted with a
+// real label, even though the old queue's counter series was still
+// alive in Prometheus. Repeating this (e.g. leader step-down clears
+// lastSeen → ForgetQueue called for every queue → 512 fresh queues
+// arrive and get admitted) lets counter cardinality grow unbounded.
+//
+// Post-fix expectation: the counter budget is one-way. Once
+// saturated, every later queue collapses to _other regardless of
+// how many ForgetQueue calls have run.
+func TestSQSMetrics_ForgetQueue_DoesNotReclaimCounterBudget(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	// Saturate the counter budget with sqsMaxTrackedQueues distinct
+	// queue names — every one is admitted as a real label.
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObservePartitionMessage("orig-"+strconv.Itoa(i)+".fifo", 0, SQSPartitionActionSend)
+	}
+
+	// Drop every queue via ForgetQueue. This used to free the
+	// budget slot for every queue, including ones that had only
+	// counter activity (depth side never touched them — pre-fix
+	// the check was non-distinguishing).
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ForgetQueue("orig-" + strconv.Itoa(i) + ".fifo")
+	}
+
+	// New queue arrives. Pre-fix this would be admitted as a real
+	// label because the slot looked free. Post-fix the counter
+	// budget is still saturated (counters were never deleted), so
+	// the new queue must collapse to _other.
+	m.ObservePartitionMessage("new-after-forget.fifo", 0, SQSPartitionActionSend)
+
+	require.InDelta(t, 0.0,
+		testutil.ToFloat64(m.partitionMessages.WithLabelValues("new-after-forget.fifo", "0", SQSPartitionActionSend)),
+		0.001,
+		"counter for the new queue must not exist under its real name — budget should be exhausted")
+	require.InDelta(t, 1.0,
+		testutil.ToFloat64(m.partitionMessages.WithLabelValues(sqsQueueOverflow, "0", SQSPartitionActionSend)),
+		0.001,
+		"new queue past the counter cap must collapse to _other")
+}
+
+// TestSQSMetrics_ForgetQueue_StillReclaimsDepthBudget pins the
+// converse: the gauge side IS reclaimable, because gauges can be
+// deleted from Prometheus without losing semantically-meaningful
+// state. A churn-heavy deployment that observes depth for 512
+// distinct queues, then forgets all of them, must be able to
+// observe a 513th distinct queue under its real name.
+func TestSQSMetrics_ForgetQueue_StillReclaimsDepthBudget(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObserveQueueDepth("orig-"+strconv.Itoa(i)+".fifo", 1, 0, 0)
+	}
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ForgetQueue("orig-" + strconv.Itoa(i) + ".fifo")
+	}
+	m.ObserveQueueDepth("fresh.fifo", 42, 0, 0)
+
+	require.InDelta(t, 42.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues("fresh.fifo", sqsQueueStateVisible)),
+		0.001,
+		"gauge budget must reclaim slots so a churn-heavy deployment can keep emitting real labels")
 }
 
 // TestSQSMetrics_DepthNilReceiverIsSafe mirrors the partition test:

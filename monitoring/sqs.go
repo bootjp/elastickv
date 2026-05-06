@@ -76,12 +76,36 @@ type SQSQueueDepth struct {
 // Mirrors DynamoDBMetrics' shape: per-Registry instance, label-
 // cardinality-bounded by sqsMaxTrackedQueues, and split between
 // counters (HT-FIFO partition activity) and gauges (queue depth).
+//
+// The cardinality budget is split into two independent maps because
+// the two metrics have different deletion semantics:
+//
+//   - partitionMessages is a CounterVec. Counters are cumulative;
+//     deleting a series throws away its observed-since-process-start
+//     value, so we never call DeleteLabelValues on it. The counter
+//     budget therefore only ever grows — once a queue is admitted to
+//     trackedCounterQueues it stays admitted, and ForgetQueue does
+//     NOT touch this map.
+//   - queueDepth is a GaugeVec. Gauges have no cumulative state, so
+//     DeleteLabelValues is safe (and necessary, otherwise a deleted
+//     queue keeps reporting a frozen backlog on the dashboard).
+//     ForgetQueue both removes the gauge series and frees the
+//     queue's slot in trackedDepthQueues so a churn-heavy deployment
+//     can reuse the budget.
+//
+// Sharing one map across the two metrics regresses the counter cap:
+// ForgetQueue would free a slot, a new queue would be admitted, and
+// the previous queue's counter series would still occupy a real-name
+// label in Prometheus — letting cardinality grow without bound under
+// queue churn (or after a leader step-down clears the observer's
+// lastSeen). This was the P1 finding on PR #743.
 type SQSMetrics struct {
 	partitionMessages *prometheus.CounterVec
 	queueDepth        *prometheus.GaugeVec
 
-	mu            sync.Mutex
-	trackedQueues map[string]struct{}
+	mu                   sync.Mutex
+	trackedCounterQueues map[string]struct{}
+	trackedDepthQueues   map[string]struct{}
 }
 
 // SQS depth gauge state-label values. Stable so dashboards / alerts
@@ -108,7 +132,8 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 			},
 			[]string{"queue", "state"},
 		),
-		trackedQueues: map[string]struct{}{},
+		trackedCounterQueues: map[string]struct{}{},
+		trackedDepthQueues:   map[string]struct{}{},
 	}
 	registerer.MustRegister(m.partitionMessages)
 	registerer.MustRegister(m.queueDepth)
@@ -132,7 +157,7 @@ func (m *SQSMetrics) ObservePartitionMessage(queue string, partition uint32, act
 		// poisoned data.
 		return
 	}
-	queueLabel := m.queueLabelForCardinalityBudget(queue)
+	queueLabel := m.admitForCounterBudget(queue)
 	// WithLabelValues avoids the prometheus.Labels map allocation
 	// on every observe call. Label order matches the
 	// NewCounterVec declaration: queue, partition, action.
@@ -155,48 +180,59 @@ func (m *SQSMetrics) ObserveQueueDepth(queue string, visible, notVisible, delaye
 	if queue == "" {
 		return
 	}
-	queueLabel := m.queueLabelForCardinalityBudget(queue)
+	queueLabel := m.admitForDepthBudget(queue)
 	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateVisible).Set(float64(max(int64(0), visible)))
 	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateNotVisible).Set(float64(max(int64(0), notVisible)))
 	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateDelayed).Set(float64(max(int64(0), delayed)))
 }
 
 // ForgetQueue drops the three gauge series for a queue and frees
-// its cardinality-budget slot so a long-running deployment that
-// regularly creates and deletes queues (CI workloads, ephemeral
-// per-job queues) doesn't permanently wedge the 512-entry budget.
-// Without the trackedQueues cleanup, post-cap new queues would
-// silently collapse onto the _other label even after their
-// predecessors had been deleted.
+// its slot in the depth-side cardinality budget so a long-running
+// deployment that regularly creates and deletes queues (CI
+// workloads, ephemeral per-job queues) doesn't permanently wedge
+// the 512-entry depth budget. Without the trackedDepthQueues
+// cleanup, post-cap new queues would silently collapse onto the
+// _other label even after their predecessors had been deleted.
 //
 // The (queue, partition, action) counter series stays —
-// cumulative-by-design and disappearing it would mask retention-
-// period activity. Queues that hit the cap and mapped to _other
-// have no individual series to delete; we detect the not-tracked
-// case and skip the DeleteLabelValues calls so we don't tear down
-// the shared _other series for an unrelated queue.
+// cumulative-by-design — and the queue's slot in
+// trackedCounterQueues stays consumed. Reclaiming the counter slot
+// would let a later queue be admitted under its real name while the
+// original counter series still sat in Prometheus, which would let
+// counter cardinality grow past sqsMaxTrackedQueues under churn or
+// after a leader step-down clears the observer's lastSeen (the P1
+// finding on PR #743).
+//
+// Queues that hit the depth cap and mapped to _other have no
+// individual gauge series to delete; we detect the not-tracked case
+// and skip the DeleteLabelValues calls so we don't tear down the
+// shared _other series for an unrelated queue.
 //
 // Caller-audit per the standing semantic-change rule: only
 // SQSObserver.observeOnce calls this (registry plumbing aside),
 // and it's invoked exactly when a queue is observed in the
-// previous tick but not the current one — symmetric with
-// ObserveQueueDepth's add side, so there is no path that calls
-// ForgetQueue without a matching prior tracked-queue insert.
+// previous tick but not the current one. The caller's contract —
+// "drop gauges for a queue that disappeared so dashboards don't
+// show frozen backlog" — is preserved. The narrowed scope (counter
+// budget no longer reclaimed) is invisible to the observer because
+// observeOnce only writes gauges; the counter side is fed by
+// ObservePartitionMessage from a different code path entirely.
 func (m *SQSMetrics) ForgetQueue(queue string) {
 	if m == nil || queue == "" {
 		return
 	}
 	m.mu.Lock()
-	_, tracked := m.trackedQueues[queue]
+	_, tracked := m.trackedDepthQueues[queue]
 	if tracked {
-		delete(m.trackedQueues, queue)
+		delete(m.trackedDepthQueues, queue)
 	}
 	m.mu.Unlock()
 	if !tracked {
-		// Queue was either never observed or had been collapsed onto
-		// the _other overflow label. Either way: no per-queue series
-		// to remove, and we must NOT delete the _other series here
-		// because other overflow queues may still be sharing it.
+		// Queue was either never depth-observed or had been collapsed
+		// onto the _other overflow label. Either way: no per-queue
+		// gauge series to remove, and we must NOT delete the _other
+		// series here because other overflow queues may still be
+		// sharing it.
 		return
 	}
 	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateVisible)
@@ -204,22 +240,40 @@ func (m *SQSMetrics) ForgetQueue(queue string) {
 	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateDelayed)
 }
 
-// queueLabelForCardinalityBudget returns queue if the metric has
-// already emitted a series for it OR there is room in the
-// tracked-queues set; returns sqsQueueOverflow otherwise. The
-// cap-and-collapse pattern mirrors DynamoDBMetrics.tableLabel
-// so a misbehaving caller cannot exhaust the Prometheus
-// cardinality budget.
-func (m *SQSMetrics) queueLabelForCardinalityBudget(queue string) string {
+// admitForCounterBudget returns the canonical label for queue: the
+// real name when the counter budget has room, sqsQueueOverflow once
+// it is saturated. The counter budget never shrinks (counter series
+// are cumulative — Prometheus has no semantically-clean delete), so
+// this is a one-way admission: once a queue gets in, it stays.
+// Mirrors DynamoDBMetrics.tableLabel.
+func (m *SQSMetrics) admitForCounterBudget(queue string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.trackedQueues[queue]; ok {
+	if _, ok := m.trackedCounterQueues[queue]; ok {
 		return queue
 	}
-	if len(m.trackedQueues) >= sqsMaxTrackedQueues {
+	if len(m.trackedCounterQueues) >= sqsMaxTrackedQueues {
 		return sqsQueueOverflow
 	}
-	m.trackedQueues[queue] = struct{}{}
+	m.trackedCounterQueues[queue] = struct{}{}
+	return queue
+}
+
+// admitForDepthBudget mirrors admitForCounterBudget for the gauge
+// budget. Unlike the counter side, slots here can be freed via
+// ForgetQueue, so a deployment that creates and deletes queues over
+// time can reuse budget for new queue names instead of permanently
+// exhausting it.
+func (m *SQSMetrics) admitForDepthBudget(queue string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.trackedDepthQueues[queue]; ok {
+		return queue
+	}
+	if len(m.trackedDepthQueues) >= sqsMaxTrackedQueues {
+		return sqsQueueOverflow
+	}
+	m.trackedDepthQueues[queue] = struct{}{}
 	return queue
 }
 
