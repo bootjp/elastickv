@@ -156,31 +156,52 @@ func (m *SQSMetrics) ObserveQueueDepth(queue string, visible, notVisible, delaye
 		return
 	}
 	queueLabel := m.queueLabelForCardinalityBudget(queue)
-	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateVisible).Set(float64(maxInt64(0, visible)))
-	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateNotVisible).Set(float64(maxInt64(0, notVisible)))
-	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateDelayed).Set(float64(maxInt64(0, delayed)))
+	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateVisible).Set(float64(max(int64(0), visible)))
+	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateNotVisible).Set(float64(max(int64(0), notVisible)))
+	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateDelayed).Set(float64(max(int64(0), delayed)))
 }
 
-// ForgetQueue implements SQSDepthObserver: drops the three gauge
-// series for a queue. Called when DeleteQueue / Purge has wiped a
-// queue so dashboards stop showing a frozen backlog. The (queue,
-// partition, action) counter series stays — it's cumulative-by-
-// design and disappearing it would mask retention-period activity.
+// ForgetQueue drops the three gauge series for a queue and frees
+// its cardinality-budget slot so a long-running deployment that
+// regularly creates and deletes queues (CI workloads, ephemeral
+// per-job queues) doesn't permanently wedge the 512-entry budget.
+// Without the trackedQueues cleanup, post-cap new queues would
+// silently collapse onto the _other label even after their
+// predecessors had been deleted.
+//
+// The (queue, partition, action) counter series stays —
+// cumulative-by-design and disappearing it would mask retention-
+// period activity. Queues that hit the cap and mapped to _other
+// have no individual series to delete; we detect the not-tracked
+// case and skip the DeleteLabelValues calls so we don't tear down
+// the shared _other series for an unrelated queue.
+//
+// Caller-audit per the standing semantic-change rule: only
+// SQSObserver.observeOnce calls this (registry plumbing aside),
+// and it's invoked exactly when a queue is observed in the
+// previous tick but not the current one — symmetric with
+// ObserveQueueDepth's add side, so there is no path that calls
+// ForgetQueue without a matching prior tracked-queue insert.
 func (m *SQSMetrics) ForgetQueue(queue string) {
 	if m == nil || queue == "" {
 		return
 	}
-	queueLabel := m.queueLabelForCardinalityBudget(queue)
-	m.queueDepth.DeleteLabelValues(queueLabel, sqsQueueStateVisible)
-	m.queueDepth.DeleteLabelValues(queueLabel, sqsQueueStateNotVisible)
-	m.queueDepth.DeleteLabelValues(queueLabel, sqsQueueStateDelayed)
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
+	m.mu.Lock()
+	_, tracked := m.trackedQueues[queue]
+	if tracked {
+		delete(m.trackedQueues, queue)
 	}
-	return b
+	m.mu.Unlock()
+	if !tracked {
+		// Queue was either never observed or had been collapsed onto
+		// the _other overflow label. Either way: no per-queue series
+		// to remove, and we must NOT delete the _other series here
+		// because other overflow queues may still be sharing it.
+		return
+	}
+	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateVisible)
+	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateNotVisible)
+	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateDelayed)
 }
 
 // queueLabelForCardinalityBudget returns queue if the metric has
@@ -274,6 +295,15 @@ func (o *SQSObserver) ObserveOnce(source SQSDepthSource) {
 	o.observeOnce(context.Background(), source)
 }
 
+// observeOnce assumes a single-writer contract: in production the
+// only caller is the goroutine launched from Start, and tests use
+// ObserveOnce serially. ObserveQueueDepth runs unlocked because the
+// CounterVec / GaugeVec writes are individually atomic; the
+// trackedQueues mutation inside is guarded by m.mu. Concurrent
+// observeOnce invocations would race only on the lastSeen diff
+// (held briefly under o.mu below), so a future caller that
+// violates the single-writer rule would at worst double-emit a
+// gauge — never a panic.
 func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	if o == nil || o.metrics == nil || source == nil {
 		return

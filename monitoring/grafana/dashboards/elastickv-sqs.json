@@ -157,7 +157,7 @@
       "targets": [
         {
           "datasource": "$datasource",
-          "expr": "max by (node_id) (elastickv_sqs_queue_messages > 0) * 0 + 1",
+          "expr": "count by (node_id) (elastickv_sqs_queue_messages)",
           "format": "table",
           "instant": true,
           "legendFormat": "{{node_id}}",

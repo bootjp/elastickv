@@ -190,9 +190,11 @@ func TestSQSMetrics_ObserveQueueDepth_DropsEmptyQueue(t *testing.T) {
 }
 
 // TestSQSMetrics_ForgetQueue_DropsThreeSeries pins that ForgetQueue
-// removes all three state-labelled series so a deleted queue stops
-// reporting a frozen backlog. The (queue, partition, action) counter
-// is intentionally untouched (cumulative-by-design).
+// (a) removes all three state-labelled series so a deleted queue
+// stops reporting a frozen backlog, (b) frees the cardinality-
+// budget slot so a churn-heavy deployment doesn't permanently
+// exhaust the 512-entry budget, and (c) leaves the
+// (queue, partition, action) counter alone (cumulative-by-design).
 func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
@@ -200,14 +202,60 @@ func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 
 	m.ObserveQueueDepth("orders.fifo", 3, 0, 0)
 	m.ObservePartitionMessage("orders.fifo", 0, SQSPartitionActionSend)
+	require.Len(t, m.trackedQueues, 1, "queue must have been added to the cardinality budget on Observe")
 
 	m.ForgetQueue("orders.fifo")
 
 	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "ForgetQueue must drop every state series for the queue")
+	require.Empty(t, m.trackedQueues, "ForgetQueue must free the cardinality-budget slot")
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.partitionMessages.WithLabelValues("orders.fifo", "0", SQSPartitionActionSend)), 0.001,
 		"counter must survive ForgetQueue (cumulative metric)")
+
+	// Observe again post-forget: the new series must be keyed on
+	// the real name (slot was freed), NOT on the _other overflow
+	// label. Without the trackedQueues cleanup this would silently
+	// collapse to _other once the budget eventually filled.
+	m.ObserveQueueDepth("orders.fifo", 7, 0, 0)
+	require.InDelta(t, 7.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("orders.fifo", sqsQueueStateVisible)), 0.001,
+		"post-forget Observe must re-emit under the real queue name")
+}
+
+// TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp pins the
+// overflow-collision safety: a queue that hit the cardinality cap
+// and got collapsed onto the _other label has no individual series
+// to delete. ForgetQueue must NOT call DeleteLabelValues with the
+// _other label because that series is shared with every other
+// overflow queue — tearing it down would zero-out unrelated data.
+func TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	// Saturate the budget with sqsMaxTrackedQueues real queues so
+	// any further observation collapses to _other.
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObserveQueueDepth("real-"+strconv.Itoa(i)+".fifo", 1, 0, 0)
+	}
+	require.Len(t, m.trackedQueues, sqsMaxTrackedQueues)
+
+	// Two overflow queues — both share the _other label.
+	m.ObserveQueueDepth("overflow-a.fifo", 100, 0, 0)
+	m.ObserveQueueDepth("overflow-b.fifo", 200, 0, 0)
+	overflowVisible := testutil.ToFloat64(m.queueDepth.WithLabelValues(sqsQueueOverflow, sqsQueueStateVisible))
+	require.InDelta(t, 200.0, overflowVisible, 0.001,
+		"second observe should overwrite the shared _other gauge")
+
+	// ForgetQueue on an overflow queue must leave the _other series
+	// (and the budget) untouched.
+	m.ForgetQueue("overflow-a.fifo")
+	require.Len(t, m.trackedQueues, sqsMaxTrackedQueues,
+		"ForgetQueue on an overflow queue must not change the budget")
+	require.InDelta(t, 200.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues(sqsQueueOverflow, sqsQueueStateVisible)),
+		0.001,
+		"_other series must still carry the latest value (overflow-b)")
 }
 
 // TestSQSMetrics_DepthNilReceiverIsSafe mirrors the partition test:
