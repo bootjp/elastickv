@@ -47,18 +47,21 @@ func (s *SQSServer) SnapshotQueueDepths(ctx context.Context) ([]SQSQueueDepth, b
 	if s == nil || s.coordinator == nil || s.store == nil || !s.coordinator.IsLeader() {
 		return nil, true
 	}
-	names, err := s.scanQueueNames(ctx)
+	// Take ONE read timestamp up front and pass it through both the
+	// membership scan and the per-queue counter scans. With separate
+	// timestamps the membership read and the per-queue reads land on
+	// different MVCC views, so a queue created or deleted between
+	// them would be silently missed (or reported with stale
+	// counters) for one tick — and the observer's "current vs
+	// previous" diff would then ForgetQueue it spuriously, dashboard-
+	// rendering as a phantom drop. One ts per tick is also lighter
+	// on the leader's HLC than two.
+	readTS := s.nextTxnReadTS(ctx)
+	names, err := s.scanQueueNamesAt(ctx, readTS)
 	if err != nil {
-		slog.Warn("sqs depth snapshot: scanQueueNames failed", "err", err)
+		slog.Warn("sqs depth snapshot: scanQueueNamesAt failed", "err", err)
 		return nil, false
 	}
-	// Take a single read timestamp for the whole tick so all queues
-	// in this snapshot share the same MVCC view. With per-queue
-	// nextTxnReadTS the first queue's read could see a state the
-	// last queue's read can't (catalog mutation between calls), and
-	// every call burns an HLC tick on the leader. One ts per tick
-	// is both more consistent and lighter on the leader's HLC.
-	readTS := s.nextTxnReadTS(ctx)
 	out := make([]SQSQueueDepth, 0, len(names))
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
