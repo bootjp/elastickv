@@ -469,13 +469,16 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	}
 	current := make(map[string]struct{}, len(snaps))
 	for _, snap := range snaps {
-		o.metrics.ObserveQueueDepth(snap.Queue, snap.Visible, snap.NotVisible, snap.Delayed)
 		current[snap.Queue] = struct{}{}
 	}
-	// Diff against the previous tick: any queue that disappeared
-	// (DeleteQueue, tombstoned cohort fully drained, leader stepped
-	// down — source returned []) gets its gauge series dropped so
-	// dashboards don't show a frozen backlog.
+	// Phase 1: forget queues that disappeared since the last tick.
+	// This MUST run before phase 2 — emitting first would let
+	// admitForDepthBudget see stale names still occupying
+	// trackedDepthQueues, so any newly-active queue admitted while
+	// the budget was full would silently collapse onto _other for
+	// at least one interval even when capacity opens up the same
+	// tick. Reclaiming first lets phase 2's admissions reuse the
+	// freed slots immediately.
 	o.mu.Lock()
 	for prev := range o.lastSeen {
 		if _, ok := current[prev]; !ok {
@@ -484,4 +487,12 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	}
 	o.lastSeen = current
 	o.mu.Unlock()
+	// Phase 2: emit gauges for the current tick. Slots freed in
+	// phase 1 are now visible to admitForDepthBudget (both phases
+	// take the SQSMetrics.mu serially), so a brand-new queue
+	// landing in the same tick that an old queue disappeared gets
+	// the freed slot's real label rather than overflow.
+	for _, snap := range snaps {
+		o.metrics.ObserveQueueDepth(snap.Queue, snap.Visible, snap.NotVisible, snap.Delayed)
+	}
 }

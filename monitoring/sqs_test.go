@@ -668,6 +668,89 @@ func TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges(t *testing.T)
 	require.InDelta(t, 2.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("audio.fifo", sqsQueueStateVisible)), 0.001)
 }
 
+// TestSQSObserver_ObserveOnce_HighChurnReclaimsBeforeAdmit pins
+// the P2 fix from PR #743 r9: observeOnce must run the
+// disappeared-queue ForgetQueue diff BEFORE emitting the current
+// tick's gauges, so that depth-budget slots freed by a
+// just-disappeared queue are available for a brand-new queue
+// admitted in the same tick.
+//
+// Pre-fix shape: emit ran first (admitForDepthBudget saw stale
+// names still occupying trackedDepthQueues, so any new queue
+// admitted while the budget was full collapsed to _other), then
+// forget cleared the stale names. End state: half the new queues
+// stuck on _other for at least one interval even though
+// capacity opened up the same tick.
+//
+// Post-fix shape: forget runs first (slots reclaim under m.mu),
+// emit runs second (admit sees the freed slots and gives every
+// new queue a real label). End state: every queue admitted under
+// its real name, no _other in the overflow gauge.
+//
+// Scenario: tick 1 saturates the budget with sqsMaxTrackedQueues
+// real queues; tick 2 keeps half and replaces the other half
+// with brand-new names — full churn at the cap.
+func TestSQSObserver_ObserveOnce_HighChurnReclaimsBeforeAdmit(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+	obs := newSQSObserver(m)
+
+	tick1 := make([]SQSQueueDepth, sqsMaxTrackedQueues)
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		tick1[i] = SQSQueueDepth{Queue: "old-" + strconv.Itoa(i) + ".fifo", Visible: 1}
+	}
+
+	half := sqsMaxTrackedQueues / 2
+	tick2 := make([]SQSQueueDepth, 0, sqsMaxTrackedQueues)
+	for i := 0; i < half; i++ {
+		// First half of old queues carry over.
+		tick2 = append(tick2, SQSQueueDepth{Queue: "old-" + strconv.Itoa(i) + ".fifo", Visible: 2})
+	}
+	for i := 0; i < half; i++ {
+		// Brand-new queues replacing the disappeared half.
+		tick2 = append(tick2, SQSQueueDepth{Queue: "new-" + strconv.Itoa(i) + ".fifo", Visible: 3})
+	}
+
+	source := &fakeDepthSource{
+		ticks: []fakeDepthTick{
+			{snaps: tick1, ok: true},
+			{snaps: tick2, ok: true},
+		},
+	}
+
+	obs.ObserveOnce(source)
+	obs.ObserveOnce(source)
+
+	// Series count first — must come before any per-queue
+	// WithLabelValues call below, because WithLabelValues
+	// materialises the labelled gauge as a side effect (creating
+	// it with default value 0 if absent). Asserting "_other has
+	// no series" via WithLabelValues would actually CREATE the
+	// _other series and inflate the count; instead we assert the
+	// total series count here and let the math prove the absence
+	// (512 real queues × 3 states = 1536 with no room for any
+	// _other series; pre-fix would land at 256 real × 3 + _other
+	// × 3 = 771).
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
+	require.NoError(t, err)
+	require.Equal(t, sqsMaxTrackedQueues*3, count,
+		"512 queues × 3 states = 1536 series, all real labels — pre-fix would be 256 real × 3 + _other × 3 = 771")
+
+	// Per-queue spot checks: the brand-new queues admitted under
+	// real labels (these series already exist from tick 2's emit
+	// phase, so WithLabelValues hits the existing children and
+	// doesn't perturb the count).
+	require.InDelta(t, 3.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues("new-0.fifo", sqsQueueStateVisible)),
+		0.001,
+		"new queue must report under its real label — slot freed by old-(half) forget within same tick")
+	require.InDelta(t, 3.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues("new-"+strconv.Itoa(half-1)+".fifo", sqsQueueStateVisible)),
+		0.001,
+		"last new queue must also report under its real label")
+}
+
 // TestSQSObserver_NilTolerant pins that nil observer / nil source
 // don't panic — the same nil-tolerant contract Raft / Redis
 // observers carry, so a metrics-disabled deployment can pass nil
