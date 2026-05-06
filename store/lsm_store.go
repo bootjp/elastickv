@@ -16,21 +16,32 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 const (
-	timestampSize            = 8
-	valueHeaderSize          = 9 // 1 byte tombstone + 8 bytes expireAt
-	snapshotBatchCountLimit  = 1000
-	snapshotBatchByteLimit   = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
-	dirPerms                 = 0755
-	metaLastCommitTS         = "_meta_last_commit_ts"
-	metaMinRetainedTS        = "_meta_min_retained_ts"
-	metaPendingMinRetainedTS = "_meta_pending_min_retained_ts"
-	spoolBufSize             = 32 * 1024 // buffer size for streaming I/O during restore
+	timestampSize   = 8
+	valueHeaderSize = 9 // 1 byte flags + 8 bytes expireAt
+	// First-byte (flags) layout per design §4.1:
+	//   bit 0      tombstone
+	//   bits 1-2   encryption_state (0b00 cleartext, 0b01 encrypted, 0b10/0b11 reserved)
+	//   bits 3-7   reserved (must be zero)
+	encStateMask             byte = 0b0000_0110
+	encStateShift                 = 1
+	tombstoneMask            byte = 0b0000_0001
+	encStateCleartext        byte = 0b00
+	encStateEncrypted        byte = 0b01
+	encStateReservedMask     byte = 0b1111_1000 // bits 3-7 must stay zero
+	snapshotBatchCountLimit       = 1000
+	snapshotBatchByteLimit        = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
+	dirPerms                      = 0755
+	metaLastCommitTS              = "_meta_last_commit_ts"
+	metaMinRetainedTS             = "_meta_min_retained_ts"
+	metaPendingMinRetainedTS      = "_meta_pending_min_retained_ts"
+	spoolBufSize                  = 32 * 1024 // buffer size for streaming I/O during restore
 
 	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
 	// which are the user key concatenated with the 8-byte inverted timestamp.
@@ -186,6 +197,14 @@ type pebbleStore struct {
 	// write-options pointer so monitoring (elastickv_fsm_apply_sync_mode)
 	// and log lines stay in sync with the resolved mode.
 	fsmApplySyncModeLabel string
+	// cipher / nonceFactory / activeStorageKeyID drive the §4.1
+	// storage envelope. nil cipher = cleartext-only legacy behaviour;
+	// see WithEncryption. Once wired, cipher and nonceFactory MUST
+	// outlive the store (the keystore behind cipher is itself
+	// copy-on-write so rotation does not break this invariant).
+	cipher             *encryption.Cipher
+	nonceFactory       NonceFactory
+	activeStorageKeyID ActiveStorageKeyID
 }
 
 // Ensure pebbleStore implements MVCCStore and RetentionController.
@@ -360,17 +379,36 @@ func decodeKeyView(k []byte) ([]byte, uint64) {
 	return k[:keyLen], ^invTs
 }
 
-// Value encoding: fixed binary header [Tombstone(1)][ExpireAt(8)] followed by raw value bytes; key and timestamp are encoded in the SST key.
+// Value encoding: fixed binary header
+//
+//	byte 0: bit 0 tombstone | bits 1-2 encryption_state | bits 3-7 reserved
+//	bytes 1-8: ExpireAt (LittleEndian uint64)
+//	bytes 9..: body — either raw plaintext (encState=0b00) or the §4.1
+//	           authenticated envelope bytes (encState=0b01). Reserved
+//	           encryption_state values (0b10, 0b11) are rejected at decode
+//	           per design §7.1.
+//
+// The Pebble key (`encodeKey(user_key, commit_ts)`) is signed into the
+// envelope's AAD so a cut-and-paste / version-substitution attack
+// rejects on Decrypt; see §4.1 case 2/3.
 type storedValue struct {
 	Value     []byte
 	Tombstone bool
+	EncState  byte // 0b00 cleartext, 0b01 encrypted; reserved values rejected at decode
 	ExpireAt  uint64
 }
 
-func encodeValue(val []byte, tombstone bool, expireAt uint64) []byte {
-	// Format: [Tombstone(1)] [ExpireAt(8)] [Value(...)]
+// ErrEncryptedValueReservedState indicates decodeValue saw an
+// encryption_state value (0b10 or 0b11) that the current build does
+// not know how to interpret. Per design §7.1, this is a fail-closed
+// trip-wire so an old binary cannot silently treat a future-version
+// encrypted entry as cleartext bytes.
+var ErrEncryptedValueReservedState = errors.New("store: value header carries reserved encryption_state; binary too old to read this entry")
+
+func encodeValue(val []byte, tombstone bool, expireAt uint64, encState byte) []byte {
+	// Format: [flags(1)] [ExpireAt(8)] [Body(...)]
 	buf := make([]byte, encodedValueLen(len(val)))
-	fillEncodedValue(buf, val, tombstone, expireAt)
+	fillEncodedValue(buf, val, tombstone, expireAt, encState)
 	return buf
 }
 
@@ -378,12 +416,13 @@ func encodedValueLen(valueLen int) int {
 	return valueHeaderSize + valueLen
 }
 
-func fillEncodedValue(dst []byte, val []byte, tombstone bool, expireAt uint64) {
+func fillEncodedValue(dst []byte, val []byte, tombstone bool, expireAt uint64, encState byte) {
+	var flags byte
 	if tombstone {
-		dst[0] = 1
-	} else {
-		dst[0] = 0
+		flags |= tombstoneMask
 	}
+	flags |= (encState << encStateShift) & encStateMask
+	dst[0] = flags
 	binary.LittleEndian.PutUint64(dst[1:], expireAt)
 	copy(dst[valueHeaderSize:], val)
 }
@@ -392,7 +431,17 @@ func decodeValue(data []byte) (storedValue, error) {
 	if len(data) < valueHeaderSize {
 		return storedValue{}, errors.New("invalid value length")
 	}
-	tombstone := data[0] != 0
+	flags := data[0]
+	if flags&encStateReservedMask != 0 {
+		return storedValue{}, errors.Wrapf(ErrEncryptedValueReservedState,
+			"value header byte = %#08b", flags)
+	}
+	encState := (flags & encStateMask) >> encStateShift
+	if encState != encStateCleartext && encState != encStateEncrypted {
+		return storedValue{}, errors.Wrapf(ErrEncryptedValueReservedState,
+			"encryption_state=%#x is reserved", encState)
+	}
+	tombstone := (flags & tombstoneMask) != 0
 	expireAt := binary.LittleEndian.Uint64(data[1:])
 	val := make([]byte, len(data)-valueHeaderSize)
 	copy(val, data[valueHeaderSize:])
@@ -400,6 +449,7 @@ func decodeValue(data []byte) (storedValue, error) {
 	return storedValue{
 		Value:     val,
 		Tombstone: tombstone,
+		EncState:  encState,
 		ExpireAt:  expireAt,
 	}, nil
 }
@@ -642,33 +692,33 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 	}
 	defer iter.Close()
 
-	if iter.SeekGE(seekKey) {
-		k := iter.Key()
-		userKey, _ := decodeKeyView(k)
-
-		if !bytes.Equal(userKey, key) {
-			// Moved to next user key
-			return nil, ErrKeyNotFound
-		}
-
-		// Found a version. Check if valid.
-		valBytes := iter.Value()
-		sv, err := decodeValue(valBytes)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		if sv.Tombstone {
-			return nil, ErrKeyNotFound
-		}
-		if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
-			return nil, ErrKeyNotFound
-		}
-
-		return sv.Value, nil
+	if !iter.SeekGE(seekKey) {
+		return nil, ErrKeyNotFound
 	}
+	return s.readVisibleVersion(iter, key, ts)
+}
 
-	return nil, ErrKeyNotFound
+// readVisibleVersion examines the iterator's current entry and
+// returns the live plaintext value at ts, or ErrKeyNotFound if the
+// entry is a different user key, a tombstone, or expired. Decrypts
+// when the value's encryption_state bit indicates an encrypted body.
+func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts uint64) ([]byte, error) {
+	k := iter.Key()
+	userKey, _ := decodeKeyView(k)
+	if !bytes.Equal(userKey, key) {
+		return nil, ErrKeyNotFound
+	}
+	sv, err := decodeValue(iter.Value())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if sv.Tombstone {
+		return nil, ErrKeyNotFound
+	}
+	if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
+		return nil, ErrKeyNotFound
+	}
+	return s.decryptForKey(k, sv.EncState, sv.Value)
 }
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -700,9 +750,13 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 	}
 
 	if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
+		plain, err := s.decryptForKey(iter.Key(), sv.EncState, sv.Value)
+		if err != nil {
+			return nil, err
+		}
 		return &KVPair{
 			Key:   userKey,
-			Value: sv.Value,
+			Value: plain,
 		}, nil
 	}
 	return nil, nil
@@ -937,7 +991,11 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	v := encodeValue(value, false, expireAt)
+	body, encState, err := s.encryptForKey(k, value)
+	if err != nil {
+		return err
+	}
+	v := encodeValue(body, false, expireAt, encState)
 
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil { //nolint:wrapcheck
 		return errors.WithStack(err)
@@ -952,7 +1010,7 @@ func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64)
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	v := encodeValue(nil, true, 0)
+	v := encodeValue(nil, true, 0, encStateCleartext)
 
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
@@ -978,7 +1036,11 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 	commitTS = s.alignCommitTS(commitTS)
 	k := encodeKey(key, commitTS)
-	v := encodeValue(val, false, expireAt)
+	body, encState, err := s.encryptForKey(k, val)
+	if err != nil {
+		return err
+	}
+	v := encodeValue(body, false, expireAt, encState)
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
@@ -1075,9 +1137,13 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 			if err := validateValueSize(mut.Value); err != nil {
 				return err
 			}
-			v = encodeValue(mut.Value, false, mut.ExpireAt)
+			body, encState, encErr := s.encryptForKey(k, mut.Value)
+			if encErr != nil {
+				return encErr
+			}
+			v = encodeValue(body, false, mut.ExpireAt, encState)
 		case OpTypeDelete:
-			v = encodeValue(nil, true, 0)
+			v = encodeValue(nil, true, 0, encStateCleartext)
 		default:
 			return ErrUnknownOp
 		}
@@ -1240,7 +1306,7 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 }
 
 func (s *pebbleStore) scanDeletePrefix(iter *pebble.Iterator, batch *pebble.Batch, prefix, excludePrefix []byte, commitTS uint64) error {
-	tombstoneVal := encodeValue(nil, true, 0)
+	tombstoneVal := encodeValue(nil, true, 0, encStateCleartext)
 
 	for iter.SeekGE(encodeKey(prefix, math.MaxUint64)); iter.Valid(); {
 		userKey, version, ok := nextScannableUserKey(iter)
@@ -1625,7 +1691,14 @@ func flushSnapshotBatch(db *pebble.DB, batch **pebble.Batch, opts *pebble.WriteO
 func setEncodedVersionInBatch(batch *pebble.Batch, key []byte, version VersionedValue) error {
 	deferred := batch.SetDeferred(encodedKeyLen(key), encodedValueLen(len(version.Value)))
 	fillEncodedKey(deferred.Key, key, version.TS)
-	fillEncodedValue(deferred.Value, version.Value, version.Tombstone, version.ExpireAt)
+	// MVCC snapshot format v2 does not carry encryption_state — Stage 8 of
+	// the encryption rollout (per docs/design/2026_04_29_proposed...) bumps
+	// the format to v3 to round-trip encrypted entries through this path.
+	// Until then, restored versions are written as cleartext and any node
+	// snapshotting/restoring an encrypted dataset must use the native
+	// Pebble snapshot path (snapshot_pebble.go), which ships raw bytes
+	// and thus preserves the on-disk envelope verbatim.
+	fillEncodedValue(deferred.Value, version.Value, version.Tombstone, version.ExpireAt, encStateCleartext)
 	return errors.WithStack(deferred.Finish())
 }
 
