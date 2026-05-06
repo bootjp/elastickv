@@ -106,6 +106,21 @@ type SQSMetrics struct {
 	mu                   sync.Mutex
 	trackedCounterQueues map[string]struct{}
 	trackedDepthQueues   map[string]struct{}
+	// overflowDepthQueues is the set of queue names whose depth
+	// gauge is currently collapsed onto the shared sqsQueueOverflow
+	// label. Tracked separately from trackedDepthQueues (which
+	// only holds real-name admissions) so ForgetQueue can ref-count
+	// overflow queues and drop the shared _other gauge once the
+	// last overflow queue disappears. Without this, churn-heavy
+	// deployments with >sqsMaxTrackedQueues distinct queues leave
+	// the dashboard pinned at whichever overflow queue last
+	// reported, even after every overflow queue has been deleted.
+	// Counter side has no equivalent map: counter series are
+	// cumulative (never deleted), so the _other counter can't
+	// produce phantom data — it correctly reflects the cumulative
+	// count of all overflow operations, even from queues that no
+	// longer exist.
+	overflowDepthQueues map[string]struct{}
 }
 
 // SQS depth gauge state-label values. Stable so dashboards / alerts
@@ -134,6 +149,7 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 		),
 		trackedCounterQueues: map[string]struct{}{},
 		trackedDepthQueues:   map[string]struct{}{},
+		overflowDepthQueues:  map[string]struct{}{},
 	}
 	registerer.MustRegister(m.partitionMessages)
 	registerer.MustRegister(m.queueDepth)
@@ -190,33 +206,47 @@ func (m *SQSMetrics) ObserveQueueDepth(queue string, visible, notVisible, delaye
 // its slot in the depth-side cardinality budget so a long-running
 // deployment that regularly creates and deletes queues (CI
 // workloads, ephemeral per-job queues) doesn't permanently wedge
-// the 512-entry depth budget. Without the trackedDepthQueues
-// cleanup, post-cap new queues would silently collapse onto the
-// _other label even after their predecessors had been deleted.
+// the 512-entry depth budget.
 //
-// The (queue, partition, action) counter series stays —
-// cumulative-by-design — and the queue's slot in
+// Three cases, by membership at call time:
+//
+//  1. Queue is in trackedDepthQueues (admitted under its real name):
+//     drop the three state-labelled series and free the budget slot.
+//  2. Queue is in overflowDepthQueues (admitted, then collapsed
+//     onto the shared sqsQueueOverflow / "_other" label because the
+//     budget was saturated): remove from the overflow set. If that
+//     leaves the overflow set empty, drop the three _other series
+//     too — there's no remaining queue reporting into them, so the
+//     gauge would otherwise pin phantom backlog. While the overflow
+//     set is still non-empty the _other series stays put: tearing
+//     it down would zero out values that other overflow queues are
+//     legitimately maintaining.
+//  3. Queue is in neither map (never depth-observed): no-op.
+//
+// The (queue, partition, action) counter series stays in all three
+// cases — cumulative-by-design — and the queue's slot in
 // trackedCounterQueues stays consumed. Reclaiming the counter slot
 // would let a later queue be admitted under its real name while the
 // original counter series still sat in Prometheus, which would let
 // counter cardinality grow past sqsMaxTrackedQueues under churn or
 // after a leader step-down clears the observer's lastSeen (the P1
-// finding on PR #743).
-//
-// Queues that hit the depth cap and mapped to _other have no
-// individual gauge series to delete; we detect the not-tracked case
-// and skip the DeleteLabelValues calls so we don't tear down the
-// shared _other series for an unrelated queue.
+// finding on PR #743). Counter-side _other has no equivalent of
+// the gauge phantom-backlog problem either, because cumulative
+// counters legitimately reflect total operations from queues that
+// have since been deleted.
 //
 // Caller-audit per the standing semantic-change rule: only
 // SQSObserver.observeOnce calls this (registry plumbing aside),
 // and it's invoked exactly when a queue is observed in the
 // previous tick but not the current one. The caller's contract —
 // "drop gauges for a queue that disappeared so dashboards don't
-// show frozen backlog" — is preserved. The narrowed scope (counter
-// budget no longer reclaimed) is invisible to the observer because
-// observeOnce only writes gauges; the counter side is fed by
-// ObservePartitionMessage from a different code path entirely.
+// show frozen backlog" — is preserved AND extended consistently:
+// overflow queues, previously a silent no-op, now also stop
+// pinning the shared gauge once the last one disappears. The
+// narrowed-but-still-correct scope (counter budget never
+// reclaimed) is invisible to observeOnce because the observer
+// only writes gauges; counters are fed via ObservePartitionMessage
+// from a different code path entirely.
 func (m *SQSMetrics) ForgetQueue(queue string) {
 	if m == nil || queue == "" {
 		return
@@ -226,18 +256,31 @@ func (m *SQSMetrics) ForgetQueue(queue string) {
 	if tracked {
 		delete(m.trackedDepthQueues, queue)
 	}
-	m.mu.Unlock()
-	if !tracked {
-		// Queue was either never depth-observed or had been collapsed
-		// onto the _other overflow label. Either way: no per-queue
-		// gauge series to remove, and we must NOT delete the _other
-		// series here because other overflow queues may still be
-		// sharing it.
-		return
+	// Ref-count the overflow set. The shared _other gauge series is
+	// safe to drop only when no queue is still reporting into it;
+	// while one or more overflow queues remain, the gauge carries
+	// real (last-write-wins) data for those queues.
+	_, overflow := m.overflowDepthQueues[queue]
+	if overflow {
+		delete(m.overflowDepthQueues, queue)
 	}
-	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateVisible)
-	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateNotVisible)
-	m.queueDepth.DeleteLabelValues(queue, sqsQueueStateDelayed)
+	overflowSetEmpty := overflow && len(m.overflowDepthQueues) == 0
+	m.mu.Unlock()
+	if tracked {
+		m.queueDepth.DeleteLabelValues(queue, sqsQueueStateVisible)
+		m.queueDepth.DeleteLabelValues(queue, sqsQueueStateNotVisible)
+		m.queueDepth.DeleteLabelValues(queue, sqsQueueStateDelayed)
+	}
+	if overflowSetEmpty {
+		// Last overflow queue forgotten — drop the shared _other
+		// series so dashboards stop showing phantom backlog for
+		// queues that no longer exist. Safe because no remaining
+		// queue is mapped to this label; any future overflow
+		// queue will re-create the series via ObserveQueueDepth.
+		m.queueDepth.DeleteLabelValues(sqsQueueOverflow, sqsQueueStateVisible)
+		m.queueDepth.DeleteLabelValues(sqsQueueOverflow, sqsQueueStateNotVisible)
+		m.queueDepth.DeleteLabelValues(sqsQueueOverflow, sqsQueueStateDelayed)
+	}
 }
 
 // admitForCounterBudget returns the canonical label for queue: the
@@ -264,6 +307,11 @@ func (m *SQSMetrics) admitForCounterBudget(queue string) string {
 // ForgetQueue, so a deployment that creates and deletes queues over
 // time can reuse budget for new queue names instead of permanently
 // exhausting it.
+//
+// Queues that hit the cap are recorded in overflowDepthQueues so
+// ForgetQueue can ref-count them and tear down the shared _other
+// gauge once the last one disappears (otherwise the dashboard
+// pins phantom backlog for queues that no longer exist).
 func (m *SQSMetrics) admitForDepthBudget(queue string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -271,6 +319,7 @@ func (m *SQSMetrics) admitForDepthBudget(queue string) string {
 		return queue
 	}
 	if len(m.trackedDepthQueues) >= sqsMaxTrackedQueues {
+		m.overflowDepthQueues[queue] = struct{}{}
 		return sqsQueueOverflow
 	}
 	m.trackedDepthQueues[queue] = struct{}{}

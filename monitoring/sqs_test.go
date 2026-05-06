@@ -260,6 +260,69 @@ func TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp(t *testing.T) {
 		"_other series must still carry the latest value (overflow-b)")
 }
 
+// TestSQSMetrics_ForgetQueue_LastOverflowClearsOtherGauge pins the
+// P2 found in PR #743 review: when the depth budget is saturated
+// and queues collapse onto the shared sqsQueueOverflow ("_other")
+// label, ForgetQueue must drop the _other gauge series once the
+// LAST overflow queue disappears. Otherwise a churn-heavy
+// deployment with >512 queues leaves the dashboard pinned at
+// whichever overflow queue last reported, even after every
+// overflow queue has been deleted — phantom backlog for queues
+// that no longer exist.
+//
+// Pre-fix bug: ForgetQueue early-returned for any queue not in
+// trackedDepthQueues, which lumps together "never observed" (no
+// series to delete) with "currently collapsed onto _other"
+// (series exists, shared, must drop only when ref-count hits 0).
+//
+// Post-fix expectation: track overflow queue membership
+// separately from trackedDepthQueues so ForgetQueue can
+// ref-count overflow queues and clear the shared _other gauge
+// the moment the set becomes empty.
+//
+// The single-overflow-not-empty case (don't tear down _other
+// while other overflow queues still report into it) is pinned
+// by TestSQSMetrics_ForgetQueue_OverflowQueueIsNoOp below.
+func TestSQSMetrics_ForgetQueue_LastOverflowClearsOtherGauge(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	// Saturate the depth budget with sqsMaxTrackedQueues real queues
+	// so subsequent observations collapse onto _other.
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObserveQueueDepth("real-"+strconv.Itoa(i)+".fifo", 1, 0, 0)
+	}
+
+	// Two overflow queues — both share the _other label.
+	m.ObserveQueueDepth("overflow-a.fifo", 100, 0, 0)
+	m.ObserveQueueDepth("overflow-b.fifo", 200, 0, 0)
+	require.InDelta(t, 200.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues(sqsQueueOverflow, sqsQueueStateVisible)),
+		0.001,
+		"sanity: _other gauge carries the latest overflow value")
+
+	// Forget the first overflow queue. _other must remain — the
+	// other overflow queue is still reporting into it.
+	m.ForgetQueue("overflow-a.fifo")
+	require.InDelta(t, 200.0,
+		testutil.ToFloat64(m.queueDepth.WithLabelValues(sqsQueueOverflow, sqsQueueStateVisible)),
+		0.001,
+		"_other must survive ForgetQueue while at least one overflow queue is still alive")
+
+	// Forget the last overflow queue. _other must now be gone:
+	// no overflow queue exists, so the gauge would only be showing
+	// phantom data for queues that no longer exist.
+	m.ForgetQueue("overflow-b.fifo")
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
+	require.NoError(t, err)
+	// 3 state-labelled series per queue. Only the original tracked
+	// queues should remain — _other (visible/not_visible/delayed)
+	// must be dropped now that the overflow set is empty.
+	require.Equal(t, sqsMaxTrackedQueues*3, count,
+		"only the 3 state series per real queue should remain after the last overflow queue is forgotten")
+}
+
 // TestSQSMetrics_ForgetQueue_DoesNotReclaimCounterBudget pins the
 // P1 found in PR #743 review: ForgetQueue must NOT free a counter-
 // side cardinality budget slot. The (queue, partition, action)
