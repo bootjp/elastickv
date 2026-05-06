@@ -930,11 +930,22 @@ run_container() {
   local keyviz_flags=()
   build_keyviz_flags keyviz_flags
 
+  # config-fingerprint label drives the skip check on the next deploy
+  # (see DEPLOY_CONFIG_FP_LABEL block above). Empty value here means
+  # the deploy script was run on an old layout that didn't compute one
+  # — the next pass will recompute and inject one regardless, so the
+  # missing label only "costs" one extra recreate during the upgrade.
+  local config_fp_label_flags=()
+  if [[ -n "${DEPLOY_CONFIG_FP:-}" && -n "${DEPLOY_CONFIG_FP_LABEL:-}" ]]; then
+    config_fp_label_flags=(--label "${DEPLOY_CONFIG_FP_LABEL}=${DEPLOY_CONFIG_FP}")
+  fi
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network host \
     "${memory_flags[@]}" \
+    "${config_fp_label_flags[@]}" \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
     "${sqs_creds_volume[@]}" \
@@ -1149,12 +1160,55 @@ new_image_id="$(docker image inspect "$IMAGE" --format "{{.Id}}")"
 running_image_id="$(docker inspect --format "{{.Image}}" "$CONTAINER_NAME" 2>/dev/null || true)"
 running_status="$(docker inspect --format "{{.State.Status}}" "$CONTAINER_NAME" 2>/dev/null || echo missing)"
 
-if [[ "$new_image_id" == "$running_image_id" && "$running_status" == "running" ]]; then
+# Config fingerprint: hash every variable that influences either the
+# docker run argv or the in-container elastickv flags. Pair it with a
+# matching --label on docker run; on the next deploy compare the label
+# against a freshly recomputed hash and recreate when they differ.
+# Without this, deploy.env changes that flip flags (e.g. ENABLE_SQS,
+# ADMIN_*, EXTRA_ENV) without bumping the image hash were silently
+# skipped because the previous skip check only looked at image+status.
+#
+# NUL separator + sha256sum keeps the hash injective (no value can
+# spoof the boundary). All inputs are always-present env vars so an
+# unset deploy knob hashes as the empty string consistently.
+config_fp() {
+  printf '%s\0' \
+    "$IMAGE" \
+    "$SERVER_ENTRYPOINT" \
+    "$DATA_DIR" \
+    "$NODE_HOST" "$NODE_ID" \
+    "$RAFT_ENGINE" \
+    "$RAFT_PORT" "$REDIS_PORT" "$DYNAMO_PORT" \
+    "$RAFT_TO_REDIS_MAP" \
+    "$ENABLE_S3" "$S3_PORT" "$S3_REGION" "$S3_PATH_STYLE_ONLY" \
+    "$S3_CREDENTIALS_FILE" "$RAFT_TO_S3_MAP" \
+    "$ENABLE_SQS" "$SQS_PORT" "$SQS_REGION" \
+    "$SQS_CREDENTIALS_FILE" "$RAFT_TO_SQS_MAP" "$SQS_FIFO_PARTITION_MAP" \
+    "$EXTRA_ENV" "$CONTAINER_MEMORY_LIMIT" \
+    "$ADMIN_ENABLED" "$ADMIN_ADDRESS" \
+    "$ADMIN_FULL_ACCESS_KEYS" "$ADMIN_READ_ONLY_ACCESS_KEYS" \
+    "$ADMIN_SESSION_SIGNING_KEY_FILE" "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" \
+    "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
+    "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
+    "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" \
+    | sha256sum | cut -d' ' -f1
+}
+DEPLOY_CONFIG_FP_LABEL="elastickv.deploy.config-fp"
+new_config_fp="$(config_fp)"
+running_config_fp="$(docker inspect --format "{{ index .Config.Labels \"${DEPLOY_CONFIG_FP_LABEL}\" }}" "$CONTAINER_NAME" 2>/dev/null || true)"
+export DEPLOY_CONFIG_FP="$new_config_fp"
+export DEPLOY_CONFIG_FP_LABEL
+
+if [[ "$new_image_id" == "$running_image_id" && "$running_status" == "running" \
+      && "$new_config_fp" == "$running_config_fp" ]]; then
   if grpc_healthy; then
-    echo "image unchanged and gRPC healthy; skip"
+    echo "image and config unchanged and gRPC healthy; skip"
     exit 0
   fi
   echo "container is running but gRPC is not reachable; recreating"
+fi
+if [[ -n "$running_config_fp" && "$new_config_fp" != "$running_config_fp" ]]; then
+  echo "deploy config fingerprint changed (was=${running_config_fp:0:12}, now=${new_config_fp:0:12}); recreating"
 fi
 
 require_passwordless_sudo
