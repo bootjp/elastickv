@@ -44,6 +44,31 @@ Optional environment:
     exist and be readable on every remote node; it will be bind-mounted into
     the container at the same path.
   S3_PATH_STYLE_ONLY
+
+  SQS adapter (opt-in; ENABLE_SQS=true turns the listener on)
+  ENABLE_SQS
+    Master switch (default false). When true, the script forwards
+    --sqsAddress, --sqsRegion, and --raftSqsMap (plus optional
+    --sqsCredentialsFile / --sqsFifoPartitionMap) to docker run.
+    Required for the admin /admin/api/v1/sqs/* endpoints to mount —
+    main.go gates registration on r.sqsServer != nil, which only
+    happens when --sqsAddress is non-empty.
+  SQS_PORT
+    SQS HTTP listener port on each node (default 9324, the conventional
+    SQS-compatible-server port). Mirrors S3_PORT.
+  SQS_REGION
+    SigV4 region the adapter signs against (default us-east-1).
+  SQS_CREDENTIALS_FILE
+    Optional path to a JSON credentials file on each target host
+    (same shape as S3_CREDENTIALS_FILE). Empty value runs the adapter
+    as an open endpoint — clients may sign with any credentials.
+  RAFT_TO_SQS_MAP
+    Optional override; auto-derived from NODES + RAFT_PORT + SQS_PORT
+    when ENABLE_SQS=true and the variable is empty.
+  SQS_FIFO_PARTITION_MAP
+    Optional HT-FIFO partition routing map (queue.fifo:N=group_0,...).
+    Empty value disables the capability gate's coverage check;
+    partitioned queues route to the default Raft group.
   HEALTH_TIMEOUT_SECONDS
   LEADERSHIP_TRANSFER_TIMEOUT_SECONDS
   LEADER_DISCOVERY_TIMEOUT_SECONDS
@@ -149,6 +174,21 @@ ENABLE_S3="${ENABLE_S3:-true}"
 S3_REGION="${S3_REGION:-us-east-1}"
 S3_CREDENTIALS_FILE="${S3_CREDENTIALS_FILE:-}"
 S3_PATH_STYLE_ONLY="${S3_PATH_STYLE_ONLY:-true}"
+# SQS adapter knobs (mirror the S3 shape). ENABLE_SQS is the master
+# switch; when false, no SQS-related flags are passed to the
+# container and admin SQS endpoints stay 404 because sqsServer is
+# nil. Set ENABLE_SQS=true and the script forwards
+# --sqsAddress / --sqsRegion / --raftSqsMap (and optionally
+# --sqsCredentialsFile and --sqsFifoPartitionMap) to docker run.
+ENABLE_SQS="${ENABLE_SQS:-false}"
+SQS_PORT="${SQS_PORT:-9324}"
+SQS_REGION="${SQS_REGION:-us-east-1}"
+SQS_CREDENTIALS_FILE="${SQS_CREDENTIALS_FILE:-}"
+# HT-FIFO partition routing map. Empty means "single-shard / no
+# partitioned-FIFO routing"; the capability gate's coverage check
+# is bypassed (resolver==nil) and partitioned queues land on the
+# default group. Format documented at main.go::buildSQSFifoPartitionMap.
+SQS_FIFO_PARTITION_MAP="${SQS_FIFO_PARTITION_MAP:-}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-60}"
 LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS:-30}"
 LEADER_DISCOVERY_TIMEOUT_SECONDS="${LEADER_DISCOVERY_TIMEOUT_SECONDS:-30}"
@@ -163,6 +203,7 @@ SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
+RAFT_TO_SQS_MAP="${RAFT_TO_SQS_MAP:-}"
 
 # Admin dashboard knobs. ADMIN_ENABLED is the master switch; the
 # remaining variables only take effect when ADMIN_ENABLED=true.
@@ -389,6 +430,20 @@ derive_raft_to_s3_map() {
   )
 }
 
+derive_raft_to_sqs_map() {
+  local parts=()
+  local i
+
+  for i in "${!NODE_IDS[@]}"; do
+    parts+=("${NODE_HOSTS[$i]}:${RAFT_PORT}=${NODE_HOSTS[$i]}:${SQS_PORT}")
+  done
+
+  (
+    IFS=,
+    printf '%s\n' "${parts[*]}"
+  )
+}
+
 ensure_local_raftadmin() {
   if [[ -n "$RAFTADMIN_LOCAL_BIN" ]]; then
     if [[ ! -x "$RAFTADMIN_LOCAL_BIN" ]]; then
@@ -510,6 +565,11 @@ update_one_node() {
       S3_REGION="$S3_REGION" \
       S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE_Q" \
       S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
+      ENABLE_SQS="$ENABLE_SQS" \
+      SQS_PORT="$SQS_PORT" \
+      SQS_REGION="$SQS_REGION" \
+      SQS_CREDENTIALS_FILE="$SQS_CREDENTIALS_FILE_Q" \
+      SQS_FIFO_PARTITION_MAP="$SQS_FIFO_PARTITION_MAP_Q" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
       LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
@@ -521,6 +581,7 @@ update_one_node() {
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
+      RAFT_TO_SQS_MAP="$RAFT_TO_SQS_MAP_Q" \
       EXTRA_ENV="$EXTRA_ENV_Q" \
       CONTAINER_MEMORY_LIMIT="$CONTAINER_MEMORY_LIMIT_Q" \
       ADMIN_ENABLED="$ADMIN_ENABLED" \
@@ -781,6 +842,33 @@ run_container() {
     )
   fi
 
+  # SQS adapter wiring mirrors S3: optional credentials file gets
+  # bind-mounted ro at the same host path; the rest of the SQS knobs
+  # are passed verbatim. ENABLE_SQS=false leaves all arrays empty so
+  # the docker run is byte-identical to a non-SQS deploy.
+  local sqs_creds_volume=()
+  local sqs_creds_flag=()
+  local sqs_flags=()
+  if [[ "${ENABLE_SQS}" == "true" && -n "${SQS_CREDENTIALS_FILE:-}" ]]; then
+    if [[ ! -f "$SQS_CREDENTIALS_FILE" || ! -r "$SQS_CREDENTIALS_FILE" ]]; then
+      echo "SQS_CREDENTIALS_FILE is set to '$SQS_CREDENTIALS_FILE' but the file is missing or not readable; aborting docker run" >&2
+      exit 1
+    fi
+    sqs_creds_volume=(-v "${SQS_CREDENTIALS_FILE}:${SQS_CREDENTIALS_FILE}:ro")
+    sqs_creds_flag=(--sqsCredentialsFile "$SQS_CREDENTIALS_FILE")
+  fi
+  if [[ "${ENABLE_SQS}" == "true" ]]; then
+    sqs_flags=(
+      --sqsAddress "${NODE_HOST}:${SQS_PORT}"
+      --sqsRegion "$SQS_REGION"
+      --raftSqsMap "$RAFT_TO_SQS_MAP"
+      "${sqs_creds_flag[@]}"
+    )
+    if [[ -n "${SQS_FIFO_PARTITION_MAP:-}" ]]; then
+      sqs_flags+=(--sqsFifoPartitionMap "$SQS_FIFO_PARTITION_MAP")
+    fi
+  fi
+
   # Pass through additional container environment variables from EXTRA_ENV.
   # Accepts a whitespace-separated list of KEY=VALUE pairs, e.g.:
   #   EXTRA_ENV="ELASTICKV_RAFT_DISPATCHER_LANES=1 ELASTICKV_PEBBLE_CACHE_MB=512"
@@ -849,6 +937,7 @@ run_container() {
     "${memory_flags[@]}" \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
+    "${sqs_creds_volume[@]}" \
     "${admin_volumes[@]}" \
     "${extra_env_flags[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
@@ -860,6 +949,7 @@ run_container() {
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
     "${s3_flags[@]}" \
+    "${sqs_flags[@]}" \
     "${admin_flags[@]}" \
     "${keyviz_flags[@]}" >/dev/null
 }
@@ -1115,6 +1205,10 @@ if [[ "${ENABLE_S3}" == "true" && -z "$RAFT_TO_S3_MAP" ]]; then
   RAFT_TO_S3_MAP="$(derive_raft_to_s3_map)"
 fi
 
+if [[ "${ENABLE_SQS}" == "true" && -z "$RAFT_TO_SQS_MAP" ]]; then
+  RAFT_TO_SQS_MAP="$(derive_raft_to_sqs_map)"
+fi
+
 ensure_local_raftadmin
 ensure_remote_raftadmin_binaries
 
@@ -1216,6 +1310,8 @@ EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_
 EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
 CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
+SQS_CREDENTIALS_FILE_Q="$(printf '%q' "${SQS_CREDENTIALS_FILE:-}")"
+SQS_FIFO_PARTITION_MAP_Q="$(printf '%q' "${SQS_FIFO_PARTITION_MAP:-}")"
 IMAGE_Q="$(printf '%q' "$IMAGE")"
 DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
 SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
@@ -1223,6 +1319,7 @@ RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
 RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
 RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
+RAFT_TO_SQS_MAP_Q="$(printf '%q' "$RAFT_TO_SQS_MAP")"
 
 # ADMIN_* values may contain commas (allow-lists), spaces (paths with
 # spaces, though discouraged), or other shell metacharacters. The
