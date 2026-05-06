@@ -1156,13 +1156,20 @@ type sqsDepthSourceAdapter struct {
 	inner *adapter.SQSServer
 }
 
-func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) []monitoring.SQSQueueDepth {
+func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) ([]monitoring.SQSQueueDepth, bool) {
 	if a.inner == nil {
-		return nil
+		// Empty-but-OK: nothing to emit. Mirrors the
+		// follower / nil-receiver case of the underlying source.
+		return nil, true
 	}
-	snaps := a.inner.SnapshotQueueDepths(ctx)
+	snaps, ok := a.inner.SnapshotQueueDepths(ctx)
+	if !ok {
+		// Propagate skip-tick verbatim so the observer leaves
+		// existing gauges alone on a transient scan failure.
+		return nil, false
+	}
 	if len(snaps) == 0 {
-		return nil
+		return nil, true
 	}
 	out := make([]monitoring.SQSQueueDepth, len(snaps))
 	for i, s := range snaps {
@@ -1173,7 +1180,7 @@ func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) []monito
 			Delayed:    s.Delayed,
 		}
 	}
-	return out
+	return out, true
 }
 
 // writeConflictMonitorSources extracts the MVCC stores that expose

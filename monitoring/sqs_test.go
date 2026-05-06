@@ -504,21 +504,32 @@ func TestSQSMetrics_DepthRegistryWiring(t *testing.T) {
 		"elastickv_sqs_queue_messages must be registered on the public Registry")
 }
 
-// fakeDepthSource lets the SQSObserver tests script the per-tick
-// snapshot without standing up a real SQS adapter + coordinator.
-type fakeDepthSource struct {
-	snapshots [][]SQSQueueDepth
-	calls     int
+// fakeDepthTick is one scripted return from fakeDepthSource. ok
+// mirrors the SQSDepthSource contract: false models a transient
+// scan failure that should NOT cause the observer to wipe gauges.
+type fakeDepthTick struct {
+	snaps []SQSQueueDepth
+	ok    bool
 }
 
-func (f *fakeDepthSource) SnapshotQueueDepths(_ context.Context) []SQSQueueDepth {
-	if f.calls >= len(f.snapshots) {
+// fakeDepthSource lets the SQSObserver tests script the per-tick
+// snapshot without standing up a real SQS adapter + coordinator.
+// Past the scripted ticks, returns the empty-OK sentinel so trailing
+// observeOnce calls drain to a clean state rather than blowing up
+// with an out-of-range index.
+type fakeDepthSource struct {
+	ticks []fakeDepthTick
+	calls int
+}
+
+func (f *fakeDepthSource) SnapshotQueueDepths(_ context.Context) ([]SQSQueueDepth, bool) {
+	if f.calls >= len(f.ticks) {
 		f.calls++
-		return nil
+		return nil, true
 	}
-	out := f.snapshots[f.calls]
+	t := f.ticks[f.calls]
 	f.calls++
-	return out
+	return t.snaps, t.ok
 }
 
 // TestSQSObserver_ObserveOnce_EmitsAndForgets pins the observer's
@@ -533,16 +544,17 @@ func TestSQSObserver_ObserveOnce_EmitsAndForgets(t *testing.T) {
 	obs := newSQSObserver(m)
 
 	source := &fakeDepthSource{
-		snapshots: [][]SQSQueueDepth{
-			// tick 1: two queues
-			{
+		ticks: []fakeDepthTick{
+			// tick 1: two queues, scrape OK.
+			{snaps: []SQSQueueDepth{
 				{Queue: "orders.fifo", Visible: 5, NotVisible: 2, Delayed: 0},
 				{Queue: "audio.fifo", Visible: 0, NotVisible: 0, Delayed: 3},
-			},
-			// tick 2: orders.fifo disappeared
-			{
+			}, ok: true},
+			// tick 2: orders.fifo disappeared from the snapshot,
+			// scrape OK.
+			{snaps: []SQSQueueDepth{
 				{Queue: "audio.fifo", Visible: 1, NotVisible: 0, Delayed: 0},
-			},
+			}, ok: true},
 		},
 	}
 
@@ -571,12 +583,15 @@ func TestSQSObserver_ObserveOnce_LeaderStepDownClearsAll(t *testing.T) {
 	obs := newSQSObserver(m)
 
 	source := &fakeDepthSource{
-		snapshots: [][]SQSQueueDepth{
-			{
+		ticks: []fakeDepthTick{
+			{snaps: []SQSQueueDepth{
 				{Queue: "orders.fifo", Visible: 5},
 				{Queue: "audio.fifo", Visible: 1},
-			},
-			nil, // leader stepped down
+			}, ok: true},
+			// Leader stepped down: empty snapshot, but ok=true so
+			// the observer ForgetQueue's the gauges from tick 1
+			// rather than skipping the diff.
+			{snaps: nil, ok: true},
 		},
 	}
 	obs.ObserveOnce(source)
@@ -588,6 +603,69 @@ func TestSQSObserver_ObserveOnce_LeaderStepDownClearsAll(t *testing.T) {
 	count, err = testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "tick 2 (leader step-down): all gauges cleared")
+}
+
+// TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges
+// pins the P2 fix from PR #743 r6: when the source returns
+// ok=false (transient catalog-scan failure on the leader, ctx
+// cancel mid-scan), the observer must NOT diff against the
+// previous tick or call ForgetQueue. The existing gauges should
+// keep their last successful values until a later successful
+// scrape — otherwise a single failed catalog read renders a
+// false "all queues drained" event on the dashboard for the
+// entire duration of the failure.
+//
+// Pre-fix shape: SnapshotQueueDepths returned bare nil on scan
+// failure, observeOnce treated bare nil as "no queues exist now"
+// and ForgetQueue'd every previously-seen queue. Post-fix shape:
+// the two cases are distinguishable via the ok return; observer
+// short-circuits when ok=false and leaves both the gauges and
+// the lastSeen map untouched.
+func TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+	obs := newSQSObserver(m)
+
+	source := &fakeDepthSource{
+		ticks: []fakeDepthTick{
+			// tick 1: two queues, scrape OK.
+			{snaps: []SQSQueueDepth{
+				{Queue: "orders.fifo", Visible: 5},
+				{Queue: "audio.fifo", Visible: 1},
+			}, ok: true},
+			// tick 2: scan failed — observer must skip.
+			{snaps: nil, ok: false},
+			// tick 3: scan recovered, both queues still present.
+			{snaps: []SQSQueueDepth{
+				{Queue: "orders.fifo", Visible: 7},
+				{Queue: "audio.fifo", Visible: 2},
+			}, ok: true},
+		},
+	}
+
+	obs.ObserveOnce(source)
+	require.InDelta(t, 5.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("orders.fifo", sqsQueueStateVisible)), 0.001)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("audio.fifo", sqsQueueStateVisible)), 0.001)
+
+	obs.ObserveOnce(source)
+	// Pre-fix: orders/audio gauges would be wiped via ForgetQueue.
+	// Post-fix: gauges still carry tick-1 values.
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
+	require.NoError(t, err)
+	require.Equal(t, 6, count, "transient scan failure must preserve existing gauges (2 queues × 3 states = 6)")
+	require.InDelta(t, 5.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("orders.fifo", sqsQueueStateVisible)), 0.001,
+		"orders.fifo gauge must keep its tick-1 value while the scan is failing")
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("audio.fifo", sqsQueueStateVisible)), 0.001,
+		"audio.fifo gauge must keep its tick-1 value while the scan is failing")
+
+	obs.ObserveOnce(source)
+	// Tick 3 recovery: both queues still present so neither is
+	// forgotten; gauges update to the new values. The lastSeen
+	// map kept its tick-1 contents through the failed tick, so
+	// no spurious ForgetQueue happens here either.
+	require.InDelta(t, 7.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("orders.fifo", sqsQueueStateVisible)), 0.001)
+	require.InDelta(t, 2.0, testutil.ToFloat64(m.queueDepth.WithLabelValues("audio.fifo", sqsQueueStateVisible)), 0.001)
 }
 
 // TestSQSObserver_NilTolerant pins that nil observer / nil source

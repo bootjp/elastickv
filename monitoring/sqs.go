@@ -53,11 +53,29 @@ type SQSPartitionObserver interface {
 // Mirrors the Raft observer's StatusReader / ConfigReader pattern
 // (monitoring/raft.go): the source returns ready-to-use snapshots
 // and the observer owns the gauge state machine (forget-on-disappear,
-// cardinality cap). Implementations return an empty slice — not an
-// error — when this node is a follower, so the dashboard's gauge
-// set always mirrors what the leader's catalog scan would report.
+// cardinality cap).
+//
+// Two distinct empty-snapshot states, signalled by ok:
+//
+//   - ok=true with an empty/nil slice — "this source legitimately
+//     has no queues this tick". Triggers when the node is a
+//     follower (leader-only emission) or the leader genuinely has
+//     zero queues configured. The observer diffs against the
+//     previous tick and ForgetQueue's any queue that disappeared
+//     so a former leader's gauges are cleared on step-down.
+//
+//   - ok=false (regardless of the slice contents) — "the source
+//     could not produce a snapshot this tick" (transient catalog-
+//     read failure on the leader, context cancelled mid-scan).
+//     The observer must skip the diff entirely: leave existing
+//     gauges in place AND leave lastSeen untouched so the next
+//     successful tick can still diff against the previous good
+//     state. Without this branch a single failed scrape would
+//     wipe every depth gauge and produce a false "all queues
+//     drained" event on the dashboard until the next successful
+//     tick.
 type SQSDepthSource interface {
-	SnapshotQueueDepths(ctx context.Context) []SQSQueueDepth
+	SnapshotQueueDepths(ctx context.Context) (snaps []SQSQueueDepth, ok bool)
 }
 
 // SQSQueueDepth is one queue's depth-attribute snapshot. Mirrors
@@ -438,7 +456,17 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	if o == nil || o.metrics == nil || source == nil {
 		return
 	}
-	snaps := source.SnapshotQueueDepths(ctx)
+	snaps, ok := source.SnapshotQueueDepths(ctx)
+	if !ok {
+		// Source signalled "skip this tick" (transient catalog-scan
+		// failure on the leader, ctx cancel mid-scan). Leave
+		// existing gauges + lastSeen untouched so the dashboard
+		// keeps the last successful snapshot rather than rendering
+		// a false "all queues drained" event for the duration of
+		// the failure. The next successful tick will diff against
+		// the same lastSeen we leave behind here.
+		return
+	}
 	current := make(map[string]struct{}, len(snaps))
 	for _, snap := range snaps {
 		o.metrics.ObserveQueueDepth(snap.Queue, snap.Visible, snap.NotVisible, snap.Delayed)
