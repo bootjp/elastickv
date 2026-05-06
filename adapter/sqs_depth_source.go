@@ -41,12 +41,19 @@ func (s *SQSServer) SnapshotQueueDepths(ctx context.Context) []SQSQueueDepth {
 		slog.Warn("sqs depth snapshot: scanQueueNames failed", "err", err)
 		return nil
 	}
+	// Take a single read timestamp for the whole tick so all queues
+	// in this snapshot share the same MVCC view. With per-queue
+	// nextTxnReadTS the first queue's read could see a state the
+	// last queue's read can't (catalog mutation between calls), and
+	// every call burns an HLC tick on the leader. One ts per tick
+	// is both more consistent and lighter on the leader's HLC.
+	readTS := s.nextTxnReadTS(ctx)
 	out := make([]SQSQueueDepth, 0, len(names))
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
 			return out
 		}
-		if snap, ok := s.snapshotOneQueueDepth(ctx, name); ok {
+		if snap, ok := s.snapshotOneQueueDepth(ctx, name, readTS); ok {
 			out = append(out, snap)
 		}
 	}
@@ -54,15 +61,14 @@ func (s *SQSServer) SnapshotQueueDepths(ctx context.Context) []SQSQueueDepth {
 }
 
 // snapshotOneQueueDepth runs the per-queue catalog read pair
-// (loadQueueMetaAt + scanApproxCounters) and returns the resulting
-// snapshot. Pulled out of the loop body so SnapshotQueueDepths
-// stays under the cyclop budget; ok=false means "skip this queue
-// from this tick" (queue gone, transient catalog read failure).
-// Per-queue scan errors are logged and the offending queue is
-// dropped from this tick's snapshot rather than aborting the
-// entire pass.
-func (s *SQSServer) snapshotOneQueueDepth(ctx context.Context, name string) (SQSQueueDepth, bool) {
-	readTS := s.nextTxnReadTS(ctx)
+// (loadQueueMetaAt + scanApproxCounters) at the caller-supplied
+// readTS and returns the resulting snapshot. Pulled out of the
+// loop body so SnapshotQueueDepths stays under the cyclop budget;
+// ok=false means "skip this queue from this tick" (queue gone,
+// transient catalog read failure). Per-queue scan errors are
+// logged and the offending queue is dropped from this tick's
+// snapshot rather than aborting the entire pass.
+func (s *SQSServer) snapshotOneQueueDepth(ctx context.Context, name string, readTS uint64) (SQSQueueDepth, bool) {
 	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
 	if err != nil || !exists {
 		return SQSQueueDepth{}, false
