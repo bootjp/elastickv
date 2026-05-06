@@ -142,6 +142,8 @@ Notes:
     RAFT_PORT, and REDIS_PORT.
   - If RAFT_TO_S3_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and S3_PORT.
+  - If RAFT_TO_SQS_MAP is unset and ENABLE_SQS=true, it is derived
+    automatically from NODES, RAFT_PORT, and SQS_PORT.
   - If RAFTADMIN_BIN is set, it must already be executable on the local control host.
 EOF
 }
@@ -235,7 +237,7 @@ KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
 # who typed "True", "1", or a stray quote sees a script-level error
 # pointing at the variable name instead of an inscrutable failure
 # inside the SSH heredoc.
-for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED; do
+for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED ENABLE_S3 ENABLE_SQS; do
   case "${!_bool_var}" in
     true|false) ;;
     *)
@@ -566,8 +568,8 @@ update_one_node() {
       S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE_Q" \
       S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
       ENABLE_SQS="$ENABLE_SQS" \
-      SQS_PORT="$SQS_PORT" \
-      SQS_REGION="$SQS_REGION" \
+      SQS_PORT="$SQS_PORT_Q" \
+      SQS_REGION="$SQS_REGION_Q" \
       SQS_CREDENTIALS_FILE="$SQS_CREDENTIALS_FILE_Q" \
       SQS_FIFO_PARTITION_MAP="$SQS_FIFO_PARTITION_MAP_Q" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
@@ -1366,6 +1368,15 @@ CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
 SQS_CREDENTIALS_FILE_Q="$(printf '%q' "${SQS_CREDENTIALS_FILE:-}")"
 SQS_FIFO_PARTITION_MAP_Q="$(printf '%q' "${SQS_FIFO_PARTITION_MAP:-}")"
+# Scalar SQS knobs are not bool-validated (port can be any uint16,
+# region can be any AWS-style region string), so they go through
+# printf '%q' before crossing the SSH boundary. ENABLE_SQS itself
+# is bool-validated at the top of the script, so it stays unquoted
+# alongside ADMIN_ENABLED / KEYVIZ_ENABLED for readability — same
+# rule the validation comment documents. Closes Gemini security-
+# high finding on PR #741.
+SQS_PORT_Q="$(printf '%q' "$SQS_PORT")"
+SQS_REGION_Q="$(printf '%q' "$SQS_REGION")"
 IMAGE_Q="$(printf '%q' "$IMAGE")"
 DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
 SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
