@@ -68,10 +68,25 @@ func WithEncryption(cipher *encryption.Cipher, nf NonceFactory, activeKeyID Acti
 // encryption key is active for the storage purpose. Returns
 // (plaintext, encStateCleartext, nil) when encryption is disabled or
 // no DEK is currently active so the cipher=nil fast path stays a
-// single branch. AAD binds the ciphertext to the envelope header AND
-// the encoded Pebble key, defeating cut-and-paste / version
-// substitution per §4.1 case 2/3.
-func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte) ([]byte, byte, error) {
+// single branch.
+//
+// AAD binds the ciphertext to:
+//
+//   - the envelope header (envelope_version, flag, key_id),
+//   - the encoded Pebble key (defeats cut-and-paste / version
+//     substitution per §4.1 case 2/3),
+//   - the on-disk value-header bytes (tombstone bit,
+//     encryption_state, expireAt). Without binding the value-header,
+//     a disk attacker could flip the tombstone bit or lower expireAt
+//     to force GetAt/scan into a silent ErrKeyNotFound/expired
+//     branch BEFORE any AEAD verification runs (PR742 codex P1).
+//
+// The expireAt argument is the value the caller will write into the
+// resulting storage entry; tombstone is hard-coded false because the
+// encrypt path is never invoked for tombstone writes (deletes carry
+// no plaintext and are emitted as cleartext by the store
+// already).
+func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64) ([]byte, byte, error) {
 	if s.cipher == nil || s.activeStorageKeyID == nil {
 		return plaintext, encStateCleartext, nil
 	}
@@ -86,13 +101,9 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte) ([]byte, byte, 
 	nonce := nonceArr[:]
 	// flag = 0: Snappy compression deferred to Stage 9 per design §4.1.
 	const envelopeFlag byte = 0
-	// Pre-size the AAD buffer to header + Pebble key so neither
-	// AppendHeaderAADBytes nor the subsequent append re-allocate on
-	// the hot path. The Pebble key length is bounded by
-	// maxPebbleEncodedKeySize, so the capacity is finite.
-	aad := make([]byte, 0, encryption.HeaderAADSize+len(pebbleKey))
-	aad = encryption.AppendHeaderAADBytes(aad, encryption.EnvelopeVersionV1, envelopeFlag, keyID)
-	aad = append(aad, pebbleKey...)
+	var hdr [valueHeaderSize]byte
+	writeValueHeaderBytes(hdr[:], false /*tombstone*/, expireAt, encStateEncrypted)
+	aad := buildStorageAAD(encryption.EnvelopeVersionV1, envelopeFlag, keyID, hdr[:], pebbleKey)
 	ciphertextAndTag, err := s.cipher.Encrypt(plaintext, aad, keyID, nonce)
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "store: encrypt value")
@@ -113,16 +124,22 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte) ([]byte, byte, 
 
 // decryptForKey is the read-side counterpart. encState=0 returns the
 // body verbatim; encState=1 decodes the envelope, recomputes the AAD
-// against the supplied pebbleKey, and unwraps via the cipher. A GCM
-// tag mismatch surfaces as ErrEncryptedReadIntegrity — callers MUST
-// NOT silently translate this into "key not found" or "empty value"
-// because that would let a disk attacker who flipped a tag bit
-// silently corrupt reads.
+// (header + value-header + pebble key), and unwraps via the cipher.
+// A GCM tag mismatch surfaces as ErrEncryptedReadIntegrity — callers
+// MUST NOT silently translate this into "key not found" or "empty
+// value" because that would let a disk attacker who flipped a tag
+// bit (or any AAD-bound header field) silently corrupt reads.
 //
 // Reserved encryption_state values are rejected upstream in
 // decodeValue, so this function only sees the two valid states.
-func (s *pebbleStore) decryptForKey(pebbleKey []byte, encState byte, body []byte) ([]byte, error) {
-	if encState == encStateCleartext {
+//
+// sv is the storedValue freshly decoded from the on-disk bytes; its
+// Tombstone, ExpireAt, and EncState are reproduced into the AAD so
+// any flip on disk fails GCM verification. Callers MUST run
+// tombstone / expireAt visibility checks AFTER decrypt succeeds —
+// the values they observe pre-decrypt are not yet authenticated.
+func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byte) ([]byte, error) {
+	if sv.EncState == encStateCleartext {
 		return body, nil
 	}
 	if s.cipher == nil {
@@ -132,13 +149,9 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, encState byte, body []byte
 	if err != nil {
 		return nil, errors.Wrap(err, "store: decode envelope")
 	}
-	// Pre-size the AAD buffer (header + Pebble key) so neither
-	// append re-allocates. Symmetric with encryptForKey above; the
-	// AAD must be byte-identical between the two paths or GCM tag
-	// verification fails.
-	aad := make([]byte, 0, encryption.HeaderAADSize+len(pebbleKey))
-	aad = encryption.AppendHeaderAADBytes(aad, env.Version, env.Flag, env.KeyID)
-	aad = append(aad, pebbleKey...)
+	var hdr [valueHeaderSize]byte
+	writeValueHeaderBytes(hdr[:], sv.Tombstone, sv.ExpireAt, sv.EncState)
+	aad := buildStorageAAD(env.Version, env.Flag, env.KeyID, hdr[:], pebbleKey)
 	plain, err := s.cipher.Decrypt(env.Body, aad, env.KeyID, env.Nonce[:])
 	if err != nil {
 		if errors.Is(err, encryption.ErrIntegrity) {
@@ -149,4 +162,22 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, encState byte, body []byte
 		return nil, errors.Wrap(err, "store: decrypt value")
 	}
 	return plain, nil
+}
+
+// buildStorageAAD composes the §4.1 storage-envelope AAD with a
+// single allocation. Layout:
+//
+//	envelope_version ‖ flag ‖ key_id ‖ value_header(9B) ‖ pebble_key
+//
+// Pre-sizing avoids the double-allocation gemini medium flagged on
+// PR742 round-1 (AppendHeaderAADBytes alloc + the subsequent
+// append). The value-header inclusion was added in round-2 in
+// response to the codex P1 finding that flipping tombstone / expireAt
+// would otherwise bypass GCM verification.
+func buildStorageAAD(version, flag byte, keyID uint32, header, pebbleKey []byte) []byte {
+	aad := make([]byte, 0, encryption.HeaderAADSize+len(header)+len(pebbleKey))
+	aad = encryption.AppendHeaderAADBytes(aad, version, flag, keyID)
+	aad = append(aad, header...)
+	aad = append(aad, pebbleKey...)
+	return aad
 }

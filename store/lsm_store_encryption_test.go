@@ -347,6 +347,73 @@ func TestEncryption_TagTamper(t *testing.T) {
 	}
 }
 
+// TestEncryption_ValueHeaderTamperRejected is the PR742 codex P1
+// regression: the value-header (tombstone bit + encryption_state +
+// expireAt) is bound into the storage envelope's AAD so a disk
+// attacker who flips any of those fields fails GCM verification
+// and surfaces ErrEncryptedReadIntegrity, NOT a silent
+// ErrKeyNotFound or expired-skip. The original AAD only bound the
+// envelope header + Pebble key, leaving these three header fields
+// as a tamper bypass.
+func TestEncryption_ValueHeaderTamperRejected(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		mutate  func(raw []byte) []byte
+		summary string
+	}{
+		{
+			name:    "tombstone bit flipped",
+			summary: "would otherwise force silent ErrKeyNotFound on a live encrypted record",
+			mutate: func(raw []byte) []byte {
+				raw[0] |= 0b0000_0001 // set tombstone bit
+				return raw
+			},
+		},
+		{
+			name:    "expireAt lowered to past",
+			summary: "would otherwise force a silent expired-skip on a live encrypted record",
+			mutate: func(raw []byte) []byte {
+				// Overwrite the 8-byte expireAt with a past timestamp;
+				// before the AAD fix this was a free attack vector.
+				past := []byte{0x01, 0, 0, 0, 0, 0, 0, 0}
+				copy(raw[1:1+timestampSize], past)
+				return raw
+			},
+		},
+		{
+			name:    "expireAt advanced",
+			summary: "asymmetric — but any change must still fail closed",
+			mutate: func(raw []byte) []byte {
+				future := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}
+				copy(raw[1:1+timestampSize], future)
+				return raw
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEncryptedStoreFixture(t, 1009)
+			ctx := context.Background()
+			// Use a future-but-finite expireAt so a "lower to past"
+			// mutation has somewhere to go AND so the original entry
+			// is live (expireAt > read ts).
+			const writeTS uint64 = 100
+			const readTS uint64 = 200
+			const liveExpireAt uint64 = 1_000_000
+			if err := f.mvcc.PutAt(ctx, []byte("vh"), []byte("payload"), writeTS, liveExpireAt); err != nil {
+				t.Fatalf("PutAt: %v", err)
+			}
+			f.tamperPebbleValue(t, []byte("vh"), writeTS, tc.mutate)
+			_, err := f.mvcc.GetAt(ctx, []byte("vh"), readTS)
+			if !errors.Is(err, ErrEncryptedReadIntegrity) {
+				t.Fatalf("%s: expected ErrEncryptedReadIntegrity (%s), got %v",
+					tc.name, tc.summary, err)
+			}
+		})
+	}
+}
+
 // TestEncryption_ReservedEncStateRejected is the §7.1 trip-wire test:
 // a value-header byte carrying encryption_state=0b10 (or 0b11) is
 // rejected by decodeValue with ErrEncryptedValueReservedState. An

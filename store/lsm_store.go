@@ -417,6 +417,18 @@ func encodedValueLen(valueLen int) int {
 }
 
 func fillEncodedValue(dst []byte, val []byte, tombstone bool, expireAt uint64, encState byte) {
+	writeValueHeaderBytes(dst, tombstone, expireAt, encState)
+	copy(dst[valueHeaderSize:], val)
+}
+
+// writeValueHeaderBytes writes only the 9-byte value-header (flags +
+// expireAt) into dst[0:valueHeaderSize]. Extracted from fillEncodedValue
+// so the encryption path (encryption_glue.go) can reproduce the
+// header bytes for AAD without having a body slice in hand: the AAD
+// must bind tombstone, encryption_state, and expireAt so a disk
+// attacker cannot flip those fields to force a silent
+// ErrKeyNotFound / expired read on an encrypted record.
+func writeValueHeaderBytes(dst []byte, tombstone bool, expireAt uint64, encState byte) {
 	var flags byte
 	if tombstone {
 		flags |= tombstoneMask
@@ -424,7 +436,6 @@ func fillEncodedValue(dst []byte, val []byte, tombstone bool, expireAt uint64, e
 	flags |= (encState << encStateShift) & encStateMask
 	dst[0] = flags
 	binary.LittleEndian.PutUint64(dst[1:], expireAt)
-	copy(dst[valueHeaderSize:], val)
 }
 
 func decodeValue(data []byte) (storedValue, error) {
@@ -700,8 +711,16 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 
 // readVisibleVersion examines the iterator's current entry and
 // returns the live plaintext value at ts, or ErrKeyNotFound if the
-// entry is a different user key, a tombstone, or expired. Decrypts
-// when the value's encryption_state bit indicates an encrypted body.
+// entry is a different user key, a tombstone, or expired.
+//
+// For encrypted entries the decrypt step runs BEFORE the
+// tombstone/expireAt visibility checks. The AAD passed to Decrypt
+// includes the on-disk value-header (tombstone bit + encryption_state
+// + expireAt), so a disk attacker cannot flip those fields to force
+// a silent ErrKeyNotFound/expired branch — any tamper either fails
+// GCM (returns ErrEncryptedReadIntegrity) or matches the original
+// values, in which case the visibility checks below are operating
+// on authenticated bytes.
 func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts uint64) ([]byte, error) {
 	k := iter.Key()
 	userKey, _ := decodeKeyView(k)
@@ -712,13 +731,17 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	plain, err := s.decryptForKey(k, sv, sv.Value)
+	if err != nil {
+		return nil, err
+	}
 	if sv.Tombstone {
 		return nil, ErrKeyNotFound
 	}
 	if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
 		return nil, ErrKeyNotFound
 	}
-	return s.decryptForKey(k, sv.EncState, sv.Value)
+	return plain, nil
 }
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -749,11 +772,16 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 		return nil, err
 	}
 
+	// Decrypt before the tombstone/expireAt visibility checks so the
+	// per-value AAD authenticates the header bits we are about to
+	// branch on. See readVisibleVersion for the matching rationale
+	// (PR742 codex P1: a flipped tombstone or lowered expireAt would
+	// otherwise force a silent skip on an encrypted entry).
+	plain, err := s.decryptForKey(iter.Key(), sv, sv.Value)
+	if err != nil {
+		return nil, err
+	}
 	if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
-		plain, err := s.decryptForKey(iter.Key(), sv.EncState, sv.Value)
-		if err != nil {
-			return nil, err
-		}
 		return &KVPair{
 			Key:   userKey,
 			Value: plain,
@@ -991,7 +1019,7 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	body, encState, err := s.encryptForKey(k, value)
+	body, encState, err := s.encryptForKey(k, value, expireAt)
 	if err != nil {
 		return err
 	}
@@ -1036,7 +1064,7 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 	commitTS = s.alignCommitTS(commitTS)
 	k := encodeKey(key, commitTS)
-	body, encState, err := s.encryptForKey(k, val)
+	body, encState, err := s.encryptForKey(k, val, expireAt)
 	if err != nil {
 		return err
 	}
@@ -1137,7 +1165,7 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 			if err := validateValueSize(mut.Value); err != nil {
 				return err
 			}
-			body, encState, encErr := s.encryptForKey(k, mut.Value)
+			body, encState, encErr := s.encryptForKey(k, mut.Value, mut.ExpireAt)
 			if encErr != nil {
 				return encErr
 			}
