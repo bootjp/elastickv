@@ -774,9 +774,9 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 
 	// Decrypt before the tombstone/expireAt visibility checks so the
 	// per-value AAD authenticates the header bits we are about to
-	// branch on. See readVisibleVersion for the matching rationale
-	// (PR742 codex P1: a flipped tombstone or lowered expireAt would
-	// otherwise force a silent skip on an encrypted entry).
+	// branch on. See readVisibleVersion for the matching rationale:
+	// a flipped tombstone or lowered expireAt would otherwise force
+	// a silent skip on an encrypted entry.
 	plain, err := s.decryptForKey(iter.Key(), sv, sv.Value)
 	if err != nil {
 		return nil, err
@@ -1685,9 +1685,9 @@ func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, er
 	// encrypted row is value-header(9B) + envelope-overhead(34B) +
 	// ciphertext. The cap must accommodate envelope overhead so a
 	// plaintext written at maxSnapshotValueSize round-trips through
-	// snapshot restore — codex P1 PR742 round-7 caught a case where
-	// validateValueSize accepts the plaintext but restore rejects
-	// the encrypted body with ErrValueTooLarge.
+	// snapshot restore — without it, validateValueSize accepts the
+	// plaintext but restore rejects the encrypted body with
+	// ErrValueTooLarge.
 	vLen, err = readRestoreFieldLen(r, "snapshot value",
 		maxSnapshotValueSize+valueHeaderSize+encryption.EnvelopeOverhead)
 	if err != nil {

@@ -18,13 +18,12 @@ var ErrEncryptedReadIntegrity = errors.New("store: encrypted value failed integr
 // the storage layer just calls Next() and uses what comes back.
 //
 // Stage 7 of the encryption rollout will replace the in-tree
-// reference implementation (deterministicCounterNonce, defined in the
-// _test.go helper) with a writer-registry-backed factory that
-// guarantees uniqueness across voters, learners, and historical
-// replicas. The interface stays the same; only the construction
-// changes. Implementations MUST NOT return the same nonce twice
-// under the same DEK — AES-GCM nonce reuse is catastrophic
-// (see encryption.Cipher doc).
+// reference implementation (CounterNonceFactory) with a
+// writer-registry-backed factory that guarantees uniqueness across
+// voters, learners, and historical replicas. The interface stays
+// the same; only the construction changes. Implementations MUST
+// NOT return the same nonce twice under the same DEK — AES-GCM
+// nonce reuse is catastrophic (see encryption.Cipher doc).
 type NonceFactory interface {
 	Next() ([encryption.NonceSize]byte, error)
 }
@@ -79,7 +78,7 @@ func WithEncryption(cipher *encryption.Cipher, nf NonceFactory, activeKeyID Acti
 //     encryption_state, expireAt). Without binding the value-header,
 //     a disk attacker could flip the tombstone bit or lower expireAt
 //     to force GetAt/scan into a silent ErrKeyNotFound/expired
-//     branch BEFORE any AEAD verification runs (PR742 codex P1).
+//     branch BEFORE any AEAD verification runs.
 //
 // The expireAt argument is the value the caller will write into the
 // resulting storage entry; tombstone is hard-coded false because the
@@ -122,30 +121,19 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 	return encoded, encStateEncrypted, nil
 }
 
-// decryptForKey is the read-side counterpart. encState=0 returns the
-// body verbatim (with the envelope-shaped fingerprint check below);
-// encState=1 decodes the envelope, recomputes the AAD (header +
-// value-header + pebble key), and unwraps via the cipher. A GCM tag
-// mismatch surfaces as ErrEncryptedReadIntegrity — callers MUST NOT
-// silently translate this into "key not found" or "empty value"
-// because that would let a disk attacker who flipped a tag bit (or
-// any AAD-bound header field) silently corrupt reads.
+// decryptForKey is the read-side counterpart of encryptForKey.
+// encState=cleartext returns the body verbatim after the
+// envelope-rebadge guard below; encState=encrypted decodes the
+// envelope, reconstructs the AAD over (header + value-header +
+// pebble key), and unwraps via the cipher.
+//
+// A GCM tag mismatch surfaces as ErrEncryptedReadIntegrity. Callers
+// MUST NOT silently translate this into "key not found" or "empty
+// value" because that would let a disk attacker who flipped a tag
+// bit (or any AAD-bound header field) silently corrupt reads.
 //
 // Reserved encryption_state values are rejected upstream in
 // decodeValue, so this function only sees the two valid states.
-//
-// Cleartext-rebadge guard (PR742 codex P1, round-3). A disk
-// attacker who flips encryption_state from 0b01 to 0b00 leaves the
-// envelope bytes in place but tells the read path to skip
-// decryption — so the caller would silently receive raw envelope
-// bytes as "plaintext". When a cipher is wired, we therefore run
-// the body through DecodeEnvelope on the cleartext branch too: if
-// it parses as a well-formed envelope AND its key_id is loaded in
-// the keystore (i.e. the bytes are almost certainly a relabeled
-// envelope rather than a coincidence), we reject as
-// ErrEncryptedReadIntegrity. False positives on legitimate
-// cleartext are bounded by the joint probability of envelope-shape
-// match + a 32-bit key_id collision with a loaded DEK.
 //
 // sv is the storedValue freshly decoded from the on-disk bytes; its
 // Tombstone, ExpireAt, and EncState are reproduced into the AAD so
@@ -182,7 +170,7 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 	// upstream callers (notably ExistsAt) distinguish "key absent"
 	// from "key present with empty value" via val != nil. Normalize
 	// to a non-nil zero-length slice so an empty stored value
-	// continues to satisfy ExistsAt → true (PR742 codex P1 round-4).
+	// continues to satisfy ExistsAt → true.
 	if plain == nil {
 		plain = []byte{}
 	}
@@ -190,42 +178,62 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 }
 
 // rejectRebadgedEnvelope is the cleartext-branch guard for the §4.1
-// encState rebadge attack. The on-disk encryption_state bit is not
-// itself authenticated (PR742 codex P1 family — Stage 8 plans to
-// move it into authenticated MVCC metadata), so a disk attacker who
-// flips it from 0b01 to 0b00 leaves the original envelope bytes in
-// place and tells the read path to skip decryption. Without a
-// guard, the caller would silently receive raw envelope bytes as
-// "plaintext".
+// encryption-state rebadge attack. The on-disk encryption_state bit
+// is not itself authenticated, so a disk attacker who flips it from
+// 0b01 to 0b00 leaves the original envelope bytes in place and tells
+// the read path to skip decryption. Without a guard the caller
+// would silently receive raw envelope bytes as "plaintext".
 //
-// The detection runs an actual AEAD trial decrypt: rebuild the
-// AAD that the envelope WOULD have used had it been written under
-// encState=0b01, then call cipher.Decrypt over the parsed envelope
-// body. If the GCM tag verifies the bytes are unambiguously a
-// real envelope — only the holder of the DEK can produce a tag
-// that survives this check, so legitimate cleartext data has a
-// 2⁻¹²⁸ false-positive probability (negligible). On any other
-// outcome (parse failure, unknown key, tag mismatch) we treat the
-// row as legitimate cleartext.
+// The guard runs an AEAD trial decrypt under each loaded DEK:
+// reconstruct the AAD that the encrypt path would have produced, then
+// call cipher.Decrypt over the body's ciphertext+tag region. If the
+// GCM tag verifies the bytes are unambiguously a real envelope —
+// only the DEK holder can produce a tag that survives this check, so
+// legitimate cleartext has a 2⁻¹²⁸ false-positive probability. On
+// any other outcome (parse failure, unknown key, tag mismatch) the
+// row is treated as legitimate cleartext.
 //
-// PR742 review history:
-//   - round-3: "envelope-shape AND key_id loaded" — bypassable via
-//     key_id rewrite to an unloaded value (codex round-4).
-//   - round-5: "envelope-shape only" — false-positives on
-//     legitimate binary cleartext that happens to start with 0x01
-//     and parse the length/version/flag/nonce checks (codex
-//     round-6).
-//   - round-7 (this change): tag verification under reconstructed
-//     encrypted-state AAD — no false positives, catches the
-//     primary key_id-unchanged rebadge. The kid-rewrite-to-loaded-
-//     other-DEK variant still falls through (AAD mismatch on the
-//     foreign DEK), but the user observes ciphertext garbage that
-//     application code rejects downstream rather than plaintext —
-//     deferred to Stage 8.
+// AAD reconstruction substitutes the values the encrypt path always
+// uses, instead of trusting the on-disk header bytes the attacker
+// could have flipped:
+//
+//   - envelope_version = EnvelopeVersionV1 (the encrypt path's
+//     fixed value; trusting on-disk would let a corrupted version
+//     byte force the body through DecodeEnvelope's error path)
+//   - flag             = 0 (Snappy compression is deferred; the
+//     encrypt path's fixed value)
+//   - tombstone        = false (the encrypt path never wraps
+//     tombstones, so any on-disk tombstone bit on an encrypted
+//     entry is necessarily attacker-supplied)
+//
+// The remaining AAD inputs come from disk and we enumerate plausible
+// candidates:
+//
+//   - key_id: every loaded DEK (the attacker can rewrite the on-disk
+//     byte, so we substitute candidates rather than trust env.KeyID)
+//   - expireAt: {on-disk value, 0} (covers both no-flip and the
+//     common "no-TTL write whose expireAt was rewritten by the
+//     attacker" case)
+//
+// The body is sliced at fixed offsets rather than going through
+// DecodeEnvelope so a corrupted version or flag byte cannot force
+// the parse to fail and short-circuit the guard.
+//
+// Residual gap. The encryption_state bit cannot itself be AAD-bound
+// because the AAD reconstruction depends on it for dispatch. An
+// attacker who flips encState=0b01→0b00 and ALSO corrupts a byte the
+// trial cannot reproduce from canonical inputs — specifically
+// body[HeaderSize:] (ciphertext / tag) or expireAt when the original
+// was a non-zero value the attacker also rewrote — falls through to
+// the cleartext branch. The user receives garbage bytes (NOT the
+// original plaintext: the attacker does not hold the DEK), so the
+// gap is in integrity observability, not confidentiality. Stage 8
+// closes this by moving encryption_state into authenticated MVCC
+// metadata.
 //
 // No-op when the store has no cipher wired (legacy single-mode
-// deployments cannot have rebadge attacks) or when the body is too
-// short to be an envelope.
+// deployments have no rebadge attack surface) or when the body is
+// too short to be an envelope.
 func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, body []byte) error {
 	if s.cipher == nil {
 		return nil
@@ -233,59 +241,6 @@ func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, b
 	if len(body) < encryption.EnvelopeOverhead {
 		return nil
 	}
-	// Bypass DecodeEnvelope entirely (PR742 codex P1 round-9): an
-	// attacker who flips encryption_state to cleartext can also
-	// corrupt the envelope's version (or flag) byte to force a
-	// DecodeEnvelope error, which previously short-circuited the
-	// guard back to "treat as cleartext". We instead slice the body
-	// at the fixed offsets the encrypt path produces and trial-decrypt
-	// under canonical version+flag values, so a corrupted version or
-	// flag byte no longer ducks the integrity check.
-	//
-	// Encrypt-time AAD canonical values:
-	//   envelope_version = 0x01 (EnvelopeVersionV1)
-	//   flag             = 0    (Snappy compression deferred to Stage 9)
-	//   tombstone        = false (encrypt path never wraps tombstones)
-	// We substitute these unconditionally. The remaining AAD inputs
-	// (key_id, expireAt) come from disk; for each we enumerate the
-	// realistic candidate values:
-	//   - key_id: every loaded DEK (round-7 — attacker can rewrite the
-	//     on-disk byte to any value, so we substitute candidates
-	//     rather than trusting the parsed field)
-	//   - expireAt: {on-disk value, 0} (round-8 — covers no-TTL writes
-	//     whose expireAt was rewritten by the attacker)
-	//
-	// Residual gap (PR742 codex P1 rounds 6, 7, 9, 10 — fundamental
-	// to Stage 2's wire format and acknowledged in the design doc):
-	//
-	// The encryption_state bit is itself unauthenticated — it lives
-	// in the same on-disk byte as the tombstone bit and cannot be
-	// covered by AAD because the AAD reconstruction depends on it
-	// to dispatch the trial. Any attacker bit-flip that BOTH (a)
-	// flips encState 0b01→0b00 AND (b) corrupts a byte that the
-	// trial-decrypt cannot reproduce from canonical/loaded-keystore
-	// inputs makes the trial fail and the row reads back as
-	// "cleartext garbage" — bytes that no longer carry the original
-	// plaintext but also do not surface ErrEncryptedReadIntegrity.
-	// Concretely the residual cases are:
-	//   - body[18:] (ciphertext or tag bytes) corrupted: Decrypt
-	//     fails for every loaded DEK, fall through.
-	//   - expireAt rewritten when the original was a specific
-	//     non-zero value the attacker also rewrote (Stage 2 has no
-	//     way to enumerate the original value).
-	//
-	// In every residual case the user observes garbage bytes, NOT
-	// the original plaintext (the attacker still does not hold the
-	// DEK). Stage 8 closes this deterministically by moving
-	// encryption_state into authenticated MVCC metadata; the
-	// attacker can no longer flip that bit without breaking the
-	// metadata's own AAD. Until Stage 8 lands the rebadge guard
-	// catches the high-leverage variants (encState flip alone,
-	// encState + value-header tamper, encState + envelope-header
-	// corruption, encState + key_id rewrite, encState + tombstone
-	// flip, encState + no-TTL expireAt rewrite) and accepts the
-	// residual as an at-rest *integrity* observability gap rather
-	// than a *confidentiality* leak.
 	nonce := body[encryption.HeaderAADSize:encryption.HeaderSize]
 	ct := body[encryption.HeaderSize:]
 	candidateExpireAts := []uint64{sv.ExpireAt}
@@ -303,12 +258,9 @@ func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, b
 			}
 		}
 	}
-	// No (DEK, candidate-expireAt) combination produces a tag match.
-	// Body is either legitimate cleartext that happens to look
-	// envelope-shaped, an envelope under a retired DEK, or a
-	// partially-tampered envelope (residual gap above). The first
-	// case is the legitimate-mixed-mode outcome the round-6 codex
-	// finding required us to preserve.
+	// No (DEK, candidate-expireAt) combination tag-matches. The body
+	// is legitimate cleartext, an envelope under a retired DEK, or
+	// fell into the documented residual gap above.
 	return nil
 }
 
@@ -317,11 +269,11 @@ func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, b
 //
 //	envelope_version ‖ flag ‖ key_id ‖ value_header(9B) ‖ pebble_key
 //
-// Pre-sizing avoids the double-allocation gemini medium flagged on
-// PR742 round-1 (AppendHeaderAADBytes alloc + the subsequent
-// append). The value-header inclusion was added in round-2 in
-// response to the codex P1 finding that flipping tombstone / expireAt
-// would otherwise bypass GCM verification.
+// Pre-sizing avoids re-allocation across the two appends below
+// (AppendHeaderAADBytes + the value-header / pebble-key append).
+// The value-header inclusion is what binds tombstone, encryption_state,
+// and expireAt into the AAD so an on-disk flip of those fields fails
+// GCM verification on read.
 func buildStorageAAD(version, flag byte, keyID uint32, header, pebbleKey []byte) []byte {
 	aad := make([]byte, 0, encryption.HeaderAADSize+len(header)+len(pebbleKey))
 	aad = encryption.AppendHeaderAADBytes(aad, version, flag, keyID)
