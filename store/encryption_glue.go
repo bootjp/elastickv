@@ -154,7 +154,7 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 // the values they observe pre-decrypt are not yet authenticated.
 func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byte) ([]byte, error) {
 	if sv.EncState == encStateCleartext {
-		if err := s.rejectRebadgedEnvelope(body); err != nil {
+		if err := s.rejectRebadgedEnvelope(pebbleKey, sv, body); err != nil {
 			return nil, err
 		}
 		return body, nil
@@ -190,41 +190,79 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 }
 
 // rejectRebadgedEnvelope is the cleartext-branch guard for the §4.1
-// encState rebadge attack. Returns nil for legitimate cleartext;
-// returns ErrEncryptedReadIntegrity if the body parses as a
-// well-formed envelope, since that is overwhelmingly likely to be
-// an attacker-flipped encrypted entry rather than an accidental
-// cleartext byte sequence.
+// encState rebadge attack. The on-disk encryption_state bit is not
+// itself authenticated (PR742 codex P1 family — Stage 8 plans to
+// move it into authenticated MVCC metadata), so a disk attacker who
+// flips it from 0b01 to 0b00 leaves the original envelope bytes in
+// place and tells the read path to skip decryption. Without a
+// guard, the caller would silently receive raw envelope bytes as
+// "plaintext".
 //
-// PR742 codex P1 (round-4) flagged that an earlier
-// "envelope shape AND key_id loaded" check was bypassable: a disk
-// attacker who flips encryption_state to cleartext can also rewrite
-// the embedded key_id bytes to any unloaded value, falling out of
-// the keystore lookup and serving the relabeled bytes as plaintext.
-// The strengthened guard rejects whenever DecodeEnvelope succeeds —
-// the joint probability of legitimate cleartext data starting with
-// 0x01, satisfying the length / flag / key_id / nonce constraints
-// is small enough to accept the trade-off in encryption-enabled
-// deployments. Stage 8's authenticated MVCC metadata bit will
-// replace this heuristic with a deterministic check.
+// The detection runs an actual AEAD trial decrypt: rebuild the
+// AAD that the envelope WOULD have used had it been written under
+// encState=0b01, then call cipher.Decrypt over the parsed envelope
+// body. If the GCM tag verifies the bytes are unambiguously a
+// real envelope — only the holder of the DEK can produce a tag
+// that survives this check, so legitimate cleartext data has a
+// 2⁻¹²⁸ false-positive probability (negligible). On any other
+// outcome (parse failure, unknown key, tag mismatch) we treat the
+// row as legitimate cleartext.
+//
+// PR742 review history:
+//   - round-3: "envelope-shape AND key_id loaded" — bypassable via
+//     key_id rewrite to an unloaded value (codex round-4).
+//   - round-5: "envelope-shape only" — false-positives on
+//     legitimate binary cleartext that happens to start with 0x01
+//     and parse the length/version/flag/nonce checks (codex
+//     round-6).
+//   - round-7 (this change): tag verification under reconstructed
+//     encrypted-state AAD — no false positives, catches the
+//     primary key_id-unchanged rebadge. The kid-rewrite-to-loaded-
+//     other-DEK variant still falls through (AAD mismatch on the
+//     foreign DEK), but the user observes ciphertext garbage that
+//     application code rejects downstream rather than plaintext —
+//     deferred to Stage 8.
 //
 // No-op when the store has no cipher wired (legacy single-mode
 // deployments cannot have rebadge attacks) or when the body is too
 // short to be an envelope.
-func (s *pebbleStore) rejectRebadgedEnvelope(body []byte) error {
+func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, body []byte) error {
 	if s.cipher == nil {
 		return nil
 	}
 	if len(body) < encryption.EnvelopeOverhead {
 		return nil
 	}
-	if _, err := encryption.DecodeEnvelope(body); err != nil {
+	env, err := encryption.DecodeEnvelope(body)
+	if err != nil {
 		// Body does not parse as an envelope; treat as legitimate
 		// cleartext.
 		return nil //nolint:nilerr // intentional: parse failure means "not an envelope"
 	}
-	return errors.Wrap(ErrEncryptedReadIntegrity,
-		"store: cleartext-labelled value parses as an envelope; refusing rebadge attempt")
+	// Reconstruct the AAD as if the row carried encState=encrypted
+	// and trial-decrypt under each loaded DEK. The encrypt-time AAD
+	// included the *original* envelope key_id; attackers can rewrite
+	// that field on disk, so we substitute each candidate kid into
+	// the AAD's HeaderAAD section rather than trusting env.KeyID.
+	// Other AAD components (Tombstone, ExpireAt, pebbleKey) are
+	// already AAD-bound from the encrypt path; any flip there shifts
+	// the AAD and trips the tag mismatch below regardless of which
+	// DEK we try.
+	var hdr [valueHeaderSize]byte
+	writeValueHeaderBytes(hdr[:], sv.Tombstone, sv.ExpireAt, encStateEncrypted)
+	for _, kid := range s.cipher.LoadedKeyIDs() {
+		aad := buildStorageAAD(env.Version, env.Flag, kid, hdr[:], pebbleKey)
+		if _, err := s.cipher.Decrypt(env.Body, aad, kid, env.Nonce[:]); err == nil {
+			return errors.Wrap(ErrEncryptedReadIntegrity,
+				"store: cleartext-labelled value verifies as a relabeled envelope under a loaded DEK")
+		}
+	}
+	// No loaded DEK produces a tag match — body is either legitimate
+	// cleartext that happens to look envelope-shaped, an envelope
+	// under a retired DEK, or a partially-tampered envelope. The
+	// first case is the legitimate-mixed-mode outcome the round-6
+	// codex finding required us to preserve.
+	return nil
 }
 
 // buildStorageAAD composes the §4.1 storage-envelope AAD with a

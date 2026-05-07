@@ -94,6 +94,23 @@ func (c *Cipher) Decrypt(ciphertextAndTag, aad []byte, keyID uint32, nonce []byt
 	return plaintext, nil
 }
 
+// LoadedKeyIDs returns the sorted list of key_ids currently loaded in
+// the underlying keystore. Used by the storage layer's rebadge guard
+// (PR742 codex P1 family) to trial-decrypt a cleartext-labelled body
+// against every candidate DEK — rotation leaves multiple DEKs active
+// at once, and the on-disk envelope's key_id field can be rewritten
+// by an attacker, so the guard must iterate rather than trust it.
+//
+// Returns nil for a nil receiver or zero-value Cipher; callers
+// MUST NOT treat that as "no keys" without considering the
+// surrounding context.
+func (c *Cipher) LoadedKeyIDs() []uint32 {
+	if c == nil || c.keystore == nil {
+		return nil
+	}
+	return c.keystore.IDs()
+}
+
 // aeadFor validates keyID and nonce length, then returns the
 // pre-initialized AEAD from the keystore. The hot path here is a single
 // atomic.Pointer load + a map lookup; AES key expansion happened once

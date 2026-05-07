@@ -509,6 +509,55 @@ func TestEncryption_RebadgeAttackRejected(t *testing.T) {
 	}
 }
 
+// TestEncryption_RebadgeGuardAllowsLegitimateEnvelopeShapedCleartext
+// is the PR742 codex P1 round-6 regression: round-5's "reject any
+// envelope-parseable body" guard turned legitimate cleartext rows
+// that coincidentally start with 0x01 and pass DecodeEnvelope's
+// length / version / flag / nonce checks into deterministic read
+// failures. Round-7 replaced the shape-only check with an actual
+// AEAD trial decrypt, so a body that does not verify under any
+// loaded DEK is allowed through as cleartext.
+//
+// We construct a cleartext payload whose bytes are envelope-shaped:
+// 0x01 version, 0x00 flag, an arbitrary 4-byte key_id, 12 random
+// nonce bytes, and 16+ bytes of "ciphertext+tag" filler. Pre-fix
+// the read would error; post-fix the body is returned unchanged.
+func TestEncryption_RebadgeGuardAllowsLegitimateEnvelopeShapedCleartext(t *testing.T) {
+	t.Parallel()
+	// Build the store with cipher wired but the active-key flag
+	// pointing at "no DEK" so PutAt writes cleartext. This models
+	// the §7.1 Phase 0 / pre-cutover window where legacy data
+	// coexists with a configured cipher.
+	var active bool
+	mvcc := newToggleableEncryptedStore(t, 71, &active)
+	ctx := context.Background()
+
+	envelopeShaped := make([]byte, 64)
+	envelopeShaped[0] = 0x01 // EnvelopeVersionV1
+	// flag stays 0; key_id = 0xCAFEBABE; nonce + body filler are arbitrary.
+	envelopeShaped[2] = 0xCA
+	envelopeShaped[3] = 0xFE
+	envelopeShaped[4] = 0xBA
+	envelopeShaped[5] = 0xBE
+	for i := 6; i < len(envelopeShaped); i++ {
+		envelopeShaped[i] = byte(i)
+	}
+
+	if err := mvcc.PutAt(ctx, []byte("legit"), envelopeShaped, 100, 0); err != nil {
+		t.Fatalf("PutAt cleartext: %v", err)
+	}
+	// Activate encryption AFTER the cleartext write — read must
+	// still surface the original bytes verbatim.
+	active = true
+	got, err := mvcc.GetAt(ctx, []byte("legit"), 100)
+	if err != nil {
+		t.Fatalf("GetAt envelope-shaped cleartext: %v (round-5 regression)", err)
+	}
+	if !bytes.Equal(got, envelopeShaped) {
+		t.Fatalf("round-trip mismatch: got %x, want %x", got, envelopeShaped)
+	}
+}
+
 // TestEncryption_EmptyValueExistsAt is the PR742 codex P1 round-4
 // regression for empty-plaintext semantics: AES-GCM Open returns a
 // nil dst for zero-length plaintext, and the upstream ExistsAt
