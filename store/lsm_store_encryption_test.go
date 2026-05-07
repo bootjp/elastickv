@@ -509,6 +509,81 @@ func TestEncryption_RebadgeAttackRejected(t *testing.T) {
 	}
 }
 
+// TestEncryption_RebadgeAttackCombinedHeaderFlips covers the PR742
+// codex P1 round-7 finding: a disk attacker who flips
+// encryption_state AND simultaneously modifies tombstone or expireAt
+// would otherwise bypass the rebadge guard because the trial-decrypt
+// AAD reconstructed from the on-disk (tampered) header bytes no
+// longer matches the encrypt-time AAD. The fix canonicalises
+// tombstone to false in the trial AAD (encrypt path always writes
+// tombstone=false) and enumerates expireAt candidates ({on-disk, 0})
+// to cover the common no-TTL case.
+//
+// Residual: encState + expireAt flip when the original expireAt was
+// a non-zero value the attacker also rewrites. Stage 8's
+// authenticated MVCC metadata bit closes that deterministically.
+func TestEncryption_RebadgeAttackCombinedHeaderFlips(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		mutate  func(raw []byte) []byte
+		writeTS uint64
+		// origExpireAt is what we passed to PutAt; the trial guard
+		// must catch the attack regardless of what the attacker
+		// modifies on top of the encState flip.
+		origExpireAt uint64
+	}{
+		{
+			name:         "encState + tombstone flipped (no TTL)",
+			writeTS:      400001,
+			origExpireAt: 0,
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask // clear bits 1-2
+				raw[0] |= tombstoneMask // set bit 0
+				return raw
+			},
+		},
+		{
+			name:         "encState + expireAt rewritten to past (no TTL)",
+			writeTS:      400002,
+			origExpireAt: 0,
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask
+				// rewrite expireAt to a small past value
+				past := []byte{0x01, 0, 0, 0, 0, 0, 0, 0}
+				copy(raw[1:1+timestampSize], past)
+				return raw
+			},
+		},
+		{
+			name:         "encState + tombstone + expireAt all flipped (no TTL)",
+			writeTS:      400003,
+			origExpireAt: 0,
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask
+				raw[0] |= tombstoneMask
+				future := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}
+				copy(raw[1:1+timestampSize], future)
+				return raw
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEncryptedStoreFixture(t, 67)
+			ctx := context.Background()
+			if err := f.mvcc.PutAt(ctx, []byte("combined"), []byte("payload"), tc.writeTS, tc.origExpireAt); err != nil {
+				t.Fatalf("PutAt: %v", err)
+			}
+			f.tamperPebbleValue(t, []byte("combined"), tc.writeTS, tc.mutate)
+			_, err := f.mvcc.GetAt(ctx, []byte("combined"), tc.writeTS)
+			if !errors.Is(err, ErrEncryptedReadIntegrity) {
+				t.Fatalf("combined-flip rebadge attempt should fail integrity, got %v", err)
+			}
+		})
+	}
+}
+
 // TestEncryption_RebadgeGuardAllowsLegitimateEnvelopeShapedCleartext
 // is the PR742 codex P1 round-6 regression: round-5's "reject any
 // envelope-parseable body" guard turned legitimate cleartext rows

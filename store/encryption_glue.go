@@ -240,26 +240,53 @@ func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, b
 		return nil //nolint:nilerr // intentional: parse failure means "not an envelope"
 	}
 	// Reconstruct the AAD as if the row carried encState=encrypted
-	// and trial-decrypt under each loaded DEK. The encrypt-time AAD
-	// included the *original* envelope key_id; attackers can rewrite
-	// that field on disk, so we substitute each candidate kid into
-	// the AAD's HeaderAAD section rather than trusting env.KeyID.
-	// Other AAD components (Tombstone, ExpireAt, pebbleKey) are
-	// already AAD-bound from the encrypt path; any flip there shifts
-	// the AAD and trips the tag mismatch below regardless of which
-	// DEK we try.
-	var hdr [valueHeaderSize]byte
-	writeValueHeaderBytes(hdr[:], sv.Tombstone, sv.ExpireAt, encStateEncrypted)
+	// and trial-decrypt under each loaded DEK + candidate-header
+	// pair.
+	//
+	// Header reconstruction. The encrypt path always writes
+	// tombstone=false (deletes never carry plaintext, so the encrypt
+	// helper is never reached on a tombstone). Trusting the on-disk
+	// tombstone bit here would let an attacker who flipped
+	// encryption_state AND tombstone slip through the trial: the AAD
+	// would carry tombstone=true while the encrypt-time AAD used
+	// tombstone=false (PR742 codex P1 round-7). We canonicalise to
+	// false here regardless of what's on disk.
+	//
+	// expireAt is harder: the encrypt-time value is whatever the
+	// caller supplied, and we have nothing on disk to compare
+	// against beyond the (potentially tampered) sv.ExpireAt. Try
+	// the on-disk value (covers the encState-only flip case, which
+	// keeps the original expireAt intact) and also expireAt=0
+	// (covers no-TTL writes whose expireAt was rewritten by the
+	// attacker — by far the common case). The residual
+	// "encState flip + expireAt rewritten when original was non-zero"
+	// is a known limitation that Stage 8's authenticated MVCC
+	// metadata bit closes deterministically.
+	//
+	// key_id reconstruction. The encrypt-time AAD included the
+	// *original* envelope key_id; attackers can rewrite that field
+	// on disk, so we substitute each candidate kid into the AAD's
+	// HeaderAAD section rather than trusting env.KeyID.
+	candidateExpireAts := []uint64{sv.ExpireAt}
+	if sv.ExpireAt != 0 {
+		candidateExpireAts = append(candidateExpireAts, 0)
+	}
 	for _, kid := range s.cipher.LoadedKeyIDs() {
-		aad := buildStorageAAD(env.Version, env.Flag, kid, hdr[:], pebbleKey)
-		if _, err := s.cipher.Decrypt(env.Body, aad, kid, env.Nonce[:]); err == nil {
-			return errors.Wrap(ErrEncryptedReadIntegrity,
-				"store: cleartext-labelled value verifies as a relabeled envelope under a loaded DEK")
+		for _, candidateExpire := range candidateExpireAts {
+			var hdr [valueHeaderSize]byte
+			writeValueHeaderBytes(hdr[:], false /*canonical*/, candidateExpire, encStateEncrypted)
+			aad := buildStorageAAD(env.Version, env.Flag, kid, hdr[:], pebbleKey)
+			if _, err := s.cipher.Decrypt(env.Body, aad, kid, env.Nonce[:]); err == nil {
+				return errors.Wrap(ErrEncryptedReadIntegrity,
+					"store: cleartext-labelled value verifies as a relabeled envelope under a loaded DEK")
+			}
 		}
 	}
-	// No loaded DEK produces a tag match — body is either legitimate
-	// cleartext that happens to look envelope-shaped, an envelope
-	// under a retired DEK, or a partially-tampered envelope. The
+	// No (DEK, candidate-expireAt) combination produces a tag match.
+	// Body is either legitimate cleartext that happens to look
+	// envelope-shaped, an envelope under a retired DEK, an envelope
+	// whose original expireAt was non-zero AND has been rewritten
+	// (Stage 8 closes this), or a partially-tampered envelope. The
 	// first case is the legitimate-mixed-mode outcome the round-6
 	// codex finding required us to preserve.
 	return nil
