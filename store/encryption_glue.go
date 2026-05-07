@@ -123,15 +123,29 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 }
 
 // decryptForKey is the read-side counterpart. encState=0 returns the
-// body verbatim; encState=1 decodes the envelope, recomputes the AAD
-// (header + value-header + pebble key), and unwraps via the cipher.
-// A GCM tag mismatch surfaces as ErrEncryptedReadIntegrity — callers
-// MUST NOT silently translate this into "key not found" or "empty
-// value" because that would let a disk attacker who flipped a tag
-// bit (or any AAD-bound header field) silently corrupt reads.
+// body verbatim (with the envelope-shaped fingerprint check below);
+// encState=1 decodes the envelope, recomputes the AAD (header +
+// value-header + pebble key), and unwraps via the cipher. A GCM tag
+// mismatch surfaces as ErrEncryptedReadIntegrity — callers MUST NOT
+// silently translate this into "key not found" or "empty value"
+// because that would let a disk attacker who flipped a tag bit (or
+// any AAD-bound header field) silently corrupt reads.
 //
 // Reserved encryption_state values are rejected upstream in
 // decodeValue, so this function only sees the two valid states.
+//
+// Cleartext-rebadge guard (PR742 codex P1, round-3). A disk
+// attacker who flips encryption_state from 0b01 to 0b00 leaves the
+// envelope bytes in place but tells the read path to skip
+// decryption — so the caller would silently receive raw envelope
+// bytes as "plaintext". When a cipher is wired, we therefore run
+// the body through DecodeEnvelope on the cleartext branch too: if
+// it parses as a well-formed envelope AND its key_id is loaded in
+// the keystore (i.e. the bytes are almost certainly a relabeled
+// envelope rather than a coincidence), we reject as
+// ErrEncryptedReadIntegrity. False positives on legitimate
+// cleartext are bounded by the joint probability of envelope-shape
+// match + a 32-bit key_id collision with a loaded DEK.
 //
 // sv is the storedValue freshly decoded from the on-disk bytes; its
 // Tombstone, ExpireAt, and EncState are reproduced into the AAD so
@@ -140,6 +154,9 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 // the values they observe pre-decrypt are not yet authenticated.
 func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byte) ([]byte, error) {
 	if sv.EncState == encStateCleartext {
+		if err := s.rejectRebadgedEnvelope(body); err != nil {
+			return nil, err
+		}
 		return body, nil
 	}
 	if s.cipher == nil {
@@ -162,6 +179,40 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 		return nil, errors.Wrap(err, "store: decrypt value")
 	}
 	return plain, nil
+}
+
+// rejectRebadgedEnvelope is the cleartext-branch guard for the §4.1
+// encState rebadge attack. Returns nil for legitimate cleartext;
+// returns ErrEncryptedReadIntegrity if the body looks like a
+// well-formed envelope whose key_id is loaded in the live keystore,
+// since that is overwhelmingly likely to be an attacker-flipped
+// encrypted entry rather than an accidental cleartext byte sequence.
+//
+// No-op when the store has no cipher wired (legacy single-mode
+// deployments cannot have rebadge attacks) or when the body is too
+// short to be an envelope.
+func (s *pebbleStore) rejectRebadgedEnvelope(body []byte) error {
+	if s.cipher == nil {
+		return nil
+	}
+	if len(body) < encryption.EnvelopeOverhead {
+		return nil
+	}
+	env, err := encryption.DecodeEnvelope(body)
+	if err != nil {
+		// Body does not parse as an envelope; treat as legitimate
+		// cleartext.
+		return nil //nolint:nilerr // intentional: parse failure means "not an envelope"
+	}
+	if !s.cipher.HasKey(env.KeyID) {
+		// Body parses but the embedded key_id is not loaded — the
+		// joint shape+keystore-collision probability is low enough
+		// to treat this as legitimate cleartext that happens to
+		// look envelope-shaped.
+		return nil
+	}
+	return errors.Wrap(ErrEncryptedReadIntegrity,
+		"store: cleartext-labelled value parses as a known-key envelope; refusing rebadge attempt")
 }
 
 // buildStorageAAD composes the §4.1 storage-envelope AAD with a

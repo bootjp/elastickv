@@ -414,6 +414,37 @@ func TestEncryption_ValueHeaderTamperRejected(t *testing.T) {
 	}
 }
 
+// TestEncryption_RebadgeAttackRejected covers the PR742 codex P1
+// (round-3) finding: a disk attacker who flips encryption_state from
+// 0b01 to 0b00 leaves the envelope bytes in place but tells the read
+// path to skip decryption. Without the cleartext-branch guard in
+// decryptForKey, the caller would receive raw envelope bytes as
+// "plaintext" — a fail-open integrity bypass.
+//
+// The guard parses the body as an envelope and consults
+// Cipher.HasKey for the embedded key_id; when both match (the
+// realistic post-flip shape), the read fails closed with
+// ErrEncryptedReadIntegrity.
+func TestEncryption_RebadgeAttackRejected(t *testing.T) {
+	t.Parallel()
+	f := newEncryptedStoreFixture(t, 31)
+	ctx := context.Background()
+	const writeTS uint64 = 314159 // distinguishable from the other tamper tests' ts=100
+	if err := f.mvcc.PutAt(ctx, []byte("rebadge"), []byte("classified"), writeTS, 0); err != nil {
+		t.Fatalf("PutAt: %v", err)
+	}
+	f.tamperPebbleValue(t, []byte("rebadge"), writeTS, func(raw []byte) []byte {
+		// Flip encryption_state from 0b01 to 0b00 (clear bits 1-2)
+		// without touching tombstone bit or expireAt.
+		raw[0] &^= encStateMask
+		return raw
+	})
+	_, err := f.mvcc.GetAt(ctx, []byte("rebadge"), writeTS)
+	if !errors.Is(err, ErrEncryptedReadIntegrity) {
+		t.Fatalf("rebadge attempt should fail integrity, got %v", err)
+	}
+}
+
 // TestEncryption_ReservedEncStateRejected is the §7.1 trip-wire test:
 // a value-header byte carrying encryption_state=0b10 (or 0b11) is
 // rejected by decodeValue with ErrEncryptedValueReservedState. An
