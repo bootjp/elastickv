@@ -414,6 +414,40 @@ func TestEncryption_ValueHeaderTamperRejected(t *testing.T) {
 	}
 }
 
+// TestEncryption_DeletePrefixHeaderTamperRejected covers the PR742
+// claude[bot] round-5 follow-up: isVisibleLiveKey is the write-side
+// counterpart to readVisibleVersion / processFoundValue (read paths
+// fixed in rounds 3–5). Without authenticating the value-header,
+// a disk attacker who flips the tombstone bit on an encrypted entry
+// would cause DeletePrefixAt to skip writing the deletion tombstone,
+// silently leaving the key alive after the prefix delete — a
+// write-side integrity bypass that survives across restarts.
+//
+// The fix runs decryptForKey inside isVisibleLiveKey; this test
+// pins the contract that scanDeletePrefix surfaces the integrity
+// error rather than no-oping the tombstone.
+func TestEncryption_DeletePrefixHeaderTamperRejected(t *testing.T) {
+	t.Parallel()
+	f := newEncryptedStoreFixture(t, 41)
+	ctx := context.Background()
+	const writeTS uint64 = 100
+	const deleteTS uint64 = 200
+	if err := f.mvcc.PutAt(ctx, []byte("doomed/k1"), []byte("victim"), writeTS, 0); err != nil {
+		t.Fatalf("PutAt: %v", err)
+	}
+	// Flip the tombstone bit on the encrypted entry's value header
+	// directly on disk. Pre-fix, scanDeletePrefix would observe the
+	// flipped sv.Tombstone and skip writing a tombstone for this key.
+	f.tamperPebbleValue(t, []byte("doomed/k1"), writeTS, func(raw []byte) []byte {
+		raw[0] |= tombstoneMask
+		return raw
+	})
+	err := f.mvcc.DeletePrefixAt(ctx, []byte("doomed/"), nil, deleteTS)
+	if !errors.Is(err, ErrEncryptedReadIntegrity) {
+		t.Fatalf("DeletePrefixAt over a tampered encrypted entry should fail integrity, got %v", err)
+	}
+}
+
 // TestEncryption_RebadgeAttackRejected covers the PR742 codex P1
 // rebadge attack family: a disk attacker who flips encryption_state
 // from 0b01 to 0b00 leaves the envelope bytes in place but tells

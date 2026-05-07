@@ -1389,6 +1389,17 @@ func (s *pebbleStore) classifyDeletePrefixKey(userKey, prefix, excludePrefix []b
 
 // isVisibleLiveKey checks whether the key has a visible, non-tombstone,
 // non-expired version at commitTS. It advances the iterator as a side effect.
+//
+// Sole caller is scanDeletePrefix, which uses the bool to decide
+// whether DeletePrefixAt needs to write a fresh tombstone for the
+// observed live key. The read path's value-header tamper guard
+// (rounds 3–5 of PR #742) is therefore reproduced here: for encrypted
+// entries we run cipher.Decrypt over (header bytes ‖ pebble key) AAD
+// before branching on the unauthenticated tombstone / expireAt fields.
+// Without this, a disk attacker who flips the tombstone bit on an
+// encrypted entry would cause DeletePrefixAt to skip writing the
+// deletion tombstone — the key survives the prefix delete silently
+// (a write-side integrity bypass, not just a transient wrong return).
 func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, version, commitTS uint64) (bool, error) {
 	if !s.seekToVisibleVersion(iter, userKey, version, commitTS) {
 		return false, nil
@@ -1396,6 +1407,14 @@ func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, ve
 	sv, err := decodeValue(iter.Value())
 	if err != nil {
 		return false, errors.WithStack(err)
+	}
+	// decryptForKey authenticates the value-header bytes when the
+	// entry is encrypted (cleartext entries no-op except for the
+	// rebadge guard). We discard the plaintext — we only need the
+	// authentication side-effect; tombstone / expireAt visibility
+	// is then decided on now-trusted bytes.
+	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+		return false, err
 	}
 	if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {
 		return false, nil
