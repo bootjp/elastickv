@@ -255,11 +255,37 @@ func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, b
 	//   - expireAt: {on-disk value, 0} (round-8 — covers no-TTL writes
 	//     whose expireAt was rewritten by the attacker)
 	//
-	// Residual gap: ciphertext/tag-byte corruption inside body[18:]
-	// (or expireAt rewrite when the original was a non-zero specific
-	// value) still falls through. Stage 8's authenticated MVCC
-	// metadata bit closes both deterministically by making
-	// encryption_state itself a tamper-proof input.
+	// Residual gap (PR742 codex P1 rounds 6, 7, 9, 10 — fundamental
+	// to Stage 2's wire format and acknowledged in the design doc):
+	//
+	// The encryption_state bit is itself unauthenticated — it lives
+	// in the same on-disk byte as the tombstone bit and cannot be
+	// covered by AAD because the AAD reconstruction depends on it
+	// to dispatch the trial. Any attacker bit-flip that BOTH (a)
+	// flips encState 0b01→0b00 AND (b) corrupts a byte that the
+	// trial-decrypt cannot reproduce from canonical/loaded-keystore
+	// inputs makes the trial fail and the row reads back as
+	// "cleartext garbage" — bytes that no longer carry the original
+	// plaintext but also do not surface ErrEncryptedReadIntegrity.
+	// Concretely the residual cases are:
+	//   - body[18:] (ciphertext or tag bytes) corrupted: Decrypt
+	//     fails for every loaded DEK, fall through.
+	//   - expireAt rewritten when the original was a specific
+	//     non-zero value the attacker also rewrote (Stage 2 has no
+	//     way to enumerate the original value).
+	//
+	// In every residual case the user observes garbage bytes, NOT
+	// the original plaintext (the attacker still does not hold the
+	// DEK). Stage 8 closes this deterministically by moving
+	// encryption_state into authenticated MVCC metadata; the
+	// attacker can no longer flip that bit without breaking the
+	// metadata's own AAD. Until Stage 8 lands the rebadge guard
+	// catches the high-leverage variants (encState flip alone,
+	// encState + value-header tamper, encState + envelope-header
+	// corruption, encState + key_id rewrite, encState + tombstone
+	// flip, encState + no-TTL expireAt rewrite) and accepts the
+	// residual as an at-rest *integrity* observability gap rather
+	// than a *confidentiality* leak.
 	nonce := body[encryption.HeaderAADSize:encryption.HeaderSize]
 	ct := body[encryption.HeaderSize:]
 	candidateExpireAts := []uint64{sv.ExpireAt}
