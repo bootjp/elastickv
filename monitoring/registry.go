@@ -22,6 +22,7 @@ type Registry struct {
 	pebble        *PebbleMetrics
 	writeConflict *WriteConflictMetrics
 	sqs           *SQSMetrics
+	sqsObserver   *SQSObserver
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -45,6 +46,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.pebble = newPebbleMetrics(registerer)
 	r.writeConflict = newWriteConflictMetrics(registerer)
 	r.sqs = newSQSMetrics(registerer)
+	r.sqsObserver = newSQSObserver(r.sqs)
 	return r
 }
 
@@ -170,6 +172,17 @@ func (r *Registry) SQSPartitionObserver() SQSPartitionObserver {
 		return nil
 	}
 	return r.sqs
+}
+
+// SQSObserver returns the queue-depth gauge observer backed by
+// this registry. Same shape as RaftObserver / RedisObserver: callers
+// pull it via the registry, then drive Start(ctx, source, interval)
+// from main.go's startMonitoringCollectors.
+func (r *Registry) SQSObserver() *SQSObserver {
+	if r == nil {
+		return nil
+	}
+	return r.sqsObserver
 }
 
 // WriteConflictCollector returns a collector that polls each MVCC

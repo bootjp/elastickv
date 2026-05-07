@@ -1126,6 +1126,63 @@ func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, ru
 	}
 }
 
+// startSQSDepthObserver wires the SQS adapter (when enabled on this
+// node) into the monitoring registry's SQSObserver so the
+// elastickv_sqs_queue_messages gauges start updating. Mirrors the
+// Raft / Redis pattern: the source is plugged in once after startup,
+// then the observer owns the ticker. nil sqsServer (e.g.
+// --sqsAddress empty on this node) is a no-op.
+//
+// The thin adapter exists because monitoring.SQSQueueDepth and
+// adapter.SQSQueueDepth are intentionally distinct types — having
+// the adapter import monitoring would invert the dependency
+// direction (every adapter would then know about Prometheus).
+// Conversion is a fixed 4-field copy and a shape mismatch surfaces
+// at compile time here, not at runtime on the metrics path.
+func startSQSDepthObserver(ctx context.Context, reg *monitoring.Registry, sqsServer *adapter.SQSServer) {
+	if reg == nil || sqsServer == nil {
+		return
+	}
+	if observer := reg.SQSObserver(); observer != nil {
+		observer.Start(ctx, sqsDepthSourceAdapter{inner: sqsServer}, 0)
+	}
+}
+
+// sqsDepthSourceAdapter bridges *adapter.SQSServer (which returns
+// []adapter.SQSQueueDepth) to monitoring.SQSDepthSource (which
+// expects []monitoring.SQSQueueDepth). Same shape both sides; the
+// loop is a fixed-size copy.
+type sqsDepthSourceAdapter struct {
+	inner *adapter.SQSServer
+}
+
+func (a sqsDepthSourceAdapter) SnapshotQueueDepths(ctx context.Context) ([]monitoring.SQSQueueDepth, bool) {
+	if a.inner == nil {
+		// Empty-but-OK: nothing to emit. Mirrors the
+		// follower / nil-receiver case of the underlying source.
+		return nil, true
+	}
+	snaps, ok := a.inner.SnapshotQueueDepths(ctx)
+	if !ok {
+		// Propagate skip-tick verbatim so the observer leaves
+		// existing gauges alone on a transient scan failure.
+		return nil, false
+	}
+	if len(snaps) == 0 {
+		return nil, true
+	}
+	out := make([]monitoring.SQSQueueDepth, len(snaps))
+	for i, s := range snaps {
+		out[i] = monitoring.SQSQueueDepth{
+			Queue:      s.Queue,
+			Visible:    s.Visible,
+			NotVisible: s.NotVisible,
+			Delayed:    s.Delayed,
+		}
+	}
+	return out, true
+}
+
 // writeConflictMonitorSources extracts the MVCC stores that expose
 // per-(kind, key_prefix) OCC conflict counters so monitoring can poll
 // them for the elastickv_store_write_conflict_total metric. Every
@@ -1551,6 +1608,13 @@ func (r *runtimeServerRunner) start() error {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	r.sqsServer = sqsServer
+	// Plug the SQS adapter into the monitoring registry's depth
+	// observer (see startSQSDepthObserver). nil sqsServer (e.g.
+	// --sqsAddress empty on this node) is a no-op so single-binary
+	// tests don't need to construct a fake source.
+	if r.sqsServer != nil {
+		startSQSDepthObserver(r.ctx, r.metricsRegistry, r.sqsServer)
+	}
 	if err := startMetricsServer(r.ctx, r.lc, r.eg, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler()); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}

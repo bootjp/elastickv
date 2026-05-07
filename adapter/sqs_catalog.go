@@ -1219,10 +1219,22 @@ func resolveListQueuesStart(names []string, token string) int {
 }
 
 func (s *SQSServer) scanQueueNames(ctx context.Context) ([]string, error) {
+	return s.scanQueueNamesAt(ctx, s.nextTxnReadTS(ctx))
+}
+
+// scanQueueNamesAt is scanQueueNames with the read timestamp passed
+// in. SnapshotQueueDepths uses this so the membership scan and the
+// per-queue counter reads share one MVCC view — without it, a queue
+// created or deleted between the two HLC ticks would either be
+// reported with stale counters or silently missed for the tick,
+// producing spurious ForgetQueue calls in the observer's diff loop.
+// Other callers (AdminListQueues, the reaper, the catalog walk)
+// don't need cross-call consistency and continue to use the
+// fresh-ts wrapper above.
+func (s *SQSServer) scanQueueNamesAt(ctx context.Context, readTS uint64) ([]string, error) {
 	prefix := []byte(SqsQueueMetaPrefix)
 	end := prefixScanEnd(prefix)
 	start := bytes.Clone(prefix)
-	readTS := s.nextTxnReadTS(ctx)
 	var names []string
 	for {
 		kvs, err := s.store.ScanAt(ctx, start, end, sqsQueueScanPageLimit, readTS)
