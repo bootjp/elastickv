@@ -509,6 +509,72 @@ func TestEncryption_RebadgeAttackRejected(t *testing.T) {
 	}
 }
 
+// TestEncryption_SnapshotRestoreAtMaxValueSize covers the PR742
+// codex P1 round-8 finding: validateValueSize accepts a plaintext
+// up to maxSnapshotValueSize, but encryptForKey adds 34 bytes
+// (EnvelopeOverhead) on the storage envelope, and the restore
+// path's per-entry cap (`maxSnapshotValueSize + valueHeaderSize`)
+// would reject the encrypted body — making it possible to persist
+// data that cannot be recovered via snapshot. The fix raises the
+// restore cap by EnvelopeOverhead so a plaintext written at the
+// exact maxSnapshotValueSize round-trips through Pebble snapshot
+// save/restore.
+func TestEncryption_SnapshotRestoreAtMaxValueSize(t *testing.T) {
+	// NOT t.Parallel: this test mutates the package-level
+	// maxSnapshotValueSize var, which other tests read; running it
+	// alongside parallel tests trips -race. Keeping it serial is
+	// the same convention the existing snapshot suite uses for the
+	// same var.
+	prev := maxSnapshotValueSize
+	maxSnapshotValueSize = 4096
+	t.Cleanup(func() { maxSnapshotValueSize = prev })
+
+	f := newEncryptedStoreFixture(t, 71)
+	ctx := context.Background()
+
+	// Write a plaintext exactly at the (shrunk) maxSnapshotValueSize.
+	value := bytes.Repeat([]byte{0xA5}, maxSnapshotValueSize)
+	if err := f.mvcc.PutAt(ctx, []byte("max"), value, 100, 0); err != nil {
+		t.Fatalf("PutAt at max value size: %v", err)
+	}
+	// Capture a snapshot before tearing the source store down.
+	snap, err := f.mvcc.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	defer snap.Close()
+	var buf bytes.Buffer
+	if _, err := snap.WriteTo(&buf); err != nil {
+		t.Fatalf("Snapshot.WriteTo: %v", err)
+	}
+
+	// Restore into a fresh store (unencrypted is fine — Pebble snapshots
+	// ship raw bytes and the encrypted envelope is preserved verbatim;
+	// we are only testing the restore size cap here, not decrypt).
+	dstDir := filepath.Join(t.TempDir(), "restore")
+	dst, err := NewPebbleStore(dstDir,
+		WithEncryption(f.cipher,
+			NewCounterNonceFactory(0xABCD, 0x0001),
+			func() (uint32, bool) { return f.keyID, true },
+		),
+	)
+	if err != nil {
+		t.Fatalf("NewPebbleStore restore-target: %v", err)
+	}
+	t.Cleanup(func() { _ = dst.Close() })
+
+	if err := dst.Restore(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("Restore at max value size + envelope overhead: %v", err)
+	}
+	got, err := dst.GetAt(ctx, []byte("max"), 100)
+	if err != nil {
+		t.Fatalf("GetAt after restore: %v", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("restored value mismatch: len=%d want=%d", len(got), len(value))
+	}
+}
+
 // TestEncryption_RebadgeAttackCombinedHeaderFlips covers the PR742
 // codex P1 round-7 finding: a disk attacker who flips
 // encryption_state AND simultaneously modifies tombstone or expireAt

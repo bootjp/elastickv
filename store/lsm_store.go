@@ -1681,7 +1681,15 @@ func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, er
 	if _, err = io.ReadFull(r, (*keyBuf)[:kLen]); err != nil {
 		return 0, 0, false, errors.WithStack(err)
 	}
-	vLen, err = readRestoreFieldLen(r, "snapshot value", maxSnapshotValueSize+valueHeaderSize)
+	// Native Pebble snapshots ship raw on-disk bytes, which for an
+	// encrypted row is value-header(9B) + envelope-overhead(34B) +
+	// ciphertext. The cap must accommodate envelope overhead so a
+	// plaintext written at maxSnapshotValueSize round-trips through
+	// snapshot restore — codex P1 PR742 round-7 caught a case where
+	// validateValueSize accepts the plaintext but restore rejects
+	// the encrypted body with ErrValueTooLarge.
+	vLen, err = readRestoreFieldLen(r, "snapshot value",
+		maxSnapshotValueSize+valueHeaderSize+encryption.EnvelopeOverhead)
 	if err != nil {
 		return 0, 0, false, err
 	}
