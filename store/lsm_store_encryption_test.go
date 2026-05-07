@@ -575,6 +575,65 @@ func TestEncryption_SnapshotRestoreAtMaxValueSize(t *testing.T) {
 	}
 }
 
+// TestEncryption_RebadgeAttackEnvelopeHeaderCorruption covers the
+// PR742 codex P1 round-9 finding: a disk attacker who flips
+// encryption_state to cleartext AND corrupts the envelope's version
+// (or flag) byte forces DecodeEnvelope to fail, which the previous
+// guard treated as "legitimate cleartext". The round-9 fix bypasses
+// DecodeEnvelope and slices the body at fixed offsets, trial-
+// decrypting with canonical (version=0x01, flag=0) so a corrupted
+// version or flag byte no longer ducks the integrity check.
+func TestEncryption_RebadgeAttackEnvelopeHeaderCorruption(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		mutate func(raw []byte) []byte
+	}{
+		{
+			name: "encState + envelope version byte corrupted",
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask // clear encState bits → cleartext
+				// envelope version sits at the start of the body, after
+				// the 9-byte value header.
+				raw[valueHeaderSize] = 0x07 // arbitrary non-0x01
+				return raw
+			},
+		},
+		{
+			name: "encState + envelope flag byte corrupted",
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask
+				raw[valueHeaderSize+1] = 0xff // flag canonical = 0
+				return raw
+			},
+		},
+		{
+			name: "encState + version AND flag corrupted",
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask
+				raw[valueHeaderSize] = 0x42
+				raw[valueHeaderSize+1] = 0x99
+				return raw
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEncryptedStoreFixture(t, 73)
+			ctx := context.Background()
+			const writeTS uint64 = 500001
+			if err := f.mvcc.PutAt(ctx, []byte("hdr"), []byte("payload"), writeTS, 0); err != nil {
+				t.Fatalf("PutAt: %v", err)
+			}
+			f.tamperPebbleValue(t, []byte("hdr"), writeTS, tc.mutate)
+			_, err := f.mvcc.GetAt(ctx, []byte("hdr"), writeTS)
+			if !errors.Is(err, ErrEncryptedReadIntegrity) {
+				t.Fatalf("envelope header corruption rebadge should fail integrity, got %v", err)
+			}
+		})
+	}
+}
+
 // TestEncryption_RebadgeAttackCombinedHeaderFlips covers the PR742
 // codex P1 round-7 finding: a disk attacker who flips
 // encryption_state AND simultaneously modifies tombstone or expireAt
