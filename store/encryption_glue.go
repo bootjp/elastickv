@@ -86,8 +86,12 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte) ([]byte, byte, 
 	nonce := nonceArr[:]
 	// flag = 0: Snappy compression deferred to Stage 9 per design §4.1.
 	const envelopeFlag byte = 0
-	aad := encryption.AppendHeaderAADBytes(nil,
-		encryption.EnvelopeVersionV1, envelopeFlag, keyID)
+	// Pre-size the AAD buffer to header + Pebble key so neither
+	// AppendHeaderAADBytes nor the subsequent append re-allocate on
+	// the hot path. The Pebble key length is bounded by
+	// maxPebbleEncodedKeySize, so the capacity is finite.
+	aad := make([]byte, 0, encryption.HeaderAADSize+len(pebbleKey))
+	aad = encryption.AppendHeaderAADBytes(aad, encryption.EnvelopeVersionV1, envelopeFlag, keyID)
 	aad = append(aad, pebbleKey...)
 	ciphertextAndTag, err := s.cipher.Encrypt(plaintext, aad, keyID, nonce)
 	if err != nil {
@@ -128,7 +132,12 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, encState byte, body []byte
 	if err != nil {
 		return nil, errors.Wrap(err, "store: decode envelope")
 	}
-	aad := encryption.AppendHeaderAADBytes(nil, env.Version, env.Flag, env.KeyID)
+	// Pre-size the AAD buffer (header + Pebble key) so neither
+	// append re-allocates. Symmetric with encryptForKey above; the
+	// AAD must be byte-identical between the two paths or GCM tag
+	// verification fails.
+	aad := make([]byte, 0, encryption.HeaderAADSize+len(pebbleKey))
+	aad = encryption.AppendHeaderAADBytes(aad, env.Version, env.Flag, env.KeyID)
 	aad = append(aad, pebbleKey...)
 	plain, err := s.cipher.Decrypt(env.Body, aad, env.KeyID, env.Nonce[:])
 	if err != nil {
