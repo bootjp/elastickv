@@ -415,33 +415,96 @@ func TestEncryption_ValueHeaderTamperRejected(t *testing.T) {
 }
 
 // TestEncryption_RebadgeAttackRejected covers the PR742 codex P1
-// (round-3) finding: a disk attacker who flips encryption_state from
-// 0b01 to 0b00 leaves the envelope bytes in place but tells the read
-// path to skip decryption. Without the cleartext-branch guard in
-// decryptForKey, the caller would receive raw envelope bytes as
-// "plaintext" — a fail-open integrity bypass.
+// rebadge attack family: a disk attacker who flips encryption_state
+// from 0b01 to 0b00 leaves the envelope bytes in place but tells
+// the read path to skip decryption. Without the cleartext-branch
+// guard in decryptForKey, the caller would receive raw envelope
+// bytes as "plaintext" — a fail-open integrity bypass.
 //
-// The guard parses the body as an envelope and consults
-// Cipher.HasKey for the embedded key_id; when both match (the
-// realistic post-flip shape), the read fails closed with
-// ErrEncryptedReadIntegrity.
+// Round-3 caught the simple flip; round-4 caught the variant where
+// the attacker ALSO modifies the embedded key_id bytes to any
+// unloaded value. The strengthened guard rejects whenever
+// DecodeEnvelope parses the body — independent of whether the
+// embedded key_id is currently loaded.
 func TestEncryption_RebadgeAttackRejected(t *testing.T) {
 	t.Parallel()
-	f := newEncryptedStoreFixture(t, 31)
+	cases := []struct {
+		name    string
+		mutate  func(raw []byte) []byte
+		writeTS uint64
+	}{
+		{
+			name:    "encState flipped, key_id intact",
+			writeTS: 314159,
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask
+				return raw
+			},
+		},
+		{
+			name:    "encState flipped AND key_id rewritten to unloaded",
+			writeTS: 271828,
+			mutate: func(raw []byte) []byte {
+				raw[0] &^= encStateMask
+				// envelope key_id is at byte offset valueHeaderSize+2
+				// (skip flags(1)+expireAt(8) + version(1)+flag(1)).
+				kidOffset := valueHeaderSize + 2
+				// Set to 0xFFFFFFFF, an id that the test fixture has
+				// not loaded. Pre-round-4 guard returned nil here.
+				raw[kidOffset+0] = 0xff
+				raw[kidOffset+1] = 0xff
+				raw[kidOffset+2] = 0xff
+				raw[kidOffset+3] = 0xff
+				return raw
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEncryptedStoreFixture(t, 31)
+			ctx := context.Background()
+			if err := f.mvcc.PutAt(ctx, []byte("rebadge"), []byte("classified"), tc.writeTS, 0); err != nil {
+				t.Fatalf("PutAt: %v", err)
+			}
+			f.tamperPebbleValue(t, []byte("rebadge"), tc.writeTS, tc.mutate)
+			_, err := f.mvcc.GetAt(ctx, []byte("rebadge"), tc.writeTS)
+			if !errors.Is(err, ErrEncryptedReadIntegrity) {
+				t.Fatalf("rebadge attempt should fail integrity, got %v", err)
+			}
+		})
+	}
+}
+
+// TestEncryption_EmptyValueExistsAt is the PR742 codex P1 round-4
+// regression for empty-plaintext semantics: AES-GCM Open returns a
+// nil dst for zero-length plaintext, and the upstream ExistsAt
+// distinguishes "key absent" from "key present with empty value"
+// via val != nil. decryptForKey now normalizes the nil-on-empty
+// case to []byte{} so a Put of an empty value followed by ExistsAt
+// returns true.
+func TestEncryption_EmptyValueExistsAt(t *testing.T) {
+	t.Parallel()
+	f := newEncryptedStoreFixture(t, 37)
 	ctx := context.Background()
-	const writeTS uint64 = 314159 // distinguishable from the other tamper tests' ts=100
-	if err := f.mvcc.PutAt(ctx, []byte("rebadge"), []byte("classified"), writeTS, 0); err != nil {
+	if err := f.mvcc.PutAt(ctx, []byte("empty"), []byte{}, 100, 0); err != nil {
 		t.Fatalf("PutAt: %v", err)
 	}
-	f.tamperPebbleValue(t, []byte("rebadge"), writeTS, func(raw []byte) []byte {
-		// Flip encryption_state from 0b01 to 0b00 (clear bits 1-2)
-		// without touching tombstone bit or expireAt.
-		raw[0] &^= encStateMask
-		return raw
-	})
-	_, err := f.mvcc.GetAt(ctx, []byte("rebadge"), writeTS)
-	if !errors.Is(err, ErrEncryptedReadIntegrity) {
-		t.Fatalf("rebadge attempt should fail integrity, got %v", err)
+	got, err := f.mvcc.GetAt(ctx, []byte("empty"), 100)
+	if err != nil {
+		t.Fatalf("GetAt: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetAt returned nil for an empty stored value (regresses ExistsAt)")
+	}
+	if len(got) != 0 {
+		t.Fatalf("GetAt returned %d bytes, want 0", len(got))
+	}
+	exists, err := f.mvcc.ExistsAt(ctx, []byte("empty"), 100)
+	if err != nil {
+		t.Fatalf("ExistsAt: %v", err)
+	}
+	if !exists {
+		t.Fatal("ExistsAt returned false for a key with empty stored value")
 	}
 }
 

@@ -226,29 +226,6 @@ func TestNewCipher_RejectsNil(t *testing.T) {
 	}
 }
 
-// TestCipher_HasKey covers the accessor used by the storage-layer
-// rebadge guard. Returns true for a loaded key_id, false for an
-// unknown key_id, and false on the nil/zero-value receiver paths.
-func TestCipher_HasKey(t *testing.T) {
-	t.Parallel()
-	ks, keyID := newKeystoreWithKey(t)
-	c := mustCipher(t, ks)
-	if !c.HasKey(keyID) {
-		t.Fatalf("HasKey(%d) = false, want true", keyID)
-	}
-	if c.HasKey(keyID + 1) {
-		t.Fatalf("HasKey(%d) = true on unknown id, want false", keyID+1)
-	}
-	var nilC *encryption.Cipher
-	if nilC.HasKey(keyID) {
-		t.Fatal("HasKey on nil receiver returned true, want false")
-	}
-	zero := encryption.Cipher{}
-	if zero.HasKey(keyID) {
-		t.Fatal("HasKey on zero-value Cipher returned true, want false")
-	}
-}
-
 // TestCipher_ZeroValueRejected covers the case where a caller bypasses
 // NewCipher and instantiates encryption.Cipher{} directly (or holds a
 // nil *Cipher). Encrypt/Decrypt must return ErrNilKeystore rather than

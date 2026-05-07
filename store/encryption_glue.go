@@ -178,15 +178,35 @@ func (s *pebbleStore) decryptForKey(pebbleKey []byte, sv storedValue, body []byt
 		}
 		return nil, errors.Wrap(err, "store: decrypt value")
 	}
+	// AES-GCM Open returns a nil dst slice for an empty plaintext;
+	// upstream callers (notably ExistsAt) distinguish "key absent"
+	// from "key present with empty value" via val != nil. Normalize
+	// to a non-nil zero-length slice so an empty stored value
+	// continues to satisfy ExistsAt → true (PR742 codex P1 round-4).
+	if plain == nil {
+		plain = []byte{}
+	}
 	return plain, nil
 }
 
 // rejectRebadgedEnvelope is the cleartext-branch guard for the §4.1
 // encState rebadge attack. Returns nil for legitimate cleartext;
-// returns ErrEncryptedReadIntegrity if the body looks like a
-// well-formed envelope whose key_id is loaded in the live keystore,
-// since that is overwhelmingly likely to be an attacker-flipped
-// encrypted entry rather than an accidental cleartext byte sequence.
+// returns ErrEncryptedReadIntegrity if the body parses as a
+// well-formed envelope, since that is overwhelmingly likely to be
+// an attacker-flipped encrypted entry rather than an accidental
+// cleartext byte sequence.
+//
+// PR742 codex P1 (round-4) flagged that an earlier
+// "envelope shape AND key_id loaded" check was bypassable: a disk
+// attacker who flips encryption_state to cleartext can also rewrite
+// the embedded key_id bytes to any unloaded value, falling out of
+// the keystore lookup and serving the relabeled bytes as plaintext.
+// The strengthened guard rejects whenever DecodeEnvelope succeeds —
+// the joint probability of legitimate cleartext data starting with
+// 0x01, satisfying the length / flag / key_id / nonce constraints
+// is small enough to accept the trade-off in encryption-enabled
+// deployments. Stage 8's authenticated MVCC metadata bit will
+// replace this heuristic with a deterministic check.
 //
 // No-op when the store has no cipher wired (legacy single-mode
 // deployments cannot have rebadge attacks) or when the body is too
@@ -198,21 +218,13 @@ func (s *pebbleStore) rejectRebadgedEnvelope(body []byte) error {
 	if len(body) < encryption.EnvelopeOverhead {
 		return nil
 	}
-	env, err := encryption.DecodeEnvelope(body)
-	if err != nil {
+	if _, err := encryption.DecodeEnvelope(body); err != nil {
 		// Body does not parse as an envelope; treat as legitimate
 		// cleartext.
 		return nil //nolint:nilerr // intentional: parse failure means "not an envelope"
 	}
-	if !s.cipher.HasKey(env.KeyID) {
-		// Body parses but the embedded key_id is not loaded — the
-		// joint shape+keystore-collision probability is low enough
-		// to treat this as legitimate cleartext that happens to
-		// look envelope-shaped.
-		return nil
-	}
 	return errors.Wrap(ErrEncryptedReadIntegrity,
-		"store: cleartext-labelled value parses as a known-key envelope; refusing rebadge attempt")
+		"store: cleartext-labelled value parses as an envelope; refusing rebadge attempt")
 }
 
 // buildStorageAAD composes the §4.1 storage-envelope AAD with a

@@ -94,24 +94,6 @@ func (c *Cipher) Decrypt(ciphertextAndTag, aad []byte, keyID uint32, nonce []byt
 	return plaintext, nil
 }
 
-// HasKey reports whether keyID is currently loaded in the underlying
-// keystore. Callers in the storage layer use this for the §4.1
-// rebadge guard (PR742 codex P1): when an on-disk value is labelled
-// cleartext but its body parses as a well-formed envelope under a
-// loaded DEK, the storage layer fails closed rather than serving the
-// envelope bytes as plaintext.
-//
-// Returns false for a nil receiver or zero-value Cipher; callers
-// MUST NOT treat that as "key absent" without considering the
-// surrounding context. The hot read/write paths use Encrypt/Decrypt,
-// which raise ErrNilKeystore at the same boundary.
-func (c *Cipher) HasKey(keyID uint32) bool {
-	if c == nil || c.keystore == nil {
-		return false
-	}
-	return c.keystore.Has(keyID)
-}
-
 // aeadFor validates keyID and nonce length, then returns the
 // pre-initialized AEAD from the keystore. The hot path here is a single
 // atomic.Pointer load + a map lookup; AES key expansion happened once
