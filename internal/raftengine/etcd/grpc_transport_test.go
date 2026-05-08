@@ -131,6 +131,259 @@ func TestReceiveSnapshotStreamRejectsDuplicateMetadata(t *testing.T) {
 	require.True(t, errors.Is(err, errSnapshotMetadataDuplicate))
 }
 
+// TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet pins the
+// memory-safety win: when the receive transport has fsmSnapDir wired,
+// the spool file is renamed to fsmSnapPath(...) and Snapshot.Data is
+// the 17-byte EKVT token instead of the materialized payload. The
+// spool dir is left empty, the fsm-snap dir holds the .fsm file, and
+// the token round-trips through restoreSnapshotState onto a fresh FSM.
+//
+// Without this path, receiving a 1.5+ GiB snapshot allocates the entire
+// payload as []byte for raftpb.Snapshot.Data — on a 2.5-GiB-container
+// production node that single allocation OOMs the process before
+// RestoreSnapshot ever runs (2026-05-08 incident).
+func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
+	const index = uint64(123)
+	const term = uint64(5)
+
+	// Build a properly framed testStateMachine payload (count + length-prefixed
+	// items) so restoreSnapshotState can decode it on the receiver. Three
+	// distinct entries mirror the production case where a follower has fallen
+	// behind by many log entries and is recovering from snapshot.
+	senderFSM := &testStateMachine{}
+	for _, e := range [][]byte{[]byte("alpha"), []byte("bravo"), []byte("charlie")} {
+		senderFSM.Apply(e)
+	}
+	snap, err := senderFSM.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+	payload := buf.Bytes()
+
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: term},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	spoolDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(spoolDir)
+	transport.SetFSMSnapDir(fsmSnapDir)
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: payload, Final: true},
+		},
+	}
+	msg, err := transport.receiveSnapshotStream(stream)
+	require.NoError(t, err)
+	require.NotNil(t, msg.Snapshot)
+
+	// Snapshot.Data should now be a 17-byte EKVT token, not the payload.
+	require.Len(t, msg.Snapshot.Data, snapshotTokenSize, "payload must NOT be inline; got %d bytes", len(msg.Snapshot.Data))
+	require.True(t, isSnapshotToken(msg.Snapshot.Data), "Snapshot.Data is not an EKVT token")
+	tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+	require.NoError(t, err)
+	require.Equal(t, index, tok.Index)
+
+	// Spool dir must be empty: the spool file was renamed into fsmSnapDir,
+	// not deleted (which would orphan the data) and not left behind (which
+	// would leak disk).
+	spoolEntries, err := os.ReadDir(spoolDir)
+	require.NoError(t, err)
+	require.Empty(t, spoolEntries, "spool dir should not retain the file after FinalizeAsFSMFile")
+
+	// .fsm file exists at the canonical path with the on-disk format
+	// openAndRestoreFSMSnapshot expects: payload + 4-byte CRC32C footer.
+	fsmPath := fsmSnapPath(fsmSnapDir, index)
+	got, err := os.ReadFile(fsmPath)
+	require.NoError(t, err)
+	require.Equal(t, len(payload)+4, len(got), "missing CRC footer")
+	require.Equal(t, payload, got[:len(payload)])
+
+	// Token round-trips through the apply path: restoreSnapshotState reads
+	// the .fsm file via the streaming io.Reader interface, never
+	// materializing the payload as []byte. Verify the receiver FSM ends up
+	// with exactly the entries the sender serialized.
+	receiverFSM := &testStateMachine{}
+	require.NoError(t, restoreSnapshotState(receiverFSM, *msg.Snapshot, fsmSnapDir))
+	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied())
+}
+
+// TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir pins the EXDEV-avoidance
+// fix from PR #747 round-3 (Codex P1): when fsmSnapDir is wired, the spool
+// file MUST be created inside fsmSnapDir (not spoolDir), so that the
+// FinalizeAsFSMFile rename stays within a single filesystem and cannot fail
+// with syscall.EXDEV. Without this, an operator who mounts spoolDir and
+// fsmSnapDir on separate volumes hits a hard receive failure with the
+// leader retrying indefinitely. Standard engine wiring puts both under
+// cfg.DataDir but the receive code must not assume that.
+func TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir(t *testing.T) {
+	const index = uint64(55)
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	// Distinct directories — different absolute paths so we can prove the
+	// spool went to fsmSnapDir, not spoolDir.
+	spoolDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	// Inject a syncDir failure to keep the partial-state observable: the
+	// rename has fired (so the .fsm file is at fsmSnapPath), Finalize
+	// returned the syncDir error, and we can inspect both directories.
+	original := snapshotSyncDir
+	syncErr := errors.New("simulated syncDir failure")
+	snapshotSyncDir = func(string) error { return syncErr }
+	t.Cleanup(func() { snapshotSyncDir = original })
+
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(spoolDir)
+	transport.SetFSMSnapDir(fsmSnapDir)
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: []byte("payload-for-spool-placement-test"), Final: true},
+		},
+	}
+	_, err = transport.receiveSnapshotStream(stream)
+	require.ErrorIs(t, err, syncErr, "should surface the simulated syncDir error")
+
+	// spoolDir must be empty: the spool was created in fsmSnapDir, not
+	// spoolDir. If a future refactor reverts the placement decision, this
+	// directory would carry an elastickv-etcd-snapshot-* leftover at
+	// minimum, or a renamed .fsm at maximum.
+	spoolEntries, err := os.ReadDir(spoolDir)
+	require.NoError(t, err)
+	require.Empty(t, spoolEntries, "spool dir must NOT receive the spool file when fsmSnapDir is wired (rename would risk EXDEV)")
+
+	// fsmSnapDir holds the renamed .fsm file at the canonical path.
+	finalPath := fsmSnapPath(fsmSnapDir, index)
+	_, statErr := os.Stat(finalPath)
+	require.NoError(t, statErr, "renamed .fsm file should exist at canonical path")
+}
+
+// TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile pins the
+// orphan-cleanup behaviour from PR #747 round-4 (Codex P2): when the
+// receive path successfully finalizes the snapshot as
+// fsmSnapDir/<index>.fsm but the engine's apply (t.handle) then fails
+// — transient context cancel, raft error, etc. — the finalized .fsm
+// file MUST be removed. Otherwise retries at later snapshot indexes
+// accumulate orphan .fsm payloads in fsmSnapDir until startup runs
+// cleanupStaleFSMSnaps. Same-index retries are already safe via
+// os.Rename's atomic-replace, so this test exercises the cross-index
+// case where the orphan would actually persist.
+func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
+	const index = uint64(77)
+
+	// Build a real testStateMachine payload + framed bytes so receive
+	// finalizes a syntactically valid .fsm file.
+	senderFSM := &testStateMachine{}
+	senderFSM.Apply([]byte("entry-for-orphan-cleanup-test"))
+	snap, err := senderFSM.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+	payload := buf.Bytes()
+
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	fsmSnapDir := t.TempDir()
+
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(t.TempDir())
+	transport.SetFSMSnapDir(fsmSnapDir)
+
+	// Wire a handler that always fails so SendSnapshot exercises the
+	// orphan-cleanup branch.
+	applyErr := errors.New("simulated apply failure")
+	transport.SetHandler(func(_ context.Context, _ raftpb.Message) error {
+		return applyErr
+	})
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: payload, Final: true},
+		},
+	}
+
+	err = transport.SendSnapshot(stream)
+	require.Error(t, err)
+	require.ErrorIs(t, err, applyErr, "SendSnapshot must surface the apply failure")
+
+	// THE point: the .fsm file at the canonical path MUST have been
+	// removed. Without the cleanup, leader retries at later indexes
+	// would accumulate one .fsm per failed apply until next startup.
+	finalPath := fsmSnapPath(fsmSnapDir, index)
+	_, statErr := os.Stat(finalPath)
+	require.True(t, os.IsNotExist(statErr),
+		"orphan .fsm file at %s must be removed after apply failure (got stat err: %v)", finalPath, statErr)
+}
+
+// TestReceiveSnapshotStream_LegacyFallbackWhenNoFSMSnapDir pins the
+// behaviour when fsmSnapDir is unset: receive still works, just via the
+// pre-PR materialization path. Tests that don't wire an fsmSnapDir (most
+// of the existing suite) MUST keep behaving exactly as before this PR.
+func TestReceiveSnapshotStream_LegacyFallbackWhenNoFSMSnapDir(t *testing.T) {
+	payload := []byte("legacy-inline-payload")
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: 42, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(t.TempDir())
+	// fsmSnapDir intentionally unset.
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw, Chunk: payload, Final: true},
+		},
+	}
+	msg, err := transport.receiveSnapshotStream(stream)
+	require.NoError(t, err)
+	require.NotNil(t, msg.Snapshot)
+	require.Equal(t, payload, msg.Snapshot.Data)
+	require.False(t, isSnapshotToken(msg.Snapshot.Data))
+}
+
 func TestClientForDeduplicatesConcurrentDial(t *testing.T) {
 	transport := NewGRPCTransport([]Peer{{
 		NodeID:  2,
