@@ -50,6 +50,13 @@ func resolveMaxSnapshotPayloadBytes() int64 {
 
 var errSnapshotPayloadTooLarge = errors.New("etcd raft snapshot payload exceeds limit")
 
+// snapshotSyncDir indirects fsync-on-directory through a package var so a
+// fault-injection test can simulate "rename succeeded but the fsync that
+// would persist the directory entry failed" — that's the partial-failure
+// path FinalizeAsFSMFile's stepwise state-clearing was added to handle,
+// and without an injection seam there's no portable way to reproduce it.
+var snapshotSyncDir = syncDir
+
 const snapshotSpoolPattern = "elastickv-etcd-snapshot-*"
 
 type snapshotSpool struct {
@@ -142,10 +149,16 @@ func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32
 	if err := s.file.Sync(); err != nil {
 		return errors.WithStack(err)
 	}
-	if err := s.file.Close(); err != nil {
-		return errors.WithStack(err)
+	closeErr := s.file.Close()
+	// File descriptor is released by os.File.Close before it returns, even
+	// on error (the underlying fd is invalidated atomically before the
+	// close syscall). Clearing s.file unconditionally avoids a double-Close
+	// from the deferred caller-side Close that would log a confusing
+	// os.ErrClosed warning on top of the real error.
+	s.file = nil
+	if closeErr != nil {
+		return errors.WithStack(closeErr)
 	}
-	s.file = nil // file descriptor closed; subsequent Close() must not double-close.
 
 	finalPath := fsmSnapPath(fsmSnapDir, index)
 	if mkErr := os.MkdirAll(fsmSnapDir, defaultDirPerm); mkErr != nil {
@@ -156,7 +169,7 @@ func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32
 	}
 	s.path = "" // file no longer at this path; subsequent Close() must not try to remove it.
 
-	if syErr := syncDir(fsmSnapDir); syErr != nil {
+	if syErr := snapshotSyncDir(fsmSnapDir); syErr != nil {
 		return errors.WithStack(syErr)
 	}
 	return nil

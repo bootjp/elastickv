@@ -164,6 +164,63 @@ func TestFinalizeAsFSMFile_RenameFailureCleansUpSpool(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr), "Close must remove the orphaned spool file")
 }
 
+// TestFinalizeAsFSMFile_SyncDirFailureCloseIsNoop pins the partial-failure
+// path documented in FinalizeAsFSMFile's comment block: when os.Rename has
+// already succeeded but the subsequent dir-fsync fails, the spool's state
+// clearing must have advanced past s.path so a deferred caller-side
+// spool.Close() returns nil instead of surfacing os.ErrNotExist from
+// trying to delete the now-renamed file. Without the snapshotSyncDir
+// injection seam there is no portable way to reproduce a syncDir failure
+// (the kernel happily fsyncs an empty tmp dir).
+func TestFinalizeAsFSMFile_SyncDirFailureCloseIsNoop(t *testing.T) {
+	const (
+		index uint64 = 17
+		crc   uint32 = 0xcafebabe
+	)
+	spoolDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	original := snapshotSyncDir
+	syncErr := errors.New("simulated syncDir failure")
+	snapshotSyncDir = func(string) error { return syncErr }
+	t.Cleanup(func() { snapshotSyncDir = original })
+
+	spool, err := newSnapshotSpool(spoolDir)
+	require.NoError(t, err)
+
+	payload := []byte("payload-bytes-for-syncdir-failure-test")
+	_, err = spool.Write(payload)
+	require.NoError(t, err)
+
+	err = spool.FinalizeAsFSMFile(fsmSnapDir, index, crc)
+	require.Error(t, err)
+	require.ErrorIs(t, err, syncErr, "Finalize must surface the syncDir error")
+
+	// Crucial: rename already happened, so the .fsm file is at its
+	// canonical path. A future read MUST find it; the syncDir failure
+	// is durability-only, not a logical-state regression.
+	finalPath := fsmSnapPath(fsmSnapDir, index)
+	_, statErr := os.Stat(finalPath)
+	require.NoError(t, statErr, ".fsm file should be at canonical path despite syncDir failure")
+
+	// Spool dir is empty (file was renamed out, not deleted, not
+	// orphaned at the spool location).
+	spoolEntries, err := os.ReadDir(spoolDir)
+	require.NoError(t, err)
+	require.Empty(t, spoolEntries)
+
+	// THE point: deferred Close() must be a clean no-op despite the
+	// upstream error. Pre-fix, Close() would have tried os.Remove on
+	// the original spool path, returned os.ErrNotExist, and the slog
+	// warning in receiveSnapshotStream would bury the real syncDir
+	// signal under a misleading not-exist log line.
+	require.NoError(t, spool.Close(), "Close after syncDir failure must not surface os.ErrNotExist")
+
+	// .fsm file is still on disk after Close.
+	_, statErr = os.Stat(finalPath)
+	require.NoError(t, statErr)
+}
+
 func TestCleanupStaleSnapshotSpools(t *testing.T) {
 	dir := t.TempDir()
 
