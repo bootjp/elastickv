@@ -2,11 +2,37 @@ package kv
 
 import (
 	"context"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
+
+// verifyLeaderTimeout caps how long the no-context verifyLeaderEngine path
+// is willing to wait for a ReadIndex round-trip.
+//
+// A previous version called engine.VerifyLeader with context.Background(),
+// so callers without an upstream deadline (LeaderProxy.Commit/Abort,
+// Coordinate.VerifyLeader, ShardedCoordinator.VerifyLeader[ForKey], and
+// the S3/SQS/admin /healthz/leader handlers) blocked indefinitely whenever
+// ReadIndex completion stalled — a single transient stall accumulated
+// callers permanently.
+//
+// Production hit this on 2026-05-08: a follower (192.168.0.214) lost its
+// network route mid-flight and the leader's ReadIndex completion stalled
+// intermittently. verifyLeaderEngine callers piled up at ~9/sec without
+// bound; after ~37 minutes the leader was holding 20,560 goroutines
+// (20,478 in submitRead select, oldest 39 minutes), CPU pinned at 1870%
+// (the Engine.run Ready loop walks pendingReads O(N) per tick, so the
+// queue feeds back on itself), and host MemAvailable trended toward 0
+// until OOM. The same pattern repeated on each new leader after failover.
+//
+// 5s matches leaderForwardTimeout: a verify that takes longer than a
+// single forward RPC is, by definition, useless as a freshness check,
+// and the proxy's verify-then-forward path stays within its 5s retry
+// budget.
+const verifyLeaderTimeout = 5 * time.Second
 
 func engineForGroup(g *ShardGroup) raftengine.Engine {
 	if g == nil {
@@ -41,7 +67,9 @@ func verifyLeaderEngineCtx(ctx context.Context, engine raftengine.LeaderView) er
 }
 
 func verifyLeaderEngine(engine raftengine.LeaderView) error {
-	return verifyLeaderEngineCtx(context.Background(), engine)
+	ctx, cancel := context.WithTimeout(context.Background(), verifyLeaderTimeout)
+	defer cancel()
+	return verifyLeaderEngineCtx(ctx, engine)
 }
 
 func linearizableReadEngineCtx(ctx context.Context, engine raftengine.LeaderView) (uint64, error) {
