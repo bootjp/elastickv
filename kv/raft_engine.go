@@ -2,11 +2,29 @@ package kv
 
 import (
 	"context"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
+
+// verifyLeaderTimeout caps how long the no-context verifyLeaderEngine path
+// is willing to wait for a ReadIndex round-trip. Without this bound,
+// callers that hold context.Background() (LeaderProxy.Commit/Abort,
+// Coordinate.VerifyLeader, ShardedCoordinator.VerifyLeader[ForKey], and
+// the S3/SQS/admin /healthz/leader handlers) blocked indefinitely whenever
+// ReadIndex completion stalled, and a single transient stall accumulated
+// callers permanently — Engine.run's Ready loop walks pendingReads O(N)
+// per tick, so the queue feeds back on itself once it grows.
+//
+// 5s matches leaderForwardTimeout: a verify that takes longer than a
+// single forward RPC is useless as a freshness check, and the proxy's
+// verify-then-forward path stays within its 5s retry budget.
+//
+// See PR #745 / incident 2026-05-08 for the goroutine-pile production
+// failure this prevents.
+const verifyLeaderTimeout = 5 * time.Second
 
 func engineForGroup(g *ShardGroup) raftengine.Engine {
 	if g == nil {
@@ -41,7 +59,9 @@ func verifyLeaderEngineCtx(ctx context.Context, engine raftengine.LeaderView) er
 }
 
 func verifyLeaderEngine(engine raftengine.LeaderView) error {
-	return verifyLeaderEngineCtx(context.Background(), engine)
+	ctx, cancel := context.WithTimeout(context.Background(), verifyLeaderTimeout)
+	defer cancel()
+	return verifyLeaderEngineCtx(ctx, engine)
 }
 
 func linearizableReadEngineCtx(ctx context.Context, engine raftengine.LeaderView) (uint64, error) {
