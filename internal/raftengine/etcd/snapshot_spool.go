@@ -2,27 +2,60 @@ package etcd
 
 import (
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 )
 
-var (
-	// The current raftpb snapshot APIs still materialize payloads as []byte, so
-	// the prototype cannot stream snapshots end-to-end yet. Keep the payload on
-	// disk while assembling it and fail fast before unbounded growth.
-	maxSnapshotPayloadBytes int64 = 1 << 30 // 1 GiB
+// defaultMaxSnapshotPayloadBytes is the receive-side cap on a single snapshot
+// stream's spooled payload. Production hit a 1 GiB ceiling here that was
+// silently rejecting real-world FSM transfers (1.35 GiB+), so the receiver
+// returned errSnapshotPayloadTooLarge mid-stream, the gRPC stream broke,
+// and etcd raft retried — indefinitely, since each retry hit the same wall.
+// Followers stuck at stale applied indices, leader sustained ~100 MB/s
+// outbound, host disks saturated for hours.
+//
+// 16 GiB is sized as ~12× the production-observed FSM size so the limit
+// does not drift back into the runway as data grows. The cap still exists
+// so a misbehaving / compromised peer cannot stream unbounded data into
+// the spool dir; operators can raise it further via
+// ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES if a real FSM ever exceeds
+// even this default.
+const defaultMaxSnapshotPayloadBytes int64 = 16 << 30 // 16 GiB
 
-	errSnapshotPayloadTooLarge = errors.New("etcd raft snapshot payload exceeds limit")
-)
+const maxSnapshotPayloadBytesEnvVar = "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES"
+
+// resolveMaxSnapshotPayloadBytes evaluates the env override once per spool
+// creation. Snapshots are infrequent enough that one Getenv + ParseInt per
+// spool is invisible in profiles, and resolving at construction means tests
+// that flip the env via t.Setenv don't have to mutate process-wide globals.
+func resolveMaxSnapshotPayloadBytes() int64 {
+	v := strings.TrimSpace(os.Getenv(maxSnapshotPayloadBytesEnvVar))
+	if v == "" {
+		return defaultMaxSnapshotPayloadBytes
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		slog.Warn("invalid ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES; using default",
+			"value", v, "default_bytes", defaultMaxSnapshotPayloadBytes)
+		return defaultMaxSnapshotPayloadBytes
+	}
+	return n
+}
+
+var errSnapshotPayloadTooLarge = errors.New("etcd raft snapshot payload exceeds limit")
 
 const snapshotSpoolPattern = "elastickv-etcd-snapshot-*"
 
 type snapshotSpool struct {
-	file *os.File
-	path string
-	size int64
+	file    *os.File
+	path    string
+	size    int64
+	maxSize int64
 }
 
 func newSnapshotSpool(dir string) (*snapshotSpool, error) {
@@ -30,12 +63,16 @@ func newSnapshotSpool(dir string) (*snapshotSpool, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &snapshotSpool{file: file, path: file.Name()}, nil
+	return &snapshotSpool{
+		file:    file,
+		path:    file.Name(),
+		maxSize: resolveMaxSnapshotPayloadBytes(),
+	}, nil
 }
 
 func (s *snapshotSpool) Write(p []byte) (int, error) {
-	if int64(len(p))+s.size > maxSnapshotPayloadBytes {
-		return 0, errors.Wrapf(errSnapshotPayloadTooLarge, "%d > %d", int64(len(p))+s.size, maxSnapshotPayloadBytes)
+	if int64(len(p))+s.size > s.maxSize {
+		return 0, errors.Wrapf(errSnapshotPayloadTooLarge, "%d > %d", int64(len(p))+s.size, s.maxSize)
 	}
 	n, err := s.file.Write(p)
 	s.size += int64(n)
@@ -50,7 +87,7 @@ func (s *snapshotSpool) Bytes() ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 	// Read incrementally instead of sizing a buffer from s.size so malformed
-	// inputs stay bounded by maxSnapshotPayloadBytes and file-backed I/O.
+	// inputs stay bounded by s.maxSize and file-backed I/O.
 	data, err := io.ReadAll(s.file)
 	if err != nil {
 		return nil, errors.WithStack(err)
