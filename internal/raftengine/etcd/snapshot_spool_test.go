@@ -45,23 +45,36 @@ func TestSnapshotSpool_DefaultCapAcceptsRealisticFSM(t *testing.T) {
 		written += int64(n)
 	}
 	require.Equal(t, target, spool.size)
+
+	// Round-trip through the materialization path (the io.ReadAll →
+	// io.ReadFull refactor) to lock down behaviour at 1.5 GiB. The
+	// returned slice MUST match s.size exactly: a short read here would
+	// indicate the pre-allocation drifted out of sync with what Write
+	// actually persisted to the spool file.
+	got, err := spool.Bytes()
+	require.NoError(t, err)
+	require.Equal(t, int(target), len(got), "Bytes() returned %d, want %d", len(got), target)
+	// Spot-check first/last bytes match the 0xAB fill; full byte-equality
+	// would double the test's memory cost without adding signal.
+	require.Equal(t, byte(0xAB), got[0])
+	require.Equal(t, byte(0xAB), got[len(got)-1])
 }
 
 // TestSnapshotSpool_OverrideViaEnv confirms the env knob actually moves the
 // cap. Tests deliberately *lower* it (cheap to write past) instead of
 // raising — the upper-bound test above already proves a generous cap works.
 func TestSnapshotSpool_OverrideViaEnv(t *testing.T) {
-	const cap = int64(4096)
-	t.Setenv(maxSnapshotPayloadBytesEnvVar, strconv.FormatInt(cap, 10))
+	const spoolCap = int64(4096)
+	t.Setenv(maxSnapshotPayloadBytesEnvVar, strconv.FormatInt(spoolCap, 10))
 
 	spool, err := newSnapshotSpool(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = spool.Close() })
 
-	require.Equal(t, cap, spool.maxSize)
+	require.Equal(t, spoolCap, spool.maxSize)
 
 	// Write up to the cap — succeeds.
-	_, err = spool.Write(bytes.Repeat([]byte{0x01}, int(cap)))
+	_, err = spool.Write(bytes.Repeat([]byte{0x01}, int(spoolCap)))
 	require.NoError(t, err)
 
 	// One byte past — fails with the documented sentinel so callers can
