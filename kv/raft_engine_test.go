@@ -5,9 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/errors"
-
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
 )
 
 // blockingLeaderView is a LeaderView whose VerifyLeader blocks until ctx is
@@ -54,11 +53,10 @@ func TestVerifyLeaderEngine_BoundsBlockingReadIndex(t *testing.T) {
 		t.Fatalf("verifyLeaderEngine(blocking) err = %v; want DeadlineExceeded", err)
 	}
 	// Lower bound: confirm the engine actually held the call until the
-	// deadline fired. Without this, a future regression that returned
-	// DeadlineExceeded immediately (e.g. a misplaced ctx check before
-	// the engine call) would silently pass. Pulled in from gemini's
-	// PR #745 round-1 review — the upper bound alone proved bounded
-	// completion but not "the timeout actually fired."
+	// deadline fired, not that some other error path returned
+	// immediately. Without this, a future regression that returned
+	// DeadlineExceeded before doing any work (e.g. a misplaced ctx
+	// check before the engine call) would silently pass.
 	//
 	// Tolerate a 200ms early-return slack so a slow CI scheduler that
 	// trips ctx.Done() a hair before the wall clock catches up does
