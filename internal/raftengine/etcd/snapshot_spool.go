@@ -71,8 +71,13 @@ func newSnapshotSpool(dir string) (*snapshotSpool, error) {
 }
 
 func (s *snapshotSpool) Write(p []byte) (int, error) {
-	if int64(len(p))+s.size > s.maxSize {
-		return 0, errors.Wrapf(errSnapshotPayloadTooLarge, "%d > %d", int64(len(p))+s.size, s.maxSize)
+	// Subtraction-based comparison so the cap check stays correct even when
+	// s.maxSize is set to a value near math.MaxInt64 via the env override:
+	// `int64(len(p))+s.size > s.maxSize` would overflow into a negative number
+	// at large maxSize and let the write through. `int64(len(p)) > s.maxSize-s.size`
+	// stays in [0, maxSize] and rejects the same payloads correctly.
+	if int64(len(p)) > s.maxSize-s.size {
+		return 0, errors.Wrapf(errSnapshotPayloadTooLarge, "adding %d bytes to current %d would exceed limit %d", len(p), s.size, s.maxSize)
 	}
 	n, err := s.file.Write(p)
 	s.size += int64(n)
@@ -86,13 +91,17 @@ func (s *snapshotSpool) Bytes() ([]byte, error) {
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	// Read incrementally instead of sizing a buffer from s.size so malformed
-	// inputs stay bounded by s.maxSize and file-backed I/O.
-	data, err := io.ReadAll(s.file)
-	if err != nil {
+	// Pre-allocate from the bytes we have already accepted past Write's
+	// per-call cap check, instead of letting io.ReadAll grow the buffer
+	// through several power-of-two doublings (a 1.35 GiB receive would
+	// trigger ~30 reallocs and copy the running total each time). s.size
+	// is the truth-of-record for what's on disk because Write only
+	// increments it on successful os.File.Write returns.
+	buf := make([]byte, s.size)
+	if _, err := io.ReadFull(s.file, buf); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return data, nil
+	return buf, nil
 }
 
 func (s *snapshotSpool) Reader() (io.Reader, error) {
