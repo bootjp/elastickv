@@ -683,28 +683,25 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 	return errors.WithStack(handler(ctx, msg))
 }
 
-func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
-	var metadata raftpb.Message
-	seenMetadata := false
+// snapshotSpoolPlacement returns (spoolDir, fsmSnapDir) under the transport
+// lock. When fsmSnapDir is wired, the spool itself is placed inside it so
+// FinalizeAsFSMFile's rename stays intra-filesystem and cannot fail with
+// EXDEV. Standard engine wiring puts both under cfg.DataDir, but the
+// receive code should not assume that. The legacy fallback path
+// (fsmSnapDir == "") keeps the spool in spoolDir because it never renames
+// — Bytes() materializes the payload in place.
+func (t *GRPCTransport) snapshotSpoolPlacement() (placement, fsmSnapDir string) {
 	t.mu.RLock()
-	spoolDir := t.spoolDir
-	fsmSnapDir := t.fsmSnapDir
-	t.mu.RUnlock()
-
-	// Place the spool file inside fsmSnapDir (not spoolDir) when the
-	// streaming-token path is wired, so FinalizeAsFSMFile's os.Rename
-	// stays within a single filesystem and cannot fail with EXDEV. An
-	// operator who mounts spoolDir and fsmSnapDir on different volumes
-	// would otherwise hit a hard receive failure (the leader retries
-	// indefinitely with no chance of success). Standard engine wiring
-	// already puts both under cfg.DataDir, but the receive code should
-	// not assume that. The legacy fallback path (fsmSnapDir empty)
-	// keeps the spool in spoolDir because it never renames — Bytes()
-	// materializes the payload in place.
-	spoolPlacement := spoolDir
+	defer t.mu.RUnlock()
+	fsmSnapDir = t.fsmSnapDir
 	if fsmSnapDir != "" {
-		spoolPlacement = fsmSnapDir
+		return fsmSnapDir, fsmSnapDir
 	}
+	return t.spoolDir, ""
+}
+
+func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
+	spoolPlacement, fsmSnapDir := t.snapshotSpoolPlacement()
 	spool, err := newSnapshotSpool(spoolPlacement)
 	if err != nil {
 		return raftpb.Message{}, err
@@ -723,11 +720,43 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		}
 	}()
 
-	// Wrap spool with crc32CWriter so the CRC accumulates as bytes hit disk.
-	// The CRC is only meaningful when we have an fsmSnapDir to finalize into;
-	// the legacy fallback path discards it. Cost is hashing speed (~GB/s on
-	// modern x86 with SSE 4.2 PCLMULQDQ) which is far above the gRPC stream
-	// throughput so the wrapper is invisible in profiles.
+	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir)
+	if err != nil {
+		return raftpb.Message{}, err
+	}
+	index := uint64(0)
+	if msg.Snapshot != nil {
+		index = msg.Snapshot.Metadata.Index
+	}
+	slog.Info("etcd raft snapshot stream received",
+		"index", index,
+		"from", msg.From,
+		"payload_bytes", payloadBytes,
+		"format", snapshotDataFormatLabel(msg.Snapshot),
+	)
+	return msg, nil
+}
+
+// drainSnapshotChunks consumes the SendSnapshot stream into spool, computes
+// CRC32C over the payload bytes as they hit disk, and on the final chunk
+// hands off to finalizeReceivedSnapshot — which decides between the
+// streaming-token path (rename to fsmSnapDir/<index>.fsm + 17-byte token
+// in Snapshot.Data) and the legacy materialize fallback. Extracted from
+// receiveSnapshotStream so that function stays under cyclop's complexity
+// budget.
+func drainSnapshotChunks(
+	stream pb.EtcdRaft_SendSnapshotServer,
+	spool *snapshotSpool,
+	fsmSnapDir string,
+) (raftpb.Message, int64, error) {
+	var metadata raftpb.Message
+	seenMetadata := false
+	// Wrap spool with crc32CWriter so the CRC accumulates as bytes hit
+	// disk. The CRC is only meaningful when we have an fsmSnapDir to
+	// finalize into; the legacy fallback path discards it. Cost is
+	// hashing speed (~GB/s on modern x86 with SSE 4.2 PCLMULQDQ), well
+	// above gRPC stream throughput so the wrapper is invisible in
+	// profiles.
 	crcWriter := newCRC32CWriter(spool)
 
 	var payloadBytes int64
@@ -735,32 +764,22 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		chunk, err := stream.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return raftpb.Message{}, errors.WithStack(errSnapshotStreamShort)
+				return raftpb.Message{}, 0, errors.WithStack(errSnapshotStreamShort)
 			}
-			return raftpb.Message{}, errors.WithStack(err)
+			return raftpb.Message{}, 0, errors.WithStack(err)
 		}
 		payloadBytes += int64(len(chunk.Chunk))
 		seen, err := appendSnapshotChunk(&metadata, crcWriter, chunk, seenMetadata)
 		if err != nil {
-			return raftpb.Message{}, err
+			return raftpb.Message{}, 0, err
 		}
 		seenMetadata = seen
 		if chunk.Final {
 			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, seenMetadata)
 			if err != nil {
-				return raftpb.Message{}, err
+				return raftpb.Message{}, 0, err
 			}
-			index := uint64(0)
-			if msg.Snapshot != nil {
-				index = msg.Snapshot.Metadata.Index
-			}
-			slog.Info("etcd raft snapshot stream received",
-				"index", index,
-				"from", msg.From,
-				"payload_bytes", payloadBytes,
-				"format", snapshotDataFormatLabel(msg.Snapshot),
-			)
-			return msg, nil
+			return msg, payloadBytes, nil
 		}
 	}
 }
