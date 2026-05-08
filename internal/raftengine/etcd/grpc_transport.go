@@ -688,6 +688,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	seenMetadata := false
 	t.mu.RLock()
 	spoolDir := t.spoolDir
+	fsmSnapDir := t.fsmSnapDir
 	t.mu.RUnlock()
 
 	spool, err := newSnapshotSpool(spoolDir)
@@ -697,6 +698,13 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	defer func() {
 		_ = spool.Close()
 	}()
+
+	// Wrap spool with crc32CWriter so the CRC accumulates as bytes hit disk.
+	// The CRC is only meaningful when we have an fsmSnapDir to finalize into;
+	// the legacy fallback path discards it. Cost is hashing speed (~GB/s on
+	// modern x86 with SSE 4.2 PCLMULQDQ) which is far above the gRPC stream
+	// throughput so the wrapper is invisible in profiles.
+	crcWriter := newCRC32CWriter(spool)
 
 	var payloadBytes int64
 	for {
@@ -708,13 +716,13 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 			return raftpb.Message{}, errors.WithStack(err)
 		}
 		payloadBytes += int64(len(chunk.Chunk))
-		seen, err := appendSnapshotChunk(&metadata, spool, chunk, seenMetadata)
+		seen, err := appendSnapshotChunk(&metadata, crcWriter, chunk, seenMetadata)
 		if err != nil {
 			return raftpb.Message{}, err
 		}
 		seenMetadata = seen
 		if chunk.Final {
-			msg, err := buildSnapshotMessage(metadata, spool, seenMetadata)
+			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, seenMetadata)
 			if err != nil {
 				return raftpb.Message{}, err
 			}
@@ -726,10 +734,58 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 				"index", index,
 				"from", msg.From,
 				"payload_bytes", payloadBytes,
+				"format", snapshotDataFormatLabel(msg.Snapshot),
 			)
 			return msg, nil
 		}
 	}
+}
+
+// finalizeReceivedSnapshot picks between the streaming-token path (when an
+// fsmSnapDir is wired and the snapshot's metadata index is non-zero) and the
+// legacy in-memory path. The streaming path renames the spool file in place
+// to fsmSnapPath(fsmSnapDir, index), embeds a 17-byte EKVT token in
+// Snapshot.Data, and lets restoreSnapshotState read the payload off disk via
+// io.Reader — heap usage stays flat regardless of FSM size, eliminating the
+// 1.35-GiB-FSM × 2.5-GiB-container OOM hazard observed in the 2026-05-08
+// incident. The legacy path is preserved for tests and legacy receivers
+// that have not wired a snapshot directory.
+func finalizeReceivedSnapshot(
+	metadata raftpb.Message,
+	spool *snapshotSpool,
+	crc32c uint32,
+	fsmSnapDir string,
+	seenMetadata bool,
+) (raftpb.Message, error) {
+	if !seenMetadata || metadata.Snapshot == nil {
+		return raftpb.Message{}, errors.WithStack(errSnapshotMetadataNil)
+	}
+	index := metadata.Snapshot.Metadata.Index
+	if fsmSnapDir != "" && index > 0 {
+		if err := spool.FinalizeAsFSMFile(fsmSnapDir, index, crc32c); err != nil {
+			return raftpb.Message{}, err
+		}
+		metadata.Snapshot.Data = encodeSnapshotToken(index, crc32c)
+		return metadata, nil
+	}
+	// Legacy fallback: full materialization. Used by tests that don't wire an
+	// fsmSnapDir and by the index=0 edge case (no canonical filename to
+	// rename to).
+	return buildSnapshotMessage(metadata, spool, seenMetadata)
+}
+
+// snapshotDataFormatLabel exists purely for the structured log line on the
+// receiver — it lets an operator distinguish a streaming-token receive
+// (small heap, payload on disk) from a legacy materialization (heap holds
+// the full payload) at a glance, without grepping for byte counts.
+func snapshotDataFormatLabel(snap *raftpb.Snapshot) string {
+	if snap == nil {
+		return "nil"
+	}
+	if isSnapshotToken(snap.Data) {
+		return "token"
+	}
+	return "inline"
 }
 
 func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.EtcdRaftSnapshotChunk, seenMetadata bool) (bool, error) {
