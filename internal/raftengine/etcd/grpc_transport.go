@@ -696,7 +696,17 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		return raftpb.Message{}, err
 	}
 	defer func() {
-		_ = spool.Close()
+		// Log rather than swallow: a Close failure here points at a
+		// half-written spool file we couldn't clean up (disk full,
+		// permission flip mid-stream, …). Once FinalizeAsFSMFile has
+		// transferred ownership, Close is a no-op so this only fires on
+		// the unhappy paths that actually need an operator to look.
+		if closeErr := spool.Close(); closeErr != nil {
+			slog.Warn("snapshot spool close failed",
+				"spool_dir", spoolDir,
+				"err", closeErr,
+			)
+		}
 	}()
 
 	// Wrap spool with crc32CWriter so the CRC accumulates as bytes hit disk.

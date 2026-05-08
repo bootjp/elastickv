@@ -119,22 +119,23 @@ func (s *snapshotSpool) Reader() (io.Reader, error) {
 // materializing a multi-GiB Snapshot.Data []byte. The spool file already
 // holds the payload; we only append 4 bytes and rename. Heap stays flat
 // regardless of FSM size.
-func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32c uint32) (err error) {
+func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32c uint32) error {
 	if s == nil || s.file == nil {
 		return errors.New("snapshot spool: finalize on closed/nil spool")
 	}
-	defer func() {
-		if err != nil {
-			// On failure, fall through to deferred Close() in caller — keep
-			// spool fields populated so Close removes the half-written file.
-			return
-		}
-		// Success: file has been renamed; null out so Close() is a no-op
-		// instead of trying to remove a path that no longer points at us.
-		s.file = nil
-		s.path = ""
-	}()
 
+	// State is cleared at each successful step so a deferred caller-side
+	// spool.Close() never tries to operate on a resource we already
+	// released. Two failure modes the original single-defer version would
+	// have produced misleading errors for, that this stepwise approach
+	// avoids:
+	//   1. file.Close() succeeds, os.Rename() fails → s.file=nil but s.path
+	//      still valid, so Close() correctly removes the half-written
+	//      spool file at its original path (the rename never happened).
+	//   2. os.Rename() succeeds, syncDir() fails → s.file=nil AND s.path=""
+	//      so Close() is a no-op. Without the per-step clear, Close()
+	//      would attempt os.Remove(s.path) and surface a misleading
+	//      ErrNotExist that buries the real syncDir error.
 	if err := binary.Write(s.file, binary.BigEndian, crc32c); err != nil {
 		return errors.WithStack(err)
 	}
@@ -144,6 +145,7 @@ func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32
 	if err := s.file.Close(); err != nil {
 		return errors.WithStack(err)
 	}
+	s.file = nil // file descriptor closed; subsequent Close() must not double-close.
 
 	finalPath := fsmSnapPath(fsmSnapDir, index)
 	if mkErr := os.MkdirAll(fsmSnapDir, defaultDirPerm); mkErr != nil {
@@ -152,6 +154,8 @@ func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32
 	if rnErr := os.Rename(s.path, finalPath); rnErr != nil {
 		return errors.WithStack(rnErr)
 	}
+	s.path = "" // file no longer at this path; subsequent Close() must not try to remove it.
+
 	if syErr := syncDir(fsmSnapDir); syErr != nil {
 		return errors.WithStack(syErr)
 	}

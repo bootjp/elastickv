@@ -82,6 +82,88 @@ func TestSnapshotSpool_OverrideInvalidFallsBack(t *testing.T) {
 	require.Equal(t, defaultMaxSnapshotPayloadBytes, spool.maxSize)
 }
 
+// TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop pins the gemini-medium
+// review on PR #747: after a successful FinalizeAsFSMFile, the deferred
+// caller-side spool.Close() must NOT attempt to remove the renamed file
+// (which would surface a misleading os.ErrNotExist that buries any real
+// error the caller is reporting). State clearing inside FinalizeAsFSMFile
+// at each successful step makes the post-success Close() a true no-op.
+func TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop(t *testing.T) {
+	const (
+		index uint64 = 99
+		crc   uint32 = 0x42424242
+	)
+	spoolDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	spool, err := newSnapshotSpool(spoolDir)
+	require.NoError(t, err)
+
+	payload := []byte("payload-bytes-for-finalize-test")
+	_, err = spool.Write(payload)
+	require.NoError(t, err)
+
+	require.NoError(t, spool.FinalizeAsFSMFile(fsmSnapDir, index, crc))
+
+	// Spool dir is empty (file moved, not deleted, not orphaned).
+	spoolEntries, err := os.ReadDir(spoolDir)
+	require.NoError(t, err)
+	require.Empty(t, spoolEntries)
+
+	// .fsm file exists at canonical path with payload + 4-byte CRC footer.
+	finalPath := fsmSnapPath(fsmSnapDir, index)
+	got, err := os.ReadFile(finalPath)
+	require.NoError(t, err)
+	require.Equal(t, len(payload)+4, len(got))
+	require.Equal(t, payload, got[:len(payload)])
+
+	// Critical: post-Finalize Close() must be a clean no-op, not surface
+	// os.ErrNotExist from trying to remove the original spool path.
+	require.NoError(t, spool.Close(), "Close after successful Finalize must not error")
+
+	// Idempotent: a second Close (from a buggy / over-cautious caller)
+	// must also be a no-op.
+	require.NoError(t, spool.Close())
+
+	// Renamed file is still on disk — Close did not nuke it.
+	_, err = os.Stat(finalPath)
+	require.NoError(t, err)
+}
+
+// TestFinalizeAsFSMFile_RenameFailureCleansUpSpool pins the partial-failure
+// path: if os.Rename fails (here simulated by removing the spool dir), the
+// already-closed spool file lives at its original path. The deferred
+// caller-side Close() should still remove that orphan so we don't leak
+// disk on the unhappy path.
+func TestFinalizeAsFSMFile_RenameFailureCleansUpSpool(t *testing.T) {
+	spoolDir := t.TempDir()
+	// Point fsmSnapDir at a path under a directory we'll make unwritable
+	// AFTER the spool file is created. The file gets sync+close'd but the
+	// rename fails because the destination dir cannot be created.
+	parent := t.TempDir()
+	require.NoError(t, os.Chmod(parent, 0o500)) // r-x: MkdirAll under it fails
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
+	fsmSnapDir := filepath.Join(parent, "no-such-subdir")
+
+	spool, err := newSnapshotSpool(spoolDir)
+	require.NoError(t, err)
+	_, err = spool.Write([]byte("payload"))
+	require.NoError(t, err)
+	spoolPath := spool.path
+
+	err = spool.FinalizeAsFSMFile(fsmSnapDir, 7, 0xdeadbeef)
+	require.Error(t, err, "Finalize must report the MkdirAll/Rename failure")
+
+	// Spool file is still at its original path (rename never happened).
+	_, statErr := os.Stat(spoolPath)
+	require.NoError(t, statErr, "spool file should still exist after a pre-rename failure")
+
+	// Caller's deferred Close() now removes the orphan.
+	require.NoError(t, spool.Close())
+	_, statErr = os.Stat(spoolPath)
+	require.True(t, os.IsNotExist(statErr), "Close must remove the orphaned spool file")
+}
+
 func TestCleanupStaleSnapshotSpools(t *testing.T) {
 	dir := t.TempDir()
 
