@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -378,9 +379,52 @@ func (t *GRPCTransport) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) erro
 		return err
 	}
 	if err := t.handle(stream.Context(), msg); err != nil {
+		// If receive finalized the snapshot as a .fsm file (token in
+		// Snapshot.Data), the engine refused to apply it — likely a
+		// transient context cancel or raft error. Remove the on-disk
+		// file so retries at later indexes don't leak orphan .fsm
+		// payloads into fsmSnapDir until the next startup runs
+		// cleanupStaleFSMSnaps. Same-index retries are already safe
+		// because os.Rename atomically replaces the prior file.
+		t.removeOrphanedFSMSnapshot(msg)
 		return err
 	}
 	return errors.WithStack(stream.SendAndClose(&pb.EtcdRaftAck{}))
+}
+
+// removeOrphanedFSMSnapshot deletes the .fsm file that
+// receiveSnapshotStream finalized for `msg`, if any. Used by
+// SendSnapshot when the engine apply (`t.handle`) fails after the
+// receive succeeded — the engine has NOT applied the snapshot (apply is
+// synchronous to t.handle, so a non-nil return means applied_index was
+// not advanced), so the file is unreferenced and safe to remove.
+//
+// Best-effort: a cleanup failure here is logged but not returned because
+// the original apply error is the actionable signal; orphans get swept
+// by cleanupStaleFSMSnaps at the next engine restart even if Remove
+// races with another process.
+func (t *GRPCTransport) removeOrphanedFSMSnapshot(msg raftpb.Message) {
+	if msg.Snapshot == nil || !isSnapshotToken(msg.Snapshot.Data) {
+		return
+	}
+	tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+	if err != nil {
+		return
+	}
+	t.mu.RLock()
+	fsmSnapDir := t.fsmSnapDir
+	t.mu.RUnlock()
+	if fsmSnapDir == "" {
+		return
+	}
+	path := fsmSnapPath(fsmSnapDir, tok.Index)
+	if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+		slog.Warn("failed to remove orphaned fsm snapshot file after apply failure",
+			"path", path,
+			"index", tok.Index,
+			"err", rmErr,
+		)
+	}
 }
 
 func (t *GRPCTransport) Send(ctx context.Context, req *pb.EtcdRaftMessage) (*pb.EtcdRaftAck, error) {

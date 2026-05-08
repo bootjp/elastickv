@@ -282,6 +282,75 @@ func TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir(t *testing.T) {
 	require.NoError(t, statErr, "renamed .fsm file should exist at canonical path")
 }
 
+// TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile pins the
+// orphan-cleanup behaviour from PR #747 round-4 (Codex P2): when the
+// receive path successfully finalizes the snapshot as
+// fsmSnapDir/<index>.fsm but the engine's apply (t.handle) then fails
+// — transient context cancel, raft error, etc. — the finalized .fsm
+// file MUST be removed. Otherwise retries at later snapshot indexes
+// accumulate orphan .fsm payloads in fsmSnapDir until startup runs
+// cleanupStaleFSMSnaps. Same-index retries are already safe via
+// os.Rename's atomic-replace, so this test exercises the cross-index
+// case where the orphan would actually persist.
+func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
+	const index = uint64(77)
+
+	// Build a real testStateMachine payload + framed bytes so receive
+	// finalizes a syntactically valid .fsm file.
+	senderFSM := &testStateMachine{}
+	senderFSM.Apply([]byte("entry-for-orphan-cleanup-test"))
+	snap, err := senderFSM.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+	payload := buf.Bytes()
+
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	fsmSnapDir := t.TempDir()
+
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(t.TempDir())
+	transport.SetFSMSnapDir(fsmSnapDir)
+
+	// Wire a handler that always fails so SendSnapshot exercises the
+	// orphan-cleanup branch.
+	applyErr := errors.New("simulated apply failure")
+	transport.SetHandler(func(_ context.Context, _ raftpb.Message) error {
+		return applyErr
+	})
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: payload, Final: true},
+		},
+	}
+
+	err = transport.SendSnapshot(stream)
+	require.Error(t, err)
+	require.ErrorIs(t, err, applyErr, "SendSnapshot must surface the apply failure")
+
+	// THE point: the .fsm file at the canonical path MUST have been
+	// removed. Without the cleanup, leader retries at later indexes
+	// would accumulate one .fsm per failed apply until next startup.
+	finalPath := fsmSnapPath(fsmSnapDir, index)
+	_, statErr := os.Stat(finalPath)
+	require.True(t, os.IsNotExist(statErr),
+		"orphan .fsm file at %s must be removed after apply failure (got stat err: %v)", finalPath, statErr)
+}
+
 // TestReceiveSnapshotStream_LegacyFallbackWhenNoFSMSnapDir pins the
 // behaviour when fsmSnapDir is unset: receive still works, just via the
 // pre-PR materialization path. Tests that don't wire an fsmSnapDir (most
