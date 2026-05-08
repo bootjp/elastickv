@@ -126,6 +126,14 @@ func (s *snapshotSpool) Reader() (io.Reader, error) {
 // materializing a multi-GiB Snapshot.Data []byte. The spool file already
 // holds the payload; we only append 4 bytes and rename. Heap stays flat
 // regardless of FSM size.
+//
+// Filesystem requirement: the spool file MUST be on the same filesystem as
+// fsmSnapDir, otherwise os.Rename returns syscall.EXDEV and the receive
+// fails (the leader will retry indefinitely with no chance of success).
+// receiveSnapshotStream guarantees this by creating the spool inside
+// fsmSnapDir when the streaming-token path is wired; standard engine
+// wiring (engine.go) keeps both spoolDir and fsmSnapDir under cfg.DataDir,
+// so the constraint is satisfied even on the legacy fallback path.
 func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32c uint32) error {
 	if s == nil || s.file == nil {
 		return errors.New("snapshot spool: finalize on closed/nil spool")

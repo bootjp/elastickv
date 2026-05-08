@@ -62,6 +62,14 @@ func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
 	if err := cleanupStaleSnapshotSpools(dataDir); err != nil {
 		return errors.Wrap(err, "cleanup stale snapshot spools")
 	}
+	// receiveSnapshotStream places its in-flight spool file inside
+	// fsmSnapDir (not dataDir) to keep the FinalizeAsFSMFile rename
+	// intra-filesystem, so a crash mid-receive can leak an
+	// elastickv-etcd-snapshot-* into fsmSnapDir. Sweep that dir on
+	// startup the same way we sweep dataDir.
+	if err := cleanupStaleSnapshotSpools(fsmSnapDir); err != nil {
+		return errors.Wrap(err, "cleanup stale snapshot spools (fsm-snap dir)")
+	}
 	// Startup CRC verification is disabled by default: for GiB-scale snapshots
 	// reading the entire file to compute a checksum can add seconds to recovery
 	// time. Orphan removal (index-based) still runs unconditionally. CRC

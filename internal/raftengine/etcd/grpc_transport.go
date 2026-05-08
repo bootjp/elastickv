@@ -691,7 +691,21 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 	fsmSnapDir := t.fsmSnapDir
 	t.mu.RUnlock()
 
-	spool, err := newSnapshotSpool(spoolDir)
+	// Place the spool file inside fsmSnapDir (not spoolDir) when the
+	// streaming-token path is wired, so FinalizeAsFSMFile's os.Rename
+	// stays within a single filesystem and cannot fail with EXDEV. An
+	// operator who mounts spoolDir and fsmSnapDir on different volumes
+	// would otherwise hit a hard receive failure (the leader retries
+	// indefinitely with no chance of success). Standard engine wiring
+	// already puts both under cfg.DataDir, but the receive code should
+	// not assume that. The legacy fallback path (fsmSnapDir empty)
+	// keeps the spool in spoolDir because it never renames — Bytes()
+	// materializes the payload in place.
+	spoolPlacement := spoolDir
+	if fsmSnapDir != "" {
+		spoolPlacement = fsmSnapDir
+	}
+	spool, err := newSnapshotSpool(spoolPlacement)
 	if err != nil {
 		return raftpb.Message{}, err
 	}
@@ -703,7 +717,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		// the unhappy paths that actually need an operator to look.
 		if closeErr := spool.Close(); closeErr != nil {
 			slog.Warn("snapshot spool close failed",
-				"spool_dir", spoolDir,
+				"spool_dir", spoolPlacement,
 				"err", closeErr,
 			)
 		}

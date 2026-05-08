@@ -221,6 +221,67 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied())
 }
 
+// TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir pins the EXDEV-avoidance
+// fix from PR #747 round-3 (Codex P1): when fsmSnapDir is wired, the spool
+// file MUST be created inside fsmSnapDir (not spoolDir), so that the
+// FinalizeAsFSMFile rename stays within a single filesystem and cannot fail
+// with syscall.EXDEV. Without this, an operator who mounts spoolDir and
+// fsmSnapDir on separate volumes hits a hard receive failure with the
+// leader retrying indefinitely. Standard engine wiring puts both under
+// cfg.DataDir but the receive code must not assume that.
+func TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir(t *testing.T) {
+	const index = uint64(55)
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	// Distinct directories — different absolute paths so we can prove the
+	// spool went to fsmSnapDir, not spoolDir.
+	spoolDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	// Inject a syncDir failure to keep the partial-state observable: the
+	// rename has fired (so the .fsm file is at fsmSnapPath), Finalize
+	// returned the syncDir error, and we can inspect both directories.
+	original := snapshotSyncDir
+	syncErr := errors.New("simulated syncDir failure")
+	snapshotSyncDir = func(string) error { return syncErr }
+	t.Cleanup(func() { snapshotSyncDir = original })
+
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(spoolDir)
+	transport.SetFSMSnapDir(fsmSnapDir)
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: []byte("payload-for-spool-placement-test"), Final: true},
+		},
+	}
+	_, err = transport.receiveSnapshotStream(stream)
+	require.ErrorIs(t, err, syncErr, "should surface the simulated syncDir error")
+
+	// spoolDir must be empty: the spool was created in fsmSnapDir, not
+	// spoolDir. If a future refactor reverts the placement decision, this
+	// directory would carry an elastickv-etcd-snapshot-* leftover at
+	// minimum, or a renamed .fsm at maximum.
+	spoolEntries, err := os.ReadDir(spoolDir)
+	require.NoError(t, err)
+	require.Empty(t, spoolEntries, "spool dir must NOT receive the spool file when fsmSnapDir is wired (rename would risk EXDEV)")
+
+	// fsmSnapDir holds the renamed .fsm file at the canonical path.
+	finalPath := fsmSnapPath(fsmSnapDir, index)
+	_, statErr := os.Stat(finalPath)
+	require.NoError(t, statErr, "renamed .fsm file should exist at canonical path")
+}
+
 // TestReceiveSnapshotStream_LegacyFallbackWhenNoFSMSnapDir pins the
 // behaviour when fsmSnapDir is unset: receive still works, just via the
 // pre-PR materialization path. Tests that don't wire an fsmSnapDir (most
