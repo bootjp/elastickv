@@ -2031,6 +2031,15 @@ func (e *Engine) setApplied(index uint64) {
 // can halt the process. Silent skip is never an option — the
 // integrity tag was added to detect divergence and skipping past
 // it would defeat that property (design §6.3).
+//
+// On the error path resolveProposal is intentionally NOT called: the
+// originating coordinator's done channel for this proposal is left
+// dangling. That is correct under the §6.3 process-fatal contract —
+// runLoop halts and the OS reaps the goroutine plus its channel as
+// part of process exit. A graceful resolveProposal on the error path
+// would deliver a nil/error response that the coordinator might mis-
+// interpret as a committed-but-failed apply (rather than the actual
+// "halting; please restart and retry" semantics).
 func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 	response, err := e.applyNormalEntry(entry)
 	if err != nil {
@@ -2098,6 +2107,15 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 	//   3. Hand the (now cleartext) payload to fsm.Apply. The
 	//      FSM contract is unchanged at Apply(data []byte) any —
 	//      the FSM never sees a raft envelope.
+	//
+	// FSM payload aliasing: when the cipher path is OFF, payload
+	// is a slice into entry.Data's backing array (DecodeProposalEnvelope
+	// returns a sub-slice). When the cipher path is ON, payload is
+	// a fresh allocation from cipher.Decrypt. FSM implementations
+	// MUST NOT retain `data` past Apply's return without copying,
+	// or the cipher / no-cipher paths will diverge in ownership.
+	// Stage 6 plans a defensive copy at the apply boundary so the
+	// contract becomes uniform regardless of cipher state.
 	if e.raftCipher != nil && entry.Index > e.raftCutoverIndex() {
 		plain, err := unwrapRaftPayload(e.raftCipher, payload)
 		if err != nil {
