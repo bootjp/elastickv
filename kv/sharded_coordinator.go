@@ -492,7 +492,15 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			ReadKeys:  groupedReadKeys[gid],
 		}
 		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
-			c.abortPreparedTxn(ctx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+			// Same WithoutCancel pattern as dispatchTxn's
+			// commitPrimaryTxn-failure cleanup: a cancelled ctx is
+			// the most likely cause of Commit failing here, and the
+			// abort MUST still go through to release the intents we
+			// already wrote on prior shards. Otherwise LockResolver
+			// holds the bag.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+			cancel()
 			return nil, errors.WithStack(err)
 		}
 		prepared = append(prepared, preparedGroup{gid: gid, keys: keyMutations(grouped[gid])})
@@ -502,7 +510,13 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 	// but no mutations in this transaction). Without this, a concurrent
 	// write to a read-only shard would go undetected.
 	if err := c.validateReadOnlyShards(ctx, groupedReadKeys, gids, startTS); err != nil {
-		c.abortPreparedTxn(ctx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		// Same reasoning as the prepare-loop cleanup above: the
+		// validate read fence may have failed because ctx
+		// expired, so the abort needs detached cancellation to
+		// avoid stranding intents.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		cancel()
 		return nil, err
 	}
 
