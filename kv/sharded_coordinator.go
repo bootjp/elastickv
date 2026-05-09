@@ -42,10 +42,10 @@ type leaseRefreshingTxn struct {
 	g     *ShardGroup
 }
 
-func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
-	resp, err := t.inner.Commit(reqs)
+	resp, err := t.inner.Commit(ctx, reqs)
 	if err != nil {
 		// Only invalidate on errors that actually signal a leadership
 		// change. Write-conflicts, validation errors, and deadline
@@ -65,10 +65,10 @@ func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, e
 	return resp, nil
 }
 
-func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+func (t *leaseRefreshingTxn) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
-	resp, err := t.inner.Abort(reqs)
+	resp, err := t.inner.Abort(ctx, reqs)
 	if err != nil {
 		if isLeadershipLossError(err) {
 			t.g.lease.invalidate()
@@ -246,7 +246,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
 	// operation to every shard group so each FSM scans locally.
 	if hasDelPrefixElem(reqs.Elems) {
-		return c.dispatchDelPrefixBroadcast(reqs.IsTxn, reqs.Elems)
+		return c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
 	}
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
@@ -271,7 +271,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
-	r, err := c.router.Commit(logs)
+	r, err := c.router.Commit(ctx, logs)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -304,7 +304,7 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 // to every shard group. Each element becomes a separate pb.Request (the FSM's
 // extractDelPrefix processes only the first DEL_PREFIX mutation per request).
 // All requests are batched into a single Commit call per shard group.
-func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
 	}
@@ -323,12 +323,12 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Ele
 		})
 	}
 
-	return c.broadcastToAllGroups(requests)
+	return c.broadcastToAllGroups(ctx, requests)
 }
 
 // broadcastToAllGroups sends the same set of requests to every shard group in
 // parallel and returns the maximum commit index.
-func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests []*pb.Request) (*CoordinateResponse, error) {
 	var (
 		maxIndex atomic.Uint64
 		firstErr error
@@ -339,7 +339,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*Coor
 		wg.Add(1)
 		go func(g *ShardGroup) {
 			defer wg.Done()
-			r, err := g.Txn.Commit(requests)
+			r, err := g.Txn.Commit(ctx, requests)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -390,7 +390,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		// If any read key belongs to a different shard the 2PC path is required
 		// so that validateReadOnlyShards can issue a linearizable read barrier,
 		// preserving SSI.
-		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
+		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
 	// Multi-shard path: group read keys by shard now. The result is passed
@@ -407,13 +407,13 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		return nil, err
 	}
 
-	primaryGid, maxIndex, err := c.commitPrimaryTxn(startTS, primaryKey, grouped, commitTS)
+	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, commitTS)
 	if err != nil {
-		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		c.abortPreparedTxn(ctx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
 		return nil, errors.WithStack(err)
 	}
 
-	maxIndex = c.commitSecondaryTxns(startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
+	maxIndex = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
@@ -443,14 +443,14 @@ func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) b
 	return true
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
 	}
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu.
-	resp, err := g.Txn.Commit([]*pb.Request{
+	resp, err := g.Txn.Commit(ctx, []*pb.Request{
 		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, readKeys),
 	})
 	if err != nil {
@@ -483,8 +483,8 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			Mutations: append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
 			ReadKeys:  groupedReadKeys[gid],
 		}
-		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
-			c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
+			c.abortPreparedTxn(ctx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
 			return nil, errors.WithStack(err)
 		}
 		prepared = append(prepared, preparedGroup{gid: gid, keys: keyMutations(grouped[gid])})
@@ -494,14 +494,14 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 	// but no mutations in this transaction). Without this, a concurrent
 	// write to a read-only shard would go undetected.
 	if err := c.validateReadOnlyShards(ctx, groupedReadKeys, gids, startTS); err != nil {
-		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		c.abortPreparedTxn(ctx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
 		return nil, err
 	}
 
 	return prepared, nil
 }
 
-func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64) (uint64, uint64, error) {
+func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64) (uint64, uint64, error) {
 	primaryGid := c.engineGroupIDForKey(primaryKey)
 	if primaryGid == 0 {
 		return 0, 0, errors.WithStack(ErrInvalidRequest)
@@ -521,7 +521,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte,
 		Mutations: append([]*pb.Mutation{meta}, keys...),
 	}
 
-	r, err := g.Txn.Commit([]*pb.Request{req})
+	r, err := g.Txn.Commit(ctx, []*pb.Request{req})
 	if err != nil {
 		return primaryGid, 0, errors.WithStack(err)
 	}
@@ -531,7 +531,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte,
 	return primaryGid, r.CommitIndex, nil
 }
 
-func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
+func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
 	// Secondary commits are best-effort. If a shard is unavailable after the
 	// primary commits, read-time lock resolution will commit the remaining
 	// secondaries based on the primary commit record. Retry a few times to
@@ -551,7 +551,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
 		}
-		r, err := commitSecondaryWithRetry(g, req)
+		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
 			c.logger().Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
@@ -569,13 +569,13 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 	return maxIndex
 }
 
-func commitSecondaryWithRetry(g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {
+func commitSecondaryWithRetry(ctx context.Context, g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {
 	if g == nil || g.Txn == nil || req == nil {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 	var lastErr error
 	for attempt := range txnSecondaryCommitRetryAttempts {
-		resp, err := g.Txn.Commit([]*pb.Request{req})
+		resp, err := g.Txn.Commit(ctx, []*pb.Request{req})
 		if err == nil {
 			return resp, nil
 		}
@@ -594,7 +594,7 @@ func (c *ShardedCoordinator) logger() *slog.Logger {
 	return slog.Default()
 }
 
-func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) {
+func (c *ShardedCoordinator) abortPreparedTxn(ctx context.Context, startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) {
 	if len(prepared) == 0 {
 		return
 	}
@@ -614,7 +614,7 @@ func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte,
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{meta}, pg.keys...),
 		}
-		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
+		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
 			if errors.Is(err, ErrTxnAlreadyCommitted) {
 				continue
 			}
@@ -722,12 +722,12 @@ func (c *ShardedCoordinator) IsLeader() bool {
 	return isLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) VerifyLeader() error {
+func (c *ShardedCoordinator) VerifyLeader(ctx context.Context) error {
 	g, ok := c.groups[c.defaultGroup]
 	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return verifyLeaderEngine(engineForGroup(g))
+	return verifyLeaderEngineCtx(ctx, engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) RaftLeader() string {
@@ -754,12 +754,12 @@ func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
 	return isLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
+func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
 	g, ok := c.groupForKey(key)
 	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return verifyLeaderEngine(engineForGroup(g))
+	return verifyLeaderEngineCtx(ctx, engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {

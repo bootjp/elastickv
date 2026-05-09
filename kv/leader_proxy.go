@@ -39,26 +39,30 @@ func NewLeaderProxyWithEngine(engine raftengine.Engine, opts ...TransactionOptio
 	}
 }
 
-func (p *LeaderProxy) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (p *LeaderProxy) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	if !isLeaderEngine(p.engine) {
-		return p.forwardWithRetry(reqs)
+		return p.forwardWithRetry(ctx, reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting writes on a stale leader.
-	if err := verifyLeaderEngine(p.engine); err != nil {
-		return p.forwardWithRetry(reqs)
+	// The caller's ctx (via verifyLeaderEngineCtx) bounds the ReadIndex
+	// round-trip; verifyLeaderEngine's no-arg variant remains as the
+	// background-caller fallback (#745) but is no longer hit on the
+	// dispatch hot path.
+	if err := verifyLeaderEngineCtx(ctx, p.engine); err != nil {
+		return p.forwardWithRetry(ctx, reqs)
 	}
-	return p.tm.Commit(reqs)
+	return p.tm.Commit(ctx, reqs)
 }
 
-func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+func (p *LeaderProxy) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	if !isLeaderEngine(p.engine) {
-		return p.forwardWithRetry(reqs)
+		return p.forwardWithRetry(ctx, reqs)
 	}
 	// Verify leadership with a quorum to avoid accepting aborts on a stale leader.
-	if err := verifyLeaderEngine(p.engine); err != nil {
-		return p.forwardWithRetry(reqs)
+	if err := verifyLeaderEngineCtx(ctx, p.engine); err != nil {
+		return p.forwardWithRetry(ctx, reqs)
 	}
-	return p.tm.Abort(reqs)
+	return p.tm.Abort(ctx, reqs)
 }
 
 // forwardWithRetry attempts to forward to the leader, re-fetching the
@@ -86,7 +90,7 @@ func (p *LeaderProxy) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
 // that second bound, a single forward() could run for the full 5s RPC
 // timeout AFTER the budget expired, pushing total latency well past
 // leaderProxyRetryBudget.
-func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse, error) {
+func (p *LeaderProxy) forwardWithRetry(callerCtx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
@@ -95,8 +99,10 @@ func (p *LeaderProxy) forwardWithRetry(reqs []*pb.Request) (*TransactionResponse
 	// Parent context carries the retry deadline so forward()'s per-call
 	// timeout (derived via context.WithTimeout(parentCtx, ...)) can
 	// never extend past it — context.WithTimeout picks the earlier of
-	// the two expirations.
-	parentCtx, cancelParent := context.WithDeadline(context.Background(), deadline)
+	// the two expirations. callerCtx is the dispatch handler's own
+	// context, so a Redis client whose deadline expires before the
+	// retry budget exits early without waiting out the full 5 s.
+	parentCtx, cancelParent := context.WithDeadline(callerCtx, deadline)
 	defer cancelParent()
 
 	var lastErr error

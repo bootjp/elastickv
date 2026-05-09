@@ -226,7 +226,7 @@ func (s *S3Server) AdminCreateBucket(ctx context.Context, principal AdminPrincip
 	if !principal.Role.canWrite() {
 		return nil, ErrAdminForbidden
 	}
-	if !s.isVerifiedS3Leader() {
+	if !s.isVerifiedS3Leader(ctx) {
 		return nil, ErrAdminNotLeader
 	}
 	if err := validateS3BucketName(name); err != nil {
@@ -314,7 +314,7 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
-	if !s.isVerifiedS3Leader() {
+	if !s.isVerifiedS3Leader(ctx) {
 		return ErrAdminNotLeader
 	}
 	acl = adminCanonicalACL(acl)
@@ -406,7 +406,7 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
-	if !s.isVerifiedS3Leader() {
+	if !s.isVerifiedS3Leader(ctx) {
 		return ErrAdminNotLeader
 	}
 

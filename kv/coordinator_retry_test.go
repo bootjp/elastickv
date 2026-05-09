@@ -54,7 +54,7 @@ type scriptedTransactional struct {
 	onCommit func(call uint64) // optional hook invoked inside Commit
 }
 
-func (s *scriptedTransactional) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (s *scriptedTransactional) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	idx := s.commits.Add(1) - 1
 	s.reqs = append(s.reqs, reqs)
 	if s.onCommit != nil {
@@ -66,7 +66,7 @@ func (s *scriptedTransactional) Commit(reqs []*pb.Request) (*TransactionResponse
 	return &TransactionResponse{CommitIndex: idx + 1}, nil
 }
 
-func (s *scriptedTransactional) Abort([]*pb.Request) (*TransactionResponse, error) {
+func (s *scriptedTransactional) Abort(context.Context, []*pb.Request) (*TransactionResponse, error) {
 	return &TransactionResponse{}, nil
 }
 

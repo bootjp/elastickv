@@ -191,11 +191,11 @@ var _ Coordinator = (*Coordinate)(nil)
 type Coordinator interface {
 	Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error)
 	IsLeader() bool
-	VerifyLeader() error
+	VerifyLeader(ctx context.Context) error
 	LinearizableRead(ctx context.Context) (uint64, error)
 	RaftLeader() string
 	IsLeaderForKey(key []byte) bool
-	VerifyLeaderForKey(key []byte) error
+	VerifyLeaderForKey(ctx context.Context, key []byte) error
 	RaftLeaderForKey(key []byte) string
 	Clock() *HLC
 }
@@ -462,9 +462,9 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
-		resp, err = c.dispatchTxn(reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
 	} else {
-		resp, err = c.dispatchRaw(reqs.Elems)
+		resp, err = c.dispatchRaw(ctx, reqs.Elems)
 	}
 	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
 	return resp, err
@@ -613,8 +613,8 @@ func (c *Coordinate) IsLeaderAcceptingWrites() bool {
 	return isLeaderAcceptingWrites(c.engine)
 }
 
-func (c *Coordinate) VerifyLeader() error {
-	return verifyLeaderEngine(c.engine)
+func (c *Coordinate) VerifyLeader(ctx context.Context) error {
+	return verifyLeaderEngineCtx(ctx, c.engine)
 }
 
 // RaftLeader returns the current leader's address as known by this node.
@@ -673,8 +673,8 @@ func (c *Coordinate) IsLeaderForKey(_ []byte) bool {
 	return c.IsLeader()
 }
 
-func (c *Coordinate) VerifyLeaderForKey(_ []byte) error {
-	return c.VerifyLeader()
+func (c *Coordinate) VerifyLeaderForKey(ctx context.Context, _ []byte) error {
+	return c.VerifyLeader(ctx)
 }
 
 func (c *Coordinate) RaftLeaderForKey(_ []byte) string {
@@ -798,7 +798,7 @@ func (c *Coordinate) nextStartTS() uint64 {
 	return c.clock.Next()
 }
 
-func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -828,7 +828,7 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], readKeys [][]byte, startTS ui
 	// and FSM application. The adapter's validateReadSet is kept as a fast
 	// path to fail early without a Raft round-trip, but the FSM check is
 	// the authoritative, serializable validation.
-	r, err := c.transactionManager.Commit([]*pb.Request{
+	r, err := c.transactionManager.Commit(ctx, []*pb.Request{
 		onePhaseTxnRequest(startTS, commitTS, primary, reqs, readKeys),
 	})
 	if err != nil {
@@ -840,7 +840,7 @@ func (c *Coordinate) dispatchTxn(reqs []*Elem[OP], readKeys [][]byte, startTS ui
 	}, nil
 }
 
-func (c *Coordinate) dispatchRaw(req []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*CoordinateResponse, error) {
 	muts := make([]*pb.Mutation, 0, len(req))
 	for _, elem := range req {
 		muts = append(muts, elemToMutation(elem))
@@ -853,7 +853,7 @@ func (c *Coordinate) dispatchRaw(req []*Elem[OP]) (*CoordinateResponse, error) {
 		Mutations: muts,
 	}}
 
-	r, err := c.transactionManager.Commit(logs)
+	r, err := c.transactionManager.Commit(ctx, logs)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

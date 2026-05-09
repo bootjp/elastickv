@@ -99,10 +99,10 @@ func (c *helloTestCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.O
 	return &kv.CoordinateResponse{}, nil
 }
 func (c *helloTestCoordinator) IsLeader() bool                  { return c.isLeader }
-func (c *helloTestCoordinator) VerifyLeader() error             { return nil }
+func (c *helloTestCoordinator) VerifyLeader(context.Context) error             { return nil }
 func (c *helloTestCoordinator) RaftLeader() string              { return "" }
 func (c *helloTestCoordinator) IsLeaderForKey([]byte) bool      { return c.isLeader }
-func (c *helloTestCoordinator) VerifyLeaderForKey([]byte) error { return nil }
+func (c *helloTestCoordinator) VerifyLeaderForKey(context.Context, []byte) error { return nil }
 func (c *helloTestCoordinator) RaftLeaderForKey([]byte) string  { return "" }
 func (c *helloTestCoordinator) Clock() *kv.HLC {
 	if c.clock == nil {

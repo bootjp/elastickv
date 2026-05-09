@@ -21,7 +21,7 @@ type recordingTransactional struct {
 	errs      []error
 }
 
-func (s *recordingTransactional) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -39,7 +39,7 @@ func (s *recordingTransactional) Commit(reqs []*pb.Request) (*TransactionRespons
 	return &TransactionResponse{}, nil
 }
 
-func (s *recordingTransactional) Abort(_ []*pb.Request) (*TransactionResponse, error) {
+func (s *recordingTransactional) Abort(_ context.Context, _ []*pb.Request) (*TransactionResponse, error) {
 	return &TransactionResponse{}, nil
 }
 
@@ -262,7 +262,7 @@ func TestCommitSecondaryWithRetry_RetriesAndSucceeds(t *testing.T) {
 		},
 	}
 
-	resp, err := commitSecondaryWithRetry(&ShardGroup{Txn: txn}, &pb.Request{
+	resp, err := commitSecondaryWithRetry(context.Background(), &ShardGroup{Txn: txn}, &pb.Request{
 		IsTxn: true,
 		Phase: pb.Phase_COMMIT,
 		Ts:    7,
@@ -288,7 +288,7 @@ func TestCommitSecondaryWithRetry_ExhaustsRetries(t *testing.T) {
 		},
 	}
 
-	_, err := commitSecondaryWithRetry(&ShardGroup{Txn: txn}, &pb.Request{
+	_, err := commitSecondaryWithRetry(context.Background(), &ShardGroup{Txn: txn}, &pb.Request{
 		IsTxn: true,
 		Phase: pb.Phase_COMMIT,
 		Ts:    9,

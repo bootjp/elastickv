@@ -202,7 +202,7 @@ func (d *DynamoDBServer) AdminCreateTable(ctx context.Context, principal AdminPr
 	if !principal.Role.canWrite() {
 		return nil, ErrAdminForbidden
 	}
-	if !isVerifiedDynamoLeader(d.coordinator) {
+	if !isVerifiedDynamoLeader(ctx, d.coordinator) {
 		return nil, ErrAdminNotLeader
 	}
 	legacy, err := buildLegacyCreateTableInput(in)
@@ -249,7 +249,7 @@ func (d *DynamoDBServer) AdminDeleteTable(ctx context.Context, principal AdminPr
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
-	if !isVerifiedDynamoLeader(d.coordinator) {
+	if !isVerifiedDynamoLeader(ctx, d.coordinator) {
 		return ErrAdminNotLeader
 	}
 	if strings.TrimSpace(name) == "" {

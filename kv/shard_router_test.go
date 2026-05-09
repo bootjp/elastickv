@@ -45,7 +45,7 @@ func TestShardRouterCommit(t *testing.T) {
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v2")}}},
 	}
 
-	if _, err := router.Commit(reqs); err != nil {
+	if _, err := router.Commit(ctx, reqs); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestShardRouterSplitAndMerge(t *testing.T) {
 	req := []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v1")}}},
 	}
-	if _, err := router.Commit(req); err != nil {
+	if _, err := router.Commit(ctx, req); err != nil {
 		t.Fatalf("commit group1: %v", err)
 	}
 	v, err := router.Get(ctx, []byte("b"))
@@ -102,7 +102,7 @@ func TestShardRouterSplitAndMerge(t *testing.T) {
 	req = []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v2")}}},
 	}
-	if _, err := router.Commit(req); err != nil {
+	if _, err := router.Commit(ctx, req); err != nil {
 		t.Fatalf("commit group2: %v", err)
 	}
 	v, err = router.Get(ctx, []byte("x"))
@@ -119,7 +119,7 @@ func TestShardRouterSplitAndMerge(t *testing.T) {
 	req = []*pb.Request{
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v3")}}},
 	}
-	if _, err := router.Commit(req); err != nil {
+	if _, err := router.Commit(ctx, req); err != nil {
 		t.Fatalf("commit after merge: %v", err)
 	}
 	v, err = router.Get(ctx, []byte("z"))
@@ -134,7 +134,8 @@ type fakeTM struct {
 	abortCalls  int
 }
 
-func (f *fakeTM) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (f *fakeTM) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	_ = reqs
 	f.commitCalls++
 	if f.commitErr {
 		return nil, fmt.Errorf("commit fail")
@@ -142,12 +143,14 @@ func (f *fakeTM) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
 	return &TransactionResponse{}, nil
 }
 
-func (f *fakeTM) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+func (f *fakeTM) Abort(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	_ = reqs
 	f.abortCalls++
 	return &TransactionResponse{}, nil
 }
 
 func TestShardRouterCommitFailure(t *testing.T) {
+	ctx := context.Background()
 	e := distribution.NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
 	e.UpdateRoute([]byte("m"), nil, 2)
@@ -164,7 +167,7 @@ func TestShardRouterCommitFailure(t *testing.T) {
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v2")}}},
 	}
 
-	if _, err := router.Commit(reqs); err == nil {
+	if _, err := router.Commit(ctx, reqs); err == nil {
 		t.Fatalf("expected error")
 	}
 
@@ -178,6 +181,7 @@ func TestShardRouterCommitFailure(t *testing.T) {
 }
 
 func TestShardRouterRoutesListKeys(t *testing.T) {
+	ctx := context.Background()
 	e := distribution.NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
 	e.UpdateRoute([]byte("m"), nil, 2)
@@ -194,7 +198,7 @@ func TestShardRouterRoutesListKeys(t *testing.T) {
 		{IsTxn: false, Phase: pb.Phase_NONE, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: listMetaKey, Value: []byte("v")}}},
 	}
 
-	if _, err := router.Commit(reqs); err != nil {
+	if _, err := router.Commit(ctx, reqs); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if ok.commitCalls != 1 {

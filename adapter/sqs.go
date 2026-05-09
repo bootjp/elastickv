@@ -498,18 +498,18 @@ func (s *SQSServer) serveSQSLeaderHealthz(w http.ResponseWriter, r *http.Request
 	if !writeSQSHealthMethod(w, r) {
 		return
 	}
-	if isVerifiedSQSLeader(s.coordinator) {
+	if isVerifiedSQSLeader(r.Context(), s.coordinator) {
 		writeSQSHealthBody(w, r, http.StatusOK, "ok\n")
 		return
 	}
 	writeSQSHealthBody(w, r, http.StatusServiceUnavailable, "not leader\n")
 }
 
-func isVerifiedSQSLeader(coordinator kv.Coordinator) bool {
+func isVerifiedSQSLeader(ctx context.Context, coordinator kv.Coordinator) bool {
 	if coordinator == nil || !coordinator.IsLeader() {
 		return false
 	}
-	return coordinator.VerifyLeader() == nil
+	return coordinator.VerifyLeader(ctx) == nil
 }
 
 func writeSQSHealthMethod(w http.ResponseWriter, r *http.Request) bool {

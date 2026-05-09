@@ -2297,12 +2297,12 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 	}
 	var leader string
 	if len(key) > 0 {
-		if s.coordinator.IsLeaderForKey(key) && s.coordinator.VerifyLeaderForKey(key) == nil {
+		if s.coordinator.IsLeaderForKey(key) && s.coordinator.VerifyLeaderForKey(r.Context(), key) == nil {
 			return false
 		}
 		leader = s.coordinator.RaftLeaderForKey(key)
 	} else {
-		if s.coordinator.IsLeader() && s.coordinator.VerifyLeader() == nil {
+		if s.coordinator.IsLeader() && s.coordinator.VerifyLeader(r.Context()) == nil {
 			return false
 		}
 		leader = s.coordinator.RaftLeader()
@@ -2420,7 +2420,7 @@ func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) 
 		return true
 	}
 	status, body := http.StatusOK, "ok"
-	if !s.isVerifiedS3Leader() {
+	if !s.isVerifiedS3Leader(r.Context()) {
 		status, body = http.StatusServiceUnavailable, "not leader"
 	}
 	w.WriteHeader(status)
@@ -2430,11 +2430,11 @@ func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) 
 	return true
 }
 
-func (s *S3Server) isVerifiedS3Leader() bool {
+func (s *S3Server) isVerifiedS3Leader(ctx context.Context) bool {
 	if s.coordinator == nil || !s.coordinator.IsLeader() {
 		return false
 	}
-	return s.coordinator.VerifyLeader() == nil
+	return s.coordinator.VerifyLeader(ctx) == nil
 }
 
 // prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When

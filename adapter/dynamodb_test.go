@@ -1831,8 +1831,8 @@ func (w *testCoordinatorWrapper) IsLeader() bool {
 	return w.inner.IsLeader()
 }
 
-func (w *testCoordinatorWrapper) VerifyLeader() error {
-	return w.inner.VerifyLeader()
+func (w *testCoordinatorWrapper) VerifyLeader(context.Context) error {
+	return w.inner.VerifyLeader(context.Background())
 }
 
 func (w *testCoordinatorWrapper) RaftLeader() string {
@@ -1843,8 +1843,8 @@ func (w *testCoordinatorWrapper) IsLeaderForKey(key []byte) bool {
 	return w.inner.IsLeaderForKey(key)
 }
 
-func (w *testCoordinatorWrapper) VerifyLeaderForKey(key []byte) error {
-	return w.inner.VerifyLeaderForKey(key)
+func (w *testCoordinatorWrapper) VerifyLeaderForKey(ctx context.Context, key []byte) error {
+	return w.inner.VerifyLeaderForKey(ctx, key)
 }
 
 func (w *testCoordinatorWrapper) RaftLeaderForKey(key []byte) string {

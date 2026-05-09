@@ -578,7 +578,7 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 	}
 	switch status {
 	case txnStatusCommitted:
-		return applyTxnResolution(g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{key})
+		return applyTxnResolution(ctx, g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusRolledBack:
 		abortTS := abortTSFrom(lock.StartTS, commitTS)
 		if abortTS <= lock.StartTS {
@@ -587,7 +587,7 @@ func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, ke
 			// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
 			return NewTxnLockedErrorWithDetail(key, "timestamp overflow")
 		}
-		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{key})
+		return applyTxnResolution(ctx, g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{key})
 	case txnStatusPending:
 		return NewTxnLockedError(key)
 	default:
@@ -652,7 +652,7 @@ func (s *ShardStore) resolveScanLocks(ctx context.Context, g *ShardGroup, kvs []
 	if err != nil {
 		return nil, err
 	}
-	if err := applyScanLockResolutions(g, plan); err != nil {
+	if err := applyScanLockResolutions(ctx, g, plan); err != nil {
 		return nil, err
 	}
 	return s.materializeScanLockResults(ctx, g, ts, plan.items)
@@ -902,10 +902,10 @@ func prefixScanEnd(prefix []byte) []byte {
 	return nil
 }
 
-func applyScanLockResolutions(g *ShardGroup, plan *scanLockPlan) error {
+func applyScanLockResolutions(ctx context.Context, g *ShardGroup, plan *scanLockPlan) error {
 	for _, txnKey := range plan.batchOrder {
 		batch := plan.resolutionBatches[txnKey]
-		if err := applyTxnResolution(g, batch.phase, batch.startTS, batch.resolveTS, batch.primaryKey, batch.keys); err != nil {
+		if err := applyTxnResolution(ctx, g, batch.phase, batch.startTS, batch.resolveTS, batch.primaryKey, batch.keys); err != nil {
 			return err
 		}
 	}
@@ -1013,7 +1013,7 @@ func txnLockExpired(lock txnLock) bool {
 }
 
 func (s *ShardStore) expiredPrimaryTxnStatus(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, error) {
-	aborted, err := s.tryAbortExpiredPrimary(primaryKey, startTS)
+	aborted, err := s.tryAbortExpiredPrimary(ctx, primaryKey, startTS)
 	if err != nil {
 		return s.statusAfterAbortFailure(ctx, primaryKey, startTS)
 	}
@@ -1075,7 +1075,7 @@ func (s *ShardStore) loadTxnLock(ctx context.Context, primaryKey []byte) (txnLoc
 	return lock, true, nil
 }
 
-func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (bool, error) {
+func (s *ShardStore) tryAbortExpiredPrimary(ctx context.Context, primaryKey []byte, startTS uint64) (bool, error) {
 	pg, ok := s.groupForKey(primaryKey)
 	if !ok || pg == nil || pg.Txn == nil {
 		return false, nil
@@ -1090,13 +1090,13 @@ func (s *ShardStore) tryAbortExpiredPrimary(primaryKey []byte, startTS uint64) (
 		// Prevents violating the FSM invariant resolveTS > startTS (fsm.go:258).
 		return false, nil
 	}
-	if err := applyTxnResolution(pg, pb.Phase_ABORT, startTS, abortTS, primaryKey, [][]byte{primaryKey}); err != nil {
+	if err := applyTxnResolution(ctx, pg, pb.Phase_ABORT, startTS, abortTS, primaryKey, [][]byte{primaryKey}); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64, primaryKey []byte, keys [][]byte) error {
+func applyTxnResolution(ctx context.Context, g *ShardGroup, phase pb.Phase, startTS, commitTS uint64, primaryKey []byte, keys [][]byte) error {
 	if g == nil || g.Txn == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}
@@ -1110,7 +1110,7 @@ func applyTxnResolution(g *ShardGroup, phase pb.Phase, startTS, commitTS uint64,
 	for _, k := range keys {
 		muts = append(muts, &pb.Mutation{Op: pb.Op_PUT, Key: k})
 	}
-	_, err := g.Txn.Commit([]*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
+	_, err := g.Txn.Commit(ctx, []*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
 	return errors.WithStack(err)
 }
 

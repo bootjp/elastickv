@@ -56,7 +56,7 @@ func (c *retryOnceCoordinator) IsLeader() bool {
 	return true
 }
 
-func (c *retryOnceCoordinator) VerifyLeader() error {
+func (c *retryOnceCoordinator) VerifyLeader(context.Context) error {
 	return nil
 }
 
@@ -68,7 +68,7 @@ func (c *retryOnceCoordinator) IsLeaderForKey([]byte) bool {
 	return true
 }
 
-func (c *retryOnceCoordinator) VerifyLeaderForKey([]byte) error {
+func (c *retryOnceCoordinator) VerifyLeaderForKey(context.Context, []byte) error {
 	return nil
 }
 

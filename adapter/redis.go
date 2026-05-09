@@ -1287,7 +1287,7 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	pattern := cmd.Args[1]
 
 	if r.coordinator.IsLeader() {
-		if err := r.coordinator.VerifyLeader(); err != nil {
+		if err := r.coordinator.VerifyLeader(r.handlerContext()); err != nil {
 			conn.WriteError(err.Error())
 			return
 		}
@@ -3254,7 +3254,7 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return nil, wrongTypeError()
 	}
 
-	if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
+	if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), key); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -3510,7 +3510,7 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	}
 
 	if r.coordinator.IsLeaderForKey(key) {
-		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
+		if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), key); err != nil {
 			return nil, errors.WithStack(err)
 		}
 		v, err := r.store.GetAt(context.Background(), key, readTS)

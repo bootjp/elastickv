@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,7 +72,7 @@ func TestRouter_HealthzRejectsPost(t *testing.T) {
 // /healthz/leader contract so a multi-protocol load balancer
 // sees identical semantics.
 func TestRouter_HealthzLeader_ReturnsOKWhenLeader(t *testing.T) {
-	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return true }))
+	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return true }))
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -88,7 +89,7 @@ func TestRouter_HealthzLeader_ReturnsOKWhenLeader(t *testing.T) {
 // rotation when it loses leadership; the body string is informative
 // for operators reading curl output.
 func TestRouter_HealthzLeader_Returns503WhenNotLeader(t *testing.T) {
-	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return false }))
+	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return false }))
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -102,14 +103,14 @@ func TestRouter_HealthzLeader_Returns503WhenNotLeader(t *testing.T) {
 // healthz HEAD test. The status code must still indicate the
 // leader state; only the body is suppressed.
 func TestRouter_HealthzLeader_HeadOmitsBody(t *testing.T) {
-	rLeader := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return true }))
+	rLeader := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return true }))
 	req := httptest.NewRequest(http.MethodHead, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()
 	rLeader.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, "", rec.Body.String())
 
-	rFollower := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return false }))
+	rFollower := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return false }))
 	req = httptest.NewRequest(http.MethodHead, "/admin/healthz/leader", nil)
 	rec = httptest.NewRecorder()
 	rFollower.ServeHTTP(rec, req)
@@ -123,7 +124,7 @@ func TestRouter_HealthzLeader_HeadOmitsBody(t *testing.T) {
 // §6.5.5 — load balancers and synthetic-monitor tools key off this
 // header to discover supported verbs.
 func TestRouter_HealthzLeader_RejectsPost(t *testing.T) {
-	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func() bool { return true }))
+	r := NewRouterWithLeaderProbe(nil, nil, LeaderProbeFunc(func(context.Context) bool { return true }))
 	req := httptest.NewRequest(http.MethodPost, "/admin/healthz/leader", strings.NewReader(""))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -148,7 +149,7 @@ func TestRouter_405_AllowHeader(t *testing.T) {
 		{"asset", "/admin/assets/app.js"},
 		{"spa", "/admin/somewhere"},
 	}
-	r := NewRouterWithLeaderProbe(nil, newTestStatic(), LeaderProbeFunc(func() bool { return true }))
+	r := NewRouterWithLeaderProbe(nil, newTestStatic(), LeaderProbeFunc(func(context.Context) bool { return true }))
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -185,7 +186,7 @@ func TestRouter_HealthzLeader_NilProbeReturns404(t *testing.T) {
 // balancer probing the path to see HTML 200 forever and never
 // detect a leadership change.
 func TestRouter_HealthzLeader_NotSwallowedBySPA(t *testing.T) {
-	probe := LeaderProbeFunc(func() bool { return false })
+	probe := LeaderProbeFunc(func(context.Context) bool { return false })
 	r := NewRouterWithLeaderProbe(nil, newTestStatic(), probe)
 	req := httptest.NewRequest(http.MethodGet, "/admin/healthz/leader", nil)
 	rec := httptest.NewRecorder()

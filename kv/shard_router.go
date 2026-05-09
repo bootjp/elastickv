@@ -152,16 +152,16 @@ func (s *ShardRouter) Register(group uint64, tm Transactional, st store.MVCCStor
 	s.groups[group] = &routerGroup{tm: tm, store: st}
 }
 
-func (s *ShardRouter) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (s *ShardRouter) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	return s.process(reqs, func(g *routerGroup, rs []*pb.Request) (*TransactionResponse, error) {
-		return g.tm.Commit(rs)
+		return g.tm.Commit(ctx, rs)
 	})
 }
 
 // Abort dispatches aborts to the correct raft group.
-func (s *ShardRouter) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+func (s *ShardRouter) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	return s.process(reqs, func(g *routerGroup, rs []*pb.Request) (*TransactionResponse, error) {
-		return g.tm.Abort(rs)
+		return g.tm.Abort(ctx, rs)
 	})
 }
 
