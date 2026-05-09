@@ -240,7 +240,17 @@ func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Re
 		// transactional requests do not leave intents behind, so they do not need
 		// abort cleanup on failure.
 		if needsTxnCleanup(reqs) {
-			_, _err := t.Abort(ctx, reqs)
+			// Use a cleanup ctx that survives the original ctx's
+			// cancellation: the upstream commit very likely failed
+			// because ctx was cancelled / hit its deadline, and Abort
+			// MUST still go through to release intents — otherwise
+			// locks linger until LockResolver picks them up at a
+			// future tick. context.WithoutCancel detaches deadline
+			// and cancellation; we re-bound with verifyLeaderTimeout
+			// so a hung Abort cannot leak the cleanup goroutine.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+			_, _err := t.Abort(cleanupCtx, reqs)
+			cancel()
 			if _err != nil {
 				return nil, errors.WithStack(errors.CombineErrors(err, _err))
 			}

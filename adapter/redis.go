@@ -1287,7 +1287,14 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	pattern := cmd.Args[1]
 
 	if r.coordinator.IsLeader() {
-		if err := r.coordinator.VerifyLeader(r.handlerContext()); err != nil {
+		// Per-call ctx with redisDispatchTimeout instead of the
+		// long-lived handlerContext: a stalled VerifyLeader on KEYS
+		// must not pin the command handler indefinitely. The same
+		// bound the rest of the dispatch path (sadd, set, …) uses;
+		// see Codex P1 review on PR #749.
+		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+		defer cancel()
+		if err := r.coordinator.VerifyLeader(ctx); err != nil {
 			conn.WriteError(err.Error())
 			return
 		}

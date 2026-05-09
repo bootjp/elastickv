@@ -1831,8 +1831,8 @@ func (w *testCoordinatorWrapper) IsLeader() bool {
 	return w.inner.IsLeader()
 }
 
-func (w *testCoordinatorWrapper) VerifyLeader(context.Context) error {
-	return w.inner.VerifyLeader(context.Background())
+func (w *testCoordinatorWrapper) VerifyLeader(ctx context.Context) error {
+	return w.inner.VerifyLeader(ctx)
 }
 
 func (w *testCoordinatorWrapper) RaftLeader() string {

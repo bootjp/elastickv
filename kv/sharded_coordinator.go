@@ -409,7 +409,15 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 
 	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, commitTS)
 	if err != nil {
-		c.abortPreparedTxn(ctx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		// abortPreparedTxn must run even when ctx was the reason
+		// commitPrimaryTxn failed — otherwise prewrite intents on
+		// every prepared shard linger until LockResolver picks them
+		// up at a future tick (lease window of expensive
+		// keyspace-scan work). Detach cancellation but cap with
+		// verifyLeaderTimeout so a hung Abort cannot leak.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		cancel()
 		return nil, errors.WithStack(err)
 	}
 

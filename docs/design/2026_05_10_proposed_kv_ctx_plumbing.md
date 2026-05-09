@@ -87,15 +87,18 @@ Implementations updated to take `ctx`:
 **Verify-leader surface:**
 
 ```go
-func (c *Coordinate)         VerifyLeaderCtx(ctx context.Context) error
-func (c *ShardedCoordinator) VerifyLeaderCtx(ctx context.Context) error
-func (c *ShardedCoordinator) VerifyLeaderForKeyCtx(ctx context.Context, key []byte) error
+func (c *Coordinate)         VerifyLeader(ctx context.Context) error
+func (c *ShardedCoordinator) VerifyLeader(ctx context.Context) error
+func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error
 ```
 
-Existing `VerifyLeader()` / `VerifyLeaderForKey(key)` methods kept as
-wrappers around the Ctx variants with `context.Background()` so the
-5 s safety bound still applies — they remain the **no-ctx** entry
-points.
+The `Coordinator` interface methods themselves take ctx — no
+parallel `Ctx`-suffixed variants. The 5 s safety bound is now
+internal to `verifyLeaderEngineCtx`: when the caller's ctx has no
+deadline (Redis server's long-lived `handlerContext`, background
+loops, …), the helper applies `verifyLeaderTimeout` as a wrapper.
+Callers with a tighter deadline keep theirs because
+`context.WithTimeout` picks the earlier of the two expirations.
 
 **LeaderProbe (`internal/admin/router.go`):**
 
@@ -105,13 +108,14 @@ type LeaderProbe interface {
 }
 ```
 
-`main_admin.go` implementation calls `coordinate.VerifyLeaderCtx(ctx)`.
+`main_admin.go` implementation calls `coordinate.VerifyLeader(ctx)`.
 Admin `/admin/healthz/leader` handler passes `r.Context()`.
 
-**Adapter healthz (`adapter/s3.go`, `adapter/sqs.go`):**
+**Adapter healthz (`adapter/s3.go`, `adapter/sqs.go`, `adapter/dynamodb.go`):**
 
-`isVerifiedS3Leader` / `isVerifiedSQSLeader` take ctx, pass it to the
-new `VerifyLeaderCtx` variants. HTTP handlers feed `r.Context()`.
+`isVerifiedS3Leader(ctx)` / `isVerifiedSQSLeader(ctx, coordinator)` /
+`isVerifiedDynamoLeader(ctx, coordinator)` take ctx, pass it to
+`VerifyLeader(ctx)`. HTTP handlers feed `r.Context()`.
 
 ## Behaviour
 
