@@ -2098,12 +2098,17 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 	//      (id, payload). This is what keeps resolveProposal's
 	//      proposal-ID lookup working — entry.Data still starts
 	//      with 0x01 proposalEnvelopeVersion.
-	//   2. If the cipher is wired AND entry.Index is past the
-	//      cluster-wide cutover, unwrap the inner raft envelope
-	//      to recover the cleartext fsm payload. Strict greater-
-	//      than: entry.Index == cutover is itself the
-	//      enable-raft-envelope flag entry and is NOT raft-DEK-
-	//      wrapped (§7.1).
+	//   2. If entry.Index is past the cluster-wide cutover, the
+	//      inner fsm payload is a raft envelope and MUST be
+	//      unwrapped via the raft DEK. Strict greater-than:
+	//      entry.Index == cutover is itself the enable-raft-
+	//      envelope flag entry and is NOT raft-DEK-wrapped
+	//      (§7.1). If the cipher is missing while cutover is
+	//      active, fail closed with ErrRaftUnwrapFailed —
+	//      handing wrapped envelope bytes to fsm.Apply would
+	//      diverge this node from peers that successfully
+	//      unwrapped, exactly the safety property the integrity
+	//      tag was added to detect.
 	//   3. Hand the (now cleartext) payload to fsm.Apply. The
 	//      FSM contract is unchanged at Apply(data []byte) any —
 	//      the FSM never sees a raft envelope.
@@ -2116,7 +2121,19 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 	// or the cipher / no-cipher paths will diverge in ownership.
 	// Stage 6 plans a defensive copy at the apply boundary so the
 	// contract becomes uniform regardless of cipher state.
-	if e.raftCipher != nil && entry.Index > e.raftCutoverIndex() {
+	if entry.Index > e.raftCutoverIndex() {
+		if e.raftCipher == nil {
+			// Cutover is active (a non-default cutover index has
+			// elected this entry as wrapped) but the cipher is
+			// missing — sidecar/init race or operator misconfig.
+			// Refuse to apply: a silent skip would diverge state
+			// permanently from peers that DID unwrap.
+			slog.Error("raft envelope cutover active but no cipher configured; halting apply",
+				slog.Uint64("entry_index", entry.Index),
+				slog.Uint64("cutover_index", e.raftCutoverIndex()))
+			return nil, errors.Wrap(ErrRaftUnwrapFailed,
+				"raftengine/etcd: entry past raft envelope cutover but no raft cipher wired")
+		}
 		plain, err := unwrapRaftPayload(e.raftCipher, payload)
 		if err != nil {
 			slog.Error("raft envelope unwrap failed; halting apply",

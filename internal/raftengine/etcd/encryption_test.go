@@ -78,10 +78,59 @@ func envelopeEntry(t *testing.T, c *encryption.Cipher, kid uint32, index uint64,
 	return raftpb.Entry{Index: index, Type: raftpb.EntryNormal, Data: encodeProposalEnvelope(7, wrapped)}
 }
 
+// TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed locks down
+// the misconfig case: when the cluster has crossed the raft envelope
+// cutover (an above-cutover entry arrives) but raftCipher is nil —
+// a sidecar/init race or operator wiring mistake — the engine MUST
+// refuse to apply, NOT silently hand wrapped envelope bytes to
+// fsm.Apply. The latter would permanently diverge this node from
+// peers that DID unwrap and apply the cleartext.
+func TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed(t *testing.T) {
+	t.Parallel()
+	const cutover uint64 = 100
+	fsm := &fakeStateMachine{}
+	// cipher == nil simulates the misconfig: cutover is set, no
+	// cipher wired.
+	e := newTestEngine(fsm, nil, func() uint64 { return cutover })
+
+	// Any payload above the cutover index hits the fail-closed branch
+	// regardless of whether it's a real envelope or cleartext, because
+	// without a cipher we cannot tell them apart.
+	entry := raftpb.Entry{
+		Type:  raftpb.EntryNormal,
+		Index: cutover + 1,
+		Data:  encodeProposalEnvelope(99, []byte("would-be wrapped payload")),
+	}
+	_, err := e.applyNormalEntry(entry)
+	if !errors.Is(err, ErrRaftUnwrapFailed) {
+		t.Fatalf("expected ErrRaftUnwrapFailed for cutover-active+no-cipher misconfig, got %v", err)
+	}
+	if got := fsm.calls.Load(); got != 0 {
+		t.Fatalf("fsm.Apply called %d times despite refused apply", got)
+	}
+
+	// Below-cutover entries still pass through unchanged in this
+	// configuration — the misconfig detection fires only when an
+	// above-cutover entry actually arrives. (Pre-cutover entries
+	// were written before encryption was activated and remain
+	// legitimately cleartext.)
+	belowCutoverEntry := raftpb.Entry{
+		Type:  raftpb.EntryNormal,
+		Index: cutover,
+		Data:  encodeProposalEnvelope(11, []byte("legacy cleartext")),
+	}
+	if _, err := e.applyNormalEntry(belowCutoverEntry); err != nil {
+		t.Fatalf("below-cutover should pass through, got %v", err)
+	}
+	if got := fsm.calls.Load(); got != 1 {
+		t.Fatalf("fsm.Apply call count after below-cutover = %d, want 1", got)
+	}
+}
+
 // TestApplyNormalEntry_NoCipher_PassThrough confirms Stage-3 wiring
-// preserves Stage-0/2 behaviour: with raftCipher == nil the apply
-// hook is inert and the FSM sees the proposal envelope's inner
-// payload byte-for-byte.
+// preserves Stage-0/2 behaviour: with raftCipher == nil AND no
+// cutover (the OpenConfig defaults), the apply hook is inert and the
+// FSM sees the proposal envelope's inner payload byte-for-byte.
 func TestApplyNormalEntry_NoCipher_PassThrough(t *testing.T) {
 	t.Parallel()
 	fsm := &fakeStateMachine{}
