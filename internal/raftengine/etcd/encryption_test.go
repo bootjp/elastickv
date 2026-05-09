@@ -373,6 +373,88 @@ func TestApplyNormalEntry_NoCutoverDefault(t *testing.T) {
 	}
 }
 
+// haltStateMachine is a fakeStateMachine that returns a response
+// implementing the HaltApply interface — used by
+// TestApplyCommitted_HaltApply_DoesNotAdvanceApplied to confirm the
+// engine's seam for §6.3 encryption-apply fatal halts works
+// independently from the raft envelope unwrap hook.
+type haltStateMachine struct {
+	calls atomic.Int32
+	err   error
+}
+
+type haltResponse struct{ err error }
+
+func (h *haltResponse) HaltApply() error { return h.err }
+
+func (s *haltStateMachine) Apply([]byte) any {
+	s.calls.Add(1)
+	if s.err != nil {
+		return &haltResponse{err: s.err}
+	}
+	return nil
+}
+func (s *haltStateMachine) Snapshot() (Snapshot, error) { return nil, nil }
+func (s *haltStateMachine) Restore(_ io.Reader) error   { return nil }
+
+// TestApplyCommitted_HaltApply_DoesNotAdvanceApplied locks down the
+// HaltApply seam: when the FSM returns a value implementing
+// `HaltApply() error` and that method returns non-nil, applyCommitted
+// surfaces the error and does NOT advance setApplied. Mirrors
+// TestApplyCommitted_UnwrapFailure_DoesNotAdvanceApplied, but for
+// the encryption-FSM-apply fatal path that arrives via the FSM's
+// return value rather than the engine's pre-apply hook.
+func TestApplyCommitted_HaltApply_DoesNotAdvanceApplied(t *testing.T) {
+	t.Parallel()
+	fsm := &haltStateMachine{err: ErrEncryptionApply}
+	e := newTestEngine(fsm, nil, nil)
+	const startApplied uint64 = 99
+	e.applied = startApplied
+	e.appliedIndex.Store(startApplied)
+
+	good := raftpb.Entry{
+		Type:  raftpb.EntryNormal,
+		Index: 100,
+		Data:  encodeProposalEnvelope(7, []byte("payload")),
+	}
+	err := e.applyCommitted([]raftpb.Entry{good})
+	if !errors.Is(err, ErrEncryptionApply) {
+		t.Fatalf("expected ErrEncryptionApply, got %v", err)
+	}
+	// fsm.Apply was reached (1 call), but setApplied did NOT
+	// advance because HaltApply().err was non-nil.
+	if got := fsm.calls.Load(); got != 1 {
+		t.Fatalf("fsm.Apply call count = %d, want 1", got)
+	}
+	if e.applied != startApplied {
+		t.Fatalf("applied advanced to %d despite halt; want %d", e.applied, startApplied)
+	}
+	if got := e.appliedIndex.Load(); got != startApplied {
+		t.Fatalf("appliedIndex advanced to %d despite halt; want %d", got, startApplied)
+	}
+}
+
+// TestApplyCommitted_HaltApply_NilContinues confirms that a HaltApply
+// implementer whose `HaltApply()` returns nil does NOT halt — the
+// apply loop advances normally. This is the no-op case where the
+// encryption FSM ran a registration/bootstrap/rotation successfully.
+func TestApplyCommitted_HaltApply_NilContinues(t *testing.T) {
+	t.Parallel()
+	fsm := &haltStateMachine{err: nil}
+	e := newTestEngine(fsm, nil, nil)
+	good := raftpb.Entry{
+		Type:  raftpb.EntryNormal,
+		Index: 100,
+		Data:  encodeProposalEnvelope(7, []byte("payload")),
+	}
+	if err := e.applyCommitted([]raftpb.Entry{good}); err != nil {
+		t.Fatalf("applyCommitted: %v", err)
+	}
+	if e.applied != 100 {
+		t.Fatalf("applied = %d, want 100 (nil HaltApply must advance)", e.applied)
+	}
+}
+
 // TestUnwrapRaftPayload_Helper sanity-checks that the engine-internal
 // unwrapRaftPayload helper marks all encryption errors with
 // ErrRaftUnwrapFailed (so callers can errors.Is-match without

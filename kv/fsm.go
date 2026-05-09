@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -29,23 +30,54 @@ type kvFSM struct {
 	// hlc is the shared HLC instance updated when a HLC lease entry is applied.
 	// May be nil for nodes that do not participate in physical ceiling tracking.
 	hlc *HLC
+	// encryption is the §6.3 / §11.3 encryption-opcode applier. nil in
+	// Stage 4 default and in tests that do not exercise opcodes 0x03/
+	// 0x04/0x05; Stage 5/6/7 wire a concrete implementation that
+	// mutates the keystore + sidecar + writer registry. With nil
+	// installed, the encryption-opcode dispatch fails closed via
+	// HaltApply rather than silently advancing setApplied past a
+	// proposal the local node cannot process.
+	encryption EncryptionApplier
 }
 
 type FSM interface {
 	raftengine.StateMachine
 }
 
+// FSMOption configures a *kvFSM at construction. Stage 4 introduces
+// WithEncryption; future stages may add more.
+type FSMOption func(*kvFSM)
+
+// WithEncryption installs the EncryptionApplier the kvFSM dispatches
+// opcodes 0x03 / 0x04 / 0x05 to. Pass nil (or omit the option
+// entirely) to leave the FSM in the Stage-4-default fail-closed
+// state where any encryption opcode halts the apply loop via
+// ErrEncryptionApply.
+func WithEncryption(applier EncryptionApplier) FSMOption {
+	return func(f *kvFSM) {
+		f.encryption = applier
+	}
+}
+
 // NewKvFSMWithHLC creates a KV FSM that updates hlc.physicalCeiling whenever
 // a HLC lease entry is applied. The caller must pass the same *HLC instance to
 // the coordinator so both sides share the agreed physical ceiling.
-func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC) FSM {
-	return &kvFSM{
+//
+// Optional FSMOption arguments configure additional handlers (see
+// WithEncryption). Existing callers without options keep the
+// pre-Stage-4 behaviour byte-for-byte.
+func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
+	f := &kvFSM{
 		store: store,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
 		hlc: hlc,
 	}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
 }
 
 var _ FSM = (*kvFSM)(nil)
@@ -62,6 +94,19 @@ func (f *kvFSM) Apply(data []byte) any {
 	// the MVCC store. The logical counter continues to be managed in memory.
 	if len(data) > 0 && data[0] == raftEncodeHLCLease {
 		return f.applyHLCLease(data[1:])
+	}
+	// Encryption FSM opcodes (§6.3 / §11.3 — 0x03 registration,
+	// 0x04 bootstrap, 0x05 rotation). Dispatched ahead of the
+	// kv-legacy decodeRaftRequests so a stray encryption opcode
+	// cannot fall through to the proto3 unmarshal path. The
+	// applyEncryption dispatcher returns a haltApplyResponse on
+	// failure; internal/raftengine/etcd.applyNormalCommitted
+	// recognises the HaltApply interface and halts the apply loop.
+	if len(data) > 0 {
+		switch data[0] {
+		case fsmwire.OpRegistration, fsmwire.OpBootstrap, fsmwire.OpRotation:
+			return f.applyEncryption(data[0], data[1:])
+		}
 	}
 
 	ctx := context.TODO()

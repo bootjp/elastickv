@@ -5,6 +5,14 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// ErrEncryptionApply is re-exported from internal/encryption so
+// callers in this package can errors.Is-match the FSM-side
+// haltApplyResponse without taking a kv-package import (which
+// would create a cycle: kv → internal/raftengine/etcd → kv tests).
+// The canonical definition lives in internal/encryption/errors.go;
+// see that file's doc for the §6.3 fail-closed contract.
+var ErrEncryptionApply = encryption.ErrEncryptionApply
+
 // ErrRaftUnwrapFailed is returned by applyNormalEntry when the
 // pre-apply hook cannot unwrap a §4.2 raft envelope (GCM tag
 // mismatch, missing DEK in the local keystore, malformed
