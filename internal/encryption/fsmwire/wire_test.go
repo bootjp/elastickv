@@ -138,6 +138,41 @@ func TestBootstrap_RejectsTruncated(t *testing.T) {
 	}
 }
 
+// TestBootstrap_RejectsHugeBatchCount is the regression for the
+// codex P1 / gemini security-high finding: a malformed bootstrap
+// payload that names `count = 0xffffffff` would, before the guard,
+// trigger `make([]RegistrationPayload, count)` (4G × 14 bytes ≈
+// 56 GiB) and OOM the process before the loop tried to read the
+// first row. The decoder must fail closed via ErrFSMWireMalformed
+// before any allocation that exceeds the remaining payload.
+func TestBootstrap_RejectsHugeBatchCount(t *testing.T) {
+	t.Parallel()
+	// Hand-roll a payload whose batch count is huge but which has
+	// only a tiny tail to serve registration rows from. We start
+	// from the encoded form of a minimal valid bootstrap, then
+	// rewrite the count prefix in place.
+	good := fsmwire.EncodeBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, RaftDEKID: 2,
+	})
+	// Locate the batch-count prefix: after [ver(1)] [storage_dek_id(4)]
+	// [storage_wrapped_len(4)] [storage_wrapped(0)] [raft_dek_id(4)]
+	// [raft_wrapped_len(4)] [raft_wrapped(0)] = offset 17.
+	const countOffset = 1 + 4 + 4 + 0 + 4 + 4 + 0
+	if got := len(good); got < countOffset+4 {
+		t.Fatalf("encoded bootstrap shorter than expected: %d bytes, want >= %d", got, countOffset+4)
+	}
+	// Overwrite count with 0xFFFFFFFF (4G entries). Pre-fix this
+	// would `make([]RegistrationPayload, 4_294_967_295)` and OOM.
+	good[countOffset+0] = 0xFF
+	good[countOffset+1] = 0xFF
+	good[countOffset+2] = 0xFF
+	good[countOffset+3] = 0xFF
+	_, err := fsmwire.DecodeBootstrap(good)
+	if !errors.Is(err, fsmwire.ErrFSMWireMalformed) {
+		t.Fatalf("expected ErrFSMWireMalformed for huge batch count, got %v", err)
+	}
+}
+
 func TestBootstrap_RejectsTrailingBytes(t *testing.T) {
 	t.Parallel()
 	good := fsmwire.EncodeBootstrap(fsmwire.BootstrapPayload{StorageDEKID: 1, RaftDEKID: 2})

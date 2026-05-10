@@ -28,6 +28,7 @@ package fsmwire
 
 import (
 	"encoding/binary"
+	"math"
 
 	"github.com/cockroachdb/errors"
 )
@@ -310,10 +311,32 @@ func readDEKAndWrapped(r *reader, opTag string) (uint32, []byte, error) {
 // readRegistrationBatch reads a uint32 count followed by that many
 // registration rows. Used by BootstrapPayload's batch-registry
 // section.
+//
+// DoS guard: the count must fit in the bytes the reader has left.
+// Without this guard, a malformed bootstrap payload that names
+// `count = 0xffffffff` triggers `make([]RegistrationPayload, count)`
+// (4G × 14 bytes ≈ 56 GiB) before the loop even tries to read the
+// first row, killing the process via OOM. Since Raft entries are
+// external input on the apply path, we fail closed with
+// ErrFSMWireMalformed instead.
 func readRegistrationBatch(r *reader) ([]RegistrationPayload, error) {
 	count, ok := r.readU32()
 	if !ok {
 		return nil, errors.Wrap(ErrFSMWireMalformed, "bootstrap: batch count truncated")
+	}
+	rem := r.remaining()
+	if rem < 0 {
+		return nil, errors.Wrap(ErrFSMWireMalformed, "bootstrap: negative remaining bytes")
+	}
+	// Compare in uint64 so neither side truncates: a 64-bit reader
+	// with > 2^32 remaining bytes (theoretical) and a count just
+	// under 2^32 must still produce a correct check. The
+	// multiplication cannot overflow uint64 because
+	// count * registrationSize <= (2^32-1) * 14 < 2^64.
+	need := uint64(count) * uint64(registrationSize)
+	if uint64(rem) < need {
+		return nil, errors.Wrapf(ErrFSMWireMalformed,
+			"bootstrap: batch count %d × %d > remaining %d", count, registrationSize, rem)
 	}
 	regs := make([]RegistrationPayload, count)
 	for i := uint32(0); i < count; i++ {
@@ -481,12 +504,14 @@ func (r *reader) readLenU32Bytes() ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	// Compare on the uint32 side: cast remaining (non-negative
-	// int by construction — readByte/readU32/etc. never advance
-	// past len(src)) into uint32 with a saturation guard so a
-	// 32-bit platform's int can never overflow the comparison.
+	// Compare in uint64 so a 64-bit reader with >2^32 remaining
+	// bytes (theoretical) is not silently truncated by uint32(rem)
+	// — a regression where rem = 4.3 GiB would shrink to ~300 MiB
+	// and falsely report "insufficient space". The rem<0 guard is
+	// belt-and-suspenders for any future change to remaining()
+	// that introduces a signed-cast hazard.
 	rem := r.remaining()
-	if rem < 0 || uint32(rem) < n { //nolint:gosec // rem >= 0 enforced by the rem < 0 branch
+	if rem < 0 || uint64(rem) < uint64(n) { //nolint:gosec // rem >= 0 enforced by the rem < 0 branch
 		return nil, false
 	}
 	end := r.off + int(n) //nolint:gosec // n bounded by rem above; rem fits int
@@ -523,9 +548,15 @@ func appendLenU32Bytes(dst []byte, data []byte) []byte {
 // caller controls every input length (wrapped DEK, batch count) at
 // hundred-byte / hundred-entry scale; a uint32 overflow indicates a
 // caller bug, not adversarial input, so panic is appropriate.
+//
+// Width-agnostic bound check: convert n to uint64 (safe for any
+// non-negative int) and compare against math.MaxUint32. An
+// earlier draft used `int(^uint32(0))` as the bound, which fails
+// to compile on GOARCH=386 because the constant 4,294,967,295
+// overflows the 32-bit signed int — the cross-compile build would
+// break before any runtime check fired.
 func safeU32(n int) uint32 {
-	const maxU32 = int(^uint32(0))
-	if n < 0 || n > maxU32 {
+	if n < 0 || uint64(n) > math.MaxUint32 { //nolint:gosec // n < 0 short-circuits the uint64 cast
 		panic(errors.Newf("fsmwire: length %d does not fit in uint32", n))
 	}
 	return uint32(n) //nolint:gosec // bounds checked above
