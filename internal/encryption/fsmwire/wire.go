@@ -203,6 +203,27 @@ const (
 	regPayloadEncoded = versionByteSize + registrationSize          // 15
 )
 
+// maxBootstrapBatchCount bounds the number of RegistrationPayload
+// entries `readRegistrationBatch` will allocate from a single
+// bootstrap payload. The wire-bytes check (count * registrationSize
+// ≤ remaining) is necessary but NOT sufficient: each
+// RegistrationPayload occupies 24 bytes in Go (uint32+uint64+uint16
+// + alignment padding) versus 14 bytes packed on the wire, so a
+// crafted bootstrap entry that fits the wire-bounds check could
+// still drive a >70% larger heap allocation. With a sufficiently
+// large raft entry the in-memory cost would multiply into the
+// gigabytes — codex P1 round-3 finding for PR748.
+//
+// The cap of 16384 is ~8x the largest realistic cluster (raft
+// deployments are typically tens of voters; the largest documented
+// production raft clusters are in the low thousands of nodes). A
+// bootstrap covers every member × 2 DEK purposes (storage + raft),
+// so for an 8000-node cluster the legitimate count would be 16000
+// — still under the cap. The post-cap allocation ceiling is
+// 16384 * 24 = 384 KiB, which is bounded regardless of any future
+// struct-padding changes.
+const maxBootstrapBatchCount = 1 << 14
+
 // EncodeRegistration serialises p as the OpRegistration payload
 // (without the leading 0x03 opcode tag — that is added by the
 // kv/fsm.go dispatch layer).
@@ -354,6 +375,21 @@ func readRegistrationBatch(r *reader) ([]RegistrationPayload, error) {
 	count, ok := r.readU32()
 	if !ok {
 		return nil, errors.Wrap(ErrFSMWireMalformed, "bootstrap: batch count truncated")
+	}
+	// Hard cap on count BEFORE the wire-bytes check. The
+	// wire-bytes check alone would let a count of (2^32-1) /
+	// registrationSize ≈ 306M pass for a sufficiently large raft
+	// entry, which `make([]RegistrationPayload, count)` would
+	// turn into a multi-GiB heap allocation due to the struct's
+	// alignment padding (24B in-memory vs 14B on the wire). The
+	// cap bounds the post-make allocation at maxBootstrapBatchCount
+	// * sizeof(RegistrationPayload) = 16384 * 24 = 384 KiB,
+	// independent of how many bytes the raft entry happens to
+	// carry. See the constant comment for the cluster-size
+	// rationale; this is the codex P1 round-3 fix for PR748.
+	if count > maxBootstrapBatchCount {
+		return nil, errors.Wrapf(ErrFSMWireMalformed,
+			"bootstrap: batch count %d exceeds cap %d", count, maxBootstrapBatchCount)
 	}
 	rem := r.remaining()
 	if rem < 0 {

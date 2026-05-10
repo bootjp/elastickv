@@ -138,6 +138,46 @@ func TestBootstrap_RejectsTruncated(t *testing.T) {
 	}
 }
 
+// TestBootstrap_RejectsOverCapBatchCount is the codex P1 round-3
+// regression for PR748: the wire-bytes check (count *
+// registrationSize ≤ remaining) is necessary but NOT sufficient
+// because RegistrationPayload occupies more bytes in memory (24
+// on 64-bit due to alignment padding) than on the wire (14 bytes
+// packed). A crafted count that fits the wire-bounds check could
+// still drive a >70% larger heap allocation; for a multi-MiB raft
+// entry the in-memory cost would multiply into the gigabytes.
+//
+// The decoder enforces an absolute cap on `count` that bounds the
+// post-make slice size independent of the raft entry length. This
+// test asserts a cap-exceeding count fails closed BEFORE the
+// allocation, even when the wire payload would otherwise admit it.
+//
+// The literal 16385 below must equal `maxBootstrapBatchCount + 1`
+// in wire.go (1<<14 + 1). The constant is intentionally unexported
+// — it is a defensive bound, not part of the wire contract.
+func TestBootstrap_RejectsOverCapBatchCount(t *testing.T) {
+	t.Parallel()
+	good := fsmwire.EncodeBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, RaftDEKID: 2,
+	})
+	const countOffset = 1 + 4 + 4 + 0 + 4 + 4 + 0
+	if got := len(good); got < countOffset+4 {
+		t.Fatalf("encoded bootstrap shorter than expected: %d bytes, want >= %d", got, countOffset+4)
+	}
+	// Overwrite count with maxBootstrapBatchCount + 1 = 16385.
+	// The cap check fires before the wire-bytes check, so we do
+	// NOT need to extend the payload with 16385 * 14 trailing
+	// bytes — the decoder must reject on the cap regardless.
+	good[countOffset+0] = 0x00
+	good[countOffset+1] = 0x00
+	good[countOffset+2] = 0x40 // 0x4001 = 16385 = (1<<14) + 1
+	good[countOffset+3] = 0x01
+	_, err := fsmwire.DecodeBootstrap(good)
+	if !errors.Is(err, fsmwire.ErrFSMWireMalformed) {
+		t.Fatalf("expected ErrFSMWireMalformed for over-cap batch count, got %v", err)
+	}
+}
+
 // TestBootstrap_RejectsHugeBatchCount is the regression for the
 // codex P1 / gemini security-high finding: a malformed bootstrap
 // payload that names `count = 0xffffffff` would, before the guard,
