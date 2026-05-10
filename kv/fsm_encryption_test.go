@@ -224,19 +224,22 @@ func TestApply_DecodeFailure_Halts(t *testing.T) {
 }
 
 // TestApply_ReservedRange_FutureOpcodes_Halt is the codex-P1
-// regression for PR748: every byte in [0x03, 0x0F] must route
-// through the encryption fail-closed halt path, NOT the legacy
-// proto3 decoder. A future leader emitting 0x06 (or any reserved
-// byte) against a stale follower would otherwise fall through to
-// decodeLegacyRaftRequest and either silently advance setApplied or
-// return an ordinary apply error — the rolling-upgrade divergence
-// shape the §6.3 halt was added to prevent.
+// regression for PR748: every byte in [OpEncryptionMin,
+// OpEncryptionMax] = [0x03, 0x07] must route through the encryption
+// fail-closed halt path, NOT the legacy proto3 decoder. A future
+// leader emitting 0x06 (or any reserved byte) against a stale
+// follower would otherwise fall through to decodeLegacyRaftRequest
+// and either silently advance setApplied or return an ordinary
+// apply error — the rolling-upgrade divergence shape the §6.3 halt
+// was added to prevent. The upper bound stops at 0x07 because
+// 0x08..0x0D collide with proto3 field-1 wire tags (see the comment
+// on OpEncryptionMax in fsmwire/wire.go for the analysis).
 //
 // The test sweeps the reserved range exhaustively and asserts that
 // every byte produces a haltApplyResponse wrapping
 // ErrEncryptionApply. The known opcodes (0x03/0x04/0x05) ride this
 // path because no applier is wired; the future-reserved opcodes
-// (0x06..0x0F) ride it because applyEncryption's default case fails
+// (0x06/0x07) ride it because applyEncryption's default case fails
 // closed for any byte not yet implemented.
 func TestApply_ReservedRange_FutureOpcodes_Halt(t *testing.T) {
 	t.Parallel()
@@ -256,8 +259,10 @@ func TestApply_ReservedRange_FutureOpcodes_Halt(t *testing.T) {
 // available for future non-encryption FSM extensions and continues
 // to flow through decodeRaftRequests, which will surface the
 // proto3 decode error (or proto3 stretch-decode it). The contract
-// is "encryption owns 0x03..0x0F"; that bound must hold from both
-// sides.
+// is "encryption owns 0x03..0x07 (OpEncryptionMax)"; bytes 0x08+
+// are reserved for the proto3 fallback (because 0x08..0x0D collide
+// with proto3 field-1 wire tags) and any later non-encryption FSM
+// extension. That bound must hold from both sides.
 func TestApply_AboveReservedRange_FallsThroughToLegacy(t *testing.T) {
 	t.Parallel()
 	applier := &fakeApplier{}
