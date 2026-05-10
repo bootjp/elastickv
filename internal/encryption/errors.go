@@ -47,4 +47,28 @@ var (
 	// rather than silently overwriting. Set with the SAME bytes is
 	// idempotent (returns nil) and does not raise this error.
 	ErrKeyConflict = errors.New("encryption: key_id already loaded with different key material")
+
+	// ErrUnsupportedFilesystem indicates the parent directory of the
+	// sidecar cannot guarantee crash-durability of os.Rename via
+	// fsync (typical on NFS, some FUSE mounts). Per §5.1 the
+	// encryption package refuses to start in that situation rather
+	// than silently degrading the durability guarantee. WriteSidecar
+	// wraps any fsync-on-directory failure with this sentinel so the
+	// Stage 5+ startup integration can errors.Is-match it.
+	ErrUnsupportedFilesystem = errors.New("encryption: filesystem does not support durable directory sync (NFS, some FUSE mounts are unsupported)")
+
+	// ErrSidecarActiveKeyMissing indicates the Sidecar has a non-zero
+	// Active.{Storage,Raft} key_id that does not appear in the Keys
+	// map. The two halves are written together by every rotation /
+	// bootstrap path; an Active id without a corresponding wrapped
+	// DEK is malformed input.
+	ErrSidecarActiveKeyMissing = errors.New("encryption: sidecar active key_id has no entry in keys map")
+
+	// ErrSidecarActivePurposeMismatch indicates the Sidecar has a
+	// non-zero Active.{Storage,Raft} key_id pointing to a Keys entry
+	// whose Purpose does not match the slot. e.g., active.storage=7
+	// but Keys["7"].purpose == "raft". Crossed pointers would route
+	// the wrong DEK into a purpose-specific encryption path after
+	// restart or rotation, so the reader fails closed.
+	ErrSidecarActivePurposeMismatch = errors.New("encryption: sidecar active key_id references a key with mismatched purpose")
 )
