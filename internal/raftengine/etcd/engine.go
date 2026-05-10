@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -175,6 +176,17 @@ type OpenConfig struct {
 	// Default: 256. Increase for deeper pipelining on high-bandwidth links;
 	// lower in memory-constrained clusters.
 	MaxInflightMsg int
+	// RaftCipher carries the AES-GCM Cipher used by the §4.2 raft
+	// envelope pre-apply hook. nil disables the hook (Stage 3
+	// default — production wiring lands once Stage 6's cluster
+	// flag flow is in place).
+	RaftCipher *encryption.Cipher
+	// RaftCutoverIndex returns the §7.1 Phase 2 raft envelope
+	// cutover index. Only entries whose Raft log index is strictly
+	// greater than this value go through Unwrap. nil ⇒ no cutover
+	// has been observed yet, equivalent to "raft envelope hook
+	// off".
+	RaftCutoverIndex RaftCutoverIndex
 }
 
 type Engine struct {
@@ -202,6 +214,16 @@ type Engine struct {
 	fsm       StateMachine
 	peers     map[uint64]Peer
 	transport *GRPCTransport
+
+	// raftCipher and raftCutoverIndex implement the §4.2 / §6.3
+	// pre-apply unwrap hook. raftCipher is nil unless the
+	// OpenConfig wiring is provided; raftCutoverIndex is set to a
+	// permanent-no-op default by Open so applyNormalEntry never
+	// branches on a nil callback. Both are read-only after Open
+	// (single-writer discipline matches the rest of the apply-loop
+	// state).
+	raftCipher       *encryption.Cipher
+	raftCutoverIndex RaftCutoverIndex
 
 	nextRequestID atomic.Uint64
 
@@ -513,6 +535,8 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		fsm:              prepared.cfg.StateMachine,
 		peers:            peerMap,
 		transport:        prepared.cfg.Transport,
+		raftCipher:       prepared.cfg.RaftCipher,
+		raftCutoverIndex: orInertCutover(prepared.cfg.RaftCutoverIndex),
 		proposeCh:        make(chan proposalRequest),
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
@@ -2092,37 +2116,19 @@ func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
 
 func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 	for _, entry := range entries {
+		var err error
 		switch entry.Type {
 		case raftpb.EntryNormal:
-			response := e.applyNormalEntry(entry)
-			e.setApplied(entry.Index)
-			e.resolveProposal(entry.Index, entry.Data, response)
+			err = e.applyNormalCommitted(entry)
 		case raftpb.EntryConfChange:
-			var cc raftpb.ConfChange
-			if err := cc.Unmarshal(entry.Data); err != nil {
-				return errors.WithStack(err)
-			}
-			confState := e.rawNode.ApplyConfChange(cc)
-			nextPeers := e.nextPeersAfterConfigChange(cc.Type, cc.NodeID, cc.Context, *confState)
-			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
-				return err
-			}
-			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index, *confState)
-			e.setApplied(entry.Index)
+			err = e.applyConfChangeCommitted(entry)
 		case raftpb.EntryConfChangeV2:
-			var cc raftpb.ConfChangeV2
-			if err := cc.Unmarshal(entry.Data); err != nil {
-				return errors.WithStack(err)
-			}
-			confState := e.rawNode.ApplyConfChange(cc)
-			nextPeers := e.nextPeersAfterConfigChangeV2(cc, *confState)
-			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
-				return err
-			}
-			e.applyConfigChangeV2(cc, entry.Index, *confState)
-			e.setApplied(entry.Index)
+			err = e.applyConfChangeV2Committed(entry)
 		default:
 			e.setApplied(entry.Index)
+		}
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2137,15 +2143,127 @@ func (e *Engine) setApplied(index uint64) {
 	e.appliedIndex.Store(index)
 }
 
-func (e *Engine) applyNormalEntry(entry raftpb.Entry) any {
+// applyNormalCommitted is the EntryNormal arm of applyCommitted.
+// Extracted so applyCommitted stays under the cyclomatic-complexity
+// budget while preserving the load-bearing fail-closed semantics:
+// if applyNormalEntry surfaces an error, setApplied is NOT called
+// and the error propagates so runLoop's existing fatal-error path
+// can halt the process. Silent skip is never an option — the
+// integrity tag was added to detect divergence and skipping past
+// it would defeat that property (design §6.3).
+//
+// On the error path resolveProposal is intentionally NOT called: the
+// originating coordinator's done channel for this proposal is left
+// dangling. That is correct under the §6.3 process-fatal contract —
+// runLoop halts and the OS reaps the goroutine plus its channel as
+// part of process exit. A graceful resolveProposal on the error path
+// would deliver a nil/error response that the coordinator might mis-
+// interpret as a committed-but-failed apply (rather than the actual
+// "halting; please restart and retry" semantics).
+func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
+	response, err := e.applyNormalEntry(entry)
+	if err != nil {
+		return err
+	}
+	e.setApplied(entry.Index)
+	e.resolveProposal(entry.Index, entry.Data, response)
+	return nil
+}
+
+// applyConfChangeCommitted is the EntryConfChange arm of
+// applyCommitted (extracted for cyclomatic-budget hygiene; see
+// applyNormalCommitted).
+func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
+	var cc raftpb.ConfChange
+	if err := cc.Unmarshal(entry.Data); err != nil {
+		return errors.WithStack(err)
+	}
+	confState := e.rawNode.ApplyConfChange(cc)
+	nextPeers := e.nextPeersAfterConfigChange(cc.Type, cc.NodeID, cc.Context, *confState)
+	if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
+		return err
+	}
+	e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index, *confState)
+	e.setApplied(entry.Index)
+	return nil
+}
+
+// applyConfChangeV2Committed is the EntryConfChangeV2 arm of
+// applyCommitted.
+func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
+	var cc raftpb.ConfChangeV2
+	if err := cc.Unmarshal(entry.Data); err != nil {
+		return errors.WithStack(err)
+	}
+	confState := e.rawNode.ApplyConfChange(cc)
+	nextPeers := e.nextPeersAfterConfigChangeV2(cc, *confState)
+	if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
+		return err
+	}
+	e.applyConfigChangeV2(cc, entry.Index, *confState)
+	e.setApplied(entry.Index)
+	return nil
+}
+
+func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 	if len(entry.Data) == 0 {
-		return nil
+		return nil, nil
 	}
 	_, payload, ok := decodeProposalEnvelope(entry.Data)
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	return e.fsm.Apply(payload)
+	// §6.3 raft envelope pre-apply hook. The order is load-bearing:
+	//   1. decodeProposalEnvelope already ran above to recover
+	//      (id, payload). This is what keeps resolveProposal's
+	//      proposal-ID lookup working — entry.Data still starts
+	//      with 0x01 proposalEnvelopeVersion.
+	//   2. If entry.Index is past the cluster-wide cutover, the
+	//      inner fsm payload is a raft envelope and MUST be
+	//      unwrapped via the raft DEK. Strict greater-than:
+	//      entry.Index == cutover is itself the enable-raft-
+	//      envelope flag entry and is NOT raft-DEK-wrapped
+	//      (§7.1). If the cipher is missing while cutover is
+	//      active, fail closed with ErrRaftUnwrapFailed —
+	//      handing wrapped envelope bytes to fsm.Apply would
+	//      diverge this node from peers that successfully
+	//      unwrapped, exactly the safety property the integrity
+	//      tag was added to detect.
+	//   3. Hand the (now cleartext) payload to fsm.Apply. The
+	//      FSM contract is unchanged at Apply(data []byte) any —
+	//      the FSM never sees a raft envelope.
+	//
+	// FSM payload aliasing: when the cipher path is OFF, payload
+	// is a slice into entry.Data's backing array (DecodeProposalEnvelope
+	// returns a sub-slice). When the cipher path is ON, payload is
+	// a fresh allocation from cipher.Decrypt. FSM implementations
+	// MUST NOT retain `data` past Apply's return without copying,
+	// or the cipher / no-cipher paths will diverge in ownership.
+	// Stage 6 plans a defensive copy at the apply boundary so the
+	// contract becomes uniform regardless of cipher state.
+	if entry.Index > e.raftCutoverIndex() {
+		if e.raftCipher == nil {
+			// Cutover is active (a non-default cutover index has
+			// elected this entry as wrapped) but the cipher is
+			// missing — sidecar/init race or operator misconfig.
+			// Refuse to apply: a silent skip would diverge state
+			// permanently from peers that DID unwrap.
+			slog.Error("raft envelope cutover active but no cipher configured; halting apply",
+				slog.Uint64("entry_index", entry.Index),
+				slog.Uint64("cutover_index", e.raftCutoverIndex()))
+			return nil, errors.Wrap(ErrRaftUnwrapFailed,
+				"raftengine/etcd: entry past raft envelope cutover but no raft cipher wired")
+		}
+		plain, err := unwrapRaftPayload(e.raftCipher, payload)
+		if err != nil {
+			slog.Error("raft envelope unwrap failed; halting apply",
+				slog.Uint64("entry_index", entry.Index),
+				slog.Any("err", err))
+			return nil, err
+		}
+		payload = plain
+	}
+	return e.fsm.Apply(payload), nil
 }
 
 func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) {
