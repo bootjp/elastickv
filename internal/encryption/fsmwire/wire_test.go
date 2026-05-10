@@ -228,6 +228,54 @@ func TestRotation_RejectsUnknownSubTag(t *testing.T) {
 	}
 }
 
+// TestRotation_RejectsUnknownPurpose is the codex P2 regression for
+// PR748: the decoder previously cast the raw purpose byte to
+// `Purpose` without validating, so values outside the §5.1 enum
+// (storage=1, raft=2) — for example 0x00 or 0xFF — were accepted as
+// syntactically valid and forwarded to the applier. That weakens the
+// fail-closed wire contract: an applier that did not independently
+// re-check purpose could advance setApplied past a malformed entry.
+// Validate at decode time and surface ErrFSMWireMalformed.
+func TestRotation_RejectsUnknownPurpose(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []byte{0x00, 0x03, 0x7F, 0xFF} {
+		raw := fsmwire.EncodeRotation(fsmwire.RotationPayload{
+			SubTag: fsmwire.RotateSubRotateDEK, DEKID: 1, Purpose: fsmwire.PurposeStorage,
+		})
+		// Tamper purpose byte. Layout: [ver(1)] [subtag(1)] [dek_id(4)] [purpose(1)] ...
+		const purposeOffset = 1 + 1 + 4
+		if got := len(raw); got <= purposeOffset {
+			t.Fatalf("encoded rotation shorter than expected: %d bytes, want > %d", got, purposeOffset)
+		}
+		raw[purposeOffset] = bad
+		_, err := fsmwire.DecodeRotation(raw)
+		if !errors.Is(err, fsmwire.ErrFSMWireMalformed) {
+			t.Fatalf("purpose=%#x: expected ErrFSMWireMalformed, got %v", bad, err)
+		}
+	}
+}
+
+// TestRotation_AcceptsKnownPurposes is the positive control for the
+// purpose-validation guard above: storage=1 and raft=2 must continue
+// to round-trip cleanly. A regression that reject-listed too
+// aggressively would also break Stage 6's enable-storage-envelope
+// and enable-raft-envelope paths.
+func TestRotation_AcceptsKnownPurposes(t *testing.T) {
+	t.Parallel()
+	for _, p := range []fsmwire.Purpose{fsmwire.PurposeStorage, fsmwire.PurposeRaft} {
+		raw := fsmwire.EncodeRotation(fsmwire.RotationPayload{
+			SubTag: fsmwire.RotateSubRotateDEK, DEKID: 9, Purpose: p,
+		})
+		got, err := fsmwire.DecodeRotation(raw)
+		if err != nil {
+			t.Fatalf("purpose=%d: %v", p, err)
+		}
+		if got.Purpose != p {
+			t.Fatalf("purpose round-trip: got %d want %d", got.Purpose, p)
+		}
+	}
+}
+
 func TestRotation_RejectsBadVersion(t *testing.T) {
 	t.Parallel()
 	raw := fsmwire.EncodeRotation(fsmwire.RotationPayload{SubTag: fsmwire.RotateSubRotateDEK})

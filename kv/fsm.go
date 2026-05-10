@@ -90,23 +90,8 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
-	// HLC lease entries advance only the physical ceiling; they do not touch
-	// the MVCC store. The logical counter continues to be managed in memory.
-	if len(data) > 0 && data[0] == raftEncodeHLCLease {
-		return f.applyHLCLease(data[1:])
-	}
-	// Encryption FSM opcodes (§6.3 / §11.3 — 0x03 registration,
-	// 0x04 bootstrap, 0x05 rotation). Dispatched ahead of the
-	// kv-legacy decodeRaftRequests so a stray encryption opcode
-	// cannot fall through to the proto3 unmarshal path. The
-	// applyEncryption dispatcher returns a haltApplyResponse on
-	// failure; internal/raftengine/etcd.applyNormalCommitted
-	// recognises the HaltApply interface and halts the apply loop.
-	if len(data) > 0 {
-		switch data[0] {
-		case fsmwire.OpRegistration, fsmwire.OpBootstrap, fsmwire.OpRotation:
-			return f.applyEncryption(data[0], data[1:])
-		}
+	if resp, handled := f.applyReservedOpcode(data); handled {
+		return resp
 	}
 
 	ctx := context.TODO()
@@ -133,6 +118,36 @@ func (f *kvFSM) Apply(data []byte) any {
 		return resp
 	}
 	return nil
+}
+
+// applyReservedOpcode handles the FSM-internal opcode bands that are
+// dispatched ahead of the legacy proto3 fallback: HLC-lease entries
+// (0x02) and the encryption opcode range (§6.3 / §11.3 — 0x03..0x07,
+// the band reserved per the proto3 wire-tag analysis in
+// fsmwire.OpEncryptionMin/Max). Returning handled=false lets Apply
+// fall through to the legacy raft-request decode path. Extracted from
+// Apply to keep the dispatcher under the cyclomatic-complexity budget.
+//
+// Encryption-opcode dispatch is the codex P1 fix for PR748: a stray
+// future encryption opcode (e.g. 0x06) — including one emitted by a
+// NEWER leader during a rolling upgrade against a STALE follower —
+// must not fall through to proto3 unmarshal and silently advance
+// setApplied. applyEncryption's default case wraps any unimplemented
+// opcode with ErrEncryptionApply, which the engine's HaltApply seam
+// recognises as a halt — same fail-closed shape as the Stage 3
+// raft-envelope unwrap path.
+func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
+	if len(data) == 0 {
+		return nil, false
+	}
+	switch {
+	case data[0] == raftEncodeHLCLease:
+		return f.applyHLCLease(data[1:]), true
+	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
+		return f.applyEncryption(data[0], data[1:]), true
+	default:
+		return nil, false
+	}
 }
 
 // hlcLeasePayloadLen is the payload length (tag byte excluded) of an HLC lease entry.

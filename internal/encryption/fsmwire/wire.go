@@ -109,6 +109,37 @@ const (
 	//   0x05 — enable-raft-envelope    (Stage 6, §7.1 Phase 2)
 )
 
+// OpEncryptionMin / OpEncryptionMax delimit the FSM-internal opcode
+// range RESERVED for the encryption subsystem. kv/fsm.go's Apply
+// dispatcher routes EVERY byte in the closed range
+// [OpEncryptionMin, OpEncryptionMax] through applyEncryption, which
+// fails closed via ErrEncryptionApply for any byte that is not yet
+// implemented (Stage 4 implements only 0x03/0x04/0x05; 0x06/0x07 are
+// reserved for later stages). The widened range is the codex P1 fix
+// for PR748: previously only the three implemented opcodes were
+// routed, so a future leader emitting 0x06 against a stale follower
+// would fall through to the legacy proto3 decoder rather than halting
+// the apply loop — the same divergence shape the §6.3 fail-closed
+// halt was added to prevent.
+//
+// Upper bound 0x07 (NOT 0x0F): proto3 wire tags for field 1 occupy
+// 0x08..0x0D (field 1 with wire types varint/fixed64/length-delim/
+// start-group/end-group/fixed32). Routing those through the
+// encryption dispatcher would short-circuit the legacy proto3
+// fallback in `decodeLegacyRaftRequest` for any RaftCommand/Request
+// payload whose first encoded field is field 1 (e.g. `Request.is_txn`
+// = true → first bytes `0x08 0x01`). Bytes 0x03..0x07 are SAFE
+// because they encode either field 0 (proto3 disallows field 0) or
+// reserved/invalid wire types (0x06/0x07 = wire types 6/7 which
+// proto3 marks reserved), so no valid proto3 marshal output starts
+// with them. Future encryption opcodes 0x08+ would need a different
+// dispatch shape (e.g. a 2-byte sentinel) before they could be
+// routed safely.
+const (
+	OpEncryptionMin byte = 0x03
+	OpEncryptionMax byte = 0x07
+)
+
 // RegistrationPayload is the OpRegistration body: a single
 // (dek_id, full_node_id, local_epoch) triple inserted by FSM apply
 // into the §4.1 writer registry. The kv/fsm_encryption.go handler
@@ -437,6 +468,14 @@ func readRotationSubTag(r *reader) (byte, error) {
 
 // readRotationBody decodes the (dek_id, purpose, wrapped) triple
 // that follows the rotation sub-tag.
+//
+// Purpose is validated against the §5.1 enum at decode time so an
+// unknown byte (e.g. 0xFF) fails closed with ErrFSMWireMalformed
+// instead of being passed to the applier as an out-of-enum value.
+// Without this check a malformed entry could advance setApplied if
+// the applier did not independently re-validate purpose, weakening
+// the §6.3 fail-closed contract. This is the codex P2 fix for
+// PR748.
 func readRotationBody(r *reader) (uint32, Purpose, []byte, error) {
 	dekID, ok := r.readU32()
 	if !ok {
@@ -445,6 +484,14 @@ func readRotationBody(r *reader) (uint32, Purpose, []byte, error) {
 	purpose, ok := r.readByte()
 	if !ok {
 		return 0, 0, nil, errors.Wrap(ErrFSMWireMalformed, "rotation: purpose truncated")
+	}
+	switch Purpose(purpose) {
+	case PurposeStorage, PurposeRaft:
+		// known, fall through
+	default:
+		return 0, 0, nil, errors.Wrapf(ErrFSMWireMalformed,
+			"rotation: unknown purpose=%#x (want %#x storage / %#x raft)",
+			purpose, byte(PurposeStorage), byte(PurposeRaft))
 	}
 	wrapped, ok := r.readLenU32Bytes()
 	if !ok {

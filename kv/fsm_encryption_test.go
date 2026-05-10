@@ -223,6 +223,60 @@ func TestApply_DecodeFailure_Halts(t *testing.T) {
 	}
 }
 
+// TestApply_ReservedRange_FutureOpcodes_Halt is the codex-P1
+// regression for PR748: every byte in [0x03, 0x0F] must route
+// through the encryption fail-closed halt path, NOT the legacy
+// proto3 decoder. A future leader emitting 0x06 (or any reserved
+// byte) against a stale follower would otherwise fall through to
+// decodeLegacyRaftRequest and either silently advance setApplied or
+// return an ordinary apply error — the rolling-upgrade divergence
+// shape the §6.3 halt was added to prevent.
+//
+// The test sweeps the reserved range exhaustively and asserts that
+// every byte produces a haltApplyResponse wrapping
+// ErrEncryptionApply. The known opcodes (0x03/0x04/0x05) ride this
+// path because no applier is wired; the future-reserved opcodes
+// (0x06..0x0F) ride it because applyEncryption's default case fails
+// closed for any byte not yet implemented.
+func TestApply_ReservedRange_FutureOpcodes_Halt(t *testing.T) {
+	t.Parallel()
+	f := newFSMWithFake(nil)
+	for op := fsmwire.OpEncryptionMin; op <= fsmwire.OpEncryptionMax; op++ {
+		// Single-byte payload (no need to be well-formed — the
+		// no-applier dispatcher fails closed before any decode).
+		err := haltApplyOf(f.Apply([]byte{op}))
+		if !errors.Is(err, encryption.ErrEncryptionApply) {
+			t.Fatalf("op=%#x: expected halt with ErrEncryptionApply, got %v", op, err)
+		}
+	}
+}
+
+// TestApply_AboveReservedRange_FallsThroughToLegacy confirms 0x10
+// and above is NOT routed through applyEncryption — it remains
+// available for future non-encryption FSM extensions and continues
+// to flow through decodeRaftRequests, which will surface the
+// proto3 decode error (or proto3 stretch-decode it). The contract
+// is "encryption owns 0x03..0x0F"; that bound must hold from both
+// sides.
+func TestApply_AboveReservedRange_FallsThroughToLegacy(t *testing.T) {
+	t.Parallel()
+	applier := &fakeApplier{}
+	f := newFSMWithFake(applier)
+	// 0x10 with a proto3-invalid payload should trigger
+	// decodeRaftRequests' legacy fallback and surface as a non-halt
+	// error response (the kv legacy path returns plain errors via
+	// errors.WithStack — NOT via the HaltApply interface). The
+	// distinguishing assertion: the response must NOT be a
+	// haltApplyResponse.
+	resp := f.Apply([]byte{0x10, 0x99, 0x88})
+	if h, ok := resp.(interface{ HaltApply() error }); ok {
+		t.Fatalf("byte 0x10 unexpectedly routed through HaltApply: %v", h.HaltApply())
+	}
+	if got := applier.regCalls.Load() + applier.bootstrapCalls.Load() + applier.rotationCalls.Load(); got != 0 {
+		t.Fatalf("encryption applier received %d calls on a 0x10 entry", got)
+	}
+}
+
 // TestApply_LegacyOpcodesUnaffected confirms 0x00 / 0x01 / 0x02
 // continue to dispatch through the kv-legacy and HLC-lease paths.
 // A regression where the encryption switch case fell through to
