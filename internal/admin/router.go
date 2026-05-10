@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"io"
 	"io/fs"
@@ -59,15 +60,15 @@ const (
 // the operational "503 not leader" state. Mirrors the S3/DynamoDB
 // /healthz/leader contract.
 type LeaderProbe interface {
-	IsVerifiedLeader() bool
+	IsVerifiedLeader(ctx context.Context) bool
 }
 
 // LeaderProbeFunc is a convenience adapter for wiring a plain function
 // without defining an interface implementation. Mirrors ClusterInfoFunc.
-type LeaderProbeFunc func() bool
+type LeaderProbeFunc func(ctx context.Context) bool
 
 // IsVerifiedLeader implements LeaderProbe.
-func (f LeaderProbeFunc) IsVerifiedLeader() bool { return f() }
+func (f LeaderProbeFunc) IsVerifiedLeader(ctx context.Context) bool { return f(ctx) }
 
 // APIHandler is the bridge between the router and all JSON API endpoints.
 // Everything under /admin/api/v1/ resolves through it; individual endpoint
@@ -263,7 +264,7 @@ func (rt *Router) serveLeaderHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status, body := http.StatusOK, "ok\n"
-	if !rt.leader.IsVerifiedLeader() {
+	if !rt.leader.IsVerifiedLeader(r.Context()) {
 		status, body = http.StatusServiceUnavailable, "not leader\n"
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

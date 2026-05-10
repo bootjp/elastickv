@@ -1039,7 +1039,7 @@ func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
 		conn.WriteInt(size)
 		return
 	}
-	if err := r.coordinator.VerifyLeader(); err != nil {
+	if err := r.coordinator.VerifyLeader(r.handlerContext()); err != nil {
 		conn.WriteError(err.Error())
 		return
 	}
@@ -1144,7 +1144,11 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 	defer cancel()
 
 	if err := r.retryRedisWrite(ctx, func() error {
-		if err := r.coordinator.VerifyLeader(); err != nil {
+		// Use the per-call ctx with redisDispatchTimeout, NOT
+		// handlerContext (the long-lived server baseCtx). FLUSHDB's
+		// retry budget already lives in ctx; routing it to
+		// VerifyLeader keeps the whole command bounded.
+		if err := r.coordinator.VerifyLeader(ctx); err != nil {
 			return fmt.Errorf("verify leader: %w", err)
 		}
 

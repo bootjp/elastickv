@@ -81,7 +81,7 @@ func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 			},
 		},
 	}
-	resp, err := p.Commit(reqs)
+	resp, err := p.Commit(context.Background(), reqs)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.Greater(t, resp.CommitIndex, uint64(0))
@@ -135,7 +135,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		},
 	}
 
-	resp, err := p.Commit(reqs)
+	resp, err := p.Commit(context.Background(), reqs)
 	require.NoError(t, err)
 	require.Equal(t, uint64(123), resp.CommitIndex)
 
@@ -245,7 +245,7 @@ func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 		eng.setLeader(lis.Addr().String())
 	}()
 
-	resp, err := p.Commit(reqs)
+	resp, err := p.Commit(context.Background(), reqs)
 	elapsed := time.Since(start)
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), resp.CommitIndex)
@@ -289,7 +289,7 @@ func TestLeaderProxy_FailsAfterLeaderBudgetElapses(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err := p.Commit(reqs)
+	_, err := p.Commit(context.Background(), reqs)
 	elapsed := time.Since(start)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrLeaderNotFound)

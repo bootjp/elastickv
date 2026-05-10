@@ -377,7 +377,7 @@ func (d *DynamoDBServer) serveDynamoLeaderHealthz(w http.ResponseWriter, r *http
 		return
 	}
 
-	if isVerifiedDynamoLeader(d.coordinator) {
+	if isVerifiedDynamoLeader(r.Context(), d.coordinator) {
 		writeDynamoHealthBody(w, r, http.StatusOK, "ok\n")
 		return
 	}
@@ -385,11 +385,11 @@ func (d *DynamoDBServer) serveDynamoLeaderHealthz(w http.ResponseWriter, r *http
 	writeDynamoHealthBody(w, r, http.StatusServiceUnavailable, "not leader\n")
 }
 
-func isVerifiedDynamoLeader(coordinator kv.Coordinator) bool {
+func isVerifiedDynamoLeader(ctx context.Context, coordinator kv.Coordinator) bool {
 	if coordinator == nil || !coordinator.IsLeader() {
 		return false
 	}
-	return coordinator.VerifyLeader() == nil
+	return coordinator.VerifyLeader(ctx) == nil
 }
 
 func writeDynamoHealthMethod(w http.ResponseWriter, r *http.Request) bool {

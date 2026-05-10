@@ -166,15 +166,17 @@ func newAdminLeaderProbe(coordinate kv.Coordinator) admin.LeaderProbe {
 	if coordinate == nil {
 		return nil
 	}
-	return admin.LeaderProbeFunc(func() bool {
+	return admin.LeaderProbeFunc(func(ctx context.Context) bool {
 		if !coordinate.IsLeader() {
 			return false
 		}
-		// VerifyLeader is the same ReadIndex round-trip lease reads
-		// use; under the hood it carries an engine-bounded deadline,
-		// so a stalled cluster surfaces 503 here on its own without
-		// the probe needing an outer timeout.
-		return coordinate.VerifyLeader() == nil
+		// VerifyLeader receives the request ctx (PR #748): a Caddy probe
+		// or browser preflight that sets its own deadline now bounds the
+		// ReadIndex round-trip, instead of falling back to
+		// verifyLeaderEngine's no-arg 5s safety net (#745). The 5s bound
+		// remains as defense-in-depth for callers without an upstream
+		// ctx (lock resolver, HLC lease tick).
+		return coordinate.VerifyLeader(ctx) == nil
 	})
 }
 

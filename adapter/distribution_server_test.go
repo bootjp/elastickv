@@ -713,7 +713,7 @@ func (s *distributionCoordinatorStub) IsLeader() bool {
 	return s.leader
 }
 
-func (s *distributionCoordinatorStub) VerifyLeader() error {
+func (s *distributionCoordinatorStub) VerifyLeader(context.Context) error {
 	if !s.leader {
 		return kv.ErrLeaderNotFound
 	}
@@ -728,7 +728,7 @@ func (s *distributionCoordinatorStub) IsLeaderForKey(_ []byte) bool {
 	return s.leader
 }
 
-func (s *distributionCoordinatorStub) VerifyLeaderForKey(_ []byte) error {
+func (s *distributionCoordinatorStub) VerifyLeaderForKey(_ context.Context, _ []byte) error {
 	if !s.leader {
 		return kv.ErrLeaderNotFound
 	}

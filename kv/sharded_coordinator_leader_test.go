@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -24,8 +25,8 @@ func TestShardedCoordinatorVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	}
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups))
 
-	require.NoError(t, coord.VerifyLeader())
-	require.NoError(t, coord.VerifyLeaderForKey([]byte("b")))
+	require.NoError(t, coord.VerifyLeader(context.Background()))
+	require.NoError(t, coord.VerifyLeaderForKey(context.Background(), []byte("b")))
 }
 
 func TestShardedCoordinatorVerifyLeader_MissingGroup(t *testing.T) {
@@ -34,6 +35,6 @@ func TestShardedCoordinatorVerifyLeader_MissingGroup(t *testing.T) {
 	engine := distribution.NewEngine()
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{}, 1, NewHLC(), nil)
 
-	require.ErrorIs(t, coord.VerifyLeader(), ErrLeaderNotFound)
-	require.ErrorIs(t, coord.VerifyLeaderForKey([]byte("k")), ErrLeaderNotFound)
+	require.ErrorIs(t, coord.VerifyLeader(context.Background()), ErrLeaderNotFound)
+	require.ErrorIs(t, coord.VerifyLeaderForKey(context.Background(), []byte("k")), ErrLeaderNotFound)
 }

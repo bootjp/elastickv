@@ -1287,7 +1287,14 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 	pattern := cmd.Args[1]
 
 	if r.coordinator.IsLeader() {
-		if err := r.coordinator.VerifyLeader(); err != nil {
+		// Per-call ctx with redisDispatchTimeout instead of the
+		// long-lived handlerContext: a stalled VerifyLeader on KEYS
+		// must not pin the command handler indefinitely. The same
+		// bound the rest of the dispatch path (sadd, set, …) uses;
+		// see Codex P1 review on PR #749.
+		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+		defer cancel()
+		if err := r.coordinator.VerifyLeader(ctx); err != nil {
 			conn.WriteError(err.Error())
 			return
 		}
@@ -3254,7 +3261,7 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return nil, wrongTypeError()
 	}
 
-	if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
+	if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), key); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -3510,7 +3517,7 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	}
 
 	if r.coordinator.IsLeaderForKey(key) {
-		if err := r.coordinator.VerifyLeaderForKey(key); err != nil {
+		if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), key); err != nil {
 			return nil, errors.WithStack(err)
 		}
 		v, err := r.store.GetAt(context.Background(), key, readTS)

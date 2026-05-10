@@ -105,7 +105,7 @@ func (s *SQSServer) AdminDeleteQueue(ctx context.Context, principal AdminPrincip
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
-	if !isVerifiedSQSLeader(s.coordinator) {
+	if !isVerifiedSQSLeader(ctx, s.coordinator) {
 		return ErrAdminNotLeader
 	}
 	if strings.TrimSpace(name) == "" {

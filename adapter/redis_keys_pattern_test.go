@@ -29,7 +29,7 @@ func (s *stubAdapterCoordinator) IsLeader() bool {
 	return true
 }
 
-func (s *stubAdapterCoordinator) VerifyLeader() error {
+func (s *stubAdapterCoordinator) VerifyLeader(context.Context) error {
 	s.verifyCalls.Add(1)
 	return s.verifyLeaderErr
 }
@@ -45,7 +45,7 @@ func (s *stubAdapterCoordinator) IsLeaderForKey([]byte) bool {
 	return true
 }
 
-func (s *stubAdapterCoordinator) VerifyLeaderForKey([]byte) error {
+func (s *stubAdapterCoordinator) VerifyLeaderForKey(context.Context, []byte) error {
 	return nil
 }
 

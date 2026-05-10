@@ -860,7 +860,7 @@ func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, e
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
 		if verify {
-			if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
+			if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), routingKey); err != nil {
 				return nil, errors.WithStack(err)
 			}
 		}

@@ -29,7 +29,7 @@ func (s *stubLeaderCoordinator) IsLeader() bool {
 	return s.isLeader
 }
 
-func (s *stubLeaderCoordinator) VerifyLeader() error {
+func (s *stubLeaderCoordinator) VerifyLeader(context.Context) error {
 	return s.verify
 }
 
@@ -41,7 +41,7 @@ func (s *stubLeaderCoordinator) IsLeaderForKey([]byte) bool {
 	return s.isLeader
 }
 
-func (s *stubLeaderCoordinator) VerifyLeaderForKey([]byte) error {
+func (s *stubLeaderCoordinator) VerifyLeaderForKey(context.Context, []byte) error {
 	return s.verify
 }
 

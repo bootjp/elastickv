@@ -69,7 +69,7 @@ func TestShardRouter_PartitionResolverWins(t *testing.T) {
 	reqs := []*pb.Request{
 		{IsTxn: false, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("resolver-key"), Value: []byte("v")}}},
 	}
-	resp, err := router.Commit(reqs)
+	resp, err := router.Commit(context.Background(), reqs)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	// Verify: the request landed on group 42's fake txn, not 1's.
@@ -102,7 +102,7 @@ func TestShardRouter_PartitionResolverFallsThrough(t *testing.T) {
 	router.Register(2, &fakeTxn{id: 2, sink: &sink}, s2)
 
 	// "b" is in the engine's [a, m) range → group 1.
-	resp1, err1 := router.Commit([]*pb.Request{
+	resp1, err1 := router.Commit(context.Background(), []*pb.Request{
 		{IsTxn: false, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v")}}},
 	})
 	require.NoError(t, err1)
@@ -111,7 +111,7 @@ func TestShardRouter_PartitionResolverFallsThrough(t *testing.T) {
 		"engine [a,m) range must route to group 1")
 
 	// "x" is in the engine's [m, ∞) range → group 2.
-	resp2, err2 := router.Commit([]*pb.Request{
+	resp2, err2 := router.Commit(context.Background(), []*pb.Request{
 		{IsTxn: false, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("v")}}},
 	})
 	require.NoError(t, err2)
@@ -138,7 +138,7 @@ func TestShardRouter_NilPartitionResolverIsNoOp(t *testing.T) {
 
 	// With no resolver installed, the engine's default route owns
 	// the request — group 7 dispatches.
-	resp, err := router.Commit([]*pb.Request{
+	resp, err := router.Commit(context.Background(), []*pb.Request{
 		{IsTxn: false, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("any"), Value: []byte("v")}}},
 	})
 	require.NoError(t, err)
@@ -173,7 +173,7 @@ func TestShardRouter_ResolverSeesRawKeyNotNormalized(t *testing.T) {
 	router.Register(1, &fakeTxn{id: 1, sink: &sink}, store.NewMVCCStore())
 	router.Register(42, &fakeTxn{id: 42, sink: &sink}, store.NewMVCCStore())
 
-	resp, err := router.Commit([]*pb.Request{
+	resp, err := router.Commit(context.Background(), []*pb.Request{
 		{IsTxn: false, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: rawKey, Value: []byte("v")}}},
 	})
 	require.NoError(t, err)
@@ -307,13 +307,15 @@ type fakeTxn struct {
 	sink *atomic.Uint64
 }
 
-func (f *fakeTxn) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (f *fakeTxn) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	_ = reqs
 	if f.sink != nil {
 		f.sink.Store(f.id)
 	}
 	return &TransactionResponse{CommitIndex: 1}, nil
 }
 
-func (f *fakeTxn) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+func (f *fakeTxn) Abort(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	_ = reqs
 	return &TransactionResponse{}, nil
 }

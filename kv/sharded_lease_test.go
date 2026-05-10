@@ -119,20 +119,20 @@ func TestShardedCoordinator_LeaseRefreshingTxn_SkipsWhenCommitIndexZero(t *testi
 	require.False(t, g1.lease.valid(monoclock.Now()))
 
 	// Commit with empty input returns success with CommitIndex=0.
-	_, err := g1.Txn.Commit(nil)
+	_, err := g1.Txn.Commit(context.Background(), nil)
 	require.NoError(t, err)
 	require.False(t, g1.lease.valid(monoclock.Now()),
 		"lease must NOT be refreshed when no Raft commit happened")
 
 	// Same for Abort.
-	_, err = g1.Txn.Abort(nil)
+	_, err = g1.Txn.Abort(context.Background(), nil)
 	require.NoError(t, err)
 	require.False(t, g1.lease.valid(monoclock.Now()))
 
 	// A response with CommitIndex > 0 refreshes the lease.
 	realResp := &TransactionResponse{CommitIndex: 42}
 	txn.inner = &fixedTransactional{response: realResp}
-	_, err = g1.Txn.Commit(nil)
+	_, err = g1.Txn.Commit(context.Background(), nil)
 	require.NoError(t, err)
 	require.True(t, g1.lease.valid(monoclock.Now()),
 		"lease must be refreshed after a real Raft commit")
@@ -145,11 +145,11 @@ type fixedTransactional struct {
 	response *TransactionResponse
 }
 
-func (f *fixedTransactional) Commit(_ []*pb.Request) (*TransactionResponse, error) {
+func (f *fixedTransactional) Commit(_ context.Context, _ []*pb.Request) (*TransactionResponse, error) {
 	return f.response, nil
 }
 
-func (f *fixedTransactional) Abort(_ []*pb.Request) (*TransactionResponse, error) {
+func (f *fixedTransactional) Abort(_ context.Context, _ []*pb.Request) (*TransactionResponse, error) {
 	return f.response, nil
 }
 

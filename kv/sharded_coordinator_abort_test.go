@@ -18,11 +18,11 @@ type failingTransactional struct {
 	err error
 }
 
-func (f *failingTransactional) Commit([]*pb.Request) (*TransactionResponse, error) {
+func (f *failingTransactional) Commit(context.Context, []*pb.Request) (*TransactionResponse, error) {
 	return nil, f.err
 }
 
-func (f *failingTransactional) Abort([]*pb.Request) (*TransactionResponse, error) {
+func (f *failingTransactional) Abort(context.Context, []*pb.Request) (*TransactionResponse, error) {
 	return nil, f.err
 }
 
@@ -97,7 +97,7 @@ func TestAbortPreparedTxn_DoesNotWarnWhenTxnAlreadyCommitted(t *testing.T) {
 		},
 	}
 
-	coord.abortPreparedTxn(10, []byte("pk"), []preparedGroup{{
+	coord.abortPreparedTxn(context.Background(), 10, []byte("pk"), []preparedGroup{{
 		gid:  1,
 		keys: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("pk")}},
 	}}, 20)

@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"context"
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -12,13 +13,13 @@ type stubTransactional struct {
 	reqs    [][]*pb.Request
 }
 
-func (s *stubTransactional) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (s *stubTransactional) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	s.commits++
 	s.reqs = append(s.reqs, reqs)
 	return &TransactionResponse{}, nil
 }
 
-func (s *stubTransactional) Abort(_ []*pb.Request) (*TransactionResponse, error) {
+func (s *stubTransactional) Abort(_ context.Context, _ []*pb.Request) (*TransactionResponse, error) {
 	return &TransactionResponse{}, nil
 }
 
@@ -34,7 +35,7 @@ func TestCoordinateDispatchTxn_RejectsNonMonotonicCommitTS(t *testing.T) {
 	startTS := ^uint64(0)
 	c.clock.Observe(startTS)
 
-	_, err := c.dispatchTxn([]*Elem[OP]{
+	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
 	}, nil, startTS, 0)
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
@@ -50,7 +51,7 @@ func TestCoordinateDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 		clock:              NewHLC(),
 	}
 
-	_, err := c.dispatchTxn([]*Elem[OP]{
+	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: nil, Value: []byte("v")},
 	}, nil, 1, 0)
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
@@ -67,7 +68,7 @@ func TestCoordinateDispatchTxn_UsesOnePhaseRequest(t *testing.T) {
 	}
 
 	startTS := uint64(10)
-	_, err := c.dispatchTxn([]*Elem[OP]{
+	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("b"), Value: []byte("v1")},
 		{Op: Del, Key: []byte("x")},
 	}, nil, startTS, 0)
@@ -105,7 +106,7 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 
 	startTS := uint64(10)
 	commitTS := uint64(25)
-	_, err := c.dispatchTxn([]*Elem[OP]{
+	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
 	}, nil, startTS, commitTS)
 	require.NoError(t, err)
@@ -127,7 +128,7 @@ func TestCoordinateDispatchTxn_PassesReadKeysToRaftEntry(t *testing.T) {
 	}
 
 	readKeys := [][]byte{[]byte("rk1"), []byte("rk2")}
-	_, err := c.dispatchTxn([]*Elem[OP]{
+	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
 	}, readKeys, 10, 0)
 	require.NoError(t, err)

@@ -53,7 +53,7 @@ func (s *LeaderRoutedStore) leaderFenceTS(ctx context.Context, key []byte) (bool
 	if !s.coordinator.IsLeaderForKey(key) {
 		return false, 0
 	}
-	return s.coordinator.VerifyLeaderForKey(key) == nil, 0
+	return s.coordinator.VerifyLeaderForKey(ctx, key) == nil, 0
 }
 
 // leaderOKForKey returns whether the local store is authoritative for key.

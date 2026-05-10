@@ -49,7 +49,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		}, errors.WithStack(err)
 	}
 
-	r, err := i.transactionManager.Commit(req.Requests)
+	r, err := i.transactionManager.Commit(ctx, req.Requests)
 	if err != nil {
 		return &pb.ForwardResponse{
 			Success:     false,

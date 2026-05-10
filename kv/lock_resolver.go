@@ -155,13 +155,13 @@ func (lr *LockResolver) resolveExpiredLock(ctx context.Context, g *ShardGroup, u
 
 	switch status {
 	case txnStatusCommitted:
-		return applyTxnResolution(g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{userKey})
+		return applyTxnResolution(ctx, g, pb.Phase_COMMIT, lock.StartTS, commitTS, lock.PrimaryKey, [][]byte{userKey})
 	case txnStatusRolledBack:
 		abortTS := abortTSFrom(lock.StartTS, commitTS)
 		if abortTS <= lock.StartTS {
 			return nil // cannot represent abort timestamp, skip
 		}
-		return applyTxnResolution(g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{userKey})
+		return applyTxnResolution(ctx, g, pb.Phase_ABORT, lock.StartTS, abortTS, lock.PrimaryKey, [][]byte{userKey})
 	case txnStatusPending:
 		// Lock is expired but primary is still pending — the primary's
 		// tryAbortExpiredPrimary inside primaryTxnStatus should have

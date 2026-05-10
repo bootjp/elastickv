@@ -55,6 +55,20 @@ func verifyLeaderEngineCtx(ctx context.Context, engine raftengine.LeaderView) er
 	if engine == nil {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
+	// Defense-in-depth: if the caller's context carries no deadline (the
+	// Redis server's long-lived handlerContext, gemini-flagged background
+	// loops, or any future caller that passes context.Background), wrap
+	// with verifyLeaderTimeout so a stalled ReadIndex still surfaces
+	// fail-fast — same bound the no-arg verifyLeaderEngine wrapper has
+	// provided since #745. Callers that already set a tighter deadline
+	// (Redis dispatch ctx with redisDispatchTimeout, healthz
+	// r.Context()) keep theirs: context.WithTimeout picks the earlier of
+	// the two expirations.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, verifyLeaderTimeout)
+		defer cancel()
+	}
 	return errors.WithStack(engine.VerifyLeader(ctx))
 }
 

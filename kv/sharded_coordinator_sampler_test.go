@@ -216,7 +216,7 @@ func TestShardedCoordinatorSkipsObserveForLeadershipChecks(t *testing.T) {
 
 	key := []byte("k")
 	_ = coord.IsLeaderForKey(key)
-	_ = coord.VerifyLeaderForKey(key)
+	_ = coord.VerifyLeaderForKey(context.Background(), key)
 	_ = coord.RaftLeaderForKey(key)
 
 	require.Empty(t, rec.snapshot(), "leadership checks must not produce read samples")
