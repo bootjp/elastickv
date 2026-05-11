@@ -295,7 +295,44 @@ var redisMetricsConnPool = sync.Pool{
 
 func (c *redisMetricsConn) WriteError(msg string) {
 	c.hadError = true
-	c.Conn.WriteError(msg)
+	c.Conn.WriteError(normalizeRedisErrorReply(msg))
+}
+
+// normalizeRedisErrorReply prefixes transient-leader error replies with
+// the NOTLEADER semantic code. Real Redis clients (Carmine, and through
+// it jepsen-io/redis) classify error replies by their first whitespace
+// token converted to a keyword (e.g. ERR, MOVED, NOTLEADER). A bare
+// "leader not found" reply ends up as `:prefix :leader`, which the
+// upstream `with-exceptions` macro does not catch, so a worker crashes
+// instead of recording a clean `:fail` op. NOTLEADER is the conventional
+// code for transient leadership-loss replies and is already handled
+// upstream.
+//
+// Suffix matching mirrors kv.hasTransientLeaderPhrase so wrapping
+// (cockroachdb/errors %w, gRPC status, etc.) at higher layers does not
+// defeat the rewrite. The check is a no-op when the reply already
+// carries a known Redis error prefix.
+func normalizeRedisErrorReply(msg string) string {
+	if msg == "" {
+		return msg
+	}
+	if i := strings.IndexByte(msg, ' '); i > 0 {
+		head := msg[:i]
+		if head == strings.ToUpper(head) {
+			// Already prefixed with a semantic error code (ERR,
+			// WRONGTYPE, NOTLEADER, MOVED, ASK, READONLY, ...).
+			return msg
+		}
+	}
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.HasSuffix(lower, "leader not found"),
+		strings.HasSuffix(lower, "not leader"),
+		strings.HasSuffix(lower, "leadership lost"),
+		strings.HasSuffix(lower, "leadership transfer in progress"):
+		return "NOTLEADER " + msg
+	}
+	return msg
 }
 
 func (c *redisMetricsConn) reset(conn redcon.Conn) {
