@@ -74,6 +74,18 @@ func TestWriteRedisError(t *testing.T) {
 			errors.New("WRONGTYPE op"), "WRONGTYPE op"},
 		{"generic io.EOF untouched",
 			io.EOF, io.EOF.Error()},
+		// Regression: address-mapping gap errors (raft leader known
+		// but raft→redis address missing in r.leaderRedis) must be
+		// ERR-prefixed at the source so Carmine maps to :prefix :err
+		// instead of :prefix :leader. This covers proxyDBSize / proxyDel /
+		// proxyFlushDatabase / proxyFlushLegacy in redis_proxy.go +
+		// proxyKeys / proxyLRange / proxyRPush / proxyLPush /
+		// leaderClientForKey / resolveLeaderRedisAddr in redis.go — all
+		// errors.Newf'd with the same "ERR leader redis address unknown
+		// for %s" prefix.
+		{"leader-address-unknown config-gap is already ERR-prefixed",
+			errors.Newf("ERR leader redis address unknown for %s", "n1"),
+			"ERR leader redis address unknown for n1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
