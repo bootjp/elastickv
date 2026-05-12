@@ -1876,7 +1876,16 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 		tv.ttl = ttl
 	} else {
 		var err error
-		val, err = t.server.readValueAt(t.ctx, storageKey, t.startTS)
+		// Some redis_txn_test.go fixtures build a minimal txnContext
+		// literal without setting ctx; fall back to Background so
+		// readValueAt's coordinator.VerifyLeaderForKey does not panic
+		// when wrapped via context.WithTimeout(nil, …). Same defensive
+		// pattern as streamDeletions / loadListState.
+		ctx := t.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		val, err = t.server.readValueAt(ctx, storageKey, t.startTS)
 		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 			return nil, errors.WithStack(err)
 		}
