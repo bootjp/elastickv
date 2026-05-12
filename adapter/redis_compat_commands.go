@@ -144,7 +144,7 @@ func (r *RedisServer) setex(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	if err := r.saveString(ctx, cmd.Args[1], cmd.Args[3], &ttl); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteString("OK")
@@ -190,7 +190,7 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 		return nil
 	})
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if v == nil {
@@ -211,7 +211,7 @@ func (r *RedisServer) setnx(conn redcon.Conn, cmd redcon.Command) {
 	opts := redisSetOptions{missingCond: true}
 	result, err := r.executeSet(ctx, cmd.Args[1], cmd.Args[2], opts)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if result.wroteNull {
@@ -659,7 +659,7 @@ func parseHelloArgs(state *connState, args [][]byte) error {
 func (r *RedisServer) hello(conn redcon.Conn, cmd redcon.Command) {
 	state := getConnState(conn)
 	if err := parseHelloArgs(state, cmd.Args[1:]); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -709,7 +709,7 @@ func (r *RedisServer) typeCmd(conn redcon.Conn, cmd redcon.Command) {
 	}
 	typ, err := r.keyType(context.Background(), cmd.Args[1])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteString(string(typ))
@@ -733,7 +733,7 @@ func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) 
 	readTS := r.readTS()
 	exists, err := r.logicalExistsAt(context.Background(), key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if !exists {
@@ -742,7 +742,7 @@ func (r *RedisServer) writeTTL(conn redcon.Conn, key []byte, milliseconds bool) 
 	}
 	ttl, err := r.ttlAt(context.Background(), key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	ms := ttlMilliseconds(ttl)
@@ -817,13 +817,13 @@ func (r *RedisServer) prepareExpire(key []byte, nxOnly bool) (uint64, bool, erro
 func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.Duration) {
 	ttl, err := parseExpireTTL(cmd.Args[2])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
 	nxOnly, err := parseExpireNXOnly(cmd.Args[3:])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -847,7 +847,7 @@ func (r *RedisServer) setExpire(conn redcon.Conn, cmd redcon.Command, unit time.
 		result, retErr = r.doSetExpire(ctx, cmd.Args[1], ttl, expireAt, nxOnly)
 		return retErr
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(result)
@@ -992,13 +992,13 @@ func writeScanReply(conn redcon.Conn, next int, keys [][]byte) {
 func (r *RedisServer) scan(conn redcon.Conn, cmd redcon.Command) {
 	cursor, pattern, count, err := parseScanArgs(cmd.Args)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
 	keys, err := r.visibleKeys(pattern)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if cursor >= len(keys) {
@@ -1033,20 +1033,20 @@ func (r *RedisServer) dbsize(conn redcon.Conn, _ redcon.Command) {
 	if !r.coordinator.IsLeader() {
 		size, err := r.proxyDBSize()
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		conn.WriteInt(size)
 		return
 	}
 	if err := r.coordinator.VerifyLeader(r.handlerContext()); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
 	keys, err := r.visibleKeys([]byte("*"))
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(len(keys))
@@ -1112,7 +1112,7 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 	if !r.coordinator.IsLeader() {
 		n, err := r.proxyFlushLegacy()
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		conn.WriteInt(n)
@@ -1124,7 +1124,7 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 
 	totalDeleted, err := r.deleteLegacyKeys(ctx, r.readTS())
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(totalDeleted)
@@ -1133,7 +1133,7 @@ func (r *RedisServer) flushlegacy(conn redcon.Conn, _ redcon.Command) {
 func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 	if !r.coordinator.IsLeader() {
 		if err := r.proxyFlushDatabase(all); err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		conn.WriteString("OK")
@@ -1186,7 +1186,7 @@ func (r *RedisServer) flushDatabase(conn redcon.Conn, all bool) {
 		}
 		return cockerrors.WithStack(combined)
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -1427,7 +1427,7 @@ func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context
 		}
 		return r.persistExactSetMembersTxn(ctx, kind, key, readTS, existing)
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(changed)
@@ -1487,7 +1487,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		})
 		return cockerrors.WithStack(dispatchErr)
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(changed)
@@ -1696,7 +1696,7 @@ func (r *RedisServer) sismember(conn redcon.Conn, cmd redcon.Command) {
 
 	hit, alive, err := r.setMemberFastExists(ctx, key, member, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if hit {
@@ -1735,7 +1735,7 @@ func (r *RedisServer) setMemberFastExists(ctx context.Context, key, member []byt
 func (r *RedisServer) sismemberSlow(conn redcon.Conn, ctx context.Context, key, member []byte, readTS uint64) {
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -1748,7 +1748,7 @@ func (r *RedisServer) sismemberSlow(conn redcon.Conn, ctx context.Context, key, 
 	}
 	value, err := r.loadSetAt(ctx, setKind, key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if slices.Contains(value.Members, string(member)) {
@@ -1765,7 +1765,7 @@ func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -1779,7 +1779,7 @@ func (r *RedisServer) smembers(conn redcon.Conn, cmd redcon.Command) {
 
 	value, err := r.loadSetAt(context.Background(), setKind, cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteArray(len(value.Members))
@@ -1813,7 +1813,7 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 
 		return r.persistExactSetMembersTxn(ctx, hllKind, cmd.Args[1], readTS, existing)
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if changed == 0 {
@@ -1832,13 +1832,13 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 	for _, key := range cmd.Args[1:] {
 		typ, err := r.keyTypeAt(context.Background(), key, readTS)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		if typ != redisTypeNone {
 			hllExists, err := r.store.ExistsAt(context.Background(), redisHLLKey(key), readTS)
 			if err != nil {
-				conn.WriteError(err.Error())
+				writeRedisError(conn, err)
 				return
 			}
 			if !hllExists {
@@ -1848,7 +1848,7 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 		}
 		value, err := r.loadSetAt(context.Background(), hllKind, key, readTS)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		for _, member := range value.Members {
@@ -1864,7 +1864,7 @@ func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
 	}
 	added, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(added)
@@ -1875,7 +1875,7 @@ func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	if _, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:]); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteString("OK")
@@ -2133,7 +2133,7 @@ func (r *RedisServer) hget(conn redcon.Conn, cmd redcon.Command) {
 	// blob hashes miss the wide-column key and fall through.
 	raw, hit, alive, err := r.hashFieldFastLookup(ctx, key, field, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if hit {
@@ -2541,7 +2541,7 @@ func (r *RedisServer) zsetRangeEmptyFastResult(ctx context.Context, key []byte, 
 func (r *RedisServer) hgetSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
 	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -2554,7 +2554,7 @@ func (r *RedisServer) hgetSlow(conn redcon.Conn, ctx context.Context, key, field
 	}
 	value, err := r.loadHashAt(ctx, key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	fieldValue, ok := value[string(field)]
@@ -2572,7 +2572,7 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	fields := cmd.Args[redisPairWidth:]
@@ -2590,7 +2590,7 @@ func (r *RedisServer) hmget(conn redcon.Conn, cmd redcon.Command) {
 
 	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteArray(len(fields))
@@ -2616,7 +2616,7 @@ func (r *RedisServer) hdel(conn redcon.Conn, cmd redcon.Command) {
 		removed, err = r.hdelTxn(ctx, cmd.Args[1], cmd.Args[2:])
 		return err
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(removed)
@@ -2770,7 +2770,7 @@ func (r *RedisServer) hexists(conn redcon.Conn, cmd redcon.Command) {
 	// is cheaper than GetAt since we don't need the value payload.
 	hit, alive, err := r.hashFieldFastExists(ctx, key, field, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if hit {
@@ -2809,7 +2809,7 @@ func (r *RedisServer) hashFieldFastExists(ctx context.Context, key, field []byte
 func (r *RedisServer) hexistsSlow(conn redcon.Conn, ctx context.Context, key, field []byte, readTS uint64) {
 	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -2822,7 +2822,7 @@ func (r *RedisServer) hexistsSlow(conn redcon.Conn, ctx context.Context, key, fi
 	}
 	value, err := r.loadHashAt(ctx, key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if _, ok := value[string(field)]; ok {
@@ -2839,7 +2839,7 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -2854,7 +2854,7 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 	// Wide-column path: use delta-aggregated metadata for O(1) count.
 	count, exists, err := r.resolveHashMeta(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if exists {
@@ -2864,7 +2864,7 @@ func (r *RedisServer) hlen(conn redcon.Conn, cmd redcon.Command) {
 	// Legacy blob fallback: load all fields and count.
 	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(len(value))
@@ -2876,7 +2876,7 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 	}
 	increment, err := strconv.ParseInt(string(cmd.Args[3]), 10, 64)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -2888,7 +2888,7 @@ func (r *RedisServer) hincrby(conn redcon.Conn, cmd redcon.Command) {
 		current, txnErr = r.hincrbyTxn(ctx, cmd.Args[1], cmd.Args[2], increment)
 		return txnErr
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt64(current)
@@ -3044,7 +3044,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt64(current)
@@ -3057,7 +3057,7 @@ func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeHash)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -3071,7 +3071,7 @@ func (r *RedisServer) hgetall(conn redcon.Conn, cmd redcon.Command) {
 
 	value, err := r.loadHashAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	fields := make([]string, 0, len(value))
@@ -3174,7 +3174,7 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 	}
 	flags, pairStart, err := parseZAddFlags(cmd.Args)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	remaining := cmd.Args[pairStart:]
@@ -3184,7 +3184,7 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 	}
 	pairs, err := parseZAddPairs(remaining)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -3196,7 +3196,7 @@ func (r *RedisServer) zadd(conn redcon.Conn, cmd redcon.Command) {
 		added, err = r.zaddTxn(ctx, cmd.Args[1], flags, pairs)
 		return err
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(added)
@@ -3425,7 +3425,7 @@ func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
 	}
 	increment, err := strconv.ParseFloat(string(cmd.Args[2]), 64)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -3437,7 +3437,7 @@ func (r *RedisServer) zincrby(conn redcon.Conn, cmd redcon.Command) {
 		newScore, txnErr = r.zincrbyTxn(ctx, cmd.Args[1], string(cmd.Args[3]), increment)
 		return txnErr
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteBulkString(formatRedisFloat(newScore))
@@ -3515,18 +3515,18 @@ func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
 	}
 	start, err := parseInt(cmd.Args[2])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	stop, err := parseInt(cmd.Args[3])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
 	opts, err := parseZRangeOptions(cmd.Args[4:])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -3537,7 +3537,7 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 	readTS := r.readTS()
 	typ, err := r.keyTypeAtExpect(context.Background(), key, readTS, redisTypeZSet)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -3551,7 +3551,7 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 
 	value, _, err := r.loadZSetAt(context.Background(), key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	entries := append([]redisZSetEntry(nil), value.Entries...)
@@ -3597,7 +3597,7 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 		}
 		return r.persistZSetEntriesTxn(ctx, cmd.Args[1], readTS, zsetMapToEntries(members))
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(removed)
@@ -3609,12 +3609,12 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 	}
 	start, err := parseInt(cmd.Args[2])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	stop, err := parseInt(cmd.Args[3])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -3648,7 +3648,7 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 		removed = e - s + 1
 		return r.persistZSetEntriesTxn(ctx, cmd.Args[1], readTS, remaining)
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(removed)
@@ -3832,7 +3832,7 @@ func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast b
 	for _, key := range keys {
 		result, err := r.tryBZPopMinWithMode(key, fast)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return true
 		}
 		if result == nil {
@@ -3905,12 +3905,12 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 	}
 	start, err := parseInt(cmd.Args[2])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	stop, err := parseInt(cmd.Args[3])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
@@ -3938,7 +3938,7 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 		}
 		return r.rewriteListTxn(ctx, cmd.Args[1], readTS, trimmed)
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteString("OK")
@@ -3950,13 +3950,13 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 	}
 	index, err := parseInt(cmd.Args[2])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -3969,7 +3969,7 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 	}
 	values, err := r.listValuesAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	idx := normalizeIndex(index, len(values))
@@ -4145,7 +4145,7 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 	}
 	req, err := parseXAddRequest(cmd.Args)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -4156,7 +4156,7 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 		id, err = r.xaddTxn(ctx, cmd.Args[1], req)
 		return err
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteBulkString(id)
@@ -4488,7 +4488,7 @@ func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
 		removed, err = r.xtrimTxn(ctx, cmd.Args[1], maxLen)
 		return err
 	}); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(removed)
@@ -4963,7 +4963,7 @@ func isXReadIterCtxError(err error) bool {
 func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	req, err := parseXReadRequest(cmd.Args)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -4990,7 +4990,7 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 	err = r.resolveXReadAfterIDs(resolveCtx, &req)
 	resolveCancel()
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -5056,7 +5056,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// timeout). xreadOnce returns nil results on any error, so
 		// suppressing iter-ctx errors here is sound.
 		if err != nil && !isXReadIterCtxError(err) {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		if len(results) > 0 {
@@ -5079,7 +5079,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 	readTS := r.readTS()
 	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -5092,7 +5092,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 	}
 	meta, found, err := r.loadStreamMetaAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if found {
@@ -5101,7 +5101,7 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 	}
 	stream, err := r.loadStreamAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt64(int64(len(stream.Entries)))
@@ -5176,14 +5176,14 @@ func selectStreamRangeEntries(entries []redisStreamEntry, startRaw, endRaw strin
 func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse bool) {
 	count, err := parseRangeStreamCount(cmd.Args)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
 	readTS := r.readTS()
 	typ, err := r.keyTypeAtExpect(context.Background(), cmd.Args[1], readTS, redisTypeStream)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -5199,13 +5199,13 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 
 	_, metaFound, err := r.loadStreamMetaAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if metaFound {
 		selected, err := r.rangeStreamNewLayout(context.Background(), cmd.Args[1], readTS, startRaw, endRaw, reverse, count)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		writeStreamEntries(conn, selected)
@@ -5214,7 +5214,7 @@ func (r *RedisServer) rangeStream(conn redcon.Conn, cmd redcon.Command, reverse 
 
 	stream, err := r.loadStreamAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	selected := selectStreamRangeEntries(stream.Entries, startRaw, endRaw, reverse, count)
