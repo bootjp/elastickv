@@ -71,4 +71,24 @@ var (
 	// the wrong DEK into a purpose-specific encryption path after
 	// restart or rotation, so the reader fails closed.
 	ErrSidecarActivePurposeMismatch = errors.New("encryption: sidecar active key_id references a key with mismatched purpose")
+
+	// ErrEncryptionApply is the §6.3 / §11.3 fatal-apply sentinel
+	// surfaced by encryption FSM handlers (kv/fsm_encryption.go)
+	// when one of the opcodes (0x03 registration, 0x04 bootstrap,
+	// 0x05 rotation) cannot be applied — malformed payload,
+	// KEK-unwrap failure, local-epoch rollback, sidecar write
+	// failure, etc.
+	//
+	// The FSM packs this error in a haltApplyResponse value;
+	// internal/raftengine/etcd's applyNormalCommitted recognises
+	// the HaltApply interface, returns the error, and runLoop's
+	// fatal-error path takes the process down without advancing
+	// setApplied — the next restart must replay the entry.
+	//
+	// Defined here (and not in internal/raftengine/etcd) so
+	// kv/fsm_encryption.go can errors.Mark its handler outputs
+	// without importing the engine package, which would close
+	// the kv ↔ engine cycle (engine_test imports kv as a fake
+	// FSM).
+	ErrEncryptionApply = errors.New("encryption: FSM apply failed; halting apply (see design §6.3)")
 )

@@ -1802,7 +1802,13 @@ type txnValue struct {
 }
 
 type txnContext struct {
-	server     *RedisServer
+	server *RedisServer
+	// ctx is the per-EXEC dispatch context (redisDispatchTimeout-bounded
+	// at the call site in runTransaction). Plumbed through so reads
+	// inside the EXEC such as load() → readValueAt() respect the
+	// caller's deadline rather than falling back to handlerContext +
+	// the verifyLeaderEngineCtx safety net.
+	ctx        context.Context //nolint:containedctx // EXEC is a long-lived value type that wraps a single client command, ctx must travel with it.
 	working    map[string]*txnValue
 	listStates map[string]*listTxnState
 	zsetStates map[string]*zsetTxnState
@@ -1911,7 +1917,16 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 		tv.ttl = ttl
 	} else {
 		var err error
-		val, err = t.server.readValueAt(storageKey, t.startTS)
+		// Some redis_txn_test.go fixtures build a minimal txnContext
+		// literal without setting ctx; fall back to Background so
+		// readValueAt's coordinator.VerifyLeaderForKey does not panic
+		// when wrapped via context.WithTimeout(nil, …). Same defensive
+		// pattern as streamDeletions / loadListState.
+		ctx := t.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		val, err = t.server.readValueAt(ctx, storageKey, t.startTS)
 		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 			return nil, errors.WithStack(err)
 		}
@@ -2838,6 +2853,7 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 
 		txn := &txnContext{
 			server:          r,
+			ctx:             dispatchCtx,
 			working:         map[string]*txnValue{},
 			listStates:      map[string]*listTxnState{},
 			zsetStates:      map[string]*zsetTxnState{},
@@ -3285,7 +3301,7 @@ func (r *RedisServer) fetchListRange(ctx context.Context, key []byte, meta store
 	return out, nil
 }
 
-func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, error) {
+func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRaw []byte) ([]string, error) {
 	if !r.coordinator.IsLeaderForKey(key) {
 		return r.proxyLRange(key, startRaw, endRaw)
 	}
@@ -3302,7 +3318,11 @@ func (r *RedisServer) rangeList(key []byte, startRaw, endRaw []byte) ([]string, 
 		return nil, wrongTypeError()
 	}
 
-	if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), key); err != nil {
+	// PR #749 follow-up: pass the per-call dispatch ctx so a stalled
+	// VerifyLeaderForKey honours the caller's deadline rather than the
+	// long-lived handlerContext + verifyLeaderEngineCtx fallback. Same
+	// shape as keys() / FLUSHDB.
+	if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -3539,7 +3559,7 @@ func (r *RedisServer) tryLeaderGetAt(key []byte, ts uint64) ([]byte, error) {
 	return resp.Value, nil
 }
 
-func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
+func (r *RedisServer) readValueAt(ctx context.Context, key []byte, readTS uint64) ([]byte, error) {
 	ttlKey := key
 	nonStringInternal := false
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
@@ -3558,7 +3578,11 @@ func (r *RedisServer) readValueAt(key []byte, readTS uint64) ([]byte, error) {
 	}
 
 	if r.coordinator.IsLeaderForKey(key) {
-		if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), key); err != nil {
+		// PR #749 follow-up: caller-supplied ctx (with
+		// redisDispatchTimeout from the dispatch handler) replaces
+		// r.handlerContext() so VerifyLeaderForKey honours the
+		// per-command deadline. Same shape as keys() / FLUSHDB.
+		if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
 			return nil, errors.WithStack(err)
 		}
 		v, err := r.store.GetAt(context.Background(), key, readTS)
@@ -3608,7 +3632,9 @@ func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {
-	items, err := r.rangeList(cmd.Args[1], cmd.Args[2], cmd.Args[3])
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
+	items, err := r.rangeList(ctx, cmd.Args[1], cmd.Args[2], cmd.Args[3])
 	if err != nil {
 		writeRedisError(conn, err)
 		return

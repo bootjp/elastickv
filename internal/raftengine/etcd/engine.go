@@ -2160,10 +2160,28 @@ func (e *Engine) setApplied(index uint64) {
 // would deliver a nil/error response that the coordinator might mis-
 // interpret as a committed-but-failed apply (rather than the actual
 // "halting; please restart and retry" semantics).
+//
+// HaltApply seam: the StateMachine.Apply contract returns `any`
+// (no error), so an FSM that needs to signal "halt the apply loop"
+// (the §6.3 fatal-encryption-apply path) packs an error inside a
+// value implementing the HaltApply interface below. The applier
+// inspects the returned response for that interface and propagates
+// the error before setApplied — same fail-closed shape as the raft
+// envelope unwrap hook in applyNormalEntry. Non-fatal Apply errors
+// (today's *fsmApplyResponse, returned by kv batch apply) do NOT
+// implement HaltApply and continue to advance setApplied.
 func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 	response, err := e.applyNormalEntry(entry)
 	if err != nil {
 		return err
+	}
+	if h, ok := response.(interface{ HaltApply() error }); ok {
+		if herr := h.HaltApply(); herr != nil {
+			slog.Error("encryption FSM apply requested halt; not advancing setApplied",
+				slog.Uint64("entry_index", entry.Index),
+				slog.Any("err", herr))
+			return errors.Wrap(herr, "raftengine/etcd: FSM-requested apply halt")
+		}
 	}
 	e.setApplied(entry.Index)
 	e.resolveProposal(entry.Index, entry.Data, response)

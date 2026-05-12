@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -29,23 +30,54 @@ type kvFSM struct {
 	// hlc is the shared HLC instance updated when a HLC lease entry is applied.
 	// May be nil for nodes that do not participate in physical ceiling tracking.
 	hlc *HLC
+	// encryption is the §6.3 / §11.3 encryption-opcode applier. nil in
+	// Stage 4 default and in tests that do not exercise opcodes 0x03/
+	// 0x04/0x05; Stage 5/6/7 wire a concrete implementation that
+	// mutates the keystore + sidecar + writer registry. With nil
+	// installed, the encryption-opcode dispatch fails closed via
+	// HaltApply rather than silently advancing setApplied past a
+	// proposal the local node cannot process.
+	encryption EncryptionApplier
 }
 
 type FSM interface {
 	raftengine.StateMachine
 }
 
+// FSMOption configures a *kvFSM at construction. Stage 4 introduces
+// WithEncryption; future stages may add more.
+type FSMOption func(*kvFSM)
+
+// WithEncryption installs the EncryptionApplier the kvFSM dispatches
+// opcodes 0x03 / 0x04 / 0x05 to. Pass nil (or omit the option
+// entirely) to leave the FSM in the Stage-4-default fail-closed
+// state where any encryption opcode halts the apply loop via
+// ErrEncryptionApply.
+func WithEncryption(applier EncryptionApplier) FSMOption {
+	return func(f *kvFSM) {
+		f.encryption = applier
+	}
+}
+
 // NewKvFSMWithHLC creates a KV FSM that updates hlc.physicalCeiling whenever
 // a HLC lease entry is applied. The caller must pass the same *HLC instance to
 // the coordinator so both sides share the agreed physical ceiling.
-func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC) FSM {
-	return &kvFSM{
+//
+// Optional FSMOption arguments configure additional handlers (see
+// WithEncryption). Existing callers without options keep the
+// pre-Stage-4 behaviour byte-for-byte.
+func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
+	f := &kvFSM{
 		store: store,
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
 		hlc: hlc,
 	}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
 }
 
 var _ FSM = (*kvFSM)(nil)
@@ -58,10 +90,8 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
-	// HLC lease entries advance only the physical ceiling; they do not touch
-	// the MVCC store. The logical counter continues to be managed in memory.
-	if len(data) > 0 && data[0] == raftEncodeHLCLease {
-		return f.applyHLCLease(data[1:])
+	if resp, handled := f.applyReservedOpcode(data); handled {
+		return resp
 	}
 
 	ctx := context.TODO()
@@ -88,6 +118,36 @@ func (f *kvFSM) Apply(data []byte) any {
 		return resp
 	}
 	return nil
+}
+
+// applyReservedOpcode handles the FSM-internal opcode bands that are
+// dispatched ahead of the legacy proto3 fallback: HLC-lease entries
+// (0x02) and the encryption opcode range (§6.3 / §11.3 — 0x03..0x07,
+// the band reserved per the proto3 wire-tag analysis in
+// fsmwire.OpEncryptionMin/Max). Returning handled=false lets Apply
+// fall through to the legacy raft-request decode path. Extracted from
+// Apply to keep the dispatcher under the cyclomatic-complexity budget.
+//
+// Encryption-opcode dispatch is the codex P1 fix for PR748: a stray
+// future encryption opcode (e.g. 0x06) — including one emitted by a
+// NEWER leader during a rolling upgrade against a STALE follower —
+// must not fall through to proto3 unmarshal and silently advance
+// setApplied. applyEncryption's default case wraps any unimplemented
+// opcode with ErrEncryptionApply, which the engine's HaltApply seam
+// recognises as a halt — same fail-closed shape as the Stage 3
+// raft-envelope unwrap path.
+func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
+	if len(data) == 0 {
+		return nil, false
+	}
+	switch {
+	case data[0] == raftEncodeHLCLease:
+		return f.applyHLCLease(data[1:]), true
+	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
+		return f.applyEncryption(data[0], data[1:]), true
+	default:
+		return nil, false
+	}
 }
 
 // hlcLeasePayloadLen is the payload length (tag byte excluded) of an HLC lease entry.

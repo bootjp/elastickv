@@ -240,7 +240,7 @@ func TestRedisEvalRetriesWriteConflict(t *testing.T) {
 	require.Equal(t, "v1", string(conn.bulk))
 	require.Equal(t, 2, coord.dispatches)
 
-	rawValue, err := srv.readValueAt(redisStrKey([]byte("retry:lua")), snapshotTS(coord.clock, st))
+	rawValue, err := srv.readValueAt(context.Background(), redisStrKey([]byte("retry:lua")), snapshotTS(coord.clock, st))
 	require.NoError(t, err)
 	value, _, err := decodeRedisStr(rawValue)
 	require.NoError(t, err)
