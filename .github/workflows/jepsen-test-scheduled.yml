@@ -57,12 +57,48 @@ jobs:
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
           chmod +x ~/lein
           ~/lein version
+      # Cache Maven artifacts across runs. Maven Central (repo1.maven.org)
+      # serves intermittent 429s during dependency download, which
+      # uncached scheduled runs trip frequently — the lein project pulls
+      # ~100 jars at first launch. Keying on project.clj invalidates the
+      # cache only when dependencies actually change.
+      - name: Cache Maven and Leiningen artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
       - name: Pre-fetch Go modules
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
           GOPATH=$(go env GOPATH)
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
+      # Warm the Maven cache up front so unit tests / workloads start
+      # against a populated ~/.m2. `lein deps` is wrapped with a retry
+      # loop because Maven Central transiently returns 429 during peak
+      # hours, and the default lein behaviour is to fail the build on
+      # the first checksum miss. Three attempts with linear backoff is
+      # enough to ride out a typical rate-limit window.
+      - name: Warm Leiningen Maven cache
+        working-directory: jepsen
+        run: |
+          set -uo pipefail
+          n=0
+          max=3
+          until ~/lein deps; do
+            n=$((n + 1))
+            if [ "$n" -ge "$max" ]; then
+              echo "lein deps failed after $n attempts" >&2
+              exit 1
+            fi
+            sleep_secs=$((n * 30))
+            echo "lein deps failed (attempt $n/$max), retrying in ${sleep_secs}s..." >&2
+            sleep "$sleep_secs"
+          done
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
