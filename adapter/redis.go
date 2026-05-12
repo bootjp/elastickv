@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -295,44 +296,47 @@ var redisMetricsConnPool = sync.Pool{
 
 func (c *redisMetricsConn) WriteError(msg string) {
 	c.hadError = true
-	c.Conn.WriteError(normalizeRedisErrorReply(msg))
+	c.Conn.WriteError(msg)
 }
 
-// normalizeRedisErrorReply prefixes transient-leader error replies with
-// the NOTLEADER semantic code. Real Redis clients (Carmine, and through
-// it jepsen-io/redis) classify error replies by their first whitespace
+// writeRedisError writes a RESP error reply for err, prepending the
+// Redis-protocol semantic code NOTLEADER when err is a transient
+// leadership-loss signal. Real Redis clients (Carmine, and through it
+// jepsen-io/redis) classify error replies by their first whitespace
 // token converted to a keyword (e.g. ERR, MOVED, NOTLEADER). A bare
 // "leader not found" reply ends up as `:prefix :leader`, which the
-// upstream `with-exceptions` macro does not catch, so a worker crashes
-// instead of recording a clean `:fail` op. NOTLEADER is the conventional
-// code for transient leadership-loss replies and is already handled
-// upstream.
+// upstream `with-exceptions` macro does not catch, so a Jepsen worker
+// crashes instead of recording a clean `:fail` op.
 //
-// Suffix matching mirrors kv.hasTransientLeaderPhrase so wrapping
-// (cockroachdb/errors %w, gRPC status, etc.) at higher layers does not
-// defeat the rewrite. The check is a no-op when the reply already
-// carries a known Redis error prefix.
-func normalizeRedisErrorReply(msg string) string {
-	if msg == "" {
-		return msg
+// Classification is purely typed: cockroachdb/errors.Is traverses both
+// the standard %w chain and Mark-based equivalence, so wrappers
+// (errors.WithStack, errors.Wrapf, raftengine's marked sentinels) do
+// not defeat the check. Sentinels mirror kv.isTransientLeaderError +
+// kv.isLeadershipLossError so any sentinel those classifiers already
+// recognize as transient also flips a Redis reply to NOTLEADER.
+func writeRedisError(conn redcon.Conn, err error) {
+	if isTransientLeaderRedisError(err) {
+		conn.WriteError("NOTLEADER " + err.Error())
+		return
 	}
-	if i := strings.IndexByte(msg, ' '); i > 0 {
-		head := msg[:i]
-		if head == strings.ToUpper(head) {
-			// Already prefixed with a semantic error code (ERR,
-			// WRONGTYPE, NOTLEADER, MOVED, ASK, READONLY, ...).
-			return msg
-		}
+	conn.WriteError(err.Error())
+}
+
+// isTransientLeaderRedisError reports whether err is a transient
+// leader-unavailable signal that the Redis adapter should rewrite to a
+// NOTLEADER reply. Uses cockroachdb/errors.Is so Mark-based equivalence
+// (used by raftengine sentinels) and %w-chain wrapping (cockroachdb
+// WithStack, fmt.Errorf %w, etc.) both resolve correctly.
+func isTransientLeaderRedisError(err error) bool {
+	if err == nil {
+		return false
 	}
-	lower := strings.ToLower(msg)
-	switch {
-	case strings.HasSuffix(lower, "leader not found"),
-		strings.HasSuffix(lower, "not leader"),
-		strings.HasSuffix(lower, "leadership lost"),
-		strings.HasSuffix(lower, "leadership transfer in progress"):
-		return "NOTLEADER " + msg
-	}
-	return msg
+	return errors.Is(err, ErrLeaderNotFound) ||
+		errors.Is(err, ErrNotLeader) ||
+		errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipLost) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
 }
 
 func (c *redisMetricsConn) reset(conn redcon.Conn) {
@@ -542,7 +546,7 @@ func (r *RedisServer) Run() error {
 
 			if err := r.validateCmd(cmd); err != nil {
 				r.traceCommandError(conn, name, cmd.Args[1:], err.Error())
-				conn.WriteError(err.Error())
+				writeRedisError(conn, err)
 				r.observeRedisError(name, time.Since(start))
 				return
 			}
@@ -960,14 +964,14 @@ func (r *RedisServer) trySetFastPath(conn redcon.Conn, ctx context.Context, key,
 	// still exists are detected and routed through the full cleanup path.
 	typ, err := r.rawKeyTypeAt(context.Background(), key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return true
 	}
 	if isNonStringCollectionType(typ) {
 		return false
 	}
 	if err := r.saveString(ctx, key, value, ttl); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return true
 	}
 	conn.WriteString("OK")
@@ -980,7 +984,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	}
 	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -993,7 +997,7 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 
 	result, err := r.executeSet(ctx, cmd.Args[1], cmd.Args[2], opts)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if result.wroteNull {
@@ -1027,7 +1031,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	if _, err := kv.LeaseReadForKeyThrough(r.coordinator, ctx, key); err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	readTS := r.readTS()
@@ -1051,7 +1055,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	if !errors.Is(err, store.ErrKeyNotFound) {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -1061,7 +1065,7 @@ func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
 	// pre-optimisation behaviour.
 	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -1189,7 +1193,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	if len(proxyKeys) > 0 {
 		proxied, err := r.proxyDel(proxyKeys)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		removed += proxied
@@ -1199,7 +1203,7 @@ func (r *RedisServer) del(conn redcon.Conn, cmd redcon.Command) {
 	if len(localKeys) > 0 {
 		localRemoved, err := r.delLocal(localKeys)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		removed += int64(localRemoved)
@@ -1250,7 +1254,7 @@ func (r *RedisServer) exists(conn redcon.Conn, cmd redcon.Command) {
 	for _, key := range cmd.Args[1:] {
 		ok, err := r.existsAtFast(ctx, key, readTS)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		if ok {
@@ -1332,12 +1336,12 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 		ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 		defer cancel()
 		if err := r.coordinator.VerifyLeader(ctx); err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		keys, err := r.visibleKeys(pattern)
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		conn.WriteArray(len(keys))
@@ -1349,7 +1353,7 @@ func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
 
 	keys, err := r.proxyKeys(pattern)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -1692,7 +1696,7 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 
 	results, err := r.runTransaction(queue)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -1725,7 +1729,7 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 func (r *RedisServer) resolveLeaderRedisAddr(conn redcon.Conn) (string, bool) {
 	leader := r.coordinator.RaftLeader()
 	if leader == "" {
-		conn.WriteError(ErrLeaderNotFound.Error())
+		writeRedisError(conn, ErrLeaderNotFound)
 		return "", false
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
@@ -1772,7 +1776,7 @@ func handleProxyTxnError(conn redcon.Conn, err error) bool {
 			errors.Is(err, io.EOF) ||
 			errors.Is(err, io.ErrUnexpectedEOF) ||
 			errors.As(err, &netErr) {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return true
 		}
 	}
@@ -2913,7 +2917,7 @@ func (r *RedisServer) writeResults(conn redcon.Conn, results []redisResult) {
 		case resultNil:
 			conn.WriteNull()
 		case resultError:
-			conn.WriteError(res.err.Error())
+			writeRedisError(conn, res.err)
 		case resultBulk:
 			conn.WriteBulk(res.bulk)
 		case resultString:
@@ -3438,7 +3442,7 @@ func (r *RedisServer) proxyToLeader(conn redcon.Conn, cmd redcon.Command, key []
 	}
 	cli, err := r.leaderClientForKey(key)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return true
 	}
 
@@ -3459,7 +3463,7 @@ func writeGoRedisResult(conn redcon.Conn, cmd *redis.Cmd) {
 		if errors.Is(err, redis.Nil) {
 			conn.WriteNull()
 		} else {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 		}
 		return
 	}
@@ -3571,7 +3575,7 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 	if !r.coordinator.IsLeaderForKey(key) {
 		length, err := proxyFn(key, cmd.Args[2:])
 		if err != nil {
-			conn.WriteError(err.Error())
+			writeRedisError(conn, err)
 			return
 		}
 		conn.WriteInt64(length)
@@ -3581,7 +3585,7 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), key, readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ != redisTypeNone && typ != redisTypeList {
@@ -3593,7 +3597,7 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 	length, err := pushFn(ctx, key, cmd.Args[2:])
 
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt64(length)
@@ -3606,7 +3610,7 @@ func (r *RedisServer) rpush(conn redcon.Conn, cmd redcon.Command) {
 func (r *RedisServer) lrange(conn redcon.Conn, cmd redcon.Command) {
 	items, err := r.rangeList(cmd.Args[1], cmd.Args[2], cmd.Args[3])
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteArray(len(items))
