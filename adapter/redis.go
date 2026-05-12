@@ -1640,7 +1640,7 @@ func (r *RedisServer) proxyKeys(pattern []byte) ([]string, error) {
 
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return nil, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
@@ -1734,7 +1734,7 @@ func (r *RedisServer) resolveLeaderRedisAddr(conn redcon.Conn) (string, bool) {
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		conn.WriteError(fmt.Sprintf("leader redis address unknown for raft address %s", leader))
+		conn.WriteError(fmt.Sprintf("ERR leader redis address unknown for raft address %s", leader))
 		return "", false
 	}
 	return leaderAddr, true
@@ -3329,7 +3329,7 @@ func (r *RedisServer) proxyLRange(key []byte, startRaw, endRaw []byte) ([]string
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return nil, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
@@ -3357,7 +3357,7 @@ func (r *RedisServer) proxyRPush(key []byte, values [][]byte) (int64, error) {
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return 0, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
@@ -3381,7 +3381,7 @@ func (r *RedisServer) proxyLPush(key []byte, values [][]byte) (int64, error) {
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return 0, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
@@ -3428,7 +3428,7 @@ func (r *RedisServer) leaderClientForKey(key []byte) (*redis.Client, error) {
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return nil, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return nil, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 	return r.getOrCreateLeaderClient(leaderAddr), nil
 }
