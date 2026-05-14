@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"strings"
 
@@ -36,19 +37,13 @@ func startSQSServer(
 	partitionObserver adapter.SQSPartitionObserver,
 ) (*adapter.SQSServer, error) {
 	sqsAddr = strings.TrimSpace(sqsAddr)
-	var sqsL net.Listener
-	if sqsAddr != "" {
-		var err error
-		sqsL, err = lc.Listen(ctx, "tcp", sqsAddr)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to listen on %s", sqsAddr)
-		}
-	}
-	staticCreds, err := loadSigV4StaticCredentialsFile(credentialsFile, "sqs")
+	sqsL, err := openSQSListener(ctx, lc, sqsAddr)
 	if err != nil {
-		if sqsL != nil {
-			_ = sqsL.Close()
-		}
+		return nil, err
+	}
+	staticCreds, err := loadSQSStaticCredentials(credentialsFile, sqsAddr)
+	if err != nil {
+		closeSQSListenerOnError(sqsL, sqsAddr)
 		return nil, err
 	}
 	sqsServer := adapter.NewSQSServer(
@@ -82,4 +77,47 @@ func startSQSServer(
 		return errors.WithStack(err)
 	})
 	return sqsServer, nil
+}
+
+// openSQSListener returns the bound listener for sqsAddr, or
+// (nil, nil) when sqsAddr is empty (listenless / admin-only mode).
+// Pulled out of startSQSServer so the constructor stays under the
+// cyclop budget; the listenless branch is otherwise the same one
+// the function-level docstring describes.
+func openSQSListener(ctx context.Context, lc *net.ListenConfig, sqsAddr string) (net.Listener, error) {
+	if sqsAddr == "" {
+		return nil, nil
+	}
+	l, err := lc.Listen(ctx, "tcp", sqsAddr)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to listen on %s", sqsAddr)
+	}
+	return l, nil
+}
+
+// loadSQSStaticCredentials wraps loadSigV4StaticCredentialsFile with
+// the listenless-mode short-circuit: when sqsAddr is empty there is
+// no public HTTP listener and the admin /admin/api/v1/sqs/* endpoints
+// bypass SigV4, so the credentials file is not needed at all.
+// Pre-listenless behavior was "SQS disabled, no creds required" —
+// keeping creds optional here preserves that contract instead of
+// gating admin-only deployments on a stale or malformed creds path.
+func loadSQSStaticCredentials(credentialsFile, sqsAddr string) (map[string]string, error) {
+	if sqsAddr == "" {
+		return nil, nil
+	}
+	return loadSigV4StaticCredentialsFile(credentialsFile, "sqs") //nolint:wrapcheck // already wraps internally
+}
+
+// closeSQSListenerOnError closes the listener after another startup
+// step has failed and logs any Close error so listener cleanup
+// failures (port stuck bound, fd leak) are visible to operators
+// rather than silently ignored.
+func closeSQSListenerOnError(l net.Listener, sqsAddr string) {
+	if l == nil {
+		return
+	}
+	if err := l.Close(); err != nil {
+		slog.Warn("sqs listener close after startup failure", "addr", sqsAddr, "err", err)
+	}
 }
