@@ -36,6 +36,32 @@ func TestEncryptionMain_RequiresSubcommand(t *testing.T) {
 	}
 }
 
+// TestEncryptionMain_HelpFlagExitsZero pins the PR754 coderabbitai
+// /claude[bot] round-2 finding: `-h`, `--help`, `help` must not
+// fall through to the unknown-subcommand error path so shell
+// scripts using $? to detect success do not trip on a help
+// request.
+func TestEncryptionMain_HelpFlagExitsZero(t *testing.T) {
+	t.Parallel()
+	for _, sub := range []string{"-h", "--help", "help"} {
+		if err := encryptionMain([]string{sub}); err != nil {
+			t.Errorf("encryptionMain(%q) returned %v, want nil", sub, err)
+		}
+	}
+}
+
+// TestRunEncryptionStatus_HelpFlagExitsZero pins the same property
+// on the subcommand's own flag parser: flag.ContinueOnError surfaces
+// `-h` via flag.ErrHelp; that sentinel must not bubble out as an
+// error.
+func TestRunEncryptionStatus_HelpFlagExitsZero(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := runEncryptionStatus([]string{"-h"}, &buf); err != nil {
+		t.Errorf("runEncryptionStatus(-h) returned %v, want nil", err)
+	}
+}
+
 func TestRunEncryptionStatus_Bootstrapped(t *testing.T) {
 	t.Parallel()
 	path := writeStatusFixture(t, &encryption.Sidecar{

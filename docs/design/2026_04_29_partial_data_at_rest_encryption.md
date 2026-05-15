@@ -13,7 +13,8 @@ Date: 2026-04-29
 | 2 | Storage layer integration (§6.2, §4.1) | shipped | PR #742 |
 | 3 | Raft envelope + engine pre-apply hook (§6.3, §4.2) | shipped | PR #744 |
 | 4 | FSM-internal Raft entry types (§5.6, §5.2 wire, §11.3 reserved opcodes) | shipped | PR #748 |
-| 5 | `EncryptionAdmin` gRPC + CLI (§5.6 bootstrap, §6.6 admin commands) | open | — |
+| 5A | `EncryptionAdmin` proto + read-only RPCs + `encryption status` CLI | shipped | PR #754 |
+| 5B | Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter), §5.6 step 1a capability fan-out, remaining CLI subcommands, main.go gRPC wiring | open | — |
 | 6 | 3-phase rollout flags + applier wiring (§6.5, §7.1) | open | — |
 | 7 | Writer registry + deterministic nonce (§4.1) | open | — |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |

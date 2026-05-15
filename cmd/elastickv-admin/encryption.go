@@ -35,6 +35,16 @@ func encryptionMain(args []string) error {
 	switch sub {
 	case "status":
 		return runEncryptionStatus(rest, os.Stdout)
+	case "-h", "--help", "help":
+		// `-h` is the universal "show usage" affordance for CLI
+		// subcommands; returning nil keeps the exit code at 0
+		// so shell scripts using $? to detect success do not
+		// trip on a help request.
+		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status")
+		if err != nil {
+			return errors.Wrap(err, "write usage")
+		}
+		return nil
 	default:
 		return errors.Errorf("encryption: unknown subcommand %q (PR-A supports: status)", sub)
 	}
@@ -77,6 +87,13 @@ func runEncryptionStatus(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("encryption status", flag.ContinueOnError)
 	endpoint := newEncryptionEndpointFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		// flag.ContinueOnError reports `-h`/`--help` via the
+		// sentinel flag.ErrHelp after writing usage to
+		// fs.Output(). That is not an error condition for the
+		// CLI, just a usage request — exit 0.
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return errors.Wrap(err, "parse flags")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *endpoint.timeout)
@@ -134,7 +151,9 @@ func writeEncryptionStatus(out io.Writer, cap *pb.CapabilityReport, state *pb.Si
 		}
 	}
 	if stateErr != nil {
-		_, _ = fmt.Fprintf(out, "sidecar_state: <unavailable: %v>\n", stateErr)
+		if _, err := fmt.Fprintf(out, "sidecar_state: <unavailable: %v>\n", stateErr); err != nil {
+			return errors.Wrap(err, "write sidecar_state unavailable")
+		}
 		return nil
 	}
 	return writeSidecarStateBlock(out, state)
