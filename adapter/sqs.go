@@ -326,6 +326,18 @@ func (s *SQSServer) Run() error {
 	// request hot path never pays the O(N) sweep cost. Cleaned up by
 	// the same reaperCtx cancellation that stops the message reaper.
 	go s.throttle.runSweepLoop(s.reaperCtx)
+	if s.listen == nil {
+		// Listenless mode: the SQS adapter was constructed without a
+		// public HTTP listener (--sqsAddress empty). Admin endpoints
+		// in adapter/sqs_admin.go still work because they go through
+		// the coordinator/store — only the SigV4 wire surface is
+		// suppressed. Block until Stop() cancels reaperCtx so the
+		// errgroup task lifetime matches the listening branch
+		// (callers wait on Run() returning to know it's safe to tear
+		// down the underlying coordinator/store).
+		<-s.reaperCtx.Done()
+		return nil
+	}
 	if err := s.httpServer.Serve(s.listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.WithStack(err)
 	}
@@ -337,6 +349,11 @@ func (s *SQSServer) Stop() {
 		s.reaperCancel()
 	}
 	if s.httpServer != nil {
+		// http.Server.Shutdown returns immediately when Serve was
+		// never called (listenless mode — no public listener was
+		// constructed), so this is a no-op for admin-only
+		// deployments. The branch is still gated on httpServer
+		// being non-nil because Shutdown panics on a nil receiver.
 		_ = s.httpServer.Shutdown(context.Background())
 	}
 }
