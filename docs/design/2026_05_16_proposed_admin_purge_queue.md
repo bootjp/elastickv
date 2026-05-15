@@ -143,27 +143,30 @@ func (s *SQSServer) AdminPeekQueue(
 - Standard / non-partitioned: `!sqs|msg|vis|<queue>|<gen>|<visible_at>|<msg_id>`
 - Partitioned FIFO (`PartitionCount > 1`): `!sqs|msg|vis|p|<queue>|<partition>|<gen>|<visible_at>|<msg_id>`
 
-For non-partitioned queues the walk is a single prefix scan over the first keyspace. For partitioned FIFO queues peek does **sequential partition scanning**: scan partition 0 to exhaustion (or until `Limit` is reached), then continue with partition 1, etc. The choice of sequential-rather-than-fanout matches `receiveMessage`'s existing dispatch and makes the cursor format trivial. A per-partition fanout would force the cursor to carry one offset per partition — Claude r2 flagged this as a concrete pagination concern and sequential scanning is the simpler resolution.
+For non-partitioned queues the walk is a single prefix scan over the first keyspace.
 
-**Cursor format.** The cursor is a versioned JSON envelope, base64url-encoded for URL safety:
+**Partitioned FIFO walk uses rotated sequential scanning.** Peek scans partitions in order — partition `k`, then `k+1`, …, then `k+N-1 mod N` — but the **starting partition `k` is rotated**, not fixed at 0. Codex r12 P2 flagged that always starting at partition 0 creates a sampling bias: if low-numbered partitions stay hot, operators paginating through peek would never see high-numbered partitions without traversing a huge backlog, which is precisely the DLQ-triage failure mode this feature is meant to avoid (purging based on an unrepresentative sample).
+
+The rotation reuses `receiveFanoutCounters` (`adapter/sqs_messages.go:875-887`), the same per-queue atomic counter `receiveMessage` already consults for fairness. On the first page (empty cursor), peek reads-and-increments `receiveFanoutCounters[queueName]` and uses the result modulo `PartitionCount` as the starting partition. The starting partition is encoded into the returned cursor so subsequent pages continue deterministically:
 
 ```go
 type peekCursor struct {
-    V          int    `json:"v"`           // schema version, currently 1
-    Generation uint64 `json:"gen"`         // queue generation at scan start
-    Partition  uint32 `json:"p,omitempty"` // current partition (0 for non-partitioned)
-    LastKey    []byte `json:"k"`           // last scanned visibility-index key
+    V              int    `json:"v"`               // schema version, currently 1
+    Generation     uint64 `json:"gen"`             // queue generation at scan start
+    StartPartition uint32 `json:"sp,omitempty"`    // partition where this peek walk began
+    Partition      uint32 `json:"p,omitempty"`     // current partition (advances during the walk)
+    LastKey        []byte `json:"k"`               // last scanned visibility-index key
 }
 ```
 
-Single-partition queues encode `Partition=0` and walk the non-partitioned keyspace. The cursor is hard-capped at **512 bytes** after encoding; any client-supplied cursor exceeding that returns `ErrAdminSQSValidation`. Same cap rejects pathologically large or crafted-by-hand inputs.
+The walk terminates when either `Partition` advances back to `StartPartition` (full circle, partitioned queue exhausted) or `Limit` results are collected. Single-partition queues encode `StartPartition=Partition=0` and walk the non-partitioned keyspace; `receiveFanoutCounters` is not consulted because there is no partition choice to make. The cursor is still hard-capped at **512 bytes** after encoding; any client-supplied cursor exceeding that returns `ErrAdminSQSValidation`.
 
-The walk:
+**The walk (single procedure for partitioned and non-partitioned queues):**
 
-1. Decodes the cursor (or starts at `Partition=0, LastKey=nil, Generation=current` if empty).
+1. Decodes the cursor (or starts at `Partition=StartPartition=rotateOnFirstCall(), LastKey=nil, Generation=current` if empty; `rotateOnFirstCall` reads-and-increments `receiveFanoutCounters[queueName] % PartitionCount` for partitioned queues, returns 0 for non-partitioned).
 2. If queue meta's current generation differs from `cursor.Generation`, returns `ErrAdminSQSValidation` (`"peek cursor is from a prior generation; restart from the front"`). The SPA surfaces this as an automatic "Refresh" on the front of the cursor flow.
 3. Issues a bounded `ScanAt` over the appropriate visibility-index prefix up to `Limit - len(rows)` keys. For each key fetches the message record via `GetAt` (one round-trip per row — the visibility index stores only the (visible_at, msg_id) pair, not the body).
-4. When a partition is exhausted and `len(rows) < Limit` and the queue is partitioned, advances `cursor.Partition++` and continues the scan from the start of the next partition's prefix.
+4. When a partition is exhausted and `len(rows) < Limit` and the queue is partitioned, advances `cursor.Partition = (cursor.Partition + 1) mod PartitionCount` and continues the scan from the start of the next partition's prefix. The walk terminates without setting a `nextCursor` when `cursor.Partition` wraps back to `cursor.StartPartition`.
 5. Truncates bodies to `BodyMaxBytes`, records `BodyTruncated` / `BodyOriginalSize` for the SPA to render "showing first 4 kB of 12 kB" labels.
 6. Builds the next cursor from the last scanned (`partition`, `key`) pair; returns it as the opaque base64url string for the SPA. Empty when the final partition was exhausted.
 
