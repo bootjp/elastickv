@@ -496,7 +496,6 @@ func proposeErrorToStatus(err error, opcode byte) error {
 //     ResyncSidecar against stale local state. Without this,
 //     a follower's recovery flow could pull an outdated DEK
 //     set from a stranded leader and miss recent rotations.
-//     Codex P1 round-2 finding on PR #756.
 func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
 	if s.leaderView == nil {
 		return nil
@@ -521,8 +520,7 @@ func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
 // client-side timeout during the ReadIndex round-trip surfaces as
 // codes.DeadlineExceeded (the retryable transport-timing
 // semantics) rather than codes.FailedPrecondition (which the
-// client would treat as a leadership rejection). Codex P1 round-4
-// finding on PR #756.
+// client would treat as a leadership rejection).
 func verifyLeaderErrorToStatus(err error) error {
 	switch {
 	case errors.Is(err, context.Canceled):

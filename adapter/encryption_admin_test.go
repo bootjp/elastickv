@@ -78,7 +78,7 @@ func TestEncryptionAdmin_GetCapability_NotBootstrapped(t *testing.T) {
 	// Active.Storage != 0. A pre-bootstrap capable node reports true
 	// so the bootstrap pre-check fan-out can proceed at all.
 	if !got.EncryptionCapable {
-		t.Errorf("EncryptionCapable=false, want true on a configured pre-bootstrap node (regression for PR754 P1)")
+		t.Errorf("EncryptionCapable=false, want true on a configured pre-bootstrap node")
 	}
 	if !got.SidecarPresent {
 		t.Errorf("SidecarPresent=false, want true when sidecar exists")
@@ -436,10 +436,9 @@ func TestEncryptionAdmin_RegisterEncryptionWriter_HappyPath(t *testing.T) {
 }
 
 // TestEncryptionAdmin_RotateDEK_RejectsZeroProposerNodeID pins the
-// PR756 codex P1 regression: full_node_id=0 is the §6.1 sentinel
-// for "not encryption-capable" and must not be persisted into a
-// writer-registry row. Reject at the gRPC boundary with
-// InvalidArgument.
+// §6.1 invariant that full_node_id=0 is the "not encryption-capable"
+// sentinel and must not be persisted into a writer-registry row.
+// Reject at the gRPC boundary with InvalidArgument.
 func TestEncryptionAdmin_RotateDEK_RejectsZeroProposerNodeID(t *testing.T) {
 	t.Parallel()
 	srv := NewEncryptionAdminServer(
@@ -475,10 +474,10 @@ func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsZeroFullNodeID(t *testi
 }
 
 // TestEncryptionAdmin_RotateDEK_RejectsStaleLeader pins the
-// PR756 codex P1 (round-2) regression: a partitioned former
-// leader whose local State() still reports StateLeader but
-// whose VerifyLeader fails (no quorum) must reject mutating
-// RPCs with FailedPrecondition. Without this, a stranded leader
+// stale-leader invariant: a partitioned former leader whose
+// local State() still reports StateLeader but whose VerifyLeader
+// fails (no quorum) must reject mutating RPCs with
+// FailedPrecondition. Without this guard, a stranded leader
 // would accept proposals that may never replicate.
 func TestEncryptionAdmin_RotateDEK_RejectsStaleLeader(t *testing.T) {
 	t.Parallel()
@@ -526,10 +525,10 @@ func TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader(t *testing.T) {
 }
 
 // TestEncryptionAdmin_RotateDEK_VerifyLeader_PreservesContextCodes
-// pins the PR756 codex round-4 P1 regression: when VerifyLeader
-// returns context.Canceled / context.DeadlineExceeded (the
-// caller's ctx was canceled or the deadline elapsed during the
-// ReadIndex round-trip), requireLeader MUST surface the matching
+// pins the context-code mapping: when VerifyLeader returns
+// context.Canceled / context.DeadlineExceeded (the caller's ctx
+// was canceled or the deadline elapsed during the ReadIndex
+// round-trip), requireLeader MUST surface the matching
 // codes.Canceled / codes.DeadlineExceeded — NOT a flat
 // FailedPrecondition that would make a transport timeout look
 // like a leadership rejection.
@@ -561,11 +560,11 @@ func TestEncryptionAdmin_RotateDEK_VerifyLeader_PreservesContextCodes(t *testing
 }
 
 // TestEncryptionAdmin_RotateDEK_MapsProposeLeaderErrorToFailedPrecondition
-// pins the PR756 codex P1 regression: Propose() returning
+// pins the Propose-side leadership-error mapping: Propose() returning
 // ErrNotLeader / ErrLeadershipLost / ErrLeadershipTransferInProgress
 // must surface as FailedPrecondition with the engine error in the
 // status detail so clients can retry against the right node, NOT
-// as the default codes.Unknown that pkgerrors.Wrap would produce.
+// as the default codes.Unknown a generic wrap would produce.
 func TestEncryptionAdmin_RotateDEK_MapsProposeLeaderErrorToFailedPrecondition(t *testing.T) {
 	t.Parallel()
 	for _, sentinel := range []error{
@@ -588,9 +587,9 @@ func TestEncryptionAdmin_RotateDEK_MapsProposeLeaderErrorToFailedPrecondition(t 
 }
 
 // TestEncryptionAdmin_RotateDEK_MapsProposeOtherErrorToUnavailable
-// pins the PR756 codex P1 regression for the non-leadership
-// failure mode. A propose failure that is NOT a known leadership
-// sentinel surfaces as Unavailable (retryable transient failure)
+// pins the non-leadership failure-mode mapping. A propose failure
+// that is NOT a known leadership sentinel surfaces as Unavailable
+// (retryable transient failure)
 // instead of Unknown.
 func TestEncryptionAdmin_RotateDEK_MapsProposeOtherErrorToUnavailable(t *testing.T) {
 	t.Parallel()
@@ -638,9 +637,10 @@ func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsBadInputs(t *testing.T)
 }
 
 // TestEncryptionAdmin_RegisterEncryptionWriter_EmptyWritersMessage
-// pins the PR756 claude[bot] P2 fix: a zero-length writers slice
-// returns a "got 0" message, not the misleading "use
-// BootstrapEncryption for multi-writer batches" text.
+// pins the message routing for the zero-length writers case: a
+// zero-length writers slice returns a "got 0" message, not the
+// misleading "use BootstrapEncryption for multi-writer batches"
+// text aimed at the >1 case.
 func TestEncryptionAdmin_RegisterEncryptionWriter_EmptyWritersMessage(t *testing.T) {
 	t.Parallel()
 	srv := NewEncryptionAdminServer(

@@ -36,11 +36,10 @@ func TestEncryptionMain_RequiresSubcommand(t *testing.T) {
 	}
 }
 
-// TestEncryptionMain_HelpFlagExitsZero pins the PR754 coderabbitai
-// /claude[bot] round-2 finding: `-h`, `--help`, `help` must not
-// fall through to the unknown-subcommand error path so shell
-// scripts using $? to detect success do not trip on a help
-// request.
+// TestEncryptionMain_HelpFlagExitsZero pins the CLI help-flag
+// contract: `-h`, `--help`, and `help` must not fall through to
+// the unknown-subcommand error path so shell scripts using $? to
+// detect success do not trip on a help request.
 func TestEncryptionMain_HelpFlagExitsZero(t *testing.T) {
 	t.Parallel()
 	for _, sub := range []string{"-h", "--help", "help"} {
@@ -124,7 +123,7 @@ func TestRunEncryptionStatus_NoSidecar(t *testing.T) {
 }
 
 // TestRunEncryptionStatus_PropagatesNonPreconditionError pins the
-// PR754 codex P2 fix: only FailedPrecondition on GetSidecarState
+// error-narrowing contract: only FailedPrecondition on GetSidecarState
 // is treated as the "node not configured" soft fallback. Any
 // other code (Internal, Unavailable, Unimplemented, …) must
 // surface as a non-nil error so the CLI exits non-zero.
