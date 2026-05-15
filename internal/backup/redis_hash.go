@@ -180,23 +180,7 @@ func parseUserKeyLenPrefix(b []byte) ([]byte, bool) {
 // HLEN). Mismatched declared-vs-observed length surfaces an
 // `redis_hash_length_mismatch` warning.
 func (r *RedisDB) flushHashes() error {
-	if len(r.hashes) == 0 {
-		return nil
-	}
-	dir := filepath.Join(r.dbDir(), "hashes")
-	if err := r.ensureDir(dir); err != nil {
-		return err
-	}
-	// Stable order across runs (Codex pattern from #716): sort by user
-	// key before flushing so identical snapshots produce identical
-	// dump output regardless of Go's randomised map iteration.
-	userKeys := make([]string, 0, len(r.hashes))
-	for k := range r.hashes {
-		userKeys = append(userKeys, k)
-	}
-	sort.Strings(userKeys)
-	for _, uk := range userKeys {
-		st := r.hashes[uk]
+	return flushWideColumnDir(r, r.hashes, "hashes", func(dir, uk string, st *redisHashState) error {
 		if r.warn != nil && st.metaSeen && int64(len(st.fields)) != st.declaredLen {
 			r.warn("redis_hash_length_mismatch",
 				"user_key_len", len(uk),
@@ -204,11 +188,8 @@ func (r *RedisDB) flushHashes() error {
 				"observed_fields", len(st.fields),
 				"hint", "meta record's Len does not match the count of !hs|fld| keys for this user key")
 		}
-		if err := r.writeHashJSON(dir, []byte(uk), st); err != nil {
-			return err
-		}
-	}
-	return nil
+		return r.writeHashJSON(dir, []byte(uk), st)
+	})
 }
 
 func (r *RedisDB) writeHashJSON(dir string, userKey []byte, st *redisHashState) error {

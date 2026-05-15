@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	cockroachdberr "github.com/cockroachdb/errors"
@@ -71,6 +72,7 @@ const (
 	redisKindString
 	redisKindHLL
 	redisKindHash
+	redisKindList
 )
 
 // RedisDB encodes one logical Redis database (`redis/db_<n>/`). All
@@ -157,6 +159,14 @@ type RedisDB struct {
 	// each meta record arriving without a key set must still emit
 	// the empty-hash file (HLEN==0, observable to clients).
 	hashes map[string]*redisHashState
+
+	// lists buffers per-userKey list state. The Phase 0a list design
+	// emits one JSON file per list at Finalize ordered by ascending
+	// item sequence (LPUSH → most-negative-seq-first, RPUSH → larger
+	// seqs at the tail). Buffering matches the hash strategy: real-
+	// world Redis lists are bounded by maxWideColumnItems on the live
+	// side, and the JSON shape requires the full item slice up front.
+	lists map[string]*redisListState
 }
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
@@ -174,6 +184,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		dirsCreated:      make(map[string]struct{}),
 		inlineTTLEmitted: make(map[string]struct{}),
 		hashes:           make(map[string]*redisHashState),
+		lists:            make(map[string]*redisListState),
 	}
 }
 
@@ -252,11 +263,19 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		st.expireAtMs = expireAtMs
 		st.hasTTL = true
 		return nil
+	case redisKindList:
+		// Same per-record TTL inlining as hashes: the list JSON
+		// carries expire_at_ms so a restorer can replay LPUSH +
+		// EXPIRE in one shot without consulting a sidecar.
+		st := r.listState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+		return nil
 	case redisKindUnknown:
 		// Track orphan TTL counts only — keys are unused before the
-		// wide-column encoders land, and buffering them allocates
-		// proportional to user-key size (up to 1 MiB per key) for
-		// no benefit. Codex P2 round 6.
+		// remaining wide-column encoders (set/zset/stream) land, and
+		// buffering them allocates proportional to user-key size
+		// (up to 1 MiB per key) for no benefit. Codex P2 round 6.
 		r.orphanTTLCount++
 		return nil
 	}
@@ -271,6 +290,7 @@ func (r *RedisDB) Finalize() error {
 	var firstErr error
 	for _, step := range []func() error{
 		r.flushHashes,
+		r.flushLists,
 		func() error { return closeJSONL(r.stringsTTL) },
 		func() error { return closeJSONL(r.hllTTL) },
 		r.closeKeymap,
@@ -282,7 +302,7 @@ func (r *RedisDB) Finalize() error {
 	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
 			"count", r.orphanTTLCount,
-			"hint", "wide-column type encoders (list/set/zset/stream) have not landed yet")
+			"hint", "remaining wide-column encoders (set/zset/stream) have not landed yet")
 	}
 	return firstErr
 }
@@ -292,6 +312,38 @@ func (r *RedisDB) Finalize() error {
 // outRoot remains a plain field — easier to reason about in tests.
 func (r *RedisDB) dbDir() string {
 	return filepath.Join(r.outRoot, "redis", redisDBSegment(r.dbIndex))
+}
+
+// flushWideColumnDir is the shared "create subdir + sort user keys +
+// iterate" boilerplate every wide-column encoder needs (hash, list,
+// and the future set/zset/stream). The encoder hands in its state
+// map plus a per-key flush callback that owns the type-specific
+// mismatch warning and JSON write.
+//
+// Iteration order is sorted by user key so identical snapshots
+// produce identical dump output across runs regardless of Go's
+// randomised map iteration. Empty maps short-circuit without
+// creating the directory so dumps that never observed a given type
+// carry no spurious subdirectory.
+func flushWideColumnDir[T any](r *RedisDB, states map[string]T, subdir string, flushOne func(dir, userKey string, st T) error) error {
+	if len(states) == 0 {
+		return nil
+	}
+	dir := filepath.Join(r.dbDir(), subdir)
+	if err := r.ensureDir(dir); err != nil {
+		return err
+	}
+	userKeys := make([]string, 0, len(states))
+	for k := range states {
+		userKeys = append(userKeys, k)
+	}
+	sort.Strings(userKeys)
+	for _, uk := range userKeys {
+		if err := flushOne(dir, uk, states[uk]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func redisDBSegment(idx int) string {
