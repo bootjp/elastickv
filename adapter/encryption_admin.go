@@ -387,7 +387,13 @@ func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, re
 		return nil, grpcStatusError(codes.InvalidArgument, "encryption: dek_id must be non-zero (key id 0 is reserved per §5.1)")
 	}
 	writers := req.GetWriters()
-	if len(writers) != 1 {
+	switch len(writers) {
+	case 1:
+		// expected shape; fall through to validation + propose.
+	case 0:
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: RegisterEncryptionWriter requires exactly one writer, got 0")
+	default:
 		return nil, grpcStatusErrorf(codes.InvalidArgument,
 			"encryption: RegisterEncryptionWriter requires exactly one writer in PR-B, got %d (use BootstrapEncryption for multi-writer batches)",
 			len(writers))

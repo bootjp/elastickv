@@ -510,6 +510,63 @@ func TestEncryptionAdmin_RotateDEK_MapsProposeOtherErrorToUnavailable(t *testing
 	}
 }
 
+// TestEncryptionAdmin_RegisterEncryptionWriter_RejectsBadInputs is
+// the table-driven twin of TestEncryptionAdmin_RotateDEK_RejectsBadInputs
+// so the registration path's boundary validation has the same
+// pin-down as rotation's. Each entry mutates a single field on a
+// known-good request to isolate the failing branch.
+func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsBadInputs(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	type tc struct {
+		name string
+		mut  func(r *pb.RegisterEncryptionWriterRequest)
+	}
+	for _, c := range []tc{
+		{"zero dek_id", func(r *pb.RegisterEncryptionWriterRequest) { r.DekId = 0 }},
+		{"local_epoch above 0xFFFF", func(r *pb.RegisterEncryptionWriterRequest) { r.Writers[0].LocalEpoch = 0x10000 }},
+		{"zero full_node_id", func(r *pb.RegisterEncryptionWriterRequest) { r.Writers[0].FullNodeId = 0 }},
+		{"empty writers", func(r *pb.RegisterEncryptionWriterRequest) { r.Writers = nil }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req := validRegisterEncryptionWriterRequest()
+			c.mut(req)
+			_, err := srv.RegisterEncryptionWriter(context.Background(), req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Errorf("%s: status=%v, want InvalidArgument", c.name, status.Code(err))
+			}
+		})
+	}
+}
+
+// TestEncryptionAdmin_RegisterEncryptionWriter_EmptyWritersMessage
+// pins the PR756 claude[bot] P2 fix: a zero-length writers slice
+// returns a "got 0" message, not the misleading "use
+// BootstrapEncryption for multi-writer batches" text.
+func TestEncryptionAdmin_RegisterEncryptionWriter_EmptyWritersMessage(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	_, err := srv.RegisterEncryptionWriter(context.Background(), &pb.RegisterEncryptionWriterRequest{
+		DekId:   5,
+		Writers: nil,
+	})
+	if err == nil {
+		t.Fatalf("RegisterEncryptionWriter returned nil, want InvalidArgument")
+	}
+	if !strings.Contains(err.Error(), "got 0") {
+		t.Errorf("error %q does not surface the 0-writer case", err)
+	}
+	if strings.Contains(err.Error(), "BootstrapEncryption") {
+		t.Errorf("error %q misroutes the operator to BootstrapEncryption for the 0-writer case", err)
+	}
+}
+
 func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsBatch(t *testing.T) {
 	t.Parallel()
 	srv := NewEncryptionAdminServer(
