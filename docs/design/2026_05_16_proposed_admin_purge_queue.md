@@ -280,21 +280,24 @@ Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DEL
 
 1. **Read the escaped path.** Use `r.URL.EscapedPath()`, NOT `r.URL.Path`. The latter is the percent-decoded form: Go has already turned `%2F` into `/` in the queue-name position, so a check on `r.URL.Path` cannot distinguish `…/queues/%2F/messages` from `…/queues//messages`. Codex r6 P1 flagged that working from `r.URL.Path` reopens the same confused-deputy vector even after the pre-`path.Clean` check is added. The router reads from `EscapedPath()` exactly.
 2. **Trim the route prefix** (`/admin/api/v1/sqs/queues/`) and split the remainder on `/`. The result is a slice of **raw** (still-escaped) segments.
-3. **Validate the queue-name segment.** The queue-name segment is `segments[0]`. Reject with `400 Bad Request` + `{"code":"ValidationError","message":"empty queue name segment"}` when ANY of these hold:
+3. **Validate the queue-name segment AND every other segment.** Reject with `400 Bad Request` + `{"code":"ValidationError","message":"empty queue name segment"}` when ANY of these hold:
    - `len(segments) == 0` — the request was `/admin/api/v1/sqs/queues` with no trailing path; routes to `handleList` instead.
    - `segments[0] == ""` — the raw URL had `…/queues//…` (the empty string between two consecutive slashes ends up as an empty segment after split).
    - `strings.ContainsRune(segments[0], '%')` — any percent sign in the queue-name segment is illegal regardless of what it would decode to. AWS queue names match `sqsQueueNamePattern` (`^[a-zA-Z0-9_-]{1,80}(\.fifo)?$`, `adapter/sqs_catalog.go:65`); none of those characters need percent-encoding, so a queue-name segment containing `%` could only be an attempt to bypass the pre-`path.Clean` empty-segment check via a single-decode (`%2F`), double-decode (`%252F`), or arbitrary-depth-nested decode (`%25252F`, …) round-trip. Rejecting all `%`-containing segments at the source forecloses the entire decoding-collision class without iterating `url.PathUnescape` and without enumerating the encoded variants. Codex r6 P1 round-2 flagged that the previous "single `PathUnescape` decodes to empty" check would have missed `%252F` (one decode yields the literal string `%2F`, not the empty string); the contains-`%` rule sidesteps the bypass entirely.
-4. **Apply `path.Clean` to the trimmed path** for everything downstream of step 3 (trailing slash normalisation, `.` / `..` collapse). With the queue-name segment validated, `path.Clean` is safe — none of its rewrites can move an empty segment into the queue-name position.
+   - **Any segment equals `"."` or `".."`** — dot-segment traversal. `path.Clean` collapses `..` against the preceding segment, so an input like `/admin/api/v1/sqs/queues/orders/../messages` would pass an "only-validate-segments[0]" check (`segments[0] == "orders"`, a legal name), then `path.Clean` rewrites the trimmed path to `/messages` and step 5 dispatches against a queue literally named `messages` — a wrong-queue operation reachable through a single crafted URL. Codex r7 P1 flagged this as the next confused-deputy vector after the `%`-decoding class was closed. The fix is structural: ban `.` and `..` in **every** segment (queue name and sub-resource alike) at step 3, before `path.Clean` ever runs. AWS queue names cannot equal `.` or `..` anyway (the legal-character set excludes both), and the only sub-resource segment we recognise is the literal string `messages`, so the prohibition costs nothing for legitimate traffic.
+4. **Apply `path.Clean` to the trimmed path** for everything downstream of step 3 (trailing slash normalisation only — every `.` / `..` has already been rejected at step 3, so `path.Clean` no longer has rewriting work to do beyond slash collapse). With the queue-name segment AND every other segment validated, `path.Clean` is safe — none of its rewrites can move an empty segment or a synthesised segment into the queue-name position.
 5. **Decode the sub-resource segments.** Re-split the cleaned path; the first post-`queues/` segment is the queue name (decoded via `url.PathUnescape`), the rest (zero or more segments) is the sub-resource path.
 
 **What the four canonical bad inputs do:**
 
-| Input                                                    | Outcome                                                                       |
-|----------------------------------------------------------|-------------------------------------------------------------------------------|
-| `/admin/api/v1/sqs/queues//messages`                     | step 3 rejects (`segments[0] == ""`) → 400 ValidationError                    |
-| `/admin/api/v1/sqs/queues/%2F/messages`                  | step 3 rejects (contains `%`) → 400 ValidationError                           |
-| `/admin/api/v1/sqs/queues/%252F/messages` (double-encode)| step 3 rejects (contains `%`) → 400 ValidationError                           |
-| `/admin/api/v1/sqs/queues/orders/messages/` (trail slash)| step 4 normalises via `path.Clean` to `/orders/messages` → 204 (legal route)  |
+| Input                                                              | Outcome                                                                       |
+|--------------------------------------------------------------------|-------------------------------------------------------------------------------|
+| `/admin/api/v1/sqs/queues//messages`                               | step 3 rejects (`segments[0] == ""`) → 400 ValidationError                    |
+| `/admin/api/v1/sqs/queues/%2F/messages`                            | step 3 rejects (contains `%`) → 400 ValidationError                           |
+| `/admin/api/v1/sqs/queues/%252F/messages` (double-encode)          | step 3 rejects (contains `%`) → 400 ValidationError                           |
+| `/admin/api/v1/sqs/queues/orders/../messages` (dot-segment escape) | step 3 rejects (segment equals `".."`) → 400 ValidationError                  |
+| `/admin/api/v1/sqs/queues/./orders/messages` (leading `.`)         | step 3 rejects (segment equals `"."`) → 400 ValidationError                   |
+| `/admin/api/v1/sqs/queues/orders/messages/` (trail slash)          | step 4 normalises via `path.Clean` to `/orders/messages` → 204 (legal route)  |
 
 **What the four canonical good inputs do:**
 
@@ -538,6 +541,8 @@ The 60-second rate-limit is **not** an authorization concern (any caller hitting
      - **`DELETE /admin/api/v1/sqs/queues//messages`** (same) → 400 with the same body
      - **`GET /admin/api/v1/sqs/queues/%2F/messages`** (percent-encoded slash bypass) → 400 with the same body (pins the Codex r6 P1 `%2F` rejection — case-insensitive, including `%2f`)
      - **`GET /admin/api/v1/sqs/queues/%252F/messages`** (double-percent-encoded slash) → 400 with the same body (the `ContainsRune('%')` rule rejects ALL `%`-containing queue-name segments, so deeper nesting like `%25252F` is also caught without enumerating levels)
+     - **`GET /admin/api/v1/sqs/queues/orders/../messages`** (dot-segment escape) → 400 with the same body (pins the Codex r7 P1: `path.Clean` would rewrite to `/messages` and dispatch on a queue literally named `messages` — the step 3 `..`-segment check forecloses this regardless of what `path.Clean` would do)
+     - **`GET /admin/api/v1/sqs/queues/./orders/messages`** (leading single dot) → 400 with the same body
      - `GET /admin/api/v1/sqs/queues/messages` (no sub-resource, legal queue name "messages") → 200 Describe of the queue (legitimate name, NOT rejected — distinguishes "queue named messages" from "missing queue name")
 5. **Frontend:** Playwright / RTL test pinning:
    - Messages tab renders rows in `visible_at` order with the correct columns
