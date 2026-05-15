@@ -112,10 +112,12 @@ func TestEncryptionAdmin_GetCapability_Bootstrapped(t *testing.T) {
 		t.Errorf("SidecarPresent=false, want true")
 	}
 	if got.LocalEpoch != 0 {
-		// PR-A always reports local_epoch=0; Stage 7 will wire the
-		// writer-registry counter. The cutover pre-check uses 0
-		// because no DEK exists yet at bootstrap time.
-		t.Errorf("LocalEpoch=%d, want 0 in PR-A", got.LocalEpoch)
+		// Stage 5 reports local_epoch=0 unconditionally; Stage 7
+		// wires the writer-registry counter so the cutover
+		// pre-check captures the per-node value. The §5.6 step
+		// 1a flow tolerates 0 here because no DEK exists yet at
+		// bootstrap time.
+		t.Errorf("LocalEpoch=%d, want 0 pre-Stage-7", got.LocalEpoch)
 	}
 }
 
@@ -520,6 +522,41 @@ func TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader(t *testing.T) {
 	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("ResyncSidecar status=%v, want FailedPrecondition on stale-leader", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_RotateDEK_VerifyLeader_PreservesContextCodes
+// pins the PR756 codex round-4 P1 regression: when VerifyLeader
+// returns context.Canceled / context.DeadlineExceeded (the
+// caller's ctx was canceled or the deadline elapsed during the
+// ReadIndex round-trip), requireLeader MUST surface the matching
+// codes.Canceled / codes.DeadlineExceeded — NOT a flat
+// FailedPrecondition that would make a transport timeout look
+// like a leadership rejection.
+func TestEncryptionAdmin_RotateDEK_VerifyLeader_PreservesContextCodes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{"context.Canceled", context.Canceled, codes.Canceled},
+		{"context.DeadlineExceeded", context.DeadlineExceeded, codes.DeadlineExceeded},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(&recordingProposer{}),
+				WithEncryptionAdminLeaderView(stubLeaderView{
+					state:     raftengine.StateLeader,
+					verifyErr: c.err,
+				}),
+			)
+			_, err := srv.RotateDEK(context.Background(), validRotateDEKRequest())
+			if got := status.Code(err); got != c.want {
+				t.Errorf("RotateDEK status=%v, want %v for VerifyLeader=%v", got, c.want, c.err)
+			}
+		})
 	}
 }
 

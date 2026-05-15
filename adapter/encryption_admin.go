@@ -511,10 +511,30 @@ func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
 			leader.ID, leader.Address)
 	}
 	if err := s.leaderView.VerifyLeader(ctx); err != nil {
+		return verifyLeaderErrorToStatus(err)
+	}
+	return nil
+}
+
+// verifyLeaderErrorToStatus maps LeaderView.VerifyLeader errors to
+// gRPC status codes. Mirrors proposeErrorToStatus so that a
+// client-side timeout during the ReadIndex round-trip surfaces as
+// codes.DeadlineExceeded (the retryable transport-timing
+// semantics) rather than codes.FailedPrecondition (which the
+// client would treat as a leadership rejection). Codex P1 round-4
+// finding on PR #756.
+func verifyLeaderErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: VerifyLeader canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: VerifyLeader deadline exceeded: %v", err)
+	default:
 		return grpcStatusErrorf(codes.FailedPrecondition,
 			"encryption: VerifyLeader failed, refusing to act on stale-leader state: %v", err)
 	}
-	return nil
 }
 
 func protoRotatePurpose(p pb.RotateDEKRequest_Purpose) (fsmwire.Purpose, error) {
