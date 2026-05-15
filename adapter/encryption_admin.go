@@ -213,12 +213,13 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 // sidecar that fell behind a Raft-log compaction window. The RPC is
 // read-only on the server side; no Raft proposal is involved.
 //
-// PR-A serves this from the local sidecar without leadership
-// verification because that is sufficient for the read-only
-// observability tests in this PR. PR-B will add a leader-only
-// guard so a follower with a stale sidecar cannot poison the
-// recovery path of a peer with an even-staler sidecar.
-func (s *EncryptionAdminServer) ResyncSidecar(_ context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
+// Leader-only via requireLeader, which calls VerifyLeader(ctx) to
+// confirm leadership through a Raft ReadIndex round-trip. Without
+// the quorum check a partitioned former leader (State() still
+// reports StateLeader pre-step-down) could ship stale wrapped-DEK
+// state to a recovering follower and silently overwrite recent
+// rotations.
+func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
 	// req.CallerFullNodeId is intentionally unused for the
 	// recovery payload itself in PR-B; Stage 7 will use it to
 	// scope the writer-registry projection to that specific
@@ -227,7 +228,7 @@ func (s *EncryptionAdminServer) ResyncSidecar(_ context.Context, req *pb.ResyncS
 	// resyncs to the requesting member without a wire-format
 	// change.
 	_ = req
-	if err := s.requireLeader(); err != nil {
+	if err := s.requireLeader(ctx); err != nil {
 		return nil, err
 	}
 	if s.sidecarPath == "" {
@@ -319,7 +320,7 @@ func statusFromSidecarErr(err error) error {
 // previous rotation is in flight, etc). Returns the commit index
 // once the entry is durable on a Raft quorum.
 func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
-	if err := s.requireLeader(); err != nil {
+	if err := s.requireLeader(ctx); err != nil {
 		return nil, err
 	}
 	if s.proposer == nil {
@@ -377,7 +378,7 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 // fans out a batched RegisterEncryptionWriter does not silently
 // propose a fraction of it.
 func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, req *pb.RegisterEncryptionWriterRequest) (*pb.RegisterEncryptionWriterResponse, error) {
-	if err := s.requireLeader(); err != nil {
+	if err := s.requireLeader(ctx); err != nil {
 		return nil, err
 	}
 	if s.proposer == nil {
@@ -479,21 +480,39 @@ func proposeErrorToStatus(err error, opcode byte) error {
 // address so the operator's CLI can re-target without parsing
 // free-form error text. A nil leaderView is allowed for tests
 // that exercise the proposer wiring directly; the production
-// wiring in main.go MUST register one.
-func (s *EncryptionAdminServer) requireLeader() error {
+// wiring in main.go MUST register one (enforced as a Stage 6
+// startup-time assertion).
+//
+// Two checks happen here:
+//
+//  1. Fast path: State() == StateLeader rejects on followers and
+//     candidates without a Raft round-trip.
+//  2. Quorum confirmation: VerifyLeader(ctx) does a ReadIndex
+//     round-trip so a *partitioned former leader* whose
+//     State() still reports StateLeader (the local view has
+//     not stepped down yet) cannot serve mutating RPCs or
+//     ResyncSidecar against stale local state. Without this,
+//     a follower's recovery flow could pull an outdated DEK
+//     set from a stranded leader and miss recent rotations.
+//     Codex P1 round-2 finding on PR #756.
+func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
 	if s.leaderView == nil {
 		return nil
 	}
-	if s.leaderView.State() == raftengine.StateLeader {
-		return nil
+	if s.leaderView.State() != raftengine.StateLeader {
+		leader := s.leaderView.Leader()
+		if leader.ID == "" && leader.Address == "" {
+			return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
+		}
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: not leader (current leader id=%q address=%q)",
+			leader.ID, leader.Address)
 	}
-	leader := s.leaderView.Leader()
-	if leader.ID == "" && leader.Address == "" {
-		return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
+	if err := s.leaderView.VerifyLeader(ctx); err != nil {
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: VerifyLeader failed, refusing to act on stale-leader state: %v", err)
 	}
-	return grpcStatusErrorf(codes.FailedPrecondition,
-		"encryption: not leader (current leader id=%q address=%q)",
-		leader.ID, leader.Address)
+	return nil
 }
 
 func protoRotatePurpose(p pb.RotateDEKRequest_Purpose) (fsmwire.Purpose, error) {

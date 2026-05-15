@@ -465,6 +465,57 @@ func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsZeroFullNodeID(t *testi
 	}
 }
 
+// TestEncryptionAdmin_RotateDEK_RejectsStaleLeader pins the
+// PR756 codex P1 (round-2) regression: a partitioned former
+// leader whose local State() still reports StateLeader but
+// whose VerifyLeader fails (no quorum) must reject mutating
+// RPCs with FailedPrecondition. Without this, a stranded leader
+// would accept proposals that may never replicate.
+func TestEncryptionAdmin_RotateDEK_RejectsStaleLeader(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{
+			state:     raftengine.StateLeader,
+			verifyErr: errors.New("synthetic quorum loss"),
+		}),
+	)
+	_, err := srv.RotateDEK(context.Background(), validRotateDEKRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("RotateDEK status=%v, want FailedPrecondition on stale-leader (VerifyLeader failure)", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "VerifyLeader") {
+		t.Errorf("error %q does not surface the VerifyLeader failure path", err)
+	}
+}
+
+// TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader is the
+// read-only path twin of the above. ResyncSidecar has no
+// Propose() to catch leadership loss, so VerifyLeader is the
+// only defence between a follower's recovery flow and a stale
+// leader's outdated sidecar contents.
+func TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 1, Raft: 2},
+		Keys: map[string]encryption.SidecarKey{
+			"1": {Purpose: "storage", Wrapped: []byte("w")},
+			"2": {Purpose: "raft", Wrapped: []byte("w")},
+		},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{
+			state:     raftengine.StateLeader,
+			verifyErr: errors.New("synthetic quorum loss"),
+		}),
+	)
+	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("ResyncSidecar status=%v, want FailedPrecondition on stale-leader", status.Code(err))
+	}
+}
+
 // TestEncryptionAdmin_RotateDEK_MapsProposeLeaderErrorToFailedPrecondition
 // pins the PR756 codex P1 regression: Propose() returning
 // ErrNotLeader / ErrLeadershipLost / ErrLeadershipTransferInProgress
@@ -628,18 +679,22 @@ func (p *recordingProposer) Propose(_ context.Context, data []byte) (*raftengine
 	return &raftengine.ProposalResult{CommitIndex: p.commitIndex}, nil
 }
 
-// stubLeaderView reports a fixed leadership state. The
-// LinearizableRead / VerifyLeader methods are not exercised by
-// EncryptionAdminServer in PR-B; they return zero values to
-// satisfy the interface.
+// stubLeaderView reports a fixed leadership state. verifyErr lets
+// a test simulate a partitioned former leader: State() still
+// reports StateLeader but VerifyLeader returns an error because
+// the local node cannot confirm leadership via a quorum
+// ReadIndex round-trip.
 type stubLeaderView struct {
-	state  raftengine.State
-	leader raftengine.LeaderInfo
+	state     raftengine.State
+	leader    raftengine.LeaderInfo
+	verifyErr error
 }
 
-func (s stubLeaderView) State() raftengine.State            { return s.state }
-func (s stubLeaderView) Leader() raftengine.LeaderInfo      { return s.leader }
-func (s stubLeaderView) VerifyLeader(context.Context) error { return nil }
+func (s stubLeaderView) State() raftengine.State       { return s.state }
+func (s stubLeaderView) Leader() raftengine.LeaderInfo { return s.leader }
+func (s stubLeaderView) VerifyLeader(context.Context) error {
+	return s.verifyErr
+}
 func (s stubLeaderView) LinearizableRead(context.Context) (uint64, error) {
 	return 0, nil
 }
