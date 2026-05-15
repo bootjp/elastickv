@@ -50,9 +50,11 @@ func WithEncryptionAdminSidecarPath(path string) EncryptionAdminServerOption {
 }
 
 // WithEncryptionAdminKeystore lets the server consult the in-memory
-// keystore for the §5.5 fallback paths. Stage 5 PR-A does not require
-// it because ReadSidecar covers every field the read-only RPCs need.
-// PR-B will use it to fast-path the RotateDEK pre-check.
+// keystore for the §5.5 fallback paths. Stage 5 PR-A / PR-B do not
+// require it because ReadSidecar covers every field the read-only
+// RPCs need and RotateDEK relies on FSM-side validation rather
+// than a pre-check. Stage 7 (writer registry) will use it for the
+// in-memory counter fast-path.
 func WithEncryptionAdminKeystore(k *encryption.Keystore) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
 		s.keystore = k

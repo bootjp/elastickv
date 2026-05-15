@@ -214,7 +214,14 @@ func TestEncryptionAdmin_ResyncSidecar_ShipsWrappedDEKs(t *testing.T) {
 			"4": {Purpose: "raft", Wrapped: []byte("wr")},
 		},
 	})
-	srv := NewEncryptionAdminServer(WithEncryptionAdminSidecarPath(path))
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		// Wire a leader-stable LeaderView so the happy path
+		// exercises State()==StateLeader && VerifyLeader()==nil
+		// end-to-end rather than short-circuiting through the
+		// nil-leaderView test escape hatch.
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
 	got, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{CallerFullNodeId: 5})
 	if err != nil {
 		t.Fatalf("ResyncSidecar: %v", err)

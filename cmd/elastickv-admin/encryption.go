@@ -61,11 +61,12 @@ type encryptionEndpointFlags struct {
 }
 
 // newEncryptionEndpointFlags registers the shared --endpoint /
-// --timeout flags every encryption subcommand needs. PR-A is
-// plaintext-only; TLS / token authentication is shared with the
-// existing --nodeTLSCACertFile / --nodeTokenFile pair on the HTTP
-// surface but is deferred to PR-B for the CLI surface so the
-// initial PR stays scoped to read-only status.
+// --timeout flags every encryption subcommand needs. The CLI
+// surface is plaintext-only through PR-B; TLS / token
+// authentication shares the existing --nodeTLSCACertFile /
+// --nodeTokenFile flags on the HTTP surface and is wired into
+// the encryption CLI in Stage 6 alongside the --encryption-enabled
+// cluster-flag gate.
 func newEncryptionEndpointFlags(fs *flag.FlagSet) *encryptionEndpointFlags {
 	return &encryptionEndpointFlags{
 		endpoint: fs.String("endpoint", "127.0.0.1:50051", "gRPC address of an elastickv node"),
