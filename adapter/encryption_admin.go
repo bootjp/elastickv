@@ -398,7 +398,7 @@ func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, re
 			"encryption: RegisterEncryptionWriter requires exactly one writer, got 0")
 	default:
 		return nil, grpcStatusErrorf(codes.InvalidArgument,
-			"encryption: RegisterEncryptionWriter requires exactly one writer in PR-B, got %d (use BootstrapEncryption for multi-writer batches)",
+			"encryption: RegisterEncryptionWriter requires exactly one writer, got %d (use BootstrapEncryption for multi-writer batches)",
 			len(writers))
 	}
 	w := writers[0]

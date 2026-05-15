@@ -51,7 +51,7 @@ func encryptionMain(args []string) error {
 		}
 		return nil
 	default:
-		return errors.Errorf("encryption: unknown subcommand %q (PR-B supports: status, rotate-dek, register-writer)", sub)
+		return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer)", sub)
 	}
 }
 
