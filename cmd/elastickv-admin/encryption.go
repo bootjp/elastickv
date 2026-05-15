@@ -35,18 +35,22 @@ func encryptionMain(args []string) error {
 	switch sub {
 	case "status":
 		return runEncryptionStatus(rest, os.Stdout)
+	case "rotate-dek":
+		return runEncryptionRotateDEK(rest, os.Stdout)
+	case "register-writer":
+		return runEncryptionRegisterWriter(rest, os.Stdout)
 	case "-h", "--help", "help":
 		// `-h` is the universal "show usage" affordance for CLI
 		// subcommands; returning nil keeps the exit code at 0
 		// so shell scripts using $? to detect success do not
 		// trip on a help request.
-		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status")
+		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer")
 		if err != nil {
 			return errors.Wrap(err, "write usage")
 		}
 		return nil
 	default:
-		return errors.Errorf("encryption: unknown subcommand %q (PR-A supports: status)", sub)
+		return errors.Errorf("encryption: unknown subcommand %q (PR-B supports: status, rotate-dek, register-writer)", sub)
 	}
 }
 

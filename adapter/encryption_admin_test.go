@@ -3,9 +3,12 @@ package adapter
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -235,19 +238,268 @@ func TestEncryptionAdmin_ResyncSidecar_ShipsWrappedDEKs(t *testing.T) {
 	}
 }
 
-func TestEncryptionAdmin_MutatingRPCs_AreUnimplemented(t *testing.T) {
+// TestEncryptionAdmin_BootstrapEncryption_Unimplemented pins the
+// PR-B contract that BootstrapEncryption is still un-wired and
+// returns Unimplemented. PR-C will replace this with positive
+// tests once the §5.6 step 1a capability fan-out lands.
+func TestEncryptionAdmin_BootstrapEncryption_Unimplemented(t *testing.T) {
 	t.Parallel()
 	srv := NewEncryptionAdminServer()
 	ctx := context.Background()
 	if _, err := srv.BootstrapEncryption(ctx, &pb.BootstrapEncryptionRequest{}); status.Code(err) != codes.Unimplemented {
 		t.Errorf("BootstrapEncryption status=%v, want Unimplemented", status.Code(err))
 	}
-	if _, err := srv.RotateDEK(ctx, &pb.RotateDEKRequest{}); status.Code(err) != codes.Unimplemented {
-		t.Errorf("RotateDEK status=%v, want Unimplemented", status.Code(err))
+}
+
+// TestEncryptionAdmin_MutatingRPCs_RejectWithoutProposer pins the
+// PR-A production-inert guarantee: an EncryptionAdminServer built
+// without WithEncryptionAdminProposer must reject every mutating
+// RPC. The §6.5 cluster flag (Stage 6) is what flips this on by
+// wiring a real proposer.
+func TestEncryptionAdmin_MutatingRPCs_RejectWithoutProposer(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer()
+	ctx := context.Background()
+	if _, err := srv.RotateDEK(ctx, validRotateDEKRequest()); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("RotateDEK status=%v, want FailedPrecondition (no proposer wired)", status.Code(err))
 	}
-	if _, err := srv.RegisterEncryptionWriter(ctx, &pb.RegisterEncryptionWriterRequest{}); status.Code(err) != codes.Unimplemented {
-		t.Errorf("RegisterEncryptionWriter status=%v, want Unimplemented", status.Code(err))
+	if _, err := srv.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest()); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("RegisterEncryptionWriter status=%v, want FailedPrecondition (no proposer wired)", status.Code(err))
 	}
+}
+
+func validRotateDEKRequest() *pb.RotateDEKRequest {
+	return &pb.RotateDEKRequest{
+		Purpose:            pb.RotateDEKRequest_PURPOSE_STORAGE,
+		NewDekId:           5,
+		WrappedNewDek:      []byte("wrapped-bytes"),
+		ProposerNodeId:     11,
+		ProposerLocalEpoch: 7,
+	}
+}
+
+func validRegisterEncryptionWriterRequest() *pb.RegisterEncryptionWriterRequest {
+	return &pb.RegisterEncryptionWriterRequest{
+		DekId: 5,
+		Writers: []*pb.WriterRegistryEntry{
+			{FullNodeId: 11, LocalEpoch: 7},
+		},
+	}
+}
+
+// TestEncryptionAdmin_RotateDEK_HappyPath verifies the byte layout
+// of the proposed Raft entry: leading opcode tag 0x05 followed by
+// the fsmwire-encoded body produced by fsmwire.EncodeRotation.
+// Pins the wire so a future refactor of either the server or
+// fsmwire cannot silently desync.
+func TestEncryptionAdmin_RotateDEK_HappyPath(t *testing.T) {
+	t.Parallel()
+	proposer := &recordingProposer{commitIndex: 99}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validRotateDEKRequest()
+	got, err := srv.RotateDEK(context.Background(), req)
+	if err != nil {
+		t.Fatalf("RotateDEK: %v", err)
+	}
+	if got.AppliedIndex != 99 {
+		t.Errorf("AppliedIndex=%d, want 99", got.AppliedIndex)
+	}
+	assertSingleProposalOpcode(t, proposer.calls, fsmwire.OpRotation)
+	body := proposer.calls[0][1:]
+	decoded, err := fsmwire.DecodeRotation(body)
+	if err != nil {
+		t.Fatalf("DecodeRotation: %v", err)
+	}
+	assertRotationDecodes(t, decoded, req)
+}
+
+func assertSingleProposalOpcode(t *testing.T, calls [][]byte, want byte) {
+	t.Helper()
+	if len(calls) != 1 {
+		t.Fatalf("propose calls=%d, want 1", len(calls))
+	}
+	if len(calls[0]) == 0 || calls[0][0] != want {
+		t.Fatalf("entry[0]=0x%02x, want 0x%02x", calls[0][0], want)
+	}
+}
+
+func assertRotationDecodes(t *testing.T, got fsmwire.RotationPayload, req *pb.RotateDEKRequest) {
+	t.Helper()
+	if got.SubTag != fsmwire.RotateSubRotateDEK {
+		t.Errorf("SubTag=0x%02x, want RotateSubRotateDEK", got.SubTag)
+	}
+	if got.DEKID != req.NewDekId {
+		t.Errorf("DEKID=%d, want %d", got.DEKID, req.NewDekId)
+	}
+	if got.Purpose != fsmwire.PurposeStorage {
+		t.Errorf("Purpose=%v, want PurposeStorage", got.Purpose)
+	}
+	if string(got.Wrapped) != string(req.WrappedNewDek) {
+		t.Errorf("Wrapped=%q, want %q", got.Wrapped, req.WrappedNewDek)
+	}
+	if got.ProposerRegistration.DEKID != req.NewDekId ||
+		got.ProposerRegistration.FullNodeID != req.ProposerNodeId ||
+		uint32(got.ProposerRegistration.LocalEpoch) != req.ProposerLocalEpoch {
+		t.Errorf("ProposerRegistration=%+v does not match request (dek=%d node=%d epoch=%d)",
+			got.ProposerRegistration, req.NewDekId, req.ProposerNodeId, req.ProposerLocalEpoch)
+	}
+}
+
+func TestEncryptionAdmin_RotateDEK_RejectsOnFollower(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{
+			state:  raftengine.StateFollower,
+			leader: raftengine.LeaderInfo{ID: "n2", Address: "127.0.0.1:50052"},
+		}),
+	)
+	_, err := srv.RotateDEK(context.Background(), validRotateDEKRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("RotateDEK status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "n2") || !strings.Contains(err.Error(), "127.0.0.1:50052") {
+		t.Errorf("error %q does not embed the leader hint (id=n2 addr=127.0.0.1:50052)", err)
+	}
+}
+
+func TestEncryptionAdmin_RotateDEK_RejectsBadInputs(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	type tc struct {
+		name string
+		mut  func(r *pb.RotateDEKRequest)
+	}
+	for _, c := range []tc{
+		{"zero new_dek_id", func(r *pb.RotateDEKRequest) { r.NewDekId = 0 }},
+		{"empty wrapped", func(r *pb.RotateDEKRequest) { r.WrappedNewDek = nil }},
+		{"unspecified purpose", func(r *pb.RotateDEKRequest) { r.Purpose = pb.RotateDEKRequest_PURPOSE_UNSPECIFIED }},
+		{"local_epoch above 0xFFFF", func(r *pb.RotateDEKRequest) { r.ProposerLocalEpoch = 0x10000 }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req := validRotateDEKRequest()
+			c.mut(req)
+			_, err := srv.RotateDEK(context.Background(), req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Errorf("%s: status=%v, want InvalidArgument", c.name, status.Code(err))
+			}
+		})
+	}
+}
+
+func TestEncryptionAdmin_RegisterEncryptionWriter_HappyPath(t *testing.T) {
+	t.Parallel()
+	proposer := &recordingProposer{commitIndex: 42}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validRegisterEncryptionWriterRequest()
+	got, err := srv.RegisterEncryptionWriter(context.Background(), req)
+	if err != nil {
+		t.Fatalf("RegisterEncryptionWriter: %v", err)
+	}
+	if got.AppliedIndex != 42 {
+		t.Errorf("AppliedIndex=%d, want 42", got.AppliedIndex)
+	}
+	if len(proposer.calls) != 1 {
+		t.Fatalf("propose calls=%d, want 1", len(proposer.calls))
+	}
+	if proposer.calls[0][0] != fsmwire.OpRegistration {
+		t.Fatalf("entry[0]=0x%02x, want OpRegistration 0x03", proposer.calls[0][0])
+	}
+	got2, err := fsmwire.DecodeRegistration(proposer.calls[0][1:])
+	if err != nil {
+		t.Fatalf("DecodeRegistration: %v", err)
+	}
+	if got2.DEKID != req.DekId ||
+		got2.FullNodeID != req.Writers[0].FullNodeId ||
+		uint32(got2.LocalEpoch) != req.Writers[0].LocalEpoch {
+		t.Errorf("decoded registration %+v does not match request %+v", got2, req)
+	}
+}
+
+func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsBatch(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := &pb.RegisterEncryptionWriterRequest{
+		DekId: 5,
+		Writers: []*pb.WriterRegistryEntry{
+			{FullNodeId: 1, LocalEpoch: 1},
+			{FullNodeId: 2, LocalEpoch: 2},
+		},
+	}
+	_, err := srv.RegisterEncryptionWriter(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("status=%v, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestEncryptionAdmin_ResyncSidecar_RejectsOnFollower(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 1, Raft: 2},
+		Keys: map[string]encryption.SidecarKey{
+			"1": {Purpose: "storage", Wrapped: []byte("w")},
+			"2": {Purpose: "raft", Wrapped: []byte("w")},
+		},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminLeaderView(stubLeaderView{
+			state:  raftengine.StateFollower,
+			leader: raftengine.LeaderInfo{ID: "n2", Address: "127.0.0.1:50052"},
+		}),
+	)
+	_, err := srv.ResyncSidecar(context.Background(), &pb.ResyncSidecarRequest{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("ResyncSidecar status=%v, want FailedPrecondition on a follower", status.Code(err))
+	}
+}
+
+// recordingProposer captures every Propose call so tests can
+// inspect the proposed entry bytes. It is unsafe for parallel use
+// across goroutines but every test that uses it does so
+// single-threaded.
+type recordingProposer struct {
+	calls       [][]byte
+	commitIndex uint64
+	err         error
+}
+
+func (p *recordingProposer) Propose(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	dup := make([]byte, len(data))
+	copy(dup, data)
+	p.calls = append(p.calls, dup)
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &raftengine.ProposalResult{CommitIndex: p.commitIndex}, nil
+}
+
+// stubLeaderView reports a fixed leadership state. The
+// LinearizableRead / VerifyLeader methods are not exercised by
+// EncryptionAdminServer in PR-B; they return zero values to
+// satisfy the interface.
+type stubLeaderView struct {
+	state  raftengine.State
+	leader raftengine.LeaderInfo
+}
+
+func (s stubLeaderView) State() raftengine.State            { return s.state }
+func (s stubLeaderView) Leader() raftengine.LeaderInfo      { return s.leader }
+func (s stubLeaderView) VerifyLeader(context.Context) error { return nil }
+func (s stubLeaderView) LinearizableRead(context.Context) (uint64, error) {
+	return 0, nil
 }
 
 // writeSidecarFixture builds a valid keys.json fixture in a tmpdir and
