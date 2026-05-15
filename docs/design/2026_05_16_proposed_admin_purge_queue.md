@@ -84,6 +84,26 @@ type AdminPeekMessageOptions struct {
     BodyMaxBytes int
 }
 
+// AdminPeekedAttribute mirrors the typed shape SQS uses for
+// MessageAttribute values: DataType (e.g. "String", "Number",
+// "Binary", "String.MyCustom") plus the value in the appropriate
+// representation. Codex r11 flagged that an earlier draft used
+// `map[string]string` here, which would have flattened the typed
+// attribute set stored in sqsMessageRecord.MessageAttributes
+// (`adapter/sqs_messages.go:86`) and silently dropped binary
+// payloads + the DataType discriminator. Operators triaging a
+// DLQ need both — a message routed there because of an
+// attribute-encoding mismatch is invisible if peek only surfaces
+// stringified values.
+type AdminPeekedAttribute struct {
+    DataType    string `json:"data_type"`
+    StringValue string `json:"string_value,omitempty"`
+    // BinaryValue carries the raw bytes; the JSON wire form
+    // base64-encodes (standard Go encoding/json behaviour for
+    // []byte) so binary payloads survive the SPA round-trip.
+    BinaryValue []byte `json:"binary_value,omitempty"`
+}
+
 // AdminPeekedMessage is one row in the peek result.
 type AdminPeekedMessage struct {
     MessageID        string
@@ -94,7 +114,7 @@ type AdminPeekedMessage struct {
     ReceiveCount     int32    // ApproximateReceiveCount
     GroupID          string   // FIFO MessageGroupId, empty for standard
     DeduplicationID  string   // FIFO MessageDeduplicationId, empty for standard
-    Attributes       map[string]string // SQS message attributes
+    Attributes       map[string]AdminPeekedAttribute // typed SQS message attributes
 }
 
 // AdminPeekQueue returns a non-destructive sample of currently-visible
@@ -373,7 +393,11 @@ type PurgeInProgressError struct{ RetryAfter time.Duration }
       "receive_count": 3,
       "group_id": "tenant-7",
       "deduplication_id": "01JCXR8V-dedup",
-      "attributes": { "Source": "checkout", "Retry": "2" }
+      "attributes": {
+        "Source":  { "data_type": "String", "string_value": "checkout" },
+        "Retry":   { "data_type": "Number", "string_value": "2" },
+        "Payload": { "data_type": "Binary", "binary_value": "AAECAwQF" }
+      }
     },
     …
   ],
