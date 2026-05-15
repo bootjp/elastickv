@@ -323,7 +323,24 @@ type QueuesSource interface {
 }
 ```
 
-`sqsQueuesBridge` in `main_admin.go` implements both new methods by translating between the admin-package types and `adapter.AdminPeek*` / `adapter.AdminPurge*`. `AdminPurgeResult` carries `GenerationBefore` / `GenerationAfter` for the audit line. The bridge inspects the returned error: a `*adapter.PurgeInProgressError` is rewrapped as `*admin.PurgeInProgressError{RetryAfter: e.RetryAfter}` so the admin package stays free of the adapter package's error types. Both struct errors implement `errors.Is(ErrQueuesPurgeInProgress)` so `writeQueuesError` can branch on the sentinel while the duration travels in the typed payload.
+`sqsQueuesBridge` in `main_admin.go` implements both new methods by translating between the admin-package types and `adapter.AdminPeek*` / `adapter.AdminPurge*`. The bridge wraps the adapter's 3-tuple return `(rows, nextCursor, err)` into a single `AdminPeekResult` struct so the `QueuesSource` interface stays consistent with the existing single-return shape of `AdminDescribeQueue` / `AdminDeleteQueue`:
+
+```go
+// AdminPeekResult is the admin-package projection of an
+// AdminPeekQueue call. Mirrors the adapter's 3-tuple return
+// (rows, nextCursor, error) but bundles the data into a single
+// struct so QueuesSource's method signatures stay regular.
+// Claude r6/r7 flagged that the earlier draft used the type
+// name without defining it; this struct lives in the admin
+// package alongside the existing QueueSummary / QueueCounters
+// types.
+type AdminPeekResult struct {
+    Messages   []AdminPeekedMessage
+    NextCursor string // empty when no further pages remain
+}
+```
+
+`AdminPurgeResult` carries `GenerationBefore` / `GenerationAfter` for the audit line. The bridge inspects the returned error: a `*adapter.PurgeInProgressError` is rewrapped as `*admin.PurgeInProgressError{RetryAfter: e.RetryAfter}` so the admin package stays free of the adapter package's error types. Both struct errors implement `errors.Is(ErrQueuesPurgeInProgress)` so `writeQueuesError` can branch on the sentinel while the duration travels in the typed payload.
 
 **Admin-package sentinel.** Two new sentinels in `internal/admin/queues_errors.go` (parallel to existing `ErrQueuesForbidden` / `ErrQueuesNotLeader` / `ErrQueuesNotFound` / `ErrQueuesValidation`):
 
@@ -520,7 +537,7 @@ The 60-second rate-limit is **not** an authorization concern (any caller hitting
      - **`GET /admin/api/v1/sqs/queues//messages`** (omitted queue name, literal double slash) → 400 `{"code":"ValidationError","message":"empty queue name segment"}` (pins the Codex r5 / r6 routing pre-check)
      - **`DELETE /admin/api/v1/sqs/queues//messages`** (same) → 400 with the same body
      - **`GET /admin/api/v1/sqs/queues/%2F/messages`** (percent-encoded slash bypass) → 400 with the same body (pins the Codex r6 P1 `%2F` rejection — case-insensitive, including `%2f`)
-     - **`GET /admin/api/v1/sqs/queues/%252F/messages`** (double-percent-encoded slash) → 400 with the same body
+     - **`GET /admin/api/v1/sqs/queues/%252F/messages`** (double-percent-encoded slash) → 400 with the same body (the `ContainsRune('%')` rule rejects ALL `%`-containing queue-name segments, so deeper nesting like `%25252F` is also caught without enumerating levels)
      - `GET /admin/api/v1/sqs/queues/messages` (no sub-resource, legal queue name "messages") → 200 Describe of the queue (legitimate name, NOT rejected — distinguishes "queue named messages" from "missing queue name")
 5. **Frontend:** Playwright / RTL test pinning:
    - Messages tab renders rows in `visible_at` order with the correct columns
