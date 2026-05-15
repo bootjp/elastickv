@@ -365,6 +365,28 @@ func TestRedisDB_HashRejectsMalformedMetaValueLength(t *testing.T) {
 	}
 }
 
+// TestRedisDB_HashRejectsOverflowingMetaValue pins the round-2 PR
+// review backport: a uint64 field count with the high bit set wraps
+// to a negative int64 declaredLen and would fire spurious
+// `redis_hash_length_mismatch` warnings on every flush. The hash
+// encoder must now refuse the value before narrowing, mirroring the
+// list encoder's symmetric guard so both wide-column encoders fail
+// closed on the same shape of corruption.
+func TestRedisDB_HashRejectsOverflowingMetaValue(t *testing.T) {
+	t.Parallel()
+	db, _ := newRedisDB(t)
+	// High bit set — uint64 value > math.MaxInt64.
+	overflow := make([]byte, 8)
+	binary.BigEndian.PutUint64(overflow, 1<<63)
+	err := db.HandleHashMeta(hashMetaKey("k"), overflow)
+	if err == nil {
+		t.Fatalf("expected error for overflowing meta value")
+	}
+	if !errors.Is(err, ErrRedisInvalidHashMeta) {
+		t.Fatalf("err=%v want ErrRedisInvalidHashMeta", err)
+	}
+}
+
 // TestRedisDB_HashHandleHashMetaSkipsDeltaKey is the regression for
 // Codex P1 round 14 (PR #725 #13): the delta prefix `!hs|meta|d|`
 // shares the base meta prefix `!hs|meta|`, so a snapshot dispatcher

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"math"
 	"path/filepath"
 	"sort"
 	"unicode/utf8"
@@ -71,8 +72,21 @@ func (r *RedisDB) HandleHashMeta(key, value []byte) error {
 		return cockroachdberr.Wrapf(ErrRedisInvalidHashMeta,
 			"length %d != %d", len(value), redisUint64Bytes)
 	}
+	// Bounds-check the uint64 field count before narrowing to int64.
+	// Without this, a corrupted store value with the high bit set
+	// would wrap to a negative declaredLen and fire spurious
+	// `redis_hash_length_mismatch` warnings on every flush. Mirrors
+	// the list encoder's symmetric guard (redis_list.go) so both
+	// wide-column encoders fail closed on the same shape of
+	// corruption. Round-2 review on PR #755 — backported from list
+	// encoder for cross-encoder consistency.
+	rawLen := binary.BigEndian.Uint64(value)
+	if rawLen > math.MaxInt64 {
+		return cockroachdberr.Wrapf(ErrRedisInvalidHashMeta,
+			"declared len %d overflows int64", rawLen)
+	}
 	st := r.hashState(userKey)
-	st.declaredLen = int64(binary.BigEndian.Uint64(value)) //nolint:gosec // signed int64 by design
+	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
 	st.metaSeen = true
 	return nil
 }
@@ -180,23 +194,7 @@ func parseUserKeyLenPrefix(b []byte) ([]byte, bool) {
 // HLEN). Mismatched declared-vs-observed length surfaces an
 // `redis_hash_length_mismatch` warning.
 func (r *RedisDB) flushHashes() error {
-	if len(r.hashes) == 0 {
-		return nil
-	}
-	dir := filepath.Join(r.dbDir(), "hashes")
-	if err := r.ensureDir(dir); err != nil {
-		return err
-	}
-	// Stable order across runs (Codex pattern from #716): sort by user
-	// key before flushing so identical snapshots produce identical
-	// dump output regardless of Go's randomised map iteration.
-	userKeys := make([]string, 0, len(r.hashes))
-	for k := range r.hashes {
-		userKeys = append(userKeys, k)
-	}
-	sort.Strings(userKeys)
-	for _, uk := range userKeys {
-		st := r.hashes[uk]
+	return flushWideColumnDir(r, r.hashes, "hashes", func(dir, uk string, st *redisHashState) error {
 		if r.warn != nil && st.metaSeen && int64(len(st.fields)) != st.declaredLen {
 			r.warn("redis_hash_length_mismatch",
 				"user_key_len", len(uk),
@@ -204,11 +202,8 @@ func (r *RedisDB) flushHashes() error {
 				"observed_fields", len(st.fields),
 				"hint", "meta record's Len does not match the count of !hs|fld| keys for this user key")
 		}
-		if err := r.writeHashJSON(dir, []byte(uk), st); err != nil {
-			return err
-		}
-	}
-	return nil
+		return r.writeHashJSON(dir, []byte(uk), st)
+	})
 }
 
 func (r *RedisDB) writeHashJSON(dir string, userKey []byte, st *redisHashState) error {
