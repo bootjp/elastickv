@@ -42,7 +42,7 @@ Both features work for any queue. The **UI is DLQ-aware** so the operator gets t
    - `DLQSources []string` — the source-queue names that point at this queue. The SPA renders these as a chip list on the detail page so the operator can confirm they understand what queue feeds the DLQ before purging.
 6. **Same AWS-shaped error mapping** as the SigV4 path — purging more than once per 60 seconds returns the SQS `PurgeQueueInProgress` semantics that `tryPurgeQueueOnce` already enforces. The admin response surfaces it as a structured `429 Too Many Requests` JSON payload (`{"code":"PurgeQueueInProgress", "retry_after_seconds":N}`).
 7. **Audit** — `admin.sqs.purge_queue` (subject, role, queue, generation_before, generation_after). Peek is a read and does NOT generate an audit line per call (the SPA polls; per-poll audit would drown the log) but the admin handler emits the standard request-log line with `route` / `subject` / `status_code` so the call is still traceable.
-8. **Read-only role can peek but not purge.** Peek is gated by `principalForRead` (same as List / Describe); purge is gated by `principalForWrite`. Both checks use the live role store, not the JWT-cached role, matching the existing pattern in `internal/admin/sqs_handler.go`.
+8. **Read-only role can peek but not purge.** Peek uses **the same session-auth gate that List / Describe currently use** — no additional live-role re-check, because `principalForRead` does not exist as a helper today and adding one just for peek would be inconsistent with the parallel List / Describe surfaces. Purge is gated by `principalForWrite` (live-role re-check), matching `AdminDeleteQueue` exactly. Claude r2 caught the earlier draft that implied a non-existent `principalForRead` helper; the doc now spells out the actual gate.
 
 ### 2.2 Non-Goals
 
@@ -109,20 +109,72 @@ func (s *SQSServer) AdminPeekQueue(
 ) (rows []AdminPeekedMessage, nextCursor string, err error)
 ```
 
-**Implementation.** Peek opens a read transaction at the leader's next read timestamp (`nextTxnReadTS`) and walks the visibility index for the queue. The visibility index is already keyed by `(queue_name, generation, visible_at, message_id)` so the scan naturally yields visible-now messages in `visible_at` order — exactly the order `ReceiveMessage` would deliver. The walk:
+**Implementation.** Peek opens a read transaction at the leader's next read timestamp (`nextTxnReadTS`) and walks the visibility index for the queue. There are two visibility keyspaces, mirroring how `receiveMessage` (`adapter/sqs_messages.go`) dispatches:
 
-1. Decodes the cursor (`encoding/json` over a small struct `{Generation uint64, LastKey []byte}`); empty cursor means "start at the front".
-2. Issues a bounded `ScanAt` over the visibility-index prefix up to `Limit` keys; for each key fetches the message record via `GetAt` (one round-trip per row — the visibility index stores only the (visible_at, msg_id) pair, not the body).
-3. Truncates bodies to `BodyMaxBytes`, records `BodyTruncated` / `BodyOriginalSize` for the SPA to render "showing first 4 kB of 12 kB" labels.
-4. Builds the next cursor from the last scanned key; returns it as an opaque string for the SPA.
+- Standard / non-partitioned: `!sqs|msg|vis|<queue>|<gen>|<visible_at>|<msg_id>`
+- Partitioned FIFO (`PartitionCount > 1`): `!sqs|msg|vis|p|<queue>|<partition>|<gen>|<visible_at>|<msg_id>`
 
-Cost is `O(Limit)` round-trips against Pebble at peek time — tiny for the bounded result sets the SPA uses. The bound on `Limit` (max 100) prevents an operator script from accidentally issuing million-row peeks against the leader. Throttle: peek shares the per-queue read-side budget the SigV4 `ReceiveMessage` path consults (see `2026_04_26_proposed_sqs_per_queue_throttling.md` §4.2) so a tight peek loop cannot starve real consumers.
+For non-partitioned queues the walk is a single prefix scan over the first keyspace. For partitioned FIFO queues peek does **sequential partition scanning**: scan partition 0 to exhaustion (or until `Limit` is reached), then continue with partition 1, etc. The choice of sequential-rather-than-fanout matches `receiveMessage`'s existing dispatch and makes the cursor format trivial. A per-partition fanout would force the cursor to carry one offset per partition — Claude r2 flagged this as a concrete pagination concern and sequential scanning is the simpler resolution.
+
+**Cursor format.** The cursor is a versioned JSON envelope, base64url-encoded for URL safety:
+
+```go
+type peekCursor struct {
+    V          int    `json:"v"`           // schema version, currently 1
+    Generation uint64 `json:"gen"`         // queue generation at scan start
+    Partition  uint32 `json:"p,omitempty"` // current partition (0 for non-partitioned)
+    LastKey    []byte `json:"k"`           // last scanned visibility-index key
+}
+```
+
+Single-partition queues encode `Partition=0` and walk the non-partitioned keyspace. The cursor is hard-capped at **512 bytes** after encoding; any client-supplied cursor exceeding that returns `ErrAdminSQSValidation`. Same cap rejects pathologically large or crafted-by-hand inputs.
+
+The walk:
+
+1. Decodes the cursor (or starts at `Partition=0, LastKey=nil, Generation=current` if empty).
+2. If queue meta's current generation differs from `cursor.Generation`, returns `ErrAdminSQSValidation` (`"peek cursor is from a prior generation; restart from the front"`). The SPA surfaces this as an automatic "Refresh" on the front of the cursor flow.
+3. Issues a bounded `ScanAt` over the appropriate visibility-index prefix up to `Limit - len(rows)` keys. For each key fetches the message record via `GetAt` (one round-trip per row — the visibility index stores only the (visible_at, msg_id) pair, not the body).
+4. When a partition is exhausted and `len(rows) < Limit` and the queue is partitioned, advances `cursor.Partition++` and continues the scan from the start of the next partition's prefix.
+5. Truncates bodies to `BodyMaxBytes`, records `BodyTruncated` / `BodyOriginalSize` for the SPA to render "showing first 4 kB of 12 kB" labels.
+6. Builds the next cursor from the last scanned (`partition`, `key`) pair; returns it as the opaque base64url string for the SPA. Empty when the final partition was exhausted.
+
+Cost is `O(Limit)` round-trips against Pebble at peek time — tiny for the bounded result sets the SPA uses. The bound on `Limit` (max 100) prevents an operator script from accidentally issuing million-row peeks against the leader.
+
+**Throttle.** Peek consults a **distinct per-queue admin-peek bucket**, *not* the per-queue `ReceiveMessage` budget. An earlier draft of this design merged the two; Claude r2 flagged that an operator paginating through a 10k-message DLQ could exhaust the budget that real consumers depend on. The separate admin-peek bucket defaults to lower steady-rate (`adminPeekRPS = 5`, `adminPeekBurst = 20`) so a pagination loop cannot starve consumers. The bucket lives next to the existing per-queue throttle (`adapter/sqs_throttle.go`) and is referenced by name from `adminPeekKey(queue) = "admin_peek:" + queue` so it cannot accidentally collide with the wire-side buckets. Exhaustion returns the same SQS-shape `429` with `Retry-After`.
 
 **Why leader-only.** The visibility index is updated by the leader as part of every `SendMessage` / `ReceiveMessage` / `DeleteMessage` commit. A follower read could see an index entry whose underlying message record was already deleted (race between the leader's apply and the follower's lease-read fence). Peek is rare and bursty rather than steady-state, so the lease-read fast path's win doesn't apply; running it on the leader keeps the snapshot internally consistent.
 
 ### 3.2 Backend: AdminPurgeQueue RPC
 
 ```go
+// AdminPurgeResult is the success return of AdminPurgeQueue. The
+// generation values are captured from the committed OCC round
+// (tryPurgeQueueOnce knows both lastGen and lastGen+1), so the audit
+// log records the value that actually landed — not an extra Pebble
+// read before/after that could race a concurrent purge.
+type AdminPurgeResult struct {
+    GenerationBefore uint64
+    GenerationAfter  uint64
+}
+
+// PurgeInProgressError is the typed error returned when the 60-second
+// rate-limit is active. RetryAfter carries the wall-clock duration the
+// caller should wait before retrying; the HTTP handler renders it as
+// both the Retry-After response header and the retry_after_seconds
+// JSON field. Implements `error` so existing errors.Is checks against
+// the ErrAdminSQSPurgeInProgress sentinel still work via wrapping:
+// `errors.Is(err, ErrAdminSQSPurgeInProgress)` returns true on any
+// PurgeInProgressError. The struct form lets the handler extract the
+// duration without parsing strings.
+type PurgeInProgressError struct {
+    RetryAfter time.Duration
+}
+
+func (e *PurgeInProgressError) Error() string { ... }
+func (e *PurgeInProgressError) Is(target error) bool {
+    return target == ErrAdminSQSPurgeInProgress
+}
+
 // AdminPurgeQueue is the SigV4-bypass counterpart to purgeQueue.
 // Bumps the queue's generation so every message under the old
 // generation becomes unreachable, leaving the meta record (name,
@@ -130,22 +182,33 @@ Cost is `O(Limit)` round-trips against Pebble at peek time — tiny for the boun
 // eventually deletes the orphaned message keys via the existing
 // tombstone path.
 //
-// Mirrors AdminDeleteQueue's sentinel-error surface:
+// Returns the captured generation pair so the admin handler's audit
+// line can record the value that actually landed (a separate
+// loadQueueMetaAt call would race a concurrent purge in the 60-second
+// window).
+//
+// Sentinel errors:
 //   - ErrAdminForbidden          — read-only principal
 //   - ErrAdminNotLeader          — follower
 //   - ErrAdminSQSNotFound        — queue absent
-//   - ErrAdminSQSPurgeInProgress — last purge < 60 s ago (new sentinel)
+//   - *PurgeInProgressError      — last purge < 60 s ago; errors.Is matches
+//                                  the sentinel ErrAdminSQSPurgeInProgress.
+//                                  RetryAfter field carries the duration.
 //   - ErrAdminSQSValidation      — empty / malformed name
 func (s *SQSServer) AdminPurgeQueue(
     ctx context.Context,
     principal AdminPrincipal,
     name string,
-) error
+) (AdminPurgeResult, error)
 ```
 
-Implementation reuses `purgeQueueWithRetry` verbatim — the SigV4 wire handler at `adapter/sqs_purge.go:22` already wraps it, and the admin handler does the same. The 60-second rate-limit lives on the meta record (`tryPurgeQueueOnce` reads it) so it survives leader failover and is enforced uniformly whether the call came from the SigV4 path or the admin path.
+**Implementation.** `purgeQueueWithRetry`'s signature changes from `error` to `(oldGen, newGen uint64, err error)`. The change is contained: there is **one** existing caller, `purgeQueue` (the SigV4 HTTP handler at `adapter/sqs_purge.go:22`), and that caller currently ignores the success values — it can simply discard the new tuple's first two elements. `tryPurgeQueueOnce` already knows `lastGen` and `lastGen + 1` from the OCC commit; threading them out is a one-line change. Claude r2 flagged that an extra `loadQueueMetaAt` call to fetch generations races a concurrent purge in the 60-second window; returning them from the committed OCC round is the only race-free choice.
 
-The `PurgeQueueInProgress` mapping: `tryPurgeQueueOnce` returns an `sqsAPIError` with code `PurgeQueueInProgress` and HTTP 400 when the 60-second window is active. The admin wrapper sniffs this via a new helper `isSQSAdminPurgeInProgress(err)` (parallel to the existing `isSQSAdminQueueDoesNotExist`) and returns `ErrAdminSQSPurgeInProgress`. The HTTP handler maps that to `429 Too Many Requests` with `Retry-After` header populated from the meta's `LastPurgedAtMillis + 60s - now()`.
+The 60-second rate-limit lives on the meta record (`tryPurgeQueueOnce` reads it) so it survives leader failover and is enforced uniformly whether the call came from the SigV4 path or the admin path.
+
+**Caller audit (semantic-change rule).** `purgeQueueWithRetry`'s signature change has exactly one external caller (`purgeQueue` in `sqs_purge.go`); the implementation PR's grep + audit will confirm the only call site is updated to discard the generation pair. `tryPurgeQueueOnce` is internal to the same file; same audit applies.
+
+The `PurgeQueueInProgress` mapping: `tryPurgeQueueOnce` returns an `sqsAPIError` with code `PurgeQueueInProgress` and HTTP 400 when the 60-second window is active. The admin wrapper sniffs this via a new helper `isSQSAdminPurgeInProgress(err)` (parallel to the existing `isSQSAdminQueueDoesNotExist`), extracts the remaining duration from the meta record (`LastPurgedAtMillis + 60s - now()`), and returns `&PurgeInProgressError{RetryAfter: remaining}`. The duration is captured once at the rejection point so the handler does not need to recompute it.
 
 ### 3.3 Backend: AdminQueueSummary extensions
 
@@ -177,7 +240,48 @@ A future optimization maintains a reverse-index (`!sqs|catalog|dlq_source|<dlq_n
 | `GET`    | `/admin/api/v1/sqs/queues/{name}/messages?limit=N&cursor=C` *(new)* | Peek a sample of visible messages      |
 | `DELETE` | `/admin/api/v1/sqs/queues/{name}/messages` *(new)*                  | Purge all messages, keep meta intact   |
 
-Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DELETE` → purge. The router in `internal/admin/sqs_handler.go` already path-prefixes on `pathSqsQueues = "/admin/api/v1/sqs/queues"`. The new endpoint is dispatched by **path-segment match, not suffix match**: after parsing the `{name}` segment, the handler splits the remaining trailing path into segments (using `path.Clean` first to normalise away leading / trailing / duplicated slashes), and accepts the path iff the trailing segments are exactly `["messages"]`. This rejects `/messages/` (one extra empty segment after Clean), `/messages/foo` (sub-resource we don't define), and `/Messages` (case-sensitive AWS naming) without relying on suffix heuristics. Two new handlers `handlePeek` (GET) and `handlePurge` (DELETE) live in `sqs_handler.go` parallel to `handleDelete`, calling `source.PeekQueue(ctx, name, opts)` / `source.PurgeQueue(ctx, name)` against the `QueuesSource` interface (implemented by `sqsQueuesBridge` in `main_admin.go`, which wraps `AdminPeekQueue` / `AdminPurgeQueue`). The path-segment matcher is the same shape DynamoHandler already uses for its sub-resource routing — keeping the two parallel reduces the cognitive load of operators who reason about both surfaces.
+Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DELETE` → purge.
+
+**ServeHTTP restructure (existing dispatch must change).** The current `ServeHTTP` in `sqs_handler.go` extracts everything after `/queues/` and passes it to `handleDescribe` / `handleDelete` as the queue name. With sub-resources, `handleDescribe("foo/messages")` would happily try to describe a queue named `"foo/messages"`. The implementation PR must restructure dispatch into three explicit levels:
+
+```
+/admin/api/v1/sqs/queues            → handleList (existing)
+/admin/api/v1/sqs/queues/{name}     → handleDescribe / handleDelete (existing handlers,
+                                       but receive bare {name} after restructure)
+/admin/api/v1/sqs/queues/{name}/messages → handlePeek (GET) / handlePurge (DELETE) (new)
+```
+
+Path segments are extracted with `path.Clean` first to normalise away leading / trailing / duplicated slashes, then split on `/`. The first segment after `queues/` is always the queue name; the rest (zero or more segments) is the sub-resource path. Sub-resource path matches: `[]` → name-only routes; `["messages"]` → messages sub-resource. Any other shape (`["messages", "x"]`, `["Messages"]`, `["messages", ""]` from trailing slash) returns 404. This restructure is itself a small change — `handleDescribe` and `handleDelete` are unchanged internally, they just receive a bare name instead of a path tail.
+
+**Bridge interface.** `QueuesSource` gains two methods:
+
+```go
+type QueuesSource interface {
+    // existing
+    List(ctx context.Context) ([]string, error)
+    Describe(ctx context.Context, name string) (*QueueSummary, bool, error)
+    Delete(ctx context.Context, p AuthPrincipal, name string) error
+    // new
+    Peek(ctx context.Context, name string, opts PeekOptions) (PeekResult, error)
+    Purge(ctx context.Context, p AuthPrincipal, name string) (PurgeResult, error)
+}
+```
+
+`sqsQueuesBridge` in `main_admin.go` implements both new methods by translating between the admin-package types and `adapter.AdminPeek*` / `adapter.AdminPurge*`. `PurgeResult` carries `GenerationBefore` / `GenerationAfter` for the audit line. The bridge inspects the returned error: a `*adapter.PurgeInProgressError` is rewrapped as `*admin.PurgeInProgressError{RetryAfter: e.RetryAfter}` so the admin package stays free of the adapter package's error types. Both struct errors implement `errors.Is(ErrQueuesPurgeInProgress)` so `writeQueuesError` can branch on the sentinel while the duration travels in the typed payload.
+
+**Admin-package sentinel.** Two new sentinels in `internal/admin/queues_errors.go` (parallel to existing `ErrQueuesForbidden` / `ErrQueuesNotLeader` / `ErrQueuesNotFound` / `ErrQueuesValidation`):
+
+```go
+ErrQueuesPurgeInProgress = errors.New("admin: purge in progress")
+// PurgeInProgressError is the typed counterpart that carries the
+// remaining duration. errors.Is(err, ErrQueuesPurgeInProgress) returns
+// true on any *PurgeInProgressError value.
+type PurgeInProgressError struct{ RetryAfter time.Duration }
+```
+
+`writeQueuesError` gains a `429 Too Many Requests` branch with `Retry-After` header populated from `PurgeInProgressError.RetryAfter`. The JSON body matches the existing structured-error shape with an extra `retry_after_seconds` field.
+
+**Peek-related path conventions.** Wire-side query parameters follow the existing admin API's snake_case convention: `limit`, `cursor`, `body_max_bytes` (not `bodyMaxBytes`). Claude r2 r1 flagged the inconsistency in an earlier draft. The frontend client's TypeScript field names (`bodyMaxBytes`, `nextCursor`) stay camelCase per JS convention; the client adapter does the case translation at the request boundary.
 
 **Peek response shape** (JSON):
 
@@ -209,7 +313,7 @@ Response shape on success: `204 No Content`. Same as `handleDelete`. On `ErrAdmi
 
 The queue detail page gains two new pieces of UI on top of the existing attributes / counters / delete-button layout:
 
-**Messages tab.** A new tab labelled "Messages" sits next to the existing "Overview" view. On mount it issues `GET /admin/api/v1/sqs/queues/{name}/messages?limit=20` and renders the result as a table:
+**Messages tab.** A new tab labelled "Messages" sits next to the existing "Overview" view. The tab header shows **"Showing N visible messages (M currently in-flight)"** where `N` = `peek.messages.length` (after applying any current cursor page) and `M` = `summary.counters.not_visible` — so an operator does not mistake an empty peek result on a busy queue for "the queue is empty". Claude r2 raised this; it is a Phase 5 UX detail but cheap to land at the same time as the rest of the tab. On mount the tab issues `GET /admin/api/v1/sqs/queues/{name}/messages?limit=20` and renders the result as a table:
 
 | Column            | Source                                              | Rendering                                                                                                                          |
 |-------------------|-----------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
@@ -221,6 +325,8 @@ The queue detail page gains two new pieces of UI on top of the existing attribut
 | Size              | `body_original_size`                                | human-readable ("1.4 kB") so operators can spot oversized messages                                                                 |
 
 Below the table: a page-size selector (20 / 50 / 100), a Refresh button, and Next / Previous controls driven by the cursor. Detail modal shows full body + every attribute + the timestamps; a "Copy as JSON" button copies the row's full record to the clipboard for manual export.
+
+**Copy as JSON payload schema.** The clipboard payload is the exact wire shape of a single `AdminPeekedMessage` entry (top-level keys: `message_id`, `body`, `body_truncated`, `body_original_size`, `sent_timestamp`, `receive_count`, `group_id`, `deduplication_id`, `attributes`) plus a wrapper `{"schema_version": 1, "queue": "<name>", "exported_at": "<ISO8601>", "message": { … }}`. The `schema_version` is what downstream tooling pins so a future change to the export format (e.g. multi-message JSONL bundle) does not silently break exporters. Operator workflows that pipe this into a recovery tool can rely on the schema not shifting under them. The full-body modal shows the FULL body — not the truncated one — by issuing a single-message peek with `body_max_bytes=65536` if the row's `body_truncated` was true on the list response.
 
 **Purge button.** Sits in the page header next to the existing Delete button. Two states:
 
@@ -258,7 +364,9 @@ admin.sqs.purge_queue
   generation_after=<n+1>
 ```
 
-The audit line stays **lean** — `subject`, `role`, `queue`, and the two generations are everything an operator needs to reconstruct who-purged-what-when. Gemini's r1 review flagged that an earlier draft logged `is_dlq` / `dlq_sources` too; computing those would force every purge to pay the catalog reverse-scan cost (§3.2), turning an O(1) generation bump into O(N). The DLQ relationship is observable separately via `AdminDescribeQueue` at audit-review time, so dragging it into the write path is not worth the cost. If incident-triage workflows turn out to need the DLQ context inline, a future PR can add a `--with-dlq-context` opt-in flag.
+The audit line stays **lean** — `subject`, `role`, `queue`, and the two generations are everything an operator needs to reconstruct who-purged-what-when. Gemini's r1 review flagged that an earlier draft logged `is_dlq` / `dlq_sources` too; computing those would force every purge to pay the catalog reverse-scan cost (§3.3), turning an O(1) generation bump into O(N). The DLQ relationship is observable separately via `AdminDescribeQueue` at audit-review time, so dragging it into the write path is not worth the cost. If incident-triage workflows turn out to need the DLQ context inline, a future PR can add a `--with-dlq-context` opt-in flag.
+
+**Sourcing the generation values.** `purgeQueueWithRetry` is modified to return `(oldGen, newGen uint64, err error)` so the audit log records the values from the **committed OCC round**, not a pre/post `loadQueueMetaAt` read that could race a concurrent purge in the 60-second window. `tryPurgeQueueOnce` already has both values inside the OCC transaction (`lastGen` and `lastGen + 1`); plumbing them out is one extra `return`. Claude r2 caught this — fetching the generations via extra Pebble reads would race the meta-stored rate-limit fields and could log values that never appeared as a single consistent state. The change is contained to `adapter/sqs_purge.go`; the only other caller (the SigV4 `purgeQueue` handler) discards the new return values via `_, _, err := ...`.
 
 Two new Prometheus counters on the existing `monitoring.SQSMetrics` registry:
 
@@ -296,11 +404,13 @@ The 60-second rate-limit is **not** an authorization concern (any caller hitting
 
 1. **Unit — Purge:** `TestAdminPurgeQueue_*` in `adapter/sqs_admin_test.go`:
    - happy path bumps the generation
+   - `AdminPurgeResult.GenerationBefore` / `GenerationAfter` are the values from the **committed** OCC round (not the meta read pre/post): the test arranges a queue at generation N, runs `AdminPurgeQueue`, asserts the returned `GenerationBefore=N, GenerationAfter=N+1`, then runs a concurrent same-tick purge attempt that must hit the rate-limit (validating the values logged in the audit line are the ones that actually landed, not stale-read intermediates)
    - read-only principal → `ErrAdminForbidden`
    - follower → `ErrAdminNotLeader`
    - missing queue → `ErrAdminSQSNotFound`
-   - second purge within 60 s → `ErrAdminSQSPurgeInProgress`
+   - second purge within 60 s → `*PurgeInProgressError{RetryAfter: d}`; `errors.Is(err, ErrAdminSQSPurgeInProgress)` returns true; `d` is in `(0, 60s]`
    - empty name → `ErrAdminSQSValidation`
+   - SigV4 caller compatibility: `TestPurgeQueueSigV4_StillCompiles` exercises the SigV4 handler path through the modified `purgeQueueWithRetry` signature to prove the change does not regress the wire-level surface
 2. **Unit — Peek:** `TestAdminPeekQueue_*` in `adapter/sqs_admin_test.go`:
    - happy path returns visible messages in `visible_at` order
    - peek does NOT change receive count (verify via subsequent Describe / ReceiveMessage)
@@ -310,8 +420,11 @@ The 60-second rate-limit is **not** an authorization concern (any caller hitting
    - Limit clamping: 0 → default 20; 500 → clamped to 100
    - Cursor round-trip: peek with empty cursor, then peek with returned cursor → second page non-overlapping with first
    - Cursor invalid (truncated base64, wrong version) → `ErrAdminSQSValidation`
+   - Cursor too large (encoded length > 512 bytes) → `ErrAdminSQSValidation`
+   - Cursor with stale generation (queue purged between calls) → `ErrAdminSQSValidation` with the "restart from the front" message; SPA refreshes from empty cursor
    - BodyMaxBytes truncation: long body → `BodyTruncated=true`, `BodyOriginalSize` correct, returned `Body` length == `BodyMaxBytes`
    - FIFO queue → `GroupID` and `DeduplicationID` populated; standard queue → both empty
+   - **Partitioned FIFO pagination (`TestAdminPeekQueue_PartitionedFIFO_Pagination`):** queue with `PartitionCount=4` and N messages spread across partitions; cursor pagination eventually surfaces every message exactly once, in `(partition, visible_at)` order; cursor cleanly transitions from partition k to partition k+1 between pages
    - read-only principal → succeeds (peek is a read)
    - nil principal → `ErrAdminForbidden`
    - follower → `ErrAdminNotLeader`
