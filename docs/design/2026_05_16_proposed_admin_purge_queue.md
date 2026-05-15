@@ -149,7 +149,11 @@ The walk:
 
 Cost is `O(Limit)` round-trips against Pebble at peek time — tiny for the bounded result sets the SPA uses. The bound on `Limit` (max 100) prevents an operator script from accidentally issuing million-row peeks against the leader.
 
-**Throttle.** Peek consults a **distinct per-queue admin-peek bucket**, *not* the per-queue `ReceiveMessage` budget. An earlier draft of this design merged the two; Claude r2 flagged that an operator paginating through a 10k-message DLQ could exhaust the budget that real consumers depend on. The separate admin-peek bucket defaults to lower steady-rate (`adminPeekRPS = 5`, `adminPeekBurst = 20`) so a pagination loop cannot starve consumers. The bucket lives next to the existing per-queue throttle (`adapter/sqs_throttle.go`) and is referenced by name from `adminPeekKey(queue) = "admin_peek:" + queue` so it cannot accidentally collide with the wire-side buckets. Exhaustion returns the same SQS-shape `429` with `Retry-After`.
+**Throttle.** Peek consults a **distinct per-queue admin-peek bucket**, *not* the per-queue `ReceiveMessage` budget. An earlier draft of this design merged the two; Claude r2 flagged that an operator paginating through a 10k-message DLQ could exhaust the budget that real consumers depend on. The separate admin-peek bucket defaults to a lower steady-rate (`adminPeekRPS = 5`, `adminPeekBurst = 20`) so a pagination loop cannot starve consumers.
+
+**Bucket key format.** The existing `bucketStore` (`adapter/sqs_throttle.go`) keys on a struct `bucketKey{queue, action, incarnation}`, not a string. The admin-peek bucket therefore uses `bucketStore.charge()` directly with `action = "admin_peek"` and the queue's current incarnation, exactly like the `SendMessage` / `ReceiveMessage` paths do. Claude r4 flagged an earlier draft that described the bucket as a free-standing string-keyed map; that would have required parallel rate-limiter infrastructure and would not have been swept by `invalidateQueue()` on queue re-creation. The `bucketStore.charge(adminPeekThrottle, queueName, "admin_peek", meta.Incarnation, 1)` form participates in the existing incarnation reset machinery automatically.
+
+Exhaustion returns `&adminPeekThrottledError{retryAfter: time.Duration}` from the bucket, which the admin wrapper converts into a 429-mapped admin sentinel parallel to `ErrAdminSQSPurgeInProgress` (call it `ErrAdminSQSPeekThrottled`); the HTTP handler maps it to `429 Too Many Requests` with `Retry-After` and the `throttled` metric outcome (§3.6).
 
 **Why leader-only.** The visibility index is updated by the leader as part of every `SendMessage` / `ReceiveMessage` / `DeleteMessage` commit. A follower read could see an index entry whose underlying message record was already deleted (race between the leader's apply and the follower's lease-read fence). Peek is rare and bursty rather than steady-state, so the lease-read fast path's win doesn't apply; running it on the leader keeps the snapshot internally consistent.
 
@@ -217,7 +221,14 @@ The 60-second rate-limit lives on the meta record (`tryPurgeQueueOnce` reads it)
 
 **Caller audit (semantic-change rule).** `purgeQueueWithRetry`'s signature change has exactly one external caller (`purgeQueue` in `sqs_purge.go`); the implementation PR's grep + audit will confirm the only call site is updated to discard the generation pair. `tryPurgeQueueOnce` is internal to the same file; same audit applies.
 
-The `PurgeQueueInProgress` mapping: `tryPurgeQueueOnce` returns an `sqsAPIError` with code `PurgeQueueInProgress` and HTTP 400 when the 60-second window is active. The admin wrapper sniffs this via a new helper `isSQSAdminPurgeInProgress(err)` (parallel to the existing `isSQSAdminQueueDoesNotExist`), extracts the remaining duration from the meta record (`LastPurgedAtMillis + 60s - now()`), and returns `&PurgeInProgressError{RetryAfter: remaining}`. The duration is captured once at the rejection point so the handler does not need to recompute it.
+**RetryAfter propagation (typed-error path, no second meta read).** Claude r3 + r4 flagged that the duration must travel **inside the error value itself** — not be recomputed by the admin wrapper via a second `loadQueueMetaAt` call, which would race a concurrent purge that resets `LastPurgedAtMillis` in the 60-second window.
+
+The implementation:
+
+1. `tryPurgeQueueOnce` already has both `meta.LastPurgedAtMillis` and `now` inside the OCC read at the rate-limit rejection point (`adapter/sqs_purge.go:63–76`). At rejection, it computes `remaining := sqsPurgeRateLimitMillis*ms - (now - meta.LastPurgedAtMillis)*ms` and returns a typed internal error `&purgeRateLimitedError{remaining: time.Duration(remaining)}`. The wire-side `purgeQueue` handler in `sqs_purge.go` wraps that with the existing `sqsAPIError{code: PurgeQueueInProgress, …}` rendering — its error message includes the same numeric duration, so the SigV4 response shape is unchanged.
+2. `AdminPurgeQueue` uses `errors.As(err, &purgeRateLimitedErr)` to extract the duration directly from the typed error and returns `&PurgeInProgressError{RetryAfter: purgeRateLimitedErr.remaining}`. No second meta read is needed.
+
+This is the only race-free path: the rate-limit decision and the duration that describes it are derived from the **same** `LastPurgedAtMillis` value in a single OCC read. The phrase "from the meta record" in earlier drafts was ambiguous; the doc now commits explicitly to the typed-error path.
 
 ### 3.3 Backend: AdminQueueSummary extensions
 
@@ -260,23 +271,27 @@ Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DEL
 /admin/api/v1/sqs/queues/{name}/messages → handlePeek (GET) / handlePurge (DELETE) (new)
 ```
 
-Path segments are extracted with `path.Clean` first to normalise away leading / trailing / duplicated slashes, then split on `/`. The first segment after `queues/` is always the queue name; the rest (zero or more segments) is the sub-resource path. Sub-resource path matches: `[]` → name-only routes; `["messages"]` → messages sub-resource. Any other shape (`["messages", "x"]`, `["Messages"]`, `["messages", ""]` from trailing slash) returns 404. This restructure is itself a small change — `handleDescribe` and `handleDelete` are unchanged internally, they just receive a bare name instead of a path tail.
+Path segments are extracted with `path.Clean` first (normalising leading / trailing / duplicated slashes and any `.` / `..` traversal), then split on `/`. The first segment after `queues/` is always the queue name; the rest (zero or more segments) is the sub-resource path. Sub-resource path matches: `[]` → name-only routes; `["messages"]` → messages sub-resource. Any other shape (`["messages", "x"]`, `["Messages"]`) returns 404.
 
-**Bridge interface.** `QueuesSource` gains two methods:
+**Trailing slash policy.** `path.Clean` strips trailing slashes, so requests like `/admin/api/v1/sqs/queues/orders/messages/` normalise to `/admin/api/v1/sqs/queues/orders/messages` and **succeed** as a peek/purge of the `messages` sub-resource. Claude r4 caught the earlier draft's contradiction — the §6 test plan asserted a trailing slash should 404, but `path.Clean` makes that impossible. The doc now commits to **(a) accept trailing slashes** because the alternative (a `strings.HasSuffix(path, "/")` pre-check) adds a special case that diverges from how the HTTP `mux` family typically treats trailing slashes. Test plan §6.4 updated to match.
+
+This restructure is itself a small change — `handleDescribe` and `handleDelete` are unchanged internally, they just receive a bare name instead of a path tail.
+
+**Bridge interface.** `QueuesSource` (defined in `internal/admin/sqs_handler.go:62-65`) gains two methods. The existing methods are named `AdminListQueues` / `AdminDescribeQueue` / `AdminDeleteQueue`; the new methods follow the same convention (Claude r4 flagged the earlier draft that showed shorter `List` / `Describe` / `Delete` names — those don't match the actual interface):
 
 ```go
 type QueuesSource interface {
     // existing
-    List(ctx context.Context) ([]string, error)
-    Describe(ctx context.Context, name string) (*QueueSummary, bool, error)
-    Delete(ctx context.Context, p AuthPrincipal, name string) error
+    AdminListQueues(ctx context.Context) ([]string, error)
+    AdminDescribeQueue(ctx context.Context, name string) (*QueueSummary, bool, error)
+    AdminDeleteQueue(ctx context.Context, principal AuthPrincipal, name string) error
     // new
-    Peek(ctx context.Context, name string, opts PeekOptions) (PeekResult, error)
-    Purge(ctx context.Context, p AuthPrincipal, name string) (PurgeResult, error)
+    AdminPeekQueue(ctx context.Context, principal AuthPrincipal, name string, opts AdminPeekMessageOptions) (AdminPeekResult, error)
+    AdminPurgeQueue(ctx context.Context, principal AuthPrincipal, name string) (AdminPurgeResult, error)
 }
 ```
 
-`sqsQueuesBridge` in `main_admin.go` implements both new methods by translating between the admin-package types and `adapter.AdminPeek*` / `adapter.AdminPurge*`. `PurgeResult` carries `GenerationBefore` / `GenerationAfter` for the audit line. The bridge inspects the returned error: a `*adapter.PurgeInProgressError` is rewrapped as `*admin.PurgeInProgressError{RetryAfter: e.RetryAfter}` so the admin package stays free of the adapter package's error types. Both struct errors implement `errors.Is(ErrQueuesPurgeInProgress)` so `writeQueuesError` can branch on the sentinel while the duration travels in the typed payload.
+`sqsQueuesBridge` in `main_admin.go` implements both new methods by translating between the admin-package types and `adapter.AdminPeek*` / `adapter.AdminPurge*`. `AdminPurgeResult` carries `GenerationBefore` / `GenerationAfter` for the audit line. The bridge inspects the returned error: a `*adapter.PurgeInProgressError` is rewrapped as `*admin.PurgeInProgressError{RetryAfter: e.RetryAfter}` so the admin package stays free of the adapter package's error types. Both struct errors implement `errors.Is(ErrQueuesPurgeInProgress)` so `writeQueuesError` can branch on the sentinel while the duration travels in the typed payload.
 
 **Admin-package sentinel.** Two new sentinels in `internal/admin/queues_errors.go` (parallel to existing `ErrQueuesForbidden` / `ErrQueuesNotLeader` / `ErrQueuesNotFound` / `ErrQueuesValidation`):
 
@@ -337,7 +352,15 @@ Below the table: a page-size selector (20 / 50 / 100), a Refresh button, and Nex
 
 **Copy as JSON payload schema.** The clipboard payload is the exact wire shape of a single `AdminPeekedMessage` entry (top-level keys: `message_id`, `body`, `body_truncated`, `body_original_size`, `sent_timestamp`, `receive_count`, `group_id`, `deduplication_id`, `attributes`) plus a wrapper `{"schema_version": 1, "queue": "<name>", "exported_at": "<ISO8601>", "message": { … }}`. The `schema_version` is what downstream tooling pins so a future change to the export format (e.g. multi-message JSONL bundle) does not silently break exporters. Operator workflows that pipe this into a recovery tool can rely on the schema not shifting under them.
 
-**Full-body fetch in the detail modal.** When a row's `body_truncated` is true on the list response, opening the detail modal triggers a single-message re-peek with `body_max_bytes` set to **`sqsMaximumAllowedMaximumMessageSize` (262144 = 256 KiB)** — the cap on SQS's stored body size. That guarantees the modal shows the full body for any legitimately stored message; the operator never has to triage with a still-truncated payload. Codex r3 flagged that an earlier 64-KiB cap on BodyMaxBytes broke this guarantee for messages between 64 KiB and 256 KiB.
+**Full-body fetch in the detail modal.** `AdminPeekQueue` walks the visibility index from a cursor; it has no by-message-id targeted fetch. When a row's `body_truncated` is true on the list response, opening the detail modal therefore **re-issues the current page's peek request** (same cursor, same limit) with `body_max_bytes` set to **`sqsMaximumAllowedMaximumMessageSize` (262144 = 256 KiB)** — the cap on SQS's stored body size. The SPA then locates the target message by `message_id` in the re-fetched response and renders the full body in the modal.
+
+Claude r4 flagged that the cap matters at scale: a 100-row page with every message at 256 KiB stretches to a 25 MiB response. The SPA mitigates by:
+
+1. Defaulting the list-view page size to 20 (not 100), so the worst-case detail-modal re-peek is 5 MiB.
+2. Tracking the per-row `body_original_size` from the list response and warning the operator before the re-peek if the cumulative re-peek size exceeds 20 MiB — they can switch to page size 20 (or smaller) and re-page to the target message first.
+3. Caching the re-peek result so opening other rows on the same page does not re-trigger the full-body fetch.
+
+Codex r3 flagged that an earlier 64-KiB cap on BodyMaxBytes broke the triage guarantee for messages between 64 KiB and 256 KiB; raising the cap to 262144 and committing to the re-peek mechanism (rather than a non-existent by-id fetch) resolves the gap. A future PR can add a `?message_id=…` filter to `AdminPeekQueue` for targeted re-fetch if the page-size–driven approach proves too coarse in production; for now the simpler design holds.
 
 **Purge button.** Sits in the page header next to the existing Delete button. Two states:
 
@@ -453,7 +476,7 @@ The 60-second rate-limit is **not** an authorization concern (any caller hitting
    - 429 with `Retry-After` header on the immediate second purge
    - peek + purge on same queue: peek shows N rows → purge → peek returns 0 rows
    - bridge bubbles `ErrAdminForbidden` through to 403 (peek under nil principal; purge under read-only principal)
-   - path-segment validation: `/messages/` (trailing slash), `/messages/foo` (sub-resource), `/Messages` (case mismatch) all return 404
+   - path-segment validation: `/messages/foo` (undefined sub-resource), `/Messages` (case mismatch) return 404; `/messages/` (trailing slash) normalises via `path.Clean` and **succeeds** with 204 — the test pins this behaviour explicitly because Claude r4 flagged the earlier "404 on trailing slash" test plan as contradicting `path.Clean`'s normalisation
 5. **Frontend:** Playwright / RTL test pinning:
    - Messages tab renders rows in `visible_at` order with the correct columns
    - row click opens detail modal with full body
