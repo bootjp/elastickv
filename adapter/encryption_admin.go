@@ -13,7 +13,6 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
-	pkgerrors "github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 )
 
@@ -341,6 +340,14 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 			"encryption: proposer_local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
 			req.GetProposerLocalEpoch())
 	}
+	if req.GetProposerNodeId() == 0 {
+		// §6.1 reserves full_node_id=0 as the "not encryption-capable"
+		// sentinel. Forwarding 0 into a writer-registry row would
+		// collide with every other un-bootstrapped node's sentinel
+		// and break the §4.1 nonce-uniqueness invariant.
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: proposer_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
+	}
 	payload := fsmwire.RotationPayload{
 		SubTag:  fsmwire.RotateSubRotateDEK,
 		DEKID:   req.GetNewDekId(),
@@ -391,6 +398,11 @@ func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, re
 			"encryption: writers[0].local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
 			w.GetLocalEpoch())
 	}
+	if w.GetFullNodeId() == 0 {
+		// Same §6.1 sentinel rule as RotateDEK.proposer_node_id.
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: writers[0].full_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
+	}
 	payload := fsmwire.RegistrationPayload{
 		DEKID:      req.GetDekId(),
 		FullNodeID: w.GetFullNodeId(),
@@ -416,17 +428,44 @@ func (s *EncryptionAdminServer) proposeEncryptionEntry(ctx context.Context, opco
 	entry = append(entry, body...)
 	res, err := s.proposer.Propose(ctx, entry)
 	if err != nil {
-		// Raft-engine errors are operator-visible diagnostics:
-		// not-leader / context-canceled / propose-queue full all
-		// surface here. We surface the engine's error rather
-		// than rewriting it so the operator can grep against
-		// the engine's own logs.
-		return 0, pkgerrors.Wrapf(err, "encryption: propose 0x%02x", opcode)
+		return 0, proposeErrorToStatus(err, opcode)
 	}
 	if res == nil {
 		return 0, grpcStatusError(codes.Internal, "encryption: proposer returned nil result")
 	}
 	return res.CommitIndex, nil
+}
+
+// proposeErrorToStatus maps raftengine.Proposer.Propose errors to
+// gRPC status codes so clients see structured retry semantics
+// instead of the default codes.Unknown:
+//
+//   - Leadership lost between requireLeader() and Propose, or a
+//     leadership transfer raced the call → FailedPrecondition.
+//     The client retries against the new leader, same shape as
+//     the up-front requireLeader() rejection.
+//   - Context errors (caller canceled / deadline elapsed) →
+//     Canceled / DeadlineExceeded so the client does not retry a
+//     genuinely-aborted call.
+//   - Anything else (engine closed, propose-queue full, etc.) →
+//     Unavailable, the standard "transient, retryable" code.
+func proposeErrorToStatus(err error, opcode byte) error {
+	switch {
+	case errors.Is(err, raftengine.ErrNotLeader),
+		errors.Is(err, raftengine.ErrLeadershipLost),
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress):
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: propose 0x%02x rejected by raft engine: %v", opcode, err)
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: propose 0x%02x canceled: %v", opcode, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: propose 0x%02x deadline exceeded: %v", opcode, err)
+	default:
+		return grpcStatusErrorf(codes.Unavailable,
+			"encryption: propose 0x%02x failed: %v", opcode, err)
+	}
 }
 
 // requireLeader rejects on followers with FailedPrecondition. The

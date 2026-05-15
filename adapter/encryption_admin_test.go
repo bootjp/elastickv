@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -422,6 +423,90 @@ func TestEncryptionAdmin_RegisterEncryptionWriter_HappyPath(t *testing.T) {
 		got2.FullNodeID != req.Writers[0].FullNodeId ||
 		uint32(got2.LocalEpoch) != req.Writers[0].LocalEpoch {
 		t.Errorf("decoded registration %+v does not match request %+v", got2, req)
+	}
+}
+
+// TestEncryptionAdmin_RotateDEK_RejectsZeroProposerNodeID pins the
+// PR756 codex P1 regression: full_node_id=0 is the §6.1 sentinel
+// for "not encryption-capable" and must not be persisted into a
+// writer-registry row. Reject at the gRPC boundary with
+// InvalidArgument.
+func TestEncryptionAdmin_RotateDEK_RejectsZeroProposerNodeID(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validRotateDEKRequest()
+	req.ProposerNodeId = 0
+	_, err := srv.RotateDEK(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("RotateDEK status=%v, want InvalidArgument (zero proposer_node_id is reserved)", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_RegisterEncryptionWriter_RejectsZeroFullNodeID
+// is the twin regression test for the registration path.
+func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsZeroFullNodeID(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := &pb.RegisterEncryptionWriterRequest{
+		DekId: 5,
+		Writers: []*pb.WriterRegistryEntry{
+			{FullNodeId: 0, LocalEpoch: 1},
+		},
+	}
+	_, err := srv.RegisterEncryptionWriter(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("RegisterEncryptionWriter status=%v, want InvalidArgument (zero full_node_id is reserved)", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_RotateDEK_MapsProposeLeaderErrorToFailedPrecondition
+// pins the PR756 codex P1 regression: Propose() returning
+// ErrNotLeader / ErrLeadershipLost / ErrLeadershipTransferInProgress
+// must surface as FailedPrecondition with the engine error in the
+// status detail so clients can retry against the right node, NOT
+// as the default codes.Unknown that pkgerrors.Wrap would produce.
+func TestEncryptionAdmin_RotateDEK_MapsProposeLeaderErrorToFailedPrecondition(t *testing.T) {
+	t.Parallel()
+	for _, sentinel := range []error{
+		raftengine.ErrNotLeader,
+		raftengine.ErrLeadershipLost,
+		raftengine.ErrLeadershipTransferInProgress,
+	} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			proposer := &recordingProposer{err: sentinel}
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(proposer),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+			)
+			_, err := srv.RotateDEK(context.Background(), validRotateDEKRequest())
+			if status.Code(err) != codes.FailedPrecondition {
+				t.Errorf("RotateDEK status=%v, want FailedPrecondition for %v", status.Code(err), sentinel)
+			}
+		})
+	}
+}
+
+// TestEncryptionAdmin_RotateDEK_MapsProposeOtherErrorToUnavailable
+// pins the PR756 codex P1 regression for the non-leadership
+// failure mode. A propose failure that is NOT a known leadership
+// sentinel surfaces as Unavailable (retryable transient failure)
+// instead of Unknown.
+func TestEncryptionAdmin_RotateDEK_MapsProposeOtherErrorToUnavailable(t *testing.T) {
+	t.Parallel()
+	proposer := &recordingProposer{err: errors.New("synthetic engine failure")}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	_, err := srv.RotateDEK(context.Background(), validRotateDEKRequest())
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("RotateDEK status=%v, want Unavailable for non-leadership propose error", status.Code(err))
 	}
 }
 
