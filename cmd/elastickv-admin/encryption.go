@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const encryptionDialTimeout = 5 * time.Second
@@ -78,15 +80,30 @@ func runEncryptionStatus(args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = closeFn() }()
+	defer func() {
+		// Surface gRPC client-conn cleanup failures so a host
+		// stuck with leaked FDs or a misbehaving transport is
+		// visible; close errors are otherwise easy to miss in
+		// a one-shot CLI.
+		if err := closeFn(); err != nil {
+			fmt.Fprintf(os.Stderr, "encryption: close connection: %v\n", err)
+		}
+	}()
 	cap, err := client.GetCapability(ctx, &pb.Empty{})
 	if err != nil {
 		return errors.Wrap(err, "GetCapability")
 	}
 	state, stateErr := client.GetSidecarState(ctx, &pb.Empty{})
-	// GetSidecarState returns FailedPrecondition on nodes without an
-	// encryption sidecar; the CLI still shows the capability summary so
-	// `status` is informative even on un-bootstrapped clusters.
+	// Only FailedPrecondition is the documented "node not
+	// configured for encryption" sentinel that downgrades to the
+	// soft "unavailable" line in writeEncryptionStatus. Anything
+	// else (Unimplemented after a binary downgrade, Unavailable
+	// from a half-open transport, etc.) is a real failure the
+	// operator must see; let it bubble up so the CLI exits
+	// non-zero.
+	if stateErr != nil && status.Code(stateErr) != codes.FailedPrecondition {
+		return errors.Wrap(stateErr, "GetSidecarState")
+	}
 	return writeEncryptionStatus(out, cap, state, stateErr)
 }
 
@@ -141,7 +158,7 @@ func writeSidecarStateBlock(out io.Writer, state *pb.SidecarStateReport) error {
 	for id := range state.WrappedDeksById {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	if _, err := fmt.Fprintf(out, "  wrapped_dek_ids:             %v\n", ids); err != nil {
 		return errors.Wrap(err, "write wrapped_dek_ids")
 	}

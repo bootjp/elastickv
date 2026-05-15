@@ -40,11 +40,17 @@ func TestEncryptionAdmin_GetCapability_SidecarMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCapability: %v", err)
 	}
-	if got.EncryptionCapable {
-		t.Errorf("EncryptionCapable=true, want false when sidecar is missing")
+	// §7.1 Phase 0: a node restarted with --encryption-enabled
+	// (proxied here by WithEncryptionAdminSidecarPath) is "capable"
+	// even before bootstrap. The cutover command needs that signal
+	// before the bootstrap entry has had a chance to write the
+	// sidecar, otherwise the bootstrap pre-check is a chicken-and-egg
+	// loop.
+	if !got.EncryptionCapable {
+		t.Errorf("EncryptionCapable=false, want true on a Phase-0 node (path configured, sidecar not yet created)")
 	}
 	if got.SidecarPresent {
-		t.Errorf("SidecarPresent=true, want false when sidecar is missing")
+		t.Errorf("SidecarPresent=true, want false when sidecar file is missing")
 	}
 }
 
@@ -63,8 +69,12 @@ func TestEncryptionAdmin_GetCapability_NotBootstrapped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCapability: %v", err)
 	}
-	if got.EncryptionCapable {
-		t.Errorf("EncryptionCapable=true, want false before bootstrap")
+	// §7.1 Phase 0 + §6.1: encryption_capable is gated on "node has
+	// been restarted with --encryption-enabled", NOT on
+	// Active.Storage != 0. A pre-bootstrap capable node reports true
+	// so the bootstrap pre-check fan-out can proceed at all.
+	if !got.EncryptionCapable {
+		t.Errorf("EncryptionCapable=false, want true on a configured pre-bootstrap node (regression for PR754 P1)")
 	}
 	if !got.SidecarPresent {
 		t.Errorf("SidecarPresent=false, want true when sidecar exists")

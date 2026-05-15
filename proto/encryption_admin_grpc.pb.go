@@ -36,18 +36,25 @@ const (
 // docs/design/2026_04_29_partial_data_at_rest_encryption.md. The
 // service is split into two groups:
 //
-//  1. Read-only, leaderless capability and state probes
-//     (GetCapability, GetSidecarState). These are safe to call on
-//     any member, including learners, and return what that node
-//     observes locally. The §5.6 / §7.1 cutover paths fan these
-//     out across every member of every Raft group to drive the
-//     pre-flight capability check and to collect the
-//     (full_node_id, local_epoch) batch that goes into the
-//     bootstrap-encryption Raft entry.
+//  1. Read-only, leaderless probes (GetCapability,
+//     GetSidecarState, ResyncSidecar). Safe to call on any
+//     member including learners; each returns the responding
+//     node's local view. The §5.6 / §7.1 cutover paths fan
+//     GetCapability out across every member of every Raft group
+//     to drive the pre-flight capability check and to collect
+//     the (full_node_id, local_epoch) batch that goes into the
+//     bootstrap-encryption Raft entry. GetSidecarState and
+//     ResyncSidecar share the §5.5 sidecar-recovery role: a
+//     follower whose sidecar fell behind a Raft-log compaction
+//     window calls either RPC against the leader and rewrites
+//     its local keys.json from the response. ResyncSidecar is
+//     addressed at the leader because the recovery flow only
+//     consults the leader's record; GetSidecarState answers from
+//     any node and is the broader observability surface.
 //
-//  2. Mutating RPCs that propose FSM-internal entries through the
-//     default Raft group's leader (BootstrapEncryption, RotateDEK,
-//     RegisterEncryptionWriter, ResyncSidecar). They route to the
+//  2. Mutating RPCs that propose FSM-internal entries through
+//     the default Raft group's leader (BootstrapEncryption,
+//     RotateDEK, RegisterEncryptionWriter). They route to the
 //     leader; followers return FailedPrecondition with the
 //     currently-known leader so the operator's CLI can retry
 //     against the right node.
@@ -150,18 +157,25 @@ func (c *encryptionAdminClient) ResyncSidecar(ctx context.Context, in *ResyncSid
 // docs/design/2026_04_29_partial_data_at_rest_encryption.md. The
 // service is split into two groups:
 //
-//  1. Read-only, leaderless capability and state probes
-//     (GetCapability, GetSidecarState). These are safe to call on
-//     any member, including learners, and return what that node
-//     observes locally. The §5.6 / §7.1 cutover paths fan these
-//     out across every member of every Raft group to drive the
-//     pre-flight capability check and to collect the
-//     (full_node_id, local_epoch) batch that goes into the
-//     bootstrap-encryption Raft entry.
+//  1. Read-only, leaderless probes (GetCapability,
+//     GetSidecarState, ResyncSidecar). Safe to call on any
+//     member including learners; each returns the responding
+//     node's local view. The §5.6 / §7.1 cutover paths fan
+//     GetCapability out across every member of every Raft group
+//     to drive the pre-flight capability check and to collect
+//     the (full_node_id, local_epoch) batch that goes into the
+//     bootstrap-encryption Raft entry. GetSidecarState and
+//     ResyncSidecar share the §5.5 sidecar-recovery role: a
+//     follower whose sidecar fell behind a Raft-log compaction
+//     window calls either RPC against the leader and rewrites
+//     its local keys.json from the response. ResyncSidecar is
+//     addressed at the leader because the recovery flow only
+//     consults the leader's record; GetSidecarState answers from
+//     any node and is the broader observability surface.
 //
-//  2. Mutating RPCs that propose FSM-internal entries through the
-//     default Raft group's leader (BootstrapEncryption, RotateDEK,
-//     RegisterEncryptionWriter, ResyncSidecar). They route to the
+//  2. Mutating RPCs that propose FSM-internal entries through
+//     the default Raft group's leader (BootstrapEncryption,
+//     RotateDEK, RegisterEncryptionWriter). They route to the
 //     leader; followers return FailedPrecondition with the
 //     currently-known leader so the operator's CLI can retry
 //     against the right node.

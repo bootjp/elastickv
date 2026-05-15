@@ -741,8 +741,16 @@ type ResyncSidecarResponse struct {
 	ActiveStorageId          uint32                 `protobuf:"varint,2,opt,name=active_storage_id,json=activeStorageId,proto3" json:"active_storage_id,omitempty"`
 	ActiveRaftId             uint32                 `protobuf:"varint,3,opt,name=active_raft_id,json=activeRaftId,proto3" json:"active_raft_id,omitempty"`
 	LeaderLatestAppliedIndex uint64                 `protobuf:"varint,4,opt,name=leader_latest_applied_index,json=leaderLatestAppliedIndex,proto3" json:"leader_latest_applied_index,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// writer_registry_for_caller carries the leader's recorded
+	// (dek_id, last_seen_local_epoch) for the calling node so the
+	// follower can re-derive its §4.1 local_epoch monotonically.
+	// Values MUST be <= 0xFFFF and the decode site MUST enforce
+	// that bound. Empty until Stage 7 wires the registry; the
+	// §5.5 recovery flow tolerates an empty map because a node
+	// recovering before any DEK exists has nothing to re-derive.
+	WriterRegistryForCaller map[uint32]uint32 `protobuf:"bytes,5,rep,name=writer_registry_for_caller,json=writerRegistryForCaller,proto3" json:"writer_registry_for_caller,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ResyncSidecarResponse) Reset() {
@@ -801,6 +809,13 @@ func (x *ResyncSidecarResponse) GetLeaderLatestAppliedIndex() uint64 {
 		return x.LeaderLatestAppliedIndex
 	}
 	return 0
+}
+
+func (x *ResyncSidecarResponse) GetWriterRegistryForCaller() map[uint32]uint32 {
+	if x != nil {
+		return x.WriterRegistryForCaller
+	}
+	return nil
 }
 
 var File_encryption_admin_proto protoreflect.FileDescriptor
@@ -863,15 +878,19 @@ const file_encryption_admin_proto_rawDesc = "" +
 	" RegisterEncryptionWriterResponse\x12#\n" +
 	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\"E\n" +
 	"\x14ResyncSidecarRequest\x12-\n" +
-	"\x13caller_full_node_id\x18\x01 \x01(\x04R\x10callerFullNodeId\"\xc6\x02\n" +
+	"\x13caller_full_node_id\x18\x01 \x01(\x04R\x10callerFullNodeId\"\x84\x04\n" +
 	"\x15ResyncSidecarResponse\x12X\n" +
 	"\x12wrapped_deks_by_id\x18\x01 \x03(\v2+.ResyncSidecarResponse.WrappedDeksByIdEntryR\x0fwrappedDeksById\x12*\n" +
 	"\x11active_storage_id\x18\x02 \x01(\rR\x0factiveStorageId\x12$\n" +
 	"\x0eactive_raft_id\x18\x03 \x01(\rR\factiveRaftId\x12=\n" +
-	"\x1bleader_latest_applied_index\x18\x04 \x01(\x04R\x18leaderLatestAppliedIndex\x1aB\n" +
+	"\x1bleader_latest_applied_index\x18\x04 \x01(\x04R\x18leaderLatestAppliedIndex\x12p\n" +
+	"\x1awriter_registry_for_caller\x18\x05 \x03(\v23.ResyncSidecarResponse.WriterRegistryForCallerEntryR\x17writerRegistryForCaller\x1aB\n" +
 	"\x14WrappedDeksByIdEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\rR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x012\xa0\x03\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\x1aJ\n" +
+	"\x1cWriterRegistryForCallerEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\rR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\rR\x05value:\x028\x012\xa0\x03\n" +
 	"\x0fEncryptionAdmin\x12,\n" +
 	"\rGetCapability\x12\x06.Empty\x1a\x11.CapabilityReport\"\x00\x120\n" +
 	"\x0fGetSidecarState\x12\x06.Empty\x1a\x13.SidecarStateReport\"\x00\x12R\n" +
@@ -893,7 +912,7 @@ func file_encryption_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_encryption_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_encryption_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_encryption_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_encryption_admin_proto_goTypes = []any{
 	(RotateDEKRequest_Purpose)(0),            // 0: RotateDEKRequest.Purpose
 	(*Empty)(nil),                            // 1: Empty
@@ -911,6 +930,7 @@ var file_encryption_admin_proto_goTypes = []any{
 	nil,                                      // 13: SidecarStateReport.WrappedDeksByIdEntry
 	nil,                                      // 14: SidecarStateReport.WriterRegistryForCallerEntry
 	nil,                                      // 15: ResyncSidecarResponse.WrappedDeksByIdEntry
+	nil,                                      // 16: ResyncSidecarResponse.WriterRegistryForCallerEntry
 }
 var file_encryption_admin_proto_depIdxs = []int32{
 	13, // 0: SidecarStateReport.wrapped_deks_by_id:type_name -> SidecarStateReport.WrappedDeksByIdEntry
@@ -919,23 +939,24 @@ var file_encryption_admin_proto_depIdxs = []int32{
 	0,  // 3: RotateDEKRequest.purpose:type_name -> RotateDEKRequest.Purpose
 	4,  // 4: RegisterEncryptionWriterRequest.writers:type_name -> WriterRegistryEntry
 	15, // 5: ResyncSidecarResponse.wrapped_deks_by_id:type_name -> ResyncSidecarResponse.WrappedDeksByIdEntry
-	1,  // 6: EncryptionAdmin.GetCapability:input_type -> Empty
-	1,  // 7: EncryptionAdmin.GetSidecarState:input_type -> Empty
-	5,  // 8: EncryptionAdmin.BootstrapEncryption:input_type -> BootstrapEncryptionRequest
-	7,  // 9: EncryptionAdmin.RotateDEK:input_type -> RotateDEKRequest
-	9,  // 10: EncryptionAdmin.RegisterEncryptionWriter:input_type -> RegisterEncryptionWriterRequest
-	11, // 11: EncryptionAdmin.ResyncSidecar:input_type -> ResyncSidecarRequest
-	2,  // 12: EncryptionAdmin.GetCapability:output_type -> CapabilityReport
-	3,  // 13: EncryptionAdmin.GetSidecarState:output_type -> SidecarStateReport
-	6,  // 14: EncryptionAdmin.BootstrapEncryption:output_type -> BootstrapEncryptionResponse
-	8,  // 15: EncryptionAdmin.RotateDEK:output_type -> RotateDEKResponse
-	10, // 16: EncryptionAdmin.RegisterEncryptionWriter:output_type -> RegisterEncryptionWriterResponse
-	12, // 17: EncryptionAdmin.ResyncSidecar:output_type -> ResyncSidecarResponse
-	12, // [12:18] is the sub-list for method output_type
-	6,  // [6:12] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	16, // 6: ResyncSidecarResponse.writer_registry_for_caller:type_name -> ResyncSidecarResponse.WriterRegistryForCallerEntry
+	1,  // 7: EncryptionAdmin.GetCapability:input_type -> Empty
+	1,  // 8: EncryptionAdmin.GetSidecarState:input_type -> Empty
+	5,  // 9: EncryptionAdmin.BootstrapEncryption:input_type -> BootstrapEncryptionRequest
+	7,  // 10: EncryptionAdmin.RotateDEK:input_type -> RotateDEKRequest
+	9,  // 11: EncryptionAdmin.RegisterEncryptionWriter:input_type -> RegisterEncryptionWriterRequest
+	11, // 12: EncryptionAdmin.ResyncSidecar:input_type -> ResyncSidecarRequest
+	2,  // 13: EncryptionAdmin.GetCapability:output_type -> CapabilityReport
+	3,  // 14: EncryptionAdmin.GetSidecarState:output_type -> SidecarStateReport
+	6,  // 15: EncryptionAdmin.BootstrapEncryption:output_type -> BootstrapEncryptionResponse
+	8,  // 16: EncryptionAdmin.RotateDEK:output_type -> RotateDEKResponse
+	10, // 17: EncryptionAdmin.RegisterEncryptionWriter:output_type -> RegisterEncryptionWriterResponse
+	12, // 18: EncryptionAdmin.ResyncSidecar:output_type -> ResyncSidecarResponse
+	13, // [13:19] is the sub-list for method output_type
+	7,  // [7:13] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_encryption_admin_proto_init() }
@@ -949,7 +970,7 @@ func file_encryption_admin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_encryption_admin_proto_rawDesc), len(file_encryption_admin_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   15,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

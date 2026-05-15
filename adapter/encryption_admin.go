@@ -105,35 +105,46 @@ func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAd
 // servable on every node regardless of leadership state so the
 // §7.1 cutover command can fan it out across voters and learners.
 //
-// A node that has never been configured for encryption
-// (sidecarPath empty, or the file does not exist) returns
-// encryption_capable=false with local_epoch=0 and full_node_id=0
-// per the §6.1 contract: the cutover command refuses with
-// ErrCapabilityCheckFailed in that case so the empty epoch never
-// reaches the writer registry.
+// encryption_capable is gated on "this node was restarted with
+// --encryption-enabled" (proxied here by a non-empty sidecar path),
+// NOT on whether the sidecar has been bootstrapped. The §7.1 Phase
+// 0 capability gate fires before bootstrap proposes the first DEK,
+// so gating on Active.Storage != 0 would deadlock the cutover
+// against the very entry it is gating. SidecarPresent then carries
+// the orthogonal "has the bootstrap entry landed yet" signal.
+//
+// A node that has never been started with --encryption-enabled
+// (empty sidecarPath) returns encryption_capable=false with
+// local_epoch=0 and full_node_id=0 per the §6.1 contract: the
+// cutover command refuses with ErrCapabilityCheckFailed in that
+// case so the empty epoch never reaches the writer registry.
 func (s *EncryptionAdminServer) GetCapability(_ context.Context, _ *pb.Empty) (*pb.CapabilityReport, error) {
 	if s.sidecarPath == "" {
 		return &pb.CapabilityReport{BuildSha: s.buildSHA}, nil
 	}
-	sc, err := encryption.ReadSidecar(s.sidecarPath)
+	report := &pb.CapabilityReport{
+		EncryptionCapable: true,
+		BuildSha:          s.buildSHA,
+		FullNodeId:        s.fullNodeID,
+		// LocalEpoch stays at 0 until Stage 7 wires the §4.1
+		// writer-registry counter. The §5.6 step 1a pre-check
+		// happens before any DEK exists, so 0 is the correct
+		// value at the cutover-time read regardless.
+		LocalEpoch: 0,
+	}
+	_, err := encryption.ReadSidecar(s.sidecarPath)
 	switch {
 	case err == nil:
+		report.SidecarPresent = true
 	case errors.Is(err, os.ErrNotExist) || encryption.IsNotExist(err):
-		return &pb.CapabilityReport{BuildSha: s.buildSHA}, nil
+		// Phase 0 window: --encryption-enabled is set but the
+		// bootstrap entry has not yet created the sidecar.
+		// Capable, not present.
+		report.SidecarPresent = false
 	default:
 		return nil, statusFromSidecarErr(err)
 	}
-	return &pb.CapabilityReport{
-		EncryptionCapable: sc.Active.Storage != 0,
-		BuildSha:          s.buildSHA,
-		SidecarPresent:    true,
-		FullNodeId:        s.fullNodeID,
-		// LocalEpoch stays at 0 until Stage 7 wires the §4.1
-		// writer-registry counter. Bootstrap pre-check is
-		// expected to call GetCapability before any DEK exists,
-		// so 0 is the correct value at that point regardless.
-		LocalEpoch: 0,
-	}, nil
+	return report, nil
 }
 
 // GetSidecarState returns the §5.5 compaction-fallback snapshot. The
@@ -188,6 +199,12 @@ func (s *EncryptionAdminServer) ResyncSidecar(_ context.Context, _ *pb.ResyncSid
 		ActiveStorageId:          sc.Active.Storage,
 		ActiveRaftId:             sc.Active.Raft,
 		LeaderLatestAppliedIndex: s.appliedIndex(sc.RaftAppliedIndex),
+		// §5.5 follower-repair: leader's recorded
+		// last_seen_local_epoch per (dek_id, caller). Stage 7
+		// fills this from the writer registry. PR-A returns an
+		// empty non-nil map because a node recovering before
+		// the registry exists has nothing to re-derive.
+		WriterRegistryForCaller: map[uint32]uint32{},
 	}, nil
 }
 
