@@ -269,7 +269,7 @@ Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DEL
 
 **ServeHTTP restructure (existing dispatch must change).** The current `ServeHTTP` in `sqs_handler.go` extracts everything after `/queues/` and passes it to `handleDescribe` / `handleDelete` as the queue name. With sub-resources, `handleDescribe("foo/messages")` would happily try to describe a queue named `"foo/messages"`. The implementation PR must restructure dispatch into three explicit levels:
 
-```
+```text
 /admin/api/v1/sqs/queues            → handleList (existing)
 /admin/api/v1/sqs/queues/{name}     → handleDescribe / handleDelete (existing handlers,
                                        but receive bare {name} after restructure)
@@ -297,7 +297,7 @@ Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DEL
 | `/admin/api/v1/sqs/queues/%252F/messages` (double-encode)          | step 4 rejects (contains `%`) → 400 ValidationError                           |
 | `/admin/api/v1/sqs/queues/orders/../messages` (dot-segment escape) | step 4 rejects (segment equals `".."`) → 400 ValidationError                  |
 | `/admin/api/v1/sqs/queues/./orders/messages` (leading `.`)         | step 4 rejects (segment equals `"."`) → 400 ValidationError                   |
-| `/admin/api/v1/sqs/queues/orders/messages/` (trail slash)          | step 5 normalises via `path.Clean` to `/orders/messages` → 204 (legal route)  |
+| `/admin/api/v1/sqs/queues/orders/messages/` (trail slash)          | step 5 normalises via `path.Clean` to `/orders/messages` → 200 (GET peek) or 204 (DELETE purge) |
 
 **What the four canonical good inputs do:**
 
@@ -308,7 +308,7 @@ Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DEL
 | `/admin/api/v1/sqs/queues/orders/messages`             | `handlePeek` / `handlePurge` on queue `orders`                       |
 | `/admin/api/v1/sqs/queues/messages`                    | **valid** — `handleDescribe` / `handleDelete` on a queue literally named `messages` (legal AWS queue name; sub-resource path is empty so this is not `/queues/<name>/messages`) |
 
-**Trailing slash on a valid path is accepted.** `/admin/api/v1/sqs/queues/orders/messages/` Cleans to `/admin/api/v1/sqs/queues/orders/messages` in step 4 and succeeds — Claude r4 originally caught the earlier draft's test-plan contradiction here, and the policy stays: accept trailing slashes via `path.Clean` normalisation rather than adding a `strings.HasSuffix(path, "/")` pre-check that would diverge from the HTTP `mux` family's convention.
+**Trailing slash on a valid path is accepted.** `/admin/api/v1/sqs/queues/orders/messages/` Cleans to `/admin/api/v1/sqs/queues/orders/messages` in step 5 and succeeds — Claude r4 originally caught the earlier draft's test-plan contradiction here, and the policy stays: accept trailing slashes via `path.Clean` normalisation rather than adding a `strings.HasSuffix(path, "/")` pre-check that would diverge from the HTTP `mux` family's convention.
 
 This restructure is itself a small change — `handleDescribe` and `handleDelete` are unchanged internally, they just receive a bare name instead of a path tail.
 
