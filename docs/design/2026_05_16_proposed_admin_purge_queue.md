@@ -69,9 +69,18 @@ type AdminPeekMessageOptions struct {
     // empty means "start from the front of the visibility index".
     Cursor string
     // BodyMaxBytes truncates message bodies at this length to bound
-    // response size. Clamped to [256, 65536]; 0 means "use default
-    // (4096)". The full body is always retained on the server; only
-    // the wire representation is truncated.
+    // response size. Clamped to [256, sqsMaximumAllowedMaximumMessageSize]
+    // (= 256 KiB, matching AWS SQS's hard cap on stored message size
+    // — adapter/sqs_catalog.go:38). 0 means "use default (4096)".
+    // The full body is always retained on the server; only the wire
+    // representation is truncated.
+    //
+    // The cap matches the maximum-possible stored body so the detail
+    // modal can pass BodyMaxBytes=262144 and be guaranteed to see the
+    // entire payload — Codex r3 flagged that an earlier 64-KiB cap
+    // broke the triage guarantee for messages between 64 KiB and
+    // 256 KiB (the modal would still show a truncated body and the
+    // operator could purge without seeing what they were dropping).
     BodyMaxBytes int
 }
 
@@ -326,7 +335,9 @@ The queue detail page gains two new pieces of UI on top of the existing attribut
 
 Below the table: a page-size selector (20 / 50 / 100), a Refresh button, and Next / Previous controls driven by the cursor. Detail modal shows full body + every attribute + the timestamps; a "Copy as JSON" button copies the row's full record to the clipboard for manual export.
 
-**Copy as JSON payload schema.** The clipboard payload is the exact wire shape of a single `AdminPeekedMessage` entry (top-level keys: `message_id`, `body`, `body_truncated`, `body_original_size`, `sent_timestamp`, `receive_count`, `group_id`, `deduplication_id`, `attributes`) plus a wrapper `{"schema_version": 1, "queue": "<name>", "exported_at": "<ISO8601>", "message": { … }}`. The `schema_version` is what downstream tooling pins so a future change to the export format (e.g. multi-message JSONL bundle) does not silently break exporters. Operator workflows that pipe this into a recovery tool can rely on the schema not shifting under them. The full-body modal shows the FULL body — not the truncated one — by issuing a single-message peek with `body_max_bytes=65536` if the row's `body_truncated` was true on the list response.
+**Copy as JSON payload schema.** The clipboard payload is the exact wire shape of a single `AdminPeekedMessage` entry (top-level keys: `message_id`, `body`, `body_truncated`, `body_original_size`, `sent_timestamp`, `receive_count`, `group_id`, `deduplication_id`, `attributes`) plus a wrapper `{"schema_version": 1, "queue": "<name>", "exported_at": "<ISO8601>", "message": { … }}`. The `schema_version` is what downstream tooling pins so a future change to the export format (e.g. multi-message JSONL bundle) does not silently break exporters. Operator workflows that pipe this into a recovery tool can rely on the schema not shifting under them.
+
+**Full-body fetch in the detail modal.** When a row's `body_truncated` is true on the list response, opening the detail modal triggers a single-message re-peek with `body_max_bytes` set to **`sqsMaximumAllowedMaximumMessageSize` (262144 = 256 KiB)** — the cap on SQS's stored body size. That guarantees the modal shows the full body for any legitimately stored message; the operator never has to triage with a still-truncated payload. Codex r3 flagged that an earlier 64-KiB cap on BodyMaxBytes broke this guarantee for messages between 64 KiB and 256 KiB.
 
 **Purge button.** Sits in the page header next to the existing Delete button. Two states:
 
@@ -375,10 +386,12 @@ elastickv_sqs_admin_purge_queue_total{queue, outcome}
   outcome ∈ {"ok", "forbidden", "not_leader", "not_found", "purge_in_progress", "internal_error"}
 
 elastickv_sqs_admin_peek_queue_total{queue, outcome}
-  outcome ∈ {"ok", "forbidden", "not_leader", "not_found", "internal_error"}
+  outcome ∈ {"ok", "forbidden", "not_leader", "not_found", "throttled", "internal_error"}
 ```
 
-The label cardinality budget is the same `sqsMaxTrackedQueues = 512` cap that already governs the depth gauges — the same `admitForCounterBudget` helper from PR #743 r3 handles the collapse to `_other`. Peek has no `purge_in_progress` outcome (no rate limit on peek itself; the per-queue read budget gates it at the request layer and a denial there returns 429 with `Retry-After` from the throttle code, surfacing in the existing `Throttling` outcome on the read-side counter).
+The label cardinality budget is the same `sqsMaxTrackedQueues = 512` cap that already governs the depth gauges — the same `admitForCounterBudget` helper from PR #743 r3 handles the collapse to `_other`.
+
+Peek's `throttled` outcome covers exhaustion of the dedicated admin-peek bucket introduced in §3.1 (`adminPeekRPS = 5`, `adminPeekBurst = 20`). Codex r3 caught that an earlier draft of this section omitted the throttled outcome — implementers following the enum literally would have classified expected rate-limit rejections as `internal_error`, making the metric unable to distinguish backend faults from operator pagination loops. Peek has no `purge_in_progress` outcome (the 60-second rate-limit is purge-specific; peek is read-only and doesn't share that state).
 
 ---
 
