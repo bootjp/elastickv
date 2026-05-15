@@ -58,6 +58,11 @@ func newEncryptionEndpointFlags(fs *flag.FlagSet) *encryptionEndpointFlags {
 	}
 }
 
+// dialEncryption opens a gRPC client. The context argument is
+// reserved for the PR-B auth path (TLS handshake + token attach);
+// grpc.NewClient itself is non-blocking and ignores the context.
+// Per-RPC timeouts come from the caller's request context, not
+// from this dial.
 func dialEncryption(_ context.Context, flags *encryptionEndpointFlags) (pb.EncryptionAdminClient, func() error, error) {
 	conn, err := grpc.NewClient(*flags.endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

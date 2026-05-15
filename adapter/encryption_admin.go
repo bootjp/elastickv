@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -186,7 +187,11 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 // observability tests in this PR. PR-B will add a leader-only
 // guard so a follower with a stale sidecar cannot poison the
 // recovery path of a peer with an even-staler sidecar.
-func (s *EncryptionAdminServer) ResyncSidecar(_ context.Context, _ *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
+func (s *EncryptionAdminServer) ResyncSidecar(_ context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
+	// req.CallerFullNodeId is intentionally unused in PR-A; PR-B
+	// will read it from the leader-only guard to scope the
+	// writer-registry projection to that specific caller per §5.5.
+	_ = req
 	if s.sidecarPath == "" {
 		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
 	}
@@ -220,12 +225,17 @@ func (s *EncryptionAdminServer) appliedIndex(sidecarValue uint64) uint64 {
 // already rejected non-decimal keys and key_id 0, so the
 // strconv.ParseUint here can only fail on values the validator
 // missed — treat any such failure as a programming error and skip
-// the entry rather than letting the RPC fall over.
+// the entry rather than letting the RPC fall over. The skip is
+// logged at error level so a future sidecar-format migration that
+// outpaces validateSidecar is visible in operator logs rather
+// than appearing as a silently shrunken wrapped_deks_by_id map.
 func wrappedDEKMap(sc *encryption.Sidecar) map[uint32][]byte {
 	out := make(map[uint32][]byte, len(sc.Keys))
 	for idStr, key := range sc.Keys {
 		id, err := parseSidecarKeyID(idStr)
 		if err != nil {
+			slog.Error("encryption: dropping malformed sidecar key id from wrapped_deks_by_id",
+				"id", idStr, "err", err)
 			continue
 		}
 		dup := make([]byte, len(key.Wrapped))

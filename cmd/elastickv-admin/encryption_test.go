@@ -179,7 +179,15 @@ func startCustomEncryptionAdminTestServer(t *testing.T, impl pb.EncryptionAdminS
 	}
 	srv := grpc.NewServer()
 	pb.RegisterEncryptionAdminServer(srv, impl)
-	go func() { _ = srv.Serve(lis) }()
+	go func() {
+		// Surface unexpected Serve failures so a listener bind
+		// or accept error before the test calls GracefulStop is
+		// visible. GracefulStop returns nil from Serve, so the
+		// happy-path exit prints nothing.
+		if err := srv.Serve(lis); err != nil {
+			t.Logf("encryption-admin test server Serve: %v", err)
+		}
+	}()
 	t.Cleanup(func() {
 		done := make(chan struct{})
 		go func() { srv.GracefulStop(); close(done) }()

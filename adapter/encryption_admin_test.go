@@ -224,6 +224,15 @@ func TestEncryptionAdmin_ResyncSidecar_ShipsWrappedDEKs(t *testing.T) {
 	if string(got.WrappedDeksById[3]) != "ws" || string(got.WrappedDeksById[4]) != "wr" {
 		t.Errorf("wrapped=%v, want id3=ws id4=wr", got.WrappedDeksById)
 	}
+	// Mirror the GetSidecarState contract: non-nil empty map until
+	// Stage 7 wires the writer registry. Locks in the §5.5 promise
+	// so a future change to the field cannot silently degrade to nil.
+	if got.WriterRegistryForCaller == nil {
+		t.Errorf("WriterRegistryForCaller=nil, want empty non-nil map (PR-A contract)")
+	}
+	if len(got.WriterRegistryForCaller) != 0 {
+		t.Errorf("WriterRegistryForCaller=%v, want empty in PR-A", got.WriterRegistryForCaller)
+	}
 }
 
 func TestEncryptionAdmin_MutatingRPCs_AreUnimplemented(t *testing.T) {
