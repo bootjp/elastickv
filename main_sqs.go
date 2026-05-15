@@ -106,7 +106,7 @@ func loadSQSStaticCredentials(credentialsFile, sqsAddr string) (map[string]strin
 	if sqsAddr == "" {
 		return nil, nil
 	}
-	return loadSigV4StaticCredentialsFile(credentialsFile, "sqs") //nolint:wrapcheck // already wraps internally
+	return loadSigV4StaticCredentialsFile(credentialsFile, "sqs")
 }
 
 // closeSQSListenerOnError closes the listener after another startup

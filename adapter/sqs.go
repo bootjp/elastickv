@@ -349,6 +349,11 @@ func (s *SQSServer) Stop() {
 		s.reaperCancel()
 	}
 	if s.httpServer != nil {
+		// http.Server.Shutdown returns immediately when Serve was
+		// never called (listenless mode — no public listener was
+		// constructed), so this is a no-op for admin-only
+		// deployments. The branch is still gated on httpServer
+		// being non-nil because Shutdown panics on a nil receiver.
 		_ = s.httpServer.Shutdown(context.Background())
 	}
 }

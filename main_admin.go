@@ -182,8 +182,15 @@ func newAdminLeaderProbe(coordinate kv.Coordinator) admin.LeaderProbe {
 // Same architectural reasoning as newDynamoTablesSource and
 // newBucketsSource: the bridge stays in this file (rather than
 // internal/admin) so the admin package stays free of the heavy
-// adapter-package dependency tree. Returns nil when sqsServer is nil
-// so admin.NewServer leaves /admin/api/v1/sqs/* off the wire.
+// adapter-package dependency tree.
+//
+// Production always passes a non-nil *SQSServer now that
+// startSQSServer constructs a listenless server when sqsAddress is
+// empty (admin endpoints don't need the public SigV4 listener).
+// The nil guard below exists only for tests that build an admin
+// server without a SQS adapter wired in; an unreachable-in-prod
+// nil here would otherwise crash the admin handler chain instead
+// of cleanly omitting /admin/api/v1/sqs/* from the wire.
 func newSqsQueuesSource(sqsServer *adapter.SQSServer) admin.QueuesSource {
 	if sqsServer == nil {
 		return nil
