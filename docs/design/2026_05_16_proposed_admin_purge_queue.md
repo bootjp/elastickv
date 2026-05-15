@@ -363,15 +363,21 @@ Below the table: a page-size selector (20 / 50 / 100), a Refresh button, and Nex
 
 **Copy as JSON payload schema.** The clipboard payload is the exact wire shape of a single `AdminPeekedMessage` entry (top-level keys: `message_id`, `body`, `body_truncated`, `body_original_size`, `sent_timestamp`, `receive_count`, `group_id`, `deduplication_id`, `attributes`) plus a wrapper `{"schema_version": 1, "queue": "<name>", "exported_at": "<ISO8601>", "message": { … }}`. The `schema_version` is what downstream tooling pins so a future change to the export format (e.g. multi-message JSONL bundle) does not silently break exporters. Operator workflows that pipe this into a recovery tool can rely on the schema not shifting under them.
 
-**Full-body fetch in the detail modal.** `AdminPeekQueue` walks the visibility index from a cursor; it has no by-message-id targeted fetch. When a row's `body_truncated` is true on the list response, opening the detail modal therefore **re-issues the current page's peek request** (same cursor, same limit) with `body_max_bytes` set to **`sqsMaximumAllowedMaximumMessageSize` (262144 = 256 KiB)** — the cap on SQS's stored body size. The SPA then locates the target message by `message_id` in the re-fetched response and renders the full body in the modal.
+**Full-body fetch in the detail modal.** `AdminPeekQueue` walks the visibility index from a cursor; it has no by-message-id targeted fetch.
 
-Claude r4 flagged that the cap matters at scale: a 100-row page with every message at 256 KiB stretches to a 25 MiB response. The SPA mitigates by:
+**The list request itself fetches full bodies.** When the SPA issues the list-view peek it sets `body_max_bytes = sqsMaximumAllowedMaximumMessageSize` (= 262 144, the cap on SQS's stored body size) so every row arrives at full fidelity. Opening the detail modal then renders directly from the row already in memory — there is **no re-peek round-trip on modal open**. This eliminates the entire class of "the row might have disappeared between list and modal open" failure modes (concurrent purge, ReceiveMessage by another client, message becoming invisible because its visibility timer started, leader step-down, etc.). Codex r5 flagged the earlier draft's re-peek mechanism as not actually guaranteeing the row was still present.
 
-1. Defaulting the list-view page size to 20 (not 100), so the worst-case detail-modal re-peek is 5 MiB.
-2. Tracking the per-row `body_original_size` from the list response and warning the operator before the re-peek if the cumulative re-peek size exceeds 20 MiB — they can switch to page size 20 (or smaller) and re-page to the target message first.
-3. Caching the re-peek result so opening other rows on the same page does not re-trigger the full-body fetch.
+Claude r4 raised the cost concern: a 100-row page with every message at 256 KiB stretches to a 25 MiB response. The SPA mitigates by:
 
-Codex r3 flagged that an earlier 64-KiB cap on BodyMaxBytes broke the triage guarantee for messages between 64 KiB and 256 KiB; raising the cap to 262144 and committing to the re-peek mechanism (rather than a non-existent by-id fetch) resolves the gap. A future PR can add a `?message_id=…` filter to `AdminPeekQueue` for targeted re-fetch if the page-size–driven approach proves too coarse in production; for now the simpler design holds.
+1. **Defaulting page size to 20** (not 100), keeping the worst-case list response at 5 MiB — well under typical network and JSON-parse budgets.
+2. **Tracking cumulative response size on the page-size selector.** When the operator selects 50 or 100, the SPA derives an estimate from the queue summary's `Counters.Visible × max(BodyOriginalSize from previous page, 4 KiB)` and shows a warning ("This page may exceed 25 MiB; messages > 256 KiB are not stored. Continue?") before issuing the larger request. Operators can dismiss and proceed if they understand the cost; the warning is informational, not blocking.
+3. **Row body sizes are visible** in the list view (the `Size` column rendered from `body_original_size`) so an operator can scroll a 20-row page and decide whether to switch to size 50 / 100 or keep paginating.
+
+The list-view full-body strategy trades initial fetch size for **modal-open consistency** — the operator sees the message exactly as it was at peek time, even if the queue churns underneath them. The trade is right for triage: the entire point of Peek is to capture a point-in-time view of what is currently in the DLQ, and a modal that fails to load the message because it has since been purged is worse than a slightly larger initial fetch.
+
+A future PR can add a `?message_id=…` filter to `AdminPeekQueue` for targeted refresh-on-demand if production needs it (e.g., for a queue with many > 100 KiB messages where the operator wants to inspect one specific message without paying for the rest of the page). For now the full-page approach is simpler and consistency-correct.
+
+Codex r3 flagged that an earlier 64-KiB cap on BodyMaxBytes broke the triage guarantee for messages between 64 KiB and 256 KiB; raising the cap to 262144 and committing to the eager-fetch model resolves the gap.
 
 **Purge button.** Sits in the page header next to the existing Delete button. Two states:
 
@@ -546,6 +552,6 @@ The proposal covers the full triage-then-clear DLQ workflow:
 
 - **`AdminPeekQueue`** — non-destructive sample of currently-visible messages so operators can see what's actually in a DLQ before deciding what to do with it. Pure read, no receive-count bump, no visibility-timer change, no receipt handles minted. Cursor-paginated; leader-only to keep the visibility index snapshot consistent.
 - **`AdminPurgeQueue`** — wraps the existing `purgeQueueWithRetry` in the same shape `AdminDeleteQueue` already uses for delete. Inherits the SigV4 path's 60-second meta-stored rate limit so the two surfaces stay in lockstep.
-- **`AdminQueueSummary.IsDLQ` / `DLQSources`** — reverse-scan the catalog (prefix scan over `SqsQueueMetaPrefix`, one storage round-trip) so the SPA can frame the Messages tab and the Purge confirmation appropriately. Reverse-index deferred until profiling shows it.
+- **`AdminQueueSummary.IsDLQ` / `DLQSources`** — reverse-scan the catalog with a **paginated prefix scan** over `SqsQueueMetaPrefix` (the same loop shape `scanQueueNames` uses today — `ceil(N / sqsQueueScanPageLimit)` round-trips, NOT a single page) so the SPA can frame the Messages tab and the Purge confirmation appropriately. Reverse-index deferred until profiling shows it. Codex r5 caught an earlier draft of this summary that said "one storage round-trip" — a regression to a single `ScanAt` would silently miss DLQ source links once the catalog exceeds 1024 queues; §3.3 has the full description.
 
 The user-visible feature is a Messages tab + Purge button on the queue detail page. Each backend primitive is small (Peek is bounded-page reads; Purge is one OCC commit) and they reuse the existing admin auth/audit/forwarding pipeline, so the design surface is intentionally small relative to the operator-facing value.
