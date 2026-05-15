@@ -1,4 +1,4 @@
-# Admin Purge Queue (DLQ-Aware) for the SQS Web Console
+# Admin Queue Peek and Purge (DLQ-Aware) for the SQS Web Console
 
 **Status:** Proposed
 **Author:** bootjp
@@ -8,11 +8,19 @@
 
 ## 1. Background and Motivation
 
-The elastickv SQS Web Console (`web/admin/src/pages/SqsDetail.tsx`) currently lets an operator **list, describe, and delete** queues, but not **purge their contents**. A queue that should keep existing (its name, ARN, RedrivePolicy, tags) but whose messages should be drained has no path through the admin SPA — the operator must drop to the AWS CLI or `cmd/elastickv-admin`, SigV4-sign a `PurgeQueue` call against the public SQS endpoint, and re-authenticate against whatever credentials store backs that path.
+The elastickv SQS Web Console (`web/admin/src/pages/SqsDetail.tsx`) currently lets an operator **list, describe, and delete** queues, but not **inspect or purge their contents**. Two operator workflows are blocked:
 
-The primary use case is **clearing a Dead-Letter Queue (DLQ)**. Failed messages routed to a DLQ accumulate indefinitely once `RedrivePolicy.maxReceiveCount` fires: the redriver in `adapter/sqs_redrive.go` moves the message and the DLQ has no automatic eviction. After a long-running incident has been triaged and operators have decided the DLQ contents are no longer useful (root cause addressed, messages already exported to another system, etc.), they need to clear the DLQ without dropping the queue itself — recreating it would invalidate the source queue's RedrivePolicy ARN reference for the duration of the recreate.
+1. **Triage a DLQ before purging it.** Failed messages routed to a DLQ accumulate indefinitely once `RedrivePolicy.maxReceiveCount` fires; the redriver in `adapter/sqs_redrive.go` moves the message and the DLQ has no automatic eviction. Before clearing the backlog the operator needs to see what's actually in there — message bodies, sent timestamps, group IDs, receive counts — to decide whether the messages are still useful (e.g. should be exported to another system) or genuinely safe to drop. Today they must drop to the AWS CLI or `cmd/elastickv-admin`, SigV4-sign `ReceiveMessage` calls against the public endpoint, and re-authenticate against whatever credentials store backs that path. Worse, `ReceiveMessage` is destructive in the sense that it bumps the receive count and starts the visibility timer — every triage glance can advance a message toward purge eligibility under the very RedrivePolicy that put it in the DLQ in the first place.
 
-This document proposes a `AdminPurgeQueue` admin RPC, a corresponding HTTP endpoint, and an SPA button on the queue detail page. The feature works for any queue (DLQ or not) because the underlying mechanism — generation bump via `purgeQueueWithRetry` — is identical; the **UI is DLQ-aware** so the operator gets the right framing and warnings when the queue is in fact a DLQ.
+2. **Drain a DLQ (or any queue) without dropping the queue itself.** Once the operator has triaged, they need to clear the DLQ. The queue itself must keep existing — its ARN is referenced by the source queue's RedrivePolicy, and recreating it would invalidate that reference for the duration of the recreate.
+
+This document proposes:
+
+- `AdminPeekQueue` — read-only, non-destructive sample of a queue's messages. Surfaces body / attributes / timestamps / receive counts without changing visibility or issuing receipt handles.
+- `AdminPurgeQueue` — same wire-level guarantee as the SigV4 `PurgeQueue` (generation bump via `purgeQueueWithRetry`), exposed through the admin auth path.
+- Corresponding HTTP endpoints and SPA views.
+
+Both features work for any queue. The **UI is DLQ-aware** so the operator gets the right framing and warnings when the queue is in fact a DLQ (e.g. "This queue is the DLQ for orders, payments — these are messages that failed processing"). Peek + Purge cover the full triage-then-clear workflow without leaving the Web Console.
 
 ---
 
@@ -20,29 +28,99 @@ This document proposes a `AdminPurgeQueue` admin RPC, a corresponding HTTP endpo
 
 ### 2.1 Goals
 
-1. **Admin-side purge** — an `AdminPurgeQueue(ctx, principal, name) error` method on `*adapter.SQSServer` that drains the queue's messages while leaving the queue meta, ARN, RedrivePolicy, and tags intact. Mirrors `AdminDeleteQueue`'s shape so the admin authorization, leader check, and audit pattern stay parallel.
-2. **HTTP endpoint** at `DELETE /admin/api/v1/sqs/queues/{name}/messages` — RESTful "delete messages, not the queue". The collection root semantics avoid collision with the existing `DELETE /admin/api/v1/sqs/queues/{name}` (delete the queue itself).
-3. **SPA button** on the queue detail page (`web/admin/src/pages/SqsDetail.tsx`) labelled either "Purge messages" or "Purge DLQ" depending on whether the queue is a DLQ. Confirmation modal requires typing the queue name, mirroring the existing Delete confirmation.
-4. **DLQ awareness** — `AdminQueueSummary` gains two fields:
+1. **Admin-side peek** — an `AdminPeekQueue(ctx, principal, name, opts) ([]AdminPeekedMessage, string, error)` method on `*adapter.SQSServer` that returns a non-destructive sample of currently-visible messages. The call does NOT bump receive counts, does NOT start a visibility timer, and does NOT issue receipt handles — it is a pure read over the message keyspace. `opts.Limit` caps results (default 20, max 100); the returned continuation token lets the SPA paginate.
+2. **Admin-side purge** — an `AdminPurgeQueue(ctx, principal, name) error` method that drains the queue's messages while leaving the queue meta, ARN, RedrivePolicy, and tags intact. Mirrors `AdminDeleteQueue`'s shape so the admin authorization, leader check, and audit pattern stay parallel.
+3. **HTTP endpoints**:
+   - `GET    /admin/api/v1/sqs/queues/{name}/messages?limit=N&cursor=C` — peek (non-destructive)
+   - `DELETE /admin/api/v1/sqs/queues/{name}/messages`                  — purge
+   The collection root semantics keep the queue itself (`{name}`) endpoint distinct from operations on its messages (`{name}/messages`).
+4. **SPA views** on the queue detail page (`web/admin/src/pages/SqsDetail.tsx`):
+   - **Messages tab**: paginated table of peeked messages (body preview, sent time, group ID for FIFO, receive count, message ID). Body is truncated to 256 chars in the row; a row click opens a modal with the full body + every attribute. Page size selector (20 / 50 / 100). "Refresh" button re-fetches the current page.
+   - **Purge button**: labelled either "Purge messages" or "Purge DLQ" depending on whether the queue is a DLQ. Confirmation modal requires typing the queue name, mirroring the existing Delete confirmation.
+5. **DLQ awareness** — `AdminQueueSummary` gains two fields:
    - `IsDLQ bool` — true iff at least one other queue's `RedrivePolicy.deadLetterTargetArn` resolves to this queue.
-   - `DLQSources []string` — the source-queue names that point at this queue. The SPA renders these as a chip list so the operator can confirm they understand what queue feeds the DLQ before purging.
-5. **Same AWS-shaped error mapping** as the SigV4 path — purging more than once per 60 seconds returns the SQS `PurgeQueueInProgress` semantics that `tryPurgeQueueOnce` already enforces. The admin response surfaces it as a structured `429 Too Many Requests` JSON payload (`{"code":"PurgeQueueInProgress", "retry_after_seconds":N}`).
-6. **Audit** — same `slog` audit line as `AdminDeleteQueue` (`admin.sqs.purge_queue` with principal subject, queue name, generation before/after).
-7. **Read-only role hard-fails** with `ErrAdminForbidden`. The role check uses the live role store (`principalForWrite`), not the JWT-cached role, matching the existing pattern in `internal/admin/sqs_handler.go`.
+   - `DLQSources []string` — the source-queue names that point at this queue. The SPA renders these as a chip list on the detail page so the operator can confirm they understand what queue feeds the DLQ before purging.
+6. **Same AWS-shaped error mapping** as the SigV4 path — purging more than once per 60 seconds returns the SQS `PurgeQueueInProgress` semantics that `tryPurgeQueueOnce` already enforces. The admin response surfaces it as a structured `429 Too Many Requests` JSON payload (`{"code":"PurgeQueueInProgress", "retry_after_seconds":N}`).
+7. **Audit** — `admin.sqs.purge_queue` (subject, role, queue, generation_before, generation_after). Peek is a read and does NOT generate an audit line per call (the SPA polls; per-poll audit would drown the log) but the admin handler emits the standard request-log line with `route` / `subject` / `status_code` so the call is still traceable.
+8. **Read-only role can peek but not purge.** Peek is gated by `principalForRead` (same as List / Describe); purge is gated by `principalForWrite`. Both checks use the live role store, not the JWT-cached role, matching the existing pattern in `internal/admin/sqs_handler.go`.
 
 ### 2.2 Non-Goals
 
-1. **Redrive ("StartMessageMoveTask")** — moving DLQ messages back to the source queue is a separate feature with very different semantics (per-message dispatch, throttling, partial-success handling). Tracked as future work in `2026_04_26_partial_sqs_split_queue_fifo.md` extensions / a future RFC. The button on the SPA will not pretend to redrive.
+1. **Redrive ("StartMessageMoveTask")** — moving DLQ messages back to the source queue is a separate feature with very different semantics (per-message dispatch, throttling, partial-success handling). The triage Peek view enables an operator to make the redrive-vs-purge decision; the actual redrive automation is tracked as future work and a future RFC.
 2. **Filtered purge** ("purge messages older than X", "purge messages matching attribute Y"). The wire-level `PurgeQueue` is all-or-nothing and we mirror that; selective deletion belongs to a future `DeleteMessageBatch` automation. AWS itself only offers all-or-nothing `PurgeQueue`.
-3. **Cross-queue bulk purge** ("purge every DLQ in this region"). Operators do this themselves with a script that calls the admin endpoint N times; building a bulk API would require new throttling rules and is not the user-facing pain point.
-4. **Per-message inspection** ("Peek the DLQ before purging"). The base SQS adapter's design doc §13 (`2026_04_24_proposed_sqs_compatible_adapter.md`) already mentions a console Peek tab; whether that ships is independent of this proposal.
-5. **Restoring purged messages.** A purge is final by design — the generation bump makes the old messages unreachable and the reaper eventually deletes them. Operators who need a recovery window must export the queue first (out of scope here).
+3. **Per-message deletion from the Peek view** ("delete this one message from the DLQ"). A `Delete` button next to each peeked row sounds useful but the receipt-handle / generation interplay (Peek doesn't mint receipt handles; per-message Delete needs the message's primary key, not its handle) makes the wire shape diverge from AWS. Future RFC if operators ask for it; the all-or-nothing purge plus the Peek view covers the most common triage workflows.
+4. **In-flight (invisible) messages in the Peek view.** Peek shows currently-visible messages only — the visibility index on the leader points at `visible_at <= now`. In-flight messages are by definition rented out to some consumer; surfacing them in Peek would confuse "messages I can act on" with "messages another worker is processing". A future PR can add an `?include_in_flight=true` query param with the timer-remaining shown per row.
+5. **Cross-queue bulk operations** ("purge every DLQ in this region", "peek across multiple queues"). Operators do this themselves with a script that calls the admin endpoint N times; building a bulk API would require new throttling rules and is not the user-facing pain point.
+6. **Restoring purged messages.** A purge is final by design — the generation bump makes the old messages unreachable and the reaper eventually deletes them. Operators who need a recovery window must Peek-and-export first (the Peek view's full-body modal includes a "Copy as JSON" action so manual export is one click per message).
 
 ---
 
 ## 3. Design
 
-### 3.1 Backend: AdminPurgeQueue RPC
+### 3.1 Backend: AdminPeekQueue RPC
+
+```go
+// AdminPeekMessageOptions controls a peek call.
+type AdminPeekMessageOptions struct {
+    // Limit caps the number of messages returned. Clamped to
+    // [1, 100]; 0 means "use default (20)".
+    Limit int
+    // Cursor is an opaque continuation token from a prior call;
+    // empty means "start from the front of the visibility index".
+    Cursor string
+    // BodyMaxBytes truncates message bodies at this length to bound
+    // response size. Clamped to [256, 65536]; 0 means "use default
+    // (4096)". The full body is always retained on the server; only
+    // the wire representation is truncated.
+    BodyMaxBytes int
+}
+
+// AdminPeekedMessage is one row in the peek result.
+type AdminPeekedMessage struct {
+    MessageID        string
+    Body             string   // truncated per opts.BodyMaxBytes
+    BodyTruncated    bool     // true when Body was cut
+    BodyOriginalSize int64    // bytes in the original body, for display
+    SentTimestamp    time.Time
+    ReceiveCount     int32    // ApproximateReceiveCount
+    GroupID          string   // FIFO MessageGroupId, empty for standard
+    DeduplicationID  string   // FIFO MessageDeduplicationId, empty for standard
+    Attributes       map[string]string // SQS message attributes
+}
+
+// AdminPeekQueue returns a non-destructive sample of currently-visible
+// messages in name. Receive counts are NOT incremented and visibility
+// timers are NOT started — peek is a pure read over the leader's
+// visibility index. Returns the rows plus a continuation cursor that
+// the caller passes back as opts.Cursor to fetch the next page.
+//
+// Sentinel errors:
+//   - ErrAdminForbidden     — peek requires read role; nil principal is denied
+//   - ErrAdminNotLeader     — peek runs on the leader (consistent with the
+//                             visibility index's leader-only writer; a follower
+//                             read would race the leader's index updates)
+//   - ErrAdminSQSNotFound   — queue absent
+//   - ErrAdminSQSValidation — empty / malformed name, invalid cursor
+func (s *SQSServer) AdminPeekQueue(
+    ctx context.Context,
+    principal AdminPrincipal,
+    name string,
+    opts AdminPeekMessageOptions,
+) (rows []AdminPeekedMessage, nextCursor string, err error)
+```
+
+**Implementation.** Peek opens a read transaction at the leader's next read timestamp (`nextTxnReadTS`) and walks the visibility index for the queue. The visibility index is already keyed by `(queue_name, generation, visible_at, message_id)` so the scan naturally yields visible-now messages in `visible_at` order — exactly the order `ReceiveMessage` would deliver. The walk:
+
+1. Decodes the cursor (`encoding/json` over a small struct `{Generation uint64, LastKey []byte}`); empty cursor means "start at the front".
+2. Issues a bounded `ScanAt` over the visibility-index prefix up to `Limit` keys; for each key fetches the message record via `GetAt` (one round-trip per row — the visibility index stores only the (visible_at, msg_id) pair, not the body).
+3. Truncates bodies to `BodyMaxBytes`, records `BodyTruncated` / `BodyOriginalSize` for the SPA to render "showing first 4 kB of 12 kB" labels.
+4. Builds the next cursor from the last scanned key; returns it as an opaque string for the SPA.
+
+Cost is `O(Limit)` round-trips against Pebble at peek time — tiny for the bounded result sets the SPA uses. The bound on `Limit` (max 100) prevents an operator script from accidentally issuing million-row peeks against the leader. Throttle: peek shares the per-queue read-side budget the SigV4 `ReceiveMessage` path consults (see `2026_04_26_proposed_sqs_per_queue_throttling.md` §4.2) so a tight peek loop cannot starve real consumers.
+
+**Why leader-only.** The visibility index is updated by the leader as part of every `SendMessage` / `ReceiveMessage` / `DeleteMessage` commit. A follower read could see an index entry whose underlying message record was already deleted (race between the leader's apply and the follower's lease-read fence). Peek is rare and bursty rather than steady-state, so the lease-read fast path's win doesn't apply; running it on the leader keeps the snapshot internally consistent.
+
+### 3.2 Backend: AdminPurgeQueue RPC
 
 ```go
 // AdminPurgeQueue is the SigV4-bypass counterpart to purgeQueue.
@@ -69,7 +147,7 @@ Implementation reuses `purgeQueueWithRetry` verbatim — the SigV4 wire handler 
 
 The `PurgeQueueInProgress` mapping: `tryPurgeQueueOnce` returns an `sqsAPIError` with code `PurgeQueueInProgress` and HTTP 400 when the 60-second window is active. The admin wrapper sniffs this via a new helper `isSQSAdminPurgeInProgress(err)` (parallel to the existing `isSQSAdminQueueDoesNotExist`) and returns `ErrAdminSQSPurgeInProgress`. The HTTP handler maps that to `429 Too Many Requests` with `Retry-After` header populated from the meta's `LastPurgedAtMillis + 60s - now()`.
 
-### 3.2 Backend: AdminQueueSummary extensions
+### 3.3 Backend: AdminQueueSummary extensions
 
 Two new fields on `AdminQueueSummary`:
 
@@ -87,42 +165,87 @@ type AdminQueueSummary struct {
 }
 ```
 
-`AdminDescribeQueue` populates `IsDLQ` / `DLQSources` by reverse-scanning the catalog: walk every queue's meta, parse its `RedrivePolicy` via `parseRedrivePolicy` (already in `adapter/sqs_redrive.go:43`), match the resolved DLQ target against `name`. The scan is bounded by the catalog cap that `scanApproxCounters` already enforces, so cost is `O(known queues)` per Describe call — the same order the existing counter scan pays.
+`AdminDescribeQueue` populates `IsDLQ` / `DLQSources` by reverse-scanning the catalog. Implementation: a single `ScanAt` over the queue-meta prefix (`SqsQueueMetaPrefix`, the prefix `scanQueueNames` already walks) returns all queue meta records in one storage round-trip; the handler then unmarshals each, runs `parseRedrivePolicy` (already in `adapter/sqs_redrive.go:43`) against the queue's `RedrivePolicy` attribute, and matches the resolved DLQ target against `name`. Cost is **one Pebble prefix scan + O(N) unmarshal-and-string-compare in memory** — not O(N) point lookups. The catalog cap (`sqsQueueScanPageLimit`, paged) already bounds the scan exactly as `scanQueueNames` does today, so the worst-case load is the same one the existing admin list endpoint pays per request.
 
-A future optimization could maintain a reverse-index (`!sqs|catalog|dlq_source|<dlq_name>|<source_name>`) updated by `CreateQueue` / `SetQueueAttributes` / `DeleteQueue`. Out of scope for this PR; the reverse-scan is correct and simple, and the catalog cap (`sqsCatalogScanCap = 1024`) already bounds the work. The reverse-index can land later if profiling shows the Describe path is hot.
+A future optimization maintains a reverse-index (`!sqs|catalog|dlq_source|<dlq_name>|<source_name>`) updated transactionally by `CreateQueue` / `SetQueueAttributes` / `DeleteQueue`, reducing Describe-time cost to O(direct sources). Out of scope for this PR; the reverse-scan is correct and the prefix-scan formulation is fast enough that the reverse-index only pays for itself in deployments with many thousands of queues — Gemini's r1 review on this proposal flagged the scan cost, and the reverse-index is the documented next step if production profiling shows the Describe path is hot.
 
-### 3.3 Backend: HTTP endpoint
+### 3.4 Backend: HTTP endpoints
 
-| Method   | Path                                              | Purpose                                |
-|----------|---------------------------------------------------|----------------------------------------|
-| `DELETE` | `/admin/api/v1/sqs/queues/{name}` *(existing)*    | Delete the queue itself                |
-| `DELETE` | `/admin/api/v1/sqs/queues/{name}/messages` *(new)*| Purge the queue's messages, keep meta  |
+| Method   | Path                                                                | Purpose                                |
+|----------|---------------------------------------------------------------------|----------------------------------------|
+| `DELETE` | `/admin/api/v1/sqs/queues/{name}` *(existing)*                      | Delete the queue itself                |
+| `GET`    | `/admin/api/v1/sqs/queues/{name}/messages?limit=N&cursor=C` *(new)* | Peek a sample of visible messages      |
+| `DELETE` | `/admin/api/v1/sqs/queues/{name}/messages` *(new)*                  | Purge all messages, keep meta intact   |
 
-The router in `internal/admin/sqs_handler.go` already path-prefixes on `pathSqsQueues = "/admin/api/v1/sqs/queues"`. The new endpoint is dispatched by suffix match: `strings.HasSuffix(trailing, "/messages")` after the `{name}` segment is parsed. A new handler `handlePurge` lives in `sqs_handler.go` parallel to `handleDelete`, calling `source.PurgeQueue(ctx, name)` against the `QueuesSource` interface (which is implemented by `sqsQueuesBridge.PurgeQueue` in `main_admin.go`, which itself wraps `AdminPurgeQueue`).
+Method-based dispatch on the same `/messages` sub-resource: `GET` → peek, `DELETE` → purge. The router in `internal/admin/sqs_handler.go` already path-prefixes on `pathSqsQueues = "/admin/api/v1/sqs/queues"`. The new endpoint is dispatched by **path-segment match, not suffix match**: after parsing the `{name}` segment, the handler splits the remaining trailing path into segments (using `path.Clean` first to normalise away leading / trailing / duplicated slashes), and accepts the path iff the trailing segments are exactly `["messages"]`. This rejects `/messages/` (one extra empty segment after Clean), `/messages/foo` (sub-resource we don't define), and `/Messages` (case-sensitive AWS naming) without relying on suffix heuristics. Two new handlers `handlePeek` (GET) and `handlePurge` (DELETE) live in `sqs_handler.go` parallel to `handleDelete`, calling `source.PeekQueue(ctx, name, opts)` / `source.PurgeQueue(ctx, name)` against the `QueuesSource` interface (implemented by `sqsQueuesBridge` in `main_admin.go`, which wraps `AdminPeekQueue` / `AdminPurgeQueue`). The path-segment matcher is the same shape DynamoHandler already uses for its sub-resource routing — keeping the two parallel reduces the cognitive load of operators who reason about both surfaces.
+
+**Peek response shape** (JSON):
+
+```json
+{
+  "messages": [
+    {
+      "message_id": "01JCXR8V…",
+      "body": "{\"orderId\": 42, …}",
+      "body_truncated": false,
+      "body_original_size": 142,
+      "sent_timestamp": "2026-05-16T09:42:11Z",
+      "receive_count": 3,
+      "group_id": "tenant-7",
+      "deduplication_id": "01JCXR8V-dedup",
+      "attributes": { "Source": "checkout", "Retry": "2" }
+    },
+    …
+  ],
+  "next_cursor": "eyJHZW5lcmF0aW9uIjoxLCJMYXN0S2V5IjoiZXhhbXBsZSJ9"
+}
+```
+
+`next_cursor` is omitted when no further pages exist. 404 / 403 / 503 use the existing structured admin-error envelope.
 
 Response shape on success: `204 No Content`. Same as `handleDelete`. On `ErrAdminSQSPurgeInProgress`: `429 Too Many Requests` with body `{"code":"PurgeQueueInProgress", "retry_after_seconds":42}` and `Retry-After: 42` header.
 
-### 3.4 Frontend: SqsDetailPage button
+### 3.5 Frontend: SqsDetailPage Messages tab + Purge button
 
-Two states for the button:
+The queue detail page gains two new pieces of UI on top of the existing attributes / counters / delete-button layout:
+
+**Messages tab.** A new tab labelled "Messages" sits next to the existing "Overview" view. On mount it issues `GET /admin/api/v1/sqs/queues/{name}/messages?limit=20` and renders the result as a table:
+
+| Column            | Source                                              | Rendering                                                                                                                          |
+|-------------------|-----------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| Message ID        | `message_id`                                        | first 8 chars in monospace; full ID in tooltip + copy-on-click                                                                     |
+| Sent              | `sent_timestamp`                                    | relative ("2m ago") + absolute ISO in tooltip                                                                                      |
+| Group ID          | `group_id` (FIFO only; column hidden for standard)  | as-is in monospace                                                                                                                 |
+| Receive count     | `receive_count`                                     | plain integer; muted styling when 0                                                                                                |
+| Body preview      | `body` (already truncated by backend)               | first 96 chars; "…" suffix when `body_truncated`. Row click opens detail modal.                                                    |
+| Size              | `body_original_size`                                | human-readable ("1.4 kB") so operators can spot oversized messages                                                                 |
+
+Below the table: a page-size selector (20 / 50 / 100), a Refresh button, and Next / Previous controls driven by the cursor. Detail modal shows full body + every attribute + the timestamps; a "Copy as JSON" button copies the row's full record to the clipboard for manual export.
+
+**Purge button.** Sits in the page header next to the existing Delete button. Two states:
 
 | Queue type   | Button label          | Confirmation copy                                                                                                                           |
 |--------------|-----------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
 | Not a DLQ    | "Purge messages"      | "This will permanently delete every message in **{name}**. The queue itself remains. Type **{name}** to confirm."                            |
 | Is a DLQ     | "Purge DLQ"           | "This queue is the DLQ for **{sources}**. Purging deletes every failed message routed here. Type **{name}** to confirm."                     |
 
-The button sits next to the existing "Delete queue" button. The confirmation flow reuses the `Modal` component already used for Delete. On submit, the SPA `POST`s … actually, `DELETE`s the new endpoint, then refreshes the queue detail. On 429 (PurgeQueueInProgress), the modal stays open and shows the retry-after countdown derived from the response header.
+Confirmation flow reuses the `Modal` component already used for Delete. On submit, the SPA `DELETE`s the new endpoint, then refreshes the queue detail and (if open) the Messages tab. On 429 (PurgeQueueInProgress), the modal stays open and shows the retry-after countdown derived from the response header.
 
-API client gets one new method:
+**API client.** Two new methods on `web/admin/src/api/client.ts`:
 
 ```ts
-// web/admin/src/api/client.ts
+peekQueue(
+  name: string,
+  opts?: { limit?: number; cursor?: string; bodyMaxBytes?: number },
+  signal?: AbortSignal,
+): Promise<{ messages: PeekedMessage[]; nextCursor?: string }>
+
 purgeQueue(name: string): Promise<void>
 ```
 
-mirroring the existing `deleteQueue` shape.
+mirroring the existing `deleteQueue` / `describeQueue` shape. `peekQueue` is `signal`-aware so the SPA can cancel an in-flight peek when the user navigates away or refreshes — matches the existing `useApiQuery` cancellation pattern.
 
-### 3.5 Audit and observability
+### 3.6 Audit and observability
 
 New structured log line at `slog.Info` level (matches `AdminDeleteQueue`):
 
@@ -133,18 +256,21 @@ admin.sqs.purge_queue
   queue=<name>
   generation_before=<n>
   generation_after=<n+1>
-  is_dlq=<bool>
-  dlq_sources=<csv>
 ```
 
-New Prometheus counter on the existing `monitoring.SQSMetrics` registry:
+The audit line stays **lean** — `subject`, `role`, `queue`, and the two generations are everything an operator needs to reconstruct who-purged-what-when. Gemini's r1 review flagged that an earlier draft logged `is_dlq` / `dlq_sources` too; computing those would force every purge to pay the catalog reverse-scan cost (§3.2), turning an O(1) generation bump into O(N). The DLQ relationship is observable separately via `AdminDescribeQueue` at audit-review time, so dragging it into the write path is not worth the cost. If incident-triage workflows turn out to need the DLQ context inline, a future PR can add a `--with-dlq-context` opt-in flag.
+
+Two new Prometheus counters on the existing `monitoring.SQSMetrics` registry:
 
 ```
 elastickv_sqs_admin_purge_queue_total{queue, outcome}
   outcome ∈ {"ok", "forbidden", "not_leader", "not_found", "purge_in_progress", "internal_error"}
+
+elastickv_sqs_admin_peek_queue_total{queue, outcome}
+  outcome ∈ {"ok", "forbidden", "not_leader", "not_found", "internal_error"}
 ```
 
-The label cardinality budget is the same `sqsMaxTrackedQueues = 512` cap that already governs the depth gauges — the same `admitForCounterBudget` helper from PR #743 r3 handles the collapse to `_other`.
+The label cardinality budget is the same `sqsMaxTrackedQueues = 512` cap that already governs the depth gauges — the same `admitForCounterBudget` helper from PR #743 r3 handles the collapse to `_other`. Peek has no `purge_in_progress` outcome (no rate limit on peek itself; the per-queue read budget gates it at the request layer and a denial there returns 429 with `Retry-After` from the throttle code, surfacing in the existing `Throttling` outcome on the read-side counter).
 
 ---
 
@@ -168,41 +294,65 @@ The 60-second rate-limit is **not** an authorization concern (any caller hitting
 
 ## 6. Testing Plan
 
-1. **Unit:** `TestAdminPurgeQueue_*` in `adapter/sqs_admin_test.go`:
+1. **Unit — Purge:** `TestAdminPurgeQueue_*` in `adapter/sqs_admin_test.go`:
    - happy path bumps the generation
    - read-only principal → `ErrAdminForbidden`
    - follower → `ErrAdminNotLeader`
    - missing queue → `ErrAdminSQSNotFound`
    - second purge within 60 s → `ErrAdminSQSPurgeInProgress`
    - empty name → `ErrAdminSQSValidation`
-2. **Unit:** `TestAdminQueueSummary_IsDLQ_*` in `adapter/sqs_admin_test.go`:
+2. **Unit — Peek:** `TestAdminPeekQueue_*` in `adapter/sqs_admin_test.go`:
+   - happy path returns visible messages in `visible_at` order
+   - peek does NOT change receive count (verify via subsequent Describe / ReceiveMessage)
+   - peek does NOT issue receipt handles (verify the returned struct has no handle field; verify no receipt-handle record was committed)
+   - in-flight messages (visibility timer not expired) are NOT returned
+   - delayed messages (DelaySeconds > 0, visible_at > now) are NOT returned
+   - Limit clamping: 0 → default 20; 500 → clamped to 100
+   - Cursor round-trip: peek with empty cursor, then peek with returned cursor → second page non-overlapping with first
+   - Cursor invalid (truncated base64, wrong version) → `ErrAdminSQSValidation`
+   - BodyMaxBytes truncation: long body → `BodyTruncated=true`, `BodyOriginalSize` correct, returned `Body` length == `BodyMaxBytes`
+   - FIFO queue → `GroupID` and `DeduplicationID` populated; standard queue → both empty
+   - read-only principal → succeeds (peek is a read)
+   - nil principal → `ErrAdminForbidden`
+   - follower → `ErrAdminNotLeader`
+   - missing queue → `ErrAdminSQSNotFound`
+3. **Unit — DLQ awareness:** `TestAdminQueueSummary_IsDLQ_*` in `adapter/sqs_admin_test.go`:
    - queue with no inbound RedrivePolicy → `IsDLQ=false, DLQSources=nil`
    - queue referenced by one source → `IsDLQ=true, DLQSources=["source-a"]`
    - queue referenced by two sources → sorted slice
    - queue referenced by itself (paranoid edge) → `IsDLQ=true, DLQSources=["self"]`
-3. **Integration:** `TestSqsHandler_PurgeMessages_*` in `internal/admin/sqs_handler_test.go`:
+4. **Integration:** `TestSqsHandler_Messages_*` in `internal/admin/sqs_handler_test.go`:
+   - `GET /admin/api/v1/sqs/queues/orders/messages?limit=5` returns paginated JSON; `next_cursor` round-trips on a second call
    - `DELETE /admin/api/v1/sqs/queues/orders/messages` against a single-node fixture → 204, generation incremented
-   - 429 with `Retry-After` header on the immediate second call
-   - Bridge bubbles `ErrAdminForbidden` through to 403
-4. **Frontend:** Playwright / RTL test pinning:
-   - button label switches between "Purge messages" and "Purge DLQ" based on `is_dlq`
-   - confirmation modal requires the exact name (case-sensitive, trimmed)
-   - 429 keeps modal open and shows countdown
-5. **Jepsen:** out of scope. Purge has been Jepsen-covered since Phase 2 via the SigV4 path; the admin RPC shares the same `tryPurgeQueueOnce` and inherits the coverage.
+   - 429 with `Retry-After` header on the immediate second purge
+   - peek + purge on same queue: peek shows N rows → purge → peek returns 0 rows
+   - bridge bubbles `ErrAdminForbidden` through to 403 (peek under nil principal; purge under read-only principal)
+   - path-segment validation: `/messages/` (trailing slash), `/messages/foo` (sub-resource), `/Messages` (case mismatch) all return 404
+5. **Frontend:** Playwright / RTL test pinning:
+   - Messages tab renders rows in `visible_at` order with the correct columns
+   - row click opens detail modal with full body
+   - Next / Previous cursor flow lands on the right pages
+   - page-size selector clamps to {20, 50, 100}
+   - Purge button label switches between "Purge messages" and "Purge DLQ" based on `is_dlq`
+   - Purge confirmation modal requires the exact name (case-sensitive, trimmed)
+   - Purge 429 keeps modal open and shows countdown
+   - Peek after purge shows empty state (zero rows)
+6. **Jepsen:** out of scope. Purge has been Jepsen-covered since Phase 2 via the SigV4 path; the admin RPC shares the same `tryPurgeQueueOnce` and inherits the coverage. Peek is a read-only operation against state the Jepsen visibility-index workload already exercises; no new Jepsen workload is warranted.
 
 ---
 
 ## 7. Rollout Plan
 
-| Phase | Content                                                                                                  |
-|-------|----------------------------------------------------------------------------------------------------------|
-| 1     | This proposal doc lands (one PR). Operators have time to flag concerns.                                  |
-| 2     | Backend: `AdminPurgeQueue` + sentinel errors + `IsDLQ` / `DLQSources` on `AdminQueueSummary` + tests.    |
-| 3     | HTTP handler in `internal/admin/sqs_handler.go` + bridge in `main_admin.go` + integration tests.          |
-| 4     | SPA button + confirmation modal + API client wiring + frontend tests.                                    |
-| 5     | Doc rename `_proposed_` → `_implemented_`.                                                               |
+| Phase | Content                                                                                                                                       |
+|-------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| 1     | This proposal doc lands (one PR). Operators have time to flag concerns.                                                                       |
+| 2     | Backend: `AdminPurgeQueue` + sentinel errors + `IsDLQ` / `DLQSources` on `AdminQueueSummary` + tests.                                          |
+| 3     | Backend: `AdminPeekQueue` + `AdminPeekedMessage` + cursor codec + tests.                                                                      |
+| 4     | HTTP handlers in `internal/admin/sqs_handler.go` (peek GET + purge DELETE + path-segment matcher) + bridge in `main_admin.go` + integration tests. |
+| 5     | SPA: Messages tab + detail modal + Purge button + DLQ chips + API client wiring + frontend tests.                                              |
+| 6     | Doc rename `_proposed_` → `_implemented_`.                                                                                                    |
 
-Phases 2 / 3 / 4 each ship as separate PRs so they review small. Phase 4 lands the user-visible feature.
+Phases 2 / 3 / 4 / 5 each ship as separate PRs so they review small. Purge (phase 2) lands first because it is the simpler write — peek (phase 3) builds on cursor / pagination infrastructure that is wholly new. Phase 5 lands the user-visible feature.
 
 ---
 
@@ -232,4 +382,10 @@ Just forward the AWS-shape JSON-1.0 request through. Rejected: the admin SPA alr
 
 ## 10. Summary
 
-`AdminPurgeQueue` wraps the existing `purgeQueueWithRetry` in the same shape `AdminDeleteQueue` already uses for delete. `AdminQueueSummary` gains an `IsDLQ` flag (reverse-scan today; reverse-index later if profiling demands) so the SPA can frame the confirmation modal appropriately. The user-visible feature is one button on the queue detail page; the design surface is intentionally small because the underlying primitive (generation bump) is already production-tested on the SigV4 path.
+The proposal covers the full triage-then-clear DLQ workflow:
+
+- **`AdminPeekQueue`** — non-destructive sample of currently-visible messages so operators can see what's actually in a DLQ before deciding what to do with it. Pure read, no receive-count bump, no visibility-timer change, no receipt handles minted. Cursor-paginated; leader-only to keep the visibility index snapshot consistent.
+- **`AdminPurgeQueue`** — wraps the existing `purgeQueueWithRetry` in the same shape `AdminDeleteQueue` already uses for delete. Inherits the SigV4 path's 60-second meta-stored rate limit so the two surfaces stay in lockstep.
+- **`AdminQueueSummary.IsDLQ` / `DLQSources`** — reverse-scan the catalog (prefix scan over `SqsQueueMetaPrefix`, one storage round-trip) so the SPA can frame the Messages tab and the Purge confirmation appropriately. Reverse-index deferred until profiling shows it.
+
+The user-visible feature is a Messages tab + Purge button on the queue detail page. Each backend primitive is small (Peek is bounded-page reads; Purge is one OCC commit) and they reuse the existing admin auth/audit/forwarding pipeline, so the design surface is intentionally small relative to the operator-facing value.
