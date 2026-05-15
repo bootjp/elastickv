@@ -1,8 +1,31 @@
 # Data-at-rest encryption for elastickv
 
-Status: Proposed
+Status: Partial — Stages 0–4 shipped, Stages 5–9 open
 Author: bootjp
 Date: 2026-04-29
+
+## Milestone status
+
+| Stage | Scope (§ reference) | Status | Landed in |
+|-------|---------------------|--------|-----------|
+| 0 | Encryption foundation (§6.1 cipher / keystore / sidecar / KEK) | shipped | PR #719 + follow-ups |
+| 1 | Sidecar crash-durable read/write (§5.1) | shipped | PR #722 |
+| 2 | Storage layer integration (§6.2, §4.1) | shipped | PR #742 |
+| 3 | Raft envelope + engine pre-apply hook (§6.3, §4.2) | shipped | PR #744 |
+| 4 | FSM-internal Raft entry types (§5.6, §5.2 wire, §11.3 reserved opcodes) | shipped | PR #748 |
+| 5A | `EncryptionAdmin` proto + read-only RPCs + `encryption status` CLI | shipped | PR #754 |
+| 5B | Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter), §5.6 step 1a capability fan-out, remaining CLI subcommands, main.go gRPC wiring | open | — |
+| 6 | 3-phase rollout flags + applier wiring (§6.5, §7.1) | open | — |
+| 7 | Writer registry + deterministic nonce (§4.1) | open | — |
+| 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |
+| 9 | KMS-backed wrappers, compression, rotation/retire/rewrite, Jepsen (§5.2, §5.4, §6.4, §8) | open | — |
+
+Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
+envelope, FSM dispatch, halt-on-error) but leave it **production
+inert**: no caller wires `WithEncryption`, the `--enable-storage-envelope`
+flag does not exist yet, and there is no admin RPC to propose a
+bootstrap entry. Stage 5 begins the operator-facing surface; Stage 6
+flips it on under a cluster flag.
 
 ---
 
