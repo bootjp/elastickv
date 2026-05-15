@@ -325,6 +325,16 @@ func (r *RedisDB) dbDir() string {
 // randomised map iteration. Empty maps short-circuit without
 // creating the directory so dumps that never observed a given type
 // carry no spurious subdirectory.
+//
+// Error policy is "fail-fast per type": the first per-key flush
+// error returns immediately without writing the remaining user keys
+// of that type. Finalize continues with other types so a hash error
+// does not strand list output, but a partial dump within a single
+// type is intentional — a half-written `lists/` directory is easier
+// to detect as corrupt than a silently-truncated one that "continue"
+// would produce, and the alternative ("collect errors, write what
+// we can") trades a noisy hard failure for a quiet soft failure
+// that survives `find -name '*.json'` scrutiny.
 func flushWideColumnDir[T any](r *RedisDB, states map[string]T, subdir string, flushOne func(dir, userKey string, st T) error) error {
 	if len(states) == 0 {
 		return nil

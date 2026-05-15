@@ -345,6 +345,38 @@ func TestRedisDB_ListRejectsMalformedMetaValueLength(t *testing.T) {
 	}
 }
 
+// TestRedisDB_ListItemsWithoutMetaStillEmitsFile is the round-2 PR
+// review regression: !lst|itm| records may arrive without a paired
+// !lst|meta| in dump order (the snapshot iterator is not required to
+// surface meta before items for a given userKey). The encoder must
+// still emit the per-list JSON file from items alone, without
+// firing the declared-vs-observed length mismatch warning (because
+// metaSeen=false means we have no "declared" baseline to compare
+// against). Mirrors the items-as-source-of-truth contract that
+// makes the !lst|meta|d| delta family safe to skip.
+func TestRedisDB_ListItemsWithoutMetaStillEmitsFile(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	var events []string
+	db.WithWarnSink(func(event string, _ ...any) { events = append(events, event) })
+	if err := db.HandleListItem(listItemKey("q", 0), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readListJSON(t, filepath.Join(root, "redis", "db_0", "lists", "q.json"))
+	items := listItemsArray(t, got)
+	if len(items) != 1 || items[0] != "v" {
+		t.Fatalf("items = %v, want [v]", items)
+	}
+	for _, e := range events {
+		if e == "redis_list_length_mismatch" {
+			t.Fatalf("items-without-meta must not fire length-mismatch warning, got events %v", events)
+		}
+	}
+}
+
 // TestRedisDB_ListRejectsTruncatedItemKey pins that an !lst|itm| key
 // missing the 8-byte trailing seq surfaces as a parse error rather
 // than silently degenerating into a userKey-only state.

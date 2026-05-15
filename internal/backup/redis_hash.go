@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"math"
 	"path/filepath"
 	"sort"
 	"unicode/utf8"
@@ -71,8 +72,21 @@ func (r *RedisDB) HandleHashMeta(key, value []byte) error {
 		return cockroachdberr.Wrapf(ErrRedisInvalidHashMeta,
 			"length %d != %d", len(value), redisUint64Bytes)
 	}
+	// Bounds-check the uint64 field count before narrowing to int64.
+	// Without this, a corrupted store value with the high bit set
+	// would wrap to a negative declaredLen and fire spurious
+	// `redis_hash_length_mismatch` warnings on every flush. Mirrors
+	// the list encoder's symmetric guard (redis_list.go) so both
+	// wide-column encoders fail closed on the same shape of
+	// corruption. Round-2 review on PR #755 — backported from list
+	// encoder for cross-encoder consistency.
+	rawLen := binary.BigEndian.Uint64(value)
+	if rawLen > math.MaxInt64 {
+		return cockroachdberr.Wrapf(ErrRedisInvalidHashMeta,
+			"declared len %d overflows int64", rawLen)
+	}
 	st := r.hashState(userKey)
-	st.declaredLen = int64(binary.BigEndian.Uint64(value)) //nolint:gosec // signed int64 by design
+	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
 	st.metaSeen = true
 	return nil
 }
