@@ -20,6 +20,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -691,7 +692,33 @@ func buildShardGroups(
 		}
 		// Each shard FSM shares the same HLC so any shard's lease renewal advances
 		// the global physicalCeiling. The logical counter remains in-memory only.
-		sm := kv.NewKvFSMWithHLC(st, clock)
+		//
+		// §6.3 EncryptionApplier wiring (Stage 6A). Constructs an
+		// Applier backed by the FSM's Pebble store and threads it
+		// into the FSM dispatch via kv.WithEncryption. The applier's
+		// ApplyBootstrap / ApplyRotation paths return ErrKEKNotConfigured
+		// until Stage 6B threads in the KEK plumbing; only
+		// ApplyRegistration is fully functional in 6A, but the gRPC
+		// mutator gate (registerEncryptionAdminServer, Stage 5D
+		// posture) keeps the operator surface inert until 6B re-enables
+		// it gated on (--encryption-enabled AND KEKConfigured()).
+		reg, err := store.WriterRegistryFor(st)
+		if err != nil {
+			for _, rt := range runtimes {
+				rt.Close()
+			}
+			_ = st.Close()
+			return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", g.id)
+		}
+		applier, err := encryption.NewApplier(reg)
+		if err != nil {
+			for _, rt := range runtimes {
+				rt.Close()
+			}
+			_ = st.Close()
+			return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", g.id)
+		}
+		sm := kv.NewKvFSMWithHLC(st, clock, kv.WithEncryption(applier))
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {

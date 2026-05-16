@@ -91,4 +91,20 @@ var (
 	// the kv ↔ engine cycle (engine_test imports kv as a fake
 	// FSM).
 	ErrEncryptionApply = errors.New("encryption: FSM apply failed; halting apply (see design §6.3)")
+
+	// ErrKEKNotConfigured is the defense-in-depth marker returned
+	// by Applier.ApplyBootstrap and Applier.ApplyRotation when no
+	// KEK unwrapper is wired (Stage 6A scaffolding before Stage 6B
+	// fills the KEK plumbing). It is wrapped with ErrEncryptionApply
+	// at the kv/fsm dispatch layer so it routes through the same
+	// HaltApply seam as any other applier error.
+	//
+	// Per PR #762's Stage 6 plan, the production safety boundary
+	// is the gRPC-layer mutator gate in registerEncryptionAdminServer
+	// (which Stage 5D left OFF, and which 6B re-enables only when
+	// both --encryption-enabled is set AND KEKConfigured() is true);
+	// this typed error exists so a future refactor that bypasses
+	// that gate produces a named, grep-able failure mode rather
+	// than a nil-pointer panic deep in the apply path.
+	ErrKEKNotConfigured = errors.New("encryption: KEK not configured on this node; cannot unwrap wrapped DEK material")
 )

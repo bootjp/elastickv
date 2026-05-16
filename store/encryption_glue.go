@@ -3,7 +3,98 @@ package store
 import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/v2"
 )
+
+// ErrUnsupportedStoreForWriterRegistry is returned by
+// WriterRegistryFor when the supplied MVCCStore is not backed by
+// the in-tree Pebble implementation. Test fakes and alternate
+// backends are detected at construction time so the failure mode
+// is "binary refuses to start" rather than "FSM apply panics
+// inside Raft loop".
+var ErrUnsupportedStoreForWriterRegistry = errors.New("store: WriterRegistryFor requires a Pebble-backed MVCCStore")
+
+// pebbleWriterRegistry adapts the Pebble-backed MVCCStore to the
+// encryption.WriterRegistryStore interface used by the §6.3
+// EncryptionApplier. The §4.1 writer-registry rows live under the
+// `!encryption|writers|...` Pebble prefix — outside the MVCC
+// namespace — so reads and writes bypass the MVCC layer entirely
+// and hit the underlying *pebble.DB directly.
+//
+// Both Get and Set hold dbMu for read (RLock) only: the apply
+// path that calls into the Applier is already serialised by
+// kv/fsm.go's applyMu, so the registry row read-modify-write is
+// safe without an exclusive Pebble-level lock. dbMu's RLock is
+// the minimum required to protect against the Pebble DB pointer
+// being swapped during snapshot restore.
+//
+// Set uses pebble.Sync so the row is durable before the FSM apply
+// returns — without that, a crash between the FSM dispatch
+// returning success and Pebble flushing the WAL would leave the
+// Raft log claiming the entry applied but the registry row
+// missing on the next restart. That would violate §4.1 case 2's
+// monotonic-epoch invariant.
+type pebbleWriterRegistry struct {
+	s *pebbleStore
+}
+
+// GetRegistryRow looks up the value at key under the
+// `!encryption|writers|...` namespace. A missing row returns
+// (nil, false, nil) — NOT an error. Any other Pebble error
+// (corruption, I/O fault) returns (nil, false, err) so the
+// applier halts apply rather than silently treating the row as
+// missing.
+func (p *pebbleWriterRegistry) GetRegistryRow(key []byte) ([]byte, bool, error) {
+	p.s.dbMu.RLock()
+	defer p.s.dbMu.RUnlock()
+	val, closer, err := p.s.db.Get(key)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, errors.Wrap(err, "pebble: get writer registry row")
+	}
+	out := make([]byte, len(val))
+	copy(out, val)
+	if cerr := closer.Close(); cerr != nil {
+		return nil, false, errors.Wrap(cerr, "pebble: close writer registry row reader")
+	}
+	return out, true, nil
+}
+
+// SetRegistryRow durably writes value at key. Idempotent at the
+// (key, value) tuple level: writing the same bytes twice is
+// observationally identical to writing them once. pebble.Sync
+// blocks until the WAL is flushed to disk so the row survives a
+// crash that lands after the FSM apply returns.
+func (p *pebbleWriterRegistry) SetRegistryRow(key, value []byte) error {
+	p.s.dbMu.RLock()
+	defer p.s.dbMu.RUnlock()
+	if err := p.s.db.Set(key, value, pebble.Sync); err != nil {
+		return errors.Wrap(err, "pebble: set writer registry row")
+	}
+	return nil
+}
+
+// WriterRegistryFor returns an encryption.WriterRegistryStore
+// backed by the Pebble DB underlying the supplied MVCCStore.
+// Returns ErrUnsupportedStoreForWriterRegistry if the store is
+// not a Pebble-backed MVCCStore — callers should treat this as a
+// startup-fatal misconfiguration (the only in-tree non-Pebble
+// MVCCStore is the in-memory test fake, which has no encryption
+// requirements).
+func WriterRegistryFor(s MVCCStore) (encryption.WriterRegistryStore, error) {
+	ps, ok := s.(*pebbleStore)
+	// A typed-nil (*pebbleStore)(nil) passes the assertion with
+	// ok=true but ps==nil; the adapter would then nil-deref on
+	// first call. Reject both shapes at construction so the
+	// failure mode is "binary refuses to start" rather than
+	// "FSM apply panics deep in Raft loop".
+	if !ok || ps == nil {
+		return nil, errors.WithStack(ErrUnsupportedStoreForWriterRegistry)
+	}
+	return &pebbleWriterRegistry{s: ps}, nil
+}
 
 // ErrEncryptedReadIntegrity wraps encryption.ErrIntegrity for storage-layer
 // callers (Get / scan / iterator). Per design §4.1, callers MUST treat this
