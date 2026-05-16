@@ -44,7 +44,9 @@ import (
 //     ("don't enable any mutator RPC until every member of
 //     every Raft group reports encryption_capable") is the
 //     same operator-discipline constraint documented in PR
-//     #765 (Stage 6A) for the 6A→6B rolling upgrade.
+//     #765 (Stage 6A) and in the Stage 6 plan in
+//     docs/design/2026_04_29_partial_data_at_rest_encryption.md
+//     (6A rationale, "Rolling 6A→6B upgrade caveat").
 //   - Adding a cluster-wide readiness probe at this layer
 //     would duplicate the §7.1 capability gate and ship
 //     before the operator-facing GetCapability fan-out is
