@@ -85,7 +85,13 @@ func (p *pebbleWriterRegistry) SetRegistryRow(key, value []byte) error {
 // requirements).
 func WriterRegistryFor(s MVCCStore) (encryption.WriterRegistryStore, error) {
 	ps, ok := s.(*pebbleStore)
-	if !ok {
+	// A typed-nil (*pebbleStore)(nil) passes the assertion with
+	// ok=true but ps==nil; the adapter would then nil-deref on
+	// first call. Reject both shapes at construction so the
+	// failure mode is "binary refuses to start" rather than
+	// "FSM apply panics deep in Raft loop" — coderabbit PR #765
+	// round-2 Major.
+	if !ok || ps == nil {
 		return nil, errors.WithStack(ErrUnsupportedStoreForWriterRegistry)
 	}
 	return &pebbleWriterRegistry{s: ps}, nil

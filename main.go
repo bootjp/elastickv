@@ -704,11 +704,17 @@ func buildShardGroups(
 		// it gated on (--encryption-enabled AND KEKConfigured()).
 		reg, err := store.WriterRegistryFor(st)
 		if err != nil {
+			for _, rt := range runtimes {
+				rt.Close()
+			}
 			_ = st.Close()
 			return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", g.id)
 		}
 		applier, err := encryption.NewApplier(reg)
 		if err != nil {
+			for _, rt := range runtimes {
+				rt.Close()
+			}
 			_ = st.Close()
 			return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", g.id)
 		}

@@ -117,35 +117,62 @@ func TestApplyRegistration_Case2_MonotonicAdvance(t *testing.T) {
 }
 
 // TestApplyRegistration_Case3_Rollback pins §4.1 case 3 (epoch
-// rollback / replay): re-registering with epoch ≤ LastSeen MUST
-// halt apply with ErrEncryptionApply. Replaying a stale local_epoch
-// under the same DEK would let a re-issued nonce collide with a
+// rollback): re-registering with a strictly-smaller local_epoch
+// under the same FullNodeID MUST halt apply with
+// ErrEncryptionApply. Replaying a stale local_epoch under the
+// same DEK would let a re-issued nonce collide with a
 // previously-issued one, breaking AEAD confidentiality.
+//
+// Equal-epoch is NOT rollback — it is idempotent replay (Raft
+// re-applies committed entries after restart until the latest
+// FSM snapshot). The equal-epoch path is exercised by
+// TestApplyRegistration_Case2_IdempotentReplay below.
 func TestApplyRegistration_Case3_Rollback(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct {
-		name     string
-		secondEp uint16
-	}{
-		{name: "equal_epoch", secondEp: 5},
-		{name: "lower_epoch", secondEp: 4},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newMapRegistryStore()
-			app, _ := encryption.NewApplier(store)
-			const dek = 1
-			nodeID := uint64(0xAAAA_BBBB_CCCC_DDDD)
-			if err := app.ApplyRegistration(fsmwire.RegistrationPayload{DEKID: dek, FullNodeID: nodeID, LocalEpoch: 5}); err != nil {
-				t.Fatalf("first ApplyRegistration: %v", err)
-			}
-			err := app.ApplyRegistration(fsmwire.RegistrationPayload{DEKID: dek, FullNodeID: nodeID, LocalEpoch: tc.secondEp})
-			if err == nil {
-				t.Fatalf("expected rollback error, got nil")
-			}
-			if !errors.Is(err, encryption.ErrEncryptionApply) {
-				t.Errorf("err not marked ErrEncryptionApply: %v", err)
-			}
-		})
+	store := newMapRegistryStore()
+	app, _ := encryption.NewApplier(store)
+	const dek = 1
+	nodeID := uint64(0xAAAA_BBBB_CCCC_DDDD)
+	if err := app.ApplyRegistration(fsmwire.RegistrationPayload{DEKID: dek, FullNodeID: nodeID, LocalEpoch: 5}); err != nil {
+		t.Fatalf("first ApplyRegistration: %v", err)
+	}
+	err := app.ApplyRegistration(fsmwire.RegistrationPayload{DEKID: dek, FullNodeID: nodeID, LocalEpoch: 4})
+	if err == nil {
+		t.Fatalf("expected rollback error, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+}
+
+// TestApplyRegistration_Case2_IdempotentReplay pins the
+// idempotent-replay path: a duplicate RegisterEncryptionWriter
+// entry with the same (dek_id, full_node_id, local_epoch) MUST
+// succeed with no error and no observable row change. Raft
+// replays committed entries after restart until the latest FSM
+// snapshot; rejecting equal epochs as rollback would pin a
+// node in a halt-on-replay loop after any crash before
+// snapshotting the entry (PR #765 round-2 codex P1).
+func TestApplyRegistration_Case2_IdempotentReplay(t *testing.T) {
+	t.Parallel()
+	store := newMapRegistryStore()
+	app, _ := encryption.NewApplier(store)
+	const dek = 3
+	nodeID := uint64(0xCAFE_BABE_DEAD_BEEF)
+	first := fsmwire.RegistrationPayload{DEKID: dek, FullNodeID: nodeID, LocalEpoch: 7}
+	if err := app.ApplyRegistration(first); err != nil {
+		t.Fatalf("first ApplyRegistration: %v", err)
+	}
+	// Snapshot row state after the first apply.
+	keyForRow := encryption.RegistryKey(dek, uint16(nodeID&0xFFFF)) //nolint:gosec // test setup, masked to 16 bits
+	before, _, _ := store.GetRegistryRow(keyForRow)
+	// Replay the SAME entry — must be a no-op success.
+	if err := app.ApplyRegistration(first); err != nil {
+		t.Errorf("idempotent replay returned error: %v", err)
+	}
+	after, _, _ := store.GetRegistryRow(keyForRow)
+	if string(before) != string(after) {
+		t.Errorf("idempotent replay altered row: before=%x after=%x", before, after)
 	}
 }
 

@@ -43,13 +43,17 @@ type WriterRegistryStore interface {
 //
 // Stage 6A ships:
 //
-//   - ApplyRegistration — the §4.1 case 1 / case 2 dispatch:
-//     case 1 (new uint16 slot)            → insert
-//     case 2 (same FullNodeID, new epoch) → update LastSeen
-//     case 3 (same FullNodeID, epoch ≤)   → halt apply (rollback;
-//     recovered via §9.1)
-//     case 4 (uint16 collision)           → halt apply (uniqueness
-//     invariant; §6.1)
+//   - ApplyRegistration — the §4.1 case 1 / case 2 dispatch.
+//     For (dek_id, uint16(full_node_id)) keying:
+//
+//     case 1: no existing row → insert.
+//     case 2 (strictly greater epoch, same full_node_id) → advance LastSeen.
+//     case 2-idempotent (equal epoch, same full_node_id) → no-op (legit
+//     Raft replay; rejecting it would halt-on-replay-loop after crash).
+//     case 3 (strictly smaller epoch, same full_node_id) → halt apply
+//     (rollback; recovered via §9.1).
+//     case 4 (different full_node_id at same uint16 truncation) →
+//     halt apply (§6.1 uniqueness invariant).
 //
 //   - ApplyBootstrap and ApplyRotation — return the defense-in-depth
 //     ErrKEKNotConfigured marker. Stage 6B will swap these for the
@@ -92,8 +96,18 @@ func NewApplier(registry WriterRegistryStore) (*Applier, error) {
 //     payload.LocalEpoch. FirstSeen is preserved as the original
 //     first-registered value.
 //
-//   - case 3 (existing row, same FullNodeID, payload.LocalEpoch ≤
-//     existing.LastSeenLocalEpoch): epoch rollback / replay.
+//   - case 2-idempotent (existing row, same FullNodeID,
+//     payload.LocalEpoch == existing.LastSeenLocalEpoch): legitimate
+//     Raft replay. Raft re-applies committed entries after restart
+//     until the latest FSM snapshot, so a RegisterEncryptionWriter
+//     entry can be applied again with the same
+//     (dek_id, full_node_id, local_epoch). Returns nil with no row
+//     change. Rejecting equal epochs as rollback would pin a node
+//     in a halt-on-replay loop after any crash before snapshotting
+//     this entry — codex PR #765 round-2 P1.
+//
+//   - case 3 (existing row, same FullNodeID, payload.LocalEpoch <
+//     existing.LastSeenLocalEpoch — strictly less): epoch rollback.
 //     Returns an error wrapped with ErrEncryptionApply so the kv
 //     dispatch layer halts apply. The §9.1 ErrLocalEpochRollback
 //     startup guard is what 6C ships to prevent this from being
@@ -141,8 +155,23 @@ func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
 			"applier: writer-registry uint16 collision at dek_id=%d (existing full_node_id=%#x, incoming=%#x)",
 			p.DEKID, prev.FullNodeID, p.FullNodeID)
 	}
-	if p.LocalEpoch <= prev.LastSeenLocalEpoch {
-		// case 3: epoch rollback / replay
+	if p.LocalEpoch == prev.LastSeenLocalEpoch {
+		// case 2-idempotent: legitimate Raft replay of an already-
+		// applied registration entry. Raft replays committed entries
+		// after restart until the latest FSM snapshot, so a
+		// RegisterEncryptionWriter entry can be applied again with
+		// the same (dek_id, full_node_id, local_epoch). Rejecting
+		// equal epochs as rollback would halt apply on every legit
+		// post-crash replay and pin the node in a restart loop
+		// (PR #765 round-2 codex P1). The row already reflects this
+		// epoch — no-op return preserves the §4.1 monotonicity
+		// invariant without false-halting.
+		return nil
+	}
+	if p.LocalEpoch < prev.LastSeenLocalEpoch {
+		// case 3: epoch rollback / replay of a STALE epoch. Strictly
+		// less-than is the rollback signal — see the equal-epoch
+		// idempotent path above for why <= would be wrong.
 		return errors.Wrapf(ErrEncryptionApply,
 			"applier: writer-registry local_epoch rollback at dek_id=%d full_node_id=%#x (existing last_seen=%d, incoming=%d)",
 			p.DEKID, p.FullNodeID, prev.LastSeenLocalEpoch, p.LocalEpoch)
