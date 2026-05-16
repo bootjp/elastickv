@@ -24,9 +24,10 @@ const encryptionDialTimeout = 5 * time.Second
 // with this one — main() picks based on argv[1] before flag.Parse() so
 // the two surfaces do not share a global flag namespace.
 //
-// PR-A wires only `status`. PR-B adds bootstrap / rotate-dek /
-// register-writer / resync-sidecar; Stage 6 adds enable-storage-envelope
-// and enable-raft-envelope.
+// PR-A wired `status`. PR-B added `rotate-dek` and
+// `register-writer`. PR-C adds `bootstrap`; Stage 6 adds
+// `enable-storage-envelope` and `enable-raft-envelope`. ResyncSidecar
+// is a server-side §5.5 fallback (no CLI surface).
 func encryptionMain(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: elastickv-admin encryption <subcommand> [flags]")
@@ -35,18 +36,22 @@ func encryptionMain(args []string) error {
 	switch sub {
 	case "status":
 		return runEncryptionStatus(rest, os.Stdout)
+	case "rotate-dek":
+		return runEncryptionRotateDEK(rest, os.Stdout)
+	case "register-writer":
+		return runEncryptionRegisterWriter(rest, os.Stdout)
 	case "-h", "--help", "help":
 		// `-h` is the universal "show usage" affordance for CLI
 		// subcommands; returning nil keeps the exit code at 0
 		// so shell scripts using $? to detect success do not
 		// trip on a help request.
-		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status")
+		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer")
 		if err != nil {
 			return errors.Wrap(err, "write usage")
 		}
 		return nil
 	default:
-		return errors.Errorf("encryption: unknown subcommand %q (PR-A supports: status)", sub)
+		return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer)", sub)
 	}
 }
 
@@ -56,11 +61,12 @@ type encryptionEndpointFlags struct {
 }
 
 // newEncryptionEndpointFlags registers the shared --endpoint /
-// --timeout flags every encryption subcommand needs. PR-A is
-// plaintext-only; TLS / token authentication is shared with the
-// existing --nodeTLSCACertFile / --nodeTokenFile pair on the HTTP
-// surface but is deferred to PR-B for the CLI surface so the
-// initial PR stays scoped to read-only status.
+// --timeout flags every encryption subcommand needs. The CLI
+// surface is plaintext-only through PR-B; TLS / token
+// authentication shares the existing --nodeTLSCACertFile /
+// --nodeTokenFile flags on the HTTP surface and is wired into
+// the encryption CLI in Stage 6 alongside the --encryption-enabled
+// cluster-flag gate.
 func newEncryptionEndpointFlags(fs *flag.FlagSet) *encryptionEndpointFlags {
 	return &encryptionEndpointFlags{
 		endpoint: fs.String("endpoint", "127.0.0.1:50051", "gRPC address of an elastickv node"),
@@ -69,10 +75,10 @@ func newEncryptionEndpointFlags(fs *flag.FlagSet) *encryptionEndpointFlags {
 }
 
 // dialEncryption opens a gRPC client. The context argument is
-// reserved for the PR-B auth path (TLS handshake + token attach);
-// grpc.NewClient itself is non-blocking and ignores the context.
-// Per-RPC timeouts come from the caller's request context, not
-// from this dial.
+// reserved for the Stage 6 auth path (TLS handshake + token
+// attach); grpc.NewClient itself is non-blocking and ignores the
+// context. Per-RPC timeouts come from the caller's request
+// context, not from this dial.
 func dialEncryption(_ context.Context, flags *encryptionEndpointFlags) (pb.EncryptionAdminClient, func() error, error) {
 	conn, err := grpc.NewClient(*flags.endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

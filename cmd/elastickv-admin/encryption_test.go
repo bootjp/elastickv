@@ -36,11 +36,10 @@ func TestEncryptionMain_RequiresSubcommand(t *testing.T) {
 	}
 }
 
-// TestEncryptionMain_HelpFlagExitsZero pins the PR754 coderabbitai
-// /claude[bot] round-2 finding: `-h`, `--help`, `help` must not
-// fall through to the unknown-subcommand error path so shell
-// scripts using $? to detect success do not trip on a help
-// request.
+// TestEncryptionMain_HelpFlagExitsZero pins the CLI help-flag
+// contract: `-h`, `--help`, and `help` must not fall through to
+// the unknown-subcommand error path so shell scripts using $? to
+// detect success do not trip on a help request.
 func TestEncryptionMain_HelpFlagExitsZero(t *testing.T) {
 	t.Parallel()
 	for _, sub := range []string{"-h", "--help", "help"} {
@@ -124,7 +123,7 @@ func TestRunEncryptionStatus_NoSidecar(t *testing.T) {
 }
 
 // TestRunEncryptionStatus_PropagatesNonPreconditionError pins the
-// PR754 codex P2 fix: only FailedPrecondition on GetSidecarState
+// error-narrowing contract: only FailedPrecondition on GetSidecarState
 // is treated as the "node not configured" soft fallback. Any
 // other code (Internal, Unavailable, Unimplemented, …) must
 // surface as a non-nil error so the CLI exits non-zero.
@@ -166,6 +165,133 @@ func (s *stubSidecarErrorServer) GetCapability(context.Context, *pb.Empty) (*pb.
 
 func (s *stubSidecarErrorServer) GetSidecarState(context.Context, *pb.Empty) (*pb.SidecarStateReport, error) {
 	return nil, s.statusErr
+}
+
+// stubMutatorServer captures the RotateDEK / RegisterEncryptionWriter
+// requests so the CLI tests can verify both the wire-level args
+// and the returned applied_index round-trip. Read-only RPCs
+// inherit Unimplemented defaults.
+type stubMutatorServer struct {
+	pb.UnimplementedEncryptionAdminServer
+	rotateCalls   []*pb.RotateDEKRequest
+	registerCalls []*pb.RegisterEncryptionWriterRequest
+	appliedIndex  uint64
+	returnErr     error
+}
+
+func (s *stubMutatorServer) RotateDEK(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
+	s.rotateCalls = append(s.rotateCalls, req)
+	if s.returnErr != nil {
+		return nil, s.returnErr
+	}
+	return &pb.RotateDEKResponse{AppliedIndex: s.appliedIndex}, nil
+}
+
+func (s *stubMutatorServer) RegisterEncryptionWriter(_ context.Context, req *pb.RegisterEncryptionWriterRequest) (*pb.RegisterEncryptionWriterResponse, error) {
+	s.registerCalls = append(s.registerCalls, req)
+	if s.returnErr != nil {
+		return nil, s.returnErr
+	}
+	return &pb.RegisterEncryptionWriterResponse{AppliedIndex: s.appliedIndex}, nil
+}
+
+func TestRunEncryptionRotateDEK_HappyPath(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{appliedIndex: 73}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+
+	var buf bytes.Buffer
+	err := runEncryptionRotateDEK([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--purpose", "storage",
+		"--new-dek-id", "9",
+		// "raw-wrapped" base64-encoded
+		"--wrapped-new-dek", "cmF3LXdyYXBwZWQ=",
+		"--proposer-node-id", "111",
+		"--proposer-local-epoch", "42",
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionRotateDEK: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "applied_index=73") {
+		t.Errorf("output missing applied_index=73, got:\n%s", out)
+	}
+	if len(stub.rotateCalls) != 1 {
+		t.Fatalf("RotateDEK calls=%d, want 1", len(stub.rotateCalls))
+	}
+	call := stub.rotateCalls[0]
+	if call.Purpose != pb.RotateDEKRequest_PURPOSE_STORAGE ||
+		call.NewDekId != 9 ||
+		string(call.WrappedNewDek) != "raw-wrapped" ||
+		call.ProposerNodeId != 111 ||
+		call.ProposerLocalEpoch != 42 {
+		t.Errorf("RotateDEK call=%+v does not match flag inputs", call)
+	}
+}
+
+func TestRunEncryptionRotateDEK_RejectsBadPurpose(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionRotateDEK([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--purpose", "junk",
+		"--new-dek-id", "9",
+		"--wrapped-new-dek", "cmF3LXdyYXBwZWQ=",
+		"--proposer-node-id", "1",
+		"--proposer-local-epoch", "0",
+	}, &buf)
+	if err == nil {
+		t.Fatalf("runEncryptionRotateDEK returned nil, want error on --purpose=junk")
+	}
+}
+
+func TestRunEncryptionRotateDEK_RejectsBadEpoch(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionRotateDEK([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--purpose", "storage",
+		"--new-dek-id", "9",
+		"--wrapped-new-dek", "cmF3LXdyYXBwZWQ=",
+		"--proposer-node-id", "1",
+		"--proposer-local-epoch", "70000", // > 0xFFFF
+	}, &buf)
+	if err == nil || !strings.Contains(err.Error(), "16-bit bound") {
+		t.Fatalf("runEncryptionRotateDEK error=%v, want bound-violation", err)
+	}
+}
+
+func TestRunEncryptionRegisterWriter_HappyPath(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{appliedIndex: 88}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+
+	var buf bytes.Buffer
+	err := runEncryptionRegisterWriter([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--dek-id", "3",
+		"--full-node-id", "555",
+		"--local-epoch", "21",
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionRegisterWriter: %v", err)
+	}
+	if !strings.Contains(buf.String(), "applied_index=88") {
+		t.Errorf("missing applied_index=88, got:\n%s", buf.String())
+	}
+	if len(stub.registerCalls) != 1 {
+		t.Fatalf("RegisterEncryptionWriter calls=%d, want 1", len(stub.registerCalls))
+	}
+	call := stub.registerCalls[0]
+	if call.DekId != 3 ||
+		len(call.Writers) != 1 ||
+		call.Writers[0].FullNodeId != 555 ||
+		call.Writers[0].LocalEpoch != 21 {
+		t.Errorf("RegisterEncryptionWriter call=%+v does not match flag inputs", call)
+	}
 }
 
 func writeStatusFixture(t *testing.T, sc *encryption.Sidecar) string {

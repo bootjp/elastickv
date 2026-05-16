@@ -4,26 +4,34 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"os"
 	"runtime/debug"
 	"strconv"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"google.golang.org/grpc/codes"
 )
 
-// EncryptionAdminServer implements proto.EncryptionAdmin. PR-A (Stage 5
-// foundation) wires only the read-only capability and state probes
-// plus ResyncSidecar; the Bootstrap / Rotate / Register RPCs return
-// Unimplemented until PR-B lands the leader-side propose path on top
-// of Stage 3's raft envelope and Stage 4's fsmwire bodies.
+// EncryptionAdminServer implements proto.EncryptionAdmin. PR-A
+// (Stage 5 foundation) wired the read-only capability and state
+// probes; PR-B (this slice) wires RotateDEK +
+// RegisterEncryptionWriter as leader-only proposers on top of
+// Stage 3's raft envelope and Stage 4's fsmwire bodies, plus the
+// leader guard on ResyncSidecar. BootstrapEncryption stays
+// Unimplemented until PR-C lands the §5.6 step 1a capability
+// fan-out.
 type EncryptionAdminServer struct {
 	sidecarPath        string
 	keystore           *encryption.Keystore
 	fullNodeID         uint64
 	buildSHA           string
 	latestAppliedIndex func() uint64
+	proposer           raftengine.Proposer
+	leaderView         raftengine.LeaderView
 	pb.UnimplementedEncryptionAdminServer
 }
 
@@ -42,9 +50,11 @@ func WithEncryptionAdminSidecarPath(path string) EncryptionAdminServerOption {
 }
 
 // WithEncryptionAdminKeystore lets the server consult the in-memory
-// keystore for the §5.5 fallback paths. Stage 5 PR-A does not require
-// it because ReadSidecar covers every field the read-only RPCs need.
-// PR-B will use it to fast-path the RotateDEK pre-check.
+// keystore for the §5.5 fallback paths. Stage 5 PR-A / PR-B do not
+// require it because ReadSidecar covers every field the read-only
+// RPCs need and RotateDEK relies on FSM-side validation rather
+// than a pre-check. Stage 7 (writer registry) will use it for the
+// in-memory counter fast-path.
 func WithEncryptionAdminKeystore(k *encryption.Keystore) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
 		s.keystore = k
@@ -80,6 +90,29 @@ func WithEncryptionAdminBuildSHA(sha string) EncryptionAdminServerOption {
 func WithEncryptionAdminLatestAppliedIndex(fn func() uint64) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
 		s.latestAppliedIndex = fn
+	}
+}
+
+// WithEncryptionAdminProposer registers the raftengine.Proposer the
+// server uses to propose the §11.3 0x03 / 0x04 / 0x05 entries
+// (Stage 4 wire format). An unset proposer makes every mutating
+// RPC return FailedPrecondition with "proposer not configured",
+// preserving the PR-A production-inert guarantee until Stage 6
+// flips the cluster flag.
+func WithEncryptionAdminProposer(p raftengine.Proposer) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		s.proposer = p
+	}
+}
+
+// WithEncryptionAdminLeaderView registers the leadership oracle.
+// Mutating RPCs and ResyncSidecar reject on followers with
+// FailedPrecondition; the leader's id and address are embedded in
+// the status detail so the operator's CLI can retry against the
+// right node without parsing free-form error text.
+func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		s.leaderView = v
 	}
 }
 
@@ -182,16 +215,24 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 // sidecar that fell behind a Raft-log compaction window. The RPC is
 // read-only on the server side; no Raft proposal is involved.
 //
-// PR-A serves this from the local sidecar without leadership
-// verification because that is sufficient for the read-only
-// observability tests in this PR. PR-B will add a leader-only
-// guard so a follower with a stale sidecar cannot poison the
-// recovery path of a peer with an even-staler sidecar.
-func (s *EncryptionAdminServer) ResyncSidecar(_ context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
-	// req.CallerFullNodeId is intentionally unused in PR-A; PR-B
-	// will read it from the leader-only guard to scope the
-	// writer-registry projection to that specific caller per §5.5.
+// Leader-only via requireLeader, which calls VerifyLeader(ctx) to
+// confirm leadership through a Raft ReadIndex round-trip. Without
+// the quorum check a partitioned former leader (State() still
+// reports StateLeader pre-step-down) could ship stale wrapped-DEK
+// state to a recovering follower and silently overwrite recent
+// rotations.
+func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
+	// req.CallerFullNodeId is intentionally unused for the
+	// recovery payload itself in PR-B; Stage 7 will use it to
+	// scope the writer-registry projection to that specific
+	// caller per §5.5. Recording it here keeps the field on the
+	// hot path so a future leader-side audit log can correlate
+	// resyncs to the requesting member without a wire-format
+	// change.
 	_ = req
+	if err := s.requireLeader(ctx); err != nil {
+		return nil, err
+	}
 	if s.sidecarPath == "" {
 		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
 	}
@@ -271,6 +312,262 @@ func statusFromSidecarErr(err error) error {
 	default:
 		return grpcStatusErrorf(codes.Internal, "encryption: read sidecar: %v", err)
 	}
+}
+
+// RotateDEK proposes a §5.2 rotation as a §11.3 0x05 OpRotation
+// entry. The server validates purpose / dek_id / local_epoch
+// boundaries at the gRPC boundary (the §6.1 doc rule for
+// local_epoch <= 0xFFFF on the wire) and the FSM apply layer
+// enforces the sidecar-level invariants (no rotation while a
+// previous rotation is in flight, etc). Returns the commit index
+// once the entry is durable on a Raft quorum.
+func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
+	if err := s.requireLeader(ctx); err != nil {
+		return nil, err
+	}
+	if s.proposer == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: proposer is not configured on this node")
+	}
+	purpose, err := protoRotatePurpose(req.GetPurpose())
+	if err != nil {
+		return nil, err
+	}
+	if req.GetNewDekId() == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, "encryption: new_dek_id must be non-zero (key id 0 is reserved per §5.1)")
+	}
+	if len(req.GetWrappedNewDek()) == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, "encryption: wrapped_new_dek is required")
+	}
+	if req.GetProposerLocalEpoch() > math.MaxUint16 {
+		return nil, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: proposer_local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
+			req.GetProposerLocalEpoch())
+	}
+	if req.GetProposerNodeId() == 0 {
+		// §6.1 reserves full_node_id=0 as the "not encryption-capable"
+		// sentinel. Forwarding 0 into a writer-registry row would
+		// collide with every other un-bootstrapped node's sentinel
+		// and break the §4.1 nonce-uniqueness invariant.
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: proposer_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
+	}
+	payload := fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubRotateDEK,
+		DEKID:   req.GetNewDekId(),
+		Purpose: purpose,
+		Wrapped: req.GetWrappedNewDek(),
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID:      req.GetNewDekId(),
+			FullNodeID: req.GetProposerNodeId(),
+			LocalEpoch: uint32ToLocalEpoch(req.GetProposerLocalEpoch()),
+		},
+	}
+	body := fsmwire.EncodeRotation(payload)
+	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpRotation, body)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.RotateDEKResponse{AppliedIndex: idx}, nil
+}
+
+// RegisterEncryptionWriter proposes a §11.3 0x03 OpRegistration
+// entry for the calling node's first encrypted-write epoch under
+// the supplied dek_id. The proto carries `repeated WriterBatch`
+// for forward-compatibility, but each PR-B call MUST provide
+// exactly one entry; batched registrations belong to the §5.6
+// step 1a bootstrap path (deferred to PR-C). The server enforces
+// the single-entry contract here so an operator who accidentally
+// fans out a batched RegisterEncryptionWriter does not silently
+// propose a fraction of it.
+func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, req *pb.RegisterEncryptionWriterRequest) (*pb.RegisterEncryptionWriterResponse, error) {
+	if err := s.requireLeader(ctx); err != nil {
+		return nil, err
+	}
+	if s.proposer == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: proposer is not configured on this node")
+	}
+	if req.GetDekId() == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, "encryption: dek_id must be non-zero (key id 0 is reserved per §5.1)")
+	}
+	writers := req.GetWriters()
+	switch len(writers) {
+	case 1:
+		// expected shape; fall through to validation + propose.
+	case 0:
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: RegisterEncryptionWriter requires exactly one writer, got 0")
+	default:
+		return nil, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: RegisterEncryptionWriter requires exactly one writer, got %d (use BootstrapEncryption for multi-writer batches)",
+			len(writers))
+	}
+	w := writers[0]
+	if w.GetLocalEpoch() > math.MaxUint16 {
+		return nil, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: writers[0].local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
+			w.GetLocalEpoch())
+	}
+	if w.GetFullNodeId() == 0 {
+		// Same §6.1 sentinel rule as RotateDEK.proposer_node_id.
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: writers[0].full_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
+	}
+	payload := fsmwire.RegistrationPayload{
+		DEKID:      req.GetDekId(),
+		FullNodeID: w.GetFullNodeId(),
+		LocalEpoch: uint32ToLocalEpoch(w.GetLocalEpoch()),
+	}
+	body := fsmwire.EncodeRegistration(payload)
+	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpRegistration, body)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.RegisterEncryptionWriterResponse{AppliedIndex: idx}, nil
+}
+
+// proposeEncryptionEntry prepends the §11.3 opcode tag to a
+// fsmwire-encoded body and submits the resulting Raft entry. The
+// Stage 4 FSM apply path peels the tag, dispatches into
+// applyEncryption, and Halt-Applies on any decode failure — this
+// helper is just the byte-level glue between the server-side
+// encoder and raftengine.Proposer.
+func (s *EncryptionAdminServer) proposeEncryptionEntry(ctx context.Context, opcode byte, body []byte) (uint64, error) {
+	entry := make([]byte, 0, 1+len(body))
+	entry = append(entry, opcode)
+	entry = append(entry, body...)
+	res, err := s.proposer.Propose(ctx, entry)
+	if err != nil {
+		return 0, proposeErrorToStatus(err, opcode)
+	}
+	if res == nil {
+		return 0, grpcStatusError(codes.Internal, "encryption: proposer returned nil result")
+	}
+	return res.CommitIndex, nil
+}
+
+// proposeErrorToStatus maps raftengine.Proposer.Propose errors to
+// gRPC status codes so clients see structured retry semantics
+// instead of the default codes.Unknown:
+//
+//   - Leadership lost between requireLeader() and Propose, or a
+//     leadership transfer raced the call → FailedPrecondition.
+//     The client retries against the new leader, same shape as
+//     the up-front requireLeader() rejection.
+//   - Context errors (caller canceled / deadline elapsed) →
+//     Canceled / DeadlineExceeded so the client does not retry a
+//     genuinely-aborted call.
+//   - Anything else (engine closed, propose-queue full, etc.) →
+//     Unavailable, the standard "transient, retryable" code.
+func proposeErrorToStatus(err error, opcode byte) error {
+	switch {
+	case errors.Is(err, raftengine.ErrNotLeader),
+		errors.Is(err, raftengine.ErrLeadershipLost),
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress):
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: propose 0x%02x rejected by raft engine: %v", opcode, err)
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: propose 0x%02x canceled: %v", opcode, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: propose 0x%02x deadline exceeded: %v", opcode, err)
+	default:
+		return grpcStatusErrorf(codes.Unavailable,
+			"encryption: propose 0x%02x failed: %v", opcode, err)
+	}
+}
+
+// requireLeader rejects on followers with FailedPrecondition. The
+// status detail embeds the currently-known leader's id and
+// address so the operator's CLI can re-target without parsing
+// free-form error text. A nil leaderView is allowed for tests
+// that exercise the proposer wiring directly; the production
+// wiring in main.go MUST register one (enforced as a Stage 6
+// startup-time assertion).
+//
+// Two checks happen here:
+//
+//  1. Fast path: State() == StateLeader rejects on followers and
+//     candidates without a Raft round-trip.
+//  2. Quorum confirmation: VerifyLeader(ctx) does a ReadIndex
+//     round-trip so a *partitioned former leader* whose
+//     State() still reports StateLeader (the local view has
+//     not stepped down yet) cannot serve mutating RPCs or
+//     ResyncSidecar against stale local state. Without this,
+//     a follower's recovery flow could pull an outdated DEK
+//     set from a stranded leader and miss recent rotations.
+func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
+	if s.leaderView == nil {
+		return nil
+	}
+	if s.leaderView.State() != raftengine.StateLeader {
+		leader := s.leaderView.Leader()
+		if leader.ID == "" && leader.Address == "" {
+			return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
+		}
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: not leader (current leader id=%q address=%q)",
+			leader.ID, leader.Address)
+	}
+	if err := s.leaderView.VerifyLeader(ctx); err != nil {
+		return verifyLeaderErrorToStatus(err)
+	}
+	return nil
+}
+
+// verifyLeaderErrorToStatus maps LeaderView.VerifyLeader errors to
+// gRPC status codes. Mirrors proposeErrorToStatus so that a
+// client-side timeout during the ReadIndex round-trip surfaces as
+// codes.DeadlineExceeded (the retryable transport-timing
+// semantics) rather than codes.FailedPrecondition (which the
+// client would treat as a leadership rejection).
+func verifyLeaderErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: VerifyLeader canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: VerifyLeader deadline exceeded: %v", err)
+	default:
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: VerifyLeader failed, refusing to act on stale-leader state: %v", err)
+	}
+}
+
+func protoRotatePurpose(p pb.RotateDEKRequest_Purpose) (fsmwire.Purpose, error) {
+	switch p {
+	case pb.RotateDEKRequest_PURPOSE_STORAGE:
+		return fsmwire.PurposeStorage, nil
+	case pb.RotateDEKRequest_PURPOSE_RAFT:
+		return fsmwire.PurposeRaft, nil
+	case pb.RotateDEKRequest_PURPOSE_UNSPECIFIED:
+		// Proto3 default value — caller forgot to set purpose.
+		// Falls into the same InvalidArgument as an out-of-range
+		// value below; spelled out separately so the exhaustive
+		// linter does not flag this switch.
+		return 0, grpcStatusError(codes.InvalidArgument,
+			"encryption: purpose must be PURPOSE_STORAGE or PURPOSE_RAFT, got PURPOSE_UNSPECIFIED")
+	default:
+		return 0, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: purpose must be PURPOSE_STORAGE or PURPOSE_RAFT, got %v", p)
+	}
+}
+
+// uint32ToLocalEpoch narrows a wire-format uint32 local_epoch to
+// its on-disk uint16 representation. Callers MUST have rejected
+// values > math.MaxUint16 first; the mask is a defence-in-depth
+// truncation that cannot drift even if a future caller skips the
+// bound check. gosec's G115 cannot see the prior validation
+// because it lives at the gRPC handler boundary; the nolint here
+// is scoped to this single conversion site so callsite drift is
+// impossible.
+// localEpochMask is the §4.1 16-bit nonce mask. Named here so the
+// magic-number linter does not flag the masking conversion below.
+const localEpochMask uint32 = 0xFFFF
+
+func uint32ToLocalEpoch(v uint32) uint16 {
+	return uint16(v & localEpochMask) //nolint:gosec // bound-checked + masked; G115 cannot trace across the handler boundary
 }
 
 func autoBuildSHA() string {
