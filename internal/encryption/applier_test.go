@@ -2,6 +2,7 @@ package encryption_test
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -242,11 +243,14 @@ func TestApplyRegistration_StoreErrorPropagates(t *testing.T) {
 	})
 }
 
-// TestApplyBootstrap_ReturnsKEKNotConfigured pins the Stage 6A stub
-// contract: until 6B threads a KEK unwrapper, ApplyBootstrap is the
-// defense-in-depth marker returning ErrKEKNotConfigured (wrapped so
-// the kv/fsm dispatch layer's ErrEncryptionApply marking still
-// fires).
+// TestApplyBootstrap_ReturnsKEKNotConfigured pins the no-options
+// default — without WithKEK / WithKeystore / WithSidecarPath, an
+// Applier returns ErrKEKNotConfigured wrapped for the HaltApply
+// pipeline. This is the Stage 6A posture; Stage 6B preserves it
+// as the unwired default so the FSM dispatch contract still
+// produces a typed, grep-able failure when an operator
+// hand-triggers Bootstrap on a binary that has not yet been
+// configured.
 func TestApplyBootstrap_ReturnsKEKNotConfigured(t *testing.T) {
 	t.Parallel()
 	app, _ := encryption.NewApplier(newMapRegistryStore())
@@ -264,8 +268,8 @@ func TestApplyBootstrap_ReturnsKEKNotConfigured(t *testing.T) {
 	}
 }
 
-// TestApplyRotation_ReturnsKEKNotConfigured pins the same Stage 6A
-// stub contract for rotation.
+// TestApplyRotation_ReturnsKEKNotConfigured pins the same no-options
+// default for ApplyRotation.
 func TestApplyRotation_ReturnsKEKNotConfigured(t *testing.T) {
 	t.Parallel()
 	app, _ := encryption.NewApplier(newMapRegistryStore())
@@ -279,5 +283,339 @@ func TestApplyRotation_ReturnsKEKNotConfigured(t *testing.T) {
 	}
 	if !errors.Is(err, encryption.ErrKEKNotConfigured) {
 		t.Errorf("err not marked ErrKEKNotConfigured: %v", err)
+	}
+}
+
+// fakeKEK is a deterministic KEKUnwrapper for tests. Unwrap
+// returns a 32-byte DEK derived from the wrapped input — same
+// wrapped bytes always produce the same DEK bytes, which exercises
+// the Keystore.Set idempotency path on replay. The wrapped input
+// can be any length (production uses ~48 bytes, tests use shorter
+// sentinels); the DEK output is always 32 bytes (Keystore.Set
+// requires encryption.KeySize).
+type fakeKEK struct {
+	failOn   []byte // if non-nil and Unwrap input matches, return failErr
+	failErr  error
+	override map[string][]byte // optional fixed mapping for specific wrapped inputs
+}
+
+func (f *fakeKEK) Unwrap(wrapped []byte) ([]byte, error) {
+	if f.failOn != nil && string(f.failOn) == string(wrapped) {
+		return nil, f.failErr
+	}
+	if v, ok := f.override[string(wrapped)]; ok {
+		return v, nil
+	}
+	// Deterministic derivation: pad/truncate wrapped to KeySize.
+	out := make([]byte, encryption.KeySize)
+	copy(out, wrapped)
+	return out, nil
+}
+
+// TestApplyBootstrap_FullyWired pins the §5.6 step 1a happy path:
+// Bootstrap KEK-unwraps both DEKs, installs them into the keystore,
+// writes a crash-durable sidecar with Active.{Storage,Raft} set,
+// and inserts the batch writer-registry rows. The post-apply
+// state is verified end-to-end via per-aspect helper functions.
+func TestApplyBootstrap_FullyWired(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+
+	payload := fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("storage-wrapped-bytes"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("raft-wrapped-bytes-different"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 1, FullNodeID: 0xAAAA, LocalEpoch: 0},
+			{DEKID: 2, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}
+	if err := app.ApplyBootstrap(payload); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	assertKeystoreHas(t, ks, payload.StorageDEKID, payload.RaftDEKID)
+	assertBootstrapSidecar(t, sidecarPath, payload)
+	assertRegistryRowsPresent(t, reg, payload.BatchRegistry)
+}
+
+func assertKeystoreHas(t *testing.T, ks *encryption.Keystore, ids ...uint32) {
+	t.Helper()
+	for _, id := range ids {
+		if !ks.Has(id) {
+			t.Errorf("keystore missing DEK id=%d", id)
+		}
+	}
+}
+
+func assertBootstrapSidecar(t *testing.T, path string, p fsmwire.BootstrapPayload) {
+	t.Helper()
+	sc, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.Active.Storage != p.StorageDEKID {
+		t.Errorf("Active.Storage = %d, want %d", sc.Active.Storage, p.StorageDEKID)
+	}
+	if sc.Active.Raft != p.RaftDEKID {
+		t.Errorf("Active.Raft = %d, want %d", sc.Active.Raft, p.RaftDEKID)
+	}
+	assertSidecarKey(t, sc, p.StorageDEKID, encryption.SidecarPurposeStorage)
+	assertSidecarKey(t, sc, p.RaftDEKID, encryption.SidecarPurposeRaft)
+}
+
+func assertSidecarKey(t *testing.T, sc *encryption.Sidecar, id uint32, wantPurpose string) {
+	t.Helper()
+	key := strconv.FormatUint(uint64(id), 10)
+	k, ok := sc.Keys[key]
+	if !ok {
+		t.Errorf("sidecar keys map missing key %s", key)
+		return
+	}
+	if k.Purpose != wantPurpose {
+		t.Errorf("keys[%s].Purpose = %q, want %q", key, k.Purpose, wantPurpose)
+	}
+}
+
+func assertRegistryRowsPresent(t *testing.T, reg *mapRegistryStore, rows []fsmwire.RegistrationPayload) {
+	t.Helper()
+	for _, r := range rows {
+		key := encryption.RegistryKey(r.DEKID, uint16(r.FullNodeID&0xFFFF)) //nolint:gosec // test setup, masked to 16 bits
+		if _, ok, _ := reg.GetRegistryRow(key); !ok {
+			t.Errorf("registry row missing for dek_id=%d full_node_id=%#x", r.DEKID, r.FullNodeID)
+		}
+	}
+}
+
+// TestApplyBootstrap_PartialWiring pins the all-or-nothing trio:
+// supplying only some of WithKEK / WithKeystore / WithSidecarPath
+// MUST return ErrKEKNotConfigured. The Applier fails closed at
+// apply time so a partial wiring during a future refactor cannot
+// mis-apply with one dep present.
+func TestApplyBootstrap_PartialWiring(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		opts []encryption.ApplierOption
+	}{
+		{name: "kek_only", opts: []encryption.ApplierOption{encryption.WithKEK(&fakeKEK{})}},
+		{name: "keystore_only", opts: []encryption.ApplierOption{encryption.WithKeystore(encryption.NewKeystore())}},
+		{name: "sidecar_path_only", opts: []encryption.ApplierOption{encryption.WithSidecarPath("/tmp/never-written")}},
+		{name: "kek_and_keystore", opts: []encryption.ApplierOption{
+			encryption.WithKEK(&fakeKEK{}),
+			encryption.WithKeystore(encryption.NewKeystore()),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, err := encryption.NewApplier(newMapRegistryStore(), tc.opts...)
+			if err != nil {
+				t.Fatalf("NewApplier: %v", err)
+			}
+			err = app.ApplyBootstrap(fsmwire.BootstrapPayload{StorageDEKID: 1, RaftDEKID: 2})
+			if err == nil {
+				t.Fatal("expected ErrKEKNotConfigured for partial wiring, got nil")
+			}
+			if !errors.Is(err, encryption.ErrKEKNotConfigured) {
+				t.Errorf("err not marked ErrKEKNotConfigured: %v", err)
+			}
+		})
+	}
+}
+
+// TestApplyBootstrap_KEKUnwrapFailure pins fail-closed behavior on
+// KEK errors. The synthetic Unwrap error is propagated; the kv/fsm
+// dispatch layer will then mark it with ErrEncryptionApply for
+// HaltApply regardless of upstream marking.
+func TestApplyBootstrap_KEKUnwrapFailure(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	boom := errors.New("kek: synthetic unwrap failure")
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{failOn: []byte("doomed"), failErr: boom}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(dir+"/keys.json"),
+	)
+	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("doomed"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("ok"),
+	})
+	if err == nil {
+		t.Fatal("expected unwrap failure, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("err did not wrap synthetic Unwrap failure: %v", err)
+	}
+	// Keystore must not contain a partial install on failure of the
+	// FIRST unwrap.
+	if ks.Has(1) || ks.Has(2) {
+		t.Error("keystore should be empty after first-unwrap failure")
+	}
+}
+
+// TestApplyBootstrap_Replay_Idempotent pins the Raft-replay
+// invariant: applying the same BootstrapPayload twice produces
+// the same sidecar and keystore state on the second pass, with
+// no error. Replay safety is the load-bearing property that lets
+// crash-mid-apply recovery work.
+func TestApplyBootstrap_Replay_Idempotent(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	payload := fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("storage"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("raft"),
+		BatchRegistry:  []fsmwire.RegistrationPayload{{DEKID: 1, FullNodeID: 0x4242, LocalEpoch: 0}},
+	}
+	if err := app.ApplyBootstrap(payload); err != nil {
+		t.Fatalf("first ApplyBootstrap: %v", err)
+	}
+	if err := app.ApplyBootstrap(payload); err != nil {
+		t.Errorf("second ApplyBootstrap (replay): %v", err)
+	}
+}
+
+// TestApplyRotation_FullyWired pins the §5.2 rotate-dek happy
+// path: KEK-unwrap, keystore install at the new DEK ID, sidecar
+// Active slot updated for the supplied Purpose, ProposerRegistration
+// row inserted.
+func TestApplyRotation_FullyWired(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	// Pre-populate the sidecar with a bootstrap so rotation has
+	// something to advance from.
+	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	// Rotate the storage DEK from id 1 to id 5.
+	if err := app.ApplyRotation(fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                5,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte("storage-v2-wrapped"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 5, FullNodeID: 0xBEEF, LocalEpoch: 0},
+	}); err != nil {
+		t.Fatalf("ApplyRotation: %v", err)
+	}
+	if !ks.Has(5) {
+		t.Error("keystore missing rotated DEK 5")
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.Active.Storage != 5 {
+		t.Errorf("Active.Storage = %d, want 5", sc.Active.Storage)
+	}
+	if sc.Active.Raft != 2 {
+		t.Errorf("Active.Raft = %d, want 2 (unchanged by storage rotation)", sc.Active.Raft)
+	}
+	if k, ok := sc.Keys["5"]; !ok {
+		t.Error("sidecar keys missing rotated DEK 5")
+	} else if k.Purpose != encryption.SidecarPurposeStorage {
+		t.Errorf("keys[5].Purpose = %q, want %q", k.Purpose, encryption.SidecarPurposeStorage)
+	}
+	// Old DEK 1 must remain in keys[] (rotation does not retire).
+	if _, ok := sc.Keys["1"]; !ok {
+		t.Error("sidecar keys should still contain old DEK 1 after rotation (retire is a separate sub-tag)")
+	}
+}
+
+// TestApplyRotation_UnknownSubTag pins the fail-closed dispatch:
+// any sub_tag other than RotateSubRotateDEK halts apply with
+// ErrEncryptionApply so Stage 6B-1 cannot silently mis-apply a
+// later sub_tag (rewrap-deks, retire-dek, enable-storage-envelope,
+// enable-raft-envelope) before its implementation lands.
+func TestApplyRotation_UnknownSubTag(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(dir+"/keys.json"),
+	)
+	err := app.ApplyRotation(fsmwire.RotationPayload{
+		SubTag:  0xFE, // not RotateSubRotateDEK
+		DEKID:   1,
+		Wrapped: []byte("x"),
+	})
+	if err == nil {
+		t.Fatal("expected halt on unknown sub_tag, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+}
+
+// TestApplyRotation_UnknownPurpose pins the same fail-closed
+// dispatch for unrecognised Purpose enum values — guards against
+// a future wire-format extension silently mis-labelling sidecar
+// entries.
+func TestApplyRotation_UnknownPurpose(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	// Pre-bootstrap so the sidecar exists.
+	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s"),
+		RaftDEKID: 2, WrappedRaft: []byte("r"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	err := app.ApplyRotation(fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubRotateDEK,
+		DEKID:   9,
+		Purpose: fsmwire.Purpose(0xFE), // not Storage / Raft
+		Wrapped: []byte("y"),
+	})
+	if err == nil {
+		t.Fatal("expected halt on unknown purpose, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
 	}
 }
