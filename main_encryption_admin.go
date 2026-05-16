@@ -9,7 +9,7 @@ import (
 )
 
 // encryptionMutatorsEnabled is the Stage 6B-2 triple-gate
-// readback. Returns true iff the operator has all three of:
+// readback. Returns true iff THIS NODE has all three of:
 //
 //   - --encryption-enabled (explicit operator opt-in)
 //   - --kekFile non-empty (KEK source loaded so ApplyBootstrap
@@ -18,14 +18,42 @@ import (
 //     crash-durably persist Active.{Storage,Raft} + keys[])
 //
 // Any one false → mutator wiring stays off. The sidecarPath
-// condition was added in PR #776 codex P1 — without it, an
-// operator with --encryption-enabled + --kekFile but no
-// --encryptionSidecarPath could call BootstrapEncryption, the
-// proposal would commit, and every replica's applier would
-// HaltApply with "bootstrap requires WithKEK + WithKeystore +
-// WithSidecarPath" because the applier's WithSidecarPath
-// option was omitted in buildShardGroups. The triple gate
-// keeps that halt unreachable.
+// condition catches the case where an operator with the other
+// two flags set could trigger a HaltApply: without
+// WithSidecarPath, the applier's bootstrapAndRotationConfigured()
+// returns false and ApplyBootstrap halts apply with
+// ErrKEKNotConfigured. The triple gate keeps that unreachable
+// at the RPC boundary.
+//
+// Scope limitation — this is a NODE-LOCAL gate, not a
+// cluster-wide readiness check. During a staged rolling
+// upgrade where some peers still run the pre-6B-2 binary (or
+// have the flags unset), a mutator proposal committed by a
+// fully-configured leader would reach those replicas'
+// appliers and HaltApply on the under-configured side. The
+// design accepts this for Stage 6B-2 because:
+//
+//   - The §7.1 Phase-1 cutover RPC (Stage 6D's
+//     enable-storage-envelope) is the load-bearing
+//     cluster-wide gate; it runs a Voters ∪ Learners
+//     capability fan-out via GetCapability and refuses if any
+//     member is not encryption_capable. That is the right
+//     layer for cluster-wide safety.
+//   - Operators using Stage 6B-2 are explicitly opting in to
+//     the mutator surface; the rolling-restart discipline
+//     ("don't enable any mutator RPC until every member of
+//     every Raft group reports encryption_capable") is the
+//     same operator-discipline constraint documented in PR
+//     #765 (Stage 6A) for the 6A→6B rolling upgrade.
+//   - Adding a cluster-wide readiness probe at this layer
+//     would duplicate the §7.1 capability gate and ship
+//     before the operator-facing GetCapability fan-out is
+//     wired into the admin CLI.
+//
+// PR #776 round-2 codex P1 flagged this scope boundary; the
+// resolution is to document the constraint explicitly here
+// rather than ship a partial cluster-wide check that would
+// be superseded by Stage 6D in any case.
 //
 // Kept in this file (not main.go) so the flag-driven gate logic
 // is colocated with the registerEncryptionAdminServer helper
