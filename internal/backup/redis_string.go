@@ -43,6 +43,17 @@ const (
 	redisStrBaseHeader      = 3
 	redisUint64Bytes        = 8
 
+	// wideColumnUserKeyLenSize is the fixed BE-uint32 width of the
+	// per-key length prefix used by every wide-column key shape
+	// (!hs|, !st|, !zs|, !stream|, and any future families that
+	// reuse the `<prefix><userKeyLen(4)><userKey>...` layout).
+	// Mirrors store/wideColKeyLenSize. Lives in the foundation
+	// file rather than redis_hash.go because list / set encoders
+	// reference it via the shared parseUserKeyLenPrefix helper —
+	// the previous hash-prefixed name (hashUserKeyLenSize) was
+	// misleading once the second wide-column encoder landed.
+	wideColumnUserKeyLenSize = 4
+
 	redisStringsTTLFile = "strings_ttl.jsonl"
 	redisHLLTTLFile     = "hll_ttl.jsonl"
 
@@ -73,6 +84,7 @@ const (
 	redisKindHLL
 	redisKindHash
 	redisKindList
+	redisKindSet
 )
 
 // RedisDB encodes one logical Redis database (`redis/db_<n>/`). All
@@ -167,6 +179,12 @@ type RedisDB struct {
 	// world Redis lists are bounded by maxWideColumnItems on the live
 	// side, and the JSON shape requires the full item slice up front.
 	lists map[string]*redisListState
+
+	// sets buffers per-userKey set state. Members live in the !st|mem|
+	// key bytes (binary-safe), the value is empty. Flushed at
+	// Finalize into sets/<key>.json with members sorted by raw byte
+	// order for deterministic dump output.
+	sets map[string]*redisSetState
 }
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
@@ -185,6 +203,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		inlineTTLEmitted: make(map[string]struct{}),
 		hashes:           make(map[string]*redisHashState),
 		lists:            make(map[string]*redisListState),
+		sets:             make(map[string]*redisSetState),
 	}
 }
 
@@ -271,6 +290,13 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		st.expireAtMs = expireAtMs
 		st.hasTTL = true
 		return nil
+	case redisKindSet:
+		// Same per-record TTL inlining: SADD + EXPIRE replay in
+		// one shot from the per-set JSON, no separate sidecar.
+		st := r.setState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+		return nil
 	case redisKindUnknown:
 		// Track orphan TTL counts only — keys are unused before the
 		// remaining wide-column encoders (set/zset/stream) land, and
@@ -291,6 +317,7 @@ func (r *RedisDB) Finalize() error {
 	for _, step := range []func() error{
 		r.flushHashes,
 		r.flushLists,
+		r.flushSets,
 		func() error { return closeJSONL(r.stringsTTL) },
 		func() error { return closeJSONL(r.hllTTL) },
 		r.closeKeymap,
@@ -302,7 +329,7 @@ func (r *RedisDB) Finalize() error {
 	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
 			"count", r.orphanTTLCount,
-			"hint", "remaining wide-column encoders (set/zset/stream) have not landed yet")
+			"hint", "remaining wide-column encoders (zset/stream) have not landed yet")
 	}
 	return firstErr
 }
