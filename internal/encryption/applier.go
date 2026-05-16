@@ -114,7 +114,7 @@ func NewApplier(registry WriterRegistryStore) (*Applier, error) {
 // the gate, or in a forensic / corruption scenario) still halts
 // rather than silently advancing setApplied.
 func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
-	key := RegistryKey(p.DEKID, uint16(p.FullNodeID&localEpochMaskU64)) //nolint:gosec // masked to 16 bits; G115 cannot trace the bitwise narrowing
+	key := RegistryKey(p.DEKID, uint16(p.FullNodeID&nodeIDMask)) //nolint:gosec // masked to 16 bits; G115 cannot trace the bitwise narrowing
 	existing, ok, err := a.registry.GetRegistryRow(key)
 	if err != nil {
 		return errors.Wrap(err, "applier: get registry row")
@@ -180,4 +180,13 @@ func (a *Applier) ApplyRotation(_ fsmwire.RotationPayload) error {
 	return errors.Wrap(ErrKEKNotConfigured, "applier: rotation requires KEK unwrapper (Stage 6B)")
 }
 
-const localEpochMaskU64 uint64 = 0xFFFF
+// nodeIDMask narrows a uint64 full_node_id to its low 16 bits to
+// match the §4.1 writer-registry key shape
+// (`!encryption|writers|<dek_id>|<be2 uint16(node_id)>`). The
+// mask happens to share the value 0xFFFF with the unrelated
+// local_epoch field width, but the semantic purpose here is
+// FullNodeID truncation — gemini-code-assist PR #765 round-1
+// medium flagged the original `localEpochMaskU64` name as
+// misleading at this call site. Untyped so the cast at the
+// call site is explicit (no implicit uint64 promotion).
+const nodeIDMask = 0xFFFF
