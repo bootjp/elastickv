@@ -358,11 +358,11 @@ func (s *EncryptionAdminServer) BootstrapEncryption(ctx context.Context, req *pb
 			"encryption: storage_dek_id and raft_dek_id must differ; got both %d",
 			req.GetStorageDekId())
 	}
-	if len(req.GetWrappedStorageDek()) == 0 {
-		return nil, grpcStatusError(codes.InvalidArgument, "encryption: wrapped_storage_dek is required")
+	if err := validateWrappedDEK("storage", req.GetWrappedStorageDek()); err != nil {
+		return nil, err
 	}
-	if len(req.GetWrappedRaftDek()) == 0 {
-		return nil, grpcStatusError(codes.InvalidArgument, "encryption: wrapped_raft_dek is required")
+	if err := validateWrappedDEK("raft", req.GetWrappedRaftDek()); err != nil {
+		return nil, err
 	}
 	batch, err := buildBootstrapBatch(req.GetWriterBatch(), req.GetStorageDekId(), req.GetRaftDekId())
 	if err != nil {
@@ -413,6 +413,9 @@ func buildBootstrapBatch(writers []*pb.WriterRegistryEntry, storageDEKID, raftDE
 			fsmwire.RegistrationPayload{DEKID: raftDEKID, FullNodeID: row.FullNodeID, LocalEpoch: row.LocalEpoch},
 		)
 	}
+	if err := validateWriterBatchUniqueness(writers); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -446,6 +449,66 @@ func validateBootstrapWriter(i int, w *pb.WriterRegistryEntry) (fsmwire.Registra
 // nonce-uniqueness invariant covers both envelope purposes from
 // the first post-bootstrap entry.
 const bootstrapRowsPerWriter = 2
+
+// maxWrappedDEKSize bounds the KEK-wrapped DEK payload size at the
+// gRPC boundary so a crafted oversized blob cannot push
+// fsmwire.EncodeBootstrap toward its safeU32 length-prefix guard
+// or inflate the resulting Raft entry beyond practical limits.
+// A real KEK-wrapped 32-byte DEK runs hundreds of bytes (KMS
+// metadata + AES-GCM tag + envelope header); 4 KiB is ~10x
+// headroom and far below the gRPC default 4 MiB message cap.
+const maxWrappedDEKSize = 4096
+
+func validateWrappedDEK(purpose string, wrapped []byte) error {
+	if len(wrapped) == 0 {
+		return grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: wrapped_%s_dek is required", purpose)
+	}
+	if len(wrapped) > maxWrappedDEKSize {
+		return grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: wrapped_%s_dek size %d exceeds the %d-byte gRPC-boundary cap",
+			purpose, len(wrapped), maxWrappedDEKSize)
+	}
+	return nil
+}
+
+// validateWriterBatchUniqueness rejects writer batches that would
+// fail closed at FSM apply time: §4.1 case-3 (the same
+// full_node_id appearing twice → ErrLocalEpochRollback) and §4.1
+// case-4 (two distinct full_node_ids colliding on the uint16
+// narrowing used as the registry-row key → ErrNodeIDCollision).
+// FSM apply errors halt the apply loop via HaltApply, so a
+// malformed bootstrap that reached apply would stop the cluster.
+func validateWriterBatchUniqueness(writers []*pb.WriterRegistryEntry) error {
+	seenFull := make(map[uint64]int, len(writers))
+	seenTrunc := make(map[uint16]uint64, len(writers))
+	for i, w := range writers {
+		if w == nil {
+			continue
+		}
+		id := w.GetFullNodeId()
+		if prev, dup := seenFull[id]; dup {
+			return grpcStatusErrorf(codes.InvalidArgument,
+				"encryption: writer_batch[%d] duplicates full_node_id %d already present at index %d",
+				i, id, prev)
+		}
+		trunc := uint16(id & localEpochMaskU64) //nolint:gosec // masked to 16 bits; G115 cannot trace the bitwise narrowing
+		if prevFull, collision := seenTrunc[trunc]; collision {
+			return grpcStatusErrorf(codes.InvalidArgument,
+				"encryption: writer_batch[%d].full_node_id=%d collides with %d on the uint16 narrowing 0x%04x (registry key)",
+				i, id, prevFull, trunc)
+		}
+		seenFull[id] = i
+		seenTrunc[trunc] = id
+	}
+	return nil
+}
+
+// localEpochMaskU64 mirrors localEpochMask in uint64 form for the
+// uint64→uint16 narrowing used by the registry row key. Named
+// here so the magic-number linter does not flag the masking
+// conversion below.
+const localEpochMaskU64 uint64 = 0xFFFF
 
 // bootstrapBatchRowCap mirrors fsmwire.maxBootstrapBatchCount.
 // The §5.6 step 1a bootstrap produces (storage + raft) rows per

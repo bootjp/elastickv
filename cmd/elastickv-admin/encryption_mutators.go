@@ -171,15 +171,23 @@ func parseRotatePurposeFlag(s string) (pb.RotateDEKRequest_Purpose, error) {
 }
 
 func decodeWrappedDEKFlag(s string) ([]byte, error) {
+	return decodeWrappedDEKFlagWithName("wrapped-new-dek", s)
+}
+
+// decodeWrappedDEKFlagWithName is the flag-name-aware variant
+// used by bootstrap (which has two wrapped-DEK flags) so error
+// messages reference the actual flag the operator typed rather
+// than the rotate-dek default.
+func decodeWrappedDEKFlagWithName(flagName, s string) ([]byte, error) {
 	if s == "" {
-		return nil, errors.New("encryption: --wrapped-new-dek is required (base64 of the KEK-wrapped DEK)")
+		return nil, errors.Errorf("encryption: --%s is required (base64 of the KEK-wrapped DEK)", flagName)
 	}
 	out, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return nil, errors.Wrap(err, "encryption: --wrapped-new-dek is not valid base64")
+		return nil, errors.Wrapf(err, "encryption: --%s is not valid base64", flagName)
 	}
 	if len(out) == 0 {
-		return nil, errors.New("encryption: --wrapped-new-dek decoded to zero bytes")
+		return nil, errors.Errorf("encryption: --%s decoded to zero bytes", flagName)
 	}
 	return out, nil
 }
@@ -303,13 +311,13 @@ func validateBootstrapDEKIDs(storage, raft uint) error {
 }
 
 func decodeBootstrapWrappedDEKs(storageB64, raftB64 string) ([]byte, []byte, error) {
-	storage, err := decodeWrappedDEKFlag(storageB64)
+	storage, err := decodeWrappedDEKFlagWithName("wrapped-storage-dek", storageB64)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "--wrapped-storage-dek")
+		return nil, nil, err
 	}
-	raft, err := decodeWrappedDEKFlag(raftB64)
+	raft, err := decodeWrappedDEKFlagWithName("wrapped-raft-dek", raftB64)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "--wrapped-raft-dek")
+		return nil, nil, err
 	}
 	return storage, raft, nil
 }

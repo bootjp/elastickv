@@ -446,6 +446,77 @@ func TestEncryptionAdmin_BootstrapEncryption_RejectsBadInputs(t *testing.T) {
 	}
 }
 
+// TestEncryptionAdmin_BootstrapEncryption_RejectsDuplicateFullNodeID
+// pins the cluster-safety invariant: a writer batch that names
+// the same full_node_id twice would, after FSM apply, attempt to
+// re-register the same registry row with possibly-different
+// local_epochs — which the §4.1 case-3 rollback guard would
+// reject. FSM apply errors are fatal under the HaltApply seam,
+// so the cluster halts. Reject at the gRPC boundary instead.
+func TestEncryptionAdmin_BootstrapEncryption_RejectsDuplicateFullNodeID(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validBootstrapEncryptionRequest()
+	req.WriterBatch = []*pb.WriterRegistryEntry{
+		{FullNodeId: 7, LocalEpoch: 0},
+		{FullNodeId: 7, LocalEpoch: 0},
+	}
+	_, err := srv.BootstrapEncryption(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("status=%v, want InvalidArgument on duplicate full_node_id", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_BootstrapEncryption_RejectsNodeIDCollision
+// pins the §4.1 case-4 invariant: two distinct full_node_ids that
+// collide on the uint16 narrowing share the same registry row
+// key (!encryption|writers|<dek_id>|<uint16(node_id)>). The FSM
+// halts on ErrNodeIDCollision so the boundary must reject.
+func TestEncryptionAdmin_BootstrapEncryption_RejectsNodeIDCollision(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validBootstrapEncryptionRequest()
+	req.WriterBatch = []*pb.WriterRegistryEntry{
+		{FullNodeId: 0x0001_0000_0000_0007, LocalEpoch: 0}, // uint16=0x0007
+		{FullNodeId: 0x0002_0000_0000_0007, LocalEpoch: 0}, // same uint16, different upper bits
+	}
+	_, err := srv.BootstrapEncryption(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("status=%v, want InvalidArgument on uint16(node_id) collision", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_BootstrapEncryption_RejectsOversizeWrappedDEK
+// pins the DoS-defense bound: wrapped DEK payloads above the
+// per-field cap are rejected at the gRPC boundary so a crafted
+// request cannot push fsmwire.EncodeBootstrap toward its safeU32
+// guard.
+func TestEncryptionAdmin_BootstrapEncryption_RejectsOversizeWrappedDEK(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	huge := make([]byte, maxWrappedDEKSize+1)
+	for _, mut := range []func(r *pb.BootstrapEncryptionRequest){
+		func(r *pb.BootstrapEncryptionRequest) { r.WrappedStorageDek = huge },
+		func(r *pb.BootstrapEncryptionRequest) { r.WrappedRaftDek = huge },
+	} {
+		req := validBootstrapEncryptionRequest()
+		mut(req)
+		_, err := srv.BootstrapEncryption(context.Background(), req)
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("status=%v, want InvalidArgument on oversize wrapped DEK", status.Code(err))
+		}
+	}
+}
+
 func TestEncryptionAdmin_BootstrapEncryption_RejectsOversizeBatch(t *testing.T) {
 	t.Parallel()
 	srv := NewEncryptionAdminServer(
