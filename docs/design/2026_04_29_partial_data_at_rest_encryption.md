@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–4 shipped, Stages 5–9 open
+Status: Partial — Stages 0–5 shipped (5E deferred), Stages 6–9 open
 Author: bootjp
 Date: 2026-04-29
 
@@ -16,9 +16,14 @@ Date: 2026-04-29
 | 5A | `EncryptionAdmin` proto + read-only RPCs + `encryption status` CLI | shipped | PR #754 |
 | 5B | RotateDEK + RegisterEncryptionWriter (leader-only Proposer wiring) + `rotate-dek` / `register-writer` CLI + ResyncSidecar leader guard | shipped | PR #756 |
 | 5C | BootstrapEncryption + `encryption bootstrap` CLI + nil-leaderView startup `Validate()` enforcement | shipped | PR #759 |
-| 5D | main.go gRPC wiring (per-shard EncryptionAdmin registration + `--encryptionSidecarPath` flag) | in PR | — |
-| 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | open | — |
-| 6 | 3-phase rollout flags + applier wiring (§6.5, §7.1) | open | — |
+| 5D | main.go gRPC wiring (per-shard EncryptionAdmin registration + `--encryptionSidecarPath` flag) | shipped | PR #760 |
+| 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | deferred | — |
+| 6A | §6.3 `EncryptionApplier` concrete implementation (writer-registry insert + sidecar mutate + keystore update) + `kv.NewKvFSMWithHLC(... WithEncryption(applier))` wiring + re-enable mutating-RPC wiring in `registerEncryptionAdminServer` (gated on `--encryption-enabled`) | open | — |
+| 6B | §6.5 KEK plumbing — `--kekFile` / `--kekUri` flags + `internal/encryption/kek` selection at startup + applier KEK-unwrap path | open | — |
+| 6C | §6.5 `--encryption-enabled` + §9.1 startup refusal guards (sidecar present without flag, KEK mismatch, sidecar/raft index gap, filesystem fsync support, `local_epoch` rollback / exhaustion, `node_id` collision) | open | — |
+| 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate | open | — |
+| 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path | open | — |
+| 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal | open | — |
 | 7 | Writer registry + deterministic nonce (§4.1) | open | — |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |
 | 9 | KMS-backed wrappers, compression, rotation/retire/rewrite, Jepsen (§5.2, §5.4, §6.4, §8) | open | — |
@@ -27,8 +32,69 @@ Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
 inert**: no caller wires `WithEncryption`, the `--enable-storage-envelope`
 flag does not exist yet, and there is no admin RPC to propose a
-bootstrap entry. Stage 5 begins the operator-facing surface; Stage 6
-flips it on under a cluster flag.
+bootstrap entry. Stage 5 ships the operator-facing surface (admin
+RPCs + CLI + gRPC wiring); Stage 6 flips it on under a cluster flag.
+
+Stage 5E (capability fan-out helper) is deferred — its scope is
+narrowly the §5.6 step 1a auto-batch CLI convenience and does not
+gate any Stage 6 work. The existing CLI accepts the writer batch
+explicitly today (PR #759), which is sufficient for hand-authored
+bootstraps; the auto-batch helper can land any time after Stage 6F
+without changing the on-disk or wire format.
+
+### Stage 6 sub-milestone rationale
+
+Stage 6 was originally scoped as "3-phase rollout flags + applier
+wiring", but the chain of dependencies makes it impractical to land
+in a single PR. The breakdown above (6A → 6F) follows the same
+shipping-order principle as Stage 5 (5A → 5D shipped, 5E deferred):
+each milestone is independently reviewable, leaves the cluster in a
+production-safe state, and unblocks the next one.
+
+- **6A is the load-bearing safety boundary.** PR #760 round-3 codex
+  P1 established that mutating EncryptionAdmin RPCs are unsafe to
+  wire until the §6.3 applier exists, because a successful
+  `BootstrapEncryption` / `RotateDEK` / `RegisterEncryptionWriter`
+  proposal lands a `0x03`/`0x04`/`0x05` entry that hits the
+  fail-closed `ErrEncryptionApply` halt path on every replica's
+  FSM. 6A lands the concrete `EncryptionApplier`, wires it via
+  `WithEncryption` at FSM construction, and re-enables the
+  mutator wiring in `registerEncryptionAdminServer` — but gated
+  on a new `--encryption-enabled` flag that defaults off, so the
+  pre-6C "operator hasn't opted in yet" cluster is still in the
+  same production-inert state PR #760 left it in. The flag
+  exists in 6A only as a wire-mutators gate; the rest of the
+  §6.5 / §9.1 logic lands in 6B and 6C.
+
+- **6B isolates KEK plumbing.** `internal/encryption/kek` already
+  exists from Stage 0, but no main.go caller wires it. 6B
+  introduces `--kekFile` / `--kekUri` and threads a `KEKUnwrapper`
+  into the applier so `ApplyBootstrap` and `ApplyRotation` can
+  actually KEK-unwrap their wrapped DEKs. Splitting this off
+  from 6A keeps 6A's review surface focused on the FSM-apply
+  side; 6B's review surface is the KEK selection + startup
+  load + unwrap path.
+
+- **6C adds §9.1 refusal guards.** These are config / on-disk
+  consistency checks at process startup that block the binary
+  from running with a half-configured encryption state. They
+  are independent of the FSM apply path and the cutover RPCs,
+  so they land in their own PR.
+
+- **6D and 6E are the actual cutovers** (Phase 1 = storage, Phase
+  2 = raft). Each touches a different code path (§6.2 storage
+  vs. §6.3 raft engine hook), each has its own §7.1 capability
+  gate, and each records a different sidecar field. Keeping
+  them separate means a Phase-1 cluster (storage encrypted, raft
+  still cleartext) is a valid intermediate state that operators
+  can dwell in, observe, and rollback from if needed before
+  committing to Phase 2.
+
+- **6F is optional ergonomics.** `--encryption-rotate-on-startup`
+  is documented in §6.5 as a request, not a guarantee, and the
+  operator can always run `elastickv-admin encryption rotate-dek`
+  out-of-band. 6F lands the convenience flag after the four
+  load-bearing PRs (6A–6E) are in.
 
 ---
 
