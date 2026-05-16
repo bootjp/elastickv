@@ -8,16 +8,30 @@ import (
 	"google.golang.org/grpc"
 )
 
-// encryptionMutatorsEnabled is the Stage 6B-2 double-gate
-// readback. Returns true iff the operator has BOTH opted in
-// (--encryption-enabled) AND supplied a KEK source (--kekFile).
-// Either condition false → mutator wiring stays off.
+// encryptionMutatorsEnabled is the Stage 6B-2 triple-gate
+// readback. Returns true iff the operator has all three of:
+//
+//   - --encryption-enabled (explicit operator opt-in)
+//   - --kekFile non-empty (KEK source loaded so ApplyBootstrap
+//     / ApplyRotation can KEK-unwrap)
+//   - --encryptionSidecarPath non-empty (so the applier can
+//     crash-durably persist Active.{Storage,Raft} + keys[])
+//
+// Any one false → mutator wiring stays off. The sidecarPath
+// condition was added in PR #776 codex P1 — without it, an
+// operator with --encryption-enabled + --kekFile but no
+// --encryptionSidecarPath could call BootstrapEncryption, the
+// proposal would commit, and every replica's applier would
+// HaltApply with "bootstrap requires WithKEK + WithKeystore +
+// WithSidecarPath" because the applier's WithSidecarPath
+// option was omitted in buildShardGroups. The triple gate
+// keeps that halt unreachable.
 //
 // Kept in this file (not main.go) so the flag-driven gate logic
 // is colocated with the registerEncryptionAdminServer helper
 // that consumes it.
 func encryptionMutatorsEnabled() bool {
-	return *encryptionEnabled && *kekFile != ""
+	return *encryptionEnabled && *kekFile != "" && *encryptionSidecarPath != ""
 }
 
 // encryptionAdminEngine is the subset of raftengine.Engine the

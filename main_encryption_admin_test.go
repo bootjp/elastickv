@@ -114,10 +114,19 @@ func TestEncryptionAdmin_MutatingRPCEnabledWhenGateOn(t *testing.T) {
 	// Whatever the deeper error, it must not be the FailedPrecondition
 	// from the gate. The stub Propose() returns success on a malformed
 	// payload, so the actual return may be a deeper InvalidArgument
-	// or codes.OK — anything except FailedPrecondition is acceptable.
+	// or codes.OK — anything except FailedPrecondition / transport
+	// statuses is acceptable.
 	if err != nil {
-		if got := status.Code(err); got == codes.FailedPrecondition {
+		got := status.Code(err)
+		if got == codes.FailedPrecondition {
 			t.Errorf("BootstrapEncryption returned FailedPrecondition with gate ON; want a deeper status (gate should not refuse): err=%v", err)
+		}
+		// Bufconn transport failures or context-derived statuses
+		// would defeat the test purpose — fail loud rather than
+		// silently passing on infra noise (coderabbit PR #776
+		// minor).
+		if got == codes.Unavailable || got == codes.DeadlineExceeded || got == codes.Canceled {
+			t.Fatalf("BootstrapEncryption failed on test transport/setup, not gate behavior: code=%v err=%v", got, err)
 		}
 	}
 }

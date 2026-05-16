@@ -163,7 +163,7 @@ var (
 	// registerEncryptionAdminServer omits the Proposer + LeaderView
 	// options and every mutator short-circuits at the gRPC boundary
 	// with FailedPrecondition before any Raft proposal is created.
-	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter) are additionally gated on --encryption-enabled AND --kekFile being non-empty.")
+	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter) are additionally gated on this flag being non-empty AND --encryption-enabled AND --kekFile being non-empty (all three required so the applier's WithKEK + WithKeystore + WithSidecarPath options are all wired before mutators can commit).")
 
 	// Stage 6B-2: cluster-wide encryption opt-in flag. The mutating
 	// EncryptionAdmin RPCs (BootstrapEncryption, RotateDEK,
@@ -724,7 +724,7 @@ func buildShardGroups(
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
-	kekWrapper *kek.FileWrapper,
+	kekWrapper kek.Wrapper,
 	keystore *encryption.Keystore,
 	sidecarPath string,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
@@ -801,10 +801,12 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 
 // loadKEKWrapperFromFlag constructs the file-backed KEK wrapper
 // from the --kekFile flag, returning nil if the flag is empty.
-// The error is wrapped so the calling run() context surfaces in
-// the startup-failure log message. Extracted from run() to keep
-// the startup path under the cyclop complexity budget.
-func loadKEKWrapperFromFlag() (*kek.FileWrapper, error) {
+// Returns the kek.Wrapper interface rather than the concrete
+// *kek.FileWrapper so the call site (buildShardGroups → applier)
+// stays decoupled from the file-mode provider — Stage 9 KMS
+// providers (AWS KMS, GCP KMS, Vault) will satisfy the same
+// interface and slot in without rewriting the dispatch site.
+func loadKEKWrapperFromFlag() (kek.Wrapper, error) {
 	if *kekFile == "" {
 		return nil, nil
 	}
@@ -821,7 +823,14 @@ func loadKEKWrapperFromFlag() (*kek.FileWrapper, error) {
 // suppresses its option, leaving the applier in the Stage 6A
 // posture for that axis. Extracted from buildShardGroups so the
 // per-shard loop stays under the cyclop complexity budget.
-func applierOptionsFor(kekWrapper *kek.FileWrapper, keystore *encryption.Keystore, sidecarPath string) []encryption.ApplierOption {
+//
+// kekWrapper is typed as encryption.KEKUnwrapper (the
+// applier-side narrow interface) rather than the wider
+// kek.Wrapper so the helper stays decoupled from the wrap-side
+// path. Any kek.Wrapper satisfies encryption.KEKUnwrapper
+// structurally because both declare Unwrap with the same
+// signature.
+func applierOptionsFor(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, sidecarPath string) []encryption.ApplierOption {
 	const maxOpts = 3
 	opts := make([]encryption.ApplierOption, 0, maxOpts)
 	if kekWrapper != nil {
