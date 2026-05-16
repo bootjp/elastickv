@@ -619,3 +619,100 @@ func TestApplyRotation_UnknownPurpose(t *testing.T) {
 		t.Errorf("err not marked ErrEncryptionApply: %v", err)
 	}
 }
+
+// TestNewApplier_RejectsNilOption pins the construction-time guard
+// against nil ApplierOption values. A `WithNowFunc(nil)` (or any
+// other nil opt passed by mistake) would silently overwrite the
+// default and panic at apply time when a.now() is invoked. The
+// guard surfaces the misconfiguration at startup.
+func TestNewApplier_RejectsNilOption(t *testing.T) {
+	t.Parallel()
+	_, err := encryption.NewApplier(newMapRegistryStore(), nil)
+	if err == nil {
+		t.Fatal("NewApplier(reg, nil) returned no error; want construction-time refusal")
+	}
+}
+
+// TestNewApplier_RejectsNilNowFunc pins the specific nil-clock
+// guard. Construction MUST refuse when WithNowFunc(nil) overwrites
+// the default time.Now — otherwise a.now() would nil-deref on
+// the first Bootstrap/Rotation apply.
+func TestNewApplier_RejectsNilNowFunc(t *testing.T) {
+	t.Parallel()
+	_, err := encryption.NewApplier(newMapRegistryStore(), encryption.WithNowFunc(nil))
+	if err == nil {
+		t.Fatal("NewApplier(reg, WithNowFunc(nil)) returned no error; want construction-time refusal")
+	}
+}
+
+// TestApplyBootstrap_RejectsIdenticalDEKIDs pins the §5.1 per-purpose
+// separation invariant. If StorageDEKID == RaftDEKID, the second
+// sc.Keys[...] assignment in writeBootstrapSidecar would overwrite
+// the first, silently mis-labelling the surviving key's purpose
+// (storage vs raft). The applier halts apply with ErrEncryptionApply
+// so a malformed bootstrap payload cannot corrupt the sidecar.
+func TestApplyBootstrap_RejectsIdenticalDEKIDs(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(dir+"/keys.json"),
+	)
+	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID:   7,
+		WrappedStorage: []byte("s"),
+		RaftDEKID:      7, // same as Storage
+		WrappedRaft:    []byte("r"),
+	})
+	if err == nil {
+		t.Fatal("expected halt on identical DEK IDs, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	// Sidecar must not have been written.
+	if _, err := encryption.ReadSidecar(dir + "/keys.json"); err == nil {
+		t.Error("sidecar was written despite rejection")
+	}
+}
+
+// TestApplyRotation_RejectsProposerDEKMismatch pins the
+// ProposerRegistration vs rotated DEK invariant: the proposer's
+// first-writer row MUST target the new DEK (that is the whole
+// point of bundling it atomically with the rotate-dek entry per
+// §5.2). A mismatch mutates writer-registry state for an
+// unrelated DEK and leaves the rotated DEK unregistered.
+func TestApplyRotation_RejectsProposerDEKMismatch(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s"),
+		RaftDEKID: 2, WrappedRaft: []byte("r"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	err := app.ApplyRotation(fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                5, // rotating to id 5
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte("w"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 99, FullNodeID: 0xAA, LocalEpoch: 0}, // mismatch
+	})
+	if err == nil {
+		t.Fatal("expected halt on proposer-registration DEK mismatch, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+}

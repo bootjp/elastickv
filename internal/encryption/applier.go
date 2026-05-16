@@ -148,8 +148,18 @@ func NewApplier(registry WriterRegistryStore, opts ...ApplierOption) (*Applier, 
 		return nil, errors.New("encryption: NewApplier: registry is nil")
 	}
 	a := &Applier{registry: registry, now: time.Now}
-	for _, opt := range opts {
+	for i, opt := range opts {
+		if opt == nil {
+			return nil, errors.Errorf("encryption: NewApplier: opts[%d] is nil", i)
+		}
 		opt(a)
+	}
+	// WithNowFunc(nil) would overwrite the default and later panic
+	// at apply time when a.now() is invoked. Fail fast at
+	// construction so the misconfiguration surfaces at startup
+	// rather than deep inside a Raft apply loop.
+	if a.now == nil {
+		return nil, errors.New("encryption: NewApplier: WithNowFunc(nil) overwrote default time.Now")
 	}
 	return a, nil
 }
@@ -310,6 +320,15 @@ func (a *Applier) ApplyBootstrap(p fsmwire.BootstrapPayload) error {
 	if !a.bootstrapAndRotationConfigured() {
 		return errors.Wrap(ErrKEKNotConfigured, "applier: bootstrap requires WithKEK + WithKeystore + WithSidecarPath")
 	}
+	// Storage and raft DEK IDs MUST differ. If they collided, the
+	// second sc.Keys[...] assignment would overwrite the first,
+	// silently mis-labelling the purpose of the lone surviving
+	// key — a violation of §5.1's per-purpose DEK separation
+	// invariant. Halt rather than silently corrupt the sidecar.
+	if p.StorageDEKID == p.RaftDEKID {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: bootstrap requires distinct storage and raft DEK IDs (got %d for both)", p.StorageDEKID)
+	}
 	storageDEK, err := a.kek.Unwrap(p.WrappedStorage)
 	if err != nil {
 		return errors.Wrap(err, "applier: kek-unwrap storage DEK")
@@ -407,6 +426,18 @@ func (a *Applier) ApplyRotation(p fsmwire.RotationPayload) error {
 	if p.SubTag != fsmwire.RotateSubRotateDEK {
 		return errors.Wrapf(ErrEncryptionApply,
 			"applier: rotation sub_tag %#x not implemented in Stage 6B-1", p.SubTag)
+	}
+	// The proposer-registration row MUST target the rotated DEK ID
+	// — that is the whole point of including it atomically with the
+	// rotate-dek entry (§5.2): cover the proposer's first encrypted
+	// write under the NEW DEK with a §4.1 case-1 first-seen row.
+	// Accepting a different DEK ID would mutate writer-registry
+	// state for an unrelated DEK while leaving the rotated DEK
+	// unregistered, silently breaking the rotate-dek invariant.
+	if p.ProposerRegistration.DEKID != p.DEKID {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: rotation proposer_registration.dek_id=%d does not match rotation dek_id=%d",
+			p.ProposerRegistration.DEKID, p.DEKID)
 	}
 	dek, err := a.kek.Unwrap(p.Wrapped)
 	if err != nil {
