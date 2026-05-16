@@ -1292,7 +1292,7 @@ func startRaftServers(
 		// FNV-1a hash already used by raftengine for peer ids
 		// (etcd.DeriveNodeID), so every node in the cluster reports
 		// a stable, distinct value. Codex r1 P1 on PR #760.
-		registerEncryptionAdminServer(gs, rt.engine, etcdraftengine.DeriveNodeID(*raftId))
+		registerEncryptionAdminServer(gs, rt.engine, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})

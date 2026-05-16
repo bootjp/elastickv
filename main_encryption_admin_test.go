@@ -75,16 +75,9 @@ func TestEncryptionAdminFullNodeID_DistinctPerRaftId(t *testing.T) {
 // the call would have reached the stub Propose() and returned a
 // fake success.
 func TestEncryptionAdmin_MutatingRPCRefusedWithoutSidecarPath(t *testing.T) {
-	// Force the global flag to empty for this test (the default
-	// already is, but be explicit so a future change to the flag
-	// default does not silently invalidate the assertion).
-	prev := *encryptionSidecarPath
-	*encryptionSidecarPath = ""
-	t.Cleanup(func() { *encryptionSidecarPath = prev })
-
 	listener := bufconn.Listen(1024 * 1024)
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, stubEncryptionAdminEngine{}, 1)
+	registerEncryptionAdminServer(gs, stubEncryptionAdminEngine{}, 1, "")
 	go func() { _ = gs.Serve(listener) }()
 	t.Cleanup(gs.Stop)
 
@@ -117,7 +110,7 @@ func TestEncryptionAdmin_MutatingRPCRefusedWithoutSidecarPath(t *testing.T) {
 
 func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, stubEncryptionAdminEngine{}, 1)
+	registerEncryptionAdminServer(gs, stubEncryptionAdminEngine{}, 1, "")
 	// reflection-style check: the service descriptor must show up
 	// in the registered service map. grpc.Server exposes this via
 	// GetServiceInfo.

@@ -60,13 +60,13 @@ type encryptionAdminEngine interface {
 // together (both wired iff sidecarPath set) so the invariant
 // holds by construction — the panic is the load-bearing guard
 // against a future refactor that splits the two options apart.
-func registerEncryptionAdminServer(gs *grpc.Server, engine encryptionAdminEngine, fullNodeID uint64) {
+func registerEncryptionAdminServer(gs *grpc.Server, engine encryptionAdminEngine, fullNodeID uint64, sidecarPath string) {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
-	if *encryptionSidecarPath != "" {
+	if sidecarPath != "" {
 		opts = append(opts,
-			adapter.WithEncryptionAdminSidecarPath(*encryptionSidecarPath),
+			adapter.WithEncryptionAdminSidecarPath(sidecarPath),
 			adapter.WithEncryptionAdminProposer(engine),
 			adapter.WithEncryptionAdminLeaderView(engine),
 		)
