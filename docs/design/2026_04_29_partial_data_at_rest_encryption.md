@@ -15,8 +15,9 @@ Date: 2026-04-29
 | 4 | FSM-internal Raft entry types (§5.6, §5.2 wire, §11.3 reserved opcodes) | shipped | PR #748 |
 | 5A | `EncryptionAdmin` proto + read-only RPCs + `encryption status` CLI | shipped | PR #754 |
 | 5B | RotateDEK + RegisterEncryptionWriter (leader-only Proposer wiring) + `rotate-dek` / `register-writer` CLI + ResyncSidecar leader guard | shipped | PR #756 |
-| 5C | BootstrapEncryption + `encryption bootstrap` CLI + nil-leaderView startup `Validate()` enforcement | in PR | — |
-| 5D | §5.6 step 1a capability fan-out helper + main.go gRPC wiring | open | — |
+| 5C | BootstrapEncryption + `encryption bootstrap` CLI + nil-leaderView startup `Validate()` enforcement | shipped | PR #759 |
+| 5D | main.go gRPC wiring (per-shard EncryptionAdmin registration + `--encryptionSidecarPath` flag) | in PR | — |
+| 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | open | — |
 | 6 | 3-phase rollout flags + applier wiring (§6.5, §7.1) | open | — |
 | 7 | Writer registry + deterministic nonce (§4.1) | open | — |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |

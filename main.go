@@ -141,6 +141,28 @@ var (
 	adminReadOnlyAccessKeys            = flag.String("adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
 	adminFullAccessKeys                = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
 
+	// Data-at-rest encryption admin RPC wiring (Stage 5D). The
+	// EncryptionAdmin gRPC service is reachable on every shard's
+	// gRPC listener so the §7.1 Phase-0 GetCapability fan-out can
+	// poll any member.
+	//
+	// This flag gates ONLY the read-only capability surface:
+	// empty → GetCapability reports encryption_capable=false (the
+	// §7.1 cutover refuses with ErrCapabilityCheckFailed);
+	// set   → capability probing reads the §5.1 keys.json and
+	// reports encryption_capable=true.
+	//
+	// Mutating RPCs (BootstrapEncryption / RotateDEK /
+	// RegisterEncryptionWriter) are refused with FailedPrecondition
+	// regardless of this flag. The §6.3 WithEncryption FSM applier
+	// is plumbed by Stage 6; until then registerEncryptionAdminServer
+	// installs neither the Proposer nor the LeaderView, so every
+	// mutator short-circuits at the gRPC boundary before any Raft
+	// proposal is created. Setting --encryptionSidecarPath does
+	// NOT enable mutating RPCs; Stage 6 wires the applier and the
+	// Proposer + LeaderView together in the same change.
+	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter) are refused with FailedPrecondition regardless of this flag until Stage 6 wires the §6.3 FSM applier together with the Proposer + LeaderView.")
+
 	// Key visualizer sampler flags. The sampler runs entirely in-memory
 	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
 	// by default — opt in with --keyvizEnabled. The other flags are
@@ -1267,6 +1289,18 @@ func startRaftServers(
 		if adminServer != nil {
 			pb.RegisterAdminServer(gs, adminServer)
 		}
+		// full_node_id MUST be per-node-stable, not per-shard.
+		// rt.spec.id is the Raft group id which every replica of
+		// the same group shares; using it as full_node_id makes
+		// every node return the same CapabilityReport value and
+		// BootstrapEncryption's writer-batch uniqueness validation
+		// (adapter/encryption_admin.go validateWriterBatchUniqueness)
+		// rejects the bootstrap with "duplicate full_node_id".
+		// Derive a per-node uint64 from --raftId via the canonical
+		// FNV-1a hash already used by raftengine for peer ids
+		// (etcd.DeriveNodeID), so every node in the cluster reports
+		// a stable, distinct value. Codex r1 P1 on PR #760.
+		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
