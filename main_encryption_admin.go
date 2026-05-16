@@ -37,27 +37,39 @@ type encryptionAdminEngine interface {
 // number — Codex r1 P1 on PR #760 caught the original wiring
 // passing the shard id by mistake.
 //
-// Production-inert until Stage 6:
+// Production-inert until Stage 6 — gating on --encryptionSidecarPath:
 //   - sidecarPath is empty by default, so GetCapability returns
 //     encryption_capable=false (the §7.1 cutover refuses with
 //     ErrCapabilityCheckFailed).
-//   - The §6.3 WithEncryption applier seam is still unwired on the
-//     FSM side, so a successfully-applied bootstrap entry is a
-//     no-op storage-side.
+//   - Proposer + LeaderView are wired ONLY when sidecarPath is
+//     set. Without them, RotateDEK / BootstrapEncryption /
+//     RegisterEncryptionWriter return FailedPrecondition
+//     "proposer is not configured on this node" at the RPC
+//     boundary — before any Raft proposal is issued. This is
+//     the load-bearing safety boundary against Codex r2 P1: the
+//     §6.3 WithEncryption applier seam is still unwired on the
+//     FSM side pre-Stage-6, so a successfully-applied bootstrap
+//     entry would hit the fail-closed halt path in
+//     kvFSM.applyEncryption (nil applier) and stop the apply
+//     loop cluster-wide. Refusing the proposal at the RPC layer
+//     means an accidental client call cannot escalate from a
+//     single RPC into a cluster-halt.
 //
 // Validate() panics on a misconfiguration that wires a proposer
-// without a LeaderView. The single callsite passes the same engine
-// for both options, so the invariant holds by construction — the
-// panic is the load-bearing guard against a future refactor that
-// splits the two options apart.
+// without a LeaderView. The wiring below pairs both options
+// together (both wired iff sidecarPath set) so the invariant
+// holds by construction — the panic is the load-bearing guard
+// against a future refactor that splits the two options apart.
 func registerEncryptionAdminServer(gs *grpc.Server, engine encryptionAdminEngine, fullNodeID uint64) {
 	opts := []adapter.EncryptionAdminServerOption{
-		adapter.WithEncryptionAdminProposer(engine),
-		adapter.WithEncryptionAdminLeaderView(engine),
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
 	if *encryptionSidecarPath != "" {
-		opts = append(opts, adapter.WithEncryptionAdminSidecarPath(*encryptionSidecarPath))
+		opts = append(opts,
+			adapter.WithEncryptionAdminSidecarPath(*encryptionSidecarPath),
+			adapter.WithEncryptionAdminProposer(engine),
+			adapter.WithEncryptionAdminLeaderView(engine),
+		)
 	}
 	srv := adapter.NewEncryptionAdminServer(opts...)
 	if err := srv.Validate(); err != nil {
