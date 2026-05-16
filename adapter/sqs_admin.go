@@ -124,9 +124,14 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string, opts ..
 // mergeDescribeQueueOptions folds the variadic opts into a single
 // effective option set. Variadic was chosen over a struct parameter
 // so the change is source-compatible with existing callers; a future
-// opt that conflicts with another can fail explicitly here. Only the
-// last value of each field wins, matching the
-// "later-wins" convention used in other elastickv adapters.
+// opt that conflicts with another can fail explicitly here. Each
+// enable-flag uses "any-true wins" semantics: once any opt sets a
+// field to true, no later opt can unset it. This matches the
+// intuitive read of opts as a sequence of "things I want enabled"
+// rather than an override chain — if any opt asks for the DLQ scan,
+// it runs. When a future field needs override semantics (e.g. a
+// limit that the caller wants to lower), the merge logic for that
+// field should be spelled out explicitly here instead.
 func mergeDescribeQueueOptions(opts []AdminDescribeQueueOptions) AdminDescribeQueueOptions {
 	var out AdminDescribeQueueOptions
 	for _, o := range opts {
