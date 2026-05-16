@@ -677,6 +677,79 @@ func TestApplyBootstrap_RejectsSecondBootstrapWithDifferentDEKs(t *testing.T) {
 		t.Errorf("Active = (%d, %d), want (1, 2) — second bootstrap mutated sidecar despite rejection",
 			sc.Active.Storage, sc.Active.Raft)
 	}
+	// Keystore must NOT contain the rejected DEK IDs (guard fires
+	// before kek.Unwrap / keystore.Set), matching the pattern set
+	// by TestApplyBootstrap_RejectsForeignBatchRegistryDEK.
+	if ks.Has(7) || ks.Has(8) {
+		t.Error("keystore mutated despite rejection of second bootstrap")
+	}
+}
+
+// TestApplyBootstrap_RejectsSecondBootstrapWithSameIDsDifferentWrapped
+// pins the stricter idempotency invariant: a second bootstrap with
+// the SAME DEK IDs but DIFFERENT wrapped DEK bytes MUST be
+// rejected. The DEK-ID-only check alone would have allowed the
+// second apply to continue, which would then re-run
+// writeBootstrapSidecar (overwriting keys[].Wrapped with the new
+// bytes) and iterate the BatchRegistry — potentially mutating
+// writer-registry state for previously-unregistered nodes through
+// the §4.1 case-1 first-seen path.
+//
+// Raft determinism couples wrapped DEK bytes to the entry hash,
+// so a legitimate replay always has matching wrapped bytes. A
+// mismatch is necessarily a malformed or malicious second bootstrap.
+func TestApplyBootstrap_RejectsSecondBootstrapWithSameIDsDifferentWrapped(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	// First bootstrap with wrapped bytes "s1" / "r2".
+	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1-orig"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2-orig"),
+	}); err != nil {
+		t.Fatalf("first ApplyBootstrap: %v", err)
+	}
+	// Second bootstrap with same DEK IDs but different wrapped bytes.
+	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1-tampered"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2-tampered"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			// Adding a previously-unregistered node — would silently
+			// insert via §4.1 case-1 if the second bootstrap had
+			// been allowed through.
+			{DEKID: 1, FullNodeID: 0x99, LocalEpoch: 0},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected halt on same-IDs/different-wrapped second bootstrap, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	// Verify no side effects: keys[].Wrapped still has the ORIGINAL
+	// bytes (not the tampered bytes), and the previously-
+	// unregistered node 0x99 was NOT inserted into the registry.
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if got := sc.Keys["1"].Wrapped; string(got) != "s1-orig" {
+		t.Errorf("keys[1].Wrapped = %q, want %q (second bootstrap should not have overwritten)", got, "s1-orig")
+	}
+	if got := sc.Keys["2"].Wrapped; string(got) != "r2-orig" {
+		t.Errorf("keys[2].Wrapped = %q, want %q", got, "r2-orig")
+	}
+	rejectedRowKey := encryption.RegistryKey(1, 0x99)
+	if _, ok, _ := reg.GetRegistryRow(rejectedRowKey); ok {
+		t.Error("writer-registry row for previously-unregistered node was inserted despite second-bootstrap rejection")
+	}
 }
 
 // TestApplyBootstrap_RejectsForeignBatchRegistryDEK pins the §5.6

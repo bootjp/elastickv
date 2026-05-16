@@ -1,6 +1,7 @@
 package encryption
 
 import (
+	"bytes"
 	"strconv"
 	"time"
 
@@ -397,15 +398,31 @@ func (a *Applier) validateBootstrap(p fsmwire.BootstrapPayload) error {
 }
 
 // checkBootstrapIdempotency enforces the §5.6 one-time-bootstrap
-// invariant. A second committed bootstrap entry with DIFFERENT
-// DEK IDs would re-point Active.{Storage,Raft} outside the
-// rotation path, leaving writer-registry and key-lifecycle
-// semantics inconsistent with the bootstrap/rotation contract.
+// invariant. A second committed bootstrap entry would re-point
+// Active.{Storage,Raft} or mutate writer-registry state outside
+// the rotation path, leaving key-lifecycle semantics inconsistent
+// with the bootstrap/rotation contract.
 //
 // Raft replay of the SAME bootstrap entry (e.g., crash after
 // bootstrap apply but before snapshot) is idempotent and allowed
-// — the existing sidecar's Active slots will match the payload's
-// DEK IDs exactly, so the check falls through.
+// — Raft entry bytes are deterministic across replicas, so a
+// legitimate replay has the same DEK IDs AND the same wrapped
+// DEK material as the original apply. The check compares both:
+//
+//  1. DEK IDs must match Active.{Storage,Raft} (otherwise the
+//     second bootstrap is rerouting active keys outside the
+//     rotation path).
+//  2. Wrapped DEK bytes must match sc.Keys[id].Wrapped
+//     (otherwise the second bootstrap is installing DIFFERENT
+//     key material under the same id — a divergent BatchRegistry
+//     would necessarily reach apply through such a payload
+//     because Raft determinism couples wrapped bytes to the
+//     entire entry hash).
+//
+// If both DEK IDs and wrapped bytes match, the BatchRegistry
+// rows must also match by Raft determinism — replay through
+// ApplyRegistration is then safe via the §4.1 case-2-idempotent
+// path.
 //
 // Split out from validateBootstrap so the dispatch path stays
 // below the cyclop complexity budget.
@@ -420,12 +437,40 @@ func (a *Applier) checkBootstrapIdempotency(p fsmwire.BootstrapPayload) error {
 	if sc.Active.Storage == 0 && sc.Active.Raft == 0 {
 		return nil
 	}
-	if sc.Active.Storage == p.StorageDEKID && sc.Active.Raft == p.RaftDEKID {
-		return nil
+	if sc.Active.Storage != p.StorageDEKID || sc.Active.Raft != p.RaftDEKID {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: cluster already bootstrapped (Active.Storage=%d, Active.Raft=%d); cannot re-bootstrap to (%d, %d) — use rotate-dek",
+			sc.Active.Storage, sc.Active.Raft, p.StorageDEKID, p.RaftDEKID)
 	}
-	return errors.Wrapf(ErrEncryptionApply,
-		"applier: cluster already bootstrapped (Active.Storage=%d, Active.Raft=%d); cannot re-bootstrap to (%d, %d) — use rotate-dek",
-		sc.Active.Storage, sc.Active.Raft, p.StorageDEKID, p.RaftDEKID)
+	if err := a.checkBootstrapWrappedMatches(sc, p); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkBootstrapWrappedMatches compares the payload's wrapped DEK
+// bytes against the existing sidecar entries at the same DEK IDs.
+// A mismatch indicates a second bootstrap entry committed with
+// the same DEK IDs but different wrapped material — Raft
+// determinism couples wrapped bytes to the entry hash, so
+// matching wrapped bytes is the stable proof of a legitimate
+// idempotent replay.
+//
+// Split out from checkBootstrapIdempotency to keep that helper
+// under the cyclop complexity budget.
+func (a *Applier) checkBootstrapWrappedMatches(sc *Sidecar, p fsmwire.BootstrapPayload) error {
+	storageKey, hasStorage := sc.Keys[strconv.FormatUint(uint64(p.StorageDEKID), 10)]
+	raftKey, hasRaft := sc.Keys[strconv.FormatUint(uint64(p.RaftDEKID), 10)]
+	if !hasStorage || !hasRaft {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: sidecar inconsistent — Active matches (%d, %d) but keys map missing one or both entries",
+			p.StorageDEKID, p.RaftDEKID)
+	}
+	if !bytes.Equal(storageKey.Wrapped, p.WrappedStorage) || !bytes.Equal(raftKey.Wrapped, p.WrappedRaft) {
+		return errors.Wrap(ErrEncryptionApply,
+			"applier: cluster already bootstrapped with different wrapped DEK material at the same DEK IDs — use rotate-dek")
+	}
+	return nil
 }
 
 // writeBootstrapSidecar reads the existing sidecar (or starts a
