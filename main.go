@@ -144,13 +144,16 @@ var (
 	// Data-at-rest encryption admin RPC wiring (Stage 5D). The
 	// EncryptionAdmin gRPC service is reachable on every shard's
 	// gRPC listener so the §7.1 Phase-0 GetCapability fan-out can
-	// poll any member. Mutating RPCs (Bootstrap / RotateDEK /
-	// RegisterEncryptionWriter) are leader-gated through the
-	// shard's raftengine.LeaderView. The cluster-flag gate that
-	// turns encryption ON is Stage 6 (§7.1); this flag only points
-	// the server at the §5.1 sidecar so the read-only probes can
-	// report capability state without enabling encryption.
-	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; empty disables the read-only EncryptionAdmin sidecar probes. Mutating RPCs are unaffected (they are leader-gated through raftengine).")
+	// poll any member. This flag is the load-bearing gate for the
+	// mutating RPCs pre-Stage 6: setting it wires the proposer +
+	// LeaderView so RotateDEK / BootstrapEncryption /
+	// RegisterEncryptionWriter become reachable on the shard's
+	// leader; leaving it empty omits both options so those RPCs
+	// short-circuit at the gRPC boundary with FailedPrecondition
+	// before any Raft proposal is created. The cluster-flag gate
+	// that turns the §6.3 FSM applier ON — and thereby makes a
+	// committed mutator entry actually do something — is Stage 6.
+	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; empty disables EncryptionAdmin sidecar capability probing AND leaves mutating EncryptionAdmin RPCs unwired on this node (proposer + LeaderView omitted → FailedPrecondition at the RPC boundary).")
 
 	// Key visualizer sampler flags. The sampler runs entirely in-memory
 	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
