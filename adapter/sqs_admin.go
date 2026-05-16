@@ -1,11 +1,14 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
@@ -24,6 +27,19 @@ type AdminQueueSummary struct {
 	CreatedAt  time.Time
 	Attributes map[string]string
 	Counters   AdminQueueCounters
+	// IsDLQ is true when at least one other queue's RedrivePolicy
+	// resolves its deadLetterTargetArn to this queue. The SPA uses
+	// the flag to switch the Messages-tab framing and the Purge
+	// button label between "Purge messages" and "Purge DLQ".
+	IsDLQ bool
+	// DLQSources lists the names of queues whose RedrivePolicy
+	// points at this queue, in lexicographic order. Empty when
+	// IsDLQ is false. Used by the SPA to render confirmation copy
+	// like "This queue is the DLQ for orders, payments". The
+	// computation is a paginated reverse scan over the queue-meta
+	// prefix at the same read timestamp as the meta load; values
+	// reflect the same MVCC snapshot the rest of the summary does.
+	DLQSources []string
 }
 
 // AdminQueueCounters matches sqsApproxCounters (int64) so the admin
@@ -68,7 +84,92 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string) (*Admin
 	if err != nil {
 		return nil, false, err
 	}
-	return adminQueueSummary(name, meta, counters, s.queueArn(name)), true, nil
+	sources, err := s.findQueuesPointingAt(ctx, name, readTS)
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	summary := adminQueueSummary(name, meta, counters, s.queueArn(name))
+	if len(sources) > 0 {
+		summary.IsDLQ = true
+		summary.DLQSources = sources
+	}
+	return summary, true, nil
+}
+
+// findQueuesPointingAt walks the queue-meta catalog at readTS and
+// returns the names of queues whose parsed RedrivePolicy resolves
+// deadLetterTargetArn to dlqName. The result is sorted
+// lexicographically so callers (and audit logs) see a stable order.
+//
+// The scan reuses scanQueueNamesAt's loop shape — paginated
+// ScanAt(prefix, end, sqsQueueScanPageLimit) calls advanced via
+// nextScanCursorAfter — so a deployment with > 1024 queues still
+// surfaces every source link. A single-page formulation would
+// silently cap at 1024 and mislabel the SPA Purge button on any
+// queue whose sources spilled past the first page.
+//
+// Catalog records that fail to decode are skipped (a malformed meta
+// record is a programmer / corruption bug, not a DLQ-detection bug —
+// dropping it keeps Describe usable rather than failing the whole
+// call). Records without a RedrivePolicy are skipped because
+// parseRedrivePolicy requires a non-empty value; the scan only pays
+// the JSON parse cost on queues that have a policy configured.
+func (s *SQSServer) findQueuesPointingAt(ctx context.Context, dlqName string, readTS uint64) ([]string, error) {
+	prefix := []byte(SqsQueueMetaPrefix)
+	end := prefixScanEnd(prefix)
+	start := bytes.Clone(prefix)
+	var sources []string
+	for {
+		page, err := s.store.ScanAt(ctx, start, end, sqsQueueScanPageLimit, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		sources, _ = collectDLQSources(page, prefix, dlqName, sources)
+		if len(page) < sqsQueueScanPageLimit {
+			break
+		}
+		start = nextScanCursorAfter(page[len(page)-1].Key)
+		if end != nil && bytes.Compare(start, end) > 0 {
+			break
+		}
+	}
+	sort.Strings(sources)
+	return sources, nil
+}
+
+// collectDLQSources walks one ScanAt page and appends every queue
+// whose RedrivePolicy resolves to dlqName. Pulled out of
+// findQueuesPointingAt so the outer pagination loop stays under the
+// cyclop budget. The bool return signals "stop scanning further
+// pages" — set when a key outside the queue-meta prefix is observed
+// (the catalog ended; subsequent pages cannot contain queues).
+func collectDLQSources(page []*store.KVPair, prefix []byte, dlqName string, sources []string) ([]string, bool) {
+	for _, kvp := range page {
+		if !bytes.HasPrefix(kvp.Key, prefix) {
+			return sources, true
+		}
+		srcName, ok := queueNameFromMetaKey(kvp.Key)
+		if !ok || srcName == dlqName {
+			// Skip self: a queue's own RedrivePolicy
+			// pointing at itself is rejected at catalog
+			// write time (registerRedriveTarget); this is
+			// defense-in-depth for that invariant.
+			continue
+		}
+		meta, decErr := decodeSQSQueueMeta(kvp.Value)
+		if decErr != nil || meta.RedrivePolicy == "" {
+			continue
+		}
+		policy, parseErr := parseRedrivePolicy(meta.RedrivePolicy)
+		if parseErr != nil || policy.DLQName != dlqName {
+			continue
+		}
+		sources = append(sources, srcName)
+	}
+	return sources, false
 }
 
 // adminQueueSummary projects a queue meta + counters into the
@@ -95,6 +196,90 @@ func adminQueueSummary(name string, meta *sqsQueueMeta, counters sqsApproxCounte
 		Attributes: metaAttributesForAdmin(meta, queueArn),
 		Counters:   AdminQueueCounters(counters),
 	}
+}
+
+// AdminPurgeResult is the success return of AdminPurgeQueue. The
+// generation values are captured from the committed OCC round, not a
+// separate pre/post meta read — a second loadQueueMetaAt call would
+// race a concurrent purge resetting LastPurgedAtMillis in the
+// 60-second window and could log generation values that never
+// appeared as a single consistent state.
+type AdminPurgeResult struct {
+	GenerationBefore uint64
+	GenerationAfter  uint64
+}
+
+// ErrAdminSQSPurgeInProgress is the sentinel admin handlers match
+// against for the 60-second PurgeQueue rate limit. errors.Is(err,
+// ErrAdminSQSPurgeInProgress) returns true for any *PurgeInProgressError
+// via the latter's Is method, so handlers can branch on the sentinel
+// while extracting the typed RetryAfter duration from the wrapped
+// value.
+var ErrAdminSQSPurgeInProgress = errors.New("sqs admin: purge in progress")
+
+// PurgeInProgressError is the typed admin error returned by
+// AdminPurgeQueue when the meta-stored 60-second rate limit is
+// active. RetryAfter carries the wall-clock duration the caller
+// should wait, derived from the same LastPurgedAtMillis value the
+// rate-limit check itself read inside the OCC transaction.
+type PurgeInProgressError struct {
+	RetryAfter time.Duration
+}
+
+func (e *PurgeInProgressError) Error() string {
+	return "sqs admin: purge already in progress; retry after " + e.RetryAfter.String()
+}
+
+// Is implements errors.Is so handlers can sniff
+// ErrAdminSQSPurgeInProgress while still extracting RetryAfter via
+// errors.As. Standard errors-wrapper pattern shared with other typed
+// admin errors in the package.
+func (e *PurgeInProgressError) Is(target error) bool {
+	return target == ErrAdminSQSPurgeInProgress
+}
+
+// AdminPurgeQueue is the SigV4-bypass counterpart to purgeQueue.
+// Bumps the queue's generation so every message under the old
+// generation becomes unreachable, leaving the meta record (name,
+// ARN, RedrivePolicy, tags, attributes) in place. The reaper
+// eventually deletes the orphaned message keys via the existing
+// tombstone path.
+//
+// Returns the captured generation pair so the admin handler's audit
+// line can record the value that actually landed; a separate
+// loadQueueMetaAt call would race a concurrent purge in the
+// 60-second window. The 60-second rate limit lives on the meta
+// record itself so the SigV4 and admin paths interlock uniformly.
+//
+// Sentinel errors:
+//   - ErrAdminForbidden          — read-only principal
+//   - ErrAdminNotLeader          — follower
+//   - ErrAdminSQSNotFound        — queue absent
+//   - *PurgeInProgressError      — last purge < 60 s ago; errors.Is matches
+//     ErrAdminSQSPurgeInProgress, RetryAfter carries the duration.
+//   - ErrAdminSQSValidation      — empty / whitespace name
+func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipal, name string) (AdminPurgeResult, error) {
+	if !principal.Role.canWrite() {
+		return AdminPurgeResult{}, ErrAdminForbidden
+	}
+	if !isVerifiedSQSLeader(ctx, s.coordinator) {
+		return AdminPurgeResult{}, ErrAdminNotLeader
+	}
+	if strings.TrimSpace(name) == "" {
+		return AdminPurgeResult{}, ErrAdminSQSValidation
+	}
+	oldGen, newGen, err := s.purgeQueueWithRetry(ctx, name)
+	if err != nil {
+		var rateLimit *purgeRateLimitedError
+		if errors.As(err, &rateLimit) {
+			return AdminPurgeResult{}, &PurgeInProgressError{RetryAfter: rateLimit.remaining}
+		}
+		if isSQSAdminQueueDoesNotExist(err) {
+			return AdminPurgeResult{}, ErrAdminSQSNotFound
+		}
+		return AdminPurgeResult{}, errors.Wrap(err, "admin purge queue")
+	}
+	return AdminPurgeResult{GenerationBefore: oldGen, GenerationAfter: newGen}, nil
 }
 
 // AdminDeleteQueue is the SigV4-bypass counterpart to deleteQueue.

@@ -1,9 +1,13 @@
 package adapter
 
 import (
+	"context"
+	"net/http"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 const testQueueArn = "arn:aws:sqs:us-east-1:000000000000:orders"
@@ -121,4 +125,251 @@ func TestMetaAttributesForAdmin_IncludesQueueArnAndLastModified(t *testing.T) {
 			t.Fatalf("CreatedTimestamp must NOT be in attrs (it lives on AdminQueueSummary.CreatedAt): got %q", attrs["CreatedTimestamp"])
 		}
 	})
+}
+
+// TestAdminPurgeQueue_HappyPath confirms AdminPurgeQueue against the
+// happy path: the queue exists, the principal is full-access, and
+// the call commits a generation bump that the returned AdminPurgeResult
+// faithfully records. Mirrors TestDynamoDB_AdminDeleteTable_HappyPath
+// on the dynamo side so the admin patterns stay parallel.
+func TestAdminPurgeQueue_HappyPath(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	_ = createSQSQueueForTest(t, node, "purgeable")
+
+	res, err := node.sqsServer.AdminPurgeQueue(context.Background(), fullAdminPrincipal, "purgeable")
+	if err != nil {
+		t.Fatalf("AdminPurgeQueue: %v", err)
+	}
+	if res.GenerationBefore == 0 {
+		t.Fatalf("GenerationBefore=%d want >0", res.GenerationBefore)
+	}
+	if res.GenerationAfter != res.GenerationBefore+1 {
+		t.Fatalf("GenerationAfter=%d want %d (before+1)", res.GenerationAfter, res.GenerationBefore+1)
+	}
+}
+
+// TestAdminPurgeQueue_RateLimitedReturnsTypedError exercises the
+// 60-second cooldown. A second purge inside the window must return
+// a typed *PurgeInProgressError that satisfies
+// errors.Is(ErrAdminSQSPurgeInProgress) and carries a non-zero
+// RetryAfter duration in (0, 60s]. This pins the typed-error
+// propagation path that AdminPurgeQueue uses to avoid a second meta
+// read (which would race a concurrent purge).
+func TestAdminPurgeQueue_RateLimitedReturnsTypedError(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	_ = createSQSQueueForTest(t, node, "rate-limited")
+	ctx := context.Background()
+
+	if _, err := node.sqsServer.AdminPurgeQueue(ctx, fullAdminPrincipal, "rate-limited"); err != nil {
+		t.Fatalf("first AdminPurgeQueue: %v", err)
+	}
+	_, err := node.sqsServer.AdminPurgeQueue(ctx, fullAdminPrincipal, "rate-limited")
+	if err == nil {
+		t.Fatalf("second AdminPurgeQueue: want PurgeInProgressError, got nil")
+	}
+	if !errors.Is(err, ErrAdminSQSPurgeInProgress) {
+		t.Fatalf("errors.Is(ErrAdminSQSPurgeInProgress): got false; err=%v", err)
+	}
+	var typed *PurgeInProgressError
+	if !errors.As(err, &typed) {
+		t.Fatalf("errors.As(*PurgeInProgressError): got false; err=%v", err)
+	}
+	if typed.RetryAfter <= 0 {
+		t.Fatalf("RetryAfter=%v want >0", typed.RetryAfter)
+	}
+	if typed.RetryAfter > 60*time.Second {
+		t.Fatalf("RetryAfter=%v want <=60s", typed.RetryAfter)
+	}
+}
+
+// TestAdminPurgeQueue_ReadOnlyForbidden pins the live-role check:
+// a read-only principal must not be able to purge, mirroring
+// AdminDeleteQueue's gate exactly.
+func TestAdminPurgeQueue_ReadOnlyForbidden(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	_ = createSQSQueueForTest(t, node, "read-only-test")
+
+	_, err := node.sqsServer.AdminPurgeQueue(context.Background(), readOnlyAdminPrincipal, "read-only-test")
+	if !errors.Is(err, ErrAdminForbidden) {
+		t.Fatalf("read-only principal: want ErrAdminForbidden, got %v", err)
+	}
+}
+
+// TestAdminPurgeQueue_MissingQueue confirms a missing queue surfaces
+// the structured ErrAdminSQSNotFound sentinel rather than a generic
+// 500 — admin handlers map this to HTTP 404 without sniffing the
+// AWS error code.
+func TestAdminPurgeQueue_MissingQueue(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	_, err := node.sqsServer.AdminPurgeQueue(context.Background(), fullAdminPrincipal, "no-such-queue")
+	if !errors.Is(err, ErrAdminSQSNotFound) {
+		t.Fatalf("missing queue: want ErrAdminSQSNotFound, got %v", err)
+	}
+}
+
+// TestAdminPurgeQueue_EmptyName pins the up-front guard so empty /
+// whitespace names never reach the coordinator. Mirrors
+// AdminDeleteQueue's identical guard.
+func TestAdminPurgeQueue_EmptyName(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	for _, name := range []string{"", "   "} {
+		_, err := node.sqsServer.AdminPurgeQueue(context.Background(), fullAdminPrincipal, name)
+		if !errors.Is(err, ErrAdminSQSValidation) {
+			t.Fatalf("name=%q: want ErrAdminSQSValidation, got %v", name, err)
+		}
+	}
+}
+
+// TestPurgeQueueSigV4_PreservesWireShapeAfterTypedErrorChange is the
+// caller-audit pin from the design doc §6.1 ("TestPurgeQueueSigV4_Still
+// Compiles"). It exercises the SigV4 PurgeQueue handler through the
+// modified purgeQueueWithRetry signature and asserts the wire shape
+// (status 400 + __type ==
+// AWS.SimpleQueueService.PurgeQueueInProgress) is unchanged. If a
+// future refactor drops the *purgeRateLimitedError branch from
+// writeSQSErrorFromErr, this test fails — without it the SigV4
+// response silently regresses to a generic 500.
+func TestPurgeQueueSigV4_PreservesWireShapeAfterTypedErrorChange(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	url := createSQSQueueForTest(t, node, "sigv4-rate-limit")
+
+	status, _ := callSQS(t, node, sqsPurgeQueueTarget, map[string]any{"QueueUrl": url})
+	if status != http.StatusOK {
+		t.Fatalf("first purge: %d want 200", status)
+	}
+	status, out := callSQS(t, node, sqsPurgeQueueTarget, map[string]any{"QueueUrl": url})
+	if status != http.StatusBadRequest {
+		t.Fatalf("second purge: status=%d want 400 (%v)", status, out)
+	}
+	got, _ := out["__type"].(string)
+	if got != sqsErrPurgeInProgress {
+		t.Fatalf("__type=%q want %q", got, sqsErrPurgeInProgress)
+	}
+}
+
+// TestAdminQueueSummary_IsDLQ_NoSources confirms a queue that nobody
+// points at reports IsDLQ=false and an empty DLQSources slice.
+func TestAdminQueueSummary_IsDLQ_NoSources(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	_ = createSQSQueueForTest(t, node, "lonely")
+
+	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "lonely")
+	if err != nil {
+		t.Fatalf("AdminDescribeQueue: %v", err)
+	}
+	if !exists {
+		t.Fatalf("queue not found")
+	}
+	if summary.IsDLQ {
+		t.Fatalf("IsDLQ=true want false")
+	}
+	if len(summary.DLQSources) != 0 {
+		t.Fatalf("DLQSources=%v want empty", summary.DLQSources)
+	}
+}
+
+// TestAdminQueueSummary_IsDLQ_OneSource confirms one inbound
+// RedrivePolicy is detected and surfaced. Uses the public CreateQueue
+// path so the meta record carries the RedrivePolicy attribute
+// exactly as a real client would have written it.
+func TestAdminQueueSummary_IsDLQ_OneSource(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	_ = createSQSQueueForTest(t, node, "dlq-target")
+
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-target","maxReceiveCount":5}`
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "source-a",
+		"Attributes": map[string]string{"RedrivePolicy": policy},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create source: %d %v", status, out)
+	}
+
+	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "dlq-target")
+	if err != nil {
+		t.Fatalf("AdminDescribeQueue: %v", err)
+	}
+	if !exists {
+		t.Fatalf("queue not found")
+	}
+	if !summary.IsDLQ {
+		t.Fatalf("IsDLQ=false want true")
+	}
+	if len(summary.DLQSources) != 1 || summary.DLQSources[0] != "source-a" {
+		t.Fatalf("DLQSources=%v want [source-a]", summary.DLQSources)
+	}
+}
+
+// TestAdminQueueSummary_IsDLQ_TwoSourcesSorted pins the sort
+// invariant: callers can rely on DLQSources being lexicographic so
+// the SPA renders chips in a stable order and audit log diffs
+// are noise-free.
+func TestAdminQueueSummary_IsDLQ_TwoSourcesSorted(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	_ = createSQSQueueForTest(t, node, "shared-dlq")
+
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:shared-dlq","maxReceiveCount":3}`
+	// Create in reverse-alphabetical order on purpose so the
+	// sort.Strings call is exercised (not just a coincidental
+	// insertion-order match).
+	for _, name := range []string{"zeta", "alpha"} {
+		status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+			"QueueName":  name,
+			"Attributes": map[string]string{"RedrivePolicy": policy},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("create %s: %d %v", name, status, out)
+		}
+	}
+
+	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "shared-dlq")
+	if err != nil {
+		t.Fatalf("AdminDescribeQueue: %v", err)
+	}
+	if !exists {
+		t.Fatalf("queue not found")
+	}
+	if !summary.IsDLQ {
+		t.Fatalf("IsDLQ=false want true")
+	}
+	want := []string{"alpha", "zeta"}
+	if len(summary.DLQSources) != len(want) {
+		t.Fatalf("DLQSources=%v want %v", summary.DLQSources, want)
+	}
+	for i, name := range want {
+		if summary.DLQSources[i] != name {
+			t.Fatalf("DLQSources[%d]=%q want %q (full=%v)", i, summary.DLQSources[i], name, summary.DLQSources)
+		}
+	}
 }
