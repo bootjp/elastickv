@@ -89,8 +89,7 @@ func WriterRegistryFor(s MVCCStore) (encryption.WriterRegistryStore, error) {
 	// ok=true but ps==nil; the adapter would then nil-deref on
 	// first call. Reject both shapes at construction so the
 	// failure mode is "binary refuses to start" rather than
-	// "FSM apply panics deep in Raft loop" — coderabbit PR #765
-	// round-2 Major.
+	// "FSM apply panics deep in Raft loop".
 	if !ok || ps == nil {
 		return nil, errors.WithStack(ErrUnsupportedStoreForWriterRegistry)
 	}

@@ -152,7 +152,7 @@ func TestApplyRegistration_Case3_Rollback(t *testing.T) {
 // replays committed entries after restart until the latest FSM
 // snapshot; rejecting equal epochs as rollback would pin a
 // node in a halt-on-replay loop after any crash before
-// snapshotting the entry (PR #765 round-2 codex P1).
+// snapshotting the entry.
 func TestApplyRegistration_Case2_IdempotentReplay(t *testing.T) {
 	t.Parallel()
 	store := newMapRegistryStore()

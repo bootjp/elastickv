@@ -104,7 +104,7 @@ func NewApplier(registry WriterRegistryStore) (*Applier, error) {
 //     (dek_id, full_node_id, local_epoch). Returns nil with no row
 //     change. Rejecting equal epochs as rollback would pin a node
 //     in a halt-on-replay loop after any crash before snapshotting
-//     this entry — codex PR #765 round-2 P1.
+//     this entry.
 //
 //   - case 3 (existing row, same FullNodeID, payload.LocalEpoch <
 //     existing.LastSeenLocalEpoch — strictly less): epoch rollback.
@@ -162,10 +162,10 @@ func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
 		// RegisterEncryptionWriter entry can be applied again with
 		// the same (dek_id, full_node_id, local_epoch). Rejecting
 		// equal epochs as rollback would halt apply on every legit
-		// post-crash replay and pin the node in a restart loop
-		// (PR #765 round-2 codex P1). The row already reflects this
-		// epoch — no-op return preserves the §4.1 monotonicity
-		// invariant without false-halting.
+		// post-crash replay and pin the node in a restart loop.
+		// The row already reflects this epoch — no-op return
+		// preserves the §4.1 monotonicity invariant without
+		// false-halting.
 		return nil
 	}
 	if p.LocalEpoch < prev.LastSeenLocalEpoch {
@@ -213,9 +213,8 @@ func (a *Applier) ApplyRotation(_ fsmwire.RotationPayload) error {
 // match the §4.1 writer-registry key shape
 // (`!encryption|writers|<dek_id>|<be2 uint16(node_id)>`). The
 // mask happens to share the value 0xFFFF with the unrelated
-// local_epoch field width, but the semantic purpose here is
-// FullNodeID truncation — gemini-code-assist PR #765 round-1
-// medium flagged the original `localEpochMaskU64` name as
-// misleading at this call site. Untyped so the cast at the
-// call site is explicit (no implicit uint64 promotion).
+// local_epoch field width, but the name distinguishes this
+// FullNodeID-truncation use from the local_epoch masking in
+// adapter/encryption_admin.go. Untyped so the cast at the call
+// site is explicit (no implicit uint64 promotion).
 const nodeIDMask = 0xFFFF
