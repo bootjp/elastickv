@@ -20,11 +20,6 @@ const (
 	RedisHashMetaPrefix      = "!hs|meta|"
 	RedisHashFieldPrefix     = "!hs|fld|"
 	RedisHashMetaDeltaPrefix = "!hs|meta|d|"
-
-	// hashUserKeyLenSize is the fixed BE-uint32 width of the
-	// per-key length prefix used by every wide-column key shape.
-	// Mirrors store/wideColKeyLenSize.
-	hashUserKeyLenSize = 4
 )
 
 // ErrRedisInvalidHashMeta is returned when the !hs|meta| value is not
@@ -165,7 +160,7 @@ func parseHashFieldKey(key []byte) ([]byte, []byte, bool) {
 	if !ok {
 		return nil, nil, false
 	}
-	fieldName := rest[hashUserKeyLenSize+len(userKey):]
+	fieldName := rest[wideColumnUserKeyLenSize+len(userKey):]
 	return userKey, fieldName, true
 }
 
@@ -178,14 +173,14 @@ func parseHashFieldKey(key []byte) ([]byte, []byte, bool) {
 // high bit is set, bypassing the bounds check and causing a slice
 // panic. Gemini high finding (PR #725 round 1).
 func parseUserKeyLenPrefix(b []byte) ([]byte, bool) {
-	if len(b) < hashUserKeyLenSize {
+	if len(b) < wideColumnUserKeyLenSize {
 		return nil, false
 	}
-	ukLen := binary.BigEndian.Uint32(b[:hashUserKeyLenSize])
-	if uint64(len(b)) < uint64(hashUserKeyLenSize)+uint64(ukLen) {
+	ukLen := binary.BigEndian.Uint32(b[:wideColumnUserKeyLenSize])
+	if uint64(len(b)) < uint64(wideColumnUserKeyLenSize)+uint64(ukLen) {
 		return nil, false
 	}
-	return b[hashUserKeyLenSize : hashUserKeyLenSize+int(ukLen)], true //nolint:gosec // bounded above
+	return b[wideColumnUserKeyLenSize : wideColumnUserKeyLenSize+int(ukLen)], true //nolint:gosec // bounded above
 }
 
 // flushHashes writes one JSON file per accumulated hash to

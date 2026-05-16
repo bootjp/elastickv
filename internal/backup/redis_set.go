@@ -156,7 +156,7 @@ func parseSetMemberKey(key []byte) ([]byte, []byte, bool) {
 	if !ok {
 		return nil, nil, false
 	}
-	member := rest[hashUserKeyLenSize+len(userKey):]
+	member := rest[wideColumnUserKeyLenSize+len(userKey):]
 	return userKey, member, true
 }
 

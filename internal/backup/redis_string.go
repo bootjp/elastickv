@@ -43,6 +43,17 @@ const (
 	redisStrBaseHeader      = 3
 	redisUint64Bytes        = 8
 
+	// wideColumnUserKeyLenSize is the fixed BE-uint32 width of the
+	// per-key length prefix used by every wide-column key shape
+	// (!hs|, !st|, !zs|, !stream|, and any future families that
+	// reuse the `<prefix><userKeyLen(4)><userKey>...` layout).
+	// Mirrors store/wideColKeyLenSize. Lives in the foundation
+	// file rather than redis_hash.go because list / set encoders
+	// reference it via the shared parseUserKeyLenPrefix helper —
+	// the previous hash-prefixed name (hashUserKeyLenSize) was
+	// misleading once the second wide-column encoder landed.
+	wideColumnUserKeyLenSize = 4
+
 	redisStringsTTLFile = "strings_ttl.jsonl"
 	redisHLLTTLFile     = "hll_ttl.jsonl"
 
