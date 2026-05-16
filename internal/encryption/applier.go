@@ -393,7 +393,39 @@ func (a *Applier) validateBootstrap(p fsmwire.BootstrapPayload) error {
 				i, reg.DEKID, p.StorageDEKID, p.RaftDEKID)
 		}
 	}
-	return nil
+	return a.checkBootstrapIdempotency(p)
+}
+
+// checkBootstrapIdempotency enforces the §5.6 one-time-bootstrap
+// invariant. A second committed bootstrap entry with DIFFERENT
+// DEK IDs would re-point Active.{Storage,Raft} outside the
+// rotation path, leaving writer-registry and key-lifecycle
+// semantics inconsistent with the bootstrap/rotation contract.
+//
+// Raft replay of the SAME bootstrap entry (e.g., crash after
+// bootstrap apply but before snapshot) is idempotent and allowed
+// — the existing sidecar's Active slots will match the payload's
+// DEK IDs exactly, so the check falls through.
+//
+// Split out from validateBootstrap so the dispatch path stays
+// below the cyclop complexity budget.
+func (a *Applier) checkBootstrapIdempotency(p fsmwire.BootstrapPayload) error {
+	sc, err := ReadSidecar(a.sidecarPath)
+	if err != nil && !IsNotExist(err) {
+		return errors.Wrap(err, "applier: read sidecar for bootstrap idempotency check")
+	}
+	if sc == nil {
+		return nil
+	}
+	if sc.Active.Storage == 0 && sc.Active.Raft == 0 {
+		return nil
+	}
+	if sc.Active.Storage == p.StorageDEKID && sc.Active.Raft == p.RaftDEKID {
+		return nil
+	}
+	return errors.Wrapf(ErrEncryptionApply,
+		"applier: cluster already bootstrapped (Active.Storage=%d, Active.Raft=%d); cannot re-bootstrap to (%d, %d) — use rotate-dek",
+		sc.Active.Storage, sc.Active.Raft, p.StorageDEKID, p.RaftDEKID)
 }
 
 // writeBootstrapSidecar reads the existing sidecar (or starts a

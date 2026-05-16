@@ -632,6 +632,53 @@ func TestApplyRotation_UnknownPurpose(t *testing.T) {
 	}
 }
 
+// TestApplyBootstrap_RejectsSecondBootstrapWithDifferentDEKs
+// pins the §5.6 one-time-bootstrap invariant: once Active slots
+// are populated, a second committed bootstrap entry with
+// DIFFERENT DEK IDs MUST be rejected. A successful re-bootstrap
+// would re-point Active.{Storage,Raft} outside the rotation
+// path, leaving writer-registry and key-lifecycle semantics
+// inconsistent. Operators advance DEKs via rotate-dek.
+func TestApplyBootstrap_RejectsSecondBootstrapWithDifferentDEKs(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	// First bootstrap: Active = (1, 2).
+	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2"),
+	}); err != nil {
+		t.Fatalf("first ApplyBootstrap: %v", err)
+	}
+	// Second bootstrap with different DEK IDs MUST be rejected.
+	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID: 7, WrappedStorage: []byte("s7"),
+		RaftDEKID: 8, WrappedRaft: []byte("r8"),
+	})
+	if err == nil {
+		t.Fatal("expected halt on second bootstrap with different DEKs, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	// Sidecar Active slots must NOT have been re-pointed.
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.Active.Storage != 1 || sc.Active.Raft != 2 {
+		t.Errorf("Active = (%d, %d), want (1, 2) — second bootstrap mutated sidecar despite rejection",
+			sc.Active.Storage, sc.Active.Raft)
+	}
+}
+
 // TestApplyBootstrap_RejectsForeignBatchRegistryDEK pins the §5.6
 // step 1a bootstrap-batch invariant: every BatchRegistry row MUST
 // target either StorageDEKID or RaftDEKID. A row targeting a
