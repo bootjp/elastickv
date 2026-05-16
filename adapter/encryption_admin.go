@@ -16,14 +16,12 @@ import (
 	"google.golang.org/grpc/codes"
 )
 
-// EncryptionAdminServer implements proto.EncryptionAdmin. PR-A
-// (Stage 5 foundation) wired the read-only capability and state
-// probes; PR-B (this slice) wires RotateDEK +
-// RegisterEncryptionWriter as leader-only proposers on top of
-// Stage 3's raft envelope and Stage 4's fsmwire bodies, plus the
-// leader guard on ResyncSidecar. BootstrapEncryption stays
-// Unimplemented until PR-C lands the §5.6 step 1a capability
-// fan-out.
+// EncryptionAdminServer implements proto.EncryptionAdmin. Wires
+// the §6.1 read-only probes (GetCapability, GetSidecarState,
+// ResyncSidecar) plus the three mutating opcodes (Bootstrap,
+// RotateDEK, RegisterEncryptionWriter) onto Stage 3's raft
+// envelope and Stage 4's fsmwire body encoders. Mutators are
+// leader-gated through requireLeader / VerifyLeader.
 type EncryptionAdminServer struct {
 	sidecarPath        string
 	keystore           *encryption.Keystore
@@ -121,6 +119,11 @@ func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServe
 // Admin / Distribution; every RPC is concurrency-safe because the
 // only mutable state is the sidecar file, which encryption.WriteSidecar
 // already serialises via the §5.1 crash-durable write protocol.
+//
+// Production wiring MUST call Validate after construction so a
+// configuration that wires a proposer but forgets the leaderView
+// fails closed at startup rather than silently letting followers
+// mutate state.
 func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAdminServer {
 	s := &EncryptionAdminServer{}
 	for _, opt := range opts {
@@ -132,6 +135,19 @@ func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAd
 		s.buildSHA = autoBuildSHA()
 	}
 	return s
+}
+
+// Validate enforces the option-pairing invariants the constructor
+// cannot express through Go's option signature. Tests that wire a
+// proposer without a leaderView are intentionally allowed (the
+// requireLeader path treats nil-leaderView as always-leader for
+// the proposer-wiring unit tests); production wiring in main.go
+// MUST call this method so a misconfiguration fails closed.
+func (s *EncryptionAdminServer) Validate() error {
+	if s.proposer != nil && s.leaderView == nil {
+		return errors.New("encryption: proposer wired without leaderView — followers must not mutate state; call WithEncryptionAdminLeaderView")
+	}
+	return nil
 }
 
 // GetCapability returns the §6.1 CapabilityReport for the local
@@ -314,6 +330,203 @@ func statusFromSidecarErr(err error) error {
 	}
 }
 
+// BootstrapEncryption proposes the §5.6 0x04 OpBootstrap entry
+// that installs the initial wrapped DEK pair AND the cluster-wide
+// writer-registry batch in a single Raft transaction. The server
+// accepts a pre-built writer batch (capability fan-out is the
+// CLI's job today) and validates every entry against the §6.1
+// invariants before delegating to fsmwire.EncodeBootstrap. FSM
+// apply enforces the idempotency check (rejects if the sidecar's
+// active.storage is already set), so re-running this RPC against
+// an already-bootstrapped cluster is safe — the engine returns
+// the apply error and ErrEncryptionApply halts the apply loop.
+func (s *EncryptionAdminServer) BootstrapEncryption(ctx context.Context, req *pb.BootstrapEncryptionRequest) (*pb.BootstrapEncryptionResponse, error) {
+	if err := s.requireLeader(ctx); err != nil {
+		return nil, err
+	}
+	if s.proposer == nil {
+		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: proposer is not configured on this node")
+	}
+	if req.GetStorageDekId() == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, "encryption: storage_dek_id must be non-zero (key id 0 is reserved per §5.1)")
+	}
+	if req.GetRaftDekId() == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument, "encryption: raft_dek_id must be non-zero (key id 0 is reserved per §5.1)")
+	}
+	if req.GetStorageDekId() == req.GetRaftDekId() {
+		return nil, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: storage_dek_id and raft_dek_id must differ; got both %d",
+			req.GetStorageDekId())
+	}
+	if err := validateWrappedDEK("storage", req.GetWrappedStorageDek()); err != nil {
+		return nil, err
+	}
+	if err := validateWrappedDEK("raft", req.GetWrappedRaftDek()); err != nil {
+		return nil, err
+	}
+	batch, err := buildBootstrapBatch(req.GetWriterBatch(), req.GetStorageDekId(), req.GetRaftDekId())
+	if err != nil {
+		return nil, err
+	}
+	payload := fsmwire.BootstrapPayload{
+		StorageDEKID:   req.GetStorageDekId(),
+		WrappedStorage: req.GetWrappedStorageDek(),
+		RaftDEKID:      req.GetRaftDekId(),
+		WrappedRaft:    req.GetWrappedRaftDek(),
+		BatchRegistry:  batch,
+	}
+	body := fsmwire.EncodeBootstrap(payload)
+	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpBootstrap, body)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.BootstrapEncryptionResponse{AppliedIndex: idx}, nil
+}
+
+// buildBootstrapBatch projects the proto writer batch into the
+// §11.3 0x04 fsmwire form. Each member is expanded into TWO
+// registry rows (one per active dek_id — storage and raft) so the
+// §4.1 nonce-uniqueness invariant holds for both envelope
+// purposes from the first post-bootstrap entry. The result size
+// is bounded by fsmwire.maxBootstrapBatchCount (2 × len(writers))
+// — checked at the gRPC boundary so a too-large batch is rejected
+// before the Propose round-trip.
+func buildBootstrapBatch(writers []*pb.WriterRegistryEntry, storageDEKID, raftDEKID uint32) ([]fsmwire.RegistrationPayload, error) {
+	if len(writers) == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: writer_batch must contain at least one member (per §5.6 step 1a)")
+	}
+	totalRows := bootstrapRowsPerWriter * len(writers)
+	if totalRows > bootstrapBatchRowCap {
+		return nil, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: writer_batch produces %d registry rows, exceeding the §4.1 bound %d",
+			totalRows, bootstrapBatchRowCap)
+	}
+	// Per-writer shape validation first (rejects nil entries, zero
+	// node id, oversize epoch) so the uniqueness pass below can
+	// assume every entry is non-nil and well-formed. Both passes
+	// run before we allocate the output slice — a near-cap batch
+	// with a collision at the end is rejected without building
+	// thousands of throwaway registry rows.
+	for i, w := range writers {
+		if _, err := validateBootstrapWriter(i, w); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateWriterBatchUniqueness(writers); err != nil {
+		return nil, err
+	}
+	out := make([]fsmwire.RegistrationPayload, 0, totalRows)
+	for _, w := range writers {
+		epoch := uint32ToLocalEpoch(w.GetLocalEpoch())
+		out = append(out,
+			fsmwire.RegistrationPayload{DEKID: storageDEKID, FullNodeID: w.GetFullNodeId(), LocalEpoch: epoch},
+			fsmwire.RegistrationPayload{DEKID: raftDEKID, FullNodeID: w.GetFullNodeId(), LocalEpoch: epoch},
+		)
+	}
+	return out, nil
+}
+
+// validateBootstrapWriter enforces the per-writer invariants the
+// §5.6 step 1a batch must satisfy before it can be expanded into
+// the two-row-per-writer bootstrap layout. Returns a partial
+// RegistrationPayload populated with the validated fields; the
+// caller supplies dek_id when building the storage / raft rows.
+func validateBootstrapWriter(i int, w *pb.WriterRegistryEntry) (fsmwire.RegistrationPayload, error) {
+	if w == nil {
+		return fsmwire.RegistrationPayload{}, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: writer_batch[%d] is nil", i)
+	}
+	if w.GetFullNodeId() == 0 {
+		return fsmwire.RegistrationPayload{}, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: writer_batch[%d].full_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)", i)
+	}
+	if w.GetLocalEpoch() > math.MaxUint16 {
+		return fsmwire.RegistrationPayload{}, grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: writer_batch[%d].local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
+			i, w.GetLocalEpoch())
+	}
+	return fsmwire.RegistrationPayload{
+		FullNodeID: w.GetFullNodeId(),
+		LocalEpoch: uint32ToLocalEpoch(w.GetLocalEpoch()),
+	}, nil
+}
+
+// bootstrapRowsPerWriter is the §5.6 step 1a fan-out per member:
+// one storage-DEK row + one raft-DEK row so the §4.1
+// nonce-uniqueness invariant covers both envelope purposes from
+// the first post-bootstrap entry.
+const bootstrapRowsPerWriter = 2
+
+// maxWrappedDEKSize bounds the KEK-wrapped DEK payload size at the
+// gRPC boundary so a crafted oversized blob cannot push
+// fsmwire.EncodeBootstrap toward its safeU32 length-prefix guard
+// or inflate the resulting Raft entry beyond practical limits.
+// A real KEK-wrapped 32-byte DEK runs hundreds of bytes (KMS
+// metadata + AES-GCM tag + envelope header); 4 KiB is ~10x
+// headroom and far below the gRPC default 4 MiB message cap.
+const maxWrappedDEKSize = 4096
+
+func validateWrappedDEK(purpose string, wrapped []byte) error {
+	if len(wrapped) == 0 {
+		return grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: wrapped_%s_dek is required", purpose)
+	}
+	if len(wrapped) > maxWrappedDEKSize {
+		return grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: wrapped_%s_dek size %d exceeds the %d-byte gRPC-boundary cap",
+			purpose, len(wrapped), maxWrappedDEKSize)
+	}
+	return nil
+}
+
+// validateWriterBatchUniqueness rejects writer batches that would
+// fail closed at FSM apply time: §4.1 case-3 (the same
+// full_node_id appearing twice → ErrLocalEpochRollback) and §4.1
+// case-4 (two distinct full_node_ids colliding on the uint16
+// narrowing used as the registry-row key → ErrNodeIDCollision).
+// FSM apply errors halt the apply loop via HaltApply, so a
+// malformed bootstrap that reached apply would stop the cluster.
+//
+// The caller (buildBootstrapBatch) runs validateBootstrapWriter
+// over the slice first, so every entry here is guaranteed
+// non-nil with a non-zero full_node_id — no defensive nil-guard
+// is needed inside this loop.
+func validateWriterBatchUniqueness(writers []*pb.WriterRegistryEntry) error {
+	seenFull := make(map[uint64]int, len(writers))
+	seenTrunc := make(map[uint16]uint64, len(writers))
+	for i, w := range writers {
+		id := w.GetFullNodeId()
+		if prev, dup := seenFull[id]; dup {
+			return grpcStatusErrorf(codes.InvalidArgument,
+				"encryption: writer_batch[%d] duplicates full_node_id %d already present at index %d",
+				i, id, prev)
+		}
+		trunc := uint16(id & localEpochMaskU64) //nolint:gosec // masked to 16 bits; G115 cannot trace the bitwise narrowing
+		if prevFull, collision := seenTrunc[trunc]; collision {
+			return grpcStatusErrorf(codes.InvalidArgument,
+				"encryption: writer_batch[%d].full_node_id=%d collides with %d on the uint16 narrowing 0x%04x (registry key)",
+				i, id, prevFull, trunc)
+		}
+		seenFull[id] = i
+		seenTrunc[trunc] = id
+	}
+	return nil
+}
+
+// localEpochMaskU64 mirrors localEpochMask in uint64 form for the
+// uint64→uint16 narrowing used by the registry row key. Named
+// here so the magic-number linter does not flag the masking
+// conversion below.
+const localEpochMaskU64 uint64 = 0xFFFF
+
+// bootstrapBatchRowCap mirrors fsmwire.maxBootstrapBatchCount.
+// The §5.6 step 1a bootstrap produces (storage + raft) rows per
+// member, so the practical member count cap is half this value.
+// Named here to avoid the magic-number linter and to keep the
+// boundary check next to where it fires.
+const bootstrapBatchRowCap = 1 << 14
+
 // RotateDEK proposes a §5.2 rotation as a §11.3 0x05 OpRotation
 // entry. The server validates purpose / dek_id / local_epoch
 // boundaries at the gRPC boundary (the §6.1 doc rule for
@@ -335,8 +548,8 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 	if req.GetNewDekId() == 0 {
 		return nil, grpcStatusError(codes.InvalidArgument, "encryption: new_dek_id must be non-zero (key id 0 is reserved per §5.1)")
 	}
-	if len(req.GetWrappedNewDek()) == 0 {
-		return nil, grpcStatusError(codes.InvalidArgument, "encryption: wrapped_new_dek is required")
+	if err := validateWrappedDEK("new", req.GetWrappedNewDek()); err != nil {
+		return nil, err
 	}
 	if req.GetProposerLocalEpoch() > math.MaxUint16 {
 		return nil, grpcStatusErrorf(codes.InvalidArgument,
