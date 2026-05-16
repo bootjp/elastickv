@@ -144,16 +144,24 @@ var (
 	// Data-at-rest encryption admin RPC wiring (Stage 5D). The
 	// EncryptionAdmin gRPC service is reachable on every shard's
 	// gRPC listener so the §7.1 Phase-0 GetCapability fan-out can
-	// poll any member. This flag is the load-bearing gate for the
-	// mutating RPCs pre-Stage 6: setting it wires the proposer +
-	// LeaderView so RotateDEK / BootstrapEncryption /
-	// RegisterEncryptionWriter become reachable on the shard's
-	// leader; leaving it empty omits both options so those RPCs
-	// short-circuit at the gRPC boundary with FailedPrecondition
-	// before any Raft proposal is created. The cluster-flag gate
-	// that turns the §6.3 FSM applier ON — and thereby makes a
-	// committed mutator entry actually do something — is Stage 6.
-	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; empty disables EncryptionAdmin sidecar capability probing AND leaves mutating EncryptionAdmin RPCs unwired on this node (proposer + LeaderView omitted → FailedPrecondition at the RPC boundary).")
+	// poll any member.
+	//
+	// This flag gates ONLY the read-only capability surface:
+	// empty → GetCapability reports encryption_capable=false (the
+	// §7.1 cutover refuses with ErrCapabilityCheckFailed);
+	// set   → capability probing reads the §5.1 keys.json and
+	// reports encryption_capable=true.
+	//
+	// Mutating RPCs (BootstrapEncryption / RotateDEK /
+	// RegisterEncryptionWriter) are refused with FailedPrecondition
+	// regardless of this flag. The §6.3 WithEncryption FSM applier
+	// is plumbed by Stage 6; until then registerEncryptionAdminServer
+	// installs neither the Proposer nor the LeaderView, so every
+	// mutator short-circuits at the gRPC boundary before any Raft
+	// proposal is created. Setting --encryptionSidecarPath does
+	// NOT enable mutating RPCs; Stage 6 wires the applier and the
+	// Proposer + LeaderView together in the same change.
+	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter) are refused with FailedPrecondition regardless of this flag until Stage 6 wires the §6.3 FSM applier together with the Proposer + LeaderView.")
 
 	// Key visualizer sampler flags. The sampler runs entirely in-memory
 	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
