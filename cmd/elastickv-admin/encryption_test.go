@@ -254,6 +254,29 @@ func assertBootstrapCallMatches(t *testing.T, call *pb.BootstrapEncryptionReques
 	}
 }
 
+// TestRunEncryptionBootstrap_RejectsEmptyWriterBatch pins the CLI
+// parse-layer guard for the missing-entirely case (no --writer
+// flags at all). The server-side "empty writer_batch" path is
+// covered by adapter tests, but the CLI's own early-out in
+// parseBootstrapArgs is otherwise unexercised.
+func TestRunEncryptionBootstrap_RejectsEmptyWriterBatch(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+	}, &buf)
+	if err == nil {
+		t.Fatalf("runEncryptionBootstrap returned nil, want error on missing --writer flags")
+	}
+	if !strings.Contains(err.Error(), "writer") {
+		t.Errorf("error %q does not surface the missing --writer condition", err)
+	}
+}
+
 func TestRunEncryptionBootstrap_RejectsBadWriter(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
