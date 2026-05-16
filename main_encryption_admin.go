@@ -2,30 +2,16 @@ package main
 
 import (
 	"github.com/bootjp/elastickv/adapter"
-	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
 
-// encryptionAdminEngine is the subset of raftengine.Engine the
-// EncryptionAdminServer needs: a Proposer (for the mutating RPCs)
-// and a LeaderView (for the requireLeader gate). Every shard's
-// raftengine.Engine satisfies both interfaces; declaring a local
-// intersection keeps the construction site decoupled from the
-// concrete engine type and lets tests substitute a stub without
-// pulling in the full engine surface.
-type encryptionAdminEngine interface {
-	raftengine.Proposer
-	raftengine.LeaderView
-}
-
 // registerEncryptionAdminServer constructs and registers an
 // EncryptionAdminServer on the supplied gRPC server. The function
 // is intentionally per-shard: the §7.1 Phase-0 GetCapability
-// fan-out polls every member, and mutator RPCs route through the
-// shard's own raftengine.LeaderView so a follower returns
-// FailedPrecondition with the current leader's hint.
+// fan-out polls every member, and the §5.1 sidecar contents are
+// per-node.
 //
 // fullNodeID MUST be per-node-stable (every replica of the same
 // group sees a distinct value), NOT the Raft group id (which is
@@ -37,39 +23,50 @@ type encryptionAdminEngine interface {
 // number — Codex r1 P1 on PR #760 caught the original wiring
 // passing the shard id by mistake.
 //
-// Production-inert until Stage 6 — gating on --encryptionSidecarPath:
-//   - sidecarPath is empty by default, so GetCapability returns
-//     encryption_capable=false (the §7.1 cutover refuses with
-//     ErrCapabilityCheckFailed).
-//   - Proposer + LeaderView are wired ONLY when sidecarPath is
-//     set. Without them, RotateDEK / BootstrapEncryption /
-//     RegisterEncryptionWriter return FailedPrecondition
-//     "proposer is not configured on this node" at the RPC
-//     boundary — before any Raft proposal is issued. This is
-//     the load-bearing safety boundary against Codex r2 P1: the
-//     §6.3 WithEncryption applier seam is still unwired on the
-//     FSM side pre-Stage-6, so a successfully-applied bootstrap
-//     entry would hit the fail-closed halt path in
-//     kvFSM.applyEncryption (nil applier) and stop the apply
-//     loop cluster-wide. Refusing the proposal at the RPC layer
-//     means an accidental client call cannot escalate from a
-//     single RPC into a cluster-halt.
+// Stage 5D is intentionally inert for mutating RPCs. This helper
+// installs ONLY the sidecar-path + full-node-id options, never
+// the Proposer or LeaderView. With both omitted,
+// EncryptionAdminServer.BootstrapEncryption / RotateDEK /
+// RegisterEncryptionWriter return FailedPrecondition at the gRPC
+// boundary — the proposal never reaches Raft.
+//
+// The reason mutator wiring stays off ENTIRELY (not just
+// sidecar-gated) is Codex r3 P1 on PR #760: the §6.3
+// WithEncryption applier seam is plumbed by Stage 6. Today the
+// FSM is constructed via kv.NewKvFSMWithHLC (no WithEncryption
+// option). A successfully-applied bootstrap entry would land a
+// 0x03/0x04/0x05 Raft entry on every replica, the FSM apply path
+// would route through kvFSM.applyEncryption, the default branch
+// would fire ErrEncryptionApply because the applier is nil, and
+// the engine's HaltApply seam would stop apply on every node.
+// Gating mutator wiring on --encryptionSidecarPath (as PR760 r2
+// did) is not safe enough — an operator who sets sidecarPath for
+// capability probing alone could still trigger a cluster-halt by
+// calling a mutating RPC. The applier and the mutator wiring
+// must land together in Stage 6.
+//
+// sidecarPath controls only the read-only capability surface:
+// when empty, GetCapability reports encryption_capable=false
+// (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
+// when set, capability probing reads the §5.1 keys.json and
+// reports encryption_capable=true. ResyncSidecar's leader guard
+// (requireLeader) returns nil when LeaderView is unset — the
+// "test escape hatch" path documented in requireLeader's godoc —
+// so ResyncSidecar serves the local sidecar on every node until
+// Stage 6 wires the LeaderView. Pre-bootstrap the sidecar is
+// either non-existent or empty so there is no §5.5 leak window.
 //
 // Validate() panics on a misconfiguration that wires a proposer
-// without a LeaderView. The wiring below pairs both options
-// together (both wired iff sidecarPath set) so the invariant
-// holds by construction — the panic is the load-bearing guard
-// against a future refactor that splits the two options apart.
-func registerEncryptionAdminServer(gs *grpc.Server, engine encryptionAdminEngine, fullNodeID uint64, sidecarPath string) {
+// without a LeaderView. The wiring below never wires either, so
+// the invariant holds vacuously today; the panic remains the
+// load-bearing guard against a future Stage 6 refactor that
+// splits the two options apart.
+func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string) {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
 	if sidecarPath != "" {
-		opts = append(opts,
-			adapter.WithEncryptionAdminSidecarPath(sidecarPath),
-			adapter.WithEncryptionAdminProposer(engine),
-			adapter.WithEncryptionAdminLeaderView(engine),
-		)
+		opts = append(opts, adapter.WithEncryptionAdminSidecarPath(sidecarPath))
 	}
 	srv := adapter.NewEncryptionAdminServer(opts...)
 	if err := srv.Validate(); err != nil {
