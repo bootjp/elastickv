@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -202,6 +203,158 @@ func requireUint16Plus1(v uint, name string) error {
 // requireUint32). The masked conversion is a defence-in-depth
 // truncation that cannot drift even if a future caller skips the
 // bound check.
+// runEncryptionBootstrap invokes EncryptionAdmin.BootstrapEncryption.
+// The operator provides the wrapped DEK pair (base64), the two
+// dek_ids, and the §5.6 step 1a writer batch as repeated
+// --writer=<full_node_id>:<local_epoch> flag values. Cluster-wide
+// capability fan-out (computing the batch automatically by
+// dialing every member's GetCapability) is deferred to a later
+// CLI iteration; for now the operator runs `encryption status`
+// against each member to gather the batch and passes it
+// explicitly.
+func runEncryptionBootstrap(args []string, out io.Writer) error {
+	parsed, endpoint, err := parseBootstrapArgs(args)
+	if err != nil {
+		return err
+	}
+	if parsed == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *endpoint.timeout)
+	defer cancel()
+	client, closeFn, err := dialEncryption(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := closeFn(); err != nil {
+			fmt.Fprintf(os.Stderr, "encryption: close connection: %v\n", err)
+		}
+	}()
+	resp, err := client.BootstrapEncryption(ctx, parsed)
+	if err != nil {
+		return errors.Wrap(err, "BootstrapEncryption")
+	}
+	if _, err := fmt.Fprintf(out, "bootstrapped storage_dek_id=%d raft_dek_id=%d writers=%d applied_index=%d\n",
+		parsed.StorageDekId, parsed.RaftDekId, len(parsed.WriterBatch), resp.AppliedIndex); err != nil {
+		return errors.Wrap(err, "write result")
+	}
+	return nil
+}
+
+// parseBootstrapArgs returns the validated proto request and the
+// shared endpoint flags. A nil request with no error means the
+// caller requested --help; runEncryptionBootstrap then exits 0.
+func parseBootstrapArgs(args []string) (*pb.BootstrapEncryptionRequest, *encryptionEndpointFlags, error) {
+	fs := flag.NewFlagSet("encryption bootstrap", flag.ContinueOnError)
+	endpoint := newEncryptionEndpointFlags(fs)
+	storageDEKID := fs.Uint("storage-dek-id", 0, "Storage DEK key id; must be non-zero and differ from --raft-dek-id")
+	raftDEKID := fs.Uint("raft-dek-id", 0, "Raft DEK key id; must be non-zero and differ from --storage-dek-id")
+	wrappedStorageB64 := fs.String("wrapped-storage-dek", "", "Base64 of the KEK-wrapped storage DEK")
+	wrappedRaftB64 := fs.String("wrapped-raft-dek", "", "Base64 of the KEK-wrapped raft DEK")
+	var writerFlags stringSliceFlag
+	fs.Var(&writerFlags, "writer", "Writer-registry entry as <full_node_id>:<local_epoch>; repeat per member")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, endpoint, nil
+		}
+		return nil, nil, errors.Wrap(err, "parse flags")
+	}
+	if err := validateBootstrapDEKIDs(*storageDEKID, *raftDEKID); err != nil {
+		return nil, nil, err
+	}
+	wrappedStorage, wrappedRaft, err := decodeBootstrapWrappedDEKs(*wrappedStorageB64, *wrappedRaftB64)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(writerFlags) == 0 {
+		return nil, nil, errors.New("encryption: at least one --writer=<full_node_id>:<local_epoch> is required")
+	}
+	batch, err := parseWriterBatch(writerFlags)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &pb.BootstrapEncryptionRequest{
+		StorageDekId:      narrowUint32(*storageDEKID),
+		RaftDekId:         narrowUint32(*raftDEKID),
+		WrappedStorageDek: wrappedStorage,
+		WrappedRaftDek:    wrappedRaft,
+		WriterBatch:       batch,
+	}, endpoint, nil
+}
+
+func validateBootstrapDEKIDs(storage, raft uint) error {
+	if err := requireUint32(storage, "storage-dek-id"); err != nil {
+		return err
+	}
+	if err := requireUint32(raft, "raft-dek-id"); err != nil {
+		return err
+	}
+	if storage == 0 {
+		return errors.New("encryption: --storage-dek-id is required and must be non-zero")
+	}
+	if raft == 0 {
+		return errors.New("encryption: --raft-dek-id is required and must be non-zero")
+	}
+	if storage == raft {
+		return errors.New("encryption: --storage-dek-id and --raft-dek-id must differ")
+	}
+	return nil
+}
+
+func decodeBootstrapWrappedDEKs(storageB64, raftB64 string) ([]byte, []byte, error) {
+	storage, err := decodeWrappedDEKFlag(storageB64)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "--wrapped-storage-dek")
+	}
+	raft, err := decodeWrappedDEKFlag(raftB64)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "--wrapped-raft-dek")
+	}
+	return storage, raft, nil
+}
+
+// stringSliceFlag accumulates repeated `--writer=` flags as a
+// flat string slice. Each entry is parsed in parseWriterBatch
+// after the flag.Parse pass so a malformed entry surfaces a
+// single composite error rather than a half-built batch.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+func parseWriterBatch(raw []string) ([]*pb.WriterRegistryEntry, error) {
+	out := make([]*pb.WriterRegistryEntry, 0, len(raw))
+	for i, entry := range raw {
+		nodeIDStr, epochStr, ok := strings.Cut(entry, ":")
+		if !ok {
+			return nil, errors.Errorf("encryption: --writer[%d]=%q is not <full_node_id>:<local_epoch>", i, entry)
+		}
+		nodeID, err := strconv.ParseUint(nodeIDStr, 10, 64)
+		if err != nil {
+			return nil, errors.Wrapf(err, "encryption: --writer[%d] full_node_id", i)
+		}
+		if nodeID == 0 {
+			return nil, errors.Errorf("encryption: --writer[%d] full_node_id must be non-zero (0 is reserved)", i)
+		}
+		epoch, err := strconv.ParseUint(epochStr, 10, 32)
+		if err != nil {
+			return nil, errors.Wrapf(err, "encryption: --writer[%d] local_epoch", i)
+		}
+		if epoch > math.MaxUint16 {
+			return nil, errors.Errorf("encryption: --writer[%d] local_epoch=%d exceeds 0xFFFF", i, epoch)
+		}
+		out = append(out, &pb.WriterRegistryEntry{
+			FullNodeId: nodeID,
+			LocalEpoch: narrowUint32(uint(epoch)),
+		})
+	}
+	return out, nil
+}
+
 // uint32Mask is the defence-in-depth narrowing mask for the
 // uint→uint32 conversion below; named so the magic-number linter
 // does not flag the mask itself.

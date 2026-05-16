@@ -173,10 +173,11 @@ func (s *stubSidecarErrorServer) GetSidecarState(context.Context, *pb.Empty) (*p
 // inherit Unimplemented defaults.
 type stubMutatorServer struct {
 	pb.UnimplementedEncryptionAdminServer
-	rotateCalls   []*pb.RotateDEKRequest
-	registerCalls []*pb.RegisterEncryptionWriterRequest
-	appliedIndex  uint64
-	returnErr     error
+	rotateCalls    []*pb.RotateDEKRequest
+	registerCalls  []*pb.RegisterEncryptionWriterRequest
+	bootstrapCalls []*pb.BootstrapEncryptionRequest
+	appliedIndex   uint64
+	returnErr      error
 }
 
 func (s *stubMutatorServer) RotateDEK(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -193,6 +194,93 @@ func (s *stubMutatorServer) RegisterEncryptionWriter(_ context.Context, req *pb.
 		return nil, s.returnErr
 	}
 	return &pb.RegisterEncryptionWriterResponse{AppliedIndex: s.appliedIndex}, nil
+}
+
+func (s *stubMutatorServer) BootstrapEncryption(_ context.Context, req *pb.BootstrapEncryptionRequest) (*pb.BootstrapEncryptionResponse, error) {
+	s.bootstrapCalls = append(s.bootstrapCalls, req)
+	if s.returnErr != nil {
+		return nil, s.returnErr
+	}
+	return &pb.BootstrapEncryptionResponse{AppliedIndex: s.appliedIndex}, nil
+}
+
+func TestRunEncryptionBootstrap_HappyPath(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{appliedIndex: 117}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+
+	var buf bytes.Buffer
+	err := runEncryptionBootstrap([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--storage-dek-id", "1",
+		"--raft-dek-id", "2",
+		// "wrapped-storage" base64-encoded
+		"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+		// "wrapped-raft" base64-encoded
+		"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+		"--writer", "11:0",
+		"--writer", "22:5",
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionBootstrap: %v", err)
+	}
+	if !strings.Contains(buf.String(), "applied_index=117") {
+		t.Errorf("output missing applied_index=117, got:\n%s", buf.String())
+	}
+	if len(stub.bootstrapCalls) != 1 {
+		t.Fatalf("BootstrapEncryption calls=%d, want 1", len(stub.bootstrapCalls))
+	}
+	assertBootstrapCallMatches(t, stub.bootstrapCalls[0])
+}
+
+func assertBootstrapCallMatches(t *testing.T, call *pb.BootstrapEncryptionRequest) {
+	t.Helper()
+	if call.StorageDekId != 1 || call.RaftDekId != 2 {
+		t.Errorf("dek ids=(s=%d,r=%d), want (1,2)", call.StorageDekId, call.RaftDekId)
+	}
+	if string(call.WrappedStorageDek) != "wrapped-storage" {
+		t.Errorf("WrappedStorageDek=%q, want wrapped-storage", call.WrappedStorageDek)
+	}
+	if string(call.WrappedRaftDek) != "wrapped-raft" {
+		t.Errorf("WrappedRaftDek=%q, want wrapped-raft", call.WrappedRaftDek)
+	}
+	if len(call.WriterBatch) != 2 {
+		t.Fatalf("WriterBatch len=%d, want 2", len(call.WriterBatch))
+	}
+	if call.WriterBatch[0].FullNodeId != 11 || call.WriterBatch[0].LocalEpoch != 0 ||
+		call.WriterBatch[1].FullNodeId != 22 || call.WriterBatch[1].LocalEpoch != 5 {
+		t.Errorf("WriterBatch=%v, want [(11,0),(22,5)]", call.WriterBatch)
+	}
+}
+
+func TestRunEncryptionBootstrap_RejectsBadWriter(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	for _, c := range []struct {
+		name  string
+		entry string
+	}{
+		{"missing colon", "12345"},
+		{"non-numeric node_id", "abc:0"},
+		{"non-numeric epoch", "1:xyz"},
+		{"zero node_id", "0:0"},
+		{"epoch above 0xFFFF", "1:70000"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			err := runEncryptionBootstrap([]string{
+				"--endpoint", "127.0.0.1:1",
+				"--storage-dek-id", "1",
+				"--raft-dek-id", "2",
+				"--wrapped-storage-dek", "d3JhcHBlZC1zdG9yYWdl",
+				"--wrapped-raft-dek", "d3JhcHBlZC1yYWZ0",
+				"--writer", c.entry,
+			}, &buf)
+			if err == nil {
+				t.Errorf("%s: runEncryptionBootstrap returned nil, want error for --writer=%q", c.name, c.entry)
+			}
+		})
+	}
 }
 
 func TestRunEncryptionRotateDEK_HappyPath(t *testing.T) {

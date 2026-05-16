@@ -248,33 +248,36 @@ func TestEncryptionAdmin_ResyncSidecar_ShipsWrappedDEKs(t *testing.T) {
 	}
 }
 
-// TestEncryptionAdmin_BootstrapEncryption_Unimplemented pins the
-// PR-B contract that BootstrapEncryption is still un-wired and
-// returns Unimplemented. PR-C will replace this with positive
-// tests once the §5.6 step 1a capability fan-out lands.
-func TestEncryptionAdmin_BootstrapEncryption_Unimplemented(t *testing.T) {
-	t.Parallel()
-	srv := NewEncryptionAdminServer()
-	ctx := context.Background()
-	if _, err := srv.BootstrapEncryption(ctx, &pb.BootstrapEncryptionRequest{}); status.Code(err) != codes.Unimplemented {
-		t.Errorf("BootstrapEncryption status=%v, want Unimplemented", status.Code(err))
-	}
-}
-
 // TestEncryptionAdmin_MutatingRPCs_RejectWithoutProposer pins the
-// PR-A production-inert guarantee: an EncryptionAdminServer built
+// production-inert guarantee: an EncryptionAdminServer built
 // without WithEncryptionAdminProposer must reject every mutating
-// RPC. The §6.5 cluster flag (Stage 6) is what flips this on by
-// wiring a real proposer.
+// RPC. The future cluster flag is what flips this on by wiring a
+// real proposer.
 func TestEncryptionAdmin_MutatingRPCs_RejectWithoutProposer(t *testing.T) {
 	t.Parallel()
 	srv := NewEncryptionAdminServer()
 	ctx := context.Background()
+	if _, err := srv.BootstrapEncryption(ctx, validBootstrapEncryptionRequest()); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("BootstrapEncryption status=%v, want FailedPrecondition (no proposer wired)", status.Code(err))
+	}
 	if _, err := srv.RotateDEK(ctx, validRotateDEKRequest()); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("RotateDEK status=%v, want FailedPrecondition (no proposer wired)", status.Code(err))
 	}
 	if _, err := srv.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest()); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("RegisterEncryptionWriter status=%v, want FailedPrecondition (no proposer wired)", status.Code(err))
+	}
+}
+
+func validBootstrapEncryptionRequest() *pb.BootstrapEncryptionRequest {
+	return &pb.BootstrapEncryptionRequest{
+		WrappedStorageDek: []byte("wrapped-storage-bytes"),
+		WrappedRaftDek:    []byte("wrapped-raft-bytes"),
+		StorageDekId:      1,
+		RaftDekId:         2,
+		WriterBatch: []*pb.WriterRegistryEntry{
+			{FullNodeId: 11, LocalEpoch: 0},
+			{FullNodeId: 22, LocalEpoch: 0},
+		},
 	}
 }
 
@@ -294,6 +297,174 @@ func validRegisterEncryptionWriterRequest() *pb.RegisterEncryptionWriterRequest 
 		Writers: []*pb.WriterRegistryEntry{
 			{FullNodeId: 11, LocalEpoch: 7},
 		},
+	}
+}
+
+// TestEncryptionAdmin_Validate_RejectsProposerWithoutLeaderView
+// pins the production-wiring guard: a server constructed with a
+// proposer but no LeaderView is rejected at Validate() time so a
+// follower cannot silently propose state-changing entries.
+func TestEncryptionAdmin_Validate_RejectsProposerWithoutLeaderView(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+	)
+	if err := srv.Validate(); err == nil {
+		t.Fatalf("Validate returned nil, want error for proposer-without-leaderView")
+	}
+}
+
+// TestEncryptionAdmin_Validate_OKWithoutProposer keeps the
+// read-only-server affordance: a server with neither proposer
+// nor leaderView is valid (it just rejects every mutator with
+// "proposer not configured"). Tests in this package rely on
+// this path.
+func TestEncryptionAdmin_Validate_OKWithoutProposer(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer()
+	if err := srv.Validate(); err != nil {
+		t.Errorf("Validate returned %v, want nil for read-only server", err)
+	}
+}
+
+// TestEncryptionAdmin_Validate_OKWithBothWired covers the
+// production happy path.
+func TestEncryptionAdmin_Validate_OKWithBothWired(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	if err := srv.Validate(); err != nil {
+		t.Errorf("Validate returned %v, want nil", err)
+	}
+}
+
+// TestEncryptionAdmin_BootstrapEncryption_HappyPath verifies the
+// byte layout of the proposed §5.6 0x04 Raft entry by
+// round-tripping through fsmwire.DecodeBootstrap. Each writer in
+// the request expands into TWO registry rows (one per active
+// dek_id) so the §4.1 nonce-uniqueness invariant covers both
+// envelope purposes from the first post-bootstrap entry.
+func TestEncryptionAdmin_BootstrapEncryption_HappyPath(t *testing.T) {
+	t.Parallel()
+	proposer := &recordingProposer{commitIndex: 5}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validBootstrapEncryptionRequest()
+	got, err := srv.BootstrapEncryption(context.Background(), req)
+	if err != nil {
+		t.Fatalf("BootstrapEncryption: %v", err)
+	}
+	if got.AppliedIndex != 5 {
+		t.Errorf("AppliedIndex=%d, want 5", got.AppliedIndex)
+	}
+	assertSingleProposalOpcode(t, proposer.calls, fsmwire.OpBootstrap)
+	decoded, err := fsmwire.DecodeBootstrap(proposer.calls[0][1:])
+	if err != nil {
+		t.Fatalf("DecodeBootstrap: %v", err)
+	}
+	assertBootstrapDecodes(t, decoded, req)
+}
+
+func assertBootstrapDecodes(t *testing.T, got fsmwire.BootstrapPayload, req *pb.BootstrapEncryptionRequest) {
+	t.Helper()
+	assertBootstrapHeader(t, got, req)
+	wantRows := 2 * len(req.WriterBatch)
+	if len(got.BatchRegistry) != wantRows {
+		t.Fatalf("BatchRegistry len=%d, want %d (2 rows per writer)",
+			len(got.BatchRegistry), wantRows)
+	}
+	for i, w := range req.WriterBatch {
+		assertBootstrapWriterRows(t, i, got.BatchRegistry, w, req.StorageDekId, req.RaftDekId)
+	}
+}
+
+func assertBootstrapHeader(t *testing.T, got fsmwire.BootstrapPayload, req *pb.BootstrapEncryptionRequest) {
+	t.Helper()
+	if got.StorageDEKID != req.StorageDekId || got.RaftDEKID != req.RaftDekId {
+		t.Errorf("dek_ids=(s=%d, r=%d), want (%d, %d)",
+			got.StorageDEKID, got.RaftDEKID, req.StorageDekId, req.RaftDekId)
+	}
+	if string(got.WrappedStorage) != string(req.WrappedStorageDek) {
+		t.Errorf("WrappedStorage=%q, want %q", got.WrappedStorage, req.WrappedStorageDek)
+	}
+	if string(got.WrappedRaft) != string(req.WrappedRaftDek) {
+		t.Errorf("WrappedRaft=%q, want %q", got.WrappedRaft, req.WrappedRaftDek)
+	}
+}
+
+func assertBootstrapWriterRows(t *testing.T, i int, rows []fsmwire.RegistrationPayload, w *pb.WriterRegistryEntry, storageDEKID, raftDEKID uint32) {
+	t.Helper()
+	storage := rows[2*i]
+	raft := rows[2*i+1]
+	if storage.DEKID != storageDEKID || storage.FullNodeID != w.FullNodeId ||
+		raft.DEKID != raftDEKID || raft.FullNodeID != w.FullNodeId ||
+		uint32(storage.LocalEpoch) != w.LocalEpoch || uint32(raft.LocalEpoch) != w.LocalEpoch {
+		t.Errorf("writer[%d]: storage=%+v raft=%+v, want both anchored to full_node_id=%d epoch=%d",
+			i, storage, raft, w.FullNodeId, w.LocalEpoch)
+	}
+}
+
+func TestEncryptionAdmin_BootstrapEncryption_RejectsBadInputs(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	type tc struct {
+		name string
+		mut  func(r *pb.BootstrapEncryptionRequest)
+	}
+	for _, c := range []tc{
+		{"zero storage_dek_id", func(r *pb.BootstrapEncryptionRequest) { r.StorageDekId = 0 }},
+		{"zero raft_dek_id", func(r *pb.BootstrapEncryptionRequest) { r.RaftDekId = 0 }},
+		{"storage_dek_id == raft_dek_id", func(r *pb.BootstrapEncryptionRequest) {
+			r.StorageDekId = 7
+			r.RaftDekId = 7
+		}},
+		{"empty wrapped_storage_dek", func(r *pb.BootstrapEncryptionRequest) { r.WrappedStorageDek = nil }},
+		{"empty wrapped_raft_dek", func(r *pb.BootstrapEncryptionRequest) { r.WrappedRaftDek = nil }},
+		{"empty writer_batch", func(r *pb.BootstrapEncryptionRequest) { r.WriterBatch = nil }},
+		{"writer with zero full_node_id", func(r *pb.BootstrapEncryptionRequest) {
+			r.WriterBatch = []*pb.WriterRegistryEntry{{FullNodeId: 0, LocalEpoch: 0}}
+		}},
+		{"writer with local_epoch above 0xFFFF", func(r *pb.BootstrapEncryptionRequest) {
+			r.WriterBatch = []*pb.WriterRegistryEntry{{FullNodeId: 1, LocalEpoch: 0x10000}}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			req := validBootstrapEncryptionRequest()
+			c.mut(req)
+			_, err := srv.BootstrapEncryption(context.Background(), req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Errorf("%s: status=%v, want InvalidArgument", c.name, status.Code(err))
+			}
+		})
+	}
+}
+
+func TestEncryptionAdmin_BootstrapEncryption_RejectsOversizeBatch(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validBootstrapEncryptionRequest()
+	// bootstrapBatchRowCap is 16384 ≈ 2 * 8192 writers. Stage 1a
+	// expands each writer into two rows; we ship just above the
+	// cap so the boundary check fires.
+	writers := make([]*pb.WriterRegistryEntry, bootstrapBatchRowCap/2+1)
+	for i := range writers {
+		// i ranges 0..~8192; bound-checked to stay inside uint64.
+		writers[i] = &pb.WriterRegistryEntry{FullNodeId: uint64(i) + 1} //nolint:gosec // i is bounded by len(writers) ≪ math.MaxInt64
+	}
+	req.WriterBatch = writers
+	_, err := srv.BootstrapEncryption(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("BootstrapEncryption status=%v, want InvalidArgument on oversize batch", status.Code(err))
 	}
 }
 
