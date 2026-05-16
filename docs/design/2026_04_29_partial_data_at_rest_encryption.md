@@ -21,8 +21,8 @@ Date: 2026-04-29
 | 6A | §6.3 `EncryptionApplier` concrete implementation (writer-registry insert + sidecar mutate + keystore update; nil-KEK code paths in `ApplyBootstrap` / `ApplyRotation` return a typed `ErrKEKNotConfigured` defense-in-depth marker until 6B fills it) + `kv.NewKvFSMWithHLC(... WithEncryption(applier))` wiring. **Mutator wiring in `registerEncryptionAdminServer` stays OFF, identical to Stage 5D** — see Stage 6 rationale §6A note. No new flag is introduced in 6A; the applier is operator-inert and reachable only through direct `FSM.Apply` calls in unit tests | open | — |
 | 6B | §6.5 KEK plumbing — `--kekFile` / `--kekUri` flags + `internal/encryption/kek` selection at startup + thread `KEKUnwrapper` into the applier so `ApplyBootstrap` / `ApplyRotation` actually KEK-unwrap (replaces the 6A `ErrKEKNotConfigured` stubs) + introduce `--encryption-enabled` flag (default off) + re-enable mutating-RPC wiring in `registerEncryptionAdminServer` gated on (`--encryption-enabled` AND `KEKConfigured()`) | open | — |
 | 6C | Extend `--encryption-enabled` (introduced in 6B) with §9.1 startup refusal guards (sidecar present without flag, KEK mismatch, sidecar/raft index gap, filesystem fsync support, `local_epoch` rollback / exhaustion, `node_id` collision) | open | — |
-| 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring — see rationale) | open | — |
-| 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself) | open | — |
+| 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring AND 6C for §9.1 startup-refusal guards — see rationale) | open | — |
+| 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself). Depends on 6B for mutator wiring AND 6C for §9.1 startup-refusal guards | open | — |
 | 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal | open | — |
 | 7 | Writer registry + deterministic nonce (§4.1) | open | — |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |
@@ -137,22 +137,33 @@ production-safe state, and unblocks the next one.
   pause before committing to Phase 2, not as an escape hatch
   from Phase 1.
 
-- **6D and 6E both depend on 6B unconditionally.** With the
-  revised 6A/6B split, every cutover RPC (`enable-storage-envelope`,
-  `enable-raft-envelope`) inherits 6B's mutator wiring — 6B is
-  what makes any EncryptionAdmin mutator reachable at all. The
-  cutover-specific work in 6D and 6E is the new admin RPC
-  handler + the cluster-flag entry it proposes; the underlying
-  ability to propose anything is 6B's. The nominal table
-  ordering 6A → 6B → 6C → 6D → 6E reflects review-time
-  cleanliness (§9.1 guards reviewed before the cutovers exercise
-  them), but the actual shipping dependency is 6A → 6B → 6D
-  → 6E with 6C orthogonal (it strictly extends `--encryption-enabled`
-  guards and can ship at any point after 6B). The
-  6D-implicit-bootstrap rationale that triggered this note —
-  §7.1 Phase 1 step 4 routing through `ApplyBootstrap`'s
-  KEK-unwrap — is still correct but is now a special case of
-  the general 6B-gates-mutators rule, not a separate dependency.
+- **6D and 6E both depend on 6B AND 6C unconditionally.** With
+  the revised 6A/6B split, every cutover RPC
+  (`enable-storage-envelope`, `enable-raft-envelope`) inherits
+  6B's mutator wiring — 6B is what makes any EncryptionAdmin
+  mutator reachable at all. The cutover-specific work in 6D and
+  6E is the new admin RPC handler + the cluster-flag entry it
+  proposes; the underlying ability to propose anything is 6B's.
+  **The shipping order is 6A → 6B → 6C → 6D → 6E with 6C as a
+  hard prerequisite, NOT optional/orthogonal.** Codex r4 P1
+  flagged that treating 6C as orthogonal violates §9.1
+  invariants: once 6D/6E flip the storage / raft envelope
+  cluster-flag, the on-disk state assumes the §9.1 guards are
+  in force (sidecar-present-without-flag is refused at startup,
+  KEK mismatch is refused, sidecar/raft index gap is refused,
+  fsync unsupported is refused, `local_epoch` rollback /
+  exhaustion is refused, `node_id` collision is refused). An
+  operator who restarts a 6D/6E-active node on a 6A+6B binary
+  without 6C's startup guards can land in a state where the
+  sidecar is present but `--encryption-enabled` is off (silently
+  reading cleartext past an envelope cutover), or reissue a
+  stale `local_epoch` that recycles a previously-used GCM nonce
+  — both are security-class regressions the §9.1 guards exist
+  to prevent. The 6D-implicit-bootstrap rationale that triggered
+  the original ordering note — §7.1 Phase 1 step 4 routing
+  through `ApplyBootstrap`'s KEK-unwrap — is still correct, and
+  the 6C-gate adds a second hard predecessor for the cutover
+  milestones rather than replacing the 6B one.
 
 - **6F is optional ergonomics.** `--encryption-rotate-on-startup`
   is documented in §6.5 as a request, not a guarantee, and the
