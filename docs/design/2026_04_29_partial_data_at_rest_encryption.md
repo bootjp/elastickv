@@ -129,9 +129,12 @@ production-safe state, and unblocks the next one.
 
 - **6C adds §9.1 refusal guards.** These are config / on-disk
   consistency checks at process startup that block the binary
-  from running with a half-configured encryption state. They
-  are independent of the FSM apply path and the cutover RPCs,
-  so they land in their own PR.
+  from running with a half-configured encryption state. The
+  guard code is independent of the FSM apply path and the
+  cutover RPCs (it runs at startup, before either has a chance
+  to fire), so 6C lands in its own PR. **The independence is
+  at the implementation level only — the safety ordering is
+  6C before 6D/6E**, see the next bullet for why.
 
 - **6D and 6E are the actual cutovers** (Phase 1 = storage, Phase
   2 = raft). Each touches a different code path (§6.2 storage
