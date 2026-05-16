@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
@@ -269,8 +270,52 @@ func TestPurgeQueueSigV4_PreservesWireShapeAfterTypedErrorChange(t *testing.T) {
 	}
 }
 
+// TestAdminDescribeQueue_DefaultSkipsDLQScan pins the opt-out
+// behavior reviewers (Codex r1 P2, Gemini r1) flagged in the first
+// draft of this PR: AdminDescribeQueue WITHOUT
+// AdminDescribeQueueOptions{IncludeDLQSources: true} must NOT
+// populate IsDLQ even when source queues exist, because the only
+// production consumer (sqsQueuesBridge.convertAdminQueueSummary) and
+// admin.QueueSummary drop the fields. The unconditional version
+// silently paid an O(N) catalog scan per Describe call for no
+// observable benefit. This test fails on the first-draft code
+// (which set IsDLQ=true here) and passes on the opt-in version.
+func TestAdminDescribeQueue_DefaultSkipsDLQScan(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+	_ = createSQSQueueForTest(t, node, "dlq-target")
+
+	// Wire a source queue with RedrivePolicy so the scan WOULD
+	// surface a result if it ran.
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-target","maxReceiveCount":5}`
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  "should-not-be-seen",
+		"Attributes": map[string]string{"RedrivePolicy": policy},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create source: %d %v", status, out)
+	}
+
+	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "dlq-target")
+	if err != nil {
+		t.Fatalf("AdminDescribeQueue: %v", err)
+	}
+	if !exists {
+		t.Fatalf("queue not found")
+	}
+	if summary.IsDLQ {
+		t.Fatalf("default AdminDescribeQueue must not populate IsDLQ; got IsDLQ=true")
+	}
+	if len(summary.DLQSources) != 0 {
+		t.Fatalf("default AdminDescribeQueue must not populate DLQSources; got %v", summary.DLQSources)
+	}
+}
+
 // TestAdminQueueSummary_IsDLQ_NoSources confirms a queue that nobody
-// points at reports IsDLQ=false and an empty DLQSources slice.
+// points at reports IsDLQ=false and an empty DLQSources slice when
+// the caller opts into the scan.
 func TestAdminQueueSummary_IsDLQ_NoSources(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -278,7 +323,7 @@ func TestAdminQueueSummary_IsDLQ_NoSources(t *testing.T) {
 	node := sqsLeaderNode(t, nodes)
 	_ = createSQSQueueForTest(t, node, "lonely")
 
-	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "lonely")
+	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "lonely", AdminDescribeQueueOptions{IncludeDLQSources: true})
 	if err != nil {
 		t.Fatalf("AdminDescribeQueue: %v", err)
 	}
@@ -294,9 +339,10 @@ func TestAdminQueueSummary_IsDLQ_NoSources(t *testing.T) {
 }
 
 // TestAdminQueueSummary_IsDLQ_OneSource confirms one inbound
-// RedrivePolicy is detected and surfaced. Uses the public CreateQueue
-// path so the meta record carries the RedrivePolicy attribute
-// exactly as a real client would have written it.
+// RedrivePolicy is detected and surfaced when the caller opts in.
+// Uses the public CreateQueue path so the meta record carries the
+// RedrivePolicy attribute exactly as a real client would have
+// written it.
 func TestAdminQueueSummary_IsDLQ_OneSource(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -313,7 +359,7 @@ func TestAdminQueueSummary_IsDLQ_OneSource(t *testing.T) {
 		t.Fatalf("create source: %d %v", status, out)
 	}
 
-	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "dlq-target")
+	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "dlq-target", AdminDescribeQueueOptions{IncludeDLQSources: true})
 	if err != nil {
 		t.Fatalf("AdminDescribeQueue: %v", err)
 	}
@@ -353,7 +399,7 @@ func TestAdminQueueSummary_IsDLQ_TwoSourcesSorted(t *testing.T) {
 		}
 	}
 
-	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "shared-dlq")
+	summary, exists, err := node.sqsServer.AdminDescribeQueue(context.Background(), "shared-dlq", AdminDescribeQueueOptions{IncludeDLQSources: true})
 	if err != nil {
 		t.Fatalf("AdminDescribeQueue: %v", err)
 	}
@@ -371,5 +417,32 @@ func TestAdminQueueSummary_IsDLQ_TwoSourcesSorted(t *testing.T) {
 		if summary.DLQSources[i] != name {
 			t.Fatalf("DLQSources[%d]=%q want %q (full=%v)", i, summary.DLQSources[i], name, summary.DLQSources)
 		}
+	}
+}
+
+// TestCollectDLQSources_StopOnOutOfPrefix pins the Gemini r1 fix:
+// when ScanAt returns a key outside the queue-meta prefix (a future
+// neighbour of the queue catalog), collectDLQSources must signal stop
+// so findQueuesPointingAt breaks the pagination loop immediately
+// rather than wasting another ScanAt round-trip on a guaranteed-empty
+// follow-up.
+func TestCollectDLQSources_StopOnOutOfPrefix(t *testing.T) {
+	t.Parallel()
+	prefix := []byte(SqsQueueMetaPrefix)
+	// Construct one in-prefix and one out-of-prefix key. The
+	// out-of-prefix key uses a different leading byte so the
+	// HasPrefix check fires.
+	inPrefix := append(append([]byte{}, prefix...), []byte("alpha")...)
+	outOfPrefix := []byte{0xff, 0xff, 0xff}
+	page := []*store.KVPair{
+		{Key: inPrefix, Value: []byte{}},    // value won't decode; the row gets skipped silently
+		{Key: outOfPrefix, Value: []byte{}}, // triggers stop
+	}
+	sources, stop := collectDLQSources(page, prefix, "dlq", nil)
+	if !stop {
+		t.Fatalf("stop=false want true (out-of-prefix key must signal end of catalog)")
+	}
+	if len(sources) != 0 {
+		t.Fatalf("sources=%v want empty (no record had matching RedrivePolicy)", sources)
 	}
 }

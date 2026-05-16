@@ -59,6 +59,23 @@ func (s *SQSServer) AdminListQueues(ctx context.Context) ([]string, error) {
 	return s.scanQueueNames(ctx) //nolint:wrapcheck // pure pass-through; the adapter owns the error context.
 }
 
+// AdminDescribeQueueOptions opts the Describe call into the more
+// expensive lookups. Each option defaults to off so the cheap path
+// (the only one Phase 2's bridge actually consumes) stays O(1).
+type AdminDescribeQueueOptions struct {
+	// IncludeDLQSources turns on the paginated reverse-scan over
+	// the queue-meta catalog that populates IsDLQ and DLQSources.
+	// Cost is ceil(N/sqsQueueScanPageLimit) round-trips plus a
+	// JSON decode per record (same envelope as scanQueueNamesAt),
+	// so it is opt-in to keep AdminDescribeQueue calls from
+	// callers that don't surface the DLQ relationship (e.g.
+	// today's admin SPA, which drops the fields in the bridge)
+	// O(1). Phase 4 (the SPA wiring) flips this on; reviewers
+	// flagged the unconditional version as dead work otherwise
+	// (Codex r1 P2, Gemini r1).
+	IncludeDLQSources bool
+}
+
 // AdminDescribeQueue returns a snapshot of name's metadata plus the
 // approximate counters. The triple (result, present, error) lets
 // admin callers distinguish a missing queue from a storage error
@@ -68,7 +85,12 @@ func (s *SQSServer) AdminListQueues(ctx context.Context) ([]string, error) {
 // on either the leader or a follower (read-only); the counter scan
 // uses a fresh nextTxnReadTS so the result is consistent with what
 // SigV4 GetQueueAttributes would have returned at the same instant.
-func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string) (*AdminQueueSummary, bool, error) {
+//
+// Optional AdminDescribeQueueOptions toggle additional lookups
+// (currently DLQ source enumeration). Existing callers that pass no
+// options retain the cheap path; Phase 4 wiring opts in when the SPA
+// needs the DLQ relationship.
+func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string, opts ...AdminDescribeQueueOptions) (*AdminQueueSummary, bool, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, false, ErrAdminSQSValidation
 	}
@@ -84,16 +106,35 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string) (*Admin
 	if err != nil {
 		return nil, false, err
 	}
-	sources, err := s.findQueuesPointingAt(ctx, name, readTS)
-	if err != nil {
-		return nil, false, errors.WithStack(err)
-	}
 	summary := adminQueueSummary(name, meta, counters, s.queueArn(name))
-	if len(sources) > 0 {
-		summary.IsDLQ = true
-		summary.DLQSources = sources
+	opt := mergeDescribeQueueOptions(opts)
+	if opt.IncludeDLQSources {
+		sources, err := s.findQueuesPointingAt(ctx, name, readTS)
+		if err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		if len(sources) > 0 {
+			summary.IsDLQ = true
+			summary.DLQSources = sources
+		}
 	}
 	return summary, true, nil
+}
+
+// mergeDescribeQueueOptions folds the variadic opts into a single
+// effective option set. Variadic was chosen over a struct parameter
+// so the change is source-compatible with existing callers; a future
+// opt that conflicts with another can fail explicitly here. Only the
+// last value of each field wins, matching the
+// "later-wins" convention used in other elastickv adapters.
+func mergeDescribeQueueOptions(opts []AdminDescribeQueueOptions) AdminDescribeQueueOptions {
+	var out AdminDescribeQueueOptions
+	for _, o := range opts {
+		if o.IncludeDLQSources {
+			out.IncludeDLQSources = true
+		}
+	}
+	return out
 }
 
 // findQueuesPointingAt walks the queue-meta catalog at readTS and
@@ -111,9 +152,10 @@ func (s *SQSServer) AdminDescribeQueue(ctx context.Context, name string) (*Admin
 // Catalog records that fail to decode are skipped (a malformed meta
 // record is a programmer / corruption bug, not a DLQ-detection bug —
 // dropping it keeps Describe usable rather than failing the whole
-// call). Records without a RedrivePolicy are skipped because
-// parseRedrivePolicy requires a non-empty value; the scan only pays
-// the JSON parse cost on queues that have a policy configured.
+// call). Records without a RedrivePolicy are skipped after the JSON
+// decode — every record pays the decode cost, but only RedrivePolicy-
+// bearing records pay the parseRedrivePolicy cost on top. A future
+// reverse-index would let us skip the decode too; out of scope here.
 func (s *SQSServer) findQueuesPointingAt(ctx context.Context, dlqName string, readTS uint64) ([]string, error) {
 	prefix := []byte(SqsQueueMetaPrefix)
 	end := prefixScanEnd(prefix)
@@ -127,7 +169,16 @@ func (s *SQSServer) findQueuesPointingAt(ctx context.Context, dlqName string, re
 		if len(page) == 0 {
 			break
 		}
-		sources, _ = collectDLQSources(page, prefix, dlqName, sources)
+		var stop bool
+		sources, stop = collectDLQSources(page, prefix, dlqName, sources)
+		if stop {
+			// Saw a key outside the queue-meta prefix —
+			// the catalog has ended, no further pages can
+			// contain queues. Avoid the extra ScanAt that
+			// would otherwise be needed to detect the
+			// empty-page sentinel.
+			break
+		}
 		if len(page) < sqsQueueScanPageLimit {
 			break
 		}
