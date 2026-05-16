@@ -27,6 +27,16 @@ type encryptionAdminEngine interface {
 // shard's own raftengine.LeaderView so a follower returns
 // FailedPrecondition with the current leader's hint.
 //
+// fullNodeID MUST be per-node-stable (every replica of the same
+// group sees a distinct value), NOT the Raft group id (which is
+// shared across replicas). Production callers derive it via
+// etcd.DeriveNodeID(*raftId) at the call site so the value
+// matches what raftengine itself uses for peer identification.
+// A wrong-shape value here makes BootstrapEncryption fail with
+// "duplicate full_node_id" because every node reports the same
+// number — Codex r1 P1 on PR #760 caught the original wiring
+// passing the shard id by mistake.
+//
 // Production-inert until Stage 6:
 //   - sidecarPath is empty by default, so GetCapability returns
 //     encryption_capable=false (the §7.1 cutover refuses with
@@ -40,11 +50,11 @@ type encryptionAdminEngine interface {
 // for both options, so the invariant holds by construction — the
 // panic is the load-bearing guard against a future refactor that
 // splits the two options apart.
-func registerEncryptionAdminServer(gs *grpc.Server, engine encryptionAdminEngine, shardID uint64) {
+func registerEncryptionAdminServer(gs *grpc.Server, engine encryptionAdminEngine, fullNodeID uint64) {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminProposer(engine),
 		adapter.WithEncryptionAdminLeaderView(engine),
-		adapter.WithEncryptionAdminFullNodeID(shardID),
+		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
 	if *encryptionSidecarPath != "" {
 		opts = append(opts, adapter.WithEncryptionAdminSidecarPath(*encryptionSidecarPath))

@@ -1278,7 +1278,18 @@ func startRaftServers(
 		if adminServer != nil {
 			pb.RegisterAdminServer(gs, adminServer)
 		}
-		registerEncryptionAdminServer(gs, rt.engine, rt.spec.id)
+		// full_node_id MUST be per-node-stable, not per-shard.
+		// rt.spec.id is the Raft group id which every replica of
+		// the same group shares; using it as full_node_id makes
+		// every node return the same CapabilityReport value and
+		// BootstrapEncryption's writer-batch uniqueness validation
+		// (adapter/encryption_admin.go validateWriterBatchUniqueness)
+		// rejects the bootstrap with "duplicate full_node_id".
+		// Derive a per-node uint64 from --raftId via the canonical
+		// FNV-1a hash already used by raftengine for peer ids
+		// (etcd.DeriveNodeID), so every node in the cluster reports
+		// a stable, distinct value. Codex r1 P1 on PR #760.
+		registerEncryptionAdminServer(gs, rt.engine, etcdraftengine.DeriveNodeID(*raftId))
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
