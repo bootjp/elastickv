@@ -614,17 +614,66 @@ func TestApplyRotation_UnknownPurpose(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("pre-bootstrap: %v", err)
 	}
+	// ProposerRegistration.DEKID MUST match RotationPayload.DEKID
+	// — the round-2 mismatch guard fires before sidecarPurposeFor
+	// otherwise, and the test would exercise the wrong code path.
 	err := app.ApplyRotation(fsmwire.RotationPayload{
-		SubTag:  fsmwire.RotateSubRotateDEK,
-		DEKID:   9,
-		Purpose: fsmwire.Purpose(0xFE), // not Storage / Raft
-		Wrapped: []byte("y"),
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                9,
+		Purpose:              fsmwire.Purpose(0xFE), // not Storage / Raft
+		Wrapped:              []byte("y"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 9, FullNodeID: 0x01, LocalEpoch: 0},
 	})
 	if err == nil {
 		t.Fatal("expected halt on unknown purpose, got nil")
 	}
 	if !errors.Is(err, encryption.ErrEncryptionApply) {
 		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+}
+
+// TestApplyBootstrap_RejectsForeignBatchRegistryDEK pins the §5.6
+// step 1a bootstrap-batch invariant: every BatchRegistry row MUST
+// target either StorageDEKID or RaftDEKID. A row targeting a
+// foreign DEK would persist writer-registry state for an unrelated
+// key while the bootstrap installs only the two declared DEKs —
+// silently breaking the §4.1 first-writer invariant on the next
+// post-bootstrap write under that foreign key.
+func TestApplyBootstrap_RejectsForeignBatchRegistryDEK(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("s"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 1, FullNodeID: 0xAA, LocalEpoch: 0},  // valid
+			{DEKID: 99, FullNodeID: 0xBB, LocalEpoch: 0}, // foreign DEK
+		},
+	})
+	if err == nil {
+		t.Fatal("expected halt on foreign BatchRegistry DEK, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	// No side effects: keystore must not contain the bootstrap
+	// DEKs, sidecar must not have been written. The guard fires
+	// before any of those mutations.
+	if ks.Has(1) || ks.Has(2) {
+		t.Error("keystore mutated despite rejection")
+	}
+	if _, err := encryption.ReadSidecar(sidecarPath); err == nil {
+		t.Error("sidecar was written despite rejection")
 	}
 }
 

@@ -332,17 +332,8 @@ func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
 // correct and matches the Stage 6A ApplyRegistration semantics
 // row-for-row.
 func (a *Applier) ApplyBootstrap(p fsmwire.BootstrapPayload) error {
-	if !a.bootstrapAndRotationConfigured() {
-		return errors.Wrap(ErrKEKNotConfigured, "applier: bootstrap requires WithKEK + WithKeystore + WithSidecarPath")
-	}
-	// Storage and raft DEK IDs MUST differ. If they collided, the
-	// second sc.Keys[...] assignment would overwrite the first,
-	// silently mis-labelling the purpose of the lone surviving
-	// key — a violation of §5.1's per-purpose DEK separation
-	// invariant. Halt rather than silently corrupt the sidecar.
-	if p.StorageDEKID == p.RaftDEKID {
-		return errors.Wrapf(ErrEncryptionApply,
-			"applier: bootstrap requires distinct storage and raft DEK IDs (got %d for both)", p.StorageDEKID)
+	if err := a.validateBootstrap(p); err != nil {
+		return err
 	}
 	storageDEK, err := a.kek.Unwrap(p.WrappedStorage)
 	if err != nil {
@@ -365,6 +356,41 @@ func (a *Applier) ApplyBootstrap(p fsmwire.BootstrapPayload) error {
 		if err := a.ApplyRegistration(reg); err != nil {
 			return errors.Wrapf(err, "applier: bootstrap batch registry insert at index %d (dek_id=%d, full_node_id=%#x)",
 				i, reg.DEKID, reg.FullNodeID)
+		}
+	}
+	return nil
+}
+
+// validateBootstrap runs the three input invariants the bootstrap
+// dispatch enforces before any state mutation:
+//
+//  1. WithKEK + WithKeystore + WithSidecarPath all supplied.
+//  2. StorageDEKID and RaftDEKID distinct — equal IDs would cause
+//     the second sc.Keys[...] assignment in writeBootstrapSidecar
+//     to overwrite the first, silently mis-labelling the lone
+//     surviving key's purpose.
+//  3. Every BatchRegistry row targets one of the two bootstrap
+//     DEKs — a row targeting a foreign DEK would persist
+//     writer-registry state for an unrelated key while the
+//     bootstrap installs only the declared pair, silently
+//     breaking the §4.1 first-writer invariant on the next
+//     post-bootstrap write under that foreign DEK.
+//
+// Extracted from ApplyBootstrap so the dispatch hot path stays
+// below the cyclomatic complexity budget.
+func (a *Applier) validateBootstrap(p fsmwire.BootstrapPayload) error {
+	if !a.bootstrapAndRotationConfigured() {
+		return errors.Wrap(ErrKEKNotConfigured, "applier: bootstrap requires WithKEK + WithKeystore + WithSidecarPath")
+	}
+	if p.StorageDEKID == p.RaftDEKID {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: bootstrap requires distinct storage and raft DEK IDs (got %d for both)", p.StorageDEKID)
+	}
+	for i, reg := range p.BatchRegistry {
+		if reg.DEKID != p.StorageDEKID && reg.DEKID != p.RaftDEKID {
+			return errors.Wrapf(ErrEncryptionApply,
+				"applier: bootstrap BatchRegistry[%d].dek_id=%d does not match storage=%d or raft=%d",
+				i, reg.DEKID, p.StorageDEKID, p.RaftDEKID)
 		}
 	}
 	return nil
