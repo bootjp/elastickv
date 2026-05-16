@@ -434,6 +434,9 @@ func TestEncryptionAdmin_BootstrapEncryption_RejectsBadInputs(t *testing.T) {
 		{"writer with local_epoch above 0xFFFF", func(r *pb.BootstrapEncryptionRequest) {
 			r.WriterBatch = []*pb.WriterRegistryEntry{{FullNodeId: 1, LocalEpoch: 0x10000}}
 		}},
+		{"nil writer in batch", func(r *pb.BootstrapEncryptionRequest) {
+			r.WriterBatch = []*pb.WriterRegistryEntry{nil}
+		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			req := validBootstrapEncryptionRequest()
@@ -615,6 +618,24 @@ func TestEncryptionAdmin_RotateDEK_RejectsOnFollower(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "n2") || !strings.Contains(err.Error(), "127.0.0.1:50052") {
 		t.Errorf("error %q does not embed the leader hint (id=n2 addr=127.0.0.1:50052)", err)
+	}
+}
+
+// TestEncryptionAdmin_RotateDEK_RejectsOversizeWrappedDEK is the
+// RotateDEK twin of the Bootstrap size-cap defence: a wrapped DEK
+// above maxWrappedDEKSize at the gRPC boundary cannot push
+// fsmwire.EncodeRotation toward its safeU32 length-prefix guard.
+func TestEncryptionAdmin_RotateDEK_RejectsOversizeWrappedDEK(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	req := validRotateDEKRequest()
+	req.WrappedNewDek = make([]byte, maxWrappedDEKSize+1)
+	_, err := srv.RotateDEK(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("RotateDEK status=%v, want InvalidArgument on oversize wrapped_new_dek", status.Code(err))
 	}
 }
 

@@ -402,19 +402,27 @@ func buildBootstrapBatch(writers []*pb.WriterRegistryEntry, storageDEKID, raftDE
 			"encryption: writer_batch produces %d registry rows, exceeding the §4.1 bound %d",
 			totalRows, bootstrapBatchRowCap)
 	}
-	out := make([]fsmwire.RegistrationPayload, 0, totalRows)
+	// Per-writer shape validation first (rejects nil entries, zero
+	// node id, oversize epoch) so the uniqueness pass below can
+	// assume every entry is non-nil and well-formed. Both passes
+	// run before we allocate the output slice — a near-cap batch
+	// with a collision at the end is rejected without building
+	// thousands of throwaway registry rows.
 	for i, w := range writers {
-		row, err := validateBootstrapWriter(i, w)
-		if err != nil {
+		if _, err := validateBootstrapWriter(i, w); err != nil {
 			return nil, err
 		}
-		out = append(out,
-			fsmwire.RegistrationPayload{DEKID: storageDEKID, FullNodeID: row.FullNodeID, LocalEpoch: row.LocalEpoch},
-			fsmwire.RegistrationPayload{DEKID: raftDEKID, FullNodeID: row.FullNodeID, LocalEpoch: row.LocalEpoch},
-		)
 	}
 	if err := validateWriterBatchUniqueness(writers); err != nil {
 		return nil, err
+	}
+	out := make([]fsmwire.RegistrationPayload, 0, totalRows)
+	for _, w := range writers {
+		epoch := uint32ToLocalEpoch(w.GetLocalEpoch())
+		out = append(out,
+			fsmwire.RegistrationPayload{DEKID: storageDEKID, FullNodeID: w.GetFullNodeId(), LocalEpoch: epoch},
+			fsmwire.RegistrationPayload{DEKID: raftDEKID, FullNodeID: w.GetFullNodeId(), LocalEpoch: epoch},
+		)
 	}
 	return out, nil
 }
@@ -479,13 +487,15 @@ func validateWrappedDEK(purpose string, wrapped []byte) error {
 // narrowing used as the registry-row key → ErrNodeIDCollision).
 // FSM apply errors halt the apply loop via HaltApply, so a
 // malformed bootstrap that reached apply would stop the cluster.
+//
+// The caller (buildBootstrapBatch) runs validateBootstrapWriter
+// over the slice first, so every entry here is guaranteed
+// non-nil with a non-zero full_node_id — no defensive nil-guard
+// is needed inside this loop.
 func validateWriterBatchUniqueness(writers []*pb.WriterRegistryEntry) error {
 	seenFull := make(map[uint64]int, len(writers))
 	seenTrunc := make(map[uint16]uint64, len(writers))
 	for i, w := range writers {
-		if w == nil {
-			continue
-		}
 		id := w.GetFullNodeId()
 		if prev, dup := seenFull[id]; dup {
 			return grpcStatusErrorf(codes.InvalidArgument,
@@ -538,8 +548,8 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 	if req.GetNewDekId() == 0 {
 		return nil, grpcStatusError(codes.InvalidArgument, "encryption: new_dek_id must be non-zero (key id 0 is reserved per §5.1)")
 	}
-	if len(req.GetWrappedNewDek()) == 0 {
-		return nil, grpcStatusError(codes.InvalidArgument, "encryption: wrapped_new_dek is required")
+	if err := validateWrappedDEK("new", req.GetWrappedNewDek()); err != nil {
+		return nil, err
 	}
 	if req.GetProposerLocalEpoch() > math.MaxUint16 {
 		return nil, grpcStatusErrorf(codes.InvalidArgument,

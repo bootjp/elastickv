@@ -206,11 +206,6 @@ func requireUint16Plus1(v uint, name string) error {
 	return nil
 }
 
-// narrowUint32 mirrors adapter.uint32ToLocalEpoch: callers MUST
-// have validated `v` against math.MaxUint32 first (via
-// requireUint32). The masked conversion is a defence-in-depth
-// truncation that cannot drift even if a future caller skips the
-// bound check.
 // runEncryptionBootstrap invokes EncryptionAdmin.BootstrapEncryption.
 // The operator provides the wrapped DEK pair (base64), the two
 // dek_ids, and the §5.6 step 1a writer batch as repeated
@@ -368,6 +363,11 @@ func parseWriterBatch(raw []string) ([]*pb.WriterRegistryEntry, error) {
 // does not flag the mask itself.
 const uint32Mask uint = 0xFFFFFFFF
 
+// narrowUint32 mirrors adapter.uint32ToLocalEpoch: callers MUST
+// have validated `v` against math.MaxUint32 first (via
+// requireUint32). The masked conversion is a defence-in-depth
+// truncation that cannot drift even if a future caller skips the
+// bound check.
 func narrowUint32(v uint) uint32 {
 	return uint32(v & uint32Mask) //nolint:gosec // bound-checked + masked; G115 cannot trace across the flag-parse boundary
 }
