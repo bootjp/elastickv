@@ -286,7 +286,6 @@ func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
 	return nil
 }
 
-// ApplyBootstrap returns ErrKEKNotConfigured as the Stage 6A
 // ApplyBootstrap implements §5.6 step 1a's initial bootstrap apply:
 //
 //  1. KEK-unwrap the wrapped storage + raft DEK pair.
@@ -300,22 +299,38 @@ func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
 // Without the trio of WithKEK / WithKeystore / WithSidecarPath
 // supplied at construction, returns ErrKEKNotConfigured wrapped
 // for the HaltApply pipeline — the defense-in-depth marker that
-// keeps Stage 6A consistent with the FSM contract.
+// keeps the no-options posture consistent with the FSM contract.
 //
 // Ordering for crash recovery: Keystore.Set fires before
-// WriteSidecar so an in-memory DEK only escapes to disk after
-// the keystore install succeeded. A crash before WriteSidecar
-// loses the in-memory keystore on restart, but the entry stays
-// in the Raft log uncommitted-from-sidecar — replay re-runs the
-// full sequence. A crash after WriteSidecar but before batch
-// insert is recovered by replay because §4.1 case-2-idempotent
-// makes the per-row inserts no-op on the second pass.
+// WriteSidecar so an ErrKeyConflict from Set aborts the apply
+// before any disk mutation. A crash before WriteSidecar loses
+// the in-memory keystore on restart, but the entry stays in the
+// Raft log unapplied — replay re-runs the full sequence. A crash
+// after WriteSidecar but before batch insert is recovered by
+// replay because §4.1 case-2-idempotent makes the per-row inserts
+// no-op on the second pass.
 //
 // Keystore.Set is idempotent for matching DEK bytes (returns nil)
 // and returns ErrKeyConflict only if the same key_id maps to
 // different bytes — which means a buggy KEK-unwrap path produced
 // different output for the same wrapped input. That's a halt
 // condition; the wrapped output is propagated.
+//
+// Blocking behaviour: ApplyBootstrap performs synchronous IO for
+// each step (KEK Unwrap may dial a KMS in production providers,
+// WriteSidecar fsyncs to disk, every BatchRegistry row triggers a
+// pebble.Sync). Stage 6A's main.go wiring invokes this from the
+// FSM apply path, which is already serialised under the engine's
+// applyMu, so the synchronous IO is part of the §6.3 contract —
+// a slow Bootstrap blocks the apply loop until commit, which is
+// the same shape every other 0x03/0x04/0x05 entry uses. The
+// BatchRegistry insert is the most likely contributor to apply
+// latency at scale (one pebble.Sync per cluster member); the
+// §5.6 BootstrapBatchRowCap = 1<<14 keeps the worst case bounded.
+// A future optimisation could replace the per-row Set with a
+// pebble.Batch.Commit(pebble.Sync), but the current shape is
+// correct and matches the Stage 6A ApplyRegistration semantics
+// row-for-row.
 func (a *Applier) ApplyBootstrap(p fsmwire.BootstrapPayload) error {
 	if !a.bootstrapAndRotationConfigured() {
 		return errors.Wrap(ErrKEKNotConfigured, "applier: bootstrap requires WithKEK + WithKeystore + WithSidecarPath")

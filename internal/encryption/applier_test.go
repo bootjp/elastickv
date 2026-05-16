@@ -417,6 +417,14 @@ func TestApplyBootstrap_PartialWiring(t *testing.T) {
 			encryption.WithKEK(&fakeKEK{}),
 			encryption.WithKeystore(encryption.NewKeystore()),
 		}},
+		{name: "kek_and_sidecar_path", opts: []encryption.ApplierOption{
+			encryption.WithKEK(&fakeKEK{}),
+			encryption.WithSidecarPath("/tmp/never-written"),
+		}},
+		{name: "keystore_and_sidecar_path", opts: []encryption.ApplierOption{
+			encryption.WithKeystore(encryption.NewKeystore()),
+			encryption.WithSidecarPath("/tmp/never-written"),
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			app, err := encryption.NewApplier(newMapRegistryStore(), tc.opts...)
