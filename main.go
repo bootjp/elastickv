@@ -141,6 +141,17 @@ var (
 	adminReadOnlyAccessKeys            = flag.String("adminReadOnlyAccessKeys", "", "Comma-separated SigV4 access keys granted read-only admin access")
 	adminFullAccessKeys                = flag.String("adminFullAccessKeys", "", "Comma-separated SigV4 access keys granted full-access admin role")
 
+	// Data-at-rest encryption admin RPC wiring (Stage 5D). The
+	// EncryptionAdmin gRPC service is reachable on every shard's
+	// gRPC listener so the §7.1 Phase-0 GetCapability fan-out can
+	// poll any member. Mutating RPCs (Bootstrap / RotateDEK /
+	// RegisterEncryptionWriter) are leader-gated through the
+	// shard's raftengine.LeaderView. The cluster-flag gate that
+	// turns encryption ON is Stage 6 (§7.1); this flag only points
+	// the server at the §5.1 sidecar so the read-only probes can
+	// report capability state without enabling encryption.
+	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; empty disables the read-only EncryptionAdmin sidecar probes. Mutating RPCs are unaffected (they are leader-gated through raftengine).")
+
 	// Key visualizer sampler flags. The sampler runs entirely in-memory
 	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
 	// by default — opt in with --keyvizEnabled. The other flags are
@@ -1267,6 +1278,7 @@ func startRaftServers(
 		if adminServer != nil {
 			pb.RegisterAdminServer(gs, adminServer)
 		}
+		registerEncryptionAdminServer(gs, rt.engine, rt.spec.id)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
