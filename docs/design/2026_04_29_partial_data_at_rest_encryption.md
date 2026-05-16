@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–4 shipped, Stages 5–9 open
+Status: Partial — Stages 0–5 shipped (5E deferred), Stages 6–9 open
 Author: bootjp
 Date: 2026-04-29
 
@@ -16,9 +16,14 @@ Date: 2026-04-29
 | 5A | `EncryptionAdmin` proto + read-only RPCs + `encryption status` CLI | shipped | PR #754 |
 | 5B | RotateDEK + RegisterEncryptionWriter (leader-only Proposer wiring) + `rotate-dek` / `register-writer` CLI + ResyncSidecar leader guard | shipped | PR #756 |
 | 5C | BootstrapEncryption + `encryption bootstrap` CLI + nil-leaderView startup `Validate()` enforcement | shipped | PR #759 |
-| 5D | main.go gRPC wiring (per-shard EncryptionAdmin registration + `--encryptionSidecarPath` flag) | in PR | — |
-| 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | open | — |
-| 6 | 3-phase rollout flags + applier wiring (§6.5, §7.1) | open | — |
+| 5D | main.go gRPC wiring (per-shard EncryptionAdmin registration + `--encryptionSidecarPath` flag) | shipped | PR #760 |
+| 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | deferred | — |
+| 6A | §6.3 `EncryptionApplier` concrete implementation (writer-registry insert + sidecar mutate + keystore update; nil-KEK code paths in `ApplyBootstrap` / `ApplyRotation` return a typed `ErrKEKNotConfigured` defense-in-depth marker until 6B fills it) + `kv.NewKvFSMWithHLC(... WithEncryption(applier))` wiring. **Mutator wiring in `registerEncryptionAdminServer` stays OFF, identical to Stage 5D** — see Stage 6 rationale §6A note. No new flag is introduced in 6A; the applier is operator-inert in a same-version 6A cluster (exercised only via direct `FSM.Apply` unit tests). Rolling 6A→6B upgrade has a halt-on-foreign-entry caveat — see rationale | open | — |
+| 6B | §6.5 KEK plumbing — `--kekFile` / `--kekUri` flags + `internal/encryption/kek` selection at startup + thread `KEKUnwrapper` into the applier so `ApplyBootstrap` / `ApplyRotation` actually KEK-unwrap (replaces the 6A `ErrKEKNotConfigured` stubs) + introduce `--encryption-enabled` flag (default off) + re-enable mutating-RPC wiring in `registerEncryptionAdminServer` gated on (`--encryption-enabled` AND `KEKConfigured()`) | open | — |
+| 6C | Extend `--encryption-enabled` (introduced in 6B) with §9.1 startup refusal guards (sidecar present without flag, KEK mismatch, sidecar/raft index gap, filesystem fsync support, `local_epoch` rollback / exhaustion, `node_id` collision) | open | — |
+| 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring AND 6C for §9.1 startup-refusal guards — see rationale) | open | — |
+| 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself). Depends on 6B for mutator wiring AND 6C for §9.1 startup-refusal guards | open | — |
+| 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal | open | — |
 | 7 | Writer registry + deterministic nonce (§4.1) | open | — |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |
 | 9 | KMS-backed wrappers, compression, rotation/retire/rewrite, Jepsen (§5.2, §5.4, §6.4, §8) | open | — |
@@ -27,8 +32,162 @@ Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
 inert**: no caller wires `WithEncryption`, the `--enable-storage-envelope`
 flag does not exist yet, and there is no admin RPC to propose a
-bootstrap entry. Stage 5 begins the operator-facing surface; Stage 6
-flips it on under a cluster flag.
+bootstrap entry. Stage 5 ships the operator-facing surface (admin
+RPCs + CLI + gRPC wiring); Stage 6 flips it on under a cluster flag.
+
+Stage 5E (capability fan-out helper) is deferred — its scope is
+narrowly the §5.6 step 1a auto-batch CLI convenience and does not
+gate any Stage 6 work. The existing CLI accepts the writer batch
+explicitly today (PR #759), which is sufficient for hand-authored
+bootstraps; the auto-batch helper can land any time after Stage 6F
+without changing the on-disk or wire format.
+
+### Stage 6 sub-milestone rationale
+
+Stage 6 was originally scoped as "3-phase rollout flags + applier
+wiring", but the chain of dependencies makes it impractical to land
+in a single PR. The breakdown above (6A → 6F) follows the same
+shipping-order principle as Stage 5 (5A → 5D shipped, 5E deferred):
+each milestone is independently reviewable, leaves the cluster in a
+production-safe state, and unblocks the next one.
+
+- **6A lands the §6.3 applier as internal scaffolding; mutator
+  wiring stays OFF.** PR #760 round-3 codex P1 established that
+  mutating EncryptionAdmin RPCs are unsafe to wire until the
+  §6.3 applier exists, because a successful `BootstrapEncryption`
+  / `RotateDEK` / `RegisterEncryptionWriter` proposal lands a
+  `0x03`/`0x04`/`0x05` entry that hits the fail-closed
+  `ErrEncryptionApply` halt path on every replica's FSM. The
+  same class of failure applies one layer deeper: even with the
+  applier wired, an `ApplyBootstrap` or `ApplyRotation` that
+  cannot KEK-unwrap its payload returns through the same halt
+  pipeline — replicas halt apply without advancing `setApplied`,
+  restart replays the same entry, and the cluster bricks on
+  that index. So the safety boundary established by PR #760 has
+  to extend to "do not wire mutators until both the applier and
+  the KEK are present" (PR #762 round-2 codex P1).
+
+  6A therefore lands the applier as **internal scaffolding only**:
+  `WithEncryption(applier)` is wired at FSM construction so the
+  dispatch path exists, but `registerEncryptionAdminServer`
+  carries forward Stage 5D's posture — Proposer + LeaderView
+  stay unwired, mutating RPCs continue to refuse with
+  FailedPrecondition. The applier is **operator-inert in a
+  same-version 6A cluster**: no 6A binary can propose
+  `0x03`/`0x04` entries (mutators gated OFF), so the FSM
+  dispatch path is exercised only in direct `FSM.Apply` unit
+  tests. 6A's value is unblocking 6B/6D: the applier exists
+  and is fully unit-testable, so 6B's KEK threading and 6D's
+  `enable-storage-envelope` cutover have a real target to bind
+  to.
+
+  **Rolling 6A→6B upgrade caveat.** Because `WithEncryption(applier)`
+  is wired in 6A, a 6A node co-resident in a Raft group with
+  a 6B+ node will dispatch any `0x03`/`0x04` Raft entry the
+  6B leader commits to its (KEK-less) applier and halt with
+  `ErrKEKNotConfigured`. This is fail-closed by design — a
+  6A replica cannot safely apply an entry whose payload it
+  cannot KEK-unwrap — but operators must not set
+  `--encryption-enabled` on a 6B+ node until every member of
+  every Raft group (voters AND learners, same Voters ∪
+  Learners gate as §7.1) is on 6B+. The 6B PR's runbook will
+  reiterate this constraint so the rollout sequence is
+  unambiguous.
+
+  The applier's `ApplyBootstrap` and `ApplyRotation` paths still
+  carry typed `ErrKEKNotConfigured` returns for the nil-KEK
+  case. This is a defense-in-depth marker so a future refactor
+  that accidentally re-wires mutators without checking
+  `KEKConfigured()` produces a named, grep-able error in the
+  logs rather than a generic "nil pointer dereference". The
+  marker is not the production safety boundary — that is the
+  RPC-layer gate added in 6B — but it keeps the apply path
+  honest in case the gate is bypassed. `ApplyRegistration`
+  does not need KEK material (it only inserts a writer-registry
+  row), so its 6A implementation is the final form; 6B and
+  later stages do not touch it.
+
+- **6B isolates KEK plumbing AND flips the mutator gate.**
+  `internal/encryption/kek` already exists from Stage 0, but no
+  main.go caller wires it. 6B introduces `--kekFile` /
+  `--kekUri`, threads a `KEKUnwrapper` into the applier so
+  `ApplyBootstrap` and `ApplyRotation` can actually KEK-unwrap
+  their wrapped DEKs, **and** introduces the `--encryption-enabled`
+  flag (default off) that gates the EncryptionAdmin mutator
+  wiring. With KEK + applier + flag all present, `registerEncryptionAdminServer`
+  finally re-enables Proposer + LeaderView for the three
+  mutating RPCs (the wiring that Stage 5D removed for safety).
+  The boolean gate is `--encryption-enabled set AND
+  KEKConfigured()` — both conditions must hold, so a binary
+  that has the flag set but no KEK source loaded continues to
+  refuse mutators at the RPC boundary instead of letting a
+  proposal commit and brick the cluster on the apply-side
+  `ErrKEKNotConfigured`. Splitting this off from 6A keeps 6A's
+  review surface focused on the FSM-apply side and the new
+  applier code; 6B's review surface is the KEK selection +
+  startup load + RPC-gate boolean wiring.
+
+- **6C adds §9.1 refusal guards.** These are config / on-disk
+  consistency checks at process startup that block the binary
+  from running with a half-configured encryption state. The
+  guard code is independent of the FSM apply path and the
+  cutover RPCs (it runs at startup, before either has a chance
+  to fire), so 6C lands in its own PR. **The independence is
+  at the implementation level only — the safety ordering is
+  6C before 6D/6E**, see the next bullet for why.
+
+- **6D and 6E are the actual cutovers** (Phase 1 = storage, Phase
+  2 = raft). Each touches a different code path (§6.2 storage
+  vs. §6.3 raft engine hook), each has its own §7.1 capability
+  gate, and each records a different sidecar field. Keeping
+  them separate means a Phase-1 cluster (storage encrypted, raft
+  still cleartext) is a valid intermediate state that operators
+  can dwell in and observe indefinitely before committing to
+  Phase 2 — running `encryption status` to verify
+  `encryption_capable` on every replica, kicking off `rewrite`
+  to expunge cleartext MVCC versions, and dwelling here as long
+  as needed before issuing `enable-raft-envelope`. **Phase 1 is
+  not a rollback point**, however: once `enable-storage-envelope`
+  has been Raft-committed, the §9.1 sidecar-present guards
+  activate cluster-wide and `encryption disable` refuses (§7.2).
+  The only path back to cleartext from either Phase 1 or
+  Phase 2 is dump-and-reload. The dwell exists so operators can
+  pause before committing to Phase 2, not as an escape hatch
+  from Phase 1.
+
+- **6D and 6E both depend on 6B AND 6C unconditionally.** With
+  the revised 6A/6B split, every cutover RPC
+  (`enable-storage-envelope`, `enable-raft-envelope`) inherits
+  6B's mutator wiring — 6B is what makes any EncryptionAdmin
+  mutator reachable at all. The cutover-specific work in 6D and
+  6E is the new admin RPC handler + the cluster-flag entry it
+  proposes; the underlying ability to propose anything is 6B's.
+  **The shipping order is 6A → 6B → 6C → 6D → 6E with 6C as a
+  hard prerequisite, NOT optional/orthogonal.** Codex r4 P1
+  flagged that treating 6C as orthogonal violates §9.1
+  invariants: once 6D/6E flip the storage / raft envelope
+  cluster-flag, the on-disk state assumes the §9.1 guards are
+  in force (sidecar-present-without-flag is refused at startup,
+  KEK mismatch is refused, sidecar/raft index gap is refused,
+  fsync unsupported is refused, `local_epoch` rollback /
+  exhaustion is refused, `node_id` collision is refused). An
+  operator who restarts a 6D/6E-active node on a 6A+6B binary
+  without 6C's startup guards can land in a state where the
+  sidecar is present but `--encryption-enabled` is off (silently
+  reading cleartext past an envelope cutover), or reissue a
+  stale `local_epoch` that recycles a previously-used GCM nonce
+  — both are security-class regressions the §9.1 guards exist
+  to prevent. The 6D-implicit-bootstrap rationale that triggered
+  the original ordering note — §7.1 Phase 1 step 4 routing
+  through `ApplyBootstrap`'s KEK-unwrap — is still correct, and
+  the 6C-gate adds a second hard predecessor for the cutover
+  milestones rather than replacing the 6B one.
+
+- **6F is optional ergonomics.** `--encryption-rotate-on-startup`
+  is documented in §6.5 as a request, not a guarantee, and the
+  operator can always run `elastickv-admin encryption rotate-dek`
+  out-of-band. 6F lands the convenience flag after the five
+  load-bearing PRs (6A–6E) are in.
 
 ---
 
