@@ -18,7 +18,7 @@ Date: 2026-04-29
 | 5C | BootstrapEncryption + `encryption bootstrap` CLI + nil-leaderView startup `Validate()` enforcement | shipped | PR #759 |
 | 5D | main.go gRPC wiring (per-shard EncryptionAdmin registration + `--encryptionSidecarPath` flag) | shipped | PR #760 |
 | 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | deferred | — |
-| 6A | §6.3 `EncryptionApplier` concrete implementation (writer-registry insert + sidecar mutate + keystore update; nil-KEK code paths in `ApplyBootstrap` / `ApplyRotation` return a typed `ErrKEKNotConfigured` defense-in-depth marker until 6B fills it) + `kv.NewKvFSMWithHLC(... WithEncryption(applier))` wiring. **Mutator wiring in `registerEncryptionAdminServer` stays OFF, identical to Stage 5D** — see Stage 6 rationale §6A note. No new flag is introduced in 6A; the applier is operator-inert and reachable only through direct `FSM.Apply` calls in unit tests | open | — |
+| 6A | §6.3 `EncryptionApplier` concrete implementation (writer-registry insert + sidecar mutate + keystore update; nil-KEK code paths in `ApplyBootstrap` / `ApplyRotation` return a typed `ErrKEKNotConfigured` defense-in-depth marker until 6B fills it) + `kv.NewKvFSMWithHLC(... WithEncryption(applier))` wiring. **Mutator wiring in `registerEncryptionAdminServer` stays OFF, identical to Stage 5D** — see Stage 6 rationale §6A note. No new flag is introduced in 6A; the applier is operator-inert in a same-version 6A cluster (exercised only via direct `FSM.Apply` unit tests). Rolling 6A→6B upgrade has a halt-on-foreign-entry caveat — see rationale | open | — |
 | 6B | §6.5 KEK plumbing — `--kekFile` / `--kekUri` flags + `internal/encryption/kek` selection at startup + thread `KEKUnwrapper` into the applier so `ApplyBootstrap` / `ApplyRotation` actually KEK-unwrap (replaces the 6A `ErrKEKNotConfigured` stubs) + introduce `--encryption-enabled` flag (default off) + re-enable mutating-RPC wiring in `registerEncryptionAdminServer` gated on (`--encryption-enabled` AND `KEKConfigured()`) | open | — |
 | 6C | Extend `--encryption-enabled` (introduced in 6B) with §9.1 startup refusal guards (sidecar present without flag, KEK mismatch, sidecar/raft index gap, filesystem fsync support, `local_epoch` rollback / exhaustion, `node_id` collision) | open | — |
 | 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring AND 6C for §9.1 startup-refusal guards — see rationale) | open | — |
@@ -72,12 +72,27 @@ production-safe state, and unblocks the next one.
   dispatch path exists, but `registerEncryptionAdminServer`
   carries forward Stage 5D's posture — Proposer + LeaderView
   stay unwired, mutating RPCs continue to refuse with
-  FailedPrecondition. The applier is reachable only through
-  direct `FSM.Apply` calls in unit tests; no operator-facing
-  surface changes in 6A. 6A's value is unblocking 6B/6D: the
-  applier exists and is fully unit-testable, so 6B's KEK
-  threading and 6D's `enable-storage-envelope` cutover have a
-  real target to bind to.
+  FailedPrecondition. The applier is **operator-inert in a
+  same-version 6A cluster**: no 6A binary can propose
+  `0x03`/`0x04` entries (mutators gated OFF), so the FSM
+  dispatch path is exercised only in direct `FSM.Apply` unit
+  tests. 6A's value is unblocking 6B/6D: the applier exists
+  and is fully unit-testable, so 6B's KEK threading and 6D's
+  `enable-storage-envelope` cutover have a real target to bind
+  to.
+
+  **Rolling 6A→6B upgrade caveat.** Because `WithEncryption(applier)`
+  is wired in 6A, a 6A node co-resident in a Raft group with
+  a 6B+ node will dispatch any `0x03`/`0x04` Raft entry the
+  6B leader commits to its (KEK-less) applier and halt with
+  `ErrKEKNotConfigured`. This is fail-closed by design — a
+  6A replica cannot safely apply an entry whose payload it
+  cannot KEK-unwrap — but operators must not set
+  `--encryption-enabled` on a 6B+ node until every member of
+  every Raft group (voters AND learners, same Voters ∪
+  Learners gate as §7.1) is on 6B+. The 6B PR's runbook will
+  reiterate this constraint so the rollout sequence is
+  unambiguous.
 
   The applier's `ApplyBootstrap` and `ApplyRotation` paths still
   carry typed `ErrKEKNotConfigured` returns for the nil-KEK
