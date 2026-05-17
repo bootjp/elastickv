@@ -125,6 +125,74 @@ func TestApply_Bootstrap_HappyPath(t *testing.T) {
 	}
 }
 
+// TestApply_Bootstrap_ThreadsRaftIdx pins the §9.1 plumbing chain
+// from raftengine.ApplyIndexAware through to the EncryptionApplier:
+// SetApplyIndex(N) on the FSM, then Apply(0x04 entry) — the
+// resulting ApplyBootstrap call MUST observe raftIdx=N.
+//
+// Without this test, a future refactor that accidentally drops
+// pendingApplyIdx from the applyEncryption argument list (or
+// reorders the SetApplyIndex / Apply sequence at the engine
+// boundary) would not be caught at unit-test level. The
+// applier-level regression test (TestApplyBootstrap_PersistsRaftAppliedIndex)
+// bypasses the FSM by calling ApplyBootstrap directly, so it
+// would not exercise this code path.
+func TestApply_Bootstrap_ThreadsRaftIdx(t *testing.T) {
+	t.Parallel()
+	applier := &fakeApplier{}
+	f := newFSMWithFake(applier)
+
+	const wantIdx uint64 = 184273
+	f.SetApplyIndex(wantIdx)
+
+	want := fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("storage-w"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("raft-w"),
+		BatchRegistry:  []fsmwire.RegistrationPayload{{DEKID: 1, FullNodeID: 11, LocalEpoch: 1}},
+	}
+	wireBytes := append([]byte{fsmwire.OpBootstrap}, fsmwire.EncodeBootstrap(want)...)
+
+	if err := haltApplyOf(f.Apply(wireBytes)); err != nil {
+		t.Fatalf("unexpected halt: %v", err)
+	}
+	if applier.lastBootstrapIdx != wantIdx {
+		t.Fatalf("ApplyBootstrap observed raftIdx=%d, want %d (§9.1 threading chain dropped)",
+			applier.lastBootstrapIdx, wantIdx)
+	}
+}
+
+// TestApply_Rotation_ThreadsRaftIdx is the rotation counterpart of
+// TestApply_Bootstrap_ThreadsRaftIdx: same plumbing chain through
+// the 0x05 dispatch.
+func TestApply_Rotation_ThreadsRaftIdx(t *testing.T) {
+	t.Parallel()
+	applier := &fakeApplier{}
+	f := newFSMWithFake(applier)
+
+	const wantIdx uint64 = 184274
+	f.SetApplyIndex(wantIdx)
+
+	want := fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubRotateDEK,
+		DEKID:   42,
+		Purpose: fsmwire.PurposeStorage,
+		Wrapped: []byte("new-w"),
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID: 42, FullNodeID: 99, LocalEpoch: 1,
+		},
+	}
+	wireBytes := append([]byte{fsmwire.OpRotation}, fsmwire.EncodeRotation(want)...)
+
+	if err := haltApplyOf(f.Apply(wireBytes)); err != nil {
+		t.Fatalf("unexpected halt: %v", err)
+	}
+	if applier.lastRotationIdx != wantIdx {
+		t.Fatalf("ApplyRotation observed raftIdx=%d, want %d", applier.lastRotationIdx, wantIdx)
+	}
+}
+
 func TestApply_Rotation_HappyPath(t *testing.T) {
 	t.Parallel()
 	applier := &fakeApplier{}
