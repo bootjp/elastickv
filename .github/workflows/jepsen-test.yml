@@ -35,7 +35,7 @@ jobs:
       # 429s during peak hours have been knocking the scheduled stress
       # run out, and the per-push run uses the same dependency set.
       - name: Cache Maven and Leiningen artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.m2/repository
