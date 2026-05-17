@@ -92,14 +92,30 @@ type StartupConfig struct {
 //   - Snapshot cutover divergence, raft-envelope-without-bootstrap,
 //     RPC local_epoch range — Stage 6E (raft cutover) / 6C-4.
 //
-// The function reads the sidecar at most once and is safe to call
-// before any other encryption package state is constructed; it
-// does NOT mutate the on-disk sidecar. ProbeSidecarFilesystem
-// creates a sentinel file in the sidecar's parent directory and
-// removes it before returning, leaving the on-disk state
-// indistinguishable from before the call.
+// The function reads the sidecar AT MOST ONCE (cached across every
+// sidecar-reading guard) and is safe to call before any other
+// encryption package state is constructed; it does NOT mutate the
+// on-disk sidecar. ProbeSidecarFilesystem creates a sentinel file
+// in the sidecar's parent directory and removes it before returning,
+// leaving the on-disk state indistinguishable from before the call.
+//
+// The single-read invariant matters as new sidecar-reading guards
+// land in 6C-2b / 6C-3 / 6C-4: shipping each new guard with its
+// own ReadSidecar call would silently grow the startup IO from
+// O(1) to O(N guards), and a partial-write race between the
+// guards' reads is harder to reason about than a single snapshot
+// shared across all of them (claude r1 medium on PR #781).
 func CheckStartupGuards(cfg StartupConfig) error {
 	sidecarPresent, err := sidecarOnDisk(cfg.SidecarPath)
+	if err != nil {
+		return err
+	}
+
+	// Load the sidecar once for every guard that needs it. nil
+	// means "no sidecar to consult" — either the path is empty,
+	// the file is absent, or the guards that consume sidecar
+	// state were short-circuited before this point.
+	sc, err := loadSidecarForGuards(cfg, sidecarPresent)
 	if err != nil {
 		return err
 	}
@@ -110,16 +126,37 @@ func CheckStartupGuards(cfg StartupConfig) error {
 	if err := guardKEKRequired(cfg); err != nil {
 		return err
 	}
-	if err := guardKEKMatchesSidecar(cfg, sidecarPresent); err != nil {
+	if err := guardKEKMatchesSidecar(cfg, sc); err != nil {
 		return err
 	}
-	if err := guardLocalEpochExhausted(cfg, sidecarPresent); err != nil {
+	if err := guardLocalEpochExhausted(cfg, sc); err != nil {
 		return err
 	}
 	if err := guardFilesystemDurability(cfg); err != nil {
 		return err
 	}
 	return nil
+}
+
+// loadSidecarForGuards parses the sidecar exactly once iff at least
+// one downstream guard needs it. Returns (nil, nil) when no guard
+// will consume it (sidecar absent, encryption off, or KEK missing
+// — guardKEKMatchesSidecar would short-circuit anyway), avoiding
+// the unnecessary ReadSidecar I/O.
+func loadSidecarForGuards(cfg StartupConfig, sidecarPresent bool) (*Sidecar, error) {
+	if !sidecarPresent {
+		return nil, nil
+	}
+	if !cfg.EncryptionEnabled {
+		// guardSidecarWithoutFlag will fire first; the sidecar
+		// contents are irrelevant to the refusal.
+		return nil, nil
+	}
+	sc, err := ReadSidecar(cfg.SidecarPath)
+	if err != nil {
+		return nil, pkgerrors.Wrapf(err, "encryption: read sidecar %q for startup guards", cfg.SidecarPath)
+	}
+	return sc, nil
 }
 
 // sidecarOnDisk reports whether SidecarPath names an existing file.
@@ -189,13 +226,9 @@ func guardKEKRequired(cfg StartupConfig) error {
 //     was either acted on or, in tests, deliberately suppressed),
 //   - the sidecar exists but has no wrapped DEKs (e.g., a freshly
 //     created empty sidecar — bootstrap not yet committed).
-func guardKEKMatchesSidecar(cfg StartupConfig, sidecarPresent bool) error {
-	if !cfg.EncryptionEnabled || !sidecarPresent || cfg.KEK == nil {
+func guardKEKMatchesSidecar(cfg StartupConfig, sc *Sidecar) error {
+	if !cfg.EncryptionEnabled || sc == nil || cfg.KEK == nil {
 		return nil
-	}
-	sc, err := ReadSidecar(cfg.SidecarPath)
-	if err != nil {
-		return pkgerrors.Wrapf(err, "encryption: read sidecar %q for KEK-mismatch guard", cfg.SidecarPath)
 	}
 	keyIDs := sortedSidecarKeyIDs(sc.Keys)
 	for _, idStr := range keyIDs {
@@ -245,13 +278,9 @@ func guardKEKMatchesSidecar(cfg StartupConfig, sidecarPresent bool) error {
 // wrapped under a retired DEK does not consume a new nonce, so an
 // exhausted retired DEK is harmless. Only a DEK that the next write
 // would actually wrap a new nonce under matters here.
-func guardLocalEpochExhausted(cfg StartupConfig, sidecarPresent bool) error {
-	if !cfg.EncryptionEnabled || !sidecarPresent {
+func guardLocalEpochExhausted(cfg StartupConfig, sc *Sidecar) error {
+	if !cfg.EncryptionEnabled || sc == nil {
 		return nil
-	}
-	sc, err := ReadSidecar(cfg.SidecarPath)
-	if err != nil {
-		return pkgerrors.Wrapf(err, "encryption: read sidecar %q for local-epoch-exhaustion guard", cfg.SidecarPath)
 	}
 	if err := checkActiveDEKEpochSaturated(sc, SidecarPurposeStorage, sc.Active.Storage, cfg.SidecarPath); err != nil {
 		return err
@@ -343,9 +372,15 @@ func ProbeSidecarFilesystem(sidecarPath string) (retErr error) {
 	}
 	tmpPath := tmp.Name()
 	defer func() {
+		// Removes whichever file `tmpPath` currently names: either
+		// the original CreateTemp output (if we returned before the
+		// rename below) or the renamed .final sentinel (if we got
+		// past the rename). NOTE: stale .encryption-probe-*.final
+		// files left behind by a prior probe that crashed between
+		// the rename and the dir.Sync are NOT cleaned up here — they
+		// are operator-removable by the .encryption-probe- prefix
+		// (claude r1 nit on PR #781).
 		_ = os.Remove(tmpPath)
-		// If a previous probe left .encryption-probe-*.final around,
-		// it will be cleaned up by the rename step below.
 	}()
 
 	if _, err := tmp.Write([]byte("encryption-probe\n")); err != nil {
