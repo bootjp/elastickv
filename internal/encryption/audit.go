@@ -20,8 +20,7 @@ import (
 // that misreads the layout and inspects payload bytes (e.g., a
 // rotation sub-tag at position 1+) would return false negatives,
 // silently letting GuardSidecarBehindRaftLog miss encryption-
-// relevant gaps and start with a stale sidecar (codex P2 on PR
-// #782 caught this docstring inversion).
+// relevant gaps and start with a stale sidecar.
 //
 // The predicate is the §9.1 ErrSidecarBehindRaftLog guard's
 // gap-coverage check: an unapplied entry in the sidecar/engine

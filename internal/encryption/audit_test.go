@@ -22,9 +22,9 @@ func TestIsEncryptionRelevantOpcode_AllRangeMembers(t *testing.T) {
 	// Iterate via int so the loop terminates even if a future
 	// stage sets OpEncryptionMax = 0xFF; a byte-typed loop
 	// counter would wrap to 0x00 on opcode++ at 0xFF and the
-	// loop would never exit. coderabbit minor + gemini medium
-	// on PR #782 caught this fragility against the design's
-	// reserved 0x06 / 0x07 slots which signal range growth.
+	// loop would never exit. The design reserves 0x06 / 0x07
+	// for Stage 6E, so the range is expected to grow and a
+	// byte-typed loop is a latent overflow risk.
 	for i := int(fsmwire.OpEncryptionMin); i <= int(fsmwire.OpEncryptionMax); i++ {
 		opcode := byte(i)
 		if !encryption.IsEncryptionRelevantOpcode(opcode) {
@@ -66,8 +66,7 @@ func TestIsEncryptionRelevantOpcode_KnownRanges(t *testing.T) {
 		// raw bytes here ensures the predicate still treats them
 		// as relevant when 6E lands the wire-format extension
 		// and a future reader is reminded the range is reserved-
-		// not-just-currently-3-opcodes (claude r1 observation 2
-		// on PR #782).
+		// not-just-currently-3-opcodes.
 		{"Reserved_0x06", 0x06},
 		{"Reserved_0x07", 0x07},
 	} {
