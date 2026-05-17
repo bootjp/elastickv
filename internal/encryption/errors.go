@@ -178,10 +178,14 @@ var (
 	// ErrSidecarBehindRaftLog is the §9.1 startup-refusal guard
 	// raised when the sidecar's raft_applied_index is behind the
 	// raftengine's persisted applied index AND the gap covers any
-	// encryption-relevant Raft entry (per §5.5's
-	// IsEncryptionRelevantOpcode predicate: 0x03 OpRegistration,
-	// 0x04 OpBootstrap, 0x05 OpRotation, plus the reserved opcodes
-	// 0x06 / 0x07 from the fsmwire OpEncryption range).
+	// SIDECAR-MUTATING Raft entry (per §5.5's
+	// IsEncryptionRelevantOpcode predicate: 0x04 OpBootstrap,
+	// 0x05 OpRotation, plus the reserved opcodes 0x06 / 0x07
+	// from the fsmwire OpEncryption range). 0x03 OpRegistration
+	// is in the OpEncryption range but is NOT sidecar-mutating
+	// — its apply path writes writer-registry rows only and
+	// never WriteSidecar, so registration-only gaps would be
+	// spurious refusals.
 	//
 	// The classic scenario this catches is a partial-write crash:
 	// an encryption-relevant entry was applied to the engine and

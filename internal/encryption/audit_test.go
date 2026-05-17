@@ -10,14 +10,16 @@ import (
 )
 
 // TestIsEncryptionRelevantOpcode_AllRangeMembers pins the
-// §5.5 predicate against every byte in the [OpEncryptionMin,
-// OpEncryptionMax] range AND a sampling of out-of-range bytes
-// (including the boundaries one below and one above the range).
+// §5.5 predicate against every byte in the sidecar-mutating
+// range [OpBootstrap, OpEncryptionMax] AND a sampling of
+// out-of-range bytes (including OpRegistration directly below
+// the lower bound, since that is the most likely regression to
+// reintroduce false-positive refusals).
 // The predicate is the load-bearing input to the
 // ErrSidecarBehindRaftLog guard; a regression that widens or
 // narrows the range silently changes the security guarantee.
 func TestIsEncryptionRelevantOpcode_AllRangeMembers(t *testing.T) {
-	// Every byte in the OpEncryption range MUST be relevant.
+	// Every byte in the sidecar-mutating range MUST be relevant.
 	//
 	// Iterate via int so the loop terminates even if a future
 	// stage sets OpEncryptionMax = 0xFF; a byte-typed loop
@@ -25,18 +27,28 @@ func TestIsEncryptionRelevantOpcode_AllRangeMembers(t *testing.T) {
 	// loop would never exit. The design reserves 0x06 / 0x07
 	// for Stage 6E, so the range is expected to grow and a
 	// byte-typed loop is a latent overflow risk.
-	for i := int(fsmwire.OpEncryptionMin); i <= int(fsmwire.OpEncryptionMax); i++ {
+	for i := int(fsmwire.OpBootstrap); i <= int(fsmwire.OpEncryptionMax); i++ {
 		opcode := byte(i)
 		if !encryption.IsEncryptionRelevantOpcode(opcode) {
 			t.Errorf("opcode 0x%02X in [0x%02X, 0x%02X] must be encryption-relevant",
-				opcode, fsmwire.OpEncryptionMin, fsmwire.OpEncryptionMax)
+				opcode, fsmwire.OpBootstrap, fsmwire.OpEncryptionMax)
 		}
 	}
+	// OpRegistration sits just below the sidecar-mutating range
+	// (0x03 < 0x04) and MUST NOT be relevant. ApplyRegistration
+	// in applier.go only mutates writer-registry rows and never
+	// calls WriteSidecar, so registration-only gaps would be
+	// false-positive refusals if this byte were classified as
+	// relevant.
+	if encryption.IsEncryptionRelevantOpcode(fsmwire.OpRegistration) {
+		t.Errorf("OpRegistration (0x%02X) must NOT be encryption-relevant (writer-registry only, never WriteSidecar)",
+			fsmwire.OpRegistration)
+	}
 	// The byte one below the range must NOT be relevant.
-	if fsmwire.OpEncryptionMin > 0 {
-		below := fsmwire.OpEncryptionMin - 1
+	if fsmwire.OpBootstrap > 0 {
+		below := fsmwire.OpBootstrap - 1
 		if encryption.IsEncryptionRelevantOpcode(below) {
-			t.Errorf("opcode 0x%02X (one below OpEncryptionMin) must NOT be encryption-relevant", below)
+			t.Errorf("opcode 0x%02X (one below OpBootstrap) must NOT be encryption-relevant", below)
 		}
 	}
 	// The byte one above the range must NOT be relevant.
@@ -49,16 +61,19 @@ func TestIsEncryptionRelevantOpcode_AllRangeMembers(t *testing.T) {
 }
 
 // TestIsEncryptionRelevantOpcode_KnownRanges pins the explicit
-// opcode values mentioned in §5.5: 0x03 (registration), 0x04
-// (bootstrap), 0x05 (rotation), plus 0x06/0x07 reserved slots.
-// Spelling them out by name catches a regression where someone
-// changes the constants but leaves the predicate range alone.
+// opcode values mentioned in §5.5: 0x04 (bootstrap), 0x05
+// (rotation), plus 0x06/0x07 reserved slots. Spelling them out
+// by name catches a regression where someone changes the
+// constants but leaves the predicate range alone.
+//
+// 0x03 OpRegistration is EXCLUDED — see the per-opcode comment
+// below and the IMPORTANT block in IsEncryptionRelevantOpcode's
+// godoc.
 func TestIsEncryptionRelevantOpcode_KnownRanges(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		opcode byte
 	}{
-		{"OpRegistration_0x03", fsmwire.OpRegistration},
 		{"OpBootstrap_0x04", fsmwire.OpBootstrap},
 		{"OpRotation_0x05", fsmwire.OpRotation},
 		// Reserved slots in the OpEncryption range. No named
@@ -66,20 +81,32 @@ func TestIsEncryptionRelevantOpcode_KnownRanges(t *testing.T) {
 		// raw bytes here ensures the predicate still treats them
 		// as relevant when 6E lands the wire-format extension
 		// and a future reader is reminded the range is reserved-
-		// not-just-currently-3-opcodes.
+		// not-just-currently-2-opcodes.
 		{"Reserved_0x06", 0x06},
 		{"Reserved_0x07", 0x07},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !encryption.IsEncryptionRelevantOpcode(tc.opcode) {
-				t.Errorf("known encryption opcode 0x%02X must be relevant", tc.opcode)
+				t.Errorf("known sidecar-mutating opcode 0x%02X must be relevant", tc.opcode)
 			}
 		})
 	}
+	// OpRegistration (0x03) is in the OpEncryption opcode range
+	// but is NOT sidecar-mutating — ApplyRegistration only writes
+	// writer-registry rows via SetRegistryRow, never WriteSidecar.
+	// Including it in the predicate would force startup refusal
+	// on every restart after the first registration, since the
+	// sidecar's raft_applied_index is not advanced by registration
+	// applies.
+	t.Run("OpRegistration_0x03_NOT_relevant", func(t *testing.T) {
+		if encryption.IsEncryptionRelevantOpcode(fsmwire.OpRegistration) {
+			t.Errorf("OpRegistration (0x%02X) must NOT be relevant (writer-registry only)", fsmwire.OpRegistration)
+		}
+	})
 	// 0x00, 0x01, 0x02 (non-encryption FSM opcodes) MUST NOT be
 	// relevant. The exact non-encryption opcode space is project-
 	// specific; what matters here is that bytes below 0x03 are
-	// never in the encryption range.
+	// never in the sidecar-mutating range.
 	for _, op := range []byte{0x00, 0x01, 0x02} {
 		if encryption.IsEncryptionRelevantOpcode(op) {
 			t.Errorf("non-encryption opcode 0x%02X must NOT be relevant", op)

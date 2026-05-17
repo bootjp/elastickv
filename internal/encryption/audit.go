@@ -6,10 +6,31 @@ import (
 )
 
 // IsEncryptionRelevantOpcode reports whether the supplied FSM
-// opcode byte is one of the §5.5 encryption-relevant opcodes:
-// 0x03 OpRegistration, 0x04 OpBootstrap, 0x05 OpRotation, and
-// the reserved 0x06 / 0x07 slots in the fsmwire OpEncryption
-// range.
+// opcode byte is one of the §5.5 SIDECAR-MUTATING opcodes —
+// the set of entry types whose apply path writes the §5.1
+// keys.json sidecar and therefore matters for the
+// ErrSidecarBehindRaftLog gap-coverage check:
+//
+//   - 0x04 OpBootstrap         (bootstrap-encryption — §5.6)
+//   - 0x05 OpRotation          (rotate-dek + future sub-tags
+//     rewrap-deks / retire-dek / enable-storage-envelope /
+//     enable-raft-envelope — §5.2 + §7.1)
+//   - 0x06 / 0x07              (reserved slots in the fsmwire
+//     OpEncryption range for Stage 6E wire extensions; whether
+//     they end up sidecar-mutating is design-stage-defined,
+//     but conservatively treating them as relevant matches the
+//     §5.5 enumeration and forces a future ABI extension to be
+//     explicit about adding a NOT-relevant opcode).
+//
+// IMPORTANT — 0x03 OpRegistration is EXCLUDED. ApplyRegistration
+// in internal/encryption/applier.go only mutates writer-registry
+// rows via SetRegistryRow; it never calls WriteSidecar. Treating
+// it as sidecar-relevant would fire ErrSidecarBehindRaftLog on
+// EVERY startup after the first registration, since the sidecar's
+// raft_applied_index is not advanced by registration applies.
+// The design's §5.5 enumeration matches this exclusion (rotate-
+// dek, rewrap-deks, bootstrap-encryption, enable-storage-envelope,
+// enable-raft-envelope, retire-dek — no register-writer).
 //
 // IMPORTANT — wire-format contract: the opcode byte is `data[0]`
 // of the FSM entry payload (the LEADING opcode tag), NOT the
@@ -24,17 +45,17 @@ import (
 //
 // The predicate is the §9.1 ErrSidecarBehindRaftLog guard's
 // gap-coverage check: an unapplied entry in the sidecar/engine
-// gap matters iff its `data[0]` is in this range. Non-encryption-
-// relevant entries (writes, transactions, control-plane RPCs)
-// in the gap do not affect the encryption sidecar and are safe
-// to ignore.
+// gap matters iff its `data[0]` is in this range. Non-sidecar-
+// mutating entries (writes, transactions, control-plane RPCs,
+// AND OpRegistration) in the gap do not affect the encryption
+// sidecar and are safe to ignore.
 //
 // Defined here (rather than in fsmwire) so the encryption
 // package owns its semantic-level predicate; the fsmwire
-// package owns the wire-level constants (OpEncryptionMin /
+// package owns the wire-level constants (OpBootstrap /
 // OpEncryptionMax) that this function reads.
 func IsEncryptionRelevantOpcode(opcode byte) bool {
-	return opcode >= fsmwire.OpEncryptionMin && opcode <= fsmwire.OpEncryptionMax
+	return opcode >= fsmwire.OpBootstrap && opcode <= fsmwire.OpEncryptionMax
 }
 
 // EncryptionRelevantScanner is the cross-package contract that
