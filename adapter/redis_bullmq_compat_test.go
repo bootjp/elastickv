@@ -47,10 +47,12 @@ func TestRedis_BullMQDirectCommands(t *testing.T) {
 	streamCh := make(chan []redis.XStream, 1)
 	streamErrCh := make(chan error, 1)
 	go func() {
+		// Block: 5s (not 1s) so the XRead does not time out before the
+		// XAdd below completes its Raft round-trip on slow CI runners.
 		streams, err := reader.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{"bull:test:events", "$"},
 			Count:   10,
-			Block:   time.Second,
+			Block:   5 * time.Second,
 		}).Result()
 		if err != nil {
 			streamErrCh <- err
@@ -78,7 +80,7 @@ func TestRedis_BullMQDirectCommands(t *testing.T) {
 		require.Len(t, streams[0].Messages, 1)
 		require.Equal(t, "1000-0", streams[0].Messages[0].ID)
 		require.Equal(t, map[string]any{"event": "waiting", "jobId": "job-1"}, streams[0].Messages[0].Values)
-	case <-time.After(2 * time.Second):
+	case <-time.After(6 * time.Second):
 		t.Fatal("timed out waiting for XREAD result")
 	}
 
@@ -100,7 +102,9 @@ func TestRedis_BullMQDirectCommands(t *testing.T) {
 	popCh := make(chan *redis.ZWithKey, 1)
 	popErrCh := make(chan error, 1)
 	go func() {
-		res, err := reader.BZPopMin(ctx, time.Second, "bull:test:marker").Result()
+		// 5s (not 1s) for the same reason as the XRead block above:
+		// the ZAdd's Raft commit can take longer than 1s on slow CI.
+		res, err := reader.BZPopMin(ctx, 5*time.Second, "bull:test:marker").Result()
 		if err != nil {
 			popErrCh <- err
 			return
@@ -123,7 +127,7 @@ func TestRedis_BullMQDirectCommands(t *testing.T) {
 		require.Equal(t, "bull:test:marker", popped.Key)
 		require.Equal(t, "10", popped.Member)
 		require.Equal(t, 10.0, popped.Score)
-	case <-time.After(2 * time.Second):
+	case <-time.After(6 * time.Second):
 		t.Fatal("timed out waiting for BZPOPMIN result")
 	}
 

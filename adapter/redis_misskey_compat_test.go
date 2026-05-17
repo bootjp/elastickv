@@ -25,11 +25,14 @@ func TestRedis_MisskeyConnectionCompatibility(t *testing.T) {
 	require.Equal(t, "OK", rdb.Do(ctx, "CLIENT", "SETINFO", "LIB-VER", "5.10.0").Val())
 	require.Equal(t, "OK", rdb.Do(ctx, "SELECT", "0").Val())
 
-	res := rdb.Do(ctx, "SET", "lock:ap-object", "v1", "PX", "200", "NX")
+	// PX 2000 (not 200) so the NX assertion at the next SET cannot race
+	// the TTL expiry on slow CI runners where ~200ms easily slips between
+	// two consecutive Raft-replicated SET commands.
+	res := rdb.Do(ctx, "SET", "lock:ap-object", "v1", "PX", "2000", "NX")
 	require.NoError(t, res.Err())
 	require.Equal(t, "OK", res.Val())
 
-	res = rdb.Do(ctx, "SET", "lock:ap-object", "v2", "PX", "200", "NX")
+	res = rdb.Do(ctx, "SET", "lock:ap-object", "v2", "PX", "2000", "NX")
 	require.ErrorIs(t, res.Err(), redis.Nil)
 
 	getRes := rdb.Do(ctx, "SET", "lock:ap-object", "v3", "EX", "1", "GET")
