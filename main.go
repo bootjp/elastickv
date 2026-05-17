@@ -356,7 +356,13 @@ func run() error {
 		keystore,
 		*encryptionSidecarPath,
 	)
-	if err != nil {
+	if err = chainEncryptionStartupGuard(
+		err,
+		runtimes,
+		cfg.defaultGroup,
+		*encryptionSidecarPath,
+		*encryptionEnabled,
+	); err != nil {
 		return err
 	}
 
