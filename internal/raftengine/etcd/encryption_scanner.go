@@ -55,11 +55,21 @@ type encryptionScanner struct {
 // caller precomputes the non-empty-gap branch and only calls scan
 // when there's a range to inspect, but the defensive guard stays.
 func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, endInclusive uint64) (bool, error) {
-	if s.storage == nil {
-		return false, errors.New("encryption scanner: storage is nil (engine not opened?)")
-	}
+	// The EncryptionRelevantScanner contract (audit.go) requires
+	// the empty-range case to return (false, nil) UNCONDITIONALLY
+	// — including on nil-storage receivers. Reorder the guards so
+	// an empty range short-circuits before any state-dependent
+	// failure path. GuardSidecarBehindRaftLog pre-filters the
+	// empty-gap case in production, so this is contract conformance
+	// rather than a reachable bug; pinning the order keeps any
+	// future caller (6C-2d, capability fan-out) from triggering
+	// the surprising "empty range on nil scanner returns error"
+	// path.
 	if startExclusive >= endInclusive {
 		return false, nil
+	}
+	if s.storage == nil {
+		return false, errors.New("encryption scanner: storage is nil (engine not opened?)")
 	}
 	// MemoryStorage.Entries(lo, hi, ...) returns indices [lo, hi).
 	// We want (startExclusive, endInclusive] = [startExclusive+1,

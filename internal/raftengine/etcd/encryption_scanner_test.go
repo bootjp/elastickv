@@ -238,12 +238,32 @@ func TestEncryptionScanner_CompactedRange(t *testing.T) {
 // TestEncryptionScanner_NilStorageError verifies the defensive
 // nil-storage check. A zero-value encryptionScanner (or one
 // constructed before the engine is opened) must fail closed
-// rather than nil-deref.
+// rather than nil-deref. The range is non-empty so the
+// empty-range short-circuit doesn't fire first.
 func TestEncryptionScanner_NilStorageError(t *testing.T) {
 	var s encryptionScanner
 	_, err := s.HasEncryptionRelevantEntryInRange(0, 5)
 	if err == nil {
-		t.Fatal("nil-storage scanner must return an error")
+		t.Fatal("nil-storage scanner must return an error on a non-empty range")
+	}
+}
+
+// TestEncryptionScanner_NilStorageEmptyRange pins the
+// EncryptionRelevantScanner contract: empty range MUST return
+// (false, nil) UNCONDITIONALLY — including on a nil-storage
+// scanner. The guard order in HasEncryptionRelevantEntryInRange
+// is empty-range-first, then nil-storage, so this test pins the
+// ordering against future regressions where someone reorders the
+// guards and reintroduces the contract violation claude flagged
+// on PR #783 r3.
+func TestEncryptionScanner_NilStorageEmptyRange(t *testing.T) {
+	var s encryptionScanner
+	hit, err := s.HasEncryptionRelevantEntryInRange(5, 5)
+	if err != nil {
+		t.Fatalf("nil-storage scanner with empty range MUST return (false, nil) per contract; got err=%v", err)
+	}
+	if hit {
+		t.Fatalf("empty range must report no hit; got hit=%v", hit)
 	}
 }
 
