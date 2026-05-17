@@ -153,6 +153,26 @@ func TestRunSidecarBehindRaftLogGuard_GapCovered(t *testing.T) {
 	}
 }
 
+// TestRunSidecarBehindRaftLogGuard_SidecarIndexZero_SkipsTransitionally
+// pins the Stage 6C-2d skip-when-zero gate: until the §6.3 applier
+// advances `sidecar.raft_applied_index` on Apply, an encrypted
+// sidecar persists with index=0 and firing the guard against
+// (0, engine.applied] would refuse every restart of an encrypted
+// cluster on historical bootstrap/rotation entries. The guard MUST
+// return nil for this transitional case even when the scanner
+// would otherwise classify the range as relevant (hit=true).
+func TestRunSidecarBehindRaftLogGuard_SidecarIndexZero_SkipsTransitionally(t *testing.T) {
+	sidecarPath := writeMinimalSidecar(t, 0) // applier-side advancement not yet shipped
+	gap := &stubGapEngine{
+		appliedIndex: 50,
+		scanner:      &stubScanner{hit: true}, // would fire if consulted
+	}
+	err := runSidecarBehindRaftLogGuard(gap, sidecarPath, 1)
+	if err != nil {
+		t.Fatalf("guard MUST skip when sidecar.raft_applied_index=0 (applier-side advancement is a 6C-2e follow-up); got %v", err)
+	}
+}
+
 // TestRunSidecarBehindRaftLogGuard_ScannerError pins the
 // scanner-error propagation path: the wrapped error is NOT
 // marked with ErrSidecarBehindRaftLog (operator triages

@@ -2,7 +2,7 @@ package main
 
 import (
 	"errors"
-	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -92,12 +92,21 @@ func checkSidecarBehindRaftLog(
 	}
 	engine := rt.snapshotEngine()
 	if engine == nil {
-		return nil
+		// A nil engine at the §9.1 phase means buildShardGroups
+		// reported success but did not actually populate this
+		// runtime's engine — the lifecycle should have failed
+		// fast upstream and never reached here. Treat as a
+		// startup-init failure rather than silently returning
+		// "guard passed", which would let the cluster boot
+		// without ever inspecting the sidecar gap.
+		return pkgerrors.Errorf(
+			"encryption startup guard: engine for default group %d is nil (buildShardGroups returned without an opened engine)",
+			defaultGroup)
 	}
 
 	gapEngine, ok := engine.(encryptionGapEngine)
 	if !ok {
-		return fmt.Errorf("encryption startup guard: engine for default group %d does not implement encryptionGapEngine (missing AppliedIndex+EncryptionScanner)", defaultGroup)
+		return pkgerrors.Errorf("encryption startup guard: engine for default group %d does not implement encryptionGapEngine (missing AppliedIndex+EncryptionScanner)", defaultGroup)
 	}
 
 	return runSidecarBehindRaftLogGuard(gapEngine, sidecarPath, defaultGroup)
@@ -119,6 +128,35 @@ func runSidecarBehindRaftLogGuard(
 	sidecar, err := encryption.ReadSidecar(sidecarPath)
 	if err != nil {
 		return pkgerrors.Wrapf(err, "encryption startup guard: read sidecar %q", sidecarPath)
+	}
+	// Stage 6C-2d transitional gate: the §6.3 applier
+	// (internal/encryption/applier.go) does not yet advance
+	// `sidecar.raft_applied_index` on ApplyBootstrap / ApplyRotation
+	// — `writeBootstrapSidecar` and `writeRotationSidecar` only
+	// mutate Active.{Storage,Raft} and the wrapped DEK row. Until
+	// that applier-side advancement ships (Stage 6C-2e or equivalent
+	// follow-up), an encrypted cluster that committed bootstrap /
+	// rotation entries will persist `raft_applied_index=0` on disk.
+	// Firing the guard against (0, engine.applied] would falsely
+	// classify those committed-and-applied historical entries as
+	// "sidecar behind" and refuse startup on every restart — turning
+	// the guard into a brick-the-cluster regression instead of a
+	// safety net.
+	//
+	// Skip-when-zero is fail-OPEN by design for this transitional
+	// window. The fail-OPEN posture matches the pre-6C-2d behaviour
+	// (no guard at all) so this PR does not regress any production
+	// cluster. Once the applier advances raft_applied_index, the
+	// skip condition is naturally a no-op (RaftAppliedIndex > 0)
+	// and the guard becomes active. A WARN-level log line surfaces
+	// the transitional state so an operator can see the dependency
+	// hasn't shipped.
+	if sidecar.RaftAppliedIndex == 0 {
+		slog.Warn("encryption startup guard skipped: sidecar.raft_applied_index=0 (applier-side advancement is a Stage 6C-2e follow-up; guard is wired but dormant until then)",
+			slog.String("sidecar_path", sidecarPath),
+			slog.Uint64("default_group", defaultGroup),
+			slog.Uint64("engine_applied_index", gapEngine.AppliedIndex()))
+		return nil
 	}
 	if err := encryption.GuardSidecarBehindRaftLog(
 		sidecar.RaftAppliedIndex,
