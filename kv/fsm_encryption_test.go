@@ -16,15 +16,17 @@ import (
 // dispatch logic must invoke exactly the right one and propagate
 // any returned error through the HaltApply seam.
 type fakeApplier struct {
-	regCalls       atomic.Int32
-	bootstrapCalls atomic.Int32
-	rotationCalls  atomic.Int32
-	regErr         error
-	bootstrapErr   error
-	rotationErr    error
-	lastReg        fsmwire.RegistrationPayload
-	lastBootstrap  fsmwire.BootstrapPayload
-	lastRotation   fsmwire.RotationPayload
+	regCalls         atomic.Int32
+	bootstrapCalls   atomic.Int32
+	rotationCalls    atomic.Int32
+	regErr           error
+	bootstrapErr     error
+	rotationErr      error
+	lastReg          fsmwire.RegistrationPayload
+	lastBootstrap    fsmwire.BootstrapPayload
+	lastRotation     fsmwire.RotationPayload
+	lastBootstrapIdx uint64
+	lastRotationIdx  uint64
 }
 
 func (f *fakeApplier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
@@ -33,15 +35,17 @@ func (f *fakeApplier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
 	return f.regErr
 }
 
-func (f *fakeApplier) ApplyBootstrap(p fsmwire.BootstrapPayload) error {
+func (f *fakeApplier) ApplyBootstrap(raftIdx uint64, p fsmwire.BootstrapPayload) error {
 	f.bootstrapCalls.Add(1)
 	f.lastBootstrap = p
+	f.lastBootstrapIdx = raftIdx
 	return f.bootstrapErr
 }
 
-func (f *fakeApplier) ApplyRotation(p fsmwire.RotationPayload) error {
+func (f *fakeApplier) ApplyRotation(raftIdx uint64, p fsmwire.RotationPayload) error {
 	f.rotationCalls.Add(1)
 	f.lastRotation = p
+	f.lastRotationIdx = raftIdx
 	return f.rotationErr
 }
 

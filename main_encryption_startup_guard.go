@@ -54,10 +54,18 @@ type encryptionGapEngine interface {
 //     The first ApplyBootstrap will create the sidecar with a
 //     RaftAppliedIndex caught up to the engine.
 //
-//   - default-group runtime is nil or its engine is nil: the
-//     engine isn't open for this shard, so there's nothing to
-//     scan. The earlier startup-guard layer (6C-1/6C-2) would
-//     have caught a missing engine before this point.
+//   - default-group runtime is nil: the runtime didn't construct
+//     for this shard. The earlier startup-guard layer (6C-1/6C-2)
+//     would have caught a fully-missing shard before this point;
+//     this branch is the defensive return for misconfigured shard
+//     maps that omit the default group entirely.
+//
+// A NON-nil runtime whose engine is nil is treated as a fatal
+// initialisation failure rather than silently skipped — by this
+// point buildShardGroups has already constructed the runtime, so
+// a nil engine means an opener failed without surfacing an error,
+// which would let the guard pass on a node that never finished
+// coming up. Fail-closed protects the §9.1 invariant.
 //
 // Why only the default group: the §5.1 sidecar tracks a SINGLE
 // raft_applied_index, advanced by WriteSidecar calls in
@@ -106,7 +114,9 @@ func checkSidecarBehindRaftLog(
 
 	gapEngine, ok := engine.(encryptionGapEngine)
 	if !ok {
-		return pkgerrors.Errorf("encryption startup guard: engine for default group %d does not implement encryptionGapEngine (missing AppliedIndex+EncryptionScanner)", defaultGroup)
+		return pkgerrors.Errorf(
+			"encryption startup guard: engine for default group %d does not implement encryptionGapEngine (missing AppliedIndex+EncryptionScanner)",
+			defaultGroup)
 	}
 
 	return runSidecarBehindRaftLogGuard(gapEngine, sidecarPath, defaultGroup)
@@ -129,30 +139,34 @@ func runSidecarBehindRaftLogGuard(
 	if err != nil {
 		return pkgerrors.Wrapf(err, "encryption startup guard: read sidecar %q", sidecarPath)
 	}
-	// Stage 6C-2d transitional gate: the §6.3 applier
-	// (internal/encryption/applier.go) does not yet advance
-	// `sidecar.raft_applied_index` on ApplyBootstrap / ApplyRotation
-	// — `writeBootstrapSidecar` and `writeRotationSidecar` only
-	// mutate Active.{Storage,Raft} and the wrapped DEK row. Until
-	// that applier-side advancement ships (Stage 6C-2e or equivalent
-	// follow-up), an encrypted cluster that committed bootstrap /
-	// rotation entries will persist `raft_applied_index=0` on disk.
-	// Firing the guard against (0, engine.applied] would falsely
-	// classify those committed-and-applied historical entries as
-	// "sidecar behind" and refuse startup on every restart — turning
-	// the guard into a brick-the-cluster regression instead of a
-	// safety net.
+	// Legacy-sidecar compat gate. Fresh sidecars written by THIS
+	// PR's applier (writeBootstrapSidecar / writeRotationSidecar
+	// now advance sc.RaftAppliedIndex via advanceRaftAppliedIndex
+	// inside the same crash-durable WriteSidecar fsync) will carry
+	// a non-zero RaftAppliedIndex from the very first ApplyBootstrap,
+	// so this branch is a no-op for any cluster bootstrapped on this
+	// version or later.
+	//
+	// The gate exists to handle sidecars that bootstrapped on a
+	// PRE-fix binary, where the applier never wrote
+	// raft_applied_index. Those sidecars persist with
+	// raft_applied_index=0 even after the cluster successfully
+	// committed and applied an encryption-relevant entry; the guard
+	// fired against (0, engine.applied] would falsely classify the
+	// historical entry as "sidecar behind" and refuse startup on
+	// every restart — turning the guard into a brick-the-cluster
+	// regression instead of a safety net.
 	//
 	// Skip-when-zero is fail-OPEN by design for this transitional
 	// window. The fail-OPEN posture matches the pre-6C-2d behaviour
-	// (no guard at all) so this PR does not regress any production
-	// cluster. Once the applier advances raft_applied_index, the
-	// skip condition is naturally a no-op (RaftAppliedIndex > 0)
-	// and the guard becomes active. A WARN-level log line surfaces
-	// the transitional state so an operator can see the dependency
-	// hasn't shipped.
+	// (no guard at all) so this PR does not regress legacy
+	// clusters. A WARN-level log line surfaces the transitional
+	// state so an operator can see the legacy posture; running
+	// `encryption resync-sidecar` (or any rotation) on the cluster
+	// will then advance raft_applied_index and the gate becomes a
+	// no-op on subsequent restarts.
 	if sidecar.RaftAppliedIndex == 0 {
-		slog.Warn("encryption startup guard skipped: sidecar.raft_applied_index=0 (applier-side advancement is a Stage 6C-2e follow-up; guard is wired but dormant until then)",
+		slog.Warn("encryption startup guard skipped: sidecar.raft_applied_index=0 (legacy sidecar from a pre-Stage-6C-2d binary; run resync-sidecar or rotate to activate the §9.1 guard)",
 			slog.String("sidecar_path", sidecarPath),
 			slog.Uint64("default_group", defaultGroup),
 			slog.Uint64("engine_applied_index", gapEngine.AppliedIndex()))

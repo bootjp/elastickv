@@ -254,7 +254,7 @@ func TestApplyRegistration_StoreErrorPropagates(t *testing.T) {
 func TestApplyBootstrap_ReturnsKEKNotConfigured(t *testing.T) {
 	t.Parallel()
 	app, _ := encryption.NewApplier(newMapRegistryStore())
-	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID:   1,
 		WrappedStorage: []byte("wrapped-storage"),
 		RaftDEKID:      2,
@@ -273,7 +273,7 @@ func TestApplyBootstrap_ReturnsKEKNotConfigured(t *testing.T) {
 func TestApplyRotation_ReturnsKEKNotConfigured(t *testing.T) {
 	t.Parallel()
 	app, _ := encryption.NewApplier(newMapRegistryStore())
-	err := app.ApplyRotation(fsmwire.RotationPayload{
+	err := app.ApplyRotation(0, fsmwire.RotationPayload{
 		SubTag:  0x01,
 		DEKID:   1,
 		Wrapped: []byte("wrapped"),
@@ -343,12 +343,181 @@ func TestApplyBootstrap_FullyWired(t *testing.T) {
 			{DEKID: 2, FullNodeID: 0xAAAA, LocalEpoch: 0},
 		},
 	}
-	if err := app.ApplyBootstrap(payload); err != nil {
+	if err := app.ApplyBootstrap(0, payload); err != nil {
 		t.Fatalf("ApplyBootstrap: %v", err)
 	}
 	assertKeystoreHas(t, ks, payload.StorageDEKID, payload.RaftDEKID)
 	assertBootstrapSidecar(t, sidecarPath, payload)
 	assertRegistryRowsPresent(t, reg, payload.BatchRegistry)
+}
+
+// TestApplyBootstrap_PersistsRaftAppliedIndex pins the §9.1 guard
+// invariant introduced by Stage 6C-2d: when raftengine threads a
+// non-zero entry index through to ApplyBootstrap via the
+// ApplyIndexAware seam, the applier writes that index into the
+// sidecar's RaftAppliedIndex field in the SAME crash-durable
+// WriteSidecar fsync that mutates the keys[] map.
+//
+// Without this, sidecar.RaftAppliedIndex stayed at 0 even after a
+// successful Bootstrap commit; the next process start would see
+// sidecar(0) << engine(>=K), scan (0, K], find the Bootstrap
+// opcode at index K, and refuse boot with ErrSidecarBehindRaftLog
+// — i.e. normal restart would be wrongly rejected. This test
+// fails on any version that omits the raftIdx → sidecar wiring.
+func TestApplyBootstrap_PersistsRaftAppliedIndex(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	payload := fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("storage-wrapped-bytes"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("raft-wrapped-bytes-different"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 1, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}
+	const wantIdx uint64 = 184273
+	if err := app.ApplyBootstrap(wantIdx, payload); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftAppliedIndex != wantIdx {
+		t.Fatalf("sidecar.RaftAppliedIndex = %d, want %d (§9.1 guard would over-fire on next restart)",
+			sc.RaftAppliedIndex, wantIdx)
+	}
+}
+
+// TestApplyBootstrap_ZeroRaftIdxPreservesExisting pins the
+// skip-on-zero policy of advanceRaftAppliedIndex: callers that did
+// not opt into ApplyIndexAware (e.g. unit tests that exercise
+// ApplyBootstrap directly without setting pendingApplyIdx, or
+// engines that have not been updated to call SetApplyIndex) MUST
+// NOT see a previously-recorded RaftAppliedIndex regress to 0.
+// That would silently break the guard's freshness invariant after
+// a future restart.
+func TestApplyBootstrap_ZeroRaftIdxPreservesExisting(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+
+	// Seed an existing sidecar with a non-zero RaftAppliedIndex so
+	// the zero-arg call has something to potentially regress.
+	seed := &encryption.Sidecar{
+		Version:          encryption.SidecarVersion,
+		RaftAppliedIndex: 9999,
+		Active:           encryption.ActiveKeys{Storage: 1, Raft: 2},
+		Keys: map[string]encryption.SidecarKey{
+			"1": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("s")},
+			"2": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("r")},
+		},
+	}
+	if err := encryption.WriteSidecar(sidecarPath, seed); err != nil {
+		t.Fatalf("WriteSidecar seed: %v", err)
+	}
+
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	payload := fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("s"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 1, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}
+	if err := app.ApplyBootstrap(0, payload); err != nil {
+		t.Fatalf("ApplyBootstrap(raftIdx=0): %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftAppliedIndex != 9999 {
+		t.Fatalf("zero-arg ApplyBootstrap regressed RaftAppliedIndex: %d, want preserved 9999",
+			sc.RaftAppliedIndex)
+	}
+}
+
+// TestApplyRotation_PersistsRaftAppliedIndex is the rotation
+// counterpart of TestApplyBootstrap_PersistsRaftAppliedIndex.
+// Same invariant: a non-zero raftIdx threaded through ApplyRotation
+// must land in sidecar.RaftAppliedIndex inside the same fsync as
+// the keys[] mutation.
+func TestApplyRotation_PersistsRaftAppliedIndex(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	// Bootstrap first to land an initial sidecar with two keys
+	// installed (rotation requires an existing sidecar — its
+	// ReadSidecar returns an error otherwise).
+	bp := fsmwire.BootstrapPayload{
+		StorageDEKID:   1,
+		WrappedStorage: []byte("s"),
+		RaftDEKID:      2,
+		WrappedRaft:    []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 1, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}
+	if err := app.ApplyBootstrap(100, bp); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	const wantIdx uint64 = 200
+	rp := fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubRotateDEK,
+		Purpose: fsmwire.PurposeStorage,
+		DEKID:   3,
+		Wrapped: []byte("new-storage"),
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID: 3, FullNodeID: 0xAAAA, LocalEpoch: 1,
+		},
+	}
+	if err := app.ApplyRotation(wantIdx, rp); err != nil {
+		t.Fatalf("ApplyRotation: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftAppliedIndex != wantIdx {
+		t.Fatalf("sidecar.RaftAppliedIndex after rotation = %d, want %d",
+			sc.RaftAppliedIndex, wantIdx)
+	}
 }
 
 func assertKeystoreHas(t *testing.T, ks *encryption.Keystore, ids ...uint32) {
@@ -431,7 +600,7 @@ func TestApplyBootstrap_PartialWiring(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewApplier: %v", err)
 			}
-			err = app.ApplyBootstrap(fsmwire.BootstrapPayload{StorageDEKID: 1, RaftDEKID: 2})
+			err = app.ApplyBootstrap(0, fsmwire.BootstrapPayload{StorageDEKID: 1, RaftDEKID: 2})
 			if err == nil {
 				t.Fatal("expected ErrKEKNotConfigured for partial wiring, got nil")
 			}
@@ -457,7 +626,7 @@ func TestApplyBootstrap_KEKUnwrapFailure(t *testing.T) {
 		encryption.WithKeystore(ks),
 		encryption.WithSidecarPath(dir+"/keys.json"),
 	)
-	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID:   1,
 		WrappedStorage: []byte("doomed"),
 		RaftDEKID:      2,
@@ -499,10 +668,10 @@ func TestApplyBootstrap_Replay_Idempotent(t *testing.T) {
 		WrappedRaft:    []byte("raft"),
 		BatchRegistry:  []fsmwire.RegistrationPayload{{DEKID: 1, FullNodeID: 0x4242, LocalEpoch: 0}},
 	}
-	if err := app.ApplyBootstrap(payload); err != nil {
+	if err := app.ApplyBootstrap(0, payload); err != nil {
 		t.Fatalf("first ApplyBootstrap: %v", err)
 	}
-	if err := app.ApplyBootstrap(payload); err != nil {
+	if err := app.ApplyBootstrap(0, payload); err != nil {
 		t.Errorf("second ApplyBootstrap (replay): %v", err)
 	}
 }
@@ -524,14 +693,14 @@ func TestApplyRotation_FullyWired(t *testing.T) {
 	)
 	// Pre-populate the sidecar with a bootstrap so rotation has
 	// something to advance from.
-	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID: 1, WrappedStorage: []byte("s1"),
 		RaftDEKID: 2, WrappedRaft: []byte("r2"),
 	}); err != nil {
 		t.Fatalf("pre-bootstrap: %v", err)
 	}
 	// Rotate the storage DEK from id 1 to id 5.
-	if err := app.ApplyRotation(fsmwire.RotationPayload{
+	if err := app.ApplyRotation(0, fsmwire.RotationPayload{
 		SubTag:               fsmwire.RotateSubRotateDEK,
 		DEKID:                5,
 		Purpose:              fsmwire.PurposeStorage,
@@ -579,7 +748,7 @@ func TestApplyRotation_UnknownSubTag(t *testing.T) {
 		encryption.WithKeystore(ks),
 		encryption.WithSidecarPath(dir+"/keys.json"),
 	)
-	err := app.ApplyRotation(fsmwire.RotationPayload{
+	err := app.ApplyRotation(0, fsmwire.RotationPayload{
 		SubTag:  0xFE, // not RotateSubRotateDEK
 		DEKID:   1,
 		Wrapped: []byte("x"),
@@ -608,7 +777,7 @@ func TestApplyRotation_UnknownPurpose(t *testing.T) {
 		encryption.WithSidecarPath(sidecarPath),
 	)
 	// Pre-bootstrap so the sidecar exists.
-	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID: 1, WrappedStorage: []byte("s"),
 		RaftDEKID: 2, WrappedRaft: []byte("r"),
 	}); err != nil {
@@ -617,7 +786,7 @@ func TestApplyRotation_UnknownPurpose(t *testing.T) {
 	// ProposerRegistration.DEKID MUST match RotationPayload.DEKID
 	// — the round-2 mismatch guard fires before sidecarPurposeFor
 	// otherwise, and the test would exercise the wrong code path.
-	err := app.ApplyRotation(fsmwire.RotationPayload{
+	err := app.ApplyRotation(0, fsmwire.RotationPayload{
 		SubTag:               fsmwire.RotateSubRotateDEK,
 		DEKID:                9,
 		Purpose:              fsmwire.Purpose(0xFE), // not Storage / Raft
@@ -651,14 +820,14 @@ func TestApplyBootstrap_RejectsSecondBootstrapWithDifferentDEKs(t *testing.T) {
 		encryption.WithSidecarPath(sidecarPath),
 	)
 	// First bootstrap: Active = (1, 2).
-	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID: 1, WrappedStorage: []byte("s1"),
 		RaftDEKID: 2, WrappedRaft: []byte("r2"),
 	}); err != nil {
 		t.Fatalf("first ApplyBootstrap: %v", err)
 	}
 	// Second bootstrap with different DEK IDs MUST be rejected.
-	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID: 7, WrappedStorage: []byte("s7"),
 		RaftDEKID: 8, WrappedRaft: []byte("r8"),
 	})
@@ -710,14 +879,14 @@ func TestApplyBootstrap_RejectsSecondBootstrapWithSameIDsDifferentWrapped(t *tes
 		encryption.WithSidecarPath(sidecarPath),
 	)
 	// First bootstrap with wrapped bytes "s1" / "r2".
-	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID: 1, WrappedStorage: []byte("s1-orig"),
 		RaftDEKID: 2, WrappedRaft: []byte("r2-orig"),
 	}); err != nil {
 		t.Fatalf("first ApplyBootstrap: %v", err)
 	}
 	// Second bootstrap with same DEK IDs but different wrapped bytes.
-	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID: 1, WrappedStorage: []byte("s1-tampered"),
 		RaftDEKID: 2, WrappedRaft: []byte("r2-tampered"),
 		BatchRegistry: []fsmwire.RegistrationPayload{
@@ -770,7 +939,7 @@ func TestApplyBootstrap_RejectsForeignBatchRegistryDEK(t *testing.T) {
 		encryption.WithKeystore(ks),
 		encryption.WithSidecarPath(sidecarPath),
 	)
-	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID:   1,
 		WrappedStorage: []byte("s"),
 		RaftDEKID:      2,
@@ -838,7 +1007,7 @@ func TestApplyBootstrap_RejectsIdenticalDEKIDs(t *testing.T) {
 		encryption.WithKeystore(ks),
 		encryption.WithSidecarPath(dir+"/keys.json"),
 	)
-	err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID:   7,
 		WrappedStorage: []byte("s"),
 		RaftDEKID:      7, // same as Storage
@@ -873,13 +1042,13 @@ func TestApplyRotation_RejectsProposerDEKMismatch(t *testing.T) {
 		encryption.WithKeystore(ks),
 		encryption.WithSidecarPath(sidecarPath),
 	)
-	if err := app.ApplyBootstrap(fsmwire.BootstrapPayload{
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
 		StorageDEKID: 1, WrappedStorage: []byte("s"),
 		RaftDEKID: 2, WrappedRaft: []byte("r"),
 	}); err != nil {
 		t.Fatalf("pre-bootstrap: %v", err)
 	}
-	err := app.ApplyRotation(fsmwire.RotationPayload{
+	err := app.ApplyRotation(0, fsmwire.RotationPayload{
 		SubTag:               fsmwire.RotateSubRotateDEK,
 		DEKID:                5, // rotating to id 5
 		Purpose:              fsmwire.PurposeStorage,

@@ -332,7 +332,7 @@ func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
 // pebble.Batch.Commit(pebble.Sync), but the current shape is
 // correct and matches the Stage 6A ApplyRegistration semantics
 // row-for-row.
-func (a *Applier) ApplyBootstrap(p fsmwire.BootstrapPayload) error {
+func (a *Applier) ApplyBootstrap(raftIdx uint64, p fsmwire.BootstrapPayload) error {
 	if err := a.validateBootstrap(p); err != nil {
 		return err
 	}
@@ -350,7 +350,7 @@ func (a *Applier) ApplyBootstrap(p fsmwire.BootstrapPayload) error {
 	if err := a.keystore.Set(p.RaftDEKID, raftDEK); err != nil {
 		return errors.Wrap(err, "applier: keystore set raft DEK")
 	}
-	if err := a.writeBootstrapSidecar(p); err != nil {
+	if err := a.writeBootstrapSidecar(raftIdx, p); err != nil {
 		return err
 	}
 	for i, reg := range p.BatchRegistry {
@@ -483,7 +483,7 @@ func (a *Applier) checkBootstrapWrappedMatches(sc *Sidecar, p fsmwire.BootstrapP
 // §4.1 case 1 first-seen invariant holds and the registry batch
 // inserts will record FirstSeen = LastSeen = 0 for the
 // proposing node.
-func (a *Applier) writeBootstrapSidecar(p fsmwire.BootstrapPayload) error {
+func (a *Applier) writeBootstrapSidecar(raftIdx uint64, p fsmwire.BootstrapPayload) error {
 	sc, err := ReadSidecar(a.sidecarPath)
 	if err != nil && !IsNotExist(err) {
 		return errors.Wrap(err, "applier: read sidecar for bootstrap")
@@ -496,6 +496,7 @@ func (a *Applier) writeBootstrapSidecar(p fsmwire.BootstrapPayload) error {
 	}
 	sc.Active.Storage = p.StorageDEKID
 	sc.Active.Raft = p.RaftDEKID
+	advanceRaftAppliedIndex(sc, raftIdx)
 	createdAt := a.now().UTC().Format(time.RFC3339)
 	sc.Keys[strconv.FormatUint(uint64(p.StorageDEKID), 10)] = SidecarKey{
 		Purpose:    SidecarPurposeStorage,
@@ -513,6 +514,38 @@ func (a *Applier) writeBootstrapSidecar(p fsmwire.BootstrapPayload) error {
 		return errors.Wrap(err, "applier: write sidecar for bootstrap")
 	}
 	return nil
+}
+
+// advanceRaftAppliedIndex sets sc.RaftAppliedIndex to raftIdx when
+// raftIdx is non-zero AND strictly greater than the current value.
+//
+// Why monotonic-and-skip-zero (instead of unconditional assignment):
+//
+//   - Zero means "caller did not supply a Raft entry index" (the
+//     raftengine.ApplyIndexAware seam was not wired, e.g. unit
+//     tests that drive ApplyBootstrap directly without setting
+//     pendingApplyIdx). Overwriting a previously-good index with
+//     zero would silently regress the sidecar's freshness marker
+//     and the §9.1 ErrSidecarBehindRaftLog guard would over-fire
+//     on the next restart. Skip-on-zero preserves Stage-6A
+//     behavior for those callers.
+//
+//   - Monotonic guards against a malformed replay (or buggy engine)
+//     handing a strictly-lower index after a successful Bootstrap.
+//     The sidecar must only ever record "the last Raft index we
+//     have observed an encryption-relevant entry for"; once
+//     advanced, regression is a divergence signal we choose to
+//     swallow rather than HaltApply (the apply itself is still
+//     correct; only the sidecar's freshness annotation would be
+//     wrong, and the guard treats sidecar < engine as the harmless
+//     direction — it just runs the scanner instead of fast-pass).
+func advanceRaftAppliedIndex(sc *Sidecar, raftIdx uint64) {
+	if raftIdx == 0 {
+		return
+	}
+	if raftIdx > sc.RaftAppliedIndex {
+		sc.RaftAppliedIndex = raftIdx
+	}
 }
 
 // ApplyRotation implements §5.2 / §5.4 rotation apply. Stage 6B-1
@@ -537,7 +570,7 @@ func (a *Applier) writeBootstrapSidecar(p fsmwire.BootstrapPayload) error {
 // Same WithKEK / WithKeystore / WithSidecarPath trio requirement
 // as ApplyBootstrap; partial wiring returns ErrKEKNotConfigured
 // at apply time.
-func (a *Applier) ApplyRotation(p fsmwire.RotationPayload) error {
+func (a *Applier) ApplyRotation(raftIdx uint64, p fsmwire.RotationPayload) error {
 	if !a.bootstrapAndRotationConfigured() {
 		return errors.Wrap(ErrKEKNotConfigured, "applier: rotation requires WithKEK + WithKeystore + WithSidecarPath")
 	}
@@ -564,7 +597,7 @@ func (a *Applier) ApplyRotation(p fsmwire.RotationPayload) error {
 	if err := a.keystore.Set(p.DEKID, dek); err != nil {
 		return errors.Wrap(err, "applier: keystore set rotation DEK")
 	}
-	if err := a.writeRotationSidecar(p); err != nil {
+	if err := a.writeRotationSidecar(raftIdx, p); err != nil {
 		return err
 	}
 	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
@@ -578,7 +611,7 @@ func (a *Applier) ApplyRotation(p fsmwire.RotationPayload) error {
 // p.DEKID, then crash-durably writes. Existing keys[] entries are
 // preserved (rotation does not retire old DEKs — that is a
 // separate sub-tag in Stage 6E).
-func (a *Applier) writeRotationSidecar(p fsmwire.RotationPayload) error {
+func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload) error {
 	sc, err := ReadSidecar(a.sidecarPath)
 	if err != nil {
 		return errors.Wrap(err, "applier: read sidecar for rotation")
@@ -596,6 +629,7 @@ func (a *Applier) writeRotationSidecar(p fsmwire.RotationPayload) error {
 	case fsmwire.PurposeRaft:
 		sc.Active.Raft = p.DEKID
 	}
+	advanceRaftAppliedIndex(sc, raftIdx)
 	sc.Keys[strconv.FormatUint(uint64(p.DEKID), 10)] = SidecarKey{
 		Purpose:    purpose,
 		Wrapped:    append([]byte(nil), p.Wrapped...),

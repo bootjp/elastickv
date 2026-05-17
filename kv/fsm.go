@@ -38,6 +38,28 @@ type kvFSM struct {
 	// HaltApply rather than silently advancing setApplied past a
 	// proposal the local node cannot process.
 	encryption EncryptionApplier
+	// pendingApplyIdx is the Raft entry index the engine is about
+	// to (or currently is) applying. raftengine sets it via the
+	// raftengine.ApplyIndexAware seam immediately before each
+	// Apply, and applyEncryption reads it to thread the index into
+	// EncryptionApplier.ApplyBootstrap / ApplyRotation so the
+	// sidecar's RaftAppliedIndex is recorded in the same
+	// crash-durable WriteSidecar fsync. Stays 0 for engines that
+	// do not implement the seam (the legacy fallback returns 0 to
+	// the applier; the applier treats 0 as "skip RaftAppliedIndex
+	// write", preserving Stage 6A behavior for backends that did
+	// not opt in).
+	pendingApplyIdx uint64
+}
+
+// SetApplyIndex implements raftengine.ApplyIndexAware. The engine
+// invokes this on the same goroutine as Apply (Raft applies are
+// serial), so plain field assignment is race-free under that
+// contract. Tests that drive Apply directly should call this with
+// the index they want propagated to the encryption applier (or
+// leave it at 0 to opt out, matching the pre-Stage-6C-2d default).
+func (f *kvFSM) SetApplyIndex(idx uint64) {
+	f.pendingApplyIdx = idx
 }
 
 type FSM interface {
@@ -144,7 +166,7 @@ func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
-		return f.applyEncryption(data[0], data[1:]), true
+		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
 		return nil, false
 	}

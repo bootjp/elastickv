@@ -108,6 +108,27 @@ func TestCheckSidecarBehindRaftLog_NoRuntimes(t *testing.T) {
 	}
 }
 
+// TestCheckSidecarBehindRaftLog_NilEngineFailsClosed verifies
+// that a present default-group runtime whose engine has not been
+// constructed (nil engine field after buildShardGroups) is
+// reported as an error rather than silently passing the guard.
+// Rationale: at this point in startup the runtime existed but
+// the engine opener failed without surfacing an error, so the
+// node never finished coming up. Silently returning nil here
+// would let the guard pass on a node that cannot serve, defeating
+// the §9.1 fail-closed contract.
+func TestCheckSidecarBehindRaftLog_NilEngineFailsClosed(t *testing.T) {
+	sidecarPath := writeMinimalSidecar(t, 10)
+	rt := &raftGroupRuntime{spec: groupSpec{id: 1}} // engine field stays nil
+	err := checkSidecarBehindRaftLog([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
+	if err == nil {
+		t.Fatal("guard must fail-closed when default-group engine is nil")
+	}
+	if errors.Is(err, encryption.ErrSidecarBehindRaftLog) {
+		t.Errorf("nil-engine must NOT surface as ErrSidecarBehindRaftLog; got %v", err)
+	}
+}
+
 // TestRunSidecarBehindRaftLogGuard_CaughtUp pins the
 // "sidecar already past engine" no-op path in the per-engine
 // inner function.
