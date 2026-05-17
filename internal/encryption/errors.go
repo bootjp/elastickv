@@ -52,9 +52,21 @@ var (
 	// sidecar cannot guarantee crash-durability of os.Rename via
 	// fsync (typical on NFS, some FUSE mounts). Per §5.1 the
 	// encryption package refuses to start in that situation rather
-	// than silently degrading the durability guarantee. WriteSidecar
-	// wraps any fsync-on-directory failure with this sentinel so the
-	// Stage 5+ startup integration can errors.Is-match it.
+	// than silently degrading the durability guarantee. Two paths
+	// surface this sentinel:
+	//
+	//   - WriteSidecar wraps any fsync-on-directory failure on the
+	//     real keys.json write path. This catches the failure on the
+	//     first encryption-relevant write — which on a fresh cluster
+	//     may be hours into operation, well past the point where
+	//     catching the misconfiguration would have been cheap.
+	//
+	//   - ProbeSidecarFilesystem (Stage 6C-2) runs at process startup
+	//     and exercises the same write+rename+dir.Sync sequence on a
+	//     sentinel file, then deletes it. The probe surfaces the
+	//     failure BEFORE any encryption-relevant Raft entry commits,
+	//     so the operator gets the unambiguous startup-time refusal
+	//     rather than a halted apply loop later.
 	ErrUnsupportedFilesystem = errors.New("encryption: filesystem does not support durable directory sync (NFS, some FUSE mounts are unsupported)")
 
 	// ErrSidecarActiveKeyMissing indicates the Sidecar has a non-zero
@@ -142,4 +154,24 @@ var (
 	// --kekFile at the correct KEK file or restore the data dir
 	// from a backup that matches the supplied KEK.
 	ErrKEKMismatch = errors.New("encryption: configured KEK cannot unwrap one or more wrapped DEKs in the sidecar; refusing to start (verify --kekFile matches the KEK that bootstrapped this data dir)")
+
+	// ErrLocalEpochExhausted is the §9.1 startup-refusal guard
+	// raised when any active DEK in the sidecar has reached the
+	// uint16 saturation value (0xFFFF). The §4.1 nonce construction
+	// reserves only 16 bits for local_epoch, so a node that already
+	// emitted a nonce with local_epoch == 0xFFFF cannot safely
+	// emit another one under the same DEK without rolling the
+	// counter back to 0 and re-issuing a nonce that has already
+	// been used (GCM catastrophic — distinct plaintexts encrypted
+	// under the same (key, nonce) pair reveal plaintext XOR via
+	// the keystream). Recovery is a deliberate DEK rotation (§5.2)
+	// which retires the exhausted DEK; the next process startup
+	// then sees a fresh DEK with local_epoch=0 and can proceed.
+	//
+	// The check runs at process startup, before any apply or new
+	// write can reach the cipher; an active DEK with
+	// local_epoch==0xFFFF is a guaranteed-future nonce-reuse
+	// liability that must be rotated before the node is allowed
+	// to participate.
+	ErrLocalEpochExhausted = errors.New("encryption: active DEK has reached local_epoch=0xFFFF saturation; refusing to start (rotate the affected DEK via `encryption rotate-dek` before the next startup or risk GCM nonce reuse — see §4.1)")
 )
