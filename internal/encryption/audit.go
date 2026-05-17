@@ -9,15 +9,26 @@ import (
 // opcode byte is one of the §5.5 encryption-relevant opcodes:
 // 0x03 OpRegistration, 0x04 OpBootstrap, 0x05 OpRotation, and
 // the reserved 0x06 / 0x07 slots in the fsmwire OpEncryption
-// range. The byte is the first non-version byte of the FSM
-// payload (after the 0x01 wire-version prefix).
+// range.
+//
+// IMPORTANT — wire-format contract: the opcode byte is `data[0]`
+// of the FSM entry payload (the LEADING opcode tag), NOT the
+// byte after a wire-version prefix. See kv/fsm_encryption.go
+// which dispatches via `wireBytes[0]` and the EncodeBootstrap /
+// EncodeRotation / EncodeRegistration helpers in fsmwire/wire.go
+// which produce `[opcode, version=0x01, ...payload]`. A scanner
+// that misreads the layout and inspects payload bytes (e.g., a
+// rotation sub-tag at position 1+) would return false negatives,
+// silently letting GuardSidecarBehindRaftLog miss encryption-
+// relevant gaps and start with a stale sidecar (codex P2 on PR
+// #782 caught this docstring inversion).
 //
 // The predicate is the §9.1 ErrSidecarBehindRaftLog guard's
 // gap-coverage check: an unapplied entry in the sidecar/engine
-// gap matters iff its opcode is in this range. Non-encryption-
+// gap matters iff its `data[0]` is in this range. Non-encryption-
 // relevant entries (writes, transactions, control-plane RPCs)
-// in the gap do not affect the encryption sidecar and are
-// safe to ignore.
+// in the gap do not affect the encryption sidecar and are safe
+// to ignore.
 //
 // Defined here (rather than in fsmwire) so the encryption
 // package owns its semantic-level predicate; the fsmwire

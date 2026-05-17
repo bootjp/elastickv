@@ -2,6 +2,7 @@ package encryption_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -17,7 +18,15 @@ import (
 // narrows the range silently changes the security guarantee.
 func TestIsEncryptionRelevantOpcode_AllRangeMembers(t *testing.T) {
 	// Every byte in the OpEncryption range MUST be relevant.
-	for opcode := fsmwire.OpEncryptionMin; opcode <= fsmwire.OpEncryptionMax; opcode++ {
+	//
+	// Iterate via int so the loop terminates even if a future
+	// stage sets OpEncryptionMax = 0xFF; a byte-typed loop
+	// counter would wrap to 0x00 on opcode++ at 0xFF and the
+	// loop would never exit. coderabbit minor + gemini medium
+	// on PR #782 caught this fragility against the design's
+	// reserved 0x06 / 0x07 slots which signal range growth.
+	for i := int(fsmwire.OpEncryptionMin); i <= int(fsmwire.OpEncryptionMax); i++ {
+		opcode := byte(i)
 		if !encryption.IsEncryptionRelevantOpcode(opcode) {
 			t.Errorf("opcode 0x%02X in [0x%02X, 0x%02X] must be encryption-relevant",
 				opcode, fsmwire.OpEncryptionMin, fsmwire.OpEncryptionMax)
@@ -52,6 +61,15 @@ func TestIsEncryptionRelevantOpcode_KnownRanges(t *testing.T) {
 		{"OpRegistration_0x03", fsmwire.OpRegistration},
 		{"OpBootstrap_0x04", fsmwire.OpBootstrap},
 		{"OpRotation_0x05", fsmwire.OpRotation},
+		// Reserved slots in the OpEncryption range. No named
+		// constant yet (Stage 6E will assign them); pinning the
+		// raw bytes here ensures the predicate still treats them
+		// as relevant when 6E lands the wire-format extension
+		// and a future reader is reminded the range is reserved-
+		// not-just-currently-3-opcodes (claude r1 observation 2
+		// on PR #782).
+		{"Reserved_0x06", 0x06},
+		{"Reserved_0x07", 0x07},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !encryption.IsEncryptionRelevantOpcode(tc.opcode) {
@@ -140,8 +158,10 @@ func TestGuardSidecarBehindRaftLog_GapCovered(t *testing.T) {
 		t.Fatalf("gap covering encryption-relevant entry must fire ErrSidecarBehindRaftLog; got %v", err)
 	}
 	msg := err.Error()
-	if !containsAll(msg, "sidecar_applied_index=10", "engine_applied_index=50") {
-		t.Errorf("error annotation must include both indices; got %q", msg)
+	for _, want := range []string{"sidecar_applied_index=10", "engine_applied_index=50"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error annotation must include %q; got %q", want, msg)
+		}
 	}
 }
 
@@ -187,25 +207,4 @@ func TestGuardSidecarBehindRaftLog_NilScanner_CaughtUp(t *testing.T) {
 	if err != nil {
 		t.Errorf("caught-up case with nil scanner must pass; got %v", err)
 	}
-}
-
-// containsAll reports whether s contains every substring in subs.
-// Helper kept local to the audit tests; the startup_test.go file
-// uses strings.Contains directly because it only has a single
-// substring assertion. Here the assertion is over multiple
-// substrings and a small helper reduces the test boilerplate.
-func containsAll(s string, subs ...string) bool {
-	for _, sub := range subs {
-		found := false
-		for i := 0; i+len(sub) <= len(s); i++ {
-			if s[i:i+len(sub)] == sub {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
 }
