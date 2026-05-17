@@ -63,7 +63,7 @@ jobs:
       # ~100 jars at first launch. Keying on project.clj invalidates the
       # cache only when dependencies actually change.
       - name: Cache Maven and Leiningen artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.m2/repository
