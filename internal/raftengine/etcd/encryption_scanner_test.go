@@ -10,15 +10,21 @@ import (
 )
 
 // newEntry constructs a normal raftpb.Entry at the supplied index
-// with a one-byte payload that begins with the supplied opcode.
-// The §5.5 wire format has the opcode at data[0], so this single
-// byte is enough to exercise the scanner's predicate.
+// whose Data is the production-shape proposal envelope:
+// [version=0x01][8-byte proposal id][payload]. The payload is a
+// one-byte buffer containing the supplied opcode. Wrapping via
+// encodeProposalEnvelope is critical — without it the entry's
+// Data[0] would be the opcode directly, which is NOT what the
+// engine ever writes; tests against bare-byte Data passed
+// trivially because Data[0] happened to match the opcode,
+// masking the envelope-strip bug fixed in the scanner per
+// gemini CRITICAL on PR #783.
 func newEntry(index uint64, opcode byte) raftpb.Entry {
 	return raftpb.Entry{
 		Type:  raftpb.EntryNormal,
 		Term:  1,
 		Index: index,
-		Data:  []byte{opcode},
+		Data:  encodeProposalEnvelope(index, []byte{opcode}),
 	}
 }
 
@@ -134,8 +140,8 @@ func TestEncryptionScanner_RotationHit(t *testing.T) {
 // not falsely trigger the predicate.
 func TestEncryptionScanner_NonNormalEntriesSkipped(t *testing.T) {
 	entries := []raftpb.Entry{
-		{Type: raftpb.EntryConfChange, Term: 1, Index: 1, Data: []byte{fsmwire.OpBootstrap}},
-		{Type: raftpb.EntryConfChangeV2, Term: 1, Index: 2, Data: []byte{fsmwire.OpRotation}},
+		{Type: raftpb.EntryConfChange, Term: 1, Index: 1, Data: encodeProposalEnvelope(1, []byte{fsmwire.OpBootstrap})},
+		{Type: raftpb.EntryConfChangeV2, Term: 1, Index: 2, Data: encodeProposalEnvelope(2, []byte{fsmwire.OpRotation})},
 	}
 	s := scannerWithEntries(t, entries...)
 	hit, err := s.HasEncryptionRelevantEntryInRange(0, 2)
@@ -143,14 +149,16 @@ func TestEncryptionScanner_NonNormalEntriesSkipped(t *testing.T) {
 		t.Fatalf("scan: %v", err)
 	}
 	if hit {
-		t.Fatal("conf-change entries must NOT be classified as encryption-relevant even if their Data byte 0 is in the OpEncryption range")
+		t.Fatal("conf-change entries must NOT be classified as encryption-relevant even if their envelope-stripped payload byte 0 is in the OpEncryption range")
 	}
 }
 
 // TestEncryptionScanner_EmptyDataSkipped verifies that
 // zero-length normal entries (etcd-raft uses these for leadership
-// bumps after election) are skipped. The opcode-byte read would
-// be an index-out-of-range panic if we didn't gate on data length.
+// bumps after election) and malformed (sub-envelope-length)
+// entries are skipped. decodeProposalEnvelope returns ok=false
+// for both — the predicate must short-circuit cleanly without
+// nil-deref or out-of-range panic.
 func TestEncryptionScanner_EmptyDataSkipped(t *testing.T) {
 	entries := []raftpb.Entry{
 		{Type: raftpb.EntryNormal, Term: 1, Index: 1, Data: nil},
@@ -163,6 +171,33 @@ func TestEncryptionScanner_EmptyDataSkipped(t *testing.T) {
 	}
 	if hit {
 		t.Fatal("zero-length normal entries (leadership bumps) must NOT be classified as encryption-relevant")
+	}
+}
+
+// TestEncryptionScanner_EnvelopeStripping_RawBytesIgnored pins
+// gemini CRITICAL on PR #783: an entry whose Data[0] coincidentally
+// matches an encryption opcode but is NOT wrapped in a proposal
+// envelope (envelope version != 0x01 or length < 9) MUST be
+// rejected by decodeProposalEnvelope, not silently classified
+// as a hit. Otherwise the scanner would have returned true for
+// every entry whose raw byte 0 happens to land in [0x04, 0x07] —
+// the exact false-positive class the envelope strip prevents.
+func TestEncryptionScanner_EnvelopeStripping_RawBytesIgnored(t *testing.T) {
+	entries := []raftpb.Entry{
+		// Bare opcode byte, no envelope. decodeProposalEnvelope
+		// returns ok=false because len(data) < envelopeHeaderSize.
+		{Type: raftpb.EntryNormal, Term: 1, Index: 1, Data: []byte{fsmwire.OpBootstrap}},
+		// Wrong version byte but full length. decodeProposalEnvelope
+		// returns ok=false because data[0] != proposalEnvelopeVersion.
+		{Type: raftpb.EntryNormal, Term: 1, Index: 2, Data: []byte{0x99, 0, 0, 0, 0, 0, 0, 0, 0, fsmwire.OpBootstrap}},
+	}
+	s := scannerWithEntries(t, entries...)
+	hit, err := s.HasEncryptionRelevantEntryInRange(0, 2)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if hit {
+		t.Fatal("entries without a valid proposal envelope must NOT be classified as encryption-relevant — would re-introduce the pre-fix false-positive class")
 	}
 }
 
@@ -190,8 +225,13 @@ func TestEncryptionScanner_CompactedRange(t *testing.T) {
 	if hit {
 		t.Errorf("compacted range must NOT report hit=true; got hit=%v err=%v", hit, err)
 	}
+	// Enforce the wrapped sentinel: the caller (GuardSidecarBehindRaftLog)
+	// distinguishes scanner errors from gap-coverage refusals AND
+	// downstream callers may want to errors.Is on ErrCompacted
+	// specifically to suggest `encryption resync-sidecar` in the
+	// recovery instructions.
 	if !errors.Is(err, etcdraft.ErrCompacted) {
-		t.Logf("note: wrapped error %v — caller surfaces this as a scanner-error refusal", err)
+		t.Fatalf("compacted-range error MUST be errors.Is(err, etcdraft.ErrCompacted); got %v", err)
 	}
 }
 
@@ -206,3 +246,49 @@ func TestEncryptionScanner_NilStorageError(t *testing.T) {
 		t.Fatal("nil-storage scanner must return an error")
 	}
 }
+
+// TestEngineEncryptionScanner_NilReceiver pins the codex P2
+// finding on PR #783: calling Engine.EncryptionScanner() on a
+// nil *Engine MUST return a usable scanner that surfaces the
+// nil-storage error rather than panicking. Production paths that
+// forward a maybe-nil engine pointer during startup/refusal
+// triage rely on this defensive return.
+func TestEngineEncryptionScanner_NilReceiver(t *testing.T) {
+	var e *Engine
+	scanner := e.EncryptionScanner()
+	if scanner == nil {
+		t.Fatal("Engine.EncryptionScanner() on nil receiver must return a non-nil scanner")
+	}
+	_, err := scanner.HasEncryptionRelevantEntryInRange(0, 5)
+	if err == nil {
+		t.Fatal("nil-receiver scanner must surface a storage error, not silently succeed")
+	}
+}
+
+// TestEncryptionScanner_EndInclusiveMaxUint64Refused pins the
+// coderabbit minor: endInclusive == math.MaxUint64 would cause
+// endInclusive+1 to wrap to 0, making the half-open Entries()
+// range degenerate. The scanner detects this and refuses with
+// an explicit error rather than silently scanning nothing.
+func TestEncryptionScanner_EndInclusiveMaxUint64Refused(t *testing.T) {
+	s := scannerWithEntries(t) // empty storage; should still hit the overflow guard before any read
+	hit, err := s.HasEncryptionRelevantEntryInRange(0, ^uint64(0))
+	if err == nil {
+		t.Fatal("endInclusive == math.MaxUint64 must refuse with an explicit error to avoid uint64 wraparound")
+	}
+	if hit {
+		t.Errorf("overflow refusal must NOT report hit=true; got hit=%v err=%v", hit, err)
+	}
+}
+
+// The "no-progress" fail-closed branch in the scanner is
+// guarded by a defensive `return false, error` when
+// storage.Entries returns an empty batch with no error. Real
+// MemoryStorage never returns this combination (it always
+// returns ErrCompacted or ErrUnavailable), so exercising the
+// branch via the public Storage API isn't possible without a
+// custom mock. The branch's correctness is verified by code
+// inspection (any zero-length non-error batch returns an
+// errors.Newf-wrapped error before the loop can advance) and
+// by the compacted-range test which exercises the same
+// fail-closed contract via a real ErrCompacted path.

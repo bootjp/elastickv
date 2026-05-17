@@ -1,6 +1,8 @@
 package etcd
 
 import (
+	"math"
+
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
 	etcdraft "go.etcd.io/raft/v3"
@@ -60,7 +62,11 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 	}
 	// MemoryStorage.Entries(lo, hi, ...) returns indices [lo, hi).
 	// We want (startExclusive, endInclusive] = [startExclusive+1,
-	// endInclusive+1).
+	// endInclusive+1). Guard against uint64 wraparound at
+	// MaxUint64 (otherwise hi = 0 and the loop never runs).
+	if endInclusive == math.MaxUint64 {
+		return false, errors.New("encryption scanner: endInclusive == math.MaxUint64 cannot be expressed as half-open Entries() range")
+	}
 	lo := startExclusive + 1
 	hi := endInclusive + 1
 	cursor := lo
@@ -72,10 +78,16 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 				cursor, hi)
 		}
 		if len(batch) == 0 {
-			// Defensive: MemoryStorage.Entries returning no entries
-			// without an error means we have made no progress. Bail
-			// out rather than spin.
-			break
+			// Fail closed: an empty batch with cursor < hi means
+			// MemoryStorage didn't advance even though the requested
+			// range is non-empty. Treating this as "no hit" would
+			// silently classify an unscanned range as harmless, so
+			// we surface it as a scanner error. The caller routes
+			// scanner errors as a refusal distinct from
+			// ErrSidecarBehindRaftLog.
+			return false, errors.Wrapf(errors.New("no progress"),
+				"encryption scanner: Entries(cursor=%d, hi=%d) returned no entries and no error (unscanned gap)",
+				cursor, hi)
 		}
 		for _, ent := range batch {
 			if isEncryptionRelevantEntry(ent) {
@@ -93,31 +105,50 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 //
 //   - EntryConfChange / EntryConfChangeV2 — never carry encryption
 //     FSM payloads.
-//   - Empty Data — etcd-raft uses a zero-length normal entry to
-//     announce a new leader; not a real FSM op.
+//   - Entries whose Data does not decode as a valid proposal
+//     envelope (zero-length leadership bumps, malformed entries).
+//   - Envelopes wrapping an empty FSM payload.
 //
-// Returns IsEncryptionRelevantOpcode(Data[0]) otherwise. The
-// opcode is the LEADING byte per the §5.5 wire format (see
-// kv/fsm_encryption.go and the encoders in fsmwire).
+// For valid envelopes, returns IsEncryptionRelevantOpcode(payload[0])
+// where payload is the post-envelope-strip FSM byte sequence. The
+// engine wraps every EntryNormal in a 9-byte proposal envelope
+// (1 byte version + 8 byte proposal ID) via encodeProposalEnvelope
+// at propose time, so the raw Data[0] is always the envelope
+// version 0x01 — NEVER the FSM opcode. A scanner that misreads
+// the layout would return false for every entry in a real Raft
+// log, silently defeating the §9.1 ErrSidecarBehindRaftLog guard.
 func isEncryptionRelevantEntry(ent raftpb.Entry) bool {
 	if ent.Type != raftpb.EntryNormal {
 		return false
 	}
-	if len(ent.Data) == 0 {
+	_, payload, ok := decodeProposalEnvelope(ent.Data)
+	if !ok || len(payload) == 0 {
 		return false
 	}
-	return encryption.IsEncryptionRelevantOpcode(ent.Data[0])
+	return encryption.IsEncryptionRelevantOpcode(payload[0])
 }
 
 // EncryptionScanner returns the engine's
 // encryption.EncryptionRelevantScanner implementation. The
 // returned value is safe to call after Open() has populated
 // MemoryStorage from the on-disk WAL + snapshot, and only after
-// — calling it before Open() returns a nil-storage error.
+// — calling it before Open() returns a nil-storage error from
+// HasEncryptionRelevantEntryInRange.
 //
 // Used by main.go's startup-guard phase (Stage 6C-2d) to invoke
 // encryption.GuardSidecarBehindRaftLog against the engine's
 // applied index and the sidecar's raft_applied_index.
+//
+// Nil-receiver-safe: a nil *Engine returns a zero-value
+// encryptionScanner whose HasEncryptionRelevantEntryInRange will
+// surface the nil-storage error. This matches the rest of the
+// package's defensive nil-receiver posture (Status() / AppliedIndex()
+// return zero values on nil receivers) and lets call sites in
+// the lifecycle that may forward a maybe-nil engine pointer
+// avoid a panic during startup/refusal triage.
 func (e *Engine) EncryptionScanner() encryption.EncryptionRelevantScanner {
+	if e == nil {
+		return &encryptionScanner{}
+	}
 	return &encryptionScanner{storage: e.storage}
 }
