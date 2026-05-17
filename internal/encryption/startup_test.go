@@ -368,3 +368,207 @@ func TestCheckStartupGuards_SidecarStatError(t *testing.T) {
 		t.Errorf("invalid path must NOT be silently treated as not-exist: %v", err)
 	}
 }
+
+// writeTestSidecarWithEpoch persists a §5.1 sidecar with the
+// supplied storage active DEK and a chosen local_epoch value. Used
+// by the local-epoch exhaustion tests to inject the saturated
+// value without going through a real rotation.
+func writeTestSidecarWithEpoch(t *testing.T, dir string, wrapped []byte, localEpoch uint16) string {
+	t.Helper()
+	sc := &encryption.Sidecar{
+		Version: encryption.SidecarVersion,
+		Keys: map[string]encryption.SidecarKey{
+			"1": {
+				Purpose:    encryption.SidecarPurposeStorage,
+				Wrapped:    wrapped,
+				Created:    "2026-05-17T00:00:00Z",
+				LocalEpoch: localEpoch,
+			},
+		},
+	}
+	sc.Active.Storage = 1
+	path := filepath.Join(dir, encryption.SidecarFilename)
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	return path
+}
+
+// TestCheckStartupGuards_LocalEpochExhausted_Storage pins the
+// Stage 6C-2 ErrLocalEpochExhausted guard. An active DEK with
+// local_epoch == 0xFFFF is one bump away from rolling back to 0
+// and re-issuing a nonce already in use under the same DEK —
+// the classic GCM catastrophic key-reuse pattern. Refuse to
+// start until the operator rotates.
+func TestCheckStartupGuards_LocalEpochExhausted_Storage(t *testing.T) {
+	dir := t.TempDir()
+	k := newTestKEK(t, dir, 0x42)
+	wrapped, err := k.Wrap(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	sidecarPath := writeTestSidecarWithEpoch(t, dir, wrapped, 0xFFFF)
+	err = encryption.CheckStartupGuards(encryption.StartupConfig{
+		EncryptionEnabled: true,
+		KEKConfigured:     true,
+		KEK:               k,
+		SidecarPath:       sidecarPath,
+	})
+	if !errors.Is(err, encryption.ErrLocalEpochExhausted) {
+		t.Fatalf("expected ErrLocalEpochExhausted, got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "purpose=\"storage\"") {
+		t.Errorf("exhaustion error %q must annotate purpose=storage so the operator knows which DEK to rotate", got)
+	}
+}
+
+// TestCheckStartupGuards_LocalEpochExhausted_BoundaryNotFire
+// pins the saturation boundary: local_epoch == 0xFFFE MUST pass
+// (one nonce still available), 0xFFFF MUST fire. A bug that uses
+// >= 0xFFFE instead of == 0xFFFF would refuse a perfectly safe
+// DEK and force a spurious rotation.
+func TestCheckStartupGuards_LocalEpochExhausted_BoundaryNotFire(t *testing.T) {
+	dir := t.TempDir()
+	k := newTestKEK(t, dir, 0x42)
+	wrapped, err := k.Wrap(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	sidecarPath := writeTestSidecarWithEpoch(t, dir, wrapped, 0xFFFE)
+	err = encryption.CheckStartupGuards(encryption.StartupConfig{
+		EncryptionEnabled: true,
+		KEKConfigured:     true,
+		KEK:               k,
+		SidecarPath:       sidecarPath,
+	})
+	if errors.Is(err, encryption.ErrLocalEpochExhausted) {
+		t.Fatalf("local_epoch=0xFFFE must NOT fire exhaustion guard (one nonce still available), got %v", err)
+	}
+	if err != nil {
+		t.Fatalf("local_epoch=0xFFFE must pass cleanly, got %v", err)
+	}
+}
+
+// TestCheckStartupGuards_LocalEpochExhausted_RetiredKeyIgnored
+// verifies the guard only inspects ACTIVE DEKs. A retired DEK
+// (active id points elsewhere) with local_epoch=0xFFFF is harmless
+// — no new write will allocate a nonce under it.
+func TestCheckStartupGuards_LocalEpochExhausted_RetiredKeyIgnored(t *testing.T) {
+	dir := t.TempDir()
+	k := newTestKEK(t, dir, 0x42)
+	wrappedFresh, err := k.Wrap(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Wrap fresh: %v", err)
+	}
+	wrappedRetired, err := k.Wrap(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Wrap retired: %v", err)
+	}
+	// Build a sidecar where the active storage points at key_id=2
+	// (fresh, local_epoch=0) and the retired DEK at key_id=1 has
+	// local_epoch=0xFFFF. The guard must not fire.
+	sc := &encryption.Sidecar{
+		Version: encryption.SidecarVersion,
+		Keys: map[string]encryption.SidecarKey{
+			"1": {Purpose: encryption.SidecarPurposeStorage, Wrapped: wrappedRetired, Created: "2026-05-17T00:00:00Z", LocalEpoch: 0xFFFF},
+			"2": {Purpose: encryption.SidecarPurposeStorage, Wrapped: wrappedFresh, Created: "2026-05-17T00:00:00Z", LocalEpoch: 0},
+		},
+	}
+	sc.Active.Storage = 2
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	err = encryption.CheckStartupGuards(encryption.StartupConfig{
+		EncryptionEnabled: true,
+		KEKConfigured:     true,
+		KEK:               k,
+		SidecarPath:       sidecarPath,
+	})
+	if err != nil {
+		t.Fatalf("retired DEK with exhausted local_epoch must NOT fire guard, got %v", err)
+	}
+}
+
+// TestProbeSidecarFilesystem_OK exercises the happy path: a tmp
+// directory on the host filesystem supports the write+rename+dir.Sync
+// sequence the §5.1 protocol requires, so the probe returns nil
+// and leaves no sentinel file behind.
+func TestProbeSidecarFilesystem_OK(t *testing.T) {
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, "keys.json")
+	if err := encryption.ProbeSidecarFilesystem(sidecarPath); err != nil {
+		t.Fatalf("probe on tmp dir must succeed, got %v", err)
+	}
+	// Probe must leave no sentinel files behind on success.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".encryption-probe-") {
+			t.Errorf("probe left behind a sentinel file on success: %s", e.Name())
+		}
+	}
+}
+
+// TestProbeSidecarFilesystem_MissingDir verifies that a missing
+// parent directory propagates as a real OS error (not wrapped with
+// ErrUnsupportedFilesystem). The two failure classes are distinct:
+// missing dir is a config error the operator must fix; filesystem
+// no-fsync is an environment problem that needs a different mount.
+func TestProbeSidecarFilesystem_MissingDir(t *testing.T) {
+	err := encryption.ProbeSidecarFilesystem("/nonexistent/elastickv-probe/keys.json")
+	if err == nil {
+		t.Fatal("expected error for missing parent directory")
+	}
+	if errors.Is(err, encryption.ErrUnsupportedFilesystem) {
+		t.Errorf("missing dir must NOT be classified as ErrUnsupportedFilesystem (config error vs FS-capability): %v", err)
+	}
+}
+
+// TestCheckStartupGuards_FilesystemProbe_RunsOnlyWhenEnabled
+// verifies that the filesystem probe is gated on
+// --encryption-enabled. A cluster that has NOT opted into the
+// §7.1 rollout has no encryption-relevant write to worry about
+// crash-durability for, so a non-fsync filesystem in the
+// sidecar dir is irrelevant — the probe must skip silently.
+func TestCheckStartupGuards_FilesystemProbe_RunsOnlyWhenEnabled(t *testing.T) {
+	// SidecarPath set, EncryptionEnabled=false → probe should
+	// not run (and even if it did, we'd hit the missing-dir
+	// branch rather than ErrUnsupportedFilesystem). Use a path
+	// whose parent does NOT exist to make any probe attempt
+	// fail loudly.
+	err := encryption.CheckStartupGuards(encryption.StartupConfig{
+		EncryptionEnabled: false,
+		SidecarPath:       "/nonexistent/elastickv-probe-disabled/keys.json",
+	})
+	if err != nil {
+		t.Fatalf("filesystem probe must skip when --encryption-enabled is off, got %v", err)
+	}
+}
+
+// TestCheckStartupGuards_KEKMismatch_ParseErrIncluded pins the
+// gemini medium finding deferred from PR #778 r3: when ParseUint
+// fails in the defensive non-decimal-key_id branch, the
+// ErrKEKMismatch annotation MUST include parseErr so an operator
+// triaging a manually-edited sidecar can see BOTH the unwrap
+// failure and the malformed key_id reason. validateSidecar
+// normally rejects non-decimal keys at ReadSidecar time, so this
+// branch is defensive-only; we cannot trigger it through the
+// public API without bypassing validation. The assertion here
+// pins the format string of the parseErr-included path.
+func TestCheckStartupGuards_KEKMismatch_ParseErrIncluded(t *testing.T) {
+	// Sanity: the format string from startup.go must reference
+	// "parse error:" in the parseErr-included branch. Grepping
+	// the package source rather than executing the unreachable
+	// branch keeps the test deterministic without forcing us
+	// to inject invalid sidecars.
+	src, err := os.ReadFile("startup.go")
+	if err != nil {
+		t.Fatalf("ReadFile startup.go: %v", err)
+	}
+	if !strings.Contains(string(src), `"sidecar=%q key_id=%q (parse error: %v): %v"`) {
+		t.Error("ErrKEKMismatch parseErr-included format string missing — gemini r3 medium regression")
+	}
+}

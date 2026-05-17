@@ -2,7 +2,9 @@ package encryption
 
 import (
 	"errors"
+	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 
@@ -49,11 +51,11 @@ type StartupConfig struct {
 }
 
 // CheckStartupGuards runs the §9.1 startup-refusal guards covered
-// by Stage 6C-1 and returns the first guard that fires. nil means
-// every guard passed and the process is safe to proceed past startup
-// into buildShardGroups / Raft engine wiring.
+// by Stage 6C-1 + 6C-2 and returns the first guard that fires.
+// nil means every guard passed and the process is safe to proceed
+// past startup into buildShardGroups / Raft engine wiring.
 //
-// Scope (Stage 6C-1, this PR):
+// Scope (Stage 6C-1, PR #778):
 //
 //   - ErrSidecarPresentWithoutFlag: sidecar on disk but flag off
 //     (downgrade prevention)
@@ -62,30 +64,40 @@ type StartupConfig struct {
 //     one wrapped DEK fails to unwrap under the configured KEK
 //     (operator-error catch)
 //
-// Out of scope (deferred to later 6C sub-milestones / Stage 6D / 6E):
+// Scope (Stage 6C-2, this PR):
 //
-//   - ErrUnsupportedFilesystem startup probe (WriteSidecar already
-//     surfaces this on the first write; a dedicated startup probe
-//     can ship without re-architecting this helper).
-//   - ErrLocalEpochExhausted (active DEK local_epoch == 0xFFFF) —
-//     coupled with the writer-registry record (Stage 7); shipping
-//     the exhaustion check without the rollback peer would create
-//     an asymmetric posture that future readers would have to
-//     reason around.
+//   - ErrLocalEpochExhausted: any active DEK in the sidecar has
+//     reached local_epoch == 0xFFFF (would-be GCM nonce-reuse on
+//     the next encrypted write). Refuse to start until rotated.
+//   - ErrUnsupportedFilesystem: ProbeSidecarFilesystem exercises
+//     the §5.1 write+rename+dir.Sync sequence at startup so the
+//     filesystem incompatibility surfaces BEFORE the first
+//     encryption-relevant Raft entry, not on the first WriteSidecar
+//     call (which on a fresh node may be hours into operation).
+//
+// Out of scope (deferred to later sub-milestones / Stage 6D / 6E):
+//
 //   - ErrNodeIDCollision — requires the cluster-wide Voters ∪
 //     Learners membership view that Stage 6D's capability fan-out
 //     provides; node-local hashing cannot detect cross-node
-//     collisions on its own.
+//     collisions on its own. Bundled with Stage 6C-3 / 6D.
+//   - ErrLocalEpochRollback — needs the writer-registry record
+//     (Stage 7); the exhaustion peer ships here, the rollback peer
+//     ships once the registry is available. Bundled with Stage 6C-3.
 //   - ErrSidecarBehindRaftLog — requires raftengine integration
 //     (read the persisted applied index) which is the same data
 //     path Stage 6D / 6E touch for the cutover gate; bundled
-//     there.
+//     there. Deferred from 6C-2 to keep this PR focused on
+//     guards that need only the encryption package's own state.
 //   - Snapshot cutover divergence, raft-envelope-without-bootstrap,
-//     RPC local_epoch range — Stage 6E (raft cutover).
+//     RPC local_epoch range — Stage 6E (raft cutover) / 6C-4.
 //
 // The function reads the sidecar at most once and is safe to call
 // before any other encryption package state is constructed; it
-// does NOT mutate the on-disk sidecar.
+// does NOT mutate the on-disk sidecar. ProbeSidecarFilesystem
+// creates a sentinel file in the sidecar's parent directory and
+// removes it before returning, leaving the on-disk state
+// indistinguishable from before the call.
 func CheckStartupGuards(cfg StartupConfig) error {
 	sidecarPresent, err := sidecarOnDisk(cfg.SidecarPath)
 	if err != nil {
@@ -99,6 +111,12 @@ func CheckStartupGuards(cfg StartupConfig) error {
 		return err
 	}
 	if err := guardKEKMatchesSidecar(cfg, sidecarPresent); err != nil {
+		return err
+	}
+	if err := guardLocalEpochExhausted(cfg, sidecarPresent); err != nil {
+		return err
+	}
+	if err := guardFilesystemDurability(cfg); err != nil {
 		return err
 	}
 	return nil
@@ -190,14 +208,184 @@ func guardKEKMatchesSidecar(cfg StartupConfig, sidecarPresent bool) error {
 			if parseErr != nil {
 				// validateSidecar would have caught a non-decimal
 				// key_id, but be defensive in case ReadSidecar's
-				// invariant changes.
+				// invariant changes. Include parseErr so an
+				// operator triaging a manual-edit sidecar can see
+				// BOTH the unwrap failure and the malformed key_id
+				// (gemini medium on PR #778; deferred to 6C-2).
 				return pkgerrors.Wrapf(ErrKEKMismatch,
-					"sidecar=%q key_id=%q: %v", cfg.SidecarPath, idStr, err)
+					"sidecar=%q key_id=%q (parse error: %v): %v",
+					cfg.SidecarPath, idStr, parseErr, err)
 			}
 			return pkgerrors.Wrapf(ErrKEKMismatch,
 				"sidecar=%q key_id=%d purpose=%q: %v",
 				cfg.SidecarPath, id, k.Purpose, err)
 		}
+	}
+	return nil
+}
+
+// guardLocalEpochExhausted fires when any active DEK in the sidecar
+// has reached the uint16 saturation value (math.MaxUint16). §4.1
+// reserves 16 bits for local_epoch in the nonce; emitting one more
+// nonce under the same DEK would either roll the counter back to 0
+// (re-issuing a nonce already in use → GCM catastrophic) or saturate
+// at 0xFFFF (the same outcome on the next bump). The right recovery
+// is a deliberate DEK rotation (§5.2), which retires the exhausted
+// DEK and lets the next process startup proceed with a fresh
+// local_epoch=0 DEK.
+//
+// Why both Active.Storage and Active.Raft are checked: §4.1 nonce
+// construction is per-DEK; an exhausted storage DEK and a fresh raft
+// DEK can coexist in the sidecar after a rotation that only rotated
+// one purpose. The guard fires on either, identifying which purpose's
+// rotation the operator must run.
+//
+// Why only ACTIVE keys are checked: a retired DEK's local_epoch is
+// frozen at the value it had when retired; reading old envelopes
+// wrapped under a retired DEK does not consume a new nonce, so an
+// exhausted retired DEK is harmless. Only a DEK that the next write
+// would actually wrap a new nonce under matters here.
+func guardLocalEpochExhausted(cfg StartupConfig, sidecarPresent bool) error {
+	if !cfg.EncryptionEnabled || !sidecarPresent {
+		return nil
+	}
+	sc, err := ReadSidecar(cfg.SidecarPath)
+	if err != nil {
+		return pkgerrors.Wrapf(err, "encryption: read sidecar %q for local-epoch-exhaustion guard", cfg.SidecarPath)
+	}
+	if err := checkActiveDEKEpochSaturated(sc, SidecarPurposeStorage, sc.Active.Storage, cfg.SidecarPath); err != nil {
+		return err
+	}
+	if err := checkActiveDEKEpochSaturated(sc, SidecarPurposeRaft, sc.Active.Raft, cfg.SidecarPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkActiveDEKEpochSaturated reports ErrLocalEpochExhausted iff
+// the active DEK for the given purpose has local_epoch ==
+// math.MaxUint16. A zero active id means "not bootstrapped for this
+// purpose" and is silently passed through.
+func checkActiveDEKEpochSaturated(sc *Sidecar, purpose string, activeID uint32, sidecarPath string) error {
+	if activeID == ReservedKeyID {
+		return nil
+	}
+	idStr := strconv.FormatUint(uint64(activeID), 10)
+	k, ok := sc.Keys[idStr]
+	if !ok {
+		// validateSidecar would have caught this in ReadSidecar
+		// via ErrSidecarActiveKeyMissing; defensive bail-out.
+		return nil
+	}
+	if k.LocalEpoch == math.MaxUint16 {
+		return pkgerrors.Wrapf(ErrLocalEpochExhausted,
+			"sidecar=%q purpose=%q active_key_id=%d local_epoch=0x%X (max=0x%X)",
+			sidecarPath, purpose, activeID, k.LocalEpoch, math.MaxUint16)
+	}
+	return nil
+}
+
+// guardFilesystemDurability runs the §5.1 write+rename+dir.Sync
+// probe on the sidecar's parent directory. It only fires when the
+// operator has supplied --encryptionSidecarPath (otherwise there
+// is no encryption directory whose durability we need to verify).
+// The check skips silently if encryption is off — a pre-rollout
+// cluster on NFS is no worse off than today (cleartext storage
+// has its own durability surface; this guard's scope is the
+// §5.1 sidecar specifically).
+func guardFilesystemDurability(cfg StartupConfig) error {
+	if !cfg.EncryptionEnabled || cfg.SidecarPath == "" {
+		return nil
+	}
+	return ProbeSidecarFilesystem(cfg.SidecarPath)
+}
+
+// ProbeSidecarFilesystem exercises the §5.1 crash-durable write
+// protocol against the parent directory of sidecarPath WITHOUT
+// disturbing an existing sidecar file. The probe writes a small
+// sentinel file, fsyncs it, renames it, dir.Syncs the parent
+// directory, and removes the sentinel. Any step that fails returns
+// the failure wrapped with ErrUnsupportedFilesystem so callers can
+// errors.Is-match it identically to the WriteSidecar path.
+//
+// The probe runs before any encryption-relevant Raft entry can
+// commit (CheckStartupGuards is called from main.go before
+// buildShardGroups). Detecting NFS or a FUSE mount whose dir.Sync
+// is a no-op at startup is dramatically cheaper than discovering
+// it days later when the first bootstrap proposal commits and the
+// sidecar write fails halfway through, leaving the cluster's
+// Raft-committed bootstrap entry without a durable on-disk DEK.
+//
+// Implementation notes:
+//   - The parent directory must exist; we do not mkdir it because
+//     the operator-supplied --encryptionSidecarPath is meant to
+//     name an EXISTING data directory. Missing parent is propagated
+//     as the underlying os.MkdirTemp error (NOT wrapped with
+//     ErrUnsupportedFilesystem — a missing dir is a config error,
+//     not a filesystem-capability problem).
+//   - The sentinel filename is prefixed with .encryption-probe- so
+//     a stale file left behind by an interrupted probe is easy to
+//     identify, and so it sorts away from the real keys.json in
+//     ls output.
+//   - We do not need to test atomicity of os.Rename (POSIX
+//     guarantees it on the same filesystem); the failure mode this
+//     probe specifically catches is dir.Sync being a no-op or
+//     erroring out.
+func ProbeSidecarFilesystem(sidecarPath string) (retErr error) {
+	dir := filepath.Dir(sidecarPath)
+	tmp, err := os.CreateTemp(dir, ".encryption-probe-*.tmp")
+	if err != nil {
+		// Missing dir / permission denied here is a config error,
+		// not a filesystem-capability problem. Propagate without
+		// the ErrUnsupportedFilesystem mark so operators see the
+		// real cause.
+		return pkgerrors.Wrapf(err, "encryption: probe sidecar dir %q for fsync support", dir)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+		// If a previous probe left .encryption-probe-*.final around,
+		// it will be cleaned up by the rename step below.
+	}()
+
+	if _, err := tmp.Write([]byte("encryption-probe\n")); err != nil {
+		_ = tmp.Close()
+		return pkgerrors.Wrap(err, "encryption: probe write")
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return pkgerrors.Wrapf(
+			pkgerrors.WithSecondaryError(ErrUnsupportedFilesystem, err),
+			"encryption: probe fsync %q", tmpPath)
+	}
+	if err := tmp.Close(); err != nil {
+		return pkgerrors.Wrapf(err, "encryption: probe close %q", tmpPath)
+	}
+
+	// Rename to a sibling and dir.Sync the parent — the same
+	// sequence WriteSidecar does. We rename to a distinct
+	// final-name so an existing .tmp-named keys.json.tmp on
+	// disk (from a prior crash) is not affected.
+	finalPath := filepath.Join(dir, filepath.Base(tmpPath)+".final")
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return pkgerrors.Wrapf(err, "encryption: probe rename %q -> %q", tmpPath, finalPath)
+	}
+	// Re-point the deferred cleanup at the renamed file so we
+	// don't leave a sentinel on disk when the probe succeeds.
+	tmpPath = finalPath
+
+	parent, err := os.Open(dir) //nolint:gosec // dir comes from operator config
+	if err != nil {
+		return pkgerrors.Wrapf(err, "encryption: probe open dir %q", dir)
+	}
+	if err := parent.Sync(); err != nil {
+		_ = parent.Close()
+		return pkgerrors.Wrapf(
+			pkgerrors.WithSecondaryError(ErrUnsupportedFilesystem, err),
+			"encryption: probe dir.Sync %q", dir)
+	}
+	if err := parent.Close(); err != nil {
+		return pkgerrors.Wrapf(err, "encryption: probe dir.Close %q", dir)
 	}
 	return nil
 }
