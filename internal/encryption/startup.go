@@ -140,16 +140,27 @@ func CheckStartupGuards(cfg StartupConfig) error {
 
 // loadSidecarForGuards parses the sidecar exactly once iff at least
 // one downstream guard needs it. Returns (nil, nil) when no guard
-// will consume it (sidecar absent, encryption off, or KEK missing
-// — guardKEKMatchesSidecar would short-circuit anyway), avoiding
-// the unnecessary ReadSidecar I/O.
+// will consume it:
+//
+//   - sidecar absent → no file to read
+//   - encryption off → guardSidecarWithoutFlag fires first;
+//     contents are irrelevant to the refusal
+//   - KEK not configured → guardKEKRequired fires before any
+//     sidecar-consuming guard, so the read would be wasted AND
+//     (more importantly) preserves the prior error precedence:
+//     a corrupt sidecar combined with a missing --kekFile must
+//     still surface as ErrKEKRequiredWithFlag (operator's primary
+//     misconfiguration) rather than a sidecar-read error
+//     (downstream symptom). Catches claude r2 + codex P2 on PR
+//     #781.
 func loadSidecarForGuards(cfg StartupConfig, sidecarPresent bool) (*Sidecar, error) {
 	if !sidecarPresent {
 		return nil, nil
 	}
 	if !cfg.EncryptionEnabled {
-		// guardSidecarWithoutFlag will fire first; the sidecar
-		// contents are irrelevant to the refusal.
+		return nil, nil
+	}
+	if !cfg.KEKConfigured {
 		return nil, nil
 	}
 	sc, err := ReadSidecar(cfg.SidecarPath)
@@ -360,7 +371,7 @@ func guardFilesystemDurability(cfg StartupConfig) error {
 //     guarantees it on the same filesystem); the failure mode this
 //     probe specifically catches is dir.Sync being a no-op or
 //     erroring out.
-func ProbeSidecarFilesystem(sidecarPath string) (retErr error) {
+func ProbeSidecarFilesystem(sidecarPath string) error {
 	dir := filepath.Dir(sidecarPath)
 	tmp, err := os.CreateTemp(dir, ".encryption-probe-*.tmp")
 	if err != nil {

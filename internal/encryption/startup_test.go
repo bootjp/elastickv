@@ -548,6 +548,34 @@ func TestCheckStartupGuards_FilesystemProbe_RunsOnlyWhenEnabled(t *testing.T) {
 	}
 }
 
+// TestCheckStartupGuards_CorruptSidecarMissingKEK_RefusesWithKEKError
+// pins the claude-r2 / codex-P2 error-precedence guarantee: when
+// BOTH the sidecar is unreadable AND --kekFile is missing, the
+// operator MUST see ErrKEKRequiredWithFlag (their primary
+// misconfiguration), not a downstream sidecar-parse error. The
+// loadSidecarForGuards KEK-missing short-circuit is what enforces
+// this ordering; without it the sidecar would be read first and
+// the parse error would mask the missing-KEK condition.
+func TestCheckStartupGuards_CorruptSidecarMissingKEK_RefusesWithKEKError(t *testing.T) {
+	dir := t.TempDir()
+	// Write a malformed sidecar — version=0 fails the ReadSidecar
+	// validation. Any unreadable file would do; we use malformed
+	// rather than missing because os.Stat distinguishes the two
+	// and "missing" wouldn't reach the ReadSidecar path at all.
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	if err := os.WriteFile(sidecarPath, []byte(`{"version":0}`), 0o600); err != nil {
+		t.Fatalf("write malformed sidecar: %v", err)
+	}
+	err := encryption.CheckStartupGuards(encryption.StartupConfig{
+		EncryptionEnabled: true,
+		KEKConfigured:     false, // <-- the missing-KEK condition
+		SidecarPath:       sidecarPath,
+	})
+	if !errors.Is(err, encryption.ErrKEKRequiredWithFlag) {
+		t.Fatalf("missing-KEK MUST take precedence over sidecar-parse error; got %v", err)
+	}
+}
+
 // TestCheckStartupGuards_KEKMismatch_ParseErrIncluded pins the
 // gemini medium finding deferred from PR #778 r3: when ParseUint
 // fails in the defensive non-decimal-key_id branch, the
