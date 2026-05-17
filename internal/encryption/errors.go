@@ -174,4 +174,38 @@ var (
 	// liability that must be rotated before the node is allowed
 	// to participate.
 	ErrLocalEpochExhausted = errors.New("encryption: active DEK has reached local_epoch=0xFFFF saturation; refusing to start (rotate the affected DEK via `encryption rotate-dek` before the next startup or risk GCM nonce reuse — see §4.1)")
+
+	// ErrSidecarBehindRaftLog is the §9.1 startup-refusal guard
+	// raised when the sidecar's raft_applied_index is behind the
+	// raftengine's persisted applied index AND the gap covers any
+	// SIDECAR-MUTATING Raft entry (per §5.5's
+	// IsEncryptionRelevantOpcode predicate: 0x04 OpBootstrap,
+	// 0x05 OpRotation, plus the reserved opcodes 0x06 / 0x07
+	// from the fsmwire OpEncryption range). 0x03 OpRegistration
+	// is in the OpEncryption range but is NOT sidecar-mutating
+	// — its apply path writes writer-registry rows only and
+	// never WriteSidecar, so registration-only gaps would be
+	// spurious refusals.
+	//
+	// The classic scenario this catches is a partial-write crash:
+	// an encryption-relevant entry was applied to the engine and
+	// the engine's applied index was advanced, but the §5.1
+	// sidecar write that should have committed the corresponding
+	// keys.json change did not complete. On the next startup the
+	// node sees a stale sidecar that does not reflect the
+	// already-Raft-committed mutation, and the encryption package
+	// would silently rebuild keystore state from an outdated
+	// wrapped-DEK snapshot — a fail-closed read would fire on the
+	// next post-cutover entry with `unknown_key_id`, halting apply.
+	//
+	// Refusing at startup with this typed error means the operator
+	// sees a single unambiguous failure pointing at the right
+	// runbook (`encryption resync-sidecar`) rather than a
+	// downstream HaltApply on the first post-cutover Raft entry.
+	//
+	// Restricting the gap check to specific encryption opcodes
+	// (rather than ANY gap) keeps non-encryption-relevant lag
+	// from forcing a spurious refusal. See §5.5 for the
+	// IsEncryptionRelevantOpcode rationale.
+	ErrSidecarBehindRaftLog = errors.New("encryption: sidecar raft_applied_index is behind the raftengine's persisted applied index and the gap covers an encryption-relevant entry; refusing to start (run `encryption resync-sidecar` to advance the sidecar past the encryption-relevant entries before retrying — see §9.1 + §5.5)")
 )
