@@ -334,7 +334,7 @@ func run() error {
 	// are only attached to the applier when --kekFile is non-empty
 	// (else the applier stays in the Stage 6A posture where
 	// ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured).
-	kekWrapper, err := loadKEKWrapperFromFlag()
+	kekWrapper, err := loadKEKAndRunStartupGuards()
 	if err != nil {
 		return err
 	}
@@ -797,6 +797,44 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 		return nil
 	}
 	return factory(groupID)
+}
+
+// loadKEKAndRunStartupGuards loads the file-backed KEK wrapper and
+// runs the §9.1 startup-refusal guards (Stage 6C-1) BEFORE
+// buildShardGroups constructs any Raft engine or storage state. The
+// two operations are paired in a single helper because the guards
+// need the loaded KEK to verify each wrapped DEK in the sidecar
+// unwraps cleanly under the configured KEK (ErrKEKMismatch), and
+// pairing keeps run()'s top-level branch count under the cyclop
+// budget.
+//
+// The triple gate in Stage 6B-2 (encryptionMutatorsEnabled) is
+// the RPC-boundary guard; this helper is the process-boundary
+// guard. Both layers exist by design — the RPC gate keeps
+// unreachable mutator paths unreachable, the startup gate keeps
+// misconfigured nodes from booting at all.
+//
+// Scope of the guards covered in this PR is documented in
+// internal/encryption/startup.go's CheckStartupGuards godoc and in
+// docs/design/2026_04_29_partial_data_at_rest_encryption.md (Stage 6C
+// sub-decomposition; 6C-1 is flag + sidecar-state guards only).
+// Later 6C-2 / 6D / 6E PRs add the guards that depend on raftengine
+// integration, the cluster-wide membership view, and the Phase-2
+// cutover record.
+func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
+	kekWrapper, err := loadKEKWrapperFromFlag()
+	if err != nil {
+		return nil, err
+	}
+	if err := encryption.CheckStartupGuards(encryption.StartupConfig{
+		EncryptionEnabled: *encryptionEnabled,
+		KEKConfigured:     *kekFile != "",
+		KEK:               kekWrapper,
+		SidecarPath:       *encryptionSidecarPath,
+	}); err != nil {
+		return nil, errors.Wrap(err, "encryption startup guards refused process start")
+	}
+	return kekWrapper, nil
 }
 
 // loadKEKWrapperFromFlag constructs the file-backed KEK wrapper

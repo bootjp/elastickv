@@ -107,4 +107,39 @@ var (
 	// that gate produces a named, grep-able failure mode rather
 	// than a nil-pointer panic deep in the apply path.
 	ErrKEKNotConfigured = errors.New("encryption: KEK not configured on this node; cannot unwrap wrapped DEK material")
+
+	// ErrSidecarPresentWithoutFlag is the §9.1 startup-refusal guard
+	// raised when the data dir already contains a sidecar (keys.json)
+	// but --encryption-enabled is NOT set. Continuing would silently
+	// downgrade the cluster to cleartext: new writes would land
+	// unencrypted while the prior wrapped DEKs sit untouched on disk,
+	// inverting the operator's intent. The process refuses to start
+	// rather than half-honor a prior bootstrap. Recovery is either
+	// to set --encryption-enabled (resume encrypted operation) or to
+	// move/delete the sidecar with deliberate runbook acknowledgement.
+	ErrSidecarPresentWithoutFlag = errors.New("encryption: sidecar present on disk but --encryption-enabled is not set; refusing to start to avoid silent downgrade to cleartext (set --encryption-enabled or remove the sidecar per the §9.1 runbook)")
+
+	// ErrKEKRequiredWithFlag is the §9.1 startup-refusal guard
+	// raised when --encryption-enabled is set but no KEK source
+	// (--kekFile) is supplied. Without a KEK the applier cannot
+	// unwrap any sidecar DEK, so the first mutating EncryptionAdmin
+	// RPC would HaltApply on every replica via ErrKEKNotConfigured.
+	// The Stage 6B-2 mutator gate keeps that path unreachable at
+	// the RPC boundary, but a flag-on / KEK-off node is misconfigured
+	// and the operator's clear intent (enable encryption) cannot be
+	// satisfied. Fail fast at startup rather than discover the
+	// mismatch later via a halted apply loop.
+	ErrKEKRequiredWithFlag = errors.New("encryption: --encryption-enabled is set but no KEK source (--kekFile) was provided; refusing to start (set --kekFile or unset --encryption-enabled)")
+
+	// ErrKEKMismatch is the §9.1 startup-refusal guard raised when
+	// the data dir contains a sidecar whose wrapped DEKs do NOT
+	// decrypt under the configured KEK. The classic operator
+	// error this catches is "wrong --kekFile points at a key from
+	// a different cluster / environment" — continuing past it
+	// would render every encrypted value on disk effectively
+	// permanently lost the moment a write tries to use the wrong
+	// DEK. Recovery requires the operator to either point
+	// --kekFile at the correct KEK file or restore the data dir
+	// from a backup that matches the supplied KEK.
+	ErrKEKMismatch = errors.New("encryption: configured KEK cannot unwrap one or more wrapped DEKs in the sidecar; refusing to start (verify --kekFile matches the KEK that bootstrapped this data dir)")
 )
