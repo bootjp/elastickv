@@ -3,6 +3,7 @@ package encryption
 import (
 	"errors"
 	"os"
+	"sort"
 	"strconv"
 
 	pkgerrors "github.com/cockroachdb/errors"
@@ -157,6 +158,12 @@ func guardKEKRequired(cfg StartupConfig) error {
 // the key_id identifies which DEK could not be unwrapped, which is
 // almost always enough to root-cause.
 //
+// Sidecar keys are visited in ascending key_id order so that when
+// more than one wrapped DEK fails the reported key_id / purpose is
+// REPRODUCIBLE across process restarts. Map-order iteration would
+// pick a different DEK each restart, breaking runbook log
+// correlation (claude r1 MEDIUM on PR #778).
+//
 // Returns nil (does not fire) when:
 //   - encryption is not enabled (other guards cover that path),
 //   - the sidecar is absent (nothing to unwrap),
@@ -172,7 +179,9 @@ func guardKEKMatchesSidecar(cfg StartupConfig, sidecarPresent bool) error {
 	if err != nil {
 		return pkgerrors.Wrapf(err, "encryption: read sidecar %q for KEK-mismatch guard", cfg.SidecarPath)
 	}
-	for idStr, k := range sc.Keys {
+	keyIDs := sortedSidecarKeyIDs(sc.Keys)
+	for _, idStr := range keyIDs {
+		k := sc.Keys[idStr]
 		if len(k.Wrapped) == 0 {
 			continue
 		}
@@ -191,4 +200,32 @@ func guardKEKMatchesSidecar(cfg StartupConfig, sidecarPresent bool) error {
 		}
 	}
 	return nil
+}
+
+// sortedSidecarKeyIDs returns the keys of m in ascending numeric
+// key_id order. Sidecar map keys are decimal uint32 strings (per
+// §5.1, enforced by validateSidecar), so a lexicographic sort
+// would put "10" before "2"; we parse and numeric-sort instead.
+// Any malformed key_id (which validateSidecar would have caught
+// upstream) is sorted to the end via the math.MaxUint32 sentinel
+// so the iteration order stays defined even if invariant drift
+// lets a bad entry through.
+func sortedSidecarKeyIDs(m map[string]SidecarKey) []string {
+	const sortLast = ^uint32(0)
+	ids := make([]string, 0, len(m))
+	for k := range m {
+		ids = append(ids, k)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		ai, aerr := strconv.ParseUint(ids[i], 10, 32)
+		bi, berr := strconv.ParseUint(ids[j], 10, 32)
+		if aerr != nil {
+			ai = uint64(sortLast)
+		}
+		if berr != nil {
+			bi = uint64(sortLast)
+		}
+		return ai < bi
+	})
+	return ids
 }

@@ -2,8 +2,10 @@ package encryption_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -48,9 +50,13 @@ func writeTestSidecar(t *testing.T, dir string, storageWrapped, raftWrapped []by
 // dir. The file is filled with the supplied seed so two test KEKs
 // constructed from different seeds will not be able to unwrap each
 // other's wrapped DEKs (which is what the ErrKEKMismatch test needs).
+//
+// The filename encodes the seed as 2-digit hex so a non-ASCII seed
+// (e.g., 0xAA) does not become a 2-byte UTF-8 path component that
+// would surprise readers of the on-disk test artifacts.
 func newTestKEK(t *testing.T, dir string, seed byte) kek.Wrapper {
 	t.Helper()
-	path := filepath.Join(dir, "kek-"+string(rune(seed))+".bin")
+	path := filepath.Join(dir, fmt.Sprintf("kek-%02x.bin", seed))
 	material := make([]byte, 32)
 	for i := range material {
 		material[i] = seed
@@ -243,24 +249,98 @@ func TestCheckStartupGuards_KEKMismatch_RaftOnly(t *testing.T) {
 	// operator's log line points at the right DEK. The exact
 	// format is intentionally part of the public contract here
 	// because runbooks grep for it.
-	if got := err.Error(); !contains(got, "purpose=\"raft\"") {
+	if got := err.Error(); !strings.Contains(got, "purpose=\"raft\"") {
 		t.Errorf("KEK mismatch error %q must annotate purpose=raft for runbook grep", got)
 	}
 }
 
-// contains is a small substring helper to keep the test free of
-// fmt/strings imports at this depth. Bringing in strings here
-// would clutter the import diff for one assertion.
-func contains(haystack, needle string) bool {
-	if len(needle) == 0 {
-		return true
+// TestCheckStartupGuards_KEKMismatch_DeterministicAnnotation pins
+// claude r1 MEDIUM on PR #778: when more than one wrapped DEK
+// fails to unwrap, the reported key_id MUST be the lowest one
+// so the error annotation is reproducible across process restarts.
+// Map-order iteration would pick a different DEK each restart,
+// breaking runbook log correlation. We use raft=2 / storage=1 so
+// that if iteration is by-insertion-order the wrong purpose
+// surfaces; sorted iteration always picks key_id=1 (storage).
+func TestCheckStartupGuards_KEKMismatch_DeterministicAnnotation(t *testing.T) {
+	dir := t.TempDir()
+	wrongKEK := newTestKEK(t, dir, 0xAA)
+	// Both DEKs wrapped under wrongKEK from the perspective of the
+	// configured KEK (rightKEK below) so EVERY DEK in the sidecar
+	// fails to unwrap. The guard must always pick key_id=1
+	// (storage), the smallest id.
+	storageWrapped, err := wrongKEK.Wrap(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Wrap storage: %v", err)
 	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
+	raftWrapped, err := wrongKEK.Wrap(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("Wrap raft: %v", err)
+	}
+	sidecarPath := writeTestSidecar(t, dir, storageWrapped, raftWrapped)
+
+	rightKEK := newTestKEK(t, dir, 0x42)
+
+	// Loop a few iterations to catch any non-determinism via
+	// Go's randomized map iteration order. If the implementation
+	// regresses to map-order, a single run might happen to pick
+	// key_id=1 by coincidence; ten iterations make the bug
+	// reliably reproducible.
+	for i := 0; i < 10; i++ {
+		err := encryption.CheckStartupGuards(encryption.StartupConfig{
+			EncryptionEnabled: true,
+			KEKConfigured:     true,
+			KEK:               rightKEK,
+			SidecarPath:       sidecarPath,
+		})
+		if !errors.Is(err, encryption.ErrKEKMismatch) {
+			t.Fatalf("iter %d: expected ErrKEKMismatch, got %v", i, err)
+		}
+		if got := err.Error(); !strings.Contains(got, "key_id=1") {
+			t.Fatalf("iter %d: KEK mismatch on multi-failure sidecar must always annotate key_id=1 (smallest), got %q", i, got)
+		}
+		if got := err.Error(); !strings.Contains(got, "purpose=\"storage\"") {
+			t.Fatalf("iter %d: KEK mismatch on key_id=1 must annotate purpose=storage, got %q", i, got)
 		}
 	}
-	return false
+}
+
+// TestCheckStartupGuards_EmptyWrappedSkipped pins the early-pass
+// behaviour for a "bootstrap not yet committed" sidecar: the file
+// exists on disk (e.g., touched by an out-of-band tool) and has
+// SidecarKey entries but every Wrapped field is empty. The guard
+// must skip empty-wrapped entries rather than calling KEK.Unwrap
+// on zero bytes (which the KEK wrapper would reject as too short
+// and fire a misleading ErrKEKMismatch).
+//
+// This locks down the godoc claim that the helper "Returns nil
+// ... when ... the sidecar exists but has no wrapped DEKs".
+func TestCheckStartupGuards_EmptyWrappedSkipped(t *testing.T) {
+	dir := t.TempDir()
+	// Write a sidecar with two SidecarKey entries that BOTH have
+	// empty Wrapped bytes. validateSidecar requires Active.X to
+	// either be 0 or point at a key in the map, so we leave the
+	// Active fields at 0 (not bootstrapped for either purpose).
+	sc := &encryption.Sidecar{
+		Version: encryption.SidecarVersion,
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: encryption.SidecarPurposeStorage, Wrapped: nil, Created: "2026-05-17T00:00:00Z"},
+			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte{}, Created: "2026-05-17T00:00:00Z"},
+		},
+	}
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	err := encryption.CheckStartupGuards(encryption.StartupConfig{
+		EncryptionEnabled: true,
+		KEKConfigured:     true,
+		KEK:               newTestKEK(t, dir, 0x42),
+		SidecarPath:       sidecarPath,
+	})
+	if err != nil {
+		t.Fatalf("expected nil for empty-Wrapped sidecar, got %v", err)
+	}
 }
 
 // TestCheckStartupGuards_SidecarStatError exercises the I/O
