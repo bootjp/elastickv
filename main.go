@@ -21,6 +21,7 @@ import (
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/memwatch"
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -154,15 +155,33 @@ var (
 	// reports encryption_capable=true.
 	//
 	// Mutating RPCs (BootstrapEncryption / RotateDEK /
-	// RegisterEncryptionWriter) are refused with FailedPrecondition
-	// regardless of this flag. The §6.3 WithEncryption FSM applier
-	// is plumbed by Stage 6; until then registerEncryptionAdminServer
-	// installs neither the Proposer nor the LeaderView, so every
-	// mutator short-circuits at the gRPC boundary before any Raft
-	// proposal is created. Setting --encryptionSidecarPath does
-	// NOT enable mutating RPCs; Stage 6 wires the applier and the
-	// Proposer + LeaderView together in the same change.
-	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter) are refused with FailedPrecondition regardless of this flag until Stage 6 wires the §6.3 FSM applier together with the Proposer + LeaderView.")
+	// RegisterEncryptionWriter) are gated by Stage 6B-2 on the
+	// AND of --encryption-enabled and --kekFile being non-empty.
+	// Setting --encryptionSidecarPath ALONE no longer enables
+	// mutators; the operator must explicitly opt in to encryption
+	// AND supply a KEK source. With either gate condition false,
+	// registerEncryptionAdminServer omits the Proposer + LeaderView
+	// options and every mutator short-circuits at the gRPC boundary
+	// with FailedPrecondition before any Raft proposal is created.
+	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter) are additionally gated on this flag being non-empty AND --encryption-enabled AND --kekFile being non-empty (all three required so the applier's WithKEK + WithKeystore + WithSidecarPath options are all wired before mutators can commit).")
+
+	// Stage 6B-2: cluster-wide encryption opt-in flag. The mutating
+	// EncryptionAdmin RPCs (BootstrapEncryption, RotateDEK,
+	// RegisterEncryptionWriter) become reachable only when this
+	// flag is set AND --kekFile points at a valid KEK source.
+	// Default off; pre-Stage-6 clusters and operators who have
+	// not yet committed to encryption are unaffected.
+	encryptionEnabled = flag.Bool("encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires --kekFile to be set; without that, mutators still refuse with FailedPrecondition. Default off.")
+
+	// Stage 6B-2: KEK source. The KEK never appears in elastickv's
+	// data dir; it is held externally and exercised only at process
+	// boot and at DEK bootstrap/rotation per §5.1. Stage 6B-2 ships
+	// only the file-backed wrapper (kek.FileWrapper); KMS providers
+	// (--kekUri) land in Stage 9. Empty disables KEK loading; the
+	// applier's ApplyBootstrap and ApplyRotation paths then return
+	// ErrKEKNotConfigured at apply time, which is masked at the
+	// RPC boundary by the mutator gate documented above.
+	kekFile = flag.String("kekFile", "", "§5.1 KEK file path (32 raw bytes, owner-only mode). When set, the file-backed kek.Wrapper is constructed at startup and threaded into the §6.3 EncryptionApplier so ApplyBootstrap and ApplyRotation can KEK-unwrap.")
 
 	// Key visualizer sampler flags. The sampler runs entirely in-memory
 	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
@@ -297,6 +316,30 @@ func run() error {
 	// physicalCeiling when HLC lease entries are applied to the Raft log.
 	clock := kv.NewHLC()
 
+	// Stage 6B-2: construct the shared KEK wrapper + in-memory
+	// Keystore once at startup, before any FSM is built. Both are
+	// process-wide singletons:
+	//
+	//   - KEK is exercised at DEK bootstrap (§5.6) and rotation
+	//     (§5.2) by every shard's applier; one wrapper per process
+	//     is what the file-mode check + kek.FileWrapper invariants
+	//     assume.
+	//   - Keystore is the in-memory map of (key_id → DEK bytes) the
+	//     storage cipher (§6.2, wired in Stage 6D) and the
+	//     EncryptionApplier (Stage 6A/6B) both read from. Sharing
+	//     one instance across shards keeps post-bootstrap DEKs
+	//     visible to every shard's storage cipher.
+	//
+	// Both are nil-safe in the applier path: WithKEK / WithKeystore
+	// are only attached to the applier when --kekFile is non-empty
+	// (else the applier stays in the Stage 6A posture where
+	// ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured).
+	kekWrapper, err := loadKEKWrapperFromFlag()
+	if err != nil {
+		return err
+	}
+	keystore := encryption.NewKeystore()
+
 	runtimes, shardGroups, err := buildShardGroups(
 		*raftId,
 		*raftDir,
@@ -309,6 +352,9 @@ func run() error {
 			return metricsRegistry.RaftProposalObserver(groupID)
 		},
 		clock,
+		kekWrapper,
+		keystore,
+		*encryptionSidecarPath,
 	)
 	if err != nil {
 		return err
@@ -678,6 +724,9 @@ func buildShardGroups(
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
+	kekWrapper kek.Wrapper,
+	keystore *encryption.Keystore,
+	sidecarPath string,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
@@ -710,7 +759,13 @@ func buildShardGroups(
 			_ = st.Close()
 			return nil, nil, errors.Wrapf(err, "failed to construct writer registry for group %d", g.id)
 		}
-		applier, err := encryption.NewApplier(reg)
+		// Stage 6B-2: thread WithKEK + WithKeystore + WithSidecarPath
+		// into the Applier when all three are supplied. Without
+		// any of them the applier stays in the Stage 6A posture
+		// (ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured)
+		// which is exactly the desired apply-time fail-closed
+		// behaviour when an operator has not opted in to encryption.
+		applier, err := encryption.NewApplier(reg, applierOptionsFor(kekWrapper, keystore, sidecarPath)...)
 		if err != nil {
 			for _, rt := range runtimes {
 				rt.Close()
@@ -742,6 +797,52 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 		return nil
 	}
 	return factory(groupID)
+}
+
+// loadKEKWrapperFromFlag constructs the file-backed KEK wrapper
+// from the --kekFile flag, returning nil if the flag is empty.
+// Returns the kek.Wrapper interface rather than the concrete
+// *kek.FileWrapper so the call site (buildShardGroups → applier)
+// stays decoupled from the file-mode provider — Stage 9 KMS
+// providers (AWS KMS, GCP KMS, Vault) will satisfy the same
+// interface and slot in without rewriting the dispatch site.
+func loadKEKWrapperFromFlag() (kek.Wrapper, error) {
+	if *kekFile == "" {
+		return nil, nil
+	}
+	w, err := kek.NewFileWrapper(*kekFile)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load KEK from %s", *kekFile)
+	}
+	return w, nil
+}
+
+// applierOptionsFor assembles the variadic ApplierOption slice
+// for encryption.NewApplier based on which Stage 6B-2 dependencies
+// the operator has wired at startup. Each nil/empty input
+// suppresses its option, leaving the applier in the Stage 6A
+// posture for that axis. Extracted from buildShardGroups so the
+// per-shard loop stays under the cyclop complexity budget.
+//
+// kekWrapper is typed as encryption.KEKUnwrapper (the
+// applier-side narrow interface) rather than the wider
+// kek.Wrapper so the helper stays decoupled from the wrap-side
+// path. Any kek.Wrapper satisfies encryption.KEKUnwrapper
+// structurally because both declare Unwrap with the same
+// signature.
+func applierOptionsFor(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, sidecarPath string) []encryption.ApplierOption {
+	const maxOpts = 3
+	opts := make([]encryption.ApplierOption, 0, maxOpts)
+	if kekWrapper != nil {
+		opts = append(opts, encryption.WithKEK(kekWrapper))
+	}
+	if keystore != nil {
+		opts = append(opts, encryption.WithKeystore(keystore))
+	}
+	if sidecarPath != "" {
+		opts = append(opts, encryption.WithSidecarPath(sidecarPath))
+	}
+	return opts
 }
 
 func raftMonitorRuntimes(runtimes []*raftGroupRuntime) []monitoring.RaftRuntime {
@@ -1291,6 +1392,7 @@ func startRaftServers(
 	// options appended below. Sized as a constant so the magic-number
 	// linter does not complain.
 	const extraOptsCap = 2
+	enableMutators := encryptionMutatorsEnabled()
 	for _, rt := range runtimes {
 		baseOpts := internalutil.GRPCServerOptions()
 		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
@@ -1327,7 +1429,11 @@ func startRaftServers(
 		// FNV-1a hash already used by raftengine for peer ids
 		// (etcd.DeriveNodeID), so every node in the cluster reports
 		// a stable, distinct value. Codex r1 P1 on PR #760.
-		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath)
+		// Stage 6B-2 mutator gate is resolved once above the
+		// per-shard loop. Each shard's own engine is the
+		// Proposer + LeaderView so the mutator proposes through
+		// the correct Raft group.
+		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath, enableMutators, rt.engine)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
