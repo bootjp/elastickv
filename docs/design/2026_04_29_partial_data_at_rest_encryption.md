@@ -23,7 +23,8 @@ Date: 2026-04-29
 | 6C-1 | Subset of §9.1 startup refusal guards that depend only on flags + sidecar state: sidecar present without `--encryption-enabled` (`ErrSidecarPresentWithoutFlag`, downgrade prevention), `--encryption-enabled` without `--kekFile` (`ErrKEKRequiredWithFlag`, fail-fast), KEK loaded but sidecar wrapped DEKs do not unwrap (`ErrKEKMismatch`, operator-error catch). `internal/encryption/startup.go`'s `CheckStartupGuards` runs once in `main.go run()` before `buildShardGroups`. | shipped | PR #778 |
 | 6C-2 | Process-local §9.1 guards that read only the encryption package's own state: `ErrLocalEpochExhausted` (any active DEK with `local_epoch == 0xFFFF` — refuses to start until rotated, preventing GCM nonce reuse on the next write), `ErrUnsupportedFilesystem` startup probe (`ProbeSidecarFilesystem` exercises the §5.1 write+rename+dir.Sync sequence on a sentinel file in the sidecar directory at startup so filesystem-capability failures surface BEFORE the first encryption-relevant Raft entry, not on the first WriteSidecar call hours into operation). Also includes the gemini-r3 medium parseErr-annotation fix deferred from PR #778 (`ErrKEKMismatch` now wraps both `parseErr` and the unwrap error when the defensive non-decimal-key_id branch fires). The asymmetric `ErrLocalEpochRollback` peer is split into 6C-3 because it requires the writer-registry record (Stage 7). The `ErrSidecarBehindRaftLog` guard moves to 6C-2b because it requires raftengine integration — outside the encryption package boundary. | open | — |
 | 6C-2b | `ErrSidecarBehindRaftLog` guard PRIMITIVE — encryption-side sentinel, `IsEncryptionRelevantOpcode` predicate (§5.5), `EncryptionRelevantScanner` cross-package interface, and `GuardSidecarBehindRaftLog` pure-function guard that takes both indices + a scanner callback. Tests use a fake scanner to exercise every branch (caught-up / gap-not-covered / gap-covered / scanner-error / nil-scanner-fails-closed). Wires nothing into main.go; the raftengine-side implementation lands in 6C-2c. | shipped-in-this-PR | this PR |
-| 6C-2c | Raftengine implementation of `EncryptionRelevantScanner` (WAL-based scan of Raft entries in the supplied index range against the §5.5 predicate) + `main.go` startup-guard phase that runs after `buildShardGroups` for each shard with encryption enabled, before any gRPC server starts serving. Inherits the encryption-side primitive from 6C-2b. | open | — |
+| 6C-2c | Raftengine implementation of `EncryptionRelevantScanner` against `etcdraft.MemoryStorage.Entries`. `Engine.EncryptionScanner()` exposes the scanner as the encryption-side interface so callers (Stage 6C-2d, 6D, 6E) inherit it without coupling to the engine internals. Tests pin every branch: empty range, no-relevant entries (with OpRegistration explicitly), bootstrap hit, rotation hit, conf-change skipped, empty-data skipped, compacted-range error propagation, nil-storage error. | shipped-in-this-PR | this PR |
+| 6C-2d | `main.go` startup-guard phase that runs after `buildShardGroups` for each shard with encryption enabled, before any gRPC server starts serving. Calls `encryption.GuardSidecarBehindRaftLog` with the shard's engine `AppliedIndex()` + sidecar `RaftAppliedIndex` + the engine's `EncryptionScanner()` from 6C-2c. The guard's existing branches (caught-up / gap-not-covered / gap-covered / scanner-error / nil-scanner-fails-closed) determine refusal behavior. | open | — |
 | 6C-3 | Cluster-wide §9.1 guards that require the Voters ∪ Learners membership view: `ErrNodeIDCollision` (two members hash to the same 16-bit `node_id`), `ErrLocalEpochRollback` (sidecar `local_epoch` ≤ writer-registry record). Naturally bundles with the Stage 6D capability fan-out which already needs that membership view. | open | — |
 | 6C-4 | Phase-2-specific §9.1 guards: `ErrEnvelopeCutoverDivergence` (sidecar `raft_envelope_cutover_index` disagrees with snapshot header), `ErrEncryptionNotBootstrapped` (`enable-raft-envelope` before bootstrap), `ErrLocalEpochOutOfRange` on the wire side of `GetCapability` / `GetSidecarState`. Bundles with Stage 6E (`enable-raft-envelope` admin RPC + Phase-2 cutover). | open | — |
 | 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring AND 6C-1+6C-2 for §9.1 startup-refusal guards; bundles 6C-3 for the membership-view-dependent collision check — see rationale) | open | — |
@@ -200,18 +201,28 @@ production-safe state, and unblocks the next one.
       ONLY on the encryption package without waiting on the
       raftengine-side scan helper.
 
-    * **6C-2c** — Raftengine implementation of the
-      `EncryptionRelevantScanner` interface defined in 6C-2b. Walks
-      the WAL across the supplied entry-index range, decodes each
-      entry's opcode byte, and applies the §5.5 predicate. Wires
-      a new startup-guard phase into `main.go` that runs AFTER
+    * **6C-2c** — Raftengine-side implementation of the
+      `EncryptionRelevantScanner` interface defined in 6C-2b.
+      Implemented against `etcdraft.MemoryStorage.Entries` so the
+      scan reads in-memory state that the engine has just replayed
+      from the WAL + snapshot at Open() time. Filters out
+      EntryConfChange / EntryConfChangeV2 and zero-length normal
+      entries (etcd-raft leadership bumps) so those don't falsely
+      trigger the predicate. Compacted-range errors propagate
+      wrapped — the caller (Stage 6C-2d's main.go phase) surfaces
+      them as a scanner-error refusal distinct from
+      ErrSidecarBehindRaftLog. Exposed via the new
+      `Engine.EncryptionScanner()` accessor.
+
+    * **6C-2d** — `main.go` startup-guard phase that ties 6C-2b's
+      pure-function guard to 6C-2c's engine scanner. Runs AFTER
       `buildShardGroups` returns and each shard's engine has opened,
       but BEFORE any gRPC server starts serving — a different
       lifecycle phase from the existing 6C-1 / 6C-2 guards (which
       run before engine startup). For each shard with encryption
-      enabled, the phase calls `GuardSidecarBehindRaftLog` with the
-      shard's engine `AppliedIndex()` and a scanner backed by the
-      engine's WAL.
+      enabled, calls `GuardSidecarBehindRaftLog` with the shard's
+      engine `AppliedIndex()` + sidecar `RaftAppliedIndex` + the
+      engine's `EncryptionScanner()`.
 
     * **6C-3** — Membership-view guards. `ErrNodeIDCollision`
       requires a Voters ∪ Learners enumeration of every Raft
@@ -229,11 +240,12 @@ production-safe state, and unblocks the next one.
       `local_epoch` values to the §4.1 16-bit field. Bundles with
       Stage 6E's `enable-raft-envelope` admin RPC.
 
-  **Shipping order:** 6C-1 → 6C-2 → 6C-2b (primitive) → 6C-2c
-  (raftengine implementation + main.go wiring) → 6D (bundles
-  6C-3) → 6E (bundles 6C-4). Stage 6D is unblocked once 6C-1
-  + 6C-2 + 6C-2b + 6C-2c have all shipped (the latter pair
-  is the load-bearing `ErrSidecarBehindRaftLog` work); 6D
+  **Shipping order:** 6C-1 → 6C-2 → 6C-2b (encryption-side
+  primitive) → 6C-2c (raftengine scanner) → 6C-2d (main.go
+  startup-guard wiring) → 6D (bundles 6C-3) → 6E (bundles
+  6C-4). Stage 6D is unblocked once 6C-1 + 6C-2 + 6C-2b +
+  6C-2c + 6C-2d have all shipped (the latter three together
+  are the load-bearing `ErrSidecarBehindRaftLog` work); 6D
   does not need to wait for the 6C-3/6C-4 work that bundles
   into it.
 
