@@ -20,8 +20,9 @@ Date: 2026-04-29
 | 5E | §5.6 step 1a capability fan-out helper + `encryption bootstrap --discover-from=...` auto-batch mode | deferred | — |
 | 6A | §6.3 `EncryptionApplier` concrete implementation (writer-registry insert + sidecar mutate + keystore update; nil-KEK code paths in `ApplyBootstrap` / `ApplyRotation` return a typed `ErrKEKNotConfigured` defense-in-depth marker until 6B fills it) + `kv.NewKvFSMWithHLC(... WithEncryption(applier))` wiring. **Mutator wiring in `registerEncryptionAdminServer` stays OFF, identical to Stage 5D** — see Stage 6 rationale §6A note. No new flag is introduced in 6A; the applier is operator-inert in a same-version 6A cluster (exercised only via direct `FSM.Apply` unit tests). Rolling 6A→6B upgrade has a halt-on-foreign-entry caveat — see rationale | open | — |
 | 6B | §6.5 KEK plumbing — `--kekFile` / `--kekUri` flags + `internal/encryption/kek` selection at startup + thread `KEKUnwrapper` into the applier so `ApplyBootstrap` / `ApplyRotation` actually KEK-unwrap (replaces the 6A `ErrKEKNotConfigured` stubs) + introduce `--encryption-enabled` flag (default off) + re-enable mutating-RPC wiring in `registerEncryptionAdminServer` gated on (`--encryption-enabled` AND `KEKConfigured()`) | open | — |
-| 6C-1 | Subset of §9.1 startup refusal guards that depend only on flags + sidecar state: sidecar present without `--encryption-enabled` (`ErrSidecarPresentWithoutFlag`, downgrade prevention), `--encryption-enabled` without `--kekFile` (`ErrKEKRequiredWithFlag`, fail-fast), KEK loaded but sidecar wrapped DEKs do not unwrap (`ErrKEKMismatch`, operator-error catch). `internal/encryption/startup.go`'s `CheckStartupGuards` runs once in `main.go run()` before `buildShardGroups`. | open | — |
-| 6C-2 | Remaining §9.1 guards that depend on raftengine integration or shared state: `ErrSidecarBehindRaftLog` (needs the persisted applied-index from raftengine), `ErrUnsupportedFilesystem` startup probe (the current code surfaces it only on first write — a dedicated `tmpfile + dir.Sync` probe at startup would surface it before any encryption-relevant write), `ErrLocalEpochExhausted` (active DEK `local_epoch == 0xFFFF` — coupled with the writer-registry record so shipping it without the rollback peer creates an asymmetric posture future readers must reason around). | open | — |
+| 6C-1 | Subset of §9.1 startup refusal guards that depend only on flags + sidecar state: sidecar present without `--encryption-enabled` (`ErrSidecarPresentWithoutFlag`, downgrade prevention), `--encryption-enabled` without `--kekFile` (`ErrKEKRequiredWithFlag`, fail-fast), KEK loaded but sidecar wrapped DEKs do not unwrap (`ErrKEKMismatch`, operator-error catch). `internal/encryption/startup.go`'s `CheckStartupGuards` runs once in `main.go run()` before `buildShardGroups`. | shipped | PR #778 |
+| 6C-2 | Process-local §9.1 guards that read only the encryption package's own state: `ErrLocalEpochExhausted` (any active DEK with `local_epoch == 0xFFFF` — refuses to start until rotated, preventing GCM nonce reuse on the next write), `ErrUnsupportedFilesystem` startup probe (`ProbeSidecarFilesystem` exercises the §5.1 write+rename+dir.Sync sequence on a sentinel file in the sidecar directory at startup so filesystem-capability failures surface BEFORE the first encryption-relevant Raft entry, not on the first WriteSidecar call hours into operation). Also includes the gemini-r3 medium parseErr-annotation fix deferred from PR #778 (`ErrKEKMismatch` now wraps both `parseErr` and the unwrap error when the defensive non-decimal-key_id branch fires). The asymmetric `ErrLocalEpochRollback` peer is split into 6C-3 because it requires the writer-registry record (Stage 7). The `ErrSidecarBehindRaftLog` guard moves to 6C-2b because it requires raftengine integration — outside the encryption package boundary. | open | — |
+| 6C-2b | `ErrSidecarBehindRaftLog` startup guard — reads the persisted applied-index from raftengine and refuses if the sidecar's `raft_applied_index` is behind by an interval covering any encryption-relevant Raft entry (`isEncryptionRelevant` predicate per §5.5). Plumbing raftengine into the startup-guard path is the load-bearing scope here; the guard itself is a one-screen function. | open | — |
 | 6C-3 | Cluster-wide §9.1 guards that require the Voters ∪ Learners membership view: `ErrNodeIDCollision` (two members hash to the same 16-bit `node_id`), `ErrLocalEpochRollback` (sidecar `local_epoch` ≤ writer-registry record). Naturally bundles with the Stage 6D capability fan-out which already needs that membership view. | open | — |
 | 6C-4 | Phase-2-specific §9.1 guards: `ErrEnvelopeCutoverDivergence` (sidecar `raft_envelope_cutover_index` disagrees with snapshot header), `ErrEncryptionNotBootstrapped` (`enable-raft-envelope` before bootstrap), `ErrLocalEpochOutOfRange` on the wire side of `GetCapability` / `GetSidecarState`. Bundles with Stage 6E (`enable-raft-envelope` admin RPC + Phase-2 cutover). | open | — |
 | 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring AND 6C-1+6C-2 for §9.1 startup-refusal guards; bundles 6C-3 for the membership-view-dependent collision check — see rationale) | open | — |
@@ -165,17 +166,34 @@ production-safe state, and unblocks the next one.
       `buildShardGroups` so a misconfigured node refuses to boot
       rather than halting mid-flight or silently downgrading.
 
-    * **6C-2** — Raftengine-integration guards. `ErrSidecarBehindRaftLog`
-      reads the persisted applied-index from the raft engine;
-      `ErrUnsupportedFilesystem` startup probe writes a temp file
-      + `dir.Sync` to surface the failure before any encryption-
-      relevant write; `ErrLocalEpochExhausted` reads the sidecar
+    * **6C-2** — Process-local guards that read only the encryption
+      package's own state. `ErrLocalEpochExhausted` reads the sidecar
       and refuses to start if any active DEK has reached
-      `local_epoch == 0xFFFF`. (The last one bundles with 6C-2
-      rather than 6C-1 because it is the asymmetric "exhaustion"
-      side of the rollback/exhaustion pair — shipping it alone
-      would leave a half-empty `local_epoch` posture future
-      readers would have to reason around.)
+      `local_epoch == 0xFFFF` (the exhaustion side of the
+      rollback/exhaustion pair — the rollback peer needs the writer
+      registry from Stage 7 and ships in 6C-3 instead).
+      `ErrUnsupportedFilesystem` startup probe (`ProbeSidecarFilesystem`)
+      writes + syncs + renames + dir-syncs a sentinel file in the
+      sidecar directory at startup so filesystem-capability failures
+      surface BEFORE the first encryption-relevant Raft entry, not
+      on the first `WriteSidecar` call hours into operation. Also
+      bundles the gemini-r3 medium `parseErr` annotation fix
+      deferred from PR #778.
+
+      `ErrSidecarBehindRaftLog` was originally listed under 6C-2 but
+      moved to **6C-2b** because it requires raftengine integration
+      to read the persisted applied-index. The encryption-package-
+      only scope of 6C-2 lets the simpler guards ship without the
+      raftengine plumbing churn.
+
+    * **6C-2b** — `ErrSidecarBehindRaftLog`. Plumbs the raftengine's
+      persisted applied-index into the startup-guard path and refuses
+      if the sidecar's `raft_applied_index` is behind by an interval
+      that covers any encryption-relevant entry (`isEncryptionRelevant`
+      predicate per §5.5: `rotate-dek`, `rewrap-deks`, `bootstrap-
+      encryption`, `enable-storage-envelope`, `enable-raft-envelope`,
+      `retire-dek`). The guard itself is a one-screen function; the
+      load-bearing scope is the cross-package plumbing.
 
     * **6C-3** — Membership-view guards. `ErrNodeIDCollision`
       requires a Voters ∪ Learners enumeration of every Raft
@@ -193,10 +211,11 @@ production-safe state, and unblocks the next one.
       `local_epoch` values to the §4.1 16-bit field. Bundles with
       Stage 6E's `enable-raft-envelope` admin RPC.
 
-  **Shipping order:** 6C-1 → 6C-2 → 6D (bundles 6C-3) → 6E
-  (bundles 6C-4). Stage 6D is unblocked once 6C-1 + 6C-2 ship;
-  it does not need to wait for the 6C-3/6C-4 work that bundles
-  into it.
+  **Shipping order:** 6C-1 → 6C-2 → 6C-2b → 6D (bundles 6C-3) →
+  6E (bundles 6C-4). Stage 6D is unblocked once 6C-1 + 6C-2 +
+  6C-2b have all shipped (the latter is the last raftengine-
+  integration piece any cutover RPC depends on); it does not need
+  to wait for the 6C-3/6C-4 work that bundles into it.
 
 - **6D and 6E are the actual cutovers** (Phase 1 = storage, Phase
   2 = raft). Each touches a different code path (§6.2 storage
