@@ -21,9 +21,10 @@ import (
 const scanMaxBytes uint64 = 64 << 20 // 64 MiB
 
 // encryptionScanner implements encryption.EncryptionRelevantScanner
-// against the engine's in-memory raft storage. It is constructed
-// once per Engine and embedded into the engine struct; callers get
-// access to it via Engine.EncryptionScanner().
+// against the engine's in-memory raft storage. It wraps the
+// engine's *MemoryStorage; a fresh value is constructed per
+// Engine.EncryptionScanner() call (cheap — no internal state).
+// Callers get access to it via Engine.EncryptionScanner().
 //
 // The scan walks raftpb.Entry rows in (startExclusive, endInclusive]
 // via etcdraft.MemoryStorage.Entries(lo, hi, maxSize), filters out
@@ -85,9 +86,9 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 			// we surface it as a scanner error. The caller routes
 			// scanner errors as a refusal distinct from
 			// ErrSidecarBehindRaftLog.
-			return false, errors.Wrapf(errors.New("no progress"),
+			return false, errors.WithStack(errors.Newf(
 				"encryption scanner: Entries(cursor=%d, hi=%d) returned no entries and no error (unscanned gap)",
-				cursor, hi)
+				cursor, hi))
 		}
 		for _, ent := range batch {
 			if isEncryptionRelevantEntry(ent) {
