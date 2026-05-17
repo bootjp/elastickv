@@ -231,6 +231,17 @@ func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
 		writeSQSError(w, apiErr.status, apiErr.errorType, apiErr.message)
 		return
 	}
+	// PurgeQueue's 60-second rate limit is a typed error so the admin
+	// path can extract the retry-after duration without parsing
+	// strings. The SigV4 wire response must stay the AWS-shaped
+	// 400 + AWS.SimpleQueueService.PurgeQueueInProgress envelope, so
+	// we render it here from the typed error's Error() text (which is
+	// pinned to the message AWS clients expect).
+	var rateLimit *purgeRateLimitedError
+	if errors.As(err, &rateLimit) {
+		writeSQSError(w, http.StatusBadRequest, sqsErrPurgeInProgress, rateLimit.Error())
+		return
+	}
 	// Internal errors can wrap Pebble file names, Raft peer ids, stack
 	// frames from errors.WithStack, etc. Never echo the raw error text
 	// to the client — an authenticated-but-untrusted caller could use
