@@ -2249,7 +2249,15 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 	//      tag was added to detect.
 	//   3. Hand the (now cleartext) payload to fsm.Apply. The
 	//      FSM contract is unchanged at Apply(data []byte) any —
-	//      the FSM never sees a raft envelope.
+	//      the FSM never sees a raft envelope. If the FSM also
+	//      implements raftengine.ApplyIndexAware, the engine
+	//      delivers entry.Index via SetApplyIndex immediately
+	//      before Apply (same goroutine, serial under applyMu) so
+	//      apply handlers that need to persist the entry index
+	//      atomically with their other side-effects (e.g. the
+	//      encryption applier's sidecar.RaftAppliedIndex write for
+	//      the §9.1 ErrSidecarBehindRaftLog guard) can read it
+	//      without changing the StateMachine signature.
 	//
 	// FSM payload aliasing: when the cipher path is OFF, payload
 	// is a slice into entry.Data's backing array (DecodeProposalEnvelope
@@ -2280,6 +2288,9 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 			return nil, err
 		}
 		payload = plain
+	}
+	if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
+		aware.SetApplyIndex(entry.Index)
 	}
 	return e.fsm.Apply(payload), nil
 }
