@@ -689,7 +689,7 @@ func TestLua_PoolBoundedOverflow(t *testing.T) {
 }
 
 // TestLua_PoolBoundedClampsZeroAndNegative locks in the contract that
-// non-positive maxIdle values clamp to defaultLuaPoolMaxIdle rather
+// non-positive maxIdle values clamp to DefaultLuaPoolMaxIdle rather
 // than silently producing a cap=0 pool (which would make every put()
 // drop). Operators that misconfigure --redisLuaMaxIdleStates=0 get the
 // default behaviour, not a permanently disabled pool.
@@ -707,8 +707,8 @@ func TestLua_PoolBoundedClampsZeroAndNegative(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			pool := newLuaStatePoolWithMaxIdle(tc.maxIdle)
-			require.Equal(t, defaultLuaPoolMaxIdle, pool.MaxIdle(),
-				"non-positive maxIdle must clamp to defaultLuaPoolMaxIdle")
+			require.Equal(t, DefaultLuaPoolMaxIdle, pool.MaxIdle(),
+				"non-positive maxIdle must clamp to DefaultLuaPoolMaxIdle")
 			// And the pool must actually retain on put (proving cap > 0).
 			pool.put(pool.get(nil))
 			require.Equal(t, 1, pool.Idle(),

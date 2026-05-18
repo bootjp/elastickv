@@ -88,7 +88,7 @@ const luaWhitelistedTableHint = 8
 // The registry-backed binding is also the reason redis.call is
 // lock-free in the hot path, unlike the first iteration which used
 // a package-level map guarded by sync.RWMutex.
-// defaultLuaPoolMaxIdle is the default upper bound on idle pooled
+// DefaultLuaPoolMaxIdle is the default upper bound on idle pooled
 // *lua.LState instances retained for reuse. Each pooled state holds
 // the base stdlib + redis/cjson/cmsgpack closures + per-state
 // snapshot tables (globals / tables / metatables); empirically ~200
@@ -103,7 +103,12 @@ const luaWhitelistedTableHint = 8
 // allocation (miss) and excess put() calls drop the state for the GC
 // (drop). The cap therefore controls memory floor, not throughput
 // ceiling.
-const defaultLuaPoolMaxIdle = 64
+//
+// Exported so main.go can use it as the default for the
+// --redisLuaMaxIdleStates flag instead of duplicating the literal
+// (which trips the mnd lint and creates a drift source if the
+// adapter-side default changes).
+const DefaultLuaPoolMaxIdle = 64
 
 // luaStatePool pools *lua.LState instances to cut heap/GC pressure on
 // high-rate EVAL / EVALSHA workloads (e.g. BullMQ ~10 scripts/s, where
@@ -227,22 +232,22 @@ func (r *RedisServer) getLuaPool() *luaStatePool {
 	return r.luaPool
 }
 
-// newLuaStatePool returns a bounded pool sized at defaultLuaPoolMaxIdle.
+// newLuaStatePool returns a bounded pool sized at DefaultLuaPoolMaxIdle.
 // Used by test fixtures and any caller that does not thread a
 // configured cap through. Production wires the explicit cap via
 // newLuaStatePoolWithMaxIdle from NewRedisServer.
 func newLuaStatePool() *luaStatePool {
-	return newLuaStatePoolWithMaxIdle(defaultLuaPoolMaxIdle)
+	return newLuaStatePoolWithMaxIdle(DefaultLuaPoolMaxIdle)
 }
 
 // newLuaStatePoolWithMaxIdle returns a pool whose idle backing
 // channel is sized at maxIdle. Non-positive values clamp to
-// defaultLuaPoolMaxIdle to keep get/put semantics well-defined
+// DefaultLuaPoolMaxIdle to keep get/put semantics well-defined
 // (cap=0 would make every put() drop, which is never what we want
 // — callers asking for "no pool" should bypass the pool entirely).
 func newLuaStatePoolWithMaxIdle(maxIdle int) *luaStatePool {
 	if maxIdle < 1 {
-		maxIdle = defaultLuaPoolMaxIdle
+		maxIdle = DefaultLuaPoolMaxIdle
 	}
 	return &luaStatePool{
 		idle:    make(chan *pooledLuaState, maxIdle),
@@ -527,30 +532,33 @@ func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValu
 // pointer write to the state-local ctxBinding userdata -- no lock,
 // no global map.
 //
-// A non-blocking channel recv on an empty idle pool returns the
-// zero value (no element), which we treat as a miss. The defensive
-// nil guard preserves behaviour if a future refactor ever sends an
-// unexpected value through the channel.
+// A non-blocking recv that does not match either case fires the
+// default branch (allocation miss). The defensive nil guard
+// preserves behaviour if a future refactor ever sends an unexpected
+// value through the idle channel.
+//
+// The ctxBinding assignment and return are centralized after the
+// select so every path goes through one binding step. This was a
+// gemini r1 review nit: refactor for clarity rather than duplicate
+// the binding in each branch.
 func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
+	var pls *pooledLuaState
 	select {
-	case pls := <-p.idle:
-		if pls == nil {
+	case pls = <-p.idle:
+		if pls != nil {
+			p.hits.Add(1)
+		} else {
 			// Defence in depth: a nil element on the channel is
 			// treated as an allocation miss rather than a panic.
 			p.misses.Add(1)
 			pls = newPooledLuaState()
-			pls.ctxBinding.Value = ctx
-			return pls
 		}
-		p.hits.Add(1)
-		pls.ctxBinding.Value = ctx
-		return pls
 	default:
 		p.misses.Add(1)
-		pls := newPooledLuaState()
-		pls.ctxBinding.Value = ctx
-		return pls
+		pls = newPooledLuaState()
 	}
+	pls.ctxBinding.Value = ctx
+	return pls
 }
 
 // put resets the state and tries to return it to the pool. If the
@@ -558,6 +566,17 @@ func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
 // channel is full it is dropped so the GC can reclaim it; the drop
 // counter makes pool saturation observable so operators can tune
 // maxIdle.
+//
+// Fast-path: when len(p.idle) already equals maxIdle the put is
+// guaranteed to overflow, so skip the (non-trivial) pls.reset()
+// — restoring the globals / tables / metatables snapshots is
+// pointless work for a state that is about to be Close()'d. This is
+// a gemini r1 review optimisation; under saturation the EVAL hot
+// path spends much less CPU on doomed resets. The check is a racy
+// snapshot of len(); concurrent puts can still observe stale
+// "len < max" and race into the select below, where the same
+// channel-full guard catches them — so the fast-path is a strict
+// improvement, not a new correctness requirement.
 func (p *luaStatePool) put(pls *pooledLuaState) {
 	if pls == nil || pls.state == nil {
 		return
@@ -571,14 +590,17 @@ func (p *luaStatePool) put(pls *pooledLuaState) {
 	if pls.state.IsClosed() {
 		return
 	}
+	if len(p.idle) >= p.maxIdle {
+		p.drops.Add(1)
+		pls.state.Close()
+		return
+	}
 	pls.reset()
 	select {
 	case p.idle <- pls:
 	default:
-		// Idle channel is full — drop the state. Close it so any
-		// per-state resources are released eagerly; the channel
-		// holds room only for steady-state reuse, not for warm
-		// states left over from a burst peak.
+		// Idle channel filled between the fast-path check and the
+		// select (concurrent puts winning the race). Drop the state.
 		p.drops.Add(1)
 		pls.state.Close()
 	}
