@@ -250,6 +250,13 @@ message EnableStorageEnvelopeResponse {
   // false; applied_index then carries
   // sidecar.RaftAppliedIndex as a best-effort fallback. The
   // CLI surfaces it as a warning.
+  //
+  // This field is ONLY relevant when was_already_active=true.
+  // On a fresh cutover (was_already_active=false),
+  // applied_index comes directly from the Raft apply result,
+  // not from reading sidecar.StorageEnvelopeCutoverIndex, so
+  // the defensive branch cannot fire and this field is always
+  // false.
   bool   cutover_index_unknown = 3;
 
   // was_already_active distinguishes a fresh cutover (false:
@@ -737,6 +744,18 @@ until 6D-6 wires it).
   path returns the user payload regardless.
 - **6D-6 (admin RPC)**: stub the FSM, the catalog, and the
   fan-out helper. Test the failure-mode matrix in §8 row-by-row.
+  Specifically pin the idempotent-retry contract: stub a
+  sidecar with `StorageEnvelopeActive=true` and
+  `StorageEnvelopeCutoverIndex=K`, call the RPC, assert the
+  response is gRPC `OK` with `was_already_active=true`,
+  `applied_index=K`, `cutover_index_unknown=false`, and
+  `capability_summary` empty. Plus the §6.4 defensive branch:
+  stub the sidecar at `StorageEnvelopeActive=true` /
+  `StorageEnvelopeCutoverIndex=0` (the operationally-impossible
+  case), call the RPC, assert response is `OK` with
+  `was_already_active=true`, `cutover_index_unknown=true`,
+  and `applied_index = sidecar.RaftAppliedIndex` as the
+  best-effort fallback.
   Integration test: build a single-node cluster, run
   `BootstrapEncryption` then `EnableStorageEnvelope` then a Put,
   read back via gRPC, assert ciphertext on disk via direct
