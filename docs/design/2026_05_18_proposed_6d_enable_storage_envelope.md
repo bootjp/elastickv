@@ -84,7 +84,8 @@ atomic in the user-visible RPC.
     `OpRegistration` and `OpBootstrap` entries); no RPC is
     required. Compare against
     `sidecar.Keys[active_storage_dek_id].LocalEpoch`. Refuse if
-    `sidecar < registry`. This catches a stale node restarted
+    `sidecar <= registry` (strict-ahead — see §5.2 for the
+    equality-case rationale). This catches a stale node restarted
     on a sidecar older than the cluster's writer registry (e.g.
     sidecar restored from an old backup). Same
     local-state-only posture as `ErrNodeIDCollision`: the
@@ -168,9 +169,35 @@ defense-in-depth posture used by `RotateSubRotateDEK`):
 
 The cutover stays on `OpRotation = 0x05` per the parent design's
 §5.5 opcode table. Old binaries that don't understand `SubTag =
-0x01` halt apply on the existing "unknown sub-tag" branch of
-`ApplyRotation` (the parent doc's "old binaries fall through with
-no matching case" safety property still applies).
+0x04` halt the apply on the existing "unknown sub-tag" branch of
+`ApplyRotation` (the parent doc's "old binaries fall through
+with no matching case" safety property still applies; the
+already-shipped `SubTag = 0x01` for `RotateSubRotateDEK` is
+unaffected). For the cluster to reach the point of proposing the
+cutover, the Voters ∪ Learners capability gate has already
+confirmed every member runs a binary that knows the new sub-tag.
+
+**Two-site whitelist change required in 6D-4.** The decoder side
+of the wire-format check is currently in
+`internal/encryption/fsmwire/wire.go::readRotationSubTag`, which
+returns `ErrFSMWireSubtag` for any sub-tag other than
+`RotateSubRotateDEK` (`wire.go:499`). The decoder rejects the
+payload BEFORE `ApplyRotation` ever sees it, so a 6D-4
+implementation that adds the new case only to the applier switch
+would still halt every cutover entry with `ErrFSMWireSubtag`.
+Stage 6D-4 must update BOTH sites:
+
+  1. `readRotationSubTag` to whitelist `0x04` alongside `0x01`
+     (the `wire.go:492-493` comment already anticipates this:
+     "later stages (rewrap, retire, enable-flag) will whitelist
+     new values").
+  2. `ApplyRotation`'s sub-tag switch in
+     `internal/encryption/applier.go` to dispatch the new
+     sub-tag to the cutover handler.
+
+The same two-site change applies to every future sub-tag
+addition (`rewrap-deks`, `retire-dek`, `enable-raft-envelope`)
+— a single-site fix would silently regress the others.
 
 ## 3. Admin RPC API
 
@@ -518,7 +545,7 @@ by construction.
 |---|---|---|---|
 | **6D-1** | This design doc | First | Doc-only; reviewable as a self-contained record |
 | **6D-2** | 6C-3 startup guards (`ErrNodeIDCollision` + `ErrLocalEpochRollback`) | Second | Cluster-wide guards bundled per parent doc §6C-3. No mutator changes. |
-| **6D-3** | Capability fan-out helper in `internal/admin/` | Third | Used by both the cutover RPC (6D-5) and Stage 6E. Standalone unit-testable. |
+| **6D-3** | Capability fan-out helper in `internal/admin/` | Third | Used by the cutover RPC (6D-6) and reused later by Stage 6E. Standalone unit-testable. |
 | **6D-4** | Wire format addition: `RotateSubEnableStorageEnvelope = 0x04` + `ApplyRotation` sub-tag dispatch (writes `StorageEnvelopeActive=true` in sidecar) | Fourth | No CLI, no §6.2 hookup yet. FSM-level testable with the existing applier_test patterns. Operator-inert at this point. |
 | **6D-5** | §6.2 storage-layer toggle (PutAt reads `StorageEnvelopeActive`) | Fifth | The §4.1 envelope encoder is already in `lsm_store.go`; this PR wires the toggle in front of it. Independent unit tests. Still operator-inert until 6D-6. |
 | **6D-6** | `EnableStorageEnvelope` admin RPC + CLI command + integration test | Sixth | Composes 6D-3 + 6D-4 + 6D-5 into the user-visible cutover. End-to-end test exercises a single-node cluster doing Bootstrap → EnableStorageEnvelope → Put → read-back-via-envelope. |
@@ -668,11 +695,15 @@ until 6D-6 wires it).
 3. **Fan-out helper location.** `internal/admin/` keeps it close
    to the gRPC server. An alternative is
    `internal/encryption/capability_fanout.go` — but the helper
-   is reused by Stage 6E (raft envelope cutover) and the
-   6C-3 startup guard (`ErrNodeIDCollision`), which are not
-   strictly encryption-internal. Picking `internal/admin/`
-   matches the existing
-   `internal/admin/config.go` precedent for shared admin
+   is reused by Stage 6E (raft envelope cutover), which is not
+   strictly encryption-internal at the call-site level (Stage 6E
+   threads through the admin RPC machinery the same way Stage
+   6D does). The 6C-3 `ErrNodeIDCollision` startup guard does
+   NOT reuse this helper — it consults the local route-catalog
+   snapshot directly because the startup-guard phase has no
+   gRPC server up. Picking `internal/admin/` matches the
+   existing `internal/admin/config.go` precedent for shared
+   admin
    helpers.
 
 If a reviewer disagrees with any of these, the discussion lives
