@@ -197,8 +197,10 @@ defense-in-depth posture used by `RotateSubRotateDEK`):
    "concurrent-overlap" race the codex finding identifies is
    bounded to "at most one cutover entry can be in flight at a
    time across all in-flight admin RPCs". Subsequent RPCs hit
-   the §3.2 `AlreadyExists` path with the original
-   `StorageEnvelopeCutoverIndex` from §6.4.
+   the §3.2 idempotent-retry path (gRPC OK with
+   `was_already_active=true` and `applied_index =
+   sidecar.StorageEnvelopeCutoverIndex` from §6.4 — see
+   §11.2 for why OK rather than AlreadyExists).
 
 ### 2.2 No new opcode
 
@@ -401,7 +403,7 @@ the rationale):
 | Sidecar missing or `Active.Storage == 0` | `FailedPrecondition` | new `ErrEncryptionNotBootstrapped` |
 | Already active (idempotent retry path) | `OK` | response's `was_already_active=true` and `applied_index = sidecar.StorageEnvelopeCutoverIndex` (the original cutover, §6.4). The OK code is intentional (see §3.2 step 5 + §11.2): unary gRPC drops the response body on non-OK status, so the idempotency contract must live on the success path. The CLI distinguishes the two outcomes by reading `was_already_active`. |
 | Capability fan-out failed | `FailedPrecondition` | new `ErrCapabilityCheckFailed` (lists offending node IDs) |
-| Apply halted (`SubTag` decode, idempotency, etc.) | `Internal` | existing `ErrEncryptionApply` |
+| Apply halted (`SubTag` decode error, `Purpose != Storage`, `Wrapped != nil`, etc.) | `Internal` | existing `ErrEncryptionApply`. The duplicate-cutover-entry case is NOT in this row — §2.1 constraint #4 defines it as a benign consumed no-op (the cutover applier returns nil; nothing halts). |
 
 ## 4. Voters ∪ Learners capability fan-out
 
