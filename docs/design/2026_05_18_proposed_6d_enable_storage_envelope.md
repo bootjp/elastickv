@@ -480,11 +480,18 @@ returns ErrCapabilityCheckFailed."
 ### 5.1 `ErrNodeIDCollision`
 
 **What it catches.** The §4.1 GCM nonce field is 16 bits of
-`node_id` || 16 bits of `local_epoch` || 32 bits of counter.
-`node_id` is derived as `xxhash(full_node_id) & 0xFFFF`. Two
-nodes whose `full_node_id`s happen to hash to the same 16-bit
-slice will reuse nonces under the same DEK with high probability
-within a single epoch — catastrophic for AES-GCM.
+`node_id` || 16 bits of `local_epoch` || 64 bits of counter.
+`node_id` is derived as `uint16(full_node_id)` — the LOW 16
+bits of the FNV-1a 64-bit node-id hash. This matches the
+already-shipped writer-registry keying
+(`uint16(full_node_id)` per `internal/encryption/applier.go`
+and `adapter/encryption_admin.go`); the guard MUST use the
+same narrowing or it would check a different 16-bit space
+than the one actually used for nonce uniqueness — missing
+real collisions and reporting false ones. Two nodes whose
+`full_node_id`s happen to share the same low 16 bits will
+reuse nonces under the same DEK with high probability within
+a single epoch — catastrophic for AES-GCM.
 
 **When it fires.** At startup, immediately AFTER the §9.1 6C-2d
 gap guard (i.e. after the engine is opened) and BEFORE any
@@ -494,7 +501,10 @@ gRPC server starts serving.
 1. Read every voter+learner full_node_id from the local route-catalog
    snapshot (the default group's catalog is the authority for
    this — same scope rule as the 6C-2d guard).
-2. For each, compute `node_id := xxhash(full_node_id) & 0xFFFF`.
+2. For each, compute `node_id := uint16(full_node_id)` (the
+   low 16 bits — matching the writer-registry's existing
+   `uint16(full_node_id)` keying so the collision-detection
+   space is identical to the nonce-uniqueness space).
 3. If any two distinct `full_node_id`s map to the same `node_id`,
    return `pkgerrors.WithDetail(ErrNodeIDCollision, ...)`.
 
@@ -512,7 +522,8 @@ route-catalog snapshot is empty (e.g. fresh single-node
 cluster pre-bootstrap; nothing to compare yet).
 
 **Collision probability and mitigation.** A 16-bit `node_id`
-derived via `xxhash(full_node_id) & 0xFFFF` carries a
+derived via `uint16(full_node_id)` (the low 16 bits of the
+existing FNV-1a 64-bit node-id hash) carries a
 birthday-bound collision risk of approximately
 `N·(N−1) / (2·2¹⁶)` for N members — concretely
 about **0.8% at N=32, about 12.5% at N=128, about 50% at
@@ -541,7 +552,7 @@ fires:
 
   2. **Coordinated ID assignment** (cluster-wide convention).
      For new deployments, the operator can pre-compute the
-     16-bit hash for each candidate `full_node_id` and only
+     low 16 bits of each candidate `full_node_id` and only
      accept assignments that maintain a collision-free set.
      The 6D-2 CLI will ship a probe subcommand
      (`elastickv-admin encryption probe-node-id
