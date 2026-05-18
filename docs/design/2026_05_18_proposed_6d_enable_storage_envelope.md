@@ -534,10 +534,36 @@ the 6C-2d gap guard, before serving).
 
 **Skip conditions.** Skip when `encryptionEnabled == false`.
 Skip when `sidecar.Active.Storage == 0` (bootstrap not yet
-committed; no DEK to compare against). Skip when the
-writer-registry has no record for this node yet (a freshly
-joined learner that hasn't proposed a `RegisterEncryptionWriter`
-yet).
+committed; no DEK to compare against).
+
+**Missing-registry-row posture.** When `encryptionEnabled ==
+true` AND `sidecar.Active.Storage != 0` AND the local
+writer-registry has no row for `(full_node_id,
+active_storage_dek_id)`, the guard splits behaviour on the
+§6.4 `sidecar.StorageEnvelopeActive` field:
+
+  - If `StorageEnvelopeActive == false` (pre-cutover): allow
+    startup. This is the legitimate freshly-joined-learner
+    case — the node has applied the `OpBootstrap` entry (so
+    `Active.Storage != 0`) but its own
+    `RegisterEncryptionWriter` proposal has not been applied
+    yet. The cluster is not yet generating encrypted-storage
+    nonces, so there's no nonce-reuse risk to anchor against.
+    The first write attempt after `RegisterEncryptionWriter`
+    commits will establish the registry row, and the next
+    restart will exercise the strict-ahead check.
+  - If `StorageEnvelopeActive == true` (post-cutover): REFUSE
+    with `ErrLocalEpochRollback` wrapped with a
+    `missing_registry_row = true` detail. Once the cutover has
+    fired, every active node MUST have a registry row before
+    issuing any new GCM nonce under the active DEK; allowing a
+    rowless node to start would let it issue nonces from
+    `local_epoch=0` with no rollback anchor, recycling the
+    nonce space the original registration was supposed to
+    pin. Operators recover by replaying `RegisterEncryptionWriter`
+    for this node (the registration is idempotent under §4.1
+    case-2), after which the row is present and the guard
+    passes.
 
 ### 5.3 Why both guards bundle here
 
@@ -715,9 +741,18 @@ until 6D-6 wires it).
   case would replay the same `(node_id, local_epoch)` prefix and
   reuse the counter under the same DEK). Sidecar strictly
   greater than registry → nil. `encryptionEnabled == false` →
-  nil. Bootstrap not committed → nil. Writer-registry has no
-  record for this node → nil (freshly joined learner that
-  hasn't proposed a `RegisterEncryptionWriter` yet).
+  nil. Bootstrap not committed → nil. **Writer-registry has no
+  record AND `StorageEnvelopeActive == false`** → nil (freshly
+  joined learner that hasn't proposed a
+  `RegisterEncryptionWriter` yet; the cluster is pre-cutover so
+  no encrypted-storage nonces are being issued). **Writer-registry
+  has no record AND `StorageEnvelopeActive == true`** → expect
+  startup-guard error with `missing_registry_row = true` in the
+  wrapped detail; the §5.2 missing-registry-row posture refuses
+  startup because a rowless node post-cutover would issue
+  nonces from `local_epoch=0` with no rollback anchor (operator
+  recovers by replaying `RegisterEncryptionWriter` for this
+  node, which is idempotent per §4.1 case-2).
 - **6D-3 (fan-out)**: stub the `DialFunc` with a table-driven
   test of (every-capable, one-not-capable, one-unreachable,
   duplicate-nodes-deduplicated). Confirm `FanoutResult.OK`
