@@ -66,6 +66,20 @@ func (r *Registry) Gatherer() prometheus.Gatherer {
 	return r.gatherer
 }
 
+// Registerer exposes the label-wrapped registerer for callers that
+// own a metric source whose lifecycle does not fit the
+// newXxxMetrics(registerer) pattern in NewRegistry — currently the
+// Redis adapter's Lua VM pool, which materializes inside
+// NewRedisServer and registers via CounterFunc / GaugeFunc at that
+// point. Returns nil if r is nil so callers can dereference safely
+// in test fixtures.
+func (r *Registry) Registerer() prometheus.Registerer {
+	if r == nil {
+		return nil
+	}
+	return r.registerer
+}
+
 // DynamoDBObserver returns the DynamoDB request observer backed by this registry.
 func (r *Registry) DynamoDBObserver() DynamoDBRequestObserver {
 	if r == nil {

@@ -1737,6 +1737,314 @@
       ],
       "title": "Hot Path (legacy PR #560)",
       "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 71
+      },
+      "id": 24,
+      "panels": [
+        {
+          "datasource": "$datasource",
+          "description": "Idle *lua.LState count retained by each node's bounded Lua VM pool (elastickv_lua_pool_idle) plotted against the configured cap (elastickv_lua_pool_max_idle). Idle staying pinned at MaxIdle for sustained periods + non-zero Drops below = pool is undersized; raise --redisLuaMaxIdleStates. Idle hovering near zero with no Drops = pool is right-sized or workload is below capacity.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "stepAfter",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "short"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "max_idle.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "dash": [
+                        10,
+                        10
+                      ],
+                      "fill": "dash"
+                    }
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "red",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 0
+          },
+          "id": 240,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "elastickv_lua_pool_idle{job=\"elastickv\"}",
+              "legendFormat": "idle {{node_id}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "elastickv_lua_pool_max_idle{job=\"elastickv\"}",
+              "legendFormat": "max_idle {{node_id}}",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Lua VM Pool — Idle vs MaxIdle",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Rate of Lua VM pool outcomes: hits (get served from pool), misses (get had to allocate), drops (put rejected because pool full). Steady-state hits >> misses means the pool is doing its job; a sustained drops rate means --redisLuaMaxIdleStates is too low.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisPlacement": "auto",
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "showPoints": "auto"
+              },
+              "unit": "ops"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "drops.*"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "fixedColor": "red",
+                      "mode": "fixed"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "id": 241,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_hits_total{job=\"elastickv\"}[5m]))",
+              "legendFormat": "hits {{node_id}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_misses_total{job=\"elastickv\"}[5m]))",
+              "legendFormat": "misses {{node_id}}",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_drops_total{job=\"elastickv\"}[5m]))",
+              "legendFormat": "drops {{node_id}}",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "Lua VM Pool — Hits / Misses / Drops Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Cluster-wide Lua VM pool drops over the dashboard time range. Non-zero values mean at least one node's pool overflowed — raise --redisLuaMaxIdleStates on the affected nodes.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "orange",
+                    "value": 1
+                  },
+                  {
+                    "color": "red",
+                    "value": 100
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 0,
+            "y": 8
+          },
+          "id": 242,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto"
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "sum by (node_id) (increase(elastickv_lua_pool_drops_total{job=\"elastickv\"}[$__range]))",
+              "legendFormat": "{{node_id}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Drops over Range (per Node)",
+          "type": "stat"
+        },
+        {
+          "datasource": "$datasource",
+          "description": "Lua VM pool saturation = idle / max_idle, per node. 100% means the pool is fully populated (every put() is at risk of dropping). Sustained 100% + non-zero Drops rate = raise --redisLuaMaxIdleStates.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "max": 1,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.8
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 6,
+            "w": 16,
+            "x": 8,
+            "y": 8
+          },
+          "id": 243,
+          "options": {
+            "displayMode": "gradient",
+            "minVizHeight": 10,
+            "minVizWidth": 0,
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showUnfilled": true
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "datasource": "$datasource",
+              "editorMode": "code",
+              "expr": "elastickv_lua_pool_idle{job=\"elastickv\"} / elastickv_lua_pool_max_idle{job=\"elastickv\"}",
+              "legendFormat": "{{node_id}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Pool Saturation (idle / max_idle)",
+          "type": "bargauge"
+        }
+      ],
+      "title": "Lua VM Pool",
+      "type": "row"
     }
   ],
   "refresh": "10s",
