@@ -817,7 +817,17 @@ until 6D-6 wires it).
   deduplicated.
 - **6D-4 (sub-tag dispatch)**: extend `applier_test.go` —
   invalid `Wrapped != nil` → halt apply. Invalid `Purpose` →
-  halt apply. Mismatched `DEKID` → halt apply. Happy path
+  halt apply. **Mismatched `DEKID` (cutover proposed against
+  DEK A but `RotateDEK` committed to DEK B between propose
+  and apply) → NOT a halt; the apply path consumes the entry
+  as a benign no-op (advance `RaftAppliedIndex`, do NOT flip
+  `StorageEnvelopeActive`, record the entry as a
+  `ErrCutoverDEKIDStale` outcome on the §6.4 detail
+  ride-along). Asserting halt-apply here would re-introduce
+  the cluster-stopping behaviour §2.1 constraint #3 explicitly
+  refuses; the mutator translates the stale-outcome detail
+  into a retryable `FailedPrecondition` for the operator.**
+  Happy path
   (apply at raft index K) → `StorageEnvelopeActive` flips
   true, `StorageEnvelopeCutoverIndex == K` (the §6.4
   idempotency token — assertion is load-bearing: without it,
