@@ -2,6 +2,7 @@ package encryption_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -55,17 +56,42 @@ func seedRegistry(t *testing.T, full uint64, lastSeen uint16) *stubRegistryStore
 	return reg
 }
 
-// TestCheckLocalEpochRollback_NoRow pins the freshly-joined-
-// learner skip: the registry has no row for
-// (full_node_id, active_storage_dek_id), so the primitive must
-// return nil per §5.2 skip-condition. The §4.1 case-1 first-seen
-// branch will create the row on the next encrypted write.
-func TestCheckLocalEpochRollback_NoRow(t *testing.T) {
+// TestCheckLocalEpochRollback_NoRow_PreCutover pins the
+// freshly-joined-learner skip per §5.2 of the 6D design doc:
+// with storageEnvelopeActive=false (pre-cutover) AND no
+// registry row, the primitive returns nil. The §4.1 case-1
+// first-seen branch will create the row on the next
+// encrypted write.
+func TestCheckLocalEpochRollback_NoRow_PreCutover(t *testing.T) {
 	t.Parallel()
 	reg := &stubRegistryStore{rows: map[string][]byte{}}
-	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 42)
+	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 42, false)
 	if err != nil {
-		t.Errorf("no-row case: want nil, got %v", err)
+		t.Errorf("no-row + pre-cutover: want nil, got %v", err)
+	}
+}
+
+// TestCheckLocalEpochRollback_NoRow_PostCutover pins the
+// post-cutover refusal per §5.2 of the 6D design doc: with
+// storageEnvelopeActive=true (post-cutover) AND no registry
+// row, encrypted writes are happening cluster-wide but this
+// node has no rollback anchor to compare its sidecar against.
+// The primitive returns ErrLocalEpochRollback wrapped with a
+// missing-row diagnostic.
+//
+// Codex r1 P2 specifically flagged that collapsing the
+// missing-row case to nil unconditionally would let a node
+// start without a nonce-reuse guardrail when the cutover is
+// active. This test pins the fix.
+func TestCheckLocalEpochRollback_NoRow_PostCutover(t *testing.T) {
+	t.Parallel()
+	reg := &stubRegistryStore{rows: map[string][]byte{}}
+	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 42, true)
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("no-row + post-cutover: want ErrLocalEpochRollback, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "storage_envelope_active=true") {
+		t.Errorf("error must mention storage_envelope_active=true context: %v", err)
 	}
 }
 
@@ -75,7 +101,7 @@ func TestCheckLocalEpochRollback_NoRow(t *testing.T) {
 func TestCheckLocalEpochRollback_SidecarStrictlyAhead(t *testing.T) {
 	t.Parallel()
 	reg := seedRegistry(t, 0xAAAA, 10)
-	if err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 11); err != nil {
+	if err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 11, false); err != nil {
 		t.Errorf("sidecar=11 > registry=10: want nil, got %v", err)
 	}
 }
@@ -86,7 +112,7 @@ func TestCheckLocalEpochRollback_SidecarStrictlyAhead(t *testing.T) {
 func TestCheckLocalEpochRollback_SidecarLessThan(t *testing.T) {
 	t.Parallel()
 	reg := seedRegistry(t, 0xAAAA, 42)
-	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 10)
+	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 10, false)
 	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
 		t.Fatalf("sidecar=10 < registry=42: want ErrLocalEpochRollback, got %v", err)
 	}
@@ -100,7 +126,7 @@ func TestCheckLocalEpochRollback_SidecarLessThan(t *testing.T) {
 func TestCheckLocalEpochRollback_SidecarEqual(t *testing.T) {
 	t.Parallel()
 	reg := seedRegistry(t, 0xAAAA, 42)
-	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 42)
+	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 42, false)
 	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
 		t.Fatalf("sidecar=42 == registry=42: want ErrLocalEpochRollback, got %v", err)
 	}
@@ -114,7 +140,7 @@ func TestCheckLocalEpochRollback_PebbleError(t *testing.T) {
 	t.Parallel()
 	pebbleErr := errors.New("simulated pebble corruption")
 	reg := &stubRegistryStore{getErr: pebbleErr}
-	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 10)
+	err := encryption.CheckLocalEpochRollback(reg, 0xAAAA, 1, 10, false)
 	if err == nil {
 		t.Fatal("pebble error: want error, got nil")
 	}
@@ -145,7 +171,7 @@ func TestCheckLocalEpochRollback_NarrowingMatchesShippedConvention(t *testing.T)
 	// Look up with a different full_node_id that ALSO narrows
 	// to 0xAAAA. Same registry row should be hit; sidecar=10 <
 	// registry=50 should fire ErrLocalEpochRollback.
-	err := encryption.CheckLocalEpochRollback(reg, 0xCAFEBABE_0000AAAA, 1, 10)
+	err := encryption.CheckLocalEpochRollback(reg, 0xCAFEBABE_0000AAAA, 1, 10, false)
 	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
 		t.Fatalf("narrowing-match: want ErrLocalEpochRollback, got %v", err)
 	}

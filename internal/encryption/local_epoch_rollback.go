@@ -41,26 +41,44 @@ import (
 //   - Sidecar's `Active.Storage == 0` (bootstrap not yet
 //     committed; no DEK to compare against).
 //
-// Skip condition handled HERE (inside the primitive):
+// Missing-registry-row split — `storageEnvelopeActive` parameter:
 //
-//   - The writer-registry has no row for
-//     `(full_node_id, active_storage_dek_id)`. A freshly-joined
-//     learner that has not yet proposed a
-//     `RegisterEncryptionWriter` legitimately lacks a registry
-//     row; the §4.1 case-1 first-seen monotonicity branch will
-//     create it on the next encrypted write. Returning nil here
-//     preserves that lifecycle.
+// §5.2 of the 6D design doc splits the missing-row behaviour on
+// whether the storage envelope cutover has fired:
+//
+//   - PRE-cutover (`storageEnvelopeActive == false`): missing
+//     row is the freshly-joined-learner lifecycle state. The
+//     node has not yet proposed a `RegisterEncryptionWriter`
+//     and the §4.1 case-1 first-seen branch will create the
+//     row on the next encrypted write. Allow startup.
+//
+//   - POST-cutover (`storageEnvelopeActive == true`): missing
+//     row means there is NO rollback anchor to compare the
+//     sidecar against, but encrypted writes are already
+//     happening cluster-wide under the active storage DEK.
+//     The node could start issuing nonces with no
+//     monotonicity guard, which is the exact failure mode the
+//     guard exists to prevent. Refuse startup with
+//     `ErrLocalEpochRollback` wrapped with a "missing
+//     registry row with active envelope" diagnostic.
+//
+// Pebble I/O errors from the registry read propagate as wrapped
+// errors NOT classified as `ErrLocalEpochRollback` (operator
+// triages transport failure separately from a real rollback).
 //
 // Returns `ErrLocalEpochRollback` wrapped with both observed
-// values when `sidecar <= registry`. Returns the wrapped
-// underlying error (NOT marked with `ErrLocalEpochRollback`) on
-// a Pebble I/O error from the registry read so the operator
-// triages a transport failure separately from a real rollback.
+// values when `sidecar <= registry`. Returns
+// `ErrLocalEpochRollback` wrapped with a missing-row
+// diagnostic when the row is absent AND
+// `storageEnvelopeActive == true`. Returns nil when the row is
+// absent AND `storageEnvelopeActive == false` (pre-cutover
+// freshly-joined learner) or when `sidecar > registry`.
 func CheckLocalEpochRollback(
 	registry WriterRegistryStore,
 	fullNodeID uint64,
 	activeStorageDEKID uint32,
 	sidecarLocalEpoch uint16,
+	storageEnvelopeActive bool,
 ) error {
 	key := RegistryKey(activeStorageDEKID, uint16(fullNodeID&nodeIDMask)) //nolint:gosec // masked to 16 bits; matches applier.go convention
 	rawVal, ok, err := registry.GetRegistryRow(key)
@@ -70,10 +88,20 @@ func CheckLocalEpochRollback(
 			fullNodeID, activeStorageDEKID)
 	}
 	if !ok {
-		// Freshly-joined learner with no registry row yet. Per
-		// §5.2 skip-condition, this is a legitimate lifecycle
-		// state — the first encrypted write will create the row
-		// via §4.1 case-1 first-seen.
+		if storageEnvelopeActive {
+			// Post-cutover: missing row means no rollback
+			// anchor exists, but encrypted writes are happening.
+			// Refuse to start; the node cannot prove nonce
+			// monotonicity without a registry record to compare
+			// against.
+			return pkgerrors.Wrapf(ErrLocalEpochRollback,
+				"writer-registry has no row for full_node_id=%#x dek_id=%d but storage_envelope_active=true; cannot prove nonce monotonicity for the active DEK",
+				fullNodeID, activeStorageDEKID)
+		}
+		// Pre-cutover: freshly-joined learner that has not yet
+		// proposed a `RegisterEncryptionWriter`. The §4.1
+		// case-1 first-seen branch will create the row on the
+		// next encrypted write.
 		return nil
 	}
 	registryRow, err := DecodeRegistryValue(rawVal)
