@@ -224,8 +224,8 @@ message EnableStorageEnvelopeRequest {
 message EnableStorageEnvelopeResponse {
   // applied_index is the raft index of the cutover entry. On a
   // freshly-successful call this is the entry the leader just
-  // proposed and waited to apply. On a retried call that returns
-  // AlreadyExists, this is the recorded
+  // proposed and waited to apply. On a retried call (see
+  // was_already_active below), this is the recorded
   // sidecar.StorageEnvelopeCutoverIndex from the ORIGINAL
   // cutover (see §6.4) — stable across arbitrary subsequent
   // encryption-relevant Raft activity.
@@ -236,8 +236,9 @@ message EnableStorageEnvelopeResponse {
   // Lets the operator see the membership view the leader used to
   // approve the cutover — useful for post-mortem if the leader's
   // route-catalog view diverges from the operator's expectation.
-  // Empty on AlreadyExists retries (the membership view of the
-  // original cutover is not retained).
+  // Empty on idempotent retries (was_already_active=true);
+  // the membership view of the original cutover is not
+  // retained.
   repeated CapabilityVerdict capability_summary = 2;
 
   // cutover_index_unknown is set by the defensive branch
@@ -250,6 +251,22 @@ message EnableStorageEnvelopeResponse {
   // sidecar.RaftAppliedIndex as a best-effort fallback. The
   // CLI surfaces it as a warning.
   bool   cutover_index_unknown = 3;
+
+  // was_already_active distinguishes a fresh cutover (false:
+  // this call proposed the entry and waited for apply) from
+  // an idempotent retry (true: the cutover had already been
+  // applied before this call; applied_index carries the
+  // ORIGINAL cutover index from sidecar.StorageEnvelopeCutoverIndex).
+  //
+  // The gRPC status code is OK in both cases, NOT
+  // AlreadyExists. Returning AlreadyExists would set the
+  // status to non-OK, and unary gRPC drops the response
+  // message body on non-OK status (the generated `(*Response,
+  // error)` shape only delivers the message when err == nil).
+  // The idempotency contract therefore lives on the success
+  // path with this boolean as the discriminator. The CLI
+  // prints a different message for the two cases.
+  bool   was_already_active = 4;
 }
 
 message CapabilityVerdict {
@@ -279,17 +296,24 @@ leader. Server-side sequence:
    "DEK bootstrap if necessary" reads as a separate explicit
    command in 6D.
 5. Verify sidecar.StorageEnvelopeActive == false — if already
-   active, return AlreadyExists with
-   sidecar.StorageEnvelopeCutoverIndex (the original cutover
-   entry's apply index, recorded by §6.4) as the response's
-   applied_index. This is stable across subsequent
-   encryption-relevant Raft entries that advance the generic
-   RaftAppliedIndex. See §6.4 for the
+   active, return gRPC OK with was_already_active=true and
+   applied_index = sidecar.StorageEnvelopeCutoverIndex (the
+   original cutover entry's apply index, recorded by §6.4).
+   This is stable across subsequent encryption-relevant Raft
+   entries that advance the generic RaftAppliedIndex. The OK
+   status is load-bearing: returning AlreadyExists would set
+   the gRPC status to non-OK, and unary gRPC drops the
+   response message body on non-OK status — so applied_index
+   would be unreachable to the client. See §6.4 for the
    `cutover_index_unknown = true` defensive-branch fallback
    when StorageEnvelopeCutoverIndex == 0 on a sidecar that
    also reports StorageEnvelopeActive == true
    (operationally impossible under normal apply but hedged
    against future schema rollback / hand-edited sidecar).
+   Skip step 6 (capability fan-out) on the
+   was_already_active=true path — the original cutover already
+   passed the gate; re-running it would add latency to
+   no-op calls.
 6. Run the Voters ∪ Learners capability fan-out (§4). On any
    member reporting encryption_capable=false or unreachable
    within one election timeout, return
@@ -302,14 +326,16 @@ leader. Server-side sequence:
    capability_summary.
 ```
 
-Server-side failure modes (each maps to a typed wrapped error):
+Server-side outcomes (failure cases map to a typed wrapped
+error; the idempotent-retry case is a success — see §11.2 for
+the rationale):
 
-| Cause | gRPC code | Wrapped sentinel |
+| Cause | gRPC code | Wrapped sentinel / discriminator |
 |---|---|---|
 | Encryption disabled / KEK absent | `FailedPrecondition` | existing 6B `ErrEncryptionMutatorsDisabled` |
 | Caller is a follower | `FailedPrecondition` | existing `ErrNotLeader` |
 | Sidecar missing or `Active.Storage == 0` | `FailedPrecondition` | new `ErrEncryptionNotBootstrapped` |
-| Already active (idempotent retry path) | `AlreadyExists` | new `ErrStorageEnvelopeAlreadyActive` (response's `applied_index` = `sidecar.StorageEnvelopeCutoverIndex` from §6.4 — stable across subsequent encryption activity) |
+| Already active (idempotent retry path) | `OK` | response's `was_already_active=true` and `applied_index = sidecar.StorageEnvelopeCutoverIndex` (the original cutover, §6.4). The OK code is intentional (see §3.2 step 5 + §11.2): unary gRPC drops the response body on non-OK status, so the idempotency contract must live on the success path. The CLI distinguishes the two outcomes by reading `was_already_active`. |
 | Capability fan-out failed | `FailedPrecondition` | new `ErrCapabilityCheckFailed` (lists offending node IDs) |
 | Apply halted (`SubTag` decode, idempotency, etc.) | `Internal` | existing `ErrEncryptionApply` |
 
@@ -603,17 +629,22 @@ write-and-rename protocol — a crash mid-apply leaves either the
 pre-cutover sidecar or the post-cutover sidecar on disk, never
 a torn mix.
 
-**Idempotency contract for `AlreadyExists`.** The Stage 6D-6
-RPC handler reads `sc.StorageEnvelopeCutoverIndex` directly
-when returning `ErrStorageEnvelopeAlreadyActive` to a retried
-call. Because that field is set at apply time and never
-re-written by later encryption entries (only the cutover
-entry's apply sets it), the response carries the **original**
-cutover index regardless of how many subsequent
-encryption-relevant Raft entries have advanced
-`RaftAppliedIndex`. Operators and automation can use this as a
-stable idempotency token across arbitrary cluster activity
-following the original cutover.
+**Idempotency contract.** The Stage 6D-6 RPC handler reads
+`sc.StorageEnvelopeCutoverIndex` directly when responding to
+a retried call. The response carries gRPC status OK with
+`was_already_active = true` and `applied_index =
+sc.StorageEnvelopeCutoverIndex`. (The intuitive gRPC code
+would be `AlreadyExists`, but unary gRPC drops the response
+message body on non-OK status, so the idempotency contract
+must live on the success path with `was_already_active` as
+the discriminator — see §11.2.) Because the cutover-index
+field is set at apply time and never re-written by later
+encryption entries (only the cutover entry's apply sets it),
+the response carries the **original** cutover index
+regardless of how many subsequent encryption-relevant Raft
+entries have advanced `RaftAppliedIndex`. Operators and
+automation can use this as a stable idempotency token across
+arbitrary cluster activity following the original cutover.
 
 Older sidecars (pre-6D-4) decode the JSON with the field
 absent, in which case `StorageEnvelopeCutoverIndex` defaults to
@@ -651,7 +682,7 @@ until 6D-6 wires it).
 | Operator runs `enable-storage-envelope` on cluster without KEK | RPC absent — undefined behaviour | `FailedPrecondition: ErrEncryptionMutatorsDisabled` |
 | Operator runs it on follower | RPC absent | `FailedPrecondition: ErrNotLeader` with leader hint |
 | Operator runs it before Bootstrap | RPC absent | `FailedPrecondition: ErrEncryptionNotBootstrapped` |
-| Operator retries after success (idempotent) | RPC absent | `AlreadyExists: ErrStorageEnvelopeAlreadyActive` carrying the original apply index |
+| Operator retries after success (idempotent) | RPC absent | `OK` with `was_already_active=true` and `applied_index = sidecar.StorageEnvelopeCutoverIndex` (the original cutover index). See §3.2 step 5 for why OK rather than AlreadyExists. |
 | One learner unreachable during fan-out | RPC absent | `FailedPrecondition: ErrCapabilityCheckFailed` with that learner's node_id |
 | Two nodes hash to the same `node_id` | Silent — would reuse nonces post-cutover | `ErrNodeIDCollision` at startup, refuse to boot |
 | Sidecar restored from old backup | Silent — would reuse nonces post-restart | `ErrLocalEpochRollback` at startup, refuse to boot |
@@ -691,8 +722,9 @@ until 6D-6 wires it).
   (apply at raft index K) → `StorageEnvelopeActive` flips
   true, `StorageEnvelopeCutoverIndex == K` (the §6.4
   idempotency token — assertion is load-bearing: without it,
-  the §3.2 / §6.4 `AlreadyExists` contract would silently
-  return 0 as the original cutover index), and
+  the §3.2 / §6.4 idempotency contract would silently
+  return 0 as the original cutover index on
+  `was_already_active=true` retries), and
   `RaftAppliedIndex` advances. Idempotent re-apply at a
   later index → no-op (already active);
   `StorageEnvelopeCutoverIndex` stays at K, NOT the
@@ -743,7 +775,8 @@ until 6D-6 wires it).
    does not propose. A leader change mid-cutover is handled by
    the existing `ErrNotLeader` retry path (operator re-runs;
    the new leader sees `StorageEnvelopeActive=true` if the
-   entry already committed, returns `AlreadyExists`).
+   entry already committed, returns OK with
+   `was_already_active=true`).
 
 3. **Performance.** Per-Put overhead post-cutover is one AES-GCM
    seal + 16-byte tag + per-version 1-byte header. Already
@@ -782,12 +815,26 @@ until 6D-6 wires it).
    cutover entry would be interpreted as a malformed RotateDEK
    by pre-6D apply paths).
 
-2. **Idempotency response code.** `AlreadyExists` (gRPC) is
-   technically a "client made a duplicate request" semantic. An
-   alternative is to return `OK` with the existing applied
-   index — same end state for the operator. This doc picks
-   `AlreadyExists` so the CLI can print a different message for
-   "this is already done" vs. "this just succeeded."
+2. **Idempotency response code.** Earlier rounds of this doc
+   picked gRPC `AlreadyExists` for the duplicate-request
+   semantic, but unary gRPC drops the response message body
+   on any non-OK status (the generated `(*Response, error)`
+   shape only delivers the message when `err == nil`).
+   Picking `AlreadyExists` therefore makes the `applied_index`
+   field unreachable on the retry path — the idempotency
+   contract cannot be implemented as written. The doc now
+   picks `OK` with a `was_already_active: bool` discriminator
+   field so the response body carrying the original cutover
+   index is actually delivered to the client. The CLI prints a
+   different message for the two cases based on
+   `was_already_active`. A third alternative — `AlreadyExists`
+   with gRPC error details (`status.Status.details` carrying a
+   proto attachment) — was considered and rejected as more
+   boilerplate without a corresponding benefit: the
+   discriminator-on-success-path approach is idiomatic for
+   the existing CLI patterns and avoids the
+   `status.Details()` unpacking that would otherwise be
+   required.
 
 3. **Fan-out helper location.** `internal/admin/` keeps it close
    to the gRPC server. An alternative is
