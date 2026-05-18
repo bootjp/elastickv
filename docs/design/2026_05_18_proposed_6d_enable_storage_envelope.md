@@ -143,8 +143,9 @@ A rotation entry with `SubTag = 0x04` carries:
 | `Wrapped` | `[]byte` | MUST be empty; the cutover does NOT add a new DEK |
 | `ProposerRegistration` | `RegistrationPayload` | MUST have `DEKID = sidecar.Active.Storage`, `LocalEpoch` ≤ current registry record for that node |
 
-Constraints (validated in both `BootstrapAdmin` mutator before
-propose AND in `ApplyRotation` at apply time, in line with the
+Constraints (validated in both the
+`EnableStorageEnvelope` mutator on the server before propose
+AND in `ApplyRotation` at apply time, in line with the
 defense-in-depth posture used by `RotateSubRotateDEK`):
 
 1. `Purpose == PurposeStorage` — flipping storage envelope ON
@@ -363,12 +364,18 @@ cluster pre-bootstrap; nothing to compare yet).
 
 **Collision probability and mitigation.** A 16-bit `node_id`
 derived via `xxhash(full_node_id) & 0xFFFF` carries a
-birthday-bound collision risk of approximately N²/(2·2¹⁶) for
-N members — concretely ~0.2% at N=32, ~3% at N=128, ~50% at
-N=300. For a typical Raft-replicated cluster (3–7 voters, small
-learner pool) the collision probability is well under 0.01%,
-but the failure mode is "refuse to boot" rather than "silent
-nonce reuse", so a hit is operationally noisy.
+birthday-bound collision risk of approximately
+`N·(N−1) / (2·2¹⁶)` for N members — concretely
+about **0.8% at N=32, about 12.5% at N=128, about 50% at
+N=302** (the canonical √(2·d·ln 2) crossover). The 50%
+point near N≈300 is the relevant threshold for "should we widen
+the field"; small clusters stay well below 1%.
+
+For a typical Raft-replicated cluster (3–7 voters, small
+learner pool) the collision probability is on the order of
+`N²/131072` — under 0.05% for N≤8 — but the failure mode is
+"refuse to boot" rather than "silent nonce reuse", so even a
+rare hit is operationally noisy.
 
 Mitigations available to the operator when `ErrNodeIDCollision`
 fires:
