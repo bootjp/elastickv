@@ -32,9 +32,17 @@ atomic in the user-visible RPC.
 ### In scope (this milestone — 6D)
 
 - **Wire format**: a new sub-tag value
-  `RotateSubEnableStorageEnvelope` (proposed concrete byte:
-  `0x01`, distinct from the existing `RotateSubRotateDEK = 0x00`)
-  on the §5.2 `OpRotation` payload's sub-tag byte. No new opcode;
+  `RotateSubEnableStorageEnvelope` (concrete byte: `0x04`,
+  matching the reservation comment block in
+  `internal/encryption/fsmwire/wire.go` that already declares
+  `0x04 — enable-storage-envelope (Stage 6, §7.1 Phase 1)`)
+  on the §5.2 `OpRotation` payload's sub-tag byte. The existing
+  `RotateSubRotateDEK` is `0x01` (shipped in Stage 4); reusing
+  `0x01` for the cutover would break rolling-upgrade
+  compatibility because pre-6D apply paths would interpret the
+  cutover entry as a malformed RotateDEK (missing wrapped DEK)
+  and halt the FSM. `0x04` is the only byte already reserved
+  for this purpose by the wire-format authority. No new opcode;
   reuses the existing 0x05 rotation pipeline.
 - **`enable-storage-envelope` admin RPC** in
   `proto/encryption_admin.proto` — new `EnableStorageEnvelope`
@@ -58,11 +66,17 @@ atomic in the user-visible RPC.
   `false`, write cleartext with `encryption_state = 0b00`. Read
   path is already dispatch-on-bit and unchanged.
 - **Bundled 6C-3 startup guards**:
-  - `ErrNodeIDCollision` — at startup, fan out `GetCapability` to
-    every Voters ∪ Learners member, hash each member's
-    `full_node_id` to its 16-bit `node_id`, and refuse if any two
-    collide. This protects the §4.1 16-bit nonce field from
-    silent reuse across nodes.
+  - `ErrNodeIDCollision` — at startup, walk the local
+    route-catalog snapshot (the default group's catalog is
+    authoritative — same scope rule as the 6C-2d guard), hash
+    each member's `full_node_id` to its 16-bit `node_id`, and
+    refuse the local node's boot if any two distinct
+    `full_node_id`s collide on the 16-bit slice. This protects
+    the §4.1 16-bit nonce field from silent reuse across nodes.
+    The check is local-snapshot-only — no `GetCapability`
+    fan-out — because the startup-guard phase runs before the
+    gRPC server is up; see §5.1 "Why local-snapshot-only" for
+    the full rationale.
   - `ErrLocalEpochRollback` — at startup, compare the local
     sidecar's per-DEK `local_epoch` against the leader's
     writer-registry record (via the existing `ResyncSidecar`
@@ -87,27 +101,35 @@ atomic in the user-visible RPC.
 
 ### 2.1 New sub-tag on `OpRotation`
 
-Today `fsmwire.RotationPayload.SubTag` carries one value:
+Today `fsmwire.RotationPayload.SubTag` carries one shipping value
+plus a reserved block in the wire package's comment:
 
 ```go
-RotateSubRotateDEK = 0x00
+RotateSubRotateDEK             = 0x01  // Stage 4 (shipped)
+// 0x02 — rewrap-deks       (Stage 9, §5.4 / §5.5)        — reserved
+// 0x03 — retire-dek        (Stage 9, §5.4)               — reserved
+// 0x04 — enable-storage-envelope (Stage 6, §7.1 Phase 1) — reserved
+// 0x05 — enable-raft-envelope    (Stage 6, §7.1 Phase 2) — reserved
 ```
 
-Stage 6D adds:
+Stage 6D promotes the `0x04` reservation to a declared constant:
 
 ```go
-RotateSubEnableStorageEnvelope = 0x01
+RotateSubEnableStorageEnvelope = 0x04
 ```
 
-The byte value is chosen at the low end of the sub-tag space
-deliberately, leaving `0x02..0xFF` free for `enable-raft-envelope`
-(Stage 6E), `retire-dek`, `rewrap-deks`, and future sub-tags.
+The byte matches the existing reservation block; declaring
+`RotateSubEnableStorageEnvelope = 0x01` would collide with the
+already-shipped `RotateSubRotateDEK` and break rolling-upgrade
+compatibility (pre-6D apply paths reading a cutover entry as a
+RotateDEK would halt the FSM on the missing wrapped DEK
+constraint).
 
-A rotation entry with `SubTag = 0x01` carries:
+A rotation entry with `SubTag = 0x04` carries:
 
 | Field | Type | Notes |
 |---|---|---|
-| `SubTag` | `uint8` | `0x01` |
+| `SubTag` | `uint8` | `0x04` |
 | `Purpose` | `uint8` | MUST be `PurposeStorage` (`0x01`); any other value → halt apply with `ErrEncryptionApply` |
 | `DEKID` | `uint32` | MUST equal `sidecar.Active.Storage` at the leader at propose time; the applier re-checks at apply time |
 | `Wrapped` | `[]byte` | MUST be empty; the cutover does NOT add a new DEK |
@@ -271,15 +293,16 @@ transport machinery is required.
 
 The cutover RPC handler calls `CapabilityFanout` once and rejects
 the proposal if `Result.OK` is false. The 6C-3
-`ErrNodeIDCollision` startup guard (§5) reuses the same helper
-at startup — it walks the verdicts and refuses the local node's
-boot if it sees two members hash to the same 16-bit `node_id`.
+`ErrNodeIDCollision` startup guard does **not** reuse this helper
+— see §5.1 below. The startup guard runs before the gRPC server
+is up so it cannot dial peers; it walks the local route-catalog
+snapshot instead. `CapabilityFanout` is exclusively for the
+cutover-RPC handler path, where the gRPC server is already
+serving and outbound connections to peers are usable.
 
 The helper deliberately does NOT cache results. The parent
 design pins fresh probing per cutover: "stale cached capability
-state cannot trigger a premature cutover." A startup-time call
-is also fresh by definition (the helper has no persistent
-state).
+state cannot trigger a premature cutover."
 
 ### 4.3 Timeout choice
 
@@ -429,7 +452,7 @@ by construction.
 | **6D-1** | This design doc | First | Doc-only; reviewable as a self-contained record |
 | **6D-2** | 6C-3 startup guards (`ErrNodeIDCollision` + `ErrLocalEpochRollback`) | Second | Cluster-wide guards bundled per parent doc §6C-3. No mutator changes. |
 | **6D-3** | Capability fan-out helper in `internal/admin/` | Third | Used by both the cutover RPC (6D-5) and Stage 6E. Standalone unit-testable. |
-| **6D-4** | Wire format addition: `RotateSubEnableStorageEnvelope = 0x01` + `ApplyRotation` sub-tag dispatch (writes `StorageEnvelopeActive=true` in sidecar) | Fourth | No CLI, no §6.2 hookup yet. FSM-level testable with the existing applier_test patterns. Operator-inert at this point. |
+| **6D-4** | Wire format addition: `RotateSubEnableStorageEnvelope = 0x04` + `ApplyRotation` sub-tag dispatch (writes `StorageEnvelopeActive=true` in sidecar) | Fourth | No CLI, no §6.2 hookup yet. FSM-level testable with the existing applier_test patterns. Operator-inert at this point. |
 | **6D-5** | §6.2 storage-layer toggle (PutAt reads `StorageEnvelopeActive`) | Fifth | The §4.1 envelope encoder is already in `lsm_store.go`; this PR wires the toggle in front of it. Independent unit tests. Still operator-inert until 6D-6. |
 | **6D-6** | `EnableStorageEnvelope` admin RPC + CLI command + integration test | Sixth | Composes 6D-3 + 6D-4 + 6D-5 into the user-visible cutover. End-to-end test exercises a single-node cluster doing Bootstrap → EnableStorageEnvelope → Put → read-back-via-envelope. |
 
@@ -549,13 +572,17 @@ until 6D-6 wires it).
 
 ## 11. Open questions for the reviewer
 
-1. **Sub-tag byte choice.** Is `0x01` the right value for
-   `RotateSubEnableStorageEnvelope`? The current `0x00` is
-   `RotateSubRotateDEK`. Going up by one is the natural choice
-   but it makes the sub-tag space numerically dense; an
-   alternative would be `0x10` to group "cutover" sub-tags
-   separately from "rotate" sub-tags. Either is fine; this doc
-   picks `0x01` for simplicity.
+1. **Sub-tag byte choice.** The chosen value is `0x04`, matching
+   the existing reservation in
+   `internal/encryption/fsmwire/wire.go` (`0x04 —
+   enable-storage-envelope (Stage 6, §7.1 Phase 1)`). The current
+   shipping value is `RotateSubRotateDEK = 0x01`, with `0x02`
+   reserved for `rewrap-deks`, `0x03` for `retire-dek`, and
+   `0x05` for `enable-raft-envelope` (Stage 6E). Choosing `0x04`
+   honors the existing audit-anchored reservation block and
+   avoids the rolling-upgrade hazard of reusing `0x01` (a
+   cutover entry would be interpreted as a malformed RotateDEK
+   by pre-6D apply paths).
 
 2. **Idempotency response code.** `AlreadyExists` (gRPC) is
    technically a "client made a duplicate request" semantic. An
