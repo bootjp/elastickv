@@ -181,6 +181,12 @@ type RedisServer struct {
 	scriptCache         map[string]string
 	luaPool             *luaStatePool
 	luaPoolOnce         sync.Once
+	// luaPoolMaxIdle is the configured cap on idle pooled *lua.LStates.
+	// Set via WithLuaPoolMaxIdle before NewRedisServer materializes the
+	// pool; getLuaPool falls back to defaultLuaPoolMaxIdle when the
+	// value is non-positive (covers test fixtures that bypass
+	// NewRedisServer).
+	luaPoolMaxIdle int
 	traceCommands       bool
 	traceSeq            atomic.Uint64
 	redisAddr           string
@@ -275,6 +281,23 @@ func WithLuaFastPathObserver(observer monitoring.LuaFastPathObserver) RedisServe
 	return func(r *RedisServer) {
 		r.luaFastPathObserver = observer
 		r.luaFastPathZRange = observer.ForCommand(luaFastPathCmdZRangeByScore)
+	}
+}
+
+// WithLuaPoolMaxIdle caps the number of idle *lua.LState instances
+// the Lua VM pool retains between EVALs. The cap controls the steady-
+// state memory floor of the pool (maxIdle * per-state footprint —
+// empirically ~200 KiB) without bounding throughput: get() falls
+// through to a fresh allocation when the pool is empty, and put()
+// drops a state to the GC when the pool is full. n <= 0 is clamped
+// to defaultLuaPoolMaxIdle, matching newLuaStatePoolWithMaxIdle.
+//
+// Passing this option overrides the default. The option records the
+// requested cap on the RedisServer; the pool itself is constructed
+// after all options are applied so the recorded cap takes effect.
+func WithLuaPoolMaxIdle(n int) RedisServerOption {
+	return func(r *RedisServer) {
+		r.luaPoolMaxIdle = n
 	}
 }
 
@@ -395,8 +418,12 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		leaderClients:   make(map[string]*redis.Client),
 		pubsub:          newRedisPubSub(),
 		scriptCache:     map[string]string{},
-		luaPool:         newLuaStatePool(),
-		traceCommands:   os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		// luaPool is materialized after the option loop so
+		// WithLuaPoolMaxIdle can influence its sizing. Test fixtures
+		// that bypass NewRedisServer construct the pool lazily via
+		// getLuaPool, which honors luaPoolMaxIdle the same way.
+		luaPool:       nil,
+		traceCommands: os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 		baseCtx:         baseCtx,
 		baseCancel:      baseCancel,
 		streamWaiters:   newKeyWaiterRegistry(),
@@ -414,6 +441,14 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 			opt(r)
 		}
 	}
+	// Materialize the Lua VM pool after option processing so
+	// WithLuaPoolMaxIdle can choose the cap. newLuaStatePoolWithMaxIdle
+	// clamps non-positive values to defaultLuaPoolMaxIdle, so callers
+	// that omit the option still get a sensible default. The
+	// luaPoolOnce barrier in getLuaPool keeps test fixtures that build
+	// a bare &RedisServer{} literal (and never call NewRedisServer)
+	// from racing on the same field.
+	r.luaPool = newLuaStatePoolWithMaxIdle(r.luaPoolMaxIdle)
 
 	return r
 }

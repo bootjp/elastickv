@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"sync"
 	"sync/atomic"
 
 	lua "github.com/yuin/gopher-lua"
@@ -89,12 +88,46 @@ const luaWhitelistedTableHint = 8
 // The registry-backed binding is also the reason redis.call is
 // lock-free in the hot path, unlike the first iteration which used
 // a package-level map guarded by sync.RWMutex.
-type luaStatePool struct {
-	pool sync.Pool
+// defaultLuaPoolMaxIdle is the default upper bound on idle pooled
+// *lua.LState instances retained for reuse. Each pooled state holds
+// the base stdlib + redis/cjson/cmsgpack closures + per-state
+// snapshot tables (globals / tables / metatables); empirically ~200
+// KiB of long-lived heap per state. 64 is sized to comfortably cover
+// typical Redis-side EVAL/EVALSHA concurrency (one in-flight script
+// per connection up to redcon's default worker pool) without
+// retaining a long tail of warm states after a burst subsides.
+//
+// Operators expecting sustained higher concurrency can raise the cap
+// with --redisLuaMaxIdleStates; concurrency that exceeds the cap
+// still works correctly — excess get() calls fall through to a fresh
+// allocation (miss) and excess put() calls drop the state for the GC
+// (drop). The cap therefore controls memory floor, not throughput
+// ceiling.
+const defaultLuaPoolMaxIdle = 64
 
-	// hits / misses are exposed for tests and metrics.
+// luaStatePool pools *lua.LState instances to cut heap/GC pressure on
+// high-rate EVAL / EVALSHA workloads (e.g. BullMQ ~10 scripts/s, where
+// each fresh state allocs ~34% of in-use heap via newFuncContext,
+// newRegistry, newFunctionProto).
+//
+// Internal storage is a buffered channel of capacity maxIdle. We
+// previously used sync.Pool, which GC-clears on every cycle and has
+// no operator-tunable capacity; the bounded channel gives a
+// predictable memory floor (maxIdle * per-state footprint) and an
+// observable "states dropped because the pool was full" counter that
+// makes mis-sizing visible. The channel ops are O(1) atomic CAS on
+// the buffered chan; under high concurrency the contention is
+// comparable to sync.Pool's per-P slabs and well below the cost of
+// a single Lua eval. See TestLua_PoolBoundedOverflow for the
+// invariants.
+type luaStatePool struct {
+	idle    chan *pooledLuaState
+	maxIdle int
+
+	// hits / misses / drops are exposed for tests and metrics.
 	hits   atomic.Uint64
 	misses atomic.Uint64
+	drops  atomic.Uint64
 }
 
 // pooledLuaState wraps a *lua.LState plus the immutable snapshot of
@@ -188,23 +221,33 @@ func luaLookupContext(state *lua.LState) (*luaScriptContext, bool) {
 func (r *RedisServer) getLuaPool() *luaStatePool {
 	r.luaPoolOnce.Do(func() {
 		if r.luaPool == nil {
-			r.luaPool = newLuaStatePool()
+			r.luaPool = newLuaStatePoolWithMaxIdle(r.luaPoolMaxIdle)
 		}
 	})
 	return r.luaPool
 }
 
-// newLuaStatePool returns a pool that lazily allocates
-// *pooledLuaState instances on demand. The pool deliberately does NOT
-// set sync.Pool.New: if it did, p.pool.Get() would auto-invoke the
-// constructor on an empty pool and we could not distinguish a fresh
-// allocation from a reused instance. Instead, get() inspects the
-// result of p.pool.Get() -- a nil return signals an empty pool and
-// drives the miss counter plus an explicit newPooledLuaState() call.
-// This keeps the hit/miss metrics honest, which is what the serial
-// reuse tests and the observability counters rely on.
+// newLuaStatePool returns a bounded pool sized at defaultLuaPoolMaxIdle.
+// Used by test fixtures and any caller that does not thread a
+// configured cap through. Production wires the explicit cap via
+// newLuaStatePoolWithMaxIdle from NewRedisServer.
 func newLuaStatePool() *luaStatePool {
-	return &luaStatePool{}
+	return newLuaStatePoolWithMaxIdle(defaultLuaPoolMaxIdle)
+}
+
+// newLuaStatePoolWithMaxIdle returns a pool whose idle backing
+// channel is sized at maxIdle. Non-positive values clamp to
+// defaultLuaPoolMaxIdle to keep get/put semantics well-defined
+// (cap=0 would make every put() drop, which is never what we want
+// — callers asking for "no pool" should bypass the pool entirely).
+func newLuaStatePoolWithMaxIdle(maxIdle int) *luaStatePool {
+	if maxIdle < 1 {
+		maxIdle = defaultLuaPoolMaxIdle
+	}
+	return &luaStatePool{
+		idle:    make(chan *pooledLuaState, maxIdle),
+		maxIdle: maxIdle,
+	}
 }
 
 // newPooledLuaState builds a fresh pooled state: base libs, dangerous
@@ -484,36 +527,37 @@ func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValu
 // pointer write to the state-local ctxBinding userdata -- no lock,
 // no global map.
 //
-// Because newLuaStatePool does NOT set sync.Pool.New, p.pool.Get()
-// returns nil when the pool is empty; that is the signal for a miss
-// (fresh allocation). A non-nil return is a genuine reuse and counts
-// as a hit. The defensive type-assertion guard preserves behaviour if
-// a future refactor ever puts something unexpected into the pool.
+// A non-blocking channel recv on an empty idle pool returns the
+// zero value (no element), which we treat as a miss. The defensive
+// nil guard preserves behaviour if a future refactor ever sends an
+// unexpected value through the channel.
 func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
-	v := p.pool.Get()
-	if v == nil {
+	select {
+	case pls := <-p.idle:
+		if pls == nil {
+			// Defence in depth: a nil element on the channel is
+			// treated as an allocation miss rather than a panic.
+			p.misses.Add(1)
+			pls = newPooledLuaState()
+			pls.ctxBinding.Value = ctx
+			return pls
+		}
+		p.hits.Add(1)
+		pls.ctxBinding.Value = ctx
+		return pls
+	default:
 		p.misses.Add(1)
 		pls := newPooledLuaState()
 		pls.ctxBinding.Value = ctx
 		return pls
 	}
-	pls, ok := v.(*pooledLuaState)
-	if !ok || pls == nil {
-		// Defence in depth: anything other than a *pooledLuaState is
-		// treated as an allocation miss rather than a silent hit.
-		p.misses.Add(1)
-		pls = newPooledLuaState()
-		pls.ctxBinding.Value = ctx
-		return pls
-	}
-	p.hits.Add(1)
-	pls.ctxBinding.Value = ctx
-	return pls
 }
 
-// put resets the state and returns it to the pool. If the state is
-// somehow closed (shouldn't happen on the happy path), it is dropped
-// so a dead VM is never handed out again.
+// put resets the state and tries to return it to the pool. If the
+// state is closed (shouldn't happen on the happy path) or the idle
+// channel is full it is dropped so the GC can reclaim it; the drop
+// counter makes pool saturation observable so operators can tune
+// maxIdle.
 func (p *luaStatePool) put(pls *pooledLuaState) {
 	if pls == nil || pls.state == nil {
 		return
@@ -528,14 +572,33 @@ func (p *luaStatePool) put(pls *pooledLuaState) {
 		return
 	}
 	pls.reset()
-	p.pool.Put(pls)
+	select {
+	case p.idle <- pls:
+	default:
+		// Idle channel is full — drop the state. Close it so any
+		// per-state resources are released eagerly; the channel
+		// holds room only for steady-state reuse, not for warm
+		// states left over from a burst peak.
+		p.drops.Add(1)
+		pls.state.Close()
+	}
 }
 
-// Hits / Misses are test hooks. They count Get() outcomes, not
-// allocations proper, but in practice they track allocation avoidance
-// well enough for the "is the pool actually being used?" test.
+// Hits / Misses / Drops are test hooks. They count Get/Put outcomes,
+// not allocations proper, but in practice they track allocation
+// avoidance well enough for the "is the pool actually being used?"
+// test and the "is maxIdle too low for the workload?" diagnostic.
 func (p *luaStatePool) Hits() uint64   { return p.hits.Load() }
 func (p *luaStatePool) Misses() uint64 { return p.misses.Load() }
+func (p *luaStatePool) Drops() uint64  { return p.drops.Load() }
+
+// Idle reports the number of states currently sitting in the pool.
+// Useful for metrics gauges and for tests asserting bounded retention.
+func (p *luaStatePool) Idle() int { return len(p.idle) }
+
+// MaxIdle reports the configured cap. Exposed for diagnostics so
+// /admin can surface "(idle / maxIdle)" to operators.
+func (p *luaStatePool) MaxIdle() int { return p.maxIdle }
 
 // registerPooledRedisModule installs redis.call / redis.pcall /
 // redis.sha1hex / redis.status_reply / redis.error_reply where the
