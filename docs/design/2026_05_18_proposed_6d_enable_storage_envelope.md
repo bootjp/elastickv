@@ -216,7 +216,24 @@ service EncryptionAdmin {
 message EnableStorageEnvelopeRequest {
   // proposer_node_id and proposer_local_epoch fill the
   // ProposerRegistration on the wire payload, same shape as
-  // RotateDEKRequest. The server validates local_epoch <= 0xFFFF.
+  // RotateDEKRequest. The server validates:
+  //
+  //   - proposer_node_id != 0 — zero is a reserved sentinel
+  //     across the mutator paths (BootstrapEncryption,
+  //     RotateDEK, RegisterEncryptionWriter all reject it via
+  //     ErrZeroFullNodeID); accepting it here would weaken
+  //     the writer-registry collision and rollback
+  //     invariants. Reject with InvalidArgument wrapping
+  //     ErrZeroFullNodeID.
+  //   - proposer_local_epoch <= 0xFFFF — the §4.1 16-bit
+  //     nonce field is carried as uint32 on the wire (proto3
+  //     has no uint16); values above 0xFFFF return
+  //     ErrLocalEpochOutOfRange.
+  //
+  // Both checks fire at the server boundary before any Raft
+  // proposal is composed. ApplyRotation re-validates them at
+  // apply time (defense-in-depth, matching the
+  // RotateSubRotateDEK posture).
   uint64 proposer_node_id    = 1;
   uint32 proposer_local_epoch = 2;
 }
@@ -290,7 +307,13 @@ message CapabilityVerdict {
 leader. Server-side sequence:
 
 ```text
-1. Validate inputs (proposer_local_epoch ≤ 0xFFFF, etc.).
+1. Validate inputs: `proposer_node_id != 0` (reject with
+   `InvalidArgument` wrapping `ErrZeroFullNodeID`),
+   `proposer_local_epoch <= 0xFFFF` (reject with
+   `InvalidArgument` wrapping `ErrLocalEpochOutOfRange`).
+   Both checks at the server boundary before any Raft
+   proposal is composed; `ApplyRotation` re-validates them at
+   apply time (defense-in-depth).
 2. Verify Stage 6B mutators are enabled (existing triple gate
    via encryptionMutatorsEnabled — encryption flag + KEK +
    capability advertised).
@@ -339,6 +362,8 @@ the rationale):
 
 | Cause | gRPC code | Wrapped sentinel / discriminator |
 |---|---|---|
+| `proposer_node_id == 0` | `InvalidArgument` | existing `ErrZeroFullNodeID` (reserved sentinel across all mutator paths) |
+| `proposer_local_epoch > 0xFFFF` | `InvalidArgument` | existing `ErrLocalEpochOutOfRange` (16-bit nonce-field bound) |
 | Encryption disabled / KEK absent | `FailedPrecondition` | existing 6B `ErrEncryptionMutatorsDisabled` |
 | Caller is a follower | `FailedPrecondition` | existing `ErrNotLeader` |
 | Sidecar missing or `Active.Storage == 0` | `FailedPrecondition` | new `ErrEncryptionNotBootstrapped` |
