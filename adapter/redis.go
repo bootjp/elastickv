@@ -355,12 +355,62 @@ func isTransientLeaderRedisError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, ErrLeaderNotFound) ||
+	if errors.Is(err, ErrLeaderNotFound) ||
 		errors.Is(err, ErrNotLeader) ||
 		errors.Is(err, kv.ErrLeaderNotFound) ||
 		errors.Is(err, raftengine.ErrNotLeader) ||
 		errors.Is(err, raftengine.ErrLeadershipLost) ||
-		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+		return true
+	}
+	// Suffix fallback for gRPC-wrapped sentinels. When the coordinator
+	// forwards a request to a remote leader via the operational gRPC
+	// service and that leader returns ErrLeaderNotFound, the status
+	// interceptor flattens the error to "rpc error: code = Unknown
+	// desc = leader not found"; the typed sentinel chain is stripped
+	// at the wire boundary, so errors.Is misses it. The Jepsen Redis
+	// workload (scheduled run 26035515694) saw workers crash with
+	// `:prefix :rpc` because the un-prefixed `"rpc error: …"` string
+	// reached Carmine. Match the same closed phrase set
+	// kv.hasTransientLeaderPhrase uses, with the same HasSuffix
+	// guard: free-form Contains would misclassify a user-controlled
+	// key like "key: not leader: write conflict" as transient.
+	return hasTransientLeaderSuffix(err.Error())
+}
+
+// redisLeaderErrorPhrases mirrors kv.leaderErrorPhrases (the kv
+// package keeps it unexported). Any new transient-leader phrase the
+// kv layer treats as retryable should also flip a NOTLEADER prefix
+// on the Redis wire so Carmine's with-exceptions catches it; keep
+// in lockstep.
+var redisLeaderErrorPhrases = []string{
+	"not leader",
+	"leader not found",
+	"leadership lost",
+	"leadership transfer in progress",
+}
+
+// hasTransientLeaderSuffix is the suffix-match fallback for
+// isTransientLeaderRedisError. Suffix — not free-form Contains —
+// because cockroachdb/errors %w-prefix and gRPC status.Errorf's
+// "rpc error: code = X desc = <orig>" both leave the original
+// sentinel text at the END of the composed string; a Contains
+// match would tag a user-controlled key like "key: not leader:
+// conflict" as transient.
+//
+// strings.EqualFold on the trailing slice — rather than
+// strings.ToLower + HasSuffix — avoids allocating a copy of the
+// full message. cockroachdb/errors messages can be multi-KB when
+// they carry a serialized stack trace; this matters on the error
+// path under leader-loss storms.
+func hasTransientLeaderSuffix(msg string) bool {
+	for _, phrase := range redisLeaderErrorPhrases {
+		if len(msg) >= len(phrase) &&
+			strings.EqualFold(msg[len(msg)-len(phrase):], phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *redisMetricsConn) reset(conn redcon.Conn) {
