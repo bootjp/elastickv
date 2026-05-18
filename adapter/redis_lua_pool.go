@@ -33,61 +33,6 @@ const luaResetKeySlack = 8
 // table, redis, cjson, cmsgpack).
 const luaWhitelistedTableHint = 8
 
-// luaStatePool pools *lua.LState instances to cut heap/GC pressure on
-// high-rate EVAL / EVALSHA workloads (e.g. BullMQ ~10 scripts/s, where
-// each fresh state allocs ~34% of in-use heap via newFuncContext,
-// newRegistry, newFunctionProto).
-//
-// Security invariant: no state must leak between scripts. Each pooled
-// state is initialised with a fixed set of base globals (redis, cjson,
-// cmsgpack, table/string/math + base lib helpers, and nil-ed loaders).
-// Three snapshots are captured at construction time:
-//
-//   - globalsSnapshot: the full (*any*-keyed) _G map at init. Using an
-//     LValue-keyed map lets the reset path catch non-string-keyed
-//     leaks like `_G[42] = "secret"` or `_G[true] = "bad"`, which
-//     would otherwise survive a naive string-only wipe.
-//   - tableSnapshots: a shallow map from each whitelisted nested
-//     table (string, math, table, redis, cjson, cmsgpack) to its
-//     init-time field set. This is what blocks table-poisoning
-//     attacks such as `string.upper = function() return "pwned" end`
-//     -- merely restoring the `string` *reference* on _G would leave
-//     the shared table's fields still mutated.
-//   - metatableSnapshots: the init-time raw metatable of _G plus of
-//     every whitelisted nested table. Without this, a script calling
-//     `setmetatable(_G, { __index = function() return "pwned" end })`
-//     could leak a poisoned fallback into the next pooled eval via
-//     any undefined-global access. Same risk for `setmetatable(string,
-//     ...)` etc.
-//
-// On release, the reset routine
-//
-//  1. restores the raw metatable of _G and every whitelisted table
-//     (LNil if there was none originally), neutering setmetatable
-//     poisoning,
-//  2. walks each snapshotted nested table and restores its contents
-//     (deletes script-added fields, rebinds original fields),
-//  3. walks the current global table and deletes every key -- of any
-//     type -- that is not present in the globals snapshot (removes
-//     user-added globals such as KEYS, ARGV, GLOBAL_LEAK, _G[42]),
-//     and
-//  4. restores every globals-snapshot key to its original value (so a
-//     script that did `table = nil` or `redis = evil` cannot poison
-//     the next script).
-//
-// Additionally the value stack is truncated to 0 and the script
-// context binding is cleared so the redis.call/pcall closures cannot
-// be invoked against a stale context.
-//
-// The redis / cjson / cmsgpack closures are registered ONCE at pool
-// fill time and read the per-eval *luaScriptContext out of each
-// state's own Lua registry (see luaCtxRegistryKey / ctxBinding),
-// which is set on acquire and cleared on release. Closures that
-// would otherwise capture a fresh context per eval no longer need
-// to be re-registered, which is what makes pooling safe and cheap.
-// The registry-backed binding is also the reason redis.call is
-// lock-free in the hot path, unlike the first iteration which used
-// a package-level map guarded by sync.RWMutex.
 // DefaultLuaPoolMaxIdle is the default upper bound on idle pooled
 // *lua.LState instances retained for reuse. Each pooled state holds
 // the base stdlib + redis/cjson/cmsgpack closures + per-state
@@ -125,6 +70,44 @@ const DefaultLuaPoolMaxIdle = 64
 // comparable to sync.Pool's per-P slabs and well below the cost of
 // a single Lua eval. See TestLua_PoolBoundedOverflow for the
 // invariants.
+//
+// Security invariant: no state must leak between scripts. Each
+// pooled state is initialised with a fixed set of base globals
+// (redis, cjson, cmsgpack, table/string/math + base lib helpers,
+// and nil-ed loaders). Three snapshots — captured per-state at
+// construction and stored on pooledLuaState — back the reset path:
+// globalsSnapshot (the full LValue-keyed _G map, so non-string-keyed
+// leaks like `_G[42] = "secret"` are caught), tableSnapshots
+// (shallow field sets of the whitelisted nested tables, so
+// `string.upper = function() return "pwned" end` cannot poison
+// reuse), and metatableSnapshots (the init-time raw metatable of
+// _G plus each whitelisted nested table, so a script-installed
+// `setmetatable(_G, { __index = function() … end })` does not
+// leak across evals).
+//
+// On release, the reset routine
+//
+//  1. restores the raw metatable of _G and every whitelisted table
+//     (LNil if there was none originally), neutering setmetatable
+//     poisoning,
+//  2. walks each snapshotted nested table and restores its contents
+//     (deletes script-added fields, rebinds original fields),
+//  3. walks the current global table and deletes every key — of any
+//     type — that is not present in the globals snapshot (removes
+//     user-added globals such as KEYS, ARGV, GLOBAL_LEAK, _G[42]),
+//     and
+//  4. restores every globals-snapshot key to its original value (so
+//     a script that did `table = nil` or `redis = evil` cannot
+//     poison the next script).
+//
+// The value stack is also truncated to 0 and the script-context
+// binding is cleared so the redis.call/pcall closures cannot be
+// invoked against a stale context. Those closures are registered
+// ONCE at pool fill time and read the per-eval *luaScriptContext
+// out of each state's own Lua registry (see luaCtxRegistryKey /
+// pooledLuaState.ctxBinding); this is what keeps redis.call
+// lock-free on the hot path, unlike the first iteration which used
+// a package-level map guarded by sync.RWMutex.
 type luaStatePool struct {
 	idle    chan *pooledLuaState
 	maxIdle int
@@ -548,8 +531,13 @@ func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
 		if pls != nil {
 			p.hits.Add(1)
 		} else {
-			// Defence in depth: a nil element on the channel is
-			// treated as an allocation miss rather than a panic.
+			// Intentionally-unreachable defence in depth:
+			// put() above already guards `if pls == nil ||
+			// pls.state == nil { return }`, so no caller can
+			// enqueue a nil. If a future refactor breaks that
+			// invariant the nil arrives here as a miss + fresh
+			// allocation rather than a runtime panic. Not a
+			// branch a reader should try to hit.
 			p.misses.Add(1)
 			pls = newPooledLuaState()
 		}

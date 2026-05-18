@@ -78,12 +78,14 @@ func TestLua_VMReuseDoesNotLeakGlobals(t *testing.T) {
 	pool.put(plsA)
 
 	// --- Script B: same pool, no leak -----------------------------
-	// sync.Pool is free to allocate a fresh item even immediately
-	// after a put under race/GC, so we do not assert pointer
-	// identity here. To assert the pool is effective at all, see
-	// TestLua_PoolRecordsReuseVsAllocation which uses the hit counter.
-	// What we DO assert is the security invariant: whichever state
-	// we got, it must not observe the leaked globals from script A.
+	// We avoid asserting pointer identity here because the channel
+	// pool's hit/miss outcome under concurrent get/put can race
+	// with other parallel sub-tests scheduled by t.Parallel; for
+	// the deterministic effectiveness check see
+	// TestLua_PoolRecordsReuseVsAllocation, which uses the hit
+	// counter directly. What we DO assert is the security
+	// invariant: whichever state we got, it must not observe the
+	// leaked globals from script A.
 	_ = ptrA
 	plsB := pool.get(nil)
 	stateB := plsB.state
@@ -109,10 +111,10 @@ func TestLua_VMReuseDoesNotLeakGlobals(t *testing.T) {
 	pool.put(plsB)
 
 	// NOTE: we intentionally do NOT assert pool.Hits() >= 1 here.
-	// As noted at line 81, sync.Pool may evict items under GC pressure,
-	// making a single-iteration hit assertion non-deterministic.
-	// Pool effectiveness is covered by TestLua_PoolRecordsReuseVsAllocation,
-	// which uses a loop to ensure reuse occurs.
+	// As noted above, parallel sub-test scheduling can racily steer
+	// the second get() to a fresh allocation; pool effectiveness is
+	// covered by TestLua_PoolRecordsReuseVsAllocation, which uses
+	// a loop to ensure reuse occurs.
 }
 
 // TestLua_VMReuseRestoresRebindsWhitelistedGlobals guards against a
@@ -140,9 +142,11 @@ func TestLua_VMReuseRestoresRebindsWhitelistedGlobals(t *testing.T) {
 
 // TestLua_PoolSerialAcquireReusesState verifies the pool serves
 // existing *lua.LState instances in sequential acquire/release cycles
-// -- the knob we care about for the heap-pressure win. sync.Pool is
-// free to reclaim under GC pressure, so we cannot assert on the exact
-// pointer; instead we count hits vs misses via the test hook.
+// — the knob we care about for the heap-pressure win. The channel
+// pool is deterministic on a single goroutine, but the test runs
+// under t.Parallel, so we assert via the hit counter rather than
+// pointer identity (a sibling test could in principle pre-empt
+// between get and put).
 func TestLua_PoolSerialAcquireReusesState(t *testing.T) {
 	t.Parallel()
 
@@ -159,28 +163,31 @@ func TestLua_PoolSerialAcquireReusesState(t *testing.T) {
 	// At least one hit proves the pool is actually handing back an
 	// existing VM rather than minting a new one every time.
 	require.GreaterOrEqual(t, pool.Hits(), uint64(1),
-		"pool never reported a hit; sync.Pool reuse not happening")
+		"pool never reported a hit; channel-pool reuse not happening")
 }
 
 // TestLua_PoolRecordsReuseVsAllocation pins down the "is the pool
 // actually doing anything?" question via the hit/miss counters. The
-// test guards against the subtle regression where sync.Pool.New is
-// (re-)configured: with a New func set, p.pool.Get() on an empty
-// pool would auto-construct and never return nil, so hit/miss
-// tracking would be meaningless. Two sub-scenarios are exercised:
+// test guards against a subtle regression where get() auto-fills on
+// empty (e.g. a hypothetical "warm pool eagerly" refactor): with
+// auto-fill, the first get on a brand-new pool would never record a
+// miss and the hit/miss accounting would silently break. Two
+// sub-scenarios are exercised:
 //
 //  1. Miss branch: a get() on a brand-new pool has nothing to hand
 //     out. It must increment the miss counter (fresh allocation) and
-//     leave hits at zero. This is deterministic -- sync.Pool's own
-//     scheduling cannot turn an empty pool into a non-empty one.
+//     leave hits at zero. Channel recv on an empty buffered channel
+//     fires the select default deterministically, so this branch is
+//     race-free.
 //  2. Hit branch: after many put/get cycles at least one acquire
-//     must actually be served from the pool. sync.Pool under -race
-//     randomises per-P caching and can drop items, so we cannot
-//     assert on a single put/get round-trip; instead we run a loop
-//     large enough that the probability of zero reuse is negligible.
+//     must actually be served from the pool. The pool is bounded
+//     and deterministic on a single goroutine, but t.Parallel can
+//     race concurrent sub-tests between put and get; the loop
+//     amortises that to a near-certainty rather than relying on a
+//     single round-trip.
 //
-// If sync.Pool.New were accidentally re-introduced, the miss branch
-// (step 1) would fail immediately: Misses would be 0, Hits would be 1.
+// If get() ever started auto-filling, the miss-branch assertion
+// would fail immediately (Misses == 0, Hits == 1).
 func TestLua_PoolRecordsReuseVsAllocation(t *testing.T) {
 	t.Parallel()
 
@@ -190,16 +197,16 @@ func TestLua_PoolRecordsReuseVsAllocation(t *testing.T) {
 	plsA := pool.get(nil)
 	require.NotNil(t, plsA, "get on empty pool must allocate a fresh state, not return nil")
 	require.Equal(t, uint64(0), pool.Hits(),
-		"empty pool must not record a hit on first acquire -- sync.Pool.New likely reintroduced")
+		"empty pool must not record a hit on first acquire — auto-fill leaked into get()")
 	require.Equal(t, uint64(1), pool.Misses(),
 		"empty pool must record exactly one miss on first acquire")
 	pool.put(plsA)
 
 	// Scenario 2: with the state now available, a loop of get/put
-	// cycles must observe at least one genuine reuse. We cannot
-	// assert on a single round-trip because sync.Pool under -race
-	// may drop the freshly-put item from the local P cache; over
-	// many iterations, however, at least one must be served.
+	// cycles must observe at least one genuine reuse. Single-
+	// goroutine reuse is deterministic for the channel pool, but
+	// t.Parallel can race sibling sub-tests between our put and
+	// get; the loop amortises that effect over many iterations.
 	const iters = 500
 	for i := 0; i < iters; i++ {
 		pool.put(pool.get(nil))
