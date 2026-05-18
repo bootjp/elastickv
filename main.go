@@ -97,6 +97,7 @@ var (
 	raftId               = flag.String("raftId", "", "Node id used by Raft")
 	raftEngineName       = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd|hashicorp)")
 	raftDir              = flag.String("raftDataDir", "data/", "Raft data dir")
+	redisLuaMaxIdleStates = flag.Int("redisLuaMaxIdleStates", 64, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
 	raftBootstrap        = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
 	raftJoinAsLearner    = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_proposed_raft_learner.md §4.5.")
@@ -1524,6 +1525,7 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
 		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
 		adapter.WithRedisCompactor(deltaCompactor),
+		adapter.WithLuaPoolMaxIdle(*redisLuaMaxIdleStates),
 	)
 	eg.Go(func() error {
 		defer redisServer.Stop()

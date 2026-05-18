@@ -627,3 +627,92 @@ func TestLua_VMReuseClearsContext(t *testing.T) {
 			"pooled LState leaked the original request ctx across put")
 	}
 }
+
+// TestLua_PoolBoundedOverflow is the load-bearing invariant for the
+// channel-backed bounded pool. With sync.Pool the upper bound on
+// retained states was implicit (GC-driven, varies per cycle); the new
+// implementation must:
+//
+//  1. Retain exactly maxIdle put() arrivals; the (maxIdle+1)th arrival
+//     drops cleanly and is reflected in Drops().
+//  2. Continue to serve subsequent get() calls from the retained pool
+//     until the pool is drained.
+//  3. Never panic or leak a half-bound state when a put() overflows.
+func TestLua_PoolBoundedOverflow(t *testing.T) {
+	t.Parallel()
+
+	const maxIdle = 4
+	pool := newLuaStatePoolWithMaxIdle(maxIdle)
+	require.Equal(t, maxIdle, pool.MaxIdle(),
+		"MaxIdle must echo the configured cap so operators can verify it via metrics")
+
+	// Acquire 2*maxIdle distinct states. Because the empty pool
+	// allocates a fresh state on every get(), these are all misses
+	// and all references are independent.
+	const acquired = 2 * maxIdle
+	plsList := make([]*pooledLuaState, 0, acquired)
+	for i := 0; i < acquired; i++ {
+		plsList = append(plsList, pool.get(nil))
+	}
+	require.Equal(t, uint64(0), pool.Hits(), "no put() yet, so no get() can be a hit")
+	require.Equal(t, uint64(acquired), pool.Misses(),
+		"every empty-pool get() must record a miss")
+	require.Equal(t, 0, pool.Idle(), "idle count must be zero before any put()")
+
+	// Release all 2*maxIdle back. Only maxIdle should survive in the
+	// pool; the rest drop and increment the drop counter.
+	for _, pls := range plsList {
+		pool.put(pls)
+	}
+	require.Equal(t, maxIdle, pool.Idle(),
+		"pool must retain exactly maxIdle states after %d puts on a cap=%d pool", acquired, maxIdle)
+	require.Equal(t, uint64(acquired-maxIdle), pool.Drops(),
+		"overflow puts must increment the drop counter so saturation is observable")
+
+	// Draining the pool must produce maxIdle hits and then fall through
+	// to misses, proving the surviving states are usable, not corrupted
+	// by the overflow path.
+	hitsBefore := pool.Hits()
+	for i := 0; i < maxIdle; i++ {
+		drained := pool.get(nil)
+		require.NotNil(t, drained, "drain get must return a usable state")
+	}
+	require.Equal(t, uint64(maxIdle), pool.Hits()-hitsBefore,
+		"draining the pool must produce exactly maxIdle hits")
+	require.Equal(t, 0, pool.Idle(), "pool must be empty after draining maxIdle states")
+
+	// One more get must miss (allocate fresh), confirming the bounded
+	// pool does not silently grow above maxIdle.
+	pool.get(nil)
+	require.Equal(t, uint64(acquired+1), pool.Misses(),
+		"first get() after full drain must record a miss")
+}
+
+// TestLua_PoolBoundedClampsZeroAndNegative locks in the contract that
+// non-positive maxIdle values clamp to defaultLuaPoolMaxIdle rather
+// than silently producing a cap=0 pool (which would make every put()
+// drop). Operators that misconfigure --redisLuaMaxIdleStates=0 get the
+// default behaviour, not a permanently disabled pool.
+func TestLua_PoolBoundedClampsZeroAndNegative(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		maxIdle int
+	}{
+		{"zero clamps to default", 0},
+		{"negative clamps to default", -7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool := newLuaStatePoolWithMaxIdle(tc.maxIdle)
+			require.Equal(t, defaultLuaPoolMaxIdle, pool.MaxIdle(),
+				"non-positive maxIdle must clamp to defaultLuaPoolMaxIdle")
+			// And the pool must actually retain on put (proving cap > 0).
+			pool.put(pool.get(nil))
+			require.Equal(t, 1, pool.Idle(),
+				"clamped pool must retain put() arrivals, not silently drop them")
+		})
+	}
+}
