@@ -42,19 +42,80 @@ func encryptionMain(args []string) error {
 		return runEncryptionRegisterWriter(rest, os.Stdout)
 	case "bootstrap":
 		return runEncryptionBootstrap(rest, os.Stdout)
+	case "probe-node-id":
+		return runEncryptionProbeNodeID(rest, os.Stdout)
 	case "-h", "--help", "help":
 		// `-h` is the universal "show usage" affordance for CLI
 		// subcommands; returning nil keeps the exit code at 0
 		// so shell scripts using $? to detect success do not
 		// trip on a help request.
-		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap")
+		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap\n  probe-node-id")
 		if err != nil {
 			return errors.Wrap(err, "write usage")
 		}
 		return nil
 	default:
-		return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap)", sub)
+		return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap, probe-node-id)", sub)
 	}
+}
+
+// runEncryptionProbeNodeID implements the §5.1 collision-
+// mitigation helper from the 6D design doc: it derives the
+// 16-bit `node_id` from a candidate `full_node_id` so the
+// operator can verify the value is free in the cluster's
+// allocated node_id space BEFORE joining the node and
+// triggering an `ErrNodeIDCollision` refusal.
+//
+// The narrowing — `uint16(full_node_id & 0xFFFF)` — matches the
+// shipped writer-registry keying and §4.1 GCM nonce prefix
+// (see `internal/encryption/applier.go::nodeIDMask`). Anything
+// other than this narrowing would compute a value that diverges
+// from what the runtime uses, defeating the purpose of the
+// probe.
+//
+// No RPC — this is a pure local computation. The operator runs
+// it against a candidate `full_node_id` and a current cluster's
+// allocated node_id list (out of scope for this subcommand; the
+// operator can read `gh ... encryption status` on each member
+// to gather them).
+func runEncryptionProbeNodeID(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("encryption probe-node-id", flag.ContinueOnError)
+	fullNodeIDStr := fs.String("full-node-id", "", "candidate 64-bit full_node_id to probe (decimal or 0x-prefixed hex)")
+	if err := fs.Parse(args); err != nil {
+		return errors.Wrap(err, "parse probe-node-id flags")
+	}
+	if *fullNodeIDStr == "" {
+		return errors.New("--full-node-id is required (decimal or 0x-prefixed hex)")
+	}
+	full, err := parseUint64WithRadix(*fullNodeIDStr)
+	if err != nil {
+		return errors.Wrapf(err, "parse --full-node-id=%q", *fullNodeIDStr)
+	}
+	const nodeIDMask = 0xFFFF
+	narrowed := uint16(full & nodeIDMask) //nolint:gosec // masked to 16 bits; matches applier.go convention
+	if _, err := fmt.Fprintf(out, "full_node_id: %#016x (%d)\nnode_id:      %#04x (%d)\n",
+		full, full, narrowed, narrowed); err != nil {
+		return errors.Wrap(err, "write probe-node-id result")
+	}
+	return nil
+}
+
+// parseUint64WithRadix accepts either decimal ("12345") or
+// 0x-prefixed hex ("0xDEADBEEF") so operators can paste values
+// in whichever form their inventory uses.
+func parseUint64WithRadix(s string) (uint64, error) {
+	if len(s) >= 2 && (s[0:2] == "0x" || s[0:2] == "0X") {
+		var v uint64
+		if _, err := fmt.Sscanf(s[2:], "%x", &v); err != nil {
+			return 0, errors.Wrap(err, "hex parse")
+		}
+		return v, nil
+	}
+	var v uint64
+	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
+		return 0, errors.Wrap(err, "decimal parse")
+	}
+	return v, nil
 }
 
 type encryptionEndpointFlags struct {

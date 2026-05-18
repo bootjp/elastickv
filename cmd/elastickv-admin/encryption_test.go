@@ -462,3 +462,102 @@ func startCustomEncryptionAdminTestServer(t *testing.T, impl pb.EncryptionAdminS
 	})
 	return lis.Addr().String()
 }
+
+// TestRunEncryptionProbeNodeID_Hex pins the §5.1 collision-
+// mitigation helper from the 6D design doc: a hex full_node_id
+// is parsed and narrowed via uint16(full_node_id & 0xFFFF) — the
+// same mask that applier.go (writer-registry keying) and §4.1
+// (GCM nonce prefix) already use. The CLI prints both the
+// full_node_id (canonical 16-hex-digit form) and the derived
+// node_id so the operator can verify the value is free in the
+// cluster's allocated node_id space before joining.
+func TestRunEncryptionProbeNodeID_Hex(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionProbeNodeID([]string{"--full-node-id=0xDEADBEEFCAFE1234"}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionProbeNodeID: %v", err)
+	}
+	out := buf.String()
+	for _, needle := range []string{
+		"full_node_id: 0xdeadbeefcafe1234",
+		"node_id:      0x1234",
+	} {
+		if !strings.Contains(out, needle) {
+			t.Errorf("output missing %q:\n%s", needle, out)
+		}
+	}
+}
+
+// TestRunEncryptionProbeNodeID_Decimal pins the dual-radix
+// parser: decimal input works alongside the 0x-prefixed hex case.
+func TestRunEncryptionProbeNodeID_Decimal(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionProbeNodeID([]string{"--full-node-id=305419896"}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionProbeNodeID: %v", err)
+	}
+	// 305419896 = 0x12345678; low 16 bits = 0x5678
+	out := buf.String()
+	for _, needle := range []string{
+		"full_node_id: 0x0000000012345678",
+		"node_id:      0x5678",
+	} {
+		if !strings.Contains(out, needle) {
+			t.Errorf("output missing %q:\n%s", needle, out)
+		}
+	}
+}
+
+// TestRunEncryptionProbeNodeID_RequiresFlag pins the
+// required-flag contract: omitting --full-node-id returns an
+// explicit error rather than producing a misleading "probe of
+// zero" output.
+func TestRunEncryptionProbeNodeID_RequiresFlag(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionProbeNodeID([]string{}, &buf)
+	if err == nil {
+		t.Fatal("missing --full-node-id: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "--full-node-id is required") {
+		t.Errorf("error message: want mention of required flag, got %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("must not print output on error: got %q", buf.String())
+	}
+}
+
+// TestRunEncryptionProbeNodeID_RejectsBadInput pins the
+// invalid-input case: non-numeric, non-hex input returns an
+// error rather than silently truncating.
+func TestRunEncryptionProbeNodeID_RejectsBadInput(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionProbeNodeID([]string{"--full-node-id=notanumber"}, &buf)
+	if err == nil {
+		t.Fatal("invalid input: want error, got nil")
+	}
+}
+
+// TestEncryptionMain_ProbeNodeIDSubcommand pins the dispatch in
+// encryptionMain: the new probe-node-id case must route to the
+// runner. Without this, a typo in encryptionMain's switch
+// statement would route the subcommand to the default branch
+// and fail with "unknown subcommand", and the dispatch test
+// would not catch it.
+func TestEncryptionMain_ProbeNodeIDSubcommand(t *testing.T) {
+	t.Parallel()
+	// Help-flag path: probe-node-id without flags errors with
+	// "required" rather than "unknown subcommand". A successful
+	// dispatch route reaches runEncryptionProbeNodeID's
+	// missing-flag branch.
+	err := encryptionMain([]string{"probe-node-id"})
+	if err == nil {
+		t.Fatal("probe-node-id with no flags: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "--full-node-id is required") {
+		t.Errorf("dispatch reached wrong handler: got %v", err)
+	}
+}
