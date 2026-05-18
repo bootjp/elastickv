@@ -152,6 +152,69 @@ func TestCheckLocalEpochRollback_PebbleError(t *testing.T) {
 	}
 }
 
+// TestCheckLocalEpochRollback_ForeignRowPreCutover pins the
+// defense-in-depth FullNodeID-mismatch case for pre-cutover:
+// a registry row exists at the 16-bit-narrowed key but belongs
+// to a DIFFERENT writer (historical occupant). Pre-cutover
+// this is the freshly-joined-learner-with-historical-collision
+// case — the next OpRegistration will overwrite the foreign
+// row. Allow startup.
+//
+// Codex r3 P2 flagged that without this check, the comparison
+// would happen against the FOREIGN writer's LastSeenLocalEpoch,
+// potentially returning nil (sidecar > foreign) when in fact
+// THIS node has no rollback anchor at all.
+func TestCheckLocalEpochRollback_ForeignRowPreCutover(t *testing.T) {
+	t.Parallel()
+	// Seed with full_node_id 0xDEADBEEF_0000AAAA (narrowed=0xAAAA).
+	reg := seedRegistry(t, 0xDEADBEEF_0000AAAA, 99)
+	// Look up with a DIFFERENT full_node_id whose low 16 bits
+	// ALSO narrow to 0xAAAA. Pre-cutover: the foreign row is
+	// not THIS node's anchor; treat as no-row + allow startup.
+	err := encryption.CheckLocalEpochRollback(reg, 0xCAFEBABE_0000AAAA, 1, 10, false)
+	if err != nil {
+		t.Errorf("foreign-row + pre-cutover: want nil, got %v", err)
+	}
+}
+
+// TestCheckLocalEpochRollback_ForeignRowPostCutover pins the
+// post-cutover refusal for the FullNodeID-mismatch case: a
+// foreign row at the same 16-bit-narrowed key MUST NOT be
+// treated as this node's rollback anchor. With
+// storage_envelope_active=true, the absence of THIS node's
+// own row means no rollback anchor exists and startup must
+// refuse — same as the no-row + post-cutover case.
+//
+// Without the FullNodeID check, the function would compare
+// sidecarLocalEpoch against the foreign writer's
+// LastSeenLocalEpoch and (when sidecar happens to be ahead)
+// return nil, allowing the node to start without an anchor.
+func TestCheckLocalEpochRollback_ForeignRowPostCutover(t *testing.T) {
+	t.Parallel()
+	// Seed with full_node_id 0xDEADBEEF_0000AAAA (narrowed=0xAAAA),
+	// large LastSeenLocalEpoch so sidecar=10 would be BELOW it
+	// (the "natural" rollback scenario) — but the foreign-row
+	// check should fire FIRST and route through the
+	// missing-row-post-cutover branch.
+	reg := seedRegistry(t, 0xDEADBEEF_0000AAAA, 99)
+	err := encryption.CheckLocalEpochRollback(reg, 0xCAFEBABE_0000AAAA, 1, 10, true)
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("foreign-row + post-cutover: want ErrLocalEpochRollback, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "storage_envelope_active=true") {
+		t.Errorf("must use the missing-row-post-cutover message (storage_envelope_active=true): %v", err)
+	}
+
+	// Even when sidecar > foreign's LastSeenLocalEpoch (the
+	// case that would have masked the missing anchor without
+	// the FullNodeID check), the refusal must still fire.
+	reg2 := seedRegistry(t, 0xDEADBEEF_0000AAAA, 5)
+	err2 := encryption.CheckLocalEpochRollback(reg2, 0xCAFEBABE_0000AAAA, 1, 100, true)
+	if !errors.Is(err2, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("foreign-row + post-cutover + sidecar>foreign.LastSeen: want ErrLocalEpochRollback, got %v", err2)
+	}
+}
+
 // TestCheckLocalEpochRollback_NarrowingMatchesShippedConvention
 // pins the load-bearing 16-bit narrowing: the primitive must
 // look up the registry row at RegistryKey(dekID,
@@ -161,17 +224,23 @@ func TestCheckLocalEpochRollback_PebbleError(t *testing.T) {
 // would lookup at a different key and the no-row branch would
 // fire spuriously, masking a real rollback.
 //
-// Verify by seeding the row at uint16-narrowed key and looking
-// up with a full_node_id whose HIGH bits differ — narrowing
-// must hit the same row.
+// Verify by seeding the row at uint16-narrowed key with a
+// full_node_id that has non-trivial high bits and looking up
+// with the SAME full_node_id — confirming that the key
+// derivation handles high-bit-aware values correctly. (The
+// foreign-row case, where two distinct full_node_ids share the
+// same 16-bit slice, is covered by the dedicated
+// `ForeignRowPreCutover` / `ForeignRowPostCutover` tests
+// above.)
 func TestCheckLocalEpochRollback_NarrowingMatchesShippedConvention(t *testing.T) {
 	t.Parallel()
 	// Seed with full_node_id 0xDEADBEEF_0000AAAA (narrowed=0xAAAA).
-	reg := seedRegistry(t, 0xDEADBEEF_0000AAAA, 50)
-	// Look up with a different full_node_id that ALSO narrows
-	// to 0xAAAA. Same registry row should be hit; sidecar=10 <
-	// registry=50 should fire ErrLocalEpochRollback.
-	err := encryption.CheckLocalEpochRollback(reg, 0xCAFEBABE_0000AAAA, 1, 10, false)
+	const fullID uint64 = 0xDEADBEEF_0000AAAA
+	reg := seedRegistry(t, fullID, 50)
+	// Look up with the SAME full_node_id. The key derivation
+	// must use uint16(fullID & 0xFFFF) and find the row.
+	// sidecar=10 < registry=50 fires ErrLocalEpochRollback.
+	err := encryption.CheckLocalEpochRollback(reg, fullID, 1, 10, false)
 	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
 		t.Fatalf("narrowing-match: want ErrLocalEpochRollback, got %v", err)
 	}

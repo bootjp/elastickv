@@ -73,6 +73,21 @@ import (
 // `storageEnvelopeActive == true`. Returns nil when the row is
 // absent AND `storageEnvelopeActive == false` (pre-cutover
 // freshly-joined learner) or when `sidecar > registry`.
+// missingRegistryRowResult is the shared §5.2 split for "no
+// registry row for THIS node": pre-cutover allow startup,
+// post-cutover refuse. The function is invoked both when the
+// Pebble Get returns ok=false AND when a row exists but its
+// FullNodeID does not match the caller's expectation (a
+// historical occupant of the same 16-bit slot).
+func missingRegistryRowResult(storageEnvelopeActive bool, fullNodeID uint64, activeStorageDEKID uint32) error {
+	if storageEnvelopeActive {
+		return pkgerrors.Wrapf(ErrLocalEpochRollback,
+			"writer-registry has no row for full_node_id=%#x dek_id=%d but storage_envelope_active=true; cannot prove nonce monotonicity for the active DEK",
+			fullNodeID, activeStorageDEKID)
+	}
+	return nil
+}
+
 func CheckLocalEpochRollback(
 	registry WriterRegistryStore,
 	fullNodeID uint64,
@@ -88,27 +103,30 @@ func CheckLocalEpochRollback(
 			fullNodeID, activeStorageDEKID)
 	}
 	if !ok {
-		if storageEnvelopeActive {
-			// Post-cutover: missing row means no rollback
-			// anchor exists, but encrypted writes are happening.
-			// Refuse to start; the node cannot prove nonce
-			// monotonicity without a registry record to compare
-			// against.
-			return pkgerrors.Wrapf(ErrLocalEpochRollback,
-				"writer-registry has no row for full_node_id=%#x dek_id=%d but storage_envelope_active=true; cannot prove nonce monotonicity for the active DEK",
-				fullNodeID, activeStorageDEKID)
-		}
-		// Pre-cutover: freshly-joined learner that has not yet
-		// proposed a `RegisterEncryptionWriter`. The §4.1
-		// case-1 first-seen branch will create the row on the
-		// next encrypted write.
-		return nil
+		return missingRegistryRowResult(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
 	}
 	registryRow, err := DecodeRegistryValue(rawVal)
 	if err != nil {
 		return pkgerrors.Wrapf(err,
 			"local_epoch rollback guard: decode writer-registry row for full_node_id=%#x dek_id=%d",
 			fullNodeID, activeStorageDEKID)
+	}
+	// Defense-in-depth: the registry key narrows full_node_id to
+	// its low 16 bits, so a row at the same key MIGHT belong to a
+	// DIFFERENT writer that previously occupied the same 16-bit
+	// slot. ErrNodeIDCollision is the primary layer that catches
+	// active collisions, but historical occupancy (a since-removed
+	// member that left its row behind) is not in the route-catalog
+	// snapshot the collision guard reads. Treat a row whose
+	// FullNodeID does NOT match the caller's expectation as if no
+	// row exists for THIS node — route through the §5.2
+	// storage_envelope_active split. Pre-cutover this is a
+	// freshly-joined-learner-with-historical-collision case (allow
+	// startup; the next OpRegistration will overwrite the foreign
+	// row at §4.1 case 1). Post-cutover it is an unrecoverable
+	// missing rollback anchor for THIS node (refuse startup).
+	if registryRow.FullNodeID != fullNodeID {
+		return missingRegistryRowResult(storageEnvelopeActive, fullNodeID, activeStorageDEKID)
 	}
 	if sidecarLocalEpoch <= registryRow.LastSeenLocalEpoch {
 		return pkgerrors.Wrapf(ErrLocalEpochRollback,
