@@ -396,13 +396,17 @@ var redisLeaderErrorPhrases = []string{
 // "rpc error: code = X desc = <orig>" both leave the original
 // sentinel text at the END of the composed string; a Contains
 // match would tag a user-controlled key like "key: not leader:
-// conflict" as transient. Lower-cased once up front because both
-// phrase sets are lower-case and the carmine wire is case-
-// preserving.
+// conflict" as transient.
+//
+// strings.EqualFold on the trailing slice — rather than
+// strings.ToLower + HasSuffix — avoids allocating a copy of the
+// full message. cockroachdb/errors messages can be multi-KB when
+// they carry a serialized stack trace; this matters on the error
+// path under leader-loss storms.
 func hasTransientLeaderSuffix(msg string) bool {
-	lower := strings.ToLower(msg)
 	for _, phrase := range redisLeaderErrorPhrases {
-		if strings.HasSuffix(lower, phrase) {
+		if len(msg) >= len(phrase) &&
+			strings.EqualFold(msg[len(msg)-len(phrase):], phrase) {
 			return true
 		}
 	}
