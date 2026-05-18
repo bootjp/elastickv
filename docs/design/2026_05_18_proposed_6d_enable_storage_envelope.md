@@ -159,14 +159,46 @@ defense-in-depth posture used by `RotateSubRotateDEK`):
    cutover sub-tag from `RotateSubRotateDEK` which always carries
    a fresh wrapped DEK. A non-empty `Wrapped` on this sub-tag is
    a malformed proposal.
-3. `DEKID == sidecar.Active.Storage` at apply time — guarantees
-   the cutover flips the state for the currently-active DEK,
-   matching the §4.1 envelope-encoder's input.
+3. `DEKID == sidecar.Active.Storage` at apply time. **Race
+   posture for a concurrent `RotateDEK`:** if a `RotateDEK`
+   entry commits between the cutover's propose and its apply,
+   `sidecar.Active.Storage` advances to the new DEK and the
+   cutover's `DEKID` no longer matches. This is NOT routed
+   through `ErrEncryptionApply` (halt-on-apply) — that would
+   escalate a normal admin race into a cluster-stopping
+   condition. Instead, the apply path treats the
+   `DEKID != Active.Storage` case as a benign no-op:
+   `ApplyRotation` advances `RaftAppliedIndex` (so the entry
+   is consumed and not replayed) and records the entry as a
+   `ErrCutoverDEKIDStale` outcome on the §6.4 response detail
+   ride-along. The cutover-RPC mutator sees the stale outcome
+   and surfaces `FailedPrecondition: ErrCutoverDEKIDStale` to
+   the operator with a hint to retry against the new
+   `Active.Storage` — exactly the retryable-precondition
+   shape the codex finding asks for. The §4.1
+   envelope-encoder invariant ("the active DEK is the only
+   key that can encode a new envelope") is still preserved
+   because the cutover entry is consumed without flipping
+   `StorageEnvelopeActive`, leaving the cluster in the
+   same state as if the cutover had never been proposed.
 4. `sidecar.StorageEnvelopeActive == false` at apply time —
-   idempotency guard. A duplicate cutover proposal (e.g. operator
-   retries the RPC after a network blip and the first call
-   already committed) returns the existing applied index instead
-   of halting apply on a "rotation when already active" error.
+   idempotency guard. A duplicate cutover proposal (e.g.
+   operator retries the RPC after a network blip and the first
+   call already committed) is consumed by the apply path
+   *without* re-flipping the field; the §6.4 stable cutover
+   index (`StorageEnvelopeCutoverIndex`) was set on the FIRST
+   apply and is NOT overwritten on subsequent applies, so any
+   number of concurrently-committed duplicates resolve to the
+   same idempotency-token value. The cutover-RPC mutator
+   serializes overlapping calls on the propose side (a
+   per-default-group mutator lock — `RotateDEK` and
+   `EnableStorageEnvelope` share the same lock so they cannot
+   interleave between propose and apply), so the
+   "concurrent-overlap" race the codex finding identifies is
+   bounded to "at most one cutover entry can be in flight at a
+   time across all in-flight admin RPCs". Subsequent RPCs hit
+   the §3.2 `AlreadyExists` path with the original
+   `StorageEnvelopeCutoverIndex` from §6.4.
 
 ### 2.2 No new opcode
 
