@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"sync"
 	"sync/atomic"
 
 	lua "github.com/yuin/gopher-lua"
@@ -34,32 +33,57 @@ const luaResetKeySlack = 8
 // table, redis, cjson, cmsgpack).
 const luaWhitelistedTableHint = 8
 
+// DefaultLuaPoolMaxIdle is the default upper bound on idle pooled
+// *lua.LState instances retained for reuse. Each pooled state holds
+// the base stdlib + redis/cjson/cmsgpack closures + per-state
+// snapshot tables (globals / tables / metatables); empirically ~200
+// KiB of long-lived heap per state. 64 is sized to comfortably cover
+// typical Redis-side EVAL/EVALSHA concurrency (one in-flight script
+// per connection up to redcon's default worker pool) without
+// retaining a long tail of warm states after a burst subsides.
+//
+// Operators expecting sustained higher concurrency can raise the cap
+// with --redisLuaMaxIdleStates; concurrency that exceeds the cap
+// still works correctly — excess get() calls fall through to a fresh
+// allocation (miss) and excess put() calls drop the state for the GC
+// (drop). The cap therefore controls memory floor, not throughput
+// ceiling.
+//
+// Exported so main.go can use it as the default for the
+// --redisLuaMaxIdleStates flag instead of duplicating the literal
+// (which trips the mnd lint and creates a drift source if the
+// adapter-side default changes).
+const DefaultLuaPoolMaxIdle = 64
+
 // luaStatePool pools *lua.LState instances to cut heap/GC pressure on
 // high-rate EVAL / EVALSHA workloads (e.g. BullMQ ~10 scripts/s, where
 // each fresh state allocs ~34% of in-use heap via newFuncContext,
 // newRegistry, newFunctionProto).
 //
-// Security invariant: no state must leak between scripts. Each pooled
-// state is initialised with a fixed set of base globals (redis, cjson,
-// cmsgpack, table/string/math + base lib helpers, and nil-ed loaders).
-// Three snapshots are captured at construction time:
+// Internal storage is a buffered channel of capacity maxIdle. We
+// previously used sync.Pool, which GC-clears on every cycle and has
+// no operator-tunable capacity; the bounded channel gives a
+// predictable memory floor (maxIdle * per-state footprint) and an
+// observable "states dropped because the pool was full" counter that
+// makes mis-sizing visible. The channel ops are O(1) atomic CAS on
+// the buffered chan; under high concurrency the contention is
+// comparable to sync.Pool's per-P slabs and well below the cost of
+// a single Lua eval. See TestLua_PoolBoundedOverflow for the
+// invariants.
 //
-//   - globalsSnapshot: the full (*any*-keyed) _G map at init. Using an
-//     LValue-keyed map lets the reset path catch non-string-keyed
-//     leaks like `_G[42] = "secret"` or `_G[true] = "bad"`, which
-//     would otherwise survive a naive string-only wipe.
-//   - tableSnapshots: a shallow map from each whitelisted nested
-//     table (string, math, table, redis, cjson, cmsgpack) to its
-//     init-time field set. This is what blocks table-poisoning
-//     attacks such as `string.upper = function() return "pwned" end`
-//     -- merely restoring the `string` *reference* on _G would leave
-//     the shared table's fields still mutated.
-//   - metatableSnapshots: the init-time raw metatable of _G plus of
-//     every whitelisted nested table. Without this, a script calling
-//     `setmetatable(_G, { __index = function() return "pwned" end })`
-//     could leak a poisoned fallback into the next pooled eval via
-//     any undefined-global access. Same risk for `setmetatable(string,
-//     ...)` etc.
+// Security invariant: no state must leak between scripts. Each
+// pooled state is initialised with a fixed set of base globals
+// (redis, cjson, cmsgpack, table/string/math + base lib helpers,
+// and nil-ed loaders). Three snapshots — captured per-state at
+// construction and stored on pooledLuaState — back the reset path:
+// globalsSnapshot (the full LValue-keyed _G map, so non-string-keyed
+// leaks like `_G[42] = "secret"` are caught), tableSnapshots
+// (shallow field sets of the whitelisted nested tables, so
+// `string.upper = function() return "pwned" end` cannot poison
+// reuse), and metatableSnapshots (the init-time raw metatable of
+// _G plus each whitelisted nested table, so a script-installed
+// `setmetatable(_G, { __index = function() … end })` does not
+// leak across evals).
 //
 // On release, the reset routine
 //
@@ -68,33 +92,30 @@ const luaWhitelistedTableHint = 8
 //     poisoning,
 //  2. walks each snapshotted nested table and restores its contents
 //     (deletes script-added fields, rebinds original fields),
-//  3. walks the current global table and deletes every key -- of any
-//     type -- that is not present in the globals snapshot (removes
+//  3. walks the current global table and deletes every key — of any
+//     type — that is not present in the globals snapshot (removes
 //     user-added globals such as KEYS, ARGV, GLOBAL_LEAK, _G[42]),
 //     and
-//  4. restores every globals-snapshot key to its original value (so a
-//     script that did `table = nil` or `redis = evil` cannot poison
-//     the next script).
+//  4. restores every globals-snapshot key to its original value (so
+//     a script that did `table = nil` or `redis = evil` cannot
+//     poison the next script).
 //
-// Additionally the value stack is truncated to 0 and the script
-// context binding is cleared so the redis.call/pcall closures cannot
-// be invoked against a stale context.
-//
-// The redis / cjson / cmsgpack closures are registered ONCE at pool
-// fill time and read the per-eval *luaScriptContext out of each
-// state's own Lua registry (see luaCtxRegistryKey / ctxBinding),
-// which is set on acquire and cleared on release. Closures that
-// would otherwise capture a fresh context per eval no longer need
-// to be re-registered, which is what makes pooling safe and cheap.
-// The registry-backed binding is also the reason redis.call is
-// lock-free in the hot path, unlike the first iteration which used
+// The value stack is also truncated to 0 and the script-context
+// binding is cleared so the redis.call/pcall closures cannot be
+// invoked against a stale context. Those closures are registered
+// ONCE at pool fill time and read the per-eval *luaScriptContext
+// out of each state's own Lua registry (see luaCtxRegistryKey /
+// pooledLuaState.ctxBinding); this is what keeps redis.call
+// lock-free on the hot path, unlike the first iteration which used
 // a package-level map guarded by sync.RWMutex.
 type luaStatePool struct {
-	pool sync.Pool
+	idle    chan *pooledLuaState
+	maxIdle int
 
-	// hits / misses are exposed for tests and metrics.
+	// hits / misses / drops are exposed for tests and metrics.
 	hits   atomic.Uint64
 	misses atomic.Uint64
+	drops  atomic.Uint64
 }
 
 // pooledLuaState wraps a *lua.LState plus the immutable snapshot of
@@ -188,23 +209,33 @@ func luaLookupContext(state *lua.LState) (*luaScriptContext, bool) {
 func (r *RedisServer) getLuaPool() *luaStatePool {
 	r.luaPoolOnce.Do(func() {
 		if r.luaPool == nil {
-			r.luaPool = newLuaStatePool()
+			r.luaPool = newLuaStatePoolWithMaxIdle(r.luaPoolMaxIdle)
 		}
 	})
 	return r.luaPool
 }
 
-// newLuaStatePool returns a pool that lazily allocates
-// *pooledLuaState instances on demand. The pool deliberately does NOT
-// set sync.Pool.New: if it did, p.pool.Get() would auto-invoke the
-// constructor on an empty pool and we could not distinguish a fresh
-// allocation from a reused instance. Instead, get() inspects the
-// result of p.pool.Get() -- a nil return signals an empty pool and
-// drives the miss counter plus an explicit newPooledLuaState() call.
-// This keeps the hit/miss metrics honest, which is what the serial
-// reuse tests and the observability counters rely on.
+// newLuaStatePool returns a bounded pool sized at DefaultLuaPoolMaxIdle.
+// Used by test fixtures and any caller that does not thread a
+// configured cap through. Production wires the explicit cap via
+// newLuaStatePoolWithMaxIdle from NewRedisServer.
 func newLuaStatePool() *luaStatePool {
-	return &luaStatePool{}
+	return newLuaStatePoolWithMaxIdle(DefaultLuaPoolMaxIdle)
+}
+
+// newLuaStatePoolWithMaxIdle returns a pool whose idle backing
+// channel is sized at maxIdle. Non-positive values clamp to
+// DefaultLuaPoolMaxIdle to keep get/put semantics well-defined
+// (cap=0 would make every put() drop, which is never what we want
+// — callers asking for "no pool" should bypass the pool entirely).
+func newLuaStatePoolWithMaxIdle(maxIdle int) *luaStatePool {
+	if maxIdle < 1 {
+		maxIdle = DefaultLuaPoolMaxIdle
+	}
+	return &luaStatePool{
+		idle:    make(chan *pooledLuaState, maxIdle),
+		maxIdle: maxIdle,
+	}
 }
 
 // newPooledLuaState builds a fresh pooled state: base libs, dangerous
@@ -484,36 +515,56 @@ func resetTableContents(tbl *lua.LTable, originalFields map[lua.LValue]lua.LValu
 // pointer write to the state-local ctxBinding userdata -- no lock,
 // no global map.
 //
-// Because newLuaStatePool does NOT set sync.Pool.New, p.pool.Get()
-// returns nil when the pool is empty; that is the signal for a miss
-// (fresh allocation). A non-nil return is a genuine reuse and counts
-// as a hit. The defensive type-assertion guard preserves behaviour if
-// a future refactor ever puts something unexpected into the pool.
+// A non-blocking recv that does not match either case fires the
+// default branch (allocation miss). The defensive nil guard
+// preserves behaviour if a future refactor ever sends an unexpected
+// value through the idle channel.
+//
+// The ctxBinding assignment and return are centralized after the
+// select so every path goes through one binding step. This was a
+// gemini r1 review nit: refactor for clarity rather than duplicate
+// the binding in each branch.
 func (p *luaStatePool) get(ctx *luaScriptContext) *pooledLuaState {
-	v := p.pool.Get()
-	if v == nil {
-		p.misses.Add(1)
-		pls := newPooledLuaState()
-		pls.ctxBinding.Value = ctx
-		return pls
-	}
-	pls, ok := v.(*pooledLuaState)
-	if !ok || pls == nil {
-		// Defence in depth: anything other than a *pooledLuaState is
-		// treated as an allocation miss rather than a silent hit.
+	var pls *pooledLuaState
+	select {
+	case pls = <-p.idle:
+		if pls != nil {
+			p.hits.Add(1)
+		} else {
+			// Intentionally-unreachable defence in depth:
+			// put() above already guards `if pls == nil ||
+			// pls.state == nil { return }`, so no caller can
+			// enqueue a nil. If a future refactor breaks that
+			// invariant the nil arrives here as a miss + fresh
+			// allocation rather than a runtime panic. Not a
+			// branch a reader should try to hit.
+			p.misses.Add(1)
+			pls = newPooledLuaState()
+		}
+	default:
 		p.misses.Add(1)
 		pls = newPooledLuaState()
-		pls.ctxBinding.Value = ctx
-		return pls
 	}
-	p.hits.Add(1)
 	pls.ctxBinding.Value = ctx
 	return pls
 }
 
-// put resets the state and returns it to the pool. If the state is
-// somehow closed (shouldn't happen on the happy path), it is dropped
-// so a dead VM is never handed out again.
+// put resets the state and tries to return it to the pool. If the
+// state is closed (shouldn't happen on the happy path) or the idle
+// channel is full it is dropped so the GC can reclaim it; the drop
+// counter makes pool saturation observable so operators can tune
+// maxIdle.
+//
+// Fast-path: when len(p.idle) already equals maxIdle the put is
+// guaranteed to overflow, so skip the (non-trivial) pls.reset()
+// — restoring the globals / tables / metatables snapshots is
+// pointless work for a state that is about to be Close()'d. This is
+// a gemini r1 review optimisation; under saturation the EVAL hot
+// path spends much less CPU on doomed resets. The check is a racy
+// snapshot of len(); concurrent puts can still observe stale
+// "len < max" and race into the select below, where the same
+// channel-full guard catches them — so the fast-path is a strict
+// improvement, not a new correctness requirement.
 func (p *luaStatePool) put(pls *pooledLuaState) {
 	if pls == nil || pls.state == nil {
 		return
@@ -527,15 +578,37 @@ func (p *luaStatePool) put(pls *pooledLuaState) {
 	if pls.state.IsClosed() {
 		return
 	}
+	if len(p.idle) >= p.maxIdle {
+		p.drops.Add(1)
+		pls.state.Close()
+		return
+	}
 	pls.reset()
-	p.pool.Put(pls)
+	select {
+	case p.idle <- pls:
+	default:
+		// Idle channel filled between the fast-path check and the
+		// select (concurrent puts winning the race). Drop the state.
+		p.drops.Add(1)
+		pls.state.Close()
+	}
 }
 
-// Hits / Misses are test hooks. They count Get() outcomes, not
-// allocations proper, but in practice they track allocation avoidance
-// well enough for the "is the pool actually being used?" test.
+// Hits / Misses / Drops are test hooks. They count Get/Put outcomes,
+// not allocations proper, but in practice they track allocation
+// avoidance well enough for the "is the pool actually being used?"
+// test and the "is maxIdle too low for the workload?" diagnostic.
 func (p *luaStatePool) Hits() uint64   { return p.hits.Load() }
 func (p *luaStatePool) Misses() uint64 { return p.misses.Load() }
+func (p *luaStatePool) Drops() uint64  { return p.drops.Load() }
+
+// Idle reports the number of states currently sitting in the pool.
+// Useful for metrics gauges and for tests asserting bounded retention.
+func (p *luaStatePool) Idle() int { return len(p.idle) }
+
+// MaxIdle reports the configured cap. Exposed for diagnostics so
+// /admin can surface "(idle / maxIdle)" to operators.
+func (p *luaStatePool) MaxIdle() int { return p.maxIdle }
 
 // registerPooledRedisModule installs redis.call / redis.pcall /
 // redis.sha1hex / redis.status_reply / redis.error_reply where the
