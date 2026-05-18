@@ -1533,6 +1533,16 @@ func startRedisServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Gr
 		adapter.WithRedisCompactor(deltaCompactor),
 		adapter.WithLuaPoolMaxIdle(*redisLuaMaxIdleStates),
 	)
+	// Wire the bounded Lua VM pool into Prometheus. The metrics
+	// (hits/misses/drops/idle/max_idle) are read at scrape time via
+	// CounterFunc / GaugeFunc, so the EVAL hot path stays
+	// observability-free. A registration error degrades observability
+	// only — keep running and surface via slog so the operator can
+	// notice on the next dashboard load rather than seeing a crash
+	// loop here.
+	if err := redisServer.RegisterLuaPoolMetrics(metricsRegistry.Registerer()); err != nil {
+		slog.Warn("failed to register lua pool metrics; pool counters will be invisible in Prometheus", "err", err)
+	}
 	eg.Go(func() error {
 		defer redisServer.Stop()
 		stop := make(chan struct{})

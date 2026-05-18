@@ -24,6 +24,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
 )
@@ -552,6 +553,31 @@ func (r *RedisServer) Close() error {
 	}
 	if r.baseCancel != nil {
 		r.baseCancel()
+	}
+	return nil
+}
+
+// RegisterLuaPoolMetrics wires this server's bounded Lua VM pool
+// into the supplied Prometheus registerer, exposing five metrics
+// (hits / misses / drops / idle / max_idle). See
+// monitoring.RegisterLuaPool for the per-metric definitions.
+//
+// Returns nil if r, the pool, or registerer is nil — callers can
+// invoke this unconditionally from main.go without guarding for
+// test fixtures. The registration uses prometheus.NewCounterFunc /
+// NewGaugeFunc, so the values are read from the pool's atomic
+// counters at scrape time; no observability load is added to the
+// EVAL hot path.
+func (r *RedisServer) RegisterLuaPoolMetrics(registerer prometheus.Registerer) error {
+	if r == nil || registerer == nil {
+		return nil
+	}
+	pool := r.getLuaPool()
+	if pool == nil {
+		return nil
+	}
+	if err := monitoring.RegisterLuaPool(registerer, pool); err != nil {
+		return errors.Wrap(err, "register lua pool metrics")
 	}
 	return nil
 }
