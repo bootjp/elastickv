@@ -100,6 +100,25 @@ func TestRegisterLuaPool_NilSafe(t *testing.T) {
 	require.NoError(t, RegisterLuaPool(nil, nil))
 }
 
+// TestRegisterLuaPool_IdempotentOnDoubleRegister locks in the
+// AlreadyRegisteredError absorption added per gemini r1 review:
+// calling RegisterLuaPool a second time against the same registerer
+// must succeed silently rather than returning a noisy error that
+// main.go would surface as a slog.Warn. Test harnesses that share a
+// registry across sub-tests rely on this.
+func TestRegisterLuaPool_IdempotentOnDoubleRegister(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	src := &fakeLuaPool{maxIdle: 64}
+	require.NoError(t, RegisterLuaPool(reg, src))
+	// Second call must be a no-op success: each of the five
+	// CounterFunc / GaugeFunc collectors AlreadyRegisteredError-
+	// returns on Register(), and the loop should absorb that.
+	require.NoError(t, RegisterLuaPool(reg, src),
+		"double registration must be idempotent so noisy retry paths "+
+			"don't crash main.go via the slog.Warn return")
+}
+
 // srcCollectorByName is a tiny helper that fetches a registered
 // collector by metric name so testutil.ToFloat64 can read its
 // scrape value. It hides the gather + scan boilerplate from each

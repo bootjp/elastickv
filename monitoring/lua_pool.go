@@ -81,6 +81,15 @@ func RegisterLuaPool(registerer prometheus.Registerer, src LuaPoolSource) error 
 	}
 	for _, c := range collectors {
 		if err := registerer.Register(c); err != nil {
+			// Idempotent on AlreadyRegistered so callers that retry
+			// (test harnesses with shared registries, hypothetical
+			// hot-reload paths) don't trip a spurious slog.Warn in
+			// main.go. Any other error — invalid metric name,
+			// inconsistent labels, registry conflict — surfaces.
+			var already prometheus.AlreadyRegisteredError
+			if errors.As(err, &already) {
+				continue
+			}
 			return errors.Wrap(err, "register lua pool collector")
 		}
 	}
