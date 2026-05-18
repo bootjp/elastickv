@@ -144,7 +144,7 @@ A rotation entry with `SubTag = 0x04` carries:
 | `SubTag` | `uint8` | `0x04` |
 | `Purpose` | `uint8` | MUST be `PurposeStorage` (`0x01`); any other value → halt apply with `ErrEncryptionApply` |
 | `DEKID` | `uint32` | MUST equal `sidecar.Active.Storage` at the leader at propose time; the applier re-checks at apply time |
-| `Wrapped` | `[]byte` | MUST be empty; the cutover does NOT add a new DEK |
+| `Wrapped` | `[]byte` | MUST be empty (`len(Wrapped) == 0`, NOT `Wrapped == nil` — see constraint #2 below for why); the cutover does NOT add a new DEK |
 | `ProposerRegistration` | `RegistrationPayload` | MUST have `DEKID = sidecar.Active.Storage`, `LocalEpoch` ≥ current registry record for that node (the proposer's epoch is expected to be at least the registry's current value; the strict-ahead invariant from §5.2 means after a normal boot it is strictly ahead, but a leader proposing the cutover on the same boot where it registered may legitimately be at equality, so the constraint accepts `=` as well as `>`). A proposer with `LocalEpoch < registry` is stale and the proposal is rejected. |
 
 Constraints (validated in both the
@@ -415,7 +415,7 @@ the rationale):
 | Sidecar missing or `Active.Storage == 0` | `FailedPrecondition` | new `ErrEncryptionNotBootstrapped` |
 | Already active (idempotent retry path) | `OK` | response's `was_already_active=true` and `applied_index = sidecar.StorageEnvelopeCutoverIndex` (the original cutover, §6.4). The OK code is intentional (see §3.2 step 5 + §11.2): unary gRPC drops the response body on non-OK status, so the idempotency contract must live on the success path. The CLI distinguishes the two outcomes by reading `was_already_active`. |
 | Capability fan-out failed | `FailedPrecondition` | new `ErrCapabilityCheckFailed` (lists offending node IDs) |
-| Apply halted (`SubTag` decode error, `Purpose != Storage`, `Wrapped != nil`, etc.) | `Internal` | existing `ErrEncryptionApply`. The duplicate-cutover-entry case is NOT in this row — §2.1 constraint #4 defines it as a benign consumed no-op (the cutover applier returns nil; nothing halts). |
+| Apply halted (`SubTag` decode error, `Purpose != Storage`, `len(Wrapped) > 0`, etc.) | `Internal` | existing `ErrEncryptionApply`. The duplicate-cutover-entry case is NOT in this row — §2.1 constraint #4 defines it as a benign consumed no-op (the cutover applier returns nil; nothing halts). |
 
 ## 4. Voters ∪ Learners capability fan-out
 
