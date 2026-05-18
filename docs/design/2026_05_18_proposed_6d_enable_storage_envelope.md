@@ -77,12 +77,20 @@ atomic in the user-visible RPC.
     fan-out — because the startup-guard phase runs before the
     gRPC server is up; see §5.1 "Why local-snapshot-only" for
     the full rationale.
-  - `ErrLocalEpochRollback` — at startup, compare the local
-    sidecar's per-DEK `local_epoch` against the leader's
-    writer-registry record (via the existing `ResyncSidecar`
-    RPC). Refuse if the local epoch is strictly less than the
-    record. This catches a stale node restarted on a sidecar
-    older than the cluster's writer registry.
+  - `ErrLocalEpochRollback` — at startup, read the LOCAL Pebble
+    writer-registry record for `(full_node_id,
+    active_storage_dek_id)`. The writer-registry is local state
+    on every node post-bootstrap (every node applies the same
+    `OpRegistration` and `OpBootstrap` entries); no RPC is
+    required. Compare against
+    `sidecar.Keys[active_storage_dek_id].LocalEpoch`. Refuse if
+    `sidecar < registry`. This catches a stale node restarted
+    on a sidecar older than the cluster's writer registry (e.g.
+    sidecar restored from an old backup). Same
+    local-state-only posture as `ErrNodeIDCollision`: the
+    startup-guard phase has no gRPC server up to host a
+    `ResyncSidecar` RPC, and the local Raft-applied state is
+    authoritative.
 - **CLI** `elastickv-admin encryption enable-storage-envelope` —
   invokes the new RPC; prints the resulting applied index and the
   capability-fan-out summary.
@@ -352,6 +360,45 @@ handles it, see `distribution/watcher.go`).
 (no encryption → no nonce reuse risk). Skip when the
 route-catalog snapshot is empty (e.g. fresh single-node
 cluster pre-bootstrap; nothing to compare yet).
+
+**Collision probability and mitigation.** A 16-bit `node_id`
+derived via `xxhash(full_node_id) & 0xFFFF` carries a
+birthday-bound collision risk of approximately N²/(2·2¹⁶) for
+N members — concretely ~0.2% at N=32, ~3% at N=128, ~50% at
+N=300. For a typical Raft-replicated cluster (3–7 voters, small
+learner pool) the collision probability is well under 0.01%,
+but the failure mode is "refuse to boot" rather than "silent
+nonce reuse", so a hit is operationally noisy.
+
+Mitigations available to the operator when `ErrNodeIDCollision`
+fires:
+
+  1. **Re-roll the colliding member's `full_node_id`.** The
+     `full_node_id` is a 64-bit operator-chosen identifier
+     (typically a uint64 derived from hostname or assigned by
+     the deployment tool). Picking a different value
+     deterministically remaps the 16-bit slice. The Stage 6F
+     `--encryption-rotate-on-startup` ergonomics flag will let
+     operators retry the boot with a fresh `full_node_id`
+     without a manual sidecar rewrite. Documented in the
+     operator runbook delivered with Stage 6D-2.
+
+  2. **Coordinated ID assignment** (cluster-wide convention).
+     For new deployments, the operator can pre-compute the
+     16-bit hash for each candidate `full_node_id` and only
+     accept assignments that maintain a collision-free set.
+     The 6D-2 CLI will ship a probe subcommand
+     (`elastickv-admin encryption probe-node-id
+     --full-node-id=<u64>`) that returns the derived 16-bit
+     `node_id` and the current cluster's allocated set, so
+     operators can verify before joining a node.
+
+  3. **Future widening** (out of scope, noted for the record).
+     The 16-bit `node_id` width is fixed by the §4.1 GCM
+     nonce-field layout. Widening to 24 or 32 bits would
+     require a wire-format change to the storage envelope —
+     too large for a Stage 6 sub-PR; documented here so future
+     work knows the ceiling exists.
 
 ### 5.2 `ErrLocalEpochRollback`
 
