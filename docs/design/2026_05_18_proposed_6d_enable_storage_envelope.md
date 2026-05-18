@@ -415,7 +415,8 @@ the rationale):
 | Sidecar missing or `Active.Storage == 0` | `FailedPrecondition` | new `ErrEncryptionNotBootstrapped` |
 | Already active (idempotent retry path) | `OK` | response's `was_already_active=true` and `applied_index = sidecar.StorageEnvelopeCutoverIndex` (the original cutover, §6.4). The OK code is intentional (see §3.2 step 5 + §11.2): unary gRPC drops the response body on non-OK status, so the idempotency contract must live on the success path. The CLI distinguishes the two outcomes by reading `was_already_active`. |
 | Capability fan-out failed | `FailedPrecondition` | new `ErrCapabilityCheckFailed` (lists offending node IDs) |
-| Apply halted (`SubTag` decode error, `Purpose != Storage`, `len(Wrapped) > 0`, etc.) | `Internal` | existing `ErrEncryptionApply`. The duplicate-cutover-entry case is NOT in this row — §2.1 constraint #4 defines it as a benign consumed no-op (the cutover applier returns nil; nothing halts). |
+| DEKID stale at apply (`RotateDEK` raced between propose and apply) | `FailedPrecondition` | new `ErrCutoverDEKIDStale` — benign no-op at FSM: `RaftAppliedIndex` advances, `StorageEnvelopeActive` stays false, no halt. Handler surfaces `FailedPrecondition` to operator with retry hint (re-run after the rotation has settled). See §2.1 constraint #3 for the race posture and rationale; the cutover IS NOT routed to `ErrEncryptionApply` because halting on a benign DEKID race would brick the cluster on every legitimate `RotateDEK` + `EnableStorageEnvelope` interleave. |
+| Apply halted (`SubTag` decode error, `Purpose != Storage`, `len(Wrapped) > 0`, etc.) | `Internal` | existing `ErrEncryptionApply`. The duplicate-cutover-entry case (§2.1 constraint #4) and the DEKID-stale case (§2.1 constraint #3, row above) are NOT in this row — both are benign consumed no-ops, not halt-apply causes. |
 
 ## 4. Voters ∪ Learners capability fan-out
 
