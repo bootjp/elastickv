@@ -56,8 +56,11 @@ atomic in the user-visible RPC.
   later by Stage 6E.
 - **FSM apply path**: extends `ApplyRotation` in
   `internal/encryption/applier.go` to handle the new sub-tag —
-  sets `sidecar.StorageEnvelopeActive = true` and persists via
-  the same `WriteSidecar` fsync that 6C-2d uses for
+  sets `sidecar.StorageEnvelopeActive = true` AND records the
+  applying raft index in a new `StorageEnvelopeCutoverIndex`
+  sidecar field (symmetric with the existing
+  `RaftEnvelopeCutoverIndex` field; see §6.4). Both writes land
+  inside the same `WriteSidecar` fsync that 6C-2d uses for
   `RaftAppliedIndex` advancement.
 - **§6.2 storage-layer toggle**: `store/mvcc_store.go` (and the
   underlying `store/lsm_store.go`) read `StorageEnvelopeActive`
@@ -219,6 +222,13 @@ message EnableStorageEnvelopeRequest {
 }
 
 message EnableStorageEnvelopeResponse {
+  // applied_index is the raft index of the cutover entry. On a
+  // freshly-successful call this is the entry the leader just
+  // proposed and waited to apply. On a retried call that returns
+  // AlreadyExists, this is the recorded
+  // sidecar.StorageEnvelopeCutoverIndex from the ORIGINAL
+  // cutover (see §6.4) — stable across arbitrary subsequent
+  // encryption-relevant Raft activity.
   uint64 applied_index = 1;
 
   // capability_summary records which (full_node_id) members were
@@ -226,7 +236,20 @@ message EnableStorageEnvelopeResponse {
   // Lets the operator see the membership view the leader used to
   // approve the cutover — useful for post-mortem if the leader's
   // route-catalog view diverges from the operator's expectation.
+  // Empty on AlreadyExists retries (the membership view of the
+  // original cutover is not retained).
   repeated CapabilityVerdict capability_summary = 2;
+
+  // cutover_index_unknown is set by the defensive branch
+  // described in §6.4 — only fires if a sidecar reports
+  // StorageEnvelopeActive=true with
+  // StorageEnvelopeCutoverIndex=0 (operationally impossible
+  // under normal apply; hedges against future schema rollback /
+  // hand-edited sidecar). On a healthy cluster this stays
+  // false; applied_index then carries
+  // sidecar.RaftAppliedIndex as a best-effort fallback. The
+  // CLI surfaces it as a warning.
+  bool   cutover_index_unknown = 3;
 }
 
 message CapabilityVerdict {
@@ -256,8 +279,12 @@ leader. Server-side sequence:
    "DEK bootstrap if necessary" reads as a separate explicit
    command in 6D.
 5. Verify sidecar.StorageEnvelopeActive == false — if already
-   active, return AlreadyExists with the recorded applied
-   index of the original cutover entry (idempotent retry).
+   active, return AlreadyExists with
+   sidecar.StorageEnvelopeCutoverIndex (the original cutover
+   entry's apply index, recorded by §6.4) as the response's
+   applied_index. This is stable across subsequent
+   encryption-relevant Raft entries that advance the generic
+   RaftAppliedIndex.
 6. Run the Voters ∪ Learners capability fan-out (§4). On any
    member reporting encryption_capable=false or unreachable
    within one election timeout, return
@@ -277,7 +304,7 @@ Server-side failure modes (each maps to a typed wrapped error):
 | Encryption disabled / KEK absent | `FailedPrecondition` | existing 6B `ErrEncryptionMutatorsDisabled` |
 | Caller is a follower | `FailedPrecondition` | existing `ErrNotLeader` |
 | Sidecar missing or `Active.Storage == 0` | `FailedPrecondition` | new `ErrEncryptionNotBootstrapped` |
-| Already active (idempotent retry path) | `AlreadyExists` | new `ErrStorageEnvelopeAlreadyActive` (carries the recorded apply index) |
+| Already active (idempotent retry path) | `AlreadyExists` | new `ErrStorageEnvelopeAlreadyActive` (response's `applied_index` = `sidecar.StorageEnvelopeCutoverIndex` from §6.4 — stable across subsequent encryption activity) |
 | Capability fan-out failed | `FailedPrecondition` | new `ErrCapabilityCheckFailed` (lists offending node IDs) |
 | Apply halted (`SubTag` decode, idempotency, etc.) | `Internal` | existing `ErrEncryptionApply` |
 
@@ -539,6 +566,64 @@ version. The `rewrite` migration command (deferred to Stage 9)
 backfills the old versions later; until then the mix is correct
 by construction.
 
+### 6.4 New sidecar field: `StorageEnvelopeCutoverIndex`
+
+Stage 6D-4 adds a new field to the §5.1 sidecar struct,
+symmetric with the existing `RaftEnvelopeCutoverIndex` reserved
+for Stage 6E:
+
+```go
+type Sidecar struct {
+    // ...existing fields...
+
+    StorageEnvelopeActive       bool   `json:"storage_envelope_active"`
+    StorageEnvelopeCutoverIndex uint64 `json:"storage_envelope_cutover_index"` // NEW in 6D-4
+    RaftEnvelopeCutoverIndex    uint64 `json:"raft_envelope_cutover_index"`    // reserved for 6E
+    RaftAppliedIndex            uint64 `json:"raft_applied_index"`             // 6C-2d
+}
+```
+
+**Apply-time semantics.** When `ApplyRotation` handles the
+`RotateSubEnableStorageEnvelope` sub-tag at raft index K, it
+writes:
+
+  - `sc.StorageEnvelopeActive = true`
+  - `sc.StorageEnvelopeCutoverIndex = K`
+  - `sc.RaftAppliedIndex` advanced to K via the existing
+    `advanceRaftAppliedIndex` helper shipped in 6C-2d
+
+All three writes land inside the single crash-durable
+`WriteSidecar` fsync. Atomicity is provided by the §5.1
+write-and-rename protocol — a crash mid-apply leaves either the
+pre-cutover sidecar or the post-cutover sidecar on disk, never
+a torn mix.
+
+**Idempotency contract for `AlreadyExists`.** The Stage 6D-6
+RPC handler reads `sc.StorageEnvelopeCutoverIndex` directly
+when returning `ErrStorageEnvelopeAlreadyActive` to a retried
+call. Because that field is set at apply time and never
+re-written by later encryption entries (only the cutover
+entry's apply sets it), the response carries the **original**
+cutover index regardless of how many subsequent
+encryption-relevant Raft entries have advanced
+`RaftAppliedIndex`. Operators and automation can use this as a
+stable idempotency token across arbitrary cluster activity
+following the original cutover.
+
+Older sidecars (pre-6D-4) decode the JSON with the field
+absent, in which case `StorageEnvelopeCutoverIndex` defaults to
+`0`. A `0` value on a sidecar where `StorageEnvelopeActive` is
+also false is the "cutover hasn't happened yet" baseline. A `0`
+value on a sidecar where `StorageEnvelopeActive == true` is
+operationally impossible (the apply path writes both fields
+together) but, defensively, the 6D-6 handler treats it as
+"original index unknown — return the current `RaftAppliedIndex`
+with a `cutover_index_unknown: true` flag in the response" so
+the cutover-completed posture is still reported to the
+operator. This branch should never fire in practice; it exists
+only to harden against a hypothetical sidecar-edit attack or
+a future schema rollback.
+
 ## 7. Decomposition into sub-PRs
 
 | Sub-PR | Surface | Land order | Notes |
@@ -546,7 +631,7 @@ by construction.
 | **6D-1** | This design doc | First | Doc-only; reviewable as a self-contained record |
 | **6D-2** | 6C-3 startup guards (`ErrNodeIDCollision` + `ErrLocalEpochRollback`) | Second | Cluster-wide guards bundled per parent doc §6C-3. No mutator changes. |
 | **6D-3** | Capability fan-out helper in `internal/admin/` | Third | Used by the cutover RPC (6D-6) and reused later by Stage 6E. Standalone unit-testable. |
-| **6D-4** | Wire format addition: `RotateSubEnableStorageEnvelope = 0x04` + `ApplyRotation` sub-tag dispatch (writes `StorageEnvelopeActive=true` in sidecar) | Fourth | No CLI, no §6.2 hookup yet. FSM-level testable with the existing applier_test patterns. Operator-inert at this point. |
+| **6D-4** | Wire format addition: `RotateSubEnableStorageEnvelope = 0x04` + `readRotationSubTag` whitelist (§2.2) + `ApplyRotation` sub-tag dispatch (writes `StorageEnvelopeActive=true` AND `StorageEnvelopeCutoverIndex=raftIdx` in sidecar; both writes inside one `WriteSidecar` fsync) | Fourth | No CLI, no §6.2 hookup yet. FSM-level testable with the existing applier_test patterns. Adds the new `StorageEnvelopeCutoverIndex uint64` field to the sidecar struct (§6.4). Operator-inert at this point. |
 | **6D-5** | §6.2 storage-layer toggle (PutAt reads `StorageEnvelopeActive`) | Fifth | The §4.1 envelope encoder is already in `lsm_store.go`; this PR wires the toggle in front of it. Independent unit tests. Still operator-inert until 6D-6. |
 | **6D-6** | `EnableStorageEnvelope` admin RPC + CLI command + integration test | Sixth | Composes 6D-3 + 6D-4 + 6D-5 into the user-visible cutover. End-to-end test exercises a single-node cluster doing Bootstrap → EnableStorageEnvelope → Put → read-back-via-envelope. |
 
