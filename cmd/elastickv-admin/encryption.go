@@ -83,6 +83,16 @@ func runEncryptionProbeNodeID(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("encryption probe-node-id", flag.ContinueOnError)
 	fullNodeIDStr := fs.String("full-node-id", "", "candidate 64-bit full_node_id to probe (decimal or 0x-prefixed hex)")
 	if err := fs.Parse(args); err != nil {
+		// flag.ContinueOnError reports `-h`/`--help` via the
+		// sentinel flag.ErrHelp after writing usage to
+		// fs.Output(). Match the convention used by every other
+		// encryption subcommand (status, rotate-dek,
+		// register-writer, bootstrap): treat ErrHelp as a usage
+		// request, exit 0 so shell scripts that test $? on help
+		// invocations don't trip.
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return errors.Wrap(err, "parse probe-node-id flags")
 	}
 	if *fullNodeIDStr == "" {

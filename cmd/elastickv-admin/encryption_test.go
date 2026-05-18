@@ -541,6 +541,21 @@ func TestRunEncryptionProbeNodeID_RejectsBadInput(t *testing.T) {
 	}
 }
 
+// TestRunEncryptionProbeNodeID_HelpFlagExitsZero pins the
+// flag.ErrHelp special-case: every other encryption subcommand
+// (status, rotate-dek, register-writer, bootstrap) returns nil
+// on `-h`/`--help` so shell scripts that test $? on help
+// invocations don't trip. probe-node-id must match the
+// convention. Codex r2 flagged the absent ErrHelp branch.
+func TestRunEncryptionProbeNodeID_HelpFlagExitsZero(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionProbeNodeID([]string{"-h"}, &buf)
+	if err != nil {
+		t.Fatalf("-h: want nil, got %v", err)
+	}
+}
+
 // TestRunEncryptionProbeNodeID_RejectsPartialInput pins the
 // strconv.ParseUint vs fmt.Sscanf distinction: parseUint64WithRadix
 // MUST reject inputs where only a prefix is parseable, because
