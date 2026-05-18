@@ -417,8 +417,21 @@ the 6C-2d gap guard, before serving).
    active_storage_dek_id)` via Pebble directly (no Raft round
    trip — the registry is local state on every node post-bootstrap).
 2. Compare against `sidecar.Keys[active_storage_dek_id].LocalEpoch`.
-3. If `sidecar < registry`, return `ErrLocalEpochRollback`
-   wrapped with both values for operator triage.
+3. If `sidecar <= registry`, return `ErrLocalEpochRollback`
+   wrapped with both values for operator triage. The check is
+   `<=` (not strict `<`) because the §4.1 nonce-monotonicity
+   invariant requires the sidecar's `local_epoch` to be
+   **strictly ahead** of the registry record before this node
+   resumes issuing nonces. On a normal restart the sidecar's
+   epoch is incremented past whatever the registry recorded
+   for the previous run, so `sidecar > registry` holds and the
+   guard passes. An equality match means the sidecar's
+   `local_epoch` has not advanced past the value the writer
+   registry already saw the previous boot use — restarting on
+   that sidecar would reissue `node_id‖local_epoch` with a
+   counter reset to zero and recycle previously-used GCM
+   nonces under the same DEK, which is exactly the divergence
+   class this guard exists to prevent.
 
 **Skip conditions.** Skip when `encryptionEnabled == false`.
 Skip when `sidecar.Active.Storage == 0` (bootstrap not yet
