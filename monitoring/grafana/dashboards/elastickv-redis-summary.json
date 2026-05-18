@@ -1746,7 +1746,7 @@
         "x": 0,
         "y": 71
       },
-      "id": 24,
+      "id": 33,
       "panels": [
         {
           "datasource": "$datasource",
@@ -1814,7 +1814,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "elastickv_lua_pool_idle{job=\"elastickv\"}",
+              "expr": "elastickv_lua_pool_idle{job=\"elastickv\",node_id=~\"$node_id\"}",
               "legendFormat": "idle {{node_id}}",
               "range": true,
               "refId": "A"
@@ -1822,7 +1822,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "elastickv_lua_pool_max_idle{job=\"elastickv\"}",
+              "expr": "elastickv_lua_pool_max_idle{job=\"elastickv\",node_id=~\"$node_id\"}",
               "legendFormat": "max_idle {{node_id}}",
               "range": true,
               "refId": "B"
@@ -1887,7 +1887,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_lua_pool_hits_total{job=\"elastickv\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_hits_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "hits {{node_id}}",
               "range": true,
               "refId": "A"
@@ -1895,7 +1895,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_lua_pool_misses_total{job=\"elastickv\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_misses_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "misses {{node_id}}",
               "range": true,
               "refId": "B"
@@ -1903,7 +1903,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (rate(elastickv_lua_pool_drops_total{job=\"elastickv\"}[5m]))",
+              "expr": "sum by (node_id) (rate(elastickv_lua_pool_drops_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m]))",
               "legendFormat": "drops {{node_id}}",
               "range": true,
               "refId": "C"
@@ -1967,7 +1967,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "sum by (node_id) (increase(elastickv_lua_pool_drops_total{job=\"elastickv\"}[$__range]))",
+              "expr": "sum by (node_id) (increase(elastickv_lua_pool_drops_total{job=\"elastickv\",node_id=~\"$node_id\"}[$__range]))",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
@@ -2033,7 +2033,7 @@
             {
               "datasource": "$datasource",
               "editorMode": "code",
-              "expr": "elastickv_lua_pool_idle{job=\"elastickv\"} / elastickv_lua_pool_max_idle{job=\"elastickv\"}",
+              "expr": "elastickv_lua_pool_idle{job=\"elastickv\",node_id=~\"$node_id\"} / elastickv_lua_pool_max_idle{job=\"elastickv\",node_id=~\"$node_id\"}",
               "legendFormat": "{{node_id}}",
               "range": true,
               "refId": "A"
