@@ -142,7 +142,7 @@ A rotation entry with `SubTag = 0x04` carries:
 | `Purpose` | `uint8` | MUST be `PurposeStorage` (`0x01`); any other value → halt apply with `ErrEncryptionApply` |
 | `DEKID` | `uint32` | MUST equal `sidecar.Active.Storage` at the leader at propose time; the applier re-checks at apply time |
 | `Wrapped` | `[]byte` | MUST be empty; the cutover does NOT add a new DEK |
-| `ProposerRegistration` | `RegistrationPayload` | MUST have `DEKID = sidecar.Active.Storage`, `LocalEpoch` ≤ current registry record for that node |
+| `ProposerRegistration` | `RegistrationPayload` | MUST have `DEKID = sidecar.Active.Storage`, `LocalEpoch` ≥ current registry record for that node (the proposer's epoch is expected to be at least the registry's current value; the strict-ahead invariant from §5.2 means after a normal boot it is strictly ahead, but a leader proposing the cutover on the same boot where it registered may legitimately be at equality, so the constraint accepts `=` as well as `>`). A proposer with `LocalEpoch < registry` is stale and the proposal is rejected. |
 
 Constraints (validated in both the
 `EnableStorageEnvelope` mutator on the server before propose
