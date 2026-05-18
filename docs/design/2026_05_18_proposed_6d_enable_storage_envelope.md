@@ -553,9 +553,16 @@ until 6D-6 wires it).
 - **6D-2 (`ErrLocalEpochRollback`)**: stub a writer-registry
   record at `local_epoch=42` and a sidecar at `local_epoch=10` →
   expect startup-guard error with both values in the wrapped
-  message. Sidecar matches → nil. Sidecar greater → nil.
-  `encryptionEnabled == false` → nil. Bootstrap not committed →
-  nil.
+  message. Sidecar equal to registry (`local_epoch=42` on both
+  sides) → expect startup-guard error too (the §5.2 strict-ahead
+  contract: a node may only resume issuing nonces when its
+  sidecar is STRICTLY ahead of the registry record; the equality
+  case would replay the same `(node_id, local_epoch)` prefix and
+  reuse the counter under the same DEK). Sidecar strictly
+  greater than registry → nil. `encryptionEnabled == false` →
+  nil. Bootstrap not committed → nil. Writer-registry has no
+  record for this node → nil (freshly joined learner that
+  hasn't proposed a `RegisterEncryptionWriter` yet).
 - **6D-3 (fan-out)**: stub the `DialFunc` with a table-driven
   test of (every-capable, one-not-capable, one-unreachable,
   duplicate-nodes-deduplicated). Confirm `FanoutResult.OK`
