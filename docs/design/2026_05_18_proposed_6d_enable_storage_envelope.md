@@ -155,10 +155,16 @@ defense-in-depth posture used by `RotateSubRotateDEK`):
 1. `Purpose == PurposeStorage` — flipping storage envelope ON
    does not affect the raft DEK; using any other purpose value
    is a malformed proposal.
-2. `Wrapped == nil` — empty wrapped DEK distinguishes the
+2. `len(Wrapped) == 0` — empty wrapped DEK distinguishes the
    cutover sub-tag from `RotateSubRotateDEK` which always carries
    a fresh wrapped DEK. A non-empty `Wrapped` on this sub-tag is
-   a malformed proposal.
+   a malformed proposal. The check MUST be length-based, NOT
+   `Wrapped == nil`: the current wire decoder
+   (`internal/encryption/fsmwire/wire.go::readLenU32Bytes`)
+   materializes zero-length payloads as an allocated empty
+   slice `[]byte{}`, not `nil`. A `== nil` check would
+   classify every valid cutover entry with `wrapped_len = 0`
+   as malformed and halt-apply the cluster.
 3. `DEKID == sidecar.Active.Storage` at apply time. **Race
    posture for a concurrent `RotateDEK`:** if a `RotateDEK`
    entry commits between the cutover's propose and its apply,
@@ -838,7 +844,10 @@ until 6D-6 wires it).
   matches expectations and the verdict list is complete +
   deduplicated.
 - **6D-4 (sub-tag dispatch)**: extend `applier_test.go` —
-  invalid `Wrapped != nil` → halt apply. Invalid `Purpose` →
+  invalid `len(Wrapped) > 0` → halt apply (the check is
+  length-based; `Wrapped == []byte{}` from the wire decoder
+  is valid and MUST NOT halt — see §2.1 constraint #2 for the
+  decoder-shape rationale). Invalid `Purpose` →
   halt apply. **Mismatched `DEKID` (cutover proposed against
   DEK A but `RotateDEK` committed to DEK B between propose
   and apply) → NOT a halt; the apply path consumes the entry
