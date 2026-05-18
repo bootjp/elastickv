@@ -284,7 +284,12 @@ leader. Server-side sequence:
    entry's apply index, recorded by §6.4) as the response's
    applied_index. This is stable across subsequent
    encryption-relevant Raft entries that advance the generic
-   RaftAppliedIndex.
+   RaftAppliedIndex. See §6.4 for the
+   `cutover_index_unknown = true` defensive-branch fallback
+   when StorageEnvelopeCutoverIndex == 0 on a sidecar that
+   also reports StorageEnvelopeActive == true
+   (operationally impossible under normal apply but hedged
+   against future schema rollback / hand-edited sidecar).
 6. Run the Voters ∪ Learners capability fan-out (§4). On any
    member reporting encryption_capable=false or unreachable
    within one election timeout, return
@@ -682,9 +687,16 @@ until 6D-6 wires it).
   deduplicated.
 - **6D-4 (sub-tag dispatch)**: extend `applier_test.go` —
   invalid `Wrapped != nil` → halt apply. Invalid `Purpose` →
-  halt apply. Mismatched `DEKID` → halt apply. Happy path →
-  `StorageEnvelopeActive` flips true, `RaftAppliedIndex`
-  advances. Idempotent re-apply → no-op (already active).
+  halt apply. Mismatched `DEKID` → halt apply. Happy path
+  (apply at raft index K) → `StorageEnvelopeActive` flips
+  true, `StorageEnvelopeCutoverIndex == K` (the §6.4
+  idempotency token — assertion is load-bearing: without it,
+  the §3.2 / §6.4 `AlreadyExists` contract would silently
+  return 0 as the original cutover index), and
+  `RaftAppliedIndex` advances. Idempotent re-apply at a
+  later index → no-op (already active);
+  `StorageEnvelopeCutoverIndex` stays at K, NOT the
+  re-applying entry's index.
 - **6D-5 (storage toggle)**: stub the sidecar state at
   `StorageEnvelopeActive=true`, write a value, confirm the
   on-disk MVCC version header carries `encryption_state=0b01`
