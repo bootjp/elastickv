@@ -4,6 +4,12 @@ import (
 	pkgerrors "github.com/cockroachdb/errors"
 )
 
+// minMembersForCollision is the smallest membership-set size at
+// which two distinct full_node_id values can exist (and therefore
+// at which a 16-bit narrowing collision becomes possible). With
+// 0 or 1 member there is nothing to compare; the guard skips early.
+const minMembersForCollision = 2
+
 // CheckNodeIDCollision is the §9.1 / 6C-3 startup-guard primitive
 // for `ErrNodeIDCollision`. It walks the supplied list of
 // `full_node_id` values (typically every voter + learner in the
@@ -38,12 +44,6 @@ import (
 //
 // Returns `ErrNodeIDCollision` wrapped with offending IDs when
 // any two distinct `full_node_id` values share a `node_id`.
-// minMembersForCollision is the smallest membership-set size at
-// which two distinct full_node_id values can exist (and therefore
-// at which a 16-bit narrowing collision becomes possible). With
-// 0 or 1 member there is nothing to compare; skip early.
-const minMembersForCollision = 2
-
 func CheckNodeIDCollision(fullNodeIDs []uint64) error {
 	if len(fullNodeIDs) < minMembersForCollision {
 		return nil

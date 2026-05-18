@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -102,17 +103,23 @@ func runEncryptionProbeNodeID(args []string, out io.Writer) error {
 
 // parseUint64WithRadix accepts either decimal ("12345") or
 // 0x-prefixed hex ("0xDEADBEEF") so operators can paste values
-// in whichever form their inventory uses.
+// in whichever form their inventory uses. Uses strconv.ParseUint
+// rather than fmt.Sscanf: ParseUint requires the ENTIRE input to
+// be valid for the chosen radix, whereas Sscanf stops at the
+// first non-matching character and silently returns the prefix.
+// The silent-prefix behaviour would let "0x1234ZZZZ" parse as
+// 0x1234 (or "1234abc" as 1234), which is unsafe for an
+// operator-visible identifier where every digit matters.
 func parseUint64WithRadix(s string) (uint64, error) {
 	if len(s) >= 2 && (s[0:2] == "0x" || s[0:2] == "0X") {
-		var v uint64
-		if _, err := fmt.Sscanf(s[2:], "%x", &v); err != nil {
+		v, err := strconv.ParseUint(s[2:], 16, 64)
+		if err != nil {
 			return 0, errors.Wrap(err, "hex parse")
 		}
 		return v, nil
 	}
-	var v uint64
-	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
 		return 0, errors.Wrap(err, "decimal parse")
 	}
 	return v, nil

@@ -541,6 +541,29 @@ func TestRunEncryptionProbeNodeID_RejectsBadInput(t *testing.T) {
 	}
 }
 
+// TestRunEncryptionProbeNodeID_RejectsPartialInput pins the
+// strconv.ParseUint vs fmt.Sscanf distinction: parseUint64WithRadix
+// MUST reject inputs where only a prefix is parseable, because
+// "0x1234ZZZZ" silently parsing as 0x1234 would mislead the
+// operator into joining a node under a different node_id than
+// the one they meant to probe. Sscanf accepts partial input;
+// ParseUint rejects it.
+func TestRunEncryptionProbeNodeID_RejectsPartialInput(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"--full-node-id=0x1234ZZZZ", // hex prefix with non-hex tail
+		"--full-node-id=1234abc",    // decimal prefix with letter tail
+		"--full-node-id=0xDEAD GHI", // hex with embedded space
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		err := runEncryptionProbeNodeID([]string{tc}, &buf)
+		if err == nil {
+			t.Errorf("partial-input %q: want error, got nil (output=%q)", tc, buf.String())
+		}
+	}
+}
+
 // TestEncryptionMain_ProbeNodeIDSubcommand pins the dispatch in
 // encryptionMain: the new probe-node-id case must route to the
 // runner. Without this, a typo in encryptionMain's switch
