@@ -130,3 +130,45 @@ func TestWriteRedisError(t *testing.T) {
 		})
 	}
 }
+
+// TestHasTransientLeaderSuffix_PinsSentinels closes the gap noted
+// at kv/coordinator.go:529 ("A symmetric pin lives in the adapter
+// test package"): the adapter's redisLeaderErrorPhrases set must
+// stay in sync with the actual .Error() text of every transient-
+// leader sentinel the suffix fallback is meant to catch. If a
+// sentinel ever gets renamed (e.g. raftengine.ErrLeadershipLost
+// becomes "raft engine: leadership lost (xyz)") the kv-side pin
+// fails first, but without this adapter-side pin the adapter's
+// phrase list could drift silently and the NOTLEADER classification
+// would regress to the pre-PR-789 worker-crash failure mode.
+//
+// Each case calls hasTransientLeaderSuffix(sentinel.Error()) and
+// asserts true. Wrapping (errors.Wrap / fmt.Errorf %w) is covered
+// by TestIsTransientLeaderRedisError; this test pins the raw
+// .Error() strings only.
+func TestHasTransientLeaderSuffix_PinsSentinels(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+	}{
+		{"adapter.ErrLeaderNotFound", ErrLeaderNotFound.Error()},
+		{"adapter.ErrNotLeader", ErrNotLeader.Error()},
+		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound.Error()},
+		{"raftengine.ErrNotLeader", raftengine.ErrNotLeader.Error()},
+		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost.Error()},
+		{"raftengine.ErrLeadershipTransferInProgress",
+			raftengine.ErrLeadershipTransferInProgress.Error()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if !hasTransientLeaderSuffix(tc.msg) {
+				t.Fatalf("hasTransientLeaderSuffix(%q) = false; "+
+					"redisLeaderErrorPhrases is out of sync with %s — "+
+					"a sentinel rename slipped through. Update the "+
+					"phrase list in adapter/redis.go to match.", tc.msg, tc.name)
+			}
+		})
+	}
+}
