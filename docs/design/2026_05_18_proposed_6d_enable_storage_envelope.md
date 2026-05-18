@@ -254,15 +254,20 @@ message EnableStorageEnvelopeRequest {
   //
   //   - proposer_node_id != 0 — zero is a reserved sentinel
   //     across the mutator paths (BootstrapEncryption,
-  //     RotateDEK, RegisterEncryptionWriter all reject it via
-  //     ErrZeroFullNodeID); accepting it here would weaken
-  //     the writer-registry collision and rollback
-  //     invariants. Reject with InvalidArgument wrapping
-  //     ErrZeroFullNodeID.
+  //     RotateDEK, RegisterEncryptionWriter all reject it
+  //     with an inline InvalidArgument error in
+  //     adapter/encryption_admin.go); accepting it here
+  //     would weaken the writer-registry collision and
+  //     rollback invariants. Reject with an inline
+  //     InvalidArgument carrying the "proposer_node_id is
+  //     reserved sentinel 0" message — same posture as the
+  //     existing RotateDEK / BootstrapEncryption paths.
   //   - proposer_local_epoch <= 0xFFFF — the §4.1 16-bit
   //     nonce field is carried as uint32 on the wire (proto3
-  //     has no uint16); values above 0xFFFF return
-  //     ErrLocalEpochOutOfRange.
+  //     has no uint16); values above 0xFFFF reject with an
+  //     inline InvalidArgument carrying a "proposer_local_epoch
+  //     exceeds 16-bit nonce-field bound" message. Same inline-
+  //     string-error convention as the zero-full-node-id check.
   //
   // Both checks fire at the server boundary before any Raft
   // proposal is composed. ApplyRotation re-validates them at
@@ -341,10 +346,11 @@ message CapabilityVerdict {
 leader. Server-side sequence:
 
 ```text
-1. Validate inputs: `proposer_node_id != 0` (reject with
-   `InvalidArgument` wrapping `ErrZeroFullNodeID`),
-   `proposer_local_epoch <= 0xFFFF` (reject with
-   `InvalidArgument` wrapping `ErrLocalEpochOutOfRange`).
+1. Validate inputs: `proposer_node_id != 0` (reject with an
+   inline `InvalidArgument` carrying "proposer_node_id is
+   reserved sentinel 0"), `proposer_local_epoch <= 0xFFFF`
+   (reject with an inline `InvalidArgument` carrying
+   "proposer_local_epoch exceeds 16-bit nonce-field bound").
    Both checks at the server boundary before any Raft
    proposal is composed; `ApplyRotation` re-validates them at
    apply time (defense-in-depth).
@@ -396,8 +402,8 @@ the rationale):
 
 | Cause | gRPC code | Wrapped sentinel / discriminator |
 |---|---|---|
-| `proposer_node_id == 0` | `InvalidArgument` | existing `ErrZeroFullNodeID` (reserved sentinel across all mutator paths) |
-| `proposer_local_epoch > 0xFFFF` | `InvalidArgument` | existing `ErrLocalEpochOutOfRange` (16-bit nonce-field bound) |
+| `proposer_node_id == 0` | `InvalidArgument` | inline `InvalidArgument` carrying a "proposer_node_id is reserved sentinel 0" message — matches the existing `RotateDEK` / `BootstrapEncryption` mutator paths in `adapter/encryption_admin.go`, which use inline string errors for the same zero-full-node-id check rather than a named sentinel. A future cleanup could introduce a shared `ErrZeroFullNodeID` Go variable and migrate all three call sites, but that is out of scope for 6D. |
+| `proposer_local_epoch > 0xFFFF` | `InvalidArgument` | inline `InvalidArgument` carrying a "proposer_local_epoch exceeds 16-bit nonce-field bound" message — same posture as the zero-full-node-id check above; matches the existing inline-string-error convention for these per-field range validations. The proto-level comment at `proto/encryption_admin.proto` mentions `ErrLocalEpochOutOfRange` as a doc label, not a Go symbol. |
 | Encryption disabled / KEK absent | `FailedPrecondition` | existing 6B `ErrEncryptionMutatorsDisabled` |
 | Caller is a follower | `FailedPrecondition` | existing `ErrNotLeader` |
 | Sidecar missing or `Active.Storage == 0` | `FailedPrecondition` | new `ErrEncryptionNotBootstrapped` |
@@ -610,7 +616,10 @@ committed; no DEK to compare against).
 true` AND `sidecar.Active.Storage != 0` AND the local
 writer-registry has no row for `(full_node_id,
 active_storage_dek_id)`, the guard splits behaviour on the
-§6.4 `sidecar.StorageEnvelopeActive` field:
+§6.2 `sidecar.StorageEnvelopeActive` field (the write-path
+toggle defined in the storage layer; §6.4 introduces the
+adjacent `StorageEnvelopeCutoverIndex` field but the active
+flag itself lives with the §6.2 write-time logic):
 
   - If `StorageEnvelopeActive == false` (pre-cutover): allow
     startup. This is the legitimate freshly-joined-learner
