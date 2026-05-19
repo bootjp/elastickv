@@ -169,11 +169,62 @@ func TestRedisDB_StreamRoundTripBasic(t *testing.T) {
 	assertStreamMetaTerminator(t, meta, 3, 1714400000002, 0)
 }
 
-// TestRedisDB_StreamFieldsDecodedToObject confirms that interleaved
+// streamFieldsPair is the decoded counterpart of streamFieldJSON used
+// in assertions.
+type streamFieldsPair struct{ name, value string }
+
+// extractStreamFieldsAsPairs pulls the `fields` array out of a
+// decoded JSONL entry and returns it as a slice of (name, value)
+// pairs. Centralises the type assertions so the per-test bodies
+// stay below the cyclop ceiling and forcetypeassert lints don't
+// fire at every call site.
+func extractStreamFieldsAsPairs(t *testing.T, entry map[string]any) []streamFieldsPair {
+	t.Helper()
+	raw, ok := entry["fields"].([]any)
+	if !ok {
+		t.Fatalf("entry.fields = %T(%v), want array", entry["fields"], entry["fields"])
+	}
+	out := make([]streamFieldsPair, 0, len(raw))
+	for i, r := range raw {
+		rec, ok := r.(map[string]any)
+		if !ok {
+			t.Fatalf("entry.fields[%d] = %T(%v), want object", i, r, r)
+		}
+		name, ok := rec["name"].(string)
+		if !ok {
+			t.Fatalf("entry.fields[%d].name = %T(%v), want string", i, rec["name"], rec["name"])
+		}
+		value, ok := rec["value"].(string)
+		if !ok {
+			t.Fatalf("entry.fields[%d].value = %T(%v), want string", i, rec["value"], rec["value"])
+		}
+		out = append(out, streamFieldsPair{name: name, value: value})
+	}
+	return out
+}
+
+// assertStreamFieldsEqual checks that the decoded fields array
+// matches the expected ordered list of (name, value) pairs.
+func assertStreamFieldsEqual(t *testing.T, got []streamFieldsPair, want []streamFieldsPair) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("len(fields) = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("fields[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestRedisDB_StreamFieldsDecodedToArray confirms that interleaved
 // `[name1, value1, name2, value2, ...]` arrays from the protobuf
-// land as `{"name1": "value1", "name2": "value2"}` JSON objects per
-// the design example (line 338).
-func TestRedisDB_StreamFieldsDecodedToObject(t *testing.T) {
+// land as a JSONL `[{"name":...,"value":...}]` array. Switched
+// from the design's original map shape (line 338) in response to
+// codex's P1 on PR #791: XADD allows duplicate field names within
+// one entry (e.g. `XADD s * f v1 f v2`) and the map representation
+// silently collapsed them.
+func TestRedisDB_StreamFieldsDecodedToArray(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
 	if err := db.HandleStreamMeta(streamMetaKey("s"), encodeStreamMetaValue(1, 100, 5)); err != nil {
@@ -190,18 +241,92 @@ func TestRedisDB_StreamFieldsDecodedToObject(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
-	fields, ok := entries[0]["fields"].(map[string]any)
-	if !ok {
-		t.Fatalf("entries[0].fields = %T(%v), want object", entries[0]["fields"], entries[0]["fields"])
+	assertStreamFieldsEqual(t, extractStreamFieldsAsPairs(t, entries[0]), []streamFieldsPair{
+		{"event", "login"},
+		{"user", "alice"},
+		{"ip", "10.0.0.1"},
+	})
+}
+
+// TestRedisDB_StreamDuplicateFieldsPreserved pins the codex P1 fix:
+// XADD permits duplicate field names within one entry (e.g.
+// `XADD s * f v1 f v2` stores both pairs verbatim in the
+// protobuf's Fields slice). The original map-based projection
+// silently collapsed duplicates; the array shape preserves them
+// and a restore can replay the original XADD argv exactly.
+func TestRedisDB_StreamDuplicateFieldsPreserved(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleStreamMeta(streamMetaKey("s"), encodeStreamMetaValue(1, 1, 0)); err != nil {
+		t.Fatal(err)
 	}
-	want := map[string]any{"event": "login", "user": "alice", "ip": "10.0.0.1"}
-	if len(fields) != len(want) {
-		t.Fatalf("fields = %v, want %v", fields, want)
+	val := encodeStreamEntryValue(t, "1-0", []string{"f", "v1", "f", "v2", "g", "v3"})
+	if err := db.HandleStreamEntry(streamEntryKey("s", 1, 0), val); err != nil {
+		t.Fatal(err)
 	}
-	for k, v := range want {
-		if fields[k] != v {
-			t.Fatalf("fields[%q] = %v, want %v", k, fields[k], v)
-		}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := readStreamJSONL(t, filepath.Join(root, "redis", "db_0", "streams", "s.jsonl"))
+	assertStreamFieldsEqual(t, extractStreamFieldsAsPairs(t, entries[0]), []streamFieldsPair{
+		{"f", "v1"},
+		{"f", "v2"},
+		{"g", "v3"},
+	})
+}
+
+// TestRedisDB_StreamTTLArrivesBeforeRows pins the codex P1 fix:
+// `!redis|ttl|<k>` lex-sorts BEFORE `!stream|...` because `r` <
+// `s`, so in real Pebble snapshot order the TTL arrives FIRST.
+// The encoder MUST buffer the expiry in pendingTTL and drain it
+// when streamState first registers the user key, inlining the
+// value into the JSONL `_meta.expire_at_ms`. Without this drain
+// every TTL'd stream would restore as permanent.
+func TestRedisDB_StreamTTLArrivesBeforeRows(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	// Snapshot order: TTL first, then meta + entry.
+	if err := db.HandleTTL([]byte("k"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleStreamMeta(streamMetaKey("k"), encodeStreamMetaValue(1, 100, 0)); err != nil {
+		t.Fatal(err)
+	}
+	val := encodeStreamEntryValue(t, "100-0", []string{"event", "login"})
+	if err := db.HandleStreamEntry(streamEntryKey("k", 100, 0), val); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	_, meta := readStreamJSONL(t, filepath.Join(root, "redis", "db_0", "streams", "k.jsonl"))
+	if streamFloat(t, meta, "expire_at_ms") != float64(fixedExpireMs) {
+		t.Fatalf("meta.expire_at_ms = %v want %d — pendingTTL drain failed", meta["expire_at_ms"], fixedExpireMs)
+	}
+}
+
+// TestRedisDB_SetTTLArrivesBeforeRows pins the same ordering fix
+// for sets (`!redis|ttl|` lex-sorts before `!st|...` because
+// `r` < `s`). Retroactive coverage for PR #758, which shipped the
+// set encoder before the pendingTTL infrastructure existed.
+func TestRedisDB_SetTTLArrivesBeforeRows(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleTTL([]byte("k"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleSetMeta(setMetaKey("k"), encodeSetMetaValue(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleSetMember(setMemberKey("k", []byte("m")), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readSetJSON(t, filepath.Join(root, "redis", "db_0", "sets", "k.json"))
+	if setFloat(t, got, "expire_at_ms") != float64(fixedExpireMs) {
+		t.Fatalf("expire_at_ms = %v want %d — pendingTTL drain failed", got["expire_at_ms"], fixedExpireMs)
 	}
 }
 

@@ -160,12 +160,23 @@ func (r *RedisDB) HandleStreamEntry(key, value []byte) error {
 // hash/list/set/zset kindByKey-registration pattern so HandleStreamMeta,
 // HandleStreamEntry, and the HandleTTL back-edge all agree on the
 // kind.
+//
+// On first registration we drain any pendingTTL for the user key.
+// `!redis|ttl|<k>` lex-sorts BEFORE `!stream|...` (because `r` < `s`),
+// so in real snapshot order the TTL arrives FIRST; HandleTTL parks
+// it in pendingTTL, and this function inlines it into the stream's
+// JSONL `_meta.expire_at_ms`. Without this drain step, every TTL'd
+// stream would restore as permanent. Codex P1 finding on PR #791.
 func (r *RedisDB) streamState(userKey []byte) *redisStreamState {
 	uk := string(userKey)
 	if st, ok := r.streams[uk]; ok {
 		return st
 	}
 	st := &redisStreamState{}
+	if expireAtMs, ok := r.claimPendingTTL(userKey); ok {
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	}
 	r.streams[uk] = st
 	r.kindByKey[uk] = redisKindStream
 	return st
@@ -291,17 +302,30 @@ func (r *RedisDB) writeStreamJSONL(dir string, userKey []byte, st *redisStreamSt
 	return nil
 }
 
-// streamEntryJSON is the dump-format projection of one stream entry.
-// Fields is emitted as a JSON object keyed by name (matching the
-// design's `"fields": {"event":"login","user":"alice"}` example)
-// because XADD itself enforces name/value pair shape and Redis
-// stream field names are user-controlled strings rather than
-// binary-safe bytes. A future format-version bump can switch to a
-// `[{"name":..., "value":...}]` array if reviewers find names that
-// collide under JSON-object keying.
+// streamFieldJSON is the dump-format projection of one (name, value)
+// pair from a stream entry. We emit a list of name/value records
+// rather than a JSON object because XADD permits duplicate field
+// names within one entry — e.g. `XADD s * f v1 f v2` records BOTH
+// (f, v1) and (f, v2) as distinct interleaved entries in the
+// stored protobuf's Fields slice. The design example at
+// docs/design/2026_04_29_proposed_snapshot_logical_decoder.md:338
+// showed an object shape, but that representation silently drops
+// duplicates and a restore would not reproduce the original
+// stream entry. Codex P1 (PR #791) — switched to a name/value
+// record array.
+type streamFieldJSON struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// streamEntryJSON is the dump-format projection of one stream
+// entry. Fields is an ARRAY so duplicate field names within a
+// single XADD round-trip correctly. The array preserves the
+// interleaved insertion order from the protobuf so consumers can
+// re-assemble the original XADD argv.
 type streamEntryJSON struct {
 	ID     string            `json:"id"`
-	Fields map[string]string `json:"fields"`
+	Fields []streamFieldJSON `json:"fields"`
 }
 
 // streamMetaJSON is the dump-format projection of the final _meta
@@ -330,13 +354,16 @@ func marshalStreamJSONL(st *redisStreamState) ([]byte, error) {
 	var buf bytes.Buffer
 	const xaddPairWidth = 2 // (name, value) — XADD enforces even arity
 	for _, e := range st.entries {
-		fieldsMap := make(map[string]string, len(e.fields)/xaddPairWidth)
+		fields := make([]streamFieldJSON, 0, len(e.fields)/xaddPairWidth)
 		for i := 0; i+1 < len(e.fields); i += xaddPairWidth {
-			fieldsMap[e.fields[i]] = e.fields[i+1]
+			fields = append(fields, streamFieldJSON{
+				Name:  e.fields[i],
+				Value: e.fields[i+1],
+			})
 		}
 		rec := streamEntryJSON{
 			ID:     formatStreamID(e.ms, e.seq),
-			Fields: fieldsMap,
+			Fields: fields,
 		}
 		line, err := json.Marshal(rec)
 		if err != nil {

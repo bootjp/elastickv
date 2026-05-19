@@ -579,11 +579,21 @@ func TestRedisDB_NoKeymapWhenAllReversible(t *testing.T) {
 
 func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
 	t.Parallel()
-	// Codex P2 round 6: orphan TTL records (those with no prior
-	// HandleString/HandleHLL claim) must be counted only — the
-	// per-key payload would allocate proportional to user-key size
-	// and is unused before the wide-column encoders land. Drive a
-	// sample of orphan records and assert the count, not a buffer.
+	// Codex P1 (PR #791): orphan TTL records are now BUFFERED in
+	// pendingTTL during intake — the wide-column state-init
+	// functions need to drain them when a typed record finally
+	// registers a user key. The buffer holds (string-userKey,
+	// uint64-expireAt) pairs; the per-record allocation cost is
+	// the same as kindByKey's, which we already pay for every
+	// typed record. The original Codex P2 round 6 concern (don't
+	// buffer arbitrarily-large payload bytes) is preserved — we
+	// still don't keep the value bytes.
+	//
+	// At Finalize, entries still in pendingTTL are counted as
+	// truly unmatched orphans. This test asserts:
+	//   - During intake: orphanTTLCount stays 0, pendingTTL grows.
+	//   - After Finalize: orphanTTLCount == n (no typed record
+	//     ever drained the entries).
 	db, _ := newRedisDB(t)
 	const n = 10_000
 	for i := 0; i < n; i++ {
@@ -593,8 +603,17 @@ func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
 			t.Fatalf("HandleTTL[%d]: %v", i, err)
 		}
 	}
+	if db.orphanTTLCount != 0 {
+		t.Fatalf("orphanTTLCount = %d at intake, want 0 (buffered)", db.orphanTTLCount)
+	}
+	if len(db.pendingTTL) != n {
+		t.Fatalf("pendingTTL len = %d, want %d", len(db.pendingTTL), n)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
 	if db.orphanTTLCount != n {
-		t.Fatalf("orphanTTLCount = %d, want %d", db.orphanTTLCount, n)
+		t.Fatalf("orphanTTLCount = %d after Finalize, want %d", db.orphanTTLCount, n)
 	}
 }
 
