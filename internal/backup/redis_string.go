@@ -85,6 +85,7 @@ const (
 	redisKindHash
 	redisKindList
 	redisKindSet
+	redisKindZSet
 )
 
 // RedisDB encodes one logical Redis database (`redis/db_<n>/`). All
@@ -185,6 +186,14 @@ type RedisDB struct {
 	// Finalize into sets/<key>.json with members sorted by raw byte
 	// order for deterministic dump output.
 	sets map[string]*redisSetState
+
+	// zsets buffers per-userKey sorted-set state. Score lives in the
+	// !zs|mem| value (8-byte IEEE 754 big-endian); member name is the
+	// trailing key bytes (binary-safe). Flushed at Finalize into
+	// zsets/<key>.json sorted by member-name bytes (not by score) so
+	// `diff -r` between dumps stays line-stable across score-only
+	// mutations.
+	zsets map[string]*redisZSetState
 }
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
@@ -204,6 +213,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		hashes:           make(map[string]*redisHashState),
 		lists:            make(map[string]*redisListState),
 		sets:             make(map[string]*redisSetState),
+		zsets:            make(map[string]*redisZSetState),
 	}
 }
 
@@ -297,9 +307,16 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		st.expireAtMs = expireAtMs
 		st.hasTTL = true
 		return nil
+	case redisKindZSet:
+		// Same per-record TTL inlining: ZADD + EXPIRE replay in
+		// one shot from the per-zset JSON, no separate sidecar.
+		st := r.zsetState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+		return nil
 	case redisKindUnknown:
 		// Track orphan TTL counts only — keys are unused before the
-		// remaining wide-column encoders (set/zset/stream) land, and
+		// remaining wide-column encoder (stream) lands, and
 		// buffering them allocates proportional to user-key size
 		// (up to 1 MiB per key) for no benefit. Codex P2 round 6.
 		r.orphanTTLCount++
@@ -318,6 +335,7 @@ func (r *RedisDB) Finalize() error {
 		r.flushHashes,
 		r.flushLists,
 		r.flushSets,
+		r.flushZSets,
 		func() error { return closeJSONL(r.stringsTTL) },
 		func() error { return closeJSONL(r.hllTTL) },
 		r.closeKeymap,
@@ -329,7 +347,7 @@ func (r *RedisDB) Finalize() error {
 	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
 			"count", r.orphanTTLCount,
-			"hint", "remaining wide-column encoders (zset/stream) have not landed yet")
+			"hint", "remaining wide-column encoder (stream) has not landed yet")
 	}
 	return firstErr
 }
