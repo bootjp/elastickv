@@ -617,6 +617,71 @@ func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
 	}
 }
 
+// TestRedisDB_PendingTTLBoundedByCap pins the codex P1 fix on PR
+// #791 round 2 (mirrored here on PR #790 round 4): pendingTTL must
+// NOT grow unboundedly. Once the cap is reached, subsequent
+// unknown-kind TTLs fall back to immediate-orphan counting without
+// buffering the user-key bytes.
+func TestRedisDB_PendingTTLBoundedByCap(t *testing.T) {
+	t.Parallel()
+	const cap = 8
+	db, _ := newRedisDB(t)
+	db.WithPendingTTLCap(cap)
+	for i := 0; i < cap*2; i++ {
+		key := []byte("orphan-" + intToDecimal(i))
+		ms := uint64(i) + 1 //nolint:gosec // i bounded above
+		if err := db.HandleTTL(key, encodeTTLValue(ms)); err != nil {
+			t.Fatalf("HandleTTL[%d]: %v", i, err)
+		}
+	}
+	if got := len(db.pendingTTL); got != cap {
+		t.Fatalf("pendingTTL len = %d, want %d (cap)", got, cap)
+	}
+	if got := db.orphanTTLCount; got != cap {
+		t.Fatalf("orphanTTLCount = %d at intake, want %d (overflow path)", got, cap)
+	}
+	if got := db.pendingTTLOverflow; got != cap {
+		t.Fatalf("pendingTTLOverflow = %d, want %d", got, cap)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if got := db.orphanTTLCount; got != cap*2 {
+		t.Fatalf("orphanTTLCount = %d after Finalize, want %d", got, cap*2)
+	}
+}
+
+// TestRedisDB_WithPendingTTLCapZeroDisablesBuffering pins that
+// cap==0 reverts to the original immediate-orphan path.
+func TestRedisDB_WithPendingTTLCapZeroDisablesBuffering(t *testing.T) {
+	t.Parallel()
+	db, _ := newRedisDB(t)
+	db.WithPendingTTLCap(0)
+	const n = 5
+	for i := 0; i < n; i++ {
+		if err := db.HandleTTL([]byte("k"+intToDecimal(i)), encodeTTLValue(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(db.pendingTTL); got != 0 {
+		t.Fatalf("pendingTTL len = %d, want 0 (cap disabled)", got)
+	}
+	if got := db.orphanTTLCount; got != n {
+		t.Fatalf("orphanTTLCount = %d, want %d", got, n)
+	}
+}
+
+// TestRedisDB_WithPendingTTLCapNegativeCoercedToZero pins input
+// sanitisation.
+func TestRedisDB_WithPendingTTLCapNegativeCoercedToZero(t *testing.T) {
+	t.Parallel()
+	db, _ := newRedisDB(t)
+	db.WithPendingTTLCap(-100)
+	if db.pendingTTLCap != 0 {
+		t.Fatalf("pendingTTLCap = %d after WithPendingTTLCap(-100), want 0", db.pendingTTLCap)
+	}
+}
+
 func TestRedisDB_DirsCreatedCachesMkdirAll(t *testing.T) {
 	t.Parallel()
 	// Two HandleString calls in a row should populate dirsCreated

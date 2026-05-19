@@ -214,7 +214,31 @@ type RedisDB struct {
 	// orphan-TTL warning for whatever remains (those keys never
 	// appeared as a typed record — likely a corrupted store).
 	pendingTTL map[string]uint64
+
+	// pendingTTLCap caps pendingTTL's in-memory size. Once the map
+	// reaches this many entries, subsequent unknown-kind TTLs fall
+	// back to incrementing orphanTTLCount directly without
+	// buffering the user-key bytes. Without this cap, an
+	// adversarial or corrupt snapshot whose `!redis|ttl|` records
+	// never find a typed-record claimer would grow pendingTTL
+	// unboundedly and could OOM the decoder. Codex P1 finding
+	// surfaced on PR #791 round 2; the same fix is applied here on
+	// PR #790 because the two PRs share the pendingTTL
+	// infrastructure and the bug is identical.
+	pendingTTLCap int
+
+	// pendingTTLOverflow counts entries skipped because the
+	// pendingTTL buffer was at cap. Surfaced in the Finalize
+	// warning so operators can distinguish "snapshot exceeded the
+	// buffer cap" from "TTL records remained unmatched".
+	pendingTTLOverflow int
 }
+
+// defaultPendingTTLCap caps pendingTTL at 1 MiB entries by default
+// (~64 MiB worst-case memory at ~64 B per Go map entry). Override
+// via WithPendingTTLCap for hosts that need a different memory /
+// coverage trade-off.
+const defaultPendingTTLCap = 1 << 20
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
 // dbIndex selects <n>; today the producer always passes 0, but accepting
@@ -235,7 +259,21 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		sets:             make(map[string]*redisSetState),
 		zsets:            make(map[string]*redisZSetState),
 		pendingTTL:       make(map[string]uint64),
+		pendingTTLCap:    defaultPendingTTLCap,
 	}
+}
+
+// WithPendingTTLCap overrides the default cap on the pendingTTL
+// buffer. A value of 0 disables buffering — every unknown-kind TTL
+// becomes an immediate orphan (matches the pre-pendingTTL behavior).
+// Negative inputs are coerced to 0. Returns the receiver so it can
+// be chained with other With* setters.
+func (r *RedisDB) WithPendingTTLCap(capacity int) *RedisDB {
+	if capacity < 0 {
+		capacity = 0
+	}
+	r.pendingTTLCap = capacity
+	return r
 }
 
 // WithWarnSink wires a structured-warning sink. The sink is called with
@@ -353,21 +391,37 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		st.hasTTL = true
 		return nil
 	case redisKindUnknown:
-		// Park the expiry until a wide-column Handle*Meta /
-		// Handle*Member / Handle*Entry registers the user key.
-		// Without this buffering, sorted-set / set / stream TTLs
-		// would be counted as orphans and dropped because their
-		// type prefixes lex-sort AFTER `!redis|ttl|` in the
-		// snapshot's encoded-key order. Codex P1 (PR #790).
-		//
-		// We store userKey as a string copy (`string([]byte)`
-		// allocates) rather than the alias slice — the snapshot
-		// reader reuses key buffers across iterations, so a slice
-		// alias would race with the next record.
-		r.pendingTTL[string(userKey)] = expireAtMs
+		r.parkUnknownTTL(userKey, expireAtMs)
 		return nil
 	}
 	return nil
+}
+
+// parkUnknownTTL buffers a redisKindUnknown TTL into pendingTTL, or
+// falls back to the immediate orphan-count path when the buffer is
+// at cap. Extracted from HandleTTL's switch so the parent stays
+// under the cyclop budget.
+//
+// Rationale (codex P1 on PR #791 round 2; same fix mirrored here):
+// Pebble snapshots emit records in encoded-key order, and
+// `!redis|ttl|` lex-sorts BEFORE every wide-column prefix where the
+// type letter is >= 's' (set, stream, zset). The buffer lets us
+// drain the parked expiry when the typed record finally arrives;
+// the cap prevents an adversarial snapshot whose TTLs never find a
+// claimer from OOM'ing the decoder. Storage: userKey is COPIED
+// (`string([]byte)` allocates) because the snapshot reader reuses
+// key buffers across iterations — an alias slice would race with
+// the next record.
+func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) {
+	if len(r.pendingTTL) >= r.pendingTTLCap {
+		// Cap reached: fall back to the immediate-orphan path so
+		// memory stays bounded. Already-buffered entries can still
+		// be drained by later state-inits.
+		r.pendingTTLOverflow++
+		r.orphanTTLCount++
+		return
+	}
+	r.pendingTTL[string(userKey)] = expireAtMs
 }
 
 // claimPendingTTL drains any buffered TTL for userKey into the
@@ -424,9 +478,16 @@ func (r *RedisDB) Finalize() error {
 	// type added on the live side without a backup-encoder update).
 	r.orphanTTLCount += len(r.pendingTTL)
 	if r.warn != nil && r.orphanTTLCount > 0 {
-		r.warn("redis_orphan_ttl",
+		fields := []any{
 			"count", r.orphanTTLCount,
-			"hint", "TTL records whose user key never appeared in a typed record — possible store corruption or an unknown type prefix")
+			"hint", "TTL records whose user key never appeared in a typed record — possible store corruption or an unknown type prefix",
+		}
+		if r.pendingTTLOverflow > 0 {
+			fields = append(fields,
+				"pending_ttl_buffer_overflow", r.pendingTTLOverflow,
+				"pending_ttl_buffer_cap", r.pendingTTLCap)
+		}
+		r.warn("redis_orphan_ttl", fields...)
 	}
 	return firstErr
 }
