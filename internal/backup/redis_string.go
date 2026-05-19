@@ -194,6 +194,26 @@ type RedisDB struct {
 	// `diff -r` between dumps stays line-stable across score-only
 	// mutations.
 	zsets map[string]*redisZSetState
+
+	// pendingTTL buffers expiries whose user-key prefix sorts AFTER
+	// `!redis|ttl|` in the snapshot's lex-ordered stream. Pebble
+	// snapshots emit records in encoded-key order
+	// (`store/snapshot_pebble.go::iter.First()/Next()`), and
+	// `!redis|ttl|` lex-sorts before all `!st|`/`!stream|`/`!zs|`
+	// prefixes (`r` < `s`/`s`/`z`). Without buffering, HandleTTL
+	// would see kindByKey == redisKindUnknown and count the TTL
+	// as an orphan, dropping it before zsetState / setState /
+	// streamState had a chance to claim the user key — TTL'd
+	// sorted sets, sets, and streams would silently restore as
+	// permanent.
+	//
+	// Lifecycle: HandleTTL files the expiry here when kind is
+	// still unknown. Each wide-column state-init function
+	// (setState / zsetState / streamState etc.) drains the entry
+	// when it first registers the user key. Finalize fires the
+	// orphan-TTL warning for whatever remains (those keys never
+	// appeared as a typed record — likely a corrupted store).
+	pendingTTL map[string]uint64
 }
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
@@ -214,6 +234,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		lists:            make(map[string]*redisListState),
 		sets:             make(map[string]*redisSetState),
 		zsets:            make(map[string]*redisZSetState),
+		pendingTTL:       make(map[string]uint64),
 	}
 }
 
@@ -256,15 +277,32 @@ func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 	return r.writeBlob("hll", userKey, value)
 }
 
-// HandleTTL processes one !redis|ttl|<userKey> record. Routing depends on
-// what HandleString/HandleHLL recorded for the same userKey:
+// HandleTTL processes one !redis|ttl|<userKey> record. Routing
+// depends on what the encoder has previously recorded for the user
+// key. There are two ordering regimes the snapshot stream presents:
 //
-//   - redisKindHLL    -> hll_ttl.jsonl
-//   - redisKindString -> strings_ttl.jsonl (legacy strings, whose TTL
-//     lives in !redis|ttl| rather than the inline magic-prefix header)
-//   - redisKindUnknown -> counted in orphanTTLCount; reported via the
-//     warn sink on Finalize because Phase 0a's wide-column encoders
-//     have not landed yet.
+//  1. Prefix sorts BEFORE !redis|ttl| in encoded-key order
+//     (!hs|, !lst|, !redis|str|, !redis|hll|). The typed record
+//     arrives FIRST, kindByKey is already set when HandleTTL fires,
+//     and we route directly to the per-type sidecar / inline field.
+//  2. Prefix sorts AFTER !redis|ttl| (!st|, !stream|, !zs|, because
+//     `r` < `s`/`s`/`z`). The TTL arrives FIRST and kindByKey is
+//     still redisKindUnknown. We park the expiry in pendingTTL and
+//     let each wide-column state-init function (setState /
+//     zsetState / streamState) drain it when the user key finally
+//     surfaces as a typed record. Codex P1 finding on PR #790.
+//
+// Routing:
+//
+//   - redisKindHLL     -> hll_ttl.jsonl (case 1)
+//   - redisKindString  -> strings_ttl.jsonl (case 1; legacy strings
+//     whose TTL lives in !redis|ttl| rather than the inline header)
+//   - redisKindHash/List/Set/ZSet/Stream -> inlined into the
+//     per-key JSON (case 1 for hash/list, case 2 for set/zset/stream
+//     where the state-init already drained from pendingTTL before
+//     HandleTTL would even be called the second time)
+//   - redisKindUnknown -> bufferPendingTTL. Finalize counts truly
+//     unmatched entries (key never registered as a typed record).
 func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 	expireAtMs, err := decodeRedisTTLValue(value)
 	if err != nil {
@@ -315,14 +353,46 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		st.hasTTL = true
 		return nil
 	case redisKindUnknown:
-		// Track orphan TTL counts only — keys are unused before the
-		// remaining wide-column encoder (stream) lands, and
-		// buffering them allocates proportional to user-key size
-		// (up to 1 MiB per key) for no benefit. Codex P2 round 6.
-		r.orphanTTLCount++
+		// Park the expiry until a wide-column Handle*Meta /
+		// Handle*Member / Handle*Entry registers the user key.
+		// Without this buffering, sorted-set / set / stream TTLs
+		// would be counted as orphans and dropped because their
+		// type prefixes lex-sort AFTER `!redis|ttl|` in the
+		// snapshot's encoded-key order. Codex P1 (PR #790).
+		//
+		// We store userKey as a string copy (`string([]byte)`
+		// allocates) rather than the alias slice — the snapshot
+		// reader reuses key buffers across iterations, so a slice
+		// alias would race with the next record.
+		r.pendingTTL[string(userKey)] = expireAtMs
 		return nil
 	}
 	return nil
+}
+
+// claimPendingTTL drains any buffered TTL for userKey into the
+// caller-provided state. Called by the wide-column state-init
+// functions (setState / zsetState / streamState) when they first
+// register a user key, so the parked expiry inlines into the same
+// per-key JSON the rest of the record assembles.
+//
+// Returns (expireAtMs, true) when a buffered TTL existed. The
+// caller should set state.expireAtMs / state.hasTTL on the
+// returned value. The pending entry is removed so Finalize's
+// orphan-count loop only sees truly-unmatched TTLs.
+//
+// Safe to call from hashState/listState too even though those
+// types' typed records sort before `!redis|ttl|`; pendingTTL will
+// always be empty for them. Keeping the call site uniform keeps
+// the state-init contract simple.
+func (r *RedisDB) claimPendingTTL(userKey []byte) (uint64, bool) {
+	uk := string(userKey)
+	expireAtMs, ok := r.pendingTTL[uk]
+	if !ok {
+		return 0, false
+	}
+	delete(r.pendingTTL, uk)
+	return expireAtMs, true
 }
 
 // Finalize flushes all open sidecar writers and emits warnings for any
@@ -344,10 +414,19 @@ func (r *RedisDB) Finalize() error {
 			firstErr = err
 		}
 	}
+	// At this point all type-prefixed records have been processed
+	// and every wide-column state-init drained its claimPendingTTL.
+	// Whatever remains in pendingTTL is truly unmatched — the
+	// user key never appeared as a typed record. Likely causes:
+	// store corruption, a snapshot mid-write where the typed
+	// record was dropped, or a `!redis|ttl|` entry written for a
+	// key whose type prefix we don't recognise (a future Redis
+	// type added on the live side without a backup-encoder update).
+	r.orphanTTLCount += len(r.pendingTTL)
 	if r.warn != nil && r.orphanTTLCount > 0 {
 		r.warn("redis_orphan_ttl",
 			"count", r.orphanTTLCount,
-			"hint", "remaining wide-column encoder (stream) has not landed yet")
+			"hint", "TTL records whose user key never appeared in a typed record — possible store corruption or an unknown type prefix")
 	}
 	return firstErr
 }

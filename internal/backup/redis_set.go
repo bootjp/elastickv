@@ -114,12 +114,24 @@ func (r *RedisDB) HandleSetMetaDelta(_, _ []byte) error { return nil }
 // setState lazily creates per-key state. Mirrors the hash/list
 // kindByKey-registration pattern so HandleSetMeta, HandleSetMember,
 // and the HandleTTL back-edge all agree on the kind.
+//
+// On first registration we drain any pendingTTL for the user key.
+// `!redis|ttl|<k>` lex-sorts BEFORE `!st|...` (because `r` < `s`),
+// so in real snapshot order the TTL arrives FIRST; HandleTTL parks
+// it in pendingTTL, and this function inlines it into the set's
+// `expire_at_ms`. Without this drain step, every TTL'd set would
+// restore as permanent — a latent bug in PR #758 surfaced by codex
+// on PR #790. Phase 0a tests added in the same PR pin the ordering.
 func (r *RedisDB) setState(userKey []byte) *redisSetState {
 	uk := string(userKey)
 	if st, ok := r.sets[uk]; ok {
 		return st
 	}
 	st := &redisSetState{members: make(map[string]struct{})}
+	if expireAtMs, ok := r.claimPendingTTL(userKey); ok {
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	}
 	r.sets[uk] = st
 	r.kindByKey[uk] = redisKindSet
 	return st

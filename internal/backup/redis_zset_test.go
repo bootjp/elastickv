@@ -513,6 +513,89 @@ func TestRedisDB_ZSetDuplicateMembersUseLatestScore(t *testing.T) {
 	})
 }
 
+// TestRedisDB_ZSetTTLArrivesBeforeRows pins the codex P1 fix:
+// `!redis|ttl|<k>` lex-sorts BEFORE `!zs|...` because `r` < `z`,
+// so in a real Pebble snapshot's encoded-key order the TTL record
+// arrives FIRST. The encoder MUST buffer the expiry in pendingTTL
+// and drain it when the zset first registers via zsetState,
+// inlining the value into the zset's JSON expire_at_ms. Without
+// this drain step every TTL'd zset would restore as permanent —
+// the P1 finding on PR #790 (chatgpt-codex-connector).
+func TestRedisDB_ZSetTTLArrivesBeforeRows(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	// Snapshot order: TTL first, then meta + member.
+	if err := db.HandleTTL([]byte("k"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleZSetMeta(zsetMetaKey("k"), encodeZSetMetaValue(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleZSetMember(zsetMemberKey("k", []byte("m")), encodeZSetScoreValue(1.5)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readZSetJSON(t, filepath.Join(root, "redis", "db_0", "zsets", "k.json"))
+	if zsetFloat(t, got, "expire_at_ms") != float64(fixedExpireMs) {
+		t.Fatalf("expire_at_ms = %v want %d — pendingTTL drain failed", got["expire_at_ms"], fixedExpireMs)
+	}
+}
+
+// TestRedisDB_SetTTLArrivesBeforeRows pins the same ordering fix
+// for sets (`!redis|ttl|` lex-sorts before `!st|...` because
+// `r` < `s`). Retroactive coverage for PR #758, which shipped the
+// set encoder before the pendingTTL infrastructure existed.
+func TestRedisDB_SetTTLArrivesBeforeRows(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	// Snapshot order: TTL first, then meta + member.
+	if err := db.HandleTTL([]byte("k"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleSetMeta(setMetaKey("k"), encodeSetMetaValue(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleSetMember(setMemberKey("k", []byte("m")), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readSetJSON(t, filepath.Join(root, "redis", "db_0", "sets", "k.json"))
+	if setFloat(t, got, "expire_at_ms") != float64(fixedExpireMs) {
+		t.Fatalf("expire_at_ms = %v want %d — pendingTTL drain failed", got["expire_at_ms"], fixedExpireMs)
+	}
+}
+
+// TestRedisDB_OrphanTTLCountsTrulyUnmatchedKeys pins the post-fix
+// orphan semantics: a TTL for a key that NEVER appears in any
+// typed record (store corruption or unknown type prefix) is
+// counted at Finalize, not silently dropped on intake.
+func TestRedisDB_OrphanTTLCountsTrulyUnmatchedKeys(t *testing.T) {
+	t.Parallel()
+	db, _ := newRedisDB(t)
+	var events []string
+	db.WithWarnSink(func(event string, _ ...any) { events = append(events, event) })
+	if err := db.HandleTTL([]byte("orphan"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range events {
+		if e == "redis_orphan_ttl" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected redis_orphan_ttl warning, got %v", events)
+	}
+}
+
 // TestRedisDB_ZSetMaxInt64DeclaredLen pins the math.MaxInt64
 // boundary — declaredLen=math.MaxInt64 must be accepted, only > that
 // rejected.
