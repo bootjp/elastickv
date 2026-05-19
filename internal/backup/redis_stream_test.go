@@ -3,6 +3,7 @@ package backup
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"math"
@@ -178,6 +179,12 @@ type streamFieldsPair struct{ name, value string }
 // pairs. Centralises the type assertions so the per-test bodies
 // stay below the cyclop ceiling and forcetypeassert lints don't
 // fire at every call site.
+//
+// Each name/value can be EITHER a plain JSON string (UTF-8 content)
+// or a `{"base64":"..."}` envelope object (non-UTF-8 binary bytes).
+// The fields are emitted via marshalRedisBinaryValue so binary
+// stream payloads round-trip byte-identical; this helper hides the
+// per-pair envelope detection from the per-test assertions.
 func extractStreamFieldsAsPairs(t *testing.T, entry map[string]any) []streamFieldsPair {
 	t.Helper()
 	raw, ok := entry["fields"].([]any)
@@ -190,17 +197,38 @@ func extractStreamFieldsAsPairs(t *testing.T, entry map[string]any) []streamFiel
 		if !ok {
 			t.Fatalf("entry.fields[%d] = %T(%v), want object", i, r, r)
 		}
-		name, ok := rec["name"].(string)
-		if !ok {
-			t.Fatalf("entry.fields[%d].name = %T(%v), want string", i, rec["name"], rec["name"])
-		}
-		value, ok := rec["value"].(string)
-		if !ok {
-			t.Fatalf("entry.fields[%d].value = %T(%v), want string", i, rec["value"], rec["value"])
-		}
-		out = append(out, streamFieldsPair{name: name, value: value})
+		out = append(out, streamFieldsPair{
+			name:  decodeRedisBinaryEnvelope(t, "name", rec["name"]),
+			value: decodeRedisBinaryEnvelope(t, "value", rec["value"]),
+		})
 	}
 	return out
+}
+
+// decodeRedisBinaryEnvelope reverses marshalRedisBinaryValue for
+// tests: a plain JSON string round-trips as a string; a
+// `{"base64":"..."}` envelope decodes via base64url back to the
+// original byte string. Returns the recovered bytes as a Go
+// string so the test assertions can compare against the input
+// regardless of which projection the encoder chose.
+func decodeRedisBinaryEnvelope(t *testing.T, label string, raw any) string {
+	t.Helper()
+	if s, ok := raw.(string); ok {
+		return s
+	}
+	env, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("%s = %T(%v), want string or base64 envelope", label, raw, raw)
+	}
+	encoded, ok := env["base64"].(string)
+	if !ok {
+		t.Fatalf("%s base64 envelope missing payload: %v", label, env)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("%s base64 decode: %v (payload %q)", label, err, encoded)
+	}
+	return string(decoded)
 }
 
 // assertStreamFieldsEqual checks that the decoded fields array
@@ -245,6 +273,54 @@ func TestRedisDB_StreamFieldsDecodedToArray(t *testing.T) {
 		{"event", "login"},
 		{"user", "alice"},
 		{"ip", "10.0.0.1"},
+	})
+}
+
+// TestBuildStreamFieldRecords_NonUTF8BytesRoundTrip pins the
+// claude-bot Critical fix on PR #791: stream field names and
+// values are binary-safe in Redis. Previously
+// streamFieldJSON.Name/Value were plain Go `string` and went
+// through json.Marshal, which silently substitutes U+FFFD for
+// every ill-formed UTF-8 byte sequence — a stream entry carrying
+// raw binary would be silently corrupted in the dump. The fix
+// routes both fields through marshalRedisBinaryValue so non-UTF-8
+// bytes emit as `{"base64":"..."}` and round-trip byte-identical.
+//
+// The protobuf wire format itself enforces UTF-8 on `string` fields
+// (proto3 `string` is by spec UTF-8, and `gproto.Marshal` rejects
+// invalid bytes), so the path "live store → snapshot → decoder"
+// cannot actually carry non-UTF-8 stream fields today; it's a
+// defensive invariant in case a future schema migration switches
+// `Fields` to `bytes`, or a code path bypasses the proto marshaler.
+// We pin the projection's behavior directly on
+// buildStreamFieldRecords + extractStreamFieldsAsPairs rather than
+// trying to push bytes through a gproto.Marshal step that would
+// reject them.
+func TestBuildStreamFieldRecords_NonUTF8BytesRoundTrip(t *testing.T) {
+	t.Parallel()
+	const xaddPairWidth = 2
+	binaryName := "\xff\xfe\x80"
+	binaryValue := "\x00\x01\xc3\x28\x02"
+	records, err := buildStreamFieldRecords([]string{binaryName, binaryValue, "utf8-key", "utf8-val"}, xaddPairWidth)
+	if err != nil {
+		t.Fatalf("buildStreamFieldRecords: %v", err)
+	}
+	if len(records) != xaddPairWidth { // we passed 2 pairs
+		t.Fatalf("len(records) = %d, want %d", len(records), xaddPairWidth)
+	}
+	// Marshal one entry to JSONL bytes, parse it back, and assert
+	// that the recovered pairs match the input byte-identical.
+	body, err := json.Marshal(streamEntryJSON{ID: "1-0", Fields: records})
+	if err != nil {
+		t.Fatalf("json.Marshal streamEntryJSON: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	assertStreamFieldsEqual(t, extractStreamFieldsAsPairs(t, parsed), []streamFieldsPair{
+		{binaryName, binaryValue},
+		{"utf8-key", "utf8-val"},
 	})
 }
 

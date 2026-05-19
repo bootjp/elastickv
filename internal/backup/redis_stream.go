@@ -313,9 +313,21 @@ func (r *RedisDB) writeStreamJSONL(dir string, userKey []byte, st *redisStreamSt
 // duplicates and a restore would not reproduce the original
 // stream entry. Codex P1 (PR #791) — switched to a name/value
 // record array.
+//
+// Name and Value are `json.RawMessage` populated via
+// `marshalRedisBinaryValue` so non-UTF-8 bytes round-trip via the
+// `{"base64":"..."}` envelope. Without this, `json.Marshal` of a
+// plain `string` carrying invalid UTF-8 silently substitutes U+FFFD
+// for each ill-formed byte sequence, and the restored stream entry
+// would carry the replacement-character mangle instead of the
+// original bytes. Redis stream field names and values are
+// binary-safe (the live store keeps them as protobuf `bytes`
+// despite the wire-format `repeated string` shape), so the
+// projection must preserve every byte. Mirrors hashFieldRecord
+// (redis_hash.go:235-238). Claude bot Critical (PR #791 round 2).
 type streamFieldJSON struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Name  json.RawMessage `json:"name"`
+	Value json.RawMessage `json:"value"`
 }
 
 // streamEntryJSON is the dump-format projection of one stream
@@ -354,12 +366,9 @@ func marshalStreamJSONL(st *redisStreamState) ([]byte, error) {
 	var buf bytes.Buffer
 	const xaddPairWidth = 2 // (name, value) — XADD enforces even arity
 	for _, e := range st.entries {
-		fields := make([]streamFieldJSON, 0, len(e.fields)/xaddPairWidth)
-		for i := 0; i+1 < len(e.fields); i += xaddPairWidth {
-			fields = append(fields, streamFieldJSON{
-				Name:  e.fields[i],
-				Value: e.fields[i+1],
-			})
+		fields, err := buildStreamFieldRecords(e.fields, xaddPairWidth)
+		if err != nil {
+			return nil, err
 		}
 		rec := streamEntryJSON{
 			ID:     formatStreamID(e.ms, e.seq),
@@ -395,4 +404,29 @@ func marshalStreamJSONL(st *redisStreamState) ([]byte, error) {
 // (the same shape XADD/XRANGE clients exchange on the wire).
 func formatStreamID(ms, seq uint64) string {
 	return strconv.FormatUint(ms, 10) + "-" + strconv.FormatUint(seq, 10)
+}
+
+// buildStreamFieldRecords converts one entry's interleaved
+// (name1, value1, name2, value2, ...) field slice into a
+// streamFieldJSON array. Each name/value goes through
+// marshalRedisBinaryValue so non-UTF-8 bytes round-trip via the
+// `{"base64":"..."}` envelope. Without this projection, plain
+// `string` fields would surrender every ill-formed UTF-8 byte to
+// json.Marshal's silent U+FFFD substitution and the restored
+// stream entry would not be byte-identical to the source. Claude
+// bot Critical (PR #791 round 2).
+func buildStreamFieldRecords(fields []string, pairWidth int) ([]streamFieldJSON, error) {
+	out := make([]streamFieldJSON, 0, len(fields)/pairWidth)
+	for i := 0; i+1 < len(fields); i += pairWidth {
+		nameJSON, err := marshalRedisBinaryValue([]byte(fields[i]))
+		if err != nil {
+			return nil, err
+		}
+		valueJSON, err := marshalRedisBinaryValue([]byte(fields[i+1]))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, streamFieldJSON{Name: nameJSON, Value: valueJSON})
+	}
+	return out, nil
 }
