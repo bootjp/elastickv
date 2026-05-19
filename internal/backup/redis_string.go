@@ -73,22 +73,27 @@ var ErrRedisInvalidStringValue = cockroachdberr.New("backup: invalid !redis|str|
 var ErrRedisInvalidTTLValue = cockroachdberr.New("backup: invalid !redis|ttl| value")
 
 // ErrPendingTTLBufferFull is returned by HandleTTL when an
-// unknown-kind TTL arrives but the pendingTTL buffer is already at
-// pendingTTLCap. The encoder fails closed here rather than silently
-// counting the TTL as an orphan because in real Pebble snapshot
-// order (`!redis|ttl|` lex-sorts before `!st|`/`!stream|`/`!zs|`),
-// the dropped entry would likely belong to a valid wide-column key
-// that arrives later — losing its expire_at_ms would produce a
-// restored database with non-expiring data that the source
-// snapshot's clients expected to expire. Codex P1 on PR #790
-// round 5.
+// unknown-kind TTL arrives but the pendingTTL buffer's BYTE
+// budget (pendingTTLBytesCap) is already exhausted. The encoder
+// fails closed here rather than silently counting the TTL as an
+// orphan because in real Pebble snapshot order (`!redis|ttl|`
+// lex-sorts before `!st|`/`!stream|`/`!zs|`), the dropped entry
+// would likely belong to a valid wide-column key that arrives
+// later — losing its expire_at_ms would produce a restored
+// database with non-expiring data that the source snapshot's
+// clients expected to expire.
 //
-// Recovery: raise WithPendingTTLCap above the snapshot's count of
-// unmatched-at-intake TTLs, or set the cap to 0 to explicitly opt
-// into the lossy counter-only mode (callers that prefer not to
-// see this error must accept that orphan-counted entries will be
-// dropped without inlining into wide-column state).
-var ErrPendingTTLBufferFull = cockroachdberr.New("backup: pendingTTL buffer at cap; raise WithPendingTTLCap or accept orphan-counter mode via WithPendingTTLCap(0)")
+// The budget is in BYTES (not entries) because Redis user keys can
+// be up to 1 MiB each; an entry-count cap of N still permits N
+// MiB of accumulated key bytes, which defeats the OOM protection
+// on adversarial snapshots with large keys. Codex P1 on PR #790
+// round 5 (entry-count -> byte-budget on round 6).
+//
+// Recovery: raise WithPendingTTLByteCap above the snapshot's
+// expected cumulative byte cost of unmatched-at-intake TTLs, or
+// set the byte cap to 0 to explicitly opt into the lossy
+// counter-only mode.
+var ErrPendingTTLBufferFull = cockroachdberr.New("backup: pendingTTL byte budget exhausted; raise WithPendingTTLByteCap or accept orphan-counter mode via WithPendingTTLByteCap(0)")
 
 // redisKeyKind tracks which Redis-type prefix introduced a user key, so that
 // when a later !redis|ttl|<K> record arrives we know whether to write its
@@ -233,30 +238,48 @@ type RedisDB struct {
 	// appeared as a typed record — likely a corrupted store).
 	pendingTTL map[string]uint64
 
-	// pendingTTLCap caps pendingTTL's in-memory size. Once the map
-	// reaches this many entries, subsequent unknown-kind TTLs fall
-	// back to incrementing orphanTTLCount directly without
-	// buffering the user-key bytes. Without this cap, an
-	// adversarial or corrupt snapshot whose `!redis|ttl|` records
-	// never find a typed-record claimer would grow pendingTTL
-	// unboundedly and could OOM the decoder. Codex P1 finding
-	// surfaced on PR #791 round 2; the same fix is applied here on
-	// PR #790 because the two PRs share the pendingTTL
-	// infrastructure and the bug is identical.
-	pendingTTLCap int
+	// pendingTTLBytes tracks the cumulative byte cost of the
+	// pendingTTL buffer (each entry costs len(userKey) + 8 bytes,
+	// where 8 is the uint64 expireAtMs payload — the per-entry
+	// Go-map overhead is not counted here, since we want the cap
+	// to be a deterministic byte budget the operator can reason
+	// about).
+	pendingTTLBytes int
 
-	// pendingTTLOverflow counts entries skipped because the
-	// pendingTTL buffer was at cap. Surfaced in the Finalize
-	// warning so operators can distinguish "snapshot exceeded the
-	// buffer cap" from "TTL records remained unmatched".
+	// pendingTTLBytesCap caps the byte cost of pendingTTL. Once
+	// the cumulative cost would exceed this budget, subsequent
+	// unknown-kind TTLs fail closed with ErrPendingTTLBufferFull.
+	// We bound by bytes (not by entry count) because Redis user
+	// keys can be up to 1 MiB each; an entry-count cap of N
+	// would still permit ~N MiB of accumulated key bytes —
+	// defeating the OOM protection on adversarial snapshots with
+	// large keys. Codex P1 finding on PR #790 round 6.
+	pendingTTLBytesCap int
+
+	// pendingTTLOverflow counts entries that would have entered
+	// pendingTTL but were rejected because the byte budget was
+	// exhausted. Surfaced in the Finalize warning so operators
+	// can distinguish "snapshot exceeded the buffer budget" from
+	// "TTL records remained unmatched after the entire scan".
 	pendingTTLOverflow int
 }
 
-// defaultPendingTTLCap caps pendingTTL at 1 MiB entries by default
-// (~64 MiB worst-case memory at ~64 B per Go map entry). Override
-// via WithPendingTTLCap for hosts that need a different memory /
-// coverage trade-off.
-const defaultPendingTTLCap = 1 << 20
+// defaultPendingTTLBytesCap caps pendingTTL at 64 MiB cumulative
+// key+payload bytes by default. Override via WithPendingTTLByteCap
+// for hosts that need a different memory / coverage trade-off.
+// 64 MiB covers tens of thousands to millions of typical Redis
+// keys (usually << 100 bytes each); the absolute key-size ceiling
+// is 1 MiB, so this budget tolerates ~64 maximally-large keys
+// without dropping the OOM protection.
+const defaultPendingTTLBytesCap = 64 << 20
+
+// pendingTTLEntryOverheadBytes is the per-entry payload cost we
+// charge against pendingTTLBytesCap on top of the user-key bytes.
+// It accounts for the uint64 expireAtMs we store as the map value.
+// The Go-map's bucket overhead is NOT included — we want a
+// deterministic byte budget the operator can reason about
+// directly, not one that drifts with Go's runtime map layout.
+const pendingTTLEntryOverheadBytes = 8
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
 // dbIndex selects <n>; today the producer always passes 0, but accepting
@@ -267,30 +290,37 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		dbIndex = 0
 	}
 	return &RedisDB{
-		outRoot:          outRoot,
-		dbIndex:          dbIndex,
-		kindByKey:        make(map[string]redisKeyKind),
-		dirsCreated:      make(map[string]struct{}),
-		inlineTTLEmitted: make(map[string]struct{}),
-		hashes:           make(map[string]*redisHashState),
-		lists:            make(map[string]*redisListState),
-		sets:             make(map[string]*redisSetState),
-		zsets:            make(map[string]*redisZSetState),
-		pendingTTL:       make(map[string]uint64),
-		pendingTTLCap:    defaultPendingTTLCap,
+		outRoot:            outRoot,
+		dbIndex:            dbIndex,
+		kindByKey:          make(map[string]redisKeyKind),
+		dirsCreated:        make(map[string]struct{}),
+		inlineTTLEmitted:   make(map[string]struct{}),
+		hashes:             make(map[string]*redisHashState),
+		lists:              make(map[string]*redisListState),
+		sets:               make(map[string]*redisSetState),
+		zsets:              make(map[string]*redisZSetState),
+		pendingTTL:         make(map[string]uint64),
+		pendingTTLBytesCap: defaultPendingTTLBytesCap,
 	}
 }
 
-// WithPendingTTLCap overrides the default cap on the pendingTTL
-// buffer. A value of 0 disables buffering — every unknown-kind TTL
-// becomes an immediate orphan (matches the pre-pendingTTL behavior).
-// Negative inputs are coerced to 0. Returns the receiver so it can
-// be chained with other With* setters.
-func (r *RedisDB) WithPendingTTLCap(capacity int) *RedisDB {
+// WithPendingTTLByteCap overrides the default byte budget for the
+// pendingTTL buffer. A value of 0 disables buffering — every
+// unknown-kind TTL becomes an immediate orphan (matches the
+// pre-pendingTTL behavior). Negative inputs are coerced to 0.
+// Returns the receiver so it can be chained with other With*
+// setters.
+//
+// The budget is in BYTES (sum of `len(userKey) +
+// pendingTTLEntryOverheadBytes` over every buffered entry), NOT
+// entry count, because Redis user keys can be up to 1 MiB each
+// and an entry-count cap of N would still permit ~N MiB of
+// accumulated key bytes. Codex P1 finding on PR #790 round 6.
+func (r *RedisDB) WithPendingTTLByteCap(capacity int) *RedisDB {
 	if capacity < 0 {
 		capacity = 0
 	}
-	r.pendingTTLCap = capacity
+	r.pendingTTLBytesCap = capacity
 	return r
 }
 
@@ -418,7 +448,7 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 // fails closed when the buffer is at cap. Extracted from HandleTTL's
 // switch so the parent stays under the cyclop budget.
 //
-// Three modes determined by pendingTTLCap:
+// Three modes determined by pendingTTLBytesCap:
 //
 //   - cap > 0 and buffer NOT full: store the (userKey, expireAtMs)
 //     pair so a later wide-column state-init can drain it.
@@ -436,24 +466,31 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 // the snapshot reader reuses key buffers across iterations — an
 // alias slice would race with the next record.
 func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) error {
-	if r.pendingTTLCap == 0 {
+	if r.pendingTTLBytesCap == 0 {
 		// Counter-only mode (operator explicitly disabled the buffer).
 		r.orphanTTLCount++
 		return nil
 	}
-	if len(r.pendingTTL) >= r.pendingTTLCap {
+	// Charge the byte cost: user-key bytes + the uint64 expireAtMs
+	// payload. The Go-map's per-bucket overhead is NOT counted
+	// because we want the cap to be a deterministic byte budget
+	// the operator can reason about. See pendingTTLEntryOverheadBytes.
+	cost := len(userKey) + pendingTTLEntryOverheadBytes
+	if r.pendingTTLBytes+cost > r.pendingTTLBytesCap {
 		// Fail closed: refuse to silently drop a TTL that may
 		// belong to a wide-column key arriving later in the
-		// snapshot scan. The operator should raise the cap
-		// (WithPendingTTLCap) or investigate the snapshot for
-		// corruption. We still increment pendingTTLOverflow so
-		// the Finalize warning surfaces the count even if the
-		// caller swallows the error.
+		// snapshot scan. The operator should raise the budget
+		// (WithPendingTTLByteCap) or investigate the snapshot
+		// for corruption. We still increment pendingTTLOverflow
+		// so the Finalize warning surfaces the count even if
+		// the caller swallows the error.
 		r.pendingTTLOverflow++
 		return cockroachdberr.Wrapf(ErrPendingTTLBufferFull,
-			"buffer at cap=%d (user_key_len=%d)", r.pendingTTLCap, len(userKey))
+			"buffer would exceed byte_cap=%d by %d bytes (user_key_len=%d, in_flight=%d)",
+			r.pendingTTLBytesCap, r.pendingTTLBytes+cost-r.pendingTTLBytesCap, len(userKey), r.pendingTTLBytes)
 	}
 	r.pendingTTL[string(userKey)] = expireAtMs
+	r.pendingTTLBytes += cost
 	return nil
 }
 
@@ -479,6 +516,10 @@ func (r *RedisDB) claimPendingTTL(userKey []byte) (uint64, bool) {
 		return 0, false
 	}
 	delete(r.pendingTTL, uk)
+	// Free the byte budget so a later snapshot scan that drains
+	// many entries can buffer further work. Matches the cost
+	// charged in parkUnknownTTL exactly.
+	r.pendingTTLBytes -= len(uk) + pendingTTLEntryOverheadBytes
 	return expireAtMs, true
 }
 
@@ -518,7 +559,7 @@ func (r *RedisDB) Finalize() error {
 		if r.pendingTTLOverflow > 0 {
 			fields = append(fields,
 				"pending_ttl_buffer_overflow", r.pendingTTLOverflow,
-				"pending_ttl_buffer_cap", r.pendingTTLCap)
+				"pending_ttl_buffer_bytes_cap", r.pendingTTLBytesCap)
 		}
 		r.warn("redis_orphan_ttl", fields...)
 	}
