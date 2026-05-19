@@ -101,8 +101,15 @@ const (
 
 // PebbleSnapshotMagic is the 8-byte file header that introduces a
 // native Pebble snapshot. Exposed for callers that need to sniff a
-// file before deciding which reader to dispatch to.
-var PebbleSnapshotMagic = [PebbleSnapshotMagicLen]byte{'E', 'K', 'V', 'P', 'B', 'B', 'L', '1'}
+// file before deciding which reader to dispatch to. Declared as an
+// untyped string CONSTANT (not a `var [8]byte`) so an importer
+// cannot mutate the bytes — a writable package variable would let
+// any caller corrupt the header globally and break parsing for
+// every consumer (coderabbit Major on PR #792 round 2).
+// Callers comparing against the magic should treat the encoded-key
+// type of their own data: most call sites convert to a byte slice
+// via `[]byte(PebbleSnapshotMagic)` at the comparison point.
+const PebbleSnapshotMagic = "EKVPBBL1"
 
 // ErrSnapshotBadMagic is returned when the first 8 bytes of the
 // reader do not match `EKVPBBL1`. The decoder caller should treat
@@ -309,7 +316,7 @@ func readSnapshotHeader(r io.Reader) (SnapshotHeader, error) {
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return SnapshotHeader{}, cockroachdberr.WithStack(err)
 	}
-	if !bytes.Equal(magic[:], PebbleSnapshotMagic[:]) {
+	if !bytes.Equal(magic[:], []byte(PebbleSnapshotMagic)) {
 		return SnapshotHeader{}, cockroachdberr.Wrapf(ErrSnapshotBadMagic,
 			"got %q", magic[:])
 	}

@@ -22,7 +22,7 @@ type snapBuilder struct {
 
 func newSnapBuilder(lastCommitTS uint64) *snapBuilder {
 	b := &snapBuilder{}
-	b.buf.Write(PebbleSnapshotMagic[:])
+	b.buf.WriteString(PebbleSnapshotMagic)
 	_ = binary.Write(&b.buf, binary.LittleEndian, lastCommitTS)
 	return b
 }
@@ -299,17 +299,21 @@ func TestReadSnapshot_RejectsValueLengthOverBudget(t *testing.T) {
 }
 
 // TestReadSnapshot_AcceptsKeyLengthAtBudgetBoundary pins the off-
-// by-one: keyLen == MaxSnapshotEncodedKeySize must be accepted (the
-// reader rejects only >, matching the live store's
-// `readRestoreFieldLen` semantics). We test with a 1 KiB key
-// because allocating the full 1 MiB on every run would slow the
-// test suite — the boundary is the same regardless of magnitude.
+// by-one: encoded-key length EXACTLY equal to
+// MaxSnapshotEncodedKeySize must be accepted (the reader rejects
+// only `> budget`, matching the live store's `readRestoreFieldLen`
+// semantics). The earlier 1 KiB version of this test (coderabbit
+// Major on PR #792 round 2) would not catch a `>=` vs `>` regression
+// because the input was far below the budget. This version sizes
+// the user key to make the encoded key (`userKey + 8-byte TS
+// suffix`) land at exactly MaxSnapshotEncodedKeySize, then asserts
+// successful round-trip. A regression that flipped the comparison
+// to `>=` would reject this entry with ErrSnapshotKeyTooLarge.
 func TestReadSnapshot_AcceptsKeyLengthAtBudgetBoundary(t *testing.T) {
 	t.Parallel()
 	b := newSnapBuilder(0)
-	// 1 KiB user key + 8-byte TS suffix.
-	const userKeyLen = 1 << 10
-	userKey := make([]byte, userKeyLen)
+	// userKey sized so that encoded-key length == MaxSnapshotEncodedKeySize.
+	userKey := make([]byte, MaxSnapshotEncodedKeySize-snapshotTSSize)
 	for i := range userKey {
 		userKey[i] = byte(i % 256)
 	}
@@ -321,10 +325,10 @@ func TestReadSnapshot_AcceptsKeyLengthAtBudgetBoundary(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("err = %v want nil at length within budget", err)
+		t.Fatalf("err = %v want nil at length == MaxSnapshotEncodedKeySize", err)
 	}
 	if !bytes.Equal(got.UserKey, userKey) {
-		t.Fatalf("UserKey mismatch at boundary")
+		t.Fatalf("UserKey mismatch at boundary (got len=%d want len=%d)", len(got.UserKey), len(userKey))
 	}
 }
 
