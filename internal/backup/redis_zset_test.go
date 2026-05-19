@@ -671,24 +671,35 @@ func TestRedisDB_ZSetLegacyBlobRoundTrip(t *testing.T) {
 	})
 }
 
-// TestRedisDB_ZSetLegacyBlobThenWideColumnMerges pins the mid-
-// migration shape: when a snapshot carries BOTH the legacy
+// TestRedisDB_ZSetWideColumnSupersedesLegacyBlob pins the codex
+// P1 round 3 fix: when a snapshot carries BOTH the legacy
 // `!redis|zset|<k>` blob AND wide-column `!zs|mem|<k>...` rows for
-// the same user key (which the live store does during the
-// migration window), the encoder must produce a single merged
-// zset. `!redis|zset|` lex-sorts before `!zs|...` so the blob
-// arrives first; the wide-column rows then update / add members.
-func TestRedisDB_ZSetLegacyBlobThenWideColumnMerges(t *testing.T) {
+// the same user key (a mid-migration state, or a stale post-
+// migration leftover), the encoder MUST drop the legacy entries
+// and use only the wide-column source-of-truth. This matches the
+// live read path in adapter/redis_compat_helpers.go:610-620
+// (RedisServer.loadZSetAt) which falls back to the legacy blob
+// ONLY when no wide-column rows exist.
+//
+// Without this fix, the dump would surface deleted or outdated
+// members from a stale legacy blob — silent backup corruption.
+func TestRedisDB_ZSetWideColumnSupersedesLegacyBlob(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
+	// Snapshot order: legacy blob arrives first (sorts before !zs|).
+	// "bob-stale" exists ONLY in the legacy blob — a stale
+	// post-migration leftover that the live store hides via the
+	// loadZSetAt preference for wide-column rows.
 	legacy := encodeZSetLegacyBlobValue(t, []zsetLegacyEntry{
 		{member: "alice", score: 1},
-		{member: "bob", score: 2},
+		{member: "bob-stale", score: 2},
 	})
 	if err := db.HandleZSetLegacyBlob(zsetLegacyBlobKey("k"), legacy); err != nil {
 		t.Fatal(err)
 	}
-	// Wide-column rows: update alice's score, add charlie.
+	// Wide-column source-of-truth: alice with a new score, charlie new.
+	// "bob-stale" is intentionally absent — its presence in the legacy
+	// blob is the stale-leftover scenario this test guards against.
 	if err := db.HandleZSetMember(zsetMemberKey("k", []byte("alice")), encodeZSetScoreValue(99)); err != nil {
 		t.Fatal(err)
 	}
@@ -699,10 +710,67 @@ func TestRedisDB_ZSetLegacyBlobThenWideColumnMerges(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := readZSetJSON(t, filepath.Join(root, "redis", "db_0", "zsets", "k.json"))
+	// "bob-stale" MUST NOT appear — wide-column rows supersede the legacy blob.
 	assertZSetMembersEqual(t, zsetMembersArray(t, got), []zsetMemberEntry{
-		{member: "alice", scoreNum: 99, scoreKind: "number"}, // wide-column won
-		{member: "bob", scoreNum: 2, scoreKind: "number"},    // legacy survived
+		{member: "alice", scoreNum: 99, scoreKind: "number"},
 		{member: "charlie", scoreNum: 3, scoreKind: "number"},
+	})
+}
+
+// TestRedisDB_ZSetMetaAloneEvictsLegacyBlob pins that a `!zs|meta|`
+// record (even without any `!zs|mem|` rows) also triggers the
+// legacy-supersedence rule. The live read path's loadZSetAt
+// preference is based on whether ANY wide-column key exists for
+// the user key — meta-only is rare in practice but the encoder
+// stays consistent with the read-side contract.
+func TestRedisDB_ZSetMetaAloneEvictsLegacyBlob(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	legacy := encodeZSetLegacyBlobValue(t, []zsetLegacyEntry{
+		{member: "stale", score: 1},
+	})
+	if err := db.HandleZSetLegacyBlob(zsetLegacyBlobKey("k"), legacy); err != nil {
+		t.Fatal(err)
+	}
+	// Wide-column meta record declares zero members.
+	if err := db.HandleZSetMeta(zsetMetaKey("k"), encodeZSetMetaValue(0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readZSetJSON(t, filepath.Join(root, "redis", "db_0", "zsets", "k.json"))
+	if members := zsetMembersArray(t, got); len(members) != 0 {
+		t.Fatalf("meta-only wide-column row MUST evict legacy blob, got members=%v", members)
+	}
+}
+
+// TestRedisDB_ZSetLegacyBlobAfterWideRowsIsDropped pins the
+// reverse-order edge case: if a snapshot somehow emits a
+// `!redis|zset|` AFTER `!zs|mem|` rows (custom dispatcher
+// ordering, or a replay), the legacy blob is dropped at intake
+// rather than overwriting the established wide-column state.
+func TestRedisDB_ZSetLegacyBlobAfterWideRowsIsDropped(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	// Wide-column row first — registers sawWide.
+	if err := db.HandleZSetMember(zsetMemberKey("k", []byte("alice")), encodeZSetScoreValue(99)); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy blob arrives later — must be ignored.
+	legacy := encodeZSetLegacyBlobValue(t, []zsetLegacyEntry{
+		{member: "alice", score: 1}, // would overwrite if not gated
+		{member: "stale", score: 2}, // would re-add if not gated
+	})
+	if err := db.HandleZSetLegacyBlob(zsetLegacyBlobKey("k"), legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readZSetJSON(t, filepath.Join(root, "redis", "db_0", "zsets", "k.json"))
+	assertZSetMembersEqual(t, zsetMembersArray(t, got), []zsetMemberEntry{
+		{member: "alice", scoreNum: 99, scoreKind: "number"}, // unchanged
 	})
 }
 

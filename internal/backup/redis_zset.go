@@ -96,10 +96,22 @@ var ErrRedisInvalidZSetKey = cockroachdberr.New("backup: malformed !zs| key")
 // HandleZSetMember calls collapse to the latest-wins score (matching
 // Redis's ZADD semantics: re-adding a member overwrites the prior
 // score).
+//
+// sawWide tracks whether ANY wide-column row (`!zs|meta|` or
+// `!zs|mem|`) has been observed for the user key. This mirrors the
+// live read path's source-of-truth selection in
+// `adapter/redis_compat_helpers.go:610-620`
+// (`RedisServer.loadZSetAt`): when wide-column rows exist they are
+// authoritative, and any `!redis|zset|<k>` legacy blob is ignored
+// (treated as a stale post-migration leftover). Without this flag,
+// the encoder would merge stale legacy members on top of the
+// wide-column source-of-truth, surfacing deleted or outdated
+// entries in the restored zset. Codex P1 round 3 (PR #790).
 type redisZSetState struct {
 	metaSeen    bool
 	declaredLen int64
 	members     map[string]float64
+	sawWide     bool
 	expireAtMs  uint64
 	hasTTL      bool
 }
@@ -141,6 +153,11 @@ func (r *RedisDB) HandleZSetMeta(key, value []byte) error {
 	st := r.zsetState(userKey)
 	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
 	st.metaSeen = true
+	// Wide-column meta means any legacy blob already merged into
+	// this state is stale; drop it. The live read path
+	// (adapter/redis_compat_helpers.go:610-620) makes the same
+	// choice on read.
+	r.markZSetWide(st)
 	return nil
 }
 
@@ -169,8 +186,37 @@ func (r *RedisDB) HandleZSetMember(key, value []byte) error {
 			"NaN score for member of user key %q (length %d)", userKey, len(userKey))
 	}
 	st := r.zsetState(userKey)
+	// First wide-column row evicts any provisional legacy-blob
+	// members on this user key. From here on, the wide-column
+	// rows are the authoritative source of truth — matches the
+	// live read path's preference in
+	// adapter/redis_compat_helpers.go:610-620.
+	r.markZSetWide(st)
 	st.members[string(member)] = score
 	return nil
+}
+
+// markZSetWide flips the sawWide flag and, if this is the first
+// wide-column observation for the state, clears any provisional
+// legacy-blob members. The live read path treats `!redis|zset|`
+// as a fallback that is ONLY consulted when no wide-column rows
+// exist (`adapter/redis_compat_helpers.go::RedisServer.loadZSetAt`
+// line 610-620), so a snapshot containing both layouts for the
+// same user key MUST drop the legacy entries to avoid surfacing
+// stale post-migration leftovers. Codex P1 round 3 (PR #790).
+func (r *RedisDB) markZSetWide(st *redisZSetState) {
+	if st.sawWide {
+		return
+	}
+	st.sawWide = true
+	// Clear any legacy-blob members deposited before the first
+	// wide-column row arrived. Re-using the same map keeps the
+	// nil-vs-empty contract for empty-but-meta-seen zsets (an
+	// explicit `make` would change observable Finalize behavior
+	// for those edge cases).
+	for k := range st.members {
+		delete(st.members, k)
+	}
 }
 
 // HandleZSetScore accepts and discards one !zs|scr|... record. The
@@ -219,6 +265,15 @@ func (r *RedisDB) HandleZSetLegacyBlob(key, value []byte) error {
 		return err
 	}
 	st := r.zsetState(userKey)
+	if st.sawWide {
+		// Wide-column rows already arrived for this user key (rare
+		// in practice because !redis|zset| sorts before !zs|...,
+		// but possible with a custom dispatcher ordering or a mid-
+		// migration replay). The live read path ignores the legacy
+		// blob in that case, so we do too — applying these entries
+		// would surface stale post-migration leftovers in the dump.
+		return nil
+	}
 	for _, e := range entries {
 		st.members[e.member] = e.score
 	}
