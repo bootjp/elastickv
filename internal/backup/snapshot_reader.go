@@ -60,6 +60,43 @@ const (
 	snapshotEncStateReserved byte = 0b1111_1000 // bits 3-7 must be zero
 	snapshotEncStateCleartx  byte = 0b00
 	snapshotEncStateEncrypt  byte = 0b01
+
+	// MaxSnapshotEncodedKeySize / MaxSnapshotEncodedValueSize bound the
+	// per-entry allocations made by readExact / readExactGrow. Mirrors
+	// the live store's `maxPebbleEncodedKeySize` (1 MiB user-key cap +
+	// 8-byte TS suffix; store/mvcc_store.go:29 + store/lsm_store.go:51)
+	// and `maxSnapshotValueSize + valueHeaderSize +
+	// encryption.EnvelopeOverhead` (256 MiB cleartext + 9-byte header +
+	// 34-byte envelope; store/mvcc_store.go:37 +
+	// store/lsm_store.go:1692). Without these guards a corrupt or
+	// adversarial snapshot whose length-prefix declares a huge size
+	// would either OOM the decoder via `make([]byte, n)` or, on 32-bit
+	// architectures, panic when narrowing `uint64` → `int` for the
+	// slice length. Codex P1 + gemini security-high (PR #792 round 1).
+	//
+	// Duplicated here (rather than imported from `store`) so the
+	// backup package keeps the adapter-independence required by the
+	// design (it must run as a standalone offline tool with no live-
+	// cluster libraries linked). The values are reviewed for staleness
+	// alongside the live store's constants at every PR round.
+
+	// maxSnapshotUserKeySize mirrors store/mvcc_store.go:29
+	// `maxSnapshotKeySize` = 1 MiB.
+	maxSnapshotUserKeySize = 1 << maxSnapshotUserKeyShift
+	// maxSnapshotUserValueSize mirrors store/mvcc_store.go:37
+	// `maxSnapshotValueSize` = 256 MiB.
+	maxSnapshotUserValueSize    = maxSnapshotValueMiB << maxSnapshotValueShift
+	maxSnapshotUserKeyShift     = 20 // 1 << 20 == 1 MiB
+	maxSnapshotValueShift       = 20 // <Mib> << 20 == byte count
+	maxSnapshotValueMiB         = 256
+	MaxSnapshotEncodedKeySize   = maxSnapshotUserKeySize + snapshotTSSize
+	MaxSnapshotEncodedValueSize = maxSnapshotUserValueSize + snapshotValueHeaderSize + envelopeMaxB
+
+	// envelopeMaxB mirrors internal/encryption.EnvelopeOverhead (12-
+	// byte nonce + 16-byte tag + 6-byte AAD-binding header = 34).
+	// Duplicated here so we do not import the encryption package
+	// from the backup-package's offline-tool boundary.
+	envelopeMaxB = 34
 )
 
 // PebbleSnapshotMagic is the 8-byte file header that introduces a
@@ -100,6 +137,16 @@ var ErrSnapshotEncryptedEntry = cockroachdberr.New("backup: snapshot contains en
 // `store.fillEncodedKey` always appends. Indicates a corrupt
 // snapshot — the live store would never emit such a key.
 var ErrSnapshotShortKey = cockroachdberr.New("backup: encoded key shorter than timestamp suffix")
+
+// ErrSnapshotKeyTooLarge / ErrSnapshotValueTooLarge are returned
+// when the on-disk length prefix declares an entry larger than the
+// MaxSnapshotEncodedKeySize / MaxSnapshotEncodedValueSize budgets.
+// Mirrors `store.ErrSnapshotKeyTooLarge` and `store.ErrValueTooLarge`
+// from the live restore path so a corrupt or adversarial snapshot
+// fails closed at the length-prefix layer instead of triggering an
+// OOM-sized allocation (codex P1 + gemini security-high on PR #792).
+var ErrSnapshotKeyTooLarge = cockroachdberr.New("backup: snapshot key length exceeds limit")
+var ErrSnapshotValueTooLarge = cockroachdberr.New("backup: snapshot value length exceeds limit")
 
 // ErrSnapshotShortValue is returned when an entry's encoded value
 // is shorter than the 9-byte value header. Indicates a corrupt
@@ -177,32 +224,19 @@ func readOneEntry(
 	valBuf *[]byte,
 	fn func(SnapshotHeader, SnapshotEntry) error,
 ) (bool, error) {
-	kLen, eof, err := readEntryLen(r)
+	key, eof, err := readEntryKey(r, keyScratch)
 	if err != nil {
 		return false, err
 	}
 	if eof {
+		// Clean inter-entry EOF — natural terminator.
 		return true, nil
 	}
-	key, err := readExact(r, keyScratch[:0], kLen)
+	value, err := readEntryValue(r, valBuf)
 	if err != nil {
-		return false, cockroachdberr.WithStack(err)
-	}
-	vLen, _, err := readEntryLen(r)
-	if err != nil {
-		// A clean EOF here means the snapshot truncated between
-		// the key bytes and the value-length field — not the
-		// same as a clean inter-entry EOF.
-		if cockroachdberr.Is(err, io.EOF) {
-			return false, cockroachdberr.WithStack(ErrSnapshotTruncated)
-		}
 		return false, err
 	}
-	*valBuf, err = readExactGrow(r, (*valBuf)[:0], vLen)
-	if err != nil {
-		return false, cockroachdberr.WithStack(err)
-	}
-	entry, err := decodeSnapshotEntry(key, *valBuf)
+	entry, err := decodeSnapshotEntry(key, value)
 	if err != nil {
 		return false, err
 	}
@@ -210,6 +244,62 @@ func readOneEntry(
 		return false, err
 	}
 	return false, nil
+}
+
+// readEntryKey reads the per-entry length-prefix-then-bytes for the
+// key half of one entry. Returns (nil, true, nil) on the natural
+// inter-entry EOF (clean stream terminator). Applies the
+// MaxSnapshotEncodedKeySize bound BEFORE allocating the read
+// buffer; without this guard a corrupt or adversarial snapshot
+// whose length prefix declares a huge size would OOM the decoder
+// or panic on 32-bit narrowing. Mirrors
+// `store/lsm_store.go::readRestoreFieldLen`. Codex P1 + gemini
+// security-high on PR #792.
+func readEntryKey(r *bufio.Reader, scratch []byte) ([]byte, bool, error) {
+	kLen, kEof, err := readEntryLen(r)
+	if err != nil {
+		return nil, false, err
+	}
+	if kEof {
+		return nil, true, nil
+	}
+	if kLen > MaxSnapshotEncodedKeySize {
+		return nil, false, cockroachdberr.Wrapf(ErrSnapshotKeyTooLarge,
+			"length %d > %d", kLen, MaxSnapshotEncodedKeySize)
+	}
+	key, err := readExact(r, scratch[:0], kLen)
+	if err != nil {
+		return nil, false, cockroachdberr.WithStack(err)
+	}
+	return key, false, nil
+}
+
+// readEntryValue reads the per-entry length-prefix-then-bytes for
+// the value half of one entry. A mid-entry EOF (length prefix
+// missing after the key was already consumed) surfaces as
+// ErrSnapshotTruncated rather than the natural inter-entry EOF —
+// gemini high finding on PR #792 (the previous code ignored
+// readEntryLen's eof return value here, allowing a truncated stream
+// to flow into decodeSnapshotEntry with vLen=0 and surface as the
+// wrong error). Applies MaxSnapshotEncodedValueSize before allocation
+// (same rationale as readEntryKey).
+func readEntryValue(r *bufio.Reader, valBuf *[]byte) ([]byte, error) {
+	vLen, vEof, err := readEntryLen(r)
+	if err != nil {
+		return nil, err
+	}
+	if vEof {
+		return nil, cockroachdberr.WithStack(ErrSnapshotTruncated)
+	}
+	if vLen > MaxSnapshotEncodedValueSize {
+		return nil, cockroachdberr.Wrapf(ErrSnapshotValueTooLarge,
+			"length %d > %d", vLen, MaxSnapshotEncodedValueSize)
+	}
+	*valBuf, err = readExactGrow(r, (*valBuf)[:0], vLen)
+	if err != nil {
+		return nil, cockroachdberr.WithStack(err)
+	}
+	return *valBuf, nil
 }
 
 // readSnapshotHeader consumes the 8-byte magic and the 8-byte LE

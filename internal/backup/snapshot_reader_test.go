@@ -225,6 +225,109 @@ func TestReadSnapshot_RejectsTruncatedEntry(t *testing.T) {
 	}
 }
 
+// TestReadSnapshot_RejectsTruncatedBeforeValueLength pins the
+// gemini-high fix on PR #792: a snapshot that ends AFTER the key
+// bytes but BEFORE the value-length field must surface as
+// ErrSnapshotTruncated (not the previous ErrSnapshotShortValue
+// misclassification, which happened because readEntryLen's `eof`
+// return value was being ignored on the second call).
+func TestReadSnapshot_RejectsTruncatedBeforeValueLength(t *testing.T) {
+	t.Parallel()
+	b := newSnapBuilder(0)
+	// Build a complete key (length + bytes) but no value-length.
+	encKey := make([]byte, 1+snapshotTSSize)
+	encKey[0] = 'k'
+	binary.BigEndian.PutUint64(encKey[1:], ^uint64(1))
+	var kLen [8]byte
+	binary.LittleEndian.PutUint64(kLen[:], uint64(len(encKey)))
+	full := append(b.Bytes(), kLen[:]...)
+	full = append(full, encKey...)
+	err := ReadSnapshot(bytes.NewReader(full), func(_ SnapshotHeader, _ SnapshotEntry) error {
+		return nil
+	})
+	if !errors.Is(err, ErrSnapshotTruncated) {
+		t.Fatalf("err = %v want ErrSnapshotTruncated", err)
+	}
+}
+
+// TestReadSnapshot_RejectsKeyLengthOverBudget pins the codex P1 +
+// gemini security-high fix on PR #792: a corrupt or adversarial
+// snapshot whose length-prefix declares a key larger than
+// MaxSnapshotEncodedKeySize must fail at the length-prefix check
+// BEFORE allocating `make([]byte, kLen)`. Without this guard a 4 GB
+// length prefix would OOM the decoder (or panic on 32-bit when
+// uint64 → int narrowing wraps).
+func TestReadSnapshot_RejectsKeyLengthOverBudget(t *testing.T) {
+	t.Parallel()
+	b := newSnapBuilder(0)
+	// Length-prefix one byte over the budget.
+	var l [8]byte
+	binary.LittleEndian.PutUint64(l[:], uint64(MaxSnapshotEncodedKeySize)+1)
+	full := append(b.Bytes(), l[:]...)
+	err := ReadSnapshot(bytes.NewReader(full), func(_ SnapshotHeader, _ SnapshotEntry) error {
+		t.Fatalf("callback fired on over-budget key length")
+		return nil
+	})
+	if !errors.Is(err, ErrSnapshotKeyTooLarge) {
+		t.Fatalf("err = %v want ErrSnapshotKeyTooLarge", err)
+	}
+}
+
+// TestReadSnapshot_RejectsValueLengthOverBudget mirrors the
+// key-length guard for the value side.
+func TestReadSnapshot_RejectsValueLengthOverBudget(t *testing.T) {
+	t.Parallel()
+	b := newSnapBuilder(0)
+	// Build a valid key entry, then a value-length one byte over the
+	// budget.
+	encKey := make([]byte, 1+snapshotTSSize)
+	encKey[0] = 'k'
+	binary.BigEndian.PutUint64(encKey[1:], ^uint64(1))
+	var kLen, vLen [8]byte
+	binary.LittleEndian.PutUint64(kLen[:], uint64(len(encKey)))
+	binary.LittleEndian.PutUint64(vLen[:], uint64(MaxSnapshotEncodedValueSize)+1)
+	full := append(b.Bytes(), kLen[:]...)
+	full = append(full, encKey...)
+	full = append(full, vLen[:]...)
+	err := ReadSnapshot(bytes.NewReader(full), func(_ SnapshotHeader, _ SnapshotEntry) error {
+		t.Fatalf("callback fired on over-budget value length")
+		return nil
+	})
+	if !errors.Is(err, ErrSnapshotValueTooLarge) {
+		t.Fatalf("err = %v want ErrSnapshotValueTooLarge", err)
+	}
+}
+
+// TestReadSnapshot_AcceptsKeyLengthAtBudgetBoundary pins the off-
+// by-one: keyLen == MaxSnapshotEncodedKeySize must be accepted (the
+// reader rejects only >, matching the live store's
+// `readRestoreFieldLen` semantics). We test with a 1 KiB key
+// because allocating the full 1 MiB on every run would slow the
+// test suite — the boundary is the same regardless of magnitude.
+func TestReadSnapshot_AcceptsKeyLengthAtBudgetBoundary(t *testing.T) {
+	t.Parallel()
+	b := newSnapBuilder(0)
+	// 1 KiB user key + 8-byte TS suffix.
+	const userKeyLen = 1 << 10
+	userKey := make([]byte, userKeyLen)
+	for i := range userKey {
+		userKey[i] = byte(i % 256)
+	}
+	b.WriteEntry(userKey, 1, []byte("v"), false, 0, snapshotEncStateCleartx)
+	var got SnapshotEntry
+	err := ReadSnapshot(bytes.NewReader(b.Bytes()), func(_ SnapshotHeader, e SnapshotEntry) error {
+		got = e
+		got.UserKey = bytes.Clone(e.UserKey)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("err = %v want nil at length within budget", err)
+	}
+	if !bytes.Equal(got.UserKey, userKey) {
+		t.Fatalf("UserKey mismatch at boundary")
+	}
+}
+
 // TestReadSnapshot_RejectsShortKey pins the encoded-key-length
 // invariant. Every encoded key has an 8-byte TS suffix; an entry
 // with a shorter key indicates store corruption.
