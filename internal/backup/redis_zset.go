@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 
+	pb "github.com/bootjp/elastickv/proto"
 	cockroachdberr "github.com/cockroachdb/errors"
+	gproto "google.golang.org/protobuf/proto"
 )
 
 // Redis zset encoder. Translates raw !zs|... snapshot records into the
@@ -36,16 +38,47 @@ const (
 	RedisZSetScorePrefix     = "!zs|scr|"
 	RedisZSetMetaDeltaPrefix = "!zs|meta|d|"
 
+	// RedisZSetLegacyBlobPrefix is the consolidated single-key
+	// layout the live store still writes for non-empty persisted
+	// zsets (`adapter/redis_compat_types.go:82` redisZSetPrefix,
+	// produced by `adapter/redis_compat_commands.go:3495-3508` and
+	// read by `adapter/redis_compat_helpers.go:610-631` as the
+	// fallback when no wide-column members exist). A backup that
+	// skipped this prefix would silently drop legacy-only zsets;
+	// HandleZSetLegacyBlob decodes the blob and registers the same
+	// per-member state HandleZSetMeta + HandleZSetMember would.
+	// Codex P1 finding on PR #790 (round 2).
+	RedisZSetLegacyBlobPrefix = "!redis|zset|"
+
 	// redisZSetScoreSize is the size of the IEEE 754 big-endian score
 	// stored in !zs|mem| values. Same constant as zsetMetaSizeBytes in
 	// store/zset_helpers.go; duplicated here to keep the backup
 	// package free of internal/storage imports.
 	redisZSetScoreSize = 8
+
+	// redisZSetLegacyProtoPrefixLen is the on-disk magic prefix size
+	// for `!redis|zset|` values
+	// (`adapter/redis_storage_codec.go:15` storedRedisZSetProtoPrefix).
+	redisZSetLegacyProtoPrefixLen = 4
 )
+
+// redisZSetLegacyProtoPrefix mirrors
+// adapter/redis_storage_codec.go:15 storedRedisZSetProtoPrefix. A
+// rename on the live side without an accompanying backup update
+// surfaces as ErrRedisInvalidZSetLegacyBlob on decode of any real
+// cluster dump.
+var redisZSetLegacyProtoPrefix = []byte{0x00, 'R', 'Z', 0x01}
 
 // ErrRedisInvalidZSetMeta is returned when an !zs|meta| value is not
 // the expected 8-byte big-endian member count.
 var ErrRedisInvalidZSetMeta = cockroachdberr.New("backup: invalid !zs|meta| value")
+
+// ErrRedisInvalidZSetLegacyBlob is returned when a `!redis|zset|`
+// value's magic prefix is missing, its protobuf body fails to
+// unmarshal, or its decoded scores include NaN. Fail-closed for
+// the same reason as ErrRedisInvalidZSetMember: silently accepting
+// a corrupt blob would lose the entire zset's contents at restore.
+var ErrRedisInvalidZSetLegacyBlob = cockroachdberr.New("backup: invalid !redis|zset| value")
 
 // ErrRedisInvalidZSetMember is returned when an !zs|mem| value is not
 // the expected 8-byte IEEE 754 score, or contains a NaN score (Redis's
@@ -152,6 +185,91 @@ func (r *RedisDB) HandleZSetScore(_, _ []byte) error { return nil }
 // See HandleZSetMeta's docstring for the rationale; !zs|mem| is the
 // source of truth at backup time.
 func (r *RedisDB) HandleZSetMetaDelta(_, _ []byte) error { return nil }
+
+// HandleZSetLegacyBlob processes one `!redis|zset|<userKey>` record.
+// This is the consolidated single-key layout the live store still
+// writes for non-empty persisted zsets (see RedisZSetLegacyBlobPrefix
+// docstring). The encoded value is a magic-prefixed
+// `pb.RedisZSetValue` carrying every (member, score) pair.
+//
+// Decoded entries land in the same per-key state HandleZSetMember
+// would have produced, so the per-zset JSON output is identical
+// regardless of which layout the live store used. NaN scores fail
+// closed at intake, matching HandleZSetMember's contract.
+//
+// The legacy prefix `!redis|zset|` lex-sorts BEFORE `!zs|...` and
+// BEFORE `!redis|ttl|`, so when a zset is stored in both formats
+// (mid-migration), this handler creates the state first and the
+// later wide-column records merge into it — duplicate
+// HandleZSetMember calls follow the same latest-wins policy.
+//
+// `!redis|zset|` ALSO sorts BEFORE `!redis|ttl|`, so an inline TTL
+// on the same user key will reach HandleTTL after this handler has
+// already registered redisKindZSet. The HandleTTL redisKindZSet
+// branch then folds the expiry into st.expireAtMs via zsetState
+// (which itself drains pendingTTL — a no-op here since the typed
+// record came first).
+func (r *RedisDB) HandleZSetLegacyBlob(key, value []byte) error {
+	userKey, ok := parseZSetLegacyBlobKey(key)
+	if !ok {
+		return cockroachdberr.Wrapf(ErrRedisInvalidZSetLegacyBlob, "key: %q", key)
+	}
+	entries, err := decodeZSetLegacyBlobValue(value)
+	if err != nil {
+		return err
+	}
+	st := r.zsetState(userKey)
+	for _, e := range entries {
+		st.members[e.member] = e.score
+	}
+	return nil
+}
+
+// zsetLegacyEntry is the per-(member, score) projection extracted
+// from a `!redis|zset|` blob's protobuf body.
+type zsetLegacyEntry struct {
+	member string
+	score  float64
+}
+
+// parseZSetLegacyBlobKey strips `!redis|zset|` and returns the
+// user-key bytes. Unlike the wide-column meta key there is no
+// userKeyLen prefix — the live store appends the user key directly
+// (`adapter/redis_compat_types.go:177` ZSetKey).
+func parseZSetLegacyBlobKey(key []byte) ([]byte, bool) {
+	rest := bytes.TrimPrefix(key, []byte(RedisZSetLegacyBlobPrefix))
+	if len(rest) == len(key) {
+		return nil, false
+	}
+	return rest, true
+}
+
+// decodeZSetLegacyBlobValue strips the magic prefix and unmarshals
+// the protobuf body into a slice of (member, score) entries.
+// Rejects NaN scores (same fail-closed contract as
+// HandleZSetMember).
+func decodeZSetLegacyBlobValue(value []byte) ([]zsetLegacyEntry, error) {
+	if len(value) < redisZSetLegacyProtoPrefixLen ||
+		!bytes.Equal(value[:redisZSetLegacyProtoPrefixLen], redisZSetLegacyProtoPrefix) {
+		return nil, cockroachdberr.Wrapf(ErrRedisInvalidZSetLegacyBlob,
+			"missing or corrupt magic prefix (len=%d)", len(value))
+	}
+	msg := &pb.RedisZSetValue{}
+	if err := gproto.Unmarshal(value[redisZSetLegacyProtoPrefixLen:], msg); err != nil {
+		return nil, cockroachdberr.Wrapf(ErrRedisInvalidZSetLegacyBlob,
+			"unmarshal: %v", err)
+	}
+	out := make([]zsetLegacyEntry, 0, len(msg.GetEntries()))
+	for _, e := range msg.GetEntries() {
+		score := e.GetScore()
+		if math.IsNaN(score) {
+			return nil, cockroachdberr.Wrapf(ErrRedisInvalidZSetLegacyBlob,
+				"NaN score for member %q", e.GetMember())
+		}
+		out = append(out, zsetLegacyEntry{member: e.GetMember(), score: score})
+	}
+	return out, nil
+}
 
 // zsetState lazily creates per-key state. Mirrors the hash/list/set
 // kindByKey-registration pattern so HandleZSetMeta, HandleZSetMember,
