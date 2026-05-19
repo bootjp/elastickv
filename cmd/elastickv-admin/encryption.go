@@ -103,9 +103,10 @@ func runEncryptionProbeNodeID(args []string, out io.Writer) error {
 		return errors.Wrapf(err, "parse --full-node-id=%q", *fullNodeIDStr)
 	}
 	const nodeIDMask = 0xFFFF
-	narrowed := uint16(full & nodeIDMask) //nolint:gosec // masked to 16 bits; matches applier.go convention
+	// keep masked as uint64: the value is only formatted for display, so the uint16 cast (and its gosec G115 nolint) is not load-bearing here.
+	masked := full & nodeIDMask
 	if _, err := fmt.Fprintf(out, "full_node_id: %#016x (%d)\nnode_id:      %#04x (%d)\n",
-		full, full, narrowed, narrowed); err != nil {
+		full, full, masked, masked); err != nil {
 		return errors.Wrap(err, "write probe-node-id result")
 	}
 	return nil
