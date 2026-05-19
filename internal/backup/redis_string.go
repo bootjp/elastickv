@@ -72,6 +72,24 @@ var ErrRedisInvalidStringValue = cockroachdberr.New("backup: invalid !redis|str|
 // expected 8-byte big-endian uint64 millisecond expiry.
 var ErrRedisInvalidTTLValue = cockroachdberr.New("backup: invalid !redis|ttl| value")
 
+// ErrPendingTTLBufferFull is returned by HandleTTL when an
+// unknown-kind TTL arrives but the pendingTTL buffer is already at
+// pendingTTLCap. The encoder fails closed here rather than silently
+// counting the TTL as an orphan because in real Pebble snapshot
+// order (`!redis|ttl|` lex-sorts before `!st|`/`!stream|`/`!zs|`),
+// the dropped entry would likely belong to a valid wide-column key
+// that arrives later — losing its expire_at_ms would produce a
+// restored database with non-expiring data that the source
+// snapshot's clients expected to expire. Codex P1 on PR #790
+// round 5.
+//
+// Recovery: raise WithPendingTTLCap above the snapshot's count of
+// unmatched-at-intake TTLs, or set the cap to 0 to explicitly opt
+// into the lossy counter-only mode (callers that prefer not to
+// see this error must accept that orphan-counted entries will be
+// dropped without inlining into wide-column state).
+var ErrPendingTTLBufferFull = cockroachdberr.New("backup: pendingTTL buffer at cap; raise WithPendingTTLCap or accept orphan-counter mode via WithPendingTTLCap(0)")
+
 // redisKeyKind tracks which Redis-type prefix introduced a user key, so that
 // when a later !redis|ttl|<K> record arrives we know whether to write its
 // expiry into strings_ttl.jsonl, hll_ttl.jsonl, or buffer it for a wide-
@@ -391,37 +409,52 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 		st.hasTTL = true
 		return nil
 	case redisKindUnknown:
-		r.parkUnknownTTL(userKey, expireAtMs)
-		return nil
+		return r.parkUnknownTTL(userKey, expireAtMs)
 	}
 	return nil
 }
 
 // parkUnknownTTL buffers a redisKindUnknown TTL into pendingTTL, or
-// falls back to the immediate orphan-count path when the buffer is
-// at cap. Extracted from HandleTTL's switch so the parent stays
-// under the cyclop budget.
+// fails closed when the buffer is at cap. Extracted from HandleTTL's
+// switch so the parent stays under the cyclop budget.
 //
-// Rationale (codex P1 on PR #791 round 2; same fix mirrored here):
-// Pebble snapshots emit records in encoded-key order, and
-// `!redis|ttl|` lex-sorts BEFORE every wide-column prefix where the
-// type letter is >= 's' (set, stream, zset). The buffer lets us
-// drain the parked expiry when the typed record finally arrives;
-// the cap prevents an adversarial snapshot whose TTLs never find a
-// claimer from OOM'ing the decoder. Storage: userKey is COPIED
-// (`string([]byte)` allocates) because the snapshot reader reuses
-// key buffers across iterations — an alias slice would race with
-// the next record.
-func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) {
-	if len(r.pendingTTL) >= r.pendingTTLCap {
-		// Cap reached: fall back to the immediate-orphan path so
-		// memory stays bounded. Already-buffered entries can still
-		// be drained by later state-inits.
-		r.pendingTTLOverflow++
+// Three modes determined by pendingTTLCap:
+//
+//   - cap > 0 and buffer NOT full: store the (userKey, expireAtMs)
+//     pair so a later wide-column state-init can drain it.
+//   - cap == 0: counter-only mode. The TTL becomes an immediate
+//     orphan. Operator-explicit opt-out for callers that prefer
+//     constant-space orphan counting over the buffered drain path.
+//   - cap > 0 and buffer FULL: fail closed with
+//     ErrPendingTTLBufferFull. Silently counting the entry as an
+//     orphan would permanently lose `expire_at_ms` for the wide-
+//     column key that arrives later — restored data becomes
+//     non-expiring without the operator noticing. Codex P1 on PR
+//     #790 round 5.
+//
+// Storage: userKey is COPIED (`string([]byte)` allocates) because
+// the snapshot reader reuses key buffers across iterations — an
+// alias slice would race with the next record.
+func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) error {
+	if r.pendingTTLCap == 0 {
+		// Counter-only mode (operator explicitly disabled the buffer).
 		r.orphanTTLCount++
-		return
+		return nil
+	}
+	if len(r.pendingTTL) >= r.pendingTTLCap {
+		// Fail closed: refuse to silently drop a TTL that may
+		// belong to a wide-column key arriving later in the
+		// snapshot scan. The operator should raise the cap
+		// (WithPendingTTLCap) or investigate the snapshot for
+		// corruption. We still increment pendingTTLOverflow so
+		// the Finalize warning surfaces the count even if the
+		// caller swallows the error.
+		r.pendingTTLOverflow++
+		return cockroachdberr.Wrapf(ErrPendingTTLBufferFull,
+			"buffer at cap=%d (user_key_len=%d)", r.pendingTTLCap, len(userKey))
 	}
 	r.pendingTTL[string(userKey)] = expireAtMs
+	return nil
 }
 
 // claimPendingTTL drains any buffered TTL for userKey into the

@@ -617,50 +617,58 @@ func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
 	}
 }
 
-// TestRedisDB_PendingTTLBoundedByCap pins the codex P1 fix on PR
-// #791 round 2 (mirrored here on PR #790 round 4): pendingTTL must
-// NOT grow unboundedly. Once the cap is reached, subsequent
-// unknown-kind TTLs fall back to immediate-orphan counting without
-// buffering the user-key bytes.
-func TestRedisDB_PendingTTLBoundedByCap(t *testing.T) {
+// TestRedisDB_PendingTTLFailsClosedAtCap pins the codex P1 fix on
+// PR #790 round 5: when pendingTTL reaches cap and another
+// unknown-kind TTL arrives, HandleTTL fails closed with
+// ErrPendingTTLBufferFull rather than silently counting the entry
+// as an orphan. Silent overflow would permanently lose
+// expire_at_ms for wide-column keys that arrive later in the scan,
+// producing restored data with TTLs the source snapshot expected
+// to expire.
+func TestRedisDB_PendingTTLFailsClosedAtCap(t *testing.T) {
 	t.Parallel()
 	const cap = 8
 	db, _ := newRedisDB(t)
 	db.WithPendingTTLCap(cap)
-	for i := 0; i < cap*2; i++ {
+	// Fill the buffer to exactly cap — should all succeed.
+	for i := 0; i < cap; i++ {
 		key := []byte("orphan-" + intToDecimal(i))
 		ms := uint64(i) + 1 //nolint:gosec // i bounded above
 		if err := db.HandleTTL(key, encodeTTLValue(ms)); err != nil {
-			t.Fatalf("HandleTTL[%d]: %v", i, err)
+			t.Fatalf("HandleTTL[%d]: %v (should succeed within cap)", i, err)
 		}
 	}
 	if got := len(db.pendingTTL); got != cap {
 		t.Fatalf("pendingTTL len = %d, want %d (cap)", got, cap)
 	}
-	if got := db.orphanTTLCount; got != cap {
-		t.Fatalf("orphanTTLCount = %d at intake, want %d (overflow path)", got, cap)
+	// One more entry should fail closed.
+	err := db.HandleTTL([]byte("orphan-overflow"), encodeTTLValue(999))
+	if !errors.Is(err, ErrPendingTTLBufferFull) {
+		t.Fatalf("err = %v, want ErrPendingTTLBufferFull at cap", err)
 	}
-	if got := db.pendingTTLOverflow; got != cap {
-		t.Fatalf("pendingTTLOverflow = %d, want %d", got, cap)
+	if got := db.pendingTTLOverflow; got != 1 {
+		t.Fatalf("pendingTTLOverflow = %d, want 1", got)
 	}
-	if err := db.Finalize(); err != nil {
-		t.Fatalf("Finalize: %v", err)
-	}
-	if got := db.orphanTTLCount; got != cap*2 {
-		t.Fatalf("orphanTTLCount = %d after Finalize, want %d", got, cap*2)
+	// orphanTTLCount must NOT be incremented at intake — the
+	// caller has to handle the error explicitly.
+	if got := db.orphanTTLCount; got != 0 {
+		t.Fatalf("orphanTTLCount = %d at intake, want 0 (failed closed)", got)
 	}
 }
 
-// TestRedisDB_WithPendingTTLCapZeroDisablesBuffering pins that
-// cap==0 reverts to the original immediate-orphan path.
-func TestRedisDB_WithPendingTTLCapZeroDisablesBuffering(t *testing.T) {
+// TestRedisDB_WithPendingTTLCapZeroOpts pins the explicit
+// counter-only mode: cap==0 disables buffering entirely and every
+// unknown-kind TTL becomes an immediate orphan WITHOUT firing
+// ErrPendingTTLBufferFull. Operators that prefer constant-space
+// orphan-counting over the fail-closed path opt in via cap=0.
+func TestRedisDB_WithPendingTTLCapZeroOpts(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
 	db.WithPendingTTLCap(0)
 	const n = 5
 	for i := 0; i < n; i++ {
 		if err := db.HandleTTL([]byte("k"+intToDecimal(i)), encodeTTLValue(1)); err != nil {
-			t.Fatal(err)
+			t.Fatalf("HandleTTL[%d]: %v (counter-only mode must not fail)", i, err)
 		}
 	}
 	if got := len(db.pendingTTL); got != 0 {
