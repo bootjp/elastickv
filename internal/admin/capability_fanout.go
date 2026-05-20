@@ -26,6 +26,13 @@ var errCapabilityFanoutBadInput = errors.New("capability fan-out: bad input")
 // letting OK=true sneak through against an unprobed peer.
 var errCapabilityFanoutMalformedMember = errors.New("capability fan-out: malformed route member")
 
+// errCapabilityFanoutBadDialer is the sentinel for a DialFunc that
+// violates its contract — returns no error but also no client
+// (nil, nil, nil). Without this guard the goroutine would panic on
+// client.GetCapability(...) and take down the admin RPC path
+// instead of producing a Reachable=false verdict.
+var errCapabilityFanoutBadDialer = errors.New("capability fan-out: dialer returned nil client without error")
+
 // RouteMember is one peer entry in a Raft group. The fan-out helper
 // dials Address and identifies the node by FullNodeID for dedup
 // across groups (a node serving multiple groups is probed once).
@@ -260,6 +267,10 @@ func probeCapability(ctx context.Context, member RouteMember, dial DialFunc) Cap
 	}
 	if closer != nil {
 		defer closer()
+	}
+	if client == nil {
+		verdict.Err = pkgerrors.Wrapf(errCapabilityFanoutBadDialer, "dial %s", member.Address)
+		return verdict
 	}
 	report, err := client.GetCapability(ctx, &pb.Empty{})
 	if err != nil {

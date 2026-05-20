@@ -353,6 +353,45 @@ func TestCapabilityFanout_FullyMalformedRowsNotCollapsed(t *testing.T) {
 	}
 }
 
+// TestCapabilityFanout_NilClientFromDialFailsClosed pins the
+// defensive-programming refusal for a buggy DialFunc that returns
+// (nil, nil, nil) — no error but also no client. Codex r2 P1 on
+// PR #793 flagged that without this guard the helper would panic on
+// client.GetCapability(...) and take down the admin RPC path
+// instead of producing a Reachable=false verdict.
+//
+// Contract pinned here: a nil client is treated as a dial-level
+// failure (Reachable=false with Err set) so a misbehaving dialer
+// implementation cannot crash the cutover RPC.
+func TestCapabilityFanout_NilClientFromDialFailsClosed(t *testing.T) {
+	t.Parallel()
+	badDial := func(context.Context, string) (pb.EncryptionAdminClient, func(), error) {
+		return nil, nil, nil
+	}
+	snapshot := RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters:  []RouteMember{{FullNodeID: 1, Address: "n1:9000"}},
+	}}}
+
+	res, err := CapabilityFanout(context.Background(), snapshot, badDial, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.OK {
+		t.Fatalf("expected OK=false when dial returns nil client without error, got OK=true")
+	}
+	if len(res.Verdicts) != 1 {
+		t.Fatalf("expected 1 verdict, got %d", len(res.Verdicts))
+	}
+	v := res.Verdicts[0]
+	if v.Reachable {
+		t.Errorf("expected Reachable=false for nil-client verdict, got %+v", v)
+	}
+	if v.Err == nil {
+		t.Errorf("expected Err to be set on nil-client verdict, got nil")
+	}
+}
+
 // TestCapabilityFanout_EmptySnapshot pins the empty-input case:
 // returns OK=false with zero verdicts but no error (the cutover RPC
 // can decide its own semantics for "no members" — typically refuse
