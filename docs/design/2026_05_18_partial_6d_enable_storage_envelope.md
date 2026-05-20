@@ -2,11 +2,35 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper) shipped; 6D-4, 6D-5, 6D-6 remain |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
 | Bundles | 6C-3 (`ErrNodeIDCollision` + `ErrLocalEpochRollback` cluster-wide guards) |
+
+### Shipped milestones (lifecycle: partial)
+
+- **6D-1** (doc) — this file. Landed with the initial proposal commit.
+- **6D-2** (startup guards) — `ErrNodeIDCollision` primitive
+  (`internal/encryption/node_id_collision.go`), `ErrLocalEpochRollback`
+  primitive (`internal/encryption/local_epoch_rollback.go`), and the
+  `probe-node-id` admin CLI subcommand. Landed in PR #788.
+- **6D-3** (capability fan-out helper) — `CapabilityFanout` in
+  `internal/admin/capability_fanout.go` with the table-driven §9
+  unit tests. The §4.1 `FanoutResult` type was renamed
+  `CapabilityFanoutResult` to disambiguate from the unrelated
+  `admin.FanoutResult` already shipped in `keyviz_fanout.go`; the
+  contract is otherwise unchanged.
+
+### Open milestones
+
+- **6D-4** — `RotateSubEnableStorageEnvelope = 0x04` wire-format
+  addition + FSM apply-path dispatch + `StorageEnvelopeCutoverIndex`
+  sidecar field.
+- **6D-5** — §6.2 storage-layer toggle (`PutAt` consults
+  `StorageEnvelopeActive`).
+- **6D-6** — `EnableStorageEnvelope` admin RPC + CLI command +
+  integration test composing 6D-3 + 6D-4 + 6D-5.
 
 ## 0. Why this doc exists
 
