@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -823,6 +824,67 @@ func TestPreparePeekCursor_PartitionOutOfRange(t *testing.T) {
 			t.Fatalf("in-range cursor: got %+v want StartPartition=3 Partition=2", out)
 		}
 	})
+}
+
+// TestAdminPeekQueue_ContinuationDoesNotBumpFanoutCounter pins Codex
+// r2 P1: AdminPeekQueue must NOT advance the shared
+// receiveFanoutCounters counter on continuation pages. The counter
+// is consumed by ReceiveMessage's partition-rotation; if peek
+// pagination bumps it on every page, a sustained backlog with small
+// MaxNumberOfMessages can repeatedly start receives at the same
+// partition (fixed-stride aliasing — e.g. PartitionCount=4 + 3
+// peek pages between receives lands every receive on partition 0,
+// starving 1-3). Only the FIRST page should advance the counter.
+func TestAdminPeekQueue_ContinuationDoesNotBumpFanoutCounter(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	const name = "peek-fanout.fifo"
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  name,
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	queueURL, _ := out["QueueUrl"].(string)
+	installPartitionedMetaForTest(t, node, name, 4, htfifoThroughputPerMessageGroupID)
+	// Send across distinct groups so a Limit=2 peek must paginate.
+	_ = sendFIFOMessagesForPeek(t, node, queueURL, []string{"a", "b", "c", "d", "e", "f"})
+
+	ctx := context.Background()
+	rows, cursor, err := node.sqsServer.AdminPeekQueue(ctx, fullAdminPrincipal, name, AdminPeekMessageOptions{Limit: 2})
+	if err != nil {
+		t.Fatalf("first peek: %v", err)
+	}
+	if len(rows) == 0 || cursor == "" {
+		t.Fatalf("first peek: rows=%d cursor=%q — need both populated to exercise continuation", len(rows), cursor)
+	}
+
+	v, ok := node.sqsServer.receiveFanoutCounters.Load(name)
+	if !ok {
+		t.Fatalf("first peek did not create the fanout counter; the bump-on-first-page contract is broken")
+	}
+	counter, _ := v.(*atomic.Uint32)
+	before := counter.Load()
+
+	// Drive 5 continuation calls; each must not move the counter.
+	for i := 0; i < 5; i++ {
+		_, next, err := node.sqsServer.AdminPeekQueue(ctx, fullAdminPrincipal, name, AdminPeekMessageOptions{Limit: 2, Cursor: cursor})
+		if err != nil {
+			t.Fatalf("continuation peek #%d: %v", i, err)
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	after := counter.Load()
+	if after != before {
+		t.Fatalf("continuation peeks bumped fanout counter from %d to %d (expected unchanged)", before, after)
+	}
 }
 
 // TestAdminPeekQueue_HostileCursorBoundedRequest is the end-to-end

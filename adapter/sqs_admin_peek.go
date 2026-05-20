@@ -233,7 +233,7 @@ func (s *SQSServer) AdminPeekQueue(
 	if !exists {
 		return nil, "", ErrAdminSQSNotFound
 	}
-	cursor, err = preparePeekCursor(cursor, meta, s.nextReceiveFanoutStart(name, meta.PartitionCount))
+	cursor, err = preparePeekCursor(cursor, meta, s.peekStartPartition(name, cursor, meta))
 	if err != nil {
 		return nil, "", err
 	}
@@ -246,6 +246,26 @@ func (s *SQSServer) AdminPeekQueue(
 		return nil, "", err
 	}
 	return rows, encoded, nil
+}
+
+// peekStartPartition returns the starting partition for a fresh peek
+// walk, or 0 when a starting partition is not needed (continuation
+// pages already carry one in the cursor; non-partitioned queues only
+// have partition 0).
+//
+// The fanout counter is consulted ONLY on the first page of a peek
+// walk. nextReceiveFanoutStart increments the per-queue counter on
+// every call regardless of whether the returned value is consumed;
+// advancing it on every continuation page would perturb the same
+// counter ReceiveMessage reads for partition fairness, reintroducing
+// fixed-stride aliasing (Codex r2 P1: e.g. PartitionCount=4 with 3
+// peek pages between receives lands every receive on the same
+// partition, starving the other three).
+func (s *SQSServer) peekStartPartition(queueName string, cursor *peekCursor, meta *sqsQueueMeta) uint32 {
+	if cursor != nil || meta.PartitionCount <= 1 {
+		return 0
+	}
+	return s.nextReceiveFanoutStart(queueName, meta.PartitionCount)
 }
 
 // preparePeekCursor builds the effective cursor for this call. On the
