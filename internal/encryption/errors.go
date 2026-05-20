@@ -208,4 +208,65 @@ var (
 	// from forcing a spurious refusal. See §5.5 for the
 	// IsEncryptionRelevantOpcode rationale.
 	ErrSidecarBehindRaftLog = errors.New("encryption: sidecar raft_applied_index is behind the raftengine's persisted applied index and the gap covers an encryption-relevant entry; refusing to start (run `encryption resync-sidecar` to advance the sidecar past the encryption-relevant entries before retrying — see §9.1 + §5.5)")
+
+	// ErrNodeIDCollision is the §9.1 / 6C-3 startup-refusal guard
+	// raised when two distinct `full_node_id` values in the local
+	// route-catalog snapshot map to the same 16-bit `node_id`. The
+	// derivation is `uint16(full_node_id & 0xFFFF)` — same narrowing
+	// the writer-registry keying and §4.1 GCM nonce prefix already
+	// use (see `applier.go` `nodeIDMask`). A collision means the two
+	// members would write under the same `(node_id, local_epoch)`
+	// prefix and reuse the GCM counter under the same DEK, which
+	// breaks AES-GCM's nonce-uniqueness requirement and is a
+	// catastrophic confidentiality + integrity failure.
+	//
+	// The guard reads the LOCAL route-catalog snapshot only — no
+	// RPC fan-out — because the startup-guard phase runs BEFORE the
+	// gRPC server is up, and the local Raft log is authoritative
+	// for cluster membership (every node applies the same
+	// `ConfChange` entries). See `2026_05_18_proposed_6d_enable_storage_envelope.md`
+	// §5.1 for the lifecycle rationale and the operator-mitigation
+	// menu (`probe-node-id` CLI, full_node_id re-roll, etc.).
+	//
+	// Skip conditions: encryption disabled (no nonce-reuse risk),
+	// empty membership snapshot (single-node pre-bootstrap; nothing
+	// to compare yet).
+	ErrNodeIDCollision = errors.New("encryption: two distinct full_node_id values in the local route-catalog hash to the same 16-bit node_id, which would reuse GCM nonces under the active DEK; refusing to start (re-roll one of the colliding full_node_id values — use `elastickv-admin encryption probe-node-id --full-node-id=<u64>` to verify before joining — see §9.1 + §5.1 of the 6D design doc)")
+
+	// ErrLocalEpochRollback is the §9.1 / 6C-3 startup-refusal
+	// guard raised when this node's sidecar `local_epoch` for the
+	// active storage DEK is less than OR equal to the local Pebble
+	// writer-registry's `LastSeenLocalEpoch` for the
+	// `(full_node_id, active_storage_dek_id)` row. The strict-ahead
+	// posture — `sidecar > registry`, not `>=` — is the §5.2
+	// nonce-monotonicity invariant: a node may only resume issuing
+	// nonces when its sidecar is STRICTLY ahead of the registry
+	// record. The equality case would replay the same
+	// `(node_id, local_epoch)` prefix and reuse the GCM counter
+	// under the same DEK, identical to the collision scenario
+	// `ErrNodeIDCollision` catches but at the single-node-restart
+	// timescale rather than the cluster-membership timescale.
+	//
+	// Classic trigger: operator restored the sidecar from an old
+	// backup, leaving `local_epoch` behind the registry record
+	// that the node has already used for prior writes.
+	//
+	// The guard reads LOCAL Pebble state only — no RPC. The
+	// writer-registry is local state on every node post-bootstrap
+	// (every node applies the same OpRegistration and OpBootstrap
+	// entries), so the local row is authoritative for this node's
+	// own monotonicity contract.
+	//
+	// Skip conditions: encryption disabled, sidecar's
+	// `Active.Storage == 0` (bootstrap not yet committed). The
+	// missing-registry-row case is NOT an unconditional skip —
+	// the §5.2 split fires based on `sidecar.StorageEnvelopeActive`:
+	// pre-cutover (active=false) the missing-row case is a
+	// freshly-joined-learner skip and `CheckLocalEpochRollback`
+	// returns nil; post-cutover (active=true) the missing-row
+	// case is a missing rollback anchor and the function fires
+	// `ErrLocalEpochRollback`. See the comprehensive doc on
+	// `CheckLocalEpochRollback` (`local_epoch_rollback.go`) for
+	// the full split.
+	ErrLocalEpochRollback = errors.New("encryption: sidecar local_epoch for the active storage DEK is at or below the local writer-registry's last_seen_local_epoch, which would replay the GCM nonce prefix under the same DEK; refusing to start (verify the sidecar was not restored from an old backup; run `encryption resync-sidecar` if appropriate, or rotate the affected DEK — see §9.1 + §5.2 of the 6D design doc)")
 )
