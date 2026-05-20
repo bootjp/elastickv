@@ -392,6 +392,106 @@ func TestCapabilityFanout_NilClientFromDialFailsClosed(t *testing.T) {
 	}
 }
 
+// TestCapabilityFanout_MismatchedResponderIDFailsClosed pins the
+// fail-closed posture for stale-routing / shared-address scenarios:
+// when the snapshot says n2:9000 has FullNodeID=2 but the responder
+// reports FullNodeID=99, accepting the response would credit
+// member 2 as verified despite member 2 never actually answering.
+// Codex r3 P1 on PR #793.
+//
+// Contract pinned here: when both the snapshot and the response
+// carry non-zero FullNodeIDs and they disagree, the verdict is
+// Reachable=false with an explanatory Err so the cutover RPC
+// refuses with OK=false rather than silently passing.
+func TestCapabilityFanout_MismatchedResponderIDFailsClosed(t *testing.T) {
+	t.Parallel()
+	stub := newStubDial()
+	stub.addOK("n2:9000", &pb.CapabilityReport{FullNodeId: 99, EncryptionCapable: true, SidecarPresent: true})
+
+	snapshot := RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters:  []RouteMember{{FullNodeID: 2, Address: "n2:9000"}},
+	}}}
+
+	res, err := CapabilityFanout(context.Background(), snapshot, stub.dial, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.OK {
+		t.Fatalf("expected OK=false when responder full_node_id (99) differs from expected (2), got OK=true")
+	}
+	if len(res.Verdicts) != 1 {
+		t.Fatalf("expected 1 verdict, got %d", len(res.Verdicts))
+	}
+	v := res.Verdicts[0]
+	if v.Reachable {
+		t.Errorf("expected Reachable=false for mismatched-id verdict, got %+v", v)
+	}
+	if v.Err == nil {
+		t.Errorf("expected Err to be set on mismatched-id verdict, got nil")
+	}
+}
+
+// hangingEncryptionAdminClient is a test-only client whose
+// GetCapability blocks on a channel and deliberately ignores ctx
+// cancellation, simulating a buggy gRPC client that fails to honor
+// the helper's timeout contract.
+type hangingEncryptionAdminClient struct {
+	pb.EncryptionAdminClient
+	hangCh chan struct{}
+}
+
+func (h *hangingEncryptionAdminClient) GetCapability(_ context.Context, _ *pb.Empty, _ ...grpc.CallOption) (*pb.CapabilityReport, error) {
+	<-h.hangCh
+	return nil, errors.New("hangingEncryptionAdminClient: unblocked")
+}
+
+// TestCapabilityFanout_TimeoutBoundsHelperReturn pins the §4.3
+// timeout contract: "Returns within `timeout` regardless of how
+// many members responded". A DialFunc / client that ignores ctx
+// cancellation must NOT be able to hang the admin RPC path
+// indefinitely — the helper synthesizes Reachable=false verdicts
+// for any probe that hasn't reported by the deadline. Codex r3 P2
+// on PR #793.
+func TestCapabilityFanout_TimeoutBoundsHelperReturn(t *testing.T) {
+	t.Parallel()
+	hangCh := make(chan struct{})
+	defer close(hangCh)
+
+	hang := &hangingEncryptionAdminClient{hangCh: hangCh}
+	dial := func(context.Context, string) (pb.EncryptionAdminClient, func(), error) {
+		return hang, func() {}, nil
+	}
+
+	snapshot := RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters:  []RouteMember{{FullNodeID: 1, Address: "n1:9000"}},
+	}}}
+
+	start := time.Now()
+	res, err := CapabilityFanout(context.Background(), snapshot, dial, 100*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	// Allow a generous margin (5x the timeout) for slow CI; the
+	// pre-fix code would have hung indefinitely so any bounded
+	// return time is a pass.
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("helper hung for %v despite 100ms timeout — contract violated", elapsed)
+	}
+	if res.OK {
+		t.Fatalf("expected OK=false on timeout, got OK=true")
+	}
+	if len(res.Verdicts) != 1 {
+		t.Fatalf("expected 1 verdict (synthesized for hung probe), got %d", len(res.Verdicts))
+	}
+	if res.Verdicts[0].Reachable {
+		t.Errorf("expected Reachable=false for hung probe, got %+v", res.Verdicts[0])
+	}
+}
+
 // TestCapabilityFanout_EmptySnapshot pins the empty-input case:
 // returns OK=false with zero verdicts but no error (the cutover RPC
 // can decide its own semantics for "no members" — typically refuse

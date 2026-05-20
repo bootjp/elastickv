@@ -33,6 +33,23 @@ var errCapabilityFanoutMalformedMember = errors.New("capability fan-out: malform
 // instead of producing a Reachable=false verdict.
 var errCapabilityFanoutBadDialer = errors.New("capability fan-out: dialer returned nil client without error")
 
+// errCapabilityFanoutMismatchedResponder is the sentinel for the
+// stale-routing / shared-address case: the snapshot expected one
+// full_node_id at an address but the responder reports a different
+// one. Accepting the response would credit the expected member as
+// verified even though the intended member never actually answered.
+// Fail-closed: verdict carries this error with Reachable=false.
+var errCapabilityFanoutMismatchedResponder = errors.New("capability fan-out: responder full_node_id does not match expected")
+
+// errCapabilityFanoutProbeTimeout is the sentinel pre-seeded on
+// every verdict slot before the probe goroutines start. A buggy
+// DialFunc/client that ignores ctx cancellation would otherwise
+// hang the helper indefinitely; by pre-seeding the slot and
+// returning whichever slots have been overwritten by the deadline,
+// the helper honors its §4.3 "Returns within timeout" contract
+// even against an uncooperative dialer.
+var errCapabilityFanoutProbeTimeout = errors.New("capability fan-out: probe did not complete within timeout")
+
 // RouteMember is one peer entry in a Raft group. The fan-out helper
 // dials Address and identifies the node by FullNodeID for dedup
 // across groups (a node serving multiple groups is probed once).
@@ -170,23 +187,60 @@ func buildCapabilityFanoutDedupSet(routes RouteSnapshot) map[string]RouteMember 
 
 // runCapabilityFanoutProbes dials every dedup target concurrently
 // and returns the per-node verdicts in unspecified order. Bounded
-// by ctx — missing responses surface as Reachable=false.
+// by ctx — when the deadline fires before a probe goroutine
+// finishes, its pre-seeded "probe-timeout" verdict surfaces as
+// Reachable=false instead of the helper waiting indefinitely for
+// a buggy DialFunc/client that ignores ctx cancellation. This
+// pins the §4.3 "Returns within `timeout`" contract.
+//
+// Note on goroutine cleanup: goroutines whose probes ignore ctx
+// continue running until they unblock on their own. The helper
+// does NOT promise to reclaim those goroutines — the contract is
+// "the HELPER returns within timeout", not "every spawned
+// goroutine returns within timeout". A dialer / client that
+// ignores ctx is a bug on the caller side; the helper's job is to
+// prevent that bug from hanging the admin RPC path.
 func runCapabilityFanoutProbes(ctx context.Context, dedupKeys map[string]RouteMember, dial DialFunc) []CapabilityVerdict {
-	results := make([]CapabilityVerdict, 0, len(dedupKeys))
+	slots := make(map[string]*CapabilityVerdict, len(dedupKeys))
+	for key, member := range dedupKeys {
+		v := CapabilityVerdict{
+			FullNodeID: member.FullNodeID,
+			Err:        pkgerrors.Wrap(errCapabilityFanoutProbeTimeout, member.Address),
+		}
+		slots[key] = &v
+	}
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for _, m := range dedupKeys {
+	for key, m := range dedupKeys {
 		wg.Add(1)
-		go func(member RouteMember) {
+		go func(slotKey string, member RouteMember) {
 			defer wg.Done()
 			verdict := probeCapability(ctx, member, dial)
 			mu.Lock()
-			results = append(results, verdict)
+			*slots[slotKey] = verdict
 			mu.Unlock()
-		}(m)
+		}(key, m)
 	}
-	wg.Wait()
-	return results
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	out := make([]CapabilityVerdict, 0, len(slots))
+	for _, v := range slots {
+		out = append(out, *v)
+	}
+	return out
 }
 
 func capabilityFanoutAllOK(verdicts []CapabilityVerdict) bool {
@@ -275,6 +329,16 @@ func probeCapability(ctx context.Context, member RouteMember, dial DialFunc) Cap
 	report, err := client.GetCapability(ctx, &pb.Empty{})
 	if err != nil {
 		verdict.Err = pkgerrors.Wrapf(err, "GetCapability %s", member.Address)
+		return verdict
+	}
+	// Mismatched-responder guard: in a stale-routing or
+	// shared-address scenario, the responder might report a
+	// different full_node_id than the one the snapshot expected.
+	// Accepting the response would credit the expected member as
+	// verified despite no member-X ever answering. Fail closed.
+	if member.FullNodeID != 0 && report.GetFullNodeId() != 0 && report.GetFullNodeId() != member.FullNodeID {
+		verdict.Err = pkgerrors.Wrapf(errCapabilityFanoutMismatchedResponder,
+			"%s: expected full_node_id=%d got %d", member.Address, member.FullNodeID, report.GetFullNodeId())
 		return verdict
 	}
 	verdict.Reachable = true
