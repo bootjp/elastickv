@@ -258,20 +258,7 @@ func cloneStringSlice(src []string) []string {
 // returns "stream", XLEN returns 0). Mismatched declared-vs-observed
 // length surfaces an `redis_stream_length_mismatch` warning.
 func (r *RedisDB) flushStreams() error {
-	if len(r.streams) == 0 {
-		return nil
-	}
-	dir := filepath.Join(r.dbDir(), "streams")
-	if err := r.ensureDir(dir); err != nil {
-		return err
-	}
-	userKeys := make([]string, 0, len(r.streams))
-	for k := range r.streams {
-		userKeys = append(userKeys, k)
-	}
-	sort.Strings(userKeys)
-	for _, uk := range userKeys {
-		st := r.streams[uk]
+	return flushWideColumnDir(r, r.streams, "streams", func(dir, uk string, st *redisStreamState) error {
 		if r.warn != nil && st.metaSeen && int64(len(st.entries)) != st.length {
 			r.warn("redis_stream_length_mismatch",
 				"user_key_len", len(uk),
@@ -279,11 +266,8 @@ func (r *RedisDB) flushStreams() error {
 				"observed_entries", len(st.entries),
 				"hint", "meta record's Length does not match the count of !stream|entry| keys for this user key")
 		}
-		if err := r.writeStreamJSONL(dir, []byte(uk), st); err != nil {
-			return err
-		}
-	}
-	return nil
+		return r.writeStreamJSONL(dir, []byte(uk), st)
+	})
 }
 
 func (r *RedisDB) writeStreamJSONL(dir string, userKey []byte, st *redisStreamState) error {
