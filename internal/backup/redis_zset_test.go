@@ -795,12 +795,16 @@ func TestRedisDB_ZSetLegacyBlobAfterWideRowsIsDropped(t *testing.T) {
 	})
 }
 
-// TestRedisDB_ZSetLegacyBlobWithInlineTTL pins that a TTL'd zset
-// stored only via the legacy blob round-trips its expiry. The
-// snapshot order is `!redis|zset|<k>` (sorts before `!redis|ttl|`),
-// so HandleZSetLegacyBlob runs first and registers redisKindZSet,
-// then HandleTTL routes via the redisKindZSet branch (no
-// pendingTTL detour needed for this ordering).
+// TestRedisDB_ZSetLegacyBlobWithInlineTTL pins the reverse-order
+// path: HandleZSetLegacyBlob runs first (custom dispatcher or
+// replay), so HandleTTL routes via the redisKindZSet fast-path
+// branch (no pendingTTL detour needed).
+//
+// NOTE: This is NOT the natural Pebble scan order. In real Pebble
+// order, `!redis|ttl|<k>` sorts BEFORE `!redis|zset|<k>` (0x74='t'
+// < 0x7A='z' on the byte after the shared `!redis|` prefix).
+// TestRedisDB_ZSetLegacyBlobTTLArrivesBeforeBlob covers the
+// natural order via the pendingTTL → claimPendingTTL path.
 func TestRedisDB_ZSetLegacyBlobWithInlineTTL(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
@@ -817,6 +821,43 @@ func TestRedisDB_ZSetLegacyBlobWithInlineTTL(t *testing.T) {
 	got := readZSetJSON(t, filepath.Join(root, "redis", "db_0", "zsets", "k.json"))
 	if zsetFloat(t, got, "expire_at_ms") != float64(fixedExpireMs) {
 		t.Fatalf("expire_at_ms = %v want %d", got["expire_at_ms"], fixedExpireMs)
+	}
+}
+
+// TestRedisDB_ZSetLegacyBlobTTLArrivesBeforeBlob pins the
+// claude r3-r10 carry-over: in natural Pebble scan order
+// `!redis|ttl|<k>` arrives BEFORE `!redis|zset|<k>` because
+// `t`=0x74 < `z`=0x7A in the byte after the shared `!redis|`
+// prefix. The TTL is parked in pendingTTL as redisKindUnknown;
+// HandleZSetLegacyBlob then registers the user key via
+// zsetState() which drains the parked TTL via claimPendingTTL
+// into st.expireAtMs. This is the production code path —
+// previously only the reverse order
+// (TestRedisDB_ZSetLegacyBlobWithInlineTTL) was tested.
+func TestRedisDB_ZSetLegacyBlobTTLArrivesBeforeBlob(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	// Real Pebble order: TTL first.
+	if err := db.HandleTTL([]byte("k"), encodeTTLValue(fixedExpireMs)); err != nil {
+		t.Fatal(err)
+	}
+	// Then the legacy blob.
+	value := encodeZSetLegacyBlobValue(t, []zsetLegacyEntry{{member: "m", score: 1}})
+	if err := db.HandleZSetLegacyBlob(zsetLegacyBlobKey("k"), value); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	got := readZSetJSON(t, filepath.Join(root, "redis", "db_0", "zsets", "k.json"))
+	if zsetFloat(t, got, "expire_at_ms") != float64(fixedExpireMs) {
+		t.Fatalf("expire_at_ms = %v want %d (pendingTTL drain path for legacy blob failed)",
+			got["expire_at_ms"], fixedExpireMs)
+	}
+	// Confirm the member survived the drain.
+	members := zsetMembersArray(t, got)
+	if len(members) != 1 {
+		t.Fatalf("members = %d, want 1", len(members))
 	}
 }
 

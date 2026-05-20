@@ -90,11 +90,14 @@ var ErrRedisInvalidTTLValue = cockroachdberr.New("backup: invalid !redis|ttl| va
 // round 5 (entry-count -> byte-budget on round 6).
 //
 // The default cap is 1 GiB (see defaultPendingTTLBytesCap), sized
-// to accommodate typical real-world workloads — a 20M-expiring-
-// wide-column-key snapshot with 50-byte keys peaks at ~1.16 GiB
-// of buffered pairs before draining. The OOM ceiling is still
-// hard (adversarial snapshots with TB of large keys fail closed).
-// Codex P1 on PR #790 round 7 / PR #791 round 7.
+// to accommodate typical real-world workloads — at the 58-byte
+// per-entry cost (50-byte user key + 8-byte expireAtMs payload)
+// the cap holds up to ~18.5M expiring wide-column keys before
+// fail-closed (1,073,741,824 / 58 ≈ 18,513,652). Larger
+// deployments must raise the ceiling via WithPendingTTLByteCap.
+// The OOM ceiling is still hard (adversarial snapshots with TB
+// of large keys fail closed). Codex P1 on PR #790 round 7;
+// claude r9/r10 sizing-claim correction in round 11.
 //
 // Recovery: raise WithPendingTTLByteCap above the snapshot's
 // expected cumulative byte cost of unmatched-at-intake TTLs, or
@@ -280,12 +283,16 @@ type RedisDB struct {
 // wide-column key in the database, because `!redis|ttl|` lex-sorts
 // BEFORE `!st|`/`!stream|`/`!zs|` — all wide-column TTLs are
 // parked before any wide-column row drains them via
-// claimPendingTTL. A real database with 20M expiring wide-column
-// keys × 50-byte user keys peaks at ~1.16 GiB; the old 64 MiB
-// default would hard-fail healthy backups (no in-repo caller
-// currently raises the ceiling, so the default IS the policy).
-// 1 GiB is the OOM ceiling — adversarial snapshots with TB of
-// 1 MiB keys still fail closed via ErrPendingTTLBufferFull.
+// claimPendingTTL. At the 58-byte per-entry cost (50-byte user
+// key + 8-byte expireAtMs payload) the 1 GiB cap holds up to
+// ~18.5M expiring wide-column keys before fail-closed
+// (1,073,741,824 / 58 ≈ 18,513,652). Deployments above that
+// threshold must raise the ceiling via WithPendingTTLByteCap;
+// the old 64 MiB default hard-failed at ~1.1M which is too
+// small for real Redis workloads. 1 GiB is the OOM ceiling —
+// adversarial snapshots with TB of 1 MiB keys still fail
+// closed via ErrPendingTTLBufferFull. Sizing-claim correction
+// in claude r9/r10 follow-up (round 11).
 const defaultPendingTTLBytesCap = 1 << 30
 
 // pendingTTLEntryOverheadBytes is the per-entry payload cost we

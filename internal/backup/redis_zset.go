@@ -247,18 +247,26 @@ func (r *RedisDB) HandleZSetMetaDelta(_, _ []byte) error { return nil }
 // regardless of which layout the live store used. NaN scores fail
 // closed at intake, matching HandleZSetMember's contract.
 //
-// The legacy prefix `!redis|zset|` lex-sorts BEFORE `!zs|...` and
-// BEFORE `!redis|ttl|`, so when a zset is stored in both formats
-// (mid-migration), this handler creates the state first and the
-// later wide-column records merge into it — duplicate
-// HandleZSetMember calls follow the same latest-wins policy.
+// Scan-order context (per Pebble lexicographic order):
 //
-// `!redis|zset|` ALSO sorts BEFORE `!redis|ttl|`, so an inline TTL
-// on the same user key will reach HandleTTL after this handler has
-// already registered redisKindZSet. The HandleTTL redisKindZSet
-// branch then folds the expiry into st.expireAtMs via zsetState
-// (which itself drains pendingTTL — a no-op here since the typed
-// record came first).
+//   - `!redis|zset|<k>` (0x72='r') sorts BEFORE `!zs|...` (0x7A='z'),
+//     so a mid-migration store with both formats hits this handler
+//     first; later wide-column records merge into the same state.
+//     Duplicate HandleZSetMember calls follow the latest-wins policy.
+//
+//   - `!redis|zset|<k>` (0x72='r' < 0x74='t' for the byte after the
+//     shared `!redis|` prefix would be the wrong direction; the
+//     actual comparison is byte 'z'=0x7A > 't'=0x74) — so
+//     `!redis|ttl|<k>` sorts BEFORE `!redis|zset|<k>`. The real
+//     production order for a TTL'd legacy zset is therefore:
+//
+//     !redis|ttl|k   → HandleTTL (redisKindUnknown) → pendingTTL["k"] = ms
+//     !redis|zset|k → HandleZSetLegacyBlob → zsetState() → claimPendingTTL()
+//     drains pendingTTL into st.expireAtMs
+//
+//     The HandleTTL redisKindZSet fast-path branch only fires for
+//     the reverse order (custom dispatcher or replay), where a
+//     wide-column row registered the key before the TTL arrived.
 func (r *RedisDB) HandleZSetLegacyBlob(key, value []byte) error {
 	userKey, ok := parseZSetLegacyBlobKey(key)
 	if !ok {
