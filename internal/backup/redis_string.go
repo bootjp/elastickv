@@ -89,6 +89,13 @@ var ErrRedisInvalidTTLValue = cockroachdberr.New("backup: invalid !redis|ttl| va
 // on adversarial snapshots with large keys. Codex P1 on PR #790
 // round 5 (entry-count -> byte-budget on round 6).
 //
+// The default cap is 1 GiB (see defaultPendingTTLBytesCap), sized
+// to accommodate typical real-world workloads — a 20M-expiring-
+// wide-column-key snapshot with 50-byte keys peaks at ~1.16 GiB
+// of buffered pairs before draining. The OOM ceiling is still
+// hard (adversarial snapshots with TB of large keys fail closed).
+// Codex P1 on PR #790 round 7 / PR #791 round 7.
+//
 // Recovery: raise WithPendingTTLByteCap above the snapshot's
 // expected cumulative byte cost of unmatched-at-intake TTLs, or
 // set the byte cap to 0 to explicitly opt into the lossy
@@ -264,14 +271,22 @@ type RedisDB struct {
 	pendingTTLOverflow int
 }
 
-// defaultPendingTTLBytesCap caps pendingTTL at 64 MiB cumulative
+// defaultPendingTTLBytesCap caps pendingTTL at 1 GiB cumulative
 // key+payload bytes by default. Override via WithPendingTTLByteCap
 // for hosts that need a different memory / coverage trade-off.
-// 64 MiB covers tens of thousands to millions of typical Redis
-// keys (usually << 100 bytes each); the absolute key-size ceiling
-// is 1 MiB, so this budget tolerates ~64 maximally-large keys
-// without dropping the OOM protection.
-const defaultPendingTTLBytesCap = 64 << 20
+//
+// Sizing rationale (codex P1 on PR #791 round 7): the buffer
+// reaches peak size = sum of (userKeyLen + 8) for every expiring
+// wide-column key in the database, because `!redis|ttl|` lex-sorts
+// BEFORE `!st|`/`!stream|`/`!zs|` — all wide-column TTLs are
+// parked before any wide-column row drains them via
+// claimPendingTTL. A real database with 20M expiring wide-column
+// keys × 50-byte user keys peaks at ~1.16 GiB; the old 64 MiB
+// default would hard-fail healthy backups (no in-repo caller
+// currently raises the ceiling, so the default IS the policy).
+// 1 GiB is the OOM ceiling — adversarial snapshots with TB of
+// 1 MiB keys still fail closed via ErrPendingTTLBufferFull.
+const defaultPendingTTLBytesCap = 1 << 30
 
 // pendingTTLEntryOverheadBytes is the per-entry payload cost we
 // charge against pendingTTLBytesCap on top of the user-key bytes.
