@@ -466,6 +466,18 @@ func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) error {
 		r.orphanTTLCount++
 		return nil
 	}
+	uk := string(userKey)
+	if _, alreadyBuffered := r.pendingTTL[uk]; alreadyBuffered {
+		// Latest-wins overwrite: a healthy Pebble snapshot never
+		// emits duplicate `!redis|ttl|` records for the same user
+		// key, but a replay or fragile input must not inflate the
+		// byte counter — the map size has not grown, so charging
+		// `cost` again would spuriously trigger ErrPendingTTLBufferFull
+		// at byte-budget boundaries. Codex P2 on PR #790 round 7;
+		// mirrored here on PR #791.
+		r.pendingTTL[uk] = expireAtMs
+		return nil
+	}
 	cost := len(userKey) + pendingTTLEntryOverheadBytes
 	if r.pendingTTLBytes+cost > r.pendingTTLBytesCap {
 		// Fail closed: refuse to silently drop a TTL that may
@@ -480,7 +492,7 @@ func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) error {
 			"buffer would exceed byte_cap=%d by %d bytes (user_key_len=%d, in_flight=%d)",
 			r.pendingTTLBytesCap, r.pendingTTLBytes+cost-r.pendingTTLBytesCap, len(userKey), r.pendingTTLBytes)
 	}
-	r.pendingTTL[string(userKey)] = expireAtMs
+	r.pendingTTL[uk] = expireAtMs
 	r.pendingTTLBytes += cost
 	return nil
 }

@@ -701,6 +701,74 @@ func TestRedisDB_PendingTTLByteBudgetReclaimedOnClaim(t *testing.T) {
 	}
 }
 
+// pendingTTLState snapshots the in-flight buffer counters at one
+// observation point.
+type pendingTTLState struct {
+	bytes    int
+	mapLen   int
+	overflow int
+}
+
+func capturePendingTTLState(db *RedisDB) pendingTTLState {
+	return pendingTTLState{
+		bytes:    db.pendingTTLBytes,
+		mapLen:   len(db.pendingTTL),
+		overflow: db.pendingTTLOverflow,
+	}
+}
+
+func assertPendingTTLState(t *testing.T, label string, got, want pendingTTLState) {
+	t.Helper()
+	if got != want {
+		t.Fatalf("%s: got %+v, want %+v", label, got, want)
+	}
+}
+
+// TestRedisDB_PendingTTLDuplicateKeyDoesNotDoubleCountBytes pins
+// the codex P2 fix (PR #790 round 7, mirrored on PR #791): when
+// parkUnknownTTL receives the same userKey more than once before
+// the key is claimed, the map entry overwrites in place (latest-
+// wins) and the byte counter stays unchanged. A duplicate at
+// byte-budget boundary must not spuriously fire
+// ErrPendingTTLBufferFull.
+func TestRedisDB_PendingTTLDuplicateKeyDoesNotDoubleCountBytes(t *testing.T) {
+	t.Parallel()
+	db, _ := newRedisDB(t)
+	const byteCap = 20 // single key "k0" costs 2+8 = 10 bytes; cap fits exactly 2 entries.
+	db.WithPendingTTLByteCap(byteCap)
+
+	if err := db.HandleTTL([]byte("k0"), encodeTTLValue(1)); err != nil {
+		t.Fatalf("first HandleTTL: %v", err)
+	}
+	assertPendingTTLState(t, "after first", capturePendingTTLState(db),
+		pendingTTLState{bytes: 10, mapLen: 1, overflow: 0})
+
+	// Replay the same userKey with a later expiry — must overwrite,
+	// not inflate the byte counter.
+	if err := db.HandleTTL([]byte("k0"), encodeTTLValue(2)); err != nil {
+		t.Fatalf("duplicate HandleTTL: %v (must succeed; map size unchanged)", err)
+	}
+	assertPendingTTLState(t, "after duplicate", capturePendingTTLState(db),
+		pendingTTLState{bytes: 10, mapLen: 1, overflow: 0})
+	if got := db.pendingTTL["k0"]; got != 2 {
+		t.Fatalf("pendingTTL[k0] = %d, want latest-wins value 2", got)
+	}
+
+	// Fill the cap with a second key.
+	if err := db.HandleTTL([]byte("k1"), encodeTTLValue(1)); err != nil {
+		t.Fatalf("second-key HandleTTL: %v", err)
+	}
+	assertPendingTTLState(t, "after fill", capturePendingTTLState(db),
+		pendingTTLState{bytes: 20, mapLen: 2, overflow: 0})
+
+	// At exact cap; duplicate of an existing key must still succeed.
+	if err := db.HandleTTL([]byte("k0"), encodeTTLValue(3)); err != nil {
+		t.Fatalf("duplicate at-cap HandleTTL: %v (must succeed; was P2 regression)", err)
+	}
+	assertPendingTTLState(t, "after duplicate at-cap", capturePendingTTLState(db),
+		pendingTTLState{bytes: 20, mapLen: 2, overflow: 0})
+}
+
 // TestRedisDB_WithPendingTTLByteCapZeroOpts pins the explicit
 // counter-only mode: byte_cap==0 disables buffering entirely.
 func TestRedisDB_WithPendingTTLByteCapZeroOpts(t *testing.T) {
