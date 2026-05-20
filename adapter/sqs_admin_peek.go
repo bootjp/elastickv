@@ -252,9 +252,19 @@ func (s *SQSServer) AdminPeekQueue(
 // first page (cursor==nil) it stamps Generation + a rotated
 // StartPartition (partitioned queues only — non-partitioned start at
 // 0). On a follow-up page it validates the stored Generation matches
-// the queue's current generation; a mismatch returns
-// ErrAdminSQSValidation so the SPA refreshes from the front rather
-// than silently surfacing messages from a purged generation.
+// the queue's current generation AND that StartPartition / Partition
+// are within [0, max(PartitionCount, 1)); a mismatch on either
+// returns ErrAdminSQSValidation.
+//
+// Bounds-check rationale: walkPeek terminates the partitioned
+// rotation when `(Partition + 1) % PartitionCount == StartPartition`.
+// If a client supplies StartPartition outside [0, PartitionCount),
+// that termination condition never fires and the call loops
+// ScanAt-by-ScanAt over guaranteed-empty partitions forever — a
+// request-amplification DoS against the admin endpoint (Codex r1
+// P1 on PR #794). Rejecting bad cursor partition indices up-front
+// closes the vector. Generation mismatch separately forces a
+// front-of-stream refresh after a purge.
 //
 // startPartition is computed by the caller (the SQSServer method's
 // nextReceiveFanoutStart) so this helper stays method-free for
@@ -274,6 +284,19 @@ func preparePeekCursor(cursor *peekCursor, meta *sqsQueueMeta, startPartition ui
 	if cursor.Generation != meta.Generation {
 		return nil, errors.Wrap(ErrAdminSQSValidation,
 			"admin peek: cursor is from a prior generation; restart from the front")
+	}
+	maxPartition := meta.PartitionCount
+	if maxPartition <= 1 {
+		// Non-partitioned queues only have partition 0. A non-zero
+		// Partition or StartPartition would also fail the rotation
+		// termination check; reject explicitly so the error is the
+		// documented 400, not a silent O(infty) loop.
+		maxPartition = 1
+	}
+	if cursor.StartPartition >= maxPartition || cursor.Partition >= maxPartition {
+		return nil, errors.Wrapf(ErrAdminSQSValidation,
+			"admin peek: cursor partition index out of range (StartPartition=%d, Partition=%d, max=%d)",
+			cursor.StartPartition, cursor.Partition, maxPartition)
 	}
 	return cursor, nil
 }

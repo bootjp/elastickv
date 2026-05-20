@@ -760,6 +760,107 @@ func TestPreparePeekCursor_GenerationMismatch(t *testing.T) {
 	}
 }
 
+// TestPreparePeekCursor_PartitionOutOfRange pins the Codex r1 P1
+// fix: a cursor with StartPartition or Partition outside
+// [0, max(PartitionCount, 1)) must be rejected with
+// ErrAdminSQSValidation BEFORE the walk runs. Without the bounds
+// check, walkPeek's `nextPart == cursor.StartPartition` termination
+// condition never fires for an out-of-range StartPartition, looping
+// ScanAt forever (request-amplification DoS against the admin
+// endpoint).
+func TestPreparePeekCursor_PartitionOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	t.Run("partitioned: StartPartition >= PartitionCount", func(t *testing.T) {
+		t.Parallel()
+		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4}
+		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 99, Partition: 0}
+		_, err := preparePeekCursor(cursor, meta, 0)
+		if !errors.Is(err, ErrAdminSQSValidation) {
+			t.Fatalf("StartPartition=99/PC=4: want ErrAdminSQSValidation, got %v", err)
+		}
+	})
+
+	t.Run("partitioned: Partition >= PartitionCount", func(t *testing.T) {
+		t.Parallel()
+		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4}
+		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 99}
+		_, err := preparePeekCursor(cursor, meta, 0)
+		if !errors.Is(err, ErrAdminSQSValidation) {
+			t.Fatalf("Partition=99/PC=4: want ErrAdminSQSValidation, got %v", err)
+		}
+	})
+
+	t.Run("non-partitioned: non-zero StartPartition", func(t *testing.T) {
+		t.Parallel()
+		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 0}
+		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 1, Partition: 0}
+		_, err := preparePeekCursor(cursor, meta, 0)
+		if !errors.Is(err, ErrAdminSQSValidation) {
+			t.Fatalf("non-partitioned StartPartition=1: want ErrAdminSQSValidation, got %v", err)
+		}
+	})
+
+	t.Run("non-partitioned: non-zero Partition", func(t *testing.T) {
+		t.Parallel()
+		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 1}
+		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 5}
+		_, err := preparePeekCursor(cursor, meta, 0)
+		if !errors.Is(err, ErrAdminSQSValidation) {
+			t.Fatalf("non-partitioned Partition=5: want ErrAdminSQSValidation, got %v", err)
+		}
+	})
+
+	t.Run("partitioned: in-range cursor accepted", func(t *testing.T) {
+		t.Parallel()
+		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4}
+		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 3, Partition: 2}
+		out, err := preparePeekCursor(cursor, meta, 0)
+		if err != nil {
+			t.Fatalf("in-range cursor: got err %v want nil", err)
+		}
+		if out.StartPartition != 3 || out.Partition != 2 {
+			t.Fatalf("in-range cursor: got %+v want StartPartition=3 Partition=2", out)
+		}
+	})
+}
+
+// TestAdminPeekQueue_HostileCursorBoundedRequest is the end-to-end
+// regression: an attacker crafts a wire-level cursor with an
+// out-of-range partition and submits it. The call MUST return
+// ErrAdminSQSValidation (not loop forever). The test runs with a
+// short deadline so a regression terminates the test run rather
+// than blocking CI.
+func TestAdminPeekQueue_HostileCursorBoundedRequest(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	const name = "hostile.fifo"
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  name,
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	installPartitionedMetaForTest(t, node, name, 4, htfifoThroughputPerMessageGroupID)
+
+	// Encode a cursor that names a partition far outside [0, 4).
+	hostile, err := encodePeekCursor(&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 999, Partition: 999})
+	if err != nil {
+		t.Fatalf("encode hostile cursor: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err = node.sqsServer.AdminPeekQueue(ctx, fullAdminPrincipal, name, AdminPeekMessageOptions{Cursor: hostile})
+	if !errors.Is(err, ErrAdminSQSValidation) {
+		t.Fatalf("hostile cursor: want ErrAdminSQSValidation, got %v", err)
+	}
+}
+
 // TestEncodePeekCursor_DecodesAsValidJSON spot-checks that the
 // base64url envelope unwraps to recognisable JSON keys (so a SPA
 // debugging session can inspect the cursor without the wire format
