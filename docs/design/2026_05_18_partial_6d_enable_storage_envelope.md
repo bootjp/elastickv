@@ -8,7 +8,7 @@
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
 | Bundles | 6C-3 (`ErrNodeIDCollision` + `ErrLocalEpochRollback` cluster-wide guards) |
 
-### Shipped milestones (lifecycle: partial)
+## Shipped milestones (lifecycle: partial)
 
 - **6D-1** (doc) — this file. Landed with the initial proposal commit.
 - **6D-2** (startup guards) — `ErrNodeIDCollision` primitive
@@ -22,7 +22,7 @@
   `admin.FanoutResult` already shipped in `keyviz_fanout.go`; the
   contract is otherwise unchanged.
 
-### Open milestones
+## Open milestones
 
 - **6D-4** — `RotateSubEnableStorageEnvelope = 0x04` wire-format
   addition + FSM apply-path dispatch + `StorageEnvelopeCutoverIndex`

@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,6 +16,15 @@ import (
 // against it without parsing strings. The concrete failure adds a
 // %w-wrapped detail.
 var errCapabilityFanoutBadInput = errors.New("capability fan-out: bad input")
+
+// errCapabilityFanoutMalformedMember is the sentinel set on the
+// Err field of verdicts whose RouteMember rows arrived malformed
+// (missing Address) from the caller's route-snapshot construction.
+// The verdict still appears in Result.Verdicts so the cutover RPC
+// fails closed (OK=false) and the operator can name the
+// misconfigured member, rather than silently dropping the row and
+// letting OK=true sneak through against an unprobed peer.
+var errCapabilityFanoutMalformedMember = errors.New("capability fan-out: malformed route member")
 
 // RouteMember is one peer entry in a Raft group. The fan-out helper
 // dials Address and identifies the node by FullNodeID for dedup
@@ -128,10 +138,18 @@ func CapabilityFanout(
 
 // buildCapabilityFanoutDedupSet folds every voter ∪ learner of
 // every group into the dedup map keyed by FullNodeID (or address
-// for unidentified rows). Pulled out of CapabilityFanout to keep
-// the orchestration body under the cyclomatic-complexity budget.
+// for unidentified rows; a synthetic key for fully-malformed rows
+// with neither FullNodeID nor Address — see capabilityFanoutDedupKey).
+// Pulled out of CapabilityFanout to keep the orchestration body
+// under the cyclomatic-complexity budget. The size hint is the
+// upper bound on cardinality (every row distinct); the map shrinks
+// at no cost when dedup collapses entries.
 func buildCapabilityFanoutDedupSet(routes RouteSnapshot) map[string]RouteMember {
-	dedupKeys := make(map[string]RouteMember)
+	upperBound := 0
+	for _, group := range routes.Groups {
+		upperBound += len(group.Voters) + len(group.Learners)
+	}
+	dedupKeys := make(map[string]RouteMember, upperBound)
 	for _, group := range routes.Groups {
 		for _, m := range group.Voters {
 			addCapabilityFanoutDedupTarget(dedupKeys, m)
@@ -177,26 +195,40 @@ func capabilityFanoutAllOK(verdicts []CapabilityVerdict) bool {
 }
 
 // addCapabilityFanoutDedupTarget folds a member into the dedup map.
-// Key choice: FullNodeID stringified when non-zero, address-prefixed
-// otherwise. A zero FullNodeID is treated as "not yet identified"
-// and falls back to address identity so two distinct stub rows
-// don't collapse into one probe.
+// Fail-closed posture: malformed rows (empty Address) are NOT
+// dropped here — they would silently disappear from Result.Verdicts
+// and let OK=true sneak through despite an unprobed peer. Instead
+// every row is admitted; probeCapability classifies empty-Address
+// members as Reachable=false with errCapabilityFanoutMalformedMember
+// so the cutover RPC's caller-facing error can name the missing
+// address.
 func addCapabilityFanoutDedupTarget(m map[string]RouteMember, member RouteMember) {
-	if member.Address == "" {
-		return
-	}
-	key := capabilityFanoutDedupKey(member)
+	key := capabilityFanoutDedupKey(member, len(m))
 	if _, exists := m[key]; exists {
 		return
 	}
 	m[key] = member
 }
 
-func capabilityFanoutDedupKey(member RouteMember) string {
+// capabilityFanoutDedupKey is the dedup key for a route member.
+//
+//   - FullNodeID != 0   → "id:<full_node_id>" (the §4.1 dedup contract)
+//   - FullNodeID == 0   ∧ Address != "" → "addr:<address>"
+//     (stub catalogs where dedup-by-id isn't satisfied still
+//     dedupe by address rather than silently collapsing rows)
+//   - FullNodeID == 0   ∧ Address == "" → "synthetic:<ordinal>"
+//     (a fully-malformed row gets a unique key so two such rows
+//     surface as two separate Reachable=false verdicts instead
+//     of collapsing into one and hiding the second
+//     misconfiguration)
+func capabilityFanoutDedupKey(member RouteMember, ordinal int) string {
 	if member.FullNodeID != 0 {
 		return "id:" + uint64ToDecimal(member.FullNodeID)
 	}
-	return "addr:" + member.Address
+	if member.Address != "" {
+		return "addr:" + member.Address
+	}
+	return "synthetic:" + strconv.Itoa(ordinal)
 }
 
 // uint64ToDecimal avoids pulling fmt for one-call hot-path
@@ -217,6 +249,10 @@ func uint64ToDecimal(v uint64) string {
 
 func probeCapability(ctx context.Context, member RouteMember, dial DialFunc) CapabilityVerdict {
 	verdict := CapabilityVerdict{FullNodeID: member.FullNodeID}
+	if member.Address == "" {
+		verdict.Err = pkgerrors.Wrapf(errCapabilityFanoutMalformedMember, "full_node_id=%d has empty address", member.FullNodeID)
+		return verdict
+	}
 	client, closer, err := dial(ctx, member.Address)
 	if err != nil {
 		verdict.Err = pkgerrors.Wrapf(err, "dial %s", member.Address)

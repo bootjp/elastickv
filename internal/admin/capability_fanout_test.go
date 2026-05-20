@@ -271,6 +271,88 @@ func TestCapabilityFanout_NonPositiveTimeoutRejected(t *testing.T) {
 	}
 }
 
+// TestCapabilityFanout_EmptyAddressFailsClosed pins the fail-closed
+// posture for a malformed route snapshot where a member has no
+// Address. The pre-review code silently dropped such rows from the
+// dedup set, which would let CapabilityFanout return OK=true even
+// though that member was never probed — the cutover would then
+// proceed against an un-verified peer. Codex r1 P1 / gemini high /
+// coderabbit major all flagged the same defect (PR #793).
+//
+// Contract pinned here:
+//   - The empty-address row is NOT dropped; it appears in
+//     Result.Verdicts with Reachable=false.
+//   - Result.OK is false because not every verdict is Reachable.
+//   - The malformed row's Err field is set so the operator can
+//     name the misconfiguration.
+func TestCapabilityFanout_EmptyAddressFailsClosed(t *testing.T) {
+	t.Parallel()
+	stub := newStubDial()
+	stub.addOK("n1:9000", &pb.CapabilityReport{FullNodeId: 1, EncryptionCapable: true, SidecarPresent: true})
+
+	snapshot := RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters: []RouteMember{
+			{FullNodeID: 1, Address: "n1:9000"},
+			{FullNodeID: 2, Address: ""},
+		},
+	}}}
+
+	res, err := CapabilityFanout(context.Background(), snapshot, stub.dial, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.OK {
+		t.Fatalf("expected OK=false when a member has empty address, got OK=true (verdicts=%+v)", res.Verdicts)
+	}
+	if len(res.Verdicts) != 2 {
+		t.Fatalf("expected 2 verdicts (incl. empty-address malformed row), got %d: %+v", len(res.Verdicts), res.Verdicts)
+	}
+	var malformed *CapabilityVerdict
+	for i := range res.Verdicts {
+		if res.Verdicts[i].FullNodeID == 2 {
+			malformed = &res.Verdicts[i]
+		}
+	}
+	if malformed == nil {
+		t.Fatal("expected verdict for empty-address member to be present so operator can name it")
+	}
+	if malformed.Reachable {
+		t.Errorf("expected Reachable=false for empty-address verdict, got %+v", malformed)
+	}
+	if malformed.Err == nil {
+		t.Errorf("expected Err to be set on malformed verdict so operator can diagnose, got nil")
+	}
+}
+
+// TestCapabilityFanout_FullyMalformedRowsNotCollapsed pins the
+// sibling fail-closed case: two members with BOTH FullNodeID=0 AND
+// Address="" must NOT collapse into one verdict (which would silently
+// hide one of the two misconfigured rows). Each gets its own
+// Reachable=false verdict via a synthetic dedup key.
+func TestCapabilityFanout_FullyMalformedRowsNotCollapsed(t *testing.T) {
+	t.Parallel()
+	stub := newStubDial()
+	snapshot := RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters: []RouteMember{
+			{FullNodeID: 0, Address: ""},
+			{FullNodeID: 0, Address: ""},
+		},
+	}}}
+
+	res, err := CapabilityFanout(context.Background(), snapshot, stub.dial, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.OK {
+		t.Fatalf("expected OK=false for fully-malformed snapshot, got OK=true")
+	}
+	if len(res.Verdicts) != 2 {
+		t.Errorf("expected 2 separate verdicts for two fully-malformed rows, got %d (collapsing would hide one)", len(res.Verdicts))
+	}
+}
+
 // TestCapabilityFanout_EmptySnapshot pins the empty-input case:
 // returns OK=false with zero verdicts but no error (the cutover RPC
 // can decide its own semantics for "no members" — typically refuse
