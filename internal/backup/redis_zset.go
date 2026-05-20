@@ -153,11 +153,15 @@ func (r *RedisDB) HandleZSetMeta(key, value []byte) error {
 	st := r.zsetState(userKey)
 	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
 	st.metaSeen = true
-	// Wide-column meta means any legacy blob already merged into
-	// this state is stale; drop it. The live read path
-	// (adapter/redis_compat_helpers.go:610-620) makes the same
-	// choice on read.
-	r.markZSetWide(st)
+	// Codex P2 (PR #790 r9): do NOT call markZSetWide here. The
+	// live read path (adapter/redis_compat_helpers.go:610-621)
+	// switches to the wide-column layout only when the !zs|mem|
+	// scan finds at least one row. A snapshot containing a
+	// !zs|meta| row WITHOUT any !zs|mem| rows continues to serve
+	// the legacy `!redis|zset|<k>` blob to live clients. If we
+	// invalidated the legacy members on meta-alone, the backup
+	// would emit an empty/stale zset and lose user-visible data
+	// on restore. Only HandleZSetMember triggers markZSetWide.
 	return nil
 }
 

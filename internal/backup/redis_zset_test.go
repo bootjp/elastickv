@@ -717,31 +717,52 @@ func TestRedisDB_ZSetWideColumnSupersedesLegacyBlob(t *testing.T) {
 	})
 }
 
-// TestRedisDB_ZSetMetaAloneEvictsLegacyBlob pins that a `!zs|meta|`
-// record (even without any `!zs|mem|` rows) also triggers the
-// legacy-supersedence rule. The live read path's loadZSetAt
-// preference is based on whether ANY wide-column key exists for
-// the user key — meta-only is rare in practice but the encoder
-// stays consistent with the read-side contract.
-func TestRedisDB_ZSetMetaAloneEvictsLegacyBlob(t *testing.T) {
+// TestRedisDB_ZSetMetaAlonePreservesLegacyBlob pins the codex P2
+// fix on PR #790 round 9: a `!zs|meta|` record WITHOUT any
+// `!zs|mem|` rows must NOT evict the legacy blob. The live read
+// path (adapter/redis_compat_helpers.go:610-621) switches to the
+// wide-column layout only when the `!zs|mem|` scan finds at
+// least one row — a snapshot containing `!zs|meta|<k>` but no
+// `!zs|mem|<k>` rows continues to serve the legacy
+// `!redis|zset|<k>` blob to live clients. Earlier rounds
+// invalidated the legacy members on meta-alone, which would
+// have produced an empty zset on restore — actual user-visible
+// data loss.
+func TestRedisDB_ZSetMetaAlonePreservesLegacyBlob(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
 	legacy := encodeZSetLegacyBlobValue(t, []zsetLegacyEntry{
-		{member: "stale", score: 1},
+		{member: "kept", score: 1},
+		{member: "also-kept", score: 2.5},
 	})
 	if err := db.HandleZSetLegacyBlob(zsetLegacyBlobKey("k"), legacy); err != nil {
 		t.Fatal(err)
 	}
-	// Wide-column meta record declares zero members.
-	if err := db.HandleZSetMeta(zsetMetaKey("k"), encodeZSetMetaValue(0)); err != nil {
+	// Wide-column meta record declares some count but no !zs|mem|
+	// rows ever arrive — the live read path would still serve the
+	// legacy blob, so the backup must do the same.
+	if err := db.HandleZSetMeta(zsetMetaKey("k"), encodeZSetMetaValue(2)); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Finalize(); err != nil {
 		t.Fatal(err)
 	}
 	got := readZSetJSON(t, filepath.Join(root, "redis", "db_0", "zsets", "k.json"))
-	if members := zsetMembersArray(t, got); len(members) != 0 {
-		t.Fatalf("meta-only wide-column row MUST evict legacy blob, got members=%v", members)
+	members := zsetMembersArray(t, got)
+	if len(members) != 2 {
+		t.Fatalf("meta-only must preserve legacy blob members, got %d (want 2)", len(members))
+	}
+	wantMembers := map[string]float64{"kept": 1, "also-kept": 2.5}
+	for _, m := range members {
+		mMap, ok := m.(map[string]any)
+		if !ok {
+			t.Fatalf("member entry not object: %T", m)
+		}
+		name, _ := mMap["member"].(string)
+		score, _ := mMap["score"].(float64)
+		if wantScore, ok := wantMembers[name]; !ok || wantScore != score {
+			t.Fatalf("unexpected member %q score %v (want from %v)", name, score, wantMembers)
+		}
 	}
 }
 
