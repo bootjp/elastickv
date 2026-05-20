@@ -1721,6 +1721,8 @@ const (
 	// the Binary base type; suffix-extended forms ("Binary.gzipped")
 	// share the same type byte.
 	sqsAttributeBaseTypeBinary = "Binary"
+	sqsAttributeBaseTypeString = "String"
+	sqsAttributeBaseTypeNumber = "Number"
 	// sqsAttributeTransportByteString applies to String and Number;
 	// sqsAttributeTransportByteBinary applies to Binary.
 	sqsAttributeTransportByteString = byte(0x01)
@@ -1845,7 +1847,7 @@ func validateOneMessageAttribute(name string, v sqsMessageAttributeValue) error 
 // function stays under the cyclop budget.
 func validateMessageAttributeValuePair(name, base string, v sqsMessageAttributeValue) error {
 	switch base {
-	case "String", "Number":
+	case sqsAttributeBaseTypeString, sqsAttributeBaseTypeNumber:
 		if v.StringValue == "" {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 				"MessageAttribute "+name+" requires StringValue")
