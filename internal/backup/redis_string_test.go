@@ -800,6 +800,25 @@ func TestRedisDB_WithPendingTTLByteCapNegativeCoercedToZero(t *testing.T) {
 	}
 }
 
+// TestRedisDB_DefaultPendingTTLByteCapSurvives1GiBLoad pins the
+// codex P1 fix (PR #791 round 7): the default cap must
+// comfortably accommodate "millions of expiring wide-column keys"
+// without hitting ErrPendingTTLBufferFull. The old 64 MiB default
+// would refuse a 10M-expiring-wide-column-key snapshot with
+// average 50-byte keys (cost = 10M * 58 = 580 MB); the new
+// 1 GiB default tolerates that workload.
+func TestRedisDB_DefaultPendingTTLByteCapSurvives1GiBLoad(t *testing.T) {
+	t.Parallel()
+	const wantDefault = 1 << 30
+	if defaultPendingTTLBytesCap != wantDefault {
+		t.Fatalf("defaultPendingTTLBytesCap = %d, want %d (1 GiB)", defaultPendingTTLBytesCap, wantDefault)
+	}
+	db, _ := newRedisDB(t)
+	if db.pendingTTLBytesCap != wantDefault {
+		t.Fatalf("NewRedisDB pendingTTLBytesCap = %d, want %d", db.pendingTTLBytesCap, wantDefault)
+	}
+}
+
 func TestRedisDB_DirsCreatedCachesMkdirAll(t *testing.T) {
 	t.Parallel()
 	// Two HandleString calls in a row should populate dirsCreated
