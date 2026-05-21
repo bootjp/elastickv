@@ -229,7 +229,28 @@ jobs:
             --host 127.0.0.1
       - name: Dump demo cluster log on failure
         if: failure()
-        run: tail -n 500 /tmp/elastickv-demo.log || true
+        # The previous `tail -n 500` truncated a 3-minute workload's
+        # log down to startup-only lines, making it impossible to
+        # correlate a Jepsen anomaly with the server-side state
+        # (start_ts, commit_ts, raft term, write conflicts, lock-
+        # resolver events). Print head + tail inline so the GH UI
+        # still shows the most recent activity at-a-glance, then
+        # upload the full log as an artifact for offline analysis.
+        run: |
+          echo "=== first 200 lines (startup) ==="
+          head -n 200 /tmp/elastickv-demo.log || true
+          echo "=== last 1000 lines (most recent activity) ==="
+          tail -n 1000 /tmp/elastickv-demo.log || true
+          echo "=== full log line count ==="
+          wc -l /tmp/elastickv-demo.log || true
+      - name: Upload demo cluster log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elastickv-demo-log
+          path: /tmp/elastickv-demo.log
+          retention-days: 14
+          if-no-files-found: warn
       - name: Stop demo cluster
         if: always()
         run: |
