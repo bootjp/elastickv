@@ -416,7 +416,8 @@ func TestRedisDB_HandleTTL_OrphanWarnsOnFinalize(t *testing.T) {
 }
 
 // warnFieldsContain returns true when fields includes the given
-// even-indexed key. Helper for warn-sink assertions.
+// even-indexed key. Helper for warn-sink assertions; avoids
+// repeated `for i:=0; i<...; i+=2` in tests.
 func warnFieldsContain(fields []any, key string) bool {
 	for i := 0; i+1 < len(fields); i += 2 {
 		if k, ok := fields[i].(string); ok && k == key {
@@ -427,11 +428,12 @@ func warnFieldsContain(fields []any, key string) bool {
 }
 
 // TestRedisDB_FinalizeWarnsOnOverflowOnlyEvenWhenOrphanCountZero
-// pins the codex P2 fix (PR #790 r14 mirrored on PR #791): Finalize
-// must emit the orphan-ttl warning when pendingTTLOverflow > 0,
-// independently of orphanTTLCount. A caller that swallowed
-// ErrPendingTTLBufferFull would otherwise lose the visibility
-// signal for dropped expirations.
+// pins the codex P2 fix (PR #790 round 13): Finalize must emit the
+// orphan-ttl warning when pendingTTLOverflow > 0, independently of
+// orphanTTLCount. Previously the warn sink only fired when
+// orphanTTLCount > 0, so a caller that swallowed
+// ErrPendingTTLBufferFull would lose the visibility signal for
+// dropped expirations.
 func TestRedisDB_FinalizeWarnsOnOverflowOnlyEvenWhenOrphanCountZero(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
@@ -441,15 +443,18 @@ func TestRedisDB_FinalizeWarnsOnOverflowOnlyEvenWhenOrphanCountZero(t *testing.T
 		events = append(events, event)
 		lastFields = fields
 	})
-	const byteCap = 16 // "k0" costs 10; second key won't fit at 20>16.
+	// Small byte-cap to force overflow on the second key.
+	const byteCap = 16 // single key "k0" costs 2+8=10; second key won't fit at 10+10=20>16.
 	db.WithPendingTTLByteCap(byteCap)
 	if err := db.HandleTTL([]byte("k0"), encodeTTLValue(1)); err != nil {
 		t.Fatalf("first HandleTTL: %v", err)
 	}
+	// Second key fails closed — overflow++, orphan stays at 0
+	// (entry never enters pendingTTL).
 	if err := db.HandleTTL([]byte("k1"), encodeTTLValue(2)); !errors.Is(err, ErrPendingTTLBufferFull) {
 		t.Fatalf("expected ErrPendingTTLBufferFull, got %v", err)
 	}
-	// Drain k0 via wide-column state-init so orphanTTLCount ends
+	// Drain k0 via a wide-column state-init so orphanTTLCount ends
 	// at 0; only pendingTTLOverflow remains > 0.
 	if err := db.HandleSetMember(setMemberKey("k0", []byte("m")), nil); err != nil {
 		t.Fatal(err)
@@ -457,11 +462,10 @@ func TestRedisDB_FinalizeWarnsOnOverflowOnlyEvenWhenOrphanCountZero(t *testing.T
 	if err := db.Finalize(); err != nil {
 		t.Fatal(err)
 	}
+	assertPendingTTLState(t, "post-finalize", capturePendingTTLState(db),
+		pendingTTLState{bytes: 0, mapLen: 0, overflow: 1})
 	if db.orphanTTLCount != 0 {
 		t.Fatalf("orphanTTLCount = %d, want 0 (drained)", db.orphanTTLCount)
-	}
-	if db.pendingTTLOverflow != 1 {
-		t.Fatalf("pendingTTLOverflow = %d, want 1", db.pendingTTLOverflow)
 	}
 	if len(events) != 1 || events[0] != "redis_orphan_ttl" {
 		t.Fatalf("events = %v want [redis_orphan_ttl] (overflow alone must trigger warn)", events)
@@ -635,21 +639,21 @@ func TestRedisDB_NoKeymapWhenAllReversible(t *testing.T) {
 
 func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
 	t.Parallel()
-	// Codex P1 (PR #791): orphan TTL records are now BUFFERED in
+	// Codex P1 (PR #790): orphan TTL records are now BUFFERED in
 	// pendingTTL during intake — the wide-column state-init
 	// functions need to drain them when a typed record finally
 	// registers a user key. The buffer holds (string-userKey,
-	// uint64-expireAt) pairs; the per-record allocation cost is
-	// the same as kindByKey's, which we already pay for every
-	// typed record. The original Codex P2 round 6 concern (don't
-	// buffer arbitrarily-large payload bytes) is preserved — we
-	// still don't keep the value bytes.
+	// uint64-expireAt) pairs; the per-record allocation cost is the
+	// same as kindByKey's, which we already pay for every typed
+	// record. The original Codex P2 round 6 concern (don't buffer
+	// arbitrarily-large payload bytes) is preserved — we still
+	// don't keep the value bytes.
 	//
-	// At Finalize, entries still in pendingTTL are counted as
-	// truly unmatched orphans. This test asserts:
-	//   - During intake: orphanTTLCount stays 0, pendingTTL grows.
-	//   - After Finalize: orphanTTLCount == n (no typed record
-	//     ever drained the entries).
+	// At Finalize, entries still in pendingTTL are counted as truly
+	// unmatched orphans. This test now asserts:
+	//   - During intake: orphanTTLCount stays at 0, pendingTTL grows.
+	//   - After Finalize: orphanTTLCount == n (no typed record ever
+	//     drained the entries).
 	db, _ := newRedisDB(t)
 	const n = 10_000
 	for i := 0; i < n; i++ {
@@ -673,13 +677,20 @@ func TestRedisDB_OrphanTTLCountedNotBuffered(t *testing.T) {
 	}
 }
 
-// TestRedisDB_PendingTTLFailsClosedAtByteCap pins the codex P1
-// fix on PR #790 round 6 (mirrored here on PR #791 round 5): the
-// byte budget bounds pendingTTL memory. When an incoming entry's
-// byte cost would exceed pendingTTLBytesCap, HandleTTL fails
-// closed with ErrPendingTTLBufferFull.
+// TestRedisDB_PendingTTLFailsClosedAtByteCap pins the codex P1 fix
+// on PR #790 round 6: the byte budget (not entry count) bounds
+// pendingTTL memory. When an incoming entry's byte cost would
+// exceed pendingTTLBytesCap, HandleTTL fails closed with
+// ErrPendingTTLBufferFull rather than silently counting it as an
+// orphan. Without this, an adversarial snapshot with a small
+// number of 1 MiB unmatched TTL keys could still OOM the decoder
+// — defeating the entry-count cap from r4/r5.
 func TestRedisDB_PendingTTLFailsClosedAtByteCap(t *testing.T) {
 	t.Parallel()
+	// Each "orphan-N" key (N=0..7) is 8 bytes. With
+	// pendingTTLEntryOverheadBytes=8, each entry costs 16 bytes.
+	// 8 entries = 128 bytes; 9th would push to 144. Cap = 128 →
+	// 8 fit, 9th fails closed.
 	const byteCap = 128
 	const entriesPerByteCap = 8
 	db, _ := newRedisDB(t)
@@ -697,6 +708,7 @@ func TestRedisDB_PendingTTLFailsClosedAtByteCap(t *testing.T) {
 	if got := db.pendingTTLBytes; got != byteCap {
 		t.Fatalf("pendingTTLBytes = %d, want %d", got, byteCap)
 	}
+	// One more entry should fail closed (would push to 144 > 128).
 	err := db.HandleTTL([]byte("orphan-X"), encodeTTLValue(999))
 	if !errors.Is(err, ErrPendingTTLBufferFull) {
 		t.Fatalf("err = %v, want ErrPendingTTLBufferFull at byte_cap", err)
@@ -709,9 +721,12 @@ func TestRedisDB_PendingTTLFailsClosedAtByteCap(t *testing.T) {
 	}
 }
 
-// TestRedisDB_PendingTTLByteCapBoundedByLargeKey pins the large-
-// key defense: a single oversized key fails closed under a small
-// byte budget even though it's a single entry.
+// TestRedisDB_PendingTTLByteCapBoundedByLargeKey pins the
+// large-key defense codex flagged on PR #790 round 6: a single
+// 1 MiB key would have fit under any reasonable entry-count cap
+// but exhausts a sensible byte budget. We use a synthetic small
+// budget (64 bytes) and a 100-byte key to exercise the same logic
+// without allocating a real 1 MiB blob.
 func TestRedisDB_PendingTTLByteCapBoundedByLargeKey(t *testing.T) {
 	t.Parallel()
 	const byteCap = 64
@@ -732,11 +747,13 @@ func TestRedisDB_PendingTTLByteCapBoundedByLargeKey(t *testing.T) {
 
 // TestRedisDB_PendingTTLByteBudgetReclaimedOnClaim pins that the
 // byte counter is decremented when an entry is drained via
-// claimPendingTTL.
+// claimPendingTTL. A later wide-column state-init that drains the
+// buffer must free byte budget so subsequent unknown-kind TTLs can
+// be buffered again.
 func TestRedisDB_PendingTTLByteBudgetReclaimedOnClaim(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
-	const byteCap = 32
+	const byteCap = 32 // ("k0"=2 + 8) * 3 = 30 entries fit; 4th would overflow at 40
 	db.WithPendingTTLByteCap(byteCap)
 	for i := 0; i < 3; i++ {
 		if err := db.HandleTTL([]byte("k"+intToDecimal(i)), encodeTTLValue(1)); err != nil {
@@ -746,12 +763,14 @@ func TestRedisDB_PendingTTLByteBudgetReclaimedOnClaim(t *testing.T) {
 	if got := db.pendingTTLBytes; got != 30 {
 		t.Fatalf("pendingTTLBytes = %d, want 30", got)
 	}
+	// Drain k0 via a wide-column state-init.
 	if err := db.HandleSetMember(setMemberKey("k0", []byte("m")), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := db.pendingTTLBytes; got != 20 {
 		t.Fatalf("pendingTTLBytes after drain = %d, want 20 (reclaimed 10 bytes)", got)
 	}
+	// New buffer space available — another small entry fits.
 	if err := db.HandleTTL([]byte("k3"), encodeTTLValue(1)); err != nil {
 		t.Fatalf("HandleTTL after drain failed: %v", err)
 	}
@@ -781,12 +800,11 @@ func assertPendingTTLState(t *testing.T, label string, got, want pendingTTLState
 }
 
 // TestRedisDB_PendingTTLDuplicateKeyDoesNotDoubleCountBytes pins
-// the codex P2 fix (PR #790 round 7, mirrored on PR #791): when
-// parkUnknownTTL receives the same userKey more than once before
-// the key is claimed, the map entry overwrites in place (latest-
-// wins) and the byte counter stays unchanged. A duplicate at
-// byte-budget boundary must not spuriously fire
-// ErrPendingTTLBufferFull.
+// the codex P2 fix (PR #790 round 7): when parkUnknownTTL receives
+// the same userKey more than once before the key is claimed, the
+// map entry overwrites in place (latest-wins) and the byte counter
+// stays unchanged. A duplicate at byte-budget boundary must not
+// spuriously fire ErrPendingTTLBufferFull.
 func TestRedisDB_PendingTTLDuplicateKeyDoesNotDoubleCountBytes(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
@@ -826,7 +844,9 @@ func TestRedisDB_PendingTTLDuplicateKeyDoesNotDoubleCountBytes(t *testing.T) {
 }
 
 // TestRedisDB_WithPendingTTLByteCapZeroOpts pins the explicit
-// counter-only mode: byte_cap==0 disables buffering entirely.
+// counter-only mode: byte_cap==0 disables buffering entirely and
+// every unknown-kind TTL becomes an immediate orphan WITHOUT
+// firing ErrPendingTTLBufferFull.
 func TestRedisDB_WithPendingTTLByteCapZeroOpts(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
@@ -857,14 +877,18 @@ func TestRedisDB_WithPendingTTLByteCapNegativeCoercedToZero(t *testing.T) {
 }
 
 // TestRedisDB_DefaultPendingTTLByteCapSurvives1GiBLoad pins the
-// codex P1 fix (PR #791 round 7): the default cap must
-// comfortably accommodate "millions of expiring wide-column keys"
-// without hitting ErrPendingTTLBufferFull. The old 64 MiB default
-// would refuse a 10M-expiring-wide-column-key snapshot with
-// average 50-byte keys (cost = 10M * 58 = 580 MB); the new
+// codex P1 fix (PR #790 round 8): the default cap must comfortably
+// accommodate "millions of expiring wide-column keys" without
+// hitting ErrPendingTTLBufferFull. Specifically the old 64 MiB
+// default would refuse a 10M-expiring-wide-column-key snapshot
+// with average 50-byte keys (cost = 10M * 58 = 580 MB); the new
 // 1 GiB default tolerates that workload.
 func TestRedisDB_DefaultPendingTTLByteCapSurvives1GiBLoad(t *testing.T) {
 	t.Parallel()
+	// Sentinel constant invariant: the default must be exactly 1 GiB.
+	// Below 64 MiB would resurrect the round-6 regression; above
+	// ~4 GiB risks raising the OOM ceiling beyond typical dump-host
+	// budget headroom.
 	const wantDefault = 1 << 30
 	if defaultPendingTTLBytesCap != wantDefault {
 		t.Fatalf("defaultPendingTTLBytesCap = %d, want %d (1 GiB)", defaultPendingTTLBytesCap, wantDefault)

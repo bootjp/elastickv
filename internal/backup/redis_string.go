@@ -73,22 +73,21 @@ var ErrRedisInvalidStringValue = cockroachdberr.New("backup: invalid !redis|str|
 var ErrRedisInvalidTTLValue = cockroachdberr.New("backup: invalid !redis|ttl| value")
 
 // ErrPendingTTLBufferFull is returned by HandleTTL when an
-// unknown-kind TTL arrives but the pendingTTL buffer's BYTE budget
-// (pendingTTLBytesCap) is already exhausted. The encoder fails
-// closed here rather than silently counting the TTL as an orphan
-// because in real Pebble snapshot order (`!redis|ttl|` lex-sorts
-// before `!st|`/`!stream|`/`!zs|`), the dropped entry would likely
-// belong to a valid wide-column key that arrives later — losing
-// its expire_at_ms would produce a restored database with non-
-// expiring data that the source snapshot's clients expected to
-// expire.
+// unknown-kind TTL arrives but the pendingTTL buffer's BYTE
+// budget (pendingTTLBytesCap) is already exhausted. The encoder
+// fails closed here rather than silently counting the TTL as an
+// orphan because in real Pebble snapshot order (`!redis|ttl|`
+// lex-sorts before `!st|`/`!stream|`/`!zs|`), the dropped entry
+// would likely belong to a valid wide-column key that arrives
+// later — losing its expire_at_ms would produce a restored
+// database with non-expiring data that the source snapshot's
+// clients expected to expire.
 //
 // The budget is in BYTES (not entries) because Redis user keys can
-// be up to 1 MiB each; an entry-count cap of N still permits ~N MiB
-// of accumulated key bytes, which defeats the OOM protection on
-// adversarial snapshots with large keys. Codex P1 on PR #790 round
-// 5 (entry-count) and round 6 (entry-count → byte-budget); the
-// same fix is mirrored here on PR #791.
+// be up to 1 MiB each; an entry-count cap of N still permits N
+// MiB of accumulated key bytes, which defeats the OOM protection
+// on adversarial snapshots with large keys. Codex P1 on PR #790
+// round 5 (entry-count -> byte-budget on round 6).
 //
 // The default cap is 1 GiB (see defaultPendingTTLBytesCap), sized
 // to accommodate typical real-world workloads — at the 58-byte
@@ -97,8 +96,8 @@ var ErrRedisInvalidTTLValue = cockroachdberr.New("backup: invalid !redis|ttl| va
 // fail-closed (1,073,741,824 / 58 ≈ 18,513,652). Larger
 // deployments must raise the ceiling via WithPendingTTLByteCap.
 // The OOM ceiling is still hard (adversarial snapshots with TB
-// of large keys fail closed). Codex P1 on PR #791 round 7;
-// sizing-claim correction in claude r9/r10 follow-up.
+// of large keys fail closed). Codex P1 on PR #790 round 7;
+// claude r9/r10 sizing-claim correction in round 11.
 //
 // Recovery: raise WithPendingTTLByteCap above the snapshot's
 // expected cumulative byte cost of unmatched-at-intake TTLs, or
@@ -119,6 +118,7 @@ const (
 	redisKindHash
 	redisKindList
 	redisKindSet
+	redisKindZSet
 	redisKindStream
 )
 
@@ -221,6 +221,14 @@ type RedisDB struct {
 	// order for deterministic dump output.
 	sets map[string]*redisSetState
 
+	// zsets buffers per-userKey sorted-set state. Score lives in the
+	// !zs|mem| value (8-byte IEEE 754 big-endian); member name is the
+	// trailing key bytes (binary-safe). Flushed at Finalize into
+	// zsets/<key>.json sorted by member-name bytes (not by score) so
+	// `diff -r` between dumps stays line-stable across score-only
+	// mutations.
+	zsets map[string]*redisZSetState
+
 	// streams buffers per-userKey stream state (meta + entry list).
 	// Flushed at Finalize into streams/<key>.jsonl as one record per
 	// entry plus a trailing `_meta` line. Streams are bounded by
@@ -235,24 +243,25 @@ type RedisDB struct {
 	// `!redis|ttl|` lex-sorts before all `!st|`/`!stream|`/`!zs|`
 	// prefixes (`r` < `s`/`s`/`z`). Without buffering, HandleTTL
 	// would see kindByKey == redisKindUnknown and count the TTL
-	// as an orphan, dropping it before setState / streamState /
-	// zsetState had a chance to claim the user key — TTL'd
-	// sets, streams, and sorted sets would silently restore as
+	// as an orphan, dropping it before zsetState / setState /
+	// streamState had a chance to claim the user key — TTL'd
+	// sorted sets, sets, and streams would silently restore as
 	// permanent.
 	//
 	// Lifecycle: HandleTTL files the expiry here when kind is
 	// still unknown. Each wide-column state-init function
-	// (setState / streamState / zsetState) drains the entry when
-	// it first registers the user key. Finalize fires the
+	// (setState / zsetState / streamState etc.) drains the entry
+	// when it first registers the user key. Finalize fires the
 	// orphan-TTL warning for whatever remains (those keys never
 	// appeared as a typed record — likely a corrupted store).
 	pendingTTL map[string]uint64
 
 	// pendingTTLBytes tracks the cumulative byte cost of the
 	// pendingTTL buffer (each entry costs len(userKey) + 8 bytes,
-	// where 8 is the uint64 expireAtMs payload). Per-bucket Go-map
-	// overhead is NOT counted — we want the cap to be a
-	// deterministic byte budget the operator can reason about.
+	// where 8 is the uint64 expireAtMs payload — the per-entry
+	// Go-map overhead is not counted here, since we want the cap
+	// to be a deterministic byte budget the operator can reason
+	// about).
 	pendingTTLBytes int
 
 	// pendingTTLBytesCap caps the byte cost of pendingTTL. Once
@@ -262,15 +271,14 @@ type RedisDB struct {
 	// keys can be up to 1 MiB each; an entry-count cap of N
 	// would still permit ~N MiB of accumulated key bytes —
 	// defeating the OOM protection on adversarial snapshots with
-	// large keys. Codex P1 finding on PR #790 round 6 (mirrored
-	// here on PR #791).
+	// large keys. Codex P1 finding on PR #790 round 6.
 	pendingTTLBytesCap int
 
 	// pendingTTLOverflow counts entries that would have entered
 	// pendingTTL but were rejected because the byte budget was
 	// exhausted. Surfaced in the Finalize warning so operators
-	// can detect a snapshot whose TTL-vs-type cardinality exceeded
-	// the buffer.
+	// can distinguish "snapshot exceeded the buffer budget" from
+	// "TTL records remained unmatched after the entire scan".
 	pendingTTLOverflow int
 }
 
@@ -292,14 +300,15 @@ type RedisDB struct {
 // small for real Redis workloads. 1 GiB is the OOM ceiling —
 // adversarial snapshots with TB of 1 MiB keys still fail
 // closed via ErrPendingTTLBufferFull. Sizing-claim correction
-// in claude r9/r10 follow-up (PR #791 round 8).
+// in claude r9/r10 follow-up (round 11).
 const defaultPendingTTLBytesCap = 1 << 30
 
 // pendingTTLEntryOverheadBytes is the per-entry payload cost we
 // charge against pendingTTLBytesCap on top of the user-key bytes.
 // It accounts for the uint64 expireAtMs we store as the map value.
 // The Go-map's bucket overhead is NOT included — we want a
-// deterministic byte budget the operator can reason about.
+// deterministic byte budget the operator can reason about
+// directly, not one that drifts with Go's runtime map layout.
 const pendingTTLEntryOverheadBytes = 8
 
 // NewRedisDB constructs a RedisDB rooted at <outRoot>/redis/db_<n>/.
@@ -319,6 +328,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		hashes:             make(map[string]*redisHashState),
 		lists:              make(map[string]*redisListState),
 		sets:               make(map[string]*redisSetState),
+		zsets:              make(map[string]*redisZSetState),
 		streams:            make(map[string]*redisStreamState),
 		pendingTTL:         make(map[string]uint64),
 		pendingTTLBytesCap: defaultPendingTTLBytesCap,
@@ -327,9 +337,10 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 
 // WithPendingTTLByteCap overrides the default byte budget for the
 // pendingTTL buffer. A value of 0 disables buffering — every
-// unknown-kind TTL becomes an immediate orphan (matches the pre-
-// PR #791-r1 behavior). Negative inputs are coerced to 0. Returns
-// the receiver so it can be chained with other With* setters.
+// unknown-kind TTL becomes an immediate orphan (matches the
+// pre-pendingTTL behavior). Negative inputs are coerced to 0.
+// Returns the receiver so it can be chained with other With*
+// setters.
 //
 // The budget is in BYTES (sum of `len(userKey) +
 // pendingTTLEntryOverheadBytes` over every buffered entry), NOT
@@ -383,10 +394,9 @@ func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 	return r.writeBlob("hll", userKey, value)
 }
 
-// HandleTTL processes one !redis|ttl|<userKey> record. Routing depends on
-// what HandleString/HandleHLL recorded for the same userKey.
-//
-// There are two ordering regimes the snapshot stream presents:
+// HandleTTL processes one !redis|ttl|<userKey> record. Routing
+// depends on what the encoder has previously recorded for the user
+// key. There are two ordering regimes the snapshot stream presents:
 //
 //  1. Prefix sorts BEFORE !redis|ttl| in encoded-key order
 //     (!hs|, !lst|, !redis|str|, !redis|hll|). The typed record
@@ -396,16 +406,16 @@ func (r *RedisDB) HandleHLL(userKey, value []byte) error {
 //     `r` < `s`/`s`/`z`). The TTL arrives FIRST and kindByKey is
 //     still redisKindUnknown. We park the expiry in pendingTTL and
 //     let each wide-column state-init function (setState /
-//     streamState / zsetState) drain it when the user key finally
-//     surfaces as a typed record. Codex P1 finding on PR #791.
+//     zsetState / streamState) drain it when the user key finally
+//     surfaces as a typed record. Codex P1 finding on PR #790.
 //
 // Routing:
 //
 //   - redisKindHLL     -> hll_ttl.jsonl (case 1)
 //   - redisKindString  -> strings_ttl.jsonl (case 1; legacy strings
 //     whose TTL lives in !redis|ttl| rather than the inline header)
-//   - redisKindHash/List/Set/Stream/ZSet -> inlined into the
-//     per-key JSON (case 1 for hash/list, case 2 for set/stream/zset
+//   - redisKindHash/List/Set/ZSet/Stream -> inlined into the
+//     per-key JSON (case 1 for hash/list, case 2 for set/zset/stream
 //     where the state-init already drained from pendingTTL before
 //     HandleTTL would even be called the second time)
 //   - redisKindUnknown -> bufferPendingTTL. Finalize counts truly
@@ -429,41 +439,50 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 			return nil
 		}
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
-	case redisKindHash:
-		// Wide-column types fold TTL into the per-hash JSON record
-		// (`expire_at_ms` field) so a restorer can replay the hash
-		// in one shot rather than chasing a separate sidecar.
-		st := r.hashState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
-		return nil
-	case redisKindList:
-		// Same per-record TTL inlining as hashes: the list JSON
-		// carries expire_at_ms so a restorer can replay LPUSH +
-		// EXPIRE in one shot without consulting a sidecar.
-		st := r.listState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
-		return nil
-	case redisKindSet:
-		// Same per-record TTL inlining: SADD + EXPIRE replay in
-		// one shot from the per-set JSON, no separate sidecar.
-		st := r.setState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
-		return nil
-	case redisKindStream:
-		// Same per-record TTL inlining: XADD + EXPIRE replay in
-		// one shot from the per-stream JSONL `_meta` terminator,
-		// no separate sidecar.
-		st := r.streamState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+	case redisKindHash, redisKindList, redisKindSet, redisKindZSet, redisKindStream:
+		// Wide-column types fold TTL into the per-key JSON record
+		// (`expire_at_ms` field) so a restorer can replay the
+		// content + EXPIRE in one shot from the per-key file.
+		r.inlineWideColumnTTL(r.kindByKey[string(userKey)], userKey, expireAtMs)
 		return nil
 	case redisKindUnknown:
 		return r.parkUnknownTTL(userKey, expireAtMs)
 	}
 	return nil
+}
+
+// inlineWideColumnTTL sets expireAtMs/hasTTL on the per-key state
+// for a wide-column type. Extracted from HandleTTL so the parent
+// stays under the cyclop budget; the wide-column types all share
+// the same "set state + record TTL" pattern but with different
+// state-getter return types.
+func (r *RedisDB) inlineWideColumnTTL(kind redisKeyKind, userKey []byte, expireAtMs uint64) {
+	switch kind {
+	case redisKindHash:
+		st := r.hashState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindList:
+		st := r.listState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindSet:
+		st := r.setState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindZSet:
+		st := r.zsetState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindStream:
+		st := r.streamState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindUnknown, redisKindString, redisKindHLL:
+		// Unreachable: HandleTTL filters to wide-column kinds
+		// before calling this helper. Listed explicitly to satisfy
+		// the exhaustive linter.
+	}
 }
 
 // parkUnknownTTL buffers a redisKindUnknown TTL into pendingTTL, or
@@ -480,8 +499,9 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 //   - cap > 0 and buffer FULL: fail closed with
 //     ErrPendingTTLBufferFull. Silently counting the entry as an
 //     orphan would permanently lose `expire_at_ms` for the wide-
-//     column key that arrives later. Codex P1 on PR #790 round 5
-//     (mirrored here on PR #791).
+//     column key that arrives later — restored data becomes
+//     non-expiring without the operator noticing. Codex P1 on PR
+//     #790 round 5.
 //
 // Storage: userKey is COPIED (`string([]byte)` allocates) because
 // the snapshot reader reuses key buffers across iterations — an
@@ -499,11 +519,14 @@ func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) error {
 		// key, but a replay or fragile input must not inflate the
 		// byte counter — the map size has not grown, so charging
 		// `cost` again would spuriously trigger ErrPendingTTLBufferFull
-		// at byte-budget boundaries. Codex P2 on PR #790 round 7;
-		// mirrored here on PR #791.
+		// at byte-budget boundaries. Codex P2 on PR #790 round 7.
 		r.pendingTTL[uk] = expireAtMs
 		return nil
 	}
+	// Charge the byte cost: user-key bytes + the uint64 expireAtMs
+	// payload. The Go-map's per-bucket overhead is NOT counted
+	// because we want the cap to be a deterministic byte budget
+	// the operator can reason about. See pendingTTLEntryOverheadBytes.
 	cost := len(userKey) + pendingTTLEntryOverheadBytes
 	if r.pendingTTLBytes+cost > r.pendingTTLBytesCap {
 		// Fail closed: refuse to silently drop a TTL that may
@@ -525,7 +548,7 @@ func (r *RedisDB) parkUnknownTTL(userKey []byte, expireAtMs uint64) error {
 
 // claimPendingTTL drains any buffered TTL for userKey into the
 // caller-provided state. Called by the wide-column state-init
-// functions (setState / streamState / zsetState) when they first
+// functions (setState / zsetState / streamState) when they first
 // register a user key, so the parked expiry inlines into the same
 // per-key JSON the rest of the record assembles.
 //
@@ -562,6 +585,7 @@ func (r *RedisDB) Finalize() error {
 		r.flushHashes,
 		r.flushLists,
 		r.flushSets,
+		r.flushZSets,
 		r.flushStreams,
 		func() error { return closeJSONL(r.stringsTTL) },
 		func() error { return closeJSONL(r.hllTTL) },
@@ -580,25 +604,20 @@ func (r *RedisDB) Finalize() error {
 	// key whose type prefix we don't recognise (a future Redis
 	// type added on the live side without a backup-encoder update).
 	r.orphanTTLCount += len(r.pendingTTL)
-	// Codex P2 (PR #790 r13, mirrored on PR #791): also warn on
-	// pendingTTLOverflow even when orphanTTLCount is zero. Overflow
-	// entries fail-closed at parkUnknownTTL and never reach
+	// Codex P2 (PR #790 r13): also warn on pendingTTLOverflow even
+	// when orphanTTLCount is zero. Overflow entries fail-closed at
+	// parkUnknownTTL with ErrPendingTTLBufferFull and never reach
 	// pendingTTL, so they don't contribute to orphanTTLCount. If
 	// the caller swallows the HandleTTL error and continues, the
-	// previous condition would suppress the visibility signal for
-	// dropped expirations.
+	// previous condition (`orphanTTLCount > 0` only) would suppress
+	// the visibility signal for dropped expirations. Treat overflow
+	// as an independent reason to warn.
 	if r.warn != nil && (r.orphanTTLCount > 0 || r.pendingTTLOverflow > 0) {
 		fields := []any{
 			"count", r.orphanTTLCount,
 			"hint", "TTL records whose user key never appeared in a typed record — possible store corruption or an unknown type prefix",
 		}
 		if r.pendingTTLOverflow > 0 {
-			// Surface buffer-overflow separately so operators can
-			// distinguish "snapshot had more unmatched TTLs than
-			// the buffer cap" (potential miss-classifier — keys
-			// at cap WERE drainable by later state-inits, but
-			// overflow keys were skipped before they got a chance)
-			// from "TTL records remained unmatched at Finalize".
 			fields = append(fields,
 				"pending_ttl_buffer_overflow", r.pendingTTLOverflow,
 				"pending_ttl_buffer_bytes_cap", r.pendingTTLBytesCap)

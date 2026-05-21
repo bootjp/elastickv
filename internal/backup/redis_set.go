@@ -121,7 +121,7 @@ func (r *RedisDB) HandleSetMetaDelta(_, _ []byte) error { return nil }
 // it in pendingTTL, and this function inlines it into the set's
 // `expire_at_ms`. Without this drain step, every TTL'd set would
 // restore as permanent — a latent bug in PR #758 surfaced by codex
-// on PR #791. Phase 0a tests added in the same PR pin the ordering.
+// on PR #790. Phase 0a tests added in the same PR pin the ordering.
 func (r *RedisDB) setState(userKey []byte) *redisSetState {
 	uk := string(userKey)
 	if st, ok := r.sets[uk]; ok {

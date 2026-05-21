@@ -381,31 +381,6 @@ func TestRedisDB_StreamTTLArrivesBeforeRows(t *testing.T) {
 	}
 }
 
-// TestRedisDB_SetTTLArrivesBeforeRows pins the same ordering fix
-// for sets (`!redis|ttl|` lex-sorts before `!st|...` because
-// `r` < `s`). Retroactive coverage for PR #758, which shipped the
-// set encoder before the pendingTTL infrastructure existed.
-func TestRedisDB_SetTTLArrivesBeforeRows(t *testing.T) {
-	t.Parallel()
-	db, root := newRedisDB(t)
-	if err := db.HandleTTL([]byte("k"), encodeTTLValue(fixedExpireMs)); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.HandleSetMeta(setMetaKey("k"), encodeSetMetaValue(1)); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.HandleSetMember(setMemberKey("k", []byte("m")), nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Finalize(); err != nil {
-		t.Fatal(err)
-	}
-	got := readSetJSON(t, filepath.Join(root, "redis", "db_0", "sets", "k.json"))
-	if setFloat(t, got, "expire_at_ms") != float64(fixedExpireMs) {
-		t.Fatalf("expire_at_ms = %v want %d — pendingTTL drain failed", got["expire_at_ms"], fixedExpireMs)
-	}
-}
-
 // TestRedisDB_StreamEmptyStreamStillEmitsFile mirrors the other
 // wide-column encoders: an empty stream (Length=0) must still emit
 // a file because TYPE returns "stream" and XLEN returns 0 to clients.

@@ -237,7 +237,11 @@ type hashFieldRecord struct {
 	Value json.RawMessage `json:"value"`
 }
 
-func marshalHashJSON(st *redisHashState) ([]byte, error) {
+// nolint comment lives at the function head: dupl pairs this with
+// marshalZSetJSON, which carries the rationale (parallel design-spec
+// wrappers that can't collapse into a shared helper without breaking
+// JSON field-order determinism). See redis_zset.go:marshalZSetJSON.
+func marshalHashJSON(st *redisHashState) ([]byte, error) { //nolint:dupl // see comment above + redis_zset.go
 	// Sort by raw byte order for deterministic output across runs.
 	names := make([]string, 0, len(st.fields))
 	for name := range st.fields {
