@@ -415,6 +415,66 @@ func TestRedisDB_HandleTTL_OrphanWarnsOnFinalize(t *testing.T) {
 	}
 }
 
+// warnFieldsContain returns true when fields includes the given
+// even-indexed key. Helper for warn-sink assertions; avoids
+// repeated `for i:=0; i<...; i+=2` in tests.
+func warnFieldsContain(fields []any, key string) bool {
+	for i := 0; i+1 < len(fields); i += 2 {
+		if k, ok := fields[i].(string); ok && k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRedisDB_FinalizeWarnsOnOverflowOnlyEvenWhenOrphanCountZero
+// pins the codex P2 fix (PR #790 round 13): Finalize must emit the
+// orphan-ttl warning when pendingTTLOverflow > 0, independently of
+// orphanTTLCount. Previously the warn sink only fired when
+// orphanTTLCount > 0, so a caller that swallowed
+// ErrPendingTTLBufferFull would lose the visibility signal for
+// dropped expirations.
+func TestRedisDB_FinalizeWarnsOnOverflowOnlyEvenWhenOrphanCountZero(t *testing.T) {
+	t.Parallel()
+	db, _ := newRedisDB(t)
+	var events []string
+	var lastFields []any
+	db.WithWarnSink(func(event string, fields ...any) {
+		events = append(events, event)
+		lastFields = fields
+	})
+	// Small byte-cap to force overflow on the second key.
+	const byteCap = 16 // single key "k0" costs 2+8=10; second key won't fit at 10+10=20>16.
+	db.WithPendingTTLByteCap(byteCap)
+	if err := db.HandleTTL([]byte("k0"), encodeTTLValue(1)); err != nil {
+		t.Fatalf("first HandleTTL: %v", err)
+	}
+	// Second key fails closed — overflow++, orphan stays at 0
+	// (entry never enters pendingTTL).
+	if err := db.HandleTTL([]byte("k1"), encodeTTLValue(2)); !errors.Is(err, ErrPendingTTLBufferFull) {
+		t.Fatalf("expected ErrPendingTTLBufferFull, got %v", err)
+	}
+	// Drain k0 via a wide-column state-init so orphanTTLCount ends
+	// at 0; only pendingTTLOverflow remains > 0.
+	if err := db.HandleSetMember(setMemberKey("k0", []byte("m")), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	assertPendingTTLState(t, "post-finalize", capturePendingTTLState(db),
+		pendingTTLState{bytes: 0, mapLen: 0, overflow: 1})
+	if db.orphanTTLCount != 0 {
+		t.Fatalf("orphanTTLCount = %d, want 0 (drained)", db.orphanTTLCount)
+	}
+	if len(events) != 1 || events[0] != "redis_orphan_ttl" {
+		t.Fatalf("events = %v want [redis_orphan_ttl] (overflow alone must trigger warn)", events)
+	}
+	if !warnFieldsContain(lastFields, "pending_ttl_buffer_overflow") {
+		t.Fatalf("warn fields missing pending_ttl_buffer_overflow: %v", lastFields)
+	}
+}
+
 func TestRedisDB_RejectsTruncatedNewFormat(t *testing.T) {
 	t.Parallel()
 	cases := [][]byte{

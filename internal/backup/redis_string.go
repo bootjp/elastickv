@@ -584,7 +584,15 @@ func (r *RedisDB) Finalize() error {
 	// key whose type prefix we don't recognise (a future Redis
 	// type added on the live side without a backup-encoder update).
 	r.orphanTTLCount += len(r.pendingTTL)
-	if r.warn != nil && r.orphanTTLCount > 0 {
+	// Codex P2 (PR #790 r13): also warn on pendingTTLOverflow even
+	// when orphanTTLCount is zero. Overflow entries fail-closed at
+	// parkUnknownTTL with ErrPendingTTLBufferFull and never reach
+	// pendingTTL, so they don't contribute to orphanTTLCount. If
+	// the caller swallows the HandleTTL error and continues, the
+	// previous condition (`orphanTTLCount > 0` only) would suppress
+	// the visibility signal for dropped expirations. Treat overflow
+	// as an independent reason to warn.
+	if r.warn != nil && (r.orphanTTLCount > 0 || r.pendingTTLOverflow > 0) {
 		fields := []any{
 			"count", r.orphanTTLCount,
 			"hint", "TTL records whose user key never appeared in a typed record — possible store corruption or an unknown type prefix",
