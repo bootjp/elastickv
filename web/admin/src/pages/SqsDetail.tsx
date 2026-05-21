@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   api,
@@ -207,24 +207,32 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
   const [purgeName, setPurgeName] = useState("");
   const [purging, setPurging] = useState(false);
   const [purgeError, setPurgeError] = useState<string | null>(null);
+  // pendingAbortRef holds the active AbortController so a fresh
+  // peek call can cancel the previous one. Without this, two
+  // button-triggered peeks racing on the wire could land out of
+  // order and the older response would overwrite the newer state
+  // (Codex r2 P2).
+  const pendingAbortRef = useRef<AbortController | null>(null);
 
   const fetchPage = useCallback(
-    async (pageCursor: string | undefined, signal?: AbortSignal) => {
+    async (pageCursor: string | undefined) => {
+      pendingAbortRef.current?.abort();
+      const ctl = new AbortController();
+      pendingAbortRef.current = ctl;
       setLoading(true);
       setError(null);
       try {
         const res = await api.peekQueue(
           queue,
           { limit: kPeekPageSize, cursor: pageCursor, body_max_bytes: kPeekBodyMaxBytes },
-          signal,
+          ctl.signal,
         );
+        if (ctl.signal.aborted) return;
         setResult(res);
         setCursor(pageCursor);
         setLoading(false);
       } catch (err) {
-        // Ignore aborts (component unmount). setLoading is NOT in
-        // finally because that would clear loading on unmounted
-        // component after abort.
+        if (ctl.signal.aborted) return;
         if (err instanceof DOMException && err.name === "AbortError") return;
         setError(formatApiError(err));
         setLoading(false);
@@ -234,9 +242,8 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
   );
 
   useEffect(() => {
-    const ctl = new AbortController();
-    void fetchPage(undefined, ctl.signal);
-    return () => ctl.abort();
+    void fetchPage(undefined);
+    return () => pendingAbortRef.current?.abort();
   }, [fetchPage]);
 
   const onPurgeSubmit = async () => {
@@ -438,10 +445,10 @@ function MessageDetail({ message, queue }: MessageDetailProps) {
       message,
     };
     const json = JSON.stringify(payload, null, 2);
-    // navigator.clipboard is only available in secure contexts
-    // (HTTPS / localhost) and some self-hosted admin UIs run over
-    // plain HTTP. Capability check + fallback prompt keeps the
-    // modal usable in all environments. Codex r1 P2 + Gemini.
+    // navigator.clipboard is secure-context-only. On insecure /
+    // unavailable, point the operator at the body <pre> in the
+    // modal rather than window.prompt (blocking modal pre-empts the
+    // error message and some browsers truncate ~350KiB payloads).
     if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
       try {
         await navigator.clipboard.writeText(json);
@@ -450,17 +457,11 @@ function MessageDetail({ message, queue }: MessageDetailProps) {
         setTimeout(() => setCopied(false), 1500);
         return;
       } catch (err) {
-        setCopyError(`Copy failed: ${String(err)}. Use the prompt to copy manually.`);
+        setCopyError(`Copy failed: ${String(err)}. Select the body text above to copy manually.`);
+        return;
       }
-    } else {
-      setCopyError("Clipboard API unavailable (insecure context). Use the prompt to copy manually.");
     }
-    // Fallback: open a prompt with the payload pre-selected so the
-    // operator can copy with Ctrl/Cmd+C. window.prompt is universally
-    // supported and works in non-secure contexts.
-    if (typeof window !== "undefined") {
-      window.prompt("Copy the JSON payload:", json);
-    }
+    setCopyError("Clipboard API unavailable (insecure context). Select the body text above to copy manually.");
   };
 
   return (
@@ -509,7 +510,7 @@ function MessageDetail({ message, queue }: MessageDetailProps) {
                 <dt className="font-mono">{k}</dt>
                 <dd className="text-muted">{v.data_type}</dd>
                 <dd className="font-mono break-all">
-                  {v.string_value ?? (v.binary_value ? `<binary, base64 length=${v.binary_value.length}>` : "")}
+                  {v.string_value ?? (v.binary_value ? `<binary, ${base64DecodedByteLength(v.binary_value)} bytes>` : "")}
                 </dd>
               </div>
             ))}
@@ -551,13 +552,23 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-// utf8ByteLength counts the bytes a string occupies in UTF-8. The
-// server applies BodyMaxBytes against raw UTF-8 bytes, so the
-// "truncated to X of Y" display must use bytes, not JavaScript's
-// UTF-16 string length (would underreport for CJK / emoji bodies).
+// utf8ByteLength: server applies BodyMaxBytes to UTF-8 bytes, not
+// UTF-16 code units; CJK/emoji bodies would otherwise under-report.
 function utf8ByteLength(s: string): number {
   if (typeof TextEncoder !== "undefined") {
     return new TextEncoder().encode(s).byteLength;
   }
-  return s.length; // legacy environment fallback
+  return s.length;
+}
+
+// base64DecodedByteLength returns the decoded length of a base64
+// string without doing the actual decode (cheap arithmetic on the
+// padded length). Each 4 base64 chars decode to 3 bytes, minus the
+// padding count.
+function base64DecodedByteLength(b64: string): number {
+  if (b64.length === 0) return 0;
+  let padding = 0;
+  if (b64.endsWith("==")) padding = 2;
+  else if (b64.endsWith("=")) padding = 1;
+  return Math.floor(b64.length * 3 / 4) - padding;
 }

@@ -40,16 +40,9 @@ type QueueSummary struct {
 	CreatedAt  *time.Time        `json:"created_at,omitempty"`
 	Attributes map[string]string `json:"attributes,omitempty"`
 	Counters   QueueCounters     `json:"counters"`
-	// IsDLQ is true when at least one other queue's RedrivePolicy
-	// resolves its deadLetterTargetArn to this queue. The SPA uses
-	// the flag to switch the Messages-tab framing and the Purge
-	// button label between "Purge messages" and "Purge DLQ".
+	// True when another queue's RedrivePolicy points at this one.
 	IsDLQ bool `json:"is_dlq"`
-	// DLQSources lists the names of queues whose RedrivePolicy
-	// points at this queue, sorted lexicographically. Empty when
-	// IsDLQ is false; the SPA renders these as chips on the queue
-	// detail page so the operator confirms what feeds the DLQ
-	// before purging.
+	// Source queue names that point at this DLQ, sorted lex.
 	DLQSources []string `json:"dlq_sources,omitempty"`
 }
 
