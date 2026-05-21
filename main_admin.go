@@ -214,7 +214,11 @@ func (b *sqsQueuesBridge) AdminListQueues(ctx context.Context) ([]string, error)
 }
 
 func (b *sqsQueuesBridge) AdminDescribeQueue(ctx context.Context, name string) (*admin.QueueSummary, bool, error) {
-	summary, exists, err := b.server.AdminDescribeQueue(ctx, name)
+	// Phase 4 wires IsDLQ / DLQSources: the SPA's Messages tab and
+	// Purge button need this flag to switch their framing, so the
+	// bridge opts into the catalog reverse-scan that Phase 2 gated
+	// behind AdminDescribeQueueOptions{IncludeDLQSources}.
+	summary, exists, err := b.server.AdminDescribeQueue(ctx, name, adapter.AdminDescribeQueueOptions{IncludeDLQSources: true})
 	if err != nil {
 		return nil, false, translateAdminQueuesError(err)
 	}
@@ -229,6 +233,78 @@ func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.
 		return translateAdminQueuesError(err)
 	}
 	return nil
+}
+
+func (b *sqsQueuesBridge) AdminPeekQueue(ctx context.Context, principal admin.AuthPrincipal, name string, opts admin.PeekMessageOptions) (admin.PeekResult, error) {
+	rows, nextCursor, err := b.server.AdminPeekQueue(ctx, convertAdminPrincipal(principal), name, adapter.AdminPeekMessageOptions{
+		Limit:        opts.Limit,
+		Cursor:       opts.Cursor,
+		BodyMaxBytes: opts.BodyMaxBytes,
+	})
+	if err != nil {
+		return admin.PeekResult{}, translateAdminQueuesError(err)
+	}
+	return admin.PeekResult{
+		Messages:   convertPeekedMessages(rows),
+		NextCursor: nextCursor,
+	}, nil
+}
+
+func (b *sqsQueuesBridge) AdminPurgeQueue(ctx context.Context, principal admin.AuthPrincipal, name string) (admin.PurgeResult, error) {
+	res, err := b.server.AdminPurgeQueue(ctx, convertAdminPrincipal(principal), name)
+	if err != nil {
+		return admin.PurgeResult{}, translateAdminQueuesError(err)
+	}
+	return admin.PurgeResult{
+		GenerationBefore: res.GenerationBefore,
+		GenerationAfter:  res.GenerationAfter,
+	}, nil
+}
+
+// convertPeekedMessages re-shapes the adapter's []AdminPeekedMessage
+// into the admin package's []PeekedMessage. The two structs are
+// deliberately isomorphic so this translation is a per-field copy;
+// if either side grows a field, the build breaks here, which is the
+// drift signal we want.
+func convertPeekedMessages(in []adapter.AdminPeekedMessage) []admin.PeekedMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]admin.PeekedMessage, len(in))
+	for i, m := range in {
+		out[i] = admin.PeekedMessage{
+			MessageID:        m.MessageID,
+			Body:             m.Body,
+			BodyTruncated:    m.BodyTruncated,
+			BodyOriginalSize: m.BodyOriginalSize,
+			SentTimestamp:    m.SentTimestamp,
+			ReceiveCount:     m.ReceiveCount,
+			GroupID:          m.GroupID,
+			DeduplicationID:  m.DeduplicationID,
+			Attributes:       convertPeekedAttributes(m.Attributes),
+		}
+	}
+	return out
+}
+
+// convertPeekedAttributes re-shapes the typed attribute map; both
+// structs share the same field layout so a direct type conversion
+// would suffice if the JSON tags matched, but they differ (adapter
+// vs admin packages) so an explicit copy keeps the wire shape stable
+// per package.
+func convertPeekedAttributes(in map[string]adapter.AdminPeekedAttribute) map[string]admin.PeekedAttribute {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]admin.PeekedAttribute, len(in))
+	for k, v := range in {
+		out[k] = admin.PeekedAttribute{
+			DataType:    v.DataType,
+			StringValue: v.StringValue,
+			BinaryValue: v.BinaryValue,
+		}
+	}
+	return out
 }
 
 // convertAdminQueueSummary mirrors adapter.AdminQueueSummary into
@@ -261,6 +337,8 @@ func convertAdminQueueSummary(in *adapter.AdminQueueSummary) *admin.QueueSummary
 			NotVisible: in.Counters.NotVisible,
 			Delayed:    in.Counters.Delayed,
 		},
+		IsDLQ:      in.IsDLQ,
+		DLQSources: in.DLQSources,
 	}
 }
 
@@ -280,6 +358,19 @@ func translateAdminQueuesError(err error) error {
 		return admin.ErrQueuesNotFound
 	case errors.Is(err, adapter.ErrAdminSQSValidation):
 		return admin.ErrQueuesValidation
+	case errors.Is(err, adapter.ErrAdminSQSPurgeInProgress):
+		// Pull the typed RetryAfter duration from the adapter's
+		// *PurgeInProgressError and rewrap as admin's typed error.
+		// Both errors.Is(err, ErrQueuesPurgeInProgress) and
+		// errors.As(err, &*admin.PurgeInProgressError) match on the
+		// admin side, so the handler can branch on the sentinel
+		// while still extracting RetryAfter for the Retry-After
+		// header.
+		var adapterErr *adapter.PurgeInProgressError
+		if errors.As(err, &adapterErr) {
+			return &admin.PurgeInProgressError{RetryAfter: adapterErr.RetryAfter}
+		}
+		return &admin.PurgeInProgressError{}
 	case isLeaderChurnError(err):
 		// Leadership can be lost between AdminDeleteQueue's upfront
 		// isVerifiedSQSLeader check and the coordinator dispatch

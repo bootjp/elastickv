@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,17 @@ type QueueSummary struct {
 	CreatedAt  *time.Time        `json:"created_at,omitempty"`
 	Attributes map[string]string `json:"attributes,omitempty"`
 	Counters   QueueCounters     `json:"counters"`
+	// IsDLQ is true when at least one other queue's RedrivePolicy
+	// resolves its deadLetterTargetArn to this queue. The SPA uses
+	// the flag to switch the Messages-tab framing and the Purge
+	// button label between "Purge messages" and "Purge DLQ".
+	IsDLQ bool `json:"is_dlq"`
+	// DLQSources lists the names of queues whose RedrivePolicy
+	// points at this queue, sorted lexicographically. Empty when
+	// IsDLQ is false; the SPA renders these as chips on the queue
+	// detail page so the operator confirms what feeds the DLQ
+	// before purging.
+	DLQSources []string `json:"dlq_sources,omitempty"`
 }
 
 // QueueCounters mirrors the three Approximate* counters AWS exposes
@@ -56,13 +68,76 @@ type QueueCounters struct {
 //
 // AdminDescribeQueue returns (nil, false, nil) for a missing queue so
 // callers can distinguish "not found" from a storage error without
-// sniffing sentinels. AdminDeleteQueue returns the structured
-// sentinels below so the handler can map them to HTTP statuses
-// without leaking the adapter's error vocabulary.
+// sniffing sentinels. AdminDeleteQueue / AdminPeekQueue / AdminPurgeQueue
+// return the structured sentinels below so the handler can map them
+// to HTTP statuses without leaking the adapter's error vocabulary.
 type QueuesSource interface {
 	AdminListQueues(ctx context.Context) ([]string, error)
 	AdminDescribeQueue(ctx context.Context, name string) (*QueueSummary, bool, error)
 	AdminDeleteQueue(ctx context.Context, principal AuthPrincipal, name string) error
+	// AdminPeekQueue returns a non-destructive sample of currently-
+	// visible messages on the queue (read role required). Wired only
+	// when the source supports it; the bridge in main_admin.go
+	// translates between adapter and admin types so the admin package
+	// stays free of the adapter dependency tree.
+	AdminPeekQueue(ctx context.Context, principal AuthPrincipal, name string, opts PeekMessageOptions) (PeekResult, error)
+	// AdminPurgeQueue is the SigV4-bypass purge counterpart to
+	// AdminDeleteQueue: bumps the queue's generation so every
+	// message becomes unreachable, leaving the queue itself in place.
+	// Returns the committed generation pair so the audit log records
+	// the value that actually landed.
+	AdminPurgeQueue(ctx context.Context, principal AuthPrincipal, name string) (PurgeResult, error)
+}
+
+// PeekMessageOptions controls a peek call. Field defaults match the
+// adapter's documented bounds (Limit clamped to [1, 100] with 0
+// meaning "default of 20"; BodyMaxBytes clamped to [256, 262144]
+// with 0 meaning "default of 4096"; Cursor empty means "start from
+// the front").
+type PeekMessageOptions struct {
+	Limit        int
+	Cursor       string
+	BodyMaxBytes int
+}
+
+// PeekResult is the admin-package projection of the adapter's
+// AdminPeekQueue 3-tuple return (rows, nextCursor, error) bundled
+// into one value so QueuesSource's method signatures stay regular.
+// The handler renders this directly as the wire JSON.
+type PeekResult struct {
+	Messages   []PeekedMessage `json:"messages"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+}
+
+// PeekedMessage is one row in the peek response. JSON tags pin the
+// snake_case wire shape the design doc §3.5 specifies.
+type PeekedMessage struct {
+	MessageID        string                     `json:"message_id"`
+	Body             string                     `json:"body"`
+	BodyTruncated    bool                       `json:"body_truncated"`
+	BodyOriginalSize int64                      `json:"body_original_size"`
+	SentTimestamp    time.Time                  `json:"sent_timestamp"`
+	ReceiveCount     int32                      `json:"receive_count"`
+	GroupID          string                     `json:"group_id,omitempty"`
+	DeduplicationID  string                     `json:"deduplication_id,omitempty"`
+	Attributes       map[string]PeekedAttribute `json:"attributes,omitempty"`
+}
+
+// PeekedAttribute mirrors the typed SQS MessageAttribute shape so
+// binary payloads and the DataType discriminator survive the round
+// trip to the SPA.
+type PeekedAttribute struct {
+	DataType    string `json:"data_type"`
+	StringValue string `json:"string_value,omitempty"`
+	BinaryValue []byte `json:"binary_value,omitempty"`
+}
+
+// PurgeResult carries the committed-OCC generation pair so the
+// admin handler's audit line records the value that actually landed
+// (separate before/after meta reads would race a concurrent purge).
+type PurgeResult struct {
+	GenerationBefore uint64
+	GenerationAfter  uint64
 }
 
 // Errors the QueuesSource may return for the handler to map onto a
@@ -82,7 +157,33 @@ var (
 	ErrQueuesNotFound = errors.New("admin sqs: queue not found")
 	// ErrQueuesValidation — request shape is bad (400).
 	ErrQueuesValidation = errors.New("admin sqs: validation failed")
+	// ErrQueuesPurgeInProgress — the queue's 60-second
+	// PurgeQueue cooldown is active (429). The handler matches
+	// against this sentinel and pulls RetryAfter from a typed
+	// PurgeInProgressError wrapping it, so callers can branch via
+	// errors.Is while extracting the duration via errors.As.
+	ErrQueuesPurgeInProgress = errors.New("admin sqs: purge in progress")
 )
+
+// PurgeInProgressError is the typed admin error returned when the
+// queue's 60-second PurgeQueue rate limit is active. RetryAfter
+// carries the remaining wall-clock duration the caller should wait,
+// derived from the same LastPurgedAtMillis value the adapter's
+// rate-limit check observed inside its OCC read.
+type PurgeInProgressError struct {
+	RetryAfter time.Duration
+}
+
+func (e *PurgeInProgressError) Error() string {
+	return "admin sqs: purge already in progress; retry after " + e.RetryAfter.String()
+}
+
+// Is lets errors.Is(err, ErrQueuesPurgeInProgress) match any
+// *PurgeInProgressError so the handler can branch on the sentinel
+// while errors.As pulls the typed duration.
+func (e *PurgeInProgressError) Is(target error) bool {
+	return target == ErrQueuesPurgeInProgress
+}
 
 // SqsHandler serves /admin/api/v1/sqs/queues and
 // /admin/api/v1/sqs/queues/{name}. Reads (list, describe) accept GET;
@@ -125,32 +226,179 @@ func (h *SqsHandler) WithRoleStore(r RoleStore) *SqsHandler {
 	return h
 }
 
-// ServeHTTP routes /queues and /queues/{name}. Method handling
-// mirrors DynamoHandler — keep the two parallel so an operator
-// reading one understands the other for free.
+// ServeHTTP routes the SQS admin paths:
+//
+//	GET    /admin/api/v1/sqs/queues                       — list
+//	GET    /admin/api/v1/sqs/queues/{name}                — describe
+//	DELETE /admin/api/v1/sqs/queues/{name}                — delete
+//	GET    /admin/api/v1/sqs/queues/{name}/messages       — peek
+//	DELETE /admin/api/v1/sqs/queues/{name}/messages       — purge
+//
+// Routing follows the 6-step ordered procedure documented in
+// docs/design/2026_05_16_..._admin_purge_queue.md §3.4. The procedure
+// closes confused-deputy classes (empty / %2F / %252F / dot-segment)
+// that would otherwise let a crafted URL route to the wrong queue or
+// the wrong sub-resource.
+// sqsSubResourceMessages is the recognised sub-resource segment on
+// /queues/{name}/{sub}. Anything else is a 404. Lifted to a constant
+// so the dispatcher and any future routing layer stay aligned.
+const sqsSubResourceMessages = "messages"
+
+// sqsRouteSegmentsQueue / sqsRouteSegmentsMessages are the segment
+// counts the dispatcher recognises after the prefix trim. Named to
+// keep the dispatch switch self-documenting.
+const (
+	sqsRouteSegmentsQueue    = 1
+	sqsRouteSegmentsMessages = 2
+)
+
 func (h *SqsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.URL.Path == pathSqsQueues:
-		switch r.Method {
-		case http.MethodGet:
-			h.handleList(w, r)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET")
-		}
-	case strings.HasPrefix(r.URL.Path, pathPrefixSqsQueues):
-		name := strings.TrimPrefix(r.URL.Path, pathPrefixSqsQueues)
-		switch r.Method {
-		case http.MethodGet:
-			h.handleDescribe(w, r, name)
-		case http.MethodDelete:
-			h.handleDelete(w, r, name)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
-		}
-	default:
+	escaped := r.URL.EscapedPath()
+	if h.serveCollectionRoot(w, r, escaped) {
+		return
+	}
+	if !strings.HasPrefix(escaped, pathPrefixSqsQueues) {
 		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
 			"no admin SQS handler is registered for this path")
+		return
 	}
+	segments, ok := h.parseSqsRouteSegments(w, escaped)
+	if !ok {
+		return
+	}
+	h.dispatchSqsRoute(w, r, segments)
+}
+
+// serveCollectionRoot handles the .../queues and .../queues/ paths
+// before any splitting (Step 2 of the routing procedure). Returns
+// true when the request was handled (the caller short-circuits).
+// strings.TrimPrefix returns its input unchanged when the prefix
+// does not match and strings.Split("", "/") returns a one-element
+// slice — handling the collection root pre-split sidesteps both
+// corner cases.
+func (h *SqsHandler) serveCollectionRoot(w http.ResponseWriter, r *http.Request, escaped string) bool {
+	if escaped != pathSqsQueues && escaped != pathPrefixSqsQueues {
+		return false
+	}
+	switch r.Method {
+	case http.MethodGet:
+		h.handleList(w, r)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET")
+	}
+	return true
+}
+
+// parseSqsRouteSegments runs Steps 3 to 5 of the routing procedure
+// — trim the prefix, split, drop the single trailing empty, validate
+// each segment (rejecting empty / % / dot-segments), then run
+// path.Clean for trailing-slash normalisation. Returns the cleaned
+// segment slice or false after writing a 400 invalid_path response.
+func (h *SqsHandler) parseSqsRouteSegments(w http.ResponseWriter, escaped string) ([]string, bool) {
+	rest := strings.TrimPrefix(escaped, pathPrefixSqsQueues)
+	segments := dropSingleTrailingEmpty(strings.Split(rest, "/"))
+	for _, seg := range segments {
+		if !isValidSqsPathSegment(seg) {
+			writeJSONError(w, http.StatusBadRequest, "invalid_path",
+				"path segment is empty, contains %, or is a dot-segment")
+			return nil, false
+		}
+	}
+	cleaned := strings.TrimPrefix(path.Clean(pathPrefixSqsQueues+rest), pathPrefixSqsQueues)
+	return dropSingleTrailingEmpty(strings.Split(cleaned, "/")), true
+}
+
+// dropSingleTrailingEmpty removes one trailing empty segment so a
+// legal trailing slash (/queues/orders/messages/) does not collide
+// with the empty-segment rejection in step 4. Never drops an
+// interior empty: /queues/orders//messages still fails validation.
+func dropSingleTrailingEmpty(segments []string) []string {
+	if len(segments) > 1 && segments[len(segments)-1] == "" {
+		return segments[:len(segments)-1]
+	}
+	return segments
+}
+
+// dispatchSqsRoute is the post-validation router. Segment count tells
+// us which resource family the request targets; the per-resource
+// dispatcher checks the HTTP method.
+func (h *SqsHandler) dispatchSqsRoute(w http.ResponseWriter, r *http.Request, segments []string) {
+	name, err := decodeSqsPathSegment(segments[0])
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_path",
+			"queue name segment is not valid percent-encoding")
+		return
+	}
+	switch len(segments) {
+	case sqsRouteSegmentsQueue:
+		h.dispatchQueueResource(w, r, name)
+	case sqsRouteSegmentsMessages:
+		sub, err := decodeSqsPathSegment(segments[1])
+		if err != nil || sub != sqsSubResourceMessages {
+			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+				"unknown sub-resource on this queue")
+			return
+		}
+		h.dispatchMessagesResource(w, r, name)
+	default:
+		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+			"too many path segments")
+	}
+}
+
+// dispatchQueueResource handles the .../queues/{name} endpoint:
+// GET = describe, DELETE = delete.
+func (h *SqsHandler) dispatchQueueResource(w http.ResponseWriter, r *http.Request, name string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.handleDescribe(w, r, name)
+	case http.MethodDelete:
+		h.handleDelete(w, r, name)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
+	}
+}
+
+// dispatchMessagesResource handles the .../queues/{name}/messages
+// endpoint: GET = peek, DELETE = purge.
+func (h *SqsHandler) dispatchMessagesResource(w http.ResponseWriter, r *http.Request, name string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.handlePeek(w, r, name)
+	case http.MethodDelete:
+		h.handlePurge(w, r, name)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
+	}
+}
+
+// isValidSqsPathSegment enforces the step-4 rules. Every segment is
+// rejected if it is empty, contains a percent sign (closes the
+// %2F / %252F / %2e / %2E / %2E%2E percent-encoded slash and
+// dot-segment classes structurally without enumerating depths), or
+// is one of the literal dot-segment strings . / .. (closes the raw
+// dot-segment traversal class — path.Clean would otherwise collapse
+// .. against the preceding segment and dispatch on the wrong path).
+func isValidSqsPathSegment(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	if strings.ContainsRune(seg, '%') {
+		return false
+	}
+	if seg == "." || seg == ".." {
+		return false
+	}
+	return true
+}
+
+// decodeSqsPathSegment is a small wrapper over url.PathUnescape. The
+// step-4 validation rejects every % in raw segments, so by the time
+// this runs the segment is guaranteed to be percent-free and the
+// decoder is a no-op. Kept as a function so a future relaxation can
+// turn it back on without touching the routing logic.
+func decodeSqsPathSegment(seg string) (string, error) {
+	return seg, nil
 }
 
 type listQueuesResponse struct {
@@ -226,6 +474,122 @@ func (h *SqsHandler) handleDelete(w http.ResponseWriter, r *http.Request, name s
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handlePeek serves GET /admin/api/v1/sqs/queues/{name}/messages.
+// Read role required (RoleReadOnly or RoleFull). Query parameters
+// follow snake_case (limit / cursor / body_max_bytes); the SPA's
+// TypeScript client adapter does the case translation at the
+// request boundary.
+func (h *SqsHandler) handlePeek(w http.ResponseWriter, r *http.Request, name string) {
+	principal, ok := h.principalForReadSensitive(w, r)
+	if !ok {
+		return
+	}
+	opts, ok := parsePeekQueryParams(w, r)
+	if !ok {
+		return
+	}
+	result, err := h.source.AdminPeekQueue(r.Context(), principal, name, opts)
+	if err != nil {
+		writeQueuesError(w, err, h.logger, r)
+		return
+	}
+	if result.Messages == nil {
+		// Force the empty-result case to render as `{"messages": []}`
+		// rather than `{"messages": null}`. The SPA iterates the
+		// array directly and would crash on null.
+		result.Messages = []PeekedMessage{}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin sqs peek response encode failed",
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// parsePeekQueryParams folds the snake_case query string into a
+// typed PeekMessageOptions. Non-numeric limit / body_max_bytes
+// surface as ErrQueuesValidation-shaped 400s; the adapter does the
+// clamp itself, so we forward any in-range integer untouched.
+func parsePeekQueryParams(w http.ResponseWriter, r *http.Request) (PeekMessageOptions, bool) {
+	opts := PeekMessageOptions{Cursor: r.URL.Query().Get("cursor")}
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request", "limit must be an integer")
+			return PeekMessageOptions{}, false
+		}
+		opts.Limit = n
+	}
+	if raw := r.URL.Query().Get("body_max_bytes"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request", "body_max_bytes must be an integer")
+			return PeekMessageOptions{}, false
+		}
+		opts.BodyMaxBytes = n
+	}
+	return opts, true
+}
+
+// handlePurge serves DELETE /admin/api/v1/sqs/queues/{name}/messages.
+// Write role required (RoleFull only). Success returns 204; the
+// 60-second rate limit surfaces as 429 with the Retry-After header
+// and a retry_after_seconds JSON body via writeQueuesError.
+func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name string) {
+	principal, ok := h.principalForWrite(w, r)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_queue_name", "queue name is required")
+		return
+	}
+	if _, err := h.source.AdminPurgeQueue(r.Context(), principal, name); err != nil {
+		writeQueuesError(w, err, h.logger, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// principalForReadSensitive gates peek (and any future read endpoint
+// that surfaces stored payload content). Mirrors principalForWrite's
+// live-role re-check pattern but accepts the lower RoleReadOnly
+// tier. List / Describe themselves stay on the looser session-auth
+// gate because their output is queue metadata already shown on the
+// SPA's queue list page; peek diverges because the payload is the
+// stored message bodies themselves (Codex r9 P1 on the design doc
+// flagged the security-class distinction).
+func (h *SqsHandler) principalForReadSensitive(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
+	principal, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
+		return AuthPrincipal{}, false
+	}
+	if h.roles != nil {
+		live, exists := h.roles.LookupRole(principal.AccessKey)
+		if !exists {
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this access key is not authorised to read queue contents")
+			return AuthPrincipal{}, false
+		}
+		if !live.AllowsRead() {
+			writeJSONError(w, http.StatusForbidden, "forbidden",
+				"this access key is not authorised to read queue contents")
+			return AuthPrincipal{}, false
+		}
+		principal.Role = live
+	} else if !principal.Role.AllowsRead() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this access key is not authorised to read queue contents")
+		return AuthPrincipal{}, false
+	}
+	return principal, true
+}
+
 // principalForWrite resolves the live role from the RoleStore (when
 // configured), gates the request, and returns the principal with the
 // **live** role overridden in place — so the role that flows downstream
@@ -284,7 +648,16 @@ func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request) (
 // — the raw err.Error() may include adapter internals (Pebble paths,
 // raft peer ids) that should not flow to the SPA.
 func writeQueuesError(w http.ResponseWriter, err error, logger *slog.Logger, r *http.Request) {
+	// errors.As lets us pull the typed RetryAfter duration from a
+	// PurgeInProgressError without losing the errors.Is sentinel
+	// match below. The typed-error path is the only race-free way
+	// to surface the duration: a second loadQueueMetaAt call would
+	// race a concurrent purge resetting LastPurgedAtMillis in the
+	// 60-second window.
+	var purgeErr *PurgeInProgressError
 	switch {
+	case errors.As(err, &purgeErr):
+		writePurgeInProgress(w, purgeErr)
 	case errors.Is(err, ErrQueuesForbidden):
 		writeJSONError(w, http.StatusForbidden, "forbidden", "principal lacks required role")
 	case errors.Is(err, ErrQueuesNotLeader):
@@ -302,4 +675,27 @@ func writeQueuesError(w http.ResponseWriter, err error, logger *slog.Logger, r *
 		writeJSONError(w, http.StatusInternalServerError, "internal",
 			"queue operation failed; see server logs")
 	}
+}
+
+// writePurgeInProgress emits the 429 response shape the design doc
+// §3.4 specifies: Retry-After header (rounded up to whole seconds so
+// a client retrying exactly at the deadline is guaranteed to clear)
+// + JSON body { code, message, retry_after_seconds }.
+func writePurgeInProgress(w http.ResponseWriter, err *PurgeInProgressError) {
+	secs := int64(err.RetryAfter / time.Second)
+	if err.RetryAfter%time.Second != 0 {
+		secs++
+	}
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"code":                "PurgeQueueInProgress",
+		"message":             "only one PurgeQueue operation on each queue is allowed every 60 seconds",
+		"retry_after_seconds": secs,
+	})
 }
