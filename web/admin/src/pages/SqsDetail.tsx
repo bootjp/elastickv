@@ -230,6 +230,10 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
       } catch (err) {
         if (ctl.signal.aborted) return;
         if (err instanceof DOMException && err.name === "AbortError") return;
+        // Clear stale rows so a failed fetch after a queue change does
+        // not leave the prior queue's messages visible (Codex r3 P2).
+        setResult(null);
+        setCursor(undefined);
         setError(formatApiError(err));
         setLoading(false);
       }
@@ -238,6 +242,10 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
   );
 
   useEffect(() => {
+    // Clear prior queue's table when the queue prop changes so the
+    // brief loading window does not show cross-queue data.
+    setResult(null);
+    setCursor(undefined);
     void fetchPage(undefined);
     return () => pendingAbortRef.current?.abort();
   }, [fetchPage]);
