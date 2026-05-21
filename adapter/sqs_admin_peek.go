@@ -31,17 +31,21 @@ type AdminPeekedAttribute struct {
 	BinaryValue []byte `json:"binary_value,omitempty"`
 }
 
-// AdminPeekedMessage is one row in the peek result.
+// AdminPeekedMessage is one row in the peek result. JSON tags pin
+// the snake_case wire shape the design doc §3.5 specifies; without
+// them the encoder would emit Go-style PascalCase field names and
+// the SPA's client adapter would silently misparse every row.
+// CodeRabbit r4 caught the regression.
 type AdminPeekedMessage struct {
-	MessageID        string
-	Body             string                          // truncated per opts.BodyMaxBytes
-	BodyTruncated    bool                            // true when Body was cut
-	BodyOriginalSize int64                           // bytes in the original body, for display
-	SentTimestamp    time.Time                       // SQS SentTimestamp
-	ReceiveCount     int32                           // ApproximateReceiveCount
-	GroupID          string                          // FIFO MessageGroupId, empty for standard
-	DeduplicationID  string                          // FIFO MessageDeduplicationId, empty for standard
-	Attributes       map[string]AdminPeekedAttribute // typed SQS message attributes
+	MessageID        string                          `json:"message_id"`
+	Body             string                          `json:"body"`                       // truncated per opts.BodyMaxBytes
+	BodyTruncated    bool                            `json:"body_truncated"`             // true when Body was cut
+	BodyOriginalSize int64                           `json:"body_original_size"`         // bytes in the original body, for display
+	SentTimestamp    time.Time                       `json:"sent_timestamp"`             // SQS SentTimestamp
+	ReceiveCount     int32                           `json:"receive_count"`              // ApproximateReceiveCount
+	GroupID          string                          `json:"group_id,omitempty"`         // FIFO MessageGroupId, empty for standard
+	DeduplicationID  string                          `json:"deduplication_id,omitempty"` // FIFO MessageDeduplicationId, empty for standard
+	Attributes       map[string]AdminPeekedAttribute `json:"attributes,omitempty"`       // typed SQS message attributes
 }
 
 // AdminPeekMessageOptions controls a peek call. Zero values map to
@@ -233,7 +237,7 @@ func (s *SQSServer) AdminPeekQueue(
 	if !exists {
 		return nil, "", ErrAdminSQSNotFound
 	}
-	cursor, err = preparePeekCursor(cursor, meta, s.peekStartPartition(name, cursor, meta))
+	cursor, err = preparePeekCursor(cursor, meta, name, s.peekStartPartition(name, cursor, meta))
 	if err != nil {
 		return nil, "", err
 	}
@@ -304,7 +308,15 @@ func (s *SQSServer) peekStartPartition(queueName string, cursor *peekCursor, met
 // peekStartPartition wrapper around nextReceiveFanoutStart) so this
 // helper stays method-free for unit-testability. Non-partitioned and
 // perQueue-collapsed queues pass 0.
-func preparePeekCursor(cursor *peekCursor, meta *sqsQueueMeta, startPartition uint32) (*peekCursor, error) {
+//
+// queueName is consumed to validate cursor.LastKey on continuation
+// pages: a forged LastKey outside the queue's visibility-index
+// prefix would otherwise let an attacker start a ScanAt at any byte
+// offset in the leader's keyspace (Codex r4 P2). Continuation
+// cursors are admin-supplied and signed only by base64-encoding, so
+// every field must be validated against the live queue meta before
+// being used as a storage cursor.
+func preparePeekCursor(cursor *peekCursor, meta *sqsQueueMeta, queueName string, startPartition uint32) (*peekCursor, error) {
 	effective := effectivePartitionCount(meta)
 	if cursor == nil {
 		out := &peekCursor{
@@ -325,6 +337,13 @@ func preparePeekCursor(cursor *peekCursor, meta *sqsQueueMeta, startPartition ui
 		return nil, errors.Wrapf(ErrAdminSQSValidation,
 			"admin peek: cursor partition index out of range (StartPartition=%d, Partition=%d, max=%d)",
 			cursor.StartPartition, cursor.Partition, effective)
+	}
+	if len(cursor.LastKey) > 0 {
+		expectedPrefix := sqsMsgVisPrefixForQueueDispatch(meta, queueName, cursor.Partition, meta.Generation)
+		if !bytes.HasPrefix(cursor.LastKey, expectedPrefix) {
+			return nil, errors.Wrap(ErrAdminSQSValidation,
+				"admin peek: cursor LastKey is outside the queue's visibility-index prefix")
+		}
 	}
 	return cursor, nil
 }

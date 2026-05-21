@@ -727,6 +727,80 @@ func TestClampPeekBodyBytes(t *testing.T) {
 	}
 }
 
+// TestAdminPeekedMessage_JSONWireFormat pins the snake_case wire
+// shape the design doc §3.5 specifies. Without explicit JSON tags
+// the encoder emits Go-style PascalCase ("MessageID", "BodyTruncated"
+// …) and the SPA's client adapter silently misparses every row
+// (CodeRabbit r4 caught the regression).
+func TestAdminPeekedMessage_JSONWireFormat(t *testing.T) {
+	t.Parallel()
+	in := AdminPeekedMessage{
+		MessageID:        "m1",
+		Body:             "hello",
+		BodyTruncated:    true,
+		BodyOriginalSize: 42,
+		SentTimestamp:    time.UnixMilli(1_700_000_000_000).UTC(),
+		ReceiveCount:     3,
+		GroupID:          "g1",
+		DeduplicationID:  "d1",
+		Attributes: map[string]AdminPeekedAttribute{
+			"Source": {DataType: sqsAttributeBaseTypeString, StringValue: "checkout"},
+		},
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	wantKeys := []string{
+		"message_id", "body", "body_truncated", "body_original_size",
+		"sent_timestamp", "receive_count", "group_id", "deduplication_id",
+		"attributes",
+	}
+	for _, k := range wantKeys {
+		if _, ok := got[k]; !ok {
+			t.Fatalf("missing key %q in wire JSON; got=%v", k, got)
+		}
+	}
+	// PascalCase keys must NOT appear.
+	for _, k := range []string{"MessageID", "Body", "BodyTruncated", "GroupID", "Attributes"} {
+		if _, ok := got[k]; ok {
+			t.Fatalf("unwanted PascalCase key %q in wire JSON; got=%v", k, got)
+		}
+	}
+	// Nested AdminPeekedAttribute also uses snake_case.
+	attrs, _ := got["attributes"].(map[string]any)
+	src, _ := attrs["Source"].(map[string]any)
+	if _, ok := src["data_type"]; !ok {
+		t.Fatalf("Source attribute missing 'data_type' key; got=%v", src)
+	}
+}
+
+// TestAdminPeekedMessage_JSONOmitsEmptyAttributes pins the
+// omitempty contract: empty Attributes / GroupID / DeduplicationID
+// must NOT appear on the wire (the SPA renders the field's absence,
+// not a "null" or "{}" placeholder).
+func TestAdminPeekedMessage_JSONOmitsEmptyAttributes(t *testing.T) {
+	t.Parallel()
+	in := AdminPeekedMessage{MessageID: "m1", Body: "x"}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, k := range []string{"group_id", "deduplication_id", "attributes"} {
+		if _, ok := got[k]; ok {
+			t.Fatalf("empty %q must be omitted from wire JSON; got=%v", k, got)
+		}
+	}
+}
+
 // TestPreparePeekCursor_FreshCursor confirms the first-call cursor
 // stamps Generation and (for partitioned queues) StartPartition.
 func TestPreparePeekCursor_FreshCursor(t *testing.T) {
@@ -735,7 +809,7 @@ func TestPreparePeekCursor_FreshCursor(t *testing.T) {
 	t.Run("non-partitioned", func(t *testing.T) {
 		t.Parallel()
 		meta := &sqsQueueMeta{Generation: 7}
-		out, err := preparePeekCursor(nil, meta, 0)
+		out, err := preparePeekCursor(nil, meta, "test", 0)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -747,7 +821,7 @@ func TestPreparePeekCursor_FreshCursor(t *testing.T) {
 	t.Run("partitioned", func(t *testing.T) {
 		t.Parallel()
 		meta := &sqsQueueMeta{Generation: 11, PartitionCount: 4}
-		out, err := preparePeekCursor(nil, meta, 2)
+		out, err := preparePeekCursor(nil, meta, "test", 2)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -763,7 +837,7 @@ func TestPreparePeekCursor_GenerationMismatch(t *testing.T) {
 	t.Parallel()
 	stale := &peekCursor{V: peekCursorSchemaV1, Generation: 3}
 	meta := &sqsQueueMeta{Generation: 4}
-	_, err := preparePeekCursor(stale, meta, 0)
+	_, err := preparePeekCursor(stale, meta, "test", 0)
 	if !errors.Is(err, ErrAdminSQSValidation) {
 		t.Fatalf("want ErrAdminSQSValidation, got %v", err)
 	}
@@ -779,52 +853,50 @@ func TestPreparePeekCursor_GenerationMismatch(t *testing.T) {
 // endpoint).
 func TestPreparePeekCursor_PartitionOutOfRange(t *testing.T) {
 	t.Parallel()
+	pc4 := &sqsQueueMeta{Generation: 1, PartitionCount: 4}
+	pc0 := &sqsQueueMeta{Generation: 1, PartitionCount: 0}
+	pc1 := &sqsQueueMeta{Generation: 1, PartitionCount: 1}
+	// foreignKey / mismatchedKey share a "first byte not in the
+	// admin prefix" property with "aaaa" so the test exercises all
+	// three forged-LastKey classes the bounds check catches.
+	foreignKey := append(sqsMsgVisPrefixForQueueDispatch(pc4, "queue-X", 0, 1), 'X')
+	mismatchedKey := append(sqsMsgVisPrefixForQueueDispatch(pc4, "queue-A", 2, 1), 'X')
 
-	t.Run("partitioned: StartPartition >= PartitionCount", func(t *testing.T) {
-		t.Parallel()
-		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4}
-		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 99, Partition: 0}
-		_, err := preparePeekCursor(cursor, meta, 0)
-		if !errors.Is(err, ErrAdminSQSValidation) {
-			t.Fatalf("StartPartition=99/PC=4: want ErrAdminSQSValidation, got %v", err)
-		}
-	})
-
-	t.Run("partitioned: Partition >= PartitionCount", func(t *testing.T) {
-		t.Parallel()
-		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4}
-		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 99}
-		_, err := preparePeekCursor(cursor, meta, 0)
-		if !errors.Is(err, ErrAdminSQSValidation) {
-			t.Fatalf("Partition=99/PC=4: want ErrAdminSQSValidation, got %v", err)
-		}
-	})
-
-	t.Run("non-partitioned: non-zero StartPartition", func(t *testing.T) {
-		t.Parallel()
-		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 0}
-		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 1, Partition: 0}
-		_, err := preparePeekCursor(cursor, meta, 0)
-		if !errors.Is(err, ErrAdminSQSValidation) {
-			t.Fatalf("non-partitioned StartPartition=1: want ErrAdminSQSValidation, got %v", err)
-		}
-	})
-
-	t.Run("non-partitioned: non-zero Partition", func(t *testing.T) {
-		t.Parallel()
-		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 1}
-		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 5}
-		_, err := preparePeekCursor(cursor, meta, 0)
-		if !errors.Is(err, ErrAdminSQSValidation) {
-			t.Fatalf("non-partitioned Partition=5: want ErrAdminSQSValidation, got %v", err)
-		}
-	})
+	cases := []struct {
+		name   string
+		meta   *sqsQueueMeta
+		queue  string
+		cursor *peekCursor
+	}{
+		{"partitioned: StartPartition >= PartitionCount", pc4, "queue-A",
+			&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 99, Partition: 0}},
+		{"partitioned: Partition >= PartitionCount", pc4, "queue-A",
+			&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 99}},
+		{"non-partitioned: non-zero StartPartition", pc0, "queue-A",
+			&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 1, Partition: 0}},
+		{"non-partitioned: non-zero Partition", pc1, "queue-A",
+			&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 5}},
+		{"forged LastKey outside partition prefix (Codex r4 P2)", pc4, "queue-A",
+			&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 0, LastKey: []byte("aaaa")}},
+		{"LastKey from a different queue", pc4, "queue-A",
+			&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 0, LastKey: foreignKey}},
+		{"LastKey from a different partition", pc4, "queue-A",
+			&peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 0, LastKey: mismatchedKey}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := preparePeekCursor(tc.cursor, tc.meta, tc.queue, 0)
+			if !errors.Is(err, ErrAdminSQSValidation) {
+				t.Fatalf("%s: want ErrAdminSQSValidation, got %v", tc.name, err)
+			}
+		})
+	}
 
 	t.Run("partitioned: in-range cursor accepted", func(t *testing.T) {
 		t.Parallel()
-		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4}
 		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 3, Partition: 2}
-		out, err := preparePeekCursor(cursor, meta, 0)
+		out, err := preparePeekCursor(cursor, pc4, "queue-A", 0)
 		if err != nil {
 			t.Fatalf("in-range cursor: got err %v want nil", err)
 		}
@@ -958,7 +1030,7 @@ func TestPreparePeekCursor_PerQueueCollapse(t *testing.T) {
 	t.Run("fresh cursor on perQueue stamps StartPartition=0", func(t *testing.T) {
 		t.Parallel()
 		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4, FifoThroughputLimit: htfifoThroughputPerQueue}
-		out, err := preparePeekCursor(nil, meta, 2)
+		out, err := preparePeekCursor(nil, meta, "test", 2)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -971,7 +1043,7 @@ func TestPreparePeekCursor_PerQueueCollapse(t *testing.T) {
 		t.Parallel()
 		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4, FifoThroughputLimit: htfifoThroughputPerQueue}
 		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 2}
-		_, err := preparePeekCursor(cursor, meta, 0)
+		_, err := preparePeekCursor(cursor, meta, "test", 0)
 		if !errors.Is(err, ErrAdminSQSValidation) {
 			t.Fatalf("perQueue Partition=2 (raw PartitionCount=4 would allow): want ErrAdminSQSValidation, got %v", err)
 		}
