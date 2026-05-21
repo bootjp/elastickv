@@ -462,6 +462,47 @@ func TestRedisDB_StreamLengthMismatchWarns(t *testing.T) {
 	}
 }
 
+// TestRedisDB_StreamOrphanEntriesWithoutMetaSkipsFile pins the
+// codex P1 fix (PR #791 r11): when `!stream|entry|` rows arrive
+// without a preceding `!stream|meta|` row (torn / partial /
+// corrupt snapshot), the encoder MUST NOT emit a
+// streams/<key>.jsonl file. The live read path treats meta-less
+// streams as non-existent; emitting a backup file would resurrect
+// the orphan entries on restore — a data-consistency regression.
+// The encoder skips the user key and surfaces a warning instead.
+func TestRedisDB_StreamOrphanEntriesWithoutMetaSkipsFile(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	var events []string
+	db.WithWarnSink(func(event string, _ ...any) { events = append(events, event) })
+	// HandleStreamEntry without a prior HandleStreamMeta — torn
+	// snapshot shape.
+	val := encodeStreamEntryValue(t, "100-0", []string{"k", "v"})
+	if err := db.HandleStreamEntry(streamEntryKey("orphan", 100, 0), val); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	// streams/orphan.jsonl MUST NOT exist.
+	path := filepath.Join(root, "redis", "db_0", "streams", "orphan.jsonl")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected streams/orphan.jsonl absent, stat err=%v (encoder must skip meta-less streams)", err)
+	}
+	// Warning must surface for operator visibility.
+	want := "redis_stream_orphan_entries_without_meta"
+	found := false
+	for _, e := range events {
+		if e == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected %q warning, got %v", want, events)
+	}
+}
+
 // TestRedisDB_StreamRejectsMalformedMetaValueLength pins that a
 // !stream|meta| value of the wrong length surfaces as an error.
 // The 24-byte fixed shape is the wire-format contract — any other
@@ -557,33 +598,29 @@ func TestRedisDB_StreamRejectsMalformedEntryKey(t *testing.T) {
 	}
 }
 
-// TestRedisDB_StreamEntriesWithoutMetaStillEmitFile pins the
-// entries-without-meta contract: stream entries may arrive before
-// (or without) meta, and the encoder must still emit the JSONL
-// without firing the length-mismatch warning. Mirrors the
-// items-without-meta rule from list (#755 round 2) and set (#758).
-func TestRedisDB_StreamEntriesWithoutMetaStillEmitFile(t *testing.T) {
-	t.Parallel()
-	db, root := newRedisDB(t)
-	var events []string
-	db.WithWarnSink(func(event string, _ ...any) { events = append(events, event) })
-	val := encodeStreamEntryValue(t, "1-0", []string{"a", "b"})
-	if err := db.HandleStreamEntry(streamEntryKey("s", 1, 0), val); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Finalize(); err != nil {
-		t.Fatal(err)
-	}
-	entries, _ := readStreamJSONL(t, filepath.Join(root, "redis", "db_0", "streams", "s.jsonl"))
-	if len(entries) != 1 {
-		t.Fatalf("entries = %v, want 1", entries)
-	}
-	for _, e := range events {
-		if e == "redis_stream_length_mismatch" {
-			t.Fatalf("entries-without-meta must not fire length-mismatch warning, got events %v", events)
-		}
-	}
-}
+// (Removed) TestRedisDB_StreamEntriesWithoutMetaStillEmitFile.
+//
+// The original test asserted that stream entries arriving without
+// a preceding `!stream|meta|` row would still produce a
+// streams/<k>.jsonl file. That behavior is incorrect: the live
+// read path (`loadStreamAt` in adapter/redis_compat_helpers.go:
+// 640-647) returns EMPTY when no meta is found, so emitting a
+// backup file would resurrect orphan entries on restore as a
+// real stream — a data-consistency regression specific to torn /
+// corrupt snapshots.
+//
+// Codex P1 on PR #791 round 11 inverted this contract. The
+// correct behavior is now pinned by
+// TestRedisDB_StreamOrphanEntriesWithoutMetaSkipsFile above:
+// the file is NOT emitted and a
+// redis_stream_orphan_entries_without_meta warning fires for
+// operator visibility.
+//
+// list (#755 r2) and set (#758) have different semantics — their
+// live read paths DO return content when meta is absent (they
+// don't depend on a separate meta row to mark existence), so
+// "items-without-meta still emit" is correct for list/set but
+// not for stream.
 
 // TestRedisDB_StreamIDFormatMatchesRedisWire pins the wire format
 // of the JSON `id` field: `<ms>-<seq>` decimal, matching what

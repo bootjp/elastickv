@@ -257,9 +257,28 @@ func cloneStringSlice(src []string) []string {
 // encoders' policy: their existence is observable to clients (TYPE
 // returns "stream", XLEN returns 0). Mismatched declared-vs-observed
 // length surfaces an `redis_stream_length_mismatch` warning.
+//
+// Codex P1 (PR #791 r11): if `!stream|entry|` rows arrive WITHOUT
+// a preceding `!stream|meta|` row (torn / partial / corrupt
+// snapshot), the live read path (`loadStreamAt` in
+// adapter/redis_compat_helpers.go:640-647) returns an EMPTY stream
+// because `metaFound == false`. Emitting a streams/<key>.jsonl
+// here would resurrect those orphan entries on restore as a real
+// stream — a data-consistency regression specific to malformed
+// snapshots. Skip the user key and surface a warning so the
+// operator can investigate the source snapshot.
 func (r *RedisDB) flushStreams() error {
 	return flushWideColumnDir(r, r.streams, "streams", func(dir, uk string, st *redisStreamState) error {
-		if r.warn != nil && st.metaSeen && int64(len(st.entries)) != st.length {
+		if !st.metaSeen {
+			if r.warn != nil {
+				r.warn("redis_stream_orphan_entries_without_meta",
+					"user_key_len", len(uk),
+					"observed_entries", len(st.entries),
+					"hint", "!stream|entry| rows arrived without a !stream|meta| row; live read treats this as a non-existent stream, so the backup skips emitting a file to avoid resurrecting orphan entries on restore")
+			}
+			return nil
+		}
+		if r.warn != nil && int64(len(st.entries)) != st.length {
 			r.warn("redis_stream_length_mismatch",
 				"user_key_len", len(uk),
 				"declared_len", st.length,
