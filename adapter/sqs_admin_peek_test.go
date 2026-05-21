@@ -46,30 +46,38 @@ func TestAdminPeekQueue_HappyPath(t *testing.T) {
 	if nextCursor != "" {
 		t.Fatalf("nextCursor=%q want empty (queue drained in one page)", nextCursor)
 	}
-	for i, row := range rows {
-		assertPeekRowMatchesIndexedBody(t, i, row, "body-")
-	}
+	want := map[string]struct{}{"body-0": {}, "body-1": {}, "body-2": {}}
+	assertPeekRowsAsSet(t, rows, want)
 }
 
-// assertPeekRowMatchesIndexedBody pins the per-row invariants the
-// happy path expects: the body matches bodyPrefix+i, no truncation
-// fired (the bodies are short), MessageID is populated, and
-// SentTimestamp is non-zero. Pulled into a helper so
-// TestAdminPeekQueue_HappyPath stays under the cyclop budget.
-func assertPeekRowMatchesIndexedBody(t *testing.T, idx int, row AdminPeekedMessage, bodyPrefix string) {
+// assertPeekRowsAsSet pins the per-row invariants (MessageID
+// populated, SentTimestamp non-zero, no truncation) AND the set of
+// observed bodies, without coupling to row order. Vis-index entries
+// with the same visible_at millisecond tie-break on message_id which
+// is random, so an order-sensitive assertion is flaky under fast
+// sends — CodeRabbit r3 caught the earlier ordered-loop version.
+func assertPeekRowsAsSet(t *testing.T, rows []AdminPeekedMessage, want map[string]struct{}) {
 	t.Helper()
-	want := bodyPrefix + strconv.Itoa(idx)
-	if row.Body != want {
-		t.Fatalf("rows[%d].Body=%q want %q", idx, row.Body, want)
+	got := make(map[string]struct{}, len(rows))
+	for i, row := range rows {
+		if row.BodyTruncated {
+			t.Fatalf("rows[%d].BodyTruncated=true; want false for short body", i)
+		}
+		if row.MessageID == "" {
+			t.Fatalf("rows[%d].MessageID empty", i)
+		}
+		if row.SentTimestamp.IsZero() {
+			t.Fatalf("rows[%d].SentTimestamp zero", i)
+		}
+		got[row.Body] = struct{}{}
 	}
-	if row.BodyTruncated {
-		t.Fatalf("rows[%d].BodyTruncated=true; want false for %d-byte body", idx, len(row.Body))
+	for w := range want {
+		if _, ok := got[w]; !ok {
+			t.Fatalf("missing body %q in observed set %v", w, got)
+		}
 	}
-	if row.MessageID == "" {
-		t.Fatalf("rows[%d].MessageID empty", idx)
-	}
-	if row.SentTimestamp.IsZero() {
-		t.Fatalf("rows[%d].SentTimestamp zero", idx)
+	if len(got) != len(want) {
+		t.Fatalf("observed set %v != expected set %v", got, want)
 	}
 }
 
@@ -826,6 +834,24 @@ func TestPreparePeekCursor_PartitionOutOfRange(t *testing.T) {
 	})
 }
 
+// loadFanoutCounter retrieves the per-queue receive fanout counter
+// the server's receive path uses for partition rotation. Returns the
+// counter or fails the test if it is absent / has an unexpected
+// type. Pulled into a helper so callers that read-then-compare the
+// counter value stay under the cyclop budget.
+func loadFanoutCounter(t *testing.T, node Node, queueName string) *atomic.Uint32 {
+	t.Helper()
+	v, ok := node.sqsServer.receiveFanoutCounters.Load(queueName)
+	if !ok {
+		t.Fatalf("fanout counter missing for queue %q (bump-on-first-page contract broken)", queueName)
+	}
+	counter, ok := v.(*atomic.Uint32)
+	if !ok || counter == nil {
+		t.Fatalf("fanout counter for %q has unexpected type %T (want *atomic.Uint32)", queueName, v)
+	}
+	return counter
+}
+
 // TestAdminPeekQueue_ContinuationDoesNotBumpFanoutCounter pins Codex
 // r2 P1: AdminPeekQueue must NOT advance the shared
 // receiveFanoutCounters counter on continuation pages. The counter
@@ -863,11 +889,7 @@ func TestAdminPeekQueue_ContinuationDoesNotBumpFanoutCounter(t *testing.T) {
 		t.Fatalf("first peek: rows=%d cursor=%q — need both populated to exercise continuation", len(rows), cursor)
 	}
 
-	v, ok := node.sqsServer.receiveFanoutCounters.Load(name)
-	if !ok {
-		t.Fatalf("first peek did not create the fanout counter; the bump-on-first-page contract is broken")
-	}
-	counter, _ := v.(*atomic.Uint32)
+	counter := loadFanoutCounter(t, node, name)
 	before := counter.Load()
 
 	// Drive 5 continuation calls; each must not move the counter.
@@ -885,6 +907,75 @@ func TestAdminPeekQueue_ContinuationDoesNotBumpFanoutCounter(t *testing.T) {
 	if after != before {
 		t.Fatalf("continuation peeks bumped fanout counter from %d to %d (expected unchanged)", before, after)
 	}
+}
+
+// TestAdminPeekQueue_PerQueueFIFOCollapsesToOnePartition pins Codex
+// r3 P2: a partitioned FIFO queue in perQueue throughput mode
+// collapses every MessageGroupId to partition 0 (see
+// effectivePartitionCount). Peek must align with the data plane: it
+// walks only the effective partitions, not the raw PartitionCount
+// count, so a PartitionCount=4 perQueue queue does not waste 3
+// guaranteed-empty ScanAt calls on partitions 1..3 per peek call.
+//
+// Functional assertion: peek succeeds end-to-end on a perQueue queue
+// and surfaces every sent message. The optimization itself is
+// internal — a follow-up that re-introduces the meta.PartitionCount
+// rotation would still pass this assertion but the (Partition+1) %
+// effective termination encoded in walkPeek would still cap the
+// scan, so the regression vector is closed by the cursor codec
+// validation (effective bounds) being the chokepoint.
+func TestAdminPeekQueue_PerQueueFIFOCollapsesToOnePartition(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	const name = "peek-perqueue.fifo"
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName":  name,
+		"Attributes": map[string]string{"FifoQueue": "true"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create: %d %v", status, out)
+	}
+	queueURL, _ := out["QueueUrl"].(string)
+	installPartitionedMetaForTest(t, node, name, 4, htfifoThroughputPerQueue)
+
+	groups := []string{"alpha", "beta", "gamma"}
+	sent := sendFIFOMessagesForPeek(t, node, queueURL, groups)
+	seen := walkPeekUntilDone(t, context.Background(), node, name, 10)
+	assertEveryMessageSeenOnce(t, sent, seen)
+}
+
+// TestPreparePeekCursor_PerQueueCollapse confirms the cursor codec's
+// validation key off effectivePartitionCount, not the raw
+// meta.PartitionCount. A perQueue queue with PartitionCount=4 must
+// reject any cursor with Partition > 0 (the effective bound is 1)
+// even though meta.PartitionCount itself is 4.
+func TestPreparePeekCursor_PerQueueCollapse(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fresh cursor on perQueue stamps StartPartition=0", func(t *testing.T) {
+		t.Parallel()
+		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4, FifoThroughputLimit: htfifoThroughputPerQueue}
+		out, err := preparePeekCursor(nil, meta, 2)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if out.StartPartition != 0 || out.Partition != 0 {
+			t.Fatalf("perQueue fresh cursor=%+v want StartPartition=Partition=0 (effective=1)", out)
+		}
+	})
+
+	t.Run("perQueue rejects cursor.Partition >= 1", func(t *testing.T) {
+		t.Parallel()
+		meta := &sqsQueueMeta{Generation: 1, PartitionCount: 4, FifoThroughputLimit: htfifoThroughputPerQueue}
+		cursor := &peekCursor{V: peekCursorSchemaV1, Generation: 1, StartPartition: 0, Partition: 2}
+		_, err := preparePeekCursor(cursor, meta, 0)
+		if !errors.Is(err, ErrAdminSQSValidation) {
+			t.Fatalf("perQueue Partition=2 (raw PartitionCount=4 would allow): want ErrAdminSQSValidation, got %v", err)
+		}
+	})
 }
 
 // TestAdminPeekQueue_HostileCursorBoundedRequest is the end-to-end

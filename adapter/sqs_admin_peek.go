@@ -262,40 +262,56 @@ func (s *SQSServer) AdminPeekQueue(
 // peek pages between receives lands every receive on the same
 // partition, starving the other three).
 func (s *SQSServer) peekStartPartition(queueName string, cursor *peekCursor, meta *sqsQueueMeta) uint32 {
-	if cursor != nil || meta.PartitionCount <= 1 {
+	if cursor != nil {
 		return 0
 	}
-	return s.nextReceiveFanoutStart(queueName, meta.PartitionCount)
+	effective := effectivePartitionCount(meta)
+	if effective <= 1 {
+		return 0
+	}
+	return s.nextReceiveFanoutStart(queueName, effective)
 }
 
 // preparePeekCursor builds the effective cursor for this call. On the
 // first page (cursor==nil) it stamps Generation + a rotated
-// StartPartition (partitioned queues only — non-partitioned start at
-// 0). On a follow-up page it validates the stored Generation matches
-// the queue's current generation AND that StartPartition / Partition
-// are within [0, max(PartitionCount, 1)); a mismatch on either
+// StartPartition (partitioned queues only — non-partitioned and
+// perQueue-throughput FIFO queues collapse to partition 0). On a
+// follow-up page it validates the stored Generation matches the
+// queue's current generation AND that StartPartition / Partition are
+// within [0, effectivePartitionCount(meta)); a mismatch on either
 // returns ErrAdminSQSValidation.
 //
+// effectivePartitionCount (not meta.PartitionCount) is the
+// authoritative iteration bound. perQueue FIFO mode collapses every
+// MessageGroupId to partition 0 (see partitionFor /
+// effectivePartitionCount), so partitions 1..N-1 are guaranteed empty
+// for those queues; walking them would be pointless read
+// amplification (Codex r3 P2). Keying validation off the effective
+// count keeps peek aligned with the data-plane's actual partition
+// usage.
+//
 // Bounds-check rationale: walkPeek terminates the partitioned
-// rotation when `(Partition + 1) % PartitionCount == StartPartition`.
-// If a client supplies StartPartition outside [0, PartitionCount),
-// that termination condition never fires and the call loops
-// ScanAt-by-ScanAt over guaranteed-empty partitions forever — a
-// request-amplification DoS against the admin endpoint (Codex r1
-// P1 on PR #794). Rejecting bad cursor partition indices up-front
-// closes the vector. Generation mismatch separately forces a
-// front-of-stream refresh after a purge.
+// rotation when `(Partition + 1) % effectivePartitionCount ==
+// StartPartition`. If a client supplies StartPartition outside
+// [0, effectivePartitionCount), that termination condition never
+// fires and the call loops ScanAt-by-ScanAt over guaranteed-empty
+// partitions forever — a request-amplification DoS against the
+// admin endpoint (Codex r1 P1 on PR #794). Rejecting bad cursor
+// partition indices up-front closes the vector. Generation mismatch
+// separately forces a front-of-stream refresh after a purge.
 //
 // startPartition is computed by the caller (the SQSServer method's
-// nextReceiveFanoutStart) so this helper stays method-free for
-// unit-testability. Non-partitioned queues pass 0.
+// peekStartPartition wrapper around nextReceiveFanoutStart) so this
+// helper stays method-free for unit-testability. Non-partitioned and
+// perQueue-collapsed queues pass 0.
 func preparePeekCursor(cursor *peekCursor, meta *sqsQueueMeta, startPartition uint32) (*peekCursor, error) {
+	effective := effectivePartitionCount(meta)
 	if cursor == nil {
 		out := &peekCursor{
 			V:          peekCursorSchemaV1,
 			Generation: meta.Generation,
 		}
-		if meta.PartitionCount > 1 {
+		if effective > 1 {
 			out.StartPartition = startPartition
 			out.Partition = startPartition
 		}
@@ -305,18 +321,10 @@ func preparePeekCursor(cursor *peekCursor, meta *sqsQueueMeta, startPartition ui
 		return nil, errors.Wrap(ErrAdminSQSValidation,
 			"admin peek: cursor is from a prior generation; restart from the front")
 	}
-	maxPartition := meta.PartitionCount
-	if maxPartition <= 1 {
-		// Non-partitioned queues only have partition 0. A non-zero
-		// Partition or StartPartition would also fail the rotation
-		// termination check; reject explicitly so the error is the
-		// documented 400, not a silent O(infty) loop.
-		maxPartition = 1
-	}
-	if cursor.StartPartition >= maxPartition || cursor.Partition >= maxPartition {
+	if cursor.StartPartition >= effective || cursor.Partition >= effective {
 		return nil, errors.Wrapf(ErrAdminSQSValidation,
 			"admin peek: cursor partition index out of range (StartPartition=%d, Partition=%d, max=%d)",
-			cursor.StartPartition, cursor.Partition, maxPartition)
+			cursor.StartPartition, cursor.Partition, effective)
 	}
 	return cursor, nil
 }
@@ -350,11 +358,15 @@ func (s *SQSServer) walkPeek(
 			cursor.LastKey = next
 			return rows, cursor, nil
 		}
-		// Partition exhausted before Limit reached.
-		if meta.PartitionCount <= 1 {
+		// Partition exhausted before Limit reached. effectivePartitionCount
+		// (not meta.PartitionCount) caps the rotation so perQueue-collapsed
+		// FIFO queues stop after partition 0 instead of walking N-1
+		// guaranteed-empty partitions (Codex r3 P2 on PR #794).
+		effective := effectivePartitionCount(meta)
+		if effective <= 1 {
 			return rows, nil, nil
 		}
-		nextPart := (cursor.Partition + 1) % meta.PartitionCount
+		nextPart := (cursor.Partition + 1) % effective
 		if nextPart == cursor.StartPartition {
 			return rows, nil, nil
 		}
