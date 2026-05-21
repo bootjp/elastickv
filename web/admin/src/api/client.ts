@@ -210,13 +210,9 @@ export interface SqsQueueSummary {
   created_at?: string;
   attributes?: Record<string, string>;
   counters: SqsQueueCounters;
-  // is_dlq is true when another queue's RedrivePolicy resolves its
-  // deadLetterTargetArn to this queue. Drives the Messages-tab
-  // framing and the Purge button label ("Purge messages" vs
-  // "Purge DLQ").
+  // True when another queue's RedrivePolicy points at this one.
   is_dlq: boolean;
-  // dlq_sources lists the source queues' names that point at this
-  // queue, in lexicographic order. Empty when is_dlq is false.
+  // Source queue names that point at this DLQ, sorted lex.
   dlq_sources?: string[];
 }
 

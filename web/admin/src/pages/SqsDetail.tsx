@@ -207,11 +207,7 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
   const [purgeName, setPurgeName] = useState("");
   const [purging, setPurging] = useState(false);
   const [purgeError, setPurgeError] = useState<string | null>(null);
-  // pendingAbortRef holds the active AbortController so a fresh
-  // peek call can cancel the previous one. Without this, two
-  // button-triggered peeks racing on the wire could land out of
-  // order and the older response would overwrite the newer state
-  // (Codex r2 P2).
+  // Cancels the prior peek so a slow response cannot overwrite newer state.
   const pendingAbortRef = useRef<AbortController | null>(null);
 
   const fetchPage = useCallback(
@@ -561,10 +557,7 @@ function utf8ByteLength(s: string): number {
   return s.length;
 }
 
-// base64DecodedByteLength returns the decoded length of a base64
-// string without doing the actual decode (cheap arithmetic on the
-// padded length). Each 4 base64 chars decode to 3 bytes, minus the
-// padding count.
+// Decoded length without actually decoding: 4 chars → 3 bytes, minus padding.
 function base64DecodedByteLength(b64: string): number {
   if (b64.length === 0) return 0;
   let padding = 0;
