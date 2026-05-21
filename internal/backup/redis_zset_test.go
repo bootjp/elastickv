@@ -45,11 +45,31 @@ func zsetLegacyBlobKey(userKey string) []byte {
 	return append(out, userKey...)
 }
 
+// appendUserKeyLenBE32 appends the 4-byte BE-uint32 length of
+// userKey to out. Consolidates the five //nolint:gosec sites
+// where test fixtures need to pack a userKey length per the
+// store/wideColKeyLenSize wire layout. The cast is safe in test
+// fixtures because every test userKey is a Go string literal far
+// below math.MaxUint32, but the bounds check makes that explicit
+// for the linter and any future reader.
+func appendUserKeyLenBE32(out []byte, userKey string) []byte {
+	n := len(userKey)
+	if n > 0xFFFFFFFF {
+		panic("test fixture userKey exceeds uint32 length")
+	}
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(n)) //nolint:gosec // n bounds-checked above
+	return append(out, l[:]...)
+}
+
 // encodeZSetMetaValue builds the 8-byte BE member-count value used by
 // the live store/zset_helpers.go (mirror of store.MarshalZSetMeta).
 func encodeZSetMetaValue(memberCount int64) []byte {
+	if memberCount < 0 {
+		panic("test fixture memberCount must be non-negative")
+	}
 	v := make([]byte, 8)
-	binary.BigEndian.PutUint64(v, uint64(memberCount)) //nolint:gosec
+	binary.BigEndian.PutUint64(v, uint64(memberCount)) //nolint:gosec // memberCount bounds-checked above
 	return v
 }
 
@@ -65,9 +85,7 @@ func encodeZSetScoreValue(score float64) []byte {
 // !zs|meta|<len(4)><userKey>.
 func zsetMetaKey(userKey string) []byte {
 	out := []byte(RedisZSetMetaPrefix)
-	var l [4]byte
-	binary.BigEndian.PutUint32(l[:], uint32(len(userKey))) //nolint:gosec
-	out = append(out, l[:]...)
+	out = appendUserKeyLenBE32(out, userKey)
 	return append(out, userKey...)
 }
 
@@ -75,9 +93,7 @@ func zsetMetaKey(userKey string) []byte {
 // !zs|mem|<len(4)><userKey><member>. Member is binary-safe.
 func zsetMemberKey(userKey string, member []byte) []byte {
 	out := []byte(RedisZSetMemberPrefix)
-	var l [4]byte
-	binary.BigEndian.PutUint32(l[:], uint32(len(userKey))) //nolint:gosec
-	out = append(out, l[:]...)
+	out = appendUserKeyLenBE32(out, userKey)
 	out = append(out, userKey...)
 	return append(out, member...)
 }
@@ -88,9 +104,7 @@ func zsetMemberKey(userKey string, member []byte) []byte {
 // HandleZSetScore in a test that pins the "discard" contract.
 func zsetScoreKey(userKey string, sortableScore [8]byte, member []byte) []byte {
 	out := []byte(RedisZSetScorePrefix)
-	var l [4]byte
-	binary.BigEndian.PutUint32(l[:], uint32(len(userKey))) //nolint:gosec
-	out = append(out, l[:]...)
+	out = appendUserKeyLenBE32(out, userKey)
 	out = append(out, userKey...)
 	out = append(out, sortableScore[:]...)
 	return append(out, member...)
@@ -100,9 +114,7 @@ func zsetScoreKey(userKey string, sortableScore [8]byte, member []byte) []byte {
 // !zs|meta|d|<len(4)><userKey><commitTS(8)><seqInTxn(4)>.
 func zsetMetaDeltaKey(userKey string, commitTS uint64, seqInTxn uint32) []byte {
 	out := []byte(RedisZSetMetaDeltaPrefix)
-	var l [4]byte
-	binary.BigEndian.PutUint32(l[:], uint32(len(userKey))) //nolint:gosec
-	out = append(out, l[:]...)
+	out = appendUserKeyLenBE32(out, userKey)
 	out = append(out, userKey...)
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], commitTS)
@@ -908,16 +920,16 @@ func TestRedisDB_ZSetLegacyBlobRejectsNaNScore(t *testing.T) {
 	}
 }
 
-// TestRedisDB_ZSetLegacyBlobRejectsMalformedKey pins that a
-// `!redis|zset|` key with no trailing user-key bytes fails parse.
-func TestRedisDB_ZSetLegacyBlobRejectsMalformedKey(t *testing.T) {
+// TestRedisDB_ZSetLegacyBlobRejectsMissingPrefix pins that a key
+// without the `!redis|zset|` prefix fails parse via
+// ErrRedisInvalidZSetLegacyBlob. Empty user key with the correct
+// prefix IS valid Redis (technically reachable via a corrupted
+// store) and is covered by parseZSetLegacyBlobKey's own unit
+// path; only the missing-prefix case routes through this handler.
+func TestRedisDB_ZSetLegacyBlobRejectsMissingPrefix(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
 	value := encodeZSetLegacyBlobValue(t, []zsetLegacyEntry{{member: "m", score: 1}})
-	// Key has the prefix but no trailing user-key bytes — parser must
-	// still accept it (empty user key is technically valid Redis).
-	// Use a key that doesn't have the prefix to trigger the parse
-	// failure.
 	err := db.HandleZSetLegacyBlob([]byte("not-the-right-prefix|k"), value)
 	if !errors.Is(err, ErrRedisInvalidZSetLegacyBlob) {
 		t.Fatalf("err=%v want ErrRedisInvalidZSetLegacyBlob", err)
