@@ -1,6 +1,8 @@
 package backup
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"math"
@@ -343,8 +345,24 @@ func TestRedisDB_ZSetBinaryMemberUsesBase64Envelope(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected base64 envelope on member, got %T(%v)", rec["member"], rec["member"])
 	}
-	if envelope["base64"] == "" {
-		t.Fatalf("base64 envelope missing payload: %v", envelope)
+	// Claude r2-r10 carryover: previous assertion compared
+	// interface{} to string with ==, which is never equal — any
+	// non-nil value (including a corrupt payload) passed.
+	assertBase64EnvelopeDecodesTo(t, envelope, []byte{0x80, 0xff, 0x01})
+}
+
+func assertBase64EnvelopeDecodesTo(t *testing.T, envelope map[string]any, want []byte) {
+	t.Helper()
+	payload, ok := envelope["base64"].(string)
+	if !ok || payload == "" {
+		t.Fatalf("base64 envelope missing payload (type=%T, value=%v)", envelope["base64"], envelope["base64"])
+	}
+	decoded, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		t.Fatalf("invalid base64 payload %q: %v", payload, err)
+	}
+	if !bytes.Equal(decoded, want) {
+		t.Fatalf("decoded member = %x, want %x", decoded, want)
 	}
 }
 
