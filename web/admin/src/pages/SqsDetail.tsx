@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
-  ApiError,
   api,
   type SqsPeekResult,
   type SqsPeekedMessage,
@@ -208,7 +207,6 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
   const [purgeName, setPurgeName] = useState("");
   const [purging, setPurging] = useState(false);
   const [purgeError, setPurgeError] = useState<string | null>(null);
-  const [purgeRetryAfter, setPurgeRetryAfter] = useState<number | null>(null);
 
   const fetchPage = useCallback(
     async (pageCursor: string | undefined, signal?: AbortSignal) => {
@@ -222,12 +220,13 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
         );
         setResult(res);
         setCursor(pageCursor);
+        setLoading(false);
       } catch (err) {
-        // Ignore aborts triggered by the cleanup function below; the
-        // component is unmounting and a state update would warn.
+        // Ignore aborts (component unmount). setLoading is NOT in
+        // finally because that would clear loading on unmounted
+        // component after abort.
         if (err instanceof DOMException && err.name === "AbortError") return;
         setError(formatApiError(err));
-      } finally {
         setLoading(false);
       }
     },
@@ -247,7 +246,6 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
     }
     setPurging(true);
     setPurgeError(null);
-    setPurgeRetryAfter(null);
     try {
       await api.purgeQueue(queue);
       setConfirmPurge(false);
@@ -255,15 +253,13 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
       onPurged();
       void fetchPage(undefined);
     } catch (err) {
-      if (err instanceof ApiError && err.code === "PurgeQueueInProgress") {
-        // The 60-second cooldown is active. The server sends both a
-        // Retry-After header and a retry_after_seconds JSON field;
-        // ApiError currently only carries the parsed `code` and
-        // `message`, so the SPA shows the message text directly. A
-        // future apiFetch enhancement could surface the typed
-        // duration without changing the error model here.
-        setPurgeRetryAfter(60);
-      }
+      // Server includes the remaining cooldown in both the
+      // Retry-After header and the body's retry_after_seconds, but
+      // ApiError only carries code+message. formatApiError already
+      // includes the message ("only one PurgeQueue operation on each
+      // queue is allowed every 60 seconds") so showing it verbatim
+      // is sufficient; a future apiFetch enhancement could surface
+      // the typed duration if it becomes worth it.
       setPurgeError(formatApiError(err));
     } finally {
       setPurging(false);
@@ -354,14 +350,7 @@ function MessagesSection({ queue, isFifo, isDLQ, inFlightCount, onPurged }: Mess
           disabled={purging}
           autoFocus
         />
-        {purgeError && (
-          <div className="mt-3 text-sm text-danger">
-            {purgeError}
-            {purgeRetryAfter !== null && (
-              <> (retry after about {purgeRetryAfter} seconds)</>
-            )}
-          </div>
-        )}
+        {purgeError && <div className="mt-3 text-sm text-danger">{purgeError}</div>}
         <div className="flex justify-end gap-2 pt-4">
           <button
             type="button"
@@ -439,20 +428,39 @@ interface MessageDetailProps {
 
 function MessageDetail({ message, queue }: MessageDetailProps) {
   const [copied, setCopied] = useState(false);
-  const onCopyJson = () => {
-    // Schema version follows design doc §3.5: a future change to the
-    // export shape bumps schema_version so downstream tooling pins
-    // the version it expects.
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const onCopyJson = async () => {
+    // Schema version per design doc §3.5; downstream tooling pins it.
     const payload = {
       schema_version: 1,
       queue,
       exported_at: new Date().toISOString(),
       message,
     };
-    void navigator.clipboard.writeText(JSON.stringify(payload, null, 2)).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+    const json = JSON.stringify(payload, null, 2);
+    // navigator.clipboard is only available in secure contexts
+    // (HTTPS / localhost) and some self-hosted admin UIs run over
+    // plain HTTP. Capability check + fallback prompt keeps the
+    // modal usable in all environments. Codex r1 P2 + Gemini.
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(json);
+        setCopied(true);
+        setCopyError(null);
+        setTimeout(() => setCopied(false), 1500);
+        return;
+      } catch (err) {
+        setCopyError(`Copy failed: ${String(err)}. Use the prompt to copy manually.`);
+      }
+    } else {
+      setCopyError("Clipboard API unavailable (insecure context). Use the prompt to copy manually.");
+    }
+    // Fallback: open a prompt with the payload pre-selected so the
+    // operator can copy with Ctrl/Cmd+C. window.prompt is universally
+    // supported and works in non-secure contexts.
+    if (typeof window !== "undefined") {
+      window.prompt("Copy the JSON payload:", json);
+    }
   };
 
   return (
@@ -484,7 +492,7 @@ function MessageDetail({ message, queue }: MessageDetailProps) {
           <span className="text-xs text-muted">Body</span>
           {message.body_truncated && (
             <span className="text-xs text-danger">
-              Truncated to {formatBytes(message.body.length)} of {formatBytes(message.body_original_size)}
+              Truncated to {formatBytes(utf8ByteLength(message.body))} of {formatBytes(message.body_original_size)}
             </span>
           )}
         </div>
@@ -508,8 +516,13 @@ function MessageDetail({ message, queue }: MessageDetailProps) {
           </dl>
         </div>
       )}
+      {copyError && <div className="text-xs text-danger">{copyError}</div>}
       <div className="flex justify-end">
-        <button type="button" className="btn-secondary text-xs" onClick={onCopyJson}>
+        <button
+          type="button"
+          className="btn-secondary text-xs"
+          onClick={() => void onCopyJson()}
+        >
           {copied ? "Copied!" : "Copy as JSON"}
         </button>
       </div>
@@ -534,6 +547,17 @@ function previewBody(m: SqsPeekedMessage): string {
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} kB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+// utf8ByteLength counts the bytes a string occupies in UTF-8. The
+// server applies BodyMaxBytes against raw UTF-8 bytes, so the
+// "truncated to X of Y" display must use bytes, not JavaScript's
+// UTF-16 string length (would underreport for CJK / emoji bodies).
+function utf8ByteLength(s: string): number {
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(s).byteLength;
+  }
+  return s.length; // legacy environment fallback
 }

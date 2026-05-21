@@ -224,12 +224,8 @@ export interface SqsQueueList {
   queues: string[];
 }
 
-// SqsPeekedAttribute mirrors the typed MessageAttribute shape AWS
-// SQS uses. data_type is "String" / "Number" / "Binary" /
-// "String.MyCustom" etc.; exactly one of string_value or
-// binary_value carries the payload (binary_value is base64 on the
-// wire — keep as string here and decode lazily if a preview needs
-// raw bytes).
+// SqsPeekedAttribute mirrors AWS's typed MessageAttribute shape;
+// binary_value arrives base64-encoded.
 export interface SqsPeekedAttribute {
   data_type: string;
   string_value?: string;
@@ -239,10 +235,6 @@ export interface SqsPeekedAttribute {
 export interface SqsPeekedMessage {
   message_id: string;
   body: string;
-  // body_truncated is true when the wire body was cut to
-  // body_max_bytes on the server side. body_original_size carries
-  // the full byte length so the modal can render "showing N of M
-  // bytes".
   body_truncated: boolean;
   body_original_size: number;
   sent_timestamp: string;
@@ -254,9 +246,7 @@ export interface SqsPeekedMessage {
 
 export interface SqsPeekResult {
   messages: SqsPeekedMessage[];
-  // next_cursor is omitted when the queue is fully drained for the
-  // current MVCC snapshot. The client treats absence as "no further
-  // pages" and re-enables the page=1 navigation.
+  // Omitted when the walk has fully completed for this MVCC snapshot.
   next_cursor?: string;
 }
 
@@ -361,12 +351,8 @@ export const api = {
     apiFetch<SqsQueueSummary>(`/sqs/queues/${encodeURIComponent(name)}`, { signal }),
   deleteQueue: (name: string) =>
     apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}`, { method: "DELETE" }),
-  // peekQueue performs a non-destructive sample of currently-visible
-  // messages. Cursor pagination: pass back the prior call's
-  // next_cursor on subsequent pages, empty on the first page. The
-  // server clamps limit to [1, 100] (default 20) and body_max_bytes
-  // to [256, 262144] (default 4096); pass undefined to use the
-  // documented defaults.
+  // Non-destructive peek of currently-visible messages. Server clamps
+  // limit to [1, 100] and body_max_bytes to [256, 262144].
   peekQueue: (name: string, opts?: SqsPeekOptions, signal?: AbortSignal) =>
     apiFetch<SqsPeekResult>(`/sqs/queues/${encodeURIComponent(name)}/messages`, {
       query: {
@@ -376,10 +362,8 @@ export const api = {
       },
       signal,
     }),
-  // purgeQueue drains the queue's messages while leaving the queue
-  // itself (ARN, RedrivePolicy, tags, attributes) intact. AWS-shape
-  // 60-second rate limit per queue: a second purge inside the window
-  // returns 429 + retry_after_seconds in the body.
+  // Drains the queue's messages while leaving meta/ARN/RedrivePolicy intact.
+  // 60-second rate limit per queue: second purge inside the window → 429.
   purgeQueue: (name: string) =>
     apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}/messages`, { method: "DELETE" }),
   keyVizMatrix: (params: KeyVizParams, signal?: AbortSignal) =>

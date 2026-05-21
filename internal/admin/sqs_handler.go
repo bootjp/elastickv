@@ -698,17 +698,9 @@ func writeQueuesError(w http.ResponseWriter, err error, logger *slog.Logger, r *
 	}
 }
 
-// writePurgeInProgress emits the 429 response shape the design doc
-// §3.4 specifies: Retry-After header (rounded up to whole seconds so
-// a client retrying exactly at the deadline is guaranteed to clear)
-// + JSON body { error, message, retry_after_seconds }.
-//
-// The `error` key (not `code`) matches writeJSONError's envelope so
-// the SPA's apiFetch wrapper extracts the AWS-style sentinel into
-// ApiError.code consistently with every other 4xx the admin surface
-// returns. The retry_after_seconds field is in addition to the
-// canonical Retry-After header so the SPA does not have to plumb
-// response headers through its error path.
+// writePurgeInProgress emits the 429 wire shape (Retry-After header
+// + JSON body { error, message, retry_after_seconds }). Whole-second
+// rounding-up so a deadline-exact retry is guaranteed to clear.
 func writePurgeInProgress(w http.ResponseWriter, err *PurgeInProgressError) {
 	secs := int64(err.RetryAfter / time.Second)
 	if err.RetryAfter%time.Second != 0 {
