@@ -194,6 +194,33 @@ jobs:
             --partition-count 4 --group-count 6 \
             --drain-time 15 \
             --sqs-ports 63501,63502,63503 --host 127.0.0.1
+      - name: Dump demo cluster logs on failure
+        if: failure()
+        # Same rationale as jepsen-test-scheduled.yml: inline summary
+        # for the GH UI + full per-node logs uploaded as artifact so
+        # any Jepsen anomaly can be traced to the server-side ts/raft
+        # state without re-running the workflow.
+        run: |
+          for node in n1 n2 n3; do
+            log=/tmp/elastickv-demo-${node}.log
+            echo "=== ${node}: first 200 lines (startup) ==="
+            head -n 200 "$log" || true
+            echo "=== ${node}: last 500 lines (most recent activity) ==="
+            tail -n 500 "$log" || true
+            echo "=== ${node}: full log line count ==="
+            wc -l "$log" || true
+          done
+      - name: Upload demo cluster logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elastickv-demo-logs
+          path: |
+            /tmp/elastickv-demo-n1.log
+            /tmp/elastickv-demo-n2.log
+            /tmp/elastickv-demo-n3.log
+          retention-days: 14
+          if-no-files-found: warn
       - name: Stop demo cluster
         if: always()
         run: |
