@@ -83,6 +83,16 @@ const (
 // future "delete-only" tier reads consistently across the package.
 func (r AdminRole) canWrite() bool { return r == AdminRoleFull }
 
+// canRead reports whether the role authorises non-destructive but
+// sensitive reads — e.g. SQS AdminPeekQueue, which exposes message
+// bodies / attributes. Both AdminRoleReadOnly and AdminRoleFull
+// satisfy this gate; the zero value (unauthenticated / role-less
+// principal) does not. List / Describe paths use the looser
+// session-auth gate because their output is queue metadata already
+// shown on the SPA list page; peek is divergent because the payload
+// is the message bodies themselves.
+func (r AdminRole) canRead() bool { return r == AdminRoleReadOnly || r == AdminRoleFull }
+
 // AdminPrincipal is the authentication context every admin write
 // entrypoint takes. The adapter re-evaluates authorisation against
 // this principal *itself* — it does not trust the caller to have
