@@ -40,16 +40,9 @@ type QueueSummary struct {
 	CreatedAt  *time.Time        `json:"created_at,omitempty"`
 	Attributes map[string]string `json:"attributes,omitempty"`
 	Counters   QueueCounters     `json:"counters"`
-	// IsDLQ is true when at least one other queue's RedrivePolicy
-	// resolves its deadLetterTargetArn to this queue. The SPA uses
-	// the flag to switch the Messages-tab framing and the Purge
-	// button label between "Purge messages" and "Purge DLQ".
+	// True when another queue's RedrivePolicy points at this one.
 	IsDLQ bool `json:"is_dlq"`
-	// DLQSources lists the names of queues whose RedrivePolicy
-	// points at this queue, sorted lexicographically. Empty when
-	// IsDLQ is false; the SPA renders these as chips on the queue
-	// detail page so the operator confirms what feeds the DLQ
-	// before purging.
+	// Source queue names that point at this DLQ, sorted lex.
 	DLQSources []string `json:"dlq_sources,omitempty"`
 }
 
@@ -698,10 +691,9 @@ func writeQueuesError(w http.ResponseWriter, err error, logger *slog.Logger, r *
 	}
 }
 
-// writePurgeInProgress emits the 429 response shape the design doc
-// §3.4 specifies: Retry-After header (rounded up to whole seconds so
-// a client retrying exactly at the deadline is guaranteed to clear)
-// + JSON body { code, message, retry_after_seconds }.
+// writePurgeInProgress emits the 429 wire shape (Retry-After header
+// + JSON body { error, message, retry_after_seconds }). Whole-second
+// rounding-up so a deadline-exact retry is guaranteed to clear.
 func writePurgeInProgress(w http.ResponseWriter, err *PurgeInProgressError) {
 	secs := int64(err.RetryAfter / time.Second)
 	if err.RetryAfter%time.Second != 0 {
@@ -712,10 +704,11 @@ func writePurgeInProgress(w http.ResponseWriter, err *PurgeInProgressError) {
 	}
 	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusTooManyRequests)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"code":                "PurgeQueueInProgress",
+		"error":               "PurgeQueueInProgress",
 		"message":             "only one PurgeQueue operation on each queue is allowed every 60 seconds",
 		"retry_after_seconds": secs,
 	})

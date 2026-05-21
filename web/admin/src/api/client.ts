@@ -210,10 +210,46 @@ export interface SqsQueueSummary {
   created_at?: string;
   attributes?: Record<string, string>;
   counters: SqsQueueCounters;
+  // True when another queue's RedrivePolicy points at this one.
+  is_dlq: boolean;
+  // Source queue names that point at this DLQ, sorted lex.
+  dlq_sources?: string[];
 }
 
 export interface SqsQueueList {
   queues: string[];
+}
+
+// SqsPeekedAttribute mirrors AWS's typed MessageAttribute shape;
+// binary_value arrives base64-encoded.
+export interface SqsPeekedAttribute {
+  data_type: string;
+  string_value?: string;
+  binary_value?: string;
+}
+
+export interface SqsPeekedMessage {
+  message_id: string;
+  body: string;
+  body_truncated: boolean;
+  body_original_size: number;
+  sent_timestamp: string;
+  receive_count: number;
+  group_id?: string;
+  deduplication_id?: string;
+  attributes?: Record<string, SqsPeekedAttribute>;
+}
+
+export interface SqsPeekResult {
+  messages: SqsPeekedMessage[];
+  // Omitted when the walk has fully completed for this MVCC snapshot.
+  next_cursor?: string;
+}
+
+export interface SqsPeekOptions {
+  limit?: number;
+  cursor?: string;
+  body_max_bytes?: number;
 }
 
 // KeyViz wire shapes mirror internal/admin/keyviz_handler.go
@@ -311,6 +347,21 @@ export const api = {
     apiFetch<SqsQueueSummary>(`/sqs/queues/${encodeURIComponent(name)}`, { signal }),
   deleteQueue: (name: string) =>
     apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  // Non-destructive peek of currently-visible messages. Server clamps
+  // limit to [1, 100] and body_max_bytes to [256, 262144].
+  peekQueue: (name: string, opts?: SqsPeekOptions, signal?: AbortSignal) =>
+    apiFetch<SqsPeekResult>(`/sqs/queues/${encodeURIComponent(name)}/messages`, {
+      query: {
+        limit: opts?.limit,
+        cursor: opts?.cursor,
+        body_max_bytes: opts?.body_max_bytes,
+      },
+      signal,
+    }),
+  // Drains the queue's messages while leaving meta/ARN/RedrivePolicy intact.
+  // 60-second rate limit per queue: second purge inside the window → 429.
+  purgeQueue: (name: string) =>
+    apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}/messages`, { method: "DELETE" }),
   keyVizMatrix: (params: KeyVizParams, signal?: AbortSignal) =>
     apiFetch<KeyVizMatrix>("/keyviz/matrix", {
       query: {

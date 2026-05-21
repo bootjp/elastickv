@@ -347,7 +347,10 @@ func TestSqsHandler_PurgeQueue_RateLimited429(t *testing.T) {
 	require.Equal(t, "43", rec.Header().Get("Retry-After"))
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-	require.Equal(t, "PurgeQueueInProgress", body["code"])
+	// The "error" key (not "code") matches writeJSONError's envelope
+	// so apiFetch.ts can extract the AWS-style sentinel consistently
+	// with every other 4xx error.
+	require.Equal(t, "PurgeQueueInProgress", body["error"])
 	require.EqualValues(t, 43, body["retry_after_seconds"])
 }
 
