@@ -135,9 +135,13 @@ type PeekedAttribute struct {
 // PurgeResult carries the committed-OCC generation pair so the
 // admin handler's audit line records the value that actually landed
 // (separate before/after meta reads would race a concurrent purge).
+// JSON tags are pinned even though the current Phase 4 handler
+// returns 204 with no body — the Phase 5 audit log will record the
+// generation pair and a future wire encoder needs the snake_case
+// shape (Claude r1 on PR #797 flagged the pre-emptive fix).
 type PurgeResult struct {
-	GenerationBefore uint64
-	GenerationAfter  uint64
+	GenerationBefore uint64 `json:"generation_before"`
+	GenerationAfter  uint64 `json:"generation_after"`
 }
 
 // Errors the QueuesSource may return for the handler to map onto a
@@ -458,7 +462,7 @@ func (h *SqsHandler) handleDescribe(w http.ResponseWriter, r *http.Request, name
 }
 
 func (h *SqsHandler) handleDelete(w http.ResponseWriter, r *http.Request, name string) {
-	principal, ok := h.principalForWrite(w, r)
+	principal, ok := h.principalForWrite(w, r, "delete queues")
 	if !ok {
 		return
 	}
@@ -539,7 +543,7 @@ func parsePeekQueryParams(w http.ResponseWriter, r *http.Request) (PeekMessageOp
 // 60-second rate limit surfaces as 429 with the Retry-After header
 // and a retry_after_seconds JSON body via writeQueuesError.
 func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name string) {
-	principal, ok := h.principalForWrite(w, r)
+	principal, ok := h.principalForWriteOnPurge(w, r)
 	if !ok {
 		return
 	}
@@ -590,6 +594,16 @@ func (h *SqsHandler) principalForReadSensitive(w http.ResponseWriter, r *http.Re
 	return principal, true
 }
 
+// principalForWriteOnPurge wraps principalForWrite with the verb the
+// purge handler wants on rejection messages. Without this, an
+// operator clicking Purge sees a 403 body saying "not authorised to
+// delete queues" (the SqsHandler's principalForWrite was authored
+// before the purge handler existed). Claude r1 caught the misleading
+// wording.
+func (h *SqsHandler) principalForWriteOnPurge(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
+	return h.principalForWrite(w, r, "purge messages")
+}
+
 // principalForWrite resolves the live role from the RoleStore (when
 // configured), gates the request, and returns the principal with the
 // **live** role overridden in place — so the role that flows downstream
@@ -600,12 +614,19 @@ func (h *SqsHandler) principalForReadSensitive(w http.ResponseWriter, r *http.Re
 // ErrAdminForbidden, forcing the user to log out and back in for a
 // delete to work.
 //
+// The action verb (e.g. "delete queues", "purge messages") is woven
+// into the 403 rejection body so an operator sees the right
+// operation name. Without this, a read-only principal clicking
+// Purge would be told they "lack the role to delete queues" — a
+// confusing message about the wrong operation (Claude r1 caught
+// this on PR #797).
+//
 // Failure paths write the response and return ok=false; callers
 // short-circuit on the bool. Logged-out / wrong-role callers never
 // reach the source layer, so the leader's identity is not leaked
 // by indirection (forbidden response is the same shape regardless
 // of leadership state).
-func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
+func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request, action string) (AuthPrincipal, bool) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
 		// SessionAuth runs before this handler, so a missing
@@ -621,12 +642,12 @@ func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request) (
 			// login. Treat it as no-access regardless of what
 			// the JWT claimed.
 			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to delete queues")
+				"this access key is not authorised to "+action)
 			return AuthPrincipal{}, false
 		}
 		if !live.AllowsWrite() {
 			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to delete queues")
+				"this access key is not authorised to "+action)
 			return AuthPrincipal{}, false
 		}
 		// Forward the live role downstream so the adapter
@@ -637,7 +658,7 @@ func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request) (
 		principal.Role = live
 	} else if !principal.Role.AllowsWrite() {
 		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to delete queues")
+			"this access key is not authorised to "+action)
 		return AuthPrincipal{}, false
 	}
 	return principal, true

@@ -352,7 +352,11 @@ func TestSqsHandler_PurgeQueue_RateLimited429(t *testing.T) {
 }
 
 // TestSqsHandler_PurgeQueue_ReadOnlyForbidden pins the write gate:
-// a read-only principal cannot purge.
+// a read-only principal cannot purge. The 403 body carries the
+// purge-specific action verb ("purge messages"), not the
+// delete-specific one — Claude r1 caught the misleading wording
+// when principalForWrite was shared between handleDelete and
+// handlePurge.
 func TestSqsHandler_PurgeQueue_ReadOnlyForbidden(t *testing.T) {
 	src := &stubQueuesSource{queues: []string{"orders"}}
 	h := NewSqsHandler(src)
@@ -363,6 +367,10 @@ func TestSqsHandler_PurgeQueue_ReadOnlyForbidden(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusForbidden, rec.Code)
 	require.Empty(t, src.lastPurgeName, "read-only principal must not reach the purge source")
+	require.Contains(t, rec.Body.String(), "purge messages",
+		"purge rejection body must use the purge verb (not 'delete queues'); got=%s", rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "delete queues",
+		"purge rejection body must not say 'delete queues' (Claude r1 fix); got=%s", rec.Body.String())
 }
 
 // TestSqsHandler_Routing_PathValidation_BadInputs is the table-driven
@@ -491,7 +499,3 @@ func TestRole_AllowsRead(t *testing.T) {
 	require.False(t, Role("").AllowsRead())
 	require.False(t, Role("bogus").AllowsRead())
 }
-
-// helper to silence the unused-import warning when errors is only
-// referenced inside one of the test functions.
-var _ = errors.New
