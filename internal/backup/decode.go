@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"io"
+	"path/filepath"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -146,10 +147,17 @@ func DecodeSnapshot(r io.Reader, opts DecodeOptions) (DecodeResult, error) {
 	hdr, err := ReadSnapshotWithHeader(r, func(_ SnapshotHeader, e SnapshotEntry) error {
 		return d.handleEntry(e)
 	})
-	if err != nil {
-		return DecodeResult{}, err
+	// finalize() runs unconditionally so encoders (notably the S3
+	// encoder's scratch tree) get cleanup even when the stream is
+	// truncated. The original read error wins over a finalize error
+	// when both occur — the read failure is the root cause and the
+	// finalize error is most likely a downstream symptom (gemini r1
+	// medium on PR #806).
+	fErr := d.finalize()
+	if err == nil {
+		err = fErr
 	}
-	if err := d.finalize(); err != nil {
+	if err != nil {
 		return DecodeResult{}, err
 	}
 	return DecodeResult{Header: hdr, Counters: d.counters}, nil
@@ -182,7 +190,14 @@ func newDispatcher(opts DecodeOptions) (*dispatcher, error) {
 	if opts.Adapters.S3 {
 		scratch := opts.ScratchRoot
 		if scratch == "" {
-			scratch = opts.OutRoot
+			// NEVER default scratch to OutRoot — S3Encoder.Finalize
+			// runs os.RemoveAll(scratchRoot/s3/) and OutRoot also
+			// holds the *final* assembled bodies at <OutRoot>/s3/.
+			// Sharing the root would wipe the dump immediately after
+			// it lands (gemini r1 security-high on PR #806). The
+			// dedicated `.scratch` subtree keeps the two trees
+			// disjoint regardless of where OutRoot points.
+			scratch = filepath.Join(opts.OutRoot, ".scratch")
 		}
 		d.s3 = NewS3Encoder(opts.OutRoot, scratch).
 			WithIncludeIncompleteUploads(opts.IncludeIncompleteUploads).
@@ -235,28 +250,32 @@ func (d *dispatcher) route(key, value []byte) error {
 // (dynamodb/, s3/, redis/, sqs/) so an operator inspecting a partial
 // dump after a finalize-time error sees the adapters in the
 // expected sequence.
+//
+// Each encoder is finalized best-effort: an error in one does NOT
+// short-circuit the rest, so later encoders still get to clean up
+// their scratch directories. The first error encountered wins
+// (mirrors the ReadSnapshotWithHeader / finalize ordering in
+// DecodeSnapshot — gemini r1 medium on PR #806).
 func (d *dispatcher) finalize() error {
-	if d.ddb != nil {
-		if err := d.ddb.Finalize(); err != nil {
-			return err
+	var firstErr error
+	record := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
+	}
+	if d.ddb != nil {
+		record(d.ddb.Finalize())
 	}
 	if d.s3 != nil {
-		if err := d.s3.Finalize(); err != nil {
-			return err
-		}
+		record(d.s3.Finalize())
 	}
 	if d.redis != nil {
-		if err := d.redis.Finalize(); err != nil {
-			return err
-		}
+		record(d.redis.Finalize())
 	}
 	if d.sqs != nil {
-		if err := d.sqs.Finalize(); err != nil {
-			return err
-		}
+		record(d.sqs.Finalize())
 	}
-	return nil
+	return firstErr
 }
 
 // prefixRoute is one row in the global dispatch table. handler is a
