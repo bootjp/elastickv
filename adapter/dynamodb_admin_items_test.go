@@ -424,3 +424,35 @@ func TestAdminAttributeValue_DeepCopyIsolation(t *testing.T) {
 	require.Equal(t, "a", roundTrip.SS[0], "SS must be deep-copied on internal→admin")
 	require.Equal(t, byte(0x10), roundTrip.BS[0][0], "BS must be deep-copied on internal→admin")
 }
+
+// TestAdminAttributeValue_EmptyContainersRoundTrip pins Codex r3
+// P1 on PR #805: an empty-but-present L or M ({"L": []} / {"M": {}})
+// is a legitimate AWS-wire attribute value and must round-trip
+// without being dropped. attributeValue.hasListType / hasMapType
+// detect presence via != nil, so a len>0 gate in the conversion
+// would silently drop these.
+func TestAdminAttributeValue_EmptyContainersRoundTrip(t *testing.T) {
+	t.Parallel()
+	emptyL := AdminAttributeValue{L: []AdminAttributeValue{}}
+	emptyM := AdminAttributeValue{M: map[string]AdminAttributeValue{}}
+
+	// admin → internal → admin
+	gotL := internalToAdminAttributeValue(adminToInternalAttributeValue(emptyL))
+	require.NotNil(t, gotL.L, "empty L must round-trip as non-nil (got nil = silently dropped)")
+	require.Len(t, gotL.L, 0)
+	require.Nil(t, gotL.M)
+
+	gotM := internalToAdminAttributeValue(adminToInternalAttributeValue(emptyM))
+	require.NotNil(t, gotM.M, "empty M must round-trip as non-nil (got nil = silently dropped)")
+	require.Len(t, gotM.M, 0)
+	require.Nil(t, gotM.L)
+
+	// Same on the internal kind-detection contract: the converted
+	// attributeValue must satisfy hasListType / hasMapType so OCC
+	// validation and other downstream readers see the empty
+	// container, not a missing field.
+	internalL := adminToInternalAttributeValue(emptyL)
+	require.True(t, internalL.hasListType(), "internal L must be hasListType()=true after round-trip from empty admin L")
+	internalM := adminToInternalAttributeValue(emptyM)
+	require.True(t, internalM.hasMapType(), "internal M must be hasMapType()=true after round-trip from empty admin M")
+}

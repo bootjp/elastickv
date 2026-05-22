@@ -341,13 +341,18 @@ func internalToAdminAttributeValue(v attributeValue) AdminAttributeValue {
 		S: v.S, N: v.N, B: bytes.Clone(v.B), BOOL: v.BOOL, NULL: v.NULL,
 		SS: slices.Clone(v.SS), NS: slices.Clone(v.NS), BS: cloneBinarySet(v.BS),
 	}
-	if len(v.L) > 0 {
+	// L and M use != nil gates (not len > 0) so empty-but-present
+	// containers ({"L": []} / {"M": {}}) round-trip. attributeValue's
+	// kind detection (hasListType / hasMapType in dynamodb_types.go)
+	// also tests != nil, so a len>0 gate would silently drop a valid
+	// AWS-wire empty list / empty map (Codex r3 P1 on PR #805).
+	if v.L != nil {
 		out.L = make([]AdminAttributeValue, len(v.L))
 		for i, e := range v.L {
 			out.L[i] = internalToAdminAttributeValue(e)
 		}
 	}
-	if len(v.M) > 0 {
+	if v.M != nil {
 		out.M = make(map[string]AdminAttributeValue, len(v.M))
 		for k, e := range v.M {
 			out.M[k] = internalToAdminAttributeValue(e)
@@ -361,13 +366,13 @@ func adminToInternalAttributeValue(v AdminAttributeValue) attributeValue {
 		S: v.S, N: v.N, B: bytes.Clone(v.B), BOOL: v.BOOL, NULL: v.NULL,
 		SS: slices.Clone(v.SS), NS: slices.Clone(v.NS), BS: cloneBinarySet(v.BS),
 	}
-	if len(v.L) > 0 {
+	if v.L != nil {
 		out.L = make([]attributeValue, len(v.L))
 		for i, e := range v.L {
 			out.L[i] = adminToInternalAttributeValue(e)
 		}
 	}
-	if len(v.M) > 0 {
+	if v.M != nil {
 		out.M = make(map[string]attributeValue, len(v.M))
 		for k, e := range v.M {
 			out.M[k] = adminToInternalAttributeValue(e)
