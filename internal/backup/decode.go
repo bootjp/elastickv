@@ -51,6 +51,11 @@ type DecodeOptions struct {
 	// OutRoot itself — sharing would let S3Encoder.Finalize's
 	// os.RemoveAll wipe the final dump). Callers backing the CLI's
 	// --scratch-root flag override it (e.g. to a tmpfs).
+	//
+	// DecodeSnapshot returns ErrDecodeOptionsInvalid if ScratchRoot
+	// cleaned-equals OutRoot: a CLI misconfig that passes
+	// --scratch-root=$OUT_ROOT would otherwise be the silent
+	// data-loss path the default-target check is designed to prevent.
 	ScratchRoot string
 	// Adapters selects which adapter encoders to construct. Entries
 	// for disabled adapters are dropped silently and counted as
@@ -200,6 +205,18 @@ func newDispatcher(opts DecodeOptions) (*dispatcher, error) {
 			// dedicated `.scratch` subtree keeps the two trees
 			// disjoint regardless of where OutRoot points.
 			scratch = filepath.Join(opts.OutRoot, ".scratch")
+		}
+		// Belt-and-braces on the operator-supplied path: the
+		// default-path fix above only protects empty ScratchRoot;
+		// a CLI invocation that passes --scratch-root=$OUT explicitly
+		// would still let Finalize wipe the dump (Codex r3 P1 on
+		// PR #806). Fail fast on cleaned-equal paths so the
+		// misconfiguration surfaces as ErrDecodeOptionsInvalid
+		// rather than as silent data loss after a long decode.
+		if filepath.Clean(scratch) == filepath.Clean(opts.OutRoot) {
+			return nil, errors.Wrap(ErrDecodeOptionsInvalid,
+				"ScratchRoot must not equal OutRoot: S3Encoder.Finalize "+
+					"would os.RemoveAll the final <OutRoot>/s3/ tree")
 		}
 		d.s3 = NewS3Encoder(opts.OutRoot, scratch).
 			WithIncludeIncompleteUploads(opts.IncludeIncompleteUploads).

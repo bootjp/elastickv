@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,6 +20,37 @@ func TestDecodeSnapshot_RejectsEmptyOutRoot(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected ErrDecodeOptionsInvalid, got nil")
+	}
+}
+
+// TestDecodeSnapshot_RejectsScratchEqualsOutRoot pins Codex r3 P1
+// on PR #806: an explicit --scratch-root=$OUT misconfig would
+// still let S3Encoder.Finalize os.RemoveAll the final S3 tree
+// because the default-target check (empty → <OutRoot>/.scratch)
+// only fires when ScratchRoot is empty. Fail fast on cleaned-equal
+// paths so the misconfiguration surfaces as
+// ErrDecodeOptionsInvalid before any decode work happens.
+func TestDecodeSnapshot_RejectsScratchEqualsOutRoot(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	b := newSnapBuilder(0)
+	_, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot:     root,
+		ScratchRoot: root, // explicit equality — the silent-data-loss path
+		Adapters:    AdapterSet{S3: true},
+	})
+	if !errors.Is(err, ErrDecodeOptionsInvalid) {
+		t.Fatalf("expected ErrDecodeOptionsInvalid, got %v", err)
+	}
+	// Also reject when the two paths differ only by trailing slash
+	// / `./` noise — filepath.Clean normalises both.
+	_, err = DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot:     root,
+		ScratchRoot: root + "/./",
+		Adapters:    AdapterSet{S3: true},
+	})
+	if !errors.Is(err, ErrDecodeOptionsInvalid) {
+		t.Fatalf("expected ErrDecodeOptionsInvalid for noisy-equal path, got %v", err)
 	}
 }
 
