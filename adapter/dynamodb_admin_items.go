@@ -1,7 +1,9 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -115,6 +117,9 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 		return AdminScanResult{}, errors.Wrap(ErrAdminDynamoValidation,
 			"table requires a one-time legacy-key migration before admin read endpoints are available; migrate via the SigV4 surface first")
 	}
+	if err := validateAdminAttributeMapDepth(opts.ExclusiveStart); err != nil {
+		return AdminScanResult{}, err
+	}
 	limit := clampAdminScanLimit(opts.Limit)
 	scanInput := scanInput{
 		TableName:         tableName,
@@ -142,6 +147,9 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) (*AdminItem, bool, error) {
 	schema, readTS, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key))
 	if err != nil {
+		return nil, false, err
+	}
+	if err := validateAdminAttributeMapDepth(key); err != nil {
 		return nil, false, err
 	}
 	internalKey := adminToInternalAttributeMap(key)
@@ -214,6 +222,9 @@ func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrinci
 	if len(item.Attributes) == 0 {
 		return ErrAdminDynamoValidation
 	}
+	if err := validateAdminAttributeMapDepth(item.Attributes); err != nil {
+		return err
+	}
 	in := putItemInput{
 		TableName: tableName,
 		Item:      adminToInternalAttributeMap(item.Attributes),
@@ -238,6 +249,9 @@ func (d *DynamoDBServer) AdminDeleteItem(ctx context.Context, principal AdminPri
 	}
 	if len(key) == 0 {
 		return ErrAdminDynamoValidation
+	}
+	if err := validateAdminAttributeMapDepth(key); err != nil {
+		return err
 	}
 	in := deleteItemInput{
 		TableName: tableName,
@@ -318,8 +332,8 @@ func adminToInternalAttributeMap(in map[string]AdminAttributeValue) map[string]a
 
 func internalToAdminAttributeValue(v attributeValue) AdminAttributeValue {
 	out := AdminAttributeValue{
-		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
-		SS: v.SS, NS: v.NS, BS: v.BS,
+		S: v.S, N: v.N, B: bytes.Clone(v.B), BOOL: v.BOOL, NULL: v.NULL,
+		SS: slices.Clone(v.SS), NS: slices.Clone(v.NS), BS: cloneBinarySet(v.BS),
 	}
 	if len(v.L) > 0 {
 		out.L = make([]AdminAttributeValue, len(v.L))
@@ -338,8 +352,8 @@ func internalToAdminAttributeValue(v attributeValue) AdminAttributeValue {
 
 func adminToInternalAttributeValue(v AdminAttributeValue) attributeValue {
 	out := attributeValue{
-		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
-		SS: v.SS, NS: v.NS, BS: v.BS,
+		S: v.S, N: v.N, B: bytes.Clone(v.B), BOOL: v.BOOL, NULL: v.NULL,
+		SS: slices.Clone(v.SS), NS: slices.Clone(v.NS), BS: cloneBinarySet(v.BS),
 	}
 	if len(v.L) > 0 {
 		out.L = make([]attributeValue, len(v.L))
@@ -354,4 +368,37 @@ func adminToInternalAttributeValue(v AdminAttributeValue) attributeValue {
 		}
 	}
 	return out
+}
+
+// validateAdminAttributeMapDepth defensively bounds the nesting
+// depth of admin-supplied attribute maps to maxAttributeValueNestingDepth.
+// The internal wire parser enforces the same cap for SigV4 inputs,
+// but admin RPCs receive AdminAttributeValue from the (Phase 3) HTTP
+// JSON decoder which does not bound recursion depth. Returns
+// ErrAdminDynamoValidation if the input is deeper than 32 (gemini r1
+// security-high on PR #805).
+func validateAdminAttributeMapDepth(in map[string]AdminAttributeValue) error {
+	for _, v := range in {
+		if err := checkAdminAttributeDepth(v, 1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkAdminAttributeDepth(v AdminAttributeValue, depth int) error {
+	if depth > maxAttributeValueNestingDepth {
+		return errors.Wrap(ErrAdminDynamoValidation, "attribute value nested too deep")
+	}
+	for _, e := range v.L {
+		if err := checkAdminAttributeDepth(e, depth+1); err != nil {
+			return err
+		}
+	}
+	for _, e := range v.M {
+		if err := checkAdminAttributeDepth(e, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
 }

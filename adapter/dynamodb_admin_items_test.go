@@ -365,3 +365,62 @@ func TestAdminAttributeValue_NestedRoundTrip(t *testing.T) {
 	require.Equal(t, "7", *roundTripped.M["list"].L[1].N)
 	require.True(t, *roundTripped.M["list"].L[2].M["nested"].BOOL)
 }
+
+// TestDynamoDB_AdminPutItem_RejectsDeepNesting pins gemini r1
+// security-high: an admin-supplied AdminAttributeValue nested
+// deeper than maxAttributeValueNestingDepth (32) is rejected with
+// ErrAdminDynamoValidation before reaching the wire codec, so a
+// pathological JSON payload cannot exhaust resources.
+func TestDynamoDB_AdminPutItem_RejectsDeepNesting(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	createTableForItemTests(t, srv, "deep")
+
+	// Build a list nested one level deeper than the cap so the depth
+	// walker trips on the boundary attribute, not a side-effect.
+	leaf := AdminAttributeValue{S: func() *string { v := "x"; return &v }()}
+	cur := leaf
+	for range maxAttributeValueNestingDepth {
+		cur = AdminAttributeValue{L: []AdminAttributeValue{cur}}
+	}
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "deep",
+		AdminItem{Attributes: map[string]AdminAttributeValue{
+			"id":   stringAttr("k"),
+			"deep": cur,
+		}})
+	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
+		"want ErrAdminDynamoValidation for over-depth payload; got %v", err)
+}
+
+// TestAdminAttributeValue_DeepCopyIsolation pins gemini r1 medium:
+// the conversion functions deep-copy B / SS / NS / BS so mutating
+// the source after conversion does not leak into the converted
+// value (and vice-versa).
+func TestAdminAttributeValue_DeepCopyIsolation(t *testing.T) {
+	t.Parallel()
+	srcB := []byte{0x01, 0x02, 0x03}
+	srcSS := []string{"a", "b"}
+	srcBS := [][]byte{{0x10, 0x11}, {0x20, 0x21}}
+	admin := AdminAttributeValue{B: srcB, SS: srcSS, BS: srcBS}
+
+	internal := adminToInternalAttributeValue(admin)
+
+	// Mutating the source after conversion must NOT change internal.
+	srcB[0] = 0xff
+	srcSS[0] = "mutated"
+	srcBS[0][0] = 0xff
+	require.Equal(t, byte(0x01), internal.B[0], "B must be deep-copied")
+	require.Equal(t, "a", internal.SS[0], "SS must be deep-copied")
+	require.Equal(t, byte(0x10), internal.BS[0][0], "BS must be deep-copied")
+
+	// Reverse direction symmetry.
+	roundTrip := internalToAdminAttributeValue(internal)
+	internal.B[0] = 0xee
+	internal.SS[0] = "again"
+	internal.BS[0][0] = 0xee
+	require.Equal(t, byte(0x01), roundTrip.B[0], "B must be deep-copied on internal→admin")
+	require.Equal(t, "a", roundTrip.SS[0], "SS must be deep-copied on internal→admin")
+	require.Equal(t, byte(0x10), roundTrip.BS[0][0], "BS must be deep-copied on internal→admin")
+}
