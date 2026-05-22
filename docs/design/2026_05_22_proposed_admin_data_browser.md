@@ -68,7 +68,7 @@ type AdminItemKey struct {
 
 type AdminAttributeValue struct {
     Type  string // "S", "N", "B", "BOOL", "NULL", "L", "M", "SS", "NS", "BS"
-    Value any    // shape depends on Type; mirrors the DynamoDB wire shape
+    Value any    // recursive for "L" ([]AdminAttributeValue) and "M" (map[string]AdminAttributeValue); raw value for scalars
 }
 
 type AdminItem struct {
@@ -101,6 +101,8 @@ AdminDeleteItem(ctx, principal, tableName, key) error
 - Clamps Limit to `[1, adminItemScanMaxLimit=100]`
 - Returns the AdminAttributeValue-shaped items and the next cursor
 
+**Scan-response budget.** A single `Scan` call may return a `LastEvaluatedKey` before reaching `Limit` because DynamoDB's 1 MiB response cap fires (the engine inherits the same bound). The admin RPC does NOT loop internally to refill the page — partial pages are documented behaviour, and the SPA treats any non-nil `LastEvaluatedKey` as "more available" regardless of how full the current page is. Looping internally would multiply scan latency on tables with large items and pin the leader; the operator's "Next page" click is the cheap fix when a page comes back short.
+
 **Key encoding.** `AdminItemKey` on the wire is `{partition: AttrValue, sort: AttrValue|null}`. The HTTP `{key}` path segment carries a base64-url-encoded JSON of the same shape (single round-trip per key, no need to plumb composite-key URI encoding through the routing layer).
 
 #### 3.1.2 S3 object RPCs
@@ -109,6 +111,7 @@ AdminDeleteItem(ctx, principal, tableName, key) error
 type AdminObject struct {
     Key          string
     Size         int64
+    ContentType  string  // backend-stored Content-Type so the GET handler can set the header
     ETag         string
     LastModified time.Time
     StorageClass string
@@ -160,14 +163,16 @@ DynamoDB and S3 handlers extend the same 6-step routing procedure the SQS handle
 ```
 /admin/api/v1/dynamo/tables                              → list tables (existing)
 /admin/api/v1/dynamo/tables/{name}                       → describe / delete (existing)
-/admin/api/v1/dynamo/tables/{name}/items                 → scan / put (NEW)
+/admin/api/v1/dynamo/tables/{name}/items                 → scan (NEW)
 /admin/api/v1/dynamo/tables/{name}/items/{key}           → get / put / delete (NEW)
 
 /admin/api/v1/s3/buckets                                 → list buckets (existing)
 /admin/api/v1/s3/buckets/{name}                          → describe / delete (existing)
-/admin/api/v1/s3/buckets/{name}/objects                  → list / put (NEW)
+/admin/api/v1/s3/buckets/{name}/objects                  → list (NEW)
 /admin/api/v1/s3/buckets/{name}/objects/{key}            → get / put / delete (NEW)
 ```
+
+The `/items` and `/objects` collection roots accept only GET. Creating an item or uploading an object always names the key explicitly via `PUT /items/{key}` / `PUT /objects/{key}` — put-create-or-replace semantics match DynamoDB's PutItem and S3's PutObject directly, and there is no implicit-key allocator the admin path needs to invent. A collection-level POST was considered (Codex r1 flagged the earlier draft's inconsistency between the route summary and the body-shape table) but the put-by-key form keeps the wire surface smaller and avoids two ways to do the same thing.
 
 `{key}` is base64-url-encoded so arbitrary bytes (Dynamo item keys, S3 object keys with `/` or non-ASCII characters) traverse the path validator's `%`-ban without ambiguity.
 
@@ -176,20 +181,34 @@ DynamoDB and S3 handlers extend the same 6-step routing procedure the SQS handle
 | Endpoint | Method | Request body | Response body |
 |----------|--------|--------------|---------------|
 | `/dynamo/tables/{n}/items` | GET | — | `{items: AdminItem[], next_cursor?: string}` |
-| `/dynamo/tables/{n}/items` | POST | `{key, attributes}` (single item) | 204 |
 | `/dynamo/tables/{n}/items/{key}` | GET | — | `AdminItem` |
-| `/dynamo/tables/{n}/items/{key}` | PUT | `{attributes}` | 204 |
+| `/dynamo/tables/{n}/items/{key}` | PUT | `AdminItem` (flat `{attributes: {...}}` payload) | 204 |
 | `/dynamo/tables/{n}/items/{key}` | DELETE | — | 204 |
 | `/s3/buckets/{n}/objects` | GET | — | `{objects: AdminObject[], common_prefixes: string[], next_continuation_token?: string}` |
 | `/s3/buckets/{n}/objects/{key}` | GET | — | raw octet-stream + `Content-Type` + `Last-Modified` + `ETag` headers |
 | `/s3/buckets/{n}/objects/{key}` | PUT | raw octet-stream | 204 |
 | `/s3/buckets/{n}/objects/{key}` | DELETE | — | 204 |
 
-S3 GET responses stream the body directly (no JSON envelope, no base64 wrapper) so the browser can offer a Save-As dialog via `Content-Disposition: attachment`.
+DynamoDB PUT body matches the `AdminItem` shape directly (a flat `attributes` map). The `{key}` path segment supplies the primary key independently; the handler validates that the key segment's decoded attributes match the corresponding key attributes in the body so a client mis-typed key + body combination is rejected with `400 invalid_request` before the underlying PutItem runs.
 
-#### 3.3.3 Upload cap
+S3 GET responses stream the body directly (no JSON envelope, no base64 wrapper) so the browser can offer a Save-As dialog via `Content-Disposition: attachment; filename="..."`.
+
+**Security headers on S3 GET.** S3 objects can carry arbitrary bytes including HTML / SVG / JavaScript. Without active sandboxing, an operator clicking Download on a malicious HTML object would let the browser render attacker-supplied content in the admin origin — XSS. The GET handler defends in depth:
+
+- `X-Content-Type-Options: nosniff` — blocks MIME-sniffing escapes if the stored `Content-Type` is `text/plain` but the body is HTML.
+- `Content-Security-Policy: default-src 'none'; sandbox` — even if the browser decides to render the body, every active behaviour (scripts, forms, navigation, plugins) is blocked.
+- `Content-Disposition: attachment; filename="..."` — instructs the browser to download rather than render, with the original key as the filename.
+- `Cache-Control: no-store` — operator inspections must not leak into shared caches.
+
+Codex r1 / Gemini security-medium on PR #801 flagged the bare-stream version as XSS-prone; the defence-in-depth above closes the class.
+
+#### 3.3.3 Upload cap and Raft sizing
 
 S3 PutObject body is capped at `adminS3UploadMaxBytes = 100 MiB` (100 × 1024 × 1024 = 104857600 bytes). Enforced via `http.MaxBytesReader`. Exceeding the cap returns `413 Payload Too Large` with a structured `{"error": "payload_too_large", "message": "object exceeds 100 MiB admin upload cap"}` body. DynamoDB PutItem stays under DynamoDB's own item-size limit (400 KiB) so the JSON-body cap inherits the existing `BodyLimit` middleware (1 MiB).
+
+**Raft entry size is bounded by the existing chunked-write path.** Gemini r1 high-priority on PR #801 raised the concern that a 100 MiB body committed as a single Raft entry would block heartbeats / destabilise leader election / pressure memory. The admin path does NOT do that: `AdminPutObject` reuses the same chunked dispatch helper the SigV4 `PutObject` path uses (`adapter/s3.go` `s3ChunkSize = 1 MiB`, `s3ChunkBatchOps = 3` — see the long comment on lines 38–58 explaining the sizing). A 100 MiB upload commits ~33 Raft entries of ~3 MiB each, every entry strictly under the post-PR-#593 `MaxSizePerMsg = 4 MiB`. The SigV4 path already supports up to 5 GiB on the same chunked write; the admin path's 100 MiB cap is a deliberately conservative slice of that envelope for browser-driven uploads (most operator-driven uploads are config blobs / log fragments / DLQ exports under 10 MiB). Future raise to match the SigV4 5 GiB ceiling is one constant change away.
+
+The 100 MiB cap therefore expresses "what the admin UI deliberately exposes" rather than "what Raft can handle" — the latter is the SigV4 path's 5 GiB envelope.
 
 ### 3.4 SPA pages
 
@@ -241,7 +260,7 @@ Reads are bounded by Limit / MaxKeys, so a separate counter has low marginal val
 
 ## 4. Failure Modes
 
-1. **Concurrent writes.** Both backends already serialise writes through Raft; the admin RPCs use the same commit path. No new TOCTOU class.
+1. **Concurrent writes.** Both backends already serialise writes through Raft; the admin RPCs use the same commit path (chunked at `s3ChunkSize = 1 MiB` × `s3ChunkBatchOps = 3` for S3 large objects — see §3.3.3). No new TOCTOU class.
 2. **Large object download mid-stream.** If a follower loses leadership while streaming a 100 MiB Get, the connection is closed by the leader-step-down path. The operator's browser shows a partial download error; safest re-try is from scratch (the partial bytes have an unknown integrity boundary).
 3. **Truncated upload.** `http.MaxBytesReader` cuts the stream at the cap; the leader receives a partial body and returns 413 without committing. No state change.
 4. **DynamoDB item with binary attributes.** `B` / `BS` types arrive as base64 in the JSON wire shape (mirroring AWS); the admin RPC decodes lazily where needed.
