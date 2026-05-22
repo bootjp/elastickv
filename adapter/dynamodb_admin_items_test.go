@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"testing"
 
@@ -455,4 +456,58 @@ func TestAdminAttributeValue_EmptyContainersRoundTrip(t *testing.T) {
 	require.True(t, internalL.hasListType(), "internal L must be hasListType()=true after round-trip from empty admin L")
 	internalM := adminToInternalAttributeValue(emptyM)
 	require.True(t, internalM.hasMapType(), "internal M must be hasMapType()=true after round-trip from empty admin M")
+}
+
+// TestAdminAttributeValue_EmptyContainersJSONRoundTrip pins
+// claude-bot r4 low on PR #805: encoding/json `omitempty` drops
+// slices/maps of len 0 regardless of nil-ness, so the default
+// struct marshaler would have lost {"L": []} / {"M": {}} on the
+// Phase 3 HTTP wire even with the r4 fix preserving the Go-level
+// distinction. The custom MarshalJSON / UnmarshalJSON delegating
+// to the internal attributeValue's AWS-wire codec fixes this.
+func TestAdminAttributeValue_EmptyContainersJSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// Empty list serializes as {"L": []}, not {}.
+	emptyL := AdminAttributeValue{L: []AdminAttributeValue{}}
+	bL, err := json.Marshal(emptyL)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"L": []}`, string(bL), "empty L must serialize as {\"L\": []} not {}")
+
+	// Empty map serializes as {"M": {}}, not {}.
+	emptyM := AdminAttributeValue{M: map[string]AdminAttributeValue{}}
+	bM, err := json.Marshal(emptyM)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"M": {}}`, string(bM), "empty M must serialize as {\"M\": {}} not {}")
+
+	// And the unmarshal direction round-trips empty containers as non-nil.
+	var roundL AdminAttributeValue
+	require.NoError(t, json.Unmarshal(bL, &roundL))
+	require.NotNil(t, roundL.L, "unmarshal {\"L\": []} must yield non-nil empty L")
+	require.Len(t, roundL.L, 0)
+
+	var roundM AdminAttributeValue
+	require.NoError(t, json.Unmarshal(bM, &roundM))
+	require.NotNil(t, roundM.M, "unmarshal {\"M\": {}} must yield non-nil empty M")
+	require.Len(t, roundM.M, 0)
+}
+
+// TestAdminAttributeValue_JSONMarshalRejectsMultiField pins the
+// fail-closed contract the custom MarshalJSON inherits from the
+// internal attributeValue: an AdminAttributeValue with zero or
+// multiple kind fields set is malformed per the AWS wire and
+// surfaces as a marshal error rather than producing an invalid
+// wire payload the SDK would silently misinterpret.
+func TestAdminAttributeValue_JSONMarshalRejectsMultiField(t *testing.T) {
+	t.Parallel()
+
+	// Zero fields → invalid.
+	_, err := json.Marshal(AdminAttributeValue{})
+	require.Error(t, err, "zero-field AdminAttributeValue must fail to marshal")
+
+	// Two fields → invalid.
+	s := "x"
+	n := "1"
+	_, err = json.Marshal(AdminAttributeValue{S: &s, N: &n})
+	require.Error(t, err, "multi-field AdminAttributeValue must fail to marshal")
 }

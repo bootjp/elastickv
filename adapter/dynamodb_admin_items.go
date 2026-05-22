@@ -14,6 +14,11 @@ import (
 // scalar types (S/N/B/BOOL/NULL), exactly one populated set
 // (SS/NS/BS), or a recursive container (L, M). Wire-compatible with
 // every AWS SDK and the existing SigV4 path's internal type.
+//
+// Marshal / Unmarshal delegate to the internal attributeValue's
+// AWS-wire-compatible codec (see MarshalJSON / UnmarshalJSON
+// below) so the JSON struct tags here are decorative; they're
+// kept as documentation of the wire shape.
 type AdminAttributeValue struct {
 	S    *string                        `json:"S,omitempty"`
 	N    *string                        `json:"N,omitempty"`
@@ -25,6 +30,38 @@ type AdminAttributeValue struct {
 	BS   [][]byte                       `json:"BS,omitempty"`
 	L    []AdminAttributeValue          `json:"L,omitempty"`
 	M    map[string]AdminAttributeValue `json:"M,omitempty"`
+}
+
+// MarshalJSON / UnmarshalJSON delegate to the internal
+// attributeValue's AWS-wire codec via the conversion functions.
+// This is the only way to:
+//
+//  1. preserve empty-but-present L/M ({"L": []} / {"M": {}}) on
+//     the wire — encoding/json's `omitempty` tag drops slices/maps
+//     of len 0 regardless of nil-ness (claude-bot r4 low on PR #805);
+//  2. enforce the AWS-wire "exactly one field set per
+//     AttributeValue" invariant — the internal MarshalJSON returns
+//     `invalid attribute value` for zero/multi-field inputs, which
+//     catches malformed Phase 3 HTTP handler output at the boundary
+//     rather than letting the SDK silently misinterpret a fall-back
+//     `"L": null` tag.
+//
+// Caller audit: the only consumer of AdminAttributeValue's wire
+// representation is the (not-yet-existing) Phase 3 admin HTTP
+// bridge. The new fail-closed marshal error path is a Phase 3
+// boundary contract — Phase 2a's Go-level callers never marshal.
+func (a AdminAttributeValue) MarshalJSON() ([]byte, error) {
+	internal := adminToInternalAttributeValue(a)
+	return internal.MarshalJSON()
+}
+
+func (a *AdminAttributeValue) UnmarshalJSON(data []byte) error {
+	var internal attributeValue
+	if err := internal.UnmarshalJSON(data); err != nil {
+		return err
+	}
+	*a = internalToAdminAttributeValue(internal)
+	return nil
 }
 
 // AdminItem is the admin-facing projection of one DynamoDB item.
