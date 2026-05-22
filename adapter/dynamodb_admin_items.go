@@ -123,6 +123,30 @@ const (
 // after the retry / commit attempt.
 var ErrAdminDynamoNotFound = errors.New("dynamodb admin: target not found")
 
+// adminReadOnlyContextKeyType is the unexported tag type used to
+// stash a "this request is read-only admin; never trigger writes"
+// flag on the context. ensureLegacyTableMigration honours it by
+// returning ErrAdminDynamoValidation instead of triggering a
+// migration write (Codex r8 P2 on PR #805 closed the TOCTOU race
+// where the admin entry-point legacy check could miss a migration
+// that started after the check but before scanItems reached the
+// migration trigger).
+type adminReadOnlyContextKeyType struct{}
+
+var adminReadOnlyContextKey = adminReadOnlyContextKeyType{}
+
+func withAdminReadOnlyContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, adminReadOnlyContextKey, true)
+}
+
+func isAdminReadOnlyContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(adminReadOnlyContextKey).(bool)
+	return v
+}
+
 // ErrAdminDynamoValidation is returned when an admin entrypoint
 // receives a structurally-bad request (missing key, malformed
 // attribute, blank table name).
@@ -183,7 +207,16 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 		ExclusiveStartKey: adminToInternalAttributeMap(opts.ExclusiveStart),
 		Limit:             &limit,
 	}
-	out, err := d.scanItems(ctx, scanInput)
+	// Tag context as read-only so scanItems' internal
+	// prepareReadSchema → ensureLegacyTableMigration call refuses
+	// to trigger Raft writes if the schema transitioned to
+	// needs-migration between the entry-point check above and the
+	// migration-trigger code path (Codex r8 P2 on PR #805). The
+	// earlier needsLegacyKeyMigration check stays as the fast
+	// happy-path rejection; this context tag closes the TOCTOU
+	// window where concurrent migration start could otherwise
+	// race an admin scan into the write path.
+	out, err := d.scanItems(withAdminReadOnlyContext(ctx), scanInput)
 	if err != nil {
 		return AdminScanResult{}, translateDynamoAdminError(err)
 	}
