@@ -1116,6 +1116,86 @@ const (
 	cutoverBootstrapRaftDEKID    uint32 = 8
 )
 
+// TestApplyRotation_EnableStorageEnvelope_RegistrationBeforeSidecar
+// pins the crash-recovery ordering invariant in
+// applyEnableStorageEnvelope (gemini-code-assist medium #1 on
+// PR804): the ProposerRegistration insert MUST happen BEFORE the
+// sidecar flip, so a crash between the two on-disk operations
+// leaves the cluster in a state from which FSM replay can recover
+// cleanly. The reverse ordering would leave StorageEnvelopeActive
+// = true with the registry row missing — the §5.2 startup guard
+// would then refuse boot, and a replay would short-circuit on the
+// already-active no-op and never insert the row.
+//
+// The test injects a failing SetRegistryRow on the cutover's
+// registry call and asserts:
+//
+//   - The apply call returns an error (so the FSM halts and the
+//     entry is not consumed without consequence).
+//   - The sidecar's StorageEnvelopeActive stays false (no
+//     premature flip).
+//   - The sidecar's StorageEnvelopeCutoverIndex stays 0.
+//
+// The replay-still-works property (registration insert is
+// idempotent via §4.1 case 2-idempotent) is already covered by
+// TestApplyRegistration_Case2_Idempotent and is not re-asserted
+// here.
+func TestApplyRotation_EnableStorageEnvelope_RegistrationBeforeSidecar(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: cutoverBootstrapStorageDEKID, WrappedStorage: []byte("s"),
+		RaftDEKID: cutoverBootstrapRaftDEKID, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: cutoverBootstrapStorageDEKID, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	// Inject a registry SetRegistryRow failure on the next call.
+	// The cutover would otherwise hit §4.1 case 2 (monotonic
+	// advance from epoch 0 → 1), so the insert reaches the
+	// (failing) SetRegistryRow.
+	reg.setEr = errors.New("simulated registry failure mid-apply")
+	err = app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:   cutoverBootstrapStorageDEKID,
+		Purpose: fsmwire.PurposeStorage,
+		Wrapped: []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID: cutoverBootstrapStorageDEKID, FullNodeID: 0xAAAA, LocalEpoch: 1,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error from injected registry failure, got nil")
+	}
+	// Sidecar must NOT show a pre-flipped cutover state — if it
+	// did, the §5.2 startup guard would refuse boot on restart,
+	// and replay would short-circuit on already-active.
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.StorageEnvelopeActive {
+		t.Error("StorageEnvelopeActive flipped despite registration failure (ordering regression)")
+	}
+	if sc.StorageEnvelopeCutoverIndex != 0 {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d despite registration failure, want 0",
+			sc.StorageEnvelopeCutoverIndex)
+	}
+}
+
 // bootstrappedDir constructs a temp dir + sidecar path with an
 // Applier-bootstrapped sidecar at
 // (cutoverBootstrapStorageDEKID, cutoverBootstrapRaftDEKID).

@@ -17,15 +17,31 @@ import (
 // the unwrapped DEK never appears on disk regardless.
 const sidecarFileMode = 0o600
 
-// SidecarVersion is the wire version of the on-disk sidecar JSON.
+// SidecarVersion is the current wire version written by
+// WriteSidecar. Versions 1 (pre-6D-4) and 2 (6D-4 and later) are
+// readable. Future versions extend the layout via additive JSON
+// fields plus a bump here; mismatched versions are rejected at
+// read time so an older binary cannot silently drop fields it
+// does not understand.
 //
-// Version 1 carries the §5.1 layout (active, keys, raft_applied_index,
-// storage_envelope_active, storage_envelope_cutover_index,
-// raft_envelope_cutover_index). Future versions extend the layout via
-// additive JSON fields plus a bump here; mismatched versions are
-// rejected at read time so an older binary cannot silently drop fields
-// it does not understand.
-const SidecarVersion = 1
+// Version 2 adds storage_envelope_cutover_index (6D-4 §6.4). The
+// upgrade path is automatic: a post-6D-4 binary reads a version-1
+// sidecar with the new field defaulting to 0, then writes
+// version 2 on the next sidecar mutation (WriteSidecar overrides
+// the in-struct Version with SidecarVersion). A subsequent
+// downgrade to a pre-6D-4 binary then refuses to boot because
+// that binary only accepts version 1 — preventing the silent
+// field-drop that the design doc §6.4 warns about (gemini
+// medium #2 on PR804).
+const SidecarVersion = 2
+
+// MinReadableSidecarVersion is the oldest wire version ReadSidecar
+// accepts. Set to 1 so a freshly-upgraded post-6D-4 node can read
+// the legacy pre-6D-4 sidecar that an in-place upgrade leaves on
+// disk; the very next WriteSidecar transitions it to
+// SidecarVersion. A future major version bump would raise this
+// constant to drop legacy-read support.
+const MinReadableSidecarVersion = 1
 
 // SidecarFilename is the standard filename inside <dataDir>/encryption/.
 const SidecarFilename = "keys.json"
@@ -134,9 +150,10 @@ func ReadSidecar(path string) (*Sidecar, error) {
 	if err := json.Unmarshal(raw, &sc); err != nil {
 		return nil, pkgerrors.Wrapf(err, "encryption: parse sidecar %q", path)
 	}
-	if sc.Version != SidecarVersion {
+	if sc.Version < MinReadableSidecarVersion || sc.Version > SidecarVersion {
 		return nil, pkgerrors.Wrapf(ErrSidecarVersion,
-			"got version %d, want %d (path=%q)", sc.Version, SidecarVersion, path)
+			"got version %d, want %d..%d (path=%q)",
+			sc.Version, MinReadableSidecarVersion, SidecarVersion, path)
 	}
 	if err := validateSidecar(&sc); err != nil {
 		return nil, pkgerrors.Wrapf(err, "encryption: validate sidecar %q", path)

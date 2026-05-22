@@ -726,17 +726,42 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 		}
 		return nil
 	}
-	// Fresh successful apply — §6.4 atomicity demands the
-	// active-flip, the cutover-index, AND the RaftAppliedIndex bump
-	// land inside one WriteSidecar fsync.
+	// Fresh successful apply.
+	//
+	// Crash-recovery ordering: ApplyRegistration runs BEFORE
+	// WriteSidecar. The cutover sidecar flip is the LAST observable
+	// side effect of the apply. If the process crashes between the
+	// registration insert and the sidecar write, on restart:
+	//
+	//   - The sidecar is still pre-cutover
+	//     (StorageEnvelopeActive == false), so FSM replay re-enters
+	//     this fresh-success branch rather than short-circuiting
+	//     on the §2.1 #4 already-active no-op above.
+	//   - ApplyRegistration re-runs with the same
+	//     (DEKID, FullNodeID, LocalEpoch) and hits the §4.1
+	//     case 2-idempotent path, returning nil without mutating
+	//     the row.
+	//   - WriteSidecar then lands cleanly.
+	//
+	// The reverse ordering (sidecar write first) would leave the
+	// cluster in a state where StorageEnvelopeActive == true but
+	// the proposer's writer-registry row is missing — the §5.2
+	// startup guard would refuse boot, and FSM replay would
+	// short-circuit on already-active and skip the registry insert
+	// permanently. This was gemini-code-assist medium #1 on PR804.
+	//
+	// §6.4 atomicity still holds for the three sidecar fields:
+	// `StorageEnvelopeActive`, `StorageEnvelopeCutoverIndex`, and
+	// the `RaftAppliedIndex` bump all land inside one WriteSidecar
+	// fsync.
+	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
+		return errors.Wrap(err, "applier: cutover proposer-registration insert")
+	}
 	sc.StorageEnvelopeActive = true
 	sc.StorageEnvelopeCutoverIndex = raftIdx
 	advanceRaftAppliedIndex(sc, raftIdx)
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for cutover")
-	}
-	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
-		return errors.Wrap(err, "applier: cutover proposer-registration insert")
 	}
 	return nil
 }
