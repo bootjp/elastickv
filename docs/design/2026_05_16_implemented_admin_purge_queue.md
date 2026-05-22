@@ -1,8 +1,24 @@
 # Admin Queue Peek and Purge (DLQ-Aware) for the SQS Web Console
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-05-16
+
+## Implementation history
+
+| Phase | PR | Landed |
+|-------|-----|--------|
+| 1 (this doc, proposal) | #757 | 2026-05-16 |
+| 2 (`AdminPurgeQueue` + `IsDLQ`/`DLQSources`) | #771 | 2026-05-17 |
+| 3 (`AdminPeekQueue` backend) | #794 | 2026-05-20 |
+| 4 (HTTP handler + bridge) | #797 | 2026-05-21 |
+| 5 (SPA Messages tab + Purge button + DLQ chips) | #798 | 2026-05-21 |
+
+Out-of-scope follow-ups (tracked separately, not gating this rename):
+- Throttle integration (`bucketActionAdminPeek` + dedicated per-queue admin-peek bucket per §3.1)
+- Audit logging + Prometheus counters per §3.6
+- `principalForReadSensitive` live `RoleStore` re-check (Goal 8, blocked on wider RoleStore plumbing)
+- Page-size selector (20 / 50 / 100) + response-size warning
 
 ---
 
