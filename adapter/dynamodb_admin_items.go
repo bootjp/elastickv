@@ -43,8 +43,8 @@ type AdminItemKey struct {
 // scan output: the bounded items page plus a continuation key (nil
 // when the scan has drained for the current MVCC snapshot).
 type AdminScanResult struct {
-	Items            []AdminItem
-	LastEvaluatedKey map[string]AdminAttributeValue
+	Items            []AdminItem                    `json:"items"`
+	LastEvaluatedKey map[string]AdminAttributeValue `json:"last_evaluated_key,omitempty"`
 }
 
 // AdminScanOptions controls one AdminScanTable call. Defaults
@@ -53,8 +53,8 @@ type AdminScanResult struct {
 //	Limit = 25 (clamped to [1, adminItemScanMaxLimit=100])
 //	StartKey = nil (front of the table)
 type AdminScanOptions struct {
-	Limit          int
-	ExclusiveStart map[string]AdminAttributeValue
+	Limit          int                            `json:"limit,omitempty"`
+	ExclusiveStart map[string]AdminAttributeValue `json:"exclusive_start,omitempty"`
 }
 
 const (
@@ -237,6 +237,12 @@ func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrinci
 
 // AdminDeleteItem removes one item by primary key. Write role
 // required.
+//
+// Sentinels:
+//   - ErrAdminForbidden        — principal lacks write role
+//   - ErrAdminNotLeader        — follower
+//   - ErrAdminDynamoNotFound   — table absent
+//   - ErrAdminDynamoValidation — empty / malformed input
 func (d *DynamoDBServer) AdminDeleteItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
