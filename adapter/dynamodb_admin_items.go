@@ -95,6 +95,26 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 	if strings.TrimSpace(tableName) == "" {
 		return AdminScanResult{}, ErrAdminDynamoValidation
 	}
+	// Refuse on legacy tables BEFORE delegating to scanItems. The
+	// SigV4 scan path calls ensureLegacyTableMigration as part of
+	// prepareReadSchema, which dispatches Raft writes to migrate the
+	// schema in-place. Letting a read-only admin trigger that path
+	// would (a) violate the read-only authorization contract and (b)
+	// generate write load on every dashboard poll until the migration
+	// finishes (Codex r1 P1 on PR #805). Operators migrate the table
+	// via the SigV4 surface before admin reads become available.
+	readTS := d.nextTxnReadTS()
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
+	if err != nil {
+		return AdminScanResult{}, errors.WithStack(err)
+	}
+	if !exists {
+		return AdminScanResult{}, ErrAdminDynamoNotFound
+	}
+	if schema.needsLegacyKeyMigration() {
+		return AdminScanResult{}, errors.Wrap(ErrAdminDynamoValidation,
+			"table requires a one-time legacy-key migration before admin read endpoints are available; migrate via the SigV4 surface first")
+	}
 	limit := clampAdminScanLimit(opts.Limit)
 	scanInput := scanInput{
 		TableName:         tableName,
@@ -120,27 +140,18 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 //   - ErrAdminDynamoNotFound — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
 func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) (*AdminItem, bool, error) {
-	if !principal.Role.canRead() {
-		return nil, false, ErrAdminForbidden
-	}
-	if !isVerifiedDynamoLeader(ctx, d.coordinator) {
-		return nil, false, ErrAdminNotLeader
-	}
-	if strings.TrimSpace(tableName) == "" {
-		return nil, false, ErrAdminDynamoValidation
-	}
-	if len(key) == 0 {
-		return nil, false, ErrAdminDynamoValidation
-	}
-	readTS := d.nextTxnReadTS()
-	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
+	schema, readTS, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key))
 	if err != nil {
-		return nil, false, errors.WithStack(err)
-	}
-	if !exists {
-		return nil, false, ErrAdminDynamoNotFound
+		return nil, false, err
 	}
 	internalKey := adminToInternalAttributeMap(key)
+	// Validate the key shape against the schema BEFORE the read so a
+	// malformed input (missing hash key, wrong type) surfaces as
+	// ErrAdminDynamoValidation rather than the plain errors.New chain
+	// readLogicalItemAt would otherwise return (Codex r1 P2).
+	if _, err := schema.itemKeyFromAttributes(internalKey); err != nil {
+		return nil, false, errors.Wrap(ErrAdminDynamoValidation, err.Error())
+	}
 	current, found, err := d.readLogicalItemAt(ctx, schema, internalKey, readTS)
 	if err != nil {
 		return nil, false, translateDynamoAdminError(err)
@@ -149,6 +160,38 @@ func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrinci
 		return nil, false, nil
 	}
 	return &AdminItem{Attributes: internalToAdminAttributeMap(current.item)}, true, nil
+}
+
+// adminLoadReadableSchema centralises the read-path preamble for
+// AdminGetItem: gate the principal, verify leader, validate the
+// table-name + non-empty key, load the schema, and refuse on
+// legacy-migration-needed tables. Returns the loaded schema + the
+// readTS the caller should reuse so the subsequent item read sees
+// the same MVCC snapshot. keyAttrs is len(key) so the helper can
+// short-circuit on an empty key.
+func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal AdminPrincipal, tableName string, keyAttrs int) (*dynamoTableSchema, uint64, error) {
+	if !principal.Role.canRead() {
+		return nil, 0, ErrAdminForbidden
+	}
+	if !isVerifiedDynamoLeader(ctx, d.coordinator) {
+		return nil, 0, ErrAdminNotLeader
+	}
+	if strings.TrimSpace(tableName) == "" || keyAttrs == 0 {
+		return nil, 0, ErrAdminDynamoValidation
+	}
+	readTS := d.nextTxnReadTS()
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	if !exists {
+		return nil, 0, ErrAdminDynamoNotFound
+	}
+	if schema.needsLegacyKeyMigration() {
+		return nil, 0, errors.Wrap(ErrAdminDynamoValidation,
+			"table requires a one-time legacy-key migration before admin read endpoints are available; migrate via the SigV4 surface first")
+	}
+	return schema, readTS, nil
 }
 
 // AdminPutItem creates-or-replaces one item. Write role required.
@@ -236,12 +279,11 @@ func translateDynamoAdminError(err error) error {
 }
 
 // adminItemsFromInternal converts a slice of internal item rows
-// (the scanItems output) into the admin-facing AdminItem slice. Nil
-// in, nil out so callers see the contract directly.
+// (the scanItems output) into the admin-facing AdminItem slice.
+// Empty in produces an empty (non-nil) slice so the JSON encoder
+// emits "items": [] rather than "items": null — the SPA's
+// items.map(...) call would otherwise crash on null (Claude r1 low).
 func adminItemsFromInternal(items []map[string]attributeValue) []AdminItem {
-	if len(items) == 0 {
-		return nil
-	}
 	out := make([]AdminItem, len(items))
 	for i, item := range items {
 		out[i] = AdminItem{Attributes: internalToAdminAttributeMap(item)}

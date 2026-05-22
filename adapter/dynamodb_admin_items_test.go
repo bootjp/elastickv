@@ -280,6 +280,70 @@ func TestClampAdminScanLimit(t *testing.T) {
 	}
 }
 
+// TestDynamoDB_AdminScanTable_EmptyTableReturnsEmptySlice pins
+// Claude r1 low: a freshly-created empty table must surface as
+// "items": [] on the wire (not "items": null) so the SPA's
+// items.map() call does not crash.
+func TestDynamoDB_AdminScanTable_EmptyTableReturnsEmptySlice(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	createTableForItemTests(t, srv, "empty")
+
+	res, err := srv.AdminScanTable(context.Background(), fullAdminPrincipal, "empty", AdminScanOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, res.Items, "empty-table scan must return [] not nil so JSON emits [] not null")
+	require.Len(t, res.Items, 0)
+}
+
+// TestDynamoDB_AdminPutItem_MissingTable confirms the write path
+// surfaces ErrAdminDynamoNotFound — the test was missing in r1
+// (Claude bot finding 3).
+func TestDynamoDB_AdminPutItem_MissingTable(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "ghost",
+		AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("x")}})
+	require.True(t, errors.Is(err, ErrAdminDynamoNotFound),
+		"want ErrAdminDynamoNotFound; got %v", err)
+}
+
+// TestDynamoDB_AdminDeleteItem_MissingTable mirrors the put-side test.
+func TestDynamoDB_AdminDeleteItem_MissingTable(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+
+	err := srv.AdminDeleteItem(context.Background(), fullAdminPrincipal, "ghost",
+		map[string]AdminAttributeValue{"id": stringAttr("x")})
+	require.True(t, errors.Is(err, ErrAdminDynamoNotFound),
+		"want ErrAdminDynamoNotFound; got %v", err)
+}
+
+// TestDynamoDB_AdminGetItem_MalformedKey pins Codex r1 P2: a key
+// that fails schema validation (e.g. wrong attribute name) must
+// surface as ErrAdminDynamoValidation rather than an opaque error
+// the admin handler would render as 500.
+func TestDynamoDB_AdminGetItem_MalformedKey(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	ctx := context.Background()
+	createTableForItemTests(t, srv, "malformed")
+
+	// Wrong attribute name: schema expects "id" (string), but we pass "wrongkey".
+	_, _, err := srv.AdminGetItem(ctx, fullAdminPrincipal, "malformed",
+		map[string]AdminAttributeValue{"wrongkey": stringAttr("x")})
+	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
+		"want ErrAdminDynamoValidation for wrong key shape; got %v", err)
+}
+
 // TestAdminAttributeValue_NestedRoundTrip pins the recursive L / M
 // conversion: a deeply nested admin value round-trips through the
 // internal type without losing any field.
