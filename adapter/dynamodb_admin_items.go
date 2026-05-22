@@ -52,6 +52,22 @@ type AdminAttributeValue struct {
 // bridge. The new fail-closed marshal error path is a Phase 3
 // boundary contract — Phase 2a's Go-level callers never marshal.
 func (a AdminAttributeValue) MarshalJSON() ([]byte, error) {
+	// Validate depth + kind shape (exactly-one + NULL-must-be-true)
+	// before forwarding. Without the kind check,
+	// AdminAttributeValue{NULL:&false} would marshal as {"NULL": true}
+	// — the internal MarshalJSON detects the NULL kind by nil-ness
+	// and always emits true, silently rewriting the caller's input
+	// (Codex r7 P2 on PR #805). The depth check guards against
+	// stack overflow on a deeply-nested Go-constructed value: the
+	// four RPC entry points run validateAdminAttributeMapDepth
+	// first, but a direct json.Marshal call (e.g. a future admin
+	// response builder) does not get that protection by default.
+	if err := checkAdminAttributeDepth(a, 1); err != nil {
+		return nil, err
+	}
+	if err := checkAdminAttributeKind(a); err != nil {
+		return nil, err
+	}
 	internal := adminToInternalAttributeValue(a)
 	return internal.MarshalJSON()
 }

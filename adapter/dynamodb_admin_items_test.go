@@ -510,6 +510,20 @@ func TestAdminAttributeValue_JSONMarshalRejectsMultiField(t *testing.T) {
 	n := "1"
 	_, err = json.Marshal(AdminAttributeValue{S: &s, N: &n})
 	require.Error(t, err, "multi-field AdminAttributeValue must fail to marshal")
+
+	// NULL=false at the marshal boundary → ErrAdminDynamoValidation
+	// (Codex r7 P2): without the marshal-side guard, internal's
+	// MarshalJSON would silently rewrite NULL=&false as {"NULL":true}.
+	falseVal := false
+	_, err = json.Marshal(AdminAttributeValue{NULL: &falseVal})
+	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
+		"NULL=false must surface as ErrAdminDynamoValidation from MarshalJSON; got %v", err)
+
+	// NULL=true (valid) round-trips through MarshalJSON.
+	trueVal := true
+	out, err := json.Marshal(AdminAttributeValue{NULL: &trueVal})
+	require.NoError(t, err, "NULL=true must marshal")
+	require.JSONEq(t, `{"NULL": true}`, string(out))
 }
 
 // TestDynamoDB_AdminPutItem_RejectsZeroFieldAttribute pins Codex
