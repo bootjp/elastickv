@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper) shipped; 6D-4, 6D-5, 6D-6 remain |
+| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch) shipped; 6D-5, 6D-6 remain |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -21,12 +21,19 @@
   `CapabilityFanoutResult` to disambiguate from the unrelated
   `admin.FanoutResult` already shipped in `keyviz_fanout.go`; the
   contract is otherwise unchanged.
+- **6D-4** (cutover wire + apply dispatch) —
+  `RotateSubEnableStorageEnvelope = 0x04` constant
+  (`internal/encryption/fsmwire/wire.go`), two-site whitelist
+  (`readRotationSubTag` decoder + `ApplyRotation` switch in
+  `internal/encryption/applier.go`), `StorageEnvelopeCutoverIndex`
+  sidecar field, and the apply-path semantics per §2.1 / §6.4:
+  malformed entries halt via `ErrEncryptionApply`, stale-DEKID and
+  already-active outcomes are benign no-ops that advance
+  `RaftAppliedIndex` without halting. Operator-inert until 6D-5
+  wires the §6.2 storage-layer toggle.
 
 ## Open milestones
 
-- **6D-4** — `RotateSubEnableStorageEnvelope = 0x04` wire-format
-  addition + FSM apply-path dispatch + `StorageEnvelopeCutoverIndex`
-  sidecar field.
 - **6D-5** — §6.2 storage-layer toggle (`PutAt` consults
   `StorageEnvelopeActive`).
 - **6D-6** — `EnableStorageEnvelope` admin RPC + CLI command +

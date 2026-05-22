@@ -99,13 +99,22 @@ const (
 	// update. Ships in Stage 4. See §5.2.
 	RotateSubRotateDEK byte = 0x01
 
+	// RotateSubEnableStorageEnvelope is the one-shot storage-layer
+	// cutover (§2.2 / §7.1 Phase 1). Ships in Stage 6D. The wire
+	// shape reuses the rotate-dek triple but with `Wrapped` empty
+	// (`len(Wrapped) == 0`) and `DEKID == sidecar.Active.Storage`;
+	// the applier re-validates both at apply time. The byte value
+	// `0x04` matches the original `0x02..0x0F` reservation block
+	// so older binaries that pre-date Stage 6D continue to halt on
+	// the existing "unknown sub-tag" branch.
+	RotateSubEnableStorageEnvelope byte = 0x04
+
 	// Reserved for later stages; declared here so the byte space
 	// is contiguous and a future commit cannot silently re-use
 	// 0x02..0x0F without an audit:
 	//
 	//   0x02 — rewrap-deks       (Stage 9, §5.4 / §5.5)
 	//   0x03 — retire-dek        (Stage 9, §5.4)
-	//   0x04 — enable-storage-envelope (Stage 6, §7.1 Phase 1)
 	//   0x05 — enable-raft-envelope    (Stage 6, §7.1 Phase 2)
 )
 
@@ -168,8 +177,8 @@ type BootstrapPayload struct {
 }
 
 // RotationPayload is the OpRotation body. SubTag selects between
-// rotate-dek / rewrap / enable-flag variants; Stage 4 ships only
-// RotateSubRotateDEK.
+// rotate-dek / rewrap / enable-flag variants. Stage 4 ships
+// RotateSubRotateDEK; Stage 6D adds RotateSubEnableStorageEnvelope.
 //
 // For RotateSubRotateDEK the payload is:
 //   - DEKID: the new key id being installed
@@ -179,6 +188,18 @@ type BootstrapPayload struct {
 //     row, inserted in the same FSM apply transaction so the
 //     proposer's first encrypted write under the new DEK is
 //     covered by the §4.1 case 2 epoch monotonicity check.
+//
+// For RotateSubEnableStorageEnvelope the payload reuses the same
+// triple but with stricter constraints (validated in both the
+// cutover RPC mutator on the propose side and `ApplyRotation` on
+// the apply side, per the 6D design's §2.1):
+//   - DEKID: MUST equal sidecar.Active.Storage at apply time
+//   - Purpose: MUST be PurposeStorage
+//   - Wrapped: MUST be empty (`len(Wrapped) == 0`, NOT nil — the
+//     wire decoder materialises zero-length payloads as an
+//     allocated empty slice)
+//   - ProposerRegistration: covers the proposer's first write
+//     under the now-active envelope
 type RotationPayload struct {
 	SubTag               byte
 	DEKID                uint32
@@ -488,18 +509,25 @@ func DecodeRotation(raw []byte) (RotationPayload, error) {
 }
 
 // readRotationSubTag consumes the 1-byte rotation sub-tag and
-// validates it against the known set. Stage 4 ships only
-// RotateSubRotateDEK; later stages (rewrap, retire, enable-flag)
-// will whitelist new values.
+// validates it against the known set. Stage 4 ships
+// RotateSubRotateDEK; Stage 6D adds RotateSubEnableStorageEnvelope.
+// Future stages (rewrap, retire, enable-raft-envelope) will
+// whitelist additional values here AND add a matching dispatch
+// branch in `internal/encryption/applier.go::ApplyRotation` —
+// updating only one site silently regresses the other (see the
+// §2.2 "Two-site whitelist change required" note in the 6D
+// design doc).
 func readRotationSubTag(r *reader) (byte, error) {
 	sub, ok := r.readByte()
 	if !ok {
 		return 0, errors.Wrap(ErrFSMWireMalformed, "rotation: missing sub-tag")
 	}
-	if sub != RotateSubRotateDEK {
+	switch sub {
+	case RotateSubRotateDEK, RotateSubEnableStorageEnvelope:
+		return sub, nil
+	default:
 		return 0, errors.Wrapf(ErrFSMWireSubtag, "rotation: subtag=%#x", sub)
 	}
-	return sub, nil
 }
 
 // readRotationBody decodes the (dek_id, purpose, wrapped) triple

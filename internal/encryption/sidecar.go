@@ -20,10 +20,11 @@ const sidecarFileMode = 0o600
 // SidecarVersion is the wire version of the on-disk sidecar JSON.
 //
 // Version 1 carries the §5.1 layout (active, keys, raft_applied_index,
-// storage_envelope_active, raft_envelope_cutover_index). Future versions
-// extend the layout via additive JSON fields plus a bump here; mismatched
-// versions are rejected at read time so an older binary cannot silently
-// drop fields it does not understand.
+// storage_envelope_active, storage_envelope_cutover_index,
+// raft_envelope_cutover_index). Future versions extend the layout via
+// additive JSON fields plus a bump here; mismatched versions are
+// rejected at read time so an older binary cannot silently drop fields
+// it does not understand.
 const SidecarVersion = 1
 
 // SidecarFilename is the standard filename inside <dataDir>/encryption/.
@@ -47,11 +48,25 @@ const (
 // are omitted; they will be added as additive fields when the relevant
 // stage ships.
 type Sidecar struct {
-	Version                  int        `json:"version"`
-	RaftAppliedIndex         uint64     `json:"raft_applied_index"`
-	StorageEnvelopeActive    bool       `json:"storage_envelope_active"`
-	RaftEnvelopeCutoverIndex uint64     `json:"raft_envelope_cutover_index"`
-	Active                   ActiveKeys `json:"active"`
+	Version          int    `json:"version"`
+	RaftAppliedIndex uint64 `json:"raft_applied_index"`
+	// StorageEnvelopeActive flips to true exactly once, when the
+	// `RotateSubEnableStorageEnvelope` (§2.2 / §7) cutover entry
+	// applies. Pre-cutover storage Puts write cleartext; post-cutover
+	// Puts wrap values in the §4.1 envelope. The flip and the
+	// cutover index below are written inside a single
+	// crash-durable `WriteSidecar` fsync (§6.4 atomicity).
+	StorageEnvelopeActive bool `json:"storage_envelope_active"`
+	// StorageEnvelopeCutoverIndex is the Raft index at which the
+	// cutover entry applied. Set once by the first cutover apply
+	// (§6.4) and never overwritten by later encryption entries; the
+	// §3.2 idempotent-retry RPC path uses it as a stable
+	// applied_index across arbitrary subsequent Raft activity. A
+	// zero value with `StorageEnvelopeActive == false` is the
+	// pre-cutover baseline.
+	StorageEnvelopeCutoverIndex uint64     `json:"storage_envelope_cutover_index"`
+	RaftEnvelopeCutoverIndex    uint64     `json:"raft_envelope_cutover_index"`
+	Active                      ActiveKeys `json:"active"`
 	// Keys is keyed by the decimal string form of key_id (per §5.1's
 	// "JSON object keys must be strings, but the on-disk envelope and
 	// the in-memory keystore always work in the binary uint32 form").

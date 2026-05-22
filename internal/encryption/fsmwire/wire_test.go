@@ -256,11 +256,71 @@ func TestRotation_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestRotation_EnableStorageEnvelope_RoundTrip pins the Stage 6D
+// wire shape for the cutover sub-tag: empty Wrapped, Purpose
+// PurposeStorage, ProposerRegistration covering the active
+// storage DEK. A regression that re-marshalled the Wrapped slice
+// as `nil` instead of `[]byte{}` would still round-trip here (the
+// applier's length-based check is the canonical guard), but a
+// regression that lost the sub-tag byte or trimmed any field
+// would surface as a header / length mismatch.
+func TestRotation_EnableStorageEnvelope_RoundTrip(t *testing.T) {
+	t.Parallel()
+	want := fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:   0xCAFEBABE,
+		Purpose: fsmwire.PurposeStorage,
+		Wrapped: []byte{}, // §2.1 constraint #2
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID:      0xCAFEBABE,
+			FullNodeID: 0xDEADBEEFCAFEBABE,
+			LocalEpoch: 9,
+		},
+	}
+	got, err := fsmwire.DecodeRotation(fsmwire.EncodeRotation(want))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.SubTag != want.SubTag {
+		t.Fatalf("sub-tag mismatch: got %#x want %#x", got.SubTag, want.SubTag)
+	}
+	if got.DEKID != want.DEKID || got.Purpose != want.Purpose {
+		t.Fatalf("header mismatch: got %+v", got)
+	}
+	if len(got.Wrapped) != 0 {
+		t.Fatalf("expected empty Wrapped, got %d bytes", len(got.Wrapped))
+	}
+	if got.ProposerRegistration != want.ProposerRegistration {
+		t.Fatalf("proposer reg mismatch: got %+v want %+v", got.ProposerRegistration, want.ProposerRegistration)
+	}
+}
+
+// TestRotation_SubTagConstantPinned guards against a future commit
+// silently shifting the byte value for the cutover sub-tag — that
+// would break rolling-upgrade compatibility, since old binaries
+// would route the cutover entry through the rotate-dek path (or
+// halt on an unknown sub-tag depending on the byte chosen).
+func TestRotation_SubTagConstantPinned(t *testing.T) {
+	t.Parallel()
+	if fsmwire.RotateSubRotateDEK != 0x01 {
+		t.Errorf("RotateSubRotateDEK drifted from 0x01: %#x", fsmwire.RotateSubRotateDEK)
+	}
+	if fsmwire.RotateSubEnableStorageEnvelope != 0x04 {
+		t.Errorf("RotateSubEnableStorageEnvelope drifted from 0x04: %#x", fsmwire.RotateSubEnableStorageEnvelope)
+	}
+	if fsmwire.RotateSubRotateDEK == fsmwire.RotateSubEnableStorageEnvelope {
+		t.Fatal("RotateSubRotateDEK and RotateSubEnableStorageEnvelope collide")
+	}
+}
+
 func TestRotation_RejectsUnknownSubTag(t *testing.T) {
 	t.Parallel()
 	raw := fsmwire.EncodeRotation(fsmwire.RotationPayload{
 		SubTag: fsmwire.RotateSubRotateDEK, DEKID: 1, Purpose: fsmwire.PurposeStorage,
 	})
+	// 0x99 is outside the whitelisted set ({0x01, 0x04}) — pinning
+	// 0x99 specifically also catches a future change that
+	// accidentally widened the whitelist to "any non-zero byte".
 	raw[1] = 0x99 // sub-tag byte (after version)
 	_, err := fsmwire.DecodeRotation(raw)
 	if !errors.Is(err, fsmwire.ErrFSMWireSubtag) {

@@ -548,15 +548,39 @@ func advanceRaftAppliedIndex(sc *Sidecar, raftIdx uint64) {
 	}
 }
 
-// ApplyRotation implements §5.2 / §5.4 rotation apply. Stage 6B-1
-// handles only the RotateSubRotateDEK sub-tag (rotate the storage
-// or raft DEK to a new key_id). Other sub-tags (rewrap-deks,
-// retire-dek, enable-storage-envelope, enable-raft-envelope) land
-// in later stages and return ErrEncryptionApply for now so the
+// ApplyRotation implements §5.2 / §5.4 rotation apply. The sub-tag
+// dispatches the entry to the per-variant handler:
+//
+//   - RotateSubRotateDEK — install a new wrapped DEK and re-point
+//     the Active slot for its Purpose (Stage 6B-1).
+//   - RotateSubEnableStorageEnvelope — one-shot storage-layer
+//     cutover (Stage 6D-4). Flips StorageEnvelopeActive and records
+//     StorageEnvelopeCutoverIndex inside a single sidecar fsync.
+//
+// Other sub-tags (rewrap-deks, retire-dek, enable-raft-envelope)
+// land in later stages and return ErrEncryptionApply so the
 // HaltApply seam fires on an unrecognised sub-tag rather than
 // silently advancing setApplied.
 //
-// For RotateSubRotateDEK:
+// Same WithKEK / WithKeystore / WithSidecarPath trio requirement
+// as ApplyBootstrap; partial wiring returns ErrKEKNotConfigured
+// at apply time.
+func (a *Applier) ApplyRotation(raftIdx uint64, p fsmwire.RotationPayload) error {
+	if !a.bootstrapAndRotationConfigured() {
+		return errors.Wrap(ErrKEKNotConfigured, "applier: rotation requires WithKEK + WithKeystore + WithSidecarPath")
+	}
+	switch p.SubTag {
+	case fsmwire.RotateSubRotateDEK:
+		return a.applyRotateDEK(raftIdx, p)
+	case fsmwire.RotateSubEnableStorageEnvelope:
+		return a.applyEnableStorageEnvelope(raftIdx, p)
+	default:
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: rotation sub_tag %#x not recognised", p.SubTag)
+	}
+}
+
+// applyRotateDEK handles the RotateSubRotateDEK variant:
 //
 //  1. KEK-unwrap the proposed wrapped DEK.
 //  2. Install it into the keystore under p.DEKID.
@@ -566,18 +590,7 @@ func advanceRaftAppliedIndex(sc *Sidecar, raftIdx uint64) {
 //  4. Insert the proposing node's ProposerRegistration row so the
 //     §4.1 case-2 monotonicity check covers its first encrypted
 //     write under the new DEK.
-//
-// Same WithKEK / WithKeystore / WithSidecarPath trio requirement
-// as ApplyBootstrap; partial wiring returns ErrKEKNotConfigured
-// at apply time.
-func (a *Applier) ApplyRotation(raftIdx uint64, p fsmwire.RotationPayload) error {
-	if !a.bootstrapAndRotationConfigured() {
-		return errors.Wrap(ErrKEKNotConfigured, "applier: rotation requires WithKEK + WithKeystore + WithSidecarPath")
-	}
-	if p.SubTag != fsmwire.RotateSubRotateDEK {
-		return errors.Wrapf(ErrEncryptionApply,
-			"applier: rotation sub_tag %#x not implemented in Stage 6B-1", p.SubTag)
-	}
+func (a *Applier) applyRotateDEK(raftIdx uint64, p fsmwire.RotationPayload) error {
 	// The proposer-registration row MUST target the rotated DEK ID
 	// — that is the whole point of including it atomically with the
 	// rotate-dek entry (§5.2): cover the proposer's first encrypted
@@ -602,6 +615,128 @@ func (a *Applier) ApplyRotation(raftIdx uint64, p fsmwire.RotationPayload) error
 	}
 	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
 		return errors.Wrap(err, "applier: rotation proposer-registration insert")
+	}
+	return nil
+}
+
+// applyEnableStorageEnvelope handles the
+// RotateSubEnableStorageEnvelope variant (§2.1, §6.4): the one-shot
+// storage-layer cutover. Defense-in-depth re-validates the four
+// §2.1 constraints on the apply side (the cutover RPC mutator,
+// shipping in 6D-6, validates the same set before propose).
+//
+// Outcomes and their FSM-level treatment:
+//
+//   - Malformed proposal (Purpose != PurposeStorage, len(Wrapped)
+//     != 0, or ProposerRegistration.DEKID mismatch) — halt apply
+//     via ErrEncryptionApply. These cannot arise from a healthy
+//     propose path and indicate either a future refactor that
+//     bypassed the mutator gate or a forensic-grade corruption.
+//
+//   - Stale DEKID (a RotateDEK raced between propose and apply, so
+//     sidecar.Active.Storage has advanced past p.DEKID) — benign
+//     no-op. The entry is consumed (RaftAppliedIndex advances) so
+//     it is not replayed, but StorageEnvelopeActive and
+//     StorageEnvelopeCutoverIndex are NOT touched. The §2.1
+//     constraint #3 race posture explicitly forbids halting on
+//     this case: it is a legitimate admin race against RotateDEK,
+//     not a malformed entry. 6D-6 will distinguish "fresh success"
+//     from "stale-DEKID no-op" via a §6.4 response-detail
+//     ride-along; for 6D-4 the FSM-level test asserts via the
+//     post-apply sidecar (StorageEnvelopeActive still false).
+//
+//   - Already active (a duplicate cutover entry committed) —
+//     idempotent. RaftAppliedIndex advances; StorageEnvelopeActive
+//     stays true; StorageEnvelopeCutoverIndex is NOT overwritten
+//     (the original first-apply value is the stable idempotency
+//     token per §6.4). The 6D-6 retry path reads
+//     sc.StorageEnvelopeCutoverIndex directly and surfaces it as
+//     `applied_index` with `was_already_active = true`.
+//
+//   - Fresh success — sidecar.StorageEnvelopeActive flips to true,
+//     sidecar.StorageEnvelopeCutoverIndex is set to raftIdx, and
+//     RaftAppliedIndex advances. All three writes land inside a
+//     single crash-durable WriteSidecar fsync (§6.4 atomicity).
+//     The ProposerRegistration row is then inserted via the
+//     standard §4.1 case 1 / case 2 dispatch so the proposer's
+//     first encrypted write under the now-active envelope is
+//     covered.
+//
+// 6D-4 deliberately does NOT wire the §6.2 storage-layer toggle —
+// PutAt continues to read pre-cutover until 6D-5 lands the
+// `StorageEnvelopeActive` consult. The cutover apply is
+// operator-inert at this stage.
+// validateEnableStorageEnvelopePayload enforces the §2.1
+// payload-shape constraints that do NOT require sidecar state
+// (purpose, empty-Wrapped, proposer DEK pinning). Sidecar-derived
+// constraints (#3 stale DEKID, #4 idempotency) live in the caller
+// so the no-op vs. fresh-success branches can read the sidecar
+// exactly once.
+func validateEnableStorageEnvelopePayload(p fsmwire.RotationPayload) error {
+	// §2.1 constraint #1.
+	if p.Purpose != fsmwire.PurposeStorage {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-storage-envelope must carry Purpose=PurposeStorage, got %#x", byte(p.Purpose))
+	}
+	// §2.1 constraint #2 — length-based, NOT `Wrapped == nil`. The
+	// wire decoder materialises a zero-length payload as an
+	// allocated empty slice (`[]byte{}`); a `== nil` check would
+	// reject every valid cutover entry and halt-apply the cluster.
+	if len(p.Wrapped) != 0 {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-storage-envelope must carry empty Wrapped, got %d bytes", len(p.Wrapped))
+	}
+	// Pin the proposer registration to the cutover's DEK — symmetric
+	// with the rotate-dek invariant. Mismatch on an empty-Wrapped
+	// cutover would otherwise silently insert a writer-registry row
+	// against an unrelated DEK.
+	if p.ProposerRegistration.DEKID != p.DEKID {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-storage-envelope proposer_registration.dek_id=%d does not match rotation dek_id=%d",
+			p.ProposerRegistration.DEKID, p.DEKID)
+	}
+	return nil
+}
+
+func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationPayload) error {
+	if err := validateEnableStorageEnvelopePayload(p); err != nil {
+		return err
+	}
+	sc, err := ReadSidecar(a.sidecarPath)
+	if err != nil {
+		return errors.Wrap(err, "applier: read sidecar for enable-storage-envelope")
+	}
+	// §2.1 constraint #3 — DEKID stale at apply (RotateDEK raced).
+	// Benign no-op: consume the entry without halting and without
+	// flipping the cutover fields.
+	if p.DEKID != sc.Active.Storage {
+		advanceRaftAppliedIndex(sc, raftIdx)
+		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+			return errors.Wrap(err, "applier: write sidecar for stale-dekid cutover no-op")
+		}
+		return nil
+	}
+	// §2.1 constraint #4 — idempotency. Preserve the original
+	// StorageEnvelopeCutoverIndex; only advance the generic
+	// RaftAppliedIndex so the duplicate entry is not replayed.
+	if sc.StorageEnvelopeActive {
+		advanceRaftAppliedIndex(sc, raftIdx)
+		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+			return errors.Wrap(err, "applier: write sidecar for already-active cutover no-op")
+		}
+		return nil
+	}
+	// Fresh successful apply — §6.4 atomicity demands the
+	// active-flip, the cutover-index, AND the RaftAppliedIndex bump
+	// land inside one WriteSidecar fsync.
+	sc.StorageEnvelopeActive = true
+	sc.StorageEnvelopeCutoverIndex = raftIdx
+	advanceRaftAppliedIndex(sc, raftIdx)
+	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+		return errors.Wrap(err, "applier: write sidecar for cutover")
+	}
+	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
+		return errors.Wrap(err, "applier: cutover proposer-registration insert")
 	}
 	return nil
 }
