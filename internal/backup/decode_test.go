@@ -303,3 +303,31 @@ func TestDecodeSnapshot_DistPrefixDroppedAsInternal(t *testing.T) {
 		t.Fatalf("Counters.Unknown = %d, want 0 (!dist| must drop to Internal, not Unknown)", res.Counters.Unknown)
 	}
 }
+
+// TestDecodeSnapshot_EncryptionPrefixDroppedAsInternal pins the
+// !encryption| route added in r3 (Codex r3 P2 on PR #806). The
+// writer-registry rows (!encryption|writers|<be4 dek_id>|<be2 node_id>)
+// are persisted by the encryption applier through the default
+// Raft group's Pebble; they appear in every snapshot from a
+// cluster that has rotated DEKs, so the dispatcher must classify
+// them as Internal, not Unknown.
+func TestDecodeSnapshot_EncryptionPrefixDroppedAsInternal(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	b := newSnapBuilder(0)
+	// !encryption|writers|<be4 dek_id=1>|<be2 node_id=0x42>
+	b.WriteEntry([]byte("!encryption|writers|\x00\x00\x00\x01|\x00\x42"), 1, []byte("row"), false, 0, snapshotEncStateCleartx)
+	res, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot:  root,
+		Adapters: AllAdapters(),
+	})
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	if res.Counters.Internal != 1 {
+		t.Fatalf("Counters.Internal = %d, want 1 (counters=%+v)", res.Counters.Internal, res.Counters)
+	}
+	if res.Counters.Unknown != 0 {
+		t.Fatalf("Counters.Unknown = %d, want 0 (!encryption| must drop to Internal, not Unknown)", res.Counters.Unknown)
+	}
+}

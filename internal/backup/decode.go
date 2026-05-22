@@ -359,6 +359,16 @@ func buildPrefixRoutes() []prefixRoute {
 		// in Counters.Unknown — a false corruption signal on real
 		// production dumps (Codex r1 P2 + claude-bot r1 on PR #806).
 		{[]byte("!dist|"), routeInternalDrop},
+		// Internal-only: encryption writer-registry rows persisted
+		// under internal/encryption/registry.go's
+		// `!encryption|writers|` prefix. These are §4.1 writer
+		// registry rows (one per (dek_id, uint16 node_id) pair) that
+		// the FSM apply path writes through the default Raft group's
+		// Pebble. They ride snapshots like any other 0x03 entry.
+		// Using the broader `!encryption|` prefix so future encryption
+		// metadata under the same namespace is also classified as
+		// Internal rather than Unknown (Codex r3 P2 on PR #806).
+		{[]byte("!encryption|"), routeInternalDrop},
 	}
 	sort.SliceStable(r, func(i, j int) bool {
 		return len(r[i].prefix) > len(r[j].prefix)
