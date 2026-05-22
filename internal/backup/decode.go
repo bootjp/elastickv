@@ -47,8 +47,10 @@ type DecodeOptions struct {
 	// OutRoot is the destination directory tree root. Must be set.
 	OutRoot string
 	// ScratchRoot is where the S3 encoder buffers blob chunks during
-	// assembly. Defaults to OutRoot when empty; callers backing the
-	// CLI's --scratch-root flag override it (e.g. to a tmpfs).
+	// assembly. Defaults to <OutRoot>/.scratch when empty (NEVER to
+	// OutRoot itself — sharing would let S3Encoder.Finalize's
+	// os.RemoveAll wipe the final dump). Callers backing the CLI's
+	// --scratch-root flag override it (e.g. to a tmpfs).
 	ScratchRoot string
 	// Adapters selects which adapter encoders to construct. Entries
 	// for disabled adapters are dropped silently and counted as
@@ -349,6 +351,14 @@ func buildPrefixRoutes() []prefixRoute {
 		// records. Phase 0a drops these; they belong to the running
 		// cluster, not the data.
 		{[]byte("!txn|"), routeInternalDrop},
+		// Internal-only: distribution catalog (route table + version
+		// metadata persisted under distribution/catalog.go's
+		// `!dist|meta|` / `!dist|route|` prefixes). These ride the
+		// default Raft group's Pebble and so appear in every
+		// clustered snapshot. Without this route they would land
+		// in Counters.Unknown — a false corruption signal on real
+		// production dumps (Codex r1 P2 + claude-bot r1 on PR #806).
+		{[]byte("!dist|"), routeInternalDrop},
 	}
 	sort.SliceStable(r, func(i, j int) bool {
 		return len(r[i].prefix) > len(r[j].prefix)

@@ -245,14 +245,18 @@ func TestDecodeSnapshot_DefaultScratchDoesNotWipeFinalS3Output(t *testing.T) {
 
 // TestDecodeSnapshot_FinalizeRunsOnTruncatedStream pins gemini r1
 // medium on PR #806: a read error in ReadSnapshotWithHeader must
-// not skip finalize(). With the default scratch path now under
-// <OutRoot>/.scratch/, a successful finalize removes that subtree
-// even when the stream errors. We feed a truncated stream and
-// assert the .scratch directory is absent after DecodeSnapshot
-// returns.
+// not skip finalize(). To make the assertion non-vacuous
+// (claude-bot r1 follow-up), we pre-create <root>/.scratch/s3/
+// manually so it exists going in — if finalize() is skipped on
+// the read error, the dir survives; if finalize() runs,
+// S3Encoder.Finalize's deferred os.RemoveAll reclaims it.
 func TestDecodeSnapshot_FinalizeRunsOnTruncatedStream(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
+	preScratch := filepath.Join(root, ".scratch", "s3")
+	if err := os.MkdirAll(preScratch, 0o755); err != nil {
+		t.Fatalf("pre-create scratch: %v", err)
+	}
 	// Truncate a header-only stream so ReadSnapshotWithHeader fails
 	// on the partial header read.
 	b := newSnapBuilder(0)
@@ -265,13 +269,37 @@ func TestDecodeSnapshot_FinalizeRunsOnTruncatedStream(t *testing.T) {
 	if err == nil {
 		t.Fatalf("DecodeSnapshot on truncated stream returned nil; want error")
 	}
-	// Finalize ran (deferred RemoveAll) — the .scratch tree must
-	// be absent. If the pre-fix code path returned without calling
-	// finalize, the scratch dir would have been created by S3Encoder
-	// methods (it isn't here, because the header errored before
-	// any S3 record was handled), but at minimum we verify the
-	// final-output area is untouched by a scratch wipe.
-	if _, err := os.Stat(filepath.Join(root, ".scratch")); err == nil {
-		t.Fatalf(".scratch dir survived finalize on truncated stream — finalize did not run")
+	// finalize() ran => S3Encoder.Finalize's defer reclaimed the
+	// scratch tree. If finalize was skipped on read error, the
+	// pre-existing dir survives.
+	if _, err := os.Stat(preScratch); err == nil {
+		t.Fatalf(".scratch/s3/ survived truncated-stream decode — finalize did not run")
+	}
+}
+
+// TestDecodeSnapshot_DistPrefixDroppedAsInternal pins the
+// !dist| route added in r2 (Codex r1 P2 / claude-bot r1 on PR
+// #806). Distribution-catalog keys ride the default Raft group's
+// Pebble and so appear in every clustered snapshot. Without the
+// route, they would land in Counters.Unknown — a false corruption
+// signal on real dumps.
+func TestDecodeSnapshot_DistPrefixDroppedAsInternal(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	b := newSnapBuilder(0)
+	b.WriteEntry([]byte("!dist|meta|version"), 1, []byte("v1"), false, 0, snapshotEncStateCleartx)
+	b.WriteEntry([]byte("!dist|route|abc"), 1, []byte("rt"), false, 0, snapshotEncStateCleartx)
+	res, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot:  root,
+		Adapters: AllAdapters(),
+	})
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	if res.Counters.Internal != 2 {
+		t.Fatalf("Counters.Internal = %d, want 2 (counters=%+v)", res.Counters.Internal, res.Counters)
+	}
+	if res.Counters.Unknown != 0 {
+		t.Fatalf("Counters.Unknown = %d, want 0 (!dist| must drop to Internal, not Unknown)", res.Counters.Unknown)
 	}
 }
