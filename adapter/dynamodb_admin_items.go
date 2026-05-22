@@ -157,6 +157,9 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 	if err := validateAdminAttributeMapDepth(opts.ExclusiveStart); err != nil {
 		return AdminScanResult{}, err
 	}
+	if err := validateAdminAttributeMapKinds(opts.ExclusiveStart); err != nil {
+		return AdminScanResult{}, err
+	}
 	limit := clampAdminScanLimit(opts.Limit)
 	scanInput := scanInput{
 		TableName:         tableName,
@@ -187,6 +190,9 @@ func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrinci
 		return nil, false, err
 	}
 	if err := validateAdminAttributeMapDepth(key); err != nil {
+		return nil, false, err
+	}
+	if err := validateAdminAttributeMapKinds(key); err != nil {
 		return nil, false, err
 	}
 	internalKey := adminToInternalAttributeMap(key)
@@ -262,6 +268,9 @@ func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrinci
 	if err := validateAdminAttributeMapDepth(item.Attributes); err != nil {
 		return err
 	}
+	if err := validateAdminAttributeMapKinds(item.Attributes); err != nil {
+		return err
+	}
 	in := putItemInput{
 		TableName: tableName,
 		Item:      adminToInternalAttributeMap(item.Attributes),
@@ -294,6 +303,9 @@ func (d *DynamoDBServer) AdminDeleteItem(ctx context.Context, principal AdminPri
 		return ErrAdminDynamoValidation
 	}
 	if err := validateAdminAttributeMapDepth(key); err != nil {
+		return err
+	}
+	if err := validateAdminAttributeMapKinds(key); err != nil {
 		return err
 	}
 	in := deleteItemInput{
@@ -449,4 +461,55 @@ func checkAdminAttributeDepth(v AdminAttributeValue, depth int) error {
 		}
 	}
 	return nil
+}
+
+// validateAdminAttributeMapKinds enforces the AWS-wire "exactly
+// one kind field set per AttributeValue" invariant across the
+// entire admin-supplied attribute tree. The custom MarshalJSON
+// guards the HTTP boundary (Phase 3), but Go-level callers
+// constructing AdminAttributeValue programmatically can still
+// pass zero-field or multi-field values; without this check
+// they would reach putItemWithRetry / readLogicalItemAt where
+// the storage codec surfaces a non-dynamoErrValidation error
+// that translateDynamoAdminError can't recognise — rendering
+// as a 500 instead of the documented 400 contract (Codex r5 P2
+// on PR #805).
+func validateAdminAttributeMapKinds(in map[string]AdminAttributeValue) error {
+	for _, v := range in {
+		if err := checkAdminAttributeKind(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkAdminAttributeKind(v AdminAttributeValue) error {
+	if countAdminKindFields(v) != 1 {
+		return errors.Wrap(ErrAdminDynamoValidation, "attribute value must have exactly one kind field set")
+	}
+	for _, e := range v.L {
+		if err := checkAdminAttributeKind(e); err != nil {
+			return err
+		}
+	}
+	for _, e := range v.M {
+		if err := checkAdminAttributeKind(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func countAdminKindFields(v AdminAttributeValue) int {
+	set := []bool{
+		v.S != nil, v.N != nil, v.B != nil, v.BOOL != nil, v.NULL != nil,
+		v.SS != nil, v.NS != nil, v.BS != nil, v.L != nil, v.M != nil,
+	}
+	n := 0
+	for _, b := range set {
+		if b {
+			n++
+		}
+	}
+	return n
 }

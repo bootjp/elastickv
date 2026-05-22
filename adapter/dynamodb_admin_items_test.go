@@ -511,3 +511,46 @@ func TestAdminAttributeValue_JSONMarshalRejectsMultiField(t *testing.T) {
 	_, err = json.Marshal(AdminAttributeValue{S: &s, N: &n})
 	require.Error(t, err, "multi-field AdminAttributeValue must fail to marshal")
 }
+
+// TestDynamoDB_AdminPutItem_RejectsZeroFieldAttribute pins Codex
+// r5 P2 on PR #805: a Go-level AdminPutItem caller can construct
+// an AdminAttributeValue with zero kind fields (bypassing the
+// JSON-boundary MarshalJSON check). Without validateAdminAttributeMapKinds
+// the malformed value reaches putItemWithRetry and surfaces as a
+// non-dynamoErrValidation error → 500 instead of the documented
+// 400 contract.
+func TestDynamoDB_AdminPutItem_RejectsZeroFieldAttribute(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	createTableForItemTests(t, srv, "zerokind")
+
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "zerokind",
+		AdminItem{Attributes: map[string]AdminAttributeValue{
+			"id":    stringAttr("k"),
+			"empty": {}, // no kind field set
+		}})
+	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
+		"want ErrAdminDynamoValidation for zero-kind attribute; got %v", err)
+}
+
+// TestDynamoDB_AdminPutItem_RejectsMultiFieldAttribute is the
+// multi-field counterpart of the zero-field test.
+func TestDynamoDB_AdminPutItem_RejectsMultiFieldAttribute(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	createTableForItemTests(t, srv, "multikind")
+
+	s := "x"
+	n := "1"
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "multikind",
+		AdminItem{Attributes: map[string]AdminAttributeValue{
+			"id":  stringAttr("k"),
+			"bad": {S: &s, N: &n},
+		}})
+	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
+		"want ErrAdminDynamoValidation for multi-kind attribute; got %v", err)
+}
