@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 )
 
@@ -185,10 +186,11 @@ func (d *DynamoDBServer) AdminScanTable(ctx context.Context, principal AdminPrin
 //   - ErrAdminDynamoNotFound — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
 func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrincipal, tableName string, key map[string]AdminAttributeValue) (*AdminItem, bool, error) {
-	schema, readTS, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key))
+	schema, readTS, readPin, err := d.adminLoadReadableSchema(ctx, principal, tableName, len(key))
 	if err != nil {
 		return nil, false, err
 	}
+	defer readPin.Release()
 	if err := validateAdminAttributeMapDepth(key); err != nil {
 		return nil, false, err
 	}
@@ -216,33 +218,42 @@ func (d *DynamoDBServer) AdminGetItem(ctx context.Context, principal AdminPrinci
 // adminLoadReadableSchema centralises the read-path preamble for
 // AdminGetItem: gate the principal, verify leader, validate the
 // table-name + non-empty key, load the schema, and refuse on
-// legacy-migration-needed tables. Returns the loaded schema + the
-// readTS the caller should reuse so the subsequent item read sees
-// the same MVCC snapshot. keyAttrs is len(key) so the helper can
-// short-circuit on an empty key.
-func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal AdminPrincipal, tableName string, keyAttrs int) (*dynamoTableSchema, uint64, error) {
+// legacy-migration-needed tables. Pins readTS via the read-tracker
+// so concurrent MVCC GC cannot advance minRetainedTS between the
+// schema load and the caller's subsequent item read at the same
+// readTS (Codex r6 P1 on PR #805; matches the SigV4 getItem path's
+// pinReadTS pattern at dynamodb.go:1386).
+//
+// On success the caller MUST defer readPin.Release(). On error the
+// helper releases the pin internally (if one was acquired) so the
+// caller never has to handle release on the error path.
+func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal AdminPrincipal, tableName string, keyAttrs int) (*dynamoTableSchema, uint64, *kv.ActiveTimestampToken, error) {
 	if !principal.Role.canRead() {
-		return nil, 0, ErrAdminForbidden
+		return nil, 0, nil, ErrAdminForbidden
 	}
 	if !isVerifiedDynamoLeader(ctx, d.coordinator) {
-		return nil, 0, ErrAdminNotLeader
+		return nil, 0, nil, ErrAdminNotLeader
 	}
 	if strings.TrimSpace(tableName) == "" || keyAttrs == 0 {
-		return nil, 0, ErrAdminDynamoValidation
+		return nil, 0, nil, ErrAdminDynamoValidation
 	}
 	readTS := d.nextTxnReadTS()
+	readPin := d.pinReadTS(readTS)
 	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 	if err != nil {
-		return nil, 0, errors.WithStack(err)
+		readPin.Release()
+		return nil, 0, nil, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, 0, ErrAdminDynamoNotFound
+		readPin.Release()
+		return nil, 0, nil, ErrAdminDynamoNotFound
 	}
 	if schema.needsLegacyKeyMigration() {
-		return nil, 0, errors.Wrap(ErrAdminDynamoValidation,
+		readPin.Release()
+		return nil, 0, nil, errors.Wrap(ErrAdminDynamoValidation,
 			"table requires a one-time legacy-key migration before admin read endpoints are available; migrate via the SigV4 surface first")
 	}
-	return schema, readTS, nil
+	return schema, readTS, readPin, nil
 }
 
 // AdminPutItem creates-or-replaces one item. Write role required.
@@ -486,6 +497,13 @@ func validateAdminAttributeMapKinds(in map[string]AdminAttributeValue) error {
 func checkAdminAttributeKind(v AdminAttributeValue) error {
 	if countAdminKindFields(v) != 1 {
 		return errors.Wrap(ErrAdminDynamoValidation, "attribute value must have exactly one kind field set")
+	}
+	// AWS-wire contract: NULL is a boolean kind tag whose value must
+	// be true; NULL=false is malformed (Codex r6 P2 on PR #805). The
+	// internal MarshalJSON would otherwise silently rewrite the input
+	// as NULL=true, hiding the caller bug.
+	if v.NULL != nil && !*v.NULL {
+		return errors.Wrap(ErrAdminDynamoValidation, "NULL attribute value must be true")
 	}
 	for _, e := range v.L {
 		if err := checkAdminAttributeKind(e); err != nil {

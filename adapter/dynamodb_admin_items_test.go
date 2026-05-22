@@ -554,3 +554,34 @@ func TestDynamoDB_AdminPutItem_RejectsMultiFieldAttribute(t *testing.T) {
 	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
 		"want ErrAdminDynamoValidation for multi-kind attribute; got %v", err)
 }
+
+// TestDynamoDB_AdminPutItem_RejectsNullFalse pins Codex r6 P2:
+// NULL is a boolean kind tag whose value must be true per the
+// AWS wire contract. A caller passing NULL=&false would otherwise
+// silently get its input rewritten to NULL=true by the internal
+// MarshalJSON, masking the caller bug.
+func TestDynamoDB_AdminPutItem_RejectsNullFalse(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	createTableForItemTests(t, srv, "nullfalse")
+
+	falseVal := false
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "nullfalse",
+		AdminItem{Attributes: map[string]AdminAttributeValue{
+			"id":  stringAttr("k"),
+			"bad": {NULL: &falseVal},
+		}})
+	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
+		"want ErrAdminDynamoValidation for NULL=false; got %v", err)
+
+	// Sanity: NULL=true is valid and round-trips.
+	trueVal := true
+	err = srv.AdminPutItem(context.Background(), fullAdminPrincipal, "nullfalse",
+		AdminItem{Attributes: map[string]AdminAttributeValue{
+			"id":   stringAttr("k"),
+			"good": {NULL: &trueVal},
+		}})
+	require.NoError(t, err, "NULL=true must be accepted")
+}
