@@ -719,6 +719,16 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	// §2.1 constraint #4 — idempotency. Preserve the original
 	// StorageEnvelopeCutoverIndex; only advance the generic
 	// RaftAppliedIndex so the duplicate entry is not replayed.
+	//
+	// Why this branch can safely skip ApplyRegistration: the
+	// fresh-success branch below runs ApplyRegistration BEFORE
+	// WriteSidecar, so the invariant
+	//   sc.StorageEnvelopeActive == true ⇒ registration row already on disk
+	// holds across crash-restart. No re-insert is needed (and the
+	// duplicate entry's ProposerRegistration field is intentionally
+	// discarded — §2.1 #4). This addresses Codex P1 on PR #804,
+	// which was filed against commit 3eb4555c77 before the
+	// registration-before-sidecar reordering landed in 74a504c8.
 	if sc.StorageEnvelopeActive {
 		advanceRaftAppliedIndex(sc, raftIdx)
 		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
