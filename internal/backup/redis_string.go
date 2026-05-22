@@ -119,6 +119,7 @@ const (
 	redisKindList
 	redisKindSet
 	redisKindZSet
+	redisKindStream
 )
 
 // RedisDB encodes one logical Redis database (`redis/db_<n>/`). All
@@ -228,6 +229,13 @@ type RedisDB struct {
 	// mutations.
 	zsets map[string]*redisZSetState
 
+	// streams buffers per-userKey stream state (meta + entry list).
+	// Flushed at Finalize into streams/<key>.jsonl as one record per
+	// entry plus a trailing `_meta` line. Streams are bounded by
+	// maxWideColumnItems on the live side, so a single in-memory
+	// slice per stream is tractable.
+	streams map[string]*redisStreamState
+
 	// pendingTTL buffers expiries whose user-key prefix sorts AFTER
 	// `!redis|ttl|` in the snapshot's lex-ordered stream. Pebble
 	// snapshots emit records in encoded-key order
@@ -321,6 +329,7 @@ func NewRedisDB(outRoot string, dbIndex int) *RedisDB {
 		lists:              make(map[string]*redisListState),
 		sets:               make(map[string]*redisSetState),
 		zsets:              make(map[string]*redisZSetState),
+		streams:            make(map[string]*redisStreamState),
 		pendingTTL:         make(map[string]uint64),
 		pendingTTLBytesCap: defaultPendingTTLBytesCap,
 	}
@@ -430,40 +439,50 @@ func (r *RedisDB) HandleTTL(userKey, value []byte) error {
 			return nil
 		}
 		return r.appendTTL(&r.stringsTTL, redisStringsTTLFile, userKey, expireAtMs)
-	case redisKindHash:
-		// Wide-column types fold TTL into the per-hash JSON record
-		// (`expire_at_ms` field) so a restorer can replay the hash
-		// in one shot rather than chasing a separate sidecar.
-		st := r.hashState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
-		return nil
-	case redisKindList:
-		// Same per-record TTL inlining as hashes: the list JSON
-		// carries expire_at_ms so a restorer can replay LPUSH +
-		// EXPIRE in one shot without consulting a sidecar.
-		st := r.listState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
-		return nil
-	case redisKindSet:
-		// Same per-record TTL inlining: SADD + EXPIRE replay in
-		// one shot from the per-set JSON, no separate sidecar.
-		st := r.setState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
-		return nil
-	case redisKindZSet:
-		// Same per-record TTL inlining: ZADD + EXPIRE replay in
-		// one shot from the per-zset JSON, no separate sidecar.
-		st := r.zsetState(userKey)
-		st.expireAtMs = expireAtMs
-		st.hasTTL = true
+	case redisKindHash, redisKindList, redisKindSet, redisKindZSet, redisKindStream:
+		// Wide-column types fold TTL into the per-key JSON record
+		// (`expire_at_ms` field) so a restorer can replay the
+		// content + EXPIRE in one shot from the per-key file.
+		r.inlineWideColumnTTL(r.kindByKey[string(userKey)], userKey, expireAtMs)
 		return nil
 	case redisKindUnknown:
 		return r.parkUnknownTTL(userKey, expireAtMs)
 	}
 	return nil
+}
+
+// inlineWideColumnTTL sets expireAtMs/hasTTL on the per-key state
+// for a wide-column type. Extracted from HandleTTL so the parent
+// stays under the cyclop budget; the wide-column types all share
+// the same "set state + record TTL" pattern but with different
+// state-getter return types.
+func (r *RedisDB) inlineWideColumnTTL(kind redisKeyKind, userKey []byte, expireAtMs uint64) {
+	switch kind {
+	case redisKindHash:
+		st := r.hashState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindList:
+		st := r.listState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindSet:
+		st := r.setState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindZSet:
+		st := r.zsetState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindStream:
+		st := r.streamState(userKey)
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	case redisKindUnknown, redisKindString, redisKindHLL:
+		// Unreachable: HandleTTL filters to wide-column kinds
+		// before calling this helper. Listed explicitly to satisfy
+		// the exhaustive linter.
+	}
 }
 
 // parkUnknownTTL buffers a redisKindUnknown TTL into pendingTTL, or
@@ -567,6 +586,7 @@ func (r *RedisDB) Finalize() error {
 		r.flushLists,
 		r.flushSets,
 		r.flushZSets,
+		r.flushStreams,
 		func() error { return closeJSONL(r.stringsTTL) },
 		func() error { return closeJSONL(r.hllTTL) },
 		r.closeKeymap,
