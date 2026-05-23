@@ -83,6 +83,16 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
     } catch (err) {
       if (listAbortRef.current !== ctrl) return false;
       if (err instanceof DOMException && err.name === "AbortError") return false;
+      // Clear stale rows on a non-abort failure. Without this, a
+      // route change from /s3/a to /s3/b followed by a transient
+      // list failure would leave bucket-a's rows visible under
+      // the bucket-b context — clicking Download/Delete would
+      // then operate on the wrong bucket with an old key (Codex
+      // P1 on PR #816 r2). The cursor stack is also cleared so
+      // a subsequent Refresh doesn't try to use a stale
+      // continuation token against the new context.
+      setPage(null);
+      setCursorStack([]);
       setLoadError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
       return false;
     } finally {
