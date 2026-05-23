@@ -315,7 +315,14 @@ func (h *DynamoHandler) handleItemDelete(w http.ResponseWriter, r *http.Request,
 func (h *DynamoHandler) principalForItemRead(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
-		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
+		// 401 matches principalForWrite (s3_handler.go,
+		// dynamo_handler.go.principalForWrite) — semantically,
+		// "no session principal" is unauthenticated, not internal
+		// failure. The path is unreachable in production
+		// (SessionAuth always attaches a principal upstream); the
+		// 401 keeps the contract symmetric with the rest of the
+		// admin surface (Claude review on PR #813 r2).
+		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
 		return AuthPrincipal{}, false
 	}
 	if h.roles != nil {
@@ -505,12 +512,29 @@ func boolPtrEqual(a, b *bool) bool {
 
 // writeItemsError translates the sentinel errors the bridge
 // surfaces into the canonical HTTP status + body shape.
+//
+// The 503 / 403 / 400 cases use fixed strings rather than
+// err.Error() — the sentinels (e.g. "admin dynamo items:
+// forbidden") are internal vocabulary and leaking them to clients
+// (a) sticks the SPA with a confusing message and (b) drifts the
+// items surface away from writeTablesError / writeBucketsError /
+// the SQS handler which all use fixed strings. Claude review on
+// PR #813 r2 caught both this and the Retry-After / canonical
+// code drift on the 503 case.
 func (h *DynamoHandler) writeItemsError(w http.ResponseWriter, r *http.Request, op, table string, err error) {
 	switch {
 	case errors.Is(err, ErrItemsForbidden):
-		writeJSONError(w, http.StatusForbidden, "forbidden", err.Error())
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
 	case errors.Is(err, ErrItemsNotLeader):
-		writeJSONError(w, http.StatusServiceUnavailable, "not_leader", err.Error())
+		// Retry-After: 1 + "leader_unavailable" matches every
+		// other admin 503 (writeTablesError, writeBucketsError,
+		// sqs_handler, forward_server). Without these the SPA's
+		// shared retry helper does not back off correctly and
+		// the error branches on the wrong code string.
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
+			"this admin node is not the raft leader")
 	case errors.Is(err, ErrItemsTableNotFound):
 		writeJSONError(w, http.StatusNotFound, "not_found", "table not found")
 	case errors.Is(err, ErrItemsValidation):

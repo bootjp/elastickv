@@ -545,13 +545,15 @@ func TestDynamoItems_Scan_RejectsAnonymous(t *testing.T) {
 	src := newStubItemsSource()
 	h := newDynamoHandlerForTest(src)
 
-	// No principal injected — should fail with internal (missing
-	// session principal).
+	// No principal injected — should fail 401 unauthenticated,
+	// matching principalForWrite and the rest of the admin
+	// surface (Claude review on PR #813 r2 caught the original
+	// 500 inconsistency).
 	req := httptest.NewRequest(http.MethodGet,
 		pathDynamoTables+"/orders/items", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
 // ---------- error translation tests ----------
@@ -581,6 +583,35 @@ func TestDynamoItems_TranslatesSentinelsToStatus(t *testing.T) {
 			require.Equal(t, tc.wantCode, rec.Code)
 		})
 	}
+}
+
+// TestDynamoItems_NotLeader503HasRetryAfterAndCanonicalCode pins
+// the items 503 contract to the same shape every other admin
+// surface uses: status 503, Retry-After: 1, error code
+// "leader_unavailable". Claude review on PR #813 r2 caught the
+// drift — translateAdminItemsError's comment promised
+// "503 + Retry-After: 1" but writeItemsError didn't set the
+// header and the items handler shipped a non-canonical
+// "not_leader" code. The SPA's retry logic branches on the code
+// string; the items 503 must be indistinguishable from the table-
+// tier / S3 / SQS 503 paths.
+func TestDynamoItems_NotLeader503HasRetryAfterAndCanonicalCode(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	src.nextErr = ErrItemsNotLeader
+	h := newDynamoHandlerForTest(src)
+
+	req := httptest.NewRequest(http.MethodGet,
+		pathDynamoTables+"/orders/items", nil)
+	req = withReadOnlyPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"),
+		"503 from items handler must set Retry-After: 1 so SPA retry backoff fires")
+	require.Contains(t, rec.Body.String(), `"leader_unavailable"`,
+		`items 503 must use the canonical "leader_unavailable" code`)
 }
 
 // ---------- body-validation defence-in-depth (Gemini medium on PR #813) ----------
