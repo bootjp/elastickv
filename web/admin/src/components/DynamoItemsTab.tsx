@@ -46,12 +46,14 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
   const [page, setPage] = useState<AdminScanItemsResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  // cursorStack tracks the previously-visited continuation tokens so
-  // a Back button can return to earlier pages without re-scanning
-  // from the start. Top-of-stack is the cursor that loaded the
-  // *current* page; popping it loads the page before. An empty
-  // stack means we are on page 0 (no cursor sent).
-  const [cursorStack, setCursorStack] = useState<string[]>([]);
+  // currentCursor is the continuation token that loaded the
+  // currently-rendered page (undefined = page 0, no cursor sent).
+  // Refresh and post-write reloads re-issue the scan against this
+  // value; Next advances it to the page's last_evaluated_key after
+  // the fetch succeeds. There is no Back button today — once Next
+  // overwrites the cursor the prior cursor is gone — so a simple
+  // single-value state is enough.
+  const [currentCursor, setCurrentCursor] = useState<string | undefined>(undefined);
 
   // scanAbortRef aborts the in-flight scan when a new one starts
   // (table change, page-size change, Next / Refresh, post-write
@@ -103,7 +105,7 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
 
   // Initial load + page-size change refetches from the start.
   useEffect(() => {
-    setCursorStack([]);
+    setCurrentCursor(undefined);
     void loadPage(undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [table, pageSize]);
@@ -112,13 +114,12 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
     const next = page?.last_evaluated_key;
     if (!next) return;
     const cursor = encodeAdminItemKey(next);
-    setCursorStack((s) => [...s, cursor]);
+    setCurrentCursor(cursor);
     void loadPage(cursor);
   };
 
   const onRefresh = () => {
-    const top = cursorStack[cursorStack.length - 1];
-    void loadPage(top);
+    void loadPage(currentCursor);
   };
 
   // Modal state.
@@ -181,7 +182,7 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
       }
       await api.putItem(table, key, next);
       closeModalForce();
-      void loadPage(cursorStack[cursorStack.length - 1]);
+      void loadPage(currentCursor);
     } catch (err) {
       setModalError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
     } finally {
@@ -196,7 +197,7 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
     try {
       await api.deleteItem(table, modalKey);
       closeModalForce();
-      void loadPage(cursorStack[cursorStack.length - 1]);
+      void loadPage(currentCursor);
     } catch (err) {
       setModalError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
     } finally {
@@ -543,11 +544,20 @@ function formatAttributeShort(v: AdminAttributeValue | undefined): string {
   if (v.N !== undefined) return v.N;
   if (v.BOOL !== undefined) return String(v.BOOL);
   if (v.NULL !== undefined) return "null";
-  if (v.B !== undefined) return `<binary ${v.B.length}b64>`;
+  // v.B is the base64 string, not the raw bytes. Operators read
+  // the size as bytes, so approximate it: every 4 base64 chars
+  // encode 3 bytes; padding-aware floor is close enough for a
+  // teaser preview (off by at most 2 from the true byte count).
+  if (v.B !== undefined) return `<binary ~${approxB64Bytes(v.B)}B>`;
   if (v.SS) return `[${v.SS.join(",")}]`;
   if (v.NS) return `[${v.NS.join(",")}]`;
   if (v.BS) return `<${v.BS.length} bin>`;
   if (v.L) return `[${v.L.length} list]`;
   if (v.M) return `{${Object.keys(v.M).length} map}`;
   return "?";
+}
+
+function approxB64Bytes(b64: string): number {
+  const trimmed = b64.replace(/=+$/u, "");
+  return Math.floor((trimmed.length * 3) / 4);
 }
