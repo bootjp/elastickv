@@ -57,6 +57,15 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
     };
   }, []);
 
+  // contextRef tracks the latest bucket/prefix so async callbacks
+  // (notably onFilePicked, which can outlive a folder navigation
+  // for large uploads) can compare against the operator's CURRENT
+  // view rather than the closure-captured value from click time.
+  // Codex P1 on PR #816 r7 caught the post-upload reload using
+  // stale prefix/cursor.
+  const contextRef = useRef({ bucket, prefix });
+  contextRef.current = { bucket, prefix };
+
   // loadPage returns true on success, false on error or
   // cancellation. Callers (notably onNextPage) inspect the
   // return value to decide whether to advance the cursor stack.
@@ -195,16 +204,47 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
     e.target.value = "";
     setUploadBusy(true);
     setUploadError(null);
+    // Snapshot the upload's context (bucket + prefix) at click
+    // time so the completion handler can detect a mid-upload
+    // navigation. Long uploads can outlive a folder/bucket
+    // switch; without the snapshot check, the closure-captured
+    // prefix would feed loadPage with the OLD context and
+    // overwrite `page` with rows that don't match the current
+    // breadcrumb (Codex P1 on PR #816 r7). Bucket changes also
+    // remount this component via the parent's key={name} guard,
+    // but the snapshot is still belt-and-braces.
+    const uploadBucket = bucket;
+    const uploadPrefix = prefix;
+    const uploadCursor = cursorStack[cursorStack.length - 1];
     try {
       // Object key is the prefix + the picked file's base name. The
       // server rejects keys whose URL segment is empty so a file
       // with an empty name (impossible via <input>, but defensive)
       // would 400 before reaching the storage layer.
-      const key = prefix + file.name;
-      await api.putObject(bucket, key, file, file.type || "application/octet-stream");
-      void loadPage(cursorStack[cursorStack.length - 1], prefix);
+      const key = uploadPrefix + file.name;
+      await api.putObject(uploadBucket, key, file, file.type || "application/octet-stream");
+      // Skip the post-upload reload if the operator navigated
+      // mid-flight — the [bucket, prefix] effect already kicked
+      // off the right scan for the new context, and re-issuing
+      // with stale bucket/prefix would overwrite `page` with
+      // rows from the OLD context. The leaderward retry semantics
+      // are unchanged: a successful PUT against bucketA/prefixA
+      // remains durable even if we skip the listing refresh.
+      // contextRef holds the LATEST state (closure-captured
+      // bucket/prefix would compare equal against themselves).
+      const cur = contextRef.current;
+      if (uploadBucket === cur.bucket && uploadPrefix === cur.prefix) {
+        void loadPage(uploadCursor, uploadPrefix);
+      }
     } catch (err) {
-      setUploadError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
+      // Only surface the upload error if the operator is still
+      // looking at the context they uploaded into; otherwise the
+      // error banner would attach to a screen that has nothing to
+      // do with the failed upload.
+      const cur = contextRef.current;
+      if (uploadBucket === cur.bucket && uploadPrefix === cur.prefix) {
+        setUploadError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
+      }
     } finally {
       setUploadBusy(false);
     }
