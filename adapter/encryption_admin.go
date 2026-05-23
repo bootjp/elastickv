@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strconv"
 
+	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -30,8 +31,51 @@ type EncryptionAdminServer struct {
 	latestAppliedIndex func() uint64
 	proposer           raftengine.Proposer
 	leaderView         raftengine.LeaderView
+	// capabilityFanout, when wired, runs the §4 Voters ∪ Learners
+	// fan-out before the §7.1 Phase 1 cutover entry is proposed.
+	// A nil value short-circuits EnableStorageEnvelope with
+	// FailedPrecondition — the 6D-6 main.go wiring (lands in 6D-6c)
+	// is what threads the route-snapshot builder + DialFunc +
+	// timeout into this closure. Other mutator RPCs are unaffected.
+	capabilityFanout CapabilityFanoutFn
+	// cutoverSem serializes concurrent EnableStorageEnvelope
+	// calls per design §2.1 #4 ("The cutover-RPC mutator
+	// serializes overlapping calls on the propose side").
+	// Without serialization, two concurrent cutover calls could
+	// both observe StorageEnvelopeActive=false, both propose, and
+	// the loser would assemble a freshCutoverResponse with
+	// was_already_active=false but the FIRST cutover's
+	// applied_index — violating the §6.4 fresh-success contract
+	// (coderabbit Major on PR812).
+	//
+	// A capacity-1 channel rather than a plain sync.Mutex so
+	// acquisition can honor ctx cancellation: an admin RPC with
+	// a short deadline whose mutator lock is held by an in-flight
+	// fan-out + propose call surfaces Canceled / DeadlineExceeded
+	// at the gRPC boundary rather than blocking indefinitely
+	// (codex P2 round-3 on PR812).
+	//
+	// The design also calls for a shared lock with RotateDEK so
+	// a RotateDEK cannot interleave between a cutover's propose
+	// and apply; that piece is left to a follow-up because
+	// RotateDEK has no existing serialization and extending it
+	// would change a hot-path mutator's semantics — see the
+	// §2.1 #3 stale-DEKID benign no-op for the FALLBACK that
+	// handles the un-serialized RotateDEK/cutover interleave
+	// today.
+	cutoverSem chan struct{}
 	pb.UnimplementedEncryptionAdminServer
 }
+
+// CapabilityFanoutFn is the closure the server invokes to run the
+// §4 Voters ∪ Learners pre-flight before the cutover proposal.
+// Production wiring composes it from
+// internal/admin.CapabilityFanout(routes, dial, timeout) where
+// routes is built from the Raft engine's live membership view and
+// dial reuses the existing admin connection pool. Tests stub it
+// with a deterministic result to exercise the §4.3 OK / refuse
+// branches at the RPC layer without spinning real clients.
+type CapabilityFanoutFn func(ctx context.Context) (admin.CapabilityFanoutResult, error)
 
 // EncryptionAdminServerOption configures EncryptionAdminServer behavior.
 type EncryptionAdminServerOption func(*EncryptionAdminServer)
@@ -103,6 +147,24 @@ func WithEncryptionAdminProposer(p raftengine.Proposer) EncryptionAdminServerOpt
 	}
 }
 
+// WithEncryptionAdminCapabilityFanout wires the §4 Voters ∪
+// Learners pre-flight that the §7.1 Phase 1 cutover RPC
+// (EnableStorageEnvelope) runs before composing the
+// RotateSubEnableStorageEnvelope payload. Without this option
+// EnableStorageEnvelope refuses with FailedPrecondition —
+// matching the proposer / leaderView posture for the other
+// mutator RPCs. A nil argument is a no-op (the server stays in
+// the cutover-disabled posture), mirroring the
+// WithEncryptionAdmin* convention.
+func WithEncryptionAdminCapabilityFanout(fn CapabilityFanoutFn) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		if fn == nil {
+			return
+		}
+		s.capabilityFanout = fn
+	}
+}
+
 // WithEncryptionAdminLeaderView registers the leadership oracle.
 // Mutating RPCs and ResyncSidecar reject on followers with
 // FailedPrecondition; the leader's id and address are embedded in
@@ -125,7 +187,11 @@ func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServe
 // fails closed at startup rather than silently letting followers
 // mutate state.
 func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAdminServer {
-	s := &EncryptionAdminServer{}
+	// cutoverSem buffer of 1 = mutual-exclusion semaphore;
+	// initialized eagerly so EnableStorageEnvelope never has to
+	// nil-check (a nil chan send blocks forever, defeating the
+	// ctx-aware acquire below).
+	s := &EncryptionAdminServer{cutoverSem: make(chan struct{}, 1)}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
@@ -581,6 +647,428 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 		return nil, err
 	}
 	return &pb.RotateDEKResponse{AppliedIndex: idx}, nil
+}
+
+// EnableStorageEnvelope is the §7.1 Phase 1 cutover RPC: it
+// proposes a RotateSubEnableStorageEnvelope (0x04) rotation entry
+// that flips sidecar.StorageEnvelopeActive on every replica
+// simultaneously and stores the original cutover index in
+// sidecar.StorageEnvelopeCutoverIndex (§6.4). After the entry
+// applies, the storage layer's WithStorageEnvelopeGate (Stage 6D-5)
+// reads true on every Put and the cluster begins emitting §4.1
+// envelopes for new versions.
+//
+// The RPC composes the §4 Voters ∪ Learners capability fan-out
+// helper (Stage 6D-3), the Stage 6D-4 wire dispatch, and the
+// idempotency contract (§6.4): a duplicate call against an
+// already-active sidecar returns OK with `was_already_active=true`
+// and `applied_index = sidecar.StorageEnvelopeCutoverIndex`.
+// Returning AlreadyExists instead would drop the response body
+// per unary-gRPC semantics, so the idempotency discriminator
+// lives on the success path.
+//
+// The server-side sequence (per design doc §3.2):
+//
+//  1. Validate `proposer_node_id != 0` and `proposer_local_epoch
+//     <= 0xFFFF` at the gRPC boundary.
+//  2. Verify Stage 6B mutators are enabled — implicit via
+//     `s.proposer == nil` (matches RotateDEK / BootstrapEncryption
+//     posture).
+//  3. Verify we are the default-group leader via `requireLeader`.
+//  4. Verify the sidecar has Active.Storage != 0 (bootstrap
+//     committed) — return FailedPrecondition with a "run
+//     BootstrapEncryption first" hint otherwise.
+//  5. If sidecar.StorageEnvelopeActive == true, return the §3.2
+//     step 5 idempotent-retry response (OK + was_already_active +
+//     applied_index = StorageEnvelopeCutoverIndex). Skip the
+//     fan-out — the original cutover already passed the gate.
+//  6. Refuse with FailedPrecondition if the capability fan-out is
+//     not wired (`s.capabilityFanout == nil`): the cutover MUST
+//     have a §4 pre-flight; a silent skip would let an
+//     unreachable learner sneak through.
+//  7. Run the fan-out. Any verdict with Reachable=false or
+//     EncryptionCapable=false refuses with FailedPrecondition;
+//     the response detail names the specific node.
+//  8. Compose the RotationPayload (§2.1: empty Wrapped, DEKID =
+//     sidecar.Active.Storage, Purpose = PurposeStorage,
+//     ProposerRegistration covering the active storage DEK).
+//  9. Propose through Raft via `proposeEncryptionEntry`.
+//  10. Re-read the sidecar to discriminate fresh-success vs.
+//     stale-DEKID race vs. concurrent-overlap idempotent and
+//     assemble the response.
+//
+// FSM-level no-op outcomes (stale DEKID via a RotateDEK race,
+// already-active via a duplicate cutover) do NOT halt the apply
+// path — the 6D-4 applier deliberately consumes those entries
+// without flipping the sidecar field. The RPC discriminates by
+// reading the post-apply sidecar: still false ⇒ stale DEKID,
+// surface as FailedPrecondition with the §2.1 #3 retry hint; now
+// true with cutover-index mismatch ⇒ another cutover landed
+// concurrently, treat as idempotent success.
+func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *pb.EnableStorageEnvelopeRequest) (*pb.EnableStorageEnvelopeResponse, error) {
+	// Serialize concurrent cutover RPCs (design §2.1 #4 + PR812
+	// coderabbit Major). The semaphore spans the entire precheck
+	// → fan-out → propose → postcheck sequence so a second
+	// overlapping call sees StorageEnvelopeActive=true at its
+	// precheck and takes the §6.4 idempotent-retry short-circuit
+	// rather than re-proposing.
+	//
+	// Acquire honors ctx cancellation so a caller with a short
+	// deadline does not block indefinitely on an in-flight
+	// cutover's fan-out + propose (codex P2 round-3 on PR812).
+	if err := s.acquireCutoverSemaphore(ctx); err != nil {
+		return nil, err
+	}
+	defer s.releaseCutoverSemaphore()
+	preSidecar, earlyResp, err := s.cutoverPrecheck(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if earlyResp != nil {
+		// Idempotent retry: preSidecar already reports
+		// StorageEnvelopeActive=true. The precheck returned the
+		// §3.2 step 5 response shape; no propose, no fan-out.
+		return earlyResp, nil
+	}
+	fanoutResult, err := s.runCutoverFanout(ctx)
+	if err != nil {
+		return nil, err
+	}
+	proposedIdx, err := s.proposeCutoverEntry(ctx, preSidecar, req)
+	if err != nil {
+		return nil, err
+	}
+	return s.cutoverPostcheck(proposedIdx, fanoutResult)
+}
+
+// acquireCutoverSemaphore takes the cutoverSem with ctx-aware
+// wait semantics. When the caller's ctx fires before the
+// semaphore frees, the wait returns immediately with a gRPC
+// status matching the ctx error — Canceled or DeadlineExceeded.
+// A plain sync.Mutex would block past the caller's deadline,
+// breaking RPC cancellation semantics (codex P2 round-3 on
+// PR812).
+//
+// The explicit ctx.Err() check before the select is load-bearing:
+// Go's select picks uniformly at random among ready cases (it
+// does NOT prioritize ctx.Done()), so an already-canceled ctx
+// paired with a free semaphore would coin-flip between acquiring
+// the slot (and running precheck / fan-out / propose against an
+// aborted caller) and the cancellation return. Checking
+// ctx.Err() first turns the cancellation into a deterministic
+// short-circuit (codex P1 round-4 on PR812).
+func (s *EncryptionAdminServer) acquireCutoverSemaphore(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return cutoverSemaphoreErrorToStatus(err)
+	}
+	select {
+	case s.cutoverSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return cutoverSemaphoreErrorToStatus(ctx.Err())
+	}
+}
+
+// cutoverSemaphoreErrorToStatus maps the ctx-cancellation
+// outcomes of an acquireCutoverSemaphore wait to their native
+// gRPC codes. Pulled out so the status detail names the wait
+// site (semaphore vs. fan-out) — without that, an operator
+// debugging a Canceled response would not know which stage
+// of the RPC the cancellation actually fired in.
+func cutoverSemaphoreErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: cutover mutator wait canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: cutover mutator wait deadline exceeded: %v", err)
+	default:
+		return grpcStatusErrorf(codes.Internal,
+			"encryption: cutover mutator wait failed: %v", err)
+	}
+}
+
+// releaseCutoverSemaphore returns the cutoverSem token. Always
+// called via defer from EnableStorageEnvelope; never called
+// without a prior successful acquireCutoverSemaphore.
+func (s *EncryptionAdminServer) releaseCutoverSemaphore() {
+	<-s.cutoverSem
+}
+
+// cutoverPrecheck runs the §3.2 steps 1-5 that fire before the
+// fan-out: input validation, leader check, sidecar read, bootstrap
+// gate, and the idempotent-retry short-circuit. Returns either
+//
+//   - (preSidecar, nil, nil) on the propose-path: continue with
+//     the fan-out and Raft proposal.
+//   - (nil, earlyResp, nil) on the §6.4 idempotent retry: the
+//     caller short-circuits and returns earlyResp without
+//     touching the fan-out or Raft.
+//   - (nil, nil, err) on any precheck refusal: the gRPC error
+//     already carries the right status code.
+func (s *EncryptionAdminServer) cutoverPrecheck(ctx context.Context, req *pb.EnableStorageEnvelopeRequest) (*encryption.Sidecar, *pb.EnableStorageEnvelopeResponse, error) {
+	if err := s.requireLeader(ctx); err != nil {
+		return nil, nil, err
+	}
+	if s.proposer == nil {
+		return nil, nil, grpcStatusError(codes.FailedPrecondition, "encryption: proposer is not configured on this node")
+	}
+	if s.sidecarPath == "" {
+		return nil, nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
+	}
+	if err := validateEnableStorageEnvelopeRequest(req); err != nil {
+		return nil, nil, err
+	}
+	preSidecar, err := encryption.ReadSidecar(s.sidecarPath)
+	if err != nil {
+		return nil, nil, statusFromSidecarErr(err)
+	}
+	if preSidecar.Active.Storage == 0 {
+		return nil, nil, grpcStatusError(codes.FailedPrecondition,
+			"encryption: cluster not bootstrapped (Active.Storage == 0) — call BootstrapEncryption first")
+	}
+	if preSidecar.StorageEnvelopeActive {
+		// §6.4 idempotent-retry path. The original cutover already
+		// passed the §4 fan-out; re-running it would add latency to
+		// what is effectively a no-op call. Return OK with the
+		// stable applied_index.
+		return nil, idempotentCutoverResponse(preSidecar), nil
+	}
+	return preSidecar, nil, nil
+}
+
+// runCutoverFanout invokes the §4 Voters ∪ Learners pre-flight
+// helper and translates the OK / refuse / error branches into the
+// §3.2 step 6-7 status codes. Pulled out so the orchestration
+// body stays under the cyclomatic-complexity budget.
+//
+// Context-cancellation errors flow through with their gRPC code
+// (codes.Canceled / codes.DeadlineExceeded) so a client that
+// cancels mid-fan-out gets the right retry-semantics shape;
+// wrapping every err as FailedPrecondition would be a configuration-
+// failure signal that misleads automated retry logic (codex P2 on
+// PR812). Configuration-shape errors (zero-member snapshot, etc.)
+// remain FailedPrecondition.
+func (s *EncryptionAdminServer) runCutoverFanout(ctx context.Context) (admin.CapabilityFanoutResult, error) {
+	if s.capabilityFanout == nil {
+		return admin.CapabilityFanoutResult{}, grpcStatusError(codes.FailedPrecondition,
+			"encryption: capability fan-out is not configured on this node")
+	}
+	result, err := s.capabilityFanout(ctx)
+	if err != nil {
+		return admin.CapabilityFanoutResult{}, capabilityFanoutErrorToStatus(err)
+	}
+	if !result.OK {
+		// Codex P2 round-2 on PR812: the production fan-out
+		// helper can return (result, nil) with OK=false when ctx
+		// expires mid-probe — it synthesizes Reachable=false
+		// verdicts and returns the result rather than erroring
+		// out. In that case, classifying the outcome as a
+		// configuration refusal (FailedPrecondition) hides the
+		// real transport-layer cancellation/deadline from
+		// retry-aware clients. Check ctx.Err() first so the
+		// gRPC status code matches what the caller observed.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return admin.CapabilityFanoutResult{}, capabilityFanoutErrorToStatus(ctxErr)
+		}
+		return admin.CapabilityFanoutResult{}, grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: capability check refused cutover (%s)", capabilityRefusalSummary(result))
+	}
+	return result, nil
+}
+
+// capabilityFanoutErrorToStatus maps the fan-out helper's
+// possible failure modes to gRPC status codes. The transport-
+// layer ctx errors (caller canceled / deadline expired) keep
+// their native codes so a client's retry behaviour stays
+// correct; anything else surfaces as a configuration failure
+// (FailedPrecondition).
+func capabilityFanoutErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: capability fan-out canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: capability fan-out deadline exceeded: %v", err)
+	default:
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: capability fan-out failed: %v", err)
+	}
+}
+
+// proposeCutoverEntry composes the RotationPayload per §2.1 and
+// drives it through Raft. The §2.1 #2 length-based-empty-Wrapped
+// constraint is satisfied at composition (the payload uses
+// []byte{}, not nil), matching the 6D-4 applier's length-based
+// check.
+func (s *EncryptionAdminServer) proposeCutoverEntry(ctx context.Context, preSidecar *encryption.Sidecar, req *pb.EnableStorageEnvelopeRequest) (uint64, error) {
+	payload := fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:   preSidecar.Active.Storage,
+		Purpose: fsmwire.PurposeStorage,
+		Wrapped: []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID:      preSidecar.Active.Storage,
+			FullNodeID: req.GetProposerNodeId(),
+			LocalEpoch: uint32ToLocalEpoch(req.GetProposerLocalEpoch()),
+		},
+	}
+	return s.proposeEncryptionEntry(ctx, fsmwire.OpRotation, fsmwire.EncodeRotation(payload))
+}
+
+// cutoverPostcheck re-reads the sidecar after the Raft propose
+// returns and discriminates the §2.1 outcomes:
+//
+//   - Fresh success (StorageEnvelopeActive == true with the
+//     cutover index set by the apply) — assemble the §3.2 happy-
+//     path response.
+//   - Stale-DEKID race (StorageEnvelopeActive still false because
+//     a RotateDEK raced and the 6D-4 applier consumed the entry
+//     as a benign no-op) — refuse with the §2.1 #3 retry hint.
+func (s *EncryptionAdminServer) cutoverPostcheck(proposedIdx uint64, fanoutResult admin.CapabilityFanoutResult) (*pb.EnableStorageEnvelopeResponse, error) {
+	postSidecar, err := encryption.ReadSidecar(s.sidecarPath)
+	if err != nil {
+		return nil, statusFromSidecarErr(err)
+	}
+	if !postSidecar.StorageEnvelopeActive {
+		// §2.1 #3 stale-DEKID race: a RotateDEK committed between
+		// propose and apply, the 6D-4 applier consumed the entry
+		// as a benign no-op, sidecar still false. Surface to the
+		// operator with a retry hint — not Aborted (transient
+		// concurrency conflict shape, but FailedPrecondition is
+		// what the design's §6.4 row pins).
+		return nil, grpcStatusError(codes.FailedPrecondition,
+			"encryption: cutover proposal raced a RotateDEK (sidecar.Active.Storage moved); retry against the new active DEK")
+	}
+	return freshCutoverResponse(postSidecar, proposedIdx, fanoutResult), nil
+}
+
+// validateEnableStorageEnvelopeRequest enforces the §3.2 step 1
+// gRPC-boundary checks. Pulled out so the EnableStorageEnvelope
+// orchestration body stays under the cyclomatic-complexity budget
+// and so tests can exercise the validation slice in isolation.
+func validateEnableStorageEnvelopeRequest(req *pb.EnableStorageEnvelopeRequest) error {
+	if req.GetProposerNodeId() == 0 {
+		// §6.1 reserves full_node_id=0 as the "not-capable"
+		// sentinel. Identical posture to RotateDEK and
+		// BootstrapEncryption — accepting 0 would weaken the
+		// writer-registry collision invariant.
+		return grpcStatusError(codes.InvalidArgument,
+			"encryption: proposer_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
+	}
+	if req.GetProposerLocalEpoch() > math.MaxUint16 {
+		return grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: proposer_local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
+			req.GetProposerLocalEpoch())
+	}
+	return nil
+}
+
+// idempotentCutoverResponse is the §3.2 step 5 retry-success
+// shape: OK status, was_already_active=true, applied_index =
+// sidecar.StorageEnvelopeCutoverIndex (the original cutover's
+// apply index). The defensive cutover_index_unknown branch fires
+// only when an attacker / schema rollback / hand-edited sidecar
+// has StorageEnvelopeActive=true paired with
+// StorageEnvelopeCutoverIndex=0 — operationally impossible under
+// normal apply but hedged against per §6.4.
+func idempotentCutoverResponse(sc *encryption.Sidecar) *pb.EnableStorageEnvelopeResponse {
+	resp := &pb.EnableStorageEnvelopeResponse{
+		WasAlreadyActive:    true,
+		CapabilitySummary:   nil, // empty on idempotent retries per §3.1
+		AppliedIndex:        sc.StorageEnvelopeCutoverIndex,
+		CutoverIndexUnknown: false,
+	}
+	if sc.StorageEnvelopeCutoverIndex == 0 {
+		// §6.4 defensive branch.
+		resp.AppliedIndex = sc.RaftAppliedIndex
+		resp.CutoverIndexUnknown = true
+	}
+	return resp
+}
+
+// freshCutoverResponse is the §3.2 fresh-success shape: OK,
+// was_already_active=false, applied_index = the Raft index of
+// the entry the leader just proposed and waited to apply,
+// capability_summary projects the fan-out verdicts into the
+// wire shape.
+func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResult admin.CapabilityFanoutResult) *pb.EnableStorageEnvelopeResponse {
+	// The reported applied_index is the post-apply sidecar's
+	// StorageEnvelopeCutoverIndex when the apply set it equal to
+	// proposedIdx (the fresh-success path). A mismatch means a
+	// concurrent cutover entry landed between propose and apply
+	// — operator-impossible under §2.1 #4 (mutator lock
+	// serialises overlapping calls on the propose side) but the
+	// applier still records the FIRST cutover's index. Treat as
+	// idempotent: report the original index with
+	// was_already_active=false (this call's propose committed)
+	// but the surfaced index is the FIRST cutover's. The CLI
+	// sees the discrepancy via the applied_index vs. its own
+	// expected value; the RPC must not lie about which call
+	// proposed which entry.
+	appliedIndex := sc.StorageEnvelopeCutoverIndex
+	if appliedIndex == 0 {
+		// Defensive: the apply path always sets the cutover
+		// index alongside the active flag. A zero here means
+		// the post-apply read raced (unlikely, but the §6.4
+		// fallback exists for hand-edited sidecars).
+		// CutoverIndexUnknown stays false on this branch — the
+		// proto field is "only meaningful when
+		// was_already_active=true" (§3.1), and here we know the
+		// correct applied_index: it is proposedIdx (the Raft
+		// entry this call just committed). The idempotent-retry
+		// path is the only context where the original cutover
+		// index is irrecoverable, hence its CutoverIndexUnknown
+		// signal. Claude bot informational on PR812.
+		appliedIndex = proposedIdx
+	}
+	return &pb.EnableStorageEnvelopeResponse{
+		AppliedIndex:        appliedIndex,
+		CapabilitySummary:   projectCapabilityVerdicts(fanoutResult.Verdicts),
+		CutoverIndexUnknown: false,
+		WasAlreadyActive:    false,
+	}
+}
+
+// projectCapabilityVerdicts marshals the internal CapabilityVerdict
+// shape into the wire-format proto.CapabilityVerdict. Reachable /
+// Err fields are intentionally NOT projected: the cutover RPC only
+// returns this summary on the OK path, so every verdict in the
+// slice has Reachable=true and Err=nil by construction. Operators
+// who need transport-layer diagnostics consult the leader's logs.
+func projectCapabilityVerdicts(in []admin.CapabilityVerdict) []*pb.CapabilityVerdict {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*pb.CapabilityVerdict, 0, len(in))
+	for _, v := range in {
+		out = append(out, &pb.CapabilityVerdict{
+			FullNodeId:        v.FullNodeID,
+			EncryptionCapable: v.EncryptionCapable,
+			BuildSha:          v.BuildSHA,
+			SidecarPresent:    v.SidecarPresent,
+		})
+	}
+	return out
+}
+
+// capabilityRefusalSummary builds the human-readable detail
+// included in the FailedPrecondition status when the fan-out
+// refused. Names the first unreachable / not-capable member so
+// the operator's CLI can immediately diagnose without trawling
+// logs.
+func capabilityRefusalSummary(result admin.CapabilityFanoutResult) string {
+	for _, v := range result.Verdicts {
+		if !v.Reachable {
+			return "unreachable member full_node_id=" + strconv.FormatUint(v.FullNodeID, 10)
+		}
+		if !v.EncryptionCapable {
+			return "not-capable member full_node_id=" + strconv.FormatUint(v.FullNodeID, 10)
+		}
+	}
+	return "fan-out reported OK=false with no per-member refusal — check leader logs"
 }
 
 // RegisterEncryptionWriter proposes a §11.3 0x03 OpRegistration

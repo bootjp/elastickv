@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle) shipped; 6D-6 remains |
+| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method) shipped; 6D-6b (CLI), 6D-6c (main.go wiring + integration test) remain |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -45,10 +45,28 @@
   pre-6D-6 production wiring keep working unchanged. Operator-
   inert until 6D-6 wires both the cipher and the gate in main.go
   and exposes the cutover RPC.
+- **6D-6a** (EnableStorageEnvelope server method) —
+  `proto/encryption_admin.proto` adds the `EnableStorageEnvelope`
+  RPC + `EnableStorageEnvelopeRequest` / `Response` +
+  `CapabilityVerdict` messages. `adapter/encryption_admin.go`
+  ships the server method that composes the §3.2 sequence: leader
+  gate → input validation → sidecar read → bootstrap gate →
+  idempotent-retry short-circuit (§6.4) → capability fan-out
+  (6D-3) → propose RotateSubEnableStorageEnvelope through Raft
+  (6D-4 wire) → post-apply re-read discriminating fresh-success
+  vs. stale-DEKID race. The 6D-6b CLI and 6D-6c main.go wiring +
+  integration test slice on top of this server method.
 
 ## Open milestones
-- **6D-6** — `EnableStorageEnvelope` admin RPC + CLI command +
-  integration test composing 6D-3 + 6D-4 + 6D-5.
+
+- **6D-6b** — `elastickv-admin enable-storage-envelope` CLI
+  subcommand that drives the server method end-to-end.
+- **6D-6c** — main.go production wiring: cipher + WithEncryption
+  + WithStorageEnvelopeGate threaded from the sidecar, plus the
+  CapabilityFanout closure bound to the live Raft membership
+  view. End-to-end integration test exercises a single-node
+  cluster Bootstrap → EnableStorageEnvelope → Put → read-back-
+  via-envelope.
 
 ## 0. Why this doc exists
 

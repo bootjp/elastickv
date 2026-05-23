@@ -3,10 +3,14 @@ package adapter
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -266,6 +270,9 @@ func TestEncryptionAdmin_MutatingRPCs_RejectWithoutProposer(t *testing.T) {
 	if _, err := srv.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest()); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("RegisterEncryptionWriter status=%v, want FailedPrecondition (no proposer wired)", status.Code(err))
 	}
+	if _, err := srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest()); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition (no proposer wired)", status.Code(err))
+	}
 }
 
 func validBootstrapEncryptionRequest() *pb.BootstrapEncryptionRequest {
@@ -286,6 +293,13 @@ func validRotateDEKRequest() *pb.RotateDEKRequest {
 		Purpose:            pb.RotateDEKRequest_PURPOSE_STORAGE,
 		NewDekId:           5,
 		WrappedNewDek:      []byte("wrapped-bytes"),
+		ProposerNodeId:     11,
+		ProposerLocalEpoch: 7,
+	}
+}
+
+func validEnableStorageEnvelopeRequest() *pb.EnableStorageEnvelopeRequest {
+	return &pb.EnableStorageEnvelopeRequest{
 		ProposerNodeId:     11,
 		ProposerLocalEpoch: 7,
 	}
@@ -1017,4 +1031,863 @@ func writeSidecarFixture(t *testing.T, sc *encryption.Sidecar) string {
 		t.Fatalf("WriteSidecar: %v", err)
 	}
 	return path
+}
+
+// fixedCapabilityFanout returns a closure that yields the supplied
+// result regardless of context — lets tests drive the §4 fan-out
+// branches deterministically without spinning real clients. A
+// non-nil err exercises the "fan-out helper itself failed" path
+// (§3.2 step 7 wraps as FailedPrecondition).
+func fixedCapabilityFanout(result admin.CapabilityFanoutResult, err error) CapabilityFanoutFn {
+	return func(context.Context) (admin.CapabilityFanoutResult, error) {
+		return result, err
+	}
+}
+
+// failOnCallCapabilityFanout returns a closure that fails the test
+// if it is invoked. Used by the §6.4 idempotent-retry tests to
+// pin the "already-active short-circuit must NOT run fan-out"
+// invariant: a regression that re-ordered the cutoverPrecheck so
+// the fan-out fired before the short-circuit would trip this
+// fixture and the test would fail at the wire-level rather than
+// silently passing on a successful fan-out. PR812 coderabbit
+// quick-win round-2.
+func failOnCallCapabilityFanout(t *testing.T) CapabilityFanoutFn {
+	t.Helper()
+	return func(context.Context) (admin.CapabilityFanoutResult, error) {
+		t.Errorf("capability fan-out invoked on idempotent-retry path; the §6.4 short-circuit MUST skip fan-out")
+		return admin.CapabilityFanoutResult{}, errors.New("fan-out invoked on idempotent path")
+	}
+}
+
+// applyingProposer is a recordingProposer that also simulates the
+// FSM apply by writing the supplied applyFn output into the
+// sidecar before returning from Propose. The 6D-6 RPC re-reads
+// the sidecar after Propose to discriminate fresh-success vs.
+// stale-DEKID vs. concurrent-overlap; without simulating the
+// apply, the RPC's post-read would always see the pre-cutover
+// sidecar and incorrectly classify every propose as stale-DEKID.
+type applyingProposer struct {
+	recordingProposer
+	sidecarPath string
+	applyFn     func(*encryption.Sidecar, uint64)
+}
+
+func (p *applyingProposer) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	res, err := p.recordingProposer.Propose(ctx, data)
+	if err != nil || res == nil || p.applyFn == nil {
+		return res, err
+	}
+	sc, rerr := encryption.ReadSidecar(p.sidecarPath)
+	if rerr != nil {
+		return nil, rerr
+	}
+	p.applyFn(sc, res.CommitIndex)
+	if werr := encryption.WriteSidecar(p.sidecarPath, sc); werr != nil {
+		return nil, werr
+	}
+	return res, nil
+}
+
+// applyCutover is the §6.4 fresh-success apply effect: flip
+// StorageEnvelopeActive to true and stamp the cutover index with
+// the apply's Raft index. Used by the EnableStorageEnvelope happy-
+// path test to drive the post-Propose sidecar re-read into the
+// fresh-success branch.
+func applyCutover(sc *encryption.Sidecar, raftIdx uint64) {
+	sc.StorageEnvelopeActive = true
+	sc.StorageEnvelopeCutoverIndex = raftIdx
+	if raftIdx > sc.RaftAppliedIndex {
+		sc.RaftAppliedIndex = raftIdx
+	}
+}
+
+// applyStaleDEKIDRace simulates the §2.1 #3 benign-no-op: the
+// applier consumed the entry without flipping
+// StorageEnvelopeActive (because a RotateDEK raced and advanced
+// Active.Storage). Only RaftAppliedIndex advances.
+func applyStaleDEKIDRace(sc *encryption.Sidecar, raftIdx uint64) {
+	if raftIdx > sc.RaftAppliedIndex {
+		sc.RaftAppliedIndex = raftIdx
+	}
+}
+
+// allOKFanoutResult is the deterministic "fan-out approved" fixture
+// the happy-path test feeds the cutover RPC. The build SHA is
+// trivially distinct so the projection-to-proto check can assert
+// the field actually flows through (a regression that dropped the
+// SHA would otherwise pass on an empty-string comparison).
+func allOKFanoutResult() admin.CapabilityFanoutResult {
+	return admin.CapabilityFanoutResult{
+		Verdicts: []admin.CapabilityVerdict{
+			{FullNodeID: 11, EncryptionCapable: true, BuildSHA: "build-n1", SidecarPresent: true, Reachable: true},
+			{FullNodeID: 22, EncryptionCapable: true, BuildSHA: "build-n2", SidecarPresent: true, Reachable: true},
+		},
+		OK: true,
+	}
+}
+
+// cutoverReadySidecarFixture writes a sidecar past Bootstrap but
+// pre-cutover (Active.Storage != 0 AND StorageEnvelopeActive ==
+// false). Returns the path so the test can hand it to the server
+// + re-read it afterwards to verify the apply effect.
+func cutoverReadySidecarFixture(t *testing.T) string {
+	t.Helper()
+	return writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 5, Raft: 6},
+		Keys: map[string]encryption.SidecarKey{
+			"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0},
+			"6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0},
+		},
+		RaftAppliedIndex: 100,
+	})
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnFollower
+// pins the §3.2 step 3 leader gate. The leader hint must be
+// embedded in the FailedPrecondition status detail so the
+// operator's CLI can retry against the right node.
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnFollower(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{
+			state:  raftengine.StateFollower,
+			leader: raftengine.LeaderInfo{ID: "n2", Address: "127.0.0.1:50052"},
+		}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "n2") || !strings.Contains(err.Error(), "127.0.0.1:50052") {
+		t.Errorf("error %q does not embed the leader hint (id=n2 addr=127.0.0.1:50052)", err)
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsWithoutSidecarPath
+// covers the §6.4 sidecar dependency: without a sidecar path
+// wired, the RPC cannot read the pre-cutover state and refuses.
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsWithoutSidecarPath(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+	)
+	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsZeroProposerNodeID
+// pins §3.1 / §6.1: the not-capable sentinel (full_node_id=0) is
+// rejected at the gRPC boundary before any sidecar read.
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsZeroProposerNodeID(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	req := validEnableStorageEnvelopeRequest()
+	req.ProposerNodeId = 0
+	_, err := srv.EnableStorageEnvelope(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("EnableStorageEnvelope status=%v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsOversizedLocalEpoch
+// pins §3.1 / §4.1: the proto3 uint32 wire field MUST be <= 0xFFFF.
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOversizedLocalEpoch(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	req := validEnableStorageEnvelopeRequest()
+	req.ProposerLocalEpoch = math.MaxUint16 + 1
+	_, err := srv.EnableStorageEnvelope(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("EnableStorageEnvelope status=%v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsNotBootstrapped
+// pins §3.2 step 4: a sidecar with Active.Storage == 0 means
+// BootstrapEncryption has not committed yet, so the cutover must
+// refuse with a clear hint.
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsNotBootstrapped(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 0, Raft: 0},
+		Keys:   map[string]encryption.SidecarKey{},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+	)
+	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "BootstrapEncryption") {
+		t.Errorf("error %q does not hint at BootstrapEncryption", err)
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_IdempotentRetry pins
+// §3.2 step 5 + §6.4: a duplicate call against an already-active
+// sidecar returns OK with was_already_active=true and
+// applied_index = sidecar.StorageEnvelopeCutoverIndex. No
+// capability fan-out, no propose. The CapabilitySummary is
+// intentionally empty so a caller cannot accidentally re-use
+// the original cutover's membership view (which may no longer
+// reflect current cluster shape).
+func TestEncryptionAdmin_EnableStorageEnvelope_IdempotentRetry(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active:                      encryption.ActiveKeys{Storage: 5, Raft: 6},
+		Keys:                        map[string]encryption.SidecarKey{"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0}, "6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0}},
+		StorageEnvelopeActive:       true,
+		StorageEnvelopeCutoverIndex: 555,
+		RaftAppliedIndex:            900,
+	})
+	proposer := &recordingProposer{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		// Use failOnCallCapabilityFanout: the §6.4 short-circuit
+		// MUST skip the fan-out; if a regression re-ordered the
+		// checks the fan-out fixture trips the test.
+		WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
+	)
+	got, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableStorageEnvelope: %v", err)
+	}
+	if !got.WasAlreadyActive {
+		t.Error("WasAlreadyActive=false, want true (idempotent retry)")
+	}
+	if got.AppliedIndex != 555 {
+		t.Errorf("AppliedIndex=%d, want 555 (original StorageEnvelopeCutoverIndex)", got.AppliedIndex)
+	}
+	if got.CutoverIndexUnknown {
+		t.Error("CutoverIndexUnknown=true, want false (cutover index is set)")
+	}
+	if len(got.CapabilitySummary) != 0 {
+		t.Errorf("CapabilitySummary len=%d, want 0 (empty on idempotent retries)", len(got.CapabilitySummary))
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (no propose on idempotent retry)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_DefensiveCutoverIndexUnknown
+// pins the §6.4 defensive branch: a sidecar reporting
+// StorageEnvelopeActive=true paired with
+// StorageEnvelopeCutoverIndex=0 is operationally impossible under
+// the 6D-4 apply path but hedged against schema rollback / hand-
+// edited sidecars. The RPC falls back to RaftAppliedIndex with
+// CutoverIndexUnknown=true so operators see the warning.
+func TestEncryptionAdmin_EnableStorageEnvelope_DefensiveCutoverIndexUnknown(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active:                      encryption.ActiveKeys{Storage: 5, Raft: 6},
+		Keys:                        map[string]encryption.SidecarKey{"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0}, "6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0}},
+		StorageEnvelopeActive:       true,
+		StorageEnvelopeCutoverIndex: 0, // operationally impossible; hedge for hand-edits
+		RaftAppliedIndex:            900,
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		// The §6.4 defensive branch is still on the
+		// idempotent-retry path (sidecar reports active); fan-out
+		// MUST be skipped exactly as in the standard retry case.
+		WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
+	)
+	got, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableStorageEnvelope: %v", err)
+	}
+	if !got.WasAlreadyActive {
+		t.Error("WasAlreadyActive=false, want true (sidecar reports active)")
+	}
+	if !got.CutoverIndexUnknown {
+		t.Error("CutoverIndexUnknown=false, want true (defensive branch)")
+	}
+	if got.AppliedIndex != 900 {
+		t.Errorf("AppliedIndex=%d, want 900 (RaftAppliedIndex fallback)", got.AppliedIndex)
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsWithoutCapabilityFanout
+// pins the §4 pre-flight requirement: without the fan-out wired,
+// the RPC refuses even on a fully-bootstrapped pre-cutover
+// sidecar. The §6D-6 main.go wiring is what threads the fan-out
+// in; tests that skip it deliberately must opt out via the
+// idempotent-retry path (already-active sidecar).
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsWithoutCapabilityFanout(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition (no fan-out wired)", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnCapabilityRefusal
+// pins §3.2 step 7: any fan-out verdict with
+// EncryptionCapable=false or Reachable=false fails the pre-flight
+// and the RPC refuses with FailedPrecondition. The status detail
+// names the specific node so the operator's CLI can diagnose
+// without trawling leader logs.
+//
+// Table-driven across the two refusal shapes so both branches of
+// capabilityRefusalSummary (Reachable=false first, then
+// EncryptionCapable=false) are exercised — without the unreachable
+// case the "unreachable member" status detail would lose its
+// regression coverage. PR812 claude P2.
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnCapabilityRefusal(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		refusal     admin.CapabilityFanoutResult
+		wantNodeStr string
+		wantReason  string
+	}{
+		{
+			name: "not_capable",
+			refusal: admin.CapabilityFanoutResult{
+				Verdicts: []admin.CapabilityVerdict{
+					{FullNodeID: 11, EncryptionCapable: true, BuildSHA: "build-n1", SidecarPresent: true, Reachable: true},
+					{FullNodeID: 99, EncryptionCapable: false, BuildSHA: "build-n99", SidecarPresent: false, Reachable: true},
+				},
+				OK: false,
+			},
+			wantNodeStr: "99",
+			wantReason:  "not-capable",
+		},
+		{
+			name: "unreachable",
+			refusal: admin.CapabilityFanoutResult{
+				Verdicts: []admin.CapabilityVerdict{
+					{FullNodeID: 11, EncryptionCapable: true, BuildSHA: "build-n1", SidecarPresent: true, Reachable: true},
+					{FullNodeID: 88, EncryptionCapable: false, BuildSHA: "", SidecarPresent: false, Reachable: false},
+				},
+				OK: false,
+			},
+			wantNodeStr: "88",
+			wantReason:  "unreachable",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runCapabilityRefusalCase(t, tc.refusal, tc.wantNodeStr, tc.wantReason)
+		})
+	}
+}
+
+func runCapabilityRefusalCase(t *testing.T, refusal admin.CapabilityFanoutResult, wantNodeStr, wantReason string) {
+	t.Helper()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(refusal, nil)),
+	)
+	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), wantNodeStr) {
+		t.Errorf("error %q does not name the refusing node (full_node_id=%s)", err, wantNodeStr)
+	}
+	if err == nil || !strings.Contains(err.Error(), wantReason) {
+		t.Errorf("error %q does not name the refusal reason (%q)", err, wantReason)
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnFanoutError
+// covers the §3.2 step 7 wrap-fallback: the fan-out helper itself
+// erroring out (e.g., zero-member snapshot rejected by input
+// validation) surfaces as FailedPrecondition rather than Internal,
+// so the operator's CLI treats it as a configuration issue rather
+// than a transient bug.
+func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnFanoutError(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(admin.CapabilityFanoutResult{}, errors.New("fan-out: bad routes input"))),
+	)
+	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_SerializesConcurrentCutovers
+// pins the §2.1 #4 mutator-lock invariant: two concurrent cutover
+// RPCs MUST NOT both produce a freshCutoverResponse — the second
+// one must observe StorageEnvelopeActive=true at its precheck and
+// fall through to the §6.4 idempotent-retry shape. Coderabbit
+// Major on PR812.
+//
+// The applying proposer flips the sidecar on the FIRST propose
+// call. The second call enters EnableStorageEnvelope, waits on
+// cutoverMu, then runs its precheck. Without the lock, the
+// second call's precheck could see the pre-flip sidecar and
+// re-propose — producing a freshCutoverResponse with
+// WasAlreadyActive=false but the FIRST cutover's
+// StorageEnvelopeCutoverIndex (the §6.4 contract violation).
+func TestEncryptionAdmin_EnableStorageEnvelope_SerializesConcurrentCutovers(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 7000},
+		sidecarPath:       path,
+		applyFn:           applyCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+	)
+	const callers = 4
+	results := make(chan *pb.EnableStorageEnvelopeResponse, callers)
+	errs := make(chan error, callers)
+	var ready sync.WaitGroup
+	var release sync.WaitGroup
+	ready.Add(callers)
+	release.Add(1)
+	for range callers {
+		go func() {
+			ready.Done()
+			release.Wait()
+			resp, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+			results <- resp
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	release.Done()
+	freshCount := 0
+	idempotentCount := 0
+	for i := 0; i < callers; i++ {
+		err := <-errs
+		resp := <-results
+		if err != nil {
+			t.Fatalf("EnableStorageEnvelope call %d: %v", i, err)
+		}
+		if resp.WasAlreadyActive {
+			idempotentCount++
+		} else {
+			freshCount++
+		}
+	}
+	if freshCount != 1 {
+		t.Errorf("freshCount=%d, want exactly 1 (only one caller should propose; the rest must hit the §6.4 idempotent-retry path)", freshCount)
+	}
+	if idempotentCount != callers-1 {
+		t.Errorf("idempotentCount=%d, want %d", idempotentCount, callers-1)
+	}
+	if len(proposer.calls) != 1 {
+		t.Errorf("proposer.calls=%d, want 1 (cutover proposed exactly once across concurrent callers)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_PreCanceledCtxDeterministicShortCircuit
+// pins codex P1 round-4 on PR812: when ctx is already canceled
+// at entry AND the cutoverSem has capacity (no in-flight cutover
+// is holding it), Go's select would pick non-deterministically
+// between the send case and the ctx.Done case. An explicit
+// ctx.Err() check before the select turns the cancellation into
+// a deterministic short-circuit so a caller who canceled before
+// the RPC even started cannot accidentally drive precheck /
+// fan-out / propose work.
+//
+// The test repeats the pre-canceled call N times against a fresh
+// (capacity-free) semaphore: every iteration MUST surface the
+// ctx error, never advance into the fan-out closure (which the
+// test fixture would observe via a t.Errorf if hit).
+func TestEncryptionAdmin_EnableStorageEnvelope_PreCanceledCtxDeterministicShortCircuit(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		ctxFn    func() (context.Context, context.CancelFunc)
+		wantCode codes.Code
+	}{
+		{
+			name: "canceled",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			wantCode: codes.Canceled,
+		},
+		{
+			name: "deadline_exceeded",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				return ctx, cancel
+			},
+			wantCode: codes.DeadlineExceeded,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// failOnCallCapabilityFanout fires t.Errorf if the
+			// RPC ever advances into fan-out — that would mean
+			// the semaphore acquire DID take the send case
+			// despite the canceled ctx.
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(&recordingProposer{}),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+				WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+				WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
+			)
+			// 100 iterations against a freshly-created server
+			// (semaphore is empty / capacity available). Without
+			// the explicit ctx.Err() check, Go's pseudo-random
+			// select choice would make some of these iterations
+			// advance into precheck/fan-out, tripping the
+			// failOnCallCapabilityFanout fixture.
+			for range 100 {
+				ctx, cancel := tc.ctxFn()
+				_, err := srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+				cancel()
+				if status.Code(err) != tc.wantCode {
+					t.Fatalf("EnableStorageEnvelope status=%v, want %v (must short-circuit on pre-canceled ctx)",
+						status.Code(err), tc.wantCode)
+				}
+			}
+		})
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_HonorsCtxDeadlineWaitingOnMutator
+// pins codex P2 round-3 on PR812: when one cutover RPC holds
+// the mutator semaphore through a slow fan-out + propose, a
+// concurrent caller with a short deadline MUST return
+// DeadlineExceeded / Canceled at the gRPC boundary rather than
+// blocking past its own ctx.
+//
+// The test drives the first call into a fan-out that blocks
+// indefinitely on a never-firing channel; while it sits in
+// fan-out (holding cutoverSem), the second call attempts the
+// RPC with an already-expired ctx and must return immediately
+// with the matching gRPC code.
+func TestEncryptionAdmin_EnableStorageEnvelope_HonorsCtxDeadlineWaitingOnMutator(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	blockFanout := make(chan struct{}) // never closed; first call blocks here forever
+	t.Cleanup(func() { close(blockFanout) })
+	blockingFanout := func(callCtx context.Context) (admin.CapabilityFanoutResult, error) {
+		select {
+		case <-blockFanout:
+			return admin.CapabilityFanoutResult{}, errors.New("test teardown")
+		case <-callCtx.Done():
+			return admin.CapabilityFanoutResult{}, callCtx.Err()
+		}
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(blockingFanout),
+	)
+	// First call: launch in a goroutine; it holds cutoverSem
+	// while blocked in fan-out.
+	firstStarted := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		close(firstStarted)
+		_, _ = srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+	}()
+	<-firstStarted
+	// Yield so the first call reaches the fan-out wait — a
+	// short sleep is the only reliable signal short of plumbing
+	// a "fan-out entered" channel through the test fixture.
+	time.Sleep(50 * time.Millisecond)
+	// Second call with an already-expired ctx. It must NOT
+	// block past its deadline waiting on the mutator semaphore.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+	start := time.Now()
+	_, err := srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("EnableStorageEnvelope blocked %v past ctx deadline; want immediate return", elapsed)
+	}
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("EnableStorageEnvelope status=%v, want DeadlineExceeded", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellationOnFanoutNotOK
+// pins codex P2 round-2 on PR812: the production fan-out helper
+// can synthesize Reachable=false verdicts and return (result, nil)
+// with OK=false when ctx expires mid-probe. In that case
+// EnableStorageEnvelope MUST preserve the transport-layer
+// cancellation/deadline shape rather than misclassifying the
+// outcome as a configuration refusal.
+func TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellationOnFanoutNotOK(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		ctxFn    func() (context.Context, context.CancelFunc)
+		wantCode codes.Code
+	}{
+		{
+			name: "canceled",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			wantCode: codes.Canceled,
+		},
+		{
+			name: "deadline_exceeded",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				return ctx, cancel
+			},
+			wantCode: codes.DeadlineExceeded,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Synthesize the production fan-out's behavior: it returns
+			// a NOT-OK result without err when ctx expired mid-probe.
+			notOK := admin.CapabilityFanoutResult{
+				Verdicts: []admin.CapabilityVerdict{{FullNodeID: 11, Reachable: false}},
+				OK:       false,
+			}
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(&recordingProposer{}),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+				WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+				WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(notOK, nil)),
+			)
+			ctx, cancel := tc.ctxFn()
+			defer cancel()
+			_, err := srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+			if status.Code(err) != tc.wantCode {
+				t.Errorf("EnableStorageEnvelope status=%v, want %v (ctx error should take precedence over FailedPrecondition)",
+					status.Code(err), tc.wantCode)
+			}
+		})
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellation
+// pins the codex P2 finding on PR812: context.Canceled and
+// context.DeadlineExceeded surfaced by the fan-out closure MUST
+// keep their native gRPC code (Canceled / DeadlineExceeded)
+// rather than being squashed into FailedPrecondition.
+// FailedPrecondition is a configuration-failure signal; mapping
+// a transport-layer cancellation to it breaks client retry
+// logic that switches on the code.
+func TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellation(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		err      error
+		wantCode codes.Code
+	}{
+		{name: "canceled", err: context.Canceled, wantCode: codes.Canceled},
+		{name: "deadline_exceeded", err: context.DeadlineExceeded, wantCode: codes.DeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(&recordingProposer{}),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+				WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+				WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(admin.CapabilityFanoutResult{}, tc.err)),
+			)
+			_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+			if status.Code(err) != tc.wantCode {
+				t.Errorf("EnableStorageEnvelope status=%v, want %v", status.Code(err), tc.wantCode)
+			}
+		})
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_HappyPath drives the
+// full §3.2 happy path: leader gate passes, fan-out approves,
+// propose lands, post-apply sidecar shows the cutover effect, the
+// response carries WasAlreadyActive=false +
+// CapabilitySummary populated + AppliedIndex matching the
+// proposed Raft index. The applying proposer also simulates the
+// §6.4 apply (StorageEnvelopeActive=true,
+// StorageEnvelopeCutoverIndex=raftIdx) so the post-Propose
+// sidecar read takes the fresh-success branch rather than the
+// stale-DEKID fallback.
+func TestEncryptionAdmin_EnableStorageEnvelope_HappyPath(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 1234},
+		sidecarPath:       path,
+		applyFn:           applyCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+	)
+	got, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableStorageEnvelope: %v", err)
+	}
+	assertFreshCutoverResponse(t, got, 1234, 2)
+	// Wire-level pin: verify the proposed Raft entry decodes as
+	// SubTag=RotateSubEnableStorageEnvelope with the §2.1
+	// constraints (Purpose=PurposeStorage, len(Wrapped)==0,
+	// DEKID=sidecar.Active.Storage).
+	assertSingleProposalOpcode(t, proposer.calls, fsmwire.OpRotation)
+	decoded, err := fsmwire.DecodeRotation(proposer.calls[0][1:])
+	if err != nil {
+		t.Fatalf("DecodeRotation: %v", err)
+	}
+	assertCutoverProposalShape(t, decoded, 5, 11, 7)
+}
+
+// assertFreshCutoverResponse pins the §3.2 happy-path response
+// shape: WasAlreadyActive=false, CutoverIndexUnknown=false,
+// AppliedIndex matches the proposed Raft index, capability
+// summary populated with the expected verdict count.
+func assertFreshCutoverResponse(t *testing.T, resp *pb.EnableStorageEnvelopeResponse, wantIdx uint64, wantVerdicts int) {
+	t.Helper()
+	if resp.WasAlreadyActive {
+		t.Error("WasAlreadyActive=true, want false (fresh cutover)")
+	}
+	if resp.CutoverIndexUnknown {
+		t.Error("CutoverIndexUnknown=true, want false")
+	}
+	if resp.AppliedIndex != wantIdx {
+		t.Errorf("AppliedIndex=%d, want %d (proposed Raft index)", resp.AppliedIndex, wantIdx)
+	}
+	if len(resp.CapabilitySummary) != wantVerdicts {
+		t.Errorf("CapabilitySummary len=%d, want %d", len(resp.CapabilitySummary), wantVerdicts)
+	}
+}
+
+// assertCutoverProposalShape pins the §2.1 wire layout of a
+// decoded cutover rotation: SubTag=RotateSubEnableStorageEnvelope,
+// empty Wrapped, Purpose=PurposeStorage, ProposerRegistration
+// matching the supplied identifiers.
+func assertCutoverProposalShape(t *testing.T, decoded fsmwire.RotationPayload, wantDEKID uint32, wantNodeID uint64, wantEpoch uint16) {
+	t.Helper()
+	if decoded.SubTag != fsmwire.RotateSubEnableStorageEnvelope {
+		t.Errorf("SubTag=0x%02x, want RotateSubEnableStorageEnvelope (0x04)", decoded.SubTag)
+	}
+	if decoded.DEKID != wantDEKID {
+		t.Errorf("DEKID=%d, want %d (sidecar.Active.Storage)", decoded.DEKID, wantDEKID)
+	}
+	if decoded.Purpose != fsmwire.PurposeStorage {
+		t.Errorf("Purpose=%v, want PurposeStorage", decoded.Purpose)
+	}
+	if len(decoded.Wrapped) != 0 {
+		t.Errorf("Wrapped len=%d, want 0 (§2.1 constraint #2)", len(decoded.Wrapped))
+	}
+	if decoded.ProposerRegistration.DEKID != wantDEKID ||
+		decoded.ProposerRegistration.FullNodeID != wantNodeID ||
+		decoded.ProposerRegistration.LocalEpoch != wantEpoch {
+		t.Errorf("ProposerRegistration=%+v, want {DEKID:%d FullNodeID:%d LocalEpoch:%d}",
+			decoded.ProposerRegistration, wantDEKID, wantNodeID, wantEpoch)
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_StaleDEKIDRace pins
+// §2.1 #3: when a RotateDEK races between propose and apply, the
+// 6D-4 applier consumes the cutover entry as a benign no-op
+// (sidecar.StorageEnvelopeActive stays false), and the RPC's
+// post-apply read takes the stale-DEKID branch. The RPC must
+// surface FailedPrecondition with a retry hint rather than
+// reporting fresh-success.
+func TestEncryptionAdmin_EnableStorageEnvelope_StaleDEKIDRace(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 1234},
+		sidecarPath:       path,
+		applyFn:           applyStaleDEKIDRace, // does NOT flip StorageEnvelopeActive
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+	)
+	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition (stale DEKID race)", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "RotateDEK") {
+		t.Errorf("error %q does not hint at the RotateDEK race", err)
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_CapabilitySummaryProjection
+// pins the wire-shape mapping from internal CapabilityVerdict to
+// proto.CapabilityVerdict. A regression that re-orders or drops
+// any field would show up here rather than at the user-facing
+// RPC client.
+func TestEncryptionAdmin_EnableStorageEnvelope_CapabilitySummaryProjection(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 2025},
+		sidecarPath:       path,
+		applyFn:           applyCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+	)
+	got, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableStorageEnvelope: %v", err)
+	}
+	if len(got.CapabilitySummary) != 2 {
+		t.Fatalf("CapabilitySummary len=%d, want 2", len(got.CapabilitySummary))
+	}
+	assertProtoVerdict(t, got.CapabilitySummary[0], 11, "build-n1")
+	assertProtoVerdict(t, got.CapabilitySummary[1], 22, "build-n2")
+}
+
+// assertProtoVerdict pins one row of the projected
+// proto.CapabilityVerdict slice. All fan-out OK-path verdicts
+// share the same shape (EncryptionCapable=true, SidecarPresent=true,
+// Reachable not projected); the per-row assertion captures only
+// the variable identity fields so the caller test stays terse.
+func assertProtoVerdict(t *testing.T, v *pb.CapabilityVerdict, wantNodeID uint64, wantBuildSHA string) {
+	t.Helper()
+	if v.FullNodeId != wantNodeID || v.BuildSha != wantBuildSHA || !v.EncryptionCapable || !v.SidecarPresent {
+		t.Errorf("verdict=%+v, want {FullNodeId:%d BuildSha:%s EncryptionCapable:true SidecarPresent:true}",
+			v, wantNodeID, wantBuildSHA)
+	}
 }

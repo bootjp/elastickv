@@ -818,6 +818,240 @@ func (x *ResyncSidecarResponse) GetWriterRegistryForCaller() map[uint32]uint32 {
 	return nil
 }
 
+// EnableStorageEnvelopeRequest proposes the §7.1 Phase 1 cutover
+// that flips the cluster from cleartext storage writes to §4.1
+// envelope writes. Defined in the 6D design doc §3.1; the server
+// composes a RotationPayload with SubTag =
+// RotateSubEnableStorageEnvelope (0x04) and routes it through the
+// default Raft group's leader as a §11.3 0x05 OpRotation entry.
+//
+// proposer_node_id MUST be non-zero (the §6.1 "not-capable"
+// sentinel is rejected at the server boundary, matching the
+// existing RotateDEK / BootstrapEncryption posture).
+//
+// proposer_local_epoch carries the §4.1 16-bit nonce field as
+// uint32 (proto3 has no uint16); values above 0xFFFF are
+// rejected at the server boundary before any Raft proposal is
+// composed. ApplyRotation re-validates at apply time
+// (defense-in-depth).
+type EnableStorageEnvelopeRequest struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	ProposerNodeId     uint64                 `protobuf:"varint,1,opt,name=proposer_node_id,json=proposerNodeId,proto3" json:"proposer_node_id,omitempty"`
+	ProposerLocalEpoch uint32                 `protobuf:"varint,2,opt,name=proposer_local_epoch,json=proposerLocalEpoch,proto3" json:"proposer_local_epoch,omitempty"` // MUST be <= 0xFFFF on the wire.
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *EnableStorageEnvelopeRequest) Reset() {
+	*x = EnableStorageEnvelopeRequest{}
+	mi := &file_encryption_admin_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EnableStorageEnvelopeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EnableStorageEnvelopeRequest) ProtoMessage() {}
+
+func (x *EnableStorageEnvelopeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_encryption_admin_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EnableStorageEnvelopeRequest.ProtoReflect.Descriptor instead.
+func (*EnableStorageEnvelopeRequest) Descriptor() ([]byte, []int) {
+	return file_encryption_admin_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *EnableStorageEnvelopeRequest) GetProposerNodeId() uint64 {
+	if x != nil {
+		return x.ProposerNodeId
+	}
+	return 0
+}
+
+func (x *EnableStorageEnvelopeRequest) GetProposerLocalEpoch() uint32 {
+	if x != nil {
+		return x.ProposerLocalEpoch
+	}
+	return 0
+}
+
+// EnableStorageEnvelopeResponse reports the outcome of a cutover
+// proposal. The §6.4 idempotency contract is encoded as an OK
+// status with `was_already_active = true` (NOT AlreadyExists,
+// since unary gRPC drops the response body on non-OK status; the
+// applied_index must be reachable on the success path).
+//
+// On a fresh cutover (was_already_active == false), applied_index
+// is the Raft index of the entry the leader just proposed and
+// waited to apply. On a retried call, applied_index is the
+// recorded sidecar.StorageEnvelopeCutoverIndex from the ORIGINAL
+// cutover (§6.4) — stable across arbitrary subsequent
+// encryption-relevant Raft activity.
+//
+// capability_summary records which (full_node_id) members were
+// probed during the pre-flight gate and what they reported.
+// Empty on idempotent retries (was_already_active=true); the
+// membership view of the original cutover is not retained.
+//
+// cutover_index_unknown is the §6.4 defensive fallback: it only
+// fires if a sidecar reports StorageEnvelopeActive=true with
+// StorageEnvelopeCutoverIndex=0 (operationally impossible under
+// normal apply, but hedged against future schema rollback). On
+// healthy clusters this stays false. The field is only
+// meaningful when was_already_active=true.
+type EnableStorageEnvelopeResponse struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	AppliedIndex        uint64                 `protobuf:"varint,1,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	CapabilitySummary   []*CapabilityVerdict   `protobuf:"bytes,2,rep,name=capability_summary,json=capabilitySummary,proto3" json:"capability_summary,omitempty"`
+	CutoverIndexUnknown bool                   `protobuf:"varint,3,opt,name=cutover_index_unknown,json=cutoverIndexUnknown,proto3" json:"cutover_index_unknown,omitempty"`
+	WasAlreadyActive    bool                   `protobuf:"varint,4,opt,name=was_already_active,json=wasAlreadyActive,proto3" json:"was_already_active,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *EnableStorageEnvelopeResponse) Reset() {
+	*x = EnableStorageEnvelopeResponse{}
+	mi := &file_encryption_admin_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EnableStorageEnvelopeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EnableStorageEnvelopeResponse) ProtoMessage() {}
+
+func (x *EnableStorageEnvelopeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_encryption_admin_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EnableStorageEnvelopeResponse.ProtoReflect.Descriptor instead.
+func (*EnableStorageEnvelopeResponse) Descriptor() ([]byte, []int) {
+	return file_encryption_admin_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *EnableStorageEnvelopeResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *EnableStorageEnvelopeResponse) GetCapabilitySummary() []*CapabilityVerdict {
+	if x != nil {
+		return x.CapabilitySummary
+	}
+	return nil
+}
+
+func (x *EnableStorageEnvelopeResponse) GetCutoverIndexUnknown() bool {
+	if x != nil {
+		return x.CutoverIndexUnknown
+	}
+	return false
+}
+
+func (x *EnableStorageEnvelopeResponse) GetWasAlreadyActive() bool {
+	if x != nil {
+		return x.WasAlreadyActive
+	}
+	return false
+}
+
+// CapabilityVerdict is one row of the §4 fan-out summary the
+// cutover RPC returns. full_node_id is the route member the leader
+// probed; the remaining fields mirror the corresponding member's
+// CapabilityReport. A cluster where any verdict has
+// encryption_capable=false MUST NOT reach the propose step; the
+// summary in the response is the post-hoc record for operators.
+type CapabilityVerdict struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	FullNodeId        uint64                 `protobuf:"varint,1,opt,name=full_node_id,json=fullNodeId,proto3" json:"full_node_id,omitempty"`
+	EncryptionCapable bool                   `protobuf:"varint,2,opt,name=encryption_capable,json=encryptionCapable,proto3" json:"encryption_capable,omitempty"`
+	BuildSha          string                 `protobuf:"bytes,3,opt,name=build_sha,json=buildSha,proto3" json:"build_sha,omitempty"`
+	SidecarPresent    bool                   `protobuf:"varint,4,opt,name=sidecar_present,json=sidecarPresent,proto3" json:"sidecar_present,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *CapabilityVerdict) Reset() {
+	*x = CapabilityVerdict{}
+	mi := &file_encryption_admin_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CapabilityVerdict) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CapabilityVerdict) ProtoMessage() {}
+
+func (x *CapabilityVerdict) ProtoReflect() protoreflect.Message {
+	mi := &file_encryption_admin_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CapabilityVerdict.ProtoReflect.Descriptor instead.
+func (*CapabilityVerdict) Descriptor() ([]byte, []int) {
+	return file_encryption_admin_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CapabilityVerdict) GetFullNodeId() uint64 {
+	if x != nil {
+		return x.FullNodeId
+	}
+	return 0
+}
+
+func (x *CapabilityVerdict) GetEncryptionCapable() bool {
+	if x != nil {
+		return x.EncryptionCapable
+	}
+	return false
+}
+
+func (x *CapabilityVerdict) GetBuildSha() string {
+	if x != nil {
+		return x.BuildSha
+	}
+	return ""
+}
+
+func (x *CapabilityVerdict) GetSidecarPresent() bool {
+	if x != nil {
+		return x.SidecarPresent
+	}
+	return false
+}
+
 var File_encryption_admin_proto protoreflect.FileDescriptor
 
 const file_encryption_admin_proto_rawDesc = "" +
@@ -890,14 +1124,29 @@ const file_encryption_admin_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\x1aJ\n" +
 	"\x1cWriterRegistryForCallerEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\rR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\rR\x05value:\x028\x012\xa0\x03\n" +
+	"\x05value\x18\x02 \x01(\rR\x05value:\x028\x01\"z\n" +
+	"\x1cEnableStorageEnvelopeRequest\x12(\n" +
+	"\x10proposer_node_id\x18\x01 \x01(\x04R\x0eproposerNodeId\x120\n" +
+	"\x14proposer_local_epoch\x18\x02 \x01(\rR\x12proposerLocalEpoch\"\xe9\x01\n" +
+	"\x1dEnableStorageEnvelopeResponse\x12#\n" +
+	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\x12A\n" +
+	"\x12capability_summary\x18\x02 \x03(\v2\x12.CapabilityVerdictR\x11capabilitySummary\x122\n" +
+	"\x15cutover_index_unknown\x18\x03 \x01(\bR\x13cutoverIndexUnknown\x12,\n" +
+	"\x12was_already_active\x18\x04 \x01(\bR\x10wasAlreadyActive\"\xaa\x01\n" +
+	"\x11CapabilityVerdict\x12 \n" +
+	"\ffull_node_id\x18\x01 \x01(\x04R\n" +
+	"fullNodeId\x12-\n" +
+	"\x12encryption_capable\x18\x02 \x01(\bR\x11encryptionCapable\x12\x1b\n" +
+	"\tbuild_sha\x18\x03 \x01(\tR\bbuildSha\x12'\n" +
+	"\x0fsidecar_present\x18\x04 \x01(\bR\x0esidecarPresent2\xfa\x03\n" +
 	"\x0fEncryptionAdmin\x12,\n" +
 	"\rGetCapability\x12\x06.Empty\x1a\x11.CapabilityReport\"\x00\x120\n" +
 	"\x0fGetSidecarState\x12\x06.Empty\x1a\x13.SidecarStateReport\"\x00\x12R\n" +
 	"\x13BootstrapEncryption\x12\x1b.BootstrapEncryptionRequest\x1a\x1c.BootstrapEncryptionResponse\"\x00\x124\n" +
 	"\tRotateDEK\x12\x11.RotateDEKRequest\x1a\x12.RotateDEKResponse\"\x00\x12a\n" +
 	"\x18RegisterEncryptionWriter\x12 .RegisterEncryptionWriterRequest\x1a!.RegisterEncryptionWriterResponse\"\x00\x12@\n" +
-	"\rResyncSidecar\x12\x15.ResyncSidecarRequest\x1a\x16.ResyncSidecarResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\rResyncSidecar\x12\x15.ResyncSidecarRequest\x1a\x16.ResyncSidecarResponse\"\x00\x12X\n" +
+	"\x15EnableStorageEnvelope\x12\x1d.EnableStorageEnvelopeRequest\x1a\x1e.EnableStorageEnvelopeResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_encryption_admin_proto_rawDescOnce sync.Once
@@ -912,7 +1161,7 @@ func file_encryption_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_encryption_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_encryption_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_encryption_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_encryption_admin_proto_goTypes = []any{
 	(RotateDEKRequest_Purpose)(0),            // 0: RotateDEKRequest.Purpose
 	(*Empty)(nil),                            // 1: Empty
@@ -927,36 +1176,42 @@ var file_encryption_admin_proto_goTypes = []any{
 	(*RegisterEncryptionWriterResponse)(nil), // 10: RegisterEncryptionWriterResponse
 	(*ResyncSidecarRequest)(nil),             // 11: ResyncSidecarRequest
 	(*ResyncSidecarResponse)(nil),            // 12: ResyncSidecarResponse
-	nil,                                      // 13: SidecarStateReport.WrappedDeksByIdEntry
-	nil,                                      // 14: SidecarStateReport.WriterRegistryForCallerEntry
-	nil,                                      // 15: ResyncSidecarResponse.WrappedDeksByIdEntry
-	nil,                                      // 16: ResyncSidecarResponse.WriterRegistryForCallerEntry
+	(*EnableStorageEnvelopeRequest)(nil),     // 13: EnableStorageEnvelopeRequest
+	(*EnableStorageEnvelopeResponse)(nil),    // 14: EnableStorageEnvelopeResponse
+	(*CapabilityVerdict)(nil),                // 15: CapabilityVerdict
+	nil,                                      // 16: SidecarStateReport.WrappedDeksByIdEntry
+	nil,                                      // 17: SidecarStateReport.WriterRegistryForCallerEntry
+	nil,                                      // 18: ResyncSidecarResponse.WrappedDeksByIdEntry
+	nil,                                      // 19: ResyncSidecarResponse.WriterRegistryForCallerEntry
 }
 var file_encryption_admin_proto_depIdxs = []int32{
-	13, // 0: SidecarStateReport.wrapped_deks_by_id:type_name -> SidecarStateReport.WrappedDeksByIdEntry
-	14, // 1: SidecarStateReport.writer_registry_for_caller:type_name -> SidecarStateReport.WriterRegistryForCallerEntry
+	16, // 0: SidecarStateReport.wrapped_deks_by_id:type_name -> SidecarStateReport.WrappedDeksByIdEntry
+	17, // 1: SidecarStateReport.writer_registry_for_caller:type_name -> SidecarStateReport.WriterRegistryForCallerEntry
 	4,  // 2: BootstrapEncryptionRequest.writer_batch:type_name -> WriterRegistryEntry
 	0,  // 3: RotateDEKRequest.purpose:type_name -> RotateDEKRequest.Purpose
 	4,  // 4: RegisterEncryptionWriterRequest.writers:type_name -> WriterRegistryEntry
-	15, // 5: ResyncSidecarResponse.wrapped_deks_by_id:type_name -> ResyncSidecarResponse.WrappedDeksByIdEntry
-	16, // 6: ResyncSidecarResponse.writer_registry_for_caller:type_name -> ResyncSidecarResponse.WriterRegistryForCallerEntry
-	1,  // 7: EncryptionAdmin.GetCapability:input_type -> Empty
-	1,  // 8: EncryptionAdmin.GetSidecarState:input_type -> Empty
-	5,  // 9: EncryptionAdmin.BootstrapEncryption:input_type -> BootstrapEncryptionRequest
-	7,  // 10: EncryptionAdmin.RotateDEK:input_type -> RotateDEKRequest
-	9,  // 11: EncryptionAdmin.RegisterEncryptionWriter:input_type -> RegisterEncryptionWriterRequest
-	11, // 12: EncryptionAdmin.ResyncSidecar:input_type -> ResyncSidecarRequest
-	2,  // 13: EncryptionAdmin.GetCapability:output_type -> CapabilityReport
-	3,  // 14: EncryptionAdmin.GetSidecarState:output_type -> SidecarStateReport
-	6,  // 15: EncryptionAdmin.BootstrapEncryption:output_type -> BootstrapEncryptionResponse
-	8,  // 16: EncryptionAdmin.RotateDEK:output_type -> RotateDEKResponse
-	10, // 17: EncryptionAdmin.RegisterEncryptionWriter:output_type -> RegisterEncryptionWriterResponse
-	12, // 18: EncryptionAdmin.ResyncSidecar:output_type -> ResyncSidecarResponse
-	13, // [13:19] is the sub-list for method output_type
-	7,  // [7:13] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	18, // 5: ResyncSidecarResponse.wrapped_deks_by_id:type_name -> ResyncSidecarResponse.WrappedDeksByIdEntry
+	19, // 6: ResyncSidecarResponse.writer_registry_for_caller:type_name -> ResyncSidecarResponse.WriterRegistryForCallerEntry
+	15, // 7: EnableStorageEnvelopeResponse.capability_summary:type_name -> CapabilityVerdict
+	1,  // 8: EncryptionAdmin.GetCapability:input_type -> Empty
+	1,  // 9: EncryptionAdmin.GetSidecarState:input_type -> Empty
+	5,  // 10: EncryptionAdmin.BootstrapEncryption:input_type -> BootstrapEncryptionRequest
+	7,  // 11: EncryptionAdmin.RotateDEK:input_type -> RotateDEKRequest
+	9,  // 12: EncryptionAdmin.RegisterEncryptionWriter:input_type -> RegisterEncryptionWriterRequest
+	11, // 13: EncryptionAdmin.ResyncSidecar:input_type -> ResyncSidecarRequest
+	13, // 14: EncryptionAdmin.EnableStorageEnvelope:input_type -> EnableStorageEnvelopeRequest
+	2,  // 15: EncryptionAdmin.GetCapability:output_type -> CapabilityReport
+	3,  // 16: EncryptionAdmin.GetSidecarState:output_type -> SidecarStateReport
+	6,  // 17: EncryptionAdmin.BootstrapEncryption:output_type -> BootstrapEncryptionResponse
+	8,  // 18: EncryptionAdmin.RotateDEK:output_type -> RotateDEKResponse
+	10, // 19: EncryptionAdmin.RegisterEncryptionWriter:output_type -> RegisterEncryptionWriterResponse
+	12, // 20: EncryptionAdmin.ResyncSidecar:output_type -> ResyncSidecarResponse
+	14, // 21: EncryptionAdmin.EnableStorageEnvelope:output_type -> EnableStorageEnvelopeResponse
+	15, // [15:22] is the sub-list for method output_type
+	8,  // [8:15] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_encryption_admin_proto_init() }
@@ -970,7 +1225,7 @@ func file_encryption_admin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_encryption_admin_proto_rawDesc), len(file_encryption_admin_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   16,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
