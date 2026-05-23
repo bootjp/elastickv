@@ -133,7 +133,21 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
   }, [bucket]);
 
   // Initial load + bucket / prefix change refetches from the start.
+  // Clears page synchronously so stale rows from the previous
+  // context (bucket or prefix) cannot remain clickable during the
+  // loading window. Without this, a /s3/a → /s3/b navigation
+  // (which fires this effect with new bucket) would leave
+  // bucket-a's rows visible until listObjects(b) resolves; a
+  // click in that window opens the detail modal carrying
+  // bucket-a's object key but with the bucket prop already
+  // flipped to b, so Download/Delete would target
+  // (bucket=b, key=staleKeyFromA) — a cross-bucket data-integrity
+  // vector when key paths happen to overlap (Codex P1 on PR
+  // #816 r5). The brief "loading…" flash during legitimate
+  // Refresh / page-size changes is acceptable; the alternative
+  // (rows visible during loading) is unsafe.
   useEffect(() => {
+    setPage(null);
     setCursorStack([]);
     void loadPage(undefined, prefix);
     // eslint-disable-next-line react-hooks/exhaustive-deps
