@@ -119,14 +119,13 @@ func parseRotateDEKArgs(args []string) (*parsedRotateDEK, *encryptionEndpointFla
 // invocation proposed the cutover or hit the §6.4
 // idempotent-retry path against a previously-active cluster:
 //
-//	fresh:        "enabled storage envelope applied_index=N
-//	               capability summary: ..."
-//	already-on:   "storage envelope already active (idempotent
-//	               retry) applied_index=N"
-//	defensive:    "warning: cutover_index_unknown=true"
-//	              emitted on top of the already-on shape when
-//	              the §6.4 hand-edited / schema-rollback hedge
-//	              fires.
+//	fresh:      "enabled applied_index=N
+//	             capability summary: ..."
+//	already-on: "already-active applied_index=N"
+//	defensive:  "warning: cutover_index_unknown=true (sidecar may
+//	             have been hand-edited or rolled back)"
+//	            emitted ON TOP OF the already-on shape when the
+//	            §6.4 hand-edited / schema-rollback hedge fires.
 func runEncryptionEnableStorageEnvelope(args []string, out io.Writer) error {
 	req, endpoint, err := parseEnableStorageEnvelopeArgs(args)
 	if err != nil {

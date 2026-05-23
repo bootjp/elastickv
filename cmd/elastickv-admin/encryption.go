@@ -26,10 +26,11 @@ const encryptionDialTimeout = 5 * time.Second
 // the two surfaces do not share a global flag namespace.
 //
 // PR-A wired `status`. PR-B added `rotate-dek` and
-// `register-writer`. PR-C adds `bootstrap`; Stage 6 adds
-// `enable-storage-envelope` (this PR — 6D-6b) and
-// `enable-raft-envelope`. ResyncSidecar is a server-side §5.5
-// fallback (no CLI surface).
+// `register-writer`. PR-C adds `bootstrap`. 6D-2 added the
+// `probe-node-id` collision-mitigation helper. 6D-6b (this PR)
+// adds `enable-storage-envelope`; the §7.1 Phase 2
+// `enable-raft-envelope` lands in Stage 6E. ResyncSidecar is a
+// server-side §5.5 fallback (no CLI surface).
 func encryptionMain(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: elastickv-admin encryption <subcommand> [flags]")
