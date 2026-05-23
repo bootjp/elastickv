@@ -629,3 +629,93 @@ func TestS3Server_AdminListObjects_RejectsAnonymous(t *testing.T) {
 	require.ErrorIs(t, err, ErrAdminForbidden,
 		"nil-role principal must be denied")
 }
+
+// TestS3Server_AdminListObjects_RejectsMismatchedToken pins the
+// claude-bot r1 + gemini r1 medium: a continuation token whose
+// bucket / generation / prefix / delimiter does not match the
+// current request must surface as ErrAdminInvalidContinuationToken,
+// NOT as the earlier mis-applied ErrAdminInvalidBucketName.
+func TestS3Server_AdminListObjects_RejectsMismatchedToken(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "bucketa")
+	createBucketForAdminTest(t, server, "bucketb")
+	putObjectsForListTest(t, server, "bucketa", "x", "y", "z")
+
+	// Take a token from bucketa.
+	page1, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "bucketa",
+		AdminListObjectsOptions{MaxKeys: 1})
+	require.NoError(t, err)
+	require.NotEmpty(t, page1.NextContinuationToken)
+
+	// Reuse it against bucketb — bucket field of the token does
+	// not match, must reject with ErrAdminInvalidContinuationToken.
+	_, err = server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "bucketb",
+		AdminListObjectsOptions{ContinuationToken: page1.NextContinuationToken})
+	require.True(t, errors.Is(err, ErrAdminInvalidContinuationToken),
+		"want ErrAdminInvalidContinuationToken for bucket-mismatch; got %v", err)
+
+	// And use it against bucketa but with a different prefix —
+	// prefix-mismatch must also reject.
+	_, err = server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "bucketa",
+		AdminListObjectsOptions{Prefix: "other/", ContinuationToken: page1.NextContinuationToken})
+	require.True(t, errors.Is(err, ErrAdminInvalidContinuationToken),
+		"want ErrAdminInvalidContinuationToken for prefix-mismatch; got %v", err)
+}
+
+// TestS3Server_AdminListObjects_RejectsExpiredToken pins the
+// store.ErrReadTSCompacted handling: when a continuation token's
+// readTS has been MVCC-GC'd past, the underlying ScanAt returns
+// ErrReadTSCompacted; AdminListObjects must translate that into
+// ErrAdminInvalidContinuationToken (matches SigV4 listObjectsV2
+// at s3.go:2105, which returns 400 InvalidArgument
+// "continuation token has expired").
+//
+// We exercise this by wrapping the store in a fake that returns
+// ErrReadTSCompacted on the second ScanAt call (the first
+// satisfies the bucket-meta load).
+func TestS3Server_AdminListObjects_RejectsExpiredToken(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "expiry")
+	putObjectsForListTest(t, server, "expiry", "a", "b")
+
+	// First page to get a real continuation token.
+	page1, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "expiry",
+		AdminListObjectsOptions{MaxKeys: 1})
+	require.NoError(t, err)
+	require.NotEmpty(t, page1.NextContinuationToken)
+
+	// Swap the store for one that errors with ErrReadTSCompacted
+	// on the *paginated* ScanAt (the second-page request). The
+	// bucket-meta load still goes through cleanly via the inner
+	// GetAt; only the ScanAt is poisoned.
+	server.store = &scanAtErrStore{MVCCStore: st, err: store.ErrReadTSCompacted}
+
+	_, err = server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "expiry",
+		AdminListObjectsOptions{MaxKeys: 1, ContinuationToken: page1.NextContinuationToken})
+	require.True(t, errors.Is(err, ErrAdminInvalidContinuationToken),
+		"want ErrAdminInvalidContinuationToken for compacted readTS; got %v", err)
+}
+
+// scanAtErrStore wraps an MVCCStore and forces ScanAt to return a
+// pre-set error. All other methods pass through. Used only by the
+// ExpiredToken test to inject store.ErrReadTSCompacted at the
+// scan boundary without having to actually run compaction.
+type scanAtErrStore struct {
+	store.MVCCStore
+	err error
+}
+
+func (s *scanAtErrStore) ScanAt(_ context.Context, _ []byte, _ []byte, _ int, _ uint64) ([]*store.KVPair, error) {
+	return nil, s.err
+}
