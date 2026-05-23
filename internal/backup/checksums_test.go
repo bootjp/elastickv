@@ -308,6 +308,83 @@ func TestValidateChecksumRelPath_AcceptsHonestPaths(t *testing.T) {
 	}
 }
 
+// TestChecksumLine_EscapeRoundTrip is the regression for codex r4
+// P2 on PR #810: a path containing `\n`/`\r`/`\\` would corrupt
+// the line-delimited CHECKSUMS without GNU coreutils-style
+// escaping. WriteChecksums prefixes such lines with `\\` and
+// substitutes `\n`/`\r`/`\\` → `\\n`/`\\r`/`\\\\`; VerifyChecksums
+// reverses the substitution at parse time. Round-trip pins both
+// halves together.
+func TestChecksumLine_EscapeRoundTrip(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"newline", "weird\nfile"},
+		{"carriage_return", "weird\rfile"},
+		{"backslash", `weird\file`},
+		{"multiple_escapes", "a\n\rb\\c"},
+		{"no_escape_pass_through", "honest/path.txt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			hex := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+			body, prefix := formatChecksumLine(hex, tc.path)
+			gotHex, gotPath, ok := splitChecksumLine(prefix + body)
+			if !ok {
+				t.Fatalf("splitChecksumLine(%q) rejected its own output", prefix+body)
+			}
+			if gotHex != hex {
+				t.Fatalf("hex = %q, want %q", gotHex, hex)
+			}
+			if gotPath != tc.path {
+				t.Fatalf("path = %q, want %q", gotPath, tc.path)
+			}
+		})
+	}
+}
+
+// TestChecksumLine_EscapePrefixMatchesGNUFormat pins the exact
+// shape WriteChecksums emits for escape-needing paths:
+//
+//	\<hex>  <body-with-\n-\r-\\\>
+//
+// so `sha256sum -c CHECKSUMS` on the dump root parses the line
+// the same way GNU coreutils does.
+func TestChecksumLine_EscapePrefixMatchesGNUFormat(t *testing.T) {
+	t.Parallel()
+	hex := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	body, prefix := formatChecksumLine(hex, "x\ny")
+	if prefix != `\` {
+		t.Fatalf("escape prefix = %q, want %q", prefix, `\`)
+	}
+	wantBody := hex + `  x\ny`
+	if body != wantBody {
+		t.Fatalf("body = %q, want %q", body, wantBody)
+	}
+}
+
+// TestSplitChecksumLine_RejectsDanglingEscape pins the parse-side
+// guard against malformed escape sequences (`\` at end-of-line, or
+// `\x` for unknown `x`). Catches a tampered CHECKSUMS whose
+// escape-prefixed line is otherwise structurally valid.
+func TestSplitChecksumLine_RejectsDanglingEscape(t *testing.T) {
+	t.Parallel()
+	hex := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	cases := []string{
+		`\` + hex + `  trailing\`,   // dangling \ at end
+		`\` + hex + `  bad\xescape`, // unknown escape \x
+	}
+	for _, c := range cases {
+		_, _, ok := splitChecksumLine(c)
+		if ok {
+			t.Fatalf("splitChecksumLine(%q) accepted malformed escape", c)
+		}
+	}
+}
+
 // TestVerifyChecksums_StreamsLargeFile pins the bufio.Scanner path
 // — the previous implementation slurped the entire CHECKSUMS file
 // via os.ReadFile, which OOMs on large dump trees (gemini

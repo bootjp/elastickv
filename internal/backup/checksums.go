@@ -74,11 +74,46 @@ func WriteChecksums(root string) error {
 	}
 	defer func() { _ = out.Close() }()
 	for _, e := range entries {
-		if _, err := fmt.Fprintf(out, "%s  %s\n", e.hex, e.relPath); err != nil {
+		line, prefix := formatChecksumLine(e.hex, e.relPath)
+		if _, err := fmt.Fprintf(out, "%s%s\n", prefix, line); err != nil {
 			return errors.WithStack(err)
 		}
 	}
 	return errors.WithStack(out.Sync())
+}
+
+// formatChecksumLine builds one CHECKSUMS row using GNU coreutils
+// sha256sum(1) escape conventions. When the path contains `\n`,
+// `\r`, or `\\`, sha256sum prefixes the entire line with `\\` and
+// replaces the offending bytes with `\\n` / `\\r` / `\\\\`. Phase 0a
+// emits the same shape so `sha256sum -c CHECKSUMS` from the dump
+// root parses a tampered or path-noisy filename without corrupting
+// the line-based output (codex r4 P2 on PR #810: the previous
+// `%s  %s\n` print would let a filename containing `\n` inject a
+// fake CHECKSUMS row).
+//
+// Returns (line-body, prefix). The prefix is either "" or "\\";
+// callers concatenate `prefix + body + "\n"` exactly like the
+// reference implementation.
+func formatChecksumLine(hex, relPath string) (string, string) {
+	if !strings.ContainsAny(relPath, "\n\r\\") {
+		return hex + "  " + relPath, ""
+	}
+	var sb strings.Builder
+	sb.Grow(len(relPath) + 4) //nolint:mnd // small heuristic to avoid early grow
+	for _, r := range relPath {
+		switch r {
+		case '\n':
+			sb.WriteString(`\n`)
+		case '\r':
+			sb.WriteString(`\r`)
+		case '\\':
+			sb.WriteString(`\\`)
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return hex + "  " + sb.String(), `\`
 }
 
 // checksumEntry is one row of the CHECKSUMS file.
@@ -313,10 +348,22 @@ func validateChecksumRelPath(rel string) (string, error) {
 var ErrChecksumsPathTraversal = errors.New("backup: CHECKSUMS path escapes dump root")
 
 // splitChecksumLine parses one sha256sum(1) line of the form
-// `<hex>  <relative-path>`. Returns (hex, path, ok). Lines with the
-// wrong shape are reported as not-ok so the caller can surface a
-// CHECKSUMS-corruption error rather than ingest garbage.
+// `<hex>  <relative-path>` (or its `\\`-prefixed escaped variant
+// when the path contains `\n`/`\r`/`\\`). Returns (hex, path, ok).
+// Lines with the wrong shape are reported as not-ok so the
+// caller can surface a CHECKSUMS-corruption error rather than
+// ingest garbage.
+//
+// Escape convention mirrors GNU coreutils: a leading `\\` signals
+// that the rest of the path has `\n`/`\r`/`\\` written as the
+// two-byte sequences `\\n`, `\\r`, `\\\\`. Codex r4 P2 on PR #810:
+// without this, a filename containing `\n` would split across
+// lines and a verifier would see a bogus second row.
 func splitChecksumLine(line string) (string, string, bool) {
+	escaped := strings.HasPrefix(line, `\`)
+	if escaped {
+		line = line[1:]
+	}
 	// sha256sum's "binary" mode separates digest and filename with
 	// exactly two spaces. Some tools emit `<hex> *<path>` for
 	// binary mode; we accept both.
@@ -332,7 +379,45 @@ func splitChecksumLine(line string) (string, string, bool) {
 	if !strings.HasPrefix(rest, "  ") && !strings.HasPrefix(rest, " *") {
 		return "", "", false
 	}
-	return hexPart, rest[2:], true
+	body := rest[2:]
+	if !escaped {
+		return hexPart, body, true
+	}
+	unescaped, ok := unescapeChecksumPath(body)
+	if !ok {
+		return "", "", false
+	}
+	return hexPart, unescaped, true
+}
+
+// unescapeChecksumPath reverses formatChecksumLine's `\n`/`\r`/`\\`
+// substitutions. Returns (path, ok). An unrecognised `\<byte>` or
+// a dangling trailing `\` is treated as malformed — the line is
+// rejected at the caller via the ok=false return.
+func unescapeChecksumPath(body string) (string, bool) {
+	var sb strings.Builder
+	sb.Grow(len(body))
+	for i := 0; i < len(body); i++ {
+		if body[i] != '\\' {
+			sb.WriteByte(body[i])
+			continue
+		}
+		i++
+		if i >= len(body) {
+			return "", false
+		}
+		switch body[i] {
+		case 'n':
+			sb.WriteByte('\n')
+		case 'r':
+			sb.WriteByte('\r')
+		case '\\':
+			sb.WriteByte('\\')
+		default:
+			return "", false
+		}
+	}
+	return sb.String(), true
 }
 
 func isLowerHex(s string) bool {

@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -278,15 +279,35 @@ func emitManifest(cfg *config, res backup.DecodeResult) error {
 	if cfg.bundleJSONL {
 		m.DynamoDBLayout = backup.DynamoDBLayoutJSONL
 	}
-	out, err := os.Create(cfg.outputRoot + "/MANIFEST.json") //nolint:gosec // operator-supplied path
+	// filepath.Join over `+ "/"` so the manifest path uses the
+	// platform separator (gemini r1 medium on PR #810).
+	out, err := os.Create(filepath.Join(cfg.outputRoot, "MANIFEST.json")) //nolint:gosec // operator-supplied path
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	defer func() { _ = out.Close() }()
+	// Surface Close errors instead of swallowing them: on a
+	// filesystem that delays writeback until Close (NFS, some
+	// FUSE mounts), the write succeeds but the buffered-data
+	// flush failure shows up only at Close time. Without this
+	// surface, a manifest that was never durably written would
+	// pass the cmd's error-return contract and the dump-tree
+	// invariant ("MANIFEST.json is on disk") would silently
+	// fail. Gemini r1 medium on PR #810. Sync runs before Close
+	// so the explicit fsync is the authoritative durability
+	// signal; Close's role is just to surface the kernel's
+	// per-fd cleanup result.
 	if err := backup.WriteManifest(out, m); err != nil {
+		_ = out.Close()
 		return errors.WithStack(err)
 	}
-	return errors.WithStack(out.Sync())
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return errors.WithStack(err)
+	}
+	if err := out.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 // populateAdapterScopes returns a non-nil pointer for every enabled
