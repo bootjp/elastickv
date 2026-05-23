@@ -49,33 +49,26 @@ function readCsrfCookie(): string | undefined {
   return undefined;
 }
 
-// encodeAdminItemKey turns a primary-key attribute map into the
-// base64-url segment the admin Dynamo items routes expect. The
-// server's decodeAdminItemKeySegment accepts both padded and raw
-// base64-url; we emit raw because it is shorter (no `=` padding
-// to URL-encode) and the server's path validator forbids `%` in
-// segments anyway.
-//
-// Exported so DynamoItemsTab's scan-cursor encoder reuses this
-// single implementation rather than maintaining a parallel
-// (Gemini medium on PR #815). LastEvaluatedKey and the URL key
-// segment share the same wire shape — both are base64-url-encoded
-// JSON of an AdminAttributeValue map — so one helper covers both.
-export function encodeAdminItemKey(key: Record<string, AdminAttributeValue>): string {
-  const json = JSON.stringify(key);
-  // btoa requires Latin-1 input; encode the JSON as UTF-8 bytes
-  // first so any non-ASCII attribute value (e.g. a key containing
-  // a JIS character) round-trips cleanly. TextEncoder is the
-  // standard UTF-8 path; the resulting Uint8Array maps directly
-  // into the Latin-1 char domain btoa accepts.
-  const bytes = new TextEncoder().encode(json);
+// base64UrlEncodeBytes turns a UTF-8 string into the unpadded
+// base64-url alphabet the admin S3 object routes accept for the
+// {key-b64url} URL segment. Used by the S3 object methods to
+// build the URL path safely for arbitrary key strings (including
+// non-ASCII, slashes, control chars).
+function base64UrlEncodeBytes(input: string): string {
+  const bytes = new TextEncoder().encode(input);
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
-  const padded = btoa(binary);
-  // Standard base64 → base64-url: `+` → `-`, `/` → `_`, strip
-  // trailing `=` padding so the URL segment carries no characters
-  // the server-side path validator forbids.
-  return padded.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+}
+
+// encodeAdminItemKey turns a primary-key attribute map into the
+// base64-url segment the admin Dynamo items routes expect.
+// Wire-shape sibling of base64UrlEncodeBytes: same alphabet, same
+// padding stripped, just JSON-stringifies the input first. Both
+// LastEvaluatedKey and the URL {key} segment use this shape, so
+// DynamoItemsTab also imports it for the scan-cursor encoder.
+export function encodeAdminItemKey(key: Record<string, AdminAttributeValue>): string {
+  return base64UrlEncodeBytes(JSON.stringify(key));
 }
 
 function buildURL(path: string, query?: ApiOptions["query"]): string {
@@ -255,6 +248,30 @@ export interface CreateBucketRequest {
   acl?: "private" | "public-read";
 }
 
+// AdminObject mirrors internal/admin/s3_objects_handler.go. The
+// per-object metadata projection list pages return.
+export interface AdminObject {
+  key: string;
+  size: number;
+  content_type: string;
+  etag: string;
+  last_modified: string;
+  storage_class: string;
+}
+
+export interface AdminObjectListing {
+  objects: AdminObject[];
+  common_prefixes?: string[];
+  next_continuation_token?: string;
+}
+
+export interface AdminListObjectsOptions {
+  prefix?: string;
+  delimiter?: string;
+  continuation_token?: string;
+  max_keys?: number;
+}
+
 // SQS queue admin DTOs (Section 16.2 of the SQS partial design doc).
 // `attributes` mirrors the AWS GetQueueAttributes "All" set with
 // snake_case keys; `counters` is the typed projection of the three
@@ -427,6 +444,62 @@ export const api = {
     }),
   deleteBucket: (name: string) =>
     apiFetch<void>(`/s3/buckets/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  listObjects: (bucket: string, opts?: AdminListObjectsOptions, signal?: AbortSignal) =>
+    apiFetch<AdminObjectListing>(
+      `/s3/buckets/${encodeURIComponent(bucket)}/objects`,
+      {
+        query: {
+          prefix: opts?.prefix,
+          delimiter: opts?.delimiter,
+          continuation_token: opts?.continuation_token,
+          max_keys: opts?.max_keys,
+        },
+        signal,
+      },
+    ),
+  // The object body endpoints carry raw bytes (application/octet-
+  // stream), so they bypass the JSON-only apiFetch and use a direct
+  // fetch with the CSRF header. base64UrlEncodeBytes turns the key
+  // into the {key-b64url} segment the server's
+  // decodeAdminObjectKeySegment expects.
+  downloadObjectURL: (bucket: string, key: string): string =>
+    `${apiBase}/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
+  putObject: async (
+    bucket: string,
+    key: string,
+    body: Blob,
+    contentType?: string,
+  ): Promise<void> => {
+    const headers: Record<string, string> = {};
+    if (contentType) headers["Content-Type"] = contentType;
+    const csrf = readCsrfCookie();
+    if (csrf) headers["X-Admin-CSRF"] = csrf;
+    const res = await fetch(
+      `${apiBase}/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
+      { method: "PUT", body, headers, credentials: "same-origin" },
+    );
+    // Treat any 2xx as success rather than just 204. The current
+    // Go handler returns 204 (no body) but the contract intent is
+    // any successful upload; a future change that returns the
+    // metadata on 200 would otherwise be misclassified as a
+    // non-JSON error (Gemini medium on PR #816).
+    if (res.ok) return;
+    const ct = res.headers.get("content-type") ?? "";
+    if (!ct.includes("application/json")) {
+      throw new ApiError(res.status, "non_json_response", `HTTP ${res.status}`);
+    }
+    const payload = (await res.json()) as Record<string, unknown>;
+    throw new ApiError(
+      res.status,
+      typeof payload.error === "string" ? payload.error : "request_failed",
+      typeof payload.message === "string" ? payload.message : "",
+    );
+  },
+  deleteObject: (bucket: string, key: string) =>
+    apiFetch<void>(
+      `/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
+      { method: "DELETE" },
+    ),
   listQueues: (signal?: AbortSignal) =>
     apiFetch<SqsQueueList>("/sqs/queues", { signal }),
   describeQueue: (name: string, signal?: AbortSignal) =>
