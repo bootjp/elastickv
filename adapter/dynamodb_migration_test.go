@@ -327,3 +327,57 @@ func TestDynamoDB_TransactWriteItemsWithRetry_MigratesLegacyTables(t *testing.T)
 	require.True(t, found)
 	require.Equal(t, newStringAttributeValue("new"), current.item["value"])
 }
+
+// TestDynamoDB_EnsureLegacyTableMigration_RefusesAdminReadOnlyContext
+// pins Codex r8 P2 on PR #805: an admin read-only call (tagged via
+// withAdminReadOnlyContext) must refuse to trigger Raft writes from
+// inside the migration path, even when the table genuinely needs
+// migration. This closes the TOCTOU window between AdminScanTable's
+// entry-point legacy check and scanItems' internal migration
+// trigger.
+func TestDynamoDB_EnsureLegacyTableMigration_RefusesAdminReadOnlyContext(t *testing.T) {
+	t.Parallel()
+
+	legacySchema, server, st := newLegacyMigrationTestServer(t, false, "S")
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(legacySchema)
+	writer.writeItem(legacySchema, map[string]attributeValue{
+		"pk": newStringAttributeValue("p"),
+		"sk": newStringAttributeValue("s"),
+	})
+
+	// Without the admin tag, ensureLegacyTableMigration drives the
+	// migration through to completion (control: confirm the table
+	// genuinely needs migration in this setup).
+	ctx := context.Background()
+	require.NoError(t, server.loadAndVerifyNeedsMigration(ctx, legacySchema.TableName, t))
+
+	// With the admin read-only context tag set, the same path
+	// MUST refuse with ErrAdminDynamoValidation rather than running
+	// the write-path migration.
+	adminCtx := withAdminReadOnlyContext(ctx)
+	err := server.ensureLegacyTableMigration(adminCtx, legacySchema.TableName)
+	require.True(t, errors.Is(err, ErrAdminDynamoValidation),
+		"want ErrAdminDynamoValidation from admin read-only migration trigger; got %v", err)
+
+	// The schema must not have been migrated (write-path skipped).
+	schema, exists, err := server.loadTableSchema(ctx, legacySchema.TableName)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.True(t, schema.needsLegacyKeyMigration(),
+		"schema must still need migration after refused admin call (no writes occurred)")
+}
+
+// loadAndVerifyNeedsMigration is a tiny test helper: load the
+// schema and confirm needsLegacyKeyMigration() == true. Returns
+// an error so the caller can require.NoError it.
+func (d *DynamoDBServer) loadAndVerifyNeedsMigration(ctx context.Context, tableName string, t *testing.T) error {
+	t.Helper()
+	schema, exists, err := d.loadTableSchema(ctx, tableName)
+	if err != nil {
+		return err
+	}
+	require.True(t, exists, "table must exist")
+	require.True(t, schema.needsLegacyKeyMigration(), "table must need migration in this setup")
+	return nil
+}

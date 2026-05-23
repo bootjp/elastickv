@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -509,6 +510,105 @@ func (b *bucketsBridge) AdminDeleteBucket(ctx context.Context, principal admin.A
 	return nil
 }
 
+// ---------- Phase 3b object-level bridge ----------
+
+func (b *bucketsBridge) AdminListObjects(ctx context.Context, principal admin.AuthPrincipal, bucket string, opts admin.AdminListObjectsOptions) (admin.AdminObjectListing, error) {
+	out, err := b.server.AdminListObjects(ctx, convertAdminPrincipal(principal), bucket, adapter.AdminListObjectsOptions{
+		Prefix:            opts.Prefix,
+		Delimiter:         opts.Delimiter,
+		ContinuationToken: opts.ContinuationToken,
+		MaxKeys:           opts.MaxKeys,
+	})
+	if err != nil {
+		return admin.AdminObjectListing{}, translateAdminObjectsError(err)
+	}
+	return adminObjectListingFromAdapter(out), nil
+}
+
+func (b *bucketsBridge) AdminGetObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string) (io.ReadCloser, admin.AdminObject, error) {
+	body, meta, err := b.server.AdminGetObject(ctx, convertAdminPrincipal(principal), bucket, key)
+	if err != nil {
+		return nil, admin.AdminObject{}, translateAdminObjectsError(err)
+	}
+	return body, adminObjectFromAdapter(meta), nil
+}
+
+func (b *bucketsBridge) AdminPutObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string, body io.Reader, contentType string) error {
+	if err := b.server.AdminPutObject(ctx, convertAdminPrincipal(principal), bucket, key, body, contentType); err != nil {
+		return translateAdminObjectsError(err)
+	}
+	return nil
+}
+
+func (b *bucketsBridge) AdminDeleteObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string) error {
+	if err := b.server.AdminDeleteObject(ctx, convertAdminPrincipal(principal), bucket, key); err != nil {
+		return translateAdminObjectsError(err)
+	}
+	return nil
+}
+
+// adminObjectFromAdapter / adminObjectListingFromAdapter translate
+// the adapter's wire shape into the admin package's. The two are
+// field-for-field isomorphic so the build breaks here on drift.
+func adminObjectFromAdapter(in adapter.AdminObject) admin.AdminObject {
+	return admin.AdminObject{
+		Key:          in.Key,
+		Size:         in.Size,
+		ContentType:  in.ContentType,
+		ETag:         in.ETag,
+		LastModified: in.LastModified,
+		StorageClass: in.StorageClass,
+	}
+}
+
+func adminObjectListingFromAdapter(in adapter.AdminObjectListing) admin.AdminObjectListing {
+	out := admin.AdminObjectListing{
+		CommonPrefixes:        in.CommonPrefixes,
+		NextContinuationToken: in.NextContinuationToken,
+	}
+	if in.Objects != nil {
+		out.Objects = make([]admin.AdminObject, len(in.Objects))
+		for i, o := range in.Objects {
+			out.Objects[i] = adminObjectFromAdapter(o)
+		}
+	}
+	return out
+}
+
+// translateAdminObjectsError maps the adapter's object-tier admin
+// error vocabulary onto the admin-package sentinels the handler
+// matches against. Mirrors translateAdminBucketsError but covers the
+// object-only sentinels (UploadTooLarge, InvalidObjectKey,
+// ObjectNotFound) that the bucket-tier path never sees.
+func translateAdminObjectsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrObjectsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrObjectsNotLeader
+	case errors.Is(err, adapter.ErrAdminBucketNotFound):
+		return admin.ErrObjectsBucketNotFound
+	case errors.Is(err, adapter.ErrAdminObjectNotFound):
+		return admin.ErrObjectsNotFound
+	case errors.Is(err, adapter.ErrAdminUploadTooLarge):
+		return admin.ErrObjectsUploadTooLarge
+	case errors.Is(err, adapter.ErrAdminInvalidBucketName),
+		errors.Is(err, adapter.ErrAdminInvalidObjectKey),
+		errors.Is(err, adapter.ErrAdminInvalidContinuationToken):
+		// Wrap the adapter's text so the handler's ErrObjectsValidation
+		// branch surfaces a useful message rather than the bare
+		// sentinel string. Same pattern translateAdminBucketsError
+		// uses for ErrAdminInvalidBucketName via *ValidationError.
+		return errors.Wrap(admin.ErrObjectsValidation, err.Error())
+	case isLeaderChurnError(err):
+		return admin.ErrObjectsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
 func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary {
 	return admin.BucketSummary{
 		Name:       in.Name,
@@ -594,6 +694,164 @@ func (b *dynamoTablesBridge) AdminDeleteTable(ctx context.Context, principal adm
 		return translateAdminTablesError(err)
 	}
 	return nil
+}
+
+// Phase 3a — item-level bridge methods. Each one converts the
+// admin-package wire types into the adapter's parallel struct
+// graph, dispatches to the adapter, and translates the adapter's
+// error vocabulary onto the admin-package sentinels.
+
+func (b *dynamoTablesBridge) AdminScanItems(ctx context.Context, principal admin.AuthPrincipal, table string, opts admin.AdminScanItemsOptions) (admin.AdminScanItemsResult, error) {
+	adapterOpts := adapter.AdminScanOptions{
+		Limit:          opts.Limit,
+		ExclusiveStart: adminToAdapterAttributeMap(opts.ExclusiveStart),
+	}
+	out, err := b.server.AdminScanTable(ctx, convertAdminPrincipal(principal), table, adapterOpts)
+	if err != nil {
+		return admin.AdminScanItemsResult{}, translateAdminItemsError(err)
+	}
+	res := admin.AdminScanItemsResult{
+		Items:            make([]admin.AdminItem, len(out.Items)),
+		LastEvaluatedKey: adapterToAdminAttributeMap(out.LastEvaluatedKey),
+	}
+	for i, item := range out.Items {
+		res.Items[i] = admin.AdminItem{Attributes: adapterToAdminAttributeMap(item.Attributes)}
+	}
+	return res, nil
+}
+
+func (b *dynamoTablesBridge) AdminGetItem(ctx context.Context, principal admin.AuthPrincipal, table string, key map[string]admin.AdminAttributeValue) (*admin.AdminItem, bool, error) {
+	item, found, err := b.server.AdminGetItem(ctx, convertAdminPrincipal(principal), table, adminToAdapterAttributeMap(key))
+	if err != nil {
+		return nil, false, translateAdminItemsError(err)
+	}
+	if !found || item == nil {
+		return nil, false, nil
+	}
+	return &admin.AdminItem{Attributes: adapterToAdminAttributeMap(item.Attributes)}, true, nil
+}
+
+func (b *dynamoTablesBridge) AdminPutItem(ctx context.Context, principal admin.AuthPrincipal, table string, item admin.AdminItem) error {
+	adapterItem := adapter.AdminItem{Attributes: adminToAdapterAttributeMap(item.Attributes)}
+	if err := b.server.AdminPutItem(ctx, convertAdminPrincipal(principal), table, adapterItem); err != nil {
+		return translateAdminItemsError(err)
+	}
+	return nil
+}
+
+func (b *dynamoTablesBridge) AdminDeleteItem(ctx context.Context, principal admin.AuthPrincipal, table string, key map[string]admin.AdminAttributeValue) error {
+	if err := b.server.AdminDeleteItem(ctx, convertAdminPrincipal(principal), table, adminToAdapterAttributeMap(key)); err != nil {
+		return translateAdminItemsError(err)
+	}
+	return nil
+}
+
+// adminToAdapterAttributeValue / map functions translate the
+// admin package's wire type into the adapter package's parallel
+// struct. The two are isomorphic field-for-field; any drift here
+// is a build break, which is the right signal.
+func adminToAdapterAttributeValue(v admin.AdminAttributeValue) adapter.AdminAttributeValue {
+	out := adapter.AdminAttributeValue{
+		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
+		SS: v.SS, NS: v.NS, BS: v.BS,
+	}
+	if v.L != nil {
+		out.L = make([]adapter.AdminAttributeValue, len(v.L))
+		for i, e := range v.L {
+			out.L[i] = adminToAdapterAttributeValue(e)
+		}
+	}
+	if v.M != nil {
+		out.M = make(map[string]adapter.AdminAttributeValue, len(v.M))
+		for k, e := range v.M {
+			out.M[k] = adminToAdapterAttributeValue(e)
+		}
+	}
+	return out
+}
+
+func adapterToAdminAttributeValue(v adapter.AdminAttributeValue) admin.AdminAttributeValue {
+	out := admin.AdminAttributeValue{
+		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
+		SS: v.SS, NS: v.NS, BS: v.BS,
+	}
+	if v.L != nil {
+		out.L = make([]admin.AdminAttributeValue, len(v.L))
+		for i, e := range v.L {
+			out.L[i] = adapterToAdminAttributeValue(e)
+		}
+	}
+	if v.M != nil {
+		out.M = make(map[string]admin.AdminAttributeValue, len(v.M))
+		for k, e := range v.M {
+			out.M[k] = adapterToAdminAttributeValue(e)
+		}
+	}
+	return out
+}
+
+func adminToAdapterAttributeMap(in map[string]admin.AdminAttributeValue) map[string]adapter.AdminAttributeValue {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]adapter.AdminAttributeValue, len(in))
+	for k, v := range in {
+		out[k] = adminToAdapterAttributeValue(v)
+	}
+	return out
+}
+
+func adapterToAdminAttributeMap(in map[string]adapter.AdminAttributeValue) map[string]admin.AdminAttributeValue {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]admin.AdminAttributeValue, len(in))
+	for k, v := range in {
+		out[k] = adapterToAdminAttributeValue(v)
+	}
+	return out
+}
+
+// translateAdminItemsError maps the adapter's item-level error
+// vocabulary onto the admin-package sentinels. Mirrors
+// translateAdminTablesError's shape but uses the Items
+// sentinels — kept separate so a future per-resource
+// classification change (e.g., a new "rate limited" sentinel
+// for the item path but not the table path) lands in one place.
+func translateAdminItemsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrItemsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrItemsNotLeader
+	case errors.Is(err, adapter.ErrAdminDynamoNotFound):
+		return admin.ErrItemsTableNotFound
+	case errors.Is(err, adapter.ErrAdminDynamoValidation):
+		// Wrap rather than replace so the adapter's specific
+		// validation message ("table_name is required", legacy-
+		// migration hint at adapter/dynamodb_admin_items.go, etc.)
+		// reaches the HTTP 400 body via writeItemsError's
+		// err.Error() emission. Bare sentinel return dropped the
+		// operator-facing reason at the bridge boundary (Claude
+		// review on PR #813 r3). errors.Is(out, ErrItemsValidation)
+		// still returns true so the handler's match arm still
+		// fires.
+		return errors.Wrap(admin.ErrItemsValidation, err.Error())
+	case isLeaderChurnError(err):
+		// Mid-dispatch leadership churn looks like an internal error
+		// from the kv coordinator (election finishes between the
+		// adapter's isVerifiedDynamoLeader check and the actual
+		// Raft propose). Map to the Items not-leader sentinel so the
+		// handler returns 503 + Retry-After: 1 and the SPA's retry
+		// contract stays intact (Codex P2 on PR #813 — the table-side
+		// translator already does this; the item-side translator
+		// initially shipped without the parallel branch).
+		return admin.ErrItemsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
 }
 
 // convertAdminPrincipal mirrors admin.AuthPrincipal onto the

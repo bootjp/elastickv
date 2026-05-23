@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/admin"
@@ -246,6 +247,25 @@ func (dummyTablesSource) AdminDeleteTable(_ context.Context, _ admin.AuthPrincip
 	panic("dummyTablesSource.AdminDeleteTable should not be invoked")
 }
 
+// Phase 3a item-level stubs — never invoked by the registration-
+// gate test but required for admin.TablesSource interface
+// satisfaction.
+func (dummyTablesSource) AdminScanItems(_ context.Context, _ admin.AuthPrincipal, _ string, _ admin.AdminScanItemsOptions) (admin.AdminScanItemsResult, error) {
+	panic("dummyTablesSource.AdminScanItems should not be invoked")
+}
+
+func (dummyTablesSource) AdminGetItem(_ context.Context, _ admin.AuthPrincipal, _ string, _ map[string]admin.AdminAttributeValue) (*admin.AdminItem, bool, error) {
+	panic("dummyTablesSource.AdminGetItem should not be invoked")
+}
+
+func (dummyTablesSource) AdminPutItem(_ context.Context, _ admin.AuthPrincipal, _ string, _ admin.AdminItem) error {
+	panic("dummyTablesSource.AdminPutItem should not be invoked")
+}
+
+func (dummyTablesSource) AdminDeleteItem(_ context.Context, _ admin.AuthPrincipal, _ string, _ map[string]admin.AdminAttributeValue) error {
+	panic("dummyTablesSource.AdminDeleteItem should not be invoked")
+}
+
 // dummyBucketsSource is the smallest concrete admin.BucketsSource
 // for the readyForRegistration gate test — symmetric with
 // dummyTablesSource. The S3-only branch of the gate (Codex P1 on
@@ -272,4 +292,20 @@ func (dummyBucketsSource) AdminPutBucketAcl(_ context.Context, _ admin.AuthPrinc
 
 func (dummyBucketsSource) AdminDeleteBucket(_ context.Context, _ admin.AuthPrincipal, _ string) error {
 	panic("dummyBucketsSource.AdminDeleteBucket should not be invoked")
+}
+
+func (dummyBucketsSource) AdminListObjects(_ context.Context, _ admin.AuthPrincipal, _ string, _ admin.AdminListObjectsOptions) (admin.AdminObjectListing, error) {
+	panic("dummyBucketsSource.AdminListObjects should not be invoked")
+}
+
+func (dummyBucketsSource) AdminGetObject(_ context.Context, _ admin.AuthPrincipal, _, _ string) (io.ReadCloser, admin.AdminObject, error) {
+	panic("dummyBucketsSource.AdminGetObject should not be invoked")
+}
+
+func (dummyBucketsSource) AdminPutObject(_ context.Context, _ admin.AuthPrincipal, _, _ string, _ io.Reader, _ string) error {
+	panic("dummyBucketsSource.AdminPutObject should not be invoked")
+}
+
+func (dummyBucketsSource) AdminDeleteObject(_ context.Context, _ admin.AuthPrincipal, _, _ string) error {
+	panic("dummyBucketsSource.AdminDeleteObject should not be invoked")
 }

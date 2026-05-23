@@ -8005,6 +8005,15 @@ func (d *DynamoDBServer) ensureLegacyTableMigrationLocked(ctx context.Context, t
 		if !exists || !schema.needsLegacyKeyMigration() {
 			return nil
 		}
+		// Admin read-only callers (AdminScanTable) must not trigger
+		// migration writes. Their own pre-check at the admin readTS
+		// already rejects needs-migration tables, but the schema can
+		// transition between that check and this one (Codex r8 P2 on
+		// PR #805) — refuse rather than racing into write-path code.
+		if isAdminReadOnlyContext(ctx) {
+			return errors.Wrap(ErrAdminDynamoValidation,
+				"table requires a one-time legacy-key migration before admin read endpoints are available; migrate via the SigV4 surface first")
+		}
 		if !schema.usesOrderedKeyEncoding() {
 			err = d.startLegacyTableKeyMigration(ctx, schema, readTS)
 		} else {
