@@ -67,8 +67,6 @@
   view. End-to-end integration test exercises a single-node
   cluster Bootstrap → EnableStorageEnvelope → Put → read-back-
   via-envelope.
-- **6D-6** — `EnableStorageEnvelope` admin RPC + CLI command +
-  integration test composing 6D-3 + 6D-4 + 6D-5.
 
 ## 0. Why this doc exists
 

@@ -6,7 +6,9 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -1042,6 +1044,22 @@ func fixedCapabilityFanout(result admin.CapabilityFanoutResult, err error) Capab
 	}
 }
 
+// failOnCallCapabilityFanout returns a closure that fails the test
+// if it is invoked. Used by the §6.4 idempotent-retry tests to
+// pin the "already-active short-circuit must NOT run fan-out"
+// invariant: a regression that re-ordered the cutoverPrecheck so
+// the fan-out fired before the short-circuit would trip this
+// fixture and the test would fail at the wire-level rather than
+// silently passing on a successful fan-out. PR812 coderabbit
+// quick-win round-2.
+func failOnCallCapabilityFanout(t *testing.T) CapabilityFanoutFn {
+	t.Helper()
+	return func(context.Context) (admin.CapabilityFanoutResult, error) {
+		t.Errorf("capability fan-out invoked on idempotent-retry path; the §6.4 short-circuit MUST skip fan-out")
+		return admin.CapabilityFanoutResult{}, errors.New("fan-out invoked on idempotent path")
+	}
+}
+
 // applyingProposer is a recordingProposer that also simulates the
 // FSM apply by writing the supplied applyFn output into the
 // sidecar before returning from Propose. The 6D-6 RPC re-reads
@@ -1244,7 +1262,10 @@ func TestEncryptionAdmin_EnableStorageEnvelope_IdempotentRetry(t *testing.T) {
 		WithEncryptionAdminProposer(proposer),
 		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
 		WithEncryptionAdminSidecarPath(path),
-		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		// Use failOnCallCapabilityFanout: the §6.4 short-circuit
+		// MUST skip the fan-out; if a regression re-ordered the
+		// checks the fan-out fixture trips the test.
+		WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
 	)
 	got, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
 	if err != nil {
@@ -1287,7 +1308,10 @@ func TestEncryptionAdmin_EnableStorageEnvelope_DefensiveCutoverIndexUnknown(t *t
 		WithEncryptionAdminProposer(&recordingProposer{}),
 		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
 		WithEncryptionAdminSidecarPath(path),
-		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		// The §6.4 defensive branch is still on the
+		// idempotent-retry path (sidecar reports active); fan-out
+		// MUST be skipped exactly as in the standard retry case.
+		WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
 	)
 	got, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
 	if err != nil {
@@ -1412,6 +1436,134 @@ func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnFanoutError(t *testing.T
 	_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_SerializesConcurrentCutovers
+// pins the §2.1 #4 mutator-lock invariant: two concurrent cutover
+// RPCs MUST NOT both produce a freshCutoverResponse — the second
+// one must observe StorageEnvelopeActive=true at its precheck and
+// fall through to the §6.4 idempotent-retry shape. Coderabbit
+// Major on PR812.
+//
+// The applying proposer flips the sidecar on the FIRST propose
+// call. The second call enters EnableStorageEnvelope, waits on
+// cutoverMu, then runs its precheck. Without the lock, the
+// second call's precheck could see the pre-flip sidecar and
+// re-propose — producing a freshCutoverResponse with
+// WasAlreadyActive=false but the FIRST cutover's
+// StorageEnvelopeCutoverIndex (the §6.4 contract violation).
+func TestEncryptionAdmin_EnableStorageEnvelope_SerializesConcurrentCutovers(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 7000},
+		sidecarPath:       path,
+		applyFn:           applyCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+	)
+	const callers = 4
+	results := make(chan *pb.EnableStorageEnvelopeResponse, callers)
+	errs := make(chan error, callers)
+	var ready sync.WaitGroup
+	var release sync.WaitGroup
+	ready.Add(callers)
+	release.Add(1)
+	for range callers {
+		go func() {
+			ready.Done()
+			release.Wait()
+			resp, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+			results <- resp
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	release.Done()
+	freshCount := 0
+	idempotentCount := 0
+	for i := 0; i < callers; i++ {
+		err := <-errs
+		resp := <-results
+		if err != nil {
+			t.Fatalf("EnableStorageEnvelope call %d: %v", i, err)
+		}
+		if resp.WasAlreadyActive {
+			idempotentCount++
+		} else {
+			freshCount++
+		}
+	}
+	if freshCount != 1 {
+		t.Errorf("freshCount=%d, want exactly 1 (only one caller should propose; the rest must hit the §6.4 idempotent-retry path)", freshCount)
+	}
+	if idempotentCount != callers-1 {
+		t.Errorf("idempotentCount=%d, want %d", idempotentCount, callers-1)
+	}
+	if len(proposer.calls) != 1 {
+		t.Errorf("proposer.calls=%d, want 1 (cutover proposed exactly once across concurrent callers)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellationOnFanoutNotOK
+// pins codex P2 round-2 on PR812: the production fan-out helper
+// can synthesize Reachable=false verdicts and return (result, nil)
+// with OK=false when ctx expires mid-probe. In that case
+// EnableStorageEnvelope MUST preserve the transport-layer
+// cancellation/deadline shape rather than misclassifying the
+// outcome as a configuration refusal.
+func TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellationOnFanoutNotOK(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		ctxFn    func() (context.Context, context.CancelFunc)
+		wantCode codes.Code
+	}{
+		{
+			name: "canceled",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			wantCode: codes.Canceled,
+		},
+		{
+			name: "deadline_exceeded",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				return ctx, cancel
+			},
+			wantCode: codes.DeadlineExceeded,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Synthesize the production fan-out's behavior: it returns
+			// a NOT-OK result without err when ctx expired mid-probe.
+			notOK := admin.CapabilityFanoutResult{
+				Verdicts: []admin.CapabilityVerdict{{FullNodeID: 11, Reachable: false}},
+				OK:       false,
+			}
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(&recordingProposer{}),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+				WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+				WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(notOK, nil)),
+			)
+			ctx, cancel := tc.ctxFn()
+			defer cancel()
+			_, err := srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+			if status.Code(err) != tc.wantCode {
+				t.Errorf("EnableStorageEnvelope status=%v, want %v (ctx error should take precedence over FailedPrecondition)",
+					status.Code(err), tc.wantCode)
+			}
+		})
 	}
 }
 

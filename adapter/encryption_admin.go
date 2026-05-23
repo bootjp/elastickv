@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strconv"
+	"sync"
 
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -38,6 +39,23 @@ type EncryptionAdminServer struct {
 	// is what threads the route-snapshot builder + DialFunc +
 	// timeout into this closure. Other mutator RPCs are unaffected.
 	capabilityFanout CapabilityFanoutFn
+	// cutoverMu serializes concurrent EnableStorageEnvelope calls
+	// per design §2.1 #4 ("The cutover-RPC mutator serializes
+	// overlapping calls on the propose side"). Without it, two
+	// concurrent cutover calls could both observe
+	// StorageEnvelopeActive=false, both propose, and the loser
+	// would assemble a freshCutoverResponse with
+	// was_already_active=false but the FIRST cutover's
+	// applied_index — violating the §6.4 fresh-success contract
+	// (coderabbit Major on PR812). The design also calls for a
+	// shared lock with RotateDEK so a RotateDEK cannot interleave
+	// between a cutover's propose and apply; that piece is left
+	// to a follow-up because RotateDEK has no existing lock and
+	// extending serialization to it would change a hot-path
+	// mutator's semantics — see the §2.1 #3 stale-DEKID benign
+	// no-op for the FALLBACK that handles the un-serialized
+	// RotateDEK/cutover interleave today.
+	cutoverMu sync.Mutex
 	pb.UnimplementedEncryptionAdminServer
 }
 
@@ -676,6 +694,14 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 // true with cutover-index mismatch ⇒ another cutover landed
 // concurrently, treat as idempotent success.
 func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *pb.EnableStorageEnvelopeRequest) (*pb.EnableStorageEnvelopeResponse, error) {
+	// Serialize concurrent cutover RPCs (design §2.1 #4 + PR812
+	// coderabbit Major). The lock spans the entire precheck →
+	// fan-out → propose → postcheck sequence so a second
+	// overlapping call sees StorageEnvelopeActive=true at its
+	// precheck and takes the §6.4 idempotent-retry short-circuit
+	// rather than re-proposing.
+	s.cutoverMu.Lock()
+	defer s.cutoverMu.Unlock()
 	preSidecar, earlyResp, err := s.cutoverPrecheck(ctx, req)
 	if err != nil {
 		return nil, err
@@ -761,6 +787,18 @@ func (s *EncryptionAdminServer) runCutoverFanout(ctx context.Context) (admin.Cap
 		return admin.CapabilityFanoutResult{}, capabilityFanoutErrorToStatus(err)
 	}
 	if !result.OK {
+		// Codex P2 round-2 on PR812: the production fan-out
+		// helper can return (result, nil) with OK=false when ctx
+		// expires mid-probe — it synthesizes Reachable=false
+		// verdicts and returns the result rather than erroring
+		// out. In that case, classifying the outcome as a
+		// configuration refusal (FailedPrecondition) hides the
+		// real transport-layer cancellation/deadline from
+		// retry-aware clients. Check ctx.Err() first so the
+		// gRPC status code matches what the caller observed.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return admin.CapabilityFanoutResult{}, capabilityFanoutErrorToStatus(ctxErr)
+		}
 		return admin.CapabilityFanoutResult{}, grpcStatusErrorf(codes.FailedPrecondition,
 			"encryption: capability check refused cutover (%s)", capabilityRefusalSummary(result))
 	}
