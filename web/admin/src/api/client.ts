@@ -55,7 +55,13 @@ function readCsrfCookie(): string | undefined {
 // base64-url; we emit raw because it is shorter (no `=` padding
 // to URL-encode) and the server's path validator forbids `%` in
 // segments anyway.
-function encodeAdminItemKey(key: Record<string, AdminAttributeValue>): string {
+//
+// Exported so DynamoItemsTab's scan-cursor encoder reuses this
+// single implementation rather than maintaining a parallel
+// (Gemini medium on PR #815). LastEvaluatedKey and the URL key
+// segment share the same wire shape — both are base64-url-encoded
+// JSON of an AdminAttributeValue map — so one helper covers both.
+export function encodeAdminItemKey(key: Record<string, AdminAttributeValue>): string {
   const json = JSON.stringify(key);
   // btoa requires Latin-1 input; encode the JSON as UTF-8 bytes
   // first so any non-ASCII attribute value (e.g. a key containing

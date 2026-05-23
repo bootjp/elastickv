@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   AdminAttributeValue,
   AdminItem,
   AdminScanItemsResult,
 } from "../api/client";
-import { ApiError, api } from "../api/client";
+import { ApiError, api, encodeAdminItemKey } from "../api/client";
 import { useAuth } from "../auth";
 import { Modal } from "./Modal";
 
@@ -53,16 +53,51 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
   // stack means we are on page 0 (no cursor sent).
   const [cursorStack, setCursorStack] = useState<string[]>([]);
 
+  // scanAbortRef aborts the in-flight scan when a new one starts
+  // (table change, page-size change, Next / Refresh, post-write
+  // reload). Without this, an older slower request can overwrite
+  // the current view with stale items after the user has already
+  // moved on — which is a confused-deputy class for the
+  // follow-up edit / delete actions that key off the rendered
+  // rows (Codex P1, Gemini high on PR #815).
+  const scanAbortRef = useRef<AbortController | null>(null);
+  // Ensure the in-flight controller is aborted on unmount. The
+  // effect's cleanup function fires on every dep change AND on
+  // unmount, so the unmount path is covered by the inline
+  // controller it owns; the ref-based aborts cover the
+  // user-driven reload cases.
+  useEffect(() => {
+    return () => {
+      scanAbortRef.current?.abort();
+    };
+  }, []);
+
   const loadPage = async (cursor: string | undefined) => {
+    scanAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    scanAbortRef.current = ctrl;
     setLoading(true);
     setLoadError(null);
     try {
-      const result = await api.scanItems(table, { limit: pageSize, next_cursor: cursor });
+      const result = await api.scanItems(table, { limit: pageSize, next_cursor: cursor }, ctrl.signal);
+      // A second loadPage() may have replaced scanAbortRef before
+      // we get here; ignore the resolved value of the obsolete
+      // request to keep `page` aligned with the latest call. The
+      // AbortError path below covers the symmetric case where the
+      // fetch itself errored out from the abort.
+      if (scanAbortRef.current !== ctrl) return;
       setPage(result);
     } catch (err) {
+      if (scanAbortRef.current !== ctrl) return;
+      // AbortError is the cancellation signal — not a user-visible
+      // failure; suppress it so the operator's manual Refresh
+      // immediately after a Next page click doesn't show "aborted".
+      if (err instanceof DOMException && err.name === "AbortError") return;
       setLoadError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
     } finally {
-      setLoading(false);
+      if (scanAbortRef.current === ctrl) {
+        setLoading(false);
+      }
     }
   };
 
@@ -76,7 +111,7 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
   const onNextPage = () => {
     const next = page?.last_evaluated_key;
     if (!next) return;
-    const cursor = encodeContinuation(next);
+    const cursor = encodeAdminItemKey(next);
     setCursorStack((s) => [...s, cursor]);
     void loadPage(cursor);
   };
@@ -121,12 +156,28 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
     setModalBusy(true);
     setModalError(null);
     try {
-      const key = extractPrimaryKey(next, partitionKey, sortKey);
-      if (!key) {
-        throw new Error(
-          `body must contain the partition key "${partitionKey}"` +
-            (sortKey ? ` and the sort key "${sortKey}"` : ""),
-        );
+      // Edit mode MUST use the originally-opened modalKey rather
+      // than re-deriving from the edited body — changing the
+      // primary key in the body otherwise turns an "edit" into a
+      // write to a different URL, leaving the original item
+      // untouched and silently creating / overwriting a sibling
+      // (Codex P1 on PR #815). Add mode does derive from body
+      // (no original key exists). The server's body / URL-key
+      // reconciliation enforces that the body's key attributes
+      // match the URL key, so a primary-key edit attempt on the
+      // edit path surfaces as 400 invalid_request — operators
+      // who actually want to rename an item must delete + add.
+      let key: Record<string, AdminAttributeValue> | null;
+      if (modalMode === "edit" && modalKey) {
+        key = modalKey;
+      } else {
+        key = extractPrimaryKey(next, partitionKey, sortKey);
+        if (!key) {
+          throw new Error(
+            `body must contain the partition key "${partitionKey}"` +
+              (sortKey ? ` and the sort key "${sortKey}"` : ""),
+          );
+        }
       }
       await api.putItem(table, key, next);
       closeModalForce();
@@ -213,9 +264,14 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
             </tr>
           </thead>
           <tbody>
-            {page!.items.map((item, idx) => (
+            {page!.items.map((item) => (
+              // Primary key uniqueness is guaranteed by DynamoDB's
+              // table semantics, so it's a more stable React key
+              // than the array index — re-ordering a page (server
+              // changed scan iteration order) doesn't churn rows
+              // (Gemini medium on PR #815).
               <ItemRow
-                key={idx}
+                key={describePrimaryKey(item, partitionKey, sortKey)}
                 item={item}
                 partitionKey={partitionKey}
                 sortKey={sortKey}
@@ -417,16 +473,6 @@ function ItemEditorModal({
 }
 
 // ---------- helpers ----------
-
-// encodeContinuation turns a LastEvaluatedKey into the base64-url
-// blob the server's next_cursor query param expects.
-function encodeContinuation(key: Record<string, AdminAttributeValue>): string {
-  const json = JSON.stringify(key);
-  const bytes = new TextEncoder().encode(json);
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
-}
 
 // extractPrimaryKey pulls the table's primary-key attributes out of
 // an item body, returning null when any required attribute is
