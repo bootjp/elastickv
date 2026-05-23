@@ -603,14 +603,19 @@ func clampAdminListMaxKeys(n int) int {
 // into CommonPrefixes the same way SigV4 ListObjectsV2 does.
 //
 // Sentinels:
-//   - ErrAdminForbidden          — principal lacks read role
-//   - ErrAdminNotLeader          — follower
-//   - ErrAdminBucketNotFound     — bucket absent
-//   - ErrAdminInvalidBucketName  — malformed bucket name
-//   - ErrAdminDynamoValidation NOT used here — admin-list-objects
-//     reuses ErrAdminInvalidBucketName for the only validation path
-//     (bucket-name shape); a malformed continuation token comes back
-//     as a wrapped json/decode error from the SigV4 helper.
+//   - ErrAdminForbidden                — principal lacks read role
+//   - ErrAdminNotLeader                — follower
+//   - ErrAdminBucketNotFound           — bucket absent
+//   - ErrAdminInvalidBucketName        — malformed bucket name argument
+//   - ErrAdminInvalidContinuationToken — token references a different
+//     bucket / generation / prefix / delimiter than the current
+//     request, OR the token's readTS has been MVCC-GC'd past
+//     (store.ErrReadTSCompacted on the underlying scan)
+//
+// A structurally invalid / non-base64-decodable continuation token
+// surfaces as a wrapped json/decode error from decodeS3ContinuationToken,
+// not as a sentinel — the bridge maps that to a generic 400 with the
+// decode-error text preserved.
 //
 // Mirrors the SigV4 listObjectsV2 precedent at s3.go (same scan-
 // and-collapse pipeline with one error-return per stage; carries
