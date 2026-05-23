@@ -403,6 +403,57 @@ func TestDynamoItems_Get_HappyPath(t *testing.T) {
 	require.Equal(t, "hello", *got.Attributes["value"].S)
 }
 
+// TestDynamoItems_Get_AcceptsURLEncodedPaddedBase64Key pins the
+// Codex P2 on PR #813 r7 fix: the dispatcher must pass the
+// percent-decoded {key} segment to the per-key handler so a
+// client that URL-encodes padded base64 (e.g. JS's
+// encodeURIComponent turns "=" into "%3D") still routes
+// correctly. Pre-fix the dispatcher passed the raw segment with
+// %3D still present, the base64 decoder rejected it as not
+// valid base64-url, and the request 400'd despite the key
+// being well-formed.
+//
+// The decodeAdminItemKeySegment2 helper explicitly supports
+// padded base64 as a fallback for hand-crafted curl, so this
+// case is part of the documented input contract.
+func TestDynamoItems_Get_AcceptsURLEncodedPaddedBase64Key(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	key := map[string]AdminAttributeValue{"pk": stringAttr("k1")}
+	val := AdminItem{Attributes: map[string]AdminAttributeValue{
+		"pk":    stringAttr("k1"),
+		"value": stringAttr("hello"),
+	}}
+	src.seedItem("orders", key, val)
+	h := newDynamoHandlerForTest(src)
+
+	// Encode the key with PADDED base64-url (=), then URL-escape
+	// the `=` to %3D — the shape a client using
+	// encodeURIComponent on a padded base64 string would produce.
+	keyJSON, err := json.Marshal(key)
+	require.NoError(t, err)
+	padded := base64.URLEncoding.EncodeToString(keyJSON)
+	// Sanity: the encoded form must actually contain padding for
+	// this test to exercise the right code path. If it doesn't,
+	// the JSON happened to be a multiple of 3 bytes; force the
+	// padded helper anyway since the URL-escape applies the same
+	// regardless.
+	urlEscaped := strings.ReplaceAll(padded, "=", "%3D")
+	url := pathDynamoTables + "/orders/" + adminItemSubResource + "/" + urlEscaped
+
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	req = withReadOnlyPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code,
+		"URL-escaped padded base64-url key must decode and route to the item; got %d body=%s",
+		rec.Code, rec.Body.String())
+
+	var got AdminItem
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, "hello", *got.Attributes["value"].S)
+}
+
 func TestDynamoItems_Get_Missing404(t *testing.T) {
 	t.Parallel()
 	src := newStubItemsSource()
