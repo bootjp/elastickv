@@ -244,6 +244,70 @@ func TestVerifyChecksums_RejectsIntermediateSymlink(t *testing.T) {
 	}
 }
 
+// TestValidateChecksumRelPath_RejectsWindowsDeviceNames is the
+// regression for codex r3 P1 on PR #810: even after the textual
+// `..`-traversal guard, names like CON / NUL / COM1 / CONOUT$
+// would open the host's console / device on Windows via
+// `os.Open(filepath.Join(root, "CON"))`. The verifier delegates
+// locality to filepath.IsLocal which refuses these names
+// lexically — but only on Windows (filepath.IsLocal is
+// platform-aware; on Unix these names are valid filenames).
+//
+// The test runs the unit-level validateChecksumRelPath check
+// rather than the full VerifyChecksums flow because the lstat
+// step downstream of the IsLocal guard would fail with a
+// generic ENOENT on Unix where the names are not pre-created,
+// masking the rejection class we want to pin.
+func TestValidateChecksumRelPath_RejectsWindowsDeviceNames(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		// filepath.IsLocal only rejects reserved device names on
+		// Windows; on Unix these strings are ordinary filenames.
+		// The lexical fix lands on every platform, but the
+		// rejection is observable only where it matters.
+		t.Skip("Windows-only: filepath.IsLocal reserved-name check is platform-specific")
+	}
+	t.Parallel()
+	names := []string{"CON", "NUL", "PRN", "AUX", "COM1", "LPT1", "CONOUT$"}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := validateChecksumRelPath(name)
+			if err == nil {
+				t.Fatalf("expected ErrChecksumsPathTraversal for reserved name %q, got nil", name)
+			}
+			if !errors.Is(err, ErrChecksumsPathTraversal) {
+				t.Fatalf("err = %v, want ErrChecksumsPathTraversal", err)
+			}
+		})
+	}
+}
+
+// TestValidateChecksumRelPath_AcceptsHonestPaths cross-checks the
+// IsLocal switchover did not regress legitimate relative paths
+// (the Phase 0a dump tree).
+func TestValidateChecksumRelPath_AcceptsHonestPaths(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"a.txt",
+		"redis/db_0/strings/foo.bin",
+		"s3/photos/2026/04/29/img.jpg",
+		"dynamodb/orders/_schema.json",
+		"sqs/queue-1/messages.jsonl",
+	}
+	for _, p := range cases {
+		t.Run(p, func(t *testing.T) {
+			t.Parallel()
+			got, err := validateChecksumRelPath(p)
+			if err != nil {
+				t.Fatalf("validateChecksumRelPath(%q) unexpected err: %v", p, err)
+			}
+			if got != filepath.Clean(p) {
+				t.Fatalf("validateChecksumRelPath(%q) = %q, want %q", p, got, filepath.Clean(p))
+			}
+		})
+	}
+}
+
 // TestVerifyChecksums_StreamsLargeFile pins the bufio.Scanner path
 // — the previous implementation slurped the entire CHECKSUMS file
 // via os.ReadFile, which OOMs on large dump trees (gemini

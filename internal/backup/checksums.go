@@ -259,39 +259,46 @@ func refuseSymlinkComponents(root, rel string) error {
 var ErrChecksumsSymlinkEscape = errors.New("backup: CHECKSUMS path traverses symlink")
 
 // validateChecksumRelPath rejects CHECKSUMS rows whose path field
-// could escape the dump root. The acceptance rules:
+// could escape the dump root or otherwise resolve outside the
+// regular-file subtree the verifier expects. The acceptance rule
+// is `filepath.IsLocal` — Go-stdlib's lexical "stays within the
+// subtree rooted at the evaluation directory" check, which
+// covers:
 //
-//   - absolute paths are rejected;
-//   - paths containing a `..` segment (before or after Clean) are
-//     rejected;
-//   - the cleaned form must not start with `../` (covers
-//     filepath.Clean turning `a/../../b` into `../b`);
-//   - empty / `.` paths are rejected so a malformed entry that
-//     would otherwise read the root directory itself surfaces.
+//   - absolute paths (any platform);
+//   - traversal via `..` segments (before or after Clean);
+//   - on Windows, reserved device names like `CON`, `NUL`,
+//     `COM1`-`COM9`, `LPT1`-`LPT9`, `PRN`, `AUX`, `CONIN$`,
+//     `CONOUT$`, etc. — opened via `os.Open` these would yield
+//     the host's console / device, not a dump file, and produce
+//     hash mismatches keyed off host state. Codex r3 P1 on
+//     PR #810.
 //
-// Returns the cleaned form so callers join it without redoing the
-// canonicalisation. Mirrors the same guard the S3 encoder applies
-// to bucket/object path segments before scratch-dir layout.
+// Empty and "." are rejected explicitly because IsLocal returns
+// true for "." (it does stay within the subtree, but it names
+// the root directory itself, which is not a file we can hash);
+// honest CHECKSUMS lines name regular files, not the root dir.
+//
+// Returns the Cleaned form so callers join it without redoing
+// the canonicalisation. Mirrors the same guard the S3 encoder
+// applies to bucket/object path segments before scratch-dir
+// layout.
 func validateChecksumRelPath(rel string) (string, error) {
 	if rel == "" || rel == "." {
 		return "", errors.Wrapf(ErrChecksumsMalformedLine, "empty path field")
 	}
-	if filepath.IsAbs(rel) {
-		return "", errors.Wrapf(ErrChecksumsPathTraversal, "absolute path: %q", rel)
+	if !filepath.IsLocal(rel) {
+		return "", errors.Wrapf(ErrChecksumsPathTraversal,
+			"not a local path (absolute / traversal / reserved name): %q", rel)
 	}
 	cleaned := filepath.Clean(rel)
-	// Defence in depth: Clean turns `a/b/../../../etc/passwd` into
-	// `../etc/passwd`. A leading `..` segment in the cleaned form
-	// means the relative path escaped its parent, regardless of
-	// what tricks were used to write it.
+	// IsLocal already rejects absolute paths and `..` traversal
+	// before/after Clean; the post-Clean recheck below is
+	// belt-and-braces against a future stdlib change that would
+	// loosen IsLocal but keep the cleaned-shape invariants.
 	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
-		return "", errors.Wrapf(ErrChecksumsPathTraversal, "escapes root: %q", rel)
+		return "", errors.Wrapf(ErrChecksumsPathTraversal, "escapes root after Clean: %q", rel)
 	}
-	// `Clean` strips trailing slashes but leaves the leading
-	// separator on absolute paths intact; we already filtered
-	// those, so a remaining absolute-shaped Clean result is from
-	// inputs like `/foo` on platforms where filepath.IsAbs
-	// disagrees with filepath.Clean. Belt-and-braces.
 	if filepath.IsAbs(cleaned) {
 		return "", errors.Wrapf(ErrChecksumsPathTraversal, "absolute after Clean: %q", rel)
 	}
