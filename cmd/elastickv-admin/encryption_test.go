@@ -173,11 +173,13 @@ func (s *stubSidecarErrorServer) GetSidecarState(context.Context, *pb.Empty) (*p
 // inherit Unimplemented defaults.
 type stubMutatorServer struct {
 	pb.UnimplementedEncryptionAdminServer
-	rotateCalls    []*pb.RotateDEKRequest
-	registerCalls  []*pb.RegisterEncryptionWriterRequest
-	bootstrapCalls []*pb.BootstrapEncryptionRequest
-	appliedIndex   uint64
-	returnErr      error
+	rotateCalls         []*pb.RotateDEKRequest
+	registerCalls       []*pb.RegisterEncryptionWriterRequest
+	bootstrapCalls      []*pb.BootstrapEncryptionRequest
+	enableEnvelopeCalls []*pb.EnableStorageEnvelopeRequest
+	enableEnvelopeResp  *pb.EnableStorageEnvelopeResponse
+	appliedIndex        uint64
+	returnErr           error
 }
 
 func (s *stubMutatorServer) RotateDEK(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -202,6 +204,23 @@ func (s *stubMutatorServer) BootstrapEncryption(_ context.Context, req *pb.Boots
 		return nil, s.returnErr
 	}
 	return &pb.BootstrapEncryptionResponse{AppliedIndex: s.appliedIndex}, nil
+}
+
+func (s *stubMutatorServer) EnableStorageEnvelope(_ context.Context, req *pb.EnableStorageEnvelopeRequest) (*pb.EnableStorageEnvelopeResponse, error) {
+	s.enableEnvelopeCalls = append(s.enableEnvelopeCalls, req)
+	if s.returnErr != nil {
+		return nil, s.returnErr
+	}
+	// enableEnvelopeResp lets tests pin the exact response shape
+	// (fresh-success vs idempotent-retry vs defensive
+	// cutover_index_unknown). When nil the stub defaults to the
+	// fresh-success shape with appliedIndex; this keeps the
+	// existing rotate / register / bootstrap fixtures unchanged
+	// while the cutover tests opt in to the richer shape.
+	if s.enableEnvelopeResp != nil {
+		return s.enableEnvelopeResp, nil
+	}
+	return &pb.EnableStorageEnvelopeResponse{AppliedIndex: s.appliedIndex}, nil
 }
 
 func TestRunEncryptionBootstrap_HappyPath(t *testing.T) {
@@ -596,6 +615,187 @@ func TestEncryptionMain_ProbeNodeIDSubcommand(t *testing.T) {
 		t.Fatal("probe-node-id with no flags: want error, got nil")
 	}
 	if !strings.Contains(err.Error(), "--full-node-id is required") {
+		t.Errorf("dispatch reached wrong handler: got %v", err)
+	}
+}
+
+// TestRunEncryptionEnableStorageEnvelope_HappyPath pins the
+// §3.1 fresh-success rendering: enabled prefix + applied_index
+// + the per-member capability summary. A regression that
+// dropped the summary or printed the wrong applied_index would
+// trip the substring assertions; the wire-level proto assertion
+// pins the request shape so the CLI cannot silently mis-marshal
+// the proposer identity fields.
+func TestRunEncryptionEnableStorageEnvelope_HappyPath(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{
+		appliedIndex: 1234,
+		enableEnvelopeResp: &pb.EnableStorageEnvelopeResponse{
+			AppliedIndex:     1234,
+			WasAlreadyActive: false,
+			CapabilitySummary: []*pb.CapabilityVerdict{
+				{FullNodeId: 11, EncryptionCapable: true, BuildSha: "build-n1", SidecarPresent: true},
+				{FullNodeId: 22, EncryptionCapable: true, BuildSha: "build-n2", SidecarPresent: true},
+			},
+		},
+	}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+	var buf bytes.Buffer
+	err := runEncryptionEnableStorageEnvelope([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--proposer-node-id", "11",
+		"--proposer-local-epoch", "7",
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionEnableStorageEnvelope: %v", err)
+	}
+	out := buf.String()
+	if !strings.HasPrefix(out, "enabled applied_index=1234") {
+		t.Errorf("output prefix missing fresh-success shape, got:\n%s", out)
+	}
+	if !strings.Contains(out, "full_node_id=11") || !strings.Contains(out, "build_sha=build-n1") {
+		t.Errorf("output missing first verdict, got:\n%s", out)
+	}
+	if !strings.Contains(out, "full_node_id=22") || !strings.Contains(out, "build_sha=build-n2") {
+		t.Errorf("output missing second verdict, got:\n%s", out)
+	}
+	if len(stub.enableEnvelopeCalls) != 1 {
+		t.Fatalf("EnableStorageEnvelope calls=%d, want 1", len(stub.enableEnvelopeCalls))
+	}
+	call := stub.enableEnvelopeCalls[0]
+	if call.ProposerNodeId != 11 || call.ProposerLocalEpoch != 7 {
+		t.Errorf("EnableStorageEnvelope call=%+v does not match flag inputs", call)
+	}
+}
+
+// TestRunEncryptionEnableStorageEnvelope_IdempotentRetry pins
+// the §6.4 was_already_active=true rendering: the output uses a
+// distinct prefix ("already-active") so a shell script can
+// switch on column 1 of the result line to discriminate
+// fresh-success from a no-op retry without parsing the full
+// message. The applied_index reports the ORIGINAL cutover
+// index from sidecar.StorageEnvelopeCutoverIndex (not this
+// call's Raft index).
+func TestRunEncryptionEnableStorageEnvelope_IdempotentRetry(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{
+		enableEnvelopeResp: &pb.EnableStorageEnvelopeResponse{
+			AppliedIndex:        555,
+			WasAlreadyActive:    true,
+			CutoverIndexUnknown: false,
+			CapabilitySummary:   nil, // §3.1: empty on retries
+		},
+	}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+	var buf bytes.Buffer
+	err := runEncryptionEnableStorageEnvelope([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--proposer-node-id", "11",
+		"--proposer-local-epoch", "7",
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionEnableStorageEnvelope: %v", err)
+	}
+	out := buf.String()
+	if !strings.HasPrefix(out, "already-active applied_index=555") {
+		t.Errorf("output prefix missing already-active shape, got:\n%s", out)
+	}
+	if strings.Contains(out, "capability summary") {
+		t.Errorf("idempotent retry must NOT print the capability summary header, got:\n%s", out)
+	}
+	if strings.Contains(out, "warning:") {
+		t.Errorf("idempotent retry without cutover_index_unknown must NOT emit a warning, got:\n%s", out)
+	}
+}
+
+// TestRunEncryptionEnableStorageEnvelope_DefensiveCutoverIndexUnknown
+// pins the §6.4 defensive-fallback warning: a sidecar reporting
+// StorageEnvelopeActive=true with StorageEnvelopeCutoverIndex=0
+// (operationally impossible under normal apply but hedged
+// against schema rollback / hand-edited sidecars) triggers a
+// "warning: cutover_index_unknown=true" line BEFORE the
+// already-active result. Operators can grep on the warning
+// substring to flag clusters that need investigation.
+func TestRunEncryptionEnableStorageEnvelope_DefensiveCutoverIndexUnknown(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{
+		enableEnvelopeResp: &pb.EnableStorageEnvelopeResponse{
+			AppliedIndex:        900,
+			WasAlreadyActive:    true,
+			CutoverIndexUnknown: true,
+		},
+	}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+	var buf bytes.Buffer
+	if err := runEncryptionEnableStorageEnvelope([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--proposer-node-id", "11",
+		"--proposer-local-epoch", "7",
+	}, &buf); err != nil {
+		t.Fatalf("runEncryptionEnableStorageEnvelope: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "warning: cutover_index_unknown=true") {
+		t.Errorf("output missing defensive-fallback warning, got:\n%s", out)
+	}
+	if !strings.Contains(out, "already-active applied_index=900") {
+		t.Errorf("output missing already-active shape, got:\n%s", out)
+	}
+}
+
+// TestRunEncryptionEnableStorageEnvelope_RejectsZeroProposerNodeID
+// pins the §6.1 sentinel rejection on the CLI side: passing
+// --proposer-node-id=0 (or omitting the flag) MUST refuse
+// before the RPC round-trip so an operator with a misconfigured
+// shell variable fails fast. The server re-validates the same
+// sentinel as the source of truth.
+func TestRunEncryptionEnableStorageEnvelope_RejectsZeroProposerNodeID(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionEnableStorageEnvelope([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--proposer-node-id", "0",
+		"--proposer-local-epoch", "7",
+	}, &buf)
+	if err == nil {
+		t.Fatal("runEncryptionEnableStorageEnvelope returned nil, want error on --proposer-node-id=0")
+	}
+	if !strings.Contains(err.Error(), "proposer-node-id") {
+		t.Errorf("error %q does not hint at the rejected flag", err)
+	}
+}
+
+// TestRunEncryptionEnableStorageEnvelope_RejectsBadEpoch pins
+// the §4.1 16-bit bound on the CLI side. Same source-of-truth
+// posture as RotateDEK / BootstrapEncryption.
+func TestRunEncryptionEnableStorageEnvelope_RejectsBadEpoch(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionEnableStorageEnvelope([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--proposer-node-id", "11",
+		"--proposer-local-epoch", "70000", // > 0xFFFF
+	}, &buf)
+	if err == nil || !strings.Contains(err.Error(), "16-bit bound") {
+		t.Fatalf("runEncryptionEnableStorageEnvelope error=%v, want bound-violation", err)
+	}
+}
+
+// TestEncryptionMain_EnableStorageEnvelopeSubcommand pins the
+// dispatch entry in encryptionMain. A typo in the switch
+// statement would route enable-storage-envelope to the default
+// branch and the user would see "unknown subcommand" rather
+// than the runner's "--proposer-node-id is required" error.
+func TestEncryptionMain_EnableStorageEnvelopeSubcommand(t *testing.T) {
+	t.Parallel()
+	err := encryptionMain([]string{"enable-storage-envelope"})
+	if err == nil {
+		t.Fatal("enable-storage-envelope with no flags: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "proposer-node-id") {
 		t.Errorf("dispatch reached wrong handler: got %v", err)
 	}
 }
