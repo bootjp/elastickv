@@ -70,6 +70,16 @@ type TablesSource interface {
 	AdminDescribeTable(ctx context.Context, name string) (*DynamoTableSummary, bool, error)
 	AdminCreateTable(ctx context.Context, principal AuthPrincipal, in CreateTableRequest) (*DynamoTableSummary, error)
 	AdminDeleteTable(ctx context.Context, principal AuthPrincipal, name string) error
+
+	// Item-level admin RPCs (Phase 3a — design §3.1.1).
+	// The handler in dynamo_items_handler.go drives these for the
+	// /tables/{name}/items{,/{key}} sub-tree. Implementations live
+	// in main_admin.go (dynamoTablesBridge) and bridge to the
+	// adapter package's Admin*Item methods.
+	AdminScanItems(ctx context.Context, principal AuthPrincipal, table string, opts AdminScanItemsOptions) (AdminScanItemsResult, error)
+	AdminGetItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) (*AdminItem, bool, error)
+	AdminPutItem(ctx context.Context, principal AuthPrincipal, table string, item AdminItem) error
+	AdminDeleteItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) error
 }
 
 // CreateTableRequest is the JSON body shape for POST /tables per
@@ -241,18 +251,104 @@ func (h *DynamoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or POST")
 		}
 	case strings.HasPrefix(r.URL.Path, pathPrefixDynamoTables):
-		name := strings.TrimPrefix(r.URL.Path, pathPrefixDynamoTables)
-		switch r.Method {
-		case http.MethodGet:
-			h.handleDescribe(w, r, name)
-		case http.MethodDelete:
-			h.handleDelete(w, r, name)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
-		}
+		h.dispatchPerTableRoute(w, r)
 	default:
 		writeJSONError(w, http.StatusNotFound, "not_found", "")
 	}
+}
+
+// dispatchPerTableRoute fans out the /tables/{name}{,/items{,/{key}}}
+// sub-tree. Splits the URL suffix into path segments and validates
+// each against the same dot-segment / percent-encoding rejection
+// the SQS handler adopted (no `..`, no `.`, no `%`-escaped path
+// segments). The validation is up-front so a malformed `{name}` or
+// `{key}` cannot reach the Admin* methods.
+//
+//	1 seg  → /tables/{name}              (existing describe / delete)
+//	2 segs → /tables/{name}/items        (Phase 3a: scan)
+//	3 segs → /tables/{name}/items/{key}  (Phase 3a: get / put / delete)
+//
+// Anything else is a 404. The second segment is required to be the
+// literal "items" string; any other sub-resource name is also a
+// 404 (the SPA never targets one).
+// Per-table route segment counts. Named to keep the dispatcher
+// switch self-documenting and to satisfy the mnd linter (which
+// flags magic 2/3 in case-labels).
+const (
+	dynamoRouteSegmentsTable           = 1
+	dynamoRouteSegmentsItemsCollection = 2
+	dynamoRouteSegmentsItemResource    = 3
+)
+
+func (h *DynamoHandler) dispatchPerTableRoute(w http.ResponseWriter, r *http.Request) {
+	// EscapedPath() exposes percent-encoded segments verbatim so the
+	// `%`-rejection in isValidAdminPathSegment catches things like
+	// %2F (encoded /), %2E%2E (encoded ..), %252F (double-encoded).
+	// r.URL.Path is pre-decoded and would let those slip through.
+	escaped := r.URL.EscapedPath()
+	rest := strings.TrimPrefix(escaped, pathPrefixDynamoTables)
+	segments := dropSingleTrailingEmpty(strings.Split(rest, "/"))
+	for _, seg := range segments {
+		if !isValidAdminPathSegment(seg) {
+			writeJSONError(w, http.StatusBadRequest, "invalid_path",
+				"path segment is empty, contains %, or is a dot-segment")
+			return
+		}
+	}
+	switch len(segments) {
+	case dynamoRouteSegmentsTable:
+		h.dispatchTableResource(w, r, segments[0])
+	case dynamoRouteSegmentsItemsCollection:
+		if segments[1] != adminItemSubResource {
+			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+				"unknown sub-resource on this table")
+			return
+		}
+		h.handleItemsCollection(w, r, segments[0])
+	case dynamoRouteSegmentsItemResource:
+		if segments[1] != adminItemSubResource {
+			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+				"unknown sub-resource on this table")
+			return
+		}
+		h.handleItemResource(w, r, segments[0], segments[2])
+	default:
+		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+			"too many path segments")
+	}
+}
+
+// dispatchTableResource handles /tables/{name}: GET = describe,
+// DELETE = delete. Extracted from dispatchPerTableRoute so the
+// parent stays under the cyclop=10 ceiling.
+func (h *DynamoHandler) dispatchTableResource(w http.ResponseWriter, r *http.Request, name string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.handleDescribe(w, r, name)
+	case http.MethodDelete:
+		h.handleDelete(w, r, name)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
+	}
+}
+
+// isValidAdminPathSegment enforces the same per-segment rules
+// SQS adopted (Phase 5 of the routing procedure docs): no empty
+// segment, no percent sign (closes the %2F / %252F / %2e /
+// %2E%2E percent-encoded escape classes), no literal dot-segment
+// strings (`.` / `..` — closes the raw dot-segment traversal
+// class that path.Clean would otherwise collapse).
+func isValidAdminPathSegment(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	if strings.ContainsRune(seg, '%') {
+		return false
+	}
+	if seg == "." || seg == ".." {
+		return false
+	}
+	return true
 }
 
 // dynamoListResponse is the JSON shape returned by GET /tables.
