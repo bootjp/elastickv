@@ -325,10 +325,29 @@ func TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket(t *testing.T) 
 	node := sqsLeaderNode(t, nodes)
 
 	url := mustCreateQueue(t, node, "throttle-noop-set")
-	mustSetQueueAttributes(t, node, url, map[string]string{
+	// Refill rate is intentionally slow (0.01/sec = 1 token per
+	// 100 seconds) so the test's wall-clock window between drain
+	// and the post-no-op send cannot accumulate to a whole token.
+	// At 1/sec the test raced its own refill on slow CI runners:
+	// 10 drain sends + sanity send + SetQueueAttributes (each
+	// going through Raft propose+apply at ~100-250ms under -race)
+	// elapses ~1.5-2.5s before the post-no-op send fires, by which
+	// time the bucket has refilled 1+ tokens and the send returns
+	// 200 instead of the expected 400. The test's intent — verify
+	// that a no-op SetQueueAttributes does not reset the bucket —
+	// is independent of the refill rate, so slowing it down is
+	// the right scope.
+	const slowRefill = "0.01"
+	// Define the attribute map once and reuse on both calls so the
+	// "no-op" intent is structurally visible: the two
+	// mustSetQueueAttributes calls share the same map literal, so
+	// a future drift between them (e.g., a typo or a stray edit)
+	// would be obviously wrong (Gemini medium on PR #819).
+	throttleAttrs := map[string]string{
 		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "1",
-	})
+		"ThrottleSendRefillPerSecond": slowRefill,
+	}
+	mustSetQueueAttributes(t, node, url, throttleAttrs)
 	// Drain the bucket so the next charge would only succeed if the
 	// bucket was reset to a fresh full-capacity replacement.
 	for range 10 {
@@ -349,10 +368,7 @@ func TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket(t *testing.T) 
 	// Re-submit identical Throttle* values. Old code invalidated on
 	// key presence and the next send would have been allowed against
 	// a fresh full bucket.
-	mustSetQueueAttributes(t, node, url, map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "1",
-	})
+	mustSetQueueAttributes(t, node, url, throttleAttrs)
 	// Bucket must still be drained — no-op SetQueueAttributes must not
 	// reset the rate limiter.
 	status, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
