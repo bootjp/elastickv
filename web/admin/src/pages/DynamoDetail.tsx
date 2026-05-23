@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../auth";
+import { DynamoItemsTab } from "../components/DynamoItemsTab";
 import { Modal } from "../components/Modal";
 import { formatApiError, useApiQuery } from "../lib/useApi";
 
@@ -66,6 +67,29 @@ export function DynamoDetailPage() {
           </dl>
         )}
       </section>
+      {detail.data && detail.data.name === name && (
+        // Only render the items tab when the loaded describe response
+        // matches the current route param. useApiQuery keeps the
+        // previous table's `detail.data` around while a new fetch is
+        // in flight, so a /dynamo/tables/A → /dynamo/tables/B
+        // navigation would otherwise mount DynamoItemsTab with
+        // table=B but partitionKey/sortKey from A's stale schema.
+        // The tab then scans table B with A's key shape; key
+        // extraction returns wrong attributes (or fails entirely on
+        // a hash+range vs hash-only mismatch) for the brief window
+        // before the new describe response lands — and any edit /
+        // delete kicked off in that window targets the wrong record
+        // (Codex P2 on PR #815 r3). The `key={name}` below remounts
+        // the tab on route change so its internal state (cursor,
+        // open modal, etc.) also resets.
+        <DynamoItemsTab
+          key={name}
+          table={name}
+          partitionKey={detail.data.partition_key}
+          sortKey={detail.data.sort_key}
+        />
+      )}
+
       {detail.data?.global_secondary_indexes && detail.data.global_secondary_indexes.length > 0 && (
         <section className="card">
           <h2 className="text-sm font-semibold mb-3">Global secondary indexes</h2>
