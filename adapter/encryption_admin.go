@@ -748,7 +748,19 @@ func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *
 // A plain sync.Mutex would block past the caller's deadline,
 // breaking RPC cancellation semantics (codex P2 round-3 on
 // PR812).
+//
+// The explicit ctx.Err() check before the select is load-bearing:
+// Go's select picks uniformly at random among ready cases (it
+// does NOT prioritize ctx.Done()), so an already-canceled ctx
+// paired with a free semaphore would coin-flip between acquiring
+// the slot (and running precheck / fan-out / propose against an
+// aborted caller) and the cancellation return. Checking
+// ctx.Err() first turns the cancellation into a deterministic
+// short-circuit (codex P1 round-4 on PR812).
 func (s *EncryptionAdminServer) acquireCutoverSemaphore(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return cutoverSemaphoreErrorToStatus(err)
+	}
 	select {
 	case s.cutoverSem <- struct{}{}:
 		return nil

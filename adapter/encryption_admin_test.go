@@ -1510,6 +1510,76 @@ func TestEncryptionAdmin_EnableStorageEnvelope_SerializesConcurrentCutovers(t *t
 	}
 }
 
+// TestEncryptionAdmin_EnableStorageEnvelope_PreCanceledCtxDeterministicShortCircuit
+// pins codex P1 round-4 on PR812: when ctx is already canceled
+// at entry AND the cutoverSem has capacity (no in-flight cutover
+// is holding it), Go's select would pick non-deterministically
+// between the send case and the ctx.Done case. An explicit
+// ctx.Err() check before the select turns the cancellation into
+// a deterministic short-circuit so a caller who canceled before
+// the RPC even started cannot accidentally drive precheck /
+// fan-out / propose work.
+//
+// The test repeats the pre-canceled call N times against a fresh
+// (capacity-free) semaphore: every iteration MUST surface the
+// ctx error, never advance into the fan-out closure (which the
+// test fixture would observe via a t.Errorf if hit).
+func TestEncryptionAdmin_EnableStorageEnvelope_PreCanceledCtxDeterministicShortCircuit(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		ctxFn    func() (context.Context, context.CancelFunc)
+		wantCode codes.Code
+	}{
+		{
+			name: "canceled",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			wantCode: codes.Canceled,
+		},
+		{
+			name: "deadline_exceeded",
+			ctxFn: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				return ctx, cancel
+			},
+			wantCode: codes.DeadlineExceeded,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// failOnCallCapabilityFanout fires t.Errorf if the
+			// RPC ever advances into fan-out — that would mean
+			// the semaphore acquire DID take the send case
+			// despite the canceled ctx.
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(&recordingProposer{}),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+				WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+				WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
+			)
+			// 100 iterations against a freshly-created server
+			// (semaphore is empty / capacity available). Without
+			// the explicit ctx.Err() check, Go's pseudo-random
+			// select choice would make some of these iterations
+			// advance into precheck/fan-out, tripping the
+			// failOnCallCapabilityFanout fixture.
+			for range 100 {
+				ctx, cancel := tc.ctxFn()
+				_, err := srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+				cancel()
+				if status.Code(err) != tc.wantCode {
+					t.Fatalf("EnableStorageEnvelope status=%v, want %v (must short-circuit on pre-canceled ctx)",
+						status.Code(err), tc.wantCode)
+				}
+			}
+		})
+	}
+}
+
 // TestEncryptionAdmin_EnableStorageEnvelope_HonorsCtxDeadlineWaitingOnMutator
 // pins codex P2 round-3 on PR812: when one cutover RPC holds
 // the mutator semaphore through a slow fan-out + propose, a
