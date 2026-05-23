@@ -57,14 +57,15 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
     };
   }, []);
 
-  // contextRef tracks the latest bucket/prefix so async callbacks
-  // (notably onFilePicked, which can outlive a folder navigation
-  // for large uploads) can compare against the operator's CURRENT
-  // view rather than the closure-captured value from click time.
-  // Codex P1 on PR #816 r7 caught the post-upload reload using
-  // stale prefix/cursor.
-  const contextRef = useRef({ bucket, prefix });
-  contextRef.current = { bucket, prefix };
+  // contextRef tracks the latest bucket/prefix/cursor so async
+  // callbacks (notably onFilePicked, which can outlive a folder
+  // navigation or in-prefix pagination for large uploads) can
+  // compare against the operator's CURRENT view rather than the
+  // closure-captured value from click time. Cursor was added in
+  // r9 after Codex P2 on r8 caught the in-prefix pagination race
+  // (jump-back to the upload's origin page on completion).
+  const contextRef = useRef({ bucket, prefix, cursor: "" as string | undefined });
+  contextRef.current = { bucket, prefix, cursor: cursorStack[cursorStack.length - 1] };
 
   // loadPage returns true on success, false on error or
   // cancellation. Callers (notably onNextPage) inspect the
@@ -224,25 +225,39 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
       const key = uploadPrefix + file.name;
       await api.putObject(uploadBucket, key, file, file.type || "application/octet-stream");
       // Skip the post-upload reload if the operator navigated
-      // mid-flight — the [bucket, prefix] effect already kicked
-      // off the right scan for the new context, and re-issuing
-      // with stale bucket/prefix would overwrite `page` with
-      // rows from the OLD context. The leaderward retry semantics
-      // are unchanged: a successful PUT against bucketA/prefixA
-      // remains durable even if we skip the listing refresh.
-      // contextRef holds the LATEST state (closure-captured
-      // bucket/prefix would compare equal against themselves).
+      // mid-flight — bucket, prefix, OR page (cursor) all count.
+      // The [bucket, prefix] effect already kicked off the right
+      // scan when the bucket/prefix changed; re-issuing here
+      // would clobber it. For in-prefix pagination (Codex P2 on
+      // r8), uploadCursor was captured at click time, so the
+      // captured cursor would force the listing back to the
+      // upload's origin page even when the operator is now on a
+      // later page. contextRef holds the LATEST state across all
+      // three; only refresh when the operator is still on the
+      // exact (bucket, prefix, page) that the upload targeted.
+      // A successful PUT against (bucketA, prefixA, pageN) stays
+      // durable on the server regardless of whether we refresh
+      // the listing client-side.
       const cur = contextRef.current;
-      if (uploadBucket === cur.bucket && uploadPrefix === cur.prefix) {
+      if (
+        uploadBucket === cur.bucket &&
+        uploadPrefix === cur.prefix &&
+        uploadCursor === cur.cursor
+      ) {
         void loadPage(uploadCursor, uploadPrefix);
       }
     } catch (err) {
       // Only surface the upload error if the operator is still
       // looking at the context they uploaded into; otherwise the
       // error banner would attach to a screen that has nothing to
-      // do with the failed upload.
+      // do with the failed upload. Same three-axis check as the
+      // success path.
       const cur = contextRef.current;
-      if (uploadBucket === cur.bucket && uploadPrefix === cur.prefix) {
+      if (
+        uploadBucket === cur.bucket &&
+        uploadPrefix === cur.prefix &&
+        uploadCursor === cur.cursor
+      ) {
         setUploadError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
       }
     } finally {
