@@ -49,6 +49,7 @@ service EncryptionAdmin {
   rpc RotateDEK (RotateDEKRequest) returns (RotateDEKResponse) {}
   rpc RegisterEncryptionWriter (RegisterEncryptionWriterRequest) returns (RegisterEncryptionWriterResponse) {}
   rpc ResyncSidecar (ResyncSidecarRequest) returns (ResyncSidecarResponse) {}
+  rpc EnableStorageEnvelope (EnableStorageEnvelopeRequest) returns (EnableStorageEnvelopeResponse) {}
 }
 
 message Empty {}
@@ -161,4 +162,69 @@ message ResyncSidecarResponse {
   // §5.5 recovery flow tolerates an empty map because a node
   // recovering before any DEK exists has nothing to re-derive.
   map<uint32, uint32> writer_registry_for_caller = 5;
+}
+
+// EnableStorageEnvelopeRequest proposes the §7.1 Phase 1 cutover
+// that flips the cluster from cleartext storage writes to §4.1
+// envelope writes. Defined in the 6D design doc §3.1; the server
+// composes a RotationPayload with SubTag =
+// RotateSubEnableStorageEnvelope (0x04) and routes it through the
+// default Raft group's leader as a §11.3 0x05 OpRotation entry.
+//
+// proposer_node_id MUST be non-zero (the §6.1 "not-capable"
+// sentinel is rejected at the server boundary, matching the
+// existing RotateDEK / BootstrapEncryption posture).
+//
+// proposer_local_epoch carries the §4.1 16-bit nonce field as
+// uint32 (proto3 has no uint16); values above 0xFFFF are
+// rejected at the server boundary before any Raft proposal is
+// composed. ApplyRotation re-validates at apply time
+// (defense-in-depth).
+message EnableStorageEnvelopeRequest {
+  uint64 proposer_node_id     = 1;
+  uint32 proposer_local_epoch = 2; // MUST be <= 0xFFFF on the wire.
+}
+
+// EnableStorageEnvelopeResponse reports the outcome of a cutover
+// proposal. The §6.4 idempotency contract is encoded as an OK
+// status with `was_already_active = true` (NOT AlreadyExists,
+// since unary gRPC drops the response body on non-OK status; the
+// applied_index must be reachable on the success path).
+//
+// On a fresh cutover (was_already_active == false), applied_index
+// is the Raft index of the entry the leader just proposed and
+// waited to apply. On a retried call, applied_index is the
+// recorded sidecar.StorageEnvelopeCutoverIndex from the ORIGINAL
+// cutover (§6.4) — stable across arbitrary subsequent
+// encryption-relevant Raft activity.
+//
+// capability_summary records which (full_node_id) members were
+// probed during the pre-flight gate and what they reported.
+// Empty on idempotent retries (was_already_active=true); the
+// membership view of the original cutover is not retained.
+//
+// cutover_index_unknown is the §6.4 defensive fallback: it only
+// fires if a sidecar reports StorageEnvelopeActive=true with
+// StorageEnvelopeCutoverIndex=0 (operationally impossible under
+// normal apply, but hedged against future schema rollback). On
+// healthy clusters this stays false. The field is only
+// meaningful when was_already_active=true.
+message EnableStorageEnvelopeResponse {
+  uint64 applied_index = 1;
+  repeated CapabilityVerdict capability_summary = 2;
+  bool   cutover_index_unknown = 3;
+  bool   was_already_active    = 4;
+}
+
+// CapabilityVerdict is one row of the §4 fan-out summary the
+// cutover RPC returns. full_node_id is the route member the leader
+// probed; the remaining fields mirror the corresponding member's
+// CapabilityReport. A cluster where any verdict has
+// encryption_capable=false MUST NOT reach the propose step; the
+// summary in the response is the post-hoc record for operators.
+message CapabilityVerdict {
+  uint64 full_node_id       = 1;
+  bool   encryption_capable = 2;
+  string build_sha          = 3;
+  bool   sidecar_present    = 4;
 }

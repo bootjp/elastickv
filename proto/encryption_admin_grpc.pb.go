@@ -25,6 +25,7 @@ const (
 	EncryptionAdmin_RotateDEK_FullMethodName                = "/EncryptionAdmin/RotateDEK"
 	EncryptionAdmin_RegisterEncryptionWriter_FullMethodName = "/EncryptionAdmin/RegisterEncryptionWriter"
 	EncryptionAdmin_ResyncSidecar_FullMethodName            = "/EncryptionAdmin/ResyncSidecar"
+	EncryptionAdmin_EnableStorageEnvelope_FullMethodName    = "/EncryptionAdmin/EnableStorageEnvelope"
 )
 
 // EncryptionAdminClient is the client API for EncryptionAdmin service.
@@ -78,6 +79,7 @@ type EncryptionAdminClient interface {
 	RotateDEK(ctx context.Context, in *RotateDEKRequest, opts ...grpc.CallOption) (*RotateDEKResponse, error)
 	RegisterEncryptionWriter(ctx context.Context, in *RegisterEncryptionWriterRequest, opts ...grpc.CallOption) (*RegisterEncryptionWriterResponse, error)
 	ResyncSidecar(ctx context.Context, in *ResyncSidecarRequest, opts ...grpc.CallOption) (*ResyncSidecarResponse, error)
+	EnableStorageEnvelope(ctx context.Context, in *EnableStorageEnvelopeRequest, opts ...grpc.CallOption) (*EnableStorageEnvelopeResponse, error)
 }
 
 type encryptionAdminClient struct {
@@ -148,6 +150,16 @@ func (c *encryptionAdminClient) ResyncSidecar(ctx context.Context, in *ResyncSid
 	return out, nil
 }
 
+func (c *encryptionAdminClient) EnableStorageEnvelope(ctx context.Context, in *EnableStorageEnvelopeRequest, opts ...grpc.CallOption) (*EnableStorageEnvelopeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnableStorageEnvelopeResponse)
+	err := c.cc.Invoke(ctx, EncryptionAdmin_EnableStorageEnvelope_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EncryptionAdminServer is the server API for EncryptionAdmin service.
 // All implementations must embed UnimplementedEncryptionAdminServer
 // for forward compatibility.
@@ -199,6 +211,7 @@ type EncryptionAdminServer interface {
 	RotateDEK(context.Context, *RotateDEKRequest) (*RotateDEKResponse, error)
 	RegisterEncryptionWriter(context.Context, *RegisterEncryptionWriterRequest) (*RegisterEncryptionWriterResponse, error)
 	ResyncSidecar(context.Context, *ResyncSidecarRequest) (*ResyncSidecarResponse, error)
+	EnableStorageEnvelope(context.Context, *EnableStorageEnvelopeRequest) (*EnableStorageEnvelopeResponse, error)
 	mustEmbedUnimplementedEncryptionAdminServer()
 }
 
@@ -226,6 +239,9 @@ func (UnimplementedEncryptionAdminServer) RegisterEncryptionWriter(context.Conte
 }
 func (UnimplementedEncryptionAdminServer) ResyncSidecar(context.Context, *ResyncSidecarRequest) (*ResyncSidecarResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResyncSidecar not implemented")
+}
+func (UnimplementedEncryptionAdminServer) EnableStorageEnvelope(context.Context, *EnableStorageEnvelopeRequest) (*EnableStorageEnvelopeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnableStorageEnvelope not implemented")
 }
 func (UnimplementedEncryptionAdminServer) mustEmbedUnimplementedEncryptionAdminServer() {}
 func (UnimplementedEncryptionAdminServer) testEmbeddedByValue()                         {}
@@ -356,6 +372,24 @@ func _EncryptionAdmin_ResyncSidecar_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EncryptionAdmin_EnableStorageEnvelope_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnableStorageEnvelopeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EncryptionAdminServer).EnableStorageEnvelope(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EncryptionAdminServer).EnableStorageEnvelope(ctx, req.(*EnableStorageEnvelopeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EncryptionAdmin_ServiceDesc is the grpc.ServiceDesc for EncryptionAdmin service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -386,6 +420,10 @@ var EncryptionAdmin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResyncSidecar",
 			Handler:    _EncryptionAdmin_ResyncSidecar_Handler,
+		},
+		{
+			MethodName: "EnableStorageEnvelope",
+			Handler:    _EncryptionAdmin_EnableStorageEnvelope_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
