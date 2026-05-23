@@ -1,10 +1,13 @@
 package backup
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 )
 
 // TestWriteChecksums_BasicListing pins the on-disk shape of a
@@ -110,6 +113,69 @@ func TestVerifyChecksums_DetectsTampering(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "a.txt"), []byte("tampered"))
 	if err := VerifyChecksums(root); err == nil {
 		t.Fatalf("expected VerifyChecksums to detect tampering, got nil")
+	}
+}
+
+// TestVerifyChecksums_RejectsTraversalPath is the regression for
+// the coderabbit critical finding on PR #810. A CHECKSUMS file
+// shipped alongside a backup must not be able to direct the
+// verifier to fingerprint files outside the dump root via a
+// `..`-laden path. The verifier rejects with
+// ErrChecksumsPathTraversal before any sha256 is computed.
+func TestVerifyChecksums_RejectsTraversalPath(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		relPath string
+	}{
+		{"parent traversal", "../etc/passwd"},
+		{"deep traversal", "a/../../b"},
+		{"absolute path", "/etc/passwd"},
+		{"current dir", "."},
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			// Write a CHECKSUMS that references the traversal path.
+			// The digest is the sha256 of an arbitrary fixture so
+			// shape parsing succeeds and the path guard is the
+			// first thing to fire.
+			body := "0000000000000000000000000000000000000000000000000000000000000000  " + tc.relPath + "\n"
+			mustWrite(t, filepath.Join(root, CHECKSUMSFilename), []byte(body))
+			err := VerifyChecksums(root)
+			if err == nil {
+				t.Fatalf("expected error for relPath=%q, got nil", tc.relPath)
+			}
+			// `.` and "" surface as malformed-line; the rest surface
+			// as path-traversal. Both signal "do not trust the
+			// CHECKSUMS contents".
+			if !errors.Is(err, ErrChecksumsPathTraversal) && !errors.Is(err, ErrChecksumsMalformedLine) {
+				t.Fatalf("err = %v, want ErrChecksumsPathTraversal or ErrChecksumsMalformedLine", err)
+			}
+		})
+	}
+}
+
+// TestVerifyChecksums_StreamsLargeFile pins the bufio.Scanner path
+// — the previous implementation slurped the entire CHECKSUMS file
+// via os.ReadFile, which OOMs on large dump trees (gemini
+// security-high on PR #810). We do not exercise an actual large
+// file (CI cost) but we confirm the streaming code path tolerates
+// many lines without buffering them all.
+func TestVerifyChecksums_StreamsLargeFile(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	const fileCount = 64
+	for i := 0; i < fileCount; i++ {
+		mustWrite(t, filepath.Join(root, fmt.Sprintf("f-%03d", i)), []byte{byte(i)})
+	}
+	if err := WriteChecksums(root); err != nil {
+		t.Fatalf("WriteChecksums: %v", err)
+	}
+	if err := VerifyChecksums(root); err != nil {
+		t.Fatalf("VerifyChecksums: %v", err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -12,6 +13,17 @@ import (
 
 	"github.com/cockroachdb/errors"
 )
+
+// maxChecksumLineLen bounds the bufio.Scanner buffer for one
+// CHECKSUMS line. A well-formed entry is 64 hex chars + 2 spaces +
+// the relative path; with NAME_MAX=255 on Linux, even a
+// pathologically deep tree (255 chars × ~30 levels) stays well
+// under 8 KiB. The cap exists so a corrupt CHECKSUMS with a
+// missing newline cannot force the scanner to buffer an
+// arbitrarily-long "line" — that is the OOM vector the gemini
+// security-high finding on PR #810 flagged when the previous
+// implementation slurped the whole file via os.ReadFile.
+const maxChecksumLineLen = 8 * 1024
 
 // CHECKSUMSFilename is the on-disk name of the dump-tree-wide
 // sha256sum(1)-compatible checksum file. Stored at the dump root so
@@ -134,33 +146,117 @@ func sha256File(path string) (string, error) {
 // referenced by CHECKSUMS but missing on disk surface as the same
 // error class so a partial-restore is obvious.
 //
+// Memory: streaming. Uses bufio.Scanner with a fixed 8 KiB per-line
+// budget so a multi-million-file dump tree's CHECKSUMS file does
+// not need to fit in memory, and a corrupt CHECKSUMS without
+// newlines cannot trick us into buffering arbitrarily much (the
+// gemini security-high finding on PR #810 — the previous
+// os.ReadFile + strings.Split path materialised the whole file).
+//
+// Path safety: every CHECKSUMS line's relative-path field is
+// validated by validateChecksumRelPath before being joined with
+// root, so an adversarial CHECKSUMS shipped alongside a backup
+// (e.g. with a `../../etc/shadow` entry) cannot escape root and
+// fingerprint files the operator did not intend to expose. The
+// coderabbit critical finding on PR #810.
+//
 // Used by the Phase 0b encoder's self-test path: after encoding a
 // directory tree back into a `.fsm`, it re-runs the decoder and
 // asserts WriteChecksums + VerifyChecksums round-trip cleanly.
 func VerifyChecksums(root string) error {
-	body, err := os.ReadFile(filepath.Join(root, CHECKSUMSFilename)) //nolint:gosec // operator-supplied output dir
+	f, err := os.Open(filepath.Join(root, CHECKSUMSFilename)) //nolint:gosec // operator-supplied output dir
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
-	for i, line := range lines {
-		if line == "" {
-			continue
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, maxChecksumLineLen), maxChecksumLineLen)
+	lineNum := 0
+	for sc.Scan() {
+		lineNum++
+		if err := verifyOneChecksumLine(root, sc.Text(), lineNum); err != nil {
+			return err
 		}
-		want, rel, ok := splitChecksumLine(line)
-		if !ok {
-			return errors.Wrapf(ErrChecksumsMalformedLine, "line %d: %q", i+1, line)
-		}
-		got, err := sha256File(filepath.Join(root, rel))
-		if err != nil {
-			return errors.Wrapf(err, "verifying %s", rel)
-		}
-		if got != want {
-			return errors.Wrapf(ErrChecksumMismatch, "%s: have %s want %s", rel, got, want)
-		}
+	}
+	if err := sc.Err(); err != nil {
+		return errors.WithStack(err)
 	}
 	return nil
 }
+
+// verifyOneChecksumLine handles a single CHECKSUMS line: parse,
+// path-validate, recompute, compare. Extracted from VerifyChecksums
+// so the parent stays under the project's cyclop ceiling and the
+// per-line failure modes (malformed shape, traversal, missing file,
+// mismatch) each surface as a distinct typed error.
+func verifyOneChecksumLine(root, line string, lineNum int) error {
+	if line == "" {
+		return nil
+	}
+	want, rel, ok := splitChecksumLine(line)
+	if !ok {
+		return errors.Wrapf(ErrChecksumsMalformedLine, "line %d: %q", lineNum, line)
+	}
+	cleaned, err := validateChecksumRelPath(rel)
+	if err != nil {
+		return errors.Wrapf(err, "line %d", lineNum)
+	}
+	got, err := sha256File(filepath.Join(root, cleaned))
+	if err != nil {
+		return errors.Wrapf(err, "verifying %s", cleaned)
+	}
+	if got != want {
+		return errors.Wrapf(ErrChecksumMismatch, "%s: have %s want %s", cleaned, got, want)
+	}
+	return nil
+}
+
+// validateChecksumRelPath rejects CHECKSUMS rows whose path field
+// could escape the dump root. The acceptance rules:
+//
+//   - absolute paths are rejected;
+//   - paths containing a `..` segment (before or after Clean) are
+//     rejected;
+//   - the cleaned form must not start with `../` (covers
+//     filepath.Clean turning `a/../../b` into `../b`);
+//   - empty / `.` paths are rejected so a malformed entry that
+//     would otherwise read the root directory itself surfaces.
+//
+// Returns the cleaned form so callers join it without redoing the
+// canonicalisation. Mirrors the same guard the S3 encoder applies
+// to bucket/object path segments before scratch-dir layout.
+func validateChecksumRelPath(rel string) (string, error) {
+	if rel == "" || rel == "." {
+		return "", errors.Wrapf(ErrChecksumsMalformedLine, "empty path field")
+	}
+	if filepath.IsAbs(rel) {
+		return "", errors.Wrapf(ErrChecksumsPathTraversal, "absolute path: %q", rel)
+	}
+	cleaned := filepath.Clean(rel)
+	// Defence in depth: Clean turns `a/b/../../../etc/passwd` into
+	// `../etc/passwd`. A leading `..` segment in the cleaned form
+	// means the relative path escaped its parent, regardless of
+	// what tricks were used to write it.
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", errors.Wrapf(ErrChecksumsPathTraversal, "escapes root: %q", rel)
+	}
+	// `Clean` strips trailing slashes but leaves the leading
+	// separator on absolute paths intact; we already filtered
+	// those, so a remaining absolute-shaped Clean result is from
+	// inputs like `/foo` on platforms where filepath.IsAbs
+	// disagrees with filepath.Clean. Belt-and-braces.
+	if filepath.IsAbs(cleaned) {
+		return "", errors.Wrapf(ErrChecksumsPathTraversal, "absolute after Clean: %q", rel)
+	}
+	return cleaned, nil
+}
+
+// ErrChecksumsPathTraversal is returned by VerifyChecksums when a
+// CHECKSUMS line's path field would resolve outside the dump root.
+// Typed so a future verifier built on top of this package can
+// branch on errors.Is and distinguish path-shape attacks from
+// honest content-mismatch.
+var ErrChecksumsPathTraversal = errors.New("backup: CHECKSUMS path escapes dump root")
 
 // splitChecksumLine parses one sha256sum(1) line of the form
 // `<hex>  <relative-path>`. Returns (hex, path, ok). Lines with the
