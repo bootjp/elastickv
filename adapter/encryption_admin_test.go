@@ -1510,6 +1510,67 @@ func TestEncryptionAdmin_EnableStorageEnvelope_SerializesConcurrentCutovers(t *t
 	}
 }
 
+// TestEncryptionAdmin_EnableStorageEnvelope_HonorsCtxDeadlineWaitingOnMutator
+// pins codex P2 round-3 on PR812: when one cutover RPC holds
+// the mutator semaphore through a slow fan-out + propose, a
+// concurrent caller with a short deadline MUST return
+// DeadlineExceeded / Canceled at the gRPC boundary rather than
+// blocking past its own ctx.
+//
+// The test drives the first call into a fan-out that blocks
+// indefinitely on a never-firing channel; while it sits in
+// fan-out (holding cutoverSem), the second call attempts the
+// RPC with an already-expired ctx and must return immediately
+// with the matching gRPC code.
+func TestEncryptionAdmin_EnableStorageEnvelope_HonorsCtxDeadlineWaitingOnMutator(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	blockFanout := make(chan struct{}) // never closed; first call blocks here forever
+	t.Cleanup(func() { close(blockFanout) })
+	blockingFanout := func(callCtx context.Context) (admin.CapabilityFanoutResult, error) {
+		select {
+		case <-blockFanout:
+			return admin.CapabilityFanoutResult{}, errors.New("test teardown")
+		case <-callCtx.Done():
+			return admin.CapabilityFanoutResult{}, callCtx.Err()
+		}
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(blockingFanout),
+	)
+	// First call: launch in a goroutine; it holds cutoverSem
+	// while blocked in fan-out.
+	firstStarted := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		close(firstStarted)
+		_, _ = srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+	}()
+	<-firstStarted
+	// Yield so the first call reaches the fan-out wait — a
+	// short sleep is the only reliable signal short of plumbing
+	// a "fan-out entered" channel through the test fixture.
+	time.Sleep(50 * time.Millisecond)
+	// Second call with an already-expired ctx. It must NOT
+	// block past its deadline waiting on the mutator semaphore.
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+	start := time.Now()
+	_, err := srv.EnableStorageEnvelope(ctx, validEnableStorageEnvelopeRequest())
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("EnableStorageEnvelope blocked %v past ctx deadline; want immediate return", elapsed)
+	}
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("EnableStorageEnvelope status=%v, want DeadlineExceeded", status.Code(err))
+	}
+}
+
 // TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellationOnFanoutNotOK
 // pins codex P2 round-2 on PR812: the production fan-out helper
 // can synthesize Reachable=false verdicts and return (result, nil)

@@ -8,7 +8,6 @@ import (
 	"os"
 	"runtime/debug"
 	"strconv"
-	"sync"
 
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -39,23 +38,32 @@ type EncryptionAdminServer struct {
 	// is what threads the route-snapshot builder + DialFunc +
 	// timeout into this closure. Other mutator RPCs are unaffected.
 	capabilityFanout CapabilityFanoutFn
-	// cutoverMu serializes concurrent EnableStorageEnvelope calls
-	// per design §2.1 #4 ("The cutover-RPC mutator serializes
-	// overlapping calls on the propose side"). Without it, two
-	// concurrent cutover calls could both observe
-	// StorageEnvelopeActive=false, both propose, and the loser
-	// would assemble a freshCutoverResponse with
+	// cutoverSem serializes concurrent EnableStorageEnvelope
+	// calls per design §2.1 #4 ("The cutover-RPC mutator
+	// serializes overlapping calls on the propose side").
+	// Without serialization, two concurrent cutover calls could
+	// both observe StorageEnvelopeActive=false, both propose, and
+	// the loser would assemble a freshCutoverResponse with
 	// was_already_active=false but the FIRST cutover's
 	// applied_index — violating the §6.4 fresh-success contract
-	// (coderabbit Major on PR812). The design also calls for a
-	// shared lock with RotateDEK so a RotateDEK cannot interleave
-	// between a cutover's propose and apply; that piece is left
-	// to a follow-up because RotateDEK has no existing lock and
-	// extending serialization to it would change a hot-path
-	// mutator's semantics — see the §2.1 #3 stale-DEKID benign
-	// no-op for the FALLBACK that handles the un-serialized
-	// RotateDEK/cutover interleave today.
-	cutoverMu sync.Mutex
+	// (coderabbit Major on PR812).
+	//
+	// A capacity-1 channel rather than a plain sync.Mutex so
+	// acquisition can honor ctx cancellation: an admin RPC with
+	// a short deadline whose mutator lock is held by an in-flight
+	// fan-out + propose call surfaces Canceled / DeadlineExceeded
+	// at the gRPC boundary rather than blocking indefinitely
+	// (codex P2 round-3 on PR812).
+	//
+	// The design also calls for a shared lock with RotateDEK so
+	// a RotateDEK cannot interleave between a cutover's propose
+	// and apply; that piece is left to a follow-up because
+	// RotateDEK has no existing serialization and extending it
+	// would change a hot-path mutator's semantics — see the
+	// §2.1 #3 stale-DEKID benign no-op for the FALLBACK that
+	// handles the un-serialized RotateDEK/cutover interleave
+	// today.
+	cutoverSem chan struct{}
 	pb.UnimplementedEncryptionAdminServer
 }
 
@@ -179,7 +187,11 @@ func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServe
 // fails closed at startup rather than silently letting followers
 // mutate state.
 func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAdminServer {
-	s := &EncryptionAdminServer{}
+	// cutoverSem buffer of 1 = mutual-exclusion semaphore;
+	// initialized eagerly so EnableStorageEnvelope never has to
+	// nil-check (a nil chan send blocks forever, defeating the
+	// ctx-aware acquire below).
+	s := &EncryptionAdminServer{cutoverSem: make(chan struct{}, 1)}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
@@ -695,13 +707,19 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 // concurrently, treat as idempotent success.
 func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *pb.EnableStorageEnvelopeRequest) (*pb.EnableStorageEnvelopeResponse, error) {
 	// Serialize concurrent cutover RPCs (design §2.1 #4 + PR812
-	// coderabbit Major). The lock spans the entire precheck →
-	// fan-out → propose → postcheck sequence so a second
+	// coderabbit Major). The semaphore spans the entire precheck
+	// → fan-out → propose → postcheck sequence so a second
 	// overlapping call sees StorageEnvelopeActive=true at its
 	// precheck and takes the §6.4 idempotent-retry short-circuit
 	// rather than re-proposing.
-	s.cutoverMu.Lock()
-	defer s.cutoverMu.Unlock()
+	//
+	// Acquire honors ctx cancellation so a caller with a short
+	// deadline does not block indefinitely on an in-flight
+	// cutover's fan-out + propose (codex P2 round-3 on PR812).
+	if err := s.acquireCutoverSemaphore(ctx); err != nil {
+		return nil, err
+	}
+	defer s.releaseCutoverSemaphore()
 	preSidecar, earlyResp, err := s.cutoverPrecheck(ctx, req)
 	if err != nil {
 		return nil, err
@@ -721,6 +739,49 @@ func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *
 		return nil, err
 	}
 	return s.cutoverPostcheck(proposedIdx, fanoutResult)
+}
+
+// acquireCutoverSemaphore takes the cutoverSem with ctx-aware
+// wait semantics. When the caller's ctx fires before the
+// semaphore frees, the wait returns immediately with a gRPC
+// status matching the ctx error — Canceled or DeadlineExceeded.
+// A plain sync.Mutex would block past the caller's deadline,
+// breaking RPC cancellation semantics (codex P2 round-3 on
+// PR812).
+func (s *EncryptionAdminServer) acquireCutoverSemaphore(ctx context.Context) error {
+	select {
+	case s.cutoverSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return cutoverSemaphoreErrorToStatus(ctx.Err())
+	}
+}
+
+// cutoverSemaphoreErrorToStatus maps the ctx-cancellation
+// outcomes of an acquireCutoverSemaphore wait to their native
+// gRPC codes. Pulled out so the status detail names the wait
+// site (semaphore vs. fan-out) — without that, an operator
+// debugging a Canceled response would not know which stage
+// of the RPC the cancellation actually fired in.
+func cutoverSemaphoreErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: cutover mutator wait canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: cutover mutator wait deadline exceeded: %v", err)
+	default:
+		return grpcStatusErrorf(codes.Internal,
+			"encryption: cutover mutator wait failed: %v", err)
+	}
+}
+
+// releaseCutoverSemaphore returns the cutoverSem token. Always
+// called via defer from EnableStorageEnvelope; never called
+// without a prior successful acquireCutoverSemaphore.
+func (s *EncryptionAdminServer) releaseCutoverSemaphore() {
+	<-s.cutoverSem
 }
 
 // cutoverPrecheck runs the §3.2 steps 1-5 that fire before the
