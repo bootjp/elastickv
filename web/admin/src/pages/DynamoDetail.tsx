@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../auth";
+import { DynamoItemsTab } from "../components/DynamoItemsTab";
 import { Modal } from "../components/Modal";
 import { formatApiError, useApiQuery } from "../lib/useApi";
 
@@ -66,6 +67,14 @@ export function DynamoDetailPage() {
           </dl>
         )}
       </section>
+      {detail.data && (
+        <DynamoItemsTab
+          table={name}
+          partitionKey={detail.data.partition_key}
+          sortKey={detail.data.sort_key}
+        />
+      )}
+
       {detail.data?.global_secondary_indexes && detail.data.global_secondary_indexes.length > 0 && (
         <section className="card">
           <h2 className="text-sm font-semibold mb-3">Global secondary indexes</h2>

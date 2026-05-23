@@ -49,6 +49,29 @@ function readCsrfCookie(): string | undefined {
   return undefined;
 }
 
+// encodeAdminItemKey turns a primary-key attribute map into the
+// base64-url segment the admin Dynamo items routes expect. The
+// server's decodeAdminItemKeySegment accepts both padded and raw
+// base64-url; we emit raw because it is shorter (no `=` padding
+// to URL-encode) and the server's path validator forbids `%` in
+// segments anyway.
+function encodeAdminItemKey(key: Record<string, AdminAttributeValue>): string {
+  const json = JSON.stringify(key);
+  // btoa requires Latin-1 input; encode the JSON as UTF-8 bytes
+  // first so any non-ASCII attribute value (e.g. a key containing
+  // a JIS character) round-trips cleanly. TextEncoder is the
+  // standard UTF-8 path; the resulting Uint8Array maps directly
+  // into the Latin-1 char domain btoa accepts.
+  const bytes = new TextEncoder().encode(json);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  const padded = btoa(binary);
+  // Standard base64 → base64-url: `+` → `-`, `/` → `_`, strip
+  // trailing `=` padding so the URL segment carries no characters
+  // the server-side path validator forbids.
+  return padded.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+}
+
 function buildURL(path: string, query?: ApiOptions["query"]): string {
   const url = new URL(apiBase + path, window.location.origin);
   if (query) {
@@ -175,6 +198,39 @@ export interface CreateTableRequest {
   partition_key: CreateTableAttribute;
   sort_key?: CreateTableAttribute;
   gsi?: CreateTableGSI[];
+}
+
+// AdminAttributeValue mirrors internal/admin/dynamo_items_handler.go.
+// One field set per value per the DynamoDB AttributeValue contract.
+// B / BS arrive as base64-encoded strings (encoding/json convention).
+// L and M serialize with the type tag present even when empty
+// (Gemini medium on PR #813) so the SPA can distinguish "no L field"
+// from "empty list".
+export interface AdminAttributeValue {
+  S?: string;
+  N?: string;
+  B?: string;
+  BOOL?: boolean;
+  NULL?: boolean;
+  SS?: string[];
+  NS?: string[];
+  BS?: string[];
+  L?: AdminAttributeValue[];
+  M?: Record<string, AdminAttributeValue>;
+}
+
+export interface AdminItem {
+  attributes: Record<string, AdminAttributeValue>;
+}
+
+export interface AdminScanItemsResult {
+  items: AdminItem[];
+  last_evaluated_key?: Record<string, AdminAttributeValue>;
+}
+
+export interface AdminScanItemsOptions {
+  limit?: number;
+  next_cursor?: string;
 }
 
 export interface S3Bucket {
@@ -328,6 +384,30 @@ export const api = {
     apiFetch<DynamoTable>("/dynamo/tables", { method: "POST", body: req as unknown as Json }),
   deleteTable: (name: string) =>
     apiFetch<void>(`/dynamo/tables/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  scanItems: (table: string, opts?: AdminScanItemsOptions, signal?: AbortSignal) =>
+    apiFetch<AdminScanItemsResult>(
+      `/dynamo/tables/${encodeURIComponent(table)}/items`,
+      { query: { limit: opts?.limit, next_cursor: opts?.next_cursor }, signal },
+    ),
+  // Items use base64-url-encoded JSON of the primary-key attribute
+  // map as the URL segment. Base64-url is the same encoding the rest
+  // of the admin API uses for arbitrary-bytes path segments, so
+  // PathEscape on the segment is a no-op.
+  getItem: (table: string, key: Record<string, AdminAttributeValue>, signal?: AbortSignal) =>
+    apiFetch<AdminItem>(
+      `/dynamo/tables/${encodeURIComponent(table)}/items/${encodeAdminItemKey(key)}`,
+      { signal },
+    ),
+  putItem: (table: string, key: Record<string, AdminAttributeValue>, item: AdminItem) =>
+    apiFetch<void>(
+      `/dynamo/tables/${encodeURIComponent(table)}/items/${encodeAdminItemKey(key)}`,
+      { method: "PUT", body: item as unknown as Json },
+    ),
+  deleteItem: (table: string, key: Record<string, AdminAttributeValue>) =>
+    apiFetch<void>(
+      `/dynamo/tables/${encodeURIComponent(table)}/items/${encodeAdminItemKey(key)}`,
+      { method: "DELETE" },
+    ),
   listBuckets: (next_token?: string, signal?: AbortSignal) =>
     apiFetch<S3BucketList>("/s3/buckets", { query: { next_token }, signal }),
   describeBucket: (name: string, signal?: AbortSignal) =>
