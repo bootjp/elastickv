@@ -2,13 +2,14 @@
 
 **Status:** Implemented
 **Author:** bootjp
-**Date:** 2026-05-22 (proposed) → 2026-05-24 (implemented)
+**Date:** 2026-05-22
 
 ---
 
 ## Implementation record
 
-All six phases shipped between 2026-05-22 and 2026-05-24:
+Final milestone landed 2026-05-24. All six phases shipped between
+2026-05-22 and 2026-05-24:
 
 | Phase | What landed | PR |
 |-------|-------------|----|
