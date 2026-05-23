@@ -93,6 +93,28 @@ func (s *stubTablesSource) AdminDeleteTable(_ context.Context, principal AuthPri
 	return nil
 }
 
+// Phase 3a stubs — most existing tests for the table-level routes
+// do not exercise the item-level surface, so the defaults return
+// zero values / ErrItemsTableNotFound for unknown tables. The
+// dedicated dynamo_items_handler_test.go file uses a richer stub
+// (stubTablesItemsSource) that overlays per-table item maps.
+
+func (s *stubTablesSource) AdminScanItems(_ context.Context, _ AuthPrincipal, _ string, _ AdminScanItemsOptions) (AdminScanItemsResult, error) {
+	return AdminScanItemsResult{Items: []AdminItem{}}, nil
+}
+
+func (s *stubTablesSource) AdminGetItem(_ context.Context, _ AuthPrincipal, _ string, _ map[string]AdminAttributeValue) (*AdminItem, bool, error) {
+	return nil, false, nil
+}
+
+func (s *stubTablesSource) AdminPutItem(_ context.Context, _ AuthPrincipal, _ string, _ AdminItem) error {
+	return nil
+}
+
+func (s *stubTablesSource) AdminDeleteItem(_ context.Context, _ AuthPrincipal, _ string, _ map[string]AdminAttributeValue) error {
+	return nil
+}
+
 func newDynamoHandlerForTest(src TablesSource) *DynamoHandler {
 	return NewDynamoHandler(src)
 }
@@ -354,11 +376,15 @@ func TestDynamoHandler_UnknownSubpathReturns404(t *testing.T) {
 func TestDynamoHandler_DescribeTable_TrailingSlashIsRejected(t *testing.T) {
 	// /admin/api/v1/dynamo/tables/ with an empty trailing component
 	// would otherwise pass an empty name down to the source.
+	// After Phase 3a's 6-step segment-validation dispatch the empty
+	// segment is rejected up front as 400 invalid_path rather than
+	// reaching the per-resource branch — semantically clearer and
+	// still keeps the empty name from reaching the source.
 	h := newDynamoHandlerForTest(&stubTablesSource{tables: map[string]*DynamoTableSummary{}})
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables+"/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 // withWritePrincipal injects a full-access principal into the
@@ -412,6 +438,40 @@ func TestDynamoHandler_CreateTable_WhitespaceOnlyNameRejected(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "table_name is required")
+}
+
+// TestDynamoHandler_CreateTable_RejectsDotSegmentNames pins the
+// symmetry Codex P2 on PR #813 r5 flagged: dispatchPerTableRoute
+// rejects decoded "." and ".." segments (dot-segment traversal
+// class), but validateCreateTableRequest let those names through.
+// A table created with name="." or name=".." would be orphaned —
+// successfully stored, but every describe/delete/items URL would
+// 400 invalid_path because the dispatcher rejects the segment
+// before the source is reached. Mirrors the slash-rejection guard
+// already in validateCreateTableRequest (PR #634).
+func TestDynamoHandler_CreateTable_RejectsDotSegmentNames(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"single dot", `{"table_name":".","partition_key":{"name":"id","type":"S"}}`},
+		{"double dot", `{"table_name":"..","partition_key":{"name":"id","type":"S"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+			h := newDynamoHandlerForTest(src)
+			req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(tc.raw))
+			req = withWritePrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code,
+				"dot-segment table name must be rejected at create time; got %d body=%s",
+				rec.Code, rec.Body.String())
+			require.Empty(t, src.lastCreateInput.TableName,
+				"source must not be touched on dot-segment name")
+		})
+	}
 }
 
 // TestDynamoHandler_CreateTable_LiveRoleRevocation covers Codex P1
@@ -761,13 +821,15 @@ func TestDynamoHandler_DeleteTable_NotLeaderReturns503WithRetryAfter(t *testing.
 }
 
 func TestDynamoHandler_DeleteTable_RejectsTrailingSlash(t *testing.T) {
+	// See TestDynamoHandler_DescribeTable_TrailingSlashIsRejected for
+	// the 404 → 400 rationale (Phase 3a 6-step dispatch).
 	src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
 	h := newDynamoHandlerForTest(src)
 	req := httptest.NewRequest(http.MethodDelete, pathDynamoTables+"/", nil)
 	req = withWritePrincipal(req)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 // tableNameForIndex generates lex-sortable monotonically increasing

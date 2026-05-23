@@ -596,6 +596,164 @@ func (b *dynamoTablesBridge) AdminDeleteTable(ctx context.Context, principal adm
 	return nil
 }
 
+// Phase 3a — item-level bridge methods. Each one converts the
+// admin-package wire types into the adapter's parallel struct
+// graph, dispatches to the adapter, and translates the adapter's
+// error vocabulary onto the admin-package sentinels.
+
+func (b *dynamoTablesBridge) AdminScanItems(ctx context.Context, principal admin.AuthPrincipal, table string, opts admin.AdminScanItemsOptions) (admin.AdminScanItemsResult, error) {
+	adapterOpts := adapter.AdminScanOptions{
+		Limit:          opts.Limit,
+		ExclusiveStart: adminToAdapterAttributeMap(opts.ExclusiveStart),
+	}
+	out, err := b.server.AdminScanTable(ctx, convertAdminPrincipal(principal), table, adapterOpts)
+	if err != nil {
+		return admin.AdminScanItemsResult{}, translateAdminItemsError(err)
+	}
+	res := admin.AdminScanItemsResult{
+		Items:            make([]admin.AdminItem, len(out.Items)),
+		LastEvaluatedKey: adapterToAdminAttributeMap(out.LastEvaluatedKey),
+	}
+	for i, item := range out.Items {
+		res.Items[i] = admin.AdminItem{Attributes: adapterToAdminAttributeMap(item.Attributes)}
+	}
+	return res, nil
+}
+
+func (b *dynamoTablesBridge) AdminGetItem(ctx context.Context, principal admin.AuthPrincipal, table string, key map[string]admin.AdminAttributeValue) (*admin.AdminItem, bool, error) {
+	item, found, err := b.server.AdminGetItem(ctx, convertAdminPrincipal(principal), table, adminToAdapterAttributeMap(key))
+	if err != nil {
+		return nil, false, translateAdminItemsError(err)
+	}
+	if !found || item == nil {
+		return nil, false, nil
+	}
+	return &admin.AdminItem{Attributes: adapterToAdminAttributeMap(item.Attributes)}, true, nil
+}
+
+func (b *dynamoTablesBridge) AdminPutItem(ctx context.Context, principal admin.AuthPrincipal, table string, item admin.AdminItem) error {
+	adapterItem := adapter.AdminItem{Attributes: adminToAdapterAttributeMap(item.Attributes)}
+	if err := b.server.AdminPutItem(ctx, convertAdminPrincipal(principal), table, adapterItem); err != nil {
+		return translateAdminItemsError(err)
+	}
+	return nil
+}
+
+func (b *dynamoTablesBridge) AdminDeleteItem(ctx context.Context, principal admin.AuthPrincipal, table string, key map[string]admin.AdminAttributeValue) error {
+	if err := b.server.AdminDeleteItem(ctx, convertAdminPrincipal(principal), table, adminToAdapterAttributeMap(key)); err != nil {
+		return translateAdminItemsError(err)
+	}
+	return nil
+}
+
+// adminToAdapterAttributeValue / map functions translate the
+// admin package's wire type into the adapter package's parallel
+// struct. The two are isomorphic field-for-field; any drift here
+// is a build break, which is the right signal.
+func adminToAdapterAttributeValue(v admin.AdminAttributeValue) adapter.AdminAttributeValue {
+	out := adapter.AdminAttributeValue{
+		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
+		SS: v.SS, NS: v.NS, BS: v.BS,
+	}
+	if v.L != nil {
+		out.L = make([]adapter.AdminAttributeValue, len(v.L))
+		for i, e := range v.L {
+			out.L[i] = adminToAdapterAttributeValue(e)
+		}
+	}
+	if v.M != nil {
+		out.M = make(map[string]adapter.AdminAttributeValue, len(v.M))
+		for k, e := range v.M {
+			out.M[k] = adminToAdapterAttributeValue(e)
+		}
+	}
+	return out
+}
+
+func adapterToAdminAttributeValue(v adapter.AdminAttributeValue) admin.AdminAttributeValue {
+	out := admin.AdminAttributeValue{
+		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
+		SS: v.SS, NS: v.NS, BS: v.BS,
+	}
+	if v.L != nil {
+		out.L = make([]admin.AdminAttributeValue, len(v.L))
+		for i, e := range v.L {
+			out.L[i] = adapterToAdminAttributeValue(e)
+		}
+	}
+	if v.M != nil {
+		out.M = make(map[string]admin.AdminAttributeValue, len(v.M))
+		for k, e := range v.M {
+			out.M[k] = adapterToAdminAttributeValue(e)
+		}
+	}
+	return out
+}
+
+func adminToAdapterAttributeMap(in map[string]admin.AdminAttributeValue) map[string]adapter.AdminAttributeValue {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]adapter.AdminAttributeValue, len(in))
+	for k, v := range in {
+		out[k] = adminToAdapterAttributeValue(v)
+	}
+	return out
+}
+
+func adapterToAdminAttributeMap(in map[string]adapter.AdminAttributeValue) map[string]admin.AdminAttributeValue {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]admin.AdminAttributeValue, len(in))
+	for k, v := range in {
+		out[k] = adapterToAdminAttributeValue(v)
+	}
+	return out
+}
+
+// translateAdminItemsError maps the adapter's item-level error
+// vocabulary onto the admin-package sentinels. Mirrors
+// translateAdminTablesError's shape but uses the Items
+// sentinels — kept separate so a future per-resource
+// classification change (e.g., a new "rate limited" sentinel
+// for the item path but not the table path) lands in one place.
+func translateAdminItemsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrItemsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrItemsNotLeader
+	case errors.Is(err, adapter.ErrAdminDynamoNotFound):
+		return admin.ErrItemsTableNotFound
+	case errors.Is(err, adapter.ErrAdminDynamoValidation):
+		// Wrap rather than replace so the adapter's specific
+		// validation message ("table_name is required", legacy-
+		// migration hint at adapter/dynamodb_admin_items.go, etc.)
+		// reaches the HTTP 400 body via writeItemsError's
+		// err.Error() emission. Bare sentinel return dropped the
+		// operator-facing reason at the bridge boundary (Claude
+		// review on PR #813 r3). errors.Is(out, ErrItemsValidation)
+		// still returns true so the handler's match arm still
+		// fires.
+		return errors.Wrap(admin.ErrItemsValidation, err.Error())
+	case isLeaderChurnError(err):
+		// Mid-dispatch leadership churn looks like an internal error
+		// from the kv coordinator (election finishes between the
+		// adapter's isVerifiedDynamoLeader check and the actual
+		// Raft propose). Map to the Items not-leader sentinel so the
+		// handler returns 503 + Retry-After: 1 and the SPA's retry
+		// contract stays intact (Codex P2 on PR #813 — the table-side
+		// translator already does this; the item-side translator
+		// initially shipped without the parallel branch).
+		return admin.ErrItemsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
 // convertAdminPrincipal mirrors admin.AuthPrincipal onto the
 // adapter's parallel struct. Both packages keep the principal type
 // independent so the adapter stays free of internal/admin
