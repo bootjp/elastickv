@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -464,6 +465,24 @@ func TestTranslateAdminItemsError_UnrelatedErrorPassesThrough(t *testing.T) {
 	out := translateAdminItemsError(in)
 	require.NotErrorIs(t, out, admin.ErrItemsNotLeader)
 	require.Equal(t, in, out)
+}
+
+// TestTranslateAdminItemsError_ValidationPreservesAdapterMessage pins
+// the Claude review on PR #813 r3 finding: a wrapped
+// adapter.ErrAdminDynamoValidation must reach the HTTP 400 body
+// with its operator-facing reason intact, not the bare sentinel
+// "admin dynamo items: invalid request". The migration-required
+// hint in particular (e.g. legacy-key migration on a freshly-loaded
+// table) is the most operator-useful 400 message in the adapter
+// vocabulary; dropping it at the bridge made the SPA unhelpful.
+func TestTranslateAdminItemsError_ValidationPreservesAdapterMessage(t *testing.T) {
+	in := fmt.Errorf("%w: table requires a one-time legacy-key migration before admin read endpoints are available",
+		adapter.ErrAdminDynamoValidation)
+	out := translateAdminItemsError(in)
+	require.ErrorIs(t, out, admin.ErrItemsValidation,
+		"wrapped adapter.ErrAdminDynamoValidation must still match admin.ErrItemsValidation")
+	require.Contains(t, out.Error(), "legacy-key migration",
+		"adapter validation message must propagate so the SPA's 400 body carries the operator hint")
 }
 
 // TestTranslateAdminQueuesError_LeaderChurn is the SQS counterpart of

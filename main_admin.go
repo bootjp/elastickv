@@ -729,7 +729,16 @@ func translateAdminItemsError(err error) error {
 	case errors.Is(err, adapter.ErrAdminDynamoNotFound):
 		return admin.ErrItemsTableNotFound
 	case errors.Is(err, adapter.ErrAdminDynamoValidation):
-		return admin.ErrItemsValidation
+		// Wrap rather than replace so the adapter's specific
+		// validation message ("table_name is required", legacy-
+		// migration hint at adapter/dynamodb_admin_items.go, etc.)
+		// reaches the HTTP 400 body via writeItemsError's
+		// err.Error() emission. Bare sentinel return dropped the
+		// operator-facing reason at the bridge boundary (Claude
+		// review on PR #813 r3). errors.Is(out, ErrItemsValidation)
+		// still returns true so the handler's match arm still
+		// fires.
+		return errors.Wrap(admin.ErrItemsValidation, err.Error())
 	case isLeaderChurnError(err):
 		// Mid-dispatch leadership churn looks like an internal error
 		// from the kv coordinator (election finishes between the
