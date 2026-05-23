@@ -903,6 +903,14 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 		// index alongside the active flag. A zero here means
 		// the post-apply read raced (unlikely, but the §6.4
 		// fallback exists for hand-edited sidecars).
+		// CutoverIndexUnknown stays false on this branch — the
+		// proto field is "only meaningful when
+		// was_already_active=true" (§3.1), and here we know the
+		// correct applied_index: it is proposedIdx (the Raft
+		// entry this call just committed). The idempotent-retry
+		// path is the only context where the original cutover
+		// index is irrecoverable, hence its CutoverIndexUnknown
+		// signal. Claude bot informational on PR812.
 		appliedIndex = proposedIdx
 	}
 	return &pb.EnableStorageEnvelopeResponse{

@@ -1329,15 +1329,54 @@ func TestEncryptionAdmin_EnableStorageEnvelope_RejectsWithoutCapabilityFanout(t 
 // and the RPC refuses with FailedPrecondition. The status detail
 // names the specific node so the operator's CLI can diagnose
 // without trawling leader logs.
+//
+// Table-driven across the two refusal shapes so both branches of
+// capabilityRefusalSummary (Reachable=false first, then
+// EncryptionCapable=false) are exercised — without the unreachable
+// case the "unreachable member" status detail would lose its
+// regression coverage. PR812 claude P2.
 func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnCapabilityRefusal(t *testing.T) {
 	t.Parallel()
-	refusal := admin.CapabilityFanoutResult{
-		Verdicts: []admin.CapabilityVerdict{
-			{FullNodeID: 11, EncryptionCapable: true, BuildSHA: "build-n1", SidecarPresent: true, Reachable: true},
-			{FullNodeID: 99, EncryptionCapable: false, BuildSHA: "build-n99", SidecarPresent: false, Reachable: true},
+	cases := []struct {
+		name        string
+		refusal     admin.CapabilityFanoutResult
+		wantNodeStr string
+		wantReason  string
+	}{
+		{
+			name: "not_capable",
+			refusal: admin.CapabilityFanoutResult{
+				Verdicts: []admin.CapabilityVerdict{
+					{FullNodeID: 11, EncryptionCapable: true, BuildSHA: "build-n1", SidecarPresent: true, Reachable: true},
+					{FullNodeID: 99, EncryptionCapable: false, BuildSHA: "build-n99", SidecarPresent: false, Reachable: true},
+				},
+				OK: false,
+			},
+			wantNodeStr: "99",
+			wantReason:  "not-capable",
 		},
-		OK: false,
+		{
+			name: "unreachable",
+			refusal: admin.CapabilityFanoutResult{
+				Verdicts: []admin.CapabilityVerdict{
+					{FullNodeID: 11, EncryptionCapable: true, BuildSHA: "build-n1", SidecarPresent: true, Reachable: true},
+					{FullNodeID: 88, EncryptionCapable: false, BuildSHA: "", SidecarPresent: false, Reachable: false},
+				},
+				OK: false,
+			},
+			wantNodeStr: "88",
+			wantReason:  "unreachable",
+		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runCapabilityRefusalCase(t, tc.refusal, tc.wantNodeStr, tc.wantReason)
+		})
+	}
+}
+
+func runCapabilityRefusalCase(t *testing.T, refusal admin.CapabilityFanoutResult, wantNodeStr, wantReason string) {
+	t.Helper()
 	srv := NewEncryptionAdminServer(
 		WithEncryptionAdminProposer(&recordingProposer{}),
 		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
@@ -1348,8 +1387,11 @@ func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnCapabilityRefusal(t *tes
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("EnableStorageEnvelope status=%v, want FailedPrecondition", status.Code(err))
 	}
-	if err == nil || !strings.Contains(err.Error(), "99") {
-		t.Errorf("error %q does not name the refusing node (full_node_id=99)", err)
+	if err == nil || !strings.Contains(err.Error(), wantNodeStr) {
+		t.Errorf("error %q does not name the refusing node (full_node_id=%s)", err, wantNodeStr)
+	}
+	if err == nil || !strings.Contains(err.Error(), wantReason) {
+		t.Errorf("error %q does not name the refusal reason (%q)", err, wantReason)
 	}
 }
 
