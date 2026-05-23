@@ -128,6 +128,28 @@ type NonceFactory interface {
 // independently.
 type ActiveStorageKeyID func() (uint32, bool)
 
+// StorageEnvelopeActive reports whether the §7.1 Phase 1 cutover has
+// fired on this node (the Stage 6D-4 sidecar field of the same name,
+// surfaced to the storage layer via WithStorageEnvelopeGate). A
+// return value of false forces every Put to write cleartext even
+// when a cipher + active DEK are wired; true allows the existing
+// activeStorageKeyID-driven envelope emit to proceed.
+//
+// The contract intentionally separates "encryption is provisioned"
+// (ActiveStorageKeyID has a DEK to use) from "encryption is
+// activated for new writes" (the cutover has fired). The two
+// signals diverge during the §7.1 Phase 0 → Phase 1 window: every
+// node in the cluster has the DEK installed, but the cluster has
+// not yet quiesced the cutover Raft entry that flips the bit on
+// every replica simultaneously.
+//
+// Reads ignore this gate — once an on-disk version's
+// encryption_state bit is 0b01, the read path always invokes the
+// cipher to unwrap regardless of the gate's current value. A
+// cluster that flipped from active back to inactive (not a path
+// the design supports) would still decrypt old envelopes correctly.
+type StorageEnvelopeActive func() bool
+
 // WithEncryption configures the pebble-backed store to wrap every
 // committed value in the §4.1 storage envelope.
 //
@@ -151,6 +173,34 @@ func WithEncryption(cipher *encryption.Cipher, nf NonceFactory, activeKeyID Acti
 		s.cipher = cipher
 		s.nonceFactory = nf
 		s.activeStorageKeyID = activeKeyID
+	}
+}
+
+// WithStorageEnvelopeGate wires the Stage 6D-5 §6.2 cutover gate
+// in front of the existing envelope-emit path. After this option,
+// encryptForKey writes cleartext when active() returns false even
+// if a cipher and active DEK are present — exactly the §7.1
+// Phase 0 / Phase 1 split described in the parent encryption
+// design doc.
+//
+// Passing nil is a no-op: the store stays in the pre-6D-5
+// "encrypt whenever activeKeyID returns a DEK" posture used by
+// existing test fixtures and by production deployments that have
+// not yet run the EnableStorageEnvelope RPC (lands in 6D-6).
+// Operators must thread this option in alongside WithEncryption
+// to actually opt into the cutover semantics.
+//
+// The gate is consulted on every Put. Reads never consult it —
+// on-disk versions with `encryption_state == 0b01` always go
+// through the cipher regardless of the gate, so a cluster mid-
+// cutover (some versions cleartext, others encrypted) stays
+// readable.
+func WithStorageEnvelopeGate(active StorageEnvelopeActive) PebbleStoreOption {
+	return func(s *pebbleStore) {
+		if active == nil {
+			return
+		}
+		s.storageEnvelopeActive = active
 	}
 }
 
@@ -182,6 +232,20 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 	}
 	keyID, ok := s.activeStorageKeyID()
 	if !ok {
+		return plaintext, encStateCleartext, nil
+	}
+	// Stage 6D-5 §6.2 cutover gate. When the gate is wired AND
+	// reports false (`sidecar.StorageEnvelopeActive == false`),
+	// fall through to the cleartext path even though a DEK is
+	// active. This is the only correctness-critical site for the
+	// §7.1 Phase 0 → Phase 1 split: a pre-cutover Put that emitted
+	// an envelope would advance the writer-registry nonce counter
+	// before every replica had agreed the cutover applied, opening
+	// the cross-replica nonce-divergence race the §6.4 atomicity
+	// contract is built to close. The gate stays unconsulted when
+	// not wired so existing fixtures + the pre-6D-6 production
+	// posture keep working unchanged.
+	if s.storageEnvelopeActive != nil && !s.storageEnvelopeActive() {
 		return plaintext, encStateCleartext, nil
 	}
 	nonceArr, err := s.nonceFactory.Next()

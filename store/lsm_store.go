@@ -205,6 +205,15 @@ type pebbleStore struct {
 	cipher             *encryption.Cipher
 	nonceFactory       NonceFactory
 	activeStorageKeyID ActiveStorageKeyID
+	// storageEnvelopeActive is the Stage 6D-5 cutover gate (design
+	// doc §6.2). When wired, every write path that would otherwise
+	// emit a §4.1 envelope first consults this closure and falls
+	// back to cleartext when it returns false. A nil closure
+	// preserves the pre-6D-5 behaviour where activeStorageKeyID
+	// alone decides the encrypt/cleartext split — the legacy test
+	// fixtures depend on that posture and the 6D-6 production wiring
+	// in main.go is what flips the gate on.
+	storageEnvelopeActive StorageEnvelopeActive
 }
 
 // Ensure pebbleStore implements MVCCStore and RetentionController.

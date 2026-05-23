@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch) shipped; 6D-5, 6D-6 remain |
+| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle) shipped; 6D-6 remains |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -31,11 +31,22 @@
   already-active outcomes are benign no-ops that advance
   `RaftAppliedIndex` without halting. Operator-inert until 6D-5
   wires the §6.2 storage-layer toggle.
+- **6D-5** (storage-layer toggle) —
+  `WithStorageEnvelopeGate(StorageEnvelopeActive)` PebbleStore
+  option (`store/encryption_glue.go`) consulted on every Put.
+  When wired AND returning false, `encryptForKey` forces cleartext
+  even with cipher + active DEK present — the §7.1 Phase 0 →
+  Phase 1 split. Read path is unchanged: on-disk
+  `encryption_state == 0b01` versions always go through the
+  cipher regardless of the gate, so mixed cleartext / encrypted
+  versions for the same key stay readable across the cutover.
+  Nil gate preserves the pre-6D-5 legacy posture (encrypt
+  whenever a DEK is active) so existing test fixtures and the
+  pre-6D-6 production wiring keep working unchanged. Operator-
+  inert until 6D-6 wires both the cipher and the gate in main.go
+  and exposes the cutover RPC.
 
 ## Open milestones
-
-- **6D-5** — §6.2 storage-layer toggle (`PutAt` consults
-  `StorageEnvelopeActive`).
 - **6D-6** — `EnableStorageEnvelope` admin RPC + CLI command +
   integration test composing 6D-3 + 6D-4 + 6D-5.
 
