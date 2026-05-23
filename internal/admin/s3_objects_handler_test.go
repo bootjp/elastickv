@@ -237,6 +237,57 @@ func TestS3Objects_RoutingRejectsTooManyKeySlashes(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "must not contain a slash")
 }
 
+// TestS3Objects_RoutingRejectsEncodedSlashInBucket pins the Codex P1
+// on PR #814: r.URL.Path is pre-decoded by net/http, so an attacker
+// URL like /buckets/victim%2Fobjects/{key} would (without the
+// EscapedPath() switch) be interpreted as
+// /buckets/victim/objects/{key} and run the operation against the
+// "victim" bucket rather than the literal-named "victim/objects"
+// segment. The fix: servePerBucket consults r.URL.EscapedPath() so
+// the %2F stays opaque through the route split.
+func TestS3Objects_RoutingRejectsEncodedSlashInBucket(t *testing.T) {
+	t.Parallel()
+	src := newStubObjectsSource()
+	src.seedObject("victim", "k1", []byte("secret"))
+	h := newS3HandlerForTest(src)
+
+	keySeg := base64.RawURLEncoding.EncodeToString([]byte("k1"))
+	cases := []struct {
+		name   string
+		method string
+		url    string
+		body   io.Reader
+	}{
+		{"GET object", http.MethodGet,
+			pathPrefixS3Buckets + "victim%2Fobjects/" + keySeg, nil},
+		{"PUT object", http.MethodPut,
+			pathPrefixS3Buckets + "victim%2Fobjects/" + keySeg, bytes.NewReader([]byte("hostile"))},
+		{"DELETE object", http.MethodDelete,
+			pathPrefixS3Buckets + "victim%2Fobjects/" + keySeg, nil},
+		{"GET list", http.MethodGet,
+			pathPrefixS3Buckets + "victim%2Fobjects", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.url, tc.body)
+			switch tc.method {
+			case http.MethodGet:
+				req = withReadOnlyPrincipal(req)
+			default:
+				req = withWritePrincipal(req)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			// Reject must happen before the source is reached — any
+			// 200 / 204 here would mean the request executed against
+			// the wrong bucket (confused-deputy class).
+			require.NotContains(t, []int{http.StatusOK, http.StatusNoContent}, rec.Code,
+				"encoded slash in bucket segment must be rejected; got %d, body=%s",
+				rec.Code, rec.Body.String())
+		})
+	}
+}
+
 func TestS3Objects_RoutingMethodNotAllowed(t *testing.T) {
 	t.Parallel()
 	h := newS3HandlerForTest(newStubObjectsSource())
