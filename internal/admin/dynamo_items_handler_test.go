@@ -381,6 +381,42 @@ func TestDynamoItems_Scan_RejectsBadLimit(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// TestDynamoItems_Scan_RejectsEmptyDecodedCursor pins the Codex P2
+// on PR #813 r8 fix: a cursor that decodes to an empty/nil map
+// (base64-url of "null", "{}", or similar) used to be silently
+// treated as ExclusiveStart=nil — i.e., "start from beginning" —
+// instead of returning 400. Clients passing a malformed cursor
+// would then see duplicated first-page results and, in a paging
+// loop driven off `next_cursor`, lock themselves into a tight
+// infinite loop on page 1.
+//
+// The URL `{key}` segment already rejects this case via
+// decodeAdminItemKeySegment's `len(out) == 0` check; this test
+// pins the parallel guard on the next_cursor query path.
+func TestDynamoItems_Scan_RejectsEmptyDecodedCursor(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	h := newDynamoHandlerForTest(src)
+
+	cases := map[string]string{
+		"json-null":    base64.RawURLEncoding.EncodeToString([]byte("null")),
+		"empty-object": base64.RawURLEncoding.EncodeToString([]byte("{}")),
+		"empty-padded": base64.URLEncoding.EncodeToString([]byte("{}")),
+	}
+	for name, cursor := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet,
+				pathDynamoTables+"/orders/items?next_cursor="+cursor, nil)
+			req = withReadOnlyPrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code,
+				"empty/null cursor must surface as 400 to avoid silent reset-to-page-0; got %d body=%s",
+				rec.Code, rec.Body.String())
+		})
+	}
+}
+
 func TestDynamoItems_Get_HappyPath(t *testing.T) {
 	t.Parallel()
 	src := newStubItemsSource()

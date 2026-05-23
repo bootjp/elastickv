@@ -379,6 +379,18 @@ func parseAdminScanItemsQuery(w http.ResponseWriter, r *http.Request) (AdminScan
 				"next_cursor is not a valid base64-url encoded key map")
 			return AdminScanItemsOptions{}, false
 		}
+		// Reject empty/nil decoded cursor symmetrically with
+		// decodeAdminItemKeySegment's len-zero check on the URL
+		// {key} segment. Base64-url of "null" decodes to nil and
+		// "{}" decodes to len-0 map; without this guard either
+		// would silently feed ExclusiveStart=nil to the adapter
+		// (start-from-beginning), duplicating page 0 and trapping
+		// paging-loop clients (Codex P2 on PR #813 r8).
+		if len(cursor) == 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request",
+				"next_cursor decodes to an empty attribute map")
+			return AdminScanItemsOptions{}, false
+		}
 		opts.ExclusiveStart = cursor
 	}
 	return opts, true
