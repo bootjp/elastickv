@@ -14,7 +14,7 @@ All six phases shipped between 2026-05-22 and 2026-05-24:
 |-------|-------------|----|
 | 2a | DynamoDB item adapter RPCs (`AdminScanTable` / `AdminGetItem` / `AdminPutItem` / `AdminDeleteItem`) | #805 |
 | 2b | S3 object adapter RPCs (`AdminListObjects` / `AdminGetObject` / `AdminPutObject` / `AdminDeleteObject`) | #811 |
-| 3a | DynamoDB item HTTP handlers + bridge (custom `MarshalJSON` preserves empty `L`/`M`; NUL-byte and trailing-data PUT-body guards; URL-key percent-encoding accepted, decoded-`/` / dot-segments still rejected; leader-churn translation matches the table-side bridge) | #813 |
+| 3a | DynamoDB item HTTP handlers + bridge (custom `MarshalJSON` preserves empty `L`/`M`; NUL-byte and trailing-data PUT-body guards; URL-key percent-encoding accepted, decoded `/` and dot-segments still rejected; leader-churn translation matches the table-side bridge) | #813 |
 | 3b | S3 object HTTP handlers + bridge (raw `application/octet-stream` PUT/GET; 100 MiB `http.MaxBytesReader` cap; security headers on GET — `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`, `Content-Disposition: attachment`, `Cache-Control: no-store`) | #814 |
 | 4 | SPA DynamoDetail Items tab (paginated scan 25/100, view/edit/add modal, two-stage delete confirm, base64-url key segment via `encodeAdminItemKey`) | #815 |
 | 5 | SPA S3Detail Objects tab + Upload (paginated list 100, breadcrumb prefix navigation, folder rows via `CommonPrefixes` with `delimiter=/`, file `<input>` upload with native Content-Type, `<a download>` for streaming downloads) | #816 |
