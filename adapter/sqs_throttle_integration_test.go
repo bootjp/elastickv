@@ -338,10 +338,16 @@ func TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket(t *testing.T) 
 	// is independent of the refill rate, so slowing it down is
 	// the right scope.
 	const slowRefill = "0.01"
-	mustSetQueueAttributes(t, node, url, map[string]string{
+	// Define the attribute map once and reuse on both calls so the
+	// "no-op" intent is structurally visible: the two
+	// mustSetQueueAttributes calls share the same map literal, so
+	// a future drift between them (e.g., a typo or a stray edit)
+	// would be obviously wrong (Gemini medium on PR #819).
+	throttleAttrs := map[string]string{
 		"ThrottleSendCapacity":        "10",
 		"ThrottleSendRefillPerSecond": slowRefill,
-	})
+	}
+	mustSetQueueAttributes(t, node, url, throttleAttrs)
 	// Drain the bucket so the next charge would only succeed if the
 	// bucket was reset to a fresh full-capacity replacement.
 	for range 10 {
@@ -362,10 +368,7 @@ func TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket(t *testing.T) 
 	// Re-submit identical Throttle* values. Old code invalidated on
 	// key presence and the next send would have been allowed against
 	// a fresh full bucket.
-	mustSetQueueAttributes(t, node, url, map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": slowRefill,
-	})
+	mustSetQueueAttributes(t, node, url, throttleAttrs)
 	// Bucket must still be drained — no-op SetQueueAttributes must not
 	// reset the rate limiter.
 	status, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
