@@ -801,6 +801,466 @@ func TestApplyRotation_UnknownPurpose(t *testing.T) {
 	}
 }
 
+// TestApplyRotation_EnableStorageEnvelope_FreshSuccess pins the
+// Stage 6D-4 happy-path apply: after Bootstrap, a cutover entry
+// with DEKID == Active.Storage, empty Wrapped, and
+// Purpose == PurposeStorage flips StorageEnvelopeActive and records
+// StorageEnvelopeCutoverIndex inside one sidecar fsync. The
+// ProposerRegistration row is inserted via the standard §4.1 case
+// dispatch so the proposer's first encrypted write under the
+// now-active envelope is covered.
+//
+// Run with Wrapped both as `nil` and as `[]byte{}` to pin the
+// length-based check on the applier side — `Wrapped == nil` is the
+// in-Go construction, `[]byte{}` is what the wire decoder
+// materialises for a `wrapped_len = 0` payload.
+func TestApplyRotation_EnableStorageEnvelope_FreshSuccess(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		wrapped []byte
+	}{
+		{name: "nil_wrapped", wrapped: nil},
+		{name: "empty_wrapped", wrapped: []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runCutoverFreshSuccess(t, tc.wrapped)
+		})
+	}
+}
+
+func runCutoverFreshSuccess(t *testing.T, wrapped []byte) {
+	t.Helper()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: 7, WrappedStorage: []byte("s"),
+		RaftDEKID: 8, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	const cutoverIdx uint64 = 500
+	if err := app.ApplyRotation(cutoverIdx, fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:   7, // matches sidecar.Active.Storage
+		Purpose: fsmwire.PurposeStorage,
+		Wrapped: wrapped,
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 1,
+		},
+	}); err != nil {
+		t.Fatalf("ApplyRotation cutover: %v", err)
+	}
+	assertCutoverApplied(t, sidecarPath, cutoverIdx)
+	assertProposerEpoch(t, reg, 7, 0xAAAA, 1)
+}
+
+// assertCutoverApplied verifies the fresh-success post-conditions:
+// StorageEnvelopeActive flipped, StorageEnvelopeCutoverIndex set
+// to raftIdx, RaftAppliedIndex advanced, Active.Storage unchanged.
+func assertCutoverApplied(t *testing.T, sidecarPath string, cutoverIdx uint64) {
+	t.Helper()
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if !sc.StorageEnvelopeActive {
+		t.Error("StorageEnvelopeActive = false after cutover, want true")
+	}
+	if sc.StorageEnvelopeCutoverIndex != cutoverIdx {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d, want %d",
+			sc.StorageEnvelopeCutoverIndex, cutoverIdx)
+	}
+	if sc.RaftAppliedIndex != cutoverIdx {
+		t.Errorf("RaftAppliedIndex = %d, want %d", sc.RaftAppliedIndex, cutoverIdx)
+	}
+	// Active slot must NOT have been re-pointed — cutover does not
+	// install a new DEK.
+	if sc.Active.Storage != 7 {
+		t.Errorf("Active.Storage = %d, want 7 (cutover should not re-point)", sc.Active.Storage)
+	}
+}
+
+// assertProposerEpoch reads the writer-registry row for the
+// (dekID, nodeID) pair and asserts the LastSeenLocalEpoch matches
+// the cutover's LocalEpoch — proves the ProposerRegistration
+// insert happened on the fresh-success path.
+func assertProposerEpoch(t *testing.T, reg *mapRegistryStore, dekID uint32, nodeID uint16, want uint16) {
+	t.Helper()
+	key := encryption.RegistryKey(dekID, nodeID)
+	raw, ok, err := reg.GetRegistryRow(key)
+	if err != nil {
+		t.Fatalf("GetRegistryRow: %v", err)
+	}
+	if !ok {
+		t.Fatal("proposer registration row missing after cutover")
+	}
+	val, err := encryption.DecodeRegistryValue(raw)
+	if err != nil {
+		t.Fatalf("DecodeRegistryValue: %v", err)
+	}
+	if val.LastSeenLocalEpoch != want {
+		t.Errorf("LastSeenLocalEpoch = %d, want %d", val.LastSeenLocalEpoch, want)
+	}
+}
+
+// TestApplyRotation_EnableStorageEnvelope_RejectsNonStoragePurpose
+// pins constraint #1 from §2.1 on the apply side: a malformed
+// cutover with Purpose=PurposeRaft must halt apply rather than
+// silently mis-flipping the storage-envelope flag based on a raft
+// DEK reference.
+func TestApplyRotation_EnableStorageEnvelope_RejectsNonStoragePurpose(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                7,
+		Purpose:              fsmwire.PurposeRaft, // wrong — cutover targets storage envelope
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	})
+	if err == nil {
+		t.Fatal("expected halt on non-storage purpose, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertCutoverNotApplied(t, sidecarPath)
+}
+
+// TestApplyRotation_EnableStorageEnvelope_RejectsNonEmptyWrapped
+// pins constraint #2 from §2.1: a cutover entry carrying any
+// wrapped bytes is malformed. The length-based check (NOT a
+// `Wrapped == nil` check) is the critical guard — the
+// post-decode slice is always non-nil for `wrapped_len = 0`.
+func TestApplyRotation_EnableStorageEnvelope_RejectsNonEmptyWrapped(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                7,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte("non-empty"), // must be len 0
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	})
+	if err == nil {
+		t.Fatal("expected halt on non-empty Wrapped, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertCutoverNotApplied(t, sidecarPath)
+}
+
+// TestApplyRotation_EnableStorageEnvelope_RejectsProposerDEKMismatch
+// pins the proposer-registration DEK-pinning symmetry: the
+// ProposerRegistration row must target the same DEK as the cutover
+// payload, otherwise an empty-Wrapped entry would silently insert
+// a writer-registry row against an unrelated DEK.
+func TestApplyRotation_EnableStorageEnvelope_RejectsProposerDEKMismatch(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                7,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 99, FullNodeID: 0xAAAA, LocalEpoch: 1}, // mismatched
+	})
+	if err == nil {
+		t.Fatal("expected halt on proposer DEK mismatch, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertCutoverNotApplied(t, sidecarPath)
+}
+
+// TestApplyRotation_EnableStorageEnvelope_StaleDEKID_BenignNoOp
+// pins the §2.1 constraint #3 race posture: a RotateDEK race that
+// advances Active.Storage between cutover propose and apply MUST
+// NOT halt the FSM. Instead the apply path consumes the entry
+// (advance RaftAppliedIndex), leaves StorageEnvelopeActive false,
+// and returns nil — the 6D-6 ride-along will surface
+// ErrCutoverDEKIDStale to the RPC client without bricking the
+// cluster.
+func TestApplyRotation_EnableStorageEnvelope_StaleDEKID_BenignNoOp(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	// Stage a RotateDEK that advances Active.Storage from 7 to 99 —
+	// simulates the "RotateDEK raced between cutover propose and
+	// apply" scenario.
+	if err := app.ApplyRotation(200, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                99,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte("new-storage-dek"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 99, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("ApplyRotation RotateDEK: %v", err)
+	}
+	// Now the cutover lands but still carries the old DEKID=7.
+	const staleIdx uint64 = 300
+	err := app.ApplyRotation(staleIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                7, // stale — sidecar.Active.Storage moved to 99
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 2},
+	})
+	if err != nil {
+		t.Fatalf("stale cutover MUST be a benign no-op (no halt), got: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	// Cutover MUST NOT have flipped on a stale DEKID.
+	if sc.StorageEnvelopeActive {
+		t.Error("StorageEnvelopeActive = true after stale cutover, want false")
+	}
+	if sc.StorageEnvelopeCutoverIndex != 0 {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d after stale cutover, want 0",
+			sc.StorageEnvelopeCutoverIndex)
+	}
+	// But the entry MUST be consumed so it is not replayed.
+	if sc.RaftAppliedIndex != staleIdx {
+		t.Errorf("RaftAppliedIndex = %d after stale cutover, want %d (entry must be consumed)",
+			sc.RaftAppliedIndex, staleIdx)
+	}
+	// And Active.Storage stays at the post-RotateDEK value.
+	if sc.Active.Storage != 99 {
+		t.Errorf("Active.Storage = %d, want 99", sc.Active.Storage)
+	}
+}
+
+// TestApplyRotation_EnableStorageEnvelope_AlreadyActive_IdempotentNoOp
+// pins the §2.1 constraint #4 idempotency: a duplicate cutover
+// entry consumed after the first cutover already committed MUST
+// preserve the original StorageEnvelopeCutoverIndex (the stable
+// idempotency token surfaced by the 6D-6 RPC retry path) and not
+// re-flip StorageEnvelopeActive. RaftAppliedIndex still advances
+// so the duplicate is consumed.
+func TestApplyRotation_EnableStorageEnvelope_AlreadyActive_IdempotentNoOp(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	const firstIdx uint64 = 500
+	if err := app.ApplyRotation(firstIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                7,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("first cutover: %v", err)
+	}
+	// Duplicate cutover at a higher raft index — simulates the
+	// "operator retried after a network blip and the first call
+	// already committed" overlap window described in §2.1
+	// constraint #4.
+	const duplicateIdx uint64 = 600
+	err := app.ApplyRotation(duplicateIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                7,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 2},
+	})
+	if err != nil {
+		t.Fatalf("duplicate cutover MUST be a benign no-op, got: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if !sc.StorageEnvelopeActive {
+		t.Error("StorageEnvelopeActive = false after duplicate, want true")
+	}
+	// The §6.4 stable idempotency token — original cutover index
+	// MUST be preserved across the duplicate apply.
+	if sc.StorageEnvelopeCutoverIndex != firstIdx {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d after duplicate, want %d (original cutover index must not be overwritten)",
+			sc.StorageEnvelopeCutoverIndex, firstIdx)
+	}
+	// RaftAppliedIndex advances so the duplicate is consumed.
+	if sc.RaftAppliedIndex != duplicateIdx {
+		t.Errorf("RaftAppliedIndex = %d after duplicate, want %d",
+			sc.RaftAppliedIndex, duplicateIdx)
+	}
+}
+
+// cutoverBootstrapStorageDEKID / cutoverBootstrapRaftDEKID are the
+// DEK IDs landed by every cutover-test bootstrap. The cutover
+// tests pin Active.Storage to this constant so the fresh-success,
+// stale-DEKID, and idempotent-retry cases share the same prelude.
+const (
+	cutoverBootstrapStorageDEKID uint32 = 7
+	cutoverBootstrapRaftDEKID    uint32 = 8
+)
+
+// TestApplyRotation_EnableStorageEnvelope_RegistrationBeforeSidecar
+// pins the crash-recovery ordering invariant in
+// applyEnableStorageEnvelope (gemini-code-assist medium #1 on
+// PR804): the ProposerRegistration insert MUST happen BEFORE the
+// sidecar flip, so a crash between the two on-disk operations
+// leaves the cluster in a state from which FSM replay can recover
+// cleanly. The reverse ordering would leave StorageEnvelopeActive
+// = true with the registry row missing — the §5.2 startup guard
+// would then refuse boot, and a replay would short-circuit on the
+// already-active no-op and never insert the row.
+//
+// The test injects a failing SetRegistryRow on the cutover's
+// registry call and asserts:
+//
+//   - The apply call returns an error (so the FSM halts and the
+//     entry is not consumed without consequence).
+//   - The sidecar's StorageEnvelopeActive stays false (no
+//     premature flip).
+//   - The sidecar's StorageEnvelopeCutoverIndex stays 0.
+//
+// The replay-still-works property (registration insert is
+// idempotent via §4.1 case 2-idempotent) is already covered by
+// TestApplyRegistration_Case2_Idempotent and is not re-asserted
+// here.
+func TestApplyRotation_EnableStorageEnvelope_RegistrationBeforeSidecar(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: cutoverBootstrapStorageDEKID, WrappedStorage: []byte("s"),
+		RaftDEKID: cutoverBootstrapRaftDEKID, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: cutoverBootstrapStorageDEKID, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	// Inject a registry SetRegistryRow failure on the next call.
+	// The cutover would otherwise hit §4.1 case 2 (monotonic
+	// advance from epoch 0 → 1), so the insert reaches the
+	// (failing) SetRegistryRow.
+	reg.setEr = errors.New("simulated registry failure mid-apply")
+	err = app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:   cutoverBootstrapStorageDEKID,
+		Purpose: fsmwire.PurposeStorage,
+		Wrapped: []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID: cutoverBootstrapStorageDEKID, FullNodeID: 0xAAAA, LocalEpoch: 1,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error from injected registry failure, got nil")
+	}
+	// Sidecar must NOT show a pre-flipped cutover state — if it
+	// did, the §5.2 startup guard would refuse boot on restart,
+	// and replay would short-circuit on already-active.
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.StorageEnvelopeActive {
+		t.Error("StorageEnvelopeActive flipped despite registration failure (ordering regression)")
+	}
+	if sc.StorageEnvelopeCutoverIndex != 0 {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d despite registration failure, want 0",
+			sc.StorageEnvelopeCutoverIndex)
+	}
+}
+
+// bootstrappedDir constructs a temp dir + sidecar path with an
+// Applier-bootstrapped sidecar at
+// (cutoverBootstrapStorageDEKID, cutoverBootstrapRaftDEKID).
+// Used by the cutover negative tests to share the setup.
+func bootstrappedDir(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: cutoverBootstrapStorageDEKID, WrappedStorage: []byte("s"),
+		RaftDEKID: cutoverBootstrapRaftDEKID, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: cutoverBootstrapStorageDEKID, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	return dir, sidecarPath
+}
+
+// newCutoverApplier returns a fresh Applier wired against the
+// bootstrappedDir sidecar so cutover tests do not have to share
+// state with the bootstrap call.
+func newCutoverApplier(t *testing.T, _ string, sidecarPath string) *encryption.Applier {
+	t.Helper()
+	app, err := encryption.NewApplier(newMapRegistryStore(),
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(encryption.NewKeystore()),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	return app
+}
+
+// assertCutoverNotApplied verifies that a rejected cutover left
+// the sidecar's cutover state untouched — neither
+// StorageEnvelopeActive nor StorageEnvelopeCutoverIndex may have
+// been mutated by a malformed entry whose apply was halted.
+func assertCutoverNotApplied(t *testing.T, sidecarPath string) {
+	t.Helper()
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.StorageEnvelopeActive {
+		t.Error("StorageEnvelopeActive = true despite halt, want false")
+	}
+	if sc.StorageEnvelopeCutoverIndex != 0 {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d despite halt, want 0",
+			sc.StorageEnvelopeCutoverIndex)
+	}
+}
+
 // TestApplyBootstrap_RejectsSecondBootstrapWithDifferentDEKs
 // pins the §5.6 one-time-bootstrap invariant: once Active slots
 // are populated, a second committed bootstrap entry with

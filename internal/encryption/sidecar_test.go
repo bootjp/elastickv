@@ -231,7 +231,10 @@ func TestReadSidecar_Missing(t *testing.T) {
 
 func TestReadSidecar_RejectsUnknownVersion(t *testing.T) {
 	path := sidecarPath(t)
-	for _, v := range []int{0, 2, 42, -1} {
+	// 0 and -1 are below MinReadableSidecarVersion; 3 / 42 are above
+	// SidecarVersion (currently 2). 1 and 2 are valid and exercised
+	// by the legacy-read and round-trip tests.
+	for _, v := range []int{0, 3, 42, -1} {
 		raw, err := json.Marshal(map[string]any{
 			"version":                     v,
 			"raft_applied_index":          0,
@@ -250,6 +253,55 @@ func TestReadSidecar_RejectsUnknownVersion(t *testing.T) {
 		if !errors.Is(err, encryption.ErrSidecarVersion) {
 			t.Fatalf("version=%d: expected ErrSidecarVersion, got %v", v, err)
 		}
+	}
+}
+
+// TestReadSidecar_AcceptsLegacyVersion1 pins the upgrade-path
+// invariant: a post-6D-4 binary MUST be able to read a pre-6D-4
+// version-1 sidecar so an in-place upgrade is rolling-compatible.
+// The new StorageEnvelopeCutoverIndex field defaults to 0
+// (pre-cutover baseline). Without this guarantee an in-place
+// upgrade would refuse to boot on the upgraded node — gemini
+// medium #2 on PR804.
+func TestReadSidecar_AcceptsLegacyVersion1(t *testing.T) {
+	path := sidecarPath(t)
+	// Version-1 layout WITHOUT storage_envelope_cutover_index, as
+	// written by a pre-6D-4 binary.
+	raw := []byte(`{
+        "version": 1,
+        "raft_applied_index": 184273,
+        "storage_envelope_active": false,
+        "raft_envelope_cutover_index": 0,
+        "active": {"storage": 0, "raft": 0},
+        "keys": {}
+    }`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	got, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar(version=1) refused legacy read: %v", err)
+	}
+	if got.Version != 1 {
+		t.Errorf("parsed Version = %d, want 1 (preserve legacy version pre-write)", got.Version)
+	}
+	if got.StorageEnvelopeCutoverIndex != 0 {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d, want 0 (default for absent field)",
+			got.StorageEnvelopeCutoverIndex)
+	}
+	// The very next WriteSidecar must transition the sidecar to
+	// version 2 — WriteSidecar overrides the in-struct Version
+	// regardless of caller value.
+	if err := encryption.WriteSidecar(path, got); err != nil {
+		t.Fatalf("WriteSidecar after legacy read: %v", err)
+	}
+	rewritten, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar after rewrite: %v", err)
+	}
+	if rewritten.Version != encryption.SidecarVersion {
+		t.Errorf("rewritten Version = %d, want %d (auto-upgrade on next write)",
+			rewritten.Version, encryption.SidecarVersion)
 	}
 }
 
