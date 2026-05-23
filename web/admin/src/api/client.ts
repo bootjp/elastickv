@@ -410,7 +410,12 @@ export const api = {
       `${apiBase}/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
       { method: "PUT", body, headers, credentials: "same-origin" },
     );
-    if (res.status === 204) return;
+    // Treat any 2xx as success rather than just 204. The current
+    // Go handler returns 204 (no body) but the contract intent is
+    // any successful upload; a future change that returns the
+    // metadata on 200 would otherwise be misclassified as a
+    // non-JSON error (Gemini medium on PR #816).
+    if (res.ok) return;
     const ct = res.headers.get("content-type") ?? "";
     if (!ct.includes("application/json")) {
       throw new ApiError(res.status, "non_json_response", `HTTP ${res.status}`);

@@ -40,21 +40,55 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
   // without scanning from the start.
   const [cursorStack, setCursorStack] = useState<string[]>([]);
 
-  const loadPage = async (cursor: string | undefined, p: string) => {
+  // listAbortRef aborts the in-flight list when a new one starts
+  // (bucket change, prefix change, Next / Refresh, post-write
+  // reload). Without this, an older slower request can overwrite
+  // the current view with stale rows for a different prefix —
+  // and the follow-up download / delete actions on those rows
+  // would mutate the wrong resource (Codex P1, Gemini high on
+  // PR #816).
+  const listAbortRef = useRef<AbortController | null>(null);
+  // Abort the last in-flight controller on unmount so a pending
+  // network call doesn't update state after the component is
+  // gone.
+  useEffect(() => {
+    return () => {
+      listAbortRef.current?.abort();
+    };
+  }, []);
+
+  // loadPage returns true on success, false on error or
+  // cancellation. Callers (notably onNextPage) inspect the
+  // return value to decide whether to advance the cursor stack.
+  const loadPage = async (cursor: string | undefined, p: string): Promise<boolean> => {
+    listAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    listAbortRef.current = ctrl;
     setLoading(true);
     setLoadError(null);
     try {
-      const result = await api.listObjects(bucket, {
-        prefix: p,
-        delimiter: DELIMITER,
-        continuation_token: cursor,
-        max_keys: PAGE_SIZE,
-      });
+      const result = await api.listObjects(
+        bucket,
+        {
+          prefix: p,
+          delimiter: DELIMITER,
+          continuation_token: cursor,
+          max_keys: PAGE_SIZE,
+        },
+        ctrl.signal,
+      );
+      if (listAbortRef.current !== ctrl) return false;
       setPage(result);
+      return true;
     } catch (err) {
+      if (listAbortRef.current !== ctrl) return false;
+      if (err instanceof DOMException && err.name === "AbortError") return false;
       setLoadError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
+      return false;
     } finally {
-      setLoading(false);
+      if (listAbortRef.current === ctrl) {
+        setLoading(false);
+      }
     }
   };
 
@@ -65,11 +99,19 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bucket, prefix]);
 
-  const onNextPage = () => {
+  const onNextPage = async () => {
     const next = page?.next_continuation_token;
     if (!next) return;
-    setCursorStack((s) => [...s, next]);
-    void loadPage(next, prefix);
+    // Advance cursorStack only after the fetch succeeds. The
+    // previous code pushed first; on a transient API failure the
+    // UI still showed the old page while internal cursor state
+    // had already moved forward — subsequent Refresh / post-
+    // mutation reloads then used the wrong token and jumped to
+    // a different page (Codex P2 on PR #816).
+    const ok = await loadPage(next, prefix);
+    if (ok) {
+      setCursorStack((s) => [...s, next]);
+    }
   };
 
   const onRefresh = () => {
