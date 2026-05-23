@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -507,6 +508,105 @@ func (b *bucketsBridge) AdminDeleteBucket(ctx context.Context, principal admin.A
 		return translateAdminBucketsError(err)
 	}
 	return nil
+}
+
+// ---------- Phase 3b object-level bridge ----------
+
+func (b *bucketsBridge) AdminListObjects(ctx context.Context, principal admin.AuthPrincipal, bucket string, opts admin.AdminListObjectsOptions) (admin.AdminObjectListing, error) {
+	out, err := b.server.AdminListObjects(ctx, convertAdminPrincipal(principal), bucket, adapter.AdminListObjectsOptions{
+		Prefix:            opts.Prefix,
+		Delimiter:         opts.Delimiter,
+		ContinuationToken: opts.ContinuationToken,
+		MaxKeys:           opts.MaxKeys,
+	})
+	if err != nil {
+		return admin.AdminObjectListing{}, translateAdminObjectsError(err)
+	}
+	return adminObjectListingFromAdapter(out), nil
+}
+
+func (b *bucketsBridge) AdminGetObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string) (io.ReadCloser, admin.AdminObject, error) {
+	body, meta, err := b.server.AdminGetObject(ctx, convertAdminPrincipal(principal), bucket, key)
+	if err != nil {
+		return nil, admin.AdminObject{}, translateAdminObjectsError(err)
+	}
+	return body, adminObjectFromAdapter(meta), nil
+}
+
+func (b *bucketsBridge) AdminPutObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string, body io.Reader, contentType string) error {
+	if err := b.server.AdminPutObject(ctx, convertAdminPrincipal(principal), bucket, key, body, contentType); err != nil {
+		return translateAdminObjectsError(err)
+	}
+	return nil
+}
+
+func (b *bucketsBridge) AdminDeleteObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string) error {
+	if err := b.server.AdminDeleteObject(ctx, convertAdminPrincipal(principal), bucket, key); err != nil {
+		return translateAdminObjectsError(err)
+	}
+	return nil
+}
+
+// adminObjectFromAdapter / adminObjectListingFromAdapter translate
+// the adapter's wire shape into the admin package's. The two are
+// field-for-field isomorphic so the build breaks here on drift.
+func adminObjectFromAdapter(in adapter.AdminObject) admin.AdminObject {
+	return admin.AdminObject{
+		Key:          in.Key,
+		Size:         in.Size,
+		ContentType:  in.ContentType,
+		ETag:         in.ETag,
+		LastModified: in.LastModified,
+		StorageClass: in.StorageClass,
+	}
+}
+
+func adminObjectListingFromAdapter(in adapter.AdminObjectListing) admin.AdminObjectListing {
+	out := admin.AdminObjectListing{
+		CommonPrefixes:        in.CommonPrefixes,
+		NextContinuationToken: in.NextContinuationToken,
+	}
+	if in.Objects != nil {
+		out.Objects = make([]admin.AdminObject, len(in.Objects))
+		for i, o := range in.Objects {
+			out.Objects[i] = adminObjectFromAdapter(o)
+		}
+	}
+	return out
+}
+
+// translateAdminObjectsError maps the adapter's object-tier admin
+// error vocabulary onto the admin-package sentinels the handler
+// matches against. Mirrors translateAdminBucketsError but covers the
+// object-only sentinels (UploadTooLarge, InvalidObjectKey,
+// ObjectNotFound) that the bucket-tier path never sees.
+func translateAdminObjectsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrObjectsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrObjectsNotLeader
+	case errors.Is(err, adapter.ErrAdminBucketNotFound):
+		return admin.ErrObjectsBucketNotFound
+	case errors.Is(err, adapter.ErrAdminObjectNotFound):
+		return admin.ErrObjectsNotFound
+	case errors.Is(err, adapter.ErrAdminUploadTooLarge):
+		return admin.ErrObjectsUploadTooLarge
+	case errors.Is(err, adapter.ErrAdminInvalidBucketName),
+		errors.Is(err, adapter.ErrAdminInvalidObjectKey),
+		errors.Is(err, adapter.ErrAdminInvalidContinuationToken):
+		// Wrap the adapter's text so the handler's ErrObjectsValidation
+		// branch surfaces a useful message rather than the bare
+		// sentinel string. Same pattern translateAdminBucketsError
+		// uses for ErrAdminInvalidBucketName via *ValidationError.
+		return errors.Wrap(admin.ErrObjectsValidation, err.Error())
+	case isLeaderChurnError(err):
+		return admin.ErrObjectsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
 }
 
 func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary {

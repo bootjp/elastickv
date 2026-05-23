@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/admin"
@@ -272,4 +273,20 @@ func (dummyBucketsSource) AdminPutBucketAcl(_ context.Context, _ admin.AuthPrinc
 
 func (dummyBucketsSource) AdminDeleteBucket(_ context.Context, _ admin.AuthPrincipal, _ string) error {
 	panic("dummyBucketsSource.AdminDeleteBucket should not be invoked")
+}
+
+func (dummyBucketsSource) AdminListObjects(_ context.Context, _ admin.AuthPrincipal, _ string, _ admin.AdminListObjectsOptions) (admin.AdminObjectListing, error) {
+	panic("dummyBucketsSource.AdminListObjects should not be invoked")
+}
+
+func (dummyBucketsSource) AdminGetObject(_ context.Context, _ admin.AuthPrincipal, _, _ string) (io.ReadCloser, admin.AdminObject, error) {
+	panic("dummyBucketsSource.AdminGetObject should not be invoked")
+}
+
+func (dummyBucketsSource) AdminPutObject(_ context.Context, _ admin.AuthPrincipal, _, _ string, _ io.Reader, _ string) error {
+	panic("dummyBucketsSource.AdminPutObject should not be invoked")
+}
+
+func (dummyBucketsSource) AdminDeleteObject(_ context.Context, _ admin.AuthPrincipal, _, _ string) error {
+	panic("dummyBucketsSource.AdminDeleteObject should not be invoked")
 }
