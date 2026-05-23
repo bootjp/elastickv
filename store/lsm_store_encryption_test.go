@@ -299,8 +299,15 @@ func newGatedEncryptedStore(t *testing.T, keyID uint32, gateFlag *bool) *gatedFi
 	}
 	g := &gatedFixture{mvcc: mvcc, dir: dir}
 	t.Cleanup(func() {
-		if !g.closed {
-			_ = g.mvcc.Close()
+		if g.closed {
+			return
+		}
+		// Surface any close error rather than swallowing it: a
+		// silent failure here could mask a leaked Pebble handle
+		// or a flush bug under a future code change (gemini-code-
+		// assist medium on PR809).
+		if err := g.mvcc.Close(); err != nil {
+			t.Errorf("cleanup close pebble: %v", err)
 		}
 	})
 	return g
@@ -509,7 +516,20 @@ func TestStorageEnvelopeGate_NilArgumentIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPebbleStore: %v", err)
 	}
-	t.Cleanup(func() { _ = mvcc.Close() })
+	// closed tracks whether the test body has already closed the
+	// store before the on-disk peek; the cleanup must surface
+	// any unexpected close error but skip the double-close that
+	// would otherwise panic inside Pebble (gemini-code-assist
+	// medium + coderabbit minor on PR809).
+	var closed bool
+	t.Cleanup(func() {
+		if closed {
+			return
+		}
+		if cerr := mvcc.Close(); cerr != nil {
+			t.Errorf("cleanup close pebble: %v", cerr)
+		}
+	})
 	ctx := context.Background()
 	// Without a gate, the store should still emit envelopes
 	// (legacy posture). A nil-deref bug surfaces as a panic here.
@@ -517,6 +537,19 @@ func TestStorageEnvelopeGate_NilArgumentIsNoOp(t *testing.T) {
 		t.Fatalf("PutAt: %v", err)
 	}
 	mustGet(t, mvcc, []byte("k"), 150, "v")
+	// Coderabbit minor: a round-trip pass alone does not prove
+	// the legacy-posture write took the envelope path — a
+	// regression that always wrote cleartext would still
+	// round-trip cleanly. Close and peek the on-disk
+	// encryption_state bits to pin the wire-level effect.
+	closed = true
+	if cerr := mvcc.Close(); cerr != nil {
+		t.Fatalf("close pebble: %v", cerr)
+	}
+	if got := rawEncStateAt(t, dir, []byte("k"), 100); got != encStateEncrypted {
+		t.Errorf("nil-gate on-disk encState = %#x, want %#x (encrypted; legacy posture)",
+			got, encStateEncrypted)
+	}
 }
 
 // TestEncryption_AADRecordBinding is the §4.1 case-2/3 regression:
