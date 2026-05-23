@@ -312,10 +312,30 @@ func (h *DynamoHandler) handleItemDelete(w http.ResponseWriter, r *http.Request,
 // a method on DynamoHandler because it's only used by item-level
 // handlers; the existing list/describe paths use the looser session-
 // auth gate (their output is metadata, not content).
+//
+// JWT role gate fires unconditionally before the optional live-store
+// re-check (matches principalForWrite's defence-in-depth pattern from
+// PR #669). A token minted with role=none cannot slip through reads
+// via a later live-role promotion; the live re-check can only further
+// constrain. Claude review on PR #814 r2 caught the parallel S3
+// asymmetry; this fix lands on PR #813 to keep the items handler
+// consistent with the contract documented in principalForWrite.
 func (h *DynamoHandler) principalForItemRead(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
-		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
+		// 401 matches principalForWrite (s3_handler.go,
+		// dynamo_handler.go.principalForWrite) — semantically,
+		// "no session principal" is unauthenticated, not internal
+		// failure. The path is unreachable in production
+		// (SessionAuth always attaches a principal upstream); the
+		// 401 keeps the contract symmetric with the rest of the
+		// admin surface (Claude review on PR #813 r2).
+		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
+		return AuthPrincipal{}, false
+	}
+	if !principal.Role.AllowsRead() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this access key is not authorised to read table contents")
 		return AuthPrincipal{}, false
 	}
 	if h.roles != nil {
@@ -325,11 +345,10 @@ func (h *DynamoHandler) principalForItemRead(w http.ResponseWriter, r *http.Requ
 				"this access key is not authorised to read table contents")
 			return AuthPrincipal{}, false
 		}
+		// Use the live role downstream — the JWT may carry a stale
+		// value but the live one is authoritative once both gates
+		// agree the request is allowed.
 		principal.Role = live
-	} else if !principal.Role.AllowsRead() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to read table contents")
-		return AuthPrincipal{}, false
 	}
 	return principal, true
 }
@@ -358,6 +377,18 @@ func parseAdminScanItemsQuery(w http.ResponseWriter, r *http.Request) (AdminScan
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid_request",
 				"next_cursor is not a valid base64-url encoded key map")
+			return AdminScanItemsOptions{}, false
+		}
+		// Reject empty/nil decoded cursor symmetrically with
+		// decodeAdminItemKeySegment's len-zero check on the URL
+		// {key} segment. Base64-url of "null" decodes to nil and
+		// "{}" decodes to len-0 map; without this guard either
+		// would silently feed ExclusiveStart=nil to the adapter
+		// (start-from-beginning), duplicating page 0 and trapping
+		// paging-loop clients (Codex P2 on PR #813 r8).
+		if len(cursor) == 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request",
+				"next_cursor decodes to an empty attribute map")
 			return AdminScanItemsOptions{}, false
 		}
 		opts.ExclusiveStart = cursor
@@ -505,12 +536,29 @@ func boolPtrEqual(a, b *bool) bool {
 
 // writeItemsError translates the sentinel errors the bridge
 // surfaces into the canonical HTTP status + body shape.
+//
+// The 503 / 403 / 400 cases use fixed strings rather than
+// err.Error() — the sentinels (e.g. "admin dynamo items:
+// forbidden") are internal vocabulary and leaking them to clients
+// (a) sticks the SPA with a confusing message and (b) drifts the
+// items surface away from writeTablesError / writeBucketsError /
+// the SQS handler which all use fixed strings. Claude review on
+// PR #813 r2 caught both this and the Retry-After / canonical
+// code drift on the 503 case.
 func (h *DynamoHandler) writeItemsError(w http.ResponseWriter, r *http.Request, op, table string, err error) {
 	switch {
 	case errors.Is(err, ErrItemsForbidden):
-		writeJSONError(w, http.StatusForbidden, "forbidden", err.Error())
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this endpoint requires a full-access role")
 	case errors.Is(err, ErrItemsNotLeader):
-		writeJSONError(w, http.StatusServiceUnavailable, "not_leader", err.Error())
+		// Retry-After: 1 + "leader_unavailable" matches every
+		// other admin 503 (writeTablesError, writeBucketsError,
+		// sqs_handler, forward_server). Without these the SPA's
+		// shared retry helper does not back off correctly and
+		// the error branches on the wrong code string.
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusServiceUnavailable, "leader_unavailable",
+			"this admin node is not the raft leader")
 	case errors.Is(err, ErrItemsTableNotFound):
 		writeJSONError(w, http.StatusNotFound, "not_found", "table not found")
 	case errors.Is(err, ErrItemsValidation):

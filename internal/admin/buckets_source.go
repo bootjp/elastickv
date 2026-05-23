@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"io"
 )
 
 // BucketsSource is the in-process surface the admin S3 handler
@@ -47,6 +48,33 @@ type BucketsSource interface {
 	// when objects remain (the dashboard cannot force a recursive
 	// delete; the SPA renders the 409 with a hint to clean up first).
 	AdminDeleteBucket(ctx context.Context, principal AuthPrincipal, name string) error
+
+	// Object-level admin RPCs (Phase 3b — design §3.1.2). The handler
+	// in s3_objects_handler.go drives these for the
+	// /buckets/{name}/objects{,/{key}} sub-tree. Implementations live
+	// in main_admin.go (bucketsBridge) and bridge to the adapter
+	// package's Admin*Object methods.
+
+	// AdminListObjects returns a bounded page of objects under a
+	// prefix. Delimiter folds pseudo-folders into CommonPrefixes
+	// (only emitted when Options.Delimiter is set).
+	AdminListObjects(ctx context.Context, principal AuthPrincipal, bucket string, opts AdminListObjectsOptions) (AdminObjectListing, error)
+	// AdminGetObject streams one object's body + metadata. The caller
+	// MUST close the returned body to release the read-tracker pin.
+	// (body, meta, nil) on success; (nil, AdminObject{}, err) on any
+	// failure. ErrObjectsNotFound flags the object-absent case.
+	AdminGetObject(ctx context.Context, principal AuthPrincipal, bucket, key string) (io.ReadCloser, AdminObject, error)
+	// AdminPutObject creates-or-replaces one object from a streaming
+	// body. ContentType is the operator-supplied Content-Type header
+	// (empty falls back to the adapter's defaultS3ContentType).
+	// Returns ErrObjectsUploadTooLarge if the body exceeds the admin
+	// per-object cap.
+	AdminPutObject(ctx context.Context, principal AuthPrincipal, bucket, key string, body io.Reader, contentType string) error
+	// AdminDeleteObject removes one object. Idempotent — a missing
+	// object surfaces as success (mirrors the SigV4 DeleteObject
+	// contract). Returns ErrObjectsBucketNotFound when the bucket
+	// itself is absent.
+	AdminDeleteObject(ctx context.Context, principal AuthPrincipal, bucket, key string) error
 }
 
 // BucketSummary is the bucket-level DTO the SPA receives. The JSON

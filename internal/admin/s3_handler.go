@@ -101,13 +101,26 @@ func (h *S3Handler) WithLeaderForwarder(f LeaderForwarder) *S3Handler {
 	return h
 }
 
-// ServeHTTP routes /buckets, /buckets/{name}, and /buckets/{name}/acl.
+// ServeHTTP routes /buckets, /buckets/{name}, /buckets/{name}/acl,
+// /buckets/{name}/objects, and /buckets/{name}/objects/{key-b64url}.
+//
+// EscapedPath() is the authoritative input — net/http pre-decodes
+// the raw path into r.URL.Path, turning `%2F` into a literal `/`
+// and splitting a single bucket segment across the route. The
+// confused-deputy class: a URL like `/buckets/victim%2Fobjects/{key}`
+// would (without EscapedPath) route to bucket "victim" rather than
+// the literal-named "victim/objects" segment, executing the
+// requested op against the wrong bucket. servePerBucket operates
+// on the escaped form so the encoded-slash and encoded-dot
+// traversal classes stay closed across all four sub-trees
+// (Codex P1 on PR #814).
 func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	escaped := r.URL.EscapedPath()
 	switch {
-	case r.URL.Path == pathS3Buckets:
+	case escaped == pathS3Buckets:
 		h.serveCollection(w, r)
-	case strings.HasPrefix(r.URL.Path, pathPrefixS3Buckets):
-		h.servePerBucket(w, r)
+	case strings.HasPrefix(escaped, pathPrefixS3Buckets):
+		h.servePerBucket(w, r, escaped)
 	default:
 		writeJSONError(w, http.StatusNotFound, "not_found", "")
 	}
@@ -125,34 +138,31 @@ func (h *S3Handler) serveCollection(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// servePerBucket dispatches /s3/buckets/{name} and the single
-// sub-resource /s3/buckets/{name}/acl. Any other sub-path 404s so a
-// SPA bug pointed at a hypothetical /buckets/{name}/policy or
-// similar sees an unambiguous "no handler" rather than mistakenly
-// hitting the describe path with a "{name}/policy" string. The
-// pinned test is TestS3Handler_DescribeBucket_SubpathReturns404
-// (CodeRabbit minor on PR #658 caught a prior version of this
-// comment that mistakenly said "405").
-func (h *S3Handler) servePerBucket(w http.ResponseWriter, r *http.Request) {
-	tail := strings.TrimPrefix(r.URL.Path, pathPrefixS3Buckets)
+// servePerBucket dispatches /s3/buckets/{name}, the ACL sub-resource
+// /s3/buckets/{name}/acl, and the Phase-3b object sub-tree
+// /s3/buckets/{name}/objects{,/{key-b64url}}. The order matters:
+// the objects sub-tree is matched first so a `{name}` literally
+// equal to "objects" cannot collide with bucket-name dispatch (and
+// validateS3BucketName already forbids `/`, so the only way to
+// reach the objects branch is via the literal /objects segment).
+//
+// Anything else under /buckets/{name}/ is a 404 — a SPA bug
+// pointed at a hypothetical /buckets/{name}/policy sees an
+// unambiguous "no handler" rather than the describe path
+// silently swallowing the suffix.
+func (h *S3Handler) servePerBucket(w http.ResponseWriter, r *http.Request, escaped string) {
+	tail := strings.TrimPrefix(escaped, pathPrefixS3Buckets)
 	if tail == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_bucket_name",
 			"bucket name is empty")
 		return
 	}
+	if name, sub, ok := splitBucketObjectsRoute(tail); ok {
+		h.dispatchObjectsSubtree(w, r, name, sub)
+		return
+	}
 	if strings.HasSuffix(tail, pathSuffixACL) {
-		name := strings.TrimSuffix(tail, pathSuffixACL)
-		if name == "" || strings.Contains(name, "/") {
-			writeJSONError(w, http.StatusNotFound, "not_found",
-				"no admin S3 handler is registered for this path")
-			return
-		}
-		if r.Method != http.MethodPut {
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
-				"only PUT is allowed on /s3/buckets/{name}/acl")
-			return
-		}
-		h.handlePutACL(w, r, name)
+		h.dispatchACLSubresource(w, r, strings.TrimSuffix(tail, pathSuffixACL))
 		return
 	}
 	if strings.Contains(tail, "/") {
@@ -168,6 +178,84 @@ func (h *S3Handler) servePerBucket(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
 			"only GET or DELETE is allowed on /s3/buckets/{name}")
+	}
+}
+
+// dispatchACLSubresource handles the /buckets/{name}/acl route. Pulled
+// out of servePerBucket so the parent dispatcher stays under the
+// cyclomatic-complexity ceiling now that the Phase-3b /objects branch
+// added another arm.
+func (h *S3Handler) dispatchACLSubresource(w http.ResponseWriter, r *http.Request, name string) {
+	if name == "" || strings.Contains(name, "/") {
+		writeJSONError(w, http.StatusNotFound, "not_found",
+			"no admin S3 handler is registered for this path")
+		return
+	}
+	if r.Method != http.MethodPut {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+			"only PUT is allowed on /s3/buckets/{name}/acl")
+		return
+	}
+	h.handlePutACL(w, r, name)
+}
+
+// splitBucketObjectsRoute recognises the two object-tier shapes
+// under /buckets/{name}/objects{,/{key-b64url}} and returns the
+// bucket name plus the residual segment (empty for the collection
+// route, the {key} segment for the per-object route). Returns
+// ok=false when tail does not address the objects sub-tree.
+//
+// Validation:
+//   - bucket name must be non-empty and slash-free (otherwise
+//     reject via the standard 404 fallthrough)
+//   - the literal "objects" sub-resource must be present
+//   - a residual that is empty OR has a leading slash is the
+//     objects route: empty returns (name, "", true) so the
+//     dispatcher routes to handleObjectsCollection (same shape
+//     as /buckets/{name}/objects); a leading-slash residual
+//     returns (name, key, true) for the per-object route
+//
+// The {key} validator (no `%`, no dot-segments) runs in the
+// object handler's segment decoder rather than here so the route
+// recogniser stays cheap.
+func splitBucketObjectsRoute(tail string) (string, string, bool) {
+	const objectsSep = "/" + adminObjectSubResource
+	idx := strings.Index(tail, objectsSep)
+	if idx <= 0 {
+		return "", "", false
+	}
+	name := tail[:idx]
+	if name == "" || strings.Contains(name, "/") {
+		return "", "", false
+	}
+	rest := tail[idx+len(objectsSep):]
+	switch {
+	case rest == "":
+		return name, "", true
+	case strings.HasPrefix(rest, "/"):
+		return name, rest[1:], true
+	default:
+		// Bucket name spilled past the /objects segment, e.g.
+		// `foo/objectsx` — not an objects route.
+		return "", "", false
+	}
+}
+
+// dispatchObjectsSubtree routes the two recognised object-tier
+// shapes. An empty sub is the collection route (matches the
+// splitter's name/objects/ trailing-slash shape with /buckets/
+// {name}/objects). A sub containing `/` is a malformed key
+// segment (the SPA base64-url-encodes the key so there should
+// be no embedded slash) and rejects with 400 invalid_path.
+func (h *S3Handler) dispatchObjectsSubtree(w http.ResponseWriter, r *http.Request, name, sub string) {
+	switch {
+	case sub == "":
+		h.handleObjectsCollection(w, r, name)
+	case strings.Contains(sub, "/"):
+		writeJSONError(w, http.StatusBadRequest, "invalid_path",
+			"object key segment must not contain a slash; encode the key as base64-url")
+	default:
+		h.handleObjectResource(w, r, name, sub)
 	}
 }
 

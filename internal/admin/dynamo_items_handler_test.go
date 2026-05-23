@@ -381,6 +381,42 @@ func TestDynamoItems_Scan_RejectsBadLimit(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// TestDynamoItems_Scan_RejectsEmptyDecodedCursor pins the Codex P2
+// on PR #813 r8 fix: a cursor that decodes to an empty/nil map
+// (base64-url of "null", "{}", or similar) used to be silently
+// treated as ExclusiveStart=nil — i.e., "start from beginning" —
+// instead of returning 400. Clients passing a malformed cursor
+// would then see duplicated first-page results and, in a paging
+// loop driven off `next_cursor`, lock themselves into a tight
+// infinite loop on page 1.
+//
+// The URL `{key}` segment already rejects this case via
+// decodeAdminItemKeySegment's `len(out) == 0` check; this test
+// pins the parallel guard on the next_cursor query path.
+func TestDynamoItems_Scan_RejectsEmptyDecodedCursor(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	h := newDynamoHandlerForTest(src)
+
+	cases := map[string]string{
+		"json-null":    base64.RawURLEncoding.EncodeToString([]byte("null")),
+		"empty-object": base64.RawURLEncoding.EncodeToString([]byte("{}")),
+		"empty-padded": base64.URLEncoding.EncodeToString([]byte("{}")),
+	}
+	for name, cursor := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet,
+				pathDynamoTables+"/orders/items?next_cursor="+cursor, nil)
+			req = withReadOnlyPrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code,
+				"empty/null cursor must surface as 400 to avoid silent reset-to-page-0; got %d body=%s",
+				rec.Code, rec.Body.String())
+		})
+	}
+}
+
 func TestDynamoItems_Get_HappyPath(t *testing.T) {
 	t.Parallel()
 	src := newStubItemsSource()
@@ -397,6 +433,57 @@ func TestDynamoItems_Get_HappyPath(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
+
+	var got AdminItem
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, "hello", *got.Attributes["value"].S)
+}
+
+// TestDynamoItems_Get_AcceptsURLEncodedPaddedBase64Key pins the
+// Codex P2 on PR #813 r7 fix: the dispatcher must pass the
+// percent-decoded {key} segment to the per-key handler so a
+// client that URL-encodes padded base64 (e.g. JS's
+// encodeURIComponent turns "=" into "%3D") still routes
+// correctly. Pre-fix the dispatcher passed the raw segment with
+// %3D still present, the base64 decoder rejected it as not
+// valid base64-url, and the request 400'd despite the key
+// being well-formed.
+//
+// The decodeAdminItemKeySegment2 helper explicitly supports
+// padded base64 as a fallback for hand-crafted curl, so this
+// case is part of the documented input contract.
+func TestDynamoItems_Get_AcceptsURLEncodedPaddedBase64Key(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	key := map[string]AdminAttributeValue{"pk": stringAttr("k1")}
+	val := AdminItem{Attributes: map[string]AdminAttributeValue{
+		"pk":    stringAttr("k1"),
+		"value": stringAttr("hello"),
+	}}
+	src.seedItem("orders", key, val)
+	h := newDynamoHandlerForTest(src)
+
+	// Encode the key with PADDED base64-url (=), then URL-escape
+	// the `=` to %3D — the shape a client using
+	// encodeURIComponent on a padded base64 string would produce.
+	keyJSON, err := json.Marshal(key)
+	require.NoError(t, err)
+	padded := base64.URLEncoding.EncodeToString(keyJSON)
+	// Sanity: the encoded form must actually contain padding for
+	// this test to exercise the right code path. If it doesn't,
+	// the JSON happened to be a multiple of 3 bytes; force the
+	// padded helper anyway since the URL-escape applies the same
+	// regardless.
+	urlEscaped := strings.ReplaceAll(padded, "=", "%3D")
+	url := pathDynamoTables + "/orders/" + adminItemSubResource + "/" + urlEscaped
+
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	req = withReadOnlyPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code,
+		"URL-escaped padded base64-url key must decode and route to the item; got %d body=%s",
+		rec.Code, rec.Body.String())
 
 	var got AdminItem
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
@@ -545,13 +632,15 @@ func TestDynamoItems_Scan_RejectsAnonymous(t *testing.T) {
 	src := newStubItemsSource()
 	h := newDynamoHandlerForTest(src)
 
-	// No principal injected — should fail with internal (missing
-	// session principal).
+	// No principal injected — should fail 401 unauthenticated,
+	// matching principalForWrite and the rest of the admin
+	// surface (Claude review on PR #813 r2 caught the original
+	// 500 inconsistency).
 	req := httptest.NewRequest(http.MethodGet,
 		pathDynamoTables+"/orders/items", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
 // ---------- error translation tests ----------
@@ -581,6 +670,81 @@ func TestDynamoItems_TranslatesSentinelsToStatus(t *testing.T) {
 			require.Equal(t, tc.wantCode, rec.Code)
 		})
 	}
+}
+
+// TestDynamoItems_Scan_JWTNoneRoleRejectedWhenLiveStoreGrantsRead
+// pins the principalForItemRead JWT-bypass fix from PR #813 r5.
+// Pre-fix, when a RoleStore was configured (h.roles != nil), the
+// JWT role check was skipped entirely and only the live store
+// was consulted — so a session whose JWT carried no read role
+// could pass through reads if the live store had since granted
+// the access key a read-or-higher role. The fix moves the JWT
+// gate ahead of the live check; both must permit the request
+// (defence-in-depth matching principalForWrite's contract).
+//
+// Pre-fix this assertion would have failed: live store grants
+// RoleReadOnly so the role-store branch accepted the request
+// and never re-checked the JWT's zero-value Role; the source's
+// AdminScanItems was invoked and returned 200 OK. Post-fix the
+// JWT check rejects first (Role="" doesn't satisfy AllowsRead)
+// and the source is never touched. Mirrors
+// TestDynamoHandler_CreateTable_LiveRoleRevocation in
+// dynamo_handler_test.go:448 (Claude review on PR #813 r5
+// flagged the missing test).
+func TestDynamoItems_Scan_JWTNoneRoleRejectedWhenLiveStoreGrantsRead(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	// Make the source return a recognisable success path so the
+	// pre-fix bug would surface as 200 (source reached) rather
+	// than a sentinel-induced status.
+	src.seedItem("orders", map[string]AdminAttributeValue{"pk": stringAttr("k1")},
+		AdminItem{Attributes: map[string]AdminAttributeValue{"pk": stringAttr("k1")}})
+	// Live role map says the access key has read access — but the
+	// JWT carries Role="" (zero value, neither read nor write).
+	roles := MapRoleStore{"AKIA_BYPASS": RoleReadOnly}
+	h := NewDynamoHandler(src).WithRoleStore(roles)
+
+	req := httptest.NewRequest(http.MethodGet,
+		pathDynamoTables+"/orders/items", nil)
+	// Inject a principal with the matching access key but no role
+	// on the JWT side. withReadOnlyPrincipal can't reproduce this —
+	// we need the JWT-without-read-role case the bypass relied on.
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_BYPASS", Role: ""}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code,
+		"JWT role with no read permission must be rejected even when the live store grants read access")
+}
+
+// TestDynamoItems_NotLeader503HasRetryAfterAndCanonicalCode pins
+// the items 503 contract to the same shape every other admin
+// surface uses: status 503, Retry-After: 1, error code
+// "leader_unavailable". Claude review on PR #813 r2 caught the
+// drift — translateAdminItemsError's comment promised
+// "503 + Retry-After: 1" but writeItemsError didn't set the
+// header and the items handler shipped a non-canonical
+// "not_leader" code. The SPA's retry logic branches on the code
+// string; the items 503 must be indistinguishable from the table-
+// tier / S3 / SQS 503 paths.
+func TestDynamoItems_NotLeader503HasRetryAfterAndCanonicalCode(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	src.nextErr = ErrItemsNotLeader
+	h := newDynamoHandlerForTest(src)
+
+	req := httptest.NewRequest(http.MethodGet,
+		pathDynamoTables+"/orders/items", nil)
+	req = withReadOnlyPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, "1", rec.Header().Get("Retry-After"),
+		"503 from items handler must set Retry-After: 1 so SPA retry backoff fires")
+	require.Contains(t, rec.Body.String(), `"leader_unavailable"`,
+		`items 503 must use the canonical "leader_unavailable" code`)
 }
 
 // ---------- body-validation defence-in-depth (Gemini medium on PR #813) ----------

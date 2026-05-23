@@ -318,13 +318,15 @@ func (h *DynamoHandler) dispatchPerTableRoute(w http.ResponseWriter, r *http.Req
 				"unknown sub-resource on this table")
 			return
 		}
-		// The {key} segment is base64-url-encoded by the SPA, so the
-		// decoded form here equals the raw form (base64-url alphabet
-		// is a subset of unreserved URL chars). Pass rawSegments[2]
-		// to handleItemResource so its existing base64 decoder runs
-		// against the wire form — a future format change in the SPA
-		// (e.g. using padded base64) wouldn't drift the contract.
-		h.handleItemResource(w, r, segments[0], rawSegments[2])
+		// Pass the decoded segment. The raw-base64-url alphabet
+		// (A-Z a-z 0-9 - _) doesn't need percent-encoding, but
+		// padded base64-url uses `=` which clients may URL-escape
+		// to %3D (encodeURIComponent does). The decoder accepts
+		// padded base64 as a fallback per decodeAdminItemKeySegment2's
+		// docstring; passing the raw segment would defeat that
+		// fallback and 400 on hand-crafted curl with %3D padding.
+		// Codex P2 on PR #813 r7 caught the regression.
+		h.handleItemResource(w, r, segments[0], segments[2])
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
 			"too many path segments")
@@ -758,6 +760,16 @@ func validateCreateTableRequest(in *CreateTableRequest) error {
 	// strictly better than discovering it later.
 	if strings.ContainsRune(in.TableName, '/') {
 		return errors.New("table_name must not contain '/'")
+	}
+	// Reject literal dot-segment names ("." / "..") symmetrically
+	// with decodeAndValidatePathSegment. Without this guard a
+	// table named "." would be creatable but every describe /
+	// delete / items URL for it would surface as 400 invalid_path
+	// (the dispatcher rejects decoded "." / ".." as path-traversal
+	// classes) — orphaned exactly like the slash case above
+	// (Codex P2 on PR #813 r5).
+	if in.TableName == "." || in.TableName == ".." {
+		return errors.New("table_name must not be \".\" or \"..\"")
 	}
 	if err := validateAttribute(in.PartitionKey, "partition_key"); err != nil {
 		return err

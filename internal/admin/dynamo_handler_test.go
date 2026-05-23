@@ -440,6 +440,40 @@ func TestDynamoHandler_CreateTable_WhitespaceOnlyNameRejected(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "table_name is required")
 }
 
+// TestDynamoHandler_CreateTable_RejectsDotSegmentNames pins the
+// symmetry Codex P2 on PR #813 r5 flagged: dispatchPerTableRoute
+// rejects decoded "." and ".." segments (dot-segment traversal
+// class), but validateCreateTableRequest let those names through.
+// A table created with name="." or name=".." would be orphaned —
+// successfully stored, but every describe/delete/items URL would
+// 400 invalid_path because the dispatcher rejects the segment
+// before the source is reached. Mirrors the slash-rejection guard
+// already in validateCreateTableRequest (PR #634).
+func TestDynamoHandler_CreateTable_RejectsDotSegmentNames(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"single dot", `{"table_name":".","partition_key":{"name":"id","type":"S"}}`},
+		{"double dot", `{"table_name":"..","partition_key":{"name":"id","type":"S"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &stubTablesSource{tables: map[string]*DynamoTableSummary{}}
+			h := newDynamoHandlerForTest(src)
+			req := httptest.NewRequest(http.MethodPost, pathDynamoTables, strings.NewReader(tc.raw))
+			req = withWritePrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code,
+				"dot-segment table name must be rejected at create time; got %d body=%s",
+				rec.Code, rec.Body.String())
+			require.Empty(t, src.lastCreateInput.TableName,
+				"source must not be touched on dot-segment name")
+		})
+	}
+}
+
 // TestDynamoHandler_CreateTable_LiveRoleRevocation covers Codex P1
 // on PR #635: a session JWT with role=full from before a config
 // reload must NOT keep mutating after the access key is revoked
