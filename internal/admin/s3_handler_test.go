@@ -121,6 +121,28 @@ func (s *stubBucketsSource) AdminDeleteBucket(_ context.Context, principal AuthP
 	return nil
 }
 
+// Object-level Phase 3b methods are stubbed out here so the
+// existing bucket-tier tests can keep using stubBucketsSource
+// without compile errors. The s3_objects_handler_test.go file
+// embeds stubBucketsSource into a richer fake (stubObjectsSource)
+// that overrides these four methods with the in-memory store the
+// object tests need.
+func (s *stubBucketsSource) AdminListObjects(_ context.Context, _ AuthPrincipal, _ string, _ AdminListObjectsOptions) (AdminObjectListing, error) {
+	return AdminObjectListing{}, errors.New("stubBucketsSource.AdminListObjects: not implemented (use stubObjectsSource)")
+}
+
+func (s *stubBucketsSource) AdminGetObject(_ context.Context, _ AuthPrincipal, _, _ string) (io.ReadCloser, AdminObject, error) {
+	return nil, AdminObject{}, errors.New("stubBucketsSource.AdminGetObject: not implemented (use stubObjectsSource)")
+}
+
+func (s *stubBucketsSource) AdminPutObject(_ context.Context, _ AuthPrincipal, _, _ string, _ io.Reader, _ string) error {
+	return errors.New("stubBucketsSource.AdminPutObject: not implemented (use stubObjectsSource)")
+}
+
+func (s *stubBucketsSource) AdminDeleteObject(_ context.Context, _ AuthPrincipal, _, _ string) error {
+	return errors.New("stubBucketsSource.AdminDeleteObject: not implemented (use stubObjectsSource)")
+}
+
 func newS3HandlerForTest(src BucketsSource) *S3Handler {
 	return NewS3Handler(src)
 }
