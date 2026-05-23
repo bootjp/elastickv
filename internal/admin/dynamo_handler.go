@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,6 +71,16 @@ type TablesSource interface {
 	AdminDescribeTable(ctx context.Context, name string) (*DynamoTableSummary, bool, error)
 	AdminCreateTable(ctx context.Context, principal AuthPrincipal, in CreateTableRequest) (*DynamoTableSummary, error)
 	AdminDeleteTable(ctx context.Context, principal AuthPrincipal, name string) error
+
+	// Item-level admin RPCs (Phase 3a — design §3.1.1).
+	// The handler in dynamo_items_handler.go drives these for the
+	// /tables/{name}/items{,/{key}} sub-tree. Implementations live
+	// in main_admin.go (dynamoTablesBridge) and bridge to the
+	// adapter package's Admin*Item methods.
+	AdminScanItems(ctx context.Context, principal AuthPrincipal, table string, opts AdminScanItemsOptions) (AdminScanItemsResult, error)
+	AdminGetItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) (*AdminItem, bool, error)
+	AdminPutItem(ctx context.Context, principal AuthPrincipal, table string, item AdminItem) error
+	AdminDeleteItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) error
 }
 
 // CreateTableRequest is the JSON body shape for POST /tables per
@@ -241,18 +252,146 @@ func (h *DynamoHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or POST")
 		}
 	case strings.HasPrefix(r.URL.Path, pathPrefixDynamoTables):
-		name := strings.TrimPrefix(r.URL.Path, pathPrefixDynamoTables)
-		switch r.Method {
-		case http.MethodGet:
-			h.handleDescribe(w, r, name)
-		case http.MethodDelete:
-			h.handleDelete(w, r, name)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
-		}
+		h.dispatchPerTableRoute(w, r)
 	default:
 		writeJSONError(w, http.StatusNotFound, "not_found", "")
 	}
+}
+
+// dispatchPerTableRoute fans out the /tables/{name}{,/items{,/{key}}}
+// sub-tree. Splits the URL suffix into path segments and validates
+// each against the same dot-segment / percent-encoding rejection
+// the SQS handler adopted (no `..`, no `.`, no `%`-escaped path
+// segments). The validation is up-front so a malformed `{name}` or
+// `{key}` cannot reach the Admin* methods.
+//
+//	1 seg  → /tables/{name}              (existing describe / delete)
+//	2 segs → /tables/{name}/items        (Phase 3a: scan)
+//	3 segs → /tables/{name}/items/{key}  (Phase 3a: get / put / delete)
+//
+// Anything else is a 404. The second segment is required to be the
+// literal "items" string; any other sub-resource name is also a
+// 404 (the SPA never targets one).
+// Per-table route segment counts. Named to keep the dispatcher
+// switch self-documenting and to satisfy the mnd linter (which
+// flags magic 2/3 in case-labels).
+const (
+	dynamoRouteSegmentsTable           = 1
+	dynamoRouteSegmentsItemsCollection = 2
+	dynamoRouteSegmentsItemResource    = 3
+)
+
+func (h *DynamoHandler) dispatchPerTableRoute(w http.ResponseWriter, r *http.Request) {
+	// EscapedPath() exposes percent-encoded segments verbatim so the
+	// decode+validate step in decodeAndValidatePathSegment can
+	// distinguish raw `/` (path separator) from `%2F` (a literal `/`
+	// the operator URL-escaped) — both must be rejected as segment
+	// content. r.URL.Path is pre-decoded and would silently turn
+	// `%2F` into a real `/`, collapsing two distinct attack classes
+	// into one.
+	escaped := r.URL.EscapedPath()
+	rest := strings.TrimPrefix(escaped, pathPrefixDynamoTables)
+	rawSegments := dropSingleTrailingEmpty(strings.Split(rest, "/"))
+	segments := make([]string, 0, len(rawSegments))
+	for _, seg := range rawSegments {
+		decoded, ok := decodeAndValidatePathSegment(seg)
+		if !ok {
+			writeJSONError(w, http.StatusBadRequest, "invalid_path",
+				"path segment is empty, malformed percent-encoding, contains an encoded slash, or is a dot-segment")
+			return
+		}
+		segments = append(segments, decoded)
+	}
+	switch len(segments) {
+	case dynamoRouteSegmentsTable:
+		h.dispatchTableResource(w, r, segments[0])
+	case dynamoRouteSegmentsItemsCollection:
+		if segments[1] != adminItemSubResource {
+			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+				"unknown sub-resource on this table")
+			return
+		}
+		h.handleItemsCollection(w, r, segments[0])
+	case dynamoRouteSegmentsItemResource:
+		if segments[1] != adminItemSubResource {
+			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+				"unknown sub-resource on this table")
+			return
+		}
+		// Pass the decoded segment. The raw-base64-url alphabet
+		// (A-Z a-z 0-9 - _) doesn't need percent-encoding, but
+		// padded base64-url uses `=` which clients may URL-escape
+		// to %3D (encodeURIComponent does). The decoder accepts
+		// padded base64 as a fallback per decodeAdminItemKeySegment2's
+		// docstring; passing the raw segment would defeat that
+		// fallback and 400 on hand-crafted curl with %3D padding.
+		// Codex P2 on PR #813 r7 caught the regression.
+		h.handleItemResource(w, r, segments[0], segments[2])
+	default:
+		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+			"too many path segments")
+	}
+}
+
+// dispatchTableResource handles /tables/{name}: GET = describe,
+// DELETE = delete. Extracted from dispatchPerTableRoute so the
+// parent stays under the cyclop=10 ceiling.
+func (h *DynamoHandler) dispatchTableResource(w http.ResponseWriter, r *http.Request, name string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.handleDescribe(w, r, name)
+	case http.MethodDelete:
+		h.handleDelete(w, r, name)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
+	}
+}
+
+// decodeAndValidatePathSegment is the canonical per-segment guard
+// for the dynamo dispatcher. Codex P1 on PR #813 narrowed the
+// original SQS-style "reject any %" rule, which made tables whose
+// names need URL-escaping (spaces, UTF-8, etc.) unreachable through
+// describe / delete / items even though validateCreateTableRequest
+// accepts those names.
+//
+// The new contract: percent-encoded chars are accepted, but the
+// decoded form is what gets validated.
+//
+//   - empty raw segment → reject
+//   - malformed percent-encoding (`%g`, dangling `%`) → reject
+//   - decoded `/` (e.g. `%2F`, `%2f`) → reject (closes the
+//     percent-encoded path-traversal class)
+//   - decoded `.` or `..` (e.g. raw `.`, `%2e`, `%2e%2e`, `%2E`) →
+//     reject (closes the raw + percent-encoded dot-segment class)
+//
+// Returns the decoded segment on success. The caller passes the
+// decoded form to the per-resource handlers so a URL like
+// `/tables/foo%20bar` reaches AdminDescribeTable with "foo bar"
+// rather than "foo%20bar".
+//
+// Note on double-encoding: `%252F` decodes to `%2F` (a literal
+// percent-2F), not to `/`. That's correct — `%252F` is the
+// percent-encoded form of the string "%2F", which is itself
+// non-traversal content. The decoded `%2F` does not contain a
+// literal `/`, so the slash check passes. Only a single layer of
+// percent-encoded slash is rejected, matching the actual attack
+// class (a single-encoded slash that bypasses the literal `/`
+// split).
+func decodeAndValidatePathSegment(seg string) (string, bool) {
+	if seg == "" {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(seg)
+	if err != nil {
+		return "", false
+	}
+	if strings.ContainsRune(decoded, '/') {
+		return "", false
+	}
+	if decoded == "." || decoded == ".." {
+		return "", false
+	}
+	return decoded, true
 }
 
 // dynamoListResponse is the JSON shape returned by GET /tables.
@@ -621,6 +760,16 @@ func validateCreateTableRequest(in *CreateTableRequest) error {
 	// strictly better than discovering it later.
 	if strings.ContainsRune(in.TableName, '/') {
 		return errors.New("table_name must not contain '/'")
+	}
+	// Reject literal dot-segment names ("." / "..") symmetrically
+	// with decodeAndValidatePathSegment. Without this guard a
+	// table named "." would be creatable but every describe /
+	// delete / items URL for it would surface as 400 invalid_path
+	// (the dispatcher rejects decoded "." / ".." as path-traversal
+	// classes) — orphaned exactly like the slash case above
+	// (Codex P2 on PR #813 r5).
+	if in.TableName == "." || in.TableName == ".." {
+		return errors.New("table_name must not be \".\" or \"..\"")
 	}
 	if err := validateAttribute(in.PartitionKey, "partition_key"); err != nil {
 		return err

@@ -166,6 +166,19 @@ func (h *S3Handler) handleObjectGet(w http.ResponseWriter, r *http.Request, buck
 		h.writeObjectsError(w, r, "get", bucket, err)
 		return
 	}
+	// Defensive nil guard: an adapter that mis-implements the
+	// (nil-body, nil-err) contract would panic on the defer
+	// body.Close() below. Surface a 500 instead and log so the
+	// regression is operator-visible (Claude review on PR #814 r1).
+	if body == nil {
+		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 get object: adapter returned nil body with nil error",
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "s3_get_failed",
+			"adapter returned nil body; see server logs")
+		return
+	}
 	defer func() {
 		if cerr := body.Close(); cerr != nil {
 			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 get object body close failed",
@@ -341,13 +354,30 @@ const (
 // ---------- principal helpers ----------
 
 // principalForObjectRead is the read-side companion to principalForWrite
-// for the object-content paths. Same live-role re-check as the SPA-
-// facing endpoints — payload is object bytes, so AllowsRead (RoleReadOnly
-// OR RoleFull) is the right gate.
+// for the object-content paths. Same defence-in-depth gate as
+// principalForWrite — the JWT role check fires unconditionally
+// before the optional live-role re-validation, so a token minted
+// with role=none (or one that drifted past a revocation) cannot
+// slip through even when the live RoleStore says the access key
+// is now allowed (Claude review on PR #814 r2 caught the
+// asymmetry between principalForObjectRead and principalForWrite
+// — the latter has had this pattern since PR #669, the former
+// shipped without it).
+//
+// AllowsRead (RoleReadOnly OR RoleFull) is the right gate for
+// object-content reads.
 func (h *S3Handler) principalForObjectRead(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
 		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
+		return AuthPrincipal{}, false
+	}
+	// JWT role gate fires first, unconditionally. The live re-check
+	// below can only further constrain — it can never relax what
+	// the token was minted with.
+	if !principal.Role.AllowsRead() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this access key is not authorised to read object contents")
 		return AuthPrincipal{}, false
 	}
 	if h.roles != nil {
@@ -357,11 +387,10 @@ func (h *S3Handler) principalForObjectRead(w http.ResponseWriter, r *http.Reques
 				"this access key is not authorised to read object contents")
 			return AuthPrincipal{}, false
 		}
+		// Use the live role downstream — the JWT may carry a stale
+		// value but the live one is authoritative once both gates
+		// agree the request is allowed.
 		principal.Role = live
-	} else if !principal.Role.AllowsRead() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to read object contents")
-		return AuthPrincipal{}, false
 	}
 	return principal, true
 }
@@ -427,6 +456,22 @@ func decodeAdminObjectKeySegment(w http.ResponseWriter, segment string) (string,
 // writeObjectsError translates the sentinel errors the bridge
 // surfaces into the canonical HTTP status + body shape. Mirrors
 // writeBucketsError but with the object-tier sentinels.
+//
+// Leader forwarding: the bucket-tier writes (CreateBucket /
+// PutBucketAcl / DeleteBucket) hand a follower's NotLeader off
+// to the leader via LeaderForwarder.ForwardXxx so the SPA never
+// observes a 503 on those routes. The object-tier endpoints
+// (ListObjects / GetObject / PutObject / DeleteObject) DO NOT
+// have this transparent fall-through yet — the same pattern the
+// SQS handler ships with today. The reason: GetObject and
+// PutObject stream bodies up to 100 MiB, which doesn't fit the
+// existing unary `bytes Payload` AdminForward proto. Wiring
+// streaming RPCs is a separate PR-scoped change (proto, server,
+// client, bridge, all four object ops); for now followers reply
+// 503 + Retry-After: 1 and the SPA's retry helper re-issues
+// against the leader via the leader-probe endpoint. Codex P1 on
+// PR #814 r3 flagged this; tracked as a follow-up rather than
+// expanding this PR by ~5 packages.
 func (h *S3Handler) writeObjectsError(w http.ResponseWriter, r *http.Request, op, bucket string, err error) {
 	switch {
 	case errors.Is(err, ErrObjectsForbidden):

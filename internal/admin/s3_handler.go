@@ -104,20 +104,23 @@ func (h *S3Handler) WithLeaderForwarder(f LeaderForwarder) *S3Handler {
 // ServeHTTP routes /buckets, /buckets/{name}, /buckets/{name}/acl,
 // /buckets/{name}/objects, and /buckets/{name}/objects/{key-b64url}.
 //
-// The Phase-3b additions adopt the same escape-aware routing the
-// SQS handler uses: r.URL.EscapedPath() is consulted so a
-// percent-encoded segment (`%2F`, `%2E%2E`, `%252F`) is rejected
-// before any decode pass. The /buckets, /buckets/{name}, and
-// /buckets/{name}/acl branches stay on the original path-based
-// dispatch so the existing handler tests don't churn — keys are
-// always base64-url-encoded by the SPA and so never carry `%` or
-// dot-segments on the wire.
+// EscapedPath() is the authoritative input — net/http pre-decodes
+// the raw path into r.URL.Path, turning `%2F` into a literal `/`
+// and splitting a single bucket segment across the route. The
+// confused-deputy class: a URL like `/buckets/victim%2Fobjects/{key}`
+// would (without EscapedPath) route to bucket "victim" rather than
+// the literal-named "victim/objects" segment, executing the
+// requested op against the wrong bucket. servePerBucket operates
+// on the escaped form so the encoded-slash and encoded-dot
+// traversal classes stay closed across all four sub-trees
+// (Codex P1 on PR #814).
 func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	escaped := r.URL.EscapedPath()
 	switch {
-	case r.URL.Path == pathS3Buckets:
+	case escaped == pathS3Buckets:
 		h.serveCollection(w, r)
-	case strings.HasPrefix(r.URL.Path, pathPrefixS3Buckets):
-		h.servePerBucket(w, r)
+	case strings.HasPrefix(escaped, pathPrefixS3Buckets):
+		h.servePerBucket(w, r, escaped)
 	default:
 		writeJSONError(w, http.StatusNotFound, "not_found", "")
 	}
@@ -147,8 +150,8 @@ func (h *S3Handler) serveCollection(w http.ResponseWriter, r *http.Request) {
 // pointed at a hypothetical /buckets/{name}/policy sees an
 // unambiguous "no handler" rather than the describe path
 // silently swallowing the suffix.
-func (h *S3Handler) servePerBucket(w http.ResponseWriter, r *http.Request) {
-	tail := strings.TrimPrefix(r.URL.Path, pathPrefixS3Buckets)
+func (h *S3Handler) servePerBucket(w http.ResponseWriter, r *http.Request, escaped string) {
+	tail := strings.TrimPrefix(escaped, pathPrefixS3Buckets)
 	if tail == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_bucket_name",
 			"bucket name is empty")
@@ -206,10 +209,11 @@ func (h *S3Handler) dispatchACLSubresource(w http.ResponseWriter, r *http.Reques
 //   - bucket name must be non-empty and slash-free (otherwise
 //     reject via the standard 404 fallthrough)
 //   - the literal "objects" sub-resource must be present
-//   - for the per-object route, the residual segment must not be
-//     empty (a trailing `/objects/` with no key is the collection
-//     shape, but we surface that as a 404 since the SPA never
-//     constructs it and a typo should be loud)
+//   - a residual that is empty OR has a leading slash is the
+//     objects route: empty returns (name, "", true) so the
+//     dispatcher routes to handleObjectsCollection (same shape
+//     as /buckets/{name}/objects); a leading-slash residual
+//     returns (name, key, true) for the per-object route
 //
 // The {key} validator (no `%`, no dot-segments) runs in the
 // object handler's segment decoder rather than here so the route
@@ -238,10 +242,11 @@ func splitBucketObjectsRoute(tail string) (string, string, bool) {
 }
 
 // dispatchObjectsSubtree routes the two recognised object-tier
-// shapes. The per-object segment is checked for emptiness here
-// (the splitter already accepts `name/objects/`); we surface that
-// as 400 invalid_path rather than misfiring into the collection
-// handler.
+// shapes. An empty sub is the collection route (matches the
+// splitter's name/objects/ trailing-slash shape with /buckets/
+// {name}/objects). A sub containing `/` is a malformed key
+// segment (the SPA base64-url-encodes the key so there should
+// be no embedded slash) and rejects with 400 invalid_path.
 func (h *S3Handler) dispatchObjectsSubtree(w http.ResponseWriter, r *http.Request, name, sub string) {
 	switch {
 	case sub == "":
