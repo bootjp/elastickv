@@ -74,7 +74,11 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
     };
   }, []);
 
-  const loadPage = async (cursor: string | undefined) => {
+  // loadPage returns true on success, false on error / cancellation.
+  // Callers (onNextPage) inspect the boolean to decide whether to
+  // advance the cursor — matches the S3 ObjectsTab pattern from
+  // PR #816 r1 so the two tabs share one cursor-advance contract.
+  const loadPage = async (cursor: string | undefined): Promise<boolean> => {
     scanAbortRef.current?.abort();
     const ctrl = new AbortController();
     scanAbortRef.current = ctrl;
@@ -84,18 +88,18 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
       const result = await api.scanItems(table, { limit: pageSize, next_cursor: cursor }, ctrl.signal);
       // A second loadPage() may have replaced scanAbortRef before
       // we get here; ignore the resolved value of the obsolete
-      // request to keep `page` aligned with the latest call. The
-      // AbortError path below covers the symmetric case where the
-      // fetch itself errored out from the abort.
-      if (scanAbortRef.current !== ctrl) return;
+      // request to keep `page` aligned with the latest call.
+      if (scanAbortRef.current !== ctrl) return false;
       setPage(result);
+      return true;
     } catch (err) {
-      if (scanAbortRef.current !== ctrl) return;
+      if (scanAbortRef.current !== ctrl) return false;
       // AbortError is the cancellation signal — not a user-visible
       // failure; suppress it so the operator's manual Refresh
       // immediately after a Next page click doesn't show "aborted".
-      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (err instanceof DOMException && err.name === "AbortError") return false;
       setLoadError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
+      return false;
     } finally {
       if (scanAbortRef.current === ctrl) {
         setLoading(false);
@@ -103,19 +107,41 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
     }
   };
 
-  // Initial load + page-size change refetches from the start.
+  // Initial load + page-size change refetches from the start AND
+  // resets the modal. useApiQuery in the parent DynamoDetail page
+  // does NOT clear data on dep change, so this component stays
+  // mounted across /dynamo/tables/A → /dynamo/tables/B navigation.
+  // Without the explicit modal reset, an open detail modal would
+  // retain modalKey from table A while the table prop is now B —
+  // onSave would then call api.putItem(B, keyFromA, body), silently
+  // overwriting a colliding key in table B. Same cross-context
+  // class as the S3 ObjectsTab detail-modal-on-bucket-change fix
+  // (PR #816 r4). Inlined rather than calling closeModalForce
+  // (declared later) to keep the effect self-contained.
   useEffect(() => {
     setCurrentCursor(undefined);
+    setModalMode(null);
+    setModalItem(null);
+    setModalKey(null);
+    setModalError(null);
     void loadPage(undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [table, pageSize]);
 
-  const onNextPage = () => {
+  const onNextPage = async () => {
     const next = page?.last_evaluated_key;
     if (!next) return;
+    // Advance currentCursor only after the fetch succeeds.
+    // Matches the S3 ObjectsTab pattern: a transient failure must
+    // not leave the UI on a cursor that no longer corresponds to
+    // the rendered page (Refresh would then re-fetch the failed
+    // page rather than the still-shown one). The comment on
+    // currentCursor's useState above promises this contract.
     const cursor = encodeAdminItemKey(next);
-    setCurrentCursor(cursor);
-    void loadPage(cursor);
+    const ok = await loadPage(cursor);
+    if (ok) {
+      setCurrentCursor(cursor);
+    }
   };
 
   const onRefresh = () => {
@@ -266,13 +292,19 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
           </thead>
           <tbody>
             {page!.items.map((item) => (
-              // Primary key uniqueness is guaranteed by DynamoDB's
-              // table semantics, so it's a more stable React key
-              // than the array index — re-ordering a page (server
-              // changed scan iteration order) doesn't churn rows
-              // (Gemini medium on PR #815).
+              // React key is the encoded primary key — guaranteed
+              // unique within a DynamoDB scan page. describePrimaryKey
+              // (which we used before) renders binary values as
+              // "<binary ~NB>" and collides when two distinct binary
+              // keys share the same byte length, so two different
+              // rows would render with the same React key and
+              // reconciliation could bind onOpen to the wrong item
+              // (Claude review on PR #815 r2). encodeAdminItemKey
+              // returns the full base64url-encoded JSON of the key
+              // map, which encodes binary bytes verbatim and is
+              // collision-free.
               <ItemRow
-                key={describePrimaryKey(item, partitionKey, sortKey)}
+                key={encodeAdminItemKey(extractPrimaryKey(item, partitionKey, sortKey) ?? {})}
                 item={item}
                 partitionKey={partitionKey}
                 sortKey={sortKey}
