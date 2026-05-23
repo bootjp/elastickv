@@ -582,3 +582,98 @@ func TestDynamoItems_TranslatesSentinelsToStatus(t *testing.T) {
 		})
 	}
 }
+
+// ---------- body-validation defence-in-depth (Gemini medium on PR #813) ----------
+
+// TestDynamoItems_AttributeValue_EmptyContainersRoundTrip locks down
+// that an item carrying an empty L or M attribute serializes with
+// the type tag still present (`{"L":[]}` / `{"M":{}}`) rather than
+// disappearing under omitempty. Without this the SPA cannot
+// distinguish a "list of zero elements" attribute from "no L field
+// at all" (a different attribute kind entirely).
+func TestDynamoItems_AttributeValue_EmptyContainersRoundTrip(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		input   AdminAttributeValue
+		wantSub string
+	}{
+		{
+			name:    "empty list keeps L tag",
+			input:   AdminAttributeValue{L: []AdminAttributeValue{}},
+			wantSub: `"L":[]`,
+		},
+		{
+			name:    "empty map keeps M tag",
+			input:   AdminAttributeValue{M: map[string]AdminAttributeValue{}},
+			wantSub: `"M":{}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := json.Marshal(tc.input)
+			require.NoError(t, err)
+			require.Contains(t, string(out), tc.wantSub,
+				"empty container attribute must round-trip through JSON")
+		})
+	}
+}
+
+// TestDynamoItems_Put_RejectsNULBytePayload guards against the
+// payload-smuggling vector goccy/go-json exhibits with NUL bytes —
+// a `{"attributes":...}\x00{"extra":1}` body would otherwise sneak
+// the second object past the decoder. Same shape as the
+// decodeCreateTableRequest test on /tables (Codex P2 on PR #634).
+func TestDynamoItems_Put_RejectsNULBytePayload(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	h := newDynamoHandlerForTest(src)
+	key := map[string]AdminAttributeValue{"pk": stringAttr("k1")}
+
+	body := []byte(`{"attributes":{"pk":{"S":"k1"}}}` + "\x00" + `{"extra":1}`)
+	req := httptest.NewRequest(http.MethodPut, itemPath("orders", key, t),
+		bytes.NewReader(body))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "NUL")
+}
+
+// TestDynamoItems_Put_RejectsTrailingJSONData mirrors
+// decodeCreateTableRequest: a body like `{"attributes":...}{"a":1}`
+// must surface 400 rather than silently accepting the first object
+// and dropping the second.
+func TestDynamoItems_Put_RejectsTrailingJSONData(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	h := newDynamoHandlerForTest(src)
+	key := map[string]AdminAttributeValue{"pk": stringAttr("k1")}
+
+	body := []byte(`{"attributes":{"pk":{"S":"k1"}}}{"extra":1}`)
+	req := httptest.NewRequest(http.MethodPut, itemPath("orders", key, t),
+		bytes.NewReader(body))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "trailing data")
+}
+
+// TestDynamoItems_Put_RejectsEmptyBody pins the existing nil-body
+// rejection contract — the io.ReadAll path returns 0 bytes which
+// would otherwise decode to a zero-value AdminItem (Attributes:
+// nil) and confuse the body/path-key reconciler.
+func TestDynamoItems_Put_RejectsEmptyBody(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	h := newDynamoHandlerForTest(src)
+	key := map[string]AdminAttributeValue{"pk": stringAttr("k1")}
+
+	req := httptest.NewRequest(http.MethodPut, itemPath("orders", key, t),
+		bytes.NewReader(nil))
+	req = withWritePrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+}

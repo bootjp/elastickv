@@ -1,10 +1,13 @@
 package admin
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -52,6 +55,12 @@ const (
 // the adapter dependency; the main_admin.go bridge converts
 // between this type and adapter.AdminAttributeValue field-for-
 // field.
+// Struct tags here are the wire-shape contract. MarshalJSON
+// overrides them to preserve the empty-but-present L/M distinction
+// (`{"L":[]}` and `{"M":{}}` are valid, type-bearing AttributeValue
+// shapes in DynamoDB; the SPA needs both shapes to render correctly).
+// UnmarshalJSON uses the default behaviour — a JSON `"L":[]` parses
+// to a non-nil zero-length slice via the tag.
 type AdminAttributeValue struct {
 	S    *string                        `json:"S,omitempty"`
 	N    *string                        `json:"N,omitempty"`
@@ -63,6 +72,61 @@ type AdminAttributeValue struct {
 	BS   [][]byte                       `json:"BS,omitempty"`
 	L    []AdminAttributeValue          `json:"L,omitempty"`
 	M    map[string]AdminAttributeValue `json:"M,omitempty"`
+}
+
+// MarshalJSON preserves the kind distinction between "no L/M field"
+// (nil slice/map) and "empty L/M field" (non-nil zero-length slice/map).
+// A stock json.Marshal with omitempty would collapse both into the
+// same wire shape, losing the type tag for an explicitly-empty list
+// or map — and an explicitly-empty list is a legitimate DynamoDB
+// AttributeValue ({"L":[]}). Gemini medium on PR #813.
+//
+// Mirrors the adapter package's AdminAttributeValue.MarshalJSON
+// invariant in the same way, except this side does not enforce the
+// "exactly-one-field" kind check (the bridge in main_admin.go calls
+// into the adapter, which performs that validation as part of its
+// own marshal-time depth/kind audit). Imposing the kind check here
+// too would reject legitimate responses constructed by tests where
+// a zero-value attribute is intentionally produced.
+//
+//nolint:cyclop // ten attribute kinds × per-kind nil-presence check
+func (a AdminAttributeValue) MarshalJSON() ([]byte, error) {
+	obj := make(map[string]any, 1)
+	if a.S != nil {
+		obj["S"] = *a.S
+	}
+	if a.N != nil {
+		obj["N"] = *a.N
+	}
+	if a.B != nil {
+		obj["B"] = a.B
+	}
+	if a.BOOL != nil {
+		obj["BOOL"] = *a.BOOL
+	}
+	if a.NULL != nil {
+		obj["NULL"] = *a.NULL
+	}
+	if a.SS != nil {
+		obj["SS"] = a.SS
+	}
+	if a.NS != nil {
+		obj["NS"] = a.NS
+	}
+	if a.BS != nil {
+		obj["BS"] = a.BS
+	}
+	if a.L != nil {
+		obj["L"] = a.L
+	}
+	if a.M != nil {
+		obj["M"] = a.M
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, errors.New("marshal AdminAttributeValue: " + err.Error())
+	}
+	return out, nil
 }
 
 // AdminItem is one row as the SPA sees it.
@@ -170,10 +234,13 @@ func (h *DynamoHandler) handleItemPut(w http.ResponseWriter, r *http.Request, ta
 	if !ok {
 		return
 	}
-	var item AdminItem
-	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid_request",
-			"request body is not a valid AdminItem JSON object")
+	item, err := decodeAdminItemBody(r.Body)
+	if err != nil {
+		if errors.Is(err, errCreateBodyTooLarge) {
+			WriteMaxBytesError(w)
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if err := assertItemBodyMatchesPathKey(item, key); err != nil {
@@ -185,6 +252,43 @@ func (h *DynamoHandler) handleItemPut(w http.ResponseWriter, r *http.Request, ta
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// decodeAdminItemBody is the PUT body parser. Same defence-in-depth
+// shape as decodeCreateTableRequest in dynamo_handler.go: read the
+// full body (BodyLimit middleware caps it), reject NUL bytes
+// (goccy/go-json treats raw NUL as end-of-input, which would
+// otherwise allow `{"attributes":...}\x00{"extra":1}` smuggling),
+// decode strictly with DisallowUnknownFields, then reject any
+// trailing JSON tokens. Codex P2 on PR #634 / Gemini medium on PR
+// #813.
+func decodeAdminItemBody(body io.Reader) (AdminItem, error) {
+	if body == nil {
+		return AdminItem{}, errors.New("request body is empty")
+	}
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		if IsMaxBytesError(err) {
+			return AdminItem{}, errCreateBodyTooLarge
+		}
+		return AdminItem{}, errors.New("request body could not be read")
+	}
+	if len(raw) == 0 {
+		return AdminItem{}, errors.New("request body is empty")
+	}
+	if bytes.IndexByte(raw, 0) >= 0 {
+		return AdminItem{}, errors.New("request body contains a NUL byte")
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var out AdminItem
+	if err := dec.Decode(&out); err != nil {
+		return AdminItem{}, errors.New("request body is not a valid AdminItem JSON object")
+	}
+	if dec.More() {
+		return AdminItem{}, errors.New("request body has trailing data after the JSON object")
+	}
+	return out, nil
 }
 
 func (h *DynamoHandler) handleItemDelete(w http.ResponseWriter, r *http.Request, table string, key map[string]AdminAttributeValue) {
@@ -346,22 +450,17 @@ func attributeValuesEqual(a, b AdminAttributeValue) bool {
 	if !boolPtrEqual(a.BOOL, b.BOOL) || !boolPtrEqual(a.NULL, b.NULL) {
 		return false
 	}
-	if !bytesEqual(a.B, b.B) {
+	if !bytes.Equal(a.B, b.B) {
 		return false
 	}
-	if !stringSliceEqual(a.SS, b.SS) || !stringSliceEqual(a.NS, b.NS) {
+	if !slices.Equal(a.SS, b.SS) || !slices.Equal(a.NS, b.NS) {
 		return false
 	}
-	if !byteSliceSliceEqual(a.BS, b.BS) {
+	if !slices.EqualFunc(a.BS, b.BS, bytes.Equal) {
 		return false
 	}
-	if len(a.L) != len(b.L) {
+	if !slices.EqualFunc(a.L, b.L, attributeValuesEqual) {
 		return false
-	}
-	for i := range a.L {
-		if !attributeValuesEqual(a.L[i], b.L[i]) {
-			return false
-		}
 	}
 	if len(a.M) != len(b.M) {
 		return false
@@ -387,42 +486,6 @@ func boolPtrEqual(a, b *bool) bool {
 		return a == b
 	}
 	return *a == *b
-}
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func stringSliceEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func byteSliceSliceEqual(a, b [][]byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !bytesEqual(a[i], b[i]) {
-			return false
-		}
-	}
-	return true
 }
 
 // writeItemsError translates the sentinel errors the bridge
