@@ -119,6 +119,17 @@ export function DynamoItemsTab({ table, partitionKey, sortKey }: DynamoItemsTabP
   // (PR #816 r4). Inlined rather than calling closeModalForce
   // (declared later) to keep the effect self-contained.
   useEffect(() => {
+    // setPage(null) hides stale rows during the loading window so
+    // the operator cannot click on the previous context's items
+    // while the new scan is in flight. The parent (DynamoDetail)
+    // already remounts this component on table change via
+    // key={name}, so the table-switch case is covered by the
+    // unmount — but a pageSize change keeps the component mounted
+    // and would otherwise leave the previous page-size's rows
+    // visible until the new scan resolves. Codex P1 on PR #815
+    // r4 caught this; mirrors the S3 ObjectsTab [bucket, prefix]
+    // effect (PR #816 r6).
+    setPage(null);
     setCurrentCursor(undefined);
     setModalMode(null);
     setModalItem(null);
