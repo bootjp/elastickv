@@ -585,6 +585,52 @@ func TestDynamoItems_TranslatesSentinelsToStatus(t *testing.T) {
 	}
 }
 
+// TestDynamoItems_Scan_JWTNoneRoleRejectedWhenLiveStoreGrantsRead
+// pins the principalForItemRead JWT-bypass fix from PR #813 r5.
+// Pre-fix, when a RoleStore was configured (h.roles != nil), the
+// JWT role check was skipped entirely and only the live store
+// was consulted — so a session whose JWT carried no read role
+// could pass through reads if the live store had since granted
+// the access key a read-or-higher role. The fix moves the JWT
+// gate ahead of the live check; both must permit the request
+// (defence-in-depth matching principalForWrite's contract).
+//
+// Pre-fix this assertion would have failed: live store grants
+// RoleReadOnly so the role-store branch accepted the request
+// and never re-checked the JWT's zero-value Role; the source's
+// AdminScanItems was invoked and returned 200 OK. Post-fix the
+// JWT check rejects first (Role="" doesn't satisfy AllowsRead)
+// and the source is never touched. Mirrors
+// TestDynamoHandler_CreateTable_LiveRoleRevocation in
+// dynamo_handler_test.go:448 (Claude review on PR #813 r5
+// flagged the missing test).
+func TestDynamoItems_Scan_JWTNoneRoleRejectedWhenLiveStoreGrantsRead(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	// Make the source return a recognisable success path so the
+	// pre-fix bug would surface as 200 (source reached) rather
+	// than a sentinel-induced status.
+	src.seedItem("orders", map[string]AdminAttributeValue{"pk": stringAttr("k1")},
+		AdminItem{Attributes: map[string]AdminAttributeValue{"pk": stringAttr("k1")}})
+	// Live role map says the access key has read access — but the
+	// JWT carries Role="" (zero value, neither read nor write).
+	roles := MapRoleStore{"AKIA_BYPASS": RoleReadOnly}
+	h := NewDynamoHandler(src).WithRoleStore(roles)
+
+	req := httptest.NewRequest(http.MethodGet,
+		pathDynamoTables+"/orders/items", nil)
+	// Inject a principal with the matching access key but no role
+	// on the JWT side. withReadOnlyPrincipal can't reproduce this —
+	// we need the JWT-without-read-role case the bypass relied on.
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_BYPASS", Role: ""}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code,
+		"JWT role with no read permission must be rejected even when the live store grants read access")
+}
+
 // TestDynamoItems_NotLeader503HasRetryAfterAndCanonicalCode pins
 // the items 503 contract to the same shape every other admin
 // surface uses: status 503, Retry-After: 1, error code
