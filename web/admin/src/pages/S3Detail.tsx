@@ -109,7 +109,22 @@ export function S3DetailPage() {
         </section>
       )}
 
-      {detail.data && <S3ObjectsTab bucket={name} />}
+      {detail.data && detail.data.bucket_name === name && (
+        // Only render the objects tab when the loaded describe
+        // response matches the current route param. useApiQuery
+        // keeps the previous bucket's `detail.data` around while
+        // a new fetch is in flight, so /s3/A → /s3/B briefly
+        // shows S3ObjectsTab with bucket=B while the describe
+        // response for B is still loading. The tab's own
+        // [bucket] effect already resets prefix/modal/cursor,
+        // but during the loading window stale rows from bucket
+        // A could remain visible and clickable (parallel of the
+        // PR #815 r4 DynamoDetail fix — same useApiQuery race
+        // shape). `key={name}` forces a fresh component instance
+        // on route change so React unmounts/remounts and the
+        // AbortController cleanup cancels any in-flight scan.
+        <S3ObjectsTab key={name} bucket={name} />
+      )}
 
       <Modal
         title="Delete bucket"
