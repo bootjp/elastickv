@@ -291,3 +291,153 @@ func TestS3Server_AdminPutObject_AcceptsNilBody(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, 0, rec.Body.Len())
 }
+
+// AdminGetObject tests
+
+func TestS3Server_AdminGetObject_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "downloads")
+	require.NoError(t, server.AdminPutObject(context.Background(),
+		fullAdminBucketsPrincipal(), "downloads", "report.txt",
+		strings.NewReader("hello, world"), "text/plain"))
+
+	body, meta, err := server.AdminGetObject(context.Background(),
+		fullAdminBucketsPrincipal(), "downloads", "report.txt")
+	require.NoError(t, err)
+	defer body.Close()
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, "hello, world", string(got))
+
+	require.Equal(t, "report.txt", meta.Key)
+	require.Equal(t, int64(len("hello, world")), meta.Size)
+	require.Equal(t, "text/plain", meta.ContentType)
+	require.NotEmpty(t, meta.ETag, "ETag must be set")
+	require.Equal(t, "STANDARD", meta.StorageClass)
+	require.False(t, meta.LastModified.IsZero(), "LastModified must be set")
+}
+
+func TestS3Server_AdminGetObject_StreamsMultipleChunks(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "bigfiles")
+
+	// Build a payload that crosses several s3ChunkSize boundaries
+	// so the reader hits the multi-chunk path.
+	payload := bytes.Repeat([]byte{0xab}, 3*s3ChunkSize+17)
+	require.NoError(t, server.AdminPutObject(context.Background(),
+		fullAdminBucketsPrincipal(), "bigfiles", "blob.bin",
+		bytes.NewReader(payload), "application/octet-stream"))
+
+	body, meta, err := server.AdminGetObject(context.Background(),
+		fullAdminBucketsPrincipal(), "bigfiles", "blob.bin")
+	require.NoError(t, err)
+	defer body.Close()
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, payload, got, "streamed body must match the uploaded bytes")
+	require.Equal(t, int64(len(payload)), meta.Size)
+}
+
+func TestS3Server_AdminGetObject_MissingObject(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "downloads")
+
+	_, _, err := server.AdminGetObject(context.Background(),
+		fullAdminBucketsPrincipal(), "downloads", "no-such-key")
+	require.True(t, errors.Is(err, ErrAdminObjectNotFound),
+		"want ErrAdminObjectNotFound; got %v", err)
+}
+
+func TestS3Server_AdminGetObject_MissingBucket(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	_, _, err := server.AdminGetObject(context.Background(),
+		fullAdminBucketsPrincipal(), "ghost", "k")
+	require.True(t, errors.Is(err, ErrAdminBucketNotFound),
+		"want ErrAdminBucketNotFound; got %v", err)
+}
+
+// TestS3Server_AdminGetObject_AllowsReadOnly pins the role contract:
+// read role suffices for GET (unlike Put / Delete which require
+// write). Important regression: if a future refactor accidentally
+// gates GET on canWrite() the read-only operator dashboard breaks.
+func TestS3Server_AdminGetObject_AllowsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "readable")
+	require.NoError(t, server.AdminPutObject(context.Background(),
+		fullAdminBucketsPrincipal(), "readable", "k", strings.NewReader("v"), "text/plain"))
+
+	body, _, err := server.AdminGetObject(context.Background(),
+		readOnlyAdminBucketsPrincipal(), "readable", "k")
+	require.NoError(t, err)
+	defer body.Close()
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.Equal(t, "v", string(got))
+}
+
+func TestS3Server_AdminGetObject_DefaultsContentType(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "ctype")
+	require.NoError(t, server.AdminPutObject(context.Background(),
+		fullAdminBucketsPrincipal(), "ctype", "blob", strings.NewReader("x"), ""))
+
+	_, meta, err := server.AdminGetObject(context.Background(),
+		fullAdminBucketsPrincipal(), "ctype", "blob")
+	require.NoError(t, err)
+	require.Equal(t, "application/octet-stream", meta.ContentType)
+}
+
+func TestS3Server_AdminGetObject_CloseIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "closes")
+	require.NoError(t, server.AdminPutObject(context.Background(),
+		fullAdminBucketsPrincipal(), "closes", "k", strings.NewReader("v"), "text/plain"))
+
+	body, _, err := server.AdminGetObject(context.Background(),
+		fullAdminBucketsPrincipal(), "closes", "k")
+	require.NoError(t, err)
+
+	require.NoError(t, body.Close())
+	require.NoError(t, body.Close(), "second Close must be a no-op")
+
+	// Read after Close returns ErrClosedPipe.
+	_, err = body.Read(make([]byte, 1))
+	require.Error(t, err, "Read after Close must error")
+}
+
+func TestS3Server_AdminGetObject_RejectsEmptyKey(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "anybucket")
+
+	_, _, err := server.AdminGetObject(context.Background(),
+		fullAdminBucketsPrincipal(), "anybucket", "")
+	require.True(t, errors.Is(err, ErrAdminInvalidObjectKey),
+		"want ErrAdminInvalidObjectKey; got %v", err)
+}

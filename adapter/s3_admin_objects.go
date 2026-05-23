@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -330,4 +331,212 @@ func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string,
 		return nil, 0, errors.WithStack(err)
 	}
 	return previous, meta.Generation, nil
+}
+
+// AdminObject is the admin-facing metadata projection. Mirrors the
+// fields the design doc §3.1.2 names — no internal-only state
+// (uploadID, chunk sizes, etc.) leaks to admin handlers / SPA.
+type AdminObject struct {
+	Key          string    `json:"key"`
+	Size         int64     `json:"size"`
+	ContentType  string    `json:"content_type"`
+	ETag         string    `json:"etag"`
+	LastModified time.Time `json:"last_modified"`
+	StorageClass string    `json:"storage_class"`
+}
+
+// AdminGetObject fetches one object's body + metadata. Read role
+// required. Returns (body, meta, nil) on success; the caller MUST
+// Close the body to release the read-tracker pin.
+//
+// Sentinels:
+//   - ErrAdminForbidden          — principal lacks read role
+//   - ErrAdminNotLeader          — follower
+//   - ErrAdminBucketNotFound     — bucket absent
+//   - ErrAdminObjectNotFound     — object absent
+//   - ErrAdminInvalidObjectKey   — empty key
+//   - ErrAdminInvalidBucketName  — malformed bucket name
+func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal, bucket, key string) (io.ReadCloser, AdminObject, error) {
+	if !principal.Role.canRead() {
+		return nil, AdminObject{}, ErrAdminForbidden
+	}
+	if !s.isVerifiedS3Leader(ctx) {
+		return nil, AdminObject{}, ErrAdminNotLeader
+	}
+	if key == "" {
+		return nil, AdminObject{}, ErrAdminInvalidObjectKey
+	}
+	if err := validateS3BucketName(bucket); err != nil {
+		return nil, AdminObject{}, errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
+	}
+
+	manifest, generation, readTS, readPin, err := s.adminLoadObjectForRead(ctx, bucket, key)
+	if err != nil {
+		return nil, AdminObject{}, err
+	}
+
+	body := newS3AdminObjectReader(ctx, s, bucket, generation, key, manifest, readTS, readPin)
+
+	adminMeta := AdminObject{
+		Key:          key,
+		Size:         manifest.SizeBytes,
+		ContentType:  manifest.ContentType,
+		ETag:         manifest.ETag,
+		LastModified: hlcToTime(manifest.LastModifiedHLC),
+		StorageClass: "STANDARD",
+	}
+	if adminMeta.ContentType == "" {
+		adminMeta.ContentType = "application/octet-stream"
+	}
+	return body, adminMeta, nil
+}
+
+// adminLoadObjectForRead centralises the read-path preamble after
+// the gate checks: pin the read timestamp, load the bucket meta,
+// load the object manifest. On any error path the pin is released
+// before returning so the caller never has to handle release on
+// the error path. On success the caller takes ownership of the
+// pin (typically by handing it to the streaming reader's Close).
+func (s *S3Server) adminLoadObjectForRead(ctx context.Context, bucket, key string) (*s3ObjectManifest, uint64, uint64, *kv.ActiveTimestampToken, error) {
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	releaseOnError := readPin
+	defer func() {
+		if releaseOnError != nil {
+			releaseOnError.Release()
+		}
+	}()
+
+	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
+	if err != nil {
+		return nil, 0, 0, nil, errors.WithStack(err)
+	}
+	if !exists || meta == nil {
+		return nil, 0, 0, nil, ErrAdminBucketNotFound
+	}
+
+	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, key)
+	manifest, found, err := s.loadObjectManifestAt(ctx, headKey, readTS)
+	if err != nil {
+		return nil, 0, 0, nil, errors.WithStack(err)
+	}
+	if !found || manifest == nil {
+		return nil, 0, 0, nil, ErrAdminObjectNotFound
+	}
+	releaseOnError = nil
+	return manifest, meta.Generation, readTS, readPin, nil
+}
+
+// s3AdminObjectReader streams an object's bytes by lazily fetching
+// chunks from the store. Memory bounded to one chunk (~s3ChunkSize)
+// regardless of total object size — the 100 MiB admin PUT cap
+// doesn't apply to GET (older objects predating the cap may be
+// larger).
+//
+// Lifecycle: holds a read-tracker pin (the readTS the manifest was
+// loaded at) so concurrent MVCC GC cannot reclaim chunks mid-read.
+// The pin is released by Close. Calling Close more than once is
+// safe (the underlying token's Release is idempotent on nil).
+type s3AdminObjectReader struct {
+	ctx        context.Context
+	server     *S3Server
+	bucket     string
+	generation uint64
+	key        string
+	manifest   *s3ObjectManifest
+	readTS     uint64
+	pin        *kv.ActiveTimestampToken
+
+	// Cursor state.
+	partIdx  int    // index into manifest.Parts
+	chunkIdx uint64 // index within Parts[partIdx].ChunkSizes
+	buf      []byte // unread bytes of the current chunk
+	closed   bool
+	err      error // sticky error after first Read failure
+}
+
+func newS3AdminObjectReader(
+	ctx context.Context,
+	server *S3Server,
+	bucket string,
+	generation uint64,
+	key string,
+	manifest *s3ObjectManifest,
+	readTS uint64,
+	pin *kv.ActiveTimestampToken,
+) *s3AdminObjectReader {
+	return &s3AdminObjectReader{
+		ctx:        ctx,
+		server:     server,
+		bucket:     bucket,
+		generation: generation,
+		key:        key,
+		manifest:   manifest,
+		readTS:     readTS,
+		pin:        pin,
+	}
+}
+
+func (r *s3AdminObjectReader) Read(p []byte) (int, error) {
+	if r.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := r.ensureBuffered(); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, io.EOF
+		}
+		r.err = err
+		return 0, err
+	}
+	n := copy(p, r.buf)
+	r.buf = r.buf[n:]
+	return n, nil
+}
+
+// ensureBuffered makes r.buf hold at least 1 unread byte from the
+// next chunk, or returns io.EOF when the manifest is fully drained.
+// Skips zero-byte chunks (defensive — shouldn't normally appear).
+func (r *s3AdminObjectReader) ensureBuffered() error {
+	if len(r.buf) > 0 {
+		return nil
+	}
+	for r.partIdx < len(r.manifest.Parts) {
+		part := r.manifest.Parts[r.partIdx]
+		if r.chunkIdx >= uint64(len(part.ChunkSizes)) {
+			r.partIdx++
+			r.chunkIdx = 0
+			continue
+		}
+		chunkKey := s3keys.VersionedBlobKey(r.bucket, r.generation, r.key,
+			r.manifest.UploadID, part.PartNo, r.chunkIdx, part.PartVersion)
+		chunk, err := r.server.store.GetAt(r.ctx, chunkKey, r.readTS)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		r.chunkIdx++
+		if len(chunk) == 0 {
+			continue
+		}
+		r.buf = chunk
+		return nil
+	}
+	return io.EOF
+}
+
+func (r *s3AdminObjectReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	if r.pin != nil {
+		r.pin.Release()
+		r.pin = nil
+	}
+	return nil
 }
