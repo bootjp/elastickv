@@ -759,6 +759,16 @@ func validateCreateTableRequest(in *CreateTableRequest) error {
 	if strings.ContainsRune(in.TableName, '/') {
 		return errors.New("table_name must not contain '/'")
 	}
+	// Reject literal dot-segment names ("." / "..") symmetrically
+	// with decodeAndValidatePathSegment. Without this guard a
+	// table named "." would be creatable but every describe /
+	// delete / items URL for it would surface as 400 invalid_path
+	// (the dispatcher rejects decoded "." / ".." as path-traversal
+	// classes) — orphaned exactly like the slash case above
+	// (Codex P2 on PR #813 r5).
+	if in.TableName == "." || in.TableName == ".." {
+		return errors.New("table_name must not be \".\" or \"..\"")
+	}
 	if err := validateAttribute(in.PartitionKey, "partition_key"); err != nil {
 		return err
 	}
