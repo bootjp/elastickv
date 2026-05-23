@@ -223,7 +223,26 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
       await api.deleteObject(bucket, detail.key);
       setDetail(null);
       setConfirmDelete(false);
-      void loadPage(cursorStack[cursorStack.length - 1], prefix);
+      // If the deleted object was the only thing on the current
+      // page (no remaining objects and no common prefixes after
+      // its removal), reloading with the same continuation token
+      // would scan from after the now-empty cursor and surface an
+      // "empty bucket" state even when earlier pages still have
+      // content. Fall back to a page-0 reload + cursor reset so
+      // the operator lands on a non-empty view (Codex P2 on PR
+      // #816 r4). The common case — page has many entries —
+      // keeps the operator's position via the cursorStack top.
+      // Only applies when cursorStack is non-empty: at page 0 the
+      // cursor is already undefined and the empty state is
+      // unambiguous.
+      const wouldEmptyPage =
+        (page?.objects?.length ?? 0) <= 1 && (page?.common_prefixes?.length ?? 0) === 0;
+      if (wouldEmptyPage && cursorStack.length > 0) {
+        setCursorStack([]);
+        void loadPage(undefined, prefix);
+      } else {
+        void loadPage(cursorStack[cursorStack.length - 1], prefix);
+      }
     } catch (err) {
       setDetailError(err instanceof ApiError ? `${err.code}: ${err.message || err.code}` : String(err));
     } finally {
