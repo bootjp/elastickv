@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../auth";
 import { Modal } from "../components/Modal";
+import { S3ObjectsTab } from "../components/S3ObjectsTab";
 import { formatApiError, useApiQuery } from "../lib/useApi";
 
 export function S3DetailPage() {
@@ -107,6 +108,8 @@ export function S3DetailPage() {
           {aclError && <div className="text-sm text-danger mt-2">{aclError}</div>}
         </section>
       )}
+
+      {detail.data && <S3ObjectsTab bucket={name} />}
 
       <Modal
         title="Delete bucket"

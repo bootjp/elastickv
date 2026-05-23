@@ -49,6 +49,17 @@ function readCsrfCookie(): string | undefined {
   return undefined;
 }
 
+// base64UrlEncodeBytes turns a UTF-8 string into the unpadded
+// base64-url alphabet the admin S3 object routes accept for the
+// {key-b64url} URL segment. Same encoding the admin Dynamo items
+// routes use for their key segment.
+function base64UrlEncodeBytes(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+}
+
 function buildURL(path: string, query?: ApiOptions["query"]): string {
   const url = new URL(apiBase + path, window.location.origin);
   if (query) {
@@ -191,6 +202,30 @@ export interface S3BucketList {
 export interface CreateBucketRequest {
   bucket_name: string;
   acl?: "private" | "public-read";
+}
+
+// AdminObject mirrors internal/admin/s3_objects_handler.go. The
+// per-object metadata projection list pages return.
+export interface AdminObject {
+  key: string;
+  size: number;
+  content_type: string;
+  etag: string;
+  last_modified: string;
+  storage_class: string;
+}
+
+export interface AdminObjectListing {
+  objects: AdminObject[];
+  common_prefixes?: string[];
+  next_continuation_token?: string;
+}
+
+export interface AdminListObjectsOptions {
+  prefix?: string;
+  delimiter?: string;
+  continuation_token?: string;
+  max_keys?: number;
 }
 
 // SQS queue admin DTOs (Section 16.2 of the SQS partial design doc).
@@ -341,6 +376,57 @@ export const api = {
     }),
   deleteBucket: (name: string) =>
     apiFetch<void>(`/s3/buckets/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  listObjects: (bucket: string, opts?: AdminListObjectsOptions, signal?: AbortSignal) =>
+    apiFetch<AdminObjectListing>(
+      `/s3/buckets/${encodeURIComponent(bucket)}/objects`,
+      {
+        query: {
+          prefix: opts?.prefix,
+          delimiter: opts?.delimiter,
+          continuation_token: opts?.continuation_token,
+          max_keys: opts?.max_keys,
+        },
+        signal,
+      },
+    ),
+  // The object body endpoints carry raw bytes (application/octet-
+  // stream), so they bypass the JSON-only apiFetch and use a direct
+  // fetch with the CSRF header. base64UrlEncodeBytes turns the key
+  // into the {key-b64url} segment the server's
+  // decodeAdminObjectKeySegment expects.
+  downloadObjectURL: (bucket: string, key: string): string =>
+    `${apiBase}/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
+  putObject: async (
+    bucket: string,
+    key: string,
+    body: Blob,
+    contentType?: string,
+  ): Promise<void> => {
+    const headers: Record<string, string> = {};
+    if (contentType) headers["Content-Type"] = contentType;
+    const csrf = readCsrfCookie();
+    if (csrf) headers["X-Admin-CSRF"] = csrf;
+    const res = await fetch(
+      `${apiBase}/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
+      { method: "PUT", body, headers, credentials: "same-origin" },
+    );
+    if (res.status === 204) return;
+    const ct = res.headers.get("content-type") ?? "";
+    if (!ct.includes("application/json")) {
+      throw new ApiError(res.status, "non_json_response", `HTTP ${res.status}`);
+    }
+    const payload = (await res.json()) as Record<string, unknown>;
+    throw new ApiError(
+      res.status,
+      typeof payload.error === "string" ? payload.error : "request_failed",
+      typeof payload.message === "string" ? payload.message : "",
+    );
+  },
+  deleteObject: (bucket: string, key: string) =>
+    apiFetch<void>(
+      `/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
+      { method: "DELETE" },
+    ),
   listQueues: (signal?: AbortSignal) =>
     apiFetch<SqsQueueList>("/sqs/queues", { signal }),
   describeQueue: (name: string, signal?: AbortSignal) =>
