@@ -511,16 +511,38 @@ func TestS3Objects_Put_Rejects413OnOversizedBody(t *testing.T) {
 	src := newStubObjectsSource()
 	h := newS3HandlerForTest(src)
 
-	// http.MaxBytesReader's *limit* is exclusive — a body of cap+1
-	// bytes overflows on the first read past the cap.
-	oversize := bytes.Repeat([]byte("x"), adminObjectUploadCap+1)
+	// http.MaxBytesReader's *limit* is exclusive — a body whose
+	// declared length exceeds the cap (or whose actual stream
+	// overflows) trips on the first read past the cap. Use a
+	// lazy infiniteX reader (capped via io.LimitReader at cap+1)
+	// rather than a 100 MiB bytes.Repeat allocation — keeps the
+	// test memory footprint under a kilobyte (Claude review on
+	// PR #814 r1).
+	oversize := io.LimitReader(&infiniteX{}, int64(adminObjectUploadCap)+1)
 	req := httptest.NewRequest(http.MethodPut, objectPath("photos", "huge.bin"),
-		bytes.NewReader(oversize))
+		oversize)
+	// httptest.NewRequest with an io.Reader sets ContentLength=-1
+	// so MaxBytesReader can't short-circuit on Content-Length; it
+	// has to actually read past the cap. That's what we want here:
+	// it exercises the read-side overflow path that production
+	// uploads hit when ContentLength is absent or wrong.
 	req = withWritePrincipal(req)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+}
+
+// infiniteX is a zero-state io.Reader that yields 'x' indefinitely;
+// callers cap it via io.LimitReader. Used by the oversize-PUT test
+// to avoid allocating the full 100 MiB body up front.
+type infiniteX struct{}
+
+func (infiniteX) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
 }
 
 func TestS3Objects_Put_TranslatesUploadTooLargeSentinel(t *testing.T) {

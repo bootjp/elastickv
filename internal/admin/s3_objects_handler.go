@@ -166,6 +166,19 @@ func (h *S3Handler) handleObjectGet(w http.ResponseWriter, r *http.Request, buck
 		h.writeObjectsError(w, r, "get", bucket, err)
 		return
 	}
+	// Defensive nil guard: an adapter that mis-implements the
+	// (nil-body, nil-err) contract would panic on the defer
+	// body.Close() below. Surface a 500 instead and log so the
+	// regression is operator-visible (Claude review on PR #814 r1).
+	if body == nil {
+		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 get object: adapter returned nil body with nil error",
+			slog.String("bucket", bucket),
+			slog.String("key", key),
+		)
+		writeJSONError(w, http.StatusInternalServerError, "s3_get_failed",
+			"adapter returned nil body; see server logs")
+		return
+	}
 	defer func() {
 		if cerr := body.Close(); cerr != nil {
 			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 get object body close failed",

@@ -209,10 +209,11 @@ func (h *S3Handler) dispatchACLSubresource(w http.ResponseWriter, r *http.Reques
 //   - bucket name must be non-empty and slash-free (otherwise
 //     reject via the standard 404 fallthrough)
 //   - the literal "objects" sub-resource must be present
-//   - for the per-object route, the residual segment must not be
-//     empty (a trailing `/objects/` with no key is the collection
-//     shape, but we surface that as a 404 since the SPA never
-//     constructs it and a typo should be loud)
+//   - a residual that is empty OR has a leading slash is the
+//     objects route: empty returns (name, "", true) so the
+//     dispatcher routes to handleObjectsCollection (same shape
+//     as /buckets/{name}/objects); a leading-slash residual
+//     returns (name, key, true) for the per-object route
 //
 // The {key} validator (no `%`, no dot-segments) runs in the
 // object handler's segment decoder rather than here so the route
@@ -241,10 +242,11 @@ func splitBucketObjectsRoute(tail string) (string, string, bool) {
 }
 
 // dispatchObjectsSubtree routes the two recognised object-tier
-// shapes. The per-object segment is checked for emptiness here
-// (the splitter already accepts `name/objects/`); we surface that
-// as 400 invalid_path rather than misfiring into the collection
-// handler.
+// shapes. An empty sub is the collection route (matches the
+// splitter's name/objects/ trailing-slash shape with /buckets/
+// {name}/objects). A sub containing `/` is a malformed key
+// segment (the SPA base64-url-encodes the key so there should
+// be no embedded slash) and rejects with 400 invalid_path.
 func (h *S3Handler) dispatchObjectsSubtree(w http.ResponseWriter, r *http.Request, name, sub string) {
 	switch {
 	case sub == "":
