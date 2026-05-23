@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -155,6 +156,91 @@ func TestVerifyChecksums_RejectsTraversalPath(t *testing.T) {
 				t.Fatalf("err = %v, want ErrChecksumsPathTraversal or ErrChecksumsMalformedLine", err)
 			}
 		})
+	}
+}
+
+// TestVerifyChecksums_RejectsTerminalSymlink is the regression for
+// codex r2 P1 on PR #810: after the textual `..` guard, a
+// CHECKSUMS line `<hex>  safe/file` whose `safe/file` is a symlink
+// pointing outside the dump root would have been silently
+// followed by os.Open, hashing the host-side target. The
+// per-component lstat walk in refuseSymlinkComponents catches
+// both terminal and intermediate symlinks.
+func TestVerifyChecksums_RejectsTerminalSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows symlink creation requires
+		// SeCreateSymbolicLinkPrivilege which is rarely available
+		// to CI users. The lstat-walk fix runs on every platform;
+		// the test only exercises Linux/macOS where os.Symlink is
+		// unprivileged.
+		t.Skip("symlink test requires unprivileged os.Symlink (skipped on Windows)")
+	}
+	t.Parallel()
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "secret")
+	mustWrite(t, outsideFile, []byte("host-only"))
+	// Build a CHECKSUMS that lists `safe/file` with a digest that
+	// would match the outside file's contents — proving the
+	// verifier did NOT follow the symlink.
+	mustWrite(t, filepath.Join(root, "safe", "honest"), []byte("dump-only"))
+	if err := WriteChecksums(root); err != nil {
+		t.Fatalf("WriteChecksums: %v", err)
+	}
+	// Now plant a symlink at safe/escape -> outsideFile and add an
+	// entry for it to CHECKSUMS. WriteChecksums followed the link
+	// during its own walk too, but VerifyChecksums must reject.
+	link := filepath.Join(root, "safe", "escape")
+	if err := os.Symlink(outsideFile, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// Append a CHECKSUMS entry for the symlinked file.
+	checksumsPath := filepath.Join(root, CHECKSUMSFilename)
+	body, err := os.ReadFile(checksumsPath) //nolint:gosec // test path
+	if err != nil {
+		t.Fatalf("read CHECKSUMS: %v", err)
+	}
+	// Use the digest of the outside file's actual content so the
+	// shape-parse + path-traversal checks succeed; the symlink
+	// guard is the first thing that must reject.
+	body = append(body, []byte("e3d1ac1b09a9e88c0c12e9b1d31d6a92e2ec43cf2bda7bcd58e3a3b2c50e2dd2  safe/escape\n")...)
+	if err := os.WriteFile(checksumsPath, body, 0o600); err != nil {
+		t.Fatalf("write CHECKSUMS: %v", err)
+	}
+	err = VerifyChecksums(root)
+	if err == nil {
+		t.Fatalf("expected ErrChecksumsSymlinkEscape, got nil")
+	}
+	if !errors.Is(err, ErrChecksumsSymlinkEscape) {
+		t.Fatalf("err = %v, want ErrChecksumsSymlinkEscape", err)
+	}
+}
+
+// TestVerifyChecksums_RejectsIntermediateSymlink pins that a
+// symlinked PARENT component is also caught — without the
+// per-component walk, refusing only the terminal symlink would
+// still leave the verifier vulnerable to a dump with a top-level
+// symlinked directory.
+func TestVerifyChecksums_RejectsIntermediateSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink test requires unprivileged os.Symlink")
+	}
+	t.Parallel()
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+	mustWrite(t, filepath.Join(outsideDir, "target.txt"), []byte("host-side"))
+	// safe/ is a symlink to a directory outside the dump root.
+	if err := os.Symlink(outsideDir, filepath.Join(root, "safe")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	body := "0000000000000000000000000000000000000000000000000000000000000000  safe/target.txt\n"
+	mustWrite(t, filepath.Join(root, CHECKSUMSFilename), []byte(body))
+	err := VerifyChecksums(root)
+	if err == nil {
+		t.Fatalf("expected ErrChecksumsSymlinkEscape, got nil")
+	}
+	if !errors.Is(err, ErrChecksumsSymlinkEscape) {
+		t.Fatalf("err = %v, want ErrChecksumsSymlinkEscape", err)
 	}
 }
 

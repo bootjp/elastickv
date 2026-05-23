@@ -187,8 +187,9 @@ func VerifyChecksums(root string) error {
 // verifyOneChecksumLine handles a single CHECKSUMS line: parse,
 // path-validate, recompute, compare. Extracted from VerifyChecksums
 // so the parent stays under the project's cyclop ceiling and the
-// per-line failure modes (malformed shape, traversal, missing file,
-// mismatch) each surface as a distinct typed error.
+// per-line failure modes (malformed shape, traversal, symlink
+// escape, missing file, mismatch) each surface as a distinct
+// typed error.
 func verifyOneChecksumLine(root, line string, lineNum int) error {
 	if line == "" {
 		return nil
@@ -201,7 +202,11 @@ func verifyOneChecksumLine(root, line string, lineNum int) error {
 	if err != nil {
 		return errors.Wrapf(err, "line %d", lineNum)
 	}
-	got, err := sha256File(filepath.Join(root, cleaned))
+	joined := filepath.Join(root, cleaned)
+	if err := refuseSymlinkComponents(root, cleaned); err != nil {
+		return errors.Wrapf(err, "line %d", lineNum)
+	}
+	got, err := sha256File(joined)
 	if err != nil {
 		return errors.Wrapf(err, "verifying %s", cleaned)
 	}
@@ -210,6 +215,48 @@ func verifyOneChecksumLine(root, line string, lineNum int) error {
 	}
 	return nil
 }
+
+// refuseSymlinkComponents walks rel one path segment at a time
+// starting at root and rejects the first component that is a
+// symlink. This closes the codex r2 P1 symlink-escape attack on
+// PR #810: after the textual `..`-traversal guard runs,
+// `os.Open(filepath.Join(root, "safe/file"))` would still follow a
+// symlink at `safe/file` (or at any of its parent components) to
+// a file outside root and hash whatever it found. A Phase 0a dump
+// produced by the encoder writes only regular files, so refusing
+// every symlink found in the path keeps the verifier honest
+// regardless of which component an adversary planted the link in.
+//
+// The per-component walk catches BOTH terminal symlinks (where
+// `cleaned` itself names a symlink) AND intermediate ones (where
+// a parent directory along the way is a symlink). syscall
+// O_NOFOLLOW would only cover the terminal case, and
+// filepath.EvalSymlinks runs the resolution we are trying to
+// avoid in the first place.
+func refuseSymlinkComponents(root, rel string) error {
+	cur := root
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if seg == "" {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.Wrapf(ErrChecksumsSymlinkEscape,
+				"symlink in path: %s", cur)
+		}
+	}
+	return nil
+}
+
+// ErrChecksumsSymlinkEscape is returned by VerifyChecksums when a
+// CHECKSUMS line's resolved path traverses a symlink. Typed so a
+// caller branching on errors.Is can distinguish symlink-tampering
+// from textual `..`-traversal (ErrChecksumsPathTraversal).
+var ErrChecksumsSymlinkEscape = errors.New("backup: CHECKSUMS path traverses symlink")
 
 // validateChecksumRelPath rejects CHECKSUMS rows whose path field
 // could escape the dump root. The acceptance rules:
