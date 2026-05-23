@@ -333,7 +333,11 @@ func rawEncStateAt(t *testing.T, dir string, key []byte, ts uint64) byte {
 	if err != nil {
 		t.Fatalf("pdb.Get %q@%d: %v", key, ts, err)
 	}
-	defer func() { _ = closer.Close() }()
+	defer func() {
+		if cerr := closer.Close(); cerr != nil {
+			t.Errorf("closer.Close: %v", cerr)
+		}
+	}()
 	if len(raw) == 0 {
 		t.Fatalf("empty raw value at %q@%d", key, ts)
 	}
