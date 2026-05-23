@@ -456,6 +456,22 @@ func decodeAdminObjectKeySegment(w http.ResponseWriter, segment string) (string,
 // writeObjectsError translates the sentinel errors the bridge
 // surfaces into the canonical HTTP status + body shape. Mirrors
 // writeBucketsError but with the object-tier sentinels.
+//
+// Leader forwarding: the bucket-tier writes (CreateBucket /
+// PutBucketAcl / DeleteBucket) hand a follower's NotLeader off
+// to the leader via LeaderForwarder.ForwardXxx so the SPA never
+// observes a 503 on those routes. The object-tier endpoints
+// (ListObjects / GetObject / PutObject / DeleteObject) DO NOT
+// have this transparent fall-through yet — the same pattern the
+// SQS handler ships with today. The reason: GetObject and
+// PutObject stream bodies up to 100 MiB, which doesn't fit the
+// existing unary `bytes Payload` AdminForward proto. Wiring
+// streaming RPCs is a separate PR-scoped change (proto, server,
+// client, bridge, all four object ops); for now followers reply
+// 503 + Retry-After: 1 and the SPA's retry helper re-issues
+// against the leader via the leader-probe endpoint. Codex P1 on
+// PR #814 r3 flagged this; tracked as a follow-up rather than
+// expanding this PR by ~5 packages.
 func (h *S3Handler) writeObjectsError(w http.ResponseWriter, r *http.Request, op, bucket string, err error) {
 	switch {
 	case errors.Is(err, ErrObjectsForbidden):
