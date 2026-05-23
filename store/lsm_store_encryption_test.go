@@ -244,6 +244,106 @@ func newToggleableEncryptedStore(t *testing.T, keyID uint32, activeFlag *bool) M
 	return mvcc
 }
 
+// gatedFixture bundles the Stage 6D-5 gate test store with its
+// dir + an idempotent close helper. Pebble panics on double-close,
+// so the cleanup MUST track whether the test already closed the
+// store before the on-disk peek (rawEncStateAt opens the same
+// directory).
+type gatedFixture struct {
+	mvcc   MVCCStore
+	dir    string
+	closed bool
+}
+
+func (g *gatedFixture) closeIfOpen(tb testing.TB) {
+	tb.Helper()
+	if g.closed {
+		return
+	}
+	g.closed = true
+	if err := g.mvcc.Close(); err != nil {
+		tb.Fatalf("close pebble: %v", err)
+	}
+}
+
+// newGatedEncryptedStore wires the Stage 6D-5 cutover gate
+// (WithStorageEnvelopeGate) alongside the existing always-active
+// keyID closure. The supplied gateFlag pointer is read by the
+// gate on every Put — the test toggles it to exercise the
+// pre-cutover (false) vs post-cutover (true) write semantics
+// without re-opening the store. Tests use the returned fixture's
+// closeIfOpen() before calling rawEncStateAt to release Pebble's
+// directory lock.
+func newGatedEncryptedStore(t *testing.T, keyID uint32, gateFlag *bool) *gatedFixture {
+	t.Helper()
+	ks := encryption.NewKeystore()
+	dek := make([]byte, encryption.KeySize)
+	dek[0] = 0xBB
+	if err := ks.Set(keyID, dek); err != nil {
+		t.Fatalf("Keystore.Set: %v", err)
+	}
+	c, err := encryption.NewCipher(ks)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	dir := filepath.Join(t.TempDir(), "pebble")
+	mvcc, err := NewPebbleStore(dir,
+		WithEncryption(c,
+			NewCounterNonceFactory(0x0022, 0x0003),
+			func() (uint32, bool) { return keyID, true }, // DEK always provisioned
+		),
+		WithStorageEnvelopeGate(func() bool { return *gateFlag }),
+	)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	g := &gatedFixture{mvcc: mvcc, dir: dir}
+	t.Cleanup(func() {
+		if g.closed {
+			return
+		}
+		// Surface any close error rather than swallowing it: a
+		// silent failure here could mask a leaked Pebble handle
+		// or a flush bug under a future code change (gemini-code-
+		// assist medium on PR809).
+		if err := g.mvcc.Close(); err != nil {
+			t.Errorf("cleanup close pebble: %v", err)
+		}
+	})
+	return g
+}
+
+// rawEncStateAt opens Pebble directly at dir (the caller MUST
+// have closed the MVCCStore at that path first; Pebble holds an
+// exclusive lock) and reads the on-disk encryption_state bits of
+// (key, ts). Lets the gate tests prove the wire-level effect of
+// the toggle rather than just the round-trip behaviour.
+func rawEncStateAt(t *testing.T, dir string, key []byte, ts uint64) byte {
+	t.Helper()
+	pdb, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("pebble.Open: %v", err)
+	}
+	defer func() {
+		if cerr := pdb.Close(); cerr != nil {
+			t.Errorf("pdb.Close: %v", cerr)
+		}
+	}()
+	raw, closer, err := pdb.Get(encodeKey(key, ts))
+	if err != nil {
+		t.Fatalf("pdb.Get %q@%d: %v", key, ts, err)
+	}
+	defer func() {
+		if cerr := closer.Close(); cerr != nil {
+			t.Errorf("closer.Close: %v", cerr)
+		}
+	}()
+	if len(raw) == 0 {
+		t.Fatalf("empty raw value at %q@%d", key, ts)
+	}
+	return (raw[0] & encStateMask) >> encStateShift
+}
+
 // mustGet calls GetAt and asserts the value matches want, surfacing
 // any error via t.Fatalf so the caller test stays linear.
 func mustGet(t *testing.T, mvcc MVCCStore, key []byte, ts uint64, want string) {
@@ -282,6 +382,178 @@ func TestEncryption_InactiveKeyWritesCleartext(t *testing.T) {
 	// Deactivating must not break reads of the already-encrypted entry.
 	active = false
 	mustGet(t, mvcc, []byte("modern"), 250, "encrypted")
+}
+
+// TestStorageEnvelopeGate_PreCutoverForcesCleartext pins the
+// Stage 6D-5 §6.2 toggle: even with a cipher and active DEK
+// wired, a `StorageEnvelopeActive == false` gate suppresses the
+// envelope emit and the on-disk encryption_state stays 0b00
+// (cleartext). This is the operator-inert post-bootstrap /
+// pre-cutover posture from the §7.1 Phase 0 window.
+func TestStorageEnvelopeGate_PreCutoverForcesCleartext(t *testing.T) {
+	t.Parallel()
+	var gate bool // false == pre-cutover
+	g := newGatedEncryptedStore(t, 51, &gate)
+	ctx := context.Background()
+
+	if err := g.mvcc.PutAt(ctx, []byte("pre"), []byte("v-pre"), 100, 0); err != nil {
+		t.Fatalf("PutAt pre-cutover: %v", err)
+	}
+	mustGet(t, g.mvcc, []byte("pre"), 150, "v-pre")
+	// Close the store so Pebble releases its directory lock; we
+	// reach in to confirm the on-disk encryption_state bits.
+	g.closeIfOpen(t)
+	if got := rawEncStateAt(t, g.dir, []byte("pre"), 100); got != encStateCleartext {
+		t.Errorf("pre-cutover on-disk encState = %#x, want %#x (cleartext)",
+			got, encStateCleartext)
+	}
+}
+
+// TestStorageEnvelopeGate_PostCutoverEmitsEnvelope is the
+// positive-control: with the gate returning true, the existing
+// envelope emit fires normally. Without this test a regression
+// that always returned cleartext from encryptForKey would not
+// be caught by the negative test above.
+func TestStorageEnvelopeGate_PostCutoverEmitsEnvelope(t *testing.T) {
+	t.Parallel()
+	gate := true // post-cutover
+	g := newGatedEncryptedStore(t, 52, &gate)
+	ctx := context.Background()
+
+	if err := g.mvcc.PutAt(ctx, []byte("post"), []byte("v-post"), 100, 0); err != nil {
+		t.Fatalf("PutAt post-cutover: %v", err)
+	}
+	mustGet(t, g.mvcc, []byte("post"), 150, "v-post")
+	g.closeIfOpen(t)
+	if got := rawEncStateAt(t, g.dir, []byte("post"), 100); got != encStateEncrypted {
+		t.Errorf("post-cutover on-disk encState = %#x, want %#x (encrypted)",
+			got, encStateEncrypted)
+	}
+}
+
+// TestStorageEnvelopeGate_FlipMidLife exercises the §7.1 Phase 0
+// → Phase 1 transition: writes before the gate flips are cleartext,
+// writes after are §4.1 envelope, AND reads of the pre-cutover
+// versions continue to work after the flip — proving the gate is
+// write-only and does NOT affect the cipher-driven read dispatch.
+func TestStorageEnvelopeGate_FlipMidLife(t *testing.T) {
+	t.Parallel()
+	var gate bool
+	g := newGatedEncryptedStore(t, 53, &gate)
+	ctx := context.Background()
+
+	if err := g.mvcc.PutAt(ctx, []byte("legacy"), []byte("v-legacy"), 100, 0); err != nil {
+		t.Fatalf("PutAt pre-cutover: %v", err)
+	}
+	gate = true // §7.1 Phase 1 cutover fires
+	if err := g.mvcc.PutAt(ctx, []byte("modern"), []byte("v-modern"), 200, 0); err != nil {
+		t.Fatalf("PutAt post-cutover: %v", err)
+	}
+	// Both reads succeed live — the gate is write-only; reads
+	// dispatch on each version's stored encryption_state.
+	mustGet(t, g.mvcc, []byte("legacy"), 150, "v-legacy")
+	mustGet(t, g.mvcc, []byte("modern"), 250, "v-modern")
+	// And the on-disk encryption_state bits actually differ.
+	g.closeIfOpen(t)
+	if got := rawEncStateAt(t, g.dir, []byte("legacy"), 100); got != encStateCleartext {
+		t.Errorf("legacy on-disk encState = %#x, want %#x (cleartext)",
+			got, encStateCleartext)
+	}
+	if got := rawEncStateAt(t, g.dir, []byte("modern"), 200); got != encStateEncrypted {
+		t.Errorf("modern on-disk encState = %#x, want %#x (encrypted)",
+			got, encStateEncrypted)
+	}
+}
+
+// TestStorageEnvelopeGate_NilGatePreservesLegacyBehavior pins the
+// backward-compat posture: a store wired with WithEncryption but
+// WITHOUT WithStorageEnvelopeGate continues to emit envelopes as
+// soon as a DEK is active, exactly like the pre-6D-5 codepath.
+// Existing test fixtures and pre-6D-6 production deployments
+// (which have not opted into the cutover semantics yet) keep
+// working unchanged.
+//
+// The negative test below uses the unmodified
+// newEncryptedStoreFixture which calls WithEncryption with no
+// gate. If a regression hard-required the gate to be set, every
+// pre-existing encryption test would fail.
+func TestStorageEnvelopeGate_NilGatePreservesLegacyBehavior(t *testing.T) {
+	t.Parallel()
+	f := newEncryptedStoreFixture(t, 54)
+	ctx := context.Background()
+	if err := f.mvcc.PutAt(ctx, []byte("legacy-mode"), []byte("encrypted"), 100, 0); err != nil {
+		t.Fatalf("PutAt: %v", err)
+	}
+	mustGet(t, f.mvcc, []byte("legacy-mode"), 150, "encrypted")
+	f.closeIfOpen(t)
+	if got := rawEncStateAt(t, f.dir, []byte("legacy-mode"), 100); got != encStateEncrypted {
+		t.Errorf("nil-gate on-disk encState = %#x, want %#x (encrypted; legacy posture)",
+			got, encStateEncrypted)
+	}
+}
+
+// TestStorageEnvelopeGate_NilArgumentIsNoOp pins the
+// WithStorageEnvelopeGate(nil) refusal: passing nil leaves the
+// store in its pre-call gate posture (nil internal field). A
+// regression that accepted nil and assigned it as the gate would
+// nil-deref on the first Put.
+func TestStorageEnvelopeGate_NilArgumentIsNoOp(t *testing.T) {
+	t.Parallel()
+	ks := encryption.NewKeystore()
+	dek := make([]byte, encryption.KeySize)
+	dek[0] = 0xCC
+	if err := ks.Set(60, dek); err != nil {
+		t.Fatalf("Keystore.Set: %v", err)
+	}
+	c, err := encryption.NewCipher(ks)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	dir := filepath.Join(t.TempDir(), "pebble")
+	mvcc, err := NewPebbleStore(dir,
+		WithEncryption(c,
+			NewCounterNonceFactory(0x0033, 0x0004),
+			func() (uint32, bool) { return 60, true },
+		),
+		WithStorageEnvelopeGate(nil), // explicit nil → no-op
+	)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	// closed tracks whether the test body has already closed the
+	// store before the on-disk peek; the cleanup must surface
+	// any unexpected close error but skip the double-close that
+	// would otherwise panic inside Pebble (gemini-code-assist
+	// medium + coderabbit minor on PR809).
+	var closed bool
+	t.Cleanup(func() {
+		if closed {
+			return
+		}
+		if cerr := mvcc.Close(); cerr != nil {
+			t.Errorf("cleanup close pebble: %v", cerr)
+		}
+	})
+	ctx := context.Background()
+	// Without a gate, the store should still emit envelopes
+	// (legacy posture). A nil-deref bug surfaces as a panic here.
+	if err := mvcc.PutAt(ctx, []byte("k"), []byte("v"), 100, 0); err != nil {
+		t.Fatalf("PutAt: %v", err)
+	}
+	mustGet(t, mvcc, []byte("k"), 150, "v")
+	// Coderabbit minor: a round-trip pass alone does not prove
+	// the legacy-posture write took the envelope path — a
+	// regression that always wrote cleartext would still
+	// round-trip cleanly. Close and peek the on-disk
+	// encryption_state bits to pin the wire-level effect.
+	closed = true
+	if cerr := mvcc.Close(); cerr != nil {
+		t.Fatalf("close pebble: %v", cerr)
+	}
+	if got := rawEncStateAt(t, dir, []byte("k"), 100); got != encStateEncrypted {
+		t.Errorf("nil-gate on-disk encState = %#x, want %#x (encrypted; legacy posture)",
+			got, encStateEncrypted)
+	}
 }
 
 // TestEncryption_AADRecordBinding is the §4.1 case-2/3 regression:
