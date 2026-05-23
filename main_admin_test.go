@@ -427,6 +427,45 @@ func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
 	require.Equal(t, in, out)
 }
 
+// TestTranslateAdminItemsError_LeaderChurn is the items-tier
+// counterpart of TestTranslateAdminTablesError_LeaderChurn — Codex
+// P2 on PR #813 flagged that translateAdminItemsError did not
+// classify transient leader-churn errors as 503/retryable, so an
+// election mid-AdminPutItem / AdminGetItem would 500 instead of
+// surfacing through the SPA's retry path.
+func TestTranslateAdminItemsError_LeaderChurn(t *testing.T) {
+	cases := []struct {
+		name string
+		in   error
+	}{
+		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
+		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
+		{"wrapped not leader", errors.New("dispatch failed: not leader")},
+		{"wrapped leader not found", errors.New("dispatch: leader not found")},
+		{"wrapped leadership lost", errors.New("commit aborted: leadership lost")},
+		{"wrapped leadership transfer", errors.New("retry exhausted: leadership transfer in progress")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := translateAdminItemsError(tc.in)
+			require.ErrorIs(t, out, admin.ErrItemsNotLeader,
+				"input %q must map to ErrItemsNotLeader", tc.in)
+		})
+	}
+}
+
+// TestTranslateAdminItemsError_UnrelatedErrorPassesThrough is the
+// items-tier counterpart of the table-tier passthrough test — keep
+// the leader-churn detector narrow enough that an unrelated error
+// mentioning "leader" still surfaces as a 500.
+func TestTranslateAdminItemsError_UnrelatedErrorPassesThrough(t *testing.T) {
+	in := errors.New("team leader misconfigured")
+	out := translateAdminItemsError(in)
+	require.NotErrorIs(t, out, admin.ErrItemsNotLeader)
+	require.Equal(t, in, out)
+}
+
 // TestTranslateAdminQueuesError_LeaderChurn is the SQS counterpart of
 // TestTranslateAdminTablesError_LeaderChurn. AdminDeleteQueue clears
 // the upfront isVerifiedSQSLeader check but the kv coordinator can

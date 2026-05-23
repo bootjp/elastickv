@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -282,18 +283,24 @@ const (
 
 func (h *DynamoHandler) dispatchPerTableRoute(w http.ResponseWriter, r *http.Request) {
 	// EscapedPath() exposes percent-encoded segments verbatim so the
-	// `%`-rejection in isValidAdminPathSegment catches things like
-	// %2F (encoded /), %2E%2E (encoded ..), %252F (double-encoded).
-	// r.URL.Path is pre-decoded and would let those slip through.
+	// decode+validate step in decodeAndValidatePathSegment can
+	// distinguish raw `/` (path separator) from `%2F` (a literal `/`
+	// the operator URL-escaped) — both must be rejected as segment
+	// content. r.URL.Path is pre-decoded and would silently turn
+	// `%2F` into a real `/`, collapsing two distinct attack classes
+	// into one.
 	escaped := r.URL.EscapedPath()
 	rest := strings.TrimPrefix(escaped, pathPrefixDynamoTables)
-	segments := dropSingleTrailingEmpty(strings.Split(rest, "/"))
-	for _, seg := range segments {
-		if !isValidAdminPathSegment(seg) {
+	rawSegments := dropSingleTrailingEmpty(strings.Split(rest, "/"))
+	segments := make([]string, 0, len(rawSegments))
+	for _, seg := range rawSegments {
+		decoded, ok := decodeAndValidatePathSegment(seg)
+		if !ok {
 			writeJSONError(w, http.StatusBadRequest, "invalid_path",
-				"path segment is empty, contains %, or is a dot-segment")
+				"path segment is empty, malformed percent-encoding, contains an encoded slash, or is a dot-segment")
 			return
 		}
+		segments = append(segments, decoded)
 	}
 	switch len(segments) {
 	case dynamoRouteSegmentsTable:
@@ -311,7 +318,13 @@ func (h *DynamoHandler) dispatchPerTableRoute(w http.ResponseWriter, r *http.Req
 				"unknown sub-resource on this table")
 			return
 		}
-		h.handleItemResource(w, r, segments[0], segments[2])
+		// The {key} segment is base64-url-encoded by the SPA, so the
+		// decoded form here equals the raw form (base64-url alphabet
+		// is a subset of unreserved URL chars). Pass rawSegments[2]
+		// to handleItemResource so its existing base64 decoder runs
+		// against the wire form — a future format change in the SPA
+		// (e.g. using padded base64) wouldn't drift the contract.
+		h.handleItemResource(w, r, segments[0], rawSegments[2])
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
 			"too many path segments")
@@ -332,23 +345,51 @@ func (h *DynamoHandler) dispatchTableResource(w http.ResponseWriter, r *http.Req
 	}
 }
 
-// isValidAdminPathSegment enforces the same per-segment rules
-// SQS adopted (Phase 5 of the routing procedure docs): no empty
-// segment, no percent sign (closes the %2F / %252F / %2e /
-// %2E%2E percent-encoded escape classes), no literal dot-segment
-// strings (`.` / `..` — closes the raw dot-segment traversal
-// class that path.Clean would otherwise collapse).
-func isValidAdminPathSegment(seg string) bool {
+// decodeAndValidatePathSegment is the canonical per-segment guard
+// for the dynamo dispatcher. Codex P1 on PR #813 narrowed the
+// original SQS-style "reject any %" rule, which made tables whose
+// names need URL-escaping (spaces, UTF-8, etc.) unreachable through
+// describe / delete / items even though validateCreateTableRequest
+// accepts those names.
+//
+// The new contract: percent-encoded chars are accepted, but the
+// decoded form is what gets validated.
+//
+//   - empty raw segment → reject
+//   - malformed percent-encoding (`%g`, dangling `%`) → reject
+//   - decoded `/` (e.g. `%2F`, `%2f`) → reject (closes the
+//     percent-encoded path-traversal class)
+//   - decoded `.` or `..` (e.g. raw `.`, `%2e`, `%2e%2e`, `%2E`) →
+//     reject (closes the raw + percent-encoded dot-segment class)
+//
+// Returns the decoded segment on success. The caller passes the
+// decoded form to the per-resource handlers so a URL like
+// `/tables/foo%20bar` reaches AdminDescribeTable with "foo bar"
+// rather than "foo%20bar".
+//
+// Note on double-encoding: `%252F` decodes to `%2F` (a literal
+// percent-2F), not to `/`. That's correct — `%252F` is the
+// percent-encoded form of the string "%2F", which is itself
+// non-traversal content. The decoded `%2F` does not contain a
+// literal `/`, so the slash check passes. Only a single layer of
+// percent-encoded slash is rejected, matching the actual attack
+// class (a single-encoded slash that bypasses the literal `/`
+// split).
+func decodeAndValidatePathSegment(seg string) (string, bool) {
 	if seg == "" {
-		return false
+		return "", false
 	}
-	if strings.ContainsRune(seg, '%') {
-		return false
+	decoded, err := url.PathUnescape(seg)
+	if err != nil {
+		return "", false
 	}
-	if seg == "." || seg == ".." {
-		return false
+	if strings.ContainsRune(decoded, '/') {
+		return "", false
 	}
-	return true
+	if decoded == "." || decoded == ".." {
+		return "", false
+	}
+	return decoded, true
 }
 
 // dynamoListResponse is the JSON shape returned by GET /tables.

@@ -416,6 +416,21 @@ func decodeAdminItemKeySegment2(segment string) (map[string]AdminAttributeValue,
 // the path segment — extra non-key attributes in the body are
 // fine (they're the item's payload). A path key attribute that
 // is missing from the body is the rejection case.
+//
+// Schema-awareness limit (Codex P2 on PR #813): this check cannot
+// reject a body that declares MORE primary-key columns than the
+// URL key, because the HTTP layer has no schema. On a hash+range
+// table where the URL key omits the sort key, a PUT carrying a
+// full (pk, sk) body succeeds — the item lands at (pk, sk), which
+// is a different resource from the URL's `pk`-only identifier.
+// The adapter's existing schema-aware key validation ensures the
+// stored item's primary key is well-formed; only the URL contract
+// is loose. The principled fix is to plumb the URL key into
+// AdminPutItem as a separate argument so the adapter can compare
+// body's schema-derived primary key against the URL key. That
+// change crosses the Phase-2a (adapter) boundary and is tracked
+// separately; the HTTP-only check here stays the URL ⊆ body
+// subset rule.
 func assertItemBodyMatchesPathKey(item AdminItem, pathKey map[string]AdminAttributeValue) error {
 	if item.Attributes == nil {
 		return errors.New("item body is missing the attributes field")

@@ -265,10 +265,10 @@ func TestDynamoItems_RoutingRejectsPercentInSegment(t *testing.T) {
 	src := newStubItemsSource()
 	h := newDynamoHandlerForTest(src)
 
-	// %2f is the URL-encoded forward slash. The 6-step dispatch
-	// rejects any `%` in a segment regardless of whether the
-	// browser decoded it; closes the percent-encoded path
-	// traversal classes.
+	// %2f decodes to `/` which would split the segment. The validator
+	// now decodes each segment first (Codex P1 on PR #813 — allow
+	// %20 / UTF-8 in table names) but still rejects decoded `/`,
+	// `.`, and `..` to keep the path-traversal classes closed.
 	req := httptest.NewRequest(http.MethodGet, pathDynamoTables+"/orders%2fother/items", nil)
 	req = withReadOnlyPrincipal(req)
 	rec := httptest.NewRecorder()
@@ -584,6 +584,59 @@ func TestDynamoItems_TranslatesSentinelsToStatus(t *testing.T) {
 }
 
 // ---------- body-validation defence-in-depth (Gemini medium on PR #813) ----------
+
+// TestDynamoItems_RoutingAcceptsPercentEncodedTableName pins the
+// Codex P1 on PR #813 fix: a table name containing characters that
+// must be URL-escaped (spaces, UTF-8, etc.) must still be routable
+// via its percent-encoded form. validateCreateTableRequest only
+// blocks empty and `/`, so a table named "foo bar" is creatable; if
+// the dispatcher rejected the percent-encoded segment outright, the
+// table would be unreachable through describe / delete / items.
+func TestDynamoItems_RoutingAcceptsPercentEncodedTableName(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	src.tables = map[string]*DynamoTableSummary{
+		"foo bar": {Name: "foo bar", PartitionKey: "pk"},
+	}
+	h := newDynamoHandlerForTest(src)
+
+	// GET /tables/foo%20bar must decode to "foo bar" before
+	// AdminDescribeTable is called.
+	req := httptest.NewRequest(http.MethodGet,
+		pathDynamoTables+"/foo%20bar", nil)
+	req = withReadOnlyPrincipal(req)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+}
+
+// TestDynamoItems_RoutingRejectsPercentEncodedSlash keeps the
+// path-traversal defence: %2f decodes to `/`, which would split the
+// segment after decode. The validator must reject the decoded `/`
+// regardless of whether it arrived raw or percent-encoded (Codex P1
+// on PR #813 narrowed the % rejection to decoded forms).
+func TestDynamoItems_RoutingRejectsPercentEncodedSlash(t *testing.T) {
+	t.Parallel()
+	src := newStubItemsSource()
+	h := newDynamoHandlerForTest(src)
+
+	cases := []string{
+		pathDynamoTables + "/orders%2fother",      // %2f → decoded `/`
+		pathDynamoTables + "/orders%2Fother",      // %2F → decoded `/` (upper)
+		pathDynamoTables + "/%2e",                 // %2e → decoded `.`  (dot-segment)
+		pathDynamoTables + "/%2E%2E",              // %2E%2E → decoded `..` (dot-segment)
+		pathDynamoTables + "/orders/%2e%2e/items", // %2e%2e → `..` mid-path
+	}
+	for _, url := range cases {
+		t.Run(url, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, url, nil)
+			req = withReadOnlyPrincipal(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+		})
+	}
+}
 
 // TestDynamoItems_AttributeValue_EmptyContainersRoundTrip locks down
 // that an item carrying an empty L or M attribute serializes with

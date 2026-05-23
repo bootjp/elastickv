@@ -730,6 +730,16 @@ func translateAdminItemsError(err error) error {
 		return admin.ErrItemsTableNotFound
 	case errors.Is(err, adapter.ErrAdminDynamoValidation):
 		return admin.ErrItemsValidation
+	case isLeaderChurnError(err):
+		// Mid-dispatch leadership churn looks like an internal error
+		// from the kv coordinator (election finishes between the
+		// adapter's isVerifiedDynamoLeader check and the actual
+		// Raft propose). Map to the Items not-leader sentinel so the
+		// handler returns 503 + Retry-After: 1 and the SPA's retry
+		// contract stays intact (Codex P2 on PR #813 — the table-side
+		// translator already does this; the item-side translator
+		// initially shipped without the parallel branch).
+		return admin.ErrItemsNotLeader
 	default:
 		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
 	}
