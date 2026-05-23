@@ -719,3 +719,49 @@ type scanAtErrStore struct {
 func (s *scanAtErrStore) ScanAt(_ context.Context, _ []byte, _ []byte, _ int, _ uint64) ([]*store.KVPair, error) {
 	return nil, s.err
 }
+
+// getAtErrStore is the GetAt-side counterpart. AdminListObjects'
+// loadBucketMetaAt step is a GetAt at the token's readTS — if the
+// token has aged out far enough that even the bucket meta is no
+// longer fetchable, the GetAt surfaces ErrReadTSCompacted BEFORE
+// the scan loop runs. The admin path must translate this into
+// ErrAdminInvalidContinuationToken too (Codex r2 P2 on PR #811).
+type getAtErrStore struct {
+	store.MVCCStore
+	err error
+}
+
+func (s *getAtErrStore) GetAt(_ context.Context, _ []byte, _ uint64) ([]byte, error) {
+	return nil, s.err
+}
+
+// TestS3Server_AdminListObjects_RejectsExpiredTokenAtBucketMeta
+// pins Codex r2 P2: when a token's readTS has been compacted
+// past the bucket-meta load (the first GetAt that runs inside
+// AdminListObjects with the token's readTS), that error path
+// must also surface as ErrAdminInvalidContinuationToken — NOT
+// a generic 500.
+func TestS3Server_AdminListObjects_RejectsExpiredTokenAtBucketMeta(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "metaexp")
+	putObjectsForListTest(t, server, "metaexp", "a", "b")
+
+	page1, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "metaexp",
+		AdminListObjectsOptions{MaxKeys: 1})
+	require.NoError(t, err)
+	require.NotEmpty(t, page1.NextContinuationToken)
+
+	// Inject ErrReadTSCompacted on the GetAt path so the
+	// continuation-token-driven loadBucketMetaAt surfaces it.
+	server.store = &getAtErrStore{MVCCStore: st, err: store.ErrReadTSCompacted}
+
+	_, err = server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "metaexp",
+		AdminListObjectsOptions{ContinuationToken: page1.NextContinuationToken})
+	require.True(t, errors.Is(err, ErrAdminInvalidContinuationToken),
+		"want ErrAdminInvalidContinuationToken when bucket-meta load hits compacted readTS; got %v", err)
+}

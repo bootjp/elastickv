@@ -646,6 +646,16 @@ func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipa
 
 	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
 	if err != nil {
+		// Same compaction-error translation as the ScanAt path
+		// below: when the caller passed a continuation token whose
+		// readTS has been MVCC-GC'd past, loadBucketMetaAt's GetAt
+		// also surfaces ErrReadTSCompacted — callers need to see
+		// the dedicated sentinel rather than a generic 500 (Codex
+		// r2 P2 on PR #811).
+		if token != nil && errors.Is(err, store.ErrReadTSCompacted) {
+			return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidContinuationToken,
+				"continuation token readTS has been compacted")
+		}
 		return AdminObjectListing{}, errors.WithStack(err)
 	}
 	if !exists || meta == nil {
