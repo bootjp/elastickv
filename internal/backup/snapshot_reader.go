@@ -198,11 +198,28 @@ type SnapshotHeader struct {
 // SnapshotEntry.Tombstone — callers decide whether to suppress
 // them (Phase 0a's intended behavior for backup output) or include
 // them (a multi-version diagnostic dump might want both).
+//
+// Callers that need the header even when the snapshot has zero
+// entries (and so the callback never fires) should use
+// ReadSnapshotWithHeader, which surfaces it as a separate return
+// value. The callback's per-entry SnapshotHeader argument carries
+// the same value but only fires when at least one entry exists.
 func ReadSnapshot(r io.Reader, fn func(SnapshotHeader, SnapshotEntry) error) error {
+	_, err := ReadSnapshotWithHeader(r, fn)
+	return err
+}
+
+// ReadSnapshotWithHeader is the variant of ReadSnapshot that returns
+// the decoded EKVPBBL1 header even when the snapshot contained zero
+// entries (in which case fn is never called). Phase 0a's
+// DecodeSnapshot needs this so MANIFEST.json's `last_commit_ts`
+// field is populated for an empty-snapshot dump — the per-entry
+// callback's header argument cannot fire on a header-only file.
+func ReadSnapshotWithHeader(r io.Reader, fn func(SnapshotHeader, SnapshotEntry) error) (SnapshotHeader, error) {
 	br := bufio.NewReader(r)
 	header, err := readSnapshotHeader(br)
 	if err != nil {
-		return err
+		return SnapshotHeader{}, err
 	}
 	var (
 		keyBuf [1 << 16]byte
@@ -211,10 +228,10 @@ func ReadSnapshot(r io.Reader, fn func(SnapshotHeader, SnapshotEntry) error) err
 	for {
 		stop, err := readOneEntry(br, header, keyBuf[:], &valBuf, fn)
 		if err != nil {
-			return err
+			return header, err
 		}
 		if stop {
-			return nil
+			return header, nil
 		}
 	}
 }
