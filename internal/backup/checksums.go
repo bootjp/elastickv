@@ -72,14 +72,40 @@ func WriteChecksums(root string) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	defer func() { _ = out.Close() }()
+	if err := writeAllChecksumLines(out, entries); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return errors.WithStack(err)
+	}
+	// Surface Close errors instead of swallowing them. On NFS /
+	// some FUSE backends Close is the authoritative durability
+	// signal — writeback failures buffered after the Sync()
+	// fsync surface here, not at Write time. A swallowed Close
+	// would let the CLI declare success with a truncated or
+	// unreadable CHECKSUMS file. coderabbit Major on PR #810
+	// round 4 (same shape as the gemini r1 medium on
+	// emitManifest, applied here too).
+	if err := out.Close(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// writeAllChecksumLines emits the formatted CHECKSUMS rows. Split
+// out from WriteChecksums so the parent stays a thin
+// open-write-sync-close skeleton — its job is the durability
+// contract; the per-line escaping is delegated.
+func writeAllChecksumLines(w io.Writer, entries []checksumEntry) error {
 	for _, e := range entries {
 		line, prefix := formatChecksumLine(e.hex, e.relPath)
-		if _, err := fmt.Fprintf(out, "%s%s\n", prefix, line); err != nil {
+		if _, err := fmt.Fprintf(w, "%s%s\n", prefix, line); err != nil {
 			return errors.WithStack(err)
 		}
 	}
-	return errors.WithStack(out.Sync())
+	return nil
 }
 
 // formatChecksumLine builds one CHECKSUMS row using GNU coreutils

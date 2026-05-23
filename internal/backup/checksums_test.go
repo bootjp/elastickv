@@ -103,7 +103,11 @@ func TestVerifyChecksums_HappyPath(t *testing.T) {
 
 // TestVerifyChecksums_DetectsTampering pins the failure mode: a
 // post-checksum write to one of the listed files must surface as
-// a verification error.
+// ErrChecksumMismatch (not just "some error"). Pinning the
+// typed sentinel keeps the contract honest — a future change
+// that turns this into ErrChecksumsMalformedLine or
+// ErrChecksumsPathTraversal would otherwise pass this test
+// silently. CodeRabbit r5 nitpick on PR #810.
 func TestVerifyChecksums_DetectsTampering(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -112,8 +116,12 @@ func TestVerifyChecksums_DetectsTampering(t *testing.T) {
 		t.Fatalf("WriteChecksums: %v", err)
 	}
 	mustWrite(t, filepath.Join(root, "a.txt"), []byte("tampered"))
-	if err := VerifyChecksums(root); err == nil {
+	err := VerifyChecksums(root)
+	if err == nil {
 		t.Fatalf("expected VerifyChecksums to detect tampering, got nil")
+	}
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("err = %v, want ErrChecksumMismatch", err)
 	}
 }
 
