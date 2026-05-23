@@ -1373,6 +1373,40 @@ func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOnFanoutError(t *testing.T
 	}
 }
 
+// TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellation
+// pins the codex P2 finding on PR812: context.Canceled and
+// context.DeadlineExceeded surfaced by the fan-out closure MUST
+// keep their native gRPC code (Canceled / DeadlineExceeded)
+// rather than being squashed into FailedPrecondition.
+// FailedPrecondition is a configuration-failure signal; mapping
+// a transport-layer cancellation to it breaks client retry
+// logic that switches on the code.
+func TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellation(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		err      error
+		wantCode codes.Code
+	}{
+		{name: "canceled", err: context.Canceled, wantCode: codes.Canceled},
+		{name: "deadline_exceeded", err: context.DeadlineExceeded, wantCode: codes.DeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(&recordingProposer{}),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+				WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+				WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(admin.CapabilityFanoutResult{}, tc.err)),
+			)
+			_, err := srv.EnableStorageEnvelope(context.Background(), validEnableStorageEnvelopeRequest())
+			if status.Code(err) != tc.wantCode {
+				t.Errorf("EnableStorageEnvelope status=%v, want %v", status.Code(err), tc.wantCode)
+			}
+		})
+	}
+}
+
 // TestEncryptionAdmin_EnableStorageEnvelope_HappyPath drives the
 // full §3.2 happy path: leader gate passes, fan-out approves,
 // propose lands, post-apply sidecar shows the cutover effect, the

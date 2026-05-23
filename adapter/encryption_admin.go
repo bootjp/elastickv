@@ -743,6 +743,14 @@ func (s *EncryptionAdminServer) cutoverPrecheck(ctx context.Context, req *pb.Ena
 // helper and translates the OK / refuse / error branches into the
 // §3.2 step 6-7 status codes. Pulled out so the orchestration
 // body stays under the cyclomatic-complexity budget.
+//
+// Context-cancellation errors flow through with their gRPC code
+// (codes.Canceled / codes.DeadlineExceeded) so a client that
+// cancels mid-fan-out gets the right retry-semantics shape;
+// wrapping every err as FailedPrecondition would be a configuration-
+// failure signal that misleads automated retry logic (codex P2 on
+// PR812). Configuration-shape errors (zero-member snapshot, etc.)
+// remain FailedPrecondition.
 func (s *EncryptionAdminServer) runCutoverFanout(ctx context.Context) (admin.CapabilityFanoutResult, error) {
 	if s.capabilityFanout == nil {
 		return admin.CapabilityFanoutResult{}, grpcStatusError(codes.FailedPrecondition,
@@ -750,14 +758,33 @@ func (s *EncryptionAdminServer) runCutoverFanout(ctx context.Context) (admin.Cap
 	}
 	result, err := s.capabilityFanout(ctx)
 	if err != nil {
-		return admin.CapabilityFanoutResult{}, grpcStatusErrorf(codes.FailedPrecondition,
-			"encryption: capability fan-out failed: %v", err)
+		return admin.CapabilityFanoutResult{}, capabilityFanoutErrorToStatus(err)
 	}
 	if !result.OK {
 		return admin.CapabilityFanoutResult{}, grpcStatusErrorf(codes.FailedPrecondition,
 			"encryption: capability check refused cutover (%s)", capabilityRefusalSummary(result))
 	}
 	return result, nil
+}
+
+// capabilityFanoutErrorToStatus maps the fan-out helper's
+// possible failure modes to gRPC status codes. The transport-
+// layer ctx errors (caller canceled / deadline expired) keep
+// their native codes so a client's retry behaviour stays
+// correct; anything else surfaces as a configuration failure
+// (FailedPrecondition).
+func capabilityFanoutErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: capability fan-out canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: capability fan-out deadline exceeded: %v", err)
+	default:
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: capability fan-out failed: %v", err)
+	}
 }
 
 // proposeCutoverEntry composes the RotationPayload per §2.1 and
