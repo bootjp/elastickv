@@ -186,15 +186,33 @@ func TestRedis_ExpiredKey_BecomesInvisible(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
 	defer func() { _ = rdb.Close() }()
 
-	// Set a key with a very short TTL.
-	require.NoError(t, rdb.Do(ctx, "SET", "expiry:short", "v", "PX", "200").Err())
+	// PX=2000ms (was 200ms). The previous 200ms TTL races against
+	// the SET → GET round-trip latency on a 3-node Raft cluster
+	// under -race on CI runners: SET proposes through Raft, waits
+	// for quorum apply, and then returns OK, which can take
+	// 100–250ms on a slow runner. By the time the "visible before
+	// expiry" GET fires, the wall-clock-based TTL has already
+	// fired and the GET returns redis.Nil — a recurring flake
+	// observed across PRs #813/#814/#815/#816 today, all of which
+	// share no code with the Redis adapter.
+	//
+	// 2s is comfortably past the worst observed SET-ack latency
+	// (~250ms on CI) while still letting the "must be gone after
+	// expiry" loop's 5s deadline (raised below) catch the expiry
+	// well before the test deadline.
+	const initialTTL = 2 * time.Second
+	require.NoError(t, rdb.Do(ctx, "SET", "expiry:short", "v", "PX",
+		initialTTL.Milliseconds()).Err())
 
 	got, err := rdb.Get(ctx, "expiry:short").Result()
 	require.NoError(t, err)
 	require.Equal(t, "v", got, "key must be visible before expiry")
 
+	// 5s deadline (was 1s) so a slow CI runner has headroom past
+	// the 2s TTL + the Eventually poll cadence (25ms tick) +
+	// any additional latency from Raft-replicated DEL on expiry.
 	require.Eventually(t, func() bool {
 		_, e := rdb.Get(ctx, "expiry:short").Result()
 		return errors.Is(e, redis.Nil)
-	}, time.Second, 25*time.Millisecond, "key must be gone after expiry")
+	}, 5*time.Second, 25*time.Millisecond, "key must be gone after expiry")
 }
