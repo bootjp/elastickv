@@ -26,6 +26,12 @@ const adminS3UploadMaxBytes int64 = 100 * 1024 * 1024
 // to 413 Payload Too Large.
 var ErrAdminUploadTooLarge = errors.New("s3 admin: object exceeds upload cap")
 
+// defaultS3ContentType is the MIME type stored on / surfaced by
+// admin RPCs when the caller (or the manifest) does not name one
+// explicitly. Matches the AWS S3 default and the SigV4 putObject
+// path's headerOrDefault fallback.
+const defaultS3ContentType = "application/octet-stream"
+
 // Phase 2b — object-level admin RPCs on *S3Server. Mirrors the
 // item-level admin surface DynamoDB ships in dynamodb_admin_items.go
 // (Scan / Get / Put / Delete) and follows the same gating model:
@@ -296,7 +302,7 @@ func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string,
 	}
 	ct := strings.TrimSpace(contentType)
 	if ct == "" {
-		ct = "application/octet-stream"
+		ct = defaultS3ContentType
 	}
 	manifest := &s3ObjectManifest{
 		UploadID:        uploadID,
@@ -386,7 +392,7 @@ func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal,
 		StorageClass: "STANDARD",
 	}
 	if adminMeta.ContentType == "" {
-		adminMeta.ContentType = "application/octet-stream"
+		adminMeta.ContentType = defaultS3ContentType
 	}
 	return body, adminMeta, nil
 }
@@ -539,4 +545,192 @@ func (r *s3AdminObjectReader) Close() error {
 		r.pin = nil
 	}
 	return nil
+}
+
+// AdminListObjectsOptions controls one AdminListObjects call.
+// Defaults match the design doc §3.1.2: MaxKeys=100, clamped to
+// [1, adminListObjectsMaxKeys=1000].
+type AdminListObjectsOptions struct {
+	Prefix            string `json:"prefix,omitempty"`
+	Delimiter         string `json:"delimiter,omitempty"`
+	ContinuationToken string `json:"continuation_token,omitempty"`
+	MaxKeys           int    `json:"max_keys,omitempty"`
+}
+
+// AdminObjectListing is the AdminListObjects response shape.
+// CommonPrefixes are populated only when Options.Delimiter is set;
+// they represent the pseudo-directories the SPA renders as
+// foldable rows. NextContinuationToken is empty when the page
+// fully drained the prefix scan.
+type AdminObjectListing struct {
+	Objects               []AdminObject `json:"objects"`
+	CommonPrefixes        []string      `json:"common_prefixes,omitempty"`
+	NextContinuationToken string        `json:"next_continuation_token,omitempty"`
+}
+
+const (
+	adminListObjectsDefaultMaxKeys = 100
+	adminListObjectsMaxKeysCap     = 1000
+)
+
+// clampAdminListMaxKeys folds the user-supplied MaxKeys into the
+// legal [1, 1000] range, mapping 0 (unset) to the default 100.
+func clampAdminListMaxKeys(n int) int {
+	if n <= 0 {
+		return adminListObjectsDefaultMaxKeys
+	}
+	if n > adminListObjectsMaxKeysCap {
+		return adminListObjectsMaxKeysCap
+	}
+	return n
+}
+
+// AdminListObjects returns a bounded page of objects under a
+// prefix. Read role required. Delimiter collapses pseudo-folders
+// into CommonPrefixes the same way SigV4 ListObjectsV2 does.
+//
+// Sentinels:
+//   - ErrAdminForbidden          — principal lacks read role
+//   - ErrAdminNotLeader          — follower
+//   - ErrAdminBucketNotFound     — bucket absent
+//   - ErrAdminInvalidBucketName  — malformed bucket name
+//   - ErrAdminDynamoValidation NOT used here — admin-list-objects
+//     reuses ErrAdminInvalidBucketName for the only validation path
+//     (bucket-name shape); a malformed continuation token comes back
+//     as a wrapped json/decode error from the SigV4 helper.
+//
+// prefix / delimiter collapsing; mirrors the SigV4 listObjectsV2
+// precedent at s3.go (same scan-and-collapse pipeline with one
+// error-return per stage). Splitting further would obscure the
+// pagination cursor lifecycle.
+//
+//nolint:cyclop,gocognit,gocyclo,nestif // Sequential scan-loop with
+func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipal, bucket string, opts AdminListObjectsOptions) (AdminObjectListing, error) {
+	if !principal.Role.canRead() {
+		return AdminObjectListing{}, ErrAdminForbidden
+	}
+	if !s.isVerifiedS3Leader(ctx) {
+		return AdminObjectListing{}, ErrAdminNotLeader
+	}
+	if err := validateS3BucketName(bucket); err != nil {
+		return AdminObjectListing{}, errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
+	}
+
+	token, err := decodeS3ContinuationToken(opts.ContinuationToken)
+	if err != nil {
+		return AdminObjectListing{}, errors.Wrap(err, "decode continuation token")
+	}
+
+	readTS := s.readTS()
+	if token != nil && token.ReadTS != 0 {
+		readTS = token.ReadTS
+	}
+
+	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
+	if err != nil {
+		return AdminObjectListing{}, errors.WithStack(err)
+	}
+	if !exists || meta == nil {
+		return AdminObjectListing{}, ErrAdminBucketNotFound
+	}
+
+	if token != nil && (token.Bucket != bucket || token.Generation != meta.Generation ||
+		token.Prefix != opts.Prefix || token.Delimiter != opts.Delimiter) {
+		return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidBucketName,
+			"continuation token does not match request")
+	}
+
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	start := s3keys.ObjectManifestScanStart(bucket, meta.Generation, opts.Prefix)
+	if token != nil {
+		start = nextScanCursor(s3keys.ObjectManifestKey(bucket, token.Generation, token.LastKey))
+	}
+	end := prefixScanEnd(s3keys.ObjectManifestScanStart(bucket, meta.Generation, opts.Prefix))
+	maxKeys := clampAdminListMaxKeys(opts.MaxKeys)
+
+	out := AdminObjectListing{Objects: []AdminObject{}}
+	commonPrefixSeen := map[string]struct{}{}
+	if token != nil && token.LastCommonPrefix != "" {
+		commonPrefixSeen[token.LastCommonPrefix] = struct{}{}
+	}
+	cursor := start
+	truncated := false
+	emitted := 0
+	var lastKey, lastCommonPrefix string
+
+	for emitted < maxKeys {
+		pageLimit := s3ListPageSize
+		if remaining := maxKeys - emitted; remaining < pageLimit {
+			pageLimit = remaining
+		}
+		page, err := s.store.ScanAt(ctx, cursor, end, pageLimit, readTS)
+		if err != nil {
+			return AdminObjectListing{}, errors.WithStack(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, kvp := range page {
+			_, generation, objectKey, ok := s3keys.ParseObjectManifestKey(kvp.Key)
+			if !ok || generation != meta.Generation || !strings.HasPrefix(objectKey, opts.Prefix) {
+				continue
+			}
+			if opts.Delimiter != "" {
+				suffix := strings.TrimPrefix(objectKey, opts.Prefix)
+				if idx := strings.Index(suffix, opts.Delimiter); idx >= 0 {
+					commonPrefix := opts.Prefix + suffix[:idx+len(opts.Delimiter)]
+					if _, exists := commonPrefixSeen[commonPrefix]; !exists {
+						commonPrefixSeen[commonPrefix] = struct{}{}
+						out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix)
+						emitted++
+						lastKey = objectKey
+						lastCommonPrefix = commonPrefix
+					}
+					if emitted >= maxKeys {
+						truncated = true
+						break
+					}
+					continue
+				}
+			}
+			manifest, err := decodeS3ObjectManifest(kvp.Value)
+			if err != nil {
+				return AdminObjectListing{}, errors.WithStack(err)
+			}
+			ct := manifest.ContentType
+			if ct == "" {
+				ct = defaultS3ContentType
+			}
+			out.Objects = append(out.Objects, AdminObject{
+				Key:          objectKey,
+				Size:         manifest.SizeBytes,
+				ContentType:  ct,
+				ETag:         manifest.ETag,
+				LastModified: hlcToTime(manifest.LastModifiedHLC),
+				StorageClass: "STANDARD",
+			})
+			emitted++
+			lastKey = objectKey
+			lastCommonPrefix = ""
+			if emitted >= maxKeys {
+				truncated = true
+				break
+			}
+		}
+		if truncated {
+			break
+		}
+		cursor = nextScanCursor(page[len(page)-1].Key)
+		if len(page) < pageLimit {
+			break
+		}
+	}
+
+	if truncated {
+		out.NextContinuationToken = encodeS3ContinuationToken(bucket, meta.Generation,
+			opts.Prefix, opts.Delimiter, lastKey, lastCommonPrefix, readTS)
+	}
+	return out, nil
 }

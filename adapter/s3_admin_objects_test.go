@@ -441,3 +441,191 @@ func TestS3Server_AdminGetObject_RejectsEmptyKey(t *testing.T) {
 	require.True(t, errors.Is(err, ErrAdminInvalidObjectKey),
 		"want ErrAdminInvalidObjectKey; got %v", err)
 }
+
+// AdminListObjects tests
+
+func putObjectsForListTest(t *testing.T, server *S3Server, bucket string, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		require.NoError(t, server.AdminPutObject(context.Background(),
+			fullAdminBucketsPrincipal(), bucket, k, strings.NewReader("v"), "text/plain"),
+			"put %q", k)
+	}
+}
+
+func TestS3Server_AdminListObjects_Empty(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "emptybucket")
+
+	got, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "emptybucket", AdminListObjectsOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, got.Objects, "Objects must be non-nil so JSON renders [] not null")
+	require.Len(t, got.Objects, 0)
+	require.Empty(t, got.CommonPrefixes)
+	require.Empty(t, got.NextContinuationToken)
+}
+
+func TestS3Server_AdminListObjects_FlatListing(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "flatbucket")
+	putObjectsForListTest(t, server, "flatbucket", "a", "b", "c")
+
+	got, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "flatbucket", AdminListObjectsOptions{})
+	require.NoError(t, err)
+	require.Len(t, got.Objects, 3)
+	require.Equal(t, []string{"a", "b", "c"},
+		[]string{got.Objects[0].Key, got.Objects[1].Key, got.Objects[2].Key},
+		"objects must be sorted lexically (scan order)")
+	require.Empty(t, got.CommonPrefixes)
+}
+
+func TestS3Server_AdminListObjects_PrefixFiltersAndCollapsesWithDelimiter(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "treebucket")
+	putObjectsForListTest(t, server, "treebucket",
+		"a/x", "a/y", "b/z", "top.txt")
+
+	// Prefix only (no delimiter): all matching keys, no collapsing.
+	got, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "treebucket",
+		AdminListObjectsOptions{Prefix: "a/"})
+	require.NoError(t, err)
+	require.Len(t, got.Objects, 2)
+	require.Equal(t, "a/x", got.Objects[0].Key)
+	require.Equal(t, "a/y", got.Objects[1].Key)
+	require.Empty(t, got.CommonPrefixes)
+
+	// Delimiter "/": children of root, with subfolders collapsed.
+	got, err = server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "treebucket",
+		AdminListObjectsOptions{Delimiter: "/"})
+	require.NoError(t, err)
+	// "top.txt" is a leaf; "a/" and "b/" are common-prefix folders.
+	require.ElementsMatch(t, []string{"a/", "b/"}, got.CommonPrefixes)
+	require.Len(t, got.Objects, 1)
+	require.Equal(t, "top.txt", got.Objects[0].Key)
+}
+
+func TestS3Server_AdminListObjects_MaxKeysClamped(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "clamps")
+	putObjectsForListTest(t, server, "clamps", "a", "b", "c", "d", "e")
+
+	// MaxKeys=2 — exactly 2 objects, NextContinuationToken non-empty.
+	got, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "clamps",
+		AdminListObjectsOptions{MaxKeys: 2})
+	require.NoError(t, err)
+	require.Len(t, got.Objects, 2)
+	require.NotEmpty(t, got.NextContinuationToken, "page below total must produce a continuation token")
+
+	// MaxKeys=0 — default 100, fits all 5.
+	got, err = server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "clamps",
+		AdminListObjectsOptions{})
+	require.NoError(t, err)
+	require.Len(t, got.Objects, 5)
+	require.Empty(t, got.NextContinuationToken)
+
+	// MaxKeys above the cap is clamped to 1000 (not tested with
+	// 1000 objects to keep the test fast; just verify it accepts
+	// the over-cap value without error).
+	got, err = server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "clamps",
+		AdminListObjectsOptions{MaxKeys: 10_000})
+	require.NoError(t, err)
+	require.Len(t, got.Objects, 5)
+}
+
+func TestS3Server_AdminListObjects_PagesViaContinuationToken(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "pages")
+	putObjectsForListTest(t, server, "pages", "a", "b", "c", "d", "e")
+
+	page1, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "pages",
+		AdminListObjectsOptions{MaxKeys: 2})
+	require.NoError(t, err)
+	require.Len(t, page1.Objects, 2)
+	require.NotEmpty(t, page1.NextContinuationToken)
+
+	page2, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "pages",
+		AdminListObjectsOptions{MaxKeys: 2, ContinuationToken: page1.NextContinuationToken})
+	require.NoError(t, err)
+	require.Len(t, page2.Objects, 2)
+	require.NotEmpty(t, page2.NextContinuationToken)
+
+	page3, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "pages",
+		AdminListObjectsOptions{MaxKeys: 2, ContinuationToken: page2.NextContinuationToken})
+	require.NoError(t, err)
+	require.Len(t, page3.Objects, 1)
+	require.Empty(t, page3.NextContinuationToken, "last page must terminate the token chain")
+
+	// Concatenating all three pages must reproduce the full list
+	// in scan order (no duplicates, no gaps).
+	got := make([]string, 0, 5)
+	for _, p := range []AdminObjectListing{page1, page2, page3} {
+		for _, o := range p.Objects {
+			got = append(got, o.Key)
+		}
+	}
+	require.Equal(t, []string{"a", "b", "c", "d", "e"}, got)
+}
+
+func TestS3Server_AdminListObjects_MissingBucket(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	_, err := server.AdminListObjects(context.Background(),
+		fullAdminBucketsPrincipal(), "ghost", AdminListObjectsOptions{})
+	require.True(t, errors.Is(err, ErrAdminBucketNotFound),
+		"want ErrAdminBucketNotFound; got %v", err)
+}
+
+func TestS3Server_AdminListObjects_AllowsReadOnly(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "readbucket")
+	putObjectsForListTest(t, server, "readbucket", "x")
+
+	got, err := server.AdminListObjects(context.Background(),
+		readOnlyAdminBucketsPrincipal(), "readbucket", AdminListObjectsOptions{})
+	require.NoError(t, err)
+	require.Len(t, got.Objects, 1)
+}
+
+func TestS3Server_AdminListObjects_RejectsAnonymous(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	createBucketForAdminTest(t, server, "anonbucket")
+
+	_, err := server.AdminListObjects(context.Background(),
+		AdminPrincipal{}, "anonbucket", AdminListObjectsOptions{})
+	require.ErrorIs(t, err, ErrAdminForbidden,
+		"nil-role principal must be denied")
+}
