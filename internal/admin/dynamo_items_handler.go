@@ -312,6 +312,14 @@ func (h *DynamoHandler) handleItemDelete(w http.ResponseWriter, r *http.Request,
 // a method on DynamoHandler because it's only used by item-level
 // handlers; the existing list/describe paths use the looser session-
 // auth gate (their output is metadata, not content).
+//
+// JWT role gate fires unconditionally before the optional live-store
+// re-check (matches principalForWrite's defence-in-depth pattern from
+// PR #669). A token minted with role=none cannot slip through reads
+// via a later live-role promotion; the live re-check can only further
+// constrain. Claude review on PR #814 r2 caught the parallel S3
+// asymmetry; this fix lands on PR #813 to keep the items handler
+// consistent with the contract documented in principalForWrite.
 func (h *DynamoHandler) principalForItemRead(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
@@ -325,6 +333,11 @@ func (h *DynamoHandler) principalForItemRead(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
 		return AuthPrincipal{}, false
 	}
+	if !principal.Role.AllowsRead() {
+		writeJSONError(w, http.StatusForbidden, "forbidden",
+			"this access key is not authorised to read table contents")
+		return AuthPrincipal{}, false
+	}
 	if h.roles != nil {
 		live, exists := h.roles.LookupRole(principal.AccessKey)
 		if !exists || !live.AllowsRead() {
@@ -332,11 +345,10 @@ func (h *DynamoHandler) principalForItemRead(w http.ResponseWriter, r *http.Requ
 				"this access key is not authorised to read table contents")
 			return AuthPrincipal{}, false
 		}
+		// Use the live role downstream — the JWT may carry a stale
+		// value but the live one is authoritative once both gates
+		// agree the request is allowed.
 		principal.Role = live
-	} else if !principal.Role.AllowsRead() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to read table contents")
-		return AuthPrincipal{}, false
 	}
 	return principal, true
 }
