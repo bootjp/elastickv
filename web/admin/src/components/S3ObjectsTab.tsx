@@ -92,6 +92,25 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
     }
   };
 
+  // Reset prefix to the bucket root whenever the bucket changes.
+  // React Router param changes reuse the same component instance,
+  // so without this the previous bucket's prefix would carry over
+  // and `bucket-b` would open at `bucket-a`'s subfolder until the
+  // operator manually clicked `(root)` — uploads / deletes in
+  // that window would target the wrong subpath, and the root-
+  // level objects would be invisible (Codex P2 on PR #816).
+  //
+  // This effect runs first, schedules setPrefix(""); the
+  // [bucket, prefix] effect below fires on the *next* render once
+  // prefix has flipped, so the user-visible network call uses
+  // prefix="". A brief loadPage(undefined, oldPrefix) does fire
+  // from this render's commit before the setPrefix re-render
+  // settles; the listAbortRef cancels it before it can land,
+  // so no stale rows leak through.
+  useEffect(() => {
+    setPrefix("");
+  }, [bucket]);
+
   // Initial load + bucket / prefix change refetches from the start.
   useEffect(() => {
     setCursorStack([]);
