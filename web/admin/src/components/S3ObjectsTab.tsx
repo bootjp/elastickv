@@ -102,23 +102,34 @@ export function S3ObjectsTab({ bucket }: S3ObjectsTabProps) {
     }
   };
 
-  // Reset prefix to the bucket root whenever the bucket changes.
-  // React Router param changes reuse the same component instance,
-  // so without this the previous bucket's prefix would carry over
-  // and `bucket-b` would open at `bucket-a`'s subfolder until the
-  // operator manually clicked `(root)` — uploads / deletes in
-  // that window would target the wrong subpath, and the root-
-  // level objects would be invisible (Codex P2 on PR #816).
+  // Reset prefix + close the detail modal whenever the bucket
+  // changes. React Router param changes reuse the same component
+  // instance, so without this two pieces of state leak across
+  // buckets:
   //
-  // This effect runs first, schedules setPrefix(""); the
-  // [bucket, prefix] effect below fires on the *next* render once
-  // prefix has flipped, so the user-visible network call uses
-  // prefix="". A brief loadPage(undefined, oldPrefix) does fire
-  // from this render's commit before the setPrefix re-render
-  // settles; the listAbortRef cancels it before it can land,
-  // so no stale rows leak through.
+  //   1. prefix — bucket-b would open at bucket-a's subfolder
+  //      until the operator manually clicked `(root)` (Codex P2
+  //      on PR #816 r1, fixed in r2);
+  //   2. detail — if a detail modal was open for an object in
+  //      bucket-a when the operator navigated to /s3/bucket-b,
+  //      the modal stayed open referencing the stale bucket-a
+  //      key. Clicking Delete would then call
+  //      api.deleteObject(bucketB, staleBucketAKey) (Claude
+  //      review on PR #816 r3 caught this — same cross-context
+  //      class as the prefix bug).
+  //
+  // This effect runs first, schedules the resets; the
+  // [bucket, prefix] effect below fires on the *next* render
+  // once prefix has flipped, so the user-visible network call
+  // uses prefix="". A brief loadPage(undefined, oldPrefix) does
+  // fire from this render's commit before the setPrefix
+  // re-render settles; listAbortRef cancels it before it can
+  // land, so no stale rows leak through.
   useEffect(() => {
     setPrefix("");
+    setDetail(null);
+    setConfirmDelete(false);
+    setDetailError(null);
   }, [bucket]);
 
   // Initial load + bucket / prefix change refetches from the start.
@@ -349,8 +360,13 @@ function Breadcrumb({ prefix, onClick }: BreadcrumbProps) {
       </button>
       {segments.map((seg, idx) => {
         const target = segments.slice(0, idx + 1).join("/") + "/";
+        // key=target rather than idx so React reconciles by the
+        // segment path itself — re-ordering or trimming the
+        // breadcrumb (e.g., the operator drops to a different
+        // depth) doesn't churn unrelated DOM nodes (Claude review
+        // on PR #816 r3 — nit).
         return (
-          <span key={idx} className="flex items-center gap-1">
+          <span key={target} className="flex items-center gap-1">
             <span>/</span>
             <button
               type="button"
