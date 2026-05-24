@@ -466,8 +466,24 @@ func buildKeyVizPeerURL(peer string, params keyVizParams) (string, error) {
 // mergeKeyVizMatrices combines per-node matrices into one. The merge
 // is column-wise on column_unix_ms (a column missing from a node
 // contributes 0 for every row); per-row keying is by BucketID. The
-// rule selector follows the requested series — reads sum, writes
-// max with conflict surfacing — per design 4.
+// rule selector follows the requested series:
+//
+//   - Reads / read_bytes: sum across nodes (independent local serves).
+//     Never raise the conflict flag.
+//   - Writes / write_bytes: §9.1 canonical merge — collapse to one
+//     value per (BucketID, RaftGroupID, LeaderTerm, column) by taking
+//     max within the same (group, term) (canonical Raft invariant:
+//     at most one leader per term per group), then SUM across
+//     distinct LeaderTerm values for the same (group, column).
+//     Surface conflict=true at the row level when ≥2 sources
+//     disagree within the SAME (group, term, column). Fall back to
+//     legacy max-merge (§4.2) for any cell where at least one source
+//     reports a zero/unknown identity (RaftGroupID=0 or
+//     LeaderTerm=0) so a legacy peer that doesn't yet emit the
+//     parallel-array wire fields never over-counts. Phase 2-C+ PR-3c
+//     promotes §4.2's row-level max to §9.1's per-cell (group, term)
+//     algorithm — see parent design `docs/admin_ui_key_visualizer_-
+//     design.md` §9.1.
 func mergeKeyVizMatrices(matrices []KeyVizMatrix, series KeyVizSeries) KeyVizMatrix {
 	if len(matrices) == 0 {
 		return KeyVizMatrix{Series: series}
@@ -482,59 +498,115 @@ func mergeKeyVizMatrices(matrices []KeyVizMatrix, series KeyVizSeries) KeyVizMat
 	for i, ts := range columns {
 		indexByColumn[ts] = i
 	}
-	rowsByBucket := make(map[string]*KeyVizRow, keyVizMergeBucketHint)
+	useGroupTermDedupe := mergeUsesGroupTermDedupe(series)
+	accByBucket := make(map[string]*rowMergeAcc, keyVizMergeBucketHint)
 	bucketOrder := make([]string, 0, keyVizMergeBucketHint)
-	mergeFn := mergeFnFor(series)
 	for mi := range matrices {
 		m := &matrices[mi]
 		for ri := range m.Rows {
-			mergeRowInto(&m.Rows[ri], m.ColumnUnixMs, indexByColumn, rowsByBucket, &bucketOrder, len(columns), mergeFn)
+			mergeRowInto(&m.Rows[ri], m.ColumnUnixMs, indexByColumn, accByBucket, &bucketOrder, len(columns), useGroupTermDedupe)
 		}
 	}
 	out := KeyVizMatrix{
 		ColumnUnixMs: columns,
 		Series:       series,
-		Rows:         make([]KeyVizRow, 0, len(rowsByBucket)),
+		Rows:         make([]KeyVizRow, 0, len(accByBucket)),
 	}
 	for _, bucket := range bucketOrder {
-		out.Rows = append(out.Rows, *rowsByBucket[bucket])
+		out.Rows = append(out.Rows, resolveRowMergeAcc(accByBucket[bucket], useGroupTermDedupe))
 	}
 	return out
 }
 
-// mergeRowInto folds one source row into the merge accumulator. Split
-// out of mergeKeyVizMatrices to keep that function under the cyclop
-// budget (and so this body — the part that actually does the merge
-// per-cell — has its own contained set of branches).
+// rowMergeAcc is the per-bucket accumulator state populated by all
+// source rows that share a BucketID. Per-cell merge state lives in
+// `cells`; row-level metadata (Start, End, Aggregate, …) is captured
+// from the first-seen source.
+type rowMergeAcc struct {
+	bucketID          string
+	start, end        []byte
+	aggregate         bool
+	routeIDs          []uint64
+	routeIDsTruncated bool
+	routeCount        uint64
+	cells             []cellMergeAcc
+}
+
+// cellMergeAcc tracks merge state for one (bucket, column) cell.
+// For reads: only `sum` and the last-seen identity matter.
+// For writes: `byTerm` maps (group, term) to the canonical (max)
+// value reported by any source; `termConflict` records which keys
+// saw disagreement. `hasUnknownTerm` forces the fallback max-merge
+// path at resolve time so a legacy peer (or a node whose
+// SetLeaderTerm publisher has not fired) never causes the per-term
+// sum to over-count.
+type cellMergeAcc struct {
+	// Read path (sumMerge): running sum across all sources.
+	sum uint64
+	// Read path identity: last non-zero contributor's (group, term).
+	// Best-effort, matching the round-1/round-2 PR-3b documented
+	// "last-touched" semantics for reads. For writes the resolved
+	// identity comes from `byTerm` largest value at resolve time.
+	lastGroup, lastTerm uint64
+
+	// Write path (group-term dedupe + sum across terms):
+	byTerm         map[termKey]uint64
+	termConflict   map[termKey]bool
+	hasUnknownTerm bool
+	// Fallback max-merge state, used when hasUnknownTerm is true.
+	// Tracks the maximum value seen and whether two non-zero
+	// distinct values were ever observed at this cell.
+	fallbackMax              uint64
+	fallbackNonZeroDistinct  bool
+	fallbackSeenNonZeroValue uint64
+}
+
+type termKey struct {
+	group uint64
+	term  uint64
+}
+
+// mergeUsesGroupTermDedupe gates the §9.1 (group, term) algorithm.
+// Writes use it; reads stay on the legacy sum-across-nodes path
+// because local serves are independent and never need per-leader
+// dedupe.
+func mergeUsesGroupTermDedupe(series KeyVizSeries) bool {
+	switch series {
+	case keyVizSeriesWrites, keyVizSeriesWriteBytes:
+		return true
+	case keyVizSeriesReads, keyVizSeriesReadBytes:
+		return false
+	default:
+		return false
+	}
+}
+
+// mergeRowInto folds one source row into the per-bucket accumulator.
+// Phase 2-C+ PR-3c: per-cell state is accumulated here, but the
+// resolution (sum across (group, term); fallback to max) happens
+// after all sources have been seen — see resolveRowMergeAcc.
 func mergeRowInto(
 	row *KeyVizRow,
 	srcColumns []int64,
 	indexByColumn map[int64]int,
-	rowsByBucket map[string]*KeyVizRow,
+	accByBucket map[string]*rowMergeAcc,
 	bucketOrder *[]string,
 	mergedWidth int,
-	mergeFn mergeCellFn,
+	useGroupTermDedupe bool,
 ) {
-	dst, ok := rowsByBucket[row.BucketID]
+	acc, ok := accByBucket[row.BucketID]
 	if !ok {
-		dst = &KeyVizRow{
-			BucketID:          row.BucketID,
-			Start:             append([]byte(nil), row.Start...),
-			End:               append([]byte(nil), row.End...),
-			Aggregate:         row.Aggregate,
-			RouteIDs:          append([]uint64(nil), row.RouteIDs...),
-			RouteIDsTruncated: row.RouteIDsTruncated,
-			RouteCount:        row.RouteCount,
-			Values:            make([]uint64, mergedWidth),
-			// Per-cell parallel arrays sized to the merged column
-			// width. Stamped per-cell in the loop below from the
-			// largest-source for that cell, so the identity always
-			// matches the value we kept (Gemini MEDIUM on PR #720
-			// resolved by going per-cell).
-			RaftGroupIDs: make([]uint64, mergedWidth),
-			LeaderTerms:  make([]uint64, mergedWidth),
+		acc = &rowMergeAcc{
+			bucketID:          row.BucketID,
+			start:             append([]byte(nil), row.Start...),
+			end:               append([]byte(nil), row.End...),
+			aggregate:         row.Aggregate,
+			routeIDs:          append([]uint64(nil), row.RouteIDs...),
+			routeIDsTruncated: row.RouteIDsTruncated,
+			routeCount:        row.RouteCount,
+			cells:             make([]cellMergeAcc, mergedWidth),
 		}
-		rowsByBucket[row.BucketID] = dst
+		accByBucket[row.BucketID] = acc
 		*bucketOrder = append(*bucketOrder, row.BucketID)
 	}
 	for j, ts := range srcColumns {
@@ -542,89 +614,170 @@ func mergeRowInto(
 		if !ok || j >= len(row.Values) {
 			continue
 		}
-		prev := dst.Values[idx]
-		next, conflict := mergeFn(prev, row.Values[j])
-		dst.Values[idx] = next
-		if conflict {
-			dst.Conflict = true
+		value := row.Values[j]
+		var group, term uint64
+		if j < len(row.RaftGroupIDs) {
+			group = row.RaftGroupIDs[j]
 		}
-		// Identity belongs to the source whose value we kept. For
-		// sumMerge (reads) this is best-effort: prev+incoming has
-		// no single owner, so we keep whichever side contributed
-		// most recently — close-to-correct in the steady state.
-		// For maxMerge (writes), `next == row.Values[j]` exactly
-		// when the incoming source won the cell; in the tied
-		// (prev == incoming != 0) case `next == prev`, both sides
-		// agree on the value, and either identity is acceptable.
-		if next == row.Values[j] {
-			// Mixed-version cluster: a legacy peer that does not
-			// emit raft_group_ids / leader_terms sends empty
-			// slices. When such a peer's value wins the cell, we
-			// must EXPLICITLY RESET dst.RaftGroupIDs[idx] /
-			// dst.LeaderTerms[idx] to 0 (the documented "term not
-			// tracked" sentinel) — leaving stale identity from a
-			// previous higher-versioned source would mislabel an
-			// unknown-term winning cell as a known term and break
-			// the per-cell dedupe/summing in PR-3c. (Codex P2
-			// round-2 on PR #720.)
-			if j < len(row.RaftGroupIDs) {
-				dst.RaftGroupIDs[idx] = row.RaftGroupIDs[j]
-			} else {
-				dst.RaftGroupIDs[idx] = 0
-			}
-			if j < len(row.LeaderTerms) {
-				dst.LeaderTerms[idx] = row.LeaderTerms[j]
-			} else {
-				dst.LeaderTerms[idx] = 0
-			}
+		if j < len(row.LeaderTerms) {
+			term = row.LeaderTerms[j]
+		}
+		if useGroupTermDedupe {
+			acc.cells[idx].addWrite(value, group, term)
+		} else {
+			acc.cells[idx].addRead(value, group, term)
 		}
 	}
 }
 
-// mergeCellFn returns the merged value plus a conflict flag.
-//
-//   - Reads (and read_bytes) sum across nodes and never raise the
-//     conflict flag — distinct local serves are independent counts.
-//   - Writes (and write_bytes) take the max across nodes and raise
-//     conflict when the inputs disagree (both non-zero with
-//     different values, or one zero and one non-zero would NOT be a
-//     conflict — that is the steady-state shape).
-type mergeCellFn func(prev, incoming uint64) (uint64, bool)
-
-func mergeFnFor(series KeyVizSeries) mergeCellFn {
-	switch series {
-	case keyVizSeriesReads, keyVizSeriesReadBytes:
-		return sumMerge
-	case keyVizSeriesWrites, keyVizSeriesWriteBytes:
-		return maxMerge
-	default:
-		return sumMerge
+// addRead is the sumMerge path: independent local serves accumulate
+// across all sources. Identity is best-effort last-touched.
+func (c *cellMergeAcc) addRead(value, group, term uint64) {
+	c.sum += value
+	if value > 0 {
+		c.lastGroup = group
+		c.lastTerm = term
 	}
 }
 
-func sumMerge(prev, incoming uint64) (uint64, bool) {
-	return prev + incoming, false
+// addWrite is the §9.1 path: track (group, term) buckets and
+// fallback-max state. Zero-valued contributions are ignored
+// (legacy max-merge treats `(prev, 0)` as no-op, matching §4.2).
+func (c *cellMergeAcc) addWrite(value, group, term uint64) {
+	if value == 0 {
+		return
+	}
+	c.updateFallbackState(value)
+	// LeaderTerm == 0 (or group == 0) means "term not tracked" —
+	// the documented sentinel from a legacy peer or a publisher
+	// that has not yet fired. We CANNOT safely sum across an
+	// unknown-term contribution because the unknown-term might
+	// overlap with a known-term entry; fall back to max-merge for
+	// the whole cell at resolve time.
+	if term == 0 || group == 0 {
+		c.hasUnknownTerm = true
+		return
+	}
+	c.recordTermContribution(termKey{group: group, term: term}, value)
 }
 
-// maxMerge pairs the §4.2 description: pick the larger value, raise
-// conflict when both inputs are non-zero AND disagree. Stable
-// leadership produces (0, X) or (X, 0) which collapse to X without
-// raising conflict; a leadership flip produces (X, Y) with both > 0
-// and the SPA hatches the row.
-func maxMerge(prev, incoming uint64) (uint64, bool) {
-	if prev == 0 {
-		return incoming, false
+// updateFallbackState advances the fallback-max accounting that
+// applies when hasUnknownTerm is set at resolve time. Maintained for
+// every non-zero contribution so a cell that later flips into the
+// fallback path has the correct running max + disagreement signal.
+func (c *cellMergeAcc) updateFallbackState(value uint64) {
+	if value > c.fallbackMax {
+		c.fallbackMax = value
 	}
-	if incoming == 0 {
-		return prev, false
+	if c.fallbackSeenNonZeroValue == 0 {
+		c.fallbackSeenNonZeroValue = value
+		return
 	}
-	if prev == incoming {
-		return prev, false
+	if c.fallbackSeenNonZeroValue != value {
+		c.fallbackNonZeroDistinct = true
 	}
-	if prev > incoming {
-		return prev, true
+}
+
+// recordTermContribution folds one (group, term) contribution into
+// the canonical byTerm map, flipping termConflict when ≥2 sources
+// disagree within the same key (a Raft invariant violation — at
+// most one leader per term per group).
+func (c *cellMergeAcc) recordTermContribution(key termKey, value uint64) {
+	if c.byTerm == nil {
+		c.byTerm = make(map[termKey]uint64, 1)
 	}
-	return incoming, true
+	existing, exists := c.byTerm[key]
+	if !exists {
+		c.byTerm[key] = value
+		return
+	}
+	if existing == value {
+		return // canonical agreement, no-op
+	}
+	if c.termConflict == nil {
+		c.termConflict = make(map[termKey]bool, 1)
+	}
+	c.termConflict[key] = true
+	if value > existing {
+		c.byTerm[key] = value
+	}
+}
+
+// resolveRowMergeAcc materialises a KeyVizRow from the accumulator.
+// For reads: cell.sum + last identity. For writes: either §9.1 sum
+// across (group, term) or fallback max-merge when hasUnknownTerm.
+// Sets row-level Conflict to any-cell-saw-conflict — Phase 2-C+
+// PR-3c keeps the wire-level conflict at row granularity; future
+// PR-3d may promote it to per-cell.
+func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
+	width := len(acc.cells)
+	row := KeyVizRow{
+		BucketID:          acc.bucketID,
+		Start:             acc.start,
+		End:               acc.end,
+		Aggregate:         acc.aggregate,
+		RouteIDs:          acc.routeIDs,
+		RouteIDsTruncated: acc.routeIDsTruncated,
+		RouteCount:        acc.routeCount,
+		Values:            make([]uint64, width),
+		RaftGroupIDs:      make([]uint64, width),
+		LeaderTerms:       make([]uint64, width),
+	}
+	for j := range acc.cells {
+		c := &acc.cells[j]
+		if useGroupTermDedupe {
+			row.Values[j], row.RaftGroupIDs[j], row.LeaderTerms[j] = c.resolveWrite()
+			if c.hasConflict() {
+				row.Conflict = true
+			}
+		} else {
+			row.Values[j] = c.sum
+			row.RaftGroupIDs[j] = c.lastGroup
+			row.LeaderTerms[j] = c.lastTerm
+		}
+	}
+	return row
+}
+
+// resolveWrite returns the canonical cell value plus the (group, term)
+// owner of the largest contribution. Falls back to max-merge when
+// hasUnknownTerm is set so a legacy peer never causes summing
+// across overlapping unknown/known windows.
+func (c *cellMergeAcc) resolveWrite() (value, group, term uint64) {
+	if c.hasUnknownTerm {
+		// Fallback: max-merge across all contributions; the only
+		// identity we have for the fallback path is the
+		// last-touched group/term (which may be 0 if every
+		// contribution was unknown), which matches the legacy
+		// §4.2 / PR-3b behavior the sentinel was designed to
+		// preserve.
+		return c.fallbackMax, c.lastGroup, c.lastTerm
+	}
+	var sum, largestValue, largestGroup, largestTerm uint64
+	for k, v := range c.byTerm {
+		sum += v
+		if v > largestValue {
+			largestValue = v
+			largestGroup = k.group
+			largestTerm = k.term
+		}
+	}
+	return sum, largestGroup, largestTerm
+}
+
+// hasConflict returns true when any (group, term) at this cell saw
+// disagreement, or — under the fallback path — when ≥2 distinct
+// non-zero values were reported.
+func (c *cellMergeAcc) hasConflict() bool {
+	if c.hasUnknownTerm {
+		return c.fallbackNonZeroDistinct
+	}
+	for k := range c.termConflict {
+		if c.termConflict[k] {
+			return true
+		}
+	}
+	return false
 }
 
 // unionColumns returns the sorted union of column timestamps across

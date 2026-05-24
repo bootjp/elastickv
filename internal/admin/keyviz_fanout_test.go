@@ -141,6 +141,101 @@ func TestMergeKeyVizMatricesLegacyPeerWinnerResetsIdentity(t *testing.T) {
 		"legacy winner without metadata must reset dst term to 0 sentinel — not inherit modern's 42")
 }
 
+// TestMergeKeyVizMatricesGroupTermSumAcrossTerms pins the Phase 2-C+
+// PR-3c canonical §9.1 algorithm: when two sources report non-zero
+// writes for the SAME (bucket, column) but DIFFERENT terms within
+// the same group, the merged cell SUMS the two values (each leader
+// only observes its own term's writes). Compare to PR-3b's §4.2
+// max-merge, which would have returned 50 and lost the ex-leader's
+// pre-transfer 30 → an undercount of the true window total.
+func TestMergeKeyVizMatricesGroupTermSumAcrossTerms(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	exLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	newLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{43}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{exLeader, newLeader}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{80}, merged.Rows[0].Values,
+		"§9.1: distinct (group, term) entries for the same cell must SUM, not max — ex-leader's 30 + new-leader's 50 = 80, recovering the pre-transfer slice the §4.2 max-merge would have lost")
+	require.False(t, merged.Rows[0].Conflict,
+		"distinct (group, term) entries are not a conflict — each leader is reporting its own term's writes")
+	// Identity: the larger term's value wins the per-cell identity slot.
+	require.Equal(t, []uint64{7}, merged.Rows[0].RaftGroupIDs)
+	require.Equal(t, []uint64{43}, merged.Rows[0].LeaderTerms, "new-leader (term=43, value=50) wins the identity slot because 50 > 30")
+}
+
+// TestMergeKeyVizMatricesGroupTermConflictWithinSameTerm pins the
+// §9.1 conflict predicate: two sources reporting DIFFERENT non-zero
+// values for the SAME (bucket, group, term, column) tuple is a Raft
+// invariant violation (at most one leader per term per group). The
+// merger keeps the larger value AND surfaces conflict=true.
+func TestMergeKeyVizMatricesGroupTermConflictWithinSameTerm(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{55}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{55}, merged.Rows[0].Values, "within-term disagreement keeps the larger value")
+	require.True(t, merged.Rows[0].Conflict,
+		"§9.1: within-(group, term) disagreement must raise the conflict flag — Raft invariant says one leader per term per group, so disagreement signals a real divergence operators need to see")
+}
+
+// TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm pins the
+// fail-closed fallback to §4.2 max-merge when ANY source contributes
+// an unknown identity (group=0 or term=0). A modern source reporting
+// 30 with (group=7, term=42) and a legacy source reporting 50 with
+// no metadata must NOT sum to 80 — the legacy source's term might
+// overlap with the modern source's term, so summing would
+// over-count. The fallback returns max=50.
+func TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	modern := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	legacy := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50}}, // no arrays — pre-PR-3b peer
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{modern, legacy}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50}, merged.Rows[0].Values,
+		"unknown-term fallback returns max-merge (50), not sum (80) — summing across an unknown term risks double-counting overlapping windows")
+	require.True(t, merged.Rows[0].Conflict, "fallback path raises conflict when ≥2 distinct non-zero values were seen")
+}
+
 // TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner pins the
 // Gemini MEDIUM fix: when maxMerge picks a value from one source,
 // the identity at that cell must come from the SAME source — not
