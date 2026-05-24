@@ -1,8 +1,31 @@
 # Admin Web UI for DynamoDB Item and S3 Object CRUD
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-05-22
+
+---
+
+## Implementation record
+
+Final milestone landed 2026-05-24. All six phases shipped between
+2026-05-22 and 2026-05-24:
+
+| Phase | What landed | PR |
+|-------|-------------|----|
+| 2a | DynamoDB item adapter RPCs (`AdminScanTable` / `AdminGetItem` / `AdminPutItem` / `AdminDeleteItem`) | #805 |
+| 2b | S3 object adapter RPCs (`AdminListObjects` / `AdminGetObject` / `AdminPutObject` / `AdminDeleteObject`) | #811 |
+| 3a | DynamoDB item HTTP handlers + bridge (custom `MarshalJSON` preserves empty `L`/`M`; NUL-byte and trailing-data PUT-body guards; URL-key percent-encoding accepted, decoded `/` and dot-segments still rejected; leader-churn translation matches the table-side bridge) | #813 |
+| 3b | S3 object HTTP handlers + bridge (raw `application/octet-stream` PUT/GET; 100 MiB `http.MaxBytesReader` cap; security headers on GET — `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`, `Content-Disposition: attachment`, `Cache-Control: no-store`) | #814 |
+| 4 | SPA DynamoDetail Items tab (paginated scan 25/100, view/edit/add modal, two-stage delete confirm, base64-url key segment via `encodeAdminItemKey`) | #815 |
+| 5 | SPA S3Detail Objects tab + Upload (paginated list 100, breadcrumb prefix navigation, folder rows via `CommonPrefixes` with `delimiter=/`, file `<input>` upload with native Content-Type, `<a download>` for streaming downloads) | #816 |
+| 6 | This rename (`_proposed_` → `_implemented_`) and the implementation record above | #817 |
+
+Notable in-flight design adjustments documented from PR review:
+- Empty `L` / `M` Dynamo attributes preserve their type tag on the wire via a custom `MarshalJSON` (Gemini medium, Codex P1 on #813). The struct tags stay as `omitempty`-decorated documentation; the custom marshal overrides.
+- Path-segment validation decodes via `url.PathUnescape` before validating, so tables named e.g. `foo bar` are reachable as `/tables/foo%20bar` while `%2F` / `%2e%2e` still close the path-traversal class (Codex P1 on #813).
+- The HTTP layer cannot reject a body that declares MORE primary-key columns than the URL key (no schema access); the principled fix (plumb the URL key into `AdminPutItem` so the adapter can compare against the schema-derived primary key) crosses the Phase-2a adapter boundary and is tracked separately (Codex P2 on #813).
+- SPA bundle output (`internal/admin/dist/assets/*`) stays `.gitignored`; CI rebuilds from source on every release.
 
 ---
 
@@ -280,16 +303,16 @@ Reads are bounded by Limit / MaxKeys, so a separate counter has low marginal val
 
 ## 6. Rollout Plan
 
-| Phase | Content |
-|-------|---------|
-| 1 | This doc lands. |
-| 2 | Backend `Admin{Scan/Get/Put/Delete}{Item,Object}` RPCs + sentinel errors + tests. Two adapters; can split into 2a (Dynamo) + 2b (S3) if review surface gets large. |
-| 3 | HTTP handlers + bridges + integration tests (also potentially split per adapter). |
-| 4 | SPA: DynamoDetail Items tab. |
-| 5 | SPA: S3Detail Objects tab + Upload. |
-| 6 | Doc rename `_proposed_` → `_implemented_`. |
+| Phase | Content | Outcome |
+|-------|---------|---------|
+| 1 | This doc lands. | shipped |
+| 2 | Backend `Admin{Scan/Get/Put/Delete}{Item,Object}` RPCs + sentinel errors + tests. Split into 2a (Dynamo, #805) + 2b (S3, #811). | shipped |
+| 3 | HTTP handlers + bridges + integration tests. Split into 3a (Dynamo, #813) + 3b (S3, #814). | shipped |
+| 4 | SPA: DynamoDetail Items tab (#815). | shipped |
+| 5 | SPA: S3Detail Objects tab + Upload (#816). | shipped |
+| 6 | Doc rename `_proposed_` → `_implemented_` (#817). | this PR |
 
-Each phase ships as a separate PR. Phase 2 (backend) lands first because the HTTP and SPA layers depend on the RPCs being callable. Phases 4 and 5 are SPA-only and can land in either order — 5 is slightly larger (upload + streaming) so it lands second.
+Each phase shipped as its own PR. Phase 2 (backend) landed first because the HTTP and SPA layers depend on the RPCs being callable. Phases 4 and 5 are SPA-only; 5 landed after 4 because the upload + streaming work is larger.
 
 ---
 
