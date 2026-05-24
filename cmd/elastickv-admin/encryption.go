@@ -26,37 +26,46 @@ const encryptionDialTimeout = 5 * time.Second
 // the two surfaces do not share a global flag namespace.
 //
 // PR-A wired `status`. PR-B added `rotate-dek` and
-// `register-writer`. PR-C adds `bootstrap`; Stage 6 adds
-// `enable-storage-envelope` and `enable-raft-envelope`. ResyncSidecar
-// is a server-side §5.5 fallback (no CLI surface).
+// `register-writer`. PR-C adds `bootstrap`. 6D-2 added the
+// `probe-node-id` collision-mitigation helper. 6D-6b (this PR)
+// adds `enable-storage-envelope`; the §7.1 Phase 2
+// `enable-raft-envelope` lands in Stage 6E. ResyncSidecar is a
+// server-side §5.5 fallback (no CLI surface).
 func encryptionMain(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: elastickv-admin encryption <subcommand> [flags]")
 	}
 	sub, rest := args[0], args[1:]
-	switch sub {
-	case "status":
-		return runEncryptionStatus(rest, os.Stdout)
-	case "rotate-dek":
-		return runEncryptionRotateDEK(rest, os.Stdout)
-	case "register-writer":
-		return runEncryptionRegisterWriter(rest, os.Stdout)
-	case "bootstrap":
-		return runEncryptionBootstrap(rest, os.Stdout)
-	case "probe-node-id":
-		return runEncryptionProbeNodeID(rest, os.Stdout)
-	case "-h", "--help", "help":
+	if handler, ok := encryptionSubcommands()[sub]; ok {
+		return handler(rest, os.Stdout)
+	}
+	if sub == "-h" || sub == "--help" || sub == "help" {
 		// `-h` is the universal "show usage" affordance for CLI
 		// subcommands; returning nil keeps the exit code at 0
 		// so shell scripts using $? to detect success do not
 		// trip on a help request.
-		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap\n  probe-node-id")
+		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap\n  enable-storage-envelope\n  probe-node-id")
 		if err != nil {
 			return errors.Wrap(err, "write usage")
 		}
 		return nil
-	default:
-		return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap, probe-node-id)", sub)
+	}
+	return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap, enable-storage-envelope, probe-node-id)", sub)
+}
+
+// encryptionSubcommands is the dispatch table for the encryption
+// CLI's runner subcommands (excluding the -h / --help / help
+// branch, which renders its own usage string). Pulled out of
+// encryptionMain so the dispatch body stays under the
+// cyclomatic-complexity budget as new subcommands land.
+func encryptionSubcommands() map[string]func(args []string, out io.Writer) error {
+	return map[string]func(args []string, out io.Writer) error{
+		"status":                  runEncryptionStatus,
+		"rotate-dek":              runEncryptionRotateDEK,
+		"register-writer":         runEncryptionRegisterWriter,
+		"bootstrap":               runEncryptionBootstrap,
+		"enable-storage-envelope": runEncryptionEnableStorageEnvelope,
+		"probe-node-id":           runEncryptionProbeNodeID,
 	}
 }
 

@@ -105,6 +105,125 @@ func parseRotateDEKArgs(args []string) (*parsedRotateDEK, *encryptionEndpointFla
 	}, endpoint, nil
 }
 
+// runEncryptionEnableStorageEnvelope invokes
+// EncryptionAdmin.EnableStorageEnvelope on the configured
+// endpoint. The Stage 6D-4 / 6D-6a server method composes the
+// §3.2 sequence (leader gate → bootstrap gate → §6.4 idempotent
+// short-circuit → §4 capability fan-out → propose
+// RotateSubEnableStorageEnvelope → discriminate fresh-success
+// vs. §2.1 #3 stale-DEKID race); this CLI surface only
+// dispatches the RPC and renders the result.
+//
+// Output discriminates the §3.1 was_already_active flag because
+// an automation script should be able to tell whether THIS
+// invocation proposed the cutover or hit the §6.4
+// idempotent-retry path against a previously-active cluster:
+//
+//	fresh:      "enabled applied_index=N
+//	             capability summary: ..."
+//	already-on: "already-active applied_index=N"
+//	defensive:  "warning: cutover_index_unknown=true (sidecar may
+//	             have been hand-edited or rolled back)"
+//	            emitted ON TOP OF the already-on shape when the
+//	            §6.4 hand-edited / schema-rollback hedge fires.
+func runEncryptionEnableStorageEnvelope(args []string, out io.Writer) error {
+	req, endpoint, err := parseEnableStorageEnvelopeArgs(args)
+	if err != nil {
+		return err
+	}
+	if req == nil {
+		// Help requested; usage was already written by flag parser.
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *endpoint.timeout)
+	defer cancel()
+	client, closeFn, err := dialEncryption(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := closeFn(); err != nil {
+			fmt.Fprintf(os.Stderr, "encryption: close connection: %v\n", err)
+		}
+	}()
+	resp, err := client.EnableStorageEnvelope(ctx, req)
+	if err != nil {
+		return errors.Wrap(err, "EnableStorageEnvelope")
+	}
+	return printEnableStorageEnvelopeResult(out, resp)
+}
+
+// parseEnableStorageEnvelopeArgs returns the validated proto
+// request and the shared endpoint flags. A nil request with no
+// error means the caller requested --help; the caller then
+// exits 0.
+func parseEnableStorageEnvelopeArgs(args []string) (*pb.EnableStorageEnvelopeRequest, *encryptionEndpointFlags, error) {
+	fs := flag.NewFlagSet("encryption enable-storage-envelope", flag.ContinueOnError)
+	endpoint := newEncryptionEndpointFlags(fs)
+	proposerNodeID := fs.Uint64("proposer-node-id", 0, "The proposer's 64-bit full_node_id (registered in §4.1 writer registry); MUST be non-zero (0 is the §6.1 not-capable sentinel)")
+	proposerLocalEpoch := fs.Uint("proposer-local-epoch", 0, "The proposer's local_epoch at proposal time (0..0xFFFF)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, endpoint, nil
+		}
+		return nil, nil, errors.Wrap(err, "parse flags")
+	}
+	if *proposerNodeID == 0 {
+		// §6.1 sentinel check duplicated on the CLI side so the
+		// operator fails fast before a round-trip; the server
+		// re-validates as the source of truth.
+		return nil, nil, errors.New("encryption: --proposer-node-id is required and must be non-zero (0 is the §6.1 not-capable sentinel)")
+	}
+	if err := requireUint16Plus1(*proposerLocalEpoch, "proposer-local-epoch"); err != nil {
+		return nil, nil, err
+	}
+	return &pb.EnableStorageEnvelopeRequest{
+		ProposerNodeId:     *proposerNodeID,
+		ProposerLocalEpoch: narrowUint32(*proposerLocalEpoch),
+	}, endpoint, nil
+}
+
+// printEnableStorageEnvelopeResult renders the §3.1 response in
+// a shell-friendly shape. Lines start with a stable prefix
+// (`enabled` / `already-active`) so scripts can `awk` on column
+// 1 to discriminate the §6.4 idempotency outcomes without
+// parsing the full message.
+func printEnableStorageEnvelopeResult(out io.Writer, resp *pb.EnableStorageEnvelopeResponse) error {
+	if resp.GetWasAlreadyActive() {
+		if resp.GetCutoverIndexUnknown() {
+			// §6.4 defensive fallback fires only when a sidecar
+			// reports StorageEnvelopeActive=true with
+			// StorageEnvelopeCutoverIndex=0 — operationally
+			// impossible under normal apply but hedged against
+			// schema rollback / hand-edited sidecars. Surface
+			// the warning so operators can investigate.
+			if _, err := fmt.Fprintln(out, "warning: cutover_index_unknown=true (sidecar may have been hand-edited or rolled back)"); err != nil {
+				return errors.Wrap(err, "write warning")
+			}
+		}
+		if _, err := fmt.Fprintf(out, "already-active applied_index=%d\n", resp.GetAppliedIndex()); err != nil {
+			return errors.Wrap(err, "write result")
+		}
+		return nil
+	}
+	if _, err := fmt.Fprintf(out, "enabled applied_index=%d\n", resp.GetAppliedIndex()); err != nil {
+		return errors.Wrap(err, "write result")
+	}
+	if len(resp.GetCapabilitySummary()) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(out, "capability summary:"); err != nil {
+		return errors.Wrap(err, "write capability summary header")
+	}
+	for _, v := range resp.GetCapabilitySummary() {
+		if _, err := fmt.Fprintf(out, "  full_node_id=%d encryption_capable=%t build_sha=%s sidecar_present=%t\n",
+			v.GetFullNodeId(), v.GetEncryptionCapable(), v.GetBuildSha(), v.GetSidecarPresent()); err != nil {
+			return errors.Wrap(err, "write capability row")
+		}
+	}
+	return nil
+}
+
 // runEncryptionRegisterWriter invokes
 // EncryptionAdmin.RegisterEncryptionWriter for a single
 // (dek_id, full_node_id, local_epoch) triple. Multi-writer

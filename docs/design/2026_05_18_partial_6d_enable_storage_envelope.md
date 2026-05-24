@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method) shipped; 6D-6b (CLI), 6D-6c (main.go wiring + integration test) remain |
+| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand) shipped; 6D-6c (main.go wiring + integration test) remain |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -57,10 +57,22 @@
   vs. stale-DEKID race. The 6D-6b CLI and 6D-6c main.go wiring +
   integration test slice on top of this server method.
 
+- **6D-6b** (CLI subcommand) —
+  `elastickv-admin encryption enable-storage-envelope` dispatch
+  + runner (`cmd/elastickv-admin/encryption_mutators.go`).
+  Renders the §3.1 response with stable line prefixes
+  (`enabled applied_index=N` for fresh success, `already-active
+  applied_index=N` for the §6.4 idempotent-retry path) so
+  automation can switch on column 1; the §6.4 defensive
+  `cutover_index_unknown=true` fallback surfaces as a preceding
+  `warning:` line. CLI-side validation duplicates the §6.1
+  `proposer_node_id != 0` sentinel and §4.1 16-bit
+  `proposer_local_epoch` bound so an operator with a
+  misconfigured shell variable fails fast before the round-trip;
+  the server re-validates as the source of truth.
+
 ## Open milestones
 
-- **6D-6b** — `elastickv-admin enable-storage-envelope` CLI
-  subcommand that drives the server method end-to-end.
 - **6D-6c** — main.go production wiring: cipher + WithEncryption
   + WithStorageEnvelopeGate threaded from the sidecar, plus the
   CapabilityFanout closure bound to the live Raft membership
