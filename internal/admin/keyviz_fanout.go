@@ -754,12 +754,14 @@ func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 // across overlapping unknown/known windows.
 func (c *cellMergeAcc) resolveWrite() (value, group, term uint64) {
 	if c.hasUnknownTerm {
-		// Fallback: max-merge across all contributions; the only
-		// identity we have for the fallback path is the
-		// last-touched group/term (which may be 0 if every
-		// contribution was unknown), which matches the legacy
-		// §4.2 / PR-3b behavior the sentinel was designed to
-		// preserve.
+		// Fallback: max-merge across all contributions. Identity
+		// is from the contributor that supplied fallbackMax (round-1
+		// fix on PR #822 — updateFallbackState now stamps
+		// lastGroup/lastTerm when value >= fallbackMax). Identity
+		// is (0, 0) only when every contribution was unknown-term
+		// or when an unknown-term source supplied the largest value.
+		// Matches the legacy §4.2 / PR-3b behavior the sentinel
+		// was designed to preserve.
 		return c.fallbackMax, c.lastGroup, c.lastTerm
 	}
 	var sum, largestValue, largestGroup, largestTerm uint64
