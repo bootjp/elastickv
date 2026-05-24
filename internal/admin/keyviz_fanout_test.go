@@ -236,6 +236,46 @@ func TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm(t *testing.T) {
 	require.True(t, merged.Rows[0].Conflict, "fallback path raises conflict when ≥2 distinct non-zero values were seen")
 }
 
+// TestMergeKeyVizMatricesFallbackPreservesKnownTermWinnerIdentity
+// pins the Gemini HIGH / Codex P2 fix on PR #822: when the
+// fallback path is triggered by an unknown-term contribution but
+// the KNOWN-term source supplies the winning max value, the
+// merged identity must reflect that known-term contributor —
+// NOT fall back to (0, 0). Mirror image of
+// TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm where the
+// legacy peer wins; this test pins the case the prior PR-3c diff
+// regressed (identity was always 0 under fallback regardless of
+// who won).
+func TestMergeKeyVizMatricesFallbackPreservesKnownTermWinnerIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	// Modern source wins with 100.
+	modern := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{100}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	// Legacy peer reports 50 with no arrays — triggers fallback but
+	// loses the max.
+	legacy := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{modern, legacy}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{100}, merged.Rows[0].Values, "fallback max-merge keeps the larger value")
+	require.Equal(t, []uint64{7}, merged.Rows[0].RaftGroupIDs,
+		"identity must reflect the known-term contributor that supplied the winning max — not (0, 0)")
+	require.Equal(t, []uint64{42}, merged.Rows[0].LeaderTerms,
+		"same: known-term contributor's term wins because its value won the fallback max")
+	require.True(t, merged.Rows[0].Conflict, "100 != 50 disagreement raises the conflict flag under fallback")
+}
+
 // TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner pins the
 // Gemini MEDIUM fix: when maxMerge picks a value from one source,
 // the identity at that cell must come from the SAME source — not

@@ -647,7 +647,7 @@ func (c *cellMergeAcc) addWrite(value, group, term uint64) {
 	if value == 0 {
 		return
 	}
-	c.updateFallbackState(value)
+	c.updateFallbackState(value, group, term)
 	// LeaderTerm == 0 (or group == 0) means "term not tracked" —
 	// the documented sentinel from a legacy peer or a publisher
 	// that has not yet fired. We CANNOT safely sum across an
@@ -664,10 +664,19 @@ func (c *cellMergeAcc) addWrite(value, group, term uint64) {
 // updateFallbackState advances the fallback-max accounting that
 // applies when hasUnknownTerm is set at resolve time. Maintained for
 // every non-zero contribution so a cell that later flips into the
-// fallback path has the correct running max + disagreement signal.
-func (c *cellMergeAcc) updateFallbackState(value uint64) {
-	if value > c.fallbackMax {
+// fallback path has the correct running max + disagreement signal
+// AND the identity of the contributor that supplied the max value.
+// Tie-break is last-touched (matching addRead) so a cell with two
+// equal contributions keeps the most recently processed identity.
+// Without the identity tracking, a cell with one known-term source
+// + one unknown-term source would always fall back to (0, 0) even
+// when the known-term source supplied the winning max (Gemini HIGH
+// + Codex P2 on PR #822).
+func (c *cellMergeAcc) updateFallbackState(value, group, term uint64) {
+	if value >= c.fallbackMax {
 		c.fallbackMax = value
+		c.lastGroup = group
+		c.lastTerm = term
 	}
 	if c.fallbackSeenNonZeroValue == 0 {
 		c.fallbackSeenNonZeroValue = value
@@ -767,17 +776,15 @@ func (c *cellMergeAcc) resolveWrite() (value, group, term uint64) {
 
 // hasConflict returns true when any (group, term) at this cell saw
 // disagreement, or — under the fallback path — when ≥2 distinct
-// non-zero values were reported.
+// non-zero values were reported. recordTermContribution only ever
+// stores `true` in termConflict (entries are never reset), so a
+// length check is equivalent to scanning the map (Gemini MEDIUM
+// on PR #822).
 func (c *cellMergeAcc) hasConflict() bool {
 	if c.hasUnknownTerm {
 		return c.fallbackNonZeroDistinct
 	}
-	for k := range c.termConflict {
-		if c.termConflict[k] {
-			return true
-		}
-	}
-	return false
+	return len(c.termConflict) > 0
 }
 
 // unionColumns returns the sorted union of column timestamps across
