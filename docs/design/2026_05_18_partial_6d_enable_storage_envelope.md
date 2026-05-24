@@ -71,28 +71,46 @@
   misconfigured shell variable fails fast before the round-trip;
   the server re-validates as the source of truth.
 
-- **6D-6c-1** (Applier in-memory accessors) — `Applier` grows
-  `ActiveStorageKeyID() (uint32, bool)` and
-  `StorageEnvelopeActive() bool` backed by `atomic.Uint32` /
-  `atomic.Bool` fields, kept coherent with the on-disk sidecar
-  via durable write-then-cache ordering inside
+- **6D-6c-1** (Applier in-memory accessors + shared StateCache)
+  — new exported `encryption.StateCache` type backed by
+  `atomic.Uint32` / `atomic.Bool` mirrors of `sidecar.Active.Storage`
+  and `sidecar.StorageEnvelopeActive`. The cache is a **process-
+  wide singleton** (parallel to the shared `*Keystore`) threaded
+  into every per-shard `Applier` via the new `WithStateCache`
+  option. Multi-group encryption FSM entries apply on exactly
+  one shard's leader, so per-Applier-private atomics would leave
+  the remaining shards stuck with pre-apply values; the shared
+  StateCache makes every shard's storage layer observe the update
+  regardless of which shard ran the apply. Coherence with disk
+  is maintained by durable write-then-cache ordering inside
   `writeBootstrapSidecar`, `writeRotationSidecar`, and the
   cutover fresh-success branch of `applyEnableStorageEnvelope`.
-  `NewApplier` primes both atomics from the sidecar on
-  construction so the storage-layer per-Put closures (wired
-  in 6D-6c-2) observe correct values before the FSM has
-  replayed a single entry after restart. Operator-inert by
-  itself — only consumed once main.go threads the methods
-  into `store.WithEncryption` and `WithStorageEnvelopeGate`
-  in 6D-6c-2.
+  `NewApplier` primes the cache from the sidecar on construction
+  so the storage-layer per-Put closures (wired in 6D-6c-2)
+  observe correct values before the FSM has replayed a single
+  entry after restart. `Applier.ActiveStorageKeyID` /
+  `Applier.StorageEnvelopeActive` remain as delegate methods for
+  tests and single-applier callers; multi-shard wiring in
+  6D-6c-2 must read via `cache.ActiveStorageKeyID` /
+  `cache.StorageEnvelopeActive` directly. Operator-inert by
+  itself — only consumed once main.go threads the cache methods
+  into `store.WithEncryption` and `WithStorageEnvelopeGate` in
+  6D-6c-2.
 
 ## Open milestones
 
 - **6D-6c-2** — main.go production wiring: build
-  `encryption.NewCipher(keystore)` and thread the
-  `Applier.ActiveStorageKeyID` / `Applier.StorageEnvelopeActive`
-  method values into `store.WithEncryption` +
-  `store.WithStorageEnvelopeGate` at shard-group construction.
+  `encryption.NewCipher(keystore)` and construct a single
+  `encryption.StateCache` at startup (parallel to the shared
+  `*Keystore`). Thread the cache via `WithStateCache` into every
+  per-shard `Applier` inside `buildShardGroups`, and pass
+  `cache.ActiveStorageKeyID` / `cache.StorageEnvelopeActive`
+  (NOT the per-shard `Applier` delegates) into
+  `store.WithEncryption` + `store.WithStorageEnvelopeGate` for
+  each shard's PebbleStore. Reading via the StateCache directly
+  ensures every shard's storage layer sees the post-apply state
+  regardless of which shard's leader accepted the encryption
+  proposal.
 - **6D-6c-3** — main.go CapabilityFanout closure bound to the
   live Raft membership view (etcd engine route snapshot + admin
   client DialFunc), and end-to-end integration test exercising

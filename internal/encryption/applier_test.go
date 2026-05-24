@@ -1745,6 +1745,134 @@ func TestApplier_StorageAccessors_PrimedFromExistingSidecar(t *testing.T) {
 	}
 }
 
+// TestApplier_StorageAccessors_SharedCache_AcrossAppliers pins the
+// multi-shard correctness invariant: in a multi-group deployment,
+// main.go constructs one Applier per shard but encryption FSM
+// entries apply on exactly one shard (the one whose engine accepted
+// the proposal). The remaining per-shard Appliers must still
+// observe the post-apply state, because their per-Put storage
+// closures gate writes on the SAME cluster-wide encryption state.
+//
+// Without a shared StateCache (the original 6D-6c-1 design), each
+// Applier carried its own atomics and only the apply-receiving
+// shard would surface (id, true) — every other shard's storage
+// layer would see (0, false) and silently write cleartext after
+// bootstrap, or skip the §4.1 envelope wrap after cutover. This
+// test fails on the original per-Applier-atomics design and passes
+// once the shared StateCache lands.
+//
+// Reported as a P1 by chatgpt-codex-connector on PR #821
+// (review comment r3294696832).
+func TestApplier_StorageAccessors_SharedCache_AcrossAppliers(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	shared := encryption.NewStateCache()
+	appliers := buildSharedCacheAppliers(t, sidecarPath, shared, 2)
+
+	// Apply Bootstrap on appliers[0] only — models the FSM apply
+	// landing on shard 0's leader. Shard 1's applier never runs the
+	// apply path, but its accessors MUST surface the update because
+	// they read from the same StateCache.
+	if err := appliers[0].ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: 17, WrappedStorage: []byte("s"),
+		RaftDEKID: 18, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 17, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("appliers[0].ApplyBootstrap: %v", err)
+	}
+	assertAllAppliersAgree(t, appliers, 17, false)
+
+	// Now flip the cutover via appliers[1] (models the cutover entry
+	// landing on the OTHER shard than the bootstrap). appliers[0]
+	// must still see the gate flip via the shared cache.
+	if err := appliers[1].ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                17,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 17, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("appliers[1].ApplyRotation cutover: %v", err)
+	}
+	assertAllAppliersAgree(t, appliers, 17, true)
+
+	// Reading via the StateCache directly (the API main.go will use
+	// for the per-Put storage closures in 6D-6c-2) must reflect the
+	// same state regardless of which Applier ran the apply.
+	if id, ok := shared.ActiveStorageKeyID(); !ok || id != 17 {
+		t.Errorf("shared.ActiveStorageKeyID = (%d, %v), want (17, true)", id, ok)
+	}
+	if !shared.StorageEnvelopeActive() {
+		t.Error("shared.StorageEnvelopeActive = false, want true after cutover")
+	}
+}
+
+// buildSharedCacheAppliers wires N appliers to the same sidecar
+// path and the same shared StateCache, modelling main.go's
+// buildShardGroups per-shard Applier construction.
+func buildSharedCacheAppliers(
+	t *testing.T,
+	sidecarPath string,
+	shared *encryption.StateCache,
+	n int,
+) []*encryption.Applier {
+	t.Helper()
+	appliers := make([]*encryption.Applier, n)
+	for i := range appliers {
+		a, err := encryption.NewApplier(newMapRegistryStore(),
+			encryption.WithKEK(&fakeKEK{}),
+			encryption.WithKeystore(encryption.NewKeystore()),
+			encryption.WithSidecarPath(sidecarPath),
+			encryption.WithStateCache(shared),
+		)
+		if err != nil {
+			t.Fatalf("NewApplier[%d]: %v", i, err)
+		}
+		appliers[i] = a
+	}
+	return appliers
+}
+
+// assertAllAppliersAgree verifies every applier surfaces the same
+// (ActiveStorageKeyID, StorageEnvelopeActive) state — the shared-
+// cache invariant for the cross-shard apply propagation.
+func assertAllAppliersAgree(
+	t *testing.T,
+	appliers []*encryption.Applier,
+	wantID uint32,
+	wantEnvelopeActive bool,
+) {
+	t.Helper()
+	for i, a := range appliers {
+		id, ok := a.ActiveStorageKeyID()
+		if !ok || id != wantID {
+			t.Errorf("appliers[%d].ActiveStorageKeyID = (%d, %v), want (%d, true)", i, id, ok, wantID)
+		}
+		if got := a.StorageEnvelopeActive(); got != wantEnvelopeActive {
+			t.Errorf("appliers[%d].StorageEnvelopeActive = %v, want %v", i, got, wantEnvelopeActive)
+		}
+	}
+}
+
+// TestStateCache_NilSafe pins the nil-receiver contract so callers
+// that have not yet wired a StateCache (early startup, partial
+// option configuration) get the pre-bootstrap posture rather than
+// a nil-deref panic.
+func TestStateCache_NilSafe(t *testing.T) {
+	t.Parallel()
+	var c *encryption.StateCache
+	if id, ok := c.ActiveStorageKeyID(); ok || id != 0 {
+		t.Errorf("nil StateCache.ActiveStorageKeyID = (%d, %v), want (0, false)", id, ok)
+	}
+	if c.StorageEnvelopeActive() {
+		t.Error("nil StateCache.StorageEnvelopeActive = true, want false")
+	}
+	c.RefreshFromSidecar(&encryption.Sidecar{}) // must not panic
+}
+
 // TestApplier_StorageAccessors_ConcurrentReads exercises the
 // atomic.Uint32 / atomic.Bool seam under -race. The accessors are
 // called on the hot storage Put path, so a torn read or a missed
