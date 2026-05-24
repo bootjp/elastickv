@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -233,17 +234,38 @@ func VerifyChecksums(root string) error {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, maxChecksumLineLen), maxChecksumLineLen)
 	lineNum := 0
+	verified := 0
 	for sc.Scan() {
 		lineNum++
-		if err := verifyOneChecksumLine(root, sc.Text(), lineNum); err != nil {
+		got, err := verifyOneChecksumLine(root, sc.Text(), lineNum)
+		if err != nil {
 			return err
+		}
+		if got {
+			verified++
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return errors.WithStack(err)
 	}
+	// Refuse a CHECKSUMS that yielded zero verified rows. An empty
+	// (or all-blank) file would otherwise pass verification and
+	// hide a producer-side corruption — the dump tree itself is
+	// non-empty (WriteChecksums lists every regular file), so a
+	// CHECKSUMS with no rows is always a signal, never a benign
+	// shape. Codex r5 P2 on PR #810.
+	if verified == 0 {
+		return errors.WithStack(ErrChecksumsEmpty)
+	}
 	return nil
 }
+
+// ErrChecksumsEmpty is returned by VerifyChecksums when the
+// CHECKSUMS file parsed to zero checksum rows (empty file, all
+// blank lines, or comment-only — none of which are valid Phase 0a
+// dump shapes). Typed so callers can distinguish "CHECKSUMS file
+// did not list anything" from "a listed file mismatched".
+var ErrChecksumsEmpty = errors.New("backup: CHECKSUMS contains no checksum rows")
 
 // verifyOneChecksumLine handles a single CHECKSUMS line: parse,
 // path-validate, recompute, compare. Extracted from VerifyChecksums
@@ -251,30 +273,59 @@ func VerifyChecksums(root string) error {
 // per-line failure modes (malformed shape, traversal, symlink
 // escape, missing file, mismatch) each surface as a distinct
 // typed error.
-func verifyOneChecksumLine(root, line string, lineNum int) error {
+//
+// Returns (verified, err): verified=true when the line was a real
+// checksum row that VerifyChecksums should count toward the
+// "at least one row" empty-file guard (blank lines do not count).
+// A missing file referenced by an honest CHECKSUMS row is
+// surfaced as ErrChecksumMismatch — partial restores and
+// adversarial deletions land in the same typed failure class
+// callers branch on. Codex r5 P2 on PR #810.
+func verifyOneChecksumLine(root, line string, lineNum int) (bool, error) {
 	if line == "" {
-		return nil
+		return false, nil
 	}
 	want, rel, ok := splitChecksumLine(line)
 	if !ok {
-		return errors.Wrapf(ErrChecksumsMalformedLine, "line %d: %q", lineNum, line)
+		return false, errors.Wrapf(ErrChecksumsMalformedLine, "line %d: %q", lineNum, line)
 	}
 	cleaned, err := validateChecksumRelPath(rel)
 	if err != nil {
-		return errors.Wrapf(err, "line %d", lineNum)
+		return false, errors.Wrapf(err, "line %d", lineNum)
 	}
 	joined := filepath.Join(root, cleaned)
 	if err := refuseSymlinkComponents(root, cleaned); err != nil {
-		return errors.Wrapf(err, "line %d", lineNum)
+		// Missing file along the resolved path is a partial-
+		// restore / tamper signal — same operational category
+		// as a hash mismatch. The Lstat-walk caller bubbles up
+		// raw fs.ErrNotExist; promote it to the typed
+		// ErrChecksumMismatch class so callers branching on
+		// errors.Is keep covering this case. Codex r5 P2 on
+		// PR #810.
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, errors.Wrapf(ErrChecksumMismatch,
+				"%s: missing on disk", cleaned)
+		}
+		return false, errors.Wrapf(err, "line %d", lineNum)
 	}
 	got, err := sha256File(joined)
 	if err != nil {
-		return errors.Wrapf(err, "verifying %s", cleaned)
+		// A missing target is a partial-restore or tamper
+		// signal; either way it is operationally identical to
+		// a checksum mismatch for the caller. Surface as
+		// ErrChecksumMismatch so `errors.Is(err,
+		// ErrChecksumMismatch)` covers both cases. Codex r5 P2
+		// on PR #810.
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, errors.Wrapf(ErrChecksumMismatch,
+				"%s: missing on disk", cleaned)
+		}
+		return false, errors.Wrapf(err, "verifying %s", cleaned)
 	}
 	if got != want {
-		return errors.Wrapf(ErrChecksumMismatch, "%s: have %s want %s", cleaned, got, want)
+		return false, errors.Wrapf(ErrChecksumMismatch, "%s: have %s want %s", cleaned, got, want)
 	}
-	return nil
+	return true, nil
 }
 
 // refuseSymlinkComponents walks rel one path segment at a time

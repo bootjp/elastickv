@@ -393,6 +393,63 @@ func TestSplitChecksumLine_RejectsDanglingEscape(t *testing.T) {
 	}
 }
 
+// TestVerifyChecksums_RejectsEmptyChecksumsFile is the regression
+// for codex r5 P2 on PR #810: a CHECKSUMS file with zero parsed
+// rows (empty, blank lines only) previously returned nil, hiding
+// a producer-side corruption. The dump tree is non-empty by
+// construction (WriteChecksums lists every regular file), so an
+// empty CHECKSUMS is always a signal.
+func TestVerifyChecksums_RejectsEmptyChecksumsFile(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty file", ""},
+		{"blank lines only", "\n\n\n"},
+		{"trailing newline only", "\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			mustWrite(t, filepath.Join(root, CHECKSUMSFilename), []byte(tc.body))
+			err := VerifyChecksums(root)
+			if err == nil {
+				t.Fatalf("expected ErrChecksumsEmpty for %q, got nil", tc.body)
+			}
+			if !errors.Is(err, ErrChecksumsEmpty) {
+				t.Fatalf("err = %v, want ErrChecksumsEmpty", err)
+			}
+		})
+	}
+}
+
+// TestVerifyChecksums_MissingTargetIsMismatch is the regression
+// for codex r5 P2 on PR #810: a CHECKSUMS line whose listed file
+// was deleted from disk (partial restore / tamper) now surfaces
+// as ErrChecksumMismatch — previously the raw fs.ErrNotExist
+// bubbled up through refuseSymlinkComponents and bypassed the
+// typed checksum-failure path callers branch on.
+func TestVerifyChecksums_MissingTargetIsMismatch(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "a.txt"), []byte("hello"))
+	if err := WriteChecksums(root); err != nil {
+		t.Fatalf("WriteChecksums: %v", err)
+	}
+	if err := os.Remove(filepath.Join(root, "a.txt")); err != nil {
+		t.Fatalf("rm a.txt: %v", err)
+	}
+	err := VerifyChecksums(root)
+	if err == nil {
+		t.Fatalf("expected ErrChecksumMismatch for missing target, got nil")
+	}
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("err = %v, want ErrChecksumMismatch", err)
+	}
+}
+
 // TestVerifyChecksums_StreamsLargeFile pins the bufio.Scanner path
 // — the previous implementation slurped the entire CHECKSUMS file
 // via os.ReadFile, which OOMs on large dump trees (gemini
