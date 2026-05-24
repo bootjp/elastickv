@@ -544,9 +544,11 @@ type cellMergeAcc struct {
 	// Read path (sumMerge): running sum across all sources.
 	sum uint64
 	// Read path identity: last non-zero contributor's (group, term).
-	// Best-effort, matching the round-1/round-2 PR-3b documented
-	// "last-touched" semantics for reads. For writes the resolved
-	// identity comes from `byTerm` largest value at resolve time.
+	// Best-effort "last-touched" semantics for reads (the read
+	// merge has no single owner — prev+incoming is a sum, so we
+	// pick whichever side contributed most recently). For writes
+	// the resolved identity comes from `byTerm` largest value at
+	// resolve time.
 	lastGroup, lastTerm uint64
 
 	// Write path (group-term dedupe + sum across terms):
@@ -670,8 +672,7 @@ func (c *cellMergeAcc) addWrite(value, group, term uint64) {
 // equal contributions keeps the most recently processed identity.
 // Without the identity tracking, a cell with one known-term source
 // + one unknown-term source would always fall back to (0, 0) even
-// when the known-term source supplied the winning max (Gemini HIGH
-// + Codex P2 on PR #822).
+// when the known-term source supplied the winning max.
 func (c *cellMergeAcc) updateFallbackState(value, group, term uint64) {
 	if value >= c.fallbackMax {
 		c.fallbackMax = value
@@ -755,12 +756,12 @@ func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 func (c *cellMergeAcc) resolveWrite() (value, group, term uint64) {
 	if c.hasUnknownTerm {
 		// Fallback: max-merge across all contributions. Identity
-		// is from the contributor that supplied fallbackMax (round-1
-		// fix on PR #822 — updateFallbackState now stamps
-		// lastGroup/lastTerm when value >= fallbackMax). Identity
-		// is (0, 0) only when every contribution was unknown-term
-		// or when an unknown-term source supplied the largest value.
-		// Matches the legacy §4.2 / PR-3b behavior the sentinel
+		// comes from the contributor that supplied fallbackMax
+		// (updateFallbackState stamps lastGroup/lastTerm when
+		// value >= fallbackMax). Identity is (0, 0) only when
+		// every contribution was unknown-term or when an
+		// unknown-term source supplied the largest value.
+		// Matches the legacy §4.2 max-merge behavior the sentinel
 		// was designed to preserve.
 		return c.fallbackMax, c.lastGroup, c.lastTerm
 	}
@@ -780,8 +781,8 @@ func (c *cellMergeAcc) resolveWrite() (value, group, term uint64) {
 // disagreement, or — under the fallback path — when ≥2 distinct
 // non-zero values were reported. recordTermContribution only ever
 // stores `true` in termConflict (entries are never reset), so a
-// length check is equivalent to scanning the map (Gemini MEDIUM
-// on PR #822).
+// length check is equivalent to scanning the map and avoids the
+// O(N) walk.
 func (c *cellMergeAcc) hasConflict() bool {
 	if c.hasUnknownTerm {
 		return c.fallbackNonZeroDistinct
