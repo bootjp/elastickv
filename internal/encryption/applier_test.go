@@ -1522,3 +1522,316 @@ func TestApplyRotation_RejectsProposerDEKMismatch(t *testing.T) {
 		t.Errorf("err not marked ErrEncryptionApply: %v", err)
 	}
 }
+
+// --- Stage 6D-6c-1: in-memory accessor coverage ---
+//
+// The Applier exposes ActiveStorageKeyID() and StorageEnvelopeActive()
+// so main.go can wire them as the per-Put closures into
+// store.WithEncryption / store.WithStorageEnvelopeGate without
+// ReadSidecar-on-every-Put. Hot-path correctness requires:
+//
+//   - Pre-bootstrap: (0, false) and false. Storage layer must
+//     write cleartext.
+//   - Post-bootstrap: (StorageDEKID, true) and false. Encryption
+//     wraps payloads at-rest using the storage DEK, but the
+//     §4.1 envelope is still gated off.
+//   - Post-rotate-dek-storage: returns the NEW storage DEK id,
+//     and StorageEnvelopeActive unchanged.
+//   - Post-cutover: ActiveStorageKeyID unchanged, but the gate
+//     flips to true.
+//   - NewApplier primes both atomics from the on-disk sidecar so
+//     a freshly-started process serves correct accessor values
+//     before the FSM has replayed a single entry.
+//   - Concurrent readers under -race must observe coherent values
+//     (atomic.Bool / atomic.Uint32 guarantees).
+
+func TestApplier_StorageAccessors_PreBootstrap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(newMapRegistryStore(),
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(encryption.NewKeystore()),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	id, ok := app.ActiveStorageKeyID()
+	if ok || id != 0 {
+		t.Errorf("ActiveStorageKeyID pre-bootstrap = (%d, %v), want (0, false)", id, ok)
+	}
+	if app.StorageEnvelopeActive() {
+		t.Error("StorageEnvelopeActive pre-bootstrap = true, want false")
+	}
+}
+
+func TestApplier_StorageAccessors_PostBootstrap(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: 11, WrappedStorage: []byte("s"),
+		RaftDEKID: 22, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 11, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	id, ok := app.ActiveStorageKeyID()
+	if !ok || id != 11 {
+		t.Errorf("ActiveStorageKeyID post-bootstrap = (%d, %v), want (11, true)", id, ok)
+	}
+	// Cutover gate must NOT flip just because bootstrap landed —
+	// §7.1 Phase 1 requires an explicit EnableStorageEnvelope
+	// proposal.
+	if app.StorageEnvelopeActive() {
+		t.Error("StorageEnvelopeActive post-bootstrap = true, want false")
+	}
+}
+
+func TestApplier_StorageAccessors_PostRotateDEK(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: 11, WrappedStorage: []byte("s"),
+		RaftDEKID: 22, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 11, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	// Rotate storage DEK 11 -> 33.
+	if err := app.ApplyRotation(200, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                33,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte("w33"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 33, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("ApplyRotation rotate-dek: %v", err)
+	}
+	id, ok := app.ActiveStorageKeyID()
+	if !ok || id != 33 {
+		t.Errorf("ActiveStorageKeyID post-rotate = (%d, %v), want (33, true)", id, ok)
+	}
+	if app.StorageEnvelopeActive() {
+		t.Error("StorageEnvelopeActive flipped by rotate-dek, want false (rotate is a key swap, not a cutover)")
+	}
+}
+
+func TestApplier_StorageAccessors_PostCutover(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: 7, WrappedStorage: []byte("s"),
+		RaftDEKID: 8, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	if err := app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                7,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 7, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("ApplyRotation cutover: %v", err)
+	}
+	id, ok := app.ActiveStorageKeyID()
+	if !ok || id != 7 {
+		t.Errorf("ActiveStorageKeyID post-cutover = (%d, %v), want (7, true) — cutover must not re-point Active", id, ok)
+	}
+	if !app.StorageEnvelopeActive() {
+		t.Error("StorageEnvelopeActive post-cutover = false, want true")
+	}
+}
+
+// TestApplier_StorageAccessors_PrimedFromExistingSidecar pins the
+// startup-recovery contract: a process restart constructs a fresh
+// Applier against an already-populated sidecar (the previous
+// process's apply landed). The accessors must reflect the on-disk
+// state BEFORE the FSM has replayed a single entry, because the
+// storage layer's Put path queries them immediately after Pebble
+// open.
+func TestApplier_StorageAccessors_PrimedFromExistingSidecar(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	// First Applier writes a full post-cutover sidecar.
+	reg := newMapRegistryStore()
+	first, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(encryption.NewKeystore()),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier (first): %v", err)
+	}
+	if err := first.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: 9, WrappedStorage: []byte("s"),
+		RaftDEKID: 10, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 9, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("first ApplyBootstrap: %v", err)
+	}
+	if err := first.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableStorageEnvelope,
+		DEKID:                9,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 9, FullNodeID: 0xAAAA, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("first ApplyRotation cutover: %v", err)
+	}
+
+	// Second Applier — simulates a process restart. The on-disk
+	// sidecar holds Active.Storage=9 and StorageEnvelopeActive=true.
+	// We use a *fresh* mapRegistryStore so this is unambiguously a
+	// from-disk prime, not state inherited from `first`.
+	second, err := encryption.NewApplier(newMapRegistryStore(),
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(encryption.NewKeystore()),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier (second): %v", err)
+	}
+	id, ok := second.ActiveStorageKeyID()
+	if !ok || id != 9 {
+		t.Errorf("second ActiveStorageKeyID = (%d, %v), want (9, true)", id, ok)
+	}
+	if !second.StorageEnvelopeActive() {
+		t.Error("second StorageEnvelopeActive = false, want true (must prime from disk)")
+	}
+}
+
+// TestApplier_StorageAccessors_ConcurrentReads exercises the
+// atomic.Uint32 / atomic.Bool seam under -race. The accessors are
+// called on the hot storage Put path, so a torn read or a missed
+// happens-before edge with the apply-side store would be a
+// production correctness bug. We run many concurrent reader
+// goroutines alongside a single applier goroutine and verify
+// readers only ever observe one of the two valid states (zero or
+// the post-cutover state) — never a torn intermediate.
+func TestApplier_StorageAccessors_ConcurrentReads(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(encryption.NewKeystore()),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+
+	const wantDEKID uint32 = 41
+	const readers = 8
+	const readsPerGoroutine = 2000
+
+	start := make(chan struct{})
+	done := make(chan struct{}, readers)
+	for i := 0; i < readers; i++ {
+		go concurrentAccessorReader(t, app, wantDEKID, readsPerGoroutine, start, done)
+	}
+	close(start)
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: wantDEKID, WrappedStorage: []byte("s"),
+		RaftDEKID: 42, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: wantDEKID, FullNodeID: 0xAAAA, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	for i := 0; i < readers; i++ {
+		<-done
+	}
+	id, ok := app.ActiveStorageKeyID()
+	if !ok || id != wantDEKID {
+		t.Errorf("final ActiveStorageKeyID = (%d, %v), want (%d, true)", id, ok, wantDEKID)
+	}
+}
+
+// concurrentAccessorReader spins on ActiveStorageKeyID until it
+// observes either the pre-bootstrap zero state or the
+// post-bootstrap (wantDEKID, true) state. Any other combination
+// indicates a torn read across the (uint32 id, bool ok) pair and
+// fails the test. Extracted out of
+// TestApplier_StorageAccessors_ConcurrentReads to keep that test
+// under cyclop's complexity ceiling.
+func concurrentAccessorReader(
+	t *testing.T,
+	app *encryption.Applier,
+	wantDEKID uint32,
+	reads int,
+	start <-chan struct{},
+	done chan<- struct{},
+) {
+	t.Helper()
+	defer func() { done <- struct{}{} }()
+	<-start
+	for j := 0; j < reads; j++ {
+		id, ok := app.ActiveStorageKeyID()
+		if !validAccessorObservation(id, ok, wantDEKID) {
+			t.Errorf("torn ActiveStorageKeyID read: (%d, %v)", id, ok)
+			return
+		}
+		_ = app.StorageEnvelopeActive()
+	}
+}
+
+// validAccessorObservation accepts only the two coherent states
+// the readers may witness while the bootstrap apply is in flight:
+// (0, false) pre-flip and (wantDEKID, true) post-flip.
+func validAccessorObservation(id uint32, ok bool, wantDEKID uint32) bool {
+	if !ok && id == 0 {
+		return true
+	}
+	if ok && id == wantDEKID {
+		return true
+	}
+	return false
+}

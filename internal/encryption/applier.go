@@ -3,6 +3,7 @@ package encryption
 import (
 	"bytes"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
@@ -74,6 +75,30 @@ type Applier struct {
 	keystore    *Keystore
 	sidecarPath string
 	now         func() time.Time
+	// activeStorageDEKID is the in-memory mirror of
+	// sidecar.Active.Storage. The storage layer's encryption
+	// path (store.WithEncryption) calls a per-Put closure that
+	// reads this field via ActiveStorageKeyID(); a sidecar
+	// ReadSidecar() on every Put would serialise hot-path writes
+	// through a JSON parse + fsync barrier. Apply paths update
+	// this atomic AFTER the durable WriteSidecar succeeds, so
+	// a crash leaves disk-truth and cache aligned: on restart
+	// NewApplier primes the cache from disk before the storage
+	// layer ever queries it. Zero means "not bootstrapped" — the
+	// closure surfaces (0, false) and the storage layer writes
+	// cleartext.
+	activeStorageDEKID atomic.Uint32
+	// storageEnvelopeActive mirrors sidecar.StorageEnvelopeActive
+	// for the §6.2 cutover gate. Same atomic-vs-sidecar-read
+	// rationale as activeStorageDEKID above. Lifecycle:
+	//   - false at construction (or primed from disk if a
+	//     previous cutover already fired).
+	//   - flipped to true exactly once by applyEnableStorageEnvelope
+	//     on a fresh-success apply, AFTER WriteSidecar succeeds.
+	//   - never flipped back to false (the cutover is one-way per
+	//     §7.1 Phase 1; rotate-dek under the active envelope keeps
+	//     it true).
+	storageEnvelopeActive atomic.Bool
 }
 
 // KEKUnwrapper is the abstraction the Applier uses to recover
@@ -162,7 +187,65 @@ func NewApplier(registry WriterRegistryStore, opts ...ApplierOption) (*Applier, 
 	if a.now == nil {
 		return nil, errors.New("encryption: NewApplier: WithNowFunc(nil) overwrote default time.Now")
 	}
+	// Prime the in-memory accessors from the on-disk sidecar
+	// (best-effort: a missing sidecar is the pre-bootstrap
+	// posture and leaves both atomics at their zero values,
+	// which is correct). The storage-layer closures may query
+	// these atomics before the FSM has replayed a single entry
+	// after restart, so the priming must happen at construction
+	// rather than lazily on first apply. A read error (corrupt
+	// JSON, bad version) surfaces back to the caller so a
+	// misconfigured node fails to start instead of silently
+	// running with stale-zero state.
+	if a.sidecarPath != "" {
+		switch sc, err := ReadSidecar(a.sidecarPath); {
+		case err == nil:
+			a.refreshActiveStateCache(sc)
+		case IsNotExist(err):
+			// Pre-bootstrap; leave atomics at zero.
+		default:
+			return nil, errors.Wrap(err, "encryption: NewApplier: prime in-memory state from sidecar")
+		}
+	}
 	return a, nil
+}
+
+// ActiveStorageKeyID returns the current sidecar.Active.Storage
+// DEK id in-memory. Signature matches store.ActiveStorageKeyID
+// so main.go can pass `applier.ActiveStorageKeyID` directly into
+// `store.WithEncryption(...)` as the per-Put activeKeyID
+// closure. A non-zero id with ok=true means the cluster has run
+// BootstrapEncryption; zero with ok=false means the cluster is
+// still pre-bootstrap and the storage layer should write
+// cleartext.
+func (a *Applier) ActiveStorageKeyID() (uint32, bool) {
+	id := a.activeStorageDEKID.Load()
+	return id, id != 0
+}
+
+// StorageEnvelopeActive returns the in-memory mirror of
+// sidecar.StorageEnvelopeActive. Signature matches
+// store.StorageEnvelopeActive so main.go can pass
+// `applier.StorageEnvelopeActive` directly into
+// `store.WithStorageEnvelopeGate(...)` as the per-Put cutover
+// gate (Stage 6D-5). Once true, the storage layer wraps every
+// new version in the §4.1 envelope; flips exactly once per
+// cluster lifetime when the §7.1 Phase 1 cutover entry applies.
+func (a *Applier) StorageEnvelopeActive() bool {
+	return a.storageEnvelopeActive.Load()
+}
+
+// refreshActiveStateCache copies the relevant sidecar fields
+// into the in-memory atomics. Called from NewApplier (prime
+// from disk on startup) and from every apply path AFTER a
+// successful WriteSidecar (durable write-then-cache ordering
+// so a crash leaves disk-truth and the next restart's prime
+// in agreement). Holding the mutate-after-WriteSidecar order
+// also avoids the storage layer reading a flipped cache while
+// the sidecar disk write is still mid-fsync.
+func (a *Applier) refreshActiveStateCache(sc *Sidecar) {
+	a.activeStorageDEKID.Store(sc.Active.Storage)
+	a.storageEnvelopeActive.Store(sc.StorageEnvelopeActive)
 }
 
 // bootstrapAndRotationConfigured reports whether WithKEK,
@@ -513,6 +596,7 @@ func (a *Applier) writeBootstrapSidecar(raftIdx uint64, p fsmwire.BootstrapPaylo
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for bootstrap")
 	}
+	a.refreshActiveStateCache(sc)
 	return nil
 }
 
@@ -773,6 +857,7 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for cutover")
 	}
+	a.refreshActiveStateCache(sc)
 	return nil
 }
 
@@ -809,6 +894,7 @@ func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for rotation")
 	}
+	a.refreshActiveStateCache(sc)
 	return nil
 }
 
