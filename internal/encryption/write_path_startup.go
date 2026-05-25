@@ -112,3 +112,15 @@ func BumpLocalEpoch(sidecarPath string, dekID uint32) (uint16, error) {
 // DEK at this epoch cannot bump further without nonce reuse, so
 // BumpLocalEpoch refuses (matching ErrLocalEpochExhausted at startup).
 const localEpochMax = uint16(0xFFFF)
+
+// NodeID16 narrows a 64-bit full node id to the 16-bit node_id field
+// of the §4.1 nonce (and of the writer-registry key). The truncation
+// is the documented `uint16(full_node_id & 0xFFFF)` rule; cluster-wide
+// uniqueness of the narrowed value is enforced by the writer registry
+// + ErrNodeIDCollision guard, not by this function. Centralised here
+// so call sites (main.go nonce-factory wiring, applier registry keys)
+// share one masked-narrowing site instead of repeating the
+// gosec-suppressed conversion.
+func NodeID16(fullNodeID uint64) uint16 {
+	return uint16(fullNodeID & nodeIDMask) //nolint:gosec // masked to 16 bits; G115 cannot trace the bitwise narrowing
+}

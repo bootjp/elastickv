@@ -341,7 +341,15 @@ func run() error {
 	}
 	keystore := encryption.NewKeystore()
 
-	runtimes, shardGroups, err := buildShardGroups(
+	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
+	// storage-envelope write-path wiring (cipher + deterministic nonce
+	// factory + the process-shared StateCache) before opening any
+	// shard store, then constructs the shard groups with it. The
+	// wiring hydrates the keystore and bumps the §4.1 local_epoch when
+	// a storage DEK is already active on disk (restart path); on a
+	// pre-bootstrap binary the per-Put gate stays cleartext until a
+	// runtime Bootstrap + EnableStorageEnvelope flips it.
+	runtimes, shardGroups, err := buildShardGroupsWithEncryptionWiring(
 		*raftId,
 		*raftDir,
 		cfg.groups,
@@ -734,6 +742,7 @@ func buildShardGroups(
 	kekWrapper kek.Wrapper,
 	keystore *encryption.Keystore,
 	sidecarPath string,
+	encWiring encryptionWriteWiring,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
@@ -742,7 +751,7 @@ func buildShardGroups(
 		if err := os.MkdirAll(dir, dirPerm); err != nil {
 			return nil, nil, errors.Wrapf(err, "failed to create fsm store dir for group %d", g.id)
 		}
-		st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"))
+		st, err := store.NewPebbleStore(filepath.Join(dir, "fsm.db"), encWiring.pebbleOptions()...)
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "failed to open pebble fsm store for group %d", g.id)
 		}
@@ -772,7 +781,13 @@ func buildShardGroups(
 		// (ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured)
 		// which is exactly the desired apply-time fail-closed
 		// behaviour when an operator has not opted in to encryption.
-		applier, err := encryption.NewApplier(reg, applierOptionsFor(kekWrapper, keystore, sidecarPath)...)
+		//
+		// Stage 6D-6c-1: WithStateCache threads the process-shared
+		// StateCache so an encryption apply landing on this shard's
+		// FSM updates the atomics every shard's storage layer reads.
+		applierOpts := append(applierOptionsFor(kekWrapper, keystore, sidecarPath),
+			encryption.WithStateCache(encWiring.cache))
+		applier, err := encryption.NewApplier(reg, applierOpts...)
 		if err != nil {
 			for _, rt := range runtimes {
 				rt.Close()

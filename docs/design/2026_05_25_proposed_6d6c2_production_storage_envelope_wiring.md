@@ -114,38 +114,70 @@ buildShardGroups(... keystore, sidecarPath ...)  // per-shard stores + appliers
 chainEncryptionStartupGuard()  // 6C-2d gap guard (post-engine)
 ```
 
-6D-6c-2 inserts two steps between the guard load and
-`buildShardGroups`, gated on `encryptionEnabled && Active.Storage != 0`:
+6D-6c-2 inserts the wiring between the guard load and
+`buildShardGroups` (`buildEncryptionWriteWiring` →
+`prepareStorageNonceEpoch`):
 
 ```
 kekWrapper := loadKEKAndRunStartupGuards()
 keystore   := NewKeystore()
 stateCache := NewStateCache()
 
-if encryptionActive(sidecar) {                 // Active.Storage != 0
-    HydrateKeystoreFromSidecar(keystore, kekWrapper, sidecarPath)   // (1)
-    epoch := BumpLocalEpoch(sidecarPath, sidecar.Active.Storage)    // (2)
-    cipher := NewCipher(keystore)                                   // (3)
-    nonceFactory := NewNonceFactory(uint16(DeriveNodeID(raftID)), epoch)
-}                                                                   // (4)
+// Cipher is wired whenever encryption is ENABLED — NOT gated on
+// bootstrap state — so a runtime Bootstrap + EnableStorageEnvelope
+// engages encryption without a restart. The per-Put gate keeps
+// writes cleartext until both signals are on.
+if encryptionEnabled && kekWrapper != nil && sidecarPath != "" {
+    cipher := NewCipher(keystore)
+    epoch  := prepareStorageNonceEpoch(sidecarPath, kekWrapper, keystore, stateCache)
+    nonceFactory := NewDeterministicNonceFactory(NodeID16(DeriveNodeID(raftID)), epoch)
+}
 buildShardGroups(... keystore, stateCache, cipher, nonceFactory ...)
 ```
 
-Ordering rationale:
+where `prepareStorageNonceEpoch` primes the cache from the sidecar and,
+**only when a storage DEK is already active on disk** (`Active.Storage
+!= 0`, the restart path), hydrates the keystore and performs the
+durable `local_epoch` bump:
 
-- **Hydrate before bump.** The bump's `ErrLocalEpochExhausted` /
-  fsync only matters once DEKs exist; hydrating first keeps the
-  "encryption active" branch self-contained and lets the cipher see
-  the DEK the bumped epoch refers to.
-- **Bump before any store opens.** No `PebbleStore` can serve a write
-  (and therefore issue a nonce) until `buildShardGroups` returns, so
-  performing the durable bump before that call guarantees the fsync
-  precedes the first nonce — the §4.1 invariant.
+```
+sc := ReadSidecar(sidecarPath)            // IsNotExist → epoch 0
+cache.RefreshFromSidecar(sc)
+if sc.Active.Storage == 0 { return 0 }    // pre-bootstrap → epoch 0
+HydrateKeystoreFromSidecar(keystore, kekWrapper, sc)   // (1)
+return BumpLocalEpoch(sidecarPath, sc.Active.Storage)  // (2)
+```
+
+Why the cipher is wired regardless of bootstrap state but the
+hydrate+bump is gated on an active DEK:
+
+- **Runtime bootstrap must work without a restart.** The §7.1 rollout
+  runs `BootstrapEncryption` and `EnableStorageEnvelope` as admin RPCs
+  at runtime. If the cipher were only wired when a DEK was active *at
+  startup*, a freshly-started cluster could never engage encryption
+  until its next restart. So the cipher + nonce factory are wired
+  whenever the operator enabled encryption; the per-Put gate
+  (`ActiveStorageKeyID` + `StorageEnvelopeActive`, both reading the
+  shared cache that FSM apply updates) is what holds writes cleartext
+  until bootstrap+cutover commit.
+- **Epoch 0 is safe for the runtime-bootstrap-this-load case.** When no
+  DEK is active at startup the nonce factory pins `local_epoch = 0` —
+  exactly the value a runtime `BootstrapEncryption` assigns the new
+  DEK, and that DEK's first-ever use, so `node_id ‖ 0 ‖ {1,2,…}` is
+  fresh. A subsequent restart sees `Active.Storage != 0` and takes the
+  bump path, so the same `(node_id, 0)` prefix is never reused under
+  the same DEK across loads.
+- **Hydrate before bump.** Hydration installs the DEK bytes the bumped
+  epoch refers to and every historical DEK needed for reads.
+- **Bump before any store opens.** No `PebbleStore` serves a write
+  (and therefore issues a nonce) until `buildShardGroups` returns, so
+  the durable bump precedes the first nonce — the §4.1 invariant.
 - **StateCache before buildShardGroups.** The per-shard appliers need
   the shared cache pointer (6D-6c-1's P1 fix), and the per-shard stores
-  need `cache.ActiveStorageKeyID` / `cache.StorageEnvelopeActive` as
-  their closures. `NewApplier` primes the cache from the sidecar, so by
-  the time the first store opens the cache reflects on-disk state.
+  capture `cache.ActiveStorageKeyID` / `cache.StorageEnvelopeActive` as
+  their gate closures. `prepareStorageNonceEpoch` primes the cache and
+  `NewApplier` re-primes it, so the gate reflects on-disk state before
+  the first Put.
 
 ## 3. Crash / restart correctness
 
