@@ -2,10 +2,28 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | partial |
 | Date | 2026-05-25 |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 nonce, §5.1 sidecar, §7.1 rollout), [`2026_05_18_partial_6d_enable_storage_envelope.md`](2026_05_18_partial_6d_enable_storage_envelope.md) (6D-6c milestone breakdown) |
 | Pulls forward | The deterministic-nonce core of Stage 7 (§4.1 `write_count` / `local_epoch` lifecycle). The full Raft-replicated writer-registry **registration-before-first-write** gate stays in Stage 7. |
+
+## Lifecycle status
+
+**Shipped (this PR, §1 "in scope"):** keystore hydration from the
+sidecar, the `local_epoch` bump-and-fsync lifecycle, the production
+`DeterministicNonceFactory`, and the `main.go` cipher + gate +
+`StateCache` wiring. A single-node cluster can now Bootstrap →
+EnableStorageEnvelope → Put (encrypted at rest) → read back.
+
+**Remaining (Stage 7, §1 "out of scope"):** the Raft-replicated
+registration-before-first-write coordinator gate (the §5.2
+process-start and §4.1 ConfChange-time paths) that makes multi-node
+membership churn nonce-safe beyond the existing startup guards
+(`ErrNodeIDCollision`, `ErrLocalEpochRollback`). Until that lands the
+write path is `partial`: production-correct for single-node and
+stable-membership clusters, with the documented cross-node-churn gap
+covered only by the startup guards. The doc flips to
+`*_implemented_*` when the Stage 7 gate ships.
 
 ## 0. Why this doc exists
 

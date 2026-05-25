@@ -100,13 +100,18 @@ func buildEncryptionWriteWiring(kekWrapper encryption.KEKUnwrapper, keystore *en
 	if !*encryptionEnabled || kekWrapper == nil || *encryptionSidecarPath == "" {
 		return w, nil
 	}
+	// On error return w (with its non-nil cache) rather than a
+	// zero-value wiring: the caller aborts startup on the error and
+	// never consults the wiring, but keeping the cache non-nil on
+	// every return path avoids a latent nil-cache footgun for any
+	// future caller that reads w before checking err.
 	cipher, err := encryption.NewCipher(keystore)
 	if err != nil {
-		return encryptionWriteWiring{}, pkgerrors.Wrap(err, "build encryption write wiring: new cipher")
+		return w, pkgerrors.Wrap(err, "build encryption write wiring: new cipher")
 	}
 	epoch, err := prepareStorageNonceEpoch(*encryptionSidecarPath, kekWrapper, keystore, w.cache)
 	if err != nil {
-		return encryptionWriteWiring{}, err
+		return w, err
 	}
 	w.cipher = cipher
 	w.nonceFactory = encryption.NewDeterministicNonceFactory(
