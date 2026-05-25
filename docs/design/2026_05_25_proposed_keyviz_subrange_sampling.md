@@ -116,9 +116,13 @@ lives in the bytes *after* that prefix. So:
    thousand. `W` is an internal constant, not a flag.
 
 2. **On the hot path** (`Observe`), with the key in hand, a single
-   shared helper `subBucketIndex(key, slot) int` (also used by `Flush`
-   for bounds reconstruction — see §4.3 — so the two paths can never
-   diverge) does:
+   shared helper `subBucketIndex(key, slot) int` does (and `Flush`'s
+   inverse bounds reconstruction in §4.3 shares the **same
+   `bits.Mul64`/`bits.Div64` kernel** `fracMul(a,b,c) = floor(a·b/c)` —
+   forward calls `fracMul(K, k-subStart, subSpan)`, inverse calls
+   `fracMul(i, subSpan, K)` — so the two directions can never diverge;
+   note `Flush` does not call `subBucketIndex` itself, since it maps an
+   index→bound, the opposite of key→index):
    - Read the `[subPrefixLen, +W)` window of `key` big-endian into `k`
      (bytes beyond the key's length read as `0x00`; a key shorter than
      `subPrefixLen` clamps to bucket 0).
@@ -260,12 +264,18 @@ Two consequences for the grace-window re-registration path
   an existing one, and a watcher re-sync re-registers the identical
   range. So the original layout stays valid. In the unexpected event
   that a same-ID re-registration ever carried a *different* range
-  within the grace window, the route keeps its original sub-ranges for
-  ≤ one grace window — a bounded **cosmetic** misattribution of sub-row
-  labels, with **no** lost or double-counted traffic (every increment
-  still lands in some bucket and is drained). This is strictly safer
-  than mutating immutable layout fields the lock-free hot path is
-  reading.
+  within the grace window, the reused slot keeps its original
+  sub-ranges **for the lifetime of that live slot** — there is no
+  re-layout trigger, so the staleness persists until the route is
+  removed and (after the grace window expires, so no slot is reclaimed)
+  re-registered fresh, which builds a brand-new slot with a recomputed
+  layout. Throughout, the effect is a bounded **cosmetic**
+  misattribution of sub-row labels, with **no** lost or double-counted
+  traffic (every increment still lands in some bucket and is drained).
+  This is strictly safer than mutating immutable layout fields the
+  lock-free hot path is reading. The staleness window is the slot's
+  lifetime, *not* a single grace window — the test oracle in §10 lens 5
+  reflects this.
 
 (`reclaimRetiredSlot` still refreshes the mutable `Start` / `End` /
 `MemberRoutesTotal` under `metaMu` as today; those remain
@@ -558,11 +568,15 @@ implementation has no ambiguity.
    both `pivotKeyVizColumns` and `adapter.matrixToProto` (the Gemini
    HIGH regression); a **grace-window re-registration** test that a
    route re-registered with a different `[Start,End)` **continues to
-   bucket into its original (stale) sub-ranges for the remainder of the
-   grace window** — verifying the §4.2 contract (cosmetic
-   misattribution, but no lost or double-counted counts) rather than
+   bucket into its original (stale) sub-ranges for the reused slot's
+   lifetime** (not merely the grace window — §4.2), verifying the
+   cosmetic-misattribution-but-no-lost-counts contract rather than
    asserting the layout is recomputed (which §4.2 deliberately does
-   *not* do); `K = 1` round-trips identically to the pre-change
-   snapshot (regression pin); caller audit covered by existing
-   coordinator tests plus a new assertion that a hot sub-range shows up
-   on a distinct row. Mixed-`K` fan-out test per the §9 decision 2.
+   *not* do), plus a companion case that a fresh registration **after**
+   grace expiry does get the new layout; `K = 1` round-trips
+   identically to the pre-change snapshot (regression pin); caller
+   audit covered by existing coordinator tests plus a new assertion
+   that a hot sub-range shows up on a distinct row. Mixed-`K` fan-out
+   test per the §9 decision 2. **Performance gate**: a benchmark of
+   `Observe` at `K = 1` vs `K = 64` (per lens 3) to bound the
+   per-call hot-path regression.
