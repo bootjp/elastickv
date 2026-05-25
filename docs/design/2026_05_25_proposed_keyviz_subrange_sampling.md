@@ -287,9 +287,16 @@ each sub-bucket with any non-zero counter, emit one `MatrixRow` whose
 `Start`/`End` are the **sub-bucket bounds**, reconstructed by inverting
 the §3.1 interpolation: bucket `i` spans
 `[subStart + i*subSpan/K, subStart + (i+1)*subSpan/K)` mapped back into
-the key byte space at offset `subPrefixLen`. To guarantee the sub-rows
-**tile the parent route exactly** (the "contiguous" property the
-heatmap advertises) despite integer truncation in the inverse:
+the key byte space at offset `subPrefixLen`. The interior boundary
+`i*subSpan/K` **must use the same 128-bit `math/bits` path as the
+forward computation** — `hi, lo := bits.Mul64(uint64(i), subSpan);
+bound, _ := bits.Div64(hi, lo, uint64(K))` — not plain `uint64`
+arithmetic: `i*subSpan` overflows a `uint64` once `subSpan > 2^63` and
+`i ≥ 2` (e.g. `K=3, i=2, subSpan=2^63` → `2^64` wraps to `0`),
+producing a nonsensical interior bound and a visible gap in the
+heatmap. To guarantee the sub-rows **tile the parent route exactly**
+(the "contiguous" property the heatmap advertises) despite integer
+truncation in the inverse:
 
 - sub-bucket `0`'s `Start` is pinned to the route's actual `Start`
   (not the reconstructed `subStart` window value, which dropped the
@@ -382,10 +389,25 @@ each sub-row unchanged.
   zero added memory beyond the length-1 slice). This is the default,
   so the change is inert until opted into.
 - `> 1` → subdivide each individual route into that many sub-ranges.
-- Clamped to `[1, keyvizKeyBucketsCap]` (cap proposed at `4096`,
-  mirroring the row-budget philosophy — an operator typo can't reserve
-  unbounded per-route memory). Values above the cap clamp down; values
-  `< 1` clamp to 1.
+- Clamped to `[1, keyvizKeyBucketsCap]`, **cap = 256**. The cap must be
+  an *operationally* safe bound, not merely a finite one: memory is
+  `K × 4 × 8` B/route, so the cap interacts with `MaxTrackedRoutes`.
+  At the default `MaxTrackedRoutes = 10_000`:
+
+  | `K` | counter memory (worst case) | pre-budget rows/column |
+  |---|---|---|
+  | 16 (typical) | ~5 MB | 160 k |
+  | 256 (cap) | ~80 MB | 2.56 M |
+  | 4096 (rejected) | ~1.28 GB | 41 M |
+
+  `4096` (the first draft's cap) is "bounded" only mathematically —
+  1.28 GB of counters and 41 M materialised rows is not acceptable for
+  a monitoring subsystem (Codex P1, R4). `256` keeps the worst case at
+  ~80 MB / 2.56 M rows, still generous versus the `K ≤ 16` target. The
+  general rule, which the flag help text should state, is
+  `K_max ≈ memBudget / (32 × MaxTrackedRoutes)`; an operator raising
+  `MaxTrackedRoutes` should lower `K` to stay within budget. Values
+  above the cap clamp down; values `< 1` clamp to 1.
 
 Threaded through `MemSamplerOptions` exactly like the existing
 `MaxTrackedRoutes` / `HistoryColumns` knobs (`buildKeyVizSampler` in
@@ -517,10 +539,11 @@ implementation has no ambiguity.
    gates the hot-path regression; flush cost rises with non-empty
    sub-buckets but is off the request path.
 4. **Data consistency** — sub-rows carry the parent route's
-   `(RaftGroupID, LeaderTerm)` unchanged, so the parent design's §9.1
-   canonical fan-out dedupe and per-cell conflict detection operate
-   identically at finer granularity. Bucket assignment is deterministic and monotone, so the
-   same key lands in the same sub-bucket every Step (stable rows across
+   `(RaftGroupID, LeaderTerm)` unchanged, so the canonical fan-out
+   dedupe and per-cell conflict detection (§5.1, §7) operate
+   identically at finer granularity. Bucket assignment is deterministic
+   and monotone (the order-preservation guarantee of §3.1), so the same
+   key lands in the same sub-bucket every Step (stable rows across
    columns — the matrix contract). Row budget + Start-order sort
    unchanged.
 5. **Test coverage** — new unit tests: `subBucketIndex`
