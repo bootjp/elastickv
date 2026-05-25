@@ -363,6 +363,14 @@ func readRootFile(root *os.Root, name string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	// Re-check regularity on the OPEN fd: the ReadDir entry type is
+	// stale, so a FIFO/device swapped in between ReadDir and Open
+	// would otherwise reach io.ReadAll (blocking, or reading
+	// attacker-controlled bytes from a writer-attached FIFO). The
+	// post-open fstat is authoritative (claude review on PR #831).
+	if !info.Mode().IsRegular() {
+		return nil, errors.Wrapf(ErrRedisEncodeNotRegular, "%s (mode=%s)", name, info.Mode())
+	}
 	if err := refuseHardLink(info, name); err != nil {
 		return nil, err
 	}

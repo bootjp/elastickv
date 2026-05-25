@@ -289,6 +289,31 @@ func TestRedisEncodeRejectsNonRegularTTLSidecar(t *testing.T) {
 	}
 }
 
+// TestReadRootFileRejectsNonRegularPostOpen pins the post-open fstat
+// guard in readRootFile, which is distinct from the walk's pre-open
+// ReadDir-type filter: the ReadDir entry type is stale, so a FIFO/device
+// swapped in between ReadDir and Open would otherwise reach io.ReadAll
+// (blocking on a writer-attached FIFO, or ingesting attacker-controlled
+// bytes). A directory is the cross-platform stand-in — it opens cleanly
+// but fstat reports non-regular, so readRootFile must fail closed with
+// ErrRedisEncodeNotRegular rather than reading it (claude review on PR
+// #831).
+func TestReadRootFileRejectsNonRegularPostOpen(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "notafile.bin"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	if _, err := readRootFile(root, "notafile.bin"); !errors.Is(err, ErrRedisEncodeNotRegular) {
+		t.Fatalf("readRootFile err = %v, want ErrRedisEncodeNotRegular", err)
+	}
+}
+
 // writeKeymap writes a single-entry KEYMAP.jsonl mapping the encoded
 // segment back to its original bytes (base64url, the KeymapRecord
 // schema), under <root>/redis/db_0/.
