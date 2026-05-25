@@ -182,12 +182,24 @@ func (e *RedisEncoder) encodeHLL(b *snapshotBuilder) error {
 // to its original user key, reads the body, and invokes fn. A missing
 // subdir is not an error. Non-.bin entries and sub-directories are
 // skipped.
+//
+// Files are read through an os.Root rooted at the subdir, so a symlink
+// inside the dump that points outside the subdir is refused — a
+// crafted dump cannot make the encoder exfiltrate an arbitrary host
+// file. This also keeps the read off the tainted-path G304 lint path
+// without a //nolint suppression (the os.Root API is the gosec-blessed
+// safe-file-access primitive).
 func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey, body []byte) error) error {
 	dir := filepath.Join(e.dbDir(), subdir)
-	entries, err := os.ReadDir(dir)
+	root, err := os.OpenRoot(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer func() { _ = root.Close() }()
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -200,15 +212,31 @@ func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey
 		if err != nil {
 			return err
 		}
-		body, err := os.ReadFile(filepath.Join(dir, ent.Name())) //nolint:gosec // path is dump-internal, validated dir
+		body, err := readRootFile(root, ent.Name())
 		if err != nil {
-			return errors.WithStack(err)
+			return err
 		}
 		if err := fn(encoded, rawKey, body); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// readRootFile reads a regular file by name within root, refusing any
+// path that escapes the root (including via an in-dump symlink to an
+// external target).
+func readRootFile(root *os.Root, name string) ([]byte, error) {
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = f.Close() }()
+	body, err := io.ReadAll(f)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return body, nil
 }
 
 // ttlSidecarRecord mirrors the JSONL shape appendTTL writes:

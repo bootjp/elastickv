@@ -74,6 +74,9 @@ func TestRedisEncodeStringRoundTripViaDecode(t *testing.T) {
 	if !bytes.Equal(got, []byte("hello")) {
 		t.Fatalf("decoded string = %q, want %q", got, "hello")
 	}
+	if _, err := os.Stat(filepath.Join(out, "redis", "db_0", "strings_ttl.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("strings_ttl.jsonl should be absent for a no-TTL string, stat err = %v", err)
+	}
 }
 
 // TestRedisEncodeStringTTLRoundTripViaDecode pins that a string's TTL
