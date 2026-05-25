@@ -17,6 +17,13 @@ import (
 // attack on the dump tree on Windows already requires the attacker to
 // hold write access to the output directory plus the symlink-create
 // privilege, which is a much higher bar than the unix case.
+// refuseHardLink is a no-op on Windows: the syscall.Stat_t.Nlink field
+// is not available, and mounting a hard-link attack on the dump tree
+// already requires write access to the output directory — the same
+// higher bar that makes openSidecarFile's simpler guard acceptable
+// here. Codex P2 on PR #828.
+func refuseHardLink(_ os.FileInfo, _ string) error { return nil }
+
 func openSidecarFile(path string) (*os.File, error) {
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil, cockroachdberr.WithStack(cockroachdberr.Newf(

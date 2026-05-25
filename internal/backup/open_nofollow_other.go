@@ -16,6 +16,14 @@ import (
 // offline / sandboxed and the threat model that motivated the unix
 // hardening (a local adversary swapping the path between syscalls)
 // does not apply. Codex P2 round 10.
+// refuseHardLink is a no-op on this platform: syscall.Stat_t.Nlink is
+// unavailable, and the threat model that motivates the unix check
+// (a local adversary hard-linking external inodes into the dump tree)
+// does not apply to the offline/sandboxed tooling these targets run.
+// Matches openSidecarFile's platform-specific posture. Codex P2 on
+// PR #828.
+func refuseHardLink(_ os.FileInfo, _ string) error { return nil }
+
 func openSidecarFile(path string) (*os.File, error) {
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return nil, cockroachdberr.WithStack(cockroachdberr.Newf(
