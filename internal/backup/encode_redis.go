@@ -18,9 +18,9 @@ import (
 // internal records to a snapshotBuilder, which MVCC-frames and writes
 // them.
 //
-// This commit covers the simple-value families: strings, HLL, and the
-// TTL handling for both. The wide-column collections (hash, list, set,
-// zset, stream) land in subsequent commits on the same milestone.
+// This file covers the simple-value families (strings, HLL, and their
+// TTL handling); the wide-column collections (hash/set/list/zset/stream)
+// live in encode_redis_coll.go in the same package.
 //
 // Format fidelity is pinned against the live adapter write path
 // (adapter/redis_compat_types.go, adapter/redis.go), not just the

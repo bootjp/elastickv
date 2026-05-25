@@ -62,9 +62,9 @@ type hashJSONRecord struct {
 // encodeHashes reconstructs !hs|meta| + !hs|fld| records from
 // hashes/*.json, plus an !redis|ttl| row for any expiring hash.
 func (e *RedisEncoder) encodeHashes(b *snapshotBuilder) error {
-	return e.walkJSONDir("hashes", ".json", func(rawKey, body []byte) error {
+	return e.walkJSONDir("hashes", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec hashJSONRecord
-		if err := json.Unmarshal(body, &rec); err != nil {
+		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "hash %q: %v", rawKey, err)
 		}
 		// Base meta: element count = number of fields (consolidated,
@@ -103,9 +103,9 @@ type setJSONRecord struct {
 // encodeSets reconstructs !st|meta| + !st|mem| records from
 // sets/*.json, plus an !redis|ttl| row for any expiring set.
 func (e *RedisEncoder) encodeSets(b *snapshotBuilder) error {
-	return e.walkJSONDir("sets", ".json", func(rawKey, body []byte) error {
+	return e.walkJSONDir("sets", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec setJSONRecord
-		if err := json.Unmarshal(body, &rec); err != nil {
+		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "set %q: %v", rawKey, err)
 		}
 		if err := b.Add(wideColMetaKey(RedisSetMetaPrefix, rawKey),
@@ -145,9 +145,9 @@ type listJSONRecord struct {
 // restored list's subsequent prepends/appends simply extend from this
 // base.
 func (e *RedisEncoder) encodeLists(b *snapshotBuilder) error {
-	return e.walkJSONDir("lists", ".json", func(rawKey, body []byte) error {
+	return e.walkJSONDir("lists", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec listJSONRecord
-		if err := json.Unmarshal(body, &rec); err != nil {
+		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "list %q: %v", rawKey, err)
 		}
 		if err := b.Add(buildListMetaKey(rawKey), marshalListMetaHead0(uint64(len(rec.Items))), 0); err != nil {
@@ -216,9 +216,9 @@ type zsetJSONRecord struct {
 // emitted so ZSCORE/ZRANK and ZRANGEBYSCORE both work on the restored
 // set (the live write path keeps them in lockstep).
 func (e *RedisEncoder) encodeZSets(b *snapshotBuilder) error {
-	return e.walkJSONDir("zsets", ".json", func(rawKey, body []byte) error {
+	return e.walkJSONDir("zsets", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec zsetJSONRecord
-		if err := json.Unmarshal(body, &rec); err != nil {
+		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "zset %q: %v", rawKey, err)
 		}
 		if err := b.Add(wideColMetaKey(RedisZSetMetaPrefix, rawKey),
@@ -319,8 +319,8 @@ type streamLineJSON struct {
 // protobuf carrying the interleaved (name,value,...) field list — the
 // exact format decodeStreamEntryValue consumes.
 func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
-	return e.walkJSONDir("streams", ".jsonl", func(rawKey, body []byte) error {
-		dec := json.NewDecoder(bytes.NewReader(body))
+	return e.walkJSONDir("streams", ".jsonl", func(rawKey []byte, r io.Reader) error {
+		dec := json.NewDecoder(r)
 		var meta *streamLineJSON
 		for {
 			var line streamLineJSON
@@ -453,11 +453,14 @@ func (e *RedisEncoder) addCollectionTTL(b *snapshotBuilder, rawKey []byte, expir
 }
 
 // walkJSONDir iterates <dbDir>/<subdir>/*<ext>, resolves each filename
-// to its original user key, reads the body, and invokes fn. A missing
-// subdir is not an error. Reads go through an os.Root so an in-dump
-// symlink cannot escape the subdir (same posture as walkBlobDir). ext
-// is ".json" for the per-key collections and ".jsonl" for streams.
-func (e *RedisEncoder) walkJSONDir(subdir, ext string, fn func(rawKey, body []byte) error) error {
+// to its original user key, and invokes fn with an io.Reader streaming
+// the file from disk — so a large stream .jsonl is decoded
+// incrementally rather than slurped into one []byte (gemini high on
+// PR #831). A missing subdir is not an error. Reads go through an
+// os.Root so an in-dump symlink cannot escape the subdir (same posture
+// as walkBlobDir). ext is ".json" for the per-key collections and
+// ".jsonl" for streams.
+func (e *RedisEncoder) walkJSONDir(subdir, ext string, fn func(rawKey []byte, r io.Reader) error) error {
 	dir := filepath.Join(e.dbDir(), subdir)
 	// Refuse a symlinked/non-directory subdir before os.OpenRoot follows
 	// it outside the dump tree (same guard walkBlobDir applies; codex P2
@@ -487,8 +490,10 @@ func (e *RedisEncoder) walkJSONDir(subdir, ext string, fn func(rawKey, body []by
 
 // handleJSONEntry processes one directory entry from walkJSONDir.
 // Non-regular entries and names not ending in ext are skipped (the
-// IsRegular() guard keeps a FIFO from reaching io.ReadAll).
-func (e *RedisEncoder) handleJSONEntry(root *os.Root, ent os.DirEntry, ext string, fn func(rawKey, body []byte) error) error {
+// IsRegular() guard keeps a FIFO from reaching the decoder). The file
+// is opened within root (symlink-escape safe), checked for hard links,
+// and streamed to fn as an io.Reader; it is closed when fn returns.
+func (e *RedisEncoder) handleJSONEntry(root *os.Root, ent os.DirEntry, ext string, fn func(rawKey []byte, r io.Reader) error) error {
 	if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ext) {
 		return nil
 	}
@@ -497,11 +502,19 @@ func (e *RedisEncoder) handleJSONEntry(root *os.Root, ent os.DirEntry, ext strin
 	if err != nil {
 		return err
 	}
-	body, err := readRootFile(root, ent.Name())
+	f, err := root.Open(ent.Name())
 	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if err := refuseHardLink(info, ent.Name()); err != nil {
 		return err
 	}
-	return fn(rawKey, body)
+	return fn(rawKey, f)
 }
 
 // wideColMetaKey builds <prefix><userKeyLen(4 BE)><userKey> — the
