@@ -128,7 +128,7 @@ type encryptionAdminEngine interface {
 // (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
 // when set, capability probing reads the §5.1 keys.json and
 // reports encryption_capable=true.
-func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine) {
+func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn) {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
@@ -140,6 +140,13 @@ func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPa
 			adapter.WithEncryptionAdminProposer(engine),
 			adapter.WithEncryptionAdminLeaderView(engine),
 		)
+		// The §4 capability fan-out is only meaningful when the
+		// cutover mutator is reachable (same enableMutators gate as
+		// the Proposer/LeaderView). Without it the cutover RPC
+		// refuses with the §4 "fan-out not wired" FailedPrecondition.
+		if capabilityFanout != nil {
+			opts = append(opts, adapter.WithEncryptionAdminCapabilityFanout(capabilityFanout))
+		}
 	}
 	srv := adapter.NewEncryptionAdminServer(opts...)
 	if err := srv.Validate(); err != nil {

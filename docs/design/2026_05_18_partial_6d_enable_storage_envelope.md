@@ -97,25 +97,27 @@
   into `store.WithEncryption` and `WithStorageEnvelopeGate` in
   6D-6c-2.
 
+- **6D-6c-2** (shipped, PR #826) — main.go production wiring:
+  `encryption.NewCipher(keystore)` + a single `encryption.StateCache`
+  threaded via `WithStateCache` into every per-shard `Applier`, with
+  `cache.ActiveStorageKeyID` / `cache.StorageEnvelopeActive` passed
+  into `store.WithEncryption` + `store.WithStorageEnvelopeGate` for
+  each shard's PebbleStore. Pulled forward the deterministic-nonce
+  core of Stage 7 (keystore hydration, local_epoch bump,
+  DeterministicNonceFactory) — see
+  [`2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md).
+- **6D-6c-3a** — main.go CapabilityFanout closure bound to the live
+  Raft membership view (`engine.Configuration` route snapshot across
+  all groups + a `DialFunc` over a dedicated `kv.GRPCConnCache`),
+  wired into the EnableStorageEnvelope server via
+  `WithEncryptionAdminCapabilityFanout` gated on encryption mutators.
+  See [`2026_05_25_proposed_6d6c3a_capability_fanout_wiring.md`](2026_05_25_proposed_6d6c3a_capability_fanout_wiring.md).
+
 ## Open milestones
 
-- **6D-6c-2** — main.go production wiring: build
-  `encryption.NewCipher(keystore)` and construct a single
-  `encryption.StateCache` at startup (parallel to the shared
-  `*Keystore`). Thread the cache via `WithStateCache` into every
-  per-shard `Applier` inside `buildShardGroups`, and pass
-  `cache.ActiveStorageKeyID` / `cache.StorageEnvelopeActive`
-  (NOT the per-shard `Applier` delegates) into
-  `store.WithEncryption` + `store.WithStorageEnvelopeGate` for
-  each shard's PebbleStore. Reading via the StateCache directly
-  ensures every shard's storage layer sees the post-apply state
-  regardless of which shard's leader accepted the encryption
-  proposal.
-- **6D-6c-3** — main.go CapabilityFanout closure bound to the
-  live Raft membership view (etcd engine route snapshot + admin
-  client DialFunc), and end-to-end integration test exercising
-  a single-node cluster Bootstrap → EnableStorageEnvelope →
-  Put → read-back-via-envelope.
+- **6D-6c-3b** — end-to-end integration test exercising a single-node
+  cluster Bootstrap → EnableStorageEnvelope → Put →
+  read-back-via-envelope, on top of the 6D-6c-3a fan-out wiring.
 
 ## 0. Why this doc exists
 
