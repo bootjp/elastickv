@@ -101,9 +101,16 @@ func TestSnapshotBuilderRoundTrip(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if _, err := b.WriteTo(&buf); err != nil {
+	n, err := b.WriteTo(&buf)
+	if err != nil {
 		t.Fatalf("WriteTo: %v", err)
 	}
+	// Byte count is deterministic: magic + lastCommitTS + per-entry
+	// (8-byte len prefix + bytes) for both key and value.
+	wantN := int64(len(PebbleSnapshotMagic) + 8 +
+		(8 + len(userKey) + snapshotTSSize) +
+		(8 + snapshotValueHeaderSize + len(userValue)))
+	assertWriteByteCount(t, n, &buf, wantN)
 
 	entries, hdr, err := DecodeLiveEntries(&buf)
 	if err != nil {
@@ -112,17 +119,35 @@ func TestSnapshotBuilderRoundTrip(t *testing.T) {
 	if hdr.LastCommitTS != encodeFixtureTS {
 		t.Fatalf("header LastCommitTS = %#x, want %#x", hdr.LastCommitTS, encodeFixtureTS)
 	}
+	assertSingleEntry(t, entries, userKey, userValue, expireAt)
+}
+
+// assertWriteByteCount checks WriteTo's returned count matches the
+// expected value and the actual buffer length.
+func assertWriteByteCount(t *testing.T, n int64, buf *bytes.Buffer, want int64) {
+	t.Helper()
+	if n != want {
+		t.Fatalf("WriteTo n = %d, want %d", n, want)
+	}
+	if n != int64(buf.Len()) {
+		t.Fatalf("WriteTo n = %d, but buf has %d bytes", n, buf.Len())
+	}
+}
+
+// assertSingleEntry checks the decoded set has exactly one entry
+// matching the given key/value/expiry.
+func assertSingleEntry(t *testing.T, entries []RoundTripEntry, key, val []byte, exp uint64) {
+	t.Helper()
 	if len(entries) != 1 {
 		t.Fatalf("got %d entries, want 1", len(entries))
 	}
-	if !bytes.Equal(entries[0].UserKey, userKey) {
-		t.Fatalf("UserKey = %q, want %q", entries[0].UserKey, userKey)
-	}
-	if !bytes.Equal(entries[0].UserValue, userValue) {
-		t.Fatalf("UserValue = %q, want %q", entries[0].UserValue, userValue)
-	}
-	if entries[0].ExpireAt != expireAt {
-		t.Fatalf("ExpireAt = %d, want %d", entries[0].ExpireAt, expireAt)
+	switch {
+	case !bytes.Equal(entries[0].UserKey, key):
+		t.Fatalf("UserKey = %q, want %q", entries[0].UserKey, key)
+	case !bytes.Equal(entries[0].UserValue, val):
+		t.Fatalf("UserValue = %q, want %q", entries[0].UserValue, val)
+	case entries[0].ExpireAt != exp:
+		t.Fatalf("ExpireAt = %d, want %d", entries[0].ExpireAt, exp)
 	}
 }
 
@@ -199,6 +224,48 @@ func TestSnapshotBuilderRejectsOversizeKey(t *testing.T) {
 	err := b.Add(oversize, []byte("v"), 0)
 	if !errors.Is(err, ErrEncodeKeyTooLarge) {
 		t.Fatalf("err = %v, want ErrEncodeKeyTooLarge", err)
+	}
+}
+
+// TestSnapshotBuilderEmptyRoundTrip pins the empty-builder path (the
+// "fresh cluster / empty shard" restore case): WriteTo emits a valid
+// header-only stream that DecodeLiveEntries reads back as zero entries
+// with the header timestamp intact.
+func TestSnapshotBuilderEmptyRoundTrip(t *testing.T) {
+	t.Parallel()
+	b := newSnapshotBuilder(encodeFixtureTS)
+	var buf bytes.Buffer
+	if _, err := b.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	entries, hdr, err := DecodeLiveEntries(&buf)
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	if hdr.LastCommitTS != encodeFixtureTS {
+		t.Fatalf("hdr.LastCommitTS = %#x, want %#x", hdr.LastCommitTS, encodeFixtureTS)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("got %d entries, want 0", len(entries))
+	}
+}
+
+// TestSnapshotBuilderRejectsReuse pins that a builder is single-use:
+// a second WriteTo fails closed with ErrSnapshotBuilderReused rather
+// than silently re-emitting the already-written entries.
+func TestSnapshotBuilderRejectsReuse(t *testing.T) {
+	t.Parallel()
+	b := newSnapshotBuilder(encodeFixtureTS)
+	if err := b.Add([]byte("!redis|str|k"), []byte("v"), 0); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := b.WriteTo(&buf); err != nil {
+		t.Fatalf("first WriteTo: %v", err)
+	}
+	_, err := b.WriteTo(&buf)
+	if !errors.Is(err, ErrSnapshotBuilderReused) {
+		t.Fatalf("second WriteTo err = %v, want ErrSnapshotBuilderReused", err)
 	}
 }
 

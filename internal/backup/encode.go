@@ -53,6 +53,14 @@ var ErrEncodeDuplicateKey = errors.New("backup: duplicate encoded key in snapsho
 var ErrEncodeKeyTooLarge = errors.New("backup: encoded key length exceeds limit")
 var ErrEncodeValueTooLarge = errors.New("backup: encoded value length exceeds limit")
 
+// ErrSnapshotBuilderReused is returned by WriteTo when it is called
+// more than once on the same builder. A builder is single-use (one
+// per encode run); a second WriteTo would re-emit the already-written
+// entries, producing a valid-but-unintended stream. Enforced so the
+// per-adapter feed loops in later milestones cannot silently double-
+// emit (claude review on PR #825).
+var ErrSnapshotBuilderReused = errors.New("backup: snapshotBuilder.WriteTo called more than once")
+
 // ErrLastCommitTSRegression is returned by ResolveCommitTS when a
 // `--last-commit-ts` override is older than MANIFEST.last_commit_ts.
 // Seeding the restored node's HLC ceiling below a timestamp already
@@ -123,6 +131,7 @@ type snapshotBuilder struct {
 	commitTS uint64
 	entries  []encodedKV
 	seen     map[string]struct{}
+	written  bool
 }
 
 // newSnapshotBuilder constructs a builder that stamps every key with
@@ -141,21 +150,24 @@ func newSnapshotBuilder(commitTS uint64) *snapshotBuilder {
 // order-dependent `.fsm`. userKey/userValue are copied — callers may
 // reuse their buffers after Add returns.
 func (b *snapshotBuilder) Add(userKey, userValue []byte, expireAt uint64) error {
-	key := encodeMVCCKey(userKey, b.commitTS)
-	if uint64(len(key)) > MaxSnapshotEncodedKeySize {
+	// Size-check from the user-buffer lengths before allocating the
+	// framed buffers — encKey = userKey + snapshotTSSize, encVal =
+	// snapshotValueHeaderSize + userValue — so an oversize record
+	// fails closed without a wasted allocation (claude review nit).
+	if uint64(len(userKey))+snapshotTSSize > MaxSnapshotEncodedKeySize {
 		return errors.Wrapf(ErrEncodeKeyTooLarge,
-			"length %d > %d", len(key), MaxSnapshotEncodedKeySize)
+			"length %d > %d", len(userKey)+snapshotTSSize, MaxSnapshotEncodedKeySize)
 	}
-	val := encodeMVCCValue(userValue, expireAt)
-	if uint64(len(val)) > MaxSnapshotEncodedValueSize {
+	if uint64(len(userValue))+snapshotValueHeaderSize > MaxSnapshotEncodedValueSize {
 		return errors.Wrapf(ErrEncodeValueTooLarge,
-			"length %d > %d", len(val), MaxSnapshotEncodedValueSize)
+			"length %d > %d", len(userValue)+snapshotValueHeaderSize, MaxSnapshotEncodedValueSize)
 	}
+	key := encodeMVCCKey(userKey, b.commitTS)
 	if _, dup := b.seen[string(key)]; dup {
 		return errors.Wrapf(ErrEncodeDuplicateKey, "userKey %q", userKey)
 	}
 	b.seen[string(key)] = struct{}{}
-	b.entries = append(b.entries, encodedKV{key: key, val: val})
+	b.entries = append(b.entries, encodedKV{key: key, val: encodeMVCCValue(userValue, expireAt)})
 	return nil
 }
 
@@ -169,6 +181,10 @@ func (b *snapshotBuilder) Len() int { return len(b.entries) }
 // format terminates on a clean EOF (store/snapshot_pebble.go WriteTo,
 // internal/backup/snapshot_reader.go ReadSnapshot).
 func (b *snapshotBuilder) WriteTo(w io.Writer) (int64, error) {
+	if b.written {
+		return 0, errors.WithStack(ErrSnapshotBuilderReused)
+	}
+	b.written = true
 	sort.Slice(b.entries, func(i, j int) bool {
 		return bytes.Compare(b.entries[i].key, b.entries[j].key) < 0
 	})
@@ -214,7 +230,10 @@ type countingWriter struct {
 func (w *countingWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
 	w.n += int64(n)
-	return n, errors.WithStack(err)
+	if err != nil {
+		return n, errors.WithStack(err)
+	}
+	return n, nil
 }
 
 // RoundTripEntry is one live record recovered by DecodeLiveEntries.
