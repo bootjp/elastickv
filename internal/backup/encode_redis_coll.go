@@ -322,6 +322,7 @@ func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
 	return e.walkJSONDir("streams", ".jsonl", func(rawKey []byte, r io.Reader) error {
 		dec := json.NewDecoder(r)
 		var meta *streamLineJSON
+		var st streamAccum
 		for {
 			var line streamLineJSON
 			if err := dec.Decode(&line); err != nil {
@@ -335,19 +336,14 @@ func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
 				meta = &m
 				continue
 			}
-			if err := e.addStreamEntry(b, rawKey, line); err != nil {
+			ms, seq, err := e.addStreamEntry(b, rawKey, line)
+			if err != nil {
 				return err
 			}
+			st.observe(ms, seq)
 		}
-		if meta == nil {
-			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: missing _meta line", rawKey)
-		}
-		// Fail closed on a negative length: marshalStreamMeta casts to
-		// uint64, so "length": -1 would otherwise encode as a huge count
-		// that the restored cluster surfaces as a corrupt XLEN (codex P2
-		// on PR #831).
-		if meta.Length < 0 {
-			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: negative _meta length %d", rawKey, meta.Length)
+		if err := validateStreamMeta(rawKey, meta, st); err != nil {
+			return err
 		}
 		if err := b.Add(wideColMetaKey(RedisStreamMetaPrefix, rawKey),
 			marshalStreamMeta(meta.Length, meta.LastMs, meta.LastSeq), 0); err != nil {
@@ -358,31 +354,77 @@ func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
 }
 
 // addStreamEntry emits one !stream|entry| record from a parsed JSONL
-// entry line. The ID "ms-seq" is split back into the 16-byte key
+// entry line and returns the entry's (ms, seq) ID so the caller can
+// track the entry count and the maximum ID for _meta consistency
+// validation. The ID "ms-seq" is split back into the 16-byte key
 // suffix; the fields array becomes the interleaved [name,value,...]
 // slice the protobuf carries.
-func (e *RedisEncoder) addStreamEntry(b *snapshotBuilder, rawKey []byte, line streamLineJSON) error {
-	ms, seq, err := parseStreamID(line.ID)
+func (e *RedisEncoder) addStreamEntry(b *snapshotBuilder, rawKey []byte, line streamLineJSON) (ms, seq uint64, err error) {
+	ms, seq, err = parseStreamID(line.ID)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	interleaved := make([]string, 0, len(line.Fields)*streamFieldPairWidth)
 	for _, f := range line.Fields {
 		name, err := unmarshalRedisBinaryValue(f.Name)
 		if err != nil {
-			return errors.Wrapf(err, "stream %q entry %s field name", rawKey, line.ID)
+			return 0, 0, errors.Wrapf(err, "stream %q entry %s field name", rawKey, line.ID)
 		}
 		value, err := unmarshalRedisBinaryValue(f.Value)
 		if err != nil {
-			return errors.Wrapf(err, "stream %q entry %s field value", rawKey, line.ID)
+			return 0, 0, errors.Wrapf(err, "stream %q entry %s field value", rawKey, line.ID)
 		}
 		interleaved = append(interleaved, string(name), string(value))
 	}
 	val, err := buildStreamEntryValue(line.ID, interleaved)
 	if err != nil {
-		return errors.Wrapf(err, "stream %q entry %s", rawKey, line.ID)
+		return 0, 0, errors.Wrapf(err, "stream %q entry %s", rawKey, line.ID)
 	}
-	return b.Add(buildStreamEntryKey(rawKey, ms, seq), val, 0)
+	if err := b.Add(buildStreamEntryKey(rawKey, ms, seq), val, 0); err != nil {
+		return 0, 0, err
+	}
+	return ms, seq, nil
+}
+
+// streamAccum tracks the entry count and the maximum (ms, seq) ID seen
+// while parsing a stream's JSONL, for validateStreamMeta.
+type streamAccum struct {
+	count         int64
+	maxMs, maxSeq uint64
+	have          bool
+}
+
+func (s *streamAccum) observe(ms, seq uint64) {
+	s.count++
+	if !s.have || ms > s.maxMs || (ms == s.maxMs && seq > s.maxSeq) {
+		s.maxMs, s.maxSeq, s.have = ms, seq, true
+	}
+}
+
+// validateStreamMeta fails closed when the _meta line is missing, has a
+// negative length, disagrees with the parsed entry count, or carries a
+// LastMs/LastSeq high-water mark BEHIND the maximum parsed entry ID.
+// The last two would silently restore an inconsistent XLEN or let a
+// future XADD '*' generate an ID that collides with (overwrites) an
+// existing entry. A well-formed dump from the decoder never trips
+// these (claude/codex on PR #831).
+func validateStreamMeta(rawKey []byte, meta *streamLineJSON, st streamAccum) error {
+	if meta == nil {
+		return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: missing _meta line", rawKey)
+	}
+	if meta.Length < 0 {
+		return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: negative _meta length %d", rawKey, meta.Length)
+	}
+	if meta.Length != st.count {
+		return errors.Wrapf(ErrRedisEncodeInvalidJSON,
+			"stream %q: _meta length %d disagrees with %d parsed entries", rawKey, meta.Length, st.count)
+	}
+	if st.have && (st.maxMs > meta.LastMs || (st.maxMs == meta.LastMs && st.maxSeq > meta.LastSeq)) {
+		return errors.Wrapf(ErrRedisEncodeInvalidJSON,
+			"stream %q: _meta last %d-%d is behind max entry %d-%d",
+			rawKey, meta.LastMs, meta.LastSeq, st.maxMs, st.maxSeq)
+	}
+	return nil
 }
 
 // parseStreamID splits a Redis stream ID "ms-seq" into its two uint64

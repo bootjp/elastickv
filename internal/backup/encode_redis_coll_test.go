@@ -646,6 +646,45 @@ func TestUnmarshalRedisBinaryValue(t *testing.T) {
 	}
 }
 
+// TestRedisEncodeStreamRejectsMismatchedMetaLength pins that a _meta
+// length disagreeing with the parsed entry count fails closed rather
+// than restoring an inconsistent XLEN.
+func TestRedisEncodeStreamRejectsMismatchedMetaLength(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("mism"))
+	// One entry line, but _meta claims length 0.
+	body := []byte(`{"id":"1-0","fields":[{"name":"f","value":"v"}]}` + "\n" +
+		`{"_meta":true,"length":0,"last_ms":1,"last_seq":0,"expire_at_ms":null}` + "\n")
+	writeRedisFile(t, in, filepath.Join("streams", enc+".jsonl"), body)
+
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeInvalidJSON) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeInvalidJSON", err)
+	}
+}
+
+// TestRedisEncodeStreamRejectsStaleLastID pins that a _meta
+// last_ms/last_seq behind the maximum parsed entry ID fails closed —
+// otherwise a future XADD '*' could mint an ID that collides with an
+// existing entry.
+func TestRedisEncodeStreamRejectsStaleLastID(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("stale"))
+	// Entry at 5-0 but _meta high-water mark only 3-0.
+	body := []byte(`{"id":"5-0","fields":[{"name":"f","value":"v"}]}` + "\n" +
+		`{"_meta":true,"length":1,"last_ms":3,"last_seq":0,"expire_at_ms":null}` + "\n")
+	writeRedisFile(t, in, filepath.Join("streams", enc+".jsonl"), body)
+
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeInvalidJSON) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeInvalidJSON", err)
+	}
+}
+
 // TestRedisEncodeStreamRejectsNegativeLength pins that a _meta line with
 // a negative length fails closed rather than encoding a corrupt
 // (uint64-wrapped) stream meta.
