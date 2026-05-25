@@ -449,10 +449,16 @@ func (e *RedisEncoder) addCollectionTTL(b *snapshotBuilder, rawKey []byte, expir
 // is ".json" for the per-key collections and ".jsonl" for streams.
 func (e *RedisEncoder) walkJSONDir(subdir, ext string, fn func(rawKey, body []byte) error) error {
 	dir := filepath.Join(e.dbDir(), subdir)
-	root, err := os.OpenRoot(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	// Refuse a symlinked/non-directory subdir before os.OpenRoot follows
+	// it outside the dump tree (same guard walkBlobDir applies; codex P2
+	// on PR #828).
+	if err := lstatDumpDir(dir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
 	}
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -462,23 +468,30 @@ func (e *RedisEncoder) walkJSONDir(subdir, ext string, fn func(rawKey, body []by
 		return errors.WithStack(err)
 	}
 	for _, ent := range entries {
-		if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ext) {
-			continue
-		}
-		encoded := strings.TrimSuffix(ent.Name(), ext)
-		rawKey, err := e.resolveKey(encoded)
-		if err != nil {
-			return err
-		}
-		body, err := readRootFile(root, ent.Name())
-		if err != nil {
-			return err
-		}
-		if err := fn(rawKey, body); err != nil {
+		if err := e.handleJSONEntry(root, ent, ext, fn); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// handleJSONEntry processes one directory entry from walkJSONDir.
+// Non-regular entries and names not ending in ext are skipped (the
+// IsRegular() guard keeps a FIFO from reaching io.ReadAll).
+func (e *RedisEncoder) handleJSONEntry(root *os.Root, ent os.DirEntry, ext string, fn func(rawKey, body []byte) error) error {
+	if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ext) {
+		return nil
+	}
+	encoded := strings.TrimSuffix(ent.Name(), ext)
+	rawKey, err := e.resolveKey(encoded)
+	if err != nil {
+		return err
+	}
+	body, err := readRootFile(root, ent.Name())
+	if err != nil {
+		return err
+	}
+	return fn(rawKey, body)
 }
 
 // wideColMetaKey builds <prefix><userKeyLen(4 BE)><userKey> — the
