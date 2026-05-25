@@ -339,6 +339,35 @@ func TestMergeKeyVizMatricesPerCellConflictMarksOnlyAffectedColumn(t *testing.T)
 		"row-level Conflict stays the OR of Conflicts[] so an older SPA still hatches the row")
 }
 
+// TestMergeKeyVizMatricesWritesWithoutConflictLeaveConflictsNil pins
+// the lazy-allocation contract: a write merge with no within-term
+// disagreement (stable leader, one source non-zero) must leave
+// Conflicts nil so json:"conflicts,omitempty" omits it. Allocating a
+// full [false,...] array per clean row would balloon the wire payload.
+func TestMergeKeyVizMatricesWritesWithoutConflictLeaveConflictsNil(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	leader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30, 40}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	follower := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{0, 0}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{leader, follower}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{30, 40}, merged.Rows[0].Values)
+	require.Nil(t, merged.Rows[0].Conflicts, "a cleanly merged write row must leave Conflicts nil for omitempty")
+	require.False(t, merged.Rows[0].Conflict)
+}
+
 // TestMergeKeyVizMatricesReadsLeaveConflictsNil pins that the read
 // merge path never allocates Conflicts — reads are independent local
 // serves that sum and can never conflict, so the per-cell slice stays

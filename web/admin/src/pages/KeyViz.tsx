@@ -310,9 +310,18 @@ function ConflictOverlay({ rows, cellH, cellW, width, columnCount }: ConflictOve
       const row = rows[i];
       const cells = row.conflicts;
       if (cells && cells.length > 0) {
-        // Per-cell: hatch only the disagreeing columns.
-        for (let j = 0; j < cells.length; j++) {
-          if (cells[j]) out.push({ x: j * cellW, y: i * cellH, w: cellW });
+        // Per-cell: hatch the disagreeing columns, coalescing adjacent
+        // runs into one <rect> so a long stretch of conflicting cells
+        // does not emit hundreds of SVG nodes.
+        let j = 0;
+        while (j < cells.length) {
+          if (!cells[j]) {
+            j++;
+            continue;
+          }
+          const startCol = j;
+          while (j < cells.length && cells[j]) j++;
+          out.push({ x: startCol * cellW, y: i * cellH, w: (j - startCol) * cellW });
         }
       } else if (row.conflict) {
         // Legacy server: only the row-level flag is available, so fall

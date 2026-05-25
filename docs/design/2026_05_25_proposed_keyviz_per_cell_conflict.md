@@ -76,10 +76,11 @@ that gap.
 ```go
 // Conflicts[j] is true when fan-out merge saw two sources report
 // different non-zero values for the same (bucket, raft_group_id,
-// leader_term, column j) tuple. Parallel to Values[]; either nil
-// (single-node / legacy server) or len == len(Values). The
-// row-level Conflict bool remains the OR of this slice for older
-// clients.
+// leader_term, column j) tuple. Parallel to Values[]; allocated
+// lazily so it is nil whenever the row had no conflict (single-node,
+// legacy server, OR a cleanly merged row) — omitempty then keeps it
+// off the wire. Otherwise len == len(Values). The row-level Conflict
+// bool remains the OR of this slice for older clients.
 Conflicts []bool `json:"conflicts,omitempty"`
 ```
 
@@ -101,11 +102,14 @@ matrices), so quiet deployments see no payload growth.
 `resolveRowMergeAcc` (`keyviz_fanout.go`) already iterates every cell
 to resolve writes. It will additionally:
 
-1. Allocate `row.Conflicts = make([]bool, width)` on the write path.
-2. Set `row.Conflicts[j] = c.hasConflict()` instead of only OR-ing
-   into `row.Conflict`.
-3. Keep `row.Conflict = row.Conflict || c.hasConflict()` so the
-   row-level OR is preserved for old clients.
+1. On the first conflicting cell, **lazily** allocate
+   `row.Conflicts = make([]bool, width)` — never up front, so a
+   cleanly merged row keeps `Conflicts == nil` and `omitempty` drops
+   it from the wire (a non-nil `[]bool` is never "empty" for
+   `omitempty`, so eager allocation would emit `[false,...]` on every
+   merged write row and balloon the payload).
+2. Set `row.Conflicts[j] = true` and `row.Conflict = true` for that
+   cell.
 
 The read path (`useGroupTermDedupe == false`) never sets conflict, so
 it leaves `Conflicts` nil — consistent with today's row-level
@@ -132,10 +136,11 @@ The hatch `<pattern>` is unchanged. Per-cell rects reuse the same
    interaction. `conflicts[]` is derived from existing merge state.
 2. **Concurrency / distributed** — none new. Merge runs synchronously
    after the parallel peer fetch; no shared mutable state added.
-3. **Performance** — one `make([]bool, width)` per merged row on the
-   write path (bounded by the 1024-row budget × column count); the
-   conflict bit was already computed per cell, so no extra passes.
-   `omitempty` avoids wire growth on quiet matrices.
+3. **Performance** — one `make([]bool, width)` only for rows that
+   actually conflict (lazy allocation), bounded by the 1024-row
+   budget; the conflict bit was already computed per cell, so no extra
+   passes. Lazy alloc + `omitempty` means clean rows add zero wire
+   bytes and zero allocations.
 4. **Data consistency** — the row-level `conflict` stays the exact OR
    of `conflicts[]`, so the coarse signal is unchanged; per-cell is
    strictly more precise. No change to `(group, term)` dedupe.

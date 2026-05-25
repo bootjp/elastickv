@@ -96,9 +96,11 @@ type KeyVizRow struct {
 	// Conflicts[j] is true when fan-out merge saw ≥2 sources report
 	// different non-zero values for the same
 	// (bucket, raft_group_id, leader_term, column j) tuple, so the SPA
-	// can hatch the individual cell rather than the whole row. Parallel
-	// to Values[]; either nil (single-node / no fan-out / legacy server)
-	// or len == len(Values). Conflict is the OR of this slice.
+	// can hatch the individual cell rather than the whole row. Allocated
+	// lazily and only on the write path: nil whenever the row had no
+	// conflict (single-node, no fan-out, legacy server, or a cleanly
+	// merged row) so omitempty keeps it off the wire; otherwise
+	// len == len(Values). Conflict is the OR of this slice.
 	Conflicts []bool `json:"conflicts,omitempty"`
 	// RaftGroupIDs[j] and LeaderTerms[j] carry the route's Raft
 	// identity at the time column j was flushed (parallel to

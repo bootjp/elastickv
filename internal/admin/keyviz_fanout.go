@@ -734,14 +734,18 @@ func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 		RaftGroupIDs:      make([]uint64, width),
 		LeaderTerms:       make([]uint64, width),
 	}
-	if useGroupTermDedupe {
-		row.Conflicts = make([]bool, width)
-	}
 	for j := range acc.cells {
 		c := &acc.cells[j]
 		if useGroupTermDedupe {
 			row.Values[j], row.RaftGroupIDs[j], row.LeaderTerms[j] = c.resolveWrite()
 			if c.hasConflict() {
+				// Allocate Conflicts lazily so a clean row keeps it nil
+				// and `json:"conflicts,omitempty"` omits it — otherwise
+				// every merged write row would serialize a full
+				// [false,...] array and balloon the wire payload.
+				if row.Conflicts == nil {
+					row.Conflicts = make([]bool, width)
+				}
 				row.Conflicts[j] = true
 				row.Conflict = true
 			}
