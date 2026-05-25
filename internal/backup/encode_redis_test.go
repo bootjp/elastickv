@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 )
 
 // redisEncTS is the commit timestamp the Redis encoder tests stamp.
@@ -157,8 +159,115 @@ func TestRedisEncodeMissingDBIsNoop(t *testing.T) {
 	}
 }
 
-// writeTTLSidecar appends one {"key","expire_at_ms"} record to a TTL
-// sidecar JSONL under <root>/redis/db_0/.
+// TestRedisEncodeHLLNoTTLRoundTripViaDecode pins the no-TTL HLL branch
+// (the !ok || expireMs==0 early return in encodeHLL): the sketch
+// survives and no hll_ttl.jsonl is produced.
+func TestRedisEncodeHLLNoTTLRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("nottl"))
+	sketch := []byte{0xAA, 0xBB, 0xCC}
+	writeRedisFile(t, in, filepath.Join("hll", enc+".bin"), sketch)
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, err := os.ReadFile(filepath.Join(out, "redis", "db_0", "hll", enc+".bin"))
+	if err != nil {
+		t.Fatalf("read decoded hll: %v", err)
+	}
+	if !bytes.Equal(got, sketch) {
+		t.Fatalf("decoded hll = %x, want %x", got, sketch)
+	}
+	if _, err := os.Stat(filepath.Join(out, "redis", "db_0", "hll_ttl.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("hll_ttl.jsonl should be absent for a no-TTL HLL, stat err = %v", err)
+	}
+}
+
+// TestRedisEncodeShaFallbackResolvesViaKeymap pins the SHA-fallback
+// happy path: a key too long for direct encoding takes the SHA-fallback
+// filename, and the encoder recovers the original bytes from KEYMAP.jsonl
+// so the round-trip restores the same key.
+func TestRedisEncodeShaFallbackResolvesViaKeymap(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	longKey := bytes.Repeat([]byte("k"), 300) // > 240-byte segment cap
+	enc := EncodeSegment(longKey)
+	if !IsShaFallback(enc) {
+		t.Fatalf("EncodeSegment(300 bytes) = %q, expected sha-fallback", enc)
+	}
+	writeRedisFile(t, in, filepath.Join("strings", enc+".bin"), []byte("payload"))
+	writeKeymap(t, in, enc, longKey)
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	// Decode re-encodes the recovered key to the same sha-fallback name.
+	got, err := os.ReadFile(filepath.Join(out, "redis", "db_0", "strings", enc+".bin"))
+	if err != nil {
+		t.Fatalf("read decoded string: %v", err)
+	}
+	if !bytes.Equal(got, []byte("payload")) {
+		t.Fatalf("decoded string = %q, want %q", got, "payload")
+	}
+}
+
+// TestRedisEncodeShaFallbackMissingKeymapFailsClosed pins the primary
+// error contract: a SHA-fallback filename with no KEYMAP entry fails
+// closed with ErrRedisEncodeMissingKeymap rather than emitting a record
+// under a hashed key.
+func TestRedisEncodeShaFallbackMissingKeymapFailsClosed(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	longKey := bytes.Repeat([]byte("m"), 300)
+	enc := EncodeSegment(longKey)
+	writeRedisFile(t, in, filepath.Join("strings", enc+".bin"), []byte("x"))
+	// No KEYMAP.jsonl written.
+
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeMissingKeymap) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeMissingKeymap", err)
+	}
+}
+
+// TestRedisEncodeNotDirFailsClosed pins that a redis/db_0 path that is a
+// regular file (malformed dump) fails with ErrRedisEncodeNotDir — a
+// dedicated sentinel distinct from the missing-keymap contract.
+func TestRedisEncodeNotDirFailsClosed(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(in, "redis"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(in, "redis", "db_0"), []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeNotDir) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeNotDir", err)
+	}
+}
+
+// writeKeymap writes a single-entry KEYMAP.jsonl mapping the encoded
+// segment back to its original bytes (base64url, the KeymapRecord
+// schema), under <root>/redis/db_0/.
+func writeKeymap(t *testing.T, root, encoded string, original []byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := NewKeymapWriter(&buf)
+	if err := w.WriteOriginal(encoded, original, "redis-string"); err != nil {
+		t.Fatalf("keymap WriteOriginal: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("keymap Close: %v", err)
+	}
+	writeRedisFile(t, root, "KEYMAP.jsonl", buf.Bytes())
+}
+
+// writeTTLSidecar writes a single {"key","expire_at_ms"} record to a TTL
+// sidecar JSONL under <root>/redis/db_0/. NOTE: it truncates (one entry
+// per call); a multi-entry helper is added when the collection encoders
+// (M2b) need it.
 func writeTTLSidecar(t *testing.T, root, name, encodedKey string, expireMs uint64) {
 	t.Helper()
 	rec := ttlSidecarRecord{Key: encodedKey, ExpireAtMs: expireMs}

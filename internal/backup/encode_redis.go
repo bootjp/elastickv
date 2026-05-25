@@ -46,6 +46,13 @@ import (
 // under a truncated/hashed key the live cluster would never serve.
 var ErrRedisEncodeMissingKeymap = errors.New("backup: redis encode missing KEYMAP entry for sha-fallback key")
 
+// ErrRedisEncodeNotDir is returned when the redis/db_<n> path exists
+// but is a regular file rather than a directory — a malformed dump.
+// A dedicated sentinel (not ErrRedisEncodeMissingKeymap) so callers
+// can distinguish "bad dump layout" from "sha-fallback key without a
+// keymap entry" via errors.Is.
+var ErrRedisEncodeNotDir = errors.New("backup: redis db path is not a directory")
+
 // RedisEncoder reconstructs the internal Redis keyspace for one logical
 // database (redis/db_<n>/) from its decoded directory tree.
 type RedisEncoder struct {
@@ -79,7 +86,7 @@ func (e *RedisEncoder) Encode(b *snapshotBuilder) error {
 	case err != nil:
 		return errors.WithStack(err)
 	case !info.IsDir():
-		return errors.Wrapf(ErrRedisEncodeMissingKeymap, "db path %q is not a directory", dir)
+		return errors.Wrapf(ErrRedisEncodeNotDir, "db path %q", dir)
 	}
 	if err := e.loadKeymap(); err != nil {
 		return err
@@ -126,7 +133,11 @@ func (e *RedisEncoder) resolveKey(encoded string) ([]byte, error) {
 	if !ok {
 		return nil, errors.Wrapf(ErrRedisEncodeMissingKeymap, "encoded %q", encoded)
 	}
-	return rec.Original()
+	original, err := rec.Original()
+	if err != nil {
+		return nil, errors.Wrapf(err, "encoded %q", encoded)
+	}
+	return original, nil
 }
 
 // encodeStrings reconstructs !redis|str| records from strings/*.bin,
@@ -241,6 +252,14 @@ func (e *RedisEncoder) loadTTLMap(name string) (map[string]uint64, error) {
 // ([0xFF 0x01][flags][expireMs BE if has_ttl]) followed by the body.
 // expireMs == 0 means "no TTL" (flags=0); a non-zero value sets the
 // has-TTL flag and the 8-byte big-endian millis section.
+//
+// expireMs is written verbatim. The decode side clamps to MaxInt64
+// (decodeRedisStringValue), and the value originates from
+// strings_ttl.jsonl which decode already wrote post-clamp, so a
+// round-tripped dump never carries a value above MaxInt64 here. A
+// hand-crafted sidecar with a larger value would be silently clamped
+// on the next decode — an accepted asymmetry, not a live concern
+// (Unix-ms never reaches MaxInt64).
 func encodeRedisStrInlineValue(body []byte, expireMs uint64) []byte {
 	if expireMs == 0 {
 		out := make([]byte, redisStrBaseHeader+len(body))
