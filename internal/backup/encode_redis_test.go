@@ -296,8 +296,7 @@ func TestRedisEncodeRejectsNonRegularTTLSidecar(t *testing.T) {
 // (blocking on a writer-attached FIFO, or ingesting attacker-controlled
 // bytes). A directory is the cross-platform stand-in — it opens cleanly
 // but fstat reports non-regular, so readRootFile must fail closed with
-// ErrRedisEncodeNotRegular rather than reading it (claude review on PR
-// #831).
+// ErrRedisEncodeNotRegular rather than reading it.
 func TestReadRootFileRejectsNonRegularPostOpen(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

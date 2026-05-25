@@ -367,7 +367,7 @@ func readRootFile(root *os.Root, name string) ([]byte, error) {
 	// stale, so a FIFO/device swapped in between ReadDir and Open
 	// would otherwise reach io.ReadAll (blocking, or reading
 	// attacker-controlled bytes from a writer-attached FIFO). The
-	// post-open fstat is authoritative (claude review on PR #831).
+	// post-open fstat is authoritative; the ReadDir type is not.
 	if !info.Mode().IsRegular() {
 		return nil, errors.Wrapf(ErrRedisEncodeNotRegular, "%s (mode=%s)", name, info.Mode())
 	}
