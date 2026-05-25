@@ -132,8 +132,11 @@ lives in the bytes *after* that prefix. So:
      guarantees `k - subStart < subSpan`, so `hi < K`, and `K` is
      capped well below `subSpan` whenever `subSpan > 0` (the degenerate
      `subSpan == 0` route is forced to `K=1` at register — §3.2 — and
-     never reaches this branch). A final clamp to `[0, K-1]` is a
-     belt-and-suspenders guard against the `k == subEnd` rounding edge.
+     never reaches this branch). With the `k >= subEnd` guard already
+     handling the top edge, the interior case (`k <= subEnd - 1`)
+     yields at most `K-1` exactly, so a final clamp to `[0, K-1]` can
+     **never actually fire** — it is kept only as defensive
+     correctness, not because any guarded path can overflow it.
    - `atomic.Add` into `slot.subBuckets[idx]`'s counter family.
 
    No allocation, no lock; one `Mul64`+`Div64` and a handful of byte
@@ -227,23 +230,45 @@ behaviour with one extra indirection. The `subShift` field from the
 first draft is gone — `math/bits` (§3.1) makes the multiply/divide
 exact without it.
 
-**Immutability & re-registration.** For a stable route these fields
-are immutable after publish (same lock-free read contract as
-`RouteID`). The one mutation path is `reclaimRetiredSlot`: when a
-`RouteID` is removed and re-registered within the grace window, its
-`[Start, End)` may differ from before. That path **must recompute**
-`subPrefixLen` / `subStart` / `subEnd` / `subSpan` (and re-size
-`subBuckets`, zeroing counters) under the slot's `metaMu`, exactly
-where it already refreshes `Start` / `End` / `MemberRoutesTotal`.
-Skipping this would bucket the re-registered route's new key range into
-the stale sub-ranges of its previous incarnation — a silent
-correctness bug. Because the recompute happens under `metaMu` off the
-hot path while `Observe` reads these fields locklessly, the sub-bucket
-metadata is published atomically with the slot's new `[Start, End)`:
-an `Observe` either sees the whole old triple or the whole new one,
-never a mix (the precomputed window ints are plain values written under
-the lock and read after the `table` pointer load that already orders
-the publish).
+**Immutability & re-registration (revised after review).** The
+sub-bucket layout (`subPrefixLen` / `subStart` / `subEnd` / `subSpan`
+and the `subBuckets` array itself) is established **once at the route's
+first registration and is immutable for the slot's lifetime**. So both
+the hot path and `Flush` read it **lock-free**, with no `metaMu` — it
+genuinely never changes, which is the cleanest way to keep the index
+computation off any lock (resolving the lock-discipline question raised
+in review).
+
+Two consequences for the grace-window re-registration path
+(`reclaimRetiredSlot`), both deliberate:
+
+- **Counters are preserved, never zeroed and never re-sized.** The slot
+  is reused precisely so pre-removal and in-flight `Observe`
+  increments survive until the next `Flush` drains them — the
+  sampler's no-loss contract (Codex P1). `K` is a sampler-wide
+  constant, so `subBuckets` is already the right length on reuse; there
+  is nothing to resize. The per-sub-bucket counters keep accumulating
+  in place exactly as the slot's scalar `reads`/`writes` counters do
+  today. An earlier draft said to "re-size and zero" here — that was
+  wrong; it would drop counts recorded between the last flush and
+  `RemoveRoute`.
+- **The layout is *not* recomputed on re-registration.** A
+  same-`RouteID` re-registration carries the **same** `[Start, End)` in
+  practice: a split/merge mints *new* `RouteID`s rather than re-ranging
+  an existing one, and a watcher re-sync re-registers the identical
+  range. So the original layout stays valid. In the unexpected event
+  that a same-ID re-registration ever carried a *different* range
+  within the grace window, the route keeps its original sub-ranges for
+  ≤ one grace window — a bounded **cosmetic** misattribution of sub-row
+  labels, with **no** lost or double-counted traffic (every increment
+  still lands in some bucket and is drained). This is strictly safer
+  than mutating immutable layout fields the lock-free hot path is
+  reading.
+
+(`reclaimRetiredSlot` still refreshes the mutable `Start` / `End` /
+`MemberRoutesTotal` under `metaMu` as today; those remain
+`snapshotMeta`-guarded. The sub-bucket layout is simply not among the
+mutated fields, so `Flush` can read it without taking the lock.)
 
 **Memory**: `K * 4 * 8` bytes per individual route. `K = 16` →
 512 B/route; at the default `MaxTrackedRoutes = 10_000` that is ~5 MB
@@ -278,13 +303,26 @@ member metadata are copied onto every sub-row so fan-out dedupe
 keep working. Idle sub-buckets are skipped, so a route with one hot
 sub-range emits one row, not `K`.
 
-A `SubBucket uint32` field on `MatrixRow` (and the derived `BucketID`
-suffix, §5) distinguishes sub-rows of the same route within a column.
+`MatrixRow` gains **two** fields, not one:
+
+- `SubBucket uint32` — this row's index within its route, `0` for the
+  first (or only) sub-bucket.
+- `SubBucketCount uint32` — how many sub-buckets the parent route is
+  divided into: `1` for a `K = 1` / aggregate / degenerate /
+  unbounded-tail slot, `> 1` for a genuinely sub-bucketed route.
+
+`SubBucketCount` is the disambiguator `bucketIDFor` needs (Claude bot
+gap): a `K = 1` slot's single row and a `K > 1` slot's first sub-row
+*both* have `SubBucket == 0`, so the index alone cannot tell them
+apart. `bucketIDFor` appends the `#<subIdx>` suffix **only when
+`SubBucketCount > 1`**, so a `K = 1` slot keeps the exact legacy
+`route:<id>` id (§5.2) and the change stays inert at the default.
+
 Because `MatrixRow` is the shared shape behind both the JSON pivot and
-the gRPC `GetKeyVizMatrix` path, the new field is a struct addition
-that the gRPC/proto layer ignores for now; if the gRPC path later
-adopts sub-rows, `proto.KeyVizRow` gains the matching field then. This
-proposal does **not** change the proto (the field is unused on that
+the gRPC `GetKeyVizMatrix` path, these are struct additions the
+gRPC/proto layer ignores for now; if the gRPC path later adopts
+sub-rows, `proto.KeyVizRow` gains the matching fields then. This
+proposal does **not** change the proto (the fields are unused on that
 path), but the dependency is flagged so the future proto edit isn't a
 surprise.
 
@@ -313,11 +351,12 @@ the row list, not the map).
 
 The JSON `KeyVizRow` already carries `Start`/`End`; sub-rows simply
 have narrower bounds. To keep `BucketID` unique per row within a
-column (the fan-out merge and the SPA both key on it), the bucket ID
-gains a sub-range discriminator:
+column (the fan-out merge and the SPA both key on it), `bucketIDFor`
+gains a sub-range discriminator keyed on `SubBucketCount` (§4.3):
 
-- individual sub-row: `route:<id>#<subIdx>`
-- whole route (`K = 1`): `route:<id>` (unchanged)
+- sub-bucketed route (`SubBucketCount > 1`): `route:<id>#<subIdx>`
+- whole route (`SubBucketCount == 1`, the `K = 1` / aggregate /
+  degenerate / unbounded-tail case): `route:<id>` (unchanged)
 - virtual bucket: `virtual:<id>` (unchanged)
 
 ### 5.3 SPA
@@ -367,6 +406,18 @@ of 1024). Two consequences to document for operators:
   a follow-up, not required for the first cut — only non-empty
   sub-buckets are emitted, and hot traffic concentrates in a few of
   them, so the typical count is far below the worst case.
+- **Bias toward concentrated traffic (intended).** `applyKeyVizRowBudget`
+  ranks rows by per-row `total`. Today a uniform route with 1,000
+  writes/step always shows as one row valued 1,000. With `K = 16` that
+  same route emits ~16 sub-rows of ~62 each, while a route whose 1,000
+  writes land in one hot sub-range emits one sub-row valued ~1,000. So
+  under budget pressure the *concentrated* route's hot sub-row
+  out-ranks the *uniform* route's diluted sub-rows and is more likely
+  to be retained. This is the **desired** behaviour — hot sub-ranges
+  are exactly what should survive truncation — but it is a behavioural
+  change from today (where a uniform route is guaranteed one row
+  regardless of absolute activity), worth stating so the operator
+  mental model is complete.
 
 ## 7. Backward compatibility & rollout
 
@@ -443,20 +494,20 @@ implementation has no ambiguity.
    existing retired-slot / grace-window machinery that prevents
    lost counts on route churn is untouched (sub-buckets live inside
    the same slot lifecycle).
-2. **Concurrency / distributed** — hot path stays lockless: sub-bucket
-   metadata is immutable for the life of a slot's range, counters are
-   per-sub-bucket `atomic.Uint64`, `Flush` drains with `atomic.Swap`
-   exactly as today. The one mutation path is grace-window
-   re-registration (`reclaimRetiredSlot`), which recomputes the
-   sub-bucket fields under the slot's existing `metaMu` alongside the
-   `Start`/`End` refresh it already does (§4.2), so the new triple
-   publishes atomically with the new range — an `Observe` sees the
-   whole old or whole new range, never a mix. Aggregate-bucket folding
-   already mutates metadata under `metaMu` but is excluded from
-   sub-bucketing (aggregates stay single-bucket), so it adds no new
-   `metaMu` contention. Run `go test -race ./keyviz/...` plus the
-   register/remove churn cases. Mixed-`K` fan-out has its own test
-   (§9.2).
+2. **Concurrency / distributed** — hot path stays lockless and now
+   provably so: the sub-bucket layout is **immutable for the slot's
+   lifetime** (§4.2), so `Observe` reads `subPrefixLen`/`subStart`/
+   `subEnd`/`subSpan` with no lock and no race — there is no writer.
+   Per-sub-bucket counters are `atomic.Uint64`; `Flush` drains with
+   `atomic.Swap` exactly as today and reads the immutable layout
+   lock-free to reconstruct bounds. Grace-window re-registration
+   preserves counters in place (never zeroed/resized — Codex P1) and
+   does not touch the layout, so it introduces no new shared-mutable
+   state on the hot path. Aggregate-bucket folding still mutates
+   `Start`/`End`/`MemberRoutes` under `metaMu`, but aggregates stay
+   single-bucket, so sub-bucketing adds no new `metaMu` interaction.
+   Run `go test -race ./keyviz/...` plus the register/remove churn
+   cases. Mixed-`K` fan-out has its own test (§9.2).
 3. **Performance** — per-`Observe` cost adds a bounded byte-window read
    + one multiply/divide + clamp; no allocation, no lock, no extra Raft
    round-trip (HLC path untouched). Memory bounded to `K * 4 * 8` B per
