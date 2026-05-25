@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -37,7 +38,7 @@ func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 	sidecarPath := dir + "/keys.json"
 	pebbleDir := dir + "/fsm.db"
 
-	st, applier, cache := newE2EEncryptionFixture(t, sidecarPath, pebbleDir)
+	st, applier, cache, closeStore := newE2EEncryptionFixture(t, sidecarPath, pebbleDir)
 
 	// Phase 0 (pre-bootstrap): no active DEK, gate off → cleartext.
 	assertActiveStorageKeyID(t, cache, 0, false)
@@ -66,9 +67,10 @@ func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 	assertGet(t, ctx, st, "mid", "plain-mid", 110)
 	assertGet(t, ctx, st, "after", "plain-after", 120)
 
-	if err := st.Close(); err != nil {
-		t.Fatalf("close encrypted store: %v", err)
-	}
+	// Release the Pebble lock before the cipher-less reopen. closeStore
+	// is idempotent (sync.Once) and also registered via t.Cleanup, so
+	// an early t.Fatal above still closes the store.
+	closeStore()
 	assertEncryptedAtRest(t, ctx, pebbleDir)
 }
 
@@ -76,7 +78,11 @@ func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 // (buildEncryptionWriteWiring) over a fresh pre-bootstrap sidecar, opens
 // a PebbleStore with its options, and constructs an Applier that shares
 // the same keystore + StateCache — exactly the main.go wiring topology.
-func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store.MVCCStore, *encryption.Applier, *encryption.StateCache) {
+// The returned closeStore is idempotent (sync.Once) and registered via
+// t.Cleanup, so the Pebble store is closed exactly once whether the
+// test closes it explicitly (before the cipher-less reopen) or exits
+// early via t.Fatal.
+func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store.MVCCStore, *encryption.Applier, *encryption.StateCache, func()) {
 	t.Helper()
 	keystore := encryption.NewKeystore()
 	encWiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wiringFakeKEK{}, keystore)
@@ -90,6 +96,9 @@ func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store
 	if err != nil {
 		t.Fatalf("NewPebbleStore: %v", err)
 	}
+	var closeOnce sync.Once
+	closeStore := func() { closeOnce.Do(func() { _ = st.Close() }) }
+	t.Cleanup(closeStore)
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
 		t.Fatalf("WriterRegistryFor: %v", err)
@@ -103,7 +112,7 @@ func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store
 	if err != nil {
 		t.Fatalf("NewApplier: %v", err)
 	}
-	return st, applier, encWiring.cache
+	return st, applier, encWiring.cache, closeStore
 }
 
 func applyE2EBootstrap(t *testing.T, applier *encryption.Applier) {
