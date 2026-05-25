@@ -251,6 +251,44 @@ func TestRedisEncodeNotDirFailsClosed(t *testing.T) {
 	}
 }
 
+// TestRedisEncodeRejectsNonRegularKeymap pins that a non-regular file
+// at the KEYMAP.jsonl path (here a directory, cross-platform stand-in
+// for a symlink/FIFO/device) fails closed with ErrRedisEncodeNotRegular
+// rather than being followed or blocking the encoder.
+func TestRedisEncodeRejectsNonRegularKeymap(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// A real string so the encoder reaches loadKeymap.
+	enc := EncodeSegment([]byte("k"))
+	writeRedisFile(t, in, filepath.Join("strings", enc+".bin"), []byte("v"))
+	// Place a directory where KEYMAP.jsonl should be a regular file.
+	if err := os.MkdirAll(filepath.Join(in, "redis", "db_0", "KEYMAP.jsonl"), 0o755); err != nil {
+		t.Fatalf("mkdir KEYMAP.jsonl: %v", err)
+	}
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeNotRegular) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeNotRegular", err)
+	}
+}
+
+// TestRedisEncodeRejectsNonRegularTTLSidecar pins the same guard for a
+// TTL sidecar (strings_ttl.jsonl).
+func TestRedisEncodeRejectsNonRegularTTLSidecar(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("k"))
+	writeRedisFile(t, in, filepath.Join("strings", enc+".bin"), []byte("v"))
+	if err := os.MkdirAll(filepath.Join(in, "redis", "db_0", "strings_ttl.jsonl"), 0o755); err != nil {
+		t.Fatalf("mkdir strings_ttl.jsonl: %v", err)
+	}
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeNotRegular) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeNotRegular", err)
+	}
+}
+
 // writeKeymap writes a single-entry KEYMAP.jsonl mapping the encoded
 // segment back to its original bytes (base64url, the KeymapRecord
 // schema), under <root>/redis/db_0/.

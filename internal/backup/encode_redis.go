@@ -53,6 +53,15 @@ var ErrRedisEncodeMissingKeymap = errors.New("backup: redis encode missing KEYMA
 // keymap entry" via errors.Is.
 var ErrRedisEncodeNotDir = errors.New("backup: redis db path is not a directory")
 
+// ErrRedisEncodeNotRegular is returned when a dump sidecar
+// (KEYMAP.jsonl, strings_ttl.jsonl, ...) exists but is not a regular
+// file — a symlink, FIFO, device, or directory. Reading such a path
+// with plain os.Open would follow the symlink or block indefinitely on
+// a reader-less FIFO; the encoder fails closed instead, matching the
+// non-regular refusal walkBlobDir applies to *.bin entries (codex P2
+// on PR #828).
+var ErrRedisEncodeNotRegular = errors.New("backup: redis dump sidecar is not a regular file")
+
 // RedisEncoder reconstructs the internal Redis keyspace for one logical
 // database (redis/db_<n>/) from its decoded directory tree.
 type RedisEncoder struct {
@@ -101,13 +110,13 @@ func (e *RedisEncoder) Encode(b *snapshotBuilder) error {
 // encoded names can be reversed to their original key bytes. Absence is
 // fine — dumps without any long/sha-fallback keys carry no KEYMAP file.
 func (e *RedisEncoder) loadKeymap() error {
-	f, err := os.Open(filepath.Join(e.dbDir(), "KEYMAP.jsonl"))
+	f, err := openDumpSidecar(e.dbDir(), "KEYMAP.jsonl")
 	if errors.Is(err, os.ErrNotExist) {
 		e.keymap = map[string]KeymapRecord{}
 		return nil
 	}
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
 	defer func() { _ = f.Close() }()
 	m, err := LoadKeymap(f)
@@ -228,6 +237,39 @@ func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey
 	return nil
 }
 
+// openDumpSidecar opens a fixed-name regular file at <dir>/<name> for
+// reading, refusing symlinks and non-regular files (FIFO / device /
+// directory) — the read-side analogue of walkBlobDir's
+// os.Root + IsRegular guard for the dump's sidecar files (KEYMAP.jsonl,
+// *_ttl.jsonl). Returns a wrapped os.ErrNotExist when the file is
+// absent so callers can treat a missing sidecar as empty.
+//
+// The Lstat type check refuses a symlink (Lstat sees the link itself,
+// not its target) and a reader-less FIFO BEFORE any blocking open, then
+// the read goes through an os.Root so the open additionally cannot
+// escape <dir>. A concurrent swap of a confirmed-regular file to a FIFO
+// between Lstat and open is the only residual race and is not a
+// concern for an offline tool reading a static dump tree.
+func openDumpSidecar(dir, name string) (*os.File, error) {
+	info, err := os.Lstat(filepath.Join(dir, name))
+	if err != nil {
+		return nil, errors.WithStack(err) // wraps os.ErrNotExist when absent
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.Wrapf(ErrRedisEncodeNotRegular, "%s (mode=%s)", name, info.Mode())
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = root.Close() }()
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return f, nil
+}
+
 // readRootFile reads a regular file by name within root, refusing any
 // path that escapes the root (including via an in-dump symlink to an
 // external target).
@@ -257,12 +299,12 @@ type ttlSidecarRecord struct {
 // sidecar stores and what the .bin filenames share, so callers look up
 // by the filename stem without re-encoding.
 func (e *RedisEncoder) loadTTLMap(name string) (map[string]uint64, error) {
-	f, err := os.Open(filepath.Join(e.dbDir(), name))
+	f, err := openDumpSidecar(e.dbDir(), name)
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]uint64{}, nil
 	}
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 	defer func() { _ = f.Close() }()
 	out := map[string]uint64{}
