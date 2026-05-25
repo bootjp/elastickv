@@ -186,6 +186,106 @@ func buildListItemKey(userKey []byte, seq int64) []byte {
 	return append(out, raw[:]...)
 }
 
+// zsetJSONRecord mirrors marshalZSetJSON: members as an array of
+// {member (binary envelope), score (number or "+inf"/"-inf")} plus an
+// optional expiry.
+type zsetJSONRecord struct {
+	FormatVersion uint32 `json:"format_version"`
+	Members       []struct {
+		Member json.RawMessage `json:"member"`
+		Score  json.RawMessage `json:"score"`
+	} `json:"members"`
+	ExpireAtMs *uint64 `json:"expire_at_ms"`
+}
+
+// encodeZSets reconstructs the two zset indexes from zsets/*.json:
+// !zs|mem|<userKey><member> -> score (8-byte BE float bits) and the
+// !zs|scr|<userKey><sortableScore(8)><member> -> empty range index,
+// plus an !redis|ttl| row for an expiring zset. Both indexes are
+// emitted so ZSCORE/ZRANK and ZRANGEBYSCORE both work on the restored
+// set (the live write path keeps them in lockstep).
+func (e *RedisEncoder) encodeZSets(b *snapshotBuilder) error {
+	return e.walkJSONDir("zsets", func(rawKey, body []byte) error {
+		var rec zsetJSONRecord
+		if err := json.Unmarshal(body, &rec); err != nil {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "zset %q: %v", rawKey, err)
+		}
+		if err := b.Add(wideColMetaKey(RedisZSetMetaPrefix, rawKey),
+			marshalCount8BE(uint64(len(rec.Members))), 0); err != nil {
+			return err
+		}
+		for _, m := range rec.Members {
+			member, err := unmarshalRedisBinaryValue(m.Member)
+			if err != nil {
+				return errors.Wrapf(err, "zset %q member", rawKey)
+			}
+			score, err := unmarshalRedisZSetScore(m.Score)
+			if err != nil {
+				return errors.Wrapf(err, "zset %q score", rawKey)
+			}
+			if err := b.Add(wideColElemKey(RedisZSetMemberPrefix, rawKey, member),
+				marshalZSetScore8BE(score), 0); err != nil {
+				return err
+			}
+			sortable := encodeSortableFloat64(score)
+			scoreSuffix := append(sortable[:], member...)
+			if err := b.Add(wideColElemKey(RedisZSetScorePrefix, rawKey, scoreSuffix), []byte{}, 0); err != nil {
+				return err
+			}
+		}
+		return e.addCollectionTTL(b, rawKey, rec.ExpireAtMs)
+	})
+}
+
+// marshalZSetScore8BE encodes a float64 score as the 8-byte big-endian
+// IEEE-754 bit pattern the !zs|mem| value carries (mirror of
+// store.MarshalZSetScore).
+func marshalZSetScore8BE(score float64) []byte {
+	buf := make([]byte, redisZSetScoreSize)
+	binary.BigEndian.PutUint64(buf, math.Float64bits(score))
+	return buf
+}
+
+// encodeSortableFloat64 reproduces store.EncodeSortableFloat64: a
+// byte-order-sortable 8-byte float encoding for the !zs|scr| range
+// index (positive flips the sign bit; negative flips all bits; -0 is
+// normalised to +0).
+func encodeSortableFloat64(f float64) [8]byte {
+	if f == 0 {
+		f = 0.0
+	}
+	bits := math.Float64bits(f)
+	if bits>>63 == 0 {
+		bits ^= 0x8000000000000000
+	} else {
+		bits ^= 0xFFFFFFFFFFFFFFFF
+	}
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], bits)
+	return b
+}
+
+// unmarshalRedisZSetScore is the inverse of marshalRedisZSetScore:
+// "+inf"/"-inf" decode to the IEEE infinities, any other token to a
+// JSON number. NaN is rejected — the live store and decoder both
+// refuse NaN scores, so the encoder fails closed too.
+func unmarshalRedisZSetScore(raw json.RawMessage) (float64, error) {
+	switch string(bytes.TrimSpace(raw)) {
+	case `"+inf"`:
+		return math.Inf(1), nil
+	case `"-inf"`:
+		return math.Inf(-1), nil
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return 0, errors.Wrap(ErrRedisEncodeInvalidJSON, err.Error())
+	}
+	if math.IsNaN(f) {
+		return 0, errors.Wrap(ErrRedisEncodeInvalidJSON, "zset score is NaN")
+	}
+	return f, nil
+}
+
 // addCollectionTTL emits the !redis|ttl|<userKey> scan-index row for a
 // non-string collection with an expiry. A nil expiry is a no-op.
 func (e *RedisEncoder) addCollectionTTL(b *snapshotBuilder, rawKey []byte, expireMs *uint64) error {

@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -327,6 +328,121 @@ func TestRedisEncodeListNoTTLRoundTripViaDecode(t *testing.T) {
 	got, gotExp := readListItems(t, out, enc)
 	if len(got) != 1 || got[0] != "only" {
 		t.Fatalf("got %v, want [only]", got)
+	}
+	if gotExp != nil {
+		t.Fatalf("decoded expire_at_ms = %v, want nil", *gotExp)
+	}
+}
+
+// buildZSetJSON constructs a zsets/<k>.json body (members array of
+// {member envelope, score number/"+inf"/"-inf"}).
+func buildZSetJSON(t *testing.T, members map[string]float64, expireMs *uint64) []byte {
+	t.Helper()
+	names := make([]string, 0, len(members))
+	for n := range members {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	type rec struct {
+		Member json.RawMessage `json:"member"`
+		Score  json.RawMessage `json:"score"`
+	}
+	recs := make([]rec, 0, len(names))
+	for _, n := range names {
+		nameJSON, err := marshalRedisBinaryValue([]byte(n))
+		if err != nil {
+			t.Fatalf("marshal member: %v", err)
+		}
+		scoreJSON, err := marshalRedisZSetScore(members[n])
+		if err != nil {
+			t.Fatalf("marshal score: %v", err)
+		}
+		recs = append(recs, rec{Member: nameJSON, Score: scoreJSON})
+	}
+	out := struct {
+		FormatVersion uint32  `json:"format_version"`
+		Members       []rec   `json:"members"`
+		ExpireAtMs    *uint64 `json:"expire_at_ms"`
+	}{FormatVersion: 1, Members: recs, ExpireAtMs: expireMs}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal zset json: %v", err)
+	}
+	return body
+}
+
+// readZSetMembers parses a decoded zsets/<k>.json into member->score
+// plus its expiry.
+func readZSetMembers(t *testing.T, root, enc string) (map[string]float64, *uint64) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, "redis", "db_0", "zsets", enc+".json"))
+	if err != nil {
+		t.Fatalf("read decoded zset: %v", err)
+	}
+	var rec zsetJSONRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("unmarshal decoded zset: %v", err)
+	}
+	out := map[string]float64{}
+	for _, m := range rec.Members {
+		member, err := unmarshalRedisBinaryValue(m.Member)
+		if err != nil {
+			t.Fatalf("unmarshal member: %v", err)
+		}
+		score, err := unmarshalRedisZSetScore(m.Score)
+		if err != nil {
+			t.Fatalf("unmarshal score: %v", err)
+		}
+		out[string(member)] = score
+	}
+	return out, rec.ExpireAtMs
+}
+
+// TestRedisEncodeZSetRoundTripViaDecode runs the gold-standard
+// directory round-trip for a zset with fractional, negative, and
+// +inf scores plus a TTL.
+func TestRedisEncodeZSetRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("myzset"))
+	const expireMs uint64 = 1_700_000_000_999
+	want := map[string]float64{
+		"alice": 100.5,
+		"bob":   -3.25,
+		"max":   math.Inf(1),
+	}
+	exp := expireMs
+	writeRedisFile(t, in, filepath.Join("zsets", enc+".json"), buildZSetJSON(t, want, &exp))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, gotExp := readZSetMembers(t, out, enc)
+	if len(got) != len(want) {
+		t.Fatalf("got %d members, want %d", len(got), len(want))
+	}
+	for m, s := range want {
+		if got[m] != s {
+			t.Fatalf("member %q score = %v, want %v", m, got[m], s)
+		}
+	}
+	if gotExp == nil || *gotExp != expireMs {
+		t.Fatalf("decoded expire_at_ms = %v, want %d", gotExp, expireMs)
+	}
+}
+
+// TestRedisEncodeZSetNoTTLRoundTripViaDecode pins the no-TTL zset path.
+func TestRedisEncodeZSetNoTTLRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("zz"))
+	writeRedisFile(t, in, filepath.Join("zsets", enc+".json"),
+		buildZSetJSON(t, map[string]float64{"x": 1, "y": 2}, nil))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, gotExp := readZSetMembers(t, out, enc)
+	if got["x"] != 1 || got["y"] != 2 {
+		t.Fatalf("got %v, want x=1 y=2", got)
 	}
 	if gotExp != nil {
 		t.Fatalf("decoded expire_at_ms = %v, want nil", *gotExp)
