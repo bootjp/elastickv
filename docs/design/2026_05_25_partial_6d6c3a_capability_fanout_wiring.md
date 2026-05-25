@@ -2,10 +2,14 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | partial |
 | Date | 2026-05-25 |
 | Parent designs | [`2026_05_18_partial_6d_enable_storage_envelope.md`](2026_05_18_partial_6d_enable_storage_envelope.md) (6D-6c-3 milestone; §4 capability fan-out), [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§7.1 rollout) |
 | Builds on | 6D-3 (`internal/admin.CapabilityFanout` helper), 6D-6a (`adapter.WithEncryptionAdminCapabilityFanout` option) |
+
+**Lifecycle:** the §1 fan-out closure wiring shipped in this PR; the
+6D-6c-3b end-to-end test (Bootstrap → EnableStorageEnvelope → Put →
+read-back) remains open. Flips to `*_implemented_*` when 3b lands.
 
 ## 0. Why this doc exists
 

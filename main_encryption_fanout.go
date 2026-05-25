@@ -75,25 +75,51 @@ func buildCapabilityFanoutFn(runtimes []*raftGroupRuntime, connCache *kv.GRPCCon
 	}
 }
 
+// configReader is the narrow membership-view surface
+// capabilityRouteSnapshot needs from a Raft engine. raftengine.Engine
+// satisfies it structurally; defining it here lets the snapshot
+// builder be unit-tested with a stub that returns a Configuration
+// error (the fail-closed path) without standing up a full engine.
+type configReader interface {
+	Configuration(ctx context.Context) (raftengine.Configuration, error)
+}
+
+// groupConfigSource pairs a group id with its membership reader.
+type groupConfigSource struct {
+	groupID uint64
+	engine  configReader
+}
+
 // capabilityRouteSnapshot builds the all-groups admin.RouteSnapshot
-// from each runtime's live Raft Configuration. Every server maps to a
-// RouteMember keyed by the same etcd.DeriveNodeID(raftID) value the
-// rest of the encryption stack uses for node identity, split into
-// Voters / Learners on Suffrage (empty suffrage is treated as voter,
-// matching raftengine's own convention). A nil runtime/engine is
-// skipped; any Configuration error aborts the whole snapshot so the
-// caller fails closed.
+// from each runtime's live Raft Configuration. It reads each engine
+// via snapshotEngine() (engineMu.RLock) because the fan-out closure
+// runs during live EnableStorageEnvelope RPCs, concurrently with a
+// possible Close() that clears the engine field — a direct field read
+// would be a data race. A nil runtime/engine is skipped.
 func capabilityRouteSnapshot(ctx context.Context, runtimes []*raftGroupRuntime) (admin.RouteSnapshot, error) {
-	groups := make([]admin.RouteGroup, 0, len(runtimes))
+	sources := make([]groupConfigSource, 0, len(runtimes))
 	for _, rt := range runtimes {
-		if rt == nil || rt.engine == nil {
+		eng := rt.snapshotEngine()
+		if eng == nil {
 			continue
 		}
-		cfg, err := rt.engine.Configuration(ctx)
+		sources = append(sources, groupConfigSource{groupID: rt.spec.id, engine: eng})
+	}
+	return routeSnapshotFromSources(ctx, sources)
+}
+
+// routeSnapshotFromSources maps each group's Configuration into the
+// admin.RouteSnapshot. Any Configuration error aborts the whole
+// snapshot so the caller fails closed — the cutover must never
+// proceed against a membership view it could not fully enumerate.
+func routeSnapshotFromSources(ctx context.Context, sources []groupConfigSource) (admin.RouteSnapshot, error) {
+	groups := make([]admin.RouteGroup, 0, len(sources))
+	for _, s := range sources {
+		cfg, err := s.engine.Configuration(ctx)
 		if err != nil {
-			return admin.RouteSnapshot{}, errors.Wrapf(err, "capability fan-out: configuration for group %d", rt.spec.id)
+			return admin.RouteSnapshot{}, errors.Wrapf(err, "capability fan-out: configuration for group %d", s.groupID)
 		}
-		groups = append(groups, routeGroupFromConfiguration(rt.spec.id, cfg))
+		groups = append(groups, routeGroupFromConfiguration(s.groupID, cfg))
 	}
 	return admin.RouteSnapshot{Groups: groups}, nil
 }

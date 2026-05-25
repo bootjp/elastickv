@@ -1,11 +1,23 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 )
+
+// stubConfigReader is a configReader for the snapshot-builder tests.
+type stubConfigReader struct {
+	cfg raftengine.Configuration
+	err error
+}
+
+func (s stubConfigReader) Configuration(context.Context) (raftengine.Configuration, error) {
+	return s.cfg, s.err
+}
 
 func TestRouteGroupFromConfiguration_SplitsVotersAndLearners(t *testing.T) {
 	t.Parallel()
@@ -60,5 +72,62 @@ func TestBuildCapabilityFanoutFn_NonNil(t *testing.T) {
 	fn := buildCapabilityFanoutFn(nil, nil, capabilityFanoutTimeout)
 	if fn == nil {
 		t.Fatal("buildCapabilityFanoutFn returned nil")
+	}
+}
+
+// TestBuildEncryptionCapabilityFanout_DisabledReturnsNil pins that the
+// closure is not built when encryption mutators are off — the cutover
+// RPC is then unreachable, so wiring a fan-out would be dead weight.
+func TestBuildEncryptionCapabilityFanout_DisabledReturnsNil(t *testing.T) {
+	t.Parallel()
+	if fn := buildEncryptionCapabilityFanout(context.Background(), nil, nil, false); fn != nil {
+		t.Error("buildEncryptionCapabilityFanout(enableMutators=false) = non-nil, want nil")
+	}
+}
+
+func TestRouteSnapshotFromSources_MapsAllGroups(t *testing.T) {
+	t.Parallel()
+	sources := []groupConfigSource{
+		{groupID: 1, engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+			{ID: "n1", Address: "a:1", Suffrage: etcdraftengine.SuffrageVoter},
+		}}}},
+		{groupID: 2, engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+			{ID: "n2", Address: "b:2", Suffrage: etcdraftengine.SuffrageLearner},
+		}}}},
+	}
+	snap, err := routeSnapshotFromSources(context.Background(), sources)
+	if err != nil {
+		t.Fatalf("routeSnapshotFromSources: %v", err)
+	}
+	if len(snap.Groups) != 2 {
+		t.Fatalf("Groups = %d, want 2", len(snap.Groups))
+	}
+	if snap.Groups[0].GroupID != 1 || len(snap.Groups[0].Voters) != 1 {
+		t.Errorf("group 1 mapping wrong: %+v", snap.Groups[0])
+	}
+	if snap.Groups[1].GroupID != 2 || len(snap.Groups[1].Learners) != 1 {
+		t.Errorf("group 2 mapping wrong: %+v", snap.Groups[1])
+	}
+}
+
+// TestRouteSnapshotFromSources_ConfigurationErrorFailsClosed pins the
+// load-bearing fail-closed invariant: if any group's Configuration
+// errors, the whole snapshot is abandoned so the cutover refuses
+// rather than proposing against a partially-enumerated membership.
+func TestRouteSnapshotFromSources_ConfigurationErrorFailsClosed(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("configuration unavailable")
+	sources := []groupConfigSource{
+		{groupID: 1, engine: stubConfigReader{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+			{ID: "n1", Address: "a:1", Suffrage: etcdraftengine.SuffrageVoter},
+		}}}},
+		{groupID: 2, engine: stubConfigReader{err: boom}},
+	}
+	_, err := routeSnapshotFromSources(context.Background(), sources)
+	if err == nil {
+		t.Fatal("expected error when a group's Configuration fails, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("error does not wrap the Configuration failure: %v", err)
 	}
 }
