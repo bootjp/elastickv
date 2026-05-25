@@ -182,6 +182,37 @@ func TestDDBEncodeRejectsUnknownSchemaFormatVersion(t *testing.T) {
 	}
 }
 
+// TestDDBEncodeRejectsNonRegularSchema pins the pre-open guard: a
+// _schema.json that is a directory (cross-platform stand-in for a
+// symlink/FIFO) is refused with ErrDDBEncodeNotRegular before any
+// blocking open.
+func TestDDBEncodeRejectsNonRegularSchema(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Place a directory where _schema.json should be a regular file.
+	if err := os.MkdirAll(filepath.Join(in, "dynamodb", "tbl", "_schema.json"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeNotRegular) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeNotRegular", err)
+	}
+}
+
+// TestDDBEncodeRejectsEmptyHashKey pins that a schema with no primary
+// hash key fails closed rather than propagating into the item encoder.
+func TestDDBEncodeRejectsEmptyHashKey(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeDDBSchema(t, in, "tbl", []byte(`{"format_version":1,"table_name":"x","primary_key":{"hash_key":{"name":""}}}`))
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeInvalidSchema) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeInvalidSchema", err)
+	}
+}
+
 // TestDDBEncodeMissingDirIsNoop pins that an absent dynamodb/ dir is a
 // no-op (no entries, no error).
 func TestDDBEncodeMissingDirIsNoop(t *testing.T) {

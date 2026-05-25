@@ -47,9 +47,20 @@ const ddbRestoreGeneration uint64 = 1
 // live store reads items with the matching encoder.
 const ddbOrderedKeyEncodingV2 uint64 = 2
 
+// ddbSchemaFormatVersion is the only _schema.json format_version the
+// DynamoDB encoder accepts (a dedicated DDB constant rather than the
+// redis collection one, even though both are 1).
+const ddbSchemaFormatVersion uint32 = 1
+
 // ErrDDBEncodeInvalidSchema is returned when a _schema.json file cannot
 // be parsed into the expected shape.
 var ErrDDBEncodeInvalidSchema = errors.New("backup: dynamodb encode invalid _schema.json")
+
+// ErrDDBEncodeNotRegular is returned when a _schema.json (or, later,
+// item file) is not a regular file — a symlink, FIFO, device, or
+// directory. A dedicated DDB sentinel (not the redis one) so callers
+// classify it correctly via errors.Is.
+var ErrDDBEncodeNotRegular = errors.New("backup: dynamodb dump file is not a regular file")
 
 // DynamoDBEncoder reconstructs the internal DynamoDB keyspace from the
 // decoded dynamodb/ directory tree.
@@ -108,6 +119,12 @@ func (e *DynamoDBEncoder) encodeTable(b *snapshotBuilder, root *os.Root, tableDi
 	if tableName == "" {
 		return errors.Wrapf(ErrDDBEncodeInvalidSchema, "%s/_schema.json: empty table_name", tableDir)
 	}
+	// A table must have a hash key; fail early here rather than letting
+	// an empty primary key propagate into the item encoder (which
+	// builds item keys from the hash/range attributes).
+	if schema.GetPrimaryKey().GetHashKey() == "" {
+		return errors.Wrapf(ErrDDBEncodeInvalidSchema, "%s/_schema.json: empty primary hash key", tableDir)
+	}
 	encTable := base64.RawURLEncoding.EncodeToString([]byte(tableName))
 
 	metaKey := append([]byte(DDBTableMetaPrefix), encTable...)
@@ -128,28 +145,34 @@ func (e *DynamoDBEncoder) encodeTable(b *snapshotBuilder, root *os.Root, tableDi
 // FIFO / hard-link safe, like the redis sidecar reads) and rebuilds the
 // DynamoTableSchema proto from its public projection.
 func (e *DynamoDBEncoder) readSchema(root *os.Root, tableDir string) (*pb.DynamoTableSchema, error) {
-	f, err := root.Open(filepath.Join(tableDir, "_schema.json"))
+	rel := filepath.Join(tableDir, "_schema.json")
+	// Pre-open Lstat THROUGH the root fd refuses a symlink / FIFO /
+	// device / directory BEFORE root.Open, so a reader-less FIFO cannot
+	// block the open (the post-open fstat guard the walk paths use never
+	// runs if Open itself hangs). Consistent with openDumpSidecar; the
+	// Lstat is relative to the pinned root fd so it cannot escape.
+	linfo, err := root.Lstat(rel)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, errors.Wrapf(ErrDDBEncodeNotRegular, "%s (mode=%s)", rel, linfo.Mode())
+	}
+	if err := refuseHardLink(linfo, rel); err != nil {
+		return nil, err
+	}
+	f, err := root.Open(rel)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.Wrapf(ErrRedisEncodeNotRegular, "%s/_schema.json (mode=%s)", tableDir, info.Mode())
-	}
-	if err := refuseHardLink(info, tableDir+"/_schema.json"); err != nil {
-		return nil, err
-	}
 	var pub ddbPublicSchema
 	if err := decodeOneJSON(f, &pub); err != nil {
-		return nil, errors.Wrapf(ErrDDBEncodeInvalidSchema, "%s/_schema.json: %v", tableDir, err)
+		return nil, errors.Wrapf(ErrDDBEncodeInvalidSchema, "%s: %v", rel, err)
 	}
-	if pub.FormatVersion != redisCollectionFormatVersion {
+	if pub.FormatVersion != ddbSchemaFormatVersion {
 		return nil, errors.Wrapf(ErrDDBEncodeInvalidSchema,
-			"%s/_schema.json: unsupported format_version %d", tableDir, pub.FormatVersion)
+			"%s: unsupported format_version %d", rel, pub.FormatVersion)
 	}
 	return publicToSchema(pub), nil
 }
