@@ -18,14 +18,17 @@ import (
 )
 
 // encode_redis_coll.go is the wide-column slice of the Phase 0b Redis
-// reverse encoder (M2b) — the inverse of the hash/list/set/zset/stream
-// decoders. This commit covers hashes; the remaining collections land
-// in follow-up commits on the same branch.
+// reverse encoder (M2b) — the inverse of the hash/set/list/zset/stream
+// decoders.
 //
 // Wide-column keys share the layout the live store builds
 // (store/hash_helpers.go etc.): <prefix><userKeyLen(4 BE)><userKey>
 // for the meta key and <prefix><userKeyLen(4 BE)><userKey><suffix> for
-// per-element keys. The meta VALUE is an 8-byte big-endian element
+// per-element keys. This applies to hash/set/zset/stream; LISTS are the
+// exception — their meta/item keys are ListMetaPrefix+userKey (no
+// length prefix), so they use buildListMetaKey/buildListItemKey rather
+// than wideColMetaKey (mirror of store.ListMetaKey). The meta VALUE is
+// an 8-byte big-endian element
 // count (store.MarshalHashMeta). The live store also writes
 // `!hs|meta|d|` length DELTAS that the read path sums onto the base;
 // the encoder emits only the consolidated base meta (full count, no
@@ -339,6 +342,13 @@ func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
 		if meta == nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: missing _meta line", rawKey)
 		}
+		// Fail closed on a negative length: marshalStreamMeta casts to
+		// uint64, so "length": -1 would otherwise encode as a huge count
+		// that the restored cluster surfaces as a corrupt XLEN (codex P2
+		// on PR #831).
+		if meta.Length < 0 {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: negative _meta length %d", rawKey, meta.Length)
+		}
 		if err := b.Add(wideColMetaKey(RedisStreamMetaPrefix, rawKey),
 			marshalStreamMeta(meta.Length, meta.LastMs, meta.LastSeq), 0); err != nil {
 			return err
@@ -534,13 +544,20 @@ func unmarshalRedisBinaryValue(raw json.RawMessage) ([]byte, error) {
 		}
 		return []byte(s), nil
 	}
+	// A pointer distinguishes an absent "base64" key (nil) from a
+	// present-but-empty one (""). A JSON object that is neither a string
+	// nor a {"base64":...} envelope (e.g. {"wrong":"x"}) would otherwise
+	// silently decode to empty bytes; fail closed instead.
 	var env struct {
-		Base64 string `json:"base64"`
+		Base64 *string `json:"base64"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	out, err := base64.RawURLEncoding.DecodeString(env.Base64)
+	if env.Base64 == nil {
+		return nil, errors.Wrap(ErrRedisEncodeInvalidJSON, "binary value is neither a string nor a base64 envelope")
+	}
+	out, err := base64.RawURLEncoding.DecodeString(*env.Base64)
 	if err != nil {
 		return nil, errors.Wrap(ErrRedisEncodeInvalidJSON, err.Error())
 	}

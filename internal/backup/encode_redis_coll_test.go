@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 )
 
 // buildHashJSON constructs a hashes/<k>.json body in the exact shape
@@ -631,5 +633,32 @@ func TestUnmarshalRedisBinaryValue(t *testing.T) {
 	b64, err := unmarshalRedisBinaryValue(json.RawMessage(`{"base64":"_wA"}`))
 	if err != nil || !bytes.Equal(b64, []byte{0xff, 0x00}) {
 		t.Fatalf("base64 decode = %x, %v; want ff00", b64, err)
+	}
+	// A JSON object lacking "base64" must fail closed, not silently
+	// decode to empty bytes.
+	if _, err := unmarshalRedisBinaryValue(json.RawMessage(`{"wrong":"x"}`)); !errors.Is(err, ErrRedisEncodeInvalidJSON) {
+		t.Fatalf("unknown-object decode err = %v, want ErrRedisEncodeInvalidJSON", err)
+	}
+	// An empty base64 envelope is a valid empty value (not an error).
+	empty, err := unmarshalRedisBinaryValue(json.RawMessage(`{"base64":""}`))
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty base64 = %x, %v; want empty/no-error", empty, err)
+	}
+}
+
+// TestRedisEncodeStreamRejectsNegativeLength pins that a _meta line with
+// a negative length fails closed rather than encoding a corrupt
+// (uint64-wrapped) stream meta.
+func TestRedisEncodeStreamRejectsNegativeLength(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("badstream"))
+	body := []byte(`{"_meta":true,"length":-1,"last_ms":0,"last_seq":0,"expire_at_ms":null}` + "\n")
+	writeRedisFile(t, in, filepath.Join("streams", enc+".jsonl"), body)
+
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeInvalidJSON) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeInvalidJSON", err)
 	}
 }
