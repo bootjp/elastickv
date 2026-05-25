@@ -519,7 +519,12 @@ func buildStreamEntryValue(id string, interleaved []string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	out := make([]byte, 0, redisStreamProtoPrefixLen+len(payload))
+	// Build by append from a const-capacity, zero-length slice (magic
+	// prefix then payload). The constant cap keeps the
+	// `const + len(payload)` arithmetic out of make() — which CodeQL
+	// flags as a potential allocation-size overflow — and the
+	// zero-length start keeps makezero happy.
+	out := make([]byte, 0, redisStreamProtoPrefixLen)
 	out = append(out, redisStreamProtoPrefix...)
 	return append(out, payload...), nil
 }
