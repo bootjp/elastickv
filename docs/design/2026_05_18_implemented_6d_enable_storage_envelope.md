@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand), 6D-6c-1 (Applier in-memory accessors) shipped; 6D-6c-2 (main.go cipher + gate wiring) and 6D-6c-3 (capability fan-out closure + e2e integration test) remain |
+| Status | implemented — all milestones shipped: 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand), 6D-6c-1 (Applier in-memory accessors), 6D-6c-2 (main.go cipher + gate wiring), 6D-6c-3a (capability fan-out closure wiring), 6D-6c-3b (end-to-end Bootstrap→cutover→Put→read-back test). Note: the multi-node-churn registration-before-first-write nonce gate is tracked separately as a Stage 7 deferral in [`2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md) — not a 6D milestone. |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -111,13 +111,19 @@
   all groups + a `DialFunc` over a dedicated `kv.GRPCConnCache`),
   wired into the EnableStorageEnvelope server via
   `WithEncryptionAdminCapabilityFanout` gated on encryption mutators.
-  See [`2026_05_25_partial_6d6c3a_capability_fanout_wiring.md`](2026_05_25_partial_6d6c3a_capability_fanout_wiring.md).
+  See [`2026_05_25_implemented_6d6c3a_capability_fanout_wiring.md`](2026_05_25_implemented_6d6c3a_capability_fanout_wiring.md).
+- **6D-6c-3b** (shipped) — `package main` end-to-end integration test
+  (`main_encryption_e2e_test.go`) driving the production
+  `buildEncryptionWriteWiring` + a shared-`StateCache` applier through
+  Bootstrap → cutover → Put → read-back, proving post-cutover writes
+  land as on-disk §4.1 envelopes (a cipher-less reopen refuses them)
+  while every version reads back as correct plaintext.
 
 ## Open milestones
 
-- **6D-6c-3b** — end-to-end integration test exercising a single-node
-  cluster Bootstrap → EnableStorageEnvelope → Put →
-  read-back-via-envelope, on top of the 6D-6c-3a fan-out wiring.
+_None — Stage 6D is complete. The §7.1 rollout's remaining
+multi-node-churn nonce safety (registration-before-first-write gate)
+is a Stage 7 item, tracked in the 6D-6c-2 partial doc._
 
 ## 0. Why this doc exists
 

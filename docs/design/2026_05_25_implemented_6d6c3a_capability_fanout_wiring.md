@@ -2,14 +2,15 @@
 
 | Field | Value |
 |---|---|
-| Status | partial |
+| Status | implemented |
 | Date | 2026-05-25 |
-| Parent designs | [`2026_05_18_partial_6d_enable_storage_envelope.md`](2026_05_18_partial_6d_enable_storage_envelope.md) (6D-6c-3 milestone; §4 capability fan-out), [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§7.1 rollout) |
+| Parent designs | [`2026_05_18_implemented_6d_enable_storage_envelope.md`](2026_05_18_implemented_6d_enable_storage_envelope.md) (6D-6c-3 milestone; §4 capability fan-out), [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§7.1 rollout) |
 | Builds on | 6D-3 (`internal/admin.CapabilityFanout` helper), 6D-6a (`adapter.WithEncryptionAdminCapabilityFanout` option) |
 
-**Lifecycle:** the §1 fan-out closure wiring shipped in this PR; the
+**Lifecycle:** the §1 fan-out closure wiring shipped in 6D-6c-3a; the
 6D-6c-3b end-to-end test (Bootstrap → EnableStorageEnvelope → Put →
-read-back) remains open. Flips to `*_implemented_*` when 3b lands.
+read-back, `main_encryption_e2e_test.go`) shipped on top of it — this
+doc is now fully implemented.
 
 ## 0. Why this doc exists
 
@@ -58,9 +59,11 @@ wire-format change.
   `WithEncryptionAdminCapabilityFanout`, gated on the same
   `enableMutators` boolean that gates the Proposer/LeaderView (the
   fan-out is only meaningful when the cutover mutator is reachable).
-- Fan-out timeout: a `const` in `main.go` (start at 5s — generous for
-  a small cluster GetCapability round-trip; the helper bounds the
-  whole fan-out by it regardless of member count).
+- Fan-out timeout: the `capabilityFanoutTimeout` const in
+  `main_encryption_fanout.go` (5s — generous for a small-cluster
+  GetCapability round-trip; the helper bounds the whole fan-out by it
+  regardless of member count). It lives alongside the fan-out builder
+  rather than in `main.go` since it only affects fan-out behavior.
 
 ### Out of scope (6D-6c-3b)
 
