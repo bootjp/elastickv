@@ -213,7 +213,7 @@ each adapter, mirroring the live adapter's index builders:
   partitioned FIFO queue. The SQS milestone's decision gate
   (§"Milestones") covers both families.
 - **Queue-level / generation counters.** Per-scope generation counters
-  (`!s3|bucket|gen|`, `!ddb|table|gen|`, `!sqs|queue|gen|`) and the SQS
+  (`!s3|bucket|gen|`, `!ddb|meta|gen|`, `!sqs|queue|gen|`) and the SQS
   queue-level sequence counter (`!sqs|queue|seq|`,
   `adapter/sqs_keys.go` `SqsQueueSeqPrefix` — a *queue* counter, not a
   per-message record) must be re-emitted so the live adapter's next
