@@ -410,17 +410,89 @@ check fires BEFORE intent lookup, so if the marker is present and
 commit_ts matches, the intent is never touched. This is the correct
 behavior (the intent is already resolved). No interaction risk.
 
+## Resolved: the trigger is leadership churn during commit
+
+> **Closed 2026-05-24** with the full demo-cluster log from scheduled
+> run
+> [26340084100](https://github.com/bootjp/elastickv/actions/runs/26340084100)
+> (the first failing run after PR #795 landed the full-log artifact).
+
+The full log positively identifies the trigger as a **leader-election
+storm racing an in-flight commit**, not a single localized code bug.
+Run 26340084100 reproduced the SAME `:duplicate-elements` anomaly
+(`{153 2}` on key 17, with adjacent values 154/155 lost) AND added a
+downstream `:G-single-item-realtime` cycle — the latter is the
+append-checker's report of the corrupted per-key version order the
+duplicate causes, not an independent fault.
+
+Server-side evidence, `elastickv-demo.log`:
+
+- The 3-node single-process demo went through **20+ leadership
+  changes in the ~3-minute workload** (terms 2→3→5→7→11→…→23), with
+  repeated `found conflict at index N [existing term: X, conflicting
+  term: Y]` — etcd raft truncating uncommitted log-tail entries on
+  each leader change.
+- At `18:21:48` — the exact instant `[:append 17 153]` was processed
+  — a 3-way pre-vote/vote storm was in flight: two peers at
+  `index: 888` campaigning while the incumbent leader sat at
+  `index: 890` (two entries ahead) with a still-valid lease
+  (`remaining ticks: 6`). The two-entry divergence is precisely the
+  window where a freshly-proposed commit lands in the leader's log
+  but has not yet committed to quorum.
+
+Causal chain, now confirmed:
+
+1. The `append 17 153` commit is proposed to the incumbent leader and
+   lands at log index ~889.
+2. The election storm makes that entry's fate ambiguous: the leader's
+   lease keeps it serving briefly, but a successor at a higher term
+   may truncate index 889 (`found conflict at index …`).
+3. The adapter's `retryRedisWrite` observes a `WriteConflict` /
+   transient error and **retries with a fresh `commitTS`** (the
+   mechanism this doc's "Problem" section describes).
+4. The original entry (if it survived the election) plus the retry
+   both commit → two `153`s at two different list indices.
+
+This confirms the doc's core hypothesis (retry regenerating
+`commitTS` defeats content-addressing) and pins the trigger to
+leadership churn rather than `commitSecondaryWithRetry` or the
+LockResolver specifically. The server-side marker (M1–M4) is the
+correct fix because it deduplicates **regardless of which raft event
+produced the ambiguous commit** — it keys on the adapter-allocated
+txn UUID, which is stable across both the `retryRedisWrite`
+regeneration and the leader change.
+
+### CI-environment amplifier (separate, non-blocking)
+
+The 20+ elections in 3 minutes are abnormally frequent and are
+amplified by the CI environment: the single-process 3-node demo runs
+co-located with the JVM Jepsen client on a 2-core GitHub runner. The
+`lease is not expired (remaining ticks: 6)` + pre-vote-storm pattern
+is the signature of heartbeats delayed by CPU starvation, which trips
+election timeouts. This makes the ambiguous-commit window far more
+frequent in CI than in the 5-node production cluster on dedicated
+VMs. It does NOT invalidate the bug — production leader churn during
+rolling deploys and failures hits the same window — but it explains
+why CI surfaces it on most scheduled runs while production has not
+reported a user-visible duplicate. A follow-up may pin the demo's
+raft tick/election timing or the runner's CPU budget to reduce CI
+flakiness, tracked separately from the correctness fix.
+
 ## Open questions
 
-- **Is the partial-commit code path the actual trigger?** PR #795 will
-  surface this in the next failing scheduled run via the full log
-  artifact. The marker design works regardless of which code path
-  produces the partial-commit; the artifact just confirms which fix
-  belongs upstream of the marker (so an earlier fix may shrink the
-  partial-commit window without needing the marker at all).
 - **Should the adapter_txn_id also propagate to read paths?** No —
   reads don't dedup (idempotent). Field is write-only.
+- **Does the marker need to cover single-key (Phase_NONE) writes as
+  well as multi-shard 2PC?** Yes — `listPushCore`'s own
+  `retryRedisWrite` regenerates `commitTS` on a single-shard RPUSH
+  too, so the marker check belongs in `handleOnePhaseTxnRequest` in
+  addition to `handleCommitRequest`. M2 already lists both; calling it
+  out here so it is not dropped during implementation.
 
 ## Decision log
 
 - (2026-05-21) initial proposal; open for review.
+- (2026-05-24) open question closed: full log from run 26340084100
+  confirms the trigger is an election storm racing an in-flight
+  commit; marker fix applies regardless. Recorded the CI CPU-starvation
+  amplifier as a separate non-blocking follow-up.
