@@ -364,6 +364,7 @@ func run() error {
 		kekWrapper,
 		keystore,
 		*encryptionSidecarPath,
+		*encryptionEnabled,
 	)
 	if err = chainEncryptionStartupGuard(
 		err,

@@ -134,6 +134,56 @@ func TestPrepareStorageNonceEpoch_ActiveDEK_HydratesAndBumps(t *testing.T) {
 	}
 }
 
+func TestBuildEncryptionWriteWiring_DisabledOrUnconfigured_Cleartext(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		enabled     bool
+		sidecarPath string
+		kek         encryption.KEKUnwrapper
+	}{
+		{name: "flag_off", enabled: false, sidecarPath: "x.json", kek: wiringFakeKEK{}},
+		{name: "no_kek", enabled: true, sidecarPath: "x.json", kek: nil},
+		{name: "no_sidecar_path", enabled: true, sidecarPath: "", kek: wiringFakeKEK{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			w, err := buildEncryptionWriteWiring(tc.enabled, "n1", tc.sidecarPath, tc.kek, encryption.NewKeystore())
+			if err != nil {
+				t.Fatalf("buildEncryptionWriteWiring: %v", err)
+			}
+			if w.cache == nil {
+				t.Error("cache is nil; must be non-nil on every return path")
+			}
+			if w.cipher != nil || w.nonceFactory != nil {
+				t.Errorf("cipher/nonceFactory should be nil when encryption is off/unconfigured")
+			}
+			if opts := w.pebbleOptions(); opts != nil {
+				t.Errorf("pebbleOptions = %d, want nil (cleartext)", len(opts))
+			}
+		})
+	}
+}
+
+func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
+	t.Parallel()
+	path := writeActiveStorageSidecar(t, 2)
+	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore())
+	if err != nil {
+		t.Fatalf("buildEncryptionWriteWiring: %v", err)
+	}
+	if w.cipher == nil || w.nonceFactory == nil {
+		t.Fatal("cipher/nonceFactory must be wired when encryption is enabled with an active DEK")
+	}
+	if opts := w.pebbleOptions(); len(opts) != 2 {
+		t.Errorf("pebbleOptions = %d, want 2", len(opts))
+	}
+	// Cache must reflect the on-disk active DEK + cutover gate.
+	if id, ok := w.cache.ActiveStorageKeyID(); !ok || id != 3 {
+		t.Errorf("cache ActiveStorageKeyID = (%d, %v), want (3, true)", id, ok)
+	}
+}
+
 func TestPrepareStorageNonceEpoch_SaturatedEpoch_RefusesWithExhausted(t *testing.T) {
 	t.Parallel()
 	// A storage DEK already at the 0xFFFF ceiling must refuse the

@@ -33,8 +33,9 @@ func buildShardGroupsWithEncryptionWiring(
 	kekWrapper kek.Wrapper,
 	keystore *encryption.Keystore,
 	sidecarPath string,
+	encryptionEnabled bool,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
-	encWiring, err := buildEncryptionWriteWiring(kekWrapper, keystore)
+	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -94,11 +95,17 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 }
 
 // buildEncryptionWriteWiring assembles the storage-envelope write-path
-// wiring from the process flags. It always returns a wiring with a
-// non-nil StateCache (the per-shard appliers need it regardless of
-// encryption state); the cipher + nonce factory are populated only
-// when encryption is enabled (--encryption-enabled AND --kekFile AND
-// --encryptionSidecarPath).
+// wiring. It always returns a wiring with a non-nil StateCache (the
+// per-shard appliers need it regardless of encryption state); the
+// cipher + nonce factory are populated only when encryption is enabled
+// (encryptionEnabled AND --kekFile AND a non-empty sidecarPath).
+//
+// Inputs are explicit parameters rather than the package-level flag
+// globals so the nonce factory's node_id is provably derived from the
+// same raftID the shard stores use, and so the helper is testable in
+// isolation (codex P2 on PR #826). run()'s orchestrator
+// buildShardGroupsWithEncryptionWiring threads its own raftID /
+// sidecarPath params plus *encryptionEnabled in.
 //
 // When a storage DEK is already active on disk (the restart path),
 // the function hydrates the keystore from the sidecar so the cipher
@@ -108,9 +115,9 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 // epoch defaults to 0 — the value a future runtime Bootstrap assigns
 // to the freshly minted DEK, which is that DEK's first-ever use and
 // therefore nonce-safe; a later restart will then take the bump path.
-func buildEncryptionWriteWiring(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore) (encryptionWriteWiring, error) {
+func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore) (encryptionWriteWiring, error) {
 	w := encryptionWriteWiring{cache: encryption.NewStateCache()}
-	if !*encryptionEnabled || kekWrapper == nil || *encryptionSidecarPath == "" {
+	if !encryptionEnabled || kekWrapper == nil || sidecarPath == "" {
 		return w, nil
 	}
 	// On error return w (with its non-nil cache) rather than a
@@ -122,13 +129,13 @@ func buildEncryptionWriteWiring(kekWrapper encryption.KEKUnwrapper, keystore *en
 	if err != nil {
 		return w, pkgerrors.Wrap(err, "build encryption write wiring: new cipher")
 	}
-	epoch, err := prepareStorageNonceEpoch(*encryptionSidecarPath, kekWrapper, keystore, w.cache)
+	epoch, err := prepareStorageNonceEpoch(sidecarPath, kekWrapper, keystore, w.cache)
 	if err != nil {
 		return w, err
 	}
 	w.cipher = cipher
 	w.nonceFactory = encryption.NewDeterministicNonceFactory(
-		encryption.NodeID16(etcdraftengine.DeriveNodeID(*raftId)), epoch)
+		encryption.NodeID16(etcdraftengine.DeriveNodeID(raftID)), epoch)
 	return w, nil
 }
 
