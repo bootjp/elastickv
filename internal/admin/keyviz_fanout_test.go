@@ -307,6 +307,61 @@ func TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner(t *testing.T) {
 		"col0's identity comes from exLeader (term 42, won 50 vs 0); col1's identity comes from newLeader (term 43, won 80 vs 0)")
 }
 
+// TestMergeKeyVizMatricesPerCellConflictMarksOnlyAffectedColumn pins
+// PR-3d: per-cell Conflicts[] must flag ONLY the column that saw a
+// within-term disagreement, not the whole row. col0 disagrees
+// (30 vs 55 for the same group/term), col1 agrees (10 == 10), so
+// Conflicts must be [true, false] while the row-level OR Conflict
+// stays true for older clients.
+func TestMergeKeyVizMatricesPerCellConflictMarksOnlyAffectedColumn(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30, 10}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{55, 10}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{55, 10}, merged.Rows[0].Values, "within-term disagreement keeps the larger value per cell")
+	require.Equal(t, []bool{true, false}, merged.Rows[0].Conflicts,
+		"only col0 disagreed (30 vs 55); col1 agreed (10 == 10) so it must not be hatched")
+	require.True(t, merged.Rows[0].Conflict,
+		"row-level Conflict stays the OR of Conflicts[] so an older SPA still hatches the row")
+}
+
+// TestMergeKeyVizMatricesReadsLeaveConflictsNil pins that the read
+// merge path never allocates Conflicts — reads are independent local
+// serves that sum and can never conflict, so the per-cell slice stays
+// nil and is omitted from the wire.
+func TestMergeKeyVizMatricesReadsLeaveConflictsNil(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesReads,
+		Rows:         []KeyVizRow{{BucketID: "route:1", Values: []uint64{10}}},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesReads,
+		Rows:         []KeyVizRow{{BucketID: "route:1", Values: []uint64{25}}},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesReads)
+	require.Len(t, merged.Rows, 1)
+	require.Nil(t, merged.Rows[0].Conflicts, "reads never conflict — Conflicts stays nil")
+	require.False(t, merged.Rows[0].Conflict)
+}
+
 // TestMergeKeyVizMatricesWritesMaxLeadershipFlip pins §4.2 under a
 // mid-window flip: two nodes report non-zero, disagreeing values
 // for the same cell. The merge keeps the larger value and raises

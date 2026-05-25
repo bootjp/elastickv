@@ -226,7 +226,13 @@ function Heatmap({ matrix }: HeatmapProps) {
             onMouseLeave={onLeave}
             style={{ display: "block", width, height }}
           />
-          <ConflictOverlay rows={matrix.rows} cellH={cellH} width={width} />
+          <ConflictOverlay
+            rows={matrix.rows}
+            cellH={cellH}
+            cellW={cellW}
+            width={width}
+            columnCount={matrix.column_unix_ms.length}
+          />
           <TimeAxis columnUnixMs={matrix.column_unix_ms} cellW={cellW} />
         </div>
       )}
@@ -270,33 +276,53 @@ function FanoutBanner({ fanout }: FanoutBannerProps) {
   );
 }
 
-// ConflictOverlay layers a thin striped pattern over rows whose
-// merge produced disagreeing per-node values (Phase 2-C row-level
-// conflict flag). Per design 4.2, this is the SPA's signal that the
-// row's totals are best-effort dedup during a leadership flip and
-// may understate the true window. The overlay is an SVG layered
-// inside the scroll container so it tracks the canvas's scroll
-// position (same idiom as TimeAxis).
+// ConflictOverlay layers a thin striped hatch over the cells whose
+// fan-out merge produced disagreeing per-node values. Per design §9.1
+// this signals that the cell's total is a best-effort dedup during a
+// leadership flip and may understate the true window. The overlay is
+// an SVG layered inside the scroll container so it tracks the canvas's
+// scroll position (same idiom as TimeAxis).
 //
-// Patterns rather than colour because the underlying canvas already
-// uses colour for intensity; a hatch communicates "soft data here"
-// without competing with the heatmap signal. SVG sized to (width,
-// rows.length × cellH) mirrors the canvas exactly.
+// When a row carries per-cell `conflicts[]` (PR-3d server) we hatch
+// only the affected columns; when it carries only the row-level
+// `conflict` flag (legacy server, no per-cell array) we hatch the
+// whole row as before. Patterns rather than colour because the canvas
+// already uses colour for intensity; a hatch communicates "soft data
+// here" without competing with the heatmap signal.
 interface ConflictOverlayProps {
   rows: KeyVizRow[];
   cellH: number;
+  cellW: number;
   width: number;
+  columnCount: number;
 }
 
-function ConflictOverlay({ rows, cellH, width }: ConflictOverlayProps) {
-  const conflictRows = useMemo(() => {
-    const out: number[] = [];
+interface ConflictRect {
+  x: number;
+  y: number;
+  w: number;
+}
+
+function ConflictOverlay({ rows, cellH, cellW, width, columnCount }: ConflictOverlayProps) {
+  const rects = useMemo(() => {
+    const out: ConflictRect[] = [];
     for (let i = 0; i < rows.length; i++) {
-      if (rows[i].conflict) out.push(i);
+      const row = rows[i];
+      const cells = row.conflicts;
+      if (cells && cells.length > 0) {
+        // Per-cell: hatch only the disagreeing columns.
+        for (let j = 0; j < cells.length; j++) {
+          if (cells[j]) out.push({ x: j * cellW, y: i * cellH, w: cellW });
+        }
+      } else if (row.conflict) {
+        // Legacy server: only the row-level flag is available, so fall
+        // back to hatching the entire row across all columns.
+        out.push({ x: 0, y: i * cellH, w: columnCount * cellW });
+      }
     }
     return out;
-  }, [rows]);
-  if (conflictRows.length === 0) return null;
+  }, [rows, cellH, cellW, columnCount]);
+  if (rects.length === 0) return null;
   const totalH = rows.length * cellH;
   return (
     <svg
@@ -324,12 +350,12 @@ function ConflictOverlay({ rows, cellH, width }: ConflictOverlayProps) {
           <line x1={0} y1={0} x2={0} y2={4} stroke="currentColor" strokeWidth={1} opacity={0.45} />
         </pattern>
       </defs>
-      {conflictRows.map((i) => (
+      {rects.map((r, idx) => (
         <rect
-          key={i}
-          x={0}
-          y={i * cellH}
-          width={width}
+          key={idx}
+          x={r.x}
+          y={r.y}
+          width={r.w}
           height={cellH}
           fill="url(#keyviz-conflict-hatch)"
         />

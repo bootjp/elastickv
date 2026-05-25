@@ -346,12 +346,17 @@ export interface KeyVizRow {
   route_ids_truncated?: boolean;
   route_count: number;
   values: number[];
-  // Phase 2-C row-level conflict flag (always present on the wire,
-  // defaults to false). True when ≥2 nodes reported a non-zero
-  // value for the same cell — typically a leadership flip mid-
-  // window. Per design 4.2 / PR-1, this is a row-level signal; it
-  // moves to per-cell when the proto extension lands in 2-C+.
+  // Row-level conflict flag — the OR of conflicts[]. True when ≥2
+  // nodes reported a different non-zero value for the same cell,
+  // typically a leadership flip mid-window. Kept on the wire so an
+  // older client without per-cell support still hatches the row.
   conflict?: boolean;
+  // Per-cell conflict flags (Phase 2-C+ PR-3d), parallel to values[].
+  // conflicts[j] is true when column j saw a within-term merge
+  // disagreement. Absent on the single-node / no-fan-out path and from
+  // legacy servers; when absent the SPA falls back to the row-level
+  // conflict flag.
+  conflicts?: boolean[];
 }
 
 // Per-node entry in the KeyVizMatrix.fanout block. OK=true means
