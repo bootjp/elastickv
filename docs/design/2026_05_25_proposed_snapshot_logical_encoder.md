@@ -6,7 +6,7 @@ Date: 2026-05-25
 
 ## Background
 
-Phase 0a (`2026_04_29_proposed_snapshot_logical_decoder.md`,
+Phase 0a (`2026_04_29_partial_snapshot_logical_decoder.md`,
 milestones all merged: PRs #790, #791, #792, #806, #810) shipped the
 **decoder**: an offline tool that reads a native Pebble `.fsm`
 snapshot and writes a vendor-independent, per-adapter directory tree
@@ -230,6 +230,17 @@ fixture.
 > first adapter access after restart. The recommended path is full
 > reconstruction; the fallback is called out in §"Milestones" as a
 > per-adapter decision gate.
+>
+> **The fallback is not zero-cost transparency.** A missing GSI row
+> makes a DynamoDB GSI query return empty *silently* (no error); a
+> missing SQS dedup window lets a FIFO queue redeliver an
+> already-received message post-restore. Neither degrades gracefully.
+> So if lazy-rebuild is chosen for an adapter, the restore runbook
+> MUST require a post-restore admin `SCAN+REBUILD` pass on the target
+> cluster to complete *before the adapter serves traffic* — the
+> milestone that picks the fallback owns adding that runbook step and
+> the admin command to drive it. Absent that, the fallback is
+> incorrect, not merely slower.
 
 ## Per-adapter reverse encoders
 
@@ -268,7 +279,11 @@ requires materializing the encoded-key set; for very large dumps the
 encoder spills to an on-disk external sort keyed by encoded key (a
 later milestone — Phase 0b v1 sorts in memory and documents the
 bound, mirroring how Phase 0a bounded per-entry allocations first and
-optimized later).
+optimized later). Worst-case in-memory bound for v1 is roughly
+`N × (avg_encoded_key_size + small_slice_header)` for the key index
+plus the value bytes if held — e.g. a 10M-key snapshot at a 256-byte
+average key is ~2.5 GiB just for the keys. The external-sort
+follow-up milestone uses this as its baseline target.
 
 ## Version coupling and the format gate
 
@@ -368,7 +383,7 @@ P2:
 
 ## References
 
-- `2026_04_29_proposed_snapshot_logical_decoder.md` — Phase 0 format
+- `2026_04_29_partial_snapshot_logical_decoder.md` — Phase 0 format
   owner; Phase 0a (decoder) shipped. Promoted to `partial` on landing
   this doc.
 - `2026_04_29_proposed_logical_backup.md` — Phase 1 (live PIT

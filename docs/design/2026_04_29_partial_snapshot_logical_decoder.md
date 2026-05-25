@@ -22,8 +22,16 @@ entire keyspace as a single opaque stream:
 [magic "EKVPBBL1" :8]
 [lastCommitTS    :8]
 ([keyLen:8][key][valLen:8][val])*
-[CRC32C footer  :4]
 ```
+
+The native Pebble snapshot stream has **no trailing checksum** — it
+terminates on a clean EOF at the start of a key-length field
+(`store/snapshot_pebble.go` `WriteTo`, `internal/backup/snapshot_reader.go`
+`ReadSnapshot`). A CRC32C footer exists only on the *MVCC streaming
+restore* path (`store/lsm_store.go` `readStreamingMVCCRestoreHeader`),
+which is a different framing the decoder/encoder do not touch. See
+`2026_05_25_proposed_snapshot_logical_encoder.md` §"Why a separate
+design doc" item 3.
 
 Snapshots are taken automatically every `defaultSnapshotEvery = 10000`
 log entries (`internal/raftengine/etcd/engine.go:92`) and stored under
@@ -466,7 +474,7 @@ elastickv-snapshot-decode \
 Pipeline:
 
 ```text
-open .fsm                                       # verifies CRC32C footer
+open .fsm                                       # verifies EKVPBBL1 magic
 parse EKVPBBL1 magic + lastCommitTS
 stream ([keyLen:8][key][valLen:8][val])* entries:
   dispatch by leading prefix:
@@ -503,7 +511,7 @@ current.
 elastickv-snapshot-encode \
   --input  <directory-root> \
   --output <fsm-file> \
-  [--last-commit-ts <unix-ms>]
+  [--last-commit-ts <hlc-uint64>]   # 64-bit HLC: 48-bit phys || 16-bit logical, not Unix-ms
 ```
 
 Pipeline:
@@ -518,7 +526,7 @@ walk per-adapter subtrees:
   Redis    → emit per-type wide-column or simple keys
   SQS      → emit !sqs|queue|meta| then !sqs|msg|data| pairs
 verify the resulting key-set has no duplicates
-write EKVPBBL1 header + lastCommitTS + sorted KV stream + CRC32C footer
+write EKVPBBL1 header + lastCommitTS + sorted KV stream (no checksum footer)
 ```
 
 Output is a valid `.fsm` file in the same wire format the live FSM
@@ -691,7 +699,7 @@ bespoke parser, the format has failed its goal.
 | `TestS3SidecarSuffixCollision` | A user S3 object key ending in `.elastickv-meta.json` is rejected without `--rename-collisions`; with the flag the rename is recorded |
 | `TestEncodeDecodeRoundTrip` | Encoded `.fsm` decodes back to a directory tree byte-identical to the original (wall-time fields excluded) |
 | `TestManifestVersionGate` | Decoder refuses inputs with `format_version > current_major`; same-major-newer-minor allowed; older-major refused with a clear message |
-| `TestDecoderRejectsTruncatedFSM` | A `.fsm` whose CRC32C footer fails verification is rejected with a typed error before any record is emitted |
+| `TestDecoderRejectsTruncatedFSM` | A `.fsm` truncated mid-entry (or carrying a bad magic header) is rejected with a typed error (`ErrSnapshotTruncated` / `ErrSnapshotBadMagic`) before a partial record is emitted — the native format has no checksum footer, so corruption is caught at the magic header and the per-entry length-prefix EOF boundary |
 
 ### P1
 
