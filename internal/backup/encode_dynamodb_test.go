@@ -200,6 +200,42 @@ func TestDDBEncodeRejectsNonRegularSchema(t *testing.T) {
 	}
 }
 
+// TestDDBEncodeRejectsDuplicateAttributeDefinition pins that a
+// _schema.json with two attribute definitions sharing a name fails
+// closed: publicToSchema folds AttributeDefinitions into a map, so a
+// duplicate would otherwise silently overwrite an entry and lose a type
+// without any error (coderabbit Major on PR #833).
+func TestDDBEncodeRejectsDuplicateAttributeDefinition(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeDDBSchema(t, in, "tbl", []byte(`{"format_version":1,"table_name":"x",`+
+		`"primary_key":{"hash_key":{"name":"id","type":"S"}},`+
+		`"attribute_definitions":[{"name":"id","type":"S"},{"name":"id","type":"N"}]}`))
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeInvalidSchema) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeInvalidSchema", err)
+	}
+}
+
+// TestDDBEncodeRejectsDuplicateGSIName pins the same fail-closed guard
+// for GlobalSecondaryIndexes, which are also folded into a map.
+func TestDDBEncodeRejectsDuplicateGSIName(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeDDBSchema(t, in, "tbl", []byte(`{"format_version":1,"table_name":"x",`+
+		`"primary_key":{"hash_key":{"name":"id","type":"S"}},`+
+		`"attribute_definitions":[{"name":"id","type":"S"},{"name":"region","type":"S"}],`+
+		`"global_secondary_indexes":[`+
+		`{"name":"by-region","key_schema":{"hash_key":{"name":"region","type":"S"}},"projection":{"type":"ALL"}},`+
+		`{"name":"by-region","key_schema":{"hash_key":{"name":"id","type":"S"}},"projection":{"type":"ALL"}}]}`))
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeInvalidSchema) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeInvalidSchema", err)
+	}
+}
+
 // TestDDBEncodeRejectsEmptyHashKey pins that a schema with no primary
 // hash key fails closed rather than propagating into the item encoder.
 func TestDDBEncodeRejectsEmptyHashKey(t *testing.T) {

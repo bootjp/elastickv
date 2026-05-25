@@ -174,7 +174,35 @@ func (e *DynamoDBEncoder) readSchema(root *os.Root, tableDir string) (*pb.Dynamo
 		return nil, errors.Wrapf(ErrDDBEncodeInvalidSchema,
 			"%s: unsupported format_version %d", rel, pub.FormatVersion)
 	}
+	// publicToSchema folds AttributeDefinitions and GlobalSecondaryIndexes
+	// into maps keyed by name, so duplicate names would silently overwrite
+	// (losing a type or an index) instead of erroring. Reject duplicates
+	// here before conversion so a malformed dump fails closed.
+	if err := rejectDuplicateSchemaNames(pub, rel); err != nil {
+		return nil, err
+	}
 	return publicToSchema(pub), nil
+}
+
+// rejectDuplicateSchemaNames fails closed on duplicate attribute-
+// definition or GSI names, which publicToSchema would otherwise collapse
+// silently when folding the slices into maps.
+func rejectDuplicateSchemaNames(pub ddbPublicSchema, rel string) error {
+	attrSeen := make(map[string]struct{}, len(pub.AttributeDefinitions))
+	for _, d := range pub.AttributeDefinitions {
+		if _, ok := attrSeen[d.Name]; ok {
+			return errors.Wrapf(ErrDDBEncodeInvalidSchema, "%s: duplicate attribute definition %q", rel, d.Name)
+		}
+		attrSeen[d.Name] = struct{}{}
+	}
+	gsiSeen := make(map[string]struct{}, len(pub.GlobalSecondaryIndexes))
+	for _, g := range pub.GlobalSecondaryIndexes {
+		if _, ok := gsiSeen[g.Name]; ok {
+			return errors.Wrapf(ErrDDBEncodeInvalidSchema, "%s: duplicate GSI name %q", rel, g.Name)
+		}
+		gsiSeen[g.Name] = struct{}{}
+	}
+	return nil
 }
 
 // publicToSchema is the inverse of schemaToPublic: it rebuilds the
