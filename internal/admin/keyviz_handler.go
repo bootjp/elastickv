@@ -72,12 +72,17 @@ type KeyVizMatrix struct {
 // KeyVizMatrix.ColumnUnixMs — Values[j] is the counter for that route
 // at column j.
 //
-// Conflict is true when the Phase 2-C max-merge collapsed disagreeing
-// values from multiple nodes for the same row (see fan-out design 4.2);
-// the SPA hatches such rows so operators know the displayed total may
-// understate the true per-window count during a leadership flip. The
-// flag is row-level for now and will move to per-cell when the proto
-// extension lands in Phase 2-C+.
+// Conflict is true when at least one of the row's cells observed a
+// merge disagreement. For writes the predicate fires when ≥2 sources
+// reported different non-zero values for the SAME
+// (bucket, raft_group_id, leader_term, column) tuple — a Raft
+// invariant violation (at most one leader per term per group), so
+// the SPA hatches the row. Phase 2-C+ PR-3c upgraded the merge from
+// the Phase 2-C row-level §4.2 max-merge to the canonical §9.1
+// per-cell (group, term)-keyed dedupe + sum-across-terms; the
+// row-level Conflict flag stays as the coarse SPA signal and a
+// per-cell `Conflicts []bool` is deferred to a future wire-format
+// extension.
 type KeyVizRow struct {
 	BucketID          string   `json:"bucket_id"`
 	Start             []byte   `json:"start"`
