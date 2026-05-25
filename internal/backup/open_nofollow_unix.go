@@ -37,6 +37,24 @@ import (
 // Lstat-then-OpenFile guard because Windows's
 // SeCreateSymbolicLinkPrivilege already raises the bar for the
 // equivalent attack and Windows has no FIFO concept.
+// refuseHardLink rejects a file whose inode carries more than one
+// link. A hard link can name an inode living OUTSIDE the dump subtree
+// while still presenting as a regular file — so both the IsRegular
+// check and the os.Root symlink-escape guard pass — letting a crafted
+// dump pull external bytes into the snapshot. This is the read-side
+// analogue of openSidecarFile's write-side Nlink defense (codex P2 on
+// PR #828). info must come from an Lstat/Fstat of the target.
+func refuseHardLink(info os.FileInfo, path string) error {
+	sysStat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	if sysStat.Nlink > 1 {
+		return cockroachdberr.Wrapf(ErrRedisEncodeHardLink, "%s (nlink=%d)", path, sysStat.Nlink)
+	}
+	return nil
+}
+
 func openSidecarFile(path string) (*os.File, error) {
 	// Note: NO O_TRUNC here — we truncate after the link-count check.
 	const flag = os.O_WRONLY | os.O_CREATE | syscall.O_NOFOLLOW | syscall.O_NONBLOCK

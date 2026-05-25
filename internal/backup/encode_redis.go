@@ -62,6 +62,14 @@ var ErrRedisEncodeNotDir = errors.New("backup: redis db path is not a directory"
 // on PR #828).
 var ErrRedisEncodeNotRegular = errors.New("backup: redis dump sidecar is not a regular file")
 
+// ErrRedisEncodeHardLink is returned (on platforms where the link
+// count is observable — see refuseHardLink) when a dump file has more
+// than one hard link. A hard link can name an inode outside the dump
+// subtree while passing the IsRegular and os.Root symlink guards, so
+// ingesting it would breach the untrusted-input boundary (codex P2 on
+// PR #828).
+var ErrRedisEncodeHardLink = errors.New("backup: redis dump file is hard-linked")
+
 // RedisEncoder reconstructs the internal Redis keyspace for one logical
 // database (redis/db_<n>/) from its decoded directory tree.
 type RedisEncoder struct {
@@ -258,6 +266,9 @@ func openDumpSidecar(dir, name string) (*os.File, error) {
 	if !info.Mode().IsRegular() {
 		return nil, errors.Wrapf(ErrRedisEncodeNotRegular, "%s (mode=%s)", name, info.Mode())
 	}
+	if err := refuseHardLink(info, name); err != nil {
+		return nil, err
+	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -279,6 +290,17 @@ func readRootFile(root *os.Root, name string) ([]byte, error) {
 		return nil, errors.WithStack(err)
 	}
 	defer func() { _ = f.Close() }()
+	// Refuse hard-linked blobs: a *.bin hard-linked to an inode outside
+	// the dump subtree passes IsRegular() and the os.Root escape guard,
+	// but ingesting its bytes would break the untrusted-input boundary
+	// (codex P2 on PR #828).
+	info, err := f.Stat()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := refuseHardLink(info, name); err != nil {
+		return nil, err
+	}
 	body, err := io.ReadAll(f)
 	if err != nil {
 		return nil, errors.WithStack(err)
