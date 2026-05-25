@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand) shipped; 6D-6c (main.go wiring + integration test) remain |
+| Status | partial — 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand), 6D-6c-1 (Applier in-memory accessors) shipped; 6D-6c-2 (main.go cipher + gate wiring) and 6D-6c-3 (capability fan-out closure + e2e integration test) remain |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -71,14 +71,51 @@
   misconfigured shell variable fails fast before the round-trip;
   the server re-validates as the source of truth.
 
+- **6D-6c-1** (Applier in-memory accessors + shared StateCache)
+  — new exported `encryption.StateCache` type backed by
+  `atomic.Uint32` / `atomic.Bool` mirrors of `sidecar.Active.Storage`
+  and `sidecar.StorageEnvelopeActive`. The cache is a **process-
+  wide singleton** (parallel to the shared `*Keystore`) threaded
+  into every per-shard `Applier` via the new `WithStateCache`
+  option. Multi-group encryption FSM entries apply on exactly
+  one shard's leader, so per-Applier-private atomics would leave
+  the remaining shards stuck with pre-apply values; the shared
+  StateCache makes every shard's storage layer observe the update
+  regardless of which shard ran the apply. Coherence with disk
+  is maintained by durable write-then-cache ordering inside
+  `writeBootstrapSidecar`, `writeRotationSidecar`, and the
+  cutover fresh-success branch of `applyEnableStorageEnvelope`.
+  `NewApplier` primes the cache from the sidecar on construction
+  so the storage-layer per-Put closures (wired in 6D-6c-2)
+  observe correct values before the FSM has replayed a single
+  entry after restart. `Applier.ActiveStorageKeyID` /
+  `Applier.StorageEnvelopeActive` remain as delegate methods for
+  tests and single-applier callers; multi-shard wiring in
+  6D-6c-2 must read via `cache.ActiveStorageKeyID` /
+  `cache.StorageEnvelopeActive` directly. Operator-inert by
+  itself — only consumed once main.go threads the cache methods
+  into `store.WithEncryption` and `WithStorageEnvelopeGate` in
+  6D-6c-2.
+
 ## Open milestones
 
-- **6D-6c** — main.go production wiring: cipher + WithEncryption
-  + WithStorageEnvelopeGate threaded from the sidecar, plus the
-  CapabilityFanout closure bound to the live Raft membership
-  view. End-to-end integration test exercises a single-node
-  cluster Bootstrap → EnableStorageEnvelope → Put → read-back-
-  via-envelope.
+- **6D-6c-2** — main.go production wiring: build
+  `encryption.NewCipher(keystore)` and construct a single
+  `encryption.StateCache` at startup (parallel to the shared
+  `*Keystore`). Thread the cache via `WithStateCache` into every
+  per-shard `Applier` inside `buildShardGroups`, and pass
+  `cache.ActiveStorageKeyID` / `cache.StorageEnvelopeActive`
+  (NOT the per-shard `Applier` delegates) into
+  `store.WithEncryption` + `store.WithStorageEnvelopeGate` for
+  each shard's PebbleStore. Reading via the StateCache directly
+  ensures every shard's storage layer sees the post-apply state
+  regardless of which shard's leader accepted the encryption
+  proposal.
+- **6D-6c-3** — main.go CapabilityFanout closure bound to the
+  live Raft membership view (etcd engine route snapshot + admin
+  client DialFunc), and end-to-end integration test exercising
+  a single-node cluster Bootstrap → EnableStorageEnvelope →
+  Put → read-back-via-envelope.
 
 ## 0. Why this doc exists
 

@@ -3,6 +3,7 @@ package encryption
 import (
 	"bytes"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
@@ -63,17 +64,127 @@ type WriterRegistryStore interface {
 //     ErrKEKNotConfigured marker. Stage 6B will swap these for the
 //     real KEK-unwrap + sidecar mutate + keystore install path.
 //
-// The Applier carries no in-memory state of its own; all state
-// lives in the supplied WriterRegistryStore. This keeps it safe
-// to construct once at FSM startup and share across the lifetime
-// of the process — no per-apply allocation, no locks, no leak
-// path for stale state across snapshot restore.
+// Apart from the shared StateCache pointer (see below), the
+// Applier carries no in-memory state of its own; durable state
+// lives in the supplied WriterRegistryStore and the on-disk
+// sidecar. The StateCache mirrors a small subset of sidecar
+// fields the storage hot path consults on every Put — kept
+// coherent by durable write-then-cache ordering inside each
+// apply path.
 type Applier struct {
 	registry    WriterRegistryStore
 	kek         KEKUnwrapper
 	keystore    *Keystore
 	sidecarPath string
 	now         func() time.Time
+	// stateCache is the process-shared mirror of the sidecar fields
+	// the storage hot path consults on every Put. See StateCache for
+	// the full contract; in short, a single instance is owned by
+	// main.go (parallel to the shared *Keystore) and threaded into
+	// every per-shard Applier via WithStateCache so that an apply
+	// landing on shard A's FSM is immediately visible to shard B's
+	// storage layer. Multi-group encryption applies always land on
+	// exactly one shard's FSM (the one whose engine accepted the
+	// proposal), so a per-Applier cache would leave the remaining
+	// shards stuck with pre-apply atomic values.
+	//
+	// Never nil after NewApplier: when WithStateCache is omitted the
+	// constructor installs a private instance so single-applier
+	// callers and tests keep working unchanged.
+	stateCache *StateCache
+}
+
+// StateCache mirrors the sidecar fields the storage hot path needs
+// to consult on every Put. Two requirements drive its existence:
+//
+//  1. ReadSidecar-on-every-Put would serialise the hot path through
+//     a JSON parse + fsync barrier. atomic.Uint32 / atomic.Bool give
+//     a wait-free single-load read instead.
+//
+//  2. In a multi-group deployment, encryption FSM entries apply on
+//     whichever shard's leader accepted the proposal — not on every
+//     shard. The per-shard storage layers must still observe the
+//     updated state, so the cache MUST be a process-shared singleton
+//     rather than a per-Applier field. main.go constructs one
+//     StateCache at startup (parallel to the shared *Keystore) and
+//     threads it into every per-shard Applier via WithStateCache.
+//
+// Coherence with disk is maintained by **durable write-then-cache**
+// ordering: NewApplier primes the cache from ReadSidecar, and every
+// apply path calls RefreshFromSidecar AFTER WriteSidecar succeeds.
+// A crash between fsync and atomic store is benign because the next
+// process start re-primes from disk.
+//
+// Zero values match the pre-bootstrap posture (no active storage
+// DEK, envelope gate off) so a freshly-constructed StateCache is
+// safe to use before any apply or prime has run.
+type StateCache struct {
+	// activeStorageDEKID mirrors sidecar.Active.Storage. Zero means
+	// "not bootstrapped"; readers surface (0, false) and the storage
+	// layer writes cleartext.
+	activeStorageDEKID atomic.Uint32
+	// storageEnvelopeActive mirrors sidecar.StorageEnvelopeActive
+	// for the §6.2 cutover gate. Lifecycle:
+	//   - false at construction (or primed from disk if a previous
+	//     cutover already fired).
+	//   - flipped to true exactly once by applyEnableStorageEnvelope
+	//     on a fresh-success apply, AFTER WriteSidecar succeeds.
+	//   - never flipped back to false (the cutover is one-way per
+	//     §7.1 Phase 1; rotate-dek under the active envelope keeps
+	//     it true).
+	storageEnvelopeActive atomic.Bool
+}
+
+// NewStateCache returns a zero-initialised StateCache. The
+// pre-bootstrap posture (Active.Storage=0, StorageEnvelopeActive=false)
+// is the correct initial state; RefreshFromSidecar advances it to the
+// current sidecar values when one is supplied.
+func NewStateCache() *StateCache { return &StateCache{} }
+
+// RefreshFromSidecar copies the relevant fields out of sc into the
+// atomic mirrors. Safe to call concurrently with reads; safe to
+// call from multiple goroutines (writers race to the same atomic
+// CAS path, but the only writer in production is the FSM apply
+// goroutine of the shard that accepted the encryption proposal).
+//
+// nil sc is a no-op: matches the pre-bootstrap posture where
+// ReadSidecar returns IsNotExist.
+func (c *StateCache) RefreshFromSidecar(sc *Sidecar) {
+	if c == nil || sc == nil {
+		return
+	}
+	c.activeStorageDEKID.Store(sc.Active.Storage)
+	c.storageEnvelopeActive.Store(sc.StorageEnvelopeActive)
+}
+
+// ActiveStorageKeyID returns the current sidecar.Active.Storage DEK
+// id. Signature matches store.ActiveStorageKeyID so main.go can pass
+// `cache.ActiveStorageKeyID` directly into `store.WithEncryption(...)`
+// as the per-Put activeKeyID closure. A non-zero id with ok=true
+// means the cluster has run BootstrapEncryption; zero with ok=false
+// means the cluster is still pre-bootstrap and the storage layer
+// should write cleartext.
+func (c *StateCache) ActiveStorageKeyID() (uint32, bool) {
+	if c == nil {
+		return 0, false
+	}
+	id := c.activeStorageDEKID.Load()
+	return id, id != 0
+}
+
+// StorageEnvelopeActive returns the in-memory mirror of
+// sidecar.StorageEnvelopeActive. Signature matches
+// store.StorageEnvelopeActive so main.go can pass
+// `cache.StorageEnvelopeActive` directly into
+// `store.WithStorageEnvelopeGate(...)` as the per-Put cutover gate.
+// Once true, the storage layer wraps every new version in the §4.1
+// envelope; flips exactly once per cluster lifetime when the §7.1
+// Phase 1 cutover entry applies.
+func (c *StateCache) StorageEnvelopeActive() bool {
+	if c == nil {
+		return false
+	}
+	return c.storageEnvelopeActive.Load()
 }
 
 // KEKUnwrapper is the abstraction the Applier uses to recover
@@ -132,6 +243,21 @@ func WithNowFunc(now func() time.Time) ApplierOption {
 	return func(a *Applier) { a.now = now }
 }
 
+// WithStateCache installs a shared StateCache so that an apply
+// landing on this Applier (typically the per-shard Applier whose
+// FSM accepted the encryption proposal) updates atomics that every
+// other Applier in the process reads. main.go owns one StateCache
+// for the lifetime of the binary and threads the same pointer into
+// every per-shard Applier and into the storage-layer per-Put
+// closures.
+//
+// If WithStateCache is omitted, NewApplier installs a private
+// instance — preserves the single-applier ergonomics that tests
+// and pre-multi-shard callers rely on.
+func WithStateCache(c *StateCache) ApplierOption {
+	return func(a *Applier) { a.stateCache = c }
+}
+
 // NewApplier wires an Applier against the supplied registry store
 // plus optional KEK / Keystore / sidecar / clock dependencies.
 // Returns an error if registry is nil so misconfiguration is caught
@@ -162,7 +288,57 @@ func NewApplier(registry WriterRegistryStore, opts ...ApplierOption) (*Applier, 
 	if a.now == nil {
 		return nil, errors.New("encryption: NewApplier: WithNowFunc(nil) overwrote default time.Now")
 	}
+	// Install a private StateCache when WithStateCache was not
+	// supplied so the apply paths and accessors always have a
+	// non-nil target. Tests rely on this; production main.go is
+	// expected to thread a shared instance in.
+	if a.stateCache == nil {
+		a.stateCache = NewStateCache()
+	}
+	// Prime the in-memory accessors from the on-disk sidecar
+	// (best-effort: a missing sidecar is the pre-bootstrap
+	// posture and leaves both atomics at their zero values,
+	// which is correct). The storage-layer closures may query
+	// these atomics before the FSM has replayed a single entry
+	// after restart, so the priming must happen at construction
+	// rather than lazily on first apply. A read error (corrupt
+	// JSON, bad version) surfaces back to the caller so a
+	// misconfigured node fails to start instead of silently
+	// running with stale-zero state.
+	if a.sidecarPath != "" {
+		switch sc, err := ReadSidecar(a.sidecarPath); {
+		case err == nil:
+			a.stateCache.RefreshFromSidecar(sc)
+		case IsNotExist(err):
+			// Pre-bootstrap; leave atomics at zero.
+		default:
+			return nil, errors.Wrap(err, "encryption: NewApplier: prime in-memory state from sidecar")
+		}
+	}
 	return a, nil
+}
+
+// StateCache returns the shared cache this Applier writes to on
+// every apply path. main.go wires one StateCache across all
+// per-shard Appliers via WithStateCache, but for callers that
+// constructed an Applier without supplying one this accessor
+// returns the privately-installed instance so tests can still
+// reach the atomics directly.
+func (a *Applier) StateCache() *StateCache { return a.stateCache }
+
+// ActiveStorageKeyID delegates to the shared StateCache. Convenience
+// for tests and single-applier callers; multi-shard wiring should
+// prefer reading StateCache().ActiveStorageKeyID directly so the
+// closure target is independent of which shard's Applier received
+// the encryption apply.
+func (a *Applier) ActiveStorageKeyID() (uint32, bool) {
+	return a.stateCache.ActiveStorageKeyID()
+}
+
+// StorageEnvelopeActive delegates to the shared StateCache. Same
+// rationale as ActiveStorageKeyID above.
+func (a *Applier) StorageEnvelopeActive() bool {
+	return a.stateCache.StorageEnvelopeActive()
 }
 
 // bootstrapAndRotationConfigured reports whether WithKEK,
@@ -513,6 +689,7 @@ func (a *Applier) writeBootstrapSidecar(raftIdx uint64, p fsmwire.BootstrapPaylo
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for bootstrap")
 	}
+	a.stateCache.RefreshFromSidecar(sc)
 	return nil
 }
 
@@ -773,6 +950,7 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for cutover")
 	}
+	a.stateCache.RefreshFromSidecar(sc)
 	return nil
 }
 
@@ -809,6 +987,7 @@ func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for rotation")
 	}
+	a.stateCache.RefreshFromSidecar(sc)
 	return nil
 }
 
