@@ -47,6 +47,14 @@ var ErrRedisEncodeInvalidJSON = errors.New("backup: redis encode invalid collect
 // interleaved field list — XADD enforces even arity.
 const streamFieldPairWidth = 2
 
+// redisCollectionFormatVersion is the only format_version the
+// collection JSON encoders accept. A dump declaring a newer version
+// (or a renamed schema) would otherwise decode with zero-valued fields
+// and emit corrupt/empty rows; the encoders fail closed instead
+// (codex P2 / claude on PR #831). Streams use a line-oriented JSONL
+// without a top-level format_version, so they are not gated here.
+const redisCollectionFormatVersion uint32 = 1
+
 // hashJSONRecord mirrors marshalHashJSON's output: a format version, a
 // fields ARRAY of {name,value} binary envelopes (object keys can't
 // hold binary-safe field names), and an optional expiry.
@@ -66,6 +74,9 @@ func (e *RedisEncoder) encodeHashes(b *snapshotBuilder) error {
 		var rec hashJSONRecord
 		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "hash %q: %v", rawKey, err)
+		}
+		if rec.FormatVersion != redisCollectionFormatVersion {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "hash %q: unsupported format_version %d", rawKey, rec.FormatVersion)
 		}
 		// Base meta: element count = number of fields (consolidated,
 		// no deltas).
@@ -108,6 +119,9 @@ func (e *RedisEncoder) encodeSets(b *snapshotBuilder) error {
 		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "set %q: %v", rawKey, err)
 		}
+		if rec.FormatVersion != redisCollectionFormatVersion {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "set %q: unsupported format_version %d", rawKey, rec.FormatVersion)
+		}
 		if err := b.Add(wideColMetaKey(RedisSetMetaPrefix, rawKey),
 			marshalCount8BE(uint64(len(rec.Members))), 0); err != nil {
 			return err
@@ -149,6 +163,9 @@ func (e *RedisEncoder) encodeLists(b *snapshotBuilder) error {
 		var rec listJSONRecord
 		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "list %q: %v", rawKey, err)
+		}
+		if rec.FormatVersion != redisCollectionFormatVersion {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "list %q: unsupported format_version %d", rawKey, rec.FormatVersion)
 		}
 		if err := b.Add(buildListMetaKey(rawKey), marshalListMetaHead0(uint64(len(rec.Items))), 0); err != nil {
 			return err
@@ -220,6 +237,9 @@ func (e *RedisEncoder) encodeZSets(b *snapshotBuilder) error {
 		var rec zsetJSONRecord
 		if err := json.NewDecoder(r).Decode(&rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "zset %q: %v", rawKey, err)
+		}
+		if rec.FormatVersion != redisCollectionFormatVersion {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "zset %q: unsupported format_version %d", rawKey, rec.FormatVersion)
 		}
 		if err := b.Add(wideColMetaKey(RedisZSetMetaPrefix, rawKey),
 			marshalCount8BE(uint64(len(rec.Members))), 0); err != nil {

@@ -646,6 +646,29 @@ func TestUnmarshalRedisBinaryValue(t *testing.T) {
 	}
 }
 
+// TestRedisEncodeCollectionRejectsUnknownFormatVersion pins that each
+// JSON collection encoder fails closed on an unsupported
+// format_version rather than decoding with zero-valued fields and
+// emitting corrupt/empty rows.
+func TestRedisEncodeCollectionRejectsUnknownFormatVersion(t *testing.T) {
+	t.Parallel()
+	for _, subdir := range []string{"hashes", "sets", "lists", "zsets"} {
+		t.Run(subdir, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			enc := EncodeSegment([]byte("k"))
+			// format_version 99 is unsupported; the guard fires right
+			// after Decode, before any field is consulted.
+			writeRedisFile(t, in, filepath.Join(subdir, enc+".json"), []byte(`{"format_version":99}`))
+			b := newSnapshotBuilder(redisEncTS)
+			err := NewRedisEncoder(in, 0).Encode(b)
+			if !errors.Is(err, ErrRedisEncodeInvalidJSON) {
+				t.Fatalf("%s Encode err = %v, want ErrRedisEncodeInvalidJSON", subdir, err)
+			}
+		})
+	}
+}
+
 // TestRedisEncodeStreamRejectsMismatchedMetaLength pins that a _meta
 // length disagreeing with the parsed entry count fails closed rather
 // than restoring an inconsistent XLEN.
