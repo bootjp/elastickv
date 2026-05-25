@@ -47,6 +47,23 @@ var ErrRedisEncodeInvalidJSON = errors.New("backup: redis encode invalid collect
 // interleaved field list — XADD enforces even arity.
 const streamFieldPairWidth = 2
 
+// decodeOneJSON decodes exactly one JSON value from r into v and fails
+// closed (ErrRedisEncodeInvalidJSON) if any trailing data follows it.
+// A collection file (hashes/sets/lists/zsets) is a single JSON object;
+// trailing bytes after it indicate a corrupt/concatenated dump that
+// json.Decoder.Decode would otherwise silently ignore (codex P2 on
+// PR #831).
+func decodeOneJSON(r io.Reader, v any) error {
+	dec := json.NewDecoder(r)
+	if err := dec.Decode(v); err != nil {
+		return errors.WithStack(err)
+	}
+	if dec.More() {
+		return errors.Wrap(ErrRedisEncodeInvalidJSON, "trailing data after JSON value")
+	}
+	return nil
+}
+
 // redisCollectionFormatVersion is the only format_version the
 // collection JSON encoders accept. A dump declaring a newer version
 // (or a renamed schema) would otherwise decode with zero-valued fields
@@ -72,7 +89,7 @@ type hashJSONRecord struct {
 func (e *RedisEncoder) encodeHashes(b *snapshotBuilder) error {
 	return e.walkJSONDir("hashes", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec hashJSONRecord
-		if err := json.NewDecoder(r).Decode(&rec); err != nil {
+		if err := decodeOneJSON(r, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "hash %q: %v", rawKey, err)
 		}
 		if rec.FormatVersion != redisCollectionFormatVersion {
@@ -116,7 +133,7 @@ type setJSONRecord struct {
 func (e *RedisEncoder) encodeSets(b *snapshotBuilder) error {
 	return e.walkJSONDir("sets", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec setJSONRecord
-		if err := json.NewDecoder(r).Decode(&rec); err != nil {
+		if err := decodeOneJSON(r, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "set %q: %v", rawKey, err)
 		}
 		if rec.FormatVersion != redisCollectionFormatVersion {
@@ -161,7 +178,7 @@ type listJSONRecord struct {
 func (e *RedisEncoder) encodeLists(b *snapshotBuilder) error {
 	return e.walkJSONDir("lists", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec listJSONRecord
-		if err := json.NewDecoder(r).Decode(&rec); err != nil {
+		if err := decodeOneJSON(r, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "list %q: %v", rawKey, err)
 		}
 		if rec.FormatVersion != redisCollectionFormatVersion {
@@ -235,7 +252,7 @@ type zsetJSONRecord struct {
 func (e *RedisEncoder) encodeZSets(b *snapshotBuilder) error {
 	return e.walkJSONDir("zsets", ".json", func(rawKey []byte, r io.Reader) error {
 		var rec zsetJSONRecord
-		if err := json.NewDecoder(r).Decode(&rec); err != nil {
+		if err := decodeOneJSON(r, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "zset %q: %v", rawKey, err)
 		}
 		if rec.FormatVersion != redisCollectionFormatVersion {
@@ -352,6 +369,9 @@ func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
 				return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: %v", rawKey, err)
 			}
 			if line.Meta {
+				if meta != nil {
+					return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: multiple _meta lines", rawKey)
+				}
 				m := line
 				meta = &m
 				continue

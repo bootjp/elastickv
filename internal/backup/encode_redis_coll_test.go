@@ -669,6 +669,41 @@ func TestRedisEncodeCollectionRejectsUnknownFormatVersion(t *testing.T) {
 	}
 }
 
+// TestRedisEncodeCollectionRejectsTrailingJSON pins that a collection
+// file with data after the single JSON object fails closed rather than
+// silently ignoring the trailing bytes.
+func TestRedisEncodeCollectionRejectsTrailingJSON(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("k"))
+	// A valid hash object followed by a second object (trailing data).
+	body := append(buildHashJSON(t, map[string]string{"f": "v"}, nil), []byte(`{"x":1}`)...)
+	writeRedisFile(t, in, filepath.Join("hashes", enc+".json"), body)
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeInvalidJSON) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeInvalidJSON", err)
+	}
+}
+
+// TestRedisEncodeStreamRejectsDuplicateMeta pins that a stream JSONL
+// carrying two _meta lines fails closed rather than silently letting
+// the second overwrite the first.
+func TestRedisEncodeStreamRejectsDuplicateMeta(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("dupmeta"))
+	body := []byte(
+		`{"_meta":true,"length":0,"last_ms":0,"last_seq":0,"expire_at_ms":null}` + "\n" +
+			`{"_meta":true,"length":0,"last_ms":0,"last_seq":0,"expire_at_ms":null}` + "\n")
+	writeRedisFile(t, in, filepath.Join("streams", enc+".jsonl"), body)
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeInvalidJSON) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeInvalidJSON", err)
+	}
+}
+
 // TestRedisEncodeStreamRejectsMismatchedMetaLength pins that a _meta
 // length disagreeing with the parsed entry count fails closed rather
 // than restoring an inconsistent XLEN.
