@@ -521,8 +521,10 @@ read MANIFEST.json (refuse on unknown major format_version)
 walk per-adapter subtrees:
   DynamoDB → emit !ddb|meta|table| then !ddb|item| KV pairs
   S3       → emit !s3|bucket|meta| then !s3|obj|head| then !s3|blob| pairs
-              (split assembled bodies into chunks at the same chunk-size
-              the live cluster uses; chunk_size from MANIFEST.json)
+              (split assembled bodies into chunks at the canonical
+              s3ChunkSize from adapter/s3.go — the public sidecar does
+              not carry per-chunk sizes; reassembly is sequential by
+              chunkNo so object bytes are identical regardless)
   Redis    → emit per-type wide-column or simple keys
   SQS      → emit !sqs|queue|meta| then !sqs|msg|data| pairs
 verify the resulting key-set has no duplicates
