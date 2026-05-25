@@ -238,6 +238,101 @@ func TestRedisEncodeSetNoTTLRoundTripViaDecode(t *testing.T) {
 	}
 }
 
+// buildListJSON constructs a lists/<k>.json body (items array in
+// left-to-right order, binary envelopes).
+func buildListJSON(t *testing.T, items []string, expireMs *uint64) []byte {
+	t.Helper()
+	raw := make([]json.RawMessage, 0, len(items))
+	for _, it := range items {
+		v, err := marshalRedisBinaryValue([]byte(it))
+		if err != nil {
+			t.Fatalf("marshal item: %v", err)
+		}
+		raw = append(raw, v)
+	}
+	out := struct {
+		FormatVersion uint32            `json:"format_version"`
+		Items         []json.RawMessage `json:"items"`
+		ExpireAtMs    *uint64           `json:"expire_at_ms"`
+	}{FormatVersion: 1, Items: raw, ExpireAtMs: expireMs}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal list json: %v", err)
+	}
+	return body
+}
+
+// readListItems parses a decoded lists/<k>.json into an ordered slice
+// plus its expiry.
+func readListItems(t *testing.T, root, enc string) ([]string, *uint64) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, "redis", "db_0", "lists", enc+".json"))
+	if err != nil {
+		t.Fatalf("read decoded list: %v", err)
+	}
+	var rec listJSONRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("unmarshal decoded list: %v", err)
+	}
+	out := make([]string, 0, len(rec.Items))
+	for _, itRaw := range rec.Items {
+		it, err := unmarshalRedisBinaryValue(itRaw)
+		if err != nil {
+			t.Fatalf("unmarshal item: %v", err)
+		}
+		out = append(out, string(it))
+	}
+	return out, rec.ExpireAtMs
+}
+
+// TestRedisEncodeListRoundTripViaDecode runs the gold-standard
+// directory round-trip for a list, asserting ORDER is preserved (the
+// defining list property) plus a TTL.
+func TestRedisEncodeListRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("mylist"))
+	const expireMs uint64 = 1_700_000_000_777
+	items := []string{"job-1", "job-2", "job-3", "\xff\xfe"}
+	exp := expireMs
+	writeRedisFile(t, in, filepath.Join("lists", enc+".json"), buildListJSON(t, items, &exp))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, gotExp := readListItems(t, out, enc)
+	if len(got) != len(items) {
+		t.Fatalf("got %d items, want %d", len(got), len(items))
+	}
+	for i := range items {
+		if got[i] != items[i] {
+			t.Fatalf("item[%d] = %q, want %q (order must be preserved)", i, got[i], items[i])
+		}
+	}
+	if gotExp == nil || *gotExp != expireMs {
+		t.Fatalf("decoded expire_at_ms = %v, want %d", gotExp, expireMs)
+	}
+}
+
+// TestRedisEncodeListNoTTLRoundTripViaDecode pins the no-TTL list path
+// and single-element order.
+func TestRedisEncodeListNoTTLRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("q"))
+	items := []string{"only"}
+	writeRedisFile(t, in, filepath.Join("lists", enc+".json"), buildListJSON(t, items, nil))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, gotExp := readListItems(t, out, enc)
+	if len(got) != 1 || got[0] != "only" {
+		t.Fatalf("got %v, want [only]", got)
+	}
+	if gotExp != nil {
+		t.Fatalf("decoded expire_at_ms = %v, want nil", *gotExp)
+	}
+}
+
 // TestUnmarshalRedisBinaryValue pins both envelope shapes directly.
 func TestUnmarshalRedisBinaryValue(t *testing.T) {
 	t.Parallel()

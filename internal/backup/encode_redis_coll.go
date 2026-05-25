@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,6 +112,78 @@ func (e *RedisEncoder) encodeSets(b *snapshotBuilder) error {
 		}
 		return e.addCollectionTTL(b, rawKey, rec.ExpireAtMs)
 	})
+}
+
+// listJSONRecord mirrors marshalListJSON: items as an ordered array of
+// binary envelopes (left-to-right list order) plus an optional expiry.
+type listJSONRecord struct {
+	FormatVersion uint32            `json:"format_version"`
+	Items         []json.RawMessage `json:"items"`
+	ExpireAtMs    *uint64           `json:"expire_at_ms"`
+}
+
+// encodeLists reconstructs !lst|meta| + !lst|itm| records from
+// lists/*.json, plus an !redis|ttl| row for any expiring list.
+//
+// The dump records items in order but not their original seqs, so the
+// encoder assigns the canonical contiguous form: Head=0, item i at
+// seq i, Tail=Len. This satisfies the live store's Tail=Head+Len
+// invariant and reproduces the same left-to-right order on read
+// (store.ListItemKey scans items in sortable-seq order). The original
+// LPUSH/RPUSH seq base is not recoverable and does not need to be — a
+// restored list's subsequent prepends/appends simply extend from this
+// base.
+func (e *RedisEncoder) encodeLists(b *snapshotBuilder) error {
+	return e.walkJSONDir("lists", func(rawKey, body []byte) error {
+		var rec listJSONRecord
+		if err := json.Unmarshal(body, &rec); err != nil {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "list %q: %v", rawKey, err)
+		}
+		if err := b.Add(buildListMetaKey(rawKey), marshalListMetaHead0(uint64(len(rec.Items))), 0); err != nil {
+			return err
+		}
+		for i, itemRaw := range rec.Items {
+			item, err := unmarshalRedisBinaryValue(itemRaw)
+			if err != nil {
+				return errors.Wrapf(err, "list %q item %d", rawKey, i)
+			}
+			if err := b.Add(buildListItemKey(rawKey, int64(i)), item, 0); err != nil {
+				return err
+			}
+		}
+		return e.addCollectionTTL(b, rawKey, rec.ExpireAtMs)
+	})
+}
+
+// buildListMetaKey builds !lst|meta|<userKey> (no length prefix —
+// mirror of store.ListMetaKey).
+func buildListMetaKey(userKey []byte) []byte {
+	out := make([]byte, 0, len(ListMetaPrefix)+len(userKey))
+	out = append(out, ListMetaPrefix...)
+	return append(out, userKey...)
+}
+
+// marshalListMetaHead0 encodes the 24-byte [Head][Tail][Len] meta with
+// Head=0, Len=n, Tail=n — the canonical restore form (mirror of
+// store.marshalListMeta with Head=0).
+func marshalListMetaHead0(n uint64) []byte {
+	buf := make([]byte, listMetaBinarySize)
+	binary.BigEndian.PutUint64(buf[0:8], 0)   // Head
+	binary.BigEndian.PutUint64(buf[8:16], n)  // Tail = Head + Len
+	binary.BigEndian.PutUint64(buf[16:24], n) // Len
+	return buf
+}
+
+// buildListItemKey builds !lst|itm|<userKey><sortableInt64(seq)>
+// (mirror of store.ListItemKey + encodeSortableInt64: the seq is
+// sign-flipped so a forward byte scan yields ascending int64).
+func buildListItemKey(userKey []byte, seq int64) []byte {
+	out := make([]byte, 0, len(ListItemPrefix)+len(userKey)+listSeqBytes)
+	out = append(out, ListItemPrefix...)
+	out = append(out, userKey...)
+	var raw [listSeqBytes]byte
+	binary.BigEndian.PutUint64(raw[:], uint64(seq^math.MinInt64)) //nolint:gosec // sortable-int64 sign-flip; mirrors store.encodeSortableInt64
+	return append(out, raw[:]...)
 }
 
 // addCollectionTTL emits the !redis|ttl|<userKey> scan-index row for a
