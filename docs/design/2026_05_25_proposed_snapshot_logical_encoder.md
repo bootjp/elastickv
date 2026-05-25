@@ -183,7 +183,7 @@ encode they map as follows:
 | Class | Examples | Encode behavior |
 |---|---|---|
 | **User-visible records** | Redis strings/hashes/.../streams; DynamoDB items + `_schema.json`; S3 object bodies + sidecars; SQS `messages.jsonl` + `_queue.json` | Reconstructed from the directory tree — the direct inverse of each Phase 0a `Handle*` encoder. |
-| **Re-derivable indexes** | Redis TTL scan index (`!redis\|ttl\|`); DynamoDB GSI rows (`!ddb\|gsi\|`); SQS vis/byage/dedup/group/seq side records; per-scope generation counters (`!s3\|bucket\|gen\|`, `!ddb\|table\|gen\|`, `!sqs\|queue\|gen\|`) | **Reconstructed by the encoder** from the user records + config it just read. Required for a correct loadable image. |
+| **Re-derivable indexes** | Redis TTL scan index (`!redis\|ttl\|`); DynamoDB GSI rows (`!ddb\|gsi\|`); SQS vis/byage/dedup/group side records; per-scope generation counters (`!s3\|bucket\|gen\|`, `!ddb\|meta\|gen\|`, `!sqs\|queue\|gen\|`) + the SQS queue sequence counter (`!sqs\|queue\|seq\|`) | **Reconstructed by the encoder** from the user records + config it just read. Required for a correct loadable image. |
 | **Per-cluster operational / in-flight transactional** | HLC ceiling, Raft term/index/conf, FSM markers, write-conflict counter; `!txn\|` intents/locks; `!dist\|`, `!encryption\|` rows | **Never emitted.** They belong to the receiving cluster, not the data. The restore runbook seeds HLC/Raft state via the `.snap` token, not via FSM rows. |
 
 The middle row is what makes Phase 0b larger than "reverse the
