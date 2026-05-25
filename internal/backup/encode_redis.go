@@ -204,7 +204,12 @@ func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey
 		return errors.WithStack(err)
 	}
 	for _, ent := range entries {
-		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".bin") {
+		// Only regular .bin files. !IsRegular() skips directories,
+		// symlinks, and — the point of the guard — FIFOs / sockets /
+		// devices, which would otherwise reach io.ReadAll and block or
+		// misbehave (parity with openSidecarFile's non-regular refusal
+		// on the write side).
+		if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ".bin") {
 			continue
 		}
 		encoded := strings.TrimSuffix(ent.Name(), ".bin")
