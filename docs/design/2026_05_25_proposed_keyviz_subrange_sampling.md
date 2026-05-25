@@ -52,9 +52,12 @@ heatmap already keys rows by `Start`/`End`), the proto, or Raft/FSM.
   current `Observe` contract (single atomic load + map lookup + atomic
   adds).
 - Emit one `MatrixRow` per **non-empty** sub-bucket at `Flush`, with
-  `Start`/`End` narrowed to the sub-bucket bounds, so the existing
-  pivot + row-budget + SPA path renders finer rows with no structural
-  change.
+  `Start`/`End` narrowed to the sub-bucket bounds. The SPA's heatmap
+  rendering needs no structural change (it already keys rows by
+  `Start`/`End`), but the server-side **pivot must be re-keyed** from
+  bare `RouteID` to a composite `(RouteID, subBucket)` id, because
+  sub-rows of one route share its `RouteID` and would otherwise collide
+  in the pivot map — see §5.
 - Bound memory and payload: `K` is modest and configurable; the
   existing `MaxTrackedRoutes` coarsening and per-request row budget
   still cap totals.
@@ -112,47 +115,62 @@ lives in the bytes *after* that prefix. So:
    past the common prefix is enough resolution for `K` up to a few
    thousand. `W` is an internal constant, not a flag.
 
-2. **On the hot path** (`Observe`), with the key in hand:
-   - Read the same `[subPrefixLen, +W)` window of `key` big-endian into
-     `k` (bytes beyond the key's length read as `0x00`; a key shorter
-     than `subPrefixLen` clamps to bucket 0).
-   - `idx = K * (k - subStart) / subSpan`, computed as
-     `uint64` math, then **clamped to `[0, K-1]`** (keys at or past
-     `End`, or below `Start`, pin to the edge buckets rather than
-     escaping the array).
+2. **On the hot path** (`Observe`), with the key in hand, a single
+   shared helper `subBucketIndex(key, slot) int` (also used by `Flush`
+   for bounds reconstruction — see §4.3 — so the two paths can never
+   diverge) does:
+   - Read the `[subPrefixLen, +W)` window of `key` big-endian into `k`
+     (bytes beyond the key's length read as `0x00`; a key shorter than
+     `subPrefixLen` clamps to bucket 0).
+   - **Underflow guard first**: if `k <= subStart` return `0`; if
+     `k >= subEnd` return `K-1`. Only the strictly-interior case does
+     arithmetic, so `k - subStart` can never wrap.
+   - `idx = K * (k - subStart) / subSpan`, computed with an exact
+     128-bit intermediate via `math/bits`:
+     `hi, lo := bits.Mul64(K, k-subStart); idx, _ := bits.Div64(hi, lo, subSpan)`.
+     `bits.Div64` panics only when `hi >= subSpan`; the interior guard
+     guarantees `k - subStart < subSpan`, so `hi < K`, and `K` is
+     capped well below `subSpan` whenever `subSpan > 0` (the degenerate
+     `subSpan == 0` route is forced to `K=1` at register — §3.2 — and
+     never reaches this branch). A final clamp to `[0, K-1]` is a
+     belt-and-suspenders guard against the `k == subEnd` rounding edge.
    - `atomic.Add` into `slot.subBuckets[idx]`'s counter family.
 
-   No allocation, no lock, one extra multiply/divide and a handful of
-   byte reads versus today. The `128`-bit intermediate for
-   `K * (k - subStart)` is avoided by requiring `K ≤ 2^32` (enforced at
-   config parse) so the product fits a `uint64` whenever
-   `k - subStart < 2^32`; for larger spans we shift both operands right
-   by the same amount before multiplying (precomputed shift stored on
-   the slot). Exact arithmetic is unnecessary — bucket assignment only
-   needs to be monotone and stable.
+   No allocation, no lock; one `Mul64`+`Div64` and a handful of byte
+   reads versus today. `bits.Mul64`/`Div64` compile to a couple of
+   instructions and keep the math exact, so we drop the earlier
+   shift-and-approximate scheme entirely — bucket assignment is exact,
+   monotone, and stable.
 
 ### 3.2 Degenerate and unbounded bounds
 
 - **`Start == nil`** (first route / open low end): treat as all-`0x00`,
-  i.e. `subStart = 0`. Natural.
-- **`End == nil`** (last route / open high end): there is no finite
-  span to divide. Fallback: set `subSpan = 1 << (8*W)` *relative to
-  `subStart`* — i.e. bucket by the **high-order bits of
-  `key - subStart`** across the full window. This spreads keys over
-  `K` buckets order-preservingly under the assumption that real keys
-  stay within `W` bytes of variation past the prefix; keys far past
-  that pin to the top bucket. Documented as approximate for the
-  unbounded tail.
-- **`subEnd <= subStart`** (the `W`-byte window doesn't capture any
-  difference — e.g. `Start`/`End` differ only beyond `subPrefixLen+W`):
-  the route is treated as a **single bucket** (`K_effective = 1`) for
-  that slot. Correct and safe; it just means "this route's interesting
-  variation is past our resolution window," which a wider `W` or a
-  route split would resolve. Surfaced via a debug metric so we can tell
-  whether `W` is too small in practice.
+  i.e. `subStart = 0`. Natural — `0x00…` is the true low end of the
+  byte-order key space.
+- **`End == nil`** (last route / open high end): the route has **no
+  finite span to divide**, so it is kept as a **single sub-bucket**
+  (`K_effective = 1`) until a route split gives it a finite `End`.
+  This is the decision adopted from review (Open Q1): the earlier
+  "high-order bits over a `W`-byte window" fallback (a) had no finite
+  `subSpan` to divide by — `1 << (8*W)` with `W = 8` overflows
+  `uint64` to `0` and would divide-by-zero on the hot path — and
+  (b) introduced an observable discontinuity (the tail's sub-ranges
+  would shift the moment its heuristic span changed). A split is a
+  discrete event operators already understand; the hotspot-shard-split
+  machinery (`docs/design/2026_02_18_partial_hotspot_shard_split.md`)
+  is exactly what gives a hot tail a finite `End`, at which point the
+  route re-registers (§4.2) and gains real sub-buckets. No overflow,
+  no heuristic, no surprise.
+- **`subEnd <= subStart`** (the `W`-byte window captures no difference —
+  e.g. `Start`/`End` differ only beyond `subPrefixLen + W`): the route
+  is likewise a **single bucket** (`K_effective = 1`, `subSpan` left 0
+  and never used because the §3.1 guard short-circuits). It means "this
+  route's interesting variation is past our resolution window," which a
+  wider `W` or a route split resolves. Surfaced via a debug metric so
+  we can tell whether `W = 8` is too small in practice.
 
-These edge rules are the part most worth scrutinising in review;
-§9 Open Questions calls them out explicitly.
+Both single-bucket cases reduce that slot to today's exact route-level
+behaviour, so they are always safe fall-backs rather than error paths.
 
 ## 4. Sampler changes (`keyviz/`)
 
@@ -170,55 +188,128 @@ it for the `*Bytes` counters). This is a **semantic-touching signature
 change**: per CLAUDE.md, every caller of `Sampler.Observe` /
 `MemSampler.Observe` will be grep-audited so each passes the real key
 (not, say, a nil placeholder that would silently bucket all traffic
-into bucket 0). Known callers: `observeMutation` (`mut.Key`),
-`observeRead` ×2 (`key` is already the parameter). The nil-receiver and
-typed-nil no-op contract is preserved.
+into bucket 0). The full audit:
+
+- `ShardedCoordinator.observeMutation` — already holds `mut.Key`; pass
+  it through.
+- `ShardedCoordinator.observeRead` — **its own signature also changes**
+  from `observeRead(routeID uint64, keyLen int)` to
+  `observeRead(routeID uint64, key []byte)`, since it is the
+  intermediate helper that wraps `sampler.Observe`
+  (`kv/sharded_coordinator.go:1100`). Both of its call sites,
+  `LinearizableReadForKey` (`:800`) and `LeaseReadForKey` (`:822`),
+  already have the full `key` in scope and pass `len(key)` today, so
+  the fix is local. This intermediate helper is the easy one to miss —
+  calling it out explicitly so the audit doesn't stop at the two
+  RPC entry points.
+
+The nil-receiver and typed-nil no-op contract is preserved.
 
 ### 4.2 `routeSlot`
 
-Individual slots gain (all set once at `RegisterRoute`, immutable
-after publish — so the hot path reads them without a lock, same as
-`RouteID`):
+Individual slots gain (all set when the slot's range is established —
+see the re-registration note below — and read by the hot path without
+a lock):
 
 ```go
 subPrefixLen int
 subStart     uint64
-subSpan      uint64
-subShift     uint8            // overflow-avoidance shift (see §3.1)
-subBuckets   []subCounter     // len == K (1 for aggregate / degenerate)
+subEnd       uint64           // subStart + subSpan; the §3.1 guard reads it
+subSpan      uint64           // 0 ⇒ single-bucket slot (§3.2)
+subBuckets   []subCounter     // len == K (1 for aggregate / degenerate / unbounded-tail)
 ```
 
 `subCounter` holds the same four `atomic.Uint64` the slot holds today.
-For `K = 1` (flag default) and for aggregate / degenerate slots,
-`subBuckets` has length 1 and `bucketIndex` is hard-wired to 0, so the
-code path collapses to exactly today's behaviour with one extra
-indirection.
+For `K = 1` (flag default) and for aggregate / degenerate /
+unbounded-tail slots, `subBuckets` has length 1 and `subBucketIndex`
+short-circuits to 0, so the code path collapses to exactly today's
+behaviour with one extra indirection. The `subShift` field from the
+first draft is gone — `math/bits` (§3.1) makes the multiply/divide
+exact without it.
+
+**Immutability & re-registration.** For a stable route these fields
+are immutable after publish (same lock-free read contract as
+`RouteID`). The one mutation path is `reclaimRetiredSlot`: when a
+`RouteID` is removed and re-registered within the grace window, its
+`[Start, End)` may differ from before. That path **must recompute**
+`subPrefixLen` / `subStart` / `subEnd` / `subSpan` (and re-size
+`subBuckets`, zeroing counters) under the slot's `metaMu`, exactly
+where it already refreshes `Start` / `End` / `MemberRoutesTotal`.
+Skipping this would bucket the re-registered route's new key range into
+the stale sub-ranges of its previous incarnation — a silent
+correctness bug. Because the recompute happens under `metaMu` off the
+hot path while `Observe` reads these fields locklessly, the sub-bucket
+metadata is published atomically with the slot's new `[Start, End)`:
+an `Observe` either sees the whole old triple or the whole new one,
+never a mix (the precomputed window ints are plain values written under
+the lock and read after the `table` pointer load that already orders
+the publish).
 
 **Memory**: `K * 4 * 8` bytes per individual route. `K = 16` →
 512 B/route; at the default `MaxTrackedRoutes = 10_000` that is ~5 MB
 worst case (every route fully populated). Bounded by construction.
-§9 Q3 weighs eager (at register) vs lazy (CAS on first non-zero
-Observe) allocation; this doc proposes **eager** for hot-path
-simplicity and lock-freedom, with lazy as a follow-up if the 5 MB
-ceiling proves to matter.
+Decision (Open Q3, confirmed in review): **eager** allocation at
+register for hot-path simplicity and lock-freedom — lazy (CAS on first
+non-zero Observe) adds hot-path branches for negligible benefit at the
+target `K ≤ 16`.
 
 ### 4.3 `Flush`
 
 `appendDrainedRow` becomes a loop over the slot's `subBuckets`: for
 each sub-bucket with any non-zero counter, emit one `MatrixRow` whose
-`Start`/`End` are the **sub-bucket bounds** (derived by inverting the
-interpolation: `Start_i = key-space point at fraction i/K`,
-`End_i = point at (i+1)/K`, reconstructed from `subPrefixLen` +
-`subStart` + window). The parent `RouteID`, `RaftGroupID`,
-`LeaderTerm`, `Aggregate`, and member metadata are copied onto every
-sub-row so fan-out dedupe (`(bucketID, group, term, column)`) and the
-SPA's route attribution keep working. Idle sub-buckets are skipped, so
-a route with one hot sub-range emits one row, not `K`.
+`Start`/`End` are the **sub-bucket bounds**, reconstructed by inverting
+the §3.1 interpolation: bucket `i` spans
+`[subStart + i*subSpan/K, subStart + (i+1)*subSpan/K)` mapped back into
+the key byte space at offset `subPrefixLen`. To guarantee the sub-rows
+**tile the parent route exactly** (the "contiguous" property the
+heatmap advertises) despite integer truncation in the inverse:
 
-A new `SubBucket uint32` (or a derived `BucketID` suffix) distinguishes
-sub-rows of the same route within a column; see §5.
+- sub-bucket `0`'s `Start` is pinned to the route's actual `Start`
+  (not the reconstructed `subStart` window value, which dropped the
+  bytes past `subPrefixLen + W`);
+- sub-bucket `K-1`'s `End` is pinned to the route's actual `End`;
+- interior boundaries use the reconstructed value, and each bucket's
+  `Start` is set equal to the previous bucket's `End` so there are no
+  gaps or overlaps.
 
-## 5. Wire format & SPA
+The parent `RouteID`, `RaftGroupID`, `LeaderTerm`, `Aggregate`, and
+member metadata are copied onto every sub-row so fan-out dedupe
+(`(bucketID, group, term, column)`) and the SPA's route attribution
+keep working. Idle sub-buckets are skipped, so a route with one hot
+sub-range emits one row, not `K`.
+
+A `SubBucket uint32` field on `MatrixRow` (and the derived `BucketID`
+suffix, §5) distinguishes sub-rows of the same route within a column.
+Because `MatrixRow` is the shared shape behind both the JSON pivot and
+the gRPC `GetKeyVizMatrix` path, the new field is a struct addition
+that the gRPC/proto layer ignores for now; if the gRPC path later
+adopts sub-rows, `proto.KeyVizRow` gains the matching field then. This
+proposal does **not** change the proto (the field is unused on that
+path), but the dependency is flagged so the future proto edit isn't a
+surprise.
+
+## 5. Pivot re-keying, wire format & SPA
+
+### 5.1 Server-side pivot must key on `(RouteID, subBucket)` — required
+
+The single most important code change beyond the sampler is in the
+**pivot**. Both `pivotKeyVizColumns` (`internal/admin/keyviz_handler.go`,
+the `rowsByID map[uint64]*KeyVizRow` keyed on `mr.RouteID` around
+`:340`) and the gRPC twin `adapter.matrixToProto` collapse all
+`MatrixRow`s sharing a `RouteID` into one output row. With sub-rows,
+every sub-bucket of a route carries the **same `RouteID`**, so the
+current map would collide them — only the last sub-bucket seen per
+column would survive, silently dropping the others (Gemini HIGH).
+
+Fix: re-key the pivot map on the composite `(RouteID, SubBucket)` (a
+small struct key, or the `BucketID` string). Both the JSON pivot and
+`adapter.matrixToProto` must change together; they are intentionally
+kept as parallel implementations today, so this is a two-file edit with
+matching table-driven tests on each. The row-budget and Start-order
+sort that run after the pivot are unaffected (they already operate on
+the row list, not the map).
+
+### 5.2 Wire format
 
 The JSON `KeyVizRow` already carries `Start`/`End`; sub-rows simply
 have narrower bounds. To keep `BucketID` unique per row within a
@@ -228,6 +319,8 @@ gains a sub-range discriminator:
 - individual sub-row: `route:<id>#<subIdx>`
 - whole route (`K = 1`): `route:<id>` (unchanged)
 - virtual bucket: `virtual:<id>` (unchanged)
+
+### 5.3 SPA
 
 The SPA heatmap renders rows by `Start`/`End` and already supports an
 arbitrary number of rows under the row budget, so **no structural SPA
@@ -257,6 +350,24 @@ Threaded through `MemSamplerOptions` exactly like the existing
 `MaxTrackedRoutes` / `HistoryColumns` knobs (`buildKeyVizSampler` in
 `main.go`).
 
+**Interaction with the row budget.** Today `Flush` emits ≤1 row per
+slot. With sub-bucketing a single route can emit up to `K` rows, so the
+*worst-case* pre-budget row count rises from `MaxTrackedRoutes` to
+`MaxTrackedRoutes × K` (e.g. `10_000 × 16 = 160_000` rows materialised
+in a column before `applyKeyVizRowBudget` prunes to the per-request cap
+of 1024). Two consequences to document for operators:
+
+- The per-request `rows` budget (`keyVizRowBudgetCap`, 1024) now buys
+  roughly `budget / active_subbuckets_per_route` *routes* shown at full
+  resolution — i.e. raising `K` trades route breadth for intra-route
+  depth at a fixed payload size. The doc/flag help text should say so.
+- The intermediate 160k-row materialisation is bounded and transient
+  (one column build), but if it proves heavy, `Flush` can apply a
+  cheap per-slot top-sub-bucket cap before the global budget. Noted as
+  a follow-up, not required for the first cut — only non-empty
+  sub-buckets are emitted, and hot traffic concentrates in a few of
+  them, so the typical count is far below the worst case.
+
 ## 7. Backward compatibility & rollout
 
 - Flag defaults to `1`: existing deployments behave identically and
@@ -264,11 +375,19 @@ Threaded through `MemSamplerOptions` exactly like the existing
   0). No wire change for `K = 1` rows.
 - `Observe` signature change is internal (all callers in-tree); audited
   per §4.1.
-- Mixed fan-out clusters: a peer running `K = 1` returns route-level
-  rows, a peer running `K = 16` returns sub-rows; the aggregator merges
-  by `(bucketID, group, term, column)` and they simply coexist as
-  distinct rows. No peer needs to agree on `K`. (Worth a fan-out test —
-  §9 Q2.)
+- Mixed fan-out clusters (decision adopted from Open Q2): a peer
+  running `K = 1` emits `bucketID = route:42`, a peer running `K = 16`
+  emits `route:42#0 … route:42#15`. Because the aggregator dedupes by
+  `bucketID`, these **do not merge** — the route-level row and the
+  sub-rows **coexist as distinct rows** in the aggregate; the `K = 1`
+  row does not "win over" or absorb the sub-rows, and vice-versa. That
+  is the correct behaviour (they represent different granularities of
+  the same range), but it is surprising enough to (a) state explicitly
+  here and (b) lock down with a dedicated mixed-`K` fan-out test. The
+  intended operational posture is therefore a **uniform `K` across the
+  cluster**; mixed `K` is tolerated (no crash, no lost data) but
+  produces a visually doubled range until the rollout converges.
+  No peer needs to agree on `K` for correctness.
 - `make run` demo + a load generator can set `--keyvizKeyBucketsPerRoute`
   to demonstrate a hot sub-range filling in under one Step.
 
@@ -290,25 +409,31 @@ Threaded through `MemSamplerOptions` exactly like the existing
   Best added later as a **drill-down** when a hot cell is clicked —
   noted as future work, not in this proposal.
 
-## 9. Open questions (for review)
+## 9. Resolved decisions (from first review round)
 
-1. **Unbounded-tail bucketing (§3.2).** Is "high-order bits of
-   `key - subStart` over a `W`-byte window" the right fallback for the
-   last route's open `End`, or should the unbounded tail stay a single
-   row until a split gives it a finite `End`? Leaning toward the
-   single-row-until-split option for honesty if review prefers it.
-2. **`K` per peer in fan-out.** Confirm the merge tolerates peers with
-   different `K` (it should — rows are keyed by `BucketID` which now
-   embeds `#subIdx`). Add an explicit mixed-`K` fan-out test.
-3. **Eager vs lazy sub-bucket allocation (§4.2).** Eager keeps the hot
-   path lock-free and simple at a bounded ~5 MB worst case; lazy
-   (atomic.Pointer + CAS on first non-zero Observe) saves memory for
-   idle routes but adds hot-path branches. Proposing eager; flagging
-   for a perf opinion.
-4. **Window width `W = 8`.** Enough for most key shapes; routes whose
+The four questions opened in the first draft converged in review
+(Codex, Gemini, Claude) and are now decided; recorded here so the
+implementation has no ambiguity.
+
+1. **Unbounded-tail bucketing (§3.2): single row until split.** The
+   last route's open `End` stays one row until a route split gives it a
+   finite `End`. This is both honest (no heuristic discontinuity when
+   the tail's effective span changes) and what kills the
+   `1 << (8*W)` overflow / divide-by-zero entirely. Adopted.
+2. **Mixed-`K` fan-out (§7): coexist, don't merge.** Rows keyed by
+   `bucketID` (now embedding `#subIdx`) mean a `K = 1` row and the
+   `K = 16` sub-rows appear side by side rather than merging. Tolerated
+   for correctness; uniform `K` is the intended posture. A dedicated
+   mixed-`K` fan-out test is required.
+3. **Eager allocation (§4.2).** Allocate `subBuckets` at register.
+   At the target `K ≤ 16` the worst case is ~5 MB and the hot path
+   stays lock-free; lazy CAS allocation is not worth its hot-path
+   branches.
+4. **Fixed window `W = 8` (§3.1).** Not configurable. Routes whose
    distinguishing bytes sit past `subPrefixLen + 8` degrade to a single
-   bucket (§3.2). Is a configurable `W` worth it, or is the
-   single-bucket degradation + a debug metric acceptable?
+   bucket (§3.2) and are surfaced via a debug metric, which is an
+   adequate safety valve; a configurable `W` would complicate the
+   precompute for no clear operator benefit.
 
 ## 10. Self-review (per CLAUDE.md five lenses)
 
@@ -319,13 +444,19 @@ Threaded through `MemSamplerOptions` exactly like the existing
    lost counts on route churn is untouched (sub-buckets live inside
    the same slot lifecycle).
 2. **Concurrency / distributed** — hot path stays lockless: sub-bucket
-   metadata is immutable post-`RegisterRoute` (same contract as
-   `RouteID`/`Start`/`End`), counters are per-sub-bucket
-   `atomic.Uint64`, `Flush` drains with `atomic.Swap` exactly as today.
-   No new shared mutable state on `Observe`. Index computation reads
-   only immutable fields. Aggregate-bucket folding (which *does* mutate
-   metadata under `metaMu`) is excluded from sub-bucketing, so no new
-   `metaMu` interaction. Run `go test -race ./keyviz/...`.
+   metadata is immutable for the life of a slot's range, counters are
+   per-sub-bucket `atomic.Uint64`, `Flush` drains with `atomic.Swap`
+   exactly as today. The one mutation path is grace-window
+   re-registration (`reclaimRetiredSlot`), which recomputes the
+   sub-bucket fields under the slot's existing `metaMu` alongside the
+   `Start`/`End` refresh it already does (§4.2), so the new triple
+   publishes atomically with the new range — an `Observe` sees the
+   whole old or whole new range, never a mix. Aggregate-bucket folding
+   already mutates metadata under `metaMu` but is excluded from
+   sub-bucketing (aggregates stay single-bucket), so it adds no new
+   `metaMu` contention. Run `go test -race ./keyviz/...` plus the
+   register/remove churn cases. Mixed-`K` fan-out has its own test
+   (§9.2).
 3. **Performance** — per-`Observe` cost adds a bounded byte-window read
    + one multiply/divide + clamp; no allocation, no lock, no extra Raft
    round-trip (HLC path untouched). Memory bounded to `K * 4 * 8` B per
@@ -339,12 +470,19 @@ Threaded through `MemSamplerOptions` exactly like the existing
    same key lands in the same sub-bucket every Step (stable rows across
    columns — the matrix contract). Row budget + Start-order sort
    unchanged.
-5. **Test coverage** — new unit tests: `bucketIndex` order-preservation
-   + clamping (table-driven, incl. `Start==nil`, `End==nil`,
-   degenerate window); a `rapid` property test that `key1 <= key2 ⇒
+5. **Test coverage** — new unit tests: `subBucketIndex`
+   order-preservation + clamping + underflow guard (table-driven, incl.
+   `Start==nil`, `End==nil`→single-bucket, degenerate window,
+   `k == subEnd` edge); a `rapid` property test that `key1 <= key2 ⇒
    idx1 <= idx2` over random `[Start,End)` and keys; `Flush` emits one
-   row per non-empty sub-bucket with correct narrowed bounds; `K = 1`
-   round-trips identically to the pre-change snapshot (regression
-   pin); caller audit covered by existing coordinator tests plus a new
-   assertion that a hot sub-range shows up on a distinct row. Mixed-`K`
-   fan-out test per §9 Q2.
+   row per non-empty sub-bucket with bounds that **tile `[Start,End)`
+   exactly** (no gap/overlap; bucket-0 `Start == route Start`,
+   bucket-`K-1` `End == route End`); a **pivot collision** test that
+   two sub-rows sharing a `RouteID` survive as distinct output rows in
+   both `pivotKeyVizColumns` and `adapter.matrixToProto` (the Gemini
+   HIGH regression); a **grace-window re-registration** test that a
+   route re-registered with a different `[Start,End)` buckets into the
+   new range, not the stale one; `K = 1` round-trips identically to the
+   pre-change snapshot (regression pin); caller audit covered by
+   existing coordinator tests plus a new assertion that a hot sub-range
+   shows up on a distinct row. Mixed-`K` fan-out test per §9.2.
