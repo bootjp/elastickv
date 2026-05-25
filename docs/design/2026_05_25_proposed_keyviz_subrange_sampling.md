@@ -127,7 +127,9 @@ lives in the bytes *after* that prefix. So:
      arithmetic, so `k - subStart` can never wrap.
    - `idx = K * (k - subStart) / subSpan`, computed with an exact
      128-bit intermediate via `math/bits`:
-     `hi, lo := bits.Mul64(K, k-subStart); idx, _ := bits.Div64(hi, lo, subSpan)`.
+     `hi, lo := bits.Mul64(uint64(K), k-subStart); idx, _ := bits.Div64(hi, lo, subSpan)`
+     (`uint64(K)` cast shown explicitly — `K` is an `int`/`uint32`
+     config value while `bits.Mul64` takes `uint64`).
      `bits.Div64` panics only when `hi >= subSpan`; the interior guard
      guarantees `k - subStart < subSpan`, so `hi < K`, and `K` is
      capped well below `subSpan` whenever `subSpan > 0` (the degenerate
@@ -507,7 +509,7 @@ implementation has no ambiguity.
    `Start`/`End`/`MemberRoutes` under `metaMu`, but aggregates stay
    single-bucket, so sub-bucketing adds no new `metaMu` interaction.
    Run `go test -race ./keyviz/...` plus the register/remove churn
-   cases. Mixed-`K` fan-out has its own test (§9.2).
+   cases. Mixed-`K` fan-out has its own test (the §9 decision 2).
 3. **Performance** — per-`Observe` cost adds a bounded byte-window read
    + one multiply/divide + clamp; no allocation, no lock, no extra Raft
    round-trip (HLC path untouched). Memory bounded to `K * 4 * 8` B per
@@ -515,9 +517,9 @@ implementation has no ambiguity.
    gates the hot-path regression; flush cost rises with non-empty
    sub-buckets but is off the request path.
 4. **Data consistency** — sub-rows carry the parent route's
-   `(RaftGroupID, LeaderTerm)` unchanged, so the §9.1 canonical fan-out
-   dedupe and per-cell conflict detection operate identically at finer
-   granularity. Bucket assignment is deterministic and monotone, so the
+   `(RaftGroupID, LeaderTerm)` unchanged, so the parent design's §9.1
+   canonical fan-out dedupe and per-cell conflict detection operate
+   identically at finer granularity. Bucket assignment is deterministic and monotone, so the
    same key lands in the same sub-bucket every Step (stable rows across
    columns — the matrix contract). Row budget + Start-order sort
    unchanged.
@@ -532,8 +534,12 @@ implementation has no ambiguity.
    two sub-rows sharing a `RouteID` survive as distinct output rows in
    both `pivotKeyVizColumns` and `adapter.matrixToProto` (the Gemini
    HIGH regression); a **grace-window re-registration** test that a
-   route re-registered with a different `[Start,End)` buckets into the
-   new range, not the stale one; `K = 1` round-trips identically to the
-   pre-change snapshot (regression pin); caller audit covered by
-   existing coordinator tests plus a new assertion that a hot sub-range
-   shows up on a distinct row. Mixed-`K` fan-out test per §9.2.
+   route re-registered with a different `[Start,End)` **continues to
+   bucket into its original (stale) sub-ranges for the remainder of the
+   grace window** — verifying the §4.2 contract (cosmetic
+   misattribution, but no lost or double-counted counts) rather than
+   asserting the layout is recomputed (which §4.2 deliberately does
+   *not* do); `K = 1` round-trips identically to the pre-change
+   snapshot (regression pin); caller audit covered by existing
+   coordinator tests plus a new assertion that a hot sub-range shows up
+   on a distinct row. Mixed-`K` fan-out test per the §9 decision 2.
