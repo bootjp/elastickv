@@ -135,7 +135,7 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, 1, "", enableMutators, engine)
+	registerEncryptionAdminServer(gs, 1, "", enableMutators, engine, nil)
 	go func() { _ = gs.Serve(listener) }()
 	t.Cleanup(gs.Stop)
 	conn, err := grpc.NewClient(
@@ -161,7 +161,7 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 
 func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, 1, "", false, nil)
+	registerEncryptionAdminServer(gs, 1, "", false, nil, nil)
 	info := gs.GetServiceInfo()
 	if _, ok := info["EncryptionAdmin"]; !ok {
 		var registered []string

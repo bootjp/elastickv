@@ -1460,6 +1460,7 @@ func startRaftServers(
 	// linter does not complain.
 	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled()
+	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
 	for _, rt := range runtimes {
 		baseOpts := internalutil.GRPCServerOptions()
 		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
@@ -1500,7 +1501,7 @@ func startRaftServers(
 		// per-shard loop. Each shard's own engine is the
 		// Proposer + LeaderView so the mutator proposes through
 		// the correct Raft group.
-		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath, enableMutators, rt.engine)
+		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath, enableMutators, rt.engine, encryptionCapabilityFanout)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
