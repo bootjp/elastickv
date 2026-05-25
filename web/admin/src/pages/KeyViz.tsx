@@ -226,13 +226,7 @@ function Heatmap({ matrix }: HeatmapProps) {
             onMouseLeave={onLeave}
             style={{ display: "block", width, height }}
           />
-          <ConflictOverlay
-            rows={matrix.rows}
-            cellH={cellH}
-            cellW={cellW}
-            width={width}
-            columnCount={matrix.column_unix_ms.length}
-          />
+          <ConflictOverlay rows={matrix.rows} cellH={cellH} cellW={cellW} width={width} />
           <TimeAxis columnUnixMs={matrix.column_unix_ms} cellW={cellW} />
         </div>
       )}
@@ -294,7 +288,6 @@ interface ConflictOverlayProps {
   cellH: number;
   cellW: number;
   width: number;
-  columnCount: number;
 }
 
 interface ConflictRect {
@@ -303,7 +296,7 @@ interface ConflictRect {
   w: number;
 }
 
-function ConflictOverlay({ rows, cellH, cellW, width, columnCount }: ConflictOverlayProps) {
+function ConflictOverlay({ rows, cellH, cellW, width }: ConflictOverlayProps) {
   const rects = useMemo(() => {
     const out: ConflictRect[] = [];
     for (let i = 0; i < rows.length; i++) {
@@ -326,11 +319,11 @@ function ConflictOverlay({ rows, cellH, cellW, width, columnCount }: ConflictOve
       } else if (row.conflict) {
         // Legacy server: only the row-level flag is available, so fall
         // back to hatching the entire row across all columns.
-        out.push({ x: 0, y: i * cellH, w: columnCount * cellW });
+        out.push({ x: 0, y: i * cellH, w: width });
       }
     }
     return out;
-  }, [rows, cellH, cellW, columnCount]);
+  }, [rows, cellH, cellW, width]);
   if (rects.length === 0) return null;
   const totalH = rows.length * cellH;
   return (

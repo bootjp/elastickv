@@ -203,6 +203,8 @@ func TestMergeKeyVizMatricesGroupTermConflictWithinSameTerm(t *testing.T) {
 	require.Equal(t, []uint64{55}, merged.Rows[0].Values, "within-term disagreement keeps the larger value")
 	require.True(t, merged.Rows[0].Conflict,
 		"§9.1: within-(group, term) disagreement must raise the conflict flag — Raft invariant says one leader per term per group, so disagreement signals a real divergence operators need to see")
+	require.Equal(t, []bool{true}, merged.Rows[0].Conflicts,
+		"the per-cell slice must flag the single conflicting column, not just the row-level OR")
 }
 
 // TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm pins the
@@ -234,6 +236,8 @@ func TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm(t *testing.T) {
 	require.Equal(t, []uint64{50}, merged.Rows[0].Values,
 		"unknown-term fallback returns max-merge (50), not sum (80) — summing across an unknown term risks double-counting overlapping windows")
 	require.True(t, merged.Rows[0].Conflict, "fallback path raises conflict when ≥2 distinct non-zero values were seen")
+	require.Equal(t, []bool{true}, merged.Rows[0].Conflicts,
+		"the per-cell slice must flag the conflicting column under the fallback path too")
 }
 
 // TestMergeKeyVizMatricesFallbackPreservesKnownTermWinnerIdentity
