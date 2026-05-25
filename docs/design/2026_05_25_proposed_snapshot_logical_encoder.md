@@ -136,6 +136,44 @@ The `last_commit_ts` written into both the file header and every
 key's invTS is the same value the decoder will read back, so the
 self-test (§"Round-trip self-test") is exact.
 
+**`last_commit_ts` is a 64-bit HLC value, not Unix-ms.** It is the
+same encoding the live store carries (`store/lsm_store.go`
+`lastCommitTS`): a 48-bit physical half (Unix-ms) in the upper bits
+and a 16-bit logical counter in the lower bits (CLAUDE.md "Timestamp
+Oracle"). The encoder reads it verbatim from `MANIFEST.json` and
+writes it verbatim into the file header and every invTS — it does not
+reinterpret or rescale it.
+
+**`--last-commit-ts T` override semantics.** The override exists only
+for the rare "the dump's recorded ceiling is too low for the target
+cluster's HLC" recovery case; **it is forbidden to diverge from the
+manifest value by default**, and when supplied it is applied as a
+single atomic substitution everywhere `last_commit_ts` appears:
+
+- The chosen `T` (a 64-bit HLC value, same encoding as above)
+  **replaces** `manifest.last_commit_ts` as the source for *both* the
+  EKVPBBL1 header *and* every key's `invTS = ^T`. There is never a
+  state where the header and the per-key suffix disagree — the whole
+  point of the uniform-stamping rule (above) is preserved.
+- **Validation (fail-closed):** the encoder rejects `T <
+  manifest.last_commit_ts`. A lower ceiling would seed the restored
+  node's HLC below timestamps already durable in the dump, letting a
+  post-restart leader re-issue a ts ≤ a restored row's commit ts —
+  the exact HLC-ceiling regression the invariant forbids. `T ≥
+  manifest.last_commit_ts` is the only accepted direction (raising the
+  ceiling is always safe). Equality is the default (no override).
+- **Self-test (§"Round-trip self-test") compares against the
+  effective `T`, not the manifest value.** The round-trip re-decode
+  reads `T` back as the dump's `last_commit_ts`, so the comparison is
+  exact when the encoder also stamps `MANIFEST.last_commit_ts := T` in
+  the round-trip's intermediate manifest. (Per-key `invTS` is
+  discarded by decode, so only the header value participates in the
+  comparison — and it is `T` on both sides.)
+
+The directory tree records no per-key write timestamp, so there is no
+*per-key* monotonicity check to perform; the single ceiling check
+above is the complete monotonicity guarantee.
+
 ## Internal-index reconstruction
 
 This is the load-bearing decision. The decoder partitions internal
@@ -290,10 +328,11 @@ tests for that adapter):
 5. **SQS** — queue + messages + **side-record derivation decision
    gate**.
 6. **CLI** — `cmd/elastickv-snapshot-encode` flag parsing
-   (`--input`, `--output`, optional `--last-commit-ts` override),
-   `ENCODE_INFO.json` provenance, end-to-end test that loads the
-   output into a fresh single-node cluster and reads back every
-   adapter's data.
+   (`--input`, `--output`, optional `--last-commit-ts` override with
+   the fail-closed `T ≥ manifest.last_commit_ts` semantics from
+   §"MVCC re-encoding"), `ENCODE_INFO.json` provenance, end-to-end
+   test that loads the output into a fresh single-node cluster and
+   reads back every adapter's data.
 
 Each milestone follows the project convention: a review-found defect
 gets a failing test first, then the fix, in the same PR.
