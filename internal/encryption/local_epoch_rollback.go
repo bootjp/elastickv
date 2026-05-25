@@ -95,7 +95,7 @@ func CheckLocalEpochRollback(
 	sidecarLocalEpoch uint16,
 	storageEnvelopeActive bool,
 ) error {
-	key := RegistryKey(activeStorageDEKID, uint16(fullNodeID&nodeIDMask)) //nolint:gosec // masked to 16 bits; matches applier.go convention
+	key := RegistryKey(activeStorageDEKID, NodeID16(fullNodeID))
 	rawVal, ok, err := registry.GetRegistryRow(key)
 	if err != nil {
 		return pkgerrors.Wrapf(err,

@@ -56,7 +56,7 @@ func CheckNodeIDCollision(fullNodeIDs []uint64) error {
 	// here keeps the primitive correct under any input ordering).
 	seen := make(map[uint16]uint64, len(fullNodeIDs))
 	for _, fnid := range fullNodeIDs {
-		nodeID := uint16(fnid & nodeIDMask) //nolint:gosec // masked to 16 bits; matches applier.go/encryption_admin.go convention
+		nodeID := NodeID16(fnid)
 		prev, exists := seen[nodeID]
 		if !exists {
 			seen[nodeID] = fnid

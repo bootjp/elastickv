@@ -175,6 +175,18 @@ var (
 	// to participate.
 	ErrLocalEpochExhausted = errors.New("encryption: active DEK has reached local_epoch=0xFFFF saturation; refusing to start (rotate the affected DEK via `encryption rotate-dek` before the next startup or risk GCM nonce reuse — see §4.1)")
 
+	// ErrWriteCountExhausted is returned by DeterministicNonceFactory.Next
+	// when the 64-bit §4.1 write_count counter wraps within a single
+	// process load. A wrap re-issues write_count=1 under the same
+	// (node_id, local_epoch), recycling every GCM nonce already
+	// produced this load under the active DEK — catastrophic. The
+	// boundary is unreachable in any realistic deployment (2^64 ≈
+	// 1.8e19 writes per load), but the factory fails closed rather
+	// than silently wrapping. Recovery is a process restart, which
+	// bumps local_epoch (BumpLocalEpoch) and resets write_count to a
+	// fresh, non-overlapping range.
+	ErrWriteCountExhausted = errors.New("encryption: nonce write_count exhausted (uint64 wrap) within a process load; restart to bump local_epoch — see §4.1")
+
 	// ErrSidecarBehindRaftLog is the §9.1 startup-refusal guard
 	// raised when the sidecar's raft_applied_index is behind the
 	// raftengine's persisted applied index AND the gap covers any

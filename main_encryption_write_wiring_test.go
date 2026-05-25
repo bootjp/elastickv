@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -130,5 +131,20 @@ func TestPrepareStorageNonceEpoch_ActiveDEK_HydratesAndBumps(t *testing.T) {
 	}
 	if sc.Keys["3"].LocalEpoch != 7 {
 		t.Errorf("persisted epoch = %d, want 7", sc.Keys["3"].LocalEpoch)
+	}
+}
+
+func TestPrepareStorageNonceEpoch_SaturatedEpoch_RefusesWithExhausted(t *testing.T) {
+	t.Parallel()
+	// A storage DEK already at the 0xFFFF ceiling must refuse the
+	// bump (the ErrLocalEpochExhausted log + error path), so wiring
+	// fails closed rather than wrapping the epoch to 0.
+	path := writeActiveStorageSidecar(t, 0xFFFF)
+	_, err := prepareStorageNonceEpoch(path, wiringFakeKEK{}, encryption.NewKeystore(), encryption.NewStateCache())
+	if err == nil {
+		t.Fatal("expected error from saturated local_epoch, got nil")
+	}
+	if !errors.Is(err, encryption.ErrLocalEpochExhausted) {
+		t.Errorf("error not marked ErrLocalEpochExhausted: %v", err)
 	}
 }

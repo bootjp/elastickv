@@ -403,7 +403,7 @@ func (a *Applier) bootstrapAndRotationConfigured() bool {
 // the gate, or in a forensic / corruption scenario) still halts
 // rather than silently advancing setApplied.
 func (a *Applier) ApplyRegistration(p fsmwire.RegistrationPayload) error {
-	key := RegistryKey(p.DEKID, uint16(p.FullNodeID&nodeIDMask)) //nolint:gosec // masked to 16 bits; G115 cannot trace the bitwise narrowing
+	key := RegistryKey(p.DEKID, NodeID16(p.FullNodeID))
 	existing, ok, err := a.registry.GetRegistryRow(key)
 	if err != nil {
 		return errors.Wrap(err, "applier: get registry row")

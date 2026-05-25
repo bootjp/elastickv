@@ -212,7 +212,48 @@ hydrate+bump is gated on an active DEK:
   write_count, distinct epochs); main-wiring smoke test that a
   non-bootstrapped binary stays cleartext.
 
+## 4a. Review-driven decisions (PR #826 round 1)
+
+- **Epoch bump must precede engine replay (codex P2).** The bump is
+  performed during `buildEncryptionWriteWiring`, *before*
+  `buildShardGroups` opens the engines and *before*
+  `chainEncryptionStartupGuard` runs the §9.1 `ErrSidecarBehindRaftLog`
+  gap guard. Reviewer asked to delay the bump until after the guards
+  pass (so a refused startup does not consume an epoch). This is
+  **intentionally not done**: etcd/raft replay re-applies committed-
+  but-unpersisted entries through `kvFSM.Apply → ApplyMutationsRaft →
+  encryptForKey → nonceFactory.Next()`, so replay issues storage
+  nonces, and replay happens during engine open inside
+  `buildShardGroups` — before the gap guard can read the engine's
+  applied index. Those replay nonces MUST carry the bumped epoch, or
+  they collide with the previous load's epoch range. Moving the bump
+  after the gap guard would trade a bounded, recoverable
+  wasted-epoch-on-repeated-failed-startup (65,536 budget, 256-restart
+  warning cushion, rotate-dek recovery) for an unbounded
+  nonce-reuse-during-replay hazard. The wasted-epoch case only arises
+  when the sidecar is already behind the Raft log — itself a recovery
+  scenario where a rotate-dek is acceptable.
+- **write_count overflow fails closed (claude moderate).**
+  `DeterministicNonceFactory.Next` returns `ErrWriteCountExhausted` on
+  the 2^64 wrap rather than silently recycling `write_count=1`.
+  Unreachable in practice; recovery is a restart (bumps local_epoch).
+- **NodeID16 centralisation completed (claude moderate).** All node_id
+  narrowing code sites (`applier.go`, `local_epoch_rollback.go`,
+  `node_id_collision.go`) now call `encryption.NodeID16`; the lone
+  gosec-suppressed conversion lives inside the helper.
+
 ## 5. Open questions for review
+
+0. **Redundant KEK unwrap at startup (gemini medium, deferred).**
+   `HydrateKeystoreFromSidecar` re-unwraps every wrapped DEK that
+   `CheckStartupGuards` already unwrapped to verify the KEK. For the
+   file-mode KEK (the only provider today) the unwrap is a local AES
+   operation, so the cost is negligible. Once Stage 9 lands KMS
+   providers (network round-trips per unwrap) this doubles startup
+   KMS calls; the fix is to have the guard phase retain the unwrapped
+   DEKs (or populate the keystore during verification), which crosses
+   the guard/hydration contract boundary. Tracked for the Stage 9 KMS
+   work rather than this PR.
 
 1. Should `BumpLocalEpoch` also bump the **raft** DEK's epoch, or only
    the storage DEK? (Raft envelope is §4.2; this PR wires only the

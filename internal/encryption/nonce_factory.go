@@ -3,6 +3,8 @@ package encryption
 import (
 	"encoding/binary"
 	"sync/atomic"
+
+	"github.com/cockroachdb/errors"
 )
 
 // DeterministicNonceFactory is the production §4.1 storage-envelope
@@ -54,10 +56,22 @@ func NewDeterministicNonceFactory(nodeID, localEpoch uint16) *DeterministicNonce
 // write_count — keeping the nonce space disjoint from any future
 // scheme that might want write_count=0 as a sentinel. The atomic add
 // makes Next safe for concurrent callers.
+//
+// Overflow: atomic.Uint64.Add wraps silently at 2^64. A wrap returns
+// the value 0 (the pre-increment all-ones value plus one), which
+// would recycle write_count=1.. under the same (node_id, local_epoch)
+// — a catastrophic GCM nonce reuse. Next fails closed with
+// ErrWriteCountExhausted on the wrapping call instead of emitting the
+// reused nonce. The boundary is unreachable in practice (2^64 writes
+// per process load); recovery is a restart, which bumps local_epoch.
 func (f *DeterministicNonceFactory) Next() ([NonceSize]byte, error) {
+	wc := f.writes.Add(1)
+	if wc == 0 {
+		return [NonceSize]byte{}, errors.WithStack(ErrWriteCountExhausted)
+	}
 	var n [NonceSize]byte
 	binary.BigEndian.PutUint16(n[0:2], f.nodeID)
 	binary.BigEndian.PutUint16(n[2:4], f.localEpoch)
-	binary.BigEndian.PutUint64(n[4:12], f.writes.Add(1))
+	binary.BigEndian.PutUint64(n[4:12], wc)
 	return n, nil
 }
