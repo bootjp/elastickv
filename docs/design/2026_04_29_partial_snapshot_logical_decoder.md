@@ -1,8 +1,16 @@
 # Snapshot ↔ Logical-Format Decoder (Phase 0)
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-04-29
+
+> **Lifecycle (2026-05-25):** Phase 0a (decoder) has fully shipped —
+> `internal/backup/` + `cmd/elastickv-snapshot-decode` (PRs #790,
+> #791, #792, #806, #810). Phase 0b (encoder) is specified in detail
+> in `2026_05_25_proposed_snapshot_logical_encoder.md` and is not yet
+> implemented. Phase 0c (operator integration) is open. This doc
+> remains the format owner; the encoder doc owns the reverse-direction
+> wire-format reconstruction.
 
 ## Background
 
