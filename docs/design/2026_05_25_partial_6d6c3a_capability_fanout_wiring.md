@@ -34,7 +34,8 @@ wire-format change.
     `rt.engine.Configuration(ctx)` and map each `raftengine.Server`
     to an `admin.RouteMember{FullNodeID: etcd.DeriveNodeID(srv.ID),
     Address: srv.Address}`, splitting on `srv.Suffrage`
-    (`SuffrageVoter` → Voters, else Learners) into one
+    (`SuffrageLearner` → Learners, else → Voters, so empty/unannotated
+    suffrage counts as a voter per raftengine's convention) into one
     `admin.RouteGroup{GroupID: rt.spec.id}`. The §4.1 contract is
     "every (voter ∪ learner) of **every** Raft group", so the
     snapshot spans **all** runtimes, not just the cutover RPC's group.

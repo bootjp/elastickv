@@ -111,7 +111,7 @@
   all groups + a `DialFunc` over a dedicated `kv.GRPCConnCache`),
   wired into the EnableStorageEnvelope server via
   `WithEncryptionAdminCapabilityFanout` gated on encryption mutators.
-  See [`2026_05_25_proposed_6d6c3a_capability_fanout_wiring.md`](2026_05_25_proposed_6d6c3a_capability_fanout_wiring.md).
+  See [`2026_05_25_partial_6d6c3a_capability_fanout_wiring.md`](2026_05_25_partial_6d6c3a_capability_fanout_wiring.md).
 
 ## Open milestones
 

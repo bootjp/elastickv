@@ -99,6 +99,9 @@ type groupConfigSource struct {
 func capabilityRouteSnapshot(ctx context.Context, runtimes []*raftGroupRuntime) (admin.RouteSnapshot, error) {
 	sources := make([]groupConfigSource, 0, len(runtimes))
 	for _, rt := range runtimes {
+		if rt == nil {
+			continue
+		}
 		eng := rt.snapshotEngine()
 		if eng == nil {
 			continue
