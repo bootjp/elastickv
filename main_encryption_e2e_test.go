@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/store"
 )
 
@@ -28,8 +29,17 @@ import (
 const (
 	e2eStorageDEKID uint32 = 7
 	e2eRaftDEKID    uint32 = 8
-	e2eNodeID       uint64 = 0xAAAA
 )
+
+// e2eNodeID is the proposer's full node id used for the writer-registry
+// rows. It is derived from the same raftID ("n1") the fixture passes to
+// buildEncryptionWriteWiring, so the registry identity matches the
+// DeterministicNonceFactory's node_id (NodeID16(DeriveNodeID("n1"))).
+// Hardcoding an unrelated constant here would pass today (the applier
+// validates DEKID, not FullNodeID) but mislead the Stage 7
+// registration-before-first-write gate, which must confirm the nonce
+// factory's node_id has a registry row.
+var e2eNodeID = etcdraftengine.DeriveNodeID("n1")
 
 func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 	t.Parallel()
@@ -153,7 +163,11 @@ func assertEncryptedAtRest(t *testing.T, ctx context.Context, pebbleDir string) 
 	if err != nil {
 		t.Fatalf("reopen cipher-less store: %v", err)
 	}
-	defer func() { _ = plainStore.Close() }()
+	defer func() {
+		if err := plainStore.Close(); err != nil {
+			t.Errorf("close cipher-less store: %v", err)
+		}
+	}()
 
 	switch _, err := plainStore.GetAt(ctx, []byte("after"), 120); {
 	case err == nil:
