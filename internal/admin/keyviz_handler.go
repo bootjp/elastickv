@@ -76,13 +76,13 @@ type KeyVizMatrix struct {
 // merge disagreement. For writes the predicate fires when ≥2 sources
 // reported different non-zero values for the SAME
 // (bucket, raft_group_id, leader_term, column) tuple — a Raft
-// invariant violation (at most one leader per term per group), so
-// the SPA hatches the row. Phase 2-C+ PR-3c upgraded the merge from
+// invariant violation (at most one leader per term per group). It is
+// the OR of Conflicts[] and stays on the wire as the coarse signal an
+// older SPA hatches the whole row from; newer clients prefer the
+// per-cell Conflicts slice. Phase 2-C+ PR-3c upgraded the merge from
 // the Phase 2-C row-level §4.2 max-merge to the canonical §9.1
-// per-cell (group, term)-keyed dedupe + sum-across-terms; the
-// row-level Conflict flag stays as the coarse SPA signal and a
-// per-cell `Conflicts []bool` is deferred to a future wire-format
-// extension.
+// per-cell (group, term)-keyed dedupe + sum-across-terms; PR-3d
+// surfaces that per-cell conflict bit on the wire via Conflicts[].
 type KeyVizRow struct {
 	BucketID          string   `json:"bucket_id"`
 	Start             []byte   `json:"start"`
@@ -93,6 +93,15 @@ type KeyVizRow struct {
 	RouteCount        uint64   `json:"route_count"`
 	Values            []uint64 `json:"values"`
 	Conflict          bool     `json:"conflict,omitempty"`
+	// Conflicts[j] is true when fan-out merge saw ≥2 sources report
+	// different non-zero values for the same
+	// (bucket, raft_group_id, leader_term, column j) tuple, so the SPA
+	// can hatch the individual cell rather than the whole row. Allocated
+	// lazily and only on the write path: nil whenever the row had no
+	// conflict (single-node, no fan-out, legacy server, or a cleanly
+	// merged row) so omitempty keeps it off the wire; otherwise
+	// len == len(Values). Conflict is the OR of this slice.
+	Conflicts []bool `json:"conflicts,omitempty"`
 	// RaftGroupIDs[j] and LeaderTerms[j] carry the route's Raft
 	// identity at the time column j was flushed (parallel to
 	// Values[]). Phase 2-C+ fan-out uses

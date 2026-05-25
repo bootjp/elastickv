@@ -108,10 +108,10 @@ type FanoutNodeStatus struct {
 //
 //   - Reads / read_bytes: sum across nodes (each node served distinct
 //     follower reads).
-//   - Writes / write_bytes: max across nodes; when the per-cell values
-//     disagree we set Conflict=true on the row (best-effort dedup
-//     during a leadership flip; the canonical (raftGroupID, leaderTerm)
-//     dedup lands in Phase 2-C+ when we extend the wire format).
+//   - Writes / write_bytes: §9.1 canonical (raftGroupID, leaderTerm)
+//     dedupe; when two sources disagree within the same (group, term,
+//     column) we set Conflicts[column]=true (and the row-level OR
+//     Conflict) so the SPA can hatch the affected cell.
 type KeyVizFanout struct {
 	self      string
 	peers     []string
@@ -475,8 +475,9 @@ func buildKeyVizPeerURL(peer string, params keyVizParams) (string, error) {
 //     max within the same (group, term) (canonical Raft invariant:
 //     at most one leader per term per group), then SUM across
 //     distinct LeaderTerm values for the same (group, column).
-//     Surface conflict=true at the row level when ≥2 sources
-//     disagree within the SAME (group, term, column). Fall back to
+//     Surface Conflicts[column]=true (and the row-level OR Conflict)
+//     when ≥2 sources disagree within the SAME (group, term, column).
+//     Fall back to
 //     legacy max-merge (§4.2) for any cell where at least one source
 //     reports a zero/unknown identity (RaftGroupID=0 or
 //     LeaderTerm=0) so a legacy peer that doesn't yet emit the
@@ -716,9 +717,9 @@ func (c *cellMergeAcc) recordTermContribution(key termKey, value uint64) {
 // resolveRowMergeAcc materialises a KeyVizRow from the accumulator.
 // For reads: cell.sum + last identity. For writes: either §9.1 sum
 // across (group, term) or fallback max-merge when hasUnknownTerm.
-// Sets row-level Conflict to any-cell-saw-conflict — Phase 2-C+
-// PR-3c keeps the wire-level conflict at row granularity; future
-// PR-3d may promote it to per-cell.
+// The write path stamps per-cell Conflicts[j] (Phase 2-C+ PR-3d) and
+// keeps row-level Conflict as their OR so an older SPA that only reads
+// `conflict` still hatches the whole row.
 func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 	width := len(acc.cells)
 	row := KeyVizRow{
@@ -738,6 +739,14 @@ func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 		if useGroupTermDedupe {
 			row.Values[j], row.RaftGroupIDs[j], row.LeaderTerms[j] = c.resolveWrite()
 			if c.hasConflict() {
+				// Allocate Conflicts lazily so a clean row keeps it nil
+				// and `json:"conflicts,omitempty"` omits it — otherwise
+				// every merged write row would serialize a full
+				// [false,...] array and balloon the wire payload.
+				if row.Conflicts == nil {
+					row.Conflicts = make([]bool, width)
+				}
+				row.Conflicts[j] = true
 				row.Conflict = true
 			}
 		} else {
