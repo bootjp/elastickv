@@ -107,7 +107,13 @@ func newE2EEncryptionFixture(t *testing.T, sidecarPath, pebbleDir string) (store
 		t.Fatalf("NewPebbleStore: %v", err)
 	}
 	var closeOnce sync.Once
-	closeStore := func() { closeOnce.Do(func() { _ = st.Close() }) }
+	closeStore := func() {
+		closeOnce.Do(func() {
+			if err := st.Close(); err != nil {
+				t.Errorf("close encrypted store: %v", err)
+			}
+		})
+	}
 	t.Cleanup(closeStore)
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
