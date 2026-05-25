@@ -602,6 +602,14 @@ func (e *RedisEncoder) handleJSONEntry(root *os.Root, ent os.DirEntry, ext strin
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	// Re-check regularity on the OPEN fd, not the (stale) ReadDir
+	// entry type: a FIFO/device swapped in between ReadDir and Open
+	// would pass ent.Type().IsRegular() yet hand attacker-controlled
+	// bytes (a reader-attached FIFO) to the decoder. The post-open
+	// fstat is authoritative (claude review on PR #831).
+	if !info.Mode().IsRegular() {
+		return errors.Wrapf(ErrRedisEncodeNotRegular, "%s (mode=%s)", ent.Name(), info.Mode())
+	}
 	if err := refuseHardLink(info, ent.Name()); err != nil {
 		return err
 	}
