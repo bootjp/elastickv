@@ -3,6 +3,8 @@ package backup
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -11,6 +13,51 @@ import (
 
 	"github.com/cockroachdb/errors"
 )
+
+// fakeRegularDirEntry is an os.DirEntry that LIES about its type,
+// reporting a regular file regardless of the real on-disk object. It
+// lets a unit test drive handleJSONEntry past the pre-open
+// ent.Type().IsRegular() check so the post-open fstat guard can be
+// exercised deterministically (simulating a ReadDir-vs-Open TOCTOU
+// without an actual race).
+type fakeRegularDirEntry struct{ name string }
+
+func (f fakeRegularDirEntry) Name() string               { return f.name }
+func (f fakeRegularDirEntry) IsDir() bool                { return false }
+func (f fakeRegularDirEntry) Type() fs.FileMode          { return 0 } // 0 == regular
+func (f fakeRegularDirEntry) Info() (fs.FileInfo, error) { return nil, errors.New("unused") }
+
+// TestHandleJSONEntryRejectsNonRegularAfterOpen pins the post-open
+// regularity guard: a ReadDir entry that claims to be a regular .json
+// file but actually resolves to a directory on open is rejected with
+// ErrRedisEncodeNotRegular, and the callback never runs. This is the
+// deterministic stand-in for the FIFO-swap TOCTOU the guard defends
+// against (a directory opens without blocking, unlike a reader-less
+// FIFO).
+func TestHandleJSONEntryRejectsNonRegularAfterOpen(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// A directory named like a regular collection file.
+	if err := os.MkdirAll(filepath.Join(dir, "x.json"), 0o755); err != nil {
+		t.Fatalf("mkdir x.json: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+
+	e := NewRedisEncoder(dir, 0)
+	called := false
+	err = e.handleJSONEntry(root, fakeRegularDirEntry{name: "x.json"}, ".json",
+		func(_ []byte, _ io.Reader) error { called = true; return nil })
+	if !errors.Is(err, ErrRedisEncodeNotRegular) {
+		t.Fatalf("handleJSONEntry err = %v, want ErrRedisEncodeNotRegular", err)
+	}
+	if called {
+		t.Fatal("callback must not run for a non-regular open target")
+	}
+}
 
 // buildHashJSON constructs a hashes/<k>.json body in the exact shape
 // marshalHashJSON emits (fields as an array of binary-envelope
@@ -612,6 +659,9 @@ func TestRedisEncodeStreamEmptyRoundTripViaDecode(t *testing.T) {
 	got, meta := readStreamEntries(t, out, enc)
 	if len(got) != 0 {
 		t.Fatalf("got %d entries, want 0", len(got))
+	}
+	if !meta.Meta {
+		t.Fatal("decoded stream missing the _meta terminator line")
 	}
 	if meta.Length != 0 {
 		t.Fatalf("meta.length = %d, want 0", meta.Length)
