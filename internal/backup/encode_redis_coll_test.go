@@ -449,6 +449,176 @@ func TestRedisEncodeZSetNoTTLRoundTripViaDecode(t *testing.T) {
 	}
 }
 
+// streamTestEntry is a test stream entry: an ID plus ordered
+// (name,value) field pairs.
+type streamTestEntry struct {
+	id     string
+	fields [][2]string
+}
+
+// buildStreamJSONL constructs a streams/<k>.jsonl body: one entry line
+// per entry then the _meta terminator line, matching marshalStreamJSONL.
+func buildStreamJSONL(t *testing.T, entries []streamTestEntry, lastMs, lastSeq uint64, expireMs *uint64) []byte {
+	t.Helper()
+	type fieldRec struct {
+		Name  json.RawMessage `json:"name"`
+		Value json.RawMessage `json:"value"`
+	}
+	var buf bytes.Buffer
+	for _, e := range entries {
+		recs := make([]fieldRec, 0, len(e.fields))
+		for _, f := range e.fields {
+			nameJSON, err := marshalRedisBinaryValue([]byte(f[0]))
+			if err != nil {
+				t.Fatalf("marshal name: %v", err)
+			}
+			valJSON, err := marshalRedisBinaryValue([]byte(f[1]))
+			if err != nil {
+				t.Fatalf("marshal value: %v", err)
+			}
+			recs = append(recs, fieldRec{Name: nameJSON, Value: valJSON})
+		}
+		line, err := json.Marshal(struct {
+			ID     string     `json:"id"`
+			Fields []fieldRec `json:"fields"`
+		}{ID: e.id, Fields: recs})
+		if err != nil {
+			t.Fatalf("marshal entry: %v", err)
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	meta, err := json.Marshal(struct {
+		Meta       bool    `json:"_meta"`
+		Length     int64   `json:"length"`
+		LastMs     uint64  `json:"last_ms"`
+		LastSeq    uint64  `json:"last_seq"`
+		ExpireAtMs *uint64 `json:"expire_at_ms"`
+	}{Meta: true, Length: int64(len(entries)), LastMs: lastMs, LastSeq: lastSeq, ExpireAtMs: expireMs})
+	if err != nil {
+		t.Fatalf("marshal meta: %v", err)
+	}
+	buf.Write(meta)
+	buf.WriteByte('\n')
+	return buf.Bytes()
+}
+
+// readStreamEntries parses a decoded streams/<k>.jsonl into ordered
+// entries plus the _meta fields.
+func readStreamEntries(t *testing.T, root, enc string) ([]streamTestEntry, streamLineJSON) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, "redis", "db_0", "streams", enc+".jsonl"))
+	if err != nil {
+		t.Fatalf("read decoded stream: %v", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var entries []streamTestEntry
+	var meta streamLineJSON
+	for dec.More() {
+		var line streamLineJSON
+		if err := dec.Decode(&line); err != nil {
+			t.Fatalf("decode stream line: %v", err)
+		}
+		if line.Meta {
+			meta = line
+			continue
+		}
+		ent := streamTestEntry{id: line.ID}
+		for _, f := range line.Fields {
+			name, err := unmarshalRedisBinaryValue(f.Name)
+			if err != nil {
+				t.Fatalf("unmarshal field name: %v", err)
+			}
+			value, err := unmarshalRedisBinaryValue(f.Value)
+			if err != nil {
+				t.Fatalf("unmarshal field value: %v", err)
+			}
+			ent.fields = append(ent.fields, [2]string{string(name), string(value)})
+		}
+		entries = append(entries, ent)
+	}
+	return entries, meta
+}
+
+// TestRedisEncodeStreamRoundTripViaDecode runs the gold-standard
+// directory round-trip for a stream: entries (with duplicate field
+// names and a binary value) preserve ID + interleaved field order, and
+// the _meta line (length, last_ms, last_seq, TTL) round-trips.
+func TestRedisEncodeStreamRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("mystream"))
+	const expireMs uint64 = 1_700_000_000_321
+	// Stream field values must be valid UTF-8: the live store marshals
+	// them into a proto3 string field, which rejects non-UTF-8 — so a
+	// real dump never carries binary stream fields. Duplicate field
+	// names within one entry ARE valid (XADD s * f v1 f v2) and must
+	// preserve interleaved order.
+	entries := []streamTestEntry{
+		{id: "1714400000000-0", fields: [][2]string{{"event", "login"}, {"user", "alice"}}},
+		{id: "1714400000001-5", fields: [][2]string{{"f", "v1"}, {"f", "v2"}}},
+	}
+	exp := expireMs
+	writeRedisFile(t, in, filepath.Join("streams", enc+".jsonl"),
+		buildStreamJSONL(t, entries, 1714400000001, 5, &exp))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, meta := readStreamEntries(t, out, enc)
+	assertStreamEntriesEqual(t, got, entries)
+	if meta.Length != int64(len(entries)) || meta.LastMs != 1714400000001 || meta.LastSeq != 5 {
+		t.Fatalf("meta = {len:%d lastMs:%d lastSeq:%d}, want {2 1714400000001 5}", meta.Length, meta.LastMs, meta.LastSeq)
+	}
+	if meta.ExpireAtMs == nil || *meta.ExpireAtMs != expireMs {
+		t.Fatalf("meta.expire_at_ms = %v, want %d", meta.ExpireAtMs, expireMs)
+	}
+}
+
+// assertStreamEntriesEqual checks two stream-entry slices match on ID
+// and interleaved field order.
+func assertStreamEntriesEqual(t *testing.T, got, want []streamTestEntry) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].id != want[i].id {
+			t.Fatalf("entry[%d] id = %q, want %q", i, got[i].id, want[i].id)
+		}
+		if len(got[i].fields) != len(want[i].fields) {
+			t.Fatalf("entry[%d] field count = %d, want %d", i, len(got[i].fields), len(want[i].fields))
+		}
+		for j := range want[i].fields {
+			if got[i].fields[j] != want[i].fields[j] {
+				t.Fatalf("entry[%d] field[%d] = %v, want %v (order must hold)", i, j, got[i].fields[j], want[i].fields[j])
+			}
+		}
+	}
+}
+
+// TestRedisEncodeStreamEmptyRoundTripViaDecode pins an empty-but-meta
+// stream (length 0, no entries) — XLEN observable, no TTL.
+func TestRedisEncodeStreamEmptyRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("emptystream"))
+	writeRedisFile(t, in, filepath.Join("streams", enc+".jsonl"),
+		buildStreamJSONL(t, nil, 0, 0, nil))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, meta := readStreamEntries(t, out, enc)
+	if len(got) != 0 {
+		t.Fatalf("got %d entries, want 0", len(got))
+	}
+	if meta.Length != 0 {
+		t.Fatalf("meta.length = %d, want 0", meta.Length)
+	}
+	if meta.ExpireAtMs != nil {
+		t.Fatalf("meta.expire_at_ms = %v, want nil", *meta.ExpireAtMs)
+	}
+}
+
 // TestUnmarshalRedisBinaryValue pins both envelope shapes directly.
 func TestUnmarshalRedisBinaryValue(t *testing.T) {
 	t.Parallel()

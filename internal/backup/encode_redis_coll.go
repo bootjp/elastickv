@@ -5,12 +5,16 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	gproto "google.golang.org/protobuf/proto"
 )
 
 // encode_redis_coll.go is the wide-column slice of the Phase 0b Redis
@@ -36,6 +40,10 @@ import (
 // the dump cannot be parsed into its expected shape.
 var ErrRedisEncodeInvalidJSON = errors.New("backup: redis encode invalid collection JSON")
 
+// streamFieldPairWidth is the (name, value) arity of a stream entry's
+// interleaved field list — XADD enforces even arity.
+const streamFieldPairWidth = 2
+
 // hashJSONRecord mirrors marshalHashJSON's output: a format version, a
 // fields ARRAY of {name,value} binary envelopes (object keys can't
 // hold binary-safe field names), and an optional expiry.
@@ -51,7 +59,7 @@ type hashJSONRecord struct {
 // encodeHashes reconstructs !hs|meta| + !hs|fld| records from
 // hashes/*.json, plus an !redis|ttl| row for any expiring hash.
 func (e *RedisEncoder) encodeHashes(b *snapshotBuilder) error {
-	return e.walkJSONDir("hashes", func(rawKey, body []byte) error {
+	return e.walkJSONDir("hashes", ".json", func(rawKey, body []byte) error {
 		var rec hashJSONRecord
 		if err := json.Unmarshal(body, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "hash %q: %v", rawKey, err)
@@ -92,7 +100,7 @@ type setJSONRecord struct {
 // encodeSets reconstructs !st|meta| + !st|mem| records from
 // sets/*.json, plus an !redis|ttl| row for any expiring set.
 func (e *RedisEncoder) encodeSets(b *snapshotBuilder) error {
-	return e.walkJSONDir("sets", func(rawKey, body []byte) error {
+	return e.walkJSONDir("sets", ".json", func(rawKey, body []byte) error {
 		var rec setJSONRecord
 		if err := json.Unmarshal(body, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "set %q: %v", rawKey, err)
@@ -134,7 +142,7 @@ type listJSONRecord struct {
 // restored list's subsequent prepends/appends simply extend from this
 // base.
 func (e *RedisEncoder) encodeLists(b *snapshotBuilder) error {
-	return e.walkJSONDir("lists", func(rawKey, body []byte) error {
+	return e.walkJSONDir("lists", ".json", func(rawKey, body []byte) error {
 		var rec listJSONRecord
 		if err := json.Unmarshal(body, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "list %q: %v", rawKey, err)
@@ -205,7 +213,7 @@ type zsetJSONRecord struct {
 // emitted so ZSCORE/ZRANK and ZRANGEBYSCORE both work on the restored
 // set (the live write path keeps them in lockstep).
 func (e *RedisEncoder) encodeZSets(b *snapshotBuilder) error {
-	return e.walkJSONDir("zsets", func(rawKey, body []byte) error {
+	return e.walkJSONDir("zsets", ".json", func(rawKey, body []byte) error {
 		var rec zsetJSONRecord
 		if err := json.Unmarshal(body, &rec); err != nil {
 			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "zset %q: %v", rawKey, err)
@@ -286,6 +294,144 @@ func unmarshalRedisZSetScore(raw json.RawMessage) (float64, error) {
 	return f, nil
 }
 
+// streamLineJSON parses one JSONL line, distinguishing an entry line
+// (id + fields) from the trailing _meta terminator line. The decoder
+// emits per-entry lines first, then exactly one {"_meta":true,...}.
+type streamLineJSON struct {
+	Meta   bool   `json:"_meta"`
+	ID     string `json:"id"`
+	Fields []struct {
+		Name  json.RawMessage `json:"name"`
+		Value json.RawMessage `json:"value"`
+	} `json:"fields"`
+	Length     int64   `json:"length"`
+	LastMs     uint64  `json:"last_ms"`
+	LastSeq    uint64  `json:"last_seq"`
+	ExpireAtMs *uint64 `json:"expire_at_ms"`
+}
+
+// encodeStreams reconstructs !stream|meta| + !stream|entry| records
+// from streams/<k>.jsonl, plus an !redis|ttl| row for an expiring
+// stream. Each entry value is the magic-prefixed pb.RedisStreamEntry
+// protobuf carrying the interleaved (name,value,...) field list — the
+// exact format decodeStreamEntryValue consumes.
+func (e *RedisEncoder) encodeStreams(b *snapshotBuilder) error {
+	return e.walkJSONDir("streams", ".jsonl", func(rawKey, body []byte) error {
+		dec := json.NewDecoder(bytes.NewReader(body))
+		var meta *streamLineJSON
+		for {
+			var line streamLineJSON
+			if err := dec.Decode(&line); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: %v", rawKey, err)
+			}
+			if line.Meta {
+				m := line
+				meta = &m
+				continue
+			}
+			if err := e.addStreamEntry(b, rawKey, line); err != nil {
+				return err
+			}
+		}
+		if meta == nil {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream %q: missing _meta line", rawKey)
+		}
+		if err := b.Add(wideColMetaKey(RedisStreamMetaPrefix, rawKey),
+			marshalStreamMeta(meta.Length, meta.LastMs, meta.LastSeq), 0); err != nil {
+			return err
+		}
+		return e.addCollectionTTL(b, rawKey, meta.ExpireAtMs)
+	})
+}
+
+// addStreamEntry emits one !stream|entry| record from a parsed JSONL
+// entry line. The ID "ms-seq" is split back into the 16-byte key
+// suffix; the fields array becomes the interleaved [name,value,...]
+// slice the protobuf carries.
+func (e *RedisEncoder) addStreamEntry(b *snapshotBuilder, rawKey []byte, line streamLineJSON) error {
+	ms, seq, err := parseStreamID(line.ID)
+	if err != nil {
+		return err
+	}
+	interleaved := make([]string, 0, len(line.Fields)*streamFieldPairWidth)
+	for _, f := range line.Fields {
+		name, err := unmarshalRedisBinaryValue(f.Name)
+		if err != nil {
+			return errors.Wrapf(err, "stream %q entry %s field name", rawKey, line.ID)
+		}
+		value, err := unmarshalRedisBinaryValue(f.Value)
+		if err != nil {
+			return errors.Wrapf(err, "stream %q entry %s field value", rawKey, line.ID)
+		}
+		interleaved = append(interleaved, string(name), string(value))
+	}
+	val, err := buildStreamEntryValue(line.ID, interleaved)
+	if err != nil {
+		return errors.Wrapf(err, "stream %q entry %s", rawKey, line.ID)
+	}
+	return b.Add(buildStreamEntryKey(rawKey, ms, seq), val, 0)
+}
+
+// parseStreamID splits a Redis stream ID "ms-seq" into its two uint64
+// components.
+func parseStreamID(id string) (ms, seq uint64, err error) {
+	msStr, seqStr, ok := strings.Cut(id, "-")
+	if !ok {
+		return 0, 0, errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream id %q missing '-'", id)
+	}
+	ms, err = strconv.ParseUint(msStr, 10, 64)
+	if err != nil {
+		return 0, 0, errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream id %q ms: %v", id, err)
+	}
+	seq, err = strconv.ParseUint(seqStr, 10, 64)
+	if err != nil {
+		return 0, 0, errors.Wrapf(ErrRedisEncodeInvalidJSON, "stream id %q seq: %v", id, err)
+	}
+	return ms, seq, nil
+}
+
+// streamEntryKey builds !stream|entry|<userKeyLen(4)><userKey><ms(8)>
+// <seq(8)> (mirror of store.StreamEntryKey + EncodeStreamID).
+func buildStreamEntryKey(userKey []byte, ms, seq uint64) []byte {
+	var id [redisStreamIDBytes]byte
+	binary.BigEndian.PutUint64(id[0:8], ms)
+	binary.BigEndian.PutUint64(id[8:16], seq)
+	return wideColElemKey(RedisStreamEntryPrefix, userKey, id[:])
+}
+
+// marshalStreamMeta encodes the 24-byte [Length][LastMs][LastSeq] meta
+// value (mirror of store.MarshalStreamMeta).
+func marshalStreamMeta(length int64, lastMs, lastSeq uint64) []byte {
+	buf := make([]byte, redisStreamMetaSize)
+	binary.BigEndian.PutUint64(buf[0:8], uint64(length)) //nolint:gosec // length is a non-negative count from the dump's _meta line
+	binary.BigEndian.PutUint64(buf[8:16], lastMs)
+	binary.BigEndian.PutUint64(buf[16:24], lastSeq)
+	return buf
+}
+
+// buildStreamEntryValue produces the magic-prefixed pb.RedisStreamEntry
+// protobuf the live store writes (adapter/redis_storage_codec.go
+// marshalStreamEntry): redisStreamProtoPrefix + the marshaled
+// {Id, Fields}. Both Id and Fields are set — the live read path
+// (unmarshalStreamEntry) returns the entry from msg.GetId() and
+// msg.GetFields(), so omitting Id would surface an empty stream ID on
+// XRANGE/XREAD even though the key carries ms/seq. Proto3 string
+// fields must be valid UTF-8; marshal fails closed otherwise, exactly
+// as the live write path would (non-UTF-8 stream fields are
+// unrepresentable on both sides).
+func buildStreamEntryValue(id string, interleaved []string) ([]byte, error) {
+	payload, err := gproto.Marshal(&pb.RedisStreamEntry{Id: id, Fields: interleaved})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	out := make([]byte, 0, redisStreamProtoPrefixLen+len(payload))
+	out = append(out, redisStreamProtoPrefix...)
+	return append(out, payload...), nil
+}
+
 // addCollectionTTL emits the !redis|ttl|<userKey> scan-index row for a
 // non-string collection with an expiry. A nil expiry is a no-op.
 func (e *RedisEncoder) addCollectionTTL(b *snapshotBuilder, rawKey []byte, expireMs *uint64) error {
@@ -296,11 +442,12 @@ func (e *RedisEncoder) addCollectionTTL(b *snapshotBuilder, rawKey []byte, expir
 	return b.Add(key, encodeRedisTTLValueMs(*expireMs), 0)
 }
 
-// walkJSONDir iterates <dbDir>/<subdir>/*.json, resolves each filename
+// walkJSONDir iterates <dbDir>/<subdir>/*<ext>, resolves each filename
 // to its original user key, reads the body, and invokes fn. A missing
 // subdir is not an error. Reads go through an os.Root so an in-dump
-// symlink cannot escape the subdir (same posture as walkBlobDir).
-func (e *RedisEncoder) walkJSONDir(subdir string, fn func(rawKey, body []byte) error) error {
+// symlink cannot escape the subdir (same posture as walkBlobDir). ext
+// is ".json" for the per-key collections and ".jsonl" for streams.
+func (e *RedisEncoder) walkJSONDir(subdir, ext string, fn func(rawKey, body []byte) error) error {
 	dir := filepath.Join(e.dbDir(), subdir)
 	root, err := os.OpenRoot(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -315,10 +462,10 @@ func (e *RedisEncoder) walkJSONDir(subdir string, fn func(rawKey, body []byte) e
 		return errors.WithStack(err)
 	}
 	for _, ent := range entries {
-		if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ".json") {
+		if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ext) {
 			continue
 		}
-		encoded := strings.TrimSuffix(ent.Name(), ".json")
+		encoded := strings.TrimSuffix(ent.Name(), ext)
 		rawKey, err := e.resolveKey(encoded)
 		if err != nil {
 			return err

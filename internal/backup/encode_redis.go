@@ -113,22 +113,22 @@ func (e *RedisEncoder) Encode(b *snapshotBuilder) error {
 	if err := e.loadKeymap(); err != nil {
 		return err
 	}
-	if err := e.encodeStrings(b); err != nil {
-		return err
+	// Fixed order matches the dump's per-type subdirectories. Each
+	// encoder is a no-op when its subdir is absent.
+	for _, encode := range []func(*snapshotBuilder) error{
+		e.encodeStrings,
+		e.encodeHLL,
+		e.encodeHashes,
+		e.encodeSets,
+		e.encodeLists,
+		e.encodeZSets,
+		e.encodeStreams,
+	} {
+		if err := encode(b); err != nil {
+			return err
+		}
 	}
-	if err := e.encodeHLL(b); err != nil {
-		return err
-	}
-	if err := e.encodeHashes(b); err != nil {
-		return err
-	}
-	if err := e.encodeSets(b); err != nil {
-		return err
-	}
-	if err := e.encodeLists(b); err != nil {
-		return err
-	}
-	return e.encodeZSets(b)
+	return nil
 }
 
 // loadKeymap reads the db's KEYMAP.jsonl (if present) so sha-fallback
