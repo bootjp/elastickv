@@ -68,6 +68,57 @@ func TestRedisEncodeRejectsHardLinkedKeymap(t *testing.T) {
 	}
 }
 
+// TestRedisEncodeRejectsSymlinkedBlobSubdir pins that a symlinked
+// strings/ (or hll/) subdir is refused before os.OpenRoot follows it
+// outside the dump tree. Unix-only (os.Symlink + the threat model).
+func TestRedisEncodeRejectsSymlinkedBlobSubdir(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// External directory holding a .bin the attacker wants ingested.
+	external := filepath.Join(in, "external")
+	if err := os.MkdirAll(external, 0o755); err != nil {
+		t.Fatalf("mkdir external: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(external, EncodeSegment([]byte("k"))+".bin"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write external blob: %v", err)
+	}
+	dbDir := filepath.Join(in, "redis", "db_0")
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		t.Fatalf("mkdir dbDir: %v", err)
+	}
+	if err := os.Symlink(external, filepath.Join(dbDir, "strings")); err != nil {
+		t.Fatalf("symlink strings: %v", err)
+	}
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeNotDir) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeNotDir", err)
+	}
+}
+
+// TestRedisEncodeRejectsSymlinkedDbDir pins that a symlinked
+// redis/db_<n> directory is refused (Lstat in Encode) rather than
+// followed outside the dump tree.
+func TestRedisEncodeRejectsSymlinkedDbDir(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	external := filepath.Join(in, "external_db")
+	if err := os.MkdirAll(filepath.Join(external, "strings"), 0o755); err != nil {
+		t.Fatalf("mkdir external db: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(in, "redis"), 0o755); err != nil {
+		t.Fatalf("mkdir redis: %v", err)
+	}
+	if err := os.Symlink(external, filepath.Join(in, "redis", "db_0")); err != nil {
+		t.Fatalf("symlink db_0: %v", err)
+	}
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeNotDir) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeNotDir", err)
+	}
+}
+
 // TestRedisEncodeRejectsHardLinkedTTLSidecar pins the same guard for a
 // TTL sidecar (strings_ttl.jsonl) — the same openDumpSidecar path as
 // the KEYMAP case, exercised separately for coverage symmetry.

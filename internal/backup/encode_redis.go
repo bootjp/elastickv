@@ -96,12 +96,17 @@ func (e *RedisEncoder) dbDir() string {
 // to encode for that database.
 func (e *RedisEncoder) Encode(b *snapshotBuilder) error {
 	dir := e.dbDir()
-	info, err := os.Stat(dir)
+	// Lstat (not Stat) so a symlinked db dir is refused rather than
+	// followed: os.OpenRoot below would otherwise resolve a symlinked
+	// redis/db_<n> outside the dump tree (codex P2 on PR #828).
+	info, err := os.Lstat(dir)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return nil
 	case err != nil:
 		return errors.WithStack(err)
+	case info.Mode()&os.ModeSymlink != 0:
+		return errors.Wrapf(ErrRedisEncodeNotDir, "db path %q is a symlink", dir)
 	case !info.IsDir():
 		return errors.Wrapf(ErrRedisEncodeNotDir, "db path %q", dir)
 	}
@@ -208,10 +213,13 @@ func (e *RedisEncoder) encodeHLL(b *snapshotBuilder) error {
 // safe-file-access primitive).
 func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey, body []byte) error) error {
 	dir := filepath.Join(e.dbDir(), subdir)
-	root, err := os.OpenRoot(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	if err := lstatDumpDir(dir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
 	}
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -221,26 +229,51 @@ func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey
 		return errors.WithStack(err)
 	}
 	for _, ent := range entries {
-		// Only regular .bin files. !IsRegular() skips directories,
-		// symlinks, and — the point of the guard — FIFOs / sockets /
-		// devices, which would otherwise reach io.ReadAll and block or
-		// misbehave (parity with openSidecarFile's non-regular refusal
-		// on the write side).
-		if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ".bin") {
-			continue
-		}
-		encoded := strings.TrimSuffix(ent.Name(), ".bin")
-		rawKey, err := e.resolveKey(encoded)
-		if err != nil {
+		if err := e.handleBlobEntry(root, ent, fn); err != nil {
 			return err
 		}
-		body, err := readRootFile(root, ent.Name())
-		if err != nil {
-			return err
-		}
-		if err := fn(encoded, rawKey, body); err != nil {
-			return err
-		}
+	}
+	return nil
+}
+
+// handleBlobEntry processes one directory entry from walkBlobDir.
+// Non-regular entries (directories, symlinks, FIFOs/sockets/devices)
+// and non-.bin names are skipped — the IsRegular() guard keeps a FIFO
+// from reaching io.ReadAll (parity with openSidecarFile's write-side
+// refusal).
+func (e *RedisEncoder) handleBlobEntry(root *os.Root, ent os.DirEntry, fn func(encoded string, rawKey, body []byte) error) error {
+	if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ".bin") {
+		return nil
+	}
+	encoded := strings.TrimSuffix(ent.Name(), ".bin")
+	rawKey, err := e.resolveKey(encoded)
+	if err != nil {
+		return err
+	}
+	body, err := readRootFile(root, ent.Name())
+	if err != nil {
+		return err
+	}
+	return fn(encoded, rawKey, body)
+}
+
+// lstatDumpDir refuses a symlinked or non-directory path before it is
+// opened as an os.Root. os.OpenRoot follows a symlink in the final
+// path component, so a symlinked redis/db_<n>/<subdir> in an untrusted
+// dump would otherwise redirect the walk outside the dump tree and pull
+// external *.bin files into the snapshot (codex P2 on PR #828). The
+// wrapped os.ErrNotExist is preserved so callers treat a missing subdir
+// as a no-op.
+func lstatDumpDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return errors.WithStack(err) // wraps os.ErrNotExist when absent
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.Wrapf(ErrRedisEncodeNotDir, "%q is a symlink", dir)
+	}
+	if !info.IsDir() {
+		return errors.Wrapf(ErrRedisEncodeNotDir, "%q is not a directory", dir)
 	}
 	return nil
 }
