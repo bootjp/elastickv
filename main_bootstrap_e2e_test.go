@@ -356,7 +356,7 @@ func startBootstrapE2ENode(
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, factory, nil, clock, nil, nil, "")
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, factory, nil, clock, nil, nil, "", encryptionWriteWiring{})
 	if err != nil {
 		return nil, err
 	}
