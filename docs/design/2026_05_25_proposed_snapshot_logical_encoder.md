@@ -201,16 +201,54 @@ each adapter, mirroring the live adapter's index builders:
   adapter does on `PutItem`. (Parent doc: "Re-creating the table from
   `_schema.json` and replaying the items rebuilds the GSI.") The
   encoder performs that derivation offline.
-- **SQS side records.** Re-derive `dedup`, `group`, `byage`, `vis`,
-  `seq` rows from `messages.jsonl` + `_queue.json` using the same
-  rules as `adapter/sqs_messages.go` / `sqs_keys.go`. By default
+- **SQS per-message side records.** Re-derive `dedup`, `group`,
+  `byage`, `vis` rows from `messages.jsonl` + `_queue.json` using the
+  same rules as `adapter/sqs_messages.go` / `sqs_keys.go`. By default
   messages restore fully visible (vis rows zeroed), matching parent
-  §"SQS".
-- **Generation counters.** Each scope's live generation is recorded in
-  its `_bucket.json` / `_schema.json` / `_queue.json` (the decoder
-  captured it). The encoder re-emits the `gen` counter row at that
-  value so the live adapter's next allocation continues from the right
-  point.
+  §"SQS". **Both the classic and the partitioned-FIFO variants must be
+  emitted** — `adapter/sqs_keys.go` defines
+  `SqsPartitionedMsg{Data,Vis,Dedup,Group,ByAge}Prefix` for partitioned
+  queues (`partition_count > 1` in `_queue.json`), and emitting only
+  the classic family would silently break dedup on a restored
+  partitioned FIFO queue. The SQS milestone's decision gate
+  (§"Milestones") covers both families.
+- **Queue-level / generation counters.** Per-scope generation counters
+  (`!s3|bucket|gen|`, `!ddb|table|gen|`, `!sqs|queue|gen|`) and the SQS
+  queue-level sequence counter (`!sqs|queue|seq|`,
+  `adapter/sqs_keys.go` `SqsQueueSeqPrefix` — a *queue* counter, not a
+  per-message record) must be re-emitted so the live adapter's next
+  allocation continues from a consistent point.
+
+  **The directory tree does NOT currently carry the generation
+  value.** The decoder reads each scope's live generation into
+  in-memory state (`s3.go` `activeGen`, the item-key generation in
+  `dynamodb.go`) but does **not** persist it into the public structs:
+  `s3PublicBucket`, `ddbPublicSchema`, and `sqsQueueMetaPublic` have no
+  `generation` field. So the encoder cannot read it back from the dump
+  alone. Two options, **Option A chosen**:
+
+  - **Option A (chosen — exact fidelity):** add an optional
+    `generation` (or `next_gen`) field to `s3PublicBucket`,
+    `ddbPublicSchema`, `sqsQueueMetaPublic`. This is a small,
+    backward-compatible decoder change (new optional JSON field) owned
+    by the corresponding encoder milestone (the decoder change lands in
+    the same PR as that adapter's encoder so dump and reload stay in
+    lockstep). The encoder then re-emits the counter at the captured
+    value **and** stamps the same generation into every reconstructed
+    item/object key, so the counter and the embedded key generation
+    agree.
+  - **Option B (fallback — internally consistent, lossy externally):**
+    emit a uniform `generation = 1` in *both* the counter row and every
+    embedded item/object key generation. This is internally consistent
+    (the restored single cluster serves correctly) but loses the
+    original generation number; any external cache or cross-cluster
+    replication keyed on the original value goes stale. Documented as
+    acceptable only for single-cluster restore.
+
+  Either way the invariant is: **the `gen` counter and the generation
+  embedded in `!ddb|item|<table>|<gen>|…` / `!s3|blob|<bucket><gen>…`
+  keys MUST match**, or the restored adapter reads from the wrong
+  generation and returns empty.
 
 To keep the offline-tool boundary the parent doc requires
 (`internal/backup` links no live-cluster machinery), the
@@ -256,18 +294,35 @@ and the value envelopes from the same codecs
 
 - **Redis** (`internal/backup/encode_redis_*.go`): strings → `!redis|str|`;
   hashes → `!hs|meta|` + `!hs|fld|`; lists → `!lst|meta|` + items;
-  sets, zsets (incl. score index `!zs|score|`), streams
-  (`!stream|meta|` + entries); HLL → `!redis|str|` body + `!redis|ttl|`.
+  sets, zsets (incl. score index `!zs|scr|`, per
+  `store/zset_helpers.go` `ZSetScorePrefix`), streams
+  (`!stream|meta|` + entries); HLL → `!redis|hll|` body (per
+  `internal/backup/redis_string.go` `RedisHLLPrefix`) + `!redis|ttl|`.
   Plus the TTL scan index for every expiring key.
 - **DynamoDB** (`encode_dynamodb.go`): `_schema.json` → `!ddb|meta|`;
   items → `!ddb|item|<table>|<gen>|<orderedKey>`; generation counter;
   derived `!ddb|gsi|` rows. Reads both per-item and `--bundle jsonl`
   layouts (`MANIFEST.dynamodb_layout`).
 - **S3** (`encode_s3.go`): `_bucket.json` → `!s3|bucket|meta|` + gen
-  counter; each object body re-split into `!s3|blob|...` chunks at the
-  chunk size recorded in the manifest sidecar / `MANIFEST.json`;
+  counter; each object body re-split into `!s3|blob|...` chunks;
   `!s3|obj|...` manifest row from the sidecar. Reverses the
   collision-rename and reserved-suffix rules via `KEYMAP.jsonl`.
+
+  **Chunk size: use the live adapter's canonical `s3ChunkSize`
+  constant (`adapter/s3.go`, currently 1 MiB), not the sidecar.** The
+  public manifest sidecar (`s3PublicManifest`) deliberately strips the
+  per-part `ChunkSizes []uint64` array (it is internal multipart
+  detail), so the original per-chunk boundaries are not recoverable
+  from the dump. Re-chunking at the canonical size is safe: the
+  decoder's reassembly reads chunks **sequentially by `chunkNo`**
+  (`internal/backup/s3.go` validates the full `{0..chunkCount-1}` set
+  and concatenates in order) and the restored adapter's GET path does
+  the same — individual chunk byte-lengths are not load-bearing. The
+  reconstructed object is byte-identical; only the internal chunk
+  partitioning may differ from the original (no correctness impact).
+  An optional `--s3-chunk-size` flag (default = `s3ChunkSize`) lets an
+  operator match a non-default deployment; a mismatch changes chunk
+  count only, never object bytes.
 - **SQS** (`encode_sqs.go`): `_queue.json` → `!sqs|queue|meta|` + gen;
   `messages.jsonl` → `!sqs|msg|data|` rows in stored order; derived
   side records.
@@ -301,6 +356,15 @@ dependency on the live key-format version (parent §"Costs"). Guards:
 - `cluster_id` from `MANIFEST.json` is surfaced in `ENCODE_INFO.json`;
   the restore runbook step refuses to place a file whose `cluster_id`
   differs from the target node (parent §"Risks").
+
+> **Decoder cleanup folded into M1.** `internal/backup/manifest.go`'s
+> `Source.FSMCRC32C` field is dead — `emitManifest` only sets
+> `FSMPath`, and the native `.fsm` has no CRC32C footer to populate it
+> from. The encoder-core milestone (M1) either removes the field or
+> repurposes it as a whole-file SHA-256 of the `.fsm` bytes (the
+> latter gives `ENCODE_INFO.json` a real integrity anchor). Tracked
+> here so it is not lost; it is a decoder-struct change, not part of
+> this doc PR.
 
 ## Round-trip self-test
 
