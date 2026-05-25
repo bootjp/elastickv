@@ -67,3 +67,31 @@ func TestRedisEncodeRejectsHardLinkedKeymap(t *testing.T) {
 		t.Fatalf("Encode err = %v, want ErrRedisEncodeHardLink", err)
 	}
 }
+
+// TestRedisEncodeRejectsHardLinkedTTLSidecar pins the same guard for a
+// TTL sidecar (strings_ttl.jsonl) — the same openDumpSidecar path as
+// the KEYMAP case, exercised separately for coverage symmetry.
+func TestRedisEncodeRejectsHardLinkedTTLSidecar(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	target := filepath.Join(in, "external_ttl.jsonl")
+	if err := os.WriteFile(target, []byte(`{"key":"x","expire_at_ms":1}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	dbDir := filepath.Join(in, "redis", "db_0")
+	if err := os.MkdirAll(filepath.Join(dbDir, "strings"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	enc := EncodeSegment([]byte("k"))
+	if err := os.WriteFile(filepath.Join(dbDir, "strings", enc+".bin"), []byte("v"), 0o600); err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+	if err := os.Link(target, filepath.Join(dbDir, "strings_ttl.jsonl")); err != nil {
+		t.Fatalf("os.Link: %v", err)
+	}
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeHardLink) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeHardLink", err)
+	}
+}
