@@ -236,7 +236,9 @@ func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey
 		return errors.WithStack(err)
 	}
 	defer func() { _ = root.Close() }()
-	entries, err := os.ReadDir(dir)
+	// List through the root fd (not os.ReadDir(dir)) to avoid the
+	// post-OpenRoot symlink-swap TOCTOU (codex/gemini on PR #831).
+	entries, err := readRootDirEntries(root)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -324,6 +326,24 @@ func openDumpSidecar(dir, name string) (*os.File, error) {
 		return nil, errors.WithStack(err)
 	}
 	return f, nil
+}
+
+// readRootDirEntries lists the directory entries THROUGH the opened
+// root fd rather than re-resolving the path with os.ReadDir, which
+// could follow a symlink swapped in after os.OpenRoot (a TOCTOU
+// window; codex/gemini security finding on PR #831). os.Root has no
+// ReadDir, so open "." within the root and read from that descriptor.
+func readRootDirEntries(root *os.Root) ([]os.DirEntry, error) {
+	d, err := root.Open(".")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = d.Close() }()
+	entries, err := d.ReadDir(-1)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return entries, nil
 }
 
 // readRootFile reads a regular file by name within root, refusing any

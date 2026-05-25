@@ -476,7 +476,11 @@ func (e *RedisEncoder) walkJSONDir(subdir, ext string, fn func(rawKey []byte, r 
 		return errors.WithStack(err)
 	}
 	defer func() { _ = root.Close() }()
-	entries, err := os.ReadDir(dir)
+	// List entries THROUGH the opened root fd (not os.ReadDir(dir),
+	// which re-resolves the path and could follow a symlink swapped in
+	// after OpenRoot — a TOCTOU window). Codex/gemini security finding
+	// on PR #831.
+	entries, err := readRootDirEntries(root)
 	if err != nil {
 		return errors.WithStack(err)
 	}
