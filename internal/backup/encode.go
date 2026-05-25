@@ -110,11 +110,17 @@ func encodeMVCCKey(userKey []byte, commitTS uint64) []byte {
 // (flags byte + 8-byte little-endian expireAt). Phase 0b emits live,
 // cleartext, non-tombstone records only, so flags is always zero.
 func encodeMVCCValue(userValue []byte, expireAt uint64) []byte {
-	out := make([]byte, snapshotValueHeaderSize+len(userValue))
-	out[0] = 0 // flags: tombstone=0, encryption_state=cleartext, reserved=0
-	binary.LittleEndian.PutUint64(out[1:snapshotValueHeaderSize], expireAt)
-	copy(out[snapshotValueHeaderSize:], userValue)
-	return out
+	// Build by append from a const-capacity, zero-length slice: the
+	// header (flags byte + 8-byte LE expireAt) then the body. Using a
+	// constant cap (not snapshotValueHeaderSize+len(userValue)) keeps
+	// the `const + len(userValue)` arithmetic out of make(), which
+	// CodeQL flags as a potential allocation-size overflow; the
+	// zero-length start keeps makezero happy. The builder already caps
+	// userValue at MaxSnapshotEncodedValueSize before this is reached.
+	out := make([]byte, 0, snapshotValueHeaderSize)
+	out = append(out, 0) // flags: tombstone=0, encryption_state=cleartext, reserved=0
+	out = binary.LittleEndian.AppendUint64(out, expireAt)
+	return append(out, userValue...)
 }
 
 // encodedKV is one fully MVCC-framed entry held by snapshotBuilder

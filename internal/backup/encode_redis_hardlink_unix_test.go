@@ -96,6 +96,31 @@ func TestRedisEncodeRejectsSymlinkedBlobSubdir(t *testing.T) {
 	}
 }
 
+// TestRedisEncodeRejectsSymlinkedCollectionSubdir pins that a symlinked
+// collection subdir (hashes/) is refused before walkJSONDir's
+// os.OpenRoot follows it outside the dump tree — the .json/.jsonl
+// counterpart of the blob-subdir guard.
+func TestRedisEncodeRejectsSymlinkedCollectionSubdir(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	external := filepath.Join(in, "external_hashes")
+	if err := os.MkdirAll(external, 0o755); err != nil {
+		t.Fatalf("mkdir external: %v", err)
+	}
+	dbDir := filepath.Join(in, "redis", "db_0")
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		t.Fatalf("mkdir dbDir: %v", err)
+	}
+	if err := os.Symlink(external, filepath.Join(dbDir, "hashes")); err != nil {
+		t.Fatalf("symlink hashes: %v", err)
+	}
+	b := newSnapshotBuilder(redisEncTS)
+	err := NewRedisEncoder(in, 0).Encode(b)
+	if !errors.Is(err, ErrRedisEncodeNotDir) {
+		t.Fatalf("Encode err = %v, want ErrRedisEncodeNotDir", err)
+	}
+}
+
 // TestRedisEncodeRejectsSymlinkedDbDir pins that a symlinked
 // redis/db_<n> directory is refused (Lstat in Encode) rather than
 // followed outside the dump tree.

@@ -18,9 +18,9 @@ import (
 // internal records to a snapshotBuilder, which MVCC-frames and writes
 // them.
 //
-// This commit covers the simple-value families: strings, HLL, and the
-// TTL handling for both. The wide-column collections (hash, list, set,
-// zset, stream) land in subsequent commits on the same milestone.
+// This file covers the simple-value families (strings, HLL, and their
+// TTL handling); the wide-column collections (hash/set/list/zset/stream)
+// live in encode_redis_coll.go in the same package.
 //
 // Format fidelity is pinned against the live adapter write path
 // (adapter/redis_compat_types.go, adapter/redis.go), not just the
@@ -113,10 +113,22 @@ func (e *RedisEncoder) Encode(b *snapshotBuilder) error {
 	if err := e.loadKeymap(); err != nil {
 		return err
 	}
-	if err := e.encodeStrings(b); err != nil {
-		return err
+	// Fixed order matches the dump's per-type subdirectories. Each
+	// encoder is a no-op when its subdir is absent.
+	for _, encode := range []func(*snapshotBuilder) error{
+		e.encodeStrings,
+		e.encodeHLL,
+		e.encodeHashes,
+		e.encodeSets,
+		e.encodeLists,
+		e.encodeZSets,
+		e.encodeStreams,
+	} {
+		if err := encode(b); err != nil {
+			return err
+		}
 	}
-	return e.encodeHLL(b)
+	return nil
 }
 
 // loadKeymap reads the db's KEYMAP.jsonl (if present) so sha-fallback
@@ -224,7 +236,9 @@ func (e *RedisEncoder) walkBlobDir(subdir string, fn func(encoded string, rawKey
 		return errors.WithStack(err)
 	}
 	defer func() { _ = root.Close() }()
-	entries, err := os.ReadDir(dir)
+	// List through the root fd (not os.ReadDir(dir)) to avoid the
+	// post-OpenRoot symlink-swap TOCTOU (codex/gemini on PR #831).
+	entries, err := readRootDirEntries(root)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -312,6 +326,24 @@ func openDumpSidecar(dir, name string) (*os.File, error) {
 		return nil, errors.WithStack(err)
 	}
 	return f, nil
+}
+
+// readRootDirEntries lists the directory entries THROUGH the opened
+// root fd rather than re-resolving the path with os.ReadDir, which
+// could follow a symlink swapped in after os.OpenRoot (a TOCTOU
+// window; codex/gemini security finding on PR #831). os.Root has no
+// ReadDir, so open "." within the root and read from that descriptor.
+func readRootDirEntries(root *os.Root) ([]os.DirEntry, error) {
+	d, err := root.Open(".")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = d.Close() }()
+	entries, err := d.ReadDir(-1)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return entries, nil
 }
 
 // readRootFile reads a regular file by name within root, refusing any
