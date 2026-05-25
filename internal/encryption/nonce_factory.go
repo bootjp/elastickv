@@ -40,6 +40,13 @@ type DeterministicNonceFactory struct {
 	nodeID     uint16
 	localEpoch uint16
 	writes     atomic.Uint64
+	// exhausted latches true the first time write_count wraps past
+	// 2^64. Once set, every subsequent Next() fails closed with
+	// ErrWriteCountExhausted rather than resuming from the recycled
+	// low write_count range. Without the latch, the call after the
+	// wrap would emit write_count=1 again — a nonce already used this
+	// load under the same (node_id, local_epoch).
+	exhausted atomic.Bool
 }
 
 // NewDeterministicNonceFactory constructs a factory pinned to
@@ -60,13 +67,21 @@ func NewDeterministicNonceFactory(nodeID, localEpoch uint16) *DeterministicNonce
 // Overflow: atomic.Uint64.Add wraps silently at 2^64. A wrap returns
 // the value 0 (the pre-increment all-ones value plus one), which
 // would recycle write_count=1.. under the same (node_id, local_epoch)
-// — a catastrophic GCM nonce reuse. Next fails closed with
-// ErrWriteCountExhausted on the wrapping call instead of emitting the
-// reused nonce. The boundary is unreachable in practice (2^64 writes
-// per process load); recovery is a restart, which bumps local_epoch.
+// — a catastrophic GCM nonce reuse. On the wrapping call Next latches
+// the factory exhausted and returns ErrWriteCountExhausted; every
+// subsequent call also returns ErrWriteCountExhausted (the latch is
+// permanent — resuming from the recycled low range would reuse nonces
+// already emitted this load). The boundary is unreachable in practice
+// (2^64 writes per process load); recovery is a restart, which bumps
+// local_epoch and resets write_count to a fresh, non-overlapping
+// range.
 func (f *DeterministicNonceFactory) Next() ([NonceSize]byte, error) {
+	if f.exhausted.Load() {
+		return [NonceSize]byte{}, errors.WithStack(ErrWriteCountExhausted)
+	}
 	wc := f.writes.Add(1)
 	if wc == 0 {
+		f.exhausted.Store(true)
 		return [NonceSize]byte{}, errors.WithStack(ErrWriteCountExhausted)
 	}
 	var n [NonceSize]byte

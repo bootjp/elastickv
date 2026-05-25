@@ -744,6 +744,12 @@ func buildShardGroups(
 	sidecarPath string,
 	encWiring encryptionWriteWiring,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
+	// Defend the "cache is always non-nil" contract for callers that
+	// pass a zero-value encryptionWriteWiring{} (the encryption-off
+	// test harnesses). WithStateCache(nil) would otherwise make
+	// NewApplier install a private per-applier cache, silently
+	// breaking the shared-cache invariant 6D-6c-1 relies on.
+	encWiring = encWiring.withDefaultedCache()
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
 	for _, g := range groups {

@@ -63,6 +63,19 @@ type encryptionWriteWiring struct {
 	nonceFactory store.NonceFactory
 }
 
+// withDefaultedCache returns a copy of w with a non-nil StateCache.
+// Zero-value wirings (the encryption-off test harnesses pass
+// encryptionWriteWiring{}) carry a nil cache; defaulting it here keeps
+// the "cache is always non-nil" contract that buildShardGroups'
+// WithStateCache wiring depends on, without adding a branch to
+// buildShardGroups itself.
+func (w encryptionWriteWiring) withDefaultedCache() encryptionWriteWiring {
+	if w.cache == nil {
+		w.cache = encryption.NewStateCache()
+	}
+	return w
+}
+
 // pebbleOptions returns the PebbleStore options for the storage
 // envelope. When the cipher is nil (encryption not enabled) it
 // returns no options, leaving the store in cleartext mode. When set,

@@ -125,7 +125,7 @@ claim multi-node-churn nonce safety beyond those guards.
 
 `run()` today:
 
-```
+```go
 loadKEKAndRunStartupGuards()   // KEK load + CheckStartupGuards (6C-1/2)
 keystore := NewKeystore()      // empty
 buildShardGroups(... keystore, sidecarPath ...)  // per-shard stores + appliers
@@ -136,7 +136,7 @@ chainEncryptionStartupGuard()  // 6C-2d gap guard (post-engine)
 `buildShardGroups` (`buildEncryptionWriteWiring` →
 `prepareStorageNonceEpoch`):
 
-```
+```go
 kekWrapper := loadKEKAndRunStartupGuards()
 keystore   := NewKeystore()
 stateCache := NewStateCache()
@@ -158,7 +158,7 @@ where `prepareStorageNonceEpoch` primes the cache from the sidecar and,
 != 0`, the restart path), hydrates the keystore and performs the
 durable `local_epoch` bump:
 
-```
+```go
 sc := ReadSidecar(sidecarPath)            // IsNotExist → epoch 0
 cache.RefreshFromSidecar(sc)
 if sc.Active.Storage == 0 { return 0 }    // pre-bootstrap → epoch 0

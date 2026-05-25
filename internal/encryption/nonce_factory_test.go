@@ -62,8 +62,14 @@ func TestDeterministicNonceFactory_DistinctEpochsDisjoint(t *testing.T) {
 	f2 := encryption.NewDeterministicNonceFactory(0x00AA, 0x0002)
 	seen := make(map[[encryption.NonceSize]byte]struct{})
 	for i := 0; i < 100; i++ {
-		a, _ := f1.Next()
-		b, _ := f2.Next()
+		a, err := f1.Next()
+		if err != nil {
+			t.Fatalf("f1.Next[%d]: %v", i, err)
+		}
+		b, err := f2.Next()
+		if err != nil {
+			t.Fatalf("f2.Next[%d]: %v", i, err)
+		}
 		if a == b {
 			t.Fatalf("epoch-disjoint factories collided at i=%d", i)
 		}

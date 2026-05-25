@@ -19,11 +19,14 @@ func TestDeterministicNonceFactory_WriteCountOverflow(t *testing.T) {
 	if _, err := f.Next(); !errors.Is(err, ErrWriteCountExhausted) {
 		t.Fatalf("Next at saturation: err = %v, want ErrWriteCountExhausted", err)
 	}
-	// The wrapped value 0 must not have been emitted; a subsequent
-	// call continues from 1 and is a normal nonce again (the counter
-	// has wrapped, but in practice recovery is a restart — this just
-	// confirms Next does not panic post-wrap).
-	if _, err := f.Next(); err != nil {
-		t.Fatalf("Next after wrap: unexpected err = %v", err)
+	// The latch is permanent: every subsequent call must also fail
+	// closed with ErrWriteCountExhausted rather than resuming from the
+	// recycled low write_count range (which would reuse nonces already
+	// emitted this load). Recovery is a restart, which bumps
+	// local_epoch.
+	for i := 0; i < 3; i++ {
+		if _, err := f.Next(); !errors.Is(err, ErrWriteCountExhausted) {
+			t.Fatalf("Next #%d after wrap: err = %v, want sticky ErrWriteCountExhausted", i, err)
+		}
 	}
 }
