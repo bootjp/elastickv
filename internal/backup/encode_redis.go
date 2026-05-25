@@ -119,7 +119,10 @@ func (e *RedisEncoder) Encode(b *snapshotBuilder) error {
 	if err := e.encodeHLL(b); err != nil {
 		return err
 	}
-	return e.encodeHashes(b)
+	if err := e.encodeHashes(b); err != nil {
+		return err
+	}
+	return e.encodeSets(b)
 }
 
 // loadKeymap reads the db's KEYMAP.jsonl (if present) so sha-fallback

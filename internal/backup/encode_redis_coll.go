@@ -78,6 +78,41 @@ func (e *RedisEncoder) encodeHashes(b *snapshotBuilder) error {
 	})
 }
 
+// setJSONRecord mirrors marshalSetJSON: members as an array of binary
+// envelopes plus an optional expiry. A set member's identity is the
+// key suffix; the live store writes an empty value for it
+// (redis_compat_commands.go SADD path), which the encoder reproduces.
+type setJSONRecord struct {
+	FormatVersion uint32            `json:"format_version"`
+	Members       []json.RawMessage `json:"members"`
+	ExpireAtMs    *uint64           `json:"expire_at_ms"`
+}
+
+// encodeSets reconstructs !st|meta| + !st|mem| records from
+// sets/*.json, plus an !redis|ttl| row for any expiring set.
+func (e *RedisEncoder) encodeSets(b *snapshotBuilder) error {
+	return e.walkJSONDir("sets", func(rawKey, body []byte) error {
+		var rec setJSONRecord
+		if err := json.Unmarshal(body, &rec); err != nil {
+			return errors.Wrapf(ErrRedisEncodeInvalidJSON, "set %q: %v", rawKey, err)
+		}
+		if err := b.Add(wideColMetaKey(RedisSetMetaPrefix, rawKey),
+			marshalCount8BE(uint64(len(rec.Members))), 0); err != nil {
+			return err
+		}
+		for _, mRaw := range rec.Members {
+			member, err := unmarshalRedisBinaryValue(mRaw)
+			if err != nil {
+				return errors.Wrapf(err, "set %q member", rawKey)
+			}
+			if err := b.Add(wideColElemKey(RedisSetMemberPrefix, rawKey, member), []byte{}, 0); err != nil {
+				return err
+			}
+		}
+		return e.addCollectionTTL(b, rawKey, rec.ExpireAtMs)
+	})
+}
+
 // addCollectionTTL emits the !redis|ttl|<userKey> scan-index row for a
 // non-string collection with an expiry. A nil expiry is a no-op.
 func (e *RedisEncoder) addCollectionTTL(b *snapshotBuilder, rawKey []byte, expireMs *uint64) error {

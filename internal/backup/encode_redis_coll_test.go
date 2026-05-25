@@ -142,6 +142,102 @@ func TestRedisEncodeHashBinaryFieldRoundTrip(t *testing.T) {
 	}
 }
 
+// buildSetJSON constructs a sets/<k>.json body in marshalSetJSON's
+// shape (members array of binary envelopes).
+func buildSetJSON(t *testing.T, members []string, expireMs *uint64) []byte {
+	t.Helper()
+	sort.Strings(members)
+	raw := make([]json.RawMessage, 0, len(members))
+	for _, m := range members {
+		v, err := marshalRedisBinaryValue([]byte(m))
+		if err != nil {
+			t.Fatalf("marshal member: %v", err)
+		}
+		raw = append(raw, v)
+	}
+	out := struct {
+		FormatVersion uint32            `json:"format_version"`
+		Members       []json.RawMessage `json:"members"`
+		ExpireAtMs    *uint64           `json:"expire_at_ms"`
+	}{FormatVersion: 1, Members: raw, ExpireAtMs: expireMs}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal set json: %v", err)
+	}
+	return body
+}
+
+// readSetMembers parses a decoded sets/<k>.json into a member set plus
+// its expiry.
+func readSetMembers(t *testing.T, root, enc string) (map[string]struct{}, *uint64) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, "redis", "db_0", "sets", enc+".json"))
+	if err != nil {
+		t.Fatalf("read decoded set: %v", err)
+	}
+	var rec setJSONRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("unmarshal decoded set: %v", err)
+	}
+	out := map[string]struct{}{}
+	for _, mRaw := range rec.Members {
+		m, err := unmarshalRedisBinaryValue(mRaw)
+		if err != nil {
+			t.Fatalf("unmarshal member: %v", err)
+		}
+		out[string(m)] = struct{}{}
+	}
+	return out, rec.ExpireAtMs
+}
+
+// TestRedisEncodeSetRoundTripViaDecode runs the gold-standard directory
+// round-trip for a set with TTL and a non-UTF-8 member.
+func TestRedisEncodeSetRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("myset"))
+	const expireMs uint64 = 1_700_000_000_123
+	members := []string{"red", "green", "\xff\x00"}
+	exp := expireMs
+	writeRedisFile(t, in, filepath.Join("sets", enc+".json"), buildSetJSON(t, members, &exp))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, gotExp := readSetMembers(t, out, enc)
+	if len(got) != len(members) {
+		t.Fatalf("got %d members, want %d", len(got), len(members))
+	}
+	for _, m := range members {
+		if _, ok := got[m]; !ok {
+			t.Fatalf("member %q missing from decoded set", m)
+		}
+	}
+	if gotExp == nil || *gotExp != expireMs {
+		t.Fatalf("decoded expire_at_ms = %v, want %d", gotExp, expireMs)
+	}
+}
+
+// TestRedisEncodeSetNoTTLRoundTripViaDecode pins the no-TTL set path.
+func TestRedisEncodeSetNoTTLRoundTripViaDecode(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	enc := EncodeSegment([]byte("plainset"))
+	writeRedisFile(t, in, filepath.Join("sets", enc+".json"), buildSetJSON(t, []string{"a", "b"}, nil))
+
+	out := decodeRedisTree(t, encodeRedisTree(t, in))
+
+	got, gotExp := readSetMembers(t, out, enc)
+	if _, ok := got["a"]; !ok {
+		t.Fatal("member a missing")
+	}
+	if _, ok := got["b"]; !ok {
+		t.Fatal("member b missing")
+	}
+	if gotExp != nil {
+		t.Fatalf("decoded expire_at_ms = %v, want nil", *gotExp)
+	}
+}
+
 // TestUnmarshalRedisBinaryValue pins both envelope shapes directly.
 func TestUnmarshalRedisBinaryValue(t *testing.T) {
 	t.Parallel()
