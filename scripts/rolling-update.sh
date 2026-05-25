@@ -79,6 +79,8 @@ Optional environment:
   RAFTADMIN_REMOTE_BIN
   RAFTADMIN_RPC_TIMEOUT_SECONDS
   RAFTADMIN_ALLOW_INSECURE
+  LEADERSHIP_TRANSFER_RETRY_ATTEMPTS
+  LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS
 
   EXTRA_ENV
     Whitespace-separated list of additional container environment variables to
@@ -198,8 +200,23 @@ ROLLING_DELAY_SECONDS="${ROLLING_DELAY_SECONDS:-2}"
 SSH_CONNECT_TIMEOUT_SECONDS="${SSH_CONNECT_TIMEOUT_SECONDS:-10}"
 SSH_STRICT_HOST_KEY_CHECKING="${SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
 RAFTADMIN_REMOTE_BIN="${RAFTADMIN_REMOTE_BIN:-/tmp/elastickv-raftadmin}"
-RAFTADMIN_RPC_TIMEOUT_SECONDS="${RAFTADMIN_RPC_TIMEOUT_SECONDS:-5}"
+# Default raised from 5 s to 15 s after the 2026-05-21 reproduction
+# (https://github.com/bootjp/elastickv/actions/runs/26198185540) where
+# the previous node's restart left raft in a transient pre-stable state
+# for the next leadership-transfer RPC. 5 s gave the RPC no headroom
+# over a brief raft-internal abort and the script bailed out. 15 s is
+# still small enough that a truly stuck call surfaces quickly.
+RAFTADMIN_RPC_TIMEOUT_SECONDS="${RAFTADMIN_RPC_TIMEOUT_SECONDS:-15}"
 RAFTADMIN_ALLOW_INSECURE="${RAFTADMIN_ALLOW_INSECURE:-true}"
+# LEADERSHIP_TRANSFER_RETRY_ATTEMPTS bounds how many times we re-issue
+# a leadership_transfer_to_server RPC when raft returns
+# FailedPrecondition (e.g. "etcd raft leadership transfer aborted")
+# because the candidate's log has not yet caught up or an in-flight
+# conf change is blocking the transfer. The first attempt counts
+# toward the budget; ATTEMPTS=1 means "no retry". Default 3 covers
+# the ~10 s catch-up window that follows a peer's rolling restart.
+LEADERSHIP_TRANSFER_RETRY_ATTEMPTS="${LEADERSHIP_TRANSFER_RETRY_ATTEMPTS:-3}"
+LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS="${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS:-5}"
 NODES="${NODES:-}"
 SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
@@ -574,6 +591,8 @@ update_one_node() {
       SQS_FIFO_PARTITION_MAP="$SQS_FIFO_PARTITION_MAP_Q" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
+      LEADERSHIP_TRANSFER_RETRY_ATTEMPTS="$LEADERSHIP_TRANSFER_RETRY_ATTEMPTS" \
+      LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS="$LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS" \
       LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
       RAFTADMIN_RPC_TIMEOUT_SECONDS="$RAFTADMIN_RPC_TIMEOUT_SECONDS" \
       RAFTADMIN_ALLOW_INSECURE="$RAFTADMIN_ALLOW_INSECURE" \
@@ -800,15 +819,34 @@ ensure_not_leader_before_restart() {
   candidate_addr="${candidate_host}:${RAFT_PORT}"
 
   echo "node is leader; transferring leadership to ${candidate_id}@${candidate_addr}"
-  rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer_to_server "${candidate_id}" "${candidate_addr}")" || {
-    echo "targeted leadership transfer RPC failed: $rpc_output" >&2
+  # Retry the targeted transfer up to LEADERSHIP_TRANSFER_RETRY_ATTEMPTS
+  # times. A common failure shape under rolling restarts is etcd raft
+  # rejecting the transfer with "etcd raft leadership transfer aborted"
+  # when the candidate's log has not yet caught up to the leader. The
+  # candidate typically becomes ready within a few seconds, so a brief
+  # backoff between attempts is usually enough. Only when ALL targeted
+  # retries are exhausted do we fall back to the generic transfer.
+  local attempt=1 transfer_succeeded=false
+  while (( attempt <= LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); do
+    if rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer_to_server "${candidate_id}" "${candidate_addr}")"; then
+      transfer_succeeded=true
+      break
+    fi
+    echo "targeted leadership transfer attempt ${attempt}/${LEADERSHIP_TRANSFER_RETRY_ATTEMPTS} failed: $rpc_output" >&2
+    if (( attempt < LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); then
+      echo "retrying in ${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}s..." >&2
+      sleep "${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}"
+    fi
+    attempt=$(( attempt + 1 ))
+  done
+  if [[ "$transfer_succeeded" != "true" ]]; then
     echo "falling back to generic leadership transfer"
     rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer)" || {
       echo "generic leadership transfer RPC failed: $rpc_output" >&2
       return 1
     }
     candidate_addr=""
-  }
+  fi
 
   if ! wait_for_leader_change "${NODE_HOST}:${RAFT_PORT}" "$candidate_addr"; then
     echo "leadership did not move away from ${NODE_HOST}:${RAFT_PORT} within ${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS}s" >&2
