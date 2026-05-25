@@ -269,6 +269,26 @@ func TestSnapshotBuilderRejectsReuse(t *testing.T) {
 	}
 }
 
+// TestSnapshotBuilderRejectsAddAfterWriteTo pins that Add fails closed
+// after WriteTo rather than silently staging records that can never be
+// flushed (the second WriteTo would reject before re-sorting). Guards
+// the M2-M5 adapter feed loops against a silent-data-loss reuse bug.
+func TestSnapshotBuilderRejectsAddAfterWriteTo(t *testing.T) {
+	t.Parallel()
+	b := newSnapshotBuilder(encodeFixtureTS)
+	if err := b.Add([]byte("!redis|str|first"), []byte("v"), 0); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := b.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	err := b.Add([]byte("!redis|str|second"), []byte("v"), 0)
+	if !errors.Is(err, ErrSnapshotBuilderReused) {
+		t.Fatalf("Add-after-WriteTo err = %v, want ErrSnapshotBuilderReused", err)
+	}
+}
+
 // TestResolveCommitTS pins the --last-commit-ts override semantics
 // (design §"MVCC re-encoding"): no override yields the manifest value;
 // an override >= manifest is accepted; an override < manifest fails

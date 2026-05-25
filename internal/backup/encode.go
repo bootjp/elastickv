@@ -150,6 +150,16 @@ func newSnapshotBuilder(commitTS uint64) *snapshotBuilder {
 // order-dependent `.fsm`. userKey/userValue are copied — callers may
 // reuse their buffers after Add returns.
 func (b *snapshotBuilder) Add(userKey, userValue []byte, expireAt uint64) error {
+	// A builder is single-use. Once WriteTo has flushed, any further
+	// Add would stage entries that can never be written (the second
+	// WriteTo fails closed before re-sorting), silently dropping
+	// records. Reject with the same sentinel WriteTo uses so a caller
+	// reusing an exhausted builder gets one consistent signal
+	// regardless of which method it calls (claude review on PR #825 —
+	// a silent-data-loss footgun for the M2-M5 adapter feed loops).
+	if b.written {
+		return errors.WithStack(ErrSnapshotBuilderReused)
+	}
 	// Size-check from the user-buffer lengths before allocating the
 	// framed buffers — encKey = userKey + snapshotTSSize, encVal =
 	// snapshotValueHeaderSize + userValue — so an oversize record
