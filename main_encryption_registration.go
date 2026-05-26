@@ -27,6 +27,11 @@ const (
 	// registrationBackoffFactor is the exponential multiplier applied
 	// to the retry backoff between failed registration attempts.
 	registrationBackoffFactor = 2
+	// registrationAttemptTimeout bounds a single propose/forward
+	// attempt so it always returns to the retry loop (which re-resolves
+	// the leader) rather than blocking indefinitely on a stale leader
+	// address under GRPCConnCache's WaitForReady(true) dials.
+	registrationAttemptTimeout = 5 * time.Second
 )
 
 // setupDistributionAndRegistration sets up the distribution catalog and
@@ -256,6 +261,13 @@ func runWriterRegistration(
 // the default-group engine when this node is the leader (DisableProposalForwarding
 // means a follower's Propose is dropped), else by forwarding to the
 // current leader's EncryptionAdmin endpoint.
+//
+// Each attempt is bounded by registrationAttemptTimeout so it always
+// returns to the retry loop (which re-resolves the leader). Without it,
+// the forwarded RPC would inherit the deadline-less run-context and —
+// because GRPCConnCache dials WaitForReady(true) — could block forever
+// on a stale/unreachable leader address, leaving the barrier open and
+// encrypted writes stuck even after leadership moves (codex P1 #5).
 func proposeWriterRegistration(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
@@ -264,8 +276,10 @@ func proposeWriterRegistration(
 	entry []byte,
 	req *pb.RegisterEncryptionWriterRequest,
 ) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
+	defer cancel()
 	if coordinate.IsLeader() {
-		if _, err := defaultEngine.Propose(ctx, entry); err != nil {
+		if _, err := defaultEngine.Propose(attemptCtx, entry); err != nil {
 			return errors.Wrap(err, "writer registration: local propose")
 		}
 		return nil
@@ -278,7 +292,7 @@ func proposeWriterRegistration(
 	if err != nil {
 		return errors.Wrapf(err, "writer registration: dial leader %s", addr)
 	}
-	if _, err := pb.NewEncryptionAdminClient(conn).RegisterEncryptionWriter(ctx, req); err != nil {
+	if _, err := pb.NewEncryptionAdminClient(conn).RegisterEncryptionWriter(attemptCtx, req); err != nil {
 		return errors.Wrap(err, "writer registration: forward to leader")
 	}
 	return nil
