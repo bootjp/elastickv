@@ -143,10 +143,10 @@ func TestS3EncodeNestedObjectKeyRoundTrip(t *testing.T) {
 }
 
 // TestReadRootBodyFileRejectsNonRegular pins the PRE-open guard on the
-// object body read: a non-regular target (directory stand-in for a
+// object body open: a non-regular target (directory stand-in for a
 // symlink/FIFO) is refused before the open, so a planted FIFO cannot block
 // the encoder (gemini security-high on PR #845).
-func TestReadRootBodyFileRejectsNonRegular(t *testing.T) {
+func TestOpenRootRegularRejectsNonRegular(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, "body"), 0o755); err != nil {
@@ -157,8 +157,8 @@ func TestReadRootBodyFileRejectsNonRegular(t *testing.T) {
 		t.Fatalf("OpenRoot: %v", err)
 	}
 	defer func() { _ = root.Close() }()
-	if _, err := readRootBodyFile(root, "body"); !errors.Is(err, ErrS3EncodeNotRegular) {
-		t.Fatalf("readRootBodyFile err = %v, want ErrS3EncodeNotRegular", err)
+	if _, _, err := openRootRegular(root, "body"); !errors.Is(err, ErrS3EncodeNotRegular) {
+		t.Fatalf("openRootRegular err = %v, want ErrS3EncodeNotRegular", err)
 	}
 }
 

@@ -161,48 +161,43 @@ func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, buc
 	}
 }
 
-// encodeObject reads one object body + sidecar and stages its blob chunks
-// and manifest. The object key is the body's path relative to bucketDir.
+// encodeObject reads one object's sidecar, streams its body into blob
+// records, and stages the manifest. The object key is the body's path
+// relative to bucketDir.
 func (e *S3RecordEncoder) encodeObject(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, objRel string) error {
 	objectKey := filepath.ToSlash(objRel)
 	bodyRel := filepath.Join(bucketDir, objRel)
-	body, err := readRootBodyFile(root, bodyRel)
-	if err != nil {
-		return err
-	}
 	sidecar, err := e.readObjectSidecar(root, bodyRel+S3MetaSuffixReserved)
 	if err != nil {
 		return err
 	}
-	return e.emitObject(b, bucketName, objectKey, body, sidecar)
+	chunkSizes, err := e.streamObjectBlobs(b, root, bodyRel, bucketName, objectKey, sidecar.SizeBytes)
+	if err != nil {
+		return err
+	}
+	return e.addObjectManifest(b, bucketName, objectKey, sidecar, chunkSizes)
 }
 
-// readRootBodyFile reads an object body within root with a PRE-open Lstat
-// guard: a symlink / FIFO / device / directory is refused BEFORE root.Open,
-// so a reader-less FIFO planted at an object path cannot block the open
-// (readRootFile's post-open check happens only after the blocking Open).
-// This matches the guard readObjectSidecar / readBucketMeta use.
-func readRootBodyFile(root *os.Root, rel string) ([]byte, error) {
+// openRootRegular opens rel within root with a PRE-open Lstat guard (a
+// symlink / FIFO / device / directory is refused BEFORE root.Open, so a
+// reader-less FIFO planted at an object path cannot block the open) plus a
+// hard-link refusal, returning the open file and its size.
+func openRootRegular(root *os.Root, rel string) (*os.File, int64, error) {
 	linfo, err := root.Lstat(rel)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, 0, errors.WithStack(err)
 	}
 	if !linfo.Mode().IsRegular() {
-		return nil, errors.Wrapf(ErrS3EncodeNotRegular, "%s (mode=%s)", rel, linfo.Mode())
+		return nil, 0, errors.Wrapf(ErrS3EncodeNotRegular, "%s (mode=%s)", rel, linfo.Mode())
 	}
 	if err := refuseHardLink(linfo, rel); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	f, err := root.Open(rel)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, 0, errors.WithStack(err)
 	}
-	defer func() { _ = f.Close() }()
-	body, err := io.ReadAll(f)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return body, nil
+	return f, linfo.Size(), nil
 }
 
 // readObjectSidecar opens <body>.elastickv-meta.json within root (symlink
@@ -234,19 +229,51 @@ func (e *S3RecordEncoder) readObjectSidecar(root *os.Root, rel string) (s3Public
 	return pub, nil
 }
 
-// emitObject re-chunks the body into blob records and builds the manifest.
-func (e *S3RecordEncoder) emitObject(b *snapshotBuilder, bucketName, objectKey string, body []byte, sidecar s3PublicManifest) error {
-	// The body file IS the object, so its length must match the manifest's
-	// declared size; a mismatch means a corrupt/inconsistent dump and fails
-	// closed rather than restoring an object whose size_bytes lies.
-	if sidecar.SizeBytes != int64(len(body)) {
-		return errors.Wrapf(ErrS3EncodeInvalidManifest,
-			"%s: size_bytes %d != body length %d", objectKey, sidecar.SizeBytes, len(body))
-	}
-	chunkSizes, err := e.addObjectBlobs(b, bucketName, objectKey, body)
+// streamObjectBlobs streams the object body in s3ChunkSize reads, staging
+// each chunk as a !s3|blob| record, and returns the per-chunk byte lengths
+// for the manifest. The body is never fully buffered in RAM (only one
+// chunk at a time), so a multi-GiB object does not blow up the encoder
+// (codex P1 #845). The declared size is validated against the file's
+// stat size before streaming — the body file IS the object, so a mismatch
+// is a corrupt dump and fails closed. A zero-length body yields no chunks.
+func (e *S3RecordEncoder) streamObjectBlobs(b *snapshotBuilder, root *os.Root, bodyRel, bucketName, objectKey string, declaredSize int64) ([]uint64, error) {
+	f, size, err := openRootRegular(root, bodyRel)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	defer func() { _ = f.Close() }()
+	if size != declaredSize {
+		return nil, errors.Wrapf(ErrS3EncodeInvalidManifest,
+			"%s: size_bytes %d != body length %d", objectKey, declaredSize, size)
+	}
+	var sizes []uint64
+	var chunkNo uint64
+	buf := make([]byte, s3ChunkSize)
+	for {
+		n, rerr := io.ReadFull(f, buf)
+		if n > 0 {
+			chunk := buf[:n]
+			key := s3keys.BlobKey(bucketName, s3RestoreGeneration, objectKey, s3RestoreUploadID, s3RestorePartNo, chunkNo)
+			// b.Add copies the value (encodeMVCCValue appends), so reusing
+			// buf across iterations is safe.
+			if err := b.Add(key, chunk, 0); err != nil {
+				return nil, err
+			}
+			sizes = append(sizes, uint64(len(chunk)))
+			chunkNo++
+		}
+		if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+			return sizes, nil
+		}
+		if rerr != nil {
+			return nil, errors.WithStack(rerr)
+		}
+	}
+}
+
+// addObjectManifest builds the !s3|obj|head| manifest from the sidecar and
+// the staged chunk sizes.
+func (e *S3RecordEncoder) addObjectManifest(b *snapshotBuilder, bucketName, objectKey string, sidecar s3PublicManifest, chunkSizes []uint64) error {
 	live := s3LiveManifest{
 		UploadID:           s3RestoreUploadID,
 		ETag:               sidecar.ETag,
@@ -273,28 +300,6 @@ func (e *S3RecordEncoder) emitObject(b *snapshotBuilder, bucketName, objectKey s
 		return errors.WithStack(err)
 	}
 	return b.Add(s3keys.ObjectManifestKey(bucketName, s3RestoreGeneration, objectKey), val, 0)
-}
-
-// addObjectBlobs splits body into s3ChunkSize chunks, stages each as a
-// !s3|blob| record, and returns the per-chunk byte lengths for the
-// manifest. A zero-length body yields no chunks (and no part).
-func (e *S3RecordEncoder) addObjectBlobs(b *snapshotBuilder, bucketName, objectKey string, body []byte) ([]uint64, error) {
-	var sizes []uint64
-	var chunkNo uint64
-	for start := 0; start < len(body); start += s3ChunkSize {
-		end := start + s3ChunkSize
-		if end > len(body) {
-			end = len(body)
-		}
-		chunk := body[start:end]
-		key := s3keys.BlobKey(bucketName, s3RestoreGeneration, objectKey, s3RestoreUploadID, s3RestorePartNo, chunkNo)
-		if err := b.Add(key, chunk, 0); err != nil {
-			return nil, err
-		}
-		sizes = append(sizes, uint64(len(chunk)))
-		chunkNo++
-	}
-	return sizes, nil
 }
 
 // parseRFC3339NanoAsHLC inverts formatHLCAsRFC3339Nano: it recovers the
