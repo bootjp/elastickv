@@ -113,16 +113,18 @@ is replicated state already present on this node post-bootstrap),
 reusing the same `RegistryKey(dek_id, NodeID16(full_node_id))` lookup
 `ApplyRegistration` / `GuardLocalEpochRollback` use.
 
-**Registry handle access (review finding #2).** `buildShardGroups`
-already constructs a `WriterRegistryStore` per shard via
-`store.WriterRegistryFor(st)` and hands it to each `Applier`. 7a
-threads the **default group's** `WriterRegistryStore` out of
-`buildShardGroups` (returned alongside the runtimes, keyed by
-`cfg.defaultGroup`) so the post-`buildShardGroups` intent step reads
-the same handle the FSM's `ApplyRegistration` mutates — rather than
-adding a new accessor that reaches into the runtime/applier internals.
-This keeps the registry's single owner (the default-group store) and
-avoids a second `WriterRegistryFor` over the same Pebble dir.
+**Registry handle access (review finding #2 — as built).** The intent
+step reads the registry through `store.WriterRegistryFor(
+shardGroups[cfg.defaultGroup].Store)`. The proposal-round plan was to
+thread the per-shard handle out of `buildShardGroups`, but
+`WriterRegistryFor` returns a **stateless** `*pebbleWriterRegistry`
+wrapper over the shared `*pebbleStore` — a second wrapper for a
+read-only `GetRegistryRow` is byte-for-byte equivalent to the
+applier's handle and holds no state of its own. So the simpler choice
+(a fresh read-only wrapper over the already-open default-group store)
+avoids widening `buildShardGroups`' already-long return signature with
+no correctness cost: the durable registry rows still have a single
+owner (the FSM apply path), and the intent step only reads.
 
 ### 3.2 Coordinator first-write gate
 

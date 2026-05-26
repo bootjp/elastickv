@@ -349,7 +349,7 @@ func run() error {
 	// a storage DEK is already active on disk (restart path); on a
 	// pre-bootstrap binary the per-Put gate stays cleartext until a
 	// runtime Bootstrap + EnableStorageEnvelope flips it.
-	runtimes, shardGroups, err := buildShardGroupsWithEncryptionWiring(
+	runtimes, shardGroups, encWiring, err := buildShardGroupsWithEncryptionWiring(
 		*raftId,
 		*raftDir,
 		cfg.groups,
@@ -431,6 +431,17 @@ func run() error {
 	// every dispatched mutation.
 	seedKeyVizRoutes(sampler, cfg.engine)
 	eg, runCtx := errgroup.WithContext(ctx)
+
+	// Stage 7a §4.1: process-start writer registration + first-write
+	// barrier. Runs after the shard stores opened (registry readable)
+	// and the startup guards passed, but before the gRPC servers start
+	// serving. nil gate (the common case: encryption off / Phase 0 /
+	// already registered) leaves writes ungated; the propose branch
+	// arms a barrier that blocks self-originated encrypted writes until
+	// this node's registration commits, with the goroutine bound to
+	// runCtx so it drains on shutdown.
+	installProcessStartRegistrationGate(runCtx, eg, coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
+
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
 	})
