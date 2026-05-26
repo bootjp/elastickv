@@ -2,7 +2,6 @@ package keyviz
 
 import (
 	"bytes"
-	"encoding/binary"
 	"sort"
 	"strconv"
 	"testing"
@@ -286,8 +285,9 @@ func TestBoundaryAtEncoding(t *testing.T) {
 	t.Parallel()
 	slot := layoutSlot([]byte{0x00}, []byte{0x40}, 4)
 	b := slot.boundaryAt(1, []byte{0x00})
-	// The window treats the first byte past the prefix as the most
-	// significant: bucket 1 of [0x00,0x40)/4 starts at 0x10 in that byte,
-	// i.e. 0x10<<56 as the window uint64.
-	require.Equal(t, uint64(0x1000000000000000), binary.BigEndian.Uint64(b[slot.subPrefixLen:]))
+	// Bucket 1 of [0x00,0x40)/4 starts at 0x10 in the most-significant
+	// window byte (0x10<<56); trailing zero bytes are trimmed so the
+	// boundary is the minimal key in the cell, {0x10}, rather than the
+	// 8-byte 0x10 00…00 (which would sort after short keys like 0x10).
+	require.Equal(t, []byte{0x10}, b)
 }

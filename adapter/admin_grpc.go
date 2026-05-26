@@ -652,7 +652,15 @@ func applyKeyVizRowBudget(rows []*pb.KeyVizRow, budget int) []*pb.KeyVizRow {
 		return rows
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		return rowActivityTotal(rows[i]) > rowActivityTotal(rows[j])
+		ai, aj := rowActivityTotal(rows[i]), rowActivityTotal(rows[j])
+		if ai != aj {
+			return ai > aj
+		}
+		// Deterministic tie-break by BucketId so the retained set is
+		// stable across refreshes when sub-rows share an activity total
+		// (e.g. a uniformly-loaded route's K sub-buckets). Mirrors the
+		// JSON pivot's budget sort (keyviz_handler.go).
+		return rows[i].BucketId < rows[j].BucketId
 	})
 	return rows[:budget]
 }

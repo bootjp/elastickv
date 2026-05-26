@@ -624,6 +624,11 @@ func fracMul(a, b, c uint64) uint64 {
 // big-endian, zero-padding past the end of b. A short/absent window is
 // the natural low end (0x00…) of the key space.
 func windowUint64(b []byte, off int) uint64 {
+	// Fast path: a full window is available — read it directly, skipping
+	// the per-byte loop and bounds checks (hot path, Gemini medium).
+	if off >= 0 && off+subWindowBytes <= len(b) {
+		return binary.BigEndian.Uint64(b[off:])
+	}
 	var v uint64
 	for i := 0; i < subWindowBytes; i++ {
 		v <<= 8
@@ -721,7 +726,19 @@ func (slot *routeSlot) boundaryAt(i int, routeStart []byte) []byte {
 	out := make([]byte, slot.subPrefixLen+subWindowBytes)
 	copy(out, routeStart[:min(slot.subPrefixLen, len(routeStart))])
 	binary.BigEndian.PutUint64(out[slot.subPrefixLen:], off)
-	return out
+	// Trim trailing zero bytes of the window. A variable-length key
+	// shorter than prefix+W zero-pads to the same window value, so the
+	// *minimal* key that buckets into this cell is the trimmed form.
+	// Without trimming, a key like 0x10 (which subBucketIndex places in
+	// the cell starting at 0x10) would sort BEFORE the emitted 8-byte
+	// boundary 0x10 00…00, so the displayed [Start,End) would exclude
+	// the very keys counted in the row — wrong labels for Redis-style
+	// variable-length keyspaces (Codex P2). The prefix is never trimmed.
+	end := len(out)
+	for end > slot.subPrefixLen && out[end-1] == 0x00 {
+		end--
+	}
+	return out[:end]
 }
 
 // RegisterRoute adds a (RouteID, [Start, End)) pair to the tracking
