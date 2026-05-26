@@ -246,6 +246,11 @@ ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 # state); it just produces no callers without --adminEnabled.
 KEYVIZ_ENABLED="${KEYVIZ_ENABLED:-false}"
 KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
+# Sub-range (hot-key) buckets per route. Empty omits the flag (binary
+# default 1 = route-level). A positive integer (e.g. 64) divides each
+# route into that many order-preserving sub-ranges so the heatmap shows
+# hot sub-ranges, including for the unbounded single-route / tail case.
+KEYVIZ_KEY_BUCKETS_PER_ROUTE="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
 
 # Validate the three boolean ADMIN_* flags must be the literal "true"
 # or "false" — they are forwarded to the remote shell unquoted (no
@@ -264,6 +269,15 @@ for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_IN
   esac
 done
 unset _bool_var
+
+# KeyViz sub-range buckets: empty (omit the flag) or a positive integer.
+# Validate before it reaches the SSH heredoc / the binary's flag parser
+# so an operator typo fails here with a clear message rather than as a
+# container crash-loop on an unparseable --keyvizKeyBucketsPerRoute.
+if [[ -n "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" && ! "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "rolling-update: KEYVIZ_KEY_BUCKETS_PER_ROUTE must be empty or a positive integer, got '$KEYVIZ_KEY_BUCKETS_PER_ROUTE'" >&2
+  exit 1
+fi
 
 # Container OOM defenses. See usage() for rationale. Empty string disables.
 DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
@@ -617,6 +631,7 @@ update_one_node() {
       ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
       KEYVIZ_ENABLED="$KEYVIZ_ENABLED" \
       KEYVIZ_FANOUT_NODES="$KEYVIZ_FANOUT_NODES_Q" \
+      KEYVIZ_KEY_BUCKETS_PER_ROUTE="$KEYVIZ_KEY_BUCKETS_PER_ROUTE_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -1022,6 +1037,11 @@ build_keyviz_flags() {
   if [[ -n "$fanout_nodes" ]]; then
     _flags+=(--keyvizFanoutNodes "$fanout_nodes")
   fi
+
+  local key_buckets="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
+  if [[ -n "$key_buckets" ]]; then
+    _flags+=(--keyvizKeyBucketsPerRoute "$key_buckets")
+  fi
 }
 
 # build_admin_flags emits the --admin* flag list and bind-mount list
@@ -1230,7 +1250,7 @@ config_fp() {
     "$ADMIN_SESSION_SIGNING_KEY_FILE" "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" \
     "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
     "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
-    "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" \
+    "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" \
     | sha256sum | cut -d' ' -f1
 }
 DEPLOY_CONFIG_FP_LABEL="elastickv.deploy.config-fp"
@@ -1446,6 +1466,7 @@ ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
 # survive an unquoted env pass but pre-quoting keeps the pattern
 # uniform with the ADMIN_* set above.
 KEYVIZ_FANOUT_NODES_Q="$(printf '%q' "$KEYVIZ_FANOUT_NODES")"
+KEYVIZ_KEY_BUCKETS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_KEY_BUCKETS_PER_ROUTE")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
