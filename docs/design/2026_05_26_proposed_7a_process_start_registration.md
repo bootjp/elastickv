@@ -87,13 +87,25 @@ inside `buildEncryptionWriteWiring`, before `buildShardGroups`). The
 > safety) stays pre-`buildShardGroups`; the registry intent (control
 > plane) runs after.
 
+**Ordering assumption (review #1).** This intent logic runs *after*
+the §9.1 `CheckLocalEpochRollback` startup guard has passed (it runs in
+the same post-engine phase and halts the process on
+`ErrLocalEpochRollback`). Consequently `epoch < registry.last_seen`
+(rollback) and the no-row-post-cutover case are **unreachable** here —
+the guard already rejected them. A **missing** registry row is treated
+as `last_seen = 0`, which falls into the `< epoch` "propose" branch
+(the legitimate freshly-joined writer whose row the guard tolerated
+pre-cutover, or the first registration under a new DEK). The intent
+therefore only ever sees `==` (skip) or `<` (propose).
+
 Intent:
 
-```
+```text
 if !StorageEnvelopeActive            -> defer (Phase 0; §1.4)
 if registry.last_seen(node,DEK) == epoch -> skip   (already registered; §1.3)
 if registry.last_seen(node,DEK) <  epoch -> propose RegisterEncryptionWriter
-                                            (the §1.1/1.2 trigger)
+                                            (the §1.1/1.2 trigger;
+                                             missing row == last_seen 0)
 ```
 
 The registry read is local (Pebble, no Raft round-trip — the registry
@@ -172,6 +184,18 @@ deadline / the gRPC server drains — never closing the barrier on an
 uncommitted registration. No goroutine leak: it always exits on one of
 the two signals.
 
+**Transient propose failures (review #3, follow-on).** A propose that
+*starts* but fails mid-flight — leader change, proposal timeout,
+`ErrProposalDropped` — is retried inside the goroutine with bounded
+backoff, against the same run-context (so retries stop on shutdown).
+The barrier stays open across retries, so encrypted writes keep
+waiting (fail-closed) rather than proceeding unregistered. The retry
+loop only exits by (a) a committed registration → `close()` the
+barrier, or (b) run-ctx cancellation → return without closing. There
+is no terminal "give up and close" path: closing the barrier without a
+committed registration would let this node emit unregistered nonces,
+which is the exact hazard 7a exists to prevent.
+
 **Snapshot/compaction interaction (review #8).** If the registration
 entry is compacted into a snapshot before the goroutine observes its
 index, the engine's `AppliedIndex()` is already ≥ the snapshot index
@@ -218,8 +242,9 @@ that cannot register does not get to emit an unregistered nonce).
   channel (O(1), no extra synchronization), and ctx-aware while
   pending. No deadlock if leadership never settles — ctx bound. The
   `nil` (never-armed) case is checked first so it is never received on.
-- **Performance** — fast path after first write is a single atomic
-  load; the registry read + propose happen once per process load.
+- **Performance** — fast path after first write is a non-blocking
+  `select` on the closed channel (O(1)); the registry read + propose
+  happen once per process load.
 - **Data consistency** — registry monotonicity (§4.1 case 2/3)
   preserved; skip-at-equal-epoch avoids the `ErrLocalEpochRollback`
   self-brick.
