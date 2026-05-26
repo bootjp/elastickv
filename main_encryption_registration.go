@@ -153,8 +153,23 @@ func buildProcessStartRegistrationGate(
 	barrier := make(chan struct{})
 	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
 	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
+	// verifyRegistered re-reads the local registry to detect whether
+	// our epoch has actually committed — covers a Propose attempt that
+	// timed out (the waiter was removed) but whose entry Raft still
+	// applied, or a registration that landed via another path. Without
+	// it, consistently >registrationAttemptTimeout commit latency could
+	// keep retrying-without-committing forever despite durable
+	// registration (codex P2 #6).
+	regStore := defaultGroup.Store
+	verifyRegistered := func() (bool, error) {
+		ls, err := readWriterRegistryLastSeen(regStore, activeDEK, fullNodeID)
+		if err != nil {
+			return false, err
+		}
+		return ls >= w.epoch, nil
+	}
 	eg.Go(func() error {
-		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, entry, req, barrier)
+		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, entry, req, barrier, verifyRegistered)
 		return nil
 	})
 	return &kv.RegistrationGate{
@@ -218,6 +233,7 @@ func runWriterRegistration(
 	entry []byte,
 	req *pb.RegisterEncryptionWriterRequest,
 	barrier chan struct{},
+	verifyRegistered func() (bool, error),
 ) {
 	// The conn cache (forwarding to the leader's EncryptionAdmin) is
 	// scoped to this one-shot goroutine: closed when registration
@@ -233,6 +249,17 @@ func runWriterRegistration(
 
 	backoff := registrationRetryInitial
 	for {
+		// Verify-before-propose: a prior attempt may have timed out yet
+		// still committed (Raft applies after the waiter is removed), or
+		// another path registered us. Closing on durable registration
+		// avoids retrying-without-committing forever under high commit
+		// latency (codex P2 #6).
+		if registered, verr := verifyRegistered(); verr == nil && registered {
+			close(barrier)
+			slog.Info("encryption: writer registration confirmed committed; first-write barrier released",
+				slog.Uint64("dek_id", uint64(req.GetDekId())))
+			return
+		}
 		err := proposeWriterRegistration(ctx, coordinate, defaultEngine, connCache, entry, req)
 		if err == nil {
 			close(barrier)

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
@@ -11,6 +12,31 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"golang.org/x/sync/errgroup"
 )
+
+// TestRunWriterRegistration_VerifyCommittedClosesBarrier pins codex
+// P2 #6: when the registration is already durably committed (e.g. a
+// prior attempt timed out but Raft applied it), the verify-before-
+// propose check closes the barrier without needing a successful
+// propose — so it never reaches proposeWriterRegistration (nil
+// coordinator/engine are safe here precisely because verify short-
+// circuits first).
+func TestRunWriterRegistration_VerifyCommittedClosesBarrier(t *testing.T) {
+	t.Parallel()
+	barrier := make(chan struct{})
+	verify := func() (bool, error) { return true, nil } // already committed
+	done := make(chan struct{})
+	go func() {
+		runWriterRegistration(context.Background(), nil, nil, nil,
+			registrationRequest(7, 1, 3), barrier, verify)
+		close(done)
+	}()
+	select {
+	case <-barrier:
+	case <-time.After(2 * time.Second):
+		t.Fatal("barrier not closed when registration already committed (verify path)")
+	}
+	<-done
+}
 
 func TestRegistrationEntry_RoundTrips(t *testing.T) {
 	t.Parallel()
