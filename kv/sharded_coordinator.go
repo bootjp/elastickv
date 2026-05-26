@@ -142,6 +142,110 @@ type ShardedCoordinator struct {
 	// disabled keyviz wires through to a no-op without branching on
 	// the hot path.
 	sampler keyviz.Sampler
+	// registrationGate is the Stage 7a §4.1 first-write barrier: when
+	// set, self-originated mutating writes that would land as §4.1
+	// storage envelopes block until this node's writer registration
+	// commits. nil when encryption is off / no registration is pending
+	// (the common case — ungated). See RegistrationGate.
+	registrationGate *RegistrationGate
+}
+
+// RegistrationGate carries the Stage 7a §4.1 registration-before-
+// first-write barrier into the coordinator. main.go owns the
+// encryption StateCache and the registration goroutine and supplies
+// this; kv stays decoupled from internal/encryption by taking a plain
+// channel + predicate closures rather than the StateCache type.
+//
+// Barrier three-state (per the 7a design §3.2):
+//   - nil           → no registration pending (Phase 0 / skip / off) → ungated
+//   - open (non-nil, not closed) → registration in flight → mutating
+//     encrypted writes block on it
+//   - closed        → registration committed → ungated (fast path)
+type RegistrationGate struct {
+	// Barrier is the open-or-closed channel described above. A nil
+	// Barrier (the zero value, or an explicitly nil field) means
+	// "never armed" → ungated; awaitRegistration checks for nil first
+	// so a nil channel is never received on (which would block forever).
+	Barrier <-chan struct{}
+	// StorageEnvelopeActive and ActiveStorageKeyID read the process-wide
+	// encryption StateCache. A write is gated only when the §7.1 cutover
+	// has fired AND a storage DEK is active — i.e. the write would land
+	// encrypted and thus emit a nonce under this node's identity.
+	StorageEnvelopeActive func() bool
+	ActiveStorageKeyID    func() (uint32, bool)
+}
+
+// WithRegistrationGate wires the Stage 7a first-write barrier onto the
+// coordinator. Applied after construction for the same reason as the
+// other With* options. A nil gate (or a gate with a nil Barrier)
+// leaves every write ungated — the encryption-off / no-pending-
+// registration posture.
+func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedCoordinator {
+	c.registrationGate = g
+	return c
+}
+
+// awaitRegistration implements the §4.1 first-write barrier (7a §3.2).
+// It returns nil (ungated) unless a registration is genuinely pending
+// AND this request is a mutating write that would land encrypted, in
+// which case it blocks until the registration commits or ctx ends.
+// Fail-closed: a write that cannot register within its ctx returns the
+// ctx error rather than proceeding to emit an unregistered nonce.
+func (c *ShardedCoordinator) awaitRegistration(ctx context.Context, reqs *OperationGroup[OP]) error {
+	g := c.registrationGate
+	if g == nil || g.Barrier == nil {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil // registration committed — fast path
+	default:
+	}
+	// Registration is in flight. Gate only mutating writes that would
+	// land encrypted; reads never reach Dispatch, and cleartext writes
+	// (pre-cutover / no active DEK) emit no nonce.
+	if !c.writeWouldEncrypt(reqs) {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "encryption: write blocked on pending §4.1 writer registration")
+	}
+}
+
+// writeWouldEncrypt reports whether reqs is a mutating write that would
+// land as a §4.1 storage envelope under the current gate state — i.e.
+// the cutover has fired AND a storage DEK is active. Only such writes
+// are gated by awaitRegistration; reads and cleartext writes are not.
+func (c *ShardedCoordinator) writeWouldEncrypt(reqs *OperationGroup[OP]) bool {
+	g := c.registrationGate
+	if !hasMutatingElems(reqs) || g.StorageEnvelopeActive == nil || !g.StorageEnvelopeActive() {
+		return false
+	}
+	if g.ActiveStorageKeyID == nil {
+		return false
+	}
+	_, ok := g.ActiveStorageKeyID()
+	return ok
+}
+
+// hasMutatingElems reports whether the group carries at least one
+// mutating operation. Every OP in OperationGroup (Put / Del /
+// DelPrefix) mutates — reads use separate Coordinator methods that
+// never reach Dispatch — so a read-only transaction reaches here with
+// only ReadKeys set and an empty Elems slice, and must stay ungated.
+func hasMutatingElems(reqs *OperationGroup[OP]) bool {
+	if reqs == nil {
+		return false
+	}
+	for _, e := range reqs.Elems {
+		if e != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // WithLeaseReadObserver wires a LeaseReadObserver onto a
@@ -242,6 +346,13 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
+	// Stage 7a §4.1: block self-originated mutating encrypted writes
+	// until this node's writer registration commits. Ungated fast path
+	// (no gate / committed / cleartext) returns immediately.
+	if err := c.awaitRegistration(ctx, reqs); err != nil {
+		return nil, err
+	}
+
 	// DEL_PREFIX cannot be routed to a single shard because the prefix may
 	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
 	// operation to every shard group so each FSM scans locally.
@@ -266,11 +377,17 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.Elems, reqs.ReadKeys)
 	}
 
+	return c.dispatchNonTxn(ctx, reqs)
+}
+
+// dispatchNonTxn routes a non-transactional operation group through the
+// shard router. Extracted from Dispatch to keep that method's branch
+// count within the cyclop budget after the 7a registration gate landed.
+func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	logs, err := c.requestLogs(reqs)
 	if err != nil {
 		return nil, err
 	}
-
 	r, err := c.router.Commit(ctx, logs)
 	if err != nil {
 		return nil, errors.WithStack(err)
