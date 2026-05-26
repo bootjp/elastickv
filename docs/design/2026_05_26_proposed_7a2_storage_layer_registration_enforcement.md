@@ -204,12 +204,22 @@ guards.
 `ErrWriterNotRegistered` retry/backoff is implemented once (a shared
 `retryUntilRegistered(ctx, fn)` helper) and reused by every direct-path
 caller rather than duplicated, for consistent backoff + diagnostics.
-**Current vs. anticipated callers (claude P3):** today the only
-non-test caller of `store.ApplyMutations` is `distribution/catalog.go`
-(catalog bootstrap + runtime `SplitRange`); "admin snapshot" and
-"migration" are *anticipated future* direct-path callers named by the
-`lsm_store.go` doc comment as the design-time category, not code that
-exists yet — the implementation only needs to wire the catalog path.
+**Direct-path caller inventory (claude P3 + codex P2).** The gated
+direct path is `pebbleStore.ApplyMutations`. It is reached by:
+  - `distribution/catalog.go` (catalog bootstrap + runtime
+    `SplitRange`) — the only caller that *originates* a write today;
+  - the `ShardStore.ApplyMutations` and `LeaderRoutedStore.ApplyMutations`
+    **MVCCStore-interface forwarders** (`kv/shard_store.go`,
+    `kv/leader_routed_store.go`) which simply delegate to the
+    underlying `pebbleStore.ApplyMutations` — no production hot-path
+    caller of these forwarders was found (grep of `adapter/`, `kv/`,
+    `main*.go`), but they are live entry points the implementation's
+    §5 verification must re-confirm.
+"admin snapshot" and "migration" are *anticipated future* direct-path
+callers named by the `lsm_store.go` doc comment as the design-time
+category, not code that exists yet. So the implementation wires the
+catalog path now and the verification step re-greps the forwarder
+callers before merge.
 
 ## 3. Scope
 
