@@ -97,15 +97,27 @@ func buildProcessStartRegistrationGate(
 	if err != nil {
 		return nil, err
 	}
-	// §4.1 case 2 monotonic advance: propose only when this load's epoch
-	// is strictly ahead. Equal (already registered) or — unreachable
-	// past the rollback guard — behind, skip.
-	if w.epoch <= lastSeen {
+	// §4.1 case 2 monotonic advance:
+	//   - epoch == last_seen → already registered (bootstrap cohort /
+	//     no-op restart) → skip, ungated.
+	//   - epoch  < last_seen → strictly behind. The §9.1
+	//     ErrLocalEpochRollback startup guard should have refused boot;
+	//     reaching here means a stale sidecar slipped past it. Fail
+	//     closed (refuse startup) rather than serving with a behind
+	//     epoch — proceeding ungated would let this load emit nonces
+	//     under a recycled (node_id, local_epoch) (codex P1).
+	//   - epoch  > last_seen → propose (the trigger).
+	switch {
+	case w.epoch == lastSeen:
 		slog.Info("encryption: writer registration skipped (already current)",
 			slog.Uint64("dek_id", uint64(activeDEK)),
 			slog.Uint64("full_node_id", fullNodeID),
 			slog.Uint64("local_epoch", uint64(w.epoch)))
-		return &kv.RegistrationGate{}, nil // already registered at this epoch
+		return &kv.RegistrationGate{}, nil
+	case w.epoch < lastSeen:
+		return nil, errors.Errorf(
+			"encryption: writer registration: local_epoch %d is behind registry last_seen %d for dek_id %d node %#x (stale sidecar past the §9.1 rollback guard)",
+			w.epoch, lastSeen, activeDEK, fullNodeID)
 	}
 
 	barrier := make(chan struct{})

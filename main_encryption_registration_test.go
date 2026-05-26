@@ -52,7 +52,11 @@ func newRegistrationTestStore(t *testing.T) store.MVCCStore {
 	return st
 }
 
-func writeRegistryRow(t *testing.T, st store.MVCCStore, dekID uint32, fullNodeID uint64, lastSeen uint16) {
+// testRegDEKID is the storage DEK id used across the registration
+// tests (the wiringFor fixtures activate the same id).
+const testRegDEKID uint32 = 7
+
+func writeRegistryRow(t *testing.T, st store.MVCCStore, fullNodeID uint64, lastSeen uint16) {
 	t.Helper()
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
@@ -61,7 +65,7 @@ func writeRegistryRow(t *testing.T, st store.MVCCStore, dekID uint32, fullNodeID
 	val := encryption.EncodeRegistryValue(encryption.RegistryValue{
 		FullNodeID: fullNodeID, FirstSeenLocalEpoch: lastSeen, LastSeenLocalEpoch: lastSeen,
 	})
-	if err := reg.SetRegistryRow(encryption.RegistryKey(dekID, encryption.NodeID16(fullNodeID)), val); err != nil {
+	if err := reg.SetRegistryRow(encryption.RegistryKey(testRegDEKID, encryption.NodeID16(fullNodeID)), val); err != nil {
 		t.Fatalf("SetRegistryRow: %v", err)
 	}
 }
@@ -82,7 +86,7 @@ func TestReadWriterRegistryLastSeen(t *testing.T) {
 	}
 
 	// After writing last_seen=5 → 5.
-	writeRegistryRow(t, st, dekID, fullNodeID, 5)
+	writeRegistryRow(t, st, fullNodeID, 5)
 	got, err = readWriterRegistryLastSeen(st, dekID, fullNodeID)
 	if err != nil {
 		t.Fatalf("readWriterRegistryLastSeen (with row): %v", err)
@@ -121,7 +125,7 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 		{
 			name: "already_registered",
 			w:    wiringFor(t, 7, true, 3),
-			seed: func(t *testing.T, st store.MVCCStore) { writeRegistryRow(t, st, 7, fullNodeID, 3) },
+			seed: func(t *testing.T, st store.MVCCStore) { writeRegistryRow(t, st, fullNodeID, 3) },
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,12 +151,36 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 	}
 }
 
+// TestBuildProcessStartRegistrationGate_BehindEpochFailsClosed pins
+// codex P1: a strictly-behind epoch (registry last_seen > bumped epoch)
+// must fail closed (error) rather than skip ungated. The §9.1 rollback
+// guard should catch this earlier, but if a stale sidecar slips past,
+// the intent step must refuse rather than serve with a behind epoch.
+func TestBuildProcessStartRegistrationGate_BehindEpochFailsClosed(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	// Registry ahead of the bumped epoch (last_seen=5 > epoch=3).
+	writeRegistryRow(t, st, fullNodeID, 5)
+
+	eg, _ := errgroup.WithContext(context.Background())
+	gate, err := buildProcessStartRegistrationGate(
+		context.Background(), eg, &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, wiringFor(t, 7, true, 3), "n1")
+	if err == nil {
+		t.Fatal("expected fail-closed error on behind epoch, got nil")
+	}
+	if gate != nil {
+		t.Errorf("behind-epoch should return nil gate, got %+v", gate)
+	}
+}
+
 func TestBuildProcessStartRegistrationGate_ProposeBranchArmsBarrier(t *testing.T) {
 	t.Parallel()
 	st := newRegistrationTestStore(t)
 	fullNodeID := etcdraftengine.DeriveNodeID("n1")
 	// Registry behind the bumped epoch (last_seen=2 < epoch=3) → propose.
-	writeRegistryRow(t, st, 7, fullNodeID, 2)
+	writeRegistryRow(t, st, fullNodeID, 2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)

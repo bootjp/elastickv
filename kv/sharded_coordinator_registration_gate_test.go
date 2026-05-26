@@ -123,6 +123,89 @@ func TestAwaitRegistration_OpenBarrier_BlocksThenReleasesOnCommit(t *testing.T) 
 	}
 }
 
+// --- awaitRegistrationBarrier: the write-layer (Transactional.Commit)
+// gate that also covers lock-resolution commits (codex P1 on #839) ---
+
+func TestAwaitRegistrationBarrier_NilReceiver_Ungated(t *testing.T) {
+	t.Parallel()
+	var c *ShardedCoordinator
+	if err := c.awaitRegistrationBarrier(context.Background()); err != nil {
+		t.Fatalf("nil receiver should be ungated, got %v", err)
+	}
+}
+
+func TestAwaitRegistrationBarrier_ClosedBarrier_FastPath(t *testing.T) {
+	t.Parallel()
+	ch := make(chan struct{})
+	close(ch)
+	envActive, activeKey := activeGatePredicates()
+	c := &ShardedCoordinator{registrationGate: &RegistrationGate{
+		Barrier: ch, StorageEnvelopeActive: envActive, ActiveStorageKeyID: activeKey,
+	}}
+	if err := c.awaitRegistrationBarrier(context.Background()); err != nil {
+		t.Fatalf("closed barrier should be ungated, got %v", err)
+	}
+}
+
+func TestAwaitRegistrationBarrier_EnvelopeInactive_Ungated(t *testing.T) {
+	t.Parallel()
+	ch := make(chan struct{}) // open
+	c := &ShardedCoordinator{registrationGate: &RegistrationGate{
+		Barrier:               ch,
+		StorageEnvelopeActive: func() bool { return false },
+		ActiveStorageKeyID:    func() (uint32, bool) { return 7, true },
+	}}
+	if err := c.awaitRegistrationBarrier(context.Background()); err != nil {
+		t.Fatalf("envelope-inactive commit should be ungated, got %v", err)
+	}
+}
+
+func TestAwaitRegistrationBarrier_OpenBarrier_BlocksThenReleases(t *testing.T) {
+	t.Parallel()
+	ch := make(chan struct{}) // open
+	envActive, activeKey := activeGatePredicates()
+	c := &ShardedCoordinator{registrationGate: &RegistrationGate{
+		Barrier: ch, StorageEnvelopeActive: envActive, ActiveStorageKeyID: activeKey,
+	}}
+	done := make(chan error, 1)
+	go func() { done <- c.awaitRegistrationBarrier(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("expected block on open barrier, returned early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(ch)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("after commit, expected ungated, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("commit did not unblock after barrier close")
+	}
+}
+
+func TestAwaitRegistrationBarrier_CtxCancelFailsClosed(t *testing.T) {
+	t.Parallel()
+	ch := make(chan struct{}) // open, never closed
+	envActive, activeKey := activeGatePredicates()
+	c := &ShardedCoordinator{registrationGate: &RegistrationGate{
+		Barrier: ch, StorageEnvelopeActive: envActive, ActiveStorageKeyID: activeKey,
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.awaitRegistrationBarrier(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected ctx.Canceled fail-closed, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("commit did not fail-closed on ctx cancel")
+	}
+}
+
 func TestAwaitRegistration_OpenBarrier_CtxCancelFailsClosed(t *testing.T) {
 	t.Parallel()
 	ch := make(chan struct{}) // open, never closed

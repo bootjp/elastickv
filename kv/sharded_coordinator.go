@@ -40,9 +40,26 @@ type ShardGroup struct {
 type leaseRefreshingTxn struct {
 	inner Transactional
 	g     *ShardGroup
+	// coord back-references the owning coordinator so Commit can
+	// consult the Stage 7a registration barrier. Every self-originated
+	// write — client writes via router.Commit AND internal
+	// lock-resolution via ShardStore's direct g.Txn.Commit — funnels
+	// through this wrapper, so gating here (in addition to the
+	// Dispatch-level gate for client groups) closes the lock-resolution
+	// path codex P1 flagged. nil in tests that construct the wrapper
+	// directly; awaitRegistrationBarrier is nil-receiver-safe.
+	coord *ShardedCoordinator
 }
 
 func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	// Stage 7a §4.1: every Commit is a self-originated write, so gate it
+	// on this node's writer registration. This is the universal
+	// chokepoint (router.Commit and ShardStore lock-resolution both land
+	// here), closing the lock-resolution path the Dispatch-level gate
+	// alone misses (codex P1 on PR #839).
+	if err := t.coord.awaitRegistrationBarrier(ctx); err != nil {
+		return nil, err
+	}
 	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
 	resp, err := t.inner.Commit(ctx, reqs)
@@ -220,11 +237,50 @@ func (c *ShardedCoordinator) awaitRegistration(ctx context.Context, reqs *Operat
 // the cutover has fired AND a storage DEK is active. Only such writes
 // are gated by awaitRegistration; reads and cleartext writes are not.
 func (c *ShardedCoordinator) writeWouldEncrypt(reqs *OperationGroup[OP]) bool {
-	g := c.registrationGate
-	if g == nil {
+	if c.registrationGate == nil {
 		return false
 	}
-	if !hasMutatingElems(reqs) || g.StorageEnvelopeActive == nil || !g.StorageEnvelopeActive() {
+	return hasMutatingElems(reqs) && c.encryptionWriteActive()
+}
+
+// awaitRegistrationBarrier is the write-layer (Transactional.Commit)
+// half of the §4.1 first-write gate. Unlike awaitRegistration it takes
+// no OperationGroup: every Commit is a write, so the gate fires
+// whenever a registration is pending AND the write would land
+// encrypted (cutover fired + active DEK). nil-receiver-safe (tests
+// construct leaseRefreshingTxn without a coordinator).
+func (c *ShardedCoordinator) awaitRegistrationBarrier(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	g := c.registrationGate
+	if g == nil || g.Barrier == nil {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil // committed — fast path
+	default:
+	}
+	if !c.encryptionWriteActive() {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "encryption: commit blocked on pending §4.1 writer registration")
+	}
+}
+
+// encryptionWriteActive reports whether a write would currently land as
+// a §4.1 storage envelope: the cutover has fired AND a storage DEK is
+// active. Shared by writeWouldEncrypt (Dispatch gate) and
+// awaitRegistrationBarrier (Commit gate). Assumes c.registrationGate
+// is non-nil (both callers check that first).
+func (c *ShardedCoordinator) encryptionWriteActive() bool {
+	g := c.registrationGate
+	if g.StorageEnvelopeActive == nil || !g.StorageEnvelopeActive() {
 		return false
 	}
 	if g.ActiveStorageKeyID == nil {
@@ -302,6 +358,19 @@ func (c *ShardedCoordinator) WithPartitionResolver(r PartitionResolver) *Sharded
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
+	// Construct the coordinator before wrapping the per-shard
+	// Transactionals so each leaseRefreshingTxn can back-reference it
+	// for the §4.1 registration barrier (the gate is installed later
+	// via WithRegistrationGate and read at Commit time).
+	c := &ShardedCoordinator{
+		engine:       engine,
+		router:       router,
+		groups:       groups,
+		defaultGroup: defaultGroup,
+		clock:        clock,
+		store:        st,
+		log:          slog.Default(),
+	}
 	var deregisters []func()
 	for gid, g := range groups {
 		// Wrap Txn so every successful Commit/Abort refreshes the
@@ -309,7 +378,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		// if already wrapped so repeat calls don't stack wrappers.
 		if g.Txn != nil {
 			if _, already := g.Txn.(*leaseRefreshingTxn); !already {
-				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
+				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}
 			}
 		}
 		router.Register(gid, g.Txn, g.Store)
@@ -320,16 +389,8 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(g.lease.invalidate))
 		}
 	}
-	return &ShardedCoordinator{
-		engine:             engine,
-		router:             router,
-		groups:             groups,
-		defaultGroup:       defaultGroup,
-		clock:              clock,
-		store:              st,
-		log:                slog.Default(),
-		deregisterLeaseCbs: deregisters,
-	}
+	c.deregisterLeaseCbs = deregisters
+	return c
 }
 
 // Close releases per-shard engine-side registrations. Idempotent.
