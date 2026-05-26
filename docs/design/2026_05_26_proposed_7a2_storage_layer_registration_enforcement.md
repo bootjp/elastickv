@@ -15,7 +15,7 @@ paths. But codex P1 #3 on PR #839 showed it is **structurally
 incomplete**: internal callers that write to the store **directly**
 bypass the coordinator entirely. The confirmed case:
 
-```
+```text
 distribution.CatalogStore.Save → applySaveMutations
   → store.ApplyMutations(...)        // the DIRECT, non-Raft local commit path
     → encryptForKey → nonceFactory.Next()
@@ -203,13 +203,18 @@ guards.
 **Centralized retry helper (gemini medium).** The
 `ErrWriterNotRegistered` retry/backoff is implemented once (a shared
 `retryUntilRegistered(ctx, fn)` helper) and reused by every direct-path
-caller (catalog bootstrap, admin snapshot, migration) rather than
-duplicated, for consistent backoff + diagnostics.
+caller rather than duplicated, for consistent backoff + diagnostics.
+**Current vs. anticipated callers (claude P3):** today the only
+non-test caller of `store.ApplyMutations` is `distribution/catalog.go`
+(catalog bootstrap + runtime `SplitRange`); "admin snapshot" and
+"migration" are *anticipated future* direct-path callers named by the
+`lsm_store.go` doc comment as the design-time category, not code that
+exists yet — the implementation only needs to wire the catalog path.
 
 ## 3. Scope
 
 ### In scope (7a-2)
-- `StateCache.registered` + `MarkRegistered` / `Registered`; 7a's
+- `StateCache.registeredStorageDEKID` + `MarkRegistered` / `Registered`; 7a's
   `runWriterRegistration` marks it on barrier close.
 - `WithStorageRegistrationGate` PebbleStore option +
   `ErrWriterNotRegistered`; `encryptForKey` direct-path enforcement.
