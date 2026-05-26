@@ -195,8 +195,11 @@ lives in the bytes *after* that prefix. So:
   wider `W` or a route split resolves. Surfaced via a debug metric so
   we can tell whether `W = 8` is too small in practice.
 
-Both single-bucket cases reduce that slot to today's exact route-level
-behaviour, so they are always safe fall-backs rather than error paths.
+The single-bucket fall-backs (`K = 1`, a degenerate window, and the
+all-`0xFF` start of an unbounded route — §3.1) reduce that slot to
+today's exact route-level behaviour, so they are always safe fall-backs
+rather than error paths. An unbounded `End` with `K > 1` and a
+non-`MaxUint64` start does sub-divide.
 
 ## 4. Sampler changes (`keyviz/`)
 
@@ -579,8 +582,8 @@ implementation has no ambiguity.
    unchanged.
 5. **Test coverage** — new unit tests: `subBucketIndex`
    order-preservation + clamping + underflow guard (table-driven, incl.
-   `Start==nil`, `End==nil`→single-bucket, degenerate window,
-   `k == subEnd` edge); a `rapid` property test that `key1 <= key2 ⇒
+   `Start==nil`, `End==nil`(K>1)→sub-divides, all-0xFF-start→single-bucket,
+   degenerate window, `k == subEnd` edge); a `rapid` property test that `key1 <= key2 ⇒
    idx1 <= idx2` over random `[Start,End)` and keys; `Flush` emits one
    row per non-empty sub-bucket with bounds that **tile `[Start,End)`
    exactly** (no gap/overlap; bucket-0 `Start == route Start`,
