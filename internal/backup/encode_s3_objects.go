@@ -58,6 +58,11 @@ const (
 // emitting a record under the wrong object key.
 var ErrS3EncodeUnsupportedCollision = errors.New("backup: s3 encode object-name collision not yet supported")
 
+// s3ManifestFormatVersion is the only object .elastickv-meta.json
+// format_version the encoder accepts (a dedicated manifest constant rather
+// than reusing the bucket one, though both are currently 1).
+const s3ManifestFormatVersion uint32 = 1
+
 // ErrS3EncodeInvalidManifest is returned when an object's
 // .elastickv-meta.json sidecar cannot be parsed.
 var ErrS3EncodeInvalidManifest = errors.New("backup: s3 encode invalid object sidecar")
@@ -222,7 +227,7 @@ func (e *S3RecordEncoder) readObjectSidecar(root *os.Root, rel string) (s3Public
 	if err := decodeOneJSON(f, &pub); err != nil {
 		return s3PublicManifest{}, errors.Wrapf(ErrS3EncodeInvalidManifest, "%s: %v", rel, err)
 	}
-	if pub.FormatVersion != s3BucketFormatVersion {
+	if pub.FormatVersion != s3ManifestFormatVersion {
 		return s3PublicManifest{}, errors.Wrapf(ErrS3EncodeInvalidManifest,
 			"%s: unsupported format_version %d", rel, pub.FormatVersion)
 	}
