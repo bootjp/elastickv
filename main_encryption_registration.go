@@ -234,13 +234,6 @@ func buildProcessStartRegistrationGate(
 			w.epoch, lastSeen, activeDEK, fullNodeID)
 	}
 
-	// Arm the Stage 7a-2 direct-path gate: this load has a registration
-	// pending, so StorageRegistrationSatisfied must fail closed until the
-	// barrier closes. Only the propose branch arms it — the skip branches
-	// (Phase 0, not-bootstrapped, already-registered) leave it unarmed so
-	// a runtime EnableStorageEnvelope cannot trap their direct writes
-	// (codex P1 on PR #847).
-	w.cache.ArmStorageRegistration()
 	barrier := make(chan struct{})
 	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
 	req := registrationRequest(activeDEK, fullNodeID, w.epoch)

@@ -267,13 +267,17 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 	}
 }
 
-// TestBuildProcessStartRegistrationGate_Phase0BootDoesNotArmGate pins
-// the codex P1 fix on PR #847: a node that boots in Phase 0 (envelope
-// inactive) must NOT arm the Stage 7a-2 direct-path gate, so a later
-// runtime EnableStorageEnvelope cannot trap its direct writes forever.
-// After the Phase-0 ungated return, StorageRegistrationSatisfied() must
-// remain true even once the envelope flips active at runtime.
-func TestBuildProcessStartRegistrationGate_Phase0BootDoesNotArmGate(t *testing.T) {
+// TestBuildProcessStartRegistrationGate_Phase0BootDoesNotMarkRegistered
+// documents the design §2.3 fail-closed posture: a node that boots in
+// Phase 0 (envelope inactive) skips registration without seeding
+// Registered(), so the per-DEK gate is NOT registered for the active
+// DEK. The Phase-0 boot itself emits no encrypted writes (envelope
+// inactive → cleartext, gate unconsulted); a runtime EnableStorageEnvelope
+// would then fail closed until the node (re)registers — the deferred
+// runtime-registration follow-on. This is the safe posture (no fail-OPEN
+// per §2.3), and benign today since the only direct write is the startup
+// catalog bootstrap Save (covered by retryUntilRegistered).
+func TestBuildProcessStartRegistrationGate_Phase0BootDoesNotMarkRegistered(t *testing.T) {
 	t.Parallel()
 	st := newRegistrationTestStore(t)
 	w := wiringFor(t, testRegDEKID, false /*envelope inactive: Phase 0*/, 1)
@@ -288,16 +292,12 @@ func TestBuildProcessStartRegistrationGate_Phase0BootDoesNotArmGate(t *testing.T
 	if gate == nil || gate.Barrier != nil {
 		t.Fatalf("Phase 0 should be ungated (nil Barrier), got %+v", gate)
 	}
-	// Simulate a runtime EnableStorageEnvelope: the cutover flips the
-	// envelope active on the shared cache.
-	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
-	sc.Active.Storage = testRegDEKID
-	w.cache.RefreshFromSidecar(sc)
-	// The direct-path gate must stay satisfied — the load never armed a
-	// registration, so it is not subject to enforcement (mirrors 7a's
-	// permanently-ungated coordinator gate for Phase-0 boots).
-	if !w.cache.StorageRegistrationSatisfied() {
-		t.Error("Phase-0 boot trapped direct writes after runtime cutover (StorageRegistrationSatisfied=false)")
+	// Phase-0 boot did not seed Registered(): the node is not registered
+	// for the active DEK, so a later runtime cutover fail-closes the gate
+	// (deferred runtime-registration). The gate is correctly per-DEK and
+	// fail-closed rather than fail-OPEN (§2.3).
+	if w.cache.Registered() {
+		t.Error("Phase-0 boot unexpectedly marked Registered() — must not seed registration")
 	}
 }
 

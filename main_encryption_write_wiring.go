@@ -104,13 +104,12 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 		// Stage 7a-2 §4.1 direct-path registration gate: the store
 		// refuses to emit an encrypted envelope on a self-originated
 		// write (catalog bootstrap Save) until this load's writer
-		// registration has committed for the active storage DEK. Uses
-		// StorageRegistrationSatisfied (not Registered directly) so the
-		// gate is inert for loads that never armed a registration — a
-		// Phase-0 boot followed by a runtime EnableStorageEnvelope must
-		// not fail closed forever (codex P1 on PR #847). Reads from the
-		// same shared cache the registration paths arm + MarkRegistered.
-		store.WithStorageRegistrationGate(w.cache.StorageRegistrationSatisfied),
+		// registration has committed for the active storage DEK. Reads
+		// Registered() (per-DEK, fail-closed) from the same shared cache
+		// the registration paths MarkRegistered. Design §2.3 forbids any
+		// fail-OPEN fallback, so unregistered loads are gated — see the
+		// Registered() doc for the deferred runtime-registration cases.
+		store.WithStorageRegistrationGate(w.cache.Registered),
 	}
 }
 

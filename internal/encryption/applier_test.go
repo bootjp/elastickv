@@ -1920,61 +1920,6 @@ func TestStateCache_Registered(t *testing.T) {
 	}
 }
 
-// TestStateCache_StorageRegistrationSatisfied exercises the codex P1 fix
-// on PR #847: the direct-path gate predicate is inert until a load arms a
-// registration (Phase-0 boot must not trap direct writes after a runtime
-// EnableStorageEnvelope), and once armed it fails closed until the active
-// DEK is marked registered (composing with 7b rotation).
-func TestStateCache_StorageRegistrationSatisfied(t *testing.T) {
-	t.Parallel()
-	c := encryption.NewStateCache()
-	sc := &encryption.Sidecar{Version: encryption.SidecarVersion}
-	sc.Active.Storage = 7
-	c.RefreshFromSidecar(sc)
-
-	// Unarmed (Phase-0 boot posture): satisfied is always true, even with
-	// an active DEK and no registration — a runtime cutover cannot trap.
-	if !c.StorageRegistrationSatisfied() {
-		t.Error("unarmed StorageRegistrationSatisfied() = false, want true (must not trap)")
-	}
-
-	// Armed but not registered → fail closed.
-	c.ArmStorageRegistration()
-	if c.StorageRegistrationSatisfied() {
-		t.Error("armed+unregistered StorageRegistrationSatisfied() = true, want false")
-	}
-
-	// Armed + registered for the active DEK → satisfied.
-	c.MarkRegistered(7)
-	if !c.StorageRegistrationSatisfied() {
-		t.Error("armed+registered StorageRegistrationSatisfied() = false, want true")
-	}
-
-	// 7b rotate to DEK 8: armed stays true, DEK 8 unmarked → fail closed
-	// again until re-registration.
-	sc.Active.Storage = 8
-	c.RefreshFromSidecar(sc)
-	if c.StorageRegistrationSatisfied() {
-		t.Error("armed+rotated-unregistered StorageRegistrationSatisfied() = true, want false")
-	}
-	c.MarkRegistered(8)
-	if !c.StorageRegistrationSatisfied() {
-		t.Error("armed+rotated-registered StorageRegistrationSatisfied() = false, want true")
-	}
-}
-
-// TestStateCache_StorageRegistrationSatisfied_NilSafe pins the nil
-// receiver to the permissive (true) default — a nil cache must not trap
-// writes.
-func TestStateCache_StorageRegistrationSatisfied_NilSafe(t *testing.T) {
-	t.Parallel()
-	var c *encryption.StateCache
-	if !c.StorageRegistrationSatisfied() {
-		t.Error("nil StateCache.StorageRegistrationSatisfied() = false, want true")
-	}
-	c.ArmStorageRegistration() // must not panic
-}
-
 // TestApplier_StorageAccessors_ConcurrentReads exercises the
 // atomic.Uint32 / atomic.Bool seam under -race. The accessors are
 // called on the hot storage Put path, so a torn read or a missed

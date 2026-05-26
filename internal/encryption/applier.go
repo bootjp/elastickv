@@ -147,19 +147,6 @@ type StateCache struct {
 	// activeStorageDEKID and re-registers, which Registered()'s
 	// equality check handles without a reset.
 	registeredStorageDEKID atomic.Uint32
-	// storageRegistrationArmed reports whether this process load actually
-	// triggered a writer registration (the §4.1 propose path — envelope
-	// active at boot with a registration pending). It gates whether the
-	// Stage 7a-2 direct-path enforcement is in force at all: when a node
-	// boots in Phase 0 (envelope inactive) the process-start path skips
-	// registration, so there is no pending registration to wait on — and
-	// if EnableStorageEnvelope is applied later at runtime, the direct
-	// path must NOT start failing closed (there is no runtime registration
-	// path yet; that is the deferred 7a follow-on). This mirrors 7a's
-	// coordinator gate, which returns a permanently-ungated gate object in
-	// the same skip branches. Set once by ArmStorageRegistration from the
-	// propose branch; never reset.
-	storageRegistrationArmed atomic.Bool
 }
 
 // NewStateCache returns a zero-initialised StateCache. The
@@ -227,12 +214,23 @@ func (c *StateCache) MarkRegistered(dekID uint32) {
 	c.registeredStorageDEKID.Store(dekID)
 }
 
-// Registered reports whether this process load has confirmed its
-// §4.1 writer registration for the currently-active storage DEK. It is
-// the pure "is-marked" predicate; the Stage 7a-2 direct-path gate
-// consults StorageRegistrationSatisfied() (which delegates here only
-// when a registration was armed), NOT Registered() directly — a load
-// that never armed a registration must not be gated.
+// Registered reports whether this process load has confirmed its §4.1
+// writer registration for the currently-active storage DEK. It is the
+// predicate Stage 7a-2's WithStorageRegistrationGate consults on the
+// direct write path: a self-originated encrypted write is refused
+// (ErrWriterNotRegistered) until Registered() is true.
+//
+// It is deliberately per-DEK and fail-closed (design §2.3 forbids any
+// fail-OPEN fallback): a node that has not registered for the active DEK
+// — including a freshly rotated DEK it has not yet re-registered under
+// (7b) — is gated. The runtime cases where a node legitimately needs to
+// (re)register before its first encrypted direct write (Phase-0 boot then
+// runtime EnableStorageEnvelope; non-proposer node after a runtime
+// RotateDEK) are the deferred runtime-registration follow-on; until it
+// lands they fail closed, which is the safe posture. No real runtime
+// direct-write caller exists today — the only direct ApplyMutations path
+// is the startup catalog bootstrap Save, which is covered by
+// retryUntilRegistered + the already-registered MarkRegistered seed.
 //
 // Lock-free: two atomic loads. Returns false when there is no active
 // storage DEK (id == 0) so a pre-bootstrap process never claims to be
@@ -245,43 +243,6 @@ func (c *StateCache) Registered() bool {
 	}
 	id := c.activeStorageDEKID.Load()
 	return id != 0 && c.registeredStorageDEKID.Load() == id
-}
-
-// ArmStorageRegistration marks that this process load triggered a §4.1
-// writer registration (the propose path). Until armed, the Stage 7a-2
-// direct-path gate is inert (StorageRegistrationSatisfied returns true),
-// so a node that booted in Phase 0 is never trapped if EnableStorageEnvelope
-// is applied at runtime. Set once at process start; never reset.
-func (c *StateCache) ArmStorageRegistration() {
-	if c == nil {
-		return
-	}
-	c.storageRegistrationArmed.Store(true)
-}
-
-// StorageRegistrationSatisfied is the predicate the Stage 7a-2 direct-path
-// gate (WithStorageRegistrationGate) actually consults. It returns false
-// — fail closed — only when this load armed a registration (the propose
-// path) AND that registration has not yet committed for the active DEK.
-//
-// When the load did NOT arm a registration (Phase 0 boot, not bootstrapped,
-// already-registered restart), it returns true so direct encrypted writes
-// are never trapped — mirroring 7a's coordinator gate, which is a
-// permanently-ungated gate object in those branches. This is the codex P1
-// fix on PR #847: wiring the live Registered() predicate alone would have
-// made a Phase-0-booted node fail closed forever after a runtime cutover,
-// since no runtime registration path exists yet (deferred 7a follow-on).
-//
-// Composes with 7b: armed stays true across a rotate-dek, and Registered()
-// re-arms per-DEK, so a rotation correctly re-gates until re-registration.
-func (c *StateCache) StorageRegistrationSatisfied() bool {
-	if c == nil {
-		return true
-	}
-	if !c.storageRegistrationArmed.Load() {
-		return true
-	}
-	return c.Registered()
 }
 
 // KEKUnwrapper is the abstraction the Applier uses to recover
