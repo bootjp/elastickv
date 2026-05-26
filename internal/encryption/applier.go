@@ -228,10 +228,11 @@ func (c *StateCache) MarkRegistered(dekID uint32) {
 }
 
 // Registered reports whether this process load has confirmed its
-// §4.1 writer registration for the currently-active storage DEK. It
-// is the predicate Stage 7a-2's WithStorageRegistrationGate consults
-// on the direct write path: an encrypted self-originated write is
-// refused (ErrWriterNotRegistered) until Registered() is true.
+// §4.1 writer registration for the currently-active storage DEK. It is
+// the pure "is-marked" predicate; the Stage 7a-2 direct-path gate
+// consults StorageRegistrationSatisfied() (which delegates here only
+// when a registration was armed), NOT Registered() directly — a load
+// that never armed a registration must not be gated.
 //
 // Lock-free: two atomic loads. Returns false when there is no active
 // storage DEK (id == 0) so a pre-bootstrap process never claims to be
