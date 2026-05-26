@@ -587,12 +587,32 @@ flakiness, tracked separately from the correctness fix.
   follow-ups? (Default: only the list-append family the Jepsen workload
   exercises; everything else keeps today's behaviour until its hook is
   added.)
-- **Synchronous-dispatch linchpin.** The race-freedom argument assumes a
-  dispatch returns only after its entry has applied or been abandoned at a
-  now-deposed leader (so the retry's E2 is never overtaken by E1). This
-  should be re-verified against the actual coordinator/propose path before
-  implementation, and an assertion or test added to lock it down. If it
-  cannot be guaranteed, fall back to (a).
+- **Synchronous-dispatch linchpin — VERIFIED (2026-05-26).** The
+  race-freedom argument assumes a dispatch returns only after its entry has
+  applied or been abandoned at a now-deposed leader (so the retry's E2 is
+  never overtaken by E1). Confirmed against the propose/apply path:
+  - `applyRequests` (`kv/transaction.go:152`) proposes with
+    `context.Background()`, so `Engine.Propose`
+    (`internal/raftengine/etcd/engine.go:606`) blocks until the entry
+    applies or the proposal is *failed* — it never abandons on a caller
+    timeout (the `ctx.Done()` branch is dead under Background).
+  - A pending proposal is failed only via (a) submission rejection (entry
+    never appended → never applies) or (b) the Leader→non-Leader transition
+    in `refreshStatus` (`engine.go:2179-2190`) calling
+    `failPending(errNotLeader)`, which *drains* the proposal from the
+    pending map so this engine never re-proposes it.
+  - On commit, `applyNormalEntry` runs `fsm.Apply` at the entry's assigned
+    log index *regardless* of whether the proposal notification is still
+    pending; `resolveProposal` (`engine.go:1780`) no-ops the notify if the
+    entry was already drained.
+
+  Therefore E1 applies at its (lower) log index before E2, or never applies
+  (truncated / never-appended) — it can never apply *after* E2. The
+  ambiguous-commit case (E1 committed by the successor leader while the
+  adapter received `errNotLeader`) maps to outcome 1: E1 applies first, the
+  exact-ts probe hits, E2 no-ops. M2 should add a regression test that pins
+  this ordering. The linchpin holds, so option 2 is cleared for
+  implementation.
 
 ## Decision log
 
@@ -616,3 +636,11 @@ flakiness, tracked separately from the correctness fix.
   never). Because the argument holds, option 2 is primary and implementation
   (M1–M4) is authorised to begin; (a) is the retreat if the synchronous-
   dispatch linchpin (Open questions) cannot be guaranteed.
+- (2026-05-26) **synchronous-dispatch linchpin verified** against the
+  propose/apply path (`kv/transaction.go:152`, `engine.go:606/1780/2179`):
+  the txn dispatch proposes with `context.Background()` and blocks until
+  apply or until the proposal is failed-and-drained on a Leader→non-Leader
+  transition; a drained proposal is never re-proposed, and `fsm.Apply` runs
+  at the entry's own (lower) log index. So attempt-1's entry applies before
+  the retry's or never — never after. The race-freedom premise holds; option
+  2 is cleared to implement.
