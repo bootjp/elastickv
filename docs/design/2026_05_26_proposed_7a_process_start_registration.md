@@ -113,16 +113,18 @@ is replicated state already present on this node post-bootstrap),
 reusing the same `RegistryKey(dek_id, NodeID16(full_node_id))` lookup
 `ApplyRegistration` / `GuardLocalEpochRollback` use.
 
-**Registry handle access (review finding #2).** `buildShardGroups`
-already constructs a `WriterRegistryStore` per shard via
-`store.WriterRegistryFor(st)` and hands it to each `Applier`. 7a
-threads the **default group's** `WriterRegistryStore` out of
-`buildShardGroups` (returned alongside the runtimes, keyed by
-`cfg.defaultGroup`) so the post-`buildShardGroups` intent step reads
-the same handle the FSM's `ApplyRegistration` mutates — rather than
-adding a new accessor that reaches into the runtime/applier internals.
-This keeps the registry's single owner (the default-group store) and
-avoids a second `WriterRegistryFor` over the same Pebble dir.
+**Registry handle access (review finding #2 — as built).** The intent
+step reads the registry through `store.WriterRegistryFor(
+shardGroups[cfg.defaultGroup].Store)`. The proposal-round plan was to
+thread the per-shard handle out of `buildShardGroups`, but
+`WriterRegistryFor` returns a **stateless** `*pebbleWriterRegistry`
+wrapper over the shared `*pebbleStore` — a second wrapper for a
+read-only `GetRegistryRow` is byte-for-byte equivalent to the
+applier's handle and holds no state of its own. So the simpler choice
+(a fresh read-only wrapper over the already-open default-group store)
+avoids widening `buildShardGroups`' already-long return signature with
+no correctness cost: the durable registry rows still have a single
+owner (the FSM apply path), and the intent step only reads.
 
 ### 3.2 Coordinator first-write gate
 
@@ -241,6 +243,27 @@ emit an unregistered nonce).
   while blocked.
 
 ### Out of scope
+- **7a-2 (complete write-path coverage)** — the coordinator-layer
+  barrier in this slice gates the client-write path (`Dispatch`) and
+  the internal lock-resolution path (`leaseRefreshingTxn.Commit`), but
+  **not** internal paths that write to the store directly without going
+  through the coordinator — notably `distribution.CatalogStore.Save` →
+  `store.ApplyMutations` (codex P1 on PR #839). Coordinator-layer
+  gating is structurally incapable of covering those; the single
+  chokepoint for "registered before any encrypted write" is the
+  nonce-emission point, `store.encryptForKey`. 7a-2 will fail-close
+  there (a non-blocking registered-flag read that refuses to emit an
+  encrypted nonce before registration), giving complete coverage of
+  every write path. **Interim bounded-safety** until 7a-2: the §5.1
+  `local_epoch` bump already prevents concrete nonce *reuse* (every
+  nonce this load emits carries the freshly-bumped epoch — unique vs.
+  all prior loads, monotonic within), and the only scenario where the
+  registry ledger is load-bearing for nonce uniqueness — a cross-node
+  16-bit `node_id` collision — is caught by the `ErrNodeIDCollision`
+  startup membership pre-check. So the residual exploitable window
+  (catalog/direct-store write × node_id collision past the startup
+  guard × sub-second pre-registration window) is negligible, and 7a-2
+  closes it entirely.
 - **7b** — post-rotation re-registration (register against the new DEK
   on a `rotate-dek` apply, same barrier mechanism).
 - **7c** — ConfChange-time registration (leader pairs a
@@ -286,7 +309,8 @@ All three original open questions were settled by the round-1 review:
    run-context to avoid a leak / a barrier-close on an uncommitted
    registration (§3.2, review #3).
 
-Remaining items to resolve **within the implementation PR** (not
-deferred further): the exact `hasMutatingElems` predicate over the
-`OperationGroup` shape, and the default-group `WriterRegistryStore`
-threading out of `buildShardGroups` (§3.1).
+Both items were resolved in the implementation PR (#839):
+`hasMutatingElems` is implemented over `OperationGroup.Elems` in
+`kv/sharded_coordinator.go`; the `WriterRegistryStore` handle is a
+stateless `store.WriterRegistryFor(...)` wrapper (§3.1) rather than a
+threaded-out return value from `buildShardGroups`.

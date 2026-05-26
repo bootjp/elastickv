@@ -350,7 +350,7 @@ func run() error {
 	// a storage DEK is already active on disk (restart path); on a
 	// pre-bootstrap binary the per-Put gate stays cleartext until a
 	// runtime Bootstrap + EnableStorageEnvelope flips it.
-	runtimes, shardGroups, err := buildShardGroupsWithEncryptionWiring(
+	runtimes, shardGroups, encWiring, err := buildShardGroupsWithEncryptionWiring(
 		*raftId,
 		*raftDir,
 		cfg.groups,
@@ -420,8 +420,17 @@ func run() error {
 		ctx, runtimes, cfg.sqsFifoPartitionMap,
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
-	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
+	eg, runCtx := errgroup.WithContext(ctx)
+	// setupDistributionCatalog + the Stage 7a process-start registration
+	// gate are bundled so run() has a single startup-fault path: a
+	// registry-read / behind-epoch failure fails the process
+	// synchronously here, BEFORE the gRPC servers serve, so writes never
+	// run with no registration gate installed (codex P1 on PR #839).
+	distCatalog, err := setupDistributionAndRegistration(
+		ctx, runCtx, eg, runtimes, cfg.engine,
+		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
 	if err != nil {
+		cancel()
 		return err
 	}
 	// Seed AFTER setupDistributionCatalog so the sampler picks up the
@@ -431,7 +440,7 @@ func run() error {
 	// the placeholder zero IDs from buildEngine and Observe would miss
 	// every dispatched mutation.
 	seedKeyVizRoutes(sampler, cfg.engine)
-	eg, runCtx := errgroup.WithContext(ctx)
+
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
 	})
