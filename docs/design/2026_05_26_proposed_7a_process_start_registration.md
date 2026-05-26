@@ -309,7 +309,8 @@ All three original open questions were settled by the round-1 review:
    run-context to avoid a leak / a barrier-close on an uncommitted
    registration (§3.2, review #3).
 
-Remaining items to resolve **within the implementation PR** (not
-deferred further): the exact `hasMutatingElems` predicate over the
-`OperationGroup` shape, and the default-group `WriterRegistryStore`
-threading out of `buildShardGroups` (§3.1).
+Both items were resolved in the implementation PR (#839):
+`hasMutatingElems` is implemented over `OperationGroup.Elems` in
+`kv/sharded_coordinator.go`; the `WriterRegistryStore` handle is a
+stateless `store.WriterRegistryFor(...)` wrapper (§3.1) rather than a
+threaded-out return value from `buildShardGroups`.
