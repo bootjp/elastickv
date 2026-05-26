@@ -1,0 +1,210 @@
+package backup
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+
+	"github.com/cockroachdb/errors"
+)
+
+const sqsEncTS uint64 = 0x0001_8F1A_2B3C_00EE
+
+// writeSQSQueue writes a _queue.json and messages.jsonl under
+// <root>/sqs/<EncodeSegment(queue)>/.
+func writeSQSQueue(t *testing.T, root, queue string, queueJSON []byte, msgLines [][]byte) {
+	t.Helper()
+	dir := filepath.Join(root, "sqs", EncodeSegment([]byte(queue)))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "_queue.json"), queueJSON, 0o600); err != nil {
+		t.Fatalf("WriteFile _queue.json: %v", err)
+	}
+	if len(msgLines) > 0 {
+		if err := os.WriteFile(filepath.Join(dir, "messages.jsonl"), bytes.Join(msgLines, []byte("\n")), 0o600); err != nil {
+			t.Fatalf("WriteFile messages.jsonl: %v", err)
+		}
+	}
+}
+
+// encodeSQSTree runs the SQS reverse encoder over inRoot and returns the
+// EKVPBBL1 bytes.
+func encodeSQSTree(t *testing.T, inRoot string) []byte {
+	t.Helper()
+	b := newSnapshotBuilder(sqsEncTS)
+	if err := NewSQSRecordEncoder(inRoot).Encode(b); err != nil {
+		t.Fatalf("SQSRecordEncoder.Encode: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := b.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// decodeSQSAndRead decodes fsm and returns the queue's _queue.json and its
+// messages.jsonl records.
+func decodeSQSAndRead(t *testing.T, fsm []byte, queue string) (sqsQueueMetaPublic, []sqsMessageRecord) {
+	t.Helper()
+	out := t.TempDir()
+	if _, err := DecodeSnapshot(bytes.NewReader(fsm), DecodeOptions{
+		OutRoot:  out,
+		Adapters: AdapterSet{SQS: true},
+	}); err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	dir := filepath.Join(out, "sqs", EncodeSegment([]byte(queue)))
+	metaData, err := os.ReadFile(filepath.Join(dir, "_queue.json"))
+	if err != nil {
+		t.Fatalf("read decoded _queue.json: %v", err)
+	}
+	var meta sqsQueueMetaPublic
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatalf("unmarshal decoded _queue.json: %v", err)
+	}
+	var msgs []sqsMessageRecord
+	f, err := os.Open(filepath.Join(dir, "messages.jsonl"))
+	if err == nil {
+		defer func() { _ = f.Close() }()
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+		for sc.Scan() {
+			line := sc.Bytes()
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			var rec sqsMessageRecord
+			if err := json.Unmarshal(line, &rec); err != nil {
+				t.Fatalf("unmarshal decoded message: %v", err)
+			}
+			msgs = append(msgs, rec)
+		}
+	}
+	return meta, msgs
+}
+
+// TestSQSEncodeStandardQueueRoundTrip pins the gold-standard round-trip
+// for a standard (non-FIFO) queue with two messages.
+func TestSQSEncodeStandardQueueRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "orders"
+	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"orders",`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{
+			[]byte(`{"message_id":"m1","body":"hello","send_timestamp_millis":1000,"available_at_millis":1000}`),
+			[]byte(`{"message_id":"m2","body":"world","send_timestamp_millis":2000,"available_at_millis":2000}`),
+		})
+
+	meta, msgs := decodeSQSAndRead(t, encodeSQSTree(t, in), queue)
+	if meta.Name != queue || meta.VisibilityTimeoutSeconds != 30 || meta.MessageRetentionSeconds != 345600 {
+		t.Fatalf("decoded meta = %+v", meta)
+	}
+	got := map[string]string{}
+	for _, m := range msgs {
+		got[m.MessageID] = string(m.Body)
+	}
+	if len(got) != 2 || got["m1"] != "hello" || got["m2"] != "world" {
+		t.Fatalf("decoded messages = %#v", got)
+	}
+}
+
+// TestSQSEncodeFifoSeqCounter pins that a FIFO queue emits a
+// !sqs|queue|seq| counter = max(sequence_number)+1, and the message bodies
+// round-trip.
+func TestSQSEncodeFifoSeqCounter(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "orders.fifo"
+	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"orders.fifo","fifo":true,`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{
+			[]byte(`{"message_id":"m1","body":"a","send_timestamp_millis":1000,"available_at_millis":1000,"message_group_id":"g","sequence_number":5}`),
+			[]byte(`{"message_id":"m2","body":"b","send_timestamp_millis":2000,"available_at_millis":2000,"message_group_id":"g","sequence_number":9}`),
+		})
+
+	entries, _, err := DecodeLiveEntries(bytes.NewReader(encodeSQSTree(t, in)))
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	seq := sqsFindEntry(entries, sqsQueueSeqKeyBytes(queue))
+	if seq == nil {
+		t.Fatal("no !sqs|queue|seq| counter emitted for FIFO queue")
+	}
+	if got := string(seq.UserValue); got != "10" {
+		t.Fatalf("seq counter = %q, want \"10\" (max 9 + 1)", got)
+	}
+	gen := sqsFindEntry(entries, sqsQueueGenKeyBytes(queue))
+	if gen == nil || string(gen.UserValue) != strconv.FormatUint(sqsRestoreGeneration, 10) {
+		t.Fatalf("gen counter = %v, want %d", gen, sqsRestoreGeneration)
+	}
+}
+
+// sqsFindEntry returns the first live entry with the given user key, or nil.
+func sqsFindEntry(entries []RoundTripEntry, key []byte) *RoundTripEntry {
+	for i := range entries {
+		if bytes.Equal(entries[i].UserKey, key) {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
+// TestSQSEncodeBinaryBodyRoundTrip pins that a non-UTF-8 message body
+// (stored as a {base64:...} envelope in messages.jsonl) round-trips.
+func TestSQSEncodeBinaryBodyRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "bin"
+	// body bytes {0xFF,0x00,0xFE} are not valid UTF-8 → base64url envelope.
+	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"bin",`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{
+			[]byte(`{"message_id":"b1","body":{"base64":"_wD-"},"send_timestamp_millis":1000,"available_at_millis":1000}`),
+		})
+
+	_, msgs := decodeSQSAndRead(t, encodeSQSTree(t, in), queue)
+	if len(msgs) != 1 || !bytes.Equal([]byte(msgs[0].Body), []byte{0xFF, 0x00, 0xFE}) {
+		t.Fatalf("binary body round-trip = %x", []byte(msgs[0].Body))
+	}
+}
+
+// TestSQSEncodeRejectsPartitioned pins fail-closed for an HT-FIFO queue.
+func TestSQSEncodeRejectsPartitioned(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "ht.fifo", []byte(`{"format_version":1,"name":"ht.fifo","fifo":true,`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0,"partition_count":4}`), nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeUnsupportedPartitioned) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeUnsupportedPartitioned", err)
+	}
+}
+
+// TestSQSEncodeMissingDirIsNoop pins that an absent sqs/ dir is a no-op.
+func TestSQSEncodeMissingDirIsNoop(t *testing.T) {
+	t.Parallel()
+	b := newSnapshotBuilder(sqsEncTS)
+	if err := NewSQSRecordEncoder(t.TempDir()).Encode(b); err != nil {
+		t.Fatalf("Encode on empty tree: %v", err)
+	}
+	if b.Len() != 0 {
+		t.Fatalf("entries = %d, want 0", b.Len())
+	}
+}
+
+// TestSQSEncodeRejectsUnknownFormatVersion pins the _queue.json format gate.
+func TestSQSEncodeRejectsUnknownFormatVersion(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "q", []byte(`{"format_version":99,"name":"q"}`), nil)
+	b := newSnapshotBuilder(sqsEncTS)
+	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidQueue", err)
+	}
+}

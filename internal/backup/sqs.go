@@ -192,6 +192,29 @@ func (b sqsMessageBody) MarshalJSON() ([]byte, error) {
 	return out, nil
 }
 
+// UnmarshalJSON is the inverse of MarshalJSON: a plain JSON string is the
+// UTF-8 body verbatim, and a {"base64":"..."} envelope is a non-UTF-8
+// payload. Used by the reverse encoder to read messages.jsonl back.
+func (b *sqsMessageBody) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*b = sqsMessageBody(s)
+		return nil
+	}
+	var envelope struct {
+		Base64 string `json:"base64"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return errors.WithStack(err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(envelope.Base64)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	*b = sqsMessageBody(raw)
+	return nil
+}
+
 // sqsMessageRecord is the dump-format projection. Mirrors the live
 // adapter/sqs_messages.go:80 record one-to-one — JSON tag names match so
 // a restorer can call SendMessage with each line as the input. Visibility
