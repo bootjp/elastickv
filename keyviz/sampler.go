@@ -616,12 +616,28 @@ func intFromUint64(v uint64) int {
 // fracMul returns floor(a*b/c) with an exact 128-bit intermediate via
 // math/bits, so the multiply cannot overflow uint64. Callers guarantee
 // c > 0 and the quotient < 2^64 (both hold for sub-bucket math: the
-// interior guard bounds a*b below c*2^64 because k is capped well below
-// 2^64). Shared by the forward index path and the Flush bound
-// reconstruction so the two can never diverge.
+// interior guard bounds a*b below c*2^64 because effK <= subSpan).
+// Used by the forward index path (subBucketIndex).
 func fracMul(a, b, c uint64) uint64 {
 	hi, lo := bits.Mul64(a, b)
 	q, _ := bits.Div64(hi, lo, c)
+	return q
+}
+
+// fracMulCeil returns ceil(a*b/c) with the same exact 128-bit
+// intermediate. boundaryAt uses ceil (not floor) so an emitted interior
+// boundary is exactly the forward map's lower edge of bucket i:
+// subBucketIndex puts w in bucket i iff w-subStart in
+// [ceil(i*subSpan/k), ceil((i+1)*subSpan/k)). With floor boundaries a
+// key landing exactly on a boundary value would be counted in the lower
+// bucket yet excluded from its half-open [Start, End) label (Codex P2);
+// ceil keeps the displayed ranges consistent with where keys are counted.
+func fracMulCeil(a, b, c uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	q, r := bits.Div64(hi, lo, c)
+	if r != 0 {
+		q++
+	}
 	return q
 }
 
@@ -756,13 +772,14 @@ func (slot *routeSlot) subBucketBounds(i int, routeStart, routeEnd []byte) (star
 	return start, end
 }
 
-// boundaryAt reconstructs the key at fraction i/k of the route's window:
-// subStart + floor(i*subSpan/k), written big-endian into the W-byte
-// window at subPrefixLen, behind the route's shared prefix. Uses the
-// same math/bits kernel as subBucketIndex so the forward and inverse
-// directions can never disagree.
+// boundaryAt reconstructs bucket i's lower edge in key space:
+// subStart + ceil(i*subSpan/k), written big-endian into the W-byte
+// window at subPrefixLen, behind the route's shared prefix. ceil (via
+// fracMulCeil) makes this exactly the forward map's lower edge of bucket
+// i, so the emitted half-open [Start, End) ranges agree with where
+// subBucketIndex counts boundary-value keys (Codex P2).
 func (slot *routeSlot) boundaryAt(i int, routeStart []byte) []byte {
-	off := slot.subStart + fracMul(u64NonNeg(i), slot.subSpan, u64NonNeg(len(slot.subBuckets)))
+	off := slot.subStart + fracMulCeil(u64NonNeg(i), slot.subSpan, u64NonNeg(len(slot.subBuckets)))
 	out := make([]byte, slot.subPrefixLen+subWindowBytes)
 	copy(out, routeStart[:min(slot.subPrefixLen, len(routeStart))])
 	binary.BigEndian.PutUint64(out[slot.subPrefixLen:], off)

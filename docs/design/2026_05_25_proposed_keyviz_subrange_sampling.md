@@ -131,10 +131,11 @@ lives in the bytes *after* that prefix. So:
      (`uint64(K)` cast shown explicitly — `K` is an `int`/`uint32`
      config value while `bits.Mul64` takes `uint64`).
      `bits.Div64` panics only when `hi >= subSpan`; the interior guard
-     guarantees `k - subStart < subSpan`, so `hi < K`, and `K` is
-     capped well below `subSpan` whenever `subSpan > 0` (the degenerate
-     `subSpan == 0` route is forced to `K=1` at register — §3.2 — and
-     never reaches this branch). With the `k >= subEnd` guard already
+     guarantees `k - subStart < subSpan`, so `hi < K`, and the effective
+     `K` is **at most `subSpan`** (`effKForSpan` caps it — §3.2), so
+     `hi < K ≤ subSpan` and the divide is safe. The degenerate
+     `subSpan == 0` route is forced to `effK = 1` at register (§3.2) and
+     never reaches this branch. With the `k >= subEnd` guard already
      handling the top edge, the interior case (`k <= subEnd - 1`)
      yields at most `K-1` exactly, so a final clamp to `[0, K-1]` can
      **never actually fire** — it is kept only as defensive
@@ -156,12 +157,20 @@ lives in the bytes *after* that prefix. So:
   `[subStart, MaxUint64]`** (revised — see the note below). There is no
   `End` window, so set `subPrefixLen = 0`, `subStart =
   windowUint64(start)`, `subEnd = math.MaxUint64`, `subSpan =
-  MaxUint64 - subStart`, and divide that finite span into `K`. Keys
-  bucket by their leading `W`-byte window across the open high end; the
-  **last** sub-bucket keeps the route's unbounded `End` (`nil`). The
-  `subBucketIndex` upper edge clamp is skipped for this slot (its
-  `subHi` snapshot is `nil` — the unbounded sentinel), relying on the
-  window math + the `w >= subEnd` guard instead.
+  MaxUint64 - subStart`, and divide that finite span into
+  `effK = min(K, subSpan)` buckets. For a typical unbounded route
+  `subSpan ≫ K`, so `effK = K`; the cap (`effKForSpan`) only bites for a
+  near-`MaxUint64` start, where a span `< K` could otherwise make
+  `boundaryAt` emit bounds that sort before the route start (an invalid
+  `Start > End` row). Keys bucket by their leading `W`-byte window across
+  the open high end; the **last** sub-bucket keeps the route's unbounded
+  `End` (`nil`). The `subBucketIndex` upper edge clamp is skipped for
+  this slot (its `subHi` snapshot is `nil` — the unbounded sentinel),
+  relying on the window math + the `w >= subEnd` guard instead.
+  Interior boundaries are reconstructed with **`ceil(i·subSpan/effK)`**
+  (`fracMulCeil`), exactly the forward map's lower edge of bucket `i`, so
+  a key landing on a boundary value is displayed in the same bucket it is
+  counted in.
 
   *Why this reverses Open Q1.* The first review chose "single row until
   split" because the original fallback used `subSpan = 1 << (8*W)`,

@@ -203,6 +203,55 @@ func TestSamplerUnboundedHighStartValidBounds(t *testing.T) {
 	}
 }
 
+// TestSubBucketBoundsContainCountedKey pins Codex P2 (boundary/bucket
+// consistency): the emitted [Start, End) of the bucket subBucketIndex
+// assigns a key to must actually CONTAIN that key — including keys that
+// land exactly on an interior boundary value. ceil-based boundaryAt
+// guarantees this; floor-based would mis-shelve boundary-value keys.
+func TestSubBucketBoundsContainCountedKey(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		start, end []byte
+		k          int
+	}{
+		{"unbounded whole space", nil, nil, 4},
+		{"unbounded k not dividing span", nil, nil, 7},
+		{"bounded", []byte{0x00}, []byte{0x40}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			slot := layoutSlot(tc.start, tc.end, tc.k)
+			// Sweep keys, plus the exact reconstructed interior boundaries
+			// (the values most likely to expose a floor/ceil mismatch).
+			keys := [][]byte{{0x00}, {0x01}, {0x3F}, {0x40}, {0x7F}, {0x80}, {0xC0}, {0xFE}, {0xFF}}
+			for i := 1; i < len(slot.subBuckets); i++ {
+				keys = append(keys, slot.boundaryAt(i, cloneBytes(tc.start)))
+			}
+			for _, key := range keys {
+				// Only in-range keys (start <= key < end) are ever Observed
+				// against this route; the out-of-range clamp (key >= End ->
+				// last bucket) intentionally does not place such keys inside
+				// a half-open range.
+				if bytes.Compare(key, tc.start) < 0 {
+					continue
+				}
+				if tc.end != nil && bytes.Compare(key, tc.end) >= 0 {
+					continue
+				}
+				idx := slot.subBucketIndex(key)
+				lo, hi := slot.subBucketBounds(idx, cloneBytes(tc.start), cloneBytes(tc.end))
+				require.LessOrEqual(t, bytes.Compare(lo, key), 0,
+					"%s: key %x counted in bucket %d but Start %x is above it", tc.name, key, idx, lo)
+				if hi != nil {
+					require.Less(t, bytes.Compare(key, hi), 0,
+						"%s: key %x counted in bucket %d but End %x excludes it", tc.name, key, idx, hi)
+				}
+			}
+		})
+	}
+}
+
 // TestSubBucketIndexMonotone is the rapid property: key1 <= key2 implies
 // idx1 <= idx2 for any [start, end) and K (order preservation).
 func TestSubBucketIndexMonotone(t *testing.T) {
