@@ -684,10 +684,18 @@ func rowActivityTotal(r *pb.KeyVizRow) uint64 {
 // to trust route_count for drill-down decisions.
 func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *pb.KeyVizRow {
 	total := mr.MemberRoutesTotal
-	if !mr.Aggregate && total == 0 {
+	switch {
+	case !mr.Aggregate && total == 0:
 		// Individual slots fall through to RouteCount=1 when the
 		// sampler predates MemberRoutesTotal or never set it.
 		total = 1
+	case mr.Aggregate && total == 0:
+		// Defensive fallback mirroring the JSON pivot
+		// (keyviz_handler.go): a just-coalesced virtual bucket
+		// serialized before its count is set would otherwise render
+		// "0 routes", which is nonsense for an aggregate. Fall back to
+		// the visible member count so route_count stays meaningful.
+		total = uint64(len(mr.MemberRoutes))
 	}
 	row := &pb.KeyVizRow{
 		BucketId:          bucketIDFor(mr),

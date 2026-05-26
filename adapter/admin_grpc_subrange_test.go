@@ -37,6 +37,23 @@ func TestMatrixToProtoSubRowsDoNotCollide(t *testing.T) {
 	require.Equal(t, []uint64{9}, byID["route:1#1"])
 }
 
+// TestNewKeyVizRowFromAggregateZeroTotalFallback pins the adapter/handler
+// harmonization (Claude round-2 follow-up): an aggregate row whose
+// MemberRoutesTotal is still 0 (a just-coalesced bucket serialized before
+// its count is set) reports route_count = len(MemberRoutes) rather than
+// the nonsensical 0 — matching the JSON pivot's defensive fallback.
+func TestNewKeyVizRowFromAggregateZeroTotalFallback(t *testing.T) {
+	t.Parallel()
+	mr := keyviz.MatrixRow{
+		RouteID:           99,
+		Aggregate:         true,
+		MemberRoutes:      []uint64{1, 2, 3},
+		MemberRoutesTotal: 0, // not yet set
+	}
+	row := newKeyVizRowFrom(mr, 1)
+	require.Equal(t, uint64(3), row.RouteCount, "aggregate with total=0 must fall back to len(MemberRoutes)")
+}
+
 // TestMatrixToProtoK1KeepsLegacyBucketID pins that a non-sub-divided row
 // keeps the exact legacy "route:<id>" BucketId (no #suffix).
 func TestMatrixToProtoK1KeepsLegacyBucketID(t *testing.T) {
