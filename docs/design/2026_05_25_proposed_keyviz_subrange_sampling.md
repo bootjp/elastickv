@@ -131,10 +131,11 @@ lives in the bytes *after* that prefix. So:
      (`uint64(K)` cast shown explicitly — `K` is an `int`/`uint32`
      config value while `bits.Mul64` takes `uint64`).
      `bits.Div64` panics only when `hi >= subSpan`; the interior guard
-     guarantees `k - subStart < subSpan`, so `hi < K`, and `K` is
-     capped well below `subSpan` whenever `subSpan > 0` (the degenerate
-     `subSpan == 0` route is forced to `K=1` at register — §3.2 — and
-     never reaches this branch). With the `k >= subEnd` guard already
+     guarantees `k - subStart < subSpan`, so `hi < K`, and the effective
+     `K` is **at most `subSpan`** (`effKForSpan` caps it — §3.2), so
+     `hi < K ≤ subSpan` and the divide is safe. The degenerate
+     `subSpan == 0` route is forced to `effK = 1` at register (§3.2) and
+     never reaches this branch. With the `k >= subEnd` guard already
      handling the top edge, the interior case (`k <= subEnd - 1`)
      yields at most `K-1` exactly, so a final clamp to `[0, K-1]` can
      **never actually fire** — it is kept only as defensive
@@ -152,20 +153,40 @@ lives in the bytes *after* that prefix. So:
 - **`Start == nil`** (first route / open low end): treat as all-`0x00`,
   i.e. `subStart = 0`. Natural — `0x00…` is the true low end of the
   byte-order key space.
-- **`End == nil`** (last route / open high end): the route has **no
-  finite span to divide**, so it is kept as a **single sub-bucket**
-  (`K_effective = 1`) until a route split gives it a finite `End`.
-  This is the decision adopted from review (Open Q1): the earlier
-  "high-order bits over a `W`-byte window" fallback (a) had no finite
-  `subSpan` to divide by — `1 << (8*W)` with `W = 8` overflows
-  `uint64` to `0` and would divide-by-zero on the hot path — and
-  (b) introduced an observable discontinuity (the tail's sub-ranges
-  would shift the moment its heuristic span changed). A split is a
-  discrete event operators already understand; the hotspot-shard-split
-  machinery (`docs/design/2026_02_18_partial_hotspot_shard_split.md`)
-  is exactly what gives a hot tail a finite `End`, at which point the
-  route re-registers (§4.2) and gains real sub-buckets. No overflow,
-  no heuristic, no surprise.
+- **`End == nil`** (last route / open high end): **sub-divide over
+  `[subStart, MaxUint64]`** (revised — see the note below). There is no
+  `End` window, so set `subPrefixLen = 0`, `subStart =
+  windowUint64(start)`, `subEnd = math.MaxUint64`, `subSpan =
+  MaxUint64 - subStart`, and divide that finite span into
+  `effK = min(K, subSpan)` buckets. For a typical unbounded route
+  `subSpan ≫ K`, so `effK = K`; the cap (`effKForSpan`) only bites for a
+  near-`MaxUint64` start, where a span `< K` could otherwise make
+  `boundaryAt` emit bounds that sort before the route start (an invalid
+  `Start > End` row). Keys bucket by their leading `W`-byte window across
+  the open high end; the **last** sub-bucket keeps the route's unbounded
+  `End` (`nil`). The `subBucketIndex` upper edge clamp is skipped for
+  this slot (its `subHi` snapshot is `nil` — the unbounded sentinel),
+  relying on the window math + the `w >= subEnd` guard instead.
+  Interior boundaries are reconstructed with **`ceil(i·subSpan/effK)`**
+  (`fracMulCeil`), exactly the forward map's lower edge of bucket `i`, so
+  a key landing on a boundary value is displayed in the same bucket it is
+  counted in.
+
+  *Why this reverses Open Q1.* The first review chose "single row until
+  split" because the original fallback used `subSpan = 1 << (8*W)`,
+  which with `W = 8` overflows `uint64` to `0` and divides by zero.
+  Using `MaxUint64` (= `2^64 − 1`) as the effective top makes the span
+  a valid `uint64` with no overflow, so the original objection no
+  longer applies. The practical driver: the **single-route cluster and
+  every cluster's tail route are unbounded**, and that is exactly where
+  an operator most wants hot-key visibility — keeping them at one row
+  made the feature inert for the most common topology. The "split
+  changes the heuristic" discontinuity is accepted: a split is a
+  discrete event that already reshuffles routes. **Caveat:** with
+  `subPrefixLen = 0` the resolution is leading-`W`-byte-coarse, so keys
+  sharing a long prefix (e.g. `user:0001…`/`user:0002…`) still collapse
+  into one bucket — finite, tight route bounds remain the way to get
+  fine intra-prefix resolution.
 - **`subEnd <= subStart`** (the `W`-byte window captures no difference —
   e.g. `Start`/`End` differ only beyond `subPrefixLen + W`): the route
   is likewise a **single bucket** (`K_effective = 1`, `subSpan` left 0
@@ -174,8 +195,11 @@ lives in the bytes *after* that prefix. So:
   wider `W` or a route split resolves. Surfaced via a debug metric so
   we can tell whether `W = 8` is too small in practice.
 
-Both single-bucket cases reduce that slot to today's exact route-level
-behaviour, so they are always safe fall-backs rather than error paths.
+The single-bucket fall-backs (`K = 1`, a degenerate window, and the
+all-`0xFF` start of an unbounded route — §3.1) reduce that slot to
+today's exact route-level behaviour, so they are always safe fall-backs
+rather than error paths. An unbounded `End` with `K > 1` and a
+non-`MaxUint64` start does sub-divide.
 
 ## 4. Sampler changes (`keyviz/`)
 
@@ -221,14 +245,15 @@ subPrefixLen int
 subStart     uint64
 subEnd       uint64           // subStart + subSpan; the §3.1 guard reads it
 subSpan      uint64           // 0 ⇒ single-bucket slot (§3.2)
-subBuckets   []subCounter     // len == K (1 for aggregate / degenerate / unbounded-tail)
+subBuckets   []subCounter     // len == effK (1 for aggregate / degenerate)
 ```
 
 `subCounter` holds the same four `atomic.Uint64` the slot holds today.
-For `K = 1` (flag default) and for aggregate / degenerate /
-unbounded-tail slots, `subBuckets` has length 1 and `subBucketIndex`
-short-circuits to 0, so the code path collapses to exactly today's
-behaviour with one extra indirection. The `subShift` field from the
+For `K = 1` (flag default) and for aggregate / degenerate slots,
+`subBuckets` has length 1 and `subBucketIndex` short-circuits to 0, so
+the code path collapses to exactly today's behaviour with one extra
+indirection. (An unbounded-`End` route with `K > 1` does sub-divide —
+§3.2 — over `[subStart, MaxUint64]`, capped at the span.) The `subShift` field from the
 first draft is gone — `math/bits` (§3.1) makes the multiply/divide
 exact without it.
 
@@ -285,18 +310,20 @@ target `K ≤ 16`.
 `appendDrainedRow` becomes a loop over the slot's `subBuckets`: for
 each sub-bucket with any non-zero counter, emit one `MatrixRow` whose
 `Start`/`End` are the **sub-bucket bounds**, reconstructed by inverting
-the §3.1 interpolation: bucket `i` spans
-`[subStart + i*subSpan/K, subStart + (i+1)*subSpan/K)` mapped back into
-the key byte space at offset `subPrefixLen`. The interior boundary
-`i*subSpan/K` **must use the same 128-bit `math/bits` path as the
-forward computation** — `hi, lo := bits.Mul64(uint64(i), subSpan);
-bound, _ := bits.Div64(hi, lo, uint64(K))` — not plain `uint64`
-arithmetic: `i*subSpan` overflows a `uint64` once `subSpan > 2^63` and
-`i ≥ 2` (e.g. `K=3, i=2, subSpan=2^63` → `2^64` wraps to `0`),
-producing a nonsensical interior bound and a visible gap in the
-heatmap. To guarantee the sub-rows **tile the parent route exactly**
-(the "contiguous" property the heatmap advertises) despite integer
-truncation in the inverse:
+the §3.1 interpolation: bucket `i`'s lower edge is
+`subStart + ceil(i*subSpan/effK)`, mapped back into the key byte space
+at offset `subPrefixLen`. The interior boundary uses **`fracMulCeil`** —
+`hi, lo := bits.Mul64(uint64(i), subSpan); q, r := bits.Div64(hi, lo,
+uint64(effK)); if r != 0 { q++ }` — i.e. **`ceil`, deliberately the
+*dual* of the forward path's `floor` `fracMul`**, not the same function.
+Using `floor` here (the forward kernel) is exactly what mis-shelves a
+boundary-value key (§3.2, Codex P2): `ceil` makes the emitted lower edge
+equal the forward map's bucket-`i` lower edge, so a key on a boundary is
+displayed in the bucket it is counted in. The 128-bit `math/bits` form
+is still required for overflow safety — `i*subSpan` overflows `uint64`
+once `subSpan > 2^63` and `i ≥ 2`. To guarantee the sub-rows **tile the
+parent route exactly** (the "contiguous" property the heatmap advertises)
+despite integer truncation in the inverse:
 
 - sub-bucket `0`'s `Start` is pinned to the route's actual `Start`
   (not the reconstructed `subStart` window value, which dropped the
@@ -314,11 +341,12 @@ sub-range emits one row, not `K`.
 
 `MatrixRow` gains **two** fields, not one:
 
-- `SubBucket uint32` — this row's index within its route, `0` for the
+- `SubBucket int` — this row's index within its route, `0` for the
   first (or only) sub-bucket.
-- `SubBucketCount uint32` — how many sub-buckets the parent route is
-  divided into: `1` for a `K = 1` / aggregate / degenerate /
-  unbounded-tail slot, `> 1` for a genuinely sub-bucketed route.
+- `SubBucketCount int` — how many sub-buckets the parent route is
+  divided into: `1` for a `K = 1` / aggregate / degenerate slot, `> 1`
+  for a genuinely sub-bucketed route (including an unbounded-`End` route
+  with `K > 1`).
 
 `SubBucketCount` is the disambiguator `bucketIDFor` needs (Claude bot
 gap): a `K = 1` slot's single row and a `K > 1` slot's first sub-row
@@ -363,9 +391,10 @@ have narrower bounds. To keep `BucketID` unique per row within a
 column (the fan-out merge and the SPA both key on it), `bucketIDFor`
 gains a sub-range discriminator keyed on `SubBucketCount` (§4.3):
 
-- sub-bucketed route (`SubBucketCount > 1`): `route:<id>#<subIdx>`
+- sub-bucketed route (`SubBucketCount > 1`, including an unbounded-`End`
+  route with `K > 1`): `route:<id>#<subIdx>`
 - whole route (`SubBucketCount == 1`, the `K = 1` / aggregate /
-  degenerate / unbounded-tail case): `route:<id>` (unchanged)
+  degenerate case): `route:<id>` (unchanged)
 - virtual bucket: `virtual:<id>` (unchanged)
 
 ### 5.3 SPA
@@ -490,11 +519,16 @@ The four questions opened in the first draft converged in review
 (Codex, Gemini, Claude) and are now decided; recorded here so the
 implementation has no ambiguity.
 
-1. **Unbounded-tail bucketing (§3.2): single row until split.** The
-   last route's open `End` stays one row until a route split gives it a
-   finite `End`. This is both honest (no heuristic discontinuity when
-   the tail's effective span changes) and what kills the
-   `1 << (8*W)` overflow / divide-by-zero entirely. Adopted.
+1. **Unbounded-tail bucketing (§3.2): ~~single row until split~~ →
+   sub-divide over `[subStart, MaxUint64]` (revised post-merge).** The
+   first-round decision kept an open-`End` route at one row. That made
+   the feature inert for the single-route cluster and every cluster's
+   tail route — the most common place hot-key visibility is wanted. The
+   original blocker (`1 << (8*W)` overflow) is avoided by using
+   `MaxUint64` as the effective top, so the open end now sub-divides by
+   the leading-`W`-byte window (§3.2). The last sub-bucket keeps the
+   unbounded `End`. Resolution is leading-byte-coarse for `prefixLen 0`;
+   tight route bounds still give finer intra-prefix detail.
 2. **Mixed-`K` fan-out (§7): coexist, don't merge.** Rows keyed by
    `bucketID` (now embedding `#subIdx`) mean a `K = 1` row and the
    `K = 16` sub-rows appear side by side rather than merging. Tolerated
@@ -548,8 +582,8 @@ implementation has no ambiguity.
    unchanged.
 5. **Test coverage** — new unit tests: `subBucketIndex`
    order-preservation + clamping + underflow guard (table-driven, incl.
-   `Start==nil`, `End==nil`→single-bucket, degenerate window,
-   `k == subEnd` edge); a `rapid` property test that `key1 <= key2 ⇒
+   `Start==nil`, `End==nil`(K>1)→sub-divides, all-0xFF-start→single-bucket,
+   degenerate window, `k == subEnd` edge); a `rapid` property test that `key1 <= key2 ⇒
    idx1 <= idx2` over random `[Start,End)` and keys; `Flush` emits one
    row per non-empty sub-bucket with bounds that **tile `[Start,End)`
    exactly** (no gap/overlap; bucket-0 `Start == route Start`,
