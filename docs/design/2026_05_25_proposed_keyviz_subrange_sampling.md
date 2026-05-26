@@ -233,14 +233,15 @@ subPrefixLen int
 subStart     uint64
 subEnd       uint64           // subStart + subSpan; the §3.1 guard reads it
 subSpan      uint64           // 0 ⇒ single-bucket slot (§3.2)
-subBuckets   []subCounter     // len == K (1 for aggregate / degenerate / unbounded-tail)
+subBuckets   []subCounter     // len == effK (1 for aggregate / degenerate)
 ```
 
 `subCounter` holds the same four `atomic.Uint64` the slot holds today.
-For `K = 1` (flag default) and for aggregate / degenerate /
-unbounded-tail slots, `subBuckets` has length 1 and `subBucketIndex`
-short-circuits to 0, so the code path collapses to exactly today's
-behaviour with one extra indirection. The `subShift` field from the
+For `K = 1` (flag default) and for aggregate / degenerate slots,
+`subBuckets` has length 1 and `subBucketIndex` short-circuits to 0, so
+the code path collapses to exactly today's behaviour with one extra
+indirection. (An unbounded-`End` route with `K > 1` does sub-divide —
+§3.2 — over `[subStart, MaxUint64]`, capped at the span.) The `subShift` field from the
 first draft is gone — `math/bits` (§3.1) makes the multiply/divide
 exact without it.
 
@@ -326,11 +327,12 @@ sub-range emits one row, not `K`.
 
 `MatrixRow` gains **two** fields, not one:
 
-- `SubBucket uint32` — this row's index within its route, `0` for the
+- `SubBucket int` — this row's index within its route, `0` for the
   first (or only) sub-bucket.
-- `SubBucketCount uint32` — how many sub-buckets the parent route is
-  divided into: `1` for a `K = 1` / aggregate / degenerate /
-  unbounded-tail slot, `> 1` for a genuinely sub-bucketed route.
+- `SubBucketCount int` — how many sub-buckets the parent route is
+  divided into: `1` for a `K = 1` / aggregate / degenerate slot, `> 1`
+  for a genuinely sub-bucketed route (including an unbounded-`End` route
+  with `K > 1`).
 
 `SubBucketCount` is the disambiguator `bucketIDFor` needs (Claude bot
 gap): a `K = 1` slot's single row and a `K > 1` slot's first sub-row
@@ -375,9 +377,10 @@ have narrower bounds. To keep `BucketID` unique per row within a
 column (the fan-out merge and the SPA both key on it), `bucketIDFor`
 gains a sub-range discriminator keyed on `SubBucketCount` (§4.3):
 
-- sub-bucketed route (`SubBucketCount > 1`): `route:<id>#<subIdx>`
+- sub-bucketed route (`SubBucketCount > 1`, including an unbounded-`End`
+  route with `K > 1`): `route:<id>#<subIdx>`
 - whole route (`SubBucketCount == 1`, the `K = 1` / aggregate /
-  degenerate / unbounded-tail case): `route:<id>` (unchanged)
+  degenerate case): `route:<id>` (unchanged)
 - virtual bucket: `virtual:<id>` (unchanged)
 
 ### 5.3 SPA

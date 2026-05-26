@@ -668,7 +668,9 @@ func (s *MemSampler) initSubLayout(slot *routeSlot, start, end []byte) {
 
 // computeSubLayout derives the sub-range layout for [start, end) divided
 // into k buckets. effK is the effective bucket count: 1 (single bucket,
-// subSpan 0) when the route cannot be sub-divided, otherwise k. See
+// subSpan 0) when the route cannot be sub-divided, otherwise
+// min(k, subSpan) — capping at the span keeps every reconstructed
+// boundary valid when the span is narrower than k (effKForSpan). See
 // design §3.1–§3.2.
 func computeSubLayout(start, end []byte, k int) (prefixLen int, subStart, subEnd, subSpan uint64, effK int) {
 	if k <= 1 {
@@ -687,7 +689,8 @@ func computeSubLayout(start, end []byte, k int) (prefixLen int, subStart, subEnd
 			// leading bytes) — nothing left to divide.
 			return 0, subStart, subStart, 0, 1
 		}
-		return 0, subStart, math.MaxUint64, math.MaxUint64 - subStart, k
+		subSpan = math.MaxUint64 - subStart
+		return 0, subStart, math.MaxUint64, subSpan, effKForSpan(subSpan, k)
 	}
 	prefixLen = commonPrefixLen(start, end)
 	subStart = windowUint64(start, prefixLen)
@@ -697,7 +700,24 @@ func computeSubLayout(start, end []byte, k int) (prefixLen int, subStart, subEnd
 		// only past prefixLen + W): single bucket.
 		return prefixLen, subStart, subEnd, 0, 1
 	}
-	return prefixLen, subStart, subEnd, subEnd - subStart, k
+	subSpan = subEnd - subStart
+	return prefixLen, subStart, subEnd, subSpan, effKForSpan(subSpan, k)
+}
+
+// effKForSpan caps the effective bucket count at the window span. A span
+// smaller than k cannot be divided into k order-distinct sub-ranges:
+// boundaryAt would round several interior boundaries back to subStart,
+// and since a reconstructed boundary carries no bytes past the window it
+// can sort BEFORE a route start that has suffix bytes — emitting a row
+// with Start > End (Codex P2). Capping at subSpan keeps every emitted
+// boundary strictly increasing in the window, so bounds stay valid and
+// non-overlapping. subSpan is > 0 here (the degenerate subEnd<=subStart
+// and all-0xFF cases return earlier), so effK >= 1.
+func effKForSpan(subSpan uint64, k int) int {
+	if subSpan < u64NonNeg(k) {
+		return intFromUint64(subSpan)
+	}
+	return k
 }
 
 // commonPrefixLen returns the number of leading bytes a and b share.

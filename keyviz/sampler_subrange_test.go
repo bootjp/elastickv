@@ -66,6 +66,14 @@ func TestComputeSubLayout(t *testing.T) {
 			name:  "all-0xFF start unbounded end single bucket",
 			start: bytes.Repeat([]byte{0xFF}, 8), end: nil, k: 8, wantEffK: 1,
 		},
+		{
+			// Unbounded high start: window 0xFF..FD leaves a span of 2 (<k),
+			// so effK caps to the span (effKForSpan / Codex P2), keeping
+			// reconstructed boundaries valid.
+			name:  "unbounded high start caps effK to span",
+			start: []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD}, end: nil, k: 8,
+			wantEffK: 2, wantSpanNonZero: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -168,6 +176,30 @@ func TestSamplerUnboundedRouteEmitsSubRanges(t *testing.T) {
 	require.Nil(t, rows[len(rows)-1].End, "last sub-bucket keeps the unbounded End (nil)")
 	for _, r := range rows {
 		require.Equal(t, 4, r.SubBucketCount)
+	}
+}
+
+// TestSamplerUnboundedHighStartValidBounds pins Codex P2: a high start
+// whose window is near MaxUint64 AND carries a suffix byte past the
+// window must never emit a sub-row with Start > End. Capping effK at the
+// span (effKForSpan) keeps reconstructed boundaries strictly above the
+// route start. Without the cap, bucket 0 would emit Start > End here.
+func TestSamplerUnboundedHighStartValidBounds(t *testing.T) {
+	t.Parallel()
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, KeyBucketsPerRoute: 4})
+	start := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD, 0xFF} // window 0xFF..FD + suffix
+	require.True(t, s.RegisterRoute(1, start, nil, 0))
+	for _, key := range [][]byte{start, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}} {
+		s.Observe(1, key, OpWrite, 0)
+	}
+	s.Flush()
+	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
+	require.NotEmpty(t, rows)
+	for _, r := range rows {
+		if r.End != nil { // the last sub-bucket keeps the unbounded End (nil)
+			require.Less(t, bytes.Compare(r.Start, r.End), 0,
+				"sub-row must have Start < End (no invalid/overlapping bounds): %x..%x", r.Start, r.End)
+		}
 	}
 }
 
