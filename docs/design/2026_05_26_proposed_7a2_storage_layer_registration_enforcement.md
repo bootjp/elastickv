@@ -98,6 +98,28 @@ needed (only one storage DEK is active at a time; 7b's rotate-dek
 re-points the active id and re-registers, which `Registered()`'s
 equality check handles for free).
 
+**Seed the already-registered startup branch too — not only the
+barrier-close paths (codex P1).** 7a's `buildProcessStartRegistrationGate`
+has an `epoch == lastSeen` branch (`main_encryption_registration.go:141`)
+— the **common restart case** where this node's epoch is already
+durably in the registry. That branch returns an *ungated*
+`&kv.RegistrationGate{}` (nil Barrier) **without** starting
+`runWriterRegistration`, so `releaseBarrier` → `MarkRegistered` never
+runs. Under 7a-2 that would leave `registeredStorageDEKID == 0`, so
+`Registered()` would report **false** on every steady-state restart and
+the direct-path bootstrap `Save` would wrongly fail-closed with
+`ErrWriterNotRegistered` despite the registry already being current.
+7a-2 therefore calls `w.cache.MarkRegistered(activeDEK)` in the
+`epoch == lastSeen` branch **before** returning the ungated gate, so the
+already-registered restart path seeds `Registered()` true. The
+strictly-behind (`epoch < lastSeen`) branch still fails closed and the
+not-active / not-bootstrapped branches need no seeding (the gate
+condition `StorageEnvelopeActive && activeKeyID != 0` is false there, so
+`encryptForKey` does not consult `Registered()` anyway). Net: every path
+that returns ungated *while the envelope is active and this node is
+registered* must seed the registered state — barrier-close is only one
+of them.
+
 Rationale for reusing the StateCache: the storage layer already reads
 `StorageEnvelopeActive` / `ActiveStorageKeyID` from it via closures
 (6D-6c-2), so a `Registered()` closure threads in the same way without
@@ -234,15 +256,18 @@ forwarder callers before merge.
 ## 3. Scope
 
 ### In scope (7a-2)
-- `StateCache.registeredStorageDEKID` + `MarkRegistered` / `Registered`; 7a's
-  `runWriterRegistration` marks it on barrier close.
+- `StateCache.registeredStorageDEKID` + `MarkRegistered` / `Registered`; seeded
+  on barrier close (`runWriterRegistration`) **and** in the
+  `epoch == lastSeen` already-registered startup branch (§2.1, codex P1).
 - `WithStorageRegistrationGate` PebbleStore option +
   `ErrWriterNotRegistered`; `encryptForKey` direct-path enforcement.
 - The direct-vs-raft path flag threaded through `applyMutationsWithOpts`.
 - main.go wiring of the `Registered()` closure.
 - Tests: direct-path write pre-registration → `ErrWriterNotRegistered`;
   post-registration → encrypts; FSM-apply path never gated; envelope
-  inactive / no DEK → ungated; catalog-bootstrap ordering.
+  inactive / no DEK → ungated; catalog-bootstrap ordering; **already-
+  registered restart (`epoch == lastSeen`) seeds `Registered()` true so
+  the first direct-path write does not fail-closed (codex P1).**
 
 ### Out of scope
 - 7b (post-rotation re-registration), 7c (ConfChange-time registration).
