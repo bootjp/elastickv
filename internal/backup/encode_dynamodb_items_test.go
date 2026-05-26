@@ -145,42 +145,133 @@ func TestDDBEncodeItemBinaryKeyRoundTrip(t *testing.T) {
 	}
 }
 
-// TestDDBEncodeItemNumericKeyFailsClosed pins that a numeric (N) primary
-// key fails closed in this slice rather than emitting a wrongly-ordered
-// key.
-func TestDDBEncodeItemNumericKeyFailsClosed(t *testing.T) {
+// TestDDBEncodeItemNumericHashKeyRoundTrip pins that a numeric (N) hash
+// key round-trips: its value survives encode -> real decode, and the
+// numeric ordered encoding (M3b-2) produces a valid loadable key.
+func TestDDBEncodeItemNumericHashKeyRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
 	const table = "counters"
 	writeDDBSchema(t, in, EncodeSegment([]byte(table)), []byte(`{"format_version":1,"table_name":"counters",`+
 		`"primary_key":{"hash_key":{"name":"id","type":"N"}},`+
 		`"attribute_definitions":[{"name":"id","type":"N"}]}`))
-	writeDDBItemFile(t, in, table, "1.json", []byte(`{"id":{"N":"1"},"v":{"S":"x"}}`))
+	item := []byte(`{"id":{"N":"100"},"v":{"S":"x"}}`)
+	writeDDBItemFile(t, in, table, "100.json", item)
 
-	b := newSnapshotBuilder(ddbEncTS)
-	err := NewDynamoDBEncoder(in).Encode(b)
-	if !errors.Is(err, ErrDDBEncodeNumericKeyUnsupported) {
-		t.Fatalf("Encode err = %v, want ErrDDBEncodeNumericKeyUnsupported", err)
+	out := decodeDDBTree(t, encodeDDBTree(t, in))
+	got := collectDDBItems(t, out, table)
+	if len(got) != 1 {
+		t.Fatalf("decoded %d items, want 1", len(got))
+	}
+	if !reflect.DeepEqual(got[0], reparse(t, item)) {
+		t.Fatalf("numeric hash-key item mismatch: got %#v", got[0])
 	}
 }
 
-// TestDDBEncodeItemNumericRangeKeyFailsClosed pins the fail-closed path
-// for a numeric RANGE key (the hash-key case is covered separately), so
-// both primary-key positions reject N until the ordered numeric encoding
-// lands (M3b-2).
-func TestDDBEncodeItemNumericRangeKeyFailsClosed(t *testing.T) {
+// TestDDBEncodeItemNumericRangeKeyRoundTrip pins a composite key with a
+// numeric (N) range key — including a fractional and negative value to
+// exercise the fraction/sign paths of the numeric encoder.
+func TestDDBEncodeItemNumericRangeKeyRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
 	const table = "events"
 	writeDDBSchema(t, in, EncodeSegment([]byte(table)), []byte(`{"format_version":1,"table_name":"events",`+
 		`"primary_key":{"hash_key":{"name":"pk","type":"S"},"range_key":{"name":"ts","type":"N"}},`+
 		`"attribute_definitions":[{"name":"pk","type":"S"},{"name":"ts","type":"N"}]}`))
-	writeDDBItemFile(t, in, table, "e.json", []byte(`{"pk":{"S":"a"},"ts":{"N":"100"}}`))
+	a := []byte(`{"pk":{"S":"a"},"ts":{"N":"-12.5"}}`)
+	bItem := []byte(`{"pk":{"S":"a"},"ts":{"N":"100"}}`)
+	writeDDBItemFile(t, in, table, "a/neg.json", a)
+	writeDDBItemFile(t, in, table, "a/pos.json", bItem)
 
-	b := newSnapshotBuilder(ddbEncTS)
-	err := NewDynamoDBEncoder(in).Encode(b)
-	if !errors.Is(err, ErrDDBEncodeNumericKeyUnsupported) {
-		t.Fatalf("Encode err = %v, want ErrDDBEncodeNumericKeyUnsupported", err)
+	out := decodeDDBTree(t, encodeDDBTree(t, in))
+	got := collectDDBItems(t, out, table)
+	if len(got) != 2 {
+		t.Fatalf("decoded %d items, want 2", len(got))
+	}
+	wantA, wantB := reparse(t, a), reparse(t, bItem)
+	for _, item := range got {
+		if !reflect.DeepEqual(item, wantA) && !reflect.DeepEqual(item, wantB) {
+			t.Fatalf("unexpected decoded item: %#v", item)
+		}
+	}
+}
+
+// TestDDBNumericKeyOrderPreserving is the core correctness guard for the
+// reproduced numeric encoding: the encoded key segments must sort in the
+// same byte-lexicographic order Pebble uses as the underlying numbers do.
+func TestDDBNumericKeyOrderPreserving(t *testing.T) {
+	t.Parallel()
+	// Strictly increasing numeric order.
+	nums := []string{"-1000", "-12.5", "-1", "-0.5", "0", "0.5", "1", "12.5", "100", "1000", "1e3", "12345"}
+	// dedupe equal values (1000 == 1e3) for the strict-order check below.
+	prev := []byte(nil)
+	prevNum := ""
+	for _, n := range nums {
+		raw, err := ddbNumericKeyBytes(n)
+		if err != nil {
+			t.Fatalf("ddbNumericKeyBytes(%q): %v", n, err)
+		}
+		seg := encodeDDBOrderedKeySegment(raw)
+		if prev != nil {
+			cmp := bytes.Compare(prev, seg)
+			equalValue := (prevNum == "1000" && n == "1e3")
+			switch {
+			case equalValue && cmp != 0:
+				t.Fatalf("%q vs %q: equal numbers must encode equal, cmp=%d", prevNum, n, cmp)
+			case !equalValue && cmp >= 0:
+				t.Fatalf("%q (%x) should sort before %q (%x), cmp=%d", prevNum, prev, n, seg, cmp)
+			}
+		}
+		prev, prevNum = seg, n
+	}
+}
+
+// TestDDBNumericKeyZeroLayout pins the canonical zero encoding: zero maps
+// to the single 0x01 marker (raw), which becomes 0x01 0x00 0x01 after the
+// segment escape/terminator.
+func TestDDBNumericKeyZeroLayout(t *testing.T) {
+	t.Parallel()
+	for _, z := range []string{"0", "0.0", "-0", "000", "0e5"} {
+		raw, err := ddbNumericKeyBytes(z)
+		if err != nil {
+			t.Fatalf("ddbNumericKeyBytes(%q): %v", z, err)
+		}
+		if !bytes.Equal(raw, []byte{0x01}) {
+			t.Fatalf("zero %q raw = %x, want 01", z, raw)
+		}
+		if seg := encodeDDBOrderedKeySegment(raw); !bytes.Equal(seg, []byte{0x01, 0x00, 0x01}) {
+			t.Fatalf("zero %q segment = %x, want 01 00 01", z, seg)
+		}
+	}
+}
+
+// TestDDBNumericKeyPositiveSignStripped pins that a leading '+' is stripped
+// so the value encodes identically to its unsigned form.
+func TestDDBNumericKeyPositiveSignStripped(t *testing.T) {
+	t.Parallel()
+	for _, pair := range [][2]string{{"+5", "5"}, {"+1e2", "100"}} {
+		withSign, err := ddbNumericKeyBytes(pair[0])
+		if err != nil {
+			t.Fatalf("ddbNumericKeyBytes(%q): %v", pair[0], err)
+		}
+		plain, err := ddbNumericKeyBytes(pair[1])
+		if err != nil {
+			t.Fatalf("ddbNumericKeyBytes(%q): %v", pair[1], err)
+		}
+		if !bytes.Equal(withSign, plain) {
+			t.Fatalf("%q (%x) must encode == %q (%x)", pair[0], withSign, pair[1], plain)
+		}
+	}
+}
+
+// TestDDBNumericKeyRejectsMalformed pins fail-closed on a non-numeric
+// literal in a numeric key position.
+func TestDDBNumericKeyRejectsMalformed(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []string{"", "abc", "1.2.3", "+", "1e", "0x10", "e3"} {
+		if _, err := ddbNumericKeyBytes(bad); !errors.Is(err, ErrDDBEncodeInvalidItem) {
+			t.Fatalf("ddbNumericKeyBytes(%q) err = %v, want ErrDDBEncodeInvalidItem", bad, err)
+		}
 	}
 }
 

@@ -13,20 +13,15 @@ import (
 )
 
 // encode_dynamodb_items.go is the Phase 0b DynamoDB ITEM reverse encoder
-// (milestone M3b-1) — the inverse of the per-item JSON emitter in
-// dynamodb.go (writeDDBItem / itemToPublic). It reconstructs the
+// — the inverse of the per-item JSON emitter in dynamodb.go (writeDDBItem
+// / itemToPublic). It reconstructs the
 // !ddb|item|<base64url(table)>|<gen>|<orderedHash><orderedRange> records
 // from each table's items/<pk>[/<sk>].json files.
 //
-// Scope of this slice (M3b-1):
-//   - S (string) and B (binary) primary/range keys only. Numeric (N)
-//     keys take a separate ordered encoding (encodeNumericKeyBytes in the
-//     live adapter) that is reproduced in a follow-up slice; until then a
-//     numeric key fails closed (ErrDDBEncodeNumericKeyUnsupported) rather
-//     than emitting a wrongly-ordered key the live store would mis-sort.
-//   - Base items only. The derived !ddb|gsi| index rows (which the
-//     decoder drops as a no-op because they are derivable from the base
-//     item set + schema) land in a later slice.
+// Primary keys: S (string), B (binary), and N (number) are all supported;
+// the N ordered encoding lives in encode_dynamodb_numeric.go. The derived
+// !ddb|gsi| index rows (which the decoder drops as a no-op because they
+// are derivable from the base item set + schema) land in a later slice.
 //
 // Format fidelity is pinned against the live adapter write path
 // (adapter/dynamodb.go: dynamoItemKey / encodeDynamoKeySegment /
@@ -55,14 +50,9 @@ const (
 
 // ErrDDBEncodeInvalidItem is returned when an items/*.json file cannot be
 // parsed into a well-formed item (bad JSON shape, unknown attribute type,
-// missing primary-key attribute, or a non-S/N/B primary key).
+// missing primary-key attribute, a non-S/N/B primary key, or a malformed
+// number literal).
 var ErrDDBEncodeInvalidItem = errors.New("backup: dynamodb encode invalid item json")
-
-// ErrDDBEncodeNumericKeyUnsupported is returned when a primary or range
-// key attribute is numeric (N). The ordered numeric key encoding is not
-// reproduced in this slice; failing closed avoids emitting a key the live
-// store would sort incorrectly.
-var ErrDDBEncodeNumericKeyUnsupported = errors.New("backup: dynamodb numeric primary key not supported by encoder yet")
 
 // encodeItems walks <tableDir>/items/ and stages one !ddb|item| record
 // per item file. A missing items/ directory is not an error (a table may
@@ -238,8 +228,9 @@ func ddbItemKeyPrefix(tableName string, generation uint64) []byte {
 }
 
 // ddbPrimaryKeyBytes extracts the raw key bytes for a primary/range key
-// attribute. Only S and B are supported in this slice; N fails closed and
-// any non-key kind is rejected (DynamoDB primary keys are S, N, or B).
+// attribute (DynamoDB primary keys are S, N, or B). S and B contribute
+// their literal bytes; N contributes its order-preserving numeric encoding
+// (the segment escape/terminator is applied uniformly by the caller).
 func ddbPrimaryKeyBytes(av *pb.DynamoAttributeValue) ([]byte, error) {
 	switch v := av.GetValue().(type) {
 	case *pb.DynamoAttributeValue_S:
@@ -247,7 +238,7 @@ func ddbPrimaryKeyBytes(av *pb.DynamoAttributeValue) ([]byte, error) {
 	case *pb.DynamoAttributeValue_B:
 		return v.B, nil
 	case *pb.DynamoAttributeValue_N:
-		return nil, errors.Wrap(ErrDDBEncodeNumericKeyUnsupported, "numeric primary key")
+		return ddbNumericKeyBytes(v.N)
 	default:
 		return nil, errors.Wrap(ErrDDBEncodeInvalidItem, "primary key attribute is not S, N, or B")
 	}
