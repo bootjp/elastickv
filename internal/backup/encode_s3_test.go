@@ -111,6 +111,20 @@ func findEntry(entries []RoundTripEntry, key []byte) *RoundTripEntry {
 	return nil
 }
 
+// TestS3EncodeRejectsUnknownFormatVersion pins the format gate: a
+// _bucket.json with an unsupported format_version fails closed rather than
+// being silently parsed under the v1 schema (claude Finding 1 on PR #842;
+// mirrors the DynamoDB schema reader's format_version gate).
+func TestS3EncodeRejectsUnknownFormatVersion(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeS3Bucket(t, in, "b", []byte(`{"format_version":99,"name":"b"}`))
+	b := newSnapshotBuilder(s3EncTS)
+	if err := NewS3RecordEncoder(in).Encode(b); !errors.Is(err, ErrS3EncodeInvalidBucket) {
+		t.Fatalf("Encode err = %v, want ErrS3EncodeInvalidBucket", err)
+	}
+}
+
 // TestS3EncodeMissingDirIsNoop pins that an absent s3/ dir is a no-op.
 func TestS3EncodeMissingDirIsNoop(t *testing.T) {
 	t.Parallel()

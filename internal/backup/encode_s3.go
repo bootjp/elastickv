@@ -34,6 +34,11 @@ import (
 // restored bucket is internally consistent (Option B; see file header).
 const s3RestoreGeneration uint64 = 1
 
+// s3BucketFormatVersion is the only _bucket.json format_version the
+// encoder accepts; a newer version fails closed rather than being parsed
+// under the v1 schema (mirrors the DynamoDB schema reader's gate).
+const s3BucketFormatVersion uint32 = 1
+
 // ErrS3EncodeInvalidBucket is returned when a _bucket.json cannot be
 // parsed into the expected shape (or carries an empty bucket name).
 var ErrS3EncodeInvalidBucket = errors.New("backup: s3 encode invalid _bucket.json")
@@ -98,6 +103,11 @@ func (e *S3RecordEncoder) encodeBucket(b *snapshotBuilder, root *os.Root, bucket
 	if pub.Name == "" {
 		return errors.Wrapf(ErrS3EncodeInvalidBucket, "%s/_bucket.json: empty bucket name", bucketDir)
 	}
+	// s3PublicBucket carries Versioning, PolicyJSONString, and
+	// CreationTimeISO, but the internal s3LiveBucketMeta record has no
+	// counterpart for them — they are dump-only metadata the live store
+	// never persisted — so they are intentionally not restored (the
+	// decoder likewise leaves CreatedAtHLC out of the public struct).
 	live := s3LiveBucketMeta{
 		BucketName:   pub.Name,
 		Generation:   s3RestoreGeneration,
@@ -141,6 +151,10 @@ func (e *S3RecordEncoder) readBucketMeta(root *os.Root, bucketDir string) (s3Pub
 	var pub s3PublicBucket
 	if err := decodeOneJSON(f, &pub); err != nil {
 		return s3PublicBucket{}, errors.Wrapf(ErrS3EncodeInvalidBucket, "%s: %v", rel, err)
+	}
+	if pub.FormatVersion != s3BucketFormatVersion {
+		return s3PublicBucket{}, errors.Wrapf(ErrS3EncodeInvalidBucket,
+			"%s: unsupported format_version %d", rel, pub.FormatVersion)
 	}
 	return pub, nil
 }
