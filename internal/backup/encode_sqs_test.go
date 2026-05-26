@@ -128,6 +128,30 @@ func TestSQSEncodeStandardQueueRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSQSEncodeStandardQueueCounters pins that a standard (non-FIFO)
+// queue emits the !sqs|queue|gen| counter but NO !sqs|queue|seq| counter
+// (the sequence counter is FIFO-only).
+func TestSQSEncodeStandardQueueCounters(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "std"
+	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"std",`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{[]byte(`{"message_id":"m1","body":"x","send_timestamp_millis":1,"available_at_millis":1}`)})
+
+	entries, _, err := DecodeLiveEntries(bytes.NewReader(encodeSQSTree(t, in)))
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	gen := sqsFindEntry(entries, sqsQueueGenKeyBytes(queue))
+	if gen == nil || string(gen.UserValue) != strconv.FormatUint(sqsRestoreGeneration, 10) {
+		t.Fatalf("gen counter = %v, want %d", gen, sqsRestoreGeneration)
+	}
+	if seq := sqsFindEntry(entries, sqsQueueSeqKeyBytes(queue)); seq != nil {
+		t.Fatalf("standard queue emitted a !sqs|queue|seq| counter, want none")
+	}
+}
+
 // TestSQSEncodeFifoSeqCounter pins that a FIFO queue emits a
 // !sqs|queue|seq| counter = max(sequence_number)+1, and the message bodies
 // round-trip.
