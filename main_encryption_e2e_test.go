@@ -68,13 +68,15 @@ func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 	assertEnvelopeActive(t, cache, true)
 	// Stage 7a-2 §4.1: with the envelope active, the DIRECT write path
 	// (PutAt) fails closed until this load's writer registration has
-	// committed. In production main.go's registration goroutine calls
-	// MarkRegistered once the barrier closes (or in the already-registered
-	// startup branch); here we drive the Applier directly, so mark the
-	// cache to simulate that registration step. Without it the Phase-1
-	// PutAt below would return ErrWriterNotRegistered.
+	// committed AND was armed. In production main.go's registration
+	// goroutine arms the gate (propose branch) and calls MarkRegistered
+	// once the barrier closes; here we drive the Applier directly, so
+	// reproduce both steps to exercise the armed+registered gate-pass
+	// path. Without them the Phase-1 PutAt below would return
+	// ErrWriterNotRegistered (armed) — see TestStateCache_StorageRegistrationSatisfied.
+	cache.ArmStorageRegistration()
 	cache.MarkRegistered(e2eStorageDEKID)
-	// Phase 1: gate on + active DEK + registered → encrypted at rest.
+	// Phase 1: gate armed + active DEK + registered → encrypted at rest.
 	mustPut(t, ctx, st, "after", "plain-after", 120)
 
 	// Every version reads back as correct plaintext through the wired

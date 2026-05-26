@@ -267,6 +267,40 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 	}
 }
 
+// TestBuildProcessStartRegistrationGate_Phase0BootDoesNotArmGate pins
+// the codex P1 fix on PR #847: a node that boots in Phase 0 (envelope
+// inactive) must NOT arm the Stage 7a-2 direct-path gate, so a later
+// runtime EnableStorageEnvelope cannot trap its direct writes forever.
+// After the Phase-0 ungated return, StorageRegistrationSatisfied() must
+// remain true even once the envelope flips active at runtime.
+func TestBuildProcessStartRegistrationGate_Phase0BootDoesNotArmGate(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	w := wiringFor(t, testRegDEKID, false /*envelope inactive: Phase 0*/, 1)
+
+	eg, _ := errgroup.WithContext(context.Background())
+	gate, err := buildProcessStartRegistrationGate(
+		context.Background(), eg, &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, "n1")
+	if err != nil {
+		t.Fatalf("buildProcessStartRegistrationGate: %v", err)
+	}
+	if gate == nil || gate.Barrier != nil {
+		t.Fatalf("Phase 0 should be ungated (nil Barrier), got %+v", gate)
+	}
+	// Simulate a runtime EnableStorageEnvelope: the cutover flips the
+	// envelope active on the shared cache.
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = testRegDEKID
+	w.cache.RefreshFromSidecar(sc)
+	// The direct-path gate must stay satisfied — the load never armed a
+	// registration, so it is not subject to enforcement (mirrors 7a's
+	// permanently-ungated coordinator gate for Phase-0 boots).
+	if !w.cache.StorageRegistrationSatisfied() {
+		t.Error("Phase-0 boot trapped direct writes after runtime cutover (StorageRegistrationSatisfied=false)")
+	}
+}
+
 // TestBuildProcessStartRegistrationGate_BehindEpochFailsClosed pins
 // codex P1: a strictly-behind epoch (registry last_seen > bumped epoch)
 // must fail closed (error) rather than skip ungated. The §9.1 rollback
