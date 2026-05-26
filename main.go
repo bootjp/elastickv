@@ -419,8 +419,17 @@ func run() error {
 		ctx, runtimes, cfg.sqsFifoPartitionMap,
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
-	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
+	eg, runCtx := errgroup.WithContext(ctx)
+	// setupDistributionCatalog + the Stage 7a process-start registration
+	// gate are bundled so run() has a single startup-fault path: a
+	// registry-read / behind-epoch failure fails the process
+	// synchronously here, BEFORE the gRPC servers serve, so writes never
+	// run with no registration gate installed (codex P1 on PR #839).
+	distCatalog, err := setupDistributionAndRegistration(
+		ctx, runCtx, eg, runtimes, cfg.engine,
+		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
 	if err != nil {
+		cancel()
 		return err
 	}
 	// Seed AFTER setupDistributionCatalog so the sampler picks up the
@@ -430,17 +439,6 @@ func run() error {
 	// the placeholder zero IDs from buildEngine and Observe would miss
 	// every dispatched mutation.
 	seedKeyVizRoutes(sampler, cfg.engine)
-	eg, runCtx := errgroup.WithContext(ctx)
-
-	// Stage 7a §4.1: process-start writer registration + first-write
-	// barrier. Runs after the shard stores opened (registry readable)
-	// and the startup guards passed, but before the gRPC servers start
-	// serving. nil gate (the common case: encryption off / Phase 0 /
-	// already registered) leaves writes ungated; the propose branch
-	// arms a barrier that blocks self-originated encrypted writes until
-	// this node's registration commits, with the goroutine bound to
-	// runCtx so it drains on shutdown.
-	installProcessStartRegistrationGate(runCtx, eg, coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
 
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)

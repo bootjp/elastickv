@@ -377,7 +377,14 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 		// per-shard lease. Leave nil transactions unchanged, and skip
 		// if already wrapped so repeat calls don't stack wrappers.
 		if g.Txn != nil {
-			if _, already := g.Txn.(*leaseRefreshingTxn); !already {
+			if existing, already := g.Txn.(*leaseRefreshingTxn); already {
+				// Re-binding over the same ShardGroup (this function
+				// supports repeat construction by not stacking
+				// wrappers): point the existing wrapper at the NEW
+				// coordinator so Commit consults the freshly-installed
+				// registration gate, not a stale one (codex P2).
+				existing.coord = c
+			} else {
 				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}
 			}
 		}

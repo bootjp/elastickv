@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -28,12 +29,38 @@ const (
 	registrationBackoffFactor = 2
 )
 
+// setupDistributionAndRegistration sets up the distribution catalog and
+// then installs the Stage 7a process-start registration gate, returning
+// the catalog store. Bundling the two lets run() handle both startup
+// faults through a single error path (keeping run() within the cyclop
+// budget) while preserving the fail-synchronously-before-serving
+// guarantee for the registration gate.
+func setupDistributionAndRegistration(
+	ctx, runCtx context.Context,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	engine *distribution.Engine,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	raftID string,
+) (*distribution.CatalogStore, error) {
+	distCatalog, err := setupDistributionCatalog(ctx, runtimes, engine)
+	if err != nil {
+		return nil, err
+	}
+	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
+		return nil, err
+	}
+	return distCatalog, nil
+}
+
 // installProcessStartRegistrationGate builds the Stage 7a registration
-// gate and wires it onto the coordinator. A registry-read failure at
-// this point is a startup fault; rather than add a branch to run() (it
-// is already at the cyclop ceiling), the error is surfaced through the
-// errgroup, whose cancellation tears the process down before it serves
-// — the same lifecycle path every other startup goroutine uses.
+// gate and wires it onto the coordinator. A registry-read / behind-epoch
+// failure here is a startup fault that MUST fail the process
+// synchronously — before run() brings up the gRPC servers — so writes
+// never serve with no gate installed (codex P1 on PR #839). The caller
+// returns the error from run() before serving.
 func installProcessStartRegistrationGate(
 	ctx context.Context,
 	eg *errgroup.Group,
@@ -41,15 +68,13 @@ func installProcessStartRegistrationGate(
 	defaultGroup *kv.ShardGroup,
 	w encryptionWriteWiring,
 	raftID string,
-) {
+) error {
 	gate, err := buildProcessStartRegistrationGate(ctx, eg, coordinate, defaultGroup, w, raftID)
 	if err != nil {
-		eg.Go(func() error {
-			return errors.Wrap(err, "process-start writer registration intent")
-		})
-		return
+		return errors.Wrap(err, "process-start writer registration intent")
 	}
 	coordinate.WithRegistrationGate(gate)
+	return nil
 }
 
 // buildProcessStartRegistrationGate implements the Stage 7a §4.1
