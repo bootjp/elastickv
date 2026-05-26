@@ -152,20 +152,32 @@ lives in the bytes *after* that prefix. So:
 - **`Start == nil`** (first route / open low end): treat as all-`0x00`,
   i.e. `subStart = 0`. Natural — `0x00…` is the true low end of the
   byte-order key space.
-- **`End == nil`** (last route / open high end): the route has **no
-  finite span to divide**, so it is kept as a **single sub-bucket**
-  (`K_effective = 1`) until a route split gives it a finite `End`.
-  This is the decision adopted from review (Open Q1): the earlier
-  "high-order bits over a `W`-byte window" fallback (a) had no finite
-  `subSpan` to divide by — `1 << (8*W)` with `W = 8` overflows
-  `uint64` to `0` and would divide-by-zero on the hot path — and
-  (b) introduced an observable discontinuity (the tail's sub-ranges
-  would shift the moment its heuristic span changed). A split is a
-  discrete event operators already understand; the hotspot-shard-split
-  machinery (`docs/design/2026_02_18_partial_hotspot_shard_split.md`)
-  is exactly what gives a hot tail a finite `End`, at which point the
-  route re-registers (§4.2) and gains real sub-buckets. No overflow,
-  no heuristic, no surprise.
+- **`End == nil`** (last route / open high end): **sub-divide over
+  `[subStart, MaxUint64]`** (revised — see the note below). There is no
+  `End` window, so set `subPrefixLen = 0`, `subStart =
+  windowUint64(start)`, `subEnd = math.MaxUint64`, `subSpan =
+  MaxUint64 - subStart`, and divide that finite span into `K`. Keys
+  bucket by their leading `W`-byte window across the open high end; the
+  **last** sub-bucket keeps the route's unbounded `End` (`nil`). The
+  `subBucketIndex` upper edge clamp is skipped for this slot (its
+  `subHi` snapshot is `nil` — the unbounded sentinel), relying on the
+  window math + the `w >= subEnd` guard instead.
+
+  *Why this reverses Open Q1.* The first review chose "single row until
+  split" because the original fallback used `subSpan = 1 << (8*W)`,
+  which with `W = 8` overflows `uint64` to `0` and divides by zero.
+  Using `MaxUint64` (= `2^64 − 1`) as the effective top makes the span
+  a valid `uint64` with no overflow, so the original objection no
+  longer applies. The practical driver: the **single-route cluster and
+  every cluster's tail route are unbounded**, and that is exactly where
+  an operator most wants hot-key visibility — keeping them at one row
+  made the feature inert for the most common topology. The "split
+  changes the heuristic" discontinuity is accepted: a split is a
+  discrete event that already reshuffles routes. **Caveat:** with
+  `subPrefixLen = 0` the resolution is leading-`W`-byte-coarse, so keys
+  sharing a long prefix (e.g. `user:0001…`/`user:0002…`) still collapse
+  into one bucket — finite, tight route bounds remain the way to get
+  fine intra-prefix resolution.
 - **`subEnd <= subStart`** (the `W`-byte window captures no difference —
   e.g. `Start`/`End` differ only beyond `subPrefixLen + W`): the route
   is likewise a **single bucket** (`K_effective = 1`, `subSpan` left 0
@@ -490,11 +502,16 @@ The four questions opened in the first draft converged in review
 (Codex, Gemini, Claude) and are now decided; recorded here so the
 implementation has no ambiguity.
 
-1. **Unbounded-tail bucketing (§3.2): single row until split.** The
-   last route's open `End` stays one row until a route split gives it a
-   finite `End`. This is both honest (no heuristic discontinuity when
-   the tail's effective span changes) and what kills the
-   `1 << (8*W)` overflow / divide-by-zero entirely. Adopted.
+1. **Unbounded-tail bucketing (§3.2): ~~single row until split~~ →
+   sub-divide over `[subStart, MaxUint64]` (revised post-merge).** The
+   first-round decision kept an open-`End` route at one row. That made
+   the feature inert for the single-route cluster and every cluster's
+   tail route — the most common place hot-key visibility is wanted. The
+   original blocker (`1 << (8*W)` overflow) is avoided by using
+   `MaxUint64` as the effective top, so the open end now sub-divides by
+   the leading-`W`-byte window (§3.2). The last sub-bucket keeps the
+   unbounded `End`. Resolution is leading-byte-coarse for `prefixLen 0`;
+   tight route bounds still give finer intra-prefix detail.
 2. **Mixed-`K` fan-out (§7): coexist, don't merge.** Rows keyed by
    `bucketID` (now embedding `#subIdx`) mean a `K = 1` row and the
    `K = 16` sub-rows appear side by side rather than merging. Tolerated
