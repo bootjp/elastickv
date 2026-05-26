@@ -2,6 +2,7 @@ package backup
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,7 +120,7 @@ func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, buc
 func (e *S3RecordEncoder) encodeObject(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, objRel string) error {
 	objectKey := filepath.ToSlash(objRel)
 	bodyRel := filepath.Join(bucketDir, objRel)
-	body, err := readRootFile(root, bodyRel)
+	body, err := readRootBodyFile(root, bodyRel)
 	if err != nil {
 		return err
 	}
@@ -128,6 +129,34 @@ func (e *S3RecordEncoder) encodeObject(b *snapshotBuilder, root *os.Root, bucket
 		return err
 	}
 	return e.emitObject(b, bucketName, objectKey, body, sidecar)
+}
+
+// readRootBodyFile reads an object body within root with a PRE-open Lstat
+// guard: a symlink / FIFO / device / directory is refused BEFORE root.Open,
+// so a reader-less FIFO planted at an object path cannot block the open
+// (readRootFile's post-open check happens only after the blocking Open).
+// This matches the guard readObjectSidecar / readBucketMeta use.
+func readRootBodyFile(root *os.Root, rel string) ([]byte, error) {
+	linfo, err := root.Lstat(rel)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, errors.Wrapf(ErrS3EncodeNotRegular, "%s (mode=%s)", rel, linfo.Mode())
+	}
+	if err := refuseHardLink(linfo, rel); err != nil {
+		return nil, err
+	}
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = f.Close() }()
+	body, err := io.ReadAll(f)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return body, nil
 }
 
 // readObjectSidecar opens <body>.elastickv-meta.json within root (symlink

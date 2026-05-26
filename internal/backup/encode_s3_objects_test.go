@@ -142,6 +142,26 @@ func TestS3EncodeNestedObjectKeyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestReadRootBodyFileRejectsNonRegular pins the PRE-open guard on the
+// object body read: a non-regular target (directory stand-in for a
+// symlink/FIFO) is refused before the open, so a planted FIFO cannot block
+// the encoder (gemini security-high on PR #845).
+func TestReadRootBodyFileRejectsNonRegular(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "body"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	if _, err := readRootBodyFile(root, "body"); !errors.Is(err, ErrS3EncodeNotRegular) {
+		t.Fatalf("readRootBodyFile err = %v, want ErrS3EncodeNotRegular", err)
+	}
+}
+
 // TestS3EncodeRejectsKeymapCollision pins fail-closed when a bucket
 // carries a KEYMAP.jsonl (object-name collision renames not yet reversed).
 func TestS3EncodeRejectsKeymapCollision(t *testing.T) {
