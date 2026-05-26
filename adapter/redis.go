@@ -239,10 +239,30 @@ type RedisServer struct {
 	// redis_key_waiters.go.
 	zsetWaiters *keyWaiterRegistry
 
+	// onePhaseTxnDedup enables option-2 one-phase idempotency: on a
+	// retryable write error, list-push retries reuse the failed attempt's
+	// write set and carry prev_commit_ts so the FSM can dedup a commit that
+	// landed under leadership churn (see
+	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md). It
+	// MUST stay off until every node runs a probe-aware binary — see R5
+	// (FSM determinism across a rolling upgrade). Default off; enabled via
+	// WithOnePhaseTxnDedup / the ELASTICKV_REDIS_ONEPHASE_DEDUP env var
+	// after a full rollout.
+	onePhaseTxnDedup bool
+
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
 type RedisServerOption func(*RedisServer)
+
+// WithOnePhaseTxnDedup enables the option-2 one-phase idempotency dedup on
+// list-push retries (see RedisServer.onePhaseTxnDedup). Off by default;
+// enable only after the whole cluster runs a probe-aware binary.
+func WithOnePhaseTxnDedup(enabled bool) RedisServerOption {
+	return func(r *RedisServer) {
+		r.onePhaseTxnDedup = enabled
+	}
+}
 
 func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisServerOption {
 	return func(r *RedisServer) {
@@ -3141,8 +3161,13 @@ type listPushBuildFn func(meta store.ListMeta, key []byte, values [][]byte, comm
 
 // listPushCore is the shared retry loop for RPUSH and LPUSH. The caller supplies
 // a buildFn that assembles the specific operations (RPUSH appends to tail, LPUSH
-// prepends to head).
+// prepends to head). When onePhaseTxnDedup is enabled it uses the write-set-reuse
+// retry path (option 2); otherwise it keeps the original recompute-on-retry loop.
 func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]byte, buildFn listPushBuildFn) (int64, error) {
+	if r.onePhaseTxnDedup {
+		return r.listPushCoreWithDedup(ctx, key, values, buildFn)
+	}
+
 	var newLen int64
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
@@ -3174,6 +3199,107 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		}
 		newLen = updatedMeta.Len
 		return nil
+	})
+	return newLen, err
+}
+
+// reusableListPush captures a dispatched list-push attempt so a subsequent
+// retry can reuse its exact write set (same seq, same item/delta keys) and
+// probe whether it already landed, instead of recomputing seq from a fresh
+// meta read. Recomputing is what duplicates the element under leadership
+// churn: attempt 1 commits at T1 but returns an ambiguous error, the retry
+// reads the now-larger list and appends at a NEW seq. Reuse + the FSM's
+// exact-ts dedup probe close that. See option 2 in
+// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
+type reusableListPush struct {
+	ops     []*kv.Elem[kv.OP]
+	startTS uint64
+	// commitTS is the most recent dispatched commit_ts for this write set;
+	// the next retry passes it as prev_commit_ts so the FSM probes exactly
+	// the attempt that might have landed.
+	commitTS uint64
+	// length is the client-visible post-push length. It is invariant across
+	// reuse — the write set was built once from attempt 1's meta — so it is
+	// also the correct value to return when the FSM dedup no-ops the apply
+	// (R1 result reconstruction: no store re-read needed).
+	length int64
+}
+
+// listPushCoreWithDedup is the option-2 retry loop. The first attempt computes
+// the write set from the current meta; any retryable failure makes the next
+// iteration REUSE that write set under a fresh commit_ts with prev_commit_ts
+// set, so the FSM no-ops if the prior attempt already landed. A WriteConflict
+// on a reuse attempt means the probe ruled out our own prior attempt and the
+// seq is genuinely taken by another txn, so we fall back to a full recompute.
+func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, values [][]byte, buildFn listPushBuildFn) (int64, error) {
+	var newLen int64
+	var pending *reusableListPush
+	err := r.retryRedisWrite(ctx, func() error {
+		if pending != nil {
+			commitTS := r.coordinator.Clock().Next()
+			_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+				IsTxn:        true,
+				StartTS:      pending.startTS,
+				CommitTS:     commitTS,
+				PrevCommitTS: pending.commitTS,
+				Elems:        pending.ops,
+			})
+			if dispErr == nil {
+				// Either the prior attempt landed (probe hit → no-op) or this
+				// reuse applied the identical write set. The post-push length
+				// is the same either way, so reconstruction is just pending.length.
+				newLen = pending.length
+				return nil
+			}
+			if errors.Is(dispErr, store.ErrWriteConflict) {
+				// The exact-ts probe ruled out our own prior attempt and the
+				// target seq is taken by another txn — a genuine conflict.
+				// Drop the reusable attempt so the next iteration recomputes.
+				pending = nil
+				return errors.WithStack(dispErr)
+			}
+			// Still ambiguous (transient leader / lock): this reuse may itself
+			// have landed, so the next retry must probe THIS commit_ts.
+			pending.commitTS = commitTS
+			return errors.WithStack(dispErr)
+		}
+
+		readTS := r.readTS()
+		meta, _, err := r.resolveListMeta(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+
+		commitTS := r.coordinator.Clock().Next()
+		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
+		if err != nil {
+			return err
+		}
+		if len(ops) == 0 {
+			newLen = updatedMeta.Len
+			return nil
+		}
+
+		startTS := normalizeStartTS(readTS)
+		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			IsTxn:    true,
+			StartTS:  startTS,
+			CommitTS: commitTS,
+			Elems:    ops,
+		})
+		if dispErr == nil {
+			newLen = updatedMeta.Len
+			return nil
+		}
+		// Retryable failure: remember this attempt so the next iteration reuses
+		// its write set (and probes prev_commit_ts) rather than recomputing seq.
+		pending = &reusableListPush{
+			ops:      ops,
+			startTS:  startTS,
+			commitTS: commitTS,
+			length:   updatedMeta.Len,
+		}
+		return errors.WithStack(dispErr)
 	})
 	return newLen, err
 }

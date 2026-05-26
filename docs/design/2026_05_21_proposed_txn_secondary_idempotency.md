@@ -447,22 +447,25 @@ preserves availability and adds correctness.
 
 ### M3 — write-set reuse + result reconstruction in the retry sites
 
-- **Emission gating (R5).** The leader emits a non-zero `prev_commit_ts`
-  (hence V2 meta, hence the probe firing) only when a cluster-wide capability
-  is enabled — default **off** until the whole cluster runs a probe-aware
-  binary. While off, no V2 meta is produced, the probe never fires, and the
-  FSM is byte-identical to today, so there is no mixed-version divergence
-  window.
-- `listPushCore` (`adapter/redis.go:3009`): on a retryable error, reuse the
-  prior attempt's write set (same `seq`) and set `prev_commit_ts` (via
-  `onePhaseTxnRequestWithPrevCommit`); on a dedup no-op, return the prior
-  length reconstructed at `prev_commit_ts`. On an OCC `WriteConflict` after
-  reuse (genuine cross-txn conflict), fall back to full recompute.
-- `runTransaction` (`adapter/redis.go:2824`): same reuse + reconstruct for
-  the EXEC body (single-mop first; see Open questions).
-- Unit tests per site: simulated ambiguous-commit (apply succeeds, error
-  returned) + retry → no duplicate, client sees success; genuine
-  cross-txn conflict + retry → two distinct elements, no dedup.
+- **Emission gating (R5) — LANDED.** `prev_commit_ts` is emitted only when
+  `RedisServer.onePhaseTxnDedup` is on (`WithOnePhaseTxnDedup` /
+  `ELASTICKV_REDIS_ONEPHASE_DEDUP`), **default off** until the whole cluster
+  runs a probe-aware binary. While off, `listPushCore` keeps the legacy
+  recompute-on-retry loop, no V2 meta is produced, the probe never fires, and
+  the FSM is byte-identical to today — no mixed-version divergence window.
+- **`listPushCore` (RPUSH/LPUSH) — LANDED.** When the gate is on, the retry
+  loop tracks a `reusableListPush` (the prior attempt's `ops`, `startTS`,
+  `commitTS`, and computed `length`). On a retryable error it REUSES that
+  write set under a fresh `commit_ts` with `PrevCommitTS` set (threaded
+  through `OperationGroup` → `ShardedCoordinator.dispatchSingleShardTxn` →
+  `onePhaseTxnRequestWithPrevCommit`). On success it returns the reused
+  `length`; on an OCC `WriteConflict` from a reuse it drops the reusable
+  attempt and recomputes from a fresh meta (outcome 3). Tests cover all three
+  outcomes end-to-end against real OCC + the real probe, plus the gate-off
+  legacy path.
+- **Result reconstruction (R1) — resolved, and simpler than feared.** See R1.
+- `runTransaction` (`adapter/redis.go`): same reuse + reconstruct for the EXEC
+  body (single-mop first; see Open questions). **Still open.**
 
 ### M4 — Validation
 
@@ -479,18 +482,30 @@ M4 is verification only.
 
 ## Risks
 
-### R1 — Client-visible result reconstruction on the dedup no-op
+### R1 — Client-visible result reconstruction on the dedup no-op — resolved
 
-When the probe finds the prior attempt landed and the apply no-ops, the
-retry must return what the client would have seen. For RPUSH/LPUSH that is
-the post-append length (a meta read at `prev_commit_ts`); for a MULTI/EXEC
-body it is each mop's result reconstructed at `prev_commit_ts`. This is the
-most intricate part. Mitigation: scope the first PR to RPUSH/LPUSH (the
-commands the Jepsen workload exercises and where the duplicate is observed)
-and the single-mop EXEC case; expand coverage per-command as needed.
-Commands whose reconstruction is not yet implemented keep today's
-(buggy-under-churn) recompute, so the change is strictly an improvement,
-never a regression.
+The doc originally called this "the most intricate part." For the list-push
+family it turns out to be trivial, and the reason is the heart of option 2:
+**because the retry reuses the write set built from attempt 1's meta, the
+client-visible result is invariant across reuse.** RPUSH/LPUSH returns the
+post-push length `meta.Len + len(values)`, computed once from attempt 1's
+meta read. Whether attempt 1 physically committed it (probe hit → no-op) or
+the reuse re-applied the identical write set (probe miss → apply at T2), the
+list ends in the same state and the return value is the same number. So the
+adapter simply **returns the remembered `length`** — no store re-read, no
+reconstruction at `prev_commit_ts`. (`listPushCoreWithDedup` keeps it in the
+`reusableListPush.length` field.) The genuine-conflict branch is the only one
+that produces a different length, and there the adapter recomputes from a
+fresh meta anyway, so the length is naturally correct.
+
+This invariance is specific to commands whose retry reuses a fixed write set.
+A MULTI/EXEC body with read-dependent results (e.g. an `INCR` whose return is
+the post-increment value) needs the same treatment — remember the
+client-visible result computed on the first attempt and return it on a dedup
+no-op — which is tractable but per-command. Mitigation unchanged: scope the
+first PR to RPUSH/LPUSH (the commands the Jepsen workload exercises); commands
+without a reuse path keep today's (buggy-under-churn, gate-off-by-default)
+recompute, so the change is strictly an improvement, never a regression.
 
 ### R2 — Probe read cost on the retry path
 
@@ -707,3 +722,16 @@ flakiness, tracked separately from the correctness fix.
   (ship the reader before the writer). Next: M1 (thread the prior attempt's
   write set + commit_ts out of `retryRedisWrite`) and M3 (write-set reuse +
   gated emission + result reconstruction in `listPushCore` / `runTransaction`).
+- (2026-05-27) **M1 + M3 (list-push) landed.** `OperationGroup.PrevCommitTS`
+  threads through `ShardedCoordinator` → `dispatchSingleShardTxn` →
+  `onePhaseTxnRequestWithPrevCommit`. `listPushCore` gained a write-set-reuse
+  retry loop (`listPushCoreWithDedup` + `reusableListPush`) gated by
+  `RedisServer.onePhaseTxnDedup` (default off; `WithOnePhaseTxnDedup` /
+  `ELASTICKV_REDIS_ONEPHASE_DEDUP`). **R1 resolved and downgraded from "most
+  intricate" to trivial for list-push:** because the retry reuses the write
+  set built from attempt 1's meta, the post-push length is invariant across
+  reuse, so reconstruction is just returning the remembered `length` — no
+  store re-read. Adapter tests cover all three outcomes (landed→dedup→no
+  duplicate; not-landed→apply; genuine cross-txn conflict→recompute) against
+  real OCC + the real probe, plus the gate-off legacy path. Remaining:
+  `runTransaction` EXEC-body reuse (per-command result memo) and M4 (Jepsen).

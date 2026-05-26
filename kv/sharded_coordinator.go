@@ -263,7 +263,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.Elems, reqs.ReadKeys)
+		return c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys)
 	}
 
 	logs, err := c.requestLogs(reqs)
@@ -366,7 +366,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, prevCommitTS uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -390,7 +390,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		// If any read key belongs to a different shard the 2PC path is required
 		// so that validateReadOnlyShards can issue a linearizable read barrier,
 		// preserving SSI.
-		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, primaryKey, gids[0], elems, readKeys)
+		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
 	// Multi-shard path: group read keys by shard now. The result is passed
@@ -451,15 +451,17 @@ func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) b
 	return true
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
 	}
 	// ReadKeys are included in the Raft log entry so the FSM validates
-	// read-write conflicts atomically under applyMu.
+	// read-write conflicts atomically under applyMu. prevCommitTS, when set,
+	// carries the one-phase dedup probe key for a retry that reuses a failed
+	// attempt's write set.
 	resp, err := g.Txn.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, readKeys),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
