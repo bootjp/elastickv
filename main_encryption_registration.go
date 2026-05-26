@@ -55,20 +55,34 @@ const (
 func retryUntilRegistered(ctx context.Context, what string, fn func() error) error {
 	backoff := registrationRetryInitial
 	start := time.Now()
-	warned := false
+	var lastWarn time.Time
 	for {
 		err := fn()
 		if err == nil || !errors.Is(err, store.ErrWriterNotRegistered) {
 			return err
 		}
-		if !warned && time.Since(start) >= registrationGateWarnAfter {
+		// Re-warn periodically (every registrationGateWarnAfter), not just
+		// once: a node stuck for minutes after the first WARN would
+		// otherwise go silent in log pipelines (claude review on PR #847).
+		// lastWarn is the zero time on the first pass, so the first WARN
+		// fires once registrationGateWarnAfter has elapsed since start.
+		if blocked := time.Since(start); blocked >= registrationGateWarnAfter && time.Since(lastWarn) >= registrationGateWarnAfter {
 			slog.Warn("encryption: direct write blocked on writer registration; still retrying",
 				slog.String("operation", what),
-				slog.Duration("blocked_for", time.Since(start)))
-			warned = true
+				slog.Duration("blocked_for", blocked))
+			lastWarn = time.Now()
 		}
 		select {
 		case <-ctx.Done():
+			// Clean-shutdown path: runCtx cancelled during the bootstrap
+			// retry window (operator graceful restart during boot). Log at
+			// INFO so this reads as shutdown, not failure (claude review on
+			// PR #847). The returned error preserves the context.Canceled
+			// chain — consistent with every other ctx-aware startup step
+			// (EnsureCatalogSnapshot included), which run() surfaces the
+			// same way.
+			slog.Info("encryption: writer-registration bootstrap retry cancelled by shutdown",
+				slog.String("operation", what))
 			return errors.Wrapf(ctx.Err(), "%s: cancelled while blocked on writer registration", what)
 		case <-time.After(backoff):
 			backoff = min(backoff*registrationBackoffFactor, registrationRetryMax)
@@ -177,7 +191,14 @@ func buildProcessStartRegistrationGate(
 		return &kv.RegistrationGate{}, nil // not bootstrapped
 	}
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
-	lastSeen, err := readWriterRegistryLastSeen(defaultGroup.Store, activeDEK, fullNodeID)
+	// Build the registry handle once and reuse it for the initial read
+	// and the verifyRegistered retry loop, rather than re-asserting +
+	// allocating a handle per call (claude review on PR #847).
+	reg, err := store.WriterRegistryFor(defaultGroup.Store)
+	if err != nil {
+		return nil, errors.Wrap(err, "writer registration: registry handle")
+	}
+	lastSeen, err := registryLastSeen(reg, activeDEK, fullNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -223,9 +244,8 @@ func buildProcessStartRegistrationGate(
 	// it, consistently >registrationAttemptTimeout commit latency could
 	// keep retrying-without-committing forever despite durable
 	// registration (codex P2 #6).
-	regStore := defaultGroup.Store
 	verifyRegistered := func() (bool, error) {
-		ls, err := readWriterRegistryLastSeen(regStore, activeDEK, fullNodeID)
+		ls, err := registryLastSeen(reg, activeDEK, fullNodeID)
 		if err != nil {
 			return false, err
 		}
@@ -244,12 +264,21 @@ func buildProcessStartRegistrationGate(
 
 // readWriterRegistryLastSeen returns the registry's last_seen_local_epoch
 // for (full_node_id, dek_id), or 0 when no row exists (treated as the
-// "propose" trigger per the 7a design §3.1).
+// "propose" trigger per the 7a design §3.1). It builds a fresh registry
+// handle per call; hot/looping callers should build the handle once and
+// use registryLastSeen instead (claude review on PR #847).
 func readWriterRegistryLastSeen(st store.MVCCStore, dekID uint32, fullNodeID uint64) (uint16, error) {
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
 		return 0, errors.Wrap(err, "writer registration: registry handle")
 	}
+	return registryLastSeen(reg, dekID, fullNodeID)
+}
+
+// registryLastSeen reads last_seen_local_epoch from an already-built
+// registry handle (no per-call WriterRegistryFor type-assert + alloc),
+// so the verifyRegistered retry loop can reuse one handle.
+func registryLastSeen(reg encryption.WriterRegistryStore, dekID uint32, fullNodeID uint64) (uint16, error) {
 	raw, ok, err := reg.GetRegistryRow(encryption.RegistryKey(dekID, encryption.NodeID16(fullNodeID)))
 	if err != nil {
 		return 0, errors.Wrap(err, "writer registration: read registry row")

@@ -1705,6 +1705,11 @@ func setupDistributionCatalog(
 	// the gate clears. The common cases (populated catalog → no-op Save,
 	// or pre-cutover → cleartext Save) never hit the gate and return on
 	// the first attempt.
+	//
+	// Idempotency requirement: the retry re-invokes EnsureCatalogSnapshot
+	// from scratch on each ErrWriterNotRegistered, so it MUST be
+	// re-entrant — on the populated-catalog path it is a version-unchanged
+	// no-op Save (no mutation, no nonce), so re-running it is safe.
 	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
 		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
 		return errors.Wrap(e, "ensure catalog snapshot")
