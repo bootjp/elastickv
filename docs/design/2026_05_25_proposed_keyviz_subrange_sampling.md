@@ -307,18 +307,20 @@ target `K ≤ 16`.
 `appendDrainedRow` becomes a loop over the slot's `subBuckets`: for
 each sub-bucket with any non-zero counter, emit one `MatrixRow` whose
 `Start`/`End` are the **sub-bucket bounds**, reconstructed by inverting
-the §3.1 interpolation: bucket `i` spans
-`[subStart + i*subSpan/K, subStart + (i+1)*subSpan/K)` mapped back into
-the key byte space at offset `subPrefixLen`. The interior boundary
-`i*subSpan/K` **must use the same 128-bit `math/bits` path as the
-forward computation** — `hi, lo := bits.Mul64(uint64(i), subSpan);
-bound, _ := bits.Div64(hi, lo, uint64(K))` — not plain `uint64`
-arithmetic: `i*subSpan` overflows a `uint64` once `subSpan > 2^63` and
-`i ≥ 2` (e.g. `K=3, i=2, subSpan=2^63` → `2^64` wraps to `0`),
-producing a nonsensical interior bound and a visible gap in the
-heatmap. To guarantee the sub-rows **tile the parent route exactly**
-(the "contiguous" property the heatmap advertises) despite integer
-truncation in the inverse:
+the §3.1 interpolation: bucket `i`'s lower edge is
+`subStart + ceil(i*subSpan/effK)`, mapped back into the key byte space
+at offset `subPrefixLen`. The interior boundary uses **`fracMulCeil`** —
+`hi, lo := bits.Mul64(uint64(i), subSpan); q, r := bits.Div64(hi, lo,
+uint64(effK)); if r != 0 { q++ }` — i.e. **`ceil`, deliberately the
+*dual* of the forward path's `floor` `fracMul`**, not the same function.
+Using `floor` here (the forward kernel) is exactly what mis-shelves a
+boundary-value key (§3.2, Codex P2): `ceil` makes the emitted lower edge
+equal the forward map's bucket-`i` lower edge, so a key on a boundary is
+displayed in the bucket it is counted in. The 128-bit `math/bits` form
+is still required for overflow safety — `i*subSpan` overflows `uint64`
+once `subSpan > 2^63` and `i ≥ 2`. To guarantee the sub-rows **tile the
+parent route exactly** (the "contiguous" property the heatmap advertises)
+despite integer truncation in the inverse:
 
 - sub-bucket `0`'s `Start` is pinned to the route's actual `Start`
   (not the reconstructed `subStart` window value, which dropped the
