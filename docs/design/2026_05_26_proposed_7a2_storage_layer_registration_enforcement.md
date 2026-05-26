@@ -83,9 +83,19 @@ new id, and `Registered()` automatically evaluates false (the new id
 ≠ `registeredStorageDEKID`) until the post-rotation registration marks
 the new id — no reset logic, no mutex, one atomic load on the hot path.
 
-7a's `runWriterRegistration`, on `close(barrier)`, calls
-`cache.MarkRegistered(activeDEK)`. Pre-registration (and Phase 0 / not
-bootstrapped) `Registered()` is false.
+**Mark at BOTH barrier-close sites (claude P1).** `runWriterRegistration`
+closes `barrier` at two places — the verify-before-propose path (a
+prior attempt already committed) and the propose-success path. 7a-2
+refactors both into a single `releaseBarrier(barrier, cache, dekID)`
+helper that `close()`s the channel **and** calls
+`cache.MarkRegistered(dekID)` atomically, so the
+"timed-out-but-committed" verify path cannot leave `registered` false
+(which would have the direct-path gate reject writes even after
+confirmed registration). The single-active-storage-DEK model means
+`registeredStorageDEKID` is one `atomic.Uint32` — no map / `sync.Map`
+needed (only one storage DEK is active at a time; 7b's rotate-dek
+re-points the active id and re-registers, which `Registered()`'s
+equality check handles for free).
 
 Rationale for reusing the StateCache: the storage layer already reads
 `StorageEnvelopeActive` / `ActiveStorageKeyID` from it via closures
@@ -101,11 +111,25 @@ option (parallel to `WithStorageEnvelopeGate`). When wired,
 (`StorageEnvelopeActive && activeKeyID != 0`) but `registered()` is
 false. The FSM-apply path passes a flag that skips this check.
 
-Mechanically: `applyMutationsWithOpts` already distinguishes the two
-entry points (`ApplyMutations` vs `ApplyMutationsRaft` pass different
-write opts). 7a-2 threads a `gateRegistration bool` alongside so
-`encryptForKey` knows whether to enforce. The direct callers
-(`ApplyMutations`) set it true; `ApplyMutationsRaft` sets it false.
+**`encryptForKey` signature, not just `applyMutationsWithOpts` (claude
+P2).** `encryptForKey` is called from more than `applyMutationsWithOpts`
+— notably `PutAt` (`store/lsm_store.go:1031`) calls it directly, and
+`ExpireAt` / `PutWithTTLAt` delegate to `PutAt`. So threading a flag
+through `applyMutationsWithOpts` alone would leave those ungated. 7a-2
+adds the path context to **`encryptForKey`'s own signature**
+(Option A): `encryptForKey(pebbleKey, plaintext, expireAt, gateRegistration bool)`.
+The direct callers — `ApplyMutations`, `PutAt` (and thus `ExpireAt` /
+`PutWithTTLAt`) — pass `true`; the FSM-apply path (`ApplyMutationsRaft`)
+passes `false`. (`PutAt`/`ExpireAt`/`PutWithTTLAt` are internal/test
+surfaces today, not adapter hot paths, but gating them is correct and
+costs one bool.)
+
+**Runtime direct-write paths too, not just bootstrap (claude P2).**
+`CatalogStore.Save` is also reached at runtime via `SplitRange`, not
+only startup `EnsureCatalogSnapshot`. An unregistered node attempting a
+`SplitRange` before its barrier closes is correctly fail-closed by the
+same gate — the implementation must not special-case only the bootstrap
+path.
 
 ### 2.3 Startup ordering (the catalog-bootstrap question)
 
@@ -127,13 +151,23 @@ the registration *apply* writes a `!encryption|writers|…` registry row
 bootstrap — bootstrap-gated-on-registration introduces no cycle.
 (Verification item retained in §5 against engine bring-up order.)
 
-**Sequencing + deadlock mitigation (gemini medium).** When the
-envelope is active at startup, 7a-2 runs catalog bootstrap *after* the
-7a registration barrier; if the barrier is still open, the bootstrap's
-direct encrypted `Save` returns `ErrWriterNotRegistered` and is retried
-via a **shared, bounded** retry helper (see below) until the barrier
-closes. To prevent a permanent startup hang if registration never
-commits:
+**Reconciling with the current startup order (claude P1).** Today
+`setupDistributionAndRegistration` (`main_encryption_registration.go`)
+runs `setupDistributionCatalog` → `EnsureCatalogSnapshot` → (possible
+`Save`) **before** `installProcessStartRegistrationGate`. So the
+empty-catalog edge currently runs before any gate exists. 7a-2 resolves
+this concretely by **reordering** `setupDistributionAndRegistration`:
+install the registration gate (arm the barrier + start the 7a
+registration goroutine) **first**, then run `EnsureCatalogSnapshot`.
+With the gate armed, the bootstrap's direct encrypted `Save` (only when
+the envelope is active AND the catalog is empty) returns
+`ErrWriterNotRegistered` and is retried via the shared bounded helper
+until the barrier closes — at which point `Save` proceeds. This is safe
+because registration has no dependency on the route catalog (above), so
+arming-before-bootstrap cannot deadlock.
+
+**Deadlock mitigation (gemini medium).** To prevent a permanent startup
+hang if registration never commits:
   - the 7a registration goroutine already retries the propose with
     bounded backoff against the run-context (per-attempt timeout,
     leader re-resolution), so "no leader" resolves as leadership
@@ -192,9 +226,14 @@ duplicated, for consistent backoff + diagnostics.
 1. Catalog-bootstrap ordering vs registration (§2.3) — confirm no
    circular dependency and pick the sequencing (bootstrap-after-close
    vs. retry-on-`ErrWriterNotRegistered`).
-2. Are there direct-`ApplyMutations` callers **other** than catalog
-   bootstrap / admin snapshot / migration that run on the hot path and
-   would be unexpectedly gated? (grep audit before implementation.)
+2. Audit **all `encryptForKey` callers** (not just `ApplyMutations`):
+   confirmed `ApplyMutations`, `ApplyMutationsRaft`, and `PutAt`
+   (`ExpireAt` / `PutWithTTLAt` delegate to `PutAt`). The §2.2
+   signature change gates the direct callers
+   (`ApplyMutations`/`PutAt`) and exempts `ApplyMutationsRaft`. Confirm
+   no *other* `encryptForKey` caller exists and that no gated direct
+   caller is reached from an adapter hot path that legitimately fires
+   before registration.
 (Open question 3 — per-DEK vs single bool — is resolved: §2.1 adopts
 the per-DEK `registeredStorageDEKID atomic.Uint32`, lock-free and
 composing with 7b.)
