@@ -97,6 +97,77 @@ func TestDDBEncodeGSISparseSkipsMissingIndexKey(t *testing.T) {
 	}
 }
 
+// TestDDBEncodeGSISparseSkipsMissingIndexRange pins the second sparse
+// branch: a GSI with a defined range key skips an item that has the index
+// hash attribute but not the index range attribute (matching the live
+// gsiKeyValues include=false path).
+func TestDDBEncodeGSISparseSkipsMissingIndexRange(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const table = "orders"
+	schema := `{"format_version":1,"table_name":"orders",` +
+		`"primary_key":{"hash_key":{"name":"customer","type":"S"},"range_key":{"name":"order","type":"S"}},` +
+		`"attribute_definitions":[{"name":"customer","type":"S"},{"name":"order","type":"S"},{"name":"region","type":"S"},{"name":"ts","type":"S"}],` +
+		`"global_secondary_indexes":[{"name":"by-region","key_schema":{"hash_key":{"name":"region","type":"S"},"range_key":{"name":"ts","type":"S"}},"projection":{"type":"ALL"}}]}`
+	writeDDBSchema(t, in, EncodeSegment([]byte(table)), []byte(schema))
+	writeDDBItemFile(t, in, table, "both.json", []byte(`{"customer":{"S":"c1"},"order":{"S":"o1"},"region":{"S":"us"},"ts":{"S":"t1"}}`))
+	writeDDBItemFile(t, in, table, "norange.json", []byte(`{"customer":{"S":"c2"},"order":{"S":"o2"},"region":{"S":"us"}}`))
+
+	itemKeys, gsiRows := splitDDBEntries(liveDDBEntries(t, in))
+	if len(itemKeys) != 2 {
+		t.Fatalf("item records = %d, want 2", len(itemKeys))
+	}
+	if len(gsiRows) != 1 {
+		t.Fatalf("GSI rows = %d, want 1 (item missing the index range key is skipped)", len(gsiRows))
+	}
+}
+
+// TestDDBEncodeGSIMultipleIndexes pins that a table with two GSIs emits a
+// row for each (covering ddbSortedGSINames over >1 index), both pointing
+// to the item and each carrying its own index prefix.
+func TestDDBEncodeGSIMultipleIndexes(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const table = "orders"
+	schema := `{"format_version":1,"table_name":"orders",` +
+		`"primary_key":{"hash_key":{"name":"customer","type":"S"}},` +
+		`"attribute_definitions":[{"name":"customer","type":"S"},{"name":"region","type":"S"},{"name":"status","type":"S"}],` +
+		`"global_secondary_indexes":[` +
+		`{"name":"by-region","key_schema":{"hash_key":{"name":"region","type":"S"}},"projection":{"type":"ALL"}},` +
+		`{"name":"by-status","key_schema":{"hash_key":{"name":"status","type":"S"}},"projection":{"type":"ALL"}}]}`
+	writeDDBSchema(t, in, EncodeSegment([]byte(table)), []byte(schema))
+	writeDDBItemFile(t, in, table, "i.json", []byte(`{"customer":{"S":"c1"},"region":{"S":"us"},"status":{"S":"active"}}`))
+
+	itemKeys, gsiRows := splitDDBEntries(liveDDBEntries(t, in))
+	if len(itemKeys) != 1 {
+		t.Fatalf("item records = %d, want 1", len(itemKeys))
+	}
+	if len(gsiRows) != 2 {
+		t.Fatalf("GSI rows = %d, want 2", len(gsiRows))
+	}
+	for _, idx := range []string{"by-region", "by-status"} {
+		prefix := []byte(DDBGSIPrefix)
+		prefix = append(prefix, base64.RawURLEncoding.EncodeToString([]byte(table))...)
+		prefix = append(prefix, "|1|"...)
+		prefix = append(prefix, base64.RawURLEncoding.EncodeToString([]byte(idx))...)
+		prefix = append(prefix, '|')
+		found := false
+		for _, r := range gsiRows {
+			if bytes.HasPrefix(r.UserKey, prefix) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("no GSI row for index %q", idx)
+		}
+	}
+	for _, r := range gsiRows {
+		if !bytes.Equal(r.UserValue, itemKeys[0]) {
+			t.Fatalf("GSI value %x != item key %x", r.UserValue, itemKeys[0])
+		}
+	}
+}
+
 // TestDDBGSIRowKeyLayout pins the full derived GSI key bytes against a
 // hand-computed expectation: prefix + ordered index hash + ordered PK hash
 // (no ranges), value = the item key.
