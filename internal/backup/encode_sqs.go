@@ -269,6 +269,8 @@ func (e *SQSRecordEncoder) addMessage(b *snapshotBuilder, queueName string, rec 
 // missing file surfaces as a wrapped os.ErrNotExist so callers can treat
 // an absent optional file as empty.
 func (e *SQSRecordEncoder) openSQSRootFile(root *os.Root, rel string) (*os.File, error) {
+	// Pre-open Lstat refuses a symlink / FIFO / device / directory BEFORE
+	// Open, so a reader-less FIFO already in place cannot block the open.
 	linfo, err := root.Lstat(rel)
 	if err != nil {
 		return nil, errors.WithStack(err) // wraps os.ErrNotExist when absent
@@ -282,6 +284,23 @@ func (e *SQSRecordEncoder) openSQSRootFile(root *os.Root, rel string) (*os.File,
 	f, err := root.Open(rel)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	// Post-open fstat is authoritative: it closes the Lstat->Open TOCTOU
+	// gap by re-checking the actual opened descriptor, so a regular file
+	// swapped to a hard link / non-regular after the Lstat is caught here
+	// (gemini security-high on PR #846).
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, errors.WithStack(err)
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, errors.Wrapf(ErrSQSEncodeNotRegular, "%s (mode=%s)", rel, fi.Mode())
+	}
+	if err := refuseHardLink(fi, rel); err != nil {
+		_ = f.Close()
+		return nil, err
 	}
 	return f, nil
 }
@@ -337,6 +356,10 @@ func marshalStoredSQS(magic []byte, v any) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	// const-capacity, zero-length start + append (magic then body): keeps
+	// the len(magic)+len(body) arithmetic out of make() — which CodeQL
+	// flags as a potential allocation-size overflow — while makezero stays
+	// happy. Same pattern as marshalStoredDDBSchema/Item.
 	out := make([]byte, 0, len(magic))
 	out = append(out, magic...)
 	return append(out, body...), nil

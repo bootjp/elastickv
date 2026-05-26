@@ -186,6 +186,35 @@ func TestSQSEncodeRejectsPartitioned(t *testing.T) {
 	}
 }
 
+// TestSQSEncodeRejectsNonRegularQueueMeta pins the file guard: a
+// _queue.json that is a directory is refused with ErrSQSEncodeNotRegular.
+func TestSQSEncodeRejectsNonRegularQueueMeta(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(in, "sqs", EncodeSegment([]byte("q")), "_queue.json"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	b := newSnapshotBuilder(sqsEncTS)
+	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeNotRegular) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeNotRegular", err)
+	}
+}
+
+// TestSQSEncodeRejectsEmptyMessageID pins fail-closed on a message lacking
+// a message_id (which would otherwise key on the empty string).
+func TestSQSEncodeRejectsEmptyMessageID(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "q-emptyid"
+	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"q-emptyid",`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{[]byte(`{"message_id":"","body":"x","send_timestamp_millis":1,"available_at_millis":1}`)})
+	b := newSnapshotBuilder(sqsEncTS)
+	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeInvalidMessage) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidMessage", err)
+	}
+}
+
 // TestSQSEncodeMissingDirIsNoop pins that an absent sqs/ dir is a no-op.
 func TestSQSEncodeMissingDirIsNoop(t *testing.T) {
 	t.Parallel()
