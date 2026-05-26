@@ -164,6 +164,48 @@ func TestDDBEncodeItemNumericKeyFailsClosed(t *testing.T) {
 	}
 }
 
+// TestDDBEncodeItemNumericRangeKeyFailsClosed pins the fail-closed path
+// for a numeric RANGE key (the hash-key case is covered separately), so
+// both primary-key positions reject N until the ordered numeric encoding
+// lands (M3b-2).
+func TestDDBEncodeItemNumericRangeKeyFailsClosed(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const table = "events"
+	writeDDBSchema(t, in, EncodeSegment([]byte(table)), []byte(`{"format_version":1,"table_name":"events",`+
+		`"primary_key":{"hash_key":{"name":"pk","type":"S"},"range_key":{"name":"ts","type":"N"}},`+
+		`"attribute_definitions":[{"name":"pk","type":"S"},{"name":"ts","type":"N"}]}`))
+	writeDDBItemFile(t, in, table, "e.json", []byte(`{"pk":{"S":"a"},"ts":{"N":"100"}}`))
+
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeNumericKeyUnsupported) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeNumericKeyUnsupported", err)
+	}
+}
+
+// TestDDBEncodeItemRejectsDeeperNesting pins that an items/ tree deeper
+// than the decoder's fixed 2 levels (items/<hash>/<range>.json) fails
+// closed rather than silently skipping items — preventing a "restore
+// succeeded but item count is off" surprise from a corrupt/hand-crafted
+// dump (claude review on PR #837).
+func TestDDBEncodeItemRejectsDeeperNesting(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const table = "t"
+	writeDDBSchema(t, in, EncodeSegment([]byte(table)), []byte(`{"format_version":1,"table_name":"t",`+
+		`"primary_key":{"hash_key":{"name":"pk","type":"S"},"range_key":{"name":"sk","type":"S"}},`+
+		`"attribute_definitions":[{"name":"pk","type":"S"},{"name":"sk","type":"S"}]}`))
+	// items/h/sub/x.json — a directory nested inside a hash directory.
+	writeDDBItemFile(t, in, table, "h/sub/x.json", []byte(`{"pk":{"S":"h"},"sk":{"S":"x"}}`))
+
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeInvalidItem) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeInvalidItem", err)
+	}
+}
+
 // TestDDBEncodeItemMissingHashKeyFailsClosed pins that an item whose JSON
 // lacks the schema's hash-key attribute is rejected.
 func TestDDBEncodeItemMissingHashKeyFailsClosed(t *testing.T) {

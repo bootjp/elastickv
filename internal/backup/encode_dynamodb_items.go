@@ -108,7 +108,15 @@ func (e *DynamoDBEncoder) encodeCompositeItemDir(b *snapshotBuilder, root *os.Ro
 		return err
 	}
 	for _, ent := range entries {
-		if ent.IsDir() || !isJSONFilename(ent.Name()) {
+		// The decoder emits at most items/<hash>/<range>.json — a directory
+		// nested inside a hash directory cannot come from a valid dump, so
+		// fail closed rather than silently skip (which would under-count
+		// restored items without any error).
+		if ent.IsDir() {
+			return errors.Wrapf(ErrDDBEncodeInvalidItem,
+				"%s: unexpected nested directory %q (items layout is at most 2 levels)", sub, ent.Name())
+		}
+		if !isJSONFilename(ent.Name()) {
 			continue
 		}
 		if err := e.encodeOneItem(b, root, filepath.Join(sub, ent.Name()), tableName, schema); err != nil {
