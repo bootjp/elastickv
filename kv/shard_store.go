@@ -98,6 +98,25 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 	return v != nil, nil
 }
 
+// CommittedVersionAt routes the exact-timestamp existence probe to the
+// owning group's local store. Unlike GetAt/LatestCommitTS it does not take
+// a leader fence or proxy to the leader: it is used only by the
+// deterministic one-phase FSM apply, which reads the local replica it is
+// writing to (the FSM holds the per-shard store directly, not ShardStore).
+// The method exists to satisfy the MVCCStore interface; routing to the
+// local group store keeps it consistent with how the apply path reads.
+func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	g, ok := s.groupForKey(key)
+	if !ok || g.Store == nil {
+		return false, nil
+	}
+	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return exists, nil
+}
+
 // ScanAt scans keys across shards at the given timestamp. Note: when the range
 // spans multiple shards, each shard may have a different Raft apply position.
 // This means the returned view is NOT a globally consistent snapshot — it is

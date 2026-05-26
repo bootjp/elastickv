@@ -128,6 +128,18 @@ type MVCCStore interface {
 	// LatestCommitTS returns the commit timestamp of the newest version.
 	// The boolean reports whether the key has any version.
 	LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error)
+	// CommittedVersionAt reports whether a committed version stamped
+	// EXACTLY commitTS exists for key. Unlike GetAt (newest version
+	// <= ts) this is an exact-timestamp existence check, used by the
+	// one-phase transaction idempotency probe to ask "did the previous
+	// attempt — which committed at this exact commit_ts — land?". Because
+	// commit timestamps are issued by the strictly-monotonic, unique HLC
+	// (Clock().Next()), a version at an exact commitTS on a given key can
+	// only have come from the transaction that was assigned that timestamp,
+	// so an exact hit unambiguously identifies that attempt. A tombstone
+	// counts as a landed version (the attempt committed a delete). See
+	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
+	CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error)
 	// ApplyMutations atomically validates and appends the provided mutations.
 	// It must return ErrWriteConflict if any mutation key or any read key has
 	// a newer commit timestamp than startTS. readKeys carries the transaction's

@@ -188,6 +188,21 @@ func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64)
 	return err == nil, errors.WithStack(err)
 }
 
+// CommittedVersionAt delegates straight to the local store with no leader
+// fence or proxy. Unlike the client-facing GetAt/ExistsAt/ScanAt reads,
+// this exact-timestamp existence probe is used only by the deterministic
+// one-phase FSM apply (which always reads the local replica it is writing
+// to). It is part of the MVCCStore interface for completeness but is never
+// invoked through the leader-routed client read path, so there is no
+// freshness fence to honour and no RawCommittedVersionAt RPC to proxy to.
+func (s *LeaderRoutedStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	if s == nil || s.local == nil {
+		return false, nil
+	}
+	exists, err := s.local.CommittedVersionAt(ctx, key, commitTS)
+	return exists, errors.WithStack(err)
+}
+
 func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if s == nil || s.local == nil {
 		return []*store.KVPair{}, nil

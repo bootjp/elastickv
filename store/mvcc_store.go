@@ -464,6 +464,24 @@ func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool,
 	return ver.TS, true, nil
 }
 
+// CommittedVersionAt reports whether a version stamped EXACTLY commitTS
+// exists for key. Versions are kept sorted by TS ascending, so a binary
+// search for the exact timestamp answers the one-phase idempotency probe.
+// A tombstone counts as present (the previous attempt committed a delete),
+// matching the pebbleStore semantics.
+func (s *mvccStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	v, ok := s.tree.Get(key)
+	if !ok {
+		return false, nil
+	}
+	vs, _ := v.([]VersionedValue)
+	i := sort.Search(len(vs), func(i int) bool { return vs[i].TS >= commitTS })
+	return i < len(vs) && vs[i].TS == commitTS, nil
+}
+
 // ApplyMutationsRaft is provided to satisfy the MVCCStore interface. The
 // in-memory store has no WAL and therefore no sync-mode distinction; this
 // method delegates to ApplyMutations.

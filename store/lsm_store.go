@@ -765,6 +765,29 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 	return val != nil, nil
 }
 
+// CommittedVersionAt reports whether a version stamped EXACTLY commitTS
+// exists for key. It is a single point lookup on the MVCC-encoded key
+// (userKey + inverted commitTS), not a <=ts scan: only the exact version
+// matters for the one-phase idempotency probe. A tombstone version counts
+// as present — the previous attempt landed even if it committed a delete —
+// so the raw key existence is the answer and the value is not decoded.
+func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
+	_, closer, err := s.db.Get(encodeKey(key, commitTS))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	if err := closer.Close(); err != nil {
+		return false, errors.WithStack(err)
+	}
+	return true, nil
+}
+
 func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, ts uint64) (*KVPair, error) {
 	valBytes := iter.Value()
 	sv, err := decodeValue(valBytes)
