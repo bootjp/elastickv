@@ -188,6 +188,12 @@ func TestDDBEncodeItemNumericRangeKeyRoundTrip(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("decoded %d items, want 2", len(got))
 	}
+	wantA, wantB := reparse(t, a), reparse(t, bItem)
+	for _, item := range got {
+		if !reflect.DeepEqual(item, wantA) && !reflect.DeepEqual(item, wantB) {
+			t.Fatalf("unexpected decoded item: %#v", item)
+		}
+	}
 }
 
 // TestDDBNumericKeyOrderPreserving is the core correctness guard for the
@@ -221,7 +227,8 @@ func TestDDBNumericKeyOrderPreserving(t *testing.T) {
 }
 
 // TestDDBNumericKeyZeroLayout pins the canonical zero encoding: zero maps
-// to the single 0x01 marker, then the segment terminator.
+// to the single 0x01 marker (raw), which becomes 0x01 0x00 0x01 after the
+// segment escape/terminator.
 func TestDDBNumericKeyZeroLayout(t *testing.T) {
 	t.Parallel()
 	for _, z := range []string{"0", "0.0", "-0", "000", "0e5"} {
@@ -232,6 +239,28 @@ func TestDDBNumericKeyZeroLayout(t *testing.T) {
 		if !bytes.Equal(raw, []byte{0x01}) {
 			t.Fatalf("zero %q raw = %x, want 01", z, raw)
 		}
+		if seg := encodeDDBOrderedKeySegment(raw); !bytes.Equal(seg, []byte{0x01, 0x00, 0x01}) {
+			t.Fatalf("zero %q segment = %x, want 01 00 01", z, seg)
+		}
+	}
+}
+
+// TestDDBNumericKeyPositiveSignStripped pins that a leading '+' is stripped
+// so the value encodes identically to its unsigned form.
+func TestDDBNumericKeyPositiveSignStripped(t *testing.T) {
+	t.Parallel()
+	for _, pair := range [][2]string{{"+5", "5"}, {"+1e2", "100"}} {
+		withSign, err := ddbNumericKeyBytes(pair[0])
+		if err != nil {
+			t.Fatalf("ddbNumericKeyBytes(%q): %v", pair[0], err)
+		}
+		plain, err := ddbNumericKeyBytes(pair[1])
+		if err != nil {
+			t.Fatalf("ddbNumericKeyBytes(%q): %v", pair[1], err)
+		}
+		if !bytes.Equal(withSign, plain) {
+			t.Fatalf("%q (%x) must encode == %q (%x)", pair[0], withSign, pair[1], plain)
+		}
 	}
 }
 
@@ -239,7 +268,7 @@ func TestDDBNumericKeyZeroLayout(t *testing.T) {
 // literal in a numeric key position.
 func TestDDBNumericKeyRejectsMalformed(t *testing.T) {
 	t.Parallel()
-	for _, bad := range []string{"", "abc", "1.2.3", "+", "1e", "0x10"} {
+	for _, bad := range []string{"", "abc", "1.2.3", "+", "1e", "0x10", "e3"} {
 		if _, err := ddbNumericKeyBytes(bad); !errors.Is(err, ErrDDBEncodeInvalidItem) {
 			t.Fatalf("ddbNumericKeyBytes(%q) err = %v, want ErrDDBEncodeInvalidItem", bad, err)
 		}
