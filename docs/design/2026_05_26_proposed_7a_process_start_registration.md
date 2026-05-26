@@ -150,20 +150,34 @@ ungated case and the dispatch path checks `barrier == nil` first.
 **Gate injection — `ShardedCoordinator.Dispatch` (review #4).** The
 reads (`LinearizableRead`, `LeaseRead`, `VerifyLeader`) are separate
 `Coordinator` methods that never reach `Dispatch`, so they are
-structurally ungated. Inside `Dispatch`, the gate fires only when:
+structurally ungated. Inside `Dispatch`, the gate applies only to
+mutating encrypted writes. Go has no `closed()` builtin, so the
+open-vs-closed distinction is a non-blocking `select` after the `nil`
+check (review #2):
 
-```
-barrier != nil && !closed(barrier)
-  && cache.StorageEnvelopeActive() && cache.activeKeyID != 0
-  && hasMutatingElems(reqs)   // PUT / DEL / DEL_PREFIX present
+```go
+if barrier != nil {
+    select {
+    case <-barrier:
+        // closed → registration committed → pass through (fast path)
+    default:
+        // open → registration pending; gate only mutating encrypted writes
+        if cache.StorageEnvelopeActive() && cache.activeKeyID != 0 && hasMutatingElems(reqs) {
+            select {
+            case <-barrier:        // registration committed while we waited
+            case <-ctx.Done():
+                return ctx.Err()   // fail-closed: never emit an unregistered nonce
+            }
+        }
+    }
+}
 ```
 
 `hasMutatingElems` is required (not just `IsTxn`): a read-only
 transaction carrying only `ReadKeys` (no PUT/DEL elements) must stay
-ungated even though it flows through `dispatchTxn`. When the gate
-fires, `Dispatch` blocks on `select { case <-barrier: ; case <-ctx.Done(): }`
-before proposing — fail-closed: a write that cannot register within
-its ctx never emits an unregistered nonce.
+ungated even though it flows through `dispatchTxn`. Fail-closed: a
+write that cannot register within its `ctx` returns the ctx error
+rather than emitting an unregistered nonce.
 
 **Multi-shard note (review #6).** The barrier is node-global; the
 registration targets the default group. So in a multi-shard
@@ -208,9 +222,12 @@ apply-wait completes correctly — same reasoning as the 6C-2b scanner.
 default group's leader (the existing 5B Proposer path). On a follower,
 the startup propose forwards to the current leader (same path the admin
 RPC uses). If no leader is available yet at startup, the barrier stays
-closed-pending and the first encrypted write blocks until leadership
-settles — bounded by the client's `ctx` deadline (fail-closed: a write
-that cannot register does not get to emit an unregistered nonce).
+**open** (pending — the channel is non-nil and not yet closed, so
+mutating encrypted writes block per the §3.2 table; "closed" is
+reserved for the committed/ungated state) and the first encrypted
+write blocks until leadership settles — bounded by the client's `ctx`
+deadline (fail-closed: a write that cannot register does not get to
+emit an unregistered nonce).
 
 ## 4. Scope
 
