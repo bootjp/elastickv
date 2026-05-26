@@ -113,8 +113,8 @@ func findEntry(entries []RoundTripEntry, key []byte) *RoundTripEntry {
 
 // TestS3EncodeRejectsUnknownFormatVersion pins the format gate: a
 // _bucket.json with an unsupported format_version fails closed rather than
-// being silently parsed under the v1 schema (claude Finding 1 on PR #842;
-// mirrors the DynamoDB schema reader's format_version gate).
+// being silently parsed under the v1 schema — mirrors the DynamoDB schema
+// reader's format_version gate.
 func TestS3EncodeRejectsUnknownFormatVersion(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
