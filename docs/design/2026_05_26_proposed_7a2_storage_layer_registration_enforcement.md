@@ -1,0 +1,160 @@
+# Stage 7a-2 — storage-layer registration enforcement (complete write-path coverage)
+
+| Field | Value |
+|---|---|
+| Status | proposed |
+| Date | 2026-05-26 |
+| Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry), [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md) (7a coordinator-layer gate) |
+| Builds on | 7a (coordinator-layer first-write barrier), 6D-6c-1 (`encryption.StateCache`) |
+
+## 0. Why this slice exists
+
+7a's coordinator-layer barrier (`ShardedCoordinator.Dispatch` +
+`leaseRefreshingTxn.Commit`) gates the client-write and lock-resolution
+paths. But codex P1 #3 on PR #839 showed it is **structurally
+incomplete**: internal callers that write to the store **directly**
+bypass the coordinator entirely. The confirmed case:
+
+```
+distribution.CatalogStore.Save → applySaveMutations
+  → store.ApplyMutations(...)        // the DIRECT, non-Raft local commit path
+    → encryptForKey → nonceFactory.Next()
+```
+
+`store.ApplyMutations` is the direct local-write path (catalog
+bootstrap, admin snapshots, migrations); it is **not** the Raft FSM
+apply path (`ApplyMutationsRaft`). It still flows through
+`encryptForKey`, so when the §7.1 envelope is active it emits a §4.1
+nonce — and it does so without consulting 7a's coordinator barrier, so
+a self-originated catalog write can emit a nonce before this node's
+writer registration commits.
+
+The single chokepoint where **every** encrypted write emits its nonce
+is `store.encryptForKey`. 7a-2 enforces registration there, giving
+complete coverage of all self-originated write paths.
+
+## 1. The hard constraint: direct path vs FSM-apply path
+
+`encryptForKey` is reached from **two** classes of caller, which must
+be treated differently:
+
+| Path | Entry | Origin | 7a-2 action |
+|---|---|---|---|
+| **Direct** | `store.ApplyMutations` | self-originated local write (catalog `Save`, admin snapshot, migration) | **fail-closed**: refuse to emit an encrypted nonce before registration |
+| **FSM-apply** | `store.ApplyMutationsRaft` | a committed Raft entry being applied on this node (could be any node's write) | **NOT gated**: §4.1 explicitly allows apply during the pre-registration window ("FSM apply may run on leader-proposed entries … decrypted using sidecar DEKs") |
+
+**Why the FSM-apply path must NOT fail-close.** `ApplyMutationsRaft`
+runs inside the deterministic FSM apply loop on every node. If it
+returned an error for "not registered," the apply loop would HaltApply
+— and since the registration entry itself is ordered in the same Raft
+log, a storage entry ordered *before* the registration entry would
+halt the loop permanently (it can never reach and apply its own
+registration). It would also diverge a not-yet-registered follower
+from registered peers. The §4.1 contract deliberately permits apply
+during the window precisely because the danger is **self-originated**
+writes, not replicated apply. 7a's coordinator barrier already gates
+self-originated writes that go through the coordinator; 7a-2 closes the
+remaining self-originated path (direct `ApplyMutations`), and leaves
+the replicated FSM-apply path alone.
+
+This is the key insight that makes "enforce at `encryptForKey`"
+tractable: the enforcement is **per-call-path**, gated on the direct
+path only, not a blanket check.
+
+## 2. Proposed design
+
+### 2.1 A `registered` signal on the StateCache
+
+Add to `encryption.StateCache` a `registered atomic.Bool` (and
+`MarkRegistered()` / `Registered()`), set to true when this node's
+writer registration for the active storage DEK commits. 7a's
+`runWriterRegistration`, on `close(barrier)`, also calls
+`cache.MarkRegistered()`. Pre-registration (and Phase 0 / not
+bootstrapped) it is false.
+
+Rationale for reusing the StateCache: the storage layer already reads
+`StorageEnvelopeActive` / `ActiveStorageKeyID` from it via closures
+(6D-6c-2), so a `Registered()` closure threads in the same way without
+coupling `store` to the registration machinery.
+
+### 2.2 Store wiring
+
+A new `WithStorageRegistrationGate(registered func() bool)` PebbleStore
+option (parallel to `WithStorageEnvelopeGate`). When wired,
+`encryptForKey` on the **direct** path returns a typed
+`ErrWriterNotRegistered` when the envelope would encrypt
+(`StorageEnvelopeActive && activeKeyID != 0`) but `registered()` is
+false. The FSM-apply path passes a flag that skips this check.
+
+Mechanically: `applyMutationsWithOpts` already distinguishes the two
+entry points (`ApplyMutations` vs `ApplyMutationsRaft` pass different
+write opts). 7a-2 threads a `gateRegistration bool` alongside so
+`encryptForKey` knows whether to enforce. The direct callers
+(`ApplyMutations`) set it true; `ApplyMutationsRaft` sets it false.
+
+### 2.3 Startup ordering (the catalog-bootstrap question)
+
+`EnsureCatalogSnapshot` runs at startup and may `Save` via the direct
+path. If the envelope is active at startup (post-cutover restart) and
+this node is not yet registered, a gated catalog `Save` would fail.
+Two sub-cases:
+
+- **Catalog already populated** (the steady-state restart): `Save` is
+  a no-op (version unchanged), no mutation, no nonce → ungated.
+- **Empty catalog + active envelope** (the flagged edge): the bootstrap
+  `Save` would be gated. Resolution: the §4.1 registration must
+  precede the first direct encrypted write. Since registration is a
+  Raft 0x03 entry proposed at startup (7a), and catalog bootstrap is
+  also a startup step, 7a-2 sequences catalog bootstrap **after** the
+  registration barrier closes when the envelope is active (or, if the
+  barrier is still open, the bootstrap `Save` returns
+  `ErrWriterNotRegistered` and is retried after close). **Open question
+  for review (§5):** confirm there is no circular dependency
+  (registration propose → engine → does it need the catalog?). Initial
+  reading: registration proposes a reserved-key 0x03 entry through the
+  default group's engine, independent of the route catalog, so no
+  cycle — but this needs verification against the engine bring-up
+  order.
+
+## 3. Scope
+
+### In scope (7a-2)
+- `StateCache.registered` + `MarkRegistered` / `Registered`; 7a's
+  `runWriterRegistration` marks it on barrier close.
+- `WithStorageRegistrationGate` PebbleStore option +
+  `ErrWriterNotRegistered`; `encryptForKey` direct-path enforcement.
+- The direct-vs-raft path flag threaded through `applyMutationsWithOpts`.
+- main.go wiring of the `Registered()` closure.
+- Tests: direct-path write pre-registration → `ErrWriterNotRegistered`;
+  post-registration → encrypts; FSM-apply path never gated; envelope
+  inactive / no DEK → ungated; catalog-bootstrap ordering.
+
+### Out of scope
+- 7b (post-rotation re-registration), 7c (ConfChange-time registration).
+- Re-evaluating whether route-catalog data *should* be encrypted at all
+  (it is, incidentally, when the envelope is active; changing that is a
+  separate question).
+
+## 4. Self-review checklist (for the implementation PR)
+- **Data loss** — gating only refuses to *emit* an encrypted write
+  before registration (caller sees a typed error and retries); never
+  drops a committed write. FSM-apply path untouched → no apply halt.
+- **Concurrency** — `registered` is an atomic bool; `encryptForKey`
+  fast path is one atomic load on the direct path, zero on the
+  FSM-apply path.
+- **Data consistency** — FSM-apply determinism preserved (no per-node
+  fail-close on replicated apply); coordinator gate + this direct-path
+  gate together cover every self-originated encrypted write.
+- **Test coverage** — direct vs FSM-apply path, pre/post registration,
+  envelope/DEK off, catalog-bootstrap ordering.
+
+## 5. Open questions
+1. Catalog-bootstrap ordering vs registration (§2.3) — confirm no
+   circular dependency and pick the sequencing (bootstrap-after-close
+   vs. retry-on-`ErrWriterNotRegistered`).
+2. Are there direct-`ApplyMutations` callers **other** than catalog
+   bootstrap / admin snapshot / migration that run on the hot path and
+   would be unexpectedly gated? (grep audit before implementation.)
+3. Should `Registered()` be per-DEK (matching `ActiveStorageKeyID`) so a
+   rotate-dek (7b) that resets registration is handled, or a single
+   bool reset on rotate? (Leaning per-active-DEK to compose with 7b.)
