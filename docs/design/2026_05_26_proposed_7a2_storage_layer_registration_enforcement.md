@@ -112,17 +112,32 @@ option (parallel to `WithStorageEnvelopeGate`). When wired,
 false. The FSM-apply path passes a flag that skips this check.
 
 **`encryptForKey` signature, not just `applyMutationsWithOpts` (claude
-P2).** `encryptForKey` is called from more than `applyMutationsWithOpts`
-— notably `PutAt` (`store/lsm_store.go:1031`) calls it directly, and
-`ExpireAt` / `PutWithTTLAt` delegate to `PutAt`. So threading a flag
-through `applyMutationsWithOpts` alone would leave those ungated. 7a-2
-adds the path context to **`encryptForKey`'s own signature**
+P2).** `encryptForKey` is called from more than `applyMutationsWithOpts`,
+so 7a-2 adds the path context to **`encryptForKey`'s own signature**
 (Option A): `encryptForKey(pebbleKey, plaintext, expireAt, gateRegistration bool)`.
-The direct callers — `ApplyMutations`, `PutAt` (and thus `ExpireAt` /
-`PutWithTTLAt`) — pass `true`; the FSM-apply path (`ApplyMutationsRaft`)
-passes `false`. (`PutAt`/`ExpireAt`/`PutWithTTLAt` are internal/test
-surfaces today, not adapter hot paths, but gating them is correct and
-costs one bool.)
+Verified call-site inventory:
+
+| Call site | Line | Path | `gateRegistration` |
+|---|---|---|---|
+| `PutAt` | 1031 | direct | `true` |
+| `ExpireAt` | 1076 | direct (its own call, **not** via `PutAt`) | `true` |
+| `applyMutationsBatch` | 1177 | direct (via `ApplyMutations`) | `true` |
+| `applyMutationsBatch` | 1177 | FSM-apply (via `ApplyMutationsRaft`) | `false` |
+
+`PutWithTTLAt` delegates to `PutAt` (so it inherits the gate);
+**`ExpireAt` does not** — it calls `encryptForKey` directly at line
+1076, so it needs its own `gateRegistration = true` (claude P1
+correction; an earlier draft wrongly said `ExpireAt` delegates to
+`PutAt`). The shared `applyMutationsBatch` site (line 1177) is reached
+from both `ApplyMutations` (direct) and `ApplyMutationsRaft` (FSM), so
+the flag threaded through `applyMutationsWithOpts` distinguishes those
+two rows. `PutAt` / `ExpireAt` are internal/test surfaces today, not
+adapter hot paths, but gating them is correct and costs one bool.
+
+`DeletePrefixAt` / `DeletePrefixAtRaft` write only tombstones
+(`encodeValue(nil, true, 0, encStateCleartext)`) and never call
+`encryptForKey`, so they are outside the gate's scope with no change
+needed (noted to close the audit loop — claude P2).
 
 **Runtime direct-write paths too, not just bootstrap (claude P2).**
 `CatalogStore.Save` is also reached at runtime via `SplitRange`, not
