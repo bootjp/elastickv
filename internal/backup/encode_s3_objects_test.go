@@ -162,6 +162,64 @@ func TestReadRootBodyFileRejectsNonRegular(t *testing.T) {
 	}
 }
 
+// TestS3EncodeRejectsSizeMismatch pins fail-closed when the sidecar's
+// size_bytes disagrees with the actual object body length (corrupt dump).
+func TestS3EncodeRejectsSizeMismatch(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const bucket = "b"
+	writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"b"}`))
+	writeS3Object(t, in, bucket, "obj", []byte("hello"), s3ObjectSidecar("e", 999, "text/plain", ""))
+	b := newSnapshotBuilder(s3EncTS)
+	if err := NewS3RecordEncoder(in).Encode(b); !errors.Is(err, ErrS3EncodeInvalidManifest) {
+		t.Fatalf("Encode err = %v, want ErrS3EncodeInvalidManifest", err)
+	}
+}
+
+// TestReadObjectSidecarRejectsNonRegular pins the pre-open guard on the
+// sidecar read.
+func TestReadObjectSidecarRejectsNonRegular(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "sc"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	e := NewS3RecordEncoder(dir)
+	if _, err := e.readObjectSidecar(root, "sc"); !errors.Is(err, ErrS3EncodeNotRegular) {
+		t.Fatalf("readObjectSidecar err = %v, want ErrS3EncodeNotRegular", err)
+	}
+}
+
+// TestParseRFC3339NanoAsHLC pins the three silent-zero paths and the
+// sub-millisecond precision loss of the HLC reconstruction.
+func TestParseRFC3339NanoAsHLC(t *testing.T) {
+	t.Parallel()
+	if got := parseRFC3339NanoAsHLC(""); got != 0 {
+		t.Fatalf("empty = %d, want 0", got)
+	}
+	if got := parseRFC3339NanoAsHLC("not-a-time"); got != 0 {
+		t.Fatalf("invalid = %d, want 0", got)
+	}
+	if got := parseRFC3339NanoAsHLC("1969-12-31T23:59:59Z"); got != 0 {
+		t.Fatalf("pre-epoch = %d, want 0", got)
+	}
+	if got := parseRFC3339NanoAsHLC("2024-01-02T03:04:05Z"); got == 0 {
+		t.Fatalf("happy path = 0, want non-zero")
+	}
+	// Sub-millisecond precision is lost (truncated to ms), so the nanosecond
+	// form encodes identically to the millisecond form.
+	withNanos := parseRFC3339NanoAsHLC("2024-01-02T03:04:05.000000001Z")
+	withoutNanos := parseRFC3339NanoAsHLC("2024-01-02T03:04:05Z")
+	if withNanos != withoutNanos {
+		t.Fatalf("sub-ms precision not truncated: %d != %d", withNanos, withoutNanos)
+	}
+}
+
 // TestS3EncodeRejectsKeymapCollisionTracker pins fail-closed when a bucket
 // carries a collision-tracker KEYMAP.jsonl — identified by the ABSENCE of
 // a companion .elastickv-meta.json sidecar (M4-2a does not reverse renames).

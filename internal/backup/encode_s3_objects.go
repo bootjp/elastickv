@@ -130,6 +130,12 @@ func (e *S3RecordEncoder) walkObjects(b *snapshotBuilder, root *os.Root, bucketD
 func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string, ent os.DirEntry) error {
 	name := ent.Name()
 	if ent.IsDir() {
+		// TODO(M4-2b): _incomplete_uploads/ and _orphans/ are the decoder's
+		// reserved dump dirs and are skipped here, but a user object key
+		// literally prefixed with "_incomplete_uploads/" or "_orphans/"
+		// would also land here and be silently dropped. The robust fix
+		// (distinguishing reserved dumps from user keys, like the
+		// KEYMAP-tracker disambiguation) is deferred to the collision slice.
 		if rel == "" && (name == "_incomplete_uploads" || name == "_orphans") {
 			return nil
 		}
@@ -225,6 +231,13 @@ func (e *S3RecordEncoder) readObjectSidecar(root *os.Root, rel string) (s3Public
 
 // emitObject re-chunks the body into blob records and builds the manifest.
 func (e *S3RecordEncoder) emitObject(b *snapshotBuilder, bucketName, objectKey string, body []byte, sidecar s3PublicManifest) error {
+	// The body file IS the object, so its length must match the manifest's
+	// declared size; a mismatch means a corrupt/inconsistent dump and fails
+	// closed rather than restoring an object whose size_bytes lies.
+	if sidecar.SizeBytes != int64(len(body)) {
+		return errors.Wrapf(ErrS3EncodeInvalidManifest,
+			"%s: size_bytes %d != body length %d", objectKey, sidecar.SizeBytes, len(body))
+	}
 	chunkSizes, err := e.addObjectBlobs(b, bucketName, objectKey, body)
 	if err != nil {
 		return err
