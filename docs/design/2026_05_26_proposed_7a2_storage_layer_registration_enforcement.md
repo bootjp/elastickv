@@ -81,7 +81,8 @@ DEK *id* rather than a bool gives lock-free per-DEK gating that
 composes with 7b: a `rotate-dek` re-points `activeStorageDEKID` to the
 new id, and `Registered()` automatically evaluates false (the new id
 ≠ `registeredStorageDEKID`) until the post-rotation registration marks
-the new id — no reset logic, no mutex, one atomic load on the hot path.
+the new id — no reset logic, no mutex, just two atomic loads on the
+hot path (`activeStorageDEKID` and `registeredStorageDEKID`).
 
 **Mark at BOTH barrier-close sites (claude P1).** `runWriterRegistration`
 closes `barrier` at two places — the verify-before-propose path (a
@@ -228,27 +229,31 @@ duplicated, for consistent backoff + diagnostics.
 - **Data loss** — gating only refuses to *emit* an encrypted write
   before registration (caller sees a typed error and retries); never
   drops a committed write. FSM-apply path untouched → no apply halt.
-- **Concurrency** — `registered` is an atomic bool; `encryptForKey`
-  fast path is one atomic load on the direct path, zero on the
-  FSM-apply path.
+- **Concurrency** — registration state is `registeredStorageDEKID
+  atomic.Uint32` (§2.1); `Registered()` is lock-free — two atomic
+  loads (`activeStorageDEKID`, `registeredStorageDEKID`) when an active
+  DEK is present, and the direct-path check is skipped entirely on the
+  FSM-apply path (`gateRegistration = false`).
 - **Data consistency** — FSM-apply determinism preserved (no per-node
   fail-close on replicated apply); coordinator gate + this direct-path
   gate together cover every self-originated encrypted write.
 - **Test coverage** — direct vs FSM-apply path, pre/post registration,
   envelope/DEK off, catalog-bootstrap ordering.
 
-## 5. Open questions
-1. Catalog-bootstrap ordering vs registration (§2.3) — confirm no
-   circular dependency and pick the sequencing (bootstrap-after-close
-   vs. retry-on-`ErrWriterNotRegistered`).
-2. Audit **all `encryptForKey` callers** (not just `ApplyMutations`):
-   confirmed `ApplyMutations`, `ApplyMutationsRaft`, and `PutAt`
-   (`ExpireAt` / `PutWithTTLAt` delegate to `PutAt`). The §2.2
-   signature change gates the direct callers
-   (`ApplyMutations`/`PutAt`) and exempts `ApplyMutationsRaft`. Confirm
-   no *other* `encryptForKey` caller exists and that no gated direct
-   caller is reached from an adapter hot path that legitimately fires
-   before registration.
+## 5. Verification action items (design decisions are settled)
+1. **Sequencing is decided** (§2.3: arm the gate first, then
+   `EnsureCatalogSnapshot`, with bounded `retryUntilRegistered` for the
+   empty-catalog + active-envelope edge). Remaining **verification**
+   before implementation: confirm the `OpRegistration` apply path in
+   `kv/fsm.go` makes no route-catalog / `distribution.Engine` call, so
+   arm-before-bootstrap has no hidden cycle.
+2. **Call-site inventory is settled** (§2.2's 4-row table: `PutAt`
+   (1031) and `ExpireAt` (1076) are *separate* direct `encryptForKey`
+   callers — `ExpireAt` does **not** delegate to `PutAt`;
+   `PutWithTTLAt` does; `applyMutationsBatch` (1177) is reached from
+   both the direct and FSM paths; `DeletePrefixAt` writes tombstones
+   only and is out of scope). Remaining **verification**: grep-confirm
+   no *other* `encryptForKey` caller exists.
 (Open question 3 — per-DEK vs single bool — is resolved: §2.1 adopts
 the per-DEK `registeredStorageDEKID atomic.Uint32`, lock-free and
 composing with 7b.)
