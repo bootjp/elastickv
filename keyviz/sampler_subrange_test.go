@@ -32,7 +32,12 @@ func TestComputeSubLayout(t *testing.T) {
 		checkStartEndSet bool
 	}{
 		{name: "k=1 single bucket", start: []byte("a"), end: []byte("z"), k: 1, wantEffK: 1},
-		{name: "unbounded end single bucket", start: []byte("a"), end: nil, k: 8, wantEffK: 1},
+		{
+			// Unbounded high end now sub-divides over [subStart, MaxUint64]
+			// (§3.2 revised) rather than collapsing to one bucket.
+			name: "unbounded end subdivides", start: []byte("a"), end: nil, k: 8,
+			wantEffK: 8, wantSpanNonZero: true,
+		},
 		{
 			name: "normal range subdivides", start: []byte("a"), end: []byte("b"), k: 4,
 			wantEffK: 4, wantSpanNonZero: true, wantPrefixLen: 0, checkStartEndSet: true,
@@ -98,13 +103,62 @@ func TestSubBucketIndexSingleBucketAlwaysZero(t *testing.T) {
 	t.Parallel()
 	for _, slot := range []*routeSlot{
 		layoutSlot([]byte("a"), []byte("z"), 1),   // K=1
-		layoutSlot([]byte("a"), nil, 8),           // unbounded tail
-		layoutSlot([]byte{0x00}, []byte{0x00}, 8), // degenerate
+		layoutSlot([]byte{0x00}, []byte{0x00}, 8), // degenerate (empty range)
 	} {
 		require.Len(t, slot.subBuckets, 1)
 		for _, key := range [][]byte{nil, {0x00}, {0x80}, {0xFF, 0xFF}} {
 			require.Equal(t, 0, slot.subBucketIndex(key))
 		}
+	}
+}
+
+// TestSubBucketIndexUnboundedEnd pins the §3.2 revision: an open high
+// end ([start, nil)) — the single-route cluster and every cluster's
+// tail route — now sub-divides over [subStart, MaxUint64] instead of
+// collapsing to one bucket. The upper-edge clamp is skipped (subHi nil
+// sentinel), so distinct leading bytes land in distinct buckets.
+func TestSubBucketIndexUnboundedEnd(t *testing.T) {
+	t.Parallel()
+	// The single-route cluster the user hit: route owns the whole space.
+	slot := layoutSlot(nil, nil, 4)
+	require.Len(t, slot.subBuckets, 4, "[nil,nil) must sub-divide, not collapse to 1")
+	require.Nil(t, slot.subHi, "unbounded end => subHi nil sentinel")
+
+	// Leading byte spreads keys across the [0, MaxUint64] window:
+	// 0x00.. -> low bucket, 0xFF.. -> top bucket, and order preserved.
+	require.Equal(t, 0, slot.subBucketIndex([]byte{0x00}))
+	require.Equal(t, 3, slot.subBucketIndex([]byte{0xFF}))
+	i40 := slot.subBucketIndex([]byte{0x40})
+	i80 := slot.subBucketIndex([]byte{0x80})
+	iC0 := slot.subBucketIndex([]byte{0xC0})
+	require.LessOrEqual(t, i40, i80)
+	require.LessOrEqual(t, i80, iC0)
+
+	// A bounded-low / unbounded-high tail route ([0x80, nil)).
+	tail := layoutSlot([]byte{0x80}, nil, 4)
+	require.Len(t, tail.subBuckets, 4)
+	require.Equal(t, 0, tail.subBucketIndex([]byte{0x00}), "key below tail Start pins to bucket 0")
+	require.Equal(t, 3, tail.subBucketIndex([]byte{0xFF}))
+}
+
+// TestSamplerUnboundedRouteEmitsSubRanges is the end-to-end fix for the
+// deployed single-route cluster: with K>1, an unbounded [nil,nil) route
+// now produces multiple sub-range rows (previously exactly one). The
+// last sub-bucket keeps the unbounded End (nil).
+func TestSamplerUnboundedRouteEmitsSubRanges(t *testing.T) {
+	t.Parallel()
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, KeyBucketsPerRoute: 4})
+	require.True(t, s.RegisterRoute(1, nil, nil, 0)) // whole keyspace, unbounded both ends
+	for _, key := range [][]byte{{0x10}, {0x50}, {0x90}, {0xD0}} {
+		s.Observe(1, key, OpWrite, 0)
+	}
+	s.Flush()
+	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
+	require.Greater(t, len(rows), 1, "unbounded route must emit >1 sub-range row")
+	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].Start, rows[j].Start) < 0 })
+	require.Nil(t, rows[len(rows)-1].End, "last sub-bucket keeps the unbounded End (nil)")
+	for _, r := range rows {
+		require.Equal(t, 4, r.SubBucketCount)
 	}
 }
 

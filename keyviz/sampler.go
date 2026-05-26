@@ -565,7 +565,11 @@ func (slot *routeSlot) subBucketIndex(key []byte) int {
 	if bytes.Compare(key, slot.subLo) <= 0 {
 		return 0
 	}
-	if bytes.Compare(key, slot.subHi) >= 0 {
+	// subHi == nil is the unbounded-End sentinel (open high end, §3.2):
+	// there is no finite upper bound to clamp against, so rely on the
+	// window math + the w >= subEnd (== MaxUint64) guard below. A finite
+	// route always has a non-nil subHi.
+	if slot.subHi != nil && bytes.Compare(key, slot.subHi) >= 0 {
 		return k - 1
 	}
 	w := windowUint64(key, slot.subPrefixLen)
@@ -664,10 +668,23 @@ func (s *MemSampler) initSubLayout(slot *routeSlot, start, end []byte) {
 // subSpan 0) when the route cannot be sub-divided, otherwise k. See
 // design §3.1–§3.2.
 func computeSubLayout(start, end []byte, k int) (prefixLen int, subStart, subEnd, subSpan uint64, effK int) {
-	if k <= 1 || len(end) == 0 {
-		// K == 1, or an unbounded high end (no finite span to divide):
-		// a single bucket until a split gives the route a finite End.
+	if k <= 1 {
 		return 0, 0, 0, 0, 1
+	}
+	if len(end) == 0 {
+		// Unbounded high end (single-route cluster, or any cluster's
+		// tail route). There is no End window to share a prefix with, so
+		// bucket the leading W-byte window of the key across
+		// [subStart, MaxUint64]. MaxUint64 (not 1<<64) keeps subSpan a
+		// valid uint64 — the overflow that sank the original fallback.
+		// See design §3.2.
+		subStart = windowUint64(start, 0)
+		if subStart == math.MaxUint64 {
+			// start's window is already at the top of the space (all-0xFF
+			// leading bytes) — nothing left to divide.
+			return 0, subStart, subStart, 0, 1
+		}
+		return 0, subStart, math.MaxUint64, math.MaxUint64 - subStart, k
 	}
 	prefixLen = commonPrefixLen(start, end)
 	subStart = windowUint64(start, prefixLen)
