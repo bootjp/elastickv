@@ -32,16 +32,68 @@ const (
 	// the leader) rather than blocking indefinitely on a stale leader
 	// address under GRPCConnCache's WaitForReady(true) dials.
 	registrationAttemptTimeout = 5 * time.Second
+	// registrationGateWarnAfter is how long the direct-path catalog
+	// bootstrap Save may stay blocked on writer registration before a
+	// diagnostic WARN fires (Stage 7a-2 §2.3). The retry continues past
+	// this; the log line just makes a stuck node visible rather than
+	// silently hung.
+	registrationGateWarnAfter = 15 * time.Second
 )
 
-// setupDistributionAndRegistration sets up the distribution catalog and
-// then installs the Stage 7a process-start registration gate, returning
-// the catalog store. Bundling the two lets run() handle both startup
-// faults through a single error path (keeping run() within the cyclop
-// budget) while preserving the fail-synchronously-before-serving
+// retryUntilRegistered runs fn, retrying with bounded backoff while it
+// returns store.ErrWriterNotRegistered — the Stage 7a-2 §4.1
+// fail-closed signal that the §7.1 envelope is active but this load's
+// writer registration has not yet committed. Any other error (or nil)
+// returns immediately, so callers that never hit an encrypted direct
+// write see the wrapped fn's result unchanged.
+//
+// The retry is bounded by ctx (the run context), so a shutdown during
+// the empty-catalog + active-envelope startup edge cancels the loop and
+// returns rather than hanging. There is deliberately no fail-OPEN
+// fallback: letting the bootstrap Save proceed unregistered is the
+// exact hazard 7a-2 closes (§2.3).
+func retryUntilRegistered(ctx context.Context, what string, fn func() error) error {
+	backoff := registrationRetryInitial
+	start := time.Now()
+	warned := false
+	for {
+		err := fn()
+		if err == nil || !errors.Is(err, store.ErrWriterNotRegistered) {
+			return err
+		}
+		if !warned && time.Since(start) >= registrationGateWarnAfter {
+			slog.Warn("encryption: direct write blocked on writer registration; still retrying",
+				slog.String("operation", what),
+				slog.Duration("blocked_for", time.Since(start)))
+			warned = true
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), "%s: cancelled while blocked on writer registration", what)
+		case <-time.After(backoff):
+			backoff = min(backoff*registrationBackoffFactor, registrationRetryMax)
+		}
+	}
+}
+
+// setupDistributionAndRegistration installs the Stage 7a process-start
+// registration gate and then sets up the distribution catalog,
+// returning the catalog store. Bundling the two lets run() handle both
+// startup faults through a single error path (keeping run() within the
+// cyclop budget) while preserving the fail-synchronously-before-serving
 // guarantee for the registration gate.
+//
+// Ordering (Stage 7a-2 §2.3): the registration gate is armed FIRST,
+// then EnsureCatalogSnapshot runs. The catalog bootstrap Save is a
+// direct encrypted write that 7a-2 gates on Registered(); arming the
+// gate (which starts the registration goroutine) before the bootstrap
+// lets the empty-catalog + active-envelope edge clear once registration
+// commits, via the bounded retryUntilRegistered wrapper inside
+// setupDistributionCatalog. Registration has no dependency on the route
+// catalog (the OpRegistration apply writes a writer-registry row, not a
+// route), so arm-before-bootstrap cannot deadlock.
 func setupDistributionAndRegistration(
-	ctx, runCtx context.Context,
+	runCtx context.Context,
 	eg *errgroup.Group,
 	runtimes []*raftGroupRuntime,
 	engine *distribution.Engine,
@@ -50,11 +102,13 @@ func setupDistributionAndRegistration(
 	w encryptionWriteWiring,
 	raftID string,
 ) (*distribution.CatalogStore, error) {
-	distCatalog, err := setupDistributionCatalog(ctx, runtimes, engine)
-	if err != nil {
+	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
 		return nil, err
 	}
-	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
+	// Bootstrap + registration both run under runCtx so a shutdown
+	// cancels the bounded retry rather than hanging.
+	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, engine)
+	if err != nil {
 		return nil, err
 	}
 	return distCatalog, nil
@@ -139,6 +193,15 @@ func buildProcessStartRegistrationGate(
 	//   - epoch  > last_seen → propose (the trigger).
 	switch {
 	case w.epoch == lastSeen:
+		// Already registered (bootstrap cohort / no-op restart). This
+		// branch returns ungated WITHOUT starting runWriterRegistration,
+		// so it must seed the Stage 7a-2 direct-path gate itself —
+		// otherwise Registered() stays false on every steady-state
+		// restart and the direct bootstrap Save would wrongly fail-closed
+		// with ErrWriterNotRegistered despite a current registry (codex
+		// P1 on PR #843). MarkRegistered is a no-op when activeDEK == 0,
+		// but we are past the not-bootstrapped guard so it is non-zero.
+		w.cache.MarkRegistered(activeDEK)
 		slog.Info("encryption: writer registration skipped (already current)",
 			slog.Uint64("dek_id", uint64(activeDEK)),
 			slog.Uint64("full_node_id", fullNodeID),
@@ -169,7 +232,7 @@ func buildProcessStartRegistrationGate(
 		return ls >= w.epoch, nil
 	}
 	eg.Go(func() error {
-		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, entry, req, barrier, verifyRegistered)
+		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, w.cache, activeDEK, entry, req, barrier, verifyRegistered)
 		return nil
 	})
 	return &kv.RegistrationGate{
@@ -221,15 +284,32 @@ func registrationRequest(dekID uint32, fullNodeID uint64, epoch uint16) *pb.Regi
 	}
 }
 
+// releaseBarrier is the single barrier-close site for the Stage 7a
+// registration goroutine. It marks the Stage 7a-2 direct-path gate
+// registered for dekID BEFORE closing the channel, so any write the
+// barrier close releases (coordinator-gated client writes) observes
+// Registered() == true rather than racing a still-false gate that would
+// fail-close the first encrypted direct write. MarkRegistered is a
+// no-op for dekID == 0 (the gate condition is then false anyway).
+func releaseBarrier(barrier chan struct{}, cache *encryption.StateCache, dekID uint32) {
+	cache.MarkRegistered(dekID)
+	close(barrier)
+}
+
 // runWriterRegistration drives the §4.1 registration to commit, then
 // closes the barrier. It retries transient failures (no leader yet,
 // proposal dropped, transport blip) with bounded backoff against ctx;
 // on ctx cancellation it returns WITHOUT closing the barrier — never
 // releasing writes on an uncommitted registration (7a §3.2).
+//
+// cache + dekID feed releaseBarrier so both close sites (verify-before-
+// propose and propose-success) seed the Stage 7a-2 direct-path gate.
 func runWriterRegistration(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
 	defaultEngine raftengine.Engine,
+	cache *encryption.StateCache,
+	dekID uint32,
 	entry []byte,
 	req *pb.RegisterEncryptionWriterRequest,
 	barrier chan struct{},
@@ -255,14 +335,14 @@ func runWriterRegistration(
 		// avoids retrying-without-committing forever under high commit
 		// latency (codex P2 #6).
 		if registered, verr := verifyRegistered(); verr == nil && registered {
-			close(barrier)
+			releaseBarrier(barrier, cache, dekID)
 			slog.Info("encryption: writer registration confirmed committed; first-write barrier released",
 				slog.Uint64("dek_id", uint64(req.GetDekId())))
 			return
 		}
 		err := proposeWriterRegistration(ctx, coordinate, defaultEngine, connCache, entry, req)
 		if err == nil {
-			close(barrier)
+			releaseBarrier(barrier, cache, dekID)
 			slog.Info("encryption: writer registration committed; first-write barrier released",
 				slog.Uint64("dek_id", uint64(req.GetDekId())))
 			return

@@ -101,6 +101,12 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 	return []store.PebbleStoreOption{
 		store.WithEncryption(w.cipher, w.nonceFactory, w.cache.ActiveStorageKeyID),
 		store.WithStorageEnvelopeGate(w.cache.StorageEnvelopeActive),
+		// Stage 7a-2 §4.1 direct-path registration gate: the store
+		// refuses to emit an encrypted envelope on a self-originated
+		// write (catalog bootstrap Save) until this load's writer
+		// registration has committed for the active storage DEK. Reads
+		// from the same shared cache the registration paths MarkRegistered.
+		store.WithStorageRegistrationGate(w.cache.Registered),
 	}
 }
 

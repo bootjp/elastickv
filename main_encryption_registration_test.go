@@ -24,10 +24,16 @@ func TestRunWriterRegistration_VerifyCommittedClosesBarrier(t *testing.T) {
 	t.Parallel()
 	barrier := make(chan struct{})
 	verify := func() (bool, error) { return true, nil } // already committed
+	// A cache with the storage DEK active so Registered() is meaningful;
+	// releaseBarrier (via the verify path) must MarkRegistered it.
+	cache := encryption.NewStateCache()
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = testRegDEKID
+	cache.RefreshFromSidecar(sc)
 	done := make(chan struct{})
 	go func() {
-		runWriterRegistration(context.Background(), nil, nil, nil,
-			registrationRequest(7, 1, 3), barrier, verify)
+		runWriterRegistration(context.Background(), nil, nil, cache, testRegDEKID, nil,
+			registrationRequest(testRegDEKID, 1, 3), barrier, verify)
 		close(done)
 	}()
 	select {
@@ -36,6 +42,11 @@ func TestRunWriterRegistration_VerifyCommittedClosesBarrier(t *testing.T) {
 		t.Fatal("barrier not closed when registration already committed (verify path)")
 	}
 	<-done
+	// The verify-before-propose close site must seed the Stage 7a-2
+	// direct-path gate, not only the propose-success site (claude P1).
+	if !cache.Registered() {
+		t.Error("verify-committed path closed the barrier but did not MarkRegistered (Registered() = false)")
+	}
 }
 
 func TestRegistrationEntry_RoundTrips(t *testing.T) {
@@ -144,14 +155,21 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 		name string
 		w    encryptionWriteWiring
 		seed func(t *testing.T, st store.MVCCStore)
+		// expectRegistered is the Stage 7a-2 direct-path gate state after
+		// the ungated branch returns. Only the already-registered restart
+		// seeds Registered() true (codex P1 on PR #843); the other ungated
+		// branches leave it false (and the gate condition is false there
+		// anyway, so encryptForKey never consults it).
+		expectRegistered bool
 	}{
 		{name: "encryption_off", w: encryptionWriteWiring{cache: encryption.NewStateCache()}}, // cipher nil
 		{name: "phase0_envelope_inactive", w: wiringFor(t, 7, false, 1)},
 		{name: "not_bootstrapped", w: wiringFor(t, 0, true, 1)},
 		{
-			name: "already_registered",
-			w:    wiringFor(t, 7, true, 3),
-			seed: func(t *testing.T, st store.MVCCStore) { writeRegistryRow(t, st, fullNodeID, 3) },
+			name:             "already_registered",
+			w:                wiringFor(t, 7, true, 3),
+			seed:             func(t *testing.T, st store.MVCCStore) { writeRegistryRow(t, st, fullNodeID, 3) },
+			expectRegistered: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -172,6 +190,9 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 			// ever blocks.
 			if gate == nil || gate.Barrier != nil {
 				t.Errorf("%s: expected ungated gate (nil Barrier), got %+v", tc.name, gate)
+			}
+			if got := tc.w.cache.Registered(); got != tc.expectRegistered {
+				t.Errorf("%s: Registered() = %v, want %v", tc.name, got, tc.expectRegistered)
 			}
 		})
 	}
