@@ -63,15 +63,47 @@ var ErrS3EncodeUnsupportedCollision = errors.New("backup: s3 encode object-name 
 var ErrS3EncodeInvalidManifest = errors.New("backup: s3 encode invalid object sidecar")
 
 // encodeBucketObjects walks a bucket's object tree and stages each
-// object's manifest + blob records. KEYMAP.jsonl (collision renames)
-// fails closed.
+// object's manifest + blob records.
+//
+// Object-name collisions: the decoder writes a top-level KEYMAP.jsonl
+// recording shorter keys renamed to <key>.elastickv-leaf-data. M4-2a does
+// not reverse those renames, so a collision-tracker KEYMAP.jsonl fails
+// closed. It is distinguished from a legitimate user object named
+// "KEYMAP.jsonl" (which the decoder also emits verbatim) by the absence of
+// a companion .elastickv-meta.json sidecar — the tracker has none. The
+// .elastickv-leaf-data suffix is NOT special-cased: a real object whose
+// key ends in it has a sidecar and round-trips normally, and any actual
+// collision is already gated by the tracker check above (codex P1 #845).
 func (e *S3RecordEncoder) encodeBucketObjects(b *snapshotBuilder, root *os.Root, bucketDir, bucketName string) error {
-	if _, err := root.Lstat(filepath.Join(bucketDir, "KEYMAP.jsonl")); err == nil {
-		return errors.Wrapf(ErrS3EncodeUnsupportedCollision, "%s: KEYMAP.jsonl present", bucketDir)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return errors.WithStack(err)
+	keymapRel := filepath.Join(bucketDir, "KEYMAP.jsonl")
+	present, err := rootEntryExists(root, keymapRel)
+	if err != nil {
+		return err
+	}
+	if present {
+		hasSidecar, err := rootEntryExists(root, keymapRel+S3MetaSuffixReserved)
+		if err != nil {
+			return err
+		}
+		if !hasSidecar {
+			return errors.Wrapf(ErrS3EncodeUnsupportedCollision,
+				"%s: collision-rename KEYMAP.jsonl present", bucketDir)
+		}
 	}
 	return e.walkObjects(b, root, bucketDir, bucketName, "")
+}
+
+// rootEntryExists reports whether rel exists within root (via Lstat, so it
+// does not follow a final symlink).
+func rootEntryExists(root *os.Root, rel string) (bool, error) {
+	_, err := root.Lstat(rel)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return true, nil
 }
 
 // walkObjects recursively descends bucketDir, treating each non-sidecar
@@ -108,9 +140,12 @@ func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, buc
 		return nil
 	case strings.HasSuffix(name, S3MetaSuffixReserved):
 		return nil // sidecar, handled with its body
-	case strings.HasSuffix(name, S3LeafDataSuffix):
-		return errors.Wrapf(ErrS3EncodeUnsupportedCollision, "%s: leaf-data rename", childRel)
 	default:
+		// Any other regular file (including a user object literally named
+		// "KEYMAP.jsonl" or ending in .elastickv-leaf-data) is an object
+		// body; encodeObject reads its sidecar and fails closed if absent.
+		// A sidecar-less collision-tracker KEYMAP.jsonl was already gated
+		// in encodeBucketObjects.
 		return e.encodeObject(b, root, bucketDir, bucketName, childRel)
 	}
 }

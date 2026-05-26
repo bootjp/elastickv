@@ -162,9 +162,10 @@ func TestReadRootBodyFileRejectsNonRegular(t *testing.T) {
 	}
 }
 
-// TestS3EncodeRejectsKeymapCollision pins fail-closed when a bucket
-// carries a KEYMAP.jsonl (object-name collision renames not yet reversed).
-func TestS3EncodeRejectsKeymapCollision(t *testing.T) {
+// TestS3EncodeRejectsKeymapCollisionTracker pins fail-closed when a bucket
+// carries a collision-tracker KEYMAP.jsonl — identified by the ABSENCE of
+// a companion .elastickv-meta.json sidecar (M4-2a does not reverse renames).
+func TestS3EncodeRejectsKeymapCollisionTracker(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
 	const bucket = "b"
@@ -179,19 +180,37 @@ func TestS3EncodeRejectsKeymapCollision(t *testing.T) {
 	}
 }
 
-// TestS3EncodeRejectsLeafDataCollision pins fail-closed on a
-// .elastickv-leaf-data renamed object.
-func TestS3EncodeRejectsLeafDataCollision(t *testing.T) {
+// TestS3EncodeKeymapObjectRoundTrip pins that a legitimate user object
+// named "KEYMAP.jsonl" (one with a companion sidecar) round-trips, rather
+// than being mistaken for the collision tracker (codex P1 #845).
+func TestS3EncodeKeymapObjectRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
-	const bucket = "b"
-	writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"b"}`))
-	leaf := filepath.Join(in, "s3", EncodeSegment([]byte(bucket)), "obj"+S3LeafDataSuffix)
-	if err := os.WriteFile(leaf, []byte("x"), 0o600); err != nil {
-		t.Fatalf("write leaf-data: %v", err)
+	const bucket = "obj-keymap"
+	writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"obj-keymap"}`))
+	body := []byte("user keymap object")
+	writeS3Object(t, in, bucket, "KEYMAP.jsonl", body, s3ObjectSidecar("e", int64(len(body)), "application/json", ""))
+
+	gotBody, _ := decodeS3Object(t, encodeS3Tree(t, in), bucket, "KEYMAP.jsonl")
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("KEYMAP.jsonl object body = %q, want %q", gotBody, body)
 	}
-	b := newSnapshotBuilder(s3EncTS)
-	if err := NewS3RecordEncoder(in).Encode(b); !errors.Is(err, ErrS3EncodeUnsupportedCollision) {
-		t.Fatalf("Encode err = %v, want ErrS3EncodeUnsupportedCollision", err)
+}
+
+// TestS3EncodeLeafDataObjectRoundTrip pins that a legitimate object key
+// ending in .elastickv-leaf-data (with a sidecar, no collision) round-trips
+// rather than being rejected as a rename artifact (codex P1 #845).
+func TestS3EncodeLeafDataObjectRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const bucket = "obj-leaf"
+	writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"obj-leaf"}`))
+	body := []byte("leaf-data named object")
+	objKey := "foo" + S3LeafDataSuffix
+	writeS3Object(t, in, bucket, objKey, body, s3ObjectSidecar("e", int64(len(body)), "application/octet-stream", ""))
+
+	gotBody, _ := decodeS3Object(t, encodeS3Tree(t, in), bucket, objKey)
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("leaf-data-named object body = %q, want %q", gotBody, body)
 	}
 }
