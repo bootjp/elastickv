@@ -600,16 +600,23 @@ func matrixToProto(cols []keyviz.MatrixColumn, pick func(keyviz.MatrixRow) uint6
 	resp := &pb.GetKeyVizMatrixResponse{
 		ColumnUnixMs: make([]int64, len(cols)),
 	}
-	rowsByID := make(map[uint64]*pb.KeyVizRow)
-	order := make([]uint64, 0)
+	// Keyed by BucketId, not bare RouteID: sub-range bucketing gives a
+	// route's sub-rows the same RouteID, so keying on RouteID would
+	// collide them. BucketId embeds the sub-bucket index when
+	// SubBucketCount > 1, so it is unique per (route, sub-bucket). The
+	// proto KeyVizRow needs no new field — the BucketId distinguishes
+	// sub-rows. See design §5.1.
+	rowsByID := make(map[string]*pb.KeyVizRow)
+	order := make([]string, 0)
 	for j, col := range cols {
 		resp.ColumnUnixMs[j] = col.At.UnixMilli()
 		for _, mr := range col.Rows {
-			pr, ok := rowsByID[mr.RouteID]
+			id := bucketIDFor(mr)
+			pr, ok := rowsByID[id]
 			if !ok {
 				pr = newKeyVizRowFrom(mr, len(cols))
-				rowsByID[mr.RouteID] = pr
-				order = append(order, mr.RouteID)
+				rowsByID[id] = pr
+				order = append(order, id)
 			}
 			pr.Values[j] = pick(mr)
 			// Per-cell Raft identity stamped from this column's
@@ -698,7 +705,13 @@ func bucketIDFor(mr keyviz.MatrixRow) string {
 	if mr.Aggregate {
 		return "virtual:" + strconv.FormatUint(mr.RouteID, 10)
 	}
-	return "route:" + strconv.FormatUint(mr.RouteID, 10)
+	id := "route:" + strconv.FormatUint(mr.RouteID, 10)
+	// Sub-bucket suffix only for genuinely sub-divided routes, so K=1 /
+	// aggregate / degenerate slots keep the exact legacy id. See §5.1.
+	if mr.SubBucketCount > 1 {
+		id += "#" + strconv.Itoa(mr.SubBucket)
+	}
+	return id
 }
 
 func sortKeyVizRowsByStart(rows []*pb.KeyVizRow) {

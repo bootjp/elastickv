@@ -337,16 +337,22 @@ func pivotKeyVizColumns(cols []keyviz.MatrixColumn, series KeyVizSeries, rowBudg
 		Series:       series,
 		ColumnUnixMs: make([]int64, len(cols)),
 	}
-	rowsByID := make(map[uint64]*KeyVizRow)
-	order := make([]uint64, 0)
+	// Keyed by BucketID, not bare RouteID: with sub-range bucketing a
+	// route's sub-rows all share its RouteID, so keying on RouteID would
+	// collide them and drop all but the last per column. BucketID embeds
+	// the sub-bucket index (#subIdx) when SubBucketCount > 1, so it is
+	// unique per (route, sub-bucket). See design §5.1.
+	rowsByID := make(map[string]*KeyVizRow)
+	order := make([]string, 0)
 	for j, col := range cols {
 		matrix.ColumnUnixMs[j] = col.At.UnixMilli()
 		for _, mr := range col.Rows {
-			row, ok := rowsByID[mr.RouteID]
+			id := bucketIDFor(mr)
+			row, ok := rowsByID[id]
 			if !ok {
 				row = newKeyVizRowFrom(mr, len(cols))
-				rowsByID[mr.RouteID] = row
-				order = append(order, mr.RouteID)
+				rowsByID[id] = row
+				order = append(order, id)
 			}
 			v := pick(mr)
 			row.Values[j] = v
@@ -424,7 +430,16 @@ func bucketIDFor(mr keyviz.MatrixRow) string {
 	if mr.Aggregate {
 		return "virtual:" + strconv.FormatUint(mr.RouteID, 10)
 	}
-	return "route:" + strconv.FormatUint(mr.RouteID, 10)
+	id := "route:" + strconv.FormatUint(mr.RouteID, 10)
+	// Append the sub-bucket index only for genuinely sub-divided routes
+	// (SubBucketCount > 1), so a K=1 / aggregate / degenerate slot keeps
+	// the exact legacy "route:<id>" id and the change stays inert at the
+	// default. SubBucket == 0 alone can't disambiguate (a K=1 slot's
+	// only row and a K>1 slot's bucket-0 row both have it).
+	if mr.SubBucketCount > 1 {
+		id += "#" + strconv.Itoa(mr.SubBucket)
+	}
+	return id
 }
 
 // applyKeyVizRowBudget mirrors the adapter Phase-1 simplification:

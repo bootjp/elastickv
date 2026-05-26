@@ -26,10 +26,10 @@ type sampleCall struct {
 	valueLen int
 }
 
-func (r *recordingSampler) Observe(routeID uint64, op keyviz.Op, keyLen, valueLen int) {
+func (r *recordingSampler) Observe(routeID uint64, key []byte, op keyviz.Op, valueLen int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls = append(r.calls, sampleCall{routeID: routeID, op: op, keyLen: keyLen, valueLen: valueLen})
+	r.calls = append(r.calls, sampleCall{routeID: routeID, op: op, keyLen: len(key), valueLen: valueLen})
 }
 
 func (r *recordingSampler) snapshot() []sampleCall {
