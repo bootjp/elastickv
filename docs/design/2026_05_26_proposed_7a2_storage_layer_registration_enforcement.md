@@ -63,14 +63,29 @@ path only, not a blanket check.
 
 ## 2. Proposed design
 
-### 2.1 A `registered` signal on the StateCache
+### 2.1 A per-DEK `registered` signal on the StateCache
 
-Add to `encryption.StateCache` a `registered atomic.Bool` (and
-`MarkRegistered()` / `Registered()`), set to true when this node's
-writer registration for the active storage DEK commits. 7a's
-`runWriterRegistration`, on `close(barrier)`, also calls
-`cache.MarkRegistered()`. Pre-registration (and Phase 0 / not
-bootstrapped) it is false.
+Add to `encryption.StateCache` a `registeredStorageDEKID atomic.Uint32`
+(0 = none) with `MarkRegistered(dekID uint32)` and a `Registered()`
+predicate:
+
+```go
+func (c *StateCache) Registered() bool {
+    id := c.activeStorageDEKID.Load()
+    return id != 0 && c.registeredStorageDEKID.Load() == id
+}
+```
+
+**Per-DEK, not a single bool (gemini medium).** Tracking the registered
+DEK *id* rather than a bool gives lock-free per-DEK gating that
+composes with 7b: a `rotate-dek` re-points `activeStorageDEKID` to the
+new id, and `Registered()` automatically evaluates false (the new id
+≠ `registeredStorageDEKID`) until the post-rotation registration marks
+the new id — no reset logic, no mutex, one atomic load on the hot path.
+
+7a's `runWriterRegistration`, on `close(barrier)`, calls
+`cache.MarkRegistered(activeDEK)`. Pre-registration (and Phase 0 / not
+bootstrapped) `Registered()` is false.
 
 Rationale for reusing the StateCache: the storage layer already reads
 `StorageEnvelopeActive` / `ActiveStorageKeyID` from it via closures
@@ -102,19 +117,44 @@ Two sub-cases:
 - **Catalog already populated** (the steady-state restart): `Save` is
   a no-op (version unchanged), no mutation, no nonce → ungated.
 - **Empty catalog + active envelope** (the flagged edge): the bootstrap
-  `Save` would be gated. Resolution: the §4.1 registration must
-  precede the first direct encrypted write. Since registration is a
-  Raft 0x03 entry proposed at startup (7a), and catalog bootstrap is
-  also a startup step, 7a-2 sequences catalog bootstrap **after** the
-  registration barrier closes when the envelope is active (or, if the
-  barrier is still open, the bootstrap `Save` returns
-  `ErrWriterNotRegistered` and is retried after close). **Open question
-  for review (§5):** confirm there is no circular dependency
-  (registration propose → engine → does it need the catalog?). Initial
-  reading: registration proposes a reserved-key 0x03 entry through the
-  default group's engine, independent of the route catalog, so no
-  cycle — but this needs verification against the engine bring-up
-  order.
+  `Save` would be gated. Resolution + deadlock mitigation below.
+
+**No circular dependency.** Registration proposes a reserved-key 0x03
+`OpRegistration` entry through the default group's engine; proposing is
+submitting bytes to Raft and does not consult the route catalog, and
+the registration *apply* writes a `!encryption|writers|…` registry row
+(not a route). So registration can commit independent of catalog
+bootstrap — bootstrap-gated-on-registration introduces no cycle.
+(Verification item retained in §5 against engine bring-up order.)
+
+**Sequencing + deadlock mitigation (gemini medium).** When the
+envelope is active at startup, 7a-2 runs catalog bootstrap *after* the
+7a registration barrier; if the barrier is still open, the bootstrap's
+direct encrypted `Save` returns `ErrWriterNotRegistered` and is retried
+via a **shared, bounded** retry helper (see below) until the barrier
+closes. To prevent a permanent startup hang if registration never
+commits:
+  - the 7a registration goroutine already retries the propose with
+    bounded backoff against the run-context (per-attempt timeout,
+    leader re-resolution), so "no leader" resolves as leadership
+    settles;
+  - the direct-path retry is **bounded by the run-context** (and a
+    generous ceiling), not infinite — on shutdown it returns the error
+    and the process exits cleanly rather than hanging;
+  - a WARN log fires when the bootstrap `Save` has been blocked on
+    registration beyond a threshold, so a stuck node is diagnosable
+    rather than silently hung.
+There is no fail-OPEN fallback: bypassing the gate to let bootstrap
+proceed unregistered is the exact hazard 7a-2 closes. A node that
+genuinely cannot register (e.g. `ErrNodeIDCollision`) fails to start —
+which is the intended fail-closed posture, matching the §9.1 startup
+guards.
+
+**Centralized retry helper (gemini medium).** The
+`ErrWriterNotRegistered` retry/backoff is implemented once (a shared
+`retryUntilRegistered(ctx, fn)` helper) and reused by every direct-path
+caller (catalog bootstrap, admin snapshot, migration) rather than
+duplicated, for consistent backoff + diagnostics.
 
 ## 3. Scope
 
@@ -155,6 +195,6 @@ Two sub-cases:
 2. Are there direct-`ApplyMutations` callers **other** than catalog
    bootstrap / admin snapshot / migration that run on the hot path and
    would be unexpectedly gated? (grep audit before implementation.)
-3. Should `Registered()` be per-DEK (matching `ActiveStorageKeyID`) so a
-   rotate-dek (7b) that resets registration is handled, or a single
-   bool reset on rotate? (Leaning per-active-DEK to compose with 7b.)
+(Open question 3 — per-DEK vs single bool — is resolved: §2.1 adopts
+the per-DEK `registeredStorageDEKID atomic.Uint32`, lock-free and
+composing with 7b.)
