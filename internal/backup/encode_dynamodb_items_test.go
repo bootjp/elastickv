@@ -271,26 +271,31 @@ func TestDDBItemKeyBytesLayout(t *testing.T) {
 	}
 }
 
-// TestDDBEncodeItemRejectsInvalidAttributes pins fail-closed validation
-// of DynamoDB semantic constraints on the untrusted dump input: NULL must
-// be true (AWS has no false NULL), and sets (SS/NS/BS) must be non-empty
-// (AWS rejects empty sets, and an empty-set record would fail on restore).
-// gemini HIGH on PR #837.
-func TestDDBEncodeItemRejectsInvalidAttributes(t *testing.T) {
+// TestDDBEncodeItemPreservesStructuralEdgeCases pins ROUND-TRIP fidelity
+// for the structural edge cases the decoder intentionally preserves
+// (rather than dropping): empty sets are serialized as [] and a NULL is
+// serialized with its boolean as-is. The encoder is the decoder's inverse
+// and must reproduce these so a snapshot of a legacy/drifted store can be
+// recovered — the encode path reconstructs internal records, it does NOT
+// re-validate AWS API payload semantics (codex P1/P2 on PR #837).
+func TestDDBEncodeItemPreservesStructuralEdgeCases(t *testing.T) {
 	t.Parallel()
-	cases := map[string]map[string]any{
-		"null false": {"a": map[string]any{"NULL": false}},
-		"empty SS":   {"a": map[string]any{"SS": []any{}}},
-		"empty NS":   {"a": map[string]any{"NS": []any{}}},
-		"empty BS":   {"a": map[string]any{"BS": []any{}}},
+	in := t.TempDir()
+	const table = "edge"
+	writeDDBSchema(t, in, EncodeSegment([]byte(table)), []byte(`{"format_version":1,"table_name":"edge",`+
+		`"primary_key":{"hash_key":{"name":"id","type":"S"}},`+
+		`"attribute_definitions":[{"name":"id","type":"S"}]}`))
+	item := []byte(`{"id":{"S":"k"},` +
+		`"ess":{"SS":[]},"ens":{"NS":[]},"ebs":{"BS":[]},"nf":{"NULL":false}}`)
+	writeDDBItemFile(t, in, table, "k.json", item)
+
+	out := decodeDDBTree(t, encodeDDBTree(t, in))
+	got := collectDDBItems(t, out, table)
+	if len(got) != 1 {
+		t.Fatalf("decoded %d items, want 1", len(got))
 	}
-	for name, public := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := publicToItem(public); !errors.Is(err, ErrDDBEncodeInvalidItem) {
-				t.Fatalf("publicToItem err = %v, want ErrDDBEncodeInvalidItem", err)
-			}
-		})
+	if !reflect.DeepEqual(got[0], reparse(t, item)) {
+		t.Fatalf("structural edge-case round-trip mismatch:\n got = %#v\nwant = %#v", got[0], reparse(t, item))
 	}
 }
 
