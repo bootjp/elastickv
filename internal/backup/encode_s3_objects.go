@@ -80,22 +80,40 @@ var ErrS3EncodeInvalidManifest = errors.New("backup: s3 encode invalid object si
 // key ends in it has a sidecar and round-trips normally, and any actual
 // collision is already gated by the tracker check above (codex P1 #845).
 func (e *S3RecordEncoder) encodeBucketObjects(b *snapshotBuilder, root *os.Root, bucketDir, bucketName string) error {
-	keymapRel := filepath.Join(bucketDir, "KEYMAP.jsonl")
-	present, err := rootEntryExists(root, keymapRel)
+	tracker, err := e.isKeymapCollisionTracker(root, bucketDir)
 	if err != nil {
 		return err
 	}
-	if present {
-		hasSidecar, err := rootEntryExists(root, keymapRel+S3MetaSuffixReserved)
-		if err != nil {
-			return err
-		}
-		if !hasSidecar {
-			return errors.Wrapf(ErrS3EncodeUnsupportedCollision,
-				"%s: collision-rename KEYMAP.jsonl present", bucketDir)
-		}
+	if tracker {
+		return errors.Wrapf(ErrS3EncodeUnsupportedCollision,
+			"%s: collision-rename KEYMAP.jsonl present", bucketDir)
 	}
 	return e.walkObjects(b, root, bucketDir, bucketName, "")
+}
+
+// isKeymapCollisionTracker reports whether the bucket's top-level
+// KEYMAP.jsonl is the decoder's collision-rename tracker. The tracker is a
+// regular FILE with no companion sidecar. It is NOT:
+//   - a user object literally named KEYMAP.jsonl (which has a sidecar), or
+//   - a directory holding objects under the "KEYMAP.jsonl/" key prefix
+//     (a directory, not a file).
+func (e *S3RecordEncoder) isKeymapCollisionTracker(root *os.Root, bucketDir string) (bool, error) {
+	keymapRel := filepath.Join(bucketDir, "KEYMAP.jsonl")
+	linfo, err := root.Lstat(keymapRel)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return false, nil // a directory (KEYMAP.jsonl/ key prefix) or other
+	}
+	hasSidecar, err := rootEntryExists(root, keymapRel+S3MetaSuffixReserved)
+	if err != nil {
+		return false, err
+	}
+	return !hasSidecar, nil
 }
 
 // rootEntryExists reports whether rel exists within root (via Lstat, so it

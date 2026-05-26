@@ -220,6 +220,24 @@ func TestParseRFC3339NanoAsHLC(t *testing.T) {
 	}
 }
 
+// TestS3EncodeKeymapDirPrefixObjectRoundTrip pins that object keys under a
+// "KEYMAP.jsonl/" prefix (where KEYMAP.jsonl is a directory, not the
+// collision-tracker file) round-trip rather than being mistaken for the
+// tracker (codex P1 #845).
+func TestS3EncodeKeymapDirPrefixObjectRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const bucket = "obj-kmdir"
+	writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"obj-kmdir"}`))
+	body := []byte("under keymap dir")
+	writeS3Object(t, in, bucket, "KEYMAP.jsonl/foo", body, s3ObjectSidecar("e", int64(len(body)), "text/plain", ""))
+
+	gotBody, _ := decodeS3Object(t, encodeS3Tree(t, in), bucket, "KEYMAP.jsonl/foo")
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("object under KEYMAP.jsonl/ prefix body = %q, want %q", gotBody, body)
+	}
+}
+
 // TestS3EncodeRejectsKeymapCollisionTracker pins fail-closed when a bucket
 // carries a collision-tracker KEYMAP.jsonl — identified by the ABSENCE of
 // a companion .elastickv-meta.json sidecar (M4-2a does not reverse renames).
