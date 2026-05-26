@@ -310,10 +310,11 @@ type routeSlot struct {
 	// doc §4.2.
 	//
 	// subSpan == 0 (and len(subBuckets) == 1) marks a slot that is not
-	// sub-divided: K==1, a virtual aggregate, a degenerate window
-	// (subEnd <= subStart), or an unbounded-tail route (End == nil).
-	// subBucketIndex then hard-wires the index to 0, collapsing to
-	// today's route-level behaviour.
+	// sub-divided: K==1, a virtual aggregate, or a degenerate window
+	// (subEnd <= subStart). An unbounded-tail route (End == nil) with
+	// K > 1 DOES sub-divide — over [subStart, MaxUint64] (§3.2) — so it
+	// is not in this list. subBucketIndex hard-wires the index to 0 for
+	// the subSpan == 0 slots, collapsing to today's route-level behaviour.
 	subPrefixLen int
 	subStart     uint64
 	subEnd       uint64
@@ -646,9 +647,11 @@ func windowUint64(b []byte, off int) uint64 {
 // initSubLayout computes the immutable sub-range layout for an
 // individual route spanning [start, end) and allocates its subBuckets.
 // Called once at slot creation (off the hot path). A route that cannot
-// be sub-divided — K == 1, an unbounded `end`, or a window that
-// captures no difference — gets a single bucket (subSpan 0), which
-// makes subBucketIndex hard-wire to 0 and reproduces today's behaviour.
+// be sub-divided — K == 1, or a window that captures no difference —
+// gets a single bucket (subSpan 0), which makes subBucketIndex
+// hard-wire to 0 and reproduces today's behaviour. An unbounded `end`
+// (End == nil) with K > 1 sub-divides over [subStart, MaxUint64] (§3.2),
+// not a single bucket.
 func (s *MemSampler) initSubLayout(slot *routeSlot, start, end []byte) {
 	prefixLen, subStart, subEnd, subSpan, effK := computeSubLayout(start, end, s.opts.KeyBucketsPerRoute)
 	slot.subPrefixLen = prefixLen

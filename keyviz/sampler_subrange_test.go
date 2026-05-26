@@ -59,6 +59,13 @@ func TestComputeSubLayout(t *testing.T) {
 			k: 16, wantEffK: 1, wantPrefixLen: 3,
 		},
 		{name: "nil start treated as zero", start: nil, end: []byte{0x10}, k: 4, wantEffK: 4, wantSpanNonZero: true},
+		{
+			// Unbounded end whose start's leading 8 bytes are all 0xFF:
+			// subStart == MaxUint64, nothing left above it to divide, so
+			// the subStart == MaxUint64 guard collapses to one bucket.
+			name:  "all-0xFF start unbounded end single bucket",
+			start: bytes.Repeat([]byte{0xFF}, 8), end: nil, k: 8, wantEffK: 1,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -128,11 +135,13 @@ func TestSubBucketIndexUnboundedEnd(t *testing.T) {
 	// 0x00.. -> low bucket, 0xFF.. -> top bucket, and order preserved.
 	require.Equal(t, 0, slot.subBucketIndex([]byte{0x00}))
 	require.Equal(t, 3, slot.subBucketIndex([]byte{0xFF}))
+	// 0x40/0x80/0xC0 fall in quarters of [0, MaxUint64] -> buckets 1/2/3,
+	// strictly increasing (Less, not LessOrEqual, so a collapse regresses).
 	i40 := slot.subBucketIndex([]byte{0x40})
 	i80 := slot.subBucketIndex([]byte{0x80})
 	iC0 := slot.subBucketIndex([]byte{0xC0})
-	require.LessOrEqual(t, i40, i80)
-	require.LessOrEqual(t, i80, iC0)
+	require.Less(t, i40, i80)
+	require.Less(t, i80, iC0)
 
 	// A bounded-low / unbounded-high tail route ([0x80, nil)).
 	tail := layoutSlot([]byte{0x80}, nil, 4)
