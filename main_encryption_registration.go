@@ -182,7 +182,12 @@ func runWriterRegistration(
 	// commits or ctx ends, so no process-lifetime cache + watcher
 	// goroutine is needed.
 	connCache := &kv.GRPCConnCache{}
-	defer func() { _ = connCache.Close() }()
+	defer func() {
+		if err := connCache.Close(); err != nil {
+			slog.Warn("encryption: failed to close writer-registration gRPC connection cache",
+				slog.String("error", err.Error()))
+		}
+	}()
 
 	backoff := registrationRetryInitial
 	for {
