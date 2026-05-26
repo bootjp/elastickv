@@ -40,7 +40,7 @@ be treated differently:
 
 | Path | Entry | Origin | 7a-2 action |
 |---|---|---|---|
-| **Direct** | `store.ApplyMutations` | self-originated local write (catalog `Save`, admin snapshot, migration) | **fail-closed**: refuse to emit an encrypted nonce before registration |
+| **Direct** | `store.ApplyMutations` | self-originated local write (catalog `Save` today; admin snapshot, migration: anticipated future — see §2.3) | **fail-closed**: refuse to emit an encrypted nonce before registration |
 | **FSM-apply** | `store.ApplyMutationsRaft` | a committed Raft entry being applied on this node (could be any node's write) | **NOT gated**: §4.1 explicitly allows apply during the pre-registration window ("FSM apply may run on leader-proposed entries … decrypted using sidecar DEKs") |
 
 **Why the FSM-apply path must NOT fail-close.** `ApplyMutationsRaft`
