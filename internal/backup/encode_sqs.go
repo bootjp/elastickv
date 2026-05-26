@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -217,7 +218,13 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 	if meta.FIFO {
 		// The sequence counter is the next value the live FIFO send path
 		// will allocate; restore it to max(seen)+1 so it never reissues a
-		// sequence number an existing message already holds.
+		// sequence number an existing message already holds. Fail closed
+		// at the uint64 ceiling rather than wrap to 0 (which would reissue
+		// sequence 1 and break FIFO ordering) — coderabbit Major #846.
+		if maxSeq == math.MaxUint64 {
+			return errors.Wrapf(ErrSQSEncodeInvalidMessage,
+				"%s: sequence_number at uint64 max, cannot advance the counter", meta.Name)
+		}
 		seqVal := []byte(strconv.FormatUint(maxSeq+1, 10))
 		if err := b.Add(sqsQueueSeqKeyBytes(meta.Name), seqVal, 0); err != nil {
 			return err

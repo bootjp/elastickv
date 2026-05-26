@@ -201,13 +201,23 @@ func (b *sqsMessageBody) UnmarshalJSON(data []byte) error {
 		*b = sqsMessageBody(s)
 		return nil
 	}
+	// Non-string: must be the exact {"base64":"..."} envelope. Reject {},
+	// null, and objects with other/extra keys (which would otherwise
+	// silently decode to an empty body) — a base64 pointer distinguishes
+	// "field absent" from "empty" and DisallowUnknownFields rejects stray
+	// keys (coderabbit Major on PR #846).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	var envelope struct {
-		Base64 string `json:"base64"`
+		Base64 *string `json:"base64"`
 	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
+	if err := dec.Decode(&envelope); err != nil {
 		return errors.WithStack(err)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(envelope.Base64)
+	if envelope.Base64 == nil {
+		return errors.WithStack(errors.New("sqs message body object missing base64 field"))
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(*envelope.Base64)
 	if err != nil {
 		return errors.WithStack(err)
 	}

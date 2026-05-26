@@ -67,25 +67,39 @@ func decodeSQSAndRead(t *testing.T, fsm []byte, queue string) (sqsQueueMetaPubli
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		t.Fatalf("unmarshal decoded _queue.json: %v", err)
 	}
-	var msgs []sqsMessageRecord
+	return meta, readDecodedSQSMessages(t, dir)
+}
+
+// readDecodedSQSMessages reads a decoded messages.jsonl (absent = empty
+// queue), failing the test on any open/scan/parse error.
+func readDecodedSQSMessages(t *testing.T, dir string) []sqsMessageRecord {
+	t.Helper()
 	f, err := os.Open(filepath.Join(dir, "messages.jsonl"))
-	if err == nil {
-		defer func() { _ = f.Close() }()
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-		for sc.Scan() {
-			line := sc.Bytes()
-			if len(bytes.TrimSpace(line)) == 0 {
-				continue
-			}
-			var rec sqsMessageRecord
-			if err := json.Unmarshal(line, &rec); err != nil {
-				t.Fatalf("unmarshal decoded message: %v", err)
-			}
-			msgs = append(msgs, rec)
-		}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	return meta, msgs
+	if err != nil {
+		t.Fatalf("open decoded messages.jsonl: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	var msgs []sqsMessageRecord
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var rec sqsMessageRecord
+		if jerr := json.Unmarshal(line, &rec); jerr != nil {
+			t.Fatalf("unmarshal decoded message: %v", jerr)
+		}
+		msgs = append(msgs, rec)
+	}
+	if serr := sc.Err(); serr != nil {
+		t.Fatalf("scan decoded messages.jsonl: %v", serr)
+	}
+	return msgs
 }
 
 // TestSQSEncodeStandardQueueRoundTrip pins the gold-standard round-trip
@@ -169,7 +183,10 @@ func TestSQSEncodeBinaryBodyRoundTrip(t *testing.T) {
 		})
 
 	_, msgs := decodeSQSAndRead(t, encodeSQSTree(t, in), queue)
-	if len(msgs) != 1 || !bytes.Equal([]byte(msgs[0].Body), []byte{0xFF, 0x00, 0xFE}) {
+	if len(msgs) != 1 {
+		t.Fatalf("decoded %d messages, want 1", len(msgs))
+	}
+	if !bytes.Equal([]byte(msgs[0].Body), []byte{0xFF, 0x00, 0xFE}) {
 		t.Fatalf("binary body round-trip = %x", []byte(msgs[0].Body))
 	}
 }
@@ -212,6 +229,44 @@ func TestSQSEncodeRejectsEmptyMessageID(t *testing.T) {
 	b := newSnapshotBuilder(sqsEncTS)
 	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeInvalidMessage) {
 		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidMessage", err)
+	}
+}
+
+// TestSQSEncodeRejectsMaxSequence pins that a FIFO message at the uint64
+// sequence ceiling fails closed rather than wrapping the seq counter to 0.
+func TestSQSEncodeRejectsMaxSequence(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "max.fifo"
+	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"max.fifo","fifo":true,`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{
+			[]byte(`{"message_id":"m1","body":"a","send_timestamp_millis":1,"available_at_millis":1,"message_group_id":"g","sequence_number":18446744073709551615}`),
+		})
+	b := newSnapshotBuilder(sqsEncTS)
+	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeInvalidMessage) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidMessage", err)
+	}
+}
+
+// TestSQSEncodeRejectsMalformedBodyObject pins that a non-string body
+// object that is not a {base64:...} envelope fails closed rather than
+// silently restoring an empty body.
+func TestSQSEncodeRejectsMalformedBodyObject(t *testing.T) {
+	t.Parallel()
+	// Note: a JSON `null` body is not covered — encoding/json skips
+	// UnmarshalJSON for null, leaving an empty body (lenient, and
+	// unreachable from a decoder-produced dump).
+	for _, body := range []string{`{}`, `{"oops":"x"}`} {
+		in := t.TempDir()
+		const queue = "q"
+		writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"q",`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+			[][]byte{[]byte(`{"message_id":"m1","body":` + body + `,"send_timestamp_millis":1,"available_at_millis":1}`)})
+		b := newSnapshotBuilder(sqsEncTS)
+		if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeInvalidMessage) {
+			t.Fatalf("body %s: Encode err = %v, want ErrSQSEncodeInvalidMessage", body, err)
+		}
 	}
 }
 
