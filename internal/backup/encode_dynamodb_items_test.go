@@ -229,6 +229,29 @@ func TestDDBItemKeyBytesLayout(t *testing.T) {
 	}
 }
 
+// TestDDBEncodeItemRejectsInvalidAttributes pins fail-closed validation
+// of DynamoDB semantic constraints on the untrusted dump input: NULL must
+// be true (AWS has no false NULL), and sets (SS/NS/BS) must be non-empty
+// (AWS rejects empty sets, and an empty-set record would fail on restore).
+// gemini HIGH on PR #837.
+func TestDDBEncodeItemRejectsInvalidAttributes(t *testing.T) {
+	t.Parallel()
+	cases := map[string]map[string]any{
+		"null false": {"a": map[string]any{"NULL": false}},
+		"empty SS":   {"a": map[string]any{"SS": []any{}}},
+		"empty NS":   {"a": map[string]any{"NS": []any{}}},
+		"empty BS":   {"a": map[string]any{"BS": []any{}}},
+	}
+	for name, public := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := publicToItem(public); !errors.Is(err, ErrDDBEncodeInvalidItem) {
+				t.Fatalf("publicToItem err = %v, want ErrDDBEncodeInvalidItem", err)
+			}
+		})
+	}
+}
+
 // TestEncodeDDBOrderedKeySegment pins the ordered-key byte layout
 // directly: 0x00 escapes to 0x00 0xFF and every segment ends 0x00 0x01.
 func TestEncodeDDBOrderedKeySegment(t *testing.T) {

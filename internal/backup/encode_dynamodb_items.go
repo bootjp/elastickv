@@ -395,7 +395,13 @@ func decodeAVNull(v any) (*pb.DynamoAttributeValue, error) {
 	if !ok {
 		return nil, errors.Wrap(ErrDDBEncodeInvalidItem, "NULL value is not a boolean")
 	}
-	return &pb.DynamoAttributeValue{Value: &pb.DynamoAttributeValue_NullValue{NullValue: b}}, nil
+	// AWS DynamoDB's NULL is definitionally {"NULL": true}; {"NULL": false}
+	// is invalid and unreachable from real data, so fail closed rather
+	// than emit a record the live API would reject on restore.
+	if !b {
+		return nil, errors.Wrap(ErrDDBEncodeInvalidItem, "NULL value must be true")
+	}
+	return &pb.DynamoAttributeValue{Value: &pb.DynamoAttributeValue_NullValue{NullValue: true}}, nil
 }
 
 func decodeAVStringSet(v any) (*pb.DynamoAttributeValue, error) {
@@ -418,6 +424,9 @@ func decodeAVBinarySet(v any) (*pb.DynamoAttributeValue, error) {
 	arr, ok := v.([]any)
 	if !ok {
 		return nil, errors.Wrap(ErrDDBEncodeInvalidItem, "BS value is not an array")
+	}
+	if len(arr) == 0 {
+		return nil, errors.Wrap(ErrDDBEncodeInvalidItem, "BS must not be empty")
 	}
 	out := make([][]byte, 0, len(arr))
 	for _, e := range arr {
@@ -470,11 +479,16 @@ func decodeAVMap(v any) (*pb.DynamoAttributeValue, error) {
 	return &pb.DynamoAttributeValue{Value: &pb.DynamoAttributeValue_M{M: &pb.DynamoAttributeValueMap{Values: out}}}, nil
 }
 
-// stringSliceFromAny coerces a JSON array of strings (SS / NS).
+// stringSliceFromAny coerces a JSON array of strings (SS / NS). AWS
+// DynamoDB rejects empty sets, and an empty-set record would fail on
+// restore, so an empty array fails closed.
 func stringSliceFromAny(v any) ([]string, error) {
 	arr, ok := v.([]any)
 	if !ok {
 		return nil, errors.Wrap(ErrDDBEncodeInvalidItem, "set value is not an array")
+	}
+	if len(arr) == 0 {
+		return nil, errors.Wrap(ErrDDBEncodeInvalidItem, "set must not be empty")
 	}
 	out := make([]string, 0, len(arr))
 	for _, e := range arr {
