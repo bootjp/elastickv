@@ -31,6 +31,9 @@ package keyviz
 
 import (
 	"bytes"
+	"encoding/binary"
+	"math"
+	"math/bits"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -67,11 +70,13 @@ const (
 // call site only checks for an interface-nil, not a typed-nil.
 type Sampler interface {
 	// Observe records a single request against a route. Op identifies
-	// the counter family. keyLen and valueLen are summed into the
-	// matching *Bytes counter; pass 0 for read-only ops where the
-	// payload size is irrelevant. Implementations must no-op (not
-	// panic) when invoked on a typed-nil receiver.
-	Observe(routeID uint64, op Op, keyLen, valueLen int)
+	// the counter family. The key drives sub-range bucketing (the hot
+	// key/sub-range heatmap, see docs/design/2026_05_25_proposed_keyviz_subrange_sampling.md);
+	// len(key) and valueLen are summed into the matching *Bytes
+	// counter; pass valueLen 0 for read-only ops where the response
+	// size is irrelevant. Implementations must no-op (not panic) when
+	// invoked on a typed-nil receiver.
+	Observe(routeID uint64, key []byte, op Op, valueLen int)
 }
 
 // Defaults for MemSamplerOptions when fields are left zero.
@@ -80,7 +85,26 @@ const (
 	DefaultHistoryColumns         = 1440 // 24 hours at 60s steps.
 	DefaultMaxTrackedRoutes       = 10_000
 	DefaultMaxMemberRoutesPerSlot = 256
+	// DefaultKeyBucketsPerRoute is 1 — no sub-range bucketing, i.e.
+	// today's exact route-granular behaviour. Operators opt into
+	// hot-key sub-range sampling by raising it.
+	DefaultKeyBucketsPerRoute = 1
 )
+
+// MaxKeyBucketsPerRoute caps KeyBucketsPerRoute. The cap is an
+// operationally-safe bound, not merely a finite one: per-route memory
+// is K × 4 × 8 bytes, so at the default MaxTrackedRoutes = 10_000 the
+// cap of 256 bounds the worst case to ~80 MB of counters (vs ~1.28 GB
+// at K=4096, which a monitoring subsystem must not need). The design's
+// operator rule of thumb is K_max ≈ memBudget / (32 × MaxTrackedRoutes).
+const MaxKeyBucketsPerRoute = 256
+
+// subWindowBytes is the W from the design: the fixed byte window past
+// the route's Start/End common prefix that the bucketer interpolates
+// over. Eight bytes (one uint64) gives enough resolution for K up to
+// the cap; keys whose distinguishing bytes sit past prefixLen + W
+// collapse the route to a single bucket (computeSubLayout).
+const subWindowBytes = 8
 
 // MaxHistoryColumns is the upper bound on opts.HistoryColumns. The
 // ring buffer pre-allocates a slice of capacity HistoryColumns at
@@ -113,6 +137,13 @@ type MemSamplerOptions struct {
 	// MaxTrackedRoutes. Snapshot consumers should treat the list as
 	// "first N members" rather than authoritative attribution.
 	MaxMemberRoutesPerSlot int
+	// KeyBucketsPerRoute (K) is how many order-preserving sub-range
+	// buckets each individual route's [Start, End) is divided into for
+	// the hot-key heatmap. 1 (the default) disables sub-bucketing and
+	// reproduces today's route-granular behaviour exactly. Clamped to
+	// [1, MaxKeyBucketsPerRoute] at construction. Virtual aggregate
+	// buckets are never sub-divided regardless of this value.
+	KeyBucketsPerRoute int
 	// Now overrides time.Now for tests; nil falls back to time.Now.
 	Now func() time.Time
 }
@@ -270,6 +301,40 @@ type routeSlot struct {
 	// slots.
 	MemberRoutesTotal uint64
 
+	// Sub-range layout (the hot-key heatmap). These fields are
+	// established once when the slot's range is set (RegisterRoute via
+	// initSubLayout) and are IMMUTABLE for the slot's lifetime — they
+	// are NOT recomputed on grace-window re-registration. So the hot
+	// path (subBucketIndex) and Flush (bound reconstruction) both read
+	// them lock-free; there is no writer to race with. See the design
+	// doc §4.2.
+	//
+	// subSpan == 0 (and len(subBuckets) == 1) marks a slot that is not
+	// sub-divided: K==1, a virtual aggregate, a degenerate window
+	// (subEnd <= subStart), or an unbounded-tail route (End == nil).
+	// subBucketIndex then hard-wires the index to 0, collapsing to
+	// today's route-level behaviour.
+	subPrefixLen int
+	subStart     uint64
+	subEnd       uint64
+	subSpan      uint64
+	// subLo/subHi are immutable copies of the route bounds the layout
+	// was built from, used by subBucketIndex's full-key edge clamp.
+	// They are NOT slot.Start/End (which are mutable under metaMu on
+	// grace-window re-registration and so can't be read on the lock-free
+	// hot path) — they are part of the immutable layout. nil for
+	// single-bucket slots (the clamp is unreachable there).
+	subLo      []byte
+	subHi      []byte
+	subBuckets []subCounter
+}
+
+// subCounter holds one sub-range bucket's four counter families. A
+// routeSlot owns len(subBuckets) of these (>= 1). Touched by Observe
+// (atomic.Add) and Flush (atomic.Swap); never value-copied (slots are
+// shared by pointer, and the slice is indexed in place), so the
+// embedded atomics are safe.
+type subCounter struct {
 	reads      atomic.Uint64
 	writes     atomic.Uint64
 	readBytes  atomic.Uint64
@@ -325,6 +390,20 @@ type MatrixRow struct {
 	RaftGroupID uint64
 	LeaderTerm  uint64
 
+	// SubBucket is this row's sub-range index within its parent route,
+	// 0 for the first (or only) sub-bucket. SubBucketCount is how many
+	// sub-buckets the route is divided into: 1 for a K==1 / aggregate /
+	// degenerate / unbounded-tail slot, > 1 for a genuinely sub-divided
+	// route. SubBucketCount is the disambiguator a row's BucketID
+	// suffix needs — a K==1 slot's only row and a K>1 slot's bucket-0
+	// row both have SubBucket == 0, so the count is what tells them
+	// apart (the #subIdx suffix is added only when SubBucketCount > 1).
+	// Both are int (bounded 0..MaxKeyBucketsPerRoute); they are
+	// keyviz-internal (the proto KeyVizRow has no equivalent), so no
+	// fixed-width type is required.
+	SubBucket      int
+	SubBucketCount int
+
 	Reads      uint64
 	Writes     uint64
 	ReadBytes  uint64
@@ -351,6 +430,12 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	}
 	if opts.MaxMemberRoutesPerSlot <= 0 {
 		opts.MaxMemberRoutesPerSlot = DefaultMaxMemberRoutesPerSlot
+	}
+	if opts.KeyBucketsPerRoute <= 0 {
+		opts.KeyBucketsPerRoute = DefaultKeyBucketsPerRoute
+	}
+	if opts.KeyBucketsPerRoute > MaxKeyBucketsPerRoute {
+		opts.KeyBucketsPerRoute = MaxKeyBucketsPerRoute
 	}
 	now := opts.Now
 	if now == nil {
@@ -424,7 +509,7 @@ func newEmptyRouteTable() *routeTable {
 // and bytes). Misses (RouteID never registered) drop silently — the
 // route-watch subscriber is responsible for Register before the
 // coordinator publishes the new RouteID.
-func (s *MemSampler) Observe(routeID uint64, op Op, keyLen, valueLen int) {
+func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int) {
 	if s == nil {
 		return
 	}
@@ -436,25 +521,224 @@ func (s *MemSampler) Observe(routeID uint64, op Op, keyLen, valueLen int) {
 			return
 		}
 	}
+	// Sub-range bucketing: pick the counter for the key's sub-bucket.
+	// subBucketIndex reads only immutable layout fields (lock-free) and
+	// returns 0 for non-sub-divided slots (len == 1), so this is one
+	// extra index computation versus today on the hot path.
+	sc := &slot.subBuckets[slot.subBucketIndex(key)]
 	byteCount := uint64(0)
-	if keyLen > 0 {
-		byteCount += uint64(keyLen)
+	if len(key) > 0 {
+		byteCount += uint64(len(key))
 	}
 	if valueLen > 0 {
 		byteCount += uint64(valueLen)
 	}
 	switch op {
 	case OpRead:
-		slot.reads.Add(1)
+		sc.reads.Add(1)
 		if byteCount > 0 {
-			slot.readBytes.Add(byteCount)
+			sc.readBytes.Add(byteCount)
 		}
 	case OpWrite:
-		slot.writes.Add(1)
+		sc.writes.Add(1)
 		if byteCount > 0 {
-			slot.writeBytes.Add(byteCount)
+			sc.writeBytes.Add(byteCount)
 		}
 	}
+}
+
+// subBucketIndex maps key to a sub-range bucket index in
+// [0, len(slot.subBuckets)). Lock-free: reads only the slot's immutable
+// sub-layout fields. Returns 0 for non-sub-divided slots (len == 1 or
+// subSpan == 0). See design §3.1.
+func (slot *routeSlot) subBucketIndex(key []byte) int {
+	k := len(slot.subBuckets)
+	if k <= 1 || slot.subSpan == 0 {
+		return 0
+	}
+	// Full-key edge clamp FIRST. The window only sees bytes past the
+	// Start/End common prefix, so two keys that differ *within* that
+	// prefix (i.e. a key outside [subLo, subHi)) would otherwise bucket
+	// on their window alone and break global order preservation. Keys
+	// inside the route share the prefix, so for them the window is
+	// monotone; out-of-range keys pin to the boundary buckets.
+	if bytes.Compare(key, slot.subLo) <= 0 {
+		return 0
+	}
+	if bytes.Compare(key, slot.subHi) >= 0 {
+		return k - 1
+	}
+	w := windowUint64(key, slot.subPrefixLen)
+	// In-range keys satisfy subStart <= w <= subEnd; these guards make
+	// the subtraction underflow-proof and handle the window-equals-edge
+	// case (keys that match Start/End in the first W suffix bytes).
+	if w <= slot.subStart {
+		return 0
+	}
+	if w >= slot.subEnd {
+		return k - 1
+	}
+	idx := fracMul(u64NonNeg(k), w-slot.subStart, slot.subSpan)
+	if idx >= u64NonNeg(k) {
+		// Defensive only — the interior guard guarantees idx <= k-1.
+		return k - 1
+	}
+	return intFromUint64(idx)
+}
+
+// u64NonNeg converts a known-non-negative int (a sub-bucket index or
+// count, always 0..MaxKeyBucketsPerRoute, or a slice length) to uint64.
+// The explicit guard makes gosec's G115 — which flags every int->uint64
+// as a possible negative wrap — provably safe without a //nolint, which
+// CLAUDE.md forbids.
+func u64NonNeg(n int) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
+
+// intFromUint64 narrows a uint64 that is known to fit in an int (here a
+// sub-bucket index proven < k <= MaxKeyBucketsPerRoute). The math.MaxInt
+// guard is the in-tree idiom gosec G115 accepts (cf. internal.Uint64ToInt).
+func intFromUint64(v uint64) int {
+	if v > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(v)
+}
+
+// fracMul returns floor(a*b/c) with an exact 128-bit intermediate via
+// math/bits, so the multiply cannot overflow uint64. Callers guarantee
+// c > 0 and the quotient < 2^64 (both hold for sub-bucket math: the
+// interior guard bounds a*b below c*2^64 because k is capped well below
+// 2^64). Shared by the forward index path and the Flush bound
+// reconstruction so the two can never diverge.
+func fracMul(a, b, c uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	q, _ := bits.Div64(hi, lo, c)
+	return q
+}
+
+// windowUint64 reads up to subWindowBytes of b starting at off,
+// big-endian, zero-padding past the end of b. A short/absent window is
+// the natural low end (0x00…) of the key space.
+func windowUint64(b []byte, off int) uint64 {
+	// Fast path: a full window is available — read it directly, skipping
+	// the per-byte loop and bounds checks (hot path, Gemini medium).
+	if off >= 0 && off+subWindowBytes <= len(b) {
+		return binary.BigEndian.Uint64(b[off:])
+	}
+	var v uint64
+	for i := 0; i < subWindowBytes; i++ {
+		v <<= 8
+		if off+i < len(b) {
+			v |= uint64(b[off+i])
+		}
+	}
+	return v
+}
+
+// initSubLayout computes the immutable sub-range layout for an
+// individual route spanning [start, end) and allocates its subBuckets.
+// Called once at slot creation (off the hot path). A route that cannot
+// be sub-divided — K == 1, an unbounded `end`, or a window that
+// captures no difference — gets a single bucket (subSpan 0), which
+// makes subBucketIndex hard-wire to 0 and reproduces today's behaviour.
+func (s *MemSampler) initSubLayout(slot *routeSlot, start, end []byte) {
+	prefixLen, subStart, subEnd, subSpan, effK := computeSubLayout(start, end, s.opts.KeyBucketsPerRoute)
+	slot.subPrefixLen = prefixLen
+	slot.subStart = subStart
+	slot.subEnd = subEnd
+	slot.subSpan = subSpan
+	if effK > 1 {
+		// Immutable bound snapshots for subBucketIndex's full-key clamp.
+		slot.subLo = cloneBytes(start)
+		slot.subHi = cloneBytes(end)
+	}
+	slot.subBuckets = make([]subCounter, effK)
+}
+
+// computeSubLayout derives the sub-range layout for [start, end) divided
+// into k buckets. effK is the effective bucket count: 1 (single bucket,
+// subSpan 0) when the route cannot be sub-divided, otherwise k. See
+// design §3.1–§3.2.
+func computeSubLayout(start, end []byte, k int) (prefixLen int, subStart, subEnd, subSpan uint64, effK int) {
+	if k <= 1 || len(end) == 0 {
+		// K == 1, or an unbounded high end (no finite span to divide):
+		// a single bucket until a split gives the route a finite End.
+		return 0, 0, 0, 0, 1
+	}
+	prefixLen = commonPrefixLen(start, end)
+	subStart = windowUint64(start, prefixLen)
+	subEnd = windowUint64(end, prefixLen)
+	if subEnd <= subStart {
+		// The W-byte window captures no difference (the routes differ
+		// only past prefixLen + W): single bucket.
+		return prefixLen, subStart, subEnd, 0, 1
+	}
+	return prefixLen, subStart, subEnd, subEnd - subStart, k
+}
+
+// commonPrefixLen returns the number of leading bytes a and b share.
+func commonPrefixLen(a, b []byte) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	i := 0
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	return i
+}
+
+// subBucketBounds reconstructs the [start, end) key bounds of sub-bucket
+// i for a slot divided into len(subBuckets) buckets. Bucket 0 pins to
+// the route's actual start and the last bucket pins to its actual end
+// (the window arithmetic drops bytes past prefixLen + W, so the
+// reconstructed extremes would otherwise fall short); interiors use the
+// same fracMul kernel as the forward path. Together this tiles
+// [routeStart, routeEnd) exactly — each bucket's start equals the
+// previous bucket's end. Caller guarantees len(subBuckets) > 1.
+func (slot *routeSlot) subBucketBounds(i int, routeStart, routeEnd []byte) (start, end []byte) {
+	last := len(slot.subBuckets) - 1
+	if i == 0 {
+		start = cloneBytes(routeStart)
+	} else {
+		start = slot.boundaryAt(i, routeStart)
+	}
+	if i == last {
+		end = cloneBytes(routeEnd)
+	} else {
+		end = slot.boundaryAt(i+1, routeStart)
+	}
+	return start, end
+}
+
+// boundaryAt reconstructs the key at fraction i/k of the route's window:
+// subStart + floor(i*subSpan/k), written big-endian into the W-byte
+// window at subPrefixLen, behind the route's shared prefix. Uses the
+// same math/bits kernel as subBucketIndex so the forward and inverse
+// directions can never disagree.
+func (slot *routeSlot) boundaryAt(i int, routeStart []byte) []byte {
+	off := slot.subStart + fracMul(u64NonNeg(i), slot.subSpan, u64NonNeg(len(slot.subBuckets)))
+	out := make([]byte, slot.subPrefixLen+subWindowBytes)
+	copy(out, routeStart[:min(slot.subPrefixLen, len(routeStart))])
+	binary.BigEndian.PutUint64(out[slot.subPrefixLen:], off)
+	// Trim trailing zero bytes of the window. A variable-length key
+	// shorter than prefix+W zero-pads to the same window value, so the
+	// *minimal* key that buckets into this cell is the trimmed form.
+	// Without trimming, a key like 0x10 (which subBucketIndex places in
+	// the cell starting at 0x10) would sort BEFORE the emitted 8-byte
+	// boundary 0x10 00…00, so the displayed [Start,End) would exclude
+	// the very keys counted in the row — wrong labels for Redis-style
+	// variable-length keyspaces (Codex P2). The prefix is never trimmed.
+	end := len(out)
+	for end > slot.subPrefixLen && out[end-1] == 0x00 {
+		end--
+	}
+	return out[:end]
 }
 
 // RegisterRoute adds a (RouteID, [Start, End)) pair to the tracking
@@ -504,6 +788,7 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 				End:               cloneBytes(end),
 				MemberRoutesTotal: 1,
 			}
+			s.initSubLayout(slot, start, end)
 		} else {
 			// Re-registering the same routeID inside the grace window:
 			// reuse the retired slot so any in-flight Observe writers
@@ -512,6 +797,17 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 			// RouteID instead of two (one live + one retired) with
 			// counts split across them. Refresh the metadata fields to
 			// match the new registration; counters are preserved.
+			//
+			// The sub-range layout (subPrefixLen/subStart/subEnd/subSpan
+			// + subBuckets) is intentionally NOT recomputed here: it is
+			// immutable for the slot's lifetime so the lock-free hot path
+			// can read it without racing this writer, and the counters
+			// must be preserved (not zeroed/resized) to honour the
+			// no-loss contract. A same-RouteID re-registration carries
+			// the same range in practice; the rare changed-range case
+			// keeps the original sub-ranges for the reused slot's
+			// lifetime — a bounded cosmetic mislabel, no lost counts.
+			// See design §4.2.
 			slot.metaMu.Lock()
 			slot.GroupID = groupID
 			slot.Start = cloneBytes(start)
@@ -539,6 +835,9 @@ func (s *MemSampler) RegisterRoute(routeID uint64, start, end []byte, groupID ui
 			Aggregate:         true,
 			MemberRoutes:      []uint64{routeID},
 			MemberRoutesTotal: 1,
+			// Aggregates are never sub-divided (they already coarsen many
+			// routes into one row) — a single counter bucket.
+			subBuckets: make([]subCounter, 1),
 		}
 		next.sortedSlots = appendSorted(next.sortedSlots, bucket)
 	} else {
@@ -911,33 +1210,51 @@ func (s *MemSampler) HistoryColumns() int {
 	return s.opts.HistoryColumns
 }
 
-// appendDrainedRow swaps the slot's counters to zero and appends a
-// MatrixRow when any counter was non-zero. Idle slots are skipped.
-// Metadata is read under the slot's metaMu so a concurrent
-// RegisterRoute fold cannot race with the row materialisation.
+// appendDrainedRow swaps each non-empty sub-bucket's counters to zero
+// and appends one MatrixRow per non-empty sub-bucket, with Start/End
+// narrowed to that sub-bucket's bounds. Idle sub-buckets are skipped,
+// so a route with one hot sub-range emits one row (not K). Slots that
+// are not sub-divided (len(subBuckets) == 1) emit at most one row with
+// the route's own bounds — today's behaviour.
+//
+// The route metadata (Start/End/Aggregate/MemberRoutes/GroupID) is read
+// under the slot's metaMu via snapshotMeta so a concurrent RegisterRoute
+// fold cannot race the read; the sub-range layout fields are immutable
+// (read lock-free, see §4.2) and the counters are per-sub-bucket atomics.
 func appendDrainedRow(rows []MatrixRow, slot *routeSlot, terms map[uint64]uint64) []MatrixRow {
-	reads := slot.reads.Swap(0)
-	writes := slot.writes.Swap(0)
-	readBytes := slot.readBytes.Swap(0)
-	writeBytes := slot.writeBytes.Swap(0)
-	if reads == 0 && writes == 0 && readBytes == 0 && writeBytes == 0 {
-		return rows
-	}
 	start, end, aggregate, members, membersTotal, groupID := slot.snapshotMeta()
-	return append(rows, MatrixRow{
-		RouteID:           slot.RouteID,
-		RaftGroupID:       groupID,
-		LeaderTerm:        terms[groupID],
-		Start:             start,
-		End:               end,
-		Aggregate:         aggregate,
-		MemberRoutes:      members,
-		MemberRoutesTotal: membersTotal,
-		Reads:             reads,
-		Writes:            writes,
-		ReadBytes:         readBytes,
-		WriteBytes:        writeBytes,
-	})
+	k := len(slot.subBuckets)
+	for i := range slot.subBuckets {
+		sc := &slot.subBuckets[i]
+		reads := sc.reads.Swap(0)
+		writes := sc.writes.Swap(0)
+		readBytes := sc.readBytes.Swap(0)
+		writeBytes := sc.writeBytes.Swap(0)
+		if reads == 0 && writes == 0 && readBytes == 0 && writeBytes == 0 {
+			continue
+		}
+		rowStart, rowEnd := start, end
+		if k > 1 {
+			rowStart, rowEnd = slot.subBucketBounds(i, start, end)
+		}
+		rows = append(rows, MatrixRow{
+			RouteID:           slot.RouteID,
+			RaftGroupID:       groupID,
+			LeaderTerm:        terms[groupID],
+			Start:             rowStart,
+			End:               rowEnd,
+			Aggregate:         aggregate,
+			MemberRoutes:      members,
+			MemberRoutesTotal: membersTotal,
+			SubBucket:         i,
+			SubBucketCount:    k,
+			Reads:             reads,
+			Writes:            writes,
+			ReadBytes:         readBytes,
+			WriteBytes:        writeBytes,
+		})
+	}
+	return rows
 }
 
 // Snapshot returns the matrix columns in the supplied [from, to)

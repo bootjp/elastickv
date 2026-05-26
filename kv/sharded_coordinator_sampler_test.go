@@ -22,14 +22,25 @@ type recordingSampler struct {
 type sampleCall struct {
 	routeID  uint64
 	op       keyviz.Op
+	key      []byte
 	keyLen   int
 	valueLen int
 }
 
-func (r *recordingSampler) Observe(routeID uint64, op keyviz.Op, keyLen, valueLen int) {
+func (r *recordingSampler) Observe(routeID uint64, key []byte, op keyviz.Op, valueLen int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls = append(r.calls, sampleCall{routeID: routeID, op: op, keyLen: keyLen, valueLen: valueLen})
+	// Copy the key: the sampler contract lets callers reuse the buffer,
+	// and the sub-range bucketer depends on the exact bytes, so the test
+	// asserts the forwarded bytes (not just length) survived the
+	// keyLen->key signature change.
+	r.calls = append(r.calls, sampleCall{
+		routeID:  routeID,
+		op:       op,
+		key:      append([]byte(nil), key...),
+		keyLen:   len(key),
+		valueLen: valueLen,
+	})
 }
 
 func (r *recordingSampler) snapshot() []sampleCall {
@@ -91,6 +102,7 @@ func TestShardedCoordinatorObservesEveryDispatchedMutation(t *testing.T) {
 		require.Equal(t, sampleCall{
 			routeID:  route.RouteID,
 			op:       keyviz.OpWrite,
+			key:      append([]byte(nil), elem.Key...),
 			keyLen:   len(elem.Key),
 			valueLen: len(elem.Value),
 		}, calls[i], "Observe call %d for key %q", i, elem.Key)
@@ -187,11 +199,12 @@ func TestShardedCoordinatorObservesLeaseAndLinearizableReads(t *testing.T) {
 	want := sampleCall{
 		routeID:  route.RouteID,
 		op:       keyviz.OpRead,
+		key:      append([]byte(nil), key...),
 		keyLen:   len(key),
 		valueLen: 0,
 	}
-	require.Equal(t, want, calls[0])
-	require.Equal(t, want, calls[1])
+	require.Equal(t, want, calls[0], "linearizable read must forward the full key bytes")
+	require.Equal(t, want, calls[1], "lease read must forward the full key bytes")
 }
 
 // TestShardedCoordinatorSkipsObserveForLeadershipChecks pins the

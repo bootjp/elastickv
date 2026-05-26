@@ -46,7 +46,7 @@ func TestSeedKeyVizRoutesCopiesEngineCatalogue(t *testing.T) {
 	seedKeyVizRoutes(s, engine)
 
 	for _, r := range engine.Stats() {
-		s.Observe(r.RouteID, keyviz.OpRead, 1, 1)
+		s.Observe(r.RouteID, make([]byte, 1), keyviz.OpRead, 1)
 	}
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
@@ -74,7 +74,7 @@ func TestStartKeyVizFlusherReturnsAfterCancel(t *testing.T) {
 	t.Parallel()
 	s := keyviz.NewMemSampler(keyviz.MemSamplerOptions{Step: time.Millisecond, HistoryColumns: 4})
 	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("b"), 0))
-	s.Observe(1, keyviz.OpRead, 0, 0)
+	s.Observe(1, make([]byte, 0), keyviz.OpRead, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, _ := errgroup.WithContext(ctx)
@@ -109,7 +109,7 @@ func TestPublishLeaderTermsFromSnapshotsStampsRows(t *testing.T) {
 	publishLeaderTermsFromSnapshots(s, []groupTermSnapshot{
 		{groupID: 7, term: 42},
 	})
-	s.Observe(1, keyviz.OpWrite, 16, 64)
+	s.Observe(1, make([]byte, 16), keyviz.OpWrite, 64)
 	s.Flush()
 	cols := s.Snapshot(time.Time{}, time.Time{})
 	require.Len(t, cols, 1)

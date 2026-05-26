@@ -797,7 +797,7 @@ func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []b
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	c.observeRead(routeID, len(key))
+	c.observeRead(routeID, key)
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
@@ -819,7 +819,7 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
-	c.observeRead(routeID, len(key))
+	c.observeRead(routeID, key)
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
@@ -1079,13 +1079,15 @@ func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 	if c.sampler == nil {
 		return
 	}
-	c.sampler.Observe(routeID, keyviz.OpWrite, len(mut.Key), len(mut.Value))
+	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value))
 }
 
 // observeRead records a single linearizable / lease read against the
-// route. valueLen is always 0 here — the consistency check at this
-// layer doesn't fetch data; the actual GetAt on the store happens
-// further down the stack and isn't observed yet.
+// route. The full key is passed (not just its length) so the sampler
+// can bucket the read into the key's sub-range for the hot-key heatmap;
+// the read's valueLen is 0 — the consistency check at this layer
+// doesn't fetch data; the actual GetAt on the store happens further
+// down the stack and isn't observed yet.
 //
 // Callers MUST pass an already-resolved routeID (via
 // routeAndGroupForKey) so the GetRoute lookup runs once across the
@@ -1097,11 +1099,11 @@ func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
 // MVCCStore.GetAt without going through the coordinator) still
 // bypass keyviz; sampling those is task B in the design's Phase 2
 // follow-up.
-func (c *ShardedCoordinator) observeRead(routeID uint64, keyLen int) {
+func (c *ShardedCoordinator) observeRead(routeID uint64, key []byte) {
 	if c.sampler == nil {
 		return
 	}
-	c.sampler.Observe(routeID, keyviz.OpRead, keyLen, 0)
+	c.sampler.Observe(routeID, key, keyviz.OpRead, 0)
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {
