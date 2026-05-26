@@ -78,15 +78,19 @@ func buildProcessStartRegistrationGate(
 	w encryptionWriteWiring,
 	raftID string,
 ) (*kv.RegistrationGate, error) {
+	// An empty &RegistrationGate{} (nil Barrier) is the "ungated" state
+	// — awaitRegistration short-circuits on a nil Barrier. Returning it
+	// (rather than a nil gate) keeps the no-error/no-registration
+	// branches free of //nolint:nilnil.
 	if w.cipher == nil || defaultGroup == nil {
-		return nil, nil //nolint:nilnil // nil gate == ungated; not an error
+		return &kv.RegistrationGate{}, nil
 	}
 	if !w.cache.StorageEnvelopeActive() {
-		return nil, nil //nolint:nilnil // Phase 0: no encrypted writes yet
+		return &kv.RegistrationGate{}, nil // Phase 0: no encrypted writes yet
 	}
 	activeDEK, ok := w.cache.ActiveStorageKeyID()
 	if !ok {
-		return nil, nil //nolint:nilnil // not bootstrapped
+		return &kv.RegistrationGate{}, nil // not bootstrapped
 	}
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
 	lastSeen, err := readWriterRegistryLastSeen(defaultGroup.Store, activeDEK, fullNodeID)
@@ -101,22 +105,14 @@ func buildProcessStartRegistrationGate(
 			slog.Uint64("dek_id", uint64(activeDEK)),
 			slog.Uint64("full_node_id", fullNodeID),
 			slog.Uint64("local_epoch", uint64(w.epoch)))
-		return nil, nil //nolint:nilnil // already registered at this epoch
+		return &kv.RegistrationGate{}, nil // already registered at this epoch
 	}
 
 	barrier := make(chan struct{})
 	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
-	connCache := &kv.GRPCConnCache{}
+	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
 	eg.Go(func() error {
-		<-ctx.Done()
-		if cerr := connCache.Close(); cerr != nil {
-			return errors.Wrap(cerr, "close writer-registration gRPC connection cache")
-		}
-		return nil
-	})
-	eg.Go(func() error {
-		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, connCache, entry,
-			registrationRequest(activeDEK, fullNodeID, w.epoch), barrier)
+		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, entry, req, barrier)
 		return nil
 	})
 	return &kv.RegistrationGate{
@@ -177,27 +173,39 @@ func runWriterRegistration(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
 	defaultEngine raftengine.Engine,
-	connCache *kv.GRPCConnCache,
 	entry []byte,
 	req *pb.RegisterEncryptionWriterRequest,
 	barrier chan struct{},
 ) {
+	// The conn cache (forwarding to the leader's EncryptionAdmin) is
+	// scoped to this one-shot goroutine: closed when registration
+	// commits or ctx ends, so no process-lifetime cache + watcher
+	// goroutine is needed.
+	connCache := &kv.GRPCConnCache{}
+	defer func() { _ = connCache.Close() }()
+
 	backoff := registrationRetryInitial
 	for {
-		if err := proposeWriterRegistration(ctx, coordinate, defaultEngine, connCache, entry, req); err == nil {
+		err := proposeWriterRegistration(ctx, coordinate, defaultEngine, connCache, entry, req)
+		if err == nil {
 			close(barrier)
 			slog.Info("encryption: writer registration committed; first-write barrier released",
 				slog.Uint64("dek_id", uint64(req.GetDekId())))
 			return
-		} else {
-			slog.Warn("encryption: writer registration attempt failed; retrying",
-				slog.String("error", err.Error()), slog.Duration("backoff", backoff))
 		}
+		// On shutdown the failure is just the cancelled ctx — return
+		// without a misleading "retrying" warning, leaving the barrier
+		// open (fail-closed).
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Warn("encryption: writer registration attempt failed; retrying",
+			slog.String("error", err.Error()), slog.Duration("backoff", backoff))
 		select {
 		case <-ctx.Done():
 			return // shutdown before commit: leave barrier open (fail-closed)
 		case <-time.After(backoff):
-			backoff = minDuration(backoff*registrationBackoffFactor, registrationRetryMax)
+			backoff = min(backoff*registrationBackoffFactor, registrationRetryMax)
 		}
 	}
 }
@@ -232,11 +240,4 @@ func proposeWriterRegistration(
 		return errors.Wrap(err, "writer registration: forward to leader")
 	}
 	return nil
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

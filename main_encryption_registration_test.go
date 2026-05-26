@@ -137,8 +137,11 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 			if err != nil {
 				t.Fatalf("buildProcessStartRegistrationGate: %v", err)
 			}
-			if gate != nil {
-				t.Errorf("%s: expected nil (ungated) gate, got %+v", tc.name, gate)
+			// Ungated == a non-nil gate with a nil Barrier (the
+			// awaitRegistration short-circuit), so no encrypted write
+			// ever blocks.
+			if gate == nil || gate.Barrier != nil {
+				t.Errorf("%s: expected ungated gate (nil Barrier), got %+v", tc.name, gate)
 			}
 		})
 	}

@@ -221,6 +221,9 @@ func (c *ShardedCoordinator) awaitRegistration(ctx context.Context, reqs *Operat
 // are gated by awaitRegistration; reads and cleartext writes are not.
 func (c *ShardedCoordinator) writeWouldEncrypt(reqs *OperationGroup[OP]) bool {
 	g := c.registrationGate
+	if g == nil {
+		return false
+	}
 	if !hasMutatingElems(reqs) || g.StorageEnvelopeActive == nil || !g.StorageEnvelopeActive() {
 		return false
 	}
@@ -240,6 +243,11 @@ func hasMutatingElems(reqs *OperationGroup[OP]) bool {
 	if reqs == nil {
 		return false
 	}
+	// The per-Elem nil check is defensive: validateOperationGroup runs
+	// before this and rejects groups with nil elements, so a non-empty
+	// Elems is effectively all-non-nil in practice. The guard keeps
+	// hasMutatingElems correct even if a future caller bypasses that
+	// validation.
 	for _, e := range reqs.Elems {
 		if e != nil {
 			return true
