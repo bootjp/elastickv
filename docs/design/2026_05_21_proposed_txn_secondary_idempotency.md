@@ -418,27 +418,46 @@ preserves availability and adds correctness.
 - Unit test: the loop driver observes the prior attempt's write set +
   `commit_ts` on the second iteration and reuses the same `seq`.
 
-### M2 — exact-ts probe at one-phase apply
+### M2 — exact-ts probe at one-phase apply — **LANDED**
 
-- `store` helper `committedVersionAt(key, commitTS) bool` — MVCC point-read
-  for a committed version stamped **exactly** `commitTS`.
-- Wire it into `handleOnePhaseTxnRequest` (`kv/fsm.go:393`): when the
-  request carries a non-zero `prev_commit_ts`, probe
-  `committedVersionAt(primaryKey, prev_commit_ts)` and no-op the apply on a
-  hit.
-- Add `prev_commit_ts uint64` to the one-phase request (zero on first
-  attempt → probe skipped).
-- Unit tests: prior attempt landed at exactly T1 → probe true → no-op;
-  truncated/never-applied → false → apply; *other* txn committed at Tx≠T1 →
-  false (exactness) → apply → OCC conflict surfaces.
+- **M2a (landed).** `store.MVCCStore.CommittedVersionAt(ctx, key, commitTS)
+  (bool, error)` — an *exact*-timestamp existence check (point lookup),
+  distinct from `GetAt`'s newest-version-`<=ts` scan. Implemented on
+  `pebbleStore` (point `Get` on `encodeKey(key, commitTS)`; a tombstone
+  counts as landed, so the value is not decoded), on the in-memory
+  `mvccStore` (binary search the TS-ascending version slice), and delegated
+  by `ShardStore` / `LeaderRoutedStore` to the local group store (apply-local
+  probe, no leader fence/proxy). Tested on both stores, including the
+  load-bearing exactness case (a version at 300 must not satisfy a probe at
+  200).
+- **M2b (landed).** `prev_commit_ts` is carried in the existing `TxnMeta`
+  blob, **not** a new proto field: a new `TxnMeta.PrevCommitTS` field + V2
+  flag `0x04`. `EncodeTxnMeta` emits V2 *only* when `PrevCommitTS != 0`, so
+  every non-retry caller stays on the V1 wire format (see R5). Wired into
+  `handleOnePhaseTxnRequest` (`kv/fsm.go`): when `meta.PrevCommitTS != 0`,
+  probe `CommittedVersionAt(meta.PrimaryKey, meta.PrevCommitTS)` and `return
+  nil` (no-op the whole apply) on a hit. FSM tests pin: prior attempt landed
+  at exactly T1 → no-op (no version at T2, newest stays T1); truncated /
+  never-applied → applies at T2; `prev_commit_ts == 0` → probe skipped,
+  byte-identical to today.
+- **Still open for M2:** an FSM test that simulates the *other*-txn case
+  (`Tx ≠ T1`) end-to-end so exactness is pinned at the apply layer too (the
+  store layer already pins it). Fold into M3, where the OCC-conflict path is
+  exercised.
 
 ### M3 — write-set reuse + result reconstruction in the retry sites
 
+- **Emission gating (R5).** The leader emits a non-zero `prev_commit_ts`
+  (hence V2 meta, hence the probe firing) only when a cluster-wide capability
+  is enabled — default **off** until the whole cluster runs a probe-aware
+  binary. While off, no V2 meta is produced, the probe never fires, and the
+  FSM is byte-identical to today, so there is no mixed-version divergence
+  window.
 - `listPushCore` (`adapter/redis.go:3009`): on a retryable error, reuse the
-  prior attempt's write set (same `seq`) and set `prev_commit_ts`; on a
-  dedup no-op, return the prior length reconstructed at `prev_commit_ts`. On
-  an OCC `WriteConflict` after reuse (genuine cross-txn conflict), fall back
-  to full recompute.
+  prior attempt's write set (same `seq`) and set `prev_commit_ts` (via
+  `onePhaseTxnRequestWithPrevCommit`); on a dedup no-op, return the prior
+  length reconstructed at `prev_commit_ts`. On an OCC `WriteConflict` after
+  reuse (genuine cross-txn conflict), fall back to full recompute.
 - `runTransaction` (`adapter/redis.go:2824`): same reuse + reconstruct for
   the EXEC body (single-mop first; see Open questions).
 - Unit tests per site: simulated ambiguous-commit (apply succeeds, error
@@ -505,6 +524,39 @@ The residual failure would require E1 to apply *after* E2 in the committed
 log, which the race-freedom argument rules out under the synchronous-
 dispatch property; if that property is ever violated in practice, fall back
 to (a).
+
+### R5 — FSM determinism across a rolling upgrade
+
+The probe changes the apply *outcome* (no-op vs. apply at T2), so it must be
+computed identically on every node — FSM apply is deterministic by
+contract; a node that no-ops while another applies would diverge the
+replicas. The decision depends only on (a) the presence of `prev_commit_ts`
+in the replicated log entry (identical on every node) and (b)
+`CommittedVersionAt(primaryKey, prev_commit_ts)`, which is itself
+deterministic: at entry E2's apply, every node has applied exactly E1..E2-1,
+so the probe result is the same everywhere. The only divergence risk is a
+node that lacks the probe code yet receives an entry carrying
+`prev_commit_ts` — it would ignore the dedup and apply at T2 while upgraded
+nodes no-op.
+
+Two design choices close this:
+
+1. **`prev_commit_ts` rides in `TxnMeta` V2, and V2 is emitted only when
+   `prev_commit_ts != 0`.** Every existing (non-retry) caller keeps emitting
+   V1, so the default wire format is unchanged. A node that predates the V2
+   flag would *reject* an unknown flag (`decodeTxnMetaV2` returns
+   "unsupported flags") rather than silently diverge — fail-loud, not
+   fail-silent.
+2. **Emission is gated off by default** (M3): the leader only starts
+   emitting a non-zero `prev_commit_ts` once the whole cluster runs a
+   probe-aware binary. Until then, no V2-with-prev-flag entry is ever
+   produced, the probe never fires, and the FSM is byte-identical to today.
+   The probe code (M2b) is always present but inert at `prev_commit_ts == 0`.
+
+The operational contract is therefore: roll out the probe-aware binary
+everywhere first (behaves exactly as before), *then* enable emission. This
+is the standard "ship the reader before the writer" sequencing for a
+replicated-state-machine format change.
 
 ## Resolved: the trigger is leadership churn during commit
 
@@ -644,3 +696,14 @@ flakiness, tracked separately from the correctness fix.
   at the entry's own (lower) log index. So attempt-1's entry applies before
   the retry's or never — never after. The race-freedom premise holds; option
   2 is cleared to implement.
+- (2026-05-26) **M2 landed.** M2a: `CommittedVersionAt` exact-ts probe on
+  both store implementations (+ ShardStore/LeaderRoutedStore delegation),
+  tested. M2b: `prev_commit_ts` carried as a new `TxnMeta.PrevCommitTS` field
+  + V2 flag `0x04` (no proto change), with `EncodeTxnMeta` emitting V2 only
+  when set, so the default wire format stays V1; the probe is wired into
+  `handleOnePhaseTxnRequest` (no-op the apply on an exact hit). Recorded R5
+  (FSM determinism across a rolling upgrade): resolved by the V1-default wire
+  format + fail-loud unknown-flag rejection + default-off emission gating
+  (ship the reader before the writer). Next: M1 (thread the prior attempt's
+  write set + commit_ts out of `retryRedisWrite`) and M3 (write-set reuse +
+  gated emission + result reconstruction in `listPushCore` / `runTransaction`).

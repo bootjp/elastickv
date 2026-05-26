@@ -1019,8 +1019,23 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 }
 
 func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte) *pb.Request {
+	return onePhaseTxnRequestWithPrevCommit(startTS, commitTS, 0, primaryKey, reqs, readKeys)
+}
+
+// onePhaseTxnRequestWithPrevCommit builds a single-shard one-phase request,
+// optionally carrying prevCommitTS — the commit timestamp of a failed prior
+// attempt of the same transaction. When prevCommitTS is non-zero the FSM
+// (handleOnePhaseTxnRequest) probes whether that attempt already landed and
+// no-ops the apply if so (option 2 dedup). When it is zero the encoded meta
+// is byte-identical to the pre-feature V1 form, so non-retry callers are
+// unaffected. See docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
+func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)
-	muts = append(muts, txnMetaMutation(primaryKey, 0, commitTS))
+	muts = append(muts, &pb.Mutation{
+		Op:    pb.Op_PUT,
+		Key:   []byte(txnMetaPrefix),
+		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS, PrevCommitTS: prevCommitTS}),
+	})
 	for _, req := range reqs {
 		muts = append(muts, elemToMutation(req))
 	}

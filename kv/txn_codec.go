@@ -23,9 +23,10 @@ const (
 const txnLockFlagPrimary byte = 0x01
 
 const (
-	txnMetaFlagLockTTL  byte = 0x01
-	txnMetaFlagCommitTS byte = 0x02
-	txnMetaKnownFlags   byte = txnMetaFlagLockTTL | txnMetaFlagCommitTS
+	txnMetaFlagLockTTL      byte = 0x01
+	txnMetaFlagCommitTS     byte = 0x02
+	txnMetaFlagPrevCommitTS byte = 0x04
+	txnMetaKnownFlags       byte = txnMetaFlagLockTTL | txnMetaFlagCommitTS | txnMetaFlagPrevCommitTS
 )
 
 const txnMetaHeaderSize = 2
@@ -35,15 +36,32 @@ const uint64FieldSize = 8
 
 // TxnMeta is embedded into transactional raft log requests via a synthetic
 // mutation (key prefix "!txn|meta|"). It is not persisted in the MVCC store.
+//
+// PrevCommitTS is the commit timestamp of a failed previous attempt of the
+// same single-shard transaction. It is set only on a retry, and only carries
+// the one-phase idempotency dedup probe (option 2): at apply, the FSM checks
+// whether the previous attempt's write set already landed at exactly this
+// timestamp and, if so, no-ops the apply instead of re-applying. Because it
+// only needs the V2 wire format, EncodeTxnMeta keeps emitting V1 whenever
+// PrevCommitTS is zero (every non-retry path), so the default wire format is
+// unchanged. See docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
 type TxnMeta struct {
-	PrimaryKey []byte
-	LockTTLms  uint64
-	CommitTS   uint64
+	PrimaryKey   []byte
+	LockTTLms    uint64
+	CommitTS     uint64
+	PrevCommitTS uint64
 }
 
 func EncodeTxnMeta(m TxnMeta) []byte {
 	// Keep v1 as the default wire format until the cluster can guarantee that
-	// every node understands v2 during rolling upgrades.
+	// every node understands v2 during rolling upgrades. The only field that
+	// requires v2 is PrevCommitTS (the one-phase dedup probe), which is set
+	// exclusively on a retry by an upgraded leader; emitting v2 only in that
+	// case bounds the new wire format to the post-rollout, feature-enabled
+	// path and leaves every existing caller on v1.
+	if m.PrevCommitTS != 0 {
+		return encodeTxnMetaV2(m)
+	}
 	return encodeTxnMetaV1(m)
 }
 
@@ -69,6 +87,9 @@ func encodeTxnMetaV2(m TxnMeta) []byte {
 	if flags&txnMetaFlagCommitTS != 0 {
 		size += uint64FieldSize
 	}
+	if flags&txnMetaFlagPrevCommitTS != 0 {
+		size += uint64FieldSize
+	}
 	b := make([]byte, size)
 	b[0] = txnMetaVersionV2
 	b[1] = flags
@@ -82,6 +103,10 @@ func encodeTxnMetaV2(m TxnMeta) []byte {
 	}
 	if flags&txnMetaFlagCommitTS != 0 {
 		binary.BigEndian.PutUint64(b[offset:], m.CommitTS)
+		offset += uint64FieldSize
+	}
+	if flags&txnMetaFlagPrevCommitTS != 0 {
+		binary.BigEndian.PutUint64(b[offset:], m.PrevCommitTS)
 	}
 	return b
 }
@@ -107,6 +132,9 @@ func txnMetaFlags(m TxnMeta) byte {
 	}
 	if m.CommitTS != 0 {
 		flags |= txnMetaFlagCommitTS
+	}
+	if m.PrevCommitTS != 0 {
+		flags |= txnMetaFlagPrevCommitTS
 	}
 	return flags
 }
@@ -162,6 +190,12 @@ func decodeTxnMetaV2(b []byte) (TxnMeta, error) {
 	}
 	if flags&txnMetaFlagCommitTS != 0 {
 		meta.CommitTS, err = readTxnUint64(r, "txn meta: commit ts truncated")
+		if err != nil {
+			return TxnMeta{}, err
+		}
+	}
+	if flags&txnMetaFlagPrevCommitTS != 0 {
+		meta.PrevCommitTS, err = readTxnUint64(r, "txn meta: prev commit ts truncated")
 		if err != nil {
 			return TxnMeta{}, err
 		}

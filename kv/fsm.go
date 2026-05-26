@@ -488,6 +488,29 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return errors.WithStack(ErrTxnCommitTSRequired)
 	}
 
+	// Option-2 idempotency dedup: when this is a retry (meta.PrevCommitTS set),
+	// the adapter reused the failed attempt's write set under a fresh commitTS.
+	// If the previous attempt already landed — its entry survived the leader
+	// churn that returned an ambiguous error — there is a committed version of
+	// the primary key at exactly PrevCommitTS. Re-applying would create a
+	// duplicate (the very :duplicate-elements anomaly), so no-op the whole
+	// apply and let the adapter reconstruct the prior result.
+	//
+	// This is race-free because it runs at this entry's deterministic apply
+	// point: by now the raft log order has already fixed the prior attempt's
+	// fate (committed at a lower index, or truncated and never applied), so
+	// every node computes the same probe result. See the design doc's
+	// "commit_ts reuse vs stale-ts ordering" argument.
+	if meta.PrevCommitTS != 0 {
+		landed, perr := f.store.CommittedVersionAt(ctx, meta.PrimaryKey, meta.PrevCommitTS)
+		if perr != nil {
+			return errors.WithStack(perr)
+		}
+		if landed {
+			return nil
+		}
+	}
+
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
