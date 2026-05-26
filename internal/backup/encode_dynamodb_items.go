@@ -274,6 +274,10 @@ func marshalStoredDDBItem(item *pb.DynamoItem) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	// const-capacity, zero-length start + append (magic then body): keeps
+	// the len(magic)+len(body) arithmetic out of make() — which CodeQL
+	// flags as a potential allocation-size overflow — and the zero length
+	// satisfies makezero. Same pattern as marshalStoredDDBSchema.
 	out := make([]byte, 0, len(storedDDBItemMagic))
 	out = append(out, storedDDBItemMagic...)
 	return append(out, body...), nil
@@ -426,6 +430,9 @@ func decodeAVNumberSet(v any) (*pb.DynamoAttributeValue, error) {
 	return &pb.DynamoAttributeValue{Value: &pb.DynamoAttributeValue_Ns{Ns: &pb.DynamoNumberSet{Values: vals}}}, nil
 }
 
+// decodeAVBinarySet rebuilds a BS attribute. Like the SS/NS path, an
+// empty array is preserved (not rejected) to round-trip the structural
+// empty case the decoder serializes for nil/empty sets.
 func decodeAVBinarySet(v any) (*pb.DynamoAttributeValue, error) {
 	arr, ok := v.([]any)
 	if !ok {
