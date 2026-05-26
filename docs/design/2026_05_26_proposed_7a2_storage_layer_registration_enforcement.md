@@ -140,12 +140,18 @@ adapter hot paths, but gating them is correct and costs one bool.
 `encryptForKey`, so they are outside the gate's scope with no change
 needed (noted to close the audit loop — claude P2).
 
-**Runtime direct-write paths too, not just bootstrap (claude P2).**
-`CatalogStore.Save` is also reached at runtime via `SplitRange`, not
-only startup `EnsureCatalogSnapshot`. An unregistered node attempting a
-`SplitRange` before its barrier closes is correctly fail-closed by the
-same gate — the implementation must not special-case only the bootstrap
-path.
+**`SplitRange` does NOT use the direct path (codex P2).** An earlier
+draft claimed `CatalogStore.Save` is reached at runtime via
+`SplitRange`. That is wrong: the non-test split path
+(`adapter/distribution_server.go` `SplitRange` →
+`saveSplitResultViaCoordinator` → `coordinator.Dispatch`) commits
+through the **coordinator** (Raft-apply), so it is already covered by
+7a's coordinator-layer barrier and lands on the FSM-apply path
+(exempt). `CatalogStore.Save` has exactly **one** non-test caller —
+the startup bootstrap in `distribution/bootstrap.go` (via
+`EnsureCatalogSnapshot`). So the *only* direct-`ApplyMutations` path
+7a-2 must gate is the bootstrap `Save`; there is no runtime `SplitRange`
+direct-write path to fail-closed.
 
 ### 2.3 Startup ordering (the catalog-bootstrap question)
 
@@ -206,8 +212,12 @@ guards.
 caller rather than duplicated, for consistent backoff + diagnostics.
 **Direct-path caller inventory (claude P3 + codex P2).** The gated
 direct path is `pebbleStore.ApplyMutations`. It is reached by:
-  - `distribution/catalog.go` (catalog bootstrap + runtime
-    `SplitRange`) — the only caller that *originates* a write today;
+  - `distribution.CatalogStore.Save` → `applySaveMutations` →
+    `store.ApplyMutations`, whose **only** non-test caller is the
+    startup bootstrap (`distribution/bootstrap.go` via
+    `EnsureCatalogSnapshot`). Runtime `SplitRange` does **not** reach
+    this path — it commits through `coordinator.Dispatch` (Raft-apply),
+    already covered by 7a's coordinator barrier (codex P2);
   - the `ShardStore.ApplyMutations` and `LeaderRoutedStore.ApplyMutations`
     **MVCCStore-interface forwarders** (`kv/shard_store.go`,
     `kv/leader_routed_store.go`) which simply delegate to the
@@ -218,8 +228,8 @@ direct path is `pebbleStore.ApplyMutations`. It is reached by:
 "admin snapshot" and "migration" are *anticipated future* direct-path
 callers named by the `lsm_store.go` doc comment as the design-time
 category, not code that exists yet. So the implementation wires the
-catalog path now and the verification step re-greps the forwarder
-callers before merge.
+bootstrap `Save` path now and the verification step re-greps the
+forwarder callers before merge.
 
 ## 3. Scope
 
