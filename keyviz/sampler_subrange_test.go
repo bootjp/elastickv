@@ -217,7 +217,10 @@ func TestSubBucketBoundsContainCountedKey(t *testing.T) {
 	}{
 		{"unbounded whole space", nil, nil, 4},
 		{"unbounded k not dividing span", nil, nil, 7},
-		{"bounded", []byte{0x00}, []byte{0x40}, 4},
+		{"bounded divisible span", []byte{0x00}, []byte{0x40}, 4},
+		// 2^62 / 7 is not integer, so ceil != floor for these boundaries —
+		// deterministic coverage of the ceil reconstruction for bounded.
+		{"bounded k not dividing span", []byte{0x00}, []byte{0x40}, 7},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

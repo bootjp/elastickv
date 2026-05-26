@@ -753,10 +753,12 @@ func commonPrefixLen(a, b []byte) int {
 // i for a slot divided into len(subBuckets) buckets. Bucket 0 pins to
 // the route's actual start and the last bucket pins to its actual end
 // (the window arithmetic drops bytes past prefixLen + W, so the
-// reconstructed extremes would otherwise fall short); interiors use the
-// same fracMul kernel as the forward path. Together this tiles
-// [routeStart, routeEnd) exactly — each bucket's start equals the
-// previous bucket's end. Caller guarantees len(subBuckets) > 1.
+// reconstructed extremes would otherwise fall short); interiors use
+// boundaryAt's fracMulCeil — the ceil-dual of the forward path's floor
+// fracMul, deliberately different so a boundary-value key lands in the
+// same bucket it is counted in. Together this tiles [routeStart,
+// routeEnd) exactly — each bucket's start equals the previous bucket's
+// end. Caller guarantees len(subBuckets) > 1.
 func (slot *routeSlot) subBucketBounds(i int, routeStart, routeEnd []byte) (start, end []byte) {
 	last := len(slot.subBuckets) - 1
 	if i == 0 {
