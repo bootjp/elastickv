@@ -71,10 +71,23 @@ recycling nonces.
 
 ## 3. Proposed implementation
 
-### 3.1 Registration decision (startup, post-bump)
+### 3.1 Registration decision (startup, post-`buildShardGroups`)
 
-Extend the 6D-6c-2 startup wiring (`prepareStorageNonceEpoch` returns
-the bumped epoch). After the bump, compute a **registration intent**:
+The bumped epoch comes from 6D-6c-2's `prepareStorageNonceEpoch` (run
+inside `buildEncryptionWriteWiring`, before `buildShardGroups`). The
+**registration-intent decision**, however, **cannot** live there:
+
+> **Timing constraint (review finding #1).** The intent decision reads
+> the writer registry, which is backed by the default group's Pebble
+> `MVCCStore`. That store is not open until `buildShardGroups` returns.
+> So the intent decision is a **post-`buildShardGroups` step**, wired
+> into the same `run()` phase as `chainEncryptionStartupGuard` (which
+> already runs after the engines/stores open), **not** into
+> `buildEncryptionWriteWiring`. The epoch bump (write-path nonce
+> safety) stays pre-`buildShardGroups`; the registry intent (control
+> plane) runs after.
+
+Intent:
 
 ```
 if !StorageEnvelopeActive            -> defer (Phase 0; §1.4)
@@ -88,29 +101,82 @@ is replicated state already present on this node post-bootstrap),
 reusing the same `RegistryKey(dek_id, NodeID16(full_node_id))` lookup
 `ApplyRegistration` / `GuardLocalEpochRollback` use.
 
+**Registry handle access (review finding #2).** `buildShardGroups`
+already constructs a `WriterRegistryStore` per shard via
+`store.WriterRegistryFor(st)` and hands it to each `Applier`. 7a
+threads the **default group's** `WriterRegistryStore` out of
+`buildShardGroups` (returned alongside the runtimes, keyed by
+`cfg.defaultGroup`) so the post-`buildShardGroups` intent step reads
+the same handle the FSM's `ApplyRegistration` mutates — rather than
+adding a new accessor that reaches into the runtime/applier internals.
+This keeps the registry's single owner (the default-group store) and
+avoids a second `WriterRegistryFor` over the same Pebble dir.
+
 ### 3.2 Coordinator first-write gate
 
 The coordinator gains a **registration barrier**: a one-shot readiness
 signal that blocks the first client write which would land encrypted
-(gate active + active DEK) until the pending `RegisterEncryptionWriter`
-proposal has committed (its `applied_index` observed). Proposed shape:
+until the pending `RegisterEncryptionWriter` proposal has committed.
 
-- A `registrationBarrier` on `ShardedCoordinator`: `nil` when no
-  registration is pending (Phase 0, skip case, or encryption-off), else
-  a channel/`atomic` closed when registration commits.
-- On the write dispatch path, when the write targets the storage
-  envelope (gate on + DEK active) and the barrier is unclosed, block on
-  it (honoring `ctx`) before proposing. Reads and non-encrypted writes
-  are never gated.
-- The barrier is armed at startup by §3.1's "propose" branch and closed
-  by the `RegisterEncryptionWriter` apply (observed via the same
-  applied-index wait the admin RPC already uses).
+**Barrier representation — `chan struct{}`, three states (review #5).**
+The barrier field on `ShardedCoordinator` is a `chan struct{}` with an
+explicit three-state semantic:
 
-**Open question for review:** exact injection point — gate inside
-`ShardedCoordinator.Dispatch` before the propose, vs. a smaller
-wrapper. Leaning toward `Dispatch` since it is the single entry point
-all adapters funnel through, but the txn vs. raw-put split needs a
-careful read so reads stay ungated.
+| State | Meaning | Write behavior |
+|---|---|---|
+| `nil` | no pending registration (Phase 0, skip case, or encryption off) | ungated |
+| open (non-nil, not closed) | registration proposed, not yet committed | mutating encrypted writes block on it |
+| closed | registration committed | ungated (fast path: non-blocking `select` branch) |
+
+The channel MUST be created (open) **before** the barrier reference is
+visible to any write-dispatch goroutine — i.e., armed in the
+post-`buildShardGroups` phase (§3.1) before gRPC starts serving. A
+`nil` channel blocks forever on receive (would deadlock rather than
+ctx-cancel), so `nil` is reserved exclusively for the never-armed
+ungated case and the dispatch path checks `barrier == nil` first.
+
+**Gate injection — `ShardedCoordinator.Dispatch` (review #4).** The
+reads (`LinearizableRead`, `LeaseRead`, `VerifyLeader`) are separate
+`Coordinator` methods that never reach `Dispatch`, so they are
+structurally ungated. Inside `Dispatch`, the gate fires only when:
+
+```
+barrier != nil && !closed(barrier)
+  && cache.StorageEnvelopeActive() && cache.activeKeyID != 0
+  && hasMutatingElems(reqs)   // PUT / DEL / DEL_PREFIX present
+```
+
+`hasMutatingElems` is required (not just `IsTxn`): a read-only
+transaction carrying only `ReadKeys` (no PUT/DEL elements) must stay
+ungated even though it flows through `dispatchTxn`. When the gate
+fires, `Dispatch` blocks on `select { case <-barrier: ; case <-ctx.Done(): }`
+before proposing — fail-closed: a write that cannot register within
+its ctx never emits an unregistered nonce.
+
+**Multi-shard note (review #6).** The barrier is node-global; the
+registration targets the default group. So in a multi-shard
+deployment a write to group 2 blocks until the group-1 registration
+Raft round-trip commits. This is correct — nonce uniqueness is
+DEK-wide, not shard-scoped — and only the first encrypted write pays
+the wait.
+
+**Arming + async commit (review #3).** §3.1's "propose" branch arms
+the barrier (creates the open channel) and starts a goroutine that
+proposes `RegisterEncryptionWriter` and waits for its apply (the same
+applied-index wait the admin RPC uses), then `close()`s the barrier.
+That goroutine MUST `select` on **both** the apply signal **and** the
+process run-context: on run-ctx cancellation (clean shutdown before
+commit) it returns **without** closing the barrier, leaving any
+in-flight encrypted writes blocked until they hit their own ctx
+deadline / the gRPC server drains — never closing the barrier on an
+uncommitted registration. No goroutine leak: it always exits on one of
+the two signals.
+
+**Snapshot/compaction interaction (review #8).** If the registration
+entry is compacted into a snapshot before the goroutine observes its
+index, the engine's `AppliedIndex()` is already ≥ the snapshot index
+and the snapshot application updated the registry row, so the
+apply-wait completes correctly — same reasoning as the 6C-2b scanner.
 
 ### 3.3 Leader routing for the propose
 
@@ -147,9 +213,11 @@ that cannot register does not get to emit an unregistered nonce).
 - **Data loss / consistency** — registration is additive (a 0x03 entry
   + a registry-row insert/advance); no user data path changes. The
   gate only *delays* encrypted writes, never drops them.
-- **Concurrency** — the barrier is read on every encrypted write; must
-  be a lock-free fast path once closed (atomic load), and ctx-aware
-  while pending. No deadlock if leadership never settles — ctx bound.
+- **Concurrency** — the barrier is read on every encrypted write; once
+  closed the fast path is a non-blocking `select` branch on the closed
+  channel (O(1), no extra synchronization), and ctx-aware while
+  pending. No deadlock if leadership never settles — ctx bound. The
+  `nil` (never-armed) case is checked first so it is never received on.
 - **Performance** — fast path after first write is a single atomic
   load; the registry read + propose happen once per process load.
 - **Data consistency** — registry monotonicity (§4.1 case 2/3)
@@ -158,14 +226,25 @@ that cannot register does not get to emit an unregistered nonce).
 - **Test coverage** — intent branches, barrier blocking/release,
   ungated reads, Phase-0 defer, ctx-cancel.
 
-## 6. Open questions
+## 6. Resolved design decisions (PR #835 round 1)
 
-1. Coordinator gate injection point (§3.2) — `Dispatch` vs. a narrower
-   seam; confirm reads/txn-reads stay ungated.
-2. Barrier representation — `chan struct{}` closed on commit vs.
-   `atomic.Bool` + condition var. Leaning `chan struct{}` for ctx-aware
-   `select`.
-3. Should the startup propose be synchronous (block startup until it
-   commits) or asynchronous (arm the barrier, let the first encrypted
-   write wait)? Leaning asynchronous so a node with no pending writes
-   starts serving reads immediately, and only encrypted writes wait.
+All three original open questions were settled by the round-1 review:
+
+1. **Gate injection point** → `ShardedCoordinator.Dispatch`, the single
+   adapter entry point. Reads (`LinearizableRead` / `LeaseRead` /
+   `VerifyLeader`) are separate methods, structurally ungated. Gate
+   condition gated on `hasMutatingElems(reqs)` (PUT/DEL/DEL_PREFIX), so
+   read-only transactions stay ungated (§3.2).
+2. **Barrier representation** → `chan struct{}` with the explicit
+   nil / open / closed three-state semantic (§3.2). Idiomatic,
+   ctx-aware, no extra synchronization primitives.
+3. **Sync vs async propose** → asynchronous: arm the barrier and let
+   only the first encrypted write wait, so reads serve immediately. The
+   propose goroutine selects on both the apply signal and the process
+   run-context to avoid a leak / a barrier-close on an uncommitted
+   registration (§3.2, review #3).
+
+Remaining items to resolve **within the implementation PR** (not
+deferred further): the exact `hasMutatingElems` predicate over the
+`OperationGroup` shape, and the default-group `WriterRegistryStore`
+threading out of `buildShardGroups` (§3.1).
