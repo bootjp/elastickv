@@ -4,9 +4,13 @@
 > Triggered by the 2026-05-21 Jepsen scheduled run
 > [26198185540](https://github.com/bootjp/elastickv/actions/runs/26198185540)
 > which surfaced a `:duplicate-elements` anomaly on the Redis list-append
-> workload. This doc proposes a server-side dedup marker (and an optional
-> client-side commit-status check) to make multi-shard txn commits
-> exactly-once-applied at the FSM layer.
+> workload. This doc proposes a **TiKV-style `CheckTxnStatus` probe at
+> the adapter's retry boundary**: before re-running an operation after a
+> conflict, check whether the previous attempt already committed and, if
+> so, return its result instead of re-appending. An earlier draft
+> proposed a UUID + FSM dedup table; that is recorded below as
+> "considered and rejected" — `CheckTxnStatus` is lighter (adapter-only,
+> no proto/FSM/GC) and sufficient for the observed bug.
 
 ## Background
 
@@ -176,239 +180,226 @@ content-addressed list-delta keys) and (3) (`kv.LockResolver` at
 `commitSecondaryWithRetry`'s loop) re-issues the write blindly without
 first checking the primary's commit status. (1) protects against
 identical-input replay but not against the regenerated-input replay that
-`runTransaction`'s EXEC-body re-execution produces.
+`runTransaction`'s EXEC-body re-execution produces — and the regeneration
+is exactly what defeats (1), because RPUSH's target key (the list index)
+is data-dependent and changes when the list grows between attempts.
+**Adding (2) is this design.**
 
-## Proposed design
+## Proposed design — CheckTxnStatus before retry (TiKV layer 2)
 
-Add a server-side **txn-applied marker** at FSM apply time, plus a kv-side
-**check-then-retry** wrapper around the secondary commit path. The marker
-is the primary fix; the check-then-retry is a performance optimisation.
+The fix is to add the one TiKV layer elastickv is missing: **before
+re-running the operation, check whether the previous attempt actually
+committed**. If it did, return its result instead of recomputing and
+re-appending. This is exactly TiKV's `CheckTxnStatus`, applied at the
+elastickv adapter's retry boundary. It needs no new wire field, no FSM
+dedup table, and no GC — only a few bytes of per-attempt state held in
+a local variable across the `retryRedisWrite` loop.
 
-### Why a server-side marker is the right layer
+### Why a UUID / FSM marker is NOT needed (considered and rejected)
 
-The duplicate cannot be deduped purely client-side because:
+The earlier draft of this doc proposed a server-allocated UUIDv7
+(`Request.AdapterTxnId`) written to a `__txn_applied__<uuid>` dedup
+table at FSM apply time, GC'd on a TTL. That works, but it is
+over-engineered for the observed bug:
 
-- The Redis client (Jepsen, Carmine, etc.) sends one `MULTI/EXEC` and
-  expects one response. There is no client-supplied txn ID.
-- The adapter could generate a UUID at EXEC entry, but to make `retryRedisWrite`
-  dedup-safe, the UUID has to survive both:
-  - regeneration of `startTS` / `commitTS` (purely server-side state), and
-  - propagation through the gRPC `Forward` redirect when the local node
-    is not the leader of all touched shards.
-- A UUID generated at EXEC entry that travels through every internal
-  retry and every Forward boundary IS the design. Storing it server-side
-  in a small dedup table is the natural place to enforce uniqueness.
+- It adds a proto field on every write `Request`, an FSM-side marker
+  read+write on every commit, and a periodic GC sweep — permanent
+  cost on the hot path to defend a rare retry race.
+- Its only capability beyond CheckTxnStatus is deduping a retry that
+  spans *different client commands* (a client re-sending the same
+  RPUSH as a brand-new request). But under Redis semantics that is a
+  *legitimate* second append — `RPUSH k v` twice means two elements —
+  so there is nothing to dedup there. The marker would be guarding a
+  case that should not be guarded.
 
-### Server-side marker (the fix)
+The observed Jepsen duplicate is always a retry *inside a single
+`retryRedisWrite` loop* (one client op, internally retried). That is
+precisely the scope CheckTxnStatus covers, so the UUID/marker buys no
+additional correctness for this bug.
 
-New reserved key on each shard:
+### The mechanism
 
-```
-__txn_applied__<adapter_txn_id>  →  (commit_ts, applied_at_wall_time)
-```
+The duplicate exists because, on a `WriteConflict`/`TxnLocked` retry,
+`retryRedisWrite` cannot tell two cases apart:
 
-`adapter_txn_id` is a server-generated UUIDv7 (time-ordered for cheap
-TTL-based GC), allocated in the adapter at EXEC entry (`runTransaction`
-line 2820, before `retryRedisWrite`). A new field
-`Request.AdapterTxnId [16]byte` propagates it through `pb.Request`. It
-survives:
+- **Genuine conflict** — *another* txn took the list index we wanted.
+  We MUST re-read and re-append at a fresh index. Recompute is correct.
+- **Spurious conflict (the bug)** — *our own* previous attempt already
+  committed (its entry survived the election that returned us an
+  ambiguous error), and the conflict we see is against our own write.
+  We must NOT re-append; we should return the prior attempt's result.
 
-- `retryRedisWrite` retries: the UUID is captured outside the
-  closure, so every iteration sees the same value.
-- `commitSecondaryWithRetry` retries: the field is on the existing `req`
-  object.
-- Forward redirect: `Coordinate.buildRedirectRequests` already builds a
-  `pb.Request`; just include the field.
-
-FSM apply path (`kv/fsm.go:handleCommitRequest`,
-`handleOnePhaseTxnRequest`):
-
-1. **Before** building store mutations, read `__txn_applied__<id>` for the
-   request's adapter_txn_id.
-2. If present and the recorded commit_ts equals the request's commit_ts:
-   no-op (return nil). The mutations would be a duplicate.
-3. If present and the recorded commit_ts **differs**: return
-   `ErrTxnAlreadyCommittedAtDifferentTS` (a new sentinel). This catches the
-   bug shape — retry generated a NEW commit_ts after the original committed
-   — and surfaces it as a hard error to the adapter, which can then return
-   a deterministic outcome rather than producing a duplicate.
-4. If absent: apply mutations normally **and** write
-   `__txn_applied__<id> → (commit_ts, now)` in the **same Pebble batch**
-   (`ApplyMutationsRaft`'s atomic guarantee). The marker is committed iff
-   the mutations are committed.
-
-### GC of the marker table
-
-`__txn_applied__*` keys must survive long enough to catch the latest possible
-retry. The retry envelope is bounded by:
-
-- `redisDispatchTimeout` (handler-context timeout for one Redis command)
-- `lockResolverInterval` (10 s) + `defaultTxnLockTTLms` (30 s) for lock-
-  resolver triggered re-applies
-
-A conservative TTL of `2 × (lockResolverInterval + defaultTxnLockTTLms)`
-= 80 s covers both. Cleanup runs in `kv/compactor.go`'s existing periodic
-sweep — add a new prefix scan that drops markers whose `applied_at` is
-older than the TTL. Cost: ~40 bytes/txn × ~1000 txn/s × 80 s ≈ 3.2 MB
-steady-state per shard. Negligible.
-
-### Client-side commit-status check (optimisation)
-
-This is the TiKV-style optimisation that *reduces* the marker's
-load-bearing role from "absolute correctness" to "race-window guard". Not
-required for correctness given the marker, but reduces wasted Raft traffic
-on the retry-after-success case:
-
-`commitSecondaryWithRetry` (`kv/sharded_coordinator.go:527`) checks the
-primary's commit record (`txnCommitKey(primary_key, start_ts)`) before
-deciding to retry:
+TiKV distinguishes these with `CheckTxnStatus(primary_key, start_ts)`.
+elastickv can do the same by remembering the **previous attempt's
+identity** — `(startTS_prev, commitTS_prev, primaryKey_prev)` — in a
+local variable across the retry loop, then probing whether that attempt
+landed before re-running:
 
 ```
-commit_record = txnCommitTS(primary_key, start_ts)
-match commit_record {
-    Committed(ts) => {
-        // Primary already committed. If our secondary's marker is
-        // present, this is a true no-op — return success. Otherwise
-        // retry the secondary commit (it really did fail).
-        if secondary_marker_present(adapter_txn_id) { return Ok }
-        else                                        { retry }
-    }
-    NotFound => { retry }   // primary not yet committed; safe to retry
-    RolledBack => { return abort }
-}
+retryRedisWrite loop, attempt N+1 (only entered after attempt N failed):
+  if attempt N actually committed:        # CheckTxnStatus
+      read back the result at commitTS_prev and return success
+  else:
+      genuine conflict → re-read state, recompute, dispatch (attempt N+1)
 ```
 
-This is purely additive; if it is omitted, the FSM-side marker still
-prevents the duplicate.
+"Did attempt N commit?" is answered without any new persistent state:
 
-## Caller audit
+- **Multi-shard 2PC** (`handleCommitRequest` path): the primary shard
+  writes `txnCommitKey(primaryKey_prev, startTS_prev)` at the commit
+  point (`buildCommitStoreMutations`, kv/fsm.go:619). Probe it; if
+  present, the txn is committed (Percolator's commit point), and the
+  pending secondaries are the LockResolver's job. Return success.
+- **Single-shard one-phase** (`handleOnePhaseTxnRequest`, kv/fsm.go:393):
+  this path does NOT write a commit record — it applies mutations
+  directly. So instead probe the previous attempt's own data write
+  content-addressed: does `listItemKey(key, seq_prev)` have a committed
+  version at `commitTS_prev`? If yes, attempt N landed. This is a pure
+  MVCC point-read on a key we already computed; still no new state.
 
-The marker design changes the FSM apply semantics: a commit request whose
-adapter_txn_id is already present becomes either a no-op (same commit_ts)
-or an error (different commit_ts). Every caller of `handleCommitRequest`
-/ `handleOnePhaseTxnRequest` (via `applyRequest`) is affected:
+Because the probe keys on the *previous attempt's* identity (held in a
+local), it is unaffected by the very regeneration that causes the bug:
+attempt N+1 recomputing a new `startTS`/`commitTS`/index does not change
+what we are checking for attempt N.
 
-| Caller | Outcome with marker | Notes |
+### Where the check lives
+
+Three call sites run the retry loop; each gets the same pre-retry
+CheckTxnStatus guard:
+
+- `runTransaction` (`adapter/redis.go:2824`) — MULTI/EXEC body. The
+  primary key is `primaryKeyForElems` over the EXEC write set;
+  multi-shard → probe `txnCommitKey`.
+- `listPushCore` (`adapter/redis.go:3009`) — single-command RPUSH/LPUSH.
+  Often single-shard → probe the previous attempt's `listItemKey` at
+  `commitTS_prev`.
+- `commitSecondaryWithRetry` (`kv/sharded_coordinator.go:527`) — already
+  retries the same `req` (stable `start_ts`/`commit_ts`), so its replay
+  is content-addressed and idempotent today; the CheckTxnStatus guard
+  here is a cheap short-circuit that avoids re-proposing once the
+  primary commit record shows the txn is done.
+
+### Caller audit
+
+The behaviour change is confined to the adapter retry loop. The FSM
+apply path is **unchanged** — no new sentinel, no marker read/write.
+
+| Call site | Behaviour change | Risk |
 |---|---|---|
-| `commitPrimaryTxn` first attempt | no marker yet → apply + write marker | normal path |
-| `commitSecondaryTxns` per shard | no marker yet → apply + write marker | normal path |
-| `commitSecondaryWithRetry` retry of same req | marker present, same commit_ts → no-op | the bug shape we are fixing |
-| `runTransaction` retry-after-success (new commit_ts) | marker present, different commit_ts → `ErrTxnAlreadyCommittedAtDifferentTS` | adapter must translate this to a synthesized success result for the user-visible txn |
-| `LockResolver.resolveExpiredLock` re-commit | same (start_ts, commit_ts) as original primary record → marker present, same commit_ts → no-op | safe |
-| `applyTxnResolution` from lock cleanup | same | safe |
+| `runTransaction` retry | before re-running EXEC body, probe prev attempt's `txnCommitKey`; if committed, read-back + return success | must reconstruct the client-visible result at `commitTS_prev` (see R1) |
+| `listPushCore` retry | before re-RPUSH, probe prev attempt's `listItemKey@commitTS_prev`; if present, return prev length | length reconstruction is a meta read at `commitTS_prev` |
+| `commitSecondaryWithRetry` | probe primary `txnCommitKey` before re-propose; short-circuit if committed | none — same `req`, already idempotent; this only saves a Raft round-trip |
+| FSM `handleCommitRequest` / `handleOnePhaseTxnRequest` | **none** | — |
+| `LockResolver` / `applyTxnResolution` | **none** — still idempotent via the existing lock-missing check | — |
 
-The adapter handles `ErrTxnAlreadyCommittedAtDifferentTS` by:
-
-1. Reading the primary's `txnCommitKey(primary_key, start_ts)` to learn the
-   ACTUAL commit_ts.
-2. Reading back the user-visible state at that commit_ts (e.g.
-   `resolveListMeta` at the actual `commit_ts`) to reconstruct what the
-   client should see.
-3. Returning success with the reconstructed result.
-
-This is the same pattern TiKV uses when it discovers
-"the txn already committed before the client knew about it" — `CheckTxnStatus`
-result + read-after-commit-ts.
+No FSM-side caller is affected because the dedup decision moves entirely
+to the adapter's pre-retry check; the FSM keeps applying whatever commit
+requests reach it, and the adapter simply stops issuing the duplicate
+one.
 
 ## Why not just remove `retryRedisWrite` from `runTransaction`?
 
 Removing the EXEC-body retry would eliminate the trigger but trade
 correctness for availability: every transient `WriteConflict` (which
 happens under normal OCC contention) would surface to the client as a
-hard error, requiring the client to retry. Jepsen/Redis clients typically
-do not retry write-conflict errors and would interpret them as `:fail`
-ops. Availability under contended workloads (BullMQ, list-append-heavy
-patterns) would drop measurably.
+hard error, requiring the client to retry. Jepsen/Redis clients
+typically do not retry write-conflict errors and would interpret them
+as `:fail` ops. Availability under contended workloads (BullMQ,
+list-append-heavy patterns) would drop measurably.
 
-Keeping the retry but making it idempotent at the FSM layer (the marker
-design) preserves availability and adds correctness.
+Keeping the retry but teaching it to recognise its own prior success
+(CheckTxnStatus) preserves availability and adds correctness.
 
 ## Implementation milestones
 
-### M1 — proto + adapter UUID plumbing
+### M1 — previous-attempt identity plumbing in the retry loop
 
-- Add `bytes AdapterTxnId = N;` to `pb.Request` (proto/service.proto)
-- `runTransaction` (`adapter/redis.go:2820`): allocate UUIDv7 once,
-  capture in closure
-- `listPushCore` / `txn.commit()` / single-command write helpers: thread
-  UUID through `kv.OperationGroup`
-- `Coordinate.buildRedirectRequests`: propagate UUID through Forward
-- `commitSecondaryTxns`: include UUID in each per-shard `req`
-- Unit tests: assert UUID is stable across retryRedisWrite iterations
+- `retryRedisWrite` (`adapter/redis_retry.go`): expose the attempt's
+  resolved `(startTS, commitTS, primaryKey)` to the loop driver so it
+  can be remembered between iterations. Today the closure hides this;
+  thread it out via a small result struct or a pre-attempt callback.
+- No proto change, no wire field.
+- Unit test: the loop driver observes the prior attempt's identity on
+  the second iteration.
 
-### M2 — FSM marker
+### M2 — CheckTxnStatus probe helper
 
-- New reserved-key prefix `__txn_applied__<uuid>` in
-  `internal/storage/keys` (or wherever the prefix table lives)
-- `handleCommitRequest` / `handleOnePhaseTxnRequest`: marker check
-  before `buildCommitStoreMutations`
-- `buildCommitStoreMutations`: append marker mutation atomically
-- New sentinel `ErrTxnAlreadyCommittedAtDifferentTS`
-- Unit tests: same-commit_ts replay → no-op; different-commit_ts replay →
-  sentinel error
+- `kv` helper `txnCommittedAt(primaryKey, startTS) (commitTS, bool)`
+  reading `txnCommitKey` on the primary shard (multi-shard path).
+- `store` helper `committedVersionAt(key, commitTS) bool` — MVCC
+  point-read for the single-shard one-phase path.
+- Unit tests: committed prior attempt → true; aborted / never-applied
+  → false; cross-key probe isolation.
 
-### M3 — Adapter handling of `ErrTxnAlreadyCommittedAtDifferentTS`
+### M3 — wire the probe into the three retry sites
 
-- `runTransaction`: catch sentinel, read back actual commit state, return
-  reconstructed success
-- Unit test: simulated partial-commit + EXEC retry → no duplicate,
-  client sees success
+- `runTransaction` (`adapter/redis.go:2824`): before re-running the EXEC
+  body, if the prior attempt's `txnCommitKey` is present, read back the
+  EXEC's client-visible results at `commitTS_prev` and return success.
+- `listPushCore` (`adapter/redis.go:3009`): before re-RPUSH, if the
+  prior attempt's `listItemKey@commitTS_prev` exists, return the prior
+  length (meta read at `commitTS_prev`).
+- `commitSecondaryWithRetry` (`kv/sharded_coordinator.go:527`):
+  short-circuit the re-propose when the primary commit record shows the
+  txn is done.
+- Unit tests per site: simulated ambiguous-commit (apply succeeds, error
+  returned) + retry → no duplicate, client sees success.
 
-### M4 — GC
+### M4 — Validation
 
-- Extend `kv/compactor.go` periodic sweep with a marker-prefix scan
-- TTL: `2 × (lockResolverInterval + defaultTxnLockTTLms)` = 80 s
-- Metric: `elastickv_txn_marker_gc_swept_total`
-
-### M5 — Optional: client-side commit-status check
-
-- `commitSecondaryWithRetry`: before each retry, read primary commit
-  record + secondary marker
-- Skip the retry if the secondary is already applied
-
-### M6 — Validation
-
-- Local Jepsen reproduction (with elevated trace logging on FSM)
+- Local Jepsen reproduction. Because the trigger is election churn
+  (see "Resolved" below), reproduce by running the 3-node demo under
+  CPU pressure or with shortened election timeouts so leadership
+  flaps during the workload.
 - Scheduled Jepsen run goes 7 consecutive days without
-  `:duplicate-elements`
+  `:duplicate-elements` / `:G-single-item-realtime`.
 
-Total scope estimate: M1-M4 are the load-bearing milestones (~600 LOC of
-Go + tests + proto change). M5 is optional, ~50 LOC. M6 is verification
-only, no code.
+Scope estimate: M1–M3 are adapter + kv/store helper changes (~250 LOC
+Go + tests), no proto change, no FSM change, no GC. M4 is verification
+only.
 
 ## Risks
 
-### R1 — Marker GC timing
+### R1 — Client-visible result reconstruction on the success short-circuit
 
-If a retry arrives after the marker is GC'd (>80 s after the original
-apply), the dedup misses → duplicate could still happen. Mitigation: the
-TTL is already 4× the maximum natural retry window (LockResolver + lock
-TTL). Operators can raise it via a tunable if late-arriving retries are
-ever observed.
+When the probe finds the prior attempt committed, the retry must
+return what the client would have seen. For RPUSH/LPUSH that is the
+post-append length (a meta read at `commitTS_prev`); for a MULTI/EXEC
+body it is each mop's result reconstructed at `commitTS_prev`. This is
+the most intricate part. Mitigation: scope the first PR to RPUSH/LPUSH
+(the commands the Jepsen workload exercises and where the duplicate is
+observed) and the single-mop EXEC case; expand reconstruction coverage
+per-command as needed. Commands whose reconstruction is not yet
+implemented fall back to the current (buggy-under-churn) retry, so the
+change is strictly an improvement, never a regression.
 
-### R2 — Proto field on every Request
+### R2 — Probe read cost on the retry path
 
-`pb.Request.AdapterTxnId` adds 16 bytes per Raft entry on every write. At
-the cluster's current scale this is negligible (<1% overhead). For very
-small-value workloads (e.g. counter increments), the relative cost is
-higher; a future optimisation could elide the field when empty.
+Each retry now does one extra point-read (primary `txnCommitKey`, or a
+single-key MVCC lookup) before deciding to recompute. Retries only
+happen on conflict, which is rare, and the read is a single key — cost
+is negligible relative to the Raft round-trip the retry would otherwise
+pay. The hot (no-conflict) path is untouched: the probe is only reached
+after an attempt has already failed.
 
-### R3 — `ErrTxnAlreadyCommittedAtDifferentTS` reconstruction
+### R3 — Probe false-negative under deep churn
 
-The adapter's read-after-commit-ts reconstruction in M3 is the most
-intricate part. For list operations the reconstruction reads `meta` at
-the actual commit_ts; for string SET the reconstruction reads the value
-at the actual commit_ts. Each Redis command needs its reconstruction
-hook. Mitigation: scope M3 to the highest-priority commands (RPUSH,
-LPUSH, SET, INCR) in the initial PR; expand coverage as needed.
+If the prior attempt's commit record / data version has itself been
+truncated by a *subsequent* election before the probe reads it, the
+probe returns false and the retry recomputes → a duplicate could still
+slip through. This is far narrower than the original bug (it needs two
+elections to straddle a single retry) and converges: the LockResolver
+and the OCC conflict check still bound the damage. If observed, the
+mitigation is the heavier FSM-marker design (preserved in git history
+of this doc) — but it is not warranted for the churn rates seen so far.
 
-### R4 — Interaction with `applyTxnResolution`'s value-less PUT
+### R4 — Single-shard one-phase has no commit record
 
-`kv/shard_store.go:1111` emits `Op_PUT` with no Value during lock
-resolution, relying on the FSM to look up the staged intent. The marker
-check fires BEFORE intent lookup, so if the marker is present and
-commit_ts matches, the intent is never touched. This is the correct
-behavior (the intent is already resolved). No interaction risk.
+`handleOnePhaseTxnRequest` (kv/fsm.go:393) does not write a
+`txnCommitKey`, so the multi-shard probe does not apply. M2's
+`committedVersionAt(key, commitTS)` MVCC point-read covers this case by
+checking the prior attempt's own data write directly. Verified against
+the one-phase apply path; no new persistent state required.
 
 ## Resolved: the trigger is leadership churn during commit
 
@@ -480,19 +471,33 @@ flakiness, tracked separately from the correctness fix.
 
 ## Open questions
 
-- **Should the adapter_txn_id also propagate to read paths?** No —
-  reads don't dedup (idempotent). Field is write-only.
-- **Does the marker need to cover single-key (Phase_NONE) writes as
-  well as multi-shard 2PC?** Yes — `listPushCore`'s own
-  `retryRedisWrite` regenerates `commitTS` on a single-shard RPUSH
-  too, so the marker check belongs in `handleOnePhaseTxnRequest` in
-  addition to `handleCommitRequest`. M2 already lists both; calling it
-  out here so it is not dropped during implementation.
+- **Result reconstruction coverage.** The success short-circuit must
+  reconstruct each command's client-visible result at `commitTS_prev`.
+  RPUSH/LPUSH (length) and single-mop EXEC are in scope for the first
+  PR; multi-mop EXEC and other write commands (SET/INCR/HSET/…) need
+  per-command reconstruction hooks. Which commands beyond RPUSH/LPUSH
+  must land in the first PR vs. follow-ups? (Default: only the
+  list-append family the Jepsen workload exercises; everything else
+  keeps today's behaviour until its hook is added.)
+- **Should `commitSecondaryWithRetry`'s short-circuit be in the first
+  PR or deferred?** It is a pure optimisation (the same-`req` replay is
+  already idempotent), so it can ship separately from the correctness
+  fix in `runTransaction` / `listPushCore`.
 
 ## Decision log
 
 - (2026-05-21) initial proposal; open for review.
 - (2026-05-24) open question closed: full log from run 26340084100
   confirms the trigger is an election storm racing an in-flight
-  commit; marker fix applies regardless. Recorded the CI CPU-starvation
-  amplifier as a separate non-blocking follow-up.
+  commit. Recorded the CI CPU-starvation amplifier as a separate
+  non-blocking follow-up.
+- (2026-05-24) design switched from the UUID + FSM-marker + GC approach
+  to a TiKV-style `CheckTxnStatus` probe at the adapter retry boundary.
+  Rationale: the observed duplicate is always an internal retry within a
+  single `retryRedisWrite` loop, which `CheckTxnStatus` fully covers
+  without a wire field, FSM dedup table, or GC. The UUID design's only
+  extra reach — deduping a retry across *different* client commands — is
+  a case Redis semantics treat as a legitimate second append, so it
+  guards nothing real. The marker design remains in this file's git
+  history if R3 (probe false-negative under deep churn) is ever
+  observed in practice.
