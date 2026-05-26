@@ -243,6 +243,27 @@ emit an unregistered nonce).
   while blocked.
 
 ### Out of scope
+- **7a-2 (complete write-path coverage)** — the coordinator-layer
+  barrier in this slice gates the client-write path (`Dispatch`) and
+  the internal lock-resolution path (`leaseRefreshingTxn.Commit`), but
+  **not** internal paths that write to the store directly without going
+  through the coordinator — notably `distribution.CatalogStore.Save` →
+  `store.ApplyMutations` (codex P1 on PR #839). Coordinator-layer
+  gating is structurally incapable of covering those; the single
+  chokepoint for "registered before any encrypted write" is the
+  nonce-emission point, `store.encryptForKey`. 7a-2 will fail-close
+  there (a non-blocking registered-flag read that refuses to emit an
+  encrypted nonce before registration), giving complete coverage of
+  every write path. **Interim bounded-safety** until 7a-2: the §5.1
+  `local_epoch` bump already prevents concrete nonce *reuse* (every
+  nonce this load emits carries the freshly-bumped epoch — unique vs.
+  all prior loads, monotonic within), and the only scenario where the
+  registry ledger is load-bearing for nonce uniqueness — a cross-node
+  16-bit `node_id` collision — is caught by the `ErrNodeIDCollision`
+  startup membership pre-check. So the residual exploitable window
+  (catalog/direct-store write × node_id collision past the startup
+  guard × sub-second pre-registration window) is negligible, and 7a-2
+  closes it entirely.
 - **7b** — post-rotation re-registration (register against the new DEK
   on a `rotate-dek` apply, same barrier mechanism).
 - **7c** — ConfChange-time registration (leader pairs a
