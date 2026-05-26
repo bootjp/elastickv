@@ -138,7 +138,10 @@ func (e *DynamoDBEncoder) encodeTable(b *snapshotBuilder, root *os.Root, tableDi
 
 	genKey := append([]byte(DDBTableGenPrefix), encTable...)
 	genVal := []byte(strconv.FormatUint(ddbRestoreGeneration, 10))
-	return b.Add(genKey, genVal, 0)
+	if err := b.Add(genKey, genVal, 0); err != nil {
+		return err
+	}
+	return e.encodeItems(b, root, tableDir, tableName, schema)
 }
 
 // readSchema opens <table>/_schema.json within root (symlink-escape /
