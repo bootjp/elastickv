@@ -125,7 +125,10 @@ func (e *S3RecordEncoder) encodeBucket(b *snapshotBuilder, root *os.Root, bucket
 	}
 	var genRaw [8]byte
 	binary.BigEndian.PutUint64(genRaw[:], s3RestoreGeneration)
-	return b.Add(s3keys.BucketGenerationKey(pub.Name), genRaw[:], 0)
+	if err := b.Add(s3keys.BucketGenerationKey(pub.Name), genRaw[:], 0); err != nil {
+		return err
+	}
+	return e.encodeBucketObjects(b, root, bucketDir, pub.Name)
 }
 
 // readBucketMeta opens <bucket>/_bucket.json within root (symlink-escape /
