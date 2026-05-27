@@ -66,7 +66,15 @@ func TestEncryption_E2E_BootstrapCutoverPutReadback(t *testing.T) {
 	// Cutover (EnableStorageEnvelope apply effect): flips the gate.
 	applyE2ECutover(t, applier)
 	assertEnvelopeActive(t, cache, true)
-	// Phase 1: gate on + active DEK → encrypted at rest.
+	// Stage 7a-2 §4.1: with the envelope active, the DIRECT write path
+	// (PutAt) fails closed until this load's writer registration has
+	// committed. In production main.go's registration goroutine calls
+	// MarkRegistered once the barrier closes (or in the already-registered
+	// startup branch); here we drive the Applier directly, so mark the
+	// cache to simulate that registration step. Without it the Phase-1
+	// PutAt below would return ErrWriterNotRegistered.
+	cache.MarkRegistered(e2eStorageDEKID)
+	// Phase 1: gate on + active DEK + registered → encrypted at rest.
 	mustPut(t, ctx, st, "after", "plain-after", 120)
 
 	// Every version reads back as correct plaintext through the wired

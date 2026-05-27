@@ -1870,7 +1870,54 @@ func TestStateCache_NilSafe(t *testing.T) {
 	if c.StorageEnvelopeActive() {
 		t.Error("nil StateCache.StorageEnvelopeActive = true, want false")
 	}
+	if c.Registered() {
+		t.Error("nil StateCache.Registered = true, want false")
+	}
+	c.MarkRegistered(7)                         // must not panic
 	c.RefreshFromSidecar(&encryption.Sidecar{}) // must not panic
+}
+
+// TestStateCache_Registered exercises the Stage 7a-2 §4.1 direct-path
+// gate predicate: Registered() is true only when an active storage DEK
+// is present AND MarkRegistered has marked that exact id. A 7b-style
+// rotate-dek to a new active id automatically re-arms the gate.
+func TestStateCache_Registered(t *testing.T) {
+	t.Parallel()
+	c := encryption.NewStateCache()
+
+	// No active DEK → never registered, even after a stray MarkRegistered.
+	if c.Registered() {
+		t.Error("fresh cache Registered() = true, want false")
+	}
+	c.MarkRegistered(0) // no-op: zero id is the "no DEK" sentinel
+	if c.Registered() {
+		t.Error("after MarkRegistered(0) Registered() = true, want false")
+	}
+
+	// Activate DEK 7 but don't mark it → still false.
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion}
+	sc.Active.Storage = 7
+	c.RefreshFromSidecar(sc)
+	if c.Registered() {
+		t.Error("active DEK 7 unmarked Registered() = true, want false")
+	}
+
+	// Mark 7 → registered.
+	c.MarkRegistered(7)
+	if !c.Registered() {
+		t.Error("active DEK 7 marked Registered() = false, want true")
+	}
+
+	// Rotate active DEK to 8 (7b) → gate re-arms until 8 is marked.
+	sc.Active.Storage = 8
+	c.RefreshFromSidecar(sc)
+	if c.Registered() {
+		t.Error("after rotate to DEK 8 (8 unmarked) Registered() = true, want false")
+	}
+	c.MarkRegistered(8)
+	if !c.Registered() {
+		t.Error("active DEK 8 marked Registered() = false, want true")
+	}
 }
 
 // TestApplier_StorageAccessors_ConcurrentReads exercises the

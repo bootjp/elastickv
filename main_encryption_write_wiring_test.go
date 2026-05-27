@@ -60,8 +60,8 @@ func TestEncryptionWriteWiring_PebbleOptions_WiredWhenCipherSet(t *testing.T) {
 		cipher:       cipher,
 		nonceFactory: encryption.NewDeterministicNonceFactory(0xABCD, 0),
 	}
-	if opts := w.pebbleOptions(); len(opts) != 2 {
-		t.Errorf("wired pebbleOptions = %d opts, want 2 (WithEncryption + WithStorageEnvelopeGate)", len(opts))
+	if opts := w.pebbleOptions(); len(opts) != 3 {
+		t.Errorf("wired pebbleOptions = %d opts, want 3 (WithEncryption + WithStorageEnvelopeGate + WithStorageRegistrationGate)", len(opts))
 	}
 }
 
@@ -175,8 +175,10 @@ func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	if w.cipher == nil || w.nonceFactory == nil {
 		t.Fatal("cipher/nonceFactory must be wired when encryption is enabled with an active DEK")
 	}
-	if opts := w.pebbleOptions(); len(opts) != 2 {
-		t.Errorf("pebbleOptions = %d, want 2", len(opts))
+	// WithEncryption + WithStorageEnvelopeGate + WithStorageRegistrationGate
+	// (Stage 7a-2 added the third).
+	if opts := w.pebbleOptions(); len(opts) != 3 {
+		t.Errorf("pebbleOptions = %d, want 3", len(opts))
 	}
 	// Cache must reflect the on-disk active DEK + cutover gate.
 	if id, ok := w.cache.ActiveStorageKeyID(); !ok || id != 3 {

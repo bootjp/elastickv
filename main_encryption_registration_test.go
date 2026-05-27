@@ -10,6 +10,7 @@ import (
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -24,10 +25,16 @@ func TestRunWriterRegistration_VerifyCommittedClosesBarrier(t *testing.T) {
 	t.Parallel()
 	barrier := make(chan struct{})
 	verify := func() (bool, error) { return true, nil } // already committed
+	// A cache with the storage DEK active so Registered() is meaningful;
+	// releaseBarrier (via the verify path) must MarkRegistered it.
+	cache := encryption.NewStateCache()
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = testRegDEKID
+	cache.RefreshFromSidecar(sc)
 	done := make(chan struct{})
 	go func() {
-		runWriterRegistration(context.Background(), nil, nil, nil,
-			registrationRequest(7, 1, 3), barrier, verify)
+		runWriterRegistration(context.Background(), nil, nil, cache, testRegDEKID, nil,
+			registrationRequest(testRegDEKID, 1, 3), barrier, verify)
 		close(done)
 	}()
 	select {
@@ -36,6 +43,79 @@ func TestRunWriterRegistration_VerifyCommittedClosesBarrier(t *testing.T) {
 		t.Fatal("barrier not closed when registration already committed (verify path)")
 	}
 	<-done
+	// The verify-before-propose close site must seed the Stage 7a-2
+	// direct-path gate, not only the propose-success site (claude P1).
+	if !cache.Registered() {
+		t.Error("verify-committed path closed the barrier but did not MarkRegistered (Registered() = false)")
+	}
+}
+
+// TestRetryUntilRegistered covers the §2.3 empty-catalog + active-
+// envelope bootstrap edge that setupDistributionCatalog relies on: the
+// helper must retry while fn returns ErrWriterNotRegistered, then return
+// fn's result once it converges; return any non-gate error immediately;
+// and surface a context.Canceled-chained error on clean shutdown
+// (claude review on PR #847).
+func TestRetryUntilRegistered(t *testing.T) {
+	t.Parallel()
+
+	t.Run("converges after transient ErrWriterNotRegistered", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		err := retryUntilRegistered(context.Background(), "test", func() error {
+			calls++
+			if calls < 3 {
+				return errors.WithStack(store.ErrWriterNotRegistered)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("retryUntilRegistered: %v", err)
+		}
+		if calls != 3 {
+			t.Errorf("fn called %d times, want 3 (2 gate failures + 1 success)", calls)
+		}
+	})
+
+	t.Run("returns non-gate error immediately", func(t *testing.T) {
+		t.Parallel()
+		sentinel := errors.New("some other failure")
+		calls := 0
+		err := retryUntilRegistered(context.Background(), "test", func() error {
+			calls++
+			return sentinel
+		})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("got %v, want the sentinel error", err)
+		}
+		if calls != 1 {
+			t.Errorf("fn called %d times, want 1 (no retry on non-gate error)", calls)
+		}
+	})
+
+	t.Run("immediate success", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		err := retryUntilRegistered(context.Background(), "test", func() error {
+			calls++
+			return nil
+		})
+		if err != nil || calls != 1 {
+			t.Errorf("got err=%v calls=%d, want nil/1", err, calls)
+		}
+	})
+
+	t.Run("cancellation surfaces context.Canceled", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // already cancelled → first gate failure then ctx.Done()
+		err := retryUntilRegistered(ctx, "test", func() error {
+			return errors.WithStack(store.ErrWriterNotRegistered)
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want a context.Canceled-chained error", err)
+		}
+	})
 }
 
 func TestRegistrationEntry_RoundTrips(t *testing.T) {
@@ -144,14 +224,21 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 		name string
 		w    encryptionWriteWiring
 		seed func(t *testing.T, st store.MVCCStore)
+		// expectRegistered is the Stage 7a-2 direct-path gate state after
+		// the ungated branch returns. Only the already-registered restart
+		// seeds Registered() true (codex P1 on PR #843); the other ungated
+		// branches leave it false (and the gate condition is false there
+		// anyway, so encryptForKey never consults it).
+		expectRegistered bool
 	}{
 		{name: "encryption_off", w: encryptionWriteWiring{cache: encryption.NewStateCache()}}, // cipher nil
 		{name: "phase0_envelope_inactive", w: wiringFor(t, 7, false, 1)},
 		{name: "not_bootstrapped", w: wiringFor(t, 0, true, 1)},
 		{
-			name: "already_registered",
-			w:    wiringFor(t, 7, true, 3),
-			seed: func(t *testing.T, st store.MVCCStore) { writeRegistryRow(t, st, fullNodeID, 3) },
+			name:             "already_registered",
+			w:                wiringFor(t, 7, true, 3),
+			seed:             func(t *testing.T, st store.MVCCStore) { writeRegistryRow(t, st, fullNodeID, 3) },
+			expectRegistered: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -173,7 +260,44 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 			if gate == nil || gate.Barrier != nil {
 				t.Errorf("%s: expected ungated gate (nil Barrier), got %+v", tc.name, gate)
 			}
+			if got := tc.w.cache.Registered(); got != tc.expectRegistered {
+				t.Errorf("%s: Registered() = %v, want %v", tc.name, got, tc.expectRegistered)
+			}
 		})
+	}
+}
+
+// TestBuildProcessStartRegistrationGate_Phase0BootDoesNotMarkRegistered
+// documents the design §2.3 fail-closed posture: a node that boots in
+// Phase 0 (envelope inactive) skips registration without seeding
+// Registered(), so the per-DEK gate is NOT registered for the active
+// DEK. The Phase-0 boot itself emits no encrypted writes (envelope
+// inactive → cleartext, gate unconsulted); a runtime EnableStorageEnvelope
+// would then fail closed until the node (re)registers — the deferred
+// runtime-registration follow-on. This is the safe posture (no fail-OPEN
+// per §2.3), and benign today since the only direct write is the startup
+// catalog bootstrap Save (covered by retryUntilRegistered).
+func TestBuildProcessStartRegistrationGate_Phase0BootDoesNotMarkRegistered(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	w := wiringFor(t, testRegDEKID, false /*envelope inactive: Phase 0*/, 1)
+
+	eg, _ := errgroup.WithContext(context.Background())
+	gate, err := buildProcessStartRegistrationGate(
+		context.Background(), eg, &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, "n1")
+	if err != nil {
+		t.Fatalf("buildProcessStartRegistrationGate: %v", err)
+	}
+	if gate == nil || gate.Barrier != nil {
+		t.Fatalf("Phase 0 should be ungated (nil Barrier), got %+v", gate)
+	}
+	// Phase-0 boot did not seed Registered(): the node is not registered
+	// for the active DEK, so a later runtime cutover fail-closes the gate
+	// (deferred runtime-registration). The gate is correctly per-DEK and
+	// fail-closed rather than fail-OPEN (§2.3).
+	if w.cache.Registered() {
+		t.Error("Phase-0 boot unexpectedly marked Registered() — must not seed registration")
 	}
 }
 

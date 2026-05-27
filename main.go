@@ -427,7 +427,7 @@ func run() error {
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed (codex P1 on PR #839).
 	distCatalog, err := setupDistributionAndRegistration(
-		ctx, runCtx, eg, runtimes, cfg.engine,
+		runCtx, eg, runtimes, cfg.engine,
 		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
 	if err != nil {
 		cancel()
@@ -1696,7 +1696,24 @@ func setupDistributionCatalog(
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
 	}
-	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine); err != nil {
+	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
+	// path. When the §7.1 storage envelope is active and this load's
+	// writer registration has not yet committed, that Save fails closed
+	// with store.ErrWriterNotRegistered (Stage 7a-2). retryUntilRegistered
+	// retries the bootstrap until the registration goroutine — armed
+	// before this call in setupDistributionAndRegistration — commits and
+	// the gate clears. The common cases (populated catalog → no-op Save,
+	// or pre-cutover → cleartext Save) never hit the gate and return on
+	// the first attempt.
+	//
+	// Idempotency requirement: the retry re-invokes EnsureCatalogSnapshot
+	// from scratch on each ErrWriterNotRegistered, so it MUST be
+	// re-entrant — on the populated-catalog path it is a version-unchanged
+	// no-op Save (no mutation, no nonce), so re-running it is safe.
+	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
+		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
+		return errors.Wrap(e, "ensure catalog snapshot")
+	}); err != nil {
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
