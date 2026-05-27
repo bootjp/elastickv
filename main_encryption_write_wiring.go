@@ -34,13 +34,16 @@ func buildShardGroupsWithEncryptionWiring(
 	keystore *encryption.Keystore,
 	sidecarPath string,
 	encryptionEnabled bool,
-) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
+) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
 	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, encryptionWriteWiring{}, err
 	}
-	return buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
+	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring)
+	// Return the wiring (cache + bumped epoch) so run() can drive the
+	// Stage 7a process-start registration after the shard stores open.
+	return runtimes, shardGroups, encWiring, err
 }
 
 // encryptionWriteWiring bundles the Stage 6D-6c storage-envelope
@@ -62,6 +65,13 @@ type encryptionWriteWiring struct {
 	cache        *encryption.StateCache
 	cipher       *encryption.Cipher
 	nonceFactory store.NonceFactory
+	// epoch is the §4.1 local_epoch this process load pinned into the
+	// nonce factory (the value BumpLocalEpoch advanced to, or 0 in the
+	// pre-bootstrap case). Stage 7a's process-start registration
+	// proposes RegisterEncryptionWriter with this epoch so the writer
+	// registry's last_seen advances in lockstep with the nonces this
+	// load emits. Zero when encryption is off or pre-bootstrap.
+	epoch uint16
 }
 
 // withDefaultedCache returns a copy of w with a non-nil StateCache.
@@ -91,6 +101,15 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 	return []store.PebbleStoreOption{
 		store.WithEncryption(w.cipher, w.nonceFactory, w.cache.ActiveStorageKeyID),
 		store.WithStorageEnvelopeGate(w.cache.StorageEnvelopeActive),
+		// Stage 7a-2 §4.1 direct-path registration gate: the store
+		// refuses to emit an encrypted envelope on a self-originated
+		// write (catalog bootstrap Save) until this load's writer
+		// registration has committed for the active storage DEK. Reads
+		// Registered() (per-DEK, fail-closed) from the same shared cache
+		// the registration paths MarkRegistered. Design §2.3 forbids any
+		// fail-OPEN fallback, so unregistered loads are gated — see the
+		// Registered() doc for the deferred runtime-registration cases.
+		store.WithStorageRegistrationGate(w.cache.Registered),
 	}
 }
 
@@ -134,6 +153,7 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 		return w, err
 	}
 	w.cipher = cipher
+	w.epoch = epoch
 	w.nonceFactory = encryption.NewDeterministicNonceFactory(
 		encryption.NodeID16(etcdraftengine.DeriveNodeID(raftID)), epoch)
 	return w, nil

@@ -133,6 +133,20 @@ type StateCache struct {
 	//     §7.1 Phase 1; rotate-dek under the active envelope keeps
 	//     it true).
 	storageEnvelopeActive atomic.Bool
+	// registeredStorageDEKID is the §4.1 writer-registry DEK id this
+	// process has confirmed its own registration for (0 = none). It is
+	// NOT mirrored from the sidecar — it tracks a per-process-load
+	// fact (this load's writer registration committed) rather than
+	// durable cluster state. Stage 7a-2's direct-write gate consults
+	// it via Registered(): a self-originated encrypted write is
+	// refused until this load's registration is confirmed for the
+	// currently-active storage DEK. Set by MarkRegistered from 7a's
+	// registration paths (barrier-close and the already-registered
+	// startup branch). A single uint32 suffices because exactly one
+	// storage DEK is active at a time; 7b's rotate-dek re-points
+	// activeStorageDEKID and re-registers, which Registered()'s
+	// equality check handles without a reset.
+	registeredStorageDEKID atomic.Uint32
 }
 
 // NewStateCache returns a zero-initialised StateCache. The
@@ -185,6 +199,50 @@ func (c *StateCache) StorageEnvelopeActive() bool {
 		return false
 	}
 	return c.storageEnvelopeActive.Load()
+}
+
+// MarkRegistered records that this process load's §4.1 writer
+// registration has committed for storage DEK dekID. Stage 7a's
+// registration paths call it once their barrier closes (or in the
+// already-registered startup branch). Idempotent; a zero dekID is a
+// no-op so a not-bootstrapped caller cannot accidentally mark the
+// "no DEK" sentinel as registered.
+func (c *StateCache) MarkRegistered(dekID uint32) {
+	if c == nil || dekID == 0 {
+		return
+	}
+	c.registeredStorageDEKID.Store(dekID)
+}
+
+// Registered reports whether this process load has confirmed its §4.1
+// writer registration for the currently-active storage DEK. It is the
+// predicate Stage 7a-2's WithStorageRegistrationGate consults on the
+// direct write path: a self-originated encrypted write is refused
+// (ErrWriterNotRegistered) until Registered() is true.
+//
+// It is deliberately per-DEK and fail-closed (design §2.3 forbids any
+// fail-OPEN fallback): a node that has not registered for the active DEK
+// — including a freshly rotated DEK it has not yet re-registered under
+// (7b) — is gated. The runtime cases where a node legitimately needs to
+// (re)register before its first encrypted direct write (Phase-0 boot then
+// runtime EnableStorageEnvelope; non-proposer node after a runtime
+// RotateDEK) are the deferred runtime-registration follow-on; until it
+// lands they fail closed, which is the safe posture. No real runtime
+// direct-write caller exists today — the only direct ApplyMutations path
+// is the startup catalog bootstrap Save, which is covered by
+// retryUntilRegistered + the already-registered MarkRegistered seed.
+//
+// Lock-free: two atomic loads. Returns false when there is no active
+// storage DEK (id == 0) so a pre-bootstrap process never claims to be
+// registered; once a DEK is active, returns true only when this load
+// has marked that exact id (so 7b's rotate-dek to a new id re-arms
+// the gate until the post-rotation registration marks the new id).
+func (c *StateCache) Registered() bool {
+	if c == nil {
+		return false
+	}
+	id := c.activeStorageDEKID.Load()
+	return id != 0 && c.registeredStorageDEKID.Load() == id
 }
 
 // KEKUnwrapper is the abstraction the Applier uses to recover

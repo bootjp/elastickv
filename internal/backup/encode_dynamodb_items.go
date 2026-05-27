@@ -135,7 +135,19 @@ func (e *DynamoDBEncoder) encodeOneItem(b *snapshotBuilder, root *os.Root, rel, 
 	if err != nil {
 		return err
 	}
-	return b.Add(key, val, 0)
+	if err := b.Add(key, val, 0); err != nil {
+		return err
+	}
+	rows, err := ddbGSIRows(tableName, ddbRestoreGeneration, schema, item, key)
+	if err != nil {
+		return errors.Wrapf(err, "%s", rel)
+	}
+	for _, row := range rows {
+		if err := b.Add(row.key, row.value, 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // readRootSubdirEntries lists a subdirectory THROUGH the pinned root fd
@@ -186,31 +198,44 @@ func isJSONFilename(name string) bool {
 // ddbItemKeyBytes builds the ordered !ddb|item| key for an item against
 // the table schema's primary-key attribute names.
 func ddbItemKeyBytes(tableName string, generation uint64, schema *pb.DynamoTableSchema, item *pb.DynamoItem) ([]byte, error) {
-	attrs := item.GetAttributes()
-	hashName := schema.GetPrimaryKey().GetHashKey()
-	hashAV, ok := attrs[hashName]
-	if !ok {
-		return nil, errors.Wrapf(ErrDDBEncodeInvalidItem, "item missing hash-key attribute %q", hashName)
-	}
-	hashRaw, err := ddbPrimaryKeyBytes(hashAV)
+	hashSeg, rangeSeg, err := ddbOrderedPrimaryKeySegments(schema, item)
 	if err != nil {
 		return nil, err
 	}
 	key := ddbItemKeyPrefix(tableName, generation)
-	key = append(key, encodeDDBOrderedKeySegment(hashRaw)...)
+	key = append(key, hashSeg...)
+	return append(key, rangeSeg...), nil
+}
+
+// ddbOrderedPrimaryKeySegments extracts the ordered hash and (optional)
+// range key segments from an item's attributes per the schema's primary
+// key. Shared by the item key and the derived GSI rows (which embed the
+// same primary-key segments). A missing primary-key attribute fails closed.
+func ddbOrderedPrimaryKeySegments(schema *pb.DynamoTableSchema, item *pb.DynamoItem) ([]byte, []byte, error) {
+	attrs := item.GetAttributes()
+	hashName := schema.GetPrimaryKey().GetHashKey()
+	hashAV, ok := attrs[hashName]
+	if !ok {
+		return nil, nil, errors.Wrapf(ErrDDBEncodeInvalidItem, "item missing hash-key attribute %q", hashName)
+	}
+	hashRaw, err := ddbPrimaryKeyBytes(hashAV)
+	if err != nil {
+		return nil, nil, err
+	}
+	hashSeg := encodeDDBOrderedKeySegment(hashRaw)
 	rangeName := schema.GetPrimaryKey().GetRangeKey()
 	if rangeName == "" {
-		return key, nil
+		return hashSeg, nil, nil
 	}
 	rangeAV, ok := attrs[rangeName]
 	if !ok {
-		return nil, errors.Wrapf(ErrDDBEncodeInvalidItem, "item missing range-key attribute %q", rangeName)
+		return nil, nil, errors.Wrapf(ErrDDBEncodeInvalidItem, "item missing range-key attribute %q", rangeName)
 	}
 	rangeRaw, err := ddbPrimaryKeyBytes(rangeAV)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return append(key, encodeDDBOrderedKeySegment(rangeRaw)...), nil
+	return hashSeg, encodeDDBOrderedKeySegment(rangeRaw), nil
 }
 
 // ddbItemKeyPrefix reproduces dynamoItemPrefixForTable:

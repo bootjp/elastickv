@@ -350,7 +350,7 @@ func run() error {
 	// a storage DEK is already active on disk (restart path); on a
 	// pre-bootstrap binary the per-Put gate stays cleartext until a
 	// runtime Bootstrap + EnableStorageEnvelope flips it.
-	runtimes, shardGroups, err := buildShardGroupsWithEncryptionWiring(
+	runtimes, shardGroups, encWiring, err := buildShardGroupsWithEncryptionWiring(
 		*raftId,
 		*raftDir,
 		cfg.groups,
@@ -420,8 +420,17 @@ func run() error {
 		ctx, runtimes, cfg.sqsFifoPartitionMap,
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
-	distCatalog, err := setupDistributionCatalog(ctx, runtimes, cfg.engine)
+	eg, runCtx := errgroup.WithContext(ctx)
+	// setupDistributionCatalog + the Stage 7a process-start registration
+	// gate are bundled so run() has a single startup-fault path: a
+	// registry-read / behind-epoch failure fails the process
+	// synchronously here, BEFORE the gRPC servers serve, so writes never
+	// run with no registration gate installed (codex P1 on PR #839).
+	distCatalog, err := setupDistributionAndRegistration(
+		runCtx, eg, runtimes, cfg.engine,
+		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
 	if err != nil {
+		cancel()
 		return err
 	}
 	// Seed AFTER setupDistributionCatalog so the sampler picks up the
@@ -431,7 +440,7 @@ func run() error {
 	// the placeholder zero IDs from buildEngine and Observe would miss
 	// every dispatched mutation.
 	seedKeyVizRoutes(sampler, cfg.engine)
-	eg, runCtx := errgroup.WithContext(ctx)
+
 	eg.Go(func() error {
 		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
 	})
@@ -1687,7 +1696,24 @@ func setupDistributionCatalog(
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
 	}
-	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine); err != nil {
+	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
+	// path. When the §7.1 storage envelope is active and this load's
+	// writer registration has not yet committed, that Save fails closed
+	// with store.ErrWriterNotRegistered (Stage 7a-2). retryUntilRegistered
+	// retries the bootstrap until the registration goroutine — armed
+	// before this call in setupDistributionAndRegistration — commits and
+	// the gate clears. The common cases (populated catalog → no-op Save,
+	// or pre-cutover → cleartext Save) never hit the gate and return on
+	// the first attempt.
+	//
+	// Idempotency requirement: the retry re-invokes EnsureCatalogSnapshot
+	// from scratch on each ErrWriterNotRegistered, so it MUST be
+	// re-entrant — on the populated-catalog path it is a version-unchanged
+	// no-op Save (no mutation, no nonce), so re-running it is safe.
+	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
+		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
+		return errors.Wrap(e, "ensure catalog snapshot")
+	}); err != nil {
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil

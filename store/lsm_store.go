@@ -214,6 +214,17 @@ type pebbleStore struct {
 	// fixtures depend on that posture and the 6D-6 production wiring
 	// in main.go is what flips the gate on.
 	storageEnvelopeActive StorageEnvelopeActive
+	// storageRegistered is the Stage 7a-2 §4.1 registration gate. When
+	// wired, the DIRECT write path (PutAt / ExpireAt / ApplyMutations)
+	// refuses to emit an encrypted envelope — returning
+	// ErrWriterNotRegistered — until this process load's writer
+	// registration has committed for the active storage DEK. The
+	// FSM-apply path (ApplyMutationsRaft) never consults it: replicated
+	// apply must stay deterministic and may legitimately run before this
+	// node's own registration entry commits (design §1). A nil closure
+	// preserves the pre-7a-2 posture (no direct-path gating); the
+	// production main.go wiring threads cache.Registered in.
+	storageRegistered StorageRegistered
 }
 
 // Ensure pebbleStore implements MVCCStore and RetentionController.
@@ -1028,7 +1039,8 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	body, encState, err := s.encryptForKey(k, value, expireAt)
+	// gateRegistration=true: PutAt is a direct (non-raft) write path.
+	body, encState, err := s.encryptForKey(k, value, expireAt, true)
 	if err != nil {
 		return err
 	}
@@ -1073,7 +1085,9 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 	commitTS = s.alignCommitTS(commitTS)
 	k := encodeKey(key, commitTS)
-	body, encState, err := s.encryptForKey(k, val, expireAt)
+	// gateRegistration=true: ExpireAt is a direct (non-raft) write path
+	// that calls encryptForKey directly (it does not delegate to PutAt).
+	body, encState, err := s.encryptForKey(k, val, expireAt, true)
 	if err != nil {
 		return err
 	}
@@ -1164,7 +1178,7 @@ func (s *pebbleStore) WriteConflictCount() uint64 {
 	return s.writeConflicts.total()
 }
 
-func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64) error {
+func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64, gateRegistration bool) error {
 	for _, mut := range mutations {
 		k := encodeKey(mut.Key, commitTS)
 		var v []byte
@@ -1174,7 +1188,7 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 			if err := validateValueSize(mut.Value); err != nil {
 				return err
 			}
-			body, encState, encErr := s.encryptForKey(k, mut.Value, mut.ExpireAt)
+			body, encState, encErr := s.encryptForKey(k, mut.Value, mut.ExpireAt, gateRegistration)
 			if encErr != nil {
 				return encErr
 			}
@@ -1213,7 +1227,11 @@ func (s *pebbleStore) raftApplyWriteOpts() *pebble.WriteOptions {
 // backstop (catalog bootstrap, admin snapshots, migrations, tests) are never
 // affected by ELASTICKV_FSM_SYNC_MODE=nosync.
 func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts())
+	// gateRegistration=true: the direct path is self-originated (catalog
+	// bootstrap Save, admin snapshot, migration). Stage 7a-2 refuses to
+	// emit an encrypted envelope here before this load's writer
+	// registration commits.
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true)
 }
 
 // ApplyMutationsRaft is the raft-apply commit path. Durability is governed
@@ -1227,10 +1245,15 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 // must use ApplyMutations so a nosync opt-in cannot silently drop
 // acknowledged writes that have no raft backstop.
 func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts())
+	// gateRegistration=false: the FSM-apply path replays committed Raft
+	// entries and must stay deterministic. It may legitimately encrypt
+	// before this node's own registration entry commits (design §1);
+	// fail-closing here would halt the apply loop and could deadlock a
+	// node whose storage entry is ordered before its registration entry.
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false)
 }
 
-func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions) error {
+func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1249,7 +1272,7 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return err
 	}
 
-	if err := s.applyMutationsBatch(b, mutations, commitTS); err != nil {
+	if err := s.applyMutationsBatch(b, mutations, commitTS, gateRegistration); err != nil {
 		return err
 	}
 

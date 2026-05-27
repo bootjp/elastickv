@@ -32,7 +32,12 @@ func TestComputeSubLayout(t *testing.T) {
 		checkStartEndSet bool
 	}{
 		{name: "k=1 single bucket", start: []byte("a"), end: []byte("z"), k: 1, wantEffK: 1},
-		{name: "unbounded end single bucket", start: []byte("a"), end: nil, k: 8, wantEffK: 1},
+		{
+			// Unbounded high end now sub-divides over [subStart, MaxUint64]
+			// (§3.2 revised) rather than collapsing to one bucket.
+			name: "unbounded end subdivides", start: []byte("a"), end: nil, k: 8,
+			wantEffK: 8, wantSpanNonZero: true,
+		},
 		{
 			name: "normal range subdivides", start: []byte("a"), end: []byte("b"), k: 4,
 			wantEffK: 4, wantSpanNonZero: true, wantPrefixLen: 0, checkStartEndSet: true,
@@ -54,6 +59,21 @@ func TestComputeSubLayout(t *testing.T) {
 			k: 16, wantEffK: 1, wantPrefixLen: 3,
 		},
 		{name: "nil start treated as zero", start: nil, end: []byte{0x10}, k: 4, wantEffK: 4, wantSpanNonZero: true},
+		{
+			// Unbounded end whose start's leading 8 bytes are all 0xFF:
+			// subStart == MaxUint64, nothing left above it to divide, so
+			// the subStart == MaxUint64 guard collapses to one bucket.
+			name:  "all-0xFF start unbounded end single bucket",
+			start: bytes.Repeat([]byte{0xFF}, 8), end: nil, k: 8, wantEffK: 1,
+		},
+		{
+			// Unbounded high start: window 0xFF..FD leaves a span of 2 (<k),
+			// so effK caps to the span (effKForSpan / Codex P2), keeping
+			// reconstructed boundaries valid.
+			name:  "unbounded high start caps effK to span",
+			start: []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD}, end: nil, k: 8,
+			wantEffK: 2, wantSpanNonZero: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,13 +118,140 @@ func TestSubBucketIndexSingleBucketAlwaysZero(t *testing.T) {
 	t.Parallel()
 	for _, slot := range []*routeSlot{
 		layoutSlot([]byte("a"), []byte("z"), 1),   // K=1
-		layoutSlot([]byte("a"), nil, 8),           // unbounded tail
-		layoutSlot([]byte{0x00}, []byte{0x00}, 8), // degenerate
+		layoutSlot([]byte{0x00}, []byte{0x00}, 8), // degenerate (empty range)
 	} {
 		require.Len(t, slot.subBuckets, 1)
 		for _, key := range [][]byte{nil, {0x00}, {0x80}, {0xFF, 0xFF}} {
 			require.Equal(t, 0, slot.subBucketIndex(key))
 		}
+	}
+}
+
+// TestSubBucketIndexUnboundedEnd pins the §3.2 revision: an open high
+// end ([start, nil)) — the single-route cluster and every cluster's
+// tail route — now sub-divides over [subStart, MaxUint64] instead of
+// collapsing to one bucket. The upper-edge clamp is skipped (subHi nil
+// sentinel), so distinct leading bytes land in distinct buckets.
+func TestSubBucketIndexUnboundedEnd(t *testing.T) {
+	t.Parallel()
+	// The single-route cluster the user hit: route owns the whole space.
+	slot := layoutSlot(nil, nil, 4)
+	require.Len(t, slot.subBuckets, 4, "[nil,nil) must sub-divide, not collapse to 1")
+	require.Nil(t, slot.subHi, "unbounded end => subHi nil sentinel")
+
+	// Leading byte spreads keys across the [0, MaxUint64] window:
+	// 0x00.. -> low bucket, 0xFF.. -> top bucket, and order preserved.
+	require.Equal(t, 0, slot.subBucketIndex([]byte{0x00}))
+	require.Equal(t, 3, slot.subBucketIndex([]byte{0xFF}))
+	// 0x40/0x80/0xC0 fall in quarters of [0, MaxUint64] -> buckets 1/2/3,
+	// strictly increasing (Less, not LessOrEqual, so a collapse regresses).
+	i40 := slot.subBucketIndex([]byte{0x40})
+	i80 := slot.subBucketIndex([]byte{0x80})
+	iC0 := slot.subBucketIndex([]byte{0xC0})
+	require.Less(t, i40, i80)
+	require.Less(t, i80, iC0)
+
+	// A bounded-low / unbounded-high tail route ([0x80, nil)).
+	tail := layoutSlot([]byte{0x80}, nil, 4)
+	require.Len(t, tail.subBuckets, 4)
+	require.Equal(t, 0, tail.subBucketIndex([]byte{0x00}), "key below tail Start pins to bucket 0")
+	require.Equal(t, 3, tail.subBucketIndex([]byte{0xFF}))
+}
+
+// TestSamplerUnboundedRouteEmitsSubRanges is the end-to-end fix for the
+// deployed single-route cluster: with K>1, an unbounded [nil,nil) route
+// now produces multiple sub-range rows (previously exactly one). The
+// last sub-bucket keeps the unbounded End (nil).
+func TestSamplerUnboundedRouteEmitsSubRanges(t *testing.T) {
+	t.Parallel()
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, KeyBucketsPerRoute: 4})
+	require.True(t, s.RegisterRoute(1, nil, nil, 0)) // whole keyspace, unbounded both ends
+	for _, key := range [][]byte{{0x10}, {0x50}, {0x90}, {0xD0}} {
+		s.Observe(1, key, OpWrite, 0)
+	}
+	s.Flush()
+	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
+	require.Greater(t, len(rows), 1, "unbounded route must emit >1 sub-range row")
+	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].Start, rows[j].Start) < 0 })
+	require.Nil(t, rows[len(rows)-1].End, "last sub-bucket keeps the unbounded End (nil)")
+	for _, r := range rows {
+		require.Equal(t, 4, r.SubBucketCount)
+	}
+}
+
+// TestSamplerUnboundedHighStartValidBounds pins Codex P2: a high start
+// whose window is near MaxUint64 AND carries a suffix byte past the
+// window must never emit a sub-row with Start > End. Capping effK at the
+// span (effKForSpan) keeps reconstructed boundaries strictly above the
+// route start. Without the cap, bucket 0 would emit Start > End here.
+func TestSamplerUnboundedHighStartValidBounds(t *testing.T) {
+	t.Parallel()
+	s := NewMemSampler(MemSamplerOptions{Step: time.Second, HistoryColumns: 4, KeyBucketsPerRoute: 4})
+	start := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD, 0xFF} // window 0xFF..FD + suffix
+	require.True(t, s.RegisterRoute(1, start, nil, 0))
+	for _, key := range [][]byte{start, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE}} {
+		s.Observe(1, key, OpWrite, 0)
+	}
+	s.Flush()
+	rows := s.Snapshot(time.Time{}, time.Time{})[0].Rows
+	require.NotEmpty(t, rows)
+	for _, r := range rows {
+		if r.End != nil { // the last sub-bucket keeps the unbounded End (nil)
+			require.Less(t, bytes.Compare(r.Start, r.End), 0,
+				"sub-row must have Start < End (no invalid/overlapping bounds): %x..%x", r.Start, r.End)
+		}
+	}
+}
+
+// TestSubBucketBoundsContainCountedKey pins Codex P2 (boundary/bucket
+// consistency): the emitted [Start, End) of the bucket subBucketIndex
+// assigns a key to must actually CONTAIN that key — including keys that
+// land exactly on an interior boundary value. ceil-based boundaryAt
+// guarantees this; floor-based would mis-shelve boundary-value keys.
+func TestSubBucketBoundsContainCountedKey(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		start, end []byte
+		k          int
+	}{
+		{"unbounded whole space", nil, nil, 4},
+		{"unbounded k not dividing span", nil, nil, 7},
+		{"bounded divisible span", []byte{0x00}, []byte{0x40}, 4},
+		// 2^62 / 7 is not integer, so ceil != floor for these boundaries —
+		// deterministic coverage of the ceil reconstruction for bounded.
+		{"bounded k not dividing span", []byte{0x00}, []byte{0x40}, 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			slot := layoutSlot(tc.start, tc.end, tc.k)
+			// Sweep keys, plus the exact reconstructed interior boundaries
+			// (the values most likely to expose a floor/ceil mismatch).
+			keys := [][]byte{{0x00}, {0x01}, {0x3F}, {0x40}, {0x7F}, {0x80}, {0xC0}, {0xFE}, {0xFF}}
+			for i := 1; i < len(slot.subBuckets); i++ {
+				keys = append(keys, slot.boundaryAt(i, cloneBytes(tc.start)))
+			}
+			for _, key := range keys {
+				// Only in-range keys (start <= key < end) are ever Observed
+				// against this route; the out-of-range clamp (key >= End ->
+				// last bucket) intentionally does not place such keys inside
+				// a half-open range.
+				if bytes.Compare(key, tc.start) < 0 {
+					continue
+				}
+				if tc.end != nil && bytes.Compare(key, tc.end) >= 0 {
+					continue
+				}
+				idx := slot.subBucketIndex(key)
+				lo, hi := slot.subBucketBounds(idx, cloneBytes(tc.start), cloneBytes(tc.end))
+				require.LessOrEqual(t, bytes.Compare(lo, key), 0,
+					"%s: key %x counted in bucket %d but Start %x is above it", tc.name, key, idx, lo)
+				if hi != nil {
+					require.Less(t, bytes.Compare(key, hi), 0,
+						"%s: key %x counted in bucket %d but End %x excludes it", tc.name, key, idx, hi)
+				}
+			}
+		})
 	}
 }
 
