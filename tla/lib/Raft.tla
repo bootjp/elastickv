@@ -1,7 +1,7 @@
 -------------------------------- MODULE Raft ---------------------------------
 (***************************************************************************)
 (* Abstract Raft interface for the elastickv TLA+ suite.                   *)
-(* Per docs/design/2026_05_28_proposed_tla_safety_spec.md §3 / §6.1, Raft   *)
+(* Per docs/design/2026_05_28_partial_tla_safety_spec.md §3 / §6.1, Raft   *)
 (* is modelled as a black box that delivers the standard log-matching +    *)
 (* leader-completeness guarantees.  This module exposes the **interface**  *)
 (* (leader / term / BecomeLeader / Apply / InstallSnapshot) — the internal *)

@@ -110,8 +110,10 @@ Invariants asserted:
 | Invariant | Statement |
 |---|---|
 | `TypeOK` | Variable types are well-formed |
-| `HLC1_PerNodeMonotonic` | Per-node committed ts are totally ordered |
-| `HLC2_CeilingMonotonic` | Ceiling never decreases (built into ApplyCeiling) |
+| `HLC1_PerNodeMonotonic` | Per-node committed ts are strictly ordered by issuance `seq` |
+| `HLC1_Action` (PROPERTY) | Transition form: `hlcLast[n]` weakly increases on every step |
+| `HLC2_NonNeg` | Residual `physicalCeiling \in Nat` content; harmless type sanity |
+| `HLC2_Action` (PROPERTY) | Transition form: `physicalCeiling[n]` weakly increases on every step |
 | `HLC3_LeaderOnly` | Every committed ts was issued by the leader of its term |
 | `HLC4_NoRegressionAcrossTerms` | Earlier-term commits are strictly less than later-term commits |
 

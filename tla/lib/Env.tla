@@ -1,7 +1,7 @@
 -------------------------------- MODULE Env ----------------------------------
 (***************************************************************************)
 (* Shared environment constants used by every module in the elastickv      *)
-(* TLA+ suite. Per docs/design/2026_05_28_proposed_tla_safety_spec.md      *)
+(* TLA+ suite. Per docs/design/2026_05_28_partial_tla_safety_spec.md       *)
 (* §6.1.                                                                    *)
 (*                                                                         *)
 (* The single normative ASSUME below encodes HLC-4 precondition (i) — the  *)

@@ -1,7 +1,7 @@
 --------------------------------- MODULE HLC ---------------------------------
 (***************************************************************************)
 (* TLA+ specification of the elastickv Hybrid Logical Clock.               *)
-(* Per docs/design/2026_05_28_proposed_tla_safety_spec.md §5.1.            *)
+(* Per docs/design/2026_05_28_partial_tla_safety_spec.md §5.1.             *)
 (*                                                                         *)
 (* This module encodes the HLC layer that sits on top of an abstract Raft *)
 (* (lib/Raft.tla).  All three HLC-4 preconditions are first-class:         *)

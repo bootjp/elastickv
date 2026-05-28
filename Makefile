@@ -14,7 +14,7 @@ gen:
 	@$(MAKE)  -C proto gen
 
 # === TLA+ model-check support (M1 deliverable) ===
-# Per docs/design/2026_05_28_proposed_tla_safety_spec.md §7.2.
+# Per docs/design/2026_05_28_partial_tla_safety_spec.md §7.2.
 # Downloads a checksum-pinned tla2tools.jar on first use, then runs TLC on
 # both MCHLC.cfg (correct design — expected PASS) and MCHLC_gap.cfg
 # (preconditions disabled — expected FAIL on HLC-4 with a counterexample
