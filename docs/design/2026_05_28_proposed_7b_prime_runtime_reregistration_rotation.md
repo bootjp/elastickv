@@ -224,19 +224,15 @@ deferred case and logs-once-then-skips. After 7b':
   observes a fresh rotation (active DEK changes again while the load is
   running), it re-proposes for the new DEK.
 
-**Check ordering (load-bearing).** `runtimeRegistrationInScope`
-MUST short-circuit in this order (claude review on PR #855):
-1. **Already-registered short-circuit:** `cache.Registered(activeDEK)
-   → true` → return `_, false` (no-op).
+**Check ordering.** `runtimeRegistrationInScope` short-circuits
+in this order (matching the existing 7b implementation):
+1. **Already-registered short-circuit:** `cache.Registered() →
+   true` → return `_, false` (no-op). The `StateCache.Registered()`
+   API takes no argument; it internally tests
+   `activeStorageDEKID == registeredStorageDEKID`, so it is
+   automatically scoped to the currently-active DEK.
 2. **Scope conditions:** evaluate the in-scope branches below.
 3. **Propose** (from `runtimeRegistrationTick`, not this function).
-
-If the `lastRegisteredDEK != activeDEK` test were checked before
-`cache.Registered()`, a `B → C → B` oscillation would trigger a
-spurious re-propose for `B` after the rotation back from `C`
-(`lastRegisteredDEK == C ≠ B`, but `cache.Registered(B) == true`).
-This is safe via §4.1 case-2 idempotent but wasteful; ordering
-(1) eliminates it.
 
 The scope-check then reads, in order:
 - In scope: `bootDEKID == 0` (pre-bootstrap), OR `activeDEK ==
@@ -254,16 +250,36 @@ down (`bootDEKID == A`, `activeDEK == B`), the first tick observes
 intended behaviour. The §4.1 case-2 idempotent acceptance covers a
 race where a prior load of the same node already registered the row.
 
-#### 3.2.2 Stale-cache transient
+#### 3.2.2 Oscillation re-proposes via the single-DEK StateCache
 
-If the in-memory `StateCache`'s `Registered` set hasn't yet
-reflected a prior registration when a rotation oscillates (`B → C
-→ B` before the cache catches up to `B`'s registration), the
-watcher observes `lastRegisteredDEK == C ≠ B` and
-`cache.Registered(B) == false` → spurious re-propose for `B`.
-This is safe via §4.1 case-2 idempotent acceptance and self-heals
-on the next tick once the cache refreshes; it is documented here
-so the implementation PR's tests do not flag it as a bug.
+`StateCache.registeredStorageDEKID` is a **single `atomic.Uint32`**
+([`internal/encryption/applier.go:149`](../../internal/encryption/applier.go)),
+not a per-DEK set. `MarkRegistered(B)` then `MarkRegistered(C)`
+overwrites — the cache holds `C`. `Registered()` returns
+`activeStorageDEKID == registeredStorageDEKID`. So in a `B → C →
+B` oscillation:
+
+- After registering B then C, the cache holds `registeredStorageDEKID
+  = C`.
+- Rotation back to B flips `activeStorageDEKID = B` (via sidecar
+  refresh). `Registered()` checks `B == C` → false.
+- Watcher's check ordering reaches step (2). Scope check:
+  `lastRegisteredDEK == C ≠ B` → in scope.
+- Watcher proposes `(B, node, w.epoch)`. The writer registry
+  already has this row from the original B registration; §4.1
+  case-2 idempotent acceptance lands a no-op apply. The
+  success callback runs `MarkRegistered(B)`, flipping the cache
+  back to B-registered.
+
+**This is the steady-state behavior**, not a transient — any
+oscillation back to a previously-registered DEK re-proposes, and
+the §4.1 case-2 idempotent path makes the re-propose a no-op
+apply (safe; one Raft round-trip per oscillation). Extending
+`StateCache` to a per-DEK registered set would short-circuit the
+re-propose but is **out of scope** for 7b' (codex P2 round-3 on
+PR #855 — "pushes the implementation toward an unplanned per-DEK
+registered set"); if oscillation overhead becomes measurable a
+separate slice can introduce a per-DEK cache.
 
 ### 3.3 Apply-side ordering invariant
 
@@ -379,7 +395,7 @@ node's sidecar now records its own emissions accurately.
      is NOT called.
    - `TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp`:
      after a first-tick MarkRegistered, a second tick at the same
-     `activeDEK` is a no-op. Asserts `cache.Registered(Y)` short-
+     `activeDEK` is a no-op. Asserts `cache.Registered()` short-
      circuits `runtimeRegistrationInScope` and `lastRegisteredDEK`
      is NOT updated (claude review nit on PR #855 — confirm it
      stays at the original value, not reset to 0 or rewritten).
@@ -387,11 +403,16 @@ node's sidecar now records its own emissions accurately.
      after registering for DEK Y, a subsequent rotation to DEK Z
      (`activeDEK == Z`, `lastRegisteredDEK == Y`) triggers a fresh
      propose. Pins that `lastRegisteredDEK` updates to Z.
-   - `TestRuntimeRegistrationTick_RotationOscillationBtoCtoB`:
-     after registering for B then C, rotation back to B with
-     `cache.Registered(B) == true` short-circuits at check
-     ordering step (1) — no spurious re-propose. Pins the
-     §3.2 check-ordering invariant.
+   - `TestRuntimeRegistrationTick_RotationOscillationBtoCtoBReProposes`:
+     after registering for B then C, rotation back to B does NOT
+     short-circuit (the single-DEK `StateCache` holds C, so
+     `cache.Registered() == false` for active B; §3.2.2). Asserts
+     the tick re-proposes `(B, node, w.epoch)`; the §4.1 case-2
+     idempotent apply lands as a no-op, and the success callback
+     runs `MarkRegistered(B)` flipping the cache back to
+     B-registered. Pins the documented oscillation behavior so
+     the implementation PR's tests do not mistake the
+     re-propose for a bug.
 
 3. Replace `TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips`
    (which pins the 7b deferral) with
@@ -485,9 +506,10 @@ mechanism). The boot sequence under the 7b binary:
    process-start registration path runs and proposes
    `(newDEK, node, prior.w.epoch + 1)`. §4.1 case-2 monotonic
    acceptance lands the row.
-3. The 7b watcher's first tick observes `cache.Registered(newDEK)
-   == true` (the 7a startup path just MarkRegistered) and
-   returns a no-op for the rest of the load.
+3. The 7b watcher's first tick observes `cache.Registered() ==
+   true` (the 7a startup path just `MarkRegistered(newDEK)`,
+   and the cache's `activeStorageDEKID == registeredStorageDEKID
+   == newDEK`) and returns a no-op for the rest of the load.
 
 The 7b binary's deferred-rotation log-once-skip branch **does NOT
 fire** on this rollback — that branch only activates when
