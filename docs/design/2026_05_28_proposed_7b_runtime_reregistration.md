@@ -359,16 +359,52 @@ already confirmed).
    `lastLoggedSkipDEK`) and does NOT propose. This makes the rotation
    deferral explicit at the code level.
 
-5. **`verifyRegistered` callback (claude P2 round-2).** The watcher's
-   call to `runWriterRegistration` passes a `verifyRegistered` callback
-   that reads the local Pebble writer-registry store
-   (`store.WriterRegistryFor(...).GetRegistryRow(RegistryKey(activeDEK,
-   NodeID16(fullNodeID)))`) and returns true when an existing row's
-   `LastSeenLocalEpoch >= w.epoch`. This matches 7a's process-start
-   pattern and handles the crash-between-propose-and-MarkRegistered
-   case: a prior watcher attempt that committed a registration but
-   crashed before `MarkRegistered` will be picked up by `verifyRegistered`
-   on the next propose, short-circuiting before re-proposing.
+5. **`verifyRegistered` callback (claude P2 round-2, tightened per
+   codex P1 round-3 on PR #848).** The watcher's call to
+   `runWriterRegistration` passes a `verifyRegistered` callback that
+   reads the local Pebble writer-registry store via
+   `store.WriterRegistryFor(...).GetRegistryRow(RegistryKey(activeDEK,
+   NodeID16(fullNodeID)))` and returns true **only when an existing
+   row is present AND its `LastSeenLocalEpoch >= w.epoch`**. The
+   callback MUST be explicit about the row-existence check:
+
+   ```go
+   verifyRegistered := func() (bool, error) {
+       raw, ok, err := reg.GetRegistryRow(RegistryKey(activeDEK, NodeID16(fullNodeID)))
+       if err != nil {
+           return false, err
+       }
+       if !ok {
+           return false, nil // no row → not registered, MUST propose
+       }
+       val, err := encryption.DecodeRegistryValue(raw)
+       if err != nil {
+           return false, err
+       }
+       return val.LastSeenLocalEpoch >= w.epoch, nil
+   }
+   ```
+
+   The `ok=true` gate is load-bearing for the pre-bootstrap branch
+   (`w.epoch == 0`): if the callback returned `(true, nil)` on the
+   zero-value `LastSeenLocalEpoch == 0` of a missing row, the
+   verify-before-propose short-circuit inside `runWriterRegistration`
+   would call `MarkRegistered(activeDEK)` and open the storage gate
+   without ever proposing a durable registry row — encrypted writes
+   would proceed with no on-disk evidence that this node ever
+   registered, and the next post-cutover restart would hit the §9.1
+   missing-row-post-cutover guard.
+
+   Do NOT reuse the existing `registryLastSeen(reg, dekID, fullNodeID)
+   uint16` helper from `main_encryption_registration.go` directly: it
+   swallows `ok=false` by returning 0, which is precisely the trap
+   above. 7a's process-start propose path is incidentally safe
+   because `buildProcessStartRegistrationGate` never reaches the
+   propose branch with `w.epoch == 0` (the not-bootstrapped guard
+   short-circuits first); the 7b watcher does, so it MUST gate
+   explicitly. The implementation may either inline the body above or
+   introduce a new `registryLastSeenWithExistence` helper used by both
+   callers.
 
 6. Add unit tests for the pre-bootstrap branch
    (`bootDEKID == 0`), split per claude P2 round-3 to cover both
