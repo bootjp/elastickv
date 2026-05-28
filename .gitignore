@@ -39,6 +39,11 @@ jepsen/.ssh/
 .golangci-cache/
 server
 
+# TLA+ TLC artifacts (counterexample traces, state directories)
+tla/**/MCHLC_TTrace_*.tla
+tla/**/MCHLC_TTrace_*.bin
+tla/**/states/
+
 # Admin SPA build outputs. The placeholder internal/admin/dist/index.html
 # is committed so `go build` succeeds in a fresh clone (the //go:embed
 # directive needs at least one matching file). Everything else under
