@@ -1,6 +1,15 @@
 # Transactional secondary-commit idempotency
 
-> **Status: proposed — not yet implemented.**
+> **Status: partial — option 2 reader landed everywhere; writer (emission)
+> gated off by default pending cluster-wide rollout.** M2a (store exact-ts
+> probe), M2b (`prev_commit_ts` in `TxnMeta` V2 + one-phase FSM probe), and
+> M1+M3 for the list-push family (write-set reuse + `OperationGroup.PrevCommitTS`
+> threading through both `ShardedCoordinator` and the legacy `Coordinate`
+> redirect path) have shipped on this branch and are tested. Emission stays
+> off by default (`RedisServer.onePhaseTxnDedup`), so the FSM is byte-identical
+> to today until operators enable it after a full probe-aware rollout — see
+> R5. Remaining: `runTransaction` EXEC-body reuse and M4 (Jepsen).
+>
 > Triggered by the 2026-05-21 Jepsen scheduled run
 > [26198185540](https://github.com/bootjp/elastickv/actions/runs/26198185540)
 > which surfaced a `:duplicate-elements` anomaly on the Redis list-append
@@ -26,7 +35,7 @@ unmasked a deeper anomaly that had been silently classified as `:info`
 
 Jepsen's history.txt for the run shows:
 
-```
+```text
 1411  3  :invoke :txn  [[:r 16 nil] [:r 16 nil] [:append 14 230]]
 1416  3  :ok     :txn  [[:r 16 [...]] [:r 16 [...]] [:append 14 230]]
 1420  7  :ok     :txn  [..., [:r 14 [... 228 229 230 230]]]
@@ -226,7 +235,7 @@ ask the only question that matters:
 
 and branches:
 
-```
+```text
 one-phase apply of the retry entry E2 (commit_ts = T2, prev_commit_ts = T1):
   if committedVersionAt(primaryKey, T1):       # attempt 1 landed
       no-op the entire apply                    # dedup: do not write at T2

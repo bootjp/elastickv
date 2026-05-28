@@ -182,28 +182,41 @@ func decodeTxnMetaV2(b []byte) (TxnMeta, error) {
 	}
 
 	meta := TxnMeta{PrimaryKey: pk}
-	if flags&txnMetaFlagLockTTL != 0 {
-		meta.LockTTLms, err = readTxnUint64(r, "txn meta: lock ttl truncated")
-		if err != nil {
-			return TxnMeta{}, err
+	for _, f := range optionalV2Fields(&meta) {
+		if flags&f.flag == 0 {
+			continue
 		}
-	}
-	if flags&txnMetaFlagCommitTS != 0 {
-		meta.CommitTS, err = readTxnUint64(r, "txn meta: commit ts truncated")
-		if err != nil {
-			return TxnMeta{}, err
+		v, rerr := readTxnUint64(r, f.errMsg)
+		if rerr != nil {
+			return TxnMeta{}, rerr
 		}
-	}
-	if flags&txnMetaFlagPrevCommitTS != 0 {
-		meta.PrevCommitTS, err = readTxnUint64(r, "txn meta: prev commit ts truncated")
-		if err != nil {
-			return TxnMeta{}, err
-		}
+		*f.dest = v
 	}
 	if r.Len() != 0 {
 		return TxnMeta{}, errors.WithStack(errors.Newf("txn meta: unexpected trailing bytes %d", r.Len()))
 	}
 	return meta, nil
+}
+
+// optionalV2Fields lists the V2 optional uint64 fields in their on-wire
+// order. encodeTxnMetaV2 and decodeTxnMetaV2 must traverse this list in the
+// same sequence; keeping the table here removes per-field branches from
+// decode (cyclop) and pins the encode/decode order in one place so adding a
+// future field is a single edit.
+func optionalV2Fields(m *TxnMeta) []struct {
+	flag   byte
+	dest   *uint64
+	errMsg string
+} {
+	return []struct {
+		flag   byte
+		dest   *uint64
+		errMsg string
+	}{
+		{txnMetaFlagLockTTL, &m.LockTTLms, "txn meta: lock ttl truncated"},
+		{txnMetaFlagCommitTS, &m.CommitTS, "txn meta: commit ts truncated"},
+		{txnMetaFlagPrevCommitTS, &m.PrevCommitTS, "txn meta: prev commit ts truncated"},
+	}
 }
 
 type txnLock struct {

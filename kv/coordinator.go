@@ -462,7 +462,7 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
-		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS)
 	} else {
 		resp, err = c.dispatchRaw(ctx, reqs.Elems)
 	}
@@ -798,7 +798,7 @@ func (c *Coordinate) nextStartTS() uint64 {
 	return c.clock.Next()
 }
 
-func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64, prevCommitTS uint64) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -827,9 +827,11 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	// window that exists between the adapter's pre-Raft validateReadSet call
 	// and FSM application. The adapter's validateReadSet is kept as a fast
 	// path to fail early without a Raft round-trip, but the FSM check is
-	// the authoritative, serializable validation.
+	// the authoritative, serializable validation. prevCommitTS, when set,
+	// carries the option-2 one-phase dedup probe key for a retry that reuses
+	// a failed attempt's write set.
 	r, err := c.transactionManager.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primary, reqs, readKeys),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primary, reqs, readKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -973,12 +975,16 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	// so the leader assigns both timestamps consistently. A caller-provided
 	// CommitTS without a StartTS would produce an invalid txn where
 	// CommitTS <= StartTS (because StartTS=0 at the forwarding site).
+	// PrevCommitTS is the immutable identity of the prior attempt — it is
+	// allocated by the originating adapter, not by the leader — so it is
+	// forwarded unconditionally so the leader's one-phase apply can run the
+	// option-2 dedup probe.
 	commitTS := reqs.CommitTS
 	if reqs.StartTS == 0 {
 		commitTS = 0
 	}
 	return []*pb.Request{
-		onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys),
+		onePhaseTxnRequestWithPrevCommit(reqs.StartTS, commitTS, reqs.PrevCommitTS, primary, reqs.Elems, reqs.ReadKeys),
 	}, nil
 }
 

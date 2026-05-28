@@ -37,7 +37,7 @@ func TestCoordinateDispatchTxn_RejectsNonMonotonicCommitTS(t *testing.T) {
 
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, nil, startTS, 0)
+	}, nil, startTS, 0, 0)
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -53,7 +53,7 @@ func TestCoordinateDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: nil, Value: []byte("v")},
-	}, nil, 1, 0)
+	}, nil, 1, 0, 0)
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -71,7 +71,7 @@ func TestCoordinateDispatchTxn_UsesOnePhaseRequest(t *testing.T) {
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("b"), Value: []byte("v1")},
 		{Op: Del, Key: []byte("x")},
-	}, nil, startTS, 0)
+	}, nil, startTS, 0, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, tx.commits)
 	require.Len(t, tx.reqs, 1)
@@ -108,7 +108,7 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	commitTS := uint64(25)
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, nil, startTS, commitTS)
+	}, nil, startTS, commitTS, 0)
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)
@@ -130,7 +130,7 @@ func TestCoordinateDispatchTxn_PassesReadKeysToRaftEntry(t *testing.T) {
 	readKeys := [][]byte{[]byte("rk1"), []byte("rk2")}
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, readKeys, 10, 0)
+	}, readKeys, 10, 0, 0)
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)

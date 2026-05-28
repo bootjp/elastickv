@@ -51,24 +51,13 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 	if c.beforeDispatch != nil {
 		c.beforeDispatch(n)
 	}
-
-	if req != nil && req.IsTxn && req.PrevCommitTS != 0 {
-		primary := minElemKey(req.Elems)
-		landed, err := c.store.CommittedVersionAt(ctx, primary, req.PrevCommitTS)
-		if err != nil {
-			return nil, err
-		}
-		if landed {
-			c.probeNoOps++
-			return &kv.CoordinateResponse{}, nil
-		}
+	if handled, resp, err := c.maybeProbe(ctx, req); handled {
+		return resp, err
 	}
-
 	if n == c.ambiguousDispatch && !c.ambiguousLands {
 		// OCC-style pre-reject: nothing is written, definitely did not land.
 		return nil, store.ErrWriteConflict
 	}
-
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
 	if err != nil {
 		return nil, err
@@ -78,6 +67,26 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 		return nil, store.ErrWriteConflict
 	}
 	return resp, nil
+}
+
+// maybeProbe mimics handleOnePhaseTxnRequest's exact-ts dedup check. It
+// returns handled=true when the probe owns the response (hit → no-op success
+// or probe error), and handled=false to fall through to the normal apply.
+// Extracted from Dispatch to keep the dispatcher under the cyclop limit.
+func (c *dedupTestCoordinator) maybeProbe(ctx context.Context, req *kv.OperationGroup[kv.OP]) (bool, *kv.CoordinateResponse, error) {
+	if req == nil || !req.IsTxn || req.PrevCommitTS == 0 {
+		return false, nil, nil
+	}
+	primary := minElemKey(req.Elems)
+	landed, err := c.store.CommittedVersionAt(ctx, primary, req.PrevCommitTS)
+	if err != nil {
+		return true, nil, err
+	}
+	if landed {
+		c.probeNoOps++
+		return true, &kv.CoordinateResponse{}, nil
+	}
+	return false, nil, nil
 }
 
 // minElemKey mirrors kv.primaryKeyForElems: the minimum non-empty key among
