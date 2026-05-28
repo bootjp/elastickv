@@ -1,8 +1,16 @@
 # TLA+ Safety Specification for elastickv
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-05-28
+
+> **Implementation status.** M1 landed in PR #TBD (the PR opening this
+> document's rename to `partial`). The HLC TLA+ module + `make tla-check`
+> + the gap-config counterexample evidence are now part of the build.
+> M2–M5 (OCC, MVCC, Routes, Composed) remain open per §8. The follow-up
+> Go code changes that strategy (c) and the ceiling fence require (per
+> §5.1 HLC-4 (ii) and (iii)) are tracked as separate issues against
+> `kv/hlc.go`, `kv/sharded_coordinator.go`, and `kv/fsm.go`.
 
 ---
 
