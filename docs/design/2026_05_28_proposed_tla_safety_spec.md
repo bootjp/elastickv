@@ -202,6 +202,25 @@ cannot check them as state invariants.
     current `kv/hlc.go` does not implement any of them, the TLC run for
     HLC-4 is expected to surface a counterexample — surfacing that
     counterexample is one of the motivating reasons for this spec.
+  - **(iii) Commit-time ceiling fencing.** Bounded skew (i) and logical
+    handoff (ii) are not enough on their own: a leader that misses
+    `RunHLCLeaseRenewal` for longer than `hlcPhysicalWindowMs` (e.g.
+    partitioned from the quorum that owns the ceiling group) but
+    remains a Raft leader will continue advancing its wall clock past
+    the last committed ceiling and can still issue persistence
+    timestamps. A subsequent leader that has only restored the same
+    stale ceiling and has a lagging wall clock can then issue a
+    strictly smaller timestamp, violating HLC-4. The spec therefore
+    requires every `Next()` that backs a persistence ts to be gated on
+    `wall_now < lastAppliedCeiling`; a leader whose ceiling has
+    expired must either re-apply a fresh ceiling via Raft before
+    committing, or refuse to commit (fail-closed). The current
+    implementation in `kv/sharded_coordinator.go` `RunHLCLeaseRenewal`
+    only logs renewal failures and dispatch paths call `HLC.Next()`
+    without checking ceiling freshness — this is the second design
+    gap the spec is meant to surface. As with (ii), if the gap is
+    real, TLC will produce a counterexample for HLC-4 under a model
+    that lets renewals fail.
 
 ### 5.2 OCC
 
@@ -420,7 +439,12 @@ The downloaded jar is checksum-pinned. No system-wide install required.
 
 `tla-check` is intended to run in CI on PRs that touch:
 
-- `kv/hlc*.go`, `kv/transaction.go`, `kv/fsm.go`, `kv/lock_resolver.go`
+- `kv/hlc*.go`, `kv/coordinator.go`, `kv/sharded_coordinator.go`,
+  `kv/transaction.go`, `kv/fsm.go`, `kv/lock_resolver.go` — the HLC
+  renewal scheduler, the timestamp-issuance dispatch path, and the
+  OCC commit-ts assignment all live in these files (per Section 3
+  anchors); a change here can violate HLC/OCC invariants and must
+  re-run `tla-check`.
 - `store/mvcc_store.go`
 - `distribution/`
 - the spec files themselves
