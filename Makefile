@@ -56,49 +56,9 @@ $(TLA_JAR):
 	@echo "tla2tools.jar ready at $(TLA_JAR) (SHA-256 $(TLA_SHA256))"
 
 tla-check: $(TLA_JAR)
-	@echo "================================================================"
-	@echo "  TLC: tla/hlc/MCHLC.cfg  (correct design, expected PASS)"
-	@echo "================================================================"
-	@cd tla/hlc && java -XX:+UseParallelGC \
-		-cp ../../$(TLA_JAR) -DTLA-Library=$(TLA_LIB) \
-		tlc2.TLC -nowarning -config MCHLC.cfg MCHLC.tla
-	@echo
-	@echo "================================================================"
-	@echo "  TLC: tla/hlc/MCHLC_gap.cfg  (no preconditions, expected FAIL)"
-	@echo "================================================================"
-	@# Capture the gap run output so we can validate not just that TLC
-	@# exited non-zero but that the failure reason is exactly the HLC-4
-	@# invariant violation we expect.  Without this check a parse error,
-	@# deadlock, JVM crash, or different invariant violation would silently
-	@# count as "expected gap counterexample" (codex P2 on PR #856 round 2).
-	@cd tla/hlc && \
-	  out=$$(java -XX:+UseParallelGC \
-	    -cp ../../$(TLA_JAR) -DTLA-Library=$(TLA_LIB) \
-	    tlc2.TLC -nowarning -config MCHLC_gap.cfg MCHLC.tla 2>&1) ; \
-	  rc=$$? ; \
-	  printf '%s\n' "$$out" ; \
-	  if [ "$$rc" -eq 0 ]; then \
-	    echo ; \
-	    echo "ERROR: MCHLC_gap.cfg unexpectedly passed."; \
-	    echo "  The gap configuration disables HLC-4 preconditions (ii)+(iii);"; \
-	    echo "  TLC was supposed to surface a counterexample showing why those"; \
-	    echo "  preconditions are necessary. A clean pass means either the spec"; \
-	    echo "  no longer encodes the gap correctly or the safety guards leaked"; \
-	    echo "  past the EnableSafety toggle."; \
-	    exit 1; \
-	  fi ; \
-	  if printf '%s\n' "$$out" | grep -qF "Invariant HLC4_NoRegressionAcrossTerms is violated"; then \
-	    echo ; \
-	    echo "OK: MCHLC_gap.cfg failed as designed (HLC-4 counterexample)."; \
-	  else \
-	    echo ; \
-	    echo "ERROR: MCHLC_gap.cfg failed, but the reason is NOT a HLC-4 violation."; \
-	    echo "  Expected substring in TLC output:"; \
-	    echo "    'Invariant HLC4_NoRegressionAcrossTerms is violated'"; \
-	    echo "  The non-zero exit may indicate a parse error, deadlock, JVM"; \
-	    echo "  crash, or a different invariant breaking — review the output"; \
-	    echo "  above before treating this as a regression in the gap evidence."; \
-	    exit 1; \
-	  fi
-	@echo
-	@echo "tla-check: all model-check outcomes match the design contract."
+	@# Per-module orchestration lives in scripts/tla-check.sh so adding
+	@# M3..M5 only needs an entry in that script's TLA_MODULES array
+	@# and a `case` line for the gap-invariant string.  The script does
+	@# the safe-config / gap-config pair per module, validates the gap
+	@# failure reason via string match, and aggregates exit codes.
+	@bash scripts/tla-check.sh

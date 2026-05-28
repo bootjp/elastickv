@@ -12,7 +12,7 @@ run it without touching anything under the Go source tree.
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla`, `make tla-check` | Landed |
-| M2 | `occ/OCC.tla` (safety invariants OCC-1..OCC-5) | Not started |
+| M2 | `occ/OCC.tla` (safety invariants OCC-1..OCC-5) | Landed |
 | M3 | `mvcc/MVCC.tla` (MVCC-1..MVCC-4) | Not started |
 | M4 | `routes/Routes.tla` (Routes-1..Routes-4) | Not started |
 | M5 | `composed/Composed.tla` + CI integration | Not started |
@@ -119,6 +119,34 @@ Invariants asserted:
 
 ### `hlc/MCHLC.tla` + `MCHLC.cfg` / `MCHLC_gap.cfg`
 TLC model-check instance.  Two configurations, one module.  See [Run](#run).
+
+### `occ/OCC.tla`
+The OCC layer.  Models the Percolator-style 2PC transaction lifecycle
+`Idle → Active → Prepared → Committed / Aborted`, the lock map
+`(key, lock_ts) → start_ts`, and the `LockResolve` action that turns
+abandoned locks into versions or clears them.  HLC is abstracted to a
+single global monotonic counter for M2; M5 (composed) will INSTANCE
+`HLC.tla` for the real 48/16 layout.  The `EnableSafety` CONSTANT
+gates the OCC-1 commit guard so the same module drives the safe and
+gap configurations.
+
+Invariants asserted:
+
+| Invariant | Statement |
+|---|---|
+| `TypeOK` | Variable types are well-formed |
+| `OCC1_CommitTsAboveStart` | Every committed txn has `commit_ts > start_ts` |
+| `OCC2_NoWriteWriteConflict` | Two committed txns sharing a write key have distinct commit_ts and one started after the other committed (`commit_ts[earlier] <= start_ts[later]`) |
+| `OCC3_ReadSnapshotStability` | Every read observation's `commit_ts <= start_ts` of the reader (lock-encoded reads only) |
+| `OCC4_NoStrandedLockAtQuiescence` | When all txns are in a terminal state, no lock remains |
+| `OCC5_StartTsConsistency` | Every read observation is bounded by the txn's `start_ts` (= `read_ts` by OCC-5) |
+| `OCC5_Action` (PROPERTY) | Transition form: `start_ts[t]` is assigned once at `BeginTxn` and never updated |
+| `CommitTsAssignedOnce` (PROPERTY) | Transition form: `commit_ts[t]` is assigned once at `Commit` and never updated |
+
+### `occ/MCOCC.tla` + `MCOCC.cfg` / `MCOCC_gap.cfg`
+TLC model-check instance for OCC.  Same one-module / two-config layout
+as MCHLC.  The gap config disables the OCC-1 commit guard; TLC
+produces an `OCC1_CommitTsAboveStart` counterexample at depth ≈ 5.
 
 ## How to interpret a TLC failure
 
