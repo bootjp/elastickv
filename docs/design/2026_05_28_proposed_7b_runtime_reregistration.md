@@ -14,18 +14,26 @@ direct-path gate to `Registered()` — per-DEK and fail-closed. Two
 runtime scenarios fall outside 7a's process-start arm and surfaced as
 codex **P1** findings on PR #847:
 
-1. **Phase-0 boot → runtime `EnableStorageEnvelope` (in scope for 7b).**
-   A node that booted in Phase 0 (envelope inactive) skips
-   `buildProcessStartRegistrationGate`'s propose path. When
-   `EnableStorageEnvelope` later applies at runtime, the storage gate
-   transitions from "not consulted" (envelope inactive) to "fail-closed
-   for an unregistered node" — direct encrypted writes are refused
-   indefinitely. **The active DEK does NOT change**, only the envelope
-   activates. `prepareStorageNonceEpoch` already called
-   `BumpLocalEpoch` for the active DEK at startup, so the sidecar's
-   `Keys[activeDEK].LocalEpoch` equals this load's pinned `w.epoch` —
-   registering at `w.epoch` keeps the sidecar and the writer-registry
-   consistent across restart.
+1. **Phase-0 / pre-bootstrap boot → runtime cutover (in scope for 7b).**
+   A node that booted before the cluster's `EnableStorageEnvelope`
+   apply skips `buildProcessStartRegistrationGate`'s propose path. When
+   the envelope later activates at runtime, the storage gate transitions
+   from "not consulted" (envelope inactive) to "fail-closed for an
+   unregistered node" — direct encrypted writes are refused indefinitely.
+   Two sub-branches both belong to this case (§1, §2.2):
+   - **Phase-0 boot (`bootDEK != 0`):** the node was bootstrapped before
+     it booted but the cutover hadn't fired yet. `prepareStorageNonceEpoch`
+     called `BumpLocalEpoch(bootDEK)` at startup, so
+     `sidecar.Keys[bootDEK].LocalEpoch == w.epoch`. The runtime cutover
+     does not change the active DEK; registering at `w.epoch` is
+     consistent with the sidecar across restart.
+   - **Pre-bootstrap boot (`bootDEK == 0`):** the node started before
+     any `BootstrapEncryption` had ever fired. `w.epoch == 0` and the
+     nonce factory emits at epoch 0. Runtime `BootstrapEncryption` then
+     `EnableStorageEnvelope` together install a new active DEK X with
+     `sidecar.Keys[X].LocalEpoch == 0` — matching the live nonce
+     factory. Registering `(X, node, 0)` is safe and consistent
+     (codex P1 round-2 on PR #848).
 
 2. **Non-proposer node after runtime `RotateDEK` (NOT in scope; deferred to 7b').**
    `applyRotateDEK` inserts only the *proposer's* registration row for
@@ -68,16 +76,30 @@ cache.StorageEnvelopeActive() && id, ok := cache.ActiveStorageKeyID(); ok && !ca
 
 This is precisely the state where `encryptForKey` on the direct path
 would return `ErrWriterNotRegistered`. The 7b watcher acts on this
-condition **only when the active DEK ID matches the boot-time active
-DEK** (`activeStorageDEKID` unchanged since process start) — i.e. the
-cutover case where `StorageEnvelopeActive` flipped but the DEK is the
-same one `prepareStorageNonceEpoch` bumped at startup. When the
-condition holds with a *different* active DEK id, that is the deferred
-rotation case (§6); the watcher logs and skips it.
+condition **only when the active DEK is consistent with the nonce
+factory's pinned `w.epoch`**, which holds in two scenarios:
 
-After `EnableStorageEnvelope` apply: `StorageEnvelopeActive` flips
-true; if this node never registered, `Registered()` is false; the boot
-DEK is unchanged. The trigger fires.
+1. **`activeDEK == bootDEK` (Phase-0-boot cutover).** `bootDEK` is the
+   active storage DEK captured at watcher construction time. The
+   envelope just flipped active; the DEK has not changed since startup;
+   `sidecar.Keys[bootDEK].LocalEpoch == w.epoch` because
+   `prepareStorageNonceEpoch` bumped it at process start.
+
+2. **`bootDEK == 0` (pre-bootstrap → runtime bootstrap+cutover, codex P1 on PR #848 round-1).**
+   A node started before `BootstrapEncryption` had ever fired: the
+   sidecar had `Active.Storage == 0`, `prepareStorageNonceEpoch`
+   returned 0, and the nonce factory is pinned at `w.epoch == 0`. When
+   `BootstrapEncryption` + `EnableStorageEnvelope` later run, the new
+   active DEK X arrives with `sidecar.Keys[X].LocalEpoch == 0` —
+   matching the live nonce factory's `w.epoch == 0`. This is NOT a
+   rotation; registering `(X, node, 0)` is consistent across restart
+   (`BumpLocalEpoch(X)` will bump 0→1 next boot, propose path,
+   lastSeen=0 advances). The watcher MUST handle this path.
+
+When `bootDEK != 0 && activeDEK != bootDEK`, that is the deferred
+rotation case (§6) — the live nonce factory's `w.epoch` is NOT
+consistent with the new DEK's sidecar `LocalEpoch` (which is 0). The
+watcher logs (rate-limited; see §2.1) and skips.
 
 The trigger is read off the shared `*encryption.StateCache`, which
 `applyEnableStorageEnvelope` and `applyRotateDEK` already update via
@@ -91,34 +113,47 @@ transitions.
 
 `runRuntimeRegistrationWatcher(ctx, coordinate, defaultGroup, w, raftID)`
 is a single goroutine started from `setupDistributionAndRegistration`
-(or a sibling helper) AFTER `installProcessStartRegistrationGate`. It
-runs for the lifetime of `runCtx` and:
+(or a sibling helper) AFTER `installProcessStartRegistrationGate`. At
+construction time it captures **`bootDEKID uint32`** by reading
+`cache.ActiveStorageKeyID()` once — this is the DEK the live nonce
+factory was pinned against (post-`BumpLocalEpoch` if non-zero; zero if
+the boot was pre-bootstrap). The watcher also keeps a per-instance
+**`lastLoggedSkipDEK uint32`** field (initial value 0) for log-once
+gating on the deferred rotation branch. It runs for the lifetime of
+`runCtx` and:
 
 1. **Observes** the trigger condition above by polling the
    `StateCache` predicates at a fixed interval
    (`runtimeRegistrationPollInterval`, default 1 s). Polling is simpler
    than an event channel and the interval is bounded by `runCtx`, so
    there is no risk of an unbounded wakeup storm during normal operation
-   (the condition flips at most once per cutover/rotation).
+   (the condition flips at most once per cutover or rotation).
 
-2. **Dedupes / scope-checks**: skip the body when (a) the cache reports
-   `Registered() == true`, (b) `StorageEnvelopeActive() == false`, or
-   (c) the active DEK id has changed from the boot-time DEK (the
-   deferred rotation case — log once and skip). Only the cutover-case
-   condition triggers the propose.
+2. **Dedupes / scope-checks** on each tick:
+   - Skip if `cache.Registered() == true` (already covered).
+   - Skip if `cache.StorageEnvelopeActive() == false` (Phase-0 still).
+   - Skip if `bootDEKID != 0 && activeDEK != bootDEKID` (deferred
+     rotation case, §6). Apply log-once gating: emit a WARN only when
+     `activeDEK != lastLoggedSkipDEK`, then set
+     `lastLoggedSkipDEK = activeDEK`. This makes the log fire once per
+     unique rotated-into DEK rather than once per second (claude P2 on
+     round-1). Subsequent rotations to *another* DEK re-log correctly.
+   - Otherwise (`activeDEK == bootDEKID` OR `bootDEKID == 0`) proceed
+     to propose.
 
 3. **Proposes** synchronously a registration entry for
-   `(bootDEK, fullNodeID, w.epoch)` using the *same*
+   `(activeDEK, fullNodeID, w.epoch)` using the *same*
    `runWriterRegistration` helper 7a already uses. The `local_epoch` is
    `w.epoch` — this load's pinned epoch from
-   `buildEncryptionWriteWiring`, post-`BumpLocalEpoch` for the boot
-   DEK — which is what the nonce factory actually emits AND equals
-   `sidecar.Keys[bootDEK].LocalEpoch`, so the writer-registry row stays
-   coherent with the sidecar across restart (§2.2).
+   `buildEncryptionWriteWiring` — which equals
+   `sidecar.Keys[activeDEK].LocalEpoch` for both in-scope branches
+   (cutover: post-`BumpLocalEpoch`; pre-bootstrap: both are 0), so the
+   writer-registry row stays coherent with the sidecar across restart
+   (§2.2).
 
 4. **Marks** on success via the existing `releaseBarrier(barrier,
-   cache, bootDEK)` helper (with a fresh per-attempt barrier whose
-   only consumer is the watcher). Once `MarkRegistered(bootDEK)`
+   cache, activeDEK)` helper (with a fresh per-attempt barrier whose
+   only consumer is the watcher). Once `MarkRegistered(activeDEK)`
    stores, `cache.Registered()` returns true and the gate clears.
 
 5. **Backs off** between attempts using the existing
@@ -154,35 +189,42 @@ new coordinator barrier; it only needs the storage-layer `Registered()`
 predicate to flip true again. The coordinator barrier from process
 start has long since closed in normal operation.
 
-### 2.2 `local_epoch` consistency (cutover case)
+### 2.2 `local_epoch` consistency (both in-scope branches)
 
 §4.1 nonce uniqueness is per-DEK over `(node_id, local_epoch,
 write_count)`. The nonce factory is built once at process start with
-`(NodeID16(raftID), w.epoch)`. For the cutover case the active DEK is
-the same one `prepareStorageNonceEpoch` already called `BumpLocalEpoch`
-on at startup, so:
+`(NodeID16(raftID), w.epoch)`. Both in-scope branches register at
+`w.epoch` and satisfy the cross-restart invariant
+`sidecar.Keys[activeDEK].LocalEpoch == w.epoch` at the moment of
+registration:
 
-- `sidecar.Keys[activeDEK].LocalEpoch == w.epoch` (post-bump value).
-- The nonce factory emits `(node, w.epoch, write_count)` under
-  `activeDEK`.
-- 7b registers `(activeDEK, node, w.epoch)`, advancing the writer
-  registry's `LastSeenLocalEpoch` to `w.epoch`.
+**Branch A — cutover (`activeDEK == bootDEKID`, bootDEKID != 0).** The
+active DEK is the same one `prepareStorageNonceEpoch` already called
+`BumpLocalEpoch` on at startup. `sidecar.Keys[activeDEK].LocalEpoch ==
+w.epoch` (post-bump value). The nonce factory emits `(node, w.epoch,
+write_count)` under `activeDEK`. 7b registers `(activeDEK, node,
+w.epoch)`. On next restart `BumpLocalEpoch` bumps `w.epoch → w.epoch +
+1`; §9.1 guard sees `w.epoch_new > lastSeen` → propose path. ✓
 
-On the next restart, `BumpLocalEpoch` reads
-`sidecar.Keys[activeDEK].LocalEpoch == w.epoch` and bumps it to
-`w.epoch + 1`. The §9.1 startup guard sees
-`w.epoch_new (w.epoch + 1) > lastSeen (w.epoch)` and takes the propose
-path, registering at `w.epoch + 1`. No brick, no nonce reuse — the
-sidecar and the writer registry stay coherent across restart.
+**Branch B — pre-bootstrap (`bootDEKID == 0`).** No sidecar Active.Storage
+at startup → `prepareStorageNonceEpoch` returned 0; `w.epoch == 0`. At
+runtime `BootstrapEncryption` installs DEK X with
+`sidecar.Keys[X].LocalEpoch == 0` (fresh-bootstrap value), then
+`EnableStorageEnvelope` flips the envelope. The nonce factory emits
+`(node, 0, write_count)` under X. 7b registers `(X, node, 0)`. On next
+restart `BumpLocalEpoch(X)` bumps `0 → 1`; §9.1 guard sees `1 > 0` →
+propose path, registers at 1. ✓ — sidecar, registry, and on-disk
+nonces are all coherent.
 
-**Rotation case is materially different.** A runtime `RotateDEK`
-installs a new active DEK whose `sidecar.Keys[newDEK].LocalEpoch == 0`,
-while the live nonce factory still emits at `w.epoch > 0` under any
-DEK currently active. Registering the new DEK at `w.epoch` would make
-the registry advance past the sidecar; the next restart's
-`BumpLocalEpoch(newDEK)` would only bump `0 → 1`, the §9.1 guard would
-refuse boot, and bypassing the guard would risk real nonce reuse once
-the per-process bumped epoch under `newDEK` eventually overlapped a
+**Rotation case is materially different (deferred).** A runtime
+`RotateDEK` after the first bootstrap installs a new active DEK whose
+`sidecar.Keys[newDEK].LocalEpoch == 0`, while the live nonce factory
+still emits at `w.epoch > 0` (the bumped value for the *previous*
+boot DEK). Registering the new DEK at `w.epoch > 0` would advance the
+registry past the sidecar; the next restart's `BumpLocalEpoch(newDEK)`
+would bump `0 → 1` ≪ `lastSeen`, the §9.1 guard would refuse boot,
+and bypassing the guard would risk real nonce reuse once the
+per-process bumped epoch under `newDEK` eventually overlapped a
 previously-emitted `(node, w.epoch, *)`. See §6 for the deferred fix.
 
 ### 2.3 Why polling, not a channel
@@ -286,11 +328,13 @@ already confirmed).
 
 ## 5. Verification action items (for the implementation PR)
 1. Confirm `runWriterRegistration` and `releaseBarrier` can be reused
-   from the runtime watcher without leaking the conn cache (the
-   goroutine-scoped `connCache.Close()` defer in 7a stays — each watcher
-   propose attempt should similarly scope its own cache, or the
-   long-running watcher should keep a single cache for its lifetime and
-   close on `runCtx`).
+   from the runtime watcher. **Decision (claude P2 round-2):**
+   goroutine-scoped `connCache` per `runWriterRegistration` call,
+   matching 7a's pattern — the existing `defer connCache.Close()`
+   inside `runWriterRegistration` stays, the watcher passes nothing
+   extra. Registrations are rare (one per cutover or pre-bootstrap
+   activation), so the cost of opening a fresh cache per propose is
+   negligible and there is no watcher-level cleanup path to maintain.
 2. *(rotation-case verification; relevant to 7b' not 7b)*
    Confirm `applyRotateDEK` updates the shared `StateCache` via
    `RefreshFromSidecar` AFTER the new DEK is durably committed
@@ -305,9 +349,26 @@ already confirmed).
    unit test pinning that the watcher proposes with `w.epoch`, not
    the freshly-rotated DEK's sidecar value.
 4. Add a unit test pinning the deferred-skip branch: when
-   `activeStorageDEKID` has changed from the boot DEK, the watcher
-   logs once and does NOT propose. This makes the rotation deferral
-   explicit at the code level.
+   `bootDEKID != 0 && activeStorageDEKID != bootDEKID`, the watcher
+   logs once per unique rotated-into DEK (gated by
+   `lastLoggedSkipDEK`) and does NOT propose. This makes the rotation
+   deferral explicit at the code level.
+
+5. **`verifyRegistered` callback (claude P2 round-2).** The watcher's
+   call to `runWriterRegistration` passes a `verifyRegistered` callback
+   that reads the local Pebble writer-registry store
+   (`store.WriterRegistryFor(...).GetRegistryRow(RegistryKey(activeDEK,
+   NodeID16(fullNodeID)))`) and returns true when an existing row's
+   `LastSeenLocalEpoch >= w.epoch`. This matches 7a's process-start
+   pattern and handles the crash-between-propose-and-MarkRegistered
+   case: a prior watcher attempt that committed a registration but
+   crashed before `MarkRegistered` will be picked up by `verifyRegistered`
+   on the next propose, short-circuiting before re-proposing.
+
+6. Add a unit test for the pre-bootstrap branch
+   (`bootDEKID == 0` → runtime `BootstrapEncryption` + cutover): the
+   watcher proposes for the freshly-installed DEK X at `w.epoch == 0`.
+   This pins the codex P1 round-2 fix.
 
 ## 6. Deferred — rotation case (7b')
 
@@ -340,10 +401,10 @@ Three viable fixes (each requires its own design slice):
 (b) **Per-node sidecar coordination at apply time.** `applyRotateDEK`
    on each node writes `sidecar.Keys[newDEK].LocalEpoch =
    thisLoad.w.epoch` (this node's pinned value, NOT the proposer's),
-   then the watcher registers at the same `w.epoch`. Each node's
-   sidecar accurately records its own highest-emitted `local_epoch`
-   under `newDEK`. Requires plumbing `w.epoch` into the `Applier` (or
-   a sidecar-mutator helper exposed to the watcher).
+   then 7b'-the-rotation-extension registers at the same `w.epoch`.
+   Each node's sidecar accurately records its own highest-emitted
+   `local_epoch` under `newDEK`. Requires plumbing `w.epoch` into the
+   `Applier` (or a sidecar-mutator helper called from the apply path).
 
 (c) **Proposer-pinned rotation epoch.** The rotation entry carries an
    explicit `local_epoch` field; `applyRotateDEK` writes that value
