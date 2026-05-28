@@ -181,11 +181,19 @@ cannot check them as state invariants.
   greater than every ts committed in term `t`. **Preconditions** that the
   spec asserts as `ASSUME`s and that the implementation must satisfy:
   - **(i) Bounded clock skew vs ceiling window.** `MaxClockSkewMs <
-    hlcPhysicalWindowMs`. Otherwise the new leader's wall clock can run
-    so far ahead of the renewed ceiling that the floor stops protecting
-    monotonicity. With the current `hlcPhysicalWindowMs = 3000ms` the
-    spec assumes inter-node skew < 3s — a constraint that should be
-    surfaced in operator docs as a cluster prerequisite.
+    hlcPhysicalWindowMs`. The hazard prevented by this bound is *not*
+    a wall clock running ahead of the ceiling (that case uses wall
+    time and is safe); the hazard is logical-counter overflow at the
+    ceiling boundary: the old leader's logical half can wrap inside a
+    ceiling window, bumping the issued wall part to `ceiling + 1` and
+    committing `(ceiling + 1, 0)`. If a new leader's wall clock can
+    independently reach `ceiling + 1` before a fresh ceiling is
+    renewed, the new leader's first `Next()` can tie or undercut the
+    old leader's last commit. Bounding inter-node skew to less than
+    one ceiling window (< 3s with the current `hlcPhysicalWindowMs =
+    3000ms`) keeps the window wide enough that the new leader cannot
+    independently reach the overflow value before a renewal applies.
+    Should be surfaced in operator docs as a cluster prerequisite.
   - **(ii) Logical-counter handoff.** The 16-bit logical half of the HLC
     is in-memory only (`kv/hlc.go` `h.last` is `atomic.Uint64`, not
     replicated), so an old leader can have committed `(ceiling_ms, k)`
@@ -195,13 +203,27 @@ cannot check them as state invariants.
     (a) carry the max committed logical alongside the ceiling in each
     Raft lease entry and restore both on apply; (b) advance the ceiling
     by at least one millisecond on every leader transition so a new
-    leader's first `Next()` floors to `(ceiling+1, 0)`; or (c) on
-    election, have the new leader scan its FSM for the max committed
-    HLC and bump `h.last` accordingly before serving any `Next()`. The
-    M1 spec encodes one of these as a normative requirement. If the
-    current `kv/hlc.go` does not implement any of them, the TLC run for
-    HLC-4 is expected to surface a counterexample — surfacing that
-    counterexample is one of the motivating reasons for this spec.
+    leader's first `Next()` floors to `(ceiling+1, 0)` — **with a
+    serving fence**: the new leader must refuse to serve persistence
+    `Next()` calls until the election-triggered ceiling proposal has
+    been applied, otherwise a client request landing between
+    `BecomeLeader` and the first ceiling apply can still issue from
+    the stale ceiling; or (c) on election, scan the FSM for the max
+    committed HLC and call `hlc.Observe(maxHLC)` before serving any
+    `Next()`, which advances `h.last` past every committed ts from the
+    previous term without requiring a protocol change to the
+    ceiling-entry format. **Default for M1: strategy (c).** It is the
+    simplest to model in TLA+ (a single `BecomeLeader` action that
+    calls `Observe(max_ts)`) and the simplest to implement
+    (`ShardedCoordinator` calls `hlc.Observe(fsm.MaxAppliedHLC())` on
+    detecting a new term, gated before the first persistence
+    `Next()`). Strategy (a) requires a Raft entry format change; (b)
+    requires the serving fence above. The M1 spec encodes one of
+    these as a normative requirement; absent a strong reason to
+    deviate, M1 should adopt (c). If the current `kv/hlc.go` does not
+    implement any of (a)/(b)/(c), the TLC run for HLC-4 is expected
+    to surface a counterexample — surfacing that counterexample is
+    one of the motivating reasons for this spec.
   - **(iii) Commit-time ceiling fencing.** Bounded skew (i) and logical
     handoff (ii) are not enough on their own: a leader that misses
     `RunHLCLeaseRenewal` for longer than `hlcPhysicalWindowMs` (e.g.
@@ -312,7 +334,19 @@ cannot check them as state invariants.
   transactions is consistent with a serial order on `commit_ts` that
   respects real-time happens-before. (This is what Jepsen / `elle` would
   check; modelling it here lets us prove it under all schedules in the
-  bounded space.)
+  bounded space.) **Real-time encoding (M5 modelling decision).** TLA+
+  is a state-machine model with no inherent real-time, so the composed
+  spec must encode "happens-before" explicitly. M5 adopts the
+  **Raft-log-index proxy**: an operation whose committing Raft entry
+  has a strictly smaller `(group_id, index)` than another's is treated
+  as happening-before the other. This is conservative (it can declare
+  operations ordered that real-time leaves concurrent) but is the
+  cheapest to model and matches the ordering Jepsen / `elle` observe
+  through the client API. If the M5 author finds the proxy too lossy
+  (e.g. it makes Composed-3 vacuously true), the fallback is an
+  auxiliary `realtime_order` history variable in `lib/Env.tla` that
+  tracks `(start_time, end_time)` per operation; this is documented
+  in the M5 PR rather than pre-committed here.
 
 ### 5.6 Liveness properties
 
@@ -334,14 +368,20 @@ expect these to be opt-in (Section 8.2 `tla-check-deep`).
   safety counterpart is OCC-4 (no stranded lock at quiescence).
 
 - **Routes-L1 — Eventual catalog convergence.** For every catalog version
-  `v` that is committed durably, every live node's `RouteEngine`
+  `v` that is committed durably, every **live** node's `RouteEngine`
   eventually observes version `≥ v`. Stated as
-  `<>(∀ n: catalogVersion[n] ≥ v)` under weak fairness on the
-  `CatalogWatcher.SyncOnce` action. The spec variable `catalogVersion[n]`
-  corresponds to `Engine.catalogVersion` in `distribution/engine.go`
-  (one field per `RouteEngine`, exposed via `Engine.Version()`). This is
-  the liveness counterpart of Routes-4 (which only bounds the order of
-  observations, not their occurrence).
+  `<>(∀ n ∈ LiveNodes: catalogVersion[n] ≥ v)` under weak fairness on
+  the `CatalogWatcher.SyncOnce` action. The `LiveNodes` qualifier is
+  load-bearing: a permanently-crashed node never resumes
+  `CatalogWatcher.SyncOnce`, so `<>(∀ n: catalogVersion[n] ≥ v)`
+  would be vacuously falsifiable by such a node and the liveness
+  checker would emit spurious counterexamples. The spec variable
+  `catalogVersion[n]` corresponds to `Engine.catalogVersion` in
+  `distribution/engine.go` (one field per `RouteEngine`, exposed via
+  `Engine.Version()`). This is the liveness counterpart of Routes-4
+  (which only bounds the order of observations, not their occurrence).
+  The same `LiveNodes` (or `LiveTransactions` for OCC-L1) qualifier
+  applies to any other `∀ n` / `∀ T` liveness property added later.
 
 ---
 
@@ -381,16 +421,18 @@ expect these to be opt-in (Section 8.2 `tla-check-deep`).
   this proposal is meant to surface.
   - **Nodes** are symmetric in every module (a node only matters relative
     to its role — leader / follower — not its identity).
-  - **Keys** are symmetric **only** in `HLC.tla` (keys do not appear) and
-    `OCC.tla` (keys participate in lock_map / read_set / write_set as
-    indices, with no ordering on the OCC invariants). Keys are **not
-    symmetric** in `MVCC.tla` (versions are ordered by `commit_ts` and
-    keys could in principle be ordered too), and are **definitely not
-    symmetric** in `Routes.tla` and `Composed.tla` because keys
-    participate in ordered ranges via `SplitRange`. Swapping arbitrary
-    keys in those modules can move them across split boundaries and
-    collapse states with different owners as equivalent — exactly the
-    stale-route / data-handoff schedules the spec is meant to analyse.
+  - **Keys** in `HLC.tla`: `HLC.tla` references no key set; `MCHLC.cfg`
+    omits the `Keys` constant entirely (the symmetry question does not
+    arise). In `OCC.tla` keys are symmetric — they participate in
+    `lock_map` / `read_set` / `write_set` as indices only, with no
+    ordering on the OCC invariants. Keys are **not symmetric** in
+    `MVCC.tla` (versions are ordered by `commit_ts` and keys could in
+    principle be ordered too), and are **definitely not symmetric** in
+    `Routes.tla` and `Composed.tla` because keys participate in
+    ordered ranges via `SplitRange`. Swapping arbitrary keys in those
+    modules can move them across split boundaries and collapse states
+    with different owners as equivalent — exactly the stale-route /
+    data-handoff schedules the spec is meant to analyse.
   - **Values, terms, group IDs** — never symmetric (they label
     distinguishable resources).
 - Use a `StateConstraint` that bounds the number of operations and the
@@ -465,7 +507,7 @@ proves something on its own).
 
 | ID | Scope | Output | Notes |
 |---|---|---|---|
-| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4. `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops). | Smallest viable PR; sets the directory layout precedent. |
+| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (including the three HLC-4 preconditions). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops). | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
 | **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | OCC spec runnable in isolation. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. Liveness (OCC-L1) is deferred to M6. |
 | **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | MVCC spec runnable in isolation. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
 | **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Route catalog spec runnable in isolation. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. Liveness (Routes-L1) is deferred to M6. |
