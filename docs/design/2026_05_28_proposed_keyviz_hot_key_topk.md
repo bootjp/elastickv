@@ -126,9 +126,13 @@ Concretely:
   channel-pushes O(1).
 - **Sampling**: 1-in-`R` Observes are enqueued (default `R = 16`).
   Hot keys are frequent enough to be sampled often; the Space-Saving
-  guarantee scales with sampled-N. Use a per-shard fast PRNG (e.g.
-  `runtime.fastrand64` if available, otherwise a Xoshiro/PCG seeded
-  per-routine) so the sample check has no contention.
+  guarantee scales with sampled-N. Implementation: an `atomic.Uint64`
+  counter where the sample gate is `counter.Add(1) % R == 0`. Lock-free,
+  allocation-free, no seeding, no `runtime.fastrand64` (which is an
+  unexported runtime symbol not accessible from user code).
+  `math/rand/v2.NewPCG` per shard, seeded at sampler construction, is
+  the alternative if call-site distribution matters more than the
+  modulo bias of a global counter; v1 picks the counter.
 - **Non-blocking enqueue**: `select { case ch <- e: default: drop }`.
   Drop-on-full preserves the no-blocking-on-hot-path contract; under
   overload v1 prefers approximate top-K over latency.
@@ -191,13 +195,34 @@ tracked, §2.2). `sub_bucket` is optional: omitted, the response is the
 whole route's top-K; supplied, the server resolves the sub-bucket's
 `[Start, End)` from the slot's immutable sub-layout (§3.2 of the
 sub-range design) and filters the route's tracked top-`m` to keys in
-that range. Two separate query params — not a single `bucket_id` —
-because the matrix response's `bucket_id` strings embed `#` (e.g.
-`route:1#3`), and `#` in a URL query is parsed as a **fragment** by
-the client (the server would only see `route:1`); separate params
-sidestep the encoding hazard entirely (CodeRabbit Major). The SPA
-parses the matrix row's `bucket_id` into the two params before
-issuing the request.
+that range. The filter MUST use the same **lexicographic byte
+comparison** (`bytes.Compare`) as `subBucketIndex` does on the forward
+path — any other comparator (locale-aware string compare, etc.) silently
+mis-shelves binary keys. Two separate query params — not a single
+`bucket_id` — because the matrix response's `bucket_id` strings embed
+`#` (e.g. `route:1#3`), and `#` in a URL query is parsed as a
+**fragment** by the client (the server would only see `route:1`);
+separate params sidestep the encoding hazard entirely (CodeRabbit
+Major). The SPA parses the matrix row's `bucket_id` into the two params
+before issuing the request.
+
+`from_unix_ms` / `to_unix_ms` are accepted for forward compatibility
+but **v1 ignores them** and always returns the **current snapshot**
+(see §2.2 — historical per-window top-K is a future extension).
+`snapshot_at` in the response shows when the returned snapshot was
+built so a client noticing a stale or out-of-window timestamp can
+decide whether to retry.
+
+**Drill-down approximation caveat (Codex P2):** because the sketch is
+per-route, not per-sub-bucket, the filter can return an empty or
+incomplete result for a sub-bucket whose traffic is spread across many
+moderate keys, or when more than `m` hotter keys live elsewhere in the
+same route. The returned set is then "the route's heavy hitters that
+happen to fall in the clicked sub-range" — not necessarily "the keys
+that made the cell hot." This is the price of per-route memory; the
+response includes the `sample_rate` / `error_bound` so a client can
+detect a thin result, and §10 records per-sub-bucket sketches as a
+future enhancement when sub-cell precision proves to be needed.
 
 Response:
 
@@ -238,6 +263,18 @@ independent — `writes` lookups never inflate `reads` data, at the
 cost of `series_count × m × routes` worst-case memory.
 
 ## 6. Fan-out
+
+> **No replication-factor inflation on writes.** Summing across peers
+> in fan-out does **not** triple-count writes on a 3-replica cluster
+> because `observeMutation` (`kv/sharded_coordinator.go`) is called
+> from the **coordinator's `Dispatch` / `groupMutations`** — i.e. only
+> on the node that received the client request (effectively the group
+> leader at the time of writing). The FSM apply path
+> (`kv/fsm.go`) does NOT call into the sampler, so followers never
+> observe a write that another node already did. Per route, at most
+> one peer's sketch contains writes at any given moment, and a brief
+> overlap window at a leadership flip is acceptable — same regime as
+> the matrix path which dedupes via `(group, term)` at merge time.
 
 Drill-down queries fan out via the existing keyviz fan-out infra
 (`internal/admin/keyviz_fanout.go`): one HTTP call per peer admin
@@ -286,16 +323,31 @@ bytes** in memory and exposes them on the admin API.
 ## 8. Configuration
 
 ```text
---keyvizHotKeysEnabled  bool  (default false)
---keyvizHotKeysPerRoute int   (default 64,  cap 256)
---keyvizHotKeysSampleRate int (default 16,  i.e. 1/16; cap 1024)
---keyvizHotKeysQueueSize  int (default 8192, cap 65536)
+--keyvizHotKeysEnabled    bool (default false)
+--keyvizHotKeysPerRoute   int  (default 64,   cap 256)        # m
+--keyvizHotKeysSampleRate int  (default 16,   i.e. 1/16; cap 1024)  # R
+--keyvizHotKeysQueueSize  int  (default 8192, cap 65536)
+--keyvizHotKeysMaxKeyLen  int  (default 1024, cap 4096)        # bytes; longer keys skip sampling
 ```
 
-Memory at defaults: per route `m = 64` × `(avg key bytes + 16 B counter)`
-≈ 5 KB; `MaxTrackedRoutes = 10_000` → ~50 MB worst case at the cap.
-The general rule for operator help text: `m × avgKey × MaxTrackedRoutes`
-bytes; raise `MaxTrackedRoutes` and lower `m` together.
+`--keyvizMaxTrackedRoutes` (the existing flag from the Phase 2-A
+sampler) doubles as the upper bound on per-route sketch count — raising
+it without lowering `m` is the §11.3 foot-gun. It is not a new flag.
+
+Memory, two perspectives:
+
+- **Typical** (≈ 62 B average keys, default `m = 64`,
+  `MaxTrackedRoutes = 10_000`): ≈ 50 MB.
+- **Worst case** (every entry holds the `1024 B` cap key length, no
+  pool sharing across routes): `m × (max_key + 16 B counter) ×
+  MaxTrackedRoutes` ≈ **665 MB** at default `m = 64`, or **2.66 GB** at
+  the `m = 256` cap. An operator sizing for safety must use this row
+  unless their workload is known to use short keys.
+
+`--keyvizHotKeysMaxKeyLen` (§8, default `1024`) is the dominant lever
+beyond `m` — halve it and the worst-case memory halves; long-key
+workloads should consider lowering it explicitly. The general rule for
+the help text: `m × (max_key + 16) × MaxTrackedRoutes` bytes worst case.
 
 ## 9. Alternatives considered
 
@@ -316,9 +368,16 @@ bytes; raise `MaxTrackedRoutes` and lower `m` together.
 
 ## 10. Open questions (for review)
 
-1. **Sample rate vs accuracy.** `R = 16` (sketched-N = total-N / 16)
-   gives an `error_bound ≈ N / (m·R)` envelope. For an operator
-   actually using the drill-down, is that good enough, or should the
+1. **Sample rate vs accuracy.** The deterministic scaled error bound is
+   `N_total / m` **independent of `R`** (the sampled-stream bound
+   `N_sample / m = (N_total / R) / m` is scaled back by `R` for the
+   API, giving `N_total / m`). What `R` actually controls is the
+   **probability** of missing a heavy hitter (fewer samples → more
+   Chernoff variance). A larger `R` therefore makes the deterministic
+   bound no tighter, only more probabilistic; the trade-off is hot-path
+   cost vs miss probability, not bound tightness. For an operator
+   actually using the drill-down, is `R = 16`'s miss probability low
+   enough, or should the
    default be `R = 4`? Bench-driven decision.
 2. **Snapshot cadence.** Publishing the immutable snapshot every
    `keyvizStep` (60 s default) ties drill-down freshness to the
