@@ -91,6 +91,21 @@ const (
 	DefaultKeyBucketsPerRoute = 1
 )
 
+// Defaults / caps for the per-cell hot-key drill-down knobs (see
+// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md §8). All
+// off-by-default; HotKeysEnabled=false is the binary's existing
+// behaviour — no extra hot-path cost, no real key bytes retained.
+const (
+	DefaultHotKeysPerRoute   = 64
+	MaxHotKeysPerRoute       = 256
+	DefaultHotKeysSampleRate = 16
+	MaxHotKeysSampleRate     = 1024
+	DefaultHotKeysQueueSize  = 8192
+	MaxHotKeysQueueSize      = 65536
+	DefaultHotKeysMaxKeyLen  = 1024
+	MaxHotKeysMaxKeyLen      = 4096
+)
+
 // MaxKeyBucketsPerRoute caps KeyBucketsPerRoute. The cap is an
 // operationally-safe bound, not merely a finite one: per-route memory
 // is K × 4 × 8 bytes, so at the default MaxTrackedRoutes = 10_000 the
@@ -144,6 +159,34 @@ type MemSamplerOptions struct {
 	// [1, MaxKeyBucketsPerRoute] at construction. Virtual aggregate
 	// buckets are never sub-divided regardless of this value.
 	KeyBucketsPerRoute int
+	// HotKeysEnabled opts in to per-route Top-K hot-key tracking that
+	// backs the heatmap drill-down (Phase 2-A++; see
+	// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md). When
+	// false the hot path adds one early-return branch and nothing else
+	// — disabled-case behaviour is byte-identical to today. When true
+	// the sampler retains REAL key bytes in memory and exposes them on
+	// the admin drill-down API (gated behind admin auth + audit).
+	HotKeysEnabled bool
+	// HotKeysPerRoute is the Space-Saving sketch capacity m per route
+	// (default 64, cap 256 — design §8). Larger m tightens the noise
+	// floor (error_bound ≈ N_total / m) at the cost of memory.
+	HotKeysPerRoute int
+	// HotKeysSampleRate is R: the hot path enqueues 1 in R observes.
+	// Default 16, cap 1024. Higher R reduces hot-path cost but raises
+	// the probability that a heavy hitter is missed (Chernoff variance
+	// over the sampled stream).
+	HotKeysSampleRate int
+	// HotKeysQueueSize bounds the channel between the hot path and
+	// the aggregator goroutine. Defaults 8192, cap 65536. Drops past
+	// the queue are counted, not silent (`dropped_samples` →
+	// `degraded`).
+	HotKeysQueueSize int
+	// HotKeysMaxKeyLen caps the key length sampled into the hot-keys
+	// sketch. Default 1024 B, cap 4096 B. Longer keys bump the
+	// node-global `skipped_long_keys` counter and contribute to the
+	// snapshot's `degraded` flag — they are never truncated (truncation
+	// would alias different keys).
+	HotKeysMaxKeyLen int
 	// Now overrides time.Now for tests; nil falls back to time.Now.
 	Now func() time.Time
 }
@@ -191,6 +234,12 @@ type MemSampler struct {
 	// twice in the same column — once as an aggregate row, once as
 	// an individual row — even under register/remove churn.
 	virtualIDCounter atomic.Uint64
+
+	// hotKeys is the per-route Top-K aggregator (design 2026_05_28
+	// _proposed_keyviz_hot_key_topk). nil when HotKeysEnabled is false
+	// — the Observe hot path then skips the feature with one branch.
+	// Read from the hot path; assigned exactly once at construction.
+	hotKeys *hotKeysAggregator
 
 	// groupTermsMu guards groupTerms. SetLeaderTerm and Flush both
 	// touch the map; Observe never does. The lock is fine-grained
@@ -328,6 +377,15 @@ type routeSlot struct {
 	subLo      []byte
 	subHi      []byte
 	subBuckets []subCounter
+
+	// hotKeysSnap is the most-recently-published per-route Top-K
+	// snapshot (design 2026_05_28_proposed_keyviz_hot_key_topk §4).
+	// nil until the hot-keys aggregator's first publish for this route.
+	// Drill-down handlers load it lock-free; the aggregator is the
+	// single writer (Store) and deep-copies snapshot contents so a
+	// subsequent reset / eviction on the live sketch cannot mutate a
+	// snapshot a reader holds.
+	hotKeysSnap atomic.Pointer[KeyvizHotKeysSnapshot]
 }
 
 // subCounter holds one sub-range bucket's four counter families. A
@@ -438,6 +496,7 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	if opts.KeyBucketsPerRoute > MaxKeyBucketsPerRoute {
 		opts.KeyBucketsPerRoute = MaxKeyBucketsPerRoute
 	}
+	applyHotKeysDefaults(&opts)
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -449,7 +508,71 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 		groupTerms: map[uint64]uint64{},
 	}
 	s.table.Store(newEmptyRouteTable())
+	if opts.HotKeysEnabled {
+		s.hotKeys = newHotKeysAggregator(s, opts)
+	}
 	return s
+}
+
+// HotKeysSnapshot returns the most-recently-published per-route Top-K
+// snapshot for the given individual route, or nil if hot-keys tracking
+// is disabled, the route is unknown, the route is an aggregate, or no
+// publish has fired yet. Lock-free: an atomic.Pointer.Load (Codex-P1
+// fix from the design's round-4 review — no shared mutable PRNG state,
+// no per-route lock).
+func (s *MemSampler) HotKeysSnapshot(routeID uint64) *KeyvizHotKeysSnapshot {
+	if s == nil {
+		return nil
+	}
+	slot := lookupSlotForRoute(s.table.Load(), routeID)
+	if slot == nil {
+		return nil
+	}
+	return slot.hotKeysSnap.Load()
+}
+
+// HotKeysOptions returns the effective hot-keys configuration after the
+// NewMemSampler clamps. Used by the admin handler so the response can
+// echo the same `sample_rate` / `m` values the sketch was built with,
+// regardless of what an operator passed on the CLI. nil-receiver-safe.
+func (s *MemSampler) HotKeysOptions() (enabled bool, capacity, sampleRate, maxKeyLen int) {
+	if s == nil {
+		return false, 0, 0, 0
+	}
+	return s.opts.HotKeysEnabled, s.opts.HotKeysPerRoute, s.opts.HotKeysSampleRate, s.opts.HotKeysMaxKeyLen
+}
+
+// SubBucketBoundsFor returns the [lo, hi) key bounds of sub-bucket
+// subBucket within the individual route routeID, mirroring what Flush
+// emits as a MatrixRow's Start/End. The admin hot-keys handler uses
+// this to filter the route's top-m snapshot to keys in the
+// drill-down-clicked sub-range (design §5).
+//
+// ok is false when the route doesn't exist, is an aggregate (those are
+// not eligible for hot-keys), or subBucket is out of range
+// [0, len(subBuckets)). For a single-bucket slot (K=1 / unbounded /
+// degenerate), bound calls with subBucket == 0 succeed and return the
+// route's own Start/End. hi == nil means the sub-bucket extends to the
+// route's unbounded tail.
+//
+// nil-receiver-safe.
+func (s *MemSampler) SubBucketBoundsFor(routeID uint64, subBucket int) (lo, hi []byte, ok bool) {
+	if s == nil || subBucket < 0 {
+		return nil, nil, false
+	}
+	slot := lookupSlotForRoute(s.table.Load(), routeID)
+	if slot == nil {
+		return nil, nil, false
+	}
+	if subBucket >= len(slot.subBuckets) {
+		return nil, nil, false
+	}
+	start, end, _, _, _, _ := slot.snapshotMeta()
+	if len(slot.subBuckets) <= 1 {
+		return start, end, true
+	}
+	lo, hi = slot.subBucketBounds(subBucket, start, end)
+	return lo, hi, true
 }
 
 // SetLeaderTerm publishes the current Raft leader term for the given
@@ -545,7 +668,22 @@ func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int) {
 		if byteCount > 0 {
 			sc.writeBytes.Add(byteCount)
 		}
+		s.observeHotKey(routeID, slot, key)
 	}
+}
+
+// observeHotKey is the per-Observe hot-key sampler dispatch, kept out of
+// Observe itself to stay under the cyclop ceiling. v1 tracks WRITES
+// only (design §5 series-picker note); reads follow in v2 once the
+// hot-path cost is measured. The nil check short-circuits in disabled
+// deploys with a single branch — Observe's disabled-case allocation
+// contract is preserved. Aggregates (Aggregate==true) are not tracked
+// (design §2.2); lookupSlotForRoute filters them at publish too.
+func (s *MemSampler) observeHotKey(routeID uint64, slot *routeSlot, key []byte) {
+	if s.hotKeys == nil || slot.Aggregate {
+		return
+	}
+	s.hotKeys.observe(routeID, key)
 }
 
 // subBucketIndex maps key to a sub-range bucket index in

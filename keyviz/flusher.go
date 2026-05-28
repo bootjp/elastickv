@@ -35,3 +35,17 @@ func RunFlusher(ctx context.Context, s *MemSampler, step time.Duration) {
 		}
 	}
 }
+
+// RunHotKeysAggregator drives the per-route Top-K aggregator goroutine
+// until ctx is cancelled, returning afterwards. Mirrors RunFlusher; the
+// caller in main.go is expected to launch one of each in the same
+// errgroup. No-op (blocks on ctx) when the sampler is nil or
+// HotKeysEnabled is false — keeping the call site uniform so a future
+// flip of the flag does not require restructuring startup wiring.
+func RunHotKeysAggregator(ctx context.Context, s *MemSampler) {
+	if s == nil || s.hotKeys == nil {
+		<-ctx.Done()
+		return
+	}
+	s.hotKeys.run(ctx)
+}
