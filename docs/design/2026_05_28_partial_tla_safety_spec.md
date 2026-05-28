@@ -1,8 +1,16 @@
 # TLA+ Safety Specification for elastickv
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-05-28
+
+> **Implementation status.** M1 landed in PR #TBD (the PR opening this
+> document's rename to `partial`). The HLC TLA+ module + `make tla-check`
+> + the gap-config counterexample evidence are now part of the build.
+> M2–M5 (OCC, MVCC, Routes, Composed) remain open per §8. The follow-up
+> Go code changes that strategy (c) and the ceiling fence require (per
+> §5.1 HLC-4 (ii) and (iii)) are tracked as separate issues against
+> `kv/hlc.go`, `kv/sharded_coordinator.go`, and `kv/fsm.go`.
 
 ---
 
@@ -536,10 +544,12 @@ Both targets shell out to `tla2tools.jar` which is downloaded on first use
 into `.cache/tla/` (matching the existing `.cache/` pattern from CLAUDE.md).
 The downloaded jar is checksum-pinned. No system-wide install required.
 
-### 7.3 CI integration (deferred)
+### 7.3 CI integration
 
-`tla-check` is intended to run in CI on PRs that touch:
+`tla-check` runs in CI via `.github/workflows/tla-check.yml` on every PR
+(and push to `main`) that touches:
 
+- `tla/**` and `Makefile` (the spec and the harness themselves).
 - `kv/hlc*.go`, `kv/coordinator.go`, `kv/sharded_coordinator.go`,
   `kv/transaction.go`, `kv/fsm.go`, `kv/lock_resolver.go` — the HLC
   renewal scheduler, the timestamp-issuance dispatch path, and the
@@ -547,12 +557,17 @@ The downloaded jar is checksum-pinned. No system-wide install required.
   anchors); a change here can violate HLC/OCC invariants and must
   re-run `tla-check`.
 - `store/mvcc_store.go`
-- `distribution/`
-- the spec files themselves
+- `distribution/**`
+- `.github/workflows/tla-check.yml` (the workflow file itself).
 
-The exact CI wiring (workflow file, path filter) is deferred to the M1 PR
-so it can be reviewed alongside a concrete spec rather than in the
-abstract.
+The workflow uses Temurin JDK 21, caches `.cache/tla/tla2tools.jar`
+keyed on the Makefile hash so version-pin changes invalidate the cache
+automatically, and inherits the Makefile's gap-config validation: a
+non-zero TLC exit on `MCHLC_gap.cfg` only counts as success if the
+output contains the exact string
+`Invariant HLC4_NoRegressionAcrossTerms is violated`. Any other failure
+mode (parse error, deadlock, JVM crash, different invariant) fails the
+job. The full M1 run completes in well under a minute.
 
 ---
 
