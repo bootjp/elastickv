@@ -126,16 +126,25 @@ Concretely:
   channel-pushes O(1).
 - **Sampling**: 1-in-`R` Observes are enqueued (default `R = 16`).
   Hot keys are frequent enough to be sampled often; the Space-Saving
-  guarantee scales with sampled-N. Implementation: an `atomic.Uint64`
-  counter where the sample gate is `counter.Add(1) % R == 0`. Lock-free,
-  allocation-free, no seeding, no `runtime.fastrand64` (which is an
-  unexported runtime symbol not accessible from user code).
-  `math/rand/v2.NewPCG` per shard, seeded at sampler construction, is
-  the alternative if call-site distribution matters more than the
-  modulo bias of a global counter; v1 picks the counter.
+  guarantee scales with sampled-N. Implementation: **per-shard
+  `math/rand/v2.PCG`** drawn once at sampler construction; the sample
+  gate is `rng.Uint64() % R == 0`. **Probabilistic**, not deterministic
+  — the simpler `atomic.Uint64`-counter-modulo gate phase-locks: a
+  workload emitting a hot key consistently at positions that are never
+  a multiple of `R` (a periodic batcher, an ordered stream) would
+  never sample it, defeating the Chernoff miss-probability argument in
+  §3 (Codex P2). PCG state is goroutine-local and reseeded per shard,
+  so the gate is contention-free without the bias hazard.
 - **Non-blocking enqueue**: `select { case ch <- e: default: drop }`.
   Drop-on-full preserves the no-blocking-on-hot-path contract; under
-  overload v1 prefers approximate top-K over latency.
+  overload v1 prefers approximate top-K over latency. **Drops are
+  counted, not silent**: an `atomic.Uint64` `dropped_samples` counter
+  increments on every `default` branch (Codex P2). The aggregator
+  copies the counter into each published snapshot, the drill-down
+  response exposes it (§5), and a non-zero value flags the snapshot
+  as **degraded** so a client cannot misread an overloaded sample as
+  exact. Without this, `sampled_n × sample_rate` would silently
+  under-estimate true activity by the drop rate.
 - **Key clone**: the hot path must copy the key bytes because the
   caller is free to reuse / mutate the buffer after `Observe` returns
   (the existing `Observe` contract). To bound allocation the clone
@@ -239,10 +248,12 @@ Response:
   // Counts above are scaled-to-true-frequency estimates (= sampled
   // sketch counter × sample_rate). The error bound is in the same
   // (scaled, true-frequency) units.
-  "sample_rate":  16,
-  "sampled_n":    7_842,      // observations the sketch saw
-  "error_bound":  125,        // = sample_rate × sampled_n / m
-  "snapshot_at":  "2026-05-28T01:23:45Z",
+  "sample_rate":     16,
+  "sampled_n":       7_842,   // observations the sketch saw
+  "dropped_samples": 0,       // sampled but dropped by full-queue back-pressure
+  "degraded":        false,   // true ⇔ dropped_samples > 0
+  "error_bound":     125,     // = sample_rate × sampled_n / m (over the sketch's actual input)
+  "snapshot_at":     "2026-05-28T01:23:45Z",
   "fanout": { ... }           // per-node status, same shape as matrix
 }
 ```
@@ -295,7 +306,10 @@ intended operational posture; if a peer is configured with a smaller
 `R` it contributes more accurate data and the merged result inherits
 the coarser bound from the looser peer). `sampled_n` is reported as
 the sum (informational: total sketch-observed events across the
-cluster).
+cluster). `dropped_samples` is the **sum** across peers, and
+`degraded` is the **OR** (`true` if any peer reports drops) — a single
+overloaded peer marks the cluster-wide result degraded so a client
+cannot misread the merged figures as exact.
 
 Mixed-K (some nodes hot-keys-enabled, others not): unchanged. Peers
 that don't sample omit their contribution; the merge proceeds with
