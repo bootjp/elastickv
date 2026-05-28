@@ -90,7 +90,7 @@ design abstraction.
 |---|---|---|
 | Raft (abstracted) | `internal/raftengine/etcd`, `kv/fsm.go` | per-group log of committed entries + current leader + term; snapshot install marker |
 | HLC | `kv/hlc.go` (`Next`, `SetPhysicalCeiling`, `Observe`); `kv/coordinator.go` and `kv/sharded_coordinator.go` (`hlcRenewalInterval`, `hlcPhysicalWindowMs`, `RunHLCLeaseRenewal`) | per-node `last` (48-bit physical + 16-bit in-memory logical), per-node `physicalCeiling` (Raft-applied), per-leader `term` |
-| OCC | `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` | per-txn `start_ts` (= `read_ts`), `write_set`, `read_set`, lock map keyed by `(key, lock_ts)` |
+| OCC | `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` | per-txn `start_ts` (= `read_ts`), `write_set`, `read_set`, lock map `(key, lock_ts) → txn_id` (the value records the owning transaction so `owner(k, ts)` is derivable for OCC-L1) |
 | MVCC | `store/mvcc_store.go` | per-key version chain `[(commit_ts, value, tombstone?)]` |
 | Route catalog | `distribution/engine.go`, `distribution/catalog.go`, `distribution/watcher.go` | catalog version, per-node cached snapshot, in-flight `SplitRange` |
 
@@ -368,11 +368,29 @@ cannot check them as state invariants.
   serialisation is established via `commit_ts` order from HLC (which
   is the global clock all groups share). This combination —
   same-group: log index; cross-group: HLC commit_ts — is the spec's
-  primary modelling choice for Composed-3. If the M5 author finds
-  the proxy too lossy (e.g. it makes Composed-3 vacuously true), the
-  fallback is an auxiliary `realtime_order` history variable in
-  `lib/Env.tla` that tracks `(start_time, end_time)` per operation;
-  this is documented in the M5 PR rather than pre-committed here.
+  primary modelling choice for Composed-3. **Cross-group `commit_ts`
+  collisions.** The HLC is *not* a single global counter: the
+  physical ceiling is Raft-replicated and converges across nodes, but
+  the 16-bit logical half is per-node in-memory (`kv/hlc.go`
+  `h.last`), so two leaders of different groups on different nodes
+  can independently produce identical 64-bit timestamps. Composed-3
+  therefore requires either: (i) **distinct-ts model constraint** —
+  the M5 model enforces globally distinct `commit_ts` values via a
+  `DISTINCT_TS` `StateConstraint`, which is sound under
+  `MaxClockSkewMs < hlcPhysicalWindowMs` (the renewal cadence makes
+  natural collisions vanishingly rare); or (ii) **explicit
+  tiebreaker** — equal-`commit_ts` cross-group operations are
+  ordered by the producing leader's `(node_id, group_id)` lex pair,
+  which is a fixed total order per node-pair within a single
+  leadership term. M5 commits to **(i)** as the default
+  (`MCComposed.cfg` ships with `DISTINCT_TS`); the tiebreaker (ii)
+  is the fallback if removing `DISTINCT_TS` produces interesting
+  counterexamples worth analysing. If the M5 author finds the proxy
+  itself too lossy (e.g. it makes Composed-3 vacuously true even
+  with distinct ts), the further fallback is an auxiliary
+  `realtime_order` history variable in `lib/Env.tla` that tracks
+  `(start_time, end_time)` per operation; this is documented in the
+  M5 PR rather than pre-committed here.
 
 ### 5.6 Liveness properties
 
@@ -542,7 +560,7 @@ proves something on its own).
 
 | ID | Scope | Output | Notes |
 |---|---|---|---|
-| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops) **against the spec-of-the-correct-design**: the M1 spec encodes precondition (i) as a TLA+ `ASSUME` (constant predicate `MaxClockSkewMs < HlcPhysicalWindowMs`), and encodes (ii) and (iii) as **action guards** — strategy (c) lives in the `BecomeLeader` action (`hlcLast[n] := max(hlcLast[n], maxAppliedHLC)`), and the ceiling-fencing gate lives in the `IssueTimestamp` action (`ENABLED ⇔ wallNow[n] < physicalCeiling[n]`). A companion `HLC_gap.tla` + `MCHLC_gap.cfg` pair that removes the `ASSUME` and relaxes those action guards is expected to surface counterexamples; that pair is committed alongside M1 as the motivating evidence that the preconditions are necessary. (TLA+ `ASSUME` is only valid for constant-level predicates, so describing behavioural requirements as `ASSUME`s would produce invalid TLA+; the distinction matters for M1 implementers.) | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
+| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops) **against the spec-of-the-correct-design**: the M1 spec encodes precondition (i) as a TLA+ `ASSUME` (constant predicate `MaxClockSkewMs < HlcPhysicalWindowMs`), and encodes (ii) and (iii) as **action guards** — strategy (c) lives in the `BecomeLeader` action (`LET maxAppliedHLC == MaxAppliedHLC(fsm[n]) IN hlcLast[n]' = max(hlcLast[n], maxAppliedHLC)`, where `MaxAppliedHLC` is the new FSM operator described in §5.1), and the ceiling-fencing gate lives in the `IssueTimestamp` action (`ENABLED ⇔ wallNow[n] < physicalCeiling[n]`). A companion `HLC_gap.tla` + `MCHLC_gap.cfg` pair that removes the `ASSUME` and relaxes those action guards is expected to surface counterexamples; that pair is committed alongside M1 as the motivating evidence that the preconditions are necessary. (TLA+ `ASSUME` is only valid for constant-level predicates, so describing behavioural requirements as `ASSUME`s would produce invalid TLA+; the distinction matters for M1 implementers.) | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
 | **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | OCC spec runnable in isolation. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. Liveness (OCC-L1) is deferred to M6. |
 | **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | MVCC spec runnable in isolation. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
 | **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Route catalog spec runnable in isolation. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. Liveness (Routes-L1) is deferred to M6. |
@@ -602,8 +620,11 @@ the spec depends on it running, not just existing.
    timestamp, so client commits are rejected until renewal succeeds.
    This is a CP, not AP, trade-off and is a stricter regime than the
    current implementation (which silently keeps issuing). Mitigation:
-   the M1 spec encodes the fence as `ASSUME`; the follow-up
-   implementation PR that adds the fence to `HLC.Next()` /
+   the M1 spec encodes the fence as an **action guard** on
+   `IssueTimestamp` (`ENABLED ⇔ wallNow[n] < physicalCeiling[n]`, per
+   §8.1 — `ASSUME` is only valid for constant predicates and does not
+   apply here); the follow-up implementation PR that adds the fence
+   to `HLC.Next()` /
    `ShardedCoordinator.RunHLCLeaseRenewal` must (a) surface the new
    error in operator-visible metrics and (b) document the
    `hlcPhysicalWindowMs` tuning guidance — operators sizing the
