@@ -188,15 +188,34 @@ func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64)
 	return err == nil, errors.WithStack(err)
 }
 
-// CommittedVersionAt delegates straight to the local store with no leader
-// fence or proxy. Unlike the client-facing GetAt/ExistsAt/ScanAt reads,
-// this exact-timestamp existence probe is used only by the deterministic
-// one-phase FSM apply (which always reads the local replica it is writing
-// to). It is part of the MVCCStore interface for completeness but is never
-// invoked through the leader-routed client read path, so there is no
-// freshness fence to honour and no RawCommittedVersionAt RPC to proxy to.
+// CommittedVersionAt gates the exact-timestamp existence probe behind the
+// same lease-aware leader check that LatestCommitTS uses, so client reads
+// through this wrapper get a fresh authoritative answer.
+//
+// The original justification for an unconditional local read was that the
+// probe is only consumed by the deterministic one-phase FSM apply path —
+// which is true and remains the case: the FSM holds the raw local store
+// (not a LeaderRoutedStore), so its probe never goes through this method.
+// But the option-2 reuse path (RedisServer.resolveReuseLength) also calls
+// CommittedVersionAt on the adapter's r.store, which IS the
+// LeaderRoutedStore. During leader churn — exactly the environment this
+// feature targets — the local replica may have lost leadership before
+// applying the entry the new leader committed, so a stale local read could
+// miss a version that exists cluster-wide and steer the adapter into the
+// wrong reconstruction branch (codex P1).
+//
+// There is no RawCommittedVersionAt RPC to proxy to. The chosen tradeoff
+// is to answer authoritatively when we are leader (lease valid → local is
+// up-to-date) and return (false, nil) otherwise; the adapter's fall-through
+// goes through resolveListMeta, which uses ScanAt/GetAt — those ARE
+// leader-fenced — so the eventual return value is the leader's current
+// Len, a valid serialization. This sacrifices the pending.length fast-path
+// during churn but never returns an incorrect length.
 func (s *LeaderRoutedStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
 	if s == nil || s.local == nil {
+		return false, nil
+	}
+	if !s.leaderOKForKey(ctx, key) {
 		return false, nil
 	}
 	exists, err := s.local.CommittedVersionAt(ctx, key, commitTS)
