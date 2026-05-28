@@ -153,8 +153,10 @@ func TestSQSEncodeStandardQueueCounters(t *testing.T) {
 }
 
 // TestSQSEncodeFifoSeqCounter pins that a FIFO queue emits a
-// !sqs|queue|seq| counter = max(sequence_number)+1, and the message bodies
-// round-trip.
+// !sqs|queue|seq| counter = max(sequence_number), matching the live FIFO
+// send path's "last issued" semantics (loadFifoSequence + prevSeq+1 in
+// adapter/sqs_fifo.go). Storing max+1 would cause the next live send to
+// skip a sequence number — codex P1 #846.
 func TestSQSEncodeFifoSeqCounter(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
@@ -174,12 +176,32 @@ func TestSQSEncodeFifoSeqCounter(t *testing.T) {
 	if seq == nil {
 		t.Fatal("no !sqs|queue|seq| counter emitted for FIFO queue")
 	}
-	if got := string(seq.UserValue); got != "10" {
-		t.Fatalf("seq counter = %q, want \"10\" (max 9 + 1)", got)
+	if got := string(seq.UserValue); got != "9" {
+		t.Fatalf("seq counter = %q, want \"9\" (max sequence_number, last issued)", got)
 	}
 	gen := sqsFindEntry(entries, sqsQueueGenKeyBytes(queue))
 	if gen == nil || string(gen.UserValue) != strconv.FormatUint(sqsRestoreGeneration, 10) {
 		t.Fatalf("gen counter = %v, want %d", gen, sqsRestoreGeneration)
+	}
+}
+
+// TestSQSEncodeEmptyFifoQueueNoSeqCounter pins that a FIFO queue with no
+// messages emits NO !sqs|queue|seq| counter — mirrors the live "no FIFO
+// send yet" state (missing key reads as 0; first send issues sequence 1).
+// Writing 1 here would make the next live send issue sequence 2 instead.
+func TestSQSEncodeEmptyFifoQueueNoSeqCounter(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "empty.fifo"
+	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"empty.fifo","fifo":true,`+
+		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`), nil)
+
+	entries, _, err := DecodeLiveEntries(bytes.NewReader(encodeSQSTree(t, in)))
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	if seq := sqsFindEntry(entries, sqsQueueSeqKeyBytes(queue)); seq != nil {
+		t.Fatalf("unexpected !sqs|queue|seq| counter for empty FIFO queue: %q", seq.UserValue)
 	}
 }
 
@@ -250,23 +272,6 @@ func TestSQSEncodeRejectsEmptyMessageID(t *testing.T) {
 	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"q-emptyid",`+
 		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
 		[][]byte{[]byte(`{"message_id":"","body":"x","send_timestamp_millis":1,"available_at_millis":1}`)})
-	b := newSnapshotBuilder(sqsEncTS)
-	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeInvalidMessage) {
-		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidMessage", err)
-	}
-}
-
-// TestSQSEncodeRejectsMaxSequence pins that a FIFO message at the uint64
-// sequence ceiling fails closed rather than wrapping the seq counter to 0.
-func TestSQSEncodeRejectsMaxSequence(t *testing.T) {
-	t.Parallel()
-	in := t.TempDir()
-	const queue = "max.fifo"
-	writeSQSQueue(t, in, queue, []byte(`{"format_version":1,"name":"max.fifo","fifo":true,`+
-		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
-		[][]byte{
-			[]byte(`{"message_id":"m1","body":"a","send_timestamp_millis":1,"available_at_millis":1,"message_group_id":"g","sequence_number":18446744073709551615}`),
-		})
 	b := newSnapshotBuilder(sqsEncTS)
 	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeInvalidMessage) {
 		t.Fatalf("Encode err = %v, want ErrSQSEncodeInvalidMessage", err)

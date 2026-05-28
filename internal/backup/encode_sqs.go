@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,7 +20,8 @@ import (
 // plus the generation and (FIFO) sequence counters:
 //   - _queue.json        -> !sqs|queue|meta|  (storedSQSMetaMagic + JSON) + !sqs|queue|gen|
 //   - messages.jsonl     -> !sqs|msg|data|    (storedSQSMsgMagic + JSON), one per line
-//   - (FIFO) seq counter -> !sqs|queue|seq|   = max(sequence_number)+1
+//   - (FIFO) seq counter -> !sqs|queue|seq|   = max(sequence_number)
+//     (last issued — matches adapter/sqs_fifo.go's loadFifoSequence + prevSeq+1)
 //
 // The derived side records (!sqs|msg|{vis,byage,dedup,group}) — re-derivable
 // from the message set + config — land in a follow-up slice (M5-2, the
@@ -215,17 +215,16 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 			maxSeq = seq
 		}
 	}
-	if meta.FIFO {
-		// The sequence counter is the next value the live FIFO send path
-		// will allocate; restore it to max(seen)+1 so it never reissues a
-		// sequence number an existing message already holds. Fail closed
-		// at the uint64 ceiling rather than wrap to 0 (which would reissue
-		// sequence 1 and break FIFO ordering) — coderabbit Major #846.
-		if maxSeq == math.MaxUint64 {
-			return errors.Wrapf(ErrSQSEncodeInvalidMessage,
-				"%s: sequence_number at uint64 max, cannot advance the counter", meta.Name)
-		}
-		seqVal := []byte(strconv.FormatUint(maxSeq+1, 10))
+	if meta.FIFO && maxSeq > 0 {
+		// The live FIFO send path (adapter/sqs_fifo.go: loadFifoSequence
+		// + prevSeq+1) reads this key as the LAST issued sequence number
+		// and advances by one before writing back. To preserve that
+		// contract on restore, store max(seen) — not max+1, which would
+		// cause the next send to skip a sequence number (codex P1 #846).
+		// Empty FIFO queues (maxSeq == 0) emit no counter at all,
+		// mirroring the live "no send yet" state where the missing key
+		// reads as 0 and the first send issues sequence 1.
+		seqVal := []byte(strconv.FormatUint(maxSeq, 10))
 		if err := b.Add(sqsQueueSeqKeyBytes(meta.Name), seqVal, 0); err != nil {
 			return err
 		}
