@@ -590,7 +590,7 @@ check verifies the spec passes; the AI reviewers verify the
 implementation matches the spec.  Both fire on every push to an
 anchored file, so a divergence cannot land silently.  The path filter
 must stay in sync across all three places (the two workflow files and
-the doc § list).
+the list in §7.3).
 
 ---
 
