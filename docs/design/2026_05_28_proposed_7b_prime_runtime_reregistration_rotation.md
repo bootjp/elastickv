@@ -109,43 +109,47 @@ cleaner but ships materially more code; we will revisit it if option
 `applyRotateDEK` currently writes the new key with `LocalEpoch: 0`
 via `writeRotationSidecar`. The change:
 
-- Inject a `localEpochProvider func() uint16` into the `Applier`
-  via a new `WithLocalEpoch` functional option (symmetric with
+- Inject a `localEpoch uint16` value into the `Applier` via a new
+  `WithLocalEpoch(uint16)` functional option (symmetric with
   `WithStateCache`, `WithSidecarPath`, etc.).
-- The provider closes over the same `encryptionWriteWiring.epoch`
-  the nonce factory is pinned to. `main_encryption_write_wiring.go`'s
-  `buildEncryptionWriteWiring` already computes this value and
-  threads it through; this slice exposes it to the `Applier`
-  construction site in `main.go`.
-- `writeRotationSidecar` calls `a.localEpoch()` (or `0` if no
-  provider is configured — preserving the FSM-internal test
-  harnesses that construct an `Applier` without write-path state)
-  and writes that value into `sc.Keys[newDEK].LocalEpoch`.
+- The value is `encryptionWriteWiring.epoch` — the same pinned
+  `w.epoch` the nonce factory is constructed with at process start.
+  `main_encryption_write_wiring.go`'s `buildEncryptionWriteWiring`
+  already computes this value; this slice exposes it to the
+  `Applier` construction site in `main.go`.
+- `writeRotationSidecar` reads `a.localEpoch` (defaulting to `0`
+  when the option was not supplied — preserving the FSM-internal
+  test harnesses that construct an `Applier` without write-path
+  state) and writes that value into `sc.Keys[newDEK].LocalEpoch`.
 
-#### 3.1.1 Why the provider, not a captured value
+A static `uint16` rather than a `func() uint16` provider is the
+right shape today. `BumpLocalEpoch` only runs at process start
+(§9.1) — there is no runtime epoch-bump path, so a late-bound
+provider would close over the same constant. If a future slice
+introduces runtime bumps (e.g. rotation-with-epoch-renew, see §4),
+the option will be upgraded to read from an `atomic.Uint32` or
+shared state at that point. Adding the provider indirection now,
+purely for a hypothetical future caller, violates the codebase's
+"don't design for hypothetical future requirements" convention.
 
-The `Applier` outlives the wiring (snapshots are restored under a
-fresh `Applier`). A captured `uint16` would freeze the epoch at
-construction time; a func provider re-reads on every apply so a
-late `BumpLocalEpoch` (between `Applier` construction and the
-rotation apply) is reflected.
+#### 3.1.1 Backward compatibility — pre-bootstrap and unwired tests
 
-In practice the apply runs in the FSM goroutine while
-`BumpLocalEpoch` runs at process start — they should not interleave.
-The provider's late-binding is defense-in-depth against a future
-runtime-bump path (rotation-with-epoch-renew, not currently in scope).
-
-#### 3.1.2 Backward compatibility — pre-bootstrap and unwired tests
-
-`localEpoch()` returns 0 for two cases:
+`a.localEpoch` is `0` (the zero value) for two cases:
 1. Pre-bootstrap process loads (no sidecar, `w.epoch == 0`).
 2. Test harnesses that instantiate an `Applier` without the
    `WithLocalEpoch` option.
 
-The applier MUST gracefully fall back to `0` in both cases —
-existing applier tests construct an `Applier` for FSM-internal
-behaviour (bootstrap, rotation, registration) and have no notion of
-a nonce-factory pinned epoch.
+The applier MUST gracefully accept `0` in both cases — existing
+applier tests construct an `Applier` for FSM-internal behaviour
+(bootstrap, rotation, registration) and have no notion of a
+nonce-factory pinned epoch. The pre-bootstrap case is naturally
+indistinguishable from the unwired-test case — both write
+`LocalEpoch: 0`, which is the value the cluster already used
+before this slice for every rotation. So a pre-bootstrap node
+that observes a runtime `RotateDEK` is exactly as safe under 7b'
+as it is under 7b (the watcher is also in scope only when
+`StorageEnvelopeActive` and the local node has a non-zero
+`w.epoch`).
 
 ### 3.2 7b watcher scope-check extension
 
@@ -279,12 +283,55 @@ Mixed-version cluster behaviour:
   is restarted on the 7b' binary.
 - A 7b' node observing a rotation registers and proceeds.
 
-Roll-forward path: deploy 7b' to every node in the cluster, then a
-RotateDEK is naturally absorbed by the 7b' watcher on every node.
+### 6.1 Rolling-upgrade mitigation strategies
+
+The mixed-version availability degradation above is a real
+operational risk: a `RotateDEK` issued during a rolling upgrade
+(some nodes still 7b) leaves every 7b node fail-closed under the
+new DEK until the operator restarts it on 7b'. Three layered
+mitigations close this gap, in order of operator friction:
+
+1. **Operational guideline (lowest friction).** The Stage-7
+   operations runbook (parent design §10) will explicitly call out
+   that `RotateDEK` MUST NOT be triggered during a rolling upgrade
+   that crosses the 7b → 7b' boundary. The 7b' release notes name
+   this constraint; an alerting check on `elastickv_encryption_*`
+   metrics can warn if the cluster reports mixed versions and a
+   `RotateDEK` is observed in the audit log.
+
+2. **Admin RPC capability gate (middle friction).** The
+   `EncryptionAdmin.RotateDEK` RPC handler (in the propose-side
+   mutator) gates on a cluster-wide capability probe — gossiped or
+   queried via `Distribution.ListNodes` — refusing to propose if
+   any peer advertises a version older than 7b'. This is
+   server-side and cannot be bypassed by a misconfigured client.
+   Failure surface: the RPC returns
+   `FailedPrecondition: cluster contains pre-7b' nodes; complete
+   the rolling upgrade before rotating`. The probe is best-effort
+   (a freshly-joined node could race the check), but the §4.1
+   case-2 idempotent posture means a false-positive admit only
+   degrades availability of the pre-7b' node — it never corrupts.
+
+3. **Cluster-version Raft entry (highest friction; deferred).** A
+   future slice could land a `ClusterVersion` Raft entry that
+   every node bumps on startup; `RotateDEK` apply would refuse to
+   commit if the entry reports a pre-7b' member. This is the
+   strongest form but adds a new wire entry and a coordination
+   protocol — overkill for a single-feature gate.
+
+7b' will ship (1) and (2). (3) is explicitly deferred — it has
+broader applicability than just this slice (snapshot v2 in Stage 8
+will face the same problem) and deserves its own design.
+
+Roll-forward path: deploy 7b' to every node in the cluster, verify
+the capability probe reports all-7b', then issue `RotateDEK`. The
+7b' watcher on each node naturally absorbs the rotation.
 
 Rollback path: rolling back to 7b after a 7b' RotateDEK has applied
 is safe — the sidecar's `Keys[newDEK].LocalEpoch = prior.w.epoch`
 value satisfies the §9.1 startup guard's `w.epoch_new >= lastSeen`
 check on next boot of the 7b binary. The 7b binary then runs its
 log-once-skip deferral for the rotation case, identical to the
-pre-7b' posture.
+pre-7b' posture. The writer registry's `(newDEK, node, w.epoch)`
+row remains in place — case-2 monotonic acceptance means it does
+not interfere with a future re-rotation under either binary.
