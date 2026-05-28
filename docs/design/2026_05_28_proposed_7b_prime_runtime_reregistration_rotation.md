@@ -181,17 +181,33 @@ indistinguishable from the unwired-test case — both write
 `LocalEpoch: 0`, which is the value the cluster already used
 before this slice for every rotation.
 
-**In practice `applyRotateDEK` is unreachable during a
-pre-bootstrap load** (claude review on PR #855): a `RotateDEK`
-entry is only committed AFTER `EnableStorageEnvelope` has
-applied, which transitions the node out of pre-bootstrap state
-(`w.epoch > 0` after the next restart's `BumpLocalEpoch`). A
-pre-bootstrap node replaying the log sees `EnableStorageEnvelope`
-first, becomes post-bootstrap, and only then sees `RotateDEK`. So
-by the time `applyRotateDEK` runs with a non-zero
-`localEpoch`-meaningful value, case 1 is unreachable for real
-rotation entries; the `localEpoch == 0` pre-bootstrap path is
-therefore only exercised by test harnesses.
+**Ordering invariant: a `RotateDEK` entry is only committed
+AFTER `EnableStorageEnvelope` has applied** (claude review on PR
+#855). The order is enforced by the propose-side mutator: the
+admin-RPC handler refuses to propose `RotateDEK` until
+`StorageEnvelopeActive == true`. So a pre-bootstrap node
+replaying the log sees `EnableStorageEnvelope` first and only
+then sees `RotateDEK`. Two sub-cases under which
+`applyRotateDEK` then runs:
+
+- **Same-load Phase-0 boot.** Both entries apply during a single
+  process load with `w.epoch == 0` throughout (no restart
+  between them, so no `BumpLocalEpoch` advance). Writing
+  `LocalEpoch: 0` to `Keys[newDEK]` is **correct** here: no
+  writes have been emitted under the new DEK with a non-zero
+  epoch on this node, so the sidecar accurately records its
+  highest-emitted local_epoch of `0`. The watcher will not
+  propose for this load (the 7a process-start path will register
+  on next restart with `BumpLocalEpoch`-advanced `w.epoch`).
+
+- **Restart between entries.** A node that crashed between the
+  two applies, or that started fresh after both committed,
+  reaches `applyRotateDEK` post-restart with `w.epoch > 0`.
+  This is the case option (b) is designed for.
+
+The invariant is "writing `LocalEpoch: w.epoch` is correct
+regardless of whether `w.epoch` is 0 or positive" — the static
+`a.localEpoch` field provides the right value in both sub-cases.
 
 ### 3.2 7b watcher scope-check extension
 
@@ -338,9 +354,12 @@ node's sidecar now records its own emissions accurately.
      constructing the `Applier` without the option preserves
      today's `LocalEpoch: 0` behaviour (test-harness
      backward-compatibility).
-   - `TestApplier_ApplyRotateDEK_ProviderInvokedPerApply`: the
-     provider closure is invoked on each apply, not cached at
-     construction. (A counter-based test fixture suffices.)
+   - `TestApplier_ApplyRotateDEK_LocalEpochAppliedPerApply`:
+     verify the static `a.localEpoch` value is correctly read
+     on each FSM apply call, not inadvertently reset or derived
+     from mutable state. A multi-apply test fixture (two
+     rotations in sequence) suffices to pin that the value
+     remains stable across applies.
 
 2. New `main_encryption_registration_test.go` cases extending the
    existing watcher harness. Split into **propose-call** vs
