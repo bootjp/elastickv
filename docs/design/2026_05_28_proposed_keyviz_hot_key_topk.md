@@ -107,14 +107,18 @@ serialise the hot path on a mutex (or worse, on the very keys we
 flow is:
 
 ```text
-   Observe (hot path)                  background goroutine
-   ─────────────────                   ────────────────────
-   if !hotKeysEnabled return                drain ch
-   if rng()%sampleRate != 0 return          for (rid, kc) := range ch:
-   kc := pool.Clone(key)                       per-route SS update (no lock —
-   select {                                     single-writer)
-     case ch <- {rid, kc}:                   periodic atomic.Pointer.Store of
-     default: pool.Release(kc); drop          a frozen snapshot for queries
+   Observe (hot path)                       background goroutine
+   ─────────────────                        ────────────────────
+   if !hotKeysEnabled return                  drain ch
+   if rand/v2.IntN(R) != 0 return             for (rid, kc) := range ch:
+   if len(key) > maxKeyLen {                     per-route SS update (no
+     skippedLong.Add(1); return                   lock — single-writer);
+   }                                              SS COPIES key bytes,
+   kc := pool.Clone(key)                          pool buffer released
+   select {                                    periodic atomic.Pointer.Store
+     case ch <- {rid, kc}:                       of a deep-copied snapshot
+     default: dropped.Add(1)                      (also reads dropped /
+       pool.Release(kc); drop                     skippedLong counters)
    }
 ```
 
@@ -155,10 +159,16 @@ Concretely:
   comes from a `sync.Pool` of pre-sized byte slices; long keys
   (>`hotKeysMaxKeyLen`, default 1024 B) are skipped from sampling
   rather than tracked truncated (truncation would alias different
-  keys into the same entry — worse than dropping). **The pool buffer
-  is strictly transient between `Observe` and the aggregator's update**
-  (see below); it is never the storage that an SS entry or a published
-  snapshot points at.
+  keys into the same entry — worse than dropping). **Long-key skips
+  are counted**, not silent (Codex P2): an `atomic.Uint64`
+  `skipped_long_keys` counter increments on the skip, the aggregator
+  copies it into the snapshot, the drill-down response exposes it
+  (§5), and a non-zero value contributes to `degraded` — so a
+  workload whose actual hot key is longer than the cap cannot
+  produce an empty drill-down result that misleads the operator into
+  thinking no key was missed. **The pool buffer is strictly transient
+  between `Observe` and the aggregator's update** (see below); it is
+  never the storage that an SS entry or a published snapshot points at.
 - **Single background aggregator goroutine** drains the channel and
   updates the per-route Space-Saving sketches. Single-writer ⇒ no
   lock needed on the sketches' update path. **The aggregator copies
@@ -219,12 +229,19 @@ separate params sidestep the encoding hazard entirely (CodeRabbit
 Major). The SPA parses the matrix row's `bucket_id` into the two params
 before issuing the request.
 
-`from_unix_ms` / `to_unix_ms` are accepted for forward compatibility
-but **v1 ignores them** and always returns the **current snapshot**
-(see §2.2 — historical per-window top-K is a future extension).
-`snapshot_at` in the response shows when the returned snapshot was
-built so a client noticing a stale or out-of-window timestamp can
-decide whether to retry.
+`from_unix_ms` / `to_unix_ms` are accepted for forward compatibility,
+but v1 maintains only the **current snapshot** (see §2.2 — historical
+per-window top-K is a future extension), so the server **rejects with
+HTTP 400 (`error_code: "out_of_snapshot_window"`)** when the requested
+window does not overlap `[snapshot_at − keyvizStep, snapshot_at]`.
+Silently returning the current snapshot for a clicked **historical**
+heatmap column would confidently name keys hot *now* as if they made
+the *historical* cell hot — exactly the misread Codex P2 (L224)
+flagged. The SPA disables the drill-down handler on heatmap columns
+outside the current window so the operator never receives a 400 in
+the normal flow. Omitting both `from`/`to` is treated as "current"
+(no rejection). `snapshot_at` in the response always reports when the
+returned snapshot was built.
 
 **Drill-down approximation caveat (Codex P2):** because the sketch is
 per-route, not per-sub-bucket, the filter can return an empty or
@@ -252,11 +269,12 @@ Response:
   // Counts above are scaled-to-true-frequency estimates (= sampled
   // sketch counter × sample_rate). The error bound is in the same
   // (scaled, true-frequency) units.
-  "sample_rate":     16,
-  "sampled_n":       7_842,   // observations the sketch saw
-  "dropped_samples": 0,       // sampled but dropped by full-queue back-pressure
-  "degraded":        false,   // true ⇔ dropped_samples > 0
-  "error_bound":     125,     // = sample_rate × sampled_n / m (over the sketch's actual input)
+  "sample_rate":       16,
+  "sampled_n":         500,   // observations the sketch saw
+  "dropped_samples":   0,     // sampled but dropped by full-queue back-pressure
+  "skipped_long_keys": 0,     // observations whose key exceeded --keyvizHotKeysMaxKeyLen
+  "degraded":          false, // true ⇔ dropped_samples > 0 OR skipped_long_keys > 0
+  "error_bound":       125,   // = sample_rate × sampled_n / m (over the sketch's actual input)
   "snapshot_at":     "2026-05-28T01:23:45Z",
   "fanout": { ... }           // per-node status, same shape as matrix
 }
@@ -419,13 +437,18 @@ the help text: `m × (max_key + 16) × MaxTrackedRoutes` bytes worst case.
    rather than corrupting; documented in the response. No Raft / FSM /
    Pebble interaction.
 2. **Concurrency / distributed** — hot path:
-   one atomic-counter increment for sampling (PRNG state), one bounded
-   channel `select-with-default`, **no mutex, no map mutation**. Single
-   aggregator goroutine ⇒ single-writer on every sketch ⇒ updates need
-   no lock. Snapshot publish via `atomic.Pointer.Store` ⇒ readers (the
-   drill-down handler) load lock-free. The sketch's internal map is
-   never read concurrently with mutation (snapshot is a separate
-   value). `go test -race ./keyviz/...` gate.
+   one `math/rand/v2.IntN(R)` call (Go 1.22+ per-P, concurrency-safe,
+   no shared sampler-owned state), one bounded channel
+   `select-with-default`, **no mutex, no map mutation, no PCG state
+   owned by the sampler**. Single aggregator goroutine ⇒ single-writer
+   on every sketch ⇒ updates need no lock. Snapshot publish via
+   `atomic.Pointer.Store` ⇒ readers (the drill-down handler) load
+   lock-free. The sketch's internal map is never read concurrently
+   with mutation (snapshot is a separate value).
+   `dropped_samples` and `skipped_long_keys` are `atomic.Uint64`
+   incremented from the hot path with relaxed ordering — their values
+   are only read by the aggregator at snapshot time, never compared
+   on the hot path. `go test -race ./keyviz/...` gate.
 3. **Performance** — see §4 table. New benchmark
    `BenchmarkObserveHotKeysEnabled/disabled/sampled` to pin the
    numbers. Memory bounded by §8 formula; raising `--keyvizMaxTrackedRoutes`
