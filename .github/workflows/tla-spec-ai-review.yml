@@ -23,6 +23,12 @@ name: TLA+ spec divergence — AI review
 # the model check AND the AI review request.
 
 on:
+  # NOTE on trigger types vs tla-check.yml: this workflow includes
+  # `ready_for_review` (draft → ready) because requesting an AI review is
+  # cheap and a draft-to-ready transition is exactly when a human starts
+  # paying attention.  tla-check.yml omits `ready_for_review` because the
+  # TLC run already happened on the prior `opened` or `synchronize`
+  # event — re-running it would be redundant compute.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
@@ -53,6 +59,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # No git operations are pushed from this job — the
+          # github-token step below uses ${{ secrets.GITHUB_TOKEN }}
+          # explicitly via the github-script action.  Drop the
+          # persisted credential so a compromised subsequent step
+          # cannot reuse it (zizmor `artipacked`).
+          persist-credentials: false
 
       - name: List spec-anchored files changed in this PR
         id: changed
@@ -61,9 +73,13 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          # The set of anchored paths must stay in sync with the `paths:`
-          # filter above AND with tla-check.yml.  Keep all three lists
-          # identical when expanding for M2..M5.
+          # The set of anchored paths must stay in sync with **four**
+          # places (see §7.3 of the design doc):
+          #   1. the `paths:` filter above (this workflow)
+          #   2. the `paths:` filter in tla-check.yml
+          #   3. this ANCHORS regex
+          #   4. the enumeration in §7.3 of the design doc
+          # Keep all four identical when expanding for M2..M5.
           ANCHORS='^(kv/hlc[^/]*\.go|kv/coordinator\.go|kv/sharded_coordinator\.go|kv/transaction\.go|kv/fsm\.go|kv/lock_resolver\.go|store/mvcc_store\.go|distribution/.*)$'
           git diff --name-only "$BASE_SHA...$HEAD_SHA" \
             | grep -E "$ANCHORS" \

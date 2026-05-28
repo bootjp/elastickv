@@ -576,21 +576,28 @@ reviewers (`@claude review` + `@codex review`) with a per-subsystem
 checklist of which spec invariants to verify the implementation has
 not drifted from.  The chain is:
 
-```
+```text
 anchored-file change in PR
-  -> tla-check.yml runs TLC (catches *spec* bugs)
-  -> tla-spec-ai-review.yml posts the review-request comment
-       -> claude.yml fires on @claude in the comment
-       -> chatgpt-codex-connector bot fires on @codex review
-            -> both bots review the diff focused on TLA+ divergence
+  ├── (in parallel) tla-check.yml runs TLC          ── catches *spec* bugs
+  └── (in parallel) tla-spec-ai-review.yml posts a PR comment with
+                    @claude review + @codex review pings
+                      ├── claude.yml fires on @claude in the comment
+                      │     → Claude reviews the diff for spec divergence
+                      └── chatgpt-codex-connector fires on @codex review
+                            → Codex reviews the diff for spec divergence
 ```
 
 `tla-check` and the AI-review request are complementary — the model
 check verifies the spec passes; the AI reviewers verify the
 implementation matches the spec.  Both fire on every push to an
 anchored file, so a divergence cannot land silently.  The path filter
-must stay in sync across all three places (the two workflow files and
-the list in §7.3).
+must stay in sync across **four** places:
+
+1. `paths:` in `.github/workflows/tla-check.yml`
+2. `paths:` in `.github/workflows/tla-spec-ai-review.yml`
+3. the `ANCHORS` regex inside `tla-spec-ai-review.yml` (used to populate
+   the per-PR comment with the actual list of changed anchored files)
+4. the list in this §7.3.
 
 ---
 
