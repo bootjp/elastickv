@@ -453,6 +453,49 @@ func TestRuntimeRegistrationTick_PreBootstrapInScopeProposes(t *testing.T) {
 	}
 }
 
+// TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes
+// pins design §5 item 6b: the bootstrap→rotate→cutover sub-path. A node
+// that booted in Phase 0 (bootDEKID==0) and then observes a runtime
+// Bootstrap followed by a rotation to a different DEK *before* its
+// cutover (activeDEK = Y ≠ original-bootstrapped DEK, w.epoch == 0) MUST
+// still propose for Y — the scope check's deferred-rotation guard
+// (`bootDEKID != 0 && activeDEK != bootDEKID`) is short-circuited by
+// `bootDEKID == 0`. Without this test the guard is one `||` swap away
+// from a regression that would silently defer the watcher and leave the
+// gate fail-closed indefinitely (claude P2 round-2 on PR #853).
+func TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	// activeDEK Y=99 (≠ original bootstrap DEK), w.epoch=0, bootDEK=0.
+	const rotatedDEK uint32 = 99
+	// Pre-populate the registry under DEK 99 so verifyRegistered
+	// short-circuits without needing a real coordinator/engine — the
+	// hardcoded writeRegistryRow uses testRegDEKID, so call SetRegistryRow
+	// directly with the rotated DEK id.
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+	val := encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID: fullNodeID, FirstSeenLocalEpoch: 0, LastSeenLocalEpoch: 0,
+	})
+	if err := reg.SetRegistryRow(encryption.RegistryKey(rotatedDEK, encryption.NodeID16(fullNodeID)), val); err != nil {
+		t.Fatalf("SetRegistryRow: %v", err)
+	}
+
+	w := wiringFor(t, rotatedDEK, true, 0 /*w.epoch=0*/)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID, &lastLogged)
+	if !w.cache.Registered() {
+		t.Error("bootstrap→rotate→cutover sub-path did not MarkRegistered (Registered=false); bootDEKID==0 should keep the deferred-rotation guard off")
+	}
+	if lastLogged != 0 {
+		t.Errorf("lastLogged = %d, want 0 (no deferred-rotation WARN should fire when bootDEKID==0)", lastLogged)
+	}
+}
+
 // TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips pins the
 // 7b' deferral: bootDEK != 0 AND activeDEK != bootDEK → log once per
 // unique rotated-into DEK, do NOT propose. A second tick at the same

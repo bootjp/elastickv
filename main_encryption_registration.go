@@ -564,13 +564,6 @@ func runRuntimeRegistrationWatcher(
 	}
 }
 
-// runtimeRegistrationTick is a single iteration of the watcher loop,
-// extracted so the loop body stays under the cyclop budget and the
-// scope-check + propose can be unit-tested independently of the ticker.
-//
-// Returns to the caller after either a no-op skip, a deferred-rotation
-// skip (logged once per unique DEK via lastLoggedSkip), or a complete
-// synchronous registration attempt via runWriterRegistration.
 // runtimeRegistrationInScope evaluates the §1 scope check: returns the
 // active storage DEK and true ONLY when the 7b watcher should propose
 // (cutover branch or pre-bootstrap branch). All other cases — already
@@ -613,6 +606,12 @@ func runtimeRegistrationInScope(
 	return activeDEK, true
 }
 
+// runtimeRegistrationTick is a single iteration of the watcher loop,
+// extracted so the loop body stays under the cyclop budget and the
+// scope-check + propose can be unit-tested independently of the ticker.
+// Returns to the caller after either a no-op skip, a deferred-rotation
+// skip (logged once per unique DEK via lastLoggedSkip), or a complete
+// synchronous registration attempt via runWriterRegistration.
 func runtimeRegistrationTick(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
