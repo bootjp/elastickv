@@ -110,16 +110,16 @@ flow is:
    Observe (hot path)                       background goroutine
    ─────────────────                        ────────────────────
    if !hotKeysEnabled return                  drain ch
-   if rand/v2.IntN(R) != 0 return             for (rid, kc) := range ch:
-   if len(key) > maxKeyLen {                     per-route SS update (no
-     skippedLong.Add(1); return                   lock — single-writer);
-   }                                              SS COPIES key bytes,
+   if len(key) > maxKeyLen {                  for (rid, kc) := range ch:
+     skippedLong.Add(1); return                   per-route SS update (no
+   }                                              lock — single-writer);
+   if rand/v2.IntN(R) != 0 return                 SS COPIES key bytes,
    kc := pool.Clone(key)                          pool buffer released
-   select {                                    periodic atomic.Pointer.Store
-     case ch <- {rid, kc}:                       of a deep-copied snapshot
-     default: dropped.Add(1)                      (also reads dropped /
-       pool.Release(kc); drop                     skippedLong counters)
-   }
+   select {                                    periodic deep-copy snapshot
+     case ch <- {rid, kc}:                       publish via atomic.Pointer
+     default: dropped.Add(1)                     (reads dropped /
+       pool.Release(kc); drop                    skippedLong counters);
+   }                                            then reset live sketch
 ```
 
 Concretely:
@@ -159,16 +159,20 @@ Concretely:
   comes from a `sync.Pool` of pre-sized byte slices; long keys
   (>`hotKeysMaxKeyLen`, default 1024 B) are skipped from sampling
   rather than tracked truncated (truncation would alias different
-  keys into the same entry — worse than dropping). **Long-key skips
-  are counted**, not silent (Codex P2): an `atomic.Uint64`
-  `skipped_long_keys` counter increments on the skip, the aggregator
-  copies it into the snapshot, the drill-down response exposes it
-  (§5), and a non-zero value contributes to `degraded` — so a
-  workload whose actual hot key is longer than the cap cannot
-  produce an empty drill-down result that misleads the operator into
-  thinking no key was missed. **The pool buffer is strictly transient
-  between `Observe` and the aggregator's update** (see below); it is
-  never the storage that an SS entry or a published snapshot points at.
+  keys into the same entry — worse than dropping). **The length
+  check happens BEFORE the sample gate** (Codex P2): `skipped_long_keys`
+  is incremented on every Observe whose key exceeds the cap,
+  regardless of whether that Observe would have passed the 1-in-`R`
+  sample. Without that ordering, a long hot key with `R` writes would
+  have only a `(1 − (1−1/R)^R) ≈ 36%` chance of producing any skip
+  signal at all, so a `degraded` flag built on the counter would
+  silently fail to fire. Now the counter is a deterministic count of
+  long-key Observes since the last snapshot reset; it does NOT scale
+  by `R` (it is not a sample). Aggregator copies it into the snapshot;
+  drill-down response exposes it (§5); a non-zero value contributes
+  to `degraded`. **The pool buffer is strictly transient between
+  `Observe` and the aggregator's update** (see below); it is never the
+  storage that an SS entry or a published snapshot points at.
 - **Single background aggregator goroutine** drains the channel and
   updates the per-route Space-Saving sketches. Single-writer ⇒ no
   lock needed on the sketches' update path. **The aggregator copies
@@ -189,12 +193,30 @@ Concretely:
   reset. Without the reset the sketch would accumulate since the
   feature was enabled, so a key hot in an old window could still
   dominate a drill-down on the current cell. The reset gives each
-  published snapshot exactly one `keyvizStep` window of observations —
-  matching the matrix cell's per-Step semantics — while the next
-  window fills the freshly-cleared sketch. The aggregator is the only
-  writer to the live sketch and to its counters, so the reset and the
-  snapshot deep-copy happen atomically from the rest of the system's
-  perspective with no lock needed.
+  published snapshot **approximately** one `keyvizStep` window of
+  observations — matching the matrix cell's per-Step semantics —
+  while the next window fills the freshly-cleared sketch. The
+  aggregator is the only writer to the live sketch and to its
+  counters, so the reset and the snapshot deep-copy happen atomically
+  from the rest of the system's perspective with no lock needed.
+
+  **Boundary smear** (Codex P2 L193): events still queued in the
+  channel at the publish tick are events that belong to the
+  just-finished window but will be drained INTO the freshly-reset
+  sketch after the reset — they therefore appear in the *next*
+  published snapshot, not the one they semantically belong to. The
+  aggregator drains the channel best-effort before the reset to
+  shrink this window, but the hot path can keep refilling, so a
+  bounded smear remains: at most `hotKeysQueueSize` events plus the
+  arrivals during the publish operation. For default `keyvizStep =
+  60s` this is sub-1% of a busy window's traffic. The matrix path has
+  the same sub-Step boundary fuzziness at its flush — we explicitly
+  accept it here for the same reason. Operators reading a snapshot
+  taken seconds after a workload spike should expect a small
+  carry-over into the next snapshot; a generation-tagged event
+  channel (each event stamped with the publish-tick gen, aggregator
+  routes by gen) is recorded as a future enhancement (§10) if the
+  smear ever proves load-bearing.
   Drill-down reads load the pointer and read the snapshot lock-free;
   snapshots are cheap (≤ m × small entry) and a new publish drops the
   previous snapshot to the GC without disturbing in-flight readers.
