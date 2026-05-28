@@ -137,7 +137,9 @@ Each module exposes:
 - **VARIABLES** — only the state owned by that subsystem.
 - **Init** / **Next** — the state machine.
 - **TypeInvariant** — well-formedness.
-- **SafetyInvariants** — Section 5.
+- **SafetyInvariants** — Section 5.1–5.5.
+- **LivenessProperties** — Section 5.6, checked with TLC `PROPERTY` under
+  the relevant fairness assumptions (separately from the `INVARIANT` set).
 
 A module **does not** import another module's variables directly. Instead,
 `Composed.tla` instantiates each module with a shared environment from
@@ -155,9 +157,12 @@ A module **does not** import another module's variables directly. Instead,
 
 ## 5. Invariants to Prove
 
-Numbered for traceability. Each invariant is asserted as a TLA+ `INVARIANT`
-in the module that owns the relevant state, plus `Composed` where it
-crosses module boundaries.
+Numbered for traceability. Sections 5.1–5.5 are **safety** properties,
+asserted as TLA+ `INVARIANT` in the module that owns the relevant state
+(plus `Composed` where they cross module boundaries). Section 5.6 lists the
+**liveness** properties separately — these are temporal (`<>`, `[]<>`) and
+are asserted as `PROPERTY` with explicit fairness assumptions, since TLC
+cannot check them as state invariants.
 
 ### 5.1 HLC
 
@@ -185,9 +190,17 @@ crosses module boundaries.
 - **OCC-3 — Read snapshot stability.** A transaction `T` that reads key `k`
   at `read_ts(T)` sees the value of the unique committed write to `k` with
   the largest `commit_ts ≤ read_ts(T)` (or "not present" if none exists).
-- **OCC-4 — Lock release.** Every lock `(k, lock_ts)` is eventually
-  released (committed → version installed, or aborted → lock cleared);
-  lock-resolver paths do not strand a lock.
+- **OCC-4 — No stranded lock at quiescence.** In any state where the
+  lock-resolver and all transactions of a given `start_ts` are no longer
+  scheduled (no enabled actions for that `start_ts`), no lock for that
+  `start_ts` remains. This is a bounded safety form of "locks are
+  eventually resolved"; the unbounded eventual-release statement is
+  restated as a liveness property in Section 5.6 (OCC-L1).
+- **OCC-5 — Start-ts consistency.** All read and write operations within a
+  single transaction `T` share the same `start_ts(T)`, which equals
+  `read_ts(T)`. In particular, for read-modify-write transactions, the
+  write half re-uses the read half's timestamp; there is no per-operation
+  re-read, so the transaction observes a single MVCC snapshot end-to-end.
 
 ### 5.3 MVCC
 
@@ -208,11 +221,23 @@ crosses module boundaries.
   monotonic; no node ever applies a snapshot with a non-increasing version.
 - **Routes-2 — Coverage and disjointness.** At every catalog version, the
   ranges form a partition of the keyspace (covering, non-overlapping).
-- **Routes-3 — SplitRange atomicity.** `SplitRange` either fully applies
-  (the parent range is replaced by exactly the two child ranges in the
-  catalog and in every node's `RouteEngine`) or has no observable effect.
+- **Routes-3 — SplitRange catalog atomicity.** `SplitRange` either fully
+  applies **in the catalog** (the parent range is atomically replaced by
+  exactly the two child ranges, with a single catalog-version bump) or has
+  no observable effect on the catalog. The handling node also updates its
+  own `RouteEngine` synchronously with the catalog write
+  (`adapter/distribution_server.go` `saveSplitResultViaCoordinator` +
+  `applyEngineSnapshot`); propagation to **other** nodes' `RouteEngine`
+  instances is asynchronous via `CatalogWatcher` polling
+  (`distribution/watcher.go`) and is covered by Routes-4 rather than
+  required to be simultaneous. The spec must not require cross-node atomic
+  engine updates — doing so would exclude the stale-cache schedules this
+  proposal is meant to analyse around SplitRange × OCC interactions.
 - **Routes-4 — Watcher fan-out monotonicity.** No node's `RouteEngine`
-  observes catalog version `v2` before `v1` if `v1 < v2`.
+  observes catalog version `v2` before `v1` if `v1 < v2`. Combined with
+  Routes-1 (durable catalog monotonicity) this means each node's view of
+  the catalog is a monotonically advancing prefix of the true catalog
+  history — never a re-ordering, only a lag.
 
 ### 5.5 Cross-subsystem (composed)
 
@@ -231,6 +256,32 @@ crosses module boundaries.
   respects real-time happens-before. (This is what Jepsen / `elle` would
   check; modelling it here lets us prove it under all schedules in the
   bounded space.)
+
+### 5.6 Liveness properties
+
+Liveness properties cannot be expressed as state invariants; they require
+TLA+ temporal operators (`<>`, `[]<>`) and fairness assumptions on the
+relevant actions. They are checked via TLC `PROPERTY` (not `INVARIANT`)
+under the fairness conditions stated alongside each property. Each
+liveness property requires the bounded model to be checked with TLC's
+liveness mode, which is significantly more expensive than safety checking;
+expect these to be opt-in (Section 8.2 `tla-check-deep`).
+
+- **OCC-L1 — Eventual lock release.** Every lock `(k, lock_ts)` is
+  eventually released — committed (→ versioned write installed) or
+  aborted (→ lock cleared). Stated as `[](lockHeld(k, ts) ⇒ <> ¬lockHeld(k, ts))`
+  under weak fairness on the lock-resolver action and on the owning
+  transaction's `Commit` / `Abort` transitions. Without these fairness
+  assumptions a model can park forever in a state with an outstanding
+  lock; TLC's liveness checker reports such a counterexample. The bounded
+  safety counterpart is OCC-4 (no stranded lock at quiescence).
+
+- **Routes-L1 — Eventual catalog convergence.** For every catalog version
+  `v` that is committed durably, every live node's `RouteEngine`
+  eventually observes version `≥ v`. Stated as `<>(∀ n: engineVersion[n] ≥ v)`
+  under weak fairness on the `CatalogWatcher.SyncOnce` action. This is
+  the liveness counterpart of Routes-4 (which only bounds the order of
+  observations, not their occurrence).
 
 ---
 
@@ -321,11 +372,11 @@ proves something on its own).
 | ID | Scope | Output | Notes |
 |---|---|---|---|
 | **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4. `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops). | Smallest viable PR; sets the directory layout precedent. |
-| **M2** | `occ/OCC.tla` with invariants OCC-1..OCC-4. | OCC spec runnable in isolation. | Re-uses `lib/Raft.tla`; introduces lock map and read/write sets. |
+| **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | OCC spec runnable in isolation. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. Liveness (OCC-L1) is deferred to M6. |
 | **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | MVCC spec runnable in isolation. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
-| **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Route catalog spec runnable in isolation. | Models `SplitRange` and watcher polling. |
-| **M5** | `composed/Composed.tla` with invariants Composed-1..Composed-3. CI integration. | Cross-subsystem spec; TLC at default bounds in <10 min. | Where interaction bugs surface. |
-| **M6** *(optional)* | `tla-check-deep` configuration: larger bounds for `Composed`. | Deeper coverage runnable on a beefier machine / off-CI. | Out of scope of the initial proposal — included only as a placeholder for the follow-up decision. |
+| **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Route catalog spec runnable in isolation. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. Liveness (Routes-L1) is deferred to M6. |
+| **M5** | `composed/Composed.tla` with safety invariants Composed-1..Composed-3. CI integration. | Cross-subsystem spec; TLC at default bounds in <10 min. | Where interaction bugs surface. Safety only; liveness is M6. |
+| **M6** *(optional)* | `tla-check-deep` configuration: larger bounds for `Composed`, plus liveness checking for OCC-L1 and Routes-L1 with their fairness assumptions. | Deeper coverage runnable on a beefier machine / off-CI. | Out of scope of the initial proposal — included only as a placeholder for the follow-up decision. Liveness checking is significantly more expensive than safety checking, hence the deferral. |
 
 ### 8.2 Doc lifecycle
 
