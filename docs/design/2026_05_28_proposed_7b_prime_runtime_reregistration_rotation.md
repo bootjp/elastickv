@@ -415,10 +415,12 @@ node's sidecar now records its own emissions accurately.
      re-propose for a bug.
 
 3. Replace `TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips`
-   (which pins the 7b deferral) with
-   `TestRuntimeRegistrationTick_RotationInScopeProposes` (the 7b'
-   behaviour) and document the lifecycle transition in the commit
-   message: the deferral was the 7b posture; 7b' is the resolution.
+   (which pins the 7b deferral) with the two tests in §5 item 2
+   above (`TestRuntimeRegistrationTick_RotationInScopeInvokesPropose`
+   + `TestRuntimeRegistrationTick_RotationVerifyShortCircuitsToMark`
+   — the 7b' resolution) and document the lifecycle transition in
+   the commit message: the deferral was the 7b posture; 7b' is the
+   resolution.
 
 4. Self-review (5-lens) for the implementation PR — same template
    as 7b. Particular attention to:
