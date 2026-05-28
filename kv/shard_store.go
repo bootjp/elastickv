@@ -131,7 +131,17 @@ func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitT
 		return exists, nil
 	}
 	if !isLinearizableRaftLeader(ctx, engine) {
-		return false, nil
+		// Not the linearizable leader for this group. Use the engine's
+		// ReadIndex (LinearizableRead) to forward to the current leader
+		// and wait until our local applied index catches up to the
+		// leader's commit point. After that, a local probe sees every
+		// committed version including any landed at commitTS. If
+		// ReadIndex fails (no leader reachable, ctx canceled), fall back
+		// to (false, nil) and let the adapter's resolveListMeta path
+		// take over via the leader-fenced ScanAt/GetAt.
+		if _, err := engine.LinearizableRead(ctx); err != nil {
+			return false, nil
+		}
 	}
 	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
 	if err != nil {

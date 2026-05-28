@@ -188,35 +188,43 @@ func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64)
 	return err == nil, errors.WithStack(err)
 }
 
-// CommittedVersionAt gates the exact-timestamp existence probe behind the
-// same lease-aware leader check that LatestCommitTS uses, so client reads
-// through this wrapper get a fresh authoritative answer.
+// CommittedVersionAt gates the exact-timestamp existence probe so client
+// reads through this wrapper get a fresh authoritative answer even on a
+// deposed leader. The FSM apply path is NOT affected — it holds the raw
+// local store (not a LeaderRoutedStore), so its deterministic probe never
+// goes through this method. The option-2 reuse path
+// (RedisServer.resolveReuseLength) DOES call this and needs the
+// authoritative answer to preserve the pending.length fast-path
+// (returning the per-our-commit length rather than the leader's current
+// Len) when our prior attempt actually committed.
 //
-// The original justification for an unconditional local read was that the
-// probe is only consumed by the deterministic one-phase FSM apply path —
-// which is true and remains the case: the FSM holds the raw local store
-// (not a LeaderRoutedStore), so its probe never goes through this method.
-// But the option-2 reuse path (RedisServer.resolveReuseLength) also calls
-// CommittedVersionAt on the adapter's r.store, which IS the
-// LeaderRoutedStore. During leader churn — exactly the environment this
-// feature targets — the local replica may have lost leadership before
-// applying the entry the new leader committed, so a stale local read could
-// miss a version that exists cluster-wide and steer the adapter into the
-// wrong reconstruction branch (codex P1).
+// Two-path strategy, mirroring how LatestCommitTS uses a lease fast-path
+// and a proxy slow-path:
 //
-// There is no RawCommittedVersionAt RPC to proxy to. The chosen tradeoff
-// is to answer authoritatively when we are leader (lease valid → local is
-// up-to-date) and return (false, nil) otherwise; the adapter's fall-through
-// goes through resolveListMeta, which uses ScanAt/GetAt — those ARE
-// leader-fenced — so the eventual return value is the leader's current
-// Len, a valid serialization. This sacrifices the pending.length fast-path
-// during churn but never returns an incorrect length.
+//   - We are the leader with a valid lease (leaderOKForKey is true): the
+//     local replica is up-to-date by the lease invariant; read local.
+//   - Not leader (deposed or never): there is no RawCommittedVersionAt
+//     RPC to proxy to, so use the coordinator's LinearizableRead to
+//     submit a Raft ReadIndex — that protocol forwards to the current
+//     leader and waits until our local applied index has caught up to
+//     the leader's commit point. After that, a local probe sees every
+//     committed version of this key (including any landed at commitTS).
+//     If the read-index fails (no leader reachable, ctx canceled), fall
+//     back to (false, nil); the adapter's resolveReuseLength then re-reads
+//     via the already-leader-fenced ScanAt/GetAt, returning the leader's
+//     current Len — a valid serialization, just not the per-our-commit
+//     value.
 func (s *LeaderRoutedStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
 	if s == nil || s.local == nil {
 		return false, nil
 	}
 	if !s.leaderOKForKey(ctx, key) {
-		return false, nil
+		if s.coordinator == nil {
+			return false, nil
+		}
+		if _, err := s.coordinator.LinearizableRead(ctx); err != nil {
+			return false, nil
+		}
 	}
 	exists, err := s.local.CommittedVersionAt(ctx, key, commitTS)
 	return exists, errors.WithStack(err)
