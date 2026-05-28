@@ -267,6 +267,64 @@ func TestListPushDedup_InterveningRPopRefusesStaleReuse(t *testing.T) {
 	require.Equal(t, []byte("v"), val, "the pushed element must be reachable at meta.Head")
 }
 
+// TestListPushDedup_InterveningNonConflictingLPush_RecomputesLength is the
+// codex P2 regression. Attempt 1's RPUSH plans seq Tail and fails without
+// landing; an intervening LPUSH commits non-conflictingly (writes at
+// Head-1, doesn't touch our boundary read keys at Head / Tail-1). The
+// reuse's probe misses (attempt 1 didn't land), the boundary OCC passes
+// (LPUSH didn't touch our boundary), the write-key OCC passes (different
+// keys), and the apply succeeds at the fresh commit_ts. Pre-fix, the
+// adapter returned pending.length (= attempt-1-snapshot, missing LPUSH's
+// element). Post-fix, the adapter detects the apply-not-no-op case via
+// CommittedVersionAt(probeKey, pending.commitTS) miss, re-reads the
+// current meta, and returns the correct post-push length.
+func TestListPushDedup_InterveningNonConflictingLPush_RecomputesLength(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("mylist")
+
+	// Seed [A] at seq 0 (Head=0, Len=1, Tail=1).
+	require.NoError(t, st.PutAt(ctx, listItemKey(key, 0), []byte("A"), 1, 0))
+	seedDelta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, 1, 0), seedDelta, 1, 0))
+
+	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 errors without landing
+	coord.clock.Observe(1)
+	// Between attempts, simulate an LPUSH committing: writes listItemKey(-1)
+	// (Head-1) and a delta with HeadDelta=-1, LenDelta=+1. Crucially this
+	// does NOT touch the boundary read keys (Head=0, Tail-1=0) or our
+	// RPUSH's write keys (listItemKey(1), ListMetaDeltaKey(key, T1, 0)),
+	// so neither the read-set OCC nor the write-set OCC catches it.
+	coord.beforeDispatch = func(n int) {
+		if n != 2 {
+			return
+		}
+		ts := coord.Clock().Next()
+		require.NoError(t, st.PutAt(ctx, listItemKey(key, -1), []byte("x"), ts, 0))
+		lpushDelta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 1})
+		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, ts, 0), lpushDelta, ts, 0))
+	}
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	n, err := srv.listRPush(ctx, key, [][]byte{[]byte("v")})
+	require.NoError(t, err)
+	// Three elements after the dust settles: LPUSH's "x" at seq -1, the
+	// seed "A" at seq 0, our "v" at seq 1. A stale snapshot return would
+	// be 2 (attempt 1's view: 1 seed + 1 push, no LPUSH).
+	require.Equal(t, int64(3), n, "return must reflect intervening non-conflicting writes, not the attempt-1 snapshot")
+	// Only two dispatches: attempt 1 (pre-rejects), attempt 2 (reuse applies).
+	// No recompute needed because the boundary and write-key OCC both pass.
+	require.Equal(t, 2, coord.dispatches)
+	require.Equal(t, 0, coord.probeNoOps, "prior did not land; the probe must miss")
+
+	readTS := snapshotTS(coord.Clock(), st)
+	meta, _, err := srv.resolveListMeta(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), meta.Len)
+	require.Equal(t, int64(-1), meta.Head)
+}
+
 // TestListPushDedup_DisabledKeepsLegacyPath confirms the gate is off by
 // default: without onePhaseTxnDedup, listPushCore never emits prev_commit_ts,
 // so the coordinator's probe is never exercised (dedup count stays zero) and

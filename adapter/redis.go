@@ -3240,6 +3240,20 @@ type reusableListPush struct {
 	readKeys [][]byte
 }
 
+// firstWriteKey returns the first non-empty element key from ops, or nil
+// when there is none. Used after a successful reuse dispatch to probe
+// whether our prior attempt's commit_ts actually landed: attempt 1 writes
+// all its elem keys atomically at the same commit_ts, so any one of them
+// answers the question.
+func firstWriteKey(ops []*kv.Elem[kv.OP]) []byte {
+	for _, e := range ops {
+		if e != nil && len(e.Key) > 0 {
+			return e.Key
+		}
+	}
+	return nil
+}
+
 // listPushBoundaryReadKeys returns the boundary positions of the list as
 // read keys for OCC. Including these in the dispatched OperationGroup makes
 // FSM apply atomically reject the retry when any pop/trim has touched the
@@ -3281,10 +3295,39 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 				Elems:        pending.ops,
 			})
 			if dispErr == nil {
-				// Either the prior attempt landed (probe hit → no-op) or this
-				// reuse applied the identical write set. The post-push length
-				// is the same either way, so reconstruction is just pending.length.
-				newLen = pending.length
+				// Distinguish the two success paths so we return the right
+				// length (codex P2): if the FSM no-op'd because our prior
+				// attempt at pending.commitTS actually committed, the
+				// client-visible length is the one we computed at that
+				// attempt and stashed in pending.length. If instead the FSM
+				// applied the reused write set at the fresh commit_ts (our
+				// prior didn't land), the length must include any
+				// non-conflicting list-modifying writes that committed
+				// between attempts (e.g. an intervening LPUSH that the
+				// boundary OCC fence did not catch because it didn't touch
+				// Head / Tail-1) — the legacy retry path would have
+				// recomputed in that window, and a stale return would
+				// understate the count. A point read of any of our write
+				// keys at pending.commitTS answers the question: attempt 1
+				// wrote all its keys atomically at that commit_ts, so any
+				// hit means it landed.
+				priorLanded := false
+				if probeKey := firstWriteKey(pending.ops); len(probeKey) > 0 {
+					hit, perr := r.store.CommittedVersionAt(ctx, probeKey, pending.commitTS)
+					if perr != nil {
+						return errors.WithStack(perr)
+					}
+					priorLanded = hit
+				}
+				if priorLanded {
+					newLen = pending.length
+					return nil
+				}
+				currentMeta, _, mErr := r.resolveListMeta(ctx, key, r.readTS())
+				if mErr != nil {
+					return mErr
+				}
+				newLen = currentMeta.Len
 				return nil
 			}
 			if errors.Is(dispErr, store.ErrWriteConflict) {
