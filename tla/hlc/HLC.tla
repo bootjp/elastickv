@@ -93,8 +93,12 @@ BecomeLeader_HLC(n) ==
 (***************************************************************************)
 TickWall(n) ==
     /\ wallNow[n] < MaxWallTime
-    /\ \A m \in Nodes : (wallNow[n] + 1) - wallNow[m] <= MaxClockSkewMs
-                     /\ wallNow[m] - (wallNow[n] + 1) <= MaxClockSkewMs
+    \* Bounded inter-node skew (HLC-4 precondition (i)).  Stated with addition
+    \* rather than subtraction so the inequality stays inside Nat (per gemini
+    \* PR #856 review: subtraction in Naturals is undefined when the LHS is
+    \* smaller and would halt TLC).
+    /\ \A m \in Nodes : /\ wallNow[n] + 1 <= wallNow[m] + MaxClockSkewMs
+                        /\ wallNow[m] <= wallNow[n] + 1 + MaxClockSkewMs
     /\ wallNow' = [wallNow EXCEPT ![n] = @ + 1]
     /\ UNCHANGED <<raftVars, hlcLast, physicalCeiling, maxAppliedHLC, committedTS, opCount>>
 
@@ -130,8 +134,12 @@ IssueTimestamp(n) ==
     /\ LET prev == hlcLast[n]
            ts   == ComputeNextHLC(prev, FlooredNow(n))
         IN /\ hlcLast' = [hlcLast EXCEPT ![n] = ts]
+           \* Each commit gets the global opCount as a strict issuance
+           \* ordinal so HLC1_PerNodeMonotonic can talk about "the prev
+           \* and next commit by the same node" — without it the state
+           \* invariant would just be a tautology on a totally ordered set.
            /\ committedTS' = committedTS \cup
-                {[ts |-> ts, term |-> activeTerm, node |-> n]}
+                {[ts |-> ts, term |-> activeTerm, node |-> n, seq |-> opCount]}
            /\ maxAppliedHLC' = IF HLCLT(maxAppliedHLC, ts)
                                THEN ts
                                ELSE maxAppliedHLC
@@ -168,22 +176,49 @@ TypeOK ==
         /\ r.ts \in HLCType
         /\ r.term \in 1..MaxTerms
         /\ r.node \in Nodes
+        /\ r.seq \in 0..MaxOps
 
 \* === SAFETY INVARIANTS ===
 
-\* HLC-1 — per-node monotonicity of hlcLast.  By construction
-\* IssueTimestamp produces ComputeNextHLC(prev, ...) which is >= prev in the
-\* HLCLE order, so this invariant is implied by the algorithm.  We assert
-\* the algebraic form on committed ts to make the proof obligation explicit.
+\* HLC-1 — per-node monotonicity of hlcLast across IssueTimestamp /
+\* BecomeLeader_HLC / Observe.  The earlier formulation
+\* `HLCLE(r1, r2) \/ HLCLE(r2, r1)` was vacuously true under the total
+\* lexicographic order on HLCVal (codex PR #856 P2): it would have admitted
+\* a regression (5,0) -> (4,0) as "ordered".  We instead carry an explicit
+\* issuance ordinal on every committedTS record (`seq` is the global opCount
+\* at the moment IssueTimestamp fired) and assert strict-greater on the same
+\* node — every later issuance is strictly above the previous one.  Combined
+\* with the per-action invariant HLC1_Action below this gives the same
+\* monotonicity the implementation provides via h.last's CAS.
 HLC1_PerNodeMonotonic ==
     \A r1, r2 \in committedTS :
-        r1.node = r2.node => HLCLE(r1.ts, r2.ts) \/ HLCLE(r2.ts, r1.ts)
+        (r1.node = r2.node /\ r1.seq < r2.seq) => HLCLT(r1.ts, r2.ts)
 
-\* HLC-2 — physical ceiling monotonicity (per node).  ApplyCeiling raises
-\* with a max(), and there is no action that lowers physicalCeiling.  The
-\* invariant is therefore a stuttering-step consequence, asserted here as
-\* a sanity check rather than a behavioural property.
-HLC2_CeilingMonotonic == \A n \in Nodes : physicalCeiling[n] >= 0
+\* HLC-2 — physical ceiling monotonicity is fundamentally an *action*
+\* invariant: physicalCeiling[n] must not decrease across any step.  We
+\* state it as the safety property `HLC2_Action` below and reference it
+\* via PROPERTIES in MCHLC.cfg.  No state-level form is meaningful here
+\* (the earlier `>= 0` was vacuously implied by TypeOK — codex PR #856
+\* P2).
+HLC2_NonNeg == \A n \in Nodes : physicalCeiling[n] \in Nat
+
+\* === ACTION-LEVEL INVARIANTS ===
+(***************************************************************************)
+(* Action-level safety properties.  In TLA+ idiom these are written as     *)
+(* [][P]_vars and registered under PROPERTIES (not INVARIANTS) in the .cfg *)
+(* — TLC checks them as transition properties without requiring fairness.  *)
+(***************************************************************************)
+
+\* HLC-1 (transition form): hlcLast on every node weakly increases across
+\* every step.  Built into ComputeNextHLC and into BecomeLeader_HLC's
+\* Observe; this property pins the contract.
+HLC1_Action ==
+    [][\A n \in Nodes : HLCLE(hlcLast[n], hlcLast'[n])]_vars
+
+\* HLC-2 (transition form): physicalCeiling on every node weakly increases
+\* across every step.  ApplyCeiling raises with max(); no action lowers it.
+HLC2_Action ==
+    [][\A n \in Nodes : physicalCeiling[n] <= physicalCeiling'[n]]_vars
 
 \* HLC-3 — only the leader of a term issues commits for that term.  Built
 \* into IssueTimestamp via the IsLeader(n) guard; asserted explicitly so

@@ -33,7 +33,18 @@ $(TLA_JAR):
 	@mkdir -p $(dir $(TLA_JAR))
 	@echo "Downloading tla2tools.jar $(TLA_VERSION)..."
 	@curl -fsSL -o $(TLA_JAR).tmp $(TLA_URL)
-	@actual=$$(shasum -a 256 $(TLA_JAR).tmp | awk '{print $$1}'); \
+	@# Prefer sha256sum (GNU coreutils, universal on Linux); fall back to
+	@# shasum -a 256 (default on macOS).  Either yields the same hex
+	@# digest in the first whitespace-delimited field.
+	@if command -v sha256sum >/dev/null 2>&1; then \
+		actual=$$(sha256sum $(TLA_JAR).tmp | awk '{print $$1}'); \
+	elif command -v shasum >/dev/null 2>&1; then \
+		actual=$$(shasum -a 256 $(TLA_JAR).tmp | awk '{print $$1}'); \
+	else \
+		echo "ERROR: neither sha256sum nor shasum is available."; \
+		rm -f $(TLA_JAR).tmp; \
+		exit 1; \
+	fi; \
 	if [ "$$actual" != "$(TLA_SHA256)" ]; then \
 		echo "ERROR: tla2tools.jar SHA-256 mismatch."; \
 		echo "  expected: $(TLA_SHA256)"; \
