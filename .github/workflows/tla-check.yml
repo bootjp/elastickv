@@ -66,13 +66,18 @@ jobs:
       # GitHub release artefacts on every run.  Key includes the Makefile
       # hash so a version-pin change invalidates the cache automatically
       # (TLA_VERSION + TLA_SHA256 both live in the Makefile).
+      #
+      # NO restore-keys: a prefix-match restore would bring back an older
+      # jar after a TLA_VERSION/TLA_SHA256 bump.  Because the Makefile's
+      # $(TLA_JAR) recipe is gated on file existence, the restored stale
+      # jar would skip checksum verification entirely — defeating the
+      # whole point of the pin (codex P2 on PR #856 round 4).  A full
+      # miss-and-redownload is correct here.
       - name: Cache tla2tools.jar
         uses: actions/cache@v5
         with:
           path: .cache/tla
           key: ${{ runner.os }}-tla-tools-${{ hashFiles('Makefile') }}
-          restore-keys: |
-            ${{ runner.os }}-tla-tools-
 
       - name: Pre-fetch tla2tools.jar (logs separately from tla-check)
         run: make tla-tools
