@@ -10,17 +10,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// hotKeysTestCapacity is the per-route Space-Saving capacity used by
+// every direct hotKeysTestSampler test. Inlined here (rather than a
+// fn parameter) because every caller passes the same value — varying
+// only along queue/key-length axes — and unparam catches the dead arg.
+const hotKeysTestCapacity = 8
+
 // hotKeysTestSampler constructs a MemSampler with hot-keys enabled and
 // R=1 (every observe enqueues — deterministic for tests). The Step is
 // set high so the aggregator's tick never fires during the test;
 // publishAndReset is called explicitly when needed.
-func hotKeysTestSampler(t *testing.T, capacity, queueSize, maxKeyLen int) *MemSampler {
+func hotKeysTestSampler(t *testing.T, queueSize, maxKeyLen int) *MemSampler {
 	t.Helper()
 	return NewMemSampler(MemSamplerOptions{
 		Step:               time.Hour, // never ticks during the test
 		HistoryColumns:     4,
 		HotKeysEnabled:     true,
-		HotKeysPerRoute:    capacity,
+		HotKeysPerRoute:    hotKeysTestCapacity,
 		HotKeysSampleRate:  1, // every Observe is sampled
 		HotKeysQueueSize:   queueSize,
 		HotKeysMaxKeyLen:   maxKeyLen,
@@ -40,7 +46,7 @@ func drainAndPublish(a *hotKeysAggregator) {
 
 func TestHotKeysObservePublishesPerRouteSnapshot(t *testing.T) {
 	t.Parallel()
-	s := hotKeysTestSampler(t, 8, 32, 64)
+	s := hotKeysTestSampler(t, 32, 64)
 	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 0))
 
 	for i := 0; i < 5; i++ {
@@ -99,27 +105,36 @@ func TestHotKeysLongKeySkippedBeforeSampling(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		s.Observe(1, tooLong, OpWrite, 0)
 	}
+	// Long-key check runs BEFORE the sample gate, so all 50 observes
+	// bump the node-global counter — independent of R.
+	require.Equal(t, uint64(50), s.hotKeys.skipped.Load(),
+		"long-key check must run BEFORE the sample gate (Codex P2 round-7 L116)")
+
+	// No events enqueued (every observe was length-skipped), so
+	// publishAndReset has no sketch to attach the node-global signal
+	// to. publishAndReset must NOT discard the signal in that case —
+	// it should carry the skipped count forward to the next window.
 	drainAndPublish(s.hotKeys)
-	snap := s.HotKeysSnapshot(1)
-	// Long-key observes never enqueue, so the route's sketch is empty
-	// (no entries, sampledN == 0) BUT the node-global skipped counter
-	// fired on every call, marking the snapshot degraded.
-	if snap != nil {
-		require.Empty(t, snap.Entries)
-		require.Zero(t, snap.SampledN)
-		require.Equal(t, uint64(50), snap.SkippedLongKeys,
-			"long-key check must run BEFORE the sample gate")
-		require.True(t, snapDegraded(snap), "skip alone -> degraded")
-	}
-	// The aggregator may not have created a snapshot for this route
-	// at all (no enqueues for it). Either way, the node-global counter
-	// must reflect the 50 skips on the aggregator's view BEFORE
-	// publish reset it — verify by re-observing one long key after
-	// publish and checking the counter increments again.
-	for i := 0; i < 3; i++ {
-		s.Observe(1, tooLong, OpWrite, 0)
-	}
-	require.Equal(t, uint64(3), s.hotKeys.skipped.Load(), "skipped counter resets at publish and re-accumulates")
+	require.Nil(t, s.HotKeysSnapshot(1), "no enqueues -> no per-route snapshot")
+	require.Equal(t, uint64(50), s.hotKeys.skipped.Load(),
+		"node-global skipped must carry forward when no sketch exists to attach it to")
+
+	// Second sampler at R=1 (every observe samples deterministically)
+	// to pin the surface-and-Swap behavior without flaking on the
+	// sample gate: seed the live `skipped` counter directly, observe
+	// one short key so a sketch exists, and verify the next publish
+	// captures the skipped count INTO that snapshot via Swap and
+	// resets the live counter atomically.
+	s2 := hotKeysTestSampler(t, 32, 4)
+	require.True(t, s2.RegisterRoute(1, []byte("a"), []byte("z"), 0))
+	s2.hotKeys.skipped.Store(50)
+	s2.Observe(1, []byte("ok"), OpWrite, 0)
+	drainAndPublish(s2.hotKeys)
+	snap := s2.HotKeysSnapshot(1)
+	require.NotNil(t, snap)
+	require.Equal(t, uint64(50), snap.SkippedLongKeys, "skipped surfaced on the first sketch-bearing snapshot")
+	require.True(t, snapDegraded(snap), "non-zero skipped -> degraded")
+	require.Equal(t, uint64(0), s2.hotKeys.skipped.Load(), "Swap reset the live counter when published")
 }
 
 // TestHotKeysChannelFullCountsDrops pins Codex round-3 L138: a sampled
@@ -129,7 +144,7 @@ func TestHotKeysChannelFullCountsDrops(t *testing.T) {
 	t.Parallel()
 	// Queue size 4; no aggregator goroutine running, so nothing drains.
 	// At R=1, the 5th observe must drop.
-	s := hotKeysTestSampler(t, 8, 4, 64)
+	s := hotKeysTestSampler(t, 4, 64)
 	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 0))
 	for i := 0; i < 10; i++ {
 		s.Observe(1, []byte("k"), OpWrite, 0)
@@ -169,7 +184,7 @@ func TestHotKeysAggregateRoutesNotTracked(t *testing.T) {
 // one window cannot dominate the next window's drill-down.
 func TestHotKeysSnapshotResetClearsLiveSketch(t *testing.T) {
 	t.Parallel()
-	s := hotKeysTestSampler(t, 8, 32, 64)
+	s := hotKeysTestSampler(t, 32, 64)
 	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 0))
 	// Window 1: "old" key hot.
 	for i := 0; i < 10; i++ {
@@ -205,13 +220,62 @@ func TestHotKeysDisabledIsZeroCost(t *testing.T) {
 	require.Nil(t, s.HotKeysSnapshot(1))
 }
 
-// TestHotKeysAggregatorRunLoopPublishesOnTick exercises the actual
-// run() goroutine (with a real ticker via the sampler's Step) and the
-// graceful-shutdown final publish path.
-func TestHotKeysAggregatorRunLoopPublishesOnTick(t *testing.T) {
+// TestHotKeysDropCounterAttachesToSnapshot pins the claude-bot 🔴
+// fix: dropped counts must reach the published snapshot via Swap (not
+// Load + later Store, which would lose drops that arrive between).
+func TestHotKeysDropCounterAttachesToSnapshot(t *testing.T) {
+	t.Parallel()
+	// Queue size 4; no aggregator goroutine — observes accumulate so
+	// the 5th onwards drops, and the dropped counter rises to 6.
+	s := hotKeysTestSampler(t, 4, 64)
+	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 0))
+	for i := 0; i < 10; i++ {
+		s.Observe(1, []byte("k"), OpWrite, 0)
+	}
+	require.Equal(t, uint64(6), s.hotKeys.dropped.Load(), "10 sends - 4 enqueued = 6 drops")
+	drainAndPublish(s.hotKeys)
+	snap := s.HotKeysSnapshot(1)
+	require.NotNil(t, snap)
+	require.Equal(t, uint64(6), snap.DroppedSamples, "Swap captures drops into the published snapshot")
+	require.Equal(t, uint64(0), s.hotKeys.dropped.Load(), "Swap reset the live counter")
+	require.True(t, snapDegraded(snap))
+}
+
+// TestHotKeysAggregatorReleasesRemovedRouteState pins the gemini-HIGH
+// fix: when a route is removed mid-window, the aggregator must drop
+// its sketch + per-route counter, otherwise removed routes leak m ×
+// key bytes (and a *uint64) indefinitely under route churn.
+func TestHotKeysAggregatorReleasesRemovedRouteState(t *testing.T) {
+	t.Parallel()
+	s := hotKeysTestSampler(t, 32, 64)
+	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 0))
+	for i := 0; i < 4; i++ {
+		s.Observe(1, []byte("hot"), OpWrite, 0)
+	}
+	drainAndPublish(s.hotKeys)
+	require.Contains(t, s.hotKeys.sketches, uint64(1))
+	require.Contains(t, s.hotKeys.perRouteN, uint64(1))
+
+	// Route removed → next publish must drop its sketch + counter.
+	s.RemoveRoute(1)
+	drainAndPublish(s.hotKeys)
+	require.NotContains(t, s.hotKeys.sketches, uint64(1), "removed route's sketch must be released")
+	require.NotContains(t, s.hotKeys.perRouteN, uint64(1), "removed route's counter must be released")
+}
+
+// TestHotKeysAggregatorGracefulShutdownPublishes pins the ctx.Done arm
+// of run(): a final drain + publish must fire so a last-second observe
+// lands in a queryable snapshot rather than being silently discarded at
+// shutdown. We use cancellation (not the tick) to drive the publish so
+// the assertion is deterministic regardless of goroutine scheduling —
+// the periodic-tick path is exercised by TestHotKeysAggregatorRaceFree.
+func TestHotKeysAggregatorGracefulShutdownPublishes(t *testing.T) {
 	t.Parallel()
 	s := NewMemSampler(MemSamplerOptions{
-		Step:              10 * time.Millisecond,
+		// Step is set very long so the periodic tick cannot fire
+		// before we cancel — the only publish must come from the
+		// ctx.Done arm.
+		Step:              time.Hour,
 		HistoryColumns:    4,
 		HotKeysEnabled:    true,
 		HotKeysPerRoute:   8,
@@ -222,7 +286,6 @@ func TestHotKeysAggregatorRunLoopPublishesOnTick(t *testing.T) {
 	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 0))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -232,21 +295,16 @@ func TestHotKeysAggregatorRunLoopPublishesOnTick(t *testing.T) {
 	for i := 0; i < 7; i++ {
 		s.Observe(1, []byte("hot"), OpWrite, 0)
 	}
-	// Wait long enough for at least one tick to fire.
-	// 5 s is generous: under -race + parallel tests the goroutine
-	// scheduling can keep the 10ms ticker from firing for a while.
-	require.Eventually(t, func() bool {
-		snap := s.HotKeysSnapshot(1)
-		return snap != nil && snap.SampledN >= 7
-	}, 5*time.Second, 10*time.Millisecond, "aggregator must publish after the tick fires")
-
-	// Graceful shutdown: the run loop should drain & publish even
-	// after ctx cancels, so a last-second observe is not lost.
-	for i := 0; i < 3; i++ {
-		s.Observe(1, []byte("late"), OpWrite, 0)
-	}
+	// Cancel triggers the ctx.Done arm, which drains the channel
+	// and publishes one final snapshot before returning.
 	cancel()
 	<-done
+
+	snap := s.HotKeysSnapshot(1)
+	require.NotNil(t, snap, "graceful shutdown must publish a final snapshot")
+	require.GreaterOrEqual(t, snap.SampledN, uint64(7), "all observed events present in the final snapshot")
+	require.Len(t, snap.Entries, 1)
+	require.Equal(t, []byte("hot"), snap.Entries[0].Key)
 }
 
 // TestHotKeysAggregatorRaceFree exercises the hot path under

@@ -273,6 +273,7 @@ func (s *Server) APIHandler() http.Handler {
 //	DELETE /admin/api/v1/s3/buckets/{name}          (auth required, full role)
 //	PUT    /admin/api/v1/s3/buckets/{name}/acl      (auth required, full role)
 //	GET    /admin/api/v1/keyviz/matrix              (auth required)
+//	GET    /admin/api/v1/keyviz/hotkeys             (auth required, full role)
 //
 // Body limit applies uniformly. CSRF and Audit middleware apply to
 // write-capable protected endpoints; login and logout carry their own

@@ -266,13 +266,14 @@ func buildHotKeysResponse(p hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot, e
 // (true-frequency-estimate) units. Capacity is clamped at >=1 by
 // NewMemSampler, so the division is safe; the guards below are
 // belt-and-suspenders for snapshots produced by a future code path.
+// (Local m, not `cap`, to avoid shadowing the builtin per gocritic.)
 func scaledErrorBound(snap *keyviz.KeyvizHotKeysSnapshot) uint64 {
 	sr := positiveAsUint64(snap.SampleRate)
-	cap := positiveAsUint64(snap.Capacity)
-	if cap == 0 {
+	m := positiveAsUint64(snap.Capacity)
+	if m == 0 {
 		return 0
 	}
-	return sr * snap.SampledN / cap
+	return sr * snap.SampledN / m
 }
 
 // positiveAsUint64 converts an int that is known to be non-negative
@@ -403,6 +404,13 @@ func parseTimeWindowParams(fromRaw, toRaw string, p *hotKeysParams) error {
 			return errors.New("to_unix_ms must be an integer (unix milliseconds)")
 		}
 		p.toUnixMs = v
+	}
+	// Reject an inverted window before checkSnapshotWindow ever runs:
+	// a `to < from` interval makes the overlap check ambiguous and
+	// papers over what is almost certainly a client bug (gemini medium
+	// / claude 🔵 on PR #854).
+	if p.fromUnixMs != 0 && p.toUnixMs != 0 && p.fromUnixMs > p.toUnixMs {
+		return errors.New("from_unix_ms must be <= to_unix_ms")
 	}
 	return nil
 }

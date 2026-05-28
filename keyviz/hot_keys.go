@@ -10,8 +10,9 @@ import (
 // Per-cell hot-key drill-down (design 2026_05_28_proposed_keyviz_hot_key_topk).
 // Off by default; opt in via MemSamplerOptions.HotKeysEnabled. Disabled-case
 // overhead is one early-return branch on Observe; enabled-case overhead is a
-// length check, a `rand/v2.IntN(R) == 0` sample gate, a pool clone, and a
-// non-blocking channel send.
+// length check, the splitmix64 `nextSampleRoll() % R == 0` sample gate (see
+// nextSampleRoll for why we avoid math/rand/v2 entirely), a pool clone, and
+// a non-blocking channel send.
 
 // hotKeyEvent ferries one sampled observation from the hot path to the
 // aggregator. key is the pool's `*[]byte` (NOT the slice itself) so the
@@ -312,14 +313,35 @@ func (a *hotKeysAggregator) consume(e hotKeyEvent) {
 // per-route / node-global counters so the next keyvizStep window
 // starts empty (design §4 sketch reset; Codex P2 round-6 L186).
 func (a *hotKeysAggregator) publishAndReset() {
+	// When no per-route sketch exists this window (e.g. every observe
+	// was filtered by the length cap, or no traffic at all on any
+	// route), we have nowhere to attach the node-global drop / skip
+	// counters — and Swap-resetting them here would silently discard
+	// the signal. Carry them forward into the next window instead;
+	// whichever publish tick first has a sketch will surface them.
+	if len(a.sketches) == 0 {
+		return
+	}
 	now := a.clock()
-	dropped := a.dropped.Load()
-	skipped := a.skipped.Load()
+	// Swap-and-capture (not Load + later Store(0)) — the hot path can
+	// still call a.dropped.Add(1) / a.skipped.Add(1) between a Load and
+	// a Store, and those increments would belong to neither the snapshot
+	// being published (already latched) nor the next window (the Store
+	// would clobber them), leaving `degraded=false` during a publish-
+	// straddling burst (claude bot 🔴 PR #854).
+	dropped := a.dropped.Swap(0)
+	skipped := a.skipped.Swap(0)
 	tbl := a.s.table.Load()
 	for rid, sk := range a.sketches {
 		slot := lookupSlotForRoute(tbl, rid)
 		if slot == nil {
-			// Route was removed mid-window; drop the sketch.
+			// Route was removed mid-window: drop the sketch AND its
+			// per-route counter so we don't accumulate dead entries
+			// under route churn (gemini HIGH on PR #854 — without this,
+			// every removed route's m × key bytes plus a *uint64 stays
+			// in the aggregator forever).
+			delete(a.sketches, rid)
+			delete(a.perRouteN, rid)
 			continue
 		}
 		n := uint64(0)
@@ -339,13 +361,13 @@ func (a *hotKeysAggregator) publishAndReset() {
 		slot.hotKeysSnap.Store(snap)
 		sk.reset()
 	}
-	// Reset per-route and node-global counters together with the
-	// sketches so the next window starts uniformly empty.
+	// Per-route counters reset; the node-global ones were already
+	// captured-and-reset by the Swap(0) calls at the top of this
+	// function — issuing another Store(0) here would re-clobber any
+	// hot-path Add that arrived during the publish loop.
 	for k := range a.perRouteN {
 		*a.perRouteN[k] = 0
 	}
-	a.dropped.Store(0)
-	a.skipped.Store(0)
 }
 
 func toSnapshotEntries(es []ssEntrySnap) []KeyvizHotKeyEntry {
