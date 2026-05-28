@@ -404,10 +404,10 @@ node's sidecar now records its own emissions accurately.
    - **Data consistency:** Each node's `Keys[newDEK].LocalEpoch`
      matches its own nonce factory's pinned epoch — no cross-node
      epoch contamination.
-   - **Concurrency:** The `localEpoch()` provider is invoked from
-     the FSM goroutine (apply path) only; no shared-state race
-     with the watcher's read of `w.epoch` (which is the same
-     captured-at-construction value the provider closes over).
+   - **Concurrency:** The `a.localEpoch` field is read from the
+     FSM goroutine (apply path) only; no shared-state race with
+     the watcher's read of `w.epoch` (both are the same static
+     value captured at `Applier` construction).
 
 ## 6. Rollout / migration
 
