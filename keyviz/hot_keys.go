@@ -198,8 +198,8 @@ func (a *hotKeysAggregator) releaseKeyBuffer(bp *[]byte) {
 // enabled. It performs the design §4 ordering:
 //  1. length check FIRST (skipped_long_keys counted deterministically,
 //     not subject to sampling — Codex P2 round-7 L116)
-//  2. probabilistic sample gate (rand/v2 per-P, concurrency-safe — Codex
-//     P1 round-4 L137)
+//  2. probabilistic sample gate (splitmix64 nextSampleRoll()%R == 0,
+//     lock-free — Codex P1 round-4 L137)
 //  3. key clone via sync.Pool
 //  4. non-blocking channel send (drop-on-full + drop counter — Codex
 //     P2 round-3 L138)

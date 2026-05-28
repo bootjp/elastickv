@@ -282,6 +282,29 @@ func TestHotKeysHandler_OutOfSnapshotWindow(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec2.Code)
 }
 
+// TestHotKeysHandler_InvertedTimeWindowReturns400 pins the
+// parseTimeWindowParams from > to rejection (round-2 reviewer 🟡): an
+// inverted [from, to] window must be rejected at the parameter layer
+// with 400 invalid_query so the snapshot-window check never gets to
+// evaluate an upside-down interval.
+func TestHotKeysHandler_InvertedTimeWindowReturns400(t *testing.T) {
+	t.Parallel()
+	src := newStubSource()
+	src.snapshots[1] = &keyviz.KeyvizHotKeysSnapshot{
+		RouteID: 1, SampledN: 10, SampleRate: 1, Capacity: 8,
+		SnapshotAt: time.Now().UTC(),
+	}
+	h := newHandler(t, src)
+	// from = 5000ms, to = 1000ms (to < from).
+	url := "/admin/api/v1/keyviz/hotkeys?route_id=1&from_unix_ms=5000&to_unix_ms=1000"
+	rec := serve(t, h, "GET", url, nil)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	body := rec.Body.String()
+	require.Contains(t, body, "invalid_query")
+	require.Contains(t, body, "from_unix_ms")
+	require.Contains(t, body, "to_unix_ms")
+}
+
 func TestHotKeysHandler_UnknownSeriesReturns400(t *testing.T) {
 	t.Parallel()
 	src := newStubSource()
