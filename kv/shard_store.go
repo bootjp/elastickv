@@ -130,24 +130,35 @@ func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitT
 		}
 		return exists, nil
 	}
-	if !isLinearizableRaftLeader(ctx, engine) {
-		// Not the linearizable leader for this group. Use the engine's
-		// ReadIndex (LinearizableRead) to forward to the current leader
-		// and wait until our local applied index catches up to the
-		// leader's commit point. After that, a local probe sees every
-		// committed version including any landed at commitTS. If
-		// ReadIndex fails (no leader reachable, ctx canceled), fall back
-		// to (false, nil) and let the adapter's resolveListMeta path
-		// take over via the leader-fenced ScanAt/GetAt.
-		if _, err := engine.LinearizableRead(ctx); err != nil {
-			return false, nil
-		}
+	if !isLinearizableRaftLeader(ctx, engine) && !tryEngineLinearizableFence(ctx, engine) {
+		// Not the linearizable leader for this group AND the ReadIndex
+		// fence failed (no leader reachable, ctx canceled). Fall back to
+		// (false, nil); the adapter's resolveListMeta path takes over via
+		// the leader-fenced ScanAt/GetAt and returns a valid current-Len
+		// serialization.
+		return false, nil
 	}
 	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
 	return exists, nil
+}
+
+// tryEngineLinearizableFence submits a Raft ReadIndex via the per-group
+// engine and reports whether it succeeded. After a successful ReadIndex
+// the local applied index is caught up to the current leader's commit
+// point, so a subsequent local read sees every committed version. The
+// error from the underlying call is intentionally not surfaced — callers
+// that need the authoritative answer treat a failed fence as "couldn't
+// verify, fall back to the leader-routed slow path." Structured to avoid
+// the nilerr false positive at the call site.
+func tryEngineLinearizableFence(ctx context.Context, engine raftengine.LeaderView) bool {
+	if engine == nil {
+		return false
+	}
+	_, err := engine.LinearizableRead(ctx)
+	return err == nil
 }
 
 // ScanAt scans keys across shards at the given timestamp. Note: when the range

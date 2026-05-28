@@ -218,16 +218,31 @@ func (s *LeaderRoutedStore) CommittedVersionAt(ctx context.Context, key []byte, 
 	if s == nil || s.local == nil {
 		return false, nil
 	}
-	if !s.leaderOKForKey(ctx, key) {
-		if s.coordinator == nil {
-			return false, nil
-		}
-		if _, err := s.coordinator.LinearizableRead(ctx); err != nil {
-			return false, nil
-		}
+	if !s.leaderOKForKey(ctx, key) && !s.tryLinearizableFence(ctx) {
+		// Not leader and ReadIndex failed (no coordinator wired, no leader
+		// reachable, ctx canceled). Report (false, nil) so the adapter's
+		// resolveReuseLength falls through to the leader-fenced ScanAt/GetAt
+		// path, which returns a valid current-Len serialization.
+		return false, nil
 	}
 	exists, err := s.local.CommittedVersionAt(ctx, key, commitTS)
 	return exists, errors.WithStack(err)
+}
+
+// tryLinearizableFence submits a Raft ReadIndex via the coordinator and
+// reports whether it succeeded. After a successful ReadIndex the local
+// applied index is caught up to the current leader's commit point, so a
+// subsequent local read sees every committed version. The error from the
+// underlying call is intentionally not surfaced — callers that need the
+// authoritative answer treat a failed fence as "couldn't verify, fall back
+// to the leader-routed slow path." Structured to avoid the nilerr
+// false positive at the call site.
+func (s *LeaderRoutedStore) tryLinearizableFence(ctx context.Context) bool {
+	if s == nil || s.coordinator == nil {
+		return false
+	}
+	_, err := s.coordinator.LinearizableRead(ctx)
+	return err == nil
 }
 
 func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
