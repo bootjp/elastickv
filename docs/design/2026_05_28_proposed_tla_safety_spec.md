@@ -227,22 +227,34 @@ cannot check them as state invariants.
   - **(iii) Commit-time ceiling fencing.** Bounded skew (i) and logical
     handoff (ii) are not enough on their own: a leader that misses
     `RunHLCLeaseRenewal` for longer than `hlcPhysicalWindowMs` (e.g.
-    partitioned from the quorum that owns the ceiling group) but
-    remains a Raft leader will continue advancing its wall clock past
-    the last committed ceiling and can still issue persistence
-    timestamps. A subsequent leader that has only restored the same
-    stale ceiling and has a lagging wall clock can then issue a
-    strictly smaller timestamp, violating HLC-4. The spec therefore
-    requires every `Next()` that backs a persistence ts to be gated on
-    `wall_now < lastAppliedCeiling`; a leader whose ceiling has
-    expired must either re-apply a fresh ceiling via Raft before
-    committing, or refuse to commit (fail-closed). The current
-    implementation in `kv/sharded_coordinator.go` `RunHLCLeaseRenewal`
-    only logs renewal failures and dispatch paths call `HLC.Next()`
-    without checking ceiling freshness — this is the second design
-    gap the spec is meant to surface. As with (ii), if the gap is
-    real, TLC will produce a counterexample for HLC-4 under a model
-    that lets renewals fail.
+    partitioned from the quorum that owns the ceiling group — in the
+    `ShardedCoordinator` the ceiling group is always
+    `c.defaultGroup`, per `kv/sharded_coordinator.go`, so the failure
+    scenario is: a node that is leader of a non-default shard but
+    partitioned from the default group's quorum) but remains a Raft
+    leader will continue advancing its wall clock past the last
+    committed ceiling and can still issue persistence timestamps. A
+    subsequent leader that has only restored the same stale ceiling
+    and has a lagging wall clock can then issue a strictly smaller
+    timestamp, violating HLC-4. The spec therefore requires every
+    `Next()` that backs a persistence ts to be gated on
+    `wall_now < physicalCeiling[n]` (the same `physicalCeiling[n]`
+    variable as §3, matching `kv/hlc.go`'s field); a leader whose
+    ceiling has expired must either re-apply a fresh ceiling via
+    Raft before committing, or refuse to commit (fail-closed). The
+    current implementation in `kv/sharded_coordinator.go`
+    `RunHLCLeaseRenewal` only logs renewal failures and dispatch
+    paths call `HLC.Next()` without checking ceiling freshness — this
+    is the second design gap the spec is meant to surface. As with
+    (ii), if the gap is real, TLC will produce a counterexample for
+    HLC-4 under a model that lets renewals fail. **Availability
+    note.** The fail-closed behaviour means a leader partitioned
+    from the default group's quorum for longer than
+    `hlcPhysicalWindowMs` cannot serve any persistence timestamp —
+    every client commit is rejected until renewal succeeds. This is
+    a CP, not AP, trade-off and operators must size
+    `hlcPhysicalWindowMs` (currently 3s) relative to expected
+    partition duration; see §9 risk 7.
 
 ### 5.2 OCC
 
@@ -507,7 +519,7 @@ proves something on its own).
 
 | ID | Scope | Output | Notes |
 |---|---|---|---|
-| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (including the three HLC-4 preconditions). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops). | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
+| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops) **against the spec-of-the-correct-design**: the M1 spec encodes preconditions (i), (ii), (iii) as TLA+ `ASSUME`s so TLC passes, demonstrating what the implementation must satisfy. A separate `MCHLC_gap.cfg` configuration that removes those `ASSUME`s is expected to surface counterexamples; that configuration is committed alongside M1 as the motivating evidence that the preconditions are necessary. | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
 | **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | OCC spec runnable in isolation. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. Liveness (OCC-L1) is deferred to M6. |
 | **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | MVCC spec runnable in isolation. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
 | **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Route catalog spec runnable in isolation. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. Liveness (Routes-L1) is deferred to M6. |
@@ -559,6 +571,20 @@ the spec depends on it running, not just existing.
    MIT-licensed but not in any package manager we already depend on.
    Downloading it on first use is the simplest path; M1 will pin a
    specific version and checksum.
+
+7. **Fail-closed availability under partition.** HLC-4 precondition
+   (iii) makes the ceiling-fence behaviour normative: a leader
+   partitioned from the default group's quorum for longer than
+   `hlcPhysicalWindowMs` (currently 3s) cannot serve any persistence
+   timestamp, so client commits are rejected until renewal succeeds.
+   This is a CP, not AP, trade-off and is a stricter regime than the
+   current implementation (which silently keeps issuing). Mitigation:
+   the M1 spec encodes the fence as `ASSUME`; the follow-up
+   implementation PR that adds the fence to `HLC.Next()` /
+   `ShardedCoordinator.RunHLCLeaseRenewal` must (a) surface the new
+   error in operator-visible metrics and (b) document the
+   `hlcPhysicalWindowMs` tuning guidance — operators sizing the
+   window must trade it against expected partition duration.
 
 ---
 
