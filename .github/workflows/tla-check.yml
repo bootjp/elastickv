@@ -1,0 +1,81 @@
+name: TLA+ model check
+
+# Runs `make tla-check` on PRs (and pushes to main) that touch the
+# subsystems modelled by the spec or the spec / tooling themselves.
+# Per docs/design/2026_05_28_partial_tla_safety_spec.md §7.3.
+#
+# The job runs both MCHLC.cfg (correct design — expected PASS) and
+# MCHLC_gap.cfg (preconditions disabled — expected FAIL with the HLC-4
+# counterexample); the Makefile target greps for the specific HLC-4
+# violation string so the gap evidence is validated, not just the exit
+# code.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'tla/**'
+      - 'Makefile'
+      - 'kv/hlc*.go'
+      - 'kv/coordinator.go'
+      - 'kv/sharded_coordinator.go'
+      - 'kv/transaction.go'
+      - 'kv/fsm.go'
+      - 'kv/lock_resolver.go'
+      - 'store/mvcc_store.go'
+      - 'distribution/**'
+      - '.github/workflows/tla-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tla/**'
+      - 'Makefile'
+      - 'kv/hlc*.go'
+      - 'kv/coordinator.go'
+      - 'kv/sharded_coordinator.go'
+      - 'kv/transaction.go'
+      - 'kv/fsm.go'
+      - 'kv/lock_resolver.go'
+      - 'store/mvcc_store.go'
+      - 'distribution/**'
+      - '.github/workflows/tla-check.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-tla-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tla-check:
+    name: tla-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Cache the checksum-pinned tla2tools.jar so we don't re-download
+      # GitHub release artefacts on every run.  Key includes the Makefile
+      # hash so a version-pin change invalidates the cache automatically
+      # (TLA_VERSION + TLA_SHA256 both live in the Makefile).
+      - name: Cache tla2tools.jar
+        uses: actions/cache@v5
+        with:
+          path: .cache/tla
+          key: ${{ runner.os }}-tla-tools-${{ hashFiles('Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-tla-tools-
+
+      - name: Pre-fetch tla2tools.jar (logs separately from tla-check)
+        run: make tla-tools
+
+      - name: Run make tla-check
+        run: make tla-check
