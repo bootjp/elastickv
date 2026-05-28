@@ -214,11 +214,19 @@ cannot check them as state invariants.
     previous term without requiring a protocol change to the
     ceiling-entry format. **Default for M1: strategy (c).** It is the
     simplest to model in TLA+ (a single `BecomeLeader` action that
-    calls `Observe(max_ts)`) and the simplest to implement
+    calls `Observe(max_ts)`) and the smallest implementation diff
     (`ShardedCoordinator` calls `hlc.Observe(fsm.MaxAppliedHLC())` on
     detecting a new term, gated before the first persistence
-    `Next()`). Strategy (a) requires a Raft entry format change; (b)
-    requires the serving fence above. The M1 spec encodes one of
+    `Next()`). **Implementation note:** `fsm.MaxAppliedHLC()` does
+    not exist today — `kv/fsm.go` tracks only the physical ceiling
+    via `applyHLCLease` → `SetPhysicalCeiling`. Strategy (c) requires
+    adding `MaxAppliedHLC()` to the FSM, which can either maintain a
+    running max across applied write entries (cheap, preferred) or
+    scan the MVCC store on election (expensive at production key
+    counts, fallback only). "Simplest" here means "smallest API
+    surface" — one new FSM method — not "trivial one-liner".
+    Strategy (a) requires a Raft entry format change; (b) requires
+    the serving fence above. The M1 spec encodes one of
     these as a normative requirement; absent a strong reason to
     deviate, M1 should adopt (c). If the current `kv/hlc.go` does not
     implement any of (a)/(b)/(c), the TLC run for HLC-4 is expected
@@ -349,16 +357,22 @@ cannot check them as state invariants.
   bounded space.) **Real-time encoding (M5 modelling decision).** TLA+
   is a state-machine model with no inherent real-time, so the composed
   spec must encode "happens-before" explicitly. M5 adopts the
-  **Raft-log-index proxy**: an operation whose committing Raft entry
-  has a strictly smaller `(group_id, index)` than another's is treated
-  as happening-before the other. This is conservative (it can declare
-  operations ordered that real-time leaves concurrent) but is the
-  cheapest to model and matches the ordering Jepsen / `elle` observe
-  through the client API. If the M5 author finds the proxy too lossy
-  (e.g. it makes Composed-3 vacuously true), the fallback is an
-  auxiliary `realtime_order` history variable in `lib/Env.tla` that
-  tracks `(start_time, end_time)` per operation; this is documented
-  in the M5 PR rather than pre-committed here.
+  **Raft-log-index proxy** with a clear scope: within a single Raft
+  group, an operation whose committing entry has a strictly smaller
+  log index than another's happens-before the other (same-group log
+  index is a total order). **Across groups** the lexicographic
+  `(group_id, index)` comparison is *not* a valid happens-before
+  relation — it would make all of group 1's writes happen-before
+  every group 2 write regardless of actual timing — so cross-group
+  operations are treated as unordered by the proxy, and their
+  serialisation is established via `commit_ts` order from HLC (which
+  is the global clock all groups share). This combination —
+  same-group: log index; cross-group: HLC commit_ts — is the spec's
+  primary modelling choice for Composed-3. If the M5 author finds
+  the proxy too lossy (e.g. it makes Composed-3 vacuously true), the
+  fallback is an auxiliary `realtime_order` history variable in
+  `lib/Env.tla` that tracks `(start_time, end_time)` per operation;
+  this is documented in the M5 PR rather than pre-committed here.
 
 ### 5.6 Liveness properties
 
@@ -370,14 +384,23 @@ liveness property requires the bounded model to be checked with TLC's
 liveness mode, which is significantly more expensive than safety checking;
 expect these to be opt-in (Section 8.2 `tla-check-deep`).
 
-- **OCC-L1 — Eventual lock release.** Every lock `(k, lock_ts)` is
-  eventually released — committed (→ versioned write installed) or
-  aborted (→ lock cleared). Stated as `[](lockHeld(k, ts) ⇒ <> ¬lockHeld(k, ts))`
+- **OCC-L1 — Eventual lock release.** Every lock `(k, lock_ts)` whose
+  owning transaction `T` is in `LiveTransactions` is eventually
+  released — committed (→ versioned write installed) or aborted
+  (→ lock cleared). Stated as
+  `[](lockHeld(k, ts) ∧ owner(k, ts) ∈ LiveTransactions ⇒ <> ¬lockHeld(k, ts))`
   under weak fairness on the lock-resolver action and on the owning
-  transaction's `Commit` / `Abort` transitions. Without these fairness
-  assumptions a model can park forever in a state with an outstanding
-  lock; TLC's liveness checker reports such a counterexample. The bounded
-  safety counterpart is OCC-4 (no stranded lock at quiescence).
+  transaction's `Commit` / `Abort` transitions. The
+  `LiveTransactions` qualifier is load-bearing: a transaction that
+  crashes mid-flight (never reaches `Commit` or `Abort`) never
+  releases its lock through the owner-driven path, so the universal
+  would be vacuously falsifiable; the lock-resolver action is then
+  the only path that can release the lock and its progress is
+  guaranteed by weak fairness only for resolvers that are themselves
+  in `LiveNodes`. Without these qualifiers a model can park forever
+  in a state with an outstanding lock; TLC's liveness checker
+  reports such a counterexample. The bounded safety counterpart is
+  OCC-4 (no stranded lock at quiescence).
 
 - **Routes-L1 — Eventual catalog convergence.** For every catalog version
   `v` that is committed durably, every **live** node's `RouteEngine`
@@ -519,7 +542,7 @@ proves something on its own).
 
 | ID | Scope | Output | Notes |
 |---|---|---|---|
-| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops) **against the spec-of-the-correct-design**: the M1 spec encodes preconditions (i), (ii), (iii) as TLA+ `ASSUME`s so TLC passes, demonstrating what the implementation must satisfy. A separate `MCHLC_gap.cfg` configuration that removes those `ASSUME`s is expected to surface counterexamples; that configuration is committed alongside M1 as the motivating evidence that the preconditions are necessary. | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
+| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Per-module TLA+ spec of HLC; TLC passes at default bounds (3 nodes, 2 terms, ≤20 ops) **against the spec-of-the-correct-design**: the M1 spec encodes precondition (i) as a TLA+ `ASSUME` (constant predicate `MaxClockSkewMs < HlcPhysicalWindowMs`), and encodes (ii) and (iii) as **action guards** — strategy (c) lives in the `BecomeLeader` action (`hlcLast[n] := max(hlcLast[n], maxAppliedHLC)`), and the ceiling-fencing gate lives in the `IssueTimestamp` action (`ENABLED ⇔ wallNow[n] < physicalCeiling[n]`). A companion `HLC_gap.tla` + `MCHLC_gap.cfg` pair that removes the `ASSUME` and relaxes those action guards is expected to surface counterexamples; that pair is committed alongside M1 as the motivating evidence that the preconditions are necessary. (TLA+ `ASSUME` is only valid for constant-level predicates, so describing behavioural requirements as `ASSUME`s would produce invalid TLA+; the distinction matters for M1 implementers.) | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
 | **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | OCC spec runnable in isolation. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. Liveness (OCC-L1) is deferred to M6. |
 | **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | MVCC spec runnable in isolation. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
 | **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Route catalog spec runnable in isolation. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. Liveness (Routes-L1) is deferred to M6. |
