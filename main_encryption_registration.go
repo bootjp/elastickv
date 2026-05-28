@@ -45,6 +45,16 @@ const (
 	// EnableStorageEnvelope is sub-second in practice, and long enough
 	// that an idle node spends negligible CPU on it.
 	runtimeRegistrationPollInterval = 1 * time.Second
+	// runtimeRegistrationTickTimeout bounds a single tick's call to
+	// runWriterRegistration. Without it, a prolonged leaderless /
+	// partitioned window would block the watcher goroutine indefinitely
+	// inside the inner retry loop — unable to re-poll, re-evaluate the
+	// active DEK, or log a deferred-rotation skip (gemini HIGH on PR
+	// #853). Choosing 30s gives the inner registrationAttemptTimeout
+	// (5s) + backoff a few cycles before the outer timeout fires and
+	// the loop reconsiders. Re-propose on the next tick is safe because
+	// §4.1 case 2-idempotent makes a duplicate apply a no-op.
+	runtimeRegistrationTickTimeout = 30 * time.Second
 )
 
 // retryUntilRegistered runs fn, retrying with bounded backoff while it
@@ -613,9 +623,18 @@ func runtimeRegistrationTick(
 	// runWriterRegistration is solely to satisfy its signature; this
 	// watcher does NOT select on it. Only the MarkRegistered side
 	// effect (via releaseBarrier on success) matters here.
+	//
+	// Per-tick bounded timeout (gemini HIGH on PR #853): if the inner
+	// retry loop is stuck (no leader, partition), this returns control
+	// to the watcher's polling loop within runtimeRegistrationTickTimeout
+	// so the next tick can re-poll, re-evaluate the active DEK, and log
+	// a deferred-rotation skip if rotation happened mid-block. The
+	// re-propose on the next tick is safe via §4.1 case-2-idempotent.
+	tickCtx, cancel := context.WithTimeout(ctx, runtimeRegistrationTickTimeout)
+	defer cancel()
 	barrier := make(chan struct{})
 	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
 	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
-	runWriterRegistration(ctx, coordinate, defaultGroup.Engine, w.cache, activeDEK,
+	runWriterRegistration(tickCtx, coordinate, defaultGroup.Engine, w.cache, activeDEK,
 		entry, req, barrier, verifyRegistered)
 }
