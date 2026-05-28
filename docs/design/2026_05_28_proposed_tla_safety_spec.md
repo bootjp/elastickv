@@ -90,7 +90,7 @@ design abstraction.
 |---|---|---|
 | Raft (abstracted) | `internal/raftengine/etcd`, `kv/fsm.go` | per-group log of committed entries + current leader + term; snapshot install marker |
 | HLC | `kv/hlc.go` (`Next`, `SetPhysicalCeiling`, `Observe`); `kv/coordinator.go` and `kv/sharded_coordinator.go` (`hlcRenewalInterval`, `hlcPhysicalWindowMs`, `RunHLCLeaseRenewal`) | per-node `last` (48-bit physical + 16-bit in-memory logical), per-node `physicalCeiling` (Raft-applied), per-leader `term` |
-| OCC | `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` | per-txn `start_ts` (= `read_ts`), `write_set`, `read_set`, lock map `(key, lock_ts) → txn_id` (the value records the owning transaction so `owner(k, ts)` is derivable for OCC-L1) |
+| OCC | `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` | per-txn `start_ts` (= `read_ts`), `write_set`, `read_set`, lock map `(key, lock_ts) → start_ts` (the value records the owning transaction's `start_ts`, which corresponds to `txnLock.StartTS` in `kv/txn_codec.go` and equals `read_ts(T)` by OCC-5, so `owner(k, ts)` is derivable for OCC-L1) |
 | MVCC | `store/mvcc_store.go` | per-key version chain `[(commit_ts, value, tombstone?)]` |
 | Route catalog | `distribution/engine.go`, `distribution/catalog.go`, `distribution/watcher.go` | catalog version, per-node cached snapshot, in-flight `SplitRange` |
 
@@ -385,7 +385,13 @@ cannot check them as state invariants.
   leadership term. M5 commits to **(i)** as the default
   (`MCComposed.cfg` ships with `DISTINCT_TS`); the tiebreaker (ii)
   is the fallback if removing `DISTINCT_TS` produces interesting
-  counterexamples worth analysing. If the M5 author finds the proxy
+  counterexamples worth analysing. (Soundness note for (i): a
+  `StateConstraint` prunes the reachable state space TLC explores;
+  it does not by itself prove the invariant in pruned states.
+  Composed-3 is therefore proved against the realistic regime
+  where the HLC preconditions make natural collisions vanishingly
+  rare; the pathological collision schedules are documented by (ii)
+  so the choice of pruning is intentional, not a soundness gap.) If the M5 author finds the proxy
   itself too lossy (e.g. it makes Composed-3 vacuously true even
   with distinct ts), the further fallback is an auxiliary
   `realtime_order` history variable in `lib/Env.tla` that tracks
