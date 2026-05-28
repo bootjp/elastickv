@@ -89,8 +89,8 @@ design abstraction.
 | Subsystem | Implementation anchors | Modelled state |
 |---|---|---|
 | Raft (abstracted) | `internal/raftengine/etcd`, `kv/fsm.go` | per-group log of committed entries + current leader + term; snapshot install marker |
-| HLC | `kv/hlc.go` (`Next`, `SetPhysicalCeiling`, `Observe`) | per-node `last`, per-node `physicalCeiling`; the ceiling is itself a Raft-applied entry |
-| OCC | `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` | per-txn `read_ts`, `write_set`, `read_set`, lock map keyed by `(key, lock_ts)` |
+| HLC | `kv/hlc.go` (`Next`, `SetPhysicalCeiling`, `Observe`); `kv/coordinator.go` and `kv/sharded_coordinator.go` (`hlcRenewalInterval`, `hlcPhysicalWindowMs`, `RunHLCLeaseRenewal`) | per-node `last` (48-bit physical + 16-bit in-memory logical), per-node `physicalCeiling` (Raft-applied), per-leader `term` |
+| OCC | `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` | per-txn `start_ts` (= `read_ts`), `write_set`, `read_set`, lock map keyed by `(key, lock_ts)` |
 | MVCC | `store/mvcc_store.go` | per-key version chain `[(commit_ts, value, tombstone?)]` |
 | Route catalog | `distribution/engine.go`, `distribution/catalog.go`, `distribution/watcher.go` | catalog version, per-node cached snapshot, in-flight `SplitRange` |
 
@@ -178,7 +178,30 @@ cannot check them as state invariants.
   issue persistence ts.)
 - **HLC-4 — No regression across leader change.** If a new leader is
   elected at term `t' > t`, every `Next()` it issues returns a ts strictly
-  greater than every ts committed in term `t`.
+  greater than every ts committed in term `t`. **Preconditions** that the
+  spec asserts as `ASSUME`s and that the implementation must satisfy:
+  - **(i) Bounded clock skew vs ceiling window.** `MaxClockSkewMs <
+    hlcPhysicalWindowMs`. Otherwise the new leader's wall clock can run
+    so far ahead of the renewed ceiling that the floor stops protecting
+    monotonicity. With the current `hlcPhysicalWindowMs = 3000ms` the
+    spec assumes inter-node skew < 3s — a constraint that should be
+    surfaced in operator docs as a cluster prerequisite.
+  - **(ii) Logical-counter handoff.** The 16-bit logical half of the HLC
+    is in-memory only (`kv/hlc.go` `h.last` is `atomic.Uint64`, not
+    replicated), so an old leader can have committed `(ceiling_ms, k)`
+    with `k ≥ 1` while a freshly elected leader that has only restored
+    the same `ceiling_ms` from the FSM will issue `(ceiling_ms, 0)` —
+    strictly less. For HLC-4 to hold the design must do **one** of:
+    (a) carry the max committed logical alongside the ceiling in each
+    Raft lease entry and restore both on apply; (b) advance the ceiling
+    by at least one millisecond on every leader transition so a new
+    leader's first `Next()` floors to `(ceiling+1, 0)`; or (c) on
+    election, have the new leader scan its FSM for the max committed
+    HLC and bump `h.last` accordingly before serving any `Next()`. The
+    M1 spec encodes one of these as a normative requirement. If the
+    current `kv/hlc.go` does not implement any of them, the TLC run for
+    HLC-4 is expected to surface a counterexample — surfacing that
+    counterexample is one of the motivating reasons for this spec.
 
 ### 5.2 OCC
 
@@ -190,6 +213,14 @@ cannot check them as state invariants.
 - **OCC-3 — Read snapshot stability.** A transaction `T` that reads key `k`
   at `read_ts(T)` sees the value of the unique committed write to `k` with
   the largest `commit_ts ≤ read_ts(T)` (or "not present" if none exists).
+  **Lock encoding.** OCC-3 is asserted only in states where no uncommitted
+  lock for key `k` at any `lock_ts ≤ read_ts(T)` exists. When a reader
+  encounters a conflicting lock, the spec models a `LockResolver` action
+  (corresponding to `kv/lock_resolver.go`) that resolves the lock —
+  committing it (the lock becomes a versioned write) or aborting it (the
+  lock is cleared) — before the read proceeds. This avoids the spurious
+  alternative that a reader sees stale data because a lock is silently
+  ignored.
 - **OCC-4 — No stranded lock at quiescence.** In any state where the
   lock-resolver and all transactions of a given `start_ts` are no longer
   scheduled (no enabled actions for that `start_ts`), no lock for that
@@ -245,12 +276,19 @@ cannot check them as state invariants.
   write to key `k` at the catalog version visible to the transaction, the
   Raft group that accepts the commit is the one that owns `k` at that
   version.
-- **Composed-2 — Read-after-write across SplitRange.** A successful
-  commit to `k` at version `v` is readable at any later `read_ts` even if
-  the catalog has advanced past `v` and `k` has moved to a different group
-  (assumes the post-split target has loaded the data — this is the
-  invariant that captures correctness of the data hand-off, not just the
-  catalog hand-off).
+- **Composed-2 — Read-after-write across SplitRange.** A successful commit
+  to `k` at version `v` is readable at any later `read_ts` at the same
+  logical key, even after the catalog has advanced past `v`. Under the
+  current `SplitRange` implementation, which is **same-group only** (per
+  CLAUDE.md and `distribution/`), the split only changes range boundaries
+  inside a single Raft group; `k` never crosses a group boundary, so the
+  data hand-off is trivially correct because no data movement occurs. The
+  invariant is therefore deliberately stated in terms that *would* also
+  cover a future cross-group migration path: when (and only when)
+  cross-group split lands, the post-split target must have replayed the
+  pre-split data before the catalog hand-off becomes observable. Until
+  then, Composed-2 is exercised only against the same-group case, and
+  the cross-group clause is a forward-looking guard rail.
 - **Composed-3 — Strict serialisability bound.** The set of committed
   transactions is consistent with a serial order on `commit_ts` that
   respects real-time happens-before. (This is what Jepsen / `elle` would
@@ -278,8 +316,11 @@ expect these to be opt-in (Section 8.2 `tla-check-deep`).
 
 - **Routes-L1 — Eventual catalog convergence.** For every catalog version
   `v` that is committed durably, every live node's `RouteEngine`
-  eventually observes version `≥ v`. Stated as `<>(∀ n: engineVersion[n] ≥ v)`
-  under weak fairness on the `CatalogWatcher.SyncOnce` action. This is
+  eventually observes version `≥ v`. Stated as
+  `<>(∀ n: catalogVersion[n] ≥ v)` under weak fairness on the
+  `CatalogWatcher.SyncOnce` action. The spec variable `catalogVersion[n]`
+  corresponds to `Engine.catalogVersion` in `distribution/engine.go`
+  (one field per `RouteEngine`, exposed via `Engine.Version()`). This is
   the liveness counterpart of Routes-4 (which only bounds the order of
   observations, not their occurrence).
 
@@ -315,7 +356,24 @@ expect these to be opt-in (Section 8.2 `tla-check-deep`).
 
 ### 6.3 Symmetry and state reduction
 
-- Use `SYMMETRY` over the node set and the key set in TLC config.
+- **Per-module symmetry.** `SYMMETRY` reductions depend on whether the
+  module treats a constant set as ordered or unordered. Picking the wrong
+  reduction can silently collapse non-equivalent states and hide the bugs
+  this proposal is meant to surface.
+  - **Nodes** are symmetric in every module (a node only matters relative
+    to its role — leader / follower — not its identity).
+  - **Keys** are symmetric **only** in `HLC.tla` (keys do not appear) and
+    `OCC.tla` (keys participate in lock_map / read_set / write_set as
+    indices, with no ordering on the OCC invariants). Keys are **not
+    symmetric** in `MVCC.tla` (versions are ordered by `commit_ts` and
+    keys could in principle be ordered too), and are **definitely not
+    symmetric** in `Routes.tla` and `Composed.tla` because keys
+    participate in ordered ranges via `SplitRange`. Swapping arbitrary
+    keys in those modules can move them across split boundaries and
+    collapse states with different owners as equivalent — exactly the
+    stale-route / data-handoff schedules the spec is meant to analyse.
+  - **Values, terms, group IDs** — never symmetric (they label
+    distinguishable resources).
 - Use a `StateConstraint` that bounds the number of operations and the
   largest term per group.
 - For invariants that are checkable in a small state (e.g. HLC-1), bound to
@@ -329,9 +387,21 @@ expect these to be opt-in (Section 8.2 `tla-check-deep`).
 ### 7.1 Files
 
 The specs live in a top-level `tla/` directory (Section 4.1) so they can
-be navigated and run without entering the Go module. `tla/README.md`
-documents how to install TLC (TLA+ Toolbox or `tla2tools.jar`) and the
-exact commands to run each module.
+be navigated and run without entering the Go module. `tla/README.md` is
+part of M1 (Section 8.1) and must cover, at minimum:
+
+- **Install** — how to obtain `tla2tools.jar` (checksum-pinned download to
+  `.cache/tla/`) and Java; what TLC version is expected.
+- **Run** — the exact `make tla-check` invocation, plus the per-module
+  TLC commands and their `MC*.cfg` config so a reviewer can re-run any
+  single module by hand without the Makefile.
+- **What each module proves** — a one-line summary per module listing the
+  invariants and properties it covers (cross-referenced to Section 5).
+- **Reading list** — a short pointer set for TLA+ newcomers (the TLA+ Book,
+  Specifying Systems, Lamport's video lectures; Diego Ongaro's Raft
+  spec; the CockroachDB / TiDB MVCC specs cited in Section 11).
+- **How to interpret a TLC failure** — counterexample dumps, how to map a
+  state trace back to the implementation, and where to file issues.
 
 ### 7.2 Makefile targets
 
@@ -382,7 +452,10 @@ proves something on its own).
 
 This doc is `proposed` at M1 kickoff. It is renamed to `partial` when M1
 lands (per CLAUDE.md's `*_partial_*.md` convention, since the proposal
-spans multiple milestones). It is renamed to `implemented` when M5 lands.
+spans multiple milestones). It is renamed to `implemented` when M5's TLC
+run passes in CI on `main` — i.e. when the composed spec is not only
+written but actively guarded by the build, since the protective value of
+the spec depends on it running, not just existing.
 
 ---
 
