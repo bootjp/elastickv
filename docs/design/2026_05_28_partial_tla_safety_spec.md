@@ -569,6 +569,29 @@ output contains the exact string
 mode (parse error, deadlock, JVM crash, different invariant) fails the
 job. The full M1 run completes in well under a minute.
 
+**Spec-divergence AI review.** A companion workflow
+`.github/workflows/tla-spec-ai-review.yml` fires on the same path
+filter and posts a PR comment that pings the Claude and Codex
+reviewers (`@claude review` + `@codex review`) with a per-subsystem
+checklist of which spec invariants to verify the implementation has
+not drifted from.  The chain is:
+
+```
+anchored-file change in PR
+  -> tla-check.yml runs TLC (catches *spec* bugs)
+  -> tla-spec-ai-review.yml posts the review-request comment
+       -> claude.yml fires on @claude in the comment
+       -> chatgpt-codex-connector bot fires on @codex review
+            -> both bots review the diff focused on TLA+ divergence
+```
+
+`tla-check` and the AI-review request are complementary — the model
+check verifies the spec passes; the AI reviewers verify the
+implementation matches the spec.  Both fire on every push to an
+anchored file, so a divergence cannot land silently.  The path filter
+must stay in sync across all three places (the two workflow files and
+the doc § list).
+
 ---
 
 ## 8. Milestones
