@@ -106,7 +106,7 @@ state machines into this interface.
 
 ### 4.1 Layout
 
-```
+```text
 tla/
   README.md                     -- how to run TLC, what each module proves
   lib/
