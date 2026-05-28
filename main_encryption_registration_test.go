@@ -202,6 +202,95 @@ func TestReadWriterRegistryLastSeen(t *testing.T) {
 	}
 }
 
+// TestRegistrationCommittedAtEpoch locks down the codex P1 round-1
+// fix (PR #853): registrationCommittedAtEpoch returns true only on an
+// exact (full_node_id, epoch) match. Higher lastSeen, lower lastSeen,
+// missing row, and FullNodeID mismatch all must return false so the
+// verifyRegistered short-circuit cannot fail-OPEN the storage gate on
+// a stale-sidecar load or a §6.1 uint16-collision.
+func TestRegistrationCommittedAtEpoch(t *testing.T) {
+	t.Parallel()
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	for _, tc := range []struct {
+		name       string
+		writeLast  *uint16 // nil → no row
+		queryEpoch uint16
+		want       bool
+	}{
+		{name: "missing_row", writeLast: nil, queryEpoch: 3, want: false},
+		{name: "exact_match", writeLast: u16ptr(3), queryEpoch: 3, want: true},
+		// lastSeen > epoch: the codex P1 round-1 fail-OPEN case — must
+		// be false so verifyRegistered's short-circuit cannot bypass a
+		// stale-sidecar load's required propose.
+		{name: "lastSeen_above_epoch", writeLast: u16ptr(5), queryEpoch: 3, want: false},
+		{name: "lastSeen_below_epoch", writeLast: u16ptr(2), queryEpoch: 3, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newRegistrationTestStore(t)
+			if tc.writeLast != nil {
+				writeRegistryRow(t, st, fullNodeID, *tc.writeLast)
+			}
+			assertRegistrationCommitted(t, st, fullNodeID, tc.queryEpoch, tc.want)
+		})
+	}
+	t.Run("full_node_id_mismatch", func(t *testing.T) {
+		t.Parallel()
+		assertFullNodeIDMismatchReturnsFalse(t)
+	})
+}
+
+func u16ptr(v uint16) *uint16 { return &v }
+
+func assertRegistrationCommitted(t *testing.T, st store.MVCCStore, fullNodeID uint64, epoch uint16, want bool) {
+	t.Helper()
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+	got, err := registrationCommittedAtEpoch(reg, testRegDEKID, fullNodeID, epoch)
+	if err != nil {
+		t.Fatalf("registrationCommittedAtEpoch: %v", err)
+	}
+	if got != want {
+		t.Errorf("registrationCommittedAtEpoch(epoch=%d) = %v, want %v", epoch, got, want)
+	}
+}
+
+// assertFullNodeIDMismatchReturnsFalse writes a registry row under
+// FullNodeID A, then queries with a different FullNodeID B that
+// truncates to the same uint16 (§6.1 collision). The strict helper
+// must return false so the applier's case-4 halt-apply path runs
+// instead of fail-OPENing the storage gate.
+func assertFullNodeIDMismatchReturnsFalse(t *testing.T) {
+	t.Helper()
+	st := newRegistrationTestStore(t)
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+	stored := uint64(0xAAAA_BBBB_CCCC_1234)
+	val := encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID: stored, FirstSeenLocalEpoch: 3, LastSeenLocalEpoch: 3,
+	})
+	key := encryption.RegistryKey(testRegDEKID, encryption.NodeID16(stored))
+	if err := reg.SetRegistryRow(key, val); err != nil {
+		t.Fatalf("SetRegistryRow: %v", err)
+	}
+	// Same low 16 bits, different upper bits → §6.1 collision query.
+	colliding := (uint64(0x1111_2222_3333) << 16) | uint64(encryption.NodeID16(stored))
+	if colliding == stored {
+		t.Fatalf("colliding FullNodeID accidentally equals stored: %#x", stored)
+	}
+	ok, err := registrationCommittedAtEpoch(reg, testRegDEKID, colliding, 3)
+	if err != nil {
+		t.Fatalf("registrationCommittedAtEpoch: %v", err)
+	}
+	if ok {
+		t.Error("full_node_id_mismatch: want false (§6.1 uint16-collision must not short-circuit), got true")
+	}
+}
+
 // wiringFor builds an encryptionWriteWiring with a non-nil cipher and a
 // StateCache reflecting the given (activeDEK, envelopeActive) state.
 func wiringFor(t *testing.T, activeDEK uint32, envelopeActive bool, epoch uint16) encryptionWriteWiring {

@@ -267,12 +267,16 @@ func buildProcessStartRegistrationGate(
 	// it, consistently >registrationAttemptTimeout commit latency could
 	// keep retrying-without-committing forever despite durable
 	// registration (codex P2 #6).
+	//
+	// Strict (full_node_id, epoch)-exact match, not lastSeen>=epoch: a
+	// row at lastSeen > w.epoch is not proof this load registered, and
+	// short-circuiting would MarkRegistered while the nonce factory
+	// stays pinned to the lower epoch (codex P1 round-1 on PR #853). The
+	// §9.1 startup guard at line 254 already rejects this state for the
+	// 7a propose branch, so the strict check is defense-in-depth that
+	// stays consistent with the 7b runtime watcher's verifyRegistered.
 	verifyRegistered := func() (bool, error) {
-		ls, err := registryLastSeen(reg, activeDEK, fullNodeID)
-		if err != nil {
-			return false, err
-		}
-		return ls >= w.epoch, nil
+		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.epoch)
 	}
 	eg.Go(func() error {
 		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, w.cache, activeDEK, entry, req, barrier, verifyRegistered)
@@ -314,6 +318,41 @@ func registryLastSeen(reg encryption.WriterRegistryStore, dekID uint32, fullNode
 		return 0, errors.Wrap(err, "writer registration: decode registry value")
 	}
 	return val.LastSeenLocalEpoch, nil
+}
+
+// registrationCommittedAtEpoch returns true only when an existing
+// registry row matches (full_node_id, dek_id) AND its
+// last_seen_local_epoch equals epoch exactly. Used by the Stage 7a/7b
+// verifyRegistered closures as a strict "did THIS load register?" check.
+//
+// A row with last_seen > epoch is NOT proof this load registered: it
+// could be a stale-sidecar load that slipped past the §9.1 startup
+// guard, or a concurrent same-raftID instance that bumped to a newer
+// epoch. Returning true on >epoch would MarkRegistered without
+// proposing, opening the storage gate while this load's nonce factory
+// remains pinned to the lower epoch — a previous load's (node, epoch)
+// nonces could then collide with this load's emissions.
+//
+// A FullNodeID mismatch indicates the §6.1 uint16-collision case the
+// applier rejects via case-4 halt apply; this helper returns false
+// (rather than true) so runWriterRegistration's propose path drives the
+// halt, instead of fail-OPENing the gate via the short-circuit branch.
+func registrationCommittedAtEpoch(reg encryption.WriterRegistryStore, dekID uint32, fullNodeID uint64, epoch uint16) (bool, error) {
+	raw, ok, err := reg.GetRegistryRow(encryption.RegistryKey(dekID, encryption.NodeID16(fullNodeID)))
+	if err != nil {
+		return false, errors.Wrap(err, "writer registration: read registry row")
+	}
+	if !ok {
+		return false, nil
+	}
+	val, err := encryption.DecodeRegistryValue(raw)
+	if err != nil {
+		return false, errors.Wrap(err, "writer registration: decode registry value")
+	}
+	if val.FullNodeID != fullNodeID {
+		return false, nil
+	}
+	return val.LastSeenLocalEpoch == epoch, nil
 }
 
 // registrationEntry composes the §11.3 0x03 OpRegistration Raft entry
@@ -605,19 +644,21 @@ func runtimeRegistrationTick(
 	// NOT the existing registryLastSeen helper (which swallows ok=false
 	// as 0 and would short-circuit registration when w.epoch==0 without
 	// proposing a durable row, opening the gate fail-OPEN).
+	//
+	// Exact (full_node_id, epoch) match, not lastSeen>=epoch (codex P1
+	// round-1 on PR #853): a row at lastSeen > w.epoch is not proof
+	// THIS process load registered. Possible causes — a stale-sidecar
+	// load that slipped past the §9.1 startup guard, or a concurrent
+	// same-raftID instance that bumped to a newer epoch and registered
+	// there. Treating that as "already registered" would MarkRegistered
+	// without a propose, opening the storage gate while this load's
+	// nonce factory still emits at the lower epoch — and the previous
+	// load's (node, epoch=this.w.epoch, *) nonces would collide with
+	// this load's emissions. The strict equality forces a propose on
+	// >epoch, which Raft applies via §4.1 case 3 (rollback halt) —
+	// loud, fail-closed, no nonce reuse.
 	verifyRegistered := func() (bool, error) {
-		raw, ok, gerr := reg.GetRegistryRow(encryption.RegistryKey(activeDEK, encryption.NodeID16(fullNodeID)))
-		if gerr != nil {
-			return false, errors.Wrap(gerr, "7b runtime watcher: read registry row")
-		}
-		if !ok {
-			return false, nil // no row → not registered, MUST propose
-		}
-		val, derr := encryption.DecodeRegistryValue(raw)
-		if derr != nil {
-			return false, errors.Wrap(derr, "7b runtime watcher: decode registry value")
-		}
-		return val.LastSeenLocalEpoch >= w.epoch, nil
+		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.epoch)
 	}
 	// Synchronous propose in this goroutine. The barrier passed to
 	// runWriterRegistration is solely to satisfy its signature; this
