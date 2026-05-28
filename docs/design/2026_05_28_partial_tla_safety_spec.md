@@ -597,7 +597,17 @@ must stay in sync across **four** places:
 2. `paths:` in `.github/workflows/tla-spec-ai-review.yml`
 3. the `ANCHORS` regex inside `tla-spec-ai-review.yml` (used to populate
    the per-PR comment with the actual list of changed anchored files)
-4. the list in this §7.3.
+4. the **Implementation anchors** column of the §3 table — that table
+   is the canonical enumeration of every file the spec models, and the
+   three workflow path lists above are operational projections of it.
+   When a future milestone adds a new anchor in §3, all three workflow
+   path lists must be updated to match.
+
+Note: `tla-check.yml` additionally watches `tla/**` and `Makefile` so
+spec edits re-run TLC; `tla-spec-ai-review.yml` deliberately omits
+those because a spec-only change has no implementation to compare
+against.  The two workflows' `paths:` lists therefore differ by this
+exact delta, but the implementation-anchor portion stays identical.
 
 ---
 

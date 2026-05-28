@@ -18,9 +18,12 @@ name: TLA+ spec divergence — AI review
 #   - tla-check: catches *spec* bugs (the spec passes / surfaces the gap)
 #   - this workflow: catches *implementation* bugs that drift from the spec
 #
-# The path filter is intentionally a copy of tla-check.yml + the design
-# doc §7.3 list, so a change to an anchored file always triggers both
-# the model check AND the AI review request.
+# The path filter is the **implementation-anchored subset** of
+# tla-check.yml's paths.  tla/**, Makefile, and the workflow
+# self-references are intentionally omitted: spec-only changes do not
+# need an AI implementation-divergence review (tla-check.yml's TLC run
+# is sufficient).  A change to any anchored file therefore triggers
+# both the TLC run AND the AI review request.
 
 on:
   # NOTE on trigger types vs tla-check.yml: this workflow includes
@@ -32,6 +35,9 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
+      # Implementation anchors only — see the file-header comment for
+      # the rationale.  Keep this list in sync with the three other
+      # sync points (see the §7.3 enumeration in the design doc).
       - 'kv/hlc*.go'
       - 'kv/coordinator.go'
       - 'kv/sharded_coordinator.go'
