@@ -569,6 +569,46 @@ output contains the exact string
 mode (parse error, deadlock, JVM crash, different invariant) fails the
 job. The full M1 run completes in well under a minute.
 
+**Spec-divergence AI review.** A companion workflow
+`.github/workflows/tla-spec-ai-review.yml` fires on the same path
+filter and posts a PR comment that pings the Claude and Codex
+reviewers (`@claude review` + `@codex review`) with a per-subsystem
+checklist of which spec invariants to verify the implementation has
+not drifted from.  The chain is:
+
+```text
+anchored-file change in PR
+  ├── (in parallel) tla-check.yml runs TLC          ── catches *spec* bugs
+  └── (in parallel) tla-spec-ai-review.yml posts a PR comment with
+                    @claude review + @codex review pings
+                      ├── claude.yml fires on @claude in the comment
+                      │     → Claude reviews the diff for spec divergence
+                      └── chatgpt-codex-connector fires on @codex review
+                            → Codex reviews the diff for spec divergence
+```
+
+`tla-check` and the AI-review request are complementary — the model
+check verifies the spec passes; the AI reviewers verify the
+implementation matches the spec.  Both fire on every push to an
+anchored file, so a divergence cannot land silently.  The path filter
+must stay in sync across **four** places:
+
+1. `paths:` in `.github/workflows/tla-check.yml`
+2. `paths:` in `.github/workflows/tla-spec-ai-review.yml`
+3. the `ANCHORS` regex inside `tla-spec-ai-review.yml` (used to populate
+   the per-PR comment with the actual list of changed anchored files)
+4. the **Implementation anchors** column of the §3 table — that table
+   is the canonical enumeration of every file the spec models, and the
+   three workflow path lists above are operational projections of it.
+   When a future milestone adds a new anchor in §3, all three workflow
+   path lists must be updated to match.
+
+Note: `tla-check.yml` additionally watches `tla/**` and `Makefile` so
+spec edits re-run TLC; `tla-spec-ai-review.yml` deliberately omits
+those because a spec-only change has no implementation to compare
+against.  The two workflows' `paths:` lists therefore differ by this
+exact delta, but the implementation-anchor portion stays identical.
+
 ---
 
 ## 8. Milestones
