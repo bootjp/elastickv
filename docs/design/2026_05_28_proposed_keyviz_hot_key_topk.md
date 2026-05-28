@@ -184,6 +184,17 @@ Concretely:
   re-allocated again, independent of even the SS entry's storage,
   so eviction in the live sketch cannot mutate a published snapshot)
   and publishes it via `atomic.Pointer[topKSnapshot]` per slot.
+  **Each publish also RESETS the route's live sketch** (Codex P2 L186):
+  entries cleared, `sampled_n` / `dropped_samples` / `skipped_long_keys`
+  reset. Without the reset the sketch would accumulate since the
+  feature was enabled, so a key hot in an old window could still
+  dominate a drill-down on the current cell. The reset gives each
+  published snapshot exactly one `keyvizStep` window of observations —
+  matching the matrix cell's per-Step semantics — while the next
+  window fills the freshly-cleared sketch. The aggregator is the only
+  writer to the live sketch and to its counters, so the reset and the
+  snapshot deep-copy happen atomically from the rest of the system's
+  perspective with no lock needed.
   Drill-down reads load the pointer and read the snapshot lock-free;
   snapshots are cheap (≤ m × small entry) and a new publish drops the
   previous snapshot to the GC without disturbing in-flight readers.
@@ -274,7 +285,7 @@ Response:
   "dropped_samples":   0,     // sampled but dropped by full-queue back-pressure
   "skipped_long_keys": 0,     // observations whose key exceeded --keyvizHotKeysMaxKeyLen
   "degraded":          false, // true ⇔ dropped_samples > 0 OR skipped_long_keys > 0
-  "error_bound":       125,   // = sample_rate × sampled_n / m (over the sketch's actual input)
+  "error_bound":       125,   // per-node bound = sample_rate × sampled_n / m; merged response is the §6 sum-of-bounds
   "snapshot_at":     "2026-05-28T01:23:45Z",
   "fanout": { ... }           // per-node status, same shape as matrix
 }
@@ -328,10 +339,14 @@ intended operational posture; if a peer is configured with a smaller
 `R` it contributes more accurate data and the merged result inherits
 the coarser bound from the looser peer). `sampled_n` is reported as
 the sum (informational: total sketch-observed events across the
-cluster). `dropped_samples` is the **sum** across peers, and
-`degraded` is the **OR** (`true` if any peer reports drops) — a single
-overloaded peer marks the cluster-wide result degraded so a client
-cannot misread the merged figures as exact.
+cluster). `dropped_samples` and `skipped_long_keys` are each the **sum** across
+peers, and `degraded` is the **OR** across all degradation signals
+(`true` if any peer reports `dropped_samples > 0` OR
+`skipped_long_keys > 0`). Either source alone is enough to mark the
+result degraded — including a peer that successfully drained its queue
+but skipped a too-long hot key (Codex P2 L333), which would otherwise
+leave the cluster reporting `degraded = false` while omitting the very
+key that made the cell hot.
 
 Mixed-K (some nodes hot-keys-enabled, others not): unchanged. Peers
 that don't sample omit their contribution; the merge proceeds with
@@ -446,9 +461,14 @@ the help text: `m × (max_key + 16) × MaxTrackedRoutes` bytes worst case.
    lock-free. The sketch's internal map is never read concurrently
    with mutation (snapshot is a separate value).
    `dropped_samples` and `skipped_long_keys` are `atomic.Uint64`
-   incremented from the hot path with relaxed ordering — their values
-   are only read by the aggregator at snapshot time, never compared
-   on the hot path. `go test -race ./keyviz/...` gate.
+   incremented from the hot path — their values are only read by the
+   aggregator at snapshot-publish time and are not load-bearing for
+   ordering relative to channel events (Go's `sync/atomic` does not
+   expose sub-sequential ordering levels — all `atomic.Uint64`
+   operations are sequentially consistent by the language spec, so
+   the freedom we want here is "no synchronisation barrier with the
+   channel send is required," not "relaxed memory order"). `go test
+   -race ./keyviz/...` gate.
 3. **Performance** — see §4 table. New benchmark
    `BenchmarkObserveHotKeysEnabled/disabled/sampled` to pin the
    numbers. Memory bounded by §8 formula; raising `--keyvizMaxTrackedRoutes`
