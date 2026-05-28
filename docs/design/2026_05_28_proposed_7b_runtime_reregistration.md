@@ -152,9 +152,14 @@ gating on the deferred rotation branch. It runs for the lifetime of
    (§2.2).
 
 4. **Marks** on success via the existing `releaseBarrier(barrier,
-   cache, activeDEK)` helper (with a fresh per-attempt barrier whose
-   only consumer is the watcher). Once `MarkRegistered(activeDEK)`
-   stores, `cache.Registered()` returns true and the gate clears.
+   cache, activeDEK)` helper. The barrier is a fresh per-attempt
+   `chan struct{}` passed in solely to satisfy
+   `runWriterRegistration`'s call signature; **the watcher does NOT
+   `select` on it** — the coordinator's per-load barrier was closed by
+   process-start and is not re-opened by the watcher. The meaningful
+   side effect inside `releaseBarrier` is the `MarkRegistered(activeDEK)`
+   call. Once that stores, `cache.Registered()` returns true and the
+   gate clears.
 
 5. **Backs off** between attempts using the existing
    `registrationRetryInitial / registrationRetryMax /
@@ -365,10 +370,23 @@ already confirmed).
    crashed before `MarkRegistered` will be picked up by `verifyRegistered`
    on the next propose, short-circuiting before re-proposing.
 
-6. Add a unit test for the pre-bootstrap branch
-   (`bootDEKID == 0` → runtime `BootstrapEncryption` + cutover): the
-   watcher proposes for the freshly-installed DEK X at `w.epoch == 0`.
-   This pins the codex P1 round-2 fix.
+6. Add unit tests for the pre-bootstrap branch
+   (`bootDEKID == 0`), split per claude P2 round-3 to cover both
+   structurally distinct sub-paths:
+   - **6a — bootstrap-then-cutover.** `bootDEKID == 0` → runtime
+     `BootstrapEncryption` installs DEK X → `EnableStorageEnvelope`
+     fires while X is the active DEK → watcher proposes
+     `(X, node, 0)`. (`sidecar.Keys[X].LocalEpoch == 0 == w.epoch`.)
+     This pins the codex P1 round-2 fix.
+   - **6b — bootstrap-then-rotate-then-cutover.** `bootDEKID == 0` →
+     `BootstrapEncryption` installs DEK X → `RotateDEK` X→Y (before
+     first cutover) → `EnableStorageEnvelope` → `activeDEK == Y`,
+     `bootDEKID == 0` keeps the skip-condition false, watcher proposes
+     `(Y, node, 0)`. The invariant `sidecar.Keys[Y].LocalEpoch == 0 ==
+     w.epoch` still holds because `writeRotationSidecar` initialises
+     `LocalEpoch` to 0 for the newly-installed DEK and the live nonce
+     factory is still pinned at `w.epoch == 0` (no `BumpLocalEpoch`
+     ever ran on a pre-bootstrap load).
 
 ## 6. Deferred — rotation case (7b')
 
