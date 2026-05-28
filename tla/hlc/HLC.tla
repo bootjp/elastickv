@@ -97,8 +97,16 @@ TickWall(n) ==
     \* rather than subtraction so the inequality stays inside Nat (per gemini
     \* PR #856 review: subtraction in Naturals is undefined when the LHS is
     \* smaller and would halt TLC).
-    /\ \A m \in Nodes : /\ wallNow[n] + 1 <= wallNow[m] + MaxClockSkewMs
-                        /\ wallNow[m] <= wallNow[n] + 1 + MaxClockSkewMs
+    \* Self is excluded from the skew check: the bounded-skew assumption
+    \* is about *inter*-node disagreement, not the ticking node's own
+    \* clock relative to its post-tick value.  Without this exclusion
+    \* the constraint includes `wallNow[n] + 1 <= wallNow[n] + MaxClockSkewMs`
+    \* which is unsatisfiable whenever MaxClockSkewMs = 0 — disabling
+    \* TickWall entirely and preventing the model from ever exercising
+    \* wall-clock advancement (codex P2 on PR #856 round 2).
+    /\ \A m \in Nodes \ {n} :
+        /\ wallNow[n] + 1 <= wallNow[m] + MaxClockSkewMs
+        /\ wallNow[m] <= wallNow[n] + 1 + MaxClockSkewMs
     /\ wallNow' = [wallNow EXCEPT ![n] = @ + 1]
     /\ UNCHANGED <<raftVars, hlcLast, physicalCeiling, maxAppliedHLC, committedTS, opCount>>
 
