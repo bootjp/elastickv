@@ -126,15 +126,19 @@ Concretely:
   channel-pushes O(1).
 - **Sampling**: 1-in-`R` Observes are enqueued (default `R = 16`).
   Hot keys are frequent enough to be sampled often; the Space-Saving
-  guarantee scales with sampled-N. Implementation: **per-shard
-  `math/rand/v2.PCG`** drawn once at sampler construction; the sample
-  gate is `rng.Uint64() % R == 0`. **Probabilistic**, not deterministic
-  — the simpler `atomic.Uint64`-counter-modulo gate phase-locks: a
-  workload emitting a hot key consistently at positions that are never
-  a multiple of `R` (a periodic batcher, an ordered stream) would
-  never sample it, defeating the Chernoff miss-probability argument in
-  §3 (Codex P2). PCG state is goroutine-local and reseeded per shard,
-  so the gate is contention-free without the bias hazard.
+  guarantee scales with sampled-N. Implementation: the sample gate is
+  **`math/rand/v2.IntN(R) == 0`** — the package-level function, which
+  on Go 1.22+ is lock-free per-P and concurrency-safe (see
+  `pkg.go.dev/math/rand/v2#IntN`'s thread-safety note). No `Source` or
+  `PCG` instance is created or shared by the sampler itself: any
+  attempt to keep one `math/rand/v2.PCG` per shard and call it from
+  request goroutines is a data race (per-`PCG` state is not
+  synchronized — Codex P1), so we lean on the standard library's
+  built-in per-P generator instead. This gives us **both**
+  properties — **probabilistic** (no phase-lock against periodic /
+  ordered workloads, addressing the original L135 finding) **and
+  race-free** (no shared mutable state we own, addressing L137) —
+  with no added allocation on the hot path.
 - **Non-blocking enqueue**: `select { case ch <- e: default: drop }`.
   Drop-on-full preserves the no-blocking-on-hot-path contract; under
   overload v1 prefers approximate top-K over latency. **Drops are
