@@ -267,6 +267,143 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 	}
 }
 
+// TestRuntimeRegistrationTick_AlreadyRegisteredIsNoOp pins that the
+// Stage 7b watcher tick body does nothing when the cache reports
+// Registered() == true (e.g., the process-start propose path already
+// marked it).
+func TestRuntimeRegistrationTick_AlreadyRegisteredIsNoOp(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	w := wiringFor(t, testRegDEKID, true, 5)
+	w.cache.MarkRegistered(testRegDEKID) // pre-marked
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, testRegDEKID, etcdraftengine.DeriveNodeID("n1"), &lastLogged)
+	if lastLogged != 0 {
+		t.Errorf("lastLogged unexpectedly mutated: %d", lastLogged)
+	}
+	if !w.cache.Registered() {
+		t.Error("pre-marked Registered() flipped to false")
+	}
+}
+
+// TestRuntimeRegistrationTick_EnvelopeInactiveIsNoOp pins the Phase-0
+// short-circuit (envelope still inactive → gate not consulted → no
+// propose needed).
+func TestRuntimeRegistrationTick_EnvelopeInactiveIsNoOp(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	w := wiringFor(t, testRegDEKID, false /*envelope inactive*/, 5)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, testRegDEKID, etcdraftengine.DeriveNodeID("n1"), &lastLogged)
+	if w.cache.Registered() {
+		t.Error("envelope inactive but Registered() flipped true")
+	}
+}
+
+// TestRuntimeRegistrationTick_NotBootstrappedIsNoOp pins the
+// pre-bootstrap-with-no-active-DEK short-circuit (ActiveStorageKeyID
+// returns !ok).
+func TestRuntimeRegistrationTick_NotBootstrappedIsNoOp(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	// Envelope on but no active DEK (impossible in production but
+	// captures the not-bootstrapped guard explicitly).
+	w := wiringFor(t, 0 /*no active DEK*/, true, 0)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 0, etcdraftengine.DeriveNodeID("n1"), &lastLogged)
+	if w.cache.Registered() {
+		t.Error("no active DEK but Registered() flipped true")
+	}
+}
+
+// TestRuntimeRegistrationTick_CutoverInScopeProposes pins the Branch A
+// (Phase-0 boot → runtime cutover) path: bootDEK==activeDEK,
+// envelope just flipped active, registry pre-populated so
+// verifyRegistered short-circuits — the tick marks Registered() true.
+func TestRuntimeRegistrationTick_CutoverInScopeProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	const epoch uint16 = 5
+	// Pre-populate the registry so verifyRegistered returns true and
+	// runWriterRegistration short-circuits to MarkRegistered without
+	// needing a real coordinator/engine.
+	writeRegistryRow(t, st, fullNodeID, epoch)
+
+	w := wiringFor(t, testRegDEKID, true /*envelope active*/, epoch)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, testRegDEKID /*bootDEK==activeDEK*/, fullNodeID, &lastLogged)
+	if !w.cache.Registered() {
+		t.Error("cutover branch did not MarkRegistered (Registered=false)")
+	}
+}
+
+// TestRuntimeRegistrationTick_PreBootstrapInScopeProposes pins the
+// Branch B (pre-bootstrap boot → runtime bootstrap+cutover) path:
+// bootDEK==0, activeDEK=X (newly bootstrapped), w.epoch==0; the tick
+// proposes for (X, node, 0). This is the codex P1 round-2 fix:
+// bootDEKID==0 keeps the skip-condition false so the watcher does NOT
+// treat the new DEK as a rotation.
+func TestRuntimeRegistrationTick_PreBootstrapInScopeProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	// w.epoch==0 (pre-bootstrap load), active DEK X just installed.
+	writeRegistryRow(t, st, fullNodeID, 0) // pre-populated → verify short-circuits
+
+	w := wiringFor(t, testRegDEKID /*activeDEK=X*/, true, 0 /*w.epoch=0*/)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID, &lastLogged)
+	if !w.cache.Registered() {
+		t.Error("pre-bootstrap branch did not MarkRegistered (Registered=false)")
+	}
+}
+
+// TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips pins the
+// 7b' deferral: bootDEK != 0 AND activeDEK != bootDEK → log once per
+// unique rotated-into DEK, do NOT propose. A second tick at the same
+// activeDEK does NOT re-log. A subsequent rotation to yet another DEK
+// re-logs correctly.
+func TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	// boot DEK 7, runtime rotation to DEK 8.
+	w := wiringFor(t, 8 /*activeDEK changed*/, true, 5)
+	var lastLogged uint32
+
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 7 /*bootDEK*/, fullNodeID, &lastLogged)
+	if w.cache.Registered() {
+		t.Error("deferred rotation branch unexpectedly MarkRegistered")
+	}
+	if lastLogged != 8 {
+		t.Errorf("lastLogged = %d, want 8 (first skip should record the DEK)", lastLogged)
+	}
+
+	// Second tick at same activeDEK: still no propose, lastLogged unchanged.
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 7, fullNodeID, &lastLogged)
+	if lastLogged != 8 {
+		t.Errorf("after repeat tick lastLogged = %d, want 8 (no re-log)", lastLogged)
+	}
+
+	// Rotate to DEK 9: re-log, lastLogged updates.
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = 9
+	w.cache.RefreshFromSidecar(sc)
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 7, fullNodeID, &lastLogged)
+	if lastLogged != 9 {
+		t.Errorf("after rotation-to-9 lastLogged = %d, want 9 (re-log on new DEK)", lastLogged)
+	}
+}
+
 // TestBuildProcessStartRegistrationGate_Phase0BootDoesNotMarkRegistered
 // documents the design §2.3 fail-closed posture: a node that boots in
 // Phase 0 (envelope inactive) skips registration without seeding

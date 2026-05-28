@@ -38,6 +38,13 @@ const (
 	// this; the log line just makes a stuck node visible rather than
 	// silently hung.
 	registrationGateWarnAfter = 15 * time.Second
+	// runtimeRegistrationPollInterval is the cadence at which the Stage
+	// 7b runtime watcher polls the shared StateCache for the cutover
+	// trigger (envelope active && !Registered()). One second is short
+	// enough that the gate-trapped window after a runtime
+	// EnableStorageEnvelope is sub-second in practice, and long enough
+	// that an idle node spends negligible CPU on it.
+	runtimeRegistrationPollInterval = 1 * time.Second
 )
 
 // retryUntilRegistered runs fn, retrying with bounded backoff while it
@@ -119,6 +126,12 @@ func setupDistributionAndRegistration(
 	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
 		return nil, err
 	}
+	// Stage 7b: arm the runtime watcher for the cutover case (Phase-0
+	// boot or pre-bootstrap boot, then runtime EnableStorageEnvelope).
+	// Must run AFTER installProcessStartRegistrationGate so the gate is
+	// in place before any runtime trigger can fire. Rotation cases are
+	// deferred to 7b' (see §6 of the design doc).
+	installRuntimeRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID)
 	// Bootstrap + registration both run under runCtx so a shutdown
 	// cancels the bounded retry rather than hanging.
 	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, engine)
@@ -432,4 +445,177 @@ func proposeWriterRegistration(
 		return errors.Wrap(err, "writer registration: forward to leader")
 	}
 	return nil
+}
+
+// installRuntimeRegistrationWatcher arms the Stage 7b runtime watcher
+// from setupDistributionAndRegistration (AFTER installProcessStartRegistrationGate).
+// It captures the boot-time active storage DEK and starts the watcher
+// goroutine under runCtx. A no-op when encryption is not wired.
+func installRuntimeRegistrationWatcher(
+	ctx context.Context,
+	eg *errgroup.Group,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	raftID string,
+) {
+	// Encryption not wired (no cipher → no nonce factory → no direct-path
+	// gate to clear). The 7a-2 storage gate is also un-armed in this
+	// case, so there is nothing the runtime watcher could usefully do.
+	if w.cipher == nil || defaultGroup == nil {
+		return
+	}
+	// Capture the boot-time active DEK once at watcher construction
+	// (per §2.1 of the design): the scope check
+	// `bootDEKID != 0 && activeDEK != bootDEKID` reads this captured
+	// value on every tick, NOT a re-read of the current DEK. The cache
+	// reports (0, false) on pre-bootstrap; that 0 is the load-bearing
+	// signal for the bootDEKID==0 branch.
+	bootDEKID, _ := w.cache.ActiveStorageKeyID()
+	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
+	eg.Go(func() error {
+		runRuntimeRegistrationWatcher(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID)
+		return nil
+	})
+}
+
+// runRuntimeRegistrationWatcher is the Stage 7b polling loop. It checks
+// the §4.1 trigger condition every runtimeRegistrationPollInterval and
+// proposes a registration synchronously for the cutover case
+// (activeDEK == bootDEKID OR bootDEKID == 0). The rotation case
+// (bootDEKID != 0 && activeDEK != bootDEKID) is deferred to 7b' and
+// gets a log-once WARN gated by lastLoggedSkipDEK.
+//
+// The propose runs in this goroutine — at most one in-flight at a time,
+// no goroutine accumulation, no duplicate Raft proposals from the
+// watcher. registrationAttemptTimeout (inside runWriterRegistration)
+// bounds individual sub-attempts. On runCtx cancellation the loop exits
+// without closing any barrier — fail-closed posture preserved.
+func runRuntimeRegistrationWatcher(
+	ctx context.Context,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	bootDEKID uint32,
+	fullNodeID uint64,
+) {
+	// Per-instance log-once gate (claude P2 round-2). Fires once per
+	// unique rotated-into DEK; a subsequent rotation to yet another DEK
+	// re-logs correctly.
+	var lastLoggedSkipDEK uint32
+	ticker := time.NewTicker(runtimeRegistrationPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		runtimeRegistrationTick(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID, &lastLoggedSkipDEK)
+	}
+}
+
+// runtimeRegistrationTick is a single iteration of the watcher loop,
+// extracted so the loop body stays under the cyclop budget and the
+// scope-check + propose can be unit-tested independently of the ticker.
+//
+// Returns to the caller after either a no-op skip, a deferred-rotation
+// skip (logged once per unique DEK via lastLoggedSkip), or a complete
+// synchronous registration attempt via runWriterRegistration.
+// runtimeRegistrationInScope evaluates the §1 scope check: returns the
+// active storage DEK and true ONLY when the 7b watcher should propose
+// (cutover branch or pre-bootstrap branch). All other cases — already
+// registered, envelope inactive, no active DEK, or deferred rotation
+// (bootDEKID != 0 && activeDEK != bootDEKID) — return (_, false). The
+// deferred-rotation branch logs once per unique rotated-into DEK,
+// gated by *lastLoggedSkip (claude P2 round-2). Extracted from
+// runtimeRegistrationTick to keep both under the cyclop budget.
+func runtimeRegistrationInScope(
+	cache *encryption.StateCache,
+	bootDEKID uint32,
+	fullNodeID uint64,
+	lastLoggedSkip *uint32,
+) (activeDEK uint32, inScope bool) {
+	if cache.Registered() {
+		return 0, false
+	}
+	if !cache.StorageEnvelopeActive() {
+		return 0, false
+	}
+	activeDEK, ok := cache.ActiveStorageKeyID()
+	if !ok {
+		return 0, false
+	}
+	if bootDEKID != 0 && activeDEK != bootDEKID {
+		// Deferred rotation case (7b'). Live nonce factory's pinned
+		// w.epoch does not match the new DEK's sidecar LocalEpoch (=0
+		// for a freshly-rotated DEK); registering here would brick the
+		// next restart or risk nonce reuse if the §9.1 guard were
+		// bypassed (see design §6).
+		if activeDEK != *lastLoggedSkip {
+			slog.Warn("encryption: 7b runtime watcher skipping deferred rotation case (7b')",
+				slog.Uint64("boot_dek_id", uint64(bootDEKID)),
+				slog.Uint64("active_dek_id", uint64(activeDEK)),
+				slog.Uint64("full_node_id", fullNodeID))
+			*lastLoggedSkip = activeDEK
+		}
+		return 0, false
+	}
+	return activeDEK, true
+}
+
+func runtimeRegistrationTick(
+	ctx context.Context,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	bootDEKID uint32,
+	fullNodeID uint64,
+	lastLoggedSkip *uint32,
+) {
+	activeDEK, inScope := runtimeRegistrationInScope(w.cache, bootDEKID, fullNodeID, lastLoggedSkip)
+	if !inScope {
+		return
+	}
+	// In scope: cutover branch (activeDEK == bootDEKID) OR pre-bootstrap
+	// branch (bootDEKID == 0). Both satisfy
+	// sidecar.Keys[activeDEK].LocalEpoch == w.epoch per design §2.2.
+	slog.Info("encryption: 7b runtime watcher proposing registration",
+		slog.Uint64("active_dek_id", uint64(activeDEK)),
+		slog.Uint64("full_node_id", fullNodeID),
+		slog.Uint64("local_epoch", uint64(w.epoch)),
+		slog.Uint64("boot_dek_id", uint64(bootDEKID)))
+	reg, err := store.WriterRegistryFor(defaultGroup.Store)
+	if err != nil {
+		slog.Warn("encryption: 7b runtime watcher failed to obtain writer registry handle; will retry",
+			slog.String("error", err.Error()))
+		return
+	}
+	// Per design §5 item 5: explicit ok=true gating on GetRegistryRow,
+	// NOT the existing registryLastSeen helper (which swallows ok=false
+	// as 0 and would short-circuit registration when w.epoch==0 without
+	// proposing a durable row, opening the gate fail-OPEN).
+	verifyRegistered := func() (bool, error) {
+		raw, ok, gerr := reg.GetRegistryRow(encryption.RegistryKey(activeDEK, encryption.NodeID16(fullNodeID)))
+		if gerr != nil {
+			return false, errors.Wrap(gerr, "7b runtime watcher: read registry row")
+		}
+		if !ok {
+			return false, nil // no row → not registered, MUST propose
+		}
+		val, derr := encryption.DecodeRegistryValue(raw)
+		if derr != nil {
+			return false, errors.Wrap(derr, "7b runtime watcher: decode registry value")
+		}
+		return val.LastSeenLocalEpoch >= w.epoch, nil
+	}
+	// Synchronous propose in this goroutine. The barrier passed to
+	// runWriterRegistration is solely to satisfy its signature; this
+	// watcher does NOT select on it. Only the MarkRegistered side
+	// effect (via releaseBarrier on success) matters here.
+	barrier := make(chan struct{})
+	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
+	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
+	runWriterRegistration(ctx, coordinate, defaultGroup.Engine, w.cache, activeDEK,
+		entry, req, barrier, verifyRegistered)
 }
