@@ -250,7 +250,12 @@ func TestListPushDedup_InterveningRPopRefusesStaleReuse(t *testing.T) {
 	// (Head+Len = 1+0 = 1) — but more importantly, the element MUST be
 	// reachable: meta.Head <= seq < meta.Tail.
 	require.Equal(t, int64(1), n)
-	require.Greater(t, coord.dispatches, 2, "the reuse must OCC-conflict and the loop must recompute")
+	// Pin the exact dispatch sequence: attempt 1 pre-rejects, attempt 2's
+	// reuse OCC-conflicts on the boundary read key (RPOP's tombstone),
+	// attempt 3 recomputes from fresh meta and lands. A future regression
+	// that piles on extra dispatches before success would slip past a >2
+	// check.
+	require.Equal(t, 3, coord.dispatches)
 
 	readTS := snapshotTS(coord.Clock(), st)
 	meta, _, err := srv.resolveListMeta(ctx, key, readTS)

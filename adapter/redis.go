@@ -495,10 +495,15 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		// getLuaPool, which honors luaPoolMaxIdle the same way.
 		luaPool:       nil,
 		traceCommands: os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
-		baseCtx:       baseCtx,
-		baseCancel:    baseCancel,
-		streamWaiters: newKeyWaiterRegistry(),
-		zsetWaiters:   newKeyWaiterRegistry(),
+		// onePhaseTxnDedup honors the documented opt-in env var; the
+		// WithOnePhaseTxnDedup option below can still override either way.
+		// Default off — see R5 in the design doc (the writer must not be
+		// enabled until the whole cluster runs a probe-aware binary).
+		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") == "1",
+		baseCtx:          baseCtx,
+		baseCancel:       baseCancel,
+		streamWaiters:    newKeyWaiterRegistry(),
+		zsetWaiters:      newKeyWaiterRegistry(),
 	}
 	r.relay.Bind(r.publishLocal)
 
@@ -3289,9 +3294,15 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 				pending = nil
 				return errors.WithStack(dispErr)
 			}
-			// Still ambiguous (transient leader / lock): this reuse may itself
-			// have landed, so the next retry must probe THIS commit_ts.
-			pending.commitTS = commitTS
+			// Still ambiguous (lock / other retryable): this reuse may itself
+			// have landed, so the next retry must probe THIS commit_ts. Only
+			// advance pending.commitTS if retryRedisWrite will actually loop
+			// (non-retryable errors escape to the client; pending is then
+			// discarded with the goroutine, so the update is wasted and the
+			// stale value would be misleading if some future caller reads it).
+			if isRetryableRedisTxnErr(dispErr) {
+				pending.commitTS = commitTS
+			}
 			return errors.WithStack(dispErr)
 		}
 
@@ -3324,17 +3335,23 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 			newLen = updatedMeta.Len
 			return nil
 		}
-		// Retryable failure: remember this attempt so the next iteration reuses
-		// its write set (and probes prev_commit_ts) rather than recomputing seq.
-		// The boundary readKeys ride along so the reuse's OCC atomically catches
-		// any intervening pop/trim — without that fence the reused seq could
-		// land past a shrunk Tail (codex P1).
-		pending = &reusableListPush{
-			ops:      ops,
-			startTS:  startTS,
-			commitTS: commitTS,
-			length:   updatedMeta.Len,
-			readKeys: boundaryReads,
+		// Only remember the attempt for reuse if retryRedisWrite will actually
+		// loop — i.e. the error is one of WriteConflict / TxnLocked. For
+		// errors that escape the loop (transient-leader, context deadline,
+		// FSM apply error, etc.), `pending` would be discarded with the
+		// goroutine, and recording it would mislead a future reader about
+		// what state was preserved. The dedup window is therefore bounded by
+		// retryRedisWrite's retry predicate; ambiguous errors that escape
+		// to the client are a separate problem space (cross-request
+		// idempotency cache) and out of scope for this design.
+		if isRetryableRedisTxnErr(dispErr) {
+			pending = &reusableListPush{
+				ops:      ops,
+				startTS:  startTS,
+				commitTS: commitTS,
+				length:   updatedMeta.Len,
+				readKeys: boundaryReads,
+			}
 		}
 		return errors.WithStack(dispErr)
 	})
