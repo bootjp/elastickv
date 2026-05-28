@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { KeyVizFanoutResult, KeyVizMatrix, KeyVizRow, KeyVizSeries } from "../api/client";
-import { api } from "../api/client";
+import type {
+  KeyVizFanoutResult,
+  KeyVizHotKeysResponse,
+  KeyVizMatrix,
+  KeyVizRow,
+  KeyVizSeries,
+} from "../api/client";
+import { ApiError, api } from "../api/client";
 import { ramp } from "../lib/colorRamp";
 import { formatApiError, useApiQuery } from "../lib/useApi";
 
@@ -91,6 +97,17 @@ interface HeatmapProps {
 function Heatmap({ matrix }: HeatmapProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [hoverRow, setHoverRow] = useState<number | null>(null);
+  // selectedCell drives the hot-key drill-down panel. Null = no
+  // selection. Clicking the same cell twice clears it (toggle) so the
+  // user can dismiss the panel without scrolling for a close button.
+  const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
+  // Clear any stale selection when the matrix identity changes (new
+  // refresh, series switch, rows resize): the selected row index may
+  // now point to a completely different bucket, so dropping the
+  // selection is safer than silently re-pointing the drill-down.
+  useEffect(() => {
+    setSelectedCell(null);
+  }, [matrix]);
   // dprTick re-runs the canvas effect when the user drags the window
   // between displays of different pixel densities or changes the
   // browser zoom; window.devicePixelRatio is not reactive on its own,
@@ -191,6 +208,19 @@ function Heatmap({ matrix }: HeatmapProps) {
 
   const onLeave = () => setHoverRow(null);
 
+  const onClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const row = Math.floor(y / cellH);
+    const col = Math.floor(x / cellW);
+    if (row < 0 || row >= matrix.rows.length) return;
+    if (col < 0 || col >= matrix.column_unix_ms.length) return;
+    setSelectedCell((prev) =>
+      prev && prev.row === row && prev.col === col ? null : { row, col },
+    );
+  };
+
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between text-xs text-muted">
@@ -224,16 +254,68 @@ function Heatmap({ matrix }: HeatmapProps) {
             ref={canvasRef}
             onMouseMove={onMove}
             onMouseLeave={onLeave}
-            style={{ display: "block", width, height }}
+            onClick={onClick}
+            style={{ display: "block", width, height, cursor: "crosshair" }}
           />
           <ConflictOverlay rows={matrix.rows} cellH={cellH} cellW={cellW} width={width} />
+          <SelectionOverlay selected={selectedCell} cellH={cellH} cellW={cellW} />
           <TimeAxis columnUnixMs={matrix.column_unix_ms} cellW={cellW} />
         </div>
       )}
       {hoverRow !== null && matrix.rows[hoverRow] && (
         <RowDetail row={matrix.rows[hoverRow]} index={hoverRow} />
       )}
+      {selectedCell && matrix.rows[selectedCell.row] && (
+        <HotKeysPanel
+          row={matrix.rows[selectedCell.row]}
+          column={selectedCell.col}
+          columnUnixMs={matrix.column_unix_ms[selectedCell.col]}
+          series={matrix.series}
+          onClose={() => setSelectedCell(null)}
+        />
+      )}
     </div>
+  );
+}
+
+// SelectionOverlay outlines the clicked cell so the user can correlate
+// the heatmap position with the drill-down panel below. SVG sits in
+// the same scroll container as ConflictOverlay so it tracks horizontal
+// scrolling without manual offset math.
+interface SelectionOverlayProps {
+  selected: { row: number; col: number } | null;
+  cellH: number;
+  cellW: number;
+}
+
+function SelectionOverlay({ selected, cellH, cellW }: SelectionOverlayProps) {
+  if (!selected) return null;
+  // 2px stroke at full opacity reads against both light and dark
+  // ramp colours; the rect itself is transparent so the underlying
+  // intensity remains visible through the selection box.
+  return (
+    <svg
+      width={cellW * (selected.col + 1) + 4}
+      height={cellH * (selected.row + 1) + 4}
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        pointerEvents: "none",
+        overflow: "visible",
+      }}
+      aria-hidden="true"
+    >
+      <rect
+        x={selected.col * cellW - 1}
+        y={selected.row * cellH - 1}
+        width={cellW + 2}
+        height={cellH + 2}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={2}
+      />
+    </svg>
   );
 }
 
@@ -461,6 +543,283 @@ function RowDetail({ row, index }: RowDetailProps) {
           </>
         )}
       </dl>
+    </div>
+  );
+}
+
+// parseBucketID maps a row's bucket_id back to the (routeID, subBucket,
+// aggregate) tuple the hot-keys endpoint expects. The wire format
+// (server: bucketIDFor) is:
+//
+//   "virtual:<routeID>"            — coarsened aggregate, no drill-down
+//   "route:<routeID>"              — K=1 route, no sub-bucket axis
+//   "route:<routeID>#<subBucket>"  — sub-bucket row of a K>1 route
+//
+// Returns null when the format is unrecognised so the panel can render
+// a clear "unsupported bucket type" placeholder rather than throw.
+interface BucketIDParts {
+  kind: "virtual" | "route";
+  routeID: number;
+  subBucket?: number;
+}
+
+function parseBucketID(id: string): BucketIDParts | null {
+  if (id.startsWith("virtual:")) {
+    const n = Number.parseInt(id.slice("virtual:".length), 10);
+    if (!Number.isFinite(n)) return null;
+    return { kind: "virtual", routeID: n };
+  }
+  if (id.startsWith("route:")) {
+    const rest = id.slice("route:".length);
+    const hash = rest.indexOf("#");
+    if (hash < 0) {
+      const n = Number.parseInt(rest, 10);
+      if (!Number.isFinite(n)) return null;
+      return { kind: "route", routeID: n };
+    }
+    const routeID = Number.parseInt(rest.slice(0, hash), 10);
+    const sub = Number.parseInt(rest.slice(hash + 1), 10);
+    if (!Number.isFinite(routeID) || !Number.isFinite(sub)) return null;
+    return { kind: "route", routeID, subBucket: sub };
+  }
+  return null;
+}
+
+interface HotKeysPanelProps {
+  row: KeyVizRow;
+  column: number;
+  columnUnixMs: number;
+  series: KeyVizSeries;
+  onClose: () => void;
+}
+
+// hotKeysTopK is the Top-K we ask the server for. The server-side
+// capacity defaults to 64 and clamps top at the per-route capacity, so
+// 20 always fits and matches the "hottest keys" density the design
+// targets (§5). A future picker can lift this without server changes.
+const hotKeysTopK = 20;
+
+// HotKeysPanel renders the per-cell drill-down for the clicked
+// (route, sub-bucket) tuple. Three branches the panel surfaces
+// cleanly so users don't see a blank box waiting on a 503/404:
+//
+//   - series !== "writes"   — server only tracks the writes stream
+//                              (design §3); show a static notice.
+//   - bucket is aggregate   — design §2.2 excludes virtual buckets
+//                              from sampling; nothing to drill into.
+//   - 404 no_snapshot       — the aggregator hasn't published a window
+//                              for this route yet (cold or just-reset).
+//   - 503 hot_keys_disabled — operator started without
+//                              --keyvizHotKeysEnabled.
+function HotKeysPanel({ row, column, columnUnixMs, series, onClose }: HotKeysPanelProps) {
+  const parts = useMemo(() => parseBucketID(row.bucket_id), [row.bucket_id]);
+  const supported =
+    series === "writes" && parts !== null && parts.kind === "route";
+
+  return (
+    <div className="card text-sm border-accent/40">
+      <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs text-muted">Hot keys · cell</span>
+          <span className="font-mono text-xs">{row.bucket_id}</span>
+          <span className="text-xs text-muted">column {column}</span>
+          <span className="text-xs text-muted">
+            ({new Date(columnUnixMs).toLocaleTimeString()})
+          </span>
+        </div>
+        <button
+          type="button"
+          className="btn-secondary text-xs"
+          onClick={onClose}
+        >
+          Close
+        </button>
+      </div>
+      {!supported && (
+        <HotKeysUnsupportedNotice row={row} parts={parts} series={series} />
+      )}
+      {supported && parts && parts.kind === "route" && (
+        <HotKeysContent routeID={parts.routeID} subBucket={parts.subBucket} />
+      )}
+    </div>
+  );
+}
+
+interface HotKeysUnsupportedNoticeProps {
+  row: KeyVizRow;
+  parts: BucketIDParts | null;
+  series: KeyVizSeries;
+}
+
+function HotKeysUnsupportedNotice({ row, parts, series }: HotKeysUnsupportedNoticeProps) {
+  if (series !== "writes") {
+    return (
+      <p className="text-xs text-muted">
+        Hot-key drill-down is only sampled for the{" "}
+        <code className="font-mono">writes</code> series. Switch the
+        series picker to <code className="font-mono">writes</code> and
+        click a cell to inspect the hottest keys in that route.
+      </p>
+    );
+  }
+  if (parts === null) {
+    return (
+      <p className="text-xs text-muted">
+        Bucket id <code className="font-mono">{row.bucket_id}</code> is
+        not in a recognised format; nothing to drill into.
+      </p>
+    );
+  }
+  // parts.kind === "virtual" — the row is a coarsened aggregate that
+  // covers many routes (design §2.2 excludes these from per-route
+  // sampling).
+  return (
+    <p className="text-xs text-muted">
+      This row is an aggregate bucket covering{" "}
+      {row.route_count.toLocaleString()} routes. Per-route hot-key
+      drill-down is only available for individually tracked routes —
+      lift{" "}
+      <code className="font-mono">--keyvizMaxTrackedRoutes</code> to
+      track this route directly.
+    </p>
+  );
+}
+
+interface HotKeysContentProps {
+  routeID: number;
+  subBucket?: number;
+}
+
+function HotKeysContent({ routeID, subBucket }: HotKeysContentProps) {
+  const query = useApiQuery(
+    (signal) =>
+      api.keyVizHotKeys(
+        {
+          route_id: routeID,
+          sub_bucket: subBucket,
+          series: "writes",
+          top: hotKeysTopK,
+        },
+        signal,
+      ),
+    [routeID, subBucket],
+  );
+  if (query.loading && !query.data) {
+    return <p className="text-xs text-muted">Loading hot keys…</p>;
+  }
+  if (query.error) {
+    return <HotKeysErrorNotice error={query.error} />;
+  }
+  if (!query.data) return null;
+  return <HotKeysTable data={query.data} />;
+}
+
+interface HotKeysErrorNoticeProps {
+  error: ApiError;
+}
+
+function HotKeysErrorNotice({ error }: HotKeysErrorNoticeProps) {
+  if (error.status === 404) {
+    return (
+      <p className="text-xs text-muted">
+        No snapshot yet for this route — the aggregator hasn't
+        published a window since the route was registered, or every
+        recent observe was length-skipped. Drive some traffic and
+        click again.
+      </p>
+    );
+  }
+  if (error.status === 503) {
+    return (
+      <p className="text-xs text-muted">
+        Hot-key sampling is disabled on this node. Start the server
+        with{" "}
+        <code className="font-mono">--keyvizHotKeysEnabled</code> to
+        enable.
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs text-danger">{formatApiError(error)}</p>
+  );
+}
+
+interface HotKeysTableProps {
+  data: KeyVizHotKeysResponse;
+}
+
+function HotKeysTable({ data }: HotKeysTableProps) {
+  return (
+    <div className="space-y-2">
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+        <dt className="text-muted">Snapshot at</dt>
+        <dd className="font-mono">
+          {new Date(data.snapshot_at).toLocaleString()}
+        </dd>
+        <dt className="text-muted">Sampled N</dt>
+        <dd className="font-mono">
+          {data.sampled_n.toLocaleString()}
+          <span className="ml-1 text-muted">
+            (1 in {data.sample_rate.toLocaleString()})
+          </span>
+        </dd>
+        <dt className="text-muted">Error bound</dt>
+        <dd className="font-mono">
+          ±{data.error_bound.toLocaleString()}
+          {data.approximate && (
+            <span className="ml-1 text-muted">(scaled estimate)</span>
+          )}
+        </dd>
+        {(data.dropped_samples > 0 || data.skipped_long_keys > 0) && (
+          <>
+            <dt className="text-muted">Dropped / skipped</dt>
+            <dd className="font-mono">
+              {data.dropped_samples.toLocaleString()} dropped ·{" "}
+              {data.skipped_long_keys.toLocaleString()} long-key skipped
+            </dd>
+          </>
+        )}
+      </dl>
+      {data.degraded && (
+        // Reusing the danger colour the FanoutBanner ("Cluster view
+        // degraded") already uses keeps a consistent "degraded sample"
+        // visual signal across the page rather than introducing a
+        // third semantic colour just for this row.
+        <p className="text-xs text-danger">
+          Degraded window — some samples were dropped or skipped, so a
+          true hot key might be missing from the list or its count
+          under-reported.
+        </p>
+      )}
+      {data.keys.length === 0 ? (
+        <p className="text-xs text-muted">
+          No keys in the snapshot — every observe in this window was
+          length-skipped or hit a queue-full drop.
+        </p>
+      ) : (
+        <table className="w-full text-xs">
+          <thead className="text-muted">
+            <tr>
+              <th className="text-left font-normal w-6">#</th>
+              <th className="text-left font-normal">Key (preview)</th>
+              <th className="text-right font-normal">Count (scaled)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.keys.map((k, i) => (
+              <tr key={`${i}-${k.key_b64}`}>
+                <td className="font-mono text-muted">{i + 1}</td>
+                <td className="font-mono break-all">
+                  {decodePreview(k.key_b64)}
+                </td>
+                <td className="font-mono text-right">
+                  {k.count.toLocaleString()}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }
