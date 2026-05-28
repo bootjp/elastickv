@@ -194,6 +194,18 @@ var (
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
 	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route for the hot-key heatmap; 1 disables sub-bucketing (route-granular, today's behaviour). Capped at 256; memory is ~K*32 bytes/route, so K_max ~= memBudget/(32*keyvizMaxTrackedRoutes)")
+
+	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_proposed_keyviz_hot_key_topk).
+	// Off by default — the disabled-case adds one early-return branch
+	// to Observe and retains zero real key bytes. When enabled, the
+	// sampler retains actual hot key bytes in memory and exposes them
+	// via the admin /keyviz/hotkeys drill-down (gated behind admin
+	// auth + audit).
+	keyvizHotKeysEnabled    = flag.Bool("keyvizHotKeysEnabled", false, "Enable per-route Top-K hot-key drill-down (retains actual key bytes; admin auth + keyviz flag both required)")
+	keyvizHotKeysPerRoute   = flag.Int("keyvizHotKeysPerRoute", keyviz.DefaultHotKeysPerRoute, "Space-Saving sketch capacity m per route (default 64, cap 256). Larger m tightens the error bound N_total/m at the cost of memory")
+	keyvizHotKeysSampleRate = flag.Int("keyvizHotKeysSampleRate", keyviz.DefaultHotKeysSampleRate, "Hot-keys hot-path sample rate R: 1-in-R observes are enqueued (default 16, cap 1024). Higher R reduces hot-path cost; raises Chernoff miss probability over the sampled stream")
+	keyvizHotKeysQueueSize  = flag.Int("keyvizHotKeysQueueSize", keyviz.DefaultHotKeysQueueSize, "Bounded channel size between Observe and the hot-keys aggregator. Default 8192, cap 65536. Drops past this are counted (dropped_samples -> degraded)")
+	keyvizHotKeysMaxKeyLen  = flag.Int("keyvizHotKeysMaxKeyLen", keyviz.DefaultHotKeysMaxKeyLen, "Maximum key length sampled into the hot-keys sketch (default 1024 B, cap 4096). Longer keys bump skipped_long_keys -> degraded, never truncated")
 	// Phase 2-C cluster fan-out: comma-separated list of admin
 	// HTTP endpoints (host:port or scheme://host:port). When set,
 	// the admin keyviz handler aggregates the local matrix with
@@ -427,7 +439,7 @@ func run() error {
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed (codex P1 on PR #839).
 	distCatalog, err := setupDistributionAndRegistration(
-		ctx, runCtx, eg, runtimes, cfg.engine,
+		runCtx, eg, runtimes, cfg.engine,
 		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
 	if err != nil {
 		cancel()
@@ -1696,7 +1708,24 @@ func setupDistributionCatalog(
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
 	}
-	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine); err != nil {
+	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
+	// path. When the §7.1 storage envelope is active and this load's
+	// writer registration has not yet committed, that Save fails closed
+	// with store.ErrWriterNotRegistered (Stage 7a-2). retryUntilRegistered
+	// retries the bootstrap until the registration goroutine — armed
+	// before this call in setupDistributionAndRegistration — commits and
+	// the gate clears. The common cases (populated catalog → no-op Save,
+	// or pre-cutover → cleartext Save) never hit the gate and return on
+	// the first attempt.
+	//
+	// Idempotency requirement: the retry re-invokes EnsureCatalogSnapshot
+	// from scratch on each ErrWriterNotRegistered, so it MUST be
+	// re-entrant — on the populated-catalog path it is a version-unchanged
+	// no-op Save (no mutation, no nonce), so re-running it is safe.
+	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
+		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
+		return errors.Wrap(e, "ensure catalog snapshot")
+	}); err != nil {
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
@@ -1897,6 +1926,11 @@ func buildKeyVizSampler() *keyviz.MemSampler {
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
 		KeyBucketsPerRoute:     *keyvizKeyBucketsPerRoute,
+		HotKeysEnabled:         *keyvizHotKeysEnabled,
+		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
+		HotKeysSampleRate:      *keyvizHotKeysSampleRate,
+		HotKeysQueueSize:       *keyvizHotKeysQueueSize,
+		HotKeysMaxKeyLen:       *keyvizHotKeysMaxKeyLen,
 	})
 }
 
@@ -1940,6 +1974,14 @@ func startKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSa
 	eg.Go(func() error {
 		keyviz.RunFlusher(ctx, s, s.Step())
 		s.Flush()
+		return nil
+	})
+	// Hot-key drill-down aggregator: a separate goroutine on the same
+	// keyvizStep cadence. RunHotKeysAggregator is a no-op block when
+	// HotKeysEnabled is false, so calling it unconditionally is safe
+	// and keeps the startup wiring uniform regardless of the flag.
+	eg.Go(func() error {
+		keyviz.RunHotKeysAggregator(ctx, s)
 		return nil
 	})
 }

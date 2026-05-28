@@ -1102,19 +1102,20 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		return nil, errors.Wrap(err, "open embedded admin SPA")
 	}
 	server, err := admin.NewServer(admin.ServerDeps{
-		Signer:       signer,
-		Verifier:     verifier,
-		Credentials:  admin.MapCredentialStore(creds),
-		Roles:        adminCfg.RoleIndex(),
-		ClusterInfo:  cluster,
-		Tables:       tables,
-		Buckets:      buckets,
-		Queues:       queues,
-		Forwarder:    forwarder,
-		KeyViz:       keyvizSourceFromSampler(keyvizSampler),
-		KeyVizFanout: buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
-		StaticFS:     staticFS,
-		LeaderProbe:  leaderProbe,
+		Signer:        signer,
+		Verifier:      verifier,
+		Credentials:   admin.MapCredentialStore(creds),
+		Roles:         adminCfg.RoleIndex(),
+		ClusterInfo:   cluster,
+		Tables:        tables,
+		Buckets:       buckets,
+		Queues:        queues,
+		Forwarder:     forwarder,
+		KeyViz:        keyvizSourceFromSampler(keyvizSampler),
+		KeyVizFanout:  buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
+		KeyVizHotKeys: keyvizHotKeysSourceFromSampler(keyvizSampler),
+		StaticFS:      staticFS,
+		LeaderProbe:   leaderProbe,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
@@ -1247,6 +1248,21 @@ func resolveSigningKey(flagValue, filePath, envVar string) (string, error) {
 // a non-nil interface would silently return an empty matrix instead
 // of the explicit "feature off" signal the SPA expects.
 func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
+// keyvizHotKeysSourceFromSampler is the keyvizSourceFromSampler twin
+// for the per-cell hot-key drill-down handler. Returning an interface-nil
+// (not a typed-nil) when the sampler is disabled is again load-bearing:
+// the hot-keys handler's "keyviz disabled → 503" branch checks for
+// interface-nil, and a typed-nil *MemSampler stored as a non-nil
+// interface would route the request into MemSampler methods that
+// already nil-check internally — correct but masking the explicit
+// "feature off" signal we want the SPA to render.
+func keyvizHotKeysSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizHotKeysSource {
 	if s == nil {
 		return nil
 	}

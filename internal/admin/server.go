@@ -67,6 +67,15 @@ type ServerDeps struct {
 	// preserves the legacy single-node behaviour.
 	KeyVizFanout *KeyVizFanout
 
+	// KeyVizHotKeys backs the per-cell Top-K drill-down handler at
+	// /admin/api/v1/keyviz/hotkeys (design 2026_05_28_proposed_keyviz_hot_key_topk).
+	// Optional: nil makes the route 503 keyviz_disabled, the same shape
+	// as the matrix route's disabled response. A non-nil source whose
+	// HotKeysOptions() reports enabled=false serves 503 hotkeys_disabled
+	// instead, so the SPA can distinguish "keyviz off entirely" from
+	// "hot-keys drill-down off".
+	KeyVizHotKeys KeyVizHotKeysSource
+
 	// Queues is the SQS admin source — covers list, describe, and
 	// delete via QueuesSource. Optional: a nil value disables
 	// /admin/api/v1/sqs/queues{,/{name}} (the mux answers them
@@ -136,8 +145,13 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	// a clearer "feature off" state than an unknown_endpoint 404.
 	// Fan-out is opt-in: nil leaves the handler in single-node mode.
 	keyviz := NewKeyVizHandler(deps.KeyViz).WithLogger(logger).WithFanout(deps.KeyVizFanout)
+	// Hot-keys drill-down: same "always registered, serves 503 when off"
+	// posture as the matrix handler. Auth + full-access role are layered
+	// at the route table (see buildAPIMux); the source's own enabled
+	// check produces hotkeys_disabled vs keyviz_disabled.
+	hotKeys := NewKeyVizHotKeysHandler(deps.KeyVizHotKeys).WithLogger(logger)
 	sqs := buildSqsHandlerForDeps(deps, logger)
-	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, sqs, logger)
+	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, hotKeys, sqs, logger)
 	router := NewRouterWithLeaderProbe(mux, deps.StaticFS, deps.LeaderProbe)
 	return &Server{deps: deps, router: router, auth: auth, mux: mux}, nil
 }
@@ -259,6 +273,7 @@ func (s *Server) APIHandler() http.Handler {
 //	DELETE /admin/api/v1/s3/buckets/{name}          (auth required, full role)
 //	PUT    /admin/api/v1/s3/buckets/{name}/acl      (auth required, full role)
 //	GET    /admin/api/v1/keyviz/matrix              (auth required)
+//	GET    /admin/api/v1/keyviz/hotkeys             (auth required, full role)
 //
 // Body limit applies uniformly. CSRF and Audit middleware apply to
 // write-capable protected endpoints; login and logout carry their own
@@ -272,7 +287,7 @@ func (s *Server) APIHandler() http.Handler {
 // keyvizHandler is always non-nil even when the sampler is disabled —
 // it serves 503 keyviz_disabled itself so the SPA gets a clearer
 // signal than an unknown_endpoint 404 from the catch-all.
-func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, s3Handler, keyvizHandler, sqsHandler http.Handler, logger *slog.Logger) http.Handler {
+func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHandler, s3Handler, keyvizHandler, keyvizHotKeysHandler, sqsHandler http.Handler, logger *slog.Logger) http.Handler {
 	loginHandler := http.HandlerFunc(auth.HandleLogin)
 	logoutHandler := http.HandlerFunc(auth.HandleLogout)
 
@@ -323,6 +338,14 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	logoutChain := protectNoAudit(logoutHandler)
 	clusterChain := protect(clusterHandler)
 	keyvizChain := protect(keyvizHandler)
+	// Hot-keys drill-down requires the full-access role (design §7):
+	// the response carries actual user key bytes. SessionAuth (in the
+	// `protect` chain) authenticates the caller, RequireWriteRole
+	// enforces the role. CSRF wraps the whole stack because the
+	// response is information-disclosure-sensitive — a cross-site
+	// page should not be able to enumerate hot keys from an
+	// authenticated session.
+	keyvizHotKeysChain := protect(RequireWriteRole()(keyvizHotKeysHandler))
 	// Dynamo endpoints (reads and writes) share the protect chain
 	// so a missing session or CSRF token 401s/403s the same way
 	// regardless of method. The Audit middleware is a no-op for
@@ -350,13 +373,14 @@ func buildAPIMux(auth *AuthService, verifier *Verifier, clusterHandler, dynamoHa
 	}
 
 	routes := apiRouteTable{
-		login:   loginChain,
-		logout:  logoutChain,
-		cluster: clusterChain,
-		dynamo:  dynamoChain,
-		s3:      s3Chain,
-		keyviz:  keyvizChain,
-		sqs:     sqsChain,
+		login:         loginChain,
+		logout:        logoutChain,
+		cluster:       clusterChain,
+		dynamo:        dynamoChain,
+		s3:            s3Chain,
+		keyviz:        keyvizChain,
+		keyvizHotKeys: keyvizHotKeysChain,
+		sqs:           sqsChain,
 	}
 	return http.HandlerFunc(routes.dispatch)
 }
@@ -370,6 +394,7 @@ type apiRouteTable struct {
 	login, logout, cluster http.Handler
 	dynamo, s3, sqs        http.Handler
 	keyviz                 http.Handler
+	keyvizHotKeys          http.Handler
 }
 
 // dispatch is the receiver method httpHandlerFunc adapts. Logic is
@@ -407,8 +432,8 @@ func (t apiRouteTable) dispatch(w http.ResponseWriter, r *http.Request) {
 // equality and never against a nil receiver.
 func (t apiRouteTable) resourceHandlerFor(path string) http.Handler {
 	switch {
-	case t.keyviz != nil && path == "/admin/api/v1/keyviz/matrix":
-		return t.keyviz
+	case isKeyVizPath(path):
+		return t.keyvizForPath(path)
 	case t.dynamo != nil && isDynamoPath(path):
 		return t.dynamo
 	case t.s3 != nil && isS3Path(path):
@@ -418,6 +443,39 @@ func (t apiRouteTable) resourceHandlerFor(path string) http.Handler {
 	default:
 		return nil
 	}
+}
+
+// keyviz API paths. Constants here (not raw literals) because the
+// strings appear in multiple dispatch helpers and in the fan-out URL
+// builder (keyviz_fanout.go); goconst flags >2 raw occurrences.
+const (
+	pathKeyVizMatrix  = "/admin/api/v1/keyviz/matrix"
+	pathKeyVizHotKeys = "/admin/api/v1/keyviz/hotkeys"
+)
+
+// isKeyVizPath reports whether the URL belongs to the keyviz family
+// (matrix / hotkeys). Used by resourceHandlerFor to dispatch with one
+// case instead of one per endpoint, keeping the switch under cyclop.
+func isKeyVizPath(path string) bool {
+	switch path {
+	case pathKeyVizMatrix, pathKeyVizHotKeys:
+		return true
+	}
+	return false
+}
+
+// keyvizForPath returns the keyviz family handler for the given path,
+// or nil when the path's specific handler isn't registered (e.g.
+// hotkeys missing from a partial deploy). Centralised here so
+// resourceHandlerFor stays small.
+func (t apiRouteTable) keyvizForPath(path string) http.Handler {
+	switch path {
+	case pathKeyVizMatrix:
+		return t.keyviz
+	case pathKeyVizHotKeys:
+		return t.keyvizHotKeys
+	}
+	return nil
 }
 
 func isDynamoPath(p string) bool {

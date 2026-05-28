@@ -449,7 +449,7 @@ func buildKeyVizPeerURL(peer string, params keyVizParams) (string, error) {
 	if base.Host == "" {
 		return "", fmt.Errorf("%w: peer base url %q has no host", errKeyVizPeer, peer)
 	}
-	base.Path = "/admin/api/v1/keyviz/matrix"
+	base.Path = pathKeyVizMatrix
 	q := base.Query()
 	q.Set("series", string(params.series))
 	q.Set("rows", strconv.Itoa(params.rows))

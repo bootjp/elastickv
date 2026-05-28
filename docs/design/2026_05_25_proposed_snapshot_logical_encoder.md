@@ -225,10 +225,15 @@ each adapter, mirroring the live adapter's index builders:
   `dynamodb.go`) but does **not** persist it into the public structs:
   `s3PublicBucket`, `ddbPublicSchema`, and `sqsQueueMetaPublic` have no
   `generation` field. So the encoder cannot read it back from the dump
-  alone. Two options, **Option A chosen**:
+  alone. Two options were considered; **Option B is the implemented
+  choice** — M3 (DynamoDB, `ddbRestoreGeneration = 1`) shipped it, and
+  M4 (S3, `s3RestoreGeneration = 1`) and M5 (SQS) follow it for
+  cross-adapter consistency. Option A remains the documented
+  exact-fidelity upgrade path if cross-cluster fidelity is later
+  required.
 
-  - **Option A (chosen — exact fidelity):** add an optional
-    `generation` (or `next_gen`) field to `s3PublicBucket`,
+  - **Option A (future exact-fidelity path — not implemented):** add an
+    optional `generation` (or `next_gen`) field to `s3PublicBucket`,
     `ddbPublicSchema`, `sqsQueueMetaPublic`. This is a small,
     backward-compatible decoder change (new optional JSON field) owned
     by the corresponding encoder milestone (the decoder change lands in
@@ -237,13 +242,14 @@ each adapter, mirroring the live adapter's index builders:
     value **and** stamps the same generation into every reconstructed
     item/object key, so the counter and the embedded key generation
     agree.
-  - **Option B (fallback — internally consistent, lossy externally):**
-    emit a uniform `generation = 1` in *both* the counter row and every
-    embedded item/object key generation. This is internally consistent
-    (the restored single cluster serves correctly) but loses the
-    original generation number; any external cache or cross-cluster
-    replication keyed on the original value goes stale. Documented as
-    acceptable only for single-cluster restore.
+  - **Option B (chosen — implemented; internally consistent, lossy
+    externally):** emit a uniform `generation = 1` in *both* the counter
+    row and every embedded item/object key generation. This is
+    internally consistent (the restored single cluster serves correctly)
+    but loses the original generation number; any external cache or
+    cross-cluster replication keyed on the original value goes stale.
+    Acceptable for single-cluster restore (the Phase 0b target). The
+    decoder needs no change — the dump carries no generation field.
 
   Either way the invariant is: **the `gen` counter and the generation
   embedded in `!ddb|item|<table>|<gen>|…` / `!s3|blob|<bucket><gen>…`

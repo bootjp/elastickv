@@ -150,6 +150,27 @@ type ActiveStorageKeyID func() (uint32, bool)
 // the design supports) would still decrypt old envelopes correctly.
 type StorageEnvelopeActive func() bool
 
+// StorageRegistered reports whether this process load's §4.1 writer
+// registration has committed for the currently-active storage DEK
+// (Stage 7a-2). It gates only the DIRECT write path: when it returns
+// false while the envelope would otherwise encrypt, encryptForKey
+// refuses to emit a nonce and returns ErrWriterNotRegistered so the
+// self-originated caller (catalog bootstrap Save, admin snapshot,
+// migration) retries until registration lands rather than emitting an
+// envelope ahead of its writer-registry row.
+//
+// The FSM-apply path never consults it — see WithStorageRegistrationGate.
+type StorageRegistered func() bool
+
+// ErrWriterNotRegistered is returned by the direct write path when the
+// §7.1 storage envelope is active but this process load has not yet
+// confirmed its §4.1 writer registration for the active storage DEK
+// (Stage 7a-2). It is a transient, retryable condition: the caller
+// should retry once registration commits (the barrier closes). Callers
+// disambiguate it with errors.Is so a fail-closed pre-registration
+// write is never mistaken for a permanent storage fault.
+var ErrWriterNotRegistered = errors.New("store: storage envelope active but writer not yet registered; refusing to emit nonce before registration")
+
 // WithEncryption configures the pebble-backed store to wrap every
 // committed value in the §4.1 storage envelope.
 //
@@ -204,6 +225,78 @@ func WithStorageEnvelopeGate(active StorageEnvelopeActive) PebbleStoreOption {
 	}
 }
 
+// WithStorageRegistrationGate wires the Stage 7a-2 §4.1 registration
+// gate in front of the envelope-emit path on the DIRECT write path
+// only. After this option, when the envelope would encrypt
+// (cipher + active DEK + StorageEnvelopeActive all true) but
+// registered() reports false, the direct path (PutAt / ExpireAt /
+// ApplyMutations) returns ErrWriterNotRegistered instead of emitting a
+// nonce. The FSM-apply path (ApplyMutationsRaft) passes
+// gateRegistration=false into encryptForKey and is never gated — see
+// design §1: replicated apply must stay deterministic and may run
+// before this node's own registration entry commits, so fail-closing
+// it would halt the apply loop (and deadlock a node whose storage
+// entry is ordered before its registration entry).
+//
+// Passing nil is a no-op: the store keeps the pre-7a-2 posture where
+// the direct path emits envelopes as soon as the cutover gate is open,
+// used by existing fixtures and by deployments that have not wired the
+// writer registry. Operators thread cache.Registered in via main.go.
+func WithStorageRegistrationGate(registered StorageRegistered) PebbleStoreOption {
+	return func(s *pebbleStore) {
+		if registered == nil {
+			return
+		}
+		s.storageRegistered = registered
+	}
+}
+
+// resolveEnvelopeEmit folds the cipher-wired / active-DEK / §6.2
+// cutover-gate checks and the Stage 7a-2 §4.1 registration gate into a
+// single decision for encryptForKey. It returns (keyID, true, nil) when
+// the value should be wrapped, (0, false, nil) when it should pass
+// through cleartext, and (0, false, ErrWriterNotRegistered) when the
+// direct path would encrypt but this load's writer registration has not
+// yet committed.
+//
+// The cutover gate (storageEnvelopeActive) stays unconsulted when not
+// wired so pre-6D-6 fixtures keep working; the registration gate
+// (storageRegistered) likewise no-ops when not wired, preserving the
+// pre-7a-2 posture. gateRegistration is false on the FSM-apply path so
+// replicated apply is never blocked (design §1).
+func (s *pebbleStore) resolveEnvelopeEmit(gateRegistration bool) (keyID uint32, encrypt bool, err error) {
+	if s.cipher == nil || s.activeStorageKeyID == nil {
+		return 0, false, nil
+	}
+	id, ok := s.activeStorageKeyID()
+	if !ok {
+		return 0, false, nil
+	}
+	// Stage 6D-5 §6.2 cutover gate. When the gate is wired AND reports
+	// false (`sidecar.StorageEnvelopeActive == false`), fall through to
+	// cleartext even though a DEK is active. This is the only
+	// correctness-critical site for the §7.1 Phase 0 → Phase 1 split: a
+	// pre-cutover Put that emitted an envelope would advance the
+	// writer-registry nonce counter before every replica had agreed the
+	// cutover applied, opening the cross-replica nonce-divergence race
+	// the §6.4 atomicity contract is built to close.
+	if s.storageEnvelopeActive != nil && !s.storageEnvelopeActive() {
+		return 0, false, nil
+	}
+	// Stage 7a-2 §4.1 registration gate. Reaching here means we WILL
+	// emit an envelope (cipher + active DEK + cutover all confirmed). On
+	// the direct path, refuse to emit the nonce until this load's writer
+	// registration has committed — otherwise a self-originated write
+	// (catalog bootstrap Save) could advance the nonce counter before the
+	// writer-registry row exists, the exact pre-registration emission
+	// 7a-2 closes. The FSM-apply path passes gateRegistration=false and
+	// is never blocked here (design §1).
+	if gateRegistration && s.storageRegistered != nil && !s.storageRegistered() {
+		return 0, false, errors.WithStack(ErrWriterNotRegistered)
+	}
+	return id, true, nil
+}
+
 // encryptForKey wraps plaintext in the §4.1 storage envelope when an
 // encryption key is active for the storage purpose. Returns
 // (plaintext, encStateCleartext, nil) when encryption is disabled or
@@ -226,26 +319,25 @@ func WithStorageEnvelopeGate(active StorageEnvelopeActive) PebbleStoreOption {
 // encrypt path is never invoked for tombstone writes (deletes carry
 // no plaintext and are emitted as cleartext by the store
 // already).
-func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64) ([]byte, byte, error) {
-	if s.cipher == nil || s.activeStorageKeyID == nil {
-		return plaintext, encStateCleartext, nil
+//
+// gateRegistration selects the Stage 7a-2 §4.1 registration enforcement
+// (design §1): true on the DIRECT write path (PutAt / ExpireAt /
+// ApplyMutations), where a self-originated encrypted write must not
+// emit a nonce before this load's writer registration commits; false
+// on the FSM-apply path (ApplyMutationsRaft), which must stay
+// deterministic and may legitimately encrypt during the pre-registration
+// window. When true and the registration gate is wired and reports
+// false, returns ErrWriterNotRegistered without emitting a nonce.
+//
+// The encrypt-vs-cleartext decision (and the registration gate) lives
+// in resolveEnvelopeEmit so this function stays within the cyclop
+// budget.
+func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64, gateRegistration bool) ([]byte, byte, error) {
+	keyID, encrypt, err := s.resolveEnvelopeEmit(gateRegistration)
+	if err != nil {
+		return nil, 0, err
 	}
-	keyID, ok := s.activeStorageKeyID()
-	if !ok {
-		return plaintext, encStateCleartext, nil
-	}
-	// Stage 6D-5 §6.2 cutover gate. When the gate is wired AND
-	// reports false (`sidecar.StorageEnvelopeActive == false`),
-	// fall through to the cleartext path even though a DEK is
-	// active. This is the only correctness-critical site for the
-	// §7.1 Phase 0 → Phase 1 split: a pre-cutover Put that emitted
-	// an envelope would advance the writer-registry nonce counter
-	// before every replica had agreed the cutover applied, opening
-	// the cross-replica nonce-divergence race the §6.4 atomicity
-	// contract is built to close. The gate stays unconsulted when
-	// not wired so existing fixtures + the pre-6D-6 production
-	// posture keep working unchanged.
-	if s.storageEnvelopeActive != nil && !s.storageEnvelopeActive() {
+	if !encrypt {
 		return plaintext, encStateCleartext, nil
 	}
 	nonceArr, err := s.nonceFactory.Next()
