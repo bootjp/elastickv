@@ -76,11 +76,28 @@ Each **individual** route owns a Space-Saving sketch with capacity
 3. Else evict the entry with the **smallest** counter, replace its key
    with `k`, and set the new counter to `min_counter + 1`.
 
-Guarantees (standard Space-Saving): a key with true frequency `f` over
-`N` total observations is reported with error `≤ N/m`; any key with
-`f > N/m` is **guaranteed** in the tracked set. Misra–Gries-equivalent
-worst-case correctness, with the practical advantage that the reported
-counter is an upper bound on the true frequency.
+Guarantees (standard Space-Saving): a key with frequency `f` over the
+sketch's observed stream of length `N_obs` is reported with error
+`≤ N_obs / m`; any key with `f > N_obs / m` is **guaranteed** in the
+tracked set. Misra–Gries-equivalent worst-case correctness, with the
+practical advantage that the reported counter is an upper bound on the
+sketch-observed frequency.
+
+**With sampling (§4), the sketch's observed stream is the *sampled*
+subset, not the original.** Let `R` be the sample rate (default `R = 16`,
+i.e. 1-in-16) and `N_eff = N_total / R` the expected sampled-stream
+length. The Space-Saving guarantees above apply to `N_eff`, not
+`N_total`: a key with true frequency `f` over the original stream gets
+its sampled frequency `f / R` reported with error `≤ N_eff / m`. The API
+returns counts **scaled by `R`** so the operator sees an estimate of
+true frequency (and the scaled error bound `R · N_eff / m = N_total / m`
+is reported alongside as `error_bound`). The original-stream guarantee
+is therefore **probabilistic, not deterministic** — a hot key can in
+principle be missed if it is unusually unlucky in sampling, with
+probability falling exponentially in the number of expected samples
+(Chernoff). For the operator UX this is acceptable; the API marks the
+result `approximate: true` and surfaces the scaling so callers cannot
+mistake the figures for exact counts.
 
 ## 4. Hot-path strategy: bounded sampled queue + background aggregator
 
@@ -117,21 +134,32 @@ Concretely:
   overload v1 prefers approximate top-K over latency.
 - **Key clone**: the hot path must copy the key bytes because the
   caller is free to reuse / mutate the buffer after `Observe` returns
-  (the existing `Observe` contract). To bound allocation, the clone
+  (the existing `Observe` contract). To bound allocation the clone
   comes from a `sync.Pool` of pre-sized byte slices; long keys
   (>`hotKeysMaxKeyLen`, default 1024 B) are skipped from sampling
   rather than tracked truncated (truncation would alias different
-  keys into the same entry — worse than dropping).
+  keys into the same entry — worse than dropping). **The pool buffer
+  is strictly transient between `Observe` and the aggregator's update**
+  (see below); it is never the storage that an SS entry or a published
+  snapshot points at.
 - **Single background aggregator goroutine** drains the channel and
   updates the per-route Space-Saving sketches. Single-writer ⇒ no
-  lock needed on the sketches' update path. The aggregator runs the
-  whole time the sampler is enabled, just like the existing flush
-  goroutine.
+  lock needed on the sketches' update path. **The aggregator copies
+  the key bytes out of the pool buffer into the SS entry's own
+  allocation on insert/replace**, then releases the pool buffer
+  immediately. So an SS entry never aliases a pool slice, and a
+  subsequent eviction returns only the entry's own bytes to the GC
+  (not to the pool) — closing the Gemini-flagged use-after-free
+  window where a snapshot reader and a hot-path re-cycle could race
+  on the same pool slice.
 - **Query path**: the aggregator periodically (default every
-  `keyvizStep`) copies each route's current top-`m` into an
-  immutable snapshot and publishes it via `atomic.Pointer[topKSnapshot]`
-  per slot. Drill-down reads load the pointer and read the snapshot
-  lock-free. Snapshots are cheap (≤ m × small entry).
+  `keyvizStep`) builds a **fully deep-copied** snapshot (key bytes
+  re-allocated again, independent of even the SS entry's storage,
+  so eviction in the live sketch cannot mutate a published snapshot)
+  and publishes it via `atomic.Pointer[topKSnapshot]` per slot.
+  Drill-down reads load the pointer and read the snapshot lock-free;
+  snapshots are cheap (≤ m × small entry) and a new publish drops the
+  previous snapshot to the GC without disturbing in-flight readers.
 
 Hot-path cost estimate (target):
 
@@ -149,39 +177,59 @@ bounded by the numbers above and reported, not gated.
 
 New endpoint, mirroring the existing keyviz matrix path:
 
-```
+```http
 GET /admin/api/v1/keyviz/hotkeys?
-    bucket_id=route:1#3
+    route_id=1
+   &sub_bucket=3
    &series=writes
    &top=20
    &from_unix_ms=…&to_unix_ms=…
 ```
 
+`route_id` is required (a single individual route — aggregates are not
+tracked, §2.2). `sub_bucket` is optional: omitted, the response is the
+whole route's top-K; supplied, the server resolves the sub-bucket's
+`[Start, End)` from the slot's immutable sub-layout (§3.2 of the
+sub-range design) and filters the route's tracked top-`m` to keys in
+that range. Two separate query params — not a single `bucket_id` —
+because the matrix response's `bucket_id` strings embed `#` (e.g.
+`route:1#3`), and `#` in a URL query is parsed as a **fragment** by
+the client (the server would only see `route:1`); separate params
+sidestep the encoding hazard entirely (CodeRabbit Major). The SPA
+parses the matrix row's `bucket_id` into the two params before
+issuing the request.
+
 Response:
 
 ```jsonc
 {
-  "bucket_id": "route:1#3",
-  "series":    "writes",
+  "route_id":   1,
+  "sub_bucket": 3,            // omitted in the whole-route case
+  "series":     "writes",
   "keys": [
     { "key_b64": "dXNlcjowMDAxOjA1MA==", "count": 12345 },
-    { "key_b64": "...",                  "count":  9876 },
-    ...
+    { "key_b64": "...",                  "count":  9876 }
   ],
-  "approximate":   true,
-  "error_bound":   100,        // N/m at query time
-  "snapshot_at":   "2026-05-28T01:23:45Z",
-  "fanout": { ... }            // per-node status, same shape as matrix
+  "approximate":  true,
+  // Counts above are scaled-to-true-frequency estimates (= sampled
+  // sketch counter × sample_rate). The error bound is in the same
+  // (scaled, true-frequency) units.
+  "sample_rate":  16,
+  "sampled_n":    7_842,      // observations the sketch saw
+  "error_bound":  125,        // = sample_rate × sampled_n / m
+  "snapshot_at":  "2026-05-28T01:23:45Z",
+  "fanout": { ... }           // per-node status, same shape as matrix
 }
 ```
 
-`bucket_id` parses three forms (see sub-range §5.2):
-
-- `route:<id>` — whole route's top-K.
-- `route:<id>#<subIdx>` — server resolves the sub-bucket's
-  `[Start, End)` from the slot's sub-layout and filters the route's
-  tracked top-`m` to keys in that range.
-- `virtual:<id>` — rejected (aggregates not tracked, §2.2).
+The response makes the sampling adjustment explicit so callers cannot
+confuse the figures with the matrix cell's exact counts (which are
+unsampled, lossless atomic counters): `sample_rate` is the on-node
+`R`, `sampled_n` is the post-sample stream length the sketch observed,
+each `count` is `sampled-count × R`, and `error_bound` is the
+worst-case per-key over-/under-count in the same scaled units
+(= `sample_rate · sampled_n / m`). All three are reported so a client
+can recover any of them.
 
 `series` selects which counter family the sketch tracks. v1 ships
 `writes` only (the dominant motivator); `reads` follows once the
@@ -193,10 +241,24 @@ cost of `series_count × m × routes` worst-case memory.
 
 Drill-down queries fan out via the existing keyviz fan-out infra
 (`internal/admin/keyviz_fanout.go`): one HTTP call per peer admin
-listener, results merged. Merge rule: sum counts per `key_b64`, take
-the global top-`top` by summed count. This converges to the
-cluster-wide top-K under Space-Saving's approximation; report the
-union error bound (max of per-node `N/m`).
+listener, results merged. Merge rule: each peer already returns its
+counts **scaled to true-frequency estimates** (per §5), so merging is
+a straight sum of `count` per `key_b64` across peers, take the global
+top-`top` by summed count.
+
+The merged `error_bound` is the **sum** of the per-peer `error_bound`
+values, **not the max**: each peer can independently over- or
+under-count a key by up to its own bound, so the worst-case error of
+the cluster-wide sum is the sum of those bounds. Reporting the max
+would understate the noise floor by up to a factor of `peer_count` and
+mislead any client using the bound as a confidence interval (Gemini
+medium / Codex P2). The merged `sample_rate` is reported as the
+**max** of per-peer rates (uniform `R` across the cluster is the
+intended operational posture; if a peer is configured with a smaller
+`R` it contributes more accurate data and the merged result inherits
+the coarser bound from the looser peer). `sampled_n` is reported as
+the sum (informational: total sketch-observed events across the
+cluster).
 
 Mixed-K (some nodes hot-keys-enabled, others not): unchanged. Peers
 that don't sample omit their contribution; the merge proceeds with
@@ -223,7 +285,7 @@ bytes** in memory and exposes them on the admin API.
 
 ## 8. Configuration
 
-```
+```text
 --keyvizHotKeysEnabled  bool  (default false)
 --keyvizHotKeysPerRoute int   (default 64,  cap 256)
 --keyvizHotKeysSampleRate int (default 16,  i.e. 1/16; cap 1024)
