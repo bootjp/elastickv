@@ -107,19 +107,25 @@ serialise the hot path on a mutex (or worse, on the very keys we
 flow is:
 
 ```text
-   Observe (hot path)                       background goroutine
-   ─────────────────                        ────────────────────
-   if !hotKeysEnabled return                  drain ch
-   if len(key) > maxKeyLen {                  for (rid, kc) := range ch:
-     skippedLong.Add(1); return                   per-route SS update (no
-   }                                              lock — single-writer);
-   if rand/v2.IntN(R) != 0 return                 SS COPIES key bytes,
-   kc := pool.Clone(key)                          pool buffer released
-   select {                                    periodic deep-copy snapshot
-     case ch <- {rid, kc}:                       publish via atomic.Pointer
-     default: dropped.Add(1)                     (reads dropped /
-       pool.Release(kc); drop                    skippedLong counters);
-   }                                            then reset live sketch
+   Observe (hot path)                       background goroutine (single
+   ─────────────────                        select-loop, single writer):
+   if !hotKeysEnabled return                  ────────────────────────
+   if len(key) > maxKeyLen {                  for {
+     skippedLong.Add(1); return                 select {
+   }                                              case e := <-ch:
+   if rand/v2.IntN(R) != 0 return                   updateSketch(e)  // SS
+   kc := pool.Clone(key)                              copies key bytes,
+   select {                                           pool buffer released
+     case ch <- {rid, kc}:                        case <-tick:           // keyvizStep
+     default: dropped.Add(1)                        for len(ch) > 0 {    // pre-drain
+       pool.Release(kc); drop                         e := <-ch
+   }                                                  updateSketch(e)
+                                                    }
+                                                    deepCopySnapshot()   // reads
+                                                    publish(atomic.Ptr)  //   dropped /
+                                                    resetLiveSketch()    //   skippedLong
+                                                  }                      //   counters
+                                                }
 ```
 
 Concretely:
@@ -153,6 +159,19 @@ Concretely:
   as **degraded** so a client cannot misread an overloaded sample as
   exact. Without this, `sampled_n × sample_rate` would silently
   under-estimate true activity by the drop rate.
+
+  **Counter scope: node-global, not per-route.** `dropped_samples` and
+  `skipped_long_keys` are single `atomic.Uint64` per node, shared by
+  every route — the hot path bumps them without an `rid`-indexed
+  lookup (one atomic add, not an array indirection). At publish-tick
+  the aggregator reads the current values once and writes the *same*
+  pair into every route's snapshot; the counters reset atomically with
+  the per-route sketches. `degraded` therefore reads "this node had
+  drops or skips since the last publish — your drill-down on this
+  node's data may be incomplete," not "exactly this route's sketch
+  was affected." Per-route attribution is recorded in §10 as a future
+  enhancement; the node-level signal already drives the operator's
+  "back off, tune R or m" response, which is what v1 needs.
 - **Key clone**: the hot path must copy the key bytes because the
   caller is free to reuse / mutate the buffer after `Observe` returns
   (the existing `Observe` contract). To bound allocation the clone
