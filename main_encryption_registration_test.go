@@ -202,6 +202,95 @@ func TestReadWriterRegistryLastSeen(t *testing.T) {
 	}
 }
 
+// TestRegistrationCommittedAtEpoch locks down the codex P1 round-1
+// fix (PR #853): registrationCommittedAtEpoch returns true only on an
+// exact (full_node_id, epoch) match. Higher lastSeen, lower lastSeen,
+// missing row, and FullNodeID mismatch all must return false so the
+// verifyRegistered short-circuit cannot fail-OPEN the storage gate on
+// a stale-sidecar load or a §6.1 uint16-collision.
+func TestRegistrationCommittedAtEpoch(t *testing.T) {
+	t.Parallel()
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	for _, tc := range []struct {
+		name       string
+		writeLast  *uint16 // nil → no row
+		queryEpoch uint16
+		want       bool
+	}{
+		{name: "missing_row", writeLast: nil, queryEpoch: 3, want: false},
+		{name: "exact_match", writeLast: u16ptr(3), queryEpoch: 3, want: true},
+		// lastSeen > epoch: the codex P1 round-1 fail-OPEN case — must
+		// be false so verifyRegistered's short-circuit cannot bypass a
+		// stale-sidecar load's required propose.
+		{name: "lastSeen_above_epoch", writeLast: u16ptr(5), queryEpoch: 3, want: false},
+		{name: "lastSeen_below_epoch", writeLast: u16ptr(2), queryEpoch: 3, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newRegistrationTestStore(t)
+			if tc.writeLast != nil {
+				writeRegistryRow(t, st, fullNodeID, *tc.writeLast)
+			}
+			assertRegistrationCommitted(t, st, fullNodeID, tc.queryEpoch, tc.want)
+		})
+	}
+	t.Run("full_node_id_mismatch", func(t *testing.T) {
+		t.Parallel()
+		assertFullNodeIDMismatchReturnsFalse(t)
+	})
+}
+
+func u16ptr(v uint16) *uint16 { return &v }
+
+func assertRegistrationCommitted(t *testing.T, st store.MVCCStore, fullNodeID uint64, epoch uint16, want bool) {
+	t.Helper()
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+	got, err := registrationCommittedAtEpoch(reg, testRegDEKID, fullNodeID, epoch)
+	if err != nil {
+		t.Fatalf("registrationCommittedAtEpoch: %v", err)
+	}
+	if got != want {
+		t.Errorf("registrationCommittedAtEpoch(epoch=%d) = %v, want %v", epoch, got, want)
+	}
+}
+
+// assertFullNodeIDMismatchReturnsFalse writes a registry row under
+// FullNodeID A, then queries with a different FullNodeID B that
+// truncates to the same uint16 (§6.1 collision). The strict helper
+// must return false so the applier's case-4 halt-apply path runs
+// instead of fail-OPENing the storage gate.
+func assertFullNodeIDMismatchReturnsFalse(t *testing.T) {
+	t.Helper()
+	st := newRegistrationTestStore(t)
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+	stored := uint64(0xAAAA_BBBB_CCCC_1234)
+	val := encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID: stored, FirstSeenLocalEpoch: 3, LastSeenLocalEpoch: 3,
+	})
+	key := encryption.RegistryKey(testRegDEKID, encryption.NodeID16(stored))
+	if err := reg.SetRegistryRow(key, val); err != nil {
+		t.Fatalf("SetRegistryRow: %v", err)
+	}
+	// Same low 16 bits, different upper bits → §6.1 collision query.
+	colliding := (uint64(0x1111_2222_3333) << 16) | uint64(encryption.NodeID16(stored))
+	if colliding == stored {
+		t.Fatalf("colliding FullNodeID accidentally equals stored: %#x", stored)
+	}
+	ok, err := registrationCommittedAtEpoch(reg, testRegDEKID, colliding, 3)
+	if err != nil {
+		t.Fatalf("registrationCommittedAtEpoch: %v", err)
+	}
+	if ok {
+		t.Error("full_node_id_mismatch: want false (§6.1 uint16-collision must not short-circuit), got true")
+	}
+}
+
 // wiringFor builds an encryptionWriteWiring with a non-nil cipher and a
 // StateCache reflecting the given (activeDEK, envelopeActive) state.
 func wiringFor(t *testing.T, activeDEK uint32, envelopeActive bool, epoch uint16) encryptionWriteWiring {
@@ -264,6 +353,186 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 				t.Errorf("%s: Registered() = %v, want %v", tc.name, got, tc.expectRegistered)
 			}
 		})
+	}
+}
+
+// TestRuntimeRegistrationTick_AlreadyRegisteredIsNoOp pins that the
+// Stage 7b watcher tick body does nothing when the cache reports
+// Registered() == true (e.g., the process-start propose path already
+// marked it).
+func TestRuntimeRegistrationTick_AlreadyRegisteredIsNoOp(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	w := wiringFor(t, testRegDEKID, true, 5)
+	w.cache.MarkRegistered(testRegDEKID) // pre-marked
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, testRegDEKID, etcdraftengine.DeriveNodeID("n1"), &lastLogged)
+	if lastLogged != 0 {
+		t.Errorf("lastLogged unexpectedly mutated: %d", lastLogged)
+	}
+	if !w.cache.Registered() {
+		t.Error("pre-marked Registered() flipped to false")
+	}
+}
+
+// TestRuntimeRegistrationTick_EnvelopeInactiveIsNoOp pins the Phase-0
+// short-circuit (envelope still inactive → gate not consulted → no
+// propose needed).
+func TestRuntimeRegistrationTick_EnvelopeInactiveIsNoOp(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	w := wiringFor(t, testRegDEKID, false /*envelope inactive*/, 5)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, testRegDEKID, etcdraftengine.DeriveNodeID("n1"), &lastLogged)
+	if w.cache.Registered() {
+		t.Error("envelope inactive but Registered() flipped true")
+	}
+}
+
+// TestRuntimeRegistrationTick_NotBootstrappedIsNoOp pins the
+// pre-bootstrap-with-no-active-DEK short-circuit (ActiveStorageKeyID
+// returns !ok).
+func TestRuntimeRegistrationTick_NotBootstrappedIsNoOp(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	// Envelope on but no active DEK (impossible in production but
+	// captures the not-bootstrapped guard explicitly).
+	w := wiringFor(t, 0 /*no active DEK*/, true, 0)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 0, etcdraftengine.DeriveNodeID("n1"), &lastLogged)
+	if w.cache.Registered() {
+		t.Error("no active DEK but Registered() flipped true")
+	}
+}
+
+// TestRuntimeRegistrationTick_CutoverInScopeProposes pins the Branch A
+// (Phase-0 boot → runtime cutover) path: bootDEK==activeDEK,
+// envelope just flipped active, registry pre-populated so
+// verifyRegistered short-circuits — the tick marks Registered() true.
+func TestRuntimeRegistrationTick_CutoverInScopeProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	const epoch uint16 = 5
+	// Pre-populate the registry so verifyRegistered returns true and
+	// runWriterRegistration short-circuits to MarkRegistered without
+	// needing a real coordinator/engine.
+	writeRegistryRow(t, st, fullNodeID, epoch)
+
+	w := wiringFor(t, testRegDEKID, true /*envelope active*/, epoch)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, testRegDEKID /*bootDEK==activeDEK*/, fullNodeID, &lastLogged)
+	if !w.cache.Registered() {
+		t.Error("cutover branch did not MarkRegistered (Registered=false)")
+	}
+}
+
+// TestRuntimeRegistrationTick_PreBootstrapInScopeProposes pins the
+// Branch B (pre-bootstrap boot → runtime bootstrap+cutover) path:
+// bootDEK==0, activeDEK=X (newly bootstrapped), w.epoch==0; the tick
+// proposes for (X, node, 0). This is the codex P1 round-2 fix:
+// bootDEKID==0 keeps the skip-condition false so the watcher does NOT
+// treat the new DEK as a rotation.
+func TestRuntimeRegistrationTick_PreBootstrapInScopeProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	// w.epoch==0 (pre-bootstrap load), active DEK X just installed.
+	writeRegistryRow(t, st, fullNodeID, 0) // pre-populated → verify short-circuits
+
+	w := wiringFor(t, testRegDEKID /*activeDEK=X*/, true, 0 /*w.epoch=0*/)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID, &lastLogged)
+	if !w.cache.Registered() {
+		t.Error("pre-bootstrap branch did not MarkRegistered (Registered=false)")
+	}
+}
+
+// TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes
+// pins design §5 item 6b: the bootstrap→rotate→cutover sub-path. A node
+// that booted in Phase 0 (bootDEKID==0) and then observes a runtime
+// Bootstrap followed by a rotation to a different DEK *before* its
+// cutover (activeDEK = Y ≠ original-bootstrapped DEK, w.epoch == 0) MUST
+// still propose for Y — the scope check's deferred-rotation guard
+// (`bootDEKID != 0 && activeDEK != bootDEKID`) is short-circuited by
+// `bootDEKID == 0`. Without this test the guard is one `||` swap away
+// from a regression that would silently defer the watcher and leave the
+// gate fail-closed indefinitely (claude P2 round-2 on PR #853).
+func TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	// activeDEK Y=99 (≠ original bootstrap DEK), w.epoch=0, bootDEK=0.
+	const rotatedDEK uint32 = 99
+	// Pre-populate the registry under DEK 99 so verifyRegistered
+	// short-circuits without needing a real coordinator/engine — the
+	// hardcoded writeRegistryRow uses testRegDEKID, so call SetRegistryRow
+	// directly with the rotated DEK id.
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+	val := encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID: fullNodeID, FirstSeenLocalEpoch: 0, LastSeenLocalEpoch: 0,
+	})
+	if err := reg.SetRegistryRow(encryption.RegistryKey(rotatedDEK, encryption.NodeID16(fullNodeID)), val); err != nil {
+		t.Fatalf("SetRegistryRow: %v", err)
+	}
+
+	w := wiringFor(t, rotatedDEK, true, 0 /*w.epoch=0*/)
+	var lastLogged uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID, &lastLogged)
+	if !w.cache.Registered() {
+		t.Error("bootstrap→rotate→cutover sub-path did not MarkRegistered (Registered=false); bootDEKID==0 should keep the deferred-rotation guard off")
+	}
+	if lastLogged != 0 {
+		t.Errorf("lastLogged = %d, want 0 (no deferred-rotation WARN should fire when bootDEKID==0)", lastLogged)
+	}
+}
+
+// TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips pins the
+// 7b' deferral: bootDEK != 0 AND activeDEK != bootDEK → log once per
+// unique rotated-into DEK, do NOT propose. A second tick at the same
+// activeDEK does NOT re-log. A subsequent rotation to yet another DEK
+// re-logs correctly.
+func TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	// boot DEK 7, runtime rotation to DEK 8.
+	w := wiringFor(t, 8 /*activeDEK changed*/, true, 5)
+	var lastLogged uint32
+
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 7 /*bootDEK*/, fullNodeID, &lastLogged)
+	if w.cache.Registered() {
+		t.Error("deferred rotation branch unexpectedly MarkRegistered")
+	}
+	if lastLogged != 8 {
+		t.Errorf("lastLogged = %d, want 8 (first skip should record the DEK)", lastLogged)
+	}
+
+	// Second tick at same activeDEK: still no propose, lastLogged unchanged.
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 7, fullNodeID, &lastLogged)
+	if lastLogged != 8 {
+		t.Errorf("after repeat tick lastLogged = %d, want 8 (no re-log)", lastLogged)
+	}
+
+	// Rotate to DEK 9: re-log, lastLogged updates.
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = 9
+	w.cache.RefreshFromSidecar(sc)
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 7, fullNodeID, &lastLogged)
+	if lastLogged != 9 {
+		t.Errorf("after rotation-to-9 lastLogged = %d, want 9 (re-log on new DEK)", lastLogged)
 	}
 }
 
