@@ -3223,6 +3223,36 @@ type reusableListPush struct {
 	// also the correct value to return when the FSM dedup no-ops the apply
 	// (R1 result reconstruction: no store re-read needed).
 	length int64
+	// readKeys is the boundary read set captured at attempt 1's meta read:
+	// listItemKey(Head) and (when Len > 1) listItemKey(Tail-1). It is the
+	// load-bearing fence against the codex P1 scenario where an intervening
+	// pop/trim shrinks the list before the retry — without it, the reused
+	// seq would land past the new Tail and be unreachable to LRANGE. OCC
+	// validates these atomically against startTS at FSM apply, so any
+	// boundary-touching commit fires WriteConflict and the adapter drops
+	// pending → recomputes. Empty when attempt 1 read an empty list (no
+	// boundary to fence; the OCC on the write key suffices for that case).
+	readKeys [][]byte
+}
+
+// listPushBoundaryReadKeys returns the boundary positions of the list as
+// read keys for OCC. Including these in the dispatched OperationGroup makes
+// FSM apply atomically reject the retry when any pop/trim has touched the
+// boundary between attempts (codex P1 fix: prevents a reused seq from
+// landing past a shrunk Tail). The keys are deduped: a single-element list
+// has Head == Tail-1, so we emit it once.
+func listPushBoundaryReadKeys(key []byte, meta store.ListMeta) [][]byte {
+	if meta.Len <= 0 {
+		return nil
+	}
+	tailIdx := meta.Tail - 1
+	if tailIdx == meta.Head {
+		return [][]byte{listItemKey(key, meta.Head)}
+	}
+	return [][]byte{
+		listItemKey(key, meta.Head),
+		listItemKey(key, tailIdx),
+	}
 }
 
 // listPushCoreWithDedup is the option-2 retry loop. The first attempt computes
@@ -3242,6 +3272,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 				StartTS:      pending.startTS,
 				CommitTS:     commitTS,
 				PrevCommitTS: pending.commitTS,
+				ReadKeys:     pending.readKeys,
 				Elems:        pending.ops,
 			})
 			if dispErr == nil {
@@ -3281,10 +3312,12 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 
 		startTS := normalizeStartTS(readTS)
+		boundaryReads := listPushBoundaryReadKeys(key, meta)
 		_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,
 			CommitTS: commitTS,
+			ReadKeys: boundaryReads,
 			Elems:    ops,
 		})
 		if dispErr == nil {
@@ -3293,11 +3326,15 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		}
 		// Retryable failure: remember this attempt so the next iteration reuses
 		// its write set (and probes prev_commit_ts) rather than recomputing seq.
+		// The boundary readKeys ride along so the reuse's OCC atomically catches
+		// any intervening pop/trim — without that fence the reused seq could
+		// land past a shrunk Tail (codex P1).
 		pending = &reusableListPush{
 			ops:      ops,
 			startTS:  startTS,
 			commitTS: commitTS,
 			length:   updatedMeta.Len,
+			readKeys: boundaryReads,
 		}
 		return errors.WithStack(dispErr)
 	})

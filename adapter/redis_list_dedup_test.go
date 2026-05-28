@@ -207,6 +207,61 @@ func TestListPushDedup_GenuineConflictRecomputes(t *testing.T) {
 	require.Equal(t, []byte("v"), ours)
 }
 
+// TestListPushDedup_InterveningRPopRefusesStaleReuse is the codex P1
+// regression. From a one-element list [A]: attempt 1's RPUSH "v" plans seq 1
+// then fails without landing; an intervening RPOP shrinks the list to []
+// (Head→1, Len→0); the retry must NOT silently re-apply the stale write set
+// (which would place "v" at seq 1, past the new Tail=1, unreachable to
+// LRANGE). The boundary-position read keys (listItemKey(Head),
+// listItemKey(Tail-1)) carried in the dispatched OperationGroup.ReadKeys
+// catch the RPOP atomically via OCC; the adapter drops pending and recomputes
+// from the fresh (empty) meta so the new RPUSH plans seq 1 (Head+Len=1+0)
+// and lands at the correct, reachable position.
+func TestListPushDedup_InterveningRPopRefusesStaleReuse(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("mylist")
+
+	// Seed the list with one element at seq 0 (Head=0, Len=1, Tail=1).
+	require.NoError(t, st.PutAt(ctx, listItemKey(key, 0), []byte("A"), 1, 0))
+	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
+	require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, 1, 0), delta, 1, 0))
+
+	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 errors without landing
+	coord.clock.Observe(1)
+	// Between attempts, an RPOP commits: it tombstones seq 0 and writes a
+	// (HeadDelta=+1, LenDelta=-1) meta delta — shrinking the list to empty.
+	coord.beforeDispatch = func(n int) {
+		if n != 2 {
+			return
+		}
+		ts := coord.Clock().Next()
+		require.NoError(t, st.DeleteAt(ctx, listItemKey(key, 0), ts))
+		popDelta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 1, LenDelta: -1})
+		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, ts, 0), popDelta, ts, 0))
+	}
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	n, err := srv.listRPush(ctx, key, [][]byte{[]byte("v")})
+	require.NoError(t, err)
+	// After the RPOP shrank the list to [] and we recomputed onto the new
+	// state, the post-push length is 1 (just "v") and seq is the new Tail
+	// (Head+Len = 1+0 = 1) — but more importantly, the element MUST be
+	// reachable: meta.Head <= seq < meta.Tail.
+	require.Equal(t, int64(1), n)
+	require.Greater(t, coord.dispatches, 2, "the reuse must OCC-conflict and the loop must recompute")
+
+	readTS := snapshotTS(coord.Clock(), st)
+	meta, _, err := srv.resolveListMeta(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len, "list has exactly one element")
+
+	val, err := st.GetAt(ctx, listItemKey(key, meta.Head), readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), val, "the pushed element must be reachable at meta.Head")
+}
+
 // TestListPushDedup_DisabledKeepsLegacyPath confirms the gate is off by
 // default: without onePhaseTxnDedup, listPushCore never emits prev_commit_ts,
 // so the coordinator's probe is never exercised (dedup count stays zero) and

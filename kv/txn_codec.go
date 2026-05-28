@@ -199,10 +199,11 @@ func decodeTxnMetaV2(b []byte) (TxnMeta, error) {
 }
 
 // optionalV2Fields lists the V2 optional uint64 fields in their on-wire
-// order. encodeTxnMetaV2 and decodeTxnMetaV2 must traverse this list in the
-// same sequence; keeping the table here removes per-field branches from
-// decode (cyclop) and pins the encode/decode order in one place so adding a
-// future field is a single edit.
+// order. Only decodeTxnMetaV2 currently iterates this table (the table-drive
+// is what keeps it under the cyclop limit); encodeTxnMetaV2 writes the same
+// fields in the same sequence via inline conditionals, so when adding a new
+// V2 optional field both functions must be updated together to keep the
+// encode/decode order in lockstep.
 func optionalV2Fields(m *TxnMeta) []struct {
 	flag   byte
 	dest   *uint64

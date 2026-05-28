@@ -1024,10 +1024,6 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	panic("unreachable")
 }
 
-func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte) *pb.Request {
-	return onePhaseTxnRequestWithPrevCommit(startTS, commitTS, 0, primaryKey, reqs, readKeys)
-}
-
 // onePhaseTxnRequestWithPrevCommit builds a single-shard one-phase request,
 // optionally carrying prevCommitTS — the commit timestamp of a failed prior
 // attempt of the same transaction. When prevCommitTS is non-zero the FSM
