@@ -84,7 +84,7 @@ func (r *GRPCServer) clock() *kv.HLC {
 func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
 	readTS := req.GetTs()
 	if readTS == 0 {
-		readTS = snapshotTS(r.clock(), r.store)
+		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
 	}
 
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
@@ -137,7 +137,7 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 
 	readTS := req.GetTs()
 	if readTS == 0 {
-		readTS = snapshotTS(r.clock(), r.store)
+		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
 	}
 
 	var res []*store.KVPair
@@ -276,7 +276,7 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 		return nil, errors.WithStack(err)
 	}
 
-	readTS := snapshotTS(r.clock(), r.store)
+	readTS := globalSnapshotTS(ctx, r.clock(), r.store)
 	v, err := r.store.GetAt(ctx, req.Key, readTS)
 	if err != nil {
 		switch {
@@ -330,7 +330,7 @@ func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanRes
 			Kv: nil,
 		}, err
 	}
-	readTS := snapshotTS(r.clock(), r.store)
+	readTS := globalSnapshotTS(ctx, r.clock(), r.store)
 	res, err := r.store.ScanAt(ctx, req.StartKey, req.EndKey, limit, readTS)
 	if err != nil {
 		return &pb.ScanResponse{
