@@ -3240,6 +3240,72 @@ type reusableListPush struct {
 	readKeys [][]byte
 }
 
+// dispatchListPushReuse runs one iteration of the option-2 reuse path:
+// dispatches the captured write set under a fresh commit_ts (carrying
+// pending.commitTS as PrevCommitTS so the FSM probes whether the prior
+// attempt landed) and returns the post-push length on success. The drop
+// return signals the caller to clear pending — set on a genuine
+// WriteConflict from another txn so the next iteration recomputes from
+// fresh meta. Extracted from listPushCoreWithDedup to keep that closure
+// under the cyclop / gocognit / nestif limits.
+func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pending *reusableListPush) (newLen int64, drop bool, err error) {
+	commitTS := r.coordinator.Clock().Next()
+	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:        true,
+		StartTS:      pending.startTS,
+		CommitTS:     commitTS,
+		PrevCommitTS: pending.commitTS,
+		ReadKeys:     pending.readKeys,
+		Elems:        pending.ops,
+	})
+	if dispErr == nil {
+		length, rerr := r.resolveReuseLength(ctx, key, pending)
+		return length, false, rerr
+	}
+	if errors.Is(dispErr, store.ErrWriteConflict) {
+		// The exact-ts probe ruled out our own prior attempt and the
+		// target seq is taken by another txn — a genuine conflict.
+		// Drop the reusable attempt so the next iteration recomputes.
+		return 0, true, errors.WithStack(dispErr)
+	}
+	// Still ambiguous (lock / other retryable): this reuse may itself
+	// have landed, so the next retry must probe THIS commit_ts. Only
+	// advance pending.commitTS if retryRedisWrite will actually loop
+	// (non-retryable errors escape to the client; pending is then
+	// discarded with the goroutine, so the update is wasted and the
+	// stale value would be misleading if some future caller reads it).
+	if isRetryableRedisTxnErr(dispErr) {
+		pending.commitTS = commitTS
+	}
+	return 0, false, errors.WithStack(dispErr)
+}
+
+// resolveReuseLength returns the client-visible post-push length after a
+// successful reuse dispatch. If our prior attempt's exact commit_ts
+// version exists, the FSM no-op'd (probe hit) and pending.length is the
+// correct length we computed at that attempt. Otherwise the FSM applied
+// the reused write set at a fresh commit_ts and we must re-read meta to
+// capture any non-conflicting list-modifying writes that committed
+// between attempts (codex P2) — without this, the return value would
+// silently understate the count when the boundary OCC fence and
+// write-key OCC both pass but the list length changed.
+func (r *RedisServer) resolveReuseLength(ctx context.Context, key []byte, pending *reusableListPush) (int64, error) {
+	if probeKey := firstWriteKey(pending.ops); len(probeKey) > 0 {
+		hit, perr := r.store.CommittedVersionAt(ctx, probeKey, pending.commitTS)
+		if perr != nil {
+			return 0, errors.WithStack(perr)
+		}
+		if hit {
+			return pending.length, nil
+		}
+	}
+	currentMeta, _, mErr := r.resolveListMeta(ctx, key, r.readTS())
+	if mErr != nil {
+		return 0, mErr
+	}
+	return currentMeta.Len, nil
+}
+
 // firstWriteKey returns the first non-empty element key from ops, or nil
 // when there is none. Used after a successful reuse dispatch to probe
 // whether our prior attempt's commit_ts actually landed: attempt 1 writes
@@ -3285,68 +3351,15 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 	var pending *reusableListPush
 	err := r.retryRedisWrite(ctx, func() error {
 		if pending != nil {
-			commitTS := r.coordinator.Clock().Next()
-			_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-				IsTxn:        true,
-				StartTS:      pending.startTS,
-				CommitTS:     commitTS,
-				PrevCommitTS: pending.commitTS,
-				ReadKeys:     pending.readKeys,
-				Elems:        pending.ops,
-			})
-			if dispErr == nil {
-				// Distinguish the two success paths so we return the right
-				// length (codex P2): if the FSM no-op'd because our prior
-				// attempt at pending.commitTS actually committed, the
-				// client-visible length is the one we computed at that
-				// attempt and stashed in pending.length. If instead the FSM
-				// applied the reused write set at the fresh commit_ts (our
-				// prior didn't land), the length must include any
-				// non-conflicting list-modifying writes that committed
-				// between attempts (e.g. an intervening LPUSH that the
-				// boundary OCC fence did not catch because it didn't touch
-				// Head / Tail-1) — the legacy retry path would have
-				// recomputed in that window, and a stale return would
-				// understate the count. A point read of any of our write
-				// keys at pending.commitTS answers the question: attempt 1
-				// wrote all its keys atomically at that commit_ts, so any
-				// hit means it landed.
-				priorLanded := false
-				if probeKey := firstWriteKey(pending.ops); len(probeKey) > 0 {
-					hit, perr := r.store.CommittedVersionAt(ctx, probeKey, pending.commitTS)
-					if perr != nil {
-						return errors.WithStack(perr)
-					}
-					priorLanded = hit
-				}
-				if priorLanded {
-					newLen = pending.length
-					return nil
-				}
-				currentMeta, _, mErr := r.resolveListMeta(ctx, key, r.readTS())
-				if mErr != nil {
-					return mErr
-				}
-				newLen = currentMeta.Len
-				return nil
-			}
-			if errors.Is(dispErr, store.ErrWriteConflict) {
-				// The exact-ts probe ruled out our own prior attempt and the
-				// target seq is taken by another txn — a genuine conflict.
-				// Drop the reusable attempt so the next iteration recomputes.
+			length, drop, dispErr := r.dispatchListPushReuse(ctx, key, pending)
+			if drop {
 				pending = nil
-				return errors.WithStack(dispErr)
 			}
-			// Still ambiguous (lock / other retryable): this reuse may itself
-			// have landed, so the next retry must probe THIS commit_ts. Only
-			// advance pending.commitTS if retryRedisWrite will actually loop
-			// (non-retryable errors escape to the client; pending is then
-			// discarded with the goroutine, so the update is wasted and the
-			// stale value would be misleading if some future caller reads it).
-			if isRetryableRedisTxnErr(dispErr) {
-				pending.commitTS = commitTS
+			if dispErr != nil {
+				return dispErr
 			}
-			return errors.WithStack(dispErr)
+			newLen = length
+			return nil
 		}
 
 		readTS := r.readTS()
