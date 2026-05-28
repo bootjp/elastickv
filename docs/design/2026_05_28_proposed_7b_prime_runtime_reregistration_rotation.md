@@ -87,12 +87,16 @@ recommendation:
    - **Pro:** Cluster-uniform sidecar simplifies forensic recovery
      (every node's record for `newDEK` is the same).
    - **Con:** The proposer's `w.epoch` is not guaranteed to be ≥
-     every other node's `w.epoch` at apply time. If proposer.w.epoch
-     < non_proposer.w.epoch, applying the proposer's value would
-     trigger the same brick / nonce-reuse failure modes that
-     motivated this slice. Detecting and gating on per-node bound
-     requires per-node Raft round-trips before the rotation can
-     commit — a strictly larger coordination problem than (b).
+     every other node's `w.epoch` at apply time. A natural defence
+     ("take the cluster-wide max") is a **strictly larger
+     coordination problem than option (b)**: it requires a
+     pre-rotation quorum read to collect every node's `w.epoch`,
+     take the max, embed it in the rotation entry, then commit —
+     i.e., a separate consensus sub-problem before the rotation
+     can even be proposed. Without that pre-coordination, if
+     `proposer.w.epoch < non_proposer.w.epoch`, applying the
+     proposer's value would trigger the same brick / nonce-reuse
+     failure modes that motivated this slice.
 
 **Recommendation: option (b).** The "each node's sidecar records its
 own emissions" invariant is the natural one for a per-node nonce
@@ -120,7 +124,37 @@ via `writeRotationSidecar`. The change:
 - `writeRotationSidecar` reads `a.localEpoch` (defaulting to `0`
   when the option was not supplied — preserving the FSM-internal
   test harnesses that construct an `Applier` without write-path
-  state) and writes that value into `sc.Keys[newDEK].LocalEpoch`.
+  state) and writes that value into `sc.Keys[newDEK].LocalEpoch`
+  **only when `p.Purpose == PurposeStorage`**.
+
+#### 3.1.1 Why the value is storage-only — Raft DEK rotations must keep `LocalEpoch: 0`
+
+`applyRotateDEK` handles both `PurposeStorage` and `PurposeRaft`
+rotations today (`writeRotationSidecar` dispatches on `p.Purpose`
+when assigning `sc.Active.{Storage,Raft}`). The
+`encryptionWriteWiring.epoch` value piped in by `WithLocalEpoch` is
+the **storage** write-path's pinned `w.epoch` — the value the
+deterministic nonce factory under the storage envelope is using.
+
+A raft DEK rotation has its own (future) per-purpose epoch
+counter; cross-applying the storage nonce factory's epoch to a
+raft DEK's `LocalEpoch` would corrupt the raft DEK's counter
+before the raft envelope path consumes it (codex P2 on PR #855).
+Until raft envelope support lands with its own per-purpose
+plumbing, raft DEK rotations MUST continue to write `LocalEpoch:
+0` exactly as today — `writeRotationSidecar`'s switch on
+`p.Purpose` gates the new behaviour to storage:
+
+```go
+switch p.Purpose {
+case fsmwire.PurposeStorage:
+    sc.Active.Storage = p.DEKID
+    keyLocalEpoch = a.localEpoch
+case fsmwire.PurposeRaft:
+    sc.Active.Raft = p.DEKID
+    keyLocalEpoch = 0  // current behaviour preserved
+}
+```
 
 A static `uint16` rather than a `func() uint16` provider is the
 right shape today. `BumpLocalEpoch` only runs at process start
@@ -132,7 +166,7 @@ shared state at that point. Adding the provider indirection now,
 purely for a hypothetical future caller, violates the codebase's
 "don't design for hypothetical future requirements" convention.
 
-#### 3.1.1 Backward compatibility — pre-bootstrap and unwired tests
+#### 3.1.2 Backward compatibility — pre-bootstrap and unwired tests
 
 `a.localEpoch` is `0` (the zero value) for two cases:
 1. Pre-bootstrap process loads (no sidecar, `w.epoch == 0`).
@@ -145,11 +179,19 @@ applier tests construct an `Applier` for FSM-internal behaviour
 nonce-factory pinned epoch. The pre-bootstrap case is naturally
 indistinguishable from the unwired-test case — both write
 `LocalEpoch: 0`, which is the value the cluster already used
-before this slice for every rotation. So a pre-bootstrap node
-that observes a runtime `RotateDEK` is exactly as safe under 7b'
-as it is under 7b (the watcher is also in scope only when
-`StorageEnvelopeActive` and the local node has a non-zero
-`w.epoch`).
+before this slice for every rotation.
+
+**In practice `applyRotateDEK` is unreachable during a
+pre-bootstrap load** (claude review on PR #855): a `RotateDEK`
+entry is only committed AFTER `EnableStorageEnvelope` has
+applied, which transitions the node out of pre-bootstrap state
+(`w.epoch > 0` after the next restart's `BumpLocalEpoch`). A
+pre-bootstrap node replaying the log sees `EnableStorageEnvelope`
+first, becomes post-bootstrap, and only then sees `RotateDEK`. So
+by the time `applyRotateDEK` runs with a non-zero
+`localEpoch`-meaningful value, case 1 is unreachable for real
+rotation entries; the `localEpoch == 0` pre-bootstrap path is
+therefore only exercised by test harnesses.
 
 ### 3.2 7b watcher scope-check extension
 
@@ -165,28 +207,94 @@ deferred case and logs-once-then-skips. After 7b':
   counter that records the most recently registered DEK; if the watcher
   observes a fresh rotation (active DEK changes again while the load is
   running), it re-proposes for the new DEK.
-- The scope-check now reads:
-  - In scope: `bootDEKID == 0` (pre-bootstrap), OR `activeDEK ==
-    bootDEKID` (cutover), OR `activeDEK != bootDEKID && lastRegisteredDEK
-    != activeDEK` (rotation, not yet registered for this DEK).
-  - Already done: `cache.Registered(activeDEK)` (the gate already says
-    yes — the existing first check).
+
+**Check ordering (load-bearing).** `runtimeRegistrationInScope`
+MUST short-circuit in this order (claude review on PR #855):
+1. **Already-registered short-circuit:** `cache.Registered(activeDEK)
+   → true` → return `_, false` (no-op).
+2. **Scope conditions:** evaluate the in-scope branches below.
+3. **Propose** (from `runtimeRegistrationTick`, not this function).
+
+If the `lastRegisteredDEK != activeDEK` test were checked before
+`cache.Registered()`, a `B → C → B` oscillation would trigger a
+spurious re-propose for `B` after the rotation back from `C`
+(`lastRegisteredDEK == C ≠ B`, but `cache.Registered(B) == true`).
+This is safe via §4.1 case-2 idempotent but wasteful; ordering
+(1) eliminates it.
+
+The scope-check then reads, in order:
+- In scope: `bootDEKID == 0` (pre-bootstrap), OR `activeDEK ==
+  bootDEKID` (cutover), OR `activeDEK != bootDEKID &&
+  lastRegisteredDEK != activeDEK` (rotation, not yet registered
+  for this DEK).
+- Out of scope: any other combination.
+
+#### 3.2.1 `lastRegisteredDEK` reset on restart
+
+`lastRegisteredDEK` is per-process-load state (not durable). On
+restart it resets to `0`. If a rotation happened while the node was
+down (`bootDEKID == A`, `activeDEK == B`), the first tick observes
+`lastRegisteredDEK (0) != activeDEK (B)` and proposes — the
+intended behaviour. The §4.1 case-2 idempotent acceptance covers a
+race where a prior load of the same node already registered the row.
+
+#### 3.2.2 Stale-cache transient
+
+If the in-memory `StateCache`'s `Registered` set hasn't yet
+reflected a prior registration when a rotation oscillates (`B → C
+→ B` before the cache catches up to `B`'s registration), the
+watcher observes `lastRegisteredDEK == C ≠ B` and
+`cache.Registered(B) == false` → spurious re-propose for `B`.
+This is safe via §4.1 case-2 idempotent acceptance and self-heals
+on the next tick once the cache refreshes; it is documented here
+so the implementation PR's tests do not flag it as a bug.
 
 ### 3.3 Apply-side ordering invariant
 
-`applyRotateDEK`'s ordering MUST be:
+`applyRotateDEK`'s ordering is **unchanged** from current
+[`internal/encryption/applier.go::applyRotateDEK`](../../internal/encryption/applier.go)
+(only the value written in step 3 changes):
 
 1. KEK-unwrap new DEK.
 2. Keystore set (`a.keystore.Set(p.DEKID, dek)`).
-3. **Sidecar write — with `localEpoch()` for `Keys[newDEK].LocalEpoch`.**
+3. **Sidecar write — with `a.localEpoch` for `Keys[newDEK].LocalEpoch`
+   when `p.Purpose == PurposeStorage`, `0` otherwise** (see §3.1.1).
 4. **Proposer registration** (`ApplyRegistration(p.ProposerRegistration)`)
    — proposer's value is `(newDEK, proposer.node_id, proposer.w.epoch)`,
    set by the proposer at propose time. Verbatim into the writer
    registry.
 
-Step 3 changes from `LocalEpoch: 0` to `LocalEpoch: a.localEpoch()`.
-Step 4 is unchanged — the proposer's row already targets the proposer's
-own `w.epoch`, which is what option (b) wants for the proposer.
+Step 3 changes from `LocalEpoch: 0` to `LocalEpoch: a.localEpoch` (for
+storage). Step 4 is unchanged.
+
+**Sidecar-before-registration is the existing `applyRotateDEK`
+ordering** (coderabbitai major review on PR #855 raised concern
+this conflicts with a "registration-before-sidecar" invariant —
+but that invariant lives in `applyEnableStorageEnvelope`, NOT
+`applyRotateDEK`):
+
+- `applyEnableStorageEnvelope` runs `ApplyRegistration` *before*
+  `WriteSidecar` because the sidecar's
+  `StorageEnvelopeActive=true` flip is the durable
+  idempotency-marker. If a crash strands the cutover with the
+  marker flipped but no proposer-registration row, the §5.2
+  startup guard refuses boot AND FSM replay short-circuits on
+  the already-active no-op branch — permanently losing the
+  registration. So that path reverses ordering. This is
+  explicitly documented in
+  [applier.go's `applyEnableStorageEnvelope` fresh-success
+  branch](../../internal/encryption/applier.go).
+
+- `applyRotateDEK` uses sidecar-before-registration because the
+  rotation has no equivalent idempotency-marker: a crash between
+  the sidecar write and the registration insert means
+  `sc.Active.Storage == newDEK` but no proposer registry row.
+  Recovery: on next process start, **7a's startup registration
+  path** observes the new active DEK and proposes
+  `(newDEK, proposer.node, proposer.w.epoch)` itself —
+  self-healing without requiring FSM replay. Non-proposers
+  similarly self-heal via the 7b watcher (this slice). No durable
+  fail-open / fail-closed skew is possible.
 
 Non-proposer nodes do NOT auto-register here — they remain at the
 old DEK's registered state. The 7b watcher's next tick observes
@@ -235,20 +343,36 @@ node's sidecar now records its own emissions accurately.
      construction. (A counter-based test fixture suffices.)
 
 2. New `main_encryption_registration_test.go` cases extending the
-   existing watcher harness:
-   - `TestRuntimeRegistrationTick_RotationInScopeProposes`:
+   existing watcher harness. Split into **propose-call** vs
+   **short-circuit** so each test exercises one path
+   independently (coderabbitai minor on PR #855):
+
+   - `TestRuntimeRegistrationTick_RotationInScopeInvokesPropose`:
      `bootDEKID == X != 0`, `activeDEK == Y != X`,
-     `lastRegisteredDEK != Y`, `w.epoch == 5` → tick proposes
-     `(Y, node, 5)`. Pre-populates a registry row at `(Y, node, 5)`
-     so `verifyRegistered` short-circuits and `MarkRegistered(Y)`
-     fires.
+     `lastRegisteredDEK != Y`, `w.epoch == 5`. NO pre-populated
+     registry row. Asserts the tick invokes the propose path (use
+     a fake `Coordinate` whose `Propose` method records the
+     entry) with payload `(Y, node, 5)`.
+   - `TestRuntimeRegistrationTick_RotationVerifyShortCircuitsToMark`:
+     same wiring as above, but **pre-populate** a registry row at
+     `(Y, node, 5)`. Asserts `verifyRegistered` short-circuits,
+     `MarkRegistered(Y)` fires, and the fake `Coordinate.Propose`
+     is NOT called.
    - `TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp`:
-     after the first proposing tick, a second tick at the same
-     `activeDEK` is a no-op (the §4.1 case-2 idempotent guard).
+     after a first-tick MarkRegistered, a second tick at the same
+     `activeDEK` is a no-op. Asserts `cache.Registered(Y)` short-
+     circuits `runtimeRegistrationInScope` and `lastRegisteredDEK`
+     is NOT updated (claude review nit on PR #855 — confirm it
+     stays at the original value, not reset to 0 or rewritten).
    - `TestRuntimeRegistrationTick_RotationToYetAnotherDEKReProposes`:
      after registering for DEK Y, a subsequent rotation to DEK Z
      (`activeDEK == Z`, `lastRegisteredDEK == Y`) triggers a fresh
-     propose. Pins that `lastRegisteredDEK` is updated to Z.
+     propose. Pins that `lastRegisteredDEK` updates to Z.
+   - `TestRuntimeRegistrationTick_RotationOscillationBtoCtoB`:
+     after registering for B then C, rotation back to B with
+     `cache.Registered(B) == true` short-circuits at check
+     ordering step (1) — no spurious re-propose. Pins the
+     §3.2 check-ordering invariant.
 
 3. Replace `TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips`
    (which pins the 7b deferral) with
@@ -327,11 +451,31 @@ Roll-forward path: deploy 7b' to every node in the cluster, verify
 the capability probe reports all-7b', then issue `RotateDEK`. The
 7b' watcher on each node naturally absorbs the rotation.
 
-Rollback path: rolling back to 7b after a 7b' RotateDEK has applied
-is safe — the sidecar's `Keys[newDEK].LocalEpoch = prior.w.epoch`
-value satisfies the §9.1 startup guard's `w.epoch_new >= lastSeen`
-check on next boot of the 7b binary. The 7b binary then runs its
-log-once-skip deferral for the rotation case, identical to the
-pre-7b' posture. The writer registry's `(newDEK, node, w.epoch)`
-row remains in place — case-2 monotonic acceptance means it does
-not interfere with a future re-rotation under either binary.
+Rollback path: rolling back to 7b after a 7b' RotateDEK has
+applied is safe (claude review on PR #855 corrected the
+mechanism). The boot sequence under the 7b binary:
+
+1. The sidecar's `Keys[newDEK].LocalEpoch = prior.w.epoch` value
+   satisfies the §9.1 startup guard. `BumpLocalEpoch(newDEK)`
+   advances `prior.w.epoch → prior.w.epoch + 1`; the guard
+   checks `prior.w.epoch + 1 >= lastSeen (= prior.w.epoch)` —
+   true. Boot succeeds.
+2. `bootDEKID = activeDEK = newDEK` (no rotation from this
+   boot's perspective — the rotation already happened in the
+   prior 7b' load and is durably committed). The 7a
+   process-start registration path runs and proposes
+   `(newDEK, node, prior.w.epoch + 1)`. §4.1 case-2 monotonic
+   acceptance lands the row.
+3. The 7b watcher's first tick observes `cache.Registered(newDEK)
+   == true` (the 7a startup path just MarkRegistered) and
+   returns a no-op for the rest of the load.
+
+The 7b binary's deferred-rotation log-once-skip branch **does NOT
+fire** on this rollback — that branch only activates when
+`bootDEKID != activeDEK`, but after rollback the two are equal
+(it is the cutover/cold-start branch that runs, exactly as on a
+fresh 7b binary boot into a cluster that has the new DEK
+active). The writer registry's `(newDEK, node, prior.w.epoch)`
+row written by 7b' remains in place — case-2 monotonic
+acceptance accepts the 7a-startup `(newDEK, node, prior.w.epoch
++ 1)` advance without interference.
