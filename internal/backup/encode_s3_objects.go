@@ -156,7 +156,7 @@ func reservedDirHoldsSidecar(root *os.Root, dirRel string) (bool, error) {
 		if ent.IsDir() {
 			has, err := reservedDirHoldsSidecar(root, childRel)
 			if err != nil {
-				return false, err
+				return false, errors.WithStack(err)
 			}
 			if has {
 				return true, nil
@@ -194,7 +194,7 @@ func (e *S3RecordEncoder) walkObjects(b *snapshotBuilder, root *os.Root, bucketD
 func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string, ent os.DirEntry) error {
 	name := ent.Name()
 	if ent.IsDir() {
-		return e.walkObjectSubdir(b, root, bucketDir, bucketName, rel, childRel, name)
+		return e.walkObjectSubdir(b, root, bucketDir, bucketName, rel, childRel)
 	}
 	switch {
 	case rel == "" && name == "_bucket.json":
@@ -220,19 +220,20 @@ func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, buc
 // those) also lands here; its sidecar makes that detectable, and we
 // fail closed rather than silently drop the user data (codex P1 #842
 // follow-up).
-func (e *S3RecordEncoder) walkObjectSubdir(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel, name string) error {
-	if rel == "" && (name == "_incomplete_uploads" || name == "_orphans") {
-		hasUserObject, err := reservedDirHoldsSidecar(root, filepath.Join(bucketDir, childRel))
-		if err != nil {
-			return err
-		}
-		if hasUserObject {
-			return errors.Wrapf(ErrS3EncodeReservedPrefixCollision,
-				"%s/%s: rename the colliding S3 key before backup", bucketDir, name)
-		}
-		return nil
+func (e *S3RecordEncoder) walkObjectSubdir(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string) error {
+	name := filepath.Base(childRel)
+	if rel != "" || (name != "_incomplete_uploads" && name != "_orphans") {
+		return e.walkObjects(b, root, bucketDir, bucketName, childRel)
 	}
-	return e.walkObjects(b, root, bucketDir, bucketName, childRel)
+	hasUserObject, err := reservedDirHoldsSidecar(root, filepath.Join(bucketDir, childRel))
+	if err != nil {
+		return err
+	}
+	if hasUserObject {
+		return errors.Wrapf(ErrS3EncodeReservedPrefixCollision,
+			"%s/%s: rename the colliding S3 key before backup", bucketDir, name)
+	}
+	return nil
 }
 
 // encodeObject reads one object's sidecar, streams its body into blob
