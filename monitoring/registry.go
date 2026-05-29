@@ -23,6 +23,7 @@ type Registry struct {
 	writeConflict *WriteConflictMetrics
 	sqs           *SQSMetrics
 	sqsObserver   *SQSObserver
+	hlc           *HLCMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -47,6 +48,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.writeConflict = newWriteConflictMetrics(registerer)
 	r.sqs = newSQSMetrics(registerer)
 	r.sqsObserver = newSQSObserver(r.sqs)
+	r.hlc = newHLCMetrics(registerer)
 	return r
 }
 
@@ -209,4 +211,17 @@ func (r *Registry) WriteConflictCollector() *WriteConflictCollector {
 		return nil
 	}
 	return newWriteConflictCollector(r.writeConflict)
+}
+
+// HLCObserver returns the HLC physical-ceiling + fence-rejection
+// observer backed by this registry. Same shape as RaftObserver /
+// SQSObserver: callers pull it via the registry, then drive
+// Start(ctx, source, interval) from main.go once the kv layer's
+// HLC is constructed. Returns nil if r is nil so test fixtures
+// can drop the observer without conditional wiring.
+func (r *Registry) HLCObserver() *HLCObserver {
+	if r == nil || r.hlc == nil {
+		return nil
+	}
+	return newHLCObserver(r.hlc)
 }
