@@ -348,3 +348,108 @@ func TestRegisterOperationalServicesRequiresContext(t *testing.T) {
 		RegisterOperationalServices(nilCtx, server, &fakeEngine{}, []string{"RawKV"})
 	})
 }
+
+// recordingInterceptor is a test double for MembershipChangeInterceptor
+// that records every PreAddMember call and optionally returns a
+// pre-configured error so tests can drive the abort branches.
+type recordingInterceptor struct {
+	mu      sync.Mutex
+	calls   []string
+	retErr  error
+	preHook func(raftID string) // optional callback; useful for ordering assertions
+}
+
+func (r *recordingInterceptor) PreAddMember(_ context.Context, raftID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, raftID)
+	if r.preHook != nil {
+		r.preHook(raftID)
+	}
+	return r.retErr
+}
+
+// TestServer_AddVoter_InvokesInterceptorBeforeConfChange pins Stage 7c
+// §5.1 contract item 1: AddVoter calls the interceptor (with the raftID
+// from the request) before the engine's AddVoter, in that order. A
+// successful interceptor permits the conf-change to proceed.
+func TestServer_AddVoter_InvokesInterceptorBeforeConfChange(t *testing.T) {
+	t.Parallel()
+	engine := &fakeEngine{}
+	var order []string
+	interceptor := &recordingInterceptor{preHook: func(string) { order = append(order, "preAdd") }}
+	server := NewServerWithInterceptor(engine, interceptor)
+	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, []string{"n42"}, interceptor.calls)
+	// fakeEngine.AddVoter appends to addVoterCalls AFTER the interceptor
+	// hook runs; ordering is observable.
+	order = append(order, "addVoter")
+	require.Equal(t, []string{"preAdd", "addVoter"}, order)
+	require.Equal(t, 1, len(engine.addVoterCalls))
+}
+
+// TestServer_AddVoter_InterceptorErrorAbortsConfChange pins §5.1
+// contract item 2: a non-nil PreAddMember error aborts AddVoter; the
+// engine's AddVoter is never called.
+func TestServer_AddVoter_InterceptorErrorAbortsConfChange(t *testing.T) {
+	t.Parallel()
+	engine := &fakeEngine{}
+	sentinel := context.DeadlineExceeded
+	interceptor := &recordingInterceptor{retErr: sentinel}
+	server := NewServerWithInterceptor(engine, interceptor)
+	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
+	require.Error(t, err)
+	require.Nil(t, resp)
+	require.Equal(t, []string{"n42"}, interceptor.calls)
+	require.Equal(t, 0, len(engine.addVoterCalls), "engine.AddVoter must NOT be called when PreAddMember errs")
+}
+
+// TestServer_AddVoter_NilInterceptorSkipsPreStep pins §5.1 contract
+// item 3: with no interceptor installed (the pre-7c posture, or an
+// encryption-disabled build), AddVoter proceeds directly to the
+// engine's AddVoter as today.
+func TestServer_AddVoter_NilInterceptorSkipsPreStep(t *testing.T) {
+	t.Parallel()
+	engine := &fakeEngine{}
+	server := NewServer(engine) // nil interceptor by construction
+	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, 1, len(engine.addVoterCalls))
+}
+
+// TestServer_AddLearner_InterceptorContract is the symmetric set for
+// AddLearner — combined into one test since the behavior mirrors
+// AddVoter exactly.
+func TestServer_AddLearner_InterceptorContract(t *testing.T) {
+	t.Parallel()
+	t.Run("invokes interceptor then conf-change", func(t *testing.T) {
+		t.Parallel()
+		engine := &fakeEngine{}
+		interceptor := &recordingInterceptor{}
+		server := NewServerWithInterceptor(engine, interceptor)
+		_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "l1", Address: "127.0.0.1:9000"})
+		require.NoError(t, err)
+		require.Equal(t, []string{"l1"}, interceptor.calls)
+		require.Equal(t, 1, len(engine.addLearnerCalls))
+	})
+	t.Run("interceptor error aborts", func(t *testing.T) {
+		t.Parallel()
+		engine := &fakeEngine{}
+		interceptor := &recordingInterceptor{retErr: context.DeadlineExceeded}
+		server := NewServerWithInterceptor(engine, interceptor)
+		_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "l1", Address: "127.0.0.1:9000"})
+		require.Error(t, err)
+		require.Equal(t, 0, len(engine.addLearnerCalls))
+	})
+	t.Run("nil interceptor skips pre-step", func(t *testing.T) {
+		t.Parallel()
+		engine := &fakeEngine{}
+		server := NewServer(engine)
+		_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "l1", Address: "127.0.0.1:9000"})
+		require.NoError(t, err)
+		require.Equal(t, 1, len(engine.addLearnerCalls))
+	})
+}

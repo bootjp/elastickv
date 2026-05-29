@@ -120,6 +120,18 @@ var (
 	// than a nil-pointer panic deep in the apply path.
 	ErrKEKNotConfigured = errors.New("encryption: KEK not configured on this node; cannot unwrap wrapped DEK material")
 
+	// ErrWriterUint16Collision is the Stage 7c §3.3 typed error returned
+	// by the encryption-aware MembershipChangeInterceptor when a new
+	// node's NodeID16 collides with an existing member's writer-
+	// registry row at the same uint16 truncation but with a different
+	// FullNodeID. The §3.1 read-before-propose guard catches the
+	// common case BEFORE any propose, so the admin RPC returns a
+	// retryable client-facing error rather than triggering a §4.1
+	// case-4 halt apply (which would, without 7c's interceptor, fire
+	// AFTER the conf-change had already committed — bricking the
+	// cluster). Operators choose a non-colliding raftID and retry.
+	ErrWriterUint16Collision = errors.New("encryption: writer registry uint16 collision; choose a different raftID")
+
 	// ErrSidecarPresentWithoutFlag is the §9.1 startup-refusal guard
 	// raised when the data dir already contains a sidecar (keys.json)
 	// but --encryption-enabled is NOT set. Continuing would silently
