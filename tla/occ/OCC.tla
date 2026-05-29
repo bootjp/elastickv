@@ -84,26 +84,28 @@ Init ==
 \* === ACTIONS ===
 
 (***************************************************************************)
-(* Tick: advance the abstract HLC counter.  Bounded by MaxTs so TLC stays  *)
-(* finite.  No other variable touched.                                     *)
-(***************************************************************************)
-Tick ==
-    /\ tsCounter < MaxTs
-    /\ tsCounter' = tsCounter + 1
-    /\ UNCHANGED <<txnState, startTs, commitTs, writeSet,
-                   readObs, lockMap, versions, opCount>>
-
-(***************************************************************************)
-(* BeginTxn: an Idle txn becomes Active and pins its start_ts.  OCC-5 is   *)
-(* structurally satisfied because every later op on this txn reads        *)
-(* startTs[t] directly — there is no separate read_ts variable.           *)
+(* BeginTxn: an Idle txn becomes Active and pins its start_ts.            *)
+(* tsCounter is advanced as part of the action so the assigned startTs    *)
+(* is a fresh, monotonically increasing value across all BeginTxn calls.  *)
+(* This models the real HLC behaviour where start_ts is allocated from a  *)
+(* leader-issued HLC ts that strictly increases per allocation.           *)
+(*                                                                         *)
+(* The monotonic-tsCounter property is load-bearing for OCC-3 (snapshot   *)
+(* stability — strict equality form): a reader's `LatestVisible(k, T)`    *)
+(* cannot change after the read because no future Commit can produce a    *)
+(* commit_ts <= T (Commit also auto-advances tsCounter under              *)
+(* EnableSafety; see Commit below).                                       *)
+(*                                                                         *)
+(* OCC-5 is structurally satisfied: every later op on this txn reads     *)
+(* startTs[t] directly — there is no separate read_ts variable.          *)
 (***************************************************************************)
 BeginTxn(t) ==
     /\ txnState[t] = "Idle"
+    /\ tsCounter < MaxTs
+    /\ tsCounter' = tsCounter + 1
     /\ txnState' = [txnState EXCEPT ![t] = "Active"]
-    /\ startTs'  = [startTs  EXCEPT ![t] = tsCounter]
-    /\ UNCHANGED <<tsCounter, commitTs, writeSet,
-                   readObs, lockMap, versions, opCount>>
+    /\ startTs'  = [startTs  EXCEPT ![t] = tsCounter + 1]
+    /\ UNCHANGED <<commitTs, writeSet, readObs, lockMap, versions, opCount>>
 
 (***************************************************************************)
 (* ReadKey: snapshot read on key k at startTs[t].  Gated by OCC-3 lock     *)
@@ -154,21 +156,24 @@ Prepare(t) ==
 
 (***************************************************************************)
 (* Commit: promote every lock owned by t into a version at commitTs.       *)
-(* commit_ts is the *current* tsCounter — Commit borrows from the clock   *)
-(* but does NOT advance it (Tick is the only action that advances ts).    *)
-(* That keeps tsCounter inside the bounded model TLC explores.            *)
 (*                                                                         *)
-(* OCC-1 guard (under EnableSafety): commit_ts strictly greater than the   *)
-(* txn's start_ts.  Equivalent to "Tick has fired at least once since      *)
-(* BeginTxn(t)".  Disabling the guard is the gap-config evidence path     *)
-(* — TLC then surfaces a (committed, commit_ts <= start_ts) counter-       *)
-(* example.                                                                *)
+(* Under EnableSafety, Commit advances tsCounter and uses the new value    *)
+(* as commit_ts — this models the HLC behaviour where commit_ts is        *)
+(* allocated as the next fresh ts > all prior start_ts and commit_ts.     *)
+(* The OCC-1 invariant (`commit_ts > start_ts`) is therefore a consequence *)
+(* of the monotonic ts allocation rather than an explicit comparison.     *)
+(*                                                                         *)
+(* Under ~EnableSafety (gap config), Commit borrows the *current*         *)
+(* tsCounter without advancing.  Combined with BeginTxn's auto-advance,   *)
+(* this lets commit_ts == startTs[t] (the BeginTxn's freshly assigned     *)
+(* value), violating OCC-1.  TLC surfaces the (committed, commit_ts ==    *)
+(* start_ts) counterexample.                                              *)
 (***************************************************************************)
 Commit(t) ==
     /\ txnState[t] = "Prepared"
-    /\ LET ct == tsCounter IN
-        /\ \/ ~EnableSafety
-           \/ ct > startTs[t]
+    /\ LET ct == IF EnableSafety THEN tsCounter + 1 ELSE tsCounter IN
+        /\ EnableSafety => tsCounter < MaxTs   \* keep ct inside the bounded model
+        /\ tsCounter' = IF EnableSafety THEN tsCounter + 1 ELSE tsCounter
         /\ commitTs' = [commitTs EXCEPT ![t] = ct]
         /\ txnState' = [txnState EXCEPT ![t] = "Committed"]
         /\ versions' = [k \in Keys |->
@@ -177,7 +182,7 @@ Commit(t) ==
                         ELSE versions[k]]
         /\ lockMap' = [k \in Keys |->
                         IF LockedBy(k, t) THEN NoLock ELSE lockMap[k]]
-    /\ UNCHANGED <<tsCounter, startTs, writeSet, readObs, opCount>>
+    /\ UNCHANGED <<startTs, writeSet, readObs, opCount>>
 
 (***************************************************************************)
 (* Abort: release all locks owned by t.  Versions are NOT created.        *)
@@ -191,33 +196,38 @@ Abort(t) ==
                    readObs, versions, opCount>>
 
 (***************************************************************************)
-(* LockResolve: clear an orphan lock whose owner has already reached a    *)
-(* terminal state.  Models kv/lock_resolver.go.  Required by OCC-4 so any *)
-(* committed-but-not-finalised lock can still be cleaned up after the     *)
-(* owner's terminal action; required by OCC-L1 (liveness, M6).            *)
+(* LockResolve is intentionally NOT part of this M2 model.                 *)
+(*                                                                         *)
+(* The real implementation has an asynchronous lock-resolver               *)
+(* (kv/lock_resolver.go): when a reader encounters a lock whose owner is  *)
+(* in a terminal state, the resolver either promotes the lock to a        *)
+(* version (Committed owner) or clears it (Aborted owner).  Modelling      *)
+(* that resolver as a TLA+ action only makes sense if Commit/Abort can    *)
+(* leave orphan locks behind — which in our `Commit`/`Abort` above is     *)
+(* not the case: both actions atomically drain every lock they own as    *)
+(* part of the same step.  A LockResolve action whose guard requires      *)
+(* HasLock(k) /\ txnState[owner] \in {Committed, Aborted} would           *)
+(* therefore be unreachable in this model (gemini HIGH on PR #858).      *)
+(*                                                                         *)
+(* This is a deliberate M2 abstraction: the atomic-drain in Commit/Abort  *)
+(* subsumes the resolver's effect on the durable state without modelling  *)
+(* the asynchronous interleaving.  The bounded-safety form of OCC-4 (no   *)
+(* stranded lock at quiescence) is therefore trivially preserved.         *)
+(* OCC-L1 (eventual lock release, the liveness counterpart) is deferred  *)
+(* to M6 per §5.6 of the design doc.  M5 (composed) is the right place    *)
+(* to model the async resolver: cross-module interactions with OCC-3      *)
+(* (lock encoding for reads) and Routes (where the resolver issues        *)
+(* secondary RPCs) make sense to test together.                            *)
 (***************************************************************************)
-LockResolve(k) ==
-    /\ HasLock(k)
-    /\ LET t == lockMap[k].owner IN
-        /\ txnState[t] \in {"Committed", "Aborted"}
-        /\ IF txnState[t] = "Committed"
-           THEN versions' = [versions EXCEPT ![k] = @ \cup
-                              {[commitTs |-> commitTs[t], owner |-> t]}]
-           ELSE versions' = versions
-        /\ lockMap' = [lockMap EXCEPT ![k] = NoLock]
-    /\ UNCHANGED <<tsCounter, txnState, startTs, commitTs, writeSet,
-                   readObs, opCount>>
 
 \* === NEXT ===
 Next ==
-    \/ Tick
     \/ \E t \in TxnIds : BeginTxn(t)
     \/ \E t \in TxnIds, k \in Keys : ReadKey(t, k)
     \/ \E t \in TxnIds, k \in Keys : WriteIntent(t, k)
     \/ \E t \in TxnIds : Prepare(t)
     \/ \E t \in TxnIds : Commit(t)
     \/ \E t \in TxnIds : Abort(t)
-    \/ \E k \in Keys   : LockResolve(k)
 
 Spec == Init /\ [][Next]_vars
 
@@ -227,6 +237,10 @@ StateConstraint ==
     /\ opCount   <= MaxOps
 
 \* === TYPE INVARIANT ===
+\* Every state variable is exhaustively typed (gemini medium on PR
+\* #858).  Without coverage of `lockMap[k].lockTs` and `versions`,
+\* TypeOK would let a buggy action smuggle in a malformed lock-ts or
+\* version record undetected.
 TypeOK ==
     /\ tsCounter \in 0..MaxTs
     /\ txnState  \in [TxnIds -> States]
@@ -235,7 +249,10 @@ TypeOK ==
     /\ writeSet  \in [TxnIds -> SUBSET Keys]
     /\ readObs   \in [TxnIds -> [Keys -> 0..MaxTs]]
     /\ opCount   \in 0..MaxOps
-    /\ \A k \in Keys : lockMap[k].owner \in TxnIds \cup {"none"}
+    /\ \A k \in Keys :
+        /\ lockMap[k].owner  \in TxnIds \cup {"none"}
+        /\ lockMap[k].lockTs \in 0..MaxTs
+    /\ versions \in [Keys -> SUBSET [commitTs: 0..MaxTs, owner: TxnIds]]
 
 \* Set of transactions in a terminal state.
 CommittedTxns == { t \in TxnIds : txnState[t] = "Committed" }
@@ -263,20 +280,29 @@ OCC2_NoWriteWriteConflict ==
             /\ commitTs[t1] # commitTs[t2]
             /\ (commitTs[t1] <= startTs[t2] \/ commitTs[t2] <= startTs[t1])
 
-\* OCC-3 — snapshot-read stability under the lock encoding.  A
-\* transaction's recorded `readObs[t][k]` equals the version we would
-\* compute now (`LatestVisible(k, startTs[t])`) for as long as no
-\* version newer than startTs[t] could ever appear on k from a prior-
-\* started writer.  We assert the simpler equality form: the recorded
-\* observation is consistent with the current visible version *if* no
-\* prior-started writer can still write between (start_ts, commit_ts].
-\* The lock-encoding clause is satisfied because ReadKey's guard
-\* (~ConflictingLockExists) ensures the observation is taken in a
-\* lock-free state for that ts.
+\* OCC-3 — snapshot-read stability under the lock encoding.  The
+\* recorded `readObs[t][k]` equals the current `LatestVisible(k,
+\* startTs[t])` for every key the transaction has read.  The previous
+\* weaker `<=` form (gemini medium on PR #858) only asserted bounds
+\* and overlapped with OCC-5; this strict equality is the real
+\* snapshot-stability claim — the read value MUST remain consistent
+\* with the canonical latest-visible version at the txn's snapshot.
+\*
+\* Soundness in the safe config rests on the monotonic ts allocation
+\* in BeginTxn/Commit: every BeginTxn issues a fresh startTs >
+\* tsCounter, and every Commit issues a commit_ts > tsCounter > every
+\* prior startTs.  So no future Commit can produce a commit_ts <=
+\* startTs[t] for any t already past BeginTxn, hence LatestVisible(k,
+\* startTs[t]) cannot change after the read.
+\*
+\* The `readObs[t][k] # 0` precondition conflates "did not read" and
+\* "read but observed no version"; this is acceptable because the
+\* latter case is vacuously stable (no version <= startTs[t] either
+\* before or after, under the monotonic-ts allocation).
 OCC3_ReadSnapshotStability ==
     \A t \in TxnIds, k \in Keys :
         (txnState[t] \in {"Active", "Prepared", "Committed"} /\ readObs[t][k] # 0) =>
-            readObs[t][k] <= startTs[t]
+            readObs[t][k] = LatestVisible(k, startTs[t])
 
 \* OCC-4 — no stranded lock at quiescence.  Bounded safety form: in any
 \* state where every txn is in a terminal state (Committed/Aborted),

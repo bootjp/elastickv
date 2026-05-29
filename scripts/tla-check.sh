@@ -63,7 +63,18 @@ for module in "${TLA_MODULES[@]}"; do
     mc="$(mc_basename "$module")"
     safe_cfg="${mc}.cfg"
     gap_cfg="${mc}_gap.cfg"
-    gap_inv="$(gap_invariant_for "$module")"
+    # `set -e` is not in effect (the script uses `set -uo pipefail`).
+    # Without explicit checking, a non-zero exit from gap_invariant_for
+    # inside the command substitution would only terminate the
+    # subshell — the parent loop would continue with gap_inv="" and the
+    # later `grep -qF "$gap_inv"` would always match (empty pattern),
+    # silently passing the gap check.  Check explicitly (gemini HIGH
+    # on PR #858).
+    if ! gap_inv="$(gap_invariant_for "$module")"; then
+        echo "ERROR: gap_invariant_for failed for module '${module}' — see error above." >&2
+        overall_rc=1
+        continue
+    fi
 
     echo "================================================================"
     echo "  TLC: tla/${module}/${safe_cfg}  (correct design, expected PASS)"
