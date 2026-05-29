@@ -529,6 +529,110 @@ func TestHotKeysHandler_FanoutSuppressedOnPeerHeaderEvenWithNilLocal(t *testing.
 		"recursion guard must prevent any outgoing peer call")
 }
 
+// TestHotKeysHandler_MixedKLocalDisabledPeerEnabled pins the codex
+// P2 round-3 fix: when this node has KeyViz sampling on but
+// --keyvizHotKeysEnabled=false, the cluster-wide hot-keys endpoint
+// must still fan out and surface a peer's data instead of returning
+// 503 unconditionally. Per design §6, mixed-K topologies omit the
+// local non-sampling contribution and merge whatever peers report.
+// Without the fix, the response would depend on which admin node the
+// operator (or load balancer) happens to hit.
+func TestHotKeysHandler_MixedKLocalDisabledPeerEnabled(t *testing.T) {
+	t.Parallel()
+	snapshotAt := time.Date(2026, 5, 29, 14, 0, 0, 0, time.UTC)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(hotKeyResponse{
+			RouteID: 1, Series: "writes", Approximate: true,
+			SampleRate: 16, SampledN: 250, ErrorBound: 62,
+			Keys:       []hotKeyResponseEntry{{KeyB64: b64("peer-hot"), Count: 480}},
+			SnapshotAt: snapshotAt,
+		})
+	}))
+	defer peer.Close()
+
+	// Local source has KeyViz on but hot-keys deliberately off.
+	src := newStubSource()
+	src.enabled = false
+	src.capacity = 0 // sampler reports 0 capacity when hot-keys is off
+	fanout := NewKeyVizHotKeysFanout("self", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithLogger(silentLogger())
+	h := NewKeyVizHotKeysHandler(src).
+		WithLogger(silentLogger()).
+		WithFanout(fanout)
+
+	rec := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=1", nil)
+	require.Equal(t, http.StatusOK, rec.Code,
+		"mixed-K (local !enabled + peer enabled with data) must serve 200, not 503")
+	var got hotKeyResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Len(t, got.Keys, 1)
+	require.Equal(t, b64("peer-hot"), got.Keys[0].KeyB64)
+	require.Equal(t, uint64(480), got.Keys[0].Count)
+	require.Equal(t, uint64(250), got.SampledN, "peer's SampledN survives the empty-local merge")
+	require.Equal(t, uint64(62), got.ErrorBound, "peer's ErrorBound survives the empty-local merge")
+	require.NotNil(t, got.Fanout)
+	require.Equal(t, 2, got.Fanout.Responded)
+}
+
+// TestHotKeysHandler_MixedKLocalDisabledNoFanoutStill503 confirms
+// the codex P2 fix only relaxes the 503 when fan-out CAN reach
+// peers. With no fan-out configured a hot-keys-off node still
+// returns 503 hotkeys_disabled — there is no peer to consult, and
+// silently 404-ing would hide the configuration error from the
+// operator.
+func TestHotKeysHandler_MixedKLocalDisabledNoFanoutStill503(t *testing.T) {
+	t.Parallel()
+	src := newStubSource()
+	src.enabled = false
+	src.capacity = 0
+	h := newHandler(t, src) // no fan-out
+
+	rec := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=1", nil)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Contains(t, rec.Body.String(), "hotkeys_disabled")
+}
+
+// TestHotKeysHandler_MixedKPeerCallStill503 pins the anti-recursion
+// invariant under mixed-K: an inbound request carrying the
+// X-Admin-Fanout-Peer header must NOT trigger fan-out even on a
+// disabled-local node. Without this guard, a sampling peer asking
+// this node for its contribution would cause us to fan back out to
+// every other peer the operator listed — exactly the O(N²) blast
+// the recursion guard exists to prevent.
+func TestHotKeysHandler_MixedKPeerCallStill503(t *testing.T) {
+	t.Parallel()
+	var peerHits atomic.Int32
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		peerHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(hotKeyResponse{RouteID: 1, Series: "writes", SampleRate: 16})
+	}))
+	defer peer.Close()
+
+	src := newStubSource()
+	src.enabled = false
+	src.capacity = 0
+	fanout := NewKeyVizHotKeysFanout("self", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithLogger(silentLogger())
+	h := NewKeyVizHotKeysHandler(src).
+		WithLogger(silentLogger()).
+		WithFanout(fanout)
+
+	req := httptest.NewRequestWithContext(context.Background(), "GET",
+		"/admin/api/v1/keyviz/hotkeys?route_id=1", nil)
+	req.Header.Set(keyVizFanoutPeerHeader, "1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code,
+		"peer-header request on disabled-local must 503, not fan out")
+	require.Equal(t, int32(0), peerHits.Load(),
+		"recursion guard must prevent any outgoing peer call even under mixed-K")
+}
+
 // TestHotKeysFanout_PeerTopRequestsSketchCeiling pins the Codex P1
 // round-1 fix: peer URLs MUST request the SS sketch ceiling (the max
 // possible per-route capacity) instead of forwarding the operator's

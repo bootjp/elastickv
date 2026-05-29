@@ -142,25 +142,18 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET")
 		return
 	}
-	if h.source == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "keyviz_disabled",
-			"key visualizer sampler is not configured on this node")
+	params, enabled, errStatus, errCode, errMsg := h.prepareRequest(r)
+	if errCode != "" {
+		writeJSONError(w, errStatus, errCode, errMsg)
 		return
 	}
-	enabled, capacity, _, _ := h.source.HotKeysOptions()
-	if !enabled {
-		writeJSONError(w, http.StatusServiceUnavailable, "hotkeys_disabled",
-			"hot-keys drill-down is not enabled on this node (--keyvizHotKeysEnabled)")
-		return
+	// Skip the snapshot lookup entirely when local hot-keys are off.
+	// The sampler would return nil anyway, but the explicit guard
+	// makes the !enabled+fanout intent visible at the call site.
+	var snap *keyviz.KeyvizHotKeysSnapshot
+	if enabled {
+		snap = h.source.HotKeysSnapshot(params.routeID)
 	}
-
-	params, err := parseHotKeysParams(r, capacity)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid_query", err.Error())
-		return
-	}
-
-	snap := h.source.HotKeysSnapshot(params.routeID)
 	out, errStatus, errCode, errMsg := h.buildLocalResponse(r, params, snap)
 	if errCode != "" {
 		writeJSONError(w, errStatus, errCode, errMsg)
@@ -281,6 +274,51 @@ func buildHotKeysResponse(p hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot, e
 		}
 	}
 	return out
+}
+
+// prepareRequest runs the prelude shared by every ServeHTTP path:
+// validate the sampler is configured, parse query params, and decide
+// whether this node should short-circuit with 503 or continue (with
+// or without a local snapshot) into the fan-out merge.
+//
+// Returns (params, enabled, status, code, msg). When code != "" the
+// caller must writeJSONError(status, code, msg) and return without
+// further processing. When code == "" the caller proceeds with the
+// returned params and `enabled` flag (the latter gates the snapshot
+// lookup).
+//
+// The mixed-K decision (codex P2 round-3): when local hot-keys are
+// off but the operator wired a fan-out peer list AND this request
+// is operator-originated (no peer header), the local non-sampling
+// contribution is omitted and the request continues to fan out.
+// 503 hotkeys_disabled is only emitted when there is no peer set
+// to consult — single-node, OR this request is itself a peer call
+// where recursing would defeat the anti-recursion guard.
+func (h *KeyVizHotKeysHandler) prepareRequest(r *http.Request) (hotKeysParams, bool, int, string, string) {
+	if h.source == nil {
+		return hotKeysParams{}, false, http.StatusServiceUnavailable, "keyviz_disabled",
+			"key visualizer sampler is not configured on this node"
+	}
+	enabled, capacity, _, _ := h.source.HotKeysOptions()
+	canFanout := h.fanout != nil && r.Header.Get(keyVizFanoutPeerHeader) == ""
+	if !enabled && !canFanout {
+		return hotKeysParams{}, false, http.StatusServiceUnavailable, "hotkeys_disabled",
+			"hot-keys drill-down is not enabled on this node (--keyvizHotKeysEnabled)"
+	}
+	// parseHotKeysParams clamps `top` to `capacity` when capacity > 0.
+	// In the mixed-K !enabled+canFanout path the local HotKeysOptions
+	// reports capacity=0 (sampler not wired), which would leave `top`
+	// effectively unclamped. Use MaxHotKeysPerRoute as the safety bound
+	// so a runaway client cannot ask for billions of keys; the merger's
+	// final truncation still applies the operator's top.
+	if capacity <= 0 {
+		capacity = keyviz.MaxHotKeysPerRoute
+	}
+	params, err := parseHotKeysParams(r, capacity)
+	if err != nil {
+		return params, enabled, http.StatusBadRequest, "invalid_query", err.Error()
+	}
+	return params, enabled, 0, "", ""
 }
 
 // buildLocalResponse turns this node's snapshot (or its absence)
