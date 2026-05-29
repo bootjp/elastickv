@@ -548,10 +548,11 @@ func runRuntimeRegistrationWatcher(
 	bootDEKID uint32,
 	fullNodeID uint64,
 ) {
-	// Per-instance log-once gate (claude P2 round-2). Fires once per
-	// unique rotated-into DEK; a subsequent rotation to yet another DEK
-	// re-logs correctly.
-	var lastLoggedSkipDEK uint32
+	// Per-instance counter (Stage 7b' §3.2): records the most recently
+	// registered DEK so a subsequent rotation to yet another DEK
+	// re-triggers a propose. Resets to 0 on restart (per-process-load
+	// state, not durable) — §3.2.1.
+	var lastRegisteredDEK uint32
 	ticker := time.NewTicker(runtimeRegistrationPollInterval)
 	defer ticker.Stop()
 	for {
@@ -560,24 +561,34 @@ func runRuntimeRegistrationWatcher(
 			return
 		case <-ticker.C:
 		}
-		runtimeRegistrationTick(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID, &lastLoggedSkipDEK)
+		runtimeRegistrationTick(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID, &lastRegisteredDEK)
 	}
 }
 
 // runtimeRegistrationInScope evaluates the §1 scope check: returns the
-// active storage DEK and true ONLY when the 7b watcher should propose
-// (cutover branch or pre-bootstrap branch). All other cases — already
-// registered, envelope inactive, no active DEK, or deferred rotation
-// (bootDEKID != 0 && activeDEK != bootDEKID) — return (_, false). The
-// deferred-rotation branch logs once per unique rotated-into DEK,
-// gated by *lastLoggedSkip (claude P2 round-2). Extracted from
-// runtimeRegistrationTick to keep both under the cyclop budget.
+// active storage DEK and true when the watcher should propose
+// (cutover, pre-bootstrap, OR — after Stage 7b' — rotation).
+//
+// Stage 7b' §3.2 check ordering (load-bearing):
+//  1. `cache.Registered()` short-circuits — internally tests
+//     `activeStorageDEKID == registeredStorageDEKID` so it auto-
+//     scopes to the currently-active DEK; the single-DEK
+//     StateCache means a B→C→B oscillation will re-propose for B
+//     (safe via §4.1 case-2 idempotent — 7b' §3.2.2).
+//  2. Envelope-inactive / not-bootstrapped guards.
+//  3. Scope branches: pre-bootstrap (bootDEKID==0), cutover
+//     (activeDEK==bootDEKID), or rotation (activeDEK!=bootDEKID &&
+//     lastRegisteredDEK!=activeDEK). The 7b' implementation
+//     replaces 7b's log-once-skip deferral for the rotation branch
+//     with an in-scope propose now that applyRotateDEK records the
+//     per-node local_epoch (writeRotationSidecar §3.1).
 func runtimeRegistrationInScope(
 	cache *encryption.StateCache,
 	bootDEKID uint32,
 	fullNodeID uint64,
-	lastLoggedSkip *uint32,
+	lastRegisteredDEK *uint32,
 ) (activeDEK uint32, inScope bool) {
+	_ = fullNodeID // reserved for future per-node scope-check refinements
 	if cache.Registered() {
 		return 0, false
 	}
@@ -588,19 +599,26 @@ func runtimeRegistrationInScope(
 	if !ok {
 		return 0, false
 	}
-	if bootDEKID != 0 && activeDEK != bootDEKID {
-		// Deferred rotation case (7b'). Live nonce factory's pinned
-		// w.epoch does not match the new DEK's sidecar LocalEpoch (=0
-		// for a freshly-rotated DEK); registering here would brick the
-		// next restart or risk nonce reuse if the §9.1 guard were
-		// bypassed (see design §6).
-		if activeDEK != *lastLoggedSkip {
-			slog.Warn("encryption: 7b runtime watcher skipping deferred rotation case (7b')",
-				slog.Uint64("boot_dek_id", uint64(bootDEKID)),
-				slog.Uint64("active_dek_id", uint64(activeDEK)),
-				slog.Uint64("full_node_id", fullNodeID))
-			*lastLoggedSkip = activeDEK
-		}
+	// Cutover / pre-bootstrap branch: activeDEK == bootDEKID OR
+	// bootDEKID == 0. Both satisfy
+	// sidecar.Keys[activeDEK].LocalEpoch == w.epoch per 7b §2.2.
+	if bootDEKID == 0 || activeDEK == bootDEKID {
+		return activeDEK, true
+	}
+	// Rotation branch (Stage 7b'): bootDEKID != 0 && activeDEK !=
+	// bootDEKID. applyRotateDEK on the local node wrote
+	// Keys[activeDEK].LocalEpoch = w.epoch (the local node's pinned
+	// value, not the proposer's 0 — see internal/encryption/applier.go
+	// writeRotationSidecar). The watcher proposes
+	// (activeDEK, node, w.epoch); §4.1 case-2 idempotent acceptance
+	// covers oscillation re-proposes (§3.2.2).
+	//
+	// lastRegisteredDEK gates against re-proposing on every tick
+	// after we already MarkRegistered'd the current activeDEK in this
+	// process load. Reset-on-restart (§3.2.1) means a rotation that
+	// happened while the node was down still triggers a fresh propose
+	// on the first tick (lastRegisteredDEK starts at 0).
+	if activeDEK == *lastRegisteredDEK {
 		return 0, false
 	}
 	return activeDEK, true
@@ -609,9 +627,11 @@ func runtimeRegistrationInScope(
 // runtimeRegistrationTick is a single iteration of the watcher loop,
 // extracted so the loop body stays under the cyclop budget and the
 // scope-check + propose can be unit-tested independently of the ticker.
-// Returns to the caller after either a no-op skip, a deferred-rotation
-// skip (logged once per unique DEK via lastLoggedSkip), or a complete
+// Returns to the caller after either a no-op skip or a complete
 // synchronous registration attempt via runWriterRegistration.
+// Updates *lastRegisteredDEK to the active DEK if the registration
+// succeeded (cache.Registered() flipped true via runWriterRegistration's
+// MarkRegistered side effect on the success path).
 func runtimeRegistrationTick(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
@@ -619,15 +639,18 @@ func runtimeRegistrationTick(
 	w encryptionWriteWiring,
 	bootDEKID uint32,
 	fullNodeID uint64,
-	lastLoggedSkip *uint32,
+	lastRegisteredDEK *uint32,
 ) {
-	activeDEK, inScope := runtimeRegistrationInScope(w.cache, bootDEKID, fullNodeID, lastLoggedSkip)
+	activeDEK, inScope := runtimeRegistrationInScope(w.cache, bootDEKID, fullNodeID, lastRegisteredDEK)
 	if !inScope {
 		return
 	}
-	// In scope: cutover branch (activeDEK == bootDEKID) OR pre-bootstrap
-	// branch (bootDEKID == 0). Both satisfy
-	// sidecar.Keys[activeDEK].LocalEpoch == w.epoch per design §2.2.
+	// In scope: cutover (activeDEK == bootDEKID), pre-bootstrap
+	// (bootDEKID == 0), or 7b' rotation (activeDEK != bootDEKID &&
+	// lastRegisteredDEK != activeDEK). All three satisfy
+	// sidecar.Keys[activeDEK].LocalEpoch == w.epoch (cutover/pre-
+	// bootstrap per 7b §2.2; rotation per 7b' §3.1's
+	// writeRotationSidecar local_epoch wiring).
 	slog.Info("encryption: 7b runtime watcher proposing registration",
 		slog.Uint64("active_dek_id", uint64(activeDEK)),
 		slog.Uint64("full_node_id", fullNodeID),
@@ -677,4 +700,13 @@ func runtimeRegistrationTick(
 	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
 	runWriterRegistration(tickCtx, coordinate, defaultGroup.Engine, w.cache, activeDEK,
 		entry, req, barrier, verifyRegistered)
+	// 7b' §3.2: advance lastRegisteredDEK only on confirmed success so a
+	// timed-out propose doesn't gate the next tick's re-attempt.
+	// cache.Registered() (no-arg, internally tests
+	// activeStorageDEKID == registeredStorageDEKID) flips true only via
+	// runWriterRegistration's MarkRegistered success path; a partial
+	// propose, ctx timeout, or §4.1 case-3 halt-apply leaves it false.
+	if w.cache.Registered() {
+		*lastRegisteredDEK = activeDEK
+	}
 }

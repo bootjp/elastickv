@@ -733,6 +733,201 @@ func TestApplyRotation_FullyWired(t *testing.T) {
 	}
 }
 
+// TestApplyRotateDEK_LocalEpochAppliedToStorageKey pins Stage 7b'
+// §3.1: with WithLocalEpoch installed, a PurposeStorage rotation
+// writes Keys[newDEK].LocalEpoch = the installed value (the local
+// node's pinned w.epoch) rather than the proposer's `0`. This is the
+// per-node sidecar coordination that makes the §9.1 startup guard
+// see a monotone advance on next restart instead of the brick
+// scenario described in 7b' §1.
+func TestApplyRotateDEK_LocalEpochAppliedToStorageKey(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	const pinnedEpoch uint16 = 7
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+		encryption.WithLocalEpoch(pinnedEpoch),
+	)
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	if err := app.ApplyRotation(0, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                5,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte("storage-v2-wrapped"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 5, FullNodeID: 0xBEEF, LocalEpoch: 0},
+	}); err != nil {
+		t.Fatalf("ApplyRotation: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	got, ok := sc.Keys["5"]
+	if !ok {
+		t.Fatal("sidecar keys missing rotated DEK 5")
+	}
+	if got.LocalEpoch != pinnedEpoch {
+		t.Errorf("Keys[5].LocalEpoch = %d, want %d (WithLocalEpoch's pinned value)", got.LocalEpoch, pinnedEpoch)
+	}
+}
+
+// TestApplyRotateDEK_LocalEpoch_RaftRotationKeepsZero pins 7b' §3.1.1:
+// the WithLocalEpoch value is the STORAGE write-path's pinned
+// `w.epoch`. Raft DEK rotations have their own (future) per-purpose
+// epoch counter; cross-applying the storage epoch to a raft DEK's
+// LocalEpoch would corrupt the raft counter before raft envelope
+// support consumes it. PurposeRaft rotations MUST continue to write
+// LocalEpoch: 0 even with WithLocalEpoch installed.
+func TestApplyRotateDEK_LocalEpoch_RaftRotationKeepsZero(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+		encryption.WithLocalEpoch(7), // storage epoch
+	)
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	// Rotate the RAFT DEK from 2 to 6 — the storage WithLocalEpoch
+	// value must NOT bleed into the new raft key's LocalEpoch.
+	if err := app.ApplyRotation(0, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                6,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte("raft-v2-wrapped"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 6, FullNodeID: 0xBEEF, LocalEpoch: 0},
+	}); err != nil {
+		t.Fatalf("ApplyRotation: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	got, ok := sc.Keys["6"]
+	if !ok {
+		t.Fatal("sidecar keys missing rotated raft DEK 6")
+	}
+	if got.LocalEpoch != 0 {
+		t.Errorf("Keys[6].LocalEpoch = %d, want 0 (raft rotation MUST NOT inherit storage write-path epoch — 7b' §3.1.1)", got.LocalEpoch)
+	}
+}
+
+// TestApplyRotateDEK_LocalEpoch_NoOptionFallsBackToZero pins 7b'
+// §3.1.2 backward compatibility: an Applier constructed without
+// WithLocalEpoch preserves today's Keys[newDEK].LocalEpoch=0 for
+// PurposeStorage rotations so existing FSM-internal test harnesses
+// (and pre-bootstrap process loads with w.epoch=0) keep working
+// unchanged.
+func TestApplyRotateDEK_LocalEpoch_NoOptionFallsBackToZero(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	// NO WithLocalEpoch option — a.localEpoch defaults to 0.
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	if err := app.ApplyRotation(0, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                5,
+		Purpose:              fsmwire.PurposeStorage,
+		Wrapped:              []byte("storage-v2-wrapped"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: 5, FullNodeID: 0xBEEF, LocalEpoch: 0},
+	}); err != nil {
+		t.Fatalf("ApplyRotation: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	got, ok := sc.Keys["5"]
+	if !ok {
+		t.Fatal("sidecar keys missing rotated DEK 5")
+	}
+	if got.LocalEpoch != 0 {
+		t.Errorf("Keys[5].LocalEpoch = %d, want 0 (no WithLocalEpoch → falls back to pre-7b' behavior)", got.LocalEpoch)
+	}
+}
+
+// TestApplyRotateDEK_LocalEpoch_AppliedPerApply pins 7b' §5 verification
+// item 3: the static a.localEpoch field is read on EACH apply, so a
+// second rotation observes the same value (not inadvertently reset
+// or derived from mutable state). Two PurposeStorage rotations in
+// sequence — both Keys[].LocalEpoch entries must equal the pinned
+// value.
+func TestApplyRotateDEK_LocalEpoch_AppliedPerApply(t *testing.T) {
+	t.Parallel()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	const pinnedEpoch uint16 = 11
+	app, _ := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+		encryption.WithLocalEpoch(pinnedEpoch),
+	)
+	if err := app.ApplyBootstrap(0, fsmwire.BootstrapPayload{
+		StorageDEKID: 1, WrappedStorage: []byte("s1"),
+		RaftDEKID: 2, WrappedRaft: []byte("r2"),
+	}); err != nil {
+		t.Fatalf("pre-bootstrap: %v", err)
+	}
+	for _, dek := range []uint32{5, 6} {
+		if err := app.ApplyRotation(0, fsmwire.RotationPayload{
+			SubTag:               fsmwire.RotateSubRotateDEK,
+			DEKID:                dek,
+			Purpose:              fsmwire.PurposeStorage,
+			Wrapped:              []byte("storage-vN-wrapped"),
+			ProposerRegistration: fsmwire.RegistrationPayload{DEKID: dek, FullNodeID: 0xBEEF, LocalEpoch: 0},
+		}); err != nil {
+			t.Fatalf("ApplyRotation dek=%d: %v", dek, err)
+		}
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	for _, dek := range []string{"5", "6"} {
+		got, ok := sc.Keys[dek]
+		if !ok {
+			t.Errorf("sidecar keys missing rotated DEK %s", dek)
+			continue
+		}
+		if got.LocalEpoch != pinnedEpoch {
+			t.Errorf("Keys[%s].LocalEpoch = %d, want %d (per-apply read of static field)", dek, got.LocalEpoch, pinnedEpoch)
+		}
+	}
+}
+
 // TestApplyRotation_UnknownSubTag pins the fail-closed dispatch:
 // any sub_tag other than RotateSubRotateDEK halts apply with
 // ErrEncryptionApply so Stage 6B-1 cannot silently mis-apply a

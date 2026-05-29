@@ -454,15 +454,19 @@ func TestRuntimeRegistrationTick_PreBootstrapInScopeProposes(t *testing.T) {
 }
 
 // TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes
-// pins design §5 item 6b: the bootstrap→rotate→cutover sub-path. A node
-// that booted in Phase 0 (bootDEKID==0) and then observes a runtime
-// Bootstrap followed by a rotation to a different DEK *before* its
-// cutover (activeDEK = Y ≠ original-bootstrapped DEK, w.epoch == 0) MUST
-// still propose for Y — the scope check's deferred-rotation guard
-// (`bootDEKID != 0 && activeDEK != bootDEKID`) is short-circuited by
-// `bootDEKID == 0`. Without this test the guard is one `||` swap away
-// from a regression that would silently defer the watcher and leave the
-// gate fail-closed indefinitely (claude P2 round-2 on PR #853).
+// pins design §5 item 6b (PR #853): the bootstrap→rotate→cutover
+// sub-path. A node that booted in Phase 0 (bootDEKID==0) and then
+// observes a runtime Bootstrap followed by a rotation to a different
+// DEK *before* its cutover (activeDEK = Y ≠ original-bootstrapped DEK,
+// w.epoch == 0) MUST still propose for Y — the scope check's rotation
+// branch (`bootDEKID != 0 && activeDEK != bootDEKID`) is short-circuited
+// by `bootDEKID == 0`. Without this test the guard is one operand swap
+// away from a regression that would silently leave the watcher fail-
+// closed indefinitely.
+//
+// After 7b' replaces the deferred-skip branch with an in-scope propose,
+// the `bootDEKID==0` short-circuit remains the cutover/pre-bootstrap
+// route that 7b' did not touch.
 func TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes(t *testing.T) {
 	t.Parallel()
 	st := newRegistrationTestStore(t)
@@ -470,69 +474,194 @@ func TestRuntimeRegistrationTick_PreBootstrapRotateBeforeCutoverProposes(t *test
 	// activeDEK Y=99 (≠ original bootstrap DEK), w.epoch=0, bootDEK=0.
 	const rotatedDEK uint32 = 99
 	// Pre-populate the registry under DEK 99 so verifyRegistered
-	// short-circuits without needing a real coordinator/engine — the
-	// hardcoded writeRegistryRow uses testRegDEKID, so call SetRegistryRow
-	// directly with the rotated DEK id.
+	// short-circuits without needing a real coordinator/engine.
+	preSeedRegistryRow(t, st, rotatedDEK, fullNodeID, 0)
+
+	w := wiringFor(t, rotatedDEK, true, 0 /*w.epoch=0*/)
+	var lastRegisteredDEK uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID, &lastRegisteredDEK)
+	if !w.cache.Registered() {
+		t.Error("bootstrap→rotate→cutover sub-path did not MarkRegistered (Registered=false); bootDEKID==0 should keep the rotation branch off")
+	}
+	if lastRegisteredDEK != rotatedDEK {
+		t.Errorf("lastRegisteredDEK = %d, want %d (success path must advance the counter)", lastRegisteredDEK, rotatedDEK)
+	}
+}
+
+// TestRuntimeRegistrationTick_RotationInScopeVerifyShortCircuits pins
+// Stage 7b' §3.2's in-scope rotation propose path. A node that booted
+// with bootDEKID=X then observes a runtime RotateDEK to Y MUST propose
+// (Y, node, w.epoch) — applyRotateDEK wrote Keys[Y].LocalEpoch=w.epoch
+// per 7b' §3.1 so the §9.1 startup guard sees a monotone advance on
+// next restart. The test pre-populates a registry row at (Y, node,
+// w.epoch) so verifyRegistered short-circuits and the success-side
+// MarkRegistered fires; lastRegisteredDEK advances to Y.
+func TestRuntimeRegistrationTick_RotationInScopeVerifyShortCircuits(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	const bootDEK, rotatedDEK uint32 = 7, 8
+	const wepoch uint16 = 5
+
+	// Pre-populate (Y, node, 5) so verifyRegistered's exact-match
+	// check returns true and runWriterRegistration short-circuits to
+	// MarkRegistered without needing a real coordinator/engine.
+	preSeedRegistryRow(t, st, rotatedDEK, fullNodeID, wepoch)
+
+	w := wiringFor(t, rotatedDEK, true, wepoch)
+	var lastRegisteredDEK uint32
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if !w.cache.Registered() {
+		t.Error("7b' rotation in-scope path did not MarkRegistered (Registered=false); applyRotateDEK + verifyRegistered short-circuit + MarkRegistered should flip the cache")
+	}
+	if lastRegisteredDEK != rotatedDEK {
+		t.Errorf("lastRegisteredDEK = %d, want %d (success advances counter to active DEK)", lastRegisteredDEK, rotatedDEK)
+	}
+}
+
+// TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp pins
+// 7b' §3.2's check ordering step (1): once cache.Registered() is true
+// for the active DEK (a prior tick MarkRegistered'd it), a subsequent
+// tick is a no-op — does NOT re-propose, does NOT mutate
+// lastRegisteredDEK (which was already advanced on the first tick).
+func TestRuntimeRegistrationTick_RotationAlreadyRegisteredIsNoOp(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	const bootDEK, rotatedDEK uint32 = 7, 8
+	const wepoch uint16 = 5
+	preSeedRegistryRow(t, st, rotatedDEK, fullNodeID, wepoch)
+
+	w := wiringFor(t, rotatedDEK, true, wepoch)
+	var lastRegisteredDEK uint32
+	// First tick: registers.
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if !w.cache.Registered() || lastRegisteredDEK != rotatedDEK {
+		t.Fatalf("first tick failed prerequisite: Registered=%v, lastRegisteredDEK=%d (want true / %d)", w.cache.Registered(), lastRegisteredDEK, rotatedDEK)
+	}
+	// Second tick: no-op via cache.Registered() short-circuit (step 1).
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if lastRegisteredDEK != rotatedDEK {
+		t.Errorf("second tick mutated lastRegisteredDEK (=%d), want unchanged %d", lastRegisteredDEK, rotatedDEK)
+	}
+}
+
+// TestRuntimeRegistrationTick_RotationToYetAnotherDEKReProposes pins
+// 7b' §3.2's lastRegisteredDEK advance: after registering for Y, a
+// subsequent rotation to Z triggers a fresh propose (Z != Y, and
+// cache.Registered() returns false because the single-DEK
+// StateCache's activeStorageDEKID flipped to Z while
+// registeredStorageDEKID still holds Y). On success lastRegisteredDEK
+// advances to Z.
+func TestRuntimeRegistrationTick_RotationToYetAnotherDEKReProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	const bootDEK, rotateY, rotateZ uint32 = 7, 8, 9
+	const wepoch uint16 = 5
+	preSeedRegistryRow(t, st, rotateY, fullNodeID, wepoch)
+	preSeedRegistryRow(t, st, rotateZ, fullNodeID, wepoch)
+
+	w := wiringFor(t, rotateY, true, wepoch)
+	var lastRegisteredDEK uint32
+	// Register Y.
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if lastRegisteredDEK != rotateY {
+		t.Fatalf("first tick: lastRegisteredDEK=%d, want %d", lastRegisteredDEK, rotateY)
+	}
+	// Rotation Y→Z: refresh sidecar to flip activeStorageDEKID.
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = rotateZ
+	w.cache.RefreshFromSidecar(sc)
+	if w.cache.Registered() {
+		t.Fatalf("after rotation Y→Z: cache.Registered() unexpectedly true; the single-DEK cache should report mismatch")
+	}
+	// Second tick on Z: re-proposes, MarkRegistered(Z) flips cache.
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if !w.cache.Registered() {
+		t.Error("rotation-to-Z tick did not MarkRegistered")
+	}
+	if lastRegisteredDEK != rotateZ {
+		t.Errorf("lastRegisteredDEK after rotation-to-Z = %d, want %d", lastRegisteredDEK, rotateZ)
+	}
+}
+
+// TestRuntimeRegistrationTick_RotationOscillationBtoCtoBReProposes
+// pins 7b' §3.2.2 documented steady-state: B → C → B oscillation.
+// After registering B then C, the single-DEK StateCache holds C; a
+// rotation back to B leaves cache.Registered() == false (active=B,
+// registered=C mismatch). The watcher re-proposes (safe via §4.1
+// case-2 idempotent on the existing B row); MarkRegistered(B) flips
+// the cache back. Pins the documented re-propose so the
+// implementation PR's tests do not mistake the re-propose for a bug.
+func TestRuntimeRegistrationTick_RotationOscillationBtoCtoBReProposes(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	const bootDEK, dekB, dekC uint32 = 7, 8, 9
+	const wepoch uint16 = 5
+	preSeedRegistryRow(t, st, dekB, fullNodeID, wepoch)
+	preSeedRegistryRow(t, st, dekC, fullNodeID, wepoch)
+
+	w := wiringFor(t, dekB, true, wepoch)
+	var lastRegisteredDEK uint32
+	// Register B.
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if lastRegisteredDEK != dekB || !w.cache.Registered() {
+		t.Fatalf("register B failed: lastRegisteredDEK=%d Registered=%v", lastRegisteredDEK, w.cache.Registered())
+	}
+	// Rotate B → C; tick registers C.
+	scC := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	scC.Active.Storage = dekC
+	w.cache.RefreshFromSidecar(scC)
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if lastRegisteredDEK != dekC || !w.cache.Registered() {
+		t.Fatalf("register C failed: lastRegisteredDEK=%d Registered=%v", lastRegisteredDEK, w.cache.Registered())
+	}
+	// Rotate C → B: §3.2.2 — cache holds C; Registered() == false
+	// when active flips to B → watcher re-proposes; success path
+	// MarkRegisters B and flips lastRegisteredDEK back to B.
+	scB := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	scB.Active.Storage = dekB
+	w.cache.RefreshFromSidecar(scB)
+	if w.cache.Registered() {
+		t.Fatalf("after rotation C→B: cache.Registered() unexpectedly true; single-DEK cache should mismatch")
+	}
+	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st}, w, bootDEK, fullNodeID, &lastRegisteredDEK)
+	if !w.cache.Registered() {
+		t.Error("rotation C→B re-propose did not MarkRegistered (Registered=false)")
+	}
+	if lastRegisteredDEK != dekB {
+		t.Errorf("lastRegisteredDEK after C→B re-propose = %d, want %d", lastRegisteredDEK, dekB)
+	}
+}
+
+// preSeedRegistryRow seeds a writer-registry row at
+// (dekID, node, epoch) so verifyRegistered short-circuits and
+// runWriterRegistration's MarkRegistered side effect fires without a
+// real coordinator/engine. The hardcoded writeRegistryRow helper uses
+// testRegDEKID; this variant takes the DEK id so 7b' rotation tests
+// can target the rotated DEK.
+func preSeedRegistryRow(t *testing.T, st store.MVCCStore, dekID uint32, fullNodeID uint64, epoch uint16) {
+	t.Helper()
 	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
 		t.Fatalf("WriterRegistryFor: %v", err)
 	}
 	val := encryption.EncodeRegistryValue(encryption.RegistryValue{
-		FullNodeID: fullNodeID, FirstSeenLocalEpoch: 0, LastSeenLocalEpoch: 0,
+		FullNodeID: fullNodeID, FirstSeenLocalEpoch: epoch, LastSeenLocalEpoch: epoch,
 	})
-	if err := reg.SetRegistryRow(encryption.RegistryKey(rotatedDEK, encryption.NodeID16(fullNodeID)), val); err != nil {
-		t.Fatalf("SetRegistryRow: %v", err)
-	}
-
-	w := wiringFor(t, rotatedDEK, true, 0 /*w.epoch=0*/)
-	var lastLogged uint32
-	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
-		&kv.ShardGroup{Store: st}, w, 0 /*bootDEK=0*/, fullNodeID, &lastLogged)
-	if !w.cache.Registered() {
-		t.Error("bootstrap→rotate→cutover sub-path did not MarkRegistered (Registered=false); bootDEKID==0 should keep the deferred-rotation guard off")
-	}
-	if lastLogged != 0 {
-		t.Errorf("lastLogged = %d, want 0 (no deferred-rotation WARN should fire when bootDEKID==0)", lastLogged)
-	}
-}
-
-// TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips pins the
-// 7b' deferral: bootDEK != 0 AND activeDEK != bootDEK → log once per
-// unique rotated-into DEK, do NOT propose. A second tick at the same
-// activeDEK does NOT re-log. A subsequent rotation to yet another DEK
-// re-logs correctly.
-func TestRuntimeRegistrationTick_DeferredRotationLogsOnceAndSkips(t *testing.T) {
-	t.Parallel()
-	st := newRegistrationTestStore(t)
-	fullNodeID := etcdraftengine.DeriveNodeID("n1")
-	// boot DEK 7, runtime rotation to DEK 8.
-	w := wiringFor(t, 8 /*activeDEK changed*/, true, 5)
-	var lastLogged uint32
-
-	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
-		&kv.ShardGroup{Store: st}, w, 7 /*bootDEK*/, fullNodeID, &lastLogged)
-	if w.cache.Registered() {
-		t.Error("deferred rotation branch unexpectedly MarkRegistered")
-	}
-	if lastLogged != 8 {
-		t.Errorf("lastLogged = %d, want 8 (first skip should record the DEK)", lastLogged)
-	}
-
-	// Second tick at same activeDEK: still no propose, lastLogged unchanged.
-	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
-		&kv.ShardGroup{Store: st}, w, 7, fullNodeID, &lastLogged)
-	if lastLogged != 8 {
-		t.Errorf("after repeat tick lastLogged = %d, want 8 (no re-log)", lastLogged)
-	}
-
-	// Rotate to DEK 9: re-log, lastLogged updates.
-	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
-	sc.Active.Storage = 9
-	w.cache.RefreshFromSidecar(sc)
-	runtimeRegistrationTick(context.Background(), &kv.ShardedCoordinator{},
-		&kv.ShardGroup{Store: st}, w, 7, fullNodeID, &lastLogged)
-	if lastLogged != 9 {
-		t.Errorf("after rotation-to-9 lastLogged = %d, want 9 (re-log on new DEK)", lastLogged)
+	if err := reg.SetRegistryRow(encryption.RegistryKey(dekID, encryption.NodeID16(fullNodeID)), val); err != nil {
+		t.Fatalf("SetRegistryRow(dek=%d, epoch=%d): %v", dekID, epoch, err)
 	}
 }
 

@@ -92,6 +92,26 @@ type Applier struct {
 	// constructor installs a private instance so single-applier
 	// callers and tests keep working unchanged.
 	stateCache *StateCache
+	// localEpoch is the §4.1 storage write-path local_epoch this
+	// process load pinned its nonce factory to at startup (the value
+	// `encryptionWriteWiring.epoch` holds). It is read ONLY by the
+	// Stage 7b' rotation-case applyRotateDEK path when writing
+	// `Keys[newDEK].LocalEpoch` for storage rotations — recording the
+	// LOCAL node's highest-emitted local_epoch under the new DEK so the
+	// §9.1 startup guard on next restart sees a monotone advance rather
+	// than the cluster-wide brick scenario described in 7b' §1. Raft
+	// rotations (PurposeRaft) continue to write `LocalEpoch: 0` (until
+	// raft envelope support lands with its own per-purpose epoch
+	// plumbing) per 7b' §3.1.1.
+	//
+	// Zero (the default when WithLocalEpoch is omitted) is correct for:
+	// (a) the pre-bootstrap process load — no writes have been emitted
+	//     under any DEK yet, so the sidecar's `0` accurately records this
+	//     node's highest-emitted local_epoch (7b' §3.1.2);
+	// (b) FSM-internal test harnesses that construct an Applier without
+	//     write-path state — they have no nonce factory and accept the
+	//     zero value as the "preserve today's behavior" fallback.
+	localEpoch uint16
 }
 
 // StateCache mirrors the sidecar fields the storage hot path needs
@@ -314,6 +334,21 @@ func WithNowFunc(now func() time.Time) ApplierOption {
 // and pre-multi-shard callers rely on.
 func WithStateCache(c *StateCache) ApplierOption {
 	return func(a *Applier) { a.stateCache = c }
+}
+
+// WithLocalEpoch installs the §4.1 storage write-path `local_epoch`
+// this process load pinned its nonce factory to. Threaded through
+// from `encryptionWriteWiring.epoch` so Stage 7b' rotation applies
+// can record THIS node's highest-emitted local_epoch under the new
+// DEK (see the `localEpoch` field doc on Applier and 7b' §3.1).
+//
+// A static `uint16` rather than a `func() uint16` provider is
+// deliberate (7b' §3.1): `BumpLocalEpoch` only runs at process start,
+// so there is no runtime epoch-bump path that would require late
+// binding. The option is omitted by FSM-internal test harnesses; the
+// zero value preserves today's `LocalEpoch: 0` behaviour for them.
+func WithLocalEpoch(epoch uint16) ApplierOption {
+	return func(a *Applier) { a.localEpoch = epoch }
 }
 
 // NewApplier wires an Applier against the supplied registry store
@@ -1029,18 +1064,29 @@ func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload
 	if err != nil {
 		return err
 	}
+	// Stage 7b' §3.1: write THIS node's pinned storage local_epoch
+	// into Keys[newDEK].LocalEpoch for storage rotations so the §9.1
+	// startup guard on next restart sees a monotone advance from
+	// prior.w.epoch → prior.w.epoch+1. Raft rotations continue to
+	// write `LocalEpoch: 0` exactly as before (raft envelope support
+	// isn't implemented yet; cross-applying the storage nonce
+	// factory's epoch to a raft DEK would corrupt the raft counter
+	// before raft envelope ships — 7b' §3.1.1).
+	var keyLocalEpoch uint16
 	switch p.Purpose {
 	case fsmwire.PurposeStorage:
 		sc.Active.Storage = p.DEKID
+		keyLocalEpoch = a.localEpoch
 	case fsmwire.PurposeRaft:
 		sc.Active.Raft = p.DEKID
+		keyLocalEpoch = 0
 	}
 	advanceRaftAppliedIndex(sc, raftIdx)
 	sc.Keys[strconv.FormatUint(uint64(p.DEKID), 10)] = SidecarKey{
 		Purpose:    purpose,
 		Wrapped:    append([]byte(nil), p.Wrapped...),
 		Created:    a.now().UTC().Format(time.RFC3339),
-		LocalEpoch: 0,
+		LocalEpoch: keyLocalEpoch,
 	}
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for rotation")
