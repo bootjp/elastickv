@@ -530,11 +530,11 @@ func TestHotKeysHandler_FanoutSuppressedOnPeerHeaderEvenWithNilLocal(t *testing.
 }
 
 // TestHotKeysFanout_PeerTopRequestsSketchCeiling pins the Codex P1
-// fix: peer URLs MUST request the SS sketch ceiling (the max possible
-// per-route capacity) instead of forwarding the operator's `top`.
-// Otherwise each peer truncates to its own top-K before merge and a
-// key whose true cluster rank is high but per-peer rank falls below
-// the cut is silently dropped.
+// round-1 fix: peer URLs MUST request the SS sketch ceiling (the max
+// possible per-route capacity) instead of forwarding the operator's
+// `top`. Otherwise each peer truncates to its own top-K before merge
+// and a key whose true cluster rank is high but per-peer rank falls
+// below the cut is silently dropped.
 func TestHotKeysFanout_PeerTopRequestsSketchCeiling(t *testing.T) {
 	t.Parallel()
 	url, err := buildKeyVizHotKeysPeerURL("10.0.0.2:8080",
@@ -542,6 +542,66 @@ func TestHotKeysFanout_PeerTopRequestsSketchCeiling(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, url, "top="+itoa(keyviz.MaxHotKeysPerRoute),
 		"peer URL must request the sketch ceiling, not the operator's top")
+}
+
+// TestHotKeysHandler_LocalTopDeferredUntilAfterFanoutMerge pins the
+// Codex P1 round-2 fix: even after peer URLs request the sketch
+// ceiling, the LOCAL node's collectEntries must ALSO defer its `top`
+// truncation until after the merge. Otherwise a key whose true
+// cluster rank is high but whose per-NODE local rank falls below
+// `top` is silently dropped before peers' counts get a chance to
+// promote it to cluster top-K.
+//
+// Concrete scenario (top=1):
+//   - local snapshot:  x=100, z=99
+//   - peer snapshot:   z=99 only
+//
+// True cluster top is z = 99 (local) + 99 (peer) = 198, not
+// x = 100. Without the round-2 fix the merger would see only x
+// locally (z pre-truncated) and report x. With the fix the local
+// contribution carries BOTH candidates so the merge sums z
+// correctly.
+func TestHotKeysHandler_LocalTopDeferredUntilAfterFanoutMerge(t *testing.T) {
+	t.Parallel()
+	snapshotAt := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(hotKeyResponse{
+			RouteID: 1, Series: "writes", Approximate: true,
+			SampleRate: 16, SampledN: 100,
+			Keys:       []hotKeyResponseEntry{{KeyB64: b64("z"), Count: 99}},
+			SnapshotAt: snapshotAt,
+		})
+	}))
+	defer peer.Close()
+
+	src := newStubSource()
+	src.snapshots[1] = &keyviz.KeyvizHotKeysSnapshot{
+		RouteID: 1, SampledN: 100, SampleRate: 16, Capacity: 64,
+		SnapshotAt: snapshotAt,
+		Entries: []keyviz.KeyvizHotKeyEntry{
+			{Key: []byte("x"), Count: 100}, // scaled 1600
+			{Key: []byte("z"), Count: 99},  // scaled 1584
+		},
+	}
+	fanout := NewKeyVizHotKeysFanout("self", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithLogger(silentLogger())
+	h := NewKeyVizHotKeysHandler(src).
+		WithLogger(silentLogger()).
+		WithFanout(fanout)
+
+	// top=1. Cluster sums: z = 1584 + 99 = 1683, x = 1600.
+	// Without the round-2 fix the local would discard z before
+	// the merger ever sees the peer's contribution and report x.
+	rec := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=1&top=1", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got hotKeyResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Len(t, got.Keys, 1, "operator asked for top=1; merged response must be size 1")
+	require.Equal(t, b64("z"), got.Keys[0].KeyB64,
+		"merged top-1 must be z (cluster sum 1683) not x (cluster sum 1600); local pre-truncation must NOT discard z before the merge sees the peer's contribution")
+	require.Equal(t, uint64(1683), got.Keys[0].Count)
 }
 
 // itoa is a tiny strconv.Itoa wrapper that keeps the test imports

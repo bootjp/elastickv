@@ -318,7 +318,21 @@ func (h *KeyVizHotKeysHandler) buildLocalResponse(r *http.Request, params hotKey
 		return hotKeyResponse{}, http.StatusBadRequest, errCode,
 			"requested time window does not overlap the current snapshot; v1 returns only the current keyvizStep window"
 	}
-	entries, errCode, errMsg := h.collectEntries(params, snap)
+	// When fan-out will run after this call, defer the operator's
+	// `top` truncation to the merger. Symmetric with the peer-URL
+	// fix: a peer returns every locally tracked candidate so the
+	// merger can compute the correct sum-then-top-K; the local
+	// contribution must do the same. Otherwise, a key whose true
+	// cluster rank is high but whose per-node rank falls below `top`
+	// is dropped by this side's pre-truncation before the merge ever
+	// sees it. Example (top=1): local x=100,z=99; peer z=99. With
+	// local pre-truncation, merge sees only x locally → reports
+	// x=100 even though z's cluster total is 198 (Codex P1 round-2).
+	localParams := params
+	if h.fanout != nil && r.Header.Get(keyVizFanoutPeerHeader) == "" {
+		localParams.top = keyviz.MaxHotKeysPerRoute
+	}
+	entries, errCode, errMsg := h.collectEntries(localParams, snap)
 	if errCode != "" {
 		return hotKeyResponse{}, http.StatusBadRequest, errCode, errMsg
 	}
