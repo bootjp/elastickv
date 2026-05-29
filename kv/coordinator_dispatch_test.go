@@ -179,3 +179,68 @@ func TestCoordinateDispatchRaw_CallsTransactionManager(t *testing.T) {
 	require.NotNil(t, resp)
 	require.Equal(t, 1, tx.commits)
 }
+
+// TestToRawRequestLeavesTsForLeaderStamping is the regression for the
+// codex P2 review on PR #867.
+//
+// buildRedirectRequests is the follower's forward path: when a client
+// hits a non-leader, the follower constructs forwarded Requests and
+// ships them to the leader's Internal.Forward, which is responsible
+// for stamping ts (adapter.Internal.stampRawTimestamps). Issuing a ts
+// on the follower violates the HLC-leader-only invariant (CLAUDE.md
+// HLC contract) and — with the HLC-4 (iii) fence now wired up — can
+// spuriously fail follower-routed raw writes when the follower's
+// physicalCeiling is stale relative to the leader.
+//
+// Contract: toRawRequest must leave Ts == 0 so the leader stamps it.
+func TestToRawRequestLeavesTsForLeaderStamping(t *testing.T) {
+	t.Parallel()
+
+	clock := NewHLC()
+	// Simulate a stale follower: ceiling sits in the past so any
+	// NextFenced() call on this clock would return ErrCeilingExpired.
+	clock.SetPhysicalCeiling(1)
+
+	c := &Coordinate{clock: clock}
+
+	cases := []struct {
+		name string
+		req  *Elem[OP]
+	}{
+		{"put", &Elem[OP]{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+		{"del", &Elem[OP]{Op: Del, Key: []byte("k")}},
+		{"del-prefix", &Elem[OP]{Op: DelPrefix, Key: []byte("p")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := c.toRawRequest(tc.req)
+			require.NotNil(t, r)
+			require.Equal(t, uint64(0), r.Ts,
+				"forwarded raw requests must arrive with Ts==0 so the leader's stampRawTimestamps assigns the canonical ts (HLC leader-only invariant + HLC-4 (iii) fence)")
+		})
+	}
+}
+
+// TestBuildRedirectRequestsSurvivesStaleFollowerCeiling exercises the
+// follower's redirect path end-to-end with an expired ceiling: it
+// confirms the follower hands off a Ts==0 request to the leader
+// instead of failing locally on ErrCeilingExpired.
+func TestBuildRedirectRequestsSurvivesStaleFollowerCeiling(t *testing.T) {
+	t.Parallel()
+
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(1) // wall_now >> 1, so NextFenced would fail
+
+	c := &Coordinate{clock: clock}
+
+	got, err := c.buildRedirectRequests(&OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("k"), Value: []byte("v")},
+		},
+	})
+	require.NoError(t, err,
+		"buildRedirectRequests must succeed even when the follower's HLC ceiling is stale")
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(0), got[0].Ts,
+		"redirect-path raw requests must carry Ts==0 (leader stamps)")
+}

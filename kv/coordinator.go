@@ -894,17 +894,32 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 	}, nil
 }
 
-func (c *Coordinate) toRawRequest(req *Elem[OP]) (*pb.Request, error) {
-	ts, err := c.clock.NextFenced()
-	if err != nil {
-		return nil, errors.Wrap(err, "allocate raw request ts")
-	}
+// toRawRequest builds a forwarded raw Request for the redirect path
+// (follower → leader Internal.Forward). The leader stamps Ts on
+// arrival via adapter.Internal.stampRawTimestamps, so the follower
+// MUST leave Ts == 0 here.
+//
+// Two reasons this is the right contract:
+//  1. HLC invariant — persistence timestamps are issued exclusively
+//     by the Raft leader (see CLAUDE.md "Timestamp Oracle"). Calling
+//     NextFenced on the follower's clock both violates that invariant
+//     and produces a ts the leader's HLC has not observed.
+//  2. HLC-4 (iii) fence — a follower whose physicalCeiling is stale
+//     (lease entry not yet applied / wall has caught up locally)
+//     would return ErrCeilingExpired here even when the actual
+//     leader has already renewed its ceiling, spuriously failing
+//     follower-routed raw writes during follower lag or
+//     re-election. Regression: TestToRawRequestLeavesTsForLeaderStamping.
+//
+// The returned Request is structurally identical to the pre-stamping
+// shape the leader's stampRawTimestamps already handles for Ts == 0
+// (see adapter/internal.go).
+func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 	switch req.Op {
 	case Put:
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    ts,
 			Mutations: []*pb.Mutation{
 				{
 					Op:    pb.Op_PUT,
@@ -912,33 +927,31 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) (*pb.Request, error) {
 					Value: req.Value,
 				},
 			},
-		}, nil
+		}
 
 	case Del:
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    ts,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL,
 					Key: req.Key,
 				},
 			},
-		}, nil
+		}
 
 	case DelPrefix:
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    ts,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL_PREFIX,
 					Key: req.Key,
 				},
 			},
-		}, nil
+		}
 	}
 
 	panic("unreachable")
@@ -994,11 +1007,7 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	if !reqs.IsTxn {
 		requests := make([]*pb.Request, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {
-			r, err := c.toRawRequest(req)
-			if err != nil {
-				return nil, err
-			}
-			requests = append(requests, r)
+			requests = append(requests, c.toRawRequest(req))
 		}
 		return requests, nil
 	}
