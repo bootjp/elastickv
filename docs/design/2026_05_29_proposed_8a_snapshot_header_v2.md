@@ -68,9 +68,13 @@ format spec; this slice is the implementation cut.
 
 ### Out of scope
 
-- **WAL coverage** (§4.5) — encrypting the Raft log on disk. Lives in
-  a sibling Stage 8b design; not blocked on 8a but conceptually
-  independent.
+- **WAL / Raft log encryption on disk.** A sibling Stage 8b design
+  will own this. (The parent doc's Stage 8 table row labels both
+  slices as "Snapshot header v2 + WAL coverage (§4.4, §4.5)", but
+  §4.5 in the parent is actually "Distribution catalog and HLC
+  ceiling entries"; WAL-file encryption is a separate concern not
+  yet detailed in any §4.x — 8b will introduce a §4.x section if
+  needed.) Not blocked on 8a; conceptually independent.
 - **Snapshot stream encryption**. Per parent §4.4, the FSM snapshot
   stream IS ciphertext by construction once §4.1 envelopes are in
   use; the header is the only thing that needs wrapping.
@@ -123,21 +127,60 @@ v2 (Phase-2-aware):
   Phase 0 or Phase 1 (no `enable-raft-envelope` applied yet on the
   cluster as observed by the local node at snapshot time).
 
+#### 3.1.1 Forward-compat boundary: what may extend v2 vs. require a new magic
+
+The `len`-skip hatch lets a future writer append optional fields to
+the v2 payload while preserving backward compat with old v2 readers
+(which size their payload read by `len` and ignore trailing bytes
+they do not understand). This is **only** safe when the appended
+fields are advisory — i.e., an old v2 reader that ignores them
+still produces correct restore behavior.
+
+If a future field affects FSM correctness (e.g., a flag that
+changes how the restore initializes the applier, or a new
+mandatory routing index), an old v2 reader that ignores it would
+silently misroute / mis-initialize. Such fields require a new
+magic (`EKVTHLC3`), not a v2 payload extension. The discriminator
+in `ReadSnapshotHeader` is the gatekeeper for the "I do not
+understand this version" fail-closed branch (step 4 above).
+
 ### 3.2 Read path
 
 `ReadSnapshotHeader` runs **once** at the top of `kv/fsm.go::Restore`
-before the inner-store payload is consumed:
+before the inner-store payload is consumed. The reader takes
+ownership of a `bufio.Reader` wrapping the input stream and MUST
+pass the **same `bufio.Reader`** to the inner-store restore on the
+headerless-legacy branch — using the underlying `io.Reader` directly
+would lose the peeked bytes.
 
-1. Peek the 8 leading bytes from the snapshot stream (`bufio.Reader`
-   or equivalent — the bytes MUST be replayable into the
-   inner-store reader if the discriminator falls through to the
-   headerless branch).
-2. `bytes.Equal(peeked, hlcSnapshotMagicV2[:])`:
+0. Peek up to 8 leading bytes via `bufio.Reader.Peek(8)`. **If the
+   stream contains fewer than 8 bytes** (`Peek` returns
+   `io.EOF` / `io.ErrUnexpectedEOF` with a short slice), fall
+   through directly to step 5 (headerless legacy) with the partial
+   bytes left in the buffer — this preserves
+   `TestFSMSnapshotRestoreSmallLegacy`'s contract that pre-HLC
+   short snapshots restore unchanged.
+1. With exactly 8 bytes peeked, discriminate via `bytes.Equal` on
+   the 8 leading bytes:
+2. `bytes.Equal(peeked, hlcSnapshotMagicV2[:])` (the v2 sentinel):
    - Consume the 8 magic bytes.
    - Read 2 bytes → `len` (big-endian uint16).
-   - Read `len` payload bytes.
+   - **Validate `len`**: require `16 <= len <= maxSnapshotHeaderPayload`
+     (suggested `maxSnapshotHeaderPayload = 1024`).
+     - `len < 16` (payload too short to hold ceiling+cutover) →
+       return `(0, 0, ErrSnapshotHeaderInvalidLength)` rather than
+       a downstream `io.EOF` / panic on slice indexing.
+     - `len > maxSnapshotHeaderPayload` → return
+       `(0, 0, ErrSnapshotHeaderInvalidLength)` to prevent a
+       malformed or malicious snapshot from triggering a 64 KiB
+       allocation per restore (DoS hardening — coderabbit major on
+       PR #877). The constant is intentionally small; raise it only
+       when a v2 extension genuinely needs the headroom.
+   - Read `len` payload bytes (now bounded by the validated `len`).
    - Parse `ceiling` from the first 8 of payload, `cutover` from
-     the next 8, ignore any trailing bytes (forward-compat).
+     the next 8, ignore any trailing bytes (forward-compat;
+     see §3.1.1 below for the boundary of what new fields may be
+     added under v2 vs. requiring a new magic).
    - Return `(ceiling, cutover, nil)`.
 3. `bytes.Equal(peeked, hlcSnapshotMagic[:])` (the v1 sentinel):
    - Consume the 8 magic bytes.
@@ -148,11 +191,12 @@ before the inner-store payload is consumed:
    - Return `(0, 0, ErrSnapshotHeaderUnknownMagic)` — the
      restore is fail-closed; the operator must upgrade to a binary
      that recognises this version.
-5. Else (no `EKVTHLC` prefix at all):
+5. Else (no `EKVTHLC` prefix at all, OR fewer than 8 bytes
+   available per step 0):
    - Headerless legacy snapshot. Return `(0, 0, nil)` AND **leave
-     the peeked 8 bytes in the underlying stream** (do NOT consume
-     them); the inner-store payload reader sees the stream from
-     byte 0.
+     the peeked bytes in the underlying `bufio.Reader`** (do NOT
+     consume them); the inner-store payload reader — passed the
+     same `bufio.Reader` — sees the stream from byte 0.
 
 The headerless-legacy fallback is the existing behavior preserved
 by today's `TestFSMSnapshotRestoreOldFormat` and
@@ -170,10 +214,32 @@ on the writer side:
 - If `raft_envelope_cutover_index != 0`: write v2 layout. `cutover`
   comes from the sidecar value; `ceiling` from the same HLC source
   as today.
-- Once v2 has been written, subsequent snapshots from this load
-  stay on v2 unless the local sidecar resets `cutover` to 0 (which
-  rotation does NOT do; this branch is unreachable in current
-  semantics but the rule is documented for the future).
+
+**No-downgrade enforcement (load-bearing).** Once a writer has
+observed a non-zero `raft_envelope_cutover_index` even once during
+its process lifetime, it MUST continue writing v2 even if a
+subsequent sidecar read returns `cutover = 0`. Without this latch,
+a future code path that resets the sidecar field (e.g. a
+hypothetical reseed or factory-reset operation) would silently
+produce a v1 snapshot from a Phase-2 node; a follower restoring
+that snapshot would configure `cutover = 0` and then fail to
+unwrap AEAD-wrapped log entries — silent data corruption.
+
+The latch is **per process load**: in-memory state on the writer
+remembers "I have seen non-zero cutover" and forces v2 from then
+on. Process restart re-reads the sidecar; if the sidecar still has
+`cutover != 0`, the latch reactivates immediately on the first
+snapshot. A node whose sidecar legitimately has `cutover = 0` (a
+pre-Phase-2 node that never observed the cutover) never engages the
+latch.
+
+Additionally, the implementation SHOULD log.Error (not Fatal — the
+write path is in a snapshot goroutine; killing the process on a
+sidecar inconsistency would surface as snapshot failure rather
+than a useful diagnostic) when it observes a non-zero → zero
+sidecar transition while the latch is engaged. This makes the
+invariant violation visible without taking the node down
+mid-snapshot.
 
 ### 3.4 Restore-side integration
 
@@ -182,13 +248,22 @@ on the writer side:
 - `ceiling` is plumbed exactly as today.
 - `cutover` is plumbed to the applier / engine pre-apply hook so
   subsequent Raft entries route through the correct wrap/unwrap
-  path:
-  - Entries with `raftIdx < cutover` are pre-Phase-2 plaintext;
-    pass through.
-  - Entries with `raftIdx >= cutover` are AEAD-wrapped; unwrap.
-- When `cutover == 0` (v1 snapshot or v2 snapshot taken in
-  Phase 0/1), no envelope-routing is needed; behavior matches the
-  pre-8a posture exactly.
+  path. The routing logic is **two-step**, with the `cutover == 0`
+  precondition load-bearing (gemini medium on PR #877):
+
+  1. If `cutover == 0` (v1 snapshot OR v2 snapshot taken in
+     Phase 0/1, i.e. before `enable-raft-envelope` applied):
+     ALL entries are pre-Phase-2 plaintext, no routing
+     consultation — behavior matches the pre-8a posture exactly.
+     A naive `raftIdx >= cutover` test would always be true at
+     `cutover == 0` and incorrectly attempt to unwrap every
+     entry as AEAD; the `cutover == 0` precondition guard MUST
+     come first.
+  2. If `cutover != 0`:
+     - Entries with `raftIdx < cutover` are pre-Phase-2
+       plaintext; pass through.
+     - Entries with `raftIdx >= cutover` are AEAD-wrapped;
+       unwrap.
 
 The exact applier-side plumbing depends on Stage 6E's apply-hook
 shape; this slice defines the snapshot-to-applier handoff but
@@ -229,15 +304,33 @@ explicitly calls out (§4.4 line 972–974).
      payload from byte 0 (re-pin existing
      `TestFSMSnapshotRestoreOldFormat` /
      `TestFSMSnapshotRestoreSmallLegacy`).
-   - `TestReadSnapshotHeader_V2WithLenMismatchFails` — write a v2
-     header with `len = 0x08` (too short for `ceiling+cutover`);
-     expect a typed error, NOT an EOF / "short payload" panic.
+   - `TestReadSnapshotHeader_V2WithLenTooShortFails` — write a v2
+     header with `len = 0x08` (below the 16-byte minimum needed
+     for `ceiling+cutover`); expect `ErrSnapshotHeaderInvalidLength`,
+     NOT an EOF / "short payload" panic.
+   - `TestReadSnapshotHeader_V2WithLenTooLargeFails` — write a v2
+     header with `len = 0xFFFF`; expect
+     `ErrSnapshotHeaderInvalidLength` (DoS hardening — pins the
+     upper bound from §3.2 step 2).
+   - `TestReadSnapshotHeader_ShortStreamFallsBackToLegacy` —
+     stream contains 0, 4, and 7 bytes (sub-cases); each must
+     return `(0, 0, nil)` and leave the available bytes in the
+     `bufio.Reader` for the inner-store path, exercising step 0
+     of the read algorithm (gemini medium + coderabbit major on
+     PR #877).
    - `TestWriteSnapshotHeader_PreCutoverWritesV1` — sidecar
      `raft_envelope_cutover_index == 0` → output is byte-for-byte
      identical to today's v1.
    - `TestWriteSnapshotHeader_PostCutoverWritesV2` — sidecar
      `raft_envelope_cutover_index != 0` → output is the v2 layout
      with the cutover correctly carried.
+   - `TestWriteSnapshotHeader_NoDowngradeAfterCutoverSeen` — first
+     snapshot is taken with sidecar `cutover = 5` → v2 output;
+     then the sidecar field is artificially reset to 0 (simulating
+     a hypothetical future reseed path) and a second snapshot is
+     taken on the same writer → MUST still be v2 (the no-downgrade
+     latch from §3.3). Pins the load-bearing rule against silent
+     data corruption.
 2. `kv/fsm.go` restore path integration:
    - `TestFSMSnapshotRestoreV2_PlumbsCutover` — drive a v2
      restore end-to-end; verify the applier's restore context
