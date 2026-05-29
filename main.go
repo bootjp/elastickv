@@ -814,8 +814,15 @@ func buildShardGroups(
 		// Stage 6D-6c-1: WithStateCache threads the process-shared
 		// StateCache so an encryption apply landing on this shard's
 		// FSM updates the atomics every shard's storage layer reads.
+		// Stage 7b' §3.1: WithLocalEpoch threads this process load's
+		// pinned storage write-path w.epoch into the Applier so
+		// applyRotateDEK (PurposeStorage) can write each node's own
+		// highest-emitted local_epoch into Keys[newDEK].LocalEpoch
+		// rather than the proposer's 0. Raft rotations (PurposeRaft)
+		// keep LocalEpoch: 0 — see writeRotationSidecar's switch.
 		applierOpts := append(applierOptionsFor(kekWrapper, keystore, sidecarPath),
-			encryption.WithStateCache(encWiring.cache))
+			encryption.WithStateCache(encWiring.cache),
+			encryption.WithLocalEpoch(encWiring.epoch))
 		applier, err := encryption.NewApplier(reg, applierOpts...)
 		if err != nil {
 			for _, rt := range runtimes {
