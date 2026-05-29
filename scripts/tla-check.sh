@@ -66,7 +66,14 @@ run_tlc() {
     local module="$1"
     local cfg="$2"
     local mc
-    mc="$(mc_basename "$module")"
+    # Same subshell-exit propagation concern as the main loop —
+    # without `set -e` an `exit 64` from mc_basename would leave
+    # mc="" and the subsequent java invocation would try to load
+    # `.tla`, which TLC parses as a malformed path.  Fail explicitly.
+    if ! mc="$(mc_basename "$module")"; then
+        echo "ERROR: mc_basename failed for module '${module}'." >&2
+        return 64
+    fi
     ( cd "${REPO_ROOT}/tla/${module}" && \
       java -XX:+UseParallelGC \
         -cp "${TLA_JAR}" -DTLA-Library=../lib \
@@ -76,16 +83,21 @@ run_tlc() {
 overall_rc=0
 
 for module in "${TLA_MODULES[@]}"; do
-    mc="$(mc_basename "$module")"
+    # `set -e` is not in effect (the script uses `set -uo pipefail`),
+    # so `exit 64` from mc_basename / gap_invariant_for in a command
+    # substitution only terminates the subshell — the parent loop
+    # would otherwise continue with an empty `mc` / `gap_inv` and the
+    # downstream `grep -qF` would match the empty pattern, silently
+    # passing the gap check.  Check both explicitly (gemini HIGH on
+    # PR #858 for gap_invariant_for; gemini MEDIUM on PR #862 for
+    # mc_basename).
+    if ! mc="$(mc_basename "$module")"; then
+        echo "ERROR: mc_basename failed for module '${module}' — see error above." >&2
+        overall_rc=1
+        continue
+    fi
     safe_cfg="${mc}.cfg"
     gap_cfg="${mc}_gap.cfg"
-    # `set -e` is not in effect (the script uses `set -uo pipefail`).
-    # Without explicit checking, a non-zero exit from gap_invariant_for
-    # inside the command substitution would only terminate the
-    # subshell — the parent loop would continue with gap_inv="" and the
-    # later `grep -qF "$gap_inv"` would always match (empty pattern),
-    # silently passing the gap check.  Check explicitly (gemini HIGH
-    # on PR #858).
     if ! gap_inv="$(gap_invariant_for "$module")"; then
         echo "ERROR: gap_invariant_for failed for module '${module}' — see error above." >&2
         overall_rc=1
