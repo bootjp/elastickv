@@ -205,3 +205,49 @@ func TestHLCLeaseRoundTrip(t *testing.T) {
 	require.Equal(t, ceilingMs, h.PhysicalCeiling(),
 		"FSM apply must advance the HLC ceiling to the encoded value")
 }
+
+// TestHLCNextFencedFailsClosedOnExpiredCeiling verifies HLC-4 precondition
+// (iii): when wall_now >= physicalCeiling, NextFenced returns
+// ErrCeilingExpired instead of issuing a persistence-grade ts that could
+// collide with a subsequent leader's window after renewal catches up.
+func TestHLCNextFencedFailsClosedOnExpiredCeiling(t *testing.T) {
+	t.Parallel()
+
+	h := NewHLC()
+	// Set a ceiling that is already in the past relative to wall_now.
+	pastMs := time.Now().UnixMilli() - 10_000
+	h.SetPhysicalCeiling(pastMs)
+
+	_, err := h.NextFenced()
+	require.ErrorIs(t, err, ErrCeilingExpired)
+}
+
+// TestHLCNextFencedIgnoredPreBootstrap verifies the documented soft-fence
+// semantics: ceiling == 0 (no prior leader) is NOT fenced — NextFenced must
+// behave identically to Next so that demo/test bootstrap can issue ts
+// before RunHLCLeaseRenewal has applied the first ceiling.
+func TestHLCNextFencedIgnoredPreBootstrap(t *testing.T) {
+	t.Parallel()
+
+	h := NewHLC()
+	require.Equal(t, int64(0), h.PhysicalCeiling())
+
+	ts, err := h.NextFenced()
+	require.NoError(t, err)
+	require.NotZero(t, ts)
+}
+
+// TestHLCNextBypassesFence documents the explicit non-fenced semantics of
+// Next: even with an expired ceiling, Next still returns a usable
+// (non-persistence) timestamp. Persistence sites must go through NextFenced.
+func TestHLCNextBypassesFence(t *testing.T) {
+	t.Parallel()
+
+	h := NewHLC()
+	pastMs := time.Now().UnixMilli() - 10_000
+	h.SetPhysicalCeiling(pastMs)
+
+	require.NotPanics(t, func() {
+		_ = h.Next()
+	})
+}

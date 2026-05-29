@@ -441,7 +441,11 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 		// CommitTS so dispatchTxn generates both timestamps consistently.
 		// A caller-supplied CommitTS without a matching StartTS could produce
 		// CommitTS <= StartTS (an invalid transaction).
-		reqs.StartTS = c.nextStartTS()
+		startTS, err := c.nextStartTS()
+		if err != nil {
+			return nil, err
+		}
+		reqs.StartTS = startTS
 		reqs.CommitTS = 0
 	}
 
@@ -794,8 +798,38 @@ func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, err
 	return c.LeaseRead(ctx)
 }
 
-func (c *Coordinate) nextStartTS() uint64 {
-	return c.clock.Next()
+func (c *Coordinate) nextStartTS() (uint64, error) {
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate startTS")
+	}
+	return ts, nil
+}
+
+// resolveDispatchCommitTS centralises the commit-ts allocation for
+// dispatchTxn so the function stays under the nestif cyclomatic
+// budget. When commitTS == 0 it allocates a fresh ts via NextFenced
+// (with an Observe-and-retry path when the first allocation is not
+// strictly above startTS); otherwise it Observes the caller-supplied
+// ts to keep HLC monotonic.
+func (c *Coordinate) resolveDispatchCommitTS(commitTS, startTS uint64) (uint64, error) {
+	if commitTS != 0 {
+		c.clock.Observe(commitTS)
+		return commitTS, nil
+	}
+	next, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate commitTS")
+	}
+	if next > startTS {
+		return next, nil
+	}
+	c.clock.Observe(startTS)
+	retry, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "re-allocate commitTS after Observe")
+	}
+	return retry, nil
 }
 
 func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
@@ -807,17 +841,11 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	if commitTS == 0 {
-		commitTS = c.clock.Next()
-		if commitTS <= startTS {
-			c.clock.Observe(startTS)
-			commitTS = c.clock.Next()
-		}
-	} else {
-		// Observe the caller-provided commitTS so the HLC never issues
-		// a smaller timestamp in subsequent calls, preserving monotonicity.
-		c.clock.Observe(commitTS)
+	resolvedCommitTS, err := c.resolveDispatchCommitTS(commitTS, startTS)
+	if err != nil {
+		return nil, err
 	}
+	commitTS = resolvedCommitTS
 	if commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
 	}
@@ -846,10 +874,14 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 		muts = append(muts, elemToMutation(elem))
 	}
 
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return nil, errors.Wrap(err, "allocate raw dispatch ts")
+	}
 	logs := []*pb.Request{{
 		IsTxn:     false,
 		Phase:     pb.Phase_NONE,
-		Ts:        c.clock.Next(),
+		Ts:        ts,
 		Mutations: muts,
 	}}
 
@@ -862,13 +894,17 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 	}, nil
 }
 
-func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
+func (c *Coordinate) toRawRequest(req *Elem[OP]) (*pb.Request, error) {
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return nil, errors.Wrap(err, "allocate raw request ts")
+	}
 	switch req.Op {
 	case Put:
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
+			Ts:    ts,
 			Mutations: []*pb.Mutation{
 				{
 					Op:    pb.Op_PUT,
@@ -876,33 +912,33 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 					Value: req.Value,
 				},
 			},
-		}
+		}, nil
 
 	case Del:
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
+			Ts:    ts,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL,
 					Key: req.Key,
 				},
 			},
-		}
+		}, nil
 
 	case DelPrefix:
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
+			Ts:    ts,
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL_PREFIX,
 					Key: req.Key,
 				},
 			},
-		}
+		}, nil
 	}
 
 	panic("unreachable")
@@ -958,7 +994,11 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	if !reqs.IsTxn {
 		requests := make([]*pb.Request, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {
-			requests = append(requests, c.toRawRequest(req))
+			r, err := c.toRawRequest(req)
+			if err != nil {
+				return nil, err
+			}
+			requests = append(requests, r)
 		}
 		return requests, nil
 	}
