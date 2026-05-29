@@ -25,16 +25,17 @@ if [ ! -f "$TLA_JAR" ]; then
 fi
 
 # Modules to check, in dependency order (libs before consumers).
-TLA_MODULES=( "hlc" "occ" "mvcc" "routes" )
+TLA_MODULES=( "hlc" "occ" "mvcc" "routes" "composed" )
 
 # The invariant the gap config is expected to break, per module.
 # These strings are matched against TLC stdout via grep -F (literal).
 gap_invariant_for() {
     case "$1" in
-        hlc)    echo "Invariant HLC4_NoRegressionAcrossTerms is violated" ;;
-        occ)    echo "Invariant OCC1_CommitTsAboveStart is violated" ;;
-        mvcc)   echo "Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated" ;;
-        routes) echo "Invariant Routes4_NoEngineRegression is violated" ;;
+        hlc)      echo "Invariant HLC4_NoRegressionAcrossTerms is violated" ;;
+        occ)      echo "Invariant OCC1_CommitTsAboveStart is violated" ;;
+        mvcc)     echo "Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated" ;;
+        routes)   echo "Invariant Routes4_NoEngineRegression is violated" ;;
+        composed) echo "Invariant Composed1_CommitToOwningGroup is violated" ;;
         *)
             echo "ERROR: no gap-invariant string registered for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
@@ -45,15 +46,16 @@ gap_invariant_for() {
 
 mc_basename() {
     # tla/<dir>/MC<MODULE>.tla — per-module spelling.  Acronym modules
-    # (HLC, OCC, MVCC) are spelled in uppercase; word-modules (Routes)
-    # use TitleCase.  Override per module rather than a one-size-fits-
-    # all `tr a-z A-Z`, which would produce ugly `MCROUTES` for the
-    # word case.
+    # (HLC, OCC, MVCC) are spelled in uppercase; word-modules (Routes,
+    # Composed) use TitleCase.  Override per module rather than a
+    # one-size-fits-all `tr a-z A-Z`, which would produce ugly
+    # `MCROUTES` / `MCCOMPOSED` for the word cases.
     case "$1" in
-        hlc)    printf 'MCHLC' ;;
-        occ)    printf 'MCOCC' ;;
-        mvcc)   printf 'MCMVCC' ;;
-        routes) printf 'MCRoutes' ;;
+        hlc)      printf 'MCHLC' ;;
+        occ)      printf 'MCOCC' ;;
+        mvcc)     printf 'MCMVCC' ;;
+        routes)   printf 'MCRoutes' ;;
+        composed) printf 'MCComposed' ;;
         *)
             echo "ERROR: no mc_basename mapping for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
