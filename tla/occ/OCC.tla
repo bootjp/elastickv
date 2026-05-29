@@ -113,7 +113,8 @@ BeginTxn(t) ==
 (* ReadKey: snapshot read on key k at startTs[t].  Gated by OCC-3 lock     *)
 (* encoding — if any uncommitted lock with lockTs <= startTs[t] is         *)
 (* outstanding, the read is blocked (modelled here as the action being    *)
-(* disabled; LockResolve fires first).                                    *)
+(* disabled until the lock holder's Commit or Abort drains the lock in    *)
+(* that same atomic step).                                                 *)
 (***************************************************************************)
 ReadKey(t, k) ==
     /\ txnState[t] = "Active"
