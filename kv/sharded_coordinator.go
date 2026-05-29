@@ -505,7 +505,10 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 		return nil, err
 	}
 
-	ts := c.clock.Next()
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return nil, errors.Wrap(err, "allocate DEL_PREFIX broadcast ts")
+	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
@@ -620,7 +623,11 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 
 func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint64, error) {
 	if commitTS == 0 {
-		commitTS = c.nextTxnTSAfter(startTS)
+		next, err := c.nextTxnTSAfter(startTS)
+		if err != nil {
+			return 0, err
+		}
+		commitTS = next
 	} else {
 		// Observe caller-provided commitTS to keep the HLC monotonic; without
 		// this the clock could later issue timestamps smaller than commitTS.
@@ -852,23 +859,29 @@ func (c *ShardedCoordinator) txnGroupForID(gid uint64) (*ShardGroup, error) {
 	return g, nil
 }
 
-func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) uint64 {
+func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) (uint64, error) {
 	if c.clock == nil {
 		nextTS := startTS + 1
 		if nextTS == 0 {
-			return 0
+			return 0, nil
 		}
-		return nextTS
+		return nextTS, nil
 	}
-	ts := c.clock.Next()
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate txn commit ts")
+	}
 	if ts <= startTS {
 		c.clock.Observe(startTS)
-		ts = c.clock.Next()
+		ts, err = c.clock.NextFenced()
+		if err != nil {
+			return 0, errors.Wrap(err, "re-allocate txn commit ts after Observe")
+		}
 	}
 	if ts <= startTS {
-		return 0
+		return 0, nil
 	}
-	return ts
+	return ts, nil
 }
 
 func abortTSFrom(startTS, commitTS uint64) uint64 {
@@ -910,7 +923,11 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 	if c.clock == nil {
 		return maxTS + 1, nil
 	}
-	return c.clock.Next(), nil
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate sharded startTS")
+	}
+	return ts, nil
 }
 
 func (c *ShardedCoordinator) maxLatestCommitTS(ctx context.Context, elems []*Elem[OP]) (uint64, error) {
@@ -1235,10 +1252,14 @@ func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 
 	logs := make([]*pb.Request, 0, len(gids))
 	for _, gid := range gids {
+		ts, err := c.clock.NextFenced()
+		if err != nil {
+			return nil, errors.Wrap(err, "allocate sharded raw log ts")
+		}
 		logs = append(logs, &pb.Request{
 			IsTxn:     false,
 			Phase:     pb.Phase_NONE,
-			Ts:        c.clock.Next(),
+			Ts:        ts,
 			Mutations: grouped[gid],
 		})
 	}
