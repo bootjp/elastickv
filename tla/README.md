@@ -15,7 +15,7 @@ run it without touching anything under the Go source tree.
 | M2 | `occ/OCC.tla` (safety invariants OCC-1..OCC-5) | Landed |
 | M3 | `mvcc/MVCC.tla` (MVCC-1 + MVCC-4; MVCC-2 / MVCC-3 deferred to M5) | Landed |
 | M4 | `routes/Routes.tla` (Routes-1 + Routes-4; Routes-2 / Routes-3 trivially-satisfied in M4 abstraction, full range modelling deferred to M5) | Landed |
-| M5 | `composed/Composed.tla` + CI integration | Not started |
+| M5 | `composed/Composed.tla` (Composed-1 + Composed-3; Composed-2 trivially-satisfied under same-group SplitRange) | Landed |
 | M6 | Liveness checking (`tla-check-deep`) | Not started |
 
 ## Install
@@ -48,8 +48,8 @@ make tla-check
 
 This runs TLC against the safe + gap configuration pair for every
 module declared in `scripts/tla-check.sh` (currently HLC, OCC, MVCC,
-and Routes; M5 will be added as it lands), and prints whether the
-outcome matches the design contract:
+Routes, and Composed; M6 liveness extension is optional and may
+follow), and prints whether the outcome matches the design contract:
 
 - **Safe config (`tla/<module>/MC<MODULE>.cfg`)** — the correct
   design, with each module's preconditions or commit guards enabled.
@@ -248,6 +248,56 @@ guard inside `CatalogWatcherSync`; TLC produces a
 `Routes4_NoEngineRegression` counterexample at depth ≈ 3 (one
 `ProposeRouteChange (v → 1)`, one `CatalogWatcherSync(n)` fetching
 `v = 1`, one `CatalogWatcherSync(n)` fetching `v = 0` — regression).
+
+### `composed/Composed.tla`
+The cross-module composition.  M1..M4 each modelled a single
+subsystem in isolation; M5 captures the seams between them — the
+two safety properties that no single-module spec can express:
+
+- **Composed-1** — every committed write key was owned by the
+  committing group at the txn's observed catalog version.  Ties OCC's
+  commit decision to the Routes catalog snapshot the txn read at
+  `BeginTxn`.
+- **Composed-3** — every pair of distinct committed transactions has
+  distinct `commit_ts` (the strict-serialisability bound).
+
+Composed-2 (read-after-write across SplitRange) is vacuously true in
+this abstraction because the implementation's `SplitRange` is
+same-group only (per CLAUDE.md), so the "key moved to a different
+group" clause has no reachable state.  We still model cross-group
+moves via `ProposeRouteChange` so Composed-1 has teeth — the
+canonical Composed-1 counterexample is a key move from `g1` to `g2`
+followed by a transaction that observed the pre-move catalog but
+commits via `g2`.
+
+The module does NOT `INSTANCE` the M1..M4 modules — INSTANCEing all
+four would explode the state space well past M5's "<10 min at
+default bounds" target from §8.1.  Composed.tla instead recreates
+the minimal cross-module state needed to express Composed-1 and
+Composed-3 (abstract HLC clock, catalog history, transaction
+lifecycle).  The integration claim is that this projection preserves
+the invariants the full product would assert.
+
+Invariants asserted:
+
+| Invariant | Statement |
+|---|---|
+| `TypeOK` | Variable types are well-formed |
+| `Composed1_CommitToOwningGroup` | For every committed txn `t` and every `k ∈ writeSet[t]`, `routes[observedVer[t]][k] = commitGroup[t]` |
+| `Composed2_ReadAcrossSplitRange` | Vacuously TRUE in M5 (same-group SplitRange) — kept for naming consistency |
+| `Composed3_DistinctCommitTs` | Distinct committed txns have distinct `commit_ts` |
+| `Composed_CatalogMonotonic` (PROPERTY) | Transition form: `catalogVersion` weakly increases |
+| `Composed_TsMonotonic` (PROPERTY) | Transition form: `tsCounter` weakly increases |
+| `Composed3_TsAction` (PROPERTY) | Transition form: every Commit strictly raises `tsCounter` |
+
+### `composed/MCComposed.tla` + `MCComposed.cfg` / `MCComposed_gap.cfg`
+TLC model-check instance for Composed.  Same one-module / two-config
+layout as the other modules.  The gap config disables the
+owning-group check in `Commit`; TLC produces a
+`Composed1_CommitToOwningGroup` counterexample at depth ≈ 4:
+`BeginTxn(t)` → `WriteIntent(t, k1)` → `ProposeRouteChange(k1, g2)`
+→ `Commit(t, g2)` where the txn observed `routes[0][k1] = g1` but
+commits via `g2`.
 
 ## How to interpret a TLC failure
 
