@@ -24,6 +24,7 @@ type Registry struct {
 	sqs           *SQSMetrics
 	sqsObserver   *SQSObserver
 	hlc           *HLCMetrics
+	hlcObserver   *HLCObserver
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -49,6 +50,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.sqs = newSQSMetrics(registerer)
 	r.sqsObserver = newSQSObserver(r.sqs)
 	r.hlc = newHLCMetrics(registerer)
+	r.hlcObserver = newHLCObserver(r.hlc)
 	return r
 }
 
@@ -214,14 +216,17 @@ func (r *Registry) WriteConflictCollector() *WriteConflictCollector {
 }
 
 // HLCObserver returns the HLC physical-ceiling + fence-rejection
-// observer backed by this registry. Same shape as RaftObserver /
-// SQSObserver: callers pull it via the registry, then drive
-// Start(ctx, source, interval) from main.go once the kv layer's
-// HLC is constructed. Returns nil if r is nil so test fixtures
+// observer backed by this registry. Same shape as SQSObserver: a
+// single observer is constructed inside NewRegistry and returned by
+// reference here, so callers that pull it more than once observe
+// the same lastRejections delta state (returning a fresh observer
+// each call would reset lastRejections and risk double-counting
+// rejections against the cumulative Prometheus counter — claude
+// review on PR #879). Returns nil if r is nil so test fixtures
 // can drop the observer without conditional wiring.
 func (r *Registry) HLCObserver() *HLCObserver {
-	if r == nil || r.hlc == nil {
+	if r == nil || r.hlcObserver == nil {
 		return nil
 	}
-	return newHLCObserver(r.hlc)
+	return r.hlcObserver
 }

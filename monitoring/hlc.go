@@ -144,7 +144,20 @@ func (o *HLCObserver) observeOnce(source HLCSource) {
 	nowMs := time.Now().UnixMilli()
 
 	o.metrics.physicalCeilingSeconds.Set(float64(ceilingMs) / hlcMsPerSecond)
-	o.metrics.wallSkewSeconds.Set(float64(nowMs-ceilingMs) / hlcMsPerSecond)
+	// Pre-bootstrap (ceilingMs == 0) the skew computation would produce
+	// nowMs / 1000 ≈ 1.75e9 seconds (~55 years), which would
+	// immediately trip the recommended `wallSkewSeconds > -0.5` alert
+	// on every cold-start node until the first HLC lease lands.  Hold
+	// the gauge at 0 in that case — the physicalCeilingSeconds gauge
+	// already exposes the pre-bootstrap state (also 0), so an alert
+	// of the form
+	//   `wallSkewSeconds > -0.5 AND physicalCeilingSeconds > 0`
+	// behaves correctly.  (Claude review medium on PR #879.)
+	if ceilingMs > 0 {
+		o.metrics.wallSkewSeconds.Set(float64(nowMs-ceilingMs) / hlcMsPerSecond)
+	} else {
+		o.metrics.wallSkewSeconds.Set(0)
+	}
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
