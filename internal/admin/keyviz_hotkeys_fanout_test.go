@@ -492,6 +492,51 @@ func TestHotKeysHandler_FanoutNilLocalAllPeersEmpty(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "no_snapshot")
 }
 
+// TestHotKeysHandler_FanoutNilLocalPeerHasEmptySnapshot pins the
+// codex P2 round-4 fix: when this node has no snapshot but a peer
+// returns a VALID empty snapshot (a tracked route that's quiet in
+// the latest window — keys=[], sampled_n=0, snapshot_at non-zero),
+// the merged response must be 200 with empty keys, not 404. The
+// single-node path returns 200 for a non-nil snapshot even when
+// quiet; the multi-node path must match. Without the fix the
+// `len(Keys)==0 && SampledN==0` post-check would downgrade to 404
+// and the response would depend on which node the operator hit.
+func TestHotKeysHandler_FanoutNilLocalPeerHasEmptySnapshot(t *testing.T) {
+	t.Parallel()
+	snapshotAt := time.Date(2026, 5, 29, 15, 0, 0, 0, time.UTC)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Peer's route is tracked but quiet: valid 200 with an
+		// empty Keys slice, SampledN=0, but a real SnapshotAt.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(hotKeyResponse{
+			RouteID: 9, Series: "writes", Approximate: true,
+			SampleRate: 16, SampledN: 0,
+			Keys:       []hotKeyResponseEntry{},
+			SnapshotAt: snapshotAt,
+		})
+	}))
+	defer peer.Close()
+
+	src := newStubSource() // no local snapshot for route 9
+	fanout := NewKeyVizHotKeysFanout("self", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithLogger(silentLogger())
+	h := NewKeyVizHotKeysHandler(src).
+		WithLogger(silentLogger()).
+		WithFanout(fanout)
+
+	rec := serve(t, h, "GET", "/admin/api/v1/keyviz/hotkeys?route_id=9", nil)
+	require.Equal(t, http.StatusOK, rec.Code,
+		"valid empty peer snapshot must be 200 with empty keys, not 404 (matches single-node path)")
+	var got hotKeyResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Empty(t, got.Keys)
+	require.Equal(t, snapshotAt, got.SnapshotAt.UTC(),
+		"peer's SnapshotAt must survive the merge so the SPA sees 'tracked but quiet' rather than 'no snapshot'")
+	require.NotNil(t, got.Fanout)
+	require.Equal(t, 2, got.Fanout.Responded)
+}
+
 // TestHotKeysHandler_FanoutSuppressedOnPeerHeaderEvenWithNilLocal
 // guards the recursion invariant under the gemini HIGH fix: when an
 // inbound request already carries X-Admin-Fanout-Peer, the handler

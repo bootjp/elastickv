@@ -162,12 +162,18 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	out = h.maybeFanout(r, params, out)
 
-	// After fan-out, if no source (local OR any peer) produced data
-	// for this route, return the same 404 the single-node path would.
-	// Without this post-fan-out check, a route that exists on no node
-	// would 200 with empty keys instead of the documented 404, and
-	// the SPA's "no snapshot" branch would never fire.
-	if snap == nil && len(out.Keys) == 0 && out.SampledN == 0 {
+	// After fan-out, decide whether to 404 by asking "did ANY node
+	// publish a snapshot for this route?". The merger sets
+	// out.SnapshotAt to the MAX across all responses, so a non-zero
+	// value means at least one source (local or a peer) had a valid
+	// snapshot — even one with empty Keys and SampledN=0 (a tracked
+	// route that happens to be quiet in the latest window). The old
+	// `len(Keys)==0 && SampledN==0` check would have downgraded that
+	// to 404, contradicting the single-node path which returns 200
+	// with an empty body when snap is non-nil but quiet (codex P2
+	// round-4). Use IsZero so a non-empty-but-empty-keys peer reply
+	// is preserved.
+	if snap == nil && out.SnapshotAt.IsZero() {
 		writeJSONError(w, http.StatusNotFound, "no_snapshot",
 			"no hot-keys snapshot is available for this route on any node in the cluster")
 		return
