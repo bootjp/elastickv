@@ -290,25 +290,29 @@ interface SelectionOverlayProps {
 
 function SelectionOverlay({ selected, cellH, cellW }: SelectionOverlayProps) {
   if (!selected) return null;
-  // 2px stroke at full opacity reads against both light and dark
-  // ramp colours; the rect itself is transparent so the underlying
-  // intensity remains visible through the selection box.
+  // Position the SVG container ITSELF at the selected cell so the
+  // viewport is one-cell-sized regardless of where the cell sits in
+  // the heatmap. At a max matrix of 1024 rows × ~1000 cols this
+  // avoids spawning a ~megapixel SVG just to draw one 8x4 outline
+  // at the far corner. 2px stroke at full opacity reads against both
+  // light and dark ramp colours; the rect itself is transparent so
+  // the underlying intensity stays visible through the selection box.
   return (
     <svg
-      width={cellW * (selected.col + 1) + 4}
-      height={cellH * (selected.row + 1) + 4}
+      width={cellW + 2}
+      height={cellH + 2}
       style={{
         position: "absolute",
-        top: 0,
-        left: 0,
+        top: selected.row * cellH - 1,
+        left: selected.col * cellW - 1,
         pointerEvents: "none",
         overflow: "visible",
       }}
       aria-hidden="true"
     >
       <rect
-        x={selected.col * cellW - 1}
-        y={selected.row * cellH - 1}
+        x={0}
+        y={0}
         width={cellW + 2}
         height={cellH + 2}
         fill="none"
@@ -564,8 +568,15 @@ interface BucketIDParts {
 }
 
 function parseBucketID(id: string): BucketIDParts | null {
+  // Use Number() rather than Number.parseInt() so a malformed id
+  // like "route:42abc" returns null instead of silently being read
+  // as 42 (parseInt stops at the first non-numeric character;
+  // Number() rejects trailing garbage as NaN). The server's
+  // strconv.FormatUint output never contains garbage today, but
+  // belt-and-braces parsing keeps a future server-side format
+  // change from quietly mis-routing the hot-keys API call.
   if (id.startsWith("virtual:")) {
-    const n = Number.parseInt(id.slice("virtual:".length), 10);
+    const n = Number(id.slice("virtual:".length));
     if (!Number.isFinite(n)) return null;
     return { kind: "virtual", routeID: n };
   }
@@ -573,12 +584,12 @@ function parseBucketID(id: string): BucketIDParts | null {
     const rest = id.slice("route:".length);
     const hash = rest.indexOf("#");
     if (hash < 0) {
-      const n = Number.parseInt(rest, 10);
+      const n = Number(rest);
       if (!Number.isFinite(n)) return null;
       return { kind: "route", routeID: n };
     }
-    const routeID = Number.parseInt(rest.slice(0, hash), 10);
-    const sub = Number.parseInt(rest.slice(hash + 1), 10);
+    const routeID = Number(rest.slice(0, hash));
+    const sub = Number(rest.slice(hash + 1));
     if (!Number.isFinite(routeID) || !Number.isFinite(sub)) return null;
     return { kind: "route", routeID, subBucket: sub };
   }
@@ -622,9 +633,15 @@ function HotKeysPanel({ row, column, columnUnixMs, series, onClose }: HotKeysPan
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs text-muted">Hot keys · cell</span>
           <span className="font-mono text-xs">{row.bucket_id}</span>
-          <span className="text-xs text-muted">column {column}</span>
+          {/* The clicked column locates the cell on the heatmap, but
+              the hot-keys API always returns the LATEST snapshot
+              (the SPA omits from/to_unix_ms by design). Label the
+              column timestamp as "clicked" so users don't read it as
+              the data's temporal anchor — the actual anchor is the
+              `Snapshot at` row in the table below. */}
           <span className="text-xs text-muted">
-            ({new Date(columnUnixMs).toLocaleTimeString()})
+            clicked column {column} (
+            {new Date(columnUnixMs).toLocaleTimeString()})
           </span>
         </div>
         <button
@@ -704,13 +721,25 @@ function HotKeysContent({ routeID, subBucket }: HotKeysContentProps) {
       ),
     [routeID, subBucket],
   );
-  if (query.loading && !query.data) {
+  // useApiQuery keeps the previous response in `data` while a new
+  // request is in flight (it doesn't reset on dep change), so when the
+  // user clicks a different bucket the table would briefly render the
+  // OLD bucket's keys under the NEW header. Compare the loaded
+  // response's identity to the current (routeID, subBucket) so the
+  // "loading" branch fires whenever they disagree. sub_bucket compares
+  // by strict equality including undefined === undefined for K=1
+  // routes.
+  const hasMatchingData =
+    !!query.data &&
+    query.data.route_id === routeID &&
+    query.data.sub_bucket === subBucket;
+  if (query.loading && !hasMatchingData) {
     return <p className="text-xs text-muted">Loading hot keys…</p>;
   }
   if (query.error) {
     return <HotKeysErrorNotice error={query.error} />;
   }
-  if (!query.data) return null;
+  if (!hasMatchingData || !query.data) return null;
   return <HotKeysTable data={query.data} />;
 }
 
@@ -730,12 +759,19 @@ function HotKeysErrorNotice({ error }: HotKeysErrorNoticeProps) {
     );
   }
   if (error.status === 503) {
+    // The handler returns two distinct 503 codes
+    // (keyviz_hotkeys_handler.go): "keyviz_disabled" when the whole
+    // sampler isn't configured, vs "hotkeys_disabled" when only
+    // hot-keys is off. Pointing operators at the wrong flag wastes
+    // a restart, so branch on error.code.
+    const flag =
+      error.code === "keyviz_disabled"
+        ? "--keyvizEnabled (plus --keyvizHotKeysEnabled)"
+        : "--keyvizHotKeysEnabled";
     return (
       <p className="text-xs text-muted">
         Hot-key sampling is disabled on this node. Start the server
-        with{" "}
-        <code className="font-mono">--keyvizHotKeysEnabled</code> to
-        enable.
+        with <code className="font-mono">{flag}</code>.
       </p>
     );
   }
