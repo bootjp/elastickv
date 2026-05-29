@@ -80,13 +80,15 @@ starts:
    apply-side ConfChange handler inserts a registry row inline.
    - **Pro**: Atomic with the conf-change; cannot be bypassed.
    - **Con**: Layering violation — the Raft engine should not know
-     about encryption registry semantics. Per-shard FSMs apply
-     ConfChanges, but the writer registry lives in the default
-     group's storage; cross-group state mutation from a non-default
-     group's apply hook is not currently a thing. Also the new
-     node's `local_epoch` is not knowable at apply time on other
-     members (it is set on the new node's first boot, not on the
-     cluster-wide ConfChange apply).
+     about encryption registry semantics. The Raft engine
+     (`internal/raftengine/etcd/engine.go`) handles ConfChange entries
+     internally via `applyConfChangeCommitted`; the FSM's `Apply()` is
+     never called for them. The writer registry lives in the default
+     group's storage; cross-group state mutation from the engine's
+     internal ConfChange handler would be a new architectural
+     coupling. Also the new node's `local_epoch` is not knowable at
+     apply time on other members (it is set on the new node's first
+     boot, not on the cluster-wide ConfChange apply).
 
 **Recommendation: option (a).** Smaller surface, reuses the existing
 proven 0x03 entry path, and the §4.1 collision halt-apply fires before
@@ -163,8 +165,30 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
         return nil // cluster not bootstrapped — no registry to gate on
     }
     newNodeFullID := e.deriveNodeID(raftID)
-    entry := registrationEntry(activeDEK, newNodeFullID, 0)
-    req := registrationRequest(activeDEK, newNodeFullID, 0)
+    // Read-before-propose guard (claude round-2 BLOCKING on PR #868).
+    // Required because §4.1 case-2 fires ONLY when proposed_epoch >
+    // last_seen_epoch (strictly greater) — re-proposing epoch=0 against
+    // an existing (epoch=0) row hits case-3 ErrLocalEpochRollback, not
+    // the idempotent case-2 path. Read the row first; if it already
+    // exists for any epoch, skip the propose. Same pattern as 7a's
+    // startup skip-if-already-registered check.
+    if existing, ok, err := e.registry.GetRegistryRow(encryption.RegistryKey(activeDEK, encryption.NodeID16(newNodeFullID))); err != nil {
+        return errors.Wrap(err, "7c pre-register: read registry row")
+    } else if ok {
+        val, derr := encryption.DecodeRegistryValue(existing)
+        if derr != nil {
+            return errors.Wrap(derr, "7c pre-register: decode registry value")
+        }
+        if val.FullNodeID == newNodeFullID {
+            return nil // already registered (possibly from a prior call); idempotent skip
+        }
+        // FullNodeID mismatch at same uint16 truncation = §6.1 collision;
+        // surface a typed error so the admin RPC returns a clear failure
+        // (no propose attempted — case-4 halt apply would brick the FSM).
+        return ErrEncryptionWriterUint16Collision
+    }
+    entry := registrationEntry(activeDEK, newNodeFullID, 0)   // entry = 0x03 Raft log payload
+    req := registrationRequest(activeDEK, newNodeFullID, 0)   // req = propose-call wrapper type
     return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Engine, entry, req)
 }
 ```
@@ -213,22 +237,40 @@ for this case.
 Without 7c, the same case-4 halt would fire AFTER the conf-change had
 already committed — irrecoverable without manual intervention.
 
-### 3.4 Fail-open posture: the catch-up safety net is 7a, NOT 7c
+### 3.4 What 7c guarantees vs what 7a remains responsible for
 
-7c is **not** the only path that registers a new node. 7a's
-process-start path on the new node's first boot is the catch-up:
+7c provides **two independent guarantees** (claude round-2 on PR #868):
 
-- If an operator adds a member through a non-admin-RPC path (direct
-  ConfChange via raftadmin grpc or a debugging tool), 7c's
-  pre-register step is bypassed.
-- The new node still starts up, 7a runs, proposes
-  `RegisterEncryptionWriter`. The first-seen insert succeeds (the
-  cluster never registered the node).
+1. **Write-window elimination (optimization)** — closes the fail-
+   closed window between the conf-change commit and 7a's first
+   propose committing. Without 7c, every node addition surfaces a
+   user-visible latency spike on the new node's first encrypted
+   write.
+2. **Collision-safe membership change (correctness)** — moves the
+   §6.1 uint16-collision case-4 halt-apply to **before** the
+   conf-change is proposed, transforming an otherwise irrecoverable
+   cluster brick into a retryable RPC failure. The pre-register
+   propose either succeeds (proceed to conf-change), returns
+   `ErrEncryptionWriterUint16Collision` from the §3.1 guard
+   (operator chooses a non-colliding raftID and retries), or hits
+   case-4 halt-apply (the cluster's FSM stops; recovery is the
+   `ErrNodeIDCollision` startup membership pre-check, same as
+   today's pre-7c posture — but now the conf-change is NOT yet in
+   the log, so recovery does not need to undo durable membership).
 
-7c is therefore an **optimization + collision-safety** layer, not the
-sole defense. The 7a-2 storage gate (`Registered()`) remains the
-last-line correctness defense for any node that hasn't registered
-yet, no matter how it joined.
+7a's process-start path is the catch-up for guarantee (1) — if an
+operator adds a member through a non-admin-RPC path (direct
+ConfChange via a debugging tool), 7c's pre-register step is
+bypassed; the new node still starts up, 7a runs, proposes
+`RegisterEncryptionWriter`, the first-seen insert succeeds. The
+7a-2 storage gate (`Registered()`) is the last-line correctness
+defense for the (1) write-window guarantee on every code path.
+
+There is **no last-line defense for guarantee (2)** on the direct
+ConfChange path: a non-admin-RPC ConfChange that hits a uint16
+collision still bricks the cluster as it does today. 7c's value for
+(2) is therefore restricted to operators who use the admin RPC,
+which is the documented path.
 
 ### 3.5 Leader-only RPC handling
 
@@ -241,9 +283,20 @@ leader-checks needed.
 
 If leadership flips between the pre-register propose and the conf-
 change propose, the second call returns the existing not-leader
-error and the operator retries. The pre-registered row is durable
-across the leader change — the next leader sees it and accepts the
-retry's conf-change normally.
+error and the operator retries against the new leader. The pre-
+registered row is durable across the leader change — on retry, the
+**§3.1 read-before-propose guard** observes the existing
+`(activeDEK, newNodeFullID)` row and skips the propose, returning
+nil. The retry then proceeds directly to the conf-change.
+
+The guard is **load-bearing** for retry correctness (claude
+round-2 BLOCKING on PR #868): without it, re-proposing `epoch=0`
+against an existing `(epoch=0)` row would hit §4.1 case-3
+(`proposed_epoch <= last_seen_epoch` → `ErrLocalEpochRollback`),
+because case-2 monotonic acceptance requires *strictly greater*
+`proposed_epoch`. The retry would then fail permanently on the
+pre-register step, leaving the operator unable to add the node
+without manually patching the registry.
 
 ## 4. Out of scope (deferred slices)
 
@@ -291,6 +344,19 @@ retry's conf-change normally.
      errors (simulated §4.1 case-4 halt apply, ctx timeout, propose
      gate refusal) propagate to the caller verbatim — the
      `raftadmin.Server` will then abort the conf-change.
+   - `TestEncryptionPreRegister_IdempotentWhenRowExists`: calling
+     `PreAddMember(raftID)` when a row already exists at
+     `(activeDEK, NodeID16(raftID))` with matching `FullNodeID`
+     skips the propose and returns nil. Pins the §3.1
+     read-before-propose guard against the §4.1 case-3
+     `ErrLocalEpochRollback` regression (claude round-2 BLOCKING on
+     PR #868).
+   - `TestEncryptionPreRegister_Uint16CollisionReturnsTypedError`:
+     a row exists at the same uint16 truncation with a *different*
+     `FullNodeID` (the §6.1 collision case) → the guard returns
+     `ErrEncryptionWriterUint16Collision` without proposing. No
+     case-4 halt-apply is triggered; the conf-change is correctly
+     aborted at the RPC layer.
 3. New `main_encryption_e2e_test.go` test or extension:
    - `TestEncryption_E2E_ConfChange_NewMemberPreRegistration`: end-
      to-end test driving the production `AddVoter` handler in a
@@ -303,11 +369,15 @@ retry's conf-change normally.
    - **Concurrency**: the pre-register step uses the same
      `coordinate` as the conf-change; race between leader flip
      mid-step → second propose fails not-leader, operator retries
-     (idempotent via §4.1 case-2).
+     against the new leader. Retry idempotency comes from the §3.1
+     **read-before-propose guard** (same pattern as 7a's startup
+     skip-if-already-registered) — NOT from §4.1 case-2, which
+     requires strictly greater `proposed_epoch` and would reject
+     a same-epoch=0 re-propose with case-3 `ErrLocalEpochRollback`.
    - **Data consistency**: the pre-register's `local_epoch=0` row is
      §4.1 case-1 first-seen; subsequent 7a propose at the new
-     node's `BumpLocalEpoch(activeDEK)`-advanced epoch is case-2
-     monotonic. No brick scenario.
+     node's `BumpLocalEpoch(activeDEK)`-advanced epoch (typically
+     `1`) is case-2 monotonic. No brick scenario.
 
 ## 6. Rollout / migration
 
@@ -325,9 +395,15 @@ existing 0x03 entry shape. Mixed-version cluster:
 - **Rollback to pre-7c**: a leader that rolls back skips the
   pre-register step; conf-changes work as today. Already-inserted
   registry rows from prior 7c-leader pre-register calls remain in
-  the catalog — benign (the row is for a real node that
-  subsequently registered itself via 7a at a higher epoch via
-  case-2 monotonic advance).
+  the catalog. These are benign **as long as the §3.1
+  read-before-propose guard is in place on every leader** (claude
+  round-2 BLOCKING on PR #868): the guard ensures a same-raftID
+  retry observes the existing row and skips the propose, even if
+  the node never actually booted (e.g., the pre-register succeeded
+  but the conf-change failed before commit). Without the guard,
+  same-raftID retries before first boot would hit §4.1 case-3
+  `ErrLocalEpochRollback` — covered by the guard, not relied on
+  from case-2 monotonic advance.
 
 The 6.1 rolling-upgrade mitigation strategies from 7b' §6.1 (admin-
 RPC capability probe etc.) do NOT apply to 7c — the change is
