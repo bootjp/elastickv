@@ -81,7 +81,8 @@ java -XX:+UseParallelGC -cp ../../$JAR -DTLA-Library=../lib \
 ```
 
 The OCC module follows the same pattern under `tla/occ/` with
-`MCOCC.cfg` / `MCOCC_gap.cfg`; future M3 / M4 / M5 modules will too.
+`MCOCC.cfg` / `MCOCC_gap.cfg`; MVCC follows under `tla/mvcc/` (see
+below).  Future M4 / M5 modules will use the same pattern.
 
 State-space bounds are set in the `.cfg` files (M1 defaults: 3 nodes,
 2 terms, ≤ 3 IssueTimestamp ops, wall clock ≤ 3 ms, `LogicalMax = 1`;
