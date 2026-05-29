@@ -4,9 +4,11 @@
 (* Per docs/design/2026_05_28_partial_tla_safety_spec.md §5.2.             *)
 (*                                                                         *)
 (* Models the transaction lifecycle Idle -> Active -> Prepared ->          *)
-(* Committed/Aborted, the lock-map (key, lock_ts) -> start_ts, and the     *)
-(* LockResolver action that turns abandoned locks into versions or         *)
-(* clears them.  Encodes all five OCC safety invariants OCC-1..OCC-5:      *)
+(* Committed/Aborted and the lock-map (key, lock_ts) -> start_ts.  In M2  *)
+(* the lock-resolver (kv/lock_resolver.go) is abstracted into the atomic  *)
+(* lock drain inside Commit/Abort; see the block comment further down for *)
+(* why a separate LockResolve action is unreachable here and deferred to  *)
+(* M5 (composed).  Encodes all five OCC safety invariants OCC-1..OCC-5:    *)
 (*                                                                         *)
 (*   OCC-1  Commit_ts > read_ts for every committed transaction.           *)
 (*   OCC-2  No write-write conflict on intersecting write sets.            *)
@@ -40,7 +42,7 @@ States == {"Idle", "Active", "Prepared", "Committed", "Aborted"}
 NoLock == [owner |-> "none", lockTs |-> 0]
 
 VARIABLES
-    tsCounter,        \* Nat. Abstract HLC counter; advances on Tick + Commit.
+    tsCounter,        \* Nat. Abstract HLC counter; advances on BeginTxn + Commit.
     txnState,         \* TxnIds -> States
     startTs,          \* TxnIds -> Nat   (== read_ts by OCC-5)
     commitTs,         \* TxnIds -> Nat   (0 if not committed)
@@ -305,8 +307,12 @@ OCC3_ReadSnapshotStability ==
             readObs[t][k] = LatestVisible(k, startTs[t])
 
 \* OCC-4 — no stranded lock at quiescence.  Bounded safety form: in any
-\* state where every txn is in a terminal state (Committed/Aborted),
-\* no lock owned by any such txn remains.  LockResolve drains them.
+\* state where every txn is in a terminal state (Idle/Committed/Aborted),
+\* no lock remains on any key.  Under the M2 atomic-drain abstraction
+\* (Commit/Abort clear every lock they own in the same step), this is
+\* maintained by construction rather than by a separate resolver action.
+\* The async resolver case is deferred to M5 — see the block comment
+\* above where LockResolve would have lived.
 OCC4_NoStrandedLockAtQuiescence ==
     LET AllTerminal == \A t \in TxnIds : txnState[t] \in {"Idle", "Committed", "Aborted"}
     IN AllTerminal =>

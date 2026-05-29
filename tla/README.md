@@ -46,38 +46,47 @@ From the repository root:
 make tla-check
 ```
 
-This runs TLC against both configurations and prints whether the outcome
+This runs TLC against the safe + gap configuration pair for every
+module declared in `scripts/tla-check.sh` (currently HLC and OCC; M3 /
+M4 / M5 will be added as they land), and prints whether the outcome
 matches the design contract:
 
-1. `tla/hlc/MCHLC.cfg` — the **correct design**, with HLC-4
-   preconditions encoded as ASSUMEs / action guards. TLC must finish
-   with no invariant violation.
-2. `tla/hlc/MCHLC_gap.cfg` — the **gap configuration**, with the
-   preconditions disabled (`EnableSafety = FALSE`). TLC must produce a
-   counterexample on `HLC4_NoRegressionAcrossTerms` — this is the
-   motivating evidence that strategy (c) handoff + the ceiling fence
-   are necessary. The `tla-check` target inverts the exit code for
-   this run so a TLC FAILURE here counts as PASS for CI.
+- **Safe config (`tla/<module>/MC<MODULE>.cfg`)** — the correct
+  design, with each module's preconditions or commit guards enabled.
+  TLC must finish with no invariant violation.
+- **Gap config (`tla/<module>/MC<MODULE>_gap.cfg`)** — the
+  preconditions or guards disabled (`EnableSafety = FALSE`). TLC must
+  produce a counterexample on the module's load-bearing invariant
+  (`HLC4_NoRegressionAcrossTerms` for HLC; `OCC1_CommitTsAboveStart`
+  for OCC). The harness inverts the exit code for the gap run AND
+  greps for the specific invariant-violation string, so any other
+  failure mode (parse error, deadlock, JVM crash, different
+  invariant) fails the job rather than silently being treated as the
+  expected gap evidence.
 
-To run a single module by hand (skipping the Makefile):
+To run a single module by hand (skipping the harness):
 
 ```sh
 JAR=.cache/tla/tla2tools.jar
 
-# Safe config (expected PASS):
+# HLC safe (expected PASS):
 cd tla/hlc
 java -XX:+UseParallelGC -cp ../../$JAR -DTLA-Library=../lib \
     tlc2.TLC -config MCHLC.cfg MCHLC.tla
 
-# Gap config (expected FAIL on HLC-4):
+# HLC gap (expected FAIL on HLC4_NoRegressionAcrossTerms):
 java -XX:+UseParallelGC -cp ../../$JAR -DTLA-Library=../lib \
     tlc2.TLC -config MCHLC_gap.cfg MCHLC.tla
 ```
 
+The OCC module follows the same pattern under `tla/occ/` with
+`MCOCC.cfg` / `MCOCC_gap.cfg`; future M3 / M4 / M5 modules will too.
+
 State-space bounds are set in the `.cfg` files (M1 defaults: 3 nodes,
-2 terms, ≤ 3 IssueTimestamp ops, wall clock ≤ 3 ms, `LogicalMax = 1`).
-Raise them locally to deepen exploration; the M1 PR keeps them small so
-the full `make tla-check` runs in well under a second.
+2 terms, ≤ 3 IssueTimestamp ops, wall clock ≤ 3 ms, `LogicalMax = 1`;
+M2 defaults: 2 keys, 2 txns, `MaxTs = 6`, `MaxOps = 3`).  Raise them
+locally to deepen exploration; the bounded configs keep `make
+tla-check` end-to-end in well under a second.
 
 ## What each module proves
 
@@ -122,13 +131,15 @@ TLC model-check instance.  Two configurations, one module.  See [Run](#run).
 
 ### `occ/OCC.tla`
 The OCC layer.  Models the Percolator-style 2PC transaction lifecycle
-`Idle → Active → Prepared → Committed / Aborted`, the lock map
-`(key, lock_ts) → start_ts`, and the `LockResolve` action that turns
-abandoned locks into versions or clears them.  HLC is abstracted to a
-single global monotonic counter for M2; M5 (composed) will INSTANCE
-`HLC.tla` for the real 48/16 layout.  The `EnableSafety` CONSTANT
-gates the OCC-1 commit guard so the same module drives the safe and
-gap configurations.
+`Idle → Active → Prepared → Committed / Aborted` and the lock map
+`(key, lock_ts) → start_ts`.  The lock-resolver
+(`kv/lock_resolver.go`) is abstracted into the atomic lock drain
+inside `Commit`/`Abort` for M2; the async-resolver case is deferred
+to M5 (composed) — see the block comment in `OCC.tla` where
+`LockResolve` would have lived.  HLC is abstracted to a single global
+monotonic counter for M2; M5 will INSTANCE `HLC.tla` for the real
+48/16 layout.  The `EnableSafety` CONSTANT gates the OCC-1 commit
+guard so the same module drives the safe and gap configurations.
 
 Invariants asserted:
 
@@ -137,7 +148,7 @@ Invariants asserted:
 | `TypeOK` | Variable types are well-formed |
 | `OCC1_CommitTsAboveStart` | Every committed txn has `commit_ts > start_ts` |
 | `OCC2_NoWriteWriteConflict` | Two committed txns sharing a write key have distinct commit_ts and one started after the other committed (`commit_ts[earlier] <= start_ts[later]`) |
-| `OCC3_ReadSnapshotStability` | Every read observation's `commit_ts <= start_ts` of the reader (lock-encoded reads only) |
+| `OCC3_ReadSnapshotStability` | Every read observation equals `LatestVisible(k, start_ts(t))` (the snapshot value remains stable under monotonic-ts allocation in BeginTxn / Commit) |
 | `OCC4_NoStrandedLockAtQuiescence` | When all txns are in a terminal state, no lock remains |
 | `OCC5_StartTsConsistency` | Every read observation is bounded by the txn's `start_ts` (= `read_ts` by OCC-5) |
 | `OCC5_Action` (PROPERTY) | Transition form: `start_ts[t]` is assigned once at `BeginTxn` and never updated |
