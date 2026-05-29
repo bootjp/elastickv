@@ -314,6 +314,27 @@ func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) 
 	return r.applyTTLFilter(ctx, key, readTS, typ)
 }
 
+// requireKeyTypeOrEmpty returns nil iff the key either has the expected
+// type at readTS or is absent at readTS.  wrongTypeError() is returned
+// when the key exists with a different type.
+//
+// Used by the wide-column command implementations (HSET / ZADD /
+// HINCRBY / ZINCRBY etc.) to collapse the keyTypeAtExpect +
+// wrong-type-rejection pair into a single branch at the call site —
+// this is what keeps those functions under the cyclop ceiling after
+// the HLC-4 (iii) ceiling fence added a NextFenced error branch
+// (PR #867 Phase 2b).
+func (r *RedisServer) requireKeyTypeOrEmpty(ctx context.Context, key []byte, readTS uint64, expected redisValueType) error {
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, expected)
+	if err != nil {
+		return err
+	}
+	if typ != redisTypeNone && typ != expected {
+		return wrongTypeError()
+	}
+	return nil
+}
+
 // keyTypeAtExpect is a fast-path replacement for keyTypeAt callers that
 // know the type they expect to find. The slow path probes ~19 Pebble
 // seeks across every collection family before returning. The fast path:
@@ -340,27 +361,6 @@ func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) 
 // place for first-write and wrongType cases, which keep their existing
 // semantics — wrongTypeError detection is preserved by the
 // fall-through.
-// requireKeyTypeOrEmpty returns nil iff the key either has the expected
-// type at readTS or is absent at readTS.  wrongTypeError() is returned
-// when the key exists with a different type.
-//
-// Used by the wide-column command implementations (HSET / ZADD /
-// HINCRBY / ZINCRBY etc.) to collapse the keyTypeAtExpect +
-// wrong-type-rejection pair into a single branch at the call site —
-// this is what keeps those functions under the cyclop ceiling after
-// the HLC-4 (iii) ceiling fence added a NextFenced error branch
-// (PR #867 Phase 2b).
-func (r *RedisServer) requireKeyTypeOrEmpty(ctx context.Context, key []byte, readTS uint64, expected redisValueType) error {
-	typ, err := r.keyTypeAtExpect(ctx, key, readTS, expected)
-	if err != nil {
-		return err
-	}
-	if typ != redisTypeNone && typ != expected {
-		return wrongTypeError()
-	}
-	return nil
-}
-
 func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (redisValueType, error) {
 	if expected == redisTypeNone {
 		return r.keyTypeAt(ctx, key, readTS)
@@ -1175,7 +1175,10 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 	for _, value := range values {
 		rawValues = append(rawValues, []byte(value))
 	}
-	commitTS := r.coordinator.Clock().Next()
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return errors.Wrap(err, "rewriteListTxn: allocate commitTS")
+	}
 	ops, _, err := r.buildRPushOps(store.ListMeta{}, key, rawValues, commitTS, 0)
 	if err != nil {
 		return err
