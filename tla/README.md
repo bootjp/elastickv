@@ -47,8 +47,9 @@ make tla-check
 ```
 
 This runs TLC against the safe + gap configuration pair for every
-module declared in `scripts/tla-check.sh` (currently HLC and OCC; M3 /
-M4 / M5 will be added as they land), and prints whether the outcome
+module declared in `scripts/tla-check.sh` (currently HLC, OCC, and
+MVCC; M4 / M5 will be added as they land), and prints whether the
+outcome
 matches the design contract:
 
 - **Safe config (`tla/<module>/MC<MODULE>.cfg`)** — the correct
