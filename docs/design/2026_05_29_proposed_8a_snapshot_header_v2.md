@@ -142,16 +142,32 @@ mandatory routing index), an old v2 reader that ignores it would
 silently misroute / mis-initialize. Such fields require a new
 magic (`EKVTHLC3`), not a v2 payload extension. The discriminator
 in `ReadSnapshotHeader` is the gatekeeper for the "I do not
-understand this version" fail-closed branch (step 4 above).
+understand this version" fail-closed branch (see §3.2, step 4).
 
 ### 3.2 Read path
 
 `ReadSnapshotHeader` runs **once** at the top of `kv/fsm.go::Restore`
-before the inner-store payload is consumed. The reader takes
-ownership of a `bufio.Reader` wrapping the input stream and MUST
-pass the **same `bufio.Reader`** to the inner-store restore on the
-headerless-legacy branch — using the underlying `io.Reader` directly
-would lose the peeked bytes.
+before the inner-store payload is consumed.
+
+**API shape and `bufio.Reader` ownership (load-bearing).** The
+**caller** creates a `bufio.Reader` wrapping the input
+`io.Reader` and passes it as the single parameter:
+
+```go
+func ReadSnapshotHeader(r *bufio.Reader) (ceiling, cutover uint64, err error)
+```
+
+The caller MUST pass the **same `r`** to the inner-store restore
+call on **all branches** (v1, v2, and headerless-legacy) — not
+just headerless. The reason: `bufio.Reader` may have read more
+bytes from the underlying `io.Reader` than it returned to
+`ReadSnapshotHeader` (buffer fill is opportunistic); inner-store
+bytes can sit in the `bufio.Reader`'s internal buffer
+between header consumption and the inner-store read. If the
+caller switches to the original `io.Reader` after the header is
+parsed, those buffered bytes are silently lost. Always-pass-the-
+same-bufio.Reader keeps the byte stream contiguous regardless of
+branch.
 
 0. Peek up to 8 leading bytes via `bufio.Reader.Peek(8)`. **If the
    stream contains fewer than 8 bytes** (`Peek` returns
@@ -357,12 +373,15 @@ semantics change.
   practice, because a pre-8a binary cannot have applied
   `enable-raft-envelope` (which only exists once 6E ships, and 6E
   follows 8a's reader). If an operator manually constructed a v2
-  snapshot for a pre-8a binary, the pre-8a reader would fall into
-  the headerless-legacy branch (no `EKVTHLC1` match), pass the
-  whole stream to the inner store, and fail to parse the inner
-  payload because the v2 header is unexpected bytes. This is a
-  loud failure, not silent corruption — acceptable for a
-  hand-rolled scenario.
+  snapshot for a pre-8a binary, the pre-8a reader would not match
+  `EKVTHLC1` and would fall through to its legacy path — passing
+  the whole stream (including the unexpected `EKVTHLC2` header
+  bytes) to the inner store, which then fails to parse the inner
+  payload. This is a loud failure, not silent corruption —
+  acceptable for a hand-rolled scenario. (Note: pre-8a code has no
+  "unknown `EKVTHLC*` magic" branch, so the `EKVTHLC` prefix in
+  `EKVTHLC2` does not trigger a typed error there. The fail-closed
+  guarantee in §3.2 step 4 is a property of the 8a reader only.)
 - **Post-8a binary reading a v1 snapshot**: byte-for-byte
   compatible. No change in behavior.
 - **Post-8a binary reading a v2 snapshot**: the steady state once
