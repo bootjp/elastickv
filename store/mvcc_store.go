@@ -469,18 +469,17 @@ func (s *mvccStore) LatestCommitTS(_ context.Context, key []byte) (uint64, bool,
 // search for the exact timestamp answers the one-phase idempotency probe.
 // A tombstone counts as present (the previous attempt committed a delete),
 // matching the pebbleStore semantics.
+//
+// No retention guard is enforced here (codex P1 round-11): see pebbleStore
+// CommittedVersionAt for the determinism rationale. The retention guard was
+// added in round-10 to mirror GetAt semantics, but for the exact-TS probe
+// used by FSM apply dedup it produced split-brain when replicas had
+// diverging local minRetainedTS — some surface ErrReadTSCompacted, others
+// see the version. Returning the raw existence answer is deterministic for
+// single-version-per-key write sets (the option-2 use case).
 func (s *mvccStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-
-	// Match pebbleStore semantics (codex P2): a probe below the retention
-	// watermark cannot distinguish "never landed" from "reclaimed", and a
-	// silent false would steer the option-2 dedup into the wrong reconstruction
-	// branch. Surface the case so callers (FSM, adapter) can fall back rather
-	// than trust the answer.
-	if readTSCompacted(commitTS, s.minRetainedTS) {
-		return false, ErrReadTSCompacted
-	}
 	v, ok := s.tree.Get(key)
 	if !ok {
 		return false, nil

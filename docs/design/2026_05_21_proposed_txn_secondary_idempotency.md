@@ -710,6 +710,37 @@ flakiness, tracked separately from the correctness fix.
   the adapter received `errNotLeader`) maps to outcome 1: E1 applies
   first, the exact-ts probe hits, E2 no-ops.
 
+- **FSM probe determinism — retention guard reverted (2026-05-30, round-11).**
+  Round-10 surfaced `ErrReadTSCompacted` from `CommittedVersionAt` when
+  the probed `commit_ts` fell below `minRetainedTS`, mirroring
+  `GetAt`/`ExistsAt` semantics (codex P2 round-10). Codex P1 round-11
+  correctly flagged that branching the FSM dedup decision on this signal
+  is non-deterministic across raft replicas: FSM compaction advances
+  `minRetainedTS` from local wall clock and per-replica scheduler
+  (`kv/compactor.go:safeMinTS` uses `time.Now()`), so two replicas
+  applying the same log entry at the same log index can return different
+  probe outcomes — one falls through and applies at the fresh
+  `commit_ts`, the other no-ops, leaving diverging MVCC histories.
+
+  The fix reverts the retention guard inside `CommittedVersionAt`. The
+  probe is now a single `pebble.Get` (or sorted-slice lookup for the
+  in-memory store) and never returns `ErrReadTSCompacted`. For the
+  option-2 use case this is deterministic across replicas: every
+  per-element key carries at most one MVCC version (`elem:N -> value`
+  appended by attempt 1), so physical pebble compaction does not remove
+  it — there is no superseding version to retire. The cluster-wide
+  invariant `retentionWindow > max(adapter retry latency)` keeps the
+  rare "real never-landed retry below the compacted floor" case out of
+  reach in practice; future work can replace the invariant with a
+  separate replicated commit-ts log if option 2 needs to support
+  arbitrary key shapes.
+
+  `ErrReadTSCompacted` continues to surface from `GetAt`, `ScanAt`,
+  `RawGetAt`, `RawScanAt` for genuine historical-read callers (gRPC
+  adapter, S3 adapter, dualwrite proxy) where the guard expresses the
+  truthful answer "the value at this timestamp is no longer
+  recoverable".
+
 ## Decision log
 
 - (2026-05-21) initial proposal; open for review.

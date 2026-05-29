@@ -496,28 +496,23 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// duplicate (the very :duplicate-elements anomaly), so no-op the whole
 	// apply and let the adapter reconstruct the prior result.
 	//
-	// This is race-free because it runs at this entry's deterministic apply
-	// point: by now the raft log order has already fixed the prior attempt's
-	// fate (committed at a lower index, or truncated and never applied), so
-	// every node computes the same probe result. See the design doc's
-	// "commit_ts reuse vs stale-ts ordering" argument.
-	if meta.PrevCommitTS != 0 {
-		landed, perr := f.store.CommittedVersionAt(ctx, meta.PrimaryKey, meta.PrevCommitTS)
-		switch {
-		case perr == nil && landed:
-			return nil
-		case perr == nil:
-			// fall through to apply normally
-		case errors.Is(perr, store.ErrReadTSCompacted):
-			// The prior attempt's commit_ts is below the retention watermark
-			// so we cannot tell "didn't land" from "reclaimed" (codex P2).
-			// Fall through to apply normally: a stale extra delta is a
-			// strict improvement over either a wrong no-op (would drop the
-			// retry's data forever) or a hard apply failure (would crash
-			// every replica deterministically on a benign condition).
-		default:
-			return errors.WithStack(perr)
-		}
+	// Determinism note (codex P1 round-11): the underlying CommittedVersionAt
+	// intentionally does NOT enforce the retention watermark — branching FSM
+	// apply on the per-replica minRetainedTS would let replicas with stale
+	// retention surface ErrReadTSCompacted and skip dedup while replicas that
+	// still retain the previous version no-op, producing split-brain. The
+	// store's probe returns the raw pebble.Get answer; for the option-2 use
+	// case (per-element keys, single MVCC version each) physical compaction
+	// does not remove the version, so the probe is identical on every replica
+	// applying this log entry. The retention-window > max-retry-latency
+	// invariant prevents the rare case where a real never-landed retry
+	// arrives with PrevCommitTS below pebble's compacted floor.
+	dedup, err := f.dedupProbeOnePhase(ctx, meta)
+	if err != nil {
+		return err
+	}
+	if dedup {
+		return nil
 	}
 
 	uniq, err := uniqueMutations(muts)
@@ -530,6 +525,25 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return err
 	}
 	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, r.ReadKeys, startTS, commitTS))
+}
+
+// dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
+// because the entry is a retry whose prior attempt already landed. Extracted
+// to keep handleOnePhaseTxnRequest under the cyclop budget; the determinism
+// rationale lives at the call site.
+//
+// Returns (true, nil) → the entry must no-op (prior attempt landed).
+// Returns (false, nil) → fall through to normal apply.
+// Returns (false, err) → propagate err; apply must not proceed.
+func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, error) {
+	if meta.PrevCommitTS == 0 {
+		return false, nil
+	}
+	landed, err := f.store.CommittedVersionAt(ctx, meta.PrimaryKey, meta.PrevCommitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return landed, nil
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {

@@ -3259,8 +3259,7 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 		Elems:        pending.ops,
 	})
 	if dispErr == nil {
-		length, rerr := r.resolveReuseLength(ctx, key, pending)
-		return length, false, rerr
+		return r.resolveReuseLength(ctx, key, pending), false, nil
 	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		// Self-inflicted-conflict guard (codex P1): the apply might have
@@ -3271,12 +3270,21 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 		// our just-attempted commit_ts land? If yes, this conflict is
 		// against our own commit — return success and keep pending pointing
 		// at THIS commit_ts so any subsequent retry probes the right point.
+		//
+		// Length resolution (codex P2 round-11): pending.length was computed
+		// during the prior attempt and is stale w.r.t. any non-conflicting
+		// list-modifying writes that landed between attempt 1 and this fresh
+		// apply. Probing pending.commitTS would hit for the fresh apply and
+		// (under the old resolveReuseLength shortcut) silently return the
+		// prior-attempt length — understating the count. Always re-read meta
+		// in the self-conflict path. resolveListMeta failure falls back to
+		// pending.length to honor codex P2 round-10 ("avoid failing after a
+		// reuse apply").
 		if probeKey := firstWriteKey(pending.ops); len(probeKey) > 0 {
 			landed, perr := r.store.CommittedVersionAt(ctx, probeKey, commitTS)
 			if perr == nil && landed {
 				pending.commitTS = commitTS
-				length, lerr := r.resolveReuseLength(ctx, key, pending)
-				return length, false, lerr
+				return r.resolveLengthAfterFreshApply(ctx, key, pending), false, nil
 			}
 		}
 		// Our attempt did not land at commitTS and the target seq is taken
@@ -3308,34 +3316,46 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 //
 // Failure modes are converted to a degraded return (pending.length) rather
 // than surfaced as an error, because the dispatch already committed. Per
-// codex P2 "avoid failing after a reuse apply", reporting a write error
-// after the apply landed drives the client into a retry that has no
-// pending state and would re-append the element — the very anomaly this
-// feature prevents. Specifically:
-//   - probe ErrReadTSCompacted (commit_ts below retention watermark):
-//     cannot tell landed-vs-reclaimed; fall back to pending.length.
-//   - probe error of any other kind: prefer pending.length over failure.
+// codex P2 round-10 ("avoid failing after a reuse apply"), reporting a
+// write error after the apply landed drives the client into a retry that
+// has no pending state and would re-append the element — the very anomaly
+// this feature prevents. Specifically:
+//   - probe error of any kind: prefer pending.length over failure.
 //   - resolveListMeta failure (e.g. delta scan over MaxDeltaScanLimit
 //     under churn): fall back to pending.length.
-func (r *RedisServer) resolveReuseLength(ctx context.Context, key []byte, pending *reusableListPush) (int64, error) {
+//
+// Returns int64 directly (no error) so callers do not have to invent
+// caller-side fallback logic; the degraded-return contract is fixed here
+// (golangci unparam / nilerr fix on the prior error-returning shape).
+func (r *RedisServer) resolveReuseLength(ctx context.Context, key []byte, pending *reusableListPush) int64 {
 	if probeKey := firstWriteKey(pending.ops); len(probeKey) > 0 {
 		hit, perr := r.store.CommittedVersionAt(ctx, probeKey, pending.commitTS)
-		switch {
-		case perr == nil && hit:
-			return pending.length, nil
-		case perr == nil:
-			// fall through to the meta re-read
-		default:
-			// Probe inconclusive (compacted history or any other read error);
-			// the dispatch already committed, so degrade gracefully.
-			return pending.length, nil
+		if perr == nil && hit {
+			return pending.length
 		}
+		if perr != nil {
+			// Probe failed; the dispatch already committed so degrade
+			// gracefully rather than propagate the read error.
+			return pending.length
+		}
+		// perr == nil && !hit: prior attempt didn't land at this ts; the
+		// FSM applied fresh writes, fall through to re-read meta.
 	}
+	return r.resolveLengthAfterFreshApply(ctx, key, pending)
+}
+
+// resolveLengthAfterFreshApply re-reads list meta to capture the post-apply
+// length when we know the fresh commitTS applied (no probe shortcut), with
+// the same fall-back-to-pending.length contract as resolveReuseLength. Used
+// by the self-conflict path (codex P2 round-11): there pending.length is
+// stale w.r.t. intervening non-conflicting writes, so the probe-hit
+// shortcut would silently understate the count.
+func (r *RedisServer) resolveLengthAfterFreshApply(ctx context.Context, key []byte, pending *reusableListPush) int64 {
 	currentMeta, _, mErr := r.resolveListMeta(ctx, key, r.readTS())
 	if mErr != nil {
-		return pending.length, nil
+		return pending.length
 	}
-	return currentMeta.Len, nil
+	return currentMeta.Len
 }
 
 // firstWriteKey returns the first non-empty element key from ops, or nil
