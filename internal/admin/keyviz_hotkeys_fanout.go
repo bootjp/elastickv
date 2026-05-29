@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bootjp/elastickv/keyviz"
 	pkgerrors "github.com/cockroachdb/errors"
 )
 
@@ -261,7 +262,19 @@ func buildKeyVizHotKeysPeerURL(peer string, params hotKeysParams) (string, error
 		q.Set("sub_bucket", strconv.Itoa(params.subBucket))
 	}
 	q.Set("series", params.series)
-	q.Set("top", strconv.Itoa(params.top))
+	// Always request the per-route sketch ceiling from each peer
+	// instead of forwarding the operator's `top`. Forwarding `top`
+	// would have each peer truncate to its own top-K before merge,
+	// hiding a key whose true cluster-wide rank is high but whose
+	// per-peer rank falls below the requested cut. Example
+	// (top=1):
+	//   peer A: x=100, z=99 (z hidden)
+	//   peer B: z=99
+	//   merge would report x=100 even though z's cluster total is
+	//   198. Requesting MaxHotKeysPerRoute pulls every locally
+	//   tracked candidate so the merger can compute the correct
+	//   sum-then-top-K (Codex P1 round-1).
+	q.Set("top", strconv.Itoa(keyviz.MaxHotKeysPerRoute))
 	if params.fromUnixMs != 0 {
 		q.Set("from_unix_ms", strconv.FormatInt(params.fromUnixMs, 10))
 	}
@@ -315,6 +328,12 @@ func mergeHotKeyResponses(responses []hotKeyResponse, params hotKeysParams) hotK
 		}
 	}
 	base := responses[0]
+	// Seed the MAX fields (SampleRate, SnapshotAt) from responses[0]
+	// so the fold loop below can stay uniform across all responses
+	// including index 0. The MAX comparisons against the seed are
+	// no-ops for index 0; for the SUM fields (SampledN,
+	// DroppedSamples, SkippedLongKeys, ErrorBound) the zero-init is
+	// the SUM identity and the loop folds responses[0] cleanly.
 	out := hotKeyResponse{
 		RouteID:     base.RouteID,
 		SubBucket:   base.SubBucket,

@@ -161,25 +161,25 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	snap := h.source.HotKeysSnapshot(params.routeID)
-	if snap == nil {
-		writeJSONError(w, http.StatusNotFound, "no_snapshot",
-			"no hot-keys snapshot is available for this route yet (it may be an aggregate, or no traffic has flushed since the feature was enabled)")
-		return
-	}
-
-	if errCode := h.checkSnapshotWindow(params, snap); errCode != "" {
-		writeJSONError(w, http.StatusBadRequest, errCode,
-			"requested time window does not overlap the current snapshot; v1 returns only the current keyvizStep window")
-		return
-	}
-
-	entries, errCode, errMsg := h.collectEntries(params, snap)
+	out, errStatus, errCode, errMsg := h.buildLocalResponse(r, params, snap)
 	if errCode != "" {
-		writeJSONError(w, http.StatusBadRequest, errCode, errMsg)
+		writeJSONError(w, errStatus, errCode, errMsg)
 		return
 	}
 
-	out := h.maybeFanout(r, params, buildHotKeysResponse(params, snap, entries))
+	out = h.maybeFanout(r, params, out)
+
+	// After fan-out, if no source (local OR any peer) produced data
+	// for this route, return the same 404 the single-node path would.
+	// Without this post-fan-out check, a route that exists on no node
+	// would 200 with empty keys instead of the documented 404, and
+	// the SPA's "no snapshot" branch would never fire.
+	if snap == nil && len(out.Keys) == 0 && out.SampledN == 0 {
+		writeJSONError(w, http.StatusNotFound, "no_snapshot",
+			"no hot-keys snapshot is available for this route on any node in the cluster")
+		return
+	}
+
 	h.audit(r, params, len(out.Keys), out.Degraded)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -279,6 +279,69 @@ func buildHotKeysResponse(p hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot, e
 			KeyB64: base64.StdEncoding.EncodeToString(e.Key),
 			Count:  e.Count * scale,
 		}
+	}
+	return out
+}
+
+// buildLocalResponse turns this node's snapshot (or its absence)
+// into a hotKeyResponse ready to feed into the fan-out merger.
+// Returns (response, errStatus, errCode, errMsg); errCode is "" on
+// success, non-empty when the caller must short-circuit with the
+// returned status (4xx).
+//
+// Three branches matter:
+//
+//   - snap != nil: run the existing pre-fan-out checks
+//     (checkSnapshotWindow / collectEntries) and return the populated
+//     local response.
+//   - snap == nil AND fan-out configured AND not a peer call:
+//     return an empty placeholder so the merger can overlay peer data
+//     — without this, a route that lives only on a peer would 404
+//     before the cluster was ever consulted (gemini HIGH).
+//   - snap == nil otherwise (no fan-out configured, OR this request
+//     is itself a peer fan-out call): 404 no_snapshot, same as the
+//     pre-PR shape; consulting peers would either be impossible or
+//     would recurse.
+//
+// The post-fan-out check in ServeHTTP downgrades back to 404 when
+// even peers had nothing, so a client never sees a "200 with empty
+// keys" body for a route that exists nowhere.
+func (h *KeyVizHotKeysHandler) buildLocalResponse(r *http.Request, params hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot) (hotKeyResponse, int, string, string) {
+	if snap == nil {
+		if h.fanout != nil && r.Header.Get(keyVizFanoutPeerHeader) == "" {
+			return emptyHotKeyResponse(params), 0, "", ""
+		}
+		return hotKeyResponse{}, http.StatusNotFound, "no_snapshot",
+			"no hot-keys snapshot is available for this route yet (it may be an aggregate, or no traffic has flushed since the feature was enabled)"
+	}
+	if errCode := h.checkSnapshotWindow(params, snap); errCode != "" {
+		return hotKeyResponse{}, http.StatusBadRequest, errCode,
+			"requested time window does not overlap the current snapshot; v1 returns only the current keyvizStep window"
+	}
+	entries, errCode, errMsg := h.collectEntries(params, snap)
+	if errCode != "" {
+		return hotKeyResponse{}, http.StatusBadRequest, errCode, errMsg
+	}
+	return buildHotKeysResponse(params, snap, entries), 0, "", ""
+}
+
+// emptyHotKeyResponse is the placeholder local response used when
+// this node has no snapshot for the requested route but the fan-out
+// is configured (so a peer may still have data). SnapshotAt stays
+// the zero value so the merger's MAX pick lets any peer's timestamp
+// win; SampleRate stays 0 so it never wins the MAX comparison; keys
+// is non-nil so the JSON encoder emits `keys: []` rather than `null`
+// even when no peer contributes either.
+func emptyHotKeyResponse(params hotKeysParams) hotKeyResponse {
+	out := hotKeyResponse{
+		RouteID:     params.routeID,
+		Series:      params.series,
+		Approximate: true,
+		Keys:        []hotKeyResponseEntry{},
+	}
+	if params.subBucketSet {
+		sb := params.subBucket
+		out.SubBucket = &sb
 	}
 	return out
 }
