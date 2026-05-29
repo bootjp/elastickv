@@ -478,13 +478,21 @@ func run() error {
 		return nil
 	})
 
+	// Stage 7c §3.1: build the encryption-aware
+	// MembershipChangeInterceptor here where the concrete
+	// *kv.ShardedCoordinator and *kv.ShardGroup are available. Returns
+	// nil when encryption is not wired (no StateCache or no default
+	// group), in which case raftadmin.Server skips the pre-step.
+	encryptionConfChangeInterceptor := newEncryptionPreRegister(
+		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, etcdraftengine.DeriveNodeID)
 	if err := startServers(serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, bootstrapServers: bootstrapServers,
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
-		keyvizSampler: sampler,
+		keyvizSampler:                   sampler,
+		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
 	}); err != nil {
 		return err
 	}
@@ -1060,6 +1068,13 @@ type serversInput struct {
 	// coordinator already has its own copy from
 	// `WithSampler(...)` higher up in run().
 	keyvizSampler *keyviz.MemSampler
+	// encryptionConfChangeInterceptor is the Stage 7c §3.1
+	// pre-register hook for raftadmin AddVoter/AddLearner.
+	// Constructed in run() where concrete *kv.ShardedCoordinator and
+	// *kv.ShardGroup are still in scope; nil when encryption is not
+	// wired or the cluster is not bootstrapped, in which case
+	// raftadmin.Server skips the pre-step.
+	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 }
 
 // startServers wires up the AdminServer, builds the runtime runner, and
@@ -1142,13 +1157,14 @@ func startServers(in serversInput) error {
 		// sqsPartitionObserver: the metrics registry's HT-FIFO
 		// partition counter observer. nil when --metricsAddress is
 		// empty (the adapter then no-ops the observe call).
-		sqsPartitionObserver: in.metricsRegistry.SQSPartitionObserver(),
-		metricsAddress:       *metricsAddr,
-		metricsToken:         *metricsToken,
-		pprofAddress:         *pprofAddr,
-		pprofToken:           *pprofToken,
-		metricsRegistry:      in.metricsRegistry,
-		roleStore:            roleStore,
+		sqsPartitionObserver:            in.metricsRegistry.SQSPartitionObserver(),
+		metricsAddress:                  *metricsAddr,
+		metricsToken:                    *metricsToken,
+		pprofAddress:                    *pprofAddr,
+		pprofToken:                      *pprofToken,
+		metricsRegistry:                 in.metricsRegistry,
+		roleStore:                       roleStore,
+		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
 	}
 	if err := runner.start(); err != nil {
 		return err
@@ -1482,6 +1498,7 @@ func startRaftServers(
 	adminServer *adapter.AdminServer,
 	adminGRPCOpts adminGRPCInterceptors,
 	forwardDeps adminForwardServerDeps,
+	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -1533,7 +1550,10 @@ func startRaftServers(
 		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath, enableMutators, rt.engine, encryptionCapabilityFanout)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
-		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
+		// Stage 7c §3.1: pass the encryption-aware pre-register hook
+		// (nil when encryption is not wired); raftadmin.Server invokes
+		// it before AddVoter/AddLearner propose the conf-change.
+		internalraftadmin.RegisterOperationalServicesWithInterceptor(ctx, gs, rt.engine, []string{"RawKV"}, confChangeInterceptor)
 		reflection.Register(gs)
 
 		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.address)
@@ -1772,36 +1792,37 @@ func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Gro
 }
 
 type runtimeServerRunner struct {
-	ctx             context.Context
-	lc              *net.ListenConfig
-	eg              *errgroup.Group
-	cancel          context.CancelFunc
-	runtimes        []*raftGroupRuntime
-	shardStore      *kv.ShardStore
-	coordinate      kv.Coordinator
-	distServer      *adapter.DistributionServer
-	adminServer     *adapter.AdminServer
-	adminGRPCOpts   adminGRPCInterceptors
-	redisAddress    string
-	leaderRedis     map[string]string
-	pubsubRelay     *adapter.RedisPubSubRelay
-	readTracker     *kv.ActiveTimestampTracker
-	dynamoAddress   string
-	leaderDynamo    map[string]string
-	s3Address       string
-	leaderS3        map[string]string
-	s3Region        string
-	s3CredsFile     string
-	s3PathStyleOnly bool
-	sqsAddress      string
-	leaderSQS       map[string]string
-	sqsRegion       string
-	sqsCredsFile    string
-	metricsAddress  string
-	metricsToken    string
-	pprofAddress    string
-	pprofToken      string
-	metricsRegistry *monitoring.Registry
+	ctx                             context.Context
+	lc                              *net.ListenConfig
+	eg                              *errgroup.Group
+	cancel                          context.CancelFunc
+	runtimes                        []*raftGroupRuntime
+	shardStore                      *kv.ShardStore
+	coordinate                      kv.Coordinator
+	distServer                      *adapter.DistributionServer
+	adminServer                     *adapter.AdminServer
+	adminGRPCOpts                   adminGRPCInterceptors
+	redisAddress                    string
+	leaderRedis                     map[string]string
+	pubsubRelay                     *adapter.RedisPubSubRelay
+	readTracker                     *kv.ActiveTimestampTracker
+	dynamoAddress                   string
+	leaderDynamo                    map[string]string
+	s3Address                       string
+	leaderS3                        map[string]string
+	s3Region                        string
+	s3CredsFile                     string
+	s3PathStyleOnly                 bool
+	sqsAddress                      string
+	leaderSQS                       map[string]string
+	sqsRegion                       string
+	sqsCredsFile                    string
+	metricsAddress                  string
+	metricsToken                    string
+	pprofAddress                    string
+	pprofToken                      string
+	metricsRegistry                 *monitoring.Registry
+	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 
 	// dynamoServer is populated by start() and made available to
 	// startAdminFromFlags in this package so the admin listener can
@@ -1894,6 +1915,7 @@ func (r *runtimeServerRunner) start() error {
 		r.adminServer,
 		r.adminGRPCOpts,
 		forwardDeps,
+		r.encryptionConfChangeInterceptor,
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
