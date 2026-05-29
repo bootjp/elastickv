@@ -81,16 +81,30 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
 	if err != nil {
 		return errors.Wrap(err, "7c pre-register: registry handle")
 	}
-	// Read-before-propose guard (design §3.1, claude round-2 BLOCKING
-	// on PR #868). Required because §4.1 case-2 fires ONLY when
-	// proposed_epoch > last_seen_epoch (strictly greater) — re-
-	// proposing epoch=0 against an existing (epoch=0) row hits case-3
-	// ErrLocalEpochRollback, not the idempotent case-2 path. The
-	// guard reads the row first; if it already exists for this exact
-	// FullNodeID at any epoch, skip the propose (idempotent retry).
-	// FullNodeID mismatch at the same uint16 truncation is the §6.1
-	// collision — return the typed error WITHOUT proposing so we do
-	// not trigger a case-4 halt apply.
+	// Read-before-propose guard (design §3.1). Two purposes:
+	//
+	//   1. LOAD-BEARING: catch §6.1 uint16 collisions (existing row
+	//      under the same NodeID16 but a different FullNodeID) at
+	//      the RPC layer and return the typed
+	//      ErrWriterUint16Collision WITHOUT proposing. Without the
+	//      guard, the propose would commit and the apply would hit
+	//      §4.1 case-4 (different FullNodeID at same uint16) → halt
+	//      apply on a durable conf-change entry. This is the
+	//      irrecoverable scenario 7c exists to prevent.
+	//
+	//   2. OPTIMIZATION: skip a redundant Raft round-trip on a
+	//      same-FullNodeID retry (e.g. leader-flip mid-step). The
+	//      FSM would safely no-op via §4.1 case-2-idempotent
+	//      (proposed_epoch=0 == last_seen_epoch=0 → return nil; see
+	//      applier.go:526), so re-proposing is not unsafe — just
+	//      wasteful. (An earlier comment claimed case-3
+	//      ErrLocalEpochRollback fired on the retry path, which was
+	//      wrong: case-3 requires strictly less than; corrected in
+	//      claude round-3 on PR #872.)
+	//
+	// Branches: existing row + matching FullNodeID → nil (idempotent
+	// skip); existing row + FullNodeID mismatch →
+	// ErrWriterUint16Collision; no row → fall through to propose.
 	existing, exists, err := reg.GetRegistryRow(encryption.RegistryKey(activeDEK, encryption.NodeID16(newNodeFullID)))
 	if err != nil {
 		return errors.Wrap(err, "7c pre-register: read registry row")
