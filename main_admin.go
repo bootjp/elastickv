@@ -1102,20 +1102,21 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		return nil, errors.Wrap(err, "open embedded admin SPA")
 	}
 	server, err := admin.NewServer(admin.ServerDeps{
-		Signer:        signer,
-		Verifier:      verifier,
-		Credentials:   admin.MapCredentialStore(creds),
-		Roles:         adminCfg.RoleIndex(),
-		ClusterInfo:   cluster,
-		Tables:        tables,
-		Buckets:       buckets,
-		Queues:        queues,
-		Forwarder:     forwarder,
-		KeyViz:        keyvizSourceFromSampler(keyvizSampler),
-		KeyVizFanout:  buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
-		KeyVizHotKeys: keyvizHotKeysSourceFromSampler(keyvizSampler),
-		StaticFS:      staticFS,
-		LeaderProbe:   leaderProbe,
+		Signer:              signer,
+		Verifier:            verifier,
+		Credentials:         admin.MapCredentialStore(creds),
+		Roles:               adminCfg.RoleIndex(),
+		ClusterInfo:         cluster,
+		Tables:              tables,
+		Buckets:             buckets,
+		Queues:              queues,
+		Forwarder:           forwarder,
+		KeyViz:              keyvizSourceFromSampler(keyvizSampler),
+		KeyVizFanout:        buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
+		KeyVizHotKeys:       keyvizHotKeysSourceFromSampler(keyvizSampler),
+		KeyVizHotKeysFanout: buildKeyVizHotKeysFanout(adminCfg.Listen, keyvizFanoutCfg),
+		StaticFS:            staticFS,
+		LeaderProbe:         leaderProbe,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
@@ -1301,6 +1302,33 @@ func buildKeyVizFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizF
 		f = f.WithTimeout(cfg.Timeout)
 	}
 	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.fanout")))
+}
+
+// buildKeyVizHotKeysFanout is the hot-keys companion of
+// buildKeyVizFanout: same peer-list reuse, same self-filter rule.
+// Returns nil when no peers remain after filtering (single-node
+// hot-keys behaviour preserved). Operators get the cluster-wide
+// drill-down for free by leaving --keyvizFanoutNodes set — no
+// separate flag, matching design §6.
+func buildKeyVizHotKeysFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizHotKeysFanout {
+	if len(cfg.Nodes) == 0 {
+		return nil
+	}
+	peers := make([]string, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		if isSelfFanoutNode(selfListen, n) {
+			continue
+		}
+		peers = append(peers, n)
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	f := admin.NewKeyVizHotKeysFanout(selfListen, peers)
+	if cfg.Timeout > 0 {
+		f = f.WithTimeout(cfg.Timeout)
+	}
+	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.hotkeys.fanout")))
 }
 
 // isSelfFanoutNode returns true when n names this node's own admin

@@ -44,6 +44,12 @@ type KeyVizHotKeysHandler struct {
 	snapshotWindow time.Duration
 	now            func() time.Time
 	logger         *slog.Logger
+	// fanout is non-nil when the operator configured
+	// --keyvizFanoutNodes and the local node has at least one peer
+	// (after self-filtering). When set, ServeHTTP runs the per-peer
+	// fan-out after building the local response and replaces the
+	// reply with the merged cluster-wide view (design §6).
+	fanout *KeyVizHotKeysFanout
 }
 
 func NewKeyVizHotKeysHandler(source KeyVizHotKeysSource) *KeyVizHotKeysHandler {
@@ -86,6 +92,16 @@ func (h *KeyVizHotKeysHandler) WithSnapshotWindow(d time.Duration) *KeyVizHotKey
 	return h
 }
 
+// WithFanout enables cluster-wide aggregation (design §6). When the
+// supplied fan-out is non-nil the handler also gates on the
+// keyVizFanoutPeerHeader on the inbound request so a peer-originated
+// fan-out call does not recursively fan out (matches the matrix
+// fan-out's anti-recursion semantics in keyviz_handler.go).
+func (h *KeyVizHotKeysHandler) WithFanout(f *KeyVizHotKeysFanout) *KeyVizHotKeysHandler {
+	h.fanout = f
+	return h
+}
+
 const (
 	hotKeysDefaultTop  = 20
 	hotKeysMaxTopParam = 1024
@@ -109,6 +125,11 @@ type hotKeyResponse struct {
 	Degraded        bool                  `json:"degraded"`
 	ErrorBound      uint64                `json:"error_bound"`
 	SnapshotAt      time.Time             `json:"snapshot_at"`
+	// Fanout is set when the handler aggregated peer responses (Phase
+	// 2-A++ §6). Absent when fan-out is not configured or when the
+	// request itself originated from another node's aggregator (the
+	// X-Admin-Fanout-Peer header suppresses the recursive call).
+	Fanout *FanoutResult `json:"fanout,omitempty"`
 }
 
 type hotKeyResponseEntry struct {
@@ -121,44 +142,43 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET")
 		return
 	}
-	if h.source == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "keyviz_disabled",
-			"key visualizer sampler is not configured on this node")
-		return
-	}
-	enabled, capacity, _, _ := h.source.HotKeysOptions()
-	if !enabled {
-		writeJSONError(w, http.StatusServiceUnavailable, "hotkeys_disabled",
-			"hot-keys drill-down is not enabled on this node (--keyvizHotKeysEnabled)")
-		return
-	}
-
-	params, err := parseHotKeysParams(r, capacity)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid_query", err.Error())
-		return
-	}
-
-	snap := h.source.HotKeysSnapshot(params.routeID)
-	if snap == nil {
-		writeJSONError(w, http.StatusNotFound, "no_snapshot",
-			"no hot-keys snapshot is available for this route yet (it may be an aggregate, or no traffic has flushed since the feature was enabled)")
-		return
-	}
-
-	if errCode := h.checkSnapshotWindow(params, snap); errCode != "" {
-		writeJSONError(w, http.StatusBadRequest, errCode,
-			"requested time window does not overlap the current snapshot; v1 returns only the current keyvizStep window")
-		return
-	}
-
-	entries, errCode, errMsg := h.collectEntries(params, snap)
+	params, enabled, errStatus, errCode, errMsg := h.prepareRequest(r)
 	if errCode != "" {
-		writeJSONError(w, http.StatusBadRequest, errCode, errMsg)
+		writeJSONError(w, errStatus, errCode, errMsg)
+		return
+	}
+	// Skip the snapshot lookup entirely when local hot-keys are off.
+	// The sampler would return nil anyway, but the explicit guard
+	// makes the !enabled+fanout intent visible at the call site.
+	var snap *keyviz.KeyvizHotKeysSnapshot
+	if enabled {
+		snap = h.source.HotKeysSnapshot(params.routeID)
+	}
+	out, errStatus, errCode, errMsg := h.buildLocalResponse(r, params, snap)
+	if errCode != "" {
+		writeJSONError(w, errStatus, errCode, errMsg)
 		return
 	}
 
-	out := buildHotKeysResponse(params, snap, entries)
+	out = h.maybeFanout(r, params, out)
+
+	// After fan-out, decide whether to 404 by asking "did ANY node
+	// publish a snapshot for this route?". The merger sets
+	// out.SnapshotAt to the MAX across all responses, so a non-zero
+	// value means at least one source (local or a peer) had a valid
+	// snapshot — even one with empty Keys and SampledN=0 (a tracked
+	// route that happens to be quiet in the latest window). The old
+	// `len(Keys)==0 && SampledN==0` check would have downgraded that
+	// to 404, contradicting the single-node path which returns 200
+	// with an empty body when snap is non-nil but quiet (codex P2
+	// round-4). Use IsZero so a non-empty-but-empty-keys peer reply
+	// is preserved.
+	if snap == nil && out.SnapshotAt.IsZero() {
+		writeJSONError(w, http.StatusNotFound, "no_snapshot",
+			"no hot-keys snapshot is available for this route on any node in the cluster")
+		return
+	}
+
 	h.audit(r, params, len(out.Keys), out.Degraded)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -260,6 +280,142 @@ func buildHotKeysResponse(p hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot, e
 		}
 	}
 	return out
+}
+
+// prepareRequest runs the prelude shared by every ServeHTTP path:
+// validate the sampler is configured, parse query params, and decide
+// whether this node should short-circuit with 503 or continue (with
+// or without a local snapshot) into the fan-out merge.
+//
+// Returns (params, enabled, status, code, msg). When code != "" the
+// caller must writeJSONError(status, code, msg) and return without
+// further processing. When code == "" the caller proceeds with the
+// returned params and `enabled` flag (the latter gates the snapshot
+// lookup).
+//
+// The mixed-K decision (codex P2 round-3): when local hot-keys are
+// off but the operator wired a fan-out peer list AND this request
+// is operator-originated (no peer header), the local non-sampling
+// contribution is omitted and the request continues to fan out.
+// 503 hotkeys_disabled is only emitted when there is no peer set
+// to consult — single-node, OR this request is itself a peer call
+// where recursing would defeat the anti-recursion guard.
+func (h *KeyVizHotKeysHandler) prepareRequest(r *http.Request) (hotKeysParams, bool, int, string, string) {
+	if h.source == nil {
+		return hotKeysParams{}, false, http.StatusServiceUnavailable, "keyviz_disabled",
+			"key visualizer sampler is not configured on this node"
+	}
+	enabled, capacity, _, _ := h.source.HotKeysOptions()
+	canFanout := h.fanout != nil && r.Header.Get(keyVizFanoutPeerHeader) == ""
+	if !enabled && !canFanout {
+		return hotKeysParams{}, false, http.StatusServiceUnavailable, "hotkeys_disabled",
+			"hot-keys drill-down is not enabled on this node (--keyvizHotKeysEnabled)"
+	}
+	// parseHotKeysParams clamps `top` to `capacity` when capacity > 0.
+	// In the mixed-K !enabled+canFanout path the local HotKeysOptions
+	// reports capacity=0 (sampler not wired), which would leave `top`
+	// effectively unclamped. Use MaxHotKeysPerRoute as the safety bound
+	// so a runaway client cannot ask for billions of keys; the merger's
+	// final truncation still applies the operator's top.
+	if capacity <= 0 {
+		capacity = keyviz.MaxHotKeysPerRoute
+	}
+	params, err := parseHotKeysParams(r, capacity)
+	if err != nil {
+		return params, enabled, http.StatusBadRequest, "invalid_query", err.Error()
+	}
+	return params, enabled, 0, "", ""
+}
+
+// buildLocalResponse turns this node's snapshot (or its absence)
+// into a hotKeyResponse ready to feed into the fan-out merger.
+// Returns (response, errStatus, errCode, errMsg); errCode is "" on
+// success, non-empty when the caller must short-circuit with the
+// returned status (4xx).
+//
+// Three branches matter:
+//
+//   - snap != nil: run the existing pre-fan-out checks
+//     (checkSnapshotWindow / collectEntries) and return the populated
+//     local response.
+//   - snap == nil AND fan-out configured AND not a peer call:
+//     return an empty placeholder so the merger can overlay peer data
+//     — without this, a route that lives only on a peer would 404
+//     before the cluster was ever consulted (gemini HIGH).
+//   - snap == nil otherwise (no fan-out configured, OR this request
+//     is itself a peer fan-out call): 404 no_snapshot, same as the
+//     pre-PR shape; consulting peers would either be impossible or
+//     would recurse.
+//
+// The post-fan-out check in ServeHTTP downgrades back to 404 when
+// even peers had nothing, so a client never sees a "200 with empty
+// keys" body for a route that exists nowhere.
+func (h *KeyVizHotKeysHandler) buildLocalResponse(r *http.Request, params hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot) (hotKeyResponse, int, string, string) {
+	if snap == nil {
+		if h.fanout != nil && r.Header.Get(keyVizFanoutPeerHeader) == "" {
+			return emptyHotKeyResponse(params), 0, "", ""
+		}
+		return hotKeyResponse{}, http.StatusNotFound, "no_snapshot",
+			"no hot-keys snapshot is available for this route yet (it may be an aggregate, or no traffic has flushed since the feature was enabled)"
+	}
+	if errCode := h.checkSnapshotWindow(params, snap); errCode != "" {
+		return hotKeyResponse{}, http.StatusBadRequest, errCode,
+			"requested time window does not overlap the current snapshot; v1 returns only the current keyvizStep window"
+	}
+	// When fan-out will run after this call, defer the operator's
+	// `top` truncation to the merger. Symmetric with the peer-URL
+	// fix: a peer returns every locally tracked candidate so the
+	// merger can compute the correct sum-then-top-K; the local
+	// contribution must do the same. Otherwise, a key whose true
+	// cluster rank is high but whose per-node rank falls below `top`
+	// is dropped by this side's pre-truncation before the merge ever
+	// sees it. Example (top=1): local x=100,z=99; peer z=99. With
+	// local pre-truncation, merge sees only x locally → reports
+	// x=100 even though z's cluster total is 198 (Codex P1 round-2).
+	localParams := params
+	if h.fanout != nil && r.Header.Get(keyVizFanoutPeerHeader) == "" {
+		localParams.top = keyviz.MaxHotKeysPerRoute
+	}
+	entries, errCode, errMsg := h.collectEntries(localParams, snap)
+	if errCode != "" {
+		return hotKeyResponse{}, http.StatusBadRequest, errCode, errMsg
+	}
+	return buildHotKeysResponse(params, snap, entries), 0, "", ""
+}
+
+// emptyHotKeyResponse is the placeholder local response used when
+// this node has no snapshot for the requested route but the fan-out
+// is configured (so a peer may still have data). SnapshotAt stays
+// the zero value so the merger's MAX pick lets any peer's timestamp
+// win; SampleRate stays 0 so it never wins the MAX comparison; keys
+// is non-nil so the JSON encoder emits `keys: []` rather than `null`
+// even when no peer contributes either.
+func emptyHotKeyResponse(params hotKeysParams) hotKeyResponse {
+	out := hotKeyResponse{
+		RouteID:     params.routeID,
+		Series:      params.series,
+		Approximate: true,
+		Keys:        []hotKeyResponseEntry{},
+	}
+	if params.subBucketSet {
+		sb := params.subBucket
+		out.SubBucket = &sb
+	}
+	return out
+}
+
+// maybeFanout runs the configured fan-out aggregator iff this
+// request is the operator-originated entry point (no peer header).
+// Returning early when no fan-out is configured (or when the request
+// is itself a peer call) keeps ServeHTTP within the cyclop limit
+// while preserving the design §6 anti-recursion rule. Forwarding the
+// inbound cookies lets each peer's SessionAuth see a valid
+// principal; nil cookies surface as ok=false in the per-node status.
+func (h *KeyVizHotKeysHandler) maybeFanout(r *http.Request, params hotKeysParams, out hotKeyResponse) hotKeyResponse {
+	if h.fanout == nil || r.Header.Get(keyVizFanoutPeerHeader) != "" {
+		return out
+	}
+	return h.fanout.Run(r.Context(), params, out, r.Cookies())
 }
 
 // scaledErrorBound is sample_rate × sampled_n / m, in scaled
