@@ -13,7 +13,7 @@ run it without touching anything under the Go source tree.
 |---|---|---|
 | M1 | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla`, `make tla-check` | Landed |
 | M2 | `occ/OCC.tla` (safety invariants OCC-1..OCC-5) | Landed |
-| M3 | `mvcc/MVCC.tla` (MVCC-1..MVCC-4) | Not started |
+| M3 | `mvcc/MVCC.tla` (MVCC-1 + MVCC-4; MVCC-2 / MVCC-3 deferred to M5) | Landed |
 | M4 | `routes/Routes.tla` (Routes-1..Routes-4) | Not started |
 | M5 | `composed/Composed.tla` + CI integration | Not started |
 | M6 | Liveness checking (`tla-check-deep`) | Not started |
@@ -158,6 +158,47 @@ Invariants asserted:
 TLC model-check instance for OCC.  Same one-module / two-config layout
 as MCHLC.  The gap config disables the OCC-1 commit guard; TLC
 produces an `OCC1_CommitTsAboveStart` counterexample at depth ≈ 5.
+
+### `mvcc/MVCC.tla`
+The MVCC layer.  Single-node model of a per-key version chain
+(`versions[k]`) with a `Compact` action that drains older versions
+to bound storage growth.  Carries a ghost variable
+`originalVersions[k]` that records every version ever written and
+is never pruned — MVCC-4 compares the two to assert that no
+committed entry has been lost across compaction.  HLC is abstracted
+to a single monotonic counter (`tsCounter`); M5 (composed) will
+INSTANCE `HLC.tla` for the real 48/16 layout.  The `EnableSafety`
+CONSTANT gates the per-key "retain the latest commit_ts below the
+new minRetained" rule inside `Compact` — under the gap config that
+guard is removed and TLC surfaces a `MVCC-4` counterexample where a
+read at `read_ts ≥ minRetained` now misses a value the original log
+would have shown.
+
+MVCC-2 (no committed version below the HLC physical ceiling) and
+MVCC-3 (cross-node read consistency) are deferred to M5:
+
+- MVCC-2 is properly an HLC.tla property — the ceiling discipline
+  lives there.  M5 will integrate the modules and check the cross-
+  spec form.
+- MVCC-3 requires a multi-node model that the single-node M3 spec
+  cannot express.  M5 is the right place for it.
+
+Invariants asserted:
+
+| Invariant | Statement |
+|---|---|
+| `TypeOK` | Variable types are well-formed |
+| `MVCC1_VisibleVersionUnique` | No two distinct version records in `versions[k]` share a `commit_ts` |
+| `MVCC4_NoLostCommitOnSnapshotInstall` | For every key and every `read_ts ≥ minRetained`, the visible version in `versions[k]` equals the visible version in the ghost `originalVersions[k]` |
+| `MVCC_TsMonotonic` (PROPERTY) | Transition form: `tsCounter` weakly increases on every step |
+| `MVCC_GhostMonotonic` (PROPERTY) | Transition form: `originalVersions[k]` only grows; `Compact` leaves it `UNCHANGED` |
+
+### `mvcc/MCMVCC.tla` + `MCMVCC.cfg` / `MCMVCC_gap.cfg`
+TLC model-check instance for MVCC.  Same one-module / two-config
+layout as MCHLC and MCOCC.  The gap config disables the retention
+guard inside `Compact`; TLC produces a
+`MVCC4_NoLostCommitOnSnapshotInstall` counterexample at depth ≈ 3
+(one `Write`, one `Compact(newMin > commit_ts)`).
 
 ## How to interpret a TLC failure
 

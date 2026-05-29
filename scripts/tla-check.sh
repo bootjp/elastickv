@@ -25,14 +25,15 @@ if [ ! -f "$TLA_JAR" ]; then
 fi
 
 # Modules to check, in dependency order (libs before consumers).
-TLA_MODULES=( "hlc" "occ" )
+TLA_MODULES=( "hlc" "occ" "mvcc" )
 
 # The invariant the gap config is expected to break, per module.
 # These strings are matched against TLC stdout via grep -F (literal).
 gap_invariant_for() {
     case "$1" in
-        hlc) echo "Invariant HLC4_NoRegressionAcrossTerms is violated" ;;
-        occ) echo "Invariant OCC1_CommitTsAboveStart is violated" ;;
+        hlc)  echo "Invariant HLC4_NoRegressionAcrossTerms is violated" ;;
+        occ)  echo "Invariant OCC1_CommitTsAboveStart is violated" ;;
+        mvcc) echo "Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated" ;;
         *)
             echo "ERROR: no gap-invariant string registered for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
