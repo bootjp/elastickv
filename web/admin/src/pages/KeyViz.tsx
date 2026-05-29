@@ -763,15 +763,22 @@ function HotKeysErrorNotice({ error }: HotKeysErrorNoticeProps) {
     // (keyviz_hotkeys_handler.go): "keyviz_disabled" when the whole
     // sampler isn't configured, vs "hotkeys_disabled" when only
     // hot-keys is off. Pointing operators at the wrong flag wastes
-    // a restart, so branch on error.code.
-    const flag =
-      error.code === "keyviz_disabled"
-        ? "--keyvizEnabled (plus --keyvizHotKeysEnabled)"
-        : "--keyvizHotKeysEnabled";
+    // a restart, so branch on error.code. Render the flags in
+    // separate <code> elements so a long compound message doesn't
+    // read as if the parenthetical is part of the flag name.
+    if (error.code === "keyviz_disabled") {
+      return (
+        <p className="text-xs text-muted">
+          KeyViz sampling is disabled on this node. Start the server
+          with <code className="font-mono">--keyvizEnabled</code> and{" "}
+          <code className="font-mono">--keyvizHotKeysEnabled</code>.
+        </p>
+      );
+    }
     return (
       <p className="text-xs text-muted">
         Hot-key sampling is disabled on this node. Start the server
-        with <code className="font-mono">{flag}</code>.
+        with <code className="font-mono">--keyvizHotKeysEnabled</code>.
       </p>
     );
   }
