@@ -466,7 +466,7 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
-		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.ObservedRouteVersion)
 	} else {
 		resp, err = c.dispatchRaw(ctx, reqs.Elems)
 	}
@@ -832,7 +832,7 @@ func (c *Coordinate) resolveDispatchCommitTS(commitTS, startTS uint64) (uint64, 
 	return retry, nil
 }
 
-func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64, observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -857,7 +857,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	// path to fail early without a Raft round-trip, but the FSM check is
 	// the authoritative, serializable validation.
 	r, err := c.transactionManager.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primary, reqs, readKeys),
+		onePhaseTxnRequest(startTS, commitTS, primary, reqs, readKeys, observedRouteVersion),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1027,7 +1027,7 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 		commitTS = 0
 	}
 	return []*pb.Request{
-		onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys),
+		onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion),
 	}, nil
 }
 
@@ -1067,18 +1067,19 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	panic("unreachable")
 }
 
-func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte) *pb.Request {
+func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)
 	muts = append(muts, txnMetaMutation(primaryKey, 0, commitTS))
 	for _, req := range reqs {
 		muts = append(muts, elemToMutation(req))
 	}
 	return &pb.Request{
-		IsTxn:     true,
-		Phase:     pb.Phase_NONE,
-		Ts:        startTS,
-		Mutations: muts,
-		ReadKeys:  readKeys,
+		IsTxn:                true,
+		Phase:                pb.Phase_NONE,
+		Ts:                   startTS,
+		Mutations:            muts,
+		ReadKeys:             readKeys,
+		ObservedRouteVersion: observedRouteVersion,
 	}
 }
 
