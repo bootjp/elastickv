@@ -51,14 +51,15 @@
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
-    Keys,           \* finite set of keys
-    Groups,         \* finite set of Raft groups
-    TxnIds,         \* finite set of transactions
-    MaxVersions,    \* bound on catalog versions
-    MaxTs,          \* bound on the abstract HLC counter
-    MaxOps,         \* bound on total actions
-    InitGroup,      \* initial owning group of every key at version 0
-    EnableSafety    \* TRUE: encode Composed-1 commit guard; FALSE: gap config
+    Keys,                \* finite set of keys
+    Groups,              \* finite set of Raft groups
+    TxnIds,              \* finite set of transactions
+    MaxVersions,         \* bound on catalog versions
+    MaxTs,               \* bound on the abstract HLC counter
+    MaxOps,              \* bound on total actions
+    InitGroup,           \* initial owning group of every key at version 0
+    EnableSafety,        \* TRUE: encode Composed-1  commit guard (observed-version owner)
+    EnableCurrentFence   \* TRUE: encode Composed-1a commit guard (current-version owner)
 
 ASSUME InitGroup \in Groups
 
@@ -69,23 +70,33 @@ States == {"Idle", "Active", "Committed", "Aborted"}
 NoGroup == "no_group"
 
 VARIABLES
-    catalogVersion,   \* Nat.  Latest durable catalog version.
-    routes,           \* [0..MaxVersions -> [Keys -> Groups]].  Historical
-                      \* snapshot per version; v <= catalogVersion is real,
-                      \* v > catalogVersion is the init map.
-    tsCounter,        \* Nat.  Monotonic abstract HLC; advances on BeginTxn
-                      \* and Commit.
-    txnState,         \* [TxnIds -> States]
-    txnStartTs,       \* [TxnIds -> 0..MaxTs]
-    txnObservedVer,   \* [TxnIds -> 0..MaxVersions].  Catalog version this
-                      \* txn read at BeginTxn.
-    txnWriteSet,      \* [TxnIds -> SUBSET Keys]
-    txnCommitTs,      \* [TxnIds -> 0..MaxTs]
-    txnCommitGroup,   \* [TxnIds -> Groups \cup {NoGroup}]
+    catalogVersion,         \* Nat.  Latest durable catalog version.
+    routes,                 \* [0..MaxVersions -> [Keys -> Groups]].  Historical
+                            \* snapshot per version; v <= catalogVersion is real,
+                            \* v > catalogVersion is the init map.
+    tsCounter,              \* Nat.  Monotonic abstract HLC; advances on BeginTxn
+                            \* and Commit.
+    txnState,               \* [TxnIds -> States]
+    txnStartTs,             \* [TxnIds -> 0..MaxTs]
+    txnObservedVer,         \* [TxnIds -> 0..MaxVersions].  Catalog version this
+                            \* txn read at BeginTxn.
+    txnWriteSet,            \* [TxnIds -> SUBSET Keys]
+    txnCommitTs,            \* [TxnIds -> 0..MaxTs]
+    txnCommitGroup,         \* [TxnIds -> Groups \cup {NoGroup}]
+    currentVersionAtCommit, \* [TxnIds -> 0..MaxVersions].  Catalog version the
+                            \* FSM observed at apply time (i.e. when the commit
+                            \* lands).  Set on Commit; together with
+                            \* txnObservedVer this witnesses BOTH the spec's
+                            \* observed-version check and the apply-time
+                            \* current-version cross-version-read fence
+                            \* (Composed-1a; see docs/design/
+                            \* 2026_05_29_proposed_composed1_cross_group_commit_guard.md
+                            \* §4.4 and §5).
     opCount
 
 vars == <<catalogVersion, routes, tsCounter, txnState, txnStartTs,
-          txnObservedVer, txnWriteSet, txnCommitTs, txnCommitGroup, opCount>>
+          txnObservedVer, txnWriteSet, txnCommitTs, txnCommitGroup,
+          currentVersionAtCommit, opCount>>
 
 \* === HELPERS ===
 CommittedTxns == { t \in TxnIds : txnState[t] = "Committed" }
@@ -95,16 +106,17 @@ OwnerAt(v, k) == routes[v][k]
 
 \* === INIT ===
 Init ==
-    /\ catalogVersion = 0
-    /\ routes         = [v \in 0..MaxVersions |-> [k \in Keys |-> InitGroup]]
-    /\ tsCounter      = 0
-    /\ txnState       = [t \in TxnIds |-> "Idle"]
-    /\ txnStartTs     = [t \in TxnIds |-> 0]
-    /\ txnObservedVer = [t \in TxnIds |-> 0]
-    /\ txnWriteSet    = [t \in TxnIds |-> {}]
-    /\ txnCommitTs    = [t \in TxnIds |-> 0]
-    /\ txnCommitGroup = [t \in TxnIds |-> NoGroup]
-    /\ opCount        = 0
+    /\ catalogVersion         = 0
+    /\ routes                 = [v \in 0..MaxVersions |-> [k \in Keys |-> InitGroup]]
+    /\ tsCounter              = 0
+    /\ txnState               = [t \in TxnIds |-> "Idle"]
+    /\ txnStartTs             = [t \in TxnIds |-> 0]
+    /\ txnObservedVer         = [t \in TxnIds |-> 0]
+    /\ txnWriteSet            = [t \in TxnIds |-> {}]
+    /\ txnCommitTs            = [t \in TxnIds |-> 0]
+    /\ txnCommitGroup         = [t \in TxnIds |-> NoGroup]
+    /\ currentVersionAtCommit = [t \in TxnIds |-> 0]
+    /\ opCount                = 0
 
 \* === ACTIONS ===
 
@@ -126,7 +138,8 @@ ProposeRouteChange(k, g_new) ==
                     [routes[catalogVersion] EXCEPT ![k] = g_new]]
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<tsCounter, txnState, txnStartTs, txnObservedVer,
-                   txnWriteSet, txnCommitTs, txnCommitGroup>>
+                   txnWriteSet, txnCommitTs, txnCommitGroup,
+                   currentVersionAtCommit>>
 
 (***************************************************************************)
 (* BeginTxn(t): the txn enters Active state, allocates a fresh start_ts  *)
@@ -145,7 +158,7 @@ BeginTxn(t) ==
     /\ txnObservedVer' = [txnObservedVer EXCEPT ![t] = catalogVersion]
     /\ opCount'        = opCount + 1
     /\ UNCHANGED <<catalogVersion, routes, txnWriteSet, txnCommitTs,
-                   txnCommitGroup>>
+                   txnCommitGroup, currentVersionAtCommit>>
 
 (***************************************************************************)
 (* WriteIntent(t, k): buffer a write to k locally.  No lock or version is *)
@@ -160,7 +173,8 @@ WriteIntent(t, k) ==
     /\ txnWriteSet' = [txnWriteSet EXCEPT ![t] = @ \cup {k}]
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<catalogVersion, routes, tsCounter, txnState, txnStartTs,
-                   txnObservedVer, txnCommitTs, txnCommitGroup>>
+                   txnObservedVer, txnCommitTs, txnCommitGroup,
+                   currentVersionAtCommit>>
 
 (***************************************************************************)
 (* Commit(t, g): atomically commit t through Raft group g.  Allocates a   *)
@@ -180,12 +194,23 @@ WriteIntent(t, k) ==
 Commit(t, g) ==
     /\ txnState[t] = "Active"
     /\ tsCounter < MaxTs
+    \* Composed-1 — observed-version owner check (the spec-level
+    \* refinement of the design doc §4.2(a) check).
     /\ \/ ~EnableSafety
        \/ \A k \in txnWriteSet[t] : OwnerAt(txnObservedVer[t], k) = g
-    /\ tsCounter'       = tsCounter + 1
-    /\ txnState'        = [txnState       EXCEPT ![t] = "Committed"]
-    /\ txnCommitTs'     = [txnCommitTs    EXCEPT ![t] = tsCounter + 1]
-    /\ txnCommitGroup'  = [txnCommitGroup EXCEPT ![t] = g]
+    \* Composed-1a — current-version owner check (the apply-time
+    \* cross-version-read fence from design doc §4.4).  This is the
+    \* strictly stronger guard the implementation adds on top of the
+    \* spec's literal Commit predicate; it prevents the codex P1 trace
+    \* where the observed-version check passes but a later
+    \* ProposeRouteChange has moved the key off the committing group.
+    /\ \/ ~EnableCurrentFence
+       \/ \A k \in txnWriteSet[t] : OwnerAt(catalogVersion, k) = g
+    /\ tsCounter'               = tsCounter + 1
+    /\ txnState'                = [txnState               EXCEPT ![t] = "Committed"]
+    /\ txnCommitTs'             = [txnCommitTs            EXCEPT ![t] = tsCounter + 1]
+    /\ txnCommitGroup'          = [txnCommitGroup         EXCEPT ![t] = g]
+    /\ currentVersionAtCommit'  = [currentVersionAtCommit EXCEPT ![t] = catalogVersion]
     /\ UNCHANGED <<catalogVersion, routes, txnStartTs, txnObservedVer,
                    txnWriteSet, opCount>>
 
@@ -197,7 +222,7 @@ Abort(t) ==
     /\ txnState' = [txnState EXCEPT ![t] = "Aborted"]
     /\ UNCHANGED <<catalogVersion, routes, tsCounter, txnStartTs,
                    txnObservedVer, txnWriteSet, txnCommitTs, txnCommitGroup,
-                   opCount>>
+                   currentVersionAtCommit, opCount>>
 
 \* === NEXT ===
 Next ==
@@ -217,16 +242,17 @@ StateConstraint ==
 
 \* === TYPE INVARIANT ===
 TypeOK ==
-    /\ catalogVersion  \in 0..MaxVersions
-    /\ routes          \in [0..MaxVersions -> [Keys -> Groups]]
-    /\ tsCounter       \in 0..MaxTs
-    /\ txnState        \in [TxnIds -> States]
-    /\ txnStartTs      \in [TxnIds -> 0..MaxTs]
-    /\ txnObservedVer  \in [TxnIds -> 0..MaxVersions]
-    /\ txnWriteSet     \in [TxnIds -> SUBSET Keys]
-    /\ txnCommitTs     \in [TxnIds -> 0..MaxTs]
-    /\ txnCommitGroup  \in [TxnIds -> Groups \cup {NoGroup}]
-    /\ opCount         \in 0..MaxOps
+    /\ catalogVersion         \in 0..MaxVersions
+    /\ routes                 \in [0..MaxVersions -> [Keys -> Groups]]
+    /\ tsCounter              \in 0..MaxTs
+    /\ txnState               \in [TxnIds -> States]
+    /\ txnStartTs             \in [TxnIds -> 0..MaxTs]
+    /\ txnObservedVer         \in [TxnIds -> 0..MaxVersions]
+    /\ txnWriteSet            \in [TxnIds -> SUBSET Keys]
+    /\ txnCommitTs            \in [TxnIds -> 0..MaxTs]
+    /\ txnCommitGroup         \in [TxnIds -> Groups \cup {NoGroup}]
+    /\ currentVersionAtCommit \in [TxnIds -> 0..MaxVersions]
+    /\ opCount                \in 0..MaxOps
 
 \* === SAFETY INVARIANTS ===
 
@@ -264,6 +290,28 @@ Composed2_ReadAcrossSplitRange == TRUE
 Composed3_DistinctCommitTs ==
     \A t1, t2 \in CommittedTxns :
         t1 # t2 => txnCommitTs[t1] # txnCommitTs[t2]
+
+\* Composed-1a — current-version cross-version-read fence.  Strictly
+\* stronger than Composed-1: every committed write key must be owned
+\* by the committing group at the CURRENT catalog version observed by
+\* the FSM at apply time (currentVersionAtCommit[t]), not only at the
+\* version the txn pinned at BeginTxn (txnObservedVer[t]).
+\*
+\* This invariant captures the design doc §4.4 apply-time fence — the
+\* implementation-level guard that closes the codex P1 trace
+\* (observed-version check passes; ProposeRouteChange has moved the
+\* key off the committing group; future readers at the new version
+\* miss the write).  The Composed-1 spec predicate alone does NOT
+\* prevent this trace; Composed-1a is the spec-level witness for the
+\* implementation's additional fence.
+\*
+\* Gated by EnableCurrentFence in Commit: under the new
+\* MCComposed_currentfence_gap.cfg model TLC finds a 4-step
+\* counterexample where this invariant fails (the codex P1 trace).
+Composed1a_CommitToCurrentOwner ==
+    \A t \in CommittedTxns :
+        \A k \in txnWriteSet[t] :
+            OwnerAt(currentVersionAtCommit[t], k) = txnCommitGroup[t]
 
 \* === ACTION-LEVEL PROPERTIES ===
 

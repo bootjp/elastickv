@@ -258,6 +258,15 @@ two safety properties that no single-module spec can express:
   committing group at the txn's observed catalog version.  Ties OCC's
   commit decision to the Routes catalog snapshot the txn read at
   `BeginTxn`.
+- **Composed-1a** — strictly stronger apply-time fence: every
+  committed write key was owned by the committing group at the
+  CURRENT catalog version observed by the FSM at apply time
+  (`currentVersionAtCommit[t]`).  Composed-1 alone permits the
+  codex-P1 trace (observed-check passes; `ProposeRouteChange` moves
+  the key after `WriteIntent`; commit lands on the old owner;
+  readers at the new version miss the write).  Composed-1a is the
+  spec-level witness for the design doc §4.4 apply-time fence;
+  surfaced as a separate gap config so it is exercised independently.
 - **Composed-3** — every pair of distinct committed transactions has
   distinct `commit_ts` (the strict-serialisability bound).
 
@@ -284,6 +293,7 @@ Invariants asserted:
 |---|---|
 | `TypeOK` | Variable types are well-formed |
 | `Composed1_CommitToOwningGroup` | For every committed txn `t` and every `k ∈ writeSet[t]`, `routes[observedVer[t]][k] = commitGroup[t]` |
+| `Composed1a_CommitToCurrentOwner` | For every committed txn `t` and every `k ∈ writeSet[t]`, `routes[currentVersionAtCommit[t]][k] = commitGroup[t]` — strictly stronger than Composed-1, witnesses the §4.4 apply-time fence |
 | `Composed2_ReadAcrossSplitRange` | Vacuously TRUE in M5 (same-group SplitRange) — kept for naming consistency |
 | `Composed3_DistinctCommitTs` | Distinct committed txns have distinct `commit_ts` |
 | `Composed_CatalogMonotonic` (PROPERTY) | Transition form: `catalogVersion` weakly increases |
