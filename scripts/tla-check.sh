@@ -44,6 +44,28 @@ gap_invariant_for() {
     esac
 }
 
+# Per-module OPTIONAL liveness (M6) configurations.  Returns one
+# "<cfg-stem>" line per liveness config; empty output means the module
+# has no liveness configuration yet (the M6 milestone is optional per
+# docs/design/2026_05_28_partial_tla_safety_spec.md §5.6).  Each
+# returned config is expected to PASS — the .cfg file points at the
+# module's SpecLive definition (which adds fairness assumptions) and
+# its PROPERTY list includes the leads-to obligation.
+live_configs_for() {
+    case "$1" in
+        occ)    printf '_live\n' ;;
+        routes) printf '_live\n' ;;
+        hlc)      ;; # no liveness config yet (HLC-L1 deferred)
+        mvcc)     ;; # no liveness config yet
+        composed) ;; # no liveness config yet (cross-module liveness deferred)
+        *)
+            echo "ERROR: no live-config list registered for module '$1'." \
+                "Add a case to scripts/tla-check.sh." >&2
+            exit 64
+            ;;
+    esac
+}
+
 mc_basename() {
     # tla/<dir>/MC<MODULE>.tla — per-module spelling.  Acronym modules
     # (HLC, OCC, MVCC) are spelled in uppercase; word-modules (Routes,
@@ -150,6 +172,31 @@ for module in "${TLA_MODULES[@]}"; do
         continue
     fi
     echo
+
+    # M6 OPTIONAL liveness configurations.  Same PASS-expected shape
+    # as the safe config — TLC checks the SpecLive definition (which
+    # adds fairness assumptions) against the module's leads-to /
+    # temporal properties.  Empty list ⇒ the module has not landed
+    # liveness yet (HLC, MVCC, Composed in the first M6 PR).
+    if ! live_list="$(live_configs_for "$module")"; then
+        echo "ERROR: live_configs_for failed for module '${module}' — see error above." >&2
+        overall_rc=1
+        continue
+    fi
+    while IFS= read -r live_stem; do
+        [ -z "$live_stem" ] && continue
+        live_cfg="${mc}${live_stem}.cfg"
+        echo "================================================================"
+        echo "  TLC: tla/${module}/${live_cfg}  (M6 liveness, expected PASS)"
+        echo "================================================================"
+        if ! run_tlc "$module" "$live_cfg"; then
+            echo
+            echo "ERROR: ${live_cfg} did not pass — see TLC output above." >&2
+            overall_rc=1
+            continue
+        fi
+        echo
+    done <<< "$live_list"
 done
 
 if [ "$overall_rc" -eq 0 ]; then

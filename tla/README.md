@@ -16,7 +16,7 @@ run it without touching anything under the Go source tree.
 | M3 | `mvcc/MVCC.tla` (MVCC-1 + MVCC-4; MVCC-2 / MVCC-3 deferred to M5) | Landed |
 | M4 | `routes/Routes.tla` (Routes-1 + Routes-4; Routes-2 / Routes-3 trivially-satisfied in M4 abstraction, full range modelling deferred to M5) | Landed |
 | M5 | `composed/Composed.tla` (Composed-1 + Composed-3; Composed-2 trivially-satisfied under same-group SplitRange) | Landed |
-| M6 | Liveness checking (`tla-check-deep`) | Not started |
+| M6 | Liveness checking — OCC-L1 (every Active txn eventually terminates), Routes-L1 (eventual fan-out). HLC / MVCC / Composed liveness deferred. | Partial |
 
 ## Install
 
@@ -154,6 +154,7 @@ Invariants asserted:
 | `OCC5_StartTsConsistency` | Every read observation is bounded by the txn's `start_ts` (= `read_ts` by OCC-5) |
 | `OCC5_Action` (PROPERTY) | Transition form: `start_ts[t]` is assigned once at `BeginTxn` and never updated |
 | `CommitTsAssignedOnce` (PROPERTY) | Transition form: `commit_ts[t]` is assigned once at `Commit` and never updated |
+| `OCC_L1_TxnTerminates` (LIVENESS, M6) | `<>[](∀t. txnState[t] ∈ {Idle, Committed, Aborted})` — every txn eventually settles, prevented from staying Active/Prepared forever by `WF_vars(Abort(t))` in `SpecLive` |
 
 ### `occ/MCOCC.tla` + `MCOCC.cfg` / `MCOCC_gap.cfg`
 TLC model-check instance for OCC.  Same one-module / two-config layout
@@ -240,6 +241,7 @@ Invariants asserted:
 | `Routes4_NoEngineRegression` | For every node `n`, `engineVersion[n] ≥ engineMaxObserved[n]` |
 | `Routes1_Action` (PROPERTY) | Transition form: `catalogVersion` weakly increases on every step |
 | `Routes4_GhostMonotonic` (PROPERTY) | Transition form: `engineMaxObserved[n]` weakly increases on every step |
+| `Routes_L1_EventualFanOut` (LIVENESS, M6) | `<>[](∀n. engineVersion[n] = catalogVersion)` — every node's RouteEngine eventually catches up to the durable catalog, driven by `WF_vars(CatalogWatcherSyncLatest(n))` in `SpecLive` |
 
 ### `routes/MCRoutes.tla` + `MCRoutes.cfg` / `MCRoutes_gap.cfg`
 TLC model-check instance for Routes.  Same one-module / two-config
