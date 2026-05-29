@@ -107,30 +107,36 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
 	}
 	entry := registrationEntry(activeDEK, newNodeFullID, 0)
 	req := registrationRequest(activeDEK, newNodeFullID, 0)
-	// connCache is only consulted by proposeWriterRegistration when
-	// the local node is NOT the leader (forward-to-leader path). On
-	// the common leader path — AddVoter/AddLearner is leader-only —
-	// the cache is never touched, so allocating it eagerly is wasted
-	// work (gemini medium on PR #872). Lazy-allocate + defer-close
-	// only on the non-leader branch.
-	var connCache *kv.GRPCConnCache
-	if !e.coordinate.IsLeader() {
-		connCache = &kv.GRPCConnCache{}
-		defer func() {
-			if cerr := connCache.Close(); cerr != nil {
-				slog.Warn("encryption: 7c pre-register failed to close gRPC connection cache",
-					slog.String("error", cerr.Error()))
-			}
-		}()
-	}
-	// TOCTOU residual (claude review on PR #872): two concurrent
+	// Always allocate connCache (NOT lazy-on-non-leader): a lazy
+	// allocation guarded by `if !e.coordinate.IsLeader()` would race
+	// with leadership change inside proposeWriterRegistration, which
+	// performs its own IsLeader() check before consulting connCache.
+	// A leader-flip between the two checks would reach
+	// connCache.ConnFor on a nil pointer — segfault (claude round-2
+	// MEDIUM on PR #872, reverting the round-1 gemini optimization).
+	// The same goroutine-scoped pattern is what the 7a/7b/7b'
+	// registration paths use.
+	connCache := &kv.GRPCConnCache{}
+	defer func() {
+		if cerr := connCache.Close(); cerr != nil {
+			slog.Warn("encryption: 7c pre-register failed to close gRPC connection cache",
+				slog.String("error", cerr.Error()))
+		}
+	}()
+	// TOCTOU residual for concurrent same-raftID AddVoter calls
+	// (claude round-2 on PR #872 — corrected): two concurrent
 	// PreAddMember calls for the SAME raftID can both read "no row"
-	// before either proposal applies, then both propose epoch=0. The
-	// FSM applies the first as §4.1 case-1 first-seen; the second
-	// hits §4.1 case-3 (proposed_epoch=0 ≤ last_seen_epoch=0) →
-	// ErrLocalEpochRollback halt-apply. Recovery is process restart;
-	// the entry replays cleanly. Concurrent AddVoter for the same
-	// raftID is an unusual operator pattern, but the guard cannot
-	// catch it because both reads precede both writes.
+	// before either proposal applies, then both propose epoch=0.
+	// The FSM applies the first as §4.1 case-1 first-seen
+	// (FirstSeen=LastSeen=0); the second hits §4.1 **case-2-
+	// idempotent** because proposed_epoch=0 == last_seen_epoch=0 →
+	// return nil (no error, no halt apply, safe no-op). Case-3
+	// requires proposed_epoch STRICTLY LESS than last_seen_epoch,
+	// which 0 == 0 does not satisfy. The concurrent same-raftID
+	// scenario is therefore harmless — one Raft round-trip on the
+	// duplicate, no operator recovery needed. (The §6.1 uint16-
+	// collision TOCTOU — different FullNodeID at the same NodeID16
+	// — is the genuine case-4 halt-apply residual; see §3.3 of the
+	// design doc.)
 	return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Engine, connCache, entry, req)
 }
