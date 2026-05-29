@@ -285,15 +285,23 @@ function Heatmap({ matrix }: HeatmapProps) {
       {hoverRow !== null && matrix.rows[hoverRow] && (
         <RowDetail row={matrix.rows[hoverRow]} index={hoverRow} />
       )}
-      {selectedCell && matrix.rows[selectedCell.row] && (
-        <HotKeysPanel
-          row={matrix.rows[selectedCell.row]}
-          column={selectedCell.col}
-          columnUnixMs={matrix.column_unix_ms[selectedCell.col]}
-          series={matrix.series}
-          onClose={() => setSelectedCell(null)}
-        />
-      )}
+      {selectedCell &&
+        matrix.rows[selectedCell.row] &&
+        // Render-level column guard: the matrix-identity useEffect
+        // fires AFTER paint, so on the one frame between a refresh
+        // that shrinks column_unix_ms and the effect clearing the
+        // selection, column_unix_ms[col] would be undefined and the
+        // panel header would briefly read "Invalid Date". The effect
+        // is the durable fix; this guard hides the one-frame flash.
+        selectedCell.col < matrix.column_unix_ms.length && (
+          <HotKeysPanel
+            row={matrix.rows[selectedCell.row]}
+            column={selectedCell.col}
+            columnUnixMs={matrix.column_unix_ms[selectedCell.col]}
+            series={matrix.series}
+            onClose={() => setSelectedCell(null)}
+          />
+        )}
     </div>
   );
 }
