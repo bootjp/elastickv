@@ -76,6 +76,14 @@ type ServerDeps struct {
 	// "hot-keys drill-down off".
 	KeyVizHotKeys KeyVizHotKeysSource
 
+	// KeyVizHotKeysFanout enables cluster-wide aggregation of the
+	// hot-keys drill-down endpoint (design §6). When non-nil, the
+	// hot-keys handler merges the local response with peer responses
+	// before serving. Optional: leaving it nil preserves the single-
+	// node behaviour. Typically constructed from the same
+	// --keyvizFanoutNodes operator flag as the matrix fan-out.
+	KeyVizHotKeysFanout *KeyVizHotKeysFanout
+
 	// Queues is the SQS admin source — covers list, describe, and
 	// delete via QueuesSource. Optional: a nil value disables
 	// /admin/api/v1/sqs/queues{,/{name}} (the mux answers them
@@ -149,7 +157,9 @@ func NewServer(deps ServerDeps) (*Server, error) {
 	// posture as the matrix handler. Auth + full-access role are layered
 	// at the route table (see buildAPIMux); the source's own enabled
 	// check produces hotkeys_disabled vs keyviz_disabled.
-	hotKeys := NewKeyVizHotKeysHandler(deps.KeyVizHotKeys).WithLogger(logger)
+	hotKeys := NewKeyVizHotKeysHandler(deps.KeyVizHotKeys).
+		WithLogger(logger).
+		WithFanout(deps.KeyVizHotKeysFanout)
 	sqs := buildSqsHandlerForDeps(deps, logger)
 	mux := buildAPIMux(auth, deps.Verifier, cluster, dynamo, s3, keyviz, hotKeys, sqs, logger)
 	router := NewRouterWithLeaderProbe(mux, deps.StaticFS, deps.LeaderProbe)

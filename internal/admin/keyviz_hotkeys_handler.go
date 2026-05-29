@@ -44,6 +44,12 @@ type KeyVizHotKeysHandler struct {
 	snapshotWindow time.Duration
 	now            func() time.Time
 	logger         *slog.Logger
+	// fanout is non-nil when the operator configured
+	// --keyvizFanoutNodes and the local node has at least one peer
+	// (after self-filtering). When set, ServeHTTP runs the per-peer
+	// fan-out after building the local response and replaces the
+	// reply with the merged cluster-wide view (design §6).
+	fanout *KeyVizHotKeysFanout
 }
 
 func NewKeyVizHotKeysHandler(source KeyVizHotKeysSource) *KeyVizHotKeysHandler {
@@ -86,6 +92,16 @@ func (h *KeyVizHotKeysHandler) WithSnapshotWindow(d time.Duration) *KeyVizHotKey
 	return h
 }
 
+// WithFanout enables cluster-wide aggregation (design §6). When the
+// supplied fan-out is non-nil the handler also gates on the
+// keyVizFanoutPeerHeader on the inbound request so a peer-originated
+// fan-out call does not recursively fan out (matches the matrix
+// fan-out's anti-recursion semantics in keyviz_handler.go).
+func (h *KeyVizHotKeysHandler) WithFanout(f *KeyVizHotKeysFanout) *KeyVizHotKeysHandler {
+	h.fanout = f
+	return h
+}
+
 const (
 	hotKeysDefaultTop  = 20
 	hotKeysMaxTopParam = 1024
@@ -109,6 +125,11 @@ type hotKeyResponse struct {
 	Degraded        bool                  `json:"degraded"`
 	ErrorBound      uint64                `json:"error_bound"`
 	SnapshotAt      time.Time             `json:"snapshot_at"`
+	// Fanout is set when the handler aggregated peer responses (Phase
+	// 2-A++ §6). Absent when fan-out is not configured or when the
+	// request itself originated from another node's aggregator (the
+	// X-Admin-Fanout-Peer header suppresses the recursive call).
+	Fanout *FanoutResult `json:"fanout,omitempty"`
 }
 
 type hotKeyResponseEntry struct {
@@ -158,7 +179,7 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	out := buildHotKeysResponse(params, snap, entries)
+	out := h.maybeFanout(r, params, buildHotKeysResponse(params, snap, entries))
 	h.audit(r, params, len(out.Keys), out.Degraded)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -260,6 +281,20 @@ func buildHotKeysResponse(p hotKeysParams, snap *keyviz.KeyvizHotKeysSnapshot, e
 		}
 	}
 	return out
+}
+
+// maybeFanout runs the configured fan-out aggregator iff this
+// request is the operator-originated entry point (no peer header).
+// Returning early when no fan-out is configured (or when the request
+// is itself a peer call) keeps ServeHTTP within the cyclop limit
+// while preserving the design §6 anti-recursion rule. Forwarding the
+// inbound cookies lets each peer's SessionAuth see a valid
+// principal; nil cookies surface as ok=false in the per-node status.
+func (h *KeyVizHotKeysHandler) maybeFanout(r *http.Request, params hotKeysParams, out hotKeyResponse) hotKeyResponse {
+	if h.fanout == nil || r.Header.Get(keyVizFanoutPeerHeader) != "" {
+		return out
+	}
+	return h.fanout.Run(r.Context(), params, out, r.Cookies())
 }
 
 // scaledErrorBound is sample_rate × sampled_n / m, in scaled
