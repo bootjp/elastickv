@@ -3361,7 +3361,7 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 	// advances past holes and the metadata stays consistent with Tail.
 	commitTS, err := r.coordinator.Clock().NextFenced()
 	if err != nil {
-		return errors.Wrap(err, "listPopClaimOnce: allocate commitTS")
+		return errors.Wrap(err, "commitListPop: allocate commitTS")
 	}
 	var headDelta int64
 	if left {
