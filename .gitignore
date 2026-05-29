@@ -40,8 +40,8 @@ jepsen/.ssh/
 server
 
 # TLA+ TLC artifacts (counterexample traces, state directories)
-tla/**/MCHLC_TTrace_*.tla
-tla/**/MCHLC_TTrace_*.bin
+tla/**/MC*_TTrace_*.tla
+tla/**/MC*_TTrace_*.bin
 tla/**/states/
 
 # Admin SPA build outputs. The placeholder internal/admin/dist/index.html
