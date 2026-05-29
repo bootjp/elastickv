@@ -548,11 +548,6 @@ func runRuntimeRegistrationWatcher(
 	bootDEKID uint32,
 	fullNodeID uint64,
 ) {
-	// Per-instance counter (Stage 7b' §3.2): records the most recently
-	// registered DEK so a subsequent rotation to yet another DEK
-	// re-triggers a propose. Resets to 0 on restart (per-process-load
-	// state, not durable) — §3.2.1.
-	var lastRegisteredDEK uint32
 	ticker := time.NewTicker(runtimeRegistrationPollInterval)
 	defer ticker.Stop()
 	for {
@@ -561,7 +556,7 @@ func runRuntimeRegistrationWatcher(
 			return
 		case <-ticker.C:
 		}
-		runtimeRegistrationTick(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID, &lastRegisteredDEK)
+		runtimeRegistrationTick(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID)
 	}
 }
 
@@ -569,26 +564,37 @@ func runRuntimeRegistrationWatcher(
 // active storage DEK and true when the watcher should propose
 // (cutover, pre-bootstrap, OR — after Stage 7b' — rotation).
 //
-// Stage 7b' §3.2 check ordering (load-bearing):
+// Check ordering (load-bearing):
 //  1. `cache.Registered()` short-circuits — internally tests
 //     `activeStorageDEKID == registeredStorageDEKID` so it auto-
-//     scopes to the currently-active DEK; the single-DEK
-//     StateCache means a B→C→B oscillation will re-propose for B
-//     (safe via §4.1 case-2 idempotent — 7b' §3.2.2).
+//     scopes to the currently-active DEK and is the **single
+//     source of truth** for "this load has registered for the
+//     currently-active DEK". The §4.1 case-2 idempotent path
+//     makes re-proposing safe; a single-DEK StateCache means a
+//     B→C→B oscillation re-proposes for B and the case-2 apply
+//     is a no-op (7b' §3.2.2).
 //  2. Envelope-inactive / not-bootstrapped guards.
 //  3. Scope branches: pre-bootstrap (bootDEKID==0), cutover
-//     (activeDEK==bootDEKID), or rotation (activeDEK!=bootDEKID &&
-//     lastRegisteredDEK!=activeDEK). The 7b' implementation
-//     replaces 7b's log-once-skip deferral for the rotation branch
-//     with an in-scope propose now that applyRotateDEK records the
-//     per-node local_epoch (writeRotationSidecar §3.1).
-func runtimeRegistrationInScope(
-	cache *encryption.StateCache,
-	bootDEKID uint32,
-	fullNodeID uint64,
-	lastRegisteredDEK *uint32,
-) (activeDEK uint32, inScope bool) {
-	_ = fullNodeID // reserved for future per-node scope-check refinements
+//     (activeDEK==bootDEKID), or rotation (activeDEK!=bootDEKID).
+//     The 7b' implementation replaces 7b's log-once-skip deferral
+//     for the rotation branch with an in-scope propose now that
+//     applyRotateDEK records the per-node local_epoch
+//     (writeRotationSidecar §3.1).
+//
+// Note: an earlier 7b' draft added a per-process-load
+// `lastRegisteredDEK` counter to gate the rotation branch against
+// re-proposing once we'd already registered for the current active
+// DEK. That introduced a permanent fail-closed in the race where the
+// 7a process-start goroutine's MarkRegistered(oldDEK) lands AFTER
+// 7b's MarkRegistered(newDEK) — overwriting `registeredStorageDEKID`
+// to a stale value, making `Registered()` false, but the new gate
+// would still see `activeDEK == lastRegisteredDEK` and skip the
+// recovery propose (gemini CRITICAL on PR #864). Letting
+// `cache.Registered()` be the sole gate eliminates that hole at the
+// cost of one extra Raft round-trip per tick whenever the cache is
+// out of sync, which the §4.1 case-2 idempotent apply makes free of
+// side effects.
+func runtimeRegistrationInScope(cache *encryption.StateCache) (activeDEK uint32, inScope bool) {
 	if cache.Registered() {
 		return 0, false
 	}
@@ -599,39 +605,32 @@ func runtimeRegistrationInScope(
 	if !ok {
 		return 0, false
 	}
-	// Cutover / pre-bootstrap branch: activeDEK == bootDEKID OR
-	// bootDEKID == 0. Both satisfy
-	// sidecar.Keys[activeDEK].LocalEpoch == w.epoch per 7b §2.2.
-	if bootDEKID == 0 || activeDEK == bootDEKID {
-		return activeDEK, true
-	}
-	// Rotation branch (Stage 7b'): bootDEKID != 0 && activeDEK !=
-	// bootDEKID. applyRotateDEK on the local node wrote
-	// Keys[activeDEK].LocalEpoch = w.epoch (the local node's pinned
-	// value, not the proposer's 0 — see internal/encryption/applier.go
-	// writeRotationSidecar). The watcher proposes
-	// (activeDEK, node, w.epoch); §4.1 case-2 idempotent acceptance
-	// covers oscillation re-proposes (§3.2.2).
-	//
-	// lastRegisteredDEK gates against re-proposing on every tick
-	// after we already MarkRegistered'd the current activeDEK in this
-	// process load. Reset-on-restart (§3.2.1) means a rotation that
-	// happened while the node was down still triggers a fresh propose
-	// on the first tick (lastRegisteredDEK starts at 0).
-	if activeDEK == *lastRegisteredDEK {
-		return 0, false
-	}
+	// All three 7b/7b' sub-cases collapse to the same propose:
+	// - cutover (activeDEK == bootDEKID, Keys[activeDEK].LocalEpoch
+	//   == w.epoch per 7b §2.2),
+	// - pre-bootstrap (bootDEKID == 0, w.epoch == 0),
+	// - rotation (activeDEK != bootDEKID, Keys[activeDEK].LocalEpoch
+	//   == w.epoch via the 7b' applyRotateDEK per-node sidecar write —
+	//   see internal/encryption/applier.go writeRotationSidecar).
+	// The §4.1 case-2 idempotent apply makes a re-propose during
+	// oscillation a no-op (§3.2.2). The Registered() short-circuit
+	// above is the sole gate against busy re-proposing once a
+	// registration has succeeded — earlier drafts added a
+	// per-process-load lastRegisteredDEK gate here but that
+	// permanently fails closed in the 7a-stale-MarkRegistered race
+	// (gemini CRITICAL on PR #864).
 	return activeDEK, true
 }
 
 // runtimeRegistrationTick is a single iteration of the watcher loop,
 // extracted so the loop body stays under the cyclop budget and the
 // scope-check + propose can be unit-tested independently of the ticker.
-// Returns to the caller after either a no-op skip or a complete
-// synchronous registration attempt via runWriterRegistration.
-// Updates *lastRegisteredDEK to the active DEK if the registration
-// succeeded (cache.Registered() flipped true via runWriterRegistration's
-// MarkRegistered side effect on the success path).
+// Returns to the caller after either a no-op skip (when
+// cache.Registered() is already true for the active DEK, or scope
+// conditions reject the tick) or a complete synchronous registration
+// attempt via runWriterRegistration. The Registered() short-circuit at
+// runtimeRegistrationInScope step 1 is the sole gate against re-proposing
+// once a registration has succeeded (gemini CRITICAL on PR #864).
 func runtimeRegistrationTick(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
@@ -639,9 +638,8 @@ func runtimeRegistrationTick(
 	w encryptionWriteWiring,
 	bootDEKID uint32,
 	fullNodeID uint64,
-	lastRegisteredDEK *uint32,
 ) {
-	activeDEK, inScope := runtimeRegistrationInScope(w.cache, bootDEKID, fullNodeID, lastRegisteredDEK)
+	activeDEK, inScope := runtimeRegistrationInScope(w.cache)
 	if !inScope {
 		return
 	}
@@ -700,13 +698,12 @@ func runtimeRegistrationTick(
 	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
 	runWriterRegistration(tickCtx, coordinate, defaultGroup.Engine, w.cache, activeDEK,
 		entry, req, barrier, verifyRegistered)
-	// 7b' §3.2: advance lastRegisteredDEK only on confirmed success so a
-	// timed-out propose doesn't gate the next tick's re-attempt.
-	// cache.Registered() (no-arg, internally tests
-	// activeStorageDEKID == registeredStorageDEKID) flips true only via
-	// runWriterRegistration's MarkRegistered success path; a partial
-	// propose, ctx timeout, or §4.1 case-3 halt-apply leaves it false.
-	if w.cache.Registered() {
-		*lastRegisteredDEK = activeDEK
-	}
+	// No success-bookkeeping needed: cache.Registered() flips true via
+	// runWriterRegistration's MarkRegistered side effect on the success
+	// path, and the next tick's runtimeRegistrationInScope step (1)
+	// short-circuit reads that state directly. Any race that leaves the
+	// cache out of sync (e.g. the 7a process-start goroutine's
+	// MarkRegistered landing after this watcher's MarkRegistered for a
+	// newer DEK) is recovered by the next tick re-proposing, with the
+	// §4.1 case-2 idempotent apply making the re-propose a no-op.
 }
