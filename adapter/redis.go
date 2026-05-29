@@ -2634,7 +2634,10 @@ func (t *txnContext) commit() error {
 
 	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
 	// the coordinator assigns it during Dispatch.
-	commitTS := t.server.coordinator.Clock().Next()
+	commitTS, err := t.server.coordinator.Clock().NextFenced()
+	if err != nil {
+		return errors.Wrap(err, "redis txn commit: allocate commitTS")
+	}
 	listElems := t.buildListElems(commitTS)
 	zsetElems, err := t.buildZSetElems(commitTS)
 	if err != nil {
@@ -3152,7 +3155,10 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 		}
 
 		// Pre-allocate commitTS so we can embed it in the Delta key.
-		commitTS := r.coordinator.Clock().Next()
+		commitTS, err := r.coordinator.Clock().NextFenced()
+		if err != nil {
+			return errors.Wrap(err, "listPushCore: allocate commitTS")
+		}
 		ops, updatedMeta, err := buildFn(meta, key, values, commitTS, 0)
 		if err != nil {
 			return err
@@ -3339,10 +3345,24 @@ func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count in
 		return nil, buildErr
 	}
 
+	if err := r.commitListPop(ctx, key, elems, n, left, readTS); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+// commitListPop allocates commitTS, appends the ListMetaDelta entry,
+// and dispatches the pop transaction. Extracted from listPopClaimOnce
+// so that function stays under the cyclop ceiling after the HLC-4
+// (iii) NextFenced fence added a new error branch (PR #867 Phase 2b).
+func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv.Elem[kv.OP], n int64, left bool, readTS uint64) error {
 	// n is the number of sequence positions claimed (including any holes).
 	// HeadDelta and LenDelta must use n, not len(values), so that Head
 	// advances past holes and the metadata stays consistent with Tail.
-	commitTS := r.coordinator.Clock().Next()
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return errors.Wrap(err, "listPopClaimOnce: allocate commitTS")
+	}
 	var headDelta int64
 	if left {
 		headDelta = n // head advances by n positions for LPOP
@@ -3354,16 +3374,15 @@ func (r *RedisServer) listPopClaimOnce(ctx context.Context, key []byte, count in
 		Value: delta,
 	})
 
-	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	if _, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
 		Elems:    elems,
-	})
-	if dispErr != nil {
-		return nil, errors.WithStack(dispErr)
+	}); dispErr != nil {
+		return errors.WithStack(dispErr)
 	}
-	return values, nil
+	return nil
 }
 
 func (r *RedisServer) listPopClaim(ctx context.Context, key []byte, count int, left bool) ([]string, error) {
