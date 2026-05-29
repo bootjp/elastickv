@@ -14,7 +14,7 @@ run it without touching anything under the Go source tree.
 | M1 | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla`, `make tla-check` | Landed |
 | M2 | `occ/OCC.tla` (safety invariants OCC-1..OCC-5) | Landed |
 | M3 | `mvcc/MVCC.tla` (MVCC-1 + MVCC-4; MVCC-2 / MVCC-3 deferred to M5) | Landed |
-| M4 | `routes/Routes.tla` (Routes-1..Routes-4) | Not started |
+| M4 | `routes/Routes.tla` (Routes-1 + Routes-4; Routes-2 / Routes-3 trivially-satisfied in M4 abstraction, full range modelling deferred to M5) | Landed |
 | M5 | `composed/Composed.tla` + CI integration | Not started |
 | M6 | Liveness checking (`tla-check-deep`) | Not started |
 
@@ -47,10 +47,9 @@ make tla-check
 ```
 
 This runs TLC against the safe + gap configuration pair for every
-module declared in `scripts/tla-check.sh` (currently HLC, OCC, and
-MVCC; M4 / M5 will be added as they land), and prints whether the
-outcome
-matches the design contract:
+module declared in `scripts/tla-check.sh` (currently HLC, OCC, MVCC,
+and Routes; M5 will be added as it lands), and prints whether the
+outcome matches the design contract:
 
 - **Safe config (`tla/<module>/MC<MODULE>.cfg`)** — the correct
   design, with each module's preconditions or commit guards enabled.
@@ -201,6 +200,54 @@ layout as MCHLC and MCOCC.  The gap config disables the retention
 guard inside `Compact`; TLC produces a
 `MVCC4_NoLostCommitOnSnapshotInstall` counterexample at depth ≈ 3
 (one `Write`, one `Compact(newMin > commit_ts)`).
+
+### `routes/Routes.tla`
+The route catalog + CatalogWatcher layer.  Models the durable catalog
+as a single monotonic `catalogVersion` counter and each node's
+`RouteEngine` as a per-node `engineVersion[n]` that re-syncs via the
+`CatalogWatcherSync(n)` action (mirroring
+`distribution/watcher.go SyncOnce`).  A ghost variable
+`engineMaxObserved[n]` records the highest version each node has
+ever observed, so Routes-4 (watcher fan-out monotonicity) can be
+stated as a state invariant
+(`engineVersion[n] ≥ engineMaxObserved[n]`).  The `EnableSafety`
+CONSTANT gates the monotonicity guard inside `CatalogWatcherSync`
+— under the gap config that guard is removed and TLC surfaces a
+Routes-4 counterexample where a node fetches an older snapshot
+after a newer one.
+
+Routes-2 (coverage and disjointness of ranges) and Routes-3
+(SplitRange catalog atomicity) are trivially satisfied in this M4
+abstraction:
+
+- Routes-2 — M4 does not model individual ranges explicitly.  Full
+  range modelling (a `routes : Keys → GroupId` function whose
+  totality implies both properties) is deferred to M5 (composed),
+  where SplitRange exercising key-boundary changes is in scope.
+- Routes-3 — every catalog update is a single TLA+ action
+  (`ProposeRouteChange`) that bumps `catalogVersion` and the
+  routes in one step, so atomicity is structural.  Asynchronous
+  cross-node propagation is captured by Routes-4.
+
+Invariants asserted:
+
+| Invariant | Statement |
+|---|---|
+| `TypeOK` | Variable types are well-formed |
+| `Routes1_VersionInRange` | `catalogVersion ∈ 0..MaxVersions`; combined with `Routes1_Action` this captures Routes-1 monotonicity |
+| `Routes2_CoverageDisjoint` | Vacuously TRUE in M4 (range partition not explicitly modelled; see comment in `Routes.tla`) |
+| `Routes3_SplitAtomicity` | Vacuously TRUE in M4 (single-step `ProposeRouteChange`; see comment in `Routes.tla`) |
+| `Routes4_NoEngineRegression` | For every node `n`, `engineVersion[n] ≥ engineMaxObserved[n]` |
+| `Routes1_Action` (PROPERTY) | Transition form: `catalogVersion` weakly increases on every step |
+| `Routes4_GhostMonotonic` (PROPERTY) | Transition form: `engineMaxObserved[n]` weakly increases on every step |
+
+### `routes/MCRoutes.tla` + `MCRoutes.cfg` / `MCRoutes_gap.cfg`
+TLC model-check instance for Routes.  Same one-module / two-config
+layout as the other modules.  The gap config disables the monotonicity
+guard inside `CatalogWatcherSync`; TLC produces a
+`Routes4_NoEngineRegression` counterexample at depth ≈ 3 (one
+`ProposeRouteChange (v → 1)`, one `CatalogWatcherSync(n)` fetching
+`v = 1`, one `CatalogWatcherSync(n)` fetching `v = 0` — regression).
 
 ## How to interpret a TLC failure
 
