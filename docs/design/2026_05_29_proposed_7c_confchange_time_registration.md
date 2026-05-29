@@ -85,7 +85,8 @@ starts:
      group's storage; cross-group state mutation from a non-default
      group's apply hook is not currently a thing. Also the new
      node's `local_epoch` is not knowable at apply time on other
-     members (it's the new node's per-load value).
+     members (it is set on the new node's first boot, not on the
+     cluster-wide ConfChange apply).
 
 **Recommendation: option (a).** Smaller surface, reuses the existing
 proven 0x03 entry path, and the §4.1 collision halt-apply fires before
@@ -95,41 +96,92 @@ deliberately avoided.
 
 ## 3. Design (option a)
 
-### 3.1 Admin-RPC pre-register step
+### 3.1 Layering: interceptor pattern at the admin-RPC boundary
 
-`AddVoter` / `AddLearner` request handlers (in
-[`internal/raftadmin/server.go`](../../internal/raftadmin/server.go))
-gain a pre-step that runs **before** `s.admin.AddVoter/AddLearner`:
+A naive implementation would thread `kv.ShardedCoordinator`,
+`kv.ShardGroup`, `encryption.StateCache`, AND
+`etcdraftengine.DeriveNodeID` directly into `raftadmin.Server`. That
+collapses the Raft-admin / KV / encryption layering — `internal/raftadmin`
+is currently engine-generic (built against `raftengine.Engine` and
+`raftengine.Admin` interfaces) and has no concrete dependency on the
+KV or encryption packages (gemini medium #1 + #2 on PR #868).
+
+Instead, 7c introduces a **`MembershipChangeInterceptor`** interface in
+`internal/raftadmin` that the KV/encryption layer implements and
+injects at construction time. `raftadmin.Server` stays generic; all
+KV/encryption knowledge lives behind the interface:
 
 ```go
-// Pseudocode
+// internal/raftadmin/interceptor.go  (new file, ~15 LOC)
+type MembershipChangeInterceptor interface {
+    // PreAddMember runs before AddVoter/AddLearner proposes the
+    // conf-change. A non-nil error aborts the membership change.
+    // Implementations propose RegisterEncryptionWriter for the new
+    // node and wait for commit; see Stage 7c §3.2-§3.4.
+    PreAddMember(ctx context.Context, raftID string) error
+}
+```
+
+```go
+// internal/raftadmin/server.go  (modified)
+type Server struct {
+    admin       Admin
+    engine      Engine
+    interceptor MembershipChangeInterceptor  // nil = no pre-step
+    ...
+}
+
 func (s *Server) AddVoter(ctx context.Context, req *pb.RaftAdminAddVoterRequest) (*pb.RaftAdminConfigurationChangeResponse, error) {
-    if err := s.preRegisterEncryptionWriter(ctx, req.Id); err != nil {
-        return nil, err
+    if s.interceptor != nil {
+        if err := s.interceptor.PreAddMember(ctx, req.Id); err != nil {
+            return nil, err
+        }
     }
     index, err := s.admin.AddVoter(ctx, req.Id, req.Address, req.PreviousIndex)
     ...
 }
+```
 
-func (s *Server) preRegisterEncryptionWriter(ctx context.Context, raftID string) error {
-    activeDEK, ok := s.encryptionCache.ActiveStorageKeyID()
+The encryption-aware implementation lives in a thin adapter that
+`main.go` (or a small new package like `internal/encryption/raftadmin`)
+wires up. The adapter holds the `*kv.ShardedCoordinator`,
+`*kv.ShardGroup`, `*encryption.StateCache`, AND the `DeriveNodeID`
+function — keeping all KV/encryption coupling in one place:
+
+```go
+// Pseudocode (adapter, lives outside internal/raftadmin)
+type encryptionPreRegister struct {
+    coordinate   *kv.ShardedCoordinator
+    defaultGroup *kv.ShardGroup
+    cache        *encryption.StateCache
+    deriveNodeID func(raftID string) uint64  // injected; usually etcdraftengine.DeriveNodeID
+}
+
+func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string) error {
+    activeDEK, ok := e.cache.ActiveStorageKeyID()
     if !ok {
-        return nil  // Cluster not bootstrapped — no registry to gate on.
+        return nil // cluster not bootstrapped — no registry to gate on
     }
-    newNodeFullID := etcdraftengine.DeriveNodeID(raftID)
-    entry := registrationEntry(activeDEK, newNodeFullID, 0)  // local_epoch=0
+    newNodeFullID := e.deriveNodeID(raftID)
+    entry := registrationEntry(activeDEK, newNodeFullID, 0)
     req := registrationRequest(activeDEK, newNodeFullID, 0)
-    return proposeWriterRegistration(ctx, s.coordinate, s.defaultGroup.Engine, entry, req)
+    return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Engine, entry, req)
 }
 ```
 
-The pre-register step needs:
-- `encryptionCache *encryption.StateCache` — already injected into the
-  Applier; thread the same instance into the `raftadmin.Server`
-  constructor.
-- `coordinate *kv.ShardedCoordinator` — already available in main.go
-  at construction time.
-- `defaultGroup *kv.ShardGroup` — same.
+`DeriveNodeID` is passed in as a function value so the adapter remains
+neutral with respect to the concrete Raft engine — main.go supplies
+`etcdraftengine.DeriveNodeID` today, but a future engine swap is a
+one-line wiring change in main.go, not a refactor of the encryption
+adapter. (Defining `DeriveNodeID` on `raftengine.Engine` itself was a
+considered alternative; rejected because the derivation is a pure
+function of the raftID string, not a method that requires engine
+state.)
+
+When the operator runs an `AddVoter`/`AddLearner` against an
+encryption-unaware build (or against a cluster with encryption
+disabled), `main.go` passes a nil interceptor and the conf-change path
+runs exactly as today.
 
 ### 3.2 Why `local_epoch = 0`
 
@@ -210,25 +262,42 @@ retry's conf-change normally.
 
 ## 5. Verification action items (for the implementation PR)
 
-1. New `internal/raftadmin/server_test.go` cases:
-   - `TestAddVoter_PreRegistersWithCurrentActiveDEK`: with the
-     state cache reporting `activeStorageDEK=X`, an `AddVoter` call
-     for `raftID=N` proposes a 0x03 entry for `(X, NodeID(N), 0)`
-     before the conf-change. Use a recording fake `Coordinate.Propose`.
-   - `TestAddVoter_PreRegisterFailureAbortsConfChange`: if the
-     registration propose fails (e.g., simulated §4.1 case-4 collision
-     halt), the conf-change is NOT proposed. Use the recording
-     fake to assert `Propose` was called once (registration only).
-   - `TestAddVoter_PreBootstrapClusterSkipsPreRegister`: when
-     `ActiveStorageKeyID()` reports `(0, false)`, the pre-register
-     step is skipped and the conf-change proceeds as today.
+1. New `internal/raftadmin/server_test.go` cases (with a fake
+   `MembershipChangeInterceptor`):
+   - `TestAddVoter_InvokesInterceptorBeforeConfChange`: a recording
+     fake interceptor that returns nil is invoked before
+     `s.admin.AddVoter`; assert order and raftID propagation.
+   - `TestAddVoter_InterceptorErrorAbortsConfChange`: a fake
+     interceptor that returns an error aborts the RPC; assert
+     `s.admin.AddVoter` is NOT called.
+   - `TestAddVoter_NilInterceptorSkipsPreStep`: with no interceptor
+     installed (e.g., encryption-disabled build), AddVoter proceeds
+     directly to `s.admin.AddVoter` as today.
    - Symmetric tests for `AddLearner`.
-2. New `main_encryption_e2e_test.go` test or extension:
+2. New encryption-adapter tests (location: alongside the adapter — if
+   it lives in `main`, then a new `main_encryption_confchange_test.go`;
+   if it lives in `internal/encryption/raftadmin/`, that package's
+   tests):
+   - `TestEncryptionPreRegister_ProposesCorrectEntry`: with the
+     state cache reporting `activeStorageDEK=X`, calling
+     `PreAddMember(raftID=N)` proposes a 0x03 entry for
+     `(X, deriveNodeID(N), 0)`. Use a recording fake `Coordinate.Propose`
+     and a stub `deriveNodeID` that returns a known sentinel.
+   - `TestEncryptionPreRegister_PreBootstrapSkips`: when
+     `ActiveStorageKeyID()` reports `(0, false)`, `PreAddMember`
+     returns nil without proposing. Encryption-disabled clusters
+     and pre-bootstrap clusters share this path.
+   - `TestEncryptionPreRegister_ProposeFailureSurfaces`: propose
+     errors (simulated §4.1 case-4 halt apply, ctx timeout, propose
+     gate refusal) propagate to the caller verbatim — the
+     `raftadmin.Server` will then abort the conf-change.
+3. New `main_encryption_e2e_test.go` test or extension:
    - `TestEncryption_E2E_ConfChange_NewMemberPreRegistration`: end-
      to-end test driving the production `AddVoter` handler in a
-     2-node test cluster, then asserting the new node's writer-
-     registry row exists at `(activeDEK, newNode, 0)` immediately
-     after the AddVoter call returns.
+     2-node test cluster (with the encryption interceptor wired),
+     then asserting the new node's writer-registry row exists at
+     `(activeDEK, newNode, 0)` immediately after the AddVoter call
+     returns.
 3. Self-review (5-lens) for the implementation PR — particular
    attention to:
    - **Concurrency**: the pre-register step uses the same
