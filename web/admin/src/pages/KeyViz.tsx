@@ -100,13 +100,25 @@ function Heatmap({ matrix }: HeatmapProps) {
   // selectedCell drives the hot-key drill-down panel. Null = no
   // selection. Clicking the same cell twice clears it (toggle) so the
   // user can dismiss the panel without scrolling for a close button.
-  const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
-  // Clear any stale selection when the matrix identity changes (new
-  // refresh, series switch, rows resize): the selected row index may
-  // now point to a completely different bucket, so dropping the
-  // selection is safer than silently re-pointing the drill-down.
+  // bucketId is snapshotted at click time so an auto-refresh that
+  // returns the same rows in the same order leaves the panel open —
+  // only a refresh that changes the row→bucket mapping (or a column
+  // shrink that puts the clicked column out of range) drops it.
+  const [selectedCell, setSelectedCell] = useState<{ row: number; col: number; bucketId: string } | null>(null);
+  // On every matrix refresh, validate the selection against the new
+  // shape. Without this, auto-refresh modes (5s / 30s) would clear
+  // the drill-down on every poll and the feature would be unusable
+  // while polling. The selection is kept only when the previously-
+  // clicked row still points at the same bucket_id AND the column
+  // is still in range; either invariant breaking drops the panel.
   useEffect(() => {
-    setSelectedCell(null);
+    setSelectedCell((prev) => {
+      if (!prev) return prev;
+      const row = matrix.rows[prev.row];
+      if (!row || row.bucket_id !== prev.bucketId) return null;
+      if (prev.col >= matrix.column_unix_ms.length) return null;
+      return prev;
+    });
   }, [matrix]);
   // dprTick re-runs the canvas effect when the user drags the window
   // between displays of different pixel densities or changes the
@@ -216,8 +228,16 @@ function Heatmap({ matrix }: HeatmapProps) {
     const col = Math.floor(x / cellW);
     if (row < 0 || row >= matrix.rows.length) return;
     if (col < 0 || col >= matrix.column_unix_ms.length) return;
+    // matrix.rows[row] is already bounds-checked above. Snapshotting
+    // the bucket id here lets the matrix-identity effect distinguish
+    // "the selected row still maps to the same bucket" (keep) from
+    // "the underlying data shifted and this row is now a different
+    // route" (drop).
+    const bucketId = matrix.rows[row].bucket_id;
     setSelectedCell((prev) =>
-      prev && prev.row === row && prev.col === col ? null : { row, col },
+      prev && prev.row === row && prev.col === col
+        ? null
+        : { row, col, bucketId },
     );
   };
 
@@ -567,30 +587,38 @@ interface BucketIDParts {
   subBucket?: number;
 }
 
+// parseUint accepts only a non-empty digit-only string. Number("")
+// and Number(" ") both coerce to 0 (finite), so a bare "route:" or
+// "route:42#" would otherwise parse as routeID=0 / subBucket=0 and
+// silently mis-route the drill-down. The regex also rejects
+// negatives, decimals, and trailing whitespace in one step.
+function parseUint(raw: string): number | null {
+  if (!/^\d+$/.test(raw)) return null;
+  return Number(raw);
+}
+
 function parseBucketID(id: string): BucketIDParts | null {
-  // Use Number() rather than Number.parseInt() so a malformed id
-  // like "route:42abc" returns null instead of silently being read
-  // as 42 (parseInt stops at the first non-numeric character;
-  // Number() rejects trailing garbage as NaN). The server's
-  // strconv.FormatUint output never contains garbage today, but
-  // belt-and-braces parsing keeps a future server-side format
-  // change from quietly mis-routing the hot-keys API call.
+  // parseUint enforces digit-only segments. Belt-and-braces against
+  // both Number.parseInt's prefix-tolerance (parseInt("42abc") → 42)
+  // and Number's empty-string coercion (Number("") → 0); the server's
+  // strconv output never produces either today, but a future format
+  // change cannot then silently mis-route the hot-keys API call.
   if (id.startsWith("virtual:")) {
-    const n = Number(id.slice("virtual:".length));
-    if (!Number.isFinite(n)) return null;
+    const n = parseUint(id.slice("virtual:".length));
+    if (n === null) return null;
     return { kind: "virtual", routeID: n };
   }
   if (id.startsWith("route:")) {
     const rest = id.slice("route:".length);
     const hash = rest.indexOf("#");
     if (hash < 0) {
-      const n = Number(rest);
-      if (!Number.isFinite(n)) return null;
+      const n = parseUint(rest);
+      if (n === null) return null;
       return { kind: "route", routeID: n };
     }
-    const routeID = Number(rest.slice(0, hash));
-    const sub = Number(rest.slice(hash + 1));
-    if (!Number.isFinite(routeID) || !Number.isFinite(sub)) return null;
+    const routeID = parseUint(rest.slice(0, hash));
+    const sub = parseUint(rest.slice(hash + 1));
+    if (routeID === null || sub === null) return null;
     return { kind: "route", routeID, subBucket: sub };
   }
   return null;
