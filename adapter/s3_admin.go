@@ -259,7 +259,10 @@ func (s *S3Server) AdminCreateBucket(ctx context.Context, principal AdminPrincip
 // error path that the wrapping retry harness needs to see.
 func (s *S3Server) adminCreateBucketTxn(ctx context.Context, principal AdminPrincipal, name, acl string) (*AdminBucketSummary, error) {
 	readTS := s.readTS()
-	startTS := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(readTS)
+	if err != nil {
+		return nil, errors.Wrap(err, "s3 admin: allocate startTS for adminCreateBucketTxn")
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -324,7 +327,10 @@ func (s *S3Server) AdminPutBucketAcl(ctx context.Context, principal AdminPrincip
 
 	err := s.retryS3Mutation(ctx, func() error {
 		readTS := s.readTS()
-		startTS := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(readTS)
+		if err != nil {
+			return errors.Wrap(err, "s3 admin: allocate startTS for mutation")
+		}
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -412,40 +418,7 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 
 	var deletedGeneration uint64
 	err := s.retryS3Mutation(ctx, func() error {
-		readTS := s.readTS()
-		startTS := s.txnStartTS(readTS)
-		readPin := s.pinReadTS(readTS)
-		defer readPin.Release()
-
-		meta, exists, err := s.loadBucketMetaAt(ctx, name, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !exists || meta == nil {
-			return ErrAdminBucketNotFound
-		}
-		start := s3keys.ObjectManifestPrefixForBucket(name, meta.Generation)
-		kvs, err := s.store.ScanAt(ctx, start, prefixScanEnd(start), 1, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if len(kvs) > 0 {
-			return ErrAdminBucketNotEmpty
-		}
-		// Phase 1: Del BucketMetaKey in a txn so a concurrent
-		// AdminCreateBucket racing the delete is rejected by OCC.
-		// retryS3Mutation handles ErrWriteConflict / ErrTxnLocked
-		// by re-running this whole closure.
-		_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-			IsTxn:   true,
-			StartTS: startTS,
-			Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(name)}},
-		})
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		deletedGeneration = meta.Generation
-		return nil
+		return s.adminDeleteBucketTxnBody(ctx, name, &deletedGeneration)
 	})
 	if err != nil {
 		return err //nolint:wrapcheck // sentinel errors propagate as-is.
@@ -455,6 +428,50 @@ func (s *S3Server) AdminDeleteBucket(ctx context.Context, principal AdminPrincip
 	// committed would 404 at loadBucketMetaAt; we want the error
 	// (if any) logged but not propagated to the operator.
 	s.runBucketDeleteSafetyNet(ctx, name, deletedGeneration)
+	return nil
+}
+
+// adminDeleteBucketTxnBody is the per-attempt body retryS3Mutation
+// invokes from AdminDeleteBucket. Extracted from the inline closure
+// so AdminDeleteBucket stays under the cyclomatic ceiling when the
+// HLC-4 (iii) fence added an extra error-branch on startTS
+// allocation (PR #867 Phase 2a).
+func (s *S3Server) adminDeleteBucketTxnBody(ctx context.Context, name string, deletedGeneration *uint64) error {
+	readTS := s.readTS()
+	startTS, err := s.txnStartTS(readTS)
+	if err != nil {
+		return errors.Wrap(err, "s3 admin: allocate startTS for adminDeleteBucket")
+	}
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(ctx, name, readTS)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !exists || meta == nil {
+		return ErrAdminBucketNotFound
+	}
+	start := s3keys.ObjectManifestPrefixForBucket(name, meta.Generation)
+	kvs, err := s.store.ScanAt(ctx, start, prefixScanEnd(start), 1, readTS)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if len(kvs) > 0 {
+		return ErrAdminBucketNotEmpty
+	}
+	// Phase 1: Del BucketMetaKey in a txn so a concurrent
+	// AdminCreateBucket racing the delete is rejected by OCC.
+	// retryS3Mutation handles ErrWriteConflict / ErrTxnLocked
+	// by re-running this whole closure.
+	if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(name)}},
+	}); err != nil {
+		return errors.WithStack(err)
+	}
+	*deletedGeneration = meta.Generation
 	return nil
 }
 
