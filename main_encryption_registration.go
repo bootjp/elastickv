@@ -136,11 +136,14 @@ func setupDistributionAndRegistration(
 	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
 		return nil, err
 	}
-	// Stage 7b: arm the runtime watcher for the cutover case (Phase-0
-	// boot or pre-bootstrap boot, then runtime EnableStorageEnvelope).
-	// Must run AFTER installProcessStartRegistrationGate so the gate is
-	// in place before any runtime trigger can fire. Rotation cases are
-	// deferred to 7b' (see §6 of the design doc).
+	// Stage 7b/7b': arm the runtime watcher. Handles all three runtime
+	// registration triggers — cutover (Phase-0 → EnableStorageEnvelope),
+	// pre-bootstrap (no DEK → runtime Bootstrap), and rotation (RotateDEK
+	// from a non-proposer's perspective). All three collapse to the same
+	// in-scope propose under the cache.Registered() gate in
+	// runtimeRegistrationInScope. Must run AFTER
+	// installProcessStartRegistrationGate so the gate is in place before
+	// any runtime trigger can fire.
 	installRuntimeRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID)
 	// Bootstrap + registration both run under runCtx so a shutdown
 	// cancels the bounded retry rather than hanging.
@@ -528,12 +531,12 @@ func installRuntimeRegistrationWatcher(
 	})
 }
 
-// runRuntimeRegistrationWatcher is the Stage 7b polling loop. It checks
-// the §4.1 trigger condition every runtimeRegistrationPollInterval and
-// proposes a registration synchronously for the cutover case
-// (activeDEK == bootDEKID OR bootDEKID == 0). The rotation case
-// (bootDEKID != 0 && activeDEK != bootDEKID) is deferred to 7b' and
-// gets a log-once WARN gated by lastLoggedSkipDEK.
+// runRuntimeRegistrationWatcher is the Stage 7b/7b' polling loop. It
+// checks the §4.1 trigger condition every runtimeRegistrationPollInterval
+// and proposes a registration synchronously for any in-scope case: the
+// cutover (activeDEK == bootDEKID), pre-bootstrap (bootDEKID == 0), and
+// rotation (activeDEK != bootDEKID) branches all collapse to the same
+// in-scope propose under the cache.Registered() gate (7b' §3.2).
 //
 // The propose runs in this goroutine — at most one in-flight at a time,
 // no goroutine accumulation, no duplicate Raft proposals from the
@@ -644,11 +647,12 @@ func runtimeRegistrationTick(
 		return
 	}
 	// In scope: cutover (activeDEK == bootDEKID), pre-bootstrap
-	// (bootDEKID == 0), or 7b' rotation (activeDEK != bootDEKID &&
-	// lastRegisteredDEK != activeDEK). All three satisfy
-	// sidecar.Keys[activeDEK].LocalEpoch == w.epoch (cutover/pre-
-	// bootstrap per 7b §2.2; rotation per 7b' §3.1's
-	// writeRotationSidecar local_epoch wiring).
+	// (bootDEKID == 0), or 7b' rotation (activeDEK != bootDEKID).
+	// All three satisfy sidecar.Keys[activeDEK].LocalEpoch == w.epoch
+	// (cutover/pre-bootstrap per 7b §2.2; rotation per 7b' §3.1's
+	// writeRotationSidecar local_epoch wiring). cache.Registered()
+	// inside runtimeRegistrationInScope gates against re-proposing
+	// after a successful registration.
 	slog.Info("encryption: 7b runtime watcher proposing registration",
 		slog.Uint64("active_dek_id", uint64(activeDEK)),
 		slog.Uint64("full_node_id", fullNodeID),
