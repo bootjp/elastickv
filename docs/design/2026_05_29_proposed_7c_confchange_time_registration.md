@@ -172,7 +172,14 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
     // the idempotent case-2 path. Read the row first; if it already
     // exists for any epoch, skip the propose. Same pattern as 7a's
     // startup skip-if-already-registered check.
-    if existing, ok, err := e.registry.GetRegistryRow(encryption.RegistryKey(activeDEK, encryption.NodeID16(newNodeFullID))); err != nil {
+    // store.WriterRegistryFor is a stateless wrapper (same idiom as
+    // 7a §3.1 startup check); avoiding a cached field on the adapter
+    // keeps construction simple.
+    reg, err := store.WriterRegistryFor(e.defaultGroup.Store)
+    if err != nil {
+        return errors.Wrap(err, "7c pre-register: registry handle")
+    }
+    if existing, ok, err := reg.GetRegistryRow(encryption.RegistryKey(activeDEK, encryption.NodeID16(newNodeFullID))); err != nil {
         return errors.Wrap(err, "7c pre-register: read registry row")
     } else if ok {
         val, derr := encryption.DecodeRegistryValue(existing)
@@ -222,20 +229,33 @@ Critically, `local_epoch = 0` for a *first-seen* row is correct under
 and any subsequent 7a propose at `epoch > 0` advances `LastSeen`
 monotonically. No brick scenario.
 
-### 3.3 §6.1 collision: case-4 halt apply fires PRE-conf-change
+### 3.3 §6.1 collision: handled cleanly by the §3.1 guard; residual TOCTOU case-4 only
 
 If the new node's `NodeID16(FullNodeID)` collides with an existing
-member's `NodeID16(FullNodeID)`, the pre-register step's 0x03 apply
-hits §4.1 case 4 (different FullNodeID at same uint16) and halts the
-FSM. The conf-change has NOT been proposed yet, so the cluster's
-membership is unchanged — recovery is "stop the operator command, run
-the existing `ErrNodeIDCollision` check, choose a non-colliding raftID,
-retry." The 7a doc's `ErrNodeIDCollision` startup membership pre-check
-is the documented recovery path; 7c does not need to add anything new
-for this case.
+member's `NodeID16(FullNodeID)`, the common case is now handled
+cleanly by the **§3.1 read-before-propose guard**: it reads the
+existing row, observes the FullNodeID mismatch, and returns
+`ErrEncryptionWriterUint16Collision` to the admin RPC caller
+**without proposing anything**. No FSM halt, no durable conf-change,
+no manual recovery. The operator chooses a non-colliding raftID and
+retries (the `ErrNodeIDCollision` startup membership pre-check from
+7a is the operator-facing diagnostic for picking a non-colliding ID).
+
+The case-4 halt-apply path is now restricted to a narrow TOCTOU
+residual: **two concurrent `AddVoter` calls on the leader** for
+uint16-colliding raftIDs, both reading "no row exists" in their guard
+checks and both proposing case-1 inserts. The second propose loses
+case-1 (now a row exists from the first call) and falls into case-4
+because the FullNodeIDs differ. This race halts the FSM, but only
+under simultaneous-operator-action; the standard sequential operator
+workflow always sees a clean guard return.
 
 Without 7c, the same case-4 halt would fire AFTER the conf-change had
-already committed — irrecoverable without manual intervention.
+already committed — irrecoverable without manual intervention. 7c's
+guard removes that scenario entirely; the residual race halts the FSM
+**before** any conf-change exists in the log, so recovery is the same
+as today's `ErrNodeIDCollision` pre-check rather than a durable
+membership rollback.
 
 ### 3.4 What 7c guarantees vs what 7a remains responsible for
 
@@ -421,7 +441,18 @@ deployment topology is covered:
 | Runtime `EnableStorageEnvelope` cutover | 7b |
 | Runtime `RotateDEK` | 7b' |
 | Runtime `AddVoter` / `AddLearner` | **7c** |
-| Direct ConfChange (non-admin-RPC) | 7a (catch-up) + 7a-2 gate |
+| Direct ConfChange (non-admin-RPC) | 7a (catch-up) + 7a-2 gate † |
+
+† **Residual uint16 collision risk on this path**: 7c's guarantee (2)
+collision-safe membership change (see §3.4) requires the admin-RPC
+pre-register step. A direct ConfChange that bypasses the admin RPC
+still triggers a case-4 halt-apply on uint16 collision *after* the
+conf-change has durably committed — the same irrecoverable scenario
+the design's option-(a) admin-RPC path eliminates. Operators using
+non-admin-RPC paths (debugging tools, manual raftadmin grpc calls
+that bypass the standard workflow) must rely on the
+`ErrNodeIDCollision` startup membership pre-check before issuing the
+ConfChange.
 
 This closes Stage 7. Stage 8 (snapshot header v2) and Stage 9 (KMS +
 compress + rotation/retire/rewrite + Jepsen) follow.
