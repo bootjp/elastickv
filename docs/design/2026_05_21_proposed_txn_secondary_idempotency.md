@@ -663,32 +663,52 @@ flakiness, tracked separately from the correctness fix.
   follow-ups? (Default: only the list-append family the Jepsen workload
   exercises; everything else keeps today's behaviour until its hook is
   added.)
-- **Synchronous-dispatch linchpin — VERIFIED (2026-05-26).** The
-  race-freedom argument assumes a dispatch returns only after its entry has
-  applied or been abandoned at a now-deposed leader (so the retry's E2 is
-  never overtaken by E1). Confirmed against the propose/apply path:
-  - `applyRequests` (`kv/transaction.go:152`) proposes with
-    `context.Background()`, so `Engine.Propose`
-    (`internal/raftengine/etcd/engine.go:606`) blocks until the entry
-    applies or the proposal is *failed* — it never abandons on a caller
-    timeout (the `ctx.Done()` branch is dead under Background).
-  - A pending proposal is failed only via (a) submission rejection (entry
-    never appended → never applies) or (b) the Leader→non-Leader transition
-    in `refreshStatus` (`engine.go:2179-2190`) calling
-    `failPending(errNotLeader)`, which *drains* the proposal from the
-    pending map so this engine never re-proposes it.
-  - On commit, `applyNormalEntry` runs `fsm.Apply` at the entry's assigned
-    log index *regardless* of whether the proposal notification is still
-    pending; `resolveProposal` (`engine.go:1780`) no-ops the notify if the
-    entry was already drained.
+- **Race-freedom linchpin — RE-VERIFIED (2026-05-30).** The race-freedom
+  argument needs **E1 applies before E2, or never** — never the other way
+  round. An earlier verification (2026-05-26) appealed to `applyRequests`
+  using `context.Background()` so that `Engine.Propose` could not abandon on
+  a caller timeout. That argument was based on a stale read; codex correctly
+  pointed out (PR #796 review) that the current single-shard txn path
+  threads the caller ctx through (`dispatchSingleShardTxn` →
+  `TransactionManager.Commit(ctx, …)` → `applyRequests(ctx, …)` →
+  `Engine.Propose(ctx, …)`), and `Engine.Propose` has a live `ctx.Done()`
+  early-return that calls `cancelPendingProposal`. So "Background blocks"
+  is *not* what guarantees ordering. Re-prove it on what actually does:
+  the FIFO propose channel and monotonic Raft log indices.
 
-  Therefore E1 applies at its (lower) log index before E2, or never applies
-  (truncated / never-appended) — it can never apply *after* E2. The
-  ambiguous-commit case (E1 committed by the successor leader while the
-  adapter received `errNotLeader`) maps to outcome 1: E1 applies first, the
-  exact-ts probe hits, E2 no-ops. M2 should add a regression test that pins
-  this ordering. The linchpin holds, so option 2 is cleared for
-  implementation.
+  The relevant facts in `internal/raftengine/etcd/engine.go`:
+  - `Engine.Propose` enqueues `req` onto `e.proposeCh` (`engine.go:626`)
+    *before* awaiting `req.done`. The raft run loop dequeues in order and
+    submits to the underlying raft node, which assigns log indices
+    monotonically on a single leader. A request that has entered
+    `proposeCh` cannot be un-enqueued: `cancelPendingProposal`
+    (`engine.go:2326`) only removes the pending-proposal notification
+    entry; the payload may still be appended to the leader's log.
+  - On commit, `applyNormalEntry` (`engine.go:1769`) runs `fsm.Apply` at
+    the entry's assigned log index *regardless* of whether the proposal
+    notification has been drained, so a cancelled or leadership-drained
+    proposal still applies if it was already committed by the log.
+  - The adapter goroutine that issues E1 returns control *before* it
+    issues E2 (the retry is sequential), and E1's Propose-submit
+    happens-before E2's. With a single leader, E1 therefore lands in
+    `proposeCh` ahead of E2 and is assigned a strictly lower log index.
+    If leadership has changed in between: E2 is proposed to a *different*
+    leader and gets a fresh-tail index in that leader's log; E1 in the
+    deposed leader's log was either already committed (index < E2's,
+    applies first) or truncated (never applies). Across leaders, E1's
+    original payload is never re-submitted to the new leader — the
+    `failPending(errNotLeader)` drain (`engine.go:2179-2190`) errors the
+    *pending* entry on this engine, but the adapter creates a brand new
+    request id on retry, so E2 is a different proposal, not a re-issue
+    of E1.
+
+  Therefore E1 either applies at a lower log index than E2, or never
+  applies at all. It cannot apply *after* E2. This holds whether the
+  caller ctx is `Background()` or a cancellable context; cancellation
+  just lets the adapter learn about a fate Raft has already decided.
+  The ambiguous-commit case (E1 committed by the successor leader while
+  the adapter received `errNotLeader`) maps to outcome 1: E1 applies
+  first, the exact-ts probe hits, E2 no-ops.
 
 ## Decision log
 

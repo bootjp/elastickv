@@ -473,6 +473,14 @@ func (s *mvccStore) CommittedVersionAt(_ context.Context, key []byte, commitTS u
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
+	// Match pebbleStore semantics (codex P2): a probe below the retention
+	// watermark cannot distinguish "never landed" from "reclaimed", and a
+	// silent false would steer the option-2 dedup into the wrong reconstruction
+	// branch. Surface the case so callers (FSM, adapter) can fall back rather
+	// than trust the answer.
+	if readTSCompacted(commitTS, s.minRetainedTS) {
+		return false, ErrReadTSCompacted
+	}
 	v, ok := s.tree.Get(key)
 	if !ok {
 		return false, nil

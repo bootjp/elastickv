@@ -393,6 +393,19 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys)
 	}
 
+	// Fail-closed when a retry carries the option-2 dedup probe key but its
+	// write set / read set spans shards (codex P2 "reject retries that leave
+	// the one-phase path"). The 2PC log builders only encode CommitTS and
+	// would silently drop PrevCommitTS — a landed ambiguous attempt would
+	// then look like an ordinary write conflict, the adapter would drop
+	// pending and recompute, and the duplicate this feature is meant to
+	// prevent would reappear. Surface the constraint explicitly so the
+	// caller (or a future multi-shard dedup design) knows the request shape
+	// is unsupported.
+	if prevCommitTS != 0 {
+		return nil, errors.WithStack(ErrTxnDedupRequiresSingleShard)
+	}
+
 	// Multi-shard path: group read keys by shard now. The result is passed
 	// directly to prewriteTxn to avoid a second iteration inside that function.
 	// A routing failure here aborts the transaction before any prewrite —

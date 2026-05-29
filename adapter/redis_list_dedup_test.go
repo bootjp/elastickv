@@ -29,8 +29,13 @@ type dedupTestCoordinator struct {
 	*occAdapterCoordinator
 	ambiguousDispatch int  // 1-based dispatch number to make ambiguous
 	ambiguousLands    bool // true: apply then error; false: error without applying
-	dispatches        int
-	probeNoOps        int
+	// landThenWriteConflictAtDispatch reproduces the self-inflicted-conflict
+	// scenario (codex P1): the named dispatch applies the elems THEN returns
+	// store.ErrWriteConflict — modelling leadership churn that surfaces a
+	// committed entry as a write conflict.
+	landThenWriteConflictAtDispatch int
+	dispatches                      int
+	probeNoOps                      int
 	// beforeDispatch, if set, runs at the start of each Dispatch with the
 	// 1-based dispatch number — lets a test inject a concurrent commit
 	// between the adapter's attempts.
@@ -64,6 +69,13 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 	}
 	if n == c.ambiguousDispatch && c.ambiguousLands {
 		// The apply LANDED, but the adapter sees an ambiguous retryable error.
+		return nil, store.ErrWriteConflict
+	}
+	if n == c.landThenWriteConflictAtDispatch {
+		// The apply LANDED, but leadership churn surfaces the commit as
+		// store.ErrWriteConflict — the original bug class. The adapter's
+		// self-inflicted-conflict guard must probe our just-committed
+		// commit_ts before treating this as a third-party conflict.
 		return nil, store.ErrWriteConflict
 	}
 	return resp, nil
@@ -323,6 +335,45 @@ func TestListPushDedup_InterveningNonConflictingLPush_RecomputesLength(t *testin
 	require.NoError(t, err)
 	require.Equal(t, int64(3), meta.Len)
 	require.Equal(t, int64(-1), meta.Head)
+}
+
+// TestListPushDedup_SelfInflictedReuseConflict_ReturnsSuccess is the codex
+// P1 regression for the "self-inflicted conflict" leadership-churn case:
+//
+//  1. attempt 1 errors without landing (pending stored, pending.commitTS=T1)
+//  2. reuse dispatched at fresh T2 with PrevCommitTS=T1; the FSM probes T1,
+//     misses (T1 didn't land), and APPLIES at T2 — but leadership churn
+//     surfaces the commit as ErrWriteConflict to the adapter.
+//
+// Pre-fix the adapter treated this as a genuine third-party conflict, dropped
+// pending, recomputed on a fresh meta read (which now reflects T2's effect)
+// and APPENDED THE SAME ELEMENT A SECOND TIME at a new seq — exactly the
+// duplicate-elements anomaly this feature exists to prevent. The fix is to
+// probe our just-attempted commit_ts on a reuse WriteConflict; if it landed
+// the conflict is against our own commit, return success and keep pending
+// pointing at THIS commit_ts.
+func TestListPushDedup_SelfInflictedReuseConflict_ReturnsSuccess(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 pre-rejects without landing
+	coord.landThenWriteConflictAtDispatch = 2      // reuse applies, then returns WriteConflict
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	key := []byte("mylist")
+	n, err := srv.listRPush(ctx, key, [][]byte{[]byte("v")})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n, "self-inflicted conflict must not duplicate the element")
+	require.Equal(t, 2, coord.dispatches, "no recompute should fire; the reuse landed")
+	require.Equal(t, 0, coord.probeNoOps, "the FSM probe at T1 misses; the no-op count stays zero")
+
+	readTS := snapshotTS(coord.Clock(), st)
+	meta, _, err := srv.resolveListMeta(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len, "exactly one element after self-inflicted conflict")
+	val, err := st.GetAt(ctx, listItemKey(key, meta.Head), readTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), val)
 }
 
 // TestListPushDedup_DisabledKeepsLegacyPath confirms the gate is off by

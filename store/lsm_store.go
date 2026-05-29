@@ -775,6 +775,14 @@ func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
+	// Surface a compacted-history probe distinctly from a clean miss
+	// (codex P2): below the retention watermark we cannot tell "this attempt
+	// never landed" from "the version was reclaimed", and a false miss would
+	// drive the option-2 dedup into the wrong reconstruction branch. Callers
+	// (FSM, adapter) treat ErrReadTSCompacted as "couldn't probe, fall back".
+	if readTSCompacted(commitTS, s.effectiveMinRetainedTS()) {
+		return false, ErrReadTSCompacted
+	}
 	_, closer, err := s.db.Get(encodeKey(key, commitTS))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {

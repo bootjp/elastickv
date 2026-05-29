@@ -503,11 +503,20 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// "commit_ts reuse vs stale-ts ordering" argument.
 	if meta.PrevCommitTS != 0 {
 		landed, perr := f.store.CommittedVersionAt(ctx, meta.PrimaryKey, meta.PrevCommitTS)
-		if perr != nil {
-			return errors.WithStack(perr)
-		}
-		if landed {
+		switch {
+		case perr == nil && landed:
 			return nil
+		case perr == nil:
+			// fall through to apply normally
+		case errors.Is(perr, store.ErrReadTSCompacted):
+			// The prior attempt's commit_ts is below the retention watermark
+			// so we cannot tell "didn't land" from "reclaimed" (codex P2).
+			// Fall through to apply normally: a stale extra delta is a
+			// strict improvement over either a wrong no-op (would drop the
+			// retry's data forever) or a hard apply failure (would crash
+			// every replica deterministically on a benign condition).
+		default:
+			return errors.WithStack(perr)
 		}
 	}
 

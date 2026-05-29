@@ -3263,9 +3263,25 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 		return length, false, rerr
 	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
-		// The exact-ts probe ruled out our own prior attempt and the
-		// target seq is taken by another txn — a genuine conflict.
-		// Drop the reusable attempt so the next iteration recomputes.
+		// Self-inflicted-conflict guard (codex P1): the apply might have
+		// landed at this fresh commitTS but bubbled up as WriteConflict due
+		// to leadership churn (the original bug class the doc's "Resolved"
+		// section identifies). Without this probe, dropping pending here
+		// would recompute and append a second copy. Ask the store: did
+		// our just-attempted commit_ts land? If yes, this conflict is
+		// against our own commit — return success and keep pending pointing
+		// at THIS commit_ts so any subsequent retry probes the right point.
+		if probeKey := firstWriteKey(pending.ops); len(probeKey) > 0 {
+			landed, perr := r.store.CommittedVersionAt(ctx, probeKey, commitTS)
+			if perr == nil && landed {
+				pending.commitTS = commitTS
+				length, lerr := r.resolveReuseLength(ctx, key, pending)
+				return length, false, lerr
+			}
+		}
+		// Our attempt did not land at commitTS and the target seq is taken
+		// by another txn — a genuine conflict. Drop pending; the next
+		// iteration recomputes from a fresh meta read.
 		return 0, true, errors.WithStack(dispErr)
 	}
 	// Still ambiguous (lock / other retryable): this reuse may itself
@@ -3289,19 +3305,35 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 // between attempts (codex P2) — without this, the return value would
 // silently understate the count when the boundary OCC fence and
 // write-key OCC both pass but the list length changed.
+//
+// Failure modes are converted to a degraded return (pending.length) rather
+// than surfaced as an error, because the dispatch already committed. Per
+// codex P2 "avoid failing after a reuse apply", reporting a write error
+// after the apply landed drives the client into a retry that has no
+// pending state and would re-append the element — the very anomaly this
+// feature prevents. Specifically:
+//   - probe ErrReadTSCompacted (commit_ts below retention watermark):
+//     cannot tell landed-vs-reclaimed; fall back to pending.length.
+//   - probe error of any other kind: prefer pending.length over failure.
+//   - resolveListMeta failure (e.g. delta scan over MaxDeltaScanLimit
+//     under churn): fall back to pending.length.
 func (r *RedisServer) resolveReuseLength(ctx context.Context, key []byte, pending *reusableListPush) (int64, error) {
 	if probeKey := firstWriteKey(pending.ops); len(probeKey) > 0 {
 		hit, perr := r.store.CommittedVersionAt(ctx, probeKey, pending.commitTS)
-		if perr != nil {
-			return 0, errors.WithStack(perr)
-		}
-		if hit {
+		switch {
+		case perr == nil && hit:
+			return pending.length, nil
+		case perr == nil:
+			// fall through to the meta re-read
+		default:
+			// Probe inconclusive (compacted history or any other read error);
+			// the dispatch already committed, so degrade gracefully.
 			return pending.length, nil
 		}
 	}
 	currentMeta, _, mErr := r.resolveListMeta(ctx, key, r.readTS())
 	if mErr != nil {
-		return 0, mErr
+		return pending.length, nil
 	}
 	return currentMeta.Len, nil
 }
