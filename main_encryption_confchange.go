@@ -48,7 +48,7 @@ func newEncryptionPreRegister(
 	cache *encryption.StateCache,
 	deriveNodeID func(raftID string) uint64,
 ) raftadmin.MembershipChangeInterceptor {
-	if coordinate == nil || defaultGroup == nil || cache == nil || deriveNodeID == nil {
+	if coordinate == nil || defaultGroup == nil || defaultGroup.Store == nil || cache == nil || deriveNodeID == nil {
 		return nil
 	}
 	return &encryptionPreRegister{
@@ -107,16 +107,30 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
 	}
 	entry := registrationEntry(activeDEK, newNodeFullID, 0)
 	req := registrationRequest(activeDEK, newNodeFullID, 0)
-	// Per-RPC connCache: closed before returning. This is the same
-	// goroutine-scoped pattern the 7a/7b registration paths use; we
-	// don't want a process-lifetime cache for an admin-RPC handler
-	// invoked on demand.
-	connCache := &kv.GRPCConnCache{}
-	defer func() {
-		if cerr := connCache.Close(); cerr != nil {
-			slog.Warn("encryption: 7c pre-register failed to close gRPC connection cache",
-				slog.String("error", cerr.Error()))
-		}
-	}()
+	// connCache is only consulted by proposeWriterRegistration when
+	// the local node is NOT the leader (forward-to-leader path). On
+	// the common leader path — AddVoter/AddLearner is leader-only —
+	// the cache is never touched, so allocating it eagerly is wasted
+	// work (gemini medium on PR #872). Lazy-allocate + defer-close
+	// only on the non-leader branch.
+	var connCache *kv.GRPCConnCache
+	if !e.coordinate.IsLeader() {
+		connCache = &kv.GRPCConnCache{}
+		defer func() {
+			if cerr := connCache.Close(); cerr != nil {
+				slog.Warn("encryption: 7c pre-register failed to close gRPC connection cache",
+					slog.String("error", cerr.Error()))
+			}
+		}()
+	}
+	// TOCTOU residual (claude review on PR #872): two concurrent
+	// PreAddMember calls for the SAME raftID can both read "no row"
+	// before either proposal applies, then both propose epoch=0. The
+	// FSM applies the first as §4.1 case-1 first-seen; the second
+	// hits §4.1 case-3 (proposed_epoch=0 ≤ last_seen_epoch=0) →
+	// ErrLocalEpochRollback halt-apply. Recovery is process restart;
+	// the entry replays cleanly. Concurrent AddVoter for the same
+	// raftID is an unusual operator pattern, but the guard cannot
+	// catch it because both reads precede both writes.
 	return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Engine, connCache, entry, req)
 }

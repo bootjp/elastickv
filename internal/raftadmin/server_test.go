@@ -29,6 +29,14 @@ type fakeEngine struct {
 	removeServerCalls   []fakeRemoveServerCall
 	transferCalls       int
 	targetTransferCalls []fakeTransferCall
+
+	// addVoterHook is invoked synchronously inside AddVoter, before
+	// recording the call. Tests use this to observe the ordering of
+	// the engine call relative to the interceptor's hook so the
+	// "interceptor runs before engine.AddVoter" invariant is actually
+	// pinned (claude review on PR #872 — without the hook the test
+	// just observed that both ran in any order).
+	addVoterHook func()
 }
 
 type fakeAddVoterCall struct {
@@ -98,6 +106,12 @@ func (f *fakeEngine) CheckServing(context.Context) error {
 }
 
 func (f *fakeEngine) AddVoter(_ context.Context, id string, address string, prevIndex uint64) (uint64, error) {
+	f.mu.Lock()
+	hook := f.addVoterHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.addVoterCalls = append(f.addVoterCalls, fakeAddVoterCall{id: id, address: address, prevIndex: prevIndex})
@@ -371,21 +385,20 @@ func (r *recordingInterceptor) PreAddMember(_ context.Context, raftID string) er
 
 // TestServer_AddVoter_InvokesInterceptorBeforeConfChange pins Stage 7c
 // §5.1 contract item 1: AddVoter calls the interceptor (with the raftID
-// from the request) before the engine's AddVoter, in that order. A
-// successful interceptor permits the conf-change to proceed.
+// from the request) before the engine's AddVoter, in that order. The
+// fakeEngine.addVoterHook appends "addVoter" synchronously from inside
+// the engine call, so the recorded ordering pins interceptor-before-
+// engine, not just that-both-ran (claude review low finding on PR #872).
 func TestServer_AddVoter_InvokesInterceptorBeforeConfChange(t *testing.T) {
 	t.Parallel()
-	engine := &fakeEngine{}
 	var order []string
+	engine := &fakeEngine{addVoterHook: func() { order = append(order, "addVoter") }}
 	interceptor := &recordingInterceptor{preHook: func(string) { order = append(order, "preAdd") }}
 	server := NewServerWithInterceptor(engine, interceptor)
 	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.Equal(t, []string{"n42"}, interceptor.calls)
-	// fakeEngine.AddVoter appends to addVoterCalls AFTER the interceptor
-	// hook runs; ordering is observable.
-	order = append(order, "addVoter")
 	require.Equal(t, []string{"preAdd", "addVoter"}, order)
 	require.Equal(t, 1, len(engine.addVoterCalls))
 }
