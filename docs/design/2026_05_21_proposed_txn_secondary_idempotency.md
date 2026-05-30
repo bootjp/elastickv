@@ -478,7 +478,7 @@ preserves availability and adds correctness.
   outcomes end-to-end against real OCC + the real probe, plus the gate-off
   legacy path.
 - **Result reconstruction (R1) — resolved, and simpler than feared.** See R1.
-- **`runTransaction` (MULTI/EXEC) — LANDED via PR #884.** When the gate is
+- **`runTransaction` (MULTI/EXEC) — LANDED via PR #887 (originally PR #884, re-landed against main).** When the gate is
   on, `runTransactionWithDedup` mirrors `listPushCoreWithDedup` at the EXEC
   granularity: the first attempt builds the txn, captures `nextResults`
   from attempt 1's `startTS` snapshot, dispatches; on a retryable failure

@@ -113,9 +113,13 @@ func TestExecDedup_GenuineConflictRebuildsAndApplies(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.Equal(t, "OK", results[0].str)
-	// Three dispatches: attempt 1 (pre-reject), reuse (OCC-conflict on key),
-	// fresh-snapshot retry (success).
-	require.GreaterOrEqual(t, coord.dispatches, 3)
+	// Exactly three dispatches: attempt 1 (pre-reject, no land), reuse
+	// (OCC-conflict on the foreign-committed key), fresh-snapshot retry
+	// (success). The single injected pre-reject + single concurrent SET
+	// fully determine the retry topology — Equal pins it so any future
+	// regression that adds an extra dispatch is caught immediately
+	// (coderabbitai PR #887 minor).
+	require.Equal(t, 3, coord.dispatches)
 	require.Equal(t, 0, coord.probeNoOps, "nothing landed at attempt 1's ts; probe must not fire as a hit")
 
 	// Our final write wins (it commits AFTER the concurrent SET because we
