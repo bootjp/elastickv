@@ -110,3 +110,62 @@ func TestOnePhaseDedup_FirstAttemptSkipsProbe(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, at20)
 }
+
+// TestOnePhaseDedup_OtherTxnVersionDoesNotMaskRetry closes the M2 open item
+// (design doc §M2 "Still open"): exactness must be pinned at the apply layer
+// for the OTHER-txn case. The store layer's TestCommittedVersionAt_PebbleStore
+// /-_MVCCStore pin (load-bearing exactness suite) already proves that a
+// version at T_other ≠ T1 does not satisfy a probe at T1. This test extends
+// that pin to the FSM apply path: if a third party committed a version at
+// some `T_other ≠ prev_commit_ts` for the SAME primary key, the FSM probe
+// at prev_commit_ts must miss and the retry must apply at the fresh
+// commit_ts. Without exactness, the probe would alias on T_other and
+// incorrectly no-op the retry — silently dropping the user's write.
+//
+// Scenario:
+//  1. Third-party txn writes key=other at T_other=20.
+//  2. Adapter's attempt 1 at commit_ts T1=30 returns ambiguous error and
+//     was actually truncated (no version at T1).
+//  3. Retry arrives at fresh commit_ts T2=40 with prev_commit_ts=T1=30.
+//  4. FSM probes CommittedVersionAt(key, 30) → MISS (only T_other=20 exists),
+//     falls through to apply, writing key=v at T2=40.
+//
+// If exactness were broken (probe at 30 returned true because T_other=20
+// existed), the retry would no-op and v would be permanently lost.
+func TestOnePhaseDedup_OtherTxnVersionDoesNotMaskRetry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	key := []byte("list-item")
+
+	// Third party commits an unrelated version at T_other=20.
+	require.NoError(t, st.PutAt(ctx, key, []byte("other"), 20, 0))
+
+	// Retry: claims prev_commit_ts=T1=30 (an "attempt 1" that never landed,
+	// no version at 30 exists) and fresh commit_ts T2=40. The third-party
+	// version at 20 must NOT cause the probe at 30 to hit.
+	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(35, 40, 30, key, []byte("v"))))
+
+	// FSM apply layer pin: probe MUST miss exact 30, retry MUST apply at 40.
+	at30, err := st.CommittedVersionAt(ctx, key, 30)
+	require.NoError(t, err)
+	require.False(t, at30, "no attempt 1 landed at 30; the third-party version at 20 must not satisfy the exact-30 probe")
+
+	at40, err := st.CommittedVersionAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.True(t, at40, "with the exact-30 probe missing, the retry must apply at the fresh commit_ts 40")
+
+	// LatestCommitTS reflects T2=40 (the retry's fresh write supersedes both
+	// the third-party version at 20 and the never-landed attempt 1 at 30).
+	latest, exists, err := st.LatestCommitTS(ctx, key)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(40), latest, "newest version must be the retry's fresh apply at 40, not the third-party 20")
+
+	val, err := st.GetAt(ctx, key, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), val, "retry's write must be readable; exactness loss would have lost it")
+}
