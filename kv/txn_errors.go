@@ -15,6 +15,13 @@ var (
 	ErrTxnAlreadyCommitted   = errors.New("txn already committed")
 	ErrTxnAlreadyAborted     = errors.New("txn already aborted")
 	ErrTxnPrimaryKeyRequired = errors.New("txn primary key required")
+	// ErrTxnDedupRequiresSingleShard is returned when a transaction request
+	// carries OperationGroup.PrevCommitTS (the option-2 one-phase dedup probe
+	// key) but its mutations or read keys span shards. The 2PC log builders
+	// encode only CommitTS, so silently honoring such a request would drop
+	// the probe at the FSM and let the original duplicate-elements anomaly
+	// reappear. See codex P2 in PR #796 and the design doc.
+	ErrTxnDedupRequiresSingleShard = errors.New("txn dedup (prev_commit_ts) requires a single-shard write set")
 )
 
 type TxnLockedError struct {
