@@ -98,6 +98,69 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 	return v != nil, nil
 }
 
+// CommittedVersionAt routes the exact-timestamp existence probe to the
+// owning group's local store, gated on the same lease-aware leader check
+// GetAt uses, so a deposed node that has not yet applied a freshly-
+// committed entry does not silently return false to a client read. The
+// FSM apply path is NOT affected — it holds the per-shard store directly
+// (not ShardStore) and runs the probe on the deterministic local replica
+// it is writing to. The option-2 reuse path (RedisServer.resolveReuseLength)
+// goes through this wrapper, so during leader churn the probe must answer
+// authoritatively or defer to a leader-routed re-read.
+//
+// There is no RawCommittedVersionAt RPC to proxy to; when we are not the
+// linearizable leader for the group we return (false, nil) and let the
+// caller fall back to derived reads (resolveListMeta uses ScanAt/GetAt,
+// which ARE leader-fenced / proxied per group). The fallback returns the
+// leader's current Len — a valid serialization — at the cost of the
+// pending.length fast-path during churn. Mirrors LeaderRoutedStore's fix
+// for codex P1 #796.
+func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	g, ok := s.groupForKey(key)
+	if !ok || g.Store == nil {
+		return false, nil
+	}
+	// engineForGroup may be nil in test fixtures that wire ShardStore
+	// without raft; preserve the existing local-only fallback there.
+	engine := engineForGroup(g)
+	if engine == nil {
+		exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		return exists, nil
+	}
+	if !isLinearizableRaftLeader(ctx, engine) && !tryEngineLinearizableFence(ctx, engine) {
+		// Not the linearizable leader for this group AND the ReadIndex
+		// fence failed (no leader reachable, ctx canceled). Fall back to
+		// (false, nil); the adapter's resolveListMeta path takes over via
+		// the leader-fenced ScanAt/GetAt and returns a valid current-Len
+		// serialization.
+		return false, nil
+	}
+	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return exists, nil
+}
+
+// tryEngineLinearizableFence submits a Raft ReadIndex via the per-group
+// engine and reports whether it succeeded. After a successful ReadIndex
+// the local applied index is caught up to the current leader's commit
+// point, so a subsequent local read sees every committed version. The
+// error from the underlying call is intentionally not surfaced — callers
+// that need the authoritative answer treat a failed fence as "couldn't
+// verify, fall back to the leader-routed slow path." Structured to avoid
+// the nilerr false positive at the call site.
+func tryEngineLinearizableFence(ctx context.Context, engine raftengine.LeaderView) bool {
+	if engine == nil {
+		return false
+	}
+	_, err := engine.LinearizableRead(ctx)
+	return err == nil
+}
+
 // ScanAt scans keys across shards at the given timestamp. Note: when the range
 // spans multiple shards, each shard may have a different Raft apply position.
 // This means the returned view is NOT a globally consistent snapshot — it is

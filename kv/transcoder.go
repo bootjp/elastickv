@@ -29,6 +29,14 @@ type OperationGroup[T OP] struct {
 	// CommitTS optionally pins the transaction commit timestamp.
 	// Coordinators choose one automatically when this is zero.
 	CommitTS uint64
+	// PrevCommitTS carries the commit timestamp of a failed previous attempt
+	// of the same single-shard transaction (option-2 one-phase idempotency
+	// dedup). It is set only on a retry that reuses the prior attempt's write
+	// set, and only flows to the one-phase apply path, where the FSM probes
+	// whether that attempt already landed and no-ops the apply if so. Zero on
+	// first attempts and on every non-retry caller. See
+	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
+	PrevCommitTS uint64
 	// ReadKeys carries the transaction's read set so the FSM can validate
 	// read-write conflicts atomically with the commit.
 	ReadKeys [][]byte
