@@ -149,9 +149,24 @@ func TestSQSServer_Throttle_SetQueueAttributesInvalidatesBucket(t *testing.T) {
 	node := sqsLeaderNode(t, nodes)
 
 	url := mustCreateQueue(t, node, "throttle-invalidate")
+	// Refill rate is intentionally slow (0.01/sec = 1 token per
+	// 100 seconds) so the drain-then-sanity window cannot
+	// accumulate a whole token. At 1/sec the test raced its own
+	// refill on slow CI runners: 10 drain sends + the sanity send
+	// (each going through Raft propose+apply at ~100-250 ms under
+	// -race) elapses ~1.1-2.75 s before the "should-throttle"
+	// assertion below fires, by which time the bucket has refilled
+	// 1+ tokens and the send returns 200 instead of the expected
+	// 400 — observed on the run-26678774684 Test workflow failure.
+	// Same mechanism as the no-op variant fixed in commit 54c6cd56
+	// (PR #819 follow-up). The test's intent — verify that a
+	// Capacity/Refill raise invalidates the bucket — is
+	// independent of the *initial* refill rate; the post-set send
+	// is exercised against the fresh Capacity=20 / Refill=20
+	// bucket regardless.
 	mustSetQueueAttributes(t, node, url, map[string]string{
 		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "1",
+		"ThrottleSendRefillPerSecond": "0.01",
 	})
 	// Drain.
 	for range 10 {
