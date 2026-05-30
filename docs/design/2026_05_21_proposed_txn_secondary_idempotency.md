@@ -544,7 +544,7 @@ preserves availability and adds correctness.
   `:duplicate-elements` / `:G-single-item-realtime` in the dedup-mode
   workflow (`.github/workflows/jepsen-test-scheduled-dedup.yml`,
   daily at 03:17 UTC). The general scheduled workflow
-  (`jepsen-test-scheduled.yml`, every 6 h) continues to run *without*
+  (`.github/workflows/jepsen-test-scheduled.yml`, every 6 h) continues to run *without*
   the gate so the legacy path stays covered — both must stay green
   for option-2 to be safe to default-on.
 - **Workflow scope rationale.** The dedup-mode workflow exercises only
