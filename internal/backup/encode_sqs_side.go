@@ -1,7 +1,9 @@
 package backup
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 
 	"github.com/cockroachdb/errors"
@@ -55,12 +57,16 @@ func sqsMsgByAgeKeyBytes(queueName string, gen uint64, sendTimestampMs int64, me
 }
 
 // sqsMsgDedupKeyBytes reproduces adapter/sqs_keys.go sqsMsgDedupKey:
-// prefix + base64url(queue) + BE-u64(gen) + base64url(dedupID).
-func sqsMsgDedupKeyBytes(queueName string, gen uint64, dedupID string) []byte {
+// prefix + base64url(queue) + BE-u64(sqsRestoreGeneration) +
+// base64url(dedupID). The live adapter signature accepts a variable gen,
+// but every M5-2 call site uses sqsRestoreGeneration (a fresh restore
+// has exactly one live generation, with no superseded counters to
+// reference), so the parameter is hardcoded here to satisfy unparam.
+func sqsMsgDedupKeyBytes(queueName, dedupID string) []byte {
 	out := make([]byte, 0, len(SQSMsgDedupPrefix)+sqsSideKeyAllocBytes)
 	out = append(out, SQSMsgDedupPrefix...)
 	out = append(out, encodeSQSSegment(queueName)...)
-	out = binary.BigEndian.AppendUint64(out, gen)
+	out = binary.BigEndian.AppendUint64(out, sqsRestoreGeneration)
 	return append(out, encodeSQSSegment(dedupID)...)
 }
 
@@ -86,6 +92,27 @@ func encodeFifoDedupRecordBytes(r *sqsFifoDedupRecord) ([]byte, error) {
 	return b, nil
 }
 
+// resolveDedupID mirrors adapter/sqs_fifo.go resolveFifoDedupID exactly: an
+// explicit MessageDeduplicationId wins; otherwise on ContentBasedDeduplication
+// queues the dedup-id is sha256(body) hex-encoded; otherwise empty (= no row).
+//
+// This is the critical CBD-correctness path: the live adapter writes only the
+// USER-SUPPLIED MessageDeduplicationId into the stored sqsStoredMessage
+// (sqs_messages.go:680), NOT the resolved one. So a CBD-FIFO message round-
+// trips through the dump as message_deduplication_id="", and a naive
+// non-empty-only gate would silently lose dedup protection on restore for
+// every CBD queue. We have to redo the live derivation at restore time.
+func resolveDedupID(rec *sqsMessageRecord, meta *sqsQueueMetaPublic) string {
+	if rec.MessageDedupID != "" {
+		return rec.MessageDedupID
+	}
+	if meta.ContentBasedDeduplication {
+		sum := sha256.Sum256(rec.Body)
+		return hex.EncodeToString(sum[:])
+	}
+	return ""
+}
+
 // addSideRecords emits the vis + byage + (conditional) dedup rows that the
 // live adapter would have written alongside the !sqs|msg|data| record M5-1
 // already stages. No !sqs|msg|group| rows are emitted at any time — see
@@ -94,15 +121,16 @@ func encodeFifoDedupRecordBytes(r *sqsFifoDedupRecord) ([]byte, error) {
 // any value would permanently block every group post-restore).
 //
 // Emission rules:
-//   - vis:   always emitted, visibleAt = rec.AvailableAtMillis (= "visible now").
-//   - byage: always emitted, sendTs = rec.SendTimestampMillis (required by the
-//     reaper to honor MessageRetentionPeriod after restore).
-//   - dedup: FIFO + non-empty MessageDedupID only; ExpiresAtMillis =
-//     SendTimestampMs + sqsFifoDedupWindowMillis.
+//   - vis:   always emitted, visibleAt = rec.AvailableAtMillis. For delayed
+//     messages captured before their delay expired this is in the future;
+//     the live ReceiveMessage path honors this exactly as it would for a
+//     fresh send (the message is invisible until the scheduled time).
+//   - byage: always emitted, sendTs = rec.SendTimestampMillis (required by
+//     the reaper to honor MessageRetentionPeriod after restore).
+//   - dedup: FIFO + resolveDedupID(rec, meta) non-empty. ExpiresAtMillis =
+//     SendTimestampMs + sqsFifoDedupWindowMillis. CBD queues get a SHA-256
+//     derived dedup-id (matches adapter/sqs_fifo.go resolveFifoDedupID).
 func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
-	if rec.MessageID == "" {
-		return errors.Wrap(ErrSQSEncodeInvalidMessage, "side records require non-empty message_id")
-	}
 	msgIDBytes := []byte(rec.MessageID)
 
 	visKey := sqsMsgVisKeyBytes(queueName, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
@@ -115,7 +143,11 @@ func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, 
 		return err
 	}
 
-	if !meta.FIFO || rec.MessageDedupID == "" {
+	if !meta.FIFO {
+		return nil
+	}
+	dedupID := resolveDedupID(rec, meta)
+	if dedupID == "" {
 		return nil
 	}
 	dedupRec := &sqsFifoDedupRecord{
@@ -128,6 +160,6 @@ func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, 
 	if err != nil {
 		return err
 	}
-	dedupKey := sqsMsgDedupKeyBytes(queueName, sqsRestoreGeneration, rec.MessageDedupID)
+	dedupKey := sqsMsgDedupKeyBytes(queueName, dedupID)
 	return b.Add(dedupKey, val, 0)
 }

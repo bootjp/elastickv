@@ -2,6 +2,8 @@ package backup
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 )
@@ -48,11 +50,16 @@ func splitSQSEntries(entries []RoundTripEntry) (data, vis, byage, dedup, group [
 	return data, vis, byage, dedup, group
 }
 
-// TestSQSEncodeSideRecordsCrossCheckClassic pins byte-identical key + value
-// output between this package and the live adapter constructors for a
-// classic FIFO queue carrying varied dedup state. It is the §"Encoder
-// cross-check" pattern the parent design mandates and the M5-2 design
-// doc lists as gold-standard. Partitioned variant deferred to M5-3.
+// TestSQSEncodeSideRecordsCrossCheckClassic pins that addSideRecords
+// produces keys consistent with this package's key builders
+// (sqsMsgVisKeyBytes, sqsMsgByAgeKeyBytes, sqsMsgDedupKeyBytes). It is the
+// §"Encoder cross-check" pattern the parent design mandates, restricted
+// to in-package parity: cross-package parity with the adapter's
+// unexported sqsMsgVisKey / sqsMsgByAgeKey / sqsMsgDedupKey is maintained
+// by manual code review of encode_sqs_side.go against the cited adapter
+// locations (the adapter functions are unexported and not callable from
+// this package, so a runtime cross-check cannot be expressed here).
+// Partitioned variant deferred to M5-3.
 func TestSQSEncodeSideRecordsCrossCheckClassic(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
@@ -84,8 +91,8 @@ func TestSQSEncodeSideRecordsCrossCheckClassic(t *testing.T) {
 		"vis[m2]":   sqsMsgVisKeyBytes(queue, sqsRestoreGeneration, fixedAvailTs+100, "m2"),
 		"byage[m1]": sqsMsgByAgeKeyBytes(queue, sqsRestoreGeneration, fixedSendTs, "m1"),
 		"byage[m2]": sqsMsgByAgeKeyBytes(queue, sqsRestoreGeneration, fixedSendTs+100, "m2"),
-		"dedup[d1]": sqsMsgDedupKeyBytes(queue, sqsRestoreGeneration, "d1"),
-		"dedup[d2]": sqsMsgDedupKeyBytes(queue, sqsRestoreGeneration, "d2"),
+		"dedup[d1]": sqsMsgDedupKeyBytes(queue, "d1"),
+		"dedup[d2]": sqsMsgDedupKeyBytes(queue, "d2"),
 	}
 	keyToValue := indexEntriesByKey(append(append(vis, byage...), dedup...))
 	for label, want := range wantKeys {
@@ -185,6 +192,41 @@ func TestSQSEncodeSideRecordsEmptyDedupOmitsDedupRow(t *testing.T) {
 	}
 	if len(dedup) != 0 {
 		t.Errorf("dedup rows for empty dedup-id = %d, want 0", len(dedup))
+	}
+}
+
+// TestSQSEncodeSideRecordsCBDDerivesDedupID pins the CBD-correctness
+// path: a FIFO queue with content_based_deduplication=true whose
+// messages have empty message_deduplication_id MUST get dedup rows
+// derived from sha256(body), matching adapter/sqs_fifo.go
+// resolveFifoDedupID. The live adapter stores only the user-supplied
+// MessageDeduplicationId on the message (sqs_messages.go:680), so the
+// dump faithfully carries an empty field for CBD sends — without
+// re-deriving the hash at restore time, every CBD queue would silently
+// lose dedup protection within the 5-minute window (claude review Obs 2
+// on PR #892).
+func TestSQSEncodeSideRecordsCBDDerivesDedupID(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "fifo-cbd"
+	writeSQSQueue(t, in, queue,
+		[]byte(`{"format_version":1,"name":"fifo-cbd","fifo":true,"content_based_deduplication":true,"partition_count":1,"generation":1}`),
+		[][]byte{
+			[]byte(`{"format_version":1,"message_id":"m1","body":"alpha","send_timestamp_millis":1700000000000,"available_at_millis":1700000000000,"sequence_number":1,"message_group_id":"g1","message_deduplication_id":""}`),
+		},
+	)
+
+	_, _, _, dedup, _ := splitSQSEntries(liveSQSEntries(t, in))
+	if len(dedup) != 1 {
+		t.Fatalf("dedup rows = %d, want 1 (CBD must derive dedup-id from sha256(body))", len(dedup))
+	}
+	// Cross-check the derived key against the same sha256 the live
+	// resolveFifoDedupID would compute for body="alpha".
+	sum := sha256.Sum256([]byte("alpha"))
+	wantDedupID := hex.EncodeToString(sum[:])
+	wantKey := sqsMsgDedupKeyBytes(queue, wantDedupID)
+	if !bytes.Equal(dedup[0].UserKey, wantKey) {
+		t.Errorf("dedup key = %x, want %x (sha256-derived from body)", dedup[0].UserKey, wantKey)
 	}
 }
 
