@@ -58,6 +58,14 @@ const (
 // emitting a record under the wrong object key.
 var ErrS3EncodeUnsupportedCollision = errors.New("backup: s3 encode object-name collision not yet supported")
 
+// ErrS3EncodeReservedPrefixCollision is returned when a user object key
+// collides with a reserved dump-control directory (_incomplete_uploads/
+// or _orphans/) — the decoder writes such keys at their natural path
+// without renaming, so the encoder cannot disambiguate them from the
+// dump's own payload. Codex P1 #842 follow-up: failing closed prevents
+// silently dropping the entire user-object subtree.
+var ErrS3EncodeReservedPrefixCollision = errors.New("backup: s3 encode user object key collides with reserved dump directory")
+
 // s3ManifestFormatVersion is the only object .elastickv-meta.json
 // format_version the encoder accepts (a dedicated manifest constant rather
 // than reusing the bucket one, though both are currently 1).
@@ -129,6 +137,39 @@ func rootEntryExists(root *os.Root, rel string) (bool, error) {
 	return true, nil
 }
 
+// reservedDirHoldsSidecar reports whether dirRel (a reserved dump dir like
+// _incomplete_uploads/ or _orphans/) contains any *.elastickv-meta.json
+// sidecar at any depth. Sidecar presence is the disambiguator: the
+// decoder's reserved-dir payload (records.jsonl, orphan .bin chunks) has
+// no sidecars; a user object whose key prefix collides with the reserved
+// name does. Missing directory is not an error.
+func reservedDirHoldsSidecar(root *os.Root, dirRel string) (bool, error) {
+	entries, err := readRootSubdirEntries(root, dirRel)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	for _, ent := range entries {
+		childRel := filepath.Join(dirRel, ent.Name())
+		if ent.IsDir() {
+			has, err := reservedDirHoldsSidecar(root, childRel)
+			if err != nil {
+				return false, errors.WithStack(err)
+			}
+			if has {
+				return true, nil
+			}
+			continue
+		}
+		if strings.HasSuffix(ent.Name(), S3MetaSuffixReserved) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // walkObjects recursively descends bucketDir, treating each non-sidecar
 // regular file as an object body whose key is its path relative to
 // bucketDir. The reserved top-level entries (_bucket.json,
@@ -153,16 +194,7 @@ func (e *S3RecordEncoder) walkObjects(b *snapshotBuilder, root *os.Root, bucketD
 func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string, ent os.DirEntry) error {
 	name := ent.Name()
 	if ent.IsDir() {
-		// TODO(M4-2b): _incomplete_uploads/ and _orphans/ are the decoder's
-		// reserved dump dirs and are skipped here, but a user object key
-		// literally prefixed with "_incomplete_uploads/" or "_orphans/"
-		// would also land here and be silently dropped. The robust fix
-		// (distinguishing reserved dumps from user keys, like the
-		// KEYMAP-tracker disambiguation) is deferred to the collision slice.
-		if rel == "" && (name == "_incomplete_uploads" || name == "_orphans") {
-			return nil
-		}
-		return e.walkObjects(b, root, bucketDir, bucketName, childRel)
+		return e.walkObjectSubdir(b, root, bucketDir, bucketName, rel, childRel)
 	}
 	switch {
 	case rel == "" && name == "_bucket.json":
@@ -177,6 +209,31 @@ func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, buc
 		// in encodeBucketObjects.
 		return e.encodeObject(b, root, bucketDir, bucketName, childRel)
 	}
+}
+
+// walkObjectSubdir handles a directory entry encountered during the
+// object walk. The reserved top-level names _incomplete_uploads/ and
+// _orphans/ are skipped — but only if they hold the decoder's own
+// payload (records.jsonl / orphan .bin chunks, none of which carry a
+// .elastickv-meta.json sidecar). A real S3 object whose key prefix
+// collides with these names (resolveObjectFilename does not rename
+// those) also lands here; its sidecar makes that detectable, and we
+// fail closed rather than silently drop the user data (codex P1 #842
+// follow-up).
+func (e *S3RecordEncoder) walkObjectSubdir(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string) error {
+	name := filepath.Base(childRel)
+	if rel != "" || (name != "_incomplete_uploads" && name != "_orphans") {
+		return e.walkObjects(b, root, bucketDir, bucketName, childRel)
+	}
+	hasUserObject, err := reservedDirHoldsSidecar(root, filepath.Join(bucketDir, childRel))
+	if err != nil {
+		return err
+	}
+	if hasUserObject {
+		return errors.Wrapf(ErrS3EncodeReservedPrefixCollision,
+			"%s/%s: rename the colliding S3 key before backup", bucketDir, name)
+	}
+	return nil
 }
 
 // encodeObject reads one object's sidecar, streams its body into blob
