@@ -1,0 +1,207 @@
+# Jepsen Scheduled Stress Test — Option-2 Dedup Mode
+#
+# Daily run with ELASTICKV_REDIS_ONEPHASE_DEDUP=1 so the demo cluster
+# exercises the option-2 idempotency path. The criterion for design doc
+# §M4 closure is 7 consecutive days of green runs with no
+# :duplicate-elements / :G-single-item-realtime anomalies in the Redis
+# workload's analysis output.
+#
+# Scope: Redis workload only. The dedup feature only ships behind the
+# Redis adapter's onePhaseTxnDedup flag (RPUSH/LPUSH, MULTI/EXEC,
+# standalone SET); DynamoDB / S3 / SQS do not route through the dedup
+# loop, so re-running them here would add hours of CI for no signal
+# on the new code path.
+#
+# Cadence: 03:17 UTC daily (off-peak; non-zero minute per ScheduleWakeup
+# guidance). The general 6-hourly scheduled workflow continues to run
+# without the dedup gate so the legacy path also stays covered.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      time-limit:
+        description: "Workload runtime seconds"
+        required: false
+        default: "300"
+      rate:
+        description: "Ops/sec per worker"
+        required: false
+        default: "10"
+      concurrency:
+        description: "Number of worker threads"
+        required: false
+        default: "8"
+      key-count:
+        description: "Number of distinct keys"
+        required: false
+        default: "16"
+      max-writes-per-key:
+        description: "Maximum writes per key before exhaustion"
+        required: false
+        default: "250"
+      max-txn-length:
+        description: "Maximum micro-ops per transaction"
+        required: false
+        default: "4"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-jepsen-dedup-scheduled
+
+name: Jepsen Scheduled Stress Test (Option-2 Dedup)
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GOCACHE: /tmp/go-build
+      # Enable the Redis adapter option-2 dedup gate for this run. This
+      # is the load-bearing differentiator from the general scheduled
+      # workflow — the demo cluster's redis adapter routes RPUSH/LPUSH,
+      # MULTI/EXEC, and standalone SET through runTransactionWithDedup,
+      # exercising the FSM exact-ts probe and the reusable<X> retry
+      # state. Anomalies in :duplicate-elements / :G-single-item-realtime
+      # under this flag indicate a regression in option-2 plumbing.
+      ELASTICKV_REDIS_ONEPHASE_DEDUP: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+      - name: Install netcat and graphviz
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz
+      - name: Install Leiningen
+        run: |
+          curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
+          chmod +x ~/lein
+          ~/lein version
+      - name: Cache Maven and Leiningen artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+      - name: Pre-fetch Go modules
+        run: |
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          export GOCACHE GOTMPDIR=/tmp/go-tmp
+          go mod download
+      - name: Warm Leiningen Maven cache
+        working-directory: jepsen
+        run: |
+          # Matches the retry pattern used in jepsen-test-scheduled.yml so
+          # both workflows fail the step (not silently succeed) when Maven
+          # Central exhausts the retry budget. The previous shape
+          # `until [ "$n" -ge 3 ]; do ~/lein deps && break; done` exited
+          # the loop on the iteration count rather than on lein-deps
+          # success; when every attempt failed the loop terminated with
+          # the last command being `sleep` (exit 0), reporting the step
+          # as green despite no dependencies being warmed -- claude[bot]
+          # PR #889 blocking finding. Backoff also aligned to 30*n
+          # seconds for parity with the general workflow.
+          set -uo pipefail
+          n=0
+          max=3
+          until ~/lein deps; do
+            n=$((n + 1))
+            if [ "$n" -ge "$max" ]; then
+              echo "lein deps failed after $n attempts" >&2
+              exit 1
+            fi
+            sleep_secs=$((n * 30))
+            echo "lein deps failed (attempt $n/$max), retrying in ${sleep_secs}s..." >&2
+            sleep "$sleep_secs"
+          done
+      - name: Launch demo cluster (dedup gate ON)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GOCACHE" /tmp/go-tmp
+          export GOTMPDIR=/tmp/go-tmp
+          # The ELASTICKV_REDIS_ONEPHASE_DEDUP=1 env var is inherited
+          # from the job env above. demo.go reads it via the redis
+          # server's WithOnePhaseTxnDedup option wired in
+          # adapter/redis.go NewRedisServer.
+          nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
+          echo $! > /tmp/elastickv-demo.pid
+
+          echo "ELASTICKV_REDIS_ONEPHASE_DEDUP=${ELASTICKV_REDIS_ONEPHASE_DEDUP}"
+          # The env var is set at the JOB level above and inherited by
+          # all `run:` steps; nothing in demo.go can intercept or unset
+          # it before NewRedisServer reads os.Getenv. So if the env var
+          # is "1" here, the dedup gate IS active in the cluster. We
+          # print it explicitly so a failed run's log makes the
+          # configuration unambiguous (vs the general 6-hourly workflow
+          # whose runs would have an empty value here).
+          if [ "${ELASTICKV_REDIS_ONEPHASE_DEDUP:-}" != "1" ]; then
+            echo "FATAL: ELASTICKV_REDIS_ONEPHASE_DEDUP is not '1' — this workflow runs only with the dedup gate on"
+            exit 2
+          fi
+
+          echo "Waiting for redis listeners (63791-63793)..."
+          for i in {1..90}; do
+            if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793; then
+              echo "Cluster is up"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Demo cluster failed to start; dumping log:"
+          tail -n 200 /tmp/elastickv-demo.log || true
+          exit 1
+      - name: Run Redis Jepsen workload (dedup mode) against elastickv
+        working-directory: jepsen
+        timeout-minutes: 10
+        run: |
+          timeout 480 ~/lein run -m elastickv.redis-workload \
+            --time-limit ${{ inputs.time-limit || '300' }} \
+            --rate ${{ inputs.rate || '10' }} \
+            --concurrency ${{ inputs.concurrency || '8' }} \
+            --key-count ${{ inputs.key-count || '16' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '250' }} \
+            --max-txn-length ${{ inputs.max-txn-length || '4' }} \
+            --ports 63791,63792,63793 \
+            --host 127.0.0.1
+      - name: Dump demo cluster log on failure
+        if: failure()
+        run: |
+          echo "=== first 200 lines (startup) ==="
+          head -n 200 /tmp/elastickv-demo.log || true
+          echo "=== last 1000 lines (most recent activity) ==="
+          tail -n 1000 /tmp/elastickv-demo.log || true
+          echo "=== full log line count ==="
+          wc -l /tmp/elastickv-demo.log || true
+      - name: Upload demo cluster log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: elastickv-demo-log-dedup
+          path: /tmp/elastickv-demo.log
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Upload Jepsen store on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-store-redis-dedup
+          path: jepsen/store
+          retention-days: 14
+      - name: Stop demo cluster
+        if: always()
+        run: |
+          if [ -f /tmp/elastickv-demo.pid ]; then
+            pid=$(cat /tmp/elastickv-demo.pid)
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi

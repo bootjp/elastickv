@@ -290,3 +290,68 @@ func TestS3EncodeLeafDataObjectRoundTrip(t *testing.T) {
 		t.Fatalf("leaf-data-named object body = %q, want %q", gotBody, body)
 	}
 }
+
+// TestS3EncodeRejectsUserObjectUnderReservedDir pins fail-closed when a
+// user S3 object key collides with the reserved dump-control directories
+// _incomplete_uploads/ or _orphans/. The decoder writes such keys at their
+// natural path (resolveObjectFilename does not rename them), so the encoder
+// must distinguish them from the dump's own payload — sidecar presence
+// inside the reserved dir is the signal. Without this guard the entire
+// user-object subtree would be silently dropped (codex P1 #842 follow-up).
+func TestS3EncodeRejectsUserObjectUnderReservedDir(t *testing.T) {
+	t.Parallel()
+	for _, dir := range []string{"_incomplete_uploads", "_orphans"} {
+		t.Run(dir, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			const bucket = "b"
+			writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"b"}`))
+			body := []byte("user object colliding with reserved prefix")
+			writeS3Object(t, in, bucket, dir+"/path/to/key", body,
+				s3ObjectSidecar("e", int64(len(body)), "text/plain", ""))
+
+			b := newSnapshotBuilder(s3EncTS)
+			if err := NewS3RecordEncoder(in).Encode(b); !errors.Is(err, ErrS3EncodeReservedPrefixCollision) {
+				t.Fatalf("Encode err = %v, want ErrS3EncodeReservedPrefixCollision", err)
+			}
+		})
+	}
+}
+
+// TestS3EncodeSkipsLegitimateReservedDumpDirs pins that a benign
+// _incomplete_uploads/records.jsonl or _orphans/<obj>/gen-N/*.bin payload
+// (no sidecars) is silently skipped, NOT treated as a collision. The
+// reserved-prefix guard must only fire when sidecar-bearing user objects
+// are present.
+func TestS3EncodeSkipsLegitimateReservedDumpDirs(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const bucket = "b"
+	writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"b"}`))
+	bucketDir := filepath.Join(in, "s3", EncodeSegment([]byte(bucket)))
+	// records.jsonl: no sidecar
+	iu := filepath.Join(bucketDir, "_incomplete_uploads")
+	if err := os.MkdirAll(iu, 0o755); err != nil {
+		t.Fatalf("MkdirAll iu: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(iu, "records.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write records.jsonl: %v", err)
+	}
+	// orphan chunk .bin: no sidecar
+	od := filepath.Join(bucketDir, "_orphans", EncodeSegment([]byte("ghost")), "gen-1")
+	if err := os.MkdirAll(od, 0o755); err != nil {
+		t.Fatalf("MkdirAll od: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(od, "0.bin"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write orphan bin: %v", err)
+	}
+	// And one legitimate object outside the reserved dirs so Encode has work to do
+	body := []byte("ok")
+	writeS3Object(t, in, bucket, "real-object", body,
+		s3ObjectSidecar("e", int64(len(body)), "text/plain", ""))
+
+	gotBody, _ := decodeS3Object(t, encodeS3Tree(t, in), bucket, "real-object")
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("real-object body = %q, want %q", gotBody, body)
+	}
+}

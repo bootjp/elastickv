@@ -234,6 +234,23 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
+\* SpecLive is Spec with the M6 fairness assumption that drives the
+\* OCC-L1 liveness property: weak fairness on Abort(t) for every txn
+\* `t` ensures that every Active or Prepared txn eventually terminates
+\* (either via Commit if its preconditions hold, or via Abort under
+\* WF).  Abort's enabling condition is `txnState[t] \in {"Active",
+\* "Prepared"}` and it never consumes opCount, so WF makes it fire
+\* eventually whenever it stays enabled — closing the OCC-L1 obligation
+\* that no transaction can stay non-terminal forever.
+\*
+\* Kept as a separate definition (not folded into Spec) so the existing
+\* MCOCC.cfg / MCOCC_gap.cfg safety runs remain pure safety checks with
+\* no fairness assumptions; only MCOCC_live.cfg points at SpecLive.
+SpecLive ==
+    /\ Init
+    /\ [][Next]_vars
+    /\ \A t \in TxnIds : WF_vars(Abort(t))
+
 \* === STATE CONSTRAINT ===
 StateConstraint ==
     /\ tsCounter <= MaxTs
@@ -337,5 +354,29 @@ OCC5_Action ==
 \* commitTs is assigned once (at Commit) and never updated.
 CommitTsAssignedOnce ==
     [][\A t \in TxnIds : commitTs[t] # 0 => commitTs'[t] = commitTs[t]]_vars
+
+\* === LIVENESS PROPERTIES (M6) ===
+
+\* OCC-L1 — every txn eventually settles into a state where it is
+\* either Idle (never started) or terminal (Committed/Aborted), and
+\* it stays there.  Prevents the "stranded txn" failure mode where a
+\* prepared write holds a lock indefinitely because the coordinator
+\* never picks up the abort path.
+\*
+\* Refers to the SpecLive definition: only checked when the harness
+\* points at SpecLive (MCOCC_live.cfg).  Under MCOCC.cfg and
+\* MCOCC_gap.cfg this property is not checked because those configs
+\* use the safety-only Spec definition without fairness.
+\*
+\* The `<>[]` form ("eventually always") matches TLC's preferred
+\* shape for terminating reactive systems: once the system reaches a
+\* state where every txn is settled, no further temporal obligation
+\* fires.  Combined with SpecLive's `WF_vars(Abort(t))`, every
+\* Active/Prepared txn that does not commit must eventually abort,
+\* so the conjunction inside `<>[]` becomes true in every fair
+\* execution.
+OCC_L1_TxnTerminates ==
+    <>[]( \A t \in TxnIds :
+            txnState[t] \in {"Idle", "Committed", "Aborted"} )
 
 =============================================================================

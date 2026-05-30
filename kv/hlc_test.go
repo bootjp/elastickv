@@ -251,3 +251,41 @@ func TestHLCNextBypassesFence(t *testing.T) {
 		_ = h.Next()
 	})
 }
+
+// TestHLCNextFencedRejectionsCounter verifies the rejection counter
+// (exposed via NextFencedRejections) increments exactly when
+// NextFenced returns ErrCeilingExpired. The monitoring layer reads
+// this counter and exports it as a Prometheus counter; if the
+// increment did not happen in lockstep with the error return, the
+// metric would silently underreport fence trips.
+func TestHLCNextFencedRejectionsCounter(t *testing.T) {
+	t.Parallel()
+
+	h := NewHLC()
+	require.Equal(t, uint64(0), h.NextFencedRejections(),
+		"freshly constructed HLC must have a zero rejection count")
+
+	// No ceiling set yet: the fence is soft, NextFenced succeeds,
+	// the counter does NOT advance.
+	_, err := h.NextFenced()
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), h.NextFencedRejections(),
+		"pre-bootstrap NextFenced must not bump the rejection counter")
+
+	// Stale ceiling: every NextFenced call must return ErrCeilingExpired
+	// AND advance the counter.
+	h.SetPhysicalCeiling(time.Now().UnixMilli() - 10_000)
+	for i := uint64(1); i <= 3; i++ {
+		_, err := h.NextFenced()
+		require.ErrorIs(t, err, ErrCeilingExpired)
+		require.Equal(t, i, h.NextFencedRejections(),
+			"counter must advance by 1 on every ErrCeilingExpired return")
+	}
+
+	// Non-fenced Next never touches the counter even with an expired
+	// ceiling (Next bypasses the fence by design).
+	priorCount := h.NextFencedRejections()
+	_ = h.Next()
+	require.Equal(t, priorCount, h.NextFencedRejections(),
+		"plain Next() must not bump the NextFenced rejection counter")
+}

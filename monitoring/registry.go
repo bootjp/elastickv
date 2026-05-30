@@ -23,6 +23,8 @@ type Registry struct {
 	writeConflict *WriteConflictMetrics
 	sqs           *SQSMetrics
 	sqsObserver   *SQSObserver
+	hlc           *HLCMetrics
+	hlcObserver   *HLCObserver
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -47,6 +49,8 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.writeConflict = newWriteConflictMetrics(registerer)
 	r.sqs = newSQSMetrics(registerer)
 	r.sqsObserver = newSQSObserver(r.sqs)
+	r.hlc = newHLCMetrics(registerer)
+	r.hlcObserver = newHLCObserver(r.hlc)
 	return r
 }
 
@@ -209,4 +213,20 @@ func (r *Registry) WriteConflictCollector() *WriteConflictCollector {
 		return nil
 	}
 	return newWriteConflictCollector(r.writeConflict)
+}
+
+// HLCObserver returns the HLC physical-ceiling + fence-rejection
+// observer backed by this registry. Same shape as SQSObserver: a
+// single observer is constructed inside NewRegistry and returned by
+// reference here, so callers that pull it more than once observe
+// the same lastRejections delta state (returning a fresh observer
+// each call would reset lastRejections and risk double-counting
+// rejections against the cumulative Prometheus counter — claude
+// review on PR #879). Returns nil if r is nil so test fixtures
+// can drop the observer without conditional wiring.
+func (r *Registry) HLCObserver() *HLCObserver {
+	if r == nil || r.hlcObserver == nil {
+		return nil
+	}
+	return r.hlcObserver
 }

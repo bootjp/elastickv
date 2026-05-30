@@ -93,10 +93,11 @@ func (c *retryOnceCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (u
 }
 
 type recordingConn struct {
-	ctx  any
-	err  string
-	bulk []byte
-	int  int64
+	ctx       any
+	err       string
+	bulk      []byte
+	int       int64
+	wroteNull bool
 }
 
 func (c *recordingConn) RemoteAddr() string { return "" }
@@ -129,6 +130,7 @@ func (c *recordingConn) WriteUint64(num uint64) {
 func (c *recordingConn) WriteArray(count int) {}
 func (c *recordingConn) WriteNull() {
 	c.bulk = nil
+	c.wroteNull = true
 }
 func (c *recordingConn) WriteRaw(data []byte) {
 	c.bulk = append([]byte(nil), data...)

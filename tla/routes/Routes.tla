@@ -115,12 +115,59 @@ CatalogWatcherSync(n) ==
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<catalogVersion>>
 
+(***************************************************************************)
+(* CatalogWatcherSyncLatest(n): a refinement of CatalogWatcherSync         *)
+(* whose v choice is fixed to the current catalogVersion (i.e. always      *)
+(* "pick the latest").  Behaviourally a subset of CatalogWatcherSync —     *)
+(* every CatalogWatcherSyncLatest(n) transition is also a valid             *)
+(* CatalogWatcherSync(n) transition — so safety properties are              *)
+(* preserved.  Exists as a separate action so the liveness model can       *)
+(* assert weak fairness on it: WF on the parent action does not guarantee  *)
+(* convergence (the watcher could fire infinitely often always picking a   *)
+(* version < catalogVersion), but WF on the latest-picking sub-action      *)
+(* does — it must eventually fire when its enabling condition              *)
+(* `engineVersion[n] < catalogVersion` holds.  Matches the implementation: *)
+(* the production CatalogWatcher always reads the current catalog          *)
+(* snapshot, never an intermediate version.                                *)
+(***************************************************************************)
+CatalogWatcherSyncLatest(n) ==
+    /\ engineVersion[n] < catalogVersion
+    /\ engineVersion'     = [engineVersion     EXCEPT ![n] = catalogVersion]
+    /\ engineMaxObserved' = [engineMaxObserved EXCEPT ![n] = catalogVersion]
+    /\ UNCHANGED <<catalogVersion, opCount>>
+
 \* === NEXT ===
 Next ==
     \/ ProposeRouteChange
     \/ \E n \in Nodes : CatalogWatcherSync(n)
+    \/ \E n \in Nodes : CatalogWatcherSyncLatest(n)
 
 Spec == Init /\ [][Next]_vars
+
+\* SpecLive is Spec with the M6 fairness assumption that drives
+\* Routes-L1: weak fairness on CatalogWatcherSyncLatest(n) for every
+\* node `n` ensures the watcher eventually converges to the current
+\* catalog version.  WF on the parent CatalogWatcherSync(n) action
+\* alone is NOT enough: the parent's `v` choice is non-deterministic
+\* and a fair execution can pick v < catalogVersion forever, so
+\* engineVersion[n] would stay below the catalog.  The
+\* CatalogWatcherSyncLatest refinement pins v = catalogVersion and
+\* is enabled exactly when engineVersion[n] < catalogVersion, so WF
+\* on it forces convergence.
+\*
+\* This matches the production code: the CatalogWatcher reads the
+\* current catalog snapshot every tick, never an intermediate one.
+\* The intermediate flexibility in CatalogWatcherSync was for the
+\* safety gap config (modelling a buggy watcher that overwrites with
+\* a stale version), not for the realistic behaviour.
+\*
+\* Kept as a separate definition so the existing safety configs
+\* (MCRoutes.cfg / MCRoutes_gap.cfg) remain pure safety checks.  Only
+\* MCRoutes_live.cfg points at SpecLive.
+SpecLive ==
+    /\ Init
+    /\ [][Next]_vars
+    /\ \A n \in Nodes : WF_vars(CatalogWatcherSyncLatest(n))
 
 \* === STATE CONSTRAINT ===
 StateConstraint ==
@@ -179,5 +226,35 @@ Routes1_Action ==
 \* per node and the ghost record is monotonic too" claim.
 Routes4_GhostMonotonic ==
     [][\A n \in Nodes : engineMaxObserved'[n] >= engineMaxObserved[n]]_vars
+
+\* === LIVENESS PROPERTIES (M6) ===
+
+\* Routes-L1 — eventual fan-out.  Every node's RouteEngine
+\* eventually catches up to the current catalog version (in this
+\* bounded model: once catalogVersion stops at MaxVersions, every node
+\* must eventually reach engineVersion[n] = catalogVersion).
+\*
+\* Implementation correspondence: the CatalogWatcher polls the durable
+\* catalog (`distribution/watcher.go SyncOnce`) on a fixed interval,
+\* and the WF assumption captures the guarantee that the polling loop
+\* makes progress for every node.  Routes-L1 is the load-bearing
+\* liveness property for the route-catalog plane: without it, a
+\* watcher stall on a single node would silently leave that node
+\* routing to a stale group.
+\*
+\* The `<>[]` form ("eventually always") matches TLC's preferred
+\* shape for liveness in terminating reactive systems: once every
+\* node has caught up to the current catalogVersion, no further
+\* obligation fires.  With SpecLive's WF_vars(CatalogWatcherSyncLatest(n))
+\* this holds because catalogVersion is finite in the model and
+\* CatalogWatcherSyncLatest(n) is enabled whenever engineVersion[n] <
+\* catalogVersion.  Note that WF on the parent action
+\* CatalogWatcherSync(n) is NOT enough — its v choice is
+\* non-deterministic and a fair execution could pick v <
+\* catalogVersion forever, leaving the convergence obligation
+\* unsatisfied; the refined "pick latest" sub-action exists
+\* precisely for this fairness pin (coderabbit minor on PR #880).
+Routes_L1_EventualFanOut ==
+    <>[]( \A n \in Nodes : engineVersion[n] = catalogVersion )
 
 =============================================================================
