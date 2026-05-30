@@ -52,10 +52,6 @@ func TestStandaloneSetDedup_LandedPriorAttempt_ReturnsOK(t *testing.T) {
 // loop reuses the cached resultNil and the recording conn observes
 // wroteNull. Without correct resultNil arming the client would observe an
 // empty bulk reply, breaking NX semantics under dedup.
-//
-// Closes the claude[bot] PR #888 review's test-gap observation that the
-// NX/XX/GET result types from applySet were not covered by the dedup
-// suite.
 func TestStandaloneSetDedup_NXMissReturnsNil(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -75,7 +71,7 @@ func TestStandaloneSetDedup_NXMissReturnsNil(t *testing.T) {
 	// Airtight assertion: WriteNull was actually called (not "nothing was
 	// written, leaving the zero-value nil"). Without the wroteNull witness
 	// flag, a wrong branch that wrote nothing at all would also pass
-	// `conn.bulk == nil` -- claude[bot] PR #888 round-2 hardening.
+	// `conn.bulk == nil`.
 	require.True(t, conn.wroteNull, "NX miss must call WriteNull, not silently skip the write")
 	require.Nil(t, conn.bulk, "WriteNull leaves conn.bulk nil; a stray WriteString/WriteBulk would have populated it")
 	require.Empty(t, conn.err, "no error must escape; NX miss is a normal response, not an error")
