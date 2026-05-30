@@ -51,10 +51,28 @@ plaintext entry at `index > cutover`.
    wrap vs plaintext per entry.
 3. **Coordinator wrap-on-propose switch** —
    `kv/coordinator.go` / `kv/sharded_coordinator.go` consult an
-   in-process `wrapOnPropose` flag (set by the cutover barrier,
-   reset never within a process lifetime) before calling
+   in-process `wrapOnPropose` flag before calling
    `engine.Propose`. Phase-2 leaders wrap; Phase-0/1 leaders
    propose plaintext exactly as today.
+
+   **Startup initialization (load-bearing)**: the flag is
+   `true` when the local sidecar's `RaftEnvelopeCutoverIndex
+   != 0`, otherwise `false`. The check runs once during
+   coordinator construction (after the sidecar is hydrated
+   per Stage 6C-2). Without this startup rule, a node that
+   restarts after the cluster has already cut over would
+   default to `false`, propose plaintext as a leader, and
+   the engine apply-hook (which uses the sidecar — not the
+   in-process flag — as the source of truth) would attempt
+   `Unwrap` on those plaintext entries, fail GCM, and halt
+   apply cluster-wide (gemini HIGH on PR #893).
+
+   Once set, the flag is never reset within a process
+   lifetime. It is set by exactly two paths:
+   - Startup: `sidecar.RaftEnvelopeCutoverIndex != 0` →
+     immediately `true` (the cluster cut over earlier).
+   - Runtime: §7.1 step 5 of the cutover barrier (the
+     cluster is cutting over right now on this leader).
 
 ### 2.2 The §7.1 6-step quiescence barrier
 
@@ -111,12 +129,23 @@ notion of it. The unwrap therefore lives in
 `internal/raftengine/etcd/engine.go::applyNormalEntry`, **before**
 the FSM apply call. Concretely:
 
+The actual codebase signature (verified against
+`internal/raftengine/etcd/engine.go:2226`):
+- `applyNormalEntry(entry) (any, error)` — returns the FSM
+  response and any error. The caller
+  (`applyNormalCommitted`, line 2173) does the `setApplied`
+  and `resolveProposal` after this returns. On a non-nil
+  error, `applyNormalCommitted` skips `setApplied` so the
+  next restart replays the entry — the existing fail-closed
+  shape. 6E-2 adds the unwrap shim inside
+  `applyNormalEntry`; no caller signature change.
+
 ```go
 // internal/raftengine/etcd/engine.go::applyNormalEntry
-func (e *engine) applyNormalEntry(entry raftpb.Entry) error {
+func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
     id, maybeEncPayload, ok := decodeProposalEnvelope(entry.Data)
     if !ok {
-        return nil // pre-envelope entry, leave intact
+        return nil, nil // pre-envelope entry, leave intact
     }
     payload := maybeEncPayload
     // §6.3 hook: unwrap only at index strictly greater than
@@ -129,25 +158,25 @@ func (e *engine) applyNormalEntry(entry raftpb.Entry) error {
         payload, err = e.encryption.RaftDEK().Unwrap(maybeEncPayload)
         if err != nil {
             // GCM tag mismatch = sidecar/keystore divergence
-            // or on-disk corruption. Halt apply WITHOUT
-            // setApplied so the next restart replays this
-            // entry under a corrected keystore. Silent skip
-            // would diverge the FSM.
-            return errors.Wrap(err, "raft envelope: unwrap")
-            // engine treats this as ErrRaftUnwrapFailed → fatal
+            // or on-disk corruption. Return the error so
+            // applyNormalCommitted skips setApplied; the next
+            // restart replays under a corrected keystore.
+            // Silent skip would diverge the FSM.
+            return nil, errors.Wrap(err, "raft envelope: unwrap")
+            // applyNormalCommitted treats as ErrRaftUnwrapFailed → fatal
         }
     }
-    response := e.fsm.Apply(payload)
-    e.resolveProposal(entry.Index, entry.Data, response)
-    return nil
+    return e.fsm.Apply(payload), nil
 }
 ```
 
 **CRITICAL**: `decodeProposalEnvelope` must run FIRST so the
-proposal-ID handoff to `resolveProposal` stays intact. The raft
-envelope wraps the FSM payload *inside* the proposal envelope;
-wrapping `entry.Data` itself would clobber the proposal-envelope
-version byte and break every coordinator write (timeout forever).
+proposal-ID handoff that `applyNormalCommitted`'s
+`resolveProposal` call (line 2187) depends on stays intact.
+The raft envelope wraps the FSM payload *inside* the
+proposal envelope; wrapping `entry.Data` itself would
+clobber the proposal-envelope version byte and break every
+coordinator write (timeout forever).
 
 ## 3. Milestone breakdown
 
@@ -265,7 +294,7 @@ applied index via the existing crash-durable
 field has been on disk since 6D shipped; only its
 load-bearingness changes per milestone.
 
-## 5. Why the cutover entry is unwrapped at index == cutover
+## 5. Why the cutover entry is NOT unwrapped at index == cutover
 
 §7.1 step 4 says: "wait for that entry to commit AND for the
 local FSM apply to set `raft_envelope_cutover_index`". The
@@ -330,6 +359,16 @@ or unwrapped-then-not-wrapped.
   `wrapOnPropose = false`, proposals are plaintext; flip to
   true; subsequent proposals are wrapped. Pin against any
   in-process race that could flip the flag mid-proposal.
+- `TestCoordinatorWrap_StartupInitFromSidecar` — pins the
+  gemini-HIGH fix (PR #893): construct a coordinator with a
+  sidecar whose `RaftEnvelopeCutoverIndex != 0`; the
+  in-process `wrapOnPropose` flag MUST be `true` immediately
+  after construction (before any cutover barrier runs).
+  Construct with cutover = 0 → flag MUST be `false`. Without
+  this, a post-cutover restart that becomes leader would
+  propose plaintext at `index > cutover`, the engine
+  apply-hook would attempt `Unwrap`, fail GCM, and halt
+  apply cluster-wide.
 - `TestPhase2EndToEnd_ProposeWrapApplyUnwrap` — full
   round-trip: coordinator wraps, engine unwraps, FSM
   applies, value lands in the store correctly.
