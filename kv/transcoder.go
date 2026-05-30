@@ -40,4 +40,15 @@ type OperationGroup[T OP] struct {
 	// ReadKeys carries the transaction's read set so the FSM can validate
 	// read-write conflicts atomically with the commit.
 	ReadKeys [][]byte
+	// ObservedRouteVersion is the durable catalog version this
+	// transaction's read set was captured at (typically set on
+	// BeginTxn from distribution.Engine.Version()).  Zero means
+	// "unpinned" — every existing caller leaves it at zero so this
+	// is behaviour-neutral on the M1 plumbing PR.  M3 of the
+	// Composed-1 design
+	// (docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md)
+	// will gate the FSM apply path on this version so a route shift
+	// between BeginTxn and Commit is caught before it can produce a
+	// G1c anomaly across a cross-group MoveRange / SplitRange.
+	ObservedRouteVersion uint64
 }
