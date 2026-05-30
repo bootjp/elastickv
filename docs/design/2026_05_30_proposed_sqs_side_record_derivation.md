@@ -100,7 +100,7 @@ Wire into `encode_sqs.go`'s existing `encodeQueueMessages` walk: after `addMessa
 2. **Concurrency / distributed failures.** Pure offline derivation; no Raft, no lock ordering. The restored cluster's first sends/receives go through the normal OCC path against the restored state.
 3. **Performance.** Each side row is one `snapshotBuilder.Add` per data row (vis/byage), plus dedup-when-present. No additional disk reads. Snapshot size grows ~2-3× the message count, all small fixed-width keys. (Group rows are not emitted — see families table.)
 4. **Data consistency.** Group rows MUST NOT be emitted at all: `loadFifoGroupLock` treats key presence as "lock held" with no graceful "empty owner = no lock" decode path, so any row would permanently block receives for the group (gemini critical #885 — pinned by `TestSQSEncodeSideRecordsNoGroupRows`). Dedup rows MUST be gated on non-empty `message_dedup_id`. FIFO-only families (dedup) MUST be gated on `meta.FIFO`; emitting them for standard queues poisons the keyspace. All three rules pinned by tests above.
-5. **Test coverage.** Two cross-check tests (classic + partitioned) match what M3b-3 did for DDB GSI; two end-to-end restore tests pin the rationale; three negative tests pin the conditional-emission rules.
+5. **Test coverage.** One cross-check test (classic only; partitioned variant deferred to M5-3) mirrors what M3b-3 did for DDB GSI; two end-to-end restore tests pin the rationale; three negative tests pin the conditional-emission rules.
 
 ## Milestones / sequencing
 
