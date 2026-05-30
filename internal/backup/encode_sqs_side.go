@@ -12,6 +12,12 @@ import (
 // will be expired the next time the live FIFO send path inspects them.
 const sqsFifoDedupWindowMillis int64 = 5 * 60 * 1000
 
+// sqsSideKeyAllocBytes mirrors the live adapter's sqsKeyCapLarge tuning
+// (adapter/sqs_messages.go:68): a 64-byte tail after the prefix is large
+// enough to hold the BE-u64 generation + visibleAt + base64url(messageID)
+// for typical queue / message IDs without forcing a re-allocation.
+const sqsSideKeyAllocBytes = 64
+
 // sqsFifoDedupRecord mirrors the live struct at adapter/sqs_fifo.go:25.
 // Duplicated here (rather than imported) so the encoder package can run
 // without a circular dependency on adapter, matching the pattern M3b-3
@@ -28,7 +34,8 @@ type sqsFifoDedupRecord struct {
 // base64url(messageID). Negative visibleAt clamps to zero, matching the
 // live uint64MaxZero helper.
 func sqsMsgVisKeyBytes(queueName string, gen uint64, visibleAtMillis int64, messageID string) []byte {
-	out := []byte(SQSMsgVisPrefix)
+	out := make([]byte, 0, len(SQSMsgVisPrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSMsgVisPrefix...)
 	out = append(out, encodeSQSSegment(queueName)...)
 	out = binary.BigEndian.AppendUint64(out, gen)
 	out = binary.BigEndian.AppendUint64(out, sqsClampNonNegativeMillis(visibleAtMillis))
@@ -39,7 +46,8 @@ func sqsMsgVisKeyBytes(queueName string, gen uint64, visibleAtMillis int64, mess
 // prefix + base64url(queue) + BE-u64(gen) + BE-u64(sendTs) +
 // base64url(messageID). Negative sendTs clamps to zero.
 func sqsMsgByAgeKeyBytes(queueName string, gen uint64, sendTimestampMs int64, messageID string) []byte {
-	out := []byte(SQSMsgByAgePrefix)
+	out := make([]byte, 0, len(SQSMsgByAgePrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSMsgByAgePrefix...)
 	out = append(out, encodeSQSSegment(queueName)...)
 	out = binary.BigEndian.AppendUint64(out, gen)
 	out = binary.BigEndian.AppendUint64(out, sqsClampNonNegativeMillis(sendTimestampMs))
@@ -49,7 +57,8 @@ func sqsMsgByAgeKeyBytes(queueName string, gen uint64, sendTimestampMs int64, me
 // sqsMsgDedupKeyBytes reproduces adapter/sqs_keys.go sqsMsgDedupKey:
 // prefix + base64url(queue) + BE-u64(gen) + base64url(dedupID).
 func sqsMsgDedupKeyBytes(queueName string, gen uint64, dedupID string) []byte {
-	out := []byte(SQSMsgDedupPrefix)
+	out := make([]byte, 0, len(SQSMsgDedupPrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSMsgDedupPrefix...)
 	out = append(out, encodeSQSSegment(queueName)...)
 	out = binary.BigEndian.AppendUint64(out, gen)
 	return append(out, encodeSQSSegment(dedupID)...)
@@ -90,18 +99,19 @@ func encodeFifoDedupRecordBytes(r *sqsFifoDedupRecord) ([]byte, error) {
 //     reaper to honor MessageRetentionPeriod after restore).
 //   - dedup: FIFO + non-empty MessageDedupID only; ExpiresAtMillis =
 //     SendTimestampMs + sqsFifoDedupWindowMillis.
-func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, meta sqsQueueMetaPublic, rec sqsMessageRecord) error {
+func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
 	if rec.MessageID == "" {
 		return errors.Wrap(ErrSQSEncodeInvalidMessage, "side records require non-empty message_id")
 	}
+	msgIDBytes := []byte(rec.MessageID)
 
 	visKey := sqsMsgVisKeyBytes(queueName, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
-	if err := b.Add(visKey, []byte(rec.MessageID), 0); err != nil {
+	if err := b.Add(visKey, msgIDBytes, 0); err != nil {
 		return err
 	}
 
 	byAgeKey := sqsMsgByAgeKeyBytes(queueName, sqsRestoreGeneration, rec.SendTimestampMillis, rec.MessageID)
-	if err := b.Add(byAgeKey, []byte(rec.MessageID), 0); err != nil {
+	if err := b.Add(byAgeKey, msgIDBytes, 0); err != nil {
 		return err
 	}
 

@@ -211,7 +211,7 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 		if err != nil {
 			return err
 		}
-		if err := e.addSideRecords(b, meta.Name, meta, records[i]); err != nil {
+		if err := e.addSideRecords(b, meta.Name, &meta, &records[i]); err != nil {
 			return err
 		}
 		if seq > maxSeq {
