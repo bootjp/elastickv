@@ -538,9 +538,30 @@ preserves availability and adds correctness.
 - Local Jepsen reproduction. Because the trigger is election churn
   (see "Resolved" below), reproduce by running the 3-node demo under
   CPU pressure or with shortened election timeouts so leadership
-  flaps during the workload.
-- Scheduled Jepsen run goes 7 consecutive days without
-  `:duplicate-elements` / `:G-single-item-realtime`.
+  flaps during the workload. Local script: `make jepsen-redis` against
+  `cmd/server/demo.go` with `ELASTICKV_REDIS_ONEPHASE_DEDUP=1`.
+- **Scheduled Jepsen run criterion.** 7 consecutive days without
+  `:duplicate-elements` / `:G-single-item-realtime` in the dedup-mode
+  workflow (`.github/workflows/jepsen-test-scheduled-dedup.yml`,
+  daily at 03:17 UTC). The general scheduled workflow
+  (`jepsen-test-scheduled.yml`, every 6 h) continues to run *without*
+  the gate so the legacy path stays covered — both must stay green
+  for option-2 to be safe to default-on.
+- **Workflow scope rationale.** The dedup-mode workflow exercises only
+  the Redis workload. The dedup feature ships behind the Redis
+  adapter's `onePhaseTxnDedup` flag (RPUSH/LPUSH via
+  `listPushCoreWithDedup`, MULTI/EXEC via `runTransactionWithDedup`,
+  standalone SET via single-mop EXEC routing); DynamoDB / S3 / SQS do
+  not route through the dedup loop, so re-running them under the gate
+  would add hours of CI for zero signal on the new code path.
+- **Demo cluster gate confirmation.** The launch step asserts
+  `ELASTICKV_REDIS_ONEPHASE_DEDUP=1` before waiting on the listeners.
+  The env var is set at the workflow job level and inherited by every
+  `run:` step — nothing in `demo.go` can intercept or unset it before
+  `NewRedisServer` reads `os.Getenv`. A misconfigured workflow (e.g.
+  the env var dropped during a careless edit) exits non-zero
+  immediately rather than producing a clean run that would prove
+  nothing about the dedup code path.
 
 Scope estimate: M1–M3 are adapter + one `store` helper + a one-field
 one-phase request change (~250 LOC Go + tests), no FSM dedup table, no GC.
