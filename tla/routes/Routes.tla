@@ -245,10 +245,15 @@ Routes4_GhostMonotonic ==
 \* The `<>[]` form ("eventually always") matches TLC's preferred
 \* shape for liveness in terminating reactive systems: once every
 \* node has caught up to the current catalogVersion, no further
-\* obligation fires.  With SpecLive's WF on CatalogWatcherSync(n)
+\* obligation fires.  With SpecLive's WF_vars(CatalogWatcherSyncLatest(n))
 \* this holds because catalogVersion is finite in the model and
-\* CatalogWatcherSync(n) is enabled whenever engineVersion[n] <
-\* catalogVersion.
+\* CatalogWatcherSyncLatest(n) is enabled whenever engineVersion[n] <
+\* catalogVersion.  Note that WF on the parent action
+\* CatalogWatcherSync(n) is NOT enough — its v choice is
+\* non-deterministic and a fair execution could pick v <
+\* catalogVersion forever, leaving the convergence obligation
+\* unsatisfied; the refined "pick latest" sub-action exists
+\* precisely for this fairness pin (coderabbit minor on PR #880).
 Routes_L1_EventualFanOut ==
     <>[]( \A n \in Nodes : engineVersion[n] = catalogVersion )
 
