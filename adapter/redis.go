@@ -3109,7 +3109,16 @@ type reusableExecTxn struct {
 // is the current length" question; the client-visible result IS the
 // cached results array.
 func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableExecTxn) (results []redisResult, drop bool, err error) {
-	commitTS := r.coordinator.Clock().Next()
+	// gemini PR-A HIGH: persistence-grade commit_ts allocation must honor the
+	// HLC-4 physical-ceiling fence (see kv/hlc.go NextFenced + the TLA proof
+	// at tla/hlc/MCHLC_gap.cfg). Clock().Next() bypasses the ceiling and
+	// could issue a timestamp that collides with a subsequent leader's
+	// window after renewal — the very class of bug option-2 is meant to
+	// rule out.
+	commitTS, allocErr := r.coordinator.Clock().NextFenced()
+	if allocErr != nil {
+		return nil, false, errors.Wrap(allocErr, "redis exec reuse: allocate commitTS")
+	}
 	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:        true,
 		StartTS:      pending.startTS,
@@ -3172,7 +3181,17 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 	var pending *reusableExecTxn
 	err := r.retryRedisWrite(dispatchCtx, func() error {
 		if pending != nil {
-			reuseCtx, reuseCancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+			// gemini PR-A MEDIUM: derive the per-attempt reuse ctx from the
+			// caller's `dispatchCtx` (not `r.handlerContext()`) so a cancelled
+			// caller stops the reuse promptly. Per-attempt `redisDispatchTimeout`
+			// still caps the dispatch the same way `commit()` does for the
+			// first attempt; what changes is that an outer cancellation can
+			// now interrupt mid-attempt instead of being ignored until the
+			// fresh 10 s budget elapses. The earlier "fresh ctx from
+			// handlerContext" pattern (noted in design doc §M3) was strictly
+			// more conservative but wasted resources on a disconnected
+			// client — see PR #887 review.
+			reuseCtx, reuseCancel := context.WithTimeout(dispatchCtx, redisDispatchTimeout)
 			defer reuseCancel()
 			res, drop, dispErr := r.dispatchExecReuse(reuseCtx, pending)
 			if drop {

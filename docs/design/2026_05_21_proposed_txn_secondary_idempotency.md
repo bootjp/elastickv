@@ -500,14 +500,20 @@ preserves availability and adds correctness.
        the slice is discarded in the empty-elems path — but the doc
        acknowledges the small semantic shift so a future reader does
        not flag it as an oversight.
-    2. The reuse path in `runTransactionWithDedup` derives a fresh
+    2. ~~The reuse path in `runTransactionWithDedup` derives a fresh
        per-attempt `reuseCtx` from `handlerContext()` rather than
-       reusing the outer `dispatchCtx`. Each reuse attempt thus gets a
-       full `redisDispatchTimeout`, strictly more conservative than
-       `listPushCoreWithDedup` (which threads the caller ctx through).
-       Chosen so a half-expired ctx never cuts a reuse attempt short
-       on the retry path; consistent with `prepareDispatch()`'s
-       per-attempt fresh-ctx pattern in `commit()`.
+       reusing the outer `dispatchCtx`.~~ **Reverted per PR #887 review:**
+       the original "more conservative" framing ignored that a
+       disconnected client cannot benefit from the extra fresh-timeout
+       budget — the wasted 10 s reuse work would never reach a waiting
+       caller. `reuseCtx` is now derived from `dispatchCtx` so an outer
+       cancellation interrupts mid-attempt, matching
+       `listPushCoreWithDedup`'s pattern (which threads the caller ctx
+       through). Per-attempt `redisDispatchTimeout` still caps the
+       dispatch the same way `commit()` does for the first attempt;
+       what changes is that an expired outer ctx is now respected
+       promptly instead of being ignored until the fresh budget
+       elapses.
 - **Standalone write commands (SET/INCR/HSET/...) — still open.** The EXEC
   path covers MULTI bodies; standalone single-command dispatch goes through
   per-handler paths (`applySet`, `applyIncr`, etc.) and needs the same
