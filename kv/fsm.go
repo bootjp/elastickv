@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -50,6 +51,19 @@ type kvFSM struct {
 	// write", preserving Stage 6A behavior for backends that did
 	// not opt in).
 	pendingApplyIdx uint64
+	// cutoverSource provides the writer-side view of the Phase-2
+	// envelope cutover index for snapshot v1/v2 selection (Stage
+	// 8a §3.3). nil = always v1 output.
+	cutoverSource CutoverSource
+	// snapLatch enforces the §3.3 no-downgrade invariant: once a
+	// non-zero cutover is observed, all subsequent snapshots from
+	// this FSM emit v2 even if the sidecar later reads 0.
+	snapLatch noDowngradeLatch
+	// restoredCutover is the Stage 8a §3.4 snapshot-to-applier
+	// handoff: Restore stores the v2 cutover here for Stage 6E's
+	// apply-hook to consume. Stays 0 for v1 restores and headerless
+	// legacy paths (matches the pre-Phase-2 posture exactly).
+	restoredCutover uint64
 }
 
 // SetApplyIndex implements raftengine.ApplyIndexAware. The engine
@@ -81,6 +95,16 @@ func WithEncryption(applier EncryptionApplier) FSMOption {
 	}
 }
 
+// WithCutoverSource installs the Stage 8a §3.3 writer-side view of the
+// Phase-2 envelope cutover index. The FSM consults it once per Snapshot
+// call to decide v1 vs v2 layout. Pass nil (or omit the option) to keep
+// the pre-8a posture where every snapshot is v1.
+func WithCutoverSource(src CutoverSource) FSMOption {
+	return func(f *kvFSM) {
+		f.cutoverSource = src
+	}
+}
+
 // NewKvFSMWithHLC creates a KV FSM that updates hlc.physicalCeiling whenever
 // a HLC lease entry is applied. The caller must pass the same *HLC instance to
 // the coordinator so both sides share the agreed physical ceiling.
@@ -99,6 +123,7 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
 	for _, opt := range opts {
 		opt(f)
 	}
+	f.snapLatch.log = f.log
 	return f
 }
 
@@ -351,36 +376,47 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 		return nil, errors.WithStack(err)
 	}
 
+	cutover := uint64(0)
+	if f.cutoverSource != nil {
+		cutover = f.cutoverSource.RaftEnvelopeCutoverIndex()
+	}
+	emitted := f.snapLatch.observe(cutover)
+	useV2 := emitted != 0 || f.snapLatch.latched()
+
 	return &kvFSMSnapshot{
 		snapshot:  snapshot,
 		ceilingMs: hlcCeilingFromHLC(f.hlc),
+		cutover:   emitted,
+		useV2:     useV2,
 	}, nil
 }
 
 func (f *kvFSM) Restore(r io.Reader) error {
-	// Read the potential 16-byte header (magic + ceiling ms).
-	var hdr [hlcSnapshotHeaderLen]byte
-	n, err := io.ReadFull(r, hdr[:])
+	// Stage 8a §3.2: the bufio.Reader is owned by the caller (us) and
+	// MUST be passed unchanged to the inner-store path on every branch
+	// — buffered bytes can sit between the header consumption and the
+	// inner-store read; switching readers silently loses them.
+	br := bufio.NewReader(r)
+	ceilingU, cutover, err := ReadSnapshotHeader(br)
 	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			// Small (or empty) old-format snapshot: fewer than hlcSnapshotHeaderLen
-			// bytes were available. Treat the partial read as legacy store data.
-			return errors.WithStack(f.store.Restore(io.NopCloser(io.MultiReader(bytes.NewReader(hdr[:n]), r))))
-		}
 		return errors.WithStack(err)
 	}
-
-	if bytes.Equal(hdr[:8], hlcSnapshotMagic[:]) {
-		// New format: restore ceiling, then restore store from remaining bytes.
-		ceilingMs := int64(binary.BigEndian.Uint64(hdr[8:])) //nolint:gosec // ceiling is a Unix ms timestamp encoded as uint64
-		if f.hlc != nil && ceilingMs > 0 {
-			f.hlc.SetPhysicalCeiling(ceilingMs)
-		}
-		return errors.WithStack(f.store.Restore(io.NopCloser(r)))
+	if f.hlc != nil && ceilingU > 0 {
+		f.hlc.SetPhysicalCeiling(int64(ceilingU)) //nolint:gosec // ceiling is a Unix ms timestamp encoded as uint64
 	}
+	// §3.4 snapshot-to-applier handoff: store the cutover for Stage
+	// 6E's apply-hook to read on the next apply. Stays 0 for v1 and
+	// headerless-legacy restores.
+	f.restoredCutover = cutover
+	return errors.WithStack(f.store.Restore(io.NopCloser(br)))
+}
 
-	// Old format (no magic): re-prepend the 16 bytes we already consumed.
-	return errors.WithStack(f.store.Restore(io.NopCloser(io.MultiReader(bytes.NewReader(hdr[:]), r))))
+// RestoredCutover returns the most recently restored v2
+// raft_envelope_cutover_index, or 0 if the last Restore was v1 / headerless
+// / has not yet been called. Stage 6E will consume this from the apply
+// hook; visible here for test inspection (design §3.4 + §5).
+func (f *kvFSM) RestoredCutover() uint64 {
+	return f.restoredCutover
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
