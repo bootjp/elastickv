@@ -6,6 +6,74 @@ import (
 	"testing"
 )
 
+// === SQS throttle test refill-rate guardrail ============================
+//
+// The throttle refill rate in this file is a recurring CI-flake vector.
+// Every test that (a) sets a `ThrottleSend/RecvRefillPerSecond` AND
+// (b) drains the bucket then asserts a "throttled" response is racing
+// its own wall clock — under `-race` on slow CI runners each request
+// elapses ~100-250 ms (Raft propose+apply), so an N-write drain plus
+// the assertion send takes ~N×150 ms ± noise. At Refill=1/sec the
+// bucket accumulates ≥1 token over that window and the "throttled"
+// assertion fires against a refilled bucket, returning 200 instead
+// of the expected 400.
+//
+// Three commits have fixed exactly this in three different tests:
+//   54c6cd56  NoOpSetQueueAttributesPreservesBucket  (PR #819)
+//   204b7294  SetQueueAttributesInvalidatesBucket    (PR #890)
+//   <THIS>    structural fix across the remaining drain-pattern tests
+//
+// Rule for new tests in this file:
+//
+//   • If the test drains a bucket and asserts a 400 throttle, the
+//     refill MUST be `slowRefillRate` (1 token per 100 s). Use the
+//     helpers `newSendThrottleAttrs` / `newRecvThrottleAttrs`.
+//   • If the test does NOT drain (config round-trip, validator
+//     rejection, post-set fresh-bucket exercise), the refill rate is
+//     part of the test contract and can be any value.
+//
+// Helpers below encode the rule so a future test writer who reaches
+// for `mustSetQueueAttributes(... "ThrottleSendRefillPerSecond": "1" ...)`
+// at least has to think about why they didn't use `newSendThrottleAttrs`.
+
+// slowRefillRate is 1 token per 100 seconds — slow enough that no
+// realistic test-window wall-clock can accumulate to a whole token.
+// The throttle-config validator accepts fractional `float64` (see
+// `sqs_catalog.go` `SendRefillPerSecond float64`) and `0.01 != 0`
+// keeps `IsEmpty()` returning false, so throttling stays enabled.
+const slowRefillRate = "0.01"
+
+// newSendThrottleAttrs returns an attribute map for a drain-then-assert
+// send-side throttle test. Capacity is caller-supplied; refill is
+// locked to `slowRefillRate` to immunize against the wall-clock race.
+//
+// All current callers pass `10`; the parameter is forward-looking so
+// new tests (and the §3.2 validator's batch-floor edge: Capacity ≥ 10)
+// can pick a value without going behind the helper. The unparam lint
+// is suppressed because the future-call diversity is the whole point
+// of taking a parameter.
+//
+//nolint:unparam // capacity parameter is forward-looking; see doc.
+func newSendThrottleAttrs(capacity int) map[string]string {
+	return map[string]string{
+		"ThrottleSendCapacity":        strconv.Itoa(capacity),
+		"ThrottleSendRefillPerSecond": slowRefillRate,
+	}
+}
+
+// newRecvThrottleAttrs is the receive-side mirror of
+// newSendThrottleAttrs. ReceiveMessage charges 1 from
+// ThrottleRecvCapacity regardless of MaxNumberOfMessages, so the
+// same drain-then-assert race applies.
+//
+//nolint:unparam // capacity parameter is forward-looking; see newSendThrottleAttrs.
+func newRecvThrottleAttrs(capacity int) map[string]string {
+	return map[string]string{
+		"ThrottleRecvCapacity":        strconv.Itoa(capacity),
+		"ThrottleRecvRefillPerSecond": slowRefillRate,
+	}
+}
+
 // TestSQSServer_Throttle_DefaultOff_AllowsUnboundedSends pins the
 // default-off contract: a queue without any Throttle* attributes
 // accepts arbitrary send volume. The hot path for unconfigured queues
@@ -41,10 +109,9 @@ func TestSQSServer_Throttle_SendBucketRejectsAfterCapacity(t *testing.T) {
 	node := sqsLeaderNode(t, nodes)
 
 	url := mustCreateQueue(t, node, "throttle-send")
-	mustSetQueueAttributes(t, node, url, map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "1",
-	})
+	// Drain-then-assert pattern — must use slowRefillRate (see file-head
+	// guardrail). Capacity=10 plays the same role as before.
+	mustSetQueueAttributes(t, node, url, newSendThrottleAttrs(10))
 	for i := range 10 {
 		status, _ := callSQS(t, node, sqsSendMessageTarget, map[string]any{
 			"QueueUrl":    url,
@@ -63,8 +130,12 @@ func TestSQSServer_Throttle_SendBucketRejectsAfterCapacity(t *testing.T) {
 	if got := resp.Header.Get("x-amzn-ErrorType"); got != sqsErrThrottling {
 		t.Fatalf("11th send: x-amzn-ErrorType=%q (expected Throttling)", got)
 	}
-	if ra := resp.Header.Get("Retry-After"); ra != "1" {
-		t.Fatalf("11th send: Retry-After=%q (expected 1)", ra)
+	// Retry-After is rounded up from the refill rate; slowRefillRate
+	// (0.01/sec) rounds to 100 seconds. With the prior Refill=1 value
+	// the assertion was "1"; pin the new value so the header contract
+	// is still verified.
+	if ra := resp.Header.Get("Retry-After"); ra != "100" {
+		t.Fatalf("11th send: Retry-After=%q (expected 100 — slowRefillRate)", ra)
 	}
 }
 
@@ -80,10 +151,9 @@ func TestSQSServer_Throttle_RecvBucketRejectsAfterCapacity(t *testing.T) {
 	node := sqsLeaderNode(t, nodes)
 
 	url := mustCreateQueue(t, node, "throttle-recv")
-	mustSetQueueAttributes(t, node, url, map[string]string{
-		"ThrottleRecvCapacity":        "10",
-		"ThrottleRecvRefillPerSecond": "1",
-	})
+	// Drain-then-assert pattern — use the receive-side helper to keep
+	// the refill rate below any wall-clock window the test can elapse.
+	mustSetQueueAttributes(t, node, url, newRecvThrottleAttrs(10))
 	for i := range 10 {
 		status, _ := callSQS(t, node, sqsReceiveMessageTarget, map[string]any{"QueueUrl": url})
 		if status != http.StatusOK {
@@ -111,10 +181,10 @@ func TestSQSServer_Throttle_BatchChargesByEntryCount(t *testing.T) {
 	node := sqsLeaderNode(t, nodes)
 
 	url := mustCreateQueue(t, node, "throttle-batch")
-	mustSetQueueAttributes(t, node, url, map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "1",
-	})
+	// Drain-then-assert pattern (the batch fully drains; the next single
+	// send must reject) — use slow refill so the inter-call gap cannot
+	// refill a token.
+	mustSetQueueAttributes(t, node, url, newSendThrottleAttrs(10))
 	entries := make([]map[string]any, 10)
 	for i := range entries {
 		entries[i] = map[string]any{
@@ -149,25 +219,12 @@ func TestSQSServer_Throttle_SetQueueAttributesInvalidatesBucket(t *testing.T) {
 	node := sqsLeaderNode(t, nodes)
 
 	url := mustCreateQueue(t, node, "throttle-invalidate")
-	// Refill rate is intentionally slow (0.01/sec = 1 token per
-	// 100 seconds) so the drain-then-sanity window cannot
-	// accumulate a whole token. At 1/sec the test raced its own
-	// refill on slow CI runners: 10 drain sends + the sanity send
-	// (each going through Raft propose+apply at ~100-250 ms under
-	// -race) elapses ~1.1-2.75 s before the "should-throttle"
-	// assertion below fires, by which time the bucket has refilled
-	// 1+ tokens and the send returns 200 instead of the expected
-	// 400 — observed on the run-26678774684 Test workflow failure.
-	// Same mechanism as the no-op variant fixed in commit 54c6cd56
-	// (PR #819 follow-up). The test's intent — verify that a
-	// Capacity/Refill raise invalidates the bucket — is
-	// independent of the *initial* refill rate; the post-set send
-	// is exercised against the fresh Capacity=20 / Refill=20
-	// bucket regardless.
-	mustSetQueueAttributes(t, node, url, map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "0.01",
-	})
+	// Drain-then-sanity-throttle pattern in the first phase, then
+	// raise Capacity/Refill in the second phase. The first phase
+	// must use slowRefillRate per the file-head guardrail; the
+	// second phase below sets the explicit raised values it is
+	// testing for.
+	mustSetQueueAttributes(t, node, url, newSendThrottleAttrs(10))
 	// Drain.
 	for range 10 {
 		status, _ := callSQS(t, node, sqsSendMessageTarget, map[string]any{
@@ -211,10 +268,11 @@ func TestSQSServer_Throttle_DeleteQueueInvalidatesBucket(t *testing.T) {
 
 	queue := "throttle-recreate"
 	url := mustCreateQueue(t, node, queue)
-	mustSetQueueAttributes(t, node, url, map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "1",
-	})
+	// Use slowRefillRate for consistency with the rest of the file. This
+	// test does not assert throttle after the drain (the drain loop
+	// ignores status), so the value does not affect correctness — but
+	// uniformity reduces "why is this one different?" cognitive load.
+	mustSetQueueAttributes(t, node, url, newSendThrottleAttrs(10))
 	for range 10 {
 		_, _ = callSQS(t, node, sqsSendMessageTarget, map[string]any{
 			"QueueUrl": url, "MessageBody": "drain",
@@ -225,10 +283,7 @@ func TestSQSServer_Throttle_DeleteQueueInvalidatesBucket(t *testing.T) {
 		t.Fatalf("delete: %d", status)
 	}
 	url2 := mustCreateQueue(t, node, queue)
-	mustSetQueueAttributes(t, node, url2, map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": "1",
-	})
+	mustSetQueueAttributes(t, node, url2, newSendThrottleAttrs(10))
 	// First send on the recreated queue must succeed (full-capacity bucket).
 	status, _ := callSQS(t, node, sqsSendMessageTarget, map[string]any{
 		"QueueUrl": url2, "MessageBody": "fresh",
@@ -340,28 +395,12 @@ func TestSQSServer_Throttle_NoOpSetQueueAttributesPreservesBucket(t *testing.T) 
 	node := sqsLeaderNode(t, nodes)
 
 	url := mustCreateQueue(t, node, "throttle-noop-set")
-	// Refill rate is intentionally slow (0.01/sec = 1 token per
-	// 100 seconds) so the test's wall-clock window between drain
-	// and the post-no-op send cannot accumulate to a whole token.
-	// At 1/sec the test raced its own refill on slow CI runners:
-	// 10 drain sends + sanity send + SetQueueAttributes (each
-	// going through Raft propose+apply at ~100-250ms under -race)
-	// elapses ~1.5-2.5s before the post-no-op send fires, by which
-	// time the bucket has refilled 1+ tokens and the send returns
-	// 200 instead of the expected 400. The test's intent — verify
-	// that a no-op SetQueueAttributes does not reset the bucket —
-	// is independent of the refill rate, so slowing it down is
-	// the right scope.
-	const slowRefill = "0.01"
-	// Define the attribute map once and reuse on both calls so the
-	// "no-op" intent is structurally visible: the two
-	// mustSetQueueAttributes calls share the same map literal, so
-	// a future drift between them (e.g., a typo or a stray edit)
-	// would be obviously wrong (Gemini medium on PR #819).
-	throttleAttrs := map[string]string{
-		"ThrottleSendCapacity":        "10",
-		"ThrottleSendRefillPerSecond": slowRefill,
-	}
+	// Drain-then-assert + re-set-identical-attrs + drain-assert. The
+	// helper handles the file-head slowRefillRate rule. The two
+	// mustSetQueueAttributes calls below share the same value so the
+	// "no-op" intent is structurally visible — a future drift would
+	// be obviously wrong (Gemini medium on PR #819).
+	throttleAttrs := newSendThrottleAttrs(10)
 	mustSetQueueAttributes(t, node, url, throttleAttrs)
 	// Drain the bucket so the next charge would only succeed if the
 	// bucket was reset to a fresh full-capacity replacement.
