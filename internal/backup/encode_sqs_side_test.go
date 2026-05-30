@@ -112,12 +112,19 @@ func TestSQSEncodeSideRecordsCrossCheckClassic(t *testing.T) {
 	}
 
 	// Dedup value cross-check: sqsFifoDedupRecord JSON with all four
-	// fields the live writer (sqs_fifo.go:219-223) produces.
+	// fields the live writer (sqs_fifo.go:219-223) produces. Both
+	// messages are asserted so per-message sequence + timestamp
+	// threading (and not just constant fields) is pinned.
 	wantD1 := sqsFifoDedupRecord{
 		MessageID: "m1", SendTimestampMs: fixedSendTs,
 		ExpiresAtMillis: fixedSendTs + sqsFifoDedupWindowMillis, OriginalSequence: 1,
 	}
 	assertDedupValue(t, "d1", keyToValue[string(wantKeys["dedup[d1]"])], wantD1)
+	wantD2 := sqsFifoDedupRecord{
+		MessageID: "m2", SendTimestampMs: fixedSendTs + 100,
+		ExpiresAtMillis: fixedSendTs + 100 + sqsFifoDedupWindowMillis, OriginalSequence: 2,
+	}
+	assertDedupValue(t, "d2", keyToValue[string(wantKeys["dedup[d2]"])], wantD2)
 }
 
 // indexEntriesByKey collapses a slice of RoundTripEntry to a key→value map
