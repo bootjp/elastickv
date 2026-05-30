@@ -1118,6 +1118,44 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	// Option-2 dedup for standalone SET: route through runTransactionWithDedup
+	// as a single-mop EXEC body when the gate is on. SET inside MULTI/EXEC
+	// already has full dedup coverage via applySet (§M3 in the design doc),
+	// so we just reuse that machinery instead of building a per-handler
+	// reusableSetTxn + dispatchSetReuse shape. The fast-path optimization is
+	// intentionally bypassed under the gate — dedup is opt-in, and a
+	// non-dedup'd fast path under a dedup-on cluster would split the
+	// idempotency contract.
+	//
+	// Result translation: runTransactionWithDedup returns []redisResult; for
+	// SET there is exactly one element with the same redisResult shape as
+	// the standalone reply (resultString OK / resultNil for NX/XX miss /
+	// resultBulk for GET).
+	if r.onePhaseTxnDedup {
+		// Call runTransactionWithDedup directly instead of going through
+		// runTransaction. runTransaction re-checks the same
+		// r.onePhaseTxnDedup gate and routes here anyway; the indirection
+		// would make the call chain misleading ("dispatches via
+		// runTransactionWithDedup" being true only by indirection).
+		// Direct call makes the intent explicit and removes the double
+		// gate check.
+		results, err := r.runTransactionWithDedup([]redcon.Command{cmd})
+		if err != nil {
+			writeRedisError(conn, err)
+			return
+		}
+		writeRedisStandaloneResult(conn, results)
+		return
+	}
+	r.setLegacy(conn, cmd)
+}
+
+// setLegacy is the pre-dedup standalone SET path. Extracted from set() so
+// the gate-on routing through runTransactionWithDedup keeps set() under the
+// cyclop budget (the gate-off branch's parse + fast-path + executeSet
+// shape carries its own decision points). Behaviour is byte-identical to
+// the pre-PR set() body.
+func (r *RedisServer) setLegacy(conn redcon.Conn, cmd redcon.Command) {
 	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
 	if err != nil {
 		writeRedisError(conn, err)
@@ -1149,6 +1187,51 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteString("OK")
+}
+
+// writeRedisStandaloneResult translates a single-element results array from
+// runTransactionWithDedup into a redcon response, mirroring the shape a
+// standalone handler would write directly. Used by SET / future standalone
+// commands routed through the dedup loop. Differs from writeResults in NOT
+// wrapping the response in conn.WriteArray — the standalone protocol returns
+// the bare element.
+//
+// Empty or multi-element input is degenerate for standalone callers; we
+// default to nil so a misuse never leaks a malformed reply to the wire.
+//
+// Array-element constraint: the resultArray arm writes each element via
+// WriteBulkString, which is correct for flat arrays of strings (the
+// shape applySet / future SET-pattern callers produce). It does NOT
+// recurse into nested arrays. A future caller whose applyXxx emits
+// resultArray with non-string elements (e.g. HGETALL-like nested
+// responses) must either pre-flatten its result or extend this switch
+// with a recursive arm; reusing it as-is would silently mangle the
+// wire reply.
+func writeRedisStandaloneResult(conn redcon.Conn, results []redisResult) {
+	if len(results) != 1 {
+		conn.WriteNull()
+		return
+	}
+	res := results[0]
+	switch res.typ {
+	case resultNil:
+		conn.WriteNull()
+	case resultError:
+		writeRedisError(conn, res.err)
+	case resultBulk:
+		conn.WriteBulk(res.bulk)
+	case resultString:
+		conn.WriteString(res.str)
+	case resultArray:
+		conn.WriteArray(len(res.arr))
+		for _, s := range res.arr {
+			conn.WriteBulkString(s)
+		}
+	case resultInt:
+		conn.WriteInt64(res.integer)
+	default:
+		conn.WriteNull()
+	}
 }
 
 func (r *RedisServer) get(conn redcon.Conn, cmd redcon.Command) {
