@@ -575,3 +575,72 @@ func TestShardedCoordinatorDispatchTxn_SingleShardIncludesReadKeysInRaftEntry(t 
 	// pre-Raft validateReadSet call and FSM application.
 	require.Equal(t, [][]byte{[]byte("rk1"), []byte("rk2")}, g1Txn.requests[0].ReadKeys)
 }
+
+// TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion
+// is the gemini-critical regression on PR #881.  The single-shard fast
+// path correctly forwarded OperationGroup.ObservedRouteVersion into
+// pb.Request, but the multi-shard 2PC path
+// (prewriteTxn / commitPrimaryTxn / commitSecondaryTxns) dropped it on
+// the floor — every PREPARE and COMMIT envelope arrived at the FSM
+// with ObservedRouteVersion = 0 ("unpinned"), which would silently
+// bypass the M3 Composed-1 apply-time gate exactly for the workload
+// most at risk of a cross-group route shift.
+//
+// Multi-shard txns are precisely the case where a MoveRange /
+// cross-group SplitRange between BeginTxn and Commit can land —
+// without this propagation, M3's safety guard would not even see
+// those txns to enforce on.
+//
+// This test routes two PUTs across two shards via Engine routes
+// (single-shard fast path requires gids == 1), verifies that the 2PC
+// loop fires (both PREPARE and COMMIT recorded per shard), and
+// asserts every recorded pb.Request carries the pinned
+// ObservedRouteVersion.
+func TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	g1Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 3},
+			{CommitIndex: 11},
+		},
+	}
+	g2Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 5},
+			{CommitIndex: 27},
+		},
+	}
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	const pinnedVer = uint64(42)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:                true,
+		StartTS:              10,
+		ObservedRouteVersion: pinnedVer,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, g1Txn.requests, 2, "g1 must see PREPARE + COMMIT")
+	require.Len(t, g2Txn.requests, 2, "g2 must see PREPARE + COMMIT")
+
+	for _, req := range append(g1Txn.requests, g2Txn.requests...) {
+		require.Equal(t, pinnedVer, req.ObservedRouteVersion,
+			"multi-shard 2PC envelope (phase=%s) must carry "+
+				"OperationGroup.ObservedRouteVersion; pre-fix this "+
+				"silently dropped to 0 and bypassed the M3 Composed-1 "+
+				"apply-time gate for every cross-shard txn",
+			req.Phase)
+	}
+}

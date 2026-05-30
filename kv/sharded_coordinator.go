@@ -598,12 +598,12 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if err != nil {
 		return nil, err
 	}
-	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys)
+	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion)
 	if err != nil {
 		return nil, err
 	}
 
-	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, commitTS)
+	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, commitTS, observedRouteVersion)
 	if err != nil {
 		// abortPreparedTxn must run even when ctx was the reason
 		// commitPrimaryTxn failed — otherwise prewrite intents on
@@ -617,7 +617,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		return nil, errors.WithStack(err)
 	}
 
-	maxIndex = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
+	maxIndex = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion)
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
@@ -675,7 +675,7 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte) ([]preparedGroup, error) {
+func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64) ([]preparedGroup, error) {
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
 
@@ -685,11 +685,12 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			return nil, err
 		}
 		req := &pb.Request{
-			IsTxn:     true,
-			Phase:     pb.Phase_PREPARE,
-			Ts:        startTS,
-			Mutations: append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
-			ReadKeys:  groupedReadKeys[gid],
+			IsTxn:                true,
+			Phase:                pb.Phase_PREPARE,
+			Ts:                   startTS,
+			Mutations:            append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
+			ReadKeys:             groupedReadKeys[gid],
+			ObservedRouteVersion: observedRouteVersion,
 		}
 		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
 			// Same WithoutCancel pattern as dispatchTxn's
@@ -723,7 +724,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 	return prepared, nil
 }
 
-func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64) (uint64, uint64, error) {
+func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64, observedRouteVersion uint64) (uint64, uint64, error) {
 	primaryGid := c.engineGroupIDForKey(primaryKey)
 	if primaryGid == 0 {
 		return 0, 0, errors.WithStack(ErrInvalidRequest)
@@ -737,10 +738,11 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 	meta := txnMetaMutation(primaryKey, 0, commitTS)
 	keys := keyMutations(grouped[primaryGid])
 	req := &pb.Request{
-		IsTxn:     true,
-		Phase:     pb.Phase_COMMIT,
-		Ts:        startTS,
-		Mutations: append([]*pb.Mutation{meta}, keys...),
+		IsTxn:                true,
+		Phase:                pb.Phase_COMMIT,
+		Ts:                   startTS,
+		Mutations:            append([]*pb.Mutation{meta}, keys...),
+		ObservedRouteVersion: observedRouteVersion,
 	}
 
 	r, err := g.Txn.Commit(ctx, []*pb.Request{req})
@@ -753,7 +755,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 	return primaryGid, r.CommitIndex, nil
 }
 
-func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
+func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) uint64 {
 	// Secondary commits are best-effort. If a shard is unavailable after the
 	// primary commits, read-time lock resolution will commit the remaining
 	// secondaries based on the primary commit record. Retry a few times to
@@ -768,10 +770,11 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 			continue
 		}
 		req := &pb.Request{
-			IsTxn:     true,
-			Phase:     pb.Phase_COMMIT,
-			Ts:        startTS,
-			Mutations: append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
+			IsTxn:                true,
+			Phase:                pb.Phase_COMMIT,
+			Ts:                   startTS,
+			Mutations:            append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
+			ObservedRouteVersion: observedRouteVersion,
 		}
 		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
@@ -1280,7 +1283,7 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if err != nil {
 		return nil, err
 	}
-	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
+	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion)
 }
 
 // observeMutation: counted pre-commit, so a mutation that subsequently
@@ -1349,7 +1352,7 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 	return grouped, gids, nil
 }
 
-func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64) ([]*pb.Request, error) {
+func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64, observedRouteVersion uint64) ([]*pb.Request, error) {
 	logs := make([]*pb.Request, 0, len(gids)*txnPhaseCount)
 	for _, gid := range gids {
 		muts := grouped[gid]
@@ -1365,6 +1368,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 				Mutations: append([]*pb.Mutation{
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: 0})},
 				}, muts...),
+				ObservedRouteVersion: observedRouteVersion,
 			},
 			&pb.Request{
 				IsTxn: true,
@@ -1373,6 +1377,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 				Mutations: append([]*pb.Mutation{
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
 				}, keys...),
+				ObservedRouteVersion: observedRouteVersion,
 			},
 		)
 	}
