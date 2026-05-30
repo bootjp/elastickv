@@ -188,6 +188,63 @@ func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64)
 	return err == nil, errors.WithStack(err)
 }
 
+// CommittedVersionAt gates the exact-timestamp existence probe so client
+// reads through this wrapper get a fresh authoritative answer even on a
+// deposed leader. The FSM apply path is NOT affected — it holds the raw
+// local store (not a LeaderRoutedStore), so its deterministic probe never
+// goes through this method. The option-2 reuse path
+// (RedisServer.resolveReuseLength) DOES call this and needs the
+// authoritative answer to preserve the pending.length fast-path
+// (returning the per-our-commit length rather than the leader's current
+// Len) when our prior attempt actually committed.
+//
+// Two-path strategy, mirroring how LatestCommitTS uses a lease fast-path
+// and a proxy slow-path:
+//
+//   - We are the leader with a valid lease (leaderOKForKey is true): the
+//     local replica is up-to-date by the lease invariant; read local.
+//   - Not leader (deposed or never): there is no RawCommittedVersionAt
+//     RPC to proxy to, so use the coordinator's LinearizableRead to
+//     submit a Raft ReadIndex — that protocol forwards to the current
+//     leader and waits until our local applied index has caught up to
+//     the leader's commit point. After that, a local probe sees every
+//     committed version of this key (including any landed at commitTS).
+//     If the read-index fails (no leader reachable, ctx canceled), fall
+//     back to (false, nil); the adapter's resolveReuseLength then re-reads
+//     via the already-leader-fenced ScanAt/GetAt, returning the leader's
+//     current Len — a valid serialization, just not the per-our-commit
+//     value.
+func (s *LeaderRoutedStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	if s == nil || s.local == nil {
+		return false, nil
+	}
+	if !s.leaderOKForKey(ctx, key) && !s.tryLinearizableFence(ctx) {
+		// Not leader and ReadIndex failed (no coordinator wired, no leader
+		// reachable, ctx canceled). Report (false, nil) so the adapter's
+		// resolveReuseLength falls through to the leader-fenced ScanAt/GetAt
+		// path, which returns a valid current-Len serialization.
+		return false, nil
+	}
+	exists, err := s.local.CommittedVersionAt(ctx, key, commitTS)
+	return exists, errors.WithStack(err)
+}
+
+// tryLinearizableFence submits a Raft ReadIndex via the coordinator and
+// reports whether it succeeded. After a successful ReadIndex the local
+// applied index is caught up to the current leader's commit point, so a
+// subsequent local read sees every committed version. The error from the
+// underlying call is intentionally not surfaced — callers that need the
+// authoritative answer treat a failed fence as "couldn't verify, fall back
+// to the leader-routed slow path." Structured to avoid the nilerr
+// false positive at the call site.
+func (s *LeaderRoutedStore) tryLinearizableFence(ctx context.Context) bool {
+	if s == nil || s.coordinator == nil {
+		return false
+	}
+	_, err := s.coordinator.LinearizableRead(ctx)
+	return err == nil
+}
+
 func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if s == nil || s.local == nil {
 		return []*store.KVPair{}, nil

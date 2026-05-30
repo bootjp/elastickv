@@ -27,17 +27,29 @@ fi
 # Modules to check, in dependency order (libs before consumers).
 TLA_MODULES=( "hlc" "occ" "mvcc" "routes" "composed" )
 
-# The invariant the gap config is expected to break, per module.
-# These strings are matched against TLC stdout via grep -F (literal).
-gap_invariant_for() {
+# Per-module list of gap configurations to run.  Each entry is
+# "<cfg-stem>|<expected-invariant-string>", one per line.  Modules
+# may register more than one gap if multiple safety guards toggle
+# independently — composed has two (Composed-1 observed-version
+# guard via EnableSafety, Composed-1a current-version fence via
+# EnableCurrentFence).
+#
+# The expected-invariant string is matched against TLC stdout via
+# grep -F (literal), so a parse error / deadlock / JVM crash /
+# different invariant breaking is NOT silently treated as the
+# expected counterexample (codex P2 on PR #856 round 2).
+gap_configs_for() {
     case "$1" in
-        hlc)      echo "Invariant HLC4_NoRegressionAcrossTerms is violated" ;;
-        occ)      echo "Invariant OCC1_CommitTsAboveStart is violated" ;;
-        mvcc)     echo "Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated" ;;
-        routes)   echo "Invariant Routes4_NoEngineRegression is violated" ;;
-        composed) echo "Invariant Composed1_CommitToOwningGroup is violated" ;;
+        hlc)      printf '_gap|Invariant HLC4_NoRegressionAcrossTerms is violated\n' ;;
+        occ)      printf '_gap|Invariant OCC1_CommitTsAboveStart is violated\n' ;;
+        mvcc)     printf '_gap|Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated\n' ;;
+        routes)   printf '_gap|Invariant Routes4_NoEngineRegression is violated\n' ;;
+        composed)
+            printf '_gap|Invariant Composed1_CommitToOwningGroup is violated\n'
+            printf '_currentfence_gap|Invariant Composed1a_CommitToCurrentOwner is violated\n'
+            ;;
         *)
-            echo "ERROR: no gap-invariant string registered for module '$1'." \
+            echo "ERROR: no gap-config list registered for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
             exit 64
             ;;
@@ -99,9 +111,8 @@ for module in "${TLA_MODULES[@]}"; do
         continue
     fi
     safe_cfg="${mc}.cfg"
-    gap_cfg="${mc}_gap.cfg"
-    if ! gap_inv="$(gap_invariant_for "$module")"; then
-        echo "ERROR: gap_invariant_for failed for module '${module}' — see error above." >&2
+    if ! gap_list="$(gap_configs_for "$module")"; then
+        echo "ERROR: gap_configs_for failed for module '${module}' — see error above." >&2
         overall_rc=1
         continue
     fi
@@ -117,39 +128,61 @@ for module in "${TLA_MODULES[@]}"; do
     fi
     echo
 
-    echo "================================================================"
-    echo "  TLC: tla/${module}/${gap_cfg}  (no preconditions, expected FAIL on ${gap_inv})"
-    echo "================================================================"
-    # Capture stdout+stderr so we can validate both the exit code AND the
-    # specific invariant string.  Without the string match, a parse
-    # error / deadlock / JVM crash / different invariant would silently
-    # count as the expected counterexample (codex P2 on PR #856 round 2).
-    gap_out=$(run_tlc "$module" "$gap_cfg" 2>&1)
-    gap_rc=$?
-    printf '%s\n' "$gap_out"
-    if [ "$gap_rc" -eq 0 ]; then
+    # Iterate every gap config registered for this module.  Each is a
+    # `<cfg-stem>|<invariant-string>` line; modules with one gap have
+    # one entry, modules with multiple guards (composed) have more.
+    #
+    # Validate both fields are non-empty BEFORE entering the inner
+    # body — a malformed entry that produces an empty gap_inv would
+    # silently false-positive at the `grep -qF "$gap_inv"` step below
+    # (empty pattern matches every line, so the gap would always
+    # "succeed" regardless of whether TLC actually surfaced the
+    # expected invariant — gemini medium on PR #878).
+    while IFS='|' read -r gap_stem gap_inv; do
+        [ -z "$gap_stem" ] && [ -z "$gap_inv" ] && continue
+        if [ -z "$gap_stem" ] || [ -z "$gap_inv" ]; then
+            echo "ERROR: malformed gap entry for module '${module}'" \
+                "— expected '<stem>|<invariant>', got" \
+                "stem='${gap_stem}' inv='${gap_inv}'." \
+                "Fix gap_configs_for() in scripts/tla-check.sh." >&2
+            overall_rc=1
+            continue
+        fi
+        gap_cfg="${mc}${gap_stem}.cfg"
+        echo "================================================================"
+        echo "  TLC: tla/${module}/${gap_cfg}  (no preconditions, expected FAIL on ${gap_inv})"
+        echo "================================================================"
+        # Capture stdout+stderr so we can validate both the exit code AND the
+        # specific invariant string.  Without the string match, a parse
+        # error / deadlock / JVM crash / different invariant would silently
+        # count as the expected counterexample (codex P2 on PR #856 round 2).
+        gap_out=$(run_tlc "$module" "$gap_cfg" 2>&1)
+        gap_rc=$?
+        printf '%s\n' "$gap_out"
+        if [ "$gap_rc" -eq 0 ]; then
+            echo
+            echo "ERROR: ${gap_cfg} unexpectedly passed." >&2
+            echo "  The gap configuration disables the safety guard; TLC was" >&2
+            echo "  supposed to surface a counterexample.  A clean pass means" >&2
+            echo "  either the spec no longer encodes the gap correctly or the" >&2
+            echo "  safety guards leaked past the EnableSafety toggle." >&2
+            overall_rc=1
+            continue
+        fi
+        if printf '%s\n' "$gap_out" | grep -qF "$gap_inv"; then
+            echo
+            echo "OK: ${gap_cfg} failed as designed (${gap_inv})."
+        else
+            echo
+            echo "ERROR: ${gap_cfg} failed, but the reason is NOT \"${gap_inv}\"." >&2
+            echo "  The non-zero exit may indicate a parse error, deadlock, JVM" >&2
+            echo "  crash, or a different invariant breaking — review the output" >&2
+            echo "  above before treating this as a regression in the gap evidence." >&2
+            overall_rc=1
+            continue
+        fi
         echo
-        echo "ERROR: ${gap_cfg} unexpectedly passed." >&2
-        echo "  The gap configuration disables the safety guard; TLC was" >&2
-        echo "  supposed to surface a counterexample.  A clean pass means" >&2
-        echo "  either the spec no longer encodes the gap correctly or the" >&2
-        echo "  safety guards leaked past the EnableSafety toggle." >&2
-        overall_rc=1
-        continue
-    fi
-    if printf '%s\n' "$gap_out" | grep -qF "$gap_inv"; then
-        echo
-        echo "OK: ${gap_cfg} failed as designed (${gap_inv})."
-    else
-        echo
-        echo "ERROR: ${gap_cfg} failed, but the reason is NOT \"${gap_inv}\"." >&2
-        echo "  The non-zero exit may indicate a parse error, deadlock, JVM" >&2
-        echo "  crash, or a different invariant breaking — review the output" >&2
-        echo "  above before treating this as a regression in the gap evidence." >&2
-        overall_rc=1
-        continue
-    fi
-    echo
+    done <<< "$gap_list"
 done
 
 if [ "$overall_rc" -eq 0 ]; then
