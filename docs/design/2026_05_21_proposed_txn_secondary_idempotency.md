@@ -514,11 +514,24 @@ preserves availability and adds correctness.
        what changes is that an expired outer ctx is now respected
        promptly instead of being ignored until the fresh budget
        elapses.
-- **Standalone write commands (SET/INCR/HSET/...) — still open.** The EXEC
-  path covers MULTI bodies; standalone single-command dispatch goes through
-  per-handler paths (`applySet`, `applyIncr`, etc.) and needs the same
-  `reusable<X>` capture + `dispatchXReuse` shape per command. Scope is
-  per-command but each is small (~50 LOC). Tracked as PR-B follow-up.
+- **Standalone SET — LANDED.** The standalone `r.set` handler now routes
+  through `runTransactionWithDedup` as a single-mop EXEC body when the gate
+  is on (the dedup machinery's "free" extension to any command whose
+  `applyXxx` already exists on `txnContext`). The fast-path optimization
+  (`trySetFastPath`) is intentionally bypassed under the gate — dedup is
+  opt-in, and a non-dedup'd fast path under a dedup-on cluster would split
+  the idempotency contract. Tested by `TestStandaloneSetDedup_*` in
+  `adapter/redis_set_dedup_test.go`.
+- **Standalone INCR / HSET — still open.** Both lack a `txnContext.applyXxx`
+  implementation, so the "route through single-mop EXEC" pattern that
+  worked for SET cannot apply as-is. Bringing them into the dedup'd path
+  requires implementing `applyIncr` / `applyHSet` first (each ~30–50 LOC
+  for the txn-state-aware read-compute-write shape), then the standalone
+  handler routing is a one-liner via `runTransactionWithDedup`. Tracked
+  as separate follow-up PRs; until then, INCR and HSET keep today's
+  buggy-under-churn behaviour, which is the design doc's stated default
+  ("everything else keeps today's behaviour until its hook is added" —
+  Open questions).
 
 ### M4 — Validation
 
