@@ -149,7 +149,7 @@ func reservedDirHoldsSidecar(root *os.Root, dirRel string) (bool, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
-		return false, err
+		return false, errors.WithStack(err)
 	}
 	for _, ent := range entries {
 		childRel := filepath.Join(dirRel, ent.Name())
