@@ -477,3 +477,171 @@ func TestEngineApplySnapshot_Concurrent(t *testing.T) {
 		t.Fatalf("expected route group %d, got %d", maxVersion, route.GroupID)
 	}
 }
+
+// TestEngineSnapshotAt_RecordsApplySnapshot is the M2 round-trip
+// witness for the Composed-1 versioned-snapshot ring (design doc
+// §M2): every successful ApplySnapshot records the (version, routes)
+// pair so SnapshotAt(v) can resolve OwnerOf(k) for any in-flight
+// transaction that observed v at BeginTxn.
+func TestEngineSnapshotAt_RecordsApplySnapshot(t *testing.T) {
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 10, Start: []byte(""), End: []byte("m"), GroupID: 7, State: RouteStateActive},
+			{RouteID: 11, Start: []byte("m"), End: nil, GroupID: 9, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply snapshot v1: %v", err)
+	}
+
+	snap, ok := e.SnapshotAt(1)
+	if !ok {
+		t.Fatal("expected SnapshotAt(1) to return the v1 snapshot")
+	}
+	if snap.Version() != 1 {
+		t.Fatalf("expected snapshot version 1, got %d", snap.Version())
+	}
+	if owner, found := snap.OwnerOf([]byte("a")); !found || owner != 7 {
+		t.Fatalf("expected key 'a' owner=7 in v1 snapshot; got owner=%d found=%v", owner, found)
+	}
+	if owner, found := snap.OwnerOf([]byte("z")); !found || owner != 9 {
+		t.Fatalf("expected key 'z' owner=9 in v1 snapshot; got owner=%d found=%v", owner, found)
+	}
+}
+
+// TestEngineSnapshotAt_PreservesHistoryAcrossVersions verifies the
+// M3-critical property: after ApplySnapshot has moved the catalog
+// forward, a SnapshotAt for the PRIOR version still returns the old
+// routes.  Without this, the M3 verifyComposed1 gate could not
+// resolve a txn whose observedVer is behind the current catalog —
+// exactly the case the design doc §3 G1c trace requires.
+func TestEngineSnapshotAt_PreservesHistoryAcrossVersions(t *testing.T) {
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{RouteID: 10, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply v1: %v", err)
+	}
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 2,
+		Routes: []RouteDescriptor{
+			{RouteID: 11, Start: []byte(""), End: nil, GroupID: 2, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply v2: %v", err)
+	}
+
+	snapV1, ok := e.SnapshotAt(1)
+	if !ok {
+		t.Fatal("expected v1 still in history after v2 applied")
+	}
+	if owner, _ := snapV1.OwnerOf([]byte("k")); owner != 1 {
+		t.Fatalf("v1 snapshot must still show group=1 owner; got %d", owner)
+	}
+	snapV2, ok := e.SnapshotAt(2)
+	if !ok {
+		t.Fatal("expected v2 in history")
+	}
+	if owner, _ := snapV2.OwnerOf([]byte("k")); owner != 2 {
+		t.Fatalf("v2 snapshot must show group=2 owner; got %d", owner)
+	}
+}
+
+// TestEngineSnapshotAt_FIFOEviction verifies that the ring respects
+// historyDepth: once more than depth versions have been applied, the
+// oldest is evicted and SnapshotAt returns (zero, false) for it.
+// The M3 gate (design doc §4.3) treats the not-found case as a hard
+// retryable error, so retention depth is a liveness knob — this
+// test pins the eviction order so a future depth change does not
+// silently break the M3 contract.
+func TestEngineSnapshotAt_FIFOEviction(t *testing.T) {
+	e := NewEngine()
+	// Force a tiny depth so the test is bounded and explicit.
+	e.historyDepth = 3
+
+	for v := uint64(1); v <= 5; v++ {
+		if err := e.ApplySnapshot(CatalogSnapshot{
+			Version: v,
+			Routes: []RouteDescriptor{
+				{RouteID: v, Start: []byte(""), End: nil, GroupID: v, State: RouteStateActive},
+			},
+		}); err != nil {
+			t.Fatalf("apply v%d: %v", v, err)
+		}
+	}
+
+	if _, ok := e.SnapshotAt(1); ok {
+		t.Fatal("v1 must be evicted (oldest) under depth=3 after v2..v5 applied")
+	}
+	if _, ok := e.SnapshotAt(2); ok {
+		t.Fatal("v2 must be evicted (second-oldest) under depth=3 after v3..v5 applied")
+	}
+	for v := uint64(3); v <= 5; v++ {
+		snap, ok := e.SnapshotAt(v)
+		if !ok {
+			t.Fatalf("expected v%d retained (depth=3 keeps the 3 most recent)", v)
+		}
+		if owner, _ := snap.OwnerOf([]byte("k")); owner != v {
+			t.Fatalf("v%d snapshot must show group=%d owner; got %d", v, v, owner)
+		}
+	}
+}
+
+// TestEngineSnapshotAt_UnknownVersionReturnsNotFound documents the
+// M3-relevant contract: a version that has never been applied (e.g.
+// in the future, or a typo) returns (zero, false).  The M3 gate
+// uses this signal to emit ErrComposed1VersionGCd and trigger a
+// coordinator retry.
+func TestEngineSnapshotAt_UnknownVersionReturnsNotFound(t *testing.T) {
+	e := NewEngineWithDefaultRoute()
+	if _, ok := e.SnapshotAt(42); ok {
+		t.Fatal("expected SnapshotAt for an unknown version to return false")
+	}
+}
+
+// TestEngineSnapshotAt_SeedsVersionZeroForDefaultRoute verifies that
+// the NewEngineWithDefaultRoute path records the version-0 default
+// route snapshot.  Without this, every txn that observed v=0 (the
+// common case before any ApplySnapshot lands) would fall through
+// to the M3 not-found path and trigger a spurious retry on its first
+// commit.
+func TestEngineSnapshotAt_SeedsVersionZeroForDefaultRoute(t *testing.T) {
+	e := NewEngineWithDefaultRoute()
+	snap, ok := e.SnapshotAt(0)
+	if !ok {
+		t.Fatal("expected NewEngineWithDefaultRoute to seed a v0 history entry")
+	}
+	if snap.Version() != 0 {
+		t.Fatalf("expected seed snapshot version 0, got %d", snap.Version())
+	}
+	// Default route covers the full keyspace ⇒ every key resolves to
+	// defaultGroupID at v0.
+	owner, ok := snap.OwnerOf([]byte("anything"))
+	if !ok || owner != defaultGroupID {
+		t.Fatalf("expected v0 snapshot to resolve every key to defaultGroupID=%d; got owner=%d found=%v", defaultGroupID, owner, ok)
+	}
+}
+
+// TestEngineSnapshotAt_BareEngineHasNoHistory documents that an
+// Engine constructed via the bare struct literal (e.g. via internal
+// test seams) has a nil history map and SnapshotAt always returns
+// (zero, false).  recordHistorySnapshot is nil-safe so ApplySnapshot
+// still works on such an engine, but the M3 gate will treat every
+// SnapshotAt as "not in ring" → soft-fail-as-retry, which is the
+// correct posture for unconfigured engines.
+func TestEngineSnapshotAt_BareEngineHasNoHistory(t *testing.T) {
+	e := &Engine{routes: make([]Route, 0)} // bare struct literal — no history
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes:  []RouteDescriptor{{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: RouteStateActive}},
+	}); err != nil {
+		t.Fatalf("apply on bare engine should succeed: %v", err)
+	}
+	if _, ok := e.SnapshotAt(1); ok {
+		t.Fatal("bare engine has no history ring; SnapshotAt should always be false")
+	}
+}

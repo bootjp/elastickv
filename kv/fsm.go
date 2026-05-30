@@ -64,6 +64,51 @@ type kvFSM struct {
 	// apply-hook to consume. Stays 0 for v1 restores and headerless
 	// legacy paths (matches the pre-Phase-2 posture exactly).
 	restoredCutover uint64
+	// routes is the M2 Composed-1 versioned-snapshot provider — the
+	// route catalog history this FSM consults at apply time to
+	// resolve OwnerOf(key) for the txn's observed catalog version.
+	// nil at M2 for nodes that have not been wired (legacy
+	// constructors), in which case the M3 verifyComposed1 gate will
+	// short-circuit as "unpinned" (no Composed-1 enforcement) —
+	// matching the pre-feature behaviour byte-for-byte.  Concrete
+	// production type is *distribution.Engine.  See
+	// docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+	// §4.2 prerequisite block + §M2.
+	routes RouteHistory
+	// shardGroupID is the Raft group ID this FSM serves.  Used by
+	// the M3 verifyComposed1 gate to compare against the historical
+	// owner-of-key resolution: a txn's commit MUST land on the
+	// group that owned the key at the txn's observed catalog
+	// version.  Zero at M2 means "unset" — the M3 gate will
+	// short-circuit (matches the pre-feature behaviour).  Wired by
+	// WithRouteHistory from main.go's shard-group construction.
+	shardGroupID uint64
+}
+
+// RouteHistory is the kv-side interface to the route catalog's
+// versioned-snapshot ring.  *distribution.Engine satisfies it.
+// Defined in the kv package so kvFSM does not have to import a
+// concrete type for the field; the M3 verifyComposed1 gate uses
+// only SnapshotAt and the returned snapshot's OwnerOf, so the
+// interface stays minimal.
+type RouteHistory interface {
+	// SnapshotAt returns the route catalog at the given catalog
+	// version.  Returns (zero, false) when the version is outside
+	// the ring (either evicted by depth, or in the future).
+	SnapshotAt(version uint64) (RouteSnapshot, bool)
+}
+
+// RouteSnapshot is the historical view of the route catalog at a
+// specific version.  Returned by RouteHistory.SnapshotAt; the M3
+// gate uses Version + OwnerOf to compare against the FSM's
+// shardGroupID.
+type RouteSnapshot interface {
+	// Version returns the catalog version this snapshot was
+	// recorded at.
+	Version() uint64
+	// OwnerOf returns the Raft group ID that owned key at this
+	// snapshot's version.  (0, false) when no route covered key.
+	OwnerOf(key []byte) (uint64, bool)
 }
 
 // SetApplyIndex implements raftengine.ApplyIndexAware. The engine
@@ -102,6 +147,28 @@ func WithEncryption(applier EncryptionApplier) FSMOption {
 func WithCutoverSource(src CutoverSource) FSMOption {
 	return func(f *kvFSM) {
 		f.cutoverSource = src
+	}
+}
+
+// WithRouteHistory installs the M2 Composed-1 versioned-snapshot
+// provider and the FSM's owning shard group ID.  Both fields are
+// consumed by the M3 verifyComposed1 gate.  At M2 the values are
+// stored but not consulted (M3 wires the check); a caller that
+// constructs a kvFSM without this option remains "unpinned" — the
+// M3 gate will short-circuit and behave exactly like the
+// pre-feature FSM.
+//
+// shardGroupID MUST match the Raft group ID this FSM serves — the
+// gate uses it as the "this group" value when comparing against the
+// historical owner-of-key resolution.  Zero is reserved for the
+// not-wired case.
+//
+// See docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+// §M2 + §4.2 prerequisite block.
+func WithRouteHistory(routes RouteHistory, shardGroupID uint64) FSMOption {
+	return func(f *kvFSM) {
+		f.routes = routes
+		f.shardGroupID = shardGroupID
 	}
 }
 

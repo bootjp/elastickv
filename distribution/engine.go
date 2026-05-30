@@ -36,7 +36,26 @@ type Engine struct {
 	catalogVersion   uint64
 	ts               atomic.Uint64
 	hotspotThreshold uint64
+	// history is the M2 versioned-snapshot ring for Composed-1
+	// (docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+	// §M2).  Keyed by catalogVersion; populated on every successful
+	// ApplySnapshot and seeded by NewEngineWithDefaultRoute so a
+	// transaction that observed catalogVersion = 0 (the engine's
+	// pre-bootstrap snapshot) can still resolve its read-set owner.
+	// Bounded by historyDepth via a FIFO eviction list
+	// (historyOrder).  At M2 the ring is plumbing only — M3 will
+	// read from it via verifyComposed1.
+	history      map[uint64]RouteHistorySnapshot
+	historyOrder []uint64
+	historyDepth int
 }
+
+// DefaultRouteHistoryDepth is the size of Engine's versioned-snapshot
+// ring used by the Composed-1 M2 plumbing.  32 is conservative
+// against current single-leader catalog churn (operator-frequency,
+// not data-plane) per the design doc §9 Q2; raise if a future
+// control plane generates more than ~tens of versions per second.
+const DefaultRouteHistoryDepth = 32
 
 const defaultGroupID uint64 = 1
 const minRouteCountForOrderValidation = 2
@@ -54,10 +73,14 @@ func NewEngine() *Engine {
 }
 
 // NewEngineWithDefaultRoute creates an Engine and registers a default route
-// covering the full keyspace with a default group ID.
+// covering the full keyspace with a default group ID.  The default route is
+// also recorded in the M2 history ring as the version-0 snapshot so
+// transactions that observed catalogVersion = 0 can resolve their read-set
+// owner through SnapshotAt(0).
 func NewEngineWithDefaultRoute() *Engine {
 	engine := NewEngine()
 	engine.UpdateRoute([]byte(""), nil, defaultGroupID)
+	engine.recordHistorySnapshot()
 	return engine
 }
 
@@ -65,7 +88,13 @@ func NewEngineWithDefaultRoute() *Engine {
 // detection. A non-zero threshold enables automatic range splitting when the
 // number of accesses to a range exceeds the threshold.
 func NewEngineWithThreshold(threshold uint64) *Engine {
-	return &Engine{routes: make([]Route, 0), hotspotThreshold: threshold}
+	return &Engine{
+		routes:           make([]Route, 0),
+		hotspotThreshold: threshold,
+		history:          make(map[uint64]RouteHistorySnapshot, DefaultRouteHistoryDepth),
+		historyOrder:     make([]uint64, 0, DefaultRouteHistoryDepth),
+		historyDepth:     DefaultRouteHistoryDepth,
+	}
 }
 
 // Version returns current route catalog version applied to the engine.
@@ -106,7 +135,91 @@ func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 
 	e.routes = routes
 	e.catalogVersion = snapshot.Version
+	e.recordHistorySnapshot()
 	return nil
+}
+
+// RouteHistorySnapshot is a point-in-time view of the route catalog at
+// a specific version.  Returned by Engine.SnapshotAt for the M3
+// Composed-1 commit-time gate.  Carries an immutable copy of the
+// catalog's routes at the recorded version so a caller can resolve
+// ownership without holding the Engine lock.
+type RouteHistorySnapshot struct {
+	version uint64
+	routes  []Route
+}
+
+// Version returns the catalog version this snapshot was recorded at.
+func (s RouteHistorySnapshot) Version() uint64 { return s.version }
+
+// OwnerOf returns the Raft group ID that owned key at this snapshot's
+// version.  Returns (0, false) when no route covers key (the
+// pre-bootstrap state or an explicitly-uncovered range).  Mirrors
+// Engine.GetRoute's right-half-open interval semantics but against
+// the historical snapshot, not the live engine state.
+func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
+	for _, r := range s.routes {
+		if bytes.Compare(key, r.Start) < 0 {
+			continue
+		}
+		if r.End != nil && bytes.Compare(key, r.End) >= 0 {
+			continue
+		}
+		return r.GroupID, true
+	}
+	return 0, false
+}
+
+// SnapshotAt returns the route catalog snapshot recorded at version v.
+// Returns (zero, false) when v is not in the ring — either because v
+// is in the future (> catalogVersion), or because the FIFO ring has
+// evicted v (it was older than the historyDepth-most-recent
+// versions).  The M3 Composed-1 gate (design doc §4.3) treats the
+// not-found case as a hard error and triggers a coordinator retry,
+// so retention depth is a liveness knob, not a safety knob.
+func (e *Engine) SnapshotAt(v uint64) (RouteHistorySnapshot, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	snap, ok := e.history[v]
+	return snap, ok
+}
+
+// HistoryDepth returns the configured ring depth for diagnostics.
+func (e *Engine) HistoryDepth() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.historyDepth
+}
+
+// recordHistorySnapshot pushes the current (catalogVersion, routes)
+// pair into the ring.  Caller MUST hold e.mu (write lock) — invoked
+// from ApplySnapshot under the write lock, and from
+// NewEngineWithDefaultRoute before the Engine is shared with any
+// concurrent reader.  Idempotent on re-record at the same version.
+func (e *Engine) recordHistorySnapshot() {
+	if e.history == nil {
+		// Engines constructed via the bare struct literal (e.g.
+		// internal test seams) — no history ring configured.  Skip
+		// the record so the M2 plumbing stays optional for those
+		// paths; the M3 gate will observe SnapshotAt → (zero,
+		// false) and trigger the soft-fail-as-retry path.
+		return
+	}
+	if _, exists := e.history[e.catalogVersion]; exists {
+		return
+	}
+	if len(e.historyOrder) >= e.historyDepth {
+		evict := e.historyOrder[0]
+		e.historyOrder = e.historyOrder[1:]
+		delete(e.history, evict)
+	}
+	cloned := make([]Route, len(e.routes))
+	copy(cloned, e.routes)
+	e.history[e.catalogVersion] = RouteHistorySnapshot{
+		version: e.catalogVersion,
+		routes:  cloned,
+	}
+	e.historyOrder = append(e.historyOrder, e.catalogVersion)
 }
 
 func staleSnapshotVersionErr(snapshotVersion, currentVersion uint64) error {

@@ -378,6 +378,7 @@ func run() error {
 		keystore,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
+		cfg.engine,
 	)
 	if err = chainEncryptionStartupGuard(
 		err,
@@ -774,6 +775,7 @@ func buildShardGroups(
 	keystore *encryption.Keystore,
 	sidecarPath string,
 	encWiring encryptionWriteWiring,
+	routeEngine *distribution.Engine,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	// Defend the "cache is always non-nil" contract for callers that
 	// pass a zero-value encryptionWriteWiring{} (the encryption-off
@@ -839,7 +841,17 @@ func buildShardGroups(
 			_ = st.Close()
 			return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", g.id)
 		}
-		sm := kv.NewKvFSMWithHLC(st, clock, kv.WithEncryption(applier))
+		// Composed-1 M2 plumbing: wire the shared route catalog
+		// engine and this shard's owning group ID so M3's
+		// verifyComposed1 apply-time gate can resolve the
+		// observed-version owner-of-key without further plumbing
+		// work. At M2 the FSM stores both but does not consult them;
+		// see docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+		// §M2.
+		sm := kv.NewKvFSMWithHLC(st, clock,
+			kv.WithEncryption(applier),
+			kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), g.id),
+		)
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {
