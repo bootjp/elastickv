@@ -38,6 +38,23 @@ const (
 	// this; the log line just makes a stuck node visible rather than
 	// silently hung.
 	registrationGateWarnAfter = 15 * time.Second
+	// runtimeRegistrationPollInterval is the cadence at which the Stage
+	// 7b runtime watcher polls the shared StateCache for the cutover
+	// trigger (envelope active && !Registered()). One second is short
+	// enough that the gate-trapped window after a runtime
+	// EnableStorageEnvelope is sub-second in practice, and long enough
+	// that an idle node spends negligible CPU on it.
+	runtimeRegistrationPollInterval = 1 * time.Second
+	// runtimeRegistrationTickTimeout bounds a single tick's call to
+	// runWriterRegistration. Without it, a prolonged leaderless /
+	// partitioned window would block the watcher goroutine indefinitely
+	// inside the inner retry loop — unable to re-poll, re-evaluate the
+	// active DEK, or log a deferred-rotation skip (gemini HIGH on PR
+	// #853). Choosing 30s gives the inner registrationAttemptTimeout
+	// (5s) + backoff a few cycles before the outer timeout fires and
+	// the loop reconsiders. Re-propose on the next tick is safe because
+	// §4.1 case 2-idempotent makes a duplicate apply a no-op.
+	runtimeRegistrationTickTimeout = 30 * time.Second
 )
 
 // retryUntilRegistered runs fn, retrying with bounded backoff while it
@@ -119,6 +136,15 @@ func setupDistributionAndRegistration(
 	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
 		return nil, err
 	}
+	// Stage 7b/7b': arm the runtime watcher. Handles all three runtime
+	// registration triggers — cutover (Phase-0 → EnableStorageEnvelope),
+	// pre-bootstrap (no DEK → runtime Bootstrap), and rotation (RotateDEK
+	// from a non-proposer's perspective). All three collapse to the same
+	// in-scope propose under the cache.Registered() gate in
+	// runtimeRegistrationInScope. Must run AFTER
+	// installProcessStartRegistrationGate so the gate is in place before
+	// any runtime trigger can fire.
+	installRuntimeRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID)
 	// Bootstrap + registration both run under runCtx so a shutdown
 	// cancels the bounded retry rather than hanging.
 	distCatalog, err := setupDistributionCatalog(runCtx, runtimes, engine)
@@ -244,12 +270,16 @@ func buildProcessStartRegistrationGate(
 	// it, consistently >registrationAttemptTimeout commit latency could
 	// keep retrying-without-committing forever despite durable
 	// registration (codex P2 #6).
+	//
+	// Strict (full_node_id, epoch)-exact match, not lastSeen>=epoch: a
+	// row at lastSeen > w.epoch is not proof this load registered, and
+	// short-circuiting would MarkRegistered while the nonce factory
+	// stays pinned to the lower epoch (codex P1 round-1 on PR #853). The
+	// §9.1 startup guard at line 254 already rejects this state for the
+	// 7a propose branch, so the strict check is defense-in-depth that
+	// stays consistent with the 7b runtime watcher's verifyRegistered.
 	verifyRegistered := func() (bool, error) {
-		ls, err := registryLastSeen(reg, activeDEK, fullNodeID)
-		if err != nil {
-			return false, err
-		}
-		return ls >= w.epoch, nil
+		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.epoch)
 	}
 	eg.Go(func() error {
 		runWriterRegistration(ctx, coordinate, defaultGroup.Engine, w.cache, activeDEK, entry, req, barrier, verifyRegistered)
@@ -291,6 +321,41 @@ func registryLastSeen(reg encryption.WriterRegistryStore, dekID uint32, fullNode
 		return 0, errors.Wrap(err, "writer registration: decode registry value")
 	}
 	return val.LastSeenLocalEpoch, nil
+}
+
+// registrationCommittedAtEpoch returns true only when an existing
+// registry row matches (full_node_id, dek_id) AND its
+// last_seen_local_epoch equals epoch exactly. Used by the Stage 7a/7b
+// verifyRegistered closures as a strict "did THIS load register?" check.
+//
+// A row with last_seen > epoch is NOT proof this load registered: it
+// could be a stale-sidecar load that slipped past the §9.1 startup
+// guard, or a concurrent same-raftID instance that bumped to a newer
+// epoch. Returning true on >epoch would MarkRegistered without
+// proposing, opening the storage gate while this load's nonce factory
+// remains pinned to the lower epoch — a previous load's (node, epoch)
+// nonces could then collide with this load's emissions.
+//
+// A FullNodeID mismatch indicates the §6.1 uint16-collision case the
+// applier rejects via case-4 halt apply; this helper returns false
+// (rather than true) so runWriterRegistration's propose path drives the
+// halt, instead of fail-OPENing the gate via the short-circuit branch.
+func registrationCommittedAtEpoch(reg encryption.WriterRegistryStore, dekID uint32, fullNodeID uint64, epoch uint16) (bool, error) {
+	raw, ok, err := reg.GetRegistryRow(encryption.RegistryKey(dekID, encryption.NodeID16(fullNodeID)))
+	if err != nil {
+		return false, errors.Wrap(err, "writer registration: read registry row")
+	}
+	if !ok {
+		return false, nil
+	}
+	val, err := encryption.DecodeRegistryValue(raw)
+	if err != nil {
+		return false, errors.Wrap(err, "writer registration: decode registry value")
+	}
+	if val.FullNodeID != fullNodeID {
+		return false, nil
+	}
+	return val.LastSeenLocalEpoch == epoch, nil
 }
 
 // registrationEntry composes the §11.3 0x03 OpRegistration Raft entry
@@ -432,4 +497,217 @@ func proposeWriterRegistration(
 		return errors.Wrap(err, "writer registration: forward to leader")
 	}
 	return nil
+}
+
+// installRuntimeRegistrationWatcher arms the Stage 7b runtime watcher
+// from setupDistributionAndRegistration (AFTER installProcessStartRegistrationGate).
+// It captures the boot-time active storage DEK and starts the watcher
+// goroutine under runCtx. A no-op when encryption is not wired.
+func installRuntimeRegistrationWatcher(
+	ctx context.Context,
+	eg *errgroup.Group,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	raftID string,
+) {
+	// Encryption not wired (no cipher → no nonce factory → no direct-path
+	// gate to clear). The 7a-2 storage gate is also un-armed in this
+	// case, so there is nothing the runtime watcher could usefully do.
+	if w.cipher == nil || defaultGroup == nil {
+		return
+	}
+	// Capture the boot-time active DEK once at watcher construction
+	// (per §2.1 of the design): the scope check
+	// `bootDEKID != 0 && activeDEK != bootDEKID` reads this captured
+	// value on every tick, NOT a re-read of the current DEK. The cache
+	// reports (0, false) on pre-bootstrap; that 0 is the load-bearing
+	// signal for the bootDEKID==0 branch.
+	bootDEKID, _ := w.cache.ActiveStorageKeyID()
+	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
+	eg.Go(func() error {
+		runRuntimeRegistrationWatcher(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID)
+		return nil
+	})
+}
+
+// runRuntimeRegistrationWatcher is the Stage 7b/7b' polling loop. It
+// checks the §4.1 trigger condition every runtimeRegistrationPollInterval
+// and proposes a registration synchronously for any in-scope case: the
+// cutover (activeDEK == bootDEKID), pre-bootstrap (bootDEKID == 0), and
+// rotation (activeDEK != bootDEKID) branches all collapse to the same
+// in-scope propose under the cache.Registered() gate (7b' §3.2).
+//
+// The propose runs in this goroutine — at most one in-flight at a time,
+// no goroutine accumulation, no duplicate Raft proposals from the
+// watcher. registrationAttemptTimeout (inside runWriterRegistration)
+// bounds individual sub-attempts. On runCtx cancellation the loop exits
+// without closing any barrier — fail-closed posture preserved.
+func runRuntimeRegistrationWatcher(
+	ctx context.Context,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	bootDEKID uint32,
+	fullNodeID uint64,
+) {
+	ticker := time.NewTicker(runtimeRegistrationPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		runtimeRegistrationTick(ctx, coordinate, defaultGroup, w, bootDEKID, fullNodeID)
+	}
+}
+
+// runtimeRegistrationInScope evaluates the §1 scope check: returns the
+// active storage DEK and true when the watcher should propose
+// (cutover, pre-bootstrap, OR — after Stage 7b' — rotation).
+//
+// Check ordering (load-bearing):
+//  1. `cache.Registered()` short-circuits — internally tests
+//     `activeStorageDEKID == registeredStorageDEKID` so it auto-
+//     scopes to the currently-active DEK and is the **single
+//     source of truth** for "this load has registered for the
+//     currently-active DEK". The §4.1 case-2 idempotent path
+//     makes re-proposing safe; a single-DEK StateCache means a
+//     B→C→B oscillation re-proposes for B and the case-2 apply
+//     is a no-op (7b' §3.2.2).
+//  2. Envelope-inactive / not-bootstrapped guards.
+//  3. Scope branches: pre-bootstrap (bootDEKID==0), cutover
+//     (activeDEK==bootDEKID), or rotation (activeDEK!=bootDEKID).
+//     The 7b' implementation replaces 7b's log-once-skip deferral
+//     for the rotation branch with an in-scope propose now that
+//     applyRotateDEK records the per-node local_epoch
+//     (writeRotationSidecar §3.1).
+//
+// Note: an earlier 7b' draft added a per-process-load
+// `lastRegisteredDEK` counter to gate the rotation branch against
+// re-proposing once we'd already registered for the current active
+// DEK. That introduced a permanent fail-closed in the race where the
+// 7a process-start goroutine's MarkRegistered(oldDEK) lands AFTER
+// 7b's MarkRegistered(newDEK) — overwriting `registeredStorageDEKID`
+// to a stale value, making `Registered()` false, but the new gate
+// would still see `activeDEK == lastRegisteredDEK` and skip the
+// recovery propose (gemini CRITICAL on PR #864). Letting
+// `cache.Registered()` be the sole gate eliminates that hole at the
+// cost of one extra Raft round-trip per tick whenever the cache is
+// out of sync, which the §4.1 case-2 idempotent apply makes free of
+// side effects.
+func runtimeRegistrationInScope(cache *encryption.StateCache) (activeDEK uint32, inScope bool) {
+	if cache.Registered() {
+		return 0, false
+	}
+	if !cache.StorageEnvelopeActive() {
+		return 0, false
+	}
+	activeDEK, ok := cache.ActiveStorageKeyID()
+	if !ok {
+		return 0, false
+	}
+	// All three 7b/7b' sub-cases collapse to the same propose:
+	// - cutover (activeDEK == bootDEKID, Keys[activeDEK].LocalEpoch
+	//   == w.epoch per 7b §2.2),
+	// - pre-bootstrap (bootDEKID == 0, w.epoch == 0),
+	// - rotation (activeDEK != bootDEKID, Keys[activeDEK].LocalEpoch
+	//   == w.epoch via the 7b' applyRotateDEK per-node sidecar write —
+	//   see internal/encryption/applier.go writeRotationSidecar).
+	// The §4.1 case-2 idempotent apply makes a re-propose during
+	// oscillation a no-op (§3.2.2). The Registered() short-circuit
+	// above is the sole gate against busy re-proposing once a
+	// registration has succeeded — earlier drafts added a
+	// per-process-load lastRegisteredDEK gate here but that
+	// permanently fails closed in the 7a-stale-MarkRegistered race
+	// (gemini CRITICAL on PR #864).
+	return activeDEK, true
+}
+
+// runtimeRegistrationTick is a single iteration of the watcher loop,
+// extracted so the loop body stays under the cyclop budget and the
+// scope-check + propose can be unit-tested independently of the ticker.
+// Returns to the caller after either a no-op skip (when
+// cache.Registered() is already true for the active DEK, or scope
+// conditions reject the tick) or a complete synchronous registration
+// attempt via runWriterRegistration. The Registered() short-circuit at
+// runtimeRegistrationInScope step 1 is the sole gate against re-proposing
+// once a registration has succeeded (gemini CRITICAL on PR #864).
+func runtimeRegistrationTick(
+	ctx context.Context,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	w encryptionWriteWiring,
+	bootDEKID uint32,
+	fullNodeID uint64,
+) {
+	activeDEK, inScope := runtimeRegistrationInScope(w.cache)
+	if !inScope {
+		return
+	}
+	// In scope: cutover (activeDEK == bootDEKID), pre-bootstrap
+	// (bootDEKID == 0), or 7b' rotation (activeDEK != bootDEKID).
+	// All three satisfy sidecar.Keys[activeDEK].LocalEpoch == w.epoch
+	// (cutover/pre-bootstrap per 7b §2.2; rotation per 7b' §3.1's
+	// writeRotationSidecar local_epoch wiring). cache.Registered()
+	// inside runtimeRegistrationInScope gates against re-proposing
+	// after a successful registration.
+	slog.Info("encryption: 7b runtime watcher proposing registration",
+		slog.Uint64("active_dek_id", uint64(activeDEK)),
+		slog.Uint64("full_node_id", fullNodeID),
+		slog.Uint64("local_epoch", uint64(w.epoch)),
+		slog.Uint64("boot_dek_id", uint64(bootDEKID)))
+	reg, err := store.WriterRegistryFor(defaultGroup.Store)
+	if err != nil {
+		slog.Warn("encryption: 7b runtime watcher failed to obtain writer registry handle; will retry",
+			slog.String("error", err.Error()))
+		return
+	}
+	// Per design §5 item 5: explicit ok=true gating on GetRegistryRow,
+	// NOT the existing registryLastSeen helper (which swallows ok=false
+	// as 0 and would short-circuit registration when w.epoch==0 without
+	// proposing a durable row, opening the gate fail-OPEN).
+	//
+	// Exact (full_node_id, epoch) match, not lastSeen>=epoch (codex P1
+	// round-1 on PR #853): a row at lastSeen > w.epoch is not proof
+	// THIS process load registered. Possible causes — a stale-sidecar
+	// load that slipped past the §9.1 startup guard, or a concurrent
+	// same-raftID instance that bumped to a newer epoch and registered
+	// there. Treating that as "already registered" would MarkRegistered
+	// without a propose, opening the storage gate while this load's
+	// nonce factory still emits at the lower epoch — and the previous
+	// load's (node, epoch=this.w.epoch, *) nonces would collide with
+	// this load's emissions. The strict equality forces a propose on
+	// >epoch, which Raft applies via §4.1 case 3 (rollback halt) —
+	// loud, fail-closed, no nonce reuse.
+	verifyRegistered := func() (bool, error) {
+		return registrationCommittedAtEpoch(reg, activeDEK, fullNodeID, w.epoch)
+	}
+	// Synchronous propose in this goroutine. The barrier passed to
+	// runWriterRegistration is solely to satisfy its signature; this
+	// watcher does NOT select on it. Only the MarkRegistered side
+	// effect (via releaseBarrier on success) matters here.
+	//
+	// Per-tick bounded timeout (gemini HIGH on PR #853): if the inner
+	// retry loop is stuck (no leader, partition), this returns control
+	// to the watcher's polling loop within runtimeRegistrationTickTimeout
+	// so the next tick can re-poll, re-evaluate the active DEK, and log
+	// a deferred-rotation skip if rotation happened mid-block. The
+	// re-propose on the next tick is safe via §4.1 case-2-idempotent.
+	tickCtx, cancel := context.WithTimeout(ctx, runtimeRegistrationTickTimeout)
+	defer cancel()
+	barrier := make(chan struct{})
+	entry := registrationEntry(activeDEK, fullNodeID, w.epoch)
+	req := registrationRequest(activeDEK, fullNodeID, w.epoch)
+	runWriterRegistration(tickCtx, coordinate, defaultGroup.Engine, w.cache, activeDEK,
+		entry, req, barrier, verifyRegistered)
+	// No success-bookkeeping needed: cache.Registered() flips true via
+	// runWriterRegistration's MarkRegistered side effect on the success
+	// path, and the next tick's runtimeRegistrationInScope step (1)
+	// short-circuit reads that state directly. Any race that leaves the
+	// cache out of sync (e.g. the 7a process-start goroutine's
+	// MarkRegistered landing after this watcher's MarkRegistered for a
+	// newer DEK) is recovered by the next tick re-proposing, with the
+	// §4.1 case-2 idempotent apply making the re-propose a no-op.
 }

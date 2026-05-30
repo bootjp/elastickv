@@ -270,6 +270,20 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 	if err := f.handleRequest(ctx, r, commitTS); err != nil {
 		return errors.WithStack(err)
 	}
+	// HLC-4 strategy (c) — observe every applied commit_ts so this node's
+	// hlc.last dominates the max committed timestamp visible in the FSM.
+	// On a follower this keeps the in-memory logical counter aligned with
+	// the cluster; when a follower is elected leader of any group,
+	// etcd/raft applies all uncommitted entries from prior terms before
+	// the leader serves a write, so by the time the new leader calls
+	// HLC.Next() for a persistence ts, hlc.last >= every commit_ts ever
+	// committed.  This closes the HLC-4 logical-handoff gap surfaced by
+	// the tla-check gap configuration on PR #856.
+	// See docs/design/2026_05_28_partial_tla_safety_spec.md §5.1 HLC-4
+	// precondition (ii) (strategy (c)) and HLC.tla BecomeLeader_HLC.
+	if f.hlc != nil && commitTS > 0 {
+		f.hlc.Observe(commitTS)
+	}
 	return nil
 }
 
@@ -488,6 +502,33 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return errors.WithStack(ErrTxnCommitTSRequired)
 	}
 
+	// Option-2 idempotency dedup: when this is a retry (meta.PrevCommitTS set),
+	// the adapter reused the failed attempt's write set under a fresh commitTS.
+	// If the previous attempt already landed — its entry survived the leader
+	// churn that returned an ambiguous error — there is a committed version of
+	// the primary key at exactly PrevCommitTS. Re-applying would create a
+	// duplicate (the very :duplicate-elements anomaly), so no-op the whole
+	// apply and let the adapter reconstruct the prior result.
+	//
+	// Determinism note (codex P1 round-11): the underlying CommittedVersionAt
+	// intentionally does NOT enforce the retention watermark — branching FSM
+	// apply on the per-replica minRetainedTS would let replicas with stale
+	// retention surface ErrReadTSCompacted and skip dedup while replicas that
+	// still retain the previous version no-op, producing split-brain. The
+	// store's probe returns the raw pebble.Get answer; for the option-2 use
+	// case (per-element keys, single MVCC version each) physical compaction
+	// does not remove the version, so the probe is identical on every replica
+	// applying this log entry. The retention-window > max-retry-latency
+	// invariant prevents the rare case where a real never-landed retry
+	// arrives with PrevCommitTS below pebble's compacted floor.
+	dedup, err := f.dedupProbeOnePhase(ctx, meta)
+	if err != nil {
+		return err
+	}
+	if dedup {
+		return nil
+	}
+
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
@@ -498,6 +539,25 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return err
 	}
 	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, r.ReadKeys, startTS, commitTS))
+}
+
+// dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
+// because the entry is a retry whose prior attempt already landed. Extracted
+// to keep handleOnePhaseTxnRequest under the cyclop budget; the determinism
+// rationale lives at the call site.
+//
+// Returns (true, nil) → the entry must no-op (prior attempt landed).
+// Returns (false, nil) → fall through to normal apply.
+// Returns (false, err) → propagate err; apply must not proceed.
+func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, error) {
+	if meta.PrevCommitTS == 0 {
+		return false, nil
+	}
+	landed, err := f.store.CommittedVersionAt(ctx, meta.PrimaryKey, meta.PrevCommitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return landed, nil
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {

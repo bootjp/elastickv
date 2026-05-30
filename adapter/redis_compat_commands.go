@@ -1442,7 +1442,10 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return err
 		}
 
-		commitTS := r.coordinator.Clock().Next()
+		commitTS, err := r.coordinator.Clock().NextFenced()
+		if err != nil {
+			return cockerrors.Wrap(err, "mutateExactSetWide: allocate commitTS")
+		}
 
 		migrationElems, migErr := r.buildSetLegacyMigrationElems(ctx, key, readTS)
 		if migErr != nil {
@@ -2057,15 +2060,14 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 	var added int
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
-		if err != nil {
+		if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeHash); err != nil {
 			return err
 		}
-		if typ != redisTypeNone && typ != redisTypeHash {
-			return wrongTypeError()
-		}
 
-		commitTS := r.coordinator.Clock().Next()
+		commitTS, err := r.coordinator.Clock().NextFenced()
+		if err != nil {
+			return cockerrors.Wrap(err, "applyHashFieldPairs: allocate commitTS")
+		}
 
 		// Atomically migrate any legacy blob on first wide-column write.
 		// Fetch migration elems before allocating the main elems slice so that
@@ -2631,7 +2633,10 @@ func (r *RedisServer) hdelWideColumn(ctx context.Context, key []byte, fields [][
 	if removed == 0 {
 		return 0, nil
 	}
-	commitTS := r.coordinator.Clock().Next()
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return 0, cockerrors.Wrap(err, "hdelWideColumn: allocate commitTS")
+	}
 	elems := delElems
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(-removed)})
 	elems = append(elems, &kv.Elem[kv.OP]{
@@ -2956,15 +2961,14 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 
 func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increment int64) (int64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeHash)
-	if err != nil {
+	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeHash); err != nil {
 		return 0, err
 	}
-	if typ != redisTypeNone && typ != redisTypeHash {
-		return 0, wrongTypeError()
-	}
 
-	commitTS := r.coordinator.Clock().Next()
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return 0, cockerrors.Wrap(err, "hincrbyTxn: allocate commitTS")
+	}
 	fieldKey := store.HashFieldKey(key, field)
 
 	current, isNewField, legacyValue, err := r.readHashFieldInt(ctx, key, field, readTS)
@@ -3277,15 +3281,14 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
-	if err != nil {
+	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeZSet); err != nil {
 		return 0, err
 	}
-	if typ != redisTypeNone && typ != redisTypeZSet {
-		return 0, wrongTypeError()
-	}
 
-	commitTS := r.coordinator.Clock().Next()
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return 0, cockerrors.Wrap(err, "zaddTxn: allocate commitTS")
+	}
 
 	migrationElems, err := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
 	if err != nil {
@@ -3368,16 +3371,15 @@ func (r *RedisServer) dispatchAndSignalZSet(
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
 	readTS := r.readTS()
-	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
-	if err != nil {
+	if err := r.requireKeyTypeOrEmpty(ctx, key, readTS, redisTypeZSet); err != nil {
 		return 0, err
-	}
-	if typ != redisTypeNone && typ != redisTypeZSet {
-		return 0, wrongTypeError()
 	}
 
 	memberKey := store.ZSetMemberKey(key, []byte(member))
-	commitTS := r.coordinator.Clock().Next()
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return 0, cockerrors.Wrap(err, "zincrbyTxn: allocate commitTS")
+	}
 
 	migrationElems, migErr := r.buildZSetLegacyMigrationElems(ctx, key, readTS)
 	if migErr != nil {
@@ -3723,7 +3725,10 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 	}
 	if isWide {
 		// Wide-column: delete the popped member key + score index, emit delta -1.
-		commitTS := r.coordinator.Clock().Next()
+		commitTS, err := r.coordinator.Clock().NextFenced()
+		if err != nil {
+			return cockerrors.Wrap(err, "persistBZPopMinResult: allocate commitTS")
+		}
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -1})
 		elems := []*kv.Elem[kv.OP]{
 			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(popped.Member))},

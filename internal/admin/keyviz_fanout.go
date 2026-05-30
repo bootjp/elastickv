@@ -322,9 +322,31 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 	if err != nil {
 		return nil, pkgerrors.Wrap(err, "build peer url")
 	}
+	var m KeyVizMatrix
+	if err := fetchPeerJSON(ctx, f.client, peer, target, cookies, f.responseBodyLimit(), f.logger, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// fetchPeerJSON performs the HTTP boilerplate every keyviz fan-out
+// fetch shares: build a GET, attach the inbound cookies, set the
+// anti-recursion peer header, bound the body read, and decode into
+// the supplied target. Shared by both the matrix fan-out and the
+// hot-keys fan-out so the two stay structurally identical without
+// duplicating the body-cap + warn-on-truncate plumbing (dupl).
+func fetchPeerJSON(
+	ctx context.Context,
+	client *http.Client,
+	peer, target string,
+	cookies []*http.Cookie,
+	bodyLimit int64,
+	logger *slog.Logger,
+	into any,
+) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, http.NoBody)
 	if err != nil {
-		return nil, pkgerrors.Wrap(err, "new request")
+		return pkgerrors.Wrap(err, "new request")
 	}
 	req.Header.Set("Accept", "application/json")
 	// Mark this request as a peer fan-out call so the receiving
@@ -332,18 +354,18 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 	// without this header, a symmetric cluster (every node lists
 	// every other node) generates O(N²) peer HTTP calls per
 	// browser poll. The check on the receiving side is in
-	// KeyVizHandler.ServeHTTP. (Claude bot P1 on PR #692.)
+	// KeyVizHandler.ServeHTTP / KeyVizHotKeysHandler.ServeHTTP.
 	req.Header.Set(keyVizFanoutPeerHeader, "1")
 	attachAdminCookies(req, cookies)
-	resp, err := f.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, pkgerrors.Wrap(err, "peer request")
+		return pkgerrors.Wrap(err, "peer request")
 	}
 	defer func() {
 		// A peer that hangs on body close can wedge our goroutine
 		// against the deadline; log and move on rather than blocking.
 		if cerr := resp.Body.Close(); cerr != nil {
-			f.logger.LogAttrs(ctx, slog.LevelDebug, "keyviz fan-out: peer body close failed",
+			logger.LogAttrs(ctx, slog.LevelDebug, "keyviz fan-out: peer body close failed",
 				slog.String("peer", peer),
 				slog.String("error", cerr.Error()),
 			)
@@ -353,7 +375,7 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 		// Read a bounded prefix of the body so the error message is
 		// useful without letting a misbehaving peer flood our logs.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, keyVizPeerErrorBodyLimit))
-		return nil, fmt.Errorf("%w: status %d: %s", errKeyVizPeer, resp.StatusCode, string(body))
+		return fmt.Errorf("%w: status %d: %s", errKeyVizPeer, resp.StatusCode, string(body))
 	}
 	// Bound the JSON decode so a peer that streams gigabytes cannot
 	// pin a goroutine and balloon memory. The countingReader wraps a
@@ -366,19 +388,18 @@ func (f *KeyVizFanout) fetchPeer(ctx context.Context, peer string, params keyViz
 	//     decoder consumed the trailing byte itself rather than
 	//     leaving it for an external probe (Claude bot round-2 on
 	//     PR #686 flagged the bufio false-negative).
-	cr := &countingReader{r: io.LimitReader(resp.Body, f.responseBodyLimit()+1)}
-	var m KeyVizMatrix
-	if err := json.NewDecoder(cr).Decode(&m); err != nil {
-		return nil, pkgerrors.Wrap(err, "decode peer response")
+	cr := &countingReader{r: io.LimitReader(resp.Body, bodyLimit+1)}
+	if err := json.NewDecoder(cr).Decode(into); err != nil {
+		return pkgerrors.Wrap(err, "decode peer response")
 	}
-	if cr.n > f.responseBodyLimit() {
-		f.logger.LogAttrs(ctx, slog.LevelWarn, "keyviz fan-out: peer response exceeded size limit; truncated decode",
+	if cr.n > bodyLimit {
+		logger.LogAttrs(ctx, slog.LevelWarn, "keyviz fan-out: peer response exceeded size limit; truncated decode",
 			slog.String("peer", peer),
-			slog.Int64("limit_bytes", f.responseBodyLimit()),
+			slog.Int64("limit_bytes", bodyLimit),
 			slog.Int64("read_bytes", cr.n),
 		)
 	}
-	return &m, nil
+	return nil
 }
 
 // countingReader wraps an io.Reader and tracks total bytes read.
@@ -449,7 +470,7 @@ func buildKeyVizPeerURL(peer string, params keyVizParams) (string, error) {
 	if base.Host == "" {
 		return "", fmt.Errorf("%w: peer base url %q has no host", errKeyVizPeer, peer)
 	}
-	base.Path = "/admin/api/v1/keyviz/matrix"
+	base.Path = pathKeyVizMatrix
 	q := base.Query()
 	q.Set("series", string(params.series))
 	q.Set("rows", strconv.Itoa(params.rows))

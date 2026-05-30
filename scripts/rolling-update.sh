@@ -247,6 +247,20 @@ ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
 KEYVIZ_ENABLED="${KEYVIZ_ENABLED:-false}"
 KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
 
+# KeyViz hot-key Top-K drill-down (Phase 2-A++). Master switch +
+# four tuning knobs. When KEYVIZ_HOT_KEYS_ENABLED != "true" the
+# build_keyviz_flags helper skips every --keyvizHotKeys* flag so
+# existing deploys see no behaviour change. Defaults match the
+# sampler-side constants in keyviz/sampler.go; empty values let
+# the daemon use those same defaults — keep them empty here so
+# bumping the Go-side default in a future release rolls out
+# without a separate env-file update.
+KEYVIZ_HOT_KEYS_ENABLED="${KEYVIZ_HOT_KEYS_ENABLED:-false}"
+KEYVIZ_HOT_KEYS_PER_ROUTE="${KEYVIZ_HOT_KEYS_PER_ROUTE:-}"
+KEYVIZ_HOT_KEYS_SAMPLE_RATE="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
+KEYVIZ_HOT_KEYS_QUEUE_SIZE="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
+KEYVIZ_HOT_KEYS_MAX_KEY_LEN="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
+
 # Validate the three boolean ADMIN_* flags must be the literal "true"
 # or "false" — they are forwarded to the remote shell unquoted (no
 # printf %q) for readability, which is only safe when the value is
@@ -254,7 +268,7 @@ KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
 # who typed "True", "1", or a stray quote sees a script-level error
 # pointing at the variable name instead of an inscrutable failure
 # inside the SSH heredoc.
-for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED ENABLE_S3 ENABLE_SQS; do
+for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED KEYVIZ_HOT_KEYS_ENABLED ENABLE_S3 ENABLE_SQS; do
   case "${!_bool_var}" in
     true|false) ;;
     *)
@@ -617,6 +631,11 @@ update_one_node() {
       ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
       KEYVIZ_ENABLED="$KEYVIZ_ENABLED" \
       KEYVIZ_FANOUT_NODES="$KEYVIZ_FANOUT_NODES_Q" \
+      KEYVIZ_HOT_KEYS_ENABLED="$KEYVIZ_HOT_KEYS_ENABLED" \
+      KEYVIZ_HOT_KEYS_PER_ROUTE="$KEYVIZ_HOT_KEYS_PER_ROUTE_Q" \
+      KEYVIZ_HOT_KEYS_SAMPLE_RATE="$KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q" \
+      KEYVIZ_HOT_KEYS_QUEUE_SIZE="$KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q" \
+      KEYVIZ_HOT_KEYS_MAX_KEY_LEN="$KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -1022,6 +1041,32 @@ build_keyviz_flags() {
   if [[ -n "$fanout_nodes" ]]; then
     _flags+=(--keyvizFanoutNodes "$fanout_nodes")
   fi
+
+  # Hot-key Top-K drill-down. Only emit the master flag (and its
+  # tuning knobs) when KEYVIZ_HOT_KEYS_ENABLED=true; the four tuning
+  # knobs are optional and only emitted when the operator set a
+  # non-empty value, so the daemon falls back to the sampler-side
+  # defaults (keyviz/sampler.go) when an env var is left empty.
+  local hot_keys_enabled="${KEYVIZ_HOT_KEYS_ENABLED:-false}"
+  if [[ "$hot_keys_enabled" == "true" ]]; then
+    _flags+=(--keyvizHotKeysEnabled)
+    local hot_keys_per_route="${KEYVIZ_HOT_KEYS_PER_ROUTE:-}"
+    if [[ -n "$hot_keys_per_route" ]]; then
+      _flags+=(--keyvizHotKeysPerRoute "$hot_keys_per_route")
+    fi
+    local hot_keys_sample_rate="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
+    if [[ -n "$hot_keys_sample_rate" ]]; then
+      _flags+=(--keyvizHotKeysSampleRate "$hot_keys_sample_rate")
+    fi
+    local hot_keys_queue_size="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
+    if [[ -n "$hot_keys_queue_size" ]]; then
+      _flags+=(--keyvizHotKeysQueueSize "$hot_keys_queue_size")
+    fi
+    local hot_keys_max_key_len="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
+    if [[ -n "$hot_keys_max_key_len" ]]; then
+      _flags+=(--keyvizHotKeysMaxKeyLen "$hot_keys_max_key_len")
+    fi
+  fi
 }
 
 # build_admin_flags emits the --admin* flag list and bind-mount list
@@ -1231,6 +1276,9 @@ config_fp() {
     "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
     "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
     "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" \
+    "$KEYVIZ_HOT_KEYS_ENABLED" "$KEYVIZ_HOT_KEYS_PER_ROUTE" \
+    "$KEYVIZ_HOT_KEYS_SAMPLE_RATE" "$KEYVIZ_HOT_KEYS_QUEUE_SIZE" \
+    "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN" \
     | sha256sum | cut -d' ' -f1
 }
 DEPLOY_CONFIG_FP_LABEL="elastickv.deploy.config-fp"
@@ -1446,6 +1494,17 @@ ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
 # survive an unquoted env pass but pre-quoting keeps the pattern
 # uniform with the ADMIN_* set above.
 KEYVIZ_FANOUT_NODES_Q="$(printf '%q' "$KEYVIZ_FANOUT_NODES")"
+
+# Hot-key tuning knobs are integers (or empty for sampler default);
+# integers carry no shell metacharacters, but pre-quoting matches the
+# SQS_PORT_Q precedent: anything that is not bool-validated at the top
+# of the script goes through printf '%q' before crossing the SSH
+# boundary. KEYVIZ_HOT_KEYS_ENABLED itself is bool-validated, so it
+# stays unquoted alongside the other booleans.
+KEYVIZ_HOT_KEYS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_PER_ROUTE")"
+KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_SAMPLE_RATE")"
+KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_QUEUE_SIZE")"
+KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
