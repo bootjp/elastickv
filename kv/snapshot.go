@@ -188,13 +188,20 @@ func ReadSnapshotHeader(r *bufio.Reader) (ceiling, cutover uint64, err error) {
 	// Step 0: peek up to 8 bytes. Short streams (< 8 bytes) fall through
 	// to the headerless-legacy branch with the partial bytes left in
 	// place — this preserves TestFSMSnapshotRestoreSmallLegacy and is
-	// the gemini-medium / coderabbit-major fix from PR #877.
+	// the gemini-medium / coderabbit-major fix from PR #877. Genuine
+	// I/O failures (network timeout, disk error) MUST surface as a
+	// typed error rather than masquerade as a legacy snapshot —
+	// otherwise the restore silently succeeds with no data and the
+	// downstream apply path looks at an empty store (gemini HIGH on
+	// PR #886).
 	peeked, perr := r.Peek(8) //nolint:mnd
 	if len(peeked) < 8 {      //nolint:mnd
+		if perr != nil && !errors.Is(perr, io.EOF) && !errors.Is(perr, io.ErrUnexpectedEOF) {
+			return 0, 0, errors.Wrap(perr, "snapshot header: peek")
+		}
 		// io.EOF / io.ErrUnexpectedEOF on a short stream: treat as
 		// headerless legacy. Bytes that were peeked stay in r per
 		// bufio.Reader semantics.
-		_ = perr
 		return 0, 0, nil
 	}
 
@@ -263,7 +270,11 @@ func readV2(r *bufio.Reader) (uint64, uint64, error) {
 	}
 	// Read exactly plen payload bytes. Parse ceiling/cutover from the
 	// first 16; ignore the remainder (forward-compat extension area).
-	payload := make([]byte, plen)
+	// plen is already bounded by maxSnapshotHeaderPayload (1024B), so
+	// a stack-allocated buffer is safe and skips the heap allocation
+	// per restore (gemini MEDIUM on PR #886).
+	var buf [maxSnapshotHeaderPayload]byte
+	payload := buf[:plen]
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return 0, 0, errors.Wrap(err, "v2 header: read payload")
 	}

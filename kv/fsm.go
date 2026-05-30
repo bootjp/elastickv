@@ -395,8 +395,14 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	// Stage 8a §3.2: the bufio.Reader is owned by the caller (us) and
 	// MUST be passed unchanged to the inner-store path on every branch
 	// — buffered bytes can sit between the header consumption and the
-	// inner-store read; switching readers silently loses them.
-	br := bufio.NewReader(r)
+	// inner-store read; switching readers silently loses them. If the
+	// engine already handed us a *bufio.Reader, reuse it to avoid the
+	// double-buffering overhead (gemini MEDIUM on PR #886); otherwise
+	// wrap once at this boundary.
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReader(r)
+	}
 	ceilingU, cutover, err := ReadSnapshotHeader(br)
 	if err != nil {
 		return errors.WithStack(err)

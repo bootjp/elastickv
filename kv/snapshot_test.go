@@ -531,3 +531,47 @@ func TestFSMSnapshotRestoreV2_PlumbsCutover(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("vv"), val)
 }
+
+// flakyReader returns the supplied error on the first Read after returning
+// the (possibly empty) prefix. Used to drive ReadSnapshotHeader's Peek
+// down the non-EOF error path.
+type flakyReader struct {
+	prefix []byte
+	err    error
+	off    int
+}
+
+func (f *flakyReader) Read(p []byte) (int, error) {
+	if f.off < len(f.prefix) {
+		n := copy(p, f.prefix[f.off:])
+		f.off += n
+		return n, nil
+	}
+	return 0, f.err
+}
+
+// TestReadSnapshotHeader_NonEOFPeekErrorPropagates pins design §3.2 step 0
+// + gemini HIGH on PR #886: an I/O failure during the initial Peek (not
+// io.EOF / io.ErrUnexpectedEOF) MUST surface as a typed error instead of
+// silently masquerading as a headerless-legacy short stream. Without this,
+// a network timeout mid-restore would silently restore an empty store.
+func TestReadSnapshotHeader_NonEOFPeekErrorPropagates(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("synthetic disk failure")
+	// 0 bytes available, then a non-EOF error: ReadSnapshotHeader must
+	// propagate the error wrapped with context, not return (0,0,nil).
+	br := bufio.NewReader(&flakyReader{prefix: nil, err: sentinel})
+	_, _, err := ReadSnapshotHeader(br)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, sentinel),
+		"want wrapped sentinel error, got %v", err)
+
+	// A few bytes available, then a non-EOF error: same fail-closed
+	// contract (partial-stream short reads must NOT swallow the I/O
+	// error and pretend the prefix is a legacy snapshot).
+	br = bufio.NewReader(&flakyReader{prefix: []byte("EKV"), err: sentinel})
+	_, _, err = ReadSnapshotHeader(br)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, sentinel),
+		"want wrapped sentinel error on partial-then-fail, got %v", err)
+}
