@@ -6,7 +6,7 @@
 | Date | 2026-05-29 |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.4 snapshot envelope, §7.1 Phase-2 cutover) |
 | Builds on | Stage 5 (sidecar `raft_envelope_cutover_index` field), forthcoming Stage 6E (`enable-raft-envelope` admin RPC populates the index) |
-| Sibling slice | Stage 8b — WAL coverage (§4.5). Deferred to a separate design and PR. |
+| Sibling slice | Stage 8b — WAL coverage (no §4.x yet; see §1 Out-of-Scope). Deferred to a separate design and PR. |
 
 ## 0. Why this slice exists
 
@@ -397,8 +397,9 @@ to carry the cutover through a snapshot restore.
 
 ## 7. After 8a
 
-- **Stage 8b** — §4.5 WAL coverage (Raft log encryption on disk).
-  A separate design and PR; not blocked on 8a.
+- **Stage 8b** — WAL coverage (Raft log encryption on disk; no §4.x
+  in the parent yet — see §1 Out-of-Scope). A separate design and
+  PR; not blocked on 8a.
 - **Stage 6E** — `enable-raft-envelope` admin RPC + cutover apply.
   Depends on 8a's reader being deployed first so a node restoring
   from a snapshot taken after cutover can resume correctly.
