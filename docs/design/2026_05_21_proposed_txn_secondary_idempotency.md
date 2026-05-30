@@ -449,10 +449,15 @@ preserves availability and adds correctness.
   at exactly T1 → no-op (no version at T2, newest stays T1); truncated /
   never-applied → applies at T2; `prev_commit_ts == 0` → probe skipped,
   byte-identical to today.
-- **Still open for M2:** an FSM test that simulates the *other*-txn case
-  (`Tx ≠ T1`) end-to-end so exactness is pinned at the apply layer too (the
-  store layer already pins it). Fold into M3, where the OCC-conflict path is
-  exercised.
+- **M2 other-txn FSM exactness (was: still open) — LANDED.**
+  `TestOnePhaseDedup_OtherTxnVersionDoesNotMaskRetry`
+  (`kv/fsm_onephase_dedup_test.go`) pins exactness at the apply layer with
+  the third-party-version-at-T_other ≠ T1 scenario: a foreign version at
+  T_other=20 must NOT satisfy the FSM's exact-T1=30 probe, so a retry
+  carrying `prev_commit_ts=30` falls through and applies at the fresh
+  `commit_ts=40`. The store layer pin
+  (`store/committed_version_at_test.go`) covers the primitive; the new test
+  covers the FSM dispatch path that uses it.
 
 ### M3 — write-set reuse + result reconstruction in the retry sites
 
@@ -473,8 +478,41 @@ preserves availability and adds correctness.
   outcomes end-to-end against real OCC + the real probe, plus the gate-off
   legacy path.
 - **Result reconstruction (R1) — resolved, and simpler than feared.** See R1.
-- `runTransaction` (`adapter/redis.go`): same reuse + reconstruct for the EXEC
-  body (single-mop first; see Open questions). **Still open.**
+- **`runTransaction` (MULTI/EXEC) — LANDED via PR #884.** When the gate is
+  on, `runTransactionWithDedup` mirrors `listPushCoreWithDedup` at the EXEC
+  granularity: the first attempt builds the txn, captures `nextResults`
+  from attempt 1's `startTS` snapshot, dispatches; on a retryable failure
+  the closure stashes a `reusableExecTxn` and the next iteration calls
+  `dispatchExecReuse` with `PrevCommitTS`. Cached `results` are returned
+  on both reuse-success and self-conflict-probe-hit; a non-self
+  `WriteConflict` drops pending and rebuilds.
+  - **Multi-mop EXEC — LANDED.**
+    `TestExecDedup_MultiMopLandedPriorAttempt_ReturnsCachedResults`
+    (`adapter/redis_exec_dedup_test.go`) pins a 3-command body (SET +
+    SET + DEL) where attempt 1 lands then errors: the retry returns the
+    cached results array as-is (OK, OK, 1) without re-executing — DEL
+    would re-execute to 0 on a second pass, which the test rejects.
+  - **Two intentional deviations from the M1/M2 template, noted per
+    claude[bot] PR #884 review:**
+    1. `prepareDispatch()` assembles `readKeys` unconditionally (before
+       the empty-elems guard), versus the old `commit()` shape that
+       assembled `readKeys` only after the guard. Harmless reorder —
+       the slice is discarded in the empty-elems path — but the doc
+       acknowledges the small semantic shift so a future reader does
+       not flag it as an oversight.
+    2. The reuse path in `runTransactionWithDedup` derives a fresh
+       per-attempt `reuseCtx` from `handlerContext()` rather than
+       reusing the outer `dispatchCtx`. Each reuse attempt thus gets a
+       full `redisDispatchTimeout`, strictly more conservative than
+       `listPushCoreWithDedup` (which threads the caller ctx through).
+       Chosen so a half-expired ctx never cuts a reuse attempt short
+       on the retry path; consistent with `prepareDispatch()`'s
+       per-attempt fresh-ctx pattern in `commit()`.
+- **Standalone write commands (SET/INCR/HSET/...) — still open.** The EXEC
+  path covers MULTI bodies; standalone single-command dispatch goes through
+  per-handler paths (`applySet`, `applyIncr`, etc.) and needs the same
+  `reusable<X>` capture + `dispatchXReuse` shape per command. Scope is
+  per-command but each is small (~50 LOC). Tracked as PR-B follow-up.
 
 ### M4 — Validation
 
