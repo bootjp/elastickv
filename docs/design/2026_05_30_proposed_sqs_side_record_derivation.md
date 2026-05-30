@@ -8,14 +8,32 @@
 
 For every `!sqs|msg|data|...` record M5-1 already writes, the encoder must also write the **derived** side records the live adapter would have written:
 
-| Family            | Classic key (partition_count = 1)                                                                              | Partitioned key (partition_count > 1)                                                                            | Value (live)                              | Derivation rule                                                                                                                                                          |
-| ----------------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `vis`             | `!sqs\|msg\|vis\|<queue-seg>\|<gen-BE>\|<visibleAt-BE>\|<msgID-seg>`                                           | `!sqs\|msg\|vis\|p\|<queue-seg>\|<part-BE>\|<gen-BE>\|<visibleAt-BE>\|<msgID-seg>`                               | `[]byte(messageID)`                       | One row per data record. **`visibleAt` always restored to `available_at_millis`** (= "visible now"), matching parent §"SQS: vis zeroed by default."                      |
-| `byage`           | `!sqs\|msg\|byage\|<queue-seg>\|<gen-BE>\|<sendTs-BE>\|<msgID-seg>`                                            | `!sqs\|msg\|byage\|p\|<queue-seg>\|<part-BE>\|<gen-BE>\|<sendTs-BE>\|<msgID-seg>`                                | `[]byte(messageID)`                       | One row per data record. `sendTs = send_timestamp_millis` from `messages.jsonl`. Reaper needs this even on a brand-new restore — without it, retention never expires.    |
-| `dedup` (FIFO)    | `!sqs\|msg\|dedup\|<queue-seg>\|<gen-BE>\|<dedupID-seg>`                                                       | `!sqs\|msg\|dedup\|p\|<queue-seg>\|<part-BE>\|<gen-BE>\|<group-seg>\|<dedupID-seg>`                              | `sqsFifoDedupRecord` JSON                 | **FIFO queues only.** One row per data record whose `message_dedup_id` is non-empty. `OriginalSequence = sequence_number`; `ExpiresAtMillis = SendTimestampMs + window`. |
-| `group` (FIFO)    | (not emitted)                                                                                                  | (not emitted)                                                                                                    | (not emitted)                             | **NOT emitted on restore.** The live `loadFifoGroupLock` (`adapter/sqs_fifo.go:135`) treats *key presence alone* as "lock held" (returns the parsed lock; only missing-key returns nil). Emitting any value — even a zeroed `sqsFifoGroupLock` — would falsely indicate an in-flight receive with no owner token, **permanently blocking every group** until manual cleanup (gemini critical #885 line 37). Live writes the lock only on `ReceiveMessage` (`sqs_fifo.go:293`), never on send; a fresh restore has no in-flight receives, so the correct steady state is *no group rows*. |
+**Scope:** classic queues only (`partition_count = 1`). M5-1 already rejects any queue with `PartitionCount > 1` via `ErrSQSEncodeUnsupportedPartitioned` (`internal/backup/encode_sqs.go:162`); M5-2 inherits that gate unchanged. Partitioned-FIFO support requires a coordinated decoder+encoder lift across M5-1 and M5-2 that the project hasn't sequenced yet — see §"Deferred (partitioned-FIFO)" below for the key shapes that would land in that follow-up.
 
-The three emitted families (`vis`, `byage`, `dedup`) reuse the verbatim key shapes from `adapter/sqs_keys.go` (prefixes `SqsMsg{Vis,ByAge,Dedup}Prefix`, `SqsPartitionedMsg{...}Prefix`) and the constructors `sqsMsg{Vis,ByAge,Dedup}Key{,Dispatch}` / `sqsPartitionedMsg{...}Key`. Encoded segments use `encodeSQSSegment` (base64-raw-URL). The encoder **MUST reuse these constructors via duplicated helpers in `internal/backup`** (parent doc §"Per-adapter reverse encoders / SQS per-message side records" — "same rules as `adapter/sqs_messages.go` / `sqs_keys.go`"), exactly as M3b-3 duplicated GSI helpers — with a cross-check test asserting byte-identical output for a shared fixture.
+| Family         | Key (classic)                                                            | Value (live)              | Derivation rule                                                                                                                                                          |
+| -------------- | ------------------------------------------------------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `vis`          | `!sqs\|msg\|vis\|<queue-seg><gen-BE><visibleAt-BE><msgID-seg>`           | `[]byte(messageID)`       | One row per data record. **`visibleAt` always restored to `available_at_millis`** (= "visible now"), matching parent §"SQS: vis zeroed by default."                      |
+| `byage`        | `!sqs\|msg\|byage\|<queue-seg><gen-BE><sendTs-BE><msgID-seg>`            | `[]byte(messageID)`       | One row per data record. `sendTs = send_timestamp_millis` from `messages.jsonl`. Reaper needs this even on a brand-new restore — without it, retention never expires.    |
+| `dedup` (FIFO) | `!sqs\|msg\|dedup\|<queue-seg><gen-BE><dedupID-seg>`                     | `sqsFifoDedupRecord` JSON | **FIFO queues only.** One row per data record whose `message_dedup_id` is non-empty. All four fields of `sqsFifoDedupRecord` (see derivation note below).                |
+| `group` (FIFO) | (not emitted)                                                            | (not emitted)             | **NOT emitted on restore.** The live `loadFifoGroupLock` (`adapter/sqs_fifo.go:135`) treats *key presence alone* as "lock held" (returns the parsed lock; only missing-key returns nil). Emitting any value — even a zeroed `sqsFifoGroupLock` — would falsely indicate an in-flight receive with no owner token, **permanently blocking every group** until manual cleanup (gemini critical #885 line 37). Live writes the lock only on `ReceiveMessage` (`sqs_fifo.go:293`), never on send; a fresh restore has no in-flight receives, so the correct steady state is *no group rows*. |
+
+> **Notation.** Pipe characters inside `<seg>…<seg>` are visual separators in this table, not literal bytes. The only literal `|` bytes are inside the family prefix (`!sqs|msg|vis|` etc.); variable-length segments are concatenated directly (with length-determined boundaries baked into the constructors). The single source of truth is the live key constructors cited below.
+
+**`sqsFifoDedupRecord` field derivation** (all four fields are required; live writer at `adapter/sqs_fifo.go:219-223`):
+
+| Field             | JSON tag             | Restored from                                                          |
+| ----------------- | -------------------- | ---------------------------------------------------------------------- |
+| `MessageID`       | `message_id`         | `message_id` from `messages.jsonl`                                     |
+| `SendTimestampMs` | `send_timestamp_ms`  | `send_timestamp_millis` from `messages.jsonl`                          |
+| `ExpiresAtMillis` | `expires_at_millis`  | `SendTimestampMs + sqsFifoDedupWindowMillis` (`= sendTs + 5 minutes`)  |
+| `OriginalSequence`| `original_sequence`  | `sequence_number` from `messages.jsonl`                                |
+
+**Source-file attribution.** The constructors come from two files, not one:
+
+- `vis` family — `SqsMsgVisPrefix` and `sqsMsgVisKey` are in **`adapter/sqs_messages.go`** (lines 30 and 158), not `sqs_keys.go`. M5-1 already mirrors this layout (`internal/backup/sqs.go:30` re-declares `SQSMsgVisPrefix` alongside `SQSMsgDataPrefix`).
+- `byage`, `dedup`, `group` constructors and prefixes — `adapter/sqs_keys.go`.
+
+The M5-2 encoder MUST reuse these via duplicated helpers in `internal/backup`, exactly as M3b-3 duplicated GSI helpers, with a cross-check test asserting byte-identical output for a shared fixture.
 
 ## Decision gate: full reconstruction vs. lazy rebuild
 
@@ -23,7 +41,7 @@ The parent doc (§"Re-derivable indexes" → scope note) allows a per-adapter fa
 
 **Recommended: full reconstruction of the three non-lock families (this proposal).** Emit `vis` + `byage` + `dedup` inline during M5-1's existing per-message walk; do *not* emit `group` rows (see families table above for why — key presence alone signals a held lock). Rationale:
 
-- **Dedup is correctness, not perf.** A FIFO restore without dedup rows lets the queue redeliver an already-acked message (parent doc §"Scope note" — "fallback is not zero-cost transparency"). There is no graceful degradation.
+- **Dedup is correctness, not perf, *within the 5-minute window*.** Dedup rows gate FIFO **sends** (not receives — receive-side replay protection comes from data+vis): the live check at `adapter/sqs_fifo.go:111` treats a record as non-existent once `ExpiresAtMillis < now`. Because `ExpiresAtMillis = send_timestamp_millis + 5 min`, every dedup row in a backup older than 5 minutes restores already-expired and provides no protection. What's preserved is the narrow window of producers that were mid-dedup-window when the backup was taken — the same "fallback is not zero-cost transparency" framing the parent doc applies to dedup correctness, scoped to that window. Beyond it, dedup gating naturally rolls off, matching live-system behavior.
 - **`byage` is required for retention.** Without it, the reaper (`sqs_reaper.go`) never finds the message and `MessageRetentionPeriod` is silently ignored — a restored queue grows unboundedly.
 - **`vis` is required for receive.** ReceiveMessage scans `!sqs|msg|vis|` — a data row without a matching vis row is invisible forever.
 - **Cost is bounded.** All three are `O(messages-in-dump)` walks over data already loaded by M5-1; no extra disk read, no cross-message coordination, no Raft round-trip (encoder is offline).
@@ -35,6 +53,21 @@ The parent doc (§"Re-derivable indexes" → scope note) allows a per-adapter fa
 - **In-flight receives.** A live cluster may have non-zero `VisibleAtMillis` for messages currently held by a consumer. The dump format (`messages.jsonl`) does not preserve this — parent §"SQS" mandates "vis zeroed by default." Anyone wanting at-the-instant transactional snapshots should use a different mechanism than logical encode/decode. Documented in the encoder header.
 - **Tombstones (`!sqs|queue|tombstone|`).** These mark superseded-generation cleanup work for the reaper. A fresh restore has only the current generation = `sqsRestoreGeneration` (1), with no superseded gens to clean up. The encoder writes no tombstones; documented in the file header.
 - **Group lock rows entirely.** See families table — emitting any row falsely blocks the group. The live receive path writes the lock on its own (`sqs_fifo.go:293`); a fresh restore correctly has no rows, and the first post-restore receive on each group acquires the lock cleanly via the normal path.
+
+## Deferred (partitioned-FIFO)
+
+M5-2 inherits M5-1's `ErrSQSEncodeUnsupportedPartitioned` gate — any queue with `PartitionCount > 1` is rejected by `encodeQueue` before `encodeQueueMessages` is reached, so the side-record walk is never invoked for partitioned queues. Lifting that gate requires coordinated changes to BOTH M5-1 (decoder dump format + encoder iteration over partitions) AND M5-2 (partitioned-key constructors for vis/byage/dedup); the project hasn't sequenced that work yet.
+
+When the partitioned slice (provisionally M5-3) lands, it should add these key shapes — sourced from `SqsPartitionedMsg{Vis,ByAge,Dedup}Prefix` + `sqsPartitionedMsg{...}Key` in `adapter/sqs_keys.go`:
+
+| Family         | Key (partitioned, `partition_count > 1`)                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------- |
+| `vis`          | `!sqs\|msg\|vis\|p\|<queue-seg>\|<part-BE><gen-BE><visibleAt-BE><msgID-seg>`                                   |
+| `byage`        | `!sqs\|msg\|byage\|p\|<queue-seg>\|<part-BE><gen-BE><sendTs-BE><msgID-seg>`                                    |
+| `dedup` (FIFO) | `!sqs\|msg\|dedup\|p\|<queue-seg>\|<part-BE><gen-BE><group-seg><dedupID-seg>`                                  |
+| `group`        | (not emitted — same rationale as classic)                                                                      |
+
+The dedup-field derivation, group-row prohibition, and decision-gate rationale above all apply unchanged in the partitioned case.
 
 ## Files to add (M5-2 implementation slice)
 
@@ -49,15 +82,14 @@ Wire into `encode_sqs.go`'s existing `encodeQueueMessages` walk: after `addMessa
 
 | Test                                                              | Verifies                                                                                                                                                                                |
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TestSQSEncodeSideRecordsCrossCheckClassic`                       | For a fixture queue (1 partition, FIFO, varied dedup), each emitted row (vis/byage/dedup) is byte-identical to what `adapter/sqs_fifo.go`'s send path would write. **Gold-standard.** |
-| `TestSQSEncodeSideRecordsCrossCheckPartitioned`                   | Same, with `partition_count = 4`. Both key family AND value JSON match.                                                                                                                 |
+| `TestSQSEncodeSideRecordsCrossCheckClassic`                       | For a fixture queue (1 partition, FIFO, varied dedup), each emitted row (vis/byage/dedup) is byte-identical AND byte-equal-value to what `adapter/sqs_fifo.go`'s send path would write for the same fixture. **Gold-standard.** (Partitioned variant deferred to M5-3 — see §"Deferred (partitioned-FIFO)".) |
 | `TestSQSEncodeSideRecordsStandardQueueOmitsFIFOFamilies`          | Non-FIFO queue: vis + byage emitted; dedup **NOT** emitted (would be junk per `adapter/sqs_keys.go` semantics). group is never emitted, so trivially absent here too.                  |
 | `TestSQSEncodeSideRecordsEmptyDedupOmitsDedupRow`                 | FIFO message with empty `message_dedup_id`: data + vis + byage emitted; dedup row **NOT** emitted.                                                                                      |
 | `TestSQSEncodeSideRecordsNoGroupRows`                             | FIFO queue with N messages across M distinct groups: **zero** `!sqs\|msg\|group\|` rows emitted (regression pin for gemini critical #885 — any row falsely indicates a held lock and blocks every group post-restore). |
 | `TestSQSEncodeFifoRestoreRoundTrip`                               | Build dump → encode → boot single-node cluster → ReceiveMessage returns every message in the original send order, exactly once. Re-sending with the same dedup-id is rejected. **The first ReceiveMessage per group must succeed** — verifies no spurious group lock was emitted. |
 | `TestSQSEncodeReaperFindsRestoredMessage`                         | Set `MessageRetentionPeriod` short, restore old messages, advance HLC: reaper deletes them. Without `byage`, this would hang.                                                            |
 
-The first two are the §"Encoder cross-check" pattern parent doc §"Per-adapter reverse encoders" mandates. The last two pin the end-to-end correctness rationale for choosing full reconstruction over lazy.
+`TestSQSEncodeSideRecordsCrossCheckClassic` is the §"Encoder cross-check" pattern the parent doc §"Per-adapter reverse encoders" mandates. The two restore round-trip tests pin the end-to-end correctness rationale for choosing full reconstruction over lazy.
 
 ## Self-review (5 passes) — proposed
 
