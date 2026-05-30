@@ -72,8 +72,12 @@ func TestStandaloneSetDedup_NXMissReturnsNil(t *testing.T) {
 	cmd := redcon.Command{Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("v1"), []byte("NX")}}
 	srv.set(conn, cmd)
 
-	// recordingConn.WriteNull sets bulk=nil; success path has no error.
-	require.Nil(t, conn.bulk, "NX miss must reach WriteNull, not WriteString or WriteBulk")
+	// Airtight assertion: WriteNull was actually called (not "nothing was
+	// written, leaving the zero-value nil"). Without the wroteNull witness
+	// flag, a wrong branch that wrote nothing at all would also pass
+	// `conn.bulk == nil` -- claude[bot] PR #888 round-2 hardening.
+	require.True(t, conn.wroteNull, "NX miss must call WriteNull, not silently skip the write")
+	require.Nil(t, conn.bulk, "WriteNull leaves conn.bulk nil; a stray WriteString/WriteBulk would have populated it")
 	require.Empty(t, conn.err, "no error must escape; NX miss is a normal response, not an error")
 
 	// Stored value is still the seed; nothing should have overwritten it.

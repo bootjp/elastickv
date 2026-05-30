@@ -1132,13 +1132,13 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	// the standalone reply (resultString OK / resultNil for NX/XX miss /
 	// resultBulk for GET).
 	if r.onePhaseTxnDedup {
-		// claude[bot] PR #888 review: call runTransactionWithDedup directly
-		// instead of going through runTransaction. runTransaction re-checks
-		// the same r.onePhaseTxnDedup gate and routes here anyway; the
-		// indirection made the call chain misleading ("dispatches via
-		// runTransactionWithDedup" was only true by indirection). Direct
-		// call makes the intent explicit and removes the double gate
-		// check.
+		// Call runTransactionWithDedup directly instead of going through
+		// runTransaction. runTransaction re-checks the same
+		// r.onePhaseTxnDedup gate and routes here anyway; the indirection
+		// would make the call chain misleading ("dispatches via
+		// runTransactionWithDedup" being true only by indirection).
+		// Direct call makes the intent explicit and removes the double
+		// gate check.
 		results, err := r.runTransactionWithDedup([]redcon.Command{cmd})
 		if err != nil {
 			writeRedisError(conn, err)
@@ -1199,14 +1199,14 @@ func (r *RedisServer) setLegacy(conn redcon.Conn, cmd redcon.Command) {
 // Empty or multi-element input is degenerate for standalone callers; we
 // default to nil so a misuse never leaks a malformed reply to the wire.
 //
-// Array-element constraint (claude[bot] PR #888 review): the resultArray
-// arm writes each element via WriteBulkString, which is correct for
-// flat arrays of strings (the shape applySet / future SET-pattern
-// callers produce). It does NOT recurse into nested arrays. A future
-// caller whose applyXxx emits resultArray with non-string elements
-// (e.g. HGETALL-like nested responses) must either pre-flatten its
-// result or extend this switch with a recursive arm; reusing it as-is
-// would silently mangle the wire reply.
+// Array-element constraint: the resultArray arm writes each element via
+// WriteBulkString, which is correct for flat arrays of strings (the
+// shape applySet / future SET-pattern callers produce). It does NOT
+// recurse into nested arrays. A future caller whose applyXxx emits
+// resultArray with non-string elements (e.g. HGETALL-like nested
+// responses) must either pre-flatten its result or extend this switch
+// with a recursive arm; reusing it as-is would silently mangle the
+// wire reply.
 func writeRedisStandaloneResult(conn redcon.Conn, results []redisResult) {
 	if len(results) != 1 {
 		conn.WriteNull()
