@@ -28,12 +28,15 @@ For every `!sqs|msg|data|...` record M5-1 already writes, the encoder must also 
 | `ExpiresAtMillis` | `expires_at_millis`  | `SendTimestampMs + sqsFifoDedupWindowMillis` (`= sendTs + 5 minutes`)  |
 | `OriginalSequence`| `original_sequence`  | `sequence_number` from `messages.jsonl`                                |
 
-**Source-file attribution.** The constructors come from two files, not one:
+**Source-file attribution** (M5-2 is classic-only — `*Dispatch` wrappers in `adapter/sqs_keys_dispatch.go` route between classic and partitioned constructors and are NOT needed here; M5-3 will pick them up):
 
-- `vis` family — `SqsMsgVisPrefix` and `sqsMsgVisKey` are in **`adapter/sqs_messages.go`** (lines 30 and 158), not `sqs_keys.go`. M5-1 already mirrors this layout (`internal/backup/sqs.go:30` re-declares `SQSMsgVisPrefix` alongside `SQSMsgDataPrefix`).
-- `byage`, `dedup`, `group` constructors and prefixes — `adapter/sqs_keys.go`.
+| Family  | Prefix constant     | File                          | Constructor      | File                          |
+| ------- | ------------------- | ----------------------------- | ---------------- | ----------------------------- |
+| `vis`   | `SqsMsgVisPrefix`   | `adapter/sqs_messages.go:30`  | `sqsMsgVisKey`   | `adapter/sqs_messages.go:158` |
+| `byage` | `SqsMsgByAgePrefix` | `adapter/sqs_keys.go:38`      | `sqsMsgByAgeKey` | `adapter/sqs_keys.go:224`     |
+| `dedup` | `SqsMsgDedupPrefix` | `adapter/sqs_keys.go:28`      | `sqsMsgDedupKey` | `adapter/sqs_keys.go:110`     |
 
-The M5-2 encoder MUST reuse these via duplicated helpers in `internal/backup`, exactly as M3b-3 duplicated GSI helpers, with a cross-check test asserting byte-identical output for a shared fixture.
+M5-1 already mirrors the split layout — `internal/backup/sqs.go:30` re-declares `SQSMsgVisPrefix` alongside `SQSMsgDataPrefix` (both originally from `sqs_messages.go`). The M5-2 encoder MUST reuse the live constructors via duplicated helpers in `internal/backup`, exactly as M3b-3 duplicated GSI helpers, with a cross-check test asserting byte-identical output for a shared fixture.
 
 ## Decision gate: full reconstruction vs. lazy rebuild
 
