@@ -71,6 +71,14 @@ type HLC struct {
 	// Next() uses max(now, physicalCeiling) so that a new leader always starts
 	// issuing timestamps above the previous leader's committed window.
 	physicalCeiling atomic.Int64
+	// nextFencedRejections counts the number of NextFenced() calls that
+	// returned ErrCeilingExpired (HLC-4 (iii) fence fired). Exposed via
+	// NextFencedRejections() so the monitoring layer can export it as a
+	// Prometheus counter without coupling the kv package to a metric type.
+	// A non-zero value here means the leader's lease renewal stopped long
+	// enough for wall_now to catch up to physicalCeiling — operators should
+	// alert on its rate.
+	nextFencedRejections atomic.Uint64
 }
 
 func nonNegativeUint64(v int64) uint64 {
@@ -155,7 +163,9 @@ func (h *HLC) nextLocked(fence bool) (uint64, error) {
 				// HLC-4 precondition (iii): ceiling has expired.  Fail
 				// closed rather than issue a timestamp that could collide
 				// with a subsequent leader's window after renewal catches
-				// up.
+				// up.  Increment the counter so the monitoring layer can
+				// alert on the rate (see NextFencedRejections).
+				h.nextFencedRejections.Add(1)
 				return 0, errors.WithStack(ErrCeilingExpired)
 			}
 			if nowMs < ceiling {
@@ -225,4 +235,20 @@ func (h *HLC) SetPhysicalCeiling(ms int64) {
 // milliseconds. Returns 0 if no ceiling has been established yet.
 func (h *HLC) PhysicalCeiling() int64 {
 	return h.physicalCeiling.Load()
+}
+
+// NextFencedRejections returns the cumulative count of NextFenced() calls
+// that returned ErrCeilingExpired since process start.  The monitoring
+// layer reads this on a fixed interval and exports it as a Prometheus
+// counter so operators can alert on the rate.
+//
+// A non-zero value here means the HLC-4 (i) bounded-skew assumption
+// (`MaxClockSkewMs < HlcPhysicalWindowMs` — see
+// docs/design/2026_05_28_partial_tla_safety_spec.md §5.1) has at some
+// point been violated by enough margin that wall_now caught up to
+// physicalCeiling and the fence fired — typically because the leader's
+// lease renewal stopped (network partition, GC pause, …) for longer than
+// `hlcPhysicalWindowMs`.
+func (h *HLC) NextFencedRejections() uint64 {
+	return h.nextFencedRejections.Load()
 }

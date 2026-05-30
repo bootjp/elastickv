@@ -465,7 +465,7 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
-	startMonitoringCollectors(runCtx, metricsRegistry, runtimes)
+	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
 		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
@@ -1375,7 +1375,7 @@ func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context
 // on top of the running raft runtimes. Kept separate from run() so
 // the latter stays under the cyclop complexity budget and so new
 // collectors can be added without widening run() further.
-func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime) {
+func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime, clock *kv.HLC) {
 	reg.RaftObserver().Start(ctx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
 	if collector := reg.DispatchCollector(); collector != nil {
 		collector.Start(ctx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
@@ -1385,6 +1385,9 @@ func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, ru
 	}
 	if collector := reg.WriteConflictCollector(); collector != nil {
 		collector.Start(ctx, writeConflictMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+	if obs := reg.HLCObserver(); obs != nil && clock != nil {
+		obs.Start(ctx, clock, raftMetricsObserveInterval)
 	}
 }
 
