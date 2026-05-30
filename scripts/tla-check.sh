@@ -131,8 +131,23 @@ for module in "${TLA_MODULES[@]}"; do
     # Iterate every gap config registered for this module.  Each is a
     # `<cfg-stem>|<invariant-string>` line; modules with one gap have
     # one entry, modules with multiple guards (composed) have more.
+    #
+    # Validate both fields are non-empty BEFORE entering the inner
+    # body — a malformed entry that produces an empty gap_inv would
+    # silently false-positive at the `grep -qF "$gap_inv"` step below
+    # (empty pattern matches every line, so the gap would always
+    # "succeed" regardless of whether TLC actually surfaced the
+    # expected invariant — gemini medium on PR #878).
     while IFS='|' read -r gap_stem gap_inv; do
-        [ -z "$gap_stem" ] && continue
+        [ -z "$gap_stem" ] && [ -z "$gap_inv" ] && continue
+        if [ -z "$gap_stem" ] || [ -z "$gap_inv" ]; then
+            echo "ERROR: malformed gap entry for module '${module}'" \
+                "— expected '<stem>|<invariant>', got" \
+                "stem='${gap_stem}' inv='${gap_inv}'." \
+                "Fix gap_configs_for() in scripts/tla-check.sh." >&2
+            overall_rc=1
+            continue
+        fi
         gap_cfg="${mc}${gap_stem}.cfg"
         echo "================================================================"
         echo "  TLC: tla/${module}/${gap_cfg}  (no preconditions, expected FAIL on ${gap_inv})"
