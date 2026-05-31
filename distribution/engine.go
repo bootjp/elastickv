@@ -179,6 +179,21 @@ func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
 	return 0, false
 }
 
+// Current returns the route catalog snapshot at the engine's current
+// catalogVersion.  Returns (zero, false) when the history ring has
+// not been initialised (bare-struct Engine).  Used by the M3
+// Composed-1 cross-version-read fence (design doc §4.4) — the gate
+// compares the txn's observed-version owner against the current
+// owner so a route shift between BeginTxn and Commit is caught
+// before it can produce a G1c anomaly across a cross-group
+// MoveRange / SplitRange.
+func (e *Engine) Current() (RouteHistorySnapshot, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	snap, ok := e.history[e.catalogVersion]
+	return snap, ok
+}
+
 // SnapshotAt returns the route catalog snapshot recorded at version v.
 // Returns (zero, false) when v is not in the ring — either because v
 // is in the future (> catalogVersion), or because the FIFO ring has
@@ -191,6 +206,26 @@ func (e *Engine) SnapshotAt(v uint64) (RouteHistorySnapshot, bool) {
 	defer e.mu.RUnlock()
 	snap, ok := e.history[v]
 	return snap, ok
+}
+
+// SetHistoryDepthForTest overrides the FIFO ring depth from outside
+// the package.  Test-only — callers MUST set the depth before the
+// Engine is shared with any concurrent reader (no internal
+// synchronisation here for the same reason TestEngineSnapshotAt_FIFOEviction
+// does the direct field write in-package; this seam exposes the
+// equivalent capability to external test packages that need a
+// small depth to exercise eviction without overwhelming TLC-style
+// bounded scenarios — claude review on PR #894).
+//
+// Production code must use DefaultRouteHistoryDepth (32) or a
+// future operator-exposed config knob; this seam is build-time
+// equivalent to direct field access and exists ONLY so tests in
+// the kv package can drive eviction-trigger scenarios without
+// adding a constructor option just for tests.
+func (e *Engine) SetHistoryDepthForTest(depth int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.historyDepth = depth
 }
 
 // HistoryDepth returns the configured ring depth for diagnostics.
