@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -34,13 +35,14 @@ func buildShardGroupsWithEncryptionWiring(
 	keystore *encryption.Keystore,
 	sidecarPath string,
 	encryptionEnabled bool,
+	routeEngine *distribution.Engine,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
 	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
 	if err != nil {
 		return nil, nil, encryptionWriteWiring{}, err
 	}
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
-		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring)
+		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)
 	// Return the wiring (cache + bumped epoch) so run() can drive the
 	// Stage 7a process-start registration after the shard stores open.
 	return runtimes, shardGroups, encWiring, err
