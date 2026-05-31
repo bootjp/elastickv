@@ -80,7 +80,7 @@ func NewEngine() *Engine {
 func NewEngineWithDefaultRoute() *Engine {
 	engine := NewEngine()
 	engine.UpdateRoute([]byte(""), nil, defaultGroupID)
-	engine.recordHistorySnapshot()
+	engine.recordHistorySnapshotLocked()
 	return engine
 }
 
@@ -135,7 +135,7 @@ func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 
 	e.routes = routes
 	e.catalogVersion = snapshot.Version
-	e.recordHistorySnapshot()
+	e.recordHistorySnapshotLocked()
 	return nil
 }
 
@@ -157,10 +157,19 @@ func (s RouteHistorySnapshot) Version() uint64 { return s.version }
 // pre-bootstrap state or an explicitly-uncovered range).  Mirrors
 // Engine.GetRoute's right-half-open interval semantics but against
 // the historical snapshot, not the live engine state.
+//
+// Routes are sorted by Start (recordHistorySnapshotLocked clones from
+// e.routes, which Engine.UpdateRoute / routesFromCatalog keep sorted),
+// so the scan can break the moment key < r.Start — every later route
+// has a strictly greater Start and cannot cover key either.  This
+// matters because M3 puts OwnerOf on every txn commit's apply path
+// (claude review on PR #894 — break-vs-continue lifts the worst-case
+// scan from O(N) to "first non-covering gap" without changing the
+// resolution semantics).
 func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
 	for _, r := range s.routes {
 		if bytes.Compare(key, r.Start) < 0 {
-			continue
+			break
 		}
 		if r.End != nil && bytes.Compare(key, r.End) >= 0 {
 			continue
@@ -191,12 +200,15 @@ func (e *Engine) HistoryDepth() int {
 	return e.historyDepth
 }
 
-// recordHistorySnapshot pushes the current (catalogVersion, routes)
-// pair into the ring.  Caller MUST hold e.mu (write lock) — invoked
-// from ApplySnapshot under the write lock, and from
-// NewEngineWithDefaultRoute before the Engine is shared with any
-// concurrent reader.  Idempotent on re-record at the same version.
-func (e *Engine) recordHistorySnapshot() {
+// recordHistorySnapshotLocked pushes the current (catalogVersion,
+// routes) pair into the ring.  The `Locked` suffix is the Go
+// convention for "caller MUST hold the receiver's lock" — checked
+// by reviewers via name, not by the runtime (claude review on PR
+// #894 — fragile lock contract).  Invoked from ApplySnapshot under
+// the write lock and from NewEngineWithDefaultRoute before the
+// Engine is shared with any concurrent reader.  Idempotent on
+// re-record at the same version.
+func (e *Engine) recordHistorySnapshotLocked() {
 	if e.history == nil {
 		// Engines constructed via the bare struct literal (e.g.
 		// internal test seams) — no history ring configured.  Skip
@@ -210,7 +222,17 @@ func (e *Engine) recordHistorySnapshot() {
 	}
 	if len(e.historyOrder) >= e.historyDepth {
 		evict := e.historyOrder[0]
-		e.historyOrder = e.historyOrder[1:]
+		// Copy the retained tail into fresh storage rather than
+		// reslicing.  `historyOrder[1:]` only advances the slice
+		// header — the head of the original backing array stays
+		// alive and grows unboundedly across evictions.  At depth=32
+		// this is small, but the FIFO eviction is the only place
+		// the array grows, and the compaction is free (single
+		// allocation, single copy of <=historyDepth entries —
+		// claude review on PR #894 — backing-array leak).
+		retained := make([]uint64, len(e.historyOrder)-1, e.historyDepth)
+		copy(retained, e.historyOrder[1:])
+		e.historyOrder = retained
 		delete(e.history, evict)
 	}
 	cloned := make([]Route, len(e.routes))

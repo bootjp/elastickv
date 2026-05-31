@@ -559,8 +559,14 @@ func TestEngineSnapshotAt_PreservesHistoryAcrossVersions(t *testing.T) {
 // test pins the eviction order so a future depth change does not
 // silently break the M3 contract.
 func TestEngineSnapshotAt_FIFOEviction(t *testing.T) {
+	t.Parallel()
 	e := NewEngine()
-	// Force a tiny depth so the test is bounded and explicit.
+	// Force a tiny depth so the test is bounded and explicit.  The
+	// direct field write is safe because `e` is local to this test
+	// goroutine and the depth is set before any ApplySnapshot fires;
+	// once the Engine is published to concurrent readers, the depth
+	// would have to flow through a constructor option (claude review
+	// on PR #894 — fragile-but-test-local lock contract).
 	e.historyDepth = 3
 
 	for v := uint64(1); v <= 5; v++ {

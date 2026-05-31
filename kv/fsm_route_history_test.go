@@ -92,6 +92,9 @@ func TestKvFSM_WithRouteHistory_NilProviderTreatedAsUnwired(t *testing.T) {
 	// shardGroupID is still recorded — the design doc says zero is
 	// the "unset" sentinel but a caller that explicitly passes a
 	// non-zero shardGroupID with a nil provider gets the gate
-	// short-circuited anyway via the nil routes check.  No invariant
-	// to assert on the ID here.
+	// short-circuited anyway via the nil routes check.  Assert the
+	// non-zero ID survives so a future refactor that accidentally
+	// zeroes it would be caught (claude review on PR #894).
+	require.Equal(t, uint64(7), fsm.shardGroupID,
+		"WithRouteHistory(nil, 7) must still record shardGroupID=7; the M3 nil-routes short-circuit fires before the ID is consulted")
 }
