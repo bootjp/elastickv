@@ -323,7 +323,13 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// probe closes the window at the readiness layer instead, so any
 	// subsequent write inherits a leader that has already held
 	// quorum through one apply.
-	waitForWriteableLeader(t, nodes, waitTimeout)
+	//
+	// `peers` and `waitInterval` are passed through so the probe loop
+	// can re-nudge leadership back to nodes[0] when a real re-election
+	// elects a different node mid-probe — without that, the loop
+	// would keep proposing through a follower engine until the budget
+	// expires and spuriously fail the readiness gate.
+	waitForWriteableLeader(t, nodes, peers, waitTimeout, waitInterval)
 }
 
 // raftReadinessProbePayload is the 9-byte Raft entry waitForWriteableLeader
@@ -352,7 +358,7 @@ var raftReadinessProbePayload = []byte{
 // write — the failure mode the per-test retry wrappers in this file
 // have been working around. See the PR description for the full
 // flake-fix history this readiness gate is meant to obsolete.
-func waitForWriteableLeader(t *testing.T, nodes []Node, timeout time.Duration) {
+func waitForWriteableLeader(t *testing.T, nodes []Node, peers []raftengine.Server, timeout, waitInterval time.Duration) {
 	t.Helper()
 	if len(nodes) == 0 || nodes[0].engine == nil {
 		return
@@ -372,6 +378,19 @@ func waitForWriteableLeader(t *testing.T, nodes []Node, timeout time.Duration) {
 		if !isReadinessProbeRetryable(err) {
 			t.Fatalf("readiness probe failed with non-transient error: %v", err)
 		}
+		// If the per-attempt error was specifically "not leader" (vs
+		// a ctx timeout), a real re-election has elected a different
+		// node since waitForStableLeader returned. Keep aiming the
+		// probe at nodes[0] by re-running ensureNodeZeroIsLeader
+		// before the next attempt; otherwise the loop would spin on
+		// a follower engine until the budget expires and spuriously
+		// fail the readiness gate even though the cluster has
+		// recovered with a different leader. ensureNodeZeroIsLeader
+		// is idempotent in the steady state, so this costs nothing
+		// when leadership has not actually moved.
+		if isTransientNotLeaderErr(err) && len(peers) > 0 {
+			ensureNodeZeroIsLeader(t, nodes, peers, time.Until(deadline), waitInterval)
+		}
 		if !time.Now().Before(deadline) {
 			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
 		}
@@ -381,10 +400,10 @@ func waitForWriteableLeader(t *testing.T, nodes []Node, timeout time.Duration) {
 
 // proposeReadinessOnce drives one no-op probe through the engine's
 // Propose, bounded by min(perProposeTimeout, remaining) so the
-// per-attempt ctx cannot block past the outer deadline (gemini PR
-// #898 HIGH point 1). Extracted from waitForWriteableLeader to keep
-// the outer loop under the cyclop budget; the retry/timeout
-// rationale lives at the call site.
+// per-attempt ctx cannot block past the outer deadline when the
+// overall budget is nearly exhausted. Extracted from
+// waitForWriteableLeader to keep the outer loop under the cyclop
+// budget; the retry/timeout rationale lives at the call site.
 func proposeReadinessOnce(engine raftengine.Engine, remaining time.Duration) error {
 	const perProposeTimeout = 2 * time.Second
 	currTimeout := perProposeTimeout
@@ -402,8 +421,7 @@ func proposeReadinessOnce(engine raftengine.Engine, remaining time.Duration) err
 // load returns context.DeadlineExceeded, which the base classifier
 // does NOT treat as transient. Without this widening the probe
 // would t.Fatalf on a slow runner instead of retrying within its
-// outer budget. context.Canceled is treated symmetrically (gemini
-// PR #898 HIGH point 2).
+// outer budget. context.Canceled is treated symmetrically.
 func isReadinessProbeRetryable(err error) bool {
 	return isTransientNotLeaderErr(err) ||
 		errors.Is(err, context.DeadlineExceeded) ||
