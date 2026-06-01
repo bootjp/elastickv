@@ -30,13 +30,16 @@ func (s *composed1RetryingTransactional) Commit(_ context.Context, reqs []*pb.Re
 		// PrevCommitTS rides inside the encoded TxnMeta on the first
 		// mutation of a one-phase txn request (see
 		// onePhaseTxnRequestWithPrevCommit in coordinator.go).  Decode
-		// it so the M4 retry tests can assert the field is cleared on
-		// the retry attempt (claude[bot] medium on PR #900: the M3
-		// gate fires at apply time, so the original attempt never
-		// committed; leaving PrevCommitTS non-zero on the retry causes
-		// dispatchMultiShardTxn to refuse with
-		// ErrTxnDedupRequiresSingleShard when groupMutations now spans
-		// two groups).
+		// it so the M4 retry tests can assert the field is PRESERVED
+		// across retry attempts — the probe names the ADAPTER'S
+		// prior attempt (e.g. adapter/redis.go:3209, :3615 send it
+		// as the option-2 ambiguous-outcome probe), which may have
+		// LANDED at the named commitTS before the route shift that
+		// triggered our M3 sentinel.  Dropping the probe in the
+		// retry would let the FSM re-apply against the post-shift
+		// route and double-write if that prior attempt landed
+		// (codex P1 on 43c55dfe, PR #900 — proved the earlier
+		// claude[bot] "clear it" advice was wrong).
 		var prev uint64
 		if muts := reqs[0].GetMutations(); len(muts) > 0 {
 			if meta, err := DecodeTxnMeta(muts[0].GetValue()); err == nil {
@@ -88,8 +91,12 @@ func TestShardedCoordinator_RetriesOnComposed1Violation(t *testing.T) {
 	// value (claude[bot] minor on PR #900: an empty goroutine here
 	// looked like an unfinished concurrent-advance model).
 	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
-		IsTxn:   true,
-		StartTS: 10,
+		IsTxn: true,
+		// StartTS intentionally omitted — let the coordinator
+		// allocate via nextStartTS so the M4 retry path is
+		// eligible to fire.  Caller-supplied StartTS surfaces the
+		// sentinel without retry (codex P1 on 57da8886, PR #900);
+		// this test exercises the coordinator-allocated path.
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("k"), Value: []byte("v")},
 		},
@@ -130,8 +137,10 @@ func TestShardedCoordinator_RetriesOnComposed1VersionGCd(t *testing.T) {
 	}, 1, NewHLC(), nil)
 
 	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
-		IsTxn:   true,
-		StartTS: 10,
+		IsTxn: true,
+		// StartTS omitted so the coordinator allocates — see
+		// TestShardedCoordinator_RetriesOnComposed1Violation for
+		// rationale (codex P1 on 57da8886, PR #900).
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("k"), Value: []byte("v")},
 		},
@@ -166,8 +175,10 @@ func TestShardedCoordinator_PersistentComposed1ViolationSurfaces(t *testing.T) {
 	}, 1, NewHLC(), nil)
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
-		IsTxn:   true,
-		StartTS: 10,
+		IsTxn: true,
+		// StartTS omitted so the coordinator allocates — see
+		// TestShardedCoordinator_RetriesOnComposed1Violation
+		// (codex P1 on 57da8886, PR #900).
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("k"), Value: []byte("v")},
 		},
@@ -421,9 +432,12 @@ func TestShardedCoordinator_PreservesPrevCommitTSOnComposed1Retry(t *testing.T) 
 	}, 1, NewHLC(), nil)
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
-		IsTxn:        true,
-		StartTS:      10,
-		CommitTS:     20,
+		IsTxn: true,
+		// StartTS / CommitTS intentionally omitted — let the
+		// coordinator allocate so the M4 retry path is eligible
+		// (codex P1 on 57da8886, PR #900: caller-supplied
+		// StartTS surfaces without retry).  PrevCommitTS is a
+		// separate option-2 dedup probe and is set unchanged.
 		PrevCommitTS: 17, // adapter-supplied option-2 dedup probe
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("k_write"), Value: []byte("v")},
@@ -436,4 +450,61 @@ func TestShardedCoordinator_PreservesPrevCommitTSOnComposed1Retry(t *testing.T) 
 		"first attempt must carry the caller's PrevCommitTS unchanged — that is the option-2 dedup probe semantics")
 	require.Equal(t, uint64(17), txn.prevCommitTSSeen[1],
 		"second attempt must ALSO carry PrevCommitTS=17 — the M3 gate only proves attempt 1 did not write; it tells us nothing about the ADAPTER's prior attempt (whose commitTS the probe names), so dropping the probe would double-write the caller's at-most-once payload if that prior attempt landed (codex P1 on 43c55dfe)")
+}
+
+// TestShardedCoordinator_SurfacesComposed1OnCallerSuppliedStartTS
+// pins the OCC-safety contract for caller-supplied snapshots
+// (codex P1 on 57da8886, PR #900): when the CALLER supplied a
+// non-zero StartTS — even with ReadKeys empty — the M4 retry path
+// must NOT bump StartTS and silently retry.  The caller's StartTS
+// names a specific snapshot they read against, and the M4 retry's
+// nextStartTS allocation would let any concurrent commit landed
+// in (originalStartTS, newStartTS) bypass the FSM's
+// `latest > startTS` OCC write-conflict check, since the bumped
+// snapshot now dominates the intervening commit_ts.
+//
+// Real exposure: many adapter sites read metadata at readTS and
+// then dispatch with `StartTS: readTS` and empty ReadKeys, e.g.
+// adapter/s3.go:573 (createBucket), adapter/sqs_messages.go:541,
+// adapter/dynamodb.go:4366, adapter/s3_admin_objects.go:144, etc.
+// Their pre-Dispatch read is invisible to the coordinator (no
+// ReadKeys), so the only signal that the snapshot is owned by the
+// caller is reqs.StartTS being non-zero at Dispatch entry.
+//
+// Contract: caller-supplied StartTS → surface the sentinel
+// unchanged.  Coordinator-allocated StartTS (when caller passed
+// StartTS=0 at Dispatch entry) is the only case M4 may retry —
+// the coordinator owns that timestamp and no one has read at it.
+func TestShardedCoordinator_SurfacesComposed1OnCallerSuppliedStartTS(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	txn := &composed1RetryingTransactional{
+		firstErr: errors.WithStack(ErrComposed1Violation),
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: 42, // caller-supplied — adapter read metadata at this ts
+		// ReadKeys intentionally empty — the read happened at the
+		// adapter layer and is not surfaced as a ReadKeys entry
+		// (typical for S3/SQS/DynamoDB metadata reads).
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("k_write"), Value: []byte("v")},
+		},
+	})
+	require.ErrorIs(t, err, ErrComposed1Violation,
+		"caller-supplied StartTS must surface the sentinel without retry — bumping StartTS would let any commit landed in (42, newStartTS) bypass the FSM's latest>startTS OCC check (codex P1 on 57da8886)")
+	require.Equal(t, int32(1), txn.calls.Load(),
+		"exactly ONE attempt must fire — M4 must NOT retry caller-supplied snapshots")
 }

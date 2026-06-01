@@ -446,6 +446,23 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
 	}
 
+	// Capture whether the caller supplied a non-zero StartTS BEFORE
+	// the coordinator-allocates-on-zero branch below mutates the
+	// field.  A caller-supplied StartTS names a specific snapshot
+	// the caller already read against (e.g. adapter/s3.go:573
+	// reads bucket metadata at readTS and dispatches with
+	// StartTS=readTS; adapter/sqs_messages.go and adapter/dynamodb.go
+	// follow the same readTS-then-mutate pattern across dozens of
+	// sites).  The pre-Dispatch read is invisible to the
+	// coordinator — it is NOT surfaced as a ReadKeys entry — so
+	// the only signal that the snapshot is owned by the caller is
+	// reqs.StartTS being non-zero on entry.  The M4 retry path
+	// uses this to gate the StartTS bump: bumping a caller-owned
+	// timestamp would let any commit landed in (originalStartTS,
+	// newStartTS) bypass the FSM's latest>startTS write-conflict
+	// check (codex P1 on 57da8886, PR #900).
+	callerSuppliedStartTS := reqs.IsTxn && reqs.StartTS != 0
+
 	if reqs.IsTxn && reqs.StartTS == 0 {
 		startTS, err := c.nextStartTS(ctx, reqs.Elems)
 		if err != nil {
@@ -460,7 +477,7 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxnWithComposed1Retry(ctx, reqs)
+		return c.dispatchTxnWithComposed1Retry(ctx, reqs, callerSuppliedStartTS)
 	}
 
 	return c.dispatchNonTxn(ctx, reqs)
@@ -510,7 +527,7 @@ func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGro
 	reqs.ObservedRouteVersion = c.engine.Version()
 }
 
-func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
 	c.maybeAutoPinObservedRouteVersion(reqs)
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
@@ -537,6 +554,22 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		// timestamp) when this sentinel surfaces.  Write-only
 		// txns (no reads to invalidate) remain safe to retry.
 		if len(reqs.ReadKeys) > 0 {
+			return resp, err
+		}
+		// Caller-supplied StartTS (ReadKeys-empty case) MUST also
+		// surface — the caller's pre-Dispatch read at this snapshot
+		// is invisible to the coordinator, so we cannot prove the
+		// retry's bumped StartTS would still preserve OCC against
+		// commits landed in (originalStartTS, newStartTS).  This
+		// catches dozens of adapter sites that supply
+		// StartTS=readTS without populating ReadKeys: S3
+		// createBucket / admin object writes, SQS messages /
+		// FIFO / purge / tags, DynamoDB metadata writes, etc.
+		// Only coordinator-allocated StartTS (caller passed 0
+		// at Dispatch entry, the coordinator allocated it from
+		// nextStartTS, and no read has happened at it) is safe
+		// to bump on retry (codex P1 on 57da8886, PR #900).
+		if callerSuppliedStartTS {
 			return resp, err
 		}
 		if attempt == composed1RetryAttempts {
