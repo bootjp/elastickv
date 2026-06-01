@@ -498,6 +498,24 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		if !isComposed1RetryableError(err) {
 			return resp, err
 		}
+		// Read-write txns (ReadKeys non-empty) MUST surface the
+		// sentinel without retry.  The client already performed
+		// the reads at the original StartTS; transparently bumping
+		// StartTS on retry would let any concurrent write that
+		// committed between the old and new timestamps go
+		// undetected by the FSM's OCC check (which only rejects
+		// versions with `latest > startTS`), letting the retry
+		// commit decisions based on stale reads — a strict-
+		// serialisability violation (gemini CRITICAL / codex P1
+		// on PR #900).
+		//
+		// The caller / adapter is responsible for re-executing the
+		// entire txn (including re-reading the keys at a fresh
+		// timestamp) when this sentinel surfaces.  Write-only
+		// txns (no reads to invalidate) remain safe to retry.
+		if len(reqs.ReadKeys) > 0 {
+			return resp, err
+		}
 		if attempt == composed1RetryAttempts {
 			return resp, err
 		}
@@ -515,15 +533,20 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		// same HLC observation; reusing the stale pair would risk
 		// a startTS that no longer dominates the new shard's
 		// applied commitTS.
-		reqs.StartTS = 0
+		//
+		// Allocate StartTS unconditionally — nextStartTS already
+		// handles the nil-clock case (falls back to
+		// maxTS+1 internally).  Gating on c.clock!=nil would leave
+		// reqs.StartTS at 0 in the nil-clock test fixture, and
+		// dispatchTxn does NOT re-allocate when StartTS is zero,
+		// so the retry would run with StartTS=0 — violating MVCC
+		// invariants (gemini HIGH on PR #900).
 		reqs.CommitTS = 0
-		if c.clock != nil {
-			startTS, allocErr := c.nextStartTS(ctx, reqs.Elems)
-			if allocErr != nil {
-				return resp, allocErr
-			}
-			reqs.StartTS = startTS
+		startTS, allocErr := c.nextStartTS(ctx, reqs.Elems)
+		if allocErr != nil {
+			return resp, allocErr
 		}
+		reqs.StartTS = startTS
 	}
 	// Unreachable — the loop body always returns on each iteration.
 	// Kept here so the function has an unambiguous return shape.

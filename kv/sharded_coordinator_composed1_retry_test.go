@@ -250,3 +250,50 @@ func TestShardedCoordinator_HonorsCallerPinnedObservedRouteVersion(t *testing.T)
 	require.Equal(t, callerPinned, txn.observedSeen[0],
 		"a caller-supplied ObservedRouteVersion must survive the Dispatch-entry pin so adapters can manage the version themselves (§4.1)")
 }
+
+// TestShardedCoordinator_DoesNotRetryReadWriteTxnOnComposed1 is the
+// regression for the gemini CRITICAL / codex P1 finding on PR #900:
+// transparently retrying a txn with a bumped StartTS is only safe
+// when the txn is write-only.  When the txn has read keys
+// (Redis MULTI/EXEC, DynamoDB TransactGetItems → TransactWrite, etc.),
+// the client already performed those reads at the original StartTS.
+// Bumping StartTS on retry would silently mask any concurrent writes
+// that landed between the old and new timestamps — the FSM's OCC
+// check rejects only versions with `latest > startTS`, so the retry
+// could commit decisions based on stale reads, violating SSI.
+//
+// Expected behaviour: the sentinel surfaces immediately (no retry)
+// when len(ReadKeys) > 0.  The caller / adapter is then responsible
+// for re-executing the entire txn (including re-reading the keys
+// at a fresh timestamp).
+func TestShardedCoordinator_DoesNotRetryReadWriteTxnOnComposed1(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	txn := &composed1RetryingTransactional{
+		firstErr: errors.WithStack(ErrComposed1Violation),
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		ReadKeys: [][]byte{[]byte("k_read")},
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("k"), Value: []byte("v")},
+		},
+	})
+	require.ErrorIs(t, err, ErrComposed1Violation,
+		"read-write txns (ReadKeys non-empty) must surface the Composed-1 sentinel WITHOUT retry: the client read at the original StartTS, so silently bumping StartTS on retry would let concurrent writes between the old and new timestamps go undetected by OCC (SSI violation)")
+	require.Equal(t, int32(1), txn.calls.Load(),
+		"read-write txn must NOT retry: exactly 1 Commit attempt — the M4 retry is reserved for write-only txns where bumping StartTS is OCC-safe")
+}
