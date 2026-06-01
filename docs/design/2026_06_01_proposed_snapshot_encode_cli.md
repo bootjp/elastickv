@@ -8,13 +8,35 @@
 A single binary `cmd/elastickv-snapshot-encode` that:
 
 1. Reads `MANIFEST.json` from `--input` (a directory tree produced by `elastickv-snapshot-decode` or by a future Phase 1 live extractor).
-2. Constructs a `snapshotBuilder` stamped with the manifest's `last_commit_ts` (or an operator override — see §"`--last-commit-ts` override").
-3. Invokes each enabled adapter encoder (`NewRedisEncoder`, `NewDynamoDBEncoder`, `NewS3RecordEncoder`, `NewSQSRecordEncoder`) on the same input root in deterministic order, each adding its records to the builder.
-4. Writes the builder out to `--output` (a `.fsm` file path) via `snapshotBuilder.WriteTo`.
-5. Emits `ENCODE_INFO.json` next to the output `.fsm` (provenance + integrity anchor).
-6. Optionally runs the round-trip self-test (`--self-test`): re-decode the produced `.fsm` into a scratch dir and diff against the input tree.
+2. Calls `backup.EncodeSnapshot(EncodeOptions)` (new) which internally constructs the `snapshotBuilder` (unexported), invokes each enabled adapter encoder in deterministic order, runs the optional self-test against the in-memory bytes, and returns an `EncodeResult` plus the assembled `.fsm` bytes.
+3. **Write-then-rename atomic publish:** the `.fsm` bytes are written to `<output>.tmp-<random>`, fsynced + closed, and ONLY after a successful self-test (when `--self-test` is set) renamed atomically to `<output>`. A self-test failure leaves nothing at the restore-visible path — the temp file is `os.RemoveAll`'d in the failure path (codex P2 v2 #896). When `--self-test` is not set, the rename happens immediately after fsync; behavior matches the decoder's atomic-publish discipline.
+4. Emits `<output>.encode_info.json` next to the renamed `.fsm` (provenance + integrity anchor; see §"`ENCODE_INFO.json`" for the path-derivation rule).
+5. On `--self-test` failure: exit 2 with `<output>.mismatch.txt` (next to where the `.fsm` would have been) and no `.fsm` at the publish path.
 
-The CLI is the **only new external surface**; the encoder slices already export their constructors and `Encode(*snapshotBuilder) error`. M6 is mostly wiring + provenance + the self-test gate.
+**New library entrypoint (`backup.EncodeSnapshot`).** Codex P2 v2 #896 correctly flagged that `snapshotBuilder` / `newSnapshotBuilder` are unexported and the adapter `Encode` methods take `*snapshotBuilder`, so an external `main` package cannot directly wire them. M6 lands a high-level wrapper in `internal/backup/encode.go` mirroring the decoder's `DecodeSnapshot`:
+
+```go
+type EncodeOptions struct {
+    InputRoot      string
+    Adapters       AdapterSet
+    LastCommitTS   uint64        // effective T (manifest or override)
+    SelfTest       bool
+    ScratchBase    string        // empty → os.TempDir(); always given a unique subdir
+}
+
+type EncodeResult struct {
+    Header              SnapshotHeader  // returned by ReadSnapshot on the produced bytes
+    BytesWritten        int64
+    SHA256              [32]byte
+    SelfTestRan         bool
+    SelfTestMatched     bool
+    SelfTestMismatchTxt []byte          // non-nil when SelfTestRan && !SelfTestMatched
+}
+
+func EncodeSnapshot(opts EncodeOptions, out io.Writer) (EncodeResult, error)
+```
+
+The CLI's responsibility is reduced to: read MANIFEST → call `EncodeSnapshot(opts, tempFile)` → on success rename + write sidecar → on `!SelfTestMatched` write `mismatch.txt` and exit 2. This keeps the builder unexported, matches the decoder's API shape, and unblocks future callers (Phase 1 live extractor, integration tests) that want encoder access without going through the CLI.
 
 ## CLI surface
 
@@ -101,13 +123,15 @@ Implementation:
 ## Files to add (M6 implementation slice)
 
 ```
-cmd/elastickv-snapshot-encode/main.go           # flag parsing, orchestration, ENCODE_INFO emission
-cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (round-trip, override validation, exit codes)
+internal/backup/encode_snapshot.go              # EncodeSnapshot wrapper (new public entrypoint)
+internal/backup/encode_snapshot_test.go         # library-level round-trip, self-test, override validation
 internal/backup/encode_info.go                  # ENCODE_INFO.json struct + WriteEncodeInfo / ReadEncodeInfo helpers
 internal/backup/encode_info_test.go             # round-trip JSON, version gate
+cmd/elastickv-snapshot-encode/main.go           # flag parsing, temp-file dance, ENCODE_INFO emission
+cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (exit codes, write-then-rename atomicity)
 ```
 
-`internal/backup/encode_info.go` lives in the encoder package because the schema is encoder-specific (decoder never writes it) and the writers in the package can reuse `WriteManifest`'s Sync+Close hardening (gemini r1 medium on #810).
+`internal/backup/encode_snapshot.go` mirrors the decoder's `DecodeSnapshot`-in-the-same-package convention: the high-level wrapper, the per-adapter encoders, and `snapshotBuilder` all live together; `main` only handles flag parsing + filesystem-level concerns (temp dance, sidecar). `internal/backup/encode_info.go` lives in the encoder package because the schema is encoder-specific (decoder never writes it) and the writers in the package can reuse `WriteManifest`'s Sync+Close hardening (gemini r1 medium on #810).
 
 ## Test plan
 
@@ -125,6 +149,8 @@ internal/backup/encode_info_test.go             # round-trip JSON, version gate
 | `TestCLIEncodeInfoTwoFilesNoCollision` | Two `--output` paths in the same dir produce two distinct sidecars; second run does not overwrite the first. |
 | `TestCLISelfTestPinnedScratchRootStillUniqueSubdir` | `--scratch-root=/tmp/pinned` produces `/tmp/pinned/encode-self-test-<random>/`, not `/tmp/pinned/` itself — concurrent runs do not collide (gemini medium #896). |
 | `TestCLISelfTestCleansScratchOnAllPaths` | Scratch subdir is removed via `os.RemoveAll` on success, mismatch, AND encoder-error paths (pinned via a t.Helper that asserts the dir is gone after the CLI returns). |
+| `TestCLISelfTestFailureLeavesNoFsmAtOutputPath` | With `--self-test` enabled and a deliberately-mangled encoder: the corrupt `.fsm` is NEVER visible at `--output` (the publish path); the temp file is removed; exit 2 (codex P2 v2 #896). Pins the write-then-rename atomic-publish discipline. |
+| `TestEncodeSnapshotLibraryRoundTrip` | `backup.EncodeSnapshot` + immediate `DecodeSnapshot` on the returned bytes produces an equivalent adapter tree without going through `cmd/`. Pins the library entrypoint independently of the CLI, so future callers (Phase 1 live extractor, integration tests) have a tested API surface (codex P2 v2 #896 — encoder entrypoint exposure). |
 
 ## Self-review (5 passes) — proposed
 
@@ -132,7 +158,7 @@ internal/backup/encode_info_test.go             # round-trip JSON, version gate
 2. **Concurrency / distributed failures.** Pure offline. No Raft, no HLC issuance, no cluster contact. The output `.fsm` is loaded by a STOPPED node via stop-replace-restart (parent §"Restore via stop-replace-restart"); concurrency surfaces only on the receiving cluster's restart path, which is owned by the node's existing snapshot loader.
 3. **Performance.** Encode is O(records in dump); each adapter's Encode is O(its inputs). Self-test doubles this. No hot-loop allocations introduced by the CLI itself (it just wires existing constructors). Big trees may want `GOGC` tuning; documented in the file header, not a flag.
 4. **Data consistency.** `--last-commit-ts T` validation is the load-bearing invariant — `T ≥ manifest.last_commit_ts` is fail-closed (pinned by `TestCLIRejectsLowerLastCommitTSOverride`). Self-test compares against the effective `T`, not the manifest value, per parent doc requirement. Adapter set passed to the CLI matches the adapter set the encoders walk — same parse-and-validate function as the decoder (`parseAdapterSet`) so a typo cannot silently downgrade scope.
-5. **Test coverage.** Twelve tests cover the four user-visible behaviors (round-trip, override validation, scope parsing, missing-manifest), the two safety nets (self-test catches corruption, ENCODE_INFO schema versioned), and four robustness regressions identified in #896 review (per-`.fsm` sidecar naming, two-files-no-collision, unique scratch subdir under pinned root, eager cleanup on every exit path). Adapter-internal coverage is already pinned by M1–M5 PRs and is not re-tested here.
+5. **Test coverage.** Fourteen tests cover the four user-visible behaviors (round-trip, override validation, scope parsing, missing-manifest), the two safety nets (self-test catches corruption, ENCODE_INFO schema versioned), and six robustness regressions identified in #896 review (per-`.fsm` sidecar naming, two-files-no-collision, unique scratch subdir under pinned root, eager cleanup on every exit path, write-then-rename atomic publish on self-test failure, library entrypoint round-trip). Adapter-internal coverage is already pinned by M1–M5 PRs and is not re-tested here.
 
 ## Decoder cleanup folded in (parent doc §"Decoder cleanup")
 
