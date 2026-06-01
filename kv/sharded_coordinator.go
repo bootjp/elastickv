@@ -485,10 +485,33 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 // churning faster than this dispatch can keep up, and surfacing the
 // error lets a wrapping adapter retry harness (or the client) decide
 // whether to keep trying.
-func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
-	if c.engine != nil && reqs.ObservedRouteVersion == 0 {
-		reqs.ObservedRouteVersion = c.engine.Version()
+// maybeAutoPinObservedRouteVersion stamps reqs.ObservedRouteVersion
+// with the engine's current catalog version at Dispatch entry, but
+// ONLY when the txn has no read keys.  Per design doc §4.1 the
+// version must be pinned at BeginTxn (read-set capture time); for
+// write-only txns Dispatch IS the BeginTxn (no prior reads have
+// happened), so pinning here is correct.  For read-write txns the
+// caller already performed reads at some earlier moment — Redis
+// MULTI/EXEC's txnContext.commit, for example, builds an
+// OperationGroup with StartTS from MULTI and ReadKeys from the GETs
+// inside the txn body — and stamping the catalog version at this
+// Dispatch call would associate post-shift routes with pre-shift
+// reads, defeating the gate (codex P1 on PR #900).  Such callers
+// MUST migrate to pin ObservedRouteVersion themselves at BeginTxn
+// time; until they do, the request flows with observedVer=0 and
+// the M3 gate short-circuits (the safe non-regressing posture for
+// non-migrated read-write callers).  Extracted from
+// dispatchTxnWithComposed1Retry to keep its cyclomatic complexity
+// in the cyclop budget.
+func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGroup[OP]) {
+	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 {
+		return
 	}
+	reqs.ObservedRouteVersion = c.engine.Version()
+}
+
+func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	c.maybeAutoPinObservedRouteVersion(reqs)
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
 		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)

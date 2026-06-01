@@ -297,3 +297,61 @@ func TestShardedCoordinator_DoesNotRetryReadWriteTxnOnComposed1(t *testing.T) {
 	require.Equal(t, int32(1), txn.calls.Load(),
 		"read-write txn must NOT retry: exactly 1 Commit attempt — the M4 retry is reserved for write-only txns where bumping StartTS is OCC-safe")
 }
+
+// TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForReadWriteTxn
+// is the regression for the codex P1 finding on PR #900: when a caller
+// already supplies a transaction StartTS/ReadKeys but leaves
+// ObservedRouteVersion unset, this used to stamp the catalog version
+// at EXEC/commit dispatch time rather than when the read set was
+// captured.
+//
+// Concrete scenario: Redis txnContext.commit builds an OperationGroup
+// with StartTS (allocated at MULTI) and ReadKeys (the GETs / WATCHes
+// from the txn body) but no ObservedRouteVersion.  If a route moves
+// between the MULTI-time reads and this Dispatch call, an auto-pin
+// at Dispatch entry would stamp the POST-shift catalog version on
+// the request and verifyComposed1 would NOT detect the shift the
+// guard is meant to catch.
+//
+// Correct behaviour: do NOT auto-fill ObservedRouteVersion when the
+// caller already has a read snapshot (len(ReadKeys) > 0).  Such
+// callers must pin ObservedRouteVersion themselves at BeginTxn time
+// per design doc §4.1; leaving it at zero surfaces as "unpinned"
+// to the M3 gate (which short-circuits), which is the safe default
+// for non-migrated callers — the gate cannot retroactively pin
+// reads it was not present for.
+//
+// Write-only txns (len(ReadKeys) == 0) continue to get auto-pinned
+// at Dispatch entry because there are no prior reads whose
+// snapshot version could disagree with the Dispatch-time pin.
+func TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForReadWriteTxn(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 5,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	txn := &composed1RetryingTransactional{firstErr: nil}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		ReadKeys: [][]byte{[]byte("k_read")},
+		// ObservedRouteVersion intentionally left at zero — caller
+		// did not migrate to pin at BeginTxn.
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("k_write"), Value: []byte("v")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.observedSeen, 1)
+	require.Equal(t, uint64(0), txn.observedSeen[0],
+		"read-write txns with unset ObservedRouteVersion must NOT be auto-pinned at Dispatch entry — pinning at commit time disagrees with the reads' actual snapshot version, so verifyComposed1 must short-circuit (observedVer=0) until the caller migrates to pin at BeginTxn per §4.1")
+}
