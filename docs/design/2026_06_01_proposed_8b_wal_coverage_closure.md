@@ -46,7 +46,9 @@ After Stage 6E ships (open at the time of this writing), every Raft entry's payl
 |   - Version (1B)                                    |
 |   - Flag (1B)                                       |
 |   - KeyID (4B uint32, the DEK id)                   |
-|   - Nonce (12B: node_id ‖ local_epoch ‖ write_count)|
+|   - Nonce (12B): node_id(2B) ‖ local_epoch(2B) ‖    |
+|     write_count(8B) — all big-endian, see           |
+|     internal/encryption/nonce_factory.go:13-15      |
 +-----------------------------------------------------+
 | AEAD body (CIPHERTEXT post-cutover, §4.2)           |
 |   - ciphertext + 16B GCM tag                        |
@@ -78,9 +80,18 @@ For a high-fidelity threat-model picture, an adversary with raw filesystem acces
 5. **Monotonic counter leakage** — two independent counters are
    visible per entry on disk:
    - **Proposal ID** (8B uint64 in the proposal envelope header,
-     monotonic per leader). Leaks per-leader throughput rate and
-     the rough cadence of leadership flips (the counter resets on
-     leadership change).
+     monotonic **per process load** — NOT per leader). Sourced
+     from `Engine.nextID()` (`engine.go:3134`), which is a
+     process-wide `atomic.Uint64.Add(1)` shared by `Propose`,
+     linearizable reads, and admin conf changes. It does NOT
+     reset across leadership transitions, and it is incremented
+     by non-WAL paths too (reads, admin), so the on-disk WAL
+     sequence shows gaps relative to the in-process counter
+     (codex P2 #2 on PR #897 — earlier wording claimed
+     per-leader resets, which was wrong). What an adversary
+     observes on disk is therefore process-local request IDs
+     with gaps from non-WAL traffic — useful for throughput
+     estimation but NOT a reliable leader-flip signal.
    - **`write_count`** component within the 12B AEAD nonce
      (constructed as `node_id ‖ local_epoch ‖ write_count`).
      Leaks per-writer throughput rate; tracks per-DEK writes per
@@ -98,6 +109,22 @@ What the adversary **cannot** observe (because §4.2 wraps the payload):
 - User keys, values, operation type (PUT/DEL/GET/COMMIT/ABORT).
 - Transaction grouping or two-phase commit metadata.
 - Backup or admin operation contents.
+
+**Important caveat — the cleartext window for pre-cutover entries**
+(codex P2 #1 + claude review #1 on PR #897). The above list applies
+ONLY to entries with `index > raftEnvelopeCutoverIndex`. On any
+cluster that enables Stage 6E AFTER existing traffic, the WAL
+interleaves cleartext pre-cutover entries with post-cutover
+ciphertext entries until the WAL segments holding the pre-cutover
+entries are removed by etcd-raft's log compaction (snapshot install
+followed by segment purge). During that window an adversary with
+raw WAL access can still read user data from the pre-cutover
+segments in cleartext. Operators should treat the §4.2 guarantee
+as **"eventually true post-compaction"** rather than **"immediately
+true post-cutover"**. This is the same engine semantics the 6E
+design's strict-`>` dispatch (`entry.Index > raftCutoverIndex`)
+documents — the cutover entry itself and everything before it is
+plaintext on disk by construction; only later entries are wrapped.
 
 ## 4. Threat-model justification for accepting the residual
 
@@ -126,14 +153,12 @@ The parent §4.3 decision predates Stage 6E but its reasoning still holds.
 
 ## 6. Forward-compat hook (deferred, not committed)
 
-If a future deployment class requires application-level WAL file encryption, the implementation would land at the `internal/raftengine/etcd/wal_store.go` boundary as a transparent `os.File`-wrapping layer. The architecture would need to address:
+If a future deployment class requires application-level WAL file encryption, the natural operator control surface lives in `internal/raftengine/etcd/wal_store.go` (the file-creation/open/rotate sites the elastickv engine actually controls). **The actual wrapping mechanism would still need to take one of the approaches §5 rules out** — the WAL bytes are written by the upstream `go.etcd.io/etcd/server/v3/storage/wal` package, which manages `*os.File` internally and exposes no external `io.Writer` intercept surface to callers. A future implementation would therefore have to either:
 
-- Block-boundary alignment with etcd-raft's 64KB segment size.
-- Random-access reads during recovery (AES-CTR with offset-derived nonce, or per-frame envelopes).
-- Crash-safety equivalence with cleartext WAL (`fsync` semantics, partial-tail recovery).
-- KEK source for the WAL-DEK (separate from `dek_raft`? same? key-hierarchy implications).
+- Fork or vendor the upstream WAL package to inject the encryption layer (the maintenance burden §5 calls out), or
+- Move file-level encryption into a lower layer (e.g., a FUSE/eBPF-style interposition or a dedicated wrapping filesystem) that the upstream package can ignore — at which point it stops being an in-process design and crosses into the infrastructure-FS-encryption answer §4 already documents as supported.
 
-This work is **not committed** by Stage 8b. It is enumerated only so a future operator request has a known starting surface. The forward-compat hook is purely informational.
+Either path puts §6's architectural concerns back in scope (block-boundary alignment with the 64KB segment size, random-access reads during recovery, `fsync` + partial-tail crash-safety equivalence, KEK source for the WAL-DEK). This enumeration is here so a future operator request has a known starting surface; the forward-compat hook is purely informational and **not committed** by Stage 8b.
 
 ## 7. Closure: Stage 8 row update
 
