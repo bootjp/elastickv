@@ -148,6 +148,16 @@ func EncodeSnapshot(opts EncodeOptions, out io.Writer) (EncodeResult, error) {
 	if out == nil {
 		return EncodeResult{}, errors.New("backup: EncodeSnapshot out writer is nil")
 	}
+	if !opts.Adapters.DynamoDB && !opts.Adapters.S3 && !opts.Adapters.Redis && !opts.Adapters.SQS {
+		// A zero AdapterSet would silently produce a valid header-only
+		// .fsm with no adapter records — a "successful" empty restore
+		// artifact. The CLI's parseAdapterSet already rejects this for
+		// flag-driven entry, but a future in-process caller (Phase 1
+		// live extractor, integration tests) might forget to thread
+		// the set; fail-closed here so that mistake surfaces (codex v5
+		// + claude v5 #904).
+		return EncodeResult{}, errors.New("backup: EncodeOptions.Adapters has no enabled adapter")
+	}
 
 	b := newSnapshotBuilder(opts.LastCommitTS)
 	enabled, err := runAdapterEncoders(b, opts)

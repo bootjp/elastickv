@@ -209,6 +209,28 @@ func TestEncodeSnapshotRequiresInputRoot(t *testing.T) {
 	}
 }
 
+// TestEncodeSnapshotRejectsZeroAdapterSet pins claude v5 + codex v5
+// carry-over: a library caller that forgets to thread Adapters into
+// EncodeOptions gets a fail-closed error rather than a silently empty
+// header-only .fsm. The CLI's parseAdapterSet already rejects this for
+// flag-driven entry; this test pins the library-level guard.
+func TestEncodeSnapshotRejectsZeroAdapterSet(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:    in,
+		Adapters:     AdapterSet{}, // explicit zero
+		LastCommitTS: 1,
+	}, &buf)
+	if err == nil {
+		t.Fatalf("EncodeSnapshot with empty AdapterSet succeeded; want error")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("buf.Len = %d, want 0 (no bytes should be written on guard rejection)", buf.Len())
+	}
+}
+
 // TestEncodeInfoSidecarPath pins the path-derivation rule for the
 // sidecar (gemini medium v2 #896): one .fsm path produces one distinct
 // sidecar path; two .fsm files in the same dir produce two distinct
