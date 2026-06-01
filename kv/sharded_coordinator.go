@@ -134,6 +134,16 @@ const (
 
 	txnSecondaryCommitRetryAttempts = 3
 	txnSecondaryCommitRetryBackoff  = 20 * time.Millisecond
+
+	// composed1RetryAttempts bounds how many times Dispatch re-issues a
+	// txn after the FSM's M3 verifyComposed1 gate returned
+	// ErrComposed1Violation / ErrComposed1VersionGCd.  Per design doc
+	// §M4: "retries it once" — so the total attempt count is 1 (initial)
+	// + composed1RetryAttempts = 2.  Beyond one retry the sentinel
+	// surfaces unchanged so the client (or a wrapping retry harness in
+	// the adapter) sees the failure rather than the coordinator spinning
+	// on a persistent route shift.
+	composed1RetryAttempts = 1
 )
 
 // ShardedCoordinator routes operations to shard-specific raft groups.
@@ -450,10 +460,81 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)
+		return c.dispatchTxnWithComposed1Retry(ctx, reqs)
 	}
 
 	return c.dispatchNonTxn(ctx, reqs)
+}
+
+// dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
+// (design doc
+// docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+// §M4).  Pins reqs.ObservedRouteVersion to the engine's current
+// catalog version on the FIRST attempt when the caller left it at the
+// zero sentinel — every txn that flows through ShardedCoordinator
+// gets gate-eligible by default so the M3 verifyComposed1 check has
+// teeth without each adapter rediscovering the contract.  On
+// ErrComposed1Violation or ErrComposed1VersionGCd, re-reads the
+// catalog version, re-stamps observed+commit on the OperationGroup,
+// and re-issues dispatchTxn ONCE.  Beyond one retry the sentinel
+// surfaces unchanged.
+//
+// The retry is bounded at composed1RetryAttempts = 1 because both
+// sentinels are "route shifted, retry on the fresh catalog" signals
+// — a persistent failure across two attempts means the catalog is
+// churning faster than this dispatch can keep up, and surfacing the
+// error lets a wrapping adapter retry harness (or the client) decide
+// whether to keep trying.
+func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if c.engine != nil && reqs.ObservedRouteVersion == 0 {
+		reqs.ObservedRouteVersion = c.engine.Version()
+	}
+
+	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
+		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)
+		if err == nil {
+			return resp, nil
+		}
+		if !isComposed1RetryableError(err) {
+			return resp, err
+		}
+		if attempt == composed1RetryAttempts {
+			return resp, err
+		}
+		// Re-route by re-reading the engine's current catalog
+		// version and stamping it on the txn.  groupMutations on
+		// the next dispatchTxn pass re-runs router.ResolveGroup,
+		// so a key whose owning group changed since the last
+		// attempt naturally lands on the new group's FSM.
+		if c.engine != nil {
+			reqs.ObservedRouteVersion = c.engine.Version()
+		}
+		// Clear the timestamps so the next attempt allocates a
+		// fresh pair against the post-shift HLC.  The OCC
+		// invariants require commitTS > startTS computed under the
+		// same HLC observation; reusing the stale pair would risk
+		// a startTS that no longer dominates the new shard's
+		// applied commitTS.
+		reqs.StartTS = 0
+		reqs.CommitTS = 0
+		if c.clock != nil {
+			startTS, allocErr := c.nextStartTS(ctx, reqs.Elems)
+			if allocErr != nil {
+				return resp, allocErr
+			}
+			reqs.StartTS = startTS
+		}
+	}
+	// Unreachable — the loop body always returns on each iteration.
+	// Kept here so the function has an unambiguous return shape.
+	return nil, errors.WithStack(ErrInvalidRequest)
+}
+
+// isComposed1RetryableError reports whether err is one of the M3 gate
+// sentinels that M4 retries.  Both surface as wrapped errors from the
+// underlying transactional Commit; errors.Is unwraps them correctly.
+func isComposed1RetryableError(err error) bool {
+	return errors.Is(err, ErrComposed1Violation) || errors.Is(err, ErrComposed1VersionGCd)
 }
 
 // dispatchNonTxn routes a non-transactional operation group through the
