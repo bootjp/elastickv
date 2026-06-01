@@ -44,7 +44,15 @@ Pinned by `TestCLIRejectsLowerLastCommitTSOverride`.
 
 ## `ENCODE_INFO.json` (provenance + integrity)
 
-A new sidecar emitted next to the output `.fsm`, NOT inside it (the EKVPBBL1 byte format is fixed). Keep the schema minimal — restore operators need to confirm "encoded for the right cluster, by the right encoder version, against this exact file":
+A new sidecar emitted next to the output `.fsm`, NOT inside it (the EKVPBBL1 byte format is fixed). **Sidecar filename is derived from the `.fsm` path**, not a static `ENCODE_INFO.json` — multiple `.fsm` files can share a directory (e.g., per-node dumps under `/backups/`), and a static name would silently overwrite siblings (gemini medium #896). The convention is:
+
+```
+<output>.encode_info.json
+```
+
+i.e. `/backups/node1.fsm` → `/backups/node1.fsm.encode_info.json`. Same scheme `gpg` and `sha256sum` follow when their input is path-addressable. Tests pin both the single-file case and the two-files-same-dir case (`TestCLIEncodeInfoPathDerivedFromOutput`, `TestCLIEncodeInfoTwoFilesNoCollision`).
+
+Keep the schema minimal — restore operators need to confirm "encoded for the right cluster, by the right encoder version, against this exact file":
 
 ```json
 {
@@ -82,11 +90,11 @@ assert dirTree == dirTree'   (excluding wall-time + encoder-provenance fields)
 
 Implementation:
 
-1. After the primary `.fsm` is written + sha256-anchored, invoke `backup.DecodeSnapshot` on the produced bytes into a scratch directory (default `os.TempDir()/encode-self-test-<random>/`; operator can pin via `--scratch-root` for tmpfs).
-2. Diff the scratch tree against `--input`. The diff is structural, not byte-equal on transient fields:
-   - **Excluded from compare:** `MANIFEST.json` `wall_time_iso`, any future `phase`-specific provenance, the `MANIFEST.json` `source.fsm_path` (decoder's record of where it read from, not data).
-   - **Required equal:** every adapter subdir's full tree (filenames + bytes), `MANIFEST.json` adapter-scope arrays, `last_commit_ts`.
-3. On mismatch: the CLI exits with code 2, writes a `mismatch.txt` next to the output `.fsm` listing the first N differing paths, and the `ENCODE_INFO.json` records `self_test.matched: false` before the exit. Restore operators inspect `mismatch.txt`.
+1. After the primary `.fsm` is written + sha256-anchored, invoke `backup.DecodeSnapshot` on the produced bytes into a unique scratch subdirectory. The scratch dir is ALWAYS a fresh `encode-self-test-<random>` subdirectory under the resolved base (default base `os.TempDir()`; operator override via `--scratch-root`). The unique-suffix is non-optional even when `--scratch-root` is pinned — concurrent encodes against the same pinned base would otherwise collide and produce false failures (gemini medium #896).
+2. **Header check (no MANIFEST.json in scratch):** `DecodeSnapshot` returns a `DecodeResult` whose `Header.LastCommitTS` is the value the decoder read from the produced `.fsm`. Compare it against the effective `T` (manifest value or `--last-commit-ts` override). The decoder library does NOT emit `MANIFEST.json` (that is the cmd wrapper's job per `internal/backup/decode.go`); the self-test deliberately consumes the library output and compares the in-memory header instead, avoiding a redundant manifest synthesis step (codex P2 #896).
+3. **Tree diff:** structurally compare the scratch adapter subtrees against the corresponding subdirs of `--input`. The diff is byte-equal on adapter files (filenames + bytes — every per-adapter dump is deterministic). `MANIFEST.json` from `--input` is NOT compared at all in the scratch tree (the scratch has none); the `last_commit_ts` field is covered by the header check above. `wall_time_iso` and other manifest transient fields are not in scope.
+4. **Eager cleanup.** The scratch subdir is removed via `os.RemoveAll` on ALL exit paths (success, mismatch, encoder error), in a `defer` set up immediately after `MkdirTemp` returns. A stale `mismatch.txt` next to the output `.fsm` is removed at the start of every run (success or fresh-failure), so the file is always the latest run's record, never a stale one.
+5. **On mismatch:** exit code 2; `mismatch.txt` (next to `.fsm`, named `<output>.mismatch.txt` per the same path-derivation rule as the sidecar) lists the first N differing paths + the header check result; `ENCODE_INFO.json` records `self_test.matched: false` before the exit. Restore operators inspect `<output>.mismatch.txt`.
 
 **Why default-off:** self-test doubles encode time and uses 2× disk. It is the gold-standard correctness check, but most operational uses (re-encode a known-good tree for restore) skip it. CI runs `--self-test` on every encoder PR; the M6 CLI test file `TestCLIRoundTripSelfTest` does too.
 
@@ -113,6 +121,10 @@ internal/backup/encode_info_test.go             # round-trip JSON, version gate
 | `TestCLISelfTestDetectsCorruption` | Patch the in-tree encoder to deliberately mangle one byte after writing the `.fsm`; `--self-test` catches the diff, exits 2, writes `mismatch.txt`. Pins that the self-test actually compares (not just runs). |
 | `TestEncodeInfoRoundTrip` | `WriteEncodeInfo` → `ReadEncodeInfo` of the same struct equal. Forward-compat: an `ENCODE_INFO.json` with extra fields decodes cleanly. |
 | `TestEncodeInfoRejectsUnknownFormatVersion` | format_version != 1 → typed error, mirroring decoder's `TestManifestVersionGate`. |
+| `TestCLIEncodeInfoPathDerivedFromOutput` | `--output /tmp/a.fsm` produces `/tmp/a.fsm.encode_info.json`, not `/tmp/ENCODE_INFO.json` (pins gemini medium #896). |
+| `TestCLIEncodeInfoTwoFilesNoCollision` | Two `--output` paths in the same dir produce two distinct sidecars; second run does not overwrite the first. |
+| `TestCLISelfTestPinnedScratchRootStillUniqueSubdir` | `--scratch-root=/tmp/pinned` produces `/tmp/pinned/encode-self-test-<random>/`, not `/tmp/pinned/` itself — concurrent runs do not collide (gemini medium #896). |
+| `TestCLISelfTestCleansScratchOnAllPaths` | Scratch subdir is removed via `os.RemoveAll` on success, mismatch, AND encoder-error paths (pinned via a t.Helper that asserts the dir is gone after the CLI returns). |
 
 ## Self-review (5 passes) — proposed
 
@@ -120,7 +132,7 @@ internal/backup/encode_info_test.go             # round-trip JSON, version gate
 2. **Concurrency / distributed failures.** Pure offline. No Raft, no HLC issuance, no cluster contact. The output `.fsm` is loaded by a STOPPED node via stop-replace-restart (parent §"Restore via stop-replace-restart"); concurrency surfaces only on the receiving cluster's restart path, which is owned by the node's existing snapshot loader.
 3. **Performance.** Encode is O(records in dump); each adapter's Encode is O(its inputs). Self-test doubles this. No hot-loop allocations introduced by the CLI itself (it just wires existing constructors). Big trees may want `GOGC` tuning; documented in the file header, not a flag.
 4. **Data consistency.** `--last-commit-ts T` validation is the load-bearing invariant — `T ≥ manifest.last_commit_ts` is fail-closed (pinned by `TestCLIRejectsLowerLastCommitTSOverride`). Self-test compares against the effective `T`, not the manifest value, per parent doc requirement. Adapter set passed to the CLI matches the adapter set the encoders walk — same parse-and-validate function as the decoder (`parseAdapterSet`) so a typo cannot silently downgrade scope.
-5. **Test coverage.** Eight tests above cover the four user-visible behaviors (round-trip, override validation, scope parsing, missing-manifest) plus the two safety nets (self-test catches corruption, ENCODE_INFO schema versioned). Adapter-internal coverage is already pinned by M1–M5 PRs and is not re-tested here.
+5. **Test coverage.** Twelve tests cover the four user-visible behaviors (round-trip, override validation, scope parsing, missing-manifest), the two safety nets (self-test catches corruption, ENCODE_INFO schema versioned), and four robustness regressions identified in #896 review (per-`.fsm` sidecar naming, two-files-no-collision, unique scratch subdir under pinned root, eager cleanup on every exit path). Adapter-internal coverage is already pinned by M1–M5 PRs and is not re-tested here.
 
 ## Decoder cleanup folded in (parent doc §"Decoder cleanup")
 
