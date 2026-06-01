@@ -7,11 +7,16 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/backup"
 )
+
+// isWindows is true on Windows builds; perm-bit tests skip on Windows
+// where Unix-style modes are not meaningful.
+var isWindows = runtime.GOOS == "windows"
 
 // emitMinimalManifest writes a minimal valid MANIFEST.json under outRoot
 // with the given lastCommitTS. Used by every CLI test as the producer-
@@ -360,6 +365,39 @@ func TestParseLastCommitTS(t *testing.T) {
 	} {
 		if _, err := parseLastCommitTS(bad); err == nil {
 			t.Errorf("%q parsed successfully; want error", bad)
+		}
+	}
+}
+
+// TestCLIPublishesFsmAndSidecarMode0600 pins claude v4 #904: the
+// produced .fsm and ENCODE_INFO.json are created with mode 0o600 so a
+// multi-user backup host does not get a world-readable dataset. The
+// earlier os.Create-based path relied on umask (typically 0644).
+//
+// Skips on Windows where Unix-style perm bits are not meaningful.
+func TestCLIPublishesFsmAndSidecarMode0600(t *testing.T) {
+	t.Parallel()
+	if isWindows {
+		t.Skip("perm bits not meaningful on Windows")
+	}
+	in := t.TempDir()
+	emitMinimalManifest(t, in, 100)
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	code, err := run([]string{"--input", in, "--output", out}, quietLogger())
+	if err != nil || code != exitSuccess {
+		t.Fatalf("run failed: code=%d err=%v", code, err)
+	}
+	for _, p := range []string{out, out + ".encode_info.json"} {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		// Only check the owner bits (rwx); umask cannot widen beyond
+		// what OpenFile requested but a misconfigured fs.ModeSticky
+		// or similar could theoretically narrow. We just assert no
+		// group/other access bits are set.
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s mode = %o, want no group/other bits (0o600 or stricter)", p, perm)
 		}
 	}
 }

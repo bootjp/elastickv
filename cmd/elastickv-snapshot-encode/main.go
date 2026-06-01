@@ -319,8 +319,10 @@ func writeAndPublish(cfg *config, encodeOpts backup.EncodeOptions, mismatchPath 
 
 // encodeToTempFile creates tempPath, runs EncodeSnapshot into it,
 // fsync+close. Caller is responsible for the os.Remove cleanup on error.
+// The temp file is created mode 0600 so the on-disk .fsm is not
+// world-readable while the encode is in flight (claude v4 #904).
 func encodeToTempFile(tempPath string, encodeOpts backup.EncodeOptions) (backup.EncodeResult, error) {
-	tempFile, err := os.Create(tempPath) //nolint:gosec // operator-supplied path
+	tempFile, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, encodeInfoFilePerm) //nolint:gosec // operator-supplied path
 	if err != nil {
 		return backup.EncodeResult{}, errors.Wrapf(err, "create %s", tempPath)
 	}
@@ -404,7 +406,10 @@ func writeSidecar(cfg *config, m backup.Manifest, effectiveTS uint64, overridden
 		Matched: result.SelfTestMatched,
 	}
 	sidecarPath := backup.EncodeInfoSidecarPath(cfg.outputPath)
-	f, err := os.Create(sidecarPath) //nolint:gosec // operator-supplied path
+	// 0o600 keeps ENCODE_INFO.json (which includes the source path,
+	// cluster_id, and SHA-256 of the .fsm) from leaking to non-owner
+	// users on multi-user backup hosts (claude v4 #904).
+	f, err := os.OpenFile(sidecarPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, encodeInfoFilePerm) //nolint:gosec // operator-supplied path
 	if err != nil {
 		return errors.WithStack(err)
 	}
