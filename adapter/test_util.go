@@ -318,12 +318,11 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// to the test body. The 300 ms stability window above only
 	// proves leadership *appears* held; a leader can still step
 	// down on the first real heartbeat-quorum miss after that.
-	// 5ba2ef94 / rpushEventually / lpushEventually have been
-	// absorbing that post-readiness churn per-test for the past
-	// several months — this commits-one-entry probe closes the
-	// window at the readiness layer instead, so any subsequent
-	// write inherits a leader that has already held quorum
-	// through one apply.
+	// The per-test retry wrappers in this file have been absorbing
+	// that post-readiness churn site-by-site; this commits-one-entry
+	// probe closes the window at the readiness layer instead, so any
+	// subsequent write inherits a leader that has already held
+	// quorum through one apply.
 	waitForWriteableLeader(t, nodes, waitTimeout)
 }
 
@@ -350,8 +349,9 @@ var raftReadinessProbePayload = []byte{
 // stability window during which leadership only *looks* stable; a
 // leader that steps down on its first real heartbeat-quorum miss can
 // surface as "etcd raft engine is not leader" on the test's first
-// write. See commits 5ba2ef94 / rpushEventually / lpushEventually for
-// the per-test work-arounds this readiness gate is meant to obsolete.
+// write — the failure mode the per-test retry wrappers in this file
+// have been working around. See the PR description for the full
+// flake-fix history this readiness gate is meant to obsolete.
 func waitForWriteableLeader(t *testing.T, nodes []Node, timeout time.Duration) {
 	t.Helper()
 	if len(nodes) == 0 || nodes[0].engine == nil {
