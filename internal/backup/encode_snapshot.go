@@ -14,15 +14,18 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// ErrSelfTestLowerLastCommitTS is returned by EncodeSnapshot when the
-// effective LastCommitTS in EncodeOptions is below the manifest's value.
+// ErrSelfTestLowerLastCommitTS is the sentinel callers should return
+// when the operator-supplied T is below the manifest's last_commit_ts.
 // The HLC ceiling invariant (CLAUDE.md "Timestamp Oracle") forbids
 // lowering the ceiling on restore: a lower T would let a post-restart
 // leader issue a read ts ≤ a restored row's commit ts.
 //
-// Surfaced at the EncodeSnapshot layer so the CLI's main exits with code
-// 2 (data-correctness failure, per parent §"Exit codes"). Caller must
-// check errors.Is on this sentinel to map to the right exit code.
+// EncodeSnapshot itself does NOT read MANIFEST.json or enforce this
+// floor — the comparison happens in the CLI's resolveLastCommitTS
+// BEFORE EncodeSnapshot is called, and a future library caller (Phase 1
+// live extractor, integration tests) must perform its own comparison
+// and return this sentinel on regression so callers can errors.Is on
+// it to map to the right exit code (claude v3 doc bug #904).
 var ErrSelfTestLowerLastCommitTS = errors.New("backup: --last-commit-ts T < manifest.last_commit_ts (HLC ceiling regression)")
 
 // The encoder dispatch order (redis → dynamodb → s3 → sqs) is encoded
@@ -130,10 +133,14 @@ type EncodeResult struct {
 // The CLI relies on this contract to write mismatch.txt + exit 2;
 // library callers should follow the same pattern.
 //
-// Returns ErrSelfTestLowerLastCommitTS when opts.LastCommitTS is below
-// the manifest's value — caller is responsible for reading the manifest
-// and computing the effective T (this layer just validates the floor).
-// The CLI maps that error to exit code 2.
+// EncodeSnapshot does NOT read MANIFEST.json and does NOT validate
+// opts.LastCommitTS against any external floor — the caller is
+// responsible for reading the manifest, computing the effective T,
+// and returning ErrSelfTestLowerLastCommitTS on regression (the CLI's
+// resolveLastCommitTS performs this check before calling EncodeSnapshot
+// and maps that error to exit code 2). A future library caller that
+// skips that step would silently stamp a too-low timestamp into the
+// .fsm header (claude v3 doc bug #904).
 func EncodeSnapshot(opts EncodeOptions, out io.Writer) (EncodeResult, error) {
 	if opts.InputRoot == "" {
 		return EncodeResult{}, errors.New("backup: EncodeOptions.InputRoot is required")
@@ -194,9 +201,8 @@ func encodeBuffered(b *snapshotBuilder, opts EncodeOptions, enabled []string, ou
 		_ = os.Remove(tempPath)
 	}()
 
-	hasher := sha256.New()
-	tee := &teeWriter{w: tempFile, h: hasher}
-	bytesWritten, err := b.WriteTo(tee)
+	hashTee := newSHA256Writer(tempFile)
+	bytesWritten, err := b.WriteTo(hashTee)
 	if err != nil {
 		return EncodeResult{}, errors.WithStack(err)
 	}
@@ -211,8 +217,7 @@ func encodeBuffered(b *snapshotBuilder, opts EncodeOptions, enabled []string, ou
 	}
 
 	header, mismatchTxt, matched, stErr := runSelfTest(tempFile, opts)
-	var sha [32]byte
-	copy(sha[:], hasher.Sum(nil))
+	sha := hashTee.Sum()
 	result := EncodeResult{
 		Header:              header,
 		BytesWritten:        bytesWritten,
@@ -235,25 +240,6 @@ func encodeBuffered(b *snapshotBuilder, opts EncodeOptions, enabled []string, ou
 		return result, errors.Wrap(err, "copy buffered fsm to out")
 	}
 	return result, nil
-}
-
-// teeWriter tees writes into a hash.Hash + an underlying writer in a
-// single pass, avoiding a second read for the SHA-256 anchor that
-// ENCODE_INFO.json records.
-type teeWriter struct {
-	w io.Writer
-	h hash.Hash
-}
-
-func (t *teeWriter) Write(p []byte) (int, error) {
-	if _, err := t.h.Write(p); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	n, err := t.w.Write(p)
-	if err != nil {
-		return n, errors.WithStack(err)
-	}
-	return n, nil
 }
 
 // adapterRunner pairs an enabled-check with an Encode call, keeping
