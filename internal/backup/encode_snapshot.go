@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"crypto/sha256"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -61,14 +62,19 @@ type EncodeOptions struct {
 	SelfTestDecodeOptions DecodeOptions
 
 	// corruptBufferForTest is an unexported test-only hook that fires
-	// against the internal *bytes.Buffer AFTER snapshotBuilder.WriteTo
+	// against the on-disk self-test buffer AFTER snapshotBuilder.WriteTo
 	// returns but BEFORE the self-test DecodeSnapshot call (when
 	// SelfTest=true). Same-package tests use it to inject corruption
 	// reachable by the self-test but never reaching the io.Writer
 	// passed to EncodeSnapshot (the write-then-rename invariant: a
 	// self-test failure must not publish corrupt bytes — codex P2 v6
 	// #896). External callers cannot set it (lowercase identifier).
-	corruptBufferForTest func([]byte)
+	//
+	// The hook receives the *os.File handle (positioned at offset 0)
+	// of the disk-backed self-test buffer; tests typically WriteAt
+	// a byte flip and rely on Seek-back-to-0 before returning so
+	// the encoder's subsequent Read sees the corrupted bytes.
+	corruptBufferForTest func(*os.File)
 }
 
 // EncodeResult is the public return value from EncodeSnapshot. Mirrors
@@ -150,26 +156,52 @@ func encodeStream(b *snapshotBuilder, opts EncodeOptions, enabled []string, out 
 	}, nil
 }
 
-// encodeBuffered is the SelfTest=true path: buffer, self-test against
-// buffer, copy to out only on match. Corruption hook (if set) fires
-// against the buffer between WriteTo and self-test so the self-test
-// sees the corruption but out never does (codex P2 v6 #896).
+// encodeBuffered is the SelfTest=true path: write the FSM to a temp
+// file on disk (NOT in memory — gemini high #904, OOM risk on large
+// snapshots), self-test by streaming the temp file through DecodeSnapshot,
+// copy to out only on match. The temp file is os.Remove'd via defer on
+// every exit path.
+//
+// Memory cost: O(1) — only the sha256 running state + read buffer for
+// the final io.Copy. Replaces the prior in-memory bytes.Buffer.
+//
+// Corruption hook (if set) fires against the temp file between WriteTo
+// and self-test so the self-test sees the corruption but out never does
+// (codex P2 v6 #896, codex P2 v7 #896).
 func encodeBuffered(b *snapshotBuilder, opts EncodeOptions, enabled []string, out io.Writer) (EncodeResult, error) {
-	var buf bytes.Buffer
-	bytesWritten, err := b.WriteTo(&buf)
+	tempFile, err := os.CreateTemp(opts.SelfTestDecodeOptions.OutRoot, "encode-self-test-fsm-")
+	if err != nil {
+		return EncodeResult{}, errors.Wrap(err, "create self-test temp file")
+	}
+	tempPath := tempFile.Name()
+	defer func() {
+		_ = tempFile.Close()
+		_ = os.Remove(tempPath)
+	}()
+
+	hasher := sha256.New()
+	tee := &teeWriter{w: tempFile, h: hasher}
+	bytesWritten, err := b.WriteTo(tee)
 	if err != nil {
 		return EncodeResult{}, errors.WithStack(err)
 	}
-	bufBytes := buf.Bytes()
+	if err := tempFile.Sync(); err != nil {
+		return EncodeResult{}, errors.Wrap(err, "fsync self-test temp file")
+	}
 	if opts.corruptBufferForTest != nil {
-		opts.corruptBufferForTest(bufBytes)
+		opts.corruptBufferForTest(tempFile)
+	}
+	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+		return EncodeResult{}, errors.Wrap(err, "seek self-test temp file")
 	}
 
-	header, mismatchTxt, matched, stErr := runSelfTest(bufBytes, opts)
+	header, mismatchTxt, matched, stErr := runSelfTest(tempFile, opts)
+	var sha [32]byte
+	copy(sha[:], hasher.Sum(nil))
 	result := EncodeResult{
 		Header:              header,
 		BytesWritten:        bytesWritten,
-		SHA256:              sha256.Sum256(bufBytes),
+		SHA256:              sha,
 		SelfTestRan:         true,
 		SelfTestMatched:     matched,
 		SelfTestMismatchTxt: mismatchTxt,
@@ -181,10 +213,32 @@ func encodeBuffered(b *snapshotBuilder, opts EncodeOptions, enabled []string, ou
 	if !matched {
 		return result, nil
 	}
-	if _, err := io.Copy(out, bytes.NewReader(bufBytes)); err != nil {
+	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+		return result, errors.Wrap(err, "rewind self-test temp file for copy")
+	}
+	if _, err := io.Copy(out, tempFile); err != nil {
 		return result, errors.Wrap(err, "copy buffered fsm to out")
 	}
 	return result, nil
+}
+
+// teeWriter tees writes into a hash.Hash + an underlying writer in a
+// single pass, avoiding a second read for the SHA-256 anchor that
+// ENCODE_INFO.json records.
+type teeWriter struct {
+	w io.Writer
+	h hash.Hash
+}
+
+func (t *teeWriter) Write(p []byte) (int, error) {
+	if _, err := t.h.Write(p); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	n, err := t.w.Write(p)
+	if err != nil {
+		return n, errors.WithStack(err)
+	}
+	return n, nil
 }
 
 // adapterRunner pairs an enabled-check with an Encode call, keeping
@@ -229,15 +283,18 @@ func runAdapterEncoders(b *snapshotBuilder, opts EncodeOptions) ([]string, error
 	return enabled, nil
 }
 
-// runSelfTest decodes fsmBytes into a unique scratch subdir, structurally
-// diffs against opts.InputRoot, and returns (header, mismatchTxt, matched,
-// err). matched=false with err=nil indicates a structural diff; matched=true
-// with err=nil indicates success. err is non-nil only on infrastructure
-// failure (mkdir, decoder error, walk error).
+// runSelfTest streams fsmFile through DecodeSnapshot into a unique
+// scratch subdir, structurally diffs against opts.InputRoot, and returns
+// (header, mismatchTxt, matched, err). matched=false with err=nil
+// indicates a structural diff; matched=true with err=nil indicates
+// success. err is non-nil only on infrastructure failure (mkdir, decoder
+// error, walk error).
 //
-// The scratch subdir is removed via defer regardless of outcome. The
-// caller cleans up <output>.mismatch.txt at the start of each run.
-func runSelfTest(fsmBytes []byte, opts EncodeOptions) (SnapshotHeader, []byte, bool, error) {
+// fsmFile is read from its current position (caller must Seek(0) before
+// calling). The scratch subdir is removed via defer regardless of
+// outcome. The caller cleans up <output>.mismatch.txt at the start of
+// each run.
+func runSelfTest(fsmFile io.Reader, opts EncodeOptions) (SnapshotHeader, []byte, bool, error) {
 	scratchBase := opts.SelfTestDecodeOptions.OutRoot
 	scratchDir, err := os.MkdirTemp(scratchBase, "encode-self-test-")
 	if err != nil {
@@ -250,7 +307,7 @@ func runSelfTest(fsmBytes []byte, opts EncodeOptions) (SnapshotHeader, []byte, b
 	decOpts := opts.SelfTestDecodeOptions
 	decOpts.OutRoot = scratchDir
 
-	result, derr := DecodeSnapshot(bytes.NewReader(fsmBytes), decOpts)
+	result, derr := DecodeSnapshot(fsmFile, decOpts)
 	if derr != nil {
 		// Decoder errored on our own output — that IS a self-test
 		// failure (the .fsm we produced isn't loadable). Surface as
@@ -313,51 +370,50 @@ func enabledAdapterSubdirs(adapters AdapterSet) []string {
 }
 
 // diffOneSubdir walks aDir + bDir in parallel, returning paths (prefixed
-// by relPrefix) that differ in presence or bytes. Missing-on-one-side is
-// a mismatch.
+// by relPrefix) that differ in presence, size, or bytes. Files are
+// compared by streaming reads (NOT by loading whole bytes into memory)
+// so a multi-GB S3 blob does not OOM the encoder (gemini high #904).
+// Missing-on-one-side is a mismatch.
 func diffOneSubdir(aDir, bDir, relPrefix string) ([]string, error) {
-	aFiles, aErr := walkRegularFiles(aDir)
+	aPaths, aErr := walkRegularFilePaths(aDir)
 	if aErr != nil && !errors.Is(aErr, os.ErrNotExist) {
 		return nil, errors.Wrapf(aErr, "walk input %s", aDir)
 	}
-	bFiles, bErr := walkRegularFiles(bDir)
+	bPaths, bErr := walkRegularFilePaths(bDir)
 	if bErr != nil && !errors.Is(bErr, os.ErrNotExist) {
 		return nil, errors.Wrapf(bErr, "walk scratch %s", bDir)
 	}
 
 	var diffs []string
-	aMap := map[string][]byte{}
-	for path, body := range aFiles {
-		aMap[path] = body
-	}
-	for path, bBody := range bFiles {
-		aBody, ok := aMap[path]
+	for relPath, bFull := range bPaths {
+		aFull, ok := aPaths[relPath]
 		if !ok {
-			diffs = append(diffs, relPrefix+"/"+path+" (missing in input)")
+			diffs = append(diffs, relPrefix+"/"+relPath+" (missing in input)")
 			continue
 		}
-		if !bytes.Equal(aBody, bBody) {
-			diffs = append(diffs, relPrefix+"/"+path+" (bytes differ)")
+		eq, derr := streamFilesEqual(aFull, bFull)
+		if derr != nil {
+			return nil, errors.Wrapf(derr, "compare %s vs %s", aFull, bFull)
 		}
-		delete(aMap, path)
+		if !eq {
+			diffs = append(diffs, relPrefix+"/"+relPath+" (bytes differ)")
+		}
+		delete(aPaths, relPath)
 	}
-	// Anything remaining in aMap is present in input but not in scratch.
-	remaining := make([]string, 0, len(aMap))
-	for path := range aMap {
-		remaining = append(remaining, relPrefix+"/"+path+" (missing in scratch)")
+	remaining := make([]string, 0, len(aPaths))
+	for relPath := range aPaths {
+		remaining = append(remaining, relPrefix+"/"+relPath+" (missing in scratch)")
 	}
 	sort.Strings(remaining)
-	diffs = append(diffs, remaining...)
-	return diffs, nil
+	return append(diffs, remaining...), nil
 }
 
-// walkRegularFiles returns a map of relative path -> file bytes for every
-// regular file under root. Missing root is the empty map + os.ErrNotExist.
-// Bounded by the per-adapter test fixtures the encoder runs against;
-// production-scale dumps may want streaming compare, deferred until a
-// real bottleneck shows up.
-func walkRegularFiles(root string) (map[string][]byte, error) {
-	out := map[string][]byte{}
+// walkRegularFilePaths returns a map of relative path → absolute path
+// for every regular file under root. Replaces walkRegularFiles which
+// eagerly read file bytes; this version only records paths so the diff
+// can stream-compare per file (gemini high #904).
+func walkRegularFilePaths(root string) (map[string]string, error) {
+	out := map[string]string{}
 	rootInfo, err := os.Stat(root)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -369,26 +425,85 @@ func walkRegularFiles(root string) (map[string][]byte, error) {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
+		if d.IsDir() || !d.Type().IsRegular() {
 			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		body, rerr := os.ReadFile(path) //nolint:gosec // walking a caller-provided root, regular files only
-		if rerr != nil {
-			return errors.Wrap(rerr, path)
 		}
 		rel, rerr := filepath.Rel(root, path)
 		if rerr != nil {
 			return errors.WithStack(rerr)
 		}
-		out[filepath.ToSlash(rel)] = body
+		out[filepath.ToSlash(rel)] = path
 		return nil
 	}); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return out, nil
+}
+
+// streamCmpBufSize is the per-file read buffer for the streaming
+// compare. 64 KiB matches Go's default bufio buffer and keeps the
+// allocation small relative to the modal adapter file size.
+const streamCmpBufSize = 64 * 1024
+
+// streamFilesEqual reports whether the contents at aPath and bPath are
+// byte-equal without loading either file fully into memory. A size
+// mismatch short-circuits. Used by diffOneSubdir to bound the
+// self-test's memory at O(streamCmpBufSize) per concurrent compare
+// (gemini high #904).
+func streamFilesEqual(aPath, bPath string) (bool, error) {
+	aSize, err := fileSize(aPath)
+	if err != nil {
+		return false, err
+	}
+	bSize, err := fileSize(bPath)
+	if err != nil {
+		return false, err
+	}
+	if aSize != bSize {
+		return false, nil
+	}
+	aFile, err := os.Open(aPath) //nolint:gosec // walking caller-provided dirs
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	defer func() { _ = aFile.Close() }()
+	bFile, err := os.Open(bPath) //nolint:gosec // walking caller-provided dirs
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	defer func() { _ = bFile.Close() }()
+	return streamReadersEqual(aFile, bFile)
+}
+
+func fileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return info.Size(), nil
+}
+
+// streamReadersEqual compares two readers of equal length chunk-by-chunk
+// and returns false on any difference, true on full match.
+func streamReadersEqual(a, b io.Reader) (bool, error) {
+	aBuf := make([]byte, streamCmpBufSize)
+	bBuf := make([]byte, streamCmpBufSize)
+	for {
+		an, aErr := io.ReadFull(a, aBuf)
+		bn, bErr := io.ReadFull(b, bBuf)
+		if an != bn || !bytes.Equal(aBuf[:an], bBuf[:bn]) {
+			return false, nil
+		}
+		if aErr == io.EOF || aErr == io.ErrUnexpectedEOF {
+			return true, nil
+		}
+		if aErr != nil {
+			return false, errors.WithStack(aErr)
+		}
+		if bErr != nil {
+			return false, errors.WithStack(bErr)
+		}
+	}
 }
 
 func formatHeaderMismatch(want, got uint64) string {

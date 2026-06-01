@@ -120,6 +120,35 @@ func TestEncodeSnapshotSelfTestMatchesInput(t *testing.T) {
 	}
 }
 
+// flipBytesPastHeaderHelper returns a corruption hook that flips bytes
+// every 13 bytes starting at offset 200 in the buffered self-test temp
+// file — far enough past the EKVPBBL1 header + lastCommitTS that the
+// decoder trips on a malformed entry length. Extracted from the test
+// body so the test body itself stays under the cyclop threshold.
+func flipBytesPastHeaderHelper(t *testing.T) func(*os.File) {
+	t.Helper()
+	return func(f *os.File) {
+		info, err := f.Stat()
+		if err != nil {
+			t.Fatalf("temp Stat: %v", err)
+		}
+		const headerSkip = 200
+		if info.Size() <= headerSkip {
+			t.Fatalf("temp file too small to corrupt past header: %d bytes", info.Size())
+		}
+		buf := make([]byte, info.Size()-headerSkip)
+		if _, err := f.ReadAt(buf, headerSkip); err != nil {
+			t.Fatalf("ReadAt: %v", err)
+		}
+		for i := 0; i < len(buf); i += 13 {
+			buf[i] ^= 0xFF
+		}
+		if _, err := f.WriteAt(buf, headerSkip); err != nil {
+			t.Fatalf("WriteAt: %v", err)
+		}
+	}
+}
+
 // TestEncodeSnapshotSelfTestDetectsCorruption pins that the unexported
 // corruptBufferForTest hook lets the self-test catch corruption in the
 // internal buffer. The corruption must be reachable by the self-test
@@ -138,14 +167,7 @@ func TestEncodeSnapshotSelfTestDetectsCorruption(t *testing.T) {
 
 	scratchBase := t.TempDir()
 	var out bytes.Buffer
-	// Corrupt every 13th byte deep inside the buffer — far enough past
-	// the header that the decoder will trip on the malformed entry
-	// length field.
-	corrupt := func(b []byte) {
-		for i := 200; i < len(b); i += 13 {
-			b[i] ^= 0xFF
-		}
-	}
+	corrupt := flipBytesPastHeaderHelper(t)
 	result, err := EncodeSnapshot(EncodeOptions{
 		InputRoot:    in,
 		Adapters:     AdapterSet{SQS: true},

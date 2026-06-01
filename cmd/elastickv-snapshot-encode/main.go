@@ -26,11 +26,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,10 +45,12 @@ const (
 	exitUserErr = 1
 	exitDataErr = 2
 	// tempSuffixHexLen is the hex-character length of the random
-	// suffix appended to <output>.tmp-<hex>; 8 hex chars = 4 bytes of
-	// entropy, which gives ~4×10^9 collision space per --output path
-	// (more than enough for concurrent encodes against the same path).
-	tempSuffixHexLen   = 8
+	// suffix appended to <output>.tmp-<hex>; 16 hex chars = 8 bytes of
+	// entropy = 2^64 collision space per --output path. The earlier
+	// 8-hex/4-byte form was flagged as collision-prone in highly
+	// concurrent CI environments (gemini medium #904); 8 bytes is the
+	// same width crypto/rand.Read pads cryptographic nonces to.
+	tempSuffixHexLen   = 16
 	tempSuffixByteLen  = tempSuffixHexLen / 2
 	mismatchTxtPerm    = 0o600
 	encodeInfoFilePerm = 0o600
@@ -144,21 +146,31 @@ func parseFlags(argv []string) (*config, error) {
 }
 
 // parseLastCommitTS parses --last-commit-ts as a uint64. Hex (0x prefix)
-// or decimal accepted. Negative or out-of-range surfaces as exit-1
-// (flag-parse error); the semantic check (T >= manifest) is exit-2.
+// or decimal accepted. Uses strconv.ParseUint strict parsing so trailing
+// garbage is rejected — fmt.Sscanf would silently accept "0xffZZ" as
+// 0xff and "100oops" as 100, which becomes a snapshot HLC ceiling that
+// silently disagrees with what the operator typed (claude high #904,
+// codex P2 #904). Negative or out-of-range surfaces as exit-1; the
+// semantic check (T >= manifest) is exit-2.
 func parseLastCommitTS(raw string) (uint64, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
 		return 0, errors.New("--last-commit-ts is empty")
 	}
-	var ts uint64
+	const (
+		base16     = 16
+		base10     = 10
+		uint64Bits = 64
+	)
 	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		if _, err := fmt.Sscanf(s[2:], "%x", &ts); err != nil {
+		ts, err := strconv.ParseUint(s[2:], base16, uint64Bits)
+		if err != nil {
 			return 0, errors.Wrap(err, "--last-commit-ts hex parse")
 		}
 		return ts, nil
 	}
-	if _, err := fmt.Sscanf(s, "%d", &ts); err != nil {
+	ts, err := strconv.ParseUint(s, base10, uint64Bits)
+	if err != nil {
 		return 0, errors.Wrap(err, "--last-commit-ts decimal parse")
 	}
 	return ts, nil
@@ -166,7 +178,12 @@ func parseLastCommitTS(raw string) (uint64, error) {
 
 // parseAdapterSet decodes a comma-separated adapter list (or "all").
 // Mirrors the decoder's parser so a typo cannot silently disable an
-// adapter. Unknown name → exit-1.
+// adapter. Unknown name → exit-1. A CSV that contains only separators
+// or whitespace (e.g. `--adapter ' ,'`) is also rejected — without this
+// guard a templated argument that expands to spaces would yield a
+// zero AdapterSet and the encoder would publish a valid header-only
+// .fsm (no adapters invoked), turning a bad argument into a silent
+// empty restore artifact (codex P2 #904).
 func parseAdapterSet(csv string) (backup.AdapterSet, error) {
 	if csv == "" || csv == "all" {
 		return backup.AdapterSet{DynamoDB: true, S3: true, Redis: true, SQS: true}, nil
@@ -174,22 +191,36 @@ func parseAdapterSet(csv string) (backup.AdapterSet, error) {
 	var set backup.AdapterSet
 	for _, raw := range strings.Split(csv, ",") {
 		name := strings.TrimSpace(strings.ToLower(raw))
-		switch name {
-		case "dynamodb":
-			set.DynamoDB = true
-		case "s3":
-			set.S3 = true
-		case "redis":
-			set.Redis = true
-		case "sqs":
-			set.SQS = true
-		case "":
+		if name == "" {
 			continue
-		default:
-			return backup.AdapterSet{}, errors.Errorf("unknown adapter %q", name)
+		}
+		if err := applyAdapterName(name, &set); err != nil {
+			return backup.AdapterSet{}, err
 		}
 	}
+	if !set.DynamoDB && !set.S3 && !set.Redis && !set.SQS {
+		return backup.AdapterSet{}, errors.Errorf("--adapter %q selects no adapters; use \"all\" or a comma-separated subset", csv)
+	}
 	return set, nil
+}
+
+// applyAdapterName sets the bit on s for one normalized adapter name,
+// or returns an unknown-name error. Split out so parseAdapterSet stays
+// under the cyclop threshold.
+func applyAdapterName(name string, s *backup.AdapterSet) error {
+	switch name {
+	case "dynamodb":
+		s.DynamoDB = true
+	case "s3":
+		s.S3 = true
+	case "redis":
+		s.Redis = true
+	case "sqs":
+		s.SQS = true
+	default:
+		return errors.Errorf("unknown adapter %q", name)
+	}
+	return nil
 }
 
 // errSelfTestMismatch is a typed sentinel so run() can map self-test diffs

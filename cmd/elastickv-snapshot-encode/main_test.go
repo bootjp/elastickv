@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
@@ -327,7 +326,8 @@ func TestCLISelfTestFailureLeavesNoFsmAtOutputPath(t *testing.T) {
 }
 
 // TestParseLastCommitTSDecimal + Hex pin both representations the
-// --last-commit-ts flag accepts.
+// --last-commit-ts flag accepts, and verify strict-parse rejection of
+// trailing junk (claude high #904, codex P2 #904).
 func TestParseLastCommitTS(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -348,15 +348,44 @@ func TestParseLastCommitTS(t *testing.T) {
 			t.Errorf("%q: got %d want %d", tc.in, got, tc.want)
 		}
 	}
-	// Reject empty and malformed.
-	for _, bad := range []string{"", "abc", "0xZZ"} {
+	// Reject empty, malformed, and trailing junk.
+	for _, bad := range []string{
+		"",
+		"abc",
+		"0xZZ",
+		"0xffZZ",   // trailing hex garbage — fmt.Sscanf would accept as 0xff
+		"100oops",  // trailing decimal garbage — fmt.Sscanf would accept as 100
+		"-1",       // negative
+		" 100 ext", // whitespace + extra
+	} {
 		if _, err := parseLastCommitTS(bad); err == nil {
 			t.Errorf("%q parsed successfully; want error", bad)
 		}
 	}
 }
 
-// Helper to silence "unused strconv" if a future edit drops its only
-// use — kept here as the canonical numeric test pin. Strconv is used
-// implicitly in subtests via tc.argTS.
-var _ = strconv.FormatUint
+// TestParseAdapterSetRejectsEmptySelection pins codex P2 #904: a CSV
+// of only separators/whitespace MUST surface as a flag-parse error, not
+// silently produce a zero AdapterSet that would publish a header-only
+// .fsm.
+func TestParseAdapterSetRejectsEmptySelection(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []string{
+		" ,",
+		",,,",
+		"   ",
+		",",
+	} {
+		if _, err := parseAdapterSet(bad); err == nil {
+			t.Errorf("--adapter %q parsed to a non-empty set; want error", bad)
+		}
+	}
+	// Single-adapter selection still works.
+	set, err := parseAdapterSet("s3")
+	if err != nil {
+		t.Fatalf("--adapter s3: %v", err)
+	}
+	if !set.S3 || set.Redis || set.DynamoDB || set.SQS {
+		t.Errorf("--adapter s3 produced %+v, want only S3", set)
+	}
+}
