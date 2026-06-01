@@ -826,11 +826,17 @@ func advanceRaftAppliedIndex(sc *Sidecar, raftIdx uint64) {
 //   - RotateSubEnableStorageEnvelope — one-shot storage-layer
 //     cutover (Stage 6D-4). Flips StorageEnvelopeActive and records
 //     StorageEnvelopeCutoverIndex inside a single sidecar fsync.
+//   - RotateSubEnableRaftEnvelope — one-shot raft-layer cutover
+//     (Stage 6E-1). Records RaftEnvelopeCutoverIndex inside a
+//     single sidecar fsync. The engine apply-hook installed by
+//     6E-2 dispatches `entry.Index > sidecar.RaftEnvelopeCutoverIndex`
+//     through the unwrap path; strict `>` makes the cutover entry
+//     itself (at index == cutover) flow through unwrap-free, which
+//     is the chicken/egg bootstrap.
 //
-// Other sub-tags (rewrap-deks, retire-dek, enable-raft-envelope)
-// land in later stages and return ErrEncryptionApply so the
-// HaltApply seam fires on an unrecognised sub-tag rather than
-// silently advancing setApplied.
+// Other sub-tags (rewrap-deks, retire-dek) land in later stages
+// and return ErrEncryptionApply so the HaltApply seam fires on an
+// unrecognised sub-tag rather than silently advancing setApplied.
 //
 // Same WithKEK / WithKeystore / WithSidecarPath trio requirement
 // as ApplyBootstrap; partial wiring returns ErrKEKNotConfigured
@@ -844,6 +850,8 @@ func (a *Applier) ApplyRotation(raftIdx uint64, p fsmwire.RotationPayload) error
 		return a.applyRotateDEK(raftIdx, p)
 	case fsmwire.RotateSubEnableStorageEnvelope:
 		return a.applyEnableStorageEnvelope(raftIdx, p)
+	case fsmwire.RotateSubEnableRaftEnvelope:
+		return a.applyEnableRaftEnvelope(raftIdx, p)
 	default:
 		return errors.Wrapf(ErrEncryptionApply,
 			"applier: rotation sub_tag %#x not recognised", p.SubTag)
@@ -1042,6 +1050,126 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	advanceRaftAppliedIndex(sc, raftIdx)
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for cutover")
+	}
+	a.stateCache.RefreshFromSidecar(sc)
+	return nil
+}
+
+// validateEnableRaftEnvelopePayload enforces the Stage 6E-1
+// payload-shape constraints that do NOT require sidecar state
+// (purpose, empty-Wrapped, proposer-DEK pinning). The shape
+// mirrors validateEnableStorageEnvelopePayload but targets the
+// raft slot:
+//
+//   - Purpose MUST be PurposeRaft
+//   - Wrapped MUST be empty (length-based check, NOT == nil; the
+//     wire decoder materialises zero-length payloads as
+//     allocated empty slices)
+//   - ProposerRegistration.DEKID MUST equal payload DEKID
+//
+// Sidecar-derived constraints (#3 stale DEKID, #4 idempotency)
+// live in the caller so the no-op vs. fresh-success branches
+// can read the sidecar exactly once.
+func validateEnableRaftEnvelopePayload(p fsmwire.RotationPayload) error {
+	if p.Purpose != fsmwire.PurposeRaft {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-raft-envelope must carry Purpose=PurposeRaft, got %#x", byte(p.Purpose))
+	}
+	if len(p.Wrapped) != 0 {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-raft-envelope must carry empty Wrapped, got %d bytes", len(p.Wrapped))
+	}
+	if p.ProposerRegistration.DEKID != p.DEKID {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-raft-envelope proposer_registration.dek_id=%d does not match rotation dek_id=%d",
+			p.ProposerRegistration.DEKID, p.DEKID)
+	}
+	return nil
+}
+
+// applyEnableRaftEnvelope handles the RotateSubEnableRaftEnvelope
+// variant (Stage 6E-1 §3.1): the one-shot raft-layer cutover.
+// Structural mirror of applyEnableStorageEnvelope; the differences
+// from the storage variant are:
+//
+//   - Compares DEKID against sidecar.Active.Raft (not .Storage).
+//   - Records the cutover via sidecar.RaftEnvelopeCutoverIndex (a
+//     uint64 index — non-zero means "Phase-2 active"), as opposed
+//     to a separate bool flag. The same field doubles as the
+//     idempotency token for replay (constraint #4).
+//   - The proposer-registration row registers against the active
+//     raft DEK (PurposeRaft), not the storage DEK. The §4.1
+//     writer-registry layout is per-(DEK_id, NodeID) so storage
+//     and raft registrations are independent rows.
+//
+// Outcomes and FSM-level treatment match the storage variant:
+//
+//   - Malformed payload — halt-apply via ErrEncryptionApply.
+//   - Stale DEKID (RotateDEK raced between propose and apply) —
+//     benign no-op, advance RaftAppliedIndex only.
+//   - Already active (duplicate cutover entry) — idempotent;
+//     preserve original RaftEnvelopeCutoverIndex, advance
+//     RaftAppliedIndex only.
+//   - Fresh success — register proposer FIRST, then set
+//     RaftEnvelopeCutoverIndex and advance RaftAppliedIndex
+//     inside one WriteSidecar fsync. The registration-before-
+//     sidecar ordering matches the storage variant's
+//     crash-recovery invariant (§4.1 case 2-idempotent re-runs
+//     are safe; the sidecar flip is the last observable
+//     side-effect).
+//
+// Stage 6E-1 deliberately does NOT activate the §6.3 engine
+// apply-hook unwrap or the coordinator wrap-on-propose switch
+// — those land atomically in 6E-2. With only 6E-1 deployed, the
+// sidecar cutover advances on apply but no entry is wrapped or
+// unwrapped, so the apply is operator-inert (matches the design
+// doc's "no behavior change" guarantee for 6E-1).
+func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayload) error {
+	if err := validateEnableRaftEnvelopePayload(p); err != nil {
+		return err
+	}
+	sc, err := ReadSidecar(a.sidecarPath)
+	if err != nil {
+		return errors.Wrap(err, "applier: read sidecar for enable-raft-envelope")
+	}
+	// Stage 6E-1 constraint #3 — DEKID stale at apply (RotateDEK
+	// raced). Benign no-op: consume the entry without halting
+	// and without flipping the cutover field.
+	if p.DEKID != sc.Active.Raft {
+		advanceRaftAppliedIndex(sc, raftIdx)
+		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+			return errors.Wrap(err, "applier: write sidecar for stale-dekid raft-cutover no-op")
+		}
+		return nil
+	}
+	// Stage 6E-1 constraint #4 — idempotency. Preserve the
+	// original RaftEnvelopeCutoverIndex; only advance the generic
+	// RaftAppliedIndex so the duplicate entry is not replayed.
+	// Non-zero RaftEnvelopeCutoverIndex IS the "already-active"
+	// signal (no separate bool flag).
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		advanceRaftAppliedIndex(sc, raftIdx)
+		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+			return errors.Wrap(err, "applier: write sidecar for already-active raft-cutover no-op")
+		}
+		return nil
+	}
+	// Fresh successful apply. Crash-recovery ordering follows
+	// the storage variant: ApplyRegistration runs BEFORE
+	// WriteSidecar so the cutover sidecar write is the last
+	// observable side effect. If the process crashes between the
+	// registration insert and the sidecar write, on restart the
+	// sidecar is still pre-cutover (RaftEnvelopeCutoverIndex ==
+	// 0), FSM replay re-enters this branch, ApplyRegistration
+	// re-runs and hits §4.1 case 2-idempotent (no-op), then
+	// WriteSidecar lands cleanly.
+	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
+		return errors.Wrap(err, "applier: raft-cutover proposer-registration insert")
+	}
+	sc.RaftEnvelopeCutoverIndex = raftIdx
+	advanceRaftAppliedIndex(sc, raftIdx)
+	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+		return errors.Wrap(err, "applier: write sidecar for raft cutover")
 	}
 	a.stateCache.RefreshFromSidecar(sc)
 	return nil
