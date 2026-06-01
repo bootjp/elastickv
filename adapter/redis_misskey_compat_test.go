@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -43,8 +44,15 @@ func TestRedis_MisskeyConnectionCompatibility(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, pttl, time.Duration(0))
 
-	time.Sleep(1100 * time.Millisecond)
-	require.ErrorIs(t, rdb.Get(ctx, "lock:ap-object").Err(), redis.Nil)
+	// The "lock:ap-object" key was just SET with EX 1 (1-second TTL).
+	// Wait for it to expire via the deadline-multiplier helper rather
+	// than a fixed time.Sleep — the previous Sleep(1100ms) raced CI
+	// scheduler jitter on slow runners (the post-sleep GET could fire
+	// before the TTL had actually been processed by the sweeper).
+	const lockTTL = 1 * time.Second
+	eventuallyExpired(t, lockTTL, func() bool {
+		return errors.Is(rdb.Get(ctx, "lock:ap-object").Err(), redis.Nil)
+	}, "lock:ap-object must be gone after its 1-second EX TTL")
 }
 
 func TestRedis_MisskeyPubSubCompatibility(t *testing.T) {

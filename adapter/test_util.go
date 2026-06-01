@@ -707,6 +707,41 @@ func isTransientNotLeaderErr(err error) bool {
 	return strings.Contains(s, "not leader") || strings.Contains(s, "leader not found")
 }
 
+// === TTL-expiry deadline-multiplier helper =============================
+//
+// Redis TTL tests that "set a short TTL, sleep past it, assert the key is
+// gone" race their own wall clock under -race on slow CI runners. The
+// inter-call pause (typically 50–150 ms above the TTL) does not absorb
+// scheduler jitter that can push the post-sleep read past the TTL window
+// itself, so the read sometimes observes a refilled/un-expired view and
+// the test fails with "expected redis.Nil, got <value>". PR #818
+// (TestRedis_ExpiredKey_BecomesInvisible) fixed one instance by switching
+// to require.Eventually with a TTL-derived deadline. eventuallyExpired
+// generalises that pattern for any TTL-expiry condition.
+//
+// Use this helper in any new test of the form:
+//
+//	require.NoError(t, rdb.PExpire(ctx, key, ttl).Err())
+//	eventuallyExpired(t, ttl, func() bool {
+//	    _, err := rdb.<Op>(ctx, key, ...).Result()
+//	    return errors.Is(err, redis.Nil)
+//	}, "key must be gone after TTL")
+//
+// instead of `time.Sleep(ttl + N*time.Millisecond)` followed by a single
+// assertion. The deadline = ttl + 3 s gives generous CI headroom; the
+// 25 ms poll cadence matches waitForStableLeader so flake patterns stay
+// uniform across the file.
+func eventuallyExpired(t *testing.T, ttl time.Duration, condition func() bool, msg string) {
+	t.Helper()
+	// Deadline = ttl + ttlExpiryHeadroom; poll cadence matches the
+	// stability-window sampler in waitForStableLeader.
+	const (
+		ttlExpiryHeadroom = 3 * time.Second
+		ttlExpiryPoll     = 25 * time.Millisecond
+	)
+	require.Eventually(t, condition, ttl+ttlExpiryHeadroom, ttlExpiryPoll, msg)
+}
+
 // doEventually retries do() while it returns a transient "not leader" error,
 // giving the cluster a few seconds to re-settle leadership after startup.
 // Non-"not leader" errors fail the test immediately.
