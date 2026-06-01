@@ -214,16 +214,13 @@ func (e *Engine) SnapshotAt(v uint64) (RouteHistorySnapshot, bool) {
 // avoid interleaving surprises around the eviction watermark, but
 // the write itself is lock-protected (e.mu.Lock below) so it is
 // safe to call from any goroutine that does not also expect a
-// consistent SnapshotAt view across the depth change.  Exists so
-// tests in the kv package can drive eviction-trigger scenarios
-// without adding a constructor option just for tests (claude
-// review on PR #894).
+// consistent SnapshotAt view across the depth change.
 //
-// Production code must use DefaultRouteHistoryDepth (32) or a
-// future operator-exposed config knob; this seam is build-time
-// equivalent to direct field access and exists ONLY so tests in
-// the kv package can drive eviction-trigger scenarios without
-// adding a constructor option just for tests.
+// Exists so tests in the kv package can drive eviction-trigger
+// scenarios without adding a constructor option just for tests
+// (claude review on PR #894).  Production code must use
+// DefaultRouteHistoryDepth (32) or a future operator-exposed
+// config knob.
 //
 // Fails fast on depth <= 0 (coderabbit minor on PR #895):
 // recordHistorySnapshotLocked's eviction path indexes
