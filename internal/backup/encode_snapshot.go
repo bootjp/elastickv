@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -49,11 +50,15 @@ type EncodeOptions struct {
 	// header and every key's invTS = ^T. Callers pass manifest.last_commit_ts
 	// by default and the --last-commit-ts override otherwise.
 	LastCommitTS uint64
-	// SelfTest enables the round-trip self-test. EncodeSnapshot buffers
-	// the FSM in *bytes.Buffer, decodes from the buffer, and copies to
-	// the caller's io.Writer only if the buffer survives DecodeSnapshot
-	// (i.e. the bytes the encoder produced are loadable). When false,
-	// the FSM streams straight to the writer with no extra buffering.
+	// SelfTest enables the round-trip self-test. When true,
+	// EncodeSnapshot writes the FSM to an on-disk temp file under
+	// SelfTestDecodeOptions.OutRoot (encode-self-test-fsm-*), streams
+	// it through DecodeSnapshot, and copies to the caller's io.Writer
+	// ONLY if the decode survives — i.e. the bytes the encoder
+	// produced are loadable. When false, the FSM streams straight to
+	// the writer with no extra buffering. Memory cost in self-test
+	// mode is O(1) on top of the sort working set (the temp file
+	// holds the snapshot; only a small streaming buffer is in RAM).
 	SelfTest bool
 	// SelfTestDecodeOptions are threaded into the scratch DecodeSnapshot
 	// call. The CLI reads MANIFEST.json's Exclusions + DynamoDBLayout
@@ -88,7 +93,8 @@ type EncodeResult struct {
 	// BytesWritten is the number of bytes written to the caller's
 	// io.Writer (the SHA256-anchored payload).
 	BytesWritten int64
-	// SHA256 of the produced .fsm (lowercase hex via SHA256Hex).
+	// SHA256 of the produced .fsm bytes (raw 32-byte digest; the CLI
+	// hex-encodes it via encoding/hex when writing ENCODE_INFO.json).
 	SHA256 [32]byte
 	// SelfTestRan is true iff opts.SelfTest was true AND the encoder
 	// ran (i.e. no earlier per-adapter error short-circuited).
@@ -105,15 +111,24 @@ type EncodeResult struct {
 }
 
 // EncodeSnapshot reads the directory tree at opts.InputRoot, invokes the
-// enabled per-adapter encoders in canonicalAdapterFanOutOrder, optionally
-// runs the round-trip self-test against the in-memory buffer, and writes
-// the .fsm bytes to out. The .fsm bytes are NOT returned; they go to out.
+// enabled per-adapter encoders in canonical fan-out order, optionally
+// runs the round-trip self-test, and writes the .fsm bytes to out.
+// The .fsm bytes are NOT returned; they go to out.
 //
-// When opts.SelfTest=false the FSM streams straight to out with no extra
-// buffering. When opts.SelfTest=true an internal *bytes.Buffer holds the
-// FSM during the self-test; bytes are copied to out only after the
-// self-test matches. Memory cost in self-test mode is one FSM-sized
-// allocation on top of the existing sort working set.
+// When opts.SelfTest=false the FSM streams straight to out with a
+// sha256 tee and no extra buffering. When opts.SelfTest=true the FSM
+// is written to an on-disk temp file (encode-self-test-fsm-*) under
+// opts.SelfTestDecodeOptions.OutRoot, the file is streamed through
+// DecodeSnapshot, and bytes are copied to out ONLY if the decode
+// survives. Memory cost in self-test mode is O(1) on top of the
+// sort working set (gemini high #904 — the earlier *bytes.Buffer
+// version would OOM on multi-GB snapshots).
+//
+// Self-test failure returns (result, nil) with result.SelfTestMatched
+// == false and result.SelfTestMismatchTxt populated. Callers MUST
+// check result.SelfTestMatched before treating a nil error as success.
+// The CLI relies on this contract to write mismatch.txt + exit 2;
+// library callers should follow the same pattern.
 //
 // Returns ErrSelfTestLowerLastCommitTS when opts.LastCommitTS is below
 // the manifest's value — caller is responsible for reading the manifest
@@ -348,7 +363,7 @@ func diffAdapterTrees(inputRoot, scratchRoot string, adapters AdapterSet) ([]str
 		diffs = append(diffs, paths...)
 		if len(diffs) >= selfTestMaxMismatchPaths {
 			diffs = diffs[:selfTestMaxMismatchPaths]
-			diffs = append(diffs, "... (truncated; first "+itoa(selfTestMaxMismatchPaths)+" paths shown)")
+			diffs = append(diffs, "... (truncated; first "+strconv.Itoa(selfTestMaxMismatchPaths)+" paths shown)")
 			return diffs, nil
 		}
 	}
@@ -373,7 +388,9 @@ func enabledAdapterSubdirs(adapters AdapterSet) []string {
 // by relPrefix) that differ in presence, size, or bytes. Files are
 // compared by streaming reads (NOT by loading whole bytes into memory)
 // so a multi-GB S3 blob does not OOM the encoder (gemini high #904).
-// Missing-on-one-side is a mismatch.
+// Missing-on-one-side is a mismatch. The returned diffs are sorted
+// alphabetically so mismatch.txt is deterministic across runs with
+// identical inputs (claude v2 carry-over observation #904).
 func diffOneSubdir(aDir, bDir, relPrefix string) ([]string, error) {
 	aPaths, aErr := walkRegularFilePaths(aDir)
 	if aErr != nil && !errors.Is(aErr, os.ErrNotExist) {
@@ -400,12 +417,11 @@ func diffOneSubdir(aDir, bDir, relPrefix string) ([]string, error) {
 		}
 		delete(aPaths, relPath)
 	}
-	remaining := make([]string, 0, len(aPaths))
 	for relPath := range aPaths {
-		remaining = append(remaining, relPrefix+"/"+relPath+" (missing in scratch)")
+		diffs = append(diffs, relPrefix+"/"+relPath+" (missing in scratch)")
 	}
-	sort.Strings(remaining)
-	return append(diffs, remaining...), nil
+	sort.Strings(diffs)
+	return diffs, nil
 }
 
 // walkRegularFilePaths returns a map of relative path → absolute path
@@ -507,33 +523,11 @@ func streamReadersEqual(a, b io.Reader) (bool, error) {
 }
 
 func formatHeaderMismatch(want, got uint64) string {
-	return "self-test failed: header.LastCommitTS mismatch (want " + uitoa(want) + ", got " + uitoa(got) + ")\n"
-}
-
-// uitoaCap is the max decimal length of a uint64 (math.MaxUint64 has
-// 20 digits). Constant so the cap is documented and lint-clean.
-const uitoaCap = 20
-
-func uitoa(v uint64) string {
-	if v == 0 {
-		return "0"
-	}
-	buf := make([]byte, 0, uitoaCap)
-	for v > 0 {
-		buf = append(buf, byte('0'+v%10))
-		v /= 10
-	}
-	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
-		buf[i], buf[j] = buf[j], buf[i]
-	}
-	return string(buf)
-}
-
-func itoa(v int) string {
-	if v < 0 {
-		return "-" + uitoa(uint64(-v))
-	}
-	return uitoa(uint64(v))
+	return "self-test failed: header.LastCommitTS mismatch (want " +
+		strconv.FormatUint(want, 10) +
+		", got " +
+		strconv.FormatUint(got, 10) +
+		")\n"
 }
 
 // sha256Writer wraps an io.Writer and tees every byte into a SHA-256
@@ -541,16 +535,7 @@ func itoa(v int) string {
 // without an extra buffer-pass. Used in the no-self-test streaming path.
 type sha256Writer struct {
 	w io.Writer
-	h sha256w
-}
-
-type sha256w = hashSHA256
-
-// hashSHA256 is an interface alias so we can satisfy the tiny hash.Hash
-// surface (Write + Sum32) without importing hash explicitly.
-type hashSHA256 interface {
-	io.Writer
-	Sum(b []byte) []byte
+	h hash.Hash
 }
 
 func newSHA256Writer(w io.Writer) *sha256Writer {
