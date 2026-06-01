@@ -565,14 +565,35 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		// so the retry would run with StartTS=0 — violating MVCC
 		// invariants (gemini HIGH on PR #900).
 		reqs.CommitTS = 0
-		// Drop the option-2 dedup probe.  The M3 gate fired at apply
-		// time, so the ORIGINAL attempt never committed — there is no
-		// prior landing for PrevCommitTS to dedup against on this
-		// retry.  Leaving it set would let dispatchMultiShardTxn:736
-		// short-circuit with ErrTxnDedupRequiresSingleShard if the
-		// post-shift catalog now reroutes this txn to span two groups
-		// (claude[bot] medium, 3rd review round on PR #900).
-		reqs.PrevCommitTS = 0
+		// IMPORTANT — do NOT clear reqs.PrevCommitTS here.  An earlier
+		// round of this PR did (taking claude[bot]'s reasoning at face
+		// value: "M3 fired at apply time, so the original attempt never
+		// committed → probe is stale").  That reasoning conflates two
+		// different "original attempts" and is wrong (codex P1 on
+		// 43c55dfe, PR #900):
+		//
+		//   * Within M4: attempt 1's M3 rejection does prove attempt 1
+		//     did not write anything (the FSM rejects before any state
+		//     change).
+		//   * Across adapter retries: PrevCommitTS names the
+		//     ADAPTER'S prior attempt (e.g. adapter/redis.go:3209,
+		//     :3615 send PrevCommitTS = pending.commitTS as the
+		//     option-2 ambiguous-outcome probe).  That earlier
+		//     attempt may have actually landed at the named commitTS
+		//     before the route shift that triggered our M3 sentinel.
+		//
+		// Dropping the probe in the retry would let the FSM re-apply
+		// the writes against the post-shift route, double-writing the
+		// caller's at-most-once-payload if the named prior attempt did
+		// land.  Preserving it has the cost that
+		// dispatchMultiShardTxn:749 surfaces
+		// ErrTxnDedupRequiresSingleShard when the post-shift route now
+		// spans multiple groups — which IS the faithful signal: the
+		// adapter's at-most-once retry contract cannot be transparently
+		// honoured across a shard split, and the caller must reckon
+		// with the ambiguity at a higher level (re-read, re-execute,
+		// abort).  Surfacing that error is strictly safer than silently
+		// losing dedup.
 		startTS, allocErr := c.nextStartTS(ctx, reqs.Elems)
 		if allocErr != nil {
 			// resp here is the failed first attempt's response (always

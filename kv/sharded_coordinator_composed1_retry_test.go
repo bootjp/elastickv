@@ -370,24 +370,39 @@ func TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForReadWriteTxn(t 
 		"read-write txns with unset ObservedRouteVersion must NOT be auto-pinned at Dispatch entry — pinning at commit time disagrees with the reads' actual snapshot version, so verifyComposed1 must short-circuit (observedVer=0) until the caller migrates to pin at BeginTxn per §4.1")
 }
 
-// TestShardedCoordinator_ClearsPrevCommitTSOnComposed1Retry verifies
-// that the M4 retry path zeros OperationGroup.PrevCommitTS before
-// the second dispatchTxn call.  Rationale (claude[bot] medium on
-// PR #900): the M3 gate fires at apply time, so the ORIGINAL attempt
-// never committed — there is no prior landing for PrevCommitTS to
-// dedup against on the retry.  If the retry kept the caller's
-// PrevCommitTS non-zero AND the post-shift catalog reroutes the txn
-// to span two groups, dispatchMultiShardTxn would short-circuit with
-// ErrTxnDedupRequiresSingleShard (kv/sharded_coordinator.go:736) on a
-// signal that no longer holds, surfacing a misleading error to the
-// caller instead of a correct re-route.  The contract is: on
-// Composed-1 retry, drop the dedup probe — the FSM's option-2
-// idempotency check has nothing valid to compare against.
+// TestShardedCoordinator_PreservesPrevCommitTSOnComposed1Retry pins
+// the at-most-once correctness contract: the M4 retry path MUST keep
+// OperationGroup.PrevCommitTS intact across attempts.
 //
-// This is a write-only txn (no ReadKeys); the M4 retry is allowed
-// (per the gemini-CRITICAL gate already in place) and PrevCommitTS
-// is the option-2 dedup probe the adapter set on the first attempt.
-func TestShardedCoordinator_ClearsPrevCommitTSOnComposed1Retry(t *testing.T) {
+// Earlier in this PR the retry path cleared PrevCommitTS in the
+// retry block (taking claude[bot]'s reasoning at face value: "M3
+// fired at apply time → original attempt never committed → probe is
+// stale").  codex P1 on 43c55dfe correctly identified that this
+// conflates two different "original attempts":
+//
+//   - Within M4: attempt 1's M3 rejection proves attempt 1 wrote
+//     nothing (the FSM rejects before any state change).
+//   - Across adapter retries: PrevCommitTS names the ADAPTER'S prior
+//     attempt — see adapter/redis.go list-push reuse path that sends
+//     PrevCommitTS = pending.commitTS as the option-2 ambiguous-outcome
+//     probe.  That earlier attempt may have actually LANDED at the
+//     named commitTS before the route shift that triggered our M3
+//     sentinel.
+//
+// Dropping the probe in the retry would let the FSM re-apply the
+// writes against the post-shift route, double-writing the caller's
+// at-most-once-payload if the named prior attempt did land.
+// Preserving the probe is the safe behaviour even at the cost of
+// dispatchMultiShardTxn:749 surfacing ErrTxnDedupRequiresSingleShard
+// in the post-shift-multi-shard case — that error IS the faithful
+// signal that the adapter's at-most-once retry contract cannot be
+// transparently honoured across a shard split.
+//
+// This test uses a single-shard fixture (one route, one ShardGroup)
+// so the second attempt succeeds in the stub; the assertion is on
+// the bytes that reach Commit, which is what the FSM actually
+// reads.
+func TestShardedCoordinator_PreservesPrevCommitTSOnComposed1Retry(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -419,6 +434,6 @@ func TestShardedCoordinator_ClearsPrevCommitTSOnComposed1Retry(t *testing.T) {
 		"both attempts must be observed for the PrevCommitTS comparison")
 	require.Equal(t, uint64(17), txn.prevCommitTSSeen[0],
 		"first attempt must carry the caller's PrevCommitTS unchanged — that is the option-2 dedup probe semantics")
-	require.Equal(t, uint64(0), txn.prevCommitTSSeen[1],
-		"second attempt must drop PrevCommitTS — the M3 gate fired at apply time so the original attempt never committed; leaving the probe set would let dispatchMultiShardTxn return ErrTxnDedupRequiresSingleShard on a stale signal if the retry's groupMutations now spans two groups")
+	require.Equal(t, uint64(17), txn.prevCommitTSSeen[1],
+		"second attempt must ALSO carry PrevCommitTS=17 — the M3 gate only proves attempt 1 did not write; it tells us nothing about the ADAPTER's prior attempt (whose commitTS the probe names), so dropping the probe would double-write the caller's at-most-once payload if that prior attempt landed (codex P1 on 43c55dfe)")
 }
