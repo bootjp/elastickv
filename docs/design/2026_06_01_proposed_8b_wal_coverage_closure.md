@@ -30,23 +30,42 @@ This slice consolidates the analysis, affirms the existing decision, and closes 
 After Stage 6E ships (open at the time of this writing), every Raft entry's payload — the `Data []byte` carried inside the proposal envelope — is AEAD-wrapped under the cluster's `dek_raft`. The etcd-raft WAL stores those entries verbatim, so the WAL file contents look like:
 
 ```text
-+-------------------------------------------------+
-| WAL record framing (cleartext, etcd-raft owned) |
-|   - CRC, type, length                           |
-+-------------------------------------------------+
-| Raft entry framing (cleartext)                  |
-|   - term, index, type, conf-change marker       |
-+-------------------------------------------------+
-| Proposal envelope header (cleartext)            |
-|   - version byte (0x01), proposal ID (8B)       |
-+-------------------------------------------------+
-| Payload (CIPHERTEXT post-cutover, §4.2)         |
-|   - AEAD-wrapped FSM request                    |
-|   - protobuf-encoded operations, keys, values   |
-+-------------------------------------------------+
++-----------------------------------------------------+
+| WAL record framing (cleartext, etcd-raft owned)     |
+|   - CRC, type, length                               |
++-----------------------------------------------------+
+| Raft entry framing (cleartext)                      |
+|   - term, index, type, conf-change marker           |
++-----------------------------------------------------+
+| Proposal envelope header (cleartext, engine-owned)  |
+|   - proposalEnvelopeVersion (1B, 0x01)              |
+|   - proposal ID (8B uint64, monotonic per leader)   |
++-----------------------------------------------------+
+| AEAD envelope header (cleartext, encryption-owned)  |
+|   §4.2 / internal/encryption/envelope.go::Envelope: |
+|   - Version (1B)                                    |
+|   - Flag (1B)                                       |
+|   - KeyID (4B uint32, the DEK id)                   |
+|   - Nonce (12B: node_id ‖ local_epoch ‖ write_count)|
++-----------------------------------------------------+
+| AEAD body (CIPHERTEXT post-cutover, §4.2)           |
+|   - ciphertext + 16B GCM tag                        |
+|   - underlying plaintext: protobuf-encoded FSM      |
+|     request — operations, keys, values, txn meta    |
++-----------------------------------------------------+
 ```
 
-The **user-data half** (keys, values, operation type) is ciphertext post-cutover. The **framing half** (CRC, term, index, type, proposal ID, envelope version byte) stays cleartext on disk.
+Two envelopes nest on disk: the **outer proposal envelope** is owned
+by the etcd-raft engine and carries the per-proposal ID handoff that
+`resolveProposal` depends on; the **inner AEAD envelope** is owned
+by §4.2 and is what 6E activates the wrap-on-propose / unwrap-on-
+apply boundary against. Both envelopes have cleartext headers; only
+the AEAD body is encrypted.
+
+The **user-data half** (keys, values, operation type, transaction
+metadata) is ciphertext post-cutover. The **framing half** (CRC,
+term, index, type, proposal ID, AEAD version/flag/key-id/nonce)
+stays cleartext on disk.
 
 ## 3. Residual cleartext on disk (re-stated from §4.6 for completeness)
 
@@ -56,8 +75,23 @@ For a high-fidelity threat-model picture, an adversary with raw filesystem acces
 2. **Entry index gaps** (presence of compaction / snapshot installs).
 3. **Term changes** (visible from raft-entry framing).
 4. **Entry types** — normal entry vs `ConfChangeV2` / `ConfChange`. ConfChange entries carry node IDs and addresses (topology, not user data).
-5. **Proposal ID sequence** (8-byte counter, mostly monotonic per leader). Leaks throughput rate and the rough cadence of leadership flips.
-6. **Snapshot boundaries** (which entries triggered snapshot install).
+5. **Monotonic counter leakage** — two independent counters are
+   visible per entry on disk:
+   - **Proposal ID** (8B uint64 in the proposal envelope header,
+     monotonic per leader). Leaks per-leader throughput rate and
+     the rough cadence of leadership flips (the counter resets on
+     leadership change).
+   - **`write_count`** component within the 12B AEAD nonce
+     (constructed as `node_id ‖ local_epoch ‖ write_count`).
+     Leaks per-writer throughput rate; tracks per-DEK writes per
+     node so the rate is observable independently of the proposal
+     ID. Both counters move together under steady state but
+     diverge in informative ways during leader flips and DEK
+     rotations.
+6. **DEK rotation events** (KeyID changes between consecutive
+   entries — the inner AEAD header's `KeyID` field is on disk as
+   cleartext and rotates when a new DEK becomes active).
+7. **Snapshot boundaries** (which entries triggered snapshot install).
 
 What the adversary **cannot** observe (because §4.2 wraps the payload):
 
