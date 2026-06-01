@@ -577,25 +577,33 @@ func TestShardedCoordinatorDispatchTxn_SingleShardIncludesReadKeysInRaftEntry(t 
 }
 
 // TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion
-// is the gemini-critical regression on PR #881.  The single-shard fast
-// path correctly forwarded OperationGroup.ObservedRouteVersion into
-// pb.Request, but the multi-shard 2PC path
-// (prewriteTxn / commitPrimaryTxn / commitSecondaryTxns) dropped it on
-// the floor — every PREPARE and COMMIT envelope arrived at the FSM
-// with ObservedRouteVersion = 0 ("unpinned"), which would silently
-// bypass the M3 Composed-1 apply-time gate exactly for the workload
-// most at risk of a cross-group route shift.
+// is the gemini-critical regression from PR #881, refined by codex
+// P1 on PR #900 6202b964.  Original PR #881 contract: every PREPARE
+// and COMMIT envelope across the 2PC paths must carry
+// OperationGroup.ObservedRouteVersion so the M3 gate fires on every
+// cross-shard txn.  Refinement: the SECONDARY commit step MUST drop
+// the gate (send ObservedRouteVersion=0) because commitSecondaryTxns
+// is best-effort — it logs and continues on per-secondary errors,
+// then dispatchMultiShardTxn returns success.  A fail-closed gate
+// on that best-effort step turns route churn between primary-COMMIT
+// and secondary-COMMIT into a silent partial commit (codex P1 on
+// 6202b964, PR #900).
 //
-// Multi-shard txns are precisely the case where a MoveRange /
-// cross-group SplitRange between BeginTxn and Commit can land —
-// without this propagation, M3's safety guard would not even see
-// those txns to enforce on.
+// Coverage matrix the post-refinement code must satisfy:
 //
-// This test routes two PUTs across two shards via Engine routes
-// (single-shard fast path requires gids == 1), verifies that the 2PC
-// loop fires (both PREPARE and COMMIT recorded per shard), and
-// asserts every recorded pb.Request carries the pinned
-// ObservedRouteVersion.
+//   - Prewrite (both shards):                ObservedRouteVersion=42 (gate active)
+//   - Primary commit (g1 — primaryKey "b"):  ObservedRouteVersion=42 (gate active)
+//   - Secondary commit (g2 — non-primary):   ObservedRouteVersion=0  (gate skipped)
+//
+// Prewrite carries the pin because it's the moment locks are placed
+// — a route shift caught here cleanly aborts with no committed
+// state.  The primary commit carries it because it's the
+// linearization point and abortPreparedTxn cleans up if the gate
+// fires.  The secondary commit drops it because there is no clean
+// recovery path available between the primary's durable commit and
+// the secondary's commit — until a lock-resolution-bypass or
+// fatal-secondary 2PC protocol lands (M5+), the only safe posture
+// is to skip the gate on this step.
 func TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion(t *testing.T) {
 	t.Parallel()
 
@@ -627,20 +635,29 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion(
 		StartTS:              10,
 		ObservedRouteVersion: pinnedVer,
 		Elems: []*Elem[OP]{
-			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
-			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")}, // → g1 (primary, "b" is first)
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")}, // → g2 (secondary)
 		},
 	})
 	require.NoError(t, err)
 	require.Len(t, g1Txn.requests, 2, "g1 must see PREPARE + COMMIT")
 	require.Len(t, g2Txn.requests, 2, "g2 must see PREPARE + COMMIT")
 
-	for _, req := range append(g1Txn.requests, g2Txn.requests...) {
-		require.Equal(t, pinnedVer, req.ObservedRouteVersion,
-			"multi-shard 2PC envelope (phase=%s) must carry "+
-				"OperationGroup.ObservedRouteVersion; pre-fix this "+
-				"silently dropped to 0 and bypassed the M3 Composed-1 "+
-				"apply-time gate for every cross-shard txn",
-			req.Phase)
-	}
+	// Prewrites on both shards must carry the pin.
+	require.Equal(t, pinnedVer, g1Txn.requests[0].ObservedRouteVersion,
+		"primary prewrite must carry the pinned version — gate active before lock placement (PR #881)")
+	require.Equal(t, pinnedVer, g2Txn.requests[0].ObservedRouteVersion,
+		"secondary prewrite must carry the pinned version — gate active before lock placement (PR #881)")
+
+	// Primary commit must carry the pin — linearization point,
+	// abortPreparedTxn cleans up if the gate fires.
+	require.Equal(t, pinnedVer, g1Txn.requests[1].ObservedRouteVersion,
+		"primary commit must carry the pinned version — linearization point with clean abort path (PR #881)")
+
+	// Secondary commit MUST drop the pin to ObservedRouteVersion=0
+	// — codex P1 on 6202b964 refinement of PR #881's "propagate
+	// everywhere" contract.  Best-effort secondary + fail-closed
+	// gate composes to a silent partial commit.
+	require.Equal(t, uint64(0), g2Txn.requests[1].ObservedRouteVersion,
+		"secondary commit must NOT carry the pinned version — propagating it would let a route shift between primary-COMMIT and secondary-COMMIT silently partial-commit (codex P1 on 6202b964, PR #900)")
 }

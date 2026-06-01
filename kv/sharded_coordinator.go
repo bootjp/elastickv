@@ -851,7 +851,13 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, errors.WithStack(err)
 	}
 
-	maxIndex = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion)
+	// observedRouteVersion is intentionally NOT propagated to
+	// commitSecondaryTxns — secondary commits drop the M3 gate to
+	// avoid the best-effort-secondary + fail-closed-gate silent
+	// partial commit hazard (codex P1 on 6202b964, PR #900).  See
+	// the Request construction inside commitSecondaryTxns for the
+	// full reasoning.
+	maxIndex = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
@@ -991,7 +997,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 	return primaryGid, r.CommitIndex, nil
 }
 
-func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) uint64 {
+func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
 	// Secondary commits are best-effort. If a shard is unavailable after the
 	// primary commits, read-time lock resolution will commit the remaining
 	// secondaries based on the primary commit record. Retry a few times to
@@ -1006,11 +1012,30 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 			continue
 		}
 		req := &pb.Request{
-			IsTxn:                true,
-			Phase:                pb.Phase_COMMIT,
-			Ts:                   startTS,
-			Mutations:            append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
-			ObservedRouteVersion: observedRouteVersion,
+			IsTxn:     true,
+			Phase:     pb.Phase_COMMIT,
+			Ts:        startTS,
+			Mutations: append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
+			// ObservedRouteVersion intentionally omitted (zero) on
+			// secondary commits.  commitSecondaryTxns is best-effort:
+			// errors are logged and the dispatch acknowledges success
+			// while the lock-resolution backstop is expected to commit
+			// the secondary later.  If we propagated the auto-pinned
+			// version here, a route shift between primary-COMMIT and
+			// secondary-COMMIT would let the secondary FSM return
+			// ErrComposed1Violation, which commitSecondaryTxns swallows
+			// — turning route churn into a silent partial commit
+			// visible to no readers on the new owner (codex P1 on
+			// 6202b964, PR #900).  The FSM's verifyComposed1
+			// short-circuits on ObservedRouteVersion=0 (fsm.go:609), so
+			// dropping the field here restores the pre-66ad5b0 "no
+			// gate on commit-phase secondaries" behaviour without
+			// affecting prewrite (still gated) or primary commit
+			// (still gated; abortPreparedTxn cleans up on failure).
+			// Until a fatal-secondary 2PC protocol or
+			// lock-resolution-bypass design lands (M5+), this is the
+			// honest posture: gate where we can cleanly abort, skip
+			// where we cannot.
 		}
 		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
