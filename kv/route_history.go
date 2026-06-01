@@ -41,6 +41,14 @@ func (a *distributionEngineAdapter) SnapshotAt(v uint64) (RouteSnapshot, bool) {
 	return distributionRouteSnapshot{snap: snap}, true
 }
 
+func (a *distributionEngineAdapter) Current() (RouteSnapshot, bool) {
+	snap, ok := a.e.Current()
+	if !ok {
+		return nil, false
+	}
+	return distributionRouteSnapshot{snap: snap}, true
+}
+
 type distributionRouteSnapshot struct {
 	snap distribution.RouteHistorySnapshot
 }

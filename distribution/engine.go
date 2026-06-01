@@ -179,6 +179,21 @@ func (s RouteHistorySnapshot) OwnerOf(key []byte) (uint64, bool) {
 	return 0, false
 }
 
+// Current returns the route catalog snapshot at the engine's current
+// catalogVersion.  Returns (zero, false) when the history ring has
+// not been initialised (bare-struct Engine).  Used by the M3
+// Composed-1 cross-version-read fence (design doc §4.4) — the gate
+// compares the txn's observed-version owner against the current
+// owner so a route shift between BeginTxn and Commit is caught
+// before it can produce a G1c anomaly across a cross-group
+// MoveRange / SplitRange.
+func (e *Engine) Current() (RouteHistorySnapshot, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	snap, ok := e.history[e.catalogVersion]
+	return snap, ok
+}
+
 // SnapshotAt returns the route catalog snapshot recorded at version v.
 // Returns (zero, false) when v is not in the ring — either because v
 // is in the future (> catalogVersion), or because the FIFO ring has
@@ -191,6 +206,49 @@ func (e *Engine) SnapshotAt(v uint64) (RouteHistorySnapshot, bool) {
 	defer e.mu.RUnlock()
 	snap, ok := e.history[v]
 	return snap, ok
+}
+
+// SetHistoryDepthForTest overrides the FIFO ring depth from outside
+// the package.  Test-only.  Callers should set the depth before
+// sharing the Engine with concurrent SnapshotAt/Current readers to
+// avoid interleaving surprises around the eviction watermark, but
+// the write itself is lock-protected (e.mu.Lock below) so it is
+// safe to call from any goroutine that does not also expect a
+// consistent SnapshotAt view across the depth change.
+//
+// Exists so tests in the kv package can drive eviction-trigger
+// scenarios without adding a constructor option just for tests
+// (claude review on PR #894).  Production code must use
+// DefaultRouteHistoryDepth (32) or a future operator-exposed
+// config knob.
+//
+// Fails fast on depth <= 0 (coderabbit minor on PR #895):
+// recordHistorySnapshotLocked's eviction path indexes
+// historyOrder[0], so a zero/negative depth would surface as a
+// confusing index-out-of-range deep in the apply path instead of
+// at the misconfigured test seam.  When shrinking depth below the
+// current ring size, evict the excess oldest entries immediately
+// rather than letting the next record see len(historyOrder) >
+// historyDepth (gemini medium on PR #895 — without this trim, the
+// next recordHistorySnapshotLocked's
+// `make([]uint64, len-1, historyDepth)` would panic on len-1 >
+// historyDepth).
+func (e *Engine) SetHistoryDepthForTest(depth int) {
+	if depth <= 0 {
+		panic("SetHistoryDepthForTest: depth must be > 0")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.historyDepth = depth
+	if len(e.historyOrder) > depth {
+		excess := len(e.historyOrder) - depth
+		for i := range excess {
+			delete(e.history, e.historyOrder[i])
+		}
+		retained := make([]uint64, depth)
+		copy(retained, e.historyOrder[excess:])
+		e.historyOrder = retained
+	}
 }
 
 // HistoryDepth returns the configured ring depth for diagnostics.

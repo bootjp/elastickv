@@ -312,6 +312,120 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// transient "not leader" errors. A stability window catches the
 	// flip and loops until the leader actually holds.
 	waitForStableLeader(t, nodes, peers, waitTimeout)
+
+	// Prove the leader can actually COMMIT by driving one no-op
+	// entry through full Raft quorum before we hand the cluster
+	// to the test body. The 300 ms stability window above only
+	// proves leadership *appears* held; a leader can still step
+	// down on the first real heartbeat-quorum miss after that.
+	// The per-test retry wrappers in this file have been absorbing
+	// that post-readiness churn site-by-site; this commits-one-entry
+	// probe closes the window at the readiness layer instead, so any
+	// subsequent write inherits a leader that has already held
+	// quorum through one apply.
+	//
+	// `peers` and `waitInterval` are passed through so the probe loop
+	// can re-nudge leadership back to nodes[0] when a real re-election
+	// elects a different node mid-probe — without that, the loop
+	// would keep proposing through a follower engine until the budget
+	// expires and spuriously fail the readiness gate.
+	waitForWriteableLeader(t, nodes, peers, waitTimeout, waitInterval)
+}
+
+// raftReadinessProbePayload is the 9-byte Raft entry waitForWriteableLeader
+// proposes. The FSM dispatches on data[0]: 0x02 (raftEncodeHLCLease) selects
+// applyHLCLease, which reads `data[1:]` as a big-endian uint64 physical
+// ceiling. With ceiling=0 the function's `if ceilingMs > 0` guard skips the
+// HLC update and returns nil — a true no-op at the state-machine layer,
+// while the entry still goes through full Raft quorum so a successful
+// Propose proves the leader holds. See kv/fsm.go applyHLCLease + the
+// raftEncodeHLCLease comment.
+var raftReadinessProbePayload = []byte{
+	0x02,                                           // raftEncodeHLCLease
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BE uint64 ceiling = 0 (no-op)
+}
+
+// waitForWriteableLeader commits one no-op Raft entry through nodes[0]'s
+// engine to prove the leader is not just *named* but actually able to
+// drive quorum. Retries on transient leader-unavailable errors up to
+// timeout — a re-election that races the probe is what this helper is
+// designed to ride out.
+//
+// Without this step, waitForRaftReadiness would return after a 300 ms
+// stability window during which leadership only *looks* stable; a
+// leader that steps down on its first real heartbeat-quorum miss can
+// surface as "etcd raft engine is not leader" on the test's first
+// write — the failure mode the per-test retry wrappers in this file
+// have been working around. See the PR description for the full
+// flake-fix history this readiness gate is meant to obsolete.
+func waitForWriteableLeader(t *testing.T, nodes []Node, peers []raftengine.Server, timeout, waitInterval time.Duration) {
+	t.Helper()
+	if len(nodes) == 0 || nodes[0].engine == nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
+		}
+		err := proposeReadinessOnce(nodes[0].engine, remaining)
+		if err == nil {
+			return
+		}
+		lastErr = err
+		if !isReadinessProbeRetryable(err) {
+			t.Fatalf("readiness probe failed with non-transient error: %v", err)
+		}
+		// If the per-attempt error was specifically "not leader" (vs
+		// a ctx timeout), a real re-election has elected a different
+		// node since waitForStableLeader returned. Keep aiming the
+		// probe at nodes[0] by re-running ensureNodeZeroIsLeader
+		// before the next attempt; otherwise the loop would spin on
+		// a follower engine until the budget expires and spuriously
+		// fail the readiness gate even though the cluster has
+		// recovered with a different leader. ensureNodeZeroIsLeader
+		// is idempotent in the steady state, so this costs nothing
+		// when leadership has not actually moved.
+		if isTransientNotLeaderErr(err) && len(peers) > 0 {
+			ensureNodeZeroIsLeader(t, nodes, peers, time.Until(deadline), waitInterval)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
+		}
+		time.Sleep(leaderChurnRetryInterval)
+	}
+}
+
+// proposeReadinessOnce drives one no-op probe through the engine's
+// Propose, bounded by min(perProposeTimeout, remaining) so the
+// per-attempt ctx cannot block past the outer deadline when the
+// overall budget is nearly exhausted. Extracted from
+// waitForWriteableLeader to keep the outer loop under the cyclop
+// budget; the retry/timeout rationale lives at the call site.
+func proposeReadinessOnce(engine raftengine.Engine, remaining time.Duration) error {
+	const perProposeTimeout = 2 * time.Second
+	currTimeout := perProposeTimeout
+	if remaining < currTimeout {
+		currTimeout = remaining
+	}
+	proposeCtx, cancel := context.WithTimeout(context.Background(), currTimeout)
+	defer cancel()
+	_, err := engine.Propose(proposeCtx, raftReadinessProbePayload)
+	return err
+}
+
+// isReadinessProbeRetryable widens isTransientNotLeaderErr for the
+// readiness-probe loop: a per-propose ctx timeout under heavy CI
+// load returns context.DeadlineExceeded, which the base classifier
+// does NOT treat as transient. Without this widening the probe
+// would t.Fatalf on a slow runner instead of retrying within its
+// outer budget. context.Canceled is treated symmetrically.
+func isReadinessProbeRetryable(err error) bool {
+	return isTransientNotLeaderErr(err) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
 }
 
 // waitForStableLeader polls the cluster until nodes[0] has been the leader
