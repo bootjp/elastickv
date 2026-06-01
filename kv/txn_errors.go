@@ -22,6 +22,32 @@ var (
 	// the probe at the FSM and let the original duplicate-elements anomaly
 	// reappear. See codex P2 in PR #796 and the design doc.
 	ErrTxnDedupRequiresSingleShard = errors.New("txn dedup (prev_commit_ts) requires a single-shard write set")
+	// ErrTxnSecondaryRouteShiftedAfterPrimaryCommit is returned by
+	// dispatchMultiShardTxn when a per-secondary commit (after primary
+	// has durably committed) fails its M3 verifyComposed1 check —
+	// i.e. the route catalog moved between primary-COMMIT and the
+	// secondary-COMMIT, the secondary's FSM rejects with a Composed-1
+	// sentinel, and we cannot transparently recover (the prepared
+	// lock lives at the old gid; the new owner per the catalog has no
+	// commit record).  The 2PC contract is half-broken at this point:
+	// the primary's write is durable but at least one secondary's
+	// write is missing.  Surfacing this explicitly (rather than
+	// swallowing per the original best-effort semantic OR silently
+	// landing the write on a stale owner per a dropped-gate fix) is
+	// the least bad outcome — the caller knows the txn state is
+	// uncertain and can do application-level recovery.
+	//
+	// This is a DIFFERENT sentinel from ErrComposed1Violation by
+	// design: the M4 retry path in dispatchTxnWithComposed1Retry
+	// matches ErrComposed1Violation / ErrComposed1VersionGCd and
+	// would otherwise loop here, re-prewriting against the same old
+	// gid that already has the first attempt's prepared lock — pure
+	// wasted work since the route catalog won't move backward.
+	// codex P1 on 6202b964 (PR #900) raised the silent-partial-commit
+	// hazard; codex P1 on d8487672 (PR #900) raised the symmetric
+	// hazard of disabling the gate.  This sentinel resolves both by
+	// keeping the gate active and surfacing the error fatally.
+	ErrTxnSecondaryRouteShiftedAfterPrimaryCommit = errors.New("txn secondary commit failed after primary commit: route catalog shifted")
 )
 
 type TxnLockedError struct {

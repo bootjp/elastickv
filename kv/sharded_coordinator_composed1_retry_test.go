@@ -576,39 +576,35 @@ func TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForCallerSuppliedS
 		"caller-supplied StartTS with empty ReadKeys must NOT be auto-pinned at Dispatch entry — stamping the post-shift catalog version would mask a read→Dispatch route shift from verifyComposed1, creating a false-confidence M3 gate signal worse than no gate (codex P1 on 144ec0ca)")
 }
 
-// TestShardedCoordinator_DropsObservedRouteVersionOn2PCSecondaryCommit
-// is the regression for codex P1 on 6202b964 (PR #900):
-// commitSecondaryTxns treats secondary commit errors as
-// best-effort — it logs and continues, then dispatchMultiShardTxn
-// returns success.  If we propagate a non-zero
-// ObservedRouteVersion to the secondary commit Request, a route
-// shift after PREPARE/primary-COMMIT but before secondary-COMMIT
-// makes the secondary FSM return ErrComposed1Violation; the
-// caller-visible Dispatch ACK still says success, leaving the
-// secondary write uncommitted/invisible to readers on the new
-// owner — a silent partial commit.
+// TestShardedCoordinator_PropagatesObservedRouteVersionOn2PCSecondaryCommit
+// pins the contract resolved across the two competing codex P1
+// findings on PR #900: secondary commits MUST carry the auto-pinned
+// ObservedRouteVersion (preserved as of the d8487672 revert in this
+// PR's later iterations), even though commitSecondaryTxns is
+// otherwise best-effort.  A non-zero observedVer ensures the M3
+// gate fires on a route shift between primary-COMMIT and
+// secondary-COMMIT, and
+// commitSecondaryTxns/dispatchMultiShardTxn surface that as a
+// distinct fatal sentinel
+// (ErrTxnSecondaryRouteShiftedAfterPrimaryCommit) instead of either
+// swallowing (codex P1 on 6202b964: missing-write silent partial
+// commit) or dropping the gate (codex P1 on d8487672: stale-owner
+// silent partial commit).
 //
-// The fundamental tension: 2PC's "best-effort secondary +
-// lock-resolution backstop" semantic does not compose with M3's
-// "fail-closed on route shift" semantic.  Until lock resolution or
-// a fatal-secondary 2PC variant is wired (M5+), the surgical fix is
-// to send ObservedRouteVersion=0 on secondary commit Requests.
-// The FSM's verifyComposed1 short-circuits on observedVer==0
-// (fsm.go:609), restoring the pre-66ad5b0 behaviour for this step
-// while keeping the gate on prewrite (catches mid-flight shifts
-// before lock placement) and the primary commit (catches
-// linearization shifts; abortPreparedTxn cleans up).
+// 2-shard fixture: primary "b" → g1, secondary "x" → g2.  Auto-pin
+// stamps ObservedRouteVersion = engine.Version() = 7.  Coverage
+// matrix:
 //
-// This test uses a 2-shard fixture: primary "b" → g1,
-// secondary "x" → g2.  Auto-pin fires at Dispatch entry
-// (coordinator-allocated StartTS, ReadKeys empty), stamping
-// ObservedRouteVersion = engine.Version() = 7.  Both shards
-// receive 2 Requests each (prewrite + commit).  Assertions:
+//   - Prewrite (both shards):  observedVer=7 (gate active)
+//   - Primary commit (g1):     observedVer=7 (gate active)
+//   - Secondary commit (g2):   observedVer=7 (gate active; fatal on
+//     Composed-1 — see
+//     TestShardedCoordinator_SurfacesFatalErrorOn2PCSecondaryComposed1)
 //
-//   - Prewrite on both shards carries observedVer=7 (gate active)
-//   - Primary commit on g1 carries observedVer=7 (gate active)
-//   - Secondary commit on g2 carries observedVer=0 (gate skipped)
-func TestShardedCoordinator_DropsObservedRouteVersionOn2PCSecondaryCommit(t *testing.T) {
+// See TestShardedCoordinator_SurfacesFatalErrorOn2PCSecondaryComposed1
+// for the regression that verifies the secondary's Composed-1 error
+// surfaces as the new fatal sentinel.
+func TestShardedCoordinator_PropagatesObservedRouteVersionOn2PCSecondaryCommit(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -629,8 +625,6 @@ func TestShardedCoordinator_DropsObservedRouteVersionOn2PCSecondaryCommit(t *tes
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		IsTxn: true,
-		// StartTS omitted → coordinator allocates → auto-pin fires
-		// (callerSuppliedStartTS=false, ReadKeys empty).
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("b"), Value: []byte("v1")}, // → g1 (primary)
 			{Op: Put, Key: []byte("x"), Value: []byte("v2")}, // → g2 (secondary)
@@ -640,22 +634,82 @@ func TestShardedCoordinator_DropsObservedRouteVersionOn2PCSecondaryCommit(t *tes
 	require.Len(t, g1Txn.requests, 2, "primary g1 receives prewrite + commit")
 	require.Len(t, g2Txn.requests, 2, "secondary g2 receives prewrite + commit")
 
-	// Prewrites on both shards must carry the auto-pinned version —
-	// gate is active there, catching shifts before lock placement.
 	require.Equal(t, uint64(7), g1Txn.requests[0].GetObservedRouteVersion(),
-		"primary prewrite must carry the auto-pinned ObservedRouteVersion (gate active before lock placement)")
+		"primary prewrite must carry observedVer=7")
 	require.Equal(t, uint64(7), g2Txn.requests[0].GetObservedRouteVersion(),
-		"secondary prewrite must carry the auto-pinned ObservedRouteVersion (gate active before lock placement)")
-
-	// Primary commit must also carry it — linearization point, gate
-	// active, abortPreparedTxn cleans up on failure.
+		"secondary prewrite must carry observedVer=7")
 	require.Equal(t, uint64(7), g1Txn.requests[1].GetObservedRouteVersion(),
-		"primary commit must carry the auto-pinned ObservedRouteVersion (gate at linearization; abort path cleans up on failure)")
+		"primary commit must carry observedVer=7")
+	require.Equal(t, uint64(7), g2Txn.requests[1].GetObservedRouteVersion(),
+		"secondary commit MUST carry observedVer=7 — the gate must fire on route shifts between primary-COMMIT and secondary-COMMIT; codex P1 on d8487672 showed that dropping the gate silently writes to a stale owner")
+}
 
-	// Secondary commit MUST carry ObservedRouteVersion=0 — the fix
-	// for codex P1 on 6202b964.  Without this, a route shift between
-	// primary-COMMIT and secondary-COMMIT turns into a silent partial
-	// commit because commitSecondaryTxns is best-effort.
-	require.Equal(t, uint64(0), g2Txn.requests[1].GetObservedRouteVersion(),
-		"secondary commit must carry ObservedRouteVersion=0 — best-effort secondary + fail-closed gate would otherwise yield a silent partial commit on route shifts between primary-COMMIT and secondary-COMMIT (codex P1 on 6202b964)")
+// TestShardedCoordinator_SurfacesFatalErrorOn2PCSecondaryComposed1
+// is the regression for codex P1 on d8487672 (PR #900).  When a
+// secondary commit fails with a Composed-1 sentinel (route shift
+// between primary-COMMIT and secondary-COMMIT),
+// dispatchMultiShardTxn MUST surface
+// ErrTxnSecondaryRouteShiftedAfterPrimaryCommit rather than:
+//
+//   - swallow the error and return success (codex P1 on 6202b964:
+//     uncommitted secondary, missing-write silent partial commit), or
+//   - drop the M3 gate to avoid the error (codex P1 on d8487672:
+//     stale-owner silent partial commit), or
+//   - propagate ErrComposed1Violation (the M4 retry would loop, the
+//     primary is durable, re-prewriting would conflict).
+//
+// The new sentinel is the only honest posture — the caller knows
+// the txn state is uncertain (primary durable, secondary missing)
+// and can do application-level recovery.
+//
+// 2-shard fixture: primary "b" → g1 succeeds, secondary "x" → g2
+// returns ErrComposed1Violation on its COMMIT (prewrite succeeds).
+func TestShardedCoordinator_SurfacesFatalErrorOn2PCSecondaryComposed1(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 101, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 3},  // prewrite OK
+			{CommitIndex: 11}, // primary commit OK
+		},
+	}
+	// g2 prewrite OK, but g2 COMMIT (best-effort secondary) fails
+	// Composed-1 on EVERY commitSecondaryWithRetry attempt
+	// (txnSecondaryCommitRetryAttempts of them).  Build the errs
+	// slice with a leading nil (for prewrite which must succeed),
+	// then composed1 errors for each retry.
+	g2Errs := []error{nil}
+	for range txnSecondaryCommitRetryAttempts {
+		g2Errs = append(g2Errs, errors.WithStack(ErrComposed1Violation))
+	}
+	g2Txn := &recordingTransactional{
+		responses: []*TransactionResponse{{CommitIndex: 5}},
+		errs:      g2Errs,
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")}, // → g1 (primary)
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")}, // → g2 (secondary)
+		},
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTxnSecondaryRouteShiftedAfterPrimaryCommit,
+		"a secondary commit Composed-1 sentinel must surface as ErrTxnSecondaryRouteShiftedAfterPrimaryCommit (NOT ErrComposed1Violation — M4 retry would loop, primary is durable, re-prewriting would conflict)")
+	require.NotErrorIs(t, err, ErrComposed1Violation,
+		"the fatal-secondary sentinel must NOT be ErrComposed1Violation so the M4 retry path does not match and loop")
 }

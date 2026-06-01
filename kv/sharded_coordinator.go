@@ -851,13 +851,23 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, errors.WithStack(err)
 	}
 
-	// observedRouteVersion is intentionally NOT propagated to
-	// commitSecondaryTxns — secondary commits drop the M3 gate to
-	// avoid the best-effort-secondary + fail-closed-gate silent
-	// partial commit hazard (codex P1 on 6202b964, PR #900).  See
-	// the Request construction inside commitSecondaryTxns for the
-	// full reasoning.
-	maxIndex = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
+	// commitSecondaryTxns propagates ObservedRouteVersion to per-
+	// secondary commits so the M3 gate fires on route shifts between
+	// primary-COMMIT and secondary-COMMIT.  Such a sentinel surfaces
+	// as ErrTxnSecondaryRouteShiftedAfterPrimaryCommit (NOT
+	// ErrComposed1Violation — the M4 retry must not loop here; the
+	// primary is already durable and re-prewriting would conflict
+	// with the existing locks).  d8487672 originally tried to avoid
+	// the silent-partial-commit hazard by dropping the gate; codex
+	// P1 (20:30:35) correctly showed that the dropped-gate posture
+	// silently lands writes on stale owners that are no longer
+	// reachable by readers on the new owner.  Both directions are
+	// silent partial commits; surfacing the error is the only honest
+	// posture (codex P1 on d8487672 + 6202b964, PR #900).
+	maxIndex, err = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
@@ -997,11 +1007,28 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 	return primaryGid, r.CommitIndex, nil
 }
 
-func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
-	// Secondary commits are best-effort. If a shard is unavailable after the
-	// primary commits, read-time lock resolution will commit the remaining
-	// secondaries based on the primary commit record. Retry a few times to
-	// absorb short leader-election windows and reduce lock lag.
+func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) (uint64, error) {
+	// Secondary commits are best-effort for non-Composed-1 errors:
+	// if a shard is unavailable after the primary commits, read-time
+	// lock resolution will commit the remaining secondaries based on
+	// the primary commit record.  Retry a few times to absorb short
+	// leader-election windows and reduce lock lag.
+	//
+	// Composed-1 errors are an exception (codex P1 on d8487672 +
+	// 6202b964, PR #900).  When the M3 gate fires on a secondary
+	// commit, the route catalog has moved between primary-COMMIT and
+	// this secondary-COMMIT — the prepared lock lives at the old
+	// gid, the new owner per the catalog has no commit record.  We
+	// CANNOT silently land the write on the stale owner (codex 20:30:35
+	// — that's invisible to readers on the new owner) and we CANNOT
+	// silently swallow the error (codex 20:10:32 — uncommitted
+	// secondary, silent partial commit on the missing direction).
+	// The only honest posture is to surface
+	// ErrTxnSecondaryRouteShiftedAfterPrimaryCommit so the caller
+	// knows the txn state is uncertain and can do application-level
+	// recovery.  This sentinel is distinct from ErrComposed1Violation
+	// so the M4 retry path does not loop here (the primary is durable
+	// and re-prewriting would conflict with the existing locks).
 	meta := txnMetaMutation(primaryKey, 0, commitTS)
 	for _, gid := range gids {
 		if gid == primaryGid {
@@ -1012,33 +1039,28 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 			continue
 		}
 		req := &pb.Request{
-			IsTxn:     true,
-			Phase:     pb.Phase_COMMIT,
-			Ts:        startTS,
-			Mutations: append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
-			// ObservedRouteVersion intentionally omitted (zero) on
-			// secondary commits.  commitSecondaryTxns is best-effort:
-			// errors are logged and the dispatch acknowledges success
-			// while the lock-resolution backstop is expected to commit
-			// the secondary later.  If we propagated the auto-pinned
-			// version here, a route shift between primary-COMMIT and
-			// secondary-COMMIT would let the secondary FSM return
-			// ErrComposed1Violation, which commitSecondaryTxns swallows
-			// — turning route churn into a silent partial commit
-			// visible to no readers on the new owner (codex P1 on
-			// 6202b964, PR #900).  The FSM's verifyComposed1
-			// short-circuits on ObservedRouteVersion=0 (fsm.go:609), so
-			// dropping the field here restores the pre-66ad5b0 "no
-			// gate on commit-phase secondaries" behaviour without
-			// affecting prewrite (still gated) or primary commit
-			// (still gated; abortPreparedTxn cleans up on failure).
-			// Until a fatal-secondary 2PC protocol or
-			// lock-resolution-bypass design lands (M5+), this is the
-			// honest posture: gate where we can cleanly abort, skip
-			// where we cannot.
+			IsTxn:                true,
+			Phase:                pb.Phase_COMMIT,
+			Ts:                   startTS,
+			Mutations:            append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
+			ObservedRouteVersion: observedRouteVersion,
 		}
 		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
+			if isComposed1RetryableError(err) {
+				// Fatal: surface the new sentinel so the caller is
+				// informed that the secondary's write is missing and
+				// the txn state is half-committed.  M4 retry won't
+				// match this sentinel, so it doesn't loop.
+				c.logger().Warn("txn secondary commit failed Composed-1 — surfacing as fatal",
+					slog.Uint64("gid", gid),
+					slog.String("primary_key", string(primaryKey)),
+					slog.Uint64("start_ts", startTS),
+					slog.Uint64("commit_ts", commitTS),
+					slog.Any("err", err),
+				)
+				return maxIndex, errors.WithStack(ErrTxnSecondaryRouteShiftedAfterPrimaryCommit)
+			}
 			c.logger().Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
 				slog.String("primary_key", string(primaryKey)),
@@ -1052,7 +1074,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 			maxIndex = r.CommitIndex
 		}
 	}
-	return maxIndex
+	return maxIndex, nil
 }
 
 func commitSecondaryWithRetry(ctx context.Context, g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {
