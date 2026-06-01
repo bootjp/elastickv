@@ -275,6 +275,7 @@ func emitManifest(cfg *config, res backup.DecodeResult) error {
 		IncludeOrphans:           cfg.includeOrphans,
 		PreserveSQSVisibility:    cfg.preserveSQSVisibility,
 		IncludeSQSSideRecords:    cfg.includeSQSSideRecords,
+		RenameS3Collisions:       cfg.renameCollisions,
 	}
 	if cfg.bundleJSONL {
 		m.DynamoDBLayout = backup.DynamoDBLayoutJSONL
