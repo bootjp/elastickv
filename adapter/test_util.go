@@ -312,6 +312,70 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// transient "not leader" errors. A stability window catches the
 	// flip and loops until the leader actually holds.
 	waitForStableLeader(t, nodes, peers, waitTimeout)
+
+	// Prove the leader can actually COMMIT by driving one no-op
+	// entry through full Raft quorum before we hand the cluster
+	// to the test body. The 300 ms stability window above only
+	// proves leadership *appears* held; a leader can still step
+	// down on the first real heartbeat-quorum miss after that.
+	// 5ba2ef94 / rpushEventually / lpushEventually have been
+	// absorbing that post-readiness churn per-test for the past
+	// several months — this commits-one-entry probe closes the
+	// window at the readiness layer instead, so any subsequent
+	// write inherits a leader that has already held quorum
+	// through one apply.
+	waitForWriteableLeader(t, nodes, waitTimeout)
+}
+
+// raftReadinessProbePayload is the 9-byte Raft entry waitForWriteableLeader
+// proposes. The FSM dispatches on data[0]: 0x02 (raftEncodeHLCLease) selects
+// applyHLCLease, which reads `data[1:]` as a big-endian uint64 physical
+// ceiling. With ceiling=0 the function's `if ceilingMs > 0` guard skips the
+// HLC update and returns nil — a true no-op at the state-machine layer,
+// while the entry still goes through full Raft quorum so a successful
+// Propose proves the leader holds. See kv/fsm.go applyHLCLease + the
+// raftEncodeHLCLease comment.
+var raftReadinessProbePayload = []byte{
+	0x02,                                           // raftEncodeHLCLease
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BE uint64 ceiling = 0 (no-op)
+}
+
+// waitForWriteableLeader commits one no-op Raft entry through nodes[0]'s
+// engine to prove the leader is not just *named* but actually able to
+// drive quorum. Retries on transient leader-unavailable errors up to
+// timeout — a re-election that races the probe is what this helper is
+// designed to ride out.
+//
+// Without this step, waitForRaftReadiness would return after a 300 ms
+// stability window during which leadership only *looks* stable; a
+// leader that steps down on its first real heartbeat-quorum miss can
+// surface as "etcd raft engine is not leader" on the test's first
+// write. See commits 5ba2ef94 / rpushEventually / lpushEventually for
+// the per-test work-arounds this readiness gate is meant to obsolete.
+func waitForWriteableLeader(t *testing.T, nodes []Node, timeout time.Duration) {
+	t.Helper()
+	if len(nodes) == 0 || nodes[0].engine == nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	const perProposeTimeout = 2 * time.Second
+	var lastErr error
+	for {
+		proposeCtx, cancel := context.WithTimeout(context.Background(), perProposeTimeout)
+		_, err := nodes[0].engine.Propose(proposeCtx, raftReadinessProbePayload)
+		cancel()
+		if err == nil {
+			return
+		}
+		lastErr = err
+		if !isTransientNotLeaderErr(err) {
+			t.Fatalf("readiness probe failed with non-transient error: %v", err)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
+		}
+		time.Sleep(leaderChurnRetryInterval)
+	}
 }
 
 // waitForStableLeader polls the cluster until nodes[0] has been the leader
