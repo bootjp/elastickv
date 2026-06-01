@@ -86,16 +86,24 @@ type kvFSM struct {
 }
 
 // RouteHistory is the kv-side interface to the route catalog's
-// versioned-snapshot ring.  *distribution.Engine satisfies it.
-// Defined in the kv package so kvFSM does not have to import a
-// concrete type for the field; the M3 verifyComposed1 gate uses
-// only SnapshotAt and the returned snapshot's OwnerOf, so the
-// interface stays minimal.
+// versioned-snapshot ring.  *distribution.Engine satisfies it via
+// WrapDistributionEngine.  Defined in the kv package so kvFSM does
+// not have to import a concrete type for the field; the M3
+// verifyComposed1 gate uses only SnapshotAt + Current + the returned
+// snapshot's OwnerOf, so the interface stays minimal.
 type RouteHistory interface {
 	// SnapshotAt returns the route catalog at the given catalog
 	// version.  Returns (zero, false) when the version is outside
-	// the ring (either evicted by depth, or in the future).
+	// the ring (either evicted by depth, or in the future).  The
+	// M3 gate maps the not-found case to ErrComposed1VersionGCd.
 	SnapshotAt(version uint64) (RouteSnapshot, bool)
+	// Current returns the route catalog snapshot at the engine's
+	// current catalog version.  Returns (zero, false) when the
+	// engine has no history (bare-struct case used by some test
+	// seams).  The M3 cross-version fence uses this to compare
+	// the txn's observed-version owner against the current
+	// owner — a mismatch is the §3 codex P1 trace.
+	Current() (RouteSnapshot, bool)
 }
 
 // RouteSnapshot is the historical view of the route catalog at a
@@ -198,6 +206,38 @@ var _ FSM = (*kvFSM)(nil)
 var _ raftengine.StateMachine = (*kvFSM)(nil)
 
 var ErrUnknownRequestType = errors.New("unknown request type")
+
+// ErrComposed1Violation is returned by verifyComposed1 when the
+// transaction's commit cannot proceed on this Raft group because the
+// txn's read-set or write-set keys are not owned by this group at
+// either the txn's observed catalog version (the spec-level §4.2(a)
+// check) or the current catalog version observed by the FSM at apply
+// time (the §4.4 cross-version-read fence).  Surfaces to the
+// coordinator as a retryable error: the M4 coordinator path re-reads
+// the route cache, re-routes the txn, and re-issues it once on the
+// new owning group.
+//
+// Wrapped with errors.Wrapf at the call site to carry the
+// per-key diagnostic (which key, which observed-version owner, which
+// current-version owner) — the caller's retry path uses
+// errors.Is(err, ErrComposed1Violation) to match.
+var ErrComposed1Violation = errors.New("composed-1: route ownership shifted; retry on new owning group")
+
+// ErrComposed1VersionGCd is returned by verifyComposed1 when the
+// txn's observed catalog version is no longer in the engine's
+// retention ring — either because the FIFO ring evicted it (the
+// txn lived longer than `routeHistoryDepth` versions worth of
+// catalog churn) or because the version was never seen on this
+// node.  Surfaces to the coordinator as a retryable error: the
+// caller's M4 retry path reads the current route cache and
+// re-issues the txn with a fresh observedVer.
+//
+// The not-found ⇒ hard-error semantics (rather than soft-pass)
+// matters because a soft-pass would let the gate be bypassed
+// exactly in the long-running-txn / high-churn cases where the
+// cross-version-read hazard is most likely (design doc §4.3 +
+// gemini medium + codex P2 on PR #870).
+var ErrComposed1VersionGCd = errors.New("composed-1: observed catalog version evicted from history ring; retry")
 
 type fsmApplyResponse struct {
 	results []error
@@ -493,6 +533,9 @@ func (f *kvFSM) RestoredCutover() uint64 {
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.verifyComposed1(r); err != nil {
+		return err
+	}
 	switch r.Phase {
 	case pb.Phase_PREPARE:
 		return f.handlePrepareRequest(ctx, r)
@@ -505,6 +548,110 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 	default:
 		return errors.WithStack(ErrUnknownRequestType)
 	}
+}
+
+// verifyComposed1 is the M3 apply-time Composed-1 gate per
+// docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+// §4.2(a) + §4.4.  Runs two checks before the txn's writes land:
+//
+//	(a) Observed-version owner — the txn's read-set was captured
+//	    at routes[observedVer], so every write key must be owned
+//	    by THIS Raft group at that historical version.  Matches
+//	    the spec-level Commit precondition in tla/composed/Composed.tla.
+//
+//	(b) Current-version owner — even when (a) passes, a route
+//	    shift between BeginTxn and Commit can leave the write
+//	    landing on the OLD owner while readers at the new
+//	    version route to the NEW owner and miss the write (the
+//	    §3 codex P1 G1c trace).  The current-version fence
+//	    refuses the commit when this group no longer owns the
+//	    key, forcing a coordinator retry on the new owner.
+//
+// Short-circuits cleanly in three legacy / not-applicable cases:
+//   - FSM was constructed without WithRouteHistory (legacy / test
+//     seam): routes == nil, return nil.
+//   - Request carries ObservedRouteVersion == 0 (unpinned —
+//     pre-M1 caller, or ABORT request that doesn't carry the
+//     version): return nil.
+//   - Engine.Current returns (zero, false) — the engine has no
+//     history (bare-struct test seam): return nil at the (b) check.
+//
+// Returns ErrComposed1VersionGCd when the observed version is
+// outside the ring (M4 retry), and ErrComposed1Violation wrapped
+// with per-key context otherwise.
+func (f *kvFSM) verifyComposed1(r *pb.Request) error {
+	// ABORT requests MUST always reach the abort handler so the
+	// txn's intent locks get released.  If a route shifted between
+	// PREPARE and ABORT (or the observed version was evicted), a
+	// rejected ABORT would leave the locks pinned until LockResolver
+	// noticed at TTL expiry — minutes of write-blocked keys for
+	// what should be a one-RPC cleanup.  Production callers carry
+	// ObservedRouteVersion=0 on ABORT (the existing observedVer==0
+	// check below handles that case), so this guard is defensive
+	// belt-and-suspenders: any future ABORT construction site that
+	// inadvertently sets the version still bypasses the gate
+	// (gemini HIGH on PR #895 — fail-open on ABORT).
+	if r.GetPhase() == pb.Phase_ABORT {
+		return nil
+	}
+	// Bypass the gate when EITHER the route history is unwired OR
+	// the FSM's shardGroupID is the unset sentinel (0).  Both
+	// fields are documented as "unset ⇒ short-circuit" but the
+	// original check only honoured `routes == nil`, leaving a
+	// partially-wired caller (routes installed before group ID)
+	// to silently reject every pinned txn — no real Raft group
+	// has ID 0, so OwnerOf would never match (coderabbit MAJOR on
+	// PR #895).
+	if f.routes == nil || f.shardGroupID == 0 {
+		return nil
+	}
+	observedVer := r.GetObservedRouteVersion()
+	if observedVer == 0 {
+		return nil
+	}
+
+	// (a) Observed-version check.
+	observedSnap, ok := f.routes.SnapshotAt(observedVer)
+	if !ok {
+		return errors.WithStack(ErrComposed1VersionGCd)
+	}
+	if err := f.verifyOwnerFromSnapshot(r.GetMutations(), observedSnap, observedVer, "observed"); err != nil {
+		return err
+	}
+
+	// (b) Current-version cross-version-read fence.
+	currentSnap, ok := f.routes.Current()
+	if !ok {
+		// No current snapshot — engine has no history, nothing
+		// to compare against.  Fall through (matches the
+		// short-circuit posture of an unwired FSM).
+		return nil
+	}
+	return f.verifyOwnerFromSnapshot(r.GetMutations(), currentSnap, currentSnap.Version(), "current")
+}
+
+// verifyOwnerFromSnapshot is the shared per-mutation owner-check
+// loop used by verifyComposed1's observed-version and current-
+// version passes.  `phase` is the diagnostic label ("observed" /
+// "current") that ends up in the wrapped error.  isTxnInternalKey
+// mutations (the TxnMeta marker prefix) are skipped — they are
+// always on every shard and have no Composed-1 ownership.
+func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, snap RouteSnapshot, snapVer uint64, phase string) error {
+	for _, mut := range mutations {
+		if mut == nil || len(mut.Key) == 0 {
+			continue
+		}
+		if isTxnInternalKey(mut.Key) {
+			continue
+		}
+		owner, found := snap.OwnerOf(mut.Key)
+		if !found || owner != f.shardGroupID {
+			return errors.Wrapf(ErrComposed1Violation,
+				"%s-version v=%d: key %q owned by group %d (found=%v); this FSM serves group %d",
+				phase, snapVer, mut.Key, owner, found, f.shardGroupID)
+		}
+	}
+	return nil
 }
 
 func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, startTS uint64) error {
