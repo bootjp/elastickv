@@ -222,10 +222,34 @@ func (e *Engine) SnapshotAt(v uint64) (RouteHistorySnapshot, bool) {
 // equivalent to direct field access and exists ONLY so tests in
 // the kv package can drive eviction-trigger scenarios without
 // adding a constructor option just for tests.
+//
+// Fails fast on depth <= 0 (coderabbit minor on PR #895):
+// recordHistorySnapshotLocked's eviction path indexes
+// historyOrder[0], so a zero/negative depth would surface as a
+// confusing index-out-of-range deep in the apply path instead of
+// at the misconfigured test seam.  When shrinking depth below the
+// current ring size, evict the excess oldest entries immediately
+// rather than letting the next record see len(historyOrder) >
+// historyDepth (gemini medium on PR #895 — without this trim, the
+// next recordHistorySnapshotLocked's
+// `make([]uint64, len-1, historyDepth)` would panic on len-1 >
+// historyDepth).
 func (e *Engine) SetHistoryDepthForTest(depth int) {
+	if depth <= 0 {
+		panic("SetHistoryDepthForTest: depth must be > 0")
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.historyDepth = depth
+	if len(e.historyOrder) > depth {
+		excess := len(e.historyOrder) - depth
+		for i := range excess {
+			delete(e.history, e.historyOrder[i])
+		}
+		retained := make([]uint64, depth)
+		copy(retained, e.historyOrder[excess:])
+		e.historyOrder = retained
+	}
 }
 
 // HistoryDepth returns the configured ring depth for diagnostics.

@@ -29,9 +29,10 @@ func applyComposed1Snapshot(t *testing.T, e *distribution.Engine, version uint64
 // in main.go's buildShardGroups; this helper short-circuits to the
 // test-only fixture without spinning up a real Raft group.
 //
-//nolint:unparam // shardGroupID is currently always 1 in tests but
 // the helper keeps it as a parameter so a future test can exercise
 // the "wrong-group" case without re-deriving the boilerplate.
+//
+//nolint:unparam // shardGroupID is currently always 1 in tests but
 func newComposed1FSM(t *testing.T, e *distribution.Engine, shardGroupID uint64) *kvFSM {
 	t.Helper()
 	fsmIface := NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC(),
@@ -214,5 +215,44 @@ func TestVerifyComposed1_NilRouteHistorySkipsGate(t *testing.T) {
 			"unwired FSM must not surface Composed1Violation")
 		require.False(t, errors.Is(err, ErrComposed1VersionGCd),
 			"unwired FSM must not surface ErrComposed1VersionGCd")
+	}
+}
+
+// TestVerifyComposed1_ShardGroupIDZeroSkipsGate is the regression
+// for the coderabbit MAJOR finding on PR #895.  A kvFSM with
+// `routes` installed but `shardGroupID == 0` is a partially-wired
+// FSM (the caller set routes before group ID, or the test fixture
+// passed a non-zero engine but a zero group).  The doc comment on
+// shardGroupID says "Zero at M2 means 'unset' — the M3 gate will
+// short-circuit (matches the pre-feature behaviour)", but
+// verifyComposed1 only checked `routes == nil`.  Without the
+// shardGroupID bypass, every pinned txn against this FSM would be
+// rejected with ErrComposed1Violation because no real group has
+// ID 0 and the snapshot's OwnerOf would never return 0 as the
+// owner.
+//
+// The fix: bypass when EITHER routes is nil OR shardGroupID is 0.
+func TestVerifyComposed1_ShardGroupIDZeroSkipsGate(t *testing.T) {
+	t.Parallel()
+
+	// Build an engine where the (only) route IS owned by some
+	// non-zero group, then construct the FSM with routes set but
+	// shardGroupID = 0.  Under the pre-fix code the gate would
+	// reject the txn (because OwnerOf returns the route's
+	// non-zero owner, which does not equal the FSM's group=0).
+	// Under the fix the gate short-circuits and returns nil —
+	// matching the documented "unset = bypass" semantics.
+	e := distribution.NewEngine()
+	applyComposed1Snapshot(t, e, 1, []distribution.RouteDescriptor{
+		{RouteID: 100, Start: []byte(""), End: nil, GroupID: 5, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, e, 0) // partially-wired: routes set, group ID unset
+
+	err := fsm.handleTxnRequest(context.Background(), commitTxnRequest(1, "k"), 0)
+	if err != nil {
+		require.False(t, errors.Is(err, ErrComposed1Violation),
+			"shardGroupID=0 must bypass the Composed-1 gate even when routes is non-nil; the documented 'unset = bypass' semantics protects partially-wired callers")
+		require.False(t, errors.Is(err, ErrComposed1VersionGCd),
+			"shardGroupID=0 must bypass before any ring lookup, so ErrComposed1VersionGCd must not surface either")
 	}
 }

@@ -554,18 +554,18 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 // docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
 // §4.2(a) + §4.4.  Runs two checks before the txn's writes land:
 //
-//   (a) Observed-version owner — the txn's read-set was captured
-//       at routes[observedVer], so every write key must be owned
-//       by THIS Raft group at that historical version.  Matches
-//       the spec-level Commit precondition in tla/composed/Composed.tla.
+//	(a) Observed-version owner — the txn's read-set was captured
+//	    at routes[observedVer], so every write key must be owned
+//	    by THIS Raft group at that historical version.  Matches
+//	    the spec-level Commit precondition in tla/composed/Composed.tla.
 //
-//   (b) Current-version owner — even when (a) passes, a route
-//       shift between BeginTxn and Commit can leave the write
-//       landing on the OLD owner while readers at the new
-//       version route to the NEW owner and miss the write (the
-//       §3 codex P1 G1c trace).  The current-version fence
-//       refuses the commit when this group no longer owns the
-//       key, forcing a coordinator retry on the new owner.
+//	(b) Current-version owner — even when (a) passes, a route
+//	    shift between BeginTxn and Commit can leave the write
+//	    landing on the OLD owner while readers at the new
+//	    version route to the NEW owner and miss the write (the
+//	    §3 codex P1 G1c trace).  The current-version fence
+//	    refuses the commit when this group no longer owns the
+//	    key, forcing a coordinator retry on the new owner.
 //
 // Short-circuits cleanly in three legacy / not-applicable cases:
 //   - FSM was constructed without WithRouteHistory (legacy / test
@@ -580,7 +580,15 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 // outside the ring (M4 retry), and ErrComposed1Violation wrapped
 // with per-key context otherwise.
 func (f *kvFSM) verifyComposed1(r *pb.Request) error {
-	if f.routes == nil {
+	// Bypass the gate when EITHER the route history is unwired OR
+	// the FSM's shardGroupID is the unset sentinel (0).  Both
+	// fields are documented as "unset ⇒ short-circuit" but the
+	// original check only honoured `routes == nil`, leaving a
+	// partially-wired caller (routes installed before group ID)
+	// to silently reject every pinned txn — no real Raft group
+	// has ID 0, so OwnerOf would never match (coderabbit MAJOR on
+	// PR #895).
+	if f.routes == nil || f.shardGroupID == 0 {
 		return nil
 	}
 	observedVer := r.GetObservedRouteVersion()
