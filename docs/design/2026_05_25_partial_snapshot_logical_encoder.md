@@ -1,8 +1,8 @@
 # Snapshot Logical Encoder (Phase 0b)
 
-Status: Proposed
+Status: Partial (M1–M5 merged via PRs #807 / #841 / #847 / #849 / #864 / #846 / #892; M6 CLI in review at PR #896)
 Author: bootjp
-Date: 2026-05-25
+Date: 2026-05-25 (promoted proposed → partial 2026-06-01 in PR #896)
 
 ## Background
 
