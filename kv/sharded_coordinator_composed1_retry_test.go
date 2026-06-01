@@ -226,8 +226,13 @@ func TestShardedCoordinator_PinsObservedRouteVersionAtDispatchEntry(t *testing.T
 	}, 1, NewHLC(), nil)
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
-		IsTxn:   true,
-		StartTS: 10,
+		IsTxn: true,
+		// StartTS omitted — the auto-pin requires a
+		// coordinator-allocated snapshot (callerSuppliedStartTS=false)
+		// in addition to ReadKeys empty.  Caller-supplied StartTS
+		// skips the auto-pin to avoid masking a read→Dispatch
+		// route shift (codex P1 on 144ec0ca, PR #900); see
+		// TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForCallerSuppliedStartTS.
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("k"), Value: []byte("v")},
 		},
@@ -235,7 +240,7 @@ func TestShardedCoordinator_PinsObservedRouteVersionAtDispatchEntry(t *testing.T
 	require.NoError(t, err)
 	require.Len(t, txn.observedSeen, 1)
 	require.Equal(t, uint64(7), txn.observedSeen[0],
-		"Dispatch must pin reqs.ObservedRouteVersion to engine.Version() at entry when the caller leaves it at zero")
+		"Dispatch must pin reqs.ObservedRouteVersion to engine.Version() at entry when the caller leaves it at zero (coordinator-allocated StartTS path)")
 }
 
 // TestShardedCoordinator_HonorsCallerPinnedObservedRouteVersion
@@ -507,4 +512,66 @@ func TestShardedCoordinator_SurfacesComposed1OnCallerSuppliedStartTS(t *testing.
 		"caller-supplied StartTS must surface the sentinel without retry — bumping StartTS would let any commit landed in (42, newStartTS) bypass the FSM's latest>startTS OCC check (codex P1 on 57da8886)")
 	require.Equal(t, int32(1), txn.calls.Load(),
 		"exactly ONE attempt must fire — M4 must NOT retry caller-supplied snapshots")
+}
+
+// TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForCallerSuppliedStartTS
+// is the regression for codex P1 on 144ec0ca (PR #900): when the
+// caller supplies StartTS but leaves ReadKeys empty (the 13+
+// adapter pattern: S3/SQS/DynamoDB sites that read metadata at
+// readTS and dispatch with StartTS=readTS, no ReadKeys), the
+// Dispatch-entry auto-pin of ObservedRouteVersion must SKIP.
+//
+// Rationale: stamping reqs.ObservedRouteVersion = engine.Version()
+// at Dispatch time falsely asserts "the read set was captured at
+// this catalog version".  For a caller-supplied-StartTS path the
+// actual read happened at the adapter layer BEFORE Dispatch; if a
+// route shift landed between that read and Dispatch entry, the
+// auto-pin stamps the POST-shift version and verifyComposed1
+// finds no mismatch at apply time — the route shift is INVISIBLE
+// to the M3 gate, masking exactly the failure mode the gate
+// exists to catch.  This is strictly worse than no auto-pin: an
+// honest ObservedRouteVersion=0 lets the gate short-circuit (no
+// false claim made) and the operator knows protection is not in
+// place; the spurious auto-pin gives false confidence.
+//
+// The correct fix lives in the adapters (pin
+// ObservedRouteVersion at read time, design doc §4.1), which is
+// M5+ work.  Until then, withholding the auto-pin is the only
+// honest posture.
+//
+// Coordinator-allocated StartTS (caller passed 0) continues to
+// auto-pin, because the coordinator's own allocation IS the
+// read-time-equivalent moment — no read has happened earlier
+// against a different catalog version.
+func TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForCallerSuppliedStartTS(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	txn := &composed1RetryingTransactional{firstErr: nil} // succeeds on first attempt
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:   true,
+		StartTS: 42, // caller-supplied — adapter read at this ts
+		// ReadKeys intentionally empty (typical for S3/SQS/DynamoDB
+		// metadata-read-then-write sites).
+		// ObservedRouteVersion intentionally zero — caller has not
+		// migrated to pin at BeginTxn per §4.1.
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("k_write"), Value: []byte("v")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.observedSeen, 1)
+	require.Equal(t, uint64(0), txn.observedSeen[0],
+		"caller-supplied StartTS with empty ReadKeys must NOT be auto-pinned at Dispatch entry — stamping the post-shift catalog version would mask a read→Dispatch route shift from verifyComposed1, creating a false-confidence M3 gate signal worse than no gate (codex P1 on 144ec0ca)")
 }

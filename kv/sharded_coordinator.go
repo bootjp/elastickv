@@ -504,31 +504,51 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 // whether to keep trying.
 // maybeAutoPinObservedRouteVersion stamps reqs.ObservedRouteVersion
 // with the engine's current catalog version at Dispatch entry, but
-// ONLY when the txn has no read keys.  Per design doc §4.1 the
-// version must be pinned at BeginTxn (read-set capture time); for
-// write-only txns Dispatch IS the BeginTxn (no prior reads have
-// happened), so pinning here is correct.  For read-write txns the
-// caller already performed reads at some earlier moment — Redis
-// MULTI/EXEC's txnContext.commit, for example, builds an
-// OperationGroup with StartTS from MULTI and ReadKeys from the GETs
-// inside the txn body — and stamping the catalog version at this
-// Dispatch call would associate post-shift routes with pre-shift
-// reads, defeating the gate (codex P1 on PR #900).  Such callers
-// MUST migrate to pin ObservedRouteVersion themselves at BeginTxn
-// time; until they do, the request flows with observedVer=0 and
-// the M3 gate short-circuits (the safe non-regressing posture for
-// non-migrated read-write callers).  Extracted from
-// dispatchTxnWithComposed1Retry to keep its cyclomatic complexity
-// in the cyclop budget.
-func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGroup[OP]) {
-	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 {
+// ONLY when (a) the txn has no read keys AND (b) the caller did not
+// supply StartTS.  Per design doc §4.1 the version must be pinned
+// at BeginTxn (read-set capture time); the auto-pin is a
+// best-effort backfill for callers that have not yet migrated to
+// pin themselves.  Two cases skip the auto-pin:
+//
+//   - len(ReadKeys) != 0 — the caller already performed reads at
+//     some earlier moment (Redis MULTI/EXEC's txnContext.commit
+//     builds an OperationGroup with StartTS from MULTI and
+//     ReadKeys from the GETs inside the txn body).  Stamping the
+//     catalog version at this Dispatch call would associate
+//     post-shift routes with pre-shift reads (codex P1 on
+//     10123c5a, PR #900).
+//
+//   - callerSuppliedStartTS — the caller supplied StartTS,
+//     meaning a read at the adapter layer happened against that
+//     snapshot before Dispatch even though it is not surfaced as
+//     a ReadKeys entry.  The 13+ S3/SQS/DynamoDB adapter sites
+//     identified in the M4-StartTS-gate audit (adapter/s3.go:573
+//     etc.) fall in this bucket.  Stamping the catalog version
+//     at Dispatch time would mask any route shift between the
+//     adapter-layer read and Dispatch entry — verifyComposed1
+//     would find no mismatch at apply time and the shift becomes
+//     INVISIBLE.  That is strictly worse than ObservedRouteVersion=0
+//     (gate short-circuits, no false claim made): the spurious
+//     auto-pin gives false confidence (codex P1 on 144ec0ca,
+//     PR #900).
+//
+// The non-auto-pin case (request flows with ObservedRouteVersion=0,
+// M3 gate short-circuits) is the safe non-regressing posture for
+// non-migrated callers — the gate cannot retroactively pin reads
+// it was not present for.  Adapters that want M3 protection must
+// migrate to pin at BeginTxn per §4.1.
+//
+// Extracted from dispatchTxnWithComposed1Retry to keep its
+// cyclomatic complexity in the cyclop budget.
+func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGroup[OP], callerSuppliedStartTS bool) {
+	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 || callerSuppliedStartTS {
 		return
 	}
 	reqs.ObservedRouteVersion = c.engine.Version()
 }
 
 func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
-	c.maybeAutoPinObservedRouteVersion(reqs)
+	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
 		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)
