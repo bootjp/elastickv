@@ -109,6 +109,8 @@ Keep the schema minimal — restore operators need to confirm "encoded for the r
 
 **`adapters_enabled` ordering** is the canonical encoder fan-out order (`redis`, `dynamodb`, `s3`, `sqs`), NOT the CLI input order. The encoder dispatches in that fixed order to keep `ENCODE_INFO.json` bytewise reproducible across runs that pass `--adapter` in different sequences. Reproducibility is also why the schema lists strings rather than ordinals.
 
+The encoder fan-out order (`redis` first) intentionally differs from the decoder's finalize order at `decode.go:278-296` (`dynamodb` first). The final `.fsm` byte sequence is determined by encoded key sort (`snapshotBuilder.WriteTo` sorts entries before writing — see `encode.go:204`), not by adapter fan-out order, so either ordering is correct as long as it is fixed. The two sides pick differently for purely historical reasons: the decoder finalizes in alphabetical-with-tweaks order; the encoder follows the parent design doc's enumeration order. No-op for restore correctness.
+
 **`cluster_id` enforcement** is decoder-side (the restore runbook step refuses to place a file whose cluster_id differs from the target node — parent §"Risks"). The encoder just propagates the manifest value into `ENCODE_INFO.json`; it does not gate on it.
 
 ## Round-trip self-test (`--self-test`)
