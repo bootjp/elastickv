@@ -565,9 +565,21 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		// so the retry would run with StartTS=0 — violating MVCC
 		// invariants (gemini HIGH on PR #900).
 		reqs.CommitTS = 0
+		// Drop the option-2 dedup probe.  The M3 gate fired at apply
+		// time, so the ORIGINAL attempt never committed — there is no
+		// prior landing for PrevCommitTS to dedup against on this
+		// retry.  Leaving it set would let dispatchMultiShardTxn:736
+		// short-circuit with ErrTxnDedupRequiresSingleShard if the
+		// post-shift catalog now reroutes this txn to span two groups
+		// (claude[bot] medium, 3rd review round on PR #900).
+		reqs.PrevCommitTS = 0
 		startTS, allocErr := c.nextStartTS(ctx, reqs.Elems)
 		if allocErr != nil {
-			return resp, allocErr
+			// resp here is the failed first attempt's response (always
+			// nil for the Composed-1 sentinels) — return nil
+			// explicitly so the contract "non-nil response on success
+			// only" is unambiguous (claude[bot] nit on PR #900).
+			return nil, allocErr
 		}
 		reqs.StartTS = startTS
 	}

@@ -17,15 +17,33 @@ import (
 // Raft groups for an integration test (a future follow-up under M5 will
 // land the full Jepsen-shaped scenario).
 type composed1RetryingTransactional struct {
-	calls        atomic.Int32
-	firstErr     error
-	observedSeen []uint64
+	calls            atomic.Int32
+	firstErr         error
+	observedSeen     []uint64
+	prevCommitTSSeen []uint64
 }
 
 func (s *composed1RetryingTransactional) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	n := s.calls.Add(1)
 	if len(reqs) > 0 {
 		s.observedSeen = append(s.observedSeen, reqs[0].GetObservedRouteVersion())
+		// PrevCommitTS rides inside the encoded TxnMeta on the first
+		// mutation of a one-phase txn request (see
+		// onePhaseTxnRequestWithPrevCommit in coordinator.go).  Decode
+		// it so the M4 retry tests can assert the field is cleared on
+		// the retry attempt (claude[bot] medium on PR #900: the M3
+		// gate fires at apply time, so the original attempt never
+		// committed; leaving PrevCommitTS non-zero on the retry causes
+		// dispatchMultiShardTxn to refuse with
+		// ErrTxnDedupRequiresSingleShard when groupMutations now spans
+		// two groups).
+		var prev uint64
+		if muts := reqs[0].GetMutations(); len(muts) > 0 {
+			if meta, err := DecodeTxnMeta(muts[0].GetValue()); err == nil {
+				prev = meta.PrevCommitTS
+			}
+		}
+		s.prevCommitTSSeen = append(s.prevCommitTSSeen, prev)
 	}
 	if n == 1 {
 		return nil, s.firstErr
@@ -61,18 +79,14 @@ func TestShardedCoordinator_RetriesOnComposed1Violation(t *testing.T) {
 		1: {Txn: txn},
 	}, 1, NewHLC(), nil)
 
-	// Between the first and second dispatch attempts, simulate the
-	// route catalog moving forward — M4's retry path must re-read
-	// the engine version and stamp the new one on the retry's
-	// pb.Request so the FSM sees the post-shift observed version.
-	go func() {
-		// The retry happens synchronously inside Dispatch; advance the
-		// catalog before the second attempt would re-read it.  In a
-		// real cluster the advance is driven by a concurrent
-		// CatalogWatcher fan-out; here we just race against the
-		// in-process Commit to model the same observable effect.
-	}()
-
+	// In a real cluster the route catalog advance between the first
+	// and second attempts is driven by a concurrent CatalogWatcher
+	// fan-out.  This test does not model the advance directly — the
+	// stub returns the sentinel unconditionally and the retry path's
+	// re-read picks up whatever the engine reports.  observedSeen[1]
+	// equality below asserts the RE-READ contract, not a particular
+	// value (claude[bot] minor on PR #900: an empty goroutine here
+	// looked like an unfinished concurrent-advance model).
 	resp, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		IsTxn:   true,
 		StartTS: 10,
@@ -354,4 +368,57 @@ func TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForReadWriteTxn(t 
 	require.Len(t, txn.observedSeen, 1)
 	require.Equal(t, uint64(0), txn.observedSeen[0],
 		"read-write txns with unset ObservedRouteVersion must NOT be auto-pinned at Dispatch entry — pinning at commit time disagrees with the reads' actual snapshot version, so verifyComposed1 must short-circuit (observedVer=0) until the caller migrates to pin at BeginTxn per §4.1")
+}
+
+// TestShardedCoordinator_ClearsPrevCommitTSOnComposed1Retry verifies
+// that the M4 retry path zeros OperationGroup.PrevCommitTS before
+// the second dispatchTxn call.  Rationale (claude[bot] medium on
+// PR #900): the M3 gate fires at apply time, so the ORIGINAL attempt
+// never committed — there is no prior landing for PrevCommitTS to
+// dedup against on the retry.  If the retry kept the caller's
+// PrevCommitTS non-zero AND the post-shift catalog reroutes the txn
+// to span two groups, dispatchMultiShardTxn would short-circuit with
+// ErrTxnDedupRequiresSingleShard (kv/sharded_coordinator.go:736) on a
+// signal that no longer holds, surfacing a misleading error to the
+// caller instead of a correct re-route.  The contract is: on
+// Composed-1 retry, drop the dedup probe — the FSM's option-2
+// idempotency check has nothing valid to compare against.
+//
+// This is a write-only txn (no ReadKeys); the M4 retry is allowed
+// (per the gemini-CRITICAL gate already in place) and PrevCommitTS
+// is the option-2 dedup probe the adapter set on the first attempt.
+func TestShardedCoordinator_ClearsPrevCommitTSOnComposed1Retry(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	txn := &composed1RetryingTransactional{
+		firstErr: errors.WithStack(ErrComposed1Violation),
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:        true,
+		StartTS:      10,
+		CommitTS:     20,
+		PrevCommitTS: 17, // adapter-supplied option-2 dedup probe
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("k_write"), Value: []byte("v")},
+		},
+	})
+	require.NoError(t, err, "M4 must retry write-only Composed-1 once and succeed on attempt 2")
+	require.Len(t, txn.prevCommitTSSeen, 2,
+		"both attempts must be observed for the PrevCommitTS comparison")
+	require.Equal(t, uint64(17), txn.prevCommitTSSeen[0],
+		"first attempt must carry the caller's PrevCommitTS unchanged — that is the option-2 dedup probe semantics")
+	require.Equal(t, uint64(0), txn.prevCommitTSSeen[1],
+		"second attempt must drop PrevCommitTS — the M3 gate fired at apply time so the original attempt never committed; leaving the probe set would let dispatchMultiShardTxn return ErrTxnDedupRequiresSingleShard on a stale signal if the retry's groupMutations now spans two groups")
 }
