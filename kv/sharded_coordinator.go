@@ -505,10 +505,11 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 // maybeAutoPinObservedRouteVersion stamps reqs.ObservedRouteVersion
 // with the engine's current catalog version at Dispatch entry, but
 // ONLY when (a) the txn has no read keys AND (b) the caller did not
-// supply StartTS.  Per design doc §4.1 the version must be pinned
-// at BeginTxn (read-set capture time); the auto-pin is a
-// best-effort backfill for callers that have not yet migrated to
-// pin themselves.  Two cases skip the auto-pin:
+// supply StartTS AND (c) no element's key is claimed by a partition
+// resolver.  Per design doc §4.1 the version must be pinned at
+// BeginTxn (read-set capture time); the auto-pin is a best-effort
+// backfill for callers that have not yet migrated to pin
+// themselves.  Three cases skip the auto-pin:
 //
 //   - len(ReadKeys) != 0 — the caller already performed reads at
 //     some earlier moment (Redis MULTI/EXEC's txnContext.commit
@@ -532,6 +533,20 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 //     auto-pin gives false confidence (codex P1 on 144ec0ca,
 //     PR #900).
 //
+//   - any element's key is resolver-claimed — when a
+//     PartitionResolver is wired (SQS HT-FIFO partition keys
+//     etc.), ShardRouter routes via the resolver but
+//     verifyComposed1 calls route-history OwnerOf on the raw
+//     mutation key against the BYTE-RANGE engine snapshot.  The
+//     engine has no knowledge of the resolver's mapping, so the
+//     gate spuriously rejects resolver-routed commits even when
+//     the resolver picked the correct gid.  Skip the auto-pin
+//     for any resolver-recognised key; the request flows with
+//     ObservedRouteVersion=0 and the M3 gate short-circuits —
+//     restoring the pre-auto-pin behaviour for resolver-routed
+//     txns.  Resolver-aware M3 is M5+ work (codex P1 on
+//     6a458a28, PR #900).
+//
 // The non-auto-pin case (request flows with ObservedRouteVersion=0,
 // M3 gate short-circuits) is the safe non-regressing posture for
 // non-migrated callers — the gate cannot retroactively pin reads
@@ -544,7 +559,31 @@ func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGro
 	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 || callerSuppliedStartTS {
 		return
 	}
+	if c.anyResolverClaimedKey(reqs.Elems) {
+		return
+	}
 	reqs.ObservedRouteVersion = c.engine.Version()
+}
+
+// anyResolverClaimedKey reports whether any element's key is
+// claimed by the partition resolver.  Returns false when the
+// router has no resolver installed (the most common case) so the
+// auto-pin path stays inexpensive in the byte-range-only deployment.
+// Extracted from maybeAutoPinObservedRouteVersion to keep the
+// auto-pin's cyclomatic complexity in the cyclop budget.
+func (c *ShardedCoordinator) anyResolverClaimedKey(elems []*Elem[OP]) bool {
+	if c.router == nil || c.router.partitionResolver == nil {
+		return false
+	}
+	for _, e := range elems {
+		if e == nil || len(e.Key) == 0 {
+			continue
+		}
+		if c.router.partitionResolver.RecognisesPartitionedKey(e.Key) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {

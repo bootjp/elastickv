@@ -713,3 +713,102 @@ func TestShardedCoordinator_SurfacesFatalErrorOn2PCSecondaryComposed1(t *testing
 	require.NotErrorIs(t, err, ErrComposed1Violation,
 		"the fatal-secondary sentinel must NOT be ErrComposed1Violation so the M4 retry path does not match and loop")
 }
+
+// stubPartitionResolver is a minimal PartitionResolver for tests.
+// It claims every key whose prefix matches `claimedPrefix` and
+// routes them all to `gid`.  Used by
+// TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForResolverRoutedTxn
+// to exercise the codex P1 (20:45:07) skip path.
+type stubPartitionResolver struct {
+	claimedPrefix []byte
+	gid           uint64
+}
+
+func (r *stubPartitionResolver) ResolveGroup(key []byte) (uint64, bool) {
+	if !r.RecognisesPartitionedKey(key) {
+		return 0, false
+	}
+	return r.gid, true
+}
+
+func (r *stubPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
+	if len(key) < len(r.claimedPrefix) {
+		return false
+	}
+	for i, b := range r.claimedPrefix {
+		if key[i] != b {
+			return false
+		}
+	}
+	return true
+}
+
+// TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForResolverRoutedTxn
+// is the regression for codex P1 on 6a458a28 (PR #900): when a
+// txn's keys are claimed by a PartitionResolver (e.g. SQS
+// HT-FIFO partition keys), the Dispatch-entry auto-pin must
+// SKIP.  Otherwise the M3 verifyComposed1 gate runs against the
+// byte-range engine snapshot — which does not reflect resolver
+// routing — and spuriously rejects the commit even though the
+// resolver selected the correct gid.
+//
+// Concrete failure mode (codex):
+//
+//   - ShardRouter.ResolveGroup → resolver returns gid R.
+//   - Dispatch-entry auto-pin stamps ObservedRouteVersion =
+//     engine.Version() on the request.
+//   - FSM at gid R applies; verifyComposed1 calls route-history
+//     OwnerOf on the raw mutation key against the engine's
+//     snapshot.
+//   - Engine's snapshot says gid B (default byte-range owner),
+//     not gid R.
+//   - Mismatch → ErrComposed1Violation.
+//   - M4 retry re-reads engine.Version() (unchanged), retries,
+//     fails again.  Spurious double failure.
+//
+// With production FSMs wired via WithRouteHistory, a
+// coordinator-owned txn with no StartTS/ReadKeys that used to
+// commit unpinned now gets rejected.  The auto-pin's
+// "blanket protection" framing breaks for resolver-routed keys.
+//
+// Correct posture: skip the auto-pin when any element's key is
+// claimed by the resolver (resolver.RecognisesPartitionedKey).
+// The request flows with ObservedRouteVersion=0 and the M3 gate
+// short-circuits — restoring the pre-auto-pin "no gate"
+// behaviour for resolver-routed txns.  Adapters that want
+// resolver-aware M3 protection need a resolver-aware gate,
+// which is M5+ work.
+func TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForResolverRoutedTxn(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	txn := &composed1RetryingTransactional{firstErr: nil} // succeeds on first attempt
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+	coord.WithPartitionResolver(&stubPartitionResolver{
+		claimedPrefix: []byte("part:"),
+		gid:           1,
+	})
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true,
+		// StartTS, ReadKeys, ObservedRouteVersion all zero — none of
+		// the existing auto-pin skip gates fire.  The new gate
+		// (resolver-claimed key) must skip the auto-pin.
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("part:q1:1234"), Value: []byte("v")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.observedSeen, 1)
+	require.Equal(t, uint64(0), txn.observedSeen[0],
+		"resolver-claimed key must NOT be auto-pinned at Dispatch entry — verifyComposed1 uses the byte-range engine snapshot which does not reflect resolver routing, so the gate would spuriously reject every resolver-routed txn (codex P1 on 6a458a28)")
+}
