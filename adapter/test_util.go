@@ -358,17 +358,18 @@ func waitForWriteableLeader(t *testing.T, nodes []Node, timeout time.Duration) {
 		return
 	}
 	deadline := time.Now().Add(timeout)
-	const perProposeTimeout = 2 * time.Second
 	var lastErr error
 	for {
-		proposeCtx, cancel := context.WithTimeout(context.Background(), perProposeTimeout)
-		_, err := nodes[0].engine.Propose(proposeCtx, raftReadinessProbePayload)
-		cancel()
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
+		}
+		err := proposeReadinessOnce(nodes[0].engine, remaining)
 		if err == nil {
 			return
 		}
 		lastErr = err
-		if !isTransientNotLeaderErr(err) {
+		if !isReadinessProbeRetryable(err) {
 			t.Fatalf("readiness probe failed with non-transient error: %v", err)
 		}
 		if !time.Now().Before(deadline) {
@@ -376,6 +377,37 @@ func waitForWriteableLeader(t *testing.T, nodes []Node, timeout time.Duration) {
 		}
 		time.Sleep(leaderChurnRetryInterval)
 	}
+}
+
+// proposeReadinessOnce drives one no-op probe through the engine's
+// Propose, bounded by min(perProposeTimeout, remaining) so the
+// per-attempt ctx cannot block past the outer deadline (gemini PR
+// #898 HIGH point 1). Extracted from waitForWriteableLeader to keep
+// the outer loop under the cyclop budget; the retry/timeout
+// rationale lives at the call site.
+func proposeReadinessOnce(engine raftengine.Engine, remaining time.Duration) error {
+	const perProposeTimeout = 2 * time.Second
+	currTimeout := perProposeTimeout
+	if remaining < currTimeout {
+		currTimeout = remaining
+	}
+	proposeCtx, cancel := context.WithTimeout(context.Background(), currTimeout)
+	defer cancel()
+	_, err := engine.Propose(proposeCtx, raftReadinessProbePayload)
+	return err
+}
+
+// isReadinessProbeRetryable widens isTransientNotLeaderErr for the
+// readiness-probe loop: a per-propose ctx timeout under heavy CI
+// load returns context.DeadlineExceeded, which the base classifier
+// does NOT treat as transient. Without this widening the probe
+// would t.Fatalf on a slow runner instead of retrying within its
+// outer budget. context.Canceled is treated symmetrically (gemini
+// PR #898 HIGH point 2).
+func isReadinessProbeRetryable(err error) bool {
+	return isTransientNotLeaderErr(err) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
 }
 
 // waitForStableLeader polls the cluster until nodes[0] has been the leader
