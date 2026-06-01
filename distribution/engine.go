@@ -209,13 +209,15 @@ func (e *Engine) SnapshotAt(v uint64) (RouteHistorySnapshot, bool) {
 }
 
 // SetHistoryDepthForTest overrides the FIFO ring depth from outside
-// the package.  Test-only — callers MUST set the depth before the
-// Engine is shared with any concurrent reader (no internal
-// synchronisation here for the same reason TestEngineSnapshotAt_FIFOEviction
-// does the direct field write in-package; this seam exposes the
-// equivalent capability to external test packages that need a
-// small depth to exercise eviction without overwhelming TLC-style
-// bounded scenarios — claude review on PR #894).
+// the package.  Test-only.  Callers should set the depth before
+// sharing the Engine with concurrent SnapshotAt/Current readers to
+// avoid interleaving surprises around the eviction watermark, but
+// the write itself is lock-protected (e.mu.Lock below) so it is
+// safe to call from any goroutine that does not also expect a
+// consistent SnapshotAt view across the depth change.  Exists so
+// tests in the kv package can drive eviction-trigger scenarios
+// without adding a constructor option just for tests (claude
+// review on PR #894).
 //
 // Production code must use DefaultRouteHistoryDepth (32) or a
 // future operator-exposed config knob; this seam is build-time

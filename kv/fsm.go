@@ -580,6 +580,20 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 // outside the ring (M4 retry), and ErrComposed1Violation wrapped
 // with per-key context otherwise.
 func (f *kvFSM) verifyComposed1(r *pb.Request) error {
+	// ABORT requests MUST always reach the abort handler so the
+	// txn's intent locks get released.  If a route shifted between
+	// PREPARE and ABORT (or the observed version was evicted), a
+	// rejected ABORT would leave the locks pinned until LockResolver
+	// noticed at TTL expiry — minutes of write-blocked keys for
+	// what should be a one-RPC cleanup.  Production callers carry
+	// ObservedRouteVersion=0 on ABORT (the existing observedVer==0
+	// check below handles that case), so this guard is defensive
+	// belt-and-suspenders: any future ABORT construction site that
+	// inadvertently sets the version still bypasses the gate
+	// (gemini HIGH on PR #895 — fail-open on ABORT).
+	if r.GetPhase() == pb.Phase_ABORT {
+		return nil
+	}
 	// Bypass the gate when EITHER the route history is unwired OR
 	// the FSM's shardGroupID is the unset sentinel (0).  Both
 	// fields are documented as "unset ⇒ short-circuit" but the

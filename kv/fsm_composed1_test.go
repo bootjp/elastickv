@@ -28,11 +28,6 @@ func applyComposed1Snapshot(t *testing.T, e *distribution.Engine, version uint64
 // shard group ID the gate compares against.  Production wiring lives
 // in main.go's buildShardGroups; this helper short-circuits to the
 // test-only fixture without spinning up a real Raft group.
-//
-// the helper keeps it as a parameter so a future test can exercise
-// the "wrong-group" case without re-deriving the boilerplate.
-//
-//nolint:unparam // shardGroupID is currently always 1 in tests but
 func newComposed1FSM(t *testing.T, e *distribution.Engine, shardGroupID uint64) *kvFSM {
 	t.Helper()
 	fsmIface := NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC(),
@@ -255,4 +250,74 @@ func TestVerifyComposed1_ShardGroupIDZeroSkipsGate(t *testing.T) {
 		require.False(t, errors.Is(err, ErrComposed1VersionGCd),
 			"shardGroupID=0 must bypass before any ring lookup, so ErrComposed1VersionGCd must not surface either")
 	}
+}
+
+// TestVerifyComposed1_ValidOwnershipPassesGate is the happy-path
+// witness the gate suite was missing (claude follow-up review on
+// PR #895): when this FSM serves the group that owns the key at
+// BOTH the txn's observed version AND the current catalog version,
+// verifyComposed1 returns nil.  Without this test an off-by-one
+// in OwnerOf, a reversed comparison, or an inadvertent sign-flip
+// in the group-ID match would silently false-reject every valid
+// commit and the failure-only suite would not catch it.
+func TestVerifyComposed1_ValidOwnershipPassesGate(t *testing.T) {
+	t.Parallel()
+
+	// At v=1 AND v=2, key "k" is owned by group 1.  An FSM serving
+	// group 1 must allow a commit pinned at v=1 to pass both the
+	// observed-version check (routes[1][k] = g1) and the
+	// current-version fence (routes[2][k] = g1).
+	e := distribution.NewEngine()
+	applyComposed1Snapshot(t, e, 1, []distribution.RouteDescriptor{
+		{RouteID: 100, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	applyComposed1Snapshot(t, e, 2, []distribution.RouteDescriptor{
+		{RouteID: 101, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, e, 1)
+
+	require.NoError(t, fsm.verifyComposed1(commitTxnRequest(1, "k")),
+		"verifyComposed1 must return nil when this FSM's shardGroupID matches the owner at BOTH the observed version and the current catalog version — covers the happy path neither the failure tests nor the bypass tests exercise")
+}
+
+// TestVerifyComposed1_AbortPhaseSkipsGate is the regression for the
+// gemini HIGH finding on PR #895: ABORT requests MUST bypass the
+// Composed-1 gate so that a route shift between PREPARE and ABORT
+// cannot strand the txn's intent locks.  Without the early
+// Phase_ABORT short-circuit, an ABORT that arrives at the wrong
+// group after a MoveRange would fail with ErrComposed1Violation and
+// the locks would remain pinned until LockResolver's TTL — minutes
+// of write-blocked keys for what should be a one-RPC cleanup.
+//
+// The production callers (transaction.go and sharded_coordinator.go)
+// happen to leave ObservedRouteVersion=0 on ABORT, so today the
+// existing observedVer==0 branch already protects them, but that's
+// enforcement-by-convention.  The Phase_ABORT guard is
+// enforcement-in-code: a future ABORT construction site that
+// inadvertently copies a COMMIT request struct would still bypass.
+func TestVerifyComposed1_AbortPhaseSkipsGate(t *testing.T) {
+	t.Parallel()
+
+	// Wire the engine so that, absent the ABORT bypass, the gate
+	// would reject: key "k" is owned by group 5 at v=1 but the
+	// FSM serves group 1.  The test deliberately sets
+	// ObservedRouteVersion=1 (non-zero) on the ABORT to defeat the
+	// existing observedVer==0 short-circuit and isolate the
+	// Phase_ABORT guard.
+	e := distribution.NewEngine()
+	applyComposed1Snapshot(t, e, 1, []distribution.RouteDescriptor{
+		{RouteID: 100, Start: []byte(""), End: nil, GroupID: 5, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, e, 1)
+
+	abortReq := &pb.Request{
+		IsTxn:                true,
+		Phase:                pb.Phase_ABORT,
+		ObservedRouteVersion: 1,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_DEL, Key: []byte("k")},
+		},
+	}
+	require.NoError(t, fsm.verifyComposed1(abortReq),
+		"ABORT requests must bypass the Composed-1 gate even with a non-zero ObservedRouteVersion pinned, so a route shift between PREPARE and ABORT cannot strand the txn's intent locks past lock-resolver TTL")
 }
