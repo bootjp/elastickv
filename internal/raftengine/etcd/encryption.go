@@ -33,6 +33,31 @@ var ErrEncryptionApply = encryption.ErrEncryptionApply
 // recovery path.
 var ErrRaftUnwrapFailed = errors.New("raftengine/etcd: raft envelope unwrap failed; halting apply")
 
+// ErrEnvelopeCutoverInProgress is returned by Engine.Propose (and
+// the coordinator wrap-on-propose path) while the §7.1
+// proposal-quiescence barrier owned by EnableRaftEnvelope is open:
+// new user proposals are rejected with this error so the barrier
+// can drain the in-flight set and atomically flip wrap-on-propose
+// without the leader admitting a plaintext proposal at
+// `index > raftEnvelopeCutoverIndex`.
+//
+// The barrier admits exactly two source classes:
+//
+//   - The cutover entry itself, proposed by EnableRaftEnvelope
+//     (source = "encryption_admin") — without this exemption the
+//     barrier would deadlock on its own cutover proposal.
+//   - ConfChange-time RegisterEncryptionWriter proposals (Stage 7c
+//     §3.1) which also pass source = "encryption_admin" because
+//     a new member joining mid-barrier must still be able to
+//     register its writer-registry entry.
+//
+// All other Propose calls receive ErrEnvelopeCutoverInProgress
+// during the barrier window. Caller policy: surface this as a
+// retryable error to the client — the barrier completes in
+// O(in-flight-drain-time) and the next attempt will succeed under
+// the new (wrapped) regime.
+var ErrEnvelopeCutoverInProgress = errors.New("raftengine/etcd: raft envelope cutover barrier open; retry shortly")
+
 // RaftCutoverIndex returns the §7.1 Phase 2 cutover Raft index.
 // Entries with index strictly greater than the returned value carry
 // raft-envelope-wrapped fsm payloads; entries at or below the

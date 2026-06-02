@@ -85,6 +85,31 @@ func envelopeEntry(t *testing.T, c *encryption.Cipher, kid uint32, index uint64,
 // refuse to apply, NOT silently hand wrapped envelope bytes to
 // fsm.Apply. The latter would permanently diverge this node from
 // peers that DID unwrap and apply the cleartext.
+// TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure pins
+// the §7.1 barrier's typed error as a separate sentinel from
+// ErrRaftUnwrapFailed. The two have very different operator
+// responses: cutover-in-progress is a retryable transient (the
+// barrier completes in drain-time, then the next attempt
+// succeeds under the new wrapped regime), while unwrap-failed is
+// process-fatal (sidecar / Raft-log divergence or KEK custody
+// problem). A caller that confuses them would either drop
+// retryable cutover-window proposals on the floor or paper over
+// a fatal data-integrity error with a retry loop. errors.Is
+// distinguishes them; this test pins that distinction so future
+// refactors of the error chain do not silently merge the two.
+func TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure(t *testing.T) {
+	t.Parallel()
+	if errors.Is(ErrEnvelopeCutoverInProgress, ErrRaftUnwrapFailed) {
+		t.Error("ErrEnvelopeCutoverInProgress matches ErrRaftUnwrapFailed; the §7.1 barrier sentinel must be a distinct error chain")
+	}
+	if errors.Is(ErrRaftUnwrapFailed, ErrEnvelopeCutoverInProgress) {
+		t.Error("ErrRaftUnwrapFailed matches ErrEnvelopeCutoverInProgress; the process-fatal sentinel must not be misclassified as retryable")
+	}
+	if !errors.Is(ErrEnvelopeCutoverInProgress, ErrEnvelopeCutoverInProgress) {
+		t.Error("ErrEnvelopeCutoverInProgress fails errors.Is against itself")
+	}
+}
+
 func TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed(t *testing.T) {
 	t.Parallel()
 	const cutover uint64 = 100
