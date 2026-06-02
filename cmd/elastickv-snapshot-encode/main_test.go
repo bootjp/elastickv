@@ -23,26 +23,28 @@ var isWindows = runtime.GOOS == "windows"
 // with the given lastCommitTS. Used by every CLI test as the producer-
 // side artifact the encoder will consume.
 //
-// Populates manifest.Adapters with ALL FOUR adapter scopes (each as
-// a non-nil &Adapter{} so the codex P2 v26 #904 validation
-// — validateAdaptersAgainstManifest — sees a manifest that claims
-// every adapter was dumped. Also creates an empty subdir for each
-// adapter under outRoot so the same validation's on-disk-stat guard
-// passes (the encoder treats an empty subdir as no-op, matching the
-// "no records to encode" semantics).
+// Populates manifest.Adapters with a non-nil &Adapter{} per adapter,
+// matching what the decoder's populateAdapterScopes would emit. When
+// the corresponding on-disk subdir is already populated (e.g. a
+// writeSQSFixture call ran before emitMinimalManifest), this helper
+// scans the subdir and stamps a placeholder scope entry of the right
+// kind (Tables / Buckets / Databases / Queues) so v29's adapter-scope
+// validation sees a manifest that matches the on-disk shape (codex
+// P2 v28 #904 — empty scope + non-empty subdir was the bug).
 //
-// Tests that need to assert rejection on specific adapter-scope
-// scenarios (e.g. manifest missing one adapter) can mutate the
-// manifest or filesystem after this returns.
+// Then creates empty subdirs for any adapter not already populated so
+// validateAdaptersAgainstManifest's empty-scope-empty-subdir branch
+// passes. Tests that need a specific adapter-scope mismatch bypass
+// this helper and write a custom manifest.
 func emitMinimalManifest(t *testing.T, outRoot string, lastCommitTS uint64) {
 	t.Helper()
 	m := backup.NewPhase0SnapshotManifest(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
 	m.LastCommitTS = lastCommitTS
 	m.Adapters = &backup.Adapters{
-		DynamoDB: &backup.Adapter{},
-		S3:       &backup.Adapter{},
-		Redis:    &backup.Adapter{},
-		SQS:      &backup.Adapter{},
+		DynamoDB: scopeForPopulatedSubdir(t, outRoot, "dynamodb", "tables"),
+		S3:       scopeForPopulatedSubdir(t, outRoot, "s3", "buckets"),
+		Redis:    scopeForPopulatedSubdir(t, outRoot, "redis", "databases"),
+		SQS:      scopeForPopulatedSubdir(t, outRoot, "sqs", "queues"),
 	}
 	m.Exclusions = &backup.Exclusions{}
 	f, err := os.Create(filepath.Join(outRoot, "MANIFEST.json"))
@@ -60,6 +62,31 @@ func emitMinimalManifest(t *testing.T, outRoot string, lastCommitTS uint64) {
 			t.Fatalf("MkdirAll %s: %v", sub, mkErr)
 		}
 	}
+}
+
+// scopeForPopulatedSubdir returns an empty Adapter{} when the named
+// subdir under outRoot is absent or empty, and an Adapter{} with a
+// single placeholder entry of the appropriate kind when the subdir
+// already has fixture content. The encoder doesn't consult the scope
+// content (it walks the on-disk subtree); the placeholder just keeps
+// v29's empty-scope-vs-non-empty-subdir guard happy.
+func scopeForPopulatedSubdir(t *testing.T, outRoot, sub, scopeKind string) *backup.Adapter {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(outRoot, sub))
+	if err != nil || len(entries) == 0 {
+		return &backup.Adapter{}
+	}
+	switch scopeKind {
+	case "tables":
+		return &backup.Adapter{Tables: []string{"placeholder"}}
+	case "buckets":
+		return &backup.Adapter{Buckets: []string{"placeholder"}}
+	case "databases":
+		return &backup.Adapter{Databases: []uint32{0}}
+	case "queues":
+		return &backup.Adapter{Queues: []string{"placeholder"}}
+	}
+	return &backup.Adapter{}
 }
 
 func quietLogger() *slog.Logger {
@@ -289,6 +316,54 @@ func TestCLIAcceptsEmptyAdapterScopeWithoutSubdir(t *testing.T) {
 	// Header-only .fsm should be published.
 	if _, statErr := os.Stat(out); statErr != nil {
 		t.Errorf(".fsm not published at %s: %v", out, statErr)
+	}
+}
+
+// TestCLIRejectsEmptyScopeWithStaleSubdir pins codex P2 v28 #904: the
+// inverse of v27. When MANIFEST.json says an adapter has an empty
+// scope (Adapter{}, no records dumped) but a stale on-disk subdir is
+// still populated (e.g., the input directory was reused or only
+// partially cleaned), the encoder would otherwise pick up the stale
+// subtree from cfg.adapters and publish records the manifest does
+// NOT declare. Fail closed.
+func TestCLIRejectsEmptyScopeWithStaleSubdir(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Manifest declares SQS with EMPTY scope, but write a stale
+	// sqs/ subdir with content.
+	m := backup.NewPhase0SnapshotManifest(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	m.LastCommitTS = 100
+	m.Adapters = &backup.Adapters{
+		DynamoDB: &backup.Adapter{},
+		S3:       &backup.Adapter{},
+		Redis:    &backup.Adapter{},
+		SQS:      &backup.Adapter{}, // declared empty
+	}
+	m.Exclusions = &backup.Exclusions{}
+	f, ferr := os.Create(filepath.Join(in, "MANIFEST.json"))
+	if ferr != nil {
+		t.Fatalf("create MANIFEST.json: %v", ferr)
+	}
+	if werr := backup.WriteManifest(f, m); werr != nil {
+		t.Fatalf("WriteManifest: %v", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	// Stale sqs/ tree from a prior decode the operator didn't clean.
+	if err := os.MkdirAll(filepath.Join(in, "sqs", "stale-queue"), 0o755); err != nil {
+		t.Fatalf("MkdirAll stale sqs subdir: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	code, err := run([]string{"--input", in, "--output", out, "--adapter", "sqs"}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want stale-subdir rejection")
+	}
+	if code != exitDataErr {
+		t.Errorf("exit code = %d, want %d (data-correctness)", code, exitDataErr)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Errorf(".fsm should not be published on stale-subdir rejection")
 	}
 }
 
