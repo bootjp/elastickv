@@ -2205,3 +2205,313 @@ func validAccessorObservation(id uint32, ok bool, wantDEKID uint32) bool {
 	}
 	return false
 }
+
+// --- Stage 6E-1: RotateSubEnableRaftEnvelope tests ---
+// Mirror the storage-envelope cutover tests but target the raft slot
+// + the RaftEnvelopeCutoverIndex (uint64 index, not bool flag).
+
+// TestApplyRotation_EnableRaftEnvelope_FreshSuccess pins Stage 6E-1
+// happy-path: after Bootstrap, a cutover entry with
+// DEKID == Active.Raft, Purpose == PurposeRaft, empty Wrapped sets
+// RaftEnvelopeCutoverIndex = raftIdx inside one sidecar fsync. The
+// ProposerRegistration row is inserted via the standard §4.1 case
+// dispatch covering the proposer's first encrypted write under the
+// now-active raft envelope.
+func TestApplyRotation_EnableRaftEnvelope_FreshSuccess(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		wrapped []byte
+	}{
+		{name: "nil_wrapped", wrapped: nil},
+		{name: "empty_wrapped", wrapped: []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runRaftCutoverFreshSuccess(t, tc.wrapped)
+		})
+	}
+}
+
+func runRaftCutoverFreshSuccess(t *testing.T, wrapped []byte) {
+	t.Helper()
+	reg := newMapRegistryStore()
+	ks := encryption.NewKeystore()
+	dir := t.TempDir()
+	sidecarPath := dir + "/keys.json"
+	app, err := encryption.NewApplier(reg,
+		encryption.WithKEK(&fakeKEK{}),
+		encryption.WithKeystore(ks),
+		encryption.WithSidecarPath(sidecarPath),
+	)
+	if err != nil {
+		t.Fatalf("NewApplier: %v", err)
+	}
+	if err := app.ApplyBootstrap(100, fsmwire.BootstrapPayload{
+		StorageDEKID: 7, WrappedStorage: []byte("s"),
+		RaftDEKID: 8, WrappedRaft: []byte("r"),
+		BatchRegistry: []fsmwire.RegistrationPayload{
+			{DEKID: 8, FullNodeID: 0xBBBB, LocalEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("ApplyBootstrap: %v", err)
+	}
+	const raftCutoverIdx uint64 = 600
+	if err := app.ApplyRotation(raftCutoverIdx, fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:   8, // matches sidecar.Active.Raft
+		Purpose: fsmwire.PurposeRaft,
+		Wrapped: wrapped,
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID: 8, FullNodeID: 0xBBBB, LocalEpoch: 1,
+		},
+	}); err != nil {
+		t.Fatalf("ApplyRotation raft-cutover: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftEnvelopeCutoverIndex != raftCutoverIdx {
+		t.Errorf("RaftEnvelopeCutoverIndex = %d, want %d",
+			sc.RaftEnvelopeCutoverIndex, raftCutoverIdx)
+	}
+	if sc.RaftAppliedIndex != raftCutoverIdx {
+		t.Errorf("RaftAppliedIndex = %d, want %d",
+			sc.RaftAppliedIndex, raftCutoverIdx)
+	}
+	if sc.Active.Raft != 8 {
+		t.Errorf("Active.Raft = %d, want 8 (raft-cutover should not re-point)",
+			sc.Active.Raft)
+	}
+	// Storage cutover state must remain untouched — raft-envelope
+	// cutover is independent of storage-envelope cutover.
+	if sc.StorageEnvelopeActive {
+		t.Error("StorageEnvelopeActive flipped by raft-cutover, want unchanged")
+	}
+	if sc.StorageEnvelopeCutoverIndex != 0 {
+		t.Errorf("StorageEnvelopeCutoverIndex = %d, want 0 (raft-cutover should not touch storage)",
+			sc.StorageEnvelopeCutoverIndex)
+	}
+	assertProposerEpoch(t, reg, 8, 0xBBBB, 1)
+}
+
+// TestApplyRotation_EnableRaftEnvelope_RejectsNonRaftPurpose pins
+// payload constraint #1: Purpose == PurposeStorage on a
+// raft-envelope cutover entry MUST halt apply rather than silently
+// mis-routing the cutover through the wrong slot accounting.
+func TestApplyRotation_EnableRaftEnvelope_RejectsNonRaftPurpose(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeStorage, // wrong
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	})
+	if err == nil {
+		t.Fatal("expected halt on non-raft purpose, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertRaftCutoverNotApplied(t, sidecarPath)
+}
+
+// TestApplyRotation_EnableRaftEnvelope_RejectsNonEmptyWrapped pins
+// payload constraint #2: a raft-envelope cutover carries
+// `Wrapped` empty (the active DEK is referenced by DEKID, not
+// re-shipped). A non-empty Wrapped is malformed and must halt
+// apply.
+func TestApplyRotation_EnableRaftEnvelope_RejectsNonEmptyWrapped(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{0xDE, 0xAD, 0xBE, 0xEF}, // non-empty
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	})
+	if err == nil {
+		t.Fatal("expected halt on non-empty Wrapped, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertRaftCutoverNotApplied(t, sidecarPath)
+}
+
+// TestApplyRotation_EnableRaftEnvelope_RejectsProposerDEKMismatch
+// pins payload constraint #3: ProposerRegistration.DEKID MUST
+// equal payload DEKID. A mismatch would silently insert a
+// writer-registry row against an unrelated DEK while leaving the
+// cutover-target DEK unregistered — the same shape that the
+// rotate-dek variant guards against.
+func TestApplyRotation_EnableRaftEnvelope_RejectsProposerDEKMismatch(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(500, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID + 1, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	})
+	if err == nil {
+		t.Fatal("expected halt on proposer dek mismatch, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertRaftCutoverNotApplied(t, sidecarPath)
+}
+
+// TestApplyRotation_EnableRaftEnvelope_RejectsZeroRaftIndex pins a
+// fail-closed pre-check: `RaftEnvelopeCutoverIndex != 0` is the
+// sole "Phase-2 active" sentinel for the raft variant (unlike the
+// storage variant which carries a separate `StorageEnvelopeActive`
+// bool). If the apply path ever receives raftIdx == 0 — a sentinel
+// elsewhere meaning "no index supplied" — the fresh-success branch
+// would persist the proposer-registration row, leave
+// `RaftEnvelopeCutoverIndex` at 0 (logically inactive), and return
+// nil, while replays would re-enter the fresh-success branch since
+// the already-active short-circuit only fires on `!= 0`. Reject
+// raftIdx == 0 before any sidecar mutation so the apply halts.
+func TestApplyRotation_EnableRaftEnvelope_RejectsZeroRaftIndex(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(0, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	})
+	if err == nil {
+		t.Fatal("expected halt on raftIdx == 0, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertRaftCutoverNotApplied(t, sidecarPath)
+}
+
+// TestApplyRotation_EnableRaftEnvelope_StaleDEKID_BenignNoOp pins
+// constraint #3 from the design: a RotateDEK race between propose
+// and apply that advances sidecar.Active.Raft past payload DEKID
+// is a benign no-op. Advance RaftAppliedIndex (so the entry is
+// not replayed) but do NOT mutate RaftEnvelopeCutoverIndex.
+func TestApplyRotation_EnableRaftEnvelope_StaleDEKID_BenignNoOp(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	// Stage a RotateDEK that advances Active.Raft from
+	// cutoverBootstrapRaftDEKID to a new id — simulates "RotateDEK
+	// raced between cutover propose and apply" (mirrors the
+	// storage stale-DEKID test setup). The RotateDEK path
+	// crash-durably writes both Active.Raft AND the keys[] entry
+	// so the sidecar validator accepts the new state.
+	const newRaftDEKID uint32 = 99
+	if err := app.ApplyRotation(200, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                newRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte("new-raft-dek"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: newRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("ApplyRotation RotateDEK: %v", err)
+	}
+	// Now the cutover lands but still carries the stale DEKID.
+	const staleIdx uint64 = 300
+	if err := app.ApplyRotation(staleIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID, // stale — Active.Raft moved to newRaftDEKID
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 2},
+	}); err != nil {
+		t.Fatalf("stale-DEKID raft-cutover MUST be a benign no-op (no halt), got: %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		t.Errorf("RaftEnvelopeCutoverIndex = %d on stale-DEKID no-op, want 0",
+			sc.RaftEnvelopeCutoverIndex)
+	}
+	if sc.RaftAppliedIndex != staleIdx {
+		t.Errorf("RaftAppliedIndex = %d, want %d (no-op must still advance applied)",
+			sc.RaftAppliedIndex, staleIdx)
+	}
+	if sc.Active.Raft != newRaftDEKID {
+		t.Errorf("Active.Raft = %d, want %d", sc.Active.Raft, newRaftDEKID)
+	}
+}
+
+// TestApplyRotation_EnableRaftEnvelope_AlreadyActive_IdempotentNoOp
+// pins constraint #4: a duplicate cutover entry (Phase-2 already
+// active) is idempotent. The original RaftEnvelopeCutoverIndex
+// (set by the first apply) is preserved as the stable
+// idempotency token; only RaftAppliedIndex advances so the
+// duplicate is not replayed. The ProposerRegistration field is
+// intentionally NOT re-inserted — the first apply ran
+// ApplyRegistration before WriteSidecar, so the invariant
+// "RaftEnvelopeCutoverIndex != 0 ⇒ registration row already on
+// disk" holds across crash-restart.
+func TestApplyRotation_EnableRaftEnvelope_AlreadyActive_IdempotentNoOp(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	const firstIdx uint64 = 500
+	if err := app.ApplyRotation(firstIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("first cutover: %v", err)
+	}
+	const duplicateIdx uint64 = 501
+	if err := app.ApplyRotation(duplicateIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 2},
+	}); err != nil {
+		t.Fatalf("duplicate cutover must be idempotent no-op, got %v", err)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftEnvelopeCutoverIndex != firstIdx {
+		t.Errorf("RaftEnvelopeCutoverIndex = %d on duplicate, want %d (first-apply value must be preserved)",
+			sc.RaftEnvelopeCutoverIndex, firstIdx)
+	}
+	if sc.RaftAppliedIndex != duplicateIdx {
+		t.Errorf("RaftAppliedIndex = %d, want %d (duplicate must still advance applied)",
+			sc.RaftAppliedIndex, duplicateIdx)
+	}
+}
+
+// assertRaftCutoverNotApplied verifies a rejected raft-envelope
+// cutover left the cutover sidecar state untouched.
+func assertRaftCutoverNotApplied(t *testing.T, sidecarPath string) {
+	t.Helper()
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		t.Errorf("RaftEnvelopeCutoverIndex = %d despite halt, want 0",
+			sc.RaftEnvelopeCutoverIndex)
+	}
+}

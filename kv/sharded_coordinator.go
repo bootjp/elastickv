@@ -134,6 +134,16 @@ const (
 
 	txnSecondaryCommitRetryAttempts = 3
 	txnSecondaryCommitRetryBackoff  = 20 * time.Millisecond
+
+	// composed1RetryAttempts bounds how many times Dispatch re-issues a
+	// txn after the FSM's M3 verifyComposed1 gate returned
+	// ErrComposed1Violation / ErrComposed1VersionGCd.  Per design doc
+	// §M4: "retries it once" — so the total attempt count is 1 (initial)
+	// + composed1RetryAttempts = 2.  Beyond one retry the sentinel
+	// surfaces unchanged so the client (or a wrapping retry harness in
+	// the adapter) sees the failure rather than the coordinator spinning
+	// on a persistent route shift.
+	composed1RetryAttempts = 1
 )
 
 // ShardedCoordinator routes operations to shard-specific raft groups.
@@ -436,6 +446,23 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
 	}
 
+	// Capture whether the caller supplied a non-zero StartTS BEFORE
+	// the coordinator-allocates-on-zero branch below mutates the
+	// field.  A caller-supplied StartTS names a specific snapshot
+	// the caller already read against (e.g. adapter/s3.go:573
+	// reads bucket metadata at readTS and dispatches with
+	// StartTS=readTS; adapter/sqs_messages.go and adapter/dynamodb.go
+	// follow the same readTS-then-mutate pattern across dozens of
+	// sites).  The pre-Dispatch read is invisible to the
+	// coordinator — it is NOT surfaced as a ReadKeys entry — so
+	// the only signal that the snapshot is owned by the caller is
+	// reqs.StartTS being non-zero on entry.  The M4 retry path
+	// uses this to gate the StartTS bump: bumping a caller-owned
+	// timestamp would let any commit landed in (originalStartTS,
+	// newStartTS) bypass the FSM's latest>startTS write-conflict
+	// check (codex P1 on 57da8886, PR #900).
+	callerSuppliedStartTS := reqs.IsTxn && reqs.StartTS != 0
+
 	if reqs.IsTxn && reqs.StartTS == 0 {
 		startTS, err := c.nextStartTS(ctx, reqs.Elems)
 		if err != nil {
@@ -450,10 +477,235 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)
+		return c.dispatchTxnWithComposed1Retry(ctx, reqs, callerSuppliedStartTS)
 	}
 
 	return c.dispatchNonTxn(ctx, reqs)
+}
+
+// dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
+// (design doc
+// docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+// §M4).  Pins reqs.ObservedRouteVersion to the engine's current
+// catalog version on the FIRST attempt when the caller left it at the
+// zero sentinel — every txn that flows through ShardedCoordinator
+// gets gate-eligible by default so the M3 verifyComposed1 check has
+// teeth without each adapter rediscovering the contract.  On
+// ErrComposed1Violation or ErrComposed1VersionGCd, re-reads the
+// catalog version, re-stamps observed+commit on the OperationGroup,
+// and re-issues dispatchTxn ONCE.  Beyond one retry the sentinel
+// surfaces unchanged.
+//
+// The retry is bounded at composed1RetryAttempts = 1 because both
+// sentinels are "route shifted, retry on the fresh catalog" signals
+// — a persistent failure across two attempts means the catalog is
+// churning faster than this dispatch can keep up, and surfacing the
+// error lets a wrapping adapter retry harness (or the client) decide
+// whether to keep trying.
+// maybeAutoPinObservedRouteVersion stamps reqs.ObservedRouteVersion
+// with the engine's current catalog version at Dispatch entry, but
+// ONLY when (a) the txn has no read keys AND (b) the caller did not
+// supply StartTS AND (c) no element's key is claimed by a partition
+// resolver.  Per design doc §4.1 the version must be pinned at
+// BeginTxn (read-set capture time); the auto-pin is a best-effort
+// backfill for callers that have not yet migrated to pin
+// themselves.  Three cases skip the auto-pin:
+//
+//   - len(ReadKeys) != 0 — the caller already performed reads at
+//     some earlier moment (Redis MULTI/EXEC's txnContext.commit
+//     builds an OperationGroup with StartTS from MULTI and
+//     ReadKeys from the GETs inside the txn body).  Stamping the
+//     catalog version at this Dispatch call would associate
+//     post-shift routes with pre-shift reads (codex P1 on
+//     10123c5a, PR #900).
+//
+//   - callerSuppliedStartTS — the caller supplied StartTS,
+//     meaning a read at the adapter layer happened against that
+//     snapshot before Dispatch even though it is not surfaced as
+//     a ReadKeys entry.  The 13+ S3/SQS/DynamoDB adapter sites
+//     identified in the M4-StartTS-gate audit (adapter/s3.go:573
+//     etc.) fall in this bucket.  Stamping the catalog version
+//     at Dispatch time would mask any route shift between the
+//     adapter-layer read and Dispatch entry — verifyComposed1
+//     would find no mismatch at apply time and the shift becomes
+//     INVISIBLE.  That is strictly worse than ObservedRouteVersion=0
+//     (gate short-circuits, no false claim made): the spurious
+//     auto-pin gives false confidence (codex P1 on 144ec0ca,
+//     PR #900).
+//
+//   - any element's key is resolver-claimed — when a
+//     PartitionResolver is wired (SQS HT-FIFO partition keys
+//     etc.), ShardRouter routes via the resolver but
+//     verifyComposed1 calls route-history OwnerOf on the raw
+//     mutation key against the BYTE-RANGE engine snapshot.  The
+//     engine has no knowledge of the resolver's mapping, so the
+//     gate spuriously rejects resolver-routed commits even when
+//     the resolver picked the correct gid.  Skip the auto-pin
+//     for any resolver-recognised key; the request flows with
+//     ObservedRouteVersion=0 and the M3 gate short-circuits —
+//     restoring the pre-auto-pin behaviour for resolver-routed
+//     txns.  Resolver-aware M3 is M5+ work (codex P1 on
+//     6a458a28, PR #900).
+//
+// The non-auto-pin case (request flows with ObservedRouteVersion=0,
+// M3 gate short-circuits) is the safe non-regressing posture for
+// non-migrated callers — the gate cannot retroactively pin reads
+// it was not present for.  Adapters that want M3 protection must
+// migrate to pin at BeginTxn per §4.1.
+//
+// Extracted from dispatchTxnWithComposed1Retry to keep its
+// cyclomatic complexity in the cyclop budget.
+func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGroup[OP], callerSuppliedStartTS bool) {
+	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 || callerSuppliedStartTS {
+		return
+	}
+	if c.anyResolverClaimedKey(reqs.Elems) {
+		return
+	}
+	reqs.ObservedRouteVersion = c.engine.Version()
+}
+
+// anyResolverClaimedKey reports whether any element's key is
+// claimed by the partition resolver.  Returns false when the
+// router has no resolver installed (the most common case) so the
+// auto-pin path stays inexpensive in the byte-range-only deployment.
+// Extracted from maybeAutoPinObservedRouteVersion to keep the
+// auto-pin's cyclomatic complexity in the cyclop budget.
+func (c *ShardedCoordinator) anyResolverClaimedKey(elems []*Elem[OP]) bool {
+	if c.router == nil || c.router.partitionResolver == nil {
+		return false
+	}
+	for _, e := range elems {
+		if e == nil || len(e.Key) == 0 {
+			continue
+		}
+		if c.router.partitionResolver.RecognisesPartitionedKey(e.Key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
+	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
+
+	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
+		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)
+		if err == nil {
+			return resp, nil
+		}
+		if !isComposed1RetryableError(err) {
+			return resp, err
+		}
+		// Read-write txns (ReadKeys non-empty) MUST surface the
+		// sentinel without retry.  The client already performed
+		// the reads at the original StartTS; transparently bumping
+		// StartTS on retry would let any concurrent write that
+		// committed between the old and new timestamps go
+		// undetected by the FSM's OCC check (which only rejects
+		// versions with `latest > startTS`), letting the retry
+		// commit decisions based on stale reads — a strict-
+		// serialisability violation (gemini CRITICAL / codex P1
+		// on PR #900).
+		//
+		// The caller / adapter is responsible for re-executing the
+		// entire txn (including re-reading the keys at a fresh
+		// timestamp) when this sentinel surfaces.  Write-only
+		// txns (no reads to invalidate) remain safe to retry.
+		if len(reqs.ReadKeys) > 0 {
+			return resp, err
+		}
+		// Caller-supplied StartTS (ReadKeys-empty case) MUST also
+		// surface — the caller's pre-Dispatch read at this snapshot
+		// is invisible to the coordinator, so we cannot prove the
+		// retry's bumped StartTS would still preserve OCC against
+		// commits landed in (originalStartTS, newStartTS).  This
+		// catches dozens of adapter sites that supply
+		// StartTS=readTS without populating ReadKeys: S3
+		// createBucket / admin object writes, SQS messages /
+		// FIFO / purge / tags, DynamoDB metadata writes, etc.
+		// Only coordinator-allocated StartTS (caller passed 0
+		// at Dispatch entry, the coordinator allocated it from
+		// nextStartTS, and no read has happened at it) is safe
+		// to bump on retry (codex P1 on 57da8886, PR #900).
+		if callerSuppliedStartTS {
+			return resp, err
+		}
+		if attempt == composed1RetryAttempts {
+			return resp, err
+		}
+		// Re-route by re-reading the engine's current catalog
+		// version and stamping it on the txn.  groupMutations on
+		// the next dispatchTxn pass re-runs router.ResolveGroup,
+		// so a key whose owning group changed since the last
+		// attempt naturally lands on the new group's FSM.
+		if c.engine != nil {
+			reqs.ObservedRouteVersion = c.engine.Version()
+		}
+		// Clear the timestamps so the next attempt allocates a
+		// fresh pair against the post-shift HLC.  The OCC
+		// invariants require commitTS > startTS computed under the
+		// same HLC observation; reusing the stale pair would risk
+		// a startTS that no longer dominates the new shard's
+		// applied commitTS.
+		//
+		// Allocate StartTS unconditionally — nextStartTS already
+		// handles the nil-clock case (falls back to
+		// maxTS+1 internally).  Gating on c.clock!=nil would leave
+		// reqs.StartTS at 0 in the nil-clock test fixture, and
+		// dispatchTxn does NOT re-allocate when StartTS is zero,
+		// so the retry would run with StartTS=0 — violating MVCC
+		// invariants (gemini HIGH on PR #900).
+		reqs.CommitTS = 0
+		// IMPORTANT — do NOT clear reqs.PrevCommitTS here.  An earlier
+		// round of this PR did (taking claude[bot]'s reasoning at face
+		// value: "M3 fired at apply time, so the original attempt never
+		// committed → probe is stale").  That reasoning conflates two
+		// different "original attempts" and is wrong (codex P1 on
+		// 43c55dfe, PR #900):
+		//
+		//   * Within M4: attempt 1's M3 rejection does prove attempt 1
+		//     did not write anything (the FSM rejects before any state
+		//     change).
+		//   * Across adapter retries: PrevCommitTS names the
+		//     ADAPTER'S prior attempt (e.g. adapter/redis.go:3209,
+		//     :3615 send PrevCommitTS = pending.commitTS as the
+		//     option-2 ambiguous-outcome probe).  That earlier
+		//     attempt may have actually landed at the named commitTS
+		//     before the route shift that triggered our M3 sentinel.
+		//
+		// Dropping the probe in the retry would let the FSM re-apply
+		// the writes against the post-shift route, double-writing the
+		// caller's at-most-once-payload if the named prior attempt did
+		// land.  Preserving it has the cost that
+		// dispatchMultiShardTxn:749 surfaces
+		// ErrTxnDedupRequiresSingleShard when the post-shift route now
+		// spans multiple groups — which IS the faithful signal: the
+		// adapter's at-most-once retry contract cannot be transparently
+		// honoured across a shard split, and the caller must reckon
+		// with the ambiguity at a higher level (re-read, re-execute,
+		// abort).  Surfacing that error is strictly safer than silently
+		// losing dedup.
+		startTS, allocErr := c.nextStartTS(ctx, reqs.Elems)
+		if allocErr != nil {
+			// resp here is the failed first attempt's response (always
+			// nil for the Composed-1 sentinels) — return nil
+			// explicitly so the contract "non-nil response on success
+			// only" is unambiguous (claude[bot] nit on PR #900).
+			return nil, allocErr
+		}
+		reqs.StartTS = startTS
+	}
+	// Unreachable — the loop body always returns on each iteration.
+	// Kept here so the function has an unambiguous return shape.
+	return nil, errors.WithStack(ErrInvalidRequest)
+}
+
+// isComposed1RetryableError reports whether err is one of the M3 gate
+// sentinels that M4 retries.  Both surface as wrapped errors from the
+// underlying transactional Commit; errors.Is unwraps them correctly.
+func isComposed1RetryableError(err error) bool {
+	return errors.Is(err, ErrComposed1Violation) || errors.Is(err, ErrComposed1VersionGCd)
 }
 
 // dispatchNonTxn routes a non-transactional operation group through the
@@ -638,7 +890,23 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, errors.WithStack(err)
 	}
 
-	maxIndex = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion)
+	// commitSecondaryTxns propagates ObservedRouteVersion to per-
+	// secondary commits so the M3 gate fires on route shifts between
+	// primary-COMMIT and secondary-COMMIT.  Such a sentinel surfaces
+	// as ErrTxnSecondaryRouteShiftedAfterPrimaryCommit (NOT
+	// ErrComposed1Violation — the M4 retry must not loop here; the
+	// primary is already durable and re-prewriting would conflict
+	// with the existing locks).  d8487672 originally tried to avoid
+	// the silent-partial-commit hazard by dropping the gate; codex
+	// P1 (20:30:35) correctly showed that the dropped-gate posture
+	// silently lands writes on stale owners that are no longer
+	// reachable by readers on the new owner.  Both directions are
+	// silent partial commits; surfacing the error is the only honest
+	// posture (codex P1 on d8487672 + 6202b964, PR #900).
+	maxIndex, err = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
@@ -778,11 +1046,28 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 	return primaryGid, r.CommitIndex, nil
 }
 
-func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) uint64 {
-	// Secondary commits are best-effort. If a shard is unavailable after the
-	// primary commits, read-time lock resolution will commit the remaining
-	// secondaries based on the primary commit record. Retry a few times to
-	// absorb short leader-election windows and reduce lock lag.
+func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) (uint64, error) {
+	// Secondary commits are best-effort for non-Composed-1 errors:
+	// if a shard is unavailable after the primary commits, read-time
+	// lock resolution will commit the remaining secondaries based on
+	// the primary commit record.  Retry a few times to absorb short
+	// leader-election windows and reduce lock lag.
+	//
+	// Composed-1 errors are an exception (codex P1 on d8487672 +
+	// 6202b964, PR #900).  When the M3 gate fires on a secondary
+	// commit, the route catalog has moved between primary-COMMIT and
+	// this secondary-COMMIT — the prepared lock lives at the old
+	// gid, the new owner per the catalog has no commit record.  We
+	// CANNOT silently land the write on the stale owner (codex 20:30:35
+	// — that's invisible to readers on the new owner) and we CANNOT
+	// silently swallow the error (codex 20:10:32 — uncommitted
+	// secondary, silent partial commit on the missing direction).
+	// The only honest posture is to surface
+	// ErrTxnSecondaryRouteShiftedAfterPrimaryCommit so the caller
+	// knows the txn state is uncertain and can do application-level
+	// recovery.  This sentinel is distinct from ErrComposed1Violation
+	// so the M4 retry path does not loop here (the primary is durable
+	// and re-prewriting would conflict with the existing locks).
 	meta := txnMetaMutation(primaryKey, 0, commitTS)
 	for _, gid := range gids {
 		if gid == primaryGid {
@@ -801,6 +1086,20 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 		}
 		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
+			if isComposed1RetryableError(err) {
+				// Fatal: surface the new sentinel so the caller is
+				// informed that the secondary's write is missing and
+				// the txn state is half-committed.  M4 retry won't
+				// match this sentinel, so it doesn't loop.
+				c.logger().Warn("txn secondary commit failed Composed-1 — surfacing as fatal",
+					slog.Uint64("gid", gid),
+					slog.String("primary_key", string(primaryKey)),
+					slog.Uint64("start_ts", startTS),
+					slog.Uint64("commit_ts", commitTS),
+					slog.Any("err", err),
+				)
+				return maxIndex, errors.WithStack(ErrTxnSecondaryRouteShiftedAfterPrimaryCommit)
+			}
 			c.logger().Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
 				slog.String("primary_key", string(primaryKey)),
@@ -814,7 +1113,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 			maxIndex = r.CommitIndex
 		}
 	}
-	return maxIndex
+	return maxIndex, nil
 }
 
 func commitSecondaryWithRetry(ctx context.Context, g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {

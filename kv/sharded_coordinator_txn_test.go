@@ -577,25 +577,29 @@ func TestShardedCoordinatorDispatchTxn_SingleShardIncludesReadKeysInRaftEntry(t 
 }
 
 // TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion
-// is the gemini-critical regression on PR #881.  The single-shard fast
-// path correctly forwarded OperationGroup.ObservedRouteVersion into
-// pb.Request, but the multi-shard 2PC path
-// (prewriteTxn / commitPrimaryTxn / commitSecondaryTxns) dropped it on
-// the floor — every PREPARE and COMMIT envelope arrived at the FSM
-// with ObservedRouteVersion = 0 ("unpinned"), which would silently
-// bypass the M3 Composed-1 apply-time gate exactly for the workload
-// most at risk of a cross-group route shift.
+// is the gemini-critical regression from PR #881.  Contract:
+// every PREPARE and COMMIT envelope across the 2PC paths
+// (prewriteTxn / commitPrimaryTxn / commitSecondaryTxns) must
+// carry OperationGroup.ObservedRouteVersion so the M3 gate fires
+// on every cross-shard txn.
 //
-// Multi-shard txns are precisely the case where a MoveRange /
-// cross-group SplitRange between BeginTxn and Commit can land —
-// without this propagation, M3's safety guard would not even see
-// those txns to enforce on.
+// History: an earlier round in PR #900 (d8487672) attempted to
+// drop the gate on secondary commits to avoid a "fail-closed gate
+// + best-effort swallow" silent partial commit (codex P1 on
+// 6202b964).  codex P1 on d8487672 (PR #900) showed that dropping
+// the gate replaces one silent partial commit with another — the
+// write lands on a stale owner that is no longer reachable by
+// readers on the new owner.  The correct fix is to KEEP the gate
+// active everywhere AND surface secondary Composed-1 errors as a
+// distinct fatal sentinel
+// (ErrTxnSecondaryRouteShiftedAfterPrimaryCommit) rather than
+// either swallowing or dropping the gate.  See
+// TestShardedCoordinator_SurfacesFatalErrorOn2PCSecondaryComposed1
+// for the fatal-error contract.
 //
-// This test routes two PUTs across two shards via Engine routes
-// (single-shard fast path requires gids == 1), verifies that the 2PC
-// loop fires (both PREPARE and COMMIT recorded per shard), and
-// asserts every recorded pb.Request carries the pinned
-// ObservedRouteVersion.
+// With the fatal-surface fix in place, this test reverts to the
+// original PR #881 contract: every 2PC envelope on every shard
+// carries the pinned version.
 func TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion(t *testing.T) {
 	t.Parallel()
 
