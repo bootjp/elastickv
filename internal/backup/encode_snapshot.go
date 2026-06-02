@@ -135,6 +135,21 @@ type EncodeOptions struct {
 	corruptBufferForTest func(*os.File)
 }
 
+// SetSelfTestCorruptHookForTest installs a same-process hook that
+// fires against the on-disk self-test buffer between WriteTo and the
+// re-decode call. The hook can WriteAt into the file to inject
+// corruption so the subsequent self-test mismatches deterministically.
+//
+// Production code MUST NOT call this; it is exclusively a test seam
+// for callers OUTSIDE package backup (specifically the
+// cmd/elastickv-snapshot-encode CLI tests, which need to drive a real
+// end-to-end self-test mismatch to verify the stale-.fsm cleanup
+// path — codex P2 v10 #904). In-package tests should set
+// EncodeOptions.corruptBufferForTest directly.
+func (o *EncodeOptions) SetSelfTestCorruptHookForTest(hook func(*os.File)) {
+	o.corruptBufferForTest = hook
+}
+
 // EncodeResult is the public return value from EncodeSnapshot. Mirrors
 // the decoder's DecodeResult shape.
 type EncodeResult struct {

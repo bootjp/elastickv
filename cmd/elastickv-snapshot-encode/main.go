@@ -335,6 +335,16 @@ func writeAndPublish(cfg *config, encodeOpts backup.EncodeOptions, mismatchPath 
 		if werr := os.WriteFile(mismatchPath, result.SelfTestMismatchTxt, mismatchTxtPerm); werr != nil {
 			logger.Warn("write mismatch.txt", "err", werr)
 		}
+		// Remove the stale <output>.fsm if one exists from a prior
+		// successful run. encodeOne is about to write a fresh
+		// <output>.encode_info.json with self_test.matched=false and
+		// a NEW SHA pointing to the unpublished temp snapshot; leaving
+		// the old bytes on disk would make the sidecar describe an
+		// FSM that does not exist and violate the "self-test failure
+		// leaves no restore-visible FSM" contract (codex P2 v10 #904).
+		if rerr := os.Remove(cfg.outputPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			logger.Warn("remove stale .fsm on self-test mismatch", "err", rerr)
+		}
 		return result, errors.Wrap(errSelfTestMismatch, "self-test diff (see "+mismatchPath+")")
 	}
 	if err := os.Rename(tempPath, cfg.outputPath); err != nil {

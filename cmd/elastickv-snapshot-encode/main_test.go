@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/backup"
+	"github.com/cockroachdb/errors"
 )
 
 // isWindows is true on Windows builds; perm-bit tests skip on Windows
@@ -298,6 +299,130 @@ func readSidecar(t *testing.T, output string) backup.EncodeInfo {
 		t.Fatalf("unmarshal sidecar: %v", err)
 	}
 	return info
+}
+
+// TestCLIWriteAndPublishRemovesStaleFSMOnSelfTestMismatch pins codex
+// P2 v10 #904: when a prior successful run left an <output>.fsm on
+// disk and a new --self-test invocation produces a mismatch,
+// writeAndPublish must remove that stale .fsm. Otherwise encodeOne
+// writes a fresh sidecar (matched=false, NEW SHA) alongside the OLD
+// bytes — violating the CLI contract that a self-test failure leaves
+// no restore-visible FSM, and making the sidecar describe an FSM that
+// is not on disk.
+//
+// To drive a deterministic self-test mismatch end-to-end through the
+// CLI's writeAndPublish, the test uses the backup package's exported
+// test seam (SetSelfTestCorruptHookForTest) to flip bytes in the
+// disk-backed self-test buffer between WriteTo and the re-decode.
+func TestCLIWriteAndPublishRemovesStaleFSMOnSelfTestMismatch(t *testing.T) {
+	t.Parallel()
+	rawIn := t.TempDir()
+	writeSQSFixture(t, rawIn)
+	emitMinimalManifest(t, rawIn, 7000)
+	canonicalIn := canonicalizeInput(t, rawIn, 7000)
+
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	// Pre-place a stale .fsm — what a prior successful run would have
+	// left behind. The codex P2 v10 contract is that a subsequent
+	// self-test mismatch invalidates this file.
+	stalePayload := []byte("STALE FSM FROM PRIOR SUCCESSFUL RUN")
+	if err := os.WriteFile(out, stalePayload, 0o600); err != nil {
+		t.Fatalf("WriteFile stale: %v", err)
+	}
+
+	scratchBase := t.TempDir()
+	encodeOpts := backup.EncodeOptions{
+		InputRoot:            canonicalIn,
+		Adapters:             backup.AdapterSet{SQS: true},
+		LastCommitTS:         7000,
+		ManifestLastCommitTS: 7000,
+		SelfTest:             true,
+		SelfTestDecodeOptions: backup.DecodeOptions{
+			OutRoot:  scratchBase,
+			Adapters: backup.AdapterSet{SQS: true},
+		},
+	}
+	// Flip bytes past the EKVPBBL1 header so the re-decode trips on
+	// a malformed entry length and the self-test returns matched=false.
+	// Pattern mirrors flipBytesPastHeaderHelper in the library test.
+	encodeOpts.SetSelfTestCorruptHookForTest(func(f *os.File) {
+		info, ferr := f.Stat()
+		if ferr != nil {
+			t.Fatalf("temp Stat: %v", ferr)
+		}
+		const headerSkip = 200
+		if info.Size() <= headerSkip {
+			t.Fatalf("temp file too small to corrupt past header: %d bytes", info.Size())
+		}
+		buf := make([]byte, info.Size()-headerSkip)
+		if _, rerr := f.ReadAt(buf, headerSkip); rerr != nil {
+			t.Fatalf("ReadAt: %v", rerr)
+		}
+		for i := 0; i < len(buf); i += 13 {
+			buf[i] ^= 0xFF
+		}
+		if _, werr := f.WriteAt(buf, headerSkip); werr != nil {
+			t.Fatalf("WriteAt: %v", werr)
+		}
+	})
+
+	cfg := &config{
+		inputPath:  canonicalIn,
+		outputPath: out,
+		adapters:   backup.AdapterSet{SQS: true},
+		selfTest:   true,
+	}
+	mismatchPath := out + ".mismatch.txt"
+
+	_, publishErr := writeAndPublish(cfg, encodeOpts, mismatchPath, quietLogger())
+	if !errors.Is(publishErr, errSelfTestMismatch) {
+		t.Fatalf("publishErr = %v, want errSelfTestMismatch", publishErr)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Errorf("stale .fsm at %s not removed after self-test mismatch (codex P2 v10)", out)
+	}
+	// The mismatch.txt should be present as the operator-visible
+	// record of the failed encode attempt.
+	if _, statErr := os.Stat(mismatchPath); statErr != nil {
+		t.Errorf("mismatch.txt missing after self-test mismatch: %v", statErr)
+	}
+}
+
+// TestCLINonSelfTestExitTwoPreservesPriorFSM pins the surgical scope
+// of the codex P2 v10 fix: non-self-test exit-2 paths (e.g. the
+// manifest-floor HLC regression that fails BEFORE writeAndPublish)
+// must NOT remove a prior <output>.fsm. Only self-test mismatch
+// triggers the cleanup; a runbook recovering from a typo'd
+// --last-commit-ts still has its last good FSM on disk.
+func TestCLINonSelfTestExitTwoPreservesPriorFSM(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	emitMinimalManifest(t, in, 1000)
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	stalePayload := []byte("STALE FSM FROM PRIOR SUCCESSFUL RUN")
+	if err := os.WriteFile(out, stalePayload, 0o600); err != nil {
+		t.Fatalf("WriteFile stale: %v", err)
+	}
+	// Manifest-floor regression → exit-2 from resolveLastCommitTS,
+	// before writeAndPublish runs. Stale .fsm should be preserved.
+	code, err := run([]string{
+		"--input", in,
+		"--output", out,
+		"--last-commit-ts", "500", // below manifest 1000
+	}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want manifest-floor regression")
+	}
+	if code != exitDataErr {
+		t.Errorf("exit code = %d, want %d", code, exitDataErr)
+	}
+	body, rerr := os.ReadFile(out)
+	if rerr != nil {
+		t.Fatalf("read stale .fsm: %v (must be preserved on non-self-test exit-2)", rerr)
+	}
+	if !bytes.Equal(body, stalePayload) {
+		t.Errorf("stale .fsm mutated; want preserved on manifest-floor regression")
+	}
 }
 
 // TestCLIRoundTripSelfTestAllAdapters is the gold-standard CLI-level
