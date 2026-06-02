@@ -58,7 +58,7 @@ func refuseHardLink(info os.FileInfo, path string) error {
 func openSidecarFile(path string) (*os.File, error) {
 	// Note: NO O_TRUNC here — we truncate after the link-count check.
 	const flag = os.O_WRONLY | os.O_CREATE | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
-	f, err := os.OpenFile(path, flag, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode
+	f, err := os.OpenFile(path, flag, sidecarFileMode) //nolint:gosec // path is composed from output-root + fixed file name; sidecarFileMode is the standard owner-only mode used here and by the post-Truncate Chmod below
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, cockroachdberr.WithStack(cockroachdberr.Wrapf(err,

@@ -422,19 +422,21 @@ func encodeOne(cfg *config, logger *slog.Logger) error {
 	// when the encode itself errored before any result was populated
 	// (publishErr != nil && !errSelfTestMismatch) (codex P2 v6 #904).
 	if publishErr == nil || errors.Is(publishErr, errSelfTestMismatch) {
-		if serr := writeSidecar(cfg, manifest, effectiveTS, overridden, result); serr != nil {
+		sidecarTruncated, serr := writeSidecar(cfg, manifest, effectiveTS, overridden, result)
+		if serr != nil {
 			// Surface the sidecar-write failure only if encode itself
 			// succeeded; on mismatch the mismatch error takes priority.
 			if publishErr == nil {
 				// .fsm was just renamed into place by writeAndPublish
 				// but the sidecar write failed → we have an orphan
 				// .fsm without its matching provenance metadata.
-				// Roll both back to a consistent absent state so the
-				// operator doesn't see a "successful" restore
-				// artifact missing its sidecar (claude/codex P2 v31
-				// observation on PR #904 — the design contract is
-				// that .fsm + sidecar move together).
-				rollbackOrphanFSMAndSidecar(cfg.outputPath, logger)
+				// Roll back to a consistent absent state. The sidecar
+				// rollback is gated on sidecarTruncated so we don't
+				// remove an operator-owned pre-existing entry that
+				// OpenSidecarFile refused to clobber (claude/codex
+				// P2 v31 added the rollback; codex P2 v33 #904 added
+				// the truncation gate for hard-linked sidecars).
+				rollbackOrphanFSMAndSidecar(cfg.outputPath, sidecarTruncated, logger)
 				return errors.Wrap(serr, "write encode_info sidecar")
 			}
 			logger.Warn("write encode_info sidecar on mismatch", "err", serr)
@@ -511,34 +513,25 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 // Both os.Remove calls log-and-continue on non-ErrNotExist failures
 // so the caller's primary sidecar-write error remains the dominant
 // signal.
-func rollbackOrphanFSMAndSidecar(outputPath string, logger *slog.Logger) {
+// rollbackOrphanFSMAndSidecar reverts an encode that succeeded in
+// publishing the .fsm but failed in writing the sidecar. Always
+// removes the just-renamed .fsm at outputPath. The sidecar at
+// EncodeInfoSidecarPath(outputPath) is removed ONLY when
+// sidecarTruncated is true — i.e., backup.OpenSidecarFile succeeded
+// and either created a fresh file or truncated an existing
+// single-link regular file. When sidecarTruncated is false the
+// existing entry is operator-owned (symlink, hard link with
+// Nlink > 1, FIFO, directory, etc.) that OpenSidecarFile refused to
+// clobber, so this rollback must NOT destroy it either (codex P2
+// v32 #904 / codex P2 v33 #904).
+func rollbackOrphanFSMAndSidecar(outputPath string, sidecarTruncated bool, logger *slog.Logger) {
 	if rerr := os.Remove(outputPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
 		logger.Warn("rollback orphan .fsm after sidecar failure", "err", rerr)
 	}
+	if !sidecarTruncated {
+		return
+	}
 	sidecarPath := backup.EncodeInfoSidecarPath(outputPath)
-	// Only remove a sidecar known to be a regular file — i.e., one
-	// this run (or a prior encoder) created. A pre-existing
-	// non-regular entry (operator-placed symlink, FIFO, directory,
-	// etc.) is what OpenSidecarFile correctly refuses to clobber
-	// when the rollback was triggered; os.Remove'ing the
-	// operator's filesystem object merely because the encode
-	// failed would be a destructive side effect (codex P2 v32
-	// #904). Symlinks the operator may have placed are also
-	// preserved here — OpenSidecarFile's O_NOFOLLOW failure means
-	// the symlink was never followed and no truncate happened, so
-	// the link is unchanged and is the operator's to manage.
-	info, err := os.Lstat(sidecarPath)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			logger.Warn("stat sidecar for rollback", "err", err)
-		}
-		return
-	}
-	if !info.Mode().IsRegular() {
-		logger.Warn("skip sidecar rollback: --output sidecar path is not a regular file",
-			"path", sidecarPath, "mode", info.Mode())
-		return
-	}
 	if srerr := os.Remove(sidecarPath); srerr != nil && !errors.Is(srerr, os.ErrNotExist) {
 		logger.Warn("rollback partial sidecar after write failure", "err", srerr)
 	}
@@ -780,9 +773,17 @@ func tempOutputPath(output string) (string, error) {
 	return output + ".tmp-" + hex.EncodeToString(buf), nil
 }
 
-// writeSidecar emits ENCODE_INFO.json next to the published .fsm.
-// Path-derived per gemini medium v2 #896.
-func writeSidecar(cfg *config, m backup.Manifest, effectiveTS uint64, overridden bool, result backup.EncodeResult) error {
+// writeSidecar emits ENCODE_INFO.json next to the published .fsm
+// (path-derived per gemini medium v2 #896). Returns (truncated, err):
+// truncated is true iff backup.OpenSidecarFile succeeded — i.e., the
+// existing path was truncated by THIS run (or a fresh file was
+// created). When truncated is false, the caller MUST NOT roll back
+// the sidecar path: any pre-existing entry there is operator-owned
+// and OpenSidecarFile correctly refused to clobber it (codex P2 v33
+// #904 — hard-linked sidecars in particular pass IsRegular but were
+// refused via Nlink>1; v32's IsRegular-only rollback gate would
+// have destroyed those).
+func writeSidecar(cfg *config, m backup.Manifest, effectiveTS uint64, overridden bool, result backup.EncodeResult) (bool, error) {
 	info := backup.NewEncodeInfo(time.Now())
 	info.EncoderVersion = version
 	info.InputRoot = cfg.inputPath
@@ -812,24 +813,30 @@ func writeSidecar(cfg *config, m backup.Manifest, effectiveTS uint64, overridden
 	// choosing (codex P2 v25 #904).
 	f, err := backup.OpenSidecarFile(sidecarPath)
 	if err != nil {
-		return errors.Wrap(err, "open sidecar")
+		// Pre-existing entry refused (symlink/hard-link/non-regular).
+		// Caller must NOT rollback the sidecar path; the file there
+		// is operator-owned and was never touched by this run.
+		return false, errors.Wrap(err, "open sidecar")
 	}
+	// From this point, f points at a truncated (zero-length) regular
+	// file owned by this run. Any subsequent failure leaves partial
+	// bytes (or empty) on disk — the caller's rollback removes them.
 	if err := backup.WriteEncodeInfo(f, info); err != nil {
 		_ = f.Close()
-		return errors.Wrap(err, "WriteEncodeInfo")
+		return true, errors.Wrap(err, "WriteEncodeInfo")
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		return errors.WithStack(err)
+		return true, errors.WithStack(err)
 	}
 	if err := f.Close(); err != nil {
-		return errors.WithStack(err)
+		return true, errors.WithStack(err)
 	}
 	// fsync the parent dir so the new sidecar's directory entry is
 	// durable alongside its bytes. Mirrors the rename path
 	// (codex P2 v24 #904).
 	if err := fsyncParentDir(sidecarPath); err != nil {
-		return errors.Wrap(err, "fsync sidecar parent dir")
+		return true, errors.Wrap(err, "fsync sidecar parent dir")
 	}
-	return nil
+	return true, nil
 }

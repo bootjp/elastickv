@@ -1071,6 +1071,65 @@ func assertSymlinkSidecarRollbackInvariants(t *testing.T, victim string, victimB
 	}
 }
 
+// TestCLISidecarWriteRefusesHardLinkTarget pins codex P2 v33 #904:
+// when the sidecar path is a hard link to an operator-owned file,
+// OpenSidecarFile refuses to truncate (Nlink > 1 guard); the v32
+// rollback's IsRegular()-only gate would have unlinked the hard
+// link anyway, destroying operator state. v34 routes the rollback
+// through a sidecarTruncated bool so a refused OpenSidecarFile
+// keeps the operator's entry intact. Unix-only (Windows hard-link
+// semantics differ).
+func TestCLISidecarWriteRefusesHardLinkTarget(t *testing.T) {
+	if isWindows {
+		t.Skip("hard-link refusal semantics differ on Windows")
+	}
+	t.Parallel()
+	in := t.TempDir()
+	emitMinimalManifest(t, in, 100)
+
+	outDir := t.TempDir()
+	out := filepath.Join(outDir, "out.fsm")
+	sidecarPath := backup.EncodeInfoSidecarPath(out)
+	// Pre-plant a victim file and hard-link the sidecar path to it.
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim.json")
+	const victimBody = "VICTIM CONTENTS — must survive hard-link rejection"
+	if err := os.WriteFile(victim, []byte(victimBody), 0o600); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+	if err := os.Link(victim, sidecarPath); err != nil {
+		t.Fatalf("Link victim → sidecar path: %v", err)
+	}
+
+	code, err := run([]string{"--input", in, "--output", out}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want sidecar open to fail on hard-linked path")
+	}
+	if code != exitUserErr {
+		t.Errorf("exit code = %d, want %d (operator-env error)", code, exitUserErr)
+	}
+	// Victim contents MUST be preserved (OpenSidecarFile's Nlink
+	// guard refused to truncate; v34 rollback's sidecarTruncated=false
+	// branch then skipped the os.Remove).
+	got, rerr := os.ReadFile(victim)
+	if rerr != nil {
+		t.Fatalf("read victim: %v", rerr)
+	}
+	if string(got) != victimBody {
+		t.Errorf("victim mutated; OpenSidecarFile truncated through hard link (codex P2 v33 regression)")
+	}
+	// The hard link at the sidecar path MUST also survive — the
+	// rollback no longer os.Removes it (codex P2 v33 fix).
+	if _, statErr := os.Lstat(sidecarPath); statErr != nil {
+		t.Errorf("hard link at sidecar path was removed by rollback (codex P2 v33 regression): %v", statErr)
+	}
+	// .fsm at outputPath MUST be removed (rollback's FSM branch
+	// always fires when the encode succeeded but sidecar failed).
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Errorf(".fsm at %s should be removed by rollback after sidecar failure", out)
+	}
+}
+
 // TestCLIPublishesFsmAndSidecarMode0600 pins claude v4 #904: the
 // produced .fsm and ENCODE_INFO.json are created with mode 0o600 so a
 // multi-user backup host does not get a world-readable dataset. The

@@ -22,6 +22,17 @@ func TestOpenSidecarFileEnforcesOwnerOnlyMode(t *testing.T) {
 	if err := os.WriteFile(path, []byte("prior"), 0o644); err != nil { //nolint:gosec // test simulates legacy permissive sidecar
 		t.Fatalf("WriteFile: %v", err)
 	}
+	// Verify the environment actually honored the broader seed mode;
+	// a restrictive umask or stricter FS could silently produce 0o600
+	// and the test would pass even if the chmod-enforcement logic
+	// regressed (CodeRabbit nit on PR #904).
+	seedInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat seeded file: %v", err)
+	}
+	if seedInfo.Mode().Perm()&0o077 == 0 {
+		t.Skipf("environment refused permissive seed mode (got 0o%o); test cannot exercise chmod-enforcement", seedInfo.Mode().Perm())
+	}
 	f, err := OpenSidecarFile(path)
 	if err != nil {
 		t.Fatalf("OpenSidecarFile: %v", err)
