@@ -348,13 +348,19 @@ func TestHotKeysAggregatorRaceFree(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
-	// Let the aggregator drain + publish a few ticks.
-	time.Sleep(50 * time.Millisecond)
-	// Snapshot reads must be lock-free and consistent.
-	s1 := s.HotKeysSnapshot(1)
-	s2 := s.HotKeysSnapshot(2)
-	require.NotNil(t, s1)
-	require.NotNil(t, s2)
+	// Wait for the aggregator to drain the queue and publish at least
+	// one tick-driven snapshot for each route. The previous
+	// time.Sleep(50ms) raced the aggregator's tick (Step=5ms) on slow
+	// -race CI runners — the Run goroutine could be slow to schedule
+	// at all, leaving hotKeysSnap as its initial nil atomic.Pointer
+	// load by the time the assertions fired. require.Eventually with
+	// a 3-second budget + 5ms poll cadence rides out any scheduler
+	// jitter; snapshot reads themselves remain lock-free
+	// (atomic.Pointer.Load), which is what this test pins. Observed
+	// failure: Actions run 26765510693.
+	require.Eventually(t, func() bool {
+		return s.HotKeysSnapshot(1) != nil && s.HotKeysSnapshot(2) != nil
+	}, 3*time.Second, 5*time.Millisecond, "aggregator must publish a snapshot for each route within the budget")
 	cancel()
 	wgRun.Wait()
 }
