@@ -197,22 +197,33 @@ func manifestAdapterField(a *backup.Adapters, name string) *backup.Adapter {
 }
 
 // checkOneAdapterScope is the per-adapter half of
-// validateAdaptersAgainstManifest. Selected adapters MUST have a
-// manifest scope; the on-disk subdir requirements depend on whether
-// the scope is empty or has concrete entries. Not-selected adapters
-// are unchecked (the operator chose to skip them).
+// validateAdaptersAgainstManifest. The decoder's populateAdapterScopes
+// explicitly defers scope enumeration and writes `&Adapter{}` (empty)
+// for every enabled adapter regardless of whether records were
+// dumped, so the manifest's scope CONTENT cannot distinguish
+// "this adapter had no records" from "this adapter had records but
+// the decoder didn't enumerate them" (codex P1 v29 #904 corrected
+// v27/v28/v29's over-eager subdir stat-and-readdir checks).
 //
-// Decision matrix (codex P2 v26 + v27 + v28 #904):
+// The only sound nil/non-nil signal is the per-adapter POINTER
+// (`manifest.Adapters.<X>`):
 //
-//   - scope == nil          → fail (producer did not dump this adapter).
-//   - empty scope, subdir absent or empty → pass (no records in dump).
-//   - empty scope, subdir non-empty       → fail (stale data on disk
-//     not declared in manifest — input directory was reused or
-//     partially cleaned).
-//   - non-empty scope, subdir missing or not-a-dir → fail (truncated
-//     dump).
-//   - non-empty scope, subdir is a directory      → pass.
-func checkOneAdapterScope(name string, selected bool, scope *backup.Adapter, subdirPath string) error {
+//   - scope == nil → fail (producer did NOT enable this adapter; any
+//     on-disk subdir is stale and would otherwise be encoded under
+//     the default `--adapter all`, codex P2 v26 #904 scenario B).
+//   - scope != nil → pass (producer enabled the adapter; trust the
+//     manifest contract regardless of the on-disk subdir's
+//     presence/contents).
+//
+// Detecting truncated dumps (codex P2 v26 #904 scenario A: scope
+// non-nil but on-disk subdir lost) needs SHA / record-count
+// verification at the producer side; the manifest alone cannot
+// surface it. Tracked as future work.
+//
+// subdirPath is intentionally unused now but kept in the signature so
+// a future check that pairs the manifest with a SHA index doesn't
+// need a call-site refactor.
+func checkOneAdapterScope(name string, selected bool, scope *backup.Adapter, _ string) error {
 	if !selected {
 		return nil
 	}
@@ -221,65 +232,7 @@ func checkOneAdapterScope(name string, selected bool, scope *backup.Adapter, sub
 			"adapter %q selected but MANIFEST.json has no scope for it (use --adapter to restrict, or re-dump including this adapter)",
 			name)
 	}
-	if isEmptyAdapterScope(scope) {
-		return checkSubdirAbsentOrEmpty(name, subdirPath)
-	}
-	info, err := os.Stat(subdirPath)
-	if err != nil {
-		return errors.Wrapf(errAdapterNotInManifest,
-			"adapter %q listed in MANIFEST.json with non-empty scope but on-disk subdir %s is missing (stat: %v)",
-			name, subdirPath, err)
-	}
-	if !info.IsDir() {
-		return errors.Wrapf(errAdapterNotInManifest,
-			"adapter %q listed in MANIFEST.json but %s is not a directory (mode=%s)",
-			name, subdirPath, info.Mode())
-	}
 	return nil
-}
-
-// checkSubdirAbsentOrEmpty fails closed when an empty-scope adapter
-// has a non-empty on-disk subdir. The empty scope says the producer
-// dumped no records; a populated subdir would otherwise be encoded by
-// cfg.adapters (default `--adapter all`) and silently publish stale
-// data the manifest doesn't claim (codex P2 v28 #904 — the inverse of
-// v27's truncated-dump scenario).
-func checkSubdirAbsentOrEmpty(name, subdirPath string) error {
-	info, err := os.Stat(subdirPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return errors.Wrapf(errAdapterNotInManifest,
-			"adapter %q: stat %s: %v", name, subdirPath, err)
-	}
-	if !info.IsDir() {
-		return errors.Wrapf(errAdapterNotInManifest,
-			"adapter %q: %s is not a directory (mode=%s)", name, subdirPath, info.Mode())
-	}
-	entries, err := os.ReadDir(subdirPath)
-	if err != nil {
-		return errors.Wrapf(errAdapterNotInManifest,
-			"adapter %q: readdir %s: %v", name, subdirPath, err)
-	}
-	if len(entries) != 0 {
-		return errors.Wrapf(errAdapterNotInManifest,
-			"adapter %q has empty scope in MANIFEST.json but %s contains %d entries (stale dump artifacts; clean the directory or re-dump)",
-			name, subdirPath, len(entries))
-	}
-	return nil
-}
-
-// isEmptyAdapterScope reports whether scope has no concrete
-// tables / buckets / databases / queues. A non-nil but empty
-// Adapter{} is the "producer dumped this adapter, no records"
-// signal — distinct from the nil pointer that means "producer did
-// not enable this adapter at all" (codex P2 v27 #904).
-func isEmptyAdapterScope(scope *backup.Adapter) bool {
-	return len(scope.Tables) == 0 &&
-		len(scope.Buckets) == 0 &&
-		len(scope.Databases) == 0 &&
-		len(scope.Queues) == 0
 }
 
 func parseFlags(argv []string) (*config, error) {
