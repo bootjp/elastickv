@@ -30,9 +30,10 @@ func TestEncodeSnapshotLibraryRoundTrip(t *testing.T) {
 
 	var buf bytes.Buffer
 	result, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:    in,
-		Adapters:     AdapterSet{SQS: true},
-		LastCommitTS: 0xDEADBEEF,
+		InputRoot:            in,
+		Adapters:             AdapterSet{SQS: true},
+		LastCommitTS:         0xDEADBEEF,
+		AllowMissingManifest: true,
 	}, &buf)
 	if err != nil {
 		t.Fatalf("EncodeSnapshot: %v", err)
@@ -83,9 +84,10 @@ func TestEncodeSnapshotSelfTestMatchesInput(t *testing.T) {
 	canonicalIn := t.TempDir()
 	var canonicalBuf bytes.Buffer
 	if _, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:    rawIn,
-		Adapters:     AdapterSet{SQS: true},
-		LastCommitTS: 0xCAFE,
+		InputRoot:            rawIn,
+		Adapters:             AdapterSet{SQS: true},
+		LastCommitTS:         0xCAFE,
+		AllowMissingManifest: true,
 	}, &canonicalBuf); err != nil {
 		t.Fatalf("canonical encode: %v", err)
 	}
@@ -107,6 +109,7 @@ func TestEncodeSnapshotSelfTestMatchesInput(t *testing.T) {
 			OutRoot:  scratchBase,
 			Adapters: AdapterSet{SQS: true},
 		},
+		AllowMissingManifest: true,
 	}, &buf)
 	if err != nil {
 		t.Fatalf("EncodeSnapshot: %v", err)
@@ -180,6 +183,7 @@ func TestEncodeSnapshotSelfTestDetectsCorruption(t *testing.T) {
 			Adapters: AdapterSet{SQS: true},
 		},
 		corruptBufferForTest: corrupt,
+		AllowMissingManifest: true,
 	}, &out)
 	if err != nil {
 		t.Fatalf("EncodeSnapshot: %v", err)
@@ -259,6 +263,55 @@ func TestEncodeSnapshotRejectsMissingInputRoot(t *testing.T) {
 	})
 }
 
+// TestEncodeSnapshotRequiresManifest pins codex P2 v17 #904: a library
+// caller pointing at an existing-but-wrong directory (no
+// MANIFEST.json) must fail closed with an error referencing
+// MANIFEST.json, NOT silently emit a header-only .fsm. The CLI hits
+// this path naturally by opening MANIFEST.json first; the library
+// validation layer needs the equivalent guard.
+func TestEncodeSnapshotRequiresManifest(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir() // exists, is a directory, but contains no MANIFEST.json
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:    in,
+		Adapters:     AdapterSet{SQS: true},
+		LastCommitTS: 1,
+		// AllowMissingManifest: false (default) — must require manifest
+	}, &buf)
+	if err == nil {
+		t.Fatalf("EncodeSnapshot with missing MANIFEST.json succeeded; want error")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("buf.Len = %d, want 0 (no bytes should be written when MANIFEST.json is missing)", buf.Len())
+	}
+}
+
+// TestEncodeSnapshotAllowMissingManifestOptOut pins that the
+// AllowMissingManifest opt-out works for synthetic test fixtures.
+// Mirrors the ManifestLastCommitTS=0 opt-out pattern from codex P2 v2.
+func TestEncodeSnapshotAllowMissingManifestOptOut(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "manifest-opt-out"
+	writeSQSQueue(t, in, queue,
+		[]byte(`{"format_version":1,"name":"manifest-opt-out","fifo":false,"partition_count":1,"generation":1}`),
+		[][]byte{
+			[]byte(`{"format_version":1,"message_id":"m1","body":"a","send_timestamp_millis":1700000000000,"available_at_millis":1700000000000,"sequence_number":0}`),
+		},
+	)
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:            in,
+		Adapters:             AdapterSet{SQS: true},
+		LastCommitTS:         1,
+		AllowMissingManifest: true,
+	}, &buf)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot with AllowMissingManifest=true failed: %v", err)
+	}
+}
+
 // TestEncodeSnapshotRejectsLowManifestFloor pins codex P2 v2: the
 // library-level HLC floor check fails-closed when opts.LastCommitTS
 // is below opts.ManifestLastCommitTS. Defense-in-depth for the CLI's
@@ -273,6 +326,7 @@ func TestEncodeSnapshotRejectsLowManifestFloor(t *testing.T) {
 		Adapters:             AdapterSet{SQS: true},
 		LastCommitTS:         500,
 		ManifestLastCommitTS: 1000, // floor; LastCommitTS is below
+		AllowMissingManifest: true,
 	}, &buf)
 	if err == nil {
 		t.Fatalf("EncodeSnapshot with LastCommitTS < ManifestLastCommitTS succeeded; want error")
@@ -305,6 +359,7 @@ func TestEncodeSnapshotManifestFloorOptOut(t *testing.T) {
 		Adapters:             AdapterSet{SQS: true},
 		LastCommitTS:         500,
 		ManifestLastCommitTS: 0, // opt-out
+		AllowMissingManifest: true,
 	}, &buf)
 	if err != nil {
 		t.Fatalf("EncodeSnapshot with opt-out floor failed: %v", err)
@@ -323,10 +378,11 @@ func TestEncodeSnapshotRejectsDynamoDBJSONLLayout(t *testing.T) {
 	in := t.TempDir()
 	var buf bytes.Buffer
 	_, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:           in,
-		Adapters:            AdapterSet{DynamoDB: true},
-		LastCommitTS:        1,
-		DynamoDBBundleJSONL: true,
+		InputRoot:            in,
+		Adapters:             AdapterSet{DynamoDB: true},
+		LastCommitTS:         1,
+		DynamoDBBundleJSONL:  true,
+		AllowMissingManifest: true,
 	}, &buf)
 	if err == nil {
 		t.Fatalf("EncodeSnapshot with DynamoDBBundleJSONL accepted; want error")
@@ -356,10 +412,11 @@ func TestEncodeSnapshotJSONLOnlyRejectedWhenDDBEnabled(t *testing.T) {
 	)
 	var buf bytes.Buffer
 	_, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:           in,
-		Adapters:            AdapterSet{SQS: true}, // DDB NOT in scope
-		LastCommitTS:        1,
-		DynamoDBBundleJSONL: true, // would be rejected if DDB were enabled
+		InputRoot:            in,
+		Adapters:             AdapterSet{SQS: true}, // DDB NOT in scope
+		LastCommitTS:         1,
+		DynamoDBBundleJSONL:  true, // would be rejected if DDB were enabled
+		AllowMissingManifest: true,
 	}, &buf)
 	if err != nil {
 		t.Fatalf("EncodeSnapshot rejected JSONL flag when DDB not in scope: %v", err)
@@ -484,9 +541,10 @@ func TestEncodeSnapshotRedisRejectsNonZeroDB(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	_, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:    in,
-		Adapters:     AdapterSet{Redis: true},
-		LastCommitTS: 1,
+		InputRoot:            in,
+		Adapters:             AdapterSet{Redis: true},
+		LastCommitTS:         1,
+		AllowMissingManifest: true,
 	}, &buf)
 	if err == nil {
 		t.Fatalf("EncodeSnapshot accepted db_3-only Redis input; want ErrRedisEncodeMultiDBUnsupported")
@@ -517,9 +575,10 @@ func TestEncodeSnapshotRedisRejectsMultipleDBs(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	_, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:    in,
-		Adapters:     AdapterSet{Redis: true},
-		LastCommitTS: 1,
+		InputRoot:            in,
+		Adapters:             AdapterSet{Redis: true},
+		LastCommitTS:         1,
+		AllowMissingManifest: true,
 	}, &buf)
 	if err == nil {
 		t.Fatalf("EncodeSnapshot accepted db_0 + db_3; want ErrRedisEncodeMultiDBUnsupported")
@@ -577,9 +636,10 @@ func TestEncodeSnapshotMarksAdapterDataErrors(t *testing.T) {
 		[]byte(`{"format_version":1,"table_name":"","primary_key":{"hash_key":{"name":"id","type":"S"}}}`))
 	var buf bytes.Buffer
 	_, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:    in,
-		Adapters:     AdapterSet{DynamoDB: true},
-		LastCommitTS: 1,
+		InputRoot:            in,
+		Adapters:             AdapterSet{DynamoDB: true},
+		LastCommitTS:         1,
+		AllowMissingManifest: true,
 	}, &buf)
 	if err == nil {
 		t.Fatalf("EncodeSnapshot with malformed schema succeeded; want error")

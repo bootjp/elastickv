@@ -304,6 +304,78 @@ func readSidecar(t *testing.T, output string) backup.EncodeInfo {
 	return info
 }
 
+// TestCLIAdapterErrorPreservesPriorSidecar pins codex P2 v17 #904: when
+// a run gets past manifest/TS validation and then fails inside an
+// adapter encoder (non-self-test exit-2), the prior <output>.fsm is
+// preserved (only the self-test mismatch path removes it), so the
+// prior <output>.encode_info.json must ALSO be preserved — wiping it
+// while leaving the .fsm would orphan the restore artifact from its
+// provenance metadata. The v17 fix drops the pre-encode sidecar
+// cleanup; this test pins the resulting invariant end-to-end.
+func TestCLIAdapterErrorPreservesPriorSidecar(t *testing.T) {
+	t.Parallel()
+	in, out, priorFSM, priorSidecar := setupAdapterErrorFixture(t)
+	code, err := run([]string{
+		"--input", in,
+		"--output", out,
+		"--adapter", "dynamodb",
+	}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want adapter-data rejection")
+	}
+	if code != exitDataErr {
+		t.Errorf("exit code = %d, want %d", code, exitDataErr)
+	}
+	assertFilePreserved(t, out, priorFSM, "prior .fsm")
+	// Prior sidecar unchanged (codex P2 v17: the v17 fix drops the
+	// pre-encode sidecar cleanup so the sidecar+.fsm stay paired).
+	assertFilePreserved(t, out+".encode_info.json", priorSidecar, "prior sidecar")
+}
+
+// setupAdapterErrorFixture builds a fixture for
+// TestCLIAdapterErrorPreservesPriorSidecar: an InputRoot with a valid
+// MANIFEST.json plus a malformed dynamodb _schema.json (empty
+// table_name → ErrDDBEncodeInvalidSchema), and a pre-placed FSM +
+// sidecar at the output path representing a hypothetical earlier
+// successful run. Returns (inputRoot, outputPath, priorFSMBytes,
+// priorSidecarBytes).
+func setupAdapterErrorFixture(t *testing.T) (string, string, []byte, []byte) {
+	t.Helper()
+	in := t.TempDir()
+	emitMinimalManifest(t, in, 1000)
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	priorFSM := []byte("PRIOR FSM BYTES")
+	priorSidecar := []byte(`{"format_version":1,"encoder_version":"prior","input_root":"x","output_fsm_path":"x"}`)
+	if err := os.WriteFile(out, priorFSM, 0o600); err != nil {
+		t.Fatalf("WriteFile prior fsm: %v", err)
+	}
+	if err := os.WriteFile(out+".encode_info.json", priorSidecar, 0o600); err != nil {
+		t.Fatalf("WriteFile prior sidecar: %v", err)
+	}
+	schemaDir := filepath.Join(in, "dynamodb", "tbl")
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	body := []byte(`{"format_version":1,"table_name":"","primary_key":{"hash_key":{"name":"id","type":"S"}}}`)
+	if err := os.WriteFile(filepath.Join(schemaDir, "_schema.json"), body, 0o600); err != nil {
+		t.Fatalf("WriteFile bad schema: %v", err)
+	}
+	return in, out, priorFSM, priorSidecar
+}
+
+// assertFilePreserved asserts the named file is still present and its
+// contents exactly match wantBody. label appears in error messages.
+func assertFilePreserved(t *testing.T, path string, wantBody []byte, label string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s at %s: %v", label, path, err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Errorf("%s mutated; codex P2 v17 expected adapter-error to preserve", label)
+	}
+}
+
 // TestCLISelfTestMismatchSkipsDirectoryAtOutputPath pins codex P2 v14
 // #904: the self-test-mismatch cleanup must NOT delete an --output
 // path that resolves to a directory (or any non-regular file). The

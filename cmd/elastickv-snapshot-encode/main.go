@@ -262,10 +262,16 @@ func encodeOne(cfg *config, logger *slog.Logger) error {
 
 	mismatchPath := cfg.outputPath + ".mismatch.txt"
 	_ = os.Remove(mismatchPath) // stale-mismatch cleanup (gemini medium v6 #896)
-	// Stale sidecar cleanup too: a self-test failure rewrites the
-	// sidecar with matched:false (codex P2 v6 #904); make sure the
-	// file always reflects the latest run, not a prior success.
-	_ = os.Remove(backup.EncodeInfoSidecarPath(cfg.outputPath))
+	// Do NOT pre-clean the sidecar here. The sidecar describes the
+	// .fsm at cfg.outputPath; the .fsm is preserved when a run fails
+	// in the adapter encoders (non-self-test exit-2 path), so wiping
+	// its sidecar would leave the prior restore artifact without its
+	// matching provenance metadata (codex P2 v17 #904). writeSidecar
+	// uses O_CREATE|O_TRUNC, so the sidecar is atomically overwritten
+	// on success and on self-test mismatch (where the .fsm is also
+	// replaced or removed in lock-step). On adapter-encoder errors
+	// neither writeSidecar nor removeStaleOutputFSM runs; the prior
+	// .fsm + prior sidecar therefore stay paired.
 
 	result, publishErr := writeAndPublish(cfg, encodeOpts, mismatchPath, logger)
 	// Sidecar is written even on self-test mismatch so an operator

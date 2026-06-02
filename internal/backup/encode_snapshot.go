@@ -135,6 +135,22 @@ type EncodeOptions struct {
 	// the original decoder would have produced.
 	SelfTestDecodeOptions DecodeOptions
 
+	// AllowMissingManifest opts out of the MANIFEST.json presence
+	// check in validateEncodeOptions. When false (default),
+	// EncodeSnapshot requires <InputRoot>/MANIFEST.json to exist —
+	// the contract on InputRoot has always claimed this, but until
+	// codex P2 v17 #904 the library only checked the path was a
+	// directory, so a real library caller pointing at the wrong
+	// directory would silently emit a header-only .fsm (each enabled
+	// adapter no-ops when its top-level subdir is missing).
+	//
+	// Set to true for synthetic test fixtures that don't have a
+	// MANIFEST.json on disk. Production callers (CLI, Phase 1
+	// in-process extractor) MUST leave this at false so a bad
+	// InputRoot surfaces an explicit error rather than a
+	// silent-empty .fsm.
+	AllowMissingManifest bool
+
 	// corruptBufferForTest is an unexported test-only hook that fires
 	// against the on-disk self-test buffer AFTER snapshotBuilder.WriteTo
 	// returns but BEFORE the self-test DecodeSnapshot call (when
@@ -200,21 +216,8 @@ type EncodeResult struct {
 // Split out so EncodeSnapshot stays under the cyclop threshold; the
 // data-correctness checks live in validateEncodeOptionsData.
 func validateEncodeOptions(opts EncodeOptions, out io.Writer) error {
-	if opts.InputRoot == "" {
-		return errors.New("backup: EncodeOptions.InputRoot is required")
-	}
-	// Stat the path so a typo'd or deleted directory surfaces here
-	// rather than fan-out-no-op'ing every adapter and producing a
-	// header-only .fsm (codex P2 v8 #904). CLI callers indirectly
-	// catch this via os.Open(MANIFEST.json) before EncodeSnapshot,
-	// but a library caller that passes a stale path needs the guard
-	// at this layer.
-	info, statErr := os.Stat(opts.InputRoot)
-	if statErr != nil {
-		return errors.Wrapf(statErr, "stat InputRoot %q", opts.InputRoot)
-	}
-	if !info.IsDir() {
-		return errors.Errorf("backup: InputRoot %q is not a directory", opts.InputRoot)
+	if err := checkInputRoot(opts); err != nil {
+		return err
 	}
 	if out == nil {
 		return errors.New("backup: EncodeSnapshot out writer is nil")
@@ -225,6 +228,39 @@ func validateEncodeOptions(opts EncodeOptions, out io.Writer) error {
 		return errors.New("backup: EncodeOptions.Adapters has no enabled adapter")
 	}
 	return validateEncodeOptionsData(opts)
+}
+
+// checkInputRoot validates InputRoot's path-level invariants: present,
+// existing as a directory, and (unless AllowMissingManifest) contains
+// a MANIFEST.json. Split out of validateEncodeOptions to keep cyclop
+// happy and to make the three failure modes inspectable in isolation.
+func checkInputRoot(opts EncodeOptions) error {
+	if opts.InputRoot == "" {
+		return errors.New("backup: EncodeOptions.InputRoot is required")
+	}
+	// Stat the path so a typo'd or deleted directory surfaces here
+	// rather than fan-out-no-op'ing every adapter and producing a
+	// header-only .fsm (codex P2 v8 #904).
+	info, statErr := os.Stat(opts.InputRoot)
+	if statErr != nil {
+		return errors.Wrapf(statErr, "stat InputRoot %q", opts.InputRoot)
+	}
+	if !info.IsDir() {
+		return errors.Errorf("backup: InputRoot %q is not a directory", opts.InputRoot)
+	}
+	// Require MANIFEST.json at InputRoot unless the caller has
+	// explicitly opted out (codex P2 v17 #904). The doc on InputRoot
+	// has always required it; this guard catches a library caller
+	// pointing at an existing-but-wrong directory whose adapter
+	// subdirs are all absent — without this check the call would
+	// silently succeed and publish a header-only .fsm.
+	if !opts.AllowMissingManifest {
+		manifestPath := filepath.Join(opts.InputRoot, "MANIFEST.json")
+		if _, mstat := os.Stat(manifestPath); mstat != nil {
+			return errors.Wrapf(mstat, "stat MANIFEST.json under InputRoot %q (set EncodeOptions.AllowMissingManifest=true for synthetic fixtures)", opts.InputRoot)
+		}
+	}
+	return nil
 }
 
 // validateEncodeOptionsData covers the data-correctness pre-conditions:
