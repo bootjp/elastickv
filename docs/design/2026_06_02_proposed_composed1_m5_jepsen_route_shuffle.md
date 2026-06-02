@@ -215,9 +215,13 @@ that lies strictly between the current route's `Start` and
 ```
 
 Exact strategy details (counter persistence across nemesis
-restarts, collision recovery, etc.) are M5b implementation
-notes — the design contract is: each shuffle's split key is
-strictly interior to the route's current range.
+restarts, collision recovery, byte-vs-string coercion of
+`ListRoutes` response fields — `(str (:start route) …)`
+silently yields `"[B@…"` if `:start` is a Java byte array
+rather than a string, a silent mis-routing footgun flagged
+by claude[bot] on b752a894) are M5b implementation notes —
+the design contract is: each shuffle's split key is strictly
+interior to the route's current range.
 
 The Clojure side gets a small helper (`composed1-nemesis/encode-dynamo-segment`)
 that mirrors the Go `encodeDynamoSegment` exactly. The Go
