@@ -906,6 +906,55 @@ func TestParseLastCommitTS(t *testing.T) {
 	}
 }
 
+// TestCLISidecarWriteRefusesSymlinkTarget pins codex P2 v25 #904: the
+// CLI's encode_info sidecar writer must not follow a pre-existing
+// symlink at <output>.encode_info.json. An attacker (or a confused
+// shared-host config) could plant a symlink pointing at a sensitive
+// file the encoding user can write; the prior os.OpenFile + O_TRUNC
+// path would have truncated that target and then written the JSON
+// blob to it. backup.OpenSidecarFile refuses the open with ELOOP on
+// unix. Skipped on Windows where symlink semantics differ and the
+// Windows variant of OpenSidecarFile uses the Lstat-then-OpenFile
+// guard.
+func TestCLISidecarWriteRefusesSymlinkTarget(t *testing.T) {
+	if isWindows {
+		t.Skip("symlink-refusal semantics differ on Windows")
+	}
+	t.Parallel()
+	in := t.TempDir()
+	emitMinimalManifest(t, in, 100)
+
+	outDir := t.TempDir()
+	out := filepath.Join(outDir, "out.fsm")
+	sidecarPath := backup.EncodeInfoSidecarPath(out)
+	// Pre-plant the attacker's victim file and the symlink.
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim.json")
+	const victimBody = "VICTIM CONTENTS — must survive sidecar write"
+	if err := os.WriteFile(victim, []byte(victimBody), 0o600); err != nil {
+		t.Fatalf("WriteFile victim: %v", err)
+	}
+	if err := os.Symlink(victim, sidecarPath); err != nil {
+		t.Fatalf("Symlink at sidecar path: %v", err)
+	}
+
+	code, err := run([]string{"--input", in, "--output", out}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want sidecar open to fail on symlinked path")
+	}
+	if code != exitUserErr {
+		t.Errorf("exit code = %d, want %d (operator-env error, not data-correctness)", code, exitUserErr)
+	}
+	// Victim file MUST be untouched.
+	got, rerr := os.ReadFile(victim)
+	if rerr != nil {
+		t.Fatalf("read victim: %v", rerr)
+	}
+	if string(got) != victimBody {
+		t.Errorf("victim mutated; OpenSidecarFile followed the symlink (codex P2 v25 regression)")
+	}
+}
+
 // TestCLIPublishesFsmAndSidecarMode0600 pins claude v4 #904: the
 // produced .fsm and ENCODE_INFO.json are created with mode 0o600 so a
 // multi-user backup host does not get a world-readable dataset. The

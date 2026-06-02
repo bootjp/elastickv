@@ -50,9 +50,13 @@ const (
 	// 8-hex/4-byte form was flagged as collision-prone in highly
 	// concurrent CI environments (gemini medium #904); 8 bytes is the
 	// same width crypto/rand.Read pads cryptographic nonces to.
-	tempSuffixHexLen   = 16
-	tempSuffixByteLen  = tempSuffixHexLen / 2
-	mismatchTxtPerm    = 0o600
+	tempSuffixHexLen  = 16
+	tempSuffixByteLen = tempSuffixHexLen / 2
+	// mismatchTxtPerm + sidecar perm constants were removed in v25:
+	// both writes now go through backup.OpenSidecarFile which fixes
+	// the mode at 0o600 internally (codex P2 v25 #904 — no-follow
+	// open required different syscall semantics than os.OpenFile +
+	// O_TRUNC, so the perm now lives in the helper).
 	encodeInfoFilePerm = 0o600
 )
 
@@ -352,6 +356,31 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 	return encodeOpts
 }
 
+// writeMismatchTxt writes the self-test mismatch report to mismatchPath
+// using the same no-follow/no-clobber discipline as the sidecar
+// writer: an attacker pre-placing a symlink at
+// <output>.mismatch.txt could otherwise redirect the
+// truncate-and-write into a target of their choosing (codex P2 v25
+// #904 — extending the sidecar guard to the sibling deterministic
+// write path). On open failure the caller (writeAndPublish) logs at
+// warn level and continues; the failure does NOT block the
+// errSelfTestMismatch return so the mismatch error remains the
+// dominant signal.
+func writeMismatchTxt(mismatchPath string, body []byte) error {
+	f, err := backup.OpenSidecarFile(mismatchPath)
+	if err != nil {
+		return errors.Wrap(err, "open mismatch.txt")
+	}
+	if _, werr := f.Write(body); werr != nil {
+		_ = f.Close()
+		return errors.Wrap(werr, "write mismatch.txt body")
+	}
+	if cerr := f.Close(); cerr != nil {
+		return errors.Wrap(cerr, "close mismatch.txt")
+	}
+	return nil
+}
+
 // removeStaleOutputFSM removes outputPath ONLY when it exists as a
 // regular file or a symlink. Both shapes satisfy the "no
 // restore-visible FSM after self-test mismatch" contract: removing a
@@ -413,7 +442,7 @@ func writeAndPublish(cfg *config, encodeOpts backup.EncodeOptions, mismatchPath 
 		return result, err
 	}
 	if cfg.selfTest && !result.SelfTestMatched {
-		if werr := os.WriteFile(mismatchPath, result.SelfTestMismatchTxt, mismatchTxtPerm); werr != nil {
+		if werr := writeMismatchTxt(mismatchPath, result.SelfTestMismatchTxt); werr != nil {
 			logger.Warn("write mismatch.txt", "err", werr)
 		}
 		// Remove the stale <output>.fsm if one exists from a prior
@@ -564,9 +593,18 @@ func writeSidecar(cfg *config, m backup.Manifest, effectiveTS uint64, overridden
 	// 0o600 keeps ENCODE_INFO.json (which includes the source path,
 	// cluster_id, and SHA-256 of the .fsm) from leaking to non-owner
 	// users on multi-user backup hosts (claude v4 #904).
-	f, err := os.OpenFile(sidecarPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, encodeInfoFilePerm) //nolint:gosec // operator-supplied path
+	//
+	// backup.OpenSidecarFile refuses to follow a symlink at the
+	// sidecar path, refuses to truncate a hard-linked or
+	// non-regular file there, and (on unix) refuses to block on a
+	// reader-less FIFO — all the clobber-attack vectors the adapter
+	// dump writers already defend against. Without these guards an
+	// attacker pre-placing a symlink at <output>.encode_info.json
+	// could redirect the truncate-and-write into a target of their
+	// choosing (codex P2 v25 #904).
+	f, err := backup.OpenSidecarFile(sidecarPath)
 	if err != nil {
-		return errors.WithStack(err)
+		return errors.Wrap(err, "open sidecar")
 	}
 	if err := backup.WriteEncodeInfo(f, info); err != nil {
 		_ = f.Close()
