@@ -337,9 +337,17 @@ mergeable on its own.
 | M5a | CLI + multi-table workload + multi-group launch | `cmd/elastickv-split` binary; new `dynamodb-append-multi-table-workload` that creates N tables and writes to ≥2 tables per `TransactWriteItems`; **`scripts/run-jepsen-local.sh` extended to pass `--shardRanges` so the cluster launches with ≥2 Raft groups** and table-route keys for `t1…tN` are statically split across groups; setup hook calls `ListRoutes` from the first node and verifies the multi-group routing is in place (read-only, no mutation). | `./scripts/run-jepsen-local.sh --workload dynamodb-append-multi-table` runs from t=0 with tables 1-2 owned by group 1 and tables 3-4 owned by group 2; the workload exercises `dispatchMultiShardTxn` (verifiable via server-side log markers or a probe metric); Elle finds zero G1c. |
 | M5b | Route-shuffle nemesis | `jepsen/src/elastickv/composed1_nemesis.clj`; compose into the multi-table workload's nemesis package; CLI flag `--composed1-route-shuffle` (default off, on under `run-jepsen-local.sh`). Nemesis re-queries `ListRoutes` before every split and picks split keys from inside the table-route keyspace. | A `./scripts/run-jepsen-local.sh --workload dynamodb-append-multi-table --composed1-route-shuffle` run produces zero G1c after ≥10 shuffles during a 5-minute run. |
 
-M5a is a small, focused PR (Go CLI + Clojure setup hook +
-docs). M5b carries the nemesis itself plus the cadence-tuning
-analysis.
+M5a is a single focused PR but no longer "small" after the
+codex P1 #2 expansion: `cmd/elastickv-split` (Go CLI), the
+new `dynamodb-append-multi-table-workload` (Clojure), the
+`scripts/run-jepsen-local.sh` multi-group launch extension
+(five coordinated changes — see §3.3 table), the setup-hook
+verification (read-only `ListRoutes` + assertion), plus docs.
+Likely to land as a single PR for atomicity (the workload
+variant only makes sense alongside the multi-group launch and
+the verification hook), but reviewable as four roughly
+independent diff sections.  M5b carries the nemesis itself
+plus the cadence-tuning analysis.
 
 ---
 
