@@ -211,6 +211,54 @@ func TestEncodeSnapshotRequiresInputRoot(t *testing.T) {
 	}
 }
 
+// TestEncodeSnapshotRejectsMissingInputRoot pins codex P2 v8 #904: a
+// non-existent or non-directory InputRoot must be rejected before any
+// adapter runs. Otherwise each enabled adapter treats its missing
+// top-level subdirectory as a no-op, the call "succeeds", and the
+// caller gets a header-only .fsm — a silent empty-restore artifact.
+// CLI callers don't hit this path (they open MANIFEST.json first),
+// but library callers can pass a stale path, so the guard belongs in
+// EncodeSnapshot itself.
+func TestEncodeSnapshotRejectsMissingInputRoot(t *testing.T) {
+	t.Parallel()
+	t.Run("non-existent path", func(t *testing.T) {
+		t.Parallel()
+		missing := filepath.Join(t.TempDir(), "does-not-exist")
+		var buf bytes.Buffer
+		_, err := EncodeSnapshot(EncodeOptions{
+			InputRoot:    missing,
+			Adapters:     AdapterSet{SQS: true},
+			LastCommitTS: 1,
+		}, &buf)
+		if err == nil {
+			t.Fatalf("EncodeSnapshot with non-existent InputRoot succeeded; want error")
+		}
+		if buf.Len() != 0 {
+			t.Errorf("buf.Len = %d, want 0 (no bytes should be written for missing InputRoot)", buf.Len())
+		}
+	})
+	t.Run("regular file", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		filePath := filepath.Join(dir, "not-a-dir")
+		if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		var buf bytes.Buffer
+		_, err := EncodeSnapshot(EncodeOptions{
+			InputRoot:    filePath,
+			Adapters:     AdapterSet{SQS: true},
+			LastCommitTS: 1,
+		}, &buf)
+		if err == nil {
+			t.Fatalf("EncodeSnapshot with file-as-InputRoot succeeded; want error")
+		}
+		if buf.Len() != 0 {
+			t.Errorf("buf.Len = %d, want 0 (no bytes should be written for non-directory InputRoot)", buf.Len())
+		}
+	})
+}
+
 // TestEncodeSnapshotRejectsLowManifestFloor pins codex P2 v2: the
 // library-level HLC floor check fails-closed when opts.LastCommitTS
 // is below opts.ManifestLastCommitTS. Defense-in-depth for the CLI's

@@ -147,43 +147,27 @@ type EncodeResult struct {
 	AdaptersEnabled []string
 }
 
-// EncodeSnapshot reads the directory tree at opts.InputRoot, invokes the
-// enabled per-adapter encoders in canonical fan-out order, optionally
-// runs the round-trip self-test, and writes the .fsm bytes to out.
-// The .fsm bytes are NOT returned; they go to out.
-//
-// When opts.SelfTest=false the FSM streams straight to out with a
-// sha256 tee and no extra buffering. When opts.SelfTest=true the FSM
-// is written to an on-disk temp file (encode-self-test-fsm-*) under
-// opts.SelfTestDecodeOptions.OutRoot, the file is streamed through
-// DecodeSnapshot, and bytes are copied to out ONLY if the decode
-// survives. Memory cost in self-test mode is O(1) on top of the
-// sort working set (gemini high #904 — the earlier *bytes.Buffer
-// version would OOM on multi-GB snapshots).
-//
-// Self-test failure returns (result, nil) with result.SelfTestMatched
-// == false and result.SelfTestMismatchTxt populated. Callers MUST
-// check result.SelfTestMatched before treating a nil error as success.
-// The CLI relies on this contract to write mismatch.txt + exit 2;
-// library callers should follow the same pattern.
-//
-// EncodeSnapshot does NOT read MANIFEST.json itself, but it WILL
-// enforce a floor on opts.LastCommitTS when the caller threads the
-// manifest value through opts.ManifestLastCommitTS — a low
-// LastCommitTS returns ErrSelfTestLowerLastCommitTS BEFORE any bytes
-// are written. The CLI's resolveLastCommitTS sets both fields to the
-// reconciled values, and library callers SHOULD do the same. The
-// check is opt-in (ManifestLastCommitTS=0 disables it) so synthetic
-// test fixtures without a manifest reference can still call this
-// directly (codex P2 v2 #904).
 // validateEncodeOptions enforces the four pre-encode invariants:
-// InputRoot/out non-nil, non-empty adapter selection, optional
-// manifest-TS floor, and DDB JSONL guard. Split out so EncodeSnapshot
-// stays under the cyclop threshold; per-check helpers below keep each
-// branch's intent narrow.
+// InputRoot non-empty + exists-as-directory, out non-nil, non-empty
+// adapter selection, optional manifest-TS floor, and DDB JSONL guard.
+// Split out so EncodeSnapshot stays under the cyclop threshold; the
+// data-correctness checks live in validateEncodeOptionsData.
 func validateEncodeOptions(opts EncodeOptions, out io.Writer) error {
 	if opts.InputRoot == "" {
 		return errors.New("backup: EncodeOptions.InputRoot is required")
+	}
+	// Stat the path so a typo'd or deleted directory surfaces here
+	// rather than fan-out-no-op'ing every adapter and producing a
+	// header-only .fsm (codex P2 v8 #904). CLI callers indirectly
+	// catch this via os.Open(MANIFEST.json) before EncodeSnapshot,
+	// but a library caller that passes a stale path needs the guard
+	// at this layer.
+	info, statErr := os.Stat(opts.InputRoot)
+	if statErr != nil {
+		return errors.Wrapf(statErr, "stat InputRoot %q", opts.InputRoot)
+	}
+	if !info.IsDir() {
+		return errors.Errorf("backup: InputRoot %q is not a directory", opts.InputRoot)
 	}
 	if out == nil {
 		return errors.New("backup: EncodeSnapshot out writer is nil")
@@ -214,6 +198,35 @@ func validateEncodeOptionsData(opts EncodeOptions) error {
 	return nil
 }
 
+// EncodeSnapshot reads the directory tree at opts.InputRoot, invokes the
+// enabled per-adapter encoders in canonical fan-out order, optionally
+// runs the round-trip self-test, and writes the .fsm bytes to out.
+// The .fsm bytes are NOT returned; they go to out.
+//
+// When opts.SelfTest=false the FSM streams straight to out with a
+// sha256 tee and no extra buffering. When opts.SelfTest=true the FSM
+// is written to an on-disk temp file (encode-self-test-fsm-*) under
+// opts.SelfTestDecodeOptions.OutRoot, the file is streamed through
+// DecodeSnapshot, and bytes are copied to out ONLY if the decode
+// survives. Memory cost in self-test mode is O(1) on top of the
+// sort working set (gemini high #904 — the earlier *bytes.Buffer
+// version would OOM on multi-GB snapshots).
+//
+// Self-test failure returns (result, nil) with result.SelfTestMatched
+// == false and result.SelfTestMismatchTxt populated. Callers MUST
+// check result.SelfTestMatched before treating a nil error as success.
+// The CLI relies on this contract to write mismatch.txt + exit 2;
+// library callers should follow the same pattern.
+//
+// EncodeSnapshot does NOT read MANIFEST.json itself, but it WILL
+// enforce a floor on opts.LastCommitTS when the caller threads the
+// manifest value through opts.ManifestLastCommitTS — a low
+// LastCommitTS returns ErrSelfTestLowerLastCommitTS BEFORE any bytes
+// are written. The CLI's resolveLastCommitTS sets both fields to the
+// reconciled values, and library callers SHOULD do the same. The
+// check is opt-in (ManifestLastCommitTS=0 disables it) so synthetic
+// test fixtures without a manifest reference can still call this
+// directly (codex P2 v2 #904).
 func EncodeSnapshot(opts EncodeOptions, out io.Writer) (EncodeResult, error) {
 	if err := validateEncodeOptions(opts, out); err != nil {
 		return EncodeResult{}, err
