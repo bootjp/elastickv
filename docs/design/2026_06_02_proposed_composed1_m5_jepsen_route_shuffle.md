@@ -14,12 +14,12 @@ Parent design:
 > scaffolding — workload shape, nemesis, success criterion — so
 > that:
 >
->   1. The current `SplitRange` is exercised under realistic
->      concurrent multi-shard write load and proved non-regressing
->      (the workload finds **no** G1c, which is the baseline M4
->      contract).
->   2. When a future PR introduces a route-mutating RPC that DOES
->      shift ownership across groups (cross-group `SplitRange`,
+> 1. The current `SplitRange` is exercised under realistic
+>    concurrent multi-shard write load and proved non-regressing
+>    (the workload finds **no** G1c, which is the baseline M4
+>    contract).
+> 2. When a future PR introduces a route-mutating RPC that DOES
+>    shift ownership across groups (cross-group `SplitRange`,
 >      `MoveRange`, online rebalancer), the M5 workload — with a
 >      one-line nemesis change to call the new RPC — becomes the
 >      integration-level proof that M3+M4 hold under cross-group
@@ -101,7 +101,7 @@ sentinel that would catch a regression. M5 closes that gap.
 
 A standalone Go binary, ~80 lines:
 
-```
+```bash
 elastickv-split \
   --address 127.0.0.1:50051 \
   --route-id 100 \
@@ -130,7 +130,7 @@ clearer.
 A new Clojure file with a single `route-shuffle-nemesis`
 function returning a `jepsen.nemesis/Nemesis` instance:
 
-```
+```clojure
 (defn route-shuffle-nemesis
   "Periodically invokes elastickv-split against the cluster.
    :start  -> shuffle one route (pick a non-edge split key)
@@ -277,7 +277,7 @@ The workload's existing Elle checker emits a `:valid?` boolean
 and an `:anomalies` map keyed by anomaly type — `{:G0 […], :G1a
 […], :G1c […], :G-single […], …}`.  M5's pass condition:
 
-```
+```clojure
 (and (:valid? results)
      (nil? (get (:anomalies results) :G1c))
      (nil? (get (:anomalies results) :G-single)))
