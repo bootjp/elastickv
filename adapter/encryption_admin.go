@@ -1032,6 +1032,21 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 	}
 }
 
+// raftEnvelopeWrapEnabled gates the EnableRaftEnvelope RPC until
+// the Stage 6E-2 wrap-on-propose / unwrap-on-apply / §7.1
+// proposal-quiescence-barrier triple ships. With only 6E-1
+// (admin RPC + FSM-apply machinery) deployed, accepting a cutover
+// proposal records RaftEnvelopeCutoverIndex=N in the sidecar, but
+// no entry between N and the eventual 6E-2 upgrade is wrapped —
+// they all remain cleartext. The future engine apply-hook
+// (designed in §6.3) dispatches `entry.Index > cutover` through
+// the unwrap path, so a 6E-2 upgrade against a sidecar where N
+// was recorded under a 6E-1-only build would treat every
+// pre-upgrade cleartext entry above N as an envelope and halt
+// apply cluster-wide. Gate fails closed until 6E-2 atomically
+// flips this to true alongside the wrap/unwrap/barrier wiring.
+const raftEnvelopeWrapEnabled = false
+
 // EnableRaftEnvelope is the Stage 6E Phase 2 cutover — flips Raft
 // proposals from cleartext to §4.2-envelope. Structural mirror of
 // EnableStorageEnvelope; the differences are:
@@ -1049,6 +1064,13 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 // The semaphore, pre-check / fan-out / propose / post-check
 // sequence, and error mapping match the storage variant verbatim;
 // see EnableStorageEnvelope for the full design rationale.
+//
+// **Gated**: refuses with FailedPrecondition until 6E-2 ships the
+// wrap-on-propose / unwrap-on-apply / §7.1 barrier (see
+// raftEnvelopeWrapEnabled for the rationale). The pre-gate
+// validation surface (leader, semaphore acquire, request shape)
+// still fires so operators get fast feedback on wiring problems,
+// but no Raft proposal is composed and no sidecar mutation occurs.
 func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.EnableRaftEnvelopeRequest) (*pb.EnableRaftEnvelopeResponse, error) {
 	if err := s.acquireCutoverSemaphore(ctx); err != nil {
 		return nil, err
@@ -1060,6 +1082,15 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 	}
 	if earlyResp != nil {
 		return earlyResp, nil
+	}
+	if !raftEnvelopeWrapEnabled {
+		// Without 6E-2 wrap-on-propose, recording the cutover
+		// index here would let cleartext entries land at indexes
+		// > N. A 6E-2 upgrade would then treat those cleartext
+		// entries as envelopes and halt apply. Refuse before the
+		// fan-out and propose so no sidecar state changes.
+		return nil, grpcStatusError(codes.FailedPrecondition,
+			"encryption: enable-raft-envelope is gated until Stage 6E-2 ships wrap-on-propose / unwrap-on-apply / §7.1 proposal-quiescence-barrier; accepting the cutover now would brick the cluster on the next upgrade")
 	}
 	fanoutResult, err := s.runCutoverFanout(ctx)
 	if err != nil {
@@ -1190,16 +1221,17 @@ func idempotentRaftCutoverResponse(sc *encryption.Sidecar) *pb.EnableRaftEnvelop
 
 // freshRaftCutoverResponse is the §3.2 fresh-success shape for the
 // raft variant. applied_index is sourced from the post-apply
-// sidecar's RaftEnvelopeCutoverIndex; a defensive fallback to
-// proposedIdx covers the same post-apply read race that the
-// storage variant hedges against.
-func freshRaftCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResult admin.CapabilityFanoutResult) *pb.EnableRaftEnvelopeResponse {
-	appliedIndex := sc.RaftEnvelopeCutoverIndex
-	if appliedIndex == 0 {
-		appliedIndex = proposedIdx
-	}
+// sidecar's RaftEnvelopeCutoverIndex, which raftCutoverPostcheck
+// has already validated as non-zero (the stale-DEKID branch
+// refuses earlier, so reaching here implies the apply set the
+// cutover index). The storage variant's `appliedIndex == 0`
+// defensive branch has no analogue here because the raft variant
+// uses the cutover index itself as the active sentinel: a zero
+// at this point would be an upstream invariant violation, not a
+// hand-edit hazard.
+func freshRaftCutoverResponse(sc *encryption.Sidecar, _ uint64, fanoutResult admin.CapabilityFanoutResult) *pb.EnableRaftEnvelopeResponse {
 	return &pb.EnableRaftEnvelopeResponse{
-		AppliedIndex:      appliedIndex,
+		AppliedIndex:      sc.RaftEnvelopeCutoverIndex,
 		CapabilitySummary: projectCapabilityVerdicts(fanoutResult.Verdicts),
 		WasAlreadyActive:  false,
 	}

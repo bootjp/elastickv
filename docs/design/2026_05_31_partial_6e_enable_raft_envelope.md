@@ -13,16 +13,45 @@
 | Milestone | Status | Shipped in |
 |---|---|---|
 | 6E-1a — FSM apply machinery (`applyEnableRaftEnvelope`, sidecar field plumbing, wire sub-tag whitelist) | shipped | #899 (3bffd344) |
-| 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand | shipped | this PR |
-| 6E-2 — engine unwrap-on-apply + coordinator wrap-on-propose + §7.1 proposal-quiescence barrier (atomic 3-piece flip) | not started | — |
+| 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand (server method **gated** until 6E-2; see §3.3 below) | shipped | this PR |
+| 6E-2 — engine unwrap-on-apply + coordinator wrap-on-propose + §7.1 proposal-quiescence barrier (atomic 3-piece flip; also flips the 6E-1b gate to true) | not started | — |
 | 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | not started | — |
 
-With 6E-1 (both sub-milestones) complete, operators can trigger
-the Phase-2 cutover and the FSM records `RaftEnvelopeCutoverIndex`
-in the sidecar atomically with the proposer-registration row. The
-flip is operator-inert until 6E-2 lands the engine and coordinator
-glue: no proposal is wrapped, and no apply is unwrapped, with only
-6E-1 deployed (per §6E design "no behavior change" guarantee).
+With 6E-1 (both sub-milestones) complete, the wire-format and
+operator surface for the cutover is reviewable end-to-end, but the
+6E-1b server method **refuses fresh cutover proposals with
+FailedPrecondition** until 6E-2 ships (see §3.3). With only 6E-1
+deployed, the cluster cannot enter Phase 2 — no
+`RaftEnvelopeCutoverIndex` value is ever written, so a 6E-2
+upgrade against a 6E-1-only cluster is safe.
+
+### 3.3 The 6E-1b gate (codex P1 round-1)
+
+A naive 6E-1b that accepted cutover proposals immediately would
+record `RaftEnvelopeCutoverIndex=N` while subsequent Raft entries
+remain cleartext (because 6E-2's wrap-on-propose path is not yet
+deployed). On a later 6E-2 upgrade, the engine apply-hook —
+designed to dispatch `entry.Index > sidecar.RaftEnvelopeCutoverIndex`
+through unwrap — would treat every cleartext entry committed at
+indexes greater than N as a wrapped envelope and halt apply
+cluster-wide.
+
+The gate is the package-level constant
+`raftEnvelopeWrapEnabled` in `adapter/encryption_admin.go`. It
+starts at `false`. The server method's pre-check (leader gate,
+sidecar bootstrap gate, idempotent-retry short-circuit) still
+fires so operators get fast feedback on misconfigured wiring;
+only the propose path is refused. Idempotent retries against a
+sidecar that already carries `RaftEnvelopeCutoverIndex != 0`
+(operationally impossible until 6E-2 lifts the gate, but the
+short-circuit is preserved for future replay symmetry) flow
+through unchanged.
+
+6E-2 flips the constant to `true` atomically with the
+wrap/unwrap/barrier wiring. The flip and the rest of the 6E-2
+slice MUST land in one commit so an operator who pulls the new
+binary cannot enter the window where the gate is open but the
+wrap/unwrap path is incomplete.
 
 ## 0. Why this slice exists
 

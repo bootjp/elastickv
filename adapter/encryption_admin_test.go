@@ -2013,14 +2013,24 @@ func TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry(t *testing.T) {
 	}
 }
 
-// TestEncryptionAdmin_EnableRaftEnvelope_HappyPath drives the full
-// raft-variant happy path: leader passes, fan-out approves,
-// propose lands, applyRaftCutover sets RaftEnvelopeCutoverIndex,
-// the response carries WasAlreadyActive=false +
-// CapabilitySummary populated + AppliedIndex matching the
-// proposed Raft index. The decoded proposal must carry
-// Purpose=PurposeRaft, len(Wrapped)==0, DEKID=sidecar.Active.Raft.
-func TestEncryptionAdmin_EnableRaftEnvelope_HappyPath(t *testing.T) {
+// TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2 pins the
+// fail-closed gate: while raftEnvelopeWrapEnabled is false (i.e.
+// before Stage 6E-2 ships wrap-on-propose / unwrap-on-apply /
+// §7.1 barrier), the RPC MUST refuse fresh cutover proposals
+// with FailedPrecondition rather than recording
+// RaftEnvelopeCutoverIndex=N. Recording N now would let cleartext
+// entries land at indexes > N and the 6E-2 engine apply-hook
+// would treat them as envelopes on upgrade, halting apply
+// cluster-wide.
+//
+// The test wires an `applyingProposer` exactly as a future
+// happy-path test would, then verifies the gate refuses BEFORE
+// any proposal is composed (proposer.calls is empty) and BEFORE
+// any sidecar mutation lands (RaftEnvelopeCutoverIndex stays 0).
+// When 6E-2 lands and flips raftEnvelopeWrapEnabled to true, this
+// test becomes the regression pin for the gate-flip and a
+// HappyPath sibling is added.
+func TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2(t *testing.T) {
 	t.Parallel()
 	path := cutoverReadySidecarFixture(t)
 	proposer := &applyingProposer{
@@ -2034,53 +2044,24 @@ func TestEncryptionAdmin_EnableRaftEnvelope_HappyPath(t *testing.T) {
 		WithEncryptionAdminSidecarPath(path),
 		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
 	)
-	got, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
-	if err != nil {
-		t.Fatalf("EnableRaftEnvelope: %v", err)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (gated until 6E-2)", status.Code(err))
 	}
-	if got.WasAlreadyActive {
-		t.Error("WasAlreadyActive=true, want false (fresh cutover)")
+	if err == nil || !strings.Contains(err.Error(), "6E-2") {
+		t.Errorf("error %q does not hint at the 6E-2 gate", err)
 	}
-	if got.AppliedIndex != 4242 {
-		t.Errorf("AppliedIndex=%d, want 4242 (proposed Raft index)", got.AppliedIndex)
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (gate must refuse before propose)", len(proposer.calls))
 	}
-	if len(got.CapabilitySummary) != 2 {
-		t.Errorf("CapabilitySummary len=%d, want 2 (allOKFanout)", len(got.CapabilitySummary))
+	// Sidecar must remain untouched: RaftEnvelopeCutoverIndex
+	// still 0 means the cluster has not entered Phase 2 and a
+	// future 6E-2 upgrade is still safe.
+	sc, readErr := encryption.ReadSidecar(path)
+	if readErr != nil {
+		t.Fatalf("ReadSidecar: %v", readErr)
 	}
-	// Wire-level pin: the proposed Raft entry MUST decode as
-	// SubTag=RotateSubEnableRaftEnvelope with §2.1 constraints.
-	assertSingleProposalOpcode(t, proposer.calls, fsmwire.OpRotation)
-	decoded, err := fsmwire.DecodeRotation(proposer.calls[0][1:])
-	if err != nil {
-		t.Fatalf("DecodeRotation: %v", err)
-	}
-	assertRaftCutoverProposalShape(t, decoded, 6, 11, 7)
-}
-
-// assertRaftCutoverProposalShape pins the §2.1 raft-variant
-// proposal shape: SubTag=RotateSubEnableRaftEnvelope,
-// Purpose=PurposeRaft, len(Wrapped)==0, DEKID=sidecar.Active.Raft,
-// ProposerRegistration {DEKID, FullNodeID, LocalEpoch} matching
-// the request. Mirrors assertCutoverProposalShape for the storage
-// variant.
-func assertRaftCutoverProposalShape(t *testing.T, decoded fsmwire.RotationPayload, wantDEKID uint32, wantNodeID uint64, wantEpoch uint16) {
-	t.Helper()
-	if decoded.SubTag != fsmwire.RotateSubEnableRaftEnvelope {
-		t.Errorf("SubTag=%#x, want RotateSubEnableRaftEnvelope (%#x)", decoded.SubTag, fsmwire.RotateSubEnableRaftEnvelope)
-	}
-	if decoded.Purpose != fsmwire.PurposeRaft {
-		t.Errorf("Purpose=%#x, want PurposeRaft (%#x)", byte(decoded.Purpose), byte(fsmwire.PurposeRaft))
-	}
-	if len(decoded.Wrapped) != 0 {
-		t.Errorf("len(Wrapped)=%d, want 0", len(decoded.Wrapped))
-	}
-	if decoded.DEKID != wantDEKID {
-		t.Errorf("DEKID=%d, want %d (Active.Raft)", decoded.DEKID, wantDEKID)
-	}
-	if decoded.ProposerRegistration.DEKID != wantDEKID ||
-		decoded.ProposerRegistration.FullNodeID != wantNodeID ||
-		decoded.ProposerRegistration.LocalEpoch != wantEpoch {
-		t.Errorf("ProposerRegistration=%+v, want {DEKID:%d FullNodeID:%d LocalEpoch:%d}",
-			decoded.ProposerRegistration, wantDEKID, wantNodeID, wantEpoch)
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		t.Errorf("RaftEnvelopeCutoverIndex=%d, want 0 (gate must refuse before sidecar mutation)", sc.RaftEnvelopeCutoverIndex)
 	}
 }
