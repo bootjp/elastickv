@@ -175,9 +175,20 @@ Concretely, the M5 split key construction is:
 ```
 
 The Clojure side gets a small helper (`composed1-nemesis/encode-dynamo-segment`)
-that mirrors the Go `encodeDynamoSegment` exactly. The
-Composed-1 doc and the encoding helper land together so any
-future change to the encoding surface is caught by an
+that mirrors the Go `encodeDynamoSegment` exactly. The Go
+implementation uses `base64.RawURLEncoding` — URL-safe charset
+(`-`/`_`) **without `=` padding**. The Clojure side MUST use
+`(.withoutPadding (java.util.Base64/getUrlEncoder))`;
+`Base64/getEncoder` (standard alphabet with `+`/`/`) and the
+default `Base64/getUrlEncoder` (URL-safe **with** padding) are
+both wrong (claude[bot] P3 on 24812867).  The failure mode is
+silent and non-obvious: a wrong encoding produces split keys
+that fall outside every route's range, `ListRoutes` returns no
+matching route, the nemesis logs and skips every `:start`,
+and the run appears clean while the nemesis is a no-op.
+
+The Composed-1 doc and the encoding helper land together so
+any future change to the encoding surface is caught by an
 unambiguous reference point.
 
 A prior revision of this doc also wrongly explained the old
@@ -232,7 +243,7 @@ startup.** Both halves are required.
 | Half | Mechanism |
 |---|---|
 | Multi-table workload | A NEW workload variant `dynamodb-append-multi-table-workload` creates N=4 tables (`jepsen_append_t1` … `jepsen_append_t4`) and writes to ≥2 distinct tables per `TransactWriteItems`.  The router maps each table to its own route key so cross-table txns engage multi-route routing. |
-| Multi-group cluster | M5a extends `scripts/run-jepsen-local.sh` to pass `--shardRanges` so the cluster starts with at least 2 Raft groups, and the table-route keys for `t1…t4` are statically split between groups: e.g. `tables 1-2 → group 1, tables 3-4 → group 2`.  The DDB leader address per-group is wired via `--raftDynamoMap` (already supported by the runner — only the `--shardRanges` argument is new). |
+| Multi-group cluster | M5a extends `scripts/run-jepsen-local.sh` to launch a multi-group cluster.  Per `shard_config.go:61-99` (claude[bot] P2 on 24812867), `--shardRanges` alone is not enough: without `--raftGroups`, every shard range's `groupID` collapses into the single default group 1 and `groupMutations` returns `gids = [1]` for every key — single-shard path, 2PC never fires.  M5a must therefore add **five** coordinated launch-script changes:<br><br>1. **`--raftGroups`** declaring ≥2 groups (e.g. `1=127.0.0.1:50051,2=127.0.0.1:50054`).<br>2. **`--shardRanges`** boundary keys placing `t1-t2` in group 1 and `t3-t4` in group 2.<br>3. **Cluster topology decision** — either 6 nodes (3-per-group, production-like consensus) or 2 single-node groups (`--raftBootstrap` per group, faster for CI).  Tentative pick: 2 single-node groups for M5a, scale to 6 nodes if/when the workload outgrows it (low cost — flip a flag).<br>4. **Per-group `--raftBootstrapMembers`** (different members sets for each group's nodes).<br>5. **Expanded `--raftDynamoMap`** covering both groups' leader addresses, plus the matching port allocations (currently `5005{1,2,3}`/`6380{1,2,3}` for the single-group 3-node layout — need `5005{1,4}`/`6380{1,4}` for the 2-single-node layout, or `5005{1..6}`/`6380{1..6}` for 6-node). |
 
 `encodeDynamoSegment("jepsen_append_t1")` etc. are computed at
 script setup time and inlined into the `--shardRanges`
