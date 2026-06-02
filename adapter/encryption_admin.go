@@ -1032,6 +1032,211 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 	}
 }
 
+// raftEnvelopeWrapEnabled gates the EnableRaftEnvelope RPC until
+// the Stage 6E-2 wrap-on-propose / unwrap-on-apply / §7.1
+// proposal-quiescence-barrier triple ships. With only 6E-1
+// (admin RPC + FSM-apply machinery) deployed, accepting a cutover
+// proposal records RaftEnvelopeCutoverIndex=N in the sidecar, but
+// no entry between N and the eventual 6E-2 upgrade is wrapped —
+// they all remain cleartext. The future engine apply-hook
+// (designed in §6.3) dispatches `entry.Index > cutover` through
+// the unwrap path, so a 6E-2 upgrade against a sidecar where N
+// was recorded under a 6E-1-only build would treat every
+// pre-upgrade cleartext entry above N as an envelope and halt
+// apply cluster-wide. Gate fails closed until 6E-2 atomically
+// flips this to true alongside the wrap/unwrap/barrier wiring.
+const raftEnvelopeWrapEnabled = false
+
+// EnableRaftEnvelope is the Stage 6E Phase 2 cutover — flips Raft
+// proposals from cleartext to §4.2-envelope. Structural mirror of
+// EnableStorageEnvelope; the differences are:
+//
+//   - Target Purpose is PurposeRaft.
+//   - Source DEK slot is sidecar.Active.Raft (not Active.Storage).
+//   - The "already active" sentinel is the single field
+//     sidecar.RaftEnvelopeCutoverIndex != 0 — there is no separate
+//     bool flag, so the raft variant has no equivalent of the
+//     §6.4 cutover_index_unknown defensive fallback (a zero index
+//     is exactly the not-active state, not a corrupted-active
+//     state, and the 6E-1a applier fail-closes on raftIdx == 0
+//     before ApplyRegistration).
+//
+// The semaphore, pre-check / fan-out / propose / post-check
+// sequence, and error mapping match the storage variant verbatim;
+// see EnableStorageEnvelope for the full design rationale.
+//
+// **Gated**: refuses with FailedPrecondition until 6E-2 ships the
+// wrap-on-propose / unwrap-on-apply / §7.1 barrier (see
+// raftEnvelopeWrapEnabled for the rationale). The pre-gate
+// validation surface (leader, semaphore acquire, request shape)
+// still fires so operators get fast feedback on wiring problems,
+// but no Raft proposal is composed and no sidecar mutation occurs.
+func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.EnableRaftEnvelopeRequest) (*pb.EnableRaftEnvelopeResponse, error) {
+	if err := s.acquireCutoverSemaphore(ctx); err != nil {
+		return nil, err
+	}
+	defer s.releaseCutoverSemaphore()
+	preSidecar, earlyResp, err := s.raftCutoverPrecheck(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if earlyResp != nil {
+		return earlyResp, nil
+	}
+	if !raftEnvelopeWrapEnabled {
+		// Without 6E-2 wrap-on-propose, recording the cutover
+		// index here would let cleartext entries land at indexes
+		// > N. A 6E-2 upgrade would then treat those cleartext
+		// entries as envelopes and halt apply. Refuse before the
+		// fan-out and propose so no sidecar state changes.
+		return nil, grpcStatusError(codes.FailedPrecondition,
+			"encryption: enable-raft-envelope is gated until Stage 6E-2 ships wrap-on-propose / unwrap-on-apply / §7.1 proposal-quiescence-barrier; accepting the cutover now would brick the cluster on the next upgrade")
+	}
+	fanoutResult, err := s.runCutoverFanout(ctx)
+	if err != nil {
+		return nil, err
+	}
+	proposedIdx, err := s.proposeRaftCutoverEntry(ctx, preSidecar, req)
+	if err != nil {
+		return nil, err
+	}
+	return s.raftCutoverPostcheck(proposedIdx, fanoutResult)
+}
+
+// raftCutoverPrecheck runs the Stage 6E §3.2 steps 1-5: input
+// validation, leader gate, bootstrap gate, idempotent-retry
+// short-circuit. Returns:
+//
+//   - (preSidecar, nil, nil) on the propose-path
+//   - (nil, earlyResp, nil) on the idempotent retry
+//   - (nil, nil, err) on any refusal
+func (s *EncryptionAdminServer) raftCutoverPrecheck(ctx context.Context, req *pb.EnableRaftEnvelopeRequest) (*encryption.Sidecar, *pb.EnableRaftEnvelopeResponse, error) {
+	if err := s.requireLeader(ctx); err != nil {
+		return nil, nil, err
+	}
+	if s.proposer == nil {
+		return nil, nil, grpcStatusError(codes.FailedPrecondition, "encryption: proposer is not configured on this node")
+	}
+	if s.sidecarPath == "" {
+		return nil, nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
+	}
+	if err := validateEnableRaftEnvelopeRequest(req); err != nil {
+		return nil, nil, err
+	}
+	preSidecar, err := encryption.ReadSidecar(s.sidecarPath)
+	if err != nil {
+		return nil, nil, statusFromSidecarErr(err)
+	}
+	if preSidecar.Active.Raft == 0 {
+		return nil, nil, grpcStatusError(codes.FailedPrecondition,
+			"encryption: cluster not bootstrapped (Active.Raft == 0) — call BootstrapEncryption first")
+	}
+	if preSidecar.RaftEnvelopeCutoverIndex != 0 {
+		// Idempotent retry — return OK with was_already_active=true
+		// and the original cutover index. Skip the fan-out: the
+		// original cutover already passed the gate.
+		return nil, idempotentRaftCutoverResponse(preSidecar), nil
+	}
+	return preSidecar, nil, nil
+}
+
+// proposeRaftCutoverEntry composes the §2.1 RotationPayload for
+// the raft variant and drives it through Raft. Purpose=PurposeRaft,
+// DEKID = sidecar.Active.Raft, Wrapped=empty (length-based, not
+// nil, matching the 6E-1a applier's length-based reject).
+func (s *EncryptionAdminServer) proposeRaftCutoverEntry(ctx context.Context, preSidecar *encryption.Sidecar, req *pb.EnableRaftEnvelopeRequest) (uint64, error) {
+	payload := fsmwire.RotationPayload{
+		SubTag:  fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:   preSidecar.Active.Raft,
+		Purpose: fsmwire.PurposeRaft,
+		Wrapped: []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{
+			DEKID:      preSidecar.Active.Raft,
+			FullNodeID: req.GetProposerNodeId(),
+			LocalEpoch: uint32ToLocalEpoch(req.GetProposerLocalEpoch()),
+		},
+	}
+	return s.proposeEncryptionEntry(ctx, fsmwire.OpRotation, fsmwire.EncodeRotation(payload))
+}
+
+// raftCutoverPostcheck re-reads the sidecar after the Raft propose
+// returns and discriminates the §2.1 outcomes:
+//
+//   - Fresh success: RaftEnvelopeCutoverIndex == proposedIdx → §3.2
+//     happy path.
+//   - Stale-DEKID race: RaftEnvelopeCutoverIndex still 0 because
+//     a RotateDEK raced and the applier consumed the entry as a
+//     benign no-op → FailedPrecondition with retry hint.
+//   - Concurrent overlap: RaftEnvelopeCutoverIndex != 0 but !=
+//     proposedIdx → another cutover landed first (operator-
+//     impossible under the semaphore, but the applier records
+//     the FIRST cutover's index; surface that index with
+//     was_already_active=false because THIS call's propose
+//     committed an entry that the applier treated as the
+//     idempotent path).
+func (s *EncryptionAdminServer) raftCutoverPostcheck(proposedIdx uint64, fanoutResult admin.CapabilityFanoutResult) (*pb.EnableRaftEnvelopeResponse, error) {
+	postSidecar, err := encryption.ReadSidecar(s.sidecarPath)
+	if err != nil {
+		return nil, statusFromSidecarErr(err)
+	}
+	if postSidecar.RaftEnvelopeCutoverIndex == 0 {
+		return nil, grpcStatusError(codes.FailedPrecondition,
+			"encryption: cutover proposal raced a RotateDEK (sidecar.Active.Raft moved); retry against the new active DEK")
+	}
+	return freshRaftCutoverResponse(postSidecar, proposedIdx, fanoutResult), nil
+}
+
+// validateEnableRaftEnvelopeRequest enforces the §3.2 step 1
+// gRPC-boundary checks. Pulled out so the EnableRaftEnvelope
+// orchestration body stays under the cyclomatic-complexity budget
+// and so tests can exercise the validation slice in isolation.
+func validateEnableRaftEnvelopeRequest(req *pb.EnableRaftEnvelopeRequest) error {
+	if req.GetProposerNodeId() == 0 {
+		return grpcStatusError(codes.InvalidArgument,
+			"encryption: proposer_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
+	}
+	if req.GetProposerLocalEpoch() > math.MaxUint16 {
+		return grpcStatusErrorf(codes.InvalidArgument,
+			"encryption: proposer_local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
+			req.GetProposerLocalEpoch())
+	}
+	return nil
+}
+
+// idempotentRaftCutoverResponse is the §3.2 step 5 retry-success
+// shape for the raft variant: OK, was_already_active=true,
+// applied_index = sidecar.RaftEnvelopeCutoverIndex (the original
+// cutover's apply index). The storage variant's
+// cutover_index_unknown defensive branch is intentionally absent
+// — the raft variant uses the cutover index itself as the active
+// sentinel, so a non-zero index here cannot coexist with the
+// "active but unknown index" state the storage hedge was for.
+func idempotentRaftCutoverResponse(sc *encryption.Sidecar) *pb.EnableRaftEnvelopeResponse {
+	return &pb.EnableRaftEnvelopeResponse{
+		WasAlreadyActive:  true,
+		CapabilitySummary: nil,
+		AppliedIndex:      sc.RaftEnvelopeCutoverIndex,
+	}
+}
+
+// freshRaftCutoverResponse is the §3.2 fresh-success shape for the
+// raft variant. applied_index is sourced from the post-apply
+// sidecar's RaftEnvelopeCutoverIndex, which raftCutoverPostcheck
+// has already validated as non-zero (the stale-DEKID branch
+// refuses earlier, so reaching here implies the apply set the
+// cutover index). The storage variant's `appliedIndex == 0`
+// defensive branch has no analogue here because the raft variant
+// uses the cutover index itself as the active sentinel: a zero
+// at this point would be an upstream invariant violation, not a
+// hand-edit hazard.
+func freshRaftCutoverResponse(sc *encryption.Sidecar, _ uint64, fanoutResult admin.CapabilityFanoutResult) *pb.EnableRaftEnvelopeResponse {
+	return &pb.EnableRaftEnvelopeResponse{
+		AppliedIndex:      sc.RaftEnvelopeCutoverIndex,
+		CapabilitySummary: projectCapabilityVerdicts(fanoutResult.Verdicts),
+		WasAlreadyActive:  false,
+	}
+}
+
 // projectCapabilityVerdicts marshals the internal CapabilityVerdict
 // shape into the wire-format proto.CapabilityVerdict. Reachable /
 // Err fields are intentionally NOT projected: the cutover RPC only

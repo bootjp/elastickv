@@ -26,6 +26,7 @@ const (
 	EncryptionAdmin_RegisterEncryptionWriter_FullMethodName = "/EncryptionAdmin/RegisterEncryptionWriter"
 	EncryptionAdmin_ResyncSidecar_FullMethodName            = "/EncryptionAdmin/ResyncSidecar"
 	EncryptionAdmin_EnableStorageEnvelope_FullMethodName    = "/EncryptionAdmin/EnableStorageEnvelope"
+	EncryptionAdmin_EnableRaftEnvelope_FullMethodName       = "/EncryptionAdmin/EnableRaftEnvelope"
 )
 
 // EncryptionAdminClient is the client API for EncryptionAdmin service.
@@ -80,6 +81,7 @@ type EncryptionAdminClient interface {
 	RegisterEncryptionWriter(ctx context.Context, in *RegisterEncryptionWriterRequest, opts ...grpc.CallOption) (*RegisterEncryptionWriterResponse, error)
 	ResyncSidecar(ctx context.Context, in *ResyncSidecarRequest, opts ...grpc.CallOption) (*ResyncSidecarResponse, error)
 	EnableStorageEnvelope(ctx context.Context, in *EnableStorageEnvelopeRequest, opts ...grpc.CallOption) (*EnableStorageEnvelopeResponse, error)
+	EnableRaftEnvelope(ctx context.Context, in *EnableRaftEnvelopeRequest, opts ...grpc.CallOption) (*EnableRaftEnvelopeResponse, error)
 }
 
 type encryptionAdminClient struct {
@@ -160,6 +162,16 @@ func (c *encryptionAdminClient) EnableStorageEnvelope(ctx context.Context, in *E
 	return out, nil
 }
 
+func (c *encryptionAdminClient) EnableRaftEnvelope(ctx context.Context, in *EnableRaftEnvelopeRequest, opts ...grpc.CallOption) (*EnableRaftEnvelopeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnableRaftEnvelopeResponse)
+	err := c.cc.Invoke(ctx, EncryptionAdmin_EnableRaftEnvelope_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EncryptionAdminServer is the server API for EncryptionAdmin service.
 // All implementations must embed UnimplementedEncryptionAdminServer
 // for forward compatibility.
@@ -212,6 +224,7 @@ type EncryptionAdminServer interface {
 	RegisterEncryptionWriter(context.Context, *RegisterEncryptionWriterRequest) (*RegisterEncryptionWriterResponse, error)
 	ResyncSidecar(context.Context, *ResyncSidecarRequest) (*ResyncSidecarResponse, error)
 	EnableStorageEnvelope(context.Context, *EnableStorageEnvelopeRequest) (*EnableStorageEnvelopeResponse, error)
+	EnableRaftEnvelope(context.Context, *EnableRaftEnvelopeRequest) (*EnableRaftEnvelopeResponse, error)
 	mustEmbedUnimplementedEncryptionAdminServer()
 }
 
@@ -242,6 +255,9 @@ func (UnimplementedEncryptionAdminServer) ResyncSidecar(context.Context, *Resync
 }
 func (UnimplementedEncryptionAdminServer) EnableStorageEnvelope(context.Context, *EnableStorageEnvelopeRequest) (*EnableStorageEnvelopeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnableStorageEnvelope not implemented")
+}
+func (UnimplementedEncryptionAdminServer) EnableRaftEnvelope(context.Context, *EnableRaftEnvelopeRequest) (*EnableRaftEnvelopeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnableRaftEnvelope not implemented")
 }
 func (UnimplementedEncryptionAdminServer) mustEmbedUnimplementedEncryptionAdminServer() {}
 func (UnimplementedEncryptionAdminServer) testEmbeddedByValue()                         {}
@@ -390,6 +406,24 @@ func _EncryptionAdmin_EnableStorageEnvelope_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EncryptionAdmin_EnableRaftEnvelope_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnableRaftEnvelopeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EncryptionAdminServer).EnableRaftEnvelope(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EncryptionAdmin_EnableRaftEnvelope_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EncryptionAdminServer).EnableRaftEnvelope(ctx, req.(*EnableRaftEnvelopeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EncryptionAdmin_ServiceDesc is the grpc.ServiceDesc for EncryptionAdmin service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -424,6 +458,10 @@ var EncryptionAdmin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EnableStorageEnvelope",
 			Handler:    _EncryptionAdmin_EnableStorageEnvelope_Handler,
+		},
+		{
+			MethodName: "EnableRaftEnvelope",
+			Handler:    _EncryptionAdmin_EnableRaftEnvelope_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

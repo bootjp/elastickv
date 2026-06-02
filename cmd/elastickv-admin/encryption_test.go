@@ -173,13 +173,15 @@ func (s *stubSidecarErrorServer) GetSidecarState(context.Context, *pb.Empty) (*p
 // inherit Unimplemented defaults.
 type stubMutatorServer struct {
 	pb.UnimplementedEncryptionAdminServer
-	rotateCalls         []*pb.RotateDEKRequest
-	registerCalls       []*pb.RegisterEncryptionWriterRequest
-	bootstrapCalls      []*pb.BootstrapEncryptionRequest
-	enableEnvelopeCalls []*pb.EnableStorageEnvelopeRequest
-	enableEnvelopeResp  *pb.EnableStorageEnvelopeResponse
-	appliedIndex        uint64
-	returnErr           error
+	rotateCalls             []*pb.RotateDEKRequest
+	registerCalls           []*pb.RegisterEncryptionWriterRequest
+	bootstrapCalls          []*pb.BootstrapEncryptionRequest
+	enableEnvelopeCalls     []*pb.EnableStorageEnvelopeRequest
+	enableEnvelopeResp      *pb.EnableStorageEnvelopeResponse
+	enableRaftEnvelopeCalls []*pb.EnableRaftEnvelopeRequest
+	enableRaftEnvelopeResp  *pb.EnableRaftEnvelopeResponse
+	appliedIndex            uint64
+	returnErr               error
 }
 
 func (s *stubMutatorServer) RotateDEK(_ context.Context, req *pb.RotateDEKRequest) (*pb.RotateDEKResponse, error) {
@@ -221,6 +223,17 @@ func (s *stubMutatorServer) EnableStorageEnvelope(_ context.Context, req *pb.Ena
 		return s.enableEnvelopeResp, nil
 	}
 	return &pb.EnableStorageEnvelopeResponse{AppliedIndex: s.appliedIndex}, nil
+}
+
+func (s *stubMutatorServer) EnableRaftEnvelope(_ context.Context, req *pb.EnableRaftEnvelopeRequest) (*pb.EnableRaftEnvelopeResponse, error) {
+	s.enableRaftEnvelopeCalls = append(s.enableRaftEnvelopeCalls, req)
+	if s.returnErr != nil {
+		return nil, s.returnErr
+	}
+	if s.enableRaftEnvelopeResp != nil {
+		return s.enableRaftEnvelopeResp, nil
+	}
+	return &pb.EnableRaftEnvelopeResponse{AppliedIndex: s.appliedIndex}, nil
 }
 
 func TestRunEncryptionBootstrap_HappyPath(t *testing.T) {
@@ -794,6 +807,136 @@ func TestEncryptionMain_EnableStorageEnvelopeSubcommand(t *testing.T) {
 	err := encryptionMain([]string{"enable-storage-envelope"})
 	if err == nil {
 		t.Fatal("enable-storage-envelope with no flags: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "proposer-node-id") {
+		t.Errorf("dispatch reached wrong handler: got %v", err)
+	}
+}
+
+// TestRunEncryptionEnableRaftEnvelope_HappyPath pins the §3.1
+// fresh-success rendering for the raft variant. Structurally
+// identical to the storage HappyPath test except the response
+// shape lacks the cutover_index_unknown field (raft variant uses
+// RaftEnvelopeCutoverIndex != 0 as the sole active sentinel).
+func TestRunEncryptionEnableRaftEnvelope_HappyPath(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{
+		appliedIndex: 4242,
+		enableRaftEnvelopeResp: &pb.EnableRaftEnvelopeResponse{
+			AppliedIndex:     4242,
+			WasAlreadyActive: false,
+			CapabilitySummary: []*pb.CapabilityVerdict{
+				{FullNodeId: 11, EncryptionCapable: true, BuildSha: "build-n1", SidecarPresent: true},
+				{FullNodeId: 22, EncryptionCapable: true, BuildSha: "build-n2", SidecarPresent: true},
+			},
+		},
+	}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+	var buf bytes.Buffer
+	err := runEncryptionEnableRaftEnvelope([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--proposer-node-id", "11",
+		"--proposer-local-epoch", "7",
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionEnableRaftEnvelope: %v", err)
+	}
+	out := buf.String()
+	if !strings.HasPrefix(out, "enabled applied_index=4242") {
+		t.Errorf("output prefix missing fresh-success shape, got:\n%s", out)
+	}
+	if !strings.Contains(out, "full_node_id=11") || !strings.Contains(out, "build_sha=build-n1") {
+		t.Errorf("output missing first verdict, got:\n%s", out)
+	}
+	if len(stub.enableRaftEnvelopeCalls) != 1 {
+		t.Fatalf("EnableRaftEnvelope calls=%d, want 1", len(stub.enableRaftEnvelopeCalls))
+	}
+	call := stub.enableRaftEnvelopeCalls[0]
+	if call.ProposerNodeId != 11 || call.ProposerLocalEpoch != 7 {
+		t.Errorf("EnableRaftEnvelope call=%+v does not match flag inputs", call)
+	}
+}
+
+// TestRunEncryptionEnableRaftEnvelope_IdempotentRetry pins the
+// was_already_active=true rendering. applied_index reports the
+// ORIGINAL cutover index from sidecar.RaftEnvelopeCutoverIndex.
+// No warning line — the raft variant has no defensive
+// cutover_index_unknown field.
+func TestRunEncryptionEnableRaftEnvelope_IdempotentRetry(t *testing.T) {
+	t.Parallel()
+	stub := &stubMutatorServer{
+		enableRaftEnvelopeResp: &pb.EnableRaftEnvelopeResponse{
+			AppliedIndex:      777,
+			WasAlreadyActive:  true,
+			CapabilitySummary: nil,
+		},
+	}
+	addr := startCustomEncryptionAdminTestServer(t, stub)
+	var buf bytes.Buffer
+	err := runEncryptionEnableRaftEnvelope([]string{
+		"--endpoint", addr,
+		"--timeout", "3s",
+		"--proposer-node-id", "11",
+		"--proposer-local-epoch", "7",
+	}, &buf)
+	if err != nil {
+		t.Fatalf("runEncryptionEnableRaftEnvelope: %v", err)
+	}
+	out := buf.String()
+	if !strings.HasPrefix(out, "already-active applied_index=777") {
+		t.Errorf("output prefix missing already-active shape, got:\n%s", out)
+	}
+	if strings.Contains(out, "capability summary") {
+		t.Errorf("idempotent retry must NOT print the capability summary header, got:\n%s", out)
+	}
+	if strings.Contains(out, "warning:") {
+		t.Errorf("raft variant must NOT emit a warning line (no cutover_index_unknown field), got:\n%s", out)
+	}
+}
+
+// TestRunEncryptionEnableRaftEnvelope_RejectsZeroProposerNodeID
+// pins the §6.1 sentinel rejection on the CLI side. Same
+// posture as the storage variant.
+func TestRunEncryptionEnableRaftEnvelope_RejectsZeroProposerNodeID(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionEnableRaftEnvelope([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--proposer-node-id", "0",
+		"--proposer-local-epoch", "7",
+	}, &buf)
+	if err == nil {
+		t.Fatal("runEncryptionEnableRaftEnvelope returned nil, want error on --proposer-node-id=0")
+	}
+	if !strings.Contains(err.Error(), "proposer-node-id") {
+		t.Errorf("error %q does not hint at the rejected flag", err)
+	}
+}
+
+// TestRunEncryptionEnableRaftEnvelope_RejectsBadEpoch pins the
+// §4.1 16-bit bound on the CLI side.
+func TestRunEncryptionEnableRaftEnvelope_RejectsBadEpoch(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	err := runEncryptionEnableRaftEnvelope([]string{
+		"--endpoint", "127.0.0.1:1",
+		"--proposer-node-id", "11",
+		"--proposer-local-epoch", "70000",
+	}, &buf)
+	if err == nil || !strings.Contains(err.Error(), "16-bit bound") {
+		t.Fatalf("runEncryptionEnableRaftEnvelope error=%v, want bound-violation", err)
+	}
+}
+
+// TestEncryptionMain_EnableRaftEnvelopeSubcommand pins the
+// dispatch entry in encryptionMain. Mirror of the storage variant
+// subcommand test.
+func TestEncryptionMain_EnableRaftEnvelopeSubcommand(t *testing.T) {
+	t.Parallel()
+	err := encryptionMain([]string{"enable-raft-envelope"})
+	if err == nil {
+		t.Fatal("enable-raft-envelope with no flags: want error, got nil")
 	}
 	if !strings.Contains(err.Error(), "proposer-node-id") {
 		t.Errorf("dispatch reached wrong handler: got %v", err)
