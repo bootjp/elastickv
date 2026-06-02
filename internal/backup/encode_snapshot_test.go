@@ -527,6 +527,11 @@ func TestEncodeSnapshotRedisRejectsMultipleDBs(t *testing.T) {
 	if !errors.Is(err, ErrRedisEncodeMultiDBUnsupported) {
 		t.Errorf("err = %v, want errors.Is ErrRedisEncodeMultiDBUnsupported", err)
 	}
+	// Marked as adapter-data so the CLI routes it to exit-2 (mirrors
+	// TestEncodeSnapshotRedisRejectsNonZeroDB; claude v17 parity).
+	if !errors.Is(err, ErrEncodeAdapterData) {
+		t.Errorf("err = %v, want errors.Is ErrEncodeAdapterData (mark from runAdapterEncoders)", err)
+	}
 	if buf.Len() != 0 {
 		t.Errorf("buf.Len = %d, want 0 (no bytes should be written on multi-DB rejection)", buf.Len())
 	}
