@@ -373,8 +373,9 @@ func adapterRunners() []adapterRunner {
 // Adapter errors are marked with ErrEncodeAdapterData so the CLI can
 // route them to exit-2 (data-correctness) rather than exit-1 (user
 // error). The original adapter sentinel chain is preserved — callers
-// that errors.Is on ErrDDBEncodeInvalidSchema, ErrS3EncodeKeyConflict,
-// etc. still see those (codex P2 v9 #904).
+// that errors.Is on ErrDDBEncodeInvalidSchema,
+// ErrS3EncodeUnsupportedCollision, etc. still see those (codex P2 v9
+// #904; phantom-sentinel doc fix from claude v10 #904).
 func runAdapterEncoders(b *snapshotBuilder, opts EncodeOptions) ([]string, error) {
 	var enabled []string
 	for _, r := range adapterRunners() {
