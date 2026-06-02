@@ -109,13 +109,24 @@ const (
 	// the existing "unknown sub-tag" branch.
 	RotateSubEnableStorageEnvelope byte = 0x04
 
+	// RotateSubEnableRaftEnvelope is the one-shot raft-layer cutover
+	// (§7.1 Phase 2). Ships in Stage 6E-1. The wire shape mirrors
+	// RotateSubEnableStorageEnvelope but with the raft slot:
+	// `Wrapped` empty (`len(Wrapped) == 0`), `DEKID ==
+	// sidecar.Active.Raft`, `Purpose == PurposeRaft`. The applier
+	// re-validates all three at apply time. On a fresh-success
+	// apply the sidecar's `RaftEnvelopeCutoverIndex` is set to
+	// `raftIdx` (the cutover entry's own apply index, which Stage
+	// 6E-2's engine apply-hook compares against `entry.Index` via
+	// strict `>` to decide unwrap-or-not).
+	RotateSubEnableRaftEnvelope byte = 0x05
+
 	// Reserved for later stages; declared here so the byte space
 	// is contiguous and a future commit cannot silently re-use
 	// 0x02..0x0F without an audit:
 	//
 	//   0x02 — rewrap-deks       (Stage 9, §5.4 / §5.5)
 	//   0x03 — retire-dek        (Stage 9, §5.4)
-	//   0x05 — enable-raft-envelope    (Stage 6, §7.1 Phase 2)
 )
 
 // OpEncryptionMin / OpEncryptionMax delimit the FSM-internal opcode
@@ -523,7 +534,7 @@ func readRotationSubTag(r *reader) (byte, error) {
 		return 0, errors.Wrap(ErrFSMWireMalformed, "rotation: missing sub-tag")
 	}
 	switch sub {
-	case RotateSubRotateDEK, RotateSubEnableStorageEnvelope:
+	case RotateSubRotateDEK, RotateSubEnableStorageEnvelope, RotateSubEnableRaftEnvelope:
 		return sub, nil
 	default:
 		return 0, errors.Wrapf(ErrFSMWireSubtag, "rotation: subtag=%#x", sub)
