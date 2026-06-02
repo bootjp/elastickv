@@ -275,14 +275,17 @@ func canonicalizeInput(t *testing.T, rawIn string, lastCommitTS uint64) string {
 	if err != nil || code != exitSuccess {
 		t.Fatalf("canonical encode: code=%d err=%v", code, err)
 	}
-	f, _ := os.Open(tmpOut)
+	f, oerr := os.Open(tmpOut)
+	if oerr != nil {
+		t.Fatalf("open canonical output: %v", oerr)
+	}
+	defer func() { _ = f.Close() }()
 	if _, err := backup.DecodeSnapshot(f, backup.DecodeOptions{
 		OutRoot:  canonicalIn,
 		Adapters: backup.AdapterSet{SQS: true},
 	}); err != nil {
 		t.Fatalf("canonical decode: %v", err)
 	}
-	_ = f.Close()
 	emitMinimalManifest(t, canonicalIn, lastCommitTS)
 	return canonicalIn
 }
@@ -457,25 +460,27 @@ func TestCLIRoundTripSelfTestAllAdapters(t *testing.T) {
 	}
 }
 
-// TestCLISelfTestMismatchWritesSidecarWithMatchedFalse pins codex P2 v6
-// #904: when --self-test detects a mismatch, the CLI MUST still write
-// <output>.encode_info.json with self_test.matched=false alongside
-// <output>.mismatch.txt. Operators need both files to diagnose a
-// failed self-test (sidecar carries SHA256, effective T, adapters).
+// TestCLIManifestFloorLeavesNoStaleSidecar pins that the
+// manifest-floor preflight failure (--last-commit-ts T < manifest;
+// fails in resolveLastCommitTS BEFORE writeAndPublish) leaves NO
+// <output>.encode_info.json on disk — neither a fresh one nor a
+// stale one from a prior run (the pre-encode cleanup at the start
+// of encodeOne removes it).
 //
-// Driven via --last-commit-ts T < manifest (data-error path) since
-// that's the only deterministic CLI-level mismatch trigger; a real
-// self-test mismatch needs the same write path. Future cleanup: when
-// the library-level corruption hook is exposed via a build-tagged
-// CLI test seam, switch to a real self-test mismatch trigger.
-func TestCLISelfTestMismatchWritesSidecarWithMatchedFalse(t *testing.T) {
+// Note: the test name was previously TestCLISelfTestMismatchWritesSidecarWithMatchedFalse,
+// which contradicted the assertion (the encode does NOT run on this
+// path, so no sidecar is written). The actual sidecar-on-mismatch
+// behavior is now pinned end-to-end by
+// TestCLIWriteAndPublishRemovesStaleFSMOnSelfTestMismatch using the
+// CLI-level corruption seam (codex P2 v6/v10 #904; claude v12 rename).
+func TestCLIManifestFloorLeavesNoStaleSidecar(t *testing.T) {
 	t.Parallel()
-	// We can drive a real self-test mismatch path at the library
-	// level (covered by TestEncodeSnapshotSelfTestDetectsCorruption).
-	// At the CLI level, we additionally need to confirm the sidecar
-	// is published on the data-error branch — the manifest-floor
-	// regression path that exit-2's via the same wrap-then-return
-	// code that previously skipped writeSidecar.
+	// The pre-encode cleanup at the top of encodeOne removes any
+	// stale <output>.encode_info.json before writeAndPublish runs.
+	// On the manifest-floor path, resolveLastCommitTS exits with
+	// exit-2 BEFORE that cleanup even runs (it's the second step in
+	// encodeOne after readInputManifest). So the assertion is: a
+	// fresh TempDir produces no sidecar at all.
 	in := t.TempDir()
 	emitMinimalManifest(t, in, 1000)
 	out := filepath.Join(t.TempDir(), "out.fsm")

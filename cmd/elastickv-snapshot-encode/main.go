@@ -314,8 +314,10 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 
 // writeAndPublish writes the .fsm to a temp path, runs the optional
 // self-test via EncodeSnapshot, and renames temp → output on success.
-// On self-test failure: writes mismatch.txt, removes the temp file via
-// the deferred cleanup, returns errSelfTestMismatch.
+// On self-test failure: writes mismatch.txt, removes any stale
+// <output>.fsm left by a prior successful run (codex P2 v10 #904),
+// removes the temp file via the deferred cleanup, returns
+// errSelfTestMismatch.
 func writeAndPublish(cfg *config, encodeOpts backup.EncodeOptions, mismatchPath string, logger *slog.Logger) (backup.EncodeResult, error) {
 	tempPath, err := tempOutputPath(cfg.outputPath)
 	if err != nil {
