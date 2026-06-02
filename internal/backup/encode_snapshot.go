@@ -318,7 +318,10 @@ func checkInputRoot(opts EncodeOptions) error {
 }
 
 // validateEncodeOptionsData covers the data-correctness pre-conditions:
-// HLC ceiling floor and DynamoDB JSONL guard. Kept separate from the
+// HLC ceiling floor, DynamoDB JSONL guard, and (via
+// validateEncodeOptionsUnsupportedFeatures) the three manifest
+// exclusion guards added by codex P2 v21 #904 (S3 incomplete uploads,
+// S3 orphans, SQS preserve-visibility). Kept separate from the
 // nil/empty-args checks so each function stays cyclop-clean.
 func validateEncodeOptionsData(opts EncodeOptions) error {
 	if opts.ManifestLastCommitTS > 0 && opts.LastCommitTS < opts.ManifestLastCommitTS {

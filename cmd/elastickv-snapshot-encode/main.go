@@ -88,16 +88,23 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 
 // classifyEncodeError maps the encodeOne return value to a CLI exit
 // code. Data-correctness sentinels (HLC ceiling regression, JSONL
-// layout, adapter rejecting input-tree contents, self-test mismatch,
-// corrupt manifest) → exit 2; everything else → exit 1. Runbooks
-// branch on exit status to triage bad-dump-data vs operator typos,
-// so this mapping is part of the CLI contract.
+// layout, unsupported manifest exclusion flags, adapter rejecting
+// input-tree contents, self-test mismatch, corrupt manifest) →
+// exit 2; everything else → exit 1. Runbooks branch on exit status
+// to triage bad-dump-data vs operator typos, so this mapping is
+// part of the CLI contract.
 //
 // Sources of each sentinel:
 //   - ErrSelfTestLowerLastCommitTS: CLI resolveLastCommitTS + library
 //     validateEncodeOptionsData (codex P2 v2 #904)
 //   - ErrEncodeUnsupportedDynamoDBLayout: validateEncodeOptionsData
 //     (codex P2 v7 #904)
+//   - ErrEncodeUnsupportedS3IncompleteUploads: validateEncodeOptionsUnsupportedFeatures
+//     (codex P2 v21 #904)
+//   - ErrEncodeUnsupportedS3Orphans: validateEncodeOptionsUnsupportedFeatures
+//     (codex P2 v21 #904)
+//   - ErrEncodeUnsupportedSQSPreserveVisibility: validateEncodeOptionsUnsupportedFeatures
+//     (codex P2 v21 #904)
 //   - ErrEncodeAdapterData: runAdapterEncoders mark on adapter
 //     rejection (codex P2 v9 #904)
 //   - errSelfTestMismatch: writeAndPublish self-test branch
