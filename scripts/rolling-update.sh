@@ -193,7 +193,25 @@ SQS_CREDENTIALS_FILE="${SQS_CREDENTIALS_FILE:-}"
 # is bypassed (resolver==nil) and partitioned queues land on the
 # default group. Format documented at main.go::buildSQSFifoPartitionMap.
 SQS_FIFO_PARTITION_MAP="${SQS_FIFO_PARTITION_MAP:-}"
-HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-60}"
+# Wall-clock budget wait_for_grpc allows for the restarted container to
+# bind its gRPC port. Sized to cover the worst-case cold-start path:
+#   1. pebble.Open (fsm.db, ~seconds)
+#   2. loadWalState -> restoreSnapshotState -> pebbleStore.Restore
+#      (restorePebbleNativeAtomic + swapInTempDB), which rewrites the
+#      entire FSM into a sibling temp directory before renaming it into
+#      place. For multi-GB FSMs on production hardware this is the
+#      dominant cost — we observed ~46 s on a 4-shard SSD-backed node
+#      with a ~5 M-key FSM; multi-GB datasets scale linearly with disk
+#      throughput.
+#   3. WAL replay of the entries between the persisted snapshot index
+#      and the latest WAL entry (typically thousands, sub-second).
+#   4. Raft follower-ization + gRPC.Serve bind.
+# A 60 s ceiling guaranteed a timeout-induced restart loop on any node
+# whose FSM exceeded ~1 GiB. 300 s comfortably absorbs (1)+(2)+(3)+(4)
+# for the multi-GiB working sets we operate against today and still
+# fails fast on genuine crash-loop bugs (which never finish (1) or (2)).
+# Operators with smaller FSMs can shrink HEALTH_TIMEOUT_SECONDS via env.
+HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"
 LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS:-30}"
 LEADER_DISCOVERY_TIMEOUT_SECONDS="${LEADER_DISCOVERY_TIMEOUT_SECONDS:-30}"
 ROLLING_DELAY_SECONDS="${ROLLING_DELAY_SECONDS:-2}"
