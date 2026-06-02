@@ -733,13 +733,21 @@ func isTransientNotLeaderErr(err error) bool {
 // uniform across the file.
 func eventuallyExpired(t *testing.T, ttl time.Duration, condition func() bool, msg string) {
 	t.Helper()
-	// Deadline = ttl + ttlExpiryHeadroom; poll cadence matches the
-	// stability-window sampler in waitForStableLeader.
 	const (
 		ttlExpiryHeadroom = 3 * time.Second
 		ttlExpiryPoll     = 25 * time.Millisecond
 	)
-	require.Eventually(t, condition, ttl+ttlExpiryHeadroom, ttlExpiryPoll, msg)
+	// Sleep past the TTL before the first poll. require.Eventually
+	// runs the condition once IMMEDIATELY before the first tick, so
+	// without this gate a regression that deletes/hides the key at
+	// PExpire time would satisfy the first poll and the test would
+	// never exercise the actual expired-after-deadline state — see
+	// codex P2 on PR #903. The post-sleep require.Eventually then
+	// has ttlExpiryHeadroom (3 s) of CI-jitter slack to observe the
+	// expired state, with a 25 ms poll cadence that matches
+	// waitForStableLeader's sampler so flake patterns stay uniform.
+	time.Sleep(ttl)
+	require.Eventually(t, condition, ttlExpiryHeadroom, ttlExpiryPoll, msg)
 }
 
 // doEventually retries do() while it returns a transient "not leader" error,
