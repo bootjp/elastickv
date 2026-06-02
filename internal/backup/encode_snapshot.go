@@ -53,6 +53,18 @@ type EncodeOptions struct {
 	// header and every key's invTS = ^T. Callers pass manifest.last_commit_ts
 	// by default and the --last-commit-ts override otherwise.
 	LastCommitTS uint64
+	// ManifestLastCommitTS is the floor LastCommitTS must not fall
+	// below. When > 0, EncodeSnapshot fails-closed with
+	// ErrSelfTestLowerLastCommitTS if LastCommitTS < ManifestLastCommitTS.
+	// This is defense-in-depth for the CLI's pre-check (which already
+	// rejects --last-commit-ts T < manifest), and it's the load-bearing
+	// guard for future in-process library callers (Phase 1 live extractor,
+	// integration tests) that bypass the CLI: a library caller that
+	// forgets to compare against the manifest can no longer silently
+	// publish a low-TS .fsm (codex P2 v2 #904). Callers that genuinely
+	// have no manifest reference (synthetic test fixtures) leave this
+	// at 0 to opt out of the check.
+	ManifestLastCommitTS uint64
 	// SelfTest enables the round-trip self-test. When true,
 	// EncodeSnapshot writes the FSM to an on-disk temp file under
 	// SelfTestDecodeOptions.OutRoot (encode-self-test-fsm-*), streams
@@ -133,30 +145,49 @@ type EncodeResult struct {
 // The CLI relies on this contract to write mismatch.txt + exit 2;
 // library callers should follow the same pattern.
 //
-// EncodeSnapshot does NOT read MANIFEST.json and does NOT validate
-// opts.LastCommitTS against any external floor — the caller is
-// responsible for reading the manifest, computing the effective T,
-// and returning ErrSelfTestLowerLastCommitTS on regression (the CLI's
-// resolveLastCommitTS performs this check before calling EncodeSnapshot
-// and maps that error to exit code 2). A future library caller that
-// skips that step would silently stamp a too-low timestamp into the
-// .fsm header (claude v3 doc bug #904).
-func EncodeSnapshot(opts EncodeOptions, out io.Writer) (EncodeResult, error) {
+// EncodeSnapshot does NOT read MANIFEST.json itself, but it WILL
+// enforce a floor on opts.LastCommitTS when the caller threads the
+// manifest value through opts.ManifestLastCommitTS — a low
+// LastCommitTS returns ErrSelfTestLowerLastCommitTS BEFORE any bytes
+// are written. The CLI's resolveLastCommitTS sets both fields to the
+// reconciled values, and library callers SHOULD do the same. The
+// check is opt-in (ManifestLastCommitTS=0 disables it) so synthetic
+// test fixtures without a manifest reference can still call this
+// directly (codex P2 v2 #904).
+// validateEncodeOptions enforces the four pre-encode invariants:
+// InputRoot/out non-nil, non-empty adapter selection, and the optional
+// manifest-TS floor. Split out so EncodeSnapshot stays under the cyclop
+// threshold.
+func validateEncodeOptions(opts EncodeOptions, out io.Writer) error {
 	if opts.InputRoot == "" {
-		return EncodeResult{}, errors.New("backup: EncodeOptions.InputRoot is required")
+		return errors.New("backup: EncodeOptions.InputRoot is required")
 	}
 	if out == nil {
-		return EncodeResult{}, errors.New("backup: EncodeSnapshot out writer is nil")
+		return errors.New("backup: EncodeSnapshot out writer is nil")
 	}
 	if !opts.Adapters.DynamoDB && !opts.Adapters.S3 && !opts.Adapters.Redis && !opts.Adapters.SQS {
-		// A zero AdapterSet would silently produce a valid header-only
-		// .fsm with no adapter records — a "successful" empty restore
-		// artifact. The CLI's parseAdapterSet already rejects this for
-		// flag-driven entry, but a future in-process caller (Phase 1
-		// live extractor, integration tests) might forget to thread
-		// the set; fail-closed here so that mistake surfaces (codex v5
-		// + claude v5 #904).
-		return EncodeResult{}, errors.New("backup: EncodeOptions.Adapters has no enabled adapter")
+		// Zero AdapterSet would silently produce a header-only .fsm —
+		// a "successful" empty restore artifact. CLI's parseAdapterSet
+		// rejects this for flag-driven entry; library callers (Phase 1
+		// live extractor, integration tests) get the same guard here
+		// (codex v5 + claude v5 #904).
+		return errors.New("backup: EncodeOptions.Adapters has no enabled adapter")
+	}
+	if opts.ManifestLastCommitTS > 0 && opts.LastCommitTS < opts.ManifestLastCommitTS {
+		// Defense-in-depth HLC ceiling floor (codex P2 v2 #904). The
+		// CLI's resolveLastCommitTS already enforces this for flag-
+		// driven entry; library callers that thread the manifest value
+		// via ManifestLastCommitTS get the same fail-closed guard here.
+		return errors.Wrapf(ErrSelfTestLowerLastCommitTS,
+			"EncodeSnapshot opts.LastCommitTS %d < opts.ManifestLastCommitTS %d",
+			opts.LastCommitTS, opts.ManifestLastCommitTS)
+	}
+	return nil
+}
+
+func EncodeSnapshot(opts EncodeOptions, out io.Writer) (EncodeResult, error) {
+	if err := validateEncodeOptions(opts, out); err != nil {
+		return EncodeResult{}, err
 	}
 
 	b := newSnapshotBuilder(opts.LastCommitTS)

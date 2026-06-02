@@ -239,14 +239,30 @@ func encodeOne(cfg *config, logger *slog.Logger) error {
 	encodeOpts := buildEncodeOptions(cfg, effectiveTS, manifest)
 
 	mismatchPath := cfg.outputPath + ".mismatch.txt"
-	_ = os.Remove(mismatchPath) // stale-mismatch cleanup, gemini medium v6 #896
+	_ = os.Remove(mismatchPath) // stale-mismatch cleanup (gemini medium v6 #896)
+	// Stale sidecar cleanup too: a self-test failure rewrites the
+	// sidecar with matched:false (codex P2 v6 #904); make sure the
+	// file always reflects the latest run, not a prior success.
+	_ = os.Remove(backup.EncodeInfoSidecarPath(cfg.outputPath))
 
-	result, err := writeAndPublish(cfg, encodeOpts, mismatchPath, logger)
-	if err != nil {
-		return err
+	result, publishErr := writeAndPublish(cfg, encodeOpts, mismatchPath, logger)
+	// Sidecar is written even on self-test mismatch so an operator
+	// has both <output>.mismatch.txt AND <output>.encode_info.json
+	// (with self_test.matched=false) for diagnostics. Only skipped
+	// when the encode itself errored before any result was populated
+	// (publishErr != nil && !errSelfTestMismatch) (codex P2 v6 #904).
+	if publishErr == nil || errors.Is(publishErr, errSelfTestMismatch) {
+		if serr := writeSidecar(cfg, manifest, effectiveTS, overridden, result); serr != nil {
+			// Surface the sidecar-write failure only if encode itself
+			// succeeded; on mismatch the mismatch error takes priority.
+			if publishErr == nil {
+				return errors.Wrap(serr, "write encode_info sidecar")
+			}
+			logger.Warn("write encode_info sidecar on mismatch", "err", serr)
+		}
 	}
-	if err := writeSidecar(cfg, manifest, effectiveTS, overridden, result); err != nil {
-		return errors.Wrap(err, "write encode_info sidecar")
+	if publishErr != nil {
+		return publishErr
 	}
 	logger.Info("encode complete",
 		"output", cfg.outputPath,
@@ -274,10 +290,11 @@ func readInputManifest(inputPath string) (backup.Manifest, error) {
 
 func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifest) backup.EncodeOptions {
 	encodeOpts := backup.EncodeOptions{
-		InputRoot:    cfg.inputPath,
-		Adapters:     cfg.adapters,
-		LastCommitTS: effectiveTS,
-		SelfTest:     cfg.selfTest,
+		InputRoot:            cfg.inputPath,
+		Adapters:             cfg.adapters,
+		LastCommitTS:         effectiveTS,
+		ManifestLastCommitTS: manifest.LastCommitTS,
+		SelfTest:             cfg.selfTest,
 	}
 	if cfg.selfTest {
 		encodeOpts.SelfTestDecodeOptions = buildSelfTestDecodeOptions(cfg, manifest)

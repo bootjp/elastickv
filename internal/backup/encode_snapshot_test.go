@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 )
 
 // TestEncodeSnapshotLibraryRoundTrip pins the public library entrypoint:
@@ -206,6 +208,58 @@ func TestEncodeSnapshotRequiresInputRoot(t *testing.T) {
 	var buf bytes.Buffer
 	if _, err := EncodeSnapshot(EncodeOptions{}, &buf); err == nil {
 		t.Fatalf("EncodeSnapshot with empty InputRoot succeeded; want error")
+	}
+}
+
+// TestEncodeSnapshotRejectsLowManifestFloor pins codex P2 v2: the
+// library-level HLC floor check fails-closed when opts.LastCommitTS
+// is below opts.ManifestLastCommitTS. Defense-in-depth for the CLI's
+// resolveLastCommitTS — a future in-process caller (Phase 1 live
+// extractor) cannot silently publish a low-TS .fsm.
+func TestEncodeSnapshotRejectsLowManifestFloor(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:            in,
+		Adapters:             AdapterSet{SQS: true},
+		LastCommitTS:         500,
+		ManifestLastCommitTS: 1000, // floor; LastCommitTS is below
+	}, &buf)
+	if err == nil {
+		t.Fatalf("EncodeSnapshot with LastCommitTS < ManifestLastCommitTS succeeded; want error")
+	}
+	if !errors.Is(err, ErrSelfTestLowerLastCommitTS) {
+		t.Errorf("err = %v, want errors.Is ErrSelfTestLowerLastCommitTS", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("buf.Len = %d, want 0 (no bytes should be written on floor regression)", buf.Len())
+	}
+}
+
+// TestEncodeSnapshotManifestFloorOptOut pins that ManifestLastCommitTS=0
+// disables the check (synthetic test fixtures, library callers without a
+// manifest reference). The existing TestEncodeSnapshotLibraryRoundTrip
+// implicitly relies on this opt-out.
+func TestEncodeSnapshotManifestFloorOptOut(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "floor-opt-out"
+	writeSQSQueue(t, in, queue,
+		[]byte(`{"format_version":1,"name":"floor-opt-out","fifo":false,"partition_count":1,"generation":1}`),
+		[][]byte{
+			[]byte(`{"format_version":1,"message_id":"m1","body":"a","send_timestamp_millis":1700000000000,"available_at_millis":1700000000000,"sequence_number":0}`),
+		},
+	)
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:            in,
+		Adapters:             AdapterSet{SQS: true},
+		LastCommitTS:         500,
+		ManifestLastCommitTS: 0, // opt-out
+	}, &buf)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot with opt-out floor failed: %v", err)
 	}
 }
 
