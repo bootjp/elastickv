@@ -39,7 +39,7 @@ After Stage 6E ships (open at the time of this writing), every Raft entry's payl
 +-----------------------------------------------------+
 | Proposal envelope header (cleartext, engine-owned)  |
 |   - proposalEnvelopeVersion (1B, 0x01)              |
-|   - proposal ID (8B uint64, monotonic per leader)   |
+|   - proposal ID (8B uint64, monotonic per process load) |
 +-----------------------------------------------------+
 | AEAD envelope header (cleartext, encryption-owned)  |
 |   §4.2 / internal/encryption/envelope.go::Envelope: |
@@ -128,13 +128,13 @@ plaintext on disk by construction; only later entries are wrapped.
 
 ## 4. Threat-model justification for accepting the residual
 
-The threat model in §2 of the parent design protects "the persisted state of the cluster" against an adversary with disk access. For entries with `index > raftEnvelopeCutoverIndex` whose WAL segments have already been compacted away (per §3 caveat), the residual cleartext does not reveal user data; it reveals **traffic-analysis metadata**:
+The threat model in §2 of the parent design protects "the persisted state of the cluster" against an adversary with disk access. For entries with `index > raftEnvelopeCutoverIndex`, the AEAD body is ciphertext (regardless of whether the holding WAL segment has been compacted); the residual cleartext is **traffic-analysis metadata** only:
 
 - Cluster throughput (entries per WAL segment ≈ ops per epoch).
 - Cluster topology changes (ConfChange entries).
 - Leader-flip cadence (term increments; the proposal-ID counter does NOT reset on leader flips — see §3 monotonic-counter leakage — so it is not a usable leader-flip signal).
 
-For entries at `index ≤ raftEnvelopeCutoverIndex`, or for post-cutover entries whose WAL segments have not yet been compacted on a cluster that enabled Stage 6E AFTER existing traffic, the residual additionally includes the §3 user-data fields (keys, values, operation type) in cleartext. Operators in that window must rely on the FS-encryption layer below until the compaction watermark crosses the cutover index.
+For entries at `index ≤ raftEnvelopeCutoverIndex`, the payload is cleartext and additionally reveals the §3 user-data fields (keys, values, operation type). On clusters that enabled Stage 6E after existing traffic, such pre-cutover entries remain readable in the WAL until the WAL segments holding them are removed by etcd-raft's log compaction. Until the compaction watermark crosses the cutover index, operators must rely on the FS-encryption layer for the user-data protection guarantee on those segments.
 
 For the deployment classes elastickv targets — internal clusters with infrastructure-level FS encryption (LUKS, EBS encryption, GCE persistent-disk encryption) handling the file-level layer — the residual is acceptable. The application-level §4.2 envelope provides defense-in-depth against an adversary who bypasses the FS-encryption layer (e.g., live-memory exfiltration of a decrypted WAL segment held in OS page cache).
 
