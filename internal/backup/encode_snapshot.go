@@ -356,6 +356,106 @@ func encodeBuffered(b *snapshotBuilder, opts EncodeOptions, enabled []string, ou
 	return result, nil
 }
 
+// redisDBDirPrefix is the canonical "db_" prefix produced by the
+// decoder for redis/db_<N>/ directories. Mirrored by encoder
+// enumeration (encodeAllRedisDBs) so a multi-DB dump round-trips.
+const redisDBDirPrefix = "db_"
+
+// enumerateRedisDBs returns the sorted dbIndex values for which
+// <inRoot>/redis/db_<N>/ exists as a directory. A missing redis/
+// directory returns nil; the caller treats it as no-op (same convention
+// as the per-DB encoder, which is a no-op when its db_<n> subdir is
+// absent). Non-db_<N> entries (regular files, symlinks at the redis/
+// level, non-numeric or non-canonical suffixes like "db_-1" or
+// "db_01") are silently skipped — they cannot have been produced by
+// the canonical decoder and are not the encoder's concern.
+//
+// Codex P1 v13 #904: replaces the prior hardcoded NewRedisEncoder(_, 0)
+// in adapterRunners that silently dropped non-default DBs from any
+// future Phase 1 multi-DB dump.
+func enumerateRedisDBs(inRoot string) ([]int, error) {
+	redisDir := filepath.Join(inRoot, "redis")
+	if err := checkRedisRoot(redisDir); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(redisDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errors.WithStack(err)
+	}
+	var indices []int
+	for _, ent := range entries {
+		if idx, ok := parseRedisDBDir(ent); ok {
+			indices = append(indices, idx)
+		}
+	}
+	sort.Ints(indices)
+	return indices, nil
+}
+
+// checkRedisRoot stats <inRoot>/redis/ and rejects symlink / non-dir
+// shapes. Missing is allowed (caller returns nil indices). Split out
+// of enumerateRedisDBs to keep that function under the cyclop bound.
+func checkRedisRoot(redisDir string) error {
+	info, err := os.Lstat(redisDir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return errors.WithStack(err)
+	case info.Mode()&os.ModeSymlink != 0:
+		// Symlinked redis/ would let os.OpenRoot in the per-DB encoder
+		// resolve outside the dump tree (mirrors the per-DB encoder's
+		// symlink refusal on redis/db_<n>).
+		return errors.Wrapf(ErrRedisEncodeNotDir, "redis path %q is a symlink", redisDir)
+	case !info.IsDir():
+		return errors.Wrapf(ErrRedisEncodeNotDir, "redis path %q is not a directory", redisDir)
+	}
+	return nil
+}
+
+// parseRedisDBDir returns (dbIndex, true) when ent names a canonical
+// db_<N> directory (N is a non-negative decimal with no leading zeros).
+// Non-matching entries return (0, false) so the caller can skip without
+// erroring — they cannot have been produced by the canonical decoder.
+// Reject non-canonical decimals so a hypothetical Phase 1 dumper cannot
+// double-emit the same db under two distinct directory names.
+func parseRedisDBDir(ent os.DirEntry) (int, bool) {
+	if !ent.IsDir() {
+		return 0, false
+	}
+	name := ent.Name()
+	if !strings.HasPrefix(name, redisDBDirPrefix) {
+		return 0, false
+	}
+	suffix := name[len(redisDBDirPrefix):]
+	idx, err := strconv.Atoi(suffix)
+	if err != nil || idx < 0 || strconv.Itoa(idx) != suffix {
+		return 0, false
+	}
+	return idx, true
+}
+
+// encodeAllRedisDBs invokes NewRedisEncoder per discovered db_<N>
+// directory in ascending index order. A missing redis/ directory is a
+// no-op. Codex P1 v13 #904: replaces the prior hardcoded db_0 fan-out
+// which would silently drop non-default DBs from any Phase 1 multi-DB
+// dump. Per-DB errors are wrapped with the db index for traceability.
+func encodeAllRedisDBs(b *snapshotBuilder, inRoot string) error {
+	indices, err := enumerateRedisDBs(inRoot)
+	if err != nil {
+		return errors.Wrap(err, "redis encoder enumerate")
+	}
+	for _, idx := range indices {
+		if err := NewRedisEncoder(inRoot, idx).Encode(b); err != nil {
+			return errors.Wrapf(err, "redis encoder db_%d", idx)
+		}
+	}
+	return nil
+}
+
 // adapterRunner pairs an enabled-check with an Encode call, keeping
 // runAdapterEncoders's per-iteration body to two branches (cyclop).
 type adapterRunner struct {
@@ -366,9 +466,7 @@ type adapterRunner struct {
 
 func adapterRunners() []adapterRunner {
 	return []adapterRunner{
-		{"redis", func(s AdapterSet) bool { return s.Redis }, func(b *snapshotBuilder, root string) error {
-			return errors.Wrap(NewRedisEncoder(root, 0).Encode(b), "redis encoder")
-		}},
+		{"redis", func(s AdapterSet) bool { return s.Redis }, encodeAllRedisDBs},
 		{"dynamodb", func(s AdapterSet) bool { return s.DynamoDB }, func(b *snapshotBuilder, root string) error {
 			return errors.Wrap(NewDynamoDBEncoder(root).Encode(b), "dynamodb encoder")
 		}},

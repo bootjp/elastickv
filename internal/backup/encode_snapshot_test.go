@@ -388,6 +388,125 @@ func TestEncodeSnapshotRejectsZeroAdapterSet(t *testing.T) {
 	}
 }
 
+// TestEnumerateRedisDBsMissingDir pins codex P1 v13 #904: a missing
+// redis/ directory returns nil indices (no-op), matching the per-DB
+// encoder's "missing db_<n> = nothing to encode" convention.
+func TestEnumerateRedisDBsMissingDir(t *testing.T) {
+	t.Parallel()
+	indices, err := enumerateRedisDBs(t.TempDir())
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if indices != nil {
+		t.Errorf("indices = %v, want nil for missing redis/", indices)
+	}
+}
+
+// TestEnumerateRedisDBsMixedEntries pins codex P1 v13 #904: only
+// canonical db_<N> entries are kept; non-numeric, negative, leading-
+// zero, empty-suffix, wrong-prefix, and non-directory entries are
+// silently skipped. The returned slice is sorted ascending.
+func TestEnumerateRedisDBsMixedEntries(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	for _, name := range []string{"db_0", "db_1", "db_5"} {
+		if err := os.MkdirAll(filepath.Join(in, "redis", name), 0o755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", name, err)
+		}
+	}
+	// Entries that MUST be skipped:
+	//   db_garbage  — non-numeric suffix
+	//   db_-1       — negative
+	//   db_01       — non-canonical leading zero
+	//   db_         — empty suffix
+	//   notdb_2     — wrong prefix
+	for _, name := range []string{"db_garbage", "db_-1", "db_01", "db_", "notdb_2"} {
+		if err := os.MkdirAll(filepath.Join(in, "redis", name), 0o755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", name, err)
+		}
+	}
+	// A regular file under redis/ must be skipped (not enumerable).
+	if err := os.WriteFile(filepath.Join(in, "redis", "README"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile README: %v", err)
+	}
+	indices, err := enumerateRedisDBs(in)
+	if err != nil {
+		t.Fatalf("enumerateRedisDBs: %v", err)
+	}
+	want := []int{0, 1, 5}
+	if len(indices) != len(want) {
+		t.Fatalf("indices = %v, want %v", indices, want)
+	}
+	for i, v := range want {
+		if indices[i] != v {
+			t.Errorf("indices[%d] = %d, want %d", i, indices[i], v)
+		}
+	}
+}
+
+// TestEnumerateRedisDBsRedisIsRegularFile pins fail-closed when the
+// "redis" path inside the dump is a regular file rather than a
+// directory — distinct from the missing case.
+func TestEnumerateRedisDBsRedisIsRegularFile(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	if err := os.WriteFile(filepath.Join(in, "redis"), []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := enumerateRedisDBs(in)
+	if !errors.Is(err, ErrRedisEncodeNotDir) {
+		t.Errorf("err = %v, want errors.Is ErrRedisEncodeNotDir", err)
+	}
+}
+
+// TestEncodeSnapshotRedisMultiDB pins codex P1 v13 #904: the Redis
+// fan-out in adapterRunners enumerates redis/db_<N>/ and invokes the
+// per-DB encoder for each. The fixture places a single string under
+// redis/db_3/ ONLY (no db_0). Pre-fix, the encoder hardcoded
+// NewRedisEncoder(root, 0) and produced a header-only .fsm for this
+// input — silent data loss. Post-fix, the db_3 string is included.
+//
+// Assertion is content-free: compare encoded byte count against an
+// empty-redis baseline. With multi-DB fan-out, the db_3 fixture
+// produces MORE bytes than an empty tree. Without it, both encodes
+// would produce identical header-only output.
+func TestEncodeSnapshotRedisMultiDB(t *testing.T) {
+	t.Parallel()
+	emptyIn := t.TempDir()
+	var emptyBuf bytes.Buffer
+	emptyResult, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:    emptyIn,
+		Adapters:     AdapterSet{Redis: true},
+		LastCommitTS: 1,
+	}, &emptyBuf)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot empty: %v", err)
+	}
+
+	in := t.TempDir()
+	encKey := EncodeSegment([]byte("k3"))
+	db3Strings := filepath.Join(in, "redis", "db_3", "strings")
+	if err := os.MkdirAll(db3Strings, 0o755); err != nil {
+		t.Fatalf("MkdirAll db_3/strings: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(db3Strings, encKey+".bin"), []byte("v3"), 0o600); err != nil {
+		t.Fatalf("WriteFile db_3 string: %v", err)
+	}
+	var buf bytes.Buffer
+	result, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:    in,
+		Adapters:     AdapterSet{Redis: true},
+		LastCommitTS: 1,
+	}, &buf)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot db_3-only: %v", err)
+	}
+	if result.BytesWritten <= emptyResult.BytesWritten {
+		t.Errorf("BytesWritten with redis/db_3 fixture (%d) <= empty (%d); pre-fix, hardcoded db_0 fan-out dropped db_3 silently",
+			result.BytesWritten, emptyResult.BytesWritten)
+	}
+}
+
 // TestEncodeSnapshotMarksAdapterDataErrors pins codex P2 v9 #904: when
 // an adapter encoder rejects the input tree's contents (e.g. a
 // malformed DynamoDB _schema.json), EncodeSnapshot must surface the
