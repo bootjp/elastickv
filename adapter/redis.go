@@ -2784,10 +2784,10 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	// txnContext's own ctx (the caller's dispatchCtx), not the server-
 	// lifetime handlerContext, so an outer cancellation (client
 	// disconnect, retryRedisWrite timeout) interrupts the prepare+dispatch
-	// promptly instead of waiting the full redisDispatchTimeout — same
-	// rationale as runTransactionWithDedup's reuseCtx fix on PR #887. The
-	// nil-guard falls back to handlerContext for callers that construct a
-	// txnContext without setting ctx (test fixtures).
+	// promptly instead of waiting the full redisDispatchTimeout. Symmetric
+	// with the reuseCtx threading in runTransactionWithDedup. The nil-guard
+	// falls back to handlerContext for callers that construct a txnContext
+	// without setting ctx (test fixtures).
 	parentCtx := t.ctx
 	if parentCtx == nil {
 		parentCtx = t.server.handlerContext()
@@ -3282,7 +3282,7 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 			// fresh 10 s budget elapses. The earlier "fresh ctx from
 			// handlerContext" pattern (noted in design doc §M3) was strictly
 			// more conservative but wasted resources on a disconnected
-			// client — see PR #887 review.
+			// client.
 			reuseCtx, reuseCancel := context.WithTimeout(dispatchCtx, redisDispatchTimeout)
 			defer reuseCancel()
 			res, drop, dispErr := r.dispatchExecReuse(reuseCtx, pending)
@@ -3618,10 +3618,11 @@ type reusableListPush struct {
 func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pending *reusableListPush) (newLen int64, drop bool, err error) {
 	// HLC-4 parity: persistence-grade commit_ts allocation must honor
 	// the physical-ceiling fence so a stale-leader window cannot mint a
-	// timestamp that collides with the successor's. dispatchExecReuse
-	// already uses NextFenced (PR #887 round 1); the two listPush dedup
-	// sites shipped before the HLC-4 migration and were missed in that
-	// pass — see PR #887 verdict for the noted gap.
+	// timestamp that collides with the successor's. The error path
+	// returns ErrCeilingExpired which isRetryableRedisTxnErr classifies
+	// as non-retryable, so it exits retryRedisWrite directly to the
+	// client — same shape as the other persistence-grade Next call
+	// sites in this file.
 	commitTS, allocErr := r.coordinator.Clock().NextFenced()
 	if allocErr != nil {
 		return 0, false, errors.Wrap(allocErr, "redis list-push reuse: allocate commitTS")
