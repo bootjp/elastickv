@@ -263,6 +263,61 @@ func TestEncodeSnapshotManifestFloorOptOut(t *testing.T) {
 	}
 }
 
+// TestEncodeSnapshotRejectsDynamoDBJSONLLayout pins codex P2 v7 #904:
+// the DynamoDB reverse encoder does not support the JSONL bundle
+// layout, so a caller that threads DynamoDBBundleJSONL=true must be
+// rejected with ErrEncodeUnsupportedDynamoDBLayout before any bytes
+// are written. The CLI hits this path automatically when MANIFEST.json
+// has `dynamodb_layout: "jsonl"`; library callers that mirror that
+// thread the field themselves.
+func TestEncodeSnapshotRejectsDynamoDBJSONLLayout(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:           in,
+		Adapters:            AdapterSet{DynamoDB: true},
+		LastCommitTS:        1,
+		DynamoDBBundleJSONL: true,
+	}, &buf)
+	if err == nil {
+		t.Fatalf("EncodeSnapshot with DynamoDBBundleJSONL accepted; want error")
+	}
+	if !errors.Is(err, ErrEncodeUnsupportedDynamoDBLayout) {
+		t.Errorf("err = %v, want errors.Is ErrEncodeUnsupportedDynamoDBLayout", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("buf.Len = %d, want 0 (no bytes should be written when JSONL is rejected)", buf.Len())
+	}
+}
+
+// TestEncodeSnapshotJSONLOnlyRejectedWhenDDBEnabled pins that the JSONL
+// guard fires only when DynamoDB is in the adapter set — a caller that
+// happens to set DynamoDBBundleJSONL=true while encoding ONLY Redis (or
+// any other adapter) is unaffected. Prevents the guard from becoming
+// over-zealous for callers who simply mirror the manifest field.
+func TestEncodeSnapshotJSONLOnlyRejectedWhenDDBEnabled(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	const queue = "no-ddb"
+	writeSQSQueue(t, in, queue,
+		[]byte(`{"format_version":1,"name":"no-ddb","fifo":false,"partition_count":1,"generation":1}`),
+		[][]byte{
+			[]byte(`{"format_version":1,"message_id":"m1","body":"a","send_timestamp_millis":1700000000000,"available_at_millis":1700000000000,"sequence_number":0}`),
+		},
+	)
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:           in,
+		Adapters:            AdapterSet{SQS: true}, // DDB NOT in scope
+		LastCommitTS:        1,
+		DynamoDBBundleJSONL: true, // would be rejected if DDB were enabled
+	}, &buf)
+	if err != nil {
+		t.Fatalf("EncodeSnapshot rejected JSONL flag when DDB not in scope: %v", err)
+	}
+}
+
 // TestEncodeSnapshotRejectsZeroAdapterSet pins claude v5 + codex v5
 // carry-over: a library caller that forgets to thread Adapters into
 // EncodeOptions gets a fail-closed error rather than a silently empty

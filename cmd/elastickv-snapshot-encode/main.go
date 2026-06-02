@@ -87,6 +87,9 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 		if errors.Is(err, backup.ErrSelfTestLowerLastCommitTS) {
 			return exitDataErr, err
 		}
+		if errors.Is(err, backup.ErrEncodeUnsupportedDynamoDBLayout) {
+			return exitDataErr, err
+		}
 		if errors.Is(err, errSelfTestMismatch) {
 			return exitDataErr, err
 		}
@@ -294,6 +297,7 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 		Adapters:             cfg.adapters,
 		LastCommitTS:         effectiveTS,
 		ManifestLastCommitTS: manifest.LastCommitTS,
+		DynamoDBBundleJSONL:  manifest.DynamoDBLayout == backup.DynamoDBLayoutJSONL,
 		SelfTest:             cfg.selfTest,
 	}
 	if cfg.selfTest {

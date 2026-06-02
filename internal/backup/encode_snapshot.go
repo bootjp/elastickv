@@ -14,19 +14,32 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// ErrSelfTestLowerLastCommitTS is the sentinel callers should return
-// when the operator-supplied T is below the manifest's last_commit_ts.
-// The HLC ceiling invariant (CLAUDE.md "Timestamp Oracle") forbids
-// lowering the ceiling on restore: a lower T would let a post-restart
-// leader issue a read ts ≤ a restored row's commit ts.
+// ErrSelfTestLowerLastCommitTS is returned when the operator-supplied
+// T is below the manifest's last_commit_ts. The HLC ceiling invariant
+// (CLAUDE.md "Timestamp Oracle") forbids lowering the ceiling on
+// restore: a lower T would let a post-restart leader issue a read
+// ts ≤ a restored row's commit ts.
 //
-// EncodeSnapshot itself does NOT read MANIFEST.json or enforce this
-// floor — the comparison happens in the CLI's resolveLastCommitTS
-// BEFORE EncodeSnapshot is called, and a future library caller (Phase 1
-// live extractor, integration tests) must perform its own comparison
-// and return this sentinel on regression so callers can errors.Is on
-// it to map to the right exit code (claude v3 doc bug #904).
+// Enforced at two layers:
+//   - CLI (`resolveLastCommitTS`) rejects --last-commit-ts T < manifest
+//     before EncodeSnapshot is called (exit code 2).
+//   - Library (`validateEncodeOptions`) rejects when the caller threads
+//     `opts.ManifestLastCommitTS > 0` and `opts.LastCommitTS` is below
+//     it — defense-in-depth for in-process callers (Phase 1 live
+//     extractor, integration tests) that bypass the CLI.
+//
+// Callers can errors.Is on this sentinel to map to the right exit code
+// (claude v3 doc bug #904 + claude v7 doc bug #904 + codex P2 v2 #904).
 var ErrSelfTestLowerLastCommitTS = errors.New("backup: --last-commit-ts T < manifest.last_commit_ts (HLC ceiling regression)")
+
+// ErrEncodeUnsupportedDynamoDBLayout is returned when an input dump
+// declares `dynamodb_layout: "jsonl"` in MANIFEST.json. The DynamoDB
+// reverse encoder only walks per-item files (items/*.json,
+// items/*/*.json) and would silently skip every items/data-*.jsonl
+// file, producing an .fsm with only table metadata and no items —
+// a silent-data-loss restore artifact (codex P2 v7 #904). Fail closed
+// until the encoder learns the JSONL layout (M7 / future milestone).
+var ErrEncodeUnsupportedDynamoDBLayout = errors.New("backup: DynamoDB JSONL layout not supported by encoder")
 
 // The encoder dispatch order (redis → dynamodb → s3 → sqs) is encoded
 // inside adapterRunners() and is intentionally distinct from decode.go's
@@ -53,6 +66,15 @@ type EncodeOptions struct {
 	// header and every key's invTS = ^T. Callers pass manifest.last_commit_ts
 	// by default and the --last-commit-ts override otherwise.
 	LastCommitTS uint64
+	// DynamoDBBundleJSONL is true when the input dump's MANIFEST.json
+	// has `dynamodb_layout: "jsonl"`. The reverse encoder does not
+	// support that layout — it would silently skip every
+	// items/data-*.jsonl file and publish an .fsm with only table
+	// metadata. Fail-closed via ErrEncodeUnsupportedDynamoDBLayout
+	// when true (codex P2 v7 #904). When the encoder gains JSONL
+	// support, this field will switch from a guard to a control.
+	DynamoDBBundleJSONL bool
+
 	// ManifestLastCommitTS is the floor LastCommitTS must not fall
 	// below. When > 0, EncodeSnapshot fails-closed with
 	// ErrSelfTestLowerLastCommitTS if LastCommitTS < ManifestLastCommitTS.
@@ -155,9 +177,10 @@ type EncodeResult struct {
 // test fixtures without a manifest reference can still call this
 // directly (codex P2 v2 #904).
 // validateEncodeOptions enforces the four pre-encode invariants:
-// InputRoot/out non-nil, non-empty adapter selection, and the optional
-// manifest-TS floor. Split out so EncodeSnapshot stays under the cyclop
-// threshold.
+// InputRoot/out non-nil, non-empty adapter selection, optional
+// manifest-TS floor, and DDB JSONL guard. Split out so EncodeSnapshot
+// stays under the cyclop threshold; per-check helpers below keep each
+// branch's intent narrow.
 func validateEncodeOptions(opts EncodeOptions, out io.Writer) error {
 	if opts.InputRoot == "" {
 		return errors.New("backup: EncodeOptions.InputRoot is required")
@@ -167,20 +190,26 @@ func validateEncodeOptions(opts EncodeOptions, out io.Writer) error {
 	}
 	if !opts.Adapters.DynamoDB && !opts.Adapters.S3 && !opts.Adapters.Redis && !opts.Adapters.SQS {
 		// Zero AdapterSet would silently produce a header-only .fsm —
-		// a "successful" empty restore artifact. CLI's parseAdapterSet
-		// rejects this for flag-driven entry; library callers (Phase 1
-		// live extractor, integration tests) get the same guard here
-		// (codex v5 + claude v5 #904).
+		// a "successful" empty restore artifact (codex v5 + claude v5 #904).
 		return errors.New("backup: EncodeOptions.Adapters has no enabled adapter")
 	}
+	return validateEncodeOptionsData(opts)
+}
+
+// validateEncodeOptionsData covers the data-correctness pre-conditions:
+// HLC ceiling floor and DynamoDB JSONL guard. Kept separate from the
+// nil/empty-args checks so each function stays cyclop-clean.
+func validateEncodeOptionsData(opts EncodeOptions) error {
 	if opts.ManifestLastCommitTS > 0 && opts.LastCommitTS < opts.ManifestLastCommitTS {
-		// Defense-in-depth HLC ceiling floor (codex P2 v2 #904). The
-		// CLI's resolveLastCommitTS already enforces this for flag-
-		// driven entry; library callers that thread the manifest value
-		// via ManifestLastCommitTS get the same fail-closed guard here.
+		// Defense-in-depth HLC ceiling floor (codex P2 v2 #904).
 		return errors.Wrapf(ErrSelfTestLowerLastCommitTS,
 			"EncodeSnapshot opts.LastCommitTS %d < opts.ManifestLastCommitTS %d",
 			opts.LastCommitTS, opts.ManifestLastCommitTS)
+	}
+	if opts.DynamoDBBundleJSONL && opts.Adapters.DynamoDB {
+		// The DynamoDB reverse encoder only walks per-item files;
+		// JSONL items would be silently skipped (codex P2 v7 #904).
+		return errors.WithStack(ErrEncodeUnsupportedDynamoDBLayout)
 	}
 	return nil
 }
