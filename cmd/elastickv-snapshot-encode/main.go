@@ -92,11 +92,11 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 
 // classifyEncodeError maps the encodeOne return value to a CLI exit
 // code. Data-correctness sentinels (HLC ceiling regression, JSONL
-// layout, unsupported manifest exclusion flags, adapter rejecting
-// input-tree contents, self-test mismatch, corrupt manifest) →
-// exit 2; everything else → exit 1. Runbooks branch on exit status
-// to triage bad-dump-data vs operator typos, so this mapping is
-// part of the CLI contract.
+// layout, unsupported manifest exclusion flags, adapter scope
+// mismatch with manifest, adapter rejecting input-tree contents,
+// self-test mismatch, corrupt manifest) → exit 2; everything else
+// → exit 1. Runbooks branch on exit status to triage bad-dump-data
+// vs operator typos, so this mapping is part of the CLI contract.
 //
 // Sources of each sentinel:
 //   - ErrSelfTestLowerLastCommitTS: CLI resolveLastCommitTS + library
@@ -114,6 +114,10 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 //   - errSelfTestMismatch: writeAndPublish self-test branch
 //   - ErrInvalidManifest / ErrUnsupportedFormatVersion: readInputManifest
 //     surfacing backup.ReadManifest sentinels (codex P2 v14 #904)
+//   - errAdapterNotInManifest: validateAdaptersAgainstManifest when
+//     a selected adapter has a nil manifest scope pointer (codex P2
+//     v26 #904 scenario B; retracted v27 scenario A in v30 per codex
+//     P1 v29 #904)
 func classifyEncodeError(err error) int {
 	switch {
 	case errors.Is(err, backup.ErrSelfTestLowerLastCommitTS),
@@ -132,28 +136,30 @@ func classifyEncodeError(err error) int {
 	}
 }
 
-// validateAdaptersAgainstManifest intersects the user-selected
-// AdapterSet with manifest.Adapters and stats each enabled adapter's
-// top-level subdir under inputPath. Two failure modes — both
-// data-correctness, both routed to exit 2:
+// validateAdaptersAgainstManifest checks each enabled adapter
+// against the nil/non-nil manifest scope pointer (manifest.Adapters.<X>).
+// One failure mode, routed to exit 2:
 //
-//   - Manifest lists no scope for an enabled adapter (nil pointer in
-//     manifest.Adapters.<X>). A truncated/wrong manifest combined with
-//     the default `--adapter dynamodb,s3,redis,sqs` would otherwise
-//     pick up a stale on-disk subdir for an adapter the producer did
-//     not dump (codex P2 v26 #904 scenario B).
-//   - Manifest lists a scope for an enabled adapter but the on-disk
-//     subdir is absent. The adapter encoder's "missing top-level
-//     subdir → no-op" behavior would otherwise publish a header-only
-//     or partial .fsm without a hard error (codex P2 v26 #904
-//     scenario A).
+//   - Manifest lists no scope (nil pointer) for an enabled adapter
+//     (codex P2 v26 #904 scenario B). A truncated/wrong manifest
+//     combined with the default `--adapter dynamodb,s3,redis,sqs`
+//     would otherwise pick up a stale on-disk subdir for an adapter
+//     the producer did not dump.
+//
+// Scenario A (non-nil scope but on-disk subdir missing) cannot be
+// detected from the manifest alone because the decoder's
+// populateAdapterScopes defers scope enumeration and always writes
+// an empty &Adapter{} regardless of record count (codex P1 v29 #904
+// pulled the v27/v28/v29 stat-and-readdir checks). Future work:
+// add a SHA / record-count manifest field so scenario A becomes
+// detectable. See checkOneAdapterScope's doc for the full per-shape
+// decision matrix.
 //
 // A nil manifest.Adapters is treated as "manifest has no scopes for
-// any adapter" — every enabled adapter trips the scenario-B guard.
-// Older manifests that omit the Adapters block deliberately are
-// expected to also omit on-disk subdirs and pass `--adapter` set to
-// only what they DO contain; that case is operator-driven and
-// surfaces the same fail-closed error here.
+// any adapter" — every enabled adapter trips the guard. Older
+// manifests that omit the Adapters block deliberately are expected
+// to pass `--adapter` set to only what they DO contain; that case
+// is operator-driven and surfaces the same fail-closed error here.
 func validateAdaptersAgainstManifest(selected backup.AdapterSet, m backup.Manifest, inputPath string) error {
 	checks := []struct {
 		name     string
@@ -368,13 +374,18 @@ func applyAdapterName(name string, s *backup.AdapterSet) error {
 var errSelfTestMismatch = errors.New("backup: --self-test diff against --input")
 
 // errAdapterNotInManifest is returned by validateAdaptersAgainstManifest
-// when the user has enabled an adapter that the manifest doesn't list,
-// or when the manifest lists an adapter whose top-level subdir is
-// missing on disk. Both are silent-data-loss scenarios per codex P2
-// v26 #904: the per-adapter encoders no-op on missing subdirs, so a
-// truncated dump or a stale-dir-with-default-`--adapter-all` would
-// publish a header-only/partial .fsm. classifyEncodeError routes this
-// to exit 2 (data-correctness).
+// when the user has enabled an adapter that the manifest doesn't list
+// (nil pointer in manifest.Adapters.<X>). This is the codex P2 v26
+// #904 scenario B: a stale on-disk subdir for an adapter the producer
+// did not dump would otherwise be encoded under the default
+// `--adapter dynamodb,s3,redis,sqs`. classifyEncodeError routes the
+// sentinel to exit 2 (data-correctness).
+//
+// The earlier v27/v28/v29 attempts to also detect a missing on-disk
+// subdir under a non-nil scope (codex P2 v26 scenario A) were retracted
+// in v30 once codex P1 v29 #904 clarified that the decoder defers
+// scope enumeration; the manifest can no longer distinguish "no
+// records dumped" from "records dumped but scope not enumerated."
 var errAdapterNotInManifest = errors.New("encode: adapter scope mismatch between MANIFEST.json and --adapter / on-disk tree")
 
 func encodeOne(cfg *config, logger *slog.Logger) error {
