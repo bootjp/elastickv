@@ -304,6 +304,126 @@ func readSidecar(t *testing.T, output string) backup.EncodeInfo {
 	return info
 }
 
+// TestCLISelfTestMismatchSkipsDirectoryAtOutputPath pins codex P2 v14
+// #904: the self-test-mismatch cleanup must NOT delete an --output
+// path that resolves to a directory (or any non-regular file). The
+// prior unconditional os.Remove(cfg.outputPath) would have wiped an
+// empty directory the operator passed in error.
+//
+// The fixture pre-creates an empty directory at the --output path,
+// drives a self-test mismatch, asserts publishErr == errSelfTestMismatch,
+// and asserts the directory is STILL PRESENT (the destructive
+// cleanup did not fire). The normal publish path would have failed
+// at os.Rename — this test pins the mismatch-cleanup-specific guard.
+func TestCLISelfTestMismatchSkipsDirectoryAtOutputPath(t *testing.T) {
+	t.Parallel()
+	rawIn := t.TempDir()
+	writeSQSFixture(t, rawIn)
+	emitMinimalManifest(t, rawIn, 7000)
+	canonicalIn := canonicalizeInput(t, rawIn, 7000)
+
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	// Pre-create a directory at the --output path — an operator
+	// typo, but the cleanup MUST NOT destructively remove it.
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	scratchBase := t.TempDir()
+	encodeOpts := backup.EncodeOptions{
+		InputRoot:            canonicalIn,
+		Adapters:             backup.AdapterSet{SQS: true},
+		LastCommitTS:         7000,
+		ManifestLastCommitTS: 7000,
+		SelfTest:             true,
+		SelfTestDecodeOptions: backup.DecodeOptions{
+			OutRoot:  scratchBase,
+			Adapters: backup.AdapterSet{SQS: true},
+		},
+	}
+	encodeOpts.SetSelfTestCorruptHookForTest(func(f *os.File) {
+		info, ferr := f.Stat()
+		if ferr != nil {
+			t.Fatalf("temp Stat: %v", ferr)
+		}
+		const headerSkip = 200
+		if info.Size() <= headerSkip {
+			t.Fatalf("temp file too small to corrupt: %d", info.Size())
+		}
+		buf := make([]byte, info.Size()-headerSkip)
+		if _, rerr := f.ReadAt(buf, headerSkip); rerr != nil {
+			t.Fatalf("ReadAt: %v", rerr)
+		}
+		for i := 0; i < len(buf); i += 13 {
+			buf[i] ^= 0xFF
+		}
+		if _, werr := f.WriteAt(buf, headerSkip); werr != nil {
+			t.Fatalf("WriteAt: %v", werr)
+		}
+	})
+
+	cfg := &config{
+		inputPath:  canonicalIn,
+		outputPath: out,
+		adapters:   backup.AdapterSet{SQS: true},
+		selfTest:   true,
+	}
+	mismatchPath := out + ".mismatch.txt"
+
+	_, publishErr := writeAndPublish(cfg, encodeOpts, mismatchPath, quietLogger())
+	if !errors.Is(publishErr, errSelfTestMismatch) {
+		t.Fatalf("publishErr = %v, want errSelfTestMismatch", publishErr)
+	}
+	info, statErr := os.Stat(out)
+	if statErr != nil {
+		t.Fatalf("output path missing after mismatch (codex P2 v14 destructive cleanup regression): %v", statErr)
+	}
+	if !info.IsDir() {
+		t.Errorf("output mode = %s; expected the pre-placed directory to be preserved", info.Mode())
+	}
+}
+
+// TestCLIInvalidManifestExitsTwo pins codex P2 v14 #904: a malformed
+// MANIFEST.json (invalid JSON or unsupported format_version) surfaces
+// backup.ErrInvalidManifest / backup.ErrUnsupportedFormatVersion from
+// readInputManifest, and the CLI MUST map both to exit 2
+// (data-correctness). Treating a broken manifest as exit 1 misroutes
+// runbook recovery for corrupt-dump scenarios.
+func TestCLIInvalidManifestExitsTwo(t *testing.T) {
+	t.Parallel()
+	t.Run("invalid JSON body", func(t *testing.T) {
+		t.Parallel()
+		in := t.TempDir()
+		if err := os.WriteFile(filepath.Join(in, "MANIFEST.json"), []byte("{not json"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		out := filepath.Join(t.TempDir(), "out.fsm")
+		code, err := run([]string{"--input", in, "--output", out}, quietLogger())
+		if err == nil {
+			t.Fatalf("run succeeded; want manifest parse error")
+		}
+		if code != exitDataErr {
+			t.Errorf("exit code = %d, want %d (invalid manifest is data-correctness)", code, exitDataErr)
+		}
+	})
+	t.Run("unsupported format_version", func(t *testing.T) {
+		t.Parallel()
+		in := t.TempDir()
+		if err := os.WriteFile(filepath.Join(in, "MANIFEST.json"),
+			[]byte(`{"format_version":99,"last_commit_ts":1}`), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		out := filepath.Join(t.TempDir(), "out.fsm")
+		code, err := run([]string{"--input", in, "--output", out}, quietLogger())
+		if err == nil {
+			t.Fatalf("run succeeded; want unsupported format_version")
+		}
+		if code != exitDataErr {
+			t.Errorf("exit code = %d, want %d (unsupported manifest format_version is data-correctness)", code, exitDataErr)
+		}
+	})
+}
+
 // TestCLIWriteAndPublishRemovesStaleFSMOnSelfTestMismatch pins codex
 // P2 v10 #904: when a prior successful run left an <output>.fsm on
 // disk and a new --self-test invocation produces a mismatch,

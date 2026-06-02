@@ -81,27 +81,40 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 		return exitUserErr, err
 	}
 	if err := encodeOne(cfg, logger); err != nil {
-		// Errors from the encoder layer that represent data constraints
-		// (HLC ceiling regression, JSONL layout, self-test mismatch,
-		// adapter rejecting input-tree contents) are exit 2; flag/path
-		// errors are exit 1. Runbooks branch on exit status to triage
-		// bad-dump-data vs operator typos, so this split is part of the
-		// CLI contract (codex P2 v9 #904 added the adapter-data branch).
-		if errors.Is(err, backup.ErrSelfTestLowerLastCommitTS) {
-			return exitDataErr, err
-		}
-		if errors.Is(err, backup.ErrEncodeUnsupportedDynamoDBLayout) {
-			return exitDataErr, err
-		}
-		if errors.Is(err, backup.ErrEncodeAdapterData) {
-			return exitDataErr, err
-		}
-		if errors.Is(err, errSelfTestMismatch) {
-			return exitDataErr, err
-		}
-		return exitUserErr, err
+		return classifyEncodeError(err), err
 	}
 	return exitSuccess, nil
+}
+
+// classifyEncodeError maps the encodeOne return value to a CLI exit
+// code. Data-correctness sentinels (HLC ceiling regression, JSONL
+// layout, adapter rejecting input-tree contents, self-test mismatch,
+// corrupt manifest) → exit 2; everything else → exit 1. Runbooks
+// branch on exit status to triage bad-dump-data vs operator typos,
+// so this mapping is part of the CLI contract.
+//
+// Sources of each sentinel:
+//   - ErrSelfTestLowerLastCommitTS: CLI resolveLastCommitTS + library
+//     validateEncodeOptionsData (codex P2 v2 #904)
+//   - ErrEncodeUnsupportedDynamoDBLayout: validateEncodeOptionsData
+//     (codex P2 v7 #904)
+//   - ErrEncodeAdapterData: runAdapterEncoders mark on adapter
+//     rejection (codex P2 v9 #904)
+//   - errSelfTestMismatch: writeAndPublish self-test branch
+//   - ErrInvalidManifest / ErrUnsupportedFormatVersion: readInputManifest
+//     surfacing backup.ReadManifest sentinels (codex P2 v14 #904)
+func classifyEncodeError(err error) int {
+	switch {
+	case errors.Is(err, backup.ErrSelfTestLowerLastCommitTS),
+		errors.Is(err, backup.ErrEncodeUnsupportedDynamoDBLayout),
+		errors.Is(err, backup.ErrEncodeAdapterData),
+		errors.Is(err, errSelfTestMismatch),
+		errors.Is(err, backup.ErrInvalidManifest),
+		errors.Is(err, backup.ErrUnsupportedFormatVersion):
+		return exitDataErr
+	default:
+		return exitUserErr
+	}
 }
 
 func parseFlags(argv []string) (*config, error) {
@@ -312,6 +325,30 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 	return encodeOpts
 }
 
+// removeStaleOutputFSM removes outputPath ONLY if it exists and is a
+// regular file. A directory or special-file at the path is left alone
+// (codex P2 v14 #904 — the prior unconditional os.Remove would have
+// deleted an empty directory the operator passed in error to --output).
+// Errors other than ErrNotExist are downgraded to warn-and-continue so
+// the caller's primary mismatch error remains the dominant signal.
+func removeStaleOutputFSM(outputPath string, logger *slog.Logger) {
+	info, err := os.Lstat(outputPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("stat stale .fsm on self-test mismatch", "err", err)
+		}
+		return
+	}
+	if !info.Mode().IsRegular() {
+		logger.Warn("skip stale .fsm cleanup: --output is not a regular file",
+			"path", outputPath, "mode", info.Mode())
+		return
+	}
+	if rerr := os.Remove(outputPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+		logger.Warn("remove stale .fsm on self-test mismatch", "err", rerr)
+	}
+}
+
 // writeAndPublish writes the .fsm to a temp path, runs the optional
 // self-test via EncodeSnapshot, and renames temp → output on success.
 // On self-test failure: writes mismatch.txt, removes any stale
@@ -338,15 +375,20 @@ func writeAndPublish(cfg *config, encodeOpts backup.EncodeOptions, mismatchPath 
 			logger.Warn("write mismatch.txt", "err", werr)
 		}
 		// Remove the stale <output>.fsm if one exists from a prior
-		// successful run. encodeOne is about to write a fresh
-		// <output>.encode_info.json with self_test.matched=false and
-		// a NEW SHA pointing to the unpublished temp snapshot; leaving
-		// the old bytes on disk would make the sidecar describe an
-		// FSM that does not exist and violate the "self-test failure
-		// leaves no restore-visible FSM" contract (codex P2 v10 #904).
-		if rerr := os.Remove(cfg.outputPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
-			logger.Warn("remove stale .fsm on self-test mismatch", "err", rerr)
-		}
+		// successful run AND is a regular file. encodeOne is about to
+		// write a fresh <output>.encode_info.json with
+		// self_test.matched=false and a NEW SHA pointing to the
+		// unpublished temp snapshot; leaving old bytes on disk would
+		// make the sidecar describe an FSM that does not exist and
+		// violate the "self-test failure leaves no restore-visible
+		// FSM" contract (codex P2 v10 #904).
+		//
+		// The mode-check guards against an --output that names a
+		// directory (or any non-regular file): the normal publish
+		// path would fail at os.Rename anyway, but the mismatch
+		// cleanup must not destructively delete a directory the
+		// operator passed in error (codex P2 v14 #904).
+		removeStaleOutputFSM(cfg.outputPath, logger)
 		return result, errors.Wrap(errSelfTestMismatch, "self-test diff (see "+mismatchPath+")")
 	}
 	if err := os.Rename(tempPath, cfg.outputPath); err != nil {
