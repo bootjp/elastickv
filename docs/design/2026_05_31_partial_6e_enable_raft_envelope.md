@@ -2,11 +2,27 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | partial |
 | Date | 2026-05-31 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.2 raft envelope, §6.3 engine apply-hook, §6.6 admin RPC, §7.1 Phase-2 cutover) |
 | Builds on | Stage 6A–6D (capability gate, storage envelope cutover, sidecar field plumbing), Stage 7 (writer registry), Stage 8a (snapshot header v2 cutover carriage) |
 | Sibling slice | Stage 8b — WAL coverage (not blocked on 6E) |
+
+## Implementation status
+
+| Milestone | Status | Shipped in |
+|---|---|---|
+| 6E-1a — FSM apply machinery (`applyEnableRaftEnvelope`, sidecar field plumbing, wire sub-tag whitelist) | shipped | #899 (3bffd344) |
+| 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand | shipped | this PR |
+| 6E-2 — engine unwrap-on-apply + coordinator wrap-on-propose + §7.1 proposal-quiescence barrier (atomic 3-piece flip) | not started | — |
+| 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | not started | — |
+
+With 6E-1 (both sub-milestones) complete, operators can trigger
+the Phase-2 cutover and the FSM records `RaftEnvelopeCutoverIndex`
+in the sidecar atomically with the proposer-registration row. The
+flip is operator-inert until 6E-2 lands the engine and coordinator
+glue: no proposal is wrapped, and no apply is unwrapped, with only
+6E-1 deployed (per §6E design "no behavior change" guarantee).
 
 ## 0. Why this slice exists
 

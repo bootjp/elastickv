@@ -65,6 +65,7 @@ func encryptionSubcommands() map[string]func(args []string, out io.Writer) error
 		"register-writer":         runEncryptionRegisterWriter,
 		"bootstrap":               runEncryptionBootstrap,
 		"enable-storage-envelope": runEncryptionEnableStorageEnvelope,
+		"enable-raft-envelope":    runEncryptionEnableRaftEnvelope,
 		"probe-node-id":           runEncryptionProbeNodeID,
 	}
 }

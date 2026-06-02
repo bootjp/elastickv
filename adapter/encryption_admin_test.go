@@ -1891,3 +1891,196 @@ func assertProtoVerdict(t *testing.T, v *pb.CapabilityVerdict, wantNodeID uint64
 			v, wantNodeID, wantBuildSHA)
 	}
 }
+
+// validEnableRaftEnvelopeRequest is the canonical valid request
+// for the raft-variant tests. Same proposer identity shape as the
+// storage variant — the two requests' Go types are independent
+// but structurally identical (proposer_node_id, proposer_local_epoch).
+func validEnableRaftEnvelopeRequest() *pb.EnableRaftEnvelopeRequest {
+	return &pb.EnableRaftEnvelopeRequest{
+		ProposerNodeId:     11,
+		ProposerLocalEpoch: 7,
+	}
+}
+
+// applyRaftCutover is the §6.4-equivalent fresh-success apply
+// effect for the raft variant: stamp RaftEnvelopeCutoverIndex
+// with the apply's Raft index. Used by the EnableRaftEnvelope
+// happy-path test to drive the post-Propose sidecar re-read into
+// the fresh-success branch.
+func applyRaftCutover(sc *encryption.Sidecar, raftIdx uint64) {
+	sc.RaftEnvelopeCutoverIndex = raftIdx
+	if raftIdx > sc.RaftAppliedIndex {
+		sc.RaftAppliedIndex = raftIdx
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RejectsZeroProposerNodeID
+// pins the §6.1 sentinel rejection at the gRPC boundary.
+func TestEncryptionAdmin_EnableRaftEnvelope_RejectsZeroProposerNodeID(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	req := validEnableRaftEnvelopeRequest()
+	req.ProposerNodeId = 0
+	_, err := srv.EnableRaftEnvelope(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("EnableRaftEnvelope status=%v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RejectsOversizedLocalEpoch
+// pins the §4.1 16-bit bound at the gRPC boundary.
+func TestEncryptionAdmin_EnableRaftEnvelope_RejectsOversizedLocalEpoch(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	req := validEnableRaftEnvelopeRequest()
+	req.ProposerLocalEpoch = math.MaxUint16 + 1
+	_, err := srv.EnableRaftEnvelope(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("EnableRaftEnvelope status=%v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped pins
+// the raft-variant bootstrap gate: Active.Raft == 0 means
+// BootstrapEncryption has not committed yet, so the cutover must
+// refuse.
+func TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 0, Raft: 0},
+		Keys:   map[string]encryption.SidecarKey{},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "BootstrapEncryption") {
+		t.Errorf("error %q does not hint at BootstrapEncryption", err)
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry pins the
+// retry path: a duplicate call against a sidecar with
+// RaftEnvelopeCutoverIndex != 0 returns OK with
+// was_already_active=true and applied_index = the original
+// cutover index. No fan-out, no propose. The raft variant has no
+// CutoverIndexUnknown field, so the response is intentionally
+// narrower than the storage variant's idempotent shape.
+func TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active:                   encryption.ActiveKeys{Storage: 5, Raft: 6},
+		Keys:                     map[string]encryption.SidecarKey{"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0}, "6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0}},
+		RaftEnvelopeCutoverIndex: 777,
+		RaftAppliedIndex:         900,
+	})
+	proposer := &recordingProposer{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
+	)
+	got, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableRaftEnvelope: %v", err)
+	}
+	if !got.WasAlreadyActive {
+		t.Error("WasAlreadyActive=false, want true (idempotent retry)")
+	}
+	if got.AppliedIndex != 777 {
+		t.Errorf("AppliedIndex=%d, want 777 (original RaftEnvelopeCutoverIndex)", got.AppliedIndex)
+	}
+	if len(got.CapabilitySummary) != 0 {
+		t.Errorf("CapabilitySummary len=%d, want 0 (empty on idempotent retries)", len(got.CapabilitySummary))
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (no propose on idempotent retry)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_HappyPath drives the full
+// raft-variant happy path: leader passes, fan-out approves,
+// propose lands, applyRaftCutover sets RaftEnvelopeCutoverIndex,
+// the response carries WasAlreadyActive=false +
+// CapabilitySummary populated + AppliedIndex matching the
+// proposed Raft index. The decoded proposal must carry
+// Purpose=PurposeRaft, len(Wrapped)==0, DEKID=sidecar.Active.Raft.
+func TestEncryptionAdmin_EnableRaftEnvelope_HappyPath(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+	)
+	got, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableRaftEnvelope: %v", err)
+	}
+	if got.WasAlreadyActive {
+		t.Error("WasAlreadyActive=true, want false (fresh cutover)")
+	}
+	if got.AppliedIndex != 4242 {
+		t.Errorf("AppliedIndex=%d, want 4242 (proposed Raft index)", got.AppliedIndex)
+	}
+	if len(got.CapabilitySummary) != 2 {
+		t.Errorf("CapabilitySummary len=%d, want 2 (allOKFanout)", len(got.CapabilitySummary))
+	}
+	// Wire-level pin: the proposed Raft entry MUST decode as
+	// SubTag=RotateSubEnableRaftEnvelope with §2.1 constraints.
+	assertSingleProposalOpcode(t, proposer.calls, fsmwire.OpRotation)
+	decoded, err := fsmwire.DecodeRotation(proposer.calls[0][1:])
+	if err != nil {
+		t.Fatalf("DecodeRotation: %v", err)
+	}
+	assertRaftCutoverProposalShape(t, decoded, 6, 11, 7)
+}
+
+// assertRaftCutoverProposalShape pins the §2.1 raft-variant
+// proposal shape: SubTag=RotateSubEnableRaftEnvelope,
+// Purpose=PurposeRaft, len(Wrapped)==0, DEKID=sidecar.Active.Raft,
+// ProposerRegistration {DEKID, FullNodeID, LocalEpoch} matching
+// the request. Mirrors assertCutoverProposalShape for the storage
+// variant.
+func assertRaftCutoverProposalShape(t *testing.T, decoded fsmwire.RotationPayload, wantDEKID uint32, wantNodeID uint64, wantEpoch uint16) {
+	t.Helper()
+	if decoded.SubTag != fsmwire.RotateSubEnableRaftEnvelope {
+		t.Errorf("SubTag=%#x, want RotateSubEnableRaftEnvelope (%#x)", decoded.SubTag, fsmwire.RotateSubEnableRaftEnvelope)
+	}
+	if decoded.Purpose != fsmwire.PurposeRaft {
+		t.Errorf("Purpose=%#x, want PurposeRaft (%#x)", byte(decoded.Purpose), byte(fsmwire.PurposeRaft))
+	}
+	if len(decoded.Wrapped) != 0 {
+		t.Errorf("len(Wrapped)=%d, want 0", len(decoded.Wrapped))
+	}
+	if decoded.DEKID != wantDEKID {
+		t.Errorf("DEKID=%d, want %d (Active.Raft)", decoded.DEKID, wantDEKID)
+	}
+	if decoded.ProposerRegistration.DEKID != wantDEKID ||
+		decoded.ProposerRegistration.FullNodeID != wantNodeID ||
+		decoded.ProposerRegistration.LocalEpoch != wantEpoch {
+		t.Errorf("ProposerRegistration=%+v, want {DEKID:%d FullNodeID:%d LocalEpoch:%d}",
+			decoded.ProposerRegistration, wantDEKID, wantNodeID, wantEpoch)
+	}
+}
