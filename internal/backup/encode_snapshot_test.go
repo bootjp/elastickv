@@ -436,6 +436,13 @@ func TestEncodeSnapshotRejectsZeroAdapterSet(t *testing.T) {
 		InputRoot:    in,
 		Adapters:     AdapterSet{}, // explicit zero
 		LastCommitTS: 1,
+		// AllowMissingManifest: true bypasses the v19 MANIFEST.json
+		// guard so this test actually exercises the zero-adapter
+		// guard further down in validateEncodeOptions — without this,
+		// checkInputRoot would error on the missing MANIFEST.json
+		// first and the assertion would pin the wrong invariant
+		// (claude v19 #904).
+		AllowMissingManifest: true,
 	}, &buf)
 	if err == nil {
 		t.Fatalf("EncodeSnapshot with empty AdapterSet succeeded; want error")
