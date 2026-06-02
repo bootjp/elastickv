@@ -459,30 +459,20 @@ func TestEnumerateRedisDBsRedisIsRegularFile(t *testing.T) {
 	}
 }
 
-// TestEncodeSnapshotRedisMultiDB pins codex P1 v13 #904: the Redis
-// fan-out in adapterRunners enumerates redis/db_<N>/ and invokes the
-// per-DB encoder for each. The fixture places a single string under
-// redis/db_3/ ONLY (no db_0). Pre-fix, the encoder hardcoded
-// NewRedisEncoder(root, 0) and produced a header-only .fsm for this
-// input — silent data loss. Post-fix, the db_3 string is included.
+// TestEncodeSnapshotRedisRejectsNonZeroDB pins codex P2 v14 #904
+// L452: the Redis MVCC key prefixes (!redis|str|, !redis|hll|,
+// !redis|ttl|, …) carry no database component, so feeding a
+// non-zero DB through the encoder would mis-scope the produced
+// .fsm — same-named keys collide and a db_3-only self-test would
+// decode under db_0. Until Phase 1 makes native keys DB-aware,
+// non-zero-DB inputs MUST fail closed.
 //
-// Assertion is content-free: compare encoded byte count against an
-// empty-redis baseline. With multi-DB fan-out, the db_3 fixture
-// produces MORE bytes than an empty tree. Without it, both encodes
-// would produce identical header-only output.
-func TestEncodeSnapshotRedisMultiDB(t *testing.T) {
+// The fixture places a single string under redis/db_3/ ONLY.
+// EncodeSnapshot must reject with ErrRedisEncodeMultiDBUnsupported
+// and write no bytes. (v14 originally attempted to fan out per DB;
+// codex's L452 follow-up established the correct fix is fail-closed.)
+func TestEncodeSnapshotRedisRejectsNonZeroDB(t *testing.T) {
 	t.Parallel()
-	emptyIn := t.TempDir()
-	var emptyBuf bytes.Buffer
-	emptyResult, err := EncodeSnapshot(EncodeOptions{
-		InputRoot:    emptyIn,
-		Adapters:     AdapterSet{Redis: true},
-		LastCommitTS: 1,
-	}, &emptyBuf)
-	if err != nil {
-		t.Fatalf("EncodeSnapshot empty: %v", err)
-	}
-
 	in := t.TempDir()
 	encKey := EncodeSegment([]byte("k3"))
 	db3Strings := filepath.Join(in, "redis", "db_3", "strings")
@@ -493,17 +483,68 @@ func TestEncodeSnapshotRedisMultiDB(t *testing.T) {
 		t.Fatalf("WriteFile db_3 string: %v", err)
 	}
 	var buf bytes.Buffer
-	result, err := EncodeSnapshot(EncodeOptions{
+	_, err := EncodeSnapshot(EncodeOptions{
 		InputRoot:    in,
 		Adapters:     AdapterSet{Redis: true},
 		LastCommitTS: 1,
 	}, &buf)
-	if err != nil {
-		t.Fatalf("EncodeSnapshot db_3-only: %v", err)
+	if err == nil {
+		t.Fatalf("EncodeSnapshot accepted db_3-only Redis input; want ErrRedisEncodeMultiDBUnsupported")
 	}
-	if result.BytesWritten <= emptyResult.BytesWritten {
-		t.Errorf("BytesWritten with redis/db_3 fixture (%d) <= empty (%d); pre-fix, hardcoded db_0 fan-out dropped db_3 silently",
-			result.BytesWritten, emptyResult.BytesWritten)
+	if !errors.Is(err, ErrRedisEncodeMultiDBUnsupported) {
+		t.Errorf("err = %v, want errors.Is ErrRedisEncodeMultiDBUnsupported", err)
+	}
+	// Marked as adapter-data so the CLI routes it to exit-2.
+	if !errors.Is(err, ErrEncodeAdapterData) {
+		t.Errorf("err = %v, want errors.Is ErrEncodeAdapterData (mark from runAdapterEncoders)", err)
+	}
+}
+
+// TestEncodeSnapshotRedisRejectsMultipleDBs pins the multi-DB case:
+// redis/db_0 + redis/db_3 → ErrRedisEncodeMultiDBUnsupported (the
+// fan-out would collide on same-named keys or merge both DBs under
+// db_0 on restore; codex P2 v14 #904 L452).
+func TestEncodeSnapshotRedisRejectsMultipleDBs(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	for _, name := range []string{"db_0", "db_3"} {
+		if err := os.MkdirAll(filepath.Join(in, "redis", name, "strings"), 0o755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", name, err)
+		}
+	}
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:    in,
+		Adapters:     AdapterSet{Redis: true},
+		LastCommitTS: 1,
+	}, &buf)
+	if err == nil {
+		t.Fatalf("EncodeSnapshot accepted db_0 + db_3; want ErrRedisEncodeMultiDBUnsupported")
+	}
+	if !errors.Is(err, ErrRedisEncodeMultiDBUnsupported) {
+		t.Errorf("err = %v, want errors.Is ErrRedisEncodeMultiDBUnsupported", err)
+	}
+}
+
+// TestEnumerateRedisDBsRejectsNonDirDBEntry pins codex P2 v14 #904
+// L427: when a canonical db_<N> name resolves to a regular file
+// (or symlink) instead of a directory, enumerateRedisDBs must fail
+// closed with ErrRedisEncodeNotDir — silently skipping would let a
+// malformed dump publish a header-only/partial FSM.
+func TestEnumerateRedisDBsRejectsNonDirDBEntry(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(in, "redis"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// redis/db_2 is a regular file — name matches the canonical
+	// pattern but the entry shape is wrong.
+	if err := os.WriteFile(filepath.Join(in, "redis", "db_2"), []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := enumerateRedisDBs(in)
+	if !errors.Is(err, ErrRedisEncodeNotDir) {
+		t.Errorf("err = %v, want errors.Is ErrRedisEncodeNotDir", err)
 	}
 }
 

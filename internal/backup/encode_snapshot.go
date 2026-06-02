@@ -41,6 +41,22 @@ var ErrSelfTestLowerLastCommitTS = errors.New("backup: --last-commit-ts T < mani
 // until the encoder learns the JSONL layout (M7 / future milestone).
 var ErrEncodeUnsupportedDynamoDBLayout = errors.New("backup: DynamoDB JSONL layout not supported by encoder")
 
+// ErrRedisEncodeMultiDBUnsupported is returned when the input tree
+// contains a Redis db_<N>/ for any N != 0, or contains multiple
+// db_<N> directories. The current Redis MVCC key prefixes
+// (!redis|str|, !redis|hll|, !redis|ttl|, …) carry NO database
+// component, so feeding two distinct DBs into the same snapshot
+// builder would either collide on same-named keys or silently merge
+// both DBs under db_0 on restore (DecodeOptions.RedisDBIndex
+// defaults to 0). Failing closed preserves correctness until Phase 1
+// makes the native keys DB-aware (codex P2 v14 #904).
+//
+// v14 originally fanned out across db_<N> to address codex P1 v13's
+// silent-data-loss concern; codex's v14 follow-up clarified that
+// fan-out under the current key format produces mis-scoped output.
+// The corrected fix replaces fan-out with fail-closed.
+var ErrRedisEncodeMultiDBUnsupported = errors.New("backup: redis encoder requires single db_0 (multi-DB or non-zero DB not yet supported)")
+
 // ErrEncodeAdapterData marks every error returned by an adapter
 // encoder (Redis / DynamoDB / S3 / SQS) so callers can distinguish
 // "the input tree contained content the encoder cannot translate"
@@ -387,9 +403,20 @@ func enumerateRedisDBs(inRoot string) ([]int, error) {
 	}
 	var indices []int
 	for _, ent := range entries {
-		if idx, ok := parseRedisDBDir(ent); ok {
-			indices = append(indices, idx)
+		idx, ok := parseRedisDBName(ent.Name())
+		if !ok {
+			continue
 		}
+		// Canonical db_<N> name; entry MUST be a directory.
+		// Silently skipping a regular file or symlink at
+		// redis/db_<N> would let a malformed dump publish a
+		// header-only/partial FSM (codex P2 v14 #904 L427).
+		if !ent.IsDir() {
+			return nil, errors.Wrapf(ErrRedisEncodeNotDir,
+				"redis/%s exists but is not a directory (mode=%s)",
+				ent.Name(), ent.Type())
+		}
+		indices = append(indices, idx)
 	}
 	sort.Ints(indices)
 	return indices, nil
@@ -416,17 +443,19 @@ func checkRedisRoot(redisDir string) error {
 	return nil
 }
 
-// parseRedisDBDir returns (dbIndex, true) when ent names a canonical
-// db_<N> directory (N is a non-negative decimal with no leading zeros).
-// Non-matching entries return (0, false) so the caller can skip without
-// erroring — they cannot have been produced by the canonical decoder.
-// Reject non-canonical decimals so a hypothetical Phase 1 dumper cannot
-// double-emit the same db under two distinct directory names.
-func parseRedisDBDir(ent os.DirEntry) (int, bool) {
-	if !ent.IsDir() {
-		return 0, false
-	}
-	name := ent.Name()
+// parseRedisDBName returns (dbIndex, true) when name matches the
+// canonical db_<N> pattern (N is a non-negative decimal with no
+// leading zeros). Non-matching names return (0, false) so the caller
+// can skip them without erroring — they cannot have been produced by
+// the canonical decoder. Reject non-canonical decimals so a
+// hypothetical Phase 1 dumper cannot double-emit the same db under
+// two distinct directory names.
+//
+// This is a pure name parser; the caller is responsible for
+// validating the directory-entry shape (codex P2 v14 #904 L427
+// shifted the IsDir check to enumerateRedisDBs so a regular file
+// at redis/db_<N> fails closed instead of being silently skipped).
+func parseRedisDBName(name string) (int, bool) {
 	if !strings.HasPrefix(name, redisDBDirPrefix) {
 		return 0, false
 	}
@@ -438,20 +467,35 @@ func parseRedisDBDir(ent os.DirEntry) (int, bool) {
 	return idx, true
 }
 
-// encodeAllRedisDBs invokes NewRedisEncoder per discovered db_<N>
-// directory in ascending index order. A missing redis/ directory is a
-// no-op. Codex P1 v13 #904: replaces the prior hardcoded db_0 fan-out
-// which would silently drop non-default DBs from any Phase 1 multi-DB
-// dump. Per-DB errors are wrapped with the db index for traceability.
+// encodeAllRedisDBs invokes NewRedisEncoder for redis/db_0/ when the
+// input tree has exactly that DB (or no Redis content at all). A
+// missing redis/ directory is a no-op. Any non-zero DB or the
+// presence of multiple db_<N> directories fails closed with
+// ErrRedisEncodeMultiDBUnsupported.
+//
+// Codex P1 v13 #904 originally asked for a per-DB fan-out to address
+// the prior hardcoded db_0 dispatch silently dropping non-default
+// DBs. Codex P2 v14 #904 (L452) clarified that fan-out under the
+// current MVCC key prefixes (!redis|str|, !redis|hll|, !redis|ttl|,
+// …, none of which carry a database component) would either collide
+// on same-named keys across DBs or merge everything under db_0 at
+// decode time. The corrected fix replaces the silent drop and the
+// incorrect fan-out with a fail-closed sentinel until Phase 1
+// makes the native keys DB-aware.
 func encodeAllRedisDBs(b *snapshotBuilder, inRoot string) error {
 	indices, err := enumerateRedisDBs(inRoot)
 	if err != nil {
 		return errors.Wrap(err, "redis encoder enumerate")
 	}
-	for _, idx := range indices {
-		if err := NewRedisEncoder(inRoot, idx).Encode(b); err != nil {
-			return errors.Wrapf(err, "redis encoder db_%d", idx)
-		}
+	if len(indices) == 0 {
+		return nil
+	}
+	if len(indices) > 1 || indices[0] != 0 {
+		return errors.Wrapf(ErrRedisEncodeMultiDBUnsupported,
+			"redis encoder enumerated db indices %v", indices)
+	}
+	if err := NewRedisEncoder(inRoot, 0).Encode(b); err != nil {
+		return errors.Wrap(err, "redis encoder db_0")
 	}
 	return nil
 }
