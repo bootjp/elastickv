@@ -426,6 +426,15 @@ func encodeOne(cfg *config, logger *slog.Logger) error {
 			// Surface the sidecar-write failure only if encode itself
 			// succeeded; on mismatch the mismatch error takes priority.
 			if publishErr == nil {
+				// .fsm was just renamed into place by writeAndPublish
+				// but the sidecar write failed → we have an orphan
+				// .fsm without its matching provenance metadata.
+				// Roll both back to a consistent absent state so the
+				// operator doesn't see a "successful" restore
+				// artifact missing its sidecar (claude/codex P2 v31
+				// observation on PR #904 — the design contract is
+				// that .fsm + sidecar move together).
+				rollbackOrphanFSMAndSidecar(cfg.outputPath, logger)
 				return errors.Wrap(serr, "write encode_info sidecar")
 			}
 			logger.Warn("write encode_info sidecar on mismatch", "err", serr)
@@ -482,6 +491,34 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 		encodeOpts.SelfTestDecodeOptions = buildSelfTestDecodeOptions(cfg, manifest)
 	}
 	return encodeOpts
+}
+
+// rollbackOrphanFSMAndSidecar removes both the just-published
+// <output>.fsm and the partial <output>.encode_info.json after a
+// sidecar-write failure on the encode success path. The pair was
+// supposed to move together (the .fsm describes the data the sidecar
+// records the provenance for); if the sidecar didn't land, the
+// operator must not see a "successful" .fsm without its matching
+// provenance metadata (claude / codex P2 v31 observation on PR #904).
+//
+// A prior successful encode at the same output path is unrecoverable
+// — writeAndPublish's os.Rename already overwrote it before
+// writeSidecar ran. The rollback brings the state to "no .fsm, no
+// sidecar at this path", which is the same end state as "encode
+// never ran." That's the cleanest consistent outcome the CLI can
+// produce without filesystem transactions.
+//
+// Both os.Remove calls log-and-continue on non-ErrNotExist failures
+// so the caller's primary sidecar-write error remains the dominant
+// signal.
+func rollbackOrphanFSMAndSidecar(outputPath string, logger *slog.Logger) {
+	if rerr := os.Remove(outputPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+		logger.Warn("rollback orphan .fsm after sidecar failure", "err", rerr)
+	}
+	sidecarPath := backup.EncodeInfoSidecarPath(outputPath)
+	if srerr := os.Remove(sidecarPath); srerr != nil && !errors.Is(srerr, os.ErrNotExist) {
+		logger.Warn("rollback partial sidecar after write failure", "err", srerr)
+	}
 }
 
 // writeMismatchTxt writes the self-test mismatch report to mismatchPath

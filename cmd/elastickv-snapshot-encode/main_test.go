@@ -1032,13 +1032,22 @@ func TestCLISidecarWriteRefusesSymlinkTarget(t *testing.T) {
 	if code != exitUserErr {
 		t.Errorf("exit code = %d, want %d (operator-env error, not data-correctness)", code, exitUserErr)
 	}
-	// Victim file MUST be untouched.
+	// Victim file MUST be untouched (the no-follow open refused to
+	// resolve the symlink; the v32 rollback's os.Remove on
+	// sidecarPath operates on the symlink itself, not the target).
 	got, rerr := os.ReadFile(victim)
 	if rerr != nil {
 		t.Fatalf("read victim: %v", rerr)
 	}
 	if string(got) != victimBody {
 		t.Errorf("victim mutated; OpenSidecarFile followed the symlink (codex P2 v25 regression)")
+	}
+	// .fsm at outputPath MUST be removed by v32's rollback. The
+	// sidecar-write failure happened AFTER writeAndPublish renamed
+	// the .fsm into place, so without the rollback we'd have an
+	// orphan .fsm visible to the restore path.
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Errorf(".fsm at %s should be removed by v32 rollback after sidecar failure", out)
 	}
 }
 

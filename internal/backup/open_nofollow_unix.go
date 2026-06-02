@@ -98,5 +98,21 @@ func openSidecarFile(path string) (*os.File, error) {
 		_ = f.Close()
 		return nil, cockroachdberr.WithStack(err)
 	}
+	// Enforce 0o600 on the descriptor. The flags-arg mode (0o600
+	// above) is applied by the kernel ONLY on file creation; if
+	// path already existed, its pre-existing perms are kept. An
+	// older encoder writing 0o644 would otherwise leave the
+	// sidecar's source path / cluster ID / SHA256 world-readable
+	// after re-encode (claude / codex P2 v31 observation on PR #904).
+	if err := f.Chmod(sidecarFileMode); err != nil {
+		_ = f.Close()
+		return nil, cockroachdberr.WithStack(err)
+	}
 	return f, nil
 }
+
+// sidecarFileMode is the file mode openSidecarFile enforces — owner
+// read/write only. Pulled into a named const so the truncate-then-
+// chmod step here matches the OpenFile flag-arg mode above; a future
+// edit that widens one must touch both.
+const sidecarFileMode os.FileMode = 0o600
