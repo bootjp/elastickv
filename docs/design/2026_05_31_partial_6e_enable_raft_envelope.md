@@ -13,7 +13,7 @@
 | Milestone | Status | Shipped in |
 |---|---|---|
 | 6E-1a — FSM apply machinery (`applyEnableRaftEnvelope`, sidecar field plumbing, wire sub-tag whitelist) | shipped | #899 (3bffd344) |
-| 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand (server method **gated** until 6E-2; see §3.3 below) | shipped | this PR |
+| 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand (server method **gated** until 6E-2; see §3.3 below) | shipped | #907 |
 | 6E-2 — engine unwrap-on-apply + coordinator wrap-on-propose + §7.1 proposal-quiescence barrier (atomic 3-piece flip; also flips the 6E-1b gate to true) | not started | — |
 | 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | not started | — |
 
@@ -66,11 +66,14 @@ Without 6E, the cluster cannot reach Phase 2 even though every
 prerequisite (6D Phase-1 storage envelope, 7 writer registry, 8a
 snapshot cutover carriage) has shipped.
 
-This slice lands the actual Phase-2 raft cutover end-to-end:
-admin RPC, sidecar cutover-index recording, engine unwrap-on-
-apply, coordinator wrap-on-propose, and the §7.1 proposal-
-quiescence barrier that prevents the unwrap path from seeing a
-plaintext entry at `index > cutover`.
+This design (sliced into milestones 6E-1a / 6E-1b / 6E-2 / 6E-3 —
+see the Implementation status table above) lands the Phase-2 raft
+cutover end-to-end: admin RPC and sidecar cutover-index recording
+(6E-1, shipped), engine unwrap-on-apply + coordinator
+wrap-on-propose + §7.1 proposal-quiescence barrier that prevents
+the unwrap path from seeing a plaintext entry at
+`index > cutover` (6E-2, **planned**), and the §6C-4 fail-closed
+guards (6E-3, planned).
 
 ## 1. Out of scope
 
