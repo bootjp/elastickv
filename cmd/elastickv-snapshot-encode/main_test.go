@@ -77,6 +77,46 @@ func TestCLIRejectsUnknownAdapter(t *testing.T) {
 	}
 }
 
+// TestCLIAdapterDataErrorExitsTwo pins codex P2 v9 #904: when an
+// adapter encoder rejects the input tree's contents (e.g. a malformed
+// DynamoDB _schema.json with an empty table_name), the CLI exits 2
+// (data-correctness) rather than 1 (operator/flag error) so runbooks
+// can branch on exit status to quarantine bad dump data. Pinned via
+// the same ErrDDBEncodeInvalidSchema fixture pattern used by the
+// in-package DynamoDB encoder tests.
+func TestCLIAdapterDataErrorExitsTwo(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	emitMinimalManifest(t, in, 100)
+	// Empty table_name triggers ErrDDBEncodeInvalidSchema inside the
+	// DynamoDB encoder; runAdapterEncoders marks it with
+	// ErrEncodeAdapterData; run() maps that to exitDataErr.
+	schemaDir := filepath.Join(in, "dynamodb", "tbl")
+	if err := os.MkdirAll(schemaDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	schemaPath := filepath.Join(schemaDir, "_schema.json")
+	body := []byte(`{"format_version":1,"table_name":"","primary_key":{"hash_key":{"name":"id","type":"S"}}}`)
+	if err := os.WriteFile(schemaPath, body, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	code, err := run([]string{
+		"--input", in,
+		"--output", out,
+		"--adapter", "dynamodb",
+	}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want adapter rejection error")
+	}
+	if code != exitDataErr {
+		t.Errorf("exit code = %d, want %d (data error from adapter rejection, not flag-parse error)", code, exitDataErr)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Errorf(".fsm exists at %s; should not be published on adapter rejection", out)
+	}
+}
+
 // TestCLIRejectsLowerLastCommitTSOverride is the fail-closed pin per
 // parent §"MVCC re-encoding": T < manifest.last_commit_ts → exit 2
 // (data-correctness failure, not flag-parse error).

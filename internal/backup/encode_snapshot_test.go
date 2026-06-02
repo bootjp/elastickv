@@ -388,6 +388,41 @@ func TestEncodeSnapshotRejectsZeroAdapterSet(t *testing.T) {
 	}
 }
 
+// TestEncodeSnapshotMarksAdapterDataErrors pins codex P2 v9 #904: when
+// an adapter encoder rejects the input tree's contents (e.g. a
+// malformed DynamoDB _schema.json), EncodeSnapshot must surface the
+// failure as ErrEncodeAdapterData so the CLI can route it to exit-2
+// (data-correctness) rather than exit-1 (operator/flag error).
+// Crucially, errors.Mark preserves the original sentinel chain, so a
+// caller that errors.Is on the per-adapter sentinel
+// (ErrDDBEncodeInvalidSchema here) still gets a match — the marking
+// is additive.
+func TestEncodeSnapshotMarksAdapterDataErrors(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Empty table_name triggers ErrDDBEncodeInvalidSchema inside the
+	// DynamoDB encoder (encode_dynamodb.go:120).
+	writeDDBSchema(t, in, "tbl",
+		[]byte(`{"format_version":1,"table_name":"","primary_key":{"hash_key":{"name":"id","type":"S"}}}`))
+	var buf bytes.Buffer
+	_, err := EncodeSnapshot(EncodeOptions{
+		InputRoot:    in,
+		Adapters:     AdapterSet{DynamoDB: true},
+		LastCommitTS: 1,
+	}, &buf)
+	if err == nil {
+		t.Fatalf("EncodeSnapshot with malformed schema succeeded; want error")
+	}
+	if !errors.Is(err, ErrEncodeAdapterData) {
+		t.Errorf("err = %v, want errors.Is ErrEncodeAdapterData", err)
+	}
+	// Inner sentinel must still be reachable so existing per-adapter
+	// errors.Is callers are unaffected by the additional mark.
+	if !errors.Is(err, ErrDDBEncodeInvalidSchema) {
+		t.Errorf("err = %v, want errors.Is ErrDDBEncodeInvalidSchema (mark must preserve inner chain)", err)
+	}
+}
+
 // TestEncodeInfoSidecarPath pins the path-derivation rule for the
 // sidecar (gemini medium v2 #896): one .fsm path produces one distinct
 // sidecar path; two .fsm files in the same dir produce two distinct

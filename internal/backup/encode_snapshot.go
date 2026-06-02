@@ -41,6 +41,22 @@ var ErrSelfTestLowerLastCommitTS = errors.New("backup: --last-commit-ts T < mani
 // until the encoder learns the JSONL layout (M7 / future milestone).
 var ErrEncodeUnsupportedDynamoDBLayout = errors.New("backup: DynamoDB JSONL layout not supported by encoder")
 
+// ErrEncodeAdapterData marks every error returned by an adapter
+// encoder (Redis / DynamoDB / S3 / SQS) so callers can distinguish
+// "the input tree contained content the encoder cannot translate"
+// from "operator passed a bad flag". The encoder is offline-only —
+// every adapter error originates from rejecting the content under
+// opts.InputRoot (a malformed DynamoDB _schema.json, an S3 collision
+// artifact the encoder cannot reverse, a SQS side-record with an
+// unknown kind, …). These are data-correctness failures, not user
+// errors; the CLI maps this sentinel to exit 2 so runbooks can branch
+// on exit status to quarantine bad dump data (codex P2 v9 #904).
+//
+// Wrapped via errors.Mark inside runAdapterEncoders so the original
+// adapter sentinel chain (ErrDDBEncodeInvalidSchema, …) is preserved
+// for callers that errors.Is on the more specific type.
+var ErrEncodeAdapterData = errors.New("backup: adapter encoder rejected input tree")
+
 // The encoder dispatch order (redis → dynamodb → s3 → sqs) is encoded
 // inside adapterRunners() and is intentionally distinct from decode.go's
 // finalize order (dynamodb → s3 → redis → sqs). The final .fsm byte
@@ -353,6 +369,12 @@ func adapterRunners() []adapterRunner {
 // runAdapterEncoders invokes each enabled adapter encoder in
 // canonicalAdapterFanOutOrder, returning the list of adapter names
 // actually invoked (for ENCODE_INFO.json adapters_enabled).
+//
+// Adapter errors are marked with ErrEncodeAdapterData so the CLI can
+// route them to exit-2 (data-correctness) rather than exit-1 (user
+// error). The original adapter sentinel chain is preserved — callers
+// that errors.Is on ErrDDBEncodeInvalidSchema, ErrS3EncodeKeyConflict,
+// etc. still see those (codex P2 v9 #904).
 func runAdapterEncoders(b *snapshotBuilder, opts EncodeOptions) ([]string, error) {
 	var enabled []string
 	for _, r := range adapterRunners() {
@@ -360,7 +382,7 @@ func runAdapterEncoders(b *snapshotBuilder, opts EncodeOptions) ([]string, error
 			continue
 		}
 		if err := r.encode(b, opts.InputRoot); err != nil {
-			return nil, err
+			return nil, errors.WithStack(errors.Mark(err, ErrEncodeAdapterData))
 		}
 		enabled = append(enabled, r.name)
 	}

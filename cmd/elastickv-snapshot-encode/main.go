@@ -82,12 +82,18 @@ func run(argv []string, logger *slog.Logger) (int, error) {
 	}
 	if err := encodeOne(cfg, logger); err != nil {
 		// Errors from the encoder layer that represent data constraints
-		// (HLC ceiling regression, self-test mismatch) are exit 2; other
-		// errors are exit 1.
+		// (HLC ceiling regression, JSONL layout, self-test mismatch,
+		// adapter rejecting input-tree contents) are exit 2; flag/path
+		// errors are exit 1. Runbooks branch on exit status to triage
+		// bad-dump-data vs operator typos, so this split is part of the
+		// CLI contract (codex P2 v9 #904 added the adapter-data branch).
 		if errors.Is(err, backup.ErrSelfTestLowerLastCommitTS) {
 			return exitDataErr, err
 		}
 		if errors.Is(err, backup.ErrEncodeUnsupportedDynamoDBLayout) {
+			return exitDataErr, err
+		}
+		if errors.Is(err, backup.ErrEncodeAdapterData) {
 			return exitDataErr, err
 		}
 		if errors.Is(err, errSelfTestMismatch) {
