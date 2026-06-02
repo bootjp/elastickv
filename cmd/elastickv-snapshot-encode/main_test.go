@@ -267,7 +267,12 @@ func writeSQSFixture(t *testing.T, root string) {
 // encoder's output shape. Subsequent self-tests against the canonical
 // tree are byte-equal (any non-canonical formatting differences are
 // flattened by this first pass).
-func canonicalizeInput(t *testing.T, rawIn string, lastCommitTS uint64) string {
+// canonicalRoundTripTS is the fixed last_commit_ts used by every
+// canonicalizeInput call site. Kept as a const so a future test that
+// wants a different value can lift it back into a parameter.
+const canonicalRoundTripTS uint64 = 7000
+
+func canonicalizeInput(t *testing.T, rawIn string) string {
 	t.Helper()
 	canonicalIn := t.TempDir()
 	tmpOut := filepath.Join(t.TempDir(), "canonical.fsm")
@@ -286,8 +291,37 @@ func canonicalizeInput(t *testing.T, rawIn string, lastCommitTS uint64) string {
 	}); err != nil {
 		t.Fatalf("canonical decode: %v", err)
 	}
-	emitMinimalManifest(t, canonicalIn, lastCommitTS)
+	emitMinimalManifest(t, canonicalIn, canonicalRoundTripTS)
 	return canonicalIn
+}
+
+// flipBytesPastHeaderInTempCorruptHook returns a corrupt-buffer hook
+// that flips one byte every 13 starting at offset 200 in the on-disk
+// self-test buffer — the same pattern as the library's
+// flipBytesPastHeaderHelper. Extracted so the three CLI mismatch
+// tests share one body rather than each open-coding the same loop.
+func flipBytesPastHeaderInTempCorruptHook(t *testing.T) func(*os.File) {
+	t.Helper()
+	return func(f *os.File) {
+		info, ferr := f.Stat()
+		if ferr != nil {
+			t.Fatalf("temp Stat: %v", ferr)
+		}
+		const headerSkip = 200
+		if info.Size() <= headerSkip {
+			t.Fatalf("temp file too small to corrupt past header: %d bytes", info.Size())
+		}
+		buf := make([]byte, info.Size()-headerSkip)
+		if _, rerr := f.ReadAt(buf, headerSkip); rerr != nil {
+			t.Fatalf("ReadAt: %v", rerr)
+		}
+		for i := 0; i < len(buf); i += 13 {
+			buf[i] ^= 0xFF
+		}
+		if _, werr := f.WriteAt(buf, headerSkip); werr != nil {
+			t.Fatalf("WriteAt: %v", werr)
+		}
+	}
 }
 
 // readSidecar reads <output>.encode_info.json into an EncodeInfo struct.
@@ -392,7 +426,7 @@ func TestCLISelfTestMismatchSkipsDirectoryAtOutputPath(t *testing.T) {
 	rawIn := t.TempDir()
 	writeSQSFixture(t, rawIn)
 	emitMinimalManifest(t, rawIn, 7000)
-	canonicalIn := canonicalizeInput(t, rawIn, 7000)
+	canonicalIn := canonicalizeInput(t, rawIn)
 
 	out := filepath.Join(t.TempDir(), "out.fsm")
 	// Pre-create a directory at the --output path — an operator
@@ -413,26 +447,7 @@ func TestCLISelfTestMismatchSkipsDirectoryAtOutputPath(t *testing.T) {
 			Adapters: backup.AdapterSet{SQS: true},
 		},
 	}
-	encodeOpts.SetSelfTestCorruptHookForTest(func(f *os.File) {
-		info, ferr := f.Stat()
-		if ferr != nil {
-			t.Fatalf("temp Stat: %v", ferr)
-		}
-		const headerSkip = 200
-		if info.Size() <= headerSkip {
-			t.Fatalf("temp file too small to corrupt: %d", info.Size())
-		}
-		buf := make([]byte, info.Size()-headerSkip)
-		if _, rerr := f.ReadAt(buf, headerSkip); rerr != nil {
-			t.Fatalf("ReadAt: %v", rerr)
-		}
-		for i := 0; i < len(buf); i += 13 {
-			buf[i] ^= 0xFF
-		}
-		if _, werr := f.WriteAt(buf, headerSkip); werr != nil {
-			t.Fatalf("WriteAt: %v", werr)
-		}
-	})
+	encodeOpts.SetSelfTestCorruptHookForTest(flipBytesPastHeaderInTempCorruptHook(t))
 
 	cfg := &config{
 		inputPath:  canonicalIn,
@@ -496,6 +511,80 @@ func TestCLIInvalidManifestExitsTwo(t *testing.T) {
 	})
 }
 
+// TestCLISelfTestMismatchRemovesSymlinkOutputButPreservesTarget pins
+// codex P2 v19 #904: when --output is a symlink to a prior .fsm file
+// and the new --self-test invocation mismatches, the cleanup must
+// unlink the symlink (so the restore-visible --output path now
+// resolves to ENOENT, matching the mismatch contract) while leaving
+// the underlying target file intact (os.Remove on a symlink operates
+// on the link, not the resolved target).
+//
+// Before v21 the IsRegular()-only check silently skipped the symlink
+// cleanup; the new sidecar (matched=false) then described a fresh
+// failed encode while --output still resolved to a prior valid .fsm,
+// breaking the "no restore-visible FSM after self-test mismatch"
+// invariant. Linux-only because Windows symlink semantics differ.
+func TestCLISelfTestMismatchRemovesSymlinkOutputButPreservesTarget(t *testing.T) {
+	if isWindows {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	t.Parallel()
+	rawIn := t.TempDir()
+	writeSQSFixture(t, rawIn)
+	emitMinimalManifest(t, rawIn, 7000)
+	canonicalIn := canonicalizeInput(t, rawIn)
+
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "real.fsm")
+	const targetBody = "TARGET FSM BYTES (must survive symlink removal)"
+	if err := os.WriteFile(target, []byte(targetBody), 0o600); err != nil {
+		t.Fatalf("WriteFile target: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	if err := os.Symlink(target, out); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	scratchBase := t.TempDir()
+	encodeOpts := backup.EncodeOptions{
+		InputRoot:            canonicalIn,
+		Adapters:             backup.AdapterSet{SQS: true},
+		LastCommitTS:         7000,
+		ManifestLastCommitTS: 7000,
+		SelfTest:             true,
+		SelfTestDecodeOptions: backup.DecodeOptions{
+			OutRoot:  scratchBase,
+			Adapters: backup.AdapterSet{SQS: true},
+		},
+	}
+	encodeOpts.SetSelfTestCorruptHookForTest(flipBytesPastHeaderInTempCorruptHook(t))
+
+	cfg := &config{
+		inputPath:  canonicalIn,
+		outputPath: out,
+		adapters:   backup.AdapterSet{SQS: true},
+		selfTest:   true,
+	}
+	mismatchPath := out + ".mismatch.txt"
+
+	_, publishErr := writeAndPublish(cfg, encodeOpts, mismatchPath, quietLogger())
+	if !errors.Is(publishErr, errSelfTestMismatch) {
+		t.Fatalf("publishErr = %v, want errSelfTestMismatch", publishErr)
+	}
+	// --output (the symlink) must now resolve to ENOENT.
+	if _, statErr := os.Lstat(out); !os.IsNotExist(statErr) {
+		t.Errorf("symlink at --output not removed after mismatch (codex P2 v19 regression)")
+	}
+	// The target file (which the symlink pointed to) must survive.
+	gotTarget, rerr := os.ReadFile(target)
+	if rerr != nil {
+		t.Fatalf("target file vanished (os.Remove operated on resolved target instead of symlink): %v", rerr)
+	}
+	if string(gotTarget) != targetBody {
+		t.Errorf("target body mutated; want preserved")
+	}
+}
+
 // TestCLIWriteAndPublishRemovesStaleFSMOnSelfTestMismatch pins codex
 // P2 v10 #904: when a prior successful run left an <output>.fsm on
 // disk and a new --self-test invocation produces a mismatch,
@@ -514,7 +603,7 @@ func TestCLIWriteAndPublishRemovesStaleFSMOnSelfTestMismatch(t *testing.T) {
 	rawIn := t.TempDir()
 	writeSQSFixture(t, rawIn)
 	emitMinimalManifest(t, rawIn, 7000)
-	canonicalIn := canonicalizeInput(t, rawIn, 7000)
+	canonicalIn := canonicalizeInput(t, rawIn)
 
 	out := filepath.Join(t.TempDir(), "out.fsm")
 	// Pre-place a stale .fsm — what a prior successful run would have
@@ -539,27 +628,7 @@ func TestCLIWriteAndPublishRemovesStaleFSMOnSelfTestMismatch(t *testing.T) {
 	}
 	// Flip bytes past the EKVPBBL1 header so the re-decode trips on
 	// a malformed entry length and the self-test returns matched=false.
-	// Pattern mirrors flipBytesPastHeaderHelper in the library test.
-	encodeOpts.SetSelfTestCorruptHookForTest(func(f *os.File) {
-		info, ferr := f.Stat()
-		if ferr != nil {
-			t.Fatalf("temp Stat: %v", ferr)
-		}
-		const headerSkip = 200
-		if info.Size() <= headerSkip {
-			t.Fatalf("temp file too small to corrupt past header: %d bytes", info.Size())
-		}
-		buf := make([]byte, info.Size()-headerSkip)
-		if _, rerr := f.ReadAt(buf, headerSkip); rerr != nil {
-			t.Fatalf("ReadAt: %v", rerr)
-		}
-		for i := 0; i < len(buf); i += 13 {
-			buf[i] ^= 0xFF
-		}
-		if _, werr := f.WriteAt(buf, headerSkip); werr != nil {
-			t.Fatalf("WriteAt: %v", werr)
-		}
-	})
+	encodeOpts.SetSelfTestCorruptHookForTest(flipBytesPastHeaderInTempCorruptHook(t))
 
 	cfg := &config{
 		inputPath:  canonicalIn,
@@ -628,7 +697,7 @@ func TestCLIRoundTripSelfTestAllAdapters(t *testing.T) {
 	rawIn := t.TempDir()
 	writeSQSFixture(t, rawIn)
 	emitMinimalManifest(t, rawIn, 7000)
-	canonicalIn := canonicalizeInput(t, rawIn, 7000)
+	canonicalIn := canonicalizeInput(t, rawIn)
 
 	out := filepath.Join(t.TempDir(), "out.fsm")
 	code, err := run([]string{

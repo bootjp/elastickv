@@ -331,12 +331,22 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 	return encodeOpts
 }
 
-// removeStaleOutputFSM removes outputPath ONLY if it exists and is a
-// regular file. A directory or special-file at the path is left alone
-// (codex P2 v14 #904 — the prior unconditional os.Remove would have
-// deleted an empty directory the operator passed in error to --output).
-// Errors other than ErrNotExist are downgraded to warn-and-continue so
-// the caller's primary mismatch error remains the dominant signal.
+// removeStaleOutputFSM removes outputPath ONLY when it exists as a
+// regular file or a symlink. Both shapes satisfy the "no
+// restore-visible FSM after self-test mismatch" contract: removing a
+// regular file empties --output; removing a symlink unlinks the
+// name (the target is preserved as a side effect — os.Remove on a
+// symlink operates on the link, not the resolved target). A directory,
+// device, FIFO, or socket at --output is left alone — those shapes
+// were never valid restore targets, and os.Remove on a non-empty
+// directory or device would be destructive in ways the mismatch
+// contract does not require (codex P2 v14 #904 caught the directory
+// case; codex P2 v19 #904 caught the symlink case where the prior
+// IsRegular()-only check silently left the symlink resolving to the
+// stale snapshot).
+//
+// Errors other than ErrNotExist are downgraded to warn-and-continue
+// so the caller's primary mismatch error remains the dominant signal.
 func removeStaleOutputFSM(outputPath string, logger *slog.Logger) {
 	info, err := os.Lstat(outputPath)
 	if err != nil {
@@ -345,9 +355,11 @@ func removeStaleOutputFSM(outputPath string, logger *slog.Logger) {
 		}
 		return
 	}
-	if !info.Mode().IsRegular() {
-		logger.Warn("skip stale .fsm cleanup: --output is not a regular file",
-			"path", outputPath, "mode", info.Mode())
+	mode := info.Mode()
+	isSymlink := mode&os.ModeSymlink != 0
+	if !mode.IsRegular() && !isSymlink {
+		logger.Warn("skip stale .fsm cleanup: --output is not a regular file or symlink",
+			"path", outputPath, "mode", mode)
 		return
 	}
 	if rerr := os.Remove(outputPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
