@@ -19,7 +19,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -46,10 +45,12 @@ const (
 	testEngineMaxSizePerMsg = 1 << 20
 	testEngineMaxInflight   = 256
 
-	// leaderChurnRetryTimeout bounds how long doEventually keeps retrying a
-	// write that fails with a transient leader-unavailable error. It covers
-	// both startup churn right after createNode returns and mid-test churn
-	// when the leader briefly steps down under CI load.
+	// leaderChurnRetryTimeout bounds how long retryNotLeader keeps
+	// retrying a write that fails with a transient leader-unavailable
+	// error. Used by tests that issue writes inside long mid-test
+	// loops where leadership can briefly step down under CI load.
+	// Startup churn (createNode → first write) is closed at the
+	// readiness layer by waitForWriteableLeader (PR #898), not here.
 	leaderChurnRetryTimeout = 5 * time.Second
 	// leaderChurnRetryInterval is the poll interval between retries.
 	leaderChurnRetryInterval = 50 * time.Millisecond
@@ -750,23 +751,17 @@ func eventuallyExpired(t *testing.T, ttl time.Duration, condition func() bool, m
 	require.Eventually(t, condition, ttlExpiryHeadroom, ttlExpiryPoll, msg)
 }
 
-// doEventually retries do() while it returns a transient "not leader" error,
-// giving the cluster a few seconds to re-settle leadership after startup.
-// Non-"not leader" errors fail the test immediately.
-//
-// MUST be called from the main test goroutine only. The final require.NoError
-// calls t.FailNow() on failure; invoking FailNow from a worker goroutine is
-// a testing.T contract violation. For parallel-worker use, call
-// retryNotLeader directly and report errors back via a channel.
-func doEventually(t *testing.T, do func() error) {
-	t.Helper()
-	require.NoError(t, retryNotLeader(context.Background(), do))
-}
-
 // retryNotLeader calls do() repeatedly while it returns a transient
 // leader-unavailable error, capped at leaderChurnRetryTimeout. It returns
 // the final error (or nil on success) without touching testing.T, making
 // it safe to call from worker goroutines in parallel tests.
+//
+// Use cases: mid-test leader churn under CI load (e.g. grpc_test.go's
+// 9999-iteration consistency loops). The startup window — leader-churn
+// between createNode returning and the first write — is closed at the
+// readiness layer instead (waitForWriteableLeader, PR #898), so first-
+// write callers should NOT wrap in retryNotLeader; direct calls suffice
+// and are clearer.
 func retryNotLeader(ctx context.Context, do func() error) error {
 	deadline := time.Now().Add(leaderChurnRetryTimeout)
 	var lastErr error
@@ -784,22 +779,4 @@ func retryNotLeader(ctx context.Context, do func() error) error {
 		case <-time.After(leaderChurnRetryInterval):
 		}
 	}
-}
-
-// rpushEventually wraps RPUSH in doEventually so transient leader churn
-// immediately after createNode doesn't fail the test.
-func rpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key string, vals ...any) {
-	t.Helper()
-	doEventually(t, func() error {
-		return rdb.RPush(ctx, key, vals...).Err()
-	})
-}
-
-// lpushEventually wraps LPUSH in doEventually so transient leader churn
-// immediately after createNode doesn't fail the test.
-func lpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key string, vals ...any) {
-	t.Helper()
-	doEventually(t, func() error {
-		return rdb.LPush(ctx, key, vals...).Err()
-	})
 }
