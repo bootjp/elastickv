@@ -167,12 +167,57 @@ of this doc used the raw table name, which would sort after
 every base64-encoded segment and leave all workload tables on
 one side of the split.
 
-Concretely, the M5 split key construction is:
+There are TWO distinct split keys to construct.  Getting them
+right is the difference between an honest non-regression
+check and a silent no-op:
+
+**(a) Setup-time boundary key (one-shot, in
+`scripts/run-jepsen-local.sh`).** This is the key that
+partitions the table-route keyspace between groups at cluster
+launch via `--shardRanges`.  It IS a route boundary by
+design — group 1 covers `[… , bk)`, group 2 covers
+`[bk, …)`.  Constructed as:
 
 ```clojure
 (str "!ddb|route|table|"
      (encode-dynamo-segment "jepsen_append_t2"))  ; base64 RawURLEncoding
 ```
+
+**(b) Per-shuffle interior key (every nemesis `:start` invocation).**
+After the setup-time boundary lands, the table-route key
+`!ddb|route|table|<encode("jepsen_append_t2")>` is now the
+**`Start`** of the right child route.  `validateSplitKey`
+in `adapter/distribution_server.go:357-372` rejects
+`splitKey == parent.Start` or `splitKey == parent.End` with
+"split key at route boundary" — so reusing the setup-time key
+would fail every nemesis tick after the first (codex P2 #2 on
+3ca2a7f7).  In a 5-minute run expecting ≥10 shuffles, the
+nemesis would no-op silently and the workload would never
+exercise the catalog-version churn M3+M4 must absorb.
+
+The nemesis MUST derive a fresh interior key per `:start`
+that lies strictly between the current route's `Start` and
+`End`.  Strategy:
+
+```clojure
+(defn fresh-interior-split-key
+  "Returns a key strictly inside [route.start, route.end).
+   The base64 RawURL alphabet (A-Z, a-z, 0-9, -, _) admits
+   simple suffix appending: any byte from that alphabet
+   appended to route.start sorts after route.start but
+   before any byte that is not in the alphabet (such as ASCII
+   '|' = 124, which is greater than every base64 char)."
+  [route]
+  ;; Append a fresh alphabetic byte plus an incrementing
+  ;; counter; check the result is < route.end and retry with
+  ;; a different prefix byte on collision.
+  (str (:start route) "A" (System/nanoTime)))
+```
+
+Exact strategy details (counter persistence across nemesis
+restarts, collision recovery, etc.) are M5b implementation
+notes — the design contract is: each shuffle's split key is
+strictly interior to the route's current range.
 
 The Clojure side gets a small helper (`composed1-nemesis/encode-dynamo-segment`)
 that mirrors the Go `encodeDynamoSegment` exactly. The Go
@@ -243,7 +288,7 @@ startup.** Both halves are required.
 | Half | Mechanism |
 |---|---|
 | Multi-table workload | A NEW workload variant `dynamodb-append-multi-table-workload` creates N=4 tables (`jepsen_append_t1` … `jepsen_append_t4`) and writes to ≥2 distinct tables per `TransactWriteItems`.  The router maps each table to its own route key so cross-table txns engage multi-route routing. |
-| Multi-group cluster | M5a extends `scripts/run-jepsen-local.sh` to launch a multi-group cluster.  Per `shard_config.go:61-99` (claude[bot] P2 on 24812867), `--shardRanges` alone is not enough: without `--raftGroups`, every shard range's `groupID` collapses into the single default group 1 and `groupMutations` returns `gids = [1]` for every key — single-shard path, 2PC never fires.  M5a must therefore add **five** coordinated launch-script changes:<br><br>1. **`--raftGroups`** declaring ≥2 groups (e.g. `1=127.0.0.1:50051,2=127.0.0.1:50054`).<br>2. **`--shardRanges`** boundary keys placing `t1-t2` in group 1 and `t3-t4` in group 2.<br>3. **Cluster topology decision** — either 6 nodes (3-per-group, production-like consensus) or 2 single-node groups (`--raftBootstrap` per group, faster for CI).  Tentative pick: 2 single-node groups for M5a, scale to 6 nodes if/when the workload outgrows it (low cost — flip a flag).<br>4. **Per-group `--raftBootstrapMembers`** (different members sets for each group's nodes).<br>5. **Expanded `--raftDynamoMap`** covering both groups' leader addresses, plus the matching port allocations (currently `5005{1,2,3}`/`6380{1,2,3}` for the single-group 3-node layout — need `5005{1,4}`/`6380{1,4}` for the 2-single-node layout, or `5005{1..6}`/`6380{1..6}` for 6-node). |
+| Multi-group cluster | M5a extends `scripts/run-jepsen-local.sh` to launch a multi-group cluster.  Per `shard_config.go:61-99` (claude[bot] P2 on 24812867), `--shardRanges` alone is not enough: without `--raftGroups`, every shard range's `groupID` collapses into the single default group 1 and `groupMutations` returns `gids = [1]` for every key — single-shard path, 2PC never fires.  M5a must therefore add **five** coordinated launch-script changes:<br><br>1. **`--raftGroups`** declaring ≥2 groups (e.g. `1=127.0.0.1:50051,2=127.0.0.1:50054`).<br>2. **`--shardRanges`** boundary keys placing `t1-t2` in group 1 and `t3-t4` in group 2.<br>3. **Cluster topology decision** — either 6 nodes (3-per-group, production-like consensus) or 2 single-node groups (`--raftBootstrap` per group, faster for CI).  Tentative pick: 2 single-node groups for M5a, scale to 6 nodes if/when the workload outgrows it (low cost — flip a flag).<br>4. **Per-node `--raftBootstrap` (boolean) — NOT `--raftBootstrapMembers`.**  `main.go:735-741` has a hard guard: `resolveBootstrapServers` returns `ErrBootstrapMembersRequireSingleGroup` whenever `--raftBootstrapMembers` is set and `--raftGroups` parses to more than one group (codex P2 + claude[bot] P2 on 3ca2a7f7).  For the tentative 2-single-node-groups topology, each process hosts ONE group with ONE member — single-member groups need no peer discovery, so `--raftBootstrap` is both necessary and sufficient.  The existing `--raftBootstrapMembers` in `run-jepsen-local.sh` must be **removed** for multi-group processes; it is only valid for single-group, multi-node formations.<br>5. **Expanded `--raftDynamoMap`** covering both groups' leader addresses, plus the matching port allocations (currently `5005{1,2,3}`/`6380{1,2,3}` for the single-group 3-node layout — need `5005{1,4}`/`6380{1,4}` for the 2-single-node layout, or `5005{1..6}`/`6380{1..6}` for 6-node). |
 
 `encodeDynamoSegment("jepsen_append_t1")` etc. are computed at
 script setup time and inlined into the `--shardRanges`
