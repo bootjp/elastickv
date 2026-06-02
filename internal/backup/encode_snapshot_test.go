@@ -366,6 +366,117 @@ func TestEncodeSnapshotManifestFloorOptOut(t *testing.T) {
 	}
 }
 
+// TestEncodeSnapshotRejectsUnsupportedFeatures pins codex P2 v21 #904:
+// three manifest-derived flags that the per-adapter encoders cannot
+// honor today must fail-closed before any bytes are written. Each
+// guard fires only when the corresponding adapter is enabled —
+// orthogonal callers (e.g., S3IncludeIncompleteUploads=true while
+// encoding only Redis) are unaffected. Pattern matches the
+// DynamoDBBundleJSONL guard from v8.
+func TestEncodeSnapshotRejectsUnsupportedFeatures(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		opts    EncodeOptions
+		wantErr error
+	}{
+		{
+			name: "S3 include_incomplete_uploads",
+			opts: EncodeOptions{
+				Adapters:                   AdapterSet{S3: true},
+				S3IncludeIncompleteUploads: true,
+			},
+			wantErr: ErrEncodeUnsupportedS3IncompleteUploads,
+		},
+		{
+			name: "S3 include_orphans",
+			opts: EncodeOptions{
+				Adapters:         AdapterSet{S3: true},
+				S3IncludeOrphans: true,
+			},
+			wantErr: ErrEncodeUnsupportedS3Orphans,
+		},
+		{
+			name: "SQS preserve_visibility",
+			opts: EncodeOptions{
+				Adapters:              AdapterSet{SQS: true},
+				PreserveSQSVisibility: true,
+			},
+			wantErr: ErrEncodeUnsupportedSQSPreserveVisibility,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			opts := tc.opts
+			opts.InputRoot = in
+			opts.LastCommitTS = 1
+			opts.AllowMissingManifest = true
+			var buf bytes.Buffer
+			_, err := EncodeSnapshot(opts, &buf)
+			if err == nil {
+				t.Fatalf("EncodeSnapshot accepted unsupported feature; want %v", tc.wantErr)
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("err = %v, want errors.Is %v", err, tc.wantErr)
+			}
+			if buf.Len() != 0 {
+				t.Errorf("buf.Len = %d, want 0 (no bytes should be written on rejection)", buf.Len())
+			}
+		})
+	}
+}
+
+// TestEncodeSnapshotUnsupportedFeaturesGatedByAdapter pins that each
+// of the three v21 guards fires ONLY when its corresponding adapter
+// is enabled. A library caller that inherits the manifest flag but
+// disables the affected adapter is unaffected — mirrors the JSONL
+// guard's "DDB not in scope" exemption.
+func TestEncodeSnapshotUnsupportedFeaturesGatedByAdapter(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		opts EncodeOptions
+	}{
+		{
+			name: "S3IncludeIncompleteUploads with S3 disabled",
+			opts: EncodeOptions{
+				Adapters:                   AdapterSet{SQS: true}, // not S3
+				S3IncludeIncompleteUploads: true,
+			},
+		},
+		{
+			name: "S3IncludeOrphans with S3 disabled",
+			opts: EncodeOptions{
+				Adapters:         AdapterSet{SQS: true}, // not S3
+				S3IncludeOrphans: true,
+			},
+		},
+		{
+			name: "PreserveSQSVisibility with SQS disabled",
+			opts: EncodeOptions{
+				Adapters:              AdapterSet{Redis: true}, // not SQS
+				PreserveSQSVisibility: true,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			opts := tc.opts
+			opts.InputRoot = in
+			opts.LastCommitTS = 1
+			opts.AllowMissingManifest = true
+			var buf bytes.Buffer
+			if _, err := EncodeSnapshot(opts, &buf); err != nil {
+				t.Errorf("EncodeSnapshot rejected unsupported flag when its adapter was out of scope: %v", err)
+			}
+		})
+	}
+}
+
 // TestEncodeSnapshotRejectsDynamoDBJSONLLayout pins codex P2 v7 #904:
 // the DynamoDB reverse encoder does not support the JSONL bundle
 // layout, so a caller that threads DynamoDBBundleJSONL=true must be

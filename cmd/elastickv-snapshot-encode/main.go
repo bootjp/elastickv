@@ -107,6 +107,9 @@ func classifyEncodeError(err error) int {
 	switch {
 	case errors.Is(err, backup.ErrSelfTestLowerLastCommitTS),
 		errors.Is(err, backup.ErrEncodeUnsupportedDynamoDBLayout),
+		errors.Is(err, backup.ErrEncodeUnsupportedS3IncompleteUploads),
+		errors.Is(err, backup.ErrEncodeUnsupportedS3Orphans),
+		errors.Is(err, backup.ErrEncodeUnsupportedSQSPreserveVisibility),
 		errors.Is(err, backup.ErrEncodeAdapterData),
 		errors.Is(err, errSelfTestMismatch),
 		errors.Is(err, backup.ErrInvalidManifest),
@@ -324,6 +327,17 @@ func buildEncodeOptions(cfg *config, effectiveTS uint64, manifest backup.Manifes
 		ManifestLastCommitTS: manifest.LastCommitTS,
 		DynamoDBBundleJSONL:  manifest.DynamoDBLayout == backup.DynamoDBLayoutJSONL,
 		SelfTest:             cfg.selfTest,
+	}
+	// Thread manifest exclusions into the library guards (codex P2 v21
+	// #904): the S3/SQS reverse encoders can't honor these today, so
+	// failing closed here surfaces the unsupported-feature errors
+	// before any bytes are written. The CLI's existing
+	// buildSelfTestDecodeOptions also threads the same fields into
+	// the scratch decode path so self-test sees a coherent picture.
+	if manifest.Exclusions != nil {
+		encodeOpts.S3IncludeIncompleteUploads = manifest.Exclusions.IncludeIncompleteUploads
+		encodeOpts.S3IncludeOrphans = manifest.Exclusions.IncludeOrphans
+		encodeOpts.PreserveSQSVisibility = manifest.Exclusions.PreserveSQSVisibility
 	}
 	if cfg.selfTest {
 		encodeOpts.SelfTestDecodeOptions = buildSelfTestDecodeOptions(cfg, manifest)

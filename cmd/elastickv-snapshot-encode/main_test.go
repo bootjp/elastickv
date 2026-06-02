@@ -118,6 +118,73 @@ func TestCLIAdapterDataErrorExitsTwo(t *testing.T) {
 	}
 }
 
+// TestCLIRejectsUnsupportedManifestExclusions pins codex P2 v21 #904
+// end-to-end: when MANIFEST.json sets one of the three exclusion
+// flags the encoder cannot honor (include_incomplete_uploads,
+// include_orphans, preserve_sqs_visibility) AND the corresponding
+// adapter is enabled, the CLI must exit 2 (data-correctness) before
+// any bytes are written. Mirrors the DynamoDB JSONL guard.
+func TestCLIRejectsUnsupportedManifestExclusions(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		mutate   func(*backup.Exclusions)
+		adapters string
+	}{
+		{
+			name:     "include_incomplete_uploads with --adapter=s3",
+			mutate:   func(e *backup.Exclusions) { e.IncludeIncompleteUploads = true },
+			adapters: "s3",
+		},
+		{
+			name:     "include_orphans with --adapter=s3",
+			mutate:   func(e *backup.Exclusions) { e.IncludeOrphans = true },
+			adapters: "s3",
+		},
+		{
+			name:     "preserve_sqs_visibility with --adapter=sqs",
+			mutate:   func(e *backup.Exclusions) { e.PreserveSQSVisibility = true },
+			adapters: "sqs",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			m := backup.NewPhase0SnapshotManifest(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+			m.LastCommitTS = 100
+			m.Adapters = &backup.Adapters{}
+			m.Exclusions = &backup.Exclusions{}
+			tc.mutate(m.Exclusions)
+			f, ferr := os.Create(filepath.Join(in, "MANIFEST.json"))
+			if ferr != nil {
+				t.Fatalf("create MANIFEST.json: %v", ferr)
+			}
+			if werr := backup.WriteManifest(f, m); werr != nil {
+				t.Fatalf("WriteManifest: %v", werr)
+			}
+			if cerr := f.Close(); cerr != nil {
+				t.Fatalf("close: %v", cerr)
+			}
+			out := filepath.Join(t.TempDir(), "out.fsm")
+			code, err := run([]string{
+				"--input", in,
+				"--output", out,
+				"--adapter", tc.adapters,
+			}, quietLogger())
+			if err == nil {
+				t.Fatalf("run succeeded; want exit-2 from unsupported manifest exclusion")
+			}
+			if code != exitDataErr {
+				t.Errorf("exit code = %d, want %d (data-correctness for unsupported exclusion)", code, exitDataErr)
+			}
+			if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+				t.Errorf(".fsm exists at %s; should not be published on unsupported-feature rejection", out)
+			}
+		})
+	}
+}
+
 // TestCLIRejectsLowerLastCommitTSOverride is the fail-closed pin per
 // parent §"MVCC re-encoding": T < manifest.last_commit_ts → exit 2
 // (data-correctness failure, not flag-parse error).

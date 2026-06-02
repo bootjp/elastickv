@@ -41,6 +41,35 @@ var ErrSelfTestLowerLastCommitTS = errors.New("backup: --last-commit-ts T < mani
 // until the encoder learns the JSONL layout (M7 / future milestone).
 var ErrEncodeUnsupportedDynamoDBLayout = errors.New("backup: DynamoDB JSONL layout not supported by encoder")
 
+// ErrEncodeUnsupportedS3IncompleteUploads is returned when a caller
+// (the CLI threading manifest.exclusions.include_incomplete_uploads,
+// or a library caller setting EncodeOptions.S3IncludeIncompleteUploads)
+// asks for S3 in-flight multipart uploads to round-trip, but the
+// reverse encoder cannot rebuild that subtree. The S3 reverse encoder
+// silently skips `_incomplete_uploads/` payload directories
+// (internal/backup/encode_s3_objects.go), so a dump that included
+// those records would publish an .fsm missing them. Fail closed until
+// the encoder learns the subtree (codex P2 v21 #904).
+var ErrEncodeUnsupportedS3IncompleteUploads = errors.New("backup: S3 include_incomplete_uploads not supported by encoder")
+
+// ErrEncodeUnsupportedS3Orphans is returned when the manifest (or a
+// library caller) requests round-tripping S3 pre-generation orphan
+// blob chunks but the reverse encoder cannot rebuild that subtree.
+// Same pattern as ErrEncodeUnsupportedS3IncompleteUploads — the S3
+// reverse encoder silently skips `_orphans/` payload directories;
+// fail closed until the encoder learns them (codex P2 v21 #904).
+var ErrEncodeUnsupportedS3Orphans = errors.New("backup: S3 include_orphans not supported by encoder")
+
+// ErrEncodeUnsupportedSQSPreserveVisibility is returned when the
+// manifest requests preserving in-flight SQS message visibility state
+// (`preserve_sqs_visibility=true`), but the reverse encoder
+// unconditionally resets VisibleAtMillis / receive count / first
+// receive / receipt token to zero on every restored message
+// (internal/backup/encode_sqs.go). A dump that intentionally
+// preserved visibility would silently restore as "every message
+// visible/reset" without this guard (codex P2 v21 #904).
+var ErrEncodeUnsupportedSQSPreserveVisibility = errors.New("backup: preserve_sqs_visibility not supported by encoder")
+
 // ErrRedisEncodeMultiDBUnsupported is returned when the input tree
 // contains a Redis db_<N>/ for any N != 0, or contains multiple
 // db_<N> directories. The current Redis MVCC key prefixes
@@ -106,6 +135,31 @@ type EncodeOptions struct {
 	// when true (codex P2 v7 #904). When the encoder gains JSONL
 	// support, this field will switch from a guard to a control.
 	DynamoDBBundleJSONL bool
+
+	// S3IncludeIncompleteUploads is true when the input dump's
+	// MANIFEST.json has `exclusions.include_incomplete_uploads=true`
+	// (the producer dumped in-flight multipart uploads under
+	// _incomplete_uploads/). The reverse encoder cannot rebuild that
+	// subtree today; fail-closed via ErrEncodeUnsupportedS3IncompleteUploads
+	// when true AND Adapters.S3 is enabled (codex P2 v21 #904).
+	S3IncludeIncompleteUploads bool
+
+	// S3IncludeOrphans is true when the input dump's MANIFEST.json
+	// has `exclusions.include_orphans=true` (the producer dumped
+	// pre-generation orphan blob chunks under _orphans/). The reverse
+	// encoder cannot rebuild that subtree today; fail-closed via
+	// ErrEncodeUnsupportedS3Orphans when true AND Adapters.S3 is
+	// enabled (codex P2 v21 #904).
+	S3IncludeOrphans bool
+
+	// PreserveSQSVisibility is true when the input dump's MANIFEST.json
+	// has `exclusions.preserve_sqs_visibility=true` (the producer
+	// preserved in-flight message visibility state — VisibleAtMillis,
+	// receive count, first receive, receipt token). The reverse
+	// encoder unconditionally zeros those fields on every restored
+	// message; fail-closed via ErrEncodeUnsupportedSQSPreserveVisibility
+	// when true AND Adapters.SQS is enabled (codex P2 v21 #904).
+	PreserveSQSVisibility bool
 
 	// ManifestLastCommitTS is the floor LastCommitTS must not fall
 	// below. When > 0, EncodeSnapshot fails-closed with
@@ -277,6 +331,34 @@ func validateEncodeOptionsData(opts EncodeOptions) error {
 		// The DynamoDB reverse encoder only walks per-item files;
 		// JSONL items would be silently skipped (codex P2 v7 #904).
 		return errors.WithStack(ErrEncodeUnsupportedDynamoDBLayout)
+	}
+	return validateEncodeOptionsUnsupportedFeatures(opts)
+}
+
+// validateEncodeOptionsUnsupportedFeatures rejects manifest-derived
+// flags that the per-adapter encoders cannot honor today. Each guard
+// fires only when the corresponding adapter is enabled — a caller
+// encoding only Redis + SQS with `include_incomplete_uploads=true`
+// inherited from the manifest is unaffected (no S3 → no concern).
+// Split out from validateEncodeOptionsData to stay under cyclop;
+// codex P2 v21 #904 added the three S3/SQS exclusion guards.
+func validateEncodeOptionsUnsupportedFeatures(opts EncodeOptions) error {
+	if opts.S3IncludeIncompleteUploads && opts.Adapters.S3 {
+		// The S3 reverse encoder skips _incomplete_uploads/ payload
+		// directories; a dump that included them would silently lose
+		// those records (codex P2 v21 #904 L326).
+		return errors.WithStack(ErrEncodeUnsupportedS3IncompleteUploads)
+	}
+	if opts.S3IncludeOrphans && opts.Adapters.S3 {
+		// The S3 reverse encoder skips _orphans/ payload directories;
+		// same silent-data-loss pattern (codex P2 v21 #904 L326).
+		return errors.WithStack(ErrEncodeUnsupportedS3Orphans)
+	}
+	if opts.PreserveSQSVisibility && opts.Adapters.SQS {
+		// The SQS reverse encoder unconditionally zeroes the
+		// visibility fields; a dump that preserved them would lose
+		// the state on restore (codex P2 v21 #904 L473).
+		return errors.WithStack(ErrEncodeUnsupportedSQSPreserveVisibility)
 	}
 	return nil
 }
