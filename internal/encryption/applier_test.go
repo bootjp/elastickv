@@ -2370,6 +2370,37 @@ func TestApplyRotation_EnableRaftEnvelope_RejectsProposerDEKMismatch(t *testing.
 	assertRaftCutoverNotApplied(t, sidecarPath)
 }
 
+// TestApplyRotation_EnableRaftEnvelope_RejectsZeroRaftIndex pins a
+// fail-closed pre-check: `RaftEnvelopeCutoverIndex != 0` is the
+// sole "Phase-2 active" sentinel for the raft variant (unlike the
+// storage variant which carries a separate `StorageEnvelopeActive`
+// bool). If the apply path ever receives raftIdx == 0 — a sentinel
+// elsewhere meaning "no index supplied" — the fresh-success branch
+// would persist the proposer-registration row, leave
+// `RaftEnvelopeCutoverIndex` at 0 (logically inactive), and return
+// nil, while replays would re-enter the fresh-success branch since
+// the already-active short-circuit only fires on `!= 0`. Reject
+// raftIdx == 0 before any sidecar mutation so the apply halts.
+func TestApplyRotation_EnableRaftEnvelope_RejectsZeroRaftIndex(t *testing.T) {
+	t.Parallel()
+	dir, sidecarPath := bootstrappedDir(t)
+	app := newCutoverApplier(t, dir, sidecarPath)
+	err := app.ApplyRotation(0, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	})
+	if err == nil {
+		t.Fatal("expected halt on raftIdx == 0, got nil")
+	}
+	if !errors.Is(err, encryption.ErrEncryptionApply) {
+		t.Errorf("err not marked ErrEncryptionApply: %v", err)
+	}
+	assertRaftCutoverNotApplied(t, sidecarPath)
+}
+
 // TestApplyRotation_EnableRaftEnvelope_StaleDEKID_BenignNoOp pins
 // constraint #3 from the design: a RotateDEK race between propose
 // and apply that advances sidecar.Active.Raft past payload DEKID

@@ -1125,6 +1125,19 @@ func validateEnableRaftEnvelopePayload(p fsmwire.RotationPayload) error {
 // unwrapped, so the apply is operator-inert (matches the design
 // doc's "no behavior change" guarantee for 6E-1).
 func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayload) error {
+	// Fail-closed: RaftEnvelopeCutoverIndex != 0 is the sole
+	// "Phase-2 active" sentinel for the raft variant (storage
+	// variant uses a separate bool). A raftIdx of 0 — the "no
+	// index supplied" sentinel from the index-aware apply seam —
+	// would let the fresh-success branch register the proposer
+	// while leaving RaftEnvelopeCutoverIndex at 0, so the cutover
+	// would silently fail to activate AND a replay would re-enter
+	// the fresh-success branch (the already-active short-circuit
+	// only triggers on != 0). Reject before any sidecar mutation.
+	if raftIdx == 0 {
+		return errors.Wrap(ErrEncryptionApply,
+			"applier: enable-raft-envelope requires a non-zero raft index")
+	}
 	if err := validateEnableRaftEnvelopePayload(p); err != nil {
 		return err
 	}
