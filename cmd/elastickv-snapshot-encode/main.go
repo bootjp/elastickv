@@ -437,7 +437,39 @@ func writeAndPublish(cfg *config, encodeOpts backup.EncodeOptions, mismatchPath 
 		return result, errors.Wrap(err, "rename tmp -> output")
 	}
 	publishedTempPath = "" // rename succeeded; defer no-ops
+	// fsync the parent dir so the rename's new directory entry is
+	// durable. Without this, a power loss / host crash immediately
+	// after a successful encode can lose the new <output> entry (or
+	// resurrect the old one) on filesystems where rename durability
+	// requires syncing the containing directory. Mirrors the repo
+	// pattern used by internal/encryption/sidecar.go +
+	// internal/raftengine/etcd/persistence.go (codex P2 v24 #904).
+	if err := fsyncParentDir(cfg.outputPath); err != nil {
+		return result, errors.Wrap(err, "fsync output dir after rename")
+	}
 	return result, nil
+}
+
+// fsyncParentDir opens the parent directory of path read-only and
+// calls fsync on its file descriptor. On most POSIX filesystems this
+// is what makes os.Rename durable. Errors other than path-traversal
+// (which means the operator passed something weird like "" — already
+// rejected upstream) bubble up so the caller can surface them.
+//
+// Mirrors syncDir in internal/encryption/sidecar.go and the etcd
+// raftengine persistence helper; kept local here so the CLI binary
+// doesn't depend on internal/encryption for a 6-line helper.
+func fsyncParentDir(path string) error {
+	dir := filepath.Dir(path)
+	f, err := os.Open(dir) //nolint:gosec // dir is derived from operator-supplied --output path
+	if err != nil {
+		return errors.Wrapf(err, "open parent dir %q", dir)
+	}
+	defer func() { _ = f.Close() }()
+	if err := f.Sync(); err != nil {
+		return errors.Wrapf(err, "fsync parent dir %q", dir)
+	}
+	return nil
 }
 
 // encodeToTempFile creates tempPath, runs EncodeSnapshot into it,
@@ -546,6 +578,12 @@ func writeSidecar(cfg *config, m backup.Manifest, effectiveTS uint64, overridden
 	}
 	if err := f.Close(); err != nil {
 		return errors.WithStack(err)
+	}
+	// fsync the parent dir so the new sidecar's directory entry is
+	// durable alongside its bytes. Mirrors the rename path
+	// (codex P2 v24 #904).
+	if err := fsyncParentDir(sidecarPath); err != nil {
+		return errors.Wrap(err, "fsync sidecar parent dir")
 	}
 	return nil
 }
