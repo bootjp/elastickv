@@ -90,7 +90,7 @@ func (e *S3RecordEncoder) Encode(b *snapshotBuilder) error {
 			// A regular file or symlink here means the dump is
 			// malformed or partially truncated — silently skipping
 			// would let the encoder publish a partial .fsm with
-			// the affected bucket omitted (codex P2 v32 #904; the
+			// the affected bucket omitted (codex P2 v31 #904; the
 			// manifest's empty S3 scope from populateAdapterScopes
 			// cannot otherwise distinguish missing bucket from
 			// dumped-empty bucket).
