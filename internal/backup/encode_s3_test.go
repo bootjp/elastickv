@@ -137,6 +137,54 @@ func TestS3EncodeMissingDirIsNoop(t *testing.T) {
 	}
 }
 
+// TestS3EncodeRejectsNonDirectoryBucketEntry pins codex P2 v32 #904:
+// when an entry directly under s3/ is a regular file or symlink
+// rather than a bucket directory, the encoder must fail closed with
+// ErrS3EncodeNotRegular rather than silently skipping (which would
+// publish a partial .fsm with the affected bucket omitted; the
+// manifest's deferred-enumeration empty S3 scope cannot otherwise
+// flag the missing data). Reserved-prefix `_*` entries (e.g.
+// `_incomplete_uploads`) are explicitly tolerated because they're
+// handled by dedicated paths.
+func TestS3EncodeRejectsNonDirectoryBucketEntry(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(in, "s3"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Plant a regular file where a bucket directory should be.
+	if err := os.WriteFile(filepath.Join(in, "s3", "stray.txt"), []byte("oops"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	b := newSnapshotBuilder(s3EncTS)
+	err := NewS3RecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrS3EncodeNotRegular) {
+		t.Fatalf("Encode err = %v, want errors.Is ErrS3EncodeNotRegular", err)
+	}
+}
+
+// TestS3EncodeIgnoresReservedPrefixEntry pins that codex P2 v32's
+// fail-closed for non-directory top-level entries does NOT fire on
+// reserved-prefix entries (those starting with "_"). The reverse
+// encoder's unsupported-features guard handles those subtrees
+// separately via ErrEncodeUnsupportedS3IncompleteUploads /
+// ErrEncodeUnsupportedS3Orphans.
+func TestS3EncodeIgnoresReservedPrefixEntry(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(in, "s3"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Reserved-prefix file (e.g., a marker the operator left).
+	if err := os.WriteFile(filepath.Join(in, "s3", "_marker"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	b := newSnapshotBuilder(s3EncTS)
+	if err := NewS3RecordEncoder(in).Encode(b); err != nil {
+		t.Errorf("Encode err = %v, want nil (reserved-prefix entries should be skipped)", err)
+	}
+}
+
 // TestS3EncodeRejectsNonRegularBucketMeta pins the pre-open guard: a
 // _bucket.json that is a directory is refused with ErrS3EncodeNotRegular.
 func TestS3EncodeRejectsNonRegularBucketMeta(t *testing.T) {

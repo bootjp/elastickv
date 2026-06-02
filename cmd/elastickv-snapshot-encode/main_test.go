@@ -1032,9 +1032,25 @@ func TestCLISidecarWriteRefusesSymlinkTarget(t *testing.T) {
 	if code != exitUserErr {
 		t.Errorf("exit code = %d, want %d (operator-env error, not data-correctness)", code, exitUserErr)
 	}
-	// Victim file MUST be untouched (the no-follow open refused to
-	// resolve the symlink; the v32 rollback's os.Remove on
-	// sidecarPath operates on the symlink itself, not the target).
+	assertSymlinkSidecarRollbackInvariants(t, victim, victimBody, out, sidecarPath)
+}
+
+// assertSymlinkSidecarRollbackInvariants checks all three post-
+// failure invariants for TestCLISidecarWriteRefusesSymlinkTarget:
+//
+//	(1) the symlink target file is unchanged (no-follow open never
+//	    resolved the link),
+//	(2) the .fsm at --output is removed (v32 rollback fired after
+//	    the .fsm was renamed into place but before encodeOne
+//	    returned), and
+//	(3) the operator-placed symlink at the sidecar path is
+//	    preserved (v33 rollback only removes regular files;
+//	    non-regular sidecar entries are operator-owned).
+//
+// Extracted into a helper to keep the test body under the cyclop
+// bound.
+func assertSymlinkSidecarRollbackInvariants(t *testing.T, victim string, victimBody, out, sidecarPath string) {
+	t.Helper()
 	got, rerr := os.ReadFile(victim)
 	if rerr != nil {
 		t.Fatalf("read victim: %v", rerr)
@@ -1042,12 +1058,16 @@ func TestCLISidecarWriteRefusesSymlinkTarget(t *testing.T) {
 	if string(got) != victimBody {
 		t.Errorf("victim mutated; OpenSidecarFile followed the symlink (codex P2 v25 regression)")
 	}
-	// .fsm at outputPath MUST be removed by v32's rollback. The
-	// sidecar-write failure happened AFTER writeAndPublish renamed
-	// the .fsm into place, so without the rollback we'd have an
-	// orphan .fsm visible to the restore path.
 	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
 		t.Errorf(".fsm at %s should be removed by v32 rollback after sidecar failure", out)
+	}
+	linkInfo, lerr := os.Lstat(sidecarPath)
+	if lerr != nil {
+		t.Errorf("operator-placed symlink at sidecar path was removed by rollback (codex P2 v32 regression): %v", lerr)
+		return
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("sidecar path mode = %s; expected symlink preserved by v33 rollback", linkInfo.Mode())
 	}
 }
 

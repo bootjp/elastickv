@@ -516,6 +516,29 @@ func rollbackOrphanFSMAndSidecar(outputPath string, logger *slog.Logger) {
 		logger.Warn("rollback orphan .fsm after sidecar failure", "err", rerr)
 	}
 	sidecarPath := backup.EncodeInfoSidecarPath(outputPath)
+	// Only remove a sidecar known to be a regular file — i.e., one
+	// this run (or a prior encoder) created. A pre-existing
+	// non-regular entry (operator-placed symlink, FIFO, directory,
+	// etc.) is what OpenSidecarFile correctly refuses to clobber
+	// when the rollback was triggered; os.Remove'ing the
+	// operator's filesystem object merely because the encode
+	// failed would be a destructive side effect (codex P2 v32
+	// #904). Symlinks the operator may have placed are also
+	// preserved here — OpenSidecarFile's O_NOFOLLOW failure means
+	// the symlink was never followed and no truncate happened, so
+	// the link is unchanged and is the operator's to manage.
+	info, err := os.Lstat(sidecarPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("stat sidecar for rollback", "err", err)
+		}
+		return
+	}
+	if !info.Mode().IsRegular() {
+		logger.Warn("skip sidecar rollback: --output sidecar path is not a regular file",
+			"path", sidecarPath, "mode", info.Mode())
+		return
+	}
 	if srerr := os.Remove(sidecarPath); srerr != nil && !errors.Is(srerr, os.ErrNotExist) {
 		logger.Warn("rollback partial sidecar after write failure", "err", srerr)
 	}
@@ -627,21 +650,41 @@ func writeAndPublish(cfg *config, encodeOpts backup.EncodeOptions, mismatchPath 
 		removeStaleOutputFSM(cfg.outputPath, logger)
 		return result, errors.Wrap(errSelfTestMismatch, "self-test diff (see "+mismatchPath+")")
 	}
-	if err := os.Rename(tempPath, cfg.outputPath); err != nil {
-		return result, errors.Wrap(err, "rename tmp -> output")
+	if perr := publishAndFsync(tempPath, cfg.outputPath, logger); perr != nil {
+		return result, perr
 	}
 	publishedTempPath = "" // rename succeeded; defer no-ops
+	return result, nil
+}
+
+// publishAndFsync renames tempPath → outputPath and then fsyncs the
+// parent directory. If the fsync fails, the just-renamed .fsm is
+// removed so the operator does not see a non-durable "successful"
+// .fsm (codex P2 v24 #904 added the fsync; codex P2 v32 #904 added
+// the rollback). Split out of writeAndPublish to keep that function
+// under the cyclop bound.
+func publishAndFsync(tempPath, outputPath string, logger *slog.Logger) error {
+	if err := os.Rename(tempPath, outputPath); err != nil {
+		return errors.Wrap(err, "rename tmp -> output")
+	}
 	// fsync the parent dir so the rename's new directory entry is
 	// durable. Without this, a power loss / host crash immediately
 	// after a successful encode can lose the new <output> entry (or
 	// resurrect the old one) on filesystems where rename durability
 	// requires syncing the containing directory. Mirrors the repo
 	// pattern used by internal/encryption/sidecar.go +
-	// internal/raftengine/etcd/persistence.go (codex P2 v24 #904).
-	if err := fsyncParentDir(cfg.outputPath); err != nil {
-		return result, errors.Wrap(err, "fsync output dir after rename")
+	// internal/raftengine/etcd/persistence.go.
+	if err := fsyncParentDir(outputPath); err != nil {
+		// Roll back so the operator doesn't see a non-durable
+		// "successful" .fsm; restoring the consistent absent state
+		// is the same outcome encodeOne enforces on sidecar-write
+		// failures (codex P2 v32 #904).
+		if rerr := os.Remove(outputPath); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			logger.Warn("rollback orphan .fsm after parent-dir fsync failure", "err", rerr)
+		}
+		return errors.Wrap(err, "fsync output dir after rename")
 	}
-	return result, nil
+	return nil
 }
 
 // fsyncParentDir opens the parent directory of path read-only and
