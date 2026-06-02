@@ -57,9 +57,12 @@ Parent design:
   `SplitRange` only, no such anomaly is reachable; the workload's
   job is to prove the gate is non-regressing today and to be
   ready for tomorrow.
-- **NG3.** New Jepsen workload primitives (new operation types,
-  new generators outside the route-shuffle nemesis). The
-  existing `dynamodb-append-workload` is the right surface.
+- **NG3.** New Jepsen workload primitives **beyond** the new
+  `dynamodb-append-multi-table-workload` variant (§3.3) and the
+  new `route-shuffle-nemesis` (§3.2).  No new operation types,
+  no new generators outside those two surfaces.  Pre-existing
+  `dynamodb-append-workload` stays as-is for trend comparison
+  with historical runs.
 - **NG4.** Changing the DynamoDB adapter or Composed-1 code on
   the server side. M5 is purely test-harness work.
 
@@ -151,26 +154,41 @@ The nemesis is composed with the existing
 via `jepsen.nemesis/compose`. The combined nemesis becomes the
 workload's `:nemesis`.
 
-**Split key picking strategy (gemini medium R1).** Pick a split
-key from inside the DynamoDB **table-route** key space
-(`!ddb|route|table|<tableSegment>` — see `kv/shard_key.go:94-124`).
-Concretely, with N tables `jepsen_append_t1` …
-`jepsen_append_tN` per §3.3, the route key for table `tK` is
-`!ddb|route|table|jepsen_append_tK`. Splits happen between
-adjacent table-route keys — e.g. between `…jepsen_append_t2`
-and `…jepsen_append_t3`. This guarantees:
+**Split key picking strategy (gemini medium R1 + codex P1 #1
+on f5d2ad7a).** Pick a split key from inside the DynamoDB
+**table-route** key space. The exact encoding matters: the
+route key is built by `dynamoRouteTableKey(encodeDynamoSegment(tableName))`
+(`adapter/dynamodb.go:8337-8365`, `kv/shard_key.go:117-124`).
+`encodeDynamoSegment` is base64 `RawURLEncoding` — for table
+`jepsen_append_t1` the real route key is
+`!ddb|route|table|am...` (base64 of the literal table name),
+**not** `!ddb|route|table|jepsen_append_t1`. A prior revision
+of this doc used the raw table name, which would sort after
+every base64-encoded segment and leave all workload tables on
+one side of the split.
 
-- The split key falls **inside** the active workload route
-  range (not lexicographically before or after, which would
-  leave all workload keys on one side of the split).
-- Each side of the split owns a distinct set of tables, so
-  cross-table `TransactWriteItems` actually exercises 2PC.
+Concretely, the M5 split key construction is:
 
-A prior revision of this doc proposed a `/split/<int>` prefix.
-That was lexicographically smaller than the workload's keyspace
-(`/` < `0` in ASCII), so every workload key ended up on the
-rightmost shard and the 2PC path was never exercised. Fixed
-above by anchoring split keys to the table-route prefix.
+```clojure
+(str "!ddb|route|table|"
+     (encode-dynamo-segment "jepsen_append_t2"))  ; base64 RawURLEncoding
+```
+
+The Clojure side gets a small helper (`composed1-nemesis/encode-dynamo-segment`)
+that mirrors the Go `encodeDynamoSegment` exactly. The
+Composed-1 doc and the encoding helper land together so any
+future change to the encoding surface is caught by an
+unambiguous reference point.
+
+A prior revision of this doc also wrongly explained the old
+`/split/<int>` proposal: it said `/` < workload keys, but the
+DynamoDB table-route prefix starts with `!` (ASCII 33) and
+`/` is ASCII 47, so `/split/<int>` is lexicographically
+**larger** than `!ddb|route|table|*` — workload keys would land
+on the **left** shard, not the rightmost (claude[bot] P2 on
+f5d2ad7a). The fix (anchoring to the table-route prefix)
+is correct in either direction; the explanation above is now
+also correct.
 
 **Route ID resolution (gemini medium R2).** The nemesis CANNOT
 rely on a single `ListRoutes` call + a local counter — every
@@ -186,59 +204,101 @@ drift (another split landing concurrently between
 `ErrCatalogVersionMismatch` from the server; the nemesis logs
 and refreshes on the next tick.
 
-### 3.3 Multi-shard workload guarantee (revised post-codex P1)
+### 3.3 Multi-shard workload guarantee (revised post-codex P1 #2)
 
-**Original §3.3 (Option A: single-key split in workload keyspace)
-was wrong.** `kv/shard_key.go:94-124` normalises every DynamoDB
-table-metadata, item, and GSI key to a single per-table route
-key (`!ddb|route|table|<tableSegment>`). So every
-`jepsen_append` item resolves to the SAME catalog point
-regardless of its partition-key value, and a `SplitRange`
-inside the item keyspace cannot put two items on different
-shards. The 2PC path (`dispatchMultiShardTxn`, secondary
-commits, the new `ErrTxnSecondaryRouteShiftedAfterPrimaryCommit`
-sentinel) would never fire — invalidating G2 (codex P1 on
-PR #905).
+**Original §3.3 (single-key item split) and revised §3.3
+(multi-table with setup-hook SplitRange) were both incomplete.**
 
-**Revised strategy: multi-table workload.** The M5 workload
-creates `N` tables (default `N = 4`): `jepsen_append_t1` …
-`jepsen_append_t4`. Each `TransactWriteItems` operation writes
-to **at least two** distinct tables. The router maps each
-table to its own table-route key, so a cross-table txn
-naturally fans out across whichever shards own those route
-keys. The setup hook splits the table-route keyspace at
-`!ddb|route|table|jepsen_append_t2` so tables 1 lives on one
-shard and tables 2–4 on another from t=0.
+Two facts about today's routing surface make the "split at
+setup" approach insufficient on its own:
+
+1. `kv/shard_key.go:94-124` normalises every DynamoDB
+   table-metadata, item, and GSI key to a single per-table
+   route key (`!ddb|route|table|<tableSegment>`).  So
+   single-table workloads have one route key and cannot
+   fan out across shards.
+2. `adapter/distribution_server.go`'s `SplitRange` only
+   creates child routes with the **parent's GroupID**.
+   `dispatchTxn` enters `dispatchMultiShardTxn` only when
+   mutations group to ≥2 distinct Raft **groups**, not just
+   ≥2 routes (codex P1 #2 on f5d2ad7a).  A `SplitRange`
+   inside the table-route keyspace produces two routes still
+   in the same group — single-shard transaction path,
+   2PC never fires.
+
+**Revised strategy: multi-table workload + multi-group cluster
+startup.** Both halves are required.
+
+| Half | Mechanism |
+|---|---|
+| Multi-table workload | A NEW workload variant `dynamodb-append-multi-table-workload` creates N=4 tables (`jepsen_append_t1` … `jepsen_append_t4`) and writes to ≥2 distinct tables per `TransactWriteItems`.  The router maps each table to its own route key so cross-table txns engage multi-route routing. |
+| Multi-group cluster | M5a extends `scripts/run-jepsen-local.sh` to pass `--shardRanges` so the cluster starts with at least 2 Raft groups, and the table-route keys for `t1…t4` are statically split between groups: e.g. `tables 1-2 → group 1, tables 3-4 → group 2`.  The DDB leader address per-group is wired via `--raftDynamoMap` (already supported by the runner — only the `--shardRanges` argument is new). |
+
+`encodeDynamoSegment("jepsen_append_t1")` etc. are computed at
+script setup time and inlined into the `--shardRanges`
+boundary keys.  An `m5_setup.sh` helper (or a Go binary, see
+OQ-7) emits the boundary keys deterministically.
+
+The Jepsen `db/setup!` hook does NOT issue any `SplitRange`.
+Instead it calls `ListRoutes` once (gated to the first node
+per `(when (= node (first (:nodes test))) …)`) and **verifies**
+that the expected multi-group routing is in place; if not, it
+fails fast with a clear error so the operator knows the
+launch script needs to be re-run with the right
+`--shardRanges`.  This avoids the gemini-medium R3 setup-hook
+concurrency hazard entirely (no mutation, just a read).  It
+also resolves the claude[bot] P3 follow-up about needing
+ListRoutes for route-ID resolution in setup — the hook now
+needs ListRoutes for **verification** rather than mutation.
 
 | Concern | Resolution |
 |---|---|
 | Workload shape change | Append ops still write a single value per row; the change is the table they write to (one per row, ≥2 rows per txn — picked from a per-txn random subset of `t1…tN`). |
 | Elle compatibility | The append checker keys on `(table, partition-key)` pairs already (the workload's history shape supports this); cross-table txns appear as multi-key ops, which Elle handles natively. |
-| Comparison with historical runs | Historical runs used a single table — the M5 workload is a NEW workload variant `dynamodb-append-multi-table-workload` rather than a modification of `dynamodb-append-workload`. Both ship; the existing one stays for trend comparison. |
+| Comparison with historical runs | The pre-existing `dynamodb-append-workload` (single table, single group) stays as-is for trend comparison.  The M5 workload is a new variant alongside it. |
 
-The setup hook (Jepsen `db/setup!`) is gated to run only on
-the FIRST node (`(when (= node (first (:nodes test))) …)`) so
-the initial split is not attempted concurrently by every
-cluster node and does not cause catalog-version conflicts
-during bootstrap (gemini medium R3).
+**Why the nemesis is still useful even though SplitRange is
+same-group only.**  The route-shuffle nemesis (§3.2) issues
+`SplitRange` calls that churn the catalog version + route IDs
+without moving ownership across groups.  This exercises the
+M3 ObservedRouteVersion drift detection and the M4 retry
+path under concurrent route-mutating control-plane traffic,
+which is the closest non-regression check the current routing
+surface allows.  When a future cross-group `MoveRange` or
+cross-group `SplitRange` lands, swapping that RPC into the
+nemesis turns the workload from a "no-regression under
+same-group churn" check into a "no G1c under cross-group
+movement" check — matching the parent doc's forward-looking
+posture.
 
 ### 3.4 Success criterion
 
 The workload's existing Elle checker emits a `:valid?` boolean
-and a list of detected cycles (`:G0`, `:G1a`, `:G1b`, `:G1c`,
-`:G-single`, etc.). M5's pass condition:
+and an `:anomalies` map keyed by anomaly type — `{:G0 […], :G1a
+[…], :G1c […], :G-single […], …}`.  M5's pass condition:
 
 ```
 (and (:valid? results)
-     (zero? (count (filter #(= (:type %) :G1c) (:anomalies results))))
-     (zero? (count (filter #(= (:type %) :G-single) (:anomalies results)))))
+     (nil? (get (:anomalies results) :G1c))
+     (nil? (get (:anomalies results) :G-single)))
 ```
+
+A prior revision of this doc used `(filter #(= (:type %) :G1c)
+…)` over `(:anomalies results)`, which is wrong: iterating a
+map yields `[key val]` vectors with no `:type` field, so the
+filter always returned an empty seq and the check would
+silently pass on any G1c run (claude[bot] P2 on f5d2ad7a).
+The corrected form above keys off the map directly.
 
 `G1c` is the parent doc's explicit safety violation; `G-single`
 is the closely-related single-item anomaly we already chase in
 the existing workload. Other anomaly types (G0, G1a, G1b)
 indicate orthogonal bugs and should also fail the run, but the
 parent doc's M5 row names G1c as the headline criterion.
+`(:valid? results)` is the canonical Elle pass/fail bit; the
+explicit G1c / G-single checks are belt-and-suspenders so a
+future Elle refactor that subdivides the cycle taxonomy still
+fails on the specific anomalies M5 cares about.
 
 ### 3.5 Cadence
 
@@ -263,7 +323,7 @@ mergeable on its own.
 
 | Phase | Title | Scope | Done when |
 |---|---|---|---|
-| M5a | CLI + multi-table workload | `cmd/elastickv-split` binary; new `dynamodb-append-multi-table-workload` that creates N tables and writes to ≥2 tables per `TransactWriteItems`; setup hook (gated to first node) issues the initial split between table-route keys. | `./scripts/run-jepsen-local.sh --workload dynamodb-append-multi-table` runs from t=0 with tables split across 2 shards; the workload exercises `dispatchMultiShardTxn` (verifiable via server-side log markers or a probe metric); Elle finds zero G1c. |
+| M5a | CLI + multi-table workload + multi-group launch | `cmd/elastickv-split` binary; new `dynamodb-append-multi-table-workload` that creates N tables and writes to ≥2 tables per `TransactWriteItems`; **`scripts/run-jepsen-local.sh` extended to pass `--shardRanges` so the cluster launches with ≥2 Raft groups** and table-route keys for `t1…tN` are statically split across groups; setup hook calls `ListRoutes` from the first node and verifies the multi-group routing is in place (read-only, no mutation). | `./scripts/run-jepsen-local.sh --workload dynamodb-append-multi-table` runs from t=0 with tables 1-2 owned by group 1 and tables 3-4 owned by group 2; the workload exercises `dispatchMultiShardTxn` (verifiable via server-side log markers or a probe metric); Elle finds zero G1c. |
 | M5b | Route-shuffle nemesis | `jepsen/src/elastickv/composed1_nemesis.clj`; compose into the multi-table workload's nemesis package; CLI flag `--composed1-route-shuffle` (default off, on under `run-jepsen-local.sh`). Nemesis re-queries `ListRoutes` before every split and picks split keys from inside the table-route keyspace. | A `./scripts/run-jepsen-local.sh --workload dynamodb-append-multi-table --composed1-route-shuffle` run produces zero G1c after ≥10 shuffles during a 5-minute run. |
 
 M5a is a small, focused PR (Go CLI + Clojure setup hook +
@@ -304,11 +364,21 @@ analysis.
   average. Defer to implementation; revisit if the workload
   becomes I/O-bound on table-meta lookups.
 - **OQ-6** (new, gemini medium R3 follow-up). The first-node
-  gate for setup splits assumes Jepsen's `(first (:nodes test))`
-  is stable across nodes; verify this matches actual Jepsen
-  semantics (it should — `:nodes` is the test config, not a
-  per-node view). Out of scope to design more carefully; will
-  test at M5a implementation.
+  gate for the setup verification assumes Jepsen's
+  `(first (:nodes test))` is stable across nodes; verify this
+  matches actual Jepsen semantics (it should — `:nodes` is the
+  test config, not a per-node view). Out of scope to design
+  more carefully; will test at M5a implementation.
+- **OQ-7** (new, codex P1 #1 follow-up). The `--shardRanges`
+  boundary keys for the multi-group launch (§3.3) need to be
+  emitted as bytes that exactly match
+  `dynamoRouteTableKey(encodeDynamoSegment(tableName))`. Two
+  options: (a) a tiny Go helper (`cmd/elastickv-route-key`)
+  that prints the encoded key for a given table name, called
+  by `scripts/run-jepsen-local.sh` to build `--shardRanges`;
+  (b) inline the base64 encoding in shell. Tentative answer:
+  (a), because the encoding lives in Go and any drift would
+  silently mis-route. Decide at implementation.
 
 ---
 
