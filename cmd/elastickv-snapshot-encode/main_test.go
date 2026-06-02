@@ -22,11 +22,28 @@ var isWindows = runtime.GOOS == "windows"
 // emitMinimalManifest writes a minimal valid MANIFEST.json under outRoot
 // with the given lastCommitTS. Used by every CLI test as the producer-
 // side artifact the encoder will consume.
+//
+// Populates manifest.Adapters with ALL FOUR adapter scopes (each as
+// a non-nil &Adapter{} so the codex P2 v26 #904 validation
+// — validateAdaptersAgainstManifest — sees a manifest that claims
+// every adapter was dumped. Also creates an empty subdir for each
+// adapter under outRoot so the same validation's on-disk-stat guard
+// passes (the encoder treats an empty subdir as no-op, matching the
+// "no records to encode" semantics).
+//
+// Tests that need to assert rejection on specific adapter-scope
+// scenarios (e.g. manifest missing one adapter) can mutate the
+// manifest or filesystem after this returns.
 func emitMinimalManifest(t *testing.T, outRoot string, lastCommitTS uint64) {
 	t.Helper()
 	m := backup.NewPhase0SnapshotManifest(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
 	m.LastCommitTS = lastCommitTS
-	m.Adapters = &backup.Adapters{}
+	m.Adapters = &backup.Adapters{
+		DynamoDB: &backup.Adapter{},
+		S3:       &backup.Adapter{},
+		Redis:    &backup.Adapter{},
+		SQS:      &backup.Adapter{},
+	}
 	m.Exclusions = &backup.Exclusions{}
 	f, err := os.Create(filepath.Join(outRoot, "MANIFEST.json"))
 	if err != nil {
@@ -37,6 +54,11 @@ func emitMinimalManifest(t *testing.T, outRoot string, lastCommitTS uint64) {
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+	for _, sub := range []string{"dynamodb", "s3", "redis", "sqs"} {
+		if mkErr := os.MkdirAll(filepath.Join(outRoot, sub), 0o755); mkErr != nil {
+			t.Fatalf("MkdirAll %s: %v", sub, mkErr)
+		}
 	}
 }
 
@@ -182,6 +204,82 @@ func TestCLIRejectsUnsupportedManifestExclusions(t *testing.T) {
 				t.Errorf(".fsm exists at %s; should not be published on unsupported-feature rejection", out)
 			}
 		})
+	}
+}
+
+// TestCLIRejectsAdapterNotInManifest pins codex P2 v26 #904 scenario B:
+// the user enables an adapter (default `--adapter` is all four) but
+// MANIFEST.json doesn't list a scope for it. The prior code would
+// pick up a stale on-disk subdir for an unlisted adapter; the new
+// guard rejects with exit 2.
+func TestCLIRejectsAdapterNotInManifest(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Manifest lists ONLY SQS (no DynamoDB / S3 / Redis), but the
+	// default `--adapter dynamodb,s3,redis,sqs` enables all four.
+	m := backup.NewPhase0SnapshotManifest(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	m.LastCommitTS = 100
+	m.Adapters = &backup.Adapters{SQS: &backup.Adapter{}}
+	m.Exclusions = &backup.Exclusions{}
+	f, ferr := os.Create(filepath.Join(in, "MANIFEST.json"))
+	if ferr != nil {
+		t.Fatalf("create MANIFEST.json: %v", ferr)
+	}
+	if werr := backup.WriteManifest(f, m); werr != nil {
+		t.Fatalf("WriteManifest: %v", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	// Operator forgot to restrict --adapter; encoder must NOT silently
+	// pick up the (absent) dynamodb/s3/redis subtrees just because
+	// the CLI default enables them.
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	code, err := run([]string{"--input", in, "--output", out}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want adapter-scope rejection")
+	}
+	if code != exitDataErr {
+		t.Errorf("exit code = %d, want %d (data-correctness)", code, exitDataErr)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Errorf(".fsm should not be published on adapter-scope rejection")
+	}
+}
+
+// TestCLIRejectsAdapterListedButSubdirMissing pins codex P2 v26 #904
+// scenario A: the manifest lists an adapter (non-nil scope) but the
+// matching on-disk subdir is missing. The per-adapter encoder would
+// no-op silently and publish a partial/header-only .fsm; the new
+// guard rejects up front with exit 2.
+func TestCLIRejectsAdapterListedButSubdirMissing(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Manifest lists SQS only; do NOT create sqs/ on disk.
+	m := backup.NewPhase0SnapshotManifest(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	m.LastCommitTS = 100
+	m.Adapters = &backup.Adapters{SQS: &backup.Adapter{Queues: []string{"q1"}}}
+	m.Exclusions = &backup.Exclusions{}
+	f, ferr := os.Create(filepath.Join(in, "MANIFEST.json"))
+	if ferr != nil {
+		t.Fatalf("create MANIFEST.json: %v", ferr)
+	}
+	if werr := backup.WriteManifest(f, m); werr != nil {
+		t.Fatalf("WriteManifest: %v", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	code, err := run([]string{"--input", in, "--output", out, "--adapter", "sqs"}, quietLogger())
+	if err == nil {
+		t.Fatalf("run succeeded; want truncated-dump rejection")
+	}
+	if code != exitDataErr {
+		t.Errorf("exit code = %d, want %d (data-correctness)", code, exitDataErr)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Errorf(".fsm should not be published on adapter-scope rejection")
 	}
 }
 

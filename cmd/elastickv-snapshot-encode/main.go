@@ -124,11 +124,103 @@ func classifyEncodeError(err error) int {
 		errors.Is(err, backup.ErrEncodeAdapterData),
 		errors.Is(err, errSelfTestMismatch),
 		errors.Is(err, backup.ErrInvalidManifest),
-		errors.Is(err, backup.ErrUnsupportedFormatVersion):
+		errors.Is(err, backup.ErrUnsupportedFormatVersion),
+		errors.Is(err, errAdapterNotInManifest):
 		return exitDataErr
 	default:
 		return exitUserErr
 	}
+}
+
+// validateAdaptersAgainstManifest intersects the user-selected
+// AdapterSet with manifest.Adapters and stats each enabled adapter's
+// top-level subdir under inputPath. Two failure modes — both
+// data-correctness, both routed to exit 2:
+//
+//   - Manifest lists no scope for an enabled adapter (nil pointer in
+//     manifest.Adapters.<X>). A truncated/wrong manifest combined with
+//     the default `--adapter dynamodb,s3,redis,sqs` would otherwise
+//     pick up a stale on-disk subdir for an adapter the producer did
+//     not dump (codex P2 v26 #904 scenario B).
+//   - Manifest lists a scope for an enabled adapter but the on-disk
+//     subdir is absent. The adapter encoder's "missing top-level
+//     subdir → no-op" behavior would otherwise publish a header-only
+//     or partial .fsm without a hard error (codex P2 v26 #904
+//     scenario A).
+//
+// A nil manifest.Adapters is treated as "manifest has no scopes for
+// any adapter" — every enabled adapter trips the scenario-B guard.
+// Older manifests that omit the Adapters block deliberately are
+// expected to also omit on-disk subdirs and pass `--adapter` set to
+// only what they DO contain; that case is operator-driven and
+// surfaces the same fail-closed error here.
+func validateAdaptersAgainstManifest(selected backup.AdapterSet, m backup.Manifest, inputPath string) error {
+	checks := []struct {
+		name     string
+		selected bool
+		scope    *backup.Adapter
+		subdir   string
+	}{
+		{"dynamodb", selected.DynamoDB, manifestAdapterField(m.Adapters, "dynamodb"), "dynamodb"},
+		{"s3", selected.S3, manifestAdapterField(m.Adapters, "s3"), "s3"},
+		{"redis", selected.Redis, manifestAdapterField(m.Adapters, "redis"), "redis"},
+		{"sqs", selected.SQS, manifestAdapterField(m.Adapters, "sqs"), "sqs"},
+	}
+	for _, c := range checks {
+		if err := checkOneAdapterScope(c.name, c.selected, c.scope, filepath.Join(inputPath, c.subdir)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// manifestAdapterField returns the *Adapter for one adapter name from
+// m.Adapters, or nil if m.Adapters or the specific adapter pointer is
+// nil. Centralized so validateAdaptersAgainstManifest's table stays
+// readable.
+func manifestAdapterField(a *backup.Adapters, name string) *backup.Adapter {
+	if a == nil {
+		return nil
+	}
+	switch name {
+	case "dynamodb":
+		return a.DynamoDB
+	case "s3":
+		return a.S3
+	case "redis":
+		return a.Redis
+	case "sqs":
+		return a.SQS
+	default:
+		return nil
+	}
+}
+
+// checkOneAdapterScope is the per-adapter half of
+// validateAdaptersAgainstManifest. Selected adapters MUST have a
+// manifest scope AND a present on-disk subdir; not-selected adapters
+// are unchecked (the operator chose to skip them).
+func checkOneAdapterScope(name string, selected bool, scope *backup.Adapter, subdirPath string) error {
+	if !selected {
+		return nil
+	}
+	if scope == nil {
+		return errors.Wrapf(errAdapterNotInManifest,
+			"adapter %q selected but MANIFEST.json has no scope for it (use --adapter to restrict, or re-dump including this adapter)",
+			name)
+	}
+	info, err := os.Stat(subdirPath)
+	if err != nil {
+		return errors.Wrapf(errAdapterNotInManifest,
+			"adapter %q listed in MANIFEST.json but on-disk subdir %s is missing (stat: %v)",
+			name, subdirPath, err)
+	}
+	if !info.IsDir() {
+		return errors.Wrapf(errAdapterNotInManifest,
+			"adapter %q listed in MANIFEST.json but %s is not a directory (mode=%s)",
+			name, subdirPath, info.Mode())
+	}
+	return nil
 }
 
 func parseFlags(argv []string) (*config, error) {
@@ -263,9 +355,22 @@ func applyAdapterName(name string, s *backup.AdapterSet) error {
 // to exit-2 without coupling to the encoder's mismatch.txt format.
 var errSelfTestMismatch = errors.New("backup: --self-test diff against --input")
 
+// errAdapterNotInManifest is returned by validateAdaptersAgainstManifest
+// when the user has enabled an adapter that the manifest doesn't list,
+// or when the manifest lists an adapter whose top-level subdir is
+// missing on disk. Both are silent-data-loss scenarios per codex P2
+// v26 #904: the per-adapter encoders no-op on missing subdirs, so a
+// truncated dump or a stale-dir-with-default-`--adapter-all` would
+// publish a header-only/partial .fsm. classifyEncodeError routes this
+// to exit 2 (data-correctness).
+var errAdapterNotInManifest = errors.New("encode: adapter scope mismatch between MANIFEST.json and --adapter / on-disk tree")
+
 func encodeOne(cfg *config, logger *slog.Logger) error {
 	manifest, err := readInputManifest(cfg.inputPath)
 	if err != nil {
+		return err
+	}
+	if err := validateAdaptersAgainstManifest(cfg.adapters, manifest, cfg.inputPath); err != nil {
 		return err
 	}
 	effectiveTS, overridden, err := resolveLastCommitTS(cfg, manifest.LastCommitTS)
