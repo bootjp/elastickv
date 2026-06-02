@@ -247,6 +247,51 @@ func TestCLIRejectsAdapterNotInManifest(t *testing.T) {
 	}
 }
 
+// TestCLIAcceptsEmptyAdapterScopeWithoutSubdir pins codex P2 v27
+// #904: when the producer ran with an adapter enabled but the
+// adapter had no records, populateAdapterScopes writes a non-nil
+// empty Adapter{} into the manifest but the decoder does NOT
+// create the top-level subdir. The encoder must accept this shape
+// — requiring the subdir would reject valid Redis-only or
+// header-only dumps re-encoded with the default --adapter set.
+func TestCLIAcceptsEmptyAdapterScopeWithoutSubdir(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Manifest lists every adapter with an EMPTY scope (no tables /
+	// buckets / databases / queues) and no on-disk subdirs.
+	m := backup.NewPhase0SnapshotManifest(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	m.LastCommitTS = 100
+	m.Adapters = &backup.Adapters{
+		DynamoDB: &backup.Adapter{},
+		S3:       &backup.Adapter{},
+		Redis:    &backup.Adapter{},
+		SQS:      &backup.Adapter{},
+	}
+	m.Exclusions = &backup.Exclusions{}
+	f, ferr := os.Create(filepath.Join(in, "MANIFEST.json"))
+	if ferr != nil {
+		t.Fatalf("create MANIFEST.json: %v", ferr)
+	}
+	if werr := backup.WriteManifest(f, m); werr != nil {
+		t.Fatalf("WriteManifest: %v", werr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		t.Fatalf("close: %v", cerr)
+	}
+	out := filepath.Join(t.TempDir(), "out.fsm")
+	code, err := run([]string{"--input", in, "--output", out}, quietLogger())
+	if err != nil {
+		t.Fatalf("run failed: code=%d err=%v (codex P2 v27 regression — empty scope should not require subdir)", code, err)
+	}
+	if code != exitSuccess {
+		t.Errorf("exit code = %d, want %d", code, exitSuccess)
+	}
+	// Header-only .fsm should be published.
+	if _, statErr := os.Stat(out); statErr != nil {
+		t.Errorf(".fsm not published at %s: %v", out, statErr)
+	}
+}
+
 // TestCLIRejectsAdapterListedButSubdirMissing pins codex P2 v26 #904
 // scenario A: the manifest lists an adapter (non-nil scope) but the
 // matching on-disk subdir is missing. The per-adapter encoder would

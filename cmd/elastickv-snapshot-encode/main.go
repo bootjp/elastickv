@@ -198,8 +198,17 @@ func manifestAdapterField(a *backup.Adapters, name string) *backup.Adapter {
 
 // checkOneAdapterScope is the per-adapter half of
 // validateAdaptersAgainstManifest. Selected adapters MUST have a
-// manifest scope AND a present on-disk subdir; not-selected adapters
-// are unchecked (the operator chose to skip them).
+// manifest scope AND, when that scope is non-empty, a present on-disk
+// subdir; not-selected adapters are unchecked (the operator chose to
+// skip them).
+//
+// An empty Adapter{} (non-nil but no tables / buckets / databases /
+// queues) means "the producer ran with this adapter enabled but the
+// adapter had no records to dump." The decoder finalizers do not
+// create the top-level subdir in that case, so requiring on-disk
+// presence would reject valid Redis-only / header-only / empty dumps
+// (codex P2 v27 #904). Empty scope → subdir is optional; only the
+// scope=nil case still fails closed.
 func checkOneAdapterScope(name string, selected bool, scope *backup.Adapter, subdirPath string) error {
 	if !selected {
 		return nil
@@ -209,10 +218,15 @@ func checkOneAdapterScope(name string, selected bool, scope *backup.Adapter, sub
 			"adapter %q selected but MANIFEST.json has no scope for it (use --adapter to restrict, or re-dump including this adapter)",
 			name)
 	}
+	if isEmptyAdapterScope(scope) {
+		// Producer dumped this adapter with no records; the absence
+		// of the on-disk subdir is valid (codex P2 v27 #904).
+		return nil
+	}
 	info, err := os.Stat(subdirPath)
 	if err != nil {
 		return errors.Wrapf(errAdapterNotInManifest,
-			"adapter %q listed in MANIFEST.json but on-disk subdir %s is missing (stat: %v)",
+			"adapter %q listed in MANIFEST.json with non-empty scope but on-disk subdir %s is missing (stat: %v)",
 			name, subdirPath, err)
 	}
 	if !info.IsDir() {
@@ -221,6 +235,18 @@ func checkOneAdapterScope(name string, selected bool, scope *backup.Adapter, sub
 			name, subdirPath, info.Mode())
 	}
 	return nil
+}
+
+// isEmptyAdapterScope reports whether scope has no concrete
+// tables / buckets / databases / queues. A non-nil but empty
+// Adapter{} is the "producer dumped this adapter, no records"
+// signal — distinct from the nil pointer that means "producer did
+// not enable this adapter at all" (codex P2 v27 #904).
+func isEmptyAdapterScope(scope *backup.Adapter) bool {
+	return len(scope.Tables) == 0 &&
+		len(scope.Buckets) == 0 &&
+		len(scope.Databases) == 0 &&
+		len(scope.Queues) == 0
 }
 
 func parseFlags(argv []string) (*config, error) {
