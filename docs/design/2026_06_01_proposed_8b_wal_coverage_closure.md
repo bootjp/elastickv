@@ -128,11 +128,13 @@ plaintext on disk by construction; only later entries are wrapped.
 
 ## 4. Threat-model justification for accepting the residual
 
-The threat model in §2 of the parent design protects "the persisted state of the cluster" against an adversary with disk access. The residual cleartext above does not reveal user data; it reveals **traffic-analysis metadata**:
+The threat model in §2 of the parent design protects "the persisted state of the cluster" against an adversary with disk access. For entries with `index > raftEnvelopeCutoverIndex` whose WAL segments have already been compacted away (per §3 caveat), the residual cleartext does not reveal user data; it reveals **traffic-analysis metadata**:
 
 - Cluster throughput (entries per WAL segment ≈ ops per epoch).
 - Cluster topology changes (ConfChange entries).
-- Leader-flip cadence (proposal-ID resets, term increments).
+- Leader-flip cadence (term increments; the proposal-ID counter does NOT reset on leader flips — see §3 monotonic-counter leakage — so it is not a usable leader-flip signal).
+
+For entries at `index ≤ raftEnvelopeCutoverIndex`, or for post-cutover entries whose WAL segments have not yet been compacted on a cluster that enabled Stage 6E AFTER existing traffic, the residual additionally includes the §3 user-data fields (keys, values, operation type) in cleartext. Operators in that window must rely on the FS-encryption layer below until the compaction watermark crosses the cutover index.
 
 For the deployment classes elastickv targets — internal clusters with infrastructure-level FS encryption (LUKS, EBS encryption, GCE persistent-disk encryption) handling the file-level layer — the residual is acceptable. The application-level §4.2 envelope provides defense-in-depth against an adversary who bypasses the FS-encryption layer (e.g., live-memory exfiltration of a decrypted WAL segment held in OS page cache).
 
