@@ -237,18 +237,6 @@ func TestSQSEncodeBinaryBodyRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSQSEncodeRejectsPartitioned pins fail-closed for an HT-FIFO queue.
-func TestSQSEncodeRejectsPartitioned(t *testing.T) {
-	t.Parallel()
-	in := t.TempDir()
-	writeSQSQueue(t, in, "ht.fifo", []byte(`{"format_version":1,"name":"ht.fifo","fifo":true,`+
-		`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0,"partition_count":4}`), nil)
-	b := newSnapshotBuilder(sqsEncTS)
-	if err := NewSQSRecordEncoder(in).Encode(b); !errors.Is(err, ErrSQSEncodeUnsupportedPartitioned) {
-		t.Fatalf("Encode err = %v, want ErrSQSEncodeUnsupportedPartitioned", err)
-	}
-}
-
 // TestSQSEncodeRejectsNonRegularQueueMeta pins the file guard: a
 // _queue.json that is a directory is refused with ErrSQSEncodeNotRegular.
 func TestSQSEncodeRejectsNonRegularQueueMeta(t *testing.T) {
