@@ -20,16 +20,29 @@ For every queue with `partition_count > 1` in `_queue.json`, the encoder must re
 
 ## Dump-format change (M5-1 decoder + encoder, NEW)
 
-`sqsMessageRecord` (`internal/backup/sqs.go:233`) does NOT currently carry a `partition` field. M5-3 adds it, plus a corresponding writer-side population in the decoder for `partition_count > 1` queues:
+`sqsMessageRecord` (`internal/backup/sqs.go:233`) does NOT currently carry a `partition` field. M5-3 adds it as a **pointer** (`*uint32`) so the encoder can distinguish "partition was captured and is 0" from "partition field absent in the dump":
 
 ```go
 // sqsMessageRecord adds (in M5-3):
-Partition uint32 `json:"partition,omitempty"`
+Partition *uint32 `json:"partition,omitempty"`
 ```
 
-`omitempty` is load-bearing — every classic-queue dump produced before M5-3 lands has no `partition` field, and the encoder MUST default to `partition=0` (the only valid value for `partition_count == 1`). New partitioned-queue dumps populate `partition` from the live key's partition trailer.
+**Why `*uint32` instead of `uint32`** (codex P1 / gemini #914 v2): partition 0 is a valid partition (it's the only valid partition for `partition_count == 1` classic queues AND a legitimate partition for FIFO-hash-routed messages in a multi-partition queue). With a plain `uint32 + omitempty`, a partition-0 message serializes as `{}` — identical on the wire to a legacy classic-queue message that was never partition-aware. A future operator who manually flips `_queue.json`'s `partition_count` from 1 to N and replays the old dump would have every message silently land in partition 0, breaking the FIFO group-hash routing invariant without an error. The pointer form makes "partition was captured" detectable.
 
-**Backward compat:** a dump written before M5-3 (no `partition` field anywhere) round-trips through the M5-3 encoder unchanged — `omitempty` handles the read side, `meta.PartitionCount <= 1` already short-circuits the partitioned emit path.
+`omitempty` stays on the JSON tag so the dump for a classic-queue message (no partition concept) omits the field entirely; legacy `format_version=1` dumps produced before M5-3 deserialize with `Partition == nil`, which the encoder then handles by branch:
+
+| Manifest                                 | `Partition` nil?  | Encoder behavior                                                                                     |
+| ---------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------- |
+| `partition_count == 1` (classic)         | nil               | Emit classic-shape keys; this is the legacy / forward-compatible path.                               |
+| `partition_count == 1` (classic)         | non-nil + `== 0`  | Emit classic-shape keys; allowed (a freshly-decoded classic dump writes `0` explicitly under M5-3). |
+| `partition_count == 1` (classic)         | non-nil + `!= 0`  | Fail-closed `ErrSQSInvalidMessage` (dump is internally inconsistent).                                |
+| `partition_count > 1` (partitioned)      | **nil**           | **Fail-closed `ErrSQSEncodeMissingPartition`** — pre-M5-3 dumps cannot be replayed under M5-3's lifted gate; the operator must re-decode with an M5-3 decoder.   |
+| `partition_count > 1` (partitioned)      | non-nil + in-range| Emit partitioned-shape keys with `*rec.Partition`.                                                   |
+| `partition_count > 1` (partitioned)      | non-nil + out-of-range | Fail-closed `ErrSQSEncodeOutOfRangePartition`.                                                  |
+
+New sentinel `ErrSQSEncodeMissingPartition` (alongside `ErrSQSEncodeOutOfRangePartition` from v1) covers the legacy-dump-under-lifted-gate case.
+
+**Backward compat:** a dump written before M5-3 (no `partition` field anywhere) for a classic queue (`partition_count == 1`) round-trips through the M5-3 encoder unchanged — `*uint32` decodes as `nil`, the classic branch takes the `nil → classic-shape keys` path.
 
 **Forward compat:** a dump written by an M5-3 decoder, then read by a pre-M5-3 encoder, would silently lose the `partition` field. The encoder is offline so cross-version replays are an operator-driven scenario; the parent-doc convention is to surface this via a fail-closed format-version bump if it ever matters. M5-3 keeps `format_version=1` because adding an optional field is backward compatible by JSON convention; if a later milestone needs to break compat it can bump the version then.
 
@@ -54,7 +67,13 @@ func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey 
 
 (`isPartitioned` is needed because `parseSQSMessageDataKey` is also the classic dispatcher — caller can branch on it without re-checking the `|p|` discriminator. For the classic path `partition` is always 0.)
 
-`decodeSQSMessageValue` then receives the parsed `partition` from its caller (the FSM-apply / dump-walker), populates `sqsMessageRecord.Partition`, and `writeMessagesJSONL` serializes it under the new JSON field. The live message value itself never contained the partition (the value pair is `<message-id, message-record>`, and partition routing lives in the KEY); M5-3 closes that gap by passing through the key-derived partition rather than re-deriving it on the decoder side.
+`decodeSQSMessageValue` then receives the parsed `partition` from its caller (`HandleMessageData`, `internal/backup/sqs.go:341`), populates `sqsMessageRecord.Partition` as a `*uint32`, and `writeMessagesJSONL` serializes it under the new JSON field. The live message value itself never contained the partition (the value pair is `<message-id, message-record>`, and partition routing lives in the KEY); M5-3 closes that gap by passing through the key-derived partition rather than re-deriving it on the decoder side.
+
+**Specific call-site updates** (claude v2 review caught these — make the impl PR mechanically faithful):
+
+- `HandleMessageData` (`sqs.go:341`): receive `(encQueue, partition uint32, isPartitioned bool, err)`, decode the value bytes, then set `rec.Partition = &partition` ONLY when `isPartitioned` is true. Classic-key call site keeps `rec.Partition = nil` so the no-partition-concept case round-trips as a legacy dump.
+- `decodeSQSMessageValue` keeps its current `(value []byte) → (*sqsMessageRecord, error)` signature — partition wiring happens at the call site, not inside the decoder, because the decoder never sees the key.
+- `parseSQSGenericKey` (`sqs.go:571`) — wraps `parseSQSPartitionedQueueAndTrailer` and is called by `HandleSideRecord` for `vis`/`byage`/`dedup` value handling (`sqs.go:367`). Side-record handlers route to `_internals/` by queue and don't need partition, so the new partition return from `parseSQSPartitionedQueueAndTrailer` is discarded inside `parseSQSGenericKey`. The signature change is mechanical; impl PR must touch the wrapper to compile.
 
 **Per-partition vs single-file layout.** Two candidate disk layouts:
 
@@ -71,7 +90,7 @@ Three changes to `internal/backup/encode_sqs.go`:
 
 1. **Drop `ErrSQSEncodeUnsupportedPartitioned`.** Remove the `meta.PartitionCount > 1` gate at line 162.
 2. **Branch on `PartitionCount`.** When `> 1`, use partitioned key constructors (duplicated from `adapter/sqs_keys.go` following the established M3b-3 GSI pattern). When `<= 1`, classic constructors as today.
-3. **Group-by-partition before emit.** Sort messages by `(partition, send_timestamp_millis, message_id)` so per-partition order is stable across runs — required for byte-identical re-encodes.
+3. **Group-by-partition before emit.** Sort messages by `(partition, send_timestamp_millis, sequence_number, message_id)` so per-partition order is stable across runs — required for byte-identical re-encodes. `sequence_number` is the definitive tiebreaker between messages that share a send timestamp (burst case); `message_id` is the last-resort tiebreaker. Gemini suggested this in the v2 review — the classic path uses the same four-field sort, so the partitioned path adds `partition` as the leading key.
 
 Plus three additions to `internal/backup/encode_sqs_side.go` (the M5-2 file):
 
@@ -81,11 +100,13 @@ Plus three additions to `internal/backup/encode_sqs_side.go` (the M5-2 file):
 
 ## Validation invariants (fail-closed)
 
-The encoder fails closed with the existing per-adapter sentinels on:
+The full decision matrix lives in the table under §"Dump-format change." The encoder fails closed with these sentinels:
 
-- `meta.PartitionCount > 1` AND any message has `Partition == 0` AND the dump's record count for partition 0 doesn't match the live partition assignment. (Detectable only if the encoder can recompute the partition; deferred to a self-test invariant rather than a runtime check.)
-- `meta.PartitionCount > 1` AND any message's `Partition >= meta.PartitionCount` — out-of-range partition number, dump is malformed. New sentinel `ErrSQSEncodeOutOfRangePartition`.
-- `meta.PartitionCount == 1` (classic) AND any message has `Partition != 0` — dump is internally inconsistent. Reuses `ErrSQSInvalidMessage`.
+- `meta.PartitionCount > 1` AND `rec.Partition == nil` (pre-M5-3 dump under lifted gate, or M5-3 decoder bug) → **new sentinel `ErrSQSEncodeMissingPartition`**. The operator must re-decode with an M5-3 decoder; replaying a legacy dump into a partitioned queue would silently move every message to partition 0 (codex P1 / gemini #914 v2).
+- `meta.PartitionCount > 1` AND `*rec.Partition >= meta.PartitionCount` → **new sentinel `ErrSQSEncodeOutOfRangePartition`** (out-of-range partition number, dump is malformed).
+- `meta.PartitionCount == 1` (classic) AND `rec.Partition != nil && *rec.Partition != 0` → reuses **`ErrSQSInvalidMessage`** (dump is internally inconsistent).
+
+Per-partition-record-count integrity (detecting "all messages in partition 0, none in partition 1..N-1") cannot be checked from the dump alone — the live partition assignment is `partitionFor(messageGroupID) → uint32` and the encoder doesn't run that hash. The self-test loop catches it because a re-decode would write the messages into the same partitions the encoder used — but only if the encoder respects the per-message partition, which is what the new fail-closed gates above ensure.
 
 ## Decision gate: full reconstruction vs lazy rebuild (carry-over from M5-2)
 
@@ -118,7 +139,8 @@ The slice ships as a single PR — the decoder format change and encoder partiti
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `TestSQSEncodePartitionedQueueRoundTrip`                          | `partition_count=2`, 3 messages across both partitions → all data + side records emitted with `|p|` prefix             |
 | `TestSQSEncodePartitionedDedupBuildsGroupSegment`                 | FIFO partitioned dedup row's `<group-seg>` matches `message_group_id` from `messages.jsonl`                            |
-| `TestSQSEncodeRejectsOutOfRangePartition`                         | message with `Partition >= meta.PartitionCount` → `ErrSQSEncodeOutOfRangePartition`                                    |
+| `TestSQSEncodeRejectsMissingPartitionOnPartitionedQueue`          | `partition_count=2`, message with `Partition == nil` (legacy dump shape) → `ErrSQSEncodeMissingPartition`              |
+| `TestSQSEncodeRejectsOutOfRangePartition`                         | message with `*Partition >= meta.PartitionCount` → `ErrSQSEncodeOutOfRangePartition`                                   |
 | `TestSQSEncodeRejectsNonZeroPartitionOnClassicQueue`              | `PartitionCount=1` but message has `Partition=2` → `ErrSQSInvalidMessage`                                              |
 | `TestSQSEncodeLegacyDumpsWithoutPartitionStillRoundTrip`          | a pre-M5-3 `messages.jsonl` with no `partition` field round-trips through M5-3 encoder unchanged                       |
 | `TestSQSEncodePartitionedSideRecordsByteCrossCheckLiveAdapter`    | M5-2-style cross-check: partitioned `vis|p|` / `byage|p|` / `dedup|p|` bytes equal `sqsPartitionedMsg{...}Key(...)`    |
