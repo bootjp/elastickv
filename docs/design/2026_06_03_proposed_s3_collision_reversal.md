@@ -47,17 +47,19 @@ func (e *S3RecordEncoder) loadBucketKeymap(root *os.Root, bucketDir string) (map
 
 The existing `checkBucketKeymap` (`encode_s3_objects.go:103`) — which currently fails closed when `KEYMAP.jsonl` is present — becomes `loadBucketKeymap`. Its no-keymap path (returns nil, no error) and its hard-link / symlink / non-regular refusal paths are preserved.
 
+**Keymap key is the full relative path, NOT per-segment.** The decoder's `recordKeymap` call site (`internal/backup/s3.go:728`) records the full filesystem-relative path produced by `resolveObjectFilename` (e.g. `path/to.elastickv-leaf-data`) as the `Encoded` field and the full original S3 object key (e.g. `path/to`) as the `OriginalB64`. Per-segment lookup would miss every nested-collision entry; the encoder MUST look up the full rel-path (gemini medium / codex P1 found in this doc's first-round review).
+
 ## Object-walk integration
 
 `encodeBucketObjects`' existing `filepath.WalkDir` continues to enumerate the bucket's `s3/<bucketDir>/**/*` tree. For each file (sidecar or body), the leaf walker resolves the on-disk relative path to the original S3 object key by:
 
-1. Splitting the rel-path into segments at `/`.
-2. For each segment, checking the keymap. If a `KindS3LeafData` record exists with `Encoded=<segment>`, strip the `.elastickv-leaf-data` suffix from the recovered key. If a `KindMetaCollision` record exists, use the recovered original `.elastickv-meta.json`-suffixed key.
-3. Concatenating the resolved segments with `/` to form the original S3 object key.
+1. Compute the relative path under `bucketDir` (e.g. `path/to.elastickv-leaf-data`) — same string the decoder passed as `Encoded` to `recordKeymap`.
+2. Look it up directly in the keymap map. If a record is found, decode `OriginalB64` to get the full original object key (e.g. `path/to`) — no suffix-stripping needed; the decoder already stored the un-suffixed original.
+3. If no record is found, the on-disk relative path IS the original object key (the no-collision case M4-2a already handles).
 
 The resolved key feeds the existing `!s3|obj|head|<key>` / `!s3|blob|<key>` emission unchanged.
 
-**Symmetry with Redis.** The Redis encoder calls `resolveKey(encodedSegment)` to recover a single segment's original bytes (`encode_redis.go:loadKeymap` doc, line 145+). S3 needs the same operation per-segment, plus suffix-stripping for `KindS3LeafData`. The proposal adds a small `resolveS3Segment(seg, keymap)` helper rather than reusing `resolveKey` directly (different suffix-handling rules and a smaller map scope).
+**Difference from Redis.** Redis's `loadKeymap` (`encode_redis.go:113`) handles only `KindSHAFallback`, where the keymap entry is keyed by a single filename segment (because filename-length overflow happens segment-by-segment). S3 collision records are scoped to the full object key, so the lookup unit is the full bucket-relative path rather than a single segment. No common helper between the two; the S3 lookup lives in `encode_s3_collision.go`.
 
 ## Error contract
 
@@ -66,7 +68,7 @@ The encoder fails closed with the existing per-adapter sentinel `ErrS3EncodeInva
 - Malformed JSON in `KEYMAP.jsonl`.
 - A `KindS3LeafData` record whose `Encoded` does not end in `.elastickv-leaf-data`.
 - A `KindMetaCollision` record whose original key does not end in `.elastickv-meta.json`.
-- A reserved-prefix original key (starts with `_` — `_incomplete_uploads`, `_orphans`, etc.).
+- An original key whose first top-level path component is exactly one of the dump-control reserved subtrees: `_incomplete_uploads` or `_orphans`. (User object keys like `_foo` or `_foo/bar` are LEGITIMATE — the whole `_` namespace is NOT reserved, only the two named subtrees are. Codex P2 found this in the first-round review of this doc.)
 - A keymap record referencing an on-disk segment that doesn't exist (orphan record — the dump is internally inconsistent).
 - A multiply-defined `Encoded` segment (the same on-disk name listed twice with different originals).
 
@@ -102,7 +104,8 @@ The slice ships as a single PR since the keymap loader, segment resolver, and in
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `TestS3EncodeRoundTripsLeafDataCollision`                           | Bucket with `path/to` + `path/to/sub` → both objects emitted under their original keys; no `.elastickv-leaf-data` suffix leaks |
 | `TestS3EncodeRoundTripsMetaCollision`                               | Bucket with user object key ending `.elastickv-meta.json` + `--rename-collisions` → original key recovered                     |
-| `TestS3EncodeRejectsKeymapWithReservedPrefix`                       | `KEYMAP.jsonl` record claiming `Original="_orphans/foo"` → `ErrS3EncodeInvalidBucket`                                          |
+| `TestS3EncodeRejectsKeymapTargetingReservedSubtree`                 | `KEYMAP.jsonl` record claiming `Original="_orphans/foo"` or `"_incomplete_uploads/x"` → `ErrS3EncodeInvalidBucket`              |
+| `TestS3EncodeAcceptsKeymapWithUserUnderscoreKey`                    | `KEYMAP.jsonl` record claiming `Original="_foo"` (legitimate user key) → round-trips successfully                              |
 | `TestS3EncodeRejectsOrphanKeymapEntry`                              | `KEYMAP.jsonl` record references a segment that doesn't exist on disk → fail closed                                            |
 | `TestS3EncodeRejectsDuplicateKeymapEntry`                           | Same `Encoded` listed twice → fail closed (we can't pick a winner)                                                             |
 | `TestS3EncodeRejectsMalformedKeymapJSON`                            | `KEYMAP.jsonl` has an invalid line → `ErrInvalidKeymapRecord` (existing sentinel from `internal/backup/keymap.go`)             |
