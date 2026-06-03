@@ -473,7 +473,7 @@ at every snapshot persist site, **before** the corresponding
 left the steady-state path uncovered (codex round-4 P2 at `:455`).
 Round-5 hooks both:
 
-**Site 1 — `persistCreatedSnapshot`** (`engine.go:2683`).  Drives
+**Site 1 — `persistCreatedSnapshot`** (`engine.go:2679`).  Drives
 **config snapshots** (created via `createConfigSnapshot` →
 `storage.CreateSnapshot`):
 
@@ -499,7 +499,7 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 is the **steady-state `SnapshotCount`-triggered snapshot path** —
 `maybePersistLocalSnapshot` (`engine.go:2070`) → `e.persistLocalSnapshotPayload`
 (`engine.go:4032`) → the free function `persistLocalSnapshotPayload`
-(`wal_store.go:519`) → `persist.SaveSnap` at `wal_store.go:525`.  This
+(`wal_store.go:519`) → `persist.SaveSnap` at `wal_store.go:524`.  This
 is the hot path the optimisation actually depends on; without hooking
 it, the codex round-3 P2 fallback is not closed.
 
@@ -519,7 +519,7 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 
     // Round-5: bump metaAppliedIndex BEFORE the free-function
     // persistLocalSnapshotPayload (which calls persist.SaveSnap at
-    // wal_store.go:525). Lives in the engine wrapper so the free
+    // wal_store.go:524). Lives in the engine wrapper so the free
     // function stays signature-stable and is reusable from tests
     // that bypass the engine. Skipped silently when the FSM does
     // not implement AppliedIndexWriter (legacy fakes / test shims).
@@ -689,7 +689,7 @@ restoreSnapshotState skipped (FSM at index %d, snapshot at %d, ceiling=%d, cutov
 | Branch | Content | Behaviour change |
 |---|---|---|
 | **B1** (this PR) | Design doc | None |
-| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` + `pebbleStore.SetDurableAppliedIndex()` (both with `dbMu.RLock()`) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2683`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
+| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` + `pebbleStore.SetDurableAppliedIndex()` (both with `dbMu.RLock()`) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2679`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
 | **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip` reusing `kv.ReadSnapshotHeader` + `SnapshotHeaderApplier` seam on `kvFSM` + metrics + INFO log | **User-visible cold-start win.** |
 | **B4** | Lower `HEALTH_TIMEOUT_SECONDS` default once production data shows steady-state skip rate ≥ 90 % | Tighter ceiling; the env override remains honoured. |
 
@@ -845,7 +845,7 @@ Verified on `origin/main`:
 - `maybePersistLocalSnapshot` (`engine.go:2070`) →
   `e.persistLocalSnapshotPayload` (`engine.go:4032`) → free
   `persistLocalSnapshotPayload` (`wal_store.go:519`) →
-  `persist.SaveSnap` (`wal_store.go:525`) is the actual hot path for
+  `persist.SaveSnap` (`wal_store.go:524`) is the actual hot path for
   `SnapshotCount`-triggered snapshots; round-4's
   `persistCreatedSnapshot` hook only covers `createConfigSnapshot`
   (membership-change snapshots).
