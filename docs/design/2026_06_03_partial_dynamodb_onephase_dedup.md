@@ -1,12 +1,14 @@
 # DynamoDB item-write one-phase idempotency dedup
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-06-03
 
-> **Status: proposed — no implementation yet.** Extends the option-2
-> one-phase dedup (write-set reuse + exact-`commit_ts` probe) from the Redis
-> adapter to the DynamoDB adapter's single-item write path
+> **Status: partial — M1 (adapter dedup, gated off) ships in PR #920; M2
+> (validation: add DynamoDB to the dedup-mode Jepsen workflow + 7-day green
+> criterion) is open, and S3/SQS remain separate follow-ups.** Extends the
+> option-2 one-phase dedup (write-set reuse + exact-`commit_ts` probe) from the
+> Redis adapter to the DynamoDB adapter's single-item write path
 > (`UpdateItem` / `PutItem` / `DeleteItem`). The FSM-side probe
 > (`dedupProbeOnePhase`, `kv/fsm.go`) and the request plumbing
 > (`OperationGroup.PrevCommitTS` → `onePhaseTxnRequestWithPrevCommit`) already
@@ -185,6 +187,26 @@ So the prepare step gains one line: allocate `commitTS` via
 stale-leader window cannot mint a colliding timestamp (HLC-4). `NextFenced`'s
 `ErrCeilingExpired` must be classified **non-retryable** by the adapter loop
 (surface to the client), matching the Redis call sites.
+
+**Leader-only allocation (codex P1, PR #920).** This local allocation moves
+timestamp issuance from the coordinator (which has the *leader* assign it on
+the non-dedup path) into the adapter, so it is only safe **on the leader** —
+otherwise two follower frontends could mint the same `commitTS` in one
+millisecond (the HLC logical counter is process-local), and a retry carrying
+that `prev_commit_ts` would make the FSM exact-ts probe dedup against the
+*other* writer's version, losing an update. The dedup path is therefore gated
+on `d.coordinator.IsLeader()` in addition to the feature flag: on the leader
+the single HLC issues monotonic unique values and `NextFenced`'s ceiling fence
+keeps a deposed leader's window disjoint from its successor's (so even a TOCTOU
+leadership loss after the `IsLeader()` check cannot collide); a non-leader
+falls back to the legacy path, where `Coordinator.Dispatch` redirects to the
+leader and the **leader** allocates `commitTS`. In the normal multi-node
+deployment the DynamoDB adapter already HTTP-proxies all follower ingress to
+the leader (`proxyToLeader`), so `retryItemWriteWithGeneration` runs on the
+leader and the dedup path is taken; the `IsLeader()` guard only matters for the
+no-`leaderMap` topology that relies on `Coordinator.Dispatch` redirect, where
+it correctly degrades to legacy (no dedup, no lost update) rather than minting
+a follower-local timestamp.
 
 ### The retry loop (gated)
 
@@ -402,6 +424,14 @@ change (the probe already exists), no proto change, no new store primitive.
 
 ## Decision log
 
+- (2026-06-03, PR #920 round-1) **Leader-only dedup guard added** per codex P1:
+  the adapter-local `commitTS` allocation is only safe on the leader, so the
+  dedup path is gated on `d.coordinator.IsLeader()` (+ `NextFenced` ceiling
+  fence for the cross-leader case); non-leaders fall back to the legacy path
+  where the leader allocates. Covered by
+  `TestItemWriteDedup_NonLeaderFallsBackToLegacy`. Also addressed gemini's
+  redundant-`errors.WithStack` findings (the attempt helpers return the
+  already-wrapped dispatch error raw; the outer loop wraps once).
 - (2026-06-03) Initial proposal, triggered by Jepsen run 26856696842
   (`:duplicate-elements` on the DynamoDB list-append workload). Open for
   review. Diagnosis confirmed: same anomaly class as the parent design

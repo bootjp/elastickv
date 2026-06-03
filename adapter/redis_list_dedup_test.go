@@ -34,8 +34,12 @@ type dedupTestCoordinator struct {
 	// store.ErrWriteConflict — modelling leadership churn that surfaces a
 	// committed entry as a write conflict.
 	landThenWriteConflictAtDispatch int
-	dispatches                      int
-	probeNoOps                      int
+	// txnLockedAtDispatch makes the named dispatch return kv.ErrTxnLocked
+	// WITHOUT applying — an ambiguous retryable error distinct from
+	// WriteConflict, exercising the "advance pending.commitTS and retry" branch.
+	txnLockedAtDispatch int
+	dispatches          int
+	probeNoOps          int
 	// beforeDispatch, if set, runs at the start of each Dispatch with the
 	// 1-based dispatch number — lets a test inject a concurrent commit
 	// between the adapter's attempts.
@@ -62,6 +66,10 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 	if n == c.ambiguousDispatch && !c.ambiguousLands {
 		// OCC-style pre-reject: nothing is written, definitely did not land.
 		return nil, store.ErrWriteConflict
+	}
+	if n == c.txnLockedAtDispatch {
+		// Ambiguous lock error, nothing written: definitely did not land.
+		return nil, kv.ErrTxnLocked
 	}
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
 	if err != nil {

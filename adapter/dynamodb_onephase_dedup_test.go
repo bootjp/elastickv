@@ -16,7 +16,7 @@ import (
 // exact-ts dedup probe on kv.PrimaryKeyForElems, a passing dedup test proves the
 // probe is load-bearing: without it a reuse would conflict against attempt 1's
 // own version, recompute the list, and duplicate.
-// See docs/design/2026_06_03_proposed_dynamodb_onephase_dedup.md.
+// See docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
 
 const dedupTestKey = "k"
 
@@ -199,6 +199,56 @@ func TestItemWriteDedup_GenuineConflictRecomputes(t *testing.T) {
 		"genuine conflict recomputes on top of the concurrent value; element 3 appears once")
 	require.Equal(t, 3, coord.dispatches, "attempt 1 pre-reject + conflicting reuse + recompute")
 	require.Equal(t, 0, coord.probeNoOps, "neither the prior attempt nor the reuse landed; the probe must miss")
+}
+
+// TestItemWriteDedup_TxnLockedOnReuseAdvancesProbe: attempt 1 pre-rejects; the
+// first reuse returns kv.ErrTxnLocked WITHOUT applying (an ambiguous lock error
+// distinct from WriteConflict). The adapter advances pending.commitTS to that
+// reuse's commit_ts and retries; the second reuse probes the new commit_ts
+// (misses, since the locked attempt never landed) and applies exactly once.
+// Locks in the pending.commitTS update on the ambiguous-retryable branch.
+func TestItemWriteDedup_TxnLockedOnReuseAdvancesProbe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, false) // attempt 1 pre-rejects
+	coord.txnLockedAtDispatch = 2                  // reuse #1 returns ErrTxnLocked, no apply
+	schema, server := newDedupItemWriteServer(st, coord, true)
+	seedDedupItem(t, st, schema, "1", "2")
+
+	plan, err := server.updateItemWithRetry(ctx, appendListInput())
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	require.Equal(t, []string{"1", "2", "3"}, readListValues(t, server, schema),
+		"the lock cleared on retry; the reuse applies exactly once")
+	require.Equal(t, 3, coord.dispatches, "attempt 1 pre-reject + locked reuse + applying reuse")
+	require.Equal(t, 0, coord.probeNoOps, "no attempt landed before the final apply; the probe must miss")
+}
+
+// TestItemWriteDedup_NonLeaderFallsBackToLegacy pins the leader-only guard
+// (codex P1, PR #920): with the gate ON but this node NOT the leader, the dedup
+// path is skipped so a non-leader never mints the commit_ts used as the dedup
+// identity (which could collide across frontends and lose an update). The legacy
+// recompute path runs instead — identical to gate-off — so no prev_commit_ts is
+// emitted and the probe never fires.
+func TestItemWriteDedup_NonLeaderFallsBackToLegacy(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true) // dispatch 1 lands then errors
+	coord.leaderSet = true
+	coord.leader = false // this node is NOT the leader
+	schema, server := newDedupItemWriteServer(st, coord, true)
+	seedDedupItem(t, st, schema, "1", "2")
+
+	plan, err := server.updateItemWithRetry(ctx, appendListInput())
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	require.Equal(t, 0, coord.probeNoOps, "non-leader must not emit prev_commit_ts / use the dedup probe")
+	require.Equal(t, []string{"1", "2", "3", "3"}, readListValues(t, server, schema),
+		"non-leader falls back to the legacy recompute path (leader allocates commit_ts via redirect)")
 }
 
 // TestItemWriteDedup_DisabledKeepsLegacyPath pins that the gate is load-bearing:
