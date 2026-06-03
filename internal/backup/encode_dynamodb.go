@@ -119,6 +119,19 @@ func (e *DynamoDBEncoder) encodeTable(b *snapshotBuilder, root *os.Root, tableDi
 	if tableName == "" {
 		return errors.Wrapf(ErrDDBEncodeInvalidSchema, "%s/_schema.json: empty table_name", tableDir)
 	}
+	// Name/dir consistency: the decoder spells the table subdir as
+	// EncodeSegment([]byte(name)) (dynamodb.go:213); a tampered or
+	// hand-rebuilt dump could rename one without the other and the
+	// encoder would otherwise emit DDBTableMeta records under
+	// tableName while reading items from a mismatched on-disk path.
+	// Fail closed so the round-trip invariant
+	// `<tableDir> == EncodeSegment(tableName)` holds for every table
+	// the encoder publishes (#35 follow-up).
+	if want := EncodeSegment([]byte(tableName)); want != tableDir {
+		return errors.Wrapf(ErrDDBEncodeInvalidSchema,
+			"%s/_schema.json: table_name %q encodes to dir %q, not %q (dump tampered or rebuilt by hand?)",
+			tableDir, tableName, want, tableDir)
+	}
 	// A table must have a hash key; fail early here rather than letting
 	// an empty primary key propagate into the item encoder (which
 	// builds item keys from the hash/range attributes).

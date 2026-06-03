@@ -137,6 +137,32 @@ func TestS3EncodeMissingDirIsNoop(t *testing.T) {
 	}
 }
 
+// TestS3EncodeRejectsNameDirMismatch pins #35: when the on-disk bucket
+// dir doesn't match EncodeSegment([]byte(_bucket.json.name)), the
+// encoder fails closed before emitting any keys. Otherwise a
+// hand-edited dump could end up with bucket-meta records keyed by
+// the JSON's name but object bytes pulled from a different
+// filesystem subtree — silent name/dir consistency violation.
+func TestS3EncodeRejectsNameDirMismatch(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Plant the dump under s3/wrong-dir/_bucket.json with name="real".
+	// EncodeSegment("real") is "real" (unreserved chars), so dir != name.
+	path := filepath.Join(in, "s3", "wrong-dir", "_bucket.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path,
+		[]byte(`{"format_version":1,"name":"real"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	b := newSnapshotBuilder(s3EncTS)
+	err := NewS3RecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrS3EncodeInvalidBucket) {
+		t.Fatalf("Encode err = %v, want ErrS3EncodeInvalidBucket for name/dir mismatch", err)
+	}
+}
+
 // TestS3EncodeRejectsNonDirectoryBucketEntry pins codex P2 v32 #904:
 // when an entry directly under s3/ is a regular file or symlink
 // rather than a bucket directory, the encoder must fail closed with

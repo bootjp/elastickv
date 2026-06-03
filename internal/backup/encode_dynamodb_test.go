@@ -238,14 +238,39 @@ func TestDDBEncodeRejectsDuplicateGSIName(t *testing.T) {
 
 // TestDDBEncodeRejectsEmptyHashKey pins that a schema with no primary
 // hash key fails closed rather than propagating into the item encoder.
+// The dir intentionally matches EncodeSegment(table_name) so the new
+// name/dir consistency check (#35) does NOT fire first — otherwise
+// this test would silently pass while exercising the wrong guard
+// (claude review #912 caught this regression in the prior revision).
 func TestDDBEncodeRejectsEmptyHashKey(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
-	writeDDBSchema(t, in, "tbl", []byte(`{"format_version":1,"table_name":"x","primary_key":{"hash_key":{"name":""}}}`))
+	writeDDBSchema(t, in, EncodeSegment([]byte("x")),
+		[]byte(`{"format_version":1,"table_name":"x","primary_key":{"hash_key":{"name":""}}}`))
 	b := newSnapshotBuilder(ddbEncTS)
 	err := NewDynamoDBEncoder(in).Encode(b)
 	if !errors.Is(err, ErrDDBEncodeInvalidSchema) {
 		t.Fatalf("Encode err = %v, want ErrDDBEncodeInvalidSchema", err)
+	}
+}
+
+// TestDDBEncodeRejectsNameDirMismatch pins #35: when the on-disk
+// table dir doesn't match EncodeSegment([]byte(_schema.json.table_name)),
+// the encoder fails closed before emitting any keys. Otherwise a
+// hand-edited dump could end up with table records keyed by the
+// JSON's table_name but item bytes pulled from a different
+// filesystem subtree — a silent name/dir consistency violation.
+func TestDDBEncodeRejectsNameDirMismatch(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Dir is "wrong-dir" but JSON says table_name = "real". EncodeSegment("real")
+	// is "real" (alphanumeric → unreserved → unchanged), so dir != encoded-name.
+	writeDDBSchema(t, in, "wrong-dir",
+		[]byte(`{"format_version":1,"table_name":"real","primary_key":{"hash_key":{"name":"id","type":"S"}}}`))
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeInvalidSchema) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeInvalidSchema for name/dir mismatch", err)
 	}
 }
 
