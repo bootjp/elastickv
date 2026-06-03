@@ -13,10 +13,10 @@ For every queue with `partition_count > 1` in `_queue.json`, the encoder must re
 | `data`   | `!sqs\|msg\|data\|<queue-seg><gen-BE><msgID-seg>`                             | `!sqs\|msg\|data\|p\|<queue-seg>\|<part-BE><gen-BE><msgID-seg>`                                       |
 | `vis`    | `!sqs\|msg\|vis\|<queue-seg><gen-BE><visibleAt-BE><msgID-seg>`                | `!sqs\|msg\|vis\|p\|<queue-seg>\|<part-BE><gen-BE><visibleAt-BE><msgID-seg>`                          |
 | `byage`  | `!sqs\|msg\|byage\|<queue-seg><gen-BE><sendTs-BE><msgID-seg>`                 | `!sqs\|msg\|byage\|p\|<queue-seg>\|<part-BE><gen-BE><sendTs-BE><msgID-seg>`                           |
-| `dedup`  | `!sqs\|msg\|dedup\|<queue-seg><gen-BE><dedupID-seg>`                          | `!sqs\|msg\|dedup\|p\|<queue-seg>\|<part-BE><gen-BE><group-seg><dedupID-seg>`                         |
+| `dedup`  | `!sqs\|msg\|dedup\|<queue-seg><gen-BE><dedupID-seg>`                          | `!sqs\|msg\|dedup\|p\|<queue-seg>\|<part-BE><gen-BE><group-seg>\|<dedupID-seg>`                       |
 | `group`  | (not emitted — see M5-2 §"families table" rationale)                          | (not emitted — same rationale)                                                                        |
 
-> **Notation.** Pipe characters inside `<seg>…<seg>` are visual separators, not literal bytes; the only literal `|` bytes are inside the family prefix and the `|p|` discriminator. Constants in `adapter/sqs_keys.go`: `SqsPartitionedMsgDataPrefix` (line 41), `SqsPartitionedMsgVisPrefix`, `SqsPartitionedMsgByAgePrefix`, `SqsPartitionedMsgDedupPrefix`. Constructors: `sqsPartitionedMsgDataKey` (line 339), and the `*Vis,ByAge,Dedup,GroupKey` siblings in the same file.
+> **Notation.** Pipe characters inside `<seg>…<seg>` are visual separators, not literal bytes; the only literal `|` bytes are (1) inside the family prefix, (2) the `|p|` partitioned-key discriminator, (3) the `sqsPartitionedQueueTerminator='|'` byte appended after `<queue-seg>` in every partitioned key (see `adapter/sqs_keys.go:82`), and (4) for the partitioned dedup family ONLY, an additional `sqsPartitionedQueueTerminator` between `<group-seg>` and `<dedupID-seg>` — the live `sqsPartitionedMsgDedupKey` (`adapter/sqs_keys.go:389`) emits this delimiter because `encodeSQSSegment` uses `base64.RawURLEncoding` (no padding) and back-to-back raw-base64 segments are ambiguous, so distinct `(groupID, dedupID)` pairs could collapse onto the same key (CodeRabbit major PR #732 round 6 + codex P2 found this missing from v1 of this doc). Constants in `adapter/sqs_keys.go`: `SqsPartitionedMsgDataPrefix` (line 41), `SqsPartitionedMsgVisPrefix`, `SqsPartitionedMsgByAgePrefix`, `SqsPartitionedMsgDedupPrefix`. Constructors: `sqsPartitionedMsgDataKey` (line 339), and the `*Vis,ByAge,Dedup,GroupKey` siblings in the same file.
 
 ## Dump-format change (M5-1 decoder + encoder, NEW)
 
@@ -35,7 +35,26 @@ Partition uint32 `json:"partition,omitempty"`
 
 ## Decoder lift (M5-1 follow-up)
 
-The decoder's `decodeSQSMessageValue` (`internal/backup/sqs.go:719`) already runs after the partition trailer has been parsed by `sqsParsePartitionedMsgKey` (`sqs.go:600`). M5-3 plumbs the partition number through `sqsMessageRecord.Partition` and writes it to `messages.jsonl`.
+The current key parser only returns the encoded queue segment:
+
+```go
+// internal/backup/sqs.go:534
+func parseSQSMessageDataKey(key []byte) (string, error)
+// internal/backup/sqs.go:611
+func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey []byte) (string, error)
+```
+
+The partition `uint32` is parsed inside `parseSQSPartitionedQueueAndTrailer` (the trailer carries `<partition u32><gen u64>` immediately after the queue segment + terminator) but is currently DISCARDED — codex P2 found this in the v1 review. M5-3 MUST extend both signatures to return the partition:
+
+```go
+// internal/backup/sqs.go (M5-3):
+func parseSQSMessageDataKey(key []byte) (encQueue string, partition uint32, isPartitioned bool, err error)
+func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey []byte) (encQueue string, partition uint32, err error)
+```
+
+(`isPartitioned` is needed because `parseSQSMessageDataKey` is also the classic dispatcher — caller can branch on it without re-checking the `|p|` discriminator. For the classic path `partition` is always 0.)
+
+`decodeSQSMessageValue` then receives the parsed `partition` from its caller (the FSM-apply / dump-walker), populates `sqsMessageRecord.Partition`, and `writeMessagesJSONL` serializes it under the new JSON field. The live message value itself never contained the partition (the value pair is `<message-id, message-record>`, and partition routing lives in the KEY); M5-3 closes that gap by passing through the key-derived partition rather than re-deriving it on the decoder side.
 
 **Per-partition vs single-file layout.** Two candidate disk layouts:
 
