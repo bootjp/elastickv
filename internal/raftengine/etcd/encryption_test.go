@@ -78,6 +78,38 @@ func envelopeEntry(t *testing.T, c *encryption.Cipher, kid uint32, index uint64,
 	return raftpb.Entry{Index: index, Type: raftpb.EntryNormal, Data: encodeProposalEnvelope(7, wrapped)}
 }
 
+// TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure pins
+// the §7.1 barrier's typed error as a separate sentinel from
+// ErrRaftUnwrapFailed. The two have very different operator
+// responses: cutover-in-progress is a retryable transient (the
+// barrier completes in drain-time, then the next attempt
+// succeeds under the new wrapped regime), while unwrap-failed is
+// process-fatal (sidecar / Raft-log divergence or KEK custody
+// problem). A caller that confuses them would either drop
+// retryable cutover-window proposals on the floor or paper over
+// a fatal data-integrity error with a retry loop. errors.Is
+// distinguishes them; this test pins that distinction so future
+// refactors of the error chain do not silently merge the two.
+func TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure(t *testing.T) {
+	t.Parallel()
+	if errors.Is(ErrEnvelopeCutoverInProgress, ErrRaftUnwrapFailed) {
+		t.Error("ErrEnvelopeCutoverInProgress matches ErrRaftUnwrapFailed; the §7.1 barrier sentinel must be a distinct error chain")
+	}
+	if errors.Is(ErrRaftUnwrapFailed, ErrEnvelopeCutoverInProgress) {
+		t.Error("ErrRaftUnwrapFailed matches ErrEnvelopeCutoverInProgress; the process-fatal sentinel must not be misclassified as retryable")
+	}
+	// Pin the chain contract that Stage 6E-2b callers depend
+	// on: an errors.Wrap-wrapped sentinel must still match via
+	// errors.Is. A downstream caller that wraps the sentinel
+	// for diagnostic context would otherwise silently lose its
+	// retryable classification and fall through to a
+	// process-fatal error path.
+	wrapped := errors.Wrap(ErrEnvelopeCutoverInProgress, "cutover barrier open")
+	if !errors.Is(wrapped, ErrEnvelopeCutoverInProgress) {
+		t.Error("ErrEnvelopeCutoverInProgress lost through errors.Wrap; callers using errors.Is on a wrapped error must still match the sentinel")
+	}
+}
+
 // TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed locks down
 // the misconfig case: when the cluster has crossed the raft envelope
 // cutover (an above-cutover entry arrives) but raftCipher is nil —
