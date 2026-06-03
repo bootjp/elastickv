@@ -249,6 +249,26 @@ func TestDDBEncodeRejectsEmptyHashKey(t *testing.T) {
 	}
 }
 
+// TestDDBEncodeRejectsNameDirMismatch pins #35: when the on-disk
+// table dir doesn't match EncodeSegment([]byte(_schema.json.table_name)),
+// the encoder fails closed before emitting any keys. Otherwise a
+// hand-edited dump could end up with table records keyed by the
+// JSON's table_name but item bytes pulled from a different
+// filesystem subtree — a silent name/dir consistency violation.
+func TestDDBEncodeRejectsNameDirMismatch(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	// Dir is "wrong-dir" but JSON says table_name = "real". EncodeSegment("real")
+	// is "real" (alphanumeric → unreserved → unchanged), so dir != encoded-name.
+	writeDDBSchema(t, in, "wrong-dir",
+		[]byte(`{"format_version":1,"table_name":"real","primary_key":{"hash_key":{"name":"id","type":"S"}}}`))
+	b := newSnapshotBuilder(ddbEncTS)
+	err := NewDynamoDBEncoder(in).Encode(b)
+	if !errors.Is(err, ErrDDBEncodeInvalidSchema) {
+		t.Fatalf("Encode err = %v, want ErrDDBEncodeInvalidSchema for name/dir mismatch", err)
+	}
+}
+
 // TestDDBEncodeMissingDirIsNoop pins that an absent dynamodb/ dir is a
 // no-op (no entries, no error).
 func TestDDBEncodeMissingDirIsNoop(t *testing.T) {

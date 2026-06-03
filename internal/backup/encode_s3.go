@@ -128,6 +128,18 @@ func (e *S3RecordEncoder) encodeBucket(b *snapshotBuilder, root *os.Root, bucket
 	if pub.Name == "" {
 		return errors.Wrapf(ErrS3EncodeInvalidBucket, "%s/_bucket.json: empty bucket name", bucketDir)
 	}
+	// Name/dir consistency: the decoder spells the bucket subdir as
+	// EncodeSegment([]byte(name)) (s3.go:564); an operator (or a
+	// malicious dump) could rename one without the other and the
+	// encoder would otherwise emit keys under pub.Name while reading
+	// objects from a mismatched on-disk path. Fail closed so the
+	// round-trip invariant `<bucketDir> == EncodeSegment(pub.Name)`
+	// holds for every bucket the encoder publishes (#35 follow-up).
+	if want := EncodeSegment([]byte(pub.Name)); want != bucketDir {
+		return errors.Wrapf(ErrS3EncodeInvalidBucket,
+			"%s/_bucket.json: bucket name %q encodes to dir %q, not %q (dump tampered or rebuilt by hand?)",
+			bucketDir, pub.Name, want, bucketDir)
+	}
 	// s3PublicBucket carries Versioning, PolicyJSONString, and
 	// CreationTimeISO, but the internal s3LiveBucketMeta record has no
 	// counterpart for them — they are dump-only metadata the live store
