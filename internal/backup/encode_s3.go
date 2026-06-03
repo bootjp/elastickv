@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/cockroachdb/errors"
@@ -83,10 +84,34 @@ func (e *S3RecordEncoder) Encode(b *snapshotBuilder) error {
 		return err
 	}
 	for _, ent := range entries {
+		name := ent.Name()
 		if !ent.IsDir() {
-			continue
+			// Top-level entries under s3/ must be bucket directories.
+			// A regular file or symlink here means the dump is
+			// malformed or partially truncated — silently skipping
+			// would let the encoder publish a partial .fsm with
+			// the affected bucket omitted (codex P2 v31 #904; the
+			// manifest's empty S3 scope from populateAdapterScopes
+			// cannot otherwise distinguish missing bucket from
+			// dumped-empty bucket).
+			//
+			// Reserved-prefix entries that start with "_" (e.g.
+			// _incomplete_uploads, _orphans) are handled by their
+			// own dedicated paths and are NOT top-level buckets;
+			// the fail-closed should not catch them. Today the
+			// reverse encoder doesn't emit those subtrees at all
+			// (covered by ErrEncodeUnsupportedS3IncompleteUploads /
+			// ErrEncodeUnsupportedS3Orphans) so any "_*" entry here
+			// would have been rejected upstream — but skip them
+			// here too for forward compat.
+			if strings.HasPrefix(name, "_") {
+				continue
+			}
+			return errors.Wrapf(ErrS3EncodeNotRegular,
+				"s3/%s is not a directory (mode=%s); top-level entries under s3/ must be bucket directories",
+				name, ent.Type())
 		}
-		if err := e.encodeBucket(b, root, ent.Name()); err != nil {
+		if err := e.encodeBucket(b, root, name); err != nil {
 			return err
 		}
 	}

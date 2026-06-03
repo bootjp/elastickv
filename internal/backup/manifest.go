@@ -128,6 +128,14 @@ type Exclusions struct {
 	IncludeOrphans           bool `json:"include_orphans"`
 	PreserveSQSVisibility    bool `json:"preserve_sqs_visibility"`
 	IncludeSQSSideRecords    bool `json:"include_sqs_side_records"`
+	// RenameS3Collisions records whether the producer ran with
+	// --rename-collisions (DecodeOptions.RenameS3Collisions), so the
+	// M6 encoder's self-test can thread the same option back through
+	// DecodeSnapshot. Older manifests that omit this field decode as
+	// false (no-rename), matching the decoder default. Intentionally
+	// NOT added to exclusionsRequiredFields below so legacy manifests
+	// continue to validate (#896 v5 — claude review on M6 design).
+	RenameS3Collisions bool `json:"rename_s3_collisions,omitempty"`
 }
 
 // Manifest is the on-disk MANIFEST.json structure. Field tags match the
