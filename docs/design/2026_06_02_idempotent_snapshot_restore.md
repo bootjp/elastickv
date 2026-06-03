@@ -1,7 +1,7 @@
 # Idempotent FSM Snapshot Restore on Cold Start
 
-**Status**: Proposal (Round 3 — corrected after round-2 self-error)
-**Date**: 2026-06-02 (round 1), 2026-06-03 (round 2 + round 3)
+**Status**: Proposal (Round 4 — codex P2 fix: snapshot-persist meta key bump)
+**Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4)
 **Author**: bootjp
 **Related**: PR #909 (`HEALTH_TIMEOUT_SECONDS` 60s → 300s)
 
@@ -429,16 +429,115 @@ back to full restore.  Safe; rare.
 `ErrSidecarBehindRaftLog`; that mechanism is orthogonal to this
 proposal.)
 
-#### HLC lease entries (Open Question 1 — Option 2)
+#### HLC lease entries — checkpoint at snapshot persist (codex round-3 P2)
 
 `f.applyHLCLease` is an in-memory mutation only; it does not touch
-`f.store`.  We accept that `metaAppliedIndex` does NOT advance for
-HLC lease entries.  Consequence: in a workload where the only entries
-between two snapshots are lease ticks, the skip gate will fall back
-to full restore — safe and rare.  Adding a synthetic pebble batch per
-lease tick would cost ~1 extra pebble batch per second per group;
-trading the rare false-positive restore for that ongoing cost is the
-wrong call.
+`f.store`, so `metaAppliedIndex` does NOT advance for HLC lease
+entries individually.
+
+Round-3 of this doc claimed the resulting full-restore fallback was
+"safe and rare."  Codex correctly pointed out it is neither:
+`RunHLCLeaseRenewal` (`kv/coordinator.go:650`) proposes a lease every
+`hlcRenewalInterval = 1 * time.Second` while the local node is leader,
+so even an active cluster will routinely accumulate a tail of lease
+entries between any two data writes.  When the next snapshot is
+persisted at index `X`, the gap between the last data-Apply index `Y`
+and `X` always contains lease entries — and once `metaAppliedIndex`
+sits at `Y < X` on restart, `fsmAlreadyAtIndex(X)` returns false, the
+full restore runs, and the same stale `metaAppliedIndex = Y` is
+re-installed from the snapshot.  Idle clusters degenerate to
+"`metaAppliedIndex` never advances past the very last data write" and
+the skip never fires.  Round-3 was wrong; round-4 fixes it.
+
+**Mechanism**: bump `metaAppliedIndex` to `snapshot.Metadata.Index`
+when persisting a created snapshot, in `persistCreatedSnapshot`
+(`internal/raftengine/etcd/engine.go:2683`), **before**
+`e.persist.SaveSnap`:
+
+```go
+// internal/raftengine/etcd/engine.go (revised)
+func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
+    if etcdraft.IsEmptySnap(snap) || e.persist == nil {
+        return nil
+    }
+    // Round-4: bump metaAppliedIndex BEFORE SaveSnap so a successful
+    // snapshot persist always implies LastAppliedIndex >= snap.Metadata.Index.
+    // Skip the bump silently when the FSM does not expose the writer
+    // seam (legacy fakes / test shims).
+    if w, ok := e.fsm.(AppliedIndexWriter); ok {
+        if err := w.SetDurableAppliedIndex(snap.Metadata.Index); err != nil {
+            return errors.WithStack(err)
+        }
+    }
+    if err := e.persist.SaveSnap(snap); err != nil {
+        return errors.WithStack(err)
+    }
+    // ... existing Release + purge ...
+}
+```
+
+The new `AppliedIndexWriter` interface lives next to
+`AppliedIndexReader` in `internal/raftengine/statemachine.go`:
+
+```go
+type AppliedIndexWriter interface {
+    SetDurableAppliedIndex(idx uint64) error
+}
+```
+
+`kvFSM` implements it by forwarding to a new `pebbleStore` method
+that runs a single-key `pebble.Batch` write with the same Sync mode
+as the raft-apply path (`s.raftApplyWriteOpts()`):
+
+```go
+// kv/fsm.go
+func (f *kvFSM) SetDurableAppliedIndex(idx uint64) error {
+    w, ok := f.store.(interface {
+        SetDurableAppliedIndex(idx uint64) error
+    })
+    if !ok { return nil }
+    return w.SetDurableAppliedIndex(idx)
+}
+
+// store/lsm_store.go
+func (s *pebbleStore) SetDurableAppliedIndex(idx uint64) error {
+    s.dbMu.RLock()
+    defer s.dbMu.RUnlock()
+    b := s.db.NewBatch()
+    defer b.Close()
+    if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, idx); err != nil {
+        return errors.WithStack(err)
+    }
+    return errors.WithStack(b.Commit(s.raftApplyWriteOpts()))
+}
+```
+
+**Crash ordering**.  The bump runs before `SaveSnap`, which means the
+invariant is:
+
+| State at crash | metaAppliedIndex on disk | snapshot pointer on disk | After restart |
+|---|---|---|---|
+| Before bump | last data Apply index `Y` | previous snapshot at `X' < X` | skip if `Y ≥ X'` (correct) |
+| Bump done, SaveSnap not yet | `X` | still `X'` | skip succeeds against `X'` (over-restore impossible) |
+| Both done | `X` | `X` | skip succeeds against `X` (correct — the optimisation works) |
+| Both done + later data Apply at `Z > X` | `Z` | `X` | skip succeeds against `X` (correct) |
+
+In particular, there is no ordering where `snapshot pointer = X` but
+`metaAppliedIndex < X`: the snapshot pointer is only persisted after
+the meta key, so the only way to observe a snapshot pointer at `X` is
+that the meta key already reached `X` (or moved past it).  Round-3's
+permanent fallback case is closed.
+
+**Cost**: one extra pebble `Batch.Commit` (Sync per
+`ELASTICKV_FSM_SYNC_MODE`) per snapshot persist.  Snapshots fire on the
+etcd raft `SnapshotCount` cadence (default 10000 entries), so this is
+~one extra fsync per ~10000 entries — negligible.
+
+**Why not bump on every HLC lease apply**.  Option A (1 pebble batch
+per lease tick) costs ~1 fsync/sec/group continuously.  Option B (the
+snapshot-persist hook) costs ~1 fsync per 10000 entries.  Both close
+the skip gap; B costs ~10⁴× less and aligns with the natural
+durability boundary the engine already maintains.
 
 ### 7. Idempotency of replay after skip (OCC two-case)
 
@@ -528,7 +627,7 @@ restoreSnapshotState skipped (FSM at index %d, snapshot at %d, ceiling=%d, cutov
 | Branch | Content | Behaviour change |
 |---|---|---|
 | **B1** (this PR) | Design doc | None |
-| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` with `dbMu.RLock()` + `kvFSM.AppliedIndexReader()` accessor + thread `f.pendingApplyIdx` into the data-Apply leaves | Meta key starts being written; skip is still disabled. Soak in production for one release. |
+| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` + `pebbleStore.SetDurableAppliedIndex()` (both with `dbMu.RLock()`) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + `persistCreatedSnapshot` calls `SetDurableAppliedIndex` BEFORE `e.persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist. Skip is still disabled. Soak in production for one release. |
 | **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip` reusing `kv.ReadSnapshotHeader` + `SnapshotHeaderApplier` seam on `kvFSM` + metrics + INFO log | **User-visible cold-start win.** |
 | **B4** | Lower `HEALTH_TIMEOUT_SECONDS` default once production data shows steady-state skip rate ≥ 90 % | Tighter ceiling; the env override remains honoured. |
 
@@ -538,14 +637,25 @@ Each of B2–B3 ships behind tests:
   `applyMutationsWithOpts` AND `deletePrefixAtWithOpts`; torn-batch
   test simulates pebble WAL replay across the meta key boundary.
   A `kvFSM` unit test asserts that `SetApplyIndex(K)` immediately
-  before a data `Apply` produces `LastAppliedIndex() == K`.
+  before a data `Apply` produces `LastAppliedIndex() == K`.  An
+  engine-level test drives `persistCreatedSnapshot(snap)` against a
+  store whose latest data Apply was at index `Y < snap.Metadata.Index`
+  and asserts `LastAppliedIndex() == snap.Metadata.Index` after the
+  call returns — verifying the snapshot-persist bump closes the
+  codex round-3 P2 gap.  A separate test simulates a crash between
+  `SetDurableAppliedIndex` and `SaveSnap` by injecting a SaveSnap
+  failure and asserts the post-restart `LastAppliedIndex` is at least
+  as fresh as the previous-snapshot pointer (over-restore impossible).
 - **B3**: integration test seeds a fsm.db with `LastAppliedIndex = K`
   and pairs it with a snapshot at index `K-N` (N varies), asserting
   skip is taken for `N ≤ 0` and restore for `N > 0`.  A separate
   test asserts that `applyHeaderStateOnSkip` sets
   `f.hlc.PhysicalCeiling()` **and** `f.restoredCutover` for both v1
   and v2 snapshot headers — the ceiling+cutover are invariant under
-  the optimisation.
+  the optimisation.  An idle-cluster test runs a 3-node cluster with
+  no data writes for `2 * SnapshotCount * hlcRenewalInterval`
+  seconds, takes a snapshot, restarts a node, and asserts the skip
+  fires — proving the codex P2 scenario is closed end-to-end.
 
 ## Open Questions
 
@@ -615,3 +725,37 @@ the `SnapshotHeaderApplier` seam.
 
 Apologies to the review bots for the round-2 push-back.  Round 3
 proceeds against the actual code.
+
+## Round-3 retraction (codex P2)
+
+Round 3 of this doc declared the HLC-lease-only fallback to be "safe
+and rare" and rejected adding any synthetic pebble write for it.
+Codex's round-3 review (P2 at `:438`) pointed out the actual
+production cadence:
+
+- `RunHLCLeaseRenewal` (`kv/coordinator.go:650`) ticks at
+  `hlcRenewalInterval = 1 * time.Second` while the local node is
+  leader.
+- `applyHLCLease` is memory-only; `metaAppliedIndex` does not advance
+  on lease apply.
+- For any cluster with a leader running for >1 s, lease entries trail
+  every snapshot.  Snapshots persist at index `X`, the last
+  data-Apply index `Y < X`, and `metaAppliedIndex` stays at `Y` on
+  restart.  `fsmAlreadyAtIndex(X)` checks `Y >= X` → false → full
+  restore.  Idle clusters degenerate to "the skip never fires";
+  active clusters have a meaningful window where it doesn't fire.
+
+Round 3's framing of this as "rare" was wrong.  Round 4 (§6 HLC lease
+subsection + B2 row + B2 test list) closes the gap by bumping
+`metaAppliedIndex` to `snapshot.Metadata.Index` inside
+`persistCreatedSnapshot`, **before** `e.persist.SaveSnap`.  After a
+successful snapshot persist, `LastAppliedIndex >= snapshot.Index`
+holds unconditionally, so the skip fires reliably on the next
+restart.  Cost: one extra pebble `Batch.Commit` per snapshot persist
+(~one extra fsync per `SnapshotCount` entries, default 10000) versus
+Option A's continuous ~1 fsync/sec/group.
+
+Lesson: "rare" should be a quantitative claim against the actual
+production timer cadence, not an intuition.  Codex's review process
+explicitly cited `kv/coordinator.go:641-663` — a file:line that I
+could have consulted before making the round-3 claim.
