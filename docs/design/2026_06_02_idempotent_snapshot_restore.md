@@ -889,9 +889,11 @@ Each of B2–B3 ships behind tests:
   `f.hlc.PhysicalCeiling()` **and** `f.restoredCutover` for both v1
   and v2 snapshot headers — the ceiling+cutover are invariant under
   the optimisation.  Three additional CRC-corruption tests (round-6,
-  one per failure mode) inject the corruption and assert the
-  specific typed error surfaces from `ApplySnapshotHeaderFromFile`
-  WITHOUT mutating `f.hlc` or `f.restoredCutover`:
+  one per failure mode) inject the corruption and drive the skip path
+  through `applyHeaderStateOnSkip` (either directly or via
+  `restoreSnapshotState` with `fsmAlreadyAtIndex` returning true),
+  asserting the specific typed error surfaces and that the FSM did
+  not mutate `f.hlc` or `f.restoredCutover`:
   - Truncate the `.fsm` file below `fsmMinFileSize` →
     `ErrFSMSnapshotTooSmall`.
   - Pair the file with a wrong-token CRC →
