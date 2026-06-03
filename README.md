@@ -91,7 +91,7 @@ docker compose up -d
 
 ## Admin Dashboard
 
-Elastickv ships an optional admin dashboard — a React SPA plus JSON API served from a separate HTTP listener (default `127.0.0.1:8080`). It is **disabled by default**; enable it with `-adminEnabled`. The dashboard inspects cluster/Raft state and manages DynamoDB tables, SQS queues, and S3 buckets without hand-rolling SigV4 requests. Any node with `-adminEnabled` can serve it: writes against a follower are transparently forwarded to the leader. See [`docs/admin.md`](docs/admin.md) for the operator guide and [`docs/design/2026_04_24_implemented_admin_dashboard.md`](docs/design/2026_04_24_implemented_admin_dashboard.md) for the design rationale.
+Elastickv ships an optional admin dashboard — a React SPA plus JSON API served from a separate HTTP listener (default `127.0.0.1:8080`). It is **disabled by default**; enable it with `--adminEnabled`. The dashboard inspects cluster/Raft state and manages DynamoDB tables, SQS queues, and S3 buckets without hand-rolling SigV4 requests. Any node with `--adminEnabled` can serve it: writes against a follower are transparently forwarded to the leader. See [`docs/admin.md`](docs/admin.md) for the operator guide and [`docs/design/2026_04_24_implemented_admin_dashboard.md`](docs/design/2026_04_24_implemented_admin_dashboard.md) for the design rationale.
 
 **Cluster overview** — leader identity, Raft group membership/local role, and resource counts.
 
