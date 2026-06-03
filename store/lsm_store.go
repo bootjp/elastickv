@@ -41,6 +41,13 @@ const (
 	metaLastCommitTS              = "_meta_last_commit_ts"
 	metaMinRetainedTS             = "_meta_min_retained_ts"
 	metaPendingMinRetainedTS      = "_meta_pending_min_retained_ts"
+	// metaAppliedIndex is the durable raft-applied index meta key.
+	// Bundled atomically with each raft-Apply pebble.Batch (see
+	// applyMutationsRaftAt / deletePrefixAtRaftAt) and pinned to
+	// snap.Metadata.Index by SetDurableAppliedIndex at every snapshot
+	// persist site. See
+	// docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
+	metaAppliedIndex              = "_meta_applied_index"
 	spoolBufSize                  = 32 * 1024 // buffer size for streaming I/O during restore
 
 	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
@@ -156,6 +163,7 @@ func resolvePebbleCacheBytes(envVal string) int64 {
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
 var metaMinRetainedTSBytes = []byte(metaMinRetainedTS)
 var metaPendingMinRetainedTSBytes = []byte(metaPendingMinRetainedTS)
+var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 
 // pebbleStore implements MVCCStore using CockroachDB's Pebble LSM tree.
 //
@@ -534,7 +542,8 @@ func writeTempDBMetadata(db *pebble.DB, lastCommitTS, minRetainedTS uint64) erro
 func isPebbleMetaKey(rawKey []byte) bool {
 	return bytes.Equal(rawKey, metaLastCommitTSBytes) ||
 		bytes.Equal(rawKey, metaMinRetainedTSBytes) ||
-		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes)
+		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes) ||
+		bytes.Equal(rawKey, metaAppliedIndexBytes)
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
@@ -551,6 +560,79 @@ func (s *pebbleStore) findPendingMinRetainedTS() (uint64, error) {
 
 func (s *pebbleStore) saveLastCommitTS(ts uint64) error {
 	return writePebbleUint64(s.db, metaLastCommitTSBytes, ts, pebble.NoSync)
+}
+
+// LastAppliedIndex implements raftengine.AppliedIndexReader. Returns
+// the largest Raft entry index whose Apply produced a durable
+// mutation on this store (via applyMutationsRaftAt /
+// deletePrefixAtRaftAt — same WriteBatch as the data — or via
+// SetDurableAppliedIndex at a snapshot persist).
+//
+// (0, false, nil) means the meta key is absent — either a pre-upgrade
+// fsm.db that has not yet bumped through a raft-Apply, or a freshly
+// restored store. Callers MUST treat this as "missing" and fall back
+// to the full restore path; see
+// docs/design/2026_06_02_idempotent_snapshot_restore.md §4 fallback
+// policy. Any other error propagates.
+//
+// dbMu.RLock matches the rest of the read path
+// (lsm_store.go:153 / :675); without it a concurrent swapInTempDB
+// could replace s.db between db.Get and the closer.Close()/value
+// access, racing the snapshot install path.
+func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	val, closer, err := s.db.Get(metaAppliedIndexBytes)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, errors.WithStack(err)
+	}
+	defer func() { _ = closer.Close() }()
+	if len(val) < timestampSize {
+		// Truncated meta key — treat as missing for strictly-additive
+		// safety. The caller will fall back to full restore, which
+		// produces a fresh well-formed value via the next Apply or
+		// snapshot persist.
+		return 0, false, nil
+	}
+	return binary.LittleEndian.Uint64(val), true, nil
+}
+
+// SetDurableAppliedIndex implements raftengine.AppliedIndexWriter.
+// Used at snapshot persist time to pin metaAppliedIndex to
+// snap.Metadata.Index BEFORE persist.SaveSnap, so a successful
+// snapshot persist always implies LastAppliedIndex >=
+// snap.Metadata.Index — closing the HLC-lease-only / encryption-only
+// fallback (see design doc §6).
+//
+// The write is single-key and goes through a fresh pebble.Batch with
+// pebble.Sync UNCONDITIONALLY — independent of
+// ELASTICKV_FSM_SYNC_MODE. The reason is durability boundary: WAL
+// compaction following SaveSnap discards every log entry at or
+// before snap.Metadata.Index, so there is no source to replay the
+// meta key bump from. If we honoured nosync mode here, a crash
+// between Pebble's deferred flush and SaveSnap's internal fsync
+// would leave snapshot pointer at X but metaAppliedIndex at Y < X
+// forever. The +1 fsync per snapshot persist (rare; default
+// SnapshotCount=10000) is negligible vs that risk.
+//
+// dbMu.RLock is sufficient because we only mutate s.db, not its
+// pointer. The raft-apply loop is serial at the engine boundary, so
+// no concurrent applyMutationsWithOpts can race this single-key
+// write at the Pebble level beyond what last-writer-wins already
+// gives us (and last-writer-wins on metaAppliedIndex always
+// satisfies have >= want for any want we already passed).
+func (s *pebbleStore) SetDurableAppliedIndex(idx uint64) error {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, idx); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(pebble.Sync))
 }
 
 func (s *pebbleStore) saveMinRetainedTS(ts uint64) error {
