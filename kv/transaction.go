@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -57,6 +58,26 @@ type TransactionOption func(*TransactionManager)
 func WithProposalObserver(observer ProposalObserver) TransactionOption {
 	return func(t *TransactionManager) {
 		t.proposalObserver = observer
+	}
+}
+
+// withDynamicRaftPayloadWrap installs a dynamicWrappedProposer in
+// front of the constructor's proposer argument. The wrap closure
+// stored at wrapPtr is loaded on every Propose / ProposeAdmin call;
+// a nil load makes the proposer a pure pass-through (the Stage 3
+// default).
+//
+// Private because the production wiring is NewLeaderProxyForShardGroup,
+// which exposes the wrap surface as ShardGroup.SetRaftPayloadWrap.
+// Tests and direct constructors should go through that path so the
+// wrap pointer's storage stays owned by the ShardGroup that owns
+// the engine.
+func withDynamicRaftPayloadWrap(wrapPtr *atomic.Pointer[RaftPayloadWrapper]) TransactionOption {
+	return func(t *TransactionManager) {
+		if wrapPtr == nil {
+			return
+		}
+		t.proposer = newDynamicWrappedProposer(t.proposer, wrapPtr)
 	}
 }
 

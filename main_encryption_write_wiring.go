@@ -43,9 +43,59 @@ func buildShardGroupsWithEncryptionWiring(
 	}
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)
+	if err == nil {
+		// Stage 6E-2c: surface a startup notice if the sidecar
+		// reports that the raft envelope cutover has already been
+		// installed but the current binary does not (yet) ship the
+		// cipher-aware wrap closure factory. The shardGroup wrap
+		// pointers stay nil — proposals reach the engine cleartext
+		// — so post-cutover writes WOULD halt the apply loop on
+		// the §6.3 strict-`>` unwrap path if any committed entries
+		// landed above the cutover under this binary.
+		//
+		// In a healthy 6E-2c-only deployment this never fires:
+		// raftEnvelopeWrapEnabled is still false in
+		// adapter/encryption_admin.go (see Stage 6E-1b), so
+		// EnableRaftEnvelope refuses to record a cutover index.
+		// The notice fires only on a sidecar restored from a
+		// future deployment where 6E-2f flipped the gate, or one
+		// hand-edited — both cases the operator must intervene
+		// before serving traffic.
+		noteRaftEnvelopeCutoverStartup(sidecarPath)
+	}
 	// Return the wiring (cache + bumped epoch) so run() can drive the
 	// Stage 7a process-start registration after the shard stores open.
 	return runtimes, shardGroups, encWiring, err
+}
+
+// noteRaftEnvelopeCutoverStartup reads the sidecar at process start
+// and logs a WARN if RaftEnvelopeCutoverIndex is non-zero. Stage
+// 6E-2c installs the dynamic wrap proposer chain on every shard
+// group but leaves the wrap closure pointer nil — the cipher-aware
+// factory ships in Stage 6E-2e/2f. Without the closure, a post-
+// cutover write proposed under this binary would land cleartext
+// above the cutover; the strict-`>` apply hook would then halt on
+// unwrap failure.
+//
+// Missing or unreadable sidecars are not this helper's concern —
+// the Stage 6C-1 startup guard already refuses to boot when the
+// sidecar is malformed or the KEK does not unwrap the recorded
+// DEKs. A clean ReadSidecar with a zero RaftEnvelopeCutoverIndex is
+// the Stage 3 default and stays silent.
+func noteRaftEnvelopeCutoverStartup(sidecarPath string) {
+	if sidecarPath == "" {
+		return
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		return
+	}
+	if sc.RaftEnvelopeCutoverIndex == 0 {
+		return
+	}
+	slog.Warn("encryption: sidecar reports raft envelope cutover active but Stage 6E-2c does not install the wrap closure on shard groups; Stage 6E-2e/2f wires the cipher. Until then, fresh writes that land above the cutover would halt the apply loop on §6.3 strict-> unwrap. Operator action required.",
+		slog.Uint64("cutover_index", sc.RaftEnvelopeCutoverIndex),
+		slog.String("sidecar_path", sidecarPath))
 }
 
 // encryptionWriteWiring bundles the Stage 6D-6c storage-envelope

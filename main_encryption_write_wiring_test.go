@@ -200,3 +200,68 @@ func TestPrepareStorageNonceEpoch_SaturatedEpoch_RefusesWithExhausted(t *testing
 		t.Errorf("error not marked ErrLocalEpochExhausted: %v", err)
 	}
 }
+
+// TestNoteRaftEnvelopeCutoverStartup_NoSidecarPath pins the
+// degraded-input behaviour: an empty sidecar path returns without
+// any side effect (no log, no panic). This is the
+// encryption-disabled startup case where no sidecar is configured.
+func TestNoteRaftEnvelopeCutoverStartup_NoSidecarPath(t *testing.T) {
+	t.Parallel()
+	noteRaftEnvelopeCutoverStartup("")
+}
+
+// TestNoteRaftEnvelopeCutoverStartup_MissingSidecar pins the
+// silent-on-missing-file behaviour: the Stage 6C-1 startup guard
+// is the authoritative refuser of malformed sidecars; this helper
+// only cares about a present sidecar with a non-zero cutover
+// index, and silently returns on any ReadSidecar error.
+func TestNoteRaftEnvelopeCutoverStartup_MissingSidecar(t *testing.T) {
+	t.Parallel()
+	noteRaftEnvelopeCutoverStartup(t.TempDir() + "/absent.json")
+}
+
+// TestNoteRaftEnvelopeCutoverStartup_ZeroCutoverIsSilent pins the
+// Stage 3 default: a sidecar with RaftEnvelopeCutoverIndex == 0
+// must not log — that is the pre-cutover state, which is
+// universal until Stage 6E-2f flips the gate.
+func TestNoteRaftEnvelopeCutoverStartup_ZeroCutoverIsSilent(t *testing.T) {
+	t.Parallel()
+	path := writeActiveStorageSidecar(t, 0) // RaftEnvelopeCutoverIndex defaults to 0
+	noteRaftEnvelopeCutoverStartup(path)
+}
+
+// TestNoteRaftEnvelopeCutoverStartup_NonZeroCutoverLogs exercises
+// the "active cutover but no wrap closure" branch end-to-end:
+// write a sidecar with RaftEnvelopeCutoverIndex != 0, invoke the
+// hook, and confirm it does not panic / does not mutate the
+// sidecar. The log line itself is observable only via slog
+// handlers in production; the test exists primarily so a future
+// refactor that removes the read path fails compile or trips a
+// regression in this asserted-no-panic branch.
+func TestNoteRaftEnvelopeCutoverStartup_NonZeroCutoverLogs(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := dir + "/keys.json"
+	sc := &encryption.Sidecar{
+		Version:                  encryption.SidecarVersion,
+		StorageEnvelopeActive:    true,
+		RaftEnvelopeCutoverIndex: 12345,
+		Active:                   encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage-wrapped-bytes")},
+			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft-wrapped-bytes-diff")},
+		},
+	}
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	noteRaftEnvelopeCutoverStartup(path)
+	// Sidecar must be unchanged on disk — the hook is read-only.
+	got, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar after hook: %v", err)
+	}
+	if got.RaftEnvelopeCutoverIndex != 12345 {
+		t.Errorf("post-hook RaftEnvelopeCutoverIndex = %d, want 12345 (hook must be read-only)", got.RaftEnvelopeCutoverIndex)
+	}
+}

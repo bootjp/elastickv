@@ -24,6 +24,72 @@ type ShardGroup struct {
 	Store  store.MVCCStore
 	Txn    Transactional
 	lease  leaseState
+	// raftPayloadWrap is the Stage 6E-2c hot-swap point for the raft
+	// envelope wrap closure. A nil load means the wrap is inactive
+	// and proposals pass through cleartext (the Stage 3 default).
+	// A non-nil load applies the closure to every payload before it
+	// reaches the engine — Propose and ProposeAdmin alike, by
+	// design (see kv/raft_payload_wrapper.go for the rationale).
+	//
+	// The cell is read on every proposal via dynamicWrappedProposer,
+	// installed in the TransactionManager's proposer chain when the
+	// ShardGroup is constructed. SetRaftPayloadWrap publishes a fresh
+	// closure atomically so EnableRaftEnvelope (Stage 6E-2d) can
+	// activate the wrap the instant the cutover entry commits,
+	// without rebuilding the TransactionManager or stalling
+	// in-flight proposals.
+	raftPayloadWrap atomic.Pointer[RaftPayloadWrapper]
+}
+
+// SetRaftPayloadWrap publishes wrap as the active raft envelope
+// closure for this shard group. Passing nil clears the wrap (the
+// proposer reverts to cleartext pass-through). Safe to call from
+// any goroutine; the next Propose / ProposeAdmin observes the new
+// state via the proposer's atomic.Pointer.Load.
+//
+// This is the sole supported way to install or rotate the wrap
+// closure on a running coordinator. Stage 6E-2d's
+// EnableRaftEnvelope handler will call this on every leader when
+// the cutover entry commits.
+func (g *ShardGroup) SetRaftPayloadWrap(wrap RaftPayloadWrapper) {
+	if wrap == nil {
+		g.raftPayloadWrap.Store(nil)
+		return
+	}
+	g.raftPayloadWrap.Store(&wrap)
+}
+
+// RaftPayloadWrap returns the currently-installed wrap closure, or
+// nil if the wrap is inactive. Primarily intended for tests and
+// diagnostics; production proposers consult the underlying
+// atomic.Pointer directly (see dynamicWrappedProposer).
+func (g *ShardGroup) RaftPayloadWrap() RaftPayloadWrapper {
+	if p := g.raftPayloadWrap.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// NewLeaderProxyForShardGroup wires a LeaderProxy whose proposer
+// consults g.raftPayloadWrap on every call, so SetRaftPayloadWrap
+// becomes the hot-swap surface for the raft envelope cutover.
+//
+// Use this in preference to NewLeaderProxyWithEngine(g.Engine, ...)
+// for any ShardGroup that participates in the encryption cutover
+// pipeline — without the dynamic wrap, post-cutover writes would
+// land cleartext at index > cutoverIndex and halt the apply loop on
+// strict-> unwrap. The non-wrap-aware constructor remains as a
+// convenience for shard groups that opt out of encryption (test
+// fixtures, transient groups).
+func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *LeaderProxy {
+	// Prepend the wrap-installation option so a caller-provided
+	// WithProposer would still take precedence (last option wins).
+	// In practice this PR has no caller that overrides the proposer
+	// via opts; the slot is reserved for future composition.
+	combined := make([]TransactionOption, 0, len(opts)+1)
+	combined = append(combined, withDynamicRaftPayloadWrap(&g.raftPayloadWrap))
+	combined = append(combined, opts...)
+	return NewLeaderProxyWithEngine(g.Engine, combined...)
 }
 
 // leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
