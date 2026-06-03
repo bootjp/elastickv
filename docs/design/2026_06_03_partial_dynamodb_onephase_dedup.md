@@ -330,8 +330,34 @@ every replica applying the same log entry.
   the workload classifies as a definite `:fail` (excluded from the history), so
   it does not produce the duplicate. Bringing it under reuse-dedup is tractable
   but doubles the test matrix; defer it.
-- **Out of scope:** S3 / SQS adapters (same `readTS`-then-mutate pattern, same
-  latent bug class) — separate docs once this lands as the template.
+- **S3 / SQS — audited (2026-06-03).** A handler-by-handler adversarial sweep
+  found that the original "same latent bug class" claim was over-broad. The
+  DynamoDB bug is specific to a read-modify-write that **recomputes a growing
+  value** (`list_append`) at a **stable key** on a self-conflict retry. The
+  audit verdicts:
+  - **S3 — no duplicate possible.** Object writes are whole-value PUTs at a
+    stable key (`PutObject`, `CompleteMultipartUpload` whose manifest is
+    re-assembled deterministically from the immutable uploaded parts, not from
+    a re-read of the object value). `PutObject` carries a caller-supplied
+    `StartTS`, so a leader-move coordinator retry that races an interleaved
+    write fails the OCC fence rather than clobbering it; it has no in-process
+    re-read-recompute retry. No `list_append`-style growth, no recompute-into-a-
+    different-value → no `:duplicate-elements`.
+  - **SQS single `SendMessage` / FIFO — safe.** Single send keys the message by
+    a random `MessageId` with no in-process retry (a conflict surfaces to the
+    client as a normal at-least-once SDK retry). FIFO send is fenced by the
+    `MessageDeduplicationId` dedup record (committed atomically with the
+    sequence), whose hit short-circuits any retry.
+  - **SQS standard `SendMessageBatch` — HAD the bug, FIXED here.** Unlike single
+    send, the batch path added an **in-process** retry loop
+    (`sendMessageBatchWithRetry`) that re-minted fresh random `MessageId`s (and
+    send timestamps) per attempt, so a committed-but-conflicted attempt plus the
+    retry double-sent every entry. Fixed by pre-generating one stable
+    `sqsSendIdentity` per entry **before** the retry loop and reusing it on
+    every attempt (`buildSendRecordWithIdentity`), so the retry overwrites the
+    same keys idempotently. This needs **no** FSM probe / `PrevCommitTS` / gate —
+    the keys become content-stable, so re-applying is a plain idempotent
+    overwrite. Tests: `adapter/sqs_batch_send_dedup_test.go`.
 
 ## Milestones
 

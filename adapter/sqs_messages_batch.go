@@ -121,10 +121,26 @@ func (s *SQSServer) sendMessageBatchWithRetry(
 	queueName string,
 	entries []sqsSendMessageBatchEntryInput,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, error) {
+	// Pre-generate one stable identity per entry BEFORE the retry loop. The
+	// standard-queue path keys each message by its random MessageID (and by
+	// timestamps derived from the send wall-clock), so re-minting per attempt
+	// would land a committed-but-conflicted attempt's messages at one key set
+	// and the retry's at another — double-sending every entry under leader
+	// churn. Reusing the identity makes the retry overwrite the SAME keys
+	// idempotently. Identities are indexed by entry position; FIFO entries
+	// ignore them (they mint their own per-entry dedup-fenced identity).
+	identities := make([]sqsSendIdentity, len(entries))
+	for i := range identities {
+		id, err := newSendIdentity()
+		if err != nil {
+			return nil, nil, err
+		}
+		identities[i] = id
+	}
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		successful, failed, retry, err := s.trySendMessageBatchOnce(ctx, queueName, entries)
+		successful, failed, retry, err := s.trySendMessageBatchOnce(ctx, queueName, entries, identities)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -154,6 +170,7 @@ func (s *SQSServer) trySendMessageBatchOnce(
 	ctx context.Context,
 	queueName string,
 	entries []sqsSendMessageBatchEntryInput,
+	identities []sqsSendIdentity,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, bool, error) {
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
@@ -166,7 +183,7 @@ func (s *SQSServer) trySendMessageBatchOnce(
 	if meta.IsFIFO {
 		return s.sendBatchFifoEntries(ctx, queueName, meta, entries)
 	}
-	return s.sendBatchStandardOnce(ctx, queueName, meta, entries, readTS)
+	return s.sendBatchStandardOnce(ctx, queueName, meta, entries, identities, readTS)
 }
 
 // sendBatchStandardOnce is the original single-OCC fast path for
@@ -177,6 +194,7 @@ func (s *SQSServer) sendBatchStandardOnce(
 	queueName string,
 	meta *sqsQueueMeta,
 	entries []sqsSendMessageBatchEntryInput,
+	identities []sqsSendIdentity,
 	readTS uint64,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, bool, error) {
 	successful := make([]sqsSendMessageBatchResultEntry, 0, len(entries))
@@ -187,8 +205,12 @@ func (s *SQSServer) sendBatchStandardOnce(
 	// against.
 	const opsPerEntry = 3
 	elems := make([]*kv.Elem[kv.OP], 0, opsPerEntry*len(entries))
-	for _, entry := range entries {
-		rec, recordBytes, apiErr := buildBatchSendRecord(meta, entry)
+	for i, entry := range entries {
+		// identities[i] is the stable per-entry identity minted once before
+		// the retry loop; reusing it keeps the storage keys constant across
+		// retries so a committed-but-conflicted attempt is overwritten
+		// idempotently rather than double-sent.
+		rec, recordBytes, apiErr := buildBatchSendRecord(meta, entry, identities[i])
 		if apiErr != nil {
 			failed = append(failed, batchErrorEntryFromAPIErr(entry.Id, apiErr))
 			continue
@@ -390,7 +412,7 @@ func (s *SQSServer) resolveFreshFifoSnapshot(ctx context.Context, queueName stri
 // SendMessage would, but returns the *sqsAPIError so the batch path
 // can drop the entry into Failed[] instead of failing the whole
 // request.
-func buildBatchSendRecord(meta *sqsQueueMeta, entry sqsSendMessageBatchEntryInput) (*sqsMessageRecord, []byte, error) {
+func buildBatchSendRecord(meta *sqsQueueMeta, entry sqsSendMessageBatchEntryInput, id sqsSendIdentity) (*sqsMessageRecord, []byte, error) {
 	if len(entry.MessageBody) == 0 {
 		return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required")
 	}
@@ -414,7 +436,9 @@ func buildBatchSendRecord(meta *sqsQueueMeta, entry sqsSendMessageBatchEntryInpu
 	if err != nil {
 		return nil, nil, err
 	}
-	return buildSendRecord(meta, asSingle, delay)
+	// Use the caller-supplied stable identity (minted once before the batch
+	// retry loop) so retries reuse the same MessageID/timestamps/keys.
+	return buildSendRecordWithIdentity(meta, asSingle, delay, id)
 }
 
 // ------------------------ DeleteMessageBatch ------------------------

@@ -653,28 +653,65 @@ func resolveSendDelay(meta *sqsQueueMeta, requested *int64) (int64, error) {
 	return *requested, nil
 }
 
-func buildSendRecord(meta *sqsQueueMeta, in sqsSendMessageInput, delay int64) (*sqsMessageRecord, []byte, error) {
+// sqsSendIdentity is the per-message identity that MUST stay stable across a
+// retry loop: the random MessageID, the random receipt token, and the send
+// wall-clock timestamp. All three feed the message's storage keys (data key
+// via MessageID; vis key via AvailableAtMillis = sendTs + delay; by-age key via
+// sendTs) — so if they were re-minted on every retry attempt, a committed-but-
+// conflicted attempt under leader churn plus the recomputed retry would land at
+// two different key sets, double-sending the message (the :duplicate-elements
+// class fixed for DynamoDB in PR #920). The batch send path pre-generates one
+// identity per entry once, before the retry loop, and reuses it on every
+// attempt so a retry overwrites the same keys idempotently.
+type sqsSendIdentity struct {
+	messageID    string
+	token        []byte
+	sendTsMillis int64
+}
+
+// newSendIdentity mints a fresh stable identity. Single-message sends call this
+// inline (they have no in-process retry, so a self-inflicted conflict surfaces
+// to the client as a normal at-least-once SDK retry); the batch path calls it
+// once per entry before its retry loop.
+func newSendIdentity() (sqsSendIdentity, error) {
 	messageID, err := newMessageIDHex()
 	if err != nil {
-		return nil, nil, errors.WithStack(err)
+		return sqsSendIdentity{}, errors.WithStack(err)
 	}
 	token, err := newReceiptToken()
 	if err != nil {
-		return nil, nil, errors.WithStack(err)
+		return sqsSendIdentity{}, errors.WithStack(err)
 	}
-	now := time.Now().UnixMilli()
-	availableAt := now + delay*sqsMillisPerSecond
+	return sqsSendIdentity{messageID: messageID, token: token, sendTsMillis: time.Now().UnixMilli()}, nil
+}
+
+func buildSendRecord(meta *sqsQueueMeta, in sqsSendMessageInput, delay int64) (*sqsMessageRecord, []byte, error) {
+	id, err := newSendIdentity()
+	if err != nil {
+		return nil, nil, err
+	}
+	return buildSendRecordWithIdentity(meta, in, delay, id)
+}
+
+// buildSendRecordWithIdentity builds the message record from a caller-supplied
+// stable identity instead of minting a fresh one. The record value embeds the
+// current meta.Generation, so callers re-invoke this per retry attempt with the
+// freshly-read generation while keeping the identity fixed — the keys stay
+// stable for a given generation (idempotent overwrite under leader churn) and
+// follow the generation if a concurrent DeleteQueue/PurgeQueue bumps it.
+func buildSendRecordWithIdentity(meta *sqsQueueMeta, in sqsSendMessageInput, delay int64, id sqsSendIdentity) (*sqsMessageRecord, []byte, error) {
+	availableAt := id.sendTsMillis + delay*sqsMillisPerSecond
 	body := []byte(in.MessageBody)
 	rec := &sqsMessageRecord{
-		MessageID:              messageID,
+		MessageID:              id.messageID,
 		Body:                   body,
 		MD5OfBody:              sqsMD5Hex(body),
 		MD5OfMessageAttributes: md5OfAttributesHex(in.MessageAttributes),
 		MessageAttributes:      in.MessageAttributes,
-		SendTimestampMillis:    now,
+		SendTimestampMillis:    id.sendTsMillis,
 		AvailableAtMillis:      availableAt,
 		VisibleAtMillis:        availableAt,
-		CurrentReceiptToken:    token,
+		CurrentReceiptToken:    id.token,
 		QueueGeneration:        meta.Generation,
 		MessageGroupId:         in.MessageGroupId,
 		MessageDeduplicationId: in.MessageDeduplicationId,
