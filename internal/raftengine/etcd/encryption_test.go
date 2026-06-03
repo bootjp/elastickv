@@ -78,13 +78,6 @@ func envelopeEntry(t *testing.T, c *encryption.Cipher, kid uint32, index uint64,
 	return raftpb.Entry{Index: index, Type: raftpb.EntryNormal, Data: encodeProposalEnvelope(7, wrapped)}
 }
 
-// TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed locks down
-// the misconfig case: when the cluster has crossed the raft envelope
-// cutover (an above-cutover entry arrives) but raftCipher is nil —
-// a sidecar/init race or operator wiring mistake — the engine MUST
-// refuse to apply, NOT silently hand wrapped envelope bytes to
-// fsm.Apply. The latter would permanently diverge this node from
-// peers that DID unwrap and apply the cleartext.
 // TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure pins
 // the §7.1 barrier's typed error as a separate sentinel from
 // ErrRaftUnwrapFailed. The two have very different operator
@@ -105,11 +98,25 @@ func TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure(t *testing.T) {
 	if errors.Is(ErrRaftUnwrapFailed, ErrEnvelopeCutoverInProgress) {
 		t.Error("ErrRaftUnwrapFailed matches ErrEnvelopeCutoverInProgress; the process-fatal sentinel must not be misclassified as retryable")
 	}
-	if !errors.Is(ErrEnvelopeCutoverInProgress, ErrEnvelopeCutoverInProgress) {
-		t.Error("ErrEnvelopeCutoverInProgress fails errors.Is against itself")
+	// Pin the chain contract that Stage 6E-2b callers depend
+	// on: an errors.Wrap-wrapped sentinel must still match via
+	// errors.Is. A downstream caller that wraps the sentinel
+	// for diagnostic context would otherwise silently lose its
+	// retryable classification and fall through to a
+	// process-fatal error path.
+	wrapped := errors.Wrap(ErrEnvelopeCutoverInProgress, "cutover barrier open")
+	if !errors.Is(wrapped, ErrEnvelopeCutoverInProgress) {
+		t.Error("ErrEnvelopeCutoverInProgress lost through errors.Wrap; callers using errors.Is on a wrapped error must still match the sentinel")
 	}
 }
 
+// TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed locks down
+// the misconfig case: when the cluster has crossed the raft envelope
+// cutover (an above-cutover entry arrives) but raftCipher is nil —
+// a sidecar/init race or operator wiring mistake — the engine MUST
+// refuse to apply, NOT silently hand wrapped envelope bytes to
+// fsm.Apply. The latter would permanently diverge this node from
+// peers that DID unwrap and apply the cleartext.
 func TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed(t *testing.T) {
 	t.Parallel()
 	const cutover uint64 = 100
