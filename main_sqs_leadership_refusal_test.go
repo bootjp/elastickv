@@ -20,6 +20,9 @@ import (
 func (f *fakeLeadershipController) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
+func (f *fakeLeadershipController) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return f.Propose(ctx, data)
+}
 func (f *fakeLeadershipController) Leader() raftengine.LeaderInfo        { return raftengine.LeaderInfo{} }
 func (f *fakeLeadershipController) VerifyLeader(_ context.Context) error { return nil }
 func (f *fakeLeadershipController) LinearizableRead(_ context.Context) (uint64, error) {

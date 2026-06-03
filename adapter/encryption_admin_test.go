@@ -1000,6 +1000,16 @@ func (p *recordingProposer) Propose(_ context.Context, data []byte) (*raftengine
 	return &raftengine.ProposalResult{CommitIndex: p.commitIndex}, nil
 }
 
+// ProposeAdmin records the call into the same slice as Propose so
+// existing assertions on p.calls continue to work after the
+// adapter/encryption_admin.go production callers (which now route
+// every control-plane entry through ProposeAdmin) switched paths.
+// In the current build both methods are operationally identical;
+// the bookkeeping is unified intentionally.
+func (p *recordingProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return p.Propose(ctx, data)
+}
+
 // stubLeaderView reports a fixed leadership state. verifyErr lets
 // a test simulate a partitioned former leader: State() still
 // reports StateLeader but VerifyLeader returns an error because
@@ -1087,6 +1097,18 @@ func (p *applyingProposer) Propose(ctx context.Context, data []byte) (*raftengin
 		return nil, werr
 	}
 	return res, nil
+}
+
+// ProposeAdmin redirects to applyingProposer.Propose (not the
+// embedded recordingProposer.Propose) so the applyFn side-effect
+// fires for admin-path proposals as well. Without this explicit
+// override, Go method resolution would dispatch
+// recordingProposer.ProposeAdmin -> recordingProposer.Propose and
+// skip the applyingProposer-level Propose body — silently losing
+// the apply emulation that EnableStorageEnvelope /
+// EnableRaftEnvelope happy-path tests depend on.
+func (p *applyingProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return p.Propose(ctx, data)
 }
 
 // applyCutover is the §6.4 fresh-success apply effect: flip

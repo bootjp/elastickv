@@ -182,6 +182,69 @@ func (s *countingSnapshotStateMachine) Restore(r io.Reader) error {
 	return err
 }
 
+// TestProposeAdmin_EquivalentToProposeToday pins the Stage 6E-2b
+// invariant: ProposeAdmin and Propose commit equivalent entries on
+// the current build. Both reach the FSM as the same byte sequence
+// and report a non-zero CommitIndex.
+//
+// This is the bridge property the migration relies on. Stage 6E-2d
+// will diverge the two paths — Propose gains a §7.1 quiescence
+// barrier check that rejects with ErrEnvelopeCutoverInProgress
+// while a cutover is being installed; ProposeAdmin remains
+// admissible so the cutover entry and ConfChange-time
+// RegisterEncryptionWriter proposals can still land. Until that
+// behaviour change ships, callers that switched to ProposeAdmin
+// in this PR must see identical results to staying on Propose,
+// else the migration would visibly change semantics before
+// 6E-2d's protective barrier is in place.
+func TestProposeAdmin_EquivalentToProposeToday(t *testing.T) {
+	fsm := &testStateMachine{}
+	engine, err := Open(context.Background(), OpenConfig{
+		NodeID:       1,
+		LocalID:      "n1",
+		LocalAddress: "127.0.0.1:7011",
+		DataDir:      t.TempDir(),
+		Bootstrap:    true,
+		StateMachine: fsm,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, engine.Close())
+	})
+
+	require.Equal(t, raftengine.StateLeader, engine.State())
+
+	plainRes, err := engine.Propose(context.Background(), []byte("plain"))
+	require.NoError(t, err)
+	require.NotNil(t, plainRes)
+	require.NotZero(t, plainRes.CommitIndex)
+	require.Equal(t, "plain", plainRes.Response)
+
+	adminRes, err := engine.ProposeAdmin(context.Background(), []byte("admin"))
+	require.NoError(t, err)
+	require.NotNil(t, adminRes)
+	require.NotZero(t, adminRes.CommitIndex)
+	require.Equal(t, "admin", adminRes.Response)
+	require.Greater(t, adminRes.CommitIndex, plainRes.CommitIndex,
+		"ProposeAdmin must advance CommitIndex past the preceding Propose, "+
+			"proving its proposal reaches the engine through the same Raft path")
+
+	applied := fsm.Applied()
+	require.Equal(t, [][]byte{[]byte("plain"), []byte("admin")}, applied,
+		"both Propose and ProposeAdmin must reach the FSM verbatim and in-order")
+}
+
+// Compile-time guard: *Engine must satisfy raftengine.Proposer
+// (which Stage 6E-2b extended with ProposeAdmin). Declared at
+// package scope so the check fires at test-package compile time
+// regardless of which test is selected; wrapping it inside a
+// no-op test function would defer the check to a test target
+// nobody runs. Removing ProposeAdmin from the interface would
+// either leave this assertion dangling (if Engine still has the
+// method) or hard-fail the build (if it doesn't) — the latter is
+// the failure mode this guard exists to produce.
+var _ raftengine.Proposer = (*Engine)(nil)
+
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
 	fsm := &testStateMachine{}
 	engine, err := Open(context.Background(), OpenConfig{

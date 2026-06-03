@@ -1341,7 +1341,27 @@ func (s *EncryptionAdminServer) proposeEncryptionEntry(ctx context.Context, opco
 	entry := make([]byte, 0, 1+len(body))
 	entry = append(entry, opcode)
 	entry = append(entry, body...)
-	res, err := s.proposer.Propose(ctx, entry)
+	// proposeEncryptionEntry composes control-plane entries
+	// (BootstrapEncryption, EnableStorageEnvelope, the §6E
+	// EnableRaftEnvelope cutover marker, RotateDEK,
+	// RegisterEncryptionWriter, etc.). The §7.1 quiescence barrier
+	// Stage 6E-2d installs on Propose would reject these — most
+	// trivially, the cutover entry itself would deadlock on its
+	// own barrier — so admin ops route through the
+	// barrier-exempt ProposeAdmin path.
+	//
+	// ProposeAdmin is barrier-exempt only; the wrap layer above
+	// the engine (kv.wrappedProposer, when configured) still
+	// applies its wrap closure to ProposeAdmin payloads, so a
+	// post-cutover RotateDEK or RegisterEncryptionWriter
+	// committed at `index > raftEnvelopeCutoverIndex` carries the
+	// AEAD envelope the §6.3 strict-`>` apply hook expects. The
+	// EnableRaftEnvelope cutover marker (at `index == cutover`)
+	// must remain cleartext for strict-`>` to leave it alone;
+	// today s.proposer is wired to the raw engine (see
+	// main_encryption_admin.go), so the marker reaches Raft
+	// without the wrap layer in the path at all.
+	res, err := s.proposer.ProposeAdmin(ctx, entry)
 	if err != nil {
 		return 0, proposeErrorToStatus(err, opcode)
 	}

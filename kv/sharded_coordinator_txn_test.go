@@ -401,6 +401,9 @@ type noopEngine struct{}
 func (noopEngine) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
+func (e noopEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.Propose(ctx, data)
+}
 func (noopEngine) State() raftengine.State                            { return raftengine.StateLeader }
 func (noopEngine) Leader() raftengine.LeaderInfo                      { return raftengine.LeaderInfo{} }
 func (noopEngine) VerifyLeader(_ context.Context) error               { return nil }

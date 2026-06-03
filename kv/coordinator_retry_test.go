@@ -25,6 +25,9 @@ type stubLeaderEngine struct{}
 func (stubLeaderEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
+func (e stubLeaderEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.Propose(ctx, data)
+}
 func (stubLeaderEngine) State() raftengine.State { return raftengine.StateLeader }
 func (stubLeaderEngine) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"}

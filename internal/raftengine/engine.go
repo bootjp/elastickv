@@ -73,8 +73,45 @@ type ProposalResult struct {
 	Response    any
 }
 
+// Proposer drives a Raft proposal through the engine and returns
+// once it has been committed (or the context/engine cancels first).
+//
+// Two semantically distinct entry points, differing ONLY in the
+// §7.1 quiescence-barrier check Stage 6E-2d installs on Propose:
+//
+//   - Propose carries ordinary user-data and control-plane traffic
+//     that may be paused during a raft-envelope cutover. 6E-2d will
+//     reject these with ErrEnvelopeCutoverInProgress while the
+//     barrier is open so the leader cannot admit a fresh entry at
+//     `index > raftEnvelopeCutoverIndex` mid-installation.
+//   - ProposeAdmin carries proposals that MUST remain admissible
+//     across the barrier — the EnableRaftEnvelope cutover entry
+//     itself (without this exemption the barrier would deadlock on
+//     its own cutover proposal) and ConfChange-time
+//     RegisterEncryptionWriter proposals (Stage 7c §3.1, so a new
+//     member joining mid-barrier can still register its
+//     writer-registry entry).
+//
+// ProposeAdmin is NOT a wrap-exemption: a payload-wrap layer
+// configured above the engine (kv.wrappedProposer) applies its
+// wrap closure to both methods identically. Admin entries that
+// land at `index > raftEnvelopeCutoverIndex` (a leader-restart
+// registration, a post-cutover RotateDEK, etc.) must carry the
+// AEAD envelope the §6.3 strict-`>` apply hook expects; a cleartext
+// admin entry above cutover would halt the apply loop on
+// unwrap-failure. The lone exception is the EnableRaftEnvelope
+// cutover marker (sits at `index == cutover`, strict-`>` leaves it
+// alone), which is proposed via a raw engine reference and never
+// flows through the wrap layer in the first place.
+//
+// In the current build the two methods are operationally
+// equivalent (the barrier is still 6E-2d work); the distinction at
+// the call site is the migration the future barrier requires —
+// sites still on Propose would fail closed the moment 6E-2d
+// activates the barrier.
 type Proposer interface {
 	Propose(ctx context.Context, data []byte) (*ProposalResult, error)
+	ProposeAdmin(ctx context.Context, data []byte) (*ProposalResult, error)
 }
 
 type LeaderView interface {

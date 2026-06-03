@@ -75,3 +75,36 @@ func (p *wrappedProposer) Propose(ctx context.Context, data []byte) (*raftengine
 	}
 	return res, nil
 }
+
+// ProposeAdmin applies the configured RaftPayloadWrapper before
+// forwarding the payload to the inner ProposeAdmin path. The wrap
+// layer is NOT a barrier-exemption concern: it exists so that
+// every entry landing at `index > raftEnvelopeCutoverIndex` carries
+// an AEAD envelope the §6.3 strict-`>` apply hook can unwrap.
+// Admin entries (BootstrapEncryption, RotateDEK,
+// RegisterEncryptionWriter, etc.) committed after the cutover are
+// no different from user data in that regard — a cleartext admin
+// entry above cutover would halt the apply loop on unwrap-failure,
+// not be silently passed through.
+//
+// The lone exception is the EnableRaftEnvelope cutover marker
+// itself, which sits exactly at `index == cutover` and must remain
+// cleartext for strict-`>` dispatch to leave it alone. That marker
+// is proposed via a raw engine reference (adapter/encryption_admin.go
+// holds the engine directly as s.proposer), not via the
+// wrappedProposer — so this wrap path is never on its way.
+//
+// ProposeAdmin's only divergence from Propose lives in Stage
+// 6E-2d's §7.1 quiescence-barrier check, which is installed on
+// Propose only.
+func (p *wrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	wrapped, err := applyRaftPayloadWrap(p.wrap, data)
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.inner.ProposeAdmin(ctx, wrapped)
+	if err != nil {
+		return nil, errors.Wrap(err, "kv: wrapped propose-admin")
+	}
+	return res, nil
+}
