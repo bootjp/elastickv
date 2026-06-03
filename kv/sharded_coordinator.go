@@ -81,6 +81,14 @@ func (g *ShardGroup) RaftPayloadWrap() RaftPayloadWrapper {
 // strict-> unwrap. The non-wrap-aware constructor remains as a
 // convenience for shard groups that opt out of encryption (test
 // fixtures, transient groups).
+//
+// Contract: g MUST be non-nil. The constructor takes the address
+// of g.raftPayloadWrap so a nil receiver is an immediate nil deref
+// — caller bug, not silently swallowed. Returning nil here would
+// only defer the panic to the first sg.Txn.Commit call site (see
+// main.go's buildShardGroups), with worse diagnostics; CLAUDE.md's
+// "don't validate for scenarios that can't happen at internal
+// boundaries" applies.
 func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *LeaderProxy {
 	// Prepend the wrap-installation option so a caller-provided
 	// WithProposer would still take precedence (last option wins).

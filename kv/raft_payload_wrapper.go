@@ -136,18 +136,32 @@ type dynamicWrappedProposer struct {
 	wrapPtr *atomic.Pointer[RaftPayloadWrapper]
 }
 
-// newDynamicWrappedProposer wires a proposer that consults wrapPtr on
-// every Propose / ProposeAdmin. wrapPtr.Load() == nil keeps the path
-// as a pure pass-through to inner; a non-nil value applies wrap
-// before forwarding. wrapPtr must not be nil itself — the caller
-// owns the storage lifetime.
+// newDynamicWrappedProposer wires a proposer that consults wrapPtr
+// on every Propose / ProposeAdmin. wrapPtr.Load() == nil keeps the
+// path as a pure pass-through to inner; a non-nil value applies
+// wrap before forwarding.
+//
+// Contract: inner MUST be non-nil. A nil inner is a caller bug
+// (the construction site is responsible for handing in a valid
+// proposer) and the constructor deliberately does not silently
+// degrade — passing nil to Propose / ProposeAdmin would NPE at
+// the first call site, which is the same fail-fast shape as the
+// sibling newWrappedProposer(nil, wrap) and matches CLAUDE.md's
+// "don't validate for scenarios that can't happen" policy at
+// internal boundaries.
+//
+// wrapPtr MAY be nil — that path returns inner verbatim, mirroring
+// newWrappedProposer(inner, nil)'s degraded shape so a wiring site
+// that accidentally drops the pointer downgrades to a no-wrap
+// proposer rather than crashing the engine loop on first use. The
+// caller owns the storage lifetime of the pointer when non-nil.
 func newDynamicWrappedProposer(inner raftengine.Proposer, wrapPtr *atomic.Pointer[RaftPayloadWrapper]) raftengine.Proposer {
 	if wrapPtr == nil {
-		// Defensive: passing a nil pointer would NPE on the first
-		// Propose. Treat as static no-wrap so callers that pass nil
-		// by mistake degrade safely rather than crashing the engine
-		// loop. This matches newWrappedProposer(inner, nil) returning
-		// inner verbatim.
+		// Defensive degradation: passing a nil pointer would NPE
+		// on the first Propose. Treat as static no-wrap so callers
+		// that pass nil by mistake see the Stage 3 default rather
+		// than crashing the engine loop. This matches
+		// newWrappedProposer(inner, nil) returning inner verbatim.
 		return inner
 	}
 	return &dynamicWrappedProposer{inner: inner, wrapPtr: wrapPtr}
