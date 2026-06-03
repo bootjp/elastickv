@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/require"
+	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -142,6 +143,82 @@ func TestPersistCreatedSnapshot_BumpErrorAborts(t *testing.T) {
 
 	snap := raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 99, Term: 1}}
 	err := e.persistCreatedSnapshot(snap)
+	require.Error(t, err, "bump failure MUST be surfaced to caller")
+	require.Empty(t, rec.snapshot(),
+		"failed bump MUST NOT have recorded; SaveSnap MUST NOT have run")
+}
+
+// --- Site 2: persistLocalSnapshotPayload (steady-state hot path) ---
+//
+// These mirror the Site 1 tests above but exercise the engine's
+// SnapshotCount-triggered local-snapshot path. The hook sits inside
+// e.persistLocalSnapshotPayload (engine.go:4060), under
+// e.snapshotMu.Lock(), BEFORE the free-function persistLocalSnapshotPayload
+// (wal_store.go:519) which is what actually calls persist.SaveSnap.
+
+// localSnapshotEngine constructs an *Engine suitable for testing
+// e.persistLocalSnapshotPayload in isolation. We need:
+//   - e.fsm: implements AppliedIndexWriter so the bump hook fires
+//   - e.persist: implements etcdstorage.Storage so SaveSnap can run
+//     (via the free-function persistLocalSnapshotPayload calling it)
+//   - e.storage: a real *etcdraft.MemoryStorage so e.storage.Snapshot()
+//     and buildLocalSnapshot return sensible values
+//   - e.dataDir / e.fsmSnapDir: temp dirs so the post-persist purge
+//     does not panic on Stat
+func localSnapshotEngine(t *testing.T, rec *applyIndexOrderRecorder, fsm *recordingAppliedIndexFSM, applied uint64) *Engine {
+	t.Helper()
+	storage := etcdraft.NewMemoryStorage()
+	// Seed the storage with enough entries so buildLocalSnapshot's
+	// storage.Term(applied) call succeeds. Without this, the free
+	// persistLocalSnapshotPayload short-circuits at Term lookup before
+	// reaching persist.SaveSnap, and the test cannot observe the save.
+	entries := make([]raftpb.Entry, applied)
+	for i := uint64(0); i < applied; i++ {
+		entries[i] = raftpb.Entry{Index: i + 1, Term: 1, Data: []byte{}}
+	}
+	require.NoError(t, storage.Append(entries))
+	persist := &recordingPersistStorage{rec: rec}
+	return &Engine{
+		fsm:        fsm,
+		persist:    persist,
+		storage:    storage,
+		dataDir:    t.TempDir(),
+		fsmSnapDir: t.TempDir(),
+	}
+}
+
+// TestPersistLocalSnapshotPayload_BumpsAppliedIndex is the
+// happy-path test for Site 2. The engine MUST call
+// SetDurableAppliedIndex(index) BEFORE the free-function
+// persistLocalSnapshotPayload — which is what eventually invokes
+// persist.SaveSnap.
+func TestPersistLocalSnapshotPayload_BumpsAppliedIndex(t *testing.T) {
+	rec := &applyIndexOrderRecorder{}
+	fsm := &recordingAppliedIndexFSM{rec: rec}
+	const index uint64 = 123
+	e := localSnapshotEngine(t, rec, fsm, index)
+
+	require.NoError(t, e.persistLocalSnapshotPayload(index, []byte("payload-stub")))
+
+	events := rec.snapshot()
+	require.GreaterOrEqual(t, len(events), 2,
+		"both bump and save events MUST be recorded; got %d", len(events))
+	require.Equal(t, "bump", events[0].kind, "bump MUST be first")
+	require.Equal(t, index, events[0].index)
+	require.Equal(t, "save", events[1].kind, "save MUST be second")
+	require.Equal(t, index, events[1].index)
+}
+
+// TestPersistLocalSnapshotPayload_BumpErrorAborts mirrors Site 1's
+// crash-ordering test for Site 2: a failed SetDurableAppliedIndex
+// MUST surface the error AND prevent persist.SaveSnap from running.
+func TestPersistLocalSnapshotPayload_BumpErrorAborts(t *testing.T) {
+	rec := &applyIndexOrderRecorder{}
+	fsm := &recordingAppliedIndexFSM{rec: rec, failNext: true, failErr: io.ErrShortBuffer}
+	const index uint64 = 456
+	e := localSnapshotEngine(t, rec, fsm, index)
+
+	err := e.persistLocalSnapshotPayload(index, []byte("payload-stub"))
 	require.Error(t, err, "bump failure MUST be surfaced to caller")
 	require.Empty(t, rec.snapshot(),
 		"failed bump MUST NOT have recorded; SaveSnap MUST NOT have run")

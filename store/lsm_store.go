@@ -47,8 +47,8 @@ const (
 	// snap.Metadata.Index by SetDurableAppliedIndex at every snapshot
 	// persist site. See
 	// docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
-	metaAppliedIndex              = "_meta_applied_index"
-	spoolBufSize                  = 32 * 1024 // buffer size for streaming I/O during restore
+	metaAppliedIndex = "_meta_applied_index"
+	spoolBufSize     = 32 * 1024 // buffer size for streaming I/O during restore
 
 	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
 	// which are the user key concatenated with the 8-byte inverted timestamp.

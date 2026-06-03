@@ -2676,25 +2676,37 @@ func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, 
 	}
 }
 
+// bumpDurableAppliedIndexBeforeSave pins the FSM's durable applied
+// index to `index` BEFORE the engine calls persist.SaveSnap, so a
+// successful snapshot persist always implies LastAppliedIndex >=
+// snap.Metadata.Index — closes the HLC-lease-only / encryption-only
+// fallback (PR #910 design §6).
+//
+// FSMs that do not expose raftengine.AppliedIndexWriter silently
+// no-op; the skip optimisation falls back to full restore for them
+// (legacy test fakes, in-memory backends). pebble.Sync is forced on
+// the writer side regardless of ELASTICKV_FSM_SYNC_MODE — once
+// persist.SaveSnap returns, WAL compaction discards every log entry
+// at or before snap.Metadata.Index, so there is no source to replay
+// the meta key bump from.
+//
+// Used by BOTH snapshot persist sites: persistCreatedSnapshot (this
+// file) and e.persistLocalSnapshotPayload (the steady-state
+// SnapshotCount-triggered hot path).
+func (e *Engine) bumpDurableAppliedIndexBeforeSave(index uint64) error {
+	w, ok := e.fsm.(raftengine.AppliedIndexWriter)
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(w.SetDurableAppliedIndex(index))
+}
+
 func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snap) || e.persist == nil {
 		return nil
 	}
-	// Pin metaAppliedIndex to snap.Metadata.Index BEFORE SaveSnap so a
-	// successful snapshot persist always implies LastAppliedIndex >=
-	// snap.Metadata.Index — closes the HLC-lease-only / encryption-only
-	// fallback (PR #910 design §6). FSMs that do not expose
-	// raftengine.AppliedIndexWriter silently no-op; the skip
-	// optimisation falls back to full restore for them. pebble.Sync
-	// is forced on the writer side (see lsm_store.SetDurableAppliedIndex)
-	// regardless of ELASTICKV_FSM_SYNC_MODE — once SaveSnap returns,
-	// WAL compaction discards every log entry at or before
-	// snap.Metadata.Index, so there is no source to replay the meta
-	// key bump from.
-	if w, ok := e.fsm.(raftengine.AppliedIndexWriter); ok {
-		if err := w.SetDurableAppliedIndex(snap.Metadata.Index); err != nil {
-			return errors.WithStack(err)
-		}
+	if err := e.bumpDurableAppliedIndexBeforeSave(snap.Metadata.Index); err != nil {
+		return err
 	}
 	if err := e.persist.SaveSnap(snap); err != nil {
 		return errors.WithStack(err)
@@ -4060,44 +4072,46 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 		return nil
 	}
 
-	// Pin metaAppliedIndex to `index` BEFORE the free-function
-	// persistLocalSnapshotPayload (which calls persist.SaveSnap at
-	// wal_store.go:524). This is the steady-state SnapshotCount-triggered
-	// snapshot path — the hot path the cold-start skip optimisation
-	// depends on. Without this hook the round-3 P2 fallback (HLC
-	// leases / encryption ops keep snapshot.Metadata.Index ahead of the
-	// last data-Apply index forever) recurs permanently. See PR #910
-	// design §6 'HLC lease entries — checkpoint at snapshot persist'
-	// and the round-5 retraction documenting why
-	// persistCreatedSnapshot alone is insufficient. pebble.Sync is
-	// forced on the writer side regardless of ELASTICKV_FSM_SYNC_MODE
-	// (lsm_store.SetDurableAppliedIndex inline comment).
-	if w, ok := e.fsm.(raftengine.AppliedIndexWriter); ok {
-		if err := w.SetDurableAppliedIndex(index); err != nil {
-			return errors.WithStack(err)
-		}
+	if err := e.bumpDurableAppliedIndexBeforeSave(index); err != nil {
+		return err
 	}
 
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
+	return e.handleLocalSnapshotPersistResult(err)
+}
+
+// handleLocalSnapshotPersistResult collapses the post-SaveSnap error
+// switch into a single helper so persistLocalSnapshotPayload stays
+// under the cyclomatic-complexity budget. The three raft-side
+// 'snapshot already moved on' cases (ErrCompacted / ErrUnavailable /
+// ErrSnapOutOfDate) are all treated as no-ops; only the success path
+// runs the disk-side purge.
+func (e *Engine) handleLocalSnapshotPersistResult(err error) error {
 	switch {
 	case err == nil:
-		snapDir := filepath.Join(e.dataDir, snapDirName)
-		if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
-			slog.Warn("failed to purge old snap files", "error", purgeErr)
-		}
-		walDir := filepath.Join(e.dataDir, walDirName)
-		if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
-			slog.Warn("failed to purge old wal files", "error", purgeErr)
-		}
+		e.purgeAfterLocalSnapshot()
 		return nil
-	case errors.Is(err, etcdraft.ErrCompacted):
-		return nil
-	case errors.Is(err, etcdraft.ErrUnavailable):
-		return nil
-	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
+	case errors.Is(err, etcdraft.ErrCompacted),
+		errors.Is(err, etcdraft.ErrUnavailable),
+		errors.Is(err, etcdraft.ErrSnapOutOfDate):
 		return nil
 	default:
 		return err
+	}
+}
+
+// purgeAfterLocalSnapshot runs the disk-side cleanup that follows a
+// successful local-snapshot persist: trim old .snap/.fsm files and
+// rotate ageing WAL segments. Both calls log on error but do not
+// propagate — failing to purge is non-fatal.
+func (e *Engine) purgeAfterLocalSnapshot() {
+	snapDir := filepath.Join(e.dataDir, snapDirName)
+	if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
+		slog.Warn("failed to purge old snap files", "error", purgeErr)
+	}
+	walDir := filepath.Join(e.dataDir, walDirName)
+	if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
+		slog.Warn("failed to purge old wal files", "error", purgeErr)
 	}
 }
 

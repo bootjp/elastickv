@@ -160,7 +160,7 @@ func (f *kvFSM) SetDurableAppliedIndex(idx uint64) error {
 	if !ok {
 		return nil
 	}
-	return w.SetDurableAppliedIndex(idx)
+	return errors.WithStack(w.SetDurableAppliedIndex(idx))
 }
 
 type FSM interface {

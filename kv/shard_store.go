@@ -1317,6 +1317,88 @@ func (s *ShardStore) LastCommitTS() uint64 {
 	return max
 }
 
+// LastAppliedIndex aggregates the durable applied-index across every
+// shard group, returning the MIN over all groups that report one.
+//
+// MIN is the right aggregator because the kvFSM is per-shard in
+// production — each shard's FSM independently asks "is MY group's
+// applied index at least as fresh as MY group's snapshot?" — and
+// ShardStore is NEVER used as the FSM's f.store in production today
+// (the FSM holds a *pebbleStore directly; ShardStore is the
+// coordinator-facing fanout wrapper). This method exists as a
+// defensive forward in case a future refactor uses ShardStore from
+// the apply path; reporting MIN guarantees the cold-start skip gate
+// would refuse to skip whenever ANY group lags, matching the
+// conservative "over-restore beats under-restore" rule (PR #910
+// design §4).
+//
+// (0, false, nil) when no group reports a value — strictly-additive
+// fallback per design §4.
+func (s *ShardStore) LastAppliedIndex() (uint64, bool, error) {
+	var (
+		minIdx    uint64
+		anyReport bool
+	)
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		reader, ok := g.Store.(interface {
+			LastAppliedIndex() (uint64, bool, error)
+		})
+		if !ok {
+			continue
+		}
+		idx, present, err := reader.LastAppliedIndex()
+		if err != nil {
+			return 0, false, errors.WithStack(err)
+		}
+		if !present {
+			// One group has no meta key. Conservative: report
+			// missing so the cold-start skip gate falls back.
+			return 0, false, nil
+		}
+		if !anyReport || idx < minIdx {
+			minIdx = idx
+		}
+		anyReport = true
+	}
+	if !anyReport {
+		return 0, false, nil
+	}
+	return minIdx, true, nil
+}
+
+// SetDurableAppliedIndex broadcasts the bump to every group store
+// that exposes the writer seam.
+//
+// This is purely defensive — in production today the FSM holds a
+// *pebbleStore directly; ShardStore is never f.store. Were it ever
+// wired through the FSM apply path, broadcasting the same idx across
+// groups would corrupt their per-group metaAppliedIndex semantics
+// (each group has its own raft log with its own entry numbering).
+// For that hypothetical, the test convention from
+// DeletePrefixAtRaftAt applies: tests MUST pass idx=0 to opt out, or
+// not use ShardStore as the writer at all. Returns the first
+// per-group error.
+func (s *ShardStore) SetDurableAppliedIndex(idx uint64) error {
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		writer, ok := g.Store.(interface {
+			SetDurableAppliedIndex(idx uint64) error
+		})
+		if !ok {
+			continue
+		}
+		if err := writer.SetDurableAppliedIndex(idx); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
 // WriteConflictCountsByPrefix aggregates OCC conflict counts across
 // every shard group owned by this ShardStore. Per-shard counts share
 // the same "<kind>|<key_prefix>" label schema, so a simple sum gives
