@@ -400,3 +400,67 @@ func sqsMsgDataKeyBytes(queueName string, generation uint64, messageID string) [
 	out = binary.BigEndian.AppendUint64(out, generation)
 	return append(out, encodeSQSSegment(messageID)...)
 }
+
+// sqsPartitionedQueueTerminator mirrors adapter/sqs_keys.go:82 — the
+// literal '|' that terminates the encoded queue segment (and, in
+// dedup keys, the encoded group segment) inside a partitioned key.
+// encodeSQSSegment uses base64.RawURLEncoding which never emits '|',
+// so the terminator is unambiguous.
+const sqsPartitionedQueueTerminator byte = '|'
+
+// sqsFifoThroughputPerQueue mirrors adapter/sqs_partitioning.go:37
+// (htfifoThroughputPerQueue). When this is the FifoThroughputLimit
+// value, partitionFor collapses every group to partition 0
+// regardless of meta.PartitionCount; the encoder uses it for one
+// fail-closed gate (ErrSQSEncodePartitionRoutingMismatch in slice D)
+// and as an effectivePartitionCount input. CANNOT be imported from
+// adapter — htfifoThroughputPerQueue is unexported (M3b-3 circular
+// dependency pattern).
+const sqsFifoThroughputPerQueue = "perQueue"
+
+// Partitioned key prefixes mirror adapter/sqs_keys.go:91..95. They
+// are the legacy prefixes with the partitioned discriminator "p|"
+// appended.
+const (
+	SQSPartitionedMsgDataPrefix  = SQSMsgDataPrefix + sqsPartitionedDiscriminator
+	SQSPartitionedMsgVisPrefix   = SQSMsgVisPrefix + sqsPartitionedDiscriminator
+	SQSPartitionedMsgByAgePrefix = SQSMsgByAgePrefix + sqsPartitionedDiscriminator
+	SQSPartitionedMsgDedupPrefix = SQSMsgDedupPrefix + sqsPartitionedDiscriminator
+)
+
+// sqsPartitionedMsgDataKeyBytes reproduces
+// adapter/sqs_keys.go:sqsPartitionedMsgDataKey for a partitioned
+// queue: prefix + base64url(queue) + '|' + BE-u32(partition) +
+// BE-u64(gen) + base64url(messageID). Mirrored locally because
+// internal/backup/ cannot import adapter (M3b-3 pattern).
+func sqsPartitionedMsgDataKeyBytes(queueName string, partition uint32, generation uint64, messageID string) []byte {
+	out := []byte(SQSPartitionedMsgDataPrefix)
+	out = append(out, encodeSQSSegment(queueName)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	out = binary.BigEndian.AppendUint32(out, partition)
+	out = binary.BigEndian.AppendUint64(out, generation)
+	return append(out, encodeSQSSegment(messageID)...)
+}
+
+// effectivePartitionCount mirrors adapter/sqs_keys_dispatch.go:121
+// (which operates on the unexported *adapter.sqsQueueMeta). Returns
+// 1 for nil meta or PartitionCount <= 1, 1 when FifoThroughputLimit
+// == "perQueue" (the live router collapses every group to partition
+// 0 in that mode), otherwise meta.PartitionCount.
+//
+// NOTE: this helper is NOT used by the encoder's validation gates —
+// the M5-3 design pins those gates on raw meta.PartitionCount > 1
+// (codex P2 v914 v7). Kept here for diagnostics, ReceiveMessage scan
+// fan-out cross-checks, and future symmetry with the adapter; using
+// it in a gate predicate would silently let a perQueue dump with
+// Partition == nil emit classic keys against a partitioned-keyspace
+// queue.
+func effectivePartitionCount(meta *sqsQueueMetaPublic) uint32 {
+	if meta == nil || meta.PartitionCount <= 1 {
+		return 1
+	}
+	if meta.FifoThroughputLimit == sqsFifoThroughputPerQueue {
+		return 1
+	}
+	return meta.PartitionCount
+}
