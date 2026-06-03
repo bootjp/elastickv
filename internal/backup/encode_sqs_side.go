@@ -70,6 +70,56 @@ func sqsMsgDedupKeyBytes(queueName, dedupID string) []byte {
 	return append(out, encodeSQSSegment(dedupID)...)
 }
 
+// sqsPartitionedMsgVisKeyBytes reproduces
+// adapter/sqs_keys.go:sqsPartitionedMsgVisKey: prefix +
+// base64url(queue) + '|' + BE-u32(partition) + BE-u64(gen) +
+// BE-u64(visibleAt) + base64url(messageID). Mirrored locally per
+// M3b-3 (internal/backup cannot import adapter).
+func sqsPartitionedMsgVisKeyBytes(queueName string, partition uint32, gen uint64, visibleAtMillis int64, messageID string) []byte {
+	out := make([]byte, 0, len(SQSPartitionedMsgVisPrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSPartitionedMsgVisPrefix...)
+	out = append(out, encodeSQSSegment(queueName)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	out = binary.BigEndian.AppendUint32(out, partition)
+	out = binary.BigEndian.AppendUint64(out, gen)
+	out = binary.BigEndian.AppendUint64(out, sqsClampNonNegativeMillis(visibleAtMillis))
+	return append(out, encodeSQSSegment(messageID)...)
+}
+
+// sqsPartitionedMsgByAgeKeyBytes reproduces
+// adapter/sqs_keys.go:sqsPartitionedMsgByAgeKey: prefix +
+// base64url(queue) + '|' + BE-u32(partition) + BE-u64(gen) +
+// BE-u64(sendTs) + base64url(messageID).
+func sqsPartitionedMsgByAgeKeyBytes(queueName string, partition uint32, gen uint64, sendTimestampMs int64, messageID string) []byte {
+	out := make([]byte, 0, len(SQSPartitionedMsgByAgePrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSPartitionedMsgByAgePrefix...)
+	out = append(out, encodeSQSSegment(queueName)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	out = binary.BigEndian.AppendUint32(out, partition)
+	out = binary.BigEndian.AppendUint64(out, gen)
+	out = binary.BigEndian.AppendUint64(out, sqsClampNonNegativeMillis(sendTimestampMs))
+	return append(out, encodeSQSSegment(messageID)...)
+}
+
+// sqsPartitionedMsgDedupKeyBytes reproduces
+// adapter/sqs_keys.go:sqsPartitionedMsgDedupKey: prefix +
+// base64url(queue) + '|' + BE-u32(partition) + BE-u64(gen) +
+// base64url(groupID) + '|' + base64url(dedupID). Note the second
+// '|' between the variable-length group and dedup segments — without
+// it distinct (groupID, dedupID) pairs can FNV-collapse onto the
+// same key (CodeRabbit major PR #732 round 6; design doc §line 19).
+func sqsPartitionedMsgDedupKeyBytes(queueName string, partition uint32, gen uint64, groupID, dedupID string) []byte {
+	out := make([]byte, 0, len(SQSPartitionedMsgDedupPrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSPartitionedMsgDedupPrefix...)
+	out = append(out, encodeSQSSegment(queueName)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	out = binary.BigEndian.AppendUint32(out, partition)
+	out = binary.BigEndian.AppendUint64(out, gen)
+	out = append(out, encodeSQSSegment(groupID)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	return append(out, encodeSQSSegment(dedupID)...)
+}
+
 // sqsClampNonNegativeMillis mirrors adapter/sqs_messages.go uint64MaxZero:
 // wall-clock millis should never be negative, but a negative int64 would
 // silently overflow under a direct uint64() cast and produce a far-future
