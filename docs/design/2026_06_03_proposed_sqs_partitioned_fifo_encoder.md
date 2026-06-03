@@ -72,7 +72,7 @@ func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey 
 **Specific call-site updates** (claude v2 review caught these — make the impl PR mechanically faithful):
 
 - `HandleMessageData` (`sqs.go:341`): receive `(encQueue, partition uint32, isPartitioned bool, err)`, decode the value bytes, then set `rec.Partition = &partition` ONLY when `isPartitioned` is true. Classic-key call site keeps `rec.Partition = nil` so the no-partition-concept case round-trips as a legacy dump.
-- `decodeSQSMessageValue` keeps its current `(value []byte) → (*sqsMessageRecord, error)` signature — partition wiring happens at the call site, not inside the decoder, because the decoder never sees the key.
+- `decodeSQSMessageValue` (`sqs.go:719`) keeps its current `(value []byte) (sqsMessageRecord, error)` signature — note the return is a value, not a pointer (claude v3 v914 caught the earlier doc typo). Partition wiring happens at the call site, not inside the decoder, because the decoder never sees the key.
 - `parseSQSGenericKey` (`sqs.go:571`) — wraps `parseSQSPartitionedQueueAndTrailer` and is called by `HandleSideRecord` for `vis`/`byage`/`dedup` value handling (`sqs.go:367`). Side-record handlers route to `_internals/` by queue and don't need partition, so the new partition return from `parseSQSPartitionedQueueAndTrailer` is discarded inside `parseSQSGenericKey`. The signature change is mechanical; impl PR must touch the wrapper to compile.
 
 **Per-partition vs single-file layout.** Two candidate disk layouts:
@@ -90,13 +90,17 @@ Three changes to `internal/backup/encode_sqs.go`:
 
 1. **Drop `ErrSQSEncodeUnsupportedPartitioned`.** Remove the `meta.PartitionCount > 1` gate at line 162.
 2. **Branch on `PartitionCount`.** When `> 1`, use partitioned key constructors (duplicated from `adapter/sqs_keys.go` following the established M3b-3 GSI pattern). When `<= 1`, classic constructors as today.
-3. **Group-by-partition before emit.** Sort messages by `(partition, send_timestamp_millis, sequence_number, message_id)` so per-partition order is stable across runs — required for byte-identical re-encodes. `sequence_number` is the definitive tiebreaker between messages that share a send timestamp (burst case); `message_id` is the last-resort tiebreaker. Gemini suggested this in the v2 review — the classic path uses the same four-field sort, so the partitioned path adds `partition` as the leading key.
+3. **Group-by-partition before emit.** Sort messages by `(partition, send_timestamp_millis, sequence_number, message_id)` so per-partition order is stable across runs — required for byte-identical re-encodes. `sequence_number` is the definitive tiebreaker between messages that share a send timestamp (burst case); `message_id` is the last-resort tiebreaker. Gemini suggested this in the v2 review; claude v3 corrected the wording — the live `sortMessagesForEmit` (`sqs.go:815`) is a **3-field** tuple `(send_timestamp_millis, sequence_number, message_id)`, and the partitioned path prepends `partition` as the leading key.
+
+4. **Per-message dispatch.** `addMessage` (`encode_sqs.go:241`) currently calls `sqsMsgDataKeyBytes(queueName, sqsRestoreGeneration, rec.MessageID)` at line 268. M5-3 threads a `partition *uint32` parameter through `addMessage`: when non-nil, it calls a new `sqsPartitionedMsgDataKeyBytes(queueName, *partition, sqsRestoreGeneration, rec.MessageID)`; when nil, the existing classic constructor. Adding the parameter (rather than a peer `addPartitionedMessage`) keeps the side-record dispatch in lockstep — `encodeMessageSideRecords` runs on the same record and needs the same partition info. Claude v3 noted that the doc previously left this implicit.
 
 Plus three additions to `internal/backup/encode_sqs_side.go` (the M5-2 file):
 
 1. Partitioned `vis` constructor → `!sqs|msg|vis|p|...`.
 2. Partitioned `byage` constructor → `!sqs|msg|byage|p|...`.
 3. Partitioned `dedup` constructor → `!sqs|msg|dedup|p|...`. Note the partitioned shape adds a `<group-seg>` segment before `<dedupID-seg>` (per `adapter/sqs_keys.go:sqsPartitionedMsgDedupKey` line N+50ish); the classic shape has only `<dedupID-seg>`. This means `message_group_id` is now load-bearing for dedup-row construction on FIFO partitioned queues — but the existing `messages.jsonl` already carries it as `message_group_id`.
+
+`encodeMessageSideRecords` (the per-message side-record dispatcher in `encode_sqs_side.go`) gains the same `partition *uint32` parameter as `addMessage` so the partitioned constructors can be selected per message. Branching by `partition != nil` (rather than re-reading `meta.PartitionCount`) keeps the call site one decision deep and makes mixed-mode bugs impossible — a classic-mode dump can never accidentally call a partitioned constructor because `rec.Partition` is enforced nil for `PartitionCount == 1` (the new fail-closed gate in §"Validation invariants" forbids any other shape). Claude v3 noted that v3 didn't spell this out.
 
 ## Validation invariants (fail-closed)
 
@@ -121,9 +125,9 @@ M5-2's "full reconstruction" gate applies unchanged to M5-3 partitioned queues. 
 ## Files to add / modify (M5-3 implementation slice)
 
 ```
-internal/backup/sqs.go                       # sqsMessageRecord +Partition; decodeSQSMessageValue plumbs partition
-internal/backup/encode_sqs.go                # drop ErrSQSEncodeUnsupportedPartitioned; branch on PartitionCount
-internal/backup/encode_sqs_side.go           # add partitioned vis/byage/dedup constructors + emit
+internal/backup/sqs.go                       # sqsMessageRecord +Partition *uint32; parseSQSMessageDataKey + parseSQSPartitionedQueueAndTrailer new (partition uint32) return values; HandleMessageData wires rec.Partition = &partition only when isPartitioned; parseSQSGenericKey wrapper discards the new return (claude v3 v914)
+internal/backup/encode_sqs.go                # drop ErrSQSEncodeUnsupportedPartitioned; addMessage takes partition *uint32 + branches between sqsMsgDataKeyBytes and the new sqsPartitionedMsgDataKeyBytes
+internal/backup/encode_sqs_side.go           # encodeMessageSideRecords takes partition *uint32; add partitioned vis/byage/dedup constructors + emit
 internal/backup/encode_sqs_test.go           # round-trip partitioned-FIFO fixture (2 partitions × 3 messages)
 internal/backup/encode_sqs_side_test.go      # cross-check partitioned vis/byage/dedup vs live constructors
 internal/backup/sqs_test.go                  # decoder round-trip with partition field populated
