@@ -1,16 +1,16 @@
 # Idempotent FSM Snapshot Restore on Cold Start
 
-**Status**: Proposal
-**Date**: 2026-06-02
+**Status**: Proposal (Round 2 — revised after PR #910 feedback)
+**Date**: 2026-06-02 (round 1), 2026-06-03 (round 2 revision)
 **Author**: bootjp
 **Related**: PR #909 (`HEALTH_TIMEOUT_SECONDS` 60s → 300s)
 
 ## Problem
 
-`loadWalState` (`internal/raftengine/etcd/wal_store.go:117`) unconditionally calls
-`restoreSnapshotState(fsm, snapshot, fsmSnapDir)` (`:246`) whenever the WAL's
-persisted snapshot pointer is non-empty.  For the EKV/token-format snapshot
-case this dispatches to:
+`loadWalState` (`internal/raftengine/etcd/wal_store.go:117`) unconditionally
+calls `restoreSnapshotState(fsm, snapshot, fsmSnapDir)` (`:246`) whenever
+the WAL's persisted snapshot pointer is non-empty.  For the EKV/token-format
+snapshot case this dispatches to:
 
 ```go
 return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
@@ -27,29 +27,26 @@ return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CR
    → `os.Rename(tmpDir, s.dir)` → `pebble.Open(s.dir, ...)`.
 
 For multi-GiB FSMs this is O(snapshot size) on the I/O path.  On a 5-node
-192.168.0.x cluster with a ~5 M-key node we measured **~46 s** between
-the first `pebble.Open(fsm.db)` log line and the post-swap re-open.
-After the swap the engine still has to:
-
-- replay WAL entries between the snapshot index and the latest committed
-  index (currently ~4 k entries → sub-second), and
-- become a raft follower, then bind the gRPC listener.
+192.168.0.x cluster with a ~5 M-key node we measured **~46 s** between the
+first `pebble.Open(fsm.db)` log line and the post-swap re-open.  After the
+swap the engine still has to replay the entries between the snapshot
+index and the latest committed index, then become a raft follower and
+bind the gRPC listener.
 
 The cumulative cold-start budget routinely exceeded the 60-second
 `HEALTH_TIMEOUT_SECONDS` (PR #909 raises it to 300 s as a band-aid).
-Beyond the wall-clock pain, the timeout creates **second-order
-instability**: docker's restart policy re-investigates a non-responsive
-container, the remaining quorum runs elections against a phantom voter,
-and the raft term inflates linearly with restart attempts (we observed
-term 665 on a cluster that should have seen single-digit-per-day
-elections).
+The timeout also drives second-order instability — docker's restart
+policy reinvestigates the non-responsive container, the remaining quorum
+runs elections against a phantom voter, and the raft term inflates
+linearly with restart attempts (we observed term 665 on a cluster that
+should have seen single-digit-per-day elections).
 
 The restore is **mostly redundant**.  Each successful `fsm.Apply` already
-persists its mutation durably (via Pebble's WriteBatch).  After the FSM
-applied entry `Y > snapshot.Metadata.Index = X`, the on-disk fsm.db
-contains state `≥ X`.  On the next cold start we tear down that state
-and rebuild it from the older snapshot — only to have raft replay the
-same entries we already had on disk.
+persists its data mutations durably (via Pebble's WriteBatch).  After
+the FSM has applied entry `Y > snapshot.Metadata.Index = X`, the on-disk
+fsm.db contains state `≥ X`.  On the next cold start we tear that state
+down and rebuild it from the older snapshot, only to have raft replay
+the same entries we already had on disk.
 
 ## Goal
 
@@ -64,8 +61,10 @@ a no-op and cold start collapses to:
 
 Expected cold-start: **<5 s for any FSM size** in the steady-state case.
 Restore still fires correctly when (a) the FSM truly is stale (e.g.
-post-disaster recovery from someone else's snapshot), or (b)
-`LastAppliedIndex` is missing / corrupt.
+post-disaster recovery from someone else's snapshot), (b)
+`LastAppliedIndex` is missing / corrupt, or (c) the HLC physical
+ceiling embedded in the snapshot file is newer than what the FSM has
+in memory (see §HLC).
 
 ## Non-Goals
 
@@ -81,68 +80,194 @@ post-disaster recovery from someone else's snapshot), or (b)
 
 ## Design
 
-### 1. Persist `LastAppliedIndex` atomically with each Apply
+### 1. Plumb `entry.Index` to `kvFSM.Apply` via a new `ApplyIndexAware` seam
 
-The smallest correct primitive is to bundle the raft-applied-index into
-the same `pebble.Batch` that the FSM uses for its data mutation.  Pebble
-batches are atomic, so the index and the data move together — never
-torn.
-
-#### Interface change
+The current `StateMachine` interface (`internal/raftengine/statemachine.go:14`)
+does not carry the raft index:
 
 ```go
-// internal/raftengine/statemachine.go
 type StateMachine interface {
-    Apply(index uint64, data []byte) any  // was: Apply(data []byte) any
+    Apply(data []byte) any
     Snapshot() (Snapshot, error)
     Restore(r io.Reader) error
 }
 ```
 
-The single producer (`Engine.applyNormalEntry`, `engine.go:1769`)
-becomes:
+**Round-1 mistake**: the round-1 design proposed breaking this signature
+to `Apply(index uint64, data []byte)`.  That works but rebinds every
+StateMachine implementation in tree.
+
+**Round-2 design**: introduce a **new** opt-in interface alongside it
+(no breaking change to `StateMachine.Apply`):
 
 ```go
-return e.fsm.Apply(entry.Index, payload)
-```
-
-All in-tree implementations and tests inherit the new signature.
-Inventoried sites (8 in `internal/raftengine/`, 1 in `kv/fsm.go`, plus
-the `raftenginetest/conformance.go` shim, plus a handful of unit-test
-fakes).  The change is mechanical; reviewers can audit by grepping for
-`Apply(data []byte)` after the rebase.
-
-#### kvFSM commits index + mutation in one batch
-
-```go
-// kv/fsm.go
-func (f *kvFSM) Apply(index uint64, data []byte) any {
-    if len(data) > 0 && data[0] == raftEncodeHLCLease {
-        return f.applyHLCLease(index, data[1:])
-    }
-    ctx := context.TODO()
-    reqs, err := decodeRaftRequests(data)
-    if err != nil { return errors.WithStack(err) }
-    return f.applyAtIndex(ctx, index, reqs)
+// internal/raftengine/statemachine.go (new — does not exist today)
+//
+// ApplyIndexAware is an opt-in seam that delivers the raft applied-index
+// to the FSM without changing StateMachine.Apply's signature. The engine
+// calls SetApplyIndex on the same goroutine, immediately before Apply,
+// so the FSM can read it back from a field stashed during SetApplyIndex.
+//
+// FSMs that do not implement this interface continue to work as before;
+// their cold start will pay the full restoreSnapshotState cost because
+// they cannot self-report LastAppliedIndex().
+type ApplyIndexAware interface {
+    SetApplyIndex(idx uint64)
 }
 ```
 
-`applyAtIndex` threads `index` through `applyRequest` /
-`applyRequestErr`; the leaf MVCC mutation acquires the `pebble.Batch`,
-adds `key=metaAppliedIndex, value=binary.BigEndian.PutUint64(index)`,
-and commits.  The cost is +16 bytes per batch and zero extra fsync
-calls (the batch was already going to commit).
-
-#### pebbleStore exposes the index
+`engine.applyNormalEntry` (`engine.go:1769`) calls it before `Apply`:
 
 ```go
-// store/lsm_store.go (new method)
+func (e *Engine) applyNormalEntry(entry raftpb.Entry) any {
+    if len(entry.Data) == 0 { return nil }
+    _, payload, ok := decodeProposalEnvelope(entry.Data)
+    if !ok { return nil }
+    if aware, ok := e.fsm.(ApplyIndexAware); ok {
+        aware.SetApplyIndex(entry.Index)
+    }
+    return e.fsm.Apply(payload)
+}
+```
+
+Single-writer invariant: the engine's raft run loop is the only caller
+of `applyNormalEntry` and the only caller of `setApplied` (`engine.go:1764`).
+SetApplyIndex / Apply pair is observed by no other goroutine; no
+synchronisation between them is required.
+
+**Compatibility audit** — concrete `StateMachine` implementations in
+this repository (count: **6**, verified by `grep 'func.*Apply(data \[\]byte) any'`):
+
+| File | Symbol | Action in Branch 2 |
+|---|---|---|
+| `kv/fsm.go:60` | `(*kvFSM).Apply` | Add `SetApplyIndex(idx)` storing into `f.pendingApplyIdx`. Read it inside `Apply`. |
+| `internal/raftengine/raftenginetest/conformance.go:27` | `(*TestStateMachine).Apply` | No change unless test wants to assert index. |
+| `internal/raftengine/etcd/engine_test.go:33` | `testStateMachine` | No change. |
+| `internal/raftengine/etcd/engine_test.go:139` | `blockingSnapshotStateMachine` | No change. |
+| `internal/raftengine/etcd/engine_test.go:170` | `countingSnapshotStateMachine` | No change. |
+| `internal/raftengine/etcd/fsm_snapshot_file_test.go:124` | `dummyFSM` | No change. |
+
+(Round-1 doc claimed "8 in `internal/raftengine/`" — that was wrong;
+the actual count is 5 non-`kvFSM` impls.  Corrected.)
+
+Only `kvFSM` needs to implement `ApplyIndexAware`; the rest stay on the
+non-aware path.  Cold-start skip is enabled only when both the FSM
+implements `ApplyIndexAware` **and** the store implements
+`AppliedIndexReader`.
+
+### 2. `kvFSM` bundles the index in the SAME pebble.Batch as the mutation
+
+`kvFSM.Apply` doesn't directly touch Pebble — it dispatches through
+`f.store.ApplyMutationsRaft(...)`, `f.store.DeletePrefixAtRaft(...)`,
+etc., which build their own `pebble.Batch` inside `pebbleStore`.  To
+land the index in the same batch as the mutation, we plumb it from
+`kvFSM.Apply` down to the leaf `applyMutationsWithOpts` /
+`deletePrefixAtWithOpts` helpers (both already bundle
+`metaLastCommitTSBytes` — the precedent for batched meta keys lives at
+`lsm_store.go:1162` and `:1231`).
+
+```go
+// kv/fsm.go — round-2: keep the StateMachine.Apply signature
+type kvFSM struct {
+    store           store.MVCCStore
+    log             *slog.Logger
+    hlc             *HLC
+    pendingApplyIdx uint64    // set by SetApplyIndex immediately before Apply
+}
+
+func (f *kvFSM) SetApplyIndex(idx uint64) {
+    f.pendingApplyIdx = idx
+}
+
+func (f *kvFSM) Apply(data []byte) any {
+    idx := f.pendingApplyIdx
+    // CRITICAL: leave dispatch (HLC-lease vs request) UNCHANGED. We only
+    // pass `idx` down to the leaf MVCC mutation. The original opcode
+    // discrimination (`data[0] == raftEncodeHLCLease`) at kv/fsm.go:63
+    // and the existing decodeRaftRequests / applyRequest sequence
+    // continue verbatim. Only the leaf store call gains an index
+    // parameter, which is bundled atomically with the data write.
+    // ... existing dispatch ...
+}
+```
+
+The store interface gains an index-carrying overload, so the raft-apply
+path can carry it down without breaking direct-write paths:
+
+```go
+// store/store.go (new method on MVCCStore)
+ApplyMutationsRaftAt(
+    ctx context.Context,
+    muts []*KVPairMutation,
+    readKeys [][]byte,
+    startTS, commitTS uint64,
+    appliedIndex uint64,
+) error
+
+DeletePrefixAtRaftAt(
+    ctx context.Context,
+    prefix, excludePrefix []byte,
+    commitTS uint64,
+    appliedIndex uint64,
+) error
+```
+
+(The existing `ApplyMutationsRaft` / `DeletePrefixAtRaft` become thin
+wrappers that pass `appliedIndex=0` — the leaf helper treats `0` as
+"don't write the meta key", preserving direct-write semantics for
+callers outside the raft apply loop.)
+
+Implementation in the leaf:
+
+```go
+// store/lsm_store.go — applyMutationsWithOpts (existing, around :1162)
+if appliedIndex > 0 {
+    if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
+        return errors.WithStack(err)
+    }
+}
+// ... existing metaLastCommitTSBytes write at :1162 stays as-is ...
+
+// store/lsm_store.go — deletePrefixAtWithOpts (existing, around :1231)
+if appliedIndex > 0 {
+    if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+        return errors.WithStack(err)
+    }
+}
+// ... existing metaLastCommitTSBytes write at :1231 stays as-is ...
+```
+
+**Why both leaves**: `handleDelPrefix` → `DeletePrefixAtRaft` builds an
+independent `pebble.Batch` via `deletePrefixAtWithOpts` (round-1 doc
+missed this).  Threading the index ONLY through `applyMutationsWithOpts`
+would let DEL_PREFIX entries land in fsm.db without bumping
+`metaAppliedIndex`, which would silently leave the meta key behind the
+true applied index — and on the next cold start, `LastAppliedIndex`
+would underestimate, triggering a conservative full restore.  Cost: +16
+bytes per batch, zero additional fsync.
+
+### 3. Read-back exposes the index (with `dbMu.RLock()`)
+
+```go
+// store/lsm_store.go (new method, lock-ordering compliant)
+//
+// LastAppliedIndex returns the largest raft applied-index that any
+// raft-apply Batch has persisted via this pebbleStore. Lock order is
+// dbMu (RLock) before any db.Get, per the discipline documented at
+// lsm_store.go:153 and exemplified at :553 / :675. Without the lock,
+// a concurrent swapInTempDB could replace s.db between the Get call
+// and our access of the returned value/closer pair, racing the
+// snapshot install path.
 func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
-    val, closer, err := s.db.Get(metaAppliedIndexKey)
+    s.dbMu.RLock()
+    defer s.dbMu.RUnlock()
+    val, closer, err := s.db.Get(metaAppliedIndexBytes)
     if errors.Is(err, pebble.ErrNotFound) {
         return 0, false, nil
     }
-    if err != nil { return 0, false, errors.WithStack(err) }
+    if err != nil {
+        return 0, false, errors.WithStack(err)
+    }
     defer closer.Close()
     if len(val) != 8 {
         return 0, false, errors.Newf("corrupt applied-index meta key: %d bytes", len(val))
@@ -151,18 +276,43 @@ func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
 }
 ```
 
-A narrow `AppliedIndexReader` interface lets `restoreSnapshotState`
-inspect any store that implements it, without coupling the wal_store
-package to `*pebbleStore`:
+`metaAppliedIndexBytes` is a new well-known prefix sibling to
+`metaLastCommitTSBytes` (which is defined at `lsm_store.go:145` as
+`[]byte("_meta_last_commit_ts")`).  Recommended value:
+`[]byte("_meta_applied_index")` — outside the MVCC user-key space and
+disjoint from every existing meta key (verified by reading
+`isReservedMetaKey` at `lsm_store.go:454`, which currently only checks
+`metaLastCommitTSBytes` and `metaMinRetainedTSBytes`).  Branch 3 extends
+`isReservedMetaKey` to include the new key.
+
+A narrow consumer interface lets `restoreSnapshotState` inspect the
+store without coupling the etcd raft engine to `*pebbleStore`:
 
 ```go
-// internal/raftengine/statemachine.go (or sibling)
+// internal/raftengine/statemachine.go (new)
 type AppliedIndexReader interface {
     LastAppliedIndex() (uint64, bool, error)
 }
 ```
 
-### 2. Conditional restore
+**Reaching the store from inside `restoreSnapshotState`**: `kvFSM` holds
+its store via `f.store`, but `kvFSM` itself does not satisfy
+`AppliedIndexReader`.  The cleanest seam is to add a typed accessor on
+`kvFSM` (`func (f *kvFSM) AppliedIndexReader() AppliedIndexReader { return f.store }`)
+which `restoreSnapshotState` calls when the FSM implements a tiny
+companion interface:
+
+```go
+type AppliedIndexReporter interface {
+    AppliedIndexReader() AppliedIndexReader
+}
+```
+
+This keeps the public `StateMachine` interface untouched and avoids
+fattening `kvFSM` with a forwarding method.  FSMs that don't expose the
+reporter fall back to the current full-restore behaviour.
+
+### 4. Conditional restore (with conservative error fallback)
 
 ```go
 // internal/raftengine/etcd/wal_store.go
@@ -173,14 +323,11 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
     if isSnapshotToken(snapshot.Data) {
         tok, err := decodeSnapshotToken(snapshot.Data)
         if err != nil { return err }
-        if skip, err := fsmAlreadyAtIndex(fsm, tok.Index); err != nil {
-            return err
-        } else if skip {
-            // FSM data on disk is at least as fresh as the snapshot.
-            // Raft will replay [tok.Index+1, committed] from the WAL
-            // and bring us to the latest committed index without
-            // touching the LSM's bulk state.
-            return nil
+        if fsmAlreadyAtIndex(fsm, tok.Index) {
+            // The body restore is skipped, but we MUST still read the
+            // HLC ceiling header from the snapshot file so the FSM's
+            // in-memory HLC starts at the right floor (see §HLC).
+            return applyHLCCeilingFromSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index))
         }
         return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
     }
@@ -188,138 +335,321 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
     return errors.WithStack(fsm.Restore(bytes.NewReader(snapshot.Data)))
 }
 
-func fsmAlreadyAtIndex(fsm StateMachine, want uint64) (bool, error) {
-    r, ok := fsm.(AppliedIndexReader)
-    if !ok {
-        return false, nil // FSM cannot self-report; restore conservatively.
-    }
-    have, present, err := r.LastAppliedIndex()
-    if err != nil { return false, err }
-    if !present { return false, nil }
-    return have >= want, nil
+// fsmAlreadyAtIndex returns true ONLY when we can prove the FSM is
+// already at or past `want`. Any uncertainty -- FSM doesn't expose the
+// reporter, store doesn't expose the reader, read error, or missing
+// meta key -- returns false so we fall back to the full restore. The
+// idea is that a stale-but-incorrect skip is far worse than a wasteful
+// full restore, so we err strictly toward restoring.
+func fsmAlreadyAtIndex(fsm StateMachine, want uint64) bool {
+    reporter, ok := fsm.(AppliedIndexReporter)
+    if !ok { return false }
+    reader := reporter.AppliedIndexReader()
+    if reader == nil { return false }
+    have, present, err := reader.LastAppliedIndex()
+    if err != nil || !present { return false }
+    return have >= want
 }
 ```
 
-The fall-back behaviour when the FSM does not implement
-`AppliedIndexReader` or has no meta-key is **the current restore**, so
-the change is strictly additive.  The first cold start after deployment
-populates the meta key on every Apply going forward; from the second
-restart onward the skip path kicks in.
+**Round-1 mistake (fixed)**: the round-1 pseudocode propagated
+`LastAppliedIndex()` errors upward, which would fail node startup on a
+corrupt meta key.  Round-2 fallback policy: any error / missing /
+uncertainty maps to `false` (run full restore).  This honours the
+"strictly additive" guarantee — adoption can never make startup worse
+than the current behaviour, only better.
 
-### 3. Crash-safety argument
+### 5. HLC ceiling preservation when skipping (P1 from review)
 
-We claim: `LastAppliedIndex = N` durably implies "every mutation
-produced by `fsm.Apply` for indices `[snapshotIndex+1 .. N]` is durably
-present in fsm.db."
+`kvFSM.Restore` (`kv/fsm.go:264`) is currently the only place that reads
+the HLC physical-ceiling header from the snapshot file and applies it
+to the in-memory `f.hlc`:
 
-Proof: the meta key is written **in the same Pebble batch** as the data
-mutation for index N.  Pebble commits batches atomically.  Either both
-land or neither does.  After commit, both are durable per the batch's
-`pebble.Sync` option.  No crash window exists between persisting the
-mutation and persisting the index.
+```go
+// kv/fsm.go:278-286 (existing)
+if bytes.Equal(hdr[:8], hlcSnapshotMagic[:]) {
+    ceilingMs := int64(binary.BigEndian.Uint64(hdr[8:]))
+    if f.hlc != nil && ceilingMs > 0 {
+        f.hlc.SetPhysicalCeiling(ceilingMs)
+    }
+    return errors.WithStack(f.store.Restore(io.NopCloser(r)))
+}
+```
 
-Suppose a crash mid-Apply.  Pebble's WAL replay either:
-- restores the batch (data + index both present), or
-- discards the torn batch (data + index both absent).
+If we skip `Restore` we also skip this assignment.  After skip:
 
-Either way the invariant holds; on the second startup the meta-key is
-either exactly the index of the last committed Apply, or strictly less.
-`LastAppliedIndex ≥ snapshot.Metadata.Index` correctly implies the FSM
-is at least as fresh as the snapshot.
+- `f.hlc.physicalCeiling` stays at whatever the in-memory HLC was
+  initialised to (typically wall-clock-now, no snapshot floor).
+- Subsequent HLC lease entries in the WAL still bump the ceiling when
+  replayed by raft, BUT the lease entries are **between the snapshot
+  index and the latest committed index** — those whose ceiling was
+  baked into the snapshot itself (lease entries whose index ≤
+  `snapshot.Metadata.Index`) are compacted away from the WAL and never
+  replayed.
+- Net effect: if the snapshot was taken at ceiling C and no fresh
+  lease has bumped past C since, this node could mint timestamps
+  below C after becoming leader.
 
-The converse risk — "skip restore when we shouldn't" — would require
-the meta key to read **a value larger than the last durable Apply**.
-Since the only writer is `fsm.Apply` and it always batches index with
-data, that's impossible barring physical corruption (in which case the
-8-byte length check rejects the read and we restore conservatively).
+This violates the HLC monotonicity invariant cluster-wide.  **The skip
+path MUST set the HLC ceiling from the snapshot header even when the
+body restore is skipped.**
 
-### 4. Idempotency of replay after skip
+Mechanism — a new helper that reads the first 16 bytes of the snapshot
+file and dispatches:
+
+```go
+// internal/raftengine/etcd/wal_store.go (new)
+func applyHLCCeilingFromSnapshot(fsm StateMachine, snapPath string) error {
+    setter, ok := fsm.(HLCCeilingSetter)
+    if !ok { return nil } // FSM doesn't carry HLC; nothing to set.
+    f, err := os.Open(snapPath)
+    if err != nil { return errors.WithStack(err) }
+    defer f.Close()
+    var hdr [hlcSnapshotHeaderLen]byte
+    n, err := io.ReadFull(f, hdr[:])
+    if err != nil {
+        // The snapshot file is too short for an HLC header. Predates
+        // the magic/ceiling format -- nothing to apply, fall through.
+        if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+            return nil
+        }
+        return errors.WithStack(err)
+    }
+    _ = n
+    if !bytes.Equal(hdr[:8], hlcSnapshotMagic[:]) {
+        return nil // old format, no ceiling.
+    }
+    ceilingMs := int64(binary.BigEndian.Uint64(hdr[8:]))
+    if ceilingMs > 0 {
+        setter.SetHLCPhysicalCeiling(ceilingMs)
+    }
+    return nil
+}
+
+// kv/fsm.go gains:
+type HLCCeilingSetter interface {
+    SetHLCPhysicalCeiling(ms int64)
+}
+func (f *kvFSM) SetHLCPhysicalCeiling(ms int64) {
+    if f.hlc != nil { f.hlc.SetPhysicalCeiling(ms) }
+}
+```
+
+Cost: a 16-byte read from the snapshot file (single syscall, no
+deserialisation).  Negligible compared to the 46 s body restore we
+elide.
+
+### 6. Crash-safety argument (revised)
+
+We claim: `LastAppliedIndex = N` durably implies "every raft apply for
+indices `[snapshotIndex+1 .. N]` that produced a `pebbleStore` mutation
+is durably present in fsm.db."
+
+#### Default mode (`pebble.Sync`)
+
+The meta key is written in the same `pebble.Batch` as the data
+mutation.  Pebble commits batches atomically: either both records make
+it to the Pebble WAL and a successful fsync confirms durability, or
+neither does.  No crash window exists between persisting the mutation
+and persisting the index.
+
+#### `ELASTICKV_FSM_SYNC_MODE=nosync` mode
+
+When `raftApplyWriteOpts()` returns `pebble.NoSync` (configured at
+`lsm_store.go:1094-1104`), the data + meta key still land in the same
+Pebble WAL record, but the OS may delay the fsync.  Durability shifts
+to the raft layer: the raft WAL is the canonical source of truth, and
+on crash recovery raft replays entries from the last fsync'd Pebble
+position forward.  The invariant still holds because:
+
+- Pebble's atomic batch property is independent of the sync option.
+- On recovery, Pebble's WAL replay reconstructs the most recent
+  committed batch (or none of it), giving us either `(data + meta)` at
+  index N or `(neither)`.
+- raft will then replay any entries that the OS-buffered fsync lost,
+  and each Apply re-bundles its own index.
+
+The skip gate therefore stays correct: a `nosync`-induced loss merely
+means `LastAppliedIndex` reports a lower value than the post-restart
+applied count would imply, which only causes us to over-restore
+conservatively.
+
+#### DEL_PREFIX path
+
+`DeletePrefixAtRaft` → `deletePrefixAtWithOpts` builds its own batch
+(`lsm_store.go:1196`) and bundles `metaLastCommitTSBytes`
+(`lsm_store.go:1231`).  Branch 3 extends that bundling to also include
+`metaAppliedIndex`.  Without this, DEL_PREFIX entries land without
+bumping the meta key and `LastAppliedIndex` drifts behind the true
+applied count (still safe — over-restoring conservatively — but
+defeats the optimisation for any workload that uses DEL_PREFIX).
+
+#### HLC lease entries (Open Question 1 — committed to Option 2)
+
+`f.applyHLCLease` (kv/fsm.go around `:63`) is currently an in-memory
+mutation only; it does not touch `f.store`.  We accept that
+`LastAppliedIndex` does NOT advance for these entries.  Consequence:
+in a workload where the only entries between two snapshots are lease
+ticks, the skip gate will fall back to full restore — which is safe
+and rare.
+
+Adding a synthetic pebble batch per lease tick (Option 1) would cost
+~1 extra pebble batch per second per group (lease cadence is 1 s),
+which is undesirable.  Option 2 (do nothing extra) is correct and
+cheaper; the trade-off is the rare false-positive restore.
+
+### 7. Idempotency of replay after skip (revised — OCC two-case)
 
 After we skip restore, raft replays entries `[snapshotIndex+1, committed]`.
-Some of those entries may have already been applied (if a previous
+Some of those entries may already be present in fsm.db (if a previous
 restart reached `applied=K > snapshotIndex` before crashing).  We do
-**not** suppress replay of already-applied entries — `fsm.Apply` is
-required to be idempotent for snapshot recovery in any raft FSM, and
-the current kvFSM upholds that (every mutation is keyed by its raft
-metadata; re-applying the same entry produces the same Pebble write).
-The meta-key gets overwritten with the same value.  No correctness
-gap; the cost is the same replay we'd pay after a full restore.
+**not** suppress replay of already-applied entries.  Two cases cover
+the invariant:
 
-### 5. Compatibility & rollback
+**(a) Raw requests** (`startTS = commitTS = T`).  The kvFSM dispatch
+reaches `f.store.ApplyMutationsRaft(... T, T ...)`.  Inside
+`checkConflicts`, `latestCommitTS(T) > T` evaluates to false (equal,
+not greater), so no conflict is raised and the Pebble write is a
+deterministic overwrite of the same MVCC cell.  Re-applying is a
+no-op at the byte level.
 
-- The interface change `Apply(data) → Apply(index, data)` is breaking
-  for **external** state machines that embed `raftengine.StateMachine`.
-  No such consumers exist in-tree.  External consumers (none known)
-  would notice immediately at compile time.
-- The meta key is new; older fsm.db files don't have it.  The
-  `present == false` branch makes the first restart after upgrade
-  fall back to the current (full restore) behaviour, populating the
-  meta key from the next Apply onward.
-- Rollback: revert the wal_store.go change to remove the skip branch.
-  The meta key remains in fsm.db (harmless dead data) and gets
-  overwritten by future Applies.  No data migration required either
-  direction.
+**(b) OCC one-phase transactions** (`startTS < commitTS`).  After the
+first apply, `latestCommitTS(key) = commitTS`.  On re-apply,
+`checkConflicts` evaluates `latestCommitTS(commitTS) > startTS` to
+**true**, returning `ErrWriteConflict`.  The key is NOT re-written.
+This is safe because `ErrWriteConflict` is returned as the FSM
+**response value** (not as the `error` from `applyNormalEntry`); it
+does not implement `HaltApply`.  The engine still calls
+`setApplied(entry.Index)`, the FSM state is already correct from the
+first apply, and the meta key is overwritten with the same value.
+End state is observationally identical to "produced the same write."
 
-### 6. Observability
+Other request types are individually safe by similar reasoning:
+`handleCommitRequest` short-circuits via
+`applyCommitWithIdempotencyFallback`; `handleAbortRequest` is safe via
+`shouldClearAbortKey` (no-op if the lock is already gone);
+`handlePrepareRequest` collapses through the OCC write-conflict path
+when intents from prior applies are still present.
+
+### 8. Compatibility & rollback
+
+- `StateMachine.Apply`'s public signature is **unchanged**.  External
+  state machines (none known) continue to work.
+- The new opt-in interfaces (`ApplyIndexAware`, `AppliedIndexReader`,
+  `AppliedIndexReporter`, `HLCCeilingSetter`) are additive.  FSMs that
+  don't implement them fall back to the current behaviour.
+- The `metaAppliedIndex` key is new; older fsm.db files don't have
+  it.  The `present=false` branch makes the first restart after upgrade
+  fall back to full restore, populating the meta key from the next
+  Apply onward.
+- Rollback: revert the wal_store.go skip branch.  The meta key remains
+  in fsm.db (harmless dead data) and gets overwritten by future
+  Applies.  No data migration in either direction.
+
+### 9. Observability
 
 Two metrics + one log line:
 
-```go
-// monitoring/metrics.go
-fsm_cold_start_restore_total{outcome="executed|skipped|fallback"}
-fsm_cold_start_applied_index_gap // snapshot.Index - lastAppliedIndex when restore is executed
 ```
+fsm_cold_start_restore_total{outcome="executed|skipped|fallback"}
+fsm_cold_start_applied_index_gap{outcome="executed|skipped"}
+```
+
+The gap label gets emitted in both directions so we can confirm the
+**skip path actually closes the gap** (positive values when skipped
+mean `LastAppliedIndex - snapshot.Index ≥ 0`) AND confirm restore
+sizes when executed (`snapshot.Index - LastAppliedIndex > 0`).
+Asymmetric emission would hide regressions where the skip succeeds but
+the meta key is drifting behind.
 
 Log line at INFO when skipping:
 
 ```
-restoreSnapshotState skipped (FSM already at index N >= snapshot index X)
+restoreSnapshotState skipped (FSM at index %d, snapshot at %d, HLC ceiling applied from header)
 ```
-
-These let us verify the skip rate in production and catch regressions
-where Apply stops bundling the index.
 
 ## Implementation Plan
 
-1. **Branch 1 (this design)** — PR-2-design, lands docs only.
-2. **Branch 2 (interface change)** — modify `StateMachine.Apply`
-   signature across all callers + the conformance shim.  No behaviour
-   change; index is accepted and discarded.  Pure mechanical PR with
-   ~200-line diff, easy review.
-3. **Branch 3 (meta key + batch bundling)** — `kvFSM.Apply` threads
-   `index` to leaf mutation; `pebbleStore` defines the meta key and
-   exposes `LastAppliedIndex()`; unit tests cover round-trip + torn
-   batch.  Activates the data side; the skip is **not yet wired**.
-4. **Branch 4 (wal_store.go skip)** — adds the `fsmAlreadyAtIndex` gate
-   to `restoreSnapshotState`, with the metrics and the log line.  This
-   is the user-visible perf win.
-5. **Branch 5 (cleanup)** — once branch 4 has soaked in production
-   for a release, consider lowering `HEALTH_TIMEOUT_SECONDS` back
-   toward a tighter ceiling.
+| Branch | Content | Behaviour change |
+|---|---|---|
+| **B1** (this PR) | Design doc | None |
+| **B2** | New `ApplyIndexAware` interface + `kvFSM.SetApplyIndex` + engine.go call site | None (engine starts feeding index; FSM stashes it; nothing reads it yet) |
+| **B3** | Thread `appliedIndex` through `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` + bundle meta key in both leaves + `pebbleStore.LastAppliedIndex()` with `dbMu.RLock()` + `kvFSM.AppliedIndexReader()` accessor | Meta key starts being written; skip is still disabled. Soak in production for one release. |
+| **B4** | `restoreSnapshotState` skip gate + `applyHLCCeilingFromSnapshot` + `kvFSM.SetHLCPhysicalCeiling` + metrics + INFO log | **User-visible cold-start win.** |
+| **B5** | Lower `HEALTH_TIMEOUT_SECONDS` default once production data shows steady-state skip rate ≥ 90 % | Tighter ceiling, but tracker the env override still honoured |
 
-Branches 2–4 each ship behind tests that prove the corresponding
-invariant.  Branch 4 specifically asserts:
+Each of B2–B4 ships behind tests:
 
-- Skip happens when `stored ≥ snapshot.Metadata.Index`.
-- Restore runs when `stored < snapshot.Metadata.Index`.
-- Restore runs when the meta key is missing.
-- Restore runs when `LastAppliedIndex()` returns an error.
+- **B2**: `engine_test.go` asserts that a recorder FSM observes
+  `SetApplyIndex(entry.Index)` immediately before `Apply(data)` for
+  every Apply.
+- **B3**: pebble-level tests round-trip the meta key in
+  `applyMutationsWithOpts` AND `deletePrefixAtWithOpts`; torn-batch
+  test simulates pebble WAL replay across the meta key boundary.
+- **B4**: integration test seeds a fsm.db with `LastAppliedIndex = K`,
+  pairs it with a snapshot at index `K-N` (N varies), asserts skip is
+  taken for `N ≤ 0` and restore for `N > 0`.  Separate test asserts
+  that `applyHLCCeilingFromSnapshot` sets `f.hlc.PhysicalCeiling()`
+  for both skip and restore paths (i.e., the ceiling is invariant
+  under the optimisation).
+
+## Errata against Round-1 reviewer feedback
+
+For honesty about the review process: round 1 received feedback from
+`gemini-code-assist[bot]` and `claude[bot]` that referenced
+codebase entities that **do not exist in this repository**.  Verified
+by `grep -r ... --include='*.go' .` over `main` HEAD at SHA
+`94579fc0`.
+
+| Cited entity | Grep matches | Reviewer claim | Reality |
+|---|---|---|---|
+| `ApplyIndexAware` | 0 | "already in production" (gemini), "engine.go:2292" (claude) | Does not exist. Engine.go:2292 is `failPending`. |
+| `SetApplyIndex` | 0 | "already implemented on kvFSM" | Does not exist on `kvFSM`. |
+| `pendingApplyIdx` | 0 | "already holds entry.Index" | Field does not exist. |
+| `applyReservedOpcode` | 0 | "dispatches HLC lease + encryption opcodes 0x03..0x07" | Function does not exist. |
+| `applyEncryption` | 0 | "goes via WriteSidecar" | Function does not exist. |
+| `WriteSidecar` | 0 | (same as above) | Method does not exist. |
+| Encryption opcodes `0x03..0x07` | 0 | "Stage 6/7/8 encryption dispatch" | Only `raftEncodeSingle=0x00`, `raftEncodeBatch=0x01`, `raftEncodeHLCLease=0x02` exist (`kv/fsm.go:110-116`). |
+
+This design therefore proceeds with **Branch 2 in place** (we have to
+create the `ApplyIndexAware` seam; we cannot reuse one that doesn't
+exist).  The reviewers' reasoning about "avoid a breaking
+`StateMachine.Apply` signature change" was sound regardless of the
+factual error — we adopt it by creating the seam they hallucinated as
+existing.  Encryption-opcode dispatch is not addressed because the
+opcodes do not exist in main today; once Stages 6/7/8 land, the
+opcode dispatch will need to plumb `appliedIndex` through whatever
+path it takes (a follow-up problem, not a round-2 problem).
+
+The **substantively correct** findings from round-1 reviews — all
+incorporated:
+
+- 🔴 codex P1 on `:319`: HLC ceiling preservation when skipping
+  body restore (`kv/fsm.go:264-286` does read the header).  **Real
+  bug**, fixed in §5.
+- 🟠 gemini medium on `:152`: `LastAppliedIndex()` needs
+  `s.dbMu.RLock()` per `lsm_store.go:153 / :162 / :553 / :675` lock
+  ordering.  **Real**, fixed in §3.
+- 🟠 claude §3 caveat 1: `ELASTICKV_FSM_SYNC_MODE=nosync`
+  (`lsm_store.go:86`) shifts durability boundary.  **Real**, fixed
+  in §6.
+- 🟠 claude §3 caveat 2: `deletePrefixAtWithOpts` (`lsm_store.go:1196`)
+  builds an independent batch and already bundles
+  `metaLastCommitTSBytes` (`:1231`).  **Real**, fixed in §2.
+- 🟠 claude §3 error handling: `fsmAlreadyAtIndex` propagating errors
+  would fail cold start on a corrupt meta key.  **Sound design
+  improvement**, fixed in §4.
+- 🟢 claude §4 OCC two-case argument and call-site count (6 not 8).
+  **Real**, fixed in §7 and §1's table.
 
 ## Open Questions
 
-- **Multi-group**: each shard's pebbleStore has its own meta key.  No
-  shared state; this design is per-shard naturally.  Sanity-check during
-  branch 3.
-- **HLC lease entries**: `kvFSM.applyHLCLease` advances `f.hlc` but does
-  not currently touch the store.  We must still bump the meta key on
-  lease applies (a degenerate batch with just the meta key, or — better
-  — fold the lease index into the next data Apply).  Decision deferred
-  to branch 3; the in-memory HLC state is reconstructed at startup from
-  the lease entries replayed by raft, so this is purely about getting
-  the index counter monotonic.
+- **Multi-group**: each shard's `pebbleStore` has its own meta key.
+  No shared state; this design is per-shard naturally.  Branch 3 will
+  verify with an integration test on a 4-group cluster.
 - **HashiCorp backend** (if it ever returns): the raft library exposes
-  `log.Index` to `(raft.FSM).Apply(log *raft.Log)`, so the interface
-  change is satisfiable on that side too.
+  `log.Index` to `(raft.FSM).Apply(log *raft.Log)`, so the
+  `ApplyIndexAware` seam is satisfiable on that side too.
 
 ## Out of Scope (future)
 
@@ -329,3 +659,6 @@ invariant.  Branch 4 specifically asserts:
 - Switching `restorePebbleNativeAtomic` to in-place ingest (e.g.
   Pebble's `Ingest`).  Risky and unrelated to the skip-when-safe
   optimisation this proposal targets.
+- Plumbing `appliedIndex` through future encryption-opcode dispatch
+  (Stages 6/7/8) — once those opcodes exist on `main`, they will need
+  the same treatment as DEL_PREFIX.
