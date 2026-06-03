@@ -13,6 +13,7 @@ require (
 	github.com/aws/smithy-go v1.25.1
 	github.com/cockroachdb/errors v1.13.0
 	github.com/cockroachdb/pebble/v2 v2.1.5
+	github.com/coreos/go-semver v0.3.1
 	github.com/emirpasic/gods v1.18.1
 	github.com/getsentry/sentry-go v0.46.2
 	github.com/goccy/go-json v0.10.6
@@ -58,7 +59,6 @@ require (
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/cockroachdb/swiss v0.0.0-20251224182025-b0f6560f979b // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
-	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
