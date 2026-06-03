@@ -234,16 +234,16 @@ func TestProposeAdmin_EquivalentToProposeToday(t *testing.T) {
 		"both Propose and ProposeAdmin must reach the FSM verbatim and in-order")
 }
 
-// TestProposerInterface_RequiresProposeAdmin is a compile-time
-// guard: it does not test runtime behaviour but ensures the
-// raftengine.Proposer interface still requires the ProposeAdmin
-// method on every implementation. Removing the method from the
-// interface declaration would let unmigrated callers stay on
-// Propose silently, defeating the Stage 6E-2b migration.
-func TestProposerInterface_RequiresProposeAdmin(t *testing.T) {
-	t.Parallel()
-	var _ raftengine.Proposer = (*Engine)(nil)
-}
+// Compile-time guard: *Engine must satisfy raftengine.Proposer
+// (which Stage 6E-2b extended with ProposeAdmin). Declared at
+// package scope so the check fires at test-package compile time
+// regardless of which test is selected; wrapping it inside a
+// no-op test function would defer the check to a test target
+// nobody runs. Removing ProposeAdmin from the interface would
+// either leave this assertion dangling (if Engine still has the
+// method) or hard-fail the build (if it doesn't) — the latter is
+// the failure mode this guard exists to produce.
+var _ raftengine.Proposer = (*Engine)(nil)
 
 func TestOpenSingleNodeProposeAndReadIndex(t *testing.T) {
 	fsm := &testStateMachine{}
