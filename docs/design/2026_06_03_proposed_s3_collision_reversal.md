@@ -50,7 +50,7 @@ func (e *S3RecordEncoder) loadBucketKeymap(root *os.Root, bucketDir string) (map
 1. Keep `isKeymapCollisionTracker` to disambiguate. When it returns `tracker = false`, the bucket has a legitimate `KEYMAP.jsonl` user object — the file is paired with a `KEYMAP.jsonl.elastickv-meta.json` sidecar and round-trips as a normal S3 body (existing `TestS3EncodeKeymapObjectRoundTrip` pins this). `loadBucketKeymap` MUST NOT touch it; M4-2a's object emission already covers it. Codex P2 v913 v2 flagged this: an implementation that called `loadBucketKeymap` unconditionally would parse the user object's body as keymap JSON and either fail or consume it as collision metadata.
 2. When `tracker == true`, call `loadBucketKeymap` (NEW). Replaces the current `ErrS3EncodeUnsupportedCollision` branch.
 
-`loadBucketKeymap` reuses the existing per-line `KeymapReader` and the `OpenSidecarFile` no-follow / hard-link / non-regular refusal pipeline (same protections `isKeymapCollisionTracker` already inherits).
+`loadBucketKeymap` reuses the existing per-line `KeymapReader`. **It MUST NOT use `OpenSidecarFile`** — that helper is write-side (`O_WRONLY|O_CREATE|O_TRUNC` on Windows / fallback, `O_WRONLY|O_CREATE` + `Truncate(0)` on Unix; see `open_nofollow_unix.go:60` + `open_nofollow_other.go:32`) and would erase `KEYMAP.jsonl` before the reader could see it, losing every rename mapping. Codex P2 v913 v3 flagged this. The loader instead uses the **read-side** pipeline that `openRootRegular` (`encode_s3_objects.go:260`) already establishes for object bodies: `root.Lstat` → `refuseHardLink` → `root.Open` (read-only). `isKeymapCollisionTracker` already inherits the same read-side protections (it opens with `root.Open` against an Lstat-validated regular file), so `loadBucketKeymap` simply reopens through the same path.
 
 **Duplicate-key contract — diverges from `LoadKeymap`.** The shared `keymap.go:LoadKeymap` documents last-wins behavior for duplicate `Encoded` segments (the Redis encoder tolerates this because its decoder's keymap writer always emits one record per encoded segment, and a duplicate from a hand-edited dump just retains the most recent). M4-2b's invariant is stricter: the S3 decoder's `recordKeymap` writes exactly one entry per renamed object, so a duplicate `Encoded` segment means the decoder wrote two distinct rename targets for the same on-disk name — a corrupt dump the encoder cannot disambiguate. Therefore `loadBucketKeymap` does NOT call `LoadKeymap`; it iterates `KeymapReader.Next()` in a manual loop and fails closed on the second occurrence of any `Encoded` value (`TestS3EncodeRejectsDuplicateKeymapEntry`). Claude v913 v2 caught this contract divergence.
 
@@ -98,10 +98,12 @@ Plus a `--rename-collisions=true` variant for `KindMetaCollision`.
 ```
 internal/backup/encode_s3_collision.go        # loadBucketKeymap + resolveS3Segment
 internal/backup/encode_s3_collision_test.go   # keymap parse, segment resolution, error paths
-internal/backup/encode_s3_objects.go          # rewrite isKeymapCollisionTracker call site + WalkDir leaf resolver
+internal/backup/encode_s3_objects.go          # rewrite isKeymapCollisionTracker call site + WalkDir leaf resolver; remove ErrS3EncodeUnsupportedCollision var (:59) + guard (:96)
 internal/backup/encode_s3_objects_test.go     # round-trip leaf-data + meta-collision; drop ErrS3EncodeUnsupportedCollision test
-internal/backup/encode_s3.go                  # remove ErrS3EncodeUnsupportedCollision (no longer reachable)
+internal/backup/encode_snapshot.go            # update comment at :655 that cites ErrS3EncodeUnsupportedCollision as an exit-2 routing example (claude v913 v3)
 ```
+
+(v3's earlier draft of this section incorrectly named `encode_s3.go` as the home of `ErrS3EncodeUnsupportedCollision`; it is actually in `encode_s3_objects.go`. Corrected in v4.)
 
 ## Milestones (within M4-2b)
 
