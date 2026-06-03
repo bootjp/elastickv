@@ -1,7 +1,7 @@
 # Idempotent FSM Snapshot Restore on Cold Start
 
-**Status**: Proposal (Round 6 — thread tok.CRC32C through the skip path)
-**Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4 / 5 / 6)
+**Status**: Proposal (Round 7 — split CRC seam + force pebble.Sync on checkpoint)
+**Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4 / 5 / 6 / 7)
 **Author**: bootjp
 **Related**: PR #909 (`HEALTH_TIMEOUT_SECONDS` 60s → 300s)
 
@@ -377,37 +377,53 @@ cutover`).  Worse, a too-short / truncated file would be parsed by
 `ReadSnapshotHeader` as headerless legacy and silently apply
 `ceiling=0, cutover=0`.
 
-Round-6 mirrors the existing safety contract by threading
-`tok.CRC32C` through to the FSM and running the same three checks
-**before** applying any side-effect:
+**Seam implementability constraint (round-7 fix)**.  Round 6 placed
+the entire CRC verification inside `kvFSM.ApplySnapshotHeaderFromFile`,
+which would need to call `readFSMFooter`, `fsmMinFileSize`,
+`crc32cTable`, `fsmRestoreReadAhead`, `statFSMFileError`,
+`ErrFSMSnapshotTokenCRC`, `ErrFSMSnapshotFileCRC` —  **all
+unexported** in `internal/raftengine/etcd/fsm_snapshot_file.go`.
+Production code does not currently have `kv → internal/raftengine/etcd`
+or `internal/raftengine/etcd → kv` edges (test-only on both sides), and
+adding either to satisfy the round-6 design either duplicates the CRC
+verifier in `kv` or breaks the layering.
+
+Round-7 keeps the CRC verifier in its existing package and splits the
+seam into two phases — a **parse** phase that reads the header from a
+caller-supplied reader (and drains the rest, for CRC coverage), and an
+**apply** phase that is pure assignment.  The engine orchestrates
+size + footer + tee'd CRC computation around the parse phase, then
+calls apply only after all three pass:
 
 ```go
-// internal/raftengine/etcd/wal_store.go (new) -- never imports kv
+// internal/raftengine/statemachine.go (new, sibling to ApplyIndexAware)
+type SnapshotHeaderApplier interface {
+    // ParseSnapshotHeader reads the v1/v2 header from r, drains the
+    // remaining bytes (so a wrapping crc32 TeeReader covers the full
+    // payload), and returns the parsed (ceiling, cutover) pair WITHOUT
+    // mutating FSM state. Implementations MUST NOT touch any FSM
+    // fields here; the engine calls ApplySnapshotHeader separately
+    // only after the wrapping CRC verification passes.
+    //
+    // Errors propagate from the underlying header parser
+    // (ErrSnapshotHeaderUnknownMagic / InvalidLength) or from the
+    // drain pass (I/O errors). FSM state stays untouched on error.
+    ParseSnapshotHeader(r io.Reader) (ceiling, cutover uint64, err error)
+
+    // ApplySnapshotHeader is pure assignment of the verified header
+    // state. The engine calls this only after ParseSnapshotHeader
+    // returned and the wrapping crc32 hash matched the file footer.
+    ApplySnapshotHeader(ceiling, cutover uint64)
+}
+
+// internal/raftengine/etcd/wal_store.go -- never imports kv;
+// CRC verification stays here where the helpers live.
 func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) error {
     setter, ok := fsm.(SnapshotHeaderApplier)
     if !ok {
         return nil // FSM has no header state; skip is harmless.
     }
-    return errors.WithStack(setter.ApplySnapshotHeaderFromFile(snapPath, tokenCRC))
-}
 
-// internal/raftengine/statemachine.go (new, sibling to ApplyIndexAware)
-type SnapshotHeaderApplier interface {
-    // ApplySnapshotHeaderFromFile opens the snapshot file at snapPath,
-    // verifies size + footer-vs-tokenCRC + full-body-CRC (matching
-    // openAndRestoreFSMSnapshot's safety contract), then applies the
-    // header side-effects the FSM's Restore would apply (HLC ceiling,
-    // Stage 8a cutover, etc.). Returns ErrFSMSnapshotTooSmall /
-    // ErrFSMSnapshotTokenCRC / ErrFSMSnapshotFileCRC for the
-    // corresponding verification failures, or
-    // ErrSnapshotHeaderUnknownMagic / InvalidLength for
-    // forward-incompat headers. MUST NOT mutate FSM state on any
-    // verification failure.
-    ApplySnapshotHeaderFromFile(snapPath string, tokenCRC uint32) error
-}
-
-// kv/fsm.go (new method on kvFSM) -- kv.ReadSnapshotHeader stays inside kv
-func (f *kvFSM) ApplySnapshotHeaderFromFile(snapPath string, tokenCRC uint32) error {
     file, err := os.Open(snapPath)
     if err != nil { return statFSMFileError(err) }
     defer file.Close()
@@ -429,28 +445,22 @@ func (f *kvFSM) ApplySnapshotHeaderFromFile(snapPath string, tokenCRC uint32) er
             "path=%s footer=%08x token=%08x", snapPath, footer, tokenCRC)
     }
 
-    // Step 3: full-body CRC, with the header parsed inside the tee'd
-    // reader so its bytes are included in the computed CRC. We
-    // intentionally drain (Discard) the body bytes -- the body is
-    // already present in fsm.db (that's why we're skipping the
-    // restore), but the CRC must cover the whole payload for the
-    // ErrFSMSnapshotFileCRC check to mean what it does in
-    // openAndRestoreFSMSnapshot.
+    // Step 3: full-body CRC. Wrap the payload in a crc32 TeeReader and
+    // hand it to the FSM's ParseSnapshotHeader for header parse + drain.
+    // The header bytes are included in the computed CRC because the
+    // FSM reads them from the tee'd reader.
     if _, err := file.Seek(0, io.SeekStart); err != nil {
         return errors.WithStack(err)
     }
     payloadSize := info.Size() - fsmFooterSize
     h := crc32.New(crc32cTable)
     tee := io.TeeReader(io.LimitReader(file, payloadSize), h)
-    br := bufio.NewReaderSize(tee, fsmRestoreReadAhead)
 
-    ceiling, cutover, herr := ReadSnapshotHeader(br)
-    if herr != nil {
-        // ErrSnapshotHeaderUnknownMagic / InvalidLength: fail closed.
-        return errors.WithStack(herr)
-    }
-    if _, err := io.Copy(io.Discard, br); err != nil {
-        return errors.WithStack(err)
+    ceiling, cutover, perr := setter.ParseSnapshotHeader(tee)
+    if perr != nil {
+        // ErrSnapshotHeaderUnknownMagic / InvalidLength / I/O error
+        // surfaced from the FSM's parse pass. State unchanged.
+        return errors.WithStack(perr)
     }
     if h.Sum32() != footer {
         return errors.Wrapf(ErrFSMSnapshotFileCRC,
@@ -458,31 +468,55 @@ func (f *kvFSM) ApplySnapshotHeaderFromFile(snapPath string, tokenCRC uint32) er
     }
 
     // All three checks passed; apply side-effects.
+    setter.ApplySnapshotHeader(ceiling, cutover)
+    return nil
+}
+
+// kv/fsm.go (new methods on kvFSM) -- kv.ReadSnapshotHeader stays inside kv;
+// no imports of internal/raftengine/etcd or its private helpers.
+func (f *kvFSM) ParseSnapshotHeader(r io.Reader) (uint64, uint64, error) {
+    // The engine has already wrapped r in a crc32 TeeReader sized at
+    // the body payload (file size minus 4-byte footer). We read the
+    // header, then drain the rest of the body so the engine's CRC
+    // covers every byte (matching restoreAndComputeCRC's behaviour).
+    br := bufio.NewReaderSize(r, 1<<20) //nolint:mnd // 1 MiB, local to kv
+    ceiling, cutover, err := ReadSnapshotHeader(br)
+    if err != nil { return 0, 0, errors.WithStack(err) }
+    if _, err := io.Copy(io.Discard, br); err != nil {
+        return 0, 0, errors.WithStack(err)
+    }
+    return ceiling, cutover, nil
+}
+
+func (f *kvFSM) ApplySnapshotHeader(ceiling, cutover uint64) {
     if f.hlc != nil && ceiling > 0 {
         f.hlc.SetPhysicalCeiling(int64(ceiling))
     }
     f.restoredCutover = cutover
-    return nil
 }
 ```
 
-**Cost note**.  Step 3 reads the full snapshot file once.  For multi-GiB
-FSMs this is a non-trivial I/O cost — but it is **strictly cheaper**
-than the restore path it replaces (which also reads the file once via
-`restoreAndComputeCRC` AND additionally writes a temp Pebble database
-with sstable / WAL output).  Observed restore wall-clock is dominated
-by Pebble writes, not reads; eliding the writes preserves the bulk of
-the win.  A future optimisation could persist the HLC ceiling +
-cutover durably (analogous to `metaAppliedIndex`) and elide the file
-read entirely — that's out of scope for this proposal but flagged
-under Open Questions.
+**Cost note**.  Step 3 reads the full snapshot file once (through the
+crc32 TeeReader).  For multi-GiB FSMs this is a non-trivial I/O cost
+— but it is **strictly cheaper** than the restore path it replaces
+(which also reads the file once via `restoreAndComputeCRC` AND
+additionally writes a temp Pebble database with sstable / WAL output).
+Observed restore wall-clock is dominated by Pebble writes, not reads;
+eliding the writes preserves the bulk of the win.  A future
+optimisation could persist the HLC ceiling + cutover durably
+(analogous to `metaAppliedIndex`) and elide the file read entirely —
+out of scope here, flagged under Open Questions.
 
-By keeping the `kv.ReadSnapshotHeader` call inside `kv/fsm.go` the
-skip path inherits v1 + v2 parity, the `ErrSnapshotHeaderUnknownMagic`
-fail-closed branch, and any future v3 the snapshot header gains —
-without `wal_store.go` ever naming the `kv` package.  The body bytes
-are read (for the CRC pass) but discarded — `file` is closed before
-returning, and no inner-store mutation occurs.
+**Why this seam shape**.  The two-phase split lets the CRC verifier
+stay co-located with its private helpers in
+`internal/raftengine/etcd/fsm_snapshot_file.go`'s package, **and**
+keeps the v1/v2 header parser inside `kv` where it already lives.
+Neither package imports the other in production.  The "do CRC on
+engine side, side-effects on FSM side after verify" contract is
+exactly the inversion of `openAndRestoreFSMSnapshot` (which inlines
+`fsm.Restore` inside the CRC tee for performance reasons): for the
+skip path we don't need a single-pass restore, so splitting the
+phases costs nothing and buys layer hygiene.
 
 ### 6. Crash-safety argument
 
@@ -500,12 +534,15 @@ and persisting the index.
 
 #### `ELASTICKV_FSM_SYNC_MODE=nosync` mode
 
-When `raftApplyWriteOpts()` returns `pebble.NoSync` (configured at
-`lsm_store.go:1094-1104`), the data + meta key still land in the same
-Pebble WAL record, but the OS may delay the fsync.  Durability shifts
-to the raft layer: the raft WAL is the canonical source of truth, and
-on crash recovery raft replays entries from the last fsync'd Pebble
-position forward.  The invariant still holds because:
+The mode applies to TWO distinct write categories with different
+durability boundaries:
+
+**(a) Per-entry data Apply batches**.  `raftApplyWriteOpts()` returns
+`pebble.NoSync` so the data + meta key land in the same Pebble WAL
+record but the OS may delay the fsync.  Durability shifts to the raft
+layer: the raft WAL is the canonical source of truth, and on crash
+recovery raft replays entries from the last fsync'd Pebble position
+forward.  The invariant still holds because:
 
 - Pebble's atomic batch property is independent of the sync option.
 - On recovery, Pebble's WAL replay reconstructs the most recent
@@ -518,6 +555,35 @@ The skip gate stays correct: a `nosync`-induced loss merely means
 `LastAppliedIndex` reports a lower value than the post-restart applied
 count would imply, which only causes us to over-restore
 conservatively.
+
+**(b) Snapshot-persist checkpoint** (round-7 fix for codex round-6 P2
+on `:660`).  `pebbleStore.SetDurableAppliedIndex` uses `pebble.Sync`
+**unconditionally**, regardless of `ELASTICKV_FSM_SYNC_MODE`.  The
+reason is that the WAL compaction following `SaveSnap` discards every
+log entry at or before `snap.Metadata.Index`, so there is no source to
+replay the meta key bump from.  If the checkpoint honoured nosync, a
+crash sequence of:
+
+1. `SetDurableAppliedIndex(X)` returns (Pebble WAL written but not
+   fsynced).
+2. `e.persist.SaveSnap(snap)` returns durably (etcd's snapshotter
+   fsyncs internally).
+3. Crash before the OS flushes the Pebble WAL.
+
+would leave the snapshot pointer at `X` durable but `metaAppliedIndex`
+rolled back to `Y < X` (the last data Apply index that *was*
+fsynced).  After restart, WAL replay starts at `X` (post-compaction),
+so the compacted HLC leases / data entries cannot rebuild
+`metaAppliedIndex`, and `fsmAlreadyAtIndex(X)` returns false forever.
+The skip permanently falls back — exactly the codex round-3 P2
+scenario, recurring permanently rather than just for the trailing
+window.
+
+By forcing `pebble.Sync` on `SetDurableAppliedIndex` we make the
+checkpoint at least as durable as the snapshot pointer that follows.
+Cost: +1 extra fsync per snapshot persist (rare; default
+`SnapshotCount=10000`).  Negligible vs. the savings, and the only
+way to keep the round-4 ordering proof intact under nosync mode.
 
 #### Encryption opcodes (`OpRegistration`/`OpBootstrap`/`OpRotation`)
 
@@ -635,8 +701,9 @@ type AppliedIndexWriter interface {
 ```
 
 `kvFSM` implements it by forwarding to a new `pebbleStore` method
-that runs a single-key `pebble.Batch` write with the same Sync mode
-as the raft-apply path (`s.raftApplyWriteOpts()`):
+that runs a single-key `pebble.Batch` write with `pebble.Sync`
+**unconditionally** (round-7 fix for codex round-6 P2 on nosync
+durability):
 
 ```go
 // kv/fsm.go
@@ -657,9 +724,29 @@ func (s *pebbleStore) SetDurableAppliedIndex(idx uint64) error {
     if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, idx); err != nil {
         return errors.WithStack(err)
     }
-    return errors.WithStack(b.Commit(s.raftApplyWriteOpts()))
+    // pebble.Sync regardless of ELASTICKV_FSM_SYNC_MODE. The whole point
+    // of this checkpoint is to be at least as durable as the raft
+    // snapshot pointer that immediately follows via SaveSnap. If we
+    // honoured ELASTICKV_FSM_SYNC_MODE=nosync here, a crash after
+    // SaveSnap (which fsyncs internally) but before Pebble's deferred
+    // flush would leave metaAppliedIndex behind the snapshot pointer;
+    // because WAL compaction starts at the snapshot index, no future
+    // replay can re-bump metaAppliedIndex from the lost lease/data
+    // applies, and the skip permanently falls back. The +1 extra fsync
+    // per snapshot persist (rare; default SnapshotCount=10000) is the
+    // right price.
+    return errors.WithStack(b.Commit(pebble.Sync))
 }
 ```
+
+**Why not `raftApplyWriteOpts()`**.  That helper returns `pebble.Sync`
+in default mode and `pebble.NoSync` under
+`ELASTICKV_FSM_SYNC_MODE=nosync`.  For per-entry data Apply batches the
+nosync mode is acceptable because the durability boundary is the raft
+WAL (raft replays unsync'd applies on restart).  For the snapshot
+checkpoint, the durability boundary IS the meta key — there is no raft
+log entry to replay it from after WAL compaction.  See the dedicated
+nosync analysis in §6.
 
 **Crash ordering**.  The bump runs before `SaveSnap`, which means the
 invariant is:
@@ -776,8 +863,8 @@ restoreSnapshotState skipped (FSM at index %d, snapshot at %d, ceiling=%d, cutov
 | Branch | Content | Behaviour change |
 |---|---|---|
 | **B1** (this PR) | Design doc | None |
-| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` + `pebbleStore.SetDurableAppliedIndex()` (both with `dbMu.RLock()`) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2679`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
-| **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip(snapPath, tok.CRC32C)` mirroring the three-step verification of `openAndRestoreFSMSnapshot` (size + footer-vs-tokenCRC + full-body-CRC) + `SnapshotHeaderApplier.ApplySnapshotHeaderFromFile(snapPath, tokenCRC)` on `kvFSM` + metrics + INFO log | **User-visible cold-start win.** |
+| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` (under `dbMu.RLock()`) + `pebbleStore.SetDurableAppliedIndex()` (under `dbMu.RLock()`, **`pebble.Sync` unconditionally**) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2679`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
+| **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip(snapPath, tok.CRC32C)` orchestrating size + footer-vs-tokenCRC + full-body-CRC verification using `internal/raftengine/etcd`'s existing helpers (matching `openAndRestoreFSMSnapshot`'s safety contract) + two-phase `SnapshotHeaderApplier` seam on `kvFSM` (`ParseSnapshotHeader(r io.Reader) (ceiling, cutover, err)` + pure `ApplySnapshotHeader(ceiling, cutover)`) + metrics + INFO log | **User-visible cold-start win.** |
 | **B4** | Lower `HEALTH_TIMEOUT_SECONDS` default once production data shows steady-state skip rate ≥ 90 % | Tighter ceiling; the env override remains honoured. |
 
 Each of B2–B3 ships behind tests:
@@ -1029,3 +1116,61 @@ cycles) but lost sight of the CRC verification it was implicitly
 inheriting from `openAndRestoreFSMSnapshot`.  Reading the existing
 restore path end-to-end before pseudocoding a replacement would have
 surfaced this.
+
+## Round-6 retraction (codex round-6 P2 × 2)
+
+Round 6 introduced two implementability / durability bugs that codex
+caught in the round-6 review:
+
+**P2 line 410 — seam not implementable as drafted.**  Round 6 placed
+the whole CRC verification in `kvFSM.ApplySnapshotHeaderFromFile`,
+which references `fsmMinFileSize`, `readFSMFooter`, `crc32cTable`,
+`fsmRestoreReadAhead`, `statFSMFileError`, `ErrFSMSnapshotTokenCRC`,
+`ErrFSMSnapshotFileCRC` — all unexported in
+`internal/raftengine/etcd/fsm_snapshot_file.go`.  Production code does
+not have an `internal/raftengine/etcd → kv` or `kv →
+internal/raftengine/etcd` edge today (both directions are test-only on
+`origin/main`), so the round-6 pseudocode would either fail to compile
+or force a layering change.
+
+Round 7 splits `SnapshotHeaderApplier` into two methods:
+`ParseSnapshotHeader(r io.Reader) (ceiling, cutover, err)` and the
+pure-assignment `ApplySnapshotHeader(ceiling, cutover)`.  The CRC
+verification orchestration stays in `internal/raftengine/etcd/wal_store.go`
+where the helpers already live; the engine wraps the file in a crc32
+TeeReader and hands the reader to `setter.ParseSnapshotHeader`, which
+calls the still-in-`kv`-package `ReadSnapshotHeader(*bufio.Reader)`
+and drains.  No package imports change; no helpers need to be
+exported.
+
+**P2 line 660 — `SetDurableAppliedIndex` honoured nosync mode.**
+Round 4 / round 5 / round 6 all wrote the checkpoint with
+`s.raftApplyWriteOpts()`, which returns `pebble.NoSync` under
+`ELASTICKV_FSM_SYNC_MODE=nosync`.  Codex pointed out the resulting
+crash sequence: `SetDurableAppliedIndex(X)` returns (Pebble WAL
+buffered) → `SaveSnap` fsyncs the snapshot pointer at `X` → crash
+before Pebble flush.  On restart `metaAppliedIndex = Y < X` (the last
+fsynced data Apply), `snapshot pointer = X`, WAL compaction starts at
+`X` so the lost lease/data applies cannot rebuild
+`metaAppliedIndex`, and `fsmAlreadyAtIndex(X)` returns false forever
+— the round-3 P2 scenario recurring **permanently** rather than just
+for the trailing window.
+
+Round 7 pins `pebbleStore.SetDurableAppliedIndex` to `pebble.Sync`
+unconditionally.  The checkpoint must be at least as durable as the
+snapshot pointer that immediately follows; there is no raft log entry
+to replay it from after WAL compaction.  Cost: +1 extra fsync per
+snapshot persist (rare, default `SnapshotCount=10000`).
+
+Lesson:
+- (P2 line 410) **Before pseudocoding cross-package helper use,
+  inventory each symbol's export status** — symbols that look obvious
+  from inside a package are often private when crossed.  Restructure
+  the seam (split into parse + apply phases) rather than reach for
+  exports as the first move.
+- (P2 line 660) **A durability boundary that depends on a sync-mode
+  knob must be examined separately for each write category.**  The
+  raft-WAL-as-source-of-truth argument applies only to per-entry
+  applies, never to writes that establish a checkpoint other code
+  paths fsync past.  When a write is the *only* durable carrier of a
+  fact, force `pebble.Sync` independent of operator mode.
