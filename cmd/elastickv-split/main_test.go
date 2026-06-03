@@ -55,7 +55,7 @@ func TestValidateFlags_AcceptsAllPresent(t *testing.T) {
 func resetFlags(t *testing.T) {
 	t.Helper()
 	// Sanity-check that the pointers are set (declared at file
-	// init).  errors.Newf rather than t.Fatalf so a future
+	// init).  errors.New rather than t.Fatalf so a future
 	// refactor that drops the package-level flags surfaces here
 	// rather than silently no-oping the resets.
 	if routeID == nil || splitKey == nil || expectedVersion == nil || address == nil {
