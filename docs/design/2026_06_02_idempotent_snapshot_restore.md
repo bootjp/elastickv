@@ -159,14 +159,14 @@ for `metaLastCommitTSBytes` (`lsm_store.go:1324` and `:1393`
 respectively):
 
 ```go
-// store/lsm_store.go — applyMutationsWithOpts (existing, around :1162)
+// store/lsm_store.go — applyMutationsWithOpts (existing, around :1324)
 if appliedIndex > 0 {
     if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
         return errors.WithStack(err)
     }
 }
 
-// store/lsm_store.go — deletePrefixAtWithOpts (existing, around :1231)
+// store/lsm_store.go — deletePrefixAtWithOpts (existing, around :1393)
 if appliedIndex > 0 {
     if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
         return errors.WithStack(err)
