@@ -45,7 +45,14 @@ New helper in `encode_s3_objects.go` (or a sibling file):
 func (e *S3RecordEncoder) loadBucketKeymap(root *os.Root, bucketDir string) (map[string]KeymapRecord, error)
 ```
 
-The existing `checkBucketKeymap` (`encode_s3_objects.go:103`) — which currently fails closed when `KEYMAP.jsonl` is present — becomes `loadBucketKeymap`. Its no-keymap path (returns nil, no error) and its hard-link / symlink / non-regular refusal paths are preserved.
+**Refactor target.** The existing call site is `isKeymapCollisionTracker` (`encode_s3_objects.go:108`, called at line 91; returns `(tracker bool, err error)`). The caller at line 91 currently fails closed via `ErrS3EncodeUnsupportedCollision` whenever `tracker == true`. M4-2b updates this site:
+
+1. Keep `isKeymapCollisionTracker` to disambiguate. When it returns `tracker = false`, the bucket has a legitimate `KEYMAP.jsonl` user object — the file is paired with a `KEYMAP.jsonl.elastickv-meta.json` sidecar and round-trips as a normal S3 body (existing `TestS3EncodeKeymapObjectRoundTrip` pins this). `loadBucketKeymap` MUST NOT touch it; M4-2a's object emission already covers it. Codex P2 v913 v2 flagged this: an implementation that called `loadBucketKeymap` unconditionally would parse the user object's body as keymap JSON and either fail or consume it as collision metadata.
+2. When `tracker == true`, call `loadBucketKeymap` (NEW). Replaces the current `ErrS3EncodeUnsupportedCollision` branch.
+
+`loadBucketKeymap` reuses the existing per-line `KeymapReader` and the `OpenSidecarFile` no-follow / hard-link / non-regular refusal pipeline (same protections `isKeymapCollisionTracker` already inherits).
+
+**Duplicate-key contract — diverges from `LoadKeymap`.** The shared `keymap.go:LoadKeymap` documents last-wins behavior for duplicate `Encoded` segments (the Redis encoder tolerates this because its decoder's keymap writer always emits one record per encoded segment, and a duplicate from a hand-edited dump just retains the most recent). M4-2b's invariant is stricter: the S3 decoder's `recordKeymap` writes exactly one entry per renamed object, so a duplicate `Encoded` segment means the decoder wrote two distinct rename targets for the same on-disk name — a corrupt dump the encoder cannot disambiguate. Therefore `loadBucketKeymap` does NOT call `LoadKeymap`; it iterates `KeymapReader.Next()` in a manual loop and fails closed on the second occurrence of any `Encoded` value (`TestS3EncodeRejectsDuplicateKeymapEntry`). Claude v913 v2 caught this contract divergence.
 
 **Keymap key is the full relative path, NOT per-segment.** The decoder's `recordKeymap` call site (`internal/backup/s3.go:728`) records the full filesystem-relative path produced by `resolveObjectFilename` (e.g. `path/to.elastickv-leaf-data`) as the `Encoded` field and the full original S3 object key (e.g. `path/to`) as the `OriginalB64`. Per-segment lookup would miss every nested-collision entry; the encoder MUST look up the full rel-path (gemini medium / codex P1 found in this doc's first-round review).
 
@@ -60,6 +67,8 @@ The existing `checkBucketKeymap` (`encode_s3_objects.go:103`) — which currentl
 The resolved key feeds the existing `!s3|obj|head|<key>` / `!s3|blob|<key>` emission unchanged.
 
 **Difference from Redis.** Redis's `loadKeymap` (`encode_redis.go:113`) handles only `KindSHAFallback`, where the keymap entry is keyed by a single filename segment (because filename-length overflow happens segment-by-segment). S3 collision records are scoped to the full object key, so the lookup unit is the full bucket-relative path rather than a single segment. No common helper between the two; the S3 lookup lives in `encode_s3_collision.go`.
+
+**`KindSHAFallback` policy for S3 (claude v913 v2 Low).** S3's decoder rename path (`s3.go:resolveObjectFilename`) currently emits only `KindS3LeafData` and `KindMetaCollision`; `KindSHAFallback` is reserved for the (not-yet-implemented) case where a single S3 key segment exceeds `EncodeSegment`'s 240-byte filesystem ceiling. M4-2b keeps the encoder permissive for forward compatibility: a `KindSHAFallback` record in an S3 `KEYMAP.jsonl` is honored by the same full-rel-path lookup (the decoder would write `Encoded = <sha-prefix>__<truncated>` as the full relative segment), so the existing object-walk path naturally handles it. Any future `Kind` value not in `{S3LeafData, MetaCollision, SHAFallback}` fails closed with `ErrS3EncodeInvalidBucket` so a hand-edited dump that injects a novel Kind cannot silently bypass invariants.
 
 ## Error contract
 
@@ -89,7 +98,7 @@ Plus a `--rename-collisions=true` variant for `KindMetaCollision`.
 ```
 internal/backup/encode_s3_collision.go        # loadBucketKeymap + resolveS3Segment
 internal/backup/encode_s3_collision_test.go   # keymap parse, segment resolution, error paths
-internal/backup/encode_s3_objects.go          # rewrite checkBucketKeymap call site + WalkDir leaf resolver
+internal/backup/encode_s3_objects.go          # rewrite isKeymapCollisionTracker call site + WalkDir leaf resolver
 internal/backup/encode_s3_objects_test.go     # round-trip leaf-data + meta-collision; drop ErrS3EncodeUnsupportedCollision test
 internal/backup/encode_s3.go                  # remove ErrS3EncodeUnsupportedCollision (no longer reachable)
 ```
@@ -104,10 +113,12 @@ The slice ships as a single PR since the keymap loader, segment resolver, and in
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `TestS3EncodeRoundTripsLeafDataCollision`                           | Bucket with `path/to` + `path/to/sub` → both objects emitted under their original keys; no `.elastickv-leaf-data` suffix leaks |
 | `TestS3EncodeRoundTripsMetaCollision`                               | Bucket with user object key ending `.elastickv-meta.json` + `--rename-collisions` → original key recovered                     |
-| `TestS3EncodeRejectsKeymapTargetingReservedSubtree`                 | `KEYMAP.jsonl` record claiming `Original="_orphans/foo"` or `"_incomplete_uploads/x"` → `ErrS3EncodeInvalidBucket`              |
+| `TestS3EncodeRejectsKeymapTargetingReservedSubtree`                 | `KEYMAP.jsonl` record claiming `Original="_orphans/foo"` or `"_incomplete_uploads/x"` → `ErrS3EncodeInvalidBucket` (PR body line: `TestS3EncodeRejectsKeymapWithReservedPrefix` — both refer to the same case; the doc is the authoritative name) |
 | `TestS3EncodeAcceptsKeymapWithUserUnderscoreKey`                    | `KEYMAP.jsonl` record claiming `Original="_foo"` (legitimate user key) → round-trips successfully                              |
+| `TestS3EncodeAcceptsLegitimateKeymapUserObject`                     | Bucket with a real user object named `KEYMAP.jsonl` (paired sidecar at `KEYMAP.jsonl.elastickv-meta.json`) → `isKeymapCollisionTracker` returns `tracker=false`, object round-trips as a normal S3 body, `loadBucketKeymap` is NOT called (codex P2 v913 v2) |
 | `TestS3EncodeRejectsOrphanKeymapEntry`                              | `KEYMAP.jsonl` record references a segment that doesn't exist on disk → fail closed                                            |
-| `TestS3EncodeRejectsDuplicateKeymapEntry`                           | Same `Encoded` listed twice → fail closed (we can't pick a winner)                                                             |
+| `TestS3EncodeRejectsDuplicateKeymapEntry`                           | Same `Encoded` listed twice → fail closed (we can't pick a winner; diverges from `LoadKeymap` last-wins)                        |
+| `TestS3EncodeRejectsUnknownKeymapKind`                              | `Kind` not in `{S3LeafData, MetaCollision, SHAFallback}` → `ErrS3EncodeInvalidBucket` (forward-compat guard, claude v913 v2)   |
 | `TestS3EncodeRejectsMalformedKeymapJSON`                            | `KEYMAP.jsonl` has an invalid line → `ErrInvalidKeymapRecord` (existing sentinel from `internal/backup/keymap.go`)             |
 | `TestS3EncodeMissingKeymapIsValidNoCollisionDump`                   | Bucket without `KEYMAP.jsonl` continues to encode (the no-collision case M4-2a already covers)                                 |
 
