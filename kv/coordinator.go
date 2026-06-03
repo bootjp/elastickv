@@ -1107,6 +1107,16 @@ func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, pr
 	}
 }
 
+// PrimaryKeyForElems returns the primary key the coordinator derives for a
+// single-shard one-phase txn over elems — the lexicographically smallest write
+// key. Adapters that implement option-2 one-phase dedup must probe this exact
+// key (it becomes the FSM's meta.PrimaryKey) so the adapter-side
+// self-inflicted-conflict guard agrees with dedupProbeOnePhase. See
+// docs/design/2026_06_03_proposed_dynamodb_onephase_dedup.md (R4).
+func PrimaryKeyForElems(reqs []*Elem[OP]) []byte {
+	return primaryKeyForElems(reqs)
+}
+
 func primaryKeyForElems(reqs []*Elem[OP]) []byte {
 	var primary []byte
 	seen := make(map[string]struct{}, len(reqs))
