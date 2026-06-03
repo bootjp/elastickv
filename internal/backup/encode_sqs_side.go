@@ -103,18 +103,22 @@ func sqsPartitionedMsgByAgeKeyBytes(queueName string, partition uint32, gen uint
 
 // sqsPartitionedMsgDedupKeyBytes reproduces
 // adapter/sqs_keys.go:sqsPartitionedMsgDedupKey: prefix +
-// base64url(queue) + '|' + BE-u32(partition) + BE-u64(gen) +
-// base64url(groupID) + '|' + base64url(dedupID). Note the second
-// '|' between the variable-length group and dedup segments — without
-// it distinct (groupID, dedupID) pairs can FNV-collapse onto the
-// same key (CodeRabbit major PR #732 round 6; design doc §line 19).
-func sqsPartitionedMsgDedupKeyBytes(queueName string, partition uint32, gen uint64, groupID, dedupID string) []byte {
+// base64url(queue) + '|' + BE-u32(partition) + BE-u64(sqsRestoreGeneration) +
+// base64url(groupID) + '|' + base64url(dedupID). The live adapter signature
+// accepts a variable gen, but every M5-3 call site uses
+// sqsRestoreGeneration (matching the classic sqsMsgDedupKeyBytes
+// hardcode), so the parameter is hardcoded here to satisfy unparam.
+// Note the second '|' between the variable-length group and dedup
+// segments — without it distinct (groupID, dedupID) pairs can
+// FNV-collapse onto the same key (CodeRabbit major PR #732 round 6;
+// design doc §line 19).
+func sqsPartitionedMsgDedupKeyBytes(queueName string, partition uint32, groupID, dedupID string) []byte {
 	out := make([]byte, 0, len(SQSPartitionedMsgDedupPrefix)+sqsSideKeyAllocBytes)
 	out = append(out, SQSPartitionedMsgDedupPrefix...)
 	out = append(out, encodeSQSSegment(queueName)...)
 	out = append(out, sqsPartitionedQueueTerminator)
 	out = binary.BigEndian.AppendUint32(out, partition)
-	out = binary.BigEndian.AppendUint64(out, gen)
+	out = binary.BigEndian.AppendUint64(out, sqsRestoreGeneration)
 	out = append(out, encodeSQSSegment(groupID)...)
 	out = append(out, sqsPartitionedQueueTerminator)
 	return append(out, encodeSQSSegment(dedupID)...)
@@ -222,7 +226,7 @@ func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, 
 		// sqsPartitionedMsgDedupKeyBytes for the rationale (CodeRabbit
 		// major PR #732 round 6: the second '|' prevents FNV-collapse
 		// across distinct (groupID, dedupID) pairs on the same partition).
-		dedupKey = sqsPartitionedMsgDedupKeyBytes(queueName, *partition, sqsRestoreGeneration, rec.MessageGroupID, dedupID)
+		dedupKey = sqsPartitionedMsgDedupKeyBytes(queueName, *partition, rec.MessageGroupID, dedupID)
 	} else {
 		dedupKey = sqsMsgDedupKeyBytes(queueName, dedupID)
 	}
