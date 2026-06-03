@@ -37,21 +37,24 @@ func buildShardGroupsWithEncryptionWiring(
 	encryptionEnabled bool,
 	routeEngine *distribution.Engine,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
-	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
-	if err != nil {
-		return nil, nil, encryptionWriteWiring{}, err
-	}
-	// Stage 6E-2c: refuse startup BEFORE buildShardGroups runs if
-	// the sidecar reports an active raft envelope cutover. This
-	// binary does not (yet) ship the cipher-aware wrap closure
-	// factory (that lands in Stage 6E-2e/2f). With the cutover
-	// recorded but no wrap installed, every fresh proposal would
-	// land cleartext above the cutover index and halt the apply
-	// loop on §6.3 strict-`>` unwrap — a node-wide crash loop is
-	// worse than refusing to serve. Fail-closed here so the
-	// operator sees the refusal at boot, before any traffic is
-	// admitted and before any shard storage is opened (codex P1
-	// round-1).
+	// Stage 6E-2c: refuse startup BEFORE buildEncryptionWriteWiring
+	// runs (which calls prepareStorageNonceEpoch → BumpLocalEpoch
+	// → durable sidecar write). If we ran the refusal after the
+	// epoch bump, an orchestrator restart loop on a sidecar with
+	// non-zero RaftEnvelopeCutoverIndex would consume one
+	// local_epoch per boot and could hit ErrLocalEpochExhausted
+	// before the operator notices (codex P2 round-1 r3). Running
+	// it first keeps the sidecar untouched on the refusal path.
+	//
+	// This binary does not (yet) ship the cipher-aware wrap
+	// closure factory (that lands in Stage 6E-2e/2f). With a
+	// cutover recorded but no wrap installed, every fresh
+	// proposal would land cleartext above the cutover index and
+	// halt the apply loop on §6.3 strict-`>` unwrap — a
+	// node-wide crash loop is worse than refusing to serve.
+	// Fail-closed so the operator sees the refusal at boot,
+	// before any traffic is admitted and before any sidecar
+	// mutation (codex P1 round-1).
 	//
 	// In a healthy 6E-2c-only deployment this never fires:
 	// raftEnvelopeWrapEnabled is still false in
@@ -63,6 +66,10 @@ func buildShardGroupsWithEncryptionWiring(
 	// traffic.
 	if cutoverErr := refuseStartupOnActiveRaftCutover(sidecarPath); cutoverErr != nil {
 		return nil, nil, encryptionWriteWiring{}, cutoverErr
+	}
+	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
+	if err != nil {
+		return nil, nil, encryptionWriteWiring{}, err
 	}
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)

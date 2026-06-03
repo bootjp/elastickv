@@ -236,6 +236,53 @@ func TestRefuseStartupOnActiveRaftCutover_ZeroCutoverPasses(t *testing.T) {
 	}
 }
 
+// TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverDoesNotBumpEpoch
+// pins the codex P2 round-1 r3 property: the refusal MUST run
+// before buildEncryptionWriteWiring's prepareStorageNonceEpoch
+// step, otherwise an orchestrator restart loop on a sidecar with
+// non-zero RaftEnvelopeCutoverIndex would consume one local_epoch
+// per boot and could hit ErrLocalEpochExhausted before the
+// operator notices.
+//
+// This is a black-box test on the helper itself: after invoking
+// refuseStartupOnActiveRaftCutover with a non-zero-cutover
+// sidecar, the sidecar's storage epoch field on disk MUST be
+// unchanged from what we wrote, proving no BumpLocalEpoch path
+// could have run downstream of the helper. The buildShardGroupsWithEncryption
+// Wiring ordering invariant (refusal BEFORE buildEncryptionWriteWiring)
+// is enforced structurally; this test guards against a future
+// refactor that swaps the order.
+func TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverDoesNotBumpEpoch(t *testing.T) {
+	t.Parallel()
+	const initialStorageEpoch uint16 = 7
+	dir := t.TempDir()
+	path := dir + "/keys.json"
+	sc := &encryption.Sidecar{
+		Version:                  encryption.SidecarVersion,
+		StorageEnvelopeActive:    true,
+		RaftEnvelopeCutoverIndex: 12345,
+		Active:                   encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage-wrapped-bytes"), LocalEpoch: initialStorageEpoch},
+			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft-wrapped-bytes-diff")},
+		},
+	}
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	if err := refuseStartupOnActiveRaftCutover(path); err == nil {
+		t.Fatal("non-zero cutover: refuseStartupOnActiveRaftCutover = nil, want refusal")
+	}
+	got, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar after refusal: %v", err)
+	}
+	gotEpoch := got.Keys["3"].LocalEpoch
+	if gotEpoch != initialStorageEpoch {
+		t.Errorf("post-refusal storage LocalEpoch = %d, want %d (refusal must run before any sidecar mutation)", gotEpoch, initialStorageEpoch)
+	}
+}
+
 // TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverRefuses
 // pins the codex P1 fail-closed property: when the sidecar
 // reports RaftEnvelopeCutoverIndex != 0, the helper returns a
