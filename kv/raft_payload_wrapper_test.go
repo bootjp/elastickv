@@ -76,18 +76,27 @@ func TestApplyRaftPayloadWrap_PropagatesError(t *testing.T) {
 	}
 }
 
-// TestWrappedProposer_ProposeAdminBypassesWrap pins the §6.3
-// invariant the Stage 6E-2b ProposeAdmin path must enforce: even
-// when a wrap closure is configured, ProposeAdmin payloads MUST
-// reach the inner proposer verbatim and MUST take the inner's
-// ProposeAdmin path (not Propose). The cutover entry itself sits
-// at `index == cutover` and the apply hook's strict-`>` dispatch
-// will treat it as cleartext; if wrappedProposer wrapped it
-// anyway, the apply side would either (a) fail to find the
-// cutover marker because its body is encrypted, or (b) attempt
-// to unwrap it against a key that hasn't been activated yet —
-// either way bricking the cutover.
-func TestWrappedProposer_ProposeAdminBypassesWrap(t *testing.T) {
+// TestWrappedProposer_ProposeAdminAppliesWrap pins the invariant
+// codex P1 round-1 surfaced: admin entries that land at
+// `index > raftEnvelopeCutoverIndex` (any post-cutover
+// BootstrapEncryption / RotateDEK / RegisterEncryptionWriter
+// committed during normal operation) MUST be wrapped, else the
+// §6.3 strict-`>` apply hook will try to AEAD-decrypt cleartext
+// bytes and halt apply on integrity failure.
+//
+// ProposeAdmin's only divergence from Propose is the future §7.1
+// quiescence-barrier exemption Stage 6E-2d installs on Propose
+// only — wrap behaviour is identical between the two paths. The
+// lone admin entry that must remain cleartext is the
+// EnableRaftEnvelope cutover marker itself (at index == cutover),
+// and that one is handled by routing it through the raw engine
+// reference instead of wrappedProposer, NOT by a method-level
+// wrap bypass.
+//
+// This test pins the corrected behaviour. The earlier round-1
+// shape (wrap-bypass on ProposeAdmin) is gone; an attempt to
+// reintroduce it must visibly fail here.
+func TestWrappedProposer_ProposeAdminAppliesWrap(t *testing.T) {
 	t.Parallel()
 	var wrapCalls atomic.Int32
 	wrap := func(p []byte) ([]byte, error) {
@@ -99,21 +108,22 @@ func TestWrappedProposer_ProposeAdminBypassesWrap(t *testing.T) {
 	}
 	inner := &fakeProposer{}
 	wp := newWrappedProposer(inner, wrap)
-	plain := []byte("cutover-marker")
+	plain := []byte("post-cutover-admin")
 	if _, err := wp.ProposeAdmin(context.Background(), plain); err != nil {
 		t.Fatalf("ProposeAdmin: %v", err)
 	}
-	if got := wrapCalls.Load(); got != 0 {
-		t.Fatalf("wrap closure ran %d times under ProposeAdmin; want 0 — admin path must bypass wrap", got)
-	}
-	if got := inner.calls.Load(); got != 0 {
-		t.Fatalf("inner.Propose called %d times under ProposeAdmin; want 0 — admin path must route through inner.ProposeAdmin", got)
+	if got := wrapCalls.Load(); got != 1 {
+		t.Fatalf("wrap closure ran %d times under ProposeAdmin; want 1 — admin path must apply wrap so post-cutover admin entries survive strict-> unwrap", got)
 	}
 	if got := inner.adminCalls.Load(); got != 1 {
-		t.Fatalf("inner.ProposeAdmin call count = %d, want 1", got)
+		t.Fatalf("inner.ProposeAdmin call count = %d, want 1 — admin path must still route through inner.ProposeAdmin so 6E-2d's barrier exemption survives", got)
 	}
-	if !bytes.Equal(inner.adminLast, plain) {
-		t.Fatalf("inner.ProposeAdmin saw %q, want %q (cleartext verbatim)", inner.adminLast, plain)
+	if got := inner.calls.Load(); got != 0 {
+		t.Fatalf("inner.Propose called %d times under ProposeAdmin; want 0 — admin path must not silently fall back to the non-exempt method", got)
+	}
+	want := append([]byte{'W'}, plain...)
+	if !bytes.Equal(inner.adminLast, want) {
+		t.Fatalf("inner.ProposeAdmin saw %q, want %q (wrapper output)", inner.adminLast, want)
 	}
 }
 

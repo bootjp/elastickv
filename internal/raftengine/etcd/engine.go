@@ -738,12 +738,20 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 // RegisterEncryptionWriter proposals (see raftengine.Proposer's
 // contract for the full exempt set).
 //
-// In the current build it is operationally identical to Propose;
-// Stage 6E-2d wires the barrier check on Propose only, leaving this
-// path admissible. The two methods are kept distinct from the
-// outset so the migration of call sites (this PR) lands ahead of
-// the behaviour change (6E-2d) — calling Propose from an exempt
-// site today is silently wrong tomorrow.
+// The barrier exemption is the SOLE divergence from Propose: a
+// higher-layer wrap (kv.wrappedProposer) applies its wrap closure
+// to both methods identically, so admin entries landing above the
+// raft-envelope cutover still carry the AEAD envelope the §6.3
+// strict-`>` apply hook expects. Only the cutover marker itself is
+// cleartext, and it bypasses the wrap layer at the call site
+// (raw engine reference), not at the method level.
+//
+// In the current build ProposeAdmin is operationally identical to
+// Propose; Stage 6E-2d adds the barrier check on Propose only.
+// The two methods are kept distinct from the outset so the
+// migration of call sites (this PR) lands ahead of the behaviour
+// change (6E-2d) — calling Propose from an exempt site today is
+// silently wrong tomorrow.
 func (e *Engine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	return e.propose(ctx, data)
 }

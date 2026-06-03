@@ -76,22 +76,33 @@ func (p *wrappedProposer) Propose(ctx context.Context, data []byte) (*raftengine
 	return res, nil
 }
 
-// ProposeAdmin forwards the payload verbatim to the inner
-// ProposeAdmin path — the wrap layer is deliberately skipped. The
-// only callers permitted to use this path are the EnableRaftEnvelope
-// cutover entry (which by §6.3 strict-`>` dispatch must remain
-// cleartext at index == cutover so the apply hook can find the
-// cutover marker) and ConfChange-time RegisterEncryptionWriter
-// registrations (Stage 7c §3.1, which carry no user data and are
-// inspected by the FSM independently of the raft envelope).
+// ProposeAdmin applies the configured RaftPayloadWrapper before
+// forwarding the payload to the inner ProposeAdmin path. The wrap
+// layer is NOT a barrier-exemption concern: it exists so that
+// every entry landing at `index > raftEnvelopeCutoverIndex` carries
+// an AEAD envelope the §6.3 strict-`>` apply hook can unwrap.
+// Admin entries (BootstrapEncryption, RotateDEK,
+// RegisterEncryptionWriter, etc.) committed after the cutover are
+// no different from user data in that regard — a cleartext admin
+// entry above cutover would halt the apply loop on unwrap-failure,
+// not be silently passed through.
 //
-// In the current build no production code routes admin proposals
-// through wrappedProposer — adapter/encryption_admin.go and
-// main_encryption_registration.go hold raw engine references. This
-// method exists so wrappedProposer continues to satisfy
-// raftengine.Proposer.
+// The lone exception is the EnableRaftEnvelope cutover marker
+// itself, which sits exactly at `index == cutover` and must remain
+// cleartext for strict-`>` dispatch to leave it alone. That marker
+// is proposed via a raw engine reference (adapter/encryption_admin.go
+// holds the engine directly as s.proposer), not via the
+// wrappedProposer — so this wrap path is never on its way.
+//
+// ProposeAdmin's only divergence from Propose lives in Stage
+// 6E-2d's §7.1 quiescence-barrier check, which is installed on
+// Propose only.
 func (p *wrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	res, err := p.inner.ProposeAdmin(ctx, data)
+	wrapped, err := applyRaftPayloadWrap(p.wrap, data)
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.inner.ProposeAdmin(ctx, wrapped)
 	if err != nil {
 		return nil, errors.Wrap(err, "kv: wrapped propose-admin")
 	}

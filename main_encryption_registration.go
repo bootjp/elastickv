@@ -483,9 +483,23 @@ func proposeWriterRegistration(
 		// Writer registrations are control-plane entries that must
 		// remain admissible across the §7.1 quiescence barrier
 		// (Stage 6E-2d). Without the admin path, a new member
-		// joining mid-barrier could not register its writer entry
-		// — the barrier would reject the registration with
-		// ErrEnvelopeCutoverInProgress and the join would stall.
+		// joining mid-barrier — or a leader restart that triggers
+		// buildProcessStartRegistrationGate in the middle of a
+		// cutover window — could not register its writer entry;
+		// the barrier would reject the registration with
+		// ErrEnvelopeCutoverInProgress and the local epoch would
+		// never publish.
+		//
+		// ProposeAdmin is barrier-exempt only — it does NOT
+		// bypass any wrap layer. defaultEngine is the raw raft
+		// engine (no wrap above it in today's wiring), so the
+		// 0x03 registration entry currently lands cleartext.
+		// That is correct pre-cutover; once Stage 6E-2c/2e wire
+		// the wrap layer onto admin paths, this call site must
+		// also pick up that wrap so a post-cutover registration
+		// landing at `index > raftEnvelopeCutoverIndex` carries
+		// the AEAD envelope the §6.3 strict-`>` apply hook
+		// expects. Tracked alongside the 6E-2c/2e wiring.
 		if _, err := defaultEngine.ProposeAdmin(attemptCtx, entry); err != nil {
 			return errors.Wrap(err, "writer registration: local propose-admin")
 		}
