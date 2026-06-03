@@ -41,7 +41,7 @@ var (
 	address         = flag.String("address", "127.0.0.1:50051", "gRPC address of an elastickv server (typically the Distribution leader)")
 	routeID         = flag.Uint64("route-id", 0, "RouteID of the route to split (required)")
 	splitKey        = flag.String("split-key", "", "Split key — must lie strictly inside the route's [Start, End) range; rejected if == Start or == End by validateSplitKey (required)")
-	expectedVersion = flag.Uint64("expected-version", 0, "Expected catalog version for OCC; obtain by calling ListRoutes first (required)")
+	expectedVersion = flag.Uint64("expected-version", 0, "Expected catalog version for OCC; obtain by calling ListRoutes first (required, must be >= 1 — catalog version is 1-based)")
 )
 
 func main() {

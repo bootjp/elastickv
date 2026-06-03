@@ -59,7 +59,7 @@ func resetFlags(t *testing.T) {
 	// refactor that drops the package-level flags surfaces here
 	// rather than silently no-oping the resets.
 	if routeID == nil || splitKey == nil || expectedVersion == nil || address == nil {
-		t.Fatal(errors.Newf("package-level flag pointers were not initialised"))
+		t.Fatal(errors.New("package-level flag pointers were not initialised"))
 	}
 	*routeID = 0
 	*splitKey = ""
