@@ -29,6 +29,9 @@ type stubEncryptionAdminEngine struct{}
 func (stubEncryptionAdminEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
+func (s stubEncryptionAdminEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return s.Propose(ctx, data)
+}
 func (stubEncryptionAdminEngine) State() raftengine.State       { return raftengine.StateLeader }
 func (stubEncryptionAdminEngine) Leader() raftengine.LeaderInfo { return raftengine.LeaderInfo{} }
 func (stubEncryptionAdminEngine) VerifyLeader(context.Context) error {

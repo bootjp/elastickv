@@ -12,13 +12,19 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 )
 
-// fakeProposer records every Propose call so the wrapper tests can
-// inspect what bytes the engine would have seen.
+// fakeProposer records every Propose / ProposeAdmin call so the
+// wrapper tests can inspect both (a) what bytes the engine would
+// have seen, and (b) which method routed there — so a test that
+// expects wrappedProposer.ProposeAdmin to bypass the wrap layer
+// can assert against adminCalls / adminLast independently of
+// (Propose) calls / last.
 type fakeProposer struct {
-	calls atomic.Int32
-	last  []byte
-	resp  *raftengine.ProposalResult
-	err   error
+	calls      atomic.Int32
+	last       []byte
+	adminCalls atomic.Int32
+	adminLast  []byte
+	resp       *raftengine.ProposalResult
+	err        error
 }
 
 func (p *fakeProposer) Propose(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
@@ -26,6 +32,20 @@ func (p *fakeProposer) Propose(_ context.Context, data []byte) (*raftengine.Prop
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	p.last = cp
+	if p.err != nil {
+		return nil, p.err
+	}
+	if p.resp == nil {
+		return &raftengine.ProposalResult{CommitIndex: 1}, nil
+	}
+	return p.resp, nil
+}
+
+func (p *fakeProposer) ProposeAdmin(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	p.adminCalls.Add(1)
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	p.adminLast = cp
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -53,6 +73,47 @@ func TestApplyRaftPayloadWrap_PropagatesError(t *testing.T) {
 	_, err := applyRaftPayloadWrap(wrap, []byte("x"))
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected wrapped sentinel, got %v", err)
+	}
+}
+
+// TestWrappedProposer_ProposeAdminBypassesWrap pins the §6.3
+// invariant the Stage 6E-2b ProposeAdmin path must enforce: even
+// when a wrap closure is configured, ProposeAdmin payloads MUST
+// reach the inner proposer verbatim and MUST take the inner's
+// ProposeAdmin path (not Propose). The cutover entry itself sits
+// at `index == cutover` and the apply hook's strict-`>` dispatch
+// will treat it as cleartext; if wrappedProposer wrapped it
+// anyway, the apply side would either (a) fail to find the
+// cutover marker because its body is encrypted, or (b) attempt
+// to unwrap it against a key that hasn't been activated yet —
+// either way bricking the cutover.
+func TestWrappedProposer_ProposeAdminBypassesWrap(t *testing.T) {
+	t.Parallel()
+	var wrapCalls atomic.Int32
+	wrap := func(p []byte) ([]byte, error) {
+		wrapCalls.Add(1)
+		out := make([]byte, len(p)+1)
+		out[0] = 'W'
+		copy(out[1:], p)
+		return out, nil
+	}
+	inner := &fakeProposer{}
+	wp := newWrappedProposer(inner, wrap)
+	plain := []byte("cutover-marker")
+	if _, err := wp.ProposeAdmin(context.Background(), plain); err != nil {
+		t.Fatalf("ProposeAdmin: %v", err)
+	}
+	if got := wrapCalls.Load(); got != 0 {
+		t.Fatalf("wrap closure ran %d times under ProposeAdmin; want 0 — admin path must bypass wrap", got)
+	}
+	if got := inner.calls.Load(); got != 0 {
+		t.Fatalf("inner.Propose called %d times under ProposeAdmin; want 0 — admin path must route through inner.ProposeAdmin", got)
+	}
+	if got := inner.adminCalls.Load(); got != 1 {
+		t.Fatalf("inner.ProposeAdmin call count = %d, want 1", got)
+	}
+	if !bytes.Equal(inner.adminLast, plain) {
+		t.Fatalf("inner.ProposeAdmin saw %q, want %q (cleartext verbatim)", inner.adminLast, plain)
 	}
 }
 

@@ -75,3 +75,25 @@ func (p *wrappedProposer) Propose(ctx context.Context, data []byte) (*raftengine
 	}
 	return res, nil
 }
+
+// ProposeAdmin forwards the payload verbatim to the inner
+// ProposeAdmin path — the wrap layer is deliberately skipped. The
+// only callers permitted to use this path are the EnableRaftEnvelope
+// cutover entry (which by §6.3 strict-`>` dispatch must remain
+// cleartext at index == cutover so the apply hook can find the
+// cutover marker) and ConfChange-time RegisterEncryptionWriter
+// registrations (Stage 7c §3.1, which carry no user data and are
+// inspected by the FSM independently of the raft envelope).
+//
+// In the current build no production code routes admin proposals
+// through wrappedProposer — adapter/encryption_admin.go and
+// main_encryption_registration.go hold raw engine references. This
+// method exists so wrappedProposer continues to satisfy
+// raftengine.Proposer.
+func (p *wrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	res, err := p.inner.ProposeAdmin(ctx, data)
+	if err != nil {
+		return nil, errors.Wrap(err, "kv: wrapped propose-admin")
+	}
+	return res, nil
+}

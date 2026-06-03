@@ -480,8 +480,14 @@ func proposeWriterRegistration(
 	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
 	defer cancel()
 	if coordinate.IsLeader() {
-		if _, err := defaultEngine.Propose(attemptCtx, entry); err != nil {
-			return errors.Wrap(err, "writer registration: local propose")
+		// Writer registrations are control-plane entries that must
+		// remain admissible across the §7.1 quiescence barrier
+		// (Stage 6E-2d). Without the admin path, a new member
+		// joining mid-barrier could not register its writer entry
+		// — the barrier would reject the registration with
+		// ErrEnvelopeCutoverInProgress and the join would stall.
+		if _, err := defaultEngine.ProposeAdmin(attemptCtx, entry); err != nil {
+			return errors.Wrap(err, "writer registration: local propose-admin")
 		}
 		return nil
 	}

@@ -68,6 +68,10 @@ func (f *fakeEngine) Propose(context.Context, []byte) (*raftengine.ProposalResul
 	return &raftengine.ProposalResult{}, nil
 }
 
+func (f *fakeEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return f.Propose(ctx, data)
+}
+
 func (f *fakeEngine) State() raftengine.State {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -310,6 +314,10 @@ func (s stateOnlyEngine) Close() error { return nil }
 
 func (s stateOnlyEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
+}
+
+func (s stateOnlyEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return s.Propose(ctx, data)
 }
 
 func (s stateOnlyEngine) State() raftengine.State { return s.state }

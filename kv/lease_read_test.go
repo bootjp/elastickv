@@ -62,6 +62,9 @@ func (e *fakeLeaseEngine) Configuration(context.Context) (raftengine.Configurati
 func (e *fakeLeaseEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
+func (e *fakeLeaseEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.Propose(ctx, data)
+}
 func (e *fakeLeaseEngine) Close() error                 { return nil }
 func (e *fakeLeaseEngine) LeaseDuration() time.Duration { return e.leaseDur }
 func (e *fakeLeaseEngine) AppliedIndex() uint64         { return e.applied }
@@ -152,6 +155,9 @@ func (e *nonLeaseEngine) Configuration(context.Context) (raftengine.Configuratio
 }
 func (e *nonLeaseEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
+}
+func (e *nonLeaseEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.Propose(ctx, data)
 }
 func (e *nonLeaseEngine) Close() error { return nil }
 

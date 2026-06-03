@@ -73,8 +73,33 @@ type ProposalResult struct {
 	Response    any
 }
 
+// Proposer drives a Raft proposal through the engine and returns
+// once it has been committed (or the context/engine cancels first).
+//
+// Two semantically distinct entry points:
+//
+//   - Propose carries ordinary user-data and control-plane traffic.
+//     A future §7.1 quiescence barrier (Stage 6E-2d) will reject
+//     these with ErrEnvelopeCutoverInProgress while a raft-envelope
+//     cutover is being installed, so the leader cannot admit a
+//     plaintext entry at `index > raftEnvelopeCutoverIndex`.
+//   - ProposeAdmin carries proposals that MUST bypass the §7.1
+//     barrier — currently the EnableRaftEnvelope cutover entry
+//     itself (without this exemption the barrier would deadlock on
+//     its own cutover proposal) and ConfChange-time
+//     RegisterEncryptionWriter proposals (Stage 7c §3.1, so a new
+//     member joining mid-barrier can still register its
+//     writer-registry entry).
+//
+// In the current build the two methods are operationally
+// equivalent; Stage 6E-2d adds the barrier check on Propose only.
+// Calling Propose from a control-plane site that should be exempt
+// will therefore not break today, but will fail-closed at the
+// barrier the moment 6E-2d ships — so the migration must land in
+// the same PR series, not after.
 type Proposer interface {
 	Propose(ctx context.Context, data []byte) (*ProposalResult, error)
+	ProposeAdmin(ctx context.Context, data []byte) (*ProposalResult, error)
 }
 
 type LeaderView interface {

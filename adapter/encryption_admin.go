@@ -1341,7 +1341,14 @@ func (s *EncryptionAdminServer) proposeEncryptionEntry(ctx context.Context, opco
 	entry := make([]byte, 0, 1+len(body))
 	entry = append(entry, opcode)
 	entry = append(entry, body...)
-	res, err := s.proposer.Propose(ctx, entry)
+	// proposeEncryptionEntry composes control-plane entries
+	// (BootstrapEncryption, EnableStorageEnvelope, the §6E
+	// EnableRaftEnvelope cutover marker, etc.). All of these are
+	// exempt from the §7.1 quiescence barrier that Stage 6E-2d
+	// installs on Propose: most carry no user-data, and the
+	// cutover entry itself would deadlock the barrier on its own
+	// proposal. ProposeAdmin is the exempt path.
+	res, err := s.proposer.ProposeAdmin(ctx, entry)
 	if err != nil {
 		return 0, proposeErrorToStatus(err, opcode)
 	}
