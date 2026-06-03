@@ -201,44 +201,50 @@ func TestPrepareStorageNonceEpoch_SaturatedEpoch_RefusesWithExhausted(t *testing
 	}
 }
 
-// TestNoteRaftEnvelopeCutoverStartup_NoSidecarPath pins the
-// degraded-input behaviour: an empty sidecar path returns without
-// any side effect (no log, no panic). This is the
-// encryption-disabled startup case where no sidecar is configured.
-func TestNoteRaftEnvelopeCutoverStartup_NoSidecarPath(t *testing.T) {
+// TestRefuseStartupOnActiveRaftCutover_NoSidecarPath pins the
+// degraded-input behaviour: an empty sidecar path returns nil
+// (no refusal). This is the encryption-disabled startup case
+// where no sidecar is configured.
+func TestRefuseStartupOnActiveRaftCutover_NoSidecarPath(t *testing.T) {
 	t.Parallel()
-	noteRaftEnvelopeCutoverStartup("")
+	if err := refuseStartupOnActiveRaftCutover(""); err != nil {
+		t.Errorf("empty sidecarPath: refuseStartupOnActiveRaftCutover = %v, want nil", err)
+	}
 }
 
-// TestNoteRaftEnvelopeCutoverStartup_MissingSidecar pins the
-// silent-on-missing-file behaviour: the Stage 6C-1 startup guard
+// TestRefuseStartupOnActiveRaftCutover_MissingSidecar pins the
+// nil-on-missing-file behaviour: the Stage 6C-1 startup guard
 // is the authoritative refuser of malformed sidecars; this helper
 // only cares about a present sidecar with a non-zero cutover
-// index, and silently returns on any ReadSidecar error.
-func TestNoteRaftEnvelopeCutoverStartup_MissingSidecar(t *testing.T) {
+// index, and silently returns nil on any ReadSidecar error.
+func TestRefuseStartupOnActiveRaftCutover_MissingSidecar(t *testing.T) {
 	t.Parallel()
-	noteRaftEnvelopeCutoverStartup(t.TempDir() + "/absent.json")
+	if err := refuseStartupOnActiveRaftCutover(t.TempDir() + "/absent.json"); err != nil {
+		t.Errorf("missing sidecar: refuseStartupOnActiveRaftCutover = %v, want nil (Stage 6C-1 owns malformed sidecars)", err)
+	}
 }
 
-// TestNoteRaftEnvelopeCutoverStartup_ZeroCutoverIsSilent pins the
+// TestRefuseStartupOnActiveRaftCutover_ZeroCutoverPasses pins the
 // Stage 3 default: a sidecar with RaftEnvelopeCutoverIndex == 0
-// must not log — that is the pre-cutover state, which is
+// must return nil — that is the pre-cutover state, which is
 // universal until Stage 6E-2f flips the gate.
-func TestNoteRaftEnvelopeCutoverStartup_ZeroCutoverIsSilent(t *testing.T) {
+func TestRefuseStartupOnActiveRaftCutover_ZeroCutoverPasses(t *testing.T) {
 	t.Parallel()
 	path := writeActiveStorageSidecar(t, 0) // RaftEnvelopeCutoverIndex defaults to 0
-	noteRaftEnvelopeCutoverStartup(path)
+	if err := refuseStartupOnActiveRaftCutover(path); err != nil {
+		t.Errorf("zero cutover: refuseStartupOnActiveRaftCutover = %v, want nil (Stage 3 default must pass)", err)
+	}
 }
 
-// TestNoteRaftEnvelopeCutoverStartup_NonZeroCutoverLogs exercises
-// the "active cutover but no wrap closure" branch end-to-end:
-// write a sidecar with RaftEnvelopeCutoverIndex != 0, invoke the
-// hook, and confirm it does not panic / does not mutate the
-// sidecar. The log line itself is observable only via slog
-// handlers in production; the test exists primarily so a future
-// refactor that removes the read path fails compile or trips a
-// regression in this asserted-no-panic branch.
-func TestNoteRaftEnvelopeCutoverStartup_NonZeroCutoverLogs(t *testing.T) {
+// TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverRefuses
+// pins the codex P1 fail-closed property: when the sidecar
+// reports RaftEnvelopeCutoverIndex != 0, the helper returns a
+// non-nil error so buildShardGroupsWithEncryptionWiring refuses
+// startup. Without this, the binary would proceed with nil
+// shard-group wrap pointers and fresh proposals could land
+// cleartext above the cutover, halting the apply loop on the
+// §6.3 strict-> unwrap path.
+func TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverRefuses(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := dir + "/keys.json"
@@ -255,13 +261,16 @@ func TestNoteRaftEnvelopeCutoverStartup_NonZeroCutoverLogs(t *testing.T) {
 	if err := encryption.WriteSidecar(path, sc); err != nil {
 		t.Fatalf("WriteSidecar: %v", err)
 	}
-	noteRaftEnvelopeCutoverStartup(path)
-	// Sidecar must be unchanged on disk — the hook is read-only.
-	got, err := encryption.ReadSidecar(path)
-	if err != nil {
-		t.Fatalf("ReadSidecar after hook: %v", err)
+	err := refuseStartupOnActiveRaftCutover(path)
+	if err == nil {
+		t.Fatal("non-zero cutover: refuseStartupOnActiveRaftCutover = nil, want refusal (codex P1)")
+	}
+	// Sidecar must be unchanged on disk — the helper is read-only.
+	got, err2 := encryption.ReadSidecar(path)
+	if err2 != nil {
+		t.Fatalf("ReadSidecar after helper: %v", err2)
 	}
 	if got.RaftEnvelopeCutoverIndex != 12345 {
-		t.Errorf("post-hook RaftEnvelopeCutoverIndex = %d, want 12345 (hook must be read-only)", got.RaftEnvelopeCutoverIndex)
+		t.Errorf("post-helper RaftEnvelopeCutoverIndex = %d, want 12345 (helper must be read-only)", got.RaftEnvelopeCutoverIndex)
 	}
 }

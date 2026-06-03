@@ -32,13 +32,42 @@ type ShardGroup struct {
 	// design (see kv/raft_payload_wrapper.go for the rationale).
 	//
 	// The cell is read on every proposal via dynamicWrappedProposer,
-	// installed in the TransactionManager's proposer chain when the
-	// ShardGroup is constructed. SetRaftPayloadWrap publishes a fresh
-	// closure atomically so EnableRaftEnvelope (Stage 6E-2d) can
-	// activate the wrap the instant the cutover entry commits,
-	// without rebuilding the TransactionManager or stalling
-	// in-flight proposals.
+	// installed in the TransactionManager's proposer chain AND on
+	// the cached proposer below when the ShardGroup is constructed
+	// via NewLeaderProxyForShardGroup. SetRaftPayloadWrap publishes
+	// a fresh closure atomically so EnableRaftEnvelope (Stage
+	// 6E-2d) can activate the wrap the instant the cutover entry
+	// commits, without rebuilding the TransactionManager or
+	// stalling in-flight proposals.
 	raftPayloadWrap atomic.Pointer[RaftPayloadWrapper]
+	// proposer is the wrap-aware proposer chain for this shard
+	// group. Set by NewLeaderProxyForShardGroup so direct shard
+	// proposals (HLC lease renewal — see RunHLCLeaseRenewal —
+	// and any future direct-engine.Propose call site) route
+	// through the same dynamicWrappedProposer the
+	// TransactionManager uses. The Proposer() accessor falls back
+	// to Engine when this is nil (the legacy / test-fixture path
+	// that constructs ShardGroup via struct literal without
+	// NewLeaderProxyForShardGroup), so the no-wrap default keeps
+	// working.
+	proposer raftengine.Proposer
+}
+
+// Proposer returns the wrap-aware proposer chain installed by
+// NewLeaderProxyForShardGroup, or the raw Engine when the
+// constructor was bypassed (legacy / test fixtures that build
+// ShardGroup via struct literal). Direct shard proposals
+// (HLC lease renewal, future cipher rotations, etc.) MUST go
+// through this getter rather than g.Engine.Propose so the
+// Stage 6E-2c dynamic wrap path applies — a direct g.Engine
+// Propose call would bypass the wrap pointer and let post-cutover
+// writes land cleartext above the raft-envelope cutover, halting
+// the apply loop on §6.3 strict-> unwrap (codex P2 round-1).
+func (g *ShardGroup) Proposer() raftengine.Proposer {
+	if g.proposer != nil {
+		return g.proposer
+	}
+	return g.Engine
 }
 
 // SetRaftPayloadWrap publishes wrap as the active raft envelope
@@ -90,14 +119,19 @@ func (g *ShardGroup) RaftPayloadWrap() RaftPayloadWrapper {
 // "don't validate for scenarios that can't happen at internal
 // boundaries" applies.
 func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *LeaderProxy {
-	// Prepend the wrap-installation option so a caller-provided
-	// WithProposer would still take precedence (last option wins).
-	// In practice this PR has no caller that overrides the proposer
-	// via opts; the slot is reserved for future composition.
-	combined := make([]TransactionOption, 0, len(opts)+1)
-	combined = append(combined, withDynamicRaftPayloadWrap(&g.raftPayloadWrap))
-	combined = append(combined, opts...)
-	return NewLeaderProxyWithEngine(g.Engine, combined...)
+	// Build a single dynamicWrappedProposer for this shard group and
+	// cache it on g.proposer so direct shard proposals (HLC lease
+	// renewal in RunHLCLeaseRenewal, future cipher rotations) and
+	// the TransactionManager.Commit / Abort path share the same
+	// wrap pointer and the same Propose / ProposeAdmin call shape.
+	// A direct g.Engine.Propose call would bypass the wrap pointer
+	// (codex P2 round-1); routing both paths through the same
+	// proposer closes that hole.
+	g.proposer = newDynamicWrappedProposer(g.Engine, &g.raftPayloadWrap)
+	return &LeaderProxy{
+		engine: g.Engine,
+		tm:     NewTransactionWithProposer(g.proposer, opts...),
+	}
 }
 
 // leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
@@ -1826,7 +1860,14 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 		case <-timer.C:
 			if group.Engine.State() == raftengine.StateLeader {
 				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-				if _, err := group.Engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
+				// Route through the ShardGroup's wrap-aware proposer
+				// chain — NOT a direct group.Engine.Propose — so the
+				// Stage 6E-2c dynamic wrap applies. Without this, an
+				// HLC lease-renewal entry committed post-cutover at
+				// `index > raftEnvelopeCutoverIndex` would land
+				// cleartext and trip the §6.3 strict-> unwrap on
+				// every replica's apply loop (codex P2 round-1).
+				if _, err := group.Proposer().Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
 					c.logger().WarnContext(ctx, "hlc lease renewal failed",
 						slog.Uint64("group_id", c.defaultGroup),
 						slog.Int64("ceiling_ms", ceilingMs),
