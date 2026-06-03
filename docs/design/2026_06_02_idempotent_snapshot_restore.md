@@ -1,7 +1,7 @@
 # Idempotent FSM Snapshot Restore on Cold Start
 
-**Status**: Proposal (Round 4 — codex P2 fix: snapshot-persist meta key bump)
-**Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4)
+**Status**: Proposal (Round 5 — import-cycle fix + cover the local snapshot path)
+**Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4 / 5)
 **Author**: bootjp
 **Related**: PR #909 (`HEALTH_TIMEOUT_SECONDS` 60s → 300s)
 
@@ -152,10 +152,10 @@ the leaf store calls (`ApplyMutationsRaft`, `DeletePrefixAtRaft`) pick
 up a new optional `appliedIndex uint64` parameter that defaults to 0
 (direct-write paths) and is non-zero for raft-apply paths.
 
-The leaf helpers `applyMutationsWithOpts` (`lsm_store.go:1130`) and
-`deletePrefixAtWithOpts` (`lsm_store.go:1196`) bundle a new
+The leaf helpers `applyMutationsWithOpts` (`lsm_store.go:1292`) and
+`deletePrefixAtWithOpts` (`lsm_store.go:1358`) bundle a new
 `metaAppliedIndexBytes` key in the same `pebble.Batch` they already use
-for `metaLastCommitTSBytes` (`lsm_store.go:1162` and `:1231`
+for `metaLastCommitTSBytes` (`lsm_store.go:1324` and `:1393`
 respectively):
 
 ```go
@@ -224,7 +224,7 @@ func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
 `metaAppliedIndexBytes` is `[]byte("_meta_applied_index")` — sibling to
 `metaLastCommitTSBytes` (`lsm_store.go:145`), outside the MVCC user-key
 space, disjoint from every existing meta key.  Branch 2 extends
-`isReservedMetaKey` (`lsm_store.go:454`) to include it.
+`isPebbleMetaKey` (`lsm_store.go:534`) to include it.
 
 The reader interface lets `restoreSnapshotState` inspect the store
 without coupling the etcd raft engine to `*pebbleStore`:
@@ -339,46 +339,63 @@ the `f.restoredCutover` write.  After skip:
 two side-effects as `kvFSM.Restore` does.**  Reuse the existing
 parser, do not invent a v1-only probe:
 
+**Import-cycle constraint (round-5 fix)**.  `internal/raftengine/etcd/`
+cannot import `kv` because `kv/snapshot.go` and `kv/fsm.go` already
+import `github.com/bootjp/elastickv/internal/raftengine`.  A direct
+call to `kv.ReadSnapshotHeader(...)` from `wal_store.go` would create
+the cycle `internal/raftengine/etcd → kv → internal/raftengine`, which
+the Go toolchain rejects.  The seam therefore pushes the file open AND
+the `ReadSnapshotHeader` call **into the FSM implementation**, so
+`wal_store.go` never names the `kv` package:
+
 ```go
-// internal/raftengine/etcd/wal_store.go (new)
+// internal/raftengine/etcd/wal_store.go (new) -- never imports kv
 func applyHeaderStateOnSkip(fsm StateMachine, snapPath string) error {
     setter, ok := fsm.(SnapshotHeaderApplier)
     if !ok {
         return nil // FSM has no header state; skip is harmless.
     }
-    f, err := os.Open(snapPath)
+    return errors.WithStack(setter.ApplySnapshotHeaderFromFile(snapPath))
+}
+
+// internal/raftengine/statemachine.go (new, sibling to ApplyIndexAware)
+type SnapshotHeaderApplier interface {
+    // ApplySnapshotHeaderFromFile opens the snapshot file at snapPath,
+    // consumes its v1/v2 header via the FSM's existing header parser,
+    // and applies the same side-effects the FSM's Restore would apply
+    // for that header (HLC ceiling, Stage 8a cutover, etc.). The
+    // implementation MUST NOT consume any post-header bytes. Returns
+    // ErrSnapshotHeaderUnknownMagic / InvalidLength for fail-closed
+    // forward-incompat handling.
+    ApplySnapshotHeaderFromFile(snapPath string) error
+}
+
+// kv/fsm.go (new method on kvFSM) -- kv.ReadSnapshotHeader stays inside kv
+func (f *kvFSM) ApplySnapshotHeaderFromFile(snapPath string) error {
+    file, err := os.Open(snapPath)
     if err != nil { return errors.WithStack(err) }
-    defer f.Close()
-    br := bufio.NewReader(f)
-    ceiling, cutover, err := kv.ReadSnapshotHeader(br)
+    defer file.Close()
+    ceiling, cutover, err := ReadSnapshotHeader(bufio.NewReader(file))
     if err != nil {
         // Includes ErrSnapshotHeaderUnknownMagic / InvalidLength.
         // Fail closed -- the operator must upgrade rather than have
         // us silently skip a forward-incompatible header.
         return errors.WithStack(err)
     }
-    setter.ApplySnapshotHeader(ceiling, cutover)
-    return nil
-}
-
-// kv/fsm.go gains:
-type SnapshotHeaderApplier interface {
-    ApplySnapshotHeader(ceiling, cutover uint64)
-}
-
-func (f *kvFSM) ApplySnapshotHeader(ceiling, cutover uint64) {
     if f.hlc != nil && ceiling > 0 {
         f.hlc.SetPhysicalCeiling(int64(ceiling))
     }
     f.restoredCutover = cutover
+    return nil
 }
 ```
 
-By reusing `kv.ReadSnapshotHeader` the skip path inherits v1 + v2
-parity, the `ErrSnapshotHeaderUnknownMagic` fail-closed branch, and
-any future v3 the snapshot header gains.  Cost: a single
-`bufio.NewReader(f)` + ~26-byte read.  We do **not** consume any of
-the inner-store payload — `f` is closed before returning.
+By keeping the `kv.ReadSnapshotHeader` call inside `kv/fsm.go` the
+skip path inherits v1 + v2 parity, the `ErrSnapshotHeaderUnknownMagic`
+fail-closed branch, and any future v3 the snapshot header gains —
+without `wal_store.go` ever naming the `kv` package.  Cost: a single
+`bufio.NewReader(file)` + ~26-byte read.  We do **not** consume any
+of the inner-store payload — `file` is closed before returning.
 
 ### 6. Crash-safety argument
 
@@ -450,9 +467,15 @@ re-installed from the snapshot.  Idle clusters degenerate to
 the skip never fires.  Round-3 was wrong; round-4 fixes it.
 
 **Mechanism**: bump `metaAppliedIndex` to `snapshot.Metadata.Index`
-when persisting a created snapshot, in `persistCreatedSnapshot`
-(`internal/raftengine/etcd/engine.go:2683`), **before**
-`e.persist.SaveSnap`:
+at every snapshot persist site, **before** the corresponding
+`persist.SaveSnap` call.  There are **two** persist sites in
+`internal/raftengine/etcd/`; round-4 only hooked one of them, which
+left the steady-state path uncovered (codex round-4 P2 at `:455`).
+Round-5 hooks both:
+
+**Site 1 — `persistCreatedSnapshot`** (`engine.go:2683`).  Drives
+**config snapshots** (created via `createConfigSnapshot` →
+`storage.CreateSnapshot`):
 
 ```go
 // internal/raftengine/etcd/engine.go (revised)
@@ -460,10 +483,6 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
     if etcdraft.IsEmptySnap(snap) || e.persist == nil {
         return nil
     }
-    // Round-4: bump metaAppliedIndex BEFORE SaveSnap so a successful
-    // snapshot persist always implies LastAppliedIndex >= snap.Metadata.Index.
-    // Skip the bump silently when the FSM does not expose the writer
-    // seam (legacy fakes / test shims).
     if w, ok := e.fsm.(AppliedIndexWriter); ok {
         if err := w.SetDurableAppliedIndex(snap.Metadata.Index); err != nil {
             return errors.WithStack(err)
@@ -475,6 +494,49 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
     // ... existing Release + purge ...
 }
 ```
+
+**Site 2 — `e.persistLocalSnapshotPayload`** (`engine.go:4032`).  This
+is the **steady-state `SnapshotCount`-triggered snapshot path** —
+`maybePersistLocalSnapshot` (`engine.go:2070`) → `e.persistLocalSnapshotPayload`
+(`engine.go:4032`) → the free function `persistLocalSnapshotPayload`
+(`wal_store.go:519`) → `persist.SaveSnap` at `wal_store.go:525`.  This
+is the hot path the optimisation actually depends on; without hooking
+it, the codex round-3 P2 fallback is not closed.
+
+The hook lives in the engine wrapper, **not** in the free function,
+because the wrapper holds `e.snapshotMu` and has direct access to
+`e.fsm`:
+
+```go
+// internal/raftengine/etcd/engine.go (revised)
+func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error {
+    e.snapshotMu.Lock()
+    defer e.snapshotMu.Unlock()
+
+    current, err := e.storage.Snapshot()
+    if err != nil { return errors.WithStack(err) }
+    if index <= current.Metadata.Index { return nil }
+
+    // Round-5: bump metaAppliedIndex BEFORE the free-function
+    // persistLocalSnapshotPayload (which calls persist.SaveSnap at
+    // wal_store.go:525). Lives in the engine wrapper so the free
+    // function stays signature-stable and is reusable from tests
+    // that bypass the engine. Skipped silently when the FSM does
+    // not implement AppliedIndexWriter (legacy fakes / test shims).
+    if w, ok := e.fsm.(AppliedIndexWriter); ok {
+        if err := w.SetDurableAppliedIndex(index); err != nil {
+            return errors.WithStack(err)
+        }
+    }
+
+    _, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
+    // ... existing error switch + purge ...
+}
+```
+
+`index` here is `req.index = e.applied` at the time the snapshot
+request was queued, so it satisfies the same monotonicity property as
+`snap.Metadata.Index` in Site 1: it never moves backward.
 
 The new `AppliedIndexWriter` interface lives next to
 `AppliedIndexReader` in `internal/raftengine/statemachine.go`:
@@ -627,7 +689,7 @@ restoreSnapshotState skipped (FSM at index %d, snapshot at %d, ceiling=%d, cutov
 | Branch | Content | Behaviour change |
 |---|---|---|
 | **B1** (this PR) | Design doc | None |
-| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` + `pebbleStore.SetDurableAppliedIndex()` (both with `dbMu.RLock()`) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + `persistCreatedSnapshot` calls `SetDurableAppliedIndex` BEFORE `e.persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist. Skip is still disabled. Soak in production for one release. |
+| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` + `pebbleStore.SetDurableAppliedIndex()` (both with `dbMu.RLock()`) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2683`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
 | **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip` reusing `kv.ReadSnapshotHeader` + `SnapshotHeaderApplier` seam on `kvFSM` + metrics + INFO log | **User-visible cold-start win.** |
 | **B4** | Lower `HEALTH_TIMEOUT_SECONDS` default once production data shows steady-state skip rate ≥ 90 % | Tighter ceiling; the env override remains honoured. |
 
@@ -652,10 +714,15 @@ Each of B2–B3 ships behind tests:
   test asserts that `applyHeaderStateOnSkip` sets
   `f.hlc.PhysicalCeiling()` **and** `f.restoredCutover` for both v1
   and v2 snapshot headers — the ceiling+cutover are invariant under
-  the optimisation.  An idle-cluster test runs a 3-node cluster with
-  no data writes for `2 * SnapshotCount * hlcRenewalInterval`
-  seconds, takes a snapshot, restarts a node, and asserts the skip
-  fires — proving the codex P2 scenario is closed end-to-end.
+  the optimisation.  An idle-cluster integration test runs a 3-node cluster with
+  `ELASTICKV_RAFT_SNAPSHOT_COUNT=10` (overriding the default
+  `defaultSnapshotEvery = 10000` at `engine.go:93` so the scenario is
+  tractable — at default + `hlcRenewalInterval = 1 s` an idle period
+  would need ≥ 20 000 s).  With the override, the test issues no data
+  writes for `2 × 10 × hlcRenewalInterval = 20 s`, takes a snapshot,
+  restarts a node, and asserts the skip fires — proving the codex
+  round-3 P2 scenario is closed end-to-end through the
+  `e.persistLocalSnapshotPayload` hook added in round-5.
 
 ## Open Questions
 
@@ -759,3 +826,49 @@ Lesson: "rare" should be a quantitative claim against the actual
 production timer cadence, not an intuition.  Codex's review process
 explicitly cited `kv/coordinator.go:641-663` — a file:line that I
 could have consulted before making the round-3 claim.
+
+## Round-4 retraction (claude carry-forward + codex local-snapshot bypass)
+
+Round 4 carried forward a §5 import cycle from round-3 (`wal_store.go`
+calling `kv.ReadSnapshotHeader` directly) and introduced a fresh hot-
+path bypass (the round-4 fix only hooked `persistCreatedSnapshot`,
+missing the steady-state `e.persistLocalSnapshotPayload` path that the
+optimisation actually depends on).
+
+Verified on `origin/main`:
+
+- `kv/snapshot.go` and `kv/fsm.go` both `import "github.com/bootjp/elastickv/internal/raftengine"`,
+  so `internal/raftengine/etcd/wal_store.go` cannot import `kv` —
+  the round-3 / round-4 pseudocode `kv.ReadSnapshotHeader(br)` from
+  `wal_store.go` would fail compilation with the cycle
+  `internal/raftengine/etcd → kv → internal/raftengine`.
+- `maybePersistLocalSnapshot` (`engine.go:2070`) →
+  `e.persistLocalSnapshotPayload` (`engine.go:4032`) → free
+  `persistLocalSnapshotPayload` (`wal_store.go:519`) →
+  `persist.SaveSnap` (`wal_store.go:525`) is the actual hot path for
+  `SnapshotCount`-triggered snapshots; round-4's
+  `persistCreatedSnapshot` hook only covers `createConfigSnapshot`
+  (membership-change snapshots).
+
+Round 5 fixes both:
+
+- §5 moves the file open AND `ReadSnapshotHeader` call inside the new
+  `kvFSM.ApplySnapshotHeaderFromFile(snapPath)` method, so
+  `wal_store.go` only ever sees the `SnapshotHeaderApplier` interface
+  and never names the `kv` package.  Import cycle eliminated.
+- §6 adds a second hook in `e.persistLocalSnapshotPayload`
+  (`engine.go:4032`), placed under `e.snapshotMu.Lock()` and before
+  the free-function call.  The B2 row of the Implementation Plan now
+  enumerates both hook sites explicitly.
+
+Cosmetic corrections incorporated from claude's annotation list:
+`isReservedMetaKey` → `isPebbleMetaKey` (`lsm_store.go:534`);
+`applyMutationsWithOpts` → `:1292` (meta-key bundle at `:1324`);
+`deletePrefixAtWithOpts` → `:1358` (meta-key bundle at `:1393`).
+
+Lesson: when a §X seam touches a package boundary, verify the import
+direction explicitly before pseudocoding the call site.  The fix in
+round-5 (push the file-open and the kv-package call **into** the FSM
+implementation) is structurally identical to how `ApplyIndexAware` was
+shaped to deliver `entry.Index` without importing kv — an existing
+template that round-3 / round-4 ignored.
