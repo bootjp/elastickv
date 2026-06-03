@@ -58,7 +58,7 @@
   (is (= "jepsen_append_t1" (key->table-name 4))
       "wraparound: k=4 must hit the same table as k=0"))
 
-(deftest key-routing-pks-disambiguate_colliding_keys
+(deftest key-routing-pks-disambiguate-colliding-keys
   ;; k=0 and k=4 land on the same table (t1) but must have distinct pks
   ;; so each Elle key maps to a unique storage location.
   (is (= "0" (key->pk 0)))
@@ -67,7 +67,27 @@
   (is (not= (key->pk 0) (key->pk 4))
       "colliding-table keys must have distinct pks"))
 
-(deftest multi-op-txn-spans_multiple_groups
+(deftest rejects-key-count-not-divisible-by-num-tables
+  ;; The workload's distribution guarantee depends on key-count % N
+  ;; = 0.  A CLI invocation that passes --key-count 10 (or any value
+  ;; that splits unevenly across 4 tables) would silently leave some
+  ;; tables with fewer keys, breaking the multi-group-span invariant.
+  ;; The construction-time assertion surfaces this loudly
+  ;; (claude[bot] low on PR #916).
+  (is (thrown? AssertionError
+        (workload/dynamodb-append-multi-table-workload {:key-count 10}))
+      "key-count not divisible by 4 must fail-fast at construction")
+  (is (thrown? AssertionError
+        (workload/dynamodb-append-multi-table-workload {:key-count 7}))
+      "odd key-count must fail-fast"))
+
+(deftest accepts-divisible-key-counts
+  ;; Sanity-check that the assertion does NOT reject valid values.
+  (is (map? (workload/dynamodb-append-multi-table-workload {:key-count 4})))
+  (is (map? (workload/dynamodb-append-multi-table-workload {:key-count 8})))
+  (is (map? (workload/dynamodb-append-multi-table-workload {:key-count 16}))))
+
+(deftest multi-op-txn-spans-multiple-groups
   ;; The M5a launch script places tables {1,2} in group 1 and {3,4}
   ;; in group 2.  A default 4-mop txn with keys [0,1,2,3] must
   ;; touch BOTH groups — that is the entire point of the multi-table

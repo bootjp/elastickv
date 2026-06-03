@@ -145,6 +145,31 @@
   (doseq [t table-names]
     (create-one-table! ddb t)))
 
+(defn- delete-one-table!
+  "Delete one of the N tables; ignore ResourceNotFoundException so
+   teardown! is idempotent across cluster states (e.g. a re-run after
+   a partial setup failure)."
+  [ddb tname]
+  (try
+    (ddb-invoke! ddb :DeleteTable {:TableName tname})
+    (catch clojure.lang.ExceptionInfo e
+      (when-not (= "ResourceNotFoundException" (:type (ex-data e)))
+        (throw e)))))
+
+(defn- delete-all-tables!
+  "Delete every table this workload owns.  Idempotent.
+
+   Without this, leftover Items from a previous run remain in the four
+   tables across runs; the next run's TransactGetItems pre-read picks
+   them up as snapshot values, the txn's :r mops report those values
+   to Jepsen, and Elle sees a history that contains writes it never
+   generated — leading to spurious G-single / G1c false positives
+   (claude[bot] medium on PR #916).  Cleaning up here keeps each run's
+   history closed under the writes Elle actually generated."
+  [ddb]
+  (doseq [t table-names]
+    (delete-one-table! ddb t)))
+
 (defn- list-attr
   "Convert a Clojure vector of longs to a DynamoDB {:L [...]} attribute."
   [vs]
@@ -191,6 +216,13 @@
                               :Key       {pk-attr {:S (key->pk k)}}}})
                      ks-vec)
         resp   (ddb-invoke! ddb :TransactGetItems {:TransactItems items})]
+    ;; DynamoDB guarantees :Responses is positionally aligned with the
+    ;; :TransactItems we sent.  Assert it so a future cognitect SDK
+    ;; that ever normalises / re-orders the response surfaces loudly
+    ;; rather than silently corrupting the snapshot map (claude[bot]
+    ;; low on PR #916).
+    (assert (= (count ks-vec) (count (:Responses resp)))
+            "TransactGetItems :Responses must be positionally aligned with the requested items")
     (into {}
           (map (fn [k entry] [k (read-list-attr (:Item entry))])
                ks-vec
@@ -262,7 +294,11 @@
   (setup! [this _test]
     (create-all-tables! ddb))
 
-  (teardown! [_this _test])
+  (teardown! [_this _test]
+    ;; Delete every table this workload created so the next run starts
+    ;; with empty Items.  See delete-all-tables! for the Elle-history
+    ;; rationale (claude[bot] medium on PR #916).
+    (delete-all-tables! ddb))
 
   (close! [this _test]
     (when ddb (aws/stop ddb))
@@ -340,17 +376,28 @@
   "Builds the multi-table list-append workload.  The append/test
    generator's integer keys are routed through key->table-name +
    key->pk to land deterministically on one of N=4 tables, exercising
-   cross-table TransactGetItems / TransactWriteItems."
+   cross-table TransactGetItems / TransactWriteItems.
+
+   Refuses to build when (:key-count opts) is not a multiple of
+   num-tables: an uneven split silently gives some tables fewer
+   keys (so 1-key txns on those tables never trigger multi-group
+   dispatch — claude[bot] low on PR #916).  The default 12 satisfies
+   this; tunable via --key-count from the CLI."
   [opts]
-  (let [workload (append/test {:key-count          (or (:key-count opts) 12)
-                               :min-txn-length     1
-                               :max-txn-length     (or (:max-txn-length opts) 4)
-                               :max-writes-per-key (or (:max-writes-per-key opts) 128)
-                               :consistency-models [:strict-serializable]})
-        client   (->DynamoDBMultiTableClient (or (:node->port opts)
-                                                 (zipmap default-nodes (repeat 8000)))
-                                             nil)]
-    (assoc workload :client client)))
+  (let [key-count (or (:key-count opts) 12)]
+    (assert (zero? (mod key-count num-tables))
+            (str "key-count (" key-count
+                 ") must be a multiple of num-tables (" num-tables
+                 ") so keys distribute evenly across all tables"))
+    (let [workload (append/test {:key-count          key-count
+                                 :min-txn-length     1
+                                 :max-txn-length     (or (:max-txn-length opts) 4)
+                                 :max-writes-per-key (or (:max-writes-per-key opts) 128)
+                                 :consistency-models [:strict-serializable]})
+          client   (->DynamoDBMultiTableClient (or (:node->port opts)
+                                                   (zipmap default-nodes (repeat 8000)))
+                                               nil)]
+      (assoc workload :client client))))
 
 (defn elastickv-dynamodb-multi-table-test
   "Builds a Jepsen test map driving the multi-table list-append workload
