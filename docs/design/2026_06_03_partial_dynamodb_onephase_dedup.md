@@ -369,14 +369,19 @@ every replica applying the same log entry.
 - Local reproduction: 3-node demo under CPU pressure / shortened election
   timeouts (`cmd/server/demo.go`) so leadership flaps during the DynamoDB
   workload, with `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1`.
-- **CI:** add the DynamoDB workload to the dedup-mode workflow
-  (`.github/workflows/jepsen-test-scheduled-dedup.yml`) with the env var set,
-  asserting the gate before the listeners come up (mirror the Redis gate
-  assertion). The general workflow
-  (`.github/workflows/jepsen-test-scheduled.yml`) continues to run DynamoDB
-  **gate-off** so the legacy path stays covered until default-on.
+- **CI — LANDED.** The DynamoDB list-append workload is added to the dedup-mode
+  workflow (`.github/workflows/jepsen-test-scheduled-dedup.yml`) with
+  `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1` set at the job env (read by
+  `adapter.NewDynamoDBServer` in the demo cluster), a fail-closed gate
+  assertion before the listeners come up (mirroring the Redis assertion), and
+  the launch step now also waits on the dynamo listeners (63801-63803). The
+  general workflow (`.github/workflows/jepsen-test-scheduled.yml`) continues to
+  run DynamoDB **gate-off** so the legacy path stays covered until default-on.
 - Criterion to default-on: 7 consecutive days without `:duplicate-elements` in
-  the dedup-mode DynamoDB workload, both workflows green.
+  the dedup-mode DynamoDB workload, both workflows green. **Default-on is a
+  separate follow-up PR** flipping `DynamoDBServer.onePhaseTxnDedup`'s default
+  (and the env-var sense) only after the 7-day criterion is met — not done in
+  the workflow PR, to keep the ship-reader-before-writer sequencing (R5).
 
 Scope estimate: M1 is ~120–180 LOC Go in `adapter/dynamodb.go` + tests; no FSM
 change (the probe already exists), no proto change, no new store primitive.

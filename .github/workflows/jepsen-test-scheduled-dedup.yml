@@ -1,16 +1,19 @@
 # Jepsen Scheduled Stress Test — Option-2 Dedup Mode
 #
-# Daily run with ELASTICKV_REDIS_ONEPHASE_DEDUP=1 so the demo cluster
-# exercises the option-2 idempotency path. The criterion for design doc
-# §M4 closure is 7 consecutive days of green runs with no
-# :duplicate-elements / :G-single-item-realtime anomalies in the Redis
-# workload's analysis output.
+# Daily run with ELASTICKV_REDIS_ONEPHASE_DEDUP=1 and
+# ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1 so the demo cluster exercises the
+# option-2 idempotency path on both adapters. The criterion for
+# default-on (docs/design/2026_05_21 §M4 and
+# docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md §M2) is 7
+# consecutive days of green runs with no :duplicate-elements /
+# :G-single-item-realtime anomalies in each workload's analysis output.
 #
-# Scope: Redis workload only. The dedup feature only ships behind the
+# Scope: Redis + DynamoDB workloads. The dedup feature ships behind the
 # Redis adapter's onePhaseTxnDedup flag (RPUSH/LPUSH, MULTI/EXEC,
-# standalone SET); DynamoDB / S3 / SQS do not route through the dedup
-# loop, so re-running them here would add hours of CI for no signal
-# on the new code path.
+# standalone SET) and the DynamoDB adapter's onePhaseTxnDedup flag
+# (single-item UpdateItem/PutItem/DeleteItem via PR #920). S3 / SQS do
+# not yet route through the dedup loop, so re-running them here would add
+# hours of CI for no signal on the new code path.
 #
 # Cadence: 03:17 UTC daily (off-peak; non-zero minute per ScheduleWakeup
 # guidance). The general 6-hourly scheduled workflow continues to run
@@ -65,6 +68,13 @@ jobs:
       # state. Anomalies in :duplicate-elements / :G-single-item-realtime
       # under this flag indicate a regression in option-2 plumbing.
       ELASTICKV_REDIS_ONEPHASE_DEDUP: "1"
+      # Enable the DynamoDB adapter option-2 dedup gate (PR #920). demo.go
+      # wires it via adapter.NewDynamoDBServer, which reads this env var;
+      # the single-item write path (UpdateItem/PutItem/DeleteItem) then
+      # routes through retryItemWriteWithGenerationDedup on the leader,
+      # exercising the same FSM exact-ts probe as the Redis path. The
+      # DynamoDB workload below validates no :duplicate-elements under it.
+      ELASTICKV_DYNAMODB_ONEPHASE_DEDUP: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -128,29 +138,37 @@ jobs:
           set -euo pipefail
           mkdir -p "$GOCACHE" /tmp/go-tmp
           export GOTMPDIR=/tmp/go-tmp
-          # The ELASTICKV_REDIS_ONEPHASE_DEDUP=1 env var is inherited
-          # from the job env above. demo.go reads it via the redis
-          # server's WithOnePhaseTxnDedup option wired in
-          # adapter/redis.go NewRedisServer.
+          # The ELASTICKV_REDIS_ONEPHASE_DEDUP=1 and
+          # ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1 env vars are inherited
+          # from the job env above. demo.go reads them via the redis
+          # server's WithOnePhaseTxnDedup option (adapter/redis.go
+          # NewRedisServer) and the DynamoDB server's NewDynamoDBServer
+          # (adapter/dynamodb.go), both of which call os.Getenv.
           nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
           echo $! > /tmp/elastickv-demo.pid
 
           echo "ELASTICKV_REDIS_ONEPHASE_DEDUP=${ELASTICKV_REDIS_ONEPHASE_DEDUP}"
-          # The env var is set at the JOB level above and inherited by
+          echo "ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=${ELASTICKV_DYNAMODB_ONEPHASE_DEDUP}"
+          # The env vars are set at the JOB level above and inherited by
           # all `run:` steps; nothing in demo.go can intercept or unset
-          # it before NewRedisServer reads os.Getenv. So if the env var
-          # is "1" here, the dedup gate IS active in the cluster. We
-          # print it explicitly so a failed run's log makes the
-          # configuration unambiguous (vs the general 6-hourly workflow
-          # whose runs would have an empty value here).
+          # them before the adapters read os.Getenv. So if they are "1"
+          # here, the dedup gates ARE active in the cluster. We print
+          # them explicitly so a failed run's log makes the configuration
+          # unambiguous (vs the general 6-hourly workflow whose runs would
+          # have empty values here).
           if [ "${ELASTICKV_REDIS_ONEPHASE_DEDUP:-}" != "1" ]; then
             echo "FATAL: ELASTICKV_REDIS_ONEPHASE_DEDUP is not '1' — this workflow runs only with the dedup gate on"
             exit 2
           fi
+          if [ "${ELASTICKV_DYNAMODB_ONEPHASE_DEDUP:-}" != "1" ]; then
+            echo "FATAL: ELASTICKV_DYNAMODB_ONEPHASE_DEDUP is not '1' — this workflow runs only with the dedup gate on"
+            exit 2
+          fi
 
-          echo "Waiting for redis listeners (63791-63793)..."
+          echo "Waiting for redis (63791-63793) and dynamo (63801-63803) listeners..."
           for i in {1..90}; do
-            if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793; then
+            if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
+              && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803; then
               echo "Cluster is up"
               exit 0
             fi
@@ -173,6 +191,24 @@ jobs:
             --max-txn-length ${{ inputs.max-txn-length || '4' }} \
             --ports 63791,63792,63793 \
             --host 127.0.0.1
+      - name: Run DynamoDB Jepsen workload (dedup mode) against elastickv
+        working-directory: jepsen
+        timeout-minutes: 10
+        # --local connects to the already-running demo cluster's dynamo
+        # ports (gate ON via ELASTICKV_DYNAMODB_ONEPHASE_DEDUP), so the
+        # single-item list_append writes exercise the option-2 reuse +
+        # exact-ts probe path. A :duplicate-elements anomaly here is the
+        # regression this workflow is meant to catch.
+        run: |
+          timeout 480 ~/lein run -m elastickv.dynamodb-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
+            --rate ${{ inputs.rate || '10' }} \
+            --concurrency ${{ inputs.concurrency || '8' }} \
+            --key-count ${{ inputs.key-count || '16' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '250' }} \
+            --max-txn-length ${{ inputs.max-txn-length || '4' }} \
+            --dynamo-ports 63801,63802,63803 \
+            --host 127.0.0.1
       - name: Dump demo cluster log on failure
         if: failure()
         run: |
@@ -194,7 +230,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: jepsen-store-redis-dedup
+          # Covers both the redis and dynamodb dedup-mode runs (each
+          # workload writes its own subdir under jepsen/store).
+          name: jepsen-store-dedup
           path: jepsen/store
           retention-days: 14
       - name: Stop demo cluster
