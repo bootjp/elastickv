@@ -2680,6 +2680,22 @@ func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snap) || e.persist == nil {
 		return nil
 	}
+	// Pin metaAppliedIndex to snap.Metadata.Index BEFORE SaveSnap so a
+	// successful snapshot persist always implies LastAppliedIndex >=
+	// snap.Metadata.Index — closes the HLC-lease-only / encryption-only
+	// fallback (PR #910 design §6). FSMs that do not expose
+	// raftengine.AppliedIndexWriter silently no-op; the skip
+	// optimisation falls back to full restore for them. pebble.Sync
+	// is forced on the writer side (see lsm_store.SetDurableAppliedIndex)
+	// regardless of ELASTICKV_FSM_SYNC_MODE — once SaveSnap returns,
+	// WAL compaction discards every log entry at or before
+	// snap.Metadata.Index, so there is no source to replay the meta
+	// key bump from.
+	if w, ok := e.fsm.(raftengine.AppliedIndexWriter); ok {
+		if err := w.SetDurableAppliedIndex(snap.Metadata.Index); err != nil {
+			return errors.WithStack(err)
+		}
+	}
 	if err := e.persist.SaveSnap(snap); err != nil {
 		return errors.WithStack(err)
 	}
@@ -4042,6 +4058,24 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	}
 	if index <= current.Metadata.Index {
 		return nil
+	}
+
+	// Pin metaAppliedIndex to `index` BEFORE the free-function
+	// persistLocalSnapshotPayload (which calls persist.SaveSnap at
+	// wal_store.go:524). This is the steady-state SnapshotCount-triggered
+	// snapshot path — the hot path the cold-start skip optimisation
+	// depends on. Without this hook the round-3 P2 fallback (HLC
+	// leases / encryption ops keep snapshot.Metadata.Index ahead of the
+	// last data-Apply index forever) recurs permanently. See PR #910
+	// design §6 'HLC lease entries — checkpoint at snapshot persist'
+	// and the round-5 retraction documenting why
+	// persistCreatedSnapshot alone is insufficient. pebble.Sync is
+	// forced on the writer side regardless of ELASTICKV_FSM_SYNC_MODE
+	// (lsm_store.SetDurableAppliedIndex inline comment).
+	if w, ok := e.fsm.(raftengine.AppliedIndexWriter); ok {
+		if err := w.SetDurableAppliedIndex(index); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
