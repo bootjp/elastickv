@@ -34,8 +34,7 @@ import (
 )
 
 const (
-	dialTimeout = 5 * time.Second
-	rpcTimeout  = 10 * time.Second
+	rpcTimeout = 10 * time.Second
 )
 
 var (
@@ -58,17 +57,20 @@ func run() error {
 		return err
 	}
 
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer dialCancel()
-
 	conn, err := grpc.NewClient(*address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return errors.Wrapf(err, "dial %s", *address)
 	}
-	defer conn.Close()
-	_ = dialCtx // grpc.NewClient does not need the context but we
-	// keep the dial timeout in case a future enhancement wants to
-	// block on connectivity before issuing the RPC.
+	defer func() {
+		// Surface gRPC close errors on stderr so a resource-leak
+		// or half-closed-stream condition is visible (gemini medium
+		// on PR #911).  Don't promote to a process-level error
+		// since the SplitRange result is already in hand by this
+		// point; a noisy close shouldn't mask a successful RPC.
+		if cerr := conn.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "elastickv-split: close: %v\n", cerr)
+		}
+	}()
 
 	client := pb.NewDistributionClient(conn)
 
