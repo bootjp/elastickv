@@ -214,10 +214,14 @@ func TestRefuseStartupOnActiveRaftCutover_NoSidecarPath(t *testing.T) {
 }
 
 // TestRefuseStartupOnActiveRaftCutover_MissingSidecar pins the
-// nil-on-missing-file behaviour: the Stage 6C-1 startup guard
-// is the authoritative refuser of malformed sidecars; this helper
-// only cares about a present sidecar with a non-zero cutover
-// index, and silently returns nil on any ReadSidecar error.
+// nil-on-missing-file behaviour: a missing sidecar is the
+// pre-bootstrap state and there is no raft envelope cutover to
+// refuse on. Only encryption.IsNotExist errors return nil here;
+// non-NotExist read errors (malformed JSON, schema violation)
+// propagate as a refusal — see the sibling
+// TestRefuseStartupOnActiveRaftCutover_BadSidecarPropagates that
+// pins that branch (codex P1 round-1 r2 narrowed the nil-return
+// from "any read error" to IsNotExist only).
 func TestRefuseStartupOnActiveRaftCutover_MissingSidecar(t *testing.T) {
 	t.Parallel()
 	if err := refuseStartupOnActiveRaftCutover(t.TempDir() + "/absent.json"); err != nil {
