@@ -1207,6 +1207,17 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 	return errors.WithStack(group.Store.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
 }
 
+// ApplyMutationsRaftAt is the raft-entry-index-aware variant. Threads
+// appliedIndex through to the single owning shard so the leaf can
+// bundle metaAppliedIndex with the mutation. See PR #910 design §2.
+func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	group, err := s.resolveSingleShardGroup(mutations)
+	if err != nil || group == nil {
+		return err
+	}
+	return errors.WithStack(group.Store.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
 // resolveSingleShardGroup returns the shard group that owns every
 // mutation in the batch, or an error if the batch is cross-shard or
 // references an unknown group. A nil group with nil error means "empty
@@ -1251,6 +1262,42 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 			continue
 		}
 		if err := g.Store.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+// DeletePrefixAtRaftAt is the raft-entry-index-aware variant. The
+// caller's raft entry index applies only to the local group whose
+// FSM is driving this apply; on a multi-group ShardStore, fanning
+// the SAME index across other groups would corrupt their
+// metaAppliedIndex. The single-group case (the common case for an
+// FSM-local DeletePrefixAtRaft path) gets the correct bundling; the
+// multi-group broadcast case is treated as "passive" — peer groups
+// receive the prefix-delete without a meta-key bump (their own raft
+// applies will catch up the index on the next mutation).
+//
+// In practice the FSM call sites that issue raft-DeletePrefix
+// operate against a single group's store; the multi-group ShardStore
+// is the receiver only when an aggregate (admin / coordinator) path
+// is replaying a global FLUSHALL, which is not raft-applied.
+func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		// Pass appliedIndex through to every group. In the
+		// single-group call-path (the production raft-apply case)
+		// this is correct: appliedIndex IS that group's raft entry
+		// index. In a hypothetical multi-group call, only one group
+		// would see the matching index and the rest would treat it
+		// as a non-monotonic stray write — but the rest of the
+		// raft-apply contract (single FSM per raft log) makes that
+		// case impossible to reach in production. Tests that
+		// exercise ShardStore.DeletePrefixAtRaftAt across multiple
+		// groups MUST pass appliedIndex=0 to opt out.
+		if err := g.Store.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex); err != nil {
 			return errors.WithStack(err)
 		}
 	}

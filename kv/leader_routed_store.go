@@ -330,6 +330,16 @@ func (s *LeaderRoutedStore) ApplyMutationsRaft(ctx context.Context, mutations []
 	return errors.WithStack(s.local.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
 }
 
+// ApplyMutationsRaftAt forwards to the local store's raft-entry-index-
+// aware variant so the underlying pebbleStore can bundle
+// metaAppliedIndex with the mutation. See PR #910 design §2.
+func (s *LeaderRoutedStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
 func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)
@@ -343,6 +353,15 @@ func (s *LeaderRoutedStore) DeletePrefixAtRaft(ctx context.Context, prefix []byt
 		return errors.WithStack(store.ErrNotSupported)
 	}
 	return errors.WithStack(s.local.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS))
+}
+
+// DeletePrefixAtRaftAt forwards to the local store's raft-entry-
+// index-aware variant. See PR #910 design §2 "why both leaves".
+func (s *LeaderRoutedStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex))
 }
 
 func (s *LeaderRoutedStore) LastCommitTS() uint64 {

@@ -1349,7 +1349,9 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	// bootstrap Save, admin snapshot, migration). Stage 7a-2 refuses to
 	// emit an encrypted envelope here before this load's writer
 	// registration commits.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true)
+	// appliedIndex=0: direct path has no raft index; the leaf treats 0 as
+	// "do not write metaAppliedIndex" so the meta key stays unchanged.
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0)
 }
 
 // ApplyMutationsRaft is the raft-apply commit path. Durability is governed
@@ -1362,16 +1364,38 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 // Must only be called from inside the FSM apply loop. All other call sites
 // must use ApplyMutations so a nosync opt-in cannot silently drop
 // acknowledged writes that have no raft backstop.
+//
+// Callers that have a raft entry index in hand (the kvFSM data-Apply
+// path via the raftengine.ApplyIndexAware seam) SHOULD prefer
+// ApplyMutationsRaftAt so the metaAppliedIndex meta key is bundled
+// atomically with the data mutation — see PR #910 / B2.
 func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	// gateRegistration=false: the FSM-apply path replays committed Raft
 	// entries and must stay deterministic. It may legitimately encrypt
 	// before this node's own registration entry commits (design §1);
 	// fail-closing here would halt the apply loop and could deadlock a
 	// node whose storage entry is ordered before its registration entry.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false)
+	// appliedIndex=0: callers that have not yet been wired to the
+	// raftengine.ApplyIndexAware seam (test fakes, legacy FSM impls)
+	// land here; their LastAppliedIndex() will stay behind the snapshot
+	// pointer and the skip optimisation will fall back to full restore
+	// for them. Preferred path is ApplyMutationsRaftAt.
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0)
 }
 
-func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool) error {
+// ApplyMutationsRaftAt is ApplyMutationsRaft with the raft entry
+// index threaded through so the leaf can bundle metaAppliedIndex in
+// the same pebble.Batch as the data mutation. See PR #910 design §2.
+//
+// appliedIndex==0 is treated as "no index" — the leaf will not write
+// metaAppliedIndex, preserving the ApplyMutationsRaft semantics.
+// Production callers (kvFSM.applyXxx with f.pendingApplyIdx) SHOULD
+// pass the entry.Index value the engine delivered via SetApplyIndex.
+func (s *pebbleStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex)
+}
+
+func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1407,6 +1431,16 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		s.mtx.Unlock()
 		return err
 	}
+	// Bundle metaAppliedIndex in the same batch as the data + commitTS
+	// meta key so a crash either commits all three atomically or none.
+	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
+	// or ApplyMutationsRaft); they leave the key unchanged.
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
+			s.mtx.Unlock()
+			return err
+		}
+	}
 	if err := b.Commit(writeOpts); err != nil {
 		s.mtx.Unlock()
 		return errors.WithStack(err)
@@ -1427,17 +1461,32 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 // ELASTICKV_FSM_SYNC_MODE=nosync. Raft-apply callers must use
 // DeletePrefixAtRaft instead.
 func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.directApplyWriteOpts())
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.directApplyWriteOpts(), 0)
 }
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt. Durability
 // is governed by s.fsmApplyWriteOpts (ELASTICKV_FSM_SYNC_MODE). See
 // ApplyMutationsRaft for the full durability argument.
+//
+// Callers that have a raft entry index in hand SHOULD prefer
+// DeletePrefixAtRaftAt to bundle metaAppliedIndex atomically — see
+// PR #910 design §2 "why both leaves".
 func (s *pebbleStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts())
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), 0)
 }
 
-func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64, writeOpts *pebble.WriteOptions) error {
+// DeletePrefixAtRaftAt is DeletePrefixAtRaft with the raft entry
+// index threaded through. handleDelPrefix builds an independent
+// pebble.Batch separate from applyMutationsWithOpts, so the meta
+// key bundle must happen here too — otherwise DEL_PREFIX entries
+// would land without bumping metaAppliedIndex and silently leave
+// LastAppliedIndex behind the true applied count for any workload
+// that uses DEL_PREFIX. PR #910 design §2.
+func (s *pebbleStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), appliedIndex)
+}
+
+func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1474,6 +1523,15 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 	}
 	if err := setPebbleUint64InBatch(batch, metaLastCommitTSBytes, newLastTS); err != nil {
 		return err
+	}
+	// Bundle metaAppliedIndex atomically with the tombstones + commitTS
+	// — same rationale as applyMutationsWithOpts. appliedIndex==0 means
+	// the legacy / non-raft caller path (DeletePrefixAt or
+	// DeletePrefixAtRaft); leave the meta key unchanged.
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
 	}
 	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
