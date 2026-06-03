@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -319,5 +320,31 @@ func TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverRefuses(t *testing.T) {
 	}
 	if got.RaftEnvelopeCutoverIndex != 12345 {
 		t.Errorf("post-helper RaftEnvelopeCutoverIndex = %d, want 12345 (helper must be read-only)", got.RaftEnvelopeCutoverIndex)
+	}
+}
+
+// TestRefuseStartupOnActiveRaftCutover_BadSidecarPropagates pins the
+// fail-closed read-error branch: ReadSidecar errors that are NOT
+// encryption.IsNotExist (malformed JSON, schema violation, KEK
+// mismatch, etc.) must propagate as a refusal error. The helper's
+// nil-return is narrowed to the pre-bootstrap case only; widening
+// it into fail-open behaviour for any other failure mode would
+// silently bypass the cutover guard.
+//
+// We use a malformed sidecar file (text that is not valid JSON) to
+// trigger a non-NotExist read error. The exact error type is not
+// asserted — only that the helper returns non-nil — because the
+// underlying error chain is supplied by encryption.ReadSidecar's
+// JSON / version decoder, which is not a contract surface this
+// test should pin.
+func TestRefuseStartupOnActiveRaftCutover_BadSidecarPropagates(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := dir + "/keys.json"
+	if err := os.WriteFile(path, []byte("not a valid sidecar"), 0o600); err != nil {
+		t.Fatalf("write malformed sidecar: %v", err)
+	}
+	if err := refuseStartupOnActiveRaftCutover(path); err == nil {
+		t.Fatal("malformed sidecar: refuseStartupOnActiveRaftCutover = nil, want refusal (fail-closed on read error)")
 	}
 }
