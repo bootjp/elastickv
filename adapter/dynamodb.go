@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -133,6 +134,17 @@ type DynamoDBServer struct {
 	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
 	tableLocks      [tableLockStripeCount]sync.Mutex
 	leaderDynamo    map[string]string
+
+	// onePhaseTxnDedup enables option-2 one-phase idempotency on the
+	// single-item write path (UpdateItem / PutItem / DeleteItem): on a
+	// retryable write error, the retry REUSES the failed attempt's write set
+	// under a fresh commit_ts and carries prev_commit_ts so the FSM no-ops a
+	// commit that already landed under leadership churn (the :duplicate-elements
+	// anomaly). It MUST stay off until every node runs a probe-aware binary —
+	// see R5 in docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+	// Default off; enabled via WithDynamoOnePhaseTxnDedup or the
+	// ELASTICKV_DYNAMODB_ONEPHASE_DEDUP env var.
+	onePhaseTxnDedup bool
 }
 
 // WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
@@ -157,6 +169,15 @@ func WithDynamoDBLeaderMap(m map[string]string) DynamoDBServerOption {
 		for k, v := range m {
 			server.leaderDynamo[k] = v
 		}
+	}
+}
+
+// WithDynamoOnePhaseTxnDedup enables the option-2 one-phase idempotency dedup on
+// the single-item write retry path (see DynamoDBServer.onePhaseTxnDedup). Off by
+// default; enable only after the whole cluster runs a probe-aware binary.
+func WithDynamoOnePhaseTxnDedup(enabled bool) DynamoDBServerOption {
+	return func(server *DynamoDBServer) {
+		server.onePhaseTxnDedup = enabled
 	}
 }
 
@@ -244,9 +265,10 @@ func (r *dynamoResponseRecorder) BytesWritten() int {
 
 func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordinator, opts ...DynamoDBServerOption) *DynamoDBServer {
 	d := &DynamoDBServer{
-		listen:      listen,
-		store:       st,
-		coordinator: coordinate,
+		listen:           listen,
+		store:            st,
+		coordinator:      coordinate,
+		onePhaseTxnDedup: os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") == "1",
 	}
 	d.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
 		createTableTarget:        d.createTable,
@@ -1235,6 +1257,38 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	exhaustedMessage string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, error) {
+	// Option-2 one-phase dedup (gated, default off): on a retryable write error,
+	// reuse the failed attempt's write set under a fresh commit_ts + prev_commit_ts
+	// so the FSM no-ops a commit that already landed under leadership churn,
+	// instead of re-reading and re-appending (the :duplicate-elements anomaly).
+	// See docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+	//
+	// Leader-only (codex P1, PR #920): the dedup path allocates commit_ts from
+	// the LOCAL HLC and carries it as prev_commit_ts, so that timestamp MUST be
+	// leader-issued to stay globally unique — otherwise two frontends could mint
+	// the same commit_ts in one millisecond and the exact-ts probe would dedup
+	// against the wrong writer's version, losing an update. On the leader the
+	// single HLC issues monotonic unique values, and NextFenced's physical-ceiling
+	// fence keeps a deposed leader's window disjoint from its successor's. A
+	// non-leader (reachable only when no leaderMap HTTP proxy forwards follower
+	// ingress) falls back to the legacy path, where Coordinator.Dispatch redirects
+	// to the leader and the LEADER allocates commit_ts — never this follower's HLC.
+	if d.onePhaseTxnDedup && d.coordinator.IsLeader() {
+		return d.retryItemWriteWithGenerationDedup(ctx, tableName, exhaustedMessage, prepare)
+	}
+	return d.retryItemWriteWithGenerationLegacy(ctx, tableName, exhaustedMessage, prepare)
+}
+
+// retryItemWriteWithGenerationLegacy is the pre-dedup retry loop: it recomputes
+// the write set from a fresh read on every retryable error. It is the active
+// path whenever the dedup gate is off or this node is not the leader, so it
+// stays byte-identical to the pre-feature behavior.
+func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
+	ctx context.Context,
+	tableName string,
+	exhaustedMessage string,
+	prepare func(readTS uint64) (*itemWritePlan, error),
+) (*itemWritePlan, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
@@ -1270,6 +1324,205 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, exhaustedMessage)
+}
+
+// reusableItemWrite captures a dispatched single-item write attempt so a
+// subsequent retry can REUSE its exact write set (the same Put/Del elems) under
+// a fresh commit_ts and probe whether it already landed, instead of re-reading
+// and recomputing the item. Recomputing is what duplicates a list_append under
+// leadership churn: attempt 1 commits at C1 but returns a WriteConflict, the
+// retry re-reads the now-larger list and appends again. Reuse + the FSM's
+// exact-ts dedup probe close that. See option 2 in
+// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+type reusableItemWrite struct {
+	// plan holds the reused OperationGroup (plan.req: Elems + fixed StartTS) and
+	// the captured current/next item. The client-visible result
+	// (updateItemReturnAttributes over current/next) is invariant across reuse
+	// — the write set was built once from attempt 1's read — so plan is also the
+	// correct value to return when the FSM dedup no-ops the apply (R1).
+	plan *itemWritePlan
+	// commitTS is the most recent dispatched commit_ts for this write set; the
+	// next retry passes it as PrevCommitTS so the FSM probes exactly the attempt
+	// that might have landed.
+	commitTS uint64
+	// probeKey is kv.PrimaryKeyForElems(plan.req.Elems) — the same key the FSM
+	// uses as meta.PrimaryKey — so the adapter-side self-inflicted-conflict guard
+	// and the FSM dedup probe agree on the point they query (R4).
+	probeKey []byte
+}
+
+// retryItemWriteWithGenerationDedup is the option-2 retry loop. The first
+// attempt computes the write set from a fresh read; any retryable failure makes
+// the next iteration REUSE that write set under a fresh commit_ts carrying
+// prev_commit_ts, so the FSM no-ops if the prior attempt already landed. A
+// genuine WriteConflict on a reuse (the self-conflict probe missed) drops the
+// pending attempt and recomputes from a fresh read.
+func (d *DynamoDBServer) retryItemWriteWithGenerationDedup(
+	ctx context.Context,
+	tableName string,
+	exhaustedMessage string,
+	prepare func(readTS uint64) (*itemWritePlan, error),
+) (*itemWritePlan, error) {
+	backoff := transactRetryInitialBackoff
+	deadline := time.Now().Add(transactRetryMaxDuration)
+	var pending *reusableItemWrite
+	for range transactRetryMaxAttempts {
+		var (
+			plan *itemWritePlan
+			err  error
+		)
+		if pending != nil {
+			plan, pending, err = d.itemWriteReuseAttempt(ctx, tableName, pending)
+		} else {
+			plan, pending, err = d.itemWriteFirstAttempt(ctx, tableName, prepare)
+		}
+		if err != nil {
+			// commitItemWrite already wraps dispatch errors; the attempt helpers
+			// return them raw, so return raw here too (no double WithStack).
+			if !isRetryableTransactWriteError(err) {
+				return nil, err
+			}
+		} else if plan != nil {
+			return plan, nil
+		}
+		if waitErr := waitRetryWithDeadline(ctx, deadline, backoff); waitErr != nil {
+			return nil, errors.WithStack(waitErr)
+		}
+		backoff = nextTransactRetryBackoff(backoff)
+	}
+	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, exhaustedMessage)
+}
+
+// itemWriteFirstAttempt runs the recompute branch of the dedup loop: a fresh
+// read snapshot, a locally-allocated commit_ts, and a dispatch. On a retryable
+// write error it returns a reusableItemWrite so the next iteration reuses this
+// write set. Return shapes match itemWriteReuseAttempt (see
+// retryItemWriteWithGenerationDedup).
+func (d *DynamoDBServer) itemWriteFirstAttempt(
+	ctx context.Context,
+	tableName string,
+	prepare func(readTS uint64) (*itemWritePlan, error),
+) (*itemWritePlan, *reusableItemWrite, error) {
+	readTS := d.nextTxnReadTS()
+	plan, err := prepare(readTS)
+	if err != nil {
+		return nil, nil, err
+	}
+	if plan.req == nil {
+		return plan, nil, nil
+	}
+	// NextFenced (not Next) honors the HLC physical-ceiling fence so a
+	// stale-leader window cannot mint a colliding commit_ts (HLC-4);
+	// ErrCeilingExpired is non-retryable and surfaces to the client.
+	commitTS, err := d.coordinator.Clock().NextFenced()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "dynamodb item-write first attempt: allocate commitTS")
+	}
+	plan.req.StartTS = readTS
+	plan.req.CommitTS = commitTS
+	if dispErr := d.commitItemWrite(ctx, plan.req); dispErr != nil {
+		// dispErr is already wrapped by commitItemWrite; return it raw.
+		if isRetryableTransactWriteError(dispErr) {
+			return nil, &reusableItemWrite{
+				plan:     plan,
+				commitTS: commitTS,
+				probeKey: kv.PrimaryKeyForElems(plan.req.Elems),
+			}, dispErr
+		}
+		return nil, nil, dispErr
+	}
+	return d.finishItemWriteAttempt(ctx, tableName, plan)
+}
+
+// itemWriteReuseAttempt runs one reuse iteration: re-dispatch the captured write
+// set under a fresh commit_ts carrying pending.commitTS as PrevCommitTS, so the
+// FSM probes whether the prior attempt landed.
+func (d *DynamoDBServer) itemWriteReuseAttempt(
+	ctx context.Context,
+	tableName string,
+	pending *reusableItemWrite,
+) (*itemWritePlan, *reusableItemWrite, error) {
+	commitTS, err := d.coordinator.Clock().NextFenced()
+	if err != nil {
+		return nil, pending, errors.Wrap(err, "dynamodb item-write reuse: allocate commitTS")
+	}
+	pending.plan.req.CommitTS = commitTS
+	pending.plan.req.PrevCommitTS = pending.commitTS
+	dispErr := d.commitItemWrite(ctx, pending.plan.req)
+	if dispErr == nil {
+		return d.finishItemWriteAttempt(ctx, tableName, pending.plan)
+	}
+	if errors.Is(dispErr, store.ErrWriteConflict) {
+		return d.resolveReuseWriteConflict(ctx, tableName, pending, commitTS, dispErr)
+	}
+	if isRetryableTransactWriteError(dispErr) {
+		// Still ambiguous (e.g. TxnLocked): this reuse may itself have landed,
+		// so the next retry must probe THIS commit_ts. dispErr is already
+		// wrapped by commitItemWrite; return it raw.
+		pending.commitTS = commitTS
+		return nil, pending, dispErr
+	}
+	return nil, nil, dispErr
+}
+
+// resolveReuseWriteConflict handles a WriteConflict from a reuse dispatch via
+// the self-inflicted-conflict guard: probe whether THIS reuse's commit_ts
+// actually landed (the apply may have committed but surfaced WriteConflict under
+// churn). On a hit the conflict is against our own commit — return the cached
+// plan, no double-apply. On a miss the write key is genuinely held by another
+// txn — drop pending so the next iteration recomputes from a fresh read.
+func (d *DynamoDBServer) resolveReuseWriteConflict(
+	ctx context.Context,
+	tableName string,
+	pending *reusableItemWrite,
+	commitTS uint64,
+	dispErr error,
+) (*itemWritePlan, *reusableItemWrite, error) {
+	if len(pending.probeKey) > 0 {
+		landed, perr := d.store.CommittedVersionAt(ctx, pending.probeKey, commitTS)
+		if perr != nil {
+			// Fail closed: a probe read error makes "did our reuse land?"
+			// unknowable, and a blind recompute would double-append if it HAD
+			// landed. Surface the probe error instead of silently recomputing,
+			// matching the FSM-side dedupProbeOnePhase (kv/fsm.go) which also
+			// propagates probe errors. The wrapped error is non-retryable, so
+			// the loop returns it to the client rather than re-applying.
+			return nil, nil, errors.Wrap(perr, "dynamodb item-write: self-conflict probe")
+		}
+		if landed {
+			// The reuse landed at commitTS. Run the SAME generation fence +
+			// cleanup the normal success path runs (finishItemWriteAttempt), so
+			// a table dropped/recreated under us cleans up the landed write and
+			// recomputes instead of returning a stale plan (coderabbit major).
+			return d.finishItemWriteAttempt(ctx, tableName, pending.plan)
+		}
+	}
+	// Probe missed (or no probe key): a genuine cross-writer conflict. dispErr
+	// is already wrapped by commitItemWrite; return it raw so the loop recomputes.
+	return nil, nil, dispErr
+}
+
+// finishItemWriteAttempt runs the table-generation fence after a successful
+// commit. Returns (plan, nil, nil) when the write is durable; (nil, nil, nil)
+// when the generation changed and the caller must recompute from a fresh read;
+// (nil, nil, err) on a fence error.
+func (d *DynamoDBServer) finishItemWriteAttempt(
+	ctx context.Context,
+	tableName string,
+	plan *itemWritePlan,
+) (*itemWritePlan, *reusableItemWrite, error) {
+	retry, verifyErr := d.handleGenerationFenceResult(
+		ctx,
+		d.verifyTableGeneration(ctx, tableName, plan.generation),
+		plan.cleanup,
+	)
+	if verifyErr != nil {
+		return nil, nil, verifyErr
+	}
+	if retry {
+		return nil, nil, nil
+	}
+	return plan, nil, nil
 }
 
 func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInput, readTS uint64) (*itemWritePlan, error) {
