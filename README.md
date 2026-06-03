@@ -89,6 +89,29 @@ docker compose up -d
 `monitoring/prometheus/prometheus.yml` assumes the demo token `demo-metrics-token`. If you override `--metricsToken` when running `go run ./cmd/server/demo.go`, update `authorization.credentials` in that file to match.
 
 
+## Admin Dashboard
+
+Elastickv ships an optional admin dashboard — a React SPA plus JSON API served from a separate HTTP listener (default `127.0.0.1:8080`). It is **disabled by default**; enable it with `-adminEnabled`. The dashboard inspects cluster/Raft state and manages DynamoDB tables, SQS queues, and S3 buckets without hand-rolling SigV4 requests. Any node with `-adminEnabled` can serve it: writes against a follower are transparently forwarded to the leader. See [`docs/admin.md`](docs/admin.md) for the operator guide and [`docs/design/2026_04_24_implemented_admin_dashboard.md`](docs/design/2026_04_24_implemented_admin_dashboard.md) for the design rationale.
+
+**Cluster overview** — leader identity, Raft group membership/local role, and resource counts.
+
+![Admin dashboard cluster overview](docs/images/admin/admin-overview.png)
+
+**DynamoDB tables** — list, create, and inspect tables backed by the existing `CreateTable` / `ListTables` handlers.
+
+![Admin dashboard DynamoDB tables](docs/images/admin/admin-dynamodb.png)
+
+**SQS queues** — list, describe, and delete queues; detail pages surface approximate visible / in-flight / delayed message counts and queue configuration.
+
+![Admin dashboard SQS queues](docs/images/admin/admin-sqs.png)
+
+![Admin dashboard SQS queue detail](docs/images/admin/admin-sqs-detail.png)
+
+**S3 buckets** — list and create buckets, with ACL and creation metadata.
+
+![Admin dashboard S3 buckets](docs/images/admin/admin-s3.png)
+
+
 ## Example Usage
 
 This section provides sample commands to demonstrate how to use the project. Make sure you have the necessary dependencies installed before running these commands.
