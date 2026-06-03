@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 
 	"github.com/cockroachdb/errors"
@@ -54,10 +55,30 @@ var (
 	// ErrSQSEncodeNotRegular is returned when a dump file is not a regular
 	// file (symlink / FIFO / device / directory).
 	ErrSQSEncodeNotRegular = errors.New("backup: sqs dump file is not a regular file")
-	// ErrSQSEncodeUnsupportedPartitioned is returned for HT-FIFO queues
-	// (partition_count > 1), whose partitioned key family this slice does
-	// not yet reproduce.
-	ErrSQSEncodeUnsupportedPartitioned = errors.New("backup: sqs partitioned (HT-FIFO) queue not yet supported by encoder")
+	// ErrSQSEncodeMissingPartition fires when a partitioned queue
+	// (meta.PartitionCount > 1) has a message whose Partition field is
+	// nil. Pre-M5-3 dumps lack the field entirely; replaying one against
+	// a partitioned queue would silently route every message to
+	// partition 0 via the `partition != nil` dispatch in addMessage,
+	// while the live readers scan the partitioned keyspace selected
+	// from raw PartitionCount > 1 — i.e. classic-shape keys against a
+	// partitioned reader = invisible on first read. Pinned by
+	// TestSQSEncodeRejectsMissingPartitionOnPartitionedQueue.
+	ErrSQSEncodeMissingPartition = errors.New("backup: sqs partitioned queue message missing partition field")
+	// ErrSQSEncodeOutOfRangePartition fires when a partitioned-queue
+	// message carries *Partition >= meta.PartitionCount. The dump is
+	// malformed (operator hand-edit or a future M5-3 decoder bug).
+	ErrSQSEncodeOutOfRangePartition = errors.New("backup: sqs message partition out of range for queue partition_count")
+	// ErrSQSEncodePartitionRoutingMismatch fires when a partitioned
+	// FIFO queue with FifoThroughputLimit == "perQueue" has a message
+	// with *Partition != 0. The live partitionFor
+	// (adapter/sqs_partitioning.go:71-72) forces every group to
+	// partition 0 in perQueue mode regardless of PartitionCount, and
+	// ReceiveMessage only scans the partition-0 lane. Accepting any
+	// other partition value would restore messages onto |p|N|... lanes
+	// the live receive fan-out never visits — silent data loss on
+	// first read. Codex P2 v914 v4 caught this gap.
+	ErrSQSEncodePartitionRoutingMismatch = errors.New("backup: sqs perQueue HT-FIFO queue must keep all messages on partition 0")
 )
 
 // sqsStoredQueueMeta mirrors the live adapter's sqsQueueMeta JSON shape
@@ -159,10 +180,6 @@ func (e *SQSRecordEncoder) encodeQueue(b *snapshotBuilder, root *os.Root, queueD
 	if meta.Name == "" {
 		return errors.Wrapf(ErrSQSEncodeInvalidQueue, "%s/_queue.json: empty queue name", queueDir)
 	}
-	if meta.PartitionCount > 1 {
-		return errors.Wrapf(ErrSQSEncodeUnsupportedPartitioned,
-			"%s: partition_count %d", queueDir, meta.PartitionCount)
-	}
 	if err := e.addQueueMeta(b, meta); err != nil {
 		return err
 	}
@@ -205,18 +222,28 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 	if err != nil {
 		return err
 	}
-	var maxSeq uint64
-	for i := range records {
-		seq, err := e.addMessage(b, meta.Name, records[i])
-		if err != nil {
-			return err
-		}
-		if err := e.addSideRecords(b, meta.Name, &meta, &records[i]); err != nil {
-			return err
-		}
-		if seq > maxSeq {
-			maxSeq = seq
-		}
+	// Fail-closed validation up-front so a malformed dump never stages
+	// partial records. Uses raw meta.PartitionCount > 1 as the
+	// partitioned-queue predicate (NOT effectivePartitionCount; codex
+	// P2 v914 v7 - using the effective count would allow a perQueue
+	// dump with Partition == nil to slip past the missing-partition
+	// gate, then addMessage's `partition != nil` dispatch would emit
+	// classic-shape keys against a partitioned-keyspace queue, making
+	// every restored message invisible).
+	if err := validatePartitioning(&meta, records); err != nil {
+		return err
+	}
+	// Per-partition deterministic emission for partitioned queues. The
+	// snapshotBuilder sorts by key bytes on WriteTo so this does not
+	// directly affect the .fsm byte output, but it makes the in-loop
+	// state (maxSeq, future per-partition counters) deterministic and
+	// matches the design doc's stated contract.
+	if meta.PartitionCount > 1 {
+		sortMessagesForPartitionedEmit(records)
+	}
+	maxSeq, err := e.stageMessageRecords(b, &meta, records)
+	if err != nil {
+		return err
 	}
 	if meta.FIFO && maxSeq > 0 {
 		// The live FIFO send path (adapter/sqs_fifo.go: loadFifoSequence
@@ -235,10 +262,126 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 	return nil
 }
 
+// stageMessageRecords iterates the (pre-validated, pre-sorted) records
+// and stages each one's data + side records on b, returning the
+// maximum SequenceNumber observed (used to write the FIFO seq counter).
+// Split out of encodeQueueMessages so the parent stays under cyclop.
+func (e *SQSRecordEncoder) stageMessageRecords(b *snapshotBuilder, meta *sqsQueueMetaPublic, records []sqsMessageRecord) (uint64, error) {
+	var maxSeq uint64
+	for i := range records {
+		seq, err := e.addMessage(b, meta.Name, records[i].Partition, records[i])
+		if err != nil {
+			return 0, err
+		}
+		if err := e.addSideRecords(b, meta.Name, records[i].Partition, meta, &records[i]); err != nil {
+			return 0, err
+		}
+		if seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	return maxSeq, nil
+}
+
+// validatePartitioning runs the four fail-closed gates from the M5-3
+// design doc §"Validation invariants" before any message is staged.
+// All four use raw meta.PartitionCount > 1 as the partitioned-queue
+// predicate, never effectivePartitionCount (codex P2 v914 v7).
+func validatePartitioning(meta *sqsQueueMetaPublic, records []sqsMessageRecord) error {
+	for i := range records {
+		if err := validatePartitioningOne(meta, &records[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validatePartitioningOne checks one message against the four gates.
+// Split out of validatePartitioning so the outer loop stays under the
+// cyclop limit.
+func validatePartitioningOne(meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
+	if meta.PartitionCount > 1 {
+		return validatePartitioningPartitioned(meta, rec)
+	}
+	// Classic queue (PartitionCount <= 1): the only invalid state is
+	// a non-zero Partition field — the dump is internally
+	// inconsistent (classic-queue keyspace has no partition concept).
+	if rec.Partition != nil && *rec.Partition != 0 {
+		return errors.Wrapf(ErrSQSEncodeInvalidMessage,
+			"queue %q (partition_count=%d): classic queue message %q has partition=%d",
+			meta.Name, meta.PartitionCount, rec.MessageID, *rec.Partition)
+	}
+	return nil
+}
+
+// validatePartitioningPartitioned runs the three partitioned-queue
+// gates (missing partition, out-of-range, perQueue routing mismatch).
+// Caller has already verified meta.PartitionCount > 1.
+func validatePartitioningPartitioned(meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
+	// Gate 1: missing partition. Pre-M5-3 dump replayed against a
+	// partitioned queue, or M5-3 decoder bug. The operator must
+	// re-decode with an M5-3 decoder.
+	if rec.Partition == nil {
+		return errors.Wrapf(ErrSQSEncodeMissingPartition,
+			"queue %q (partition_count=%d): message %q missing partition field",
+			meta.Name, meta.PartitionCount, rec.MessageID)
+	}
+	// Gate 2: out-of-range partition. Dump is malformed.
+	if *rec.Partition >= meta.PartitionCount {
+		return errors.Wrapf(ErrSQSEncodeOutOfRangePartition,
+			"queue %q (partition_count=%d): message %q partition=%d out of range",
+			meta.Name, meta.PartitionCount, rec.MessageID, *rec.Partition)
+	}
+	// Gate 3: perQueue HT-FIFO with nonzero partition. The live
+	// partitionFor collapses every group to partition 0 in perQueue
+	// mode; accepting any other partition would write to a lane the
+	// live receive never scans.
+	if meta.FifoThroughputLimit == sqsFifoThroughputPerQueue && *rec.Partition != 0 {
+		return errors.Wrapf(ErrSQSEncodePartitionRoutingMismatch,
+			"queue %q (partition_count=%d, fifo_throughput_limit=%q): message %q partition=%d, want 0",
+			meta.Name, meta.PartitionCount, meta.FifoThroughputLimit, rec.MessageID, *rec.Partition)
+	}
+	return nil
+}
+
+// sortMessagesForPartitionedEmit sorts messages by
+// (partition, send_timestamp_millis, sequence_number, message_id).
+// Partition is the leading key so per-partition state (maxSeq, future
+// counters) is computed deterministically; the remaining three fields
+// match sortMessagesForEmit (sqs.go:842) for the classic path.
+// validatePartitioning ensures Partition is non-nil whenever the
+// caller invokes this fn (PartitionCount > 1), so the *rec.Partition
+// dereference is safe.
+func sortMessagesForPartitionedEmit(msgs []sqsMessageRecord) {
+	partitionOf := func(r *sqsMessageRecord) uint32 {
+		if r.Partition == nil {
+			return 0
+		}
+		return *r.Partition
+	}
+	sort.SliceStable(msgs, func(i, j int) bool {
+		a, b := &msgs[i], &msgs[j]
+		pa, pb := partitionOf(a), partitionOf(b)
+		switch {
+		case pa != pb:
+			return pa < pb
+		case a.SendTimestampMillis != b.SendTimestampMillis:
+			return a.SendTimestampMillis < b.SendTimestampMillis
+		case a.SequenceNumber != b.SequenceNumber:
+			return a.SequenceNumber < b.SequenceNumber
+		default:
+			return a.MessageID < b.MessageID
+		}
+	})
+}
+
 // addMessage stages one !sqs|msg|data| record and returns the message's
 // sequence number (for the seq-counter computation). Visibility state is
 // zeroed (every message restores visible), matching the decoder default.
-func (e *SQSRecordEncoder) addMessage(b *snapshotBuilder, queueName string, rec sqsMessageRecord) (uint64, error) {
+// partition is non-nil only when the queue is partitioned
+// (meta.PartitionCount > 1); validatePartitioning enforces this
+// invariant before encodeQueueMessages invokes addMessage.
+func (e *SQSRecordEncoder) addMessage(b *snapshotBuilder, queueName string, partition *uint32, rec sqsMessageRecord) (uint64, error) {
 	if rec.MessageID == "" {
 		return 0, errors.Wrap(ErrSQSEncodeInvalidMessage, "message missing message_id")
 	}
@@ -265,7 +408,12 @@ func (e *SQSRecordEncoder) addMessage(b *snapshotBuilder, queueName string, rec 
 	if err != nil {
 		return 0, err
 	}
-	key := sqsMsgDataKeyBytes(queueName, sqsRestoreGeneration, rec.MessageID)
+	var key []byte
+	if partition != nil {
+		key = sqsPartitionedMsgDataKeyBytes(queueName, *partition, sqsRestoreGeneration, rec.MessageID)
+	} else {
+		key = sqsMsgDataKeyBytes(queueName, sqsRestoreGeneration, rec.MessageID)
+	}
 	if err := b.Add(key, val, 0); err != nil {
 		return 0, err
 	}
