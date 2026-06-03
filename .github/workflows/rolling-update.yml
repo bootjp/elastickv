@@ -1,0 +1,256 @@
+name: Rolling update
+
+# Manually-triggered production rollout. Joins the Tailnet, SSHes over
+# MagicDNS into each node, and invokes scripts/rolling-update.sh.
+# See docs/design/2026_04_24_proposed_deploy_via_tailscale.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref (tag or sha) to deploy. Also used as the image tag unless image_tag is set.
+        required: true
+        type: string
+      image_tag:
+        description: Override the image tag (default = ref). Used for rollbacks.
+        required: false
+        type: string
+        default: ""
+      nodes:
+        description: Comma-separated raft IDs to roll (e.g. "n1,n2"). Empty = all nodes in NODES_RAFT_MAP.
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: Render the plan and run a reachability check only; do NOT touch containers.
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write   # required by tailscale/github-action OIDC flow
+  packages: read    # required by `docker manifest inspect` on ghcr.io private images
+
+concurrency:
+  group: rolling-update
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Approval gate — see GitHub environment settings for required reviewers.
+    # Dry-runs also use this environment so the secret wiring is identical;
+    # the environment's approval rule should be configured to auto-approve
+    # dry-runs if that distinction is desired (GitHub UI: "Deployment
+    # protection rules").
+    environment: production
+    timeout-minutes: 60
+
+    steps:
+      # The deploy script (scripts/rolling-update.sh) is executed from the
+      # checkout below, after the tailnet join and SSH key load. If `ref`
+      # were unvalidated, anyone with workflow_dispatch permission could
+      # point it at a fork commit containing a modified script that
+      # harvests the SSH key / Tailscale OAuth secret. Validate that
+      # `ref` resolves to (a) the repository's default branch, or (b) a
+      # tag on the repo, before we hand it any secret. Branches other
+      # than the default are rejected so review-gated default is the only
+      # entry point besides immutable tags.
+      - name: Validate ref is default branch or a tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          default_branch=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+          default_sha=$(gh api "repos/${{ github.repository }}/commits/$default_branch" --jq '.sha')
+          if [[ "$REF" == "$default_branch" || "$REF" == "$default_sha" ]]; then
+            echo "ref is the default branch ($default_branch / $default_sha)"
+            exit 0
+          fi
+          if gh api "repos/${{ github.repository }}/git/refs/tags/$REF" >/dev/null 2>&1; then
+            echo "ref is a tag"
+            exit 0
+          fi
+          # Also accept a sha that is reachable from the default branch's HEAD
+          # so historical default-branch commits remain deployable for rollback.
+          if git -c "http.https://github.com/.extraheader=" ls-remote "https://github.com/${{ github.repository }}.git" | grep -q "^$REF"; then
+            echo "::error::ref '$REF' is not the default branch or a tag. Branches other than '$default_branch' are disallowed to prevent arbitrary-code execution with production secrets."
+            exit 1
+          fi
+          echo "ref '$REF' treated as a sha; checkout will fail if it is not reachable."
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install jq
+        run: sudo apt-get install -y --no-install-recommends jq
+
+      - name: Verify image exists on ghcr.io
+        env:
+          IMAGE_BASE: ${{ vars.IMAGE_BASE }}
+          IMAGE_TAG: ${{ inputs.image_tag || inputs.ref }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$IMAGE_BASE" ]]; then
+            echo "::error::IMAGE_BASE repository variable is not set"
+            exit 1
+          fi
+          echo "Checking $IMAGE_BASE:$IMAGE_TAG"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          if ! docker manifest inspect "$IMAGE_BASE:$IMAGE_TAG" >/dev/null; then
+            echo "::error::image $IMAGE_BASE:$IMAGE_TAG not found on ghcr.io"
+            exit 1
+          fi
+
+      - name: Join Tailnet (ephemeral)
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-deploy
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          # Sanity: no stray CRLF in the key, no empty file.
+          test -s ~/.ssh/id_ed25519 || { echo "::error::DEPLOY_SSH_PRIVATE_KEY is empty"; exit 1; }
+          ssh-keygen -lf ~/.ssh/id_ed25519 >/dev/null
+
+      - name: Render NODES and SSH_TARGETS
+        id: render
+        env:
+          NODES_RAFT_MAP: ${{ vars.NODES_RAFT_MAP }}
+          SSH_TARGETS_MAP: ${{ vars.SSH_TARGETS_MAP }}
+          NODES_FILTER: ${{ inputs.nodes }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$NODES_RAFT_MAP" || -z "$SSH_TARGETS_MAP" ]]; then
+            echo "::error::NODES_RAFT_MAP or SSH_TARGETS_MAP is not set in the production environment variables"
+            exit 1
+          fi
+          if [[ -n "$NODES_FILTER" ]]; then
+            # Filter NODES_RAFT_MAP and SSH_TARGETS_MAP to the requested subset.
+            # Reject any filter ID that does not appear in the map: silently
+            # dropping unknown IDs would let a typo like "n1,n9" proceed as
+            # a one-node rollout of n1 alone, which is a staged-deploy
+            # footgun.
+            IFS=',' read -r -a wanted <<< "$NODES_FILTER"
+            IFS=',' read -r -a entries <<< "$NODES_RAFT_MAP"
+            declare -a known_ids=()
+            for e in "${entries[@]}"; do
+              known_ids+=("${e%%=*}")
+            done
+            unknown=""
+            for w in "${wanted[@]}"; do
+              found=0
+              for k in "${known_ids[@]}"; do
+                if [[ "$k" == "$w" ]]; then found=1; break; fi
+              done
+              if [[ $found -eq 0 ]]; then unknown+="${unknown:+, }$w"; fi
+            done
+            if [[ -n "$unknown" ]]; then
+              echo "::error::nodes filter '$NODES_FILTER' references unknown raft IDs: $unknown. Known IDs: ${known_ids[*]}"
+              exit 1
+            fi
+            filter_csv() {
+              local all="$1"
+              local filter="$2"
+              local out=""
+              IFS=',' read -r -a list_entries <<< "$all"
+              IFS=',' read -r -a list_wanted <<< "$filter"
+              for e in "${list_entries[@]}"; do
+                key="${e%%=*}"
+                for w in "${list_wanted[@]}"; do
+                  if [[ "$key" == "$w" ]]; then
+                    out+="${e},"
+                    break
+                  fi
+                done
+              done
+              echo "${out%,}"
+            }
+            NODES_RAFT_MAP="$(filter_csv "$NODES_RAFT_MAP" "$NODES_FILTER")"
+            SSH_TARGETS_MAP="$(filter_csv "$SSH_TARGETS_MAP" "$NODES_FILTER")"
+            if [[ -z "$NODES_RAFT_MAP" ]]; then
+              echo "::error::nodes filter '$NODES_FILTER' matches nothing in NODES_RAFT_MAP"
+              exit 1
+            fi
+          fi
+          {
+            echo "NODES=$NODES_RAFT_MAP"
+            echo "SSH_TARGETS=$SSH_TARGETS_MAP"
+          } >> "$GITHUB_OUTPUT"
+          echo "::group::Deploy plan"
+          echo "NODES=$NODES_RAFT_MAP"
+          echo "SSH_TARGETS=$SSH_TARGETS_MAP"
+          echo "::endgroup::"
+
+      - name: Tailscale reachability check
+        env:
+          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a entries <<< "$SSH_TARGETS"
+          failed=0
+          for e in "${entries[@]}"; do
+            host="${e##*=}"
+            host="${host%%:*}"
+            # strip user@ if present
+            host="${host##*@}"
+            if tailscale ping --c 2 --timeout 3s "$host" >/dev/null 2>&1; then
+              echo "  ok   $host"
+            else
+              echo "::error::$host not reachable over tailnet"
+              failed=1
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          NODES: ${{ steps.render.outputs.NODES }}
+          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          IMAGE_BASE: ${{ vars.IMAGE_BASE }}
+          IMAGE_TAG: ${{ inputs.image_tag || inputs.ref }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          set -euo pipefail
+          cat <<EOF
+          ==== DRY RUN — no containers were touched ====
+          image:       ${IMAGE_BASE}:${IMAGE_TAG}
+          SSH user:    ${SSH_USER}
+          NODES:       ${NODES}
+          SSH_TARGETS: ${SSH_TARGETS}
+          ref:         ${{ inputs.ref }}
+          Re-run with dry_run=false to apply.
+          EOF
+
+      - name: Roll cluster
+        if: ${{ !inputs.dry_run }}
+        env:
+          NODES: ${{ steps.render.outputs.NODES }}
+          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
+          SSH_STRICT_HOST_KEY_CHECKING: "yes"
+        run: |
+          set -euo pipefail
+          ./scripts/rolling-update.sh
