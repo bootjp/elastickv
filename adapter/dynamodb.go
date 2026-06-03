@@ -1453,7 +1453,7 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 		return d.finishItemWriteAttempt(ctx, tableName, pending.plan)
 	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
-		return d.resolveReuseWriteConflict(ctx, pending, commitTS, dispErr)
+		return d.resolveReuseWriteConflict(ctx, tableName, pending, commitTS, dispErr)
 	}
 	if isRetryableTransactWriteError(dispErr) {
 		// Still ambiguous (e.g. TxnLocked): this reuse may itself have landed,
@@ -1473,6 +1473,7 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 // txn — drop pending so the next iteration recomputes from a fresh read.
 func (d *DynamoDBServer) resolveReuseWriteConflict(
 	ctx context.Context,
+	tableName string,
 	pending *reusableItemWrite,
 	commitTS uint64,
 	dispErr error,
@@ -1489,7 +1490,11 @@ func (d *DynamoDBServer) resolveReuseWriteConflict(
 			return nil, nil, errors.Wrap(perr, "dynamodb item-write: self-conflict probe")
 		}
 		if landed {
-			return pending.plan, nil, nil
+			// The reuse landed at commitTS. Run the SAME generation fence +
+			// cleanup the normal success path runs (finishItemWriteAttempt), so
+			// a table dropped/recreated under us cleans up the landed write and
+			// recomputes instead of returning a stale plan (coderabbit major).
+			return d.finishItemWriteAttempt(ctx, tableName, pending.plan)
 		}
 	}
 	// Probe missed (or no probe key): a genuine cross-writer conflict. dispErr
