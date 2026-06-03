@@ -292,6 +292,13 @@
       (assoc this :ddb (make-ddb-client host port))))
 
   (setup! [this _test]
+    ;; No DescribeTable poll loop is needed: elastickv's adapter
+    ;; returns TableStatus=ACTIVE synchronously in the CreateTable
+    ;; response (adapter/dynamodb.go:779-783), so the table is
+    ;; queryable as soon as create-one-table! returns.  Real DynamoDB's
+    ;; CreateTable is async and would need a poll; if this workload is
+    ;; ever pointed at a real DynamoDB endpoint, add a DescribeTable
+    ;; loop here (claude[bot] design note on PR #916 c46b2b5e).
     (create-all-tables! ddb))
 
   (teardown! [_this _test]
