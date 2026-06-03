@@ -1,7 +1,7 @@
 # Idempotent FSM Snapshot Restore on Cold Start
 
-**Status**: Proposal (Round 5 — import-cycle fix + cover the local snapshot path)
-**Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4 / 5)
+**Status**: Proposal (Round 6 — thread tok.CRC32C through the skip path)
+**Date**: 2026-06-02 (round 1), 2026-06-03 (rounds 2 / 3 / 4 / 5 / 6)
 **Author**: bootjp
 **Related**: PR #909 (`HEALTH_TIMEOUT_SECONDS` 60s → 300s)
 
@@ -265,8 +265,11 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
         if fsmAlreadyAtIndex(fsm, tok.Index) {
             // The body restore is skipped, but we MUST still consume
             // the v1/v2 snapshot header so the FSM picks up the HLC
-            // ceiling AND the Stage 8a cutover (see §5).
-            return applyHeaderStateOnSkip(fsm, fsmSnapPath(fsmSnapDir, tok.Index))
+            // ceiling AND the Stage 8a cutover (see §5).  Thread
+            // tok.CRC32C through so the skip path verifies the file
+            // before mutating FSM state, matching the existing
+            // openAndRestoreFSMSnapshot safety contract.
+            return applyHeaderStateOnSkip(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
         }
         return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
     }
@@ -348,40 +351,113 @@ the Go toolchain rejects.  The seam therefore pushes the file open AND
 the `ReadSnapshotHeader` call **into the FSM implementation**, so
 `wal_store.go` never names the `kv` package:
 
+**CRC verification constraint (round-6 fix, codex P1)**.
+`openAndRestoreFSMSnapshot` (`fsm_snapshot_file.go`) protects FSM state
+from corrupt snapshots with a three-step verification *before* calling
+`fsm.Restore`:
+
+1. `info.Size() < fsmMinFileSize` → `ErrFSMSnapshotTooSmall`.
+2. `readFSMFooter(f, info.Size())` → 4-byte CRC32C footer; compare to
+   `tokenCRC` from the WAL snapshot token → `ErrFSMSnapshotTokenCRC`
+   on mismatch (catches wrong-file / token-vs-content drift).
+3. `restoreAndComputeCRC(f, info.Size(), fsm)` reads the whole body
+   through a `crc32` `TeeReader` and compares the computed CRC to the
+   footer → `ErrFSMSnapshotFileCRC` on mismatch (catches bit rot
+   anywhere in the file).
+
+Side-effects on the FSM only run inside `restoreAndComputeCRC`'s
+`fsm.Restore` callback, so any pre-step failure cleanly aborts before
+mutating state.
+
+The round-5 `ApplySnapshotHeaderFromFile(snapPath)` shape does **none**
+of this.  A corrupt `.fsm` file or a wrong-token pairing would let the
+skip path silently install a bogus HLC ceiling / Stage 8a cutover
+(`f.hlc.SetPhysicalCeiling(int64(ceiling))`, `f.restoredCutover =
+cutover`).  Worse, a too-short / truncated file would be parsed by
+`ReadSnapshotHeader` as headerless legacy and silently apply
+`ceiling=0, cutover=0`.
+
+Round-6 mirrors the existing safety contract by threading
+`tok.CRC32C` through to the FSM and running the same three checks
+**before** applying any side-effect:
+
 ```go
 // internal/raftengine/etcd/wal_store.go (new) -- never imports kv
-func applyHeaderStateOnSkip(fsm StateMachine, snapPath string) error {
+func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) error {
     setter, ok := fsm.(SnapshotHeaderApplier)
     if !ok {
         return nil // FSM has no header state; skip is harmless.
     }
-    return errors.WithStack(setter.ApplySnapshotHeaderFromFile(snapPath))
+    return errors.WithStack(setter.ApplySnapshotHeaderFromFile(snapPath, tokenCRC))
 }
 
 // internal/raftengine/statemachine.go (new, sibling to ApplyIndexAware)
 type SnapshotHeaderApplier interface {
     // ApplySnapshotHeaderFromFile opens the snapshot file at snapPath,
-    // consumes its v1/v2 header via the FSM's existing header parser,
-    // and applies the same side-effects the FSM's Restore would apply
-    // for that header (HLC ceiling, Stage 8a cutover, etc.). The
-    // implementation MUST NOT consume any post-header bytes. Returns
-    // ErrSnapshotHeaderUnknownMagic / InvalidLength for fail-closed
-    // forward-incompat handling.
-    ApplySnapshotHeaderFromFile(snapPath string) error
+    // verifies size + footer-vs-tokenCRC + full-body-CRC (matching
+    // openAndRestoreFSMSnapshot's safety contract), then applies the
+    // header side-effects the FSM's Restore would apply (HLC ceiling,
+    // Stage 8a cutover, etc.). Returns ErrFSMSnapshotTooSmall /
+    // ErrFSMSnapshotTokenCRC / ErrFSMSnapshotFileCRC for the
+    // corresponding verification failures, or
+    // ErrSnapshotHeaderUnknownMagic / InvalidLength for
+    // forward-incompat headers. MUST NOT mutate FSM state on any
+    // verification failure.
+    ApplySnapshotHeaderFromFile(snapPath string, tokenCRC uint32) error
 }
 
 // kv/fsm.go (new method on kvFSM) -- kv.ReadSnapshotHeader stays inside kv
-func (f *kvFSM) ApplySnapshotHeaderFromFile(snapPath string) error {
+func (f *kvFSM) ApplySnapshotHeaderFromFile(snapPath string, tokenCRC uint32) error {
     file, err := os.Open(snapPath)
-    if err != nil { return errors.WithStack(err) }
+    if err != nil { return statFSMFileError(err) }
     defer file.Close()
-    ceiling, cutover, err := ReadSnapshotHeader(bufio.NewReader(file))
-    if err != nil {
-        // Includes ErrSnapshotHeaderUnknownMagic / InvalidLength.
-        // Fail closed -- the operator must upgrade rather than have
-        // us silently skip a forward-incompatible header.
+
+    info, err := file.Stat()
+    if err != nil { return errors.WithStack(err) }
+
+    // Step 1: size check (matches openAndRestoreFSMSnapshot).
+    if info.Size() < fsmMinFileSize {
+        return errors.Wrapf(ErrFSMSnapshotTooSmall,
+            "file too small: %d bytes (minimum %d)", info.Size(), fsmMinFileSize)
+    }
+
+    // Step 2: footer vs tokenCRC (cheap; catches wrong-file / token drift).
+    footer, err := readFSMFooter(file, info.Size())
+    if err != nil { return err }
+    if footer != tokenCRC {
+        return errors.Wrapf(ErrFSMSnapshotTokenCRC,
+            "path=%s footer=%08x token=%08x", snapPath, footer, tokenCRC)
+    }
+
+    // Step 3: full-body CRC, with the header parsed inside the tee'd
+    // reader so its bytes are included in the computed CRC. We
+    // intentionally drain (Discard) the body bytes -- the body is
+    // already present in fsm.db (that's why we're skipping the
+    // restore), but the CRC must cover the whole payload for the
+    // ErrFSMSnapshotFileCRC check to mean what it does in
+    // openAndRestoreFSMSnapshot.
+    if _, err := file.Seek(0, io.SeekStart); err != nil {
         return errors.WithStack(err)
     }
+    payloadSize := info.Size() - fsmFooterSize
+    h := crc32.New(crc32cTable)
+    tee := io.TeeReader(io.LimitReader(file, payloadSize), h)
+    br := bufio.NewReaderSize(tee, fsmRestoreReadAhead)
+
+    ceiling, cutover, herr := ReadSnapshotHeader(br)
+    if herr != nil {
+        // ErrSnapshotHeaderUnknownMagic / InvalidLength: fail closed.
+        return errors.WithStack(herr)
+    }
+    if _, err := io.Copy(io.Discard, br); err != nil {
+        return errors.WithStack(err)
+    }
+    if h.Sum32() != footer {
+        return errors.Wrapf(ErrFSMSnapshotFileCRC,
+            "path=%s footer=%08x computed=%08x", snapPath, footer, h.Sum32())
+    }
+
+    // All three checks passed; apply side-effects.
     if f.hlc != nil && ceiling > 0 {
         f.hlc.SetPhysicalCeiling(int64(ceiling))
     }
@@ -390,12 +466,23 @@ func (f *kvFSM) ApplySnapshotHeaderFromFile(snapPath string) error {
 }
 ```
 
+**Cost note**.  Step 3 reads the full snapshot file once.  For multi-GiB
+FSMs this is a non-trivial I/O cost — but it is **strictly cheaper**
+than the restore path it replaces (which also reads the file once via
+`restoreAndComputeCRC` AND additionally writes a temp Pebble database
+with sstable / WAL output).  Observed restore wall-clock is dominated
+by Pebble writes, not reads; eliding the writes preserves the bulk of
+the win.  A future optimisation could persist the HLC ceiling +
+cutover durably (analogous to `metaAppliedIndex`) and elide the file
+read entirely — that's out of scope for this proposal but flagged
+under Open Questions.
+
 By keeping the `kv.ReadSnapshotHeader` call inside `kv/fsm.go` the
 skip path inherits v1 + v2 parity, the `ErrSnapshotHeaderUnknownMagic`
 fail-closed branch, and any future v3 the snapshot header gains —
-without `wal_store.go` ever naming the `kv` package.  Cost: a single
-`bufio.NewReader(file)` + ~26-byte read.  We do **not** consume any
-of the inner-store payload — `file` is closed before returning.
+without `wal_store.go` ever naming the `kv` package.  The body bytes
+are read (for the CRC pass) but discarded — `file` is closed before
+returning, and no inner-store mutation occurs.
 
 ### 6. Crash-safety argument
 
@@ -690,7 +777,7 @@ restoreSnapshotState skipped (FSM at index %d, snapshot at %d, ceiling=%d, cutov
 |---|---|---|
 | **B1** (this PR) | Design doc | None |
 | **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` + `pebbleStore.SetDurableAppliedIndex()` (both with `dbMu.RLock()`) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2679`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
-| **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip` reusing `kv.ReadSnapshotHeader` + `SnapshotHeaderApplier` seam on `kvFSM` + metrics + INFO log | **User-visible cold-start win.** |
+| **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip(snapPath, tok.CRC32C)` mirroring the three-step verification of `openAndRestoreFSMSnapshot` (size + footer-vs-tokenCRC + full-body-CRC) + `SnapshotHeaderApplier.ApplySnapshotHeaderFromFile(snapPath, tokenCRC)` on `kvFSM` + metrics + INFO log | **User-visible cold-start win.** |
 | **B4** | Lower `HEALTH_TIMEOUT_SECONDS` default once production data shows steady-state skip rate ≥ 90 % | Tighter ceiling; the env override remains honoured. |
 
 Each of B2–B3 ships behind tests:
@@ -714,7 +801,20 @@ Each of B2–B3 ships behind tests:
   test asserts that `applyHeaderStateOnSkip` sets
   `f.hlc.PhysicalCeiling()` **and** `f.restoredCutover` for both v1
   and v2 snapshot headers — the ceiling+cutover are invariant under
-  the optimisation.  An idle-cluster integration test runs a 3-node cluster with
+  the optimisation.  Three additional CRC-corruption tests (round-6,
+  one per failure mode) inject the corruption and assert the
+  specific typed error surfaces from `ApplySnapshotHeaderFromFile`
+  WITHOUT mutating `f.hlc` or `f.restoredCutover`:
+  - Truncate the `.fsm` file below `fsmMinFileSize` →
+    `ErrFSMSnapshotTooSmall`.
+  - Pair the file with a wrong-token CRC →
+    `ErrFSMSnapshotTokenCRC`.
+  - Flip one body byte (post-header) →
+    `ErrFSMSnapshotFileCRC` (round-6's full-body CRC pass catches
+    this; without round-6 the skip would silently install state
+    from a corrupt file).
+
+  An idle-cluster integration test runs a 3-node cluster with
   `ELASTICKV_RAFT_SNAPSHOT_COUNT=10` (overriding the default
   `defaultSnapshotEvery = 10000` at `engine.go:93` so the scenario is
   tractable — at default + `hlcRenewalInterval = 1 s` an idle period
@@ -738,6 +838,20 @@ Each of B2–B3 ships behind tests:
   cluster-membership token), `SnapshotHeaderApplier` needs an
   additional method; the §3.2 read-path doc updates first, then this
   proposal extends.
+- **Persist HLC ceiling + cutover durably to elide the snapshot file
+  read entirely** (codex round-5 P1 follow-up).  The round-6 fix
+  reads the whole snapshot file on the skip path (~6 s for a 6 GiB
+  FSM at 1 GiB/s SSD read, versus ~46 s observed for restore).
+  Persisting `metaHLCCeiling` + `metaRestoredCutover` alongside
+  `metaAppliedIndex` would let the skip path consult the pebble
+  store directly and skip the file read entirely — collapsing
+  cold-start to single-digit ms.  Bundling the new meta keys
+  atomically requires plumbing through the same Apply paths as
+  `metaAppliedIndex` plus a write at `Restore` time and at every
+  HLC lease apply (or at every snapshot persist via the
+  round-4/5 hook sites).  Deferred because the round-6 design is
+  already correct and useful; this is a follow-up performance
+  optimisation, not a correctness fix.
 
 ## Out of Scope (future)
 
@@ -872,3 +986,46 @@ round-5 (push the file-open and the kv-package call **into** the FSM
 implementation) is structurally identical to how `ApplyIndexAware` was
 shaped to deliver `entry.Index` without importing kv — an existing
 template that round-3 / round-4 ignored.
+
+## Round-5 retraction (codex round-5 P1)
+
+Round 5 of this doc introduced the `SnapshotHeaderApplier` seam with
+the signature `ApplySnapshotHeaderFromFile(snapPath string) error` —
+no CRC verification.  Codex's round-5 review (P1) correctly pointed
+out that the existing `openAndRestoreFSMSnapshot`
+(`internal/raftengine/etcd/fsm_snapshot_file.go:262`) guards FSM state
+from corrupt snapshots with a three-step verification *before*
+calling `fsm.Restore`:
+
+1. `fsmMinFileSize` check → `ErrFSMSnapshotTooSmall`.
+2. footer-vs-`tokenCRC` → `ErrFSMSnapshotTokenCRC` on mismatch
+   (catches wrong-file / metadata corruption).
+3. full-body CRC vs footer → `ErrFSMSnapshotFileCRC` on mismatch
+   (catches bit rot anywhere in the file).
+
+The round-5 skip path bypassed all three.  A corrupt or wrong-file
+snapshot could silently install bogus HLC ceiling / Stage 8a cutover,
+or — worse — be parsed by `ReadSnapshotHeader` as headerless legacy
+and silently apply `ceiling=0, cutover=0` for a too-short file.
+
+Round 6 threads `tok.CRC32C` through `applyHeaderStateOnSkip` and
+`SnapshotHeaderApplier.ApplySnapshotHeaderFromFile`, and the §5
+pseudocode runs the same three-step verification before applying any
+side-effect.  Cost: one extra full-file read on the skip path — still
+strictly cheaper than the restore path it replaces (the same read
+happens during `restoreAndComputeCRC`, plus restore additionally
+writes a temp Pebble database via `restoreBatchLoopInto`).
+
+A follow-up optimisation that persists the HLC ceiling + cutover as
+durable meta keys (analogous to `metaAppliedIndex`) would let the
+skip path elide the file read entirely; flagged under Open Questions
+but not part of this proposal.
+
+Lesson: when a §X seam takes over a side-effect previously gated by
+existing fail-closed checks, **inventory those checks first and
+mirror them in the new path**.  Round 5 moved the `ReadSnapshotHeader`
+call into the FSM (which was the right structural fix for import
+cycles) but lost sight of the CRC verification it was implicitly
+inheriting from `openAndRestoreFSMSnapshot`.  Reading the existing
+restore path end-to-end before pseudocoding a replacement would have
+surfaced this.
