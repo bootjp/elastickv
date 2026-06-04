@@ -71,6 +71,18 @@ fi
 # the elastickv-route-key Go helper rather than inlined in shell so
 # the base64 encoding stays in sync with adapter/dynamodb.go's
 # encodeDynamoSegment (codex P1 #1 on PR #905 ffb9c73f).
+#
+# When --no-rebuild is set, every helper binary must already exist
+# from a previous run; fail fast with a clear message rather than
+# letting `set -e` swallow a misleading 'No such file or directory'
+# (gemini medium on PR #924).
+for bin in "$ROUTE_KEY_BIN" "$LIST_ROUTES_BIN" "$BINARY"; do
+  if [ ! -x "$bin" ]; then
+    echo "[error] required helper not found at $bin." >&2
+    echo "        Re-run without --no-rebuild to compile the helpers." >&2
+    exit 1
+  fi
+done
 T1_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t1)"
 T3_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t3)"
 # Group 1: [T1_KEY, T3_KEY) — tables 1, 2
@@ -93,6 +105,14 @@ stop_cluster() {
 
 # ---- start cluster: ONE process hosting both groups ----
 if ! $NO_CLUSTER; then
+  # Install the cleanup hook BEFORE starting the cluster so an
+  # exception during launch (e.g. bind-port collision) still
+  # tears down the half-started state.  EXIT covers normal flow,
+  # INT/TERM cover user Ctrl-C and CI cancellation.  Without
+  # this the failure path leaks background processes that hold
+  # the Raft / Dynamo ports for the next run (gemini medium on
+  # PR #924).
+  trap stop_cluster EXIT INT TERM
   stop_cluster
   rm -rf "$DATA_DIR"
   mkdir -p "$DATA_DIR"
@@ -134,7 +154,10 @@ if ! $NO_CLUSTER; then
 
   echo "[cluster] waiting for Dynamo endpoint ($DYNAMO_ADDR)..."
   for i in $(seq 1 90); do
-    if nc -z 127.0.0.1 63801; then
+    # Use bash's built-in /dev/tcp probe rather than `nc` so the
+    # script runs on minimal CI images that may not ship netcat
+    # (gemini medium on PR #924).
+    if (echo > /dev/tcp/127.0.0.1/63801) >/dev/null 2>&1; then
       echo "[cluster] up after ${i}s"
       break
     fi
@@ -178,9 +201,11 @@ HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
 EXIT_CODE=${EXIT_CODE:-0}
 
 # ---- teardown ----
-if ! $NO_CLUSTER; then
-  echo "[cluster] stopping..."
-  stop_cluster
-fi
+# Cluster shutdown is handled by the `trap stop_cluster EXIT INT TERM`
+# installed above the cluster launch.  No explicit teardown call is
+# needed here; doing so would double-call stop_cluster on success
+# (harmless but noisy) and double-call on failure (which is also
+# harmless since stop_cluster is idempotent, but the EXIT trap path
+# is the canonical one — see gemini medium on PR #924).
 
 exit "$EXIT_CODE"
