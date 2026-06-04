@@ -51,6 +51,16 @@ done
 
 # ---- build (server + route-key + list-routes helpers) ----
 if ! $NO_REBUILD; then
+  # Pre-flight: cmd/elastickv-list-routes lands in PR #925.  If this
+  # branch is run before #925 merges, `go build` would emit an
+  # opaque package-not-found error.  Surface the cross-PR dependency
+  # in a machine-readable way (claude[bot] suggestion on PR #924).
+  if [ ! -d "$REPO_ROOT/cmd/elastickv-list-routes" ]; then
+    echo "[error] cmd/elastickv-list-routes/ not found in this branch." >&2
+    echo "        PR #924 depends on PR #925 (setup-hook + list-routes CLI)." >&2
+    echo "        Merge #925 first, or check out the integrated branch." >&2
+    exit 1
+  fi
   echo "[build] compiling elastickv server..."
   cd "$REPO_ROOT"
   go build -o "$BINARY" .
@@ -72,10 +82,13 @@ fi
 # the base64 encoding stays in sync with adapter/dynamodb.go's
 # encodeDynamoSegment (codex P1 #1 on PR #905 ffb9c73f).
 #
-# When --no-rebuild is set, every helper binary must already exist
-# from a previous run; fail fast with a clear message rather than
-# letting `set -e` swallow a misleading 'No such file or directory'
-# (gemini medium on PR #924).
+# Guard: every helper binary must exist before continuing.  Runs
+# unconditionally — catches both --no-rebuild (helpers expected from
+# a previous run) AND a fresh-build environment where a helper
+# somehow produced a non-executable.  Failing fast with a clear
+# remediation message is strictly better than letting `set -e`
+# swallow a misleading 'No such file or directory' deeper in the
+# script (gemini medium + claude[bot] minor on PR #924).
 for bin in "$ROUTE_KEY_BIN" "$LIST_ROUTES_BIN" "$BINARY"; do
   if [ ! -x "$bin" ]; then
     echo "[error] required helper not found at $bin." >&2
