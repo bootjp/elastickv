@@ -270,6 +270,66 @@ func TestSQSEncodeGateUsesRawPartitionCount(t *testing.T) {
 	}
 }
 
+// TestSQSEncodeRejectsHashMismatchOnPerMessageGroupId pins gate 5
+// (codex P2 #929). For a perMessageGroupId HT-FIFO queue, the
+// partition value MUST match partitionFor(MessageGroupID). An
+// in-range but wrong partition would split a FIFO group across two
+// partition-scoped group-lock keyspaces and break FIFO order on
+// first read.
+//
+// "g0" hashes (FNV-1a-mod-2) to partition 0; pairing it with
+// partition=1 violates the invariant.
+func TestSQSEncodeRejectsHashMismatchOnPerMessageGroupId(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "p.fifo",
+		[]byte(`{"format_version":1,"name":"p.fifo","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":2,"fifo_throughput_limit":"perMessageGroupId"}`),
+		[][]byte{
+			// group_id="g0" hashes to partition 0; partition=1 is
+			// in-range but inconsistent.
+			[]byte(`{"message_id":"m1","body":"hello",` +
+				`"send_timestamp_millis":1000,"available_at_millis":1000,` +
+				`"message_group_id":"g0","partition":1}`),
+		})
+	b := newSnapshotBuilder(sqsEncTS)
+	err := NewSQSRecordEncoder(in).Encode(b)
+	if !errors.Is(err, ErrSQSEncodePartitionHashMismatch) {
+		t.Fatalf("Encode err = %v, want ErrSQSEncodePartitionHashMismatch", err)
+	}
+}
+
+// TestSQSEncodePartitionForGroup_LiveAdapterParity verifies the
+// internal partitionForGroup mirror matches adapter/sqs_partitioning.go
+// for representative inputs. We cannot import adapter (M3b-3 ban),
+// so this is a parity-by-spec check against the FNV-1a constants.
+func TestSQSEncodePartitionForGroup_LiveAdapterParity(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		meta  *sqsQueueMetaPublic
+		group string
+		want  uint32
+	}{
+		// Classic queue: always 0.
+		{&sqsQueueMetaPublic{PartitionCount: 1}, "anything", 0},
+		// perQueue: always 0 regardless of PartitionCount.
+		{&sqsQueueMetaPublic{PartitionCount: 4, FifoThroughputLimit: sqsFifoThroughputPerQueue}, "g0", 0},
+		// perMessageGroupId, empty group: 0.
+		{&sqsQueueMetaPublic{PartitionCount: 4, FifoThroughputLimit: "perMessageGroupId"}, "", 0},
+		// perMessageGroupId, FNV-1a-mod-2 of "g0" = 0, "g1" = 1.
+		{&sqsQueueMetaPublic{PartitionCount: 2, FifoThroughputLimit: "perMessageGroupId"}, "g0", 0},
+		{&sqsQueueMetaPublic{PartitionCount: 2, FifoThroughputLimit: "perMessageGroupId"}, "g1", 1},
+	}
+	for _, c := range cases {
+		got := partitionForGroup(c.meta, c.group)
+		if got != c.want {
+			t.Errorf("partitionForGroup(meta{PC=%d,limit=%q}, %q) = %d, want %d",
+				c.meta.PartitionCount, c.meta.FifoThroughputLimit, c.group, got, c.want)
+		}
+	}
+}
+
 // TestSQSEncodeClassicQueueWithExplicitPartitionZeroUsesClassicKeys is
 // the regression for codex P1 / gemini critical (PR #929). A classic
 // queue dump with an explicit `"partition": 0` is allowed past gate 4
@@ -474,9 +534,12 @@ func TestSQSEncodePartitionedDedupBuildsGroupSegment(t *testing.T) {
 func TestSQSEncodePartitionedSideRecordsByteCrossCheck(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
+	// groupID "g1" hashes (FNV-1a-mod-2) to partition 1; pair it with
+	// partition=1 so gate 5 (partition-hash consistency for
+	// perMessageGroupId) is satisfied.
 	const (
 		queue   = "p.fifo"
-		groupID = "g0"
+		groupID = "g1"
 		dedupID = "d0"
 		msgID   = "mid-001"
 		sendMs  = int64(2000)
@@ -489,7 +552,7 @@ func TestSQSEncodePartitionedSideRecordsByteCrossCheck(t *testing.T) {
 			`"delay_seconds":0,"partition_count":2,"fifo_throughput_limit":"perMessageGroupId"}`),
 		[][]byte{
 			[]byte(`{"message_id":"mid-001","body":"x","send_timestamp_millis":2000,` +
-				`"available_at_millis":2000,"message_group_id":"g0",` +
+				`"available_at_millis":2000,"message_group_id":"g1",` +
 				`"message_deduplication_id":"d0","sequence_number":1,"partition":1}`),
 		})
 	entries, _, err := DecodeLiveEntries(bytes.NewReader(encodeSQSTree(t, in)))

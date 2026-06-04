@@ -79,6 +79,15 @@ var (
 	// the live receive fan-out never visits — silent data loss on
 	// first read. Codex P2 v914 v4 caught this gap.
 	ErrSQSEncodePartitionRoutingMismatch = errors.New("backup: sqs perQueue HT-FIFO queue must keep all messages on partition 0")
+	// ErrSQSEncodePartitionHashMismatch fires for a perMessageGroupId
+	// HT-FIFO message whose Partition disagrees with
+	// partitionFor(MessageGroupID). The live send/receive/group-lock
+	// path uses partitionFor's FNV-1a-mod-PartitionCount mapping
+	// (adapter/sqs_partitioning.go:64); restoring under the wrong
+	// lane would split a FIFO group across two partition-scoped
+	// group-lock keyspaces and break FIFO order on first read. Codex
+	// P2 #929.
+	ErrSQSEncodePartitionHashMismatch = errors.New("backup: sqs perMessageGroupId HT-FIFO message partition disagrees with partitionFor(message_group_id)")
 )
 
 // sqsStoredQueueMeta mirrors the live adapter's sqsQueueMeta JSON shape
@@ -351,12 +360,58 @@ func validatePartitioningPartitioned(meta *sqsQueueMetaPublic, rec *sqsMessageRe
 	// partitionFor collapses every group to partition 0 in perQueue
 	// mode; accepting any other partition would write to a lane the
 	// live receive never scans.
-	if meta.FifoThroughputLimit == sqsFifoThroughputPerQueue && *rec.Partition != 0 {
-		return errors.Wrapf(ErrSQSEncodePartitionRoutingMismatch,
-			"queue %q (partition_count=%d, fifo_throughput_limit=%q): message %q partition=%d, want 0",
-			meta.Name, meta.PartitionCount, meta.FifoThroughputLimit, rec.MessageID, *rec.Partition)
+	if meta.FifoThroughputLimit == sqsFifoThroughputPerQueue {
+		if *rec.Partition != 0 {
+			return errors.Wrapf(ErrSQSEncodePartitionRoutingMismatch,
+				"queue %q (partition_count=%d, fifo_throughput_limit=%q): message %q partition=%d, want 0",
+				meta.Name, meta.PartitionCount, meta.FifoThroughputLimit, rec.MessageID, *rec.Partition)
+		}
+		return nil
+	}
+	// Gate 5: perMessageGroupId HT-FIFO partition-hash consistency.
+	// For perMessageGroupId queues, the live partitionFor maps each
+	// group_id to one partition via FNV-1a hash; the receivers /
+	// group-lock reader use that partition value to find messages.
+	// A dump line with an in-range but inconsistent partition would
+	// be restored under the wrong lane and split a FIFO group across
+	// two partition-scoped group-lock keyspaces, allowing concurrent
+	// out-of-order delivery. Mirror the hash here. Codex P2 #929.
+	want := partitionForGroup(meta, rec.MessageGroupID)
+	if *rec.Partition != want {
+		return errors.Wrapf(ErrSQSEncodePartitionHashMismatch,
+			"queue %q (partition_count=%d, group_id=%q): message %q partition=%d, partitionFor=%d",
+			meta.Name, meta.PartitionCount, rec.MessageGroupID, rec.MessageID, *rec.Partition, want)
 	}
 	return nil
+}
+
+// partitionForGroup mirrors adapter/sqs_partitioning.go:partitionFor
+// for use by the encoder's validation gate 5. Same FNV-1a 32-bit
+// inlined hash, same masking on (PartitionCount - 1). MUST be a copy
+// (M3b-3 circular-dep ban: internal/backup cannot import adapter).
+// Returns 0 when partitionFor would: classic queues, perQueue mode,
+// or empty MessageGroupID.
+func partitionForGroup(meta *sqsQueueMetaPublic, messageGroupID string) uint32 {
+	if meta == nil || meta.PartitionCount <= 1 {
+		return 0
+	}
+	if meta.FifoThroughputLimit == sqsFifoThroughputPerQueue {
+		return 0
+	}
+	if messageGroupID == "" {
+		return 0
+	}
+	const (
+		fnv32Offset uint32 = 2166136261
+		fnv32Prime  uint32 = 16777619
+	)
+	hash := fnv32Offset
+	for i := 0; i < len(messageGroupID); i++ {
+		hash ^= uint32(messageGroupID[i])
+		hash *= fnv32Prime
+	}
+	// PartitionCount is power-of-two (live validator-enforced).
+	return hash & (meta.PartitionCount - 1)
 }
 
 // sortMessagesForPartitionedEmit sorts messages by
