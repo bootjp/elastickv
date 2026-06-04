@@ -38,7 +38,8 @@ func (c *recordingBatchCoordinator) Dispatch(_ context.Context, req *kv.Operatio
 	return &kv.CoordinateResponse{}, nil
 }
 
-func seedStandardQueue(t *testing.T, st store.MVCCStore, name string) {
+func seedStandardQueue(t *testing.T, st store.MVCCStore) {
+	const name = "q"
 	t.Helper()
 	meta := &sqsQueueMeta{
 		Name:               name,
@@ -62,7 +63,7 @@ func TestSendMessageBatchStandard_RetryReusesStableKeys(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	seedStandardQueue(t, st, "q")
+	seedStandardQueue(t, st)
 
 	coord := &recordingBatchCoordinator{stubAdapterCoordinator: stubAdapterCoordinator{clock: kv.NewHLC()}}
 	srv := &SQSServer{store: st, coordinator: coord}
@@ -92,7 +93,7 @@ func TestSendMessageBatchStandard_VisKeyStableAcrossDelayChange(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	seedStandardQueue(t, st, "q") // DelaySeconds = 0
+	seedStandardQueue(t, st) // DelaySeconds = 0
 
 	coord := &recordingBatchCoordinator{stubAdapterCoordinator: stubAdapterCoordinator{clock: kv.NewHLC()}}
 	coord.beforeDispatch = func(n int) {
@@ -117,6 +118,41 @@ func TestSendMessageBatchStandard_VisKeyStableAcrossDelayChange(t *testing.T) {
 		"vis/by-age keys must stay stable across a mid-retry DelaySeconds change (cached AvailableAtMillis)")
 }
 
+// TestSendMessageBatchStandard_RevalidatesAgainstCurrentMetaOnRetry pins codex
+// P2 round-2: if a prior attempt minted the identity but did NOT commit (lost a
+// normal OCC race) and a concurrent SetQueueAttributes then lowered
+// MaximumMessageSize below the body, the retry must re-validate against the
+// fresh meta and REJECT the entry rather than commit it on the cached identity.
+func TestSendMessageBatchStandard_RevalidatesAgainstCurrentMetaOnRetry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	seedStandardQueue(t, st) // MaximumMessageSize = 262144
+
+	coord := &recordingBatchCoordinator{stubAdapterCoordinator: stubAdapterCoordinator{clock: kv.NewHLC()}}
+	coord.beforeDispatch = func(n int) {
+		if n != 1 {
+			return
+		}
+		// SetQueueAttributes lowers MaximumMessageSize below the body size,
+		// landing during attempt 1's dispatch (which does not commit — it
+		// returns a WriteConflict). The retry then loads this lowered meta
+		// BEFORE re-validating, so the entry must be rejected.
+		meta := &sqsQueueMeta{Name: "q", Generation: 1, MaximumMessageSize: 3}
+		body, err := encodeSQSQueueMeta(meta)
+		require.NoError(t, err)
+		require.NoError(t, st.PutAt(ctx, sqsQueueMetaKey("q"), body, 100, 0))
+	}
+	srv := &SQSServer{store: st, coordinator: coord}
+
+	entries := []sqsSendMessageBatchEntryInput{{Id: "a", MessageBody: "alpha"}} // 5 bytes > new limit 3
+	successful, failed, err := srv.sendMessageBatchWithRetry(ctx, "q", entries)
+	require.NoError(t, err)
+	require.Empty(t, successful, "the retry must re-validate against the lowered limit and reject the entry")
+	require.Len(t, failed, 1)
+	require.Equal(t, "a", failed[0].Id)
+}
+
 // TestSendMessageBatchStandard_ReturnedMessageIdsStableAcrossRetry pins that
 // the MessageIds reported to the client are the ones actually stored on the
 // retry (not a discarded first-attempt set), so a consumer cannot observe a
@@ -125,7 +161,7 @@ func TestSendMessageBatchStandard_ReturnedMessageIdsStableAcrossRetry(t *testing
 	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	seedStandardQueue(t, st, "q")
+	seedStandardQueue(t, st)
 
 	coord := &recordingBatchCoordinator{stubAdapterCoordinator: stubAdapterCoordinator{clock: kv.NewHLC()}}
 	srv := &SQSServer{store: st, coordinator: coord}
