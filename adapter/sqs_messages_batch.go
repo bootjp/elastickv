@@ -121,22 +121,17 @@ func (s *SQSServer) sendMessageBatchWithRetry(
 	queueName string,
 	entries []sqsSendMessageBatchEntryInput,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, error) {
-	// Pre-generate one stable identity per entry BEFORE the retry loop. The
-	// standard-queue path keys each message by its random MessageID (and by
-	// timestamps derived from the send wall-clock), so re-minting per attempt
-	// would land a committed-but-conflicted attempt's messages at one key set
-	// and the retry's at another — double-sending every entry under leader
-	// churn. Reusing the identity makes the retry overwrite the SAME keys
-	// idempotently. Identities are indexed by entry position; FIFO entries
-	// ignore them (they mint their own per-entry dedup-fenced identity).
+	// Per-entry stable identities, indexed by entry position and shared (by
+	// reference) across every retry attempt. The standard-queue path keys each
+	// message by its random MessageID and send-derived timestamps, so re-minting
+	// per attempt would land a committed-but-conflicted attempt's messages at one
+	// key set and the retry's at another — double-sending every entry under
+	// leader churn. The standard path lazily mints each identity on its first
+	// attempt (sendBatchStandardOnce) and reuses it thereafter, so the keys stay
+	// stable. Left zero-valued here: FIFO entries never touch these (they mint
+	// their own per-entry dedup-fenced identity), so FIFO batches pay no
+	// crypto/rand cost for identities they ignore.
 	identities := make([]sqsSendIdentity, len(entries))
-	for i := range identities {
-		id, err := newSendIdentity()
-		if err != nil {
-			return nil, nil, err
-		}
-		identities[i] = id
-	}
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
@@ -206,11 +201,11 @@ func (s *SQSServer) sendBatchStandardOnce(
 	const opsPerEntry = 3
 	elems := make([]*kv.Elem[kv.OP], 0, opsPerEntry*len(entries))
 	for i, entry := range entries {
-		// identities[i] is the stable per-entry identity minted once before
-		// the retry loop; reusing it keeps the storage keys constant across
-		// retries so a committed-but-conflicted attempt is overwritten
-		// idempotently rather than double-sent.
-		rec, recordBytes, apiErr := buildBatchSendRecord(meta, entry, identities[i])
+		// &identities[i] is the stable per-entry identity, lazily minted on the
+		// first attempt and reused on every retry; reusing it keeps the storage
+		// keys constant across retries so a committed-but-conflicted attempt is
+		// overwritten idempotently rather than double-sent.
+		rec, recordBytes, apiErr := buildBatchSendRecord(meta, entry, &identities[i])
 		if apiErr != nil {
 			failed = append(failed, batchErrorEntryFromAPIErr(entry.Id, apiErr))
 			continue
@@ -412,16 +407,16 @@ func (s *SQSServer) resolveFreshFifoSnapshot(ctx context.Context, queueName stri
 // SendMessage would, but returns the *sqsAPIError so the batch path
 // can drop the entry into Failed[] instead of failing the whole
 // request.
-func buildBatchSendRecord(meta *sqsQueueMeta, entry sqsSendMessageBatchEntryInput, id sqsSendIdentity) (*sqsMessageRecord, []byte, error) {
-	if len(entry.MessageBody) == 0 {
-		return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required")
-	}
-	if int64(len(entry.MessageBody)) > meta.MaximumMessageSize {
-		return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
-	}
-	if err := validateMessageAttributes(entry.MessageAttributes); err != nil {
-		return nil, nil, err
-	}
+// buildBatchSendRecord builds one standard-queue batch entry's record, reusing
+// a stable per-entry identity across retries. id points into the caller's
+// identities slice: on the FIRST attempt for this entry (id.messageID == "")
+// it validates, resolves the delay, and mints the identity (capturing
+// AvailableAtMillis from the delay in effect at that moment); on retries it
+// skips validation/resolution and reuses the cached identity, so the storage
+// keys are stable even if a concurrent SetQueueAttributes changes the queue's
+// DelaySeconds between attempts (codex P2). An entry that already committed on a
+// prior attempt is never re-validated against a since-changed meta.
+func buildBatchSendRecord(meta *sqsQueueMeta, entry sqsSendMessageBatchEntryInput, id *sqsSendIdentity) (*sqsMessageRecord, []byte, error) {
 	asSingle := sqsSendMessageInput{
 		MessageBody:            entry.MessageBody,
 		DelaySeconds:           entry.DelaySeconds,
@@ -429,16 +424,39 @@ func buildBatchSendRecord(meta *sqsQueueMeta, entry sqsSendMessageBatchEntryInpu
 		MessageGroupId:         entry.MessageGroupId,
 		MessageDeduplicationId: entry.MessageDeduplicationId,
 	}
+	if id.messageID == "" {
+		// First attempt for this entry: validate, resolve delay, mint identity.
+		minted, err := mintBatchSendIdentity(meta, entry, asSingle)
+		if err != nil {
+			return nil, nil, err
+		}
+		*id = minted
+	}
+	return buildSendRecordWithIdentity(meta, asSingle, *id)
+}
+
+// mintBatchSendIdentity validates one batch entry against the current queue
+// meta, resolves its delay, and mints the stable identity. It runs only on the
+// first attempt for an entry; retries reuse the cached identity so a
+// since-changed meta cannot re-fail an already-committed entry or shift its keys.
+func mintBatchSendIdentity(meta *sqsQueueMeta, entry sqsSendMessageBatchEntryInput, asSingle sqsSendMessageInput) (sqsSendIdentity, error) {
+	if len(entry.MessageBody) == 0 {
+		return sqsSendIdentity{}, newSQSAPIError(http.StatusBadRequest, sqsErrValidation, "MessageBody is required")
+	}
+	if int64(len(entry.MessageBody)) > meta.MaximumMessageSize {
+		return sqsSendIdentity{}, newSQSAPIError(http.StatusBadRequest, sqsErrMessageTooLong, "message body exceeds MaximumMessageSize")
+	}
+	if err := validateMessageAttributes(entry.MessageAttributes); err != nil {
+		return sqsSendIdentity{}, err
+	}
 	if err := validateSendFIFOParams(meta, asSingle); err != nil {
-		return nil, nil, err
+		return sqsSendIdentity{}, err
 	}
 	delay, err := resolveSendDelay(meta, entry.DelaySeconds)
 	if err != nil {
-		return nil, nil, err
+		return sqsSendIdentity{}, err
 	}
-	// Use the caller-supplied stable identity (minted once before the batch
-	// retry loop) so retries reuse the same MessageID/timestamps/keys.
-	return buildSendRecordWithIdentity(meta, asSingle, delay, id)
+	return newSendIdentity(delay)
 }
 
 // ------------------------ DeleteMessageBatch ------------------------

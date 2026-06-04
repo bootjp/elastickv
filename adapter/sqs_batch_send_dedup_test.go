@@ -18,9 +18,15 @@ import (
 type recordingBatchCoordinator struct {
 	stubAdapterCoordinator
 	dispatchKeys [][]string
+	// beforeDispatch, if set, runs at the start of each Dispatch with the
+	// 1-based dispatch number — lets a test mutate queue state between attempts.
+	beforeDispatch func(n int)
 }
 
 func (c *recordingBatchCoordinator) Dispatch(_ context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if c.beforeDispatch != nil {
+		c.beforeDispatch(len(c.dispatchKeys) + 1)
+	}
 	keys := make([]string, 0, len(req.Elems))
 	for _, e := range req.Elems {
 		keys = append(keys, string(e.Key))
@@ -74,6 +80,41 @@ func TestSendMessageBatchStandard_RetryReusesStableKeys(t *testing.T) {
 	require.NotEmpty(t, coord.dispatchKeys[0])
 	require.Equal(t, coord.dispatchKeys[0], coord.dispatchKeys[1],
 		"the retry MUST reuse the same storage keys; fresh MessageIDs would double-send every entry under leader churn")
+}
+
+// TestSendMessageBatchStandard_VisKeyStableAcrossDelayChange pins codex P2:
+// if a SetQueueAttributes changes the queue's DelaySeconds between a
+// committed-but-conflicted attempt and its retry, the retry must still write
+// the SAME vis/by-age keys (AvailableAtMillis is captured in the identity at
+// first mint, not recomputed from the changed delay) — otherwise the first
+// attempt's vis index entry is orphaned and can redeliver the message.
+func TestSendMessageBatchStandard_VisKeyStableAcrossDelayChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	seedStandardQueue(t, st, "q") // DelaySeconds = 0
+
+	coord := &recordingBatchCoordinator{stubAdapterCoordinator: stubAdapterCoordinator{clock: kv.NewHLC()}}
+	coord.beforeDispatch = func(n int) {
+		if n != 2 {
+			return
+		}
+		// SetQueueAttributes raises DelaySeconds to 900 before the retry.
+		meta := &sqsQueueMeta{Name: "q", Generation: 1, MaximumMessageSize: 262144, DelaySeconds: 900}
+		body, err := encodeSQSQueueMeta(meta)
+		require.NoError(t, err)
+		require.NoError(t, st.PutAt(ctx, sqsQueueMetaKey("q"), body, 100, 0))
+	}
+	srv := &SQSServer{store: st, coordinator: coord}
+
+	entries := []sqsSendMessageBatchEntryInput{{Id: "a", MessageBody: "alpha"}} // no per-message DelaySeconds
+	successful, _, err := srv.sendMessageBatchWithRetry(ctx, "q", entries)
+	require.NoError(t, err)
+	require.Len(t, successful, 1)
+
+	require.Len(t, coord.dispatchKeys, 2)
+	require.Equal(t, coord.dispatchKeys[0], coord.dispatchKeys[1],
+		"vis/by-age keys must stay stable across a mid-retry DelaySeconds change (cached AvailableAtMillis)")
 }
 
 // TestSendMessageBatchStandard_ReturnedMessageIdsStableAcrossRetry pins that
