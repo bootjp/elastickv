@@ -1998,6 +1998,15 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 		if err != nil {
 			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.Metadata.Index)
 		}
+		// B3/follow-up: also call SetDurableAppliedIndex(tok.Index) here
+		// after Restore so peer-after-InstallSnapshot populates the meta
+		// key. The local-snapshot persist path already bumps the live
+		// store (engine.persistLocalSnapshotPayload), but the receiving
+		// node's restored store inherits the pre-bump value embedded in
+		// the snapshot artifact. Design Non-Goals §
+		// docs/design/2026_06_02_idempotent_snapshot_restore.md:71-74
+		// scopes this out of Branch 2; see PR #915 round-4/5 codex P2 on
+		// engine.go:4077 for the rationale.
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
 			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
 		}

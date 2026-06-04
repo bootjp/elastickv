@@ -236,20 +236,36 @@ type AppliedIndexReader interface {
 }
 ```
 
-`kvFSM` exposes its store through a typed accessor so wal_store.go can
-reach it without importing the concrete pebble type:
+`kvFSM` directly satisfies `raftengine.AppliedIndexReader` by
+forwarding to its underlying store (PR #915 round-5 — round-1 had a
+factory `AppliedIndexReader() AppliedIndexReader` method intended to
+be called through a separate `AppliedIndexReporter` interface, but
+that pattern would require the skip gate to know about the reporter
+shim; the direct interface satisfaction is simpler and a compile-time
+guard catches future signature drift):
 
 ```go
-type AppliedIndexReporter interface {
-    AppliedIndexReader() AppliedIndexReader
-}
-func (f *kvFSM) AppliedIndexReader() AppliedIndexReader {
-    if r, ok := f.store.(AppliedIndexReader); ok {
-        return r
+// kv/fsm.go
+func (f *kvFSM) LastAppliedIndex() (uint64, bool, error) {
+    r, ok := f.store.(raftengine.AppliedIndexReader)
+    if !ok {
+        return 0, false, nil
     }
-    return nil
+    idx, present, err := r.LastAppliedIndex()
+    if err != nil {
+        return 0, false, errors.WithStack(err)
+    }
+    return idx, present, nil
 }
+
+// kv/fsm_applied_index_iface_check.go (compile-time guard)
+var _ raftengine.AppliedIndexReader = (*kvFSM)(nil)
+var _ raftengine.AppliedIndexWriter = (*kvFSM)(nil)
 ```
+
+The compile-time guard means any future rename or signature drift
+fails `go build` immediately — the soak investment is protected at
+the compiler level.
 
 ### 4. Conditional restore (with conservative error fallback)
 
@@ -279,16 +295,20 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
 
 // fsmAlreadyAtIndex returns true ONLY when we can prove the FSM is
 // already at or past `want`. Any uncertainty -- FSM doesn't expose
-// the reporter, store doesn't expose the reader, read error, or
-// missing meta key -- returns false so we fall back to the full
-// restore. A stale-but-incorrect skip is far worse than a wasteful
-// full restore; the fallback errs strictly toward restoring.
+// the reader interface, read error, or missing meta key -- returns
+// false so we fall back to the full restore. A stale-but-incorrect
+// skip is far worse than a wasteful full restore; the fallback errs
+// strictly toward restoring.
+//
+// Direct type-assert against raftengine.AppliedIndexReader (PR #915
+// round-5): kvFSM satisfies the interface directly via its
+// LastAppliedIndex method, so no separate AppliedIndexReporter shim
+// is needed. The compile-time guard in kv/fsm_applied_index_iface_check.go
+// keeps this stable.
 func fsmAlreadyAtIndex(fsm StateMachine, want uint64) bool {
-    reporter, ok := fsm.(AppliedIndexReporter)
+    r, ok := fsm.(raftengine.AppliedIndexReader)
     if !ok { return false }
-    reader := reporter.AppliedIndexReader()
-    if reader == nil { return false }
-    have, present, err := reader.LastAppliedIndex()
+    have, present, err := r.LastAppliedIndex()
     if err != nil || !present { return false }
     return have >= want
 }
@@ -814,8 +834,12 @@ present.
 - `ApplyIndexAware` is **already** in `main`; this design only adds
   consumers.
 - The new opt-in interfaces (`AppliedIndexReader`,
-  `AppliedIndexReporter`, `SnapshotHeaderApplier`) are additive.
+  `AppliedIndexWriter`, `SnapshotHeaderApplier`) are additive.
   FSMs that don't implement them fall back to the current behaviour.
+  (Round-1 / round-2 of this doc mentioned an `AppliedIndexReporter`
+  factory-method shim; PR #915 round-5 superseded it by having
+  `kvFSM` satisfy `AppliedIndexReader` directly via its
+  `LastAppliedIndex` method.)
 - `metaAppliedIndexBytes` is new.  Older fsm.db files don't have it.
   The `present=false` branch makes the first restart after upgrade
   fall back to full restore, populating the meta key from the next
@@ -863,7 +887,7 @@ restoreSnapshotState skipped (FSM at index %d, snapshot at %d, ceiling=%d, cutov
 | Branch | Content | Behaviour change |
 |---|---|---|
 | **B1** (this PR) | Design doc | None |
-| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` (under `dbMu.RLock()`) + `pebbleStore.SetDurableAppliedIndex()` (under `dbMu.RLock()`, **`pebble.Sync` unconditionally**) + `kvFSM.AppliedIndexReader()` accessor + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2679`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
+| **B2** | `ApplyMutationsRaftAt` / `DeletePrefixAtRaftAt` overloads + meta-key bundling in both leaves + `pebbleStore.LastAppliedIndex()` (under `dbMu.RLock()`) + `pebbleStore.SetDurableAppliedIndex()` (under `dbMu.RLock()` + `applyMu.Lock()` RMW monotonic guard, **`pebble.Sync` unconditionally**) + `kvFSM.LastAppliedIndex()` directly satisfies `raftengine.AppliedIndexReader` (compile-time guard in `kv/fsm_applied_index_iface_check.go`) + `kvFSM.SetDurableAppliedIndex` forwarding + thread `f.pendingApplyIdx` into the data-Apply leaves + BOTH `persistCreatedSnapshot` (`engine.go:2679`) AND `e.persistLocalSnapshotPayload` (`engine.go:4032`, the SnapshotCount-triggered hot path) call `SetDurableAppliedIndex` BEFORE the corresponding `persist.SaveSnap` | Meta key starts being written on every data Apply AND at every snapshot persist (both config-snapshot and steady-state local-snapshot paths). Skip is still disabled. Soak in production for one release. |
 | **B3** | `restoreSnapshotState` skip gate + `applyHeaderStateOnSkip(snapPath, tok.CRC32C)` orchestrating size + footer-vs-tokenCRC + full-body-CRC verification using `internal/raftengine/etcd`'s existing helpers (matching `openAndRestoreFSMSnapshot`'s safety contract) + two-phase `SnapshotHeaderApplier` seam on `kvFSM` (`ParseSnapshotHeader(r io.Reader) (ceiling, cutover, err)` + pure `ApplySnapshotHeader(ceiling, cutover)`) + metrics + INFO log | **User-visible cold-start win.** |
 | **B4** | Lower `HEALTH_TIMEOUT_SECONDS` default once production data shows steady-state skip rate ≥ 90 % | Tighter ceiling; the env override remains honoured. |
 
