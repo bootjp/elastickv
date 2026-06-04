@@ -248,6 +248,42 @@ func TestS3EncodeRejectsMalformedKeymapJSON(t *testing.T) {
 	}
 }
 
+// TestS3EncodeTrackerWithDirectorySidecar pins codex P2 PR #928. A
+// user key prefix that happens to be `KEYMAP.jsonl.elastickv-meta.json/`
+// creates a directory at the sidecar path. Earlier code treated ANY
+// entry at the sidecar path as "the sidecar exists" and skipped the
+// keymap-loading branch, mis-classifying the tracker file as a user
+// object. The fix requires the sidecar to be a regular file before
+// the tracker can be bypassed.
+func TestS3EncodeTrackerWithDirectorySidecar(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeS3Bucket(t, in, collisionTestBucket, []byte(`{"format_version":1,"name":"b"}`))
+	bucketDir := filepath.Join(in, "s3", EncodeSegment([]byte(collisionTestBucket)))
+	// Tracker file (no companion regular-file sidecar).
+	writeS3KeymapTracker(t, in, []KeymapRecord{
+		leafRecord("path/to"+S3LeafDataSuffix, "path/to"),
+	})
+	// User-key subtree whose prefix happens to be the sidecar name.
+	// This creates a DIRECTORY at <bucket>/KEYMAP.jsonl.elastickv-meta.json/.
+	if err := os.MkdirAll(filepath.Join(bucketDir, "KEYMAP.jsonl"+S3MetaSuffixReserved), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// The renamed leaf-data body for the tracker entry.
+	body := []byte("shorter-key body")
+	writeS3LeafDataRename(t, in, collisionTestBucket, "path/to", body,
+		s3ObjectSidecar("etag-1", int64(len(body)), "text/plain", ""))
+	// path/to/sub to make the leaf-data rename plausible.
+	longerBody := []byte("longer-key subobject body")
+	writeS3Object(t, in, collisionTestBucket, "path/to/sub", longerBody,
+		s3ObjectSidecar("etag-2", int64(len(longerBody)), "text/plain", ""))
+
+	fsm := encodeS3Tree(t, in)
+	// The tracker classification stood despite the directory at the
+	// sidecar path, so the keymap loaded and "path/to" recovered.
+	assertS3ManifestEmittedUnder(t, fsm, "path/to", "path/to"+S3LeafDataSuffix)
+}
+
 // TestS3EncodeMissingKeymapIsValidNoCollisionDump pins that the
 // M4-2a happy path is unchanged: a bucket without KEYMAP.jsonl
 // continues to encode every object at its on-disk path.

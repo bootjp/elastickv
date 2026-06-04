@@ -204,6 +204,55 @@ func TestValidateKeymapRecord_KindMetaSuffix(t *testing.T) {
 	}
 }
 
+// TestValidateKeymapRecord_PathTraversal pins gemini medium PR #928:
+// rec.Encoded must be a clean relative path. `..`, `.`, and empty
+// segments would let a hand-crafted dump escape the bucket
+// sub-root when filepath.Join joins encoded into the Lstat path.
+func TestValidateKeymapRecord_PathTraversal(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		encoded string
+	}{
+		{"contains ..", "../escape" + S3LeafDataSuffix},
+		{"contains .", "./still-bad" + S3LeafDataSuffix},
+		{"double slash (empty segment)", "path//to" + S3LeafDataSuffix},
+		{"trailing slash (empty segment)", "path/to" + S3LeafDataSuffix + "/"},
+		{"leading slash (empty segment)", "/path/to" + S3LeafDataSuffix},
+		{"middle ..", "path/../escape" + S3LeafDataSuffix},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			rec := leafRecord(c.encoded, "any/orig")
+			err := validateKeymapRecord(rec)
+			if !errors.Is(err, ErrInvalidKeymapRecord) {
+				t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+			}
+		})
+	}
+}
+
+// TestValidateKeymapRecord_EmptyOriginal pins gemini medium PR #928:
+// an S3 object key cannot be empty. Reject the keymap record at
+// load time rather than letting it propagate to object-body
+// assembly where the diagnostic is harder to read.
+func TestValidateKeymapRecord_EmptyOriginal(t *testing.T) {
+	t.Parallel()
+	rec := KeymapRecord{
+		Encoded:     "any" + S3LeafDataSuffix,
+		OriginalB64: base64.RawURLEncoding.EncodeToString([]byte("")),
+		Kind:        KindS3LeafData,
+	}
+	err := validateKeymapRecord(rec)
+	if !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+	}
+	if !strings.Contains(err.Error(), "empty original") {
+		t.Fatalf("err message = %v, want empty-original message", err)
+	}
+}
+
 // TestValidateKeymapRecord_UnknownKind pins the forward-compat
 // guard: an unrecognized Kind value fails closed rather than
 // silently passing.

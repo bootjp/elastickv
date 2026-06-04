@@ -133,14 +133,48 @@ func validateKeymapRecord(rec KeymapRecord) error {
 		return errors.Wrapf(ErrInvalidKeymapRecord,
 			"unknown kind %q for encoded segment %q", rec.Kind, rec.Encoded)
 	}
+	if err := validateKeymapEncodedPath(rec.Encoded); err != nil {
+		return err
+	}
 	originalBytes, err := rec.Original()
 	if err != nil {
 		return err
 	}
 	original := string(originalBytes)
+	// S3 object keys cannot be empty; reject an empty decoded
+	// original here so the operator sees the keymap problem at load
+	// time rather than at object-body assembly. Gemini medium PR #928.
+	if original == "" {
+		return errors.Wrapf(ErrInvalidKeymapRecord,
+			"empty original key for encoded segment %q (kind=%q)", rec.Encoded, rec.Kind)
+	}
 	if err := validateKeymapReservedRoot(rec, original); err != nil {
 		return err
 	}
+	return validateKeymapKindSuffix(rec, original)
+}
+
+// validateKeymapEncodedPath rejects rec.Encoded values that would
+// escape the bucket sub-root or carry empty segments. The lookup
+// site (resolveObjectKeyFromRel) joins this value under bucketDir
+// when calling root.Lstat, and ".." would silently break out of the
+// bucket. Gemini medium PR #928.
+func validateKeymapEncodedPath(encoded string) error {
+	for _, seg := range strings.Split(encoded, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return errors.Wrapf(ErrInvalidKeymapRecord,
+				"encoded path %q contains invalid segment %q", encoded, seg)
+		}
+	}
+	return nil
+}
+
+// validateKeymapKindSuffix enforces the Kind-specific suffix
+// invariants: KindS3LeafData encoded values must end in
+// S3LeafDataSuffix; KindMetaCollision original values must end in
+// S3MetaSuffixReserved; KindSHAFallback has no extra invariant
+// today (forward-compat).
+func validateKeymapKindSuffix(rec KeymapRecord, original string) error {
 	switch rec.Kind {
 	case KindS3LeafData:
 		if !strings.HasSuffix(rec.Encoded, S3LeafDataSuffix) {

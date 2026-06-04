@@ -105,9 +105,17 @@ func (e *S3RecordEncoder) encodeBucketObjects(b *snapshotBuilder, root *os.Root,
 // isKeymapCollisionTracker reports whether the bucket's top-level
 // KEYMAP.jsonl is the decoder's collision-rename tracker. The tracker is a
 // regular FILE with no companion sidecar. It is NOT:
-//   - a user object literally named KEYMAP.jsonl (which has a sidecar), or
+//   - a user object literally named KEYMAP.jsonl (which has a regular-
+//     file sidecar at KEYMAP.jsonl.elastickv-meta.json), or
 //   - a directory holding objects under the "KEYMAP.jsonl/" key prefix
 //     (a directory, not a file).
+//
+// The sidecar disambiguation requires the sidecar to be a REGULAR FILE
+// (not just any entry). A user object whose key prefix happens to be
+// `KEYMAP.jsonl.elastickv-meta.json/` would create a directory at that
+// path; treating that directory as "the sidecar" would mis-classify
+// the tracker file as a user object and skip keymap loading. Codex P2
+// PR #928.
 func (e *S3RecordEncoder) isKeymapCollisionTracker(root *os.Root, bucketDir string) (bool, error) {
 	keymapRel := filepath.Join(bucketDir, "KEYMAP.jsonl")
 	linfo, err := root.Lstat(keymapRel)
@@ -120,24 +128,22 @@ func (e *S3RecordEncoder) isKeymapCollisionTracker(root *os.Root, bucketDir stri
 	if !linfo.Mode().IsRegular() {
 		return false, nil // a directory (KEYMAP.jsonl/ key prefix) or other
 	}
-	hasSidecar, err := rootEntryExists(root, keymapRel+S3MetaSuffixReserved)
-	if err != nil {
-		return false, err
-	}
-	return !hasSidecar, nil
-}
-
-// rootEntryExists reports whether rel exists within root (via Lstat, so it
-// does not follow a final symlink).
-func rootEntryExists(root *os.Root, rel string) (bool, error) {
-	_, err := root.Lstat(rel)
+	sinfo, err := root.Lstat(keymapRel + S3MetaSuffixReserved)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		// No sidecar at all → this KEYMAP.jsonl is the tracker.
+		return true, nil
 	}
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	return true, nil
+	// Sidecar entry exists, but only a regular file disambiguates a
+	// legitimate user object. A directory at the sidecar path means
+	// some user key prefix collides with `KEYMAP.jsonl.elastickv-meta.json/`
+	// — that is NOT a sidecar; the tracker classification stands.
+	if !sinfo.Mode().IsRegular() {
+		return true, nil
+	}
+	return false, nil
 }
 
 // reservedDirHoldsSidecar reports whether dirRel (a reserved dump dir like
