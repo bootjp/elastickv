@@ -28,6 +28,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY=/tmp/elastickv4-m5-binary
 ROUTE_KEY_BIN=/tmp/elastickv4-m5-route-key
+LIST_ROUTES_BIN=/tmp/elastickv4-m5-list-routes
 DATA_DIR=/tmp/elastickv-m5-test-run
 PID_FILE=/tmp/elastickv-m5-test-run.pid
 
@@ -48,14 +49,19 @@ for arg in "$@"; do
   esac
 done
 
-# ---- build (server + route-key helper) ----
+# ---- build (server + route-key + list-routes helpers) ----
 if ! $NO_REBUILD; then
   echo "[build] compiling elastickv server..."
   cd "$REPO_ROOT"
   go build -o "$BINARY" .
   echo "[build] compiling elastickv-route-key helper..."
   go build -o "$ROUTE_KEY_BIN" ./cmd/elastickv-route-key
-  echo "[build] done -> $BINARY, $ROUTE_KEY_BIN"
+  echo "[build] compiling elastickv-list-routes helper..."
+  # Used by the Jepsen workload's setup-hook verification
+  # (verify-multi-group-routing!).  Confirms the cluster booted with
+  # >=2 distinct Raft groups before any workload op runs.
+  go build -o "$LIST_ROUTES_BIN" ./cmd/elastickv-list-routes
+  echo "[build] done -> $BINARY, $ROUTE_KEY_BIN, $LIST_ROUTES_BIN"
 fi
 
 # ---- compute --shardRanges boundary keys ----
@@ -154,6 +160,10 @@ fi
 
 echo "[jepsen] running DynamoDB multi-table list-append workload via $LEIN_BIN..."
 mkdir -p tmp-home .lein
+# --list-routes-bin / --grpc-host-port wire the setup-hook verification
+# (verify-multi-group-routing!) at the workload's first setup! call.
+# Without them the hook falls back to PATH lookup which fails when
+# run from this script's tmp build.
 HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
   LEIN_JVM_OPTS="-Duser.home=$(pwd)/tmp-home" \
   "$LEIN_BIN" run -m elastickv.dynamodb-multi-table-workload \
@@ -161,6 +171,8 @@ HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
     --time-limit 30 \
     --rate 5 \
     --dynamo-port 63801 \
+    --list-routes-bin "$LIST_ROUTES_BIN" \
+    --grpc-host-port  "$PROC_ADDR" \
   || EXIT_CODE=$?
 
 EXIT_CODE=${EXIT_CODE:-0}
