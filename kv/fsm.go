@@ -129,19 +129,36 @@ func (f *kvFSM) SetApplyIndex(idx uint64) {
 	f.pendingApplyIdx = idx
 }
 
-// AppliedIndexReader implements raftengine.AppliedIndexReporter. It
-// exposes the underlying store's durable applied-index when the
-// store implements raftengine.AppliedIndexReader (pebbleStore does;
-// the in-memory mvccStore does not, in which case (0, false, nil)
-// from the missing-key path will land at the caller). nil means
-// "not supported on this backend" and triggers the conservative
-// full-restore fallback at the cold-start skip gate. See
-// docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
-func (f *kvFSM) AppliedIndexReader() raftengine.AppliedIndexReader {
-	if r, ok := f.store.(raftengine.AppliedIndexReader); ok {
-		return r
+// LastAppliedIndex implements raftengine.AppliedIndexReader by
+// forwarding to the underlying store when it supports the reader
+// seam (pebbleStore does; the in-memory mvccStore does not).
+//
+// Round-1 of this PR shipped this as a factory method
+// (AppliedIndexReader() AppliedIndexReader) intended to be called
+// through a separate AppliedIndexReporter interface. Codex P2 on
+// round-4 (kv/fsm.go:145) correctly pointed out that the planned
+// cold-start skip gate (Branch 3) will type-assert
+// fsm.(raftengine.AppliedIndexReader) directly — a factory method
+// with a different signature does NOT satisfy the interface, so
+// the skip would always fall back even after the meta key is
+// populated. Renaming the method to LastAppliedIndex and inlining
+// the type-assert forward makes kvFSM directly satisfy
+// raftengine.AppliedIndexReader.
+//
+// (0, false, nil) propagates the strictly-additive fallback when
+// the store does not expose the seam — the future skip gate treats
+// "missing" as "fall back to full restore." See
+// docs/design/2026_06_02_idempotent_snapshot_restore.md §3 / §4.
+func (f *kvFSM) LastAppliedIndex() (uint64, bool, error) {
+	r, ok := f.store.(raftengine.AppliedIndexReader)
+	if !ok {
+		return 0, false, nil
 	}
-	return nil
+	idx, present, err := r.LastAppliedIndex()
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return idx, present, nil
 }
 
 // SetDurableAppliedIndex implements raftengine.AppliedIndexWriter by
