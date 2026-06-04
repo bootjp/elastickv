@@ -32,7 +32,8 @@
    maintained API and obscure the side-by-side comparability that is
    the point of running both."
   (:gen-class)
-  (:require [clojure.string :as str]
+  (:require [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
@@ -280,6 +281,73 @@
                  {:TransactItems (into checks updates)})))
 
 ;; ---------------------------------------------------------------------------
+;; M5a setup-hook verification (design doc §3.3)
+;; ---------------------------------------------------------------------------
+
+(def ^:private default-list-routes-bin
+  "Default path to the cmd/elastickv-list-routes Go helper.  Tunable
+   via (:list-routes-bin opts) so the binary can sit anywhere on disk
+   when the launch script doesn't put it on PATH."
+  "elastickv-list-routes")
+
+(def ^:private default-grpc-host-port
+  "Default gRPC --address argument to elastickv-list-routes.  Matches
+   the launch script's PROC_ADDR (scripts/run-jepsen-m5-local.sh).
+   Tunable via (:grpc-host-port opts)."
+  "127.0.0.1:50051")
+
+(defn- distinct-group-ids
+  "Parses elastickv-list-routes' JSON output and returns the set of
+   distinct raft_group_id values present.  Uses a regex rather than
+   pulling in a JSON dependency: the CLI emits a stable JSON shape
+   tested in cmd/elastickv-list-routes/main_test.go, and this hook
+   only needs a coarse-grained 'how many groups own routes' check.
+   If a future ListRoutes change introduces a different field name,
+   the regex returns the empty set and the assertion below fails
+   loudly — strictly better than silently passing on an unexpected
+   shape."
+  [json-str]
+  (->> (re-seq #"\"raft_group_id\"\s*:\s*(\d+)" json-str)
+       (map (comp #(Long/parseLong %) second))
+       set))
+
+(defn- verify-multi-group-routing!
+  "Asserts the cluster reports >=2 distinct Raft groups in its route
+   catalog.  Shells out to cmd/elastickv-list-routes (the JSON
+   contract is stable; design doc §3.3).  Throws ex-info on any
+   failure so the Jepsen setup-hook fails fast with a clear error
+   pointing the operator at the launch-script flag the cluster is
+   missing.
+
+   opts (read from the test map):
+     :list-routes-bin — absolute path to the CLI (default \"elastickv-list-routes\";
+                        assumes PATH or matching launch-script PWD).
+     :grpc-host-port  — --address arg to the CLI (default 127.0.0.1:50051)."
+  [test]
+  (let [bin    (or (:list-routes-bin test) default-list-routes-bin)
+        addr   (or (:grpc-host-port test)  default-grpc-host-port)
+        result (shell/sh bin "--address" addr)]
+    (when-not (zero? (:exit result))
+      (throw (ex-info (str bin " --address " addr " failed: " (:err result))
+                      {:exit   (:exit result)
+                       :stdout (:out result)
+                       :stderr (:err result)})))
+    (let [groups (distinct-group-ids (:out result))]
+      (when (< (count groups) 2)
+        (throw (ex-info
+                 (str "M5a multi-group routing precondition failed: only "
+                      (count groups) " distinct Raft group(s) observed in the catalog "
+                      "(expected >=2).  Re-launch the cluster with both --raftGroups "
+                      "AND --shardRanges (see scripts/run-jepsen-m5-local.sh) — "
+                      "without both flags --shardRanges collapses every range into "
+                      "the default group 1 and dispatchMultiShardTxn never fires.")
+                 {:groups   groups
+                  :bin      bin
+                  :address  addr
+                  :raw-out  (:out result)})))
+      groups)))
+
+;; ---------------------------------------------------------------------------
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
 
@@ -291,7 +359,19 @@
           host (or (:dynamo-host test) (name node))]
       (assoc this :ddb (make-ddb-client host port))))
 
-  (setup! [this _test]
+  (setup! [_this test]
+    ;; M5a setup-hook verification per design doc §3.3.  Asserts the
+    ;; launch script's --raftGroups / --shardRanges actually placed
+    ;; the M5 table-route keys on >=2 distinct Raft groups before any
+    ;; workload op runs.  Fails fast with a clear error so the operator
+    ;; knows the cluster needs to be relaunched — strictly better than
+    ;; silently running the workload on a single-shard layout and
+    ;; reporting "zero G1c" without ever exercising dispatchMultiShardTxn.
+    ;;
+    ;; jepsen.client/setup! is invoked exactly once per test (not
+    ;; per-node like jepsen.db/setup!), so no first-node gating is
+    ;; required.
+    (verify-multi-group-routing! test)
     ;; No DescribeTable poll loop is needed: elastickv's adapter
     ;; returns TableStatus=ACTIVE synchronously in the CreateTable
     ;; response (adapter/dynamodb.go:779-783), so the table is
