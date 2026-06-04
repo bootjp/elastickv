@@ -330,6 +330,16 @@ func (s *LeaderRoutedStore) ApplyMutationsRaft(ctx context.Context, mutations []
 	return errors.WithStack(s.local.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
 }
 
+// ApplyMutationsRaftAt forwards to the local store's raft-entry-index-
+// aware variant so the underlying pebbleStore can bundle
+// metaAppliedIndex with the mutation. See PR #910 design §2.
+func (s *LeaderRoutedStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
 func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)
@@ -343,6 +353,64 @@ func (s *LeaderRoutedStore) DeletePrefixAtRaft(ctx context.Context, prefix []byt
 		return errors.WithStack(store.ErrNotSupported)
 	}
 	return errors.WithStack(s.local.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS))
+}
+
+// DeletePrefixAtRaftAt forwards to the local store's raft-entry-
+// index-aware variant. See PR #910 design §2 "why both leaves".
+func (s *LeaderRoutedStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex))
+}
+
+// LastAppliedIndex forwards to the local store when it implements
+// raftengine.AppliedIndexReader. Defensive: in production today the
+// kvFSM holds a *pebbleStore directly (not a LeaderRoutedStore — that
+// wrapper is used by adapter/server code for read routing, not by
+// the FSM apply path); so this forward is currently dead code for
+// the cold-start skip optimisation. We add it anyway because future
+// refactors might wrap the FSM's store, and a silent no-op there
+// would degrade the optimisation to full-restore-always with no
+// failure signal.
+//
+// (0, false, nil) returns are the strictly-additive fallback —
+// either the wrapper has no local, the local does not implement
+// the reader, or the local reports missing/truncated. The caller in
+// internal/raftengine/etcd/wal_store.go (Branch 3) treats all of
+// these as "fall back to full restore", which is correct.
+func (s *LeaderRoutedStore) LastAppliedIndex() (uint64, bool, error) {
+	if s == nil || s.local == nil {
+		return 0, false, nil
+	}
+	reader, ok := s.local.(interface {
+		LastAppliedIndex() (uint64, bool, error)
+	})
+	if !ok {
+		return 0, false, nil
+	}
+	idx, present, err := reader.LastAppliedIndex()
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return idx, present, nil
+}
+
+// SetDurableAppliedIndex forwards to the local store when it
+// implements raftengine.AppliedIndexWriter. Symmetric defensive
+// no-op when the local store does not expose the writer seam — see
+// LastAppliedIndex doc-comment.
+func (s *LeaderRoutedStore) SetDurableAppliedIndex(idx uint64) error {
+	if s == nil || s.local == nil {
+		return nil
+	}
+	writer, ok := s.local.(interface {
+		SetDurableAppliedIndex(idx uint64) error
+	})
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(writer.SetDurableAppliedIndex(idx))
 }
 
 func (s *LeaderRoutedStore) LastCommitTS() uint64 {

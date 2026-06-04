@@ -129,6 +129,57 @@ func (f *kvFSM) SetApplyIndex(idx uint64) {
 	f.pendingApplyIdx = idx
 }
 
+// LastAppliedIndex implements raftengine.AppliedIndexReader by
+// forwarding to the underlying store when it supports the reader
+// seam (pebbleStore does; the in-memory mvccStore does not).
+//
+// Round-1 of this PR shipped this as a factory method
+// (AppliedIndexReader() AppliedIndexReader) intended to be called
+// through a separate AppliedIndexReporter interface. Codex P2 on
+// round-4 (kv/fsm.go:145) correctly pointed out that the planned
+// cold-start skip gate (Branch 3) will type-assert
+// fsm.(raftengine.AppliedIndexReader) directly — a factory method
+// with a different signature does NOT satisfy the interface, so
+// the skip would always fall back even after the meta key is
+// populated. Renaming the method to LastAppliedIndex and inlining
+// the type-assert forward makes kvFSM directly satisfy
+// raftengine.AppliedIndexReader.
+//
+// (0, false, nil) propagates the strictly-additive fallback when
+// the store does not expose the seam — the future skip gate treats
+// "missing" as "fall back to full restore." See
+// docs/design/2026_06_02_idempotent_snapshot_restore.md §3 / §4.
+func (f *kvFSM) LastAppliedIndex() (uint64, bool, error) {
+	r, ok := f.store.(raftengine.AppliedIndexReader)
+	if !ok {
+		return 0, false, nil
+	}
+	idx, present, err := r.LastAppliedIndex()
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return idx, present, nil
+}
+
+// SetDurableAppliedIndex implements raftengine.AppliedIndexWriter by
+// forwarding to the underlying store when it supports the writer
+// seam. Called by the engine at every snapshot persist site BEFORE
+// persist.SaveSnap so a successful snapshot persist implies
+// LastAppliedIndex >= snap.Metadata.Index, closing the HLC-lease-
+// only / encryption-only fallback (PR #910 design §6).
+//
+// Returns nil silently when the backing store does not implement
+// the writer seam (in-memory mvccStore, test fakes) — the skip
+// optimisation simply degrades to "fall back to full restore" for
+// those FSMs.
+func (f *kvFSM) SetDurableAppliedIndex(idx uint64) error {
+	w, ok := f.store.(raftengine.AppliedIndexWriter)
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(w.SetDurableAppliedIndex(idx))
+}
+
 type FSM interface {
 	raftengine.StateMachine
 }
@@ -455,7 +506,7 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	}
 	// Raw requests always commit against the latest state; use commitTS as both
 	// the validation snapshot and the commit timestamp.
-	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, muts, nil, commitTS, commitTS))
+	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, muts, nil, commitTS, commitTS, f.pendingApplyIdx))
 }
 
 // extractDelPrefix checks if the mutations contain a DEL_PREFIX operation.
@@ -472,7 +523,7 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
-	return errors.WithStack(f.store.DeletePrefixAtRaft(ctx, prefix, txnCommonPrefix, commitTS))
+	return errors.WithStack(f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx))
 }
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -730,7 +781,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 		return err
 	}
 
-	if err := f.store.ApplyMutationsRaft(ctx, storeMuts, r.ReadKeys, startTS, startTS); err != nil {
+	if err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, startTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -794,7 +845,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, r.ReadKeys, startTS, commitTS))
+	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx))
 }
 
 // dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
@@ -898,7 +949,7 @@ func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, start
 // The secondary-shard LatestCommitTS scan is intentionally deferred to the
 // write-conflict path so the hot (first-time) commit path pays no extra cost.
 func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
-	err := f.store.ApplyMutationsRaft(ctx, storeMuts, nil, applyStartTS, commitTS)
+	err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, applyStartTS, commitTS, f.pendingApplyIdx)
 	if err == nil {
 		return nil
 	}
@@ -915,7 +966,7 @@ func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMut
 			return errors.WithStack(lErr)
 		}
 		if exists && latestTS >= commitTS {
-			return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, nil, commitTS, commitTS))
+			return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, commitTS, commitTS, f.pendingApplyIdx))
 		}
 	}
 	return errors.WithStack(err)
@@ -966,7 +1017,7 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	if len(storeMuts) == 0 {
 		return nil
 	}
-	return errors.WithStack(f.store.ApplyMutationsRaft(ctx, storeMuts, nil, startTS, abortTS))
+	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, startTS, abortTS, f.pendingApplyIdx))
 }
 
 func (f *kvFSM) buildPrepareStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS, expireAt uint64) ([]*store.KVPairMutation, error) {

@@ -46,3 +46,47 @@ type StateMachine interface {
 type ApplyIndexAware interface {
 	SetApplyIndex(idx uint64)
 }
+
+// AppliedIndexReader is an OPTIONAL extension that lets the engine
+// query the FSM's durable applied-index for the cold-start skip gate.
+// See docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
+//
+// The returned value MUST be the largest Raft entry index whose Apply
+// produced a durable mutation on the FSM's primary store (i.e. the
+// metaAppliedIndex Pebble meta key, bundled in the same WriteBatch
+// as the data mutation). FSMs that cannot self-report return
+// (0, false, nil) — the caller treats that as "missing" and falls
+// back to the full restore path, preserving the strictly-additive
+// invariant.
+//
+// Returning a non-nil error MUST NOT abort cold start. The
+// fsmAlreadyAtIndex caller (restoreSnapshotState) intentionally
+// collapses (false, _, err) to "fall back to restore" rather than
+// surface the error, because over-restoring on a corrupt meta key is
+// strictly safer than skipping incorrectly.
+type AppliedIndexReader interface {
+	LastAppliedIndex() (uint64, bool, error)
+}
+
+// AppliedIndexWriter is an OPTIONAL extension that lets the engine
+// pin the FSM's durable applied-index to a known value at snapshot
+// persist time. See docs/design/2026_06_02_idempotent_snapshot_restore.md
+// §6 "HLC lease entries — checkpoint at snapshot persist".
+//
+// The engine calls SetDurableAppliedIndex(snap.Metadata.Index)
+// before it calls persist.SaveSnap, so that on every successful
+// snapshot persist the invariant `LastAppliedIndex >=
+// snapshot.Metadata.Index` holds unconditionally — closing the
+// HLC-lease-only / encryption-only fallback that would otherwise
+// leave LastAppliedIndex stuck at the last data-Apply index.
+//
+// Implementations MUST persist the value with pebble.Sync (or the
+// equivalent strong-durability flag for the backing store)
+// regardless of ELASTICKV_FSM_SYNC_MODE. The checkpoint is the only
+// durable carrier of metaAppliedIndex at this point — once
+// persist.SaveSnap returns, WAL compaction discards every log entry
+// at or before snap.Metadata.Index, so there is no source to replay
+// the meta key bump from.
+type AppliedIndexWriter interface {
+	SetDurableAppliedIndex(idx uint64) error
+}

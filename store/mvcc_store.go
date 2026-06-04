@@ -496,6 +496,16 @@ func (s *mvccStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPairM
 	return s.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
 
+// ApplyMutationsRaftAt satisfies the MVCCStore interface. The in-memory
+// store has no Pebble batch to bundle metaAppliedIndex in, so the
+// appliedIndex argument is discarded — LastAppliedIndex on this
+// backend would always read as missing and the skip optimisation
+// would fall back to full restore. Acceptable: the in-memory store
+// is only used in unit tests and the catalog bootstrap path.
+func (s *mvccStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, _ uint64) error {
+	return s.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
+}
+
 func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -562,6 +572,12 @@ func (s *mvccStore) WriteConflictCount() uint64 {
 // DeletePrefixAtRaft delegates to DeletePrefixAt; the in-memory store has
 // no WAL and therefore no sync-mode distinction.
 func (s *mvccStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS)
+}
+
+// DeletePrefixAtRaftAt satisfies the MVCCStore interface — see
+// ApplyMutationsRaftAt for the appliedIndex disposition rationale.
+func (s *mvccStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, _ uint64) error {
 	return s.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS)
 }
 

@@ -172,6 +172,15 @@ type MVCCStore interface {
 	// migrations, tests) must use ApplyMutations, which is always
 	// pebble.Sync and therefore safe without raft-log replay.
 	ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error
+	// ApplyMutationsRaftAt is ApplyMutationsRaft with the raft entry
+	// index threaded through. The leaf bundles metaAppliedIndex in the
+	// same pebble.Batch as the data mutation so a successful Apply
+	// implies LastAppliedIndex >= appliedIndex; the cold-start
+	// snapshot-restore skip gate uses this invariant (PR #910 / B2).
+	// appliedIndex==0 is treated as "no index, do not bump the meta
+	// key", matching ApplyMutationsRaft semantics for callers that have
+	// not yet been wired to the raftengine.ApplyIndexAware seam.
+	ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error
 	// DeletePrefixAt atomically deletes all visible (non-tombstone, non-expired)
 	// keys matching prefix at commitTS by writing tombstone versions. An empty
 	// prefix means "all keys". Keys matching excludePrefix are preserved.
@@ -181,6 +190,12 @@ type MVCCStore interface {
 	// DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt with
 	// the same durability contract as ApplyMutationsRaft.
 	DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error
+	// DeletePrefixAtRaftAt is DeletePrefixAtRaft with the raft entry
+	// index threaded through. handleDelPrefix builds an independent
+	// pebble.Batch separate from applyMutationsWithOpts; this overload
+	// bundles metaAppliedIndex in that batch so DEL_PREFIX entries
+	// also advance the meta key. PR #910 design §2 "why both leaves".
+	DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
 	// WriteConflictCountsByPrefix returns a snapshot of the MVCC
