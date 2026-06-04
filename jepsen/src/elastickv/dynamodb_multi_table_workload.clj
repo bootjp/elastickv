@@ -290,11 +290,25 @@
    when the launch script doesn't put it on PATH."
   "elastickv-list-routes")
 
-(def ^:private default-grpc-host-port
-  "Default gRPC --address argument to elastickv-list-routes.  Matches
-   the launch script's PROC_ADDR (scripts/run-jepsen-m5-local.sh).
-   Tunable via (:grpc-host-port opts)."
-  "127.0.0.1:50051")
+(def ^:private default-grpc-port
+  "Default elastickv server gRPC port.  Combined with the test's
+   first node hostname (or 127.0.0.1 when --local) to form the
+   --address argument."
+  50051)
+
+(defn- default-grpc-host-port-for
+  "Returns the default --address for elastickv-list-routes when the
+   test does NOT pass an explicit :grpc-host-port.  Resolves to the
+   first node's hostname + default port — works in both local mode
+   (first node is typically 127.0.0.1 or 'n1') and distributed Jepsen
+   runs where database nodes live on separate hosts (gemini medium
+   on PR #925).  Falls back to 127.0.0.1:50051 only when :nodes is
+   missing entirely."
+  [test]
+  (let [node (first (:nodes test))]
+    (if node
+      (str (name node) ":" default-grpc-port)
+      (str "127.0.0.1:" default-grpc-port))))
 
 (defn- distinct-group-ids
   "Parses elastickv-list-routes' JSON output and returns the set of
@@ -322,10 +336,13 @@
    opts (read from the test map):
      :list-routes-bin — absolute path to the CLI (default \"elastickv-list-routes\";
                         assumes PATH or matching launch-script PWD).
-     :grpc-host-port  — --address arg to the CLI (default 127.0.0.1:50051)."
+     :grpc-host-port  — --address arg to the CLI; defaults to the
+                        first node's hostname + 50051 so distributed
+                        Jepsen runs work without flag plumbing
+                        (gemini medium on PR #925)."
   [test]
   (let [bin    (or (:list-routes-bin test) default-list-routes-bin)
-        addr   (or (:grpc-host-port test)  default-grpc-host-port)
+        addr   (or (:grpc-host-port test)  (default-grpc-host-port-for test))
         result (shell/sh bin "--address" addr)]
     (when-not (zero? (:exit result))
       (throw (ex-info (str bin " --address " addr " failed: " (:err result))

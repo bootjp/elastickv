@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -100,8 +101,11 @@ func run() error {
 }
 
 // emit serialises resp as JSON to w.  Extracted from run() so the
-// encoding is testable without dialling a real server.
-func emit(resp *pb.ListRoutesResponse, w *os.File) error {
+// encoding is testable with bytes.Buffer rather than a real
+// temp file (gemini medium on PR #925).  io.Writer is the
+// idiomatic Go return shape for "I write structured output to
+// something."
+func emit(resp *pb.ListRoutesResponse, w io.Writer) error {
 	out := responseJSON{
 		CatalogVersion: resp.GetCatalogVersion(),
 		Routes:         make([]routeJSON, 0, len(resp.GetRoutes())),

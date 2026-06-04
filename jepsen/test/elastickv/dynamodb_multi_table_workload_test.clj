@@ -39,6 +39,7 @@
 (def ^:private key->table-name      (var-get #'workload/key->table-name))
 (def ^:private key->pk              (var-get #'workload/key->pk))
 (def ^:private distinct-group-ids   (var-get #'workload/distinct-group-ids))
+(def ^:private default-grpc-host-port-for (var-get #'workload/default-grpc-host-port-for))
 
 (deftest key-routing-distributes-across-all-tables
   ;; Elle's default key-count is 12.  With N=4 tables and the
@@ -134,6 +135,27 @@
       "no routes must yield empty set")
   (is (= #{} (distinct-group-ids "{\"unrelated\":true}"))
       "missing routes field must yield empty set"))
+
+(deftest default-grpc-host-port-resolves-from-first-node
+  ;; Distributed Jepsen runs configure :nodes with real hostnames
+  ;; (e.g. ["n1" "n2" "n3"]).  default-grpc-host-port-for must
+  ;; derive the --address from the first node so the setup-hook
+  ;; doesn't punt every distributed run to localhost (gemini
+  ;; medium on PR #925).
+  (is (= "n1:50051" (default-grpc-host-port-for {:nodes ["n1" "n2" "n3"]}))
+      "first node hostname must form the default --address")
+  (is (= "alpha.internal:50051"
+         (default-grpc-host-port-for {:nodes ["alpha.internal" "beta.internal"]}))
+      "FQDN-style nodes must round-trip cleanly")
+  (is (= "n1:50051" (default-grpc-host-port-for {:nodes [:n1 :n2]}))
+      "keyword node ids must be coerced via (name)"))
+
+(deftest default-grpc-host-port-falls-back-on-empty-nodes
+  ;; The pre-existing 127.0.0.1:50051 default is the right fallback
+  ;; for test maps with no :nodes key (the workload-builder unit
+  ;; tests under this file, for one).
+  (is (= "127.0.0.1:50051" (default-grpc-host-port-for {})))
+  (is (= "127.0.0.1:50051" (default-grpc-host-port-for {:nodes []}))))
 
 (deftest distinct-group-ids-handles-whitespace
   ;; The CLI pretty-prints with two-space indent; the regex must
