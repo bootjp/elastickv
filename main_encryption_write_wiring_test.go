@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -198,5 +199,156 @@ func TestPrepareStorageNonceEpoch_SaturatedEpoch_RefusesWithExhausted(t *testing
 	}
 	if !errors.Is(err, encryption.ErrLocalEpochExhausted) {
 		t.Errorf("error not marked ErrLocalEpochExhausted: %v", err)
+	}
+}
+
+// TestRefuseStartupOnActiveRaftCutover_NoSidecarPath pins the
+// degraded-input behaviour: an empty sidecar path returns nil
+// (no refusal). This is the encryption-disabled startup case
+// where no sidecar is configured.
+func TestRefuseStartupOnActiveRaftCutover_NoSidecarPath(t *testing.T) {
+	t.Parallel()
+	if err := refuseStartupOnActiveRaftCutover(""); err != nil {
+		t.Errorf("empty sidecarPath: refuseStartupOnActiveRaftCutover = %v, want nil", err)
+	}
+}
+
+// TestRefuseStartupOnActiveRaftCutover_MissingSidecar pins the
+// nil-on-missing-file behaviour: a missing sidecar is the
+// pre-bootstrap state and there is no raft envelope cutover to
+// refuse on. Only encryption.IsNotExist errors return nil here;
+// non-NotExist read errors (malformed JSON, schema violation)
+// propagate as a refusal — see the sibling
+// TestRefuseStartupOnActiveRaftCutover_BadSidecarPropagates that
+// pins that branch (codex P1 round-1 r2 narrowed the nil-return
+// from "any read error" to IsNotExist only).
+func TestRefuseStartupOnActiveRaftCutover_MissingSidecar(t *testing.T) {
+	t.Parallel()
+	if err := refuseStartupOnActiveRaftCutover(t.TempDir() + "/absent.json"); err != nil {
+		t.Errorf("missing sidecar: refuseStartupOnActiveRaftCutover = %v, want nil (Stage 6C-1 owns malformed sidecars)", err)
+	}
+}
+
+// TestRefuseStartupOnActiveRaftCutover_ZeroCutoverPasses pins the
+// Stage 3 default: a sidecar with RaftEnvelopeCutoverIndex == 0
+// must return nil — that is the pre-cutover state, which is
+// universal until Stage 6E-2f flips the gate.
+func TestRefuseStartupOnActiveRaftCutover_ZeroCutoverPasses(t *testing.T) {
+	t.Parallel()
+	path := writeActiveStorageSidecar(t, 0) // RaftEnvelopeCutoverIndex defaults to 0
+	if err := refuseStartupOnActiveRaftCutover(path); err != nil {
+		t.Errorf("zero cutover: refuseStartupOnActiveRaftCutover = %v, want nil (Stage 3 default must pass)", err)
+	}
+}
+
+// TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverDoesNotBumpEpoch
+// pins the codex P2 round-1 r3 property: the refusal MUST run
+// before buildEncryptionWriteWiring's prepareStorageNonceEpoch
+// step, otherwise an orchestrator restart loop on a sidecar with
+// non-zero RaftEnvelopeCutoverIndex would consume one local_epoch
+// per boot and could hit ErrLocalEpochExhausted before the
+// operator notices.
+//
+// This is a black-box test on the helper itself: after invoking
+// refuseStartupOnActiveRaftCutover with a non-zero-cutover
+// sidecar, the sidecar's storage epoch field on disk MUST be
+// unchanged from what we wrote, proving no BumpLocalEpoch path
+// could have run downstream of the helper. The buildShardGroupsWithEncryption
+// Wiring ordering invariant (refusal BEFORE buildEncryptionWriteWiring)
+// is enforced structurally; this test guards against a future
+// refactor that swaps the order.
+func TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverDoesNotBumpEpoch(t *testing.T) {
+	t.Parallel()
+	const initialStorageEpoch uint16 = 7
+	dir := t.TempDir()
+	path := dir + "/keys.json"
+	sc := &encryption.Sidecar{
+		Version:                  encryption.SidecarVersion,
+		StorageEnvelopeActive:    true,
+		RaftEnvelopeCutoverIndex: 12345,
+		Active:                   encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage-wrapped-bytes"), LocalEpoch: initialStorageEpoch},
+			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft-wrapped-bytes-diff")},
+		},
+	}
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	if err := refuseStartupOnActiveRaftCutover(path); err == nil {
+		t.Fatal("non-zero cutover: refuseStartupOnActiveRaftCutover = nil, want refusal")
+	}
+	got, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar after refusal: %v", err)
+	}
+	gotEpoch := got.Keys["3"].LocalEpoch
+	if gotEpoch != initialStorageEpoch {
+		t.Errorf("post-refusal storage LocalEpoch = %d, want %d (refusal must run before any sidecar mutation)", gotEpoch, initialStorageEpoch)
+	}
+}
+
+// TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverRefuses
+// pins the codex P1 fail-closed property: when the sidecar
+// reports RaftEnvelopeCutoverIndex != 0, the helper returns a
+// non-nil error so buildShardGroupsWithEncryptionWiring refuses
+// startup. Without this, the binary would proceed with nil
+// shard-group wrap pointers and fresh proposals could land
+// cleartext above the cutover, halting the apply loop on the
+// §6.3 strict-> unwrap path.
+func TestRefuseStartupOnActiveRaftCutover_NonZeroCutoverRefuses(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := dir + "/keys.json"
+	sc := &encryption.Sidecar{
+		Version:                  encryption.SidecarVersion,
+		StorageEnvelopeActive:    true,
+		RaftEnvelopeCutoverIndex: 12345,
+		Active:                   encryption.ActiveKeys{Storage: 3, Raft: 4},
+		Keys: map[string]encryption.SidecarKey{
+			"3": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage-wrapped-bytes")},
+			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft-wrapped-bytes-diff")},
+		},
+	}
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	err := refuseStartupOnActiveRaftCutover(path)
+	if err == nil {
+		t.Fatal("non-zero cutover: refuseStartupOnActiveRaftCutover = nil, want refusal (codex P1)")
+	}
+	// Sidecar must be unchanged on disk — the helper is read-only.
+	got, err2 := encryption.ReadSidecar(path)
+	if err2 != nil {
+		t.Fatalf("ReadSidecar after helper: %v", err2)
+	}
+	if got.RaftEnvelopeCutoverIndex != 12345 {
+		t.Errorf("post-helper RaftEnvelopeCutoverIndex = %d, want 12345 (helper must be read-only)", got.RaftEnvelopeCutoverIndex)
+	}
+}
+
+// TestRefuseStartupOnActiveRaftCutover_BadSidecarPropagates pins the
+// fail-closed read-error branch: ReadSidecar errors that are NOT
+// encryption.IsNotExist (malformed JSON, schema violation, KEK
+// mismatch, etc.) must propagate as a refusal error. The helper's
+// nil-return is narrowed to the pre-bootstrap case only; widening
+// it into fail-open behaviour for any other failure mode would
+// silently bypass the cutover guard.
+//
+// We use a malformed sidecar file (text that is not valid JSON) to
+// trigger a non-NotExist read error. The exact error type is not
+// asserted — only that the helper returns non-nil — because the
+// underlying error chain is supplied by encryption.ReadSidecar's
+// JSON / version decoder, which is not a contract surface this
+// test should pin.
+func TestRefuseStartupOnActiveRaftCutover_BadSidecarPropagates(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := dir + "/keys.json"
+	if err := os.WriteFile(path, []byte("not a valid sidecar"), 0o600); err != nil {
+		t.Fatalf("write malformed sidecar: %v", err)
+	}
+	if err := refuseStartupOnActiveRaftCutover(path); err == nil {
+		t.Fatal("malformed sidecar: refuseStartupOnActiveRaftCutover = nil, want refusal (fail-closed on read error)")
 	}
 }

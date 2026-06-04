@@ -488,7 +488,7 @@ func run() error {
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, etcdraftengine.DeriveNodeID)
 	if err := startServers(serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
-		runtimes: runtimes, bootstrapServers: bootstrapServers,
+		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapServers,
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
@@ -861,11 +861,23 @@ func buildShardGroups(
 			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
 		}
 		runtimes = append(runtimes, runtime)
-		shardGroups[g.id] = &kv.ShardGroup{
+		// Stage 6E-2c: route every shard group's TransactionManager
+		// through NewLeaderProxyForShardGroup so the proposer chain
+		// consults sg.raftPayloadWrap on every Propose / ProposeAdmin.
+		// The cell is nil at startup (the Stage 3 default — payloads
+		// pass through cleartext); Stage 6E-2d's EnableRaftEnvelope
+		// handler will publish the active wrap closure the instant
+		// the cutover entry commits. Going through this constructor
+		// for every group avoids a future "I forgot to wire wrap on
+		// this code path" regression — if a new shard group bypasses
+		// this helper, the wrap install would silently no-op on
+		// proposals for that group.
+		sg := &kv.ShardGroup{
 			Engine: runtime.engine,
 			Store:  st,
-			Txn:    kv.NewLeaderProxyWithEngine(runtime.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),
 		}
+		sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id)))
+		shardGroups[g.id] = sg
 	}
 	return runtimes, shardGroups, nil
 }
@@ -875,6 +887,23 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 		return nil
 	}
 	return factory(groupID)
+}
+
+// proposerForGroup returns the wrap-aware proposer for rt's shard
+// group, falling back to the raw engine when shardGroups does not
+// have an entry (test fixtures that construct a partial map).
+// Centralises the Stage 6E-2c forwarded-write wiring so the
+// Internal.Forward receive side and any future wrap-aware
+// construction site share the same lookup shape: the leader's
+// local LeaderProxy.Commit path is already wrap-aware via
+// NewLeaderProxyForShardGroup; this helper extends the same
+// guarantee to the Internal.Forward path that follower-forwarded
+// writes ride (codex P1 round-1 r2).
+func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+	if sg, ok := shardGroups[rt.spec.id]; ok && sg != nil {
+		return sg.Proposer()
+	}
+	return rt.engine
 }
 
 // loadKEKAndRunStartupGuards loads the file-backed KEK wrapper and
@@ -1067,6 +1096,7 @@ type serversInput struct {
 	cancel           context.CancelFunc
 	lc               *net.ListenConfig
 	runtimes         []*raftGroupRuntime
+	shardGroups      map[uint64]*kv.ShardGroup
 	bootstrapServers []raftengine.Server
 	shardStore       *kv.ShardStore
 	coordinate       kv.Coordinator
@@ -1137,6 +1167,7 @@ func startServers(in serversInput) error {
 		eg:              in.eg,
 		cancel:          in.cancel,
 		runtimes:        in.runtimes,
+		shardGroups:     in.shardGroups,
 		shardStore:      in.shardStore,
 		coordinate:      in.coordinate,
 		distServer:      in.distServer,
@@ -1505,6 +1536,7 @@ func startRaftServers(
 	lc *net.ListenConfig,
 	eg *errgroup.Group,
 	runtimes []*raftGroupRuntime,
+	shardGroups map[uint64]*kv.ShardGroup,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
@@ -1538,7 +1570,7 @@ func startRaftServers(
 			opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
 		}
 		gs := grpc.NewServer(opts...)
-		trx := kv.NewTransactionWithProposer(rt.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
+		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
@@ -1812,6 +1844,7 @@ type runtimeServerRunner struct {
 	eg                              *errgroup.Group
 	cancel                          context.CancelFunc
 	runtimes                        []*raftGroupRuntime
+	shardGroups                     map[uint64]*kv.ShardGroup
 	shardStore                      *kv.ShardStore
 	coordinate                      kv.Coordinator
 	distServer                      *adapter.DistributionServer
@@ -1920,6 +1953,7 @@ func (r *runtimeServerRunner) start() error {
 		r.lc,
 		r.eg,
 		r.runtimes,
+		r.shardGroups,
 		r.shardStore,
 		r.coordinate,
 		r.distServer,

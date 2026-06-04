@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -105,6 +106,98 @@ func (p *wrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*rafte
 	res, err := p.inner.ProposeAdmin(ctx, wrapped)
 	if err != nil {
 		return nil, errors.Wrap(err, "kv: wrapped propose-admin")
+	}
+	return res, nil
+}
+
+// dynamicWrappedProposer is the Stage 6E-2c sibling of wrappedProposer
+// for the case where the wrap closure must be swappable at runtime.
+// On every Propose / ProposeAdmin call it loads an atomic.Pointer to
+// the currently-active RaftPayloadWrapper; a nil pointer means wrap
+// is inactive (payload passes through verbatim).
+//
+// Why a separate type (vs adding a setter to wrappedProposer): the
+// existing wrappedProposer captures wrap at construction time and is
+// used by static call sites that never need to change wrap state.
+// The Stage 6E-2 cutover model needs runtime swap so the
+// EnableRaftEnvelope admin handler (Stage 6E-2d) can publish the
+// active wrap closure the instant the cutover entry commits, without
+// rebuilding the TransactionManager or stalling in-flight proposals.
+// Splitting the two keeps the static-wrap fast path branch-free and
+// keeps the dynamic path's atomic.Pointer.Load() cost confined to
+// the call sites that need it.
+//
+// The pointer is required to be non-nil; pass an atomic.Pointer that
+// stores nil to express "wrap inactive". This is so the call site
+// (typically a ShardGroup) owns the storage and the proposer just
+// reads.
+type dynamicWrappedProposer struct {
+	inner   raftengine.Proposer
+	wrapPtr *atomic.Pointer[RaftPayloadWrapper]
+}
+
+// newDynamicWrappedProposer wires a proposer that consults wrapPtr
+// on every Propose / ProposeAdmin. wrapPtr.Load() == nil keeps the
+// path as a pure pass-through to inner; a non-nil value applies
+// wrap before forwarding.
+//
+// Contract: inner MUST be non-nil. A nil inner is a caller bug
+// (the construction site is responsible for handing in a valid
+// proposer) and the constructor deliberately does not silently
+// degrade — passing nil to Propose / ProposeAdmin would NPE at
+// the first call site, which is the same fail-fast shape as the
+// sibling newWrappedProposer(nil, wrap) and matches CLAUDE.md's
+// "don't validate for scenarios that can't happen" policy at
+// internal boundaries.
+//
+// wrapPtr MAY be nil — that path returns inner verbatim, mirroring
+// newWrappedProposer(inner, nil)'s degraded shape so a wiring site
+// that accidentally drops the pointer downgrades to a no-wrap
+// proposer rather than crashing the engine loop on first use. The
+// caller owns the storage lifetime of the pointer when non-nil.
+func newDynamicWrappedProposer(inner raftengine.Proposer, wrapPtr *atomic.Pointer[RaftPayloadWrapper]) raftengine.Proposer {
+	if wrapPtr == nil {
+		// Defensive degradation: passing a nil pointer would NPE
+		// on the first Propose. Treat as static no-wrap so callers
+		// that pass nil by mistake see the Stage 3 default rather
+		// than crashing the engine loop. This matches
+		// newWrappedProposer(inner, nil) returning inner verbatim.
+		return inner
+	}
+	return &dynamicWrappedProposer{inner: inner, wrapPtr: wrapPtr}
+}
+
+func (p *dynamicWrappedProposer) currentWrap() RaftPayloadWrapper {
+	if loaded := p.wrapPtr.Load(); loaded != nil {
+		return *loaded
+	}
+	return nil
+}
+
+func (p *dynamicWrappedProposer) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	wrapped, err := applyRaftPayloadWrap(p.currentWrap(), data)
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.inner.Propose(ctx, wrapped)
+	if err != nil {
+		return nil, errors.Wrap(err, "kv: dynamic wrapped propose")
+	}
+	return res, nil
+}
+
+// ProposeAdmin mirrors Propose's wrap-applies semantics. See
+// wrappedProposer.ProposeAdmin for the design rationale (the wrap
+// layer is NOT a barrier exemption; the EnableRaftEnvelope cutover
+// marker bypasses wrap at the call site, not the method level).
+func (p *dynamicWrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	wrapped, err := applyRaftPayloadWrap(p.currentWrap(), data)
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.inner.ProposeAdmin(ctx, wrapped)
+	if err != nil {
+		return nil, errors.Wrap(err, "kv: dynamic wrapped propose-admin")
 	}
 	return res, nil
 }
