@@ -13,9 +13,11 @@ import (
 // writeS3KeymapTracker writes <root>/s3/<EncodeSegment(bucket)>/KEYMAP.jsonl
 // with the given records and NO companion .elastickv-meta.json
 // sidecar, so isKeymapCollisionTracker classifies it as a tracker.
-func writeS3KeymapTracker(t *testing.T, root, bucket string, records []KeymapRecord) {
+// Bucket is taken from the shared collisionTestBucket constant since
+// every commit-A and commit-C fixture uses the same name.
+func writeS3KeymapTracker(t *testing.T, root string, records []KeymapRecord) {
 	t.Helper()
-	bucketDir := filepath.Join(root, "s3", EncodeSegment([]byte(bucket)))
+	bucketDir := filepath.Join(root, "s3", EncodeSegment([]byte(collisionTestBucket)))
 	if err := os.MkdirAll(bucketDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -71,7 +73,6 @@ func metaRecord(encoded, originalSlashKey string) KeymapRecord {
 func TestLoadBucketKeymap_HappyPath(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
-	const bucket = "b"
 	records := []KeymapRecord{
 		leafRecord("path/to"+S3LeafDataSuffix, "path/to"),
 		metaRecord("renamed.user-data", "real"+S3MetaSuffixReserved),
@@ -81,7 +82,7 @@ func TestLoadBucketKeymap_HappyPath(t *testing.T) {
 			Kind:        KindSHAFallback,
 		},
 	}
-	writeS3KeymapTracker(t, in, bucket, records)
+	writeS3KeymapTracker(t, in, records)
 
 	got, err := loadKeymapForBucketB(t, in)
 	if err != nil {
@@ -107,7 +108,7 @@ func TestLoadBucketKeymap_HappyPath(t *testing.T) {
 func TestLoadBucketKeymap_DuplicateEncoded(t *testing.T) {
 	t.Parallel()
 	in := t.TempDir()
-	writeS3KeymapTracker(t, in, "b", []KeymapRecord{
+	writeS3KeymapTracker(t, in, []KeymapRecord{
 		leafRecord("path/to"+S3LeafDataSuffix, "path/to"),
 		leafRecord("path/to"+S3LeafDataSuffix, "elsewhere"),
 	})
