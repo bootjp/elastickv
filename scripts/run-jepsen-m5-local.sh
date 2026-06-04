@@ -98,11 +98,18 @@ for bin in "$ROUTE_KEY_BIN" "$LIST_ROUTES_BIN" "$BINARY"; do
 done
 T1_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t1)"
 T3_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t3)"
-# Group 1: [T1_KEY, T3_KEY) — tables 1, 2
-# Group 2: [T3_KEY, +inf)   — tables 3, 4
-# Keys outside [T1_KEY, +inf) fall through to the default group; this
-# workload only writes table-route keys so that range is unused.
-SHARD_RANGES="${T1_KEY}:${T3_KEY}=1,${T3_KEY}:=2"
+# Issue #930 fix: --shardRanges must cover every routing key.  Without
+# a [<empty>, T1_KEY) range, any table whose base64-encoded name sorts
+# before "amVwc2VuX2FwcGVuZF90MQ" (= base64("jepsen_append_t1"))
+# returns "no route for key" from ShardedCoordinator.dispatchTxn, and
+# createTableWithRetry silently swallows that as ACTIVE.
+#
+# Group 1: [<empty>, T3_KEY)   — default + tables 1, 2
+# Group 2: [T3_KEY, +inf)      — tables 3, 4
+#
+# Note: assigning the default range to group 1 (not a third group) keeps
+# the topology consistent with the 1-process-2-groups launch.
+SHARD_RANGES=":${T3_KEY}=1,${T3_KEY}:=2"
 echo "[shard-ranges] $SHARD_RANGES"
 
 # ---- stop any previously managed cluster ----
