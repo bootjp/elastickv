@@ -270,6 +270,62 @@ func TestSQSEncodeGateUsesRawPartitionCount(t *testing.T) {
 	}
 }
 
+// TestSQSEncodeClassicQueueWithExplicitPartitionZeroUsesClassicKeys is
+// the regression for codex P1 / gemini critical (PR #929). A classic
+// queue dump with an explicit `"partition": 0` is allowed past gate 4
+// (which only rejects *Partition != 0) — but the dispatch MUST still
+// pick classic-shape keys because the live reader for a classic queue
+// only scans the classic keyspace.
+//
+// Before the (isPartitioned bool, partition uint32) signature, the
+// `partition != nil` branch incorrectly chose partitioned keys here,
+// making restored messages invisible. This test would fail (silently
+// emit |p|0|... keys) under that buggy dispatch.
+func TestSQSEncodeClassicQueueWithExplicitPartitionZeroUsesClassicKeys(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "classic",
+		[]byte(`{"format_version":1,"name":"classic",`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{
+			// PartitionCount<=1 (classic), but message has explicit
+			// "partition": 0. Gate 4 must NOT fire (*Partition == 0),
+			// and addMessage must use classic keys.
+			[]byte(`{"message_id":"m1","body":"hello",` +
+				`"send_timestamp_millis":1000,"available_at_millis":1000,"partition":0}`),
+		})
+	fsm := encodeSQSTree(t, in)
+	entries, _, err := DecodeLiveEntries(bytes.NewReader(fsm))
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	// No partitioned-shape data/vis/byage/dedup keys allowed.
+	for _, e := range entries {
+		for _, p := range []string{
+			SQSPartitionedMsgDataPrefix,
+			SQSPartitionedMsgVisPrefix,
+			SQSPartitionedMsgByAgePrefix,
+			SQSPartitionedMsgDedupPrefix,
+		} {
+			if bytes.HasPrefix(e.UserKey, []byte(p)) {
+				t.Errorf("partitioned-shape key on classic queue with explicit partition=0: %q (prefix %q)", e.UserKey, p)
+			}
+		}
+	}
+	// At least one classic data key must exist.
+	found := false
+	for _, e := range entries {
+		if bytes.HasPrefix(e.UserKey, []byte(SQSMsgDataPrefix)) &&
+			!bytes.HasPrefix(e.UserKey, []byte(SQSPartitionedMsgDataPrefix)) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no classic data record found")
+	}
+}
+
 // TestSQSEncodeLegacyDumpsWithoutPartitionStillRoundTrip pins that a
 // pre-M5-3 messages.jsonl (no "partition" field on any line) still
 // round-trips through the M5-3 encoder unchanged when the queue is

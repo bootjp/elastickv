@@ -184,13 +184,13 @@ func resolveDedupID(rec *sqsMessageRecord, meta *sqsQueueMetaPublic) string {
 //   - dedup: FIFO + resolveDedupID(rec, meta) non-empty. ExpiresAtMillis =
 //     SendTimestampMs + sqsFifoDedupWindowMillis. CBD queues get a SHA-256
 //     derived dedup-id (matches adapter/sqs_fifo.go resolveFifoDedupID).
-func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, partition *uint32, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
+func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, isPartitioned bool, partition uint32, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
 	msgIDBytes := []byte(rec.MessageID)
 
 	var visKey, byAgeKey []byte
-	if partition != nil {
-		visKey = sqsPartitionedMsgVisKeyBytes(queueName, *partition, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
-		byAgeKey = sqsPartitionedMsgByAgeKeyBytes(queueName, *partition, sqsRestoreGeneration, rec.SendTimestampMillis, rec.MessageID)
+	if isPartitioned {
+		visKey = sqsPartitionedMsgVisKeyBytes(queueName, partition, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
+		byAgeKey = sqsPartitionedMsgByAgeKeyBytes(queueName, partition, sqsRestoreGeneration, rec.SendTimestampMillis, rec.MessageID)
 	} else {
 		visKey = sqsMsgVisKeyBytes(queueName, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
 		byAgeKey = sqsMsgByAgeKeyBytes(queueName, sqsRestoreGeneration, rec.SendTimestampMillis, rec.MessageID)
@@ -220,13 +220,13 @@ func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, 
 		return err
 	}
 	var dedupKey []byte
-	if partition != nil {
+	if isPartitioned {
 		// Partitioned dedup includes <group-seg> + '|' + <dedup-seg>
 		// per the partitioned dedup constructor — see
 		// sqsPartitionedMsgDedupKeyBytes for the rationale (CodeRabbit
 		// major PR #732 round 6: the second '|' prevents FNV-collapse
 		// across distinct (groupID, dedupID) pairs on the same partition).
-		dedupKey = sqsPartitionedMsgDedupKeyBytes(queueName, *partition, rec.MessageGroupID, dedupID)
+		dedupKey = sqsPartitionedMsgDedupKeyBytes(queueName, partition, rec.MessageGroupID, dedupID)
 	} else {
 		dedupKey = sqsMsgDedupKeyBytes(queueName, dedupID)
 	}

@@ -266,14 +266,29 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 // and stages each one's data + side records on b, returning the
 // maximum SequenceNumber observed (used to write the FIFO seq counter).
 // Split out of encodeQueueMessages so the parent stays under cyclop.
+//
+// isPartitioned is derived once from raw meta.PartitionCount > 1 — NOT
+// from rec.Partition != nil. Codex P1 / gemini critical (PR #929):
+// a classic queue dump (PartitionCount<=1) may carry an explicit
+// rec.Partition = &0 that validatePartitioningOne lets through (gate 4
+// only rejects *Partition != 0). Routing on `partition != nil` would
+// emit partitioned keys for that classic queue, and the live reader
+// only scans the classic keyspace - the messages become invisible on
+// first read. Keying the dispatch on isPartitioned (a property of the
+// QUEUE, not the message) closes that gap.
 func (e *SQSRecordEncoder) stageMessageRecords(b *snapshotBuilder, meta *sqsQueueMetaPublic, records []sqsMessageRecord) (uint64, error) {
 	var maxSeq uint64
+	isPartitioned := meta.PartitionCount > 1
 	for i := range records {
-		seq, err := e.addMessage(b, meta.Name, records[i].Partition, records[i])
+		var partition uint32
+		if isPartitioned && records[i].Partition != nil {
+			partition = *records[i].Partition
+		}
+		seq, err := e.addMessage(b, meta.Name, isPartitioned, partition, records[i])
 		if err != nil {
 			return 0, err
 		}
-		if err := e.addSideRecords(b, meta.Name, records[i].Partition, meta, &records[i]); err != nil {
+		if err := e.addSideRecords(b, meta.Name, isPartitioned, partition, meta, &records[i]); err != nil {
 			return 0, err
 		}
 		if seq > maxSeq {
@@ -378,10 +393,13 @@ func sortMessagesForPartitionedEmit(msgs []sqsMessageRecord) {
 // addMessage stages one !sqs|msg|data| record and returns the message's
 // sequence number (for the seq-counter computation). Visibility state is
 // zeroed (every message restores visible), matching the decoder default.
-// partition is non-nil only when the queue is partitioned
-// (meta.PartitionCount > 1); validatePartitioning enforces this
-// invariant before encodeQueueMessages invokes addMessage.
-func (e *SQSRecordEncoder) addMessage(b *snapshotBuilder, queueName string, partition *uint32, rec sqsMessageRecord) (uint64, error) {
+//
+// isPartitioned is derived from raw meta.PartitionCount > 1 by the
+// caller, NOT from rec.Partition != nil. The partition uint32 carries
+// the value (0 if the queue is classic). See stageMessageRecords doc
+// for why the key-shape decision MUST be made on the queue-level
+// predicate (codex P1 / gemini critical PR #929).
+func (e *SQSRecordEncoder) addMessage(b *snapshotBuilder, queueName string, isPartitioned bool, partition uint32, rec sqsMessageRecord) (uint64, error) {
 	if rec.MessageID == "" {
 		return 0, errors.Wrap(ErrSQSEncodeInvalidMessage, "message missing message_id")
 	}
@@ -409,8 +427,8 @@ func (e *SQSRecordEncoder) addMessage(b *snapshotBuilder, queueName string, part
 		return 0, err
 	}
 	var key []byte
-	if partition != nil {
-		key = sqsPartitionedMsgDataKeyBytes(queueName, *partition, sqsRestoreGeneration, rec.MessageID)
+	if isPartitioned {
+		key = sqsPartitionedMsgDataKeyBytes(queueName, partition, sqsRestoreGeneration, rec.MessageID)
 	} else {
 		key = sqsMsgDataKeyBytes(queueName, sqsRestoreGeneration, rec.MessageID)
 	}
