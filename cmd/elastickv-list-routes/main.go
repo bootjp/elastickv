@@ -20,7 +20,7 @@
 //	{
 //	  "catalog_version": 7,
 //	  "routes": [
-//	    {"route_id": 100, "raft_group_id": 1, "start": "...", "end": "...", "state": "ACTIVE"},
+//	    {"route_id": 100, "raft_group_id": 1, "start": "...", "end": "...", "state": "ROUTE_STATE_ACTIVE"},
 //	    ...
 //	  ]
 //	}

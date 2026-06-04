@@ -67,6 +67,12 @@ func TestEmit_RoundTripsRouteBytes(t *testing.T) {
 	decodedEnd, err := base64.StdEncoding.DecodeString(out.Routes[0].End)
 	require.NoError(t, err)
 	require.Equal(t, endBytes, decodedEnd)
+
+	// State serialises via proto's String() — verify the on-the-wire
+	// shape so a future enum-name change (e.g. stripped prefix to
+	// "ACTIVE") is caught here rather than silently parsed by the
+	// Clojure regex (claude[bot] low on PR #925).
+	require.Equal(t, "ROUTE_STATE_ACTIVE", out.Routes[0].State)
 }
 
 // TestEmit_EmptyEndDistinguishable verifies that an unset End
