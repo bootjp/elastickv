@@ -206,10 +206,19 @@ HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
     --local \
     --time-limit 30 \
     --rate 5 \
+    --host 127.0.0.1 \
     --dynamo-port 63801 \
     --list-routes-bin "$LIST_ROUTES_BIN" \
     --grpc-host-port  "$PROC_ADDR" \
   || EXIT_CODE=$?
+# --host 127.0.0.1 — without this the workload's open! resolves the
+# DynamoDB client hostname from (name node) where node is one of
+# default-nodes ["n1" "n2" "n3" "n4" "n5"]; these are virtual labels,
+# not real hostnames, and DNS resolution fails with 'nodename nor
+# servname provided'.  --host overrides via cli/common-cli-opts'
+# --host -> :host -> :dynamo-host -> make-ddb-client wiring.  Required
+# for the single-process two-group topology this script launches —
+# every "node" client talks to the same loopback DynamoDB endpoint.
 
 EXIT_CODE=${EXIT_CODE:-0}
 
