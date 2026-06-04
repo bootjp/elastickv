@@ -1,10 +1,25 @@
 # Composed-1 M5 — Jepsen route-shuffle workload
 
-Status: Proposed
+Status: Partial.  M5a shipped:
+  - PR #911 — `cmd/elastickv-split` + `cmd/elastickv-route-key` CLI helpers
+  - PR #916 — `dynamodb-append-multi-table-workload` (Clojure)
+  - PR #925 — `cmd/elastickv-list-routes` + setup-hook
+    `verify-multi-group-routing!`
+  - PR #924 — `scripts/run-jepsen-m5-local.sh` single-process
+    two-group launcher (with cross-PR integration to #925)
+  - PR #926 (separate) — `--host 127.0.0.1` fix discovered during
+    M5a E2E
+
+M5b (route-shuffle nemesis) is still open.  Plus one known follow-up
+issue from M5a E2E: workers report `ResourceNotFoundException` for
+every txn despite `create-all-tables!` reporting success and ListRoutes
+showing the expected two-group catalog — likely a CreateTable
+race / sync issue under 5-parallel client setup; tracked separately.
+
 Author: bootjp
-Date: 2026-06-02
+Date: 2026-06-02 (renamed *_proposed_* → *_partial_* on 2026-06-04)
 Parent design:
-[`2026_05_29_proposed_composed1_cross_group_commit_guard.md`](2026_05_29_proposed_composed1_cross_group_commit_guard.md)
+[`2026_05_29_partial_composed1_cross_group_commit_guard.md`](2026_05_29_partial_composed1_cross_group_commit_guard.md)
 
 > **Forward-looking proposal, same posture as the parent doc.**
 > Today's `SplitRange` is same-group only (per CLAUDE.md and
