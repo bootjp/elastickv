@@ -179,8 +179,9 @@ func TestSetDurableAppliedIndex_UsesPebbleSync(t *testing.T) {
 // past the snapshot's index.
 //
 // The test mirrors the production race in single-threaded form:
-//   1. ApplyMutationsRaftAt(... appliedIndex=N+k) — meta key = N+k
-//   2. SetDurableAppliedIndex(N) — must NO-OP (N < N+k)
+//  1. ApplyMutationsRaftAt(... appliedIndex=N+k) — meta key = N+k
+//  2. SetDurableAppliedIndex(N) — must NO-OP (N < N+k)
+//
 // After step 2, LastAppliedIndex must still report N+k.
 func TestSetDurableAppliedIndex_Monotonic(t *testing.T) {
 	ctx := context.Background()

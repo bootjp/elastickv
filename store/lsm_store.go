@@ -173,7 +173,13 @@ var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 //  2. dbMu          – guards the s.db pointer; held as a write-lock while the
 //     DB is being swapped (Restore/Close), and as a read-lock by every
 //     operation that accesses s.db.
-//  3. mtx           – guards the in-memory metadata fields
+//  3. applyMu       – serialises raft-apply conflict-check → batch-commit so
+//     concurrent ApplyMutationsRaft/At cannot both pass checkConflicts and
+//     then both commit. Also held by deletePrefixAtWithOpts and by
+//     SetDurableAppliedIndex's read-modify-write monotonic guard
+//     (PR #915 round-3) so the snapshot-persist checkpoint cannot rewind
+//     metaAppliedIndex below a concurrent per-Apply value.
+//  4. mtx           – guards the in-memory metadata fields
 //     (lastCommitTS, minRetainedTS, pendingMinRetainedTS).
 type pebbleStore struct {
 	db                   *pebble.DB

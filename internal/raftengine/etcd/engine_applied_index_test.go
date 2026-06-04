@@ -200,13 +200,15 @@ func TestPersistLocalSnapshotPayload_BumpsAppliedIndex(t *testing.T) {
 
 	require.NoError(t, e.persistLocalSnapshotPayload(index, []byte("payload-stub")))
 
-	events := rec.snapshot()
-	require.GreaterOrEqual(t, len(events), 2,
-		"both bump and save events MUST be recorded; got %d", len(events))
-	require.Equal(t, "bump", events[0].kind, "bump MUST be first")
-	require.Equal(t, index, events[0].index)
-	require.Equal(t, "save", events[1].kind, "save MUST be second")
-	require.Equal(t, index, events[1].index)
+	// Exact slice match (matches Site 1 style + closes claude[bot]
+	// round-3 note #4 / coderabbit round-2 nit). A spurious third
+	// event — e.g. an accidental double SaveSnap — would fail this
+	// assertion; a GreaterOrEqual + positional check would not.
+	require.Equal(t, []orderEvent{
+		{kind: "bump", index: index},
+		{kind: "save", index: index},
+	}, rec.snapshot(),
+		"hook MUST call SetDurableAppliedIndex BEFORE SaveSnap exactly once each")
 }
 
 // TestPersistLocalSnapshotPayload_BumpErrorAborts mirrors Site 1's
