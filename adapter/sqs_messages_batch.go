@@ -403,10 +403,6 @@ func (s *SQSServer) resolveFreshFifoSnapshot(ctx context.Context, queueName stri
 	return meta, dedupID, delay, nil
 }
 
-// buildBatchSendRecord runs every per-entry validation a single
-// SendMessage would, but returns the *sqsAPIError so the batch path
-// can drop the entry into Failed[] instead of failing the whole
-// request.
 // buildBatchSendRecord builds one standard-queue batch entry's record. It splits
 // two concerns that must NOT be conflated:
 //

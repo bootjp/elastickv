@@ -357,7 +357,19 @@ every replica applying the same log entry.
     every attempt (`buildSendRecordWithIdentity`), so the retry overwrites the
     same keys idempotently. This needs **no** FSM probe / `PrevCommitTS` / gate —
     the keys become content-stable, so re-applying is a plain idempotent
-    overwrite. Tests: `adapter/sqs_batch_send_dedup_test.go`.
+    overwrite. The identity also pins `AvailableAtMillis` (vis-key input) and the
+    per-entry validation re-runs against the current meta on every attempt, so a
+    mid-retry `SetQueueAttributes` neither shifts the vis key (codex P2 round-1)
+    nor lets a now-too-large body through (codex P2 round-2). Tests:
+    `adapter/sqs_batch_send_dedup_test.go`.
+    - **Residual edge (within at-least-once, no action):** if attempt 1
+      *commits* (committed-but-conflicted) and a concurrent `SetQueueAttributes`
+      tightens a limit (e.g. lowers `MaximumMessageSize`) before the retry, the
+      retry's re-validation rejects the entry into `Failed[]` even though it is
+      already in the queue — an inconsistent client view (message stored, client
+      told it failed) but never a double-send. This is within the SQS
+      standard-queue at-least-once contract; distinguishing committed-vs-not
+      would need a dedup probe, which is out of proportion for this corner.
 
 ## Milestones
 
