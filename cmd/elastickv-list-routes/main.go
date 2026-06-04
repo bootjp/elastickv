@@ -4,7 +4,7 @@
 // table-route keys on the expected Raft groups before any workload
 // op runs.
 //
-// Per the design doc (docs/design/2026_06_02_proposed_composed1_m5_jepsen_route_shuffle.md
+// Per the design doc (docs/design/2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md
 // §3.3), the Jepsen client's setup! shells out to this tool rather
 // than re-implementing the gRPC client in Clojure: a JSON contract is
 // stable across versions and a future ListRoutes schema change shows

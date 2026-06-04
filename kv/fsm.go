@@ -72,7 +72,7 @@ type kvFSM struct {
 	// short-circuit as "unpinned" (no Composed-1 enforcement) —
 	// matching the pre-feature behaviour byte-for-byte.  Concrete
 	// production type is *distribution.Engine.  See
-	// docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+	// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 	// §4.2 prerequisite block + §M2.
 	routes RouteHistory
 	// shardGroupID is the Raft group ID this FSM serves.  Used by
@@ -171,7 +171,7 @@ func WithCutoverSource(src CutoverSource) FSMOption {
 // historical owner-of-key resolution.  Zero is reserved for the
 // not-wired case.
 //
-// See docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+// See docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 // §M2 + §4.2 prerequisite block.
 func WithRouteHistory(routes RouteHistory, shardGroupID uint64) FSMOption {
 	return func(f *kvFSM) {
@@ -551,7 +551,7 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 }
 
 // verifyComposed1 is the M3 apply-time Composed-1 gate per
-// docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 // §4.2(a) + §4.4.  Runs two checks before the txn's writes land:
 //
 //	(a) Observed-version owner — the txn's read-set was captured

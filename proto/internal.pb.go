@@ -203,7 +203,7 @@ type Request struct {
 	// transaction's read set was captured at (set on BeginTxn from
 	// distribution.Engine.Version()). Zero means "unpinned" (legacy
 	// callers + read-only paths). M3 of the Composed-1 design
-	// (docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md)
+	// (docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md)
 	// will gate the FSM apply path on it; M1 (this field's introduction)
 	// is plumbing only — the FSM ignores the value, so all existing
 	// callers see no behaviour change.

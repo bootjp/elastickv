@@ -1,10 +1,6 @@
 # Composed-1 — cross-group commit-time ownership guard
 
-Status: Partial — M1–M4 shipped via PR #900; M5a shipped via PRs
-#911 / #916 / #924 / #925; M5b (route-shuffle nemesis) still
-open.  See companion doc
-`2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md` for the
-detailed M5 design and per-milestone state.
+Status: Partial — M1–M4 shipped via PR #900; M5a shipped via PRs #911 / #916 / #924 / #925; M5b (route-shuffle nemesis) still open.  See companion doc `2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md` for the detailed M5 design and per-milestone state.
 Author: bootjp
 Date: 2026-05-29 (renamed *_proposed_* → *_partial_* on 2026-06-04)
 
