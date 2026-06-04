@@ -172,6 +172,63 @@ func TestSetDurableAppliedIndex_UsesPebbleSync(t *testing.T) {
 	require.Equal(t, idx, got)
 }
 
+// TestSetDurableAppliedIndex_Monotonic guards the round-2 fix for
+// codex P2: a background snapshot persist (which is what
+// SetDurableAppliedIndex services) MUST NOT rewind metaAppliedIndex
+// when a concurrent ApplyMutationsRaftAt has already advanced it
+// past the snapshot's index.
+//
+// The test mirrors the production race in single-threaded form:
+//   1. ApplyMutationsRaftAt(... appliedIndex=N+k) — meta key = N+k
+//   2. SetDurableAppliedIndex(N) — must NO-OP (N < N+k)
+// After step 2, LastAppliedIndex must still report N+k.
+func TestSetDurableAppliedIndex_Monotonic(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	const (
+		applied uint64 = 250 // simulated ApplyMutationsRaftAt index
+		snapIdx uint64 = 100 // simulated older background snapshot persist
+	)
+	require.Less(t, snapIdx, applied,
+		"test invariant: snapshot index must be older than the applied index for the race to matter")
+
+	// Step 1: ApplyMutationsRaftAt advances metaAppliedIndex to N+k.
+	muts := []*KVPairMutation{{Op: OpTypePut, Key: []byte("k"), Value: []byte("v")}}
+	require.NoError(t, ps.ApplyMutationsRaftAt(ctx, muts, nil, 100, 100, applied))
+
+	// Step 2: background SetDurableAppliedIndex(snapIdx) — the per-Apply
+	// path has already moved past, so this MUST no-op.
+	require.NoError(t, ps.SetDurableAppliedIndex(snapIdx))
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present)
+	require.Equal(t, applied, got,
+		"SetDurableAppliedIndex MUST NOT rewind metaAppliedIndex below the per-Apply value")
+}
+
+// TestSetDurableAppliedIndex_AdvancesOnlyForward complements the
+// monotonic test by exercising the inverse case: the snapshot persist
+// runs first (no prior apply), then a strictly-greater index lands.
+// The forward write MUST take effect.
+func TestSetDurableAppliedIndex_AdvancesOnlyForward(t *testing.T) {
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	require.NoError(t, ps.SetDurableAppliedIndex(50))
+	require.NoError(t, ps.SetDurableAppliedIndex(100)) // strictly greater → advances
+	require.NoError(t, ps.SetDurableAppliedIndex(75))  // strictly less → no-op
+	require.NoError(t, ps.SetDurableAppliedIndex(100)) // equal → no-op
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present)
+	require.Equal(t, uint64(100), got,
+		"SetDurableAppliedIndex must advance strictly-greater values and no-op on equal/lesser")
+}
+
 // TestLastAppliedIndex_CorruptValue exercises the "len(val) <
 // timestampSize" fallback — a truncated meta key surfaces as missing
 // (NOT as an error) so the caller falls back to full restore rather

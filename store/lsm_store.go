@@ -618,21 +618,64 @@ func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
 // forever. The +1 fsync per snapshot persist (rare; default
 // SnapshotCount=10000) is negligible vs that risk.
 //
-// dbMu.RLock is sufficient because we only mutate s.db, not its
-// pointer. The raft-apply loop is serial at the engine boundary, so
-// no concurrent applyMutationsWithOpts can race this single-key
-// write at the Pebble level beyond what last-writer-wins already
-// gives us (and last-writer-wins on metaAppliedIndex always
-// satisfies have >= want for any want we already passed).
+// Monotonicity (round-2 P2 fix for PR #915): when persistLocalSnapshot
+// runs in a background worker, raft apply can continue and the per-
+// entry ApplyMutationsRaftAt path can advance metaAppliedIndex past
+// `idx` before this method runs. An unconditional write would rewind
+// the meta key — defeating the soak/verification invariant and
+// causing the future skip gate to fall back unnecessarily. The
+// applyMu lock serialises with applyMutationsWithOpts /
+// deletePrefixAtWithOpts (both hold it across their batch commit),
+// and the read-modify-write keeps the meta key strictly monotonic.
+//
+// Lock order: dbMu.RLock before applyMu.Lock matches the existing
+// discipline in applyMutationsWithOpts (lsm_store.go around :1438 /
+// :1444). No deadlock.
 func (s *pebbleStore) SetDurableAppliedIndex(idx uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
+	existing, present, err := s.readAppliedIndexLocked()
+	if err != nil {
+		return err
+	}
+	if present && existing >= idx {
+		// Concurrent apply already advanced the meta key past `idx`;
+		// no work needed. The skip-invariant still holds because the
+		// snapshot's claim (LastAppliedIndex >= snap.Metadata.Index)
+		// is satisfied by existing >= idx >= snap.Metadata.Index.
+		return nil
+	}
+
 	batch := s.db.NewBatch()
 	defer func() { _ = batch.Close() }()
 	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, idx); err != nil {
 		return err
 	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
+}
+
+// readAppliedIndexLocked decodes the metaAppliedIndex key. Caller
+// MUST hold s.dbMu.RLock (so s.db is stable) AND s.applyMu.Lock (so
+// the value reflects a consistent snapshot vs concurrent batch
+// commits in applyMutationsWithOpts). The body is shared with the
+// unlocked LastAppliedIndex() reader; same (0, false, nil) semantics
+// for absent / truncated meta keys.
+func (s *pebbleStore) readAppliedIndexLocked() (uint64, bool, error) {
+	val, closer, err := s.db.Get(metaAppliedIndexBytes)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, errors.WithStack(err)
+	}
+	defer func() { _ = closer.Close() }()
+	if len(val) < timestampSize {
+		return 0, false, nil
+	}
+	return binary.LittleEndian.Uint64(val), true, nil
 }
 
 func (s *pebbleStore) saveMinRetainedTS(ts uint64) error {
