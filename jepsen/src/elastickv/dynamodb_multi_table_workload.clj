@@ -522,6 +522,15 @@
             {:name            (or (:name opts) "elastickv-dynamodb-append-multi-table")
              :nodes           nodes
              :db              db
+             ;; Setup-hook verification keys — read by
+             ;; verify-multi-group-routing! at workload setup! time.
+             ;; Threaded into the test map (not the workload map)
+             ;; because jepsen.client/setup! receives the test, not
+             ;; opts; the M5a launch script passes these via the
+             ;; --list-routes-bin and --grpc-host-port CLI flags
+             ;; defined in dynamo-cli-opts below.
+             :list-routes-bin (:list-routes-bin opts)
+             :grpc-host-port  (:grpc-host-port opts)
              :dynamo-host     (:dynamo-host opts)
              :os              (if local? os/noop debian/os)
              :net             (if local? net/noop net/iptables)
@@ -561,7 +570,11 @@
     :parse-fn #(Integer/parseInt %)]
    [nil "--max-txn-length N" "Maximum number of micro-ops per transaction."
     :default nil
-    :parse-fn #(Integer/parseInt %)]])
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--list-routes-bin PATH" "Path to the cmd/elastickv-list-routes Go helper used by the workload's setup-hook verification.  Defaults to bare-name 'elastickv-list-routes' (assumes PATH lookup); pass an absolute path when invoking from a launch script that builds the binary into a tmp dir."
+    :default nil]
+   [nil "--grpc-host-port HOST:PORT" "gRPC --address argument passed to elastickv-list-routes by the setup-hook verification.  Default 127.0.0.1:50051 matches scripts/run-jepsen-m5-local.sh's PROC_ADDR."
+    :default nil]])
 
 (defn- prepare-dynamo-opts
   "Transform parsed CLI options into the map expected by
