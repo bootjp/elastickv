@@ -253,6 +253,49 @@ func TestValidateKeymapRecord_EmptyOriginal(t *testing.T) {
 	}
 }
 
+// TestValidateKeymapOriginalPath pins codex P2 #928 round 3: the
+// decoded original key must not contain any form the decoder's
+// safeJoinUnderRoot would refuse — NUL byte, backslash, dot
+// segments, empty segments. Without this gate the encoder would
+// emit !s3 records under a key the decoder cannot re-materialise
+// during restore, surfacing the corruption only at restore time.
+func TestValidateKeymapOriginalPath(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		key     string
+		wantErr bool
+	}{
+		{"plain key", "path/to/object", false},
+		{"single segment", "object", false},
+		{"underscore prefix (legit user key)", "_foo/bar", false},
+		{"contains NUL", "path/\x00/bad", true},
+		{"contains backslash", "path\\to\\file", true},
+		{"middle ..", "a/../b", true},
+		{"middle .", "a/./b", true},
+		{"leading slash", "/leading", true},
+		{"trailing slash", "trailing/", true},
+		{"double slash", "double//slash", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			rec := KeymapRecord{
+				Encoded:     "any" + S3LeafDataSuffix,
+				OriginalB64: base64.RawURLEncoding.EncodeToString([]byte(c.key)),
+				Kind:        KindSHAFallback,
+			}
+			err := validateKeymapRecord(rec)
+			if c.wantErr && !errors.Is(err, ErrInvalidKeymapRecord) {
+				t.Fatalf("err = %v, want ErrInvalidKeymapRecord for key %q", err, c.key)
+			}
+			if !c.wantErr && err != nil {
+				t.Fatalf("unexpected err = %v for key %q", err, c.key)
+			}
+		})
+	}
+}
+
 // TestValidateKeymapRecord_UnknownKind pins the forward-compat
 // guard: an unrecognized Kind value fails closed rather than
 // silently passing.

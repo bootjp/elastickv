@@ -148,10 +148,48 @@ func validateKeymapRecord(rec KeymapRecord) error {
 		return errors.Wrapf(ErrInvalidKeymapRecord,
 			"empty original key for encoded segment %q (kind=%q)", rec.Encoded, rec.Kind)
 	}
+	// Mirror the decoder's safeJoinUnderRoot (s3.go:808) restrictions
+	// on the decoded original key. A corrupt KEYMAP entry can decode
+	// to a key shape the decoder's restore path refuses (NUL byte,
+	// backslash, `.`/`..` segments, empty segments, leading slash).
+	// Without this gate the encoder would emit !s3 records under the
+	// rejected key and the resulting snapshot would fail at restore
+	// instead of fail-closed at keymap load time. Codex P2 #928 round 3.
+	if err := validateKeymapOriginalPath(rec, original); err != nil {
+		return err
+	}
 	if err := validateKeymapReservedRoot(rec, original); err != nil {
 		return err
 	}
 	return validateKeymapKindSuffix(rec, original)
+}
+
+// validateKeymapOriginalPath mirrors the decoder's
+// safeJoinUnderRoot restrictions (s3.go:808) on the decoded
+// original key. The decoder refuses NUL bytes (POSIX cannot
+// represent them), backslashes (Windows separator that bypasses
+// the slash-segment scan), `.` / `..` segments (S3 treats them
+// literally; filepath.Clean would silently merge distinct keys),
+// and empty segments (consecutive `/` or leading `/`). A KEYMAP
+// entry recovering such a key would emit !s3 records the decoder
+// could never re-materialise during restore. Codex P2 #928 round 3.
+func validateKeymapOriginalPath(rec KeymapRecord, original string) error {
+	if strings.ContainsRune(original, 0) {
+		return errors.Wrapf(ErrInvalidKeymapRecord,
+			"original key %q contains NUL byte (encoded=%q)", original, rec.Encoded)
+	}
+	if strings.ContainsRune(original, '\\') {
+		return errors.Wrapf(ErrInvalidKeymapRecord,
+			"original key %q contains backslash (encoded=%q; rename in S3 first)", original, rec.Encoded)
+	}
+	for _, seg := range strings.Split(original, "/") {
+		switch seg {
+		case "", ".", "..":
+			return errors.Wrapf(ErrInvalidKeymapRecord,
+				"original key %q has invalid path segment %q (encoded=%q)", original, seg, rec.Encoded)
+		}
+	}
+	return nil
 }
 
 // validateKeymapEncodedPath rejects rec.Encoded values that would
