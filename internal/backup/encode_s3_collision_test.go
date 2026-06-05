@@ -362,6 +362,30 @@ func TestVerifyKeymapTargetsExist(t *testing.T) {
 			t.Fatalf("err message = %v, want orphan-keymap-record", err)
 		}
 	})
+
+	t.Run("target is directory", func(t *testing.T) {
+		t.Parallel()
+		// Codex P2 #928 round 2: a corrupt KEYMAP entry naming an
+		// existing DIRECTORY (e.g. a prefix created by another
+		// object) passes a bare existence check, but the walk would
+		// recurse into it and silently ignore the keymap entry.
+		// verifyKeymapTargetsExist must require regular files.
+		dirIn := t.TempDir()
+		bucketDir := filepath.Join(dirIn, "s3", EncodeSegment([]byte(collisionTestBucket)))
+		if err := os.MkdirAll(filepath.Join(bucketDir, "dir-target"+S3LeafDataSuffix), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		km := map[string]KeymapRecord{
+			"dir-target" + S3LeafDataSuffix: leafRecord("dir-target"+S3LeafDataSuffix, "dir-target"),
+		}
+		err := verifyKeymapTargetsExistCase(t, dirIn, km)
+		if !errors.Is(err, ErrInvalidKeymapRecord) {
+			t.Fatalf("err = %v, want ErrInvalidKeymapRecord for directory target", err)
+		}
+		if !strings.Contains(err.Error(), "want regular file") {
+			t.Fatalf("err message = %v, want regular-file-required message", err)
+		}
+	})
 }
 
 // TestResolveObjectKeyFromRel covers the lookup contract: nil

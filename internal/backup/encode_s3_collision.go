@@ -219,11 +219,17 @@ func validateKeymapReservedRoot(rec KeymapRecord, original string) error {
 }
 
 // verifyKeymapTargetsExist scans the loaded keymap and confirms each
-// record's Encoded value points to an actual on-disk file under
-// bucketDir. Orphan records (Encoded with no body) surface here
-// rather than as a missing-sidecar error from the walker, so the
-// operator sees the keymap inconsistency directly. O(N) Lstats per
-// bucket, run once at load time.
+// record's Encoded value points to an actual on-disk REGULAR FILE
+// under bucketDir. Orphan records (Encoded with no body) surface
+// here rather than as a missing-sidecar error from the walker, so
+// the operator sees the keymap inconsistency directly. O(N) Lstats
+// per bucket, run once at load time.
+//
+// The target MUST be a regular file. A directory at the target path
+// (e.g. a prefix created by another object) would pass a bare
+// existence check but the walk-time encodeObject path would never
+// run for it — encodeBucketObjects recurses into the directory and
+// silently ignores the keymap entry. Fail closed here. Codex P2 #928.
 func (e *S3RecordEncoder) verifyKeymapTargetsExist(root *os.Root, bucketDir string, km map[string]KeymapRecord) error {
 	for encoded := range km {
 		// Encoded is a bucket-relative path in slash-form (that's
@@ -232,13 +238,17 @@ func (e *S3RecordEncoder) verifyKeymapTargetsExist(root *os.Root, bucketDir stri
 		// which is the slash-form S3 key + optional rename
 		// suffix). Convert to filepath form before Lstat.
 		rel := filepath.Join(bucketDir, filepath.FromSlash(encoded))
-		_, err := root.Lstat(rel)
+		info, err := root.Lstat(rel)
 		if errors.Is(err, os.ErrNotExist) {
 			return errors.Wrapf(ErrInvalidKeymapRecord,
 				"orphan keymap record: encoded %q has no on-disk file under %s", encoded, bucketDir)
 		}
 		if err != nil {
 			return errors.WithStack(err)
+		}
+		if !info.Mode().IsRegular() {
+			return errors.Wrapf(ErrInvalidKeymapRecord,
+				"keymap record %q resolves to %s (mode=%s), want regular file", encoded, rel, info.Mode())
 		}
 	}
 	return nil
