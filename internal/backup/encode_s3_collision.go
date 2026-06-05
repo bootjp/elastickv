@@ -219,8 +219,17 @@ func validateKeymapEncodedPath(encoded string) error {
 				"encoded path %q contains invalid segment %q", encoded, seg)
 		}
 	}
-	last := segs[len(segs)-1]
-	if strings.HasSuffix(last, S3MetaSuffixReserved) {
+	return validateKeymapEncodedPathWalkerSkipped(encoded, segs)
+}
+
+// validateKeymapEncodedPathWalkerSkipped rejects encoded paths the
+// object walk would silently skip — sidecar suffixes at any depth,
+// top-level "_bucket.json" / "KEYMAP.jsonl" control files, and any
+// path rooted in a reserved dump subtree (_orphans /
+// _incomplete_uploads). Split out of validateKeymapEncodedPath so
+// the parent stays under cyclop. Codex P2 #928 round 4 + round 5.
+func validateKeymapEncodedPathWalkerSkipped(encoded string, segs []string) error {
+	if strings.HasSuffix(segs[len(segs)-1], S3MetaSuffixReserved) {
 		return errors.Wrapf(ErrInvalidKeymapRecord,
 			"encoded path %q ends in reserved sidecar suffix %q (walker would skip)",
 			encoded, S3MetaSuffixReserved)
@@ -232,6 +241,19 @@ func validateKeymapEncodedPath(encoded string) error {
 	if len(segs) == 1 && (segs[0] == "_bucket.json" || segs[0] == "KEYMAP.jsonl") {
 		return errors.Wrapf(ErrInvalidKeymapRecord,
 			"encoded path %q names a top-level control file the walker skips", encoded)
+	}
+	// Reserved-subtree first-segment guard. walkObjectSubdir skips
+	// top-level "_orphans/" and "_incomplete_uploads/" when they
+	// hold no sidecars (the dump's own payload). A KEYMAP entry
+	// whose Encoded is under those subtrees passes the IsRegular
+	// check on the existing dump-control payload (e.g.
+	// "_orphans/foo.bin" or "_incomplete_uploads/records.jsonl") but
+	// the walk never consumes it. The companion gate for the
+	// decoded original key lives in validateKeymapReservedRoot;
+	// this mirror catches the encoded side. Codex P2 #928 round 5.
+	if _, reserved := keymapReservedRoots[segs[0]]; reserved {
+		return errors.Wrapf(ErrInvalidKeymapRecord,
+			"encoded path %q targets reserved dump subtree %q (walker would skip)", encoded, segs[0])
 	}
 	return nil
 }

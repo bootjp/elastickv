@@ -281,6 +281,51 @@ func TestValidateKeymapEncodedPath_Backslash(t *testing.T) {
 	}
 }
 
+// TestValidateKeymapEncodedPath_ReservedSubtree pins codex P2 #928
+// round 5. walkObjectSubdir skips top-level "_orphans/" and
+// "_incomplete_uploads/" when they hold no sidecars (the dump's
+// own payload). A KEYMAP entry pointing into those subtrees passes
+// the IsRegular existence check but the walk never consumes it -
+// the rename is silently dropped.
+func TestValidateKeymapEncodedPath_ReservedSubtree(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		encoded string
+		wantErr bool
+	}{
+		{"_orphans top-level payload", "_orphans/foo.bin", true},
+		{"_orphans nested", "_orphans/gen-1/x.bin", true},
+		{"_incomplete_uploads top-level", "_incomplete_uploads/records.jsonl", true},
+		{"_incomplete_uploads nested", "_incomplete_uploads/sub/x", true},
+		// _orphansFoo / nested _orphans are NOT reserved — only the
+		// exact top-level segment matches.
+		{"_orphansFoo (not reserved)", "_orphansFoo/x" + S3LeafDataSuffix, false},
+		{"nested _orphans (not top-level)", "prefix/_orphans/x" + S3LeafDataSuffix, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			rec := KeymapRecord{
+				Encoded:     c.encoded,
+				OriginalB64: base64.RawURLEncoding.EncodeToString([]byte("original/key")),
+				Kind:        KindSHAFallback,
+			}
+			err := validateKeymapRecord(rec)
+			if c.wantErr {
+				if !errors.Is(err, ErrInvalidKeymapRecord) {
+					t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+				}
+				if !strings.Contains(err.Error(), "reserved dump subtree") {
+					t.Fatalf("err = %v, want reserved-dump-subtree message", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected err = %v", err)
+			}
+		})
+	}
+}
+
 // TestValidateKeymapEncodedPath_WalkerSkipped pins codex P2 #928
 // round 4 (walker-skipped reserved files): a corrupt KEYMAP entry
 // whose Encoded names a top-level "_bucket.json" / "KEYMAP.jsonl"
