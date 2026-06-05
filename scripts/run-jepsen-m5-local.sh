@@ -96,7 +96,6 @@ for bin in "$ROUTE_KEY_BIN" "$LIST_ROUTES_BIN" "$BINARY"; do
     exit 1
   fi
 done
-T1_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t1)"
 T3_KEY="$("$ROUTE_KEY_BIN" jepsen_append_t3)"
 # Issue #930 fix: --shardRanges must cover every routing key.  Without
 # a [<empty>, T1_KEY) range, any table whose base64-encoded name sorts
@@ -207,6 +206,15 @@ mkdir -p tmp-home .lein
 # (verify-multi-group-routing!) at the workload's first setup! call.
 # Without them the hook falls back to PATH lookup which fails when
 # run from this script's tmp build.
+#
+# --host 127.0.0.1 — without this the workload's open! resolves the
+# DynamoDB client hostname from (name node) where node is one of
+# default-nodes ["n1" "n2" "n3" "n4" "n5"]; these are virtual labels,
+# not real hostnames, and DNS resolution fails with 'nodename nor
+# servname provided'.  --host overrides via cli/common-cli-opts'
+# --host -> :host -> :dynamo-host -> make-ddb-client wiring.  Required
+# for the single-process two-group topology this script launches —
+# every "node" client talks to the same loopback DynamoDB endpoint.
 HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
   LEIN_JVM_OPTS="-Duser.home=$(pwd)/tmp-home" \
   "$LEIN_BIN" run -m elastickv.dynamodb-multi-table-workload \
@@ -218,14 +226,6 @@ HOME="$(pwd)/tmp-home" LEIN_HOME="$(pwd)/.lein" \
     --list-routes-bin "$LIST_ROUTES_BIN" \
     --grpc-host-port  "$PROC_ADDR" \
   || EXIT_CODE=$?
-# --host 127.0.0.1 — without this the workload's open! resolves the
-# DynamoDB client hostname from (name node) where node is one of
-# default-nodes ["n1" "n2" "n3" "n4" "n5"]; these are virtual labels,
-# not real hostnames, and DNS resolution fails with 'nodename nor
-# servname provided'.  --host overrides via cli/common-cli-opts'
-# --host -> :host -> :dynamo-host -> make-ddb-client wiring.  Required
-# for the single-process two-group topology this script launches —
-# every "node" client talks to the same loopback DynamoDB endpoint.
 
 EXIT_CODE=${EXIT_CODE:-0}
 
