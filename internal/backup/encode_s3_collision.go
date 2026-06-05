@@ -193,16 +193,45 @@ func validateKeymapOriginalPath(rec KeymapRecord, original string) error {
 }
 
 // validateKeymapEncodedPath rejects rec.Encoded values that would
-// escape the bucket sub-root or carry empty segments. The lookup
-// site (resolveObjectKeyFromRel) joins this value under bucketDir
-// when calling root.Lstat, and ".." would silently break out of the
-// bucket. Gemini medium PR #928.
+// escape the bucket sub-root, carry empty segments, contain
+// backslashes filepath.Join splits on Windows, or name a
+// walker-skipped control/sidecar file that encodeObject never
+// reaches.
+//
+// Path segments: gemini medium PR #928.
+// Backslash + walker-skipped reserved names: codex P2 #928 round 4.
+//   - The walker (walkObjectEntry) returns nil for top-level
+//     "_bucket.json" and top-level "KEYMAP.jsonl" (when a tracker
+//     is loaded) and for any file ending in S3MetaSuffixReserved.
+//     A KEYMAP entry whose Encoded names one of those passes the
+//     IsRegular check in verifyKeymapTargetsExist but is silently
+//     ignored by the walk - the corruption surfaces only as a
+//     missing-key during restore.
 func validateKeymapEncodedPath(encoded string) error {
-	for _, seg := range strings.Split(encoded, "/") {
+	if strings.ContainsRune(encoded, '\\') {
+		return errors.Wrapf(ErrInvalidKeymapRecord,
+			"encoded path %q contains backslash (treated as a separator on Windows; rename in S3 first)", encoded)
+	}
+	segs := strings.Split(encoded, "/")
+	for _, seg := range segs {
 		if seg == "" || seg == "." || seg == ".." {
 			return errors.Wrapf(ErrInvalidKeymapRecord,
 				"encoded path %q contains invalid segment %q", encoded, seg)
 		}
+	}
+	last := segs[len(segs)-1]
+	if strings.HasSuffix(last, S3MetaSuffixReserved) {
+		return errors.Wrapf(ErrInvalidKeymapRecord,
+			"encoded path %q ends in reserved sidecar suffix %q (walker would skip)",
+			encoded, S3MetaSuffixReserved)
+	}
+	// _bucket.json and KEYMAP.jsonl are walker-skipped only at the
+	// top level (rel == ""). Nested user keys like
+	// "prefix/_bucket.json" are real object bodies that the walk
+	// processes normally, so accept those.
+	if len(segs) == 1 && (segs[0] == "_bucket.json" || segs[0] == "KEYMAP.jsonl") {
+		return errors.Wrapf(ErrInvalidKeymapRecord,
+			"encoded path %q names a top-level control file the walker skips", encoded)
 	}
 	return nil
 }

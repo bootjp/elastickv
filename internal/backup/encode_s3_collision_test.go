@@ -253,6 +253,76 @@ func TestValidateKeymapRecord_EmptyOriginal(t *testing.T) {
 	}
 }
 
+// TestValidateKeymapEncodedPath_Backslash pins codex P2 #928
+// round 4 (encoded-backslash): a corrupt KEYMAP Encoded value with
+// a backslash bypasses the slash-segment scan on Windows because
+// filepath.Join treats `\` as a separator. The validator must
+// reject backslashes anywhere in the encoded path.
+func TestValidateKeymapEncodedPath_Backslash(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`dir\x` + S3LeafDataSuffix,
+		`a\b\c` + S3LeafDataSuffix,
+		`\leading` + S3LeafDataSuffix,
+		`trailing\` + S3LeafDataSuffix,
+	}
+	for _, enc := range cases {
+		t.Run(enc, func(t *testing.T) {
+			t.Parallel()
+			rec := leafRecord(enc, "ok/key")
+			err := validateKeymapRecord(rec)
+			if !errors.Is(err, ErrInvalidKeymapRecord) {
+				t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+			}
+			if !strings.Contains(err.Error(), "backslash") {
+				t.Fatalf("err = %v, want backslash message", err)
+			}
+		})
+	}
+}
+
+// TestValidateKeymapEncodedPath_WalkerSkipped pins codex P2 #928
+// round 4 (walker-skipped reserved files): a corrupt KEYMAP entry
+// whose Encoded names a top-level "_bucket.json" / "KEYMAP.jsonl"
+// or any path ending in S3MetaSuffixReserved passes the IsRegular
+// check but the walk silently skips it — the rename is never
+// reversed and the operator sees no diagnostic. The validator must
+// reject these encoded values at load time.
+func TestValidateKeymapEncodedPath_WalkerSkipped(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		encoded string
+		wantErr bool
+	}{
+		{"top-level _bucket.json", "_bucket.json", true},
+		{"top-level KEYMAP.jsonl", "KEYMAP.jsonl", true},
+		{"sidecar suffix (top-level)", "obj" + S3MetaSuffixReserved, true},
+		{"sidecar suffix (nested)", "prefix/obj" + S3MetaSuffixReserved, true},
+		// Nested _bucket.json / KEYMAP.jsonl ARE real user objects
+		// the walker processes - accept them.
+		{"nested _bucket.json (user key)", "prefix/_bucket.json", false},
+		{"nested KEYMAP.jsonl (user key)", "prefix/KEYMAP.jsonl", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			rec := KeymapRecord{
+				Encoded:     c.encoded,
+				OriginalB64: base64.RawURLEncoding.EncodeToString([]byte("original/key")),
+				Kind:        KindSHAFallback,
+			}
+			err := validateKeymapRecord(rec)
+			if c.wantErr && !errors.Is(err, ErrInvalidKeymapRecord) {
+				t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+			}
+			if !c.wantErr && err != nil {
+				t.Fatalf("unexpected err = %v", err)
+			}
+		})
+	}
+}
+
 // TestValidateKeymapOriginalPath pins codex P2 #928 round 3: the
 // decoded original key must not contain any form the decoder's
 // safeJoinUnderRoot would refuse — NUL byte, backslash, dot
