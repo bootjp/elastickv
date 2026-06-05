@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/errors"
@@ -370,6 +371,52 @@ func TestSQSEncodeClassicDedupKeepsLatestOnExpiredCollision(t *testing.T) {
 	}
 	if !bytes.Contains(dedupVal, []byte(`"message_id":"m-new"`)) {
 		t.Fatalf("classic dedup row contents = %s, want winner = m-new", dedupVal)
+	}
+}
+
+// TestSQSEncodeRejectsNonPowerOfTwoPartitionCount pins coderabbit
+// Major #929. partitionForGroup masks with (PartitionCount - 1)
+// which assumes a power of two. A malformed dump like
+// partition_count=3 would mask via (h & 0b10) and route messages
+// inconsistently. readQueueMeta must fail closed.
+func TestSQSEncodeRejectsNonPowerOfTwoPartitionCount(t *testing.T) {
+	t.Parallel()
+	for _, n := range []uint32{3, 5, 6, 7, 9, 10} {
+		t.Run(fmt.Sprintf("count=%d", n), func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "bad.fifo",
+				[]byte(fmt.Sprintf(`{"format_version":1,"name":"bad.fifo","fifo":true,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,"partition_count":%d,"fifo_throughput_limit":"perMessageGroupId"}`, n)),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			err := NewSQSRecordEncoder(in).Encode(b)
+			if !errors.Is(err, ErrSQSEncodeInvalidQueue) {
+				t.Fatalf("partition_count=%d: err = %v, want ErrSQSEncodeInvalidQueue", n, err)
+			}
+		})
+	}
+}
+
+// TestSQSEncodeAcceptsPowerOfTwoPartitionCount confirms the
+// power-of-two guard does not reject legitimate values.
+func TestSQSEncodeAcceptsPowerOfTwoPartitionCount(t *testing.T) {
+	t.Parallel()
+	for _, n := range []uint32{2, 4, 8, 16, 32} {
+		t.Run(fmt.Sprintf("count=%d", n), func(t *testing.T) {
+			t.Parallel()
+			in := t.TempDir()
+			writeSQSQueue(t, in, "ok.fifo",
+				[]byte(fmt.Sprintf(`{"format_version":1,"name":"ok.fifo","fifo":true,`+
+					`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+					`"delay_seconds":0,"partition_count":%d,"fifo_throughput_limit":"perQueue"}`, n)),
+				nil)
+			b := newSnapshotBuilder(sqsEncTS)
+			if err := NewSQSRecordEncoder(in).Encode(b); err != nil {
+				t.Fatalf("partition_count=%d: unexpected err = %v", n, err)
+			}
+		})
 	}
 }
 

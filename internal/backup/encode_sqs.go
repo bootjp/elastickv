@@ -624,6 +624,16 @@ func (e *SQSRecordEncoder) readQueueMeta(root *os.Root, queueDir string) (sqsQue
 		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
 			"%s: unsupported format_version %d", rel, pub.FormatVersion)
 	}
+	// PartitionCount must be a power of two when > 1. The live
+	// validator (adapter/sqs_partitioning.go:isPowerOfTwo) enforces
+	// this so partitionFor's mask AND (h & (n-1)) is equivalent to
+	// (h % n). A malformed dump with e.g. partition_count=3 would
+	// hash inconsistently and route messages to wrong partitions.
+	// Coderabbit Major #929.
+	if pub.PartitionCount > 1 && pub.PartitionCount&(pub.PartitionCount-1) != 0 {
+		return sqsQueueMetaPublic{}, errors.Wrapf(ErrSQSEncodeInvalidQueue,
+			"%s: partition_count %d must be a power of two", rel, pub.PartitionCount)
+	}
 	return pub, nil
 }
 
