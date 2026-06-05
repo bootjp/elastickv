@@ -695,11 +695,16 @@ func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, snap RouteSnap
 		if isTxnInternalKey(mut.Key) {
 			continue
 		}
-		owner, found := snap.OwnerOf(mut.Key)
+		// routeKey-normalize before OwnerOf so the gate routes the
+		// same way as ShardRouter.ResolveGroup — raw adapter keys
+		// and route catalog ranges live in different lex bands
+		// (issue #930).
+		rKey := routeKey(mut.Key)
+		owner, found := snap.OwnerOf(rKey)
 		if !found || owner != f.shardGroupID {
 			return errors.Wrapf(ErrComposed1Violation,
-				"%s-version v=%d: key %q owned by group %d (found=%v); this FSM serves group %d",
-				phase, snapVer, mut.Key, owner, found, f.shardGroupID)
+				"%s-version v=%d: key %q (routeKey %q) owned by group %d (found=%v); this FSM serves group %d",
+				phase, snapVer, mut.Key, rKey, owner, found, f.shardGroupID)
 		}
 	}
 	return nil
