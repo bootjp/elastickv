@@ -2,10 +2,12 @@ package etcd
 
 import (
 	"bytes"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
@@ -252,10 +254,144 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
 		if err != nil {
 			return err
 		}
+		// Branch 3 (PR #910 design §4): skip the multi-GiB body
+		// restore when the on-disk FSM is already at least as fresh
+		// as the snapshot pointer. The skip path still consumes the
+		// v1/v2 header so the HLC ceiling + Stage 8a cutover are
+		// preserved (PR #910 §5), and runs the same three-step CRC
+		// verification (size + footer-vs-tokenCRC + full-body-CRC)
+		// as openAndRestoreFSMSnapshot before mutating any FSM state.
+		if fsmAlreadyAtIndex(fsm, tok.Index) {
+			return applyHeaderStateOnSkip(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
+		}
 		return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
 	}
 	// Legacy format: full FSM payload embedded in snapshot.Data.
 	return errors.WithStack(fsm.Restore(bytes.NewReader(snapshot.Data)))
+}
+
+// fsmAlreadyAtIndex reports whether the FSM's durably-recorded
+// applied index is at least `want`. Returns true ONLY when we can
+// prove it. Any uncertainty -- FSM doesn't expose the reader
+// interface, the underlying store reports the meta key as missing,
+// or LastAppliedIndex returns an error -- collapses to false, which
+// makes the caller fall back to the full restore path. The design's
+// strictly-additive guarantee (PR #910 §4) says over-restoring is
+// strictly safer than skipping incorrectly.
+func fsmAlreadyAtIndex(fsm StateMachine, want uint64) bool {
+	r, ok := fsm.(raftengine.AppliedIndexReader)
+	if !ok {
+		return false
+	}
+	have, present, err := r.LastAppliedIndex()
+	if err != nil || !present {
+		return false
+	}
+	return have >= want
+}
+
+// applyHeaderStateOnSkip mirrors openAndRestoreFSMSnapshot's safety
+// contract (size + footer-vs-tokenCRC + full-body-CRC) but applies
+// only the header side-effects (HLC ceiling + Stage 8a cutover)
+// instead of running the body restore. The body bytes are read for
+// CRC coverage but discarded -- fsm.db already holds equivalent
+// state, which is precisely the reason we're skipping the restore.
+//
+// FSMs that do not implement raftengine.SnapshotHeaderApplier
+// silently no-op the apply phase -- the FSM has no header state to
+// carry forward, and the CRC verification still runs (with no
+// observable side-effect on success). On any verification failure
+// the typed error propagates and FSM state stays untouched.
+//
+// See PR #910 design §5 round-7 (two-phase seam) + round-6
+// (three-step CRC mirroring openAndRestoreFSMSnapshot).
+func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) error {
+	file, err := os.Open(snapPath)
+	if err != nil {
+		return statFSMFileError(err)
+	}
+	defer func() { _ = file.Close() }()
+
+	info, err := file.Stat()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	footer, err := verifyFSMSnapshotPrefix(file, info.Size(), snapPath, tokenCRC)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: full-body CRC. Wrap the payload in a crc32 TeeReader
+	// and hand it to the FSM's ParseSnapshotHeader for header parse
+	// + drain. Every payload byte flows through h, matching
+	// restoreAndComputeCRC's boundary in openAndRestoreFSMSnapshot.
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return errors.WithStack(err)
+	}
+	payloadSize := info.Size() - fsmFooterSize
+	h := crc32.New(crc32cTable)
+	tee := io.TeeReader(io.LimitReader(file, payloadSize), h)
+
+	setter, hasSetter := fsm.(raftengine.SnapshotHeaderApplier)
+	ceiling, cutover, err := readSnapshotHeaderOrDrain(setter, hasSetter, tee)
+	if err != nil {
+		return err
+	}
+
+	if h.Sum32() != footer {
+		return errors.Wrapf(ErrFSMSnapshotFileCRC,
+			"path=%s footer=%08x computed=%08x", snapPath, footer, h.Sum32())
+	}
+
+	// All three checks passed; apply side-effects (pure assignment
+	// in the FSM). Skipped silently when the FSM does not expose
+	// the seam.
+	if hasSetter {
+		setter.ApplySnapshotHeader(ceiling, cutover)
+	}
+	return nil
+}
+
+// verifyFSMSnapshotPrefix runs the first two cheap checks of
+// openAndRestoreFSMSnapshot's three-step contract: size and
+// footer-vs-tokenCRC. Returns the on-disk footer value (caller
+// reuses it for the step-3 full-body CRC compare). Typed errors
+// surface unchanged.
+func verifyFSMSnapshotPrefix(file *os.File, fileSize int64, snapPath string, tokenCRC uint32) (uint32, error) {
+	if fileSize < fsmMinFileSize {
+		return 0, errors.Wrapf(ErrFSMSnapshotTooSmall,
+			"file too small: %d bytes (minimum %d)", fileSize, fsmMinFileSize)
+	}
+	footer, err := readFSMFooter(file, fileSize)
+	if err != nil {
+		return 0, err
+	}
+	if footer != tokenCRC {
+		return 0, errors.Wrapf(ErrFSMSnapshotTokenCRC,
+			"path=%s footer=%08x token=%08x", snapPath, footer, tokenCRC)
+	}
+	return footer, nil
+}
+
+// readSnapshotHeaderOrDrain branches on whether the FSM exposes the
+// SnapshotHeaderApplier seam: when present, delegate to
+// ParseSnapshotHeader (which parses the header AND drains the rest);
+// otherwise drain the entire payload through the tee'd reader so the
+// CRC pass covers every byte. The (ceiling, cutover) tuple is zero
+// in the no-seam case -- the caller's ApplySnapshotHeader branch
+// short-circuits on hasSetter, so the zero values are inert.
+func readSnapshotHeaderOrDrain(setter raftengine.SnapshotHeaderApplier, hasSetter bool, tee io.Reader) (uint64, uint64, error) {
+	if hasSetter {
+		ceiling, cutover, err := setter.ParseSnapshotHeader(tee)
+		if err != nil {
+			return 0, 0, errors.WithStack(err)
+		}
+		return ceiling, cutover, nil
+	}
+	if _, err := io.Copy(io.Discard, tee); err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	return 0, 0, nil
 }
 
 func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
