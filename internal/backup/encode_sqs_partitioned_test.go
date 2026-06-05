@@ -373,6 +373,65 @@ func TestSQSEncodeClassicDedupKeepsLatestOnExpiredCollision(t *testing.T) {
 	}
 }
 
+// TestSQSEncodeClassicDedupKeepsLatestAcrossGroups pins codex P2
+// #929 (round 2): for classic FIFO queues the live dedup key is
+// (queue, generation, dedupID) — NO group / partition. Two retained
+// messages in DIFFERENT MessageGroupIds but the SAME dedupID
+// (after the 5-minute window expired) must collapse to one winner;
+// otherwise both groups emit the same classic dedup key and
+// snapshotBuilder.Add fails.
+//
+// Earlier pickDedupWinners keyed on (partition, group, dedupID) for
+// both shapes; this test would have produced 2 dedup rows and
+// aborted the restore. The classic-collapse keying produces 1 row
+// for the latest send and 2 data records.
+func TestSQSEncodeClassicDedupKeepsLatestAcrossGroups(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "classic",
+		[]byte(`{"format_version":1,"name":"classic","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{
+			[]byte(`{"message_id":"m-grpA","body":"a","send_timestamp_millis":1000000,` +
+				`"available_at_millis":1000000,"message_group_id":"groupA",` +
+				`"message_deduplication_id":"d","sequence_number":1}`),
+			// Different group, same dedup, 10 min later.
+			[]byte(`{"message_id":"m-grpB","body":"b","send_timestamp_millis":1600000,` +
+				`"available_at_millis":1600000,"message_group_id":"groupB",` +
+				`"message_deduplication_id":"d","sequence_number":2}`),
+		})
+	fsm := encodeSQSTree(t, in)
+	entries, _, err := DecodeLiveEntries(bytes.NewReader(fsm))
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	var dedupCount int
+	var dedupVal []byte
+	for _, e := range entries {
+		if bytes.HasPrefix(e.UserKey, []byte(SQSMsgDedupPrefix)) {
+			dedupCount++
+			dedupVal = e.UserValue
+		}
+	}
+	if dedupCount != 1 {
+		t.Fatalf("classic cross-group dedup-row count = %d, want 1", dedupCount)
+	}
+	if !bytes.Contains(dedupVal, []byte(`"message_id":"m-grpB"`)) {
+		t.Fatalf("classic cross-group dedup row = %s, want winner = m-grpB", dedupVal)
+	}
+	// Both DATA records emitted (data key includes message_id).
+	dataCount := 0
+	for _, e := range entries {
+		if bytes.HasPrefix(e.UserKey, []byte(SQSMsgDataPrefix)) &&
+			!bytes.HasPrefix(e.UserKey, []byte(SQSPartitionedMsgDataPrefix)) {
+			dataCount++
+		}
+	}
+	if dataCount != 2 {
+		t.Fatalf("classic cross-group data-record count = %d, want 2", dataCount)
+	}
+}
+
 // TestSQSEncodeRejectsHashMismatchOnPerMessageGroupId pins gate 5
 // (codex P2 #929). For a perMessageGroupId HT-FIFO queue, the
 // partition value MUST match partitionFor(MessageGroupID). An

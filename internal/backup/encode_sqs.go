@@ -319,11 +319,21 @@ func (e *SQSRecordEncoder) stageMessageRecords(b *snapshotBuilder, meta *sqsQueu
 // pickDedupWinners returns a boolean slice indexed by records' position;
 // true means "this message is the LATEST send for its dedup-key tuple
 // and therefore owns the dedup row". Caller passes the boolean into
-// addSideRecords so non-winners skip dedup emission. The tuple is
-// (partition, MessageGroupID, resolvedDedupID); for classic queues
-// partition and MessageGroupID collapse to ("0", "") so the
-// disambiguation lives in dedupID alone (matching the live
-// sqsMsgDedupKey shape).
+// addSideRecords so non-winners skip dedup emission.
+//
+// The winner-key tuple MUST match the live dedup-key shape exactly,
+// otherwise two messages that would collide on snapshotBuilder.Add
+// can both be marked as winners:
+//   - Partitioned: live key is sqsPartitionedMsgDedupKey(queue,
+//     partition, gen, groupID, dedupID), so the tuple is
+//     (partition, group, dedupID).
+//   - Classic: live key is sqsMsgDedupKey(queue, gen, dedupID) — NO
+//     group / partition in the key — so the tuple collapses to
+//     ("", "", dedupID). Codex P2 #929: keeping MessageGroupID in the
+//     classic winner key would let two retained-but-expired duplicates
+//     in DIFFERENT groups but with the same dedupID both win, then
+//     both emit the same sqsMsgDedupKeyBytes(queue, dedupID) and
+//     collide.
 //
 // For non-FIFO queues or messages with empty resolvedDedupID the
 // returned slice entry is false — dedup emission was already skipped
@@ -344,11 +354,20 @@ func pickDedupWinners(meta *sqsQueueMetaPublic, records []sqsMessageRecord, isPa
 		if d == "" {
 			continue
 		}
-		var p uint32
-		if isPartitioned && records[i].Partition != nil {
-			p = *records[i].Partition
+		k := dedupKey{dedup: d}
+		if isPartitioned {
+			// Partitioned dedup key includes partition + group +
+			// dedupID; group is load-bearing because the partitioned
+			// constructor splits group / dedup segments with a '|'.
+			k.group = records[i].MessageGroupID
+			if records[i].Partition != nil {
+				k.partition = *records[i].Partition
+			}
 		}
-		k := dedupKey{partition: p, group: records[i].MessageGroupID, dedup: d}
+		// Classic case leaves k.partition=0 and k.group="" so two
+		// retained-but-expired duplicates in different groups with
+		// the same dedupID collapse to the same winner key —
+		// matching the classic sqsMsgDedupKey shape.
 		prev, seen := latest[k]
 		if !seen || records[i].SendTimestampMillis > records[prev].SendTimestampMillis {
 			latest[k] = i
