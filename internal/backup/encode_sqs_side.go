@@ -70,6 +70,60 @@ func sqsMsgDedupKeyBytes(queueName, dedupID string) []byte {
 	return append(out, encodeSQSSegment(dedupID)...)
 }
 
+// sqsPartitionedMsgVisKeyBytes reproduces
+// adapter/sqs_keys.go:sqsPartitionedMsgVisKey: prefix +
+// base64url(queue) + '|' + BE-u32(partition) + BE-u64(gen) +
+// BE-u64(visibleAt) + base64url(messageID). Mirrored locally per
+// M3b-3 (internal/backup cannot import adapter).
+func sqsPartitionedMsgVisKeyBytes(queueName string, partition uint32, gen uint64, visibleAtMillis int64, messageID string) []byte {
+	out := make([]byte, 0, len(SQSPartitionedMsgVisPrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSPartitionedMsgVisPrefix...)
+	out = append(out, encodeSQSSegment(queueName)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	out = binary.BigEndian.AppendUint32(out, partition)
+	out = binary.BigEndian.AppendUint64(out, gen)
+	out = binary.BigEndian.AppendUint64(out, sqsClampNonNegativeMillis(visibleAtMillis))
+	return append(out, encodeSQSSegment(messageID)...)
+}
+
+// sqsPartitionedMsgByAgeKeyBytes reproduces
+// adapter/sqs_keys.go:sqsPartitionedMsgByAgeKey: prefix +
+// base64url(queue) + '|' + BE-u32(partition) + BE-u64(gen) +
+// BE-u64(sendTs) + base64url(messageID).
+func sqsPartitionedMsgByAgeKeyBytes(queueName string, partition uint32, gen uint64, sendTimestampMs int64, messageID string) []byte {
+	out := make([]byte, 0, len(SQSPartitionedMsgByAgePrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSPartitionedMsgByAgePrefix...)
+	out = append(out, encodeSQSSegment(queueName)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	out = binary.BigEndian.AppendUint32(out, partition)
+	out = binary.BigEndian.AppendUint64(out, gen)
+	out = binary.BigEndian.AppendUint64(out, sqsClampNonNegativeMillis(sendTimestampMs))
+	return append(out, encodeSQSSegment(messageID)...)
+}
+
+// sqsPartitionedMsgDedupKeyBytes reproduces
+// adapter/sqs_keys.go:sqsPartitionedMsgDedupKey: prefix +
+// base64url(queue) + '|' + BE-u32(partition) + BE-u64(sqsRestoreGeneration) +
+// base64url(groupID) + '|' + base64url(dedupID). The live adapter signature
+// accepts a variable gen, but every M5-3 call site uses
+// sqsRestoreGeneration (matching the classic sqsMsgDedupKeyBytes
+// hardcode), so the parameter is hardcoded here to satisfy unparam.
+// Note the second '|' between the variable-length group and dedup
+// segments — without it distinct (groupID, dedupID) pairs can
+// FNV-collapse onto the same key (CodeRabbit major PR #732 round 6;
+// design doc §line 19).
+func sqsPartitionedMsgDedupKeyBytes(queueName string, partition uint32, groupID, dedupID string) []byte {
+	out := make([]byte, 0, len(SQSPartitionedMsgDedupPrefix)+sqsSideKeyAllocBytes)
+	out = append(out, SQSPartitionedMsgDedupPrefix...)
+	out = append(out, encodeSQSSegment(queueName)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	out = binary.BigEndian.AppendUint32(out, partition)
+	out = binary.BigEndian.AppendUint64(out, sqsRestoreGeneration)
+	out = append(out, encodeSQSSegment(groupID)...)
+	out = append(out, sqsPartitionedQueueTerminator)
+	return append(out, encodeSQSSegment(dedupID)...)
+}
+
 // sqsClampNonNegativeMillis mirrors adapter/sqs_messages.go uint64MaxZero:
 // wall-clock millis should never be negative, but a negative int64 would
 // silently overflow under a direct uint64() cast and produce a far-future
@@ -130,19 +184,34 @@ func resolveDedupID(rec *sqsMessageRecord, meta *sqsQueueMetaPublic) string {
 //   - dedup: FIFO + resolveDedupID(rec, meta) non-empty. ExpiresAtMillis =
 //     SendTimestampMs + sqsFifoDedupWindowMillis. CBD queues get a SHA-256
 //     derived dedup-id (matches adapter/sqs_fifo.go resolveFifoDedupID).
-func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
+func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, isPartitioned bool, partition uint32, emitDedup bool, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
 	msgIDBytes := []byte(rec.MessageID)
 
-	visKey := sqsMsgVisKeyBytes(queueName, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
+	var visKey, byAgeKey []byte
+	if isPartitioned {
+		visKey = sqsPartitionedMsgVisKeyBytes(queueName, partition, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
+		byAgeKey = sqsPartitionedMsgByAgeKeyBytes(queueName, partition, sqsRestoreGeneration, rec.SendTimestampMillis, rec.MessageID)
+	} else {
+		visKey = sqsMsgVisKeyBytes(queueName, sqsRestoreGeneration, rec.AvailableAtMillis, rec.MessageID)
+		byAgeKey = sqsMsgByAgeKeyBytes(queueName, sqsRestoreGeneration, rec.SendTimestampMillis, rec.MessageID)
+	}
 	if err := b.Add(visKey, msgIDBytes, 0); err != nil {
 		return err
 	}
-
-	byAgeKey := sqsMsgByAgeKeyBytes(queueName, sqsRestoreGeneration, rec.SendTimestampMillis, rec.MessageID)
 	if err := b.Add(byAgeKey, msgIDBytes, 0); err != nil {
 		return err
 	}
 
+	// emitDedup is set by stageMessageRecords' pre-pass (pickDedupWinners)
+	// to false for every message whose (group, dedupID) tuple is owned
+	// by a LATER send. The live FIFO dedup window
+	// (sqsFifoDedupWindowMillis = 5 minutes) lets a duplicate re-send
+	// overwrite the prior dedup row, so when the dump captures both
+	// messages naive per-message emission would collide on
+	// snapshotBuilder.Add. Codex P2 #929.
+	if !emitDedup {
+		return nil
+	}
 	if !meta.FIFO {
 		return nil
 	}
@@ -160,6 +229,16 @@ func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, 
 	if err != nil {
 		return err
 	}
-	dedupKey := sqsMsgDedupKeyBytes(queueName, dedupID)
+	var dedupKey []byte
+	if isPartitioned {
+		// Partitioned dedup includes <group-seg> + '|' + <dedup-seg>
+		// per the partitioned dedup constructor — see
+		// sqsPartitionedMsgDedupKeyBytes for the rationale (CodeRabbit
+		// major PR #732 round 6: the second '|' prevents FNV-collapse
+		// across distinct (groupID, dedupID) pairs on the same partition).
+		dedupKey = sqsPartitionedMsgDedupKeyBytes(queueName, partition, rec.MessageGroupID, dedupID)
+	} else {
+		dedupKey = sqsMsgDedupKeyBytes(queueName, dedupID)
+	}
 	return b.Add(dedupKey, val, 0)
 }

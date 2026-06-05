@@ -372,7 +372,7 @@ func TestSQS_ParseMessageDataKey_RejectsEmptyMsgIDSegment(t *testing.T) {
 	// a legitimate snapshot record.
 	key := append([]byte(SQSMsgDataPrefix), []byte("cQ")...)
 	key = append(key, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
-	if _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
+	if _, _, _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
 		t.Fatalf("err=%v want ErrSQSMalformedKey for empty msg-id", err)
 	}
 }
@@ -597,12 +597,18 @@ func TestSQS_ParsePartitionedMessageDataKey(t *testing.T) {
 	key = append(key, 0x00, 0x00, 0x00, 0x07)                         // partition = 7
 	key = append(key, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01) // gen
 	key = append(key, []byte(encMsgID)...)
-	got, err := parseSQSMessageDataKey(key)
+	got, partition, isPartitioned, err := parseSQSMessageDataKey(key)
 	if err != nil {
 		t.Fatalf("parseSQSMessageDataKey: %v", err)
 	}
 	if got != encQueue {
 		t.Fatalf("got %q want %q", got, encQueue)
+	}
+	if !isPartitioned {
+		t.Fatalf("isPartitioned=false, want true for partitioned key")
+	}
+	if partition != 7 {
+		t.Fatalf("partition=%d want 7", partition)
 	}
 }
 
@@ -643,7 +649,7 @@ func TestSQS_ParsePartitionedMessageDataKey_RejectsTruncatedTrailer(t *testing.T
 	key := []byte(SQSMsgDataPrefix + sqsPartitionedDiscriminator + encQueue + "|")
 	// Only 4 partition bytes, no gen, no msg-id.
 	key = append(key, 0x00, 0x00, 0x00, 0x01)
-	if _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
+	if _, _, _, err := parseSQSMessageDataKey(key); !errors.Is(err, ErrSQSMalformedKey) {
 		t.Fatalf("err=%v want ErrSQSMalformedKey for truncated partitioned trailer", err)
 	}
 }
