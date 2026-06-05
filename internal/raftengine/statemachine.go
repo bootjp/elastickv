@@ -90,3 +90,35 @@ type AppliedIndexReader interface {
 type AppliedIndexWriter interface {
 	SetDurableAppliedIndex(idx uint64) error
 }
+
+// SnapshotHeaderApplier is an OPTIONAL extension that lets the
+// cold-start skip gate preserve the header state (HLC ceiling,
+// Stage 8a cutover) the FSM's Restore would normally apply, without
+// running the (multi-GiB) body restore. See
+// docs/design/2026_06_02_idempotent_snapshot_restore.md §5.
+//
+// The interface is two-phase by design:
+//
+//   - ParseSnapshotHeader reads the v1/v2 header from a caller-
+//     supplied io.Reader (wrapped in a crc32 TeeReader by the
+//     engine) and drains the remaining bytes so the wrapping CRC
+//     covers the full payload. It returns the parsed (ceiling,
+//     cutover) pair WITHOUT mutating FSM state. Errors propagate
+//     from the underlying header parser
+//     (ErrSnapshotHeaderUnknownMagic / InvalidLength) or from the
+//     drain pass (I/O errors); FSM state stays untouched on error.
+//
+//   - ApplySnapshotHeader is pure assignment of the verified header
+//     state. The engine calls this only after ParseSnapshotHeader
+//     returned successfully AND the wrapping crc32 hash matched
+//     the file footer.
+//
+// Splitting parse from apply lets the CRC verifier stay co-located
+// with its private helpers in internal/raftengine/etcd (matching
+// the openAndRestoreFSMSnapshot safety contract) while the v1/v2
+// header parser stays inside the kv package where it already lives.
+// Neither package imports the other in production.
+type SnapshotHeaderApplier interface {
+	ParseSnapshotHeader(r io.Reader) (ceiling, cutover uint64, err error)
+	ApplySnapshotHeader(ceiling, cutover uint64)
+}
