@@ -5,7 +5,7 @@
 # Why this script exists separately from run-jepsen-local.sh: the M5
 # workload requires a multi-Raft-group cluster topology that the
 # existing 3-node single-group layout cannot provide.  Per the design
-# doc (docs/design/2026_06_02_proposed_composed1_m5_jepsen_route_shuffle.md
+# doc (docs/design/2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md
 # §3.3), today's `validateShardRanges` / `buildShardGroups` only
 # support a "single process hosts all groups" model — separate
 # processes per group fail validation or race on Raft listeners.

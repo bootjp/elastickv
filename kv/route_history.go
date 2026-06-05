@@ -20,7 +20,7 @@ import (
 // kv.RouteHistory bypass the wrapper entirely and implement the kv
 // interface directly.
 //
-// See docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+// See docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 // §M2.
 func WrapDistributionEngine(e *distribution.Engine) RouteHistory {
 	if e == nil {

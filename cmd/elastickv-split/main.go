@@ -1,7 +1,7 @@
 // elastickv-split is a single-shot CLI that invokes the
 // Distribution.SplitRange RPC on a running elastickv cluster.  Per
 // the Composed-1 M5 design doc
-// (docs/design/2026_06_02_proposed_composed1_m5_jepsen_route_shuffle.md
+// (docs/design/2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md
 // §3.1), the Jepsen route-shuffle nemesis shells out to this tool
 // rather than re-implementing the gRPC client in Clojure: keeping
 // the request construction and the SplitRangeRequest field

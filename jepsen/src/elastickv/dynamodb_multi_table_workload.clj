@@ -2,7 +2,7 @@
   "Composed-1 M5a multi-table variant of the DynamoDB list-append workload.
 
    Why a separate workload exists (see
-   docs/design/2026_06_02_proposed_composed1_m5_jepsen_route_shuffle.md §3.3):
+   docs/design/2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md §3.3):
    the single-table elastickv.dynamodb-workload cannot exercise the 2PC
    path because kv/shard_key.go normalises every DynamoDB table-meta,
    item, and GSI key for one table to a single per-table route key

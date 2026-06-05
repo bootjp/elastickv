@@ -37,7 +37,7 @@ type Engine struct {
 	ts               atomic.Uint64
 	hotspotThreshold uint64
 	// history is the M2 versioned-snapshot ring for Composed-1
-	// (docs/design/2026_05_29_proposed_composed1_cross_group_commit_guard.md
+	// (docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 	// §M2).  Keyed by catalogVersion; populated on every successful
 	// ApplySnapshot and seeded by NewEngineWithDefaultRoute so a
 	// transaction that observed catalogVersion = 0 (the engine's

@@ -90,7 +90,7 @@ VARIABLES
                             \* observed-version check and the apply-time
                             \* current-version cross-version-read fence
                             \* (Composed-1a; see docs/design/
-                            \* 2026_05_29_proposed_composed1_cross_group_commit_guard.md
+                            \* 2026_05_29_partial_composed1_cross_group_commit_guard.md
                             \* §4.4 and §5).
     opCount
 
