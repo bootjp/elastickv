@@ -351,7 +351,7 @@ func startBootstrapE2ENode(
 	}
 	bootstrap = bootstrap || len(bootstrapServers) > 0
 
-	factory, err := newRaftFactory(engineType)
+	factory, err := newRaftFactory(engineType, nil)
 	if err != nil {
 		return nil, err
 	}
