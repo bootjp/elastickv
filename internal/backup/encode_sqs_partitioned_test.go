@@ -270,6 +270,109 @@ func TestSQSEncodeGateUsesRawPartitionCount(t *testing.T) {
 	}
 }
 
+// TestSQSEncodePartitionedDedupKeepsLatestOnExpiredCollision pins
+// codex P2 #929. Two FIFO partitioned messages with the SAME
+// (group, dedupID) tuple but sent more than the dedup window
+// (5 minutes) apart end up with the same dedup-row key. The live
+// keyspace only holds one row at a time (the later send overwrites
+// the prior expired one), but the dump captures BOTH message data
+// records. Naive per-message dedup emission would collide on
+// snapshotBuilder.Add and abort the restore. pickDedupWinners must
+// keep only the LATEST send's dedup row.
+//
+// "g1" hashes to partition 1 (FNV-1a-mod-2). Both messages share
+// group_id="g1" + dedup_id="d" but differ in send_timestamp by 10
+// minutes (well beyond sqsFifoDedupWindowMillis = 5 min).
+func TestSQSEncodePartitionedDedupKeepsLatestOnExpiredCollision(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "p.fifo",
+		[]byte(`{"format_version":1,"name":"p.fifo","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,`+
+			`"delay_seconds":0,"partition_count":2,"fifo_throughput_limit":"perMessageGroupId"}`),
+		[][]byte{
+			// Older send (send_ts = 1_000_000).
+			[]byte(`{"message_id":"m-old","body":"first","send_timestamp_millis":1000000,` +
+				`"available_at_millis":1000000,"message_group_id":"g1",` +
+				`"message_deduplication_id":"d","sequence_number":1,"partition":1}`),
+			// Newer send 10 min later (send_ts = 1_600_000); dedup
+			// window already expired for the older send.
+			[]byte(`{"message_id":"m-new","body":"second","send_timestamp_millis":1600000,` +
+				`"available_at_millis":1600000,"message_group_id":"g1",` +
+				`"message_deduplication_id":"d","sequence_number":2,"partition":1}`),
+		})
+	fsm := encodeSQSTree(t, in)
+	entries, _, err := DecodeLiveEntries(bytes.NewReader(fsm))
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	// Exactly ONE dedup row, and it must encode m-new (the latest).
+	var dedupCount int
+	var dedupVal []byte
+	for _, e := range entries {
+		if bytes.HasPrefix(e.UserKey, []byte(SQSPartitionedMsgDedupPrefix)) {
+			dedupCount++
+			dedupVal = e.UserValue
+		}
+	}
+	if dedupCount != 1 {
+		t.Fatalf("dedup-row count = %d, want 1 (only the latest send keeps the row)", dedupCount)
+	}
+	if !bytes.Contains(dedupVal, []byte(`"message_id":"m-new"`)) {
+		t.Fatalf("dedup row contents = %s, want winner = m-new", dedupVal)
+	}
+	// Both DATA records still emitted.
+	dataCount := 0
+	for _, e := range entries {
+		if bytes.HasPrefix(e.UserKey, []byte(SQSPartitionedMsgDataPrefix)) {
+			dataCount++
+		}
+	}
+	if dataCount != 2 {
+		t.Fatalf("data-record count = %d, want 2 (both messages still emitted)", dataCount)
+	}
+}
+
+// TestSQSEncodeClassicDedupKeepsLatestOnExpiredCollision pins the
+// same fix for classic FIFO queues. Codex P2 #929 framed the issue
+// around partitioned queues, but the same key-collision class
+// exists for classic queues (where the dedup key is just
+// (queue, dedupID) — no partition / group disambiguation).
+func TestSQSEncodeClassicDedupKeepsLatestOnExpiredCollision(t *testing.T) {
+	t.Parallel()
+	in := t.TempDir()
+	writeSQSQueue(t, in, "classic",
+		[]byte(`{"format_version":1,"name":"classic","fifo":true,`+
+			`"visibility_timeout_seconds":30,"message_retention_seconds":345600,"delay_seconds":0}`),
+		[][]byte{
+			[]byte(`{"message_id":"m-old","body":"first","send_timestamp_millis":1000000,` +
+				`"available_at_millis":1000000,"message_group_id":"g",` +
+				`"message_deduplication_id":"d","sequence_number":1}`),
+			[]byte(`{"message_id":"m-new","body":"second","send_timestamp_millis":1600000,` +
+				`"available_at_millis":1600000,"message_group_id":"g",` +
+				`"message_deduplication_id":"d","sequence_number":2}`),
+		})
+	fsm := encodeSQSTree(t, in)
+	entries, _, err := DecodeLiveEntries(bytes.NewReader(fsm))
+	if err != nil {
+		t.Fatalf("DecodeLiveEntries: %v", err)
+	}
+	var dedupCount int
+	var dedupVal []byte
+	for _, e := range entries {
+		if bytes.HasPrefix(e.UserKey, []byte(SQSMsgDedupPrefix)) {
+			dedupCount++
+			dedupVal = e.UserValue
+		}
+	}
+	if dedupCount != 1 {
+		t.Fatalf("classic dedup-row count = %d, want 1", dedupCount)
+	}
+	if !bytes.Contains(dedupVal, []byte(`"message_id":"m-new"`)) {
+		t.Fatalf("classic dedup row contents = %s, want winner = m-new", dedupVal)
+	}
+}
+
 // TestSQSEncodeRejectsHashMismatchOnPerMessageGroupId pins gate 5
 // (codex P2 #929). For a perMessageGroupId HT-FIFO queue, the
 // partition value MUST match partitionFor(MessageGroupID). An

@@ -288,6 +288,15 @@ func (e *SQSRecordEncoder) encodeQueueMessages(b *snapshotBuilder, root *os.Root
 func (e *SQSRecordEncoder) stageMessageRecords(b *snapshotBuilder, meta *sqsQueueMetaPublic, records []sqsMessageRecord) (uint64, error) {
 	var maxSeq uint64
 	isPartitioned := meta.PartitionCount > 1
+	// Pre-pass: pick the LATEST send per dedup-key tuple so only one
+	// dedup row is emitted per (group, dedupID) [classic] or
+	// (partition, group, dedupID) [partitioned]. When the live FIFO
+	// dedup window expires, a duplicate (group, dedupID) re-send
+	// overwrites the prior row; the dump may carry BOTH messages but
+	// the live keyspace only ever held one dedup row at a time. Naive
+	// per-message emission would collide on snapshotBuilder.Add and
+	// abort the restore. Codex P2 #929.
+	dedupWinner := pickDedupWinners(meta, records, isPartitioned)
 	for i := range records {
 		var partition uint32
 		if isPartitioned && records[i].Partition != nil {
@@ -297,7 +306,7 @@ func (e *SQSRecordEncoder) stageMessageRecords(b *snapshotBuilder, meta *sqsQueu
 		if err != nil {
 			return 0, err
 		}
-		if err := e.addSideRecords(b, meta.Name, isPartitioned, partition, meta, &records[i]); err != nil {
+		if err := e.addSideRecords(b, meta.Name, isPartitioned, partition, dedupWinner[i], meta, &records[i]); err != nil {
 			return 0, err
 		}
 		if seq > maxSeq {
@@ -305,6 +314,50 @@ func (e *SQSRecordEncoder) stageMessageRecords(b *snapshotBuilder, meta *sqsQueu
 		}
 	}
 	return maxSeq, nil
+}
+
+// pickDedupWinners returns a boolean slice indexed by records' position;
+// true means "this message is the LATEST send for its dedup-key tuple
+// and therefore owns the dedup row". Caller passes the boolean into
+// addSideRecords so non-winners skip dedup emission. The tuple is
+// (partition, MessageGroupID, resolvedDedupID); for classic queues
+// partition and MessageGroupID collapse to ("0", "") so the
+// disambiguation lives in dedupID alone (matching the live
+// sqsMsgDedupKey shape).
+//
+// For non-FIFO queues or messages with empty resolvedDedupID the
+// returned slice entry is false — dedup emission was already skipped
+// by addSideRecords for those cases.
+func pickDedupWinners(meta *sqsQueueMetaPublic, records []sqsMessageRecord, isPartitioned bool) []bool {
+	winners := make([]bool, len(records))
+	if !meta.FIFO {
+		return winners
+	}
+	type dedupKey struct {
+		partition uint32
+		group     string
+		dedup     string
+	}
+	latest := make(map[dedupKey]int, len(records))
+	for i := range records {
+		d := resolveDedupID(&records[i], meta)
+		if d == "" {
+			continue
+		}
+		var p uint32
+		if isPartitioned && records[i].Partition != nil {
+			p = *records[i].Partition
+		}
+		k := dedupKey{partition: p, group: records[i].MessageGroupID, dedup: d}
+		prev, seen := latest[k]
+		if !seen || records[i].SendTimestampMillis > records[prev].SendTimestampMillis {
+			latest[k] = i
+		}
+	}
+	for _, idx := range latest {
+		winners[idx] = true
+	}
+	return winners
 }
 
 // validatePartitioning runs the four fail-closed gates from the M5-3

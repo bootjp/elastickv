@@ -184,7 +184,7 @@ func resolveDedupID(rec *sqsMessageRecord, meta *sqsQueueMetaPublic) string {
 //   - dedup: FIFO + resolveDedupID(rec, meta) non-empty. ExpiresAtMillis =
 //     SendTimestampMs + sqsFifoDedupWindowMillis. CBD queues get a SHA-256
 //     derived dedup-id (matches adapter/sqs_fifo.go resolveFifoDedupID).
-func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, isPartitioned bool, partition uint32, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
+func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, isPartitioned bool, partition uint32, emitDedup bool, meta *sqsQueueMetaPublic, rec *sqsMessageRecord) error {
 	msgIDBytes := []byte(rec.MessageID)
 
 	var visKey, byAgeKey []byte
@@ -202,6 +202,16 @@ func (e *SQSRecordEncoder) addSideRecords(b *snapshotBuilder, queueName string, 
 		return err
 	}
 
+	// emitDedup is set by stageMessageRecords' pre-pass (pickDedupWinners)
+	// to false for every message whose (group, dedupID) tuple is owned
+	// by a LATER send. The live FIFO dedup window
+	// (sqsFifoDedupWindowMillis = 5 minutes) lets a duplicate re-send
+	// overwrite the prior dedup row, so when the dump captures both
+	// messages naive per-message emission would collide on
+	// snapshotBuilder.Add. Codex P2 #929.
+	if !emitDedup {
+		return nil
+	}
 	if !meta.FIFO {
 		return nil
 	}
