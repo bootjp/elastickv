@@ -40,7 +40,7 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	}
 
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine)
+		return loadWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, cfg.ColdStartObserver)
 	}
 
 	legacy, legacyErr := loadLegacyOrSplitState(cfg.DataDir)
@@ -116,7 +116,7 @@ func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, f
 	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, boot)
 }
 
-func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine) (*diskState, error) {
+func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver) (*diskState, error) {
 	// Scope the repair retry tightly to WAL-only reads: both
 	// loadPersistedSnapshot (scans WAL via wal.ValidSnapshotEntries)
 	// and openAndReadWAL's ReadAll can surface io.ErrUnexpectedEOF
@@ -132,7 +132,7 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	if err != nil {
 		return nil, err
 	}
-	if err := restoreSnapshotState(fsm, snapshot, fsmSnapDir); err != nil {
+	if err := restoreSnapshotState(fsm, snapshot, fsmSnapDir, obs, logger); err != nil {
 		return nil, err
 	}
 
@@ -245,7 +245,7 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 	}
 }
 
-func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir string) error {
+func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) error {
 	if etcdraft.IsEmptySnap(snapshot) || len(snapshot.Data) == 0 || fsm == nil {
 		return nil
 	}
@@ -261,7 +261,9 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
 		// preserved (PR #910 §5), and runs the same three-step CRC
 		// verification (size + footer-vs-tokenCRC + full-body-CRC)
 		// as openAndRestoreFSMSnapshot before mutating any FSM state.
-		if fsmAlreadyAtIndex(fsm, tok.Index) {
+		decision, have := decideSkipOutcome(fsm, tok.Index)
+		reportColdStart(obs, logger, decision, tok.Index, have)
+		if decision == coldStartSkip {
 			return applyHeaderStateOnSkip(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
 		}
 		return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
@@ -270,24 +272,95 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
 	return errors.WithStack(fsm.Restore(bytes.NewReader(snapshot.Data)))
 }
 
-// fsmAlreadyAtIndex reports whether the FSM's durably-recorded
-// applied index is at least `want`. Returns true ONLY when we can
-// prove it. Any uncertainty -- FSM doesn't expose the reader
-// interface, the underlying store reports the meta key as missing,
-// or LastAppliedIndex returns an error -- collapses to false, which
-// makes the caller fall back to the full restore path. The design's
-// strictly-additive guarantee (PR #910 §4) says over-restoring is
-// strictly safer than skipping incorrectly.
-func fsmAlreadyAtIndex(fsm StateMachine, want uint64) bool {
+// coldStartDecision enumerates the three outcomes the skip gate
+// distinguishes. Used together with ColdStartObserver labels to
+// keep the metrics + log emitter centralised.
+type coldStartDecision int
+
+const (
+	coldStartSkip coldStartDecision = iota
+	coldStartExecute
+	coldStartFallbackNotReader
+	coldStartFallbackMissingMeta
+	coldStartFallbackReadErr
+)
+
+func (d coldStartDecision) fallbackReason() string {
+	switch d { //nolint:exhaustive // skip / execute return "" via default
+	case coldStartFallbackNotReader:
+		return "not_reader"
+	case coldStartFallbackMissingMeta:
+		return "missing_meta"
+	case coldStartFallbackReadErr:
+		return "read_err"
+	default:
+		return ""
+	}
+}
+
+// decideSkipOutcome reads the FSM's durable applied index and
+// classifies into one of the five outcomes. Returns (decision,
+// haveIndex). haveIndex is meaningful only for skip / execute
+// outcomes; the three fallback outcomes leave it at 0 because the
+// store could not authoritatively report a value.
+func decideSkipOutcome(fsm StateMachine, want uint64) (coldStartDecision, uint64) {
 	r, ok := fsm.(raftengine.AppliedIndexReader)
 	if !ok {
-		return false
+		return coldStartFallbackNotReader, 0
 	}
 	have, present, err := r.LastAppliedIndex()
-	if err != nil || !present {
-		return false
+	switch {
+	case err != nil:
+		return coldStartFallbackReadErr, 0
+	case !present:
+		return coldStartFallbackMissingMeta, 0
+	case have < want:
+		return coldStartExecute, have
+	default:
+		return coldStartSkip, have
 	}
-	return have >= want
+}
+
+// reportColdStart dispatches the outcome to the observer + the
+// engine logger. nil observer / nil logger no-op individually.
+func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d coldStartDecision, snapIndex, have uint64) {
+	switch d { //nolint:exhaustive // default groups the three fallback variants
+	case coldStartSkip:
+		if obs != nil {
+			obs.RestoreSkipped(snapIndex, have)
+		}
+		if logger != nil {
+			logger.Info("restoreSnapshotState skipped",
+				zap.Uint64("fsm_applied", have),
+				zap.Uint64("snapshot_index", snapIndex),
+				zap.Uint64("gap_ahead", have-snapIndex),
+			)
+		}
+	case coldStartExecute:
+		if obs != nil {
+			obs.RestoreExecuted(snapIndex, have)
+		}
+		if logger != nil {
+			logger.Info("restoreSnapshotState executed (FSM behind snapshot)",
+				zap.Uint64("fsm_applied", have),
+				zap.Uint64("snapshot_index", snapIndex),
+				zap.Uint64("gap_behind", snapIndex-have),
+			)
+		}
+	default:
+		// Fallback variants: the strictly-additive policy. We could
+		// not even attempt the skip; the full restore runs.
+		reason := d.fallbackReason()
+		if obs != nil {
+			obs.RestoreFallback(snapIndex, reason)
+		}
+		if logger != nil {
+			logger.Info("restoreSnapshotState fallback to full restore",
+				zap.Uint64("snapshot_index", snapIndex),
+				zap.String("reason", reason),
+			)
+		}
+	}
 }
 
 // applyHeaderStateOnSkip mirrors openAndRestoreFSMSnapshot's safety
@@ -446,7 +519,12 @@ func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fs
 		return nil, err
 	}
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsmSnapDir, fsm)
+		// Recursive load after bootstrap-style setup: no observer
+		// needed because the engine has not handed one to us
+		// (bootstrap path runs before OpenConfig wiring reaches
+		// this point) and a fresh-bootstrap restore will be a no-op
+		// anyway (the WAL was just created).
+		return loadWalState(logger, walDir, snapDir, fsmSnapDir, fsm, nil)
 	}
 
 	w, err := wal.Create(logger, walDir, nil)

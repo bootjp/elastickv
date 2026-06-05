@@ -22,7 +22,7 @@ import (
 func TestRestoreSnapshotStateEmptySnapshot(t *testing.T) {
 	// An empty (zero-value) snapshot must be a no-op: FSM not touched.
 	fsm := &dummyFSM{}
-	err := restoreSnapshotState(fsm, raftpb.Snapshot{}, "")
+	err := restoreSnapshotState(fsm, raftpb.Snapshot{}, "", nil, nil)
 	require.NoError(t, err)
 	require.Nil(t, fsm.restored)
 }
@@ -33,7 +33,7 @@ func TestRestoreSnapshotStateNilData(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: 5, Term: 1},
 	}
 	fsm := &dummyFSM{}
-	err := restoreSnapshotState(fsm, snap, "")
+	err := restoreSnapshotState(fsm, snap, "", nil, nil)
 	require.NoError(t, err)
 	require.Nil(t, fsm.restored)
 }
@@ -44,7 +44,7 @@ func TestRestoreSnapshotStateNilFSM(t *testing.T) {
 		Data:     []byte("some payload"),
 		Metadata: raftpb.SnapshotMetadata{Index: 1, Term: 1},
 	}
-	err := restoreSnapshotState(nil, snap, "")
+	err := restoreSnapshotState(nil, snap, "", nil, nil)
 	require.NoError(t, err)
 }
 
@@ -58,7 +58,7 @@ func TestRestoreSnapshotStateLegacyFormat(t *testing.T) {
 	}
 
 	fsm := &dummyFSM{}
-	err := restoreSnapshotState(fsm, snap, "")
+	err := restoreSnapshotState(fsm, snap, "", nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, payload, fsm.restored)
 }
@@ -76,7 +76,7 @@ func TestRestoreSnapshotStateTokenFormat(t *testing.T) {
 	}
 
 	fsm := &dummyFSM{}
-	err := restoreSnapshotState(fsm, snap, dir)
+	err := restoreSnapshotState(fsm, snap, dir, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, payload, fsm.restored)
 }
@@ -93,7 +93,7 @@ func TestRestoreSnapshotStateTokenEmptyPayload(t *testing.T) {
 	}
 
 	fsm := &dummyFSM{}
-	err := restoreSnapshotState(fsm, snap, dir)
+	err := restoreSnapshotState(fsm, snap, dir, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, []byte{}, fsm.restored)
 }
@@ -112,7 +112,7 @@ func TestRestoreSnapshotStateTokenCRCMismatch(t *testing.T) {
 	}
 
 	fsm := &dummyFSM{}
-	err := restoreSnapshotState(fsm, snap, dir)
+	err := restoreSnapshotState(fsm, snap, dir, nil, nil)
 	require.ErrorIs(t, err, ErrFSMSnapshotTokenCRC)
 	require.Nil(t, fsm.restored, "FSM must not be restored after CRC mismatch")
 }
@@ -129,7 +129,7 @@ func TestRestoreSnapshotStateTokenFileNotFound(t *testing.T) {
 	}
 
 	fsm := &dummyFSM{}
-	err := restoreSnapshotState(fsm, snap, dir)
+	err := restoreSnapshotState(fsm, snap, dir, nil, nil)
 	require.ErrorIs(t, err, ErrFSMSnapshotNotFound)
 	require.Nil(t, fsm.restored)
 }

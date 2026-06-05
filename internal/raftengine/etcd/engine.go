@@ -187,6 +187,12 @@ type OpenConfig struct {
 	// has been observed yet, equivalent to "raft envelope hook
 	// off".
 	RaftCutoverIndex RaftCutoverIndex
+	// ColdStartObserver receives the cold-start snapshot-restore
+	// skip-gate lifecycle events (skipped / executed / fallback).
+	// nil disables metrics; the skip itself still runs. See
+	// docs/design/2026_06_02_idempotent_snapshot_restore.md §9 and
+	// internal/raftengine/cold_start.go for the contract.
+	ColdStartObserver raftengine.ColdStartObserver
 }
 
 type Engine struct {
