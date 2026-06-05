@@ -321,3 +321,43 @@ func TestVerifyComposed1_AbortPhaseSkipsGate(t *testing.T) {
 	require.NoError(t, fsm.verifyComposed1(abortReq),
 		"ABORT requests must bypass the Composed-1 gate even with a non-zero ObservedRouteVersion pinned, so a route shift between PREPARE and ABORT cannot strand the txn's intent locks past lock-resolver TTL")
 }
+
+// TestVerifyComposed1_DynamoMetaKeyNormalizedToRouteKeyBeforeOwnerOf
+// is the regression for issue #930. verifyOwnerFromSnapshot was
+// passing the raw adapter mutation key (e.g. "!ddb|meta|table|<seg>")
+// to OwnerOf, but the route catalog's ranges are keyed by routing
+// keys ("!ddb|route|table|<seg>"). "meta" (ASCII 'm'=109) sorts below
+// "route" ('r'=114), so every "!ddb|meta|..." key fell into the
+// empty-prefix range — the wrong group — and every cross-group
+// DynamoDB write was rejected with ErrComposed1Violation. The fix
+// normalizes the key via routeKey() before OwnerOf, matching what
+// ShardRouter.ResolveGroup and ShardStore.GetAt already do on the
+// engine side.
+//
+// Without the fix this test fails: OwnerOf returns group 1 for the
+// raw "!ddb|meta|table|anyseg" key (which is < the "!ddb|route|..."
+// boundary), so the FSM serving group 2 raises ErrComposed1Violation.
+// With routeKey() normalization the raw key maps to
+// "!ddb|route|table|anyseg" which falls into group 2's range and the
+// gate passes.
+func TestVerifyComposed1_DynamoMetaKeyNormalizedToRouteKeyBeforeOwnerOf(t *testing.T) {
+	t.Parallel()
+
+	tableSegment := []byte("anyseg")
+	routeBoundary := append([]byte("!ddb|route|table|"), tableSegment...)
+	rawMetaKey := append([]byte("!ddb|meta|table|"), tableSegment...)
+
+	e := distribution.NewEngine()
+	applyComposed1Snapshot(t, e, 1, []distribution.RouteDescriptor{
+		// group 1 owns the empty-prefix half [<empty>, routeBoundary).
+		// Without routeKey() normalization, rawMetaKey would fall in here.
+		{RouteID: 100, Start: []byte(""), End: routeBoundary, GroupID: 1, State: distribution.RouteStateActive},
+		// group 2 owns [routeBoundary, +inf). routeKey(rawMetaKey)
+		// equals routeBoundary, so the normalized key lands here.
+		{RouteID: 101, Start: routeBoundary, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, e, 2) // this FSM serves group 2
+
+	require.NoError(t, fsm.verifyComposed1(commitTxnRequest(1, string(rawMetaKey))),
+		"issue #930: verifyOwnerFromSnapshot must routeKey-normalize raw adapter keys before OwnerOf, so the gate routes the same way as ShardRouter.ResolveGroup; without normalization the raw \"!ddb|meta|...\" key sorts below the \"!ddb|route|...\" range and is falsely owned by group 1")
+}
