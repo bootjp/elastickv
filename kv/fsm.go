@@ -644,24 +644,16 @@ func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, snap RouteSnap
 		if isTxnInternalKey(mut.Key) {
 			continue
 		}
-		// Issue #930 fix: normalize the raw mutation key through
-		// routeKey() before consulting OwnerOf — the same way
-		// ShardRouter.ResolveGroup and ShardStore.GetAt route on the
-		// engine side.  Without this, raw adapter keys (e.g.
-		// "!ddb|meta|table|<base64>") are compared byte-wise against
-		// routing keys (e.g. "!ddb|route|table|<base64>") which sit in
-		// a completely different lexicographical band, yielding a
-		// wrong-group verdict and a spurious ErrComposed1Violation on
-		// every adapter write.  Reproduced by PR #911-#925 M5a
-		// multi-table workload: every DynamoDB CreateTable / write to
-		// a group-2 table was rejected because OwnerOf saw the raw
-		// "!ddb|meta|..." key fall into group 1 instead of the routing
-		// key's actual group-2 range.
-		owner, found := snap.OwnerOf(routeKey(mut.Key))
+		// routeKey-normalize before OwnerOf so the gate routes the
+		// same way as ShardRouter.ResolveGroup — raw adapter keys
+		// and route catalog ranges live in different lex bands
+		// (issue #930).
+		rKey := routeKey(mut.Key)
+		owner, found := snap.OwnerOf(rKey)
 		if !found || owner != f.shardGroupID {
 			return errors.Wrapf(ErrComposed1Violation,
-				"%s-version v=%d: key %q owned by group %d (found=%v); this FSM serves group %d",
-				phase, snapVer, mut.Key, owner, found, f.shardGroupID)
+				"%s-version v=%d: key %q (routeKey %q) owned by group %d (found=%v); this FSM serves group %d",
+				phase, snapVer, mut.Key, rKey, owner, found, f.shardGroupID)
 		}
 	}
 	return nil

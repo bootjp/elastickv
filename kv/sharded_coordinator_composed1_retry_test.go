@@ -758,8 +758,8 @@ func (r *stubPartitionResolver) RecognisesPartitionedKey(key []byte) bool {
 //   - Dispatch-entry auto-pin stamps ObservedRouteVersion =
 //     engine.Version() on the request.
 //   - FSM at gid R applies; verifyComposed1 calls route-history
-//     OwnerOf on the raw mutation key against the engine's
-//     snapshot.
+//     OwnerOf on the routeKey()-normalized mutation key against
+//     the engine's snapshot (issue #930 fix).
 //   - Engine's snapshot says gid B (default byte-range owner),
 //     not gid R.
 //   - Mismatch → ErrComposed1Violation.
