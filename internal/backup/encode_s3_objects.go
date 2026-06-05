@@ -52,12 +52,6 @@ const (
 	s3RestoreUploadID        = "elastickv-restore"
 )
 
-// ErrS3EncodeUnsupportedCollision is returned when the dump carries an
-// object-name collision artifact (KEYMAP.jsonl or a .elastickv-leaf-data
-// file) that this slice does not yet reverse — failing closed avoids
-// emitting a record under the wrong object key.
-var ErrS3EncodeUnsupportedCollision = errors.New("backup: s3 encode object-name collision not yet supported")
-
 // ErrS3EncodeReservedPrefixCollision is returned when a user object key
 // collides with a reserved dump-control directory (_incomplete_uploads/
 // or _orphans/) — the decoder writes such keys at their natural path
@@ -79,32 +73,49 @@ var ErrS3EncodeInvalidManifest = errors.New("backup: s3 encode invalid object si
 // object's manifest + blob records.
 //
 // Object-name collisions: the decoder writes a top-level KEYMAP.jsonl
-// recording shorter keys renamed to <key>.elastickv-leaf-data. M4-2a does
-// not reverse those renames, so a collision-tracker KEYMAP.jsonl fails
-// closed. It is distinguished from a legitimate user object named
-// "KEYMAP.jsonl" (which the decoder also emits verbatim) by the absence of
-// a companion .elastickv-meta.json sidecar — the tracker has none. The
-// .elastickv-leaf-data suffix is NOT special-cased: a real object whose
-// key ends in it has a sidecar and round-trips normally, and any actual
-// collision is already gated by the tracker check above (codex P1 #845).
+// recording shorter keys renamed to <key>.elastickv-leaf-data (and the
+// --rename-collisions variants for .elastickv-meta.json-suffixed user
+// keys). M4-2b reverses those renames: when isKeymapCollisionTracker
+// reports the tracker is present, loadBucketKeymap reads the file and
+// the walk consults the resulting map to recover original S3 keys.
+// A legitimate user object literally named "KEYMAP.jsonl" (which has
+// a companion sidecar) keeps the M4-2a normal-object-body path —
+// isKeymapCollisionTracker disambiguates by sidecar absence. The
+// .elastickv-leaf-data suffix on a real object key (sidecar present,
+// no keymap entry) likewise stays on the normal path. Design doc PR
+// #913.
 func (e *S3RecordEncoder) encodeBucketObjects(b *snapshotBuilder, root *os.Root, bucketDir, bucketName string) error {
 	tracker, err := e.isKeymapCollisionTracker(root, bucketDir)
 	if err != nil {
 		return err
 	}
+	var keymap map[string]KeymapRecord
 	if tracker {
-		return errors.Wrapf(ErrS3EncodeUnsupportedCollision,
-			"%s: collision-rename KEYMAP.jsonl present", bucketDir)
+		keymap, err = e.loadBucketKeymap(root, bucketDir)
+		if err != nil {
+			return errors.Wrapf(ErrS3EncodeInvalidBucket, "%s: %v", bucketDir, err)
+		}
+		if err := e.verifyKeymapTargetsExist(root, bucketDir, keymap); err != nil {
+			return errors.Wrapf(ErrS3EncodeInvalidBucket, "%s: %v", bucketDir, err)
+		}
 	}
-	return e.walkObjects(b, root, bucketDir, bucketName, "")
+	return e.walkObjects(b, root, bucketDir, bucketName, "", keymap)
 }
 
 // isKeymapCollisionTracker reports whether the bucket's top-level
 // KEYMAP.jsonl is the decoder's collision-rename tracker. The tracker is a
 // regular FILE with no companion sidecar. It is NOT:
-//   - a user object literally named KEYMAP.jsonl (which has a sidecar), or
+//   - a user object literally named KEYMAP.jsonl (which has a regular-
+//     file sidecar at KEYMAP.jsonl.elastickv-meta.json), or
 //   - a directory holding objects under the "KEYMAP.jsonl/" key prefix
 //     (a directory, not a file).
+//
+// The sidecar disambiguation requires the sidecar to be a REGULAR FILE
+// (not just any entry). A user object whose key prefix happens to be
+// `KEYMAP.jsonl.elastickv-meta.json/` would create a directory at that
+// path; treating that directory as "the sidecar" would mis-classify
+// the tracker file as a user object and skip keymap loading. Codex P2
+// PR #928.
 func (e *S3RecordEncoder) isKeymapCollisionTracker(root *os.Root, bucketDir string) (bool, error) {
 	keymapRel := filepath.Join(bucketDir, "KEYMAP.jsonl")
 	linfo, err := root.Lstat(keymapRel)
@@ -117,24 +128,22 @@ func (e *S3RecordEncoder) isKeymapCollisionTracker(root *os.Root, bucketDir stri
 	if !linfo.Mode().IsRegular() {
 		return false, nil // a directory (KEYMAP.jsonl/ key prefix) or other
 	}
-	hasSidecar, err := rootEntryExists(root, keymapRel+S3MetaSuffixReserved)
-	if err != nil {
-		return false, err
-	}
-	return !hasSidecar, nil
-}
-
-// rootEntryExists reports whether rel exists within root (via Lstat, so it
-// does not follow a final symlink).
-func rootEntryExists(root *os.Root, rel string) (bool, error) {
-	_, err := root.Lstat(rel)
+	sinfo, err := root.Lstat(keymapRel + S3MetaSuffixReserved)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		// No sidecar at all → this KEYMAP.jsonl is the tracker.
+		return true, nil
 	}
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	return true, nil
+	// Sidecar entry exists, but only a regular file disambiguates a
+	// legitimate user object. A directory at the sidecar path means
+	// some user key prefix collides with `KEYMAP.jsonl.elastickv-meta.json/`
+	// — that is NOT a sidecar; the tracker classification stands.
+	if !sinfo.Mode().IsRegular() {
+		return true, nil
+	}
+	return false, nil
 }
 
 // reservedDirHoldsSidecar reports whether dirRel (a reserved dump dir like
@@ -174,14 +183,14 @@ func reservedDirHoldsSidecar(root *os.Root, dirRel string) (bool, error) {
 // regular file as an object body whose key is its path relative to
 // bucketDir. The reserved top-level entries (_bucket.json,
 // _incomplete_uploads/, _orphans/) are skipped.
-func (e *S3RecordEncoder) walkObjects(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel string) error {
+func (e *S3RecordEncoder) walkObjects(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel string, keymap map[string]KeymapRecord) error {
 	entries, err := readRootSubdirEntries(root, filepath.Join(bucketDir, rel))
 	if err != nil {
 		return err
 	}
 	for _, ent := range entries {
 		childRel := filepath.Join(rel, ent.Name())
-		if err := e.walkObjectEntry(b, root, bucketDir, bucketName, rel, childRel, ent); err != nil {
+		if err := e.walkObjectEntry(b, root, bucketDir, bucketName, rel, childRel, ent, keymap); err != nil {
 			return err
 		}
 	}
@@ -191,23 +200,33 @@ func (e *S3RecordEncoder) walkObjects(b *snapshotBuilder, root *os.Root, bucketD
 // walkObjectEntry classifies one directory entry: reserved skips,
 // sidecars, collision artifacts (fail closed), sub-directories (recurse),
 // or an object body.
-func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string, ent os.DirEntry) error {
+func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string, ent os.DirEntry, keymap map[string]KeymapRecord) error {
 	name := ent.Name()
 	if ent.IsDir() {
-		return e.walkObjectSubdir(b, root, bucketDir, bucketName, rel, childRel)
+		return e.walkObjectSubdir(b, root, bucketDir, bucketName, rel, childRel, keymap)
 	}
 	switch {
 	case rel == "" && name == "_bucket.json":
+		return nil
+	case rel == "" && name == "KEYMAP.jsonl" && keymap != nil:
+		// The collision-tracker file itself, NOT a user object. The
+		// tracker has no companion sidecar (encodeObject would fail
+		// closed reading a missing sidecar); explicitly skip it here so
+		// the disambiguation contract in isKeymapCollisionTracker
+		// remains the single decision point. A legitimate user object
+		// named KEYMAP.jsonl is handled by the default branch because
+		// keymap stays nil in that case (isKeymapCollisionTracker
+		// returned false).
 		return nil
 	case strings.HasSuffix(name, S3MetaSuffixReserved):
 		return nil // sidecar, handled with its body
 	default:
 		// Any other regular file (including a user object literally named
 		// "KEYMAP.jsonl" or ending in .elastickv-leaf-data) is an object
-		// body; encodeObject reads its sidecar and fails closed if absent.
-		// A sidecar-less collision-tracker KEYMAP.jsonl was already gated
-		// in encodeBucketObjects.
-		return e.encodeObject(b, root, bucketDir, bucketName, childRel)
+		// body; encodeObject reads its sidecar and fails closed if
+		// absent. The keymap (if present) is consulted in encodeObject
+		// to recover the original S3 key for renamed entries.
+		return e.encodeObject(b, root, bucketDir, bucketName, childRel, keymap)
 	}
 }
 
@@ -220,10 +239,10 @@ func (e *S3RecordEncoder) walkObjectEntry(b *snapshotBuilder, root *os.Root, buc
 // those) also lands here; its sidecar makes that detectable, and we
 // fail closed rather than silently drop the user data (codex P1 #842
 // follow-up).
-func (e *S3RecordEncoder) walkObjectSubdir(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string) error {
+func (e *S3RecordEncoder) walkObjectSubdir(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, rel, childRel string, keymap map[string]KeymapRecord) error {
 	name := filepath.Base(childRel)
 	if rel != "" || (name != "_incomplete_uploads" && name != "_orphans") {
-		return e.walkObjects(b, root, bucketDir, bucketName, childRel)
+		return e.walkObjects(b, root, bucketDir, bucketName, childRel, keymap)
 	}
 	hasUserObject, err := reservedDirHoldsSidecar(root, filepath.Join(bucketDir, childRel))
 	if err != nil {
@@ -239,8 +258,15 @@ func (e *S3RecordEncoder) walkObjectSubdir(b *snapshotBuilder, root *os.Root, bu
 // encodeObject reads one object's sidecar, streams its body into blob
 // records, and stages the manifest. The object key is the body's path
 // relative to bucketDir.
-func (e *S3RecordEncoder) encodeObject(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, objRel string) error {
-	objectKey := filepath.ToSlash(objRel)
+func (e *S3RecordEncoder) encodeObject(b *snapshotBuilder, root *os.Root, bucketDir, bucketName, objRel string, keymap map[string]KeymapRecord) error {
+	// resolveObjectKeyFromRel does the slash-form conversion and
+	// keymap lookup. nil keymap or miss returns slash-form of objRel
+	// (the no-collision M4-2a path); a hit returns the decoded
+	// original key bytes from KEYMAP.jsonl.
+	objectKey, err := resolveObjectKeyFromRel(keymap, objRel)
+	if err != nil {
+		return errors.Wrapf(ErrS3EncodeInvalidBucket, "%s: %v", bucketDir, err)
+	}
 	bodyRel := filepath.Join(bucketDir, objRel)
 	sidecar, err := e.readObjectSidecar(root, bodyRel+S3MetaSuffixReserved)
 	if err != nil {

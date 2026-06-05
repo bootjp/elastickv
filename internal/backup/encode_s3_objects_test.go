@@ -238,24 +238,6 @@ func TestS3EncodeKeymapDirPrefixObjectRoundTrip(t *testing.T) {
 	}
 }
 
-// TestS3EncodeRejectsKeymapCollisionTracker pins fail-closed when a bucket
-// carries a collision-tracker KEYMAP.jsonl — identified by the ABSENCE of
-// a companion .elastickv-meta.json sidecar (M4-2a does not reverse renames).
-func TestS3EncodeRejectsKeymapCollisionTracker(t *testing.T) {
-	t.Parallel()
-	in := t.TempDir()
-	const bucket = "b"
-	writeS3Bucket(t, in, bucket, []byte(`{"format_version":1,"name":"b"}`))
-	km := filepath.Join(in, "s3", EncodeSegment([]byte(bucket)), "KEYMAP.jsonl")
-	if err := os.WriteFile(km, []byte("{}\n"), 0o600); err != nil {
-		t.Fatalf("write KEYMAP: %v", err)
-	}
-	b := newSnapshotBuilder(s3EncTS)
-	if err := NewS3RecordEncoder(in).Encode(b); !errors.Is(err, ErrS3EncodeUnsupportedCollision) {
-		t.Fatalf("Encode err = %v, want ErrS3EncodeUnsupportedCollision", err)
-	}
-}
-
 // TestS3EncodeKeymapObjectRoundTrip pins that a legitimate user object
 // named "KEYMAP.jsonl" (one with a companion sidecar) round-trips, rather
 // than being mistaken for the collision tracker (codex P1 #845).
