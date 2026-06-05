@@ -2087,3 +2087,243 @@ func TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2(t *testing.T) {
 		t.Errorf("RaftEnvelopeCutoverIndex=%d, want 0 (gate must refuse before sidecar mutation)", sc.RaftEnvelopeCutoverIndex)
 	}
 }
+
+// recordingCutoverBarrier is a CutoverBarrierController stub that
+// records the call order so the §7.1 6-step state-machine tests can
+// assert Begin → WaitDrained → (propose) → InstallWrap → End. It
+// also tracks call counts so tests can pin "End MUST be called once
+// even on error" without flake risk.
+type recordingCutoverBarrier struct {
+	order []string // appends "Begin", "WaitDrained", "InstallWrap", "End"
+	// waitErr is returned from WaitDrained when non-nil so the test
+	// can exercise the step-2 timeout path. Otherwise WaitDrained
+	// returns nil immediately.
+	waitErr error
+}
+
+func (b *recordingCutoverBarrier) Begin() <-chan struct{} {
+	b.order = append(b.order, "Begin")
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func (b *recordingCutoverBarrier) WaitDrained(_ context.Context) error {
+	b.order = append(b.order, "WaitDrained")
+	return b.waitErr
+}
+
+func (b *recordingCutoverBarrier) InstallWrap() {
+	b.order = append(b.order, "InstallWrap")
+}
+
+func (b *recordingCutoverBarrier) End() {
+	b.order = append(b.order, "End")
+}
+
+// withWrapEnabledForTest flips raftEnvelopeWrapEnabled to true for
+// the duration of t and restores the original value via t.Cleanup.
+// Tests that exercise the §7.1 state machine MUST call this — the
+// production value is still false in 6E-2d so the gated short-
+// circuit would otherwise eat the test before the barrier path
+// runs. Returns no value; t.Cleanup handles teardown so callers
+// don't need to defer.
+func withWrapEnabledForTest(t *testing.T) {
+	t.Helper()
+	prev := raftEnvelopeWrapEnabled
+	raftEnvelopeWrapEnabled = true
+	t.Cleanup(func() { raftEnvelopeWrapEnabled = prev })
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier
+// pins the §7.1 wiring gate: even with raftEnvelopeWrapEnabled
+// flipped true (the future 6E-2f production state), the handler
+// MUST refuse with FailedPrecondition when the cutoverBarrier
+// controller is not wired. Silently skipping the barrier would
+// let a fresh USER proposal land at index > proposedIdx mid-
+// cutover and halt apply cluster-wide on the §6.3 strict-`>` hook.
+func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		// Deliberately NO WithEncryptionAdminCutoverBarrier.
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (no barrier wired)", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "cutover barrier") {
+		t.Errorf("error %q does not hint at the missing barrier wiring", err)
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (no barrier MUST refuse before propose)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutAppliedIndex
+// pins the §7.1 step-4 wiring gate: without a wired
+// latestAppliedIndex callback, awaitCutoverApply has no oracle for
+// "the cutover entry has been applied locally". Skipping the wait
+// would let InstallWrap (step 5) run before the cutover entry's
+// FSM apply, potentially wrapping the cutover entry itself if a
+// Propose racing the install observed the freshly-set wrap pointer.
+// Refuse before any side effect.
+func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutAppliedIndex(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(&recordingCutoverBarrier{}),
+		// Deliberately NO WithEncryptionAdminLatestAppliedIndex.
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (no applied-index wired)", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "latest-applied-index") {
+		t.Errorf("error %q does not hint at the missing applied-index wiring", err)
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence
+// pins the §7.1 6-step state-machine ordering: Begin → WaitDrained
+// → (ProposeAdmin) → (await apply) → InstallWrap → End. A
+// regression that reordered these (e.g. InstallWrap before
+// awaitCutoverApply) would create the same race as skipping the
+// apply wait — install the wrap closure while the engine has not
+// yet seen the cutover entry, letting a Propose-side wrap apply to
+// the cutover marker itself.
+func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	barrier := &recordingCutoverBarrier{}
+	// latestAppliedIndex returns the proposer's commitIndex so the
+	// step-4 wait completes immediately on the first poll. A
+	// production wiring would have the FSM apply path update this.
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 4242 }),
+	)
+	resp, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableRaftEnvelope: %v", err)
+	}
+	if resp == nil || resp.GetAppliedIndex() != 4242 {
+		t.Fatalf("response applied_index=%v, want 4242", resp)
+	}
+	wantOrder := []string{"Begin", "WaitDrained", "InstallWrap", "End"}
+	if !equalStrings(barrier.order, wantOrder) {
+		t.Errorf("barrier call order = %v, want %v (Propose runs between WaitDrained and InstallWrap; the barrier doesn't observe it)", barrier.order, wantOrder)
+	}
+	if len(proposer.calls) != 1 {
+		t.Errorf("proposer.calls len=%d, want 1 (one ProposeAdmin between WaitDrained and InstallWrap)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnProposeError
+// pins the §7.1 step-6 deferred-cleanup invariant: if step-3
+// (ProposeAdmin) errors, the handler MUST still call End() so the
+// barrier closes and user writes resume. A regression that returned
+// early without End would brick the cluster — every coordinator
+// would see ErrEnvelopeCutoverInProgress forever, and a retry of
+// EnableRaftEnvelope would block on the cutoverSem.
+func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnProposeError(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &recordingProposer{err: errors.New("engine refused")}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 0 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want error from propose-failure, got nil")
+	}
+	// Order is Begin → WaitDrained → End (propose errored, no InstallWrap)
+	wantOrder := []string{"Begin", "WaitDrained", "End"}
+	if !equalStrings(barrier.order, wantOrder) {
+		t.Errorf("barrier call order = %v, want %v (End MUST run on propose error)", barrier.order, wantOrder)
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout
+// pins step-2's failure path: if WaitDrained returns an error
+// (typically context cancellation or a misbehaving in-flight
+// proposal), the handler MUST still call End() so the barrier
+// closes. Symmetric with the propose-error case above.
+func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &recordingProposer{}
+	barrier := &recordingCutoverBarrier{waitErr: errors.New("drain timeout")}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 0 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want error from drain timeout, got nil")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("EnableRaftEnvelope status=%v, want Unavailable for drain timeout", status.Code(err))
+	}
+	wantOrder := []string{"Begin", "WaitDrained", "End"}
+	if !equalStrings(barrier.order, wantOrder) {
+		t.Errorf("barrier call order = %v, want %v (End MUST run on drain timeout)", barrier.order, wantOrder)
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (drain timeout MUST refuse before propose)", len(proposer.calls))
+	}
+}
+
+// equalStrings compares two string slices element-by-element. Used
+// by the barrier-order assertions because reflect.DeepEqual would
+// pull in an extra import for the same single use, and the call-
+// site is more readable than slices.Equal under the test's t.Errorf
+// formatting.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

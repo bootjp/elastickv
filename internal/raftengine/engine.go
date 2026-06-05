@@ -23,6 +23,20 @@ var (
 	// ErrLeadershipTransferInProgress indicates a leadership transfer
 	// is under way and proposals are being held back.
 	ErrLeadershipTransferInProgress = errors.New("raft engine: leadership transfer in progress")
+	// ErrEnvelopeCutoverInProgress indicates the §7.1 raft-envelope
+	// cutover barrier is open on this leader and rejecting fresh
+	// USER proposals on the Propose path. The error is the step-1
+	// gate-rejection surface for coordinator clients while the
+	// EnableRaftEnvelope handler runs the 6-step barrier sequence
+	// (block intake → drain → propose cutover via ProposeAdmin →
+	// wait apply → flip wrap → unblock). Callers should treat it
+	// as a transient back-off: a healthy cluster spends single-
+	// digit milliseconds inside the barrier. ProposeAdmin is the
+	// design's barrier exemption (admin entries that MUST remain
+	// admissible across the barrier — the cutover marker itself,
+	// ConfChange-time RegisterEncryptionWriter) and never observes
+	// this error.
+	ErrEnvelopeCutoverInProgress = errors.New("raft engine: envelope cutover in progress")
 )
 
 type State string

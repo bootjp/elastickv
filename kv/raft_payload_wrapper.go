@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -131,9 +132,44 @@ func (p *wrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*rafte
 // stores nil to express "wrap inactive". This is so the call site
 // (typically a ShardGroup) owns the storage and the proposer just
 // reads.
+//
+// §7.1 quiescence-barrier state (Stage 6E-2d) lives here too — see
+// the BeginCutoverBarrier / WaitInflightDrained / EndCutoverBarrier
+// trio below for the 6-step state machine's mechanics. The barrier
+// gates only the user-Propose path; ProposeAdmin is exempt by
+// interface contract so the EnableRaftEnvelope handler can propose
+// the cutover marker itself across its own barrier.
 type dynamicWrappedProposer struct {
 	inner   raftengine.Proposer
 	wrapPtr *atomic.Pointer[RaftPayloadWrapper]
+
+	// barrierMu guards barrierOpen, inflightUser, and drainSig. Held
+	// only briefly on Propose entry/exit (the engine.Propose call
+	// itself runs without the mutex), so contention is bounded by
+	// the per-Propose acquire/release pair. The 6E-2d handler holds
+	// it longer on the BeginCutoverBarrier / EndCutoverBarrier
+	// transitions, but those are once per cutover (~ms-scale).
+	//
+	// Why a mutex rather than three atomics: the barrier-open check
+	// and the in-flight counter increment MUST be observed as one
+	// atomic transition, or a Propose that read barrierOpen=false
+	// just before the cutover handler stores true could increment
+	// the counter AFTER BeginCutoverBarrier observed it as 0,
+	// leaving WaitInflightDrained returning success while a fresh
+	// user proposal slips through to engine.Propose. The mutex is
+	// the simplest way to make Propose's (read-barrier, inc-counter)
+	// pair atomic with the handler's (open-barrier, sample-counter)
+	// pair on the other side.
+	barrierMu    sync.Mutex
+	barrierOpen  bool
+	inflightUser int64
+	// drainSig is freshly allocated each BeginCutoverBarrier call
+	// and closed when inflightUser drops to 0 after the barrier has
+	// opened (either at BeginCutoverBarrier time if no Propose is
+	// in flight, or at the last proposeExit that hits 0). nil
+	// outside a barrier cycle so WaitInflightDrained called without
+	// an active barrier degrades gracefully to immediate success.
+	drainSig chan struct{}
 }
 
 // newDynamicWrappedProposer wires a proposer that consults wrapPtr
@@ -174,7 +210,24 @@ func (p *dynamicWrappedProposer) currentWrap() RaftPayloadWrapper {
 	return nil
 }
 
+// Propose runs the §7.1 quiescence-barrier gate, then forwards the
+// (optionally wrapped) payload to the inner Propose. The gate
+// rejects with ErrEnvelopeCutoverInProgress while the barrier is
+// open — the 6E-2d EnableRaftEnvelope handler holds the barrier
+// open for the few-ms it takes to commit the cutover entry and
+// publish the active wrap closure. Callers should treat the error
+// as a transient back-off (retry on a new leader-issued ts).
+//
+// The barrierMu + inflight-counter pair makes (read-barrier,
+// inc-counter) atomic with the handler's (open-barrier,
+// sample-counter); see the type comment for the race that motivates
+// it.
 func (p *dynamicWrappedProposer) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	if err := p.beginUserPropose(); err != nil {
+		return nil, err
+	}
+	defer p.endUserPropose()
+
 	wrapped, err := applyRaftPayloadWrap(p.currentWrap(), data)
 	if err != nil {
 		return nil, err
@@ -184,6 +237,108 @@ func (p *dynamicWrappedProposer) Propose(ctx context.Context, data []byte) (*raf
 		return nil, errors.Wrap(err, "kv: dynamic wrapped propose")
 	}
 	return res, nil
+}
+
+// beginUserPropose increments the in-flight counter under
+// barrierMu, returning ErrEnvelopeCutoverInProgress if the barrier
+// is open. Returning the error without incrementing is intentional:
+// a rejected Propose must not count toward in-flight (the handler
+// would otherwise wait on a fictional in-flight that will never
+// drain). Pair with endUserPropose.
+func (p *dynamicWrappedProposer) beginUserPropose() error {
+	p.barrierMu.Lock()
+	defer p.barrierMu.Unlock()
+	if p.barrierOpen {
+		return raftengine.ErrEnvelopeCutoverInProgress
+	}
+	p.inflightUser++
+	return nil
+}
+
+// endUserPropose pairs with beginUserPropose: decrement the
+// in-flight counter under barrierMu and, if the barrier is open
+// and we just dropped to 0, close drainSig so the handler's
+// WaitInflightDrained unblocks. Idempotent close via the
+// select/default pattern so concurrent EndCutoverBarrier doesn't
+// race a late proposeExit on a freshly nil-ed drainSig (the nil
+// check covers EndCutoverBarrier having already torn down the
+// channel; the closed-recv guard covers the BeginCutoverBarrier
+// path that closed an empty-inflight channel at open time).
+func (p *dynamicWrappedProposer) endUserPropose() {
+	p.barrierMu.Lock()
+	defer p.barrierMu.Unlock()
+	p.inflightUser--
+	if p.barrierOpen && p.inflightUser == 0 && p.drainSig != nil {
+		select {
+		case <-p.drainSig:
+			// already closed at BeginCutoverBarrier-with-no-inflight
+			// or by a sibling exit; treat as success.
+		default:
+			close(p.drainSig)
+		}
+	}
+}
+
+// BeginCutoverBarrier opens the §7.1 step-1 quiescence barrier.
+// After return, every fresh dynamicWrappedProposer.Propose call
+// fails with ErrEnvelopeCutoverInProgress until EndCutoverBarrier
+// runs. Idempotent against double-Begin: a second call freshens
+// drainSig but leaves barrierOpen true. ProposeAdmin is unaffected
+// (the cutover marker proposes through it).
+//
+// Returns the channel that closes when in-flight drains to 0 so
+// callers MAY block on it directly; the recommended pattern is to
+// use WaitInflightDrained which composes context cancellation.
+func (p *dynamicWrappedProposer) BeginCutoverBarrier() <-chan struct{} {
+	p.barrierMu.Lock()
+	defer p.barrierMu.Unlock()
+	p.drainSig = make(chan struct{})
+	p.barrierOpen = true
+	if p.inflightUser == 0 {
+		// Fast path: no in-flight, drain is already complete.
+		close(p.drainSig)
+	}
+	return p.drainSig
+}
+
+// WaitInflightDrained blocks until the in-flight Propose counter
+// drops to 0 after BeginCutoverBarrier was called, or ctx fires.
+// Returns nil on drain, wrapped ctx.Err() on cancellation, and nil
+// also if no barrier is currently open (degraded fast-path so
+// out-of-sequence calls don't deadlock callers).
+func (p *dynamicWrappedProposer) WaitInflightDrained(ctx context.Context) error {
+	p.barrierMu.Lock()
+	ch := p.drainSig
+	p.barrierMu.Unlock()
+	if ch == nil {
+		// No active barrier — drain is trivially complete.
+		return nil
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "kv: wait inflight drained")
+	}
+}
+
+// EndCutoverBarrier closes the §7.1 step-6 barrier. After return,
+// fresh Propose calls succeed again. Idempotent against a
+// no-barrier-active state. Callers MUST call this once for each
+// BeginCutoverBarrier (the EnableRaftEnvelope handler uses defer).
+func (p *dynamicWrappedProposer) EndCutoverBarrier() {
+	p.barrierMu.Lock()
+	defer p.barrierMu.Unlock()
+	p.barrierOpen = false
+	// Drop the drainSig reference so a stale WaitInflightDrained
+	// caller that reads the channel after EndCutoverBarrier sees
+	// nil (immediate-success degraded path) rather than blocking
+	// on a closed channel from a previous cycle. Whether the
+	// channel was closed or not at this point depends on whether
+	// in-flight drained; both shapes are acceptable transient
+	// states because no new BeginCutoverBarrier has run yet to
+	// allocate a fresh channel.
+	p.drainSig = nil
 }
 
 // ProposeAdmin mirrors Propose's wrap-applies semantics. See

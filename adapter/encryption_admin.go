@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strconv"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -64,7 +65,70 @@ type EncryptionAdminServer struct {
 	// handles the un-serialized RotateDEK/cutover interleave
 	// today.
 	cutoverSem chan struct{}
+	// cutoverBarrier drives the §7.1 6-step quiescence barrier that
+	// EnableRaftEnvelope wraps around its cutover proposal. nil means
+	// the barrier is unwired — EnableRaftEnvelope refuses with
+	// FailedPrecondition before composing any proposal (matches the
+	// proposer / leaderView posture for the other mutator RPCs).
+	//
+	// Production wiring (6E-2e: main.go) fans this out over every
+	// ShardGroup that participates in the cutover so the barrier
+	// engages all leaders for the few-ms cutover window. The
+	// raftEnvelopeWrapEnabled production gate (still false in 6E-2d)
+	// short-circuits EnableRaftEnvelope before reaching the barrier;
+	// tests that exercise the state machine flip the gate via the
+	// test-only override and inject a stub controller.
+	cutoverBarrier CutoverBarrierController
 	pb.UnimplementedEncryptionAdminServer
+}
+
+// CutoverBarrierController coordinates the §7.1 quiescence barrier
+// across every ShardGroup that participates in the raft-envelope
+// cutover. EnableRaftEnvelope drives the 6-step sequence:
+//
+//	Begin()          // step 1: block USER proposals
+//	WaitDrained(ctx) // step 2: drain in-flight
+//	<handler proposes cutover entry via ProposeAdmin>
+//	<handler waits for FSM apply via latestAppliedIndex>
+//	InstallWrap()    // step 5: SetRaftPayloadWrap on each group
+//	End()            // step 6: unblock USER proposals
+//
+// Production wiring (6E-2e: main.go) fans the controller over every
+// participating ShardGroup so each leader's
+// dynamicWrappedProposer.Propose engages the gate. Tests stub the
+// interface to drive the state machine without spinning real engines.
+//
+// All four methods MUST be safe to call from one handler goroutine
+// at a time (per-handler serialization via cutoverSem); the
+// controller does not need internal locking against re-entry from
+// itself. Cross-goroutine reads of the underlying state (Propose
+// gate check, drain signal) ARE concurrent and rely on the
+// controller's own happens-before ordering.
+type CutoverBarrierController interface {
+	// Begin opens the barrier on every participating ShardGroup.
+	// Returns a channel that closes when in-flight drains. The
+	// typical caller uses WaitDrained instead so context cancellation
+	// composes; the channel is exposed so callers MAY use a select
+	// with other signals when needed.
+	Begin() <-chan struct{}
+	// WaitDrained blocks until in-flight drains or ctx fires.
+	// Returns nil on drain, wrapped ctx.Err() on cancellation. A
+	// barrier-incapable controller (test fixture) may degrade to
+	// immediate-success; production controllers MUST honour the
+	// drain semantic so the handler doesn't propose the cutover
+	// while user proposals are still landing.
+	WaitDrained(ctx context.Context) error
+	// InstallWrap publishes the active raft envelope wrap closure
+	// on every participating ShardGroup, in step 5 of the barrier
+	// sequence (after the cutover entry has both committed AND
+	// applied locally). The closure source is owned by the
+	// controller, not the EncryptionAdminServer — 6E-2e populates
+	// it via main.go wiring from the sidecar's Active.Raft DEK.
+	InstallWrap()
+	// End closes the barrier on every participating ShardGroup.
+	// Idempotent against double-End. Pair with Begin via defer in
+	// the handler.
+	End()
 }
 
 // CapabilityFanoutFn is the closure the server invokes to run the
@@ -173,6 +237,25 @@ func WithEncryptionAdminCapabilityFanout(fn CapabilityFanoutFn) EncryptionAdminS
 func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
 		s.leaderView = v
+	}
+}
+
+// WithEncryptionAdminCutoverBarrier wires the §7.1 quiescence
+// barrier controller used by EnableRaftEnvelope. A nil argument is
+// a no-op (the server stays in the cutover-disabled posture);
+// EnableRaftEnvelope refuses with FailedPrecondition until both
+// raftEnvelopeWrapEnabled flips to true AND this controller is
+// wired.
+//
+// Production wiring (6E-2e: main.go) fans the controller over every
+// ShardGroup that participates in the cutover. Tests pass a stub
+// implementation to exercise the state machine deterministically.
+func WithEncryptionAdminCutoverBarrier(c CutoverBarrierController) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		if c == nil {
+			return
+		}
+		s.cutoverBarrier = c
 	}
 }
 
@@ -1045,7 +1128,14 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 // pre-upgrade cleartext entry above N as an envelope and halt
 // apply cluster-wide. Gate fails closed until 6E-2 atomically
 // flips this to true alongside the wrap/unwrap/barrier wiring.
-const raftEnvelopeWrapEnabled = false
+// raftEnvelopeWrapEnabled is a var, not a const, so the unit tests
+// in encryption_admin_test.go can flip it to true (with
+// t.Cleanup-based restore) to exercise the §7.1 6-step state
+// machine that ships in 6E-2d. The production value is false until
+// 6E-2f flips it; releasing 6E-2d alone with the gate still false
+// keeps the handler's barrier path unreachable from operators while
+// the wrap closure source wires through in 6E-2e.
+var raftEnvelopeWrapEnabled = false
 
 // EnableRaftEnvelope is the Stage 6E Phase 2 cutover — flips Raft
 // proposals from cleartext to §4.2-envelope. Structural mirror of
@@ -1092,16 +1182,119 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 		return nil, grpcStatusError(codes.FailedPrecondition,
 			"encryption: enable-raft-envelope is gated until Stage 6E-2 ships wrap-on-propose / unwrap-on-apply / §7.1 proposal-quiescence-barrier; accepting the cutover now would brick the cluster on the next upgrade")
 	}
+	if s.cutoverBarrier == nil {
+		// Production wiring (6E-2e: main.go) injects the barrier
+		// controller. Without it the handler cannot drive the §7.1
+		// 6-step sequence — refuse before any side effect rather
+		// than silently skip the barrier and let a fresh USER
+		// proposal land at index > proposedIdx mid-cutover.
+		return nil, grpcStatusError(codes.FailedPrecondition,
+			"encryption: cutover barrier controller is not wired — wire WithEncryptionAdminCutoverBarrier before flipping raftEnvelopeWrapEnabled")
+	}
 	fanoutResult, err := s.runCutoverFanout(ctx)
 	if err != nil {
 		return nil, err
 	}
-	proposedIdx, err := s.proposeRaftCutoverEntry(ctx, preSidecar, req)
+	// §7.1 6-step quiescence barrier. Steps 1 + 6 are bracketed
+	// here as the most direct deferred-cleanup shape; steps 2-5
+	// run between. The barrier is held for the smallest possible
+	// window — only the propose + wait-apply + install-wrap path —
+	// so user writes are blocked just for the few-ms cutover entry
+	// commit RTT. Fanout runs BEFORE the barrier so a refused
+	// capability check fails fast without blocking user writes.
+	proposedIdx, err := s.runRaftEnvelopeCutoverBarrier(ctx, preSidecar, req)
 	if err != nil {
 		return nil, err
 	}
 	return s.raftCutoverPostcheck(proposedIdx, fanoutResult)
 }
+
+// runRaftEnvelopeCutoverBarrier executes the §7.1 step-1..6
+// quiescence-barrier sequence around the cutover proposal:
+//
+//	step 1: Begin() opens the barrier; defer End() pairs step 6.
+//	step 2: WaitDrained blocks until in-flight USER proposals drain.
+//	step 3: ProposeAdmin (proposeRaftCutoverEntry) — barrier-exempt
+//	        by interface contract so this call doesn't deadlock on
+//	        its own barrier.
+//	step 4: awaitCutoverApply polls the local FSM applied index
+//	        until it reaches the cutover entry's commit index, by
+//	        which point the apply path has set
+//	        sidecar.RaftEnvelopeCutoverIndex.
+//	step 5: InstallWrap publishes the wrap closure on every
+//	        participating ShardGroup (the dynamic-wrap-pointer
+//	        hot-swap installed in 6E-2c).
+//	step 6: End() (via the deferred call) closes the barrier so
+//	        fresh USER proposals carry the active wrap closure.
+//
+// Returns the cutover entry's commit_index on success. Errors
+// during steps 3-4 still trigger step 6 via defer so the handler
+// never leaves the barrier open after returning.
+func (s *EncryptionAdminServer) runRaftEnvelopeCutoverBarrier(ctx context.Context, preSidecar *encryption.Sidecar, req *pb.EnableRaftEnvelopeRequest) (uint64, error) {
+	s.cutoverBarrier.Begin()
+	defer s.cutoverBarrier.End()
+
+	if err := s.cutoverBarrier.WaitDrained(ctx); err != nil {
+		return 0, grpcStatusErrorf(codes.Unavailable,
+			"encryption: §7.1 step-2 drain wait: %v", err)
+	}
+
+	proposedIdx, err := s.proposeRaftCutoverEntry(ctx, preSidecar, req)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := s.awaitCutoverApply(ctx, proposedIdx); err != nil {
+		return 0, err
+	}
+
+	s.cutoverBarrier.InstallWrap()
+	return proposedIdx, nil
+}
+
+// awaitCutoverApply blocks until the local FSM applied index
+// reaches proposedIdx — by that point the cutover entry's apply
+// has run, which writes sidecar.RaftEnvelopeCutoverIndex. Polls on
+// latestAppliedIndex every cutoverApplyPollInterval; the expected
+// duration in a healthy cluster is single-digit milliseconds.
+//
+// Without a wired latestAppliedIndex callback the handler refuses
+// with FailedPrecondition: skipping the wait would let
+// InstallWrap (step 5) run before the cutover entry is applied,
+// potentially wrapping the cutover entry itself if a Propose racing
+// the install observed the freshly-set wrap pointer. The
+// §6.3 strict-`>` dispatch guards the cutover entry on apply, but
+// the propose-side window deserves the explicit gate.
+func (s *EncryptionAdminServer) awaitCutoverApply(ctx context.Context, proposedIdx uint64) error {
+	if s.latestAppliedIndex == nil {
+		return grpcStatusError(codes.FailedPrecondition,
+			"encryption: latest-applied-index callback is not wired — wire WithEncryptionAdminLatestAppliedIndex before flipping raftEnvelopeWrapEnabled")
+	}
+	if s.latestAppliedIndex() >= proposedIdx {
+		return nil
+	}
+	ticker := time.NewTicker(cutoverApplyPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return grpcStatusErrorf(codes.DeadlineExceeded,
+				"encryption: §7.1 step-4 await apply of index %d: %v", proposedIdx, ctx.Err())
+		case <-ticker.C:
+			if s.latestAppliedIndex() >= proposedIdx {
+				return nil
+			}
+		}
+	}
+}
+
+// cutoverApplyPollInterval bounds the poll cadence inside the §7.1
+// step-4 wait. A short interval keeps the cutover window tight in
+// healthy clusters (single Raft RTT). The handler's caller-supplied
+// ctx governs the upper bound — typical gRPC deadlines run in the
+// seconds, so this poll never fires more than a few hundred times
+// before either succeeding or hitting the deadline.
+const cutoverApplyPollInterval = 500 * time.Microsecond
 
 // raftCutoverPrecheck runs the Stage 6E §3.2 steps 1-5: input
 // validation, leader gate, bootstrap gate, idempotent-retry
