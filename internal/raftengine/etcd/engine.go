@@ -555,7 +555,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
 		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
 		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
-		applied:          maxAppliedIndex(prepared.disk.LocalSnap),
+		applied:          coldStartApplied(prepared.disk),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
@@ -570,7 +570,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
-	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.appliedIndex.Store(coldStartApplied(prepared.disk))
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -2181,7 +2181,17 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 // lock-free atomic mirror in a single place. Called exclusively from
 // the Raft run loop, so no synchronization between the two writes is
 // required beyond the single-writer invariant.
+//
+// Advance-only: cold-start with EffectiveApplied > snapshot.Index
+// seeds e.applied with `have`, after which raft still delivers conf-
+// change entries from snapshot.Index+1..have whose applyConfChange*
+// path calls setApplied(entry.Index) with index < have. Allowing the
+// counter to walk backwards would break the e.appliedIndex.Load()
+// contract every other watcher depends on. Codex P1 #934.
 func (e *Engine) setApplied(index uint64) {
+	if index <= e.applied {
+		return
+	}
 	e.applied = index
 	e.appliedIndex.Store(index)
 }
@@ -2214,6 +2224,18 @@ func (e *Engine) setApplied(index uint64) {
 // (today's *fsmApplyResponse, returned by kv batch apply) do NOT
 // implement HaltApply and continue to advance setApplied.
 func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
+	// Cold-start idempotency: when the skip gate fires with the FSM
+	// past snapshot.Metadata.Index (have > tok.Index), e.applied is
+	// seeded with `have`. Raft still delivers entries
+	// snapshot.Metadata.Index+1..commit including the [snap.Index+1,
+	// have] tail, which the FSM has already applied. Re-calling
+	// applyNormalEntry would re-execute the KV-side transaction (OCC
+	// conflicts; HLC ceiling inversion). Drop the duplicate without
+	// touching the FSM. setApplied is NOT called - e.applied is
+	// already >= entry.Index. Codex P1 #934.
+	if entry.Index <= e.applied {
+		return nil
+	}
 	response, err := e.applyNormalEntry(entry)
 	if err != nil {
 		return err

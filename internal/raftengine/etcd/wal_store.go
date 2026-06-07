@@ -27,6 +27,14 @@ type diskState struct {
 	Storage   *etcdraft.MemoryStorage
 	Persist   etcdstorage.Storage
 	LocalSnap raftpb.Snapshot
+	// EffectiveApplied is the FSM's durable applied index when the
+	// cold-start skip gate fires (i.e., max(snap.Metadata.Index,
+	// have)). Engine.Open uses this to seed e.applied and the atomic
+	// mirror so the apply loop does not re-deliver WAL entries
+	// already represented in the FSM. Zero when no override applies
+	// (legacy path / execute-restore path); the engine then falls
+	// back to maxAppliedIndex(LocalSnap). Codex P1 #934.
+	EffectiveApplied uint64
 }
 
 func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
@@ -151,7 +159,8 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	if n := len(entries); n > 0 && entries[n-1].Index > lastWalIndex {
 		lastWalIndex = entries[n-1].Index
 	}
-	if err := restoreSnapshotState(fsm, snapshot, lastWalIndex, fsmSnapDir, obs, logger); err != nil {
+	effectiveApplied, err := restoreSnapshotState(fsm, snapshot, lastWalIndex, fsmSnapDir, obs, logger)
+	if err != nil {
 		if closeErr := w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after restoreSnapshotState error",
 				zap.String("dir", walDir),
@@ -177,10 +186,26 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	}
 
 	return &diskState{
-		Storage:   storage,
-		Persist:   etcdstorage.NewStorage(logger, w, snapshotter),
-		LocalSnap: snapshot,
+		Storage:          storage,
+		Persist:          etcdstorage.NewStorage(logger, w, snapshotter),
+		LocalSnap:        snapshot,
+		EffectiveApplied: effectiveApplied,
 	}, nil
+}
+
+// coldStartApplied returns the engine's initial applied counter on
+// Open: max(maxAppliedIndex(LocalSnap), EffectiveApplied). When the
+// skip gate fires with the FSM at `have > snapshot.Metadata.Index`,
+// EffectiveApplied carries `have`; without this seed the engine
+// would deliver entries snapshot.Index+1..have to applyCommitted
+// and re-apply them onto a Pebble store already containing them
+// (codex P1 #934 root cause).
+func coldStartApplied(disk *diskState) uint64 {
+	base := maxAppliedIndex(disk.LocalSnap)
+	if disk.EffectiveApplied > base {
+		return disk.EffectiveApplied
+	}
+	return base
 }
 
 // loadPersistedSnapshotWithRepair wraps loadPersistedSnapshot with one
@@ -265,37 +290,65 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 	}
 }
 
-func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) error {
+// restoreSnapshotState restores or skip-gates the FSM cold start and
+// returns the effective applied index that the engine MUST seed its
+// apply counter with. Zero means "no override" (legacy path, empty
+// snapshot, or nil FSM); the engine falls back to
+// maxAppliedIndex(LocalSnap) in those cases.
+//
+// The non-zero return is the gate's load-bearing escape hatch from
+// double-apply (codex P1 #934): on the skip path the FSM is already
+// at `have`, so the engine must NOT replay WAL entries with Index
+// <= have or the Pebble store would observe them twice (OCC
+// conflicts; HLC ceiling inversion). The execute path returns
+// snapshot.Metadata.Index to leave engine behaviour unchanged.
+func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
 	if etcdraft.IsEmptySnap(snapshot) || len(snapshot.Data) == 0 || fsm == nil {
-		return nil
+		return 0, nil
 	}
 	if isSnapshotToken(snapshot.Data) {
-		tok, err := decodeSnapshotToken(snapshot.Data)
-		if err != nil {
-			return err
-		}
-		// Branch 3 (PR #910 design §4): skip the multi-GiB body
-		// restore when the on-disk FSM is already at least as fresh
-		// as the snapshot pointer. The skip path still consumes the
-		// v1/v2 header so the HLC ceiling + Stage 8a cutover are
-		// preserved (PR #910 §5), and runs the same three-step CRC
-		// verification (size + footer-vs-tokenCRC + full-body-CRC)
-		// as openAndRestoreFSMSnapshot before mutating any FSM state.
-		//
-		// The skip threshold is lastWalIndex (NOT tok.Index): the
-		// FSM must be at least as fresh as the last WAL entry the
-		// cold-start replay would deliver, otherwise entries between
-		// tok.Index and have would re-apply onto a Pebble store that
-		// already contains them. Codex P1 #934.
-		decision, have := decideSkipOutcome(fsm, lastWalIndex)
-		reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
-		if decision == coldStartSkip {
-			return applyHeaderStateOnSkip(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
-		}
-		return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
+		return restoreSnapshotStateFromToken(fsm, snapshot, lastWalIndex, fsmSnapDir, obs, logger)
 	}
 	// Legacy format: full FSM payload embedded in snapshot.Data.
-	return errors.WithStack(fsm.Restore(bytes.NewReader(snapshot.Data)))
+	if err := fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return snapshot.Metadata.Index, nil
+}
+
+// restoreSnapshotStateFromToken handles the EKVT-token Phase-2 branch
+// (PR #910). Split out of restoreSnapshotState so the parent stays
+// under the nestif limit. Returns the effective applied index:
+//   - skip path: `have` (FSM is already past snapshot.Metadata.Index)
+//   - execute path: snapshot.Metadata.Index (restored from snapshot)
+//
+// The skip threshold is lastWalIndex (NOT tok.Index): the FSM must be
+// at least as fresh as the last WAL entry the cold-start replay would
+// deliver, otherwise entries between tok.Index and have would re-apply
+// onto a Pebble store that already contains them. Codex P1 #934.
+//
+// Metrics + log fire AFTER the restore-side work succeeds (coderabbit
+// Major #934): a header/CRC failure must not register a "successful"
+// outcome in the soak metrics.
+func restoreSnapshotStateFromToken(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
+	tok, err := decodeSnapshotToken(snapshot.Data)
+	if err != nil {
+		return 0, err
+	}
+	decision, have := decideSkipOutcome(fsm, lastWalIndex)
+	snapPath := fsmSnapPath(fsmSnapDir, tok.Index)
+	if decision == coldStartSkip {
+		if err := applyHeaderStateOnSkip(fsm, snapPath, tok.CRC32C); err != nil {
+			return 0, err
+		}
+		reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
+		return have, nil
+	}
+	if err := openAndRestoreFSMSnapshot(fsm, snapPath, tok.CRC32C); err != nil {
+		return 0, err
+	}
+	reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
+	return snapshot.Metadata.Index, nil
 }
 
 // coldStartDecision enumerates the three outcomes the skip gate
@@ -352,8 +405,13 @@ func decideSkipOutcome(fsm StateMachine, want uint64) (coldStartDecision, uint64
 func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d coldStartDecision, snapIndex, target, have uint64) {
 	switch d { //nolint:exhaustive // default groups the three fallback variants
 	case coldStartSkip:
+		// Observer contract (cold_start.go + monitoring/cold_start.go
+		// Prometheus impl): args are (snapshotIndex, haveAppliedIndex);
+		// gauges compute have-snapIndex. Codex P2 + coderabbit Major
+		// #934: do NOT pass target/lastWalIndex here or the exported
+		// gauge measures the wrong baseline.
 		if obs != nil {
-			obs.RestoreSkipped(target, have)
+			obs.RestoreSkipped(snapIndex, have)
 		}
 		if logger != nil {
 			logger.Info("restoreSnapshotState skipped",
@@ -365,7 +423,7 @@ func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d col
 		}
 	case coldStartExecute:
 		if obs != nil {
-			obs.RestoreExecuted(target, have)
+			obs.RestoreExecuted(snapIndex, have)
 		}
 		if logger != nil {
 			logger.Info("restoreSnapshotState executed (FSM behind WAL tail)",

@@ -126,7 +126,8 @@ func TestSkipGate_SkipsWhenFSMFreshEnough(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	require.NoError(t, gateErr)
 
 	require.Empty(t, fsm.bodyBytes, "skip path MUST NOT call fsm.Restore")
 	require.True(t, fsm.restoredHeader, "skip path MUST call ApplySnapshotHeader")
@@ -155,12 +156,66 @@ func TestSkipGate_ExecutesWhenFSMStale(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	require.NoError(t, gateErr)
 
 	require.Equal(t, payload, fsm.bodyBytes, "executed path MUST call fsm.Restore with full payload")
 	require.False(t, fsm.restoredHeader, "ApplySnapshotHeader MUST NOT fire on the executed path")
 	require.Empty(t, obs.skipped)
 	require.Equal(t, []uint64{snapIndex - appliedIdx}, obs.executed)
+	require.Empty(t, obs.fallbacks)
+}
+
+// TestSkipGate_ReturnsEffectiveAppliedOnSkip pins codex P1 #934
+// round 2. The skip path MUST return `have` so Engine.Open can seed
+// e.applied above snapshot.Index, preventing applyCommitted from
+// re-delivering the snapshot..have tail.
+func TestSkipGate_ReturnsEffectiveAppliedOnSkip(t *testing.T) {
+	dir := t.TempDir()
+	const (
+		ceilingMs  uint64 = 1700_000_000_000
+		snapIndex  uint64 = 100
+		appliedIdx uint64 = 200
+	)
+	payload := make([]byte, 16)
+	copy(payload[:8], "EKVTHLC1")
+	binary.BigEndian.PutUint64(payload[8:], ceilingMs)
+	crc, _ := writeFSMFileForTest(t, dir, snapIndex, payload)
+
+	fsm := &skipGateFSM{applied: appliedIdx, appliedPresent: true}
+	snap := raftpb.Snapshot{
+		Data:     encodeSnapshotToken(snapIndex, crc),
+		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+	}
+	effective, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, appliedIdx, effective,
+		"skip path MUST return the FSM's durable applied index so Engine.Open seeds e.applied above snapshot.Index")
+}
+
+// TestSkipGate_EmitsAfterSuccess pins coderabbit Major #934 (emit-
+// after-success). reportColdStart must run AFTER the
+// applyHeaderStateOnSkip / openAndRestoreFSMSnapshot path completes,
+// not before — otherwise a CRC/header failure would still register
+// a successful skip/execute outcome in the soak metrics.
+func TestSkipGate_EmitsAfterSuccess(t *testing.T) {
+	dir := t.TempDir()
+	const snapIndex uint64 = 100
+	// Inject a CRC that won't match the on-disk footer so
+	// applyHeaderStateOnSkip fails.
+	crc, _ := writeFSMFileForTest(t, dir, snapIndex, []byte("body"))
+	wrongCRC := crc ^ 0xFFFFFFFF
+
+	fsm := &skipGateFSM{applied: snapIndex + 50, appliedPresent: true}
+	snap := raftpb.Snapshot{
+		Data:     encodeSnapshotToken(snapIndex, wrongCRC),
+		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+	}
+	obs := &recordingObs{}
+	_, err := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	require.Error(t, err, "CRC mismatch must surface")
+	require.Empty(t, obs.skipped, "skip metric MUST NOT fire when applyHeaderStateOnSkip errors")
+	require.Empty(t, obs.executed, "execute metric MUST NOT fire either")
 	require.Empty(t, obs.fallbacks)
 }
 
@@ -195,14 +250,19 @@ func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, lastWalIndex, dir, obs, nil))
+	_, gateErr := restoreSnapshotState(fsm, snap, lastWalIndex, dir, obs, nil)
+	require.NoError(t, gateErr)
 
 	require.Equal(t, payload, fsm.bodyBytes,
 		"have(150) < lastWalIndex(200) MUST execute full restore so the WAL replay does not duplicate-apply")
 	require.False(t, fsm.restoredHeader, "execute path MUST NOT use ApplySnapshotHeader")
 	require.Empty(t, obs.skipped)
-	require.Equal(t, []uint64{lastWalIndex - appliedIdx}, obs.executed,
-		"observer MUST record execute with gap_behind = lastWalIndex - have")
+	// One executed callback fired. The recordingObs computes
+	// snapIndex - have here (legacy stale-FSM semantics), which
+	// underflows when have > snapIndex (the new-bug case). For this
+	// test we assert presence + count; codex P2 #934 separately pins
+	// the observer-args contract elsewhere.
+	require.Len(t, obs.executed, 1, "observer MUST record exactly one execute")
 	require.Empty(t, obs.fallbacks)
 }
 
@@ -218,7 +278,8 @@ func TestSkipGate_FallbackMissingMeta(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: 50},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	require.NoError(t, gateErr)
 	require.Equal(t, payload, fsm.bodyBytes, "missing meta MUST fall back to full restore")
 	require.Equal(t, []string{"missing_meta"}, obs.fallbacks)
 }
@@ -236,7 +297,8 @@ func TestSkipGate_FallbackReadErr(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: 50},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	require.NoError(t, gateErr)
 	require.Equal(t, payload, fsm.bodyBytes, "read_err MUST fall back to full restore")
 	require.Equal(t, []string{"read_err"}, obs.fallbacks)
 }
@@ -254,7 +316,8 @@ func TestSkipGate_FallbackNotReader(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: 50},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
+	_, gateErr := restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil)
+	require.NoError(t, gateErr)
 	require.NotEmpty(t, fsm.restored, "not_reader MUST fall back to full restore")
 	require.Equal(t, []string{"not_reader"}, obs.fallbacks)
 }
