@@ -91,7 +91,18 @@ func (o *recordingObs) RestoreSkipped(snapIndex, have uint64) {
 func (o *recordingObs) RestoreExecuted(snapIndex, have uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.executed = append(o.executed, snapIndex-have)
+	// Mirror the production monitoring.ColdStartObserver semantics:
+	// the executed gauge stores |snapIndex - have| because the gate
+	// shifted to comparing against the committed-tail (codex P2 #934
+	// round 3) and the FSM-ahead-of-snapshot case must not underflow
+	// into ~2^64. Claude #934 round 5 caught the test double drift.
+	var gap uint64
+	if have >= snapIndex {
+		gap = have - snapIndex
+	} else {
+		gap = snapIndex - have
+	}
+	o.executed = append(o.executed, gap)
 }
 
 func (o *recordingObs) RestoreFallback(_ uint64, reason string) {
@@ -287,12 +298,12 @@ func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
 		"have(150) < lastWalIndex(200) MUST execute full restore so the WAL replay does not duplicate-apply")
 	require.False(t, fsm.restoredHeader, "execute path MUST NOT use ApplySnapshotHeader")
 	require.Empty(t, obs.skipped)
-	// One executed callback fired. The recordingObs computes
-	// snapIndex - have here (legacy stale-FSM semantics), which
-	// underflows when have > snapIndex (the new-bug case). For this
-	// test we assert presence + count; codex P2 #934 separately pins
-	// the observer-args contract elsewhere.
-	require.Len(t, obs.executed, 1, "observer MUST record exactly one execute")
+	// recordingObs now stores |snapIndex - have| (round-5 fix; mirrors
+	// monitoring.ColdStartObserver semantics so the FSM-ahead-of-
+	// snapshot case doesn't underflow). For have(150) > snapIndex(100)
+	// the absolute gap is 50.
+	require.Equal(t, []uint64{appliedIdx - snapIndex}, obs.executed,
+		"observer MUST record the absolute snapshot-relative gap")
 	require.Empty(t, obs.fallbacks)
 }
 

@@ -190,6 +190,36 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	}, nil
 }
 
+// reportColdStartExecute emits the executed-arm of the cold-start
+// outcome (callback + structured log). Split out of reportColdStart
+// so the parent stays under the cyclop limit; the absolute-value
+// gap calculation pushes the inline arm over the threshold.
+func reportColdStartExecute(obs raftengine.ColdStartObserver, logger *zap.Logger, snapIndex, target, have uint64) {
+	if obs != nil {
+		obs.RestoreExecuted(snapIndex, have)
+	}
+	if logger == nil {
+		return
+	}
+	// gap_to_snapshot uses absolute value because the gate now
+	// permits have > snapIndex (FSM ahead of snapshot but behind
+	// committed tail). gap_behind_committed is target-have; can be
+	// 0 when have==target.
+	var gapToSnapshot uint64
+	if have >= snapIndex {
+		gapToSnapshot = have - snapIndex
+	} else {
+		gapToSnapshot = snapIndex - have
+	}
+	logger.Info("restoreSnapshotState executed (FSM behind WAL committed tail)",
+		zap.Uint64("fsm_applied", have),
+		zap.Uint64("snapshot_index", snapIndex),
+		zap.Uint64("last_committed_index", target),
+		zap.Uint64("gap_to_snapshot", gapToSnapshot),
+		zap.Uint64("gap_behind_committed", target-have),
+	)
+}
+
 // coldStartSkipThreshold returns the maximum log index the cold-
 // start replay can deliver via Ready.CommittedEntries on this
 // node: max(snapshot.Metadata.Index, hardState.Commit). The skip
@@ -437,25 +467,23 @@ func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d col
 			obs.RestoreSkipped(snapIndex, have)
 		}
 		if logger != nil {
+			// Two named gap fields so an operator correlating the
+			// log against the Prometheus gauge sees consistent
+			// magnitudes (claude #934 round 5):
+			// - gap_ahead_snapshot mirrors monitoring.ColdStartObserver
+			//   (have - snapIndex), the metric baseline.
+			// - gap_ahead_committed measures how far past the WAL
+			//   committed tail (target) the FSM is.
 			logger.Info("restoreSnapshotState skipped",
 				zap.Uint64("fsm_applied", have),
 				zap.Uint64("snapshot_index", snapIndex),
-				zap.Uint64("last_wal_index", target),
-				zap.Uint64("gap_ahead", have-target),
+				zap.Uint64("last_committed_index", target),
+				zap.Uint64("gap_ahead_snapshot", have-snapIndex),
+				zap.Uint64("gap_ahead_committed", have-target),
 			)
 		}
 	case coldStartExecute:
-		if obs != nil {
-			obs.RestoreExecuted(snapIndex, have)
-		}
-		if logger != nil {
-			logger.Info("restoreSnapshotState executed (FSM behind WAL tail)",
-				zap.Uint64("fsm_applied", have),
-				zap.Uint64("snapshot_index", snapIndex),
-				zap.Uint64("last_wal_index", target),
-				zap.Uint64("gap_behind", target-have),
-			)
-		}
+		reportColdStartExecute(obs, logger, snapIndex, target, have)
 	default:
 		// Fallback variants: the strictly-additive policy. We could
 		// not even attempt the skip; the full restore runs.
