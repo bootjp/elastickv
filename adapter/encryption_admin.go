@@ -1252,23 +1252,29 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 //
 // Returns the cutover entry's commit_index on success.
 //
-// Critical post-propose invariant (codex P1 round-1): once
-// proposeRaftCutoverEntry returns success, the cutover entry is
-// committed in Raft and will apply on every replica. If the
-// remainder of the sequence fails (apply-wait ctx cancel,
-// InstallWrap not reached), the handler MUST NOT release the
-// barrier — doing so lets fresh USER proposals on this leader land
-// cleartext at indexes > cutover_index, which the §6.3 strict-`>`
-// apply hook then halts on cluster-wide. The releaseSafe flag
-// gates the End() call so:
+// Critical barrier-safety invariant (codex P1 rounds 1+4): once a
+// cutover marker MAY have entered Raft, the handler MUST NOT
+// release the barrier without first installing the wrap closure.
+// Doing so lets fresh USER proposals on this leader land cleartext
+// at indexes > cutover_index, which the §6.3 strict-`>` apply hook
+// then halts on cluster-wide. The releaseSafe flag gates the End()
+// call so:
 //
 //   - Pre-propose failures (drain timeout) release safely; no
 //     cutover entry exists in Raft to brick the cluster.
-//   - Post-propose failures (apply-wait timeout, InstallWrap not
-//     reached) leave the barrier OPEN; operator intervention (this
-//     leader's restart, or a retry that hits the idempotent
-//     pre-check path on a new leader after apply caught up) is
-//     required.
+//   - Propose errors (codex P1 round-4): the etcd engine cannot
+//     distinguish a ctx-cancel that fired before rawNode.Propose
+//     from one that fired after — both surface as a ProposeAdmin
+//     error, but only the latter leaves the marker submitted to
+//     Raft. Treat ALL propose errors as ambiguous and leave the
+//     barrier OPEN. releaseSafe is flipped to false BEFORE the
+//     propose call so the deferred End() does not race the ctx
+//     window.
+//   - Post-propose failures (apply-wait timeout, stale-DEK no-op
+//     branch, post-apply sidecar I/O fault) leave the barrier
+//     OPEN; operator intervention (this leader's restart, or a
+//     retry that hits the idempotent pre-check path on a new
+//     leader after apply caught up) is required.
 //   - Full success releases the barrier explicitly via End().
 //
 // This is a deliberate per-leader safety trade-off: a leader whose
