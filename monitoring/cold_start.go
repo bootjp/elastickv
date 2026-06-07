@@ -70,14 +70,28 @@ func (o *ColdStartObserver) RestoreSkipped(snapIndex, have uint64) {
 	o.metrics.appliedIndexGap.WithLabelValues("skipped").Set(float64(have - snapIndex))
 }
 
-// RestoreExecuted records a full restore that ran because the FSM
-// was stale. gap = snapIndex - have (positive: how far behind).
+// RestoreExecuted records a full restore that ran. gap is the
+// absolute distance |snapIndex - have| in entry indices.
+//
+// The skip-gate threshold is no longer snap.Metadata.Index — it
+// shifted to the WAL committed-tail (codex P1 #934). An executed
+// restore therefore no longer implies have < snapIndex: a crashed
+// follower can have the FSM ahead of the snapshot pointer but
+// behind the WAL committed tail. Using snapIndex - have directly
+// would underflow into ~2^64 in that case and corrupt the gauge.
+// Codex P2 #934 round 3.
 func (o *ColdStartObserver) RestoreExecuted(snapIndex, have uint64) {
 	if o == nil || o.metrics == nil {
 		return
 	}
+	var gap uint64
+	if have >= snapIndex {
+		gap = have - snapIndex
+	} else {
+		gap = snapIndex - have
+	}
 	o.metrics.restoreTotal.WithLabelValues("executed", "").Inc()
-	o.metrics.appliedIndexGap.WithLabelValues("executed").Set(float64(snapIndex - have))
+	o.metrics.appliedIndexGap.WithLabelValues("executed").Set(float64(gap))
 }
 
 // RestoreFallback records the strictly-additive fallback path.

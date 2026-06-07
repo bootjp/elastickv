@@ -219,6 +219,36 @@ func TestSkipGate_EmitsAfterSuccess(t *testing.T) {
 	require.Empty(t, obs.fallbacks)
 }
 
+// TestColdStartSkipThreshold pins codex P2 #934 round 3. The
+// threshold caps at hardState.Commit so a follower carrying an
+// uncommitted WAL suffix is NOT forced to run the full restore
+// every restart (the original gate used the WAL tail, which can
+// exceed Commit, and raft would not deliver those entries until
+// the leader confirmed them).
+func TestColdStartSkipThreshold(t *testing.T) {
+	t.Parallel()
+	mkSnap := func(idx uint64) raftpb.Snapshot {
+		return raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: idx}}
+	}
+	cases := []struct {
+		name     string
+		snap     raftpb.Snapshot
+		hs       raftpb.HardState
+		expected uint64
+	}{
+		{"hardState.Commit equals snapshot (fresh follower)", mkSnap(100), raftpb.HardState{Commit: 100}, 100},
+		{"hardState.Commit below snapshot (pre-replay)", mkSnap(100), raftpb.HardState{Commit: 50}, 100},
+		{"hardState.Commit above snapshot (post-replay)", mkSnap(100), raftpb.HardState{Commit: 150}, 150},
+		{"hardState.Commit zero", mkSnap(100), raftpb.HardState{Commit: 0}, 100},
+	}
+	for _, c := range cases {
+		got := coldStartSkipThreshold(c.snap, c.hs)
+		if got != c.expected {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.expected)
+		}
+	}
+}
+
 // TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries pins
 // codex P1 #934. When the FSM is past tok.Index but the WAL still
 // carries entries tok.Index+1 .. have (the normal interval between

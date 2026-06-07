@@ -155,11 +155,8 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	if err != nil {
 		return nil, err
 	}
-	lastWalIndex := snapshot.Metadata.Index
-	if n := len(entries); n > 0 && entries[n-1].Index > lastWalIndex {
-		lastWalIndex = entries[n-1].Index
-	}
-	effectiveApplied, err := restoreSnapshotState(fsm, snapshot, lastWalIndex, fsmSnapDir, obs, logger)
+	lastCommittedIndex := coldStartSkipThreshold(snapshot, hardState)
+	effectiveApplied, err := restoreSnapshotState(fsm, snapshot, lastCommittedIndex, fsmSnapDir, obs, logger)
 	if err != nil {
 		if closeErr := w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after restoreSnapshotState error",
@@ -191,6 +188,32 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		LocalSnap:        snapshot,
 		EffectiveApplied: effectiveApplied,
 	}, nil
+}
+
+// coldStartSkipThreshold returns the maximum log index the cold-
+// start replay can deliver via Ready.CommittedEntries on this
+// node: max(snapshot.Metadata.Index, hardState.Commit). The skip
+// gate compares the FSM's durable applied index against this
+// value; skip is only safe when the FSM is at least this fresh.
+//
+// Followers can carry an UNCOMMITTED WAL suffix
+// (entries[n-1].Index > hardState.Commit). Raft does NOT surface
+// those entries in CommittedEntries until the leader confirms
+// them. The previous gate used the WAL tail (entries[n-1].Index)
+// which forced a multi-GiB restore on every restart of any
+// follower with an uncommitted suffix, defeating the cold-start
+// optimization. Codex P2 #934 round 3.
+//
+// The lower bound stays at the snapshot pointer because an empty
+// WAL still requires the FSM to be at least at the snapshot
+// index. Raft's invariant guarantees hardState.Commit >= 0; we do
+// not need to bound from below explicitly beyond snap.Index.
+func coldStartSkipThreshold(snapshot raftpb.Snapshot, hardState raftpb.HardState) uint64 {
+	threshold := snapshot.Metadata.Index
+	if hardState.Commit > threshold {
+		threshold = hardState.Commit
+	}
+	return threshold
 }
 
 // coldStartApplied returns the engine's initial applied counter on
