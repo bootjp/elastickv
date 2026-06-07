@@ -2389,25 +2389,42 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (a
 		}
 		payload = plain
 	}
-	// Cold-start duplicate guard: only volatile-only payloads (HLC
-	// lease, tag 0x02) survive past this point on the duplicate path.
-	// Data-mutating entries return (nil, nil) so the caller skips
-	// setApplied + resolveProposal and the FSM is never touched —
-	// preserving the pre-PR semantics for KV/MVCC duplicates while
-	// fixing the post-snapshot lease replay loss. The check happens
-	// AFTER decryption because post-cutover the cleartext payload's
-	// leading byte is the only reliable carrier of the entry-kind
-	// tag. Codex P1 #934 round 7.
-	if dropIfNonVolatile {
-		classifier, ok := e.fsm.(raftengine.VolatileEntryClassifier)
-		if !ok || !classifier.IsVolatileOnlyPayload(payload) {
-			return nil, nil
+	if dropIfNonVolatile && !e.isVolatilePayload(payload) {
+		return nil, nil
+	}
+	// SetApplyIndex is suppressed on the duplicate-replay path
+	// because pendingApplyIdx is documented as "the entry index the
+	// engine is about to apply". On a volatile replay entry.Index is
+	// BELOW e.applied; writing it would feed a stale index to any
+	// future durability sink (encryption sidecar.RaftAppliedIndex,
+	// ApplyMutationsRaftAt's metaAppliedIndex bundle). Today's only
+	// volatile entry (HLC lease) does not read pendingApplyIdx so
+	// this is a no-op, but it future-proofs the seam against a new
+	// volatile entry type that also persists. Claude #934 round 7
+	// finding R7-F1.
+	if !dropIfNonVolatile {
+		if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
+			aware.SetApplyIndex(entry.Index)
 		}
 	}
-	if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
-		aware.SetApplyIndex(entry.Index)
-	}
 	return e.fsm.Apply(payload), nil
+}
+
+// isVolatilePayload is the cold-start duplicate guard's cleartext
+// classifier. Only volatile-only payloads (HLC lease, tag 0x02) may
+// be re-applied past e.applied; data-mutating entries return false so
+// the caller drops them. The check runs AFTER raft envelope
+// decryption because post-cutover the cleartext payload's leading
+// byte is the only reliable carrier of the entry-kind tag. FSMs that
+// do not implement VolatileEntryClassifier default to false
+// (drop-all), preserving the pre-PR semantics for engines that
+// haven't opted in. Codex P1 #934 round 7.
+func (e *Engine) isVolatilePayload(payload []byte) bool {
+	classifier, ok := e.fsm.(raftengine.VolatileEntryClassifier)
+	if !ok {
+		return false
+	}
+	return classifier.IsVolatileOnlyPayload(payload)
 }
 
 func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) {

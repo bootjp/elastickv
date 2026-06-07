@@ -1,6 +1,7 @@
 package etcd
 
 import (
+	"bytes"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -122,6 +123,43 @@ func TestApplyNormalCommitted_FreshEntryAlwaysAppliesAndAdvances(t *testing.T) {
 				t.Fatalf("e.applied = %d, want 150 (fresh entry must advance)", e.applied)
 			}
 		})
+	}
+}
+
+// TestApplyNormalCommitted_VolatileDuplicate_PostCutoverEncrypted pins
+// the post-Stage-8a cutover path: encrypted HLC lease entries past
+// e.applied MUST be decrypted FIRST, then classified as volatile, then
+// replayed for their in-memory effect. The wire-format reality is
+// that a post-cutover HLC lease's `payload[0]` is encrypted bytes;
+// only the cleartext (after WrapRaftPayload unwrap) carries the 0x02
+// tag, so the classifier must see the cleartext or the lease drops.
+// Claude #934 round 7 finding R7-F2 — pre-cutover-only coverage was
+// insufficient.
+func TestApplyNormalCommitted_VolatileDuplicate_PostCutoverEncrypted(t *testing.T) {
+	t.Parallel()
+	c, kid := raftCipherFixture(t)
+	const cutover uint64 = 100
+	fsm := &volatileTagFakeFSM{}
+	e := newTestEngine(fsm, c, func() uint64 { return cutover })
+	e.applied = 200
+
+	// HLC lease cleartext: tag 0x02 + 8-byte big-endian ceiling.
+	plain := []byte{0x02, 0, 0, 0, 0, 0, 0, 0, 0x01}
+	// Index above cutover → triggers WrapRaftPayload path inside
+	// applyNormalEntry; index below e.applied → duplicate arm.
+	entry := envelopeEntry(t, c, kid, 150, plain)
+
+	if err := e.applyNormalCommitted(entry); err != nil {
+		t.Fatalf("applyNormalCommitted: %v", err)
+	}
+	if got := fsm.calls.Load(); got != 1 {
+		t.Fatalf("encrypted volatile duplicate: fsm.Apply call count = %d, want 1 — decryption must run before classification or the lease drops", got)
+	}
+	if !bytes.Equal(fsm.lastPayload, plain) {
+		t.Fatalf("FSM received %x, want cleartext %x — classifier must see post-decrypt bytes", fsm.lastPayload, plain)
+	}
+	if e.applied != 200 {
+		t.Fatalf("e.applied advanced to %d, want pinned at 200 for duplicate-arm replay", e.applied)
 	}
 }
 
