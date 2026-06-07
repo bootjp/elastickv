@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2128,11 +2129,16 @@ func (b *recordingCutoverBarrier) End() {
 // circuit would otherwise eat the test before the barrier path
 // runs. Returns no value; t.Cleanup handles teardown so callers
 // don't need to defer.
+//
+// Safe to call from t.Parallel() tests: raftEnvelopeWrapEnabled is
+// an atomic.Bool, so concurrent reads from sibling parallel tests
+// (e.g. GatedUntil6E2) observe a coherent value rather than
+// tripping -race detection (claude finding 3 round-1).
 func withWrapEnabledForTest(t *testing.T) {
 	t.Helper()
-	prev := raftEnvelopeWrapEnabled
-	raftEnvelopeWrapEnabled = true
-	t.Cleanup(func() { raftEnvelopeWrapEnabled = prev })
+	prev := raftEnvelopeWrapEnabled.Load()
+	raftEnvelopeWrapEnabled.Store(true)
+	t.Cleanup(func() { raftEnvelopeWrapEnabled.Store(prev) })
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier
@@ -2308,6 +2314,126 @@ func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout(t *testing.T
 	}
 	if len(proposer.calls) != 0 {
 		t.Errorf("proposer.calls len=%d, want 0 (drain timeout MUST refuse before propose)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout
+// pins the codex P1 round-1 invariant: once
+// proposeRaftCutoverEntry has succeeded, the cutover entry is
+// committed in Raft and will apply on every replica. If the
+// remainder of the sequence fails (apply-wait ctx fires before
+// the local FSM catches up), the handler MUST NOT call End() —
+// releasing the barrier without InstallWrap lets fresh USER
+// proposals on this leader land cleartext at indexes >
+// cutover_index, which the §6.3 strict-`>` apply hook would then
+// halt on cluster-wide.
+//
+// The releaseSafe flag in runRaftEnvelopeCutoverBarrier gates the
+// deferred End() so this test catches a regression that reordered
+// the flag flip back inside the apply-wait error path.
+func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		// Note: applyFn is nil so the sidecar's
+		// RaftEnvelopeCutoverIndex stays 0, simulating local FSM
+		// apply lag (the entry is committed in Raft but not yet
+		// applied locally).
+	}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		// latestAppliedIndex never catches up to 4242 — simulates
+		// permanently-lagging local apply that exhausts the gRPC
+		// deadline.
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 0 }),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := srv.EnableRaftEnvelope(ctx, validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want apply-timeout error, got nil")
+	}
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("EnableRaftEnvelope status=%v, want DeadlineExceeded for apply-wait ctx fire", status.Code(err))
+	}
+	// Critical assertion: End was NOT called. The barrier stays
+	// open so user proposals on this leader continue to fail with
+	// ErrEnvelopeCutoverInProgress until operator intervention.
+	for _, op := range barrier.order {
+		if op == "End" {
+			t.Errorf("barrier.End() WAS called after propose-success + apply-timeout; order = %v; this opens the cluster-brick window codex P1 round-1 flagged", barrier.order)
+		}
+	}
+	// And the sequence reached propose + drain but not InstallWrap.
+	wantPrefix := []string{"Begin", "WaitDrained"}
+	if len(barrier.order) < len(wantPrefix) || !equalStrings(barrier.order[:len(wantPrefix)], wantPrefix) {
+		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
+	}
+	for _, op := range barrier.order {
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap MUST NOT run when apply-wait fails; order = %v", barrier.order)
+		}
+	}
+	if len(proposer.calls) != 1 {
+		t.Errorf("proposer.calls len=%d, want 1 (cutover entry MUST have been proposed before the apply-wait timeout)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex pins the
+// awaitCutoverApply ticker-poll branch (claude finding 2 round-1):
+// the happy-path test wires latestAppliedIndex to return the
+// proposed index immediately, which short-circuits the poll loop
+// before time.NewTicker fires. A regression that broke the ticker
+// branch (wrong duration, ticker.Stop missed, etc.) would only
+// surface under a lagging-apply scenario like this one.
+//
+// Strategy: have latestAppliedIndex return 0 for the first few
+// calls and proposedIdx after that, forcing the loop to poll
+// through the ticker at least once.
+func TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	barrier := &recordingCutoverBarrier{}
+	var pollCount atomic.Int32
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 {
+			if pollCount.Add(1) < 4 {
+				return 0
+			}
+			return 4242
+		}),
+	)
+	resp, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableRaftEnvelope: %v", err)
+	}
+	if resp == nil || resp.GetAppliedIndex() != 4242 {
+		t.Fatalf("response applied_index=%v, want 4242", resp)
+	}
+	if got := pollCount.Load(); got < 4 {
+		t.Errorf("pollCount = %d, want >= 4 (ticker poll branch should have fired at least 3 times)", got)
+	}
+	// Full success path: barrier closes after InstallWrap.
+	wantOrder := []string{"Begin", "WaitDrained", "InstallWrap", "End"}
+	if !equalStrings(barrier.order, wantOrder) {
+		t.Errorf("barrier.order = %v, want %v", barrier.order, wantOrder)
 	}
 }
 

@@ -282,9 +282,21 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 // BeginCutoverBarrier opens the §7.1 step-1 quiescence barrier.
 // After return, every fresh dynamicWrappedProposer.Propose call
 // fails with ErrEnvelopeCutoverInProgress until EndCutoverBarrier
-// runs. Idempotent against double-Begin: a second call freshens
-// drainSig but leaves barrierOpen true. ProposeAdmin is unaffected
-// (the cutover marker proposes through it).
+// runs. ProposeAdmin is unaffected (the cutover marker proposes
+// through it).
+//
+// Idempotent against double-Begin: a second call freshens drainSig
+// and leaves barrierOpen true. CALLER SAFETY: a goroutine that was
+// blocked on a prior cycle's drainSig from WaitInflightDrained is
+// orphaned by the freshen (it never observes the close because the
+// channel reference was discarded). This is safe in practice
+// because the EncryptionAdminServer serializes EnableRaftEnvelope
+// calls via cutoverSem, so only one handler goroutine ever drives
+// the BeginCutoverBarrier → WaitInflightDrained → EndCutoverBarrier
+// sequence at a time. A future caller that drives the barrier
+// outside that semaphore MUST not rely on Begin's idempotency to
+// rescue an orphaned WaitInflightDrained — explicit End/Begin
+// ordering on a single goroutine is the only correct usage.
 //
 // Returns the channel that closes when in-flight drains to 0 so
 // callers MAY block on it directly; the recommended pattern is to
