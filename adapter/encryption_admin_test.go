@@ -3,7 +3,9 @@ package adapter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -1126,10 +1128,15 @@ func applyCutover(sc *encryption.Sidecar, raftIdx uint64) {
 	}
 }
 
-// applyStaleDEKIDRace simulates the §2.1 #3 benign-no-op: the
-// applier consumed the entry without flipping
-// StorageEnvelopeActive (because a RotateDEK raced and advanced
-// Active.Storage). Only RaftAppliedIndex advances.
+// applyStaleDEKIDRace simulates the §2.1 #3 / §6E-1a constraint
+// #3 benign-no-op shape shared by the storage and raft variants:
+// the applier consumed the entry without flipping the variant's
+// "cutover active" sentinel (StorageEnvelopeActive for the storage
+// path; the non-zero RaftEnvelopeCutoverIndex for the raft path)
+// because a RotateDEK raced and advanced Active.Storage /
+// Active.Raft respectively. Only RaftAppliedIndex advances. Used
+// by both EnableStorageEnvelope and EnableRaftEnvelope tests to
+// pin the no-cutover branch (claude r3 minor nit on PR933).
 func applyStaleDEKIDRace(sc *encryption.Sidecar, raftIdx uint64) {
 	if raftIdx > sc.RaftAppliedIndex {
 		sc.RaftAppliedIndex = raftIdx
@@ -2465,6 +2472,126 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace(t *testin
 	if sc.RaftEnvelopeCutoverIndex != 0 {
 		t.Errorf("RaftEnvelopeCutoverIndex=%d after stale-DEK race, want 0", sc.RaftEnvelopeCutoverIndex)
 	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError
+// pins the new r2 sidecar-I/O-failure branch of
+// runRaftEnvelopeCutoverBarrier (claude r3 finding 1 on PR933).
+// After awaitCutoverApply succeeds, the handler re-reads the
+// sidecar to distinguish fresh-success from stale-DEK no-op. If
+// that re-read fails (corrupted sidecar, filesystem fault, ENOENT
+// after the fact), the handler MUST NOT InstallWrap and MUST NOT
+// release the barrier: the cutover entry IS committed in Raft and
+// the operator cannot determine the outcome without sidecar
+// access. End() stays unreached so user proposals on this leader
+// remain rejected with ErrEnvelopeCutoverInProgress until
+// supervised restart.
+//
+// Construction: applyingProposer writes a valid sidecar with
+// RaftEnvelopeCutoverIndex=4242 (fresh success), then a
+// post-apply hook truncates the sidecar to zero bytes before
+// EnableRaftEnvelope can re-read it. ReadSidecar surfaces a
+// decode error; the handler must propagate that as an error
+// without InstallWrap or End.
+func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn: func(sc *encryption.Sidecar, raftIdx uint64) {
+			// Apply the cutover as fresh-success first (mirrors
+			// what the real applier would do), then corrupt the
+			// sidecar on disk so the handler's subsequent
+			// re-read fails. Truncating to an empty file makes
+			// ReadSidecar return a decode error (json.Unmarshal
+			// of an empty buffer fails).
+			applyRaftCutover(sc, raftIdx)
+			// Note: applyingProposer.Propose will WriteSidecar
+			// the modified sc AFTER this callback returns, so we
+			// truncate AFTER that write by scheduling a cleanup
+			// that runs after Propose returns but before
+			// runRaftEnvelopeCutoverBarrier's re-read. The
+			// cleanest way: corrupt the file from a separate
+			// goroutine triggered by the apply callback.
+		},
+	}
+	// Use a recordingProposer wrapper that corrupts the sidecar
+	// after writing the fresh-success state. The simplest shape:
+	// after applyingProposer.Propose writes the sidecar, replace
+	// the file contents with an empty byte slice via a deferred
+	// callback. We accomplish that with a custom proposer that
+	// composes applyingProposer with a post-apply corrupt step.
+	corruptingProposer := &postProposeCorruptingProposer{
+		inner:       proposer,
+		sidecarPath: path,
+	}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(corruptingProposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 4242 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want sidecar-read error post-apply, got nil")
+	}
+	for _, op := range barrier.order {
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap MUST NOT run on sidecar-read failure (cutover outcome unknown); order = %v", barrier.order)
+		}
+		if op == "End" {
+			t.Errorf("End MUST NOT run on sidecar-read failure (releaseSafe stays false; operator must intervene); order = %v", barrier.order)
+		}
+	}
+	// Sequence reached propose + drain but not the post-apply
+	// re-read's successful branch.
+	wantPrefix := []string{"Begin", "WaitDrained"}
+	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
+		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
+	}
+}
+
+// postProposeCorruptingProposer wraps applyingProposer and, after
+// the apply callback writes the fresh-success sidecar, truncates
+// the file to zero bytes so the handler's subsequent re-read
+// surfaces a decode error. Used by the sidecar-read-failure test
+// above. Only Propose / ProposeAdmin go through this wrapper;
+// other methods (Stop, etc.) aren't needed on the test path.
+type postProposeCorruptingProposer struct {
+	inner       *applyingProposer
+	sidecarPath string
+}
+
+func (p *postProposeCorruptingProposer) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	res, err := p.inner.Propose(ctx, data)
+	if err == nil {
+		// Truncate the sidecar so the handler's re-read fails.
+		// os.Truncate to 0 bytes is enough — ReadSidecar's JSON
+		// decode of an empty buffer surfaces an error.
+		if truncErr := truncateFileToZero(p.sidecarPath); truncErr != nil {
+			return nil, truncErr
+		}
+	}
+	return res, err
+}
+
+func (p *postProposeCorruptingProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return p.Propose(ctx, data)
+}
+
+// truncateFileToZero rewrites the file at path to an empty byte
+// sequence, preserving the path so ReadSidecar's open succeeds and
+// the decode is what fails. Used only by the sidecar-read-failure
+// test.
+func truncateFileToZero(path string) error {
+	if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
+		return fmt.Errorf("test: truncate sidecar: %w", err)
+	}
+	return nil
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex pins the
