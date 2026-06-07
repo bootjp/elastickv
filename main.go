@@ -50,15 +50,16 @@ const (
 	etcdMaxInflightMsg    = 256
 )
 
-func newRaftFactory(engineType raftEngineType) (raftengine.Factory, error) {
+func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
 	switch engineType {
 	case raftEngineEtcd:
 		return etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
-			TickInterval:   etcdTickInterval,
-			HeartbeatTick:  durationToTicks(heartbeatTimeout, etcdTickInterval, etcdHeartbeatMinTicks),
-			ElectionTick:   durationToTicks(electionTimeout, etcdTickInterval, etcdElectionMinTicks),
-			MaxSizePerMsg:  etcdMaxSizePerMsg,
-			MaxInflightMsg: etcdMaxInflightMsg,
+			TickInterval:      etcdTickInterval,
+			HeartbeatTick:     durationToTicks(heartbeatTimeout, etcdTickInterval, etcdHeartbeatMinTicks),
+			ElectionTick:      durationToTicks(electionTimeout, etcdTickInterval, etcdElectionMinTicks),
+			MaxSizePerMsg:     etcdMaxSizePerMsg,
+			MaxInflightMsg:    etcdMaxInflightMsg,
+			ColdStartObserver: coldStartObs,
 		}), nil
 	default:
 		return nil, errors.Wrapf(ErrUnsupportedRaftEngine, "%q", engineType)
@@ -317,14 +318,20 @@ func run() error {
 		return err
 	}
 
-	factory, err := newRaftFactory(engineType)
-	if err != nil {
-		return err
-	}
-
 	var lc net.ListenConfig
 
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
+
+	// Factory needs the cold-start observer from the registry so the
+	// engine's restoreSnapshotState path can emit
+	// elastickv_fsm_cold_start_restore_total / _applied_index_gap
+	// (PR #934 round-1 codex P2 closed this plumbing gap — the
+	// observer was previously unused because Factory.Create did not
+	// carry it through to OpenConfig).
+	factory, err := newRaftFactory(engineType, metricsRegistry.ColdStartObserver())
+	if err != nil {
+		return err
+	}
 
 	// Create the shared HLC before building shard groups so every FSM can update
 	// physicalCeiling when HLC lease entries are applied to the Raft log.

@@ -91,6 +91,6 @@ func TestDurationToTicks(t *testing.T) {
 
 func TestNewRaftFactory_UnsupportedEngine(t *testing.T) {
 	t.Parallel()
-	_, err := newRaftFactory(raftEngineType("unknown"))
+	_, err := newRaftFactory(raftEngineType("unknown"), nil)
 	require.ErrorIs(t, err, ErrUnsupportedRaftEngine)
 }

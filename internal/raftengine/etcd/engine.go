@@ -187,6 +187,12 @@ type OpenConfig struct {
 	// has been observed yet, equivalent to "raft envelope hook
 	// off".
 	RaftCutoverIndex RaftCutoverIndex
+	// ColdStartObserver receives the cold-start snapshot-restore
+	// skip-gate lifecycle events (skipped / executed / fallback).
+	// nil disables metrics; the skip itself still runs. See
+	// docs/design/2026_06_02_idempotent_snapshot_restore.md §9 and
+	// internal/raftengine/cold_start.go for the contract.
+	ColdStartObserver raftengine.ColdStartObserver
 }
 
 type Engine struct {
@@ -549,7 +555,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
 		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
 		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
-		applied:          maxAppliedIndex(prepared.disk.LocalSnap),
+		applied:          coldStartApplied(prepared.disk),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
@@ -564,7 +570,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
-	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.appliedIndex.Store(coldStartApplied(prepared.disk))
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -2175,7 +2181,17 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 // lock-free atomic mirror in a single place. Called exclusively from
 // the Raft run loop, so no synchronization between the two writes is
 // required beyond the single-writer invariant.
+//
+// Advance-only: cold-start with EffectiveApplied > snapshot.Index
+// seeds e.applied with `have`, after which raft still delivers conf-
+// change entries from snapshot.Index+1..have whose applyConfChange*
+// path calls setApplied(entry.Index) with index < have. Allowing the
+// counter to walk backwards would break the e.appliedIndex.Load()
+// contract every other watcher depends on. Codex P1 #934.
 func (e *Engine) setApplied(index uint64) {
+	if index <= e.applied {
+		return
+	}
 	e.applied = index
 	e.appliedIndex.Store(index)
 }
@@ -2208,7 +2224,28 @@ func (e *Engine) setApplied(index uint64) {
 // (today's *fsmApplyResponse, returned by kv batch apply) do NOT
 // implement HaltApply and continue to advance setApplied.
 func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
-	response, err := e.applyNormalEntry(entry)
+	// Cold-start idempotency: when the skip gate fires with the FSM
+	// past snapshot.Metadata.Index (have > tok.Index), e.applied is
+	// seeded with `have`. Raft still delivers entries
+	// snapshot.Metadata.Index+1..commit including the [snap.Index+1,
+	// have] tail, which the FSM has already applied. Re-calling
+	// applyNormalEntry on a KV/MVCC entry would re-execute the
+	// transaction (OCC conflicts; HLC ceiling inversion). Drop the
+	// duplicate without touching the FSM. setApplied is NOT called -
+	// e.applied is already >= entry.Index. Codex P1 #934.
+	//
+	// Codex P1 #934 round 7: volatile-only entries (HLC lease, tag
+	// 0x02) carry effects that live purely in process memory
+	// (HLC.SetPhysicalCeiling). Their post-snapshot effect must be
+	// re-applied on cold start; otherwise ApplySnapshotHeader restores
+	// only the older snapshot-time ceiling and the next leader-issued
+	// timestamp can collide with persisted commit_ts values stamped
+	// under the lost lease. applyNormalEntry routes those duplicates
+	// to fsm.Apply (which is monotonic and idempotent for HLC leases)
+	// and returns (nil, nil) for data-mutating duplicates so we fall
+	// through to the "no setApplied advance, no resolveProposal" arm.
+	duplicate := entry.Index <= e.applied
+	response, err := e.applyNormalEntry(entry, duplicate)
 	if err != nil {
 		return err
 	}
@@ -2219,6 +2256,13 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 				slog.Any("err", herr))
 			return errors.Wrap(herr, "raftengine/etcd: FSM-requested apply halt")
 		}
+	}
+	if duplicate {
+		// Volatile-only entries replayed for their in-memory effect
+		// (e.applied already past) or data-mutating duplicates
+		// dropped inside applyNormalEntry — either way the engine's
+		// applied pointer and pending-proposal map stay untouched.
+		return nil
 	}
 	e.setApplied(entry.Index)
 	e.resolveProposal(entry.Index, entry.Data, response)
@@ -2260,7 +2304,26 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	return nil
 }
 
-func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
+// applyNormalEntry decodes the raft envelope, optionally unwraps the
+// cipher payload, and dispatches to fsm.Apply.
+//
+// dropIfNonVolatile is the cold-start idempotency seam. When the skip
+// gate fires the engine still receives WAL committed-tail entries past
+// snapshot.Metadata.Index; data-mutating duplicates must NOT call
+// fsm.Apply (OCC re-validation, ceiling regression, sidecar drift) but
+// volatile-only entries (HLC lease) MUST still call fsm.Apply for
+// their in-memory monotonic effect. The classifier inspects the
+// cleartext payload AFTER raft envelope decode + decryption — the
+// raftEncodeHLCLease tag (0x02) is only visible there in the
+// post-cutover path, so the cleartext-side decision is the only
+// correct one. Codex P1 #934 round 7.
+//
+// dropIfNonVolatile=false preserves the original semantics: every
+// decodable entry is handed to fsm.Apply. dropIfNonVolatile=true
+// gates the fsm.Apply call on VolatileEntryClassifier.IsVolatileOnlyPayload
+// and returns (nil, nil) for data-mutating duplicates so the caller's
+// "no setApplied advance" arm fires unchanged.
+func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (any, error) {
 	if len(entry.Data) == 0 {
 		return nil, nil
 	}
@@ -2326,10 +2389,42 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 		}
 		payload = plain
 	}
-	if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
-		aware.SetApplyIndex(entry.Index)
+	if dropIfNonVolatile && !e.isVolatilePayload(payload) {
+		return nil, nil
+	}
+	// SetApplyIndex is suppressed on the duplicate-replay path
+	// because pendingApplyIdx is documented as "the entry index the
+	// engine is about to apply". On a volatile replay entry.Index is
+	// BELOW e.applied; writing it would feed a stale index to any
+	// future durability sink (encryption sidecar.RaftAppliedIndex,
+	// ApplyMutationsRaftAt's metaAppliedIndex bundle). Today's only
+	// volatile entry (HLC lease) does not read pendingApplyIdx so
+	// this is a no-op, but it future-proofs the seam against a new
+	// volatile entry type that also persists. Claude #934 round 7
+	// finding R7-F1.
+	if !dropIfNonVolatile {
+		if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
+			aware.SetApplyIndex(entry.Index)
+		}
 	}
 	return e.fsm.Apply(payload), nil
+}
+
+// isVolatilePayload is the cold-start duplicate guard's cleartext
+// classifier. Only volatile-only payloads (HLC lease, tag 0x02) may
+// be re-applied past e.applied; data-mutating entries return false so
+// the caller drops them. The check runs AFTER raft envelope
+// decryption because post-cutover the cleartext payload's leading
+// byte is the only reliable carrier of the entry-kind tag. FSMs that
+// do not implement VolatileEntryClassifier default to false
+// (drop-all), preserving the pre-PR semantics for engines that
+// haven't opted in. Codex P1 #934 round 7.
+func (e *Engine) isVolatilePayload(payload []byte) bool {
+	classifier, ok := e.fsm.(raftengine.VolatileEntryClassifier)
+	if !ok {
+		return false
+	}
+	return classifier.IsVolatileOnlyPayload(payload)
 }
 
 func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) {

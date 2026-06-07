@@ -25,6 +25,8 @@ type Registry struct {
 	sqsObserver   *SQSObserver
 	hlc           *HLCMetrics
 	hlcObserver   *HLCObserver
+	coldStart     *ColdStartMetrics
+	coldStartObs  *ColdStartObserver
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -51,7 +53,20 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.sqsObserver = newSQSObserver(r.sqs)
 	r.hlc = newHLCMetrics(registerer)
 	r.hlcObserver = newHLCObserver(r.hlc)
+	r.coldStart = newColdStartMetrics(registerer)
+	r.coldStartObs = newColdStartObserver(r.coldStart)
 	return r
+}
+
+// ColdStartObserver returns the cold-start snapshot-restore observer
+// backed by this registry. The engine receives it through
+// raftengine/etcd.OpenConfig.ColdStartObserver and calls it on each
+// skip-gate outcome (PR #910 design §9).
+func (r *Registry) ColdStartObserver() *ColdStartObserver {
+	if r == nil {
+		return nil
+	}
+	return r.coldStartObs
 }
 
 // Handler returns an HTTP handler that exposes the Prometheus scrape endpoint.
