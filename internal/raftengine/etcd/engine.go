@@ -2229,14 +2229,23 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 	// seeded with `have`. Raft still delivers entries
 	// snapshot.Metadata.Index+1..commit including the [snap.Index+1,
 	// have] tail, which the FSM has already applied. Re-calling
-	// applyNormalEntry would re-execute the KV-side transaction (OCC
-	// conflicts; HLC ceiling inversion). Drop the duplicate without
-	// touching the FSM. setApplied is NOT called - e.applied is
-	// already >= entry.Index. Codex P1 #934.
-	if entry.Index <= e.applied {
-		return nil
-	}
-	response, err := e.applyNormalEntry(entry)
+	// applyNormalEntry on a KV/MVCC entry would re-execute the
+	// transaction (OCC conflicts; HLC ceiling inversion). Drop the
+	// duplicate without touching the FSM. setApplied is NOT called -
+	// e.applied is already >= entry.Index. Codex P1 #934.
+	//
+	// Codex P1 #934 round 7: volatile-only entries (HLC lease, tag
+	// 0x02) carry effects that live purely in process memory
+	// (HLC.SetPhysicalCeiling). Their post-snapshot effect must be
+	// re-applied on cold start; otherwise ApplySnapshotHeader restores
+	// only the older snapshot-time ceiling and the next leader-issued
+	// timestamp can collide with persisted commit_ts values stamped
+	// under the lost lease. applyNormalEntry routes those duplicates
+	// to fsm.Apply (which is monotonic and idempotent for HLC leases)
+	// and returns (nil, nil) for data-mutating duplicates so we fall
+	// through to the "no setApplied advance, no resolveProposal" arm.
+	duplicate := entry.Index <= e.applied
+	response, err := e.applyNormalEntry(entry, duplicate)
 	if err != nil {
 		return err
 	}
@@ -2247,6 +2256,13 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 				slog.Any("err", herr))
 			return errors.Wrap(herr, "raftengine/etcd: FSM-requested apply halt")
 		}
+	}
+	if duplicate {
+		// Volatile-only entries replayed for their in-memory effect
+		// (e.applied already past) or data-mutating duplicates
+		// dropped inside applyNormalEntry — either way the engine's
+		// applied pointer and pending-proposal map stay untouched.
+		return nil
 	}
 	e.setApplied(entry.Index)
 	e.resolveProposal(entry.Index, entry.Data, response)
@@ -2288,7 +2304,26 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	return nil
 }
 
-func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
+// applyNormalEntry decodes the raft envelope, optionally unwraps the
+// cipher payload, and dispatches to fsm.Apply.
+//
+// dropIfNonVolatile is the cold-start idempotency seam. When the skip
+// gate fires the engine still receives WAL committed-tail entries past
+// snapshot.Metadata.Index; data-mutating duplicates must NOT call
+// fsm.Apply (OCC re-validation, ceiling regression, sidecar drift) but
+// volatile-only entries (HLC lease) MUST still call fsm.Apply for
+// their in-memory monotonic effect. The classifier inspects the
+// cleartext payload AFTER raft envelope decode + decryption — the
+// raftEncodeHLCLease tag (0x02) is only visible there in the
+// post-cutover path, so the cleartext-side decision is the only
+// correct one. Codex P1 #934 round 7.
+//
+// dropIfNonVolatile=false preserves the original semantics: every
+// decodable entry is handed to fsm.Apply. dropIfNonVolatile=true
+// gates the fsm.Apply call on VolatileEntryClassifier.IsVolatileOnlyPayload
+// and returns (nil, nil) for data-mutating duplicates so the caller's
+// "no setApplied advance" arm fires unchanged.
+func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (any, error) {
 	if len(entry.Data) == 0 {
 		return nil, nil
 	}
@@ -2353,6 +2388,21 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 			return nil, err
 		}
 		payload = plain
+	}
+	// Cold-start duplicate guard: only volatile-only payloads (HLC
+	// lease, tag 0x02) survive past this point on the duplicate path.
+	// Data-mutating entries return (nil, nil) so the caller skips
+	// setApplied + resolveProposal and the FSM is never touched —
+	// preserving the pre-PR semantics for KV/MVCC duplicates while
+	// fixing the post-snapshot lease replay loss. The check happens
+	// AFTER decryption because post-cutover the cleartext payload's
+	// leading byte is the only reliable carrier of the entry-kind
+	// tag. Codex P1 #934 round 7.
+	if dropIfNonVolatile {
+		classifier, ok := e.fsm.(raftengine.VolatileEntryClassifier)
+		if !ok || !classifier.IsVolatileOnlyPayload(payload) {
+			return nil, nil
+		}
 	}
 	if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
 		aware.SetApplyIndex(entry.Index)

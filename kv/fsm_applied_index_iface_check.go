@@ -15,3 +15,12 @@ var _ raftengine.AppliedIndexWriter = (*kvFSM)(nil)
 // restore. A future rename or signature drift fails the build
 // immediately rather than silently degrading the skip optimisation.
 var _ raftengine.SnapshotHeaderApplier = (*kvFSM)(nil)
+
+// Codex P1 #934 round 7: kvFSM must directly implement
+// raftengine.VolatileEntryClassifier so the engine's cold-start
+// duplicate-entry guard can distinguish HLC lease entries (volatile,
+// must replay) from KV/MVCC duplicates (idempotency-violating, must
+// skip). A future rename of IsVolatileOnlyPayload or accidental
+// removal of the raftEncodeHLCLease classification would otherwise
+// silently re-introduce the post-snapshot lease replay loss.
+var _ raftengine.VolatileEntryClassifier = (*kvFSM)(nil)

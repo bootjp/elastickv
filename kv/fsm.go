@@ -626,6 +626,26 @@ func (f *kvFSM) ApplySnapshotHeader(ceiling, cutover uint64) {
 	f.restoredCutover = cutover
 }
 
+// IsVolatileOnlyPayload satisfies raftengine.VolatileEntryClassifier.
+// Returns true iff payload is an HLC lease entry (raftEncodeHLCLease
+// tag, 0x02) — those entries only call HLC.SetPhysicalCeiling, which
+// is monotonic and lives purely in memory. After the cold-start skip
+// gate fires, the engine still delivers WAL committed-tail entries
+// past snapshot.Metadata.Index; without this classifier those
+// volatile entries get dropped along with KV/MVCC duplicates and the
+// post-snapshot ceiling raise is lost. Codex P1 #934 round 7.
+//
+// Re-applying KV/MVCC entries would re-execute OCC validation against
+// store state that has already moved past commit_ts, surfacing
+// spurious conflicts. Returning false for any non-HLC payload tag
+// preserves that idempotency. Encryption opcodes (0x03..0x07) MUST
+// also return false — they persist DEK state in the encryption
+// sidecar and re-applying would diverge the sidecar's
+// RaftAppliedIndex from the engine's appliedIndex.
+func (f *kvFSM) IsVolatileOnlyPayload(payload []byte) bool {
+	return len(payload) > 0 && payload[0] == raftEncodeHLCLease
+}
+
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
 	if err := f.verifyComposed1(r); err != nil {
 		return err
