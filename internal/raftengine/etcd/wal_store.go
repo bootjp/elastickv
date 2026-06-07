@@ -535,6 +535,20 @@ func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) 
 	// and hand it to the FSM's ParseSnapshotHeader for header parse
 	// + drain. Every payload byte flows through h, matching
 	// restoreAndComputeCRC's boundary in openAndRestoreFSMSnapshot.
+	//
+	// Error-ordering contract (claude #934 R1-F1): header parse
+	// errors surface BEFORE the body-CRC compare runs, so callers
+	// (the skip-gate fallback in restoreSnapshotState) may observe
+	// either an ErrSnapshotHeaderUnknownMagic / InvalidLength chain or
+	// an ErrFSMSnapshotFileCRC chain depending on which check fails
+	// first. This is the same ordering openAndRestoreFSMSnapshot has
+	// — both errors are equally fatal for the skip path (they signal
+	// snapshot file corruption) and both must propagate without ever
+	// calling ApplySnapshotHeader. The CRC check stays AFTER the
+	// header parse so the TeeReader has actually been drained before
+	// we read h.Sum32(); inverting the order would let a CRC mismatch
+	// surface on a truncated body even when the header was valid,
+	// muddying the operator-facing diagnostic.
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return errors.WithStack(err)
 	}
