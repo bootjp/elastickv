@@ -1307,6 +1307,46 @@ func (s *EncryptionAdminServer) runRaftEnvelopeCutoverBarrier(ctx context.Contex
 		return 0, err
 	}
 
+	// Codex P1 #2 round-2 — verify the cutover applied as a
+	// fresh-success (not a §6E-1a constraint #3 stale-DEK benign
+	// no-op). Re-read the sidecar: if RaftEnvelopeCutoverIndex is
+	// still 0, a concurrent RotateDEK changed Active.Raft between
+	// propose and apply and the applier consumed the marker as a
+	// no-op without flipping the cutover field.
+	//
+	// In that race we MUST NOT install the wrap closure: the §6.3
+	// strict-`>` hook compares against the (still-zero)
+	// RaftEnvelopeCutoverIndex, so a fresh wrap-active proposal at
+	// index > 0 would be treated as a wrapped envelope while
+	// pre-install admin entries (the racing RotateDEK, cleartext
+	// via ProposeAdmin) still sit in the apply queue at indexes
+	// > 0 and halt every follower on unwrap-failure.
+	//
+	// Recovery shape: leave releaseSafe=true (no cutover took
+	// effect, safe to resume user writes in pre-cutover cleartext
+	// mode), let the deferred End() close the barrier, surface a
+	// FailedPrecondition. The operator's CLI re-runs the cutover
+	// RPC against the now-updated Active.Raft.
+	postSidecar, err := encryption.ReadSidecar(s.sidecarPath)
+	if err != nil {
+		// Sidecar I/O failure post-apply: the cutover entry IS
+		// committed in Raft but we cannot determine whether it
+		// applied as fresh-success or as a stale-DEK no-op. Leave
+		// the barrier open (releaseSafe stays false) — operator
+		// must intervene because we can't safely install or skip
+		// the wrap without knowing the actual outcome.
+		return 0, statusFromSidecarErr(err)
+	}
+	if postSidecar.RaftEnvelopeCutoverIndex == 0 {
+		// Stale-DEK no-op: no cutover took effect. Release the
+		// barrier (no committed cutover state to protect against)
+		// and surface a FailedPrecondition for the operator
+		// retry-against-new-DEK path.
+		releaseSafe = true
+		return 0, grpcStatusError(codes.FailedPrecondition,
+			"encryption: cutover marker applied as stale-DEK no-op (concurrent RotateDEK race) — retry against the now-updated Active.Raft")
+	}
+
 	s.cutoverBarrier.InstallWrap()
 	releaseSafe = true
 	return proposedIdx, nil

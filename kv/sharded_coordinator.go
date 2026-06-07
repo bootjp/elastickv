@@ -146,6 +146,10 @@ func (g *ShardGroup) BeginCutoverBarrier() <-chan struct{} {
 // the handler). Wraps ctx.Err() on cancellation.
 func (g *ShardGroup) WaitInflightDrained(ctx context.Context) error {
 	if cbp, ok := g.Proposer().(cutoverBarrierProposer); ok {
+		// dynamicWrappedProposer.WaitInflightDrained returns raw
+		// ctx.Err() so this single wrap is the canonical operator-
+		// log entry (claude r2 finding B: avoid the redundant
+		// "kv: ... kv: ..." chain a doubled wrap would produce).
 		if err := cbp.WaitInflightDrained(ctx); err != nil {
 			return errors.Wrap(err, "kv: shard group wait inflight drained")
 		}

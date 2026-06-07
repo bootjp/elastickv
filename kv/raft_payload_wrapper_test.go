@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -592,6 +593,13 @@ func TestDynamicWrappedProposer_WaitDrainedNoBarrier(t *testing.T) {
 func TestDynamicWrappedProposer_BarrierDrainsInflight(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
+	// Idempotent close ensures the in-flight goroutine drains even
+	// if an assertion below t.Fatals before the explicit close on
+	// line 630 (claude r2 finding A: avoid orphaning the
+	// blockingFakeProposer.Propose goroutine on test failure).
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(closeRelease)
 	entered := make(chan struct{})
 	inner := &blockingFakeProposer{enter: entered, release: release}
 	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
@@ -627,7 +635,9 @@ func TestDynamicWrappedProposer_BarrierDrainsInflight(t *testing.T) {
 	}
 
 	// Release inner.Propose; in-flight drains; drainSig closes.
-	close(release)
+	// closeRelease is idempotent so the deferred t.Cleanup is a no-op
+	// after this happy-path close.
+	closeRelease()
 	if err := <-proposeDone; err != nil {
 		t.Fatalf("inflight Propose: %v", err)
 	}

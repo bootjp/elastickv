@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2386,6 +2387,86 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout(t *te
 	}
 }
 
+// TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace
+// pins the codex P1 round-2 invariant (codex P1 #2 on PR933): if a
+// concurrent RotateDEK advances sidecar.Active.Raft between
+// propose and apply, the applier consumes the cutover marker as a
+// stale-DEK no-op (RaftAppliedIndex advances but
+// RaftEnvelopeCutoverIndex stays 0 — §6E-1a constraint #3 benign
+// no-op). The handler MUST detect this race by re-reading the
+// sidecar after awaitCutoverApply and refuse to InstallWrap.
+// Installing the wrap while the FSM sidecar still reads
+// RaftEnvelopeCutoverIndex == 0 would brick the cluster: the §6.3
+// strict-`>` hook would treat every post-install proposal at
+// index > 0 as a wrapped envelope while pre-install admin entries
+// (RotateDEK from the race, cleartext via ProposeAdmin) still sit
+// in the apply queue at indexes > 0, halting on unwrap-failure.
+//
+// Expected outcome on the race:
+//   - awaitCutoverApply returns success (RaftAppliedIndex advanced).
+//   - Sidecar re-read shows RaftEnvelopeCutoverIndex == 0.
+//   - InstallWrap is NOT called.
+//   - releaseSafe stays true, deferred End() releases the barrier
+//     (no cutover took effect; safe to resume user writes — they
+//     remain in cleartext pre-cutover mode).
+//   - Handler returns a FailedPrecondition error so the operator's
+//     CLI can retry against the now-updated Active.Raft.
+func TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		// applyStaleDEKIDRace advances RaftAppliedIndex but
+		// deliberately does NOT touch RaftEnvelopeCutoverIndex —
+		// the §2.1 #3 benign-no-op shape the applier produces for
+		// a stale-DEK race.
+		applyFn: applyStaleDEKIDRace,
+	}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 4242 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want stale-DEK-race error, got nil")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (cutover marker consumed as no-op)", status.Code(err))
+	}
+	for _, op := range barrier.order {
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap WAS called after stale-DEK race; order = %v; this is the codex P1 #2 cluster-brick window", barrier.order)
+		}
+	}
+	// End MUST have run: releaseSafe stays true because no cutover
+	// took effect, so unblocking user writes is safe (they stay
+	// in pre-cutover cleartext mode, consistent with the FSM state).
+	endCalled := false
+	for _, op := range barrier.order {
+		if op == "End" {
+			endCalled = true
+			break
+		}
+	}
+	if !endCalled {
+		t.Errorf("End MUST run on stale-DEK no-op (no committed cutover, safe to release); order = %v", barrier.order)
+	}
+	// Sidecar still at the pre-cutover state: RaftEnvelopeCutoverIndex == 0.
+	sc, readErr := encryption.ReadSidecar(path)
+	if readErr != nil {
+		t.Fatalf("ReadSidecar: %v", readErr)
+	}
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		t.Errorf("RaftEnvelopeCutoverIndex=%d after stale-DEK race, want 0", sc.RaftEnvelopeCutoverIndex)
+	}
+}
+
 // TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex pins the
 // awaitCutoverApply ticker-poll branch (claude finding 2 round-1):
 // the happy-path test wires latestAppliedIndex to return the
@@ -2437,19 +2518,11 @@ func TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex(t *testing.T) {
 	}
 }
 
-// equalStrings compares two string slices element-by-element. Used
-// by the barrier-order assertions because reflect.DeepEqual would
-// pull in an extra import for the same single use, and the call-
-// site is more readable than slices.Equal under the test's t.Errorf
-// formatting.
+// equalStrings is a thin alias over slices.Equal, kept as a
+// named helper so the existing call sites (Begin / WaitDrained /
+// InstallWrap / End order assertions) read naturally. Claude r2
+// finding C: prefer slices.Equal from stdlib over a hand-rolled
+// loop.
 func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(a, b)
 }

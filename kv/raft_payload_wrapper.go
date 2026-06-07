@@ -285,6 +285,33 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 // runs. ProposeAdmin is unaffected (the cutover marker proposes
 // through it).
 //
+// HAZARD — wrap-gap admin RPCs (codex P1 #1 round-2 on PR933):
+// Other admin RPCs that route through ProposeAdmin (RotateDEK,
+// RegisterEncryptionWriter) are ALSO barrier-exempt and currently
+// reach the engine via the raw-engine s.proposer in
+// adapter/encryption_admin.go. Between the cutover marker's commit
+// and the handler's InstallWrap call, an admin RPC that lands at
+// `index > raftEnvelopeCutoverIndex` would be cleartext, and the
+// §6.3 strict-`>` apply hook on every follower would treat it as
+// a wrapped envelope and halt apply cluster-wide.
+//
+// 6E-2d does not close this gap — the barrier scaffold ships
+// inert (raftEnvelopeWrapEnabled = false) so no leader ever opens
+// the wrap-gap window in production. Closing the gap is a 6E-2e
+// requirement and MUST land before 6E-2f flips the gate:
+//
+//   - Option A (preferred): route RotateDEK / RegisterEncryptionWriter
+//     through the wrap-aware proposer (the same dynamicWrappedProposer
+//     the user path uses) so post-cutover admin entries are wrapped.
+//     The cutover marker itself remains on a separate raw-engine
+//     reference held by the EnableRaftEnvelope handler.
+//   - Option B: extend cutoverSem to serialize RotateDEK and
+//     RegisterEncryptionWriter against the EnableRaftEnvelope
+//     handler so no admin RPC can race the barrier window.
+//
+// See main_encryption_registration.go's call-site comment for the
+// 7c §3.1 wiring that Option A would extend.
+//
 // Idempotent against double-Begin: a second call freshens drainSig
 // and leaves barrierOpen true. CALLER SAFETY: a goroutine that was
 // blocked on a prior cycle's drainSig from WaitInflightDrained is
@@ -315,8 +342,11 @@ func (p *dynamicWrappedProposer) BeginCutoverBarrier() <-chan struct{} {
 
 // WaitInflightDrained blocks until the in-flight Propose counter
 // drops to 0 after BeginCutoverBarrier was called, or ctx fires.
-// Returns nil on drain, wrapped ctx.Err() on cancellation, and nil
-// also if no barrier is currently open (degraded fast-path so
+// Returns nil on drain, an error wrapping ctx.Err() with a
+// domain-only prefix on cancellation (the ShardGroup forwarder
+// adds the package prefix so operator logs don't carry a
+// redundant "kv: ... kv: ..." chain, claude r2 finding B), and
+// nil also if no barrier is currently open (degraded fast-path so
 // out-of-sequence calls don't deadlock callers).
 func (p *dynamicWrappedProposer) WaitInflightDrained(ctx context.Context) error {
 	p.barrierMu.Lock()
@@ -330,7 +360,7 @@ func (p *dynamicWrappedProposer) WaitInflightDrained(ctx context.Context) error 
 	case <-ch:
 		return nil
 	case <-ctx.Done():
-		return errors.Wrap(ctx.Err(), "kv: wait inflight drained")
+		return errors.Wrap(ctx.Err(), "drain await canceled")
 	}
 }
 
