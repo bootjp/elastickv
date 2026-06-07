@@ -132,12 +132,32 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	if err != nil {
 		return nil, err
 	}
-	if err := restoreSnapshotState(fsm, snapshot, fsmSnapDir, obs, logger); err != nil {
-		return nil, err
-	}
 
+	// Codex P1 #934: open the WAL BEFORE the skip-gate decision so we
+	// know the post-snapshot entry tail. The skip path is only safe
+	// when the FSM is at least as advanced as the last WAL entry; if
+	// the FSM is past `tok.Index` but the WAL still carries entries
+	// `tok.Index+1 .. have` (the normal interval between snapshots,
+	// since metaAppliedIndex advances on each Apply), those entries
+	// would re-apply onto a Pebble store that already contains them,
+	// hitting OCC conflicts and leaving the HLC below timestamps
+	// already on disk. Compute the WAL tail's last index and gate
+	// the skip on `have >= lastWalIndex`.
 	w, hardState, entries, err := openAndReadWALWithRepair(logger, walDir, walSnapshotFor(snapshot))
 	if err != nil {
+		return nil, err
+	}
+	lastWalIndex := snapshot.Metadata.Index
+	if n := len(entries); n > 0 && entries[n-1].Index > lastWalIndex {
+		lastWalIndex = entries[n-1].Index
+	}
+	if err := restoreSnapshotState(fsm, snapshot, lastWalIndex, fsmSnapDir, obs, logger); err != nil {
+		if closeErr := w.Close(); closeErr != nil {
+			logger.Warn("WAL close failed after restoreSnapshotState error",
+				zap.String("dir", walDir),
+				zap.Error(closeErr),
+			)
+		}
 		return nil, err
 	}
 
@@ -245,7 +265,7 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 	}
 }
 
-func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) error {
+func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) error {
 	if etcdraft.IsEmptySnap(snapshot) || len(snapshot.Data) == 0 || fsm == nil {
 		return nil
 	}
@@ -261,8 +281,14 @@ func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir
 		// preserved (PR #910 §5), and runs the same three-step CRC
 		// verification (size + footer-vs-tokenCRC + full-body-CRC)
 		// as openAndRestoreFSMSnapshot before mutating any FSM state.
-		decision, have := decideSkipOutcome(fsm, tok.Index)
-		reportColdStart(obs, logger, decision, tok.Index, have)
+		//
+		// The skip threshold is lastWalIndex (NOT tok.Index): the
+		// FSM must be at least as fresh as the last WAL entry the
+		// cold-start replay would deliver, otherwise entries between
+		// tok.Index and have would re-apply onto a Pebble store that
+		// already contains them. Codex P1 #934.
+		decision, have := decideSkipOutcome(fsm, lastWalIndex)
+		reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
 		if decision == coldStartSkip {
 			return applyHeaderStateOnSkip(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
 		}
@@ -323,28 +349,30 @@ func decideSkipOutcome(fsm StateMachine, want uint64) (coldStartDecision, uint64
 
 // reportColdStart dispatches the outcome to the observer + the
 // engine logger. nil observer / nil logger no-op individually.
-func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d coldStartDecision, snapIndex, have uint64) {
+func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d coldStartDecision, snapIndex, target, have uint64) {
 	switch d { //nolint:exhaustive // default groups the three fallback variants
 	case coldStartSkip:
 		if obs != nil {
-			obs.RestoreSkipped(snapIndex, have)
+			obs.RestoreSkipped(target, have)
 		}
 		if logger != nil {
 			logger.Info("restoreSnapshotState skipped",
 				zap.Uint64("fsm_applied", have),
 				zap.Uint64("snapshot_index", snapIndex),
-				zap.Uint64("gap_ahead", have-snapIndex),
+				zap.Uint64("last_wal_index", target),
+				zap.Uint64("gap_ahead", have-target),
 			)
 		}
 	case coldStartExecute:
 		if obs != nil {
-			obs.RestoreExecuted(snapIndex, have)
+			obs.RestoreExecuted(target, have)
 		}
 		if logger != nil {
-			logger.Info("restoreSnapshotState executed (FSM behind snapshot)",
+			logger.Info("restoreSnapshotState executed (FSM behind WAL tail)",
 				zap.Uint64("fsm_applied", have),
 				zap.Uint64("snapshot_index", snapIndex),
-				zap.Uint64("gap_behind", snapIndex-have),
+				zap.Uint64("last_wal_index", target),
+				zap.Uint64("gap_behind", target-have),
 			)
 		}
 	default:

@@ -126,7 +126,7 @@ func TestSkipGate_SkipsWhenFSMFreshEnough(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, dir, obs, nil))
+	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
 
 	require.Empty(t, fsm.bodyBytes, "skip path MUST NOT call fsm.Restore")
 	require.True(t, fsm.restoredHeader, "skip path MUST call ApplySnapshotHeader")
@@ -155,12 +155,54 @@ func TestSkipGate_ExecutesWhenFSMStale(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, dir, obs, nil))
+	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
 
 	require.Equal(t, payload, fsm.bodyBytes, "executed path MUST call fsm.Restore with full payload")
 	require.False(t, fsm.restoredHeader, "ApplySnapshotHeader MUST NOT fire on the executed path")
 	require.Empty(t, obs.skipped)
 	require.Equal(t, []uint64{snapIndex - appliedIdx}, obs.executed)
+	require.Empty(t, obs.fallbacks)
+}
+
+// TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries pins
+// codex P1 #934. When the FSM is past tok.Index but the WAL still
+// carries entries tok.Index+1 .. have (the normal interval between
+// snapshots — metaAppliedIndex advances on each Apply), the skip
+// path MUST NOT fire even though have > tok.Index. Those WAL
+// entries would re-apply onto a Pebble store that already contains
+// them, hitting OCC conflicts and leaving the HLC below timestamps
+// already on disk.
+//
+// Fixture: snap.Index=100, fsm.applied=150, lastWalIndex=150 (the
+// WAL has entries 101..150 mirroring the applied tail). Gate
+// criterion is have >= lastWalIndex, which holds; that's the
+// happy-skip case. To exercise the bug, set lastWalIndex=200 (the
+// WAL still has entries 151..200 that have NOT been applied yet);
+// have=150 < lastWalIndex=200 must trigger execute, not skip.
+func TestSkipGate_ExecutesWhenWALCarriesPostSnapshotEntries(t *testing.T) {
+	dir := t.TempDir()
+	const (
+		snapIndex    uint64 = 100
+		appliedIdx   uint64 = 150
+		lastWalIndex uint64 = 200
+	)
+	payload := []byte("body-bytes-for-execute")
+	crc, _ := writeFSMFileForTest(t, dir, snapIndex, payload)
+
+	fsm := &skipGateFSM{applied: appliedIdx, appliedPresent: true}
+	snap := raftpb.Snapshot{
+		Data:     encodeSnapshotToken(snapIndex, crc),
+		Metadata: raftpb.SnapshotMetadata{Index: snapIndex},
+	}
+	obs := &recordingObs{}
+	require.NoError(t, restoreSnapshotState(fsm, snap, lastWalIndex, dir, obs, nil))
+
+	require.Equal(t, payload, fsm.bodyBytes,
+		"have(150) < lastWalIndex(200) MUST execute full restore so the WAL replay does not duplicate-apply")
+	require.False(t, fsm.restoredHeader, "execute path MUST NOT use ApplySnapshotHeader")
+	require.Empty(t, obs.skipped)
+	require.Equal(t, []uint64{lastWalIndex - appliedIdx}, obs.executed,
+		"observer MUST record execute with gap_behind = lastWalIndex - have")
 	require.Empty(t, obs.fallbacks)
 }
 
@@ -176,7 +218,7 @@ func TestSkipGate_FallbackMissingMeta(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: 50},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, dir, obs, nil))
+	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
 	require.Equal(t, payload, fsm.bodyBytes, "missing meta MUST fall back to full restore")
 	require.Equal(t, []string{"missing_meta"}, obs.fallbacks)
 }
@@ -194,7 +236,7 @@ func TestSkipGate_FallbackReadErr(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: 50},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, dir, obs, nil))
+	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
 	require.Equal(t, payload, fsm.bodyBytes, "read_err MUST fall back to full restore")
 	require.Equal(t, []string{"read_err"}, obs.fallbacks)
 }
@@ -212,7 +254,7 @@ func TestSkipGate_FallbackNotReader(t *testing.T) {
 		Metadata: raftpb.SnapshotMetadata{Index: 50},
 	}
 	obs := &recordingObs{}
-	require.NoError(t, restoreSnapshotState(fsm, snap, dir, obs, nil))
+	require.NoError(t, restoreSnapshotState(fsm, snap, snap.Metadata.Index, dir, obs, nil))
 	require.NotEmpty(t, fsm.restored, "not_reader MUST fall back to full restore")
 	require.Equal(t, []string{"not_reader"}, obs.fallbacks)
 }

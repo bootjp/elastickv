@@ -18,8 +18,8 @@ type fakeHLCSource struct {
 	rejections uint64
 }
 
-func (f *fakeHLCSource) PhysicalCeiling() int64       { return f.ceiling }
-func (f *fakeHLCSource) NextFencedRejections() uint64 { return f.rejections }
+func (f *fakeHLCSource) PhysicalCeiling() int64        { return f.ceiling }
+func (f *fakeHLCSource) NextFencedRejections() uint64  { return f.rejections }
 
 func TestHLCObserveOnce_NegativeSkewIsHealthy(t *testing.T) {
 	t.Parallel()

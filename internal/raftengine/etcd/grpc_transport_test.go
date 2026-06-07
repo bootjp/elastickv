@@ -217,7 +217,7 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 	// materializing the payload as []byte. Verify the receiver FSM ends up
 	// with exactly the entries the sender serialized.
 	receiverFSM := &testStateMachine{}
-	require.NoError(t, restoreSnapshotState(receiverFSM, *msg.Snapshot, fsmSnapDir, nil, nil))
+	require.NoError(t, restoreSnapshotState(receiverFSM, *msg.Snapshot, msg.Snapshot.Metadata.Index, fsmSnapDir, nil, nil))
 	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied())
 }
 
