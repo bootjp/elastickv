@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -350,6 +352,92 @@ func TestShardGroup_SetRaftPayloadWrap_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestShardGroup_BarrierForwarders_DegradedFallback pins the
+// 6E-2d ShardGroup forwarders' bare-engine fallback contract: when
+// g.proposer is nil (struct-literal test fixture), the forwarders
+// MUST degrade to immediate-success rather than panic or block —
+// otherwise a unit test that constructs ShardGroup directly would
+// deadlock the EnableRaftEnvelope handler on its WaitDrained.
+// Begin returns a pre-closed channel; WaitDrained returns nil;
+// End is a no-op. The semantics match what the EnableRaftEnvelope
+// state machine expects from a barrier-capable controller in the
+// no-op case.
+func TestShardGroup_BarrierForwarders_DegradedFallback(t *testing.T) {
+	t.Parallel()
+	g := &ShardGroup{}
+
+	ch := g.BeginCutoverBarrier()
+	select {
+	case <-ch:
+		// expected: pre-closed
+	default:
+		t.Fatal("BeginCutoverBarrier without proposer: channel must be pre-closed for degraded fallback")
+	}
+
+	if err := g.WaitInflightDrained(context.Background()); err != nil {
+		t.Fatalf("WaitInflightDrained without proposer: want nil, got %v", err)
+	}
+
+	// Idempotent / no-panic.
+	g.EndCutoverBarrier()
+}
+
+// TestShardGroup_BarrierForwarders_DelegatesToProposer pins the
+// production-path: when ShardGroup is constructed via
+// NewLeaderProxyForShardGroup, the forwarders MUST drive the
+// underlying *dynamicWrappedProposer's barrier state so a
+// subsequent Propose call observes ErrEnvelopeCutoverInProgress.
+// A regression that left the forwarders no-op for production
+// ShardGroups would silently disable the §7.1 barrier — exactly
+// the bug class that this stage exists to prevent.
+func TestShardGroup_BarrierForwarders_DelegatesToProposer(t *testing.T) {
+	t.Parallel()
+	inner := &fakeProposer{}
+	g := &ShardGroup{Engine: &recordingEngineForShardGroup{inner: inner}}
+	_ = NewLeaderProxyForShardGroup(g)
+
+	// Sanity: pre-barrier Propose succeeds.
+	if _, err := g.Proposer().Propose(context.Background(), []byte("pre")); err != nil {
+		t.Fatalf("pre-barrier Propose: %v", err)
+	}
+	if got := inner.calls.Load(); got != 1 {
+		t.Fatalf("pre-barrier inner.Propose calls = %d, want 1", got)
+	}
+
+	// Open barrier via ShardGroup forwarder.
+	g.BeginCutoverBarrier()
+	t.Cleanup(g.EndCutoverBarrier)
+
+	// Post-Begin Propose is rejected at the wrap layer (engine NOT reached).
+	_, err := g.Proposer().Propose(context.Background(), []byte("blocked"))
+	if !errors.Is(err, raftengine.ErrEnvelopeCutoverInProgress) {
+		t.Fatalf("Propose under ShardGroup barrier: want ErrEnvelopeCutoverInProgress, got %v", err)
+	}
+	if got := inner.calls.Load(); got != 1 {
+		t.Errorf("inner.Propose calls = %d after barrier; want still 1 — barrier did not gate", got)
+	}
+}
+
+// recordingEngineForShardGroup satisfies the raftengine.Engine
+// surface that NewLeaderProxyForShardGroup expects, forwarding
+// Propose/ProposeAdmin to an embedded fakeProposer so the
+// barrier-forwarder test can inspect what the engine saw. The
+// nil-embedded shape is sufficient because the test path only
+// exercises Propose/ProposeAdmin; everything else NPEs if invoked,
+// which is the fail-fast we want for a misuse.
+type recordingEngineForShardGroup struct {
+	raftengine.Engine
+	inner *fakeProposer
+}
+
+func (e *recordingEngineForShardGroup) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.inner.Propose(ctx, data)
+}
+
+func (e *recordingEngineForShardGroup) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.inner.ProposeAdmin(ctx, data)
+}
+
 // TestDynamicWrappedProposer_ProposeAdminAppliesCurrentWrap is the
 // admin-path mirror of LoadsCurrentWrapEveryCall: ProposeAdmin
 // must also see hot-swapped wrap closures so post-cutover admin
@@ -385,4 +473,260 @@ func TestDynamicWrappedProposer_ProposeAdminAppliesCurrentWrap(t *testing.T) {
 	if !bytes.Equal(inner.adminLast, want) {
 		t.Fatalf("inner.ProposeAdmin saw %q, want %q (wrapped)", inner.adminLast, want)
 	}
+}
+
+// TestDynamicWrappedProposer_BarrierBlocksPropose pins the §7.1
+// step-1 contract: once BeginCutoverBarrier runs, fresh Propose
+// calls fail with raftengine.ErrEnvelopeCutoverInProgress and the
+// payload never reaches the inner engine. A regression that lets
+// the barrier no-op would silently let a user proposal land at
+// index > cutover_index during the cutover window — exactly the
+// case the §7.1 barrier exists to prevent.
+func TestDynamicWrappedProposer_BarrierBlocksPropose(t *testing.T) {
+	t.Parallel()
+	inner := &fakeProposer{}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	wp, ok := newDynamicWrappedProposer(inner, &wrapPtr).(*dynamicWrappedProposer)
+	if !ok {
+		t.Fatal("newDynamicWrappedProposer should return *dynamicWrappedProposer when wrapPtr is non-nil")
+	}
+	wp.BeginCutoverBarrier()
+	t.Cleanup(wp.EndCutoverBarrier)
+
+	_, err := wp.Propose(context.Background(), []byte("user-write"))
+	if !errors.Is(err, raftengine.ErrEnvelopeCutoverInProgress) {
+		t.Fatalf("Propose under barrier: want ErrEnvelopeCutoverInProgress, got %v", err)
+	}
+	if got := inner.calls.Load(); got != 0 {
+		t.Errorf("inner.Propose called %d times under barrier; gate is broken — payload could have reached the engine", got)
+	}
+}
+
+// TestDynamicWrappedProposer_BarrierAllowsProposeAdmin pins the
+// design's barrier-exemption: ProposeAdmin MUST remain admissible
+// across the barrier so the EnableRaftEnvelope handler can propose
+// the cutover marker through its own barrier (without this exempt,
+// the handler would deadlock on its own cutover proposal). A
+// regression that gated ProposeAdmin on barrierOpen would brick
+// the cutover RPC; this test catches that immediately.
+func TestDynamicWrappedProposer_BarrierAllowsProposeAdmin(t *testing.T) {
+	t.Parallel()
+	inner := &fakeProposer{}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	wp, ok := newDynamicWrappedProposer(inner, &wrapPtr).(*dynamicWrappedProposer)
+	if !ok {
+		t.Fatal("newDynamicWrappedProposer should return *dynamicWrappedProposer when wrapPtr is non-nil")
+	}
+	wp.BeginCutoverBarrier()
+	t.Cleanup(wp.EndCutoverBarrier)
+
+	if _, err := wp.ProposeAdmin(context.Background(), []byte("cutover-marker")); err != nil {
+		t.Fatalf("ProposeAdmin under barrier: %v (must be barrier-exempt)", err)
+	}
+	if got := inner.adminCalls.Load(); got != 1 {
+		t.Errorf("inner.ProposeAdmin calls = %d, want 1 under barrier (admin path must remain admissible)", got)
+	}
+}
+
+// TestDynamicWrappedProposer_BarrierEndReopens pins step-6 of the
+// quiescence sequence: after EndCutoverBarrier, fresh Propose
+// calls succeed again (the cutover is complete, user writes resume).
+// A regression that left barrierOpen=true after End would brick the
+// cluster on the post-cutover write path — every coordinator would
+// see ErrEnvelopeCutoverInProgress forever.
+func TestDynamicWrappedProposer_BarrierEndReopens(t *testing.T) {
+	t.Parallel()
+	inner := &fakeProposer{}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	wp, ok := newDynamicWrappedProposer(inner, &wrapPtr).(*dynamicWrappedProposer)
+	if !ok {
+		t.Fatal("newDynamicWrappedProposer should return *dynamicWrappedProposer when wrapPtr is non-nil")
+	}
+	wp.BeginCutoverBarrier()
+	wp.EndCutoverBarrier()
+
+	if _, err := wp.Propose(context.Background(), []byte("post-cutover")); err != nil {
+		t.Fatalf("Propose after End: %v (user writes must resume)", err)
+	}
+	if got := inner.calls.Load(); got != 1 {
+		t.Errorf("inner.Propose calls = %d, want 1 after End", got)
+	}
+}
+
+// TestDynamicWrappedProposer_WaitDrainedNoBarrier pins the degraded
+// fast-path: WaitInflightDrained called WITHOUT a preceding
+// BeginCutoverBarrier returns nil immediately rather than blocking
+// forever. A handler that mis-sequences the calls (or a test stub
+// that skips Begin) should not deadlock — it should observe an
+// immediately-drained state because there is no in-flight gate to
+// drain past.
+func TestDynamicWrappedProposer_WaitDrainedNoBarrier(t *testing.T) {
+	t.Parallel()
+	inner := &fakeProposer{}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	wp, ok := newDynamicWrappedProposer(inner, &wrapPtr).(*dynamicWrappedProposer)
+	if !ok {
+		t.Fatal("newDynamicWrappedProposer should return *dynamicWrappedProposer when wrapPtr is non-nil")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := wp.WaitInflightDrained(ctx); err != nil {
+		t.Fatalf("WaitInflightDrained without prior Begin must return nil, got %v", err)
+	}
+}
+
+// TestDynamicWrappedProposer_BarrierDrainsInflight pins the §7.1
+// step-2 contract: BeginCutoverBarrier opens the gate but
+// WaitInflightDrained must NOT return until the in-flight
+// proposals that started before the gate finished. Without this,
+// the handler would propose the cutover entry while a previously-
+// accepted Propose is still mid-flight inside engine.Propose,
+// risking it landing at index > cutover_index after the FSM apply
+// of the cutover entry — which the §6.3 hook would then try to
+// unwrap as ciphertext and HaltApply the cluster.
+//
+// Construction: start a Propose that blocks inside the inner
+// proposer via a hand-rolled gate, open the barrier, assert
+// WaitInflightDrained blocks, then release the inner gate and
+// assert WaitInflightDrained returns.
+func TestDynamicWrappedProposer_BarrierDrainsInflight(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	// Idempotent close ensures the in-flight goroutine drains even
+	// if an assertion below t.Fatals before the explicit close on
+	// line 630 (claude r2 finding A: avoid orphaning the
+	// blockingFakeProposer.Propose goroutine on test failure).
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(closeRelease)
+	entered := make(chan struct{})
+	inner := &blockingFakeProposer{enter: entered, release: release}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	wp, ok := newDynamicWrappedProposer(inner, &wrapPtr).(*dynamicWrappedProposer)
+	if !ok {
+		t.Fatal("newDynamicWrappedProposer should return *dynamicWrappedProposer when wrapPtr is non-nil")
+	}
+
+	// In-flight Propose: blocks inside inner.Propose
+	proposeDone := make(chan error, 1)
+	go func() {
+		_, err := wp.Propose(context.Background(), []byte("inflight-write"))
+		proposeDone <- err
+	}()
+	<-entered // inner.Propose reached
+
+	// Open the barrier while one Propose is in-flight.
+	wp.BeginCutoverBarrier()
+	t.Cleanup(wp.EndCutoverBarrier)
+
+	// WaitInflightDrained must NOT return — drainSig isn't closed
+	// because inflightUser > 0.
+	drained := make(chan error, 1)
+	go func() {
+		drained <- wp.WaitInflightDrained(context.Background())
+	}()
+
+	select {
+	case err := <-drained:
+		t.Fatalf("WaitInflightDrained returned (%v) while inflight Propose is still in flight; barrier drain semantics broken", err)
+	case <-makeShortTimer():
+		// expected: still blocking
+	}
+
+	// Release inner.Propose; in-flight drains; drainSig closes.
+	// closeRelease is idempotent so the deferred t.Cleanup is a no-op
+	// after this happy-path close.
+	closeRelease()
+	if err := <-proposeDone; err != nil {
+		t.Fatalf("inflight Propose: %v", err)
+	}
+
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("WaitInflightDrained after drain: %v", err)
+		}
+	case <-makeLongTimer():
+		t.Fatal("WaitInflightDrained did not return within budget after in-flight finished")
+	}
+}
+
+// blockingFakeProposer signals on enter when Propose is invoked
+// and blocks until release is closed. Used by the
+// barrier-drains-inflight test to deterministically hold a
+// Propose call past BeginCutoverBarrier.
+type blockingFakeProposer struct {
+	enter   chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingFakeProposer) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
+	close(p.enter)
+	<-p.release
+	return &raftengine.ProposalResult{CommitIndex: 1}, nil
+}
+
+func (p *blockingFakeProposer) ProposeAdmin(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
+	return &raftengine.ProposalResult{CommitIndex: 1}, nil
+}
+
+// TestDynamicWrappedProposer_WaitDrainedRespectsCtx pins the
+// composability requirement: a context cancellation MUST short-
+// circuit WaitInflightDrained so a misbehaving in-flight proposal
+// can't deadlock the EnableRaftEnvelope handler past its gRPC
+// deadline. Without ctx-respect the handler would block forever,
+// holding the cutoverSem and the barrier — denying every retry of
+// the same cutover RPC and blocking user writes indefinitely.
+func TestDynamicWrappedProposer_WaitDrainedRespectsCtx(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	defer close(release)
+	entered := make(chan struct{})
+	inner := &blockingFakeProposer{enter: entered, release: release}
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	wp, ok := newDynamicWrappedProposer(inner, &wrapPtr).(*dynamicWrappedProposer)
+	if !ok {
+		t.Fatal("newDynamicWrappedProposer should return *dynamicWrappedProposer when wrapPtr is non-nil")
+	}
+
+	go func() {
+		_, _ = wp.Propose(context.Background(), []byte("inflight"))
+	}()
+	<-entered
+
+	wp.BeginCutoverBarrier()
+	t.Cleanup(wp.EndCutoverBarrier)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := wp.WaitInflightDrained(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitInflightDrained: want wrapped DeadlineExceeded, got %v", err)
+	}
+}
+
+// makeShortTimer returns a channel that fires after a few
+// milliseconds — long enough for the in-flight goroutine to make
+// progress past the barrier check if the drain semantic were
+// broken, short enough to keep the test fast.
+func makeShortTimer() <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		<-time.After(20 * time.Millisecond)
+		close(ch)
+	}()
+	return ch
+}
+
+// makeLongTimer returns a channel that fires after a longer
+// budget for the post-release drain to complete. Picks a window
+// well within the test deadline so a 50ms CI hiccup doesn't flake.
+func makeLongTimer() <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		<-time.After(2 * time.Second)
+		close(ch)
+	}()
+	return ch
 }

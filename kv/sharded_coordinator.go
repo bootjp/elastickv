@@ -99,6 +99,76 @@ func (g *ShardGroup) RaftPayloadWrap() RaftPayloadWrapper {
 	return nil
 }
 
+// cutoverBarrierProposer is the optional interface a Proposer can
+// satisfy to participate in the §7.1 quiescence barrier. Production
+// proposers built via NewLeaderProxyForShardGroup (i.e.,
+// *dynamicWrappedProposer) implement it; test fixtures that wire a
+// bare engine into ShardGroup.Engine do not. The ShardGroup
+// forwarders below type-assert on this interface so the barrier
+// control degrades gracefully (immediate-success drain, no-op
+// Begin/End) when the proposer can't participate.
+type cutoverBarrierProposer interface {
+	raftengine.Proposer
+	BeginCutoverBarrier() <-chan struct{}
+	WaitInflightDrained(ctx context.Context) error
+	EndCutoverBarrier()
+}
+
+// BeginCutoverBarrier opens the §7.1 step-1 quiescence barrier on
+// this shard group's proposer chain. Returns a channel that closes
+// when all in-flight user Propose calls drain; the typical caller
+// uses WaitInflightDrained which composes context cancellation.
+//
+// Forwards to *dynamicWrappedProposer when present. When the
+// proposer is the bare engine (raw Engine fallback in test
+// fixtures), returns a pre-closed channel so callers that don't
+// distinguish barrier-capable from -incapable proposers can drive
+// the same state-machine shape against either.
+//
+// 6E-2d wiring: every leader's EnableRaftEnvelope handler calls this
+// on each ShardGroup that participates in the cutover before
+// proposing the cutover entry. After return, the proposer's
+// dynamicWrappedProposer.Propose rejects fresh user calls with
+// raftengine.ErrEnvelopeCutoverInProgress.
+func (g *ShardGroup) BeginCutoverBarrier() <-chan struct{} {
+	if cbp, ok := g.Proposer().(cutoverBarrierProposer); ok {
+		return cbp.BeginCutoverBarrier()
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// WaitInflightDrained blocks until the in-flight Propose counter
+// drops to 0 after BeginCutoverBarrier ran on this ShardGroup, or
+// ctx fires. Returns nil on drain or when the proposer is barrier-
+// incapable (degraded fast-path so test fixtures don't deadlock
+// the handler). Wraps ctx.Err() on cancellation.
+func (g *ShardGroup) WaitInflightDrained(ctx context.Context) error {
+	if cbp, ok := g.Proposer().(cutoverBarrierProposer); ok {
+		// dynamicWrappedProposer.WaitInflightDrained returns raw
+		// ctx.Err() so this single wrap is the canonical operator-
+		// log entry (claude r2 finding B: avoid the redundant
+		// "kv: ... kv: ..." chain a doubled wrap would produce).
+		if err := cbp.WaitInflightDrained(ctx); err != nil {
+			return errors.Wrap(err, "kv: shard group wait inflight drained")
+		}
+		return nil
+	}
+	return nil
+}
+
+// EndCutoverBarrier closes the §7.1 step-6 barrier on this shard
+// group's proposer chain. Idempotent against barrier-incapable
+// proposers (no-op). Callers MUST pair each BeginCutoverBarrier
+// with exactly one EndCutoverBarrier (the EnableRaftEnvelope
+// handler uses defer).
+func (g *ShardGroup) EndCutoverBarrier() {
+	if cbp, ok := g.Proposer().(cutoverBarrierProposer); ok {
+		cbp.EndCutoverBarrier()
+	}
+}
+
 // NewLeaderProxyForShardGroup wires a LeaderProxy whose proposer
 // consults g.raftPayloadWrap on every call, so SetRaftPayloadWrap
 // becomes the hot-swap surface for the raft envelope cutover.

@@ -14,7 +14,12 @@
 |---|---|---|
 | 6E-1a — FSM apply machinery (`applyEnableRaftEnvelope`, sidecar field plumbing, wire sub-tag whitelist) | shipped | #899 (3bffd344) |
 | 6E-1b — `EnableRaftEnvelope` admin RPC + `elastickv-admin enable-raft-envelope` CLI subcommand (server method **gated** until 6E-2; see §3.3 below) | shipped | #907 |
-| 6E-2 — engine unwrap-on-apply + coordinator wrap-on-propose + §7.1 proposal-quiescence barrier (atomic 3-piece flip; also flips the 6E-1b gate to true) | not started | — |
+| 6E-2a — typed cutover sentinel + sidecar `RaftEnvelopeCutoverIndex` apply seam | shipped | (rolled into earlier slices) |
+| 6E-2b — `ProposeAdmin` sibling on `raftengine.Proposer` (barrier-exempt by interface contract) | shipped | (rolled into earlier slices) |
+| 6E-2c — Coordinator `dynamicWrappedProposer` + `ShardGroup.raftPayloadWrap` hot-swap + `Proposer()` accessor + Internal.Forward wrap-aware proposer + fail-closed startup guard on active cutover | shipped | #922 (eb371ca6) |
+| 6E-2d — §7.1 6-step quiescence barrier on `dynamicWrappedProposer.Propose` + `ShardGroup` barrier forwarders + `CutoverBarrierController` option + state-machine in `EnableRaftEnvelope` handler (gated behind `raftEnvelopeWrapEnabled = false`; flipped in 6E-2f) | shipped | this PR |
+| 6E-2e — `main.go` wiring: `OpenConfig.RaftCipher` + `RaftCutoverIndex` → `CutoverBarrierController` implementation fanning out over participating `ShardGroup`s. **BLOCKER (a):** route admin RPCs (RotateDEK, RegisterEncryptionWriter) through the wrap-aware proposer so post-cutover admin entries are wrapped — the raw-engine ProposeAdmin path leaves cleartext admin entries at `index > cutoverIdx` and §6.3 halts the cluster (codex P1 #1 round-2 on PR933). **BLOCKER (b):** auto-install the wrap on every replica's FSM-apply of the cutover marker so a leader failover between cutover commit and `InstallWrap` doesn't admit cleartext writes on the newly-elected leader (codex P1 round-3 on PR933). Both blockers MUST land before 6E-2f flips the gate. | not started | — |
+| 6E-2f — atomic flip of `raftEnvelopeWrapEnabled` to `true` (the §3.3 6E-1b gate release) | not started | — |
 | 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | not started | — |
 
 With 6E-1 (both sub-milestones) complete, the wire-format and
