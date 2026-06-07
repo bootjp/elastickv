@@ -2260,14 +2260,23 @@ func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) 
 	}
 }
 
-// TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnProposeError
-// pins the §7.1 step-6 deferred-cleanup invariant: if step-3
-// (ProposeAdmin) errors, the handler MUST still call End() so the
-// barrier closes and user writes resume. A regression that returned
-// early without End would brick the cluster — every coordinator
-// would see ErrEnvelopeCutoverInProgress forever, and a retry of
-// EnableRaftEnvelope would block on the cutoverSem.
-func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnProposeError(t *testing.T) {
+// TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError
+// pins the codex P1 round-4 ambiguous-propose-outcome invariant on
+// PR933: if proposeRaftCutoverEntry returns an error, the
+// underlying etcd engine cannot retract a rawNode.Propose that has
+// already been submitted to Raft. The handler therefore CANNOT
+// distinguish "marker never reached Raft" from "marker submitted,
+// outcome unknown" and MUST treat every propose-side error as the
+// latter — leaving the barrier OPEN so a marker that subsequently
+// commits cluster-wide cannot brick the §6.3 strict-`>` unwrap
+// hook by letting cleartext user proposals land at
+// `index > cutoverIdx`.
+//
+// Trade-off: a propose error that definitively was rejected before
+// submission (ErrNotLeader transient) leaves this leader's barrier
+// stuck until restart — recoverable by operator action — but the
+// cluster-brick alternative is not.
+func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError(t *testing.T) {
 	withWrapEnabledForTest(t)
 	path := cutoverReadySidecarFixture(t)
 	proposer := &recordingProposer{err: errors.New("engine refused")}
@@ -2284,10 +2293,19 @@ func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnProposeError(t *testing.T
 	if err == nil {
 		t.Fatal("EnableRaftEnvelope: want error from propose-failure, got nil")
 	}
-	// Order is Begin → WaitDrained → End (propose errored, no InstallWrap)
-	wantOrder := []string{"Begin", "WaitDrained", "End"}
-	if !equalStrings(barrier.order, wantOrder) {
-		t.Errorf("barrier call order = %v, want %v (End MUST run on propose error)", barrier.order, wantOrder)
+	for _, op := range barrier.order {
+		if op == "End" {
+			t.Errorf("End was called after propose error; order = %v; this releases the barrier across an ambiguous commit window (codex P1 round-4)", barrier.order)
+		}
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap MUST NOT run on propose error; order = %v", barrier.order)
+		}
+	}
+	// Sequence reached Begin and WaitDrained, then propose
+	// errored. InstallWrap and End must not run.
+	wantPrefix := []string{"Begin", "WaitDrained"}
+	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
+		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
 	}
 }
 
@@ -2500,28 +2518,20 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError(t
 		recordingProposer: recordingProposer{commitIndex: 4242},
 		sidecarPath:       path,
 		applyFn: func(sc *encryption.Sidecar, raftIdx uint64) {
-			// Apply the cutover as fresh-success first (mirrors
-			// what the real applier would do), then corrupt the
-			// sidecar on disk so the handler's subsequent
-			// re-read fails. Truncating to an empty file makes
-			// ReadSidecar return a decode error (json.Unmarshal
-			// of an empty buffer fails).
+			// Apply the cutover as fresh-success (mirrors what the
+			// real applier does on the no-race path). The
+			// post-write sidecar corruption is handled by the
+			// postProposeCorruptingProposer wrapper below, not
+			// here — applyFn only sees the sc value pre-write, so
+			// we can't reach the on-disk file from this hook.
 			applyRaftCutover(sc, raftIdx)
-			// Note: applyingProposer.Propose will WriteSidecar
-			// the modified sc AFTER this callback returns, so we
-			// truncate AFTER that write by scheduling a cleanup
-			// that runs after Propose returns but before
-			// runRaftEnvelopeCutoverBarrier's re-read. The
-			// cleanest way: corrupt the file from a separate
-			// goroutine triggered by the apply callback.
 		},
 	}
-	// Use a recordingProposer wrapper that corrupts the sidecar
-	// after writing the fresh-success state. The simplest shape:
-	// after applyingProposer.Propose writes the sidecar, replace
-	// the file contents with an empty byte slice via a deferred
-	// callback. We accomplish that with a custom proposer that
-	// composes applyingProposer with a post-apply corrupt step.
+	// postProposeCorruptingProposer composes applyingProposer and
+	// truncates the sidecar on disk after applyingProposer.Propose
+	// returns, simulating an I/O fault (or filesystem corruption)
+	// in the narrow window between the cutover apply and the
+	// handler's post-apply sidecar re-read.
 	corruptingProposer := &postProposeCorruptingProposer{
 		inner:       proposer,
 		sidecarPath: path,

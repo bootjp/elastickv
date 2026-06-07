@@ -1291,17 +1291,34 @@ func (s *EncryptionAdminServer) runRaftEnvelopeCutoverBarrier(ctx context.Contex
 		return 0, classifyCutoverCtxErr(err, "encryption: §7.1 step-2 drain wait", codes.Unavailable)
 	}
 
+	// Codex P1 round-4 on PR933 — keep the barrier closed across
+	// ambiguous propose outcomes. proposeRaftCutoverEntry calls
+	// raftengine.Proposer.ProposeAdmin, which submits to
+	// rawNode.Propose and then waits on a pending response. If ctx
+	// fires AFTER the engine submitted the marker to Raft but
+	// BEFORE the local apply resolves it, ProposeAdmin returns an
+	// error even though the marker may still commit cluster-wide.
+	// The etcd engine's cancellation path
+	// (internal/raftengine/etcd/engine.go) removes the pending
+	// response but cannot retract the rawNode.Propose submission.
+	// Treating any propose-side error as "marker never reached
+	// Raft" would release the barrier; if the marker subsequently
+	// commits on every other replica, user proposals admitted
+	// after End() would land at indexes > cutoverIdx in cleartext
+	// and halt the cluster on the §6.3 strict-`>` unwrap hook.
+	//
+	// Flip releaseSafe to false BEFORE the propose so any error
+	// path leaves the barrier open. The cost is a false-positive
+	// barrier-stuck state on errors that DID definitively reject
+	// before submission (ErrNotLeader transients, etc.) — that's
+	// recoverable by operator restart of this leader; the cluster-
+	// brick scenario is not.
+	releaseSafe = false
+
 	proposedIdx, err := s.proposeRaftCutoverEntry(ctx, preSidecar, req)
 	if err != nil {
 		return 0, err
 	}
-
-	// Cutover entry is now committed in Raft. From this point on,
-	// releasing the barrier without installing the wrap closure is
-	// unsafe (see the function comment). Flip releaseSafe to false
-	// before any operation that might error; flip back to true only
-	// after InstallWrap completes.
-	releaseSafe = false
 
 	if err := s.awaitCutoverApply(ctx, proposedIdx); err != nil {
 		return 0, err
