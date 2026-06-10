@@ -440,6 +440,159 @@ func TestDynamoDB_TransactGetItems(t *testing.T) {
 	assert.Empty(t, out.Responses[2].Item)
 }
 
+// postDynamoRaw issues a single, non-retried DynamoDB HTTP request and returns
+// the status code and body. The AWS SDK retries 5xx responses, which would
+// obscure the single lease-read failure under test, so the lease-failure cases
+// drive the wire directly.
+func postDynamoRaw(t *testing.T, address, target, body string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"http://"+address+"/",
+		strings.NewReader(body),
+	)
+	require.NoError(t, err)
+	req.Header.Set("X-Amz-Target", target)
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, string(respBody)
+}
+
+// wrapDynamoCoordinator swaps in a testCoordinatorWrapper around the node's
+// coordinator and restores the original on cleanup, so lease-read failures can
+// be injected for the read handlers.
+func wrapDynamoCoordinator(t *testing.T, node *Node) *testCoordinatorWrapper {
+	t.Helper()
+	orig := node.dynamoServer.coordinator
+	wrapped := &testCoordinatorWrapper{inner: orig}
+	node.dynamoServer.coordinator = wrapped
+	t.Cleanup(func() {
+		node.dynamoServer.coordinator = orig
+	})
+	return wrapped
+}
+
+func TestDynamoDB_Query_LeaseRead(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	client := newDynamoTestClient(t, nodes[0].dynamoAddress)
+	ctx := context.Background()
+	createSimpleKeyTable(t, ctx, client)
+	_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: "k1"},
+			"value": &types.AttributeValueMemberS{Value: "v1"},
+		},
+	})
+	require.NoError(t, err)
+
+	wrapped := wrapDynamoCoordinator(t, &nodes[0])
+
+	// Healthy lease: the query succeeds and returns the item.
+	out, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("t"),
+		KeyConditionExpression: aws.String("#k = :k"),
+		ExpressionAttributeNames: map[string]string{
+			"#k": "key",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":k": &types.AttributeValueMemberS{Value: "k1"},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, out.Items, 1)
+
+	// Lease-read failure surfaces as the same InternalServerError getItem
+	// produces. Drive the wire directly so the SDK does not retry the 500.
+	wrapped.failLeaseReads.Store(true)
+	status, respBody := postDynamoRaw(t, nodes[0].dynamoAddress, queryTarget,
+		`{"TableName":"t","KeyConditionExpression":"#k = :k",`+
+			`"ExpressionAttributeNames":{"#k":"key"},`+
+			`"ExpressionAttributeValues":{":k":{"S":"k1"}}}`)
+	require.Equal(t, http.StatusInternalServerError, status)
+	require.Contains(t, respBody, dynamoErrInternal)
+}
+
+func TestDynamoDB_Scan_LeaseRead(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	client := newDynamoTestClient(t, nodes[0].dynamoAddress)
+	ctx := context.Background()
+	createSimpleKeyTable(t, ctx, client)
+	_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: "k1"},
+			"value": &types.AttributeValueMemberS{Value: "v1"},
+		},
+	})
+	require.NoError(t, err)
+
+	wrapped := wrapDynamoCoordinator(t, &nodes[0])
+
+	// Healthy lease: the scan succeeds and returns the item.
+	out, err := client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String("t")})
+	require.NoError(t, err)
+	require.Len(t, out.Items, 1)
+
+	// Lease-read failure surfaces as the same InternalServerError getItem
+	// produces.
+	wrapped.failLeaseReads.Store(true)
+	status, respBody := postDynamoRaw(t, nodes[0].dynamoAddress, scanTarget, `{"TableName":"t"}`)
+	require.Equal(t, http.StatusInternalServerError, status)
+	require.Contains(t, respBody, dynamoErrInternal)
+}
+
+func TestDynamoDB_TransactGetItems_LeaseRead(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	client := newDynamoTestClient(t, nodes[0].dynamoAddress)
+	ctx := context.Background()
+	createSimpleKeyTable(t, ctx, client)
+	_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: "k1"},
+			"value": &types.AttributeValueMemberS{Value: "v1"},
+		},
+	})
+	require.NoError(t, err)
+
+	wrapped := wrapDynamoCoordinator(t, &nodes[0])
+
+	// Healthy lease: the transaction reads the item at a single snapshot.
+	out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{
+		TransactItems: []types.TransactGetItem{
+			{Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{"key": &types.AttributeValueMemberS{Value: "k1"}}}},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, out.Responses, 1)
+	v1, ok := out.Responses[0].Item["value"].(*types.AttributeValueMemberS)
+	require.True(t, ok)
+	require.Equal(t, "v1", v1.Value)
+
+	// Lease-read failure surfaces as the same InternalServerError getItem
+	// produces, before the single snapshot timestamp is resolved.
+	wrapped.failLeaseReads.Store(true)
+	status, respBody := postDynamoRaw(t, nodes[0].dynamoAddress, transactGetItemsTarget,
+		`{"TransactItems":[{"Get":{"TableName":"t","Key":{"key":{"S":"k1"}}}}]}`)
+	require.Equal(t, http.StatusInternalServerError, status)
+	require.Contains(t, respBody, dynamoErrInternal)
+}
+
 func TestDynamoDB_TransactGetItems_ValidationErrors(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -1792,12 +1945,20 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 	require.Equal(t, "closed", guardStatus.Value)
 }
 
+// errInjectedLeaseRead is the failure injected by testCoordinatorWrapper when
+// failLeaseReads is set, standing in for quorum loss on the lease-read path.
+var errInjectedLeaseRead = errors.New("injected lease-read failure")
+
 type testCoordinatorWrapper struct {
 	inner kv.Coordinator
 
 	failTxnDispatches atomic.Int32
 	injectedFailures  atomic.Int32
 	txnDispatches     atomic.Int32
+
+	// failLeaseReads, when true, makes LeaseRead / LeaseReadForKey return
+	// errInjectedLeaseRead instead of delegating, simulating quorum loss.
+	failLeaseReads atomic.Bool
 
 	blockEntered chan struct{}
 	blockRelease chan struct{}
@@ -1860,9 +2021,15 @@ func (w *testCoordinatorWrapper) LinearizableRead(ctx context.Context) (uint64, 
 }
 
 func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) {
+	if w.failLeaseReads.Load() {
+		return 0, errInjectedLeaseRead
+	}
 	return kv.LeaseReadThrough(w.inner, ctx)
 }
 
 func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	if w.failLeaseReads.Load() {
+		return 0, errInjectedLeaseRead
+	}
 	return kv.LeaseReadForKeyThrough(w.inner, ctx, key)
 }
