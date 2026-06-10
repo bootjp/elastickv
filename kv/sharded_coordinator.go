@@ -24,6 +24,14 @@ type ShardGroup struct {
 	Store  store.MVCCStore
 	Txn    Transactional
 	lease  leaseState
+	// lp caches the Engine's optional LeaseProvider capability so the
+	// groupLeaseRead / maybeRefresh hot paths test a single field for
+	// nil instead of performing an interface type assertion per call.
+	// NewShardedCoordinator resolves it once for every group it owns; it
+	// is nil when the Engine does not implement raftengine.LeaseProvider.
+	// Engine is not reassigned after the coordinator is constructed, so
+	// the cached value stays valid.
+	lp raftengine.LeaseProvider
 	// raftPayloadWrap is the Stage 6E-2c hot-swap point for the raft
 	// envelope wrap closure. A nil load means the wrap is inactive
 	// and proposals pass through cleartext (the Stage 3 default).
@@ -283,11 +291,10 @@ func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start monoc
 	if resp == nil || resp.CommitIndex == 0 {
 		return
 	}
-	lp, ok := t.g.Engine.(raftengine.LeaseProvider)
-	if !ok {
+	if t.g.lp == nil {
 		return
 	}
-	t.g.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
+	t.g.lease.extend(start.Add(t.g.lp.LeaseDuration()), expectedGen)
 }
 
 // Close forwards to the wrapped Transactional if it implements
@@ -577,10 +584,14 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 			}
 		}
 		router.Register(gid, g.Txn, g.Store)
+		// Resolve the optional LeaseProvider capability once so
+		// groupLeaseRead / maybeRefresh test g.lp for nil instead of
+		// re-asserting the interface per call.
 		// Per-shard leader-loss hook: when this group's engine notices
 		// a state transition out of leader, drop the lease so the next
 		// LeaseReadForKey on that shard takes the slow path.
 		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
+			g.lp = lp
 			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(g.lease.invalidate))
 		}
 	}
@@ -1547,10 +1558,15 @@ func observeLeaseRead(observer LeaseReadObserver, hit bool) {
 
 func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
 	engine := engineForGroup(g)
-	lp, ok := engine.(raftengine.LeaseProvider)
-	if !ok {
+	// g.lp caches the LeaseProvider assertion done once at construction
+	// (NewShardedCoordinator); a nil group or an engine without the
+	// capability falls through to the linearizable slow path. The nil-g
+	// guard preserves engineForGroup's nil-safety since g.lp would panic
+	// on a nil receiver.
+	if g == nil || g.lp == nil {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
+	lp := g.lp
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
 		return linearizableReadEngineCtx(ctx, engine)

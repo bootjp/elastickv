@@ -120,6 +120,11 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	for _, opt := range opts {
 		opt(c)
 	}
+	// Resolve the optional LeaseProvider capability once here so the
+	// LeaseRead / refreshLeaseAfterDispatch hot paths test a cached
+	// field instead of repeating the interface type assertion per call.
+	// engine is never reassigned after construction, so the cached value
+	// stays valid for the Coordinate's lifetime.
 	// Register a leader-loss hook so the lease is invalidated the instant
 	// the engine notices a state transition out of the leader role,
 	// rather than waiting for wall-clock expiry of the current lease.
@@ -128,6 +133,7 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	// one-shot tools) MUST call Close() to avoid leaking a closure
 	// pointing into this Coordinate.
 	if lp, ok := engine.(raftengine.LeaseProvider); ok {
+		c.lp = lp
 		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(c.lease.invalidate)
 	}
 	return c
@@ -169,10 +175,18 @@ type CoordinateResponse struct {
 type Coordinate struct {
 	transactionManager Transactional
 	engine             raftengine.Engine
-	clock              *HLC
-	connCache          GRPCConnCache
-	log                *slog.Logger
-	lease              leaseState
+	// lp caches the engine's optional LeaseProvider capability so the
+	// LeaseRead hot path (and refreshLeaseAfterDispatch) test a single
+	// field for nil instead of performing an interface type assertion on
+	// every call. It is set once in NewCoordinatorWithEngine and is nil
+	// when the engine does not implement raftengine.LeaseProvider. The
+	// engine field is never reassigned after construction, so this stays
+	// in sync without a lock.
+	lp        raftengine.LeaseProvider
+	clock     *HLC
+	connCache GRPCConnCache
+	log       *slog.Logger
+	lease     leaseState
 	// deregisterLeaseCb removes the leader-loss callback registered
 	// against engine at construction. Long-lived Coordinates don't
 	// need to call it (the engine will be closed after them), but
@@ -599,11 +613,10 @@ func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err err
 	if resp == nil || resp.CommitIndex == 0 {
 		return
 	}
-	lp, ok := c.engine.(raftengine.LeaseProvider)
-	if !ok {
+	if c.lp == nil {
 		return
 	}
-	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()), expectedGen)
+	c.lease.extend(dispatchStart.Add(c.lp.LeaseDuration()), expectedGen)
 }
 
 func (c *Coordinate) IsLeader() bool {
@@ -716,8 +729,8 @@ func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint
 // Callers that resolve timestamps via store.LastCommitTS may discard
 // the value.
 func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
-	lp, ok := c.engine.(raftengine.LeaseProvider)
-	if !ok {
+	lp := c.lp
+	if lp == nil {
 		return c.LinearizableRead(ctx)
 	}
 	leaseDur := lp.LeaseDuration()
