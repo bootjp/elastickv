@@ -150,22 +150,17 @@ go run . \
   --raftId "n1"
 ```
 
+`etcd` is the only supported engine; `--raftEngine` accepts no other value.
 Elastickv writes a `raft-engine` marker into each Raft data directory and refuses
-to reopen a directory with a different backend. Do not point the default etcd
-runtime at an existing HashiCorp Raft directory, or vice versa. Use
-`--raftEngine hashicorp` only for legacy clusters that have not migrated yet.
+to reopen a directory with a different backend. A node also refuses to start on a
+directory that still holds legacy HashiCorp Raft artifacts (`raft.db`).
 
-For existing stores, seed a fresh etcd data dir with the offline migrator:
-
-```bash
-go run ./cmd/etcd-raft-migrate \
-  --fsm-store /var/lib/elastickv/n1/fsm.db \
-  --dest /var/lib/elastickv-etcd/n1 \
-  --peers n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053
-```
-
-The full cutover procedure, validation, and rollback constraints are documented
-in `docs/etcd_raft_migration_operations.md`.
+The legacy HashiCorp Raft backend and its offline migrator
+(`cmd/etcd-raft-migrate`) were removed in commit `a35245a` once the one-time
+migration to `etcd/raft` was complete. If you still need to migrate an old
+HashiCorp-backed store, retrieve the migrator from git history at the commit
+before `a35245a` (`git show a35245a^:cmd/etcd-raft-migrate/main.go`). See
+`docs/etcd_raft_migration_operations.md` for the historical procedure.
 
 ### Starting the Client
 
