@@ -243,11 +243,12 @@ type RedisServer struct {
 	// retryable write error, list-push retries reuse the failed attempt's
 	// write set and carry prev_commit_ts so the FSM can dedup a commit that
 	// landed under leadership churn (see
-	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md). It
-	// MUST stay off until every node runs a probe-aware binary — see R5
-	// (FSM determinism across a rolling upgrade). Default off; enabled via
-	// WithOnePhaseTxnDedup / the ELASTICKV_REDIS_ONEPHASE_DEDUP env var
-	// after a full rollout.
+	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md). The
+	// FSM probe ships on every node in production, satisfying R5 (FSM
+	// determinism across a rolling upgrade), so the gate now defaults on
+	// per docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+	// Set ELASTICKV_REDIS_ONEPHASE_DEDUP=0 (or WithOnePhaseTxnDedup(false))
+	// to opt out — kept as a one-env-var operator rollback.
 	onePhaseTxnDedup bool
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
@@ -255,9 +256,12 @@ type RedisServer struct {
 
 type RedisServerOption func(*RedisServer)
 
-// WithOnePhaseTxnDedup enables the option-2 one-phase idempotency dedup on
-// list-push retries (see RedisServer.onePhaseTxnDedup). Off by default;
-// enable only after the whole cluster runs a probe-aware binary.
+// WithOnePhaseTxnDedup enables (or disables) the option-2 one-phase
+// idempotency dedup on list-push, MULTI/EXEC, and standalone-write retries
+// (see RedisServer.onePhaseTxnDedup). On by default since the rollout
+// recorded in docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md;
+// pass false to opt out from code, or set ELASTICKV_REDIS_ONEPHASE_DEDUP=0
+// to opt out from the environment. The constructor option trumps the env var.
 func WithOnePhaseTxnDedup(enabled bool) RedisServerOption {
 	return func(r *RedisServer) {
 		r.onePhaseTxnDedup = enabled
@@ -495,11 +499,13 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		// getLuaPool, which honors luaPoolMaxIdle the same way.
 		luaPool:       nil,
 		traceCommands: os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
-		// onePhaseTxnDedup honors the documented opt-in env var; the
-		// WithOnePhaseTxnDedup option below can still override either way.
-		// Default off — see R5 in the design doc (the writer must not be
-		// enabled until the whole cluster runs a probe-aware binary).
-		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") == "1",
+		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
+		// constraint is discharged (FSM probe shipped on every node months ago,
+		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).
+		// See docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+		// ELASTICKV_REDIS_ONEPHASE_DEDUP=0 opts out; the WithOnePhaseTxnDedup
+		// constructor option still trumps the env var.
+		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") != "0",
 		baseCtx:          baseCtx,
 		baseCancel:       baseCancel,
 		streamWaiters:    newKeyWaiterRegistry(),
