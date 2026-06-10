@@ -1165,21 +1165,36 @@ func validateEnableRaftEnvelopePayload(p fsmwire.RotationPayload) error {
 //     writer-registry layout is per-(DEK_id, NodeID) so storage
 //     and raft registrations are independent rows.
 //
-// Outcomes and FSM-level treatment match the storage variant:
+// Outcomes and FSM-level treatment match the storage variant.
+// The CHECK ORDER differs from the storage variant though
+// (codex P1 round-1 on PR944): the raft path tests
+// RaftEnvelopeCutoverIndex != 0 BEFORE the stale-DEK check so
+// FSM replay of the original cutover marker after a later
+// RotateDEK lands on the already-active branch (which republishes
+// the wrap closure via raftCutoverWrapInstaller) rather than the
+// stale-DEK no-op (which does NOT install). The storage variant
+// has no installer hook so the order swap is unnecessary there.
 //
 //   - Malformed payload — halt-apply via ErrEncryptionApply.
-//   - Stale DEKID (RotateDEK raced between propose and apply) —
-//     benign no-op, advance RaftAppliedIndex only.
-//   - Already active (duplicate cutover entry) — idempotent;
-//     preserve original RaftEnvelopeCutoverIndex, advance
-//     RaftAppliedIndex only.
+//   - Already active (duplicate cutover entry, OR FSM replay of
+//     the original marker after RotateDEK advanced Active.Raft) —
+//     idempotent; preserve original RaftEnvelopeCutoverIndex,
+//     advance RaftAppliedIndex only, invoke installer with
+//     sc.Active.Raft so the wrap is keyed to the current DEK on
+//     every replica.
+//   - Stale DEKID (RotateDEK raced between propose and apply AND
+//     RaftEnvelopeCutoverIndex == 0, i.e. cutover never took
+//     effect) — benign no-op, advance RaftAppliedIndex only.
+//     Installer is NOT invoked: no cutover took effect, so
+//     publishing a wrap closure would be incorrect.
 //   - Fresh success — register proposer FIRST, then set
 //     RaftEnvelopeCutoverIndex and advance RaftAppliedIndex
 //     inside one WriteSidecar fsync. The registration-before-
 //     sidecar ordering matches the storage variant's
 //     crash-recovery invariant (§4.1 case 2-idempotent re-runs
 //     are safe; the sidecar flip is the last observable
-//     side-effect).
+//     side-effect). Installer is invoked with sc.Active.Raft
+//     after the sidecar write completes.
 //
 // Stage 6E-1 deliberately does NOT activate the §6.3 engine
 // apply-hook unwrap or the coordinator wrap-on-propose switch
@@ -1208,27 +1223,45 @@ func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayl
 	if err != nil {
 		return errors.Wrap(err, "applier: read sidecar for enable-raft-envelope")
 	}
+	// Stage 6E-1 constraint #4 (idempotency) — ordered BEFORE the
+	// stale-DEK check so an FSM replay of the original cutover
+	// marker after a successful cutover + later RotateDEK reaches
+	// the already-active branch and republishes the wrap. With the
+	// reverse order, a replayed payload whose p.DEKID predates the
+	// rotation would be treated as a stale-DEK no-op, the wrap
+	// would never be installed in this process, and a freshly-
+	// elected leader on this node would admit cleartext writes
+	// above the cutover index (codex P1 round-1 on PR944).
+	//
+	// The already-active branch preserves the original
+	// RaftEnvelopeCutoverIndex; only RaftAppliedIndex advances so
+	// the duplicate entry is not replayed again. Non-zero
+	// RaftEnvelopeCutoverIndex IS the "already-active" signal (no
+	// separate bool flag).
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		advanceRaftAppliedIndex(sc, raftIdx)
+		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+			return errors.Wrap(err, "applier: write sidecar for already-active raft-cutover no-op")
+		}
+		// Installer takes the CURRENT sc.Active.Raft, NOT the
+		// replayed p.DEKID — the wrap closure must key to the
+		// active DEK on this node so the §6.3 strict-`>` hook
+		// unwraps with the same key on every replica (gemini
+		// medium #1 on PR944).
+		return a.invokeRaftCutoverWrapInstaller(sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, "already-active replay")
+	}
 	// Stage 6E-1 constraint #3 — DEKID stale at apply (RotateDEK
-	// raced). Benign no-op: consume the entry without halting
-	// and without flipping the cutover field.
+	// raced between propose and apply, AND the cutover never
+	// took effect — RaftEnvelopeCutoverIndex==0 is the gate above
+	// that distinguishes the genuine race from a replay). Benign
+	// no-op: consume the entry without halting and without
+	// flipping the cutover field.
 	if p.DEKID != sc.Active.Raft {
 		advanceRaftAppliedIndex(sc, raftIdx)
 		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 			return errors.Wrap(err, "applier: write sidecar for stale-dekid raft-cutover no-op")
 		}
 		return nil
-	}
-	// Stage 6E-1 constraint #4 — idempotency. Preserve the
-	// original RaftEnvelopeCutoverIndex; only advance the generic
-	// RaftAppliedIndex so the duplicate entry is not replayed.
-	// Non-zero RaftEnvelopeCutoverIndex IS the "already-active"
-	// signal (no separate bool flag).
-	if sc.RaftEnvelopeCutoverIndex != 0 {
-		advanceRaftAppliedIndex(sc, raftIdx)
-		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-			return errors.Wrap(err, "applier: write sidecar for already-active raft-cutover no-op")
-		}
-		return a.invokeRaftCutoverWrapInstaller(sc.RaftEnvelopeCutoverIndex, p.DEKID, "already-active replay")
 	}
 	// Fresh successful apply. Crash-recovery ordering follows
 	// the storage variant: ApplyRegistration runs BEFORE
@@ -1268,7 +1301,11 @@ func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayl
 	// first) would leave the wrap published but the sidecar
 	// pre-cutover on crash, breaking the equality the §6.3 hook
 	// relies on cluster-wide.
-	return a.invokeRaftCutoverWrapInstaller(raftIdx, p.DEKID, "fresh-success apply")
+	// Installer takes sc.Active.Raft (which equals p.DEKID here
+	// because the stale-DEK check above passed) for documentation
+	// clarity and to match the already-active branch's argument
+	// shape (gemini medium #2 on PR944).
+	return a.invokeRaftCutoverWrapInstaller(raftIdx, sc.Active.Raft, "fresh-success apply")
 }
 
 // invokeRaftCutoverWrapInstaller is the Stage 6E-2e-1 dispatch

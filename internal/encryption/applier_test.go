@@ -2638,6 +2638,90 @@ func TestApplyRotation_EnableRaftEnvelope_AlreadyActive_InvokesInstaller(t *test
 	}
 }
 
+// TestApplyRotation_EnableRaftEnvelope_AlreadyActive_StaleDEKReplay_InvokesInstaller
+// pins the codex P1 invariant on PR944: an FSM replay of the
+// original cutover marker AFTER a successful cutover AND a
+// subsequent RotateDEK MUST hit the already-active branch (which
+// invokes the installer), NOT the stale-DEK no-op branch. This is
+// the exact replay-safety path the installer hook is meant to
+// repair.
+//
+// Scenario:
+//  1. Original cutover applied at index N with DEK D1 (Active.Raft=D1).
+//     Installer fires, RaftEnvelopeCutoverIndex=N.
+//  2. RotateDEK advances Active.Raft from D1 to D2.
+//  3. Process restarts. Snapshot didn't include the cutover entry,
+//     so FSM replay re-applies it. Replay carries p.DEKID=D1, but
+//     sidecar.Active.Raft is now D2.
+//  4. Order MUST be: check RaftEnvelopeCutoverIndex != 0 FIRST → hit
+//     the already-active branch → installer fires with sc.Active.Raft
+//     (D2). Reversed order (stale-DEK first) short-circuits at
+//     p.DEKID != D2 and the wrap is never re-installed in this
+//     process — a freshly-elected leader on this node would admit
+//     cleartext proposals above the cutover index and brick the §6.3
+//     strict-`>` apply hook on every replica.
+func TestApplyRotation_EnableRaftEnvelope_AlreadyActive_StaleDEKReplay_InvokesInstaller(t *testing.T) {
+	t.Parallel()
+	_, sidecarPath := bootstrappedDir(t)
+	app, rec := newCutoverApplierWithInstaller(t, sidecarPath)
+
+	const originalCutoverIdx uint64 = 500
+	if err := app.ApplyRotation(originalCutoverIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("original cutover: %v", err)
+	}
+	const newRaftDEKID uint32 = 99
+	if err := app.ApplyRotation(600, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                newRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte("new-raft-dek"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: newRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 2},
+	}); err != nil {
+		t.Fatalf("RotateDEK: %v", err)
+	}
+	callsBeforeReplay := len(rec.calls)
+	// FSM replay carries the ORIGINAL payload's DEKID, now stale
+	// against the post-rotate Active.Raft.
+	if err := app.ApplyRotation(700, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 3},
+	}); err != nil {
+		t.Fatalf("FSM replay of cutover marker: %v", err)
+	}
+	if got := len(rec.calls); got != callsBeforeReplay+1 {
+		t.Errorf("installer called %d times on replay, want 1 (already-active branch MUST install regardless of replayed payload's DEKID)",
+			got-callsBeforeReplay)
+	}
+	if got := rec.calls[len(rec.calls)-1].activeRaftDEKID; got != newRaftDEKID {
+		t.Errorf("installer activeRaftDEKID on replay = %d, want %d (sidecar.Active.Raft, NOT replayed p.DEKID)",
+			got, newRaftDEKID)
+	}
+	if got := rec.calls[len(rec.calls)-1].cutoverIdx; got != originalCutoverIdx {
+		t.Errorf("installer cutoverIdx on replay = %d, want %d (originally-recorded sidecar value)",
+			got, originalCutoverIdx)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.RaftEnvelopeCutoverIndex != originalCutoverIdx {
+		t.Errorf("RaftEnvelopeCutoverIndex = %d after replay, want %d",
+			sc.RaftEnvelopeCutoverIndex, originalCutoverIdx)
+	}
+	if sc.Active.Raft != newRaftDEKID {
+		t.Errorf("Active.Raft = %d after replay, want %d", sc.Active.Raft, newRaftDEKID)
+	}
+}
+
 // TestApplyRotation_EnableRaftEnvelope_StaleDEKID_SkipsInstaller
 // pins the constraint #3 contract: a stale-DEK race produces a
 // benign no-op apply that advances RaftAppliedIndex but does NOT
