@@ -161,96 +161,78 @@ func TestLeaseState_ExtendWithFreshGenSucceedsAfterInvalidate(t *testing.T) {
 	require.True(t, s.valid(now))
 }
 
-// TestLeaseState_RollbackCASUsesPointerIdentity pins the codex-P3
-// invariant: when a stale extender rolls back after a racing
-// invalidate, its rollback CAS must be gated on pointer identity, NOT
-// on the expiry-nanos value. A value-gated CAS could clobber a fresh
-// lease installed by a concurrent extender that (due to clock-
-// granularity ties) computed the same expiry.
+// TestLeaseState_StaleExtendCannotClobberFreshLeaseSameExpiry pins the
+// invariant that a stale-generation extend (a Dispatch that captured the
+// pre-invalidate generation) must never clobber a fresh lease installed
+// at a newer generation, even when both compute the SAME expiry value
+// because their monoclock samples collided at clock granularity. The
+// generation guard, not the expiry value, is what disambiguates the two
+// writers: extend stores only when its captured generation still
+// matches the live one.
 //
 // Scenario:
-//  1. Extender A captures genA = 0 and installs slot{target, gen=0}.
-//  2. invalidate fires, bumping the live slot to gen=1 with zero
-//     expiry. A's post-CAS gen check now MUST see the mismatch and
-//     attempt a rollback.
-//  3. A concurrent extender B captures genB = 1 and installs a FRESH
-//     *leaseSlot{target, gen=1} -- same target value, distinct
-//     allocation.
-//  4. A's rollback CAS runs LAST. A value-gated CAS (old impl
-//     expiryNanos.CompareAndSwap(target, 0)) would erase B's
-//     still-valid lease. A pointer-gated CAS (new impl
-//     current.CompareAndSwap(aSlot, rb)) fails because the live
-//     pointer is B's allocation, preserving B's lease.
-//
-// Simulated step-by-step (no goroutines) against internal state so
-// the ordering is deterministic. Without the fix this test fails:
-// s.valid(now) observes the rolled-back zero-expiry slot.
-func TestLeaseState_RollbackCASUsesPointerIdentity(t *testing.T) {
+//  1. Extender A captures genA = 0 (BEFORE its quorum op).
+//  2. invalidate fires (leader-loss callback), bumping gen to 1 and
+//     clearing the expiry.
+//  3. A concurrent extender B captures genB = 1 (after invalidate) and
+//     installs a fresh lease with target T.
+//  4. A's delayed extend(T, genA=0) runs LAST with the SAME target T.
+//     It must be dropped by the generation guard, leaving B's lease
+//     untouched.
+func TestLeaseState_StaleExtendCannotClobberFreshLeaseSameExpiry(t *testing.T) {
 	t.Parallel()
 	var s leaseState
 	now := monoclock.Now()
 	target := now.Add(time.Hour)
-	targetNanos := target.Nanos()
 
-	// Step 1: simulate A's CAS having already landed.
-	aSlot := &leaseSlot{expiryNanos: targetNanos, gen: 0}
-	s.current.Store(aSlot)
+	// Step 1: A captures the pre-invalidate generation.
+	genA := s.generation()
 
-	// Step 2: invalidate races in. It CAS-replaces aSlot with a
-	// zero-expiry slot at gen=1.
+	// Step 2: leader-loss invalidate fires during A's quorum op.
 	s.invalidate()
-	require.Equal(t, uint64(1), s.generation())
+	require.NotEqual(t, genA, s.generation(), "invalidate must bump the generation")
 
-	// Step 3: concurrent extender B captures genB=1 (post-invalidate)
-	// and installs a distinct *leaseSlot with the same target value.
-	// This exercises the clock-granularity tie.
-	bSlot := &leaseSlot{expiryNanos: targetNanos, gen: 1}
-	bOld := s.current.Load()
-	require.True(t, s.current.CompareAndSwap(bOld, bSlot),
-		"B's CAS install must succeed in this simulated ordering")
+	// Step 3: B captures the post-invalidate generation and installs a
+	// fresh lease with the exact same target value A will compute.
+	genB := s.generation()
+	s.extend(target, genB)
 	require.True(t, s.valid(now), "B's fresh lease must be valid")
+	expiryAfterB := s.expiryNanos.Load()
 
-	// Step 4: A's delayed rollback runs. The fix is that rollback is
-	// pointer-identity CAS on aSlot, which fails here because the
-	// live pointer is bSlot (even though bSlot.expiryNanos equals
-	// aSlot.expiryNanos).
-	rb := &leaseSlot{expiryNanos: 0, gen: 1}
-	swapped := s.current.CompareAndSwap(aSlot, rb)
-	require.False(t, swapped,
-		"pointer-identity rollback must NOT clobber a fresh lease that happened to compute the same expiry value")
+	// Step 4: A's delayed extend with the stale generation and the same
+	// target. The generation guard must drop it.
+	s.extend(target, genA)
 
-	// Invariant: B's lease is still live.
 	require.True(t, s.valid(now),
-		"fresh lease with matching expiry must survive a stale extender's rollback")
-	require.Equal(t, bSlot, s.current.Load(),
-		"live slot must still be B's allocation, unchanged")
+		"fresh lease with matching expiry must survive a stale extender's write")
+	require.Equal(t, expiryAfterB, s.expiryNanos.Load(),
+		"stale-generation extend must not overwrite the live expiry, even with an equal value")
 }
 
-// TestLeaseState_RollbackCASClearsOwnSlot is the positive control:
-// when NO concurrent extender has replaced A's slot, A's rollback
-// DOES clear it (because the live pointer is still aSlot). Exercises
-// the happy path for the rollback branch inside extend.
-func TestLeaseState_RollbackCASClearsOwnSlot(t *testing.T) {
+// TestLeaseState_StaleExtendAfterInvalidateIsNoop is the negative
+// control: when a stale-generation extend races an invalidate and NO
+// concurrent fresh extender re-warms the lease, the lease stays cleared.
+// A re-entered caller that captures the post-invalidate generation can
+// then warm and clear it normally.
+func TestLeaseState_StaleExtendAfterInvalidateIsNoop(t *testing.T) {
 	t.Parallel()
 	var s leaseState
 	now := monoclock.Now()
 
 	// Caller pattern: sample generation, then quorum op races with
-	// invalidate, then extend. extend sees the gen advance in its
-	// post-CAS recheck and rolls back its own freshly-installed slot.
+	// invalidate, then extend with the now-stale generation.
 	expectedGen := s.generation()
 	s.invalidate() // concurrent leader-loss during the quorum op
 
-	// extend with the pre-invalidate generation. Internal flow:
-	// pre-CAS gate observes gen mismatch and returns WITHOUT
-	// installing any slot. The invalidate's zero-slot remains.
+	// extend with the pre-invalidate generation: the guard sees the
+	// mismatch and drops the write. The invalidate's cleared state
+	// remains.
 	s.extend(now.Add(time.Hour), expectedGen)
 	require.False(t, s.valid(now),
 		"pre-invalidate extend must not resurrect the lease")
 
-	// Separately, run the actual extend race: sample a FRESH gen
-	// (simulating a caller that re-entered after invalidate), install
-	// a lease, then invalidate, then verify clearing.
+	// A re-entered caller samples a FRESH generation, warms the lease,
+	// then a later invalidate clears it.
 	freshGen := s.generation()
 	s.extend(now.Add(time.Hour), freshGen)
 	require.True(t, s.valid(now))
@@ -299,4 +281,37 @@ func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 	close(stop)
 	<-done
 	<-done
+}
+
+// BenchmarkLeaseStateExtend pins the zero-allocation acceptance
+// criterion for the write path. Every successful extend installs a new
+// expiry; the int64-atomic layout must not heap-allocate (the previous
+// pointer-swap design allocated one slot per call, 1:1 with Dispatch
+// throughput). Run with -benchmem; allocs/op MUST be 0.
+//
+// Each iteration advances the target by 1ns so the monotonic gate
+// always takes the store branch (the worst case for allocation), rather
+// than short-circuiting on a non-increasing target.
+func BenchmarkLeaseStateExtend(b *testing.B) {
+	var s leaseState
+	base := monoclock.Now()
+	gen := s.generation()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.extend(base.Add(time.Duration(i+1)), gen)
+	}
+}
+
+// BenchmarkLeaseStateValid pins the hot read path: a single atomic load
+// and comparison, zero allocations.
+func BenchmarkLeaseStateValid(b *testing.B) {
+	var s leaseState
+	now := monoclock.Now()
+	s.extend(now.Add(time.Hour), s.generation())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = s.valid(now)
+	}
 }
