@@ -80,7 +80,8 @@ profile that produced the parent design's trigger anomaly. M4 is met.
 
 The control workflow (`jepsen-test-scheduled.yml`, gate off) continues
 to surface `:duplicate-elements` and the related real-time cycle
-anomalies as expected; the 2026-06-05 18:37 failure ([#937]) is the
+anomalies as expected; the 2026-06-05 18:37 failure
+([#937](https://github.com/bootjp/elastickv/issues/937)) is the
 most recent observation. The control's purpose ends when default-on
 lands — see *§Control workflow disposition* below.
 
@@ -109,6 +110,37 @@ constructor-level override and trumps the env var either way.
 Comment and `WithOnePhaseTxnDedup`'s godoc are updated to describe the
 new default; the in-file pointer to R5 stays (now reframed as "the
 ordering constraint that authorized this default flip").
+
+### M1a — Carve out standalone `SET` behind a separate sub-gate
+
+PR #943 round-1 codex P1 flagged that `txnContext.applySet`
+(`adapter/redis.go:2356-2360`) returns `WRONGTYPE` when the existing
+key is a list/hash/set/zset/stream, while the legacy `setLegacy` →
+`executeSet` → `replaceWithStringTxn` path correctly deletes the
+collection's logical elements and writes the string. Real Redis lets
+`SET k v` overwrite any existing type unconditionally; flipping
+`onePhaseTxnDedup` default-on therefore would have silently changed
+normal Redis overwrite behaviour for every standalone-`SET`-against-
+collection configuration.
+
+This proposal does not bring `applySet` to parity (collection-deletion
+inside the dedup txn is a larger surgery, tracked as a separate
+follow-up). Instead it introduces a dedicated sub-gate
+`RedisServer.standaloneSetDedup` (default off, opt-in via
+`WithStandaloneSetDedup(true)` or
+`ELASTICKV_REDIS_ONEPHASE_DEDUP_SET=1`). The standalone-`SET` branch
+in `set()` now requires **both** `onePhaseTxnDedup` **and**
+`standaloneSetDedup` to be true before routing through
+`runTransactionWithDedup`; the previous behaviour is preserved as the
+default. MULTI/EXEC and list-push paths (the parent design's actual
+M4-validated workloads) are unaffected.
+
+The new field, option, env var, and the regression test
+`TestRedis_SET_OverwritesList_UnderDefaultGate`
+(`adapter/redis_set_overwrite_default_test.go`) all land in this PR.
+The test seeds `RPUSH k x`, calls `SET k v`, asserts `OK` + a
+subsequent `GET` returns `v` — it fails on the pre-fix build
+(WRONGTYPE) and passes on the fixed build.
 
 ### M2 — Control workflow disposition
 
