@@ -96,7 +96,7 @@ var (
 	pprofAddr             = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
 	pprofToken            = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 	raftId                = flag.String("raftId", "", "Node id used by Raft")
-	raftEngineName        = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd|hashicorp)")
+	raftEngineName        = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
 	raftDir               = flag.String("raftDataDir", "data/", "Raft data dir")
 	redisLuaMaxIdleStates = flag.Int("redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
 	raftBootstrap         = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
@@ -1068,9 +1068,9 @@ func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSourc
 
 // dispatchMonitorSources extracts the raft engines that expose etcd
 // dispatch counters so monitoring can poll them for the hot-path
-// dashboard. Engines that do not satisfy the interface (hashicorp
-// backend today) are skipped silently; their groups simply won't
-// contribute to elastickv_raft_dispatch_* metrics.
+// dashboard. Engines that do not satisfy the interface are skipped
+// silently; their groups simply won't contribute to
+// elastickv_raft_dispatch_* metrics.
 func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchSource {
 	out := make([]monitoring.DispatchSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
