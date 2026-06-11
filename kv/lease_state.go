@@ -164,16 +164,41 @@ func (s *leaseState) extend(until monoclock.Instant, expectedGen uint64) {
 // in the future: otherwise leadership-loss callbacks would be powerless
 // once a lease is in place.
 //
+// Store order matters for the lock-free reader. valid() reads only
+// expiryNanos; generation() reads only gen. Clearing the expiry BEFORE
+// bumping the generation guarantees that the fast-path guard (valid())
+// fails closed at least as early as the generation bump becomes visible.
+// If the generation were bumped first, a reader that loaded gen and then
+// loaded expiryNanos in the window before the zero-store landed could
+// observe "new generation, old (still valid) expiry" and serve a
+// fast-path read after leadership loss was already detected. With the
+// expiry cleared first, once any reader can observe the post-invalidate
+// generation it can also observe the cleared expiry, so the fast path is
+// never served past the point invalidation began.
+//
 // extend serializes on writeMu so the two never interleave: an extend
 // either runs fully before this invalidate (and is then cleared here) or
 // fully after (and observes the bumped generation via its guard and is
-// dropped).
+// dropped). The intra-invalidate store order is invisible to a
+// mutex-serialized extend, so reordering does not weaken the extend
+// generation guard.
 func (s *leaseState) invalidate() {
 	if s == nil {
 		return
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	s.gen.Add(1)
 	s.expiryNanos.Store(0)
+	if onInvalidateBetweenStores != nil {
+		onInvalidateBetweenStores()
+	}
+	s.gen.Add(1)
 }
+
+// onInvalidateBetweenStores is a test-only hook invoked inside
+// invalidate() after the expiry has been cleared but before the
+// generation is bumped. It exists to make the intra-invalidate store
+// ordering deterministically observable so the fail-closed invariant can
+// be regression-tested; it is nil in production and adds a single
+// predictable-branch nil check to the once-per-leadership-change path.
+var onInvalidateBetweenStores func()

@@ -241,6 +241,54 @@ func TestLeaseState_StaleExtendAfterInvalidateIsNoop(t *testing.T) {
 		"invalidate after a successful extend must clear the lease")
 }
 
+// TestLeaseState_InvalidateClearsExpiryBeforeBumpingGen pins the store
+// ordering inside invalidate(): the expiry sentinel must be cleared
+// BEFORE the generation is bumped. valid() reads only expiryNanos and
+// generation() reads only gen, so if the generation were bumped first a
+// reader could observe the post-invalidate generation together with the
+// still-valid old expiry and serve a fast-path read after leadership
+// loss was already detected.
+//
+// The intra-invalidate hook fires after the expiry store but before the
+// generation bump; with the correct ordering valid() must already report
+// false at that point. With the buggy ordering (gen bumped first) the
+// hook would observe a still-valid lease and the assertion fails.
+func TestLeaseState_InvalidateClearsExpiryBeforeBumpingGen(t *testing.T) {
+	// Not parallel: mutates the package-level onInvalidateBetweenStores
+	// hook.
+	var s leaseState
+	now := monoclock.Now()
+	s.extend(now.Add(time.Hour), s.generation())
+	require.True(t, s.valid(now), "sanity: warmed lease is valid before invalidate")
+
+	genBefore := s.generation()
+
+	var (
+		validInWindow bool
+		genInWindow   uint64
+		hookFired     bool
+	)
+	onInvalidateBetweenStores = func() {
+		hookFired = true
+		// At this point invalidate() has cleared the expiry but has not
+		// yet bumped the generation. A lock-free reader interleaving here
+		// must already see the lease as invalid.
+		validInWindow = s.valid(now)
+		genInWindow = s.generation()
+	}
+	t.Cleanup(func() { onInvalidateBetweenStores = nil })
+
+	s.invalidate()
+
+	require.True(t, hookFired, "intra-invalidate hook must fire")
+	require.False(t, validInWindow,
+		"expiry must be cleared before the generation bump so valid() fails closed as early as the gen bump")
+	require.Equal(t, genBefore, genInWindow,
+		"generation must not be bumped before the expiry is cleared")
+	require.False(t, s.valid(now), "lease stays invalid after invalidate completes")
+	require.NotEqual(t, genBefore, s.generation(), "invalidate must bump the generation")
+}
+
 func TestLeaseState_ConcurrentExtendAndRead(t *testing.T) {
 	t.Parallel()
 	var s leaseState
