@@ -2191,10 +2191,12 @@ func (d *DynamoDBServer) scan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A Scan reads the whole table and therefore spans every shard that
-	// holds any of its items. Use the keyless lease check (LeaseRead) so
-	// the quorum-freshness bound is established BEFORE scanItems samples
-	// readTS.
-	if !d.leaseReadKeyless(w, r) {
+	// holds any of its items. leaseCheckScan establishes the quorum-freshness
+	// bound across every group BEFORE scanItems samples readTS — but only for
+	// a request that passes the cheap table/GSI validation, so a scan that
+	// will deterministically 4xx is not masked by a degraded-lease 500
+	// (codex #952 P2-A).
+	if !d.leaseCheckScan(w, r, in) {
 		return
 	}
 	out, err := d.scanItems(r.Context(), in)
@@ -2233,6 +2235,96 @@ func (d *DynamoDBServer) leaseReadKeyless(w http.ResponseWriter, r *http.Request
 		return false
 	}
 	return true
+}
+
+// leaseCheckScan runs the Scan lease pre-pass. A Scan reads the whole table, so
+// a VALID scan must fence EVERY group via the keyless all-groups check. But a
+// scan against a missing table, an unknown index, or a GSI with
+// ConsistentRead=true never touches data: the read path rejects it with a
+// deterministic 4xx, so establishing freshness is unnecessary and a failed
+// all-groups fence on a degraded deployment would mask that 4xx with a 500
+// (codex #952 P2-A). leaseCheckScan therefore cheaply pre-validates the request
+// (schema load + the same GSI read-option checks scanItems re-runs) at a
+// tentative timestamp and skips the lease on a client-side validation error,
+// while still failing closed (fencing every group) on a transient schema-read
+// failure. Returns false after writing an error response; the caller returns.
+func (d *DynamoDBServer) leaseCheckScan(w http.ResponseWriter, r *http.Request, in scanInput) bool {
+	// leaseCtx bounds the pre-validation schema read AND the lease read so a
+	// stalled schema read cannot block the handler past dynamoLeaseReadTimeout
+	// before the lease phase begins. leaseReadKeyless creates its own bounded
+	// context for the actual lease read.
+	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
+	defer leaseCancel()
+	_, plan, err := d.multiShardReadLeasePlan(leaseCtx, in.TableName, in.IndexName, in.Select, in.ProjectionExpression, in.ExpressionAttributeNames, in.ConsistentRead)
+	if err != nil {
+		// Transient/internal schema-read failure: fail closed by fencing every
+		// group. leaseReadKeyless writes the same InternalServerError on its
+		// own failure.
+		return d.leaseReadKeyless(w, r)
+	}
+	if plan == queryLeaseSkip {
+		// Client-side validation problem (table not found, unknown index,
+		// unsupported ConsistentRead): the read path re-runs the identical
+		// validation and surfaces the deterministic 4xx, so skip the lease so a
+		// degraded-lease failure cannot mask it with a 500 (codex #952 P2-A).
+		return true
+	}
+	// Valid whole-table read: fence every group (fail closed).
+	return d.leaseReadKeyless(w, r)
+}
+
+// multiShardReadLeasePlan cheaply classifies whether a multi-shard read (Scan or
+// a GSI/whole-table Query) is a VALID data read that must fence every group
+// (queryLeaseAllGroups) or a CLIENT-side validation problem the read path
+// rejects identically without touching data (queryLeaseSkip). It performs the
+// same table-existence and GSI read-option checks prepareReadSchema runs, at a
+// tentative timestamp (schema only, no readTS sampling), so the lease pre-pass
+// never masks a deterministic 4xx with a degraded-lease 500. A transient/internal
+// schema-read failure is returned as an error so the caller fails closed.
+//
+// The loaded schema is returned (nil when the table is missing or on error) so
+// callers that need a further deterministic validation (the GSI Query
+// KeyConditionExpression check) can reuse it without a second schema load.
+//
+// Validation failures are reported via queryLeaseSkip rather than an error: the
+// read path re-runs the same resolution and reports the identical validation
+// error, so error mapping is unchanged.
+func (d *DynamoDBServer) multiShardReadLeasePlan(
+	ctx context.Context,
+	tableName string,
+	indexName string,
+	selectValue string,
+	projectionExpression string,
+	names map[string]string,
+	consistentRead *bool,
+) (*dynamoTableSchema, queryLeasePlan, error) {
+	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, tentativeTS)
+	if err != nil {
+		// loadTableSchemaAt maps ErrKeyNotFound to (_, false, nil); any error
+		// reaching here is a transient store/context/decode failure, so fail
+		// closed.
+		return nil, queryLeaseAllGroups, errors.WithStack(err)
+	}
+	if !exists {
+		// Table not found is a deterministic ResourceNotFoundException the read
+		// path produces without touching data; skip the lease.
+		return nil, queryLeaseSkip, nil
+	}
+	// validateGSIReadOptions runs the identical unknown-index / GSI
+	// ConsistentRead / projection checks prepareReadSchema performs. Any failure
+	// is a *dynamoAPIError (a deterministic ValidationException), so classify it
+	// as a skip; a transient failure is impossible here (no store access).
+	if err := validateGSIReadOptions(schema, indexName, selectValue, projectionExpression, names, consistentRead); err != nil {
+		if dynamoErrIsTransient(err) {
+			// Defensive: validateGSIReadOptions returns only *dynamoAPIError, so
+			// this is unreachable. Fail closed if a future change adds a
+			// transient path.
+			return nil, queryLeaseAllGroups, errors.WithStack(err)
+		}
+		return schema, queryLeaseSkip, nil
+	}
+	return schema, queryLeaseAllGroups, nil
 }
 
 // leaseCheckQuery lease-checks the shard a Query reads with a bounded
@@ -2314,9 +2406,12 @@ const (
 //   - (nil, queryLeaseAllGroups, nil) for a VALID multi-shard read (GSI query
 //     or whole-table prefix) the caller must fence across every group;
 //   - (nil, queryLeaseSkip, nil) for a CLIENT-side validation problem (table
-//     not found, malformed/unsupported KeyConditionExpression) the read path
-//     rejects identically — the caller skips the lease so the deterministic
-//     4xx is not masked by a transient lease failure (codex #952 P2);
+//     not found, unknown index, GSI ConsistentRead, malformed/unsupported
+//     KeyConditionExpression) the read path rejects identically — the caller
+//     skips the lease so the deterministic 4xx is not masked by a transient
+//     lease failure (codex #952 P2). GSI queries are validated against the
+//     table schema here before being classified as a multi-shard read so an
+//     invalid index can never trigger the all-groups fence (codex #952 P2-B);
 //   - (nil, _, err) for a TRANSIENT/INTERNAL schema-read failure (leaseCtx
 //     deadline, Pebble error) so the caller fails closed.
 //
@@ -2325,8 +2420,22 @@ const (
 // error, so error mapping is unchanged.
 func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]byte, queryLeasePlan, error) {
 	if strings.TrimSpace(in.IndexName) != "" {
-		// A GSI query is a valid multi-shard read; fence every group.
-		return nil, queryLeaseAllGroups, nil
+		// A GSI query is a multi-shard read, but only when it passes the same
+		// validation the read path runs: a query against a missing table,
+		// unknown index, GSI ConsistentRead, or malformed KeyConditionExpression
+		// touches no data and the read path rejects it with a deterministic 4xx.
+		// Fencing every group before that validation would mask the 4xx with a
+		// degraded-lease 500, so classify those as a skip (codex #952 P2-B).
+		schema, plan, err := d.multiShardReadLeasePlan(ctx, in.TableName, in.IndexName, in.Select, in.ProjectionExpression, in.ExpressionAttributeNames, in.ConsistentRead)
+		if err != nil {
+			return nil, queryLeaseAllGroups, errors.WithStack(err)
+		}
+		if plan == queryLeaseSkip {
+			return nil, queryLeaseSkip, nil
+		}
+		// Schema + GSI options are valid; the KeyConditionExpression is the last
+		// deterministic validation the read path runs before touching data.
+		return nil, gsiQueryLeasePlan(in, schema), nil
 	}
 	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, tentativeTS)
@@ -2372,6 +2481,22 @@ func queryLeasePrefix(in queryInput, schema *dynamoTableSchema) ([]byte, queryLe
 		return nil, queryLeaseSkip
 	}
 	return prefix, queryLeaseSingleGroup
+}
+
+// gsiQueryLeasePlan classifies a GSI Query (already known to name a valid index
+// on an existing table) as the multi-shard all-groups read it is, unless its
+// KeyConditionExpression is malformed — the last deterministic validation the
+// read path runs before touching data. resolveQueryCondition does no store
+// access and returns only *dynamoAPIError, so a failure is a ValidationException
+// the read path rejects identically; classify it as a skip so the lease pre-pass
+// cannot mask that 4xx with a degraded-lease 500 (codex #952 P2-B). Like
+// queryLeasePrefix, the validation error is deliberately not surfaced — only the
+// routing classification matters here.
+func gsiQueryLeasePlan(in queryInput, schema *dynamoTableSchema) queryLeasePlan {
+	if _, _, err := resolveQueryCondition(in, schema); err != nil {
+		return queryLeaseSkip
+	}
+	return queryLeaseAllGroups
 }
 
 func decodeQueryInput(bodyReader io.Reader) (queryInput, error) {

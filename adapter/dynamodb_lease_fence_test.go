@@ -115,10 +115,15 @@ func TestDynamoDB_ScanLeaseFencesAllGroups(t *testing.T) {
 func TestDynamoDB_QueryLeaseFallbackFencesAllGroups(t *testing.T) {
 	t.Parallel()
 
-	coord := newMultiGroupLeaseCoordinator()
-	server := NewDynamoDBServer(nil, store.NewMVCCStore(), coord)
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(leaseGSIFixtureSchema())
 
-	// IndexName set => queryLeaseKey returns (_, false, nil) => keyless fallback.
+	coord := newMultiGroupLeaseCoordinator()
+	server := NewDynamoDBServer(nil, st, coord)
+
+	// IndexName set on a VALID GSI of an EXISTING table => queryLeaseKey
+	// returns (_, queryLeaseAllGroups, nil) => keyless all-groups fallback.
 	in := queryInput{
 		TableName:              "t",
 		IndexName:              "gsi1",
