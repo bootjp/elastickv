@@ -63,7 +63,8 @@ Key layout:
 | `snapshot_ts` | uint64 | HLC commit-ts pinned at BACKFILL entry. |
 | `fence_ts` | uint64 | HLC commit-ts pinned at FENCE → DELTA_COPY entry. |
 | `cutover_version` | uint64 | Catalog version produced by the CUTOVER write; populated at CUTOVER, used by §7.2 read-fence and §4.2 GC. |
-| `cursor` | bytes | Next-key cursor for BACKFILL / DELTA_COPY resume. |
+| `cursor` | bytes | Opaque (raw_key, commit_ts) export position for BACKFILL / DELTA_COPY resume — addresses an MVCC version, not a raw key, so a hot key with many committed versions can be chunked safely across batches (see §6.1.1). |
+| `max_imported_ts` | uint64 | Monotone HLC ceiling: the largest `commit_ts` ever included in an ack'd import batch for this job. Used by §6.2.1 to advance the target group's HLC at CUTOVER. |
 | `last_error` | string | Most recent transient failure (for operator diagnosis). |
 | `started_at`, `updated_at`, `terminal_at` | int64 | Wall-clock ms; **diagnostic only**, must not be read by any ordering-sensitive logic (CLAUDE.md HLC rule). `terminal_at` is set when phase enters DONE/FAILED. |
 
@@ -114,16 +115,23 @@ catalog snapshot evolution                migrator action
 [ source.Active(left)           ]
 [ source.WriteFenced(right)     ]
         |
-        |  DELTA_COPY → CUTOVER            Atomic catalog write under
-        v                                  CAS(expected_catalog_version):
-[ source.Active(left)           ]            (a) source.WriteFenced(right)
-[ target.Active(right)          ]                  → removed
+        |  DELTA_COPY → CUTOVER            Migrator first proposes a final
+        v                                  SetPhysicalCeiling(max_imported_ts)
+[ source.Active(left)           ]          on the TARGET group so the target
+[ source.WriteFenced(right)     ]          HLC ≥ every imported commit_ts
+                                           (§6.2.1, monotone primitive).
+                                           Then atomic catalog write under
+                                           CAS(expected_catalog_version):
+                                             (a) source.WriteFenced(right)
+                                                  → removed
                                              (b) target.Active(right) inserted
                                                   with raft_group_id=target
                                            Catalog snapshot still
                                            non-overlapping; version+=1
                                            atomically. `cutover_version`
                                            recorded in the SplitJob.
+[ source.Active(left)           ]
+[ target.Active(right)          ]
         |
         |  CUTOVER → CLEANUP               Source group's leader deletes
         v                                  the moved key range from its
@@ -303,12 +311,30 @@ type KeyFilter func(rawKey []byte) bool
 // Visibility rules MUST match the read path's snapshot at maxCommitTS;
 // in particular, intent locks (!txn|lock|...) are excluded — those
 // belong to in-flight txns the importer must not observe as commits.
+// The cursor is opaque (see §6.1.1) — it addresses an MVCC version
+// (raw key + commit_ts), not just a raw key, so a single hot key's
+// history is allowed to span batches without losing or duplicating
+// versions.
 // `accept` (nil = no filtering) is the §6.3 decoupling seam.
 ExportVersions(ctx context.Context, start, end []byte, minCommitTS, maxCommitTS uint64,
     cursor []byte, chunkBytes int, accept KeyFilter) ([]MVCCVersion, []byte, bool, error)
 ```
 
 The function uses the existing snapshot read primitive (the same one Composed-1 already trusts for visibility), so MVCC semantics during export are guaranteed to match a reader at `maxCommitTS`. `accept` is consulted before a row is added to the chunk; rejected rows do not advance the chunk-bytes budget so the caller sees deterministic per-call shapes.
+
+#### 6.1.1 Cursor granularity — addresses an MVCC version, not a raw key (closes codex P2)
+
+Codex P2 on PR #945: a "next-key" cursor breaks for hot keys with version histories larger than `chunkBytes` — the migrator would either have to send the whole version chain in one unbounded chunk (blowing the memory bound) or skip/duplicate the tail after a restart. The cursor must therefore address an **MVCC position**, not a raw key.
+
+Concretely, the cursor is opaque on the wire but encodes the tuple `(raw_key, commit_ts)`. The exporter iterates by `(raw_key ASC, commit_ts DESC)` (newest-first within a key, matching the MVCC iterator already used by snapshot reads in `store/mvcc_store.go`), and a chunk's boundary is recorded as "the position **after** the last emitted version" — encoded as the *exclusive* `(raw_key, commit_ts)` of the next-to-emit row. Three properties follow:
+
+- **Hot-key safe.** A chunk may contain only versions of a single raw key, and the next chunk picks up the next-older version of the same key without any all-or-nothing constraint on the key's history.
+- **Resume-safe across restarts.** Restarting from a persisted opaque cursor lands on the exact same MVCC version as a continuous run — no skipped versions (the cursor is exclusive on the resume side) and no duplicates (the importer's idempotency check, §6.2, dedups any one resume that overlaps an ack window).
+- **Importer doesn't care about key boundaries.** Versions arrive in `(raw_key, commit_ts DESC)` order; the importer just applies them. No "this batch is the rest of key K" handshake is needed.
+
+The opaque encoding is `varint(len(raw_key)) || raw_key || uvarint(commit_ts)`; an empty cursor signals "start from the beginning." Future evolution can add fields after `commit_ts` (e.g. a tombstone marker) because the consumer never parses the cursor by hand — only the exporter reads its own encoding.
+
+The store-side type stays `[]byte` and the exporter alone owns the codec, preserving the §6.1 decoupling seam: the migrator hands the cursor back as opaque bytes on every `ExportVersions` call.
 
 ### 6.2 Target side
 
@@ -319,11 +345,30 @@ New method:
 // with the same (job_id, cursor) MUST be a no-op past the recorded
 // cursor — the importer records last-applied cursor under
 // !dist|job|<id>|import_cursor so a network retry doesn't double-write.
+// As a side effect, the import atomically advances metaLastCommitTS
+// AND the node-local HLC ceiling to at least max(commit_ts) of the
+// batch (§6.2.1).
 ImportVersions(ctx context.Context, jobID uint64, versions []MVCCVersion,
     cursor []byte) ([]byte, error)
 ```
 
 Idempotency: persist `(job_id, cursor)` after each batch's apply, and on a duplicate request check the persisted cursor.
+
+#### 6.2.1 Target HLC advancement — preventing post-CUTOVER time travel (closes codex P1)
+
+Codex P1 on PR #945: when the source range contains commit timestamps higher than the target group's current `LastCommitTS` / HLC, an import that only writes versions + cursor leaves the target's clock below the staged data. After CUTOVER the target's first new write at `Next() = max(wall, ceiling)` can therefore receive a `commit_ts` **smaller** than imported values — MVCC visibility then resurrects the pre-cutover value on a snapshot read at the new commit_ts, an unambiguous time-travel hazard.
+
+The fix runs inside `ImportVersions` (and the equivalent CUTOVER bulk-rename apply that promotes the staged keyspace into live keys):
+
+1. **Per-batch advance.** On every apply of an `ImportVersions` batch, the target FSM computes `batchMax = max(versions[i].commit_ts)` and **atomically** (under the same FSM apply lock that mutates the MVCC store):
+   - sets `metaLastCommitTS = max(metaLastCommitTS, batchMax)`, and
+   - calls `hlc.SetPhysicalCeiling(batchMax)` (the same Raft-agreed primitive used by the M1 HLC renewal proposer, `kv/coordinator.go:644-669`). `SetPhysicalCeiling` is already monotone — a lower argument is a no-op — so duplicate / out-of-order batches are safe.
+2. **Job-level monotone witness.** The SplitJob carries `max_imported_ts` (§3.1) — the high-water mark of all ack'd import batches for this job. The migrator updates it whenever it persists an import_cursor, so it survives leader flap.
+3. **CUTOVER precondition.** Before the migrator issues the CUTOVER catalog write, it ensures the target group's HLC ceiling is at least `max_imported_ts` by issuing a final `SetPhysicalCeiling(max_imported_ts)` proposal on the **target group** (not the default group). The proposal is gated by `cap_migration_v2` (§11.1) and is the **last** target-side write before CUTOVER. If the target HLC is already above `max_imported_ts` (e.g. due to per-batch advancement), this proposal is the trivial no-op the ceiling already enforces; if a follower flap dropped one of the per-batch advances, this proposal closes the gap.
+4. **Post-CUTOVER write-side invariant.** A target-group `Next()` after CUTOVER is bounded below by `metaLastCommitTS` AND by the HLC ceiling (the existing `HLC.Next()` semantics in `kv/hlc.go`), so it is provably strictly greater than every `commit_ts` ever imported under this job. Reads at any post-CUTOVER `Next()` therefore see the imported version as historical (older than the read ts) and see the new write as the most-recent committed version — no resurrection, no time travel.
+5. **Same-group split (M1) unaffected.** Same-group split never crosses the FSM apply boundary, so its `Next()` is already bounded by the source's HLC; the new advance path is a no-op when `target_group_id == source_group_id`.
+
+This is the same Raft-agreed monotone-ceiling primitive that PR #927 / Composed-1 already relies on; M2 reuses it instead of inventing a new fence. Test coverage: §10.1 unit gains an explicit `kv/migrator_hlc_advance_test.go` that asserts (a) `metaLastCommitTS` and HLC ceiling are advanced by `max(batch.commit_ts)`, (b) the CUTOVER pre-write proposal closes any gap left by a missing batch, (c) post-CUTOVER first write's `commit_ts > max_imported_ts`. Property test extends the §10.1 export-chunks/import-acks/leader-flap sequence with a `Next()` invocation after CUTOVER and asserts strict monotonicity vs. every imported ts.
 
 ### 6.3 Internal-key coverage and the routeKey delegate
 
