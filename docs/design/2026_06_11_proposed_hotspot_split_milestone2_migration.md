@@ -48,7 +48,8 @@ A split job is durable state for the migration. Persist under reserved keys in t
 Key layout:
 
 - `!dist|meta|next_job_id` — uint64, allocator for `job_id`.
-- `!dist|job|<job_id>` — encoded `SplitJob` record.
+- `!dist|job|<job_id>` — encoded `SplitJob` record (in-flight + terminal until GC).
+- `!dist|jobhist|<terminal_at_ms_be>|<job_id>` — moved here at GC time for short-term audit; periodically truncated.
 
 `SplitJob` fields:
 
@@ -61,31 +62,83 @@ Key layout:
 | `phase` | enum | `PLANNED` / `BACKFILL` / `FENCE` / `DELTA_COPY` / `CUTOVER` / `CLEANUP` / `DONE` / `FAILED`. |
 | `snapshot_ts` | uint64 | HLC commit-ts pinned at BACKFILL entry. |
 | `fence_ts` | uint64 | HLC commit-ts pinned at FENCE → DELTA_COPY entry. |
+| `cutover_version` | uint64 | Catalog version produced by the CUTOVER write; populated at CUTOVER, used by §7.2 read-fence and §4.2 GC. |
 | `cursor` | bytes | Next-key cursor for BACKFILL / DELTA_COPY resume. |
 | `last_error` | string | Most recent transient failure (for operator diagnosis). |
-| `started_at`, `updated_at` | int64 | Wall-clock ms; **diagnostic only**, must not be read by any ordering-sensitive logic (CLAUDE.md HLC rule). |
+| `started_at`, `updated_at`, `terminal_at` | int64 | Wall-clock ms; **diagnostic only**, must not be read by any ordering-sensitive logic (CLAUDE.md HLC rule). `terminal_at` is set when phase enters DONE/FAILED. |
 
 Encoding mirrors `RouteDescriptor` (a single-byte codec version prefix + protobuf body). Reserve a new codec constant `catalogJobCodecVersion = 1`.
+
+#### 3.1.1 Job retention (bounded storage)
+
+Without a retention policy the `!dist|job|*` namespace grows unboundedly across a long-lived cluster (gemini medium on PR #945). M2 ships these bounds:
+
+- **Live cap**: at most `maxLiveJobs = 64` non-terminal SplitJobs in the catalog at any time. `SplitRange` rejects new requests with `ErrTooManyInFlightJobs` once the live count hits the cap; this also throttles a runaway M3 scheduler. The cap is intentionally generous (one per shard group × small factor) — operators raise it via a future runtime config if needed.
+- **Audit retention**: terminal jobs (`DONE`, `FAILED`, abandoned) are moved by the migrator from `!dist|job|<id>` to `!dist|jobhist|<terminal_at_ms_be>|<id>` immediately on transition. The history key sorts by terminal time so a single bounded prefix-scan trims oldest entries.
+- **History bound**: `maxJobHistory = 1_000` total entries OR retention age `historyTTL = 7d`, whichever is tighter. The migrator runs a GC sweep at most once per minute on the default-group leader; it batch-deletes excess entries with a single Raft proposal.
+- **Listing**: `ListSplitJobs` returns live + history (default cap 200 newest), with `since_terminal_at_ms` / `phase` filters; operators page through history via cursor.
+
+Bounded both by count (worst case ≤ `maxLiveJobs + maxJobHistory ≈ 1k` records ≈ low-MB storage) and by time. The cap on live jobs also prevents `ListSplitJobs` enumeration from blowing the response.
 
 ### 3.2 RouteState transitions during a job
 
 Same-group split (M1): `Active → (atomic CAS) → Active+Active`.
 
-Cross-group split (M2):
+Cross-group split (M2) — **catalog stays single-source-of-truth, never holds an overlapping route**:
 
-```
-source.Active
-  ├─ BACKFILL:   right child created with state=MigratingTarget on target group;
-  │              source remains Active; writes still flow to source.
-  ├─ FENCE:      source.right_child → WriteFenced; writes on the moving range
-  │              are rejected with ErrRouteWriteFenced (retryable).
-  ├─ DELTA_COPY: same as FENCE; reads still work from source.
-  ├─ CUTOVER:    atomic catalog bump — source.right_child removed; target's
-  │              MigratingTarget → Active; route version v+1.
-  └─ CLEANUP:    grace period; then source GCs the moved key range.
+```text
+catalog snapshot evolution                migrator action
+============================              ====================
+[ source.Active(full range) ]
+        |
+        |  PLANNED → BACKFILL              SplitJob created on default group;
+        |                                  no catalog mutation. Target group
+        |                                  accepts ImportRangeVersions into a
+        |                                  shadow keyspace (not yet routable).
+        v
+[ source.Active(full range) ]              BACKFILL: chunked export from
+                                           source @ snapshot_ts; idempotent
+                                           import into target's shadow space.
+        |
+        |  BACKFILL → FENCE                Atomic catalog write: source's
+        v                                  right child split out as a NEW
+[ source.Active(left)           ]          RouteDescriptor with state =
+[ source.WriteFenced(right)     ]          WriteFenced, raft_group_id =
+                                           source. Catalog snapshot remains
+                                           non-overlapping. Coordinator/FSM
+                                           reject writes on the fenced route.
+        |
+        |  FENCE → DELTA_COPY              Copy (snapshot_ts, fence_ts] from
+        |                                  source to target shadow space.
+        v
+[ source.Active(left)           ]
+[ source.WriteFenced(right)     ]
+        |
+        |  DELTA_COPY → CUTOVER            Atomic catalog write under
+        v                                  CAS(expected_catalog_version):
+[ source.Active(left)           ]            (a) source.WriteFenced(right)
+[ target.Active(right)          ]                  → removed
+                                             (b) target.Active(right) inserted
+                                                  with raft_group_id=target
+                                           Catalog snapshot still
+                                           non-overlapping; version+=1
+                                           atomically. `cutover_version`
+                                           recorded in the SplitJob.
+        |
+        |  CUTOVER → CLEANUP               Source group's leader deletes
+        v                                  the moved key range from its
+[ source.Active(left)           ]          MVCC store after the read-fence
+[ target.Active(right)          ]          grace window (§7.2).
+        |
+        |  CLEANUP → DONE                  Job moved to !dist|jobhist|<...>.
+        v
+[ source.Active(left)           ]
+[ target.Active(right)          ]
 ```
 
-The Composed-1 gate already rejects an apply on the wrong group at the observed catalog version; CUTOVER bumps `catalog_version` so any straggler write from an unaware coordinator fails closed at apply time on either side.
+Key invariant: **catalog snapshots never contain overlapping ranges**. The target shadow keyspace lives outside the catalog (BACKFILL / DELTA_COPY land into private `!dist|migstage|<job_id>|<raw_key>` keys on the target group's MVCC store; CUTOVER promotes the staged data to live keys via a single bulk-rename FSM apply). This keeps `routesFromCatalog` + `validateRouteOrder` (`distribution/engine.go:496-527`) green throughout the migration — addresses codex P1 on overlapping routes (PR #945 review). RouteState `MigratingSource` / `MigratingTarget` are reserved but unused in M2; they remain available for a future merge / multi-stage migration design.
+
+The Composed-1 gate rejects an apply on the wrong group at the observed catalog version; CUTOVER bumps `catalog_version` so any straggler write from an unaware coordinator fails closed at apply time on either side.
 
 ## 4. State Machine and Recovery
 
@@ -106,6 +159,16 @@ Failure semantics per phase:
 | `FAILED` | Operator-visible terminal state. Job sits until a manual `RetryJob` or `AbandonJob` RPC. Abandoned jobs unblock the source: `WriteFenced` is rolled back to `Active`. |
 
 `PLANNED → BACKFILL` can be rolled back by `AbandonJob` (no data moved yet). After CUTOVER the job is one-way; rollback would require a reverse migration, which is M2-out-of-scope.
+
+### 4.2 Job garbage collection
+
+The retention policy from §3.1.1 runs as a CLEANUP-tail sweep on the default-group leader. Concretely:
+
+1. On a phase transition `CUTOVER → CLEANUP`, the migrator records `terminal_at` candidate and waits for the read-fence grace window (§7.2.4) before transitioning `CLEANUP → DONE`.
+2. On `CLEANUP → DONE` or `* → FAILED`, the migrator issues one Raft proposal that (a) deletes `!dist|job|<id>`, (b) writes `!dist|jobhist|<terminal_at_ms_be>|<id>` with the final body.
+3. Once per minute the leader scans `!dist|jobhist|` for entries older than `historyTTL` (default 7d) OR exceeding `maxJobHistory` (1k) and deletes the oldest excess in one proposal.
+
+GC failure modes are bounded: the sweep is idempotent (delete-if-exists), and a stale leader's proposal lands as a no-op on the new leader's apply because the keys are already gone.
 
 ## 5. Wire / RPC Changes
 
@@ -222,9 +285,17 @@ Streaming the export keeps the migrator memory-bounded; a single `ImportRangeVer
 
 ### 6.1 Source side (`store/mvcc_store.go`, `store/lsm_store.go`)
 
+The `store` package is generic and **must not** import `kv` or know about routing keys (gemini medium on PR #945). Filtering is injected as a delegate from the caller.
+
 New method on `MVCCStore`:
 
 ```go
+// KeyFilter is the in-package contract: the caller decides which raw
+// keys belong to the slice of MVCC space being exported. nil means
+// "accept every key in [start, end)". The decision MUST be deterministic
+// and pure — the export streams it on the iteration goroutine.
+type KeyFilter func(rawKey []byte) bool
+
 // ExportVersions iterates committed versions in the half-open range
 // [start, end) whose commit_ts is in (minCommitTS, maxCommitTS],
 // resuming from cursor. Returns a slice of versions (capped roughly
@@ -232,11 +303,12 @@ New method on `MVCCStore`:
 // Visibility rules MUST match the read path's snapshot at maxCommitTS;
 // in particular, intent locks (!txn|lock|...) are excluded — those
 // belong to in-flight txns the importer must not observe as commits.
+// `accept` (nil = no filtering) is the §6.3 decoupling seam.
 ExportVersions(ctx context.Context, start, end []byte, minCommitTS, maxCommitTS uint64,
-    cursor []byte, chunkBytes int) ([]MVCCVersion, []byte, bool, error)
+    cursor []byte, chunkBytes int, accept KeyFilter) ([]MVCCVersion, []byte, bool, error)
 ```
 
-The function uses the existing snapshot read primitive (the same one Composed-1 already trusts for visibility), so MVCC semantics during export are guaranteed to match a reader at `maxCommitTS`.
+The function uses the existing snapshot read primitive (the same one Composed-1 already trusts for visibility), so MVCC semantics during export are guaranteed to match a reader at `maxCommitTS`. `accept` is consulted before a row is added to the chunk; rejected rows do not advance the chunk-bytes budget so the caller sees deterministic per-call shapes.
 
 ### 6.2 Target side
 
@@ -253,11 +325,26 @@ ImportVersions(ctx context.Context, jobID uint64, versions []MVCCVersion,
 
 Idempotency: persist `(job_id, cursor)` after each batch's apply, and on a duplicate request check the persisted cursor.
 
-### 6.3 Internal-key coverage
+### 6.3 Internal-key coverage and the routeKey delegate
 
-§9 of the parent doc enumerates the key families. The exporter scans the raw storage range `[start, end)` filtered by **routeKey** equivalence to the moving range, so internal keys (`!txn|...`, `!lst|...`, redis hash/list/etc.) land in the same shard as their logical owner. The importer dispatches by `key_family` into the matching store helper to preserve any per-family invariant (e.g., list head pointer updates).
+§9 of the parent doc enumerates the key families. The migrator builds a `KeyFilter` closure in `kv/` (where `routeKey()` lives) and passes it to `store.ExportVersions`:
 
-A simple safety check: every exported key must map back to the moving range under `routeKey()`. The exporter asserts this on every row before adding to the chunk; an assertion failure aborts the job and surfaces in `last_error`. This protects against a future internal-key family being added that the exporter forgot to teach.
+```go
+// kv/migrator_filter.go (sketch)
+func RouteKeyFilter(rangeStart, rangeEnd []byte) store.KeyFilter {
+    return func(rawKey []byte) bool {
+        rKey := routeKey(rawKey)
+        // half-open [rangeStart, rangeEnd) in the routing-key namespace.
+        if bytes.Compare(rKey, rangeStart) < 0 { return false }
+        if rangeEnd != nil && bytes.Compare(rKey, rangeEnd) >= 0 { return false }
+        return true
+    }
+}
+```
+
+The closure ensures internal keys (`!txn|...`, `!lst|...`, redis hash/list/etc.) land in the same shard as their logical owner without `store` ever importing `kv`. The importer dispatches by `key_family` into the matching store helper (in a future kv-level `Import` wrapper) to preserve per-family invariants (e.g., list head pointer updates).
+
+A simple safety check: every exported key in the migrator's send buffer must map back to the moving range under `routeKey()`. The migrator asserts this on every row before the gRPC send; an assertion failure aborts the job and surfaces in `last_error`. The assertion guards against a future internal-key family being added that someone forgot to teach `routeKey()`.
 
 ## 7. Coordinator / FSM Integration
 
@@ -274,15 +361,49 @@ FSM-side defense in depth:
 
 - `kv/fsm.go` already routes through `verifyComposed1` at apply. Extend `verifyOwnerFromSnapshot` to also reject when the resolved route's state is `WriteFenced` — even if a coordinator with a stale engine forwarded a write, the FSM closes the door. The error wraps `ErrRouteWriteFenced` so M4 retry logic differentiates from `ErrComposed1Violation`.
 
-Reads are **not** fenced: `ShardStore.GetAt` continues to serve from source until CUTOVER. Snapshot reads at any `commit_ts ≤ fence_ts` remain consistent because the source's MVCC history is unchanged through DELTA_COPY.
+Reads during FENCE / DELTA_COPY are **not** rejected: `ShardStore.GetAt` continues to serve from source. Snapshot reads at any `commit_ts ≤ fence_ts` remain consistent because the source's MVCC history is unchanged through DELTA_COPY. The post-CUTOVER read-side fence is §7.2.
 
-### 7.2 CUTOVER coherence with Composed-1
+### 7.2 Post-CUTOVER read fence (closes codex P1)
 
-The Composed-1 gate compares observed catalog version against current. CUTOVER bumps the version by 1; any in-flight txn pinned at the pre-CUTOVER version that lands on the target sees its observed-version owner ≠ target → ErrComposed1Violation → coordinator retries at the new version → routes to the target's new active route. This is the same flow PR #927 exercised; M2 reuses it, no new gate work.
+Codex P1 on PR #945: today the read path resolves the group from the local engine and serves/proxies the read **without carrying an observed catalog version** (`kv/shard_store.go:38-53`, `kv/shard_store.go:1471-1477`), while `verifyComposed1`'s `verifyOwnerFromSnapshot` (`kv/fsm.go:753-773`) only inspects mutations. After CUTOVER, a coordinator or source-group leader that has not applied the new catalog yet would keep routing reads of the moved key to the source — returning the stale pre-cutover value while writes have already landed on the target. M2 must close this read path symmetrically to writes.
 
-### 7.3 Engine route lookup invariant
+#### 7.2.1 Read request carries an observed catalog version
 
-After CUTOVER, the engine's per-route ranges no longer overlap (the right child moved entirely to target's range). `Engine.GetRoute(routeKey(k))` therefore continues to return exactly one route, matching M1's invariant. No `OwnerOf` change is needed beyond what PR #932 already shipped.
+Add `read_route_version uint64` to the read-path message (`pb.ReadRequest`, including the lease-read envelope used by `ShardStore.GetAt` / `.ScanAt`). The coordinator stamps the engine's catalog version into every read at the moment it picks a group. This is the read-side equivalent of `ObservedRouteVersion` on writes.
+
+#### 7.2.2 Source FSM rejects reads after CUTOVER
+
+When a source-group FSM applies a lease read whose `read_route_version` is **strictly less than** the FSM's last-applied catalog version, and the requested key's `routeKey()` maps to a route the FSM no longer owns, the FSM returns `ErrRouteMoved{new_route_version, new_group_id}` instead of the value. The error is mapped to a retryable status (gRPC `codes.FailedPrecondition` + detail) and the coordinator retries after a `RouteEngine` refresh.
+
+Two sub-cases:
+
+- **Coordinator stale**: it routed to source assuming the pre-cutover catalog. Refresh → re-route to target → succeeds.
+- **Source FSM stale (read_route_version ≥ FSM version)**: the FSM hasn't applied CUTOVER yet, but the coordinator (and quorum) already have. The FSM treats `read_route_version > local` as a "wait until applied" (bounded by lease TTL) before answering, then re-evaluates ownership; if still not owned, returns `ErrRouteMoved`. This avoids a wedge while keeping the read consistent.
+
+#### 7.2.3 Coordinator-side fallback
+
+If the engine's local catalog is behind the FSM's `new_route_version`, the coordinator does a single best-effort `WatcherRefresh` and retries once. Repeated `ErrRouteMoved` surfaces to the client only on persistent inconsistency (alert-worthy).
+
+#### 7.2.4 Grace window before CLEANUP
+
+CLEANUP deletes the moved range from source's MVCC after a configurable grace window (`readFenceGrace`, default 30 s — chosen to comfortably exceed both lease TTL and watcher tick × 2). During the window:
+
+- Source still has the data physically; the read fence above turns it into `ErrRouteMoved` rather than serving the value.
+- After the window the data is gone; a stale read attempt naturally returns "not found" via the read fence (the FSM has already rotated past the cutover version).
+
+This protects the operational corner case where a coordinator's `WatcherRefresh` is paused (CPU saturation, GC pause) for tens of seconds.
+
+#### 7.2.5 Composed-1 alignment
+
+`verifyOwnerFromSnapshot` keeps its current write-only behaviour. The new read-fence lives on a parallel path (`verifyReadOwner` next to it in `kv/fsm.go`) so the two stay independent — a future change to read-fence policy doesn't risk regressing the write gate the Jepsen suite (PR #932) already trusts.
+
+### 7.3 CUTOVER coherence with Composed-1
+
+The Composed-1 write gate compares observed catalog version against current. CUTOVER bumps the version by 1; any in-flight txn pinned at the pre-CUTOVER version that lands on the target sees its observed-version owner ≠ target → ErrComposed1Violation → coordinator retries at the new version → routes to the target's new active route. This is the same flow PR #927 exercised; M2 reuses it for writes, and §7.2 adds the parallel read mechanism.
+
+### 7.4 Engine route lookup invariant
+
+After CUTOVER, the engine's per-route ranges remain non-overlapping (per §3.2, the catalog only ever holds non-overlapping routes — the FENCE-time split out + the CUTOVER-time group rebind are each atomic and overlap-free). `Engine.GetRoute(routeKey(k))` therefore continues to return exactly one route, matching M1's invariant. No `OwnerOf` change is needed beyond what PR #932 already shipped.
 
 ## 8. Migrator Runtime
 
@@ -361,6 +482,20 @@ Phased into reviewable PRs, each lands behind its own doc-or-test gate:
 | M2-PR8 | Rename `*_proposed_*` → `*_partial_*` after PR1 ships; update parent partial doc M2 status; rename to `*_implemented_*` after PR7 |  |
 
 Each PR follows the five-lens self-review and is gated by its tests + `make lint`.
+
+### 11.1 Rolling-upgrade compatibility
+
+Closes gemini medium on PR #945: an M1 node that has not yet been upgraded does not understand `RouteStateWriteFenced` enforcement on writes, the read fence in §7.2, or the import RPCs. Starting a cross-group split while M1 nodes are still serving is a silent-write-loss hazard.
+
+Layered mitigations:
+
+1. **Capability advertisement.** Each node advertises a `node_capability_bitfield` in its periodic heartbeat to the default group (existing distribution heartbeat — extend by one field). M2-capable nodes set the `cap_migration_v2` bit at boot.
+2. **Cluster-readiness gate at the entry RPC.** `SplitRangeRequest` with `target_group_id != source_group_id` is rejected at `adapter/distribution_server.go` with `ErrClusterNotReadyForMigration` unless **every active node** advertises `cap_migration_v2`. Same-group split (M1) remains unconditionally available — its semantics did not change.
+3. **In-flight job invalidation on downgrade.** If the default-group leader observes any node losing `cap_migration_v2` mid-migration (rare — would only happen with a botched rollback), the migrator pauses (stays in current phase, no new state advancement) and surfaces `ErrClusterCapabilityRegressed`. Operator must either roll forward or `AbandonSplitJob`.
+4. **M2-PR1..PR5 land in this order so the capability bit can be set safely**: PR1-PR3 are wire/codec/store additions with **no behaviour change for M1** (no SplitJob created without explicit `target_group_id != source_group_id`); PR4 introduces the state machine but, until PR5 (FENCE rejection) lands, the bit must NOT be advertised. The `cap_migration_v2` bit goes live in PR5 commit so by the time it is observable, all required enforcement is present.
+5. **Test plan**: `distribution/capability_test.go` exercises (a) gate accepts M2-only cluster, (b) gate rejects mixed cluster, (c) gate rejects on heartbeat staleness (no advertisement within 2× heartbeat interval treated as no capability).
+
+This is independent of the existing rolling-upgrade protocol for unrelated subsystems and adds zero overhead for clusters never using cross-group split.
 
 ## 12. Open Questions
 
