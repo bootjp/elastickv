@@ -185,7 +185,7 @@ Failure semantics per phase:
 | `FENCE` | Catalog state is `WriteFenced`; coordinator rejects until phase advances. A leader flap here keeps the fence (state is durable). |
 | `DELTA_COPY` | Same as BACKFILL — chunked + cursor-persisted. `fence_ts` is recorded at FENCE entry, so a resumed DELTA_COPY uses the same upper bound. |
 | `CUTOVER` | Single atomic catalog write under CAS on `expected_catalog_version`. Either fully visible or fully not — no partial split. |
-| `CLEANUP` | After grace period (default 60s, configurable). GC is idempotent (delete-if-version-≤-fence_ts). |
+| `CLEANUP` | After grace period (`readFenceGrace`, default **30 s** per §7.2.4 — comfortably exceeds lease TTL and watcher tick × 2; matches §12 OQ-3 resolution). GC is idempotent (delete-if-version-≤-fence_ts). |
 | `FAILED` | Operator-visible terminal state. Job sits until a manual `RetryJob` or `AbandonJob` RPC. Abandoned jobs unblock the source: `WriteFenced` is rolled back to `Active`. |
 
 `PLANNED → BACKFILL` can be rolled back by `AbandonJob` (no data moved yet). After CUTOVER the job is one-way; rollback would require a reverse migration, which is M2-out-of-scope.
@@ -366,7 +366,7 @@ New method:
 // ImportVersions writes the given versions idempotently. A second call
 // with the same (job_id, cursor) MUST be a no-op past the recorded
 // cursor — the importer records last-applied cursor under
-// !dist|job|<id>|import_cursor so a network retry doesn't double-write.
+// !migstage|cursor|<id> so a network retry doesn't double-write.
 // As a side effect, the import atomically advances metaLastCommitTS
 // AND the node-local HLC ceiling to at least max(commit_ts) of the
 // batch (§6.2.1).
@@ -502,7 +502,7 @@ Codex P2 round-3 on PR #945 (line 147): "staging every imported row under `!dist
    Per-family adapter helpers (Redis list head pointers, DynamoDB GSI shadow rows, etc.) follow the same merge rule on the corresponding internal-family keys — the merge operates on raw keys, so the per-family invariants the `key_family` dispatch (§6.3.1) already enforces still apply.
 
 3. **Background incremental promoter on the target group.** Immediately after CUTOVER the target group's FSM starts a **leader-local promoter goroutine** that walks the `!dist|migstage|<job_id>|*` prefix in cursor-resumable chunks (the same `chunkBytes` / pacing knobs §6.1 and the migrator already use), and for each staged version proposes one `PromoteStaged` Raft entry that:
-   - copies the staged key into its live position (no-op when a later live write has already shadowed it; the FSM applies `metaLastCommitTS`-respecting MVCC put),
+   - copies the staged key into its live position with the original imported `commit_ts` — **always**, regardless of whether a newer live version at a higher `commit_ts` exists. The MVCC store naturally holds both `K@commit_ts=3` (the staged version being promoted) and `K@commit_ts=10` (a later live write) at different commit timestamps; a snapshot read at any `read_ts ∈ [3, 10)` correctly sees the imported `K@3`, and a read at `read_ts ≥ 10` correctly sees `K@10`. The idempotency guard for this copy is "**no-op if a live version at the same `commit_ts` already exists**" — that means this exact staged version was already promoted in a prior batch before a leader flap re-tried it. It is **not** "no-op when a newer live version exists," which would silently drop the imported version from MVCC history and make snapshot reads at older `read_ts` return wrong results (closes claude round-3 P1, 5-round flag). History pruning belongs to `kv/compactor.go`, not the promoter,
    - deletes the staged key,
    - advances the per-job `promote_cursor` on the SplitJob.
    Each batch is a small bounded proposal, exactly like BACKFILL — there is no single oversized apply.
@@ -569,7 +569,7 @@ Crucially, this catches **the equal-stale window** the strict-less-than form mis
 Two sub-cases of the legacy framing are preserved:
 
 - **Coordinator stale, source up-to-date**: source's `source_local_version ≥ cutover_version` and source no longer owns the key → unconditional `ErrRouteMoved`. Coordinator refreshes → re-routes to target → succeeds.
-- **Source stale, coordinator further ahead (`read_route_version > source_local_version`)**: the FSM treats this as "wait until applied" (bounded by lease TTL) before answering, then re-evaluates ownership; if still not owned, returns `ErrRouteMoved`. This avoids a wedge while keeping the read consistent.
+- **Source stale, coordinator further ahead (`read_route_version > source_local_version`)**: the FSM blocks on a **condition variable signalled by the apply goroutine** when it advances `appliedIndex`, with a timeout of `min(remaining_lease_TTL, 200 ms)` (the FSM tracks `appliedIndex` natively; the condition variable wraps it with a one-shot notifier consumed by the read-fence path). On the signal the FSM re-evaluates ownership; if `source_local_version` has now caught up to `read_route_version` AND the source still owns the key under the new snapshot, the read proceeds. If `source_local_version` is still behind on timeout, OR if the catch-up reveals the source no longer owns the key, the FSM returns `ErrRouteMoved`. This avoids a wedge while keeping the read consistent (closes claude round-2 spec-mechanism flag, 4-round flag).
 
 #### 7.2.2a Equal-stale window — concrete walkthrough
 
@@ -706,7 +706,7 @@ This is independent of the existing rolling-upgrade protocol for unrelated subsy
 
 1. **Job concurrency.** M2 caps at one in-flight migration. Confirm acceptable for first cut; M3 may want concurrent jobs for hotspot bursts.
 2. **Pacing knobs.** Default 1 MiB chunk + 5 ms inter-chunk pacing — these are guesses; should we ship a metrics-emitting default and let operators tune via `SplitRangeRequest.options`?
-3. **Grace period.** CLEANUP grace default 60s. Long enough to bound stale-route reads on a lagging follower? Or tie to `hlcPhysicalWindowMs` (3 s) × N?
+3. **Grace period (RESOLVED — `readFenceGrace = 30 s`).** §7.2.4 sets the default at 30 s with the rationale "comfortably exceeds both lease TTL and watcher tick × 2." All cross-references (§4 CLEANUP row) now match this value. Operators on extreme deployments (very long lease TTLs, or watcher polling intervals beyond the defaults) raise it via the existing `readFenceGrace` knob.
 4. **`MVCCVersion.key_family` enum.** Add a strict enum in proto, or stay numeric and document constants in `kv/`? Strict enum costs proto churn for every new internal family; numeric + go-side constant has been the project pattern.
 5. **`AbandonSplitJob` after CUTOVER.** Currently rejected. Worth offering a "reverse migration" RPC in M2, or defer to M3+?
 6. **Backfill source visibility.** Backfill reads at `snapshot_ts`; if `snapshot_ts` is younger than any in-flight prepare, the exported state excludes that prepare's intent. Is that semantic correct, or do we want a stricter "wait until all prepares ≤ snapshot_ts are either committed or aborted" gate before BACKFILL entry?
