@@ -67,6 +67,9 @@ Key layout:
 | `max_imported_ts` | uint64 | Monotone HLC ceiling: the largest `commit_ts` ever included in an ack'd import batch for this job. Used by §6.2.1 to advance the target group's HLC at CUTOVER. |
 | `promote_cursor` | bytes | Opaque cursor for the §6.4 incremental staged-to-live promoter. Same encoding as §6.1.1; advances during background promotion after CUTOVER. |
 | `promotion_completed_ts` | uint64 | HLC commit-ts of the apply that cleared `staged_visibility_active` and ended CLEANUP. Diagnostic / audit only. |
+| `fence_catalog_version` | uint64 | Catalog version produced by the FENCE catalog write — the value §3.2a's voter-ACK barrier compares each voter's `catalog_version_applied` against (closes claude round-12 minor on PR #945). Set at FENCE entry. |
+| `fence_ack_cursor` | bytes | Opaque encoding of the per-voter ACK progress for §3.2a's fence-apply barrier (which voter IDs have reported `catalog_version_applied >= fence_catalog_version`). Restart-safe: a migrator restart resumes from the pending voter list rather than re-polling completed voters. |
+| `bracket_progress` | repeated `BracketProgress` | Per-family export bracket state for §6.3.1's parallel exports. Each entry carries `(family uint32, cursor bytes, done bool, scanned_bytes uint64, accepted_rows uint64)` so a leader flap resumes each bracket independently. `phase` advances from BACKFILL/DELTA_COPY only when every entry has `done = true`. |
 | `last_error` | string | Most recent transient failure (for operator diagnosis). |
 | `started_at`, `updated_at`, `terminal_at` | int64 | Wall-clock ms; **diagnostic only**, must not be read by any ordering-sensitive logic (CLAUDE.md HLC rule). `terminal_at` is set when phase enters DONE/FAILED. |
 
@@ -151,7 +154,7 @@ catalog snapshot evolution                migrator action
 [ target.Active(right)          ]
 ```
 
-Key invariant: **catalog snapshots never contain overlapping ranges**. The target shadow keyspace lives outside the catalog (BACKFILL / DELTA_COPY land into private `!dist|migstage|<job_id>|<raw_key>` keys on the target group's MVCC store; CUTOVER **does not** bulk-rename them — promotion is incremental and runs as a target-side background job after CUTOVER, see §6.2.2). This keeps `routesFromCatalog` + `validateRouteOrder` (`distribution/engine.go:496-527`) green throughout the migration — addresses codex P1 on overlapping routes (PR #945 review). RouteState `MigratingSource` / `MigratingTarget` are reserved but unused in M2; they remain available for a future merge / multi-stage migration design.
+Key invariant: **catalog snapshots never contain overlapping ranges**. The target shadow keyspace lives outside the catalog (BACKFILL / DELTA_COPY land into private `!dist|migstage|<job_id>|<raw_key>` keys on the target group's MVCC store; CUTOVER **does not** bulk-rename them — promotion is incremental and runs as a target-side background job after CUTOVER, see §6.4). This keeps `routesFromCatalog` + `validateRouteOrder` (`distribution/engine.go:496-527`) green throughout the migration — addresses codex P1 on overlapping routes (PR #945 review). RouteState `MigratingSource` / `MigratingTarget` are reserved but unused in M2; they remain available for a future merge / multi-stage migration design.
 
 The Composed-1 gate rejects an apply on the wrong group at the observed catalog version; CUTOVER bumps `catalog_version` so any straggler write from an unaware coordinator fails closed at apply time on either side.
 
@@ -159,7 +162,10 @@ The Composed-1 gate rejects an apply on the wrong group at the observed catalog 
 
 Codex round-6 P1 on PR #945 (line 115): the FENCE catalog write commits on the default group, but the source FSM only learns about the new `WriteFenced` state through the watcher's asynchronous catalog snapshot apply (`distribution/watcher.go:11`, `:87-98`). If the migrator records `fence_ts = source.LastCommitTS()` and starts DELTA_COPY immediately after the FENCE catalog write, the source leader may still accept writes for the moved keys for one watcher-tick worth of time after the catalog commit — those writes get a `commit_ts > fence_ts`, fall outside DELTA_COPY's `(snapshot_ts, fence_ts]` window, and are silently left on the source at CUTOVER. Result: write loss after CUTOVER hands the routing to the target.
 
-M2 fixes this with a two-step gate on the FENCE → DELTA_COPY transition:
+M2 fixes this with a **three-step gate** on the FENCE → DELTA_COPY transition (step 0 added per claude round-12 P1 on PR #945 — prepared-txn drain — see §7.1's no-`Phase_COMMIT`-bypass rationale):
+
+0. **Prepared-txn drain (resolves OQ-6).** Before transitioning `BACKFILL → FENCE` (yes, before — the FENCE catalog write itself does not run until this drain returns), the migrator waits until **no in-flight transaction intent locks remain in `[routeStart, routeEnd)`**. "No intents remaining" is observable via a scan of `!txn|lock|<encoded>[routeStart, routeEnd)` returning empty. The wait is bounded by the txn timeout — a long-lived prepared txn either commits or is aborted by the lock resolver (`kv/lock_resolver.go`) within its TTL, so the scan converges in at worst one TTL window. While the drain is pending the migrator logs `last_error = "fence drain pending: <N> intent locks in moving range"`. **Why this is required:** §7.1's `verifyRouteNotFenced` rejects every write request in the WriteFenced range and has **no `Phase_COMMIT` bypass** because the matching intent lock is excluded from BACKFILL (§6.1) and absent on the target after CUTOVER — a `Phase_COMMIT` reaching the FSM after FENCE has nothing to commit against. Letting a prepared txn into the FENCE phase would therefore strand its commit indefinitely. The drain guarantees every commit that reaches the FSM during/after FENCE is for a txn whose intent has already resolved (committed via the pre-FENCE accept window, or aborted by the lock resolver). After CUTOVER the target has no historical intent for a moved-range key, so a coordinator that retries a Phase_COMMIT against the target would also fail; the drain is the only safe ordering.
+
 
 1. **Fence-apply ACK from every source-group voter.** After the FENCE catalog write commits, the migrator does **not** immediately pick `fence_ts`. Instead it polls a per-node `GetCatalogVersion` RPC (or piggybacks on the existing distribution heartbeat — same surface as §11.1's capability bit) against every voter of the source group's Raft membership (`engine.Configuration(ctx)` is already read by the migrator for §3.4 routing). The migrator advances the phase only when **every voter reports `catalog_version_applied >= fence_catalog_version`**, where `fence_catalog_version` is the catalog version of the FENCE write recorded in the SplitJob. This guarantees every node that could be the source-group leader at any future moment has the `WriteFenced` route locally applied, so any write that reaches its FSM apply path after this point is rejected by the FENCE pre-gate (§7.1's `verifyRouteNotFenced`).
 2. **`fence_ts` pinned after the ACK.** After step 1 returns, the migrator queries the source group leader for `LastCommitTS()` and pins that as `fence_ts`. Because the WriteFenced route is now applied on every voter, no in-flight write with `commit_ts > fence_ts` can land for the moved range — the apply path rejects them with `ErrRouteWriteFenced` at the FSM gate. DELTA_COPY's `(snapshot_ts, fence_ts]` window therefore captures every committed write whose `commit_ts > snapshot_ts`, completing the BACKFILL+DELTA_COPY semantic.
@@ -294,12 +300,26 @@ service Internal {
 }
 
 message ExportRangeVersionsRequest {
+  // Raw scan bounds — what the server iterator's [start, end) range
+  // is in the MVCC storage key space. For a §6.3.1 internal-family
+  // bracket these are the family-wide bounds (e.g. txnLockPrefix() →
+  // txnLockPrefixEnd()), which scan ALL of the family cluster-wide.
   bytes range_start = 1;
   bytes range_end = 2;
   uint64 max_commit_ts = 3;  // snapshot_ts (BACKFILL) or fence_ts (DELTA_COPY)
   uint64 min_commit_ts = 4;  // 0 for BACKFILL; snapshot_ts for DELTA_COPY
   bytes cursor = 5;          // resume token; empty on first call
   uint32 chunk_bytes = 6;    // soft cap, server may exceed by one row
+  // Logical moving range bounds — what the server's KeyFilter (§6.3)
+  // narrows the raw iterator to (closes claude round-12 P1 on PR #945:
+  // without these, a family-wide raw bracket cannot be narrowed to the
+  // moving slice on the server side and would export every cluster-
+  // wide txn lock / list / redis / etc. to the target). The server
+  // constructs RouteKeyFilter(route_start, route_end) from these and
+  // applies it before adding a row to the chunk. Required on every
+  // call; the migrator already has them on its SplitJob.
+  bytes route_start = 7;
+  bytes route_end = 8;  // empty == +infinity (open-ended right edge)
 }
 
 message ExportRangeVersionsResponse {
@@ -555,7 +575,7 @@ Coordinator-side:
 FSM-side defense in depth — **must run on an unconditional apply path** (closes codex round-3 P1 on PR #945):
 
 - The naïve placement — extend `verifyOwnerFromSnapshot` so it also rejects routes in `WriteFenced` — does NOT work. `verifyComposed1` short-circuits when `ObservedRouteVersion == 0` (`kv/fsm.go:608-611`), and there are several **intentional zero-version write paths today**: read/write txns with `ReadKeys`, caller-supplied `StartTS`, and resolver-claimed keys all dispatch with `ObservedRouteVersion = 0` (`kv/sharded_coordinator.go:694-754`, M3 sibling §3.5 + auto-pin policy). A stale coordinator in any of those flows would forward a write to the source during FENCE and the FSM defense would never run. The fence must be enforced **before** any version-conditional early return.
-- M2 therefore introduces a **separate, unconditional pre-gate** `verifyRouteNotFenced(mutations)` in `kv/fsm.go` that the apply path consults **before** `verifyComposed1`. It scans the mutations exactly as `verifyOwnerFromSnapshot` does — `routeKey(mut.Key)` against the **current** catalog snapshot — and rejects with `ErrRouteWriteFenced` when **any** key resolves to a route whose `RouteState == WriteFenced`. No dependency on `ObservedRouteVersion`, no early return on `0`; the gate runs on every applied write request unconditionally (it has the same `Phase_ABORT` bypass as the Composed-1 gate, for the same lock-release reason in §3.5 of the parent partial doc).
+- M2 therefore introduces a **separate, unconditional pre-gate** `verifyRouteNotFenced(mutations)` in `kv/fsm.go` that the apply path consults **before** `verifyComposed1`. It scans the mutations exactly as `verifyOwnerFromSnapshot` does — `routeKey(mut.Key)` against the **current** catalog snapshot — and rejects with `ErrRouteWriteFenced` when **any** key resolves to a route whose `RouteState == WriteFenced`. No dependency on `ObservedRouteVersion`, no early return on `0`; the gate runs on every applied write request unconditionally. The gate has the same `Phase_ABORT` bypass as the Composed-1 gate (for the same lock-release reason in §3.5 of the parent partial doc) but has **no `Phase_COMMIT` bypass** — a `Phase_COMMIT` for a prepared txn whose intent is in the moving range cannot safely fall through this gate because the matching intent lock is excluded from BACKFILL (§6.1) and absent on the target, so a forwarded commit would have nothing to commit against. §3.2a's prepared-txn drain precondition closes this hazard by ensuring no prepared txn intents remain in the moving range at FENCE entry; any commit reaching the FSM after that point is for a txn whose intent has already resolved (committed or aborted), so the `verifyRouteNotFenced` rejection on `Phase_COMMIT` is the strict path. Closes claude round-12 P1 on PR #945.
 - Concretely, the apply path becomes: `verifyRouteNotFenced` → `verifyComposed1` → existing handlers. `verifyRouteNotFenced` reads the current `RouteSnapshot` once (the same one `verifyComposed1` would have read at the current-version check) and looks up each mutation key's route state. Cost is bounded by the existing per-mutation `OwnerOf` call already done at apply time when ObservedRouteVersion is non-zero; the new path adds it for the zero-version case too. The two gates stay independent so a future change to one cannot regress the other (same isolation rationale as `verifyReadOwner` next to `verifyOwnerFromSnapshot` in §7.2.5).
 - Forward-compatibility hook (M3): a follow-on change can flip the `ObservedRouteVersion == 0` short-circuit off entirely once every M2-shipped flow stamps a non-zero version, at which point `verifyRouteNotFenced` collapses into a `verifyComposed1` invariant. M2 ships the safe form (unconditional pre-gate) so the FENCE rejection cannot be silently bypassed before that cleanup lands.
 
