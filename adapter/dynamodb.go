@@ -4598,26 +4598,45 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 	// handler past dynamoLeaseReadTimeout before the lease phase begins.
 	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
 	defer leaseCancel()
+	uniqueKeys, skipLease, transientErr := d.resolveTransactGetItemKeys(leaseCtx, in)
+	if transientErr != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, transientErr.Error())
+		return false
+	}
+	if skipLease {
+		return true
+	}
+	groupKeys := kv.LeaseReadGroupKeys(d.coordinator, uniqueKeys)
+	if leaseErr := d.leaseReadGroupKeys(leaseCtx, groupKeys); leaseErr != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, leaseErr.Error())
+		return false
+	}
+	return true
+}
+
+// resolveTransactGetItemKeys runs the per-item schema resolution that the
+// lease pre-pass needs. Returns (uniqueKeys, skipLease, transientErr) where
+// skipLease is true when either (a) every item was malformed (nothing to
+// fence) or (b) at least one item was malformed and at least one was valid —
+// the latter means the read path will surface a deterministic 4xx via
+// buildTransactGetItemsResponses without touching any store, so leasing the
+// valid items only risks masking that 4xx with a degraded-shard 500 (codex P2
+// #952). transientErr is the schema-read failure the caller MUST fail closed
+// on (CLAUDE.md: the slow conditions the fence targets are exactly when a
+// silently-dropped item would let a stale snapshot through).
+func (d *DynamoDBServer) resolveTransactGetItemKeys(ctx context.Context, in transactGetItemsInput) ([][]byte, bool, error) {
 	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
 	schemaCache := make(map[string]*dynamoTableSchema)
 	seenKeys := make(map[string]struct{}, len(in.TransactItems))
 	uniqueKeys := make([][]byte, 0, len(in.TransactItems))
+	hasMalformed := false
 	for _, item := range in.TransactItems {
-		itemKey, ok, err := d.transactGetItemKey(leaseCtx, item, schemaCache, tentativeTS)
+		itemKey, ok, err := d.transactGetItemKey(ctx, item, schemaCache, tentativeTS)
 		if err != nil {
-			// Transient/internal schema read failure (leaseCtx deadline,
-			// Pebble error). Fail closed: silently dropping the item would
-			// leave its shard unfenced and let the later read return a
-			// stale snapshot under exactly the slow conditions the fence
-			// targets. Same InternalServerError mapping as a lease failure.
-			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
-			return false
+			return nil, false, err
 		}
 		if !ok {
-			// Malformed input (nil Get, empty/unknown table, unresolvable
-			// key). Skipping is safe: the item never reaches a store read,
-			// and buildTransactGetItemsResponses surfaces the identical
-			// validation error downstream so error mapping is unchanged.
+			hasMalformed = true
 			continue
 		}
 		if _, dup := seenKeys[string(itemKey)]; dup {
@@ -4626,20 +4645,47 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 		seenKeys[string(itemKey)] = struct{}{}
 		uniqueKeys = append(uniqueKeys, itemKey)
 	}
-	if len(uniqueKeys) == 0 {
-		// Every item is malformed or its schema/key could not be resolved,
-		// so no store read will happen and no shard will be touched; there
-		// is nothing to establish freshness against. buildTransactGetItemsResponses
-		// surfaces the identical validation error downstream.
-		return true
+	if hasMalformed || len(uniqueKeys) == 0 {
+		return nil, true, nil
 	}
-	for _, itemKey := range kv.LeaseReadGroupKeys(d.coordinator, uniqueKeys) {
-		if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, itemKey); err != nil {
-			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
-			return false
+	return uniqueKeys, false, nil
+}
+
+// leaseReadGroupKeys fences every group whose key appears in groupKeys. The
+// single-group case stays on the calling goroutine; multi-group fan-out is
+// concurrent so a 100-item TransactGetItems does not serialize into 100 Raft
+// round-trips and blow dynamoLeaseReadTimeout (gemini HIGH on PR #952). The
+// fan-out is bounded by len(groupKeys) ≤ transactGetItemsMaxItems (100), so a
+// per-call goroutine pool is unnecessary. Returns the first error seen across
+// all goroutines (the rest are dropped to preserve the single-response
+// contract at the HTTP layer).
+func (d *DynamoDBServer) leaseReadGroupKeys(ctx context.Context, groupKeys [][]byte) error {
+	if len(groupKeys) == 0 {
+		return nil
+	}
+	if len(groupKeys) == 1 {
+		_, err := kv.LeaseReadForKeyThrough(d.coordinator, ctx, groupKeys[0])
+		return errors.WithStack(err)
+	}
+	errCh := make(chan error, len(groupKeys))
+	var wg sync.WaitGroup
+	for _, itemKey := range groupKeys {
+		wg.Add(1)
+		go func(k []byte) {
+			defer wg.Done()
+			if _, err := kv.LeaseReadForKeyThrough(d.coordinator, ctx, k); err != nil {
+				errCh <- err
+			}
+		}(itemKey)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
 		}
 	}
-	return true
+	return nil
 }
 
 // transactGetItemKey resolves the storage key for one TransactGetItems Get at

@@ -219,6 +219,65 @@ func TestDynamoDB_TransactGetItems_TransientSchemaReadFailsClosed(t *testing.T) 
 	require.Contains(t, rec.Body.String(), dynamoErrInternal)
 }
 
+// TestDynamoDB_TransactGetItems_MalformedMixedWithValidSkipsLease asserts the
+// regression for codex P2 #952 (line 4621): when a TransactGetItems request
+// mixes a malformed item (validation error: table not found) with at least one
+// VALID item, the whole transaction is doomed by validation, and the read path
+// will return a deterministic 4xx via buildTransactGetItemsResponses without
+// touching a store. The lease pre-pass must therefore skip leasing the valid
+// keys; otherwise, in a degraded shard where the lease cannot be confirmed,
+// the handler returns a 500 InternalServerError that masks the 4xx error
+// mapping. Pre-fix the loop kept the valid item's key in uniqueKeys and called
+// LeaseReadForKeyThrough — this test asserts the post-fix behaviour: no lease
+// call, and the handler returns true so the caller falls through to the
+// validation 4xx.
+func TestDynamoDB_TransactGetItems_MalformedMixedWithValidSkipsLease(t *testing.T) {
+	t.Parallel()
+
+	// Set up a schema for "t" so the second item resolves cleanly, but
+	// leave "missing" unwired so it produces a ResourceNotFoundException
+	// in transactGetItemKey — the canonical malformed case.
+	schema := &dynamoTableSchema{
+		TableName:          "t",
+		Generation:         1,
+		KeyEncodingVersion: dynamoOrderedKeyEncodingV2,
+		AttributeDefinitions: map[string]string{
+			"pk": "S",
+		},
+		PrimaryKey: dynamoKeySchema{HashKey: "pk"},
+	}
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(schema)
+
+	coord := &leaseReadCountingCoordinator{stubAdapterCoordinator: &stubAdapterCoordinator{}}
+	server := NewDynamoDBServer(nil, st, coord)
+
+	in := transactGetItemsInput{
+		TransactItems: []transactGetItem{
+			// Malformed: "missing" table → validation error.
+			{Get: &transactGetItemGet{
+				TableName: "missing",
+				Key:       map[string]attributeValue{"pk": newStringAttributeValue("x")},
+			}},
+			// Valid: "t" table → would normally fence a single group.
+			{Get: &transactGetItemGet{
+				TableName: "t",
+				Key:       map[string]attributeValue{"pk": newStringAttributeValue("real")},
+			}},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
+	require.True(t, server.leaseCheckTransactGetItems(rec, req, in),
+		"a malformed item mixed with valid items must skip the lease so the read path's 4xx is not masked by a degraded-shard 500 (codex P2 #952)")
+	require.Equal(t, http.StatusOK, rec.Code, "no error response should be written for the mixed case")
+	require.Equal(t, int64(0), coord.leaseReadForKeyCalls.Load(),
+		"valid items in a malformed-mixed transaction must NOT be leased — the transaction is doomed by validation, no shard freshness needs to be established")
+	require.Equal(t, int64(0), coord.leaseReadCalls.Load())
+}
+
 // TestDynamoDB_TransactGetItems_MalformedItemStillSkipped asserts the
 // malformed-input path is unchanged: an item whose schema does not exist
 // (ResourceNotFoundException, a validation error) is still skipped, not failed
