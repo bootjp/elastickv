@@ -5,6 +5,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -110,5 +111,72 @@ func TestLeaseReadGroupKeys(t *testing.T) {
 		in := keys("a", "b", "c")
 		got := LeaseReadGroupKeys(plainNonRoutable{}, in)
 		equalKeySlices(t, in, got)
+	})
+}
+
+// singleGroupLeaseCoordinator implements Coordinator + LeaseReadableCoordinator
+// but NOT AllGroupsLeaseReadableCoordinator, modeling a single-group
+// deployment. It records how many keyless LeaseRead calls it received so the
+// fallback path can be asserted to issue exactly one.
+type singleGroupLeaseCoordinator struct {
+	Coordinator
+	leaseReads int
+	leaseErr   error
+}
+
+func (c *singleGroupLeaseCoordinator) LeaseRead(context.Context) (uint64, error) {
+	c.leaseReads++
+	return 0, c.leaseErr
+}
+
+func (c *singleGroupLeaseCoordinator) LeaseReadForKey(context.Context, []byte) (uint64, error) {
+	panic("unused")
+}
+
+// allGroupsLeaseCoordinator implements AllGroupsLeaseReadableCoordinator and
+// records how many groups a single LeaseReadAllGroups call fenced.
+type allGroupsLeaseCoordinator struct {
+	Coordinator
+	allGroupsCalls int
+	allGroupsErr   error
+}
+
+func (c *allGroupsLeaseCoordinator) LeaseReadAllGroups(context.Context) error {
+	c.allGroupsCalls++
+	return c.allGroupsErr
+}
+
+func TestLeaseReadAllGroupsThrough(t *testing.T) {
+	t.Parallel()
+
+	t.Run("single-group coordinator issues exactly one LeaseRead", func(t *testing.T) {
+		t.Parallel()
+		c := &singleGroupLeaseCoordinator{}
+		require.NoError(t, LeaseReadAllGroupsThrough(c, context.Background()))
+		require.Equal(t, 1, c.leaseReads,
+			"single-group fallback must issue exactly one keyless lease read")
+	})
+
+	t.Run("single-group LeaseRead error propagates", func(t *testing.T) {
+		t.Parallel()
+		sentinel := errors.New("boom")
+		c := &singleGroupLeaseCoordinator{leaseErr: sentinel}
+		err := LeaseReadAllGroupsThrough(c, context.Background())
+		require.ErrorIs(t, err, sentinel)
+	})
+
+	t.Run("all-groups coordinator fences every group in one call", func(t *testing.T) {
+		t.Parallel()
+		c := &allGroupsLeaseCoordinator{}
+		require.NoError(t, LeaseReadAllGroupsThrough(c, context.Background()))
+		require.Equal(t, 1, c.allGroupsCalls)
+	})
+
+	t.Run("all-groups error propagates", func(t *testing.T) {
+		t.Parallel()
+		sentinel := errors.New("group fence failed")
+		c := &allGroupsLeaseCoordinator{allGroupsErr: sentinel}
+		err := LeaseReadAllGroupsThrough(c, context.Background())
+		require.ErrorIs(t, err, sentinel)
 	})
 }

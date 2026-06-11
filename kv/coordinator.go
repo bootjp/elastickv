@@ -237,6 +237,37 @@ func LeaseReadForKeyThrough(c Coordinator, ctx context.Context, key []byte) (uin
 	return idx, errors.WithStack(err)
 }
 
+// AllGroupsLeaseReadableCoordinator is the optional capability implemented
+// by coordinators that own more than one Raft group and can establish the
+// lease freshness bound on EVERY group in a single call. Multi-shard read
+// handlers (Scan, GSI/whole-table Query) need this because the underlying
+// scan visits all intersecting routes across all groups, whereas the plain
+// LeaseRead only fences the default group. Single-group coordinators do not
+// implement it: LeaseReadAllGroupsThrough falls back to LeaseRead so they
+// still issue exactly one lease read.
+type AllGroupsLeaseReadableCoordinator interface {
+	// LeaseReadAllGroups establishes the lease freshness bound on every
+	// group the coordinator owns, failing closed on the first group that
+	// cannot confirm its lease. The freshness bound is what a multi-shard
+	// read relies on, so a returned error MUST abort the read.
+	LeaseReadAllGroups(ctx context.Context) error
+}
+
+// LeaseReadAllGroupsThrough establishes the lease freshness bound across
+// every shard group a multi-shard read can touch. When the coordinator owns
+// multiple groups (AllGroupsLeaseReadableCoordinator) it fences all of them;
+// otherwise it falls back to the single-group LeaseRead path so a
+// single-group deployment still issues exactly one lease read. Adapter call
+// sites use this for keyless reads (Scan, whole-table/GSI Query fallback)
+// that the per-key LeaseReadForKey cannot route to one group.
+func LeaseReadAllGroupsThrough(c Coordinator, ctx context.Context) error {
+	if ag, ok := c.(AllGroupsLeaseReadableCoordinator); ok {
+		return errors.WithStack(ag.LeaseReadAllGroups(ctx))
+	}
+	_, err := LeaseReadThrough(c, ctx)
+	return errors.WithStack(err)
+}
+
 // GroupRoutableCoordinator is the optional capability implemented by
 // coordinators that can resolve the owning Raft group of a key without
 // any I/O. Callers that need to lease-check a set of keys use it to
