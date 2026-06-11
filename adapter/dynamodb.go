@@ -2278,8 +2278,33 @@ func (d *DynamoDBServer) leaseCheckScan(w http.ResponseWriter, r *http.Request, 
 	if scanExclusiveStartKeyInvalid(schema, in) {
 		return true
 	}
+	// Same logic for a malformed ProjectionExpression: newReadPageState runs
+	// resolveProjectionAttributes before the iterator reads from the store, so a
+	// parse failure is a deterministic ValidationException the lease pre-pass
+	// must not mask (codex #952 P2 round-4 line 2346). validateGSIReadOptions
+	// already covers the GSI case; this catches the base-table path that the
+	// earlier ExclusiveStartKey check left exposed.
+	if projectionInvalid(in.ProjectionExpression, in.ExpressionAttributeNames) {
+		return true
+	}
 	// Valid whole-table read: fence every group (fail closed).
 	return d.leaseReadKeyless(w, r)
+}
+
+// projectionInvalid returns true when the ProjectionExpression cannot be
+// parsed against the given ExpressionAttributeNames. resolveProjectionAttributes
+// is the same validator newReadPageState runs before the iterator reads from
+// the store, so a true result means the read path WILL reject the request with
+// a deterministic ValidationException without touching data. Pre-pass uses
+// this to skip leasing in that case (codex #952 P2 round-4 lines 2346, 2492).
+// An empty ProjectionExpression is the common "project everything" case and
+// returns false (no validation needed).
+func projectionInvalid(projectionExpression string, names map[string]string) bool {
+	if strings.TrimSpace(projectionExpression) == "" {
+		return false
+	}
+	_, err := resolveProjectionAttributes(projectionExpression, names)
+	return err != nil
 }
 
 // scanExclusiveStartKeyInvalid returns true when in.ExclusiveStartKey cannot be
@@ -2468,6 +2493,13 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 		if queryExclusiveStartKeyInvalid(schema, in) {
 			return nil, queryLeaseSkip, nil
 		}
+		// Malformed ProjectionExpression is the same kind of deterministic
+		// ValidationException newReadPageState raises before the iterator
+		// touches data (codex #952 P2 round-4 line 2492); skip the lease so a
+		// degraded shard cannot mask it.
+		if projectionInvalid(in.ProjectionExpression, in.ExpressionAttributeNames) {
+			return nil, queryLeaseSkip, nil
+		}
 		// Schema + GSI options are valid; the KeyConditionExpression is the last
 		// deterministic validation the read path runs before touching data.
 		return nil, gsiQueryLeasePlan(in, schema), nil
@@ -2487,6 +2519,11 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 	}
 	// Same ExclusiveStartKey pre-check as the GSI branch above (base table).
 	if queryExclusiveStartKeyInvalid(schema, in) {
+		return nil, queryLeaseSkip, nil
+	}
+	// Same ProjectionExpression pre-check (base-table path; codex #952 P2 round-4
+	// line 2492).
+	if projectionInvalid(in.ProjectionExpression, in.ExpressionAttributeNames) {
 		return nil, queryLeaseSkip, nil
 	}
 	prefix, plan := queryLeasePrefix(in, schema)

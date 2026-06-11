@@ -488,6 +488,67 @@ func TestDynamoDB_LeaseCheckScan_InvalidExclusiveStartKeySkipsLease(t *testing.T
 		"invalid ExclusiveStartKey must not trigger the all-groups lease check — the transaction is doomed by validation")
 }
 
+// TestDynamoDB_LeaseCheckScan_InvalidProjectionSkipsLease asserts the regression
+// for codex P2 #952 round-4 (line 2346): a base-table Scan with a malformed
+// ProjectionExpression (e.g., a trailing comma "pk,") is a deterministic
+// ValidationException newReadPageState raises before the iterator reads from
+// the store. Pre-fix the lease pre-pass only validated the table/index, so the
+// all-groups fence ran and a degraded shard's 500 masked the 4xx. Post-fix
+// projectionInvalid catches it.
+func TestDynamoDB_LeaseCheckScan_InvalidProjectionSkipsLease(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(leaseGSIFixtureSchema())
+
+	coord := newDegradedLeaseCoordinator()
+	server := NewDynamoDBServer(nil, st, coord)
+
+	in := scanInput{
+		TableName:            "t",
+		ProjectionExpression: "pk,",
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
+	require.True(t, server.leaseCheckScan(rec, req, in),
+		"a Scan with malformed ProjectionExpression must skip the lease fallback so the read path's 4xx is not masked by a 500 (codex P2 #952 round-4)")
+	require.Equal(t, http.StatusOK, rec.Code, "no lease error response should be written for invalid ProjectionExpression")
+	require.Equal(t, 0, coord.allGroupsCalls,
+		"invalid ProjectionExpression must not trigger the all-groups lease check")
+}
+
+// TestDynamoDB_LeaseCheckQuery_InvalidProjectionSkipsLease is the Query
+// counterpart (codex P2 #952 round-4 line 2492).
+func TestDynamoDB_LeaseCheckQuery_InvalidProjectionSkipsLease(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(leaseGSIFixtureSchema())
+
+	coord := newDegradedLeaseCoordinator()
+	server := NewDynamoDBServer(nil, st, coord)
+
+	in := queryInput{
+		TableName:              "t",
+		KeyConditionExpression: "pk = :pk",
+		ExpressionAttributeValues: map[string]attributeValue{
+			":pk": newStringAttributeValue("x"),
+		},
+		ProjectionExpression: "pk,",
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
+	require.True(t, server.leaseCheckQuery(rec, req, in),
+		"a Query with malformed ProjectionExpression must skip the lease so the read path's 4xx is not masked by a 500 (codex P2 #952 round-4)")
+	require.Equal(t, http.StatusOK, rec.Code, "no lease error response should be written for invalid ProjectionExpression")
+	require.Equal(t, 0, coord.allGroupsCalls,
+		"invalid ProjectionExpression must not trigger the lease check")
+}
+
 // TestDynamoDB_LeaseCheckQuery_InvalidExclusiveStartKeySkipsLease is the Query
 // counterpart of the above (codex P2 #952 round-3, line 2482): a Query with a
 // valid KeyConditionExpression but malformed ExclusiveStartKey is a deterministic
