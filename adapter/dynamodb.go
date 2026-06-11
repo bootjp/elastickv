@@ -2215,15 +2215,20 @@ func (d *DynamoDBServer) scan(w http.ResponseWriter, r *http.Request) {
 }
 
 // leaseReadKeyless performs a keyless quorum-freshness lease check for
-// multi-shard read handlers (Query, Scan). It bounds the wait with
-// dynamoLeaseReadTimeout so a stalled Raft cannot hang the handler when
-// the client never cancels, and writes the same InternalServerError that
-// getItem produces on lease failure. Returns false after writing an
-// error response; the caller should simply return.
+// multi-shard read handlers (Scan, GSI/whole-table Query fallback). These
+// reads visit every shard the range intersects, so the check fences EVERY
+// group the coordinator owns via LeaseReadAllGroupsThrough — a default-group-
+// only lease would let a non-default group serve a stale snapshot. A
+// single-group coordinator falls back to one LeaseRead, so single-group
+// deployments still issue exactly one lease read. It bounds the wait with
+// dynamoLeaseReadTimeout so a stalled Raft cannot hang the handler when the
+// client never cancels, and writes the same InternalServerError that getItem
+// produces on lease failure. Returns false after writing an error response;
+// the caller should simply return.
 func (d *DynamoDBServer) leaseReadKeyless(w http.ResponseWriter, r *http.Request) bool {
 	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
 	defer leaseCancel()
-	if _, err := kv.LeaseReadThrough(d.coordinator, leaseCtx); err != nil {
+	if err := kv.LeaseReadAllGroupsThrough(d.coordinator, leaseCtx); err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return false
 	}
@@ -2247,8 +2252,18 @@ func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request,
 	// phase begins. The keyless fallback creates its own bounded context.
 	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
 	defer leaseCancel()
-	leaseKey, ok := d.queryLeaseKey(leaseCtx, in)
+	leaseKey, ok, err := d.queryLeaseKey(leaseCtx, in)
+	if err != nil {
+		// Transient/internal schema read failure: the routing key could
+		// not be resolved, so fail closed by fencing EVERY group via the
+		// keyless check (a strict superset of the single group this query
+		// would have routed to). leaseReadKeyless writes the same
+		// InternalServerError on its own failure.
+		return d.leaseReadKeyless(w, r)
+	}
 	if !ok {
+		// GSI / whole-table / unresolved-but-valid query: spans multiple
+		// shards, so the keyless all-groups check is the correct fence.
 		return d.leaseReadKeyless(w, r)
 	}
 	if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, leaseKey); err != nil {
@@ -2261,21 +2276,47 @@ func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request,
 // queryLeaseKey resolves the single hash-key prefix a base-table Query
 // reads, at a tentative timestamp (schema only, no readTS sampling), so
 // the lease check can be routed to the owning shard group. It returns
-// (_, false) — signalling the caller to fall back to a keyless lease
-// check — for GSI queries, requests that read the whole-table prefix, or
-// any case where the schema/condition cannot be resolved without
-// duplicating queryItems error handling. Resolution failures here are
-// not surfaced as errors: the read path re-runs the same resolution and
-// reports the identical validation error, so error mapping is unchanged.
-func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]byte, bool) {
+// (prefix, true, nil) when the query routes to exactly one shard group,
+// (nil, false, nil) when the caller should fall back to a keyless all-groups
+// lease check (GSI query, whole-table prefix, table not found, or a query
+// condition that cannot be resolved — all surfaced identically by the read
+// path), and (nil, false, err) for a TRANSIENT/INTERNAL schema-read failure
+// (leaseCtx deadline, Pebble error) so the caller fails closed instead of
+// proceeding with no fence. Validation failures here are not surfaced as
+// errors: the read path re-runs the same resolution and reports the identical
+// validation error, so error mapping is unchanged.
+func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]byte, bool, error) {
 	if strings.TrimSpace(in.IndexName) != "" {
-		return nil, false
+		return nil, false, nil
 	}
 	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, tentativeTS)
-	if err != nil || !exists {
-		return nil, false
+	if err != nil {
+		// loadTableSchemaAt maps ErrKeyNotFound to (_, false, nil); any
+		// error reaching here is a transient store/context/decode failure,
+		// so fail closed.
+		return nil, false, errors.WithStack(err)
 	}
+	if !exists {
+		return nil, false, nil
+	}
+	// resolveQueryCondition / queryScanPrefix only fail on a malformed
+	// query condition (invalid key, unsupported operator) — pure
+	// validation errors that the read path re-runs and rejects identically.
+	// queryLeasePrefix discards them (the caller falls back to the keyless
+	// all-groups check, a strict superset of the single group this query
+	// would have routed to), so only a non-validation, transient/internal
+	// error (already handled above at loadTableSchemaAt) ever fails closed.
+	prefix, ok := queryLeasePrefix(in, schema)
+	return prefix, ok, nil
+}
+
+// queryLeasePrefix resolves the single hash-key prefix a base-table Query
+// reads, returning ok=false for GSI/whole-table/malformed-condition queries
+// that must fall back to the keyless all-groups lease check. Validation
+// errors are deliberately swallowed: they are not surfaced as a routing key,
+// and the read path reports the identical error downstream.
+func queryLeasePrefix(in queryInput, schema *dynamoTableSchema) ([]byte, bool) {
 	keySchema, cond, err := resolveQueryCondition(in, schema)
 	if err != nil {
 		return nil, false
@@ -4397,8 +4438,21 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 	seenKeys := make(map[string]struct{}, len(in.TransactItems))
 	uniqueKeys := make([][]byte, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		itemKey, ok := d.transactGetItemKey(leaseCtx, item, schemaCache, tentativeTS)
+		itemKey, ok, err := d.transactGetItemKey(leaseCtx, item, schemaCache, tentativeTS)
+		if err != nil {
+			// Transient/internal schema read failure (leaseCtx deadline,
+			// Pebble error). Fail closed: silently dropping the item would
+			// leave its shard unfenced and let the later read return a
+			// stale snapshot under exactly the slow conditions the fence
+			// targets. Same InternalServerError mapping as a lease failure.
+			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+			return false
+		}
 		if !ok {
+			// Malformed input (nil Get, empty/unknown table, unresolvable
+			// key). Skipping is safe: the item never reaches a store read,
+			// and buildTransactGetItemsResponses surfaces the identical
+			// validation error downstream so error mapping is unchanged.
 			continue
 		}
 		if _, dup := seenKeys[string(itemKey)]; dup {
@@ -4424,18 +4478,43 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 }
 
 // transactGetItemKey resolves the storage key for one TransactGetItems Get at
-// the tentative timestamp, returning false when the item is malformed or its
-// schema/key cannot be resolved. It never writes a response: validation is left
-// to the read path so error mapping stays identical.
-func (d *DynamoDBServer) transactGetItemKey(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, tentativeTS uint64) ([]byte, bool) {
+// the tentative timestamp. It returns (key, true, nil) on success,
+// (nil, false, nil) when the item is MALFORMED (nil Get, empty/unknown table,
+// or an invalid key) — the read path rejects those identically, so the lease
+// pre-pass may safely skip them — and (nil, false, err) for a TRANSIENT or
+// INTERNAL schema-read failure (leaseCtx deadline, Pebble error) that the
+// caller MUST fail closed on rather than skip, otherwise the item's shard goes
+// unfenced and a stale read can slip through. The malformed/transient split
+// keys off dynamoErrIsTransient: validation errors are *dynamoAPIError,
+// everything else is treated as transient. It never writes a response:
+// validation is left to the read path so error mapping stays identical.
+func (d *DynamoDBServer) transactGetItemKey(ctx context.Context, item transactGetItem, schemaCache map[string]*dynamoTableSchema, tentativeTS uint64) ([]byte, bool, error) {
 	if item.Get == nil || strings.TrimSpace(item.Get.TableName) == "" {
-		return nil, false
+		return nil, false, nil
 	}
 	schema, err := d.resolveTransactTableSchema(ctx, schemaCache, item.Get.TableName, tentativeTS)
 	if err != nil {
-		return nil, false
+		if dynamoErrIsTransient(err) {
+			return nil, false, errors.WithStack(err)
+		}
+		// Validation error (table not found): the read path rejects it
+		// identically, so skip rather than fail closed.
+		return nil, false, nil
 	}
-	itemKey, err := schema.itemKeyFromAttributes(item.Get.Key)
+	// itemKeyFromAttributes only fails on malformed key attributes
+	// (missing/unparseable hash or range key), a pure validation error the
+	// read path rejects identically; transactGetItemKeyFromSchema swallows
+	// it to ok=false so the item is skipped, not failed closed.
+	itemKey, ok := transactGetItemKeyFromSchema(schema, item.Get.Key)
+	return itemKey, ok, nil
+}
+
+// transactGetItemKeyFromSchema computes the storage key for a TransactGetItems
+// Get, returning ok=false when the key attributes are malformed. The error is
+// deliberately discarded: it is a validation failure the read path reports
+// downstream, and the lease pre-pass only needs the routing key.
+func transactGetItemKeyFromSchema(schema *dynamoTableSchema, key map[string]attributeValue) ([]byte, bool) {
+	itemKey, err := schema.itemKeyFromAttributes(key)
 	if err != nil {
 		return nil, false
 	}
@@ -5334,6 +5413,22 @@ func writeDynamoErrorFromErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+}
+
+// dynamoErrIsTransient reports whether err is a transient/internal failure
+// (Pebble error, context deadline, decode failure) as opposed to a structured
+// validation/malformed-input error. A *dynamoAPIError is always a deliberate
+// validation result (it carries an HTTP status + error type), so it is NOT
+// transient; everything else — a raw wrapped store/context error — is. The
+// lease pre-pass uses this to decide whether an unresolvable item must fail
+// closed (transient) or may be skipped (validation, rejected identically by
+// the read path).
+func dynamoErrIsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *dynamoAPIError
+	return !errors.As(err, &apiErr)
 }
 
 func writeDynamoError(w http.ResponseWriter, status int, errorType string, message string) {
