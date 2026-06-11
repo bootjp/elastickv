@@ -4616,13 +4616,22 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 
 // resolveTransactGetItemKeys runs the per-item schema resolution that the
 // lease pre-pass needs. Returns (uniqueKeys, skipLease, transientErr) where
-// skipLease is true when either (a) every item was malformed (nothing to
-// fence) or (b) at least one item was malformed and at least one was valid —
-// the latter means the read path will surface a deterministic 4xx via
-// buildTransactGetItemsResponses without touching any store, so leasing the
-// valid items only risks masking that 4xx with a degraded-shard 500 (codex P2
-// #952). transientErr is the schema-read failure the caller MUST fail closed
-// on (CLAUDE.md: the slow conditions the fence targets are exactly when a
+// skipLease is true when the read path will surface a deterministic 4xx via
+// buildTransactGetItemsResponses without touching any store — leasing the
+// valid items in that case only risks masking that 4xx with a degraded-shard
+// 500 (codex P2 #952). skipLease covers three cases:
+//   - (a) every item was malformed (nothing to fence)
+//   - (b) at least one item was malformed and at least one was valid
+//     (buildTransactGetItemsResponses returns a ValidationException for the
+//     malformed item; the valid items never reach a store read)
+//   - (c) the request contains a duplicate (table, key) pair — DynamoDB
+//     rejects this with `Transaction request cannot include multiple
+//     operations on one item`, a deterministic ValidationException the read
+//     path produces before touching data, so the lease must be skipped for
+//     the same reason malformed-mixed-with-valid is skipped.
+//
+// transientErr is the schema-read failure the caller MUST fail closed on
+// (CLAUDE.md: the slow conditions the fence targets are exactly when a
 // silently-dropped item would let a stale snapshot through).
 func (d *DynamoDBServer) resolveTransactGetItemKeys(ctx context.Context, in transactGetItemsInput) ([][]byte, bool, error) {
 	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
@@ -4630,6 +4639,7 @@ func (d *DynamoDBServer) resolveTransactGetItemKeys(ctx context.Context, in tran
 	seenKeys := make(map[string]struct{}, len(in.TransactItems))
 	uniqueKeys := make([][]byte, 0, len(in.TransactItems))
 	hasMalformed := false
+	hasDuplicate := false
 	for _, item := range in.TransactItems {
 		itemKey, ok, err := d.transactGetItemKey(ctx, item, schemaCache, tentativeTS)
 		if err != nil {
@@ -4640,12 +4650,13 @@ func (d *DynamoDBServer) resolveTransactGetItemKeys(ctx context.Context, in tran
 			continue
 		}
 		if _, dup := seenKeys[string(itemKey)]; dup {
+			hasDuplicate = true
 			continue
 		}
 		seenKeys[string(itemKey)] = struct{}{}
 		uniqueKeys = append(uniqueKeys, itemKey)
 	}
-	if hasMalformed || len(uniqueKeys) == 0 {
+	if hasMalformed || hasDuplicate || len(uniqueKeys) == 0 {
 		return nil, true, nil
 	}
 	return uniqueKeys, false, nil

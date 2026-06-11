@@ -278,6 +278,57 @@ func TestDynamoDB_TransactGetItems_MalformedMixedWithValidSkipsLease(t *testing.
 	require.Equal(t, int64(0), coord.leaseReadCalls.Load())
 }
 
+// TestDynamoDB_TransactGetItems_DuplicateKeySkipsLease asserts the regression
+// for codex P2 #952 round-2 (line 4643): a TransactGetItems request with
+// duplicate (table, key) pairs is a deterministic ValidationException that
+// the read path produces before touching any data. Pre-fix the loop silently
+// dedup'd via the seenKeys map and called LeaseReadForKeyThrough on the
+// surviving unique key — in a degraded shard the lease failure surfaced as
+// 500 InternalServerError and masked the 4xx. Post-fix a hasDuplicate flag
+// joins hasMalformed in the skip-lease condition so the lease pre-pass exits
+// without touching any shard.
+func TestDynamoDB_TransactGetItems_DuplicateKeySkipsLease(t *testing.T) {
+	t.Parallel()
+
+	schema := &dynamoTableSchema{
+		TableName:          "t",
+		Generation:         1,
+		KeyEncodingVersion: dynamoOrderedKeyEncodingV2,
+		AttributeDefinitions: map[string]string{
+			"pk": "S",
+		},
+		PrimaryKey: dynamoKeySchema{HashKey: "pk"},
+	}
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(schema)
+
+	coord := &leaseReadCountingCoordinator{stubAdapterCoordinator: &stubAdapterCoordinator{}}
+	server := NewDynamoDBServer(nil, st, coord)
+
+	in := transactGetItemsInput{
+		TransactItems: []transactGetItem{
+			{Get: &transactGetItemGet{
+				TableName: "t",
+				Key:       map[string]attributeValue{"pk": newStringAttributeValue("dup")},
+			}},
+			{Get: &transactGetItemGet{
+				TableName: "t",
+				Key:       map[string]attributeValue{"pk": newStringAttributeValue("dup")},
+			}},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
+	require.True(t, server.leaseCheckTransactGetItems(rec, req, in),
+		"a duplicate (table, key) pair is a deterministic ValidationException — the lease pre-pass must skip leasing so a degraded shard cannot mask the 4xx with a 500 (codex P2 #952)")
+	require.Equal(t, http.StatusOK, rec.Code, "no error response should be written for duplicate keys")
+	require.Equal(t, int64(0), coord.leaseReadForKeyCalls.Load(),
+		"duplicate keys must NOT trigger a lease — the transaction is already doomed by the duplicate-item ValidationException")
+	require.Equal(t, int64(0), coord.leaseReadCalls.Load())
+}
+
 // TestDynamoDB_TransactGetItems_MalformedItemStillSkipped asserts the
 // malformed-input path is unchanged: an item whose schema does not exist
 // (ResourceNotFoundException, a validation error) is still skipped, not failed
