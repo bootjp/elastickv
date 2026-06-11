@@ -597,15 +597,16 @@ Codex round-9 P1: §7.2.2's ownership check resolves the scan's **start key** ag
 
 This is not hypothetical — `ScanAt` / `ReverseScanAt` underlie Redis `KEYS` / `HSCAN` / `LRANGE`, DynamoDB `Scan` / GSI `Query`, S3 `ListObjects`, etc. Any such call straddling the split boundary in the equal-stale window would observe the regression.
 
-The fix is a **scan-interval ownership gate** on the source FSM, parallel to §7.2.2's point-key gate:
+The fix is a **scan-interval ownership gate** on the source FSM, parallel to §7.2.2's point-key gate. Like the point-key gate it has **two branches** keyed on the watermark, so it catches both the "coordinator-stale, source-up-to-date" and the "coordinator-and-source-equal-stale" cases (closes claude round-10 P1 on equal-stale scans, PR #945):
 
-- When the FSM applies a read whose request shape is `ScanAt(start, end)` (or its reverse / lease-read variants), the FSM additionally calls `GetIntersectingRoutes(start, end)` against its **own** current catalog snapshot (not the stale coordinator's). If **every** intersecting route is owned by this group, the scan proceeds as today.
-- If **any** intersecting route is owned by a different group, the FSM returns `ErrRouteMoved{new_route_version, new_group_id, sub_range_start, sub_range_end}` for the **first** foreign-owned sub-range encountered (lexicographically smallest). The coordinator's existing `WatcherRefresh` + retry path (§7.2.3) re-issues the scan; on retry the now-fresh engine returns the correct two routes and `routesForScan` splits the scan into `[A, M)` to source and `[M, Z)` to target, both fenced correctly under their respective FSMs' point-key gates.
-- The §7.2.2 point-key gate still runs (for the scan's start key) so the watermark / equal-stale logic continues to apply; the new check is **in addition to**, not in place of.
+- **Branch 1 — source has applied CUTOVER (`source_local_version >= cutover_version`).** The FSM calls `GetIntersectingRoutes(start, end)` against its **own** current catalog snapshot. If **every** intersecting route is owned by this group, the scan proceeds. If **any** intersecting route is owned by a different group, the FSM returns `ErrRouteMoved{new_route_version, new_group_id, sub_range_start, sub_range_end}` for the **first** foreign-owned sub-range encountered (lexicographically smallest).
+- **Branch 2 — source has NOT applied CUTOVER but `max_cutover_version_seen > source_local_version` (equal-stale, watcher lag).** The local snapshot still says `source.Active(full: [A, Z))` — a single route, no foreign owner visible — so Branch 1 alone would silently pass a cross-boundary scan. The gate therefore additionally calls `GetIntersectingRoutes([start, end), catalog_version = max_cutover_version_seen)` as a single best-effort, deadline-bounded RPC to the **default-group leader** (mirroring exactly §7.2.2's point-key extension — same watermark trigger, same RPC target, same 1 s cache TTL with cache key `(start, end, max_cutover_version_seen)`). The default-group leader answers from its current catalog snapshot. If any returned route is owned by another group, the source FSM returns `ErrRouteMoved{max_cutover_version_seen, foreign_group_id, sub_range_start, sub_range_end}` for the first foreign-owned sub-range. If every returned route is still source-owned (the elevated watermark covers an *unrelated* migration that did not touch this scan range), the scan proceeds normally.
+- **Coordinator path identical in both branches.** The coordinator's existing `WatcherRefresh` + retry path (§7.2.3) re-issues the scan; on retry the fresh engine returns the correct two routes and `routesForScan` splits the scan into `[A, M)` to source and `[M, Z)` to target, both fenced correctly.
+- **The §7.2.2 point-key gate still runs** for the scan's start key — the new check is **in addition to**, not in place of, so the watermark / equal-stale logic at the start key continues to apply.
 
-Implementation cost: one additional `GetIntersectingRoutes` call per scan on the FSM, against the same `RouteSnapshot` the point-key gate already loads. Memory: bounded by the number of routes intersecting the scan (typically 1–2; the rare cross-multi-boundary scan is the same `O(routes_in_range)` the coordinator already pays).
+Implementation cost: one additional `GetIntersectingRoutes` call per scan on the FSM. Branch 1 (the common case once watcher catches up) is local-only. Branch 2 adds at most one cached RPC to the default-group leader per `(start, end, max_cutover_version_seen)` per second — bounded by the same cache as §7.2.2's point-key extension. Memory: bounded by the number of routes intersecting the scan (typically 1–2; the rare cross-multi-boundary scan is the same `O(routes_in_range)` the coordinator already pays).
 
-The §7.2.2a equal-stale walkthrough is extended in §7.2.2c with a parallel scan-shape walkthrough to demonstrate the gate catches the case above.
+The §7.2.2a equal-stale walkthrough is extended in §7.2.2c (Branch 1 scenario) and §7.2.2d (Branch 2 / equal-stale scenario) with parallel scan-shape walkthroughs to demonstrate both branches catch their case.
 
 #### 7.2.2c Equal-stale scan walkthrough
 
@@ -618,6 +619,19 @@ Continuing from §7.2.2a's setup, with the post-CUTOVER catalog v+1 = `source.Ac
 5. `t=6`: C1 receives `ErrRouteMoved`, runs `WatcherRefresh`, advances its engine to `v+1`, and re-routes the scan as two sub-scans: `[A, M)` to source and `[M, Z)` to target. Both succeed; the merged result is the consistent post-CUTOVER snapshot. No stale data for `[M, Z)` was ever returned.
 
 The gate runs at apply time on the source FSM, not on the coordinator, so even a coordinator with a paused `WatcherRefresh` cannot serve mixed pre/post-CUTOVER data — the source FSM is the chokepoint that knows the authoritative current catalog.
+
+#### 7.2.2d Equal-stale cross-boundary scan walkthrough — Branch 2
+
+Same `t=0..t=2` setup as §7.2.2a (CUTOVER commits at `v+1`, default-group heartbeat carries `max_cutover_version_seen = v+1` immediately, source-group leader has received the heartbeat but its FSM watcher has **not yet** applied `v+1` — `source_local_version` is still `v`):
+
+1. `t=3`: source-group leader's local atomic `max_cutover_version_seen = v+1`, but FSM-local `source_local_version = v`. Source FSM snapshot still says `source.Active(full: [A, Z))`.
+2. `t=4`: stale coordinator C1 issues `ScanAt([D, Z), ts=now)` where `D ∈ [A, M)` — scan starts in the non-moved left half and ends in the moved right half. `read_route_version = v`.
+3. Coordinator's `routesForScan` against its v-catalog returns `[source.Active(full: [A, Z))]` → entire scan dispatched to source group.
+4. Source FSM receives the scan. §7.2.2 **point-key gate** runs: `max_cutover_version_seen (v+1) > source_local_version (v)` → equal-stale watermark fires; FSM calls `GetRouteOwnership(routeKey(D), v+1)` to the default-group leader → answer: "owned by source (left half)". Point-key check passes (the scan's START key is still source-owned).
+5. **§7.2.2b scan-interval gate Branch 2 fires** (because watermark is elevated): FSM calls `GetIntersectingRoutes([D, Z), catalog_version = v+1)` to the default-group leader → returns `[source.Active(left: [D, M)), target.Active(right: [M, Z))]`. The second route is owned by target. The FSM returns `ErrRouteMoved{v+1, target_group_id, M, Z}` for the moved sub-range. **The gap §7.2.2c's Branch 1 would have left open is now closed** — without Branch 2, step 5 would have run `GetIntersectingRoutes` against the FSM's own `v` snapshot, returned the single `source.Active(full)` route, and served the entire scan stale.
+6. `t=5`: C1 receives `ErrRouteMoved`, runs `WatcherRefresh`, advances to `v+1`, and re-issues the scan as two sub-scans: `[D, M)` to source and `[M, Z)` to target. Both succeed; the merged result is consistent. No stale data for `[M, Z)` was ever returned.
+
+The Branch 2 RPC to the default-group leader is cached for 1 second per `(start, end, max_cutover_version_seen)`, so a burst of cross-boundary scans during the watcher-lag window pays at most one RPC per second across all of them. Once the watcher catches up (`source_local_version >= cutover_version`), Branch 1 takes over and the local snapshot is authoritative — the cached Branch 2 results are no longer consulted.
 
 #### 7.2.3 Coordinator-side fallback
 
