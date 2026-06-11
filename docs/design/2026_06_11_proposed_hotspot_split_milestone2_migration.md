@@ -65,6 +65,8 @@ Key layout:
 | `cutover_version` | uint64 | Catalog version produced by the CUTOVER write; populated at CUTOVER, used by §7.2 read-fence and §4.2 GC. |
 | `cursor` | bytes | Opaque (raw_key, commit_ts) export position for BACKFILL / DELTA_COPY resume — addresses an MVCC version, not a raw key, so a hot key with many committed versions can be chunked safely across batches (see §6.1.1). |
 | `max_imported_ts` | uint64 | Monotone HLC ceiling: the largest `commit_ts` ever included in an ack'd import batch for this job. Used by §6.2.1 to advance the target group's HLC at CUTOVER. |
+| `promote_cursor` | bytes | Opaque cursor for the §6.4 incremental staged-to-live promoter. Same encoding as §6.1.1; advances during background promotion after CUTOVER. |
+| `promotion_completed_ts` | uint64 | HLC commit-ts of the apply that cleared `staged_visibility_active` and ended CLEANUP. Diagnostic / audit only. |
 | `last_error` | string | Most recent transient failure (for operator diagnosis). |
 | `started_at`, `updated_at`, `terminal_at` | int64 | Wall-clock ms; **diagnostic only**, must not be read by any ordering-sensitive logic (CLAUDE.md HLC rule). `terminal_at` is set when phase enters DONE/FAILED. |
 
@@ -144,7 +146,7 @@ catalog snapshot evolution                migrator action
 [ target.Active(right)          ]
 ```
 
-Key invariant: **catalog snapshots never contain overlapping ranges**. The target shadow keyspace lives outside the catalog (BACKFILL / DELTA_COPY land into private `!dist|migstage|<job_id>|<raw_key>` keys on the target group's MVCC store; CUTOVER promotes the staged data to live keys via a single bulk-rename FSM apply). This keeps `routesFromCatalog` + `validateRouteOrder` (`distribution/engine.go:496-527`) green throughout the migration — addresses codex P1 on overlapping routes (PR #945 review). RouteState `MigratingSource` / `MigratingTarget` are reserved but unused in M2; they remain available for a future merge / multi-stage migration design.
+Key invariant: **catalog snapshots never contain overlapping ranges**. The target shadow keyspace lives outside the catalog (BACKFILL / DELTA_COPY land into private `!dist|migstage|<job_id>|<raw_key>` keys on the target group's MVCC store; CUTOVER **does not** bulk-rename them — promotion is incremental and runs as a target-side background job after CUTOVER, see §6.2.2). This keeps `routesFromCatalog` + `validateRouteOrder` (`distribution/engine.go:496-527`) green throughout the migration — addresses codex P1 on overlapping routes (PR #945 review). RouteState `MigratingSource` / `MigratingTarget` are reserved but unused in M2; they remain available for a future merge / multi-stage migration design.
 
 The Composed-1 gate rejects an apply on the wrong group at the observed catalog version; CUTOVER bumps `catalog_version` so any straggler write from an unaware coordinator fails closed at apply time on either side.
 
@@ -391,6 +393,39 @@ The closure ensures internal keys (`!txn|...`, `!lst|...`, redis hash/list/etc.)
 
 A simple safety check: every exported key in the migrator's send buffer must map back to the moving range under `routeKey()`. The migrator asserts this on every row before the gRPC send; an assertion failure aborts the job and surfaces in `last_error`. The assertion guards against a future internal-key family being added that someone forgot to teach `routeKey()`.
 
+### 6.4 Incremental staged-to-live promotion — CUTOVER is constant-time (closes codex P2 on PR #945)
+
+Codex P2 round-3 on PR #945 (line 147): "staging every imported row under `!dist|migstage|...` and then promoting the whole range via a single FSM apply makes CUTOVER proportional to the entire migrated range. For any split larger than the Raft proposal/apply budget, this defeats the chunked BACKFILL/DELTA_COPY design and can block or fail exactly when the catalog must switch atomically." The proposal must therefore avoid a per-key bulk move at cutover. M2 ships an incremental promotion path that keeps CUTOVER a constant-time catalog write while preserving the visibility fence:
+
+1. **CUTOVER itself is one catalog write — no per-key work.** The CUTOVER FSM apply on the default group does **only**:
+   - (a) CAS-bump the catalog version,
+   - (b) remove the source's `WriteFenced(right)` route,
+   - (c) insert the target's `Active(right)` route with `raft_group_id = target`,
+   - (d) populate `cutover_version` on the SplitJob and stamp `staged_visibility_active = true` on the new target route.
+
+   No iteration over the migrated key range, no bulk rename, no per-key proposals. The Raft proposal carrying this apply is `O(1)` in the migrated data size — bounded by a handful of catalog descriptors and the SplitJob record.
+
+2. **Staged keyspace stays visible through a per-route flag.** After CUTOVER the target FSM's read path checks the route's `staged_visibility_active` bit. When set, a read for key `K` in the moved range first looks up `!dist|migstage|<job_id>|<K>` and falls back to the live key only if the staged entry is absent. (Writes always land in the live keyspace — the CUTOVER bump already routed writers to the target group via the catalog, and §6.2.1's HLC ceiling advance guarantees their `commit_ts` is strictly greater than every imported `commit_ts`, so a live write shadowing a staged version is the *correct* MVCC visibility.) This gives reads access to the imported data the instant CUTOVER lands, with **no promotion work blocking CUTOVER itself**.
+
+3. **Background incremental promoter on the target group.** Immediately after CUTOVER the target group's FSM starts a **leader-local promoter goroutine** that walks the `!dist|migstage|<job_id>|*` prefix in cursor-resumable chunks (the same `chunkBytes` / pacing knobs §6.1 and the migrator already use), and for each staged version proposes one `PromoteStaged` Raft entry that:
+   - copies the staged key into its live position (no-op when a later live write has already shadowed it; the FSM applies `metaLastCommitTS`-respecting MVCC put),
+   - deletes the staged key,
+   - advances the per-job `promote_cursor` on the SplitJob.
+   Each batch is a small bounded proposal, exactly like BACKFILL — there is no single oversized apply.
+
+4. **Promotion is restart-safe.** The promoter is leader-only; a leader flap restarts from `promote_cursor`. Concurrent reads keep using the staged-fallback path (step 2) for whatever has not yet been promoted, so the user-visible state is correct throughout.
+
+5. **CLEANUP → DONE precondition.** The SplitJob does not advance from CLEANUP to DONE until **both** (a) the read-fence grace window (§7.2.4) has elapsed AND (b) the promoter has reported "no staged keys remain" (the prefix scan finds nothing) AND (c) one final apply clears `staged_visibility_active` on the target route. Once cleared, reads no longer pay the staged-fallback cost; the route is indistinguishable from any other Active route. The migrator records the final apply's commit_ts as `promotion_completed_ts` on the SplitJob for audit.
+
+6. **Edge cases.**
+   - **Hot key with many versions** (codex P2 on cursor granularity, §6.1.1): the promoter iterates the staged prefix in `(raw_key ASC, commit_ts DESC)` order using the same opaque-cursor codec; the staged-fallback read path treats a key with multiple staged versions identically to the MVCC iterator. No version chain is materialised in one apply.
+   - **Concurrent writes during promotion**: a live write at `commit_ts > max_imported_ts` lands ahead of the staged version it shadows; the FSM's per-key `metaLastCommitTS` check applied by step 3's `PromoteStaged` keeps the staged copy from overwriting a fresher live value. The staged-fallback read at any `read_ts ≥ live_write.commit_ts` sees the live value; at any `read_ts ∈ (max_imported_ts, live_write.commit_ts)` sees the imported value via the staged-fallback. Both correct.
+   - **AbandonSplitJob after CUTOVER** is still rejected (§4); abandoning post-CUTOVER would leave half-promoted state visible.
+
+7. **Per-PR landing.** M2-PR6 ships the staged-fallback read path + `PromoteStaged` apply (mechanics); M2-PR7 ships the background promoter + CLEANUP precondition. PR4-PR5 land the catalog flag and the SplitJob fields needed by PR6/PR7 so the wire is in place before the runtime turns on. The incremental design is therefore a strict superset of the chunked BACKFILL/DELTA_COPY semantics — the same chunk sizing, the same cursor codec, the same leader-flap recovery — applied to the promotion step instead of one bulk apply at CUTOVER.
+
+The result: CUTOVER is a single bounded catalog write, never `O(migrated range)`, and the visibility fence is preserved by the per-route flag plus the staged-fallback. The migrator still gets resumable, bounded apply costs for the actual data move; the catalog switch itself is decoupled from the data volume. This closes codex P2 line 147 on PR #945 without weakening any consistency property already established by §6.2.1 (HLC ceiling) or §7.2 (read fence).
+
 ## 7. Coordinator / FSM Integration
 
 ### 7.1 FENCE write rejection
@@ -402,9 +437,12 @@ Coordinator-side:
   - Redis adapter: `MOVED`-style retry (existing path).
   - DynamoDB adapter: throttled error so the SDK retries with backoff.
 
-FSM-side defense in depth:
+FSM-side defense in depth — **must run on an unconditional apply path** (closes codex round-3 P1 on PR #945):
 
-- `kv/fsm.go` already routes through `verifyComposed1` at apply. Extend `verifyOwnerFromSnapshot` to also reject when the resolved route's state is `WriteFenced` — even if a coordinator with a stale engine forwarded a write, the FSM closes the door. The error wraps `ErrRouteWriteFenced` so M4 retry logic differentiates from `ErrComposed1Violation`.
+- The naïve placement — extend `verifyOwnerFromSnapshot` so it also rejects routes in `WriteFenced` — does NOT work. `verifyComposed1` short-circuits when `ObservedRouteVersion == 0` (`kv/fsm.go:608-611`), and there are several **intentional zero-version write paths today**: read/write txns with `ReadKeys`, caller-supplied `StartTS`, and resolver-claimed keys all dispatch with `ObservedRouteVersion = 0` (`kv/sharded_coordinator.go:694-754`, M3 sibling §3.5 + auto-pin policy). A stale coordinator in any of those flows would forward a write to the source during FENCE and the FSM defense would never run. The fence must be enforced **before** any version-conditional early return.
+- M2 therefore introduces a **separate, unconditional pre-gate** `verifyRouteNotFenced(mutations)` in `kv/fsm.go` that the apply path consults **before** `verifyComposed1`. It scans the mutations exactly as `verifyOwnerFromSnapshot` does — `routeKey(mut.Key)` against the **current** catalog snapshot — and rejects with `ErrRouteWriteFenced` when **any** key resolves to a route whose `RouteState == WriteFenced`. No dependency on `ObservedRouteVersion`, no early return on `0`; the gate runs on every applied write request unconditionally (it has the same `Phase_ABORT` bypass as the Composed-1 gate, for the same lock-release reason in §3.5 of the parent partial doc).
+- Concretely, the apply path becomes: `verifyRouteNotFenced` → `verifyComposed1` → existing handlers. `verifyRouteNotFenced` reads the current `RouteSnapshot` once (the same one `verifyComposed1` would have read at the current-version check) and looks up each mutation key's route state. Cost is bounded by the existing per-mutation `OwnerOf` call already done at apply time when ObservedRouteVersion is non-zero; the new path adds it for the zero-version case too. The two gates stay independent so a future change to one cannot regress the other (same isolation rationale as `verifyReadOwner` next to `verifyOwnerFromSnapshot` in §7.2.5).
+- Forward-compatibility hook (M3): a follow-on change can flip the `ObservedRouteVersion == 0` short-circuit off entirely once every M2-shipped flow stamps a non-zero version, at which point `verifyRouteNotFenced` collapses into a `verifyComposed1` invariant. M2 ships the safe form (unconditional pre-gate) so the FENCE rejection cannot be silently bypassed before that cleanup lands.
 
 Reads during FENCE / DELTA_COPY are **not** rejected: `ShardStore.GetAt` continues to serve from source. Snapshot reads at any `commit_ts ≤ fence_ts` remain consistent because the source's MVCC history is unchanged through DELTA_COPY. The post-CUTOVER read-side fence is §7.2.
 
