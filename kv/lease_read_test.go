@@ -21,6 +21,9 @@ type fakeLeaseEngine struct {
 	leaseDur                 time.Duration
 	linearizableErr          error
 	linearizableCalls        atomic.Int32
+	proposeErr               error // when set, Propose returns it (warm-up failure tests)
+	proposeCalls             atomic.Int32
+	proposeHook              func()       // invoked inside Propose before returning (race injection)
 	state                    atomic.Value // stores raftengine.State; default Leader
 	lastQuorumAckMonoNs      atomic.Int64 // 0 = no ack yet. Updated by setQuorumAck().
 	leaderLossCallbacksMu    sync.Mutex
@@ -60,6 +63,13 @@ func (e *fakeLeaseEngine) Configuration(context.Context) (raftengine.Configurati
 	return raftengine.Configuration{}, nil
 }
 func (e *fakeLeaseEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	e.proposeCalls.Add(1)
+	if e.proposeHook != nil {
+		e.proposeHook()
+	}
+	if e.proposeErr != nil {
+		return nil, e.proposeErr
+	}
 	return &raftengine.ProposalResult{}, nil
 }
 func (e *fakeLeaseEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {

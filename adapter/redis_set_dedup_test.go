@@ -28,7 +28,12 @@ func TestStandaloneSetDedup_LandedPriorAttempt_ReturnsOK(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	coord := newDedupTestCoordinator(st, 1, true) // attempt 1 lands then errors
-	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+	// Both gates: onePhaseTxnDedup is the umbrella; standaloneSetDedup is
+	// the per-path sub-gate that opts the *standalone* SET branch into
+	// the dedup routing. The sub-gate defaults off (PR #943 round-1 codex
+	// P1 — applySet diverges from executeSet on SET-over-collection).
+	// Tests that pin the dedup-on routing must explicitly enable both.
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true, standaloneSetDedup: true}
 
 	conn := &recordingConn{}
 	cmd := redcon.Command{Args: [][]byte{[]byte(cmdSet), []byte("k"), []byte("v1")}}
@@ -61,7 +66,12 @@ func TestStandaloneSetDedup_NXMissReturnsNil(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, redisStrKey([]byte("k")), encodeRedisStr([]byte("seed"), nil), 5, 0))
 
 	coord := newDedupTestCoordinator(st, 1, true) // attempt 1 lands then errors
-	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+	// Both gates: onePhaseTxnDedup is the umbrella; standaloneSetDedup is
+	// the per-path sub-gate that opts the *standalone* SET branch into
+	// the dedup routing. The sub-gate defaults off (PR #943 round-1 codex
+	// P1 — applySet diverges from executeSet on SET-over-collection).
+	// Tests that pin the dedup-on routing must explicitly enable both.
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true, standaloneSetDedup: true}
 
 	conn := &recordingConn{}
 	// SET k v1 NX -- attempt 1 records resultNil because NX miss.
@@ -99,7 +109,12 @@ func TestStandaloneSetDedup_GETOptionReturnsOldBulk(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, redisStrKey([]byte("k")), encodeRedisStr([]byte("prior"), nil), 5, 0))
 
 	coord := newDedupTestCoordinator(st, 1, true) // attempt 1 lands then errors
-	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+	// Both gates: onePhaseTxnDedup is the umbrella; standaloneSetDedup is
+	// the per-path sub-gate that opts the *standalone* SET branch into
+	// the dedup routing. The sub-gate defaults off (PR #943 round-1 codex
+	// P1 — applySet diverges from executeSet on SET-over-collection).
+	// Tests that pin the dedup-on routing must explicitly enable both.
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true, standaloneSetDedup: true}
 
 	conn := &recordingConn{}
 	// SET k v1 GET -- attempt 1 records resultBulk("prior").
