@@ -585,6 +585,40 @@ To make the §7.2.2 fix concrete:
 
 Without the watermark + ownership-query path, step 6 would have returned the pre-CUTOVER value because the strict-less-than version check passed.
 
+#### 7.2.2b Scan-interval ownership gate — point-key check is insufficient for scans (closes codex P1 round-9 on PR #945)
+
+Codex round-9 P1: §7.2.2's ownership check resolves the scan's **start key** against `routeKey(scan_start)`, but a `ScanAt(start, end)` or `ReverseScanAt(start, end)` spans **a range**, and a stale-coordinator scan that straddles the post-CUTOVER split boundary can pass the point-key check while serving stale data for the moved sub-range. Concrete failure scenario (verified against `kv/shard_store.go:164-228`):
+
+1. After CUTOVER, the catalog is at version `v+1`: `source.Active(left: [A, M))`, `target.Active(right: [M, Z))`.
+2. A coordinator stale at version `v` still sees `source.Active(full: [A, Z))` — one route.
+3. Client calls `ScanAt([A, Z), ts)`. The coordinator's `routesForScan` calls `engine.GetIntersectingRoutes([A, Z))` against the stale engine → returns the single `source.Active(full)` route, and dispatches the entire scan to the source group.
+4. Source FSM's §7.2.2 point-key check resolves `routeKey(A)` → still owned by source under its **current** catalog (left half is `source.Active([A, M))`). Check passes.
+5. Source FSM executes the full `[A, Z)` scan over its MVCC store, returning **live data for `[A, M)` AND stale pre-CUTOVER data for `[M, Z)`** — the target has already received post-CUTOVER writes for that range, but the source has the historical versions for those keys still resident (CLEANUP grace window). Client sees a snapshot that mixes pre- and post-CUTOVER state across the boundary. This is the read-side analogue of the §3.2a write-loss window the source-side fence-apply barrier closes.
+
+This is not hypothetical — `ScanAt` / `ReverseScanAt` underlie Redis `KEYS` / `HSCAN` / `LRANGE`, DynamoDB `Scan` / GSI `Query`, S3 `ListObjects`, etc. Any such call straddling the split boundary in the equal-stale window would observe the regression.
+
+The fix is a **scan-interval ownership gate** on the source FSM, parallel to §7.2.2's point-key gate:
+
+- When the FSM applies a read whose request shape is `ScanAt(start, end)` (or its reverse / lease-read variants), the FSM additionally calls `GetIntersectingRoutes(start, end)` against its **own** current catalog snapshot (not the stale coordinator's). If **every** intersecting route is owned by this group, the scan proceeds as today.
+- If **any** intersecting route is owned by a different group, the FSM returns `ErrRouteMoved{new_route_version, new_group_id, sub_range_start, sub_range_end}` for the **first** foreign-owned sub-range encountered (lexicographically smallest). The coordinator's existing `WatcherRefresh` + retry path (§7.2.3) re-issues the scan; on retry the now-fresh engine returns the correct two routes and `routesForScan` splits the scan into `[A, M)` to source and `[M, Z)` to target, both fenced correctly under their respective FSMs' point-key gates.
+- The §7.2.2 point-key gate still runs (for the scan's start key) so the watermark / equal-stale logic continues to apply; the new check is **in addition to**, not in place of.
+
+Implementation cost: one additional `GetIntersectingRoutes` call per scan on the FSM, against the same `RouteSnapshot` the point-key gate already loads. Memory: bounded by the number of routes intersecting the scan (typically 1–2; the rare cross-multi-boundary scan is the same `O(routes_in_range)` the coordinator already pays).
+
+The §7.2.2a equal-stale walkthrough is extended in §7.2.2c with a parallel scan-shape walkthrough to demonstrate the gate catches the case above.
+
+#### 7.2.2c Equal-stale scan walkthrough
+
+Continuing from §7.2.2a's setup, with the post-CUTOVER catalog v+1 = `source.Active(left: [A, M))`, `target.Active(right: [M, Z))`:
+
+1. `t=4`: stale coordinator C1 issues `ScanAt([A, Z), ts=now)` with `read_route_version = v`.
+2. Coordinator's `routesForScan` against its v-catalog returns `[source.Active(full: [A, Z))]` → entire scan dispatched to source group.
+3. `t=5`: source FSM applies the scan. §7.2.2 point-key gate resolves `routeKey(A)` against the current snapshot at `v+1` → owned by source (left half). Point-key check passes.
+4. **§7.2.2b scan-interval gate fires**: source FSM calls `GetIntersectingRoutes([A, Z))` against its `v+1` catalog → returns `[source.Active(left: [A, M)), target.Active(right: [M, Z))]`. The second route is owned by target, not source. The FSM returns `ErrRouteMoved{v+1, target_group_id, M, Z}` for the moved sub-range.
+5. `t=6`: C1 receives `ErrRouteMoved`, runs `WatcherRefresh`, advances its engine to `v+1`, and re-routes the scan as two sub-scans: `[A, M)` to source and `[M, Z)` to target. Both succeed; the merged result is the consistent post-CUTOVER snapshot. No stale data for `[M, Z)` was ever returned.
+
+The gate runs at apply time on the source FSM, not on the coordinator, so even a coordinator with a paused `WatcherRefresh` cannot serve mixed pre/post-CUTOVER data — the source FSM is the chokepoint that knows the authoritative current catalog.
+
 #### 7.2.3 Coordinator-side fallback
 
 If the engine's local catalog is behind the FSM's `new_route_version`, the coordinator does a single best-effort `WatcherRefresh` and retries once. Repeated `ErrRouteMoved` surfaces to the client only on persistent inconsistency (alert-worthy).
