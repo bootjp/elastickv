@@ -158,9 +158,11 @@ directory that still holds legacy HashiCorp Raft artifacts (`raft.db`).
 The legacy HashiCorp Raft backend and its offline migrator
 (`cmd/etcd-raft-migrate`) were removed in commit `a35245a` once the one-time
 migration to `etcd/raft` was complete. If you still need to migrate an old
-HashiCorp-backed store, retrieve the migrator from git history at the commit
-before `a35245a` (`git show a35245a^:cmd/etcd-raft-migrate/main.go`). See
-`docs/etcd_raft_migration_operations.md` for the historical procedure.
+HashiCorp-backed store, run the migrator by checking out the whole repository at
+the commit before `a35245a` (`a35245a^`) — extracting a single file will not
+build, because the migrator links against module dependencies that were dropped
+along with it. See `docs/etcd_raft_migration_operations.md` for the historical
+procedure.
 
 ### Starting the Client
 

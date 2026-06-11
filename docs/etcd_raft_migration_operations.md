@@ -40,16 +40,22 @@ can be used.
 ## Retrieving the removed migrator
 
 `cmd/etcd-raft-migrate` (and `cmd/etcd-raft-rollback`) were deleted in commit
-`a35245a`. To run the historical migration steps below, first restore the
-migrator from git history into a scratch directory:
+`a35245a`, along with the `go.mod` entries for the HashiCorp backend packages the
+migrator links against. Extracting a single `main.go` is not enough — the
+migrator only builds inside the contemporaneous module tree. To run the
+historical migration steps below, check out the whole repository at `a35245a^`
+(the commit before the removal) in a scratch directory and run the migrator from
+there:
 
 ```bash
-git show a35245a^:cmd/etcd-raft-migrate/main.go > /tmp/etcd-raft-migrate/main.go
+git clone https://github.com/bootjp/elastickv.git /tmp/elastickv-migration
+cd /tmp/elastickv-migration
+git checkout a35245a^
+go build ./cmd/etcd-raft-migrate   # verify it builds against the pinned tree
 ```
 
-Build it against a checkout pinned at `a35245a^`, since the migrator depended on
-the since-removed HashiCorp backend packages. The `go run ./cmd/etcd-raft-migrate`
-invocations in the steps below assume such a restored checkout.
+The `go run ./cmd/etcd-raft-migrate` invocations in the steps below assume you run
+them from inside this pinned checkout, not the current tree.
 
 ## Preconditions
 
