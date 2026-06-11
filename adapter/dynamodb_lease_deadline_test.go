@@ -5,6 +5,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/store"
@@ -19,17 +21,31 @@ import (
 type schemaDeadlineStore struct {
 	store.MVCCStore
 
-	metaKey         []byte
+	metaKey []byte
+
+	// mu guards sawMetaGet/metaHadDeadline so the check-then-set in GetAt is
+	// race-free if the handler ever issues concurrent schema reads.
+	mu              sync.Mutex
 	sawMetaGet      bool
 	metaHadDeadline bool
 }
 
 func (s *schemaDeadlineStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	if !s.sawMetaGet && bytes.Equal(key, s.metaKey) {
-		s.sawMetaGet = true
-		_, s.metaHadDeadline = ctx.Deadline()
+	if bytes.Equal(key, s.metaKey) {
+		s.mu.Lock()
+		if !s.sawMetaGet {
+			s.sawMetaGet = true
+			_, s.metaHadDeadline = ctx.Deadline()
+		}
+		s.mu.Unlock()
 	}
 	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+func (s *schemaDeadlineStore) observed() (sawMetaGet bool, metaHadDeadline bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sawMetaGet, s.metaHadDeadline
 }
 
 // newSchemaDeadlineServer builds a DynamoDB server over a real MVCC store
@@ -95,8 +111,9 @@ func TestDynamoDB_LeaseCheckQuery_SchemaReadBounded(t *testing.T) {
 	rec := httptest.NewRecorder()
 	require.True(t, server.leaseCheckQuery(rec, noDeadlineRequest(t), in))
 
-	require.True(t, recording.sawMetaGet, "lease pre-pass must read the table schema")
-	require.True(t, recording.metaHadDeadline,
+	sawMetaGet, metaHadDeadline := recording.observed()
+	require.True(t, sawMetaGet, "lease pre-pass must read the table schema")
+	require.True(t, metaHadDeadline,
 		"queryLeaseKey schema read must run under the bounded leaseCtx, not the deadline-free request context")
 }
 
@@ -124,8 +141,9 @@ func TestDynamoDB_LeaseCheckTransactGetItems_SchemaReadBounded(t *testing.T) {
 	rec := httptest.NewRecorder()
 	require.True(t, server.leaseCheckTransactGetItems(rec, noDeadlineRequest(t), in))
 
-	require.True(t, recording.sawMetaGet, "lease pre-pass must read the table schema")
-	require.True(t, recording.metaHadDeadline,
+	sawMetaGet, metaHadDeadline := recording.observed()
+	require.True(t, sawMetaGet, "lease pre-pass must read the table schema")
+	require.True(t, metaHadDeadline,
 		"transactGetItemKey schema read must run under the bounded leaseCtx, not the deadline-free request context")
 }
 
@@ -155,27 +173,29 @@ func TestDynamoDB_LeaseCheckTransactGetItems_AllItemsSkippedNoLeaseRead(t *testi
 
 	rec := httptest.NewRecorder()
 	require.True(t, server.leaseCheckTransactGetItems(rec, noDeadlineRequest(t), in))
-	require.Equal(t, 0, wrapped.leaseReadForKeyCalls,
+	require.Equal(t, int64(0), wrapped.leaseReadForKeyCalls.Load(),
 		"all-items-skipped path must not issue a lease read when no shard is touched")
-	require.Equal(t, 0, wrapped.leaseReadCalls,
+	require.Equal(t, int64(0), wrapped.leaseReadCalls.Load(),
 		"all-items-skipped path must not fall back to the keyless lease check")
 	require.Equal(t, http.StatusOK, rec.Code, "no error response should be written")
 }
 
 // leaseReadCountingCoordinator wraps stubAdapterCoordinator and counts
-// lease-read calls so a test can assert none were issued.
+// lease-read calls so a test can assert none were issued. The counters are
+// atomic so the assertions stay race-free if a handler ever fans out lease
+// reads concurrently.
 type leaseReadCountingCoordinator struct {
 	*stubAdapterCoordinator
-	leaseReadCalls       int
-	leaseReadForKeyCalls int
+	leaseReadCalls       atomic.Int64
+	leaseReadForKeyCalls atomic.Int64
 }
 
 func (c *leaseReadCountingCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
-	c.leaseReadCalls++
+	c.leaseReadCalls.Add(1)
 	return c.stubAdapterCoordinator.LeaseRead(ctx)
 }
 
 func (c *leaseReadCountingCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	c.leaseReadForKeyCalls++
+	c.leaseReadForKeyCalls.Add(1)
 	return c.stubAdapterCoordinator.LeaseReadForKey(ctx, key)
 }

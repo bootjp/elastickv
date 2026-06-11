@@ -240,8 +240,8 @@ func TestDynamoDB_TransactGetItems_MalformedItemStillSkipped(t *testing.T) {
 	require.True(t, server.leaseCheckTransactGetItems(rec, req, in),
 		"a malformed item (table not found) must still be skipped, not failed closed")
 	require.Equal(t, http.StatusOK, rec.Code, "no error response should be written for malformed input")
-	require.Equal(t, 0, coord.leaseReadForKeyCalls)
-	require.Equal(t, 0, coord.leaseReadCalls)
+	require.Equal(t, int64(0), coord.leaseReadForKeyCalls.Load())
+	require.Equal(t, int64(0), coord.leaseReadCalls.Load())
 }
 
 // TestDynamoDB_QueryLeaseKey_TransientSchemaReadFailsClosed asserts a transient

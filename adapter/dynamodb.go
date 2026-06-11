@@ -2252,7 +2252,7 @@ func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request,
 	// phase begins. The keyless fallback creates its own bounded context.
 	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
 	defer leaseCancel()
-	leaseKey, ok, err := d.queryLeaseKey(leaseCtx, in)
+	leaseKey, plan, err := d.queryLeaseKey(leaseCtx, in)
 	if err != nil {
 		// Transient/internal schema read failure: the routing key could
 		// not be resolved, so fail closed by fencing EVERY group via the
@@ -2261,33 +2261,72 @@ func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request,
 		// InternalServerError on its own failure.
 		return d.leaseReadKeyless(w, r)
 	}
-	if !ok {
-		// GSI / whole-table / unresolved-but-valid query: spans multiple
-		// shards, so the keyless all-groups check is the correct fence.
+	switch plan {
+	case queryLeaseSkip:
+		// Client-side validation problem (table not found, malformed/
+		// unsupported KeyConditionExpression): the request touches no data,
+		// so establishing freshness is unnecessary. Skip the lease entirely
+		// and let queryItems re-run the identical resolution and surface the
+		// deterministic ResourceNotFoundException/ValidationException — a
+		// lease failure on the fallback must not mask that 4xx with a 500 in
+		// a degraded deployment (codex #952 P2). This matches getItem, which
+		// writes the 4xx before any lease read.
+		return true
+	case queryLeaseAllGroups:
+		// GSI / whole-table query: a VALID read that spans multiple shards,
+		// so the keyless all-groups check is the correct fence (fail closed).
+		return d.leaseReadKeyless(w, r)
+	case queryLeaseSingleGroup:
+		if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, leaseKey); err != nil {
+			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+			return false
+		}
+		return true
+	default:
+		// Unreachable: queryLeaseKey only returns the three plans above. Fail
+		// closed via the all-groups fence rather than silently proceeding.
 		return d.leaseReadKeyless(w, r)
 	}
-	if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, leaseKey); err != nil {
-		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
-		return false
-	}
-	return true
 }
 
-// queryLeaseKey resolves the single hash-key prefix a base-table Query
-// reads, at a tentative timestamp (schema only, no readTS sampling), so
-// the lease check can be routed to the owning shard group. It returns
-// (prefix, true, nil) when the query routes to exactly one shard group,
-// (nil, false, nil) when the caller should fall back to a keyless all-groups
-// lease check (GSI query, whole-table prefix, table not found, or a query
-// condition that cannot be resolved — all surfaced identically by the read
-// path), and (nil, false, err) for a TRANSIENT/INTERNAL schema-read failure
-// (leaseCtx deadline, Pebble error) so the caller fails closed instead of
-// proceeding with no fence. Validation failures here are not surfaced as
-// errors: the read path re-runs the same resolution and reports the identical
-// validation error, so error mapping is unchanged.
-func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]byte, bool, error) {
+// queryLeasePlan classifies how a Query lease pre-pass must fence the read.
+type queryLeasePlan int
+
+const (
+	// queryLeaseSingleGroup: the query routes to exactly one shard group;
+	// fence that group via the resolved leaseKey.
+	queryLeaseSingleGroup queryLeasePlan = iota
+	// queryLeaseAllGroups: a VALID multi-shard read (GSI query or whole-table
+	// prefix); fence every group via the keyless all-groups check.
+	queryLeaseAllGroups
+	// queryLeaseSkip: a CLIENT-side validation problem (table not found,
+	// malformed/unsupported KeyConditionExpression) that the read path rejects
+	// deterministically without touching data; skip the lease so the handler's
+	// 4xx is never masked by a transient lease failure.
+	queryLeaseSkip
+)
+
+// queryLeaseKey resolves the single hash-key prefix a base-table Query reads,
+// at a tentative timestamp (schema only, no readTS sampling), so the lease
+// check can be routed to the owning shard group. It returns:
+//   - (prefix, queryLeaseSingleGroup, nil) when the query routes to exactly
+//     one shard group;
+//   - (nil, queryLeaseAllGroups, nil) for a VALID multi-shard read (GSI query
+//     or whole-table prefix) the caller must fence across every group;
+//   - (nil, queryLeaseSkip, nil) for a CLIENT-side validation problem (table
+//     not found, malformed/unsupported KeyConditionExpression) the read path
+//     rejects identically — the caller skips the lease so the deterministic
+//     4xx is not masked by a transient lease failure (codex #952 P2);
+//   - (nil, _, err) for a TRANSIENT/INTERNAL schema-read failure (leaseCtx
+//     deadline, Pebble error) so the caller fails closed.
+//
+// Validation failures are reported via queryLeaseSkip rather than an error: the
+// read path re-runs the same resolution and reports the identical validation
+// error, so error mapping is unchanged.
+func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]byte, queryLeasePlan, error) {
 	if strings.TrimSpace(in.IndexName) != "" {
-		return nil, false, nil
+		// A GSI query is a valid multi-shard read; fence every group.
+		return nil, queryLeaseAllGroups, nil
 	}
 	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
 	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, tentativeTS)
@@ -2295,43 +2334,44 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 		// loadTableSchemaAt maps ErrKeyNotFound to (_, false, nil); any
 		// error reaching here is a transient store/context/decode failure,
 		// so fail closed.
-		return nil, false, errors.WithStack(err)
+		return nil, queryLeaseSingleGroup, errors.WithStack(err)
 	}
 	if !exists {
-		return nil, false, nil
+		// Table not found is a deterministic ResourceNotFoundException the
+		// read path produces without touching data; skip the lease.
+		return nil, queryLeaseSkip, nil
 	}
-	// resolveQueryCondition / queryScanPrefix only fail on a malformed
-	// query condition (invalid key, unsupported operator) — pure
-	// validation errors that the read path re-runs and rejects identically.
-	// queryLeasePrefix discards them (the caller falls back to the keyless
-	// all-groups check, a strict superset of the single group this query
-	// would have routed to), so only a non-validation, transient/internal
-	// error (already handled above at loadTableSchemaAt) ever fails closed.
-	prefix, ok := queryLeasePrefix(in, schema)
-	return prefix, ok, nil
+	prefix, plan := queryLeasePrefix(in, schema)
+	return prefix, plan, nil
 }
 
 // queryLeasePrefix resolves the single hash-key prefix a base-table Query
-// reads, returning ok=false for GSI/whole-table/malformed-condition queries
-// that must fall back to the keyless all-groups lease check. Validation
-// errors are deliberately swallowed: they are not surfaced as a routing key,
-// and the read path reports the identical error downstream.
-func queryLeasePrefix(in queryInput, schema *dynamoTableSchema) ([]byte, bool) {
+// reads, classifying the read into queryLeaseSingleGroup (resolved prefix),
+// queryLeaseAllGroups (whole-table prefix: a valid multi-shard read), or
+// queryLeaseSkip (malformed KeyConditionExpression: a validation error the
+// read path rejects identically). The validation error is deliberately not
+// surfaced — only the routing classification matters here, and the read path
+// reports the identical error downstream.
+func queryLeasePrefix(in queryInput, schema *dynamoTableSchema) ([]byte, queryLeasePlan) {
 	keySchema, cond, err := resolveQueryCondition(in, schema)
 	if err != nil {
-		return nil, false
+		// Malformed/unsupported KeyConditionExpression: a deterministic
+		// ValidationException the read path produces without touching data.
+		return nil, queryLeaseSkip
 	}
 	// A query whose key schema hash key differs from the primary hash
 	// key reads the whole-table prefix (see queryScanPrefix), which can
-	// span multiple shards; let the keyless check cover them.
+	// span multiple shards; let the all-groups check cover them.
 	if keySchema.HashKey != schema.PrimaryKey.HashKey {
-		return nil, false
+		return nil, queryLeaseAllGroups
 	}
 	prefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
 	if err != nil {
-		return nil, false
+		// queryScanPrefix only fails on an unparseable hash-key value — a
+		// ValidationException the read path rejects identically.
+		return nil, queryLeaseSkip
 	}
-	return prefix, true
+	return prefix, queryLeaseSingleGroup
 }
 
 func decodeQueryInput(bodyReader io.Reader) (queryInput, error) {
