@@ -204,6 +204,27 @@ GC failure modes are bounded: the sweep is idempotent (delete-if-exists), and a 
 
 ### 5.1 `proto/distribution.proto`
 
+Extend `RouteDescriptor` to carry the staged-visibility flag and migration job ID that §6.4 step 2's MVCC merge read needs (closes claude round-11 P1 on PR #945: the target FSM cannot identify which `!dist|migstage|<job_id>|*` prefix to merge without `migration_job_id` on the route snapshot):
+
+```proto
+message RouteDescriptor {
+  // ... existing M1 fields (raft_group_id, route_id, start/end, state) ...
+
+  // Milestone 2: set on CUTOVER, cleared on CLEANUP→DONE in the same
+  // atomic proposal. While true, the target FSM's read path runs the
+  // staged+live MVCC merge of §6.4 step 2 against the
+  // !dist|migstage|<migration_job_id>|* prefix; once cleared the route
+  // is indistinguishable from any other Active route.
+  bool   staged_visibility_active = N;
+  // Identifies the !dist|migstage|<id>|* prefix the §6.4 step 2 merge
+  // reads. Non-zero iff staged_visibility_active is true; cleared in
+  // the same CLEANUP→DONE proposal. The target FSM needs this on the
+  // RouteSnapshot so per-request reads can find the staged prefix
+  // without an extra lookup against the SplitJob catalog.
+  uint64 migration_job_id         = N+1;
+}
+```
+
 Extend `SplitRangeRequest` and add job-introspection RPCs:
 
 ```proto
@@ -639,7 +660,11 @@ If the engine's local catalog is behind the FSM's `new_route_version`, the coord
 
 #### 7.2.4 Grace window before CLEANUP
 
-CLEANUP deletes the moved range from source's MVCC after a configurable grace window (`readFenceGrace`, default 30 s — chosen to comfortably exceed both lease TTL and watcher tick × 2). During the window:
+CLEANUP deletes the moved range from source's MVCC after a configurable grace window (`readFenceGrace`, default 30 s — chosen to comfortably exceed both lease TTL and watcher tick × 2).
+
+**Pre-watcher staleness window after CUTOVER (closes claude round-11 medium on PR #945).** The `CatalogWatcher` propagates the CUTOVER catalog write to the source-group leader within one polling interval (`defaultCatalogWatcherInterval = 100 ms`, `distribution/watcher.go`). Within that ~100 ms window the source FSM has neither applied the new catalog nor received the heartbeat-carried `max_cutover_version_seen`, so §7.2.2b Branch 2's watermark check has nothing to fire on. The window is bounded by the watcher polling interval rather than the heartbeat interval (~1 s) because watcher → FSM apply is the faster of the two propagation paths. A coordinator whose watcher fired right at the same tick as CUTOVER could refresh and route reads to the target while the source's watcher hasn't yet applied v+1 — a ~100 ms window during which a cross-boundary read could see source-stale data. This is consistent with the watcher-lag model the read fence operates under elsewhere (lease reads, Composed-1 read path); deployments requiring zero-staleness can replace the polling watcher with a synchronous notification from the default-group leader to source-group leaders on the CUTOVER Raft apply (OQ-17 — "synchronous CUTOVER notification to source group" — out of scope for M2).
+
+During the grace window:
 
 - Source still has the data physically; the read fence above turns it into `ErrRouteMoved` rather than serving the value.
 - After the window the data is gone; a stale read attempt naturally returns "not found" via the read fence (the FSM has already rotated past the cutover version).
@@ -745,7 +770,7 @@ Layered mitigations:
 1. **Capability advertisement.** Each node advertises a `node_capability_bitfield` in its periodic heartbeat to the default group (existing distribution heartbeat — extend by one field). M2-capable nodes set the `cap_migration_v2` bit at boot.
 2. **Cluster-readiness gate at the entry RPC.** `SplitRangeRequest` with `target_group_id != source_group_id` is rejected at `adapter/distribution_server.go` with `ErrClusterNotReadyForMigration` unless **every active node** advertises `cap_migration_v2`. Same-group split (M1) remains unconditionally available — its semantics did not change.
 3. **In-flight job invalidation on downgrade.** If the default-group leader observes any node losing `cap_migration_v2` mid-migration (rare — would only happen with a botched rollback), the migrator pauses (stays in current phase, no new state advancement) and surfaces `ErrClusterCapabilityRegressed`. Operator must either roll forward or `AbandonSplitJob`.
-4. **M2-PR1..PR5 land in this order so the capability bit can be set safely**: PR1-PR3 are wire/codec/store additions with **no behaviour change for M1** (no SplitJob created without explicit `target_group_id != source_group_id`); PR4 introduces the state machine but, until PR5 (FENCE rejection) lands, the bit must NOT be advertised. The `cap_migration_v2` bit goes live in PR5 commit so by the time it is observable, all required enforcement is present.
+4. **M2-PR1..PR7 land in this order so the capability bit only opens when the full feature is present (closes claude round-11 P2 on PR #945).** PR1-PR3 are wire/codec/store additions with **no behaviour change for M1** (no SplitJob created without explicit `target_group_id != source_group_id`); PR4 introduces the state machine but no data move; PR5 lands FENCE rejection (`verifyRouteNotFenced` + `ErrRouteWriteFenced`); PR6 lands `ExportRangeVersions` / `ImportRangeVersions` server-side handlers + §6.4 step 2 staged-merge read path; PR7 lands the background promoter + `AbandonSplitJob` + CLEANUP drain. **The `cap_migration_v2` bit goes live only in PR7 commit**, when the full end-to-end migration path can complete — not in PR5 (where FENCE is enforced but BACKFILL has no export handler yet, so a SplitJob would create successfully and then fail at BACKFILL, giving operators false assurance). The earlier-rounds intention was "the bit guards against rollout-skew silent execution," and the corrected intent is "the bit guards against operators starting a migration in a half-shipped cluster." If a finer-grained gate is desired later, OQ-18 records the option to split into `cap_fence_v2` (PR5) + `cap_data_move_v2` (PR6/PR7), with `SplitRangeRequest` gated on the conjunction — out of scope for v1.
 5. **Test plan**: `distribution/capability_test.go` exercises (a) gate accepts M2-only cluster, (b) gate rejects mixed cluster, (c) gate rejects on heartbeat staleness (no advertisement within 2× heartbeat interval treated as no capability).
 
 This is independent of the existing rolling-upgrade protocol for unrelated subsystems and adds zero overhead for clusters never using cross-group split.
