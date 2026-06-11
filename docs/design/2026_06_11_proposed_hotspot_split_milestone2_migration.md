@@ -391,7 +391,60 @@ func RouteKeyFilter(rangeStart, rangeEnd []byte) store.KeyFilter {
 
 The closure ensures internal keys (`!txn|...`, `!lst|...`, redis hash/list/etc.) land in the same shard as their logical owner without `store` ever importing `kv`. The importer dispatches by `key_family` into the matching store helper (in a future kv-level `Import` wrapper) to preserve per-family invariants (e.g., list head pointer updates).
 
-A simple safety check: every exported key in the migrator's send buffer must map back to the moving range under `routeKey()`. The migrator asserts this on every row before the gRPC send; an assertion failure aborts the job and surfaces in `last_error`. The assertion guards against a future internal-key family being added that someone forgot to teach `routeKey()`.
+#### 6.3.1 Internal-family brackets — raw range alone misses internal state (closes codex P1 line 310)
+
+The above closure correctly *rejects* a raw key that does not belong to the moving range, but it cannot *find* internal-family keys that the caller never iterates over in the first place. Codex P1 round-4 on PR #945 (line 310): for a moving user-key interval `[foo, bar)`, an iteration over the raw range `[foo, bar)` never visits `!txn|lock|foo`, `!lst|meta|foo`, `!redis|str|foo`, `!ddb|item|<tbl>|foo`, `!sqs|...`, `!s3|...`, because each of those prefixes sorts **outside** `[foo, bar)` in the raw MVCC key space — the routeKey filter rejects nothing because those bytes were never iterated. Without the fix below, CUTOVER would leave intent locks, list metadata, and adapter-private state behind on the source and the target would serve reads against a half-populated MVCC space — silent data loss.
+
+M2 therefore runs **multiple parallel exports per migration**, one per relevant raw-key family, each driven by the same `KeyFilter` so `routeKey()` remains the single source of truth for "does this key belong to the moving range?". The migrator computes the bracket list from the moving range's logical scope:
+
+```go
+// kv/migrator_export_plan.go (sketch)
+//
+// Each bracket is one (start, end) raw-key band the migrator
+// ExportVersions over. The KeyFilter rejects any key whose
+// routeKey() falls outside the moving range — necessary because
+// each bracket below is FAMILY-WIDE (every txn lock cluster-wide,
+// not just the moving range's), and the filter narrows it back to
+// the moving slice.
+type ExportBracket struct {
+    Start, End []byte  // raw key bounds for ExportVersions
+    Family     uint32  // MVCCVersion.key_family tag
+}
+
+func PlanExportBrackets(routeStart, routeEnd []byte) []ExportBracket {
+    return []ExportBracket{
+        // User-key bracket itself, in the routing-key namespace.
+        {Start: routeStart, End: routeEnd, Family: familyUser},
+        // Each internal-family raw-key band. routeKey() decodes the
+        // family-prefixed raw key back to its routing key, so the
+        // filter rejects any entry whose routing key falls outside
+        // [routeStart, routeEnd).
+        {Start: txnLockPrefix(),  End: txnLockPrefixEnd(),  Family: familyTxnLock},
+        {Start: txnCmtPrefix(),   End: txnCmtPrefixEnd(),   Family: familyTxnCommit},
+        {Start: txnRbPrefix(),    End: txnRbPrefixEnd(),    Family: familyTxnRollback},
+        {Start: txnMetaPrefix(),  End: txnMetaPrefixEnd(),  Family: familyTxnMeta},
+        {Start: txnIntPrefix(),   End: txnIntPrefixEnd(),   Family: familyTxnInternal},
+        {Start: lstMetaPrefix(),  End: lstMetaPrefixEnd(),  Family: familyListMeta},
+        {Start: lstItmPrefix(),   End: lstItmPrefixEnd(),   Family: familyListItem},
+        {Start: redisPrefix(),    End: redisPrefixEnd(),    Family: familyRedis},
+        {Start: ddbItemPrefix(),  End: ddbItemPrefixEnd(),  Family: familyDdbItem},
+        {Start: ddbGSIPrefix(),   End: ddbGSIPrefixEnd(),   Family: familyDdbGSI},
+        {Start: sqsPrefix(),      End: sqsPrefixEnd(),      Family: familySqs},
+        {Start: s3Prefix(),       End: s3PrefixEnd(),       Family: familyS3},
+        // A future adapter MUST add its bracket here at the same PR
+        // that teaches routeKey() about its family — both are
+        // required to land internal-family migration end-to-end.
+    }
+}
+```
+
+`routeKey()` already decodes every internal-family prefix back to the same routing key that the user-key route resolution returns (parent partial doc §9; implementation in `kv/shard_key.go`); the `KeyFilter` therefore correctly accepts an internal-family raw key whose routing key falls inside the moving range and rejects others. So adding the bracket list is the only new machinery needed — the filter stays unchanged.
+
+The migrator runs the brackets **in parallel up to `--migrationExportFanout` (default 4)** within a single phase (BACKFILL or DELTA_COPY): each bracket gets its own opaque cursor (the §6.1.1 codec is extended to key on `(family, raw_key, commit_ts)`), so a bracket can be paused/resumed independently and the §9 resumability matrix applies per bracket. The migrator records per-bracket `cursor` and `done` flags on the SplitJob; the phase advances only when **every bracket** reports `done = true`. Cost is at most `fanout`× the gRPC frame budget but is bounded by the total bracket count (~12 today), not by data volume.
+
+A bracket whose family doesn't actually intersect the moving range (e.g. an SQS migration on a Redis-only deployment) returns its first chunk empty and `done=true` immediately — no wasted scan work. The `keys per bracket` distribution is a §7.3 / §11.x metric so operators can spot a runaway family scan.
+
+A simple safety check: every exported key in the migrator's send buffer must map back to the moving range under `routeKey()`. The migrator asserts this on every row before the gRPC send; an assertion failure aborts the job and surfaces in `last_error`. The assertion now guards two failure modes: (i) a future internal-family being added that someone forgot to teach `routeKey()`, and (ii) a bracket being added without a matching `routeKey()` decoder. Reuses the same routeKey assertion §6.3 already specifies — no new code surface beyond the bracket list.
 
 ### 6.4 Incremental staged-to-live promotion — CUTOVER is constant-time (closes codex P2 on PR #945)
 
@@ -405,7 +458,20 @@ Codex P2 round-3 on PR #945 (line 147): "staging every imported row under `!dist
 
    No iteration over the migrated key range, no bulk rename, no per-key proposals. The Raft proposal carrying this apply is `O(1)` in the migrated data size — bounded by a handful of catalog descriptors and the SplitJob record.
 
-2. **Staged keyspace stays visible through a per-route flag.** After CUTOVER the target FSM's read path checks the route's `staged_visibility_active` bit. When set, a read for key `K` in the moved range first looks up `!dist|migstage|<job_id>|<K>` and falls back to the live key only if the staged entry is absent. (Writes always land in the live keyspace — the CUTOVER bump already routed writers to the target group via the catalog, and §6.2.1's HLC ceiling advance guarantees their `commit_ts` is strictly greater than every imported `commit_ts`, so a live write shadowing a staged version is the *correct* MVCC visibility.) This gives reads access to the imported data the instant CUTOVER lands, with **no promotion work blocking CUTOVER itself**.
+2. **Staged keyspace participates in MVCC merge — newest commit_ts wins (closes codex P1 line 408).** After CUTOVER the target FSM's read path treats the staged area as **a second source of MVCC versions for the same logical key**, not as an authoritative override. For a read for key `K` at `read_ts` in the moved range with `staged_visibility_active = true`:
+   - read the **newest live MVCC version of `K` with `commit_ts ≤ read_ts`** (the standard snapshot read against `!ddb|...K`, `!redis|...K`, the user-key band, etc. — whichever family `K` belongs to);
+   - read the **newest staged MVCC version of `K` with `commit_ts ≤ read_ts`** under `!dist|migstage|<job_id>|<K>` (the §6.1.1 staged area, iterated by the same `(raw_key ASC, commit_ts DESC)` order the snapshot iterator already uses);
+   - return whichever has the **greater `commit_ts`** (newest wins); if both are absent return "not found".
+
+   This is the standard MVCC visibility rule applied to a second column-family-like source, not a "stage-shadows-live" fallback. The earlier wording — "first look at staged, fall back to live when staged is absent" — was wrong precisely because §6.2.1's HLC ceiling advance guarantees a live write after CUTOVER has `commit_ts > max_imported_ts`, so for any `read_ts ≥ live_write.commit_ts` the live version is the most-recent committed value and a `staged-first-then-live-fallback` would return the older staged value while the staged entry still exists — exactly the visibility regression codex P1 line 408 flagged. The merge form is correct because:
+   - For `read_ts < live_write.commit_ts`: live has no committed version ≤ read_ts (or only an older one), staged's imported `commit_ts ≤ max_imported_ts < live_write.commit_ts`, so the merge correctly surfaces whichever is newest at `read_ts` (typically the staged one for `read_ts ∈ (max_imported_ts, live_write.commit_ts)`).
+   - For `read_ts ≥ live_write.commit_ts`: the live version's `commit_ts > max_imported_ts ≥ every staged version's commit_ts`, so the merge correctly returns the live value.
+   - For never-overwritten keys post-CUTOVER: only the staged version exists ≤ read_ts, the merge returns it.
+   - For a key with multiple staged versions (the §6.1.1 hot-key case): the staged iterator returns the newest staged version ≤ read_ts; the live iterator returns the newest live version ≤ read_ts; the merge picks the greater of the two. Correct in every interleaving.
+
+   Writes always land in the live keyspace — the CUTOVER bump already routed writers to the target group via the catalog, and §6.2.1's HLC ceiling advance guarantees their `commit_ts` is strictly greater than every imported `commit_ts`, so a live write shadowing a staged version is the *correct* MVCC visibility AND the merge rule above surfaces it correctly. This gives reads access to the imported data the instant CUTOVER lands, with **no promotion work blocking CUTOVER itself**, and with no staleness window where staged shadows a fresher live write.
+
+   Per-family adapter helpers (Redis list head pointers, DynamoDB GSI shadow rows, etc.) follow the same merge rule on the corresponding internal-family keys — the merge operates on raw keys, so the per-family invariants the `key_family` dispatch (§6.3.1) already enforces still apply.
 
 3. **Background incremental promoter on the target group.** Immediately after CUTOVER the target group's FSM starts a **leader-local promoter goroutine** that walks the `!dist|migstage|<job_id>|*` prefix in cursor-resumable chunks (the same `chunkBytes` / pacing knobs §6.1 and the migrator already use), and for each staged version proposes one `PromoteStaged` Raft entry that:
    - copies the staged key into its live position (no-op when a later live write has already shadowed it; the FSM applies `metaLastCommitTS`-respecting MVCC put),
@@ -454,14 +520,42 @@ Codex P1 on PR #945: today the read path resolves the group from the local engin
 
 Add `read_route_version uint64` to the read-path message (`pb.ReadRequest`, including the lease-read envelope used by `ShardStore.GetAt` / `.ScanAt`). The coordinator stamps the engine's catalog version into every read at the moment it picks a group. This is the read-side equivalent of `ObservedRouteVersion` on writes.
 
-#### 7.2.2 Source FSM rejects reads after CUTOVER
+#### 7.2.2 Source FSM rejects reads after CUTOVER — authoritative ownership check, not version comparison (closes codex P1 line 459)
 
-When a source-group FSM applies a lease read whose `read_route_version` is **strictly less than** the FSM's last-applied catalog version, and the requested key's `routeKey()` maps to a route the FSM no longer owns, the FSM returns `ErrRouteMoved{new_route_version, new_group_id}` instead of the value. The error is mapped to a retryable status (gRPC `codes.FailedPrecondition` + detail) and the coordinator retries after a `RouteEngine` refresh.
+The original wording — "the FSM returns `ErrRouteMoved` when `read_route_version` is strictly less than the FSM's last-applied catalog version, and the key is no longer owned" — is **insufficient**. Codex P1 round-4 on PR #945: it misses the common post-CUTOVER case where the coordinator and the source FSM are **equally stale at the pre-CUTOVER version**. In that window:
 
-Two sub-cases:
+1. A *different* coordinator, refreshed against the new catalog, routes a write of key `K` to the target group. The write commits there with `commit_ts > max_imported_ts` (§6.2.1).
+2. The original stale coordinator routes a read of `K` to the source FSM with `read_route_version == source_local_version` (both at the pre-CUTOVER version).
+3. Under the strict-less-than rule, `read_route_version` equals `source_local_version`, the comparison passes, and the source serves the old value — even though the target has a fresher committed write.
 
-- **Coordinator stale**: it routed to source assuming the pre-cutover catalog. Refresh → re-route to target → succeeds.
-- **Source FSM stale (read_route_version ≥ FSM version)**: the FSM hasn't applied CUTOVER yet, but the coordinator (and quorum) already have. The FSM treats `read_route_version > local` as a "wait until applied" (bounded by lease TTL) before answering, then re-evaluates ownership; if still not owned, returns `ErrRouteMoved`. This avoids a wedge while keeping the read consistent.
+This is the same hazard the §7.2 read fence was added to prevent; the strict-less-than form simply doesn't catch the equal-stale case. The fix replaces version comparison with an **authoritative ownership check** scoped on either the local or the cutover-version snapshot, whichever exists:
+
+- If the source FSM **has applied** CUTOVER (`source_local_version ≥ cutover_version`): the source no longer owns the key under its current snapshot. **Unconditionally** return `ErrRouteMoved{new_route_version, new_group_id}` regardless of `read_route_version`. This is the simple case the old wording also handled.
+- If the source FSM **has NOT applied** CUTOVER (`source_local_version < cutover_version`), but the **default group has** (the migrator already populated `cutover_version` on the SplitJob and that proposal has committed, observable via the watcher's view of the catalog version known to the source group leader): the source must consult an out-of-band authoritative signal because its local FSM snapshot still says it owns the key. M2 ships two layers:
+  1. **Heartbeat-piggybacked watermark.** The default-group leader's existing distribution heartbeat to every node already carries `catalog_version` (§11.1 capability bit lives there). Extend it to also carry `max_cutover_version_seen` (monotone, never decreases). The source-group FSM stores this as a leader-local atomic and consults it on every read fence: if `max_cutover_version_seen > source_local_version`, the source treats itself as "potentially stale at the cutover boundary" and the read fence runs the next bullet.
+  2. **Cutover-aware ownership query.** When the watermark indicates a possible stale read, the source-group leader makes a single best-effort, deadline-bounded `GetRouteOwnership(routeKey(K), catalog_version=max_cutover_version_seen)` RPC to the default-group leader. The default-group leader answers from its current catalog snapshot. If the answer is "owned by another group" the source returns `ErrRouteMoved{new_route_version=max_cutover_version_seen, new_group_id}` to the coordinator; if owned by the source (no cutover landed on this key after all — the watermark covers an *unrelated* migration) the source returns the value normally.
+- The RPC is cached on the source-group leader per `(routeKey, max_cutover_version_seen)` for one second to keep the fence cheap; the cache invalidates the moment `max_cutover_version_seen` advances.
+
+Crucially, this catches **the equal-stale window** the strict-less-than form missed: both coordinator and source are at the pre-CUTOVER version, but the heartbeat watermark on the source is already at the post-CUTOVER version (because the default-group leader propagated it as soon as the catalog write committed), so the source consults the default-group leader and gets the authoritative "no longer yours" verdict before serving a stale value.
+
+Two sub-cases of the legacy framing are preserved:
+
+- **Coordinator stale, source up-to-date**: source's `source_local_version ≥ cutover_version` and source no longer owns the key → unconditional `ErrRouteMoved`. Coordinator refreshes → re-routes to target → succeeds.
+- **Source stale, coordinator further ahead (`read_route_version > source_local_version`)**: the FSM treats this as "wait until applied" (bounded by lease TTL) before answering, then re-evaluates ownership; if still not owned, returns `ErrRouteMoved`. This avoids a wedge while keeping the read consistent.
+
+#### 7.2.2a Equal-stale window — concrete walkthrough
+
+To make the §7.2.2 fix concrete:
+
+1. `t=0`: catalog at version `v`. Coordinators C1 and C2 both at `v`. Source FSM at `v`. CUTOVER not yet issued.
+2. `t=1`: migrator issues CUTOVER on default group. Catalog committed at `v+1`. Default-group leader's outbound heartbeat starts carrying `max_cutover_version_seen = v+1` immediately.
+3. `t=2`: source-group leader receives the heartbeat. Its local atomic `max_cutover_version_seen` advances to `v+1`. Its FSM-local `source_local_version` is **still `v`** because the watcher hasn't yet routed the catalog update through the source group's own Raft log.
+4. `t=3`: C2 watches the catalog, sees `v+1`, refreshes its engine, routes its write of `K` to the target. Target commits the write with `commit_ts > max_imported_ts`.
+5. `t=4`: C1 (still at `v`) routes a read of `K` to the source FSM with `read_route_version = v == source_local_version`. **Equal stale.**
+6. `t=5`: source FSM sees `max_cutover_version_seen (v+1) > source_local_version (v)`. Runs `GetRouteOwnership(routeKey(K), v+1)` against the default-group leader. Answer: "owned by target group." Source returns `ErrRouteMoved{new_route_version=v+1, new_group_id=target}` to C1.
+7. `t=6`: C1 refreshes, retries on target, sees C2's fresh write.
+
+Without the watermark + ownership-query path, step 6 would have returned the pre-CUTOVER value because the strict-less-than version check passed.
 
 #### 7.2.3 Coordinator-side fallback
 
