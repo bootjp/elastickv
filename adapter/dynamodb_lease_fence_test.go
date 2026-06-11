@@ -100,7 +100,7 @@ func TestDynamoDB_ScanLeaseFencesAllGroups(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
-	require.True(t, server.leaseReadKeyless(rec, req))
+	require.True(t, server.leaseReadKeyless(rec, req.Context()))
 
 	fenced := coord.fencedGroupSet()
 	require.Contains(t, fenced, multiGroupDefaultID,

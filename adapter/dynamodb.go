@@ -2227,9 +2227,16 @@ func (d *DynamoDBServer) scan(w http.ResponseWriter, r *http.Request) {
 // client never cancels, and writes the same InternalServerError that getItem
 // produces on lease failure. Returns false after writing an error response;
 // the caller should simply return.
-func (d *DynamoDBServer) leaseReadKeyless(w http.ResponseWriter, r *http.Request) bool {
-	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
-	defer leaseCancel()
+// leaseReadKeyless fences every group via the keyless all-groups lease check.
+// `leaseCtx` MUST be the SAME context the pre-pass armed (it bounds the entire
+// pre-pass — schema read + the lease that lands here — by dynamoLeaseReadTimeout
+// total; coderabbit Major on PR #952 round-4). Creating a fresh
+// context.WithTimeout(r.Context(), dynamoLeaseReadTimeout) here would re-arm
+// the 5s budget per call, so a slow schema read followed by the keyless
+// fallback could consume close to 10s end-to-end. Callers that do NOT have a
+// pre-pass context must pass their own bounded ctx; r.Context() with the
+// handler's own timeout-on-the-roundabout is the conservative choice.
+func (d *DynamoDBServer) leaseReadKeyless(w http.ResponseWriter, leaseCtx context.Context) bool {
 	if err := kv.LeaseReadAllGroupsThrough(d.coordinator, leaseCtx); err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return false
@@ -2260,7 +2267,7 @@ func (d *DynamoDBServer) leaseCheckScan(w http.ResponseWriter, r *http.Request, 
 		// Transient/internal schema-read failure: fail closed by fencing every
 		// group. leaseReadKeyless writes the same InternalServerError on its
 		// own failure.
-		return d.leaseReadKeyless(w, r)
+		return d.leaseReadKeyless(w, leaseCtx)
 	}
 	if plan == queryLeaseSkip {
 		// Client-side validation problem (table not found, unknown index,
@@ -2288,7 +2295,7 @@ func (d *DynamoDBServer) leaseCheckScan(w http.ResponseWriter, r *http.Request, 
 		return true
 	}
 	// Valid whole-table read: fence every group (fail closed).
-	return d.leaseReadKeyless(w, r)
+	return d.leaseReadKeyless(w, leaseCtx)
 }
 
 // projectionInvalid returns true when the ProjectionExpression cannot be
@@ -2404,7 +2411,7 @@ func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request,
 		// keyless check (a strict superset of the single group this query
 		// would have routed to). leaseReadKeyless writes the same
 		// InternalServerError on its own failure.
-		return d.leaseReadKeyless(w, r)
+		return d.leaseReadKeyless(w, leaseCtx)
 	}
 	switch plan {
 	case queryLeaseSkip:
@@ -2420,7 +2427,7 @@ func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request,
 	case queryLeaseAllGroups:
 		// GSI / whole-table query: a VALID read that spans multiple shards,
 		// so the keyless all-groups check is the correct fence (fail closed).
-		return d.leaseReadKeyless(w, r)
+		return d.leaseReadKeyless(w, leaseCtx)
 	case queryLeaseSingleGroup:
 		if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, leaseKey); err != nil {
 			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
@@ -2430,7 +2437,7 @@ func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request,
 	default:
 		// Unreachable: queryLeaseKey only returns the three plans above. Fail
 		// closed via the all-groups fence rather than silently proceeding.
-		return d.leaseReadKeyless(w, r)
+		return d.leaseReadKeyless(w, leaseCtx)
 	}
 }
 
@@ -4775,14 +4782,24 @@ func (d *DynamoDBServer) leaseReadGroupKeys(ctx context.Context, groupKeys [][]b
 		_, err := kv.LeaseReadForKeyThrough(d.coordinator, ctx, groupKeys[0])
 		return errors.WithStack(err)
 	}
+	// Derive a cancellable child so the first error cancels the sibling lease
+	// reads instead of letting them run out the full dynamoLeaseReadTimeout
+	// budget (coderabbit Major on PR #952 round-4). The siblings observe the
+	// cancellation via the LeaseReadForKeyThrough's own context check.
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errCh := make(chan error, len(groupKeys))
 	var wg sync.WaitGroup
 	for _, itemKey := range groupKeys {
 		wg.Add(1)
 		go func(k []byte) {
 			defer wg.Done()
-			if _, err := kv.LeaseReadForKeyThrough(d.coordinator, ctx, k); err != nil {
-				errCh <- err
+			if _, err := kv.LeaseReadForKeyThrough(d.coordinator, cancelCtx, k); err != nil {
+				select {
+				case errCh <- err:
+					cancel() // unwind the remaining goroutines on the first error.
+				default:
+				}
 			}
 		}(itemKey)
 	}
