@@ -353,6 +353,15 @@ message ExportRangeVersionsRequest {
   // call; the migrator already has them on its SplitJob.
   bytes route_start = 7;
   bytes route_end = 8;  // empty == +infinity (open-ended right edge)
+  // §6.3.1 scan budget: hard cap on the bytes the server iterator may
+  // scan (accepted AND rejected rows both count) before it must return
+  // whatever it has accepted plus next_cursor over the last-scanned
+  // position. Bounds the per-call wall-clock cost of a family-wide
+  // sparse bracket whose moving slice is empty or tiny — without it a
+  // single call could scan an arbitrarily large unrelated internal-
+  // family prefix (e.g. a cluster-wide 10 GB !sqs| range) to prove
+  // done=true. 0 means "use the server default" (4 × chunk_bytes, §6.3.1).
+  uint64 max_scanned_bytes = 9;
 }
 
 message ExportRangeVersionsResponse {
@@ -375,7 +384,20 @@ message MVCCVersion {
 message ImportRangeVersionsRequest {
   uint64 job_id = 1;
   repeated MVCCVersion versions = 2;
-  bytes cursor = 3;  // for ack/idempotency
+  // Exporter resume token (§6.1.1): carried so the migrator can persist
+  // it back on ack and resume the bracket after a restart. NOT the
+  // idempotency key — see bracket_id / batch_seq below.
+  bytes cursor = 3;
+  // §6.1.1 importer idempotency key. Because §6.3.1 runs export brackets
+  // in parallel, dedup keys on (job_id, bracket_id, batch_seq), not on
+  // (job_id, cursor) which parallel brackets would clobber.
+  //   bracket_id — the §6.3.1 per-bracket id (stable for the SplitJob's
+  //                life; recorded in bracket_progress).
+  //   batch_seq  — monotonic per-bracket counter the migrator advances
+  //                on every successful ack; a retry of
+  //                (job_id, bracket_id, batch_seq ≤ stored) is a no-op.
+  uint64 bracket_id = 4;
+  uint64 batch_seq = 5;
 }
 
 message ImportRangeVersionsResponse {
@@ -432,11 +454,20 @@ type KeyFilter func(rawKey []byte) bool
 // history is allowed to span batches without losing or duplicating
 // versions.
 // `accept` (nil = no filtering) is the §6.3 decoupling seam.
+// `maxScannedBytes` is the §6.3.1 scan budget: a hard cap on the bytes
+// the iterator may scan — counting BOTH accepted and rejected rows —
+// before it must return whatever it has accepted plus the next cursor
+// over the last-scanned position (done=false). It bounds the per-call
+// cost of a sparse family-wide bracket whose moving slice is empty or
+// tiny, where `accept` rejects most rows and they do not count against
+// chunkBytes. 0 means "no scan cap" (the dense default path); the
+// migrator passes the §6.3.1 default of 4 × chunkBytes for sparse
+// brackets. chunkBytes still caps the accepted-row payload.
 ExportVersions(ctx context.Context, start, end []byte, minCommitTS, maxCommitTS uint64,
-    cursor []byte, chunkBytes int, accept KeyFilter) ([]MVCCVersion, []byte, bool, error)
+    cursor []byte, chunkBytes, maxScannedBytes int, accept KeyFilter) ([]MVCCVersion, []byte, bool, error)
 ```
 
-The function uses the existing snapshot read primitive (the same one Composed-1 already trusts for visibility), so MVCC semantics during export are guaranteed to match a reader at `maxCommitTS`. `accept` is consulted before a row is added to the chunk; rejected rows do not advance the chunk-bytes budget so the caller sees deterministic per-call shapes.
+The function uses the existing snapshot read primitive (the same one Composed-1 already trusts for visibility), so MVCC semantics during export are guaranteed to match a reader at `maxCommitTS`. `accept` is consulted before a row is added to the chunk; rejected rows do not advance the chunk-bytes budget so the caller sees deterministic per-call shapes — but they **do** advance the `maxScannedBytes` budget, so a sparse bracket cannot scan an unbounded prefix to prove `done=true` (§6.3.1).
 
 #### 6.1.1 Cursor granularity — addresses a scanned MVCC position, not just a raw key (closes codex P2; refined for sparse brackets per coderabbit round-12 Major / codex round-14 P2)
 
@@ -469,18 +500,23 @@ The store-side type stays `[]byte` and the exporter alone owns the codec, preser
 New method:
 
 ```go
-// ImportVersions writes the given versions idempotently. A second call
-// with the same (job_id, cursor) MUST be a no-op past the recorded
-// cursor — the importer records last-applied cursor under
-// !migstage|cursor|<id> so a network retry doesn't double-write.
-// As a side effect, the import atomically advances metaLastCommitTS
-// AND the node-local HLC ceiling to at least max(commit_ts) of the
-// batch (§6.2.1).
-ImportVersions(ctx context.Context, jobID uint64, versions []MVCCVersion,
-    cursor []byte) ([]byte, error)
+// ImportVersions writes the given versions idempotently. The dedup key
+// is (jobID, bracketID, batchSeq) — NOT (jobID, cursor) — because §6.3.1
+// runs export brackets in parallel and a single cursor slot would be
+// clobbered across brackets (§6.1.1). A second call with
+// batchSeq ≤ the recorded max for (jobID, bracketID) MUST be a no-op:
+// the importer records the per-bracket high-water mark under
+// !migstage|ack|<jobID>|<bracketID> so a network retry doesn't
+// double-write. The opaque `cursor` is the exporter's resume token
+// (§6.1.1) — carried so the migrator can persist it back on ack, but
+// it is NOT the dedup key. As a side effect, the import atomically
+// advances metaLastCommitTS AND the node-local HLC ceiling to at least
+// max(commit_ts) of the batch (§6.2.1).
+ImportVersions(ctx context.Context, jobID, bracketID, batchSeq uint64,
+    versions []MVCCVersion, cursor []byte) ([]byte, error)
 ```
 
-Idempotency: persist `(job_id, cursor)` after each batch's apply, and on a duplicate request check the persisted cursor.
+Idempotency: persist `(jobID, bracketID) → max_applied_batch_seq` under `!migstage|ack|<jobID>|<bracketID>` after each batch's apply (the bracket dimension is required — a single `!migstage|cursor|<jobID>` record would be clobbered by parallel brackets per §6.1.1), and on a duplicate request drop any batch whose `batchSeq` is `≤` the recorded high-water mark. The `cursor` is persisted alongside on the SplitJob's `bracket_progress` entry for exporter resume, separate from the dedup record.
 
 #### 6.2.1 Target HLC advancement — preventing post-CUTOVER time travel (closes codex P1)
 
@@ -494,7 +530,7 @@ The fix runs inside `ImportVersions` (and the equivalent CUTOVER bulk-rename app
    - calls `hlc.Observe(batchMax)` so the local clock's last-issued value also tracks the high-water mark — keeps `Next()`'s logical-half advancement consistent with what `metaLastCommitTS` now says.
 
    `SetPhysicalCeiling` is monotone — a lower argument is a no-op — so duplicate / out-of-order batches are safe. `Observe` is similarly monotone.
-2. **Job-level monotone witness.** The SplitJob carries `max_imported_ts` (§3.1) — the high-water mark of all ack'd import batches for this job. The migrator updates it whenever it persists an import_cursor, so it survives leader flap.
+2. **Job-level monotone witness.** The SplitJob carries `max_imported_ts` (§3.1) — the high-water mark of all ack'd import batches for this job. The migrator updates it whenever it advances a bracket's `cursor` / `last_acked_batch_seq` in `bracket_progress` on ack (§6.1.1), so it survives leader flap.
 3. **CUTOVER precondition.** Before the migrator issues the CUTOVER catalog write, it ensures the target group's HLC ceiling is at least `hlcPhysicalMs(max_imported_ts)` by issuing a final `SetPhysicalCeiling(hlcPhysicalMs(max_imported_ts))` + `Observe(max_imported_ts)` proposal on the **target group** (not the default group). The proposal is gated by `cap_migration_v2` (§11.1) and is the **last** target-side write before CUTOVER. If the target HLC is already above this value (e.g. due to per-batch advancement), the `SetPhysicalCeiling` call is the trivial no-op the ceiling already enforces; if a follower flap dropped one of the per-batch advances, this proposal closes the gap.
 4. **Post-CUTOVER write-side invariant.** A target-group `Next()` after CUTOVER is bounded below by `metaLastCommitTS` AND by the HLC ceiling (the existing `HLC.Next()` semantics in `kv/hlc.go`), so it is provably strictly greater than every `commit_ts` ever imported under this job. Reads at any post-CUTOVER `Next()` therefore see the imported version as historical (older than the read ts) and see the new write as the most-recent committed version — no resurrection, no time travel.
 5. **Same-group split (M1) unaffected.** Same-group split never crosses the FSM apply boundary, so its `Next()` is already bounded by the source's HLC; the new advance path is a no-op when `target_group_id == source_group_id`.
@@ -573,7 +609,7 @@ The migrator runs the brackets **in parallel up to `--migrationExportFanout` (de
 
 **Bounded scan for sparse / out-of-range brackets (closes codex P2 round-5 line 445).** "Returns its first chunk empty and `done=true` immediately" is only true when the iterator can short-circuit; under the §6.1 contract, `accept` rejections do **not** count against `chunkBytes` (so the caller sees deterministic chunk shapes), which would otherwise let a family-wide raw range scan an arbitrarily large prefix to prove `done=true` for a moving range with no intersection. The fix has two layers:
 
-- **Scan-budget pacing.** Each `ExportVersions` call carries a separate `maxScannedBytes` (default 4 × `chunkBytes`) that **counts both accepted and rejected rows** as iteration cost. When the iterator hits that budget without filling the accepted chunk, it returns whatever it has accepted so far + the next cursor (over the *rejected* tail position, so the next call resumes past the already-rejected window). `done = false`, so the next chunk picks up where the rejection scan left off. Without this, a Redis migration where the SQS family has a cluster-wide 10 GB raw prefix would block on a single `ExportVersions` call for the entire prefix duration.
+- **Scan-budget pacing.** Each `ExportVersions` call carries a separate scan budget — the `maxScannedBytes` parameter on the store-layer signature above, carried on the wire as `ExportRangeVersionsRequest.max_scanned_bytes` (default 4 × `chunkBytes`; `0` on the wire means "use the server default", mirroring how the migrator leaves other tuning fields unset) — that **counts both accepted and rejected rows** as iteration cost, where `chunkBytes` alone counts only accepted rows. When the iterator hits that budget without filling the accepted chunk, it returns whatever it has accepted so far + the next cursor (over the *rejected* tail position — the §6.1.1 `scanned_position_tag = 1` case, so the next call resumes strictly past the already-rejected window). `done = false`, so the next chunk picks up where the rejection scan left off. Without this field on the contract, a Redis migration where the SQS family has a cluster-wide 10 GB raw prefix would block on a single `ExportVersions` call for the entire prefix duration.
 - **Route-key sub-prefix indexing where the family layout allows it.** Each internal-family bracket's raw key starts with a known fixed prefix (e.g. `!txn|lock|`, `!lst|meta|`) followed by the routing-key bytes (mostly — adapters like SQS encode queue ID first; per-family `EncodeBracketStart(routeStart)` is the per-family hook). When such a hook is available, the bracket's `Start` / `End` are tightened to `(familyPrefix || EncodeBracketStart(routeStart), familyPrefix || EncodeBracketStart(routeEnd))` instead of the family-wide bounds, reducing the scan budget consumption from "full family" to "moving slice within family." Families without an encoder hook (initially `!s3|...`, until the design records its routing-key encoding) keep the family-wide bracket + the scan-budget pacing above; the scan-budget alone is sufficient for correctness, the encoder hook is a per-family optimization that lands in the matching adapter's PR.
 
 These two layers together preserve the §9 resumability matrix per bracket (cursor still advances through both accepted and rejected rows; a leader flap resumes at the persisted scan cursor) and bound the per-chunk wall-clock cost regardless of how sparse the bracket happens to be. The `keys per bracket` distribution AND `rejected_rows per bracket` are §7.3 / §11.x metrics so operators can spot a runaway family scan and prioritize adding an encoder hook for that adapter.
@@ -797,7 +833,7 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 | Leader loss during CUTOVER | The CAS catalog write either landed (new version visible, job → CLEANUP) or not (job stays in DELTA_COPY, redo). Never partial. | None. |
 | Target group temporarily unreachable | Migrator retries with backoff; phase doesn't advance. | None. |
 | Source group temporarily unreachable | Same. Reads to source continue to fail with whatever transport error the adapter raises (independent of split). | Existing per-RPC retry. |
-| Duplicate ImportRangeVersions RPC | Importer compares request cursor to persisted; skips already-applied prefix; acks. | None. |
+| Duplicate ImportRangeVersions RPC | Importer compares the request's `(bracket_id, batch_seq)` to the per-bracket high-water mark under `!migstage|ack|<job_id>|<bracket_id>` (§6.1.1); drops any batch at or below it; acks. | None. |
 | Operator `AbandonSplitJob` during BACKFILL/FENCE/DELTA_COPY | Migrator rolls catalog back to `Active`; job → FAILED with `reason=abandoned`. | Brief retryable rejection clears. |
 | Crash between job state writes | Job state is **last-write-wins** on CAS; replaying a phase is safe by construction (idempotent imports, bounded ts windows). | None. |
 
@@ -807,8 +843,8 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 
 - `distribution/migrator_test.go`: state machine — exhaustive phase transitions, abandon paths, CAS contention.
 - `distribution/catalog_test.go`: SplitJob codec round-trip + version-1 stability.
-- `store/mvcc_store_export_test.go`: snapshot semantics — exported versions match a reader at `maxCommitTS`; intent locks excluded; cursor monotonic.
-- `store/mvcc_store_import_test.go`: idempotency under duplicate cursor; key_family dispatch.
+- `store/mvcc_store_export_test.go`: snapshot semantics — exported versions match a reader at `maxCommitTS`; intent locks excluded; cursor monotonic; `maxScannedBytes` budget bounds a sparse-bracket call (returns a partial/empty chunk + advancing cursor at `done=false` instead of scanning the full prefix).
+- `store/mvcc_store_import_test.go`: idempotency under duplicate `(bracket_id, batch_seq)` (a replayed batch at or below the per-bracket high-water mark is a no-op; parallel brackets do not clobber each other's ack record); key_family dispatch.
 - `kv/fsm_route_fenced_test.go`: FENCE rejection at FSM (table-driven over key families, mirroring `fsm_composed1_test.go`).
 - `kv/sharded_coordinator_route_fenced_test.go`: coordinator-side rejection + retry-after surfacing.
 - Property tests (`pgregory.net/rapid`): replay a sequence of (export-chunks, import-acks, leader-flap) and assert (a) all source keys land on target, (b) no duplicates committed at any commit_ts.
