@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,6 +59,52 @@ func TestCoordinate_ProposeHLCLease_FailedProposeDoesNotWarmLease(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, int32(1), eng.linearizableCalls.Load(),
 		"cold lease after a failed renewal must fall through to LinearizableRead")
+}
+
+// TestCoordinate_ProposeHLCLease_LeadershipLossErrorInvalidatesLease is
+// the SEQUENTIAL leadership-loss case (distinct from the concurrent
+// proposeHook race below). When Propose itself returns a
+// leadership-loss error -- this node lost leadership BEFORE the propose
+// completed, before any async RegisterLeaderLossCallback could fire --
+// the warm-up path must EAGERLY invalidate an already-warm lease, so no
+// stale-warm lease survives on a non-leader node for the callback
+// latency window. This is the exact-parity guarantee with
+// refreshLeaseAfterDispatch's leadership-loss branch.
+func TestCoordinate_ProposeHLCLease_LeadershipLossErrorInvalidatesLease(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	// Warm the lease so a regression (no eager invalidation) leaves it
+	// valid -- the assertion below would then fail.
+	require.NoError(t, c.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs))
+	require.True(t, c.lease.valid(monoclock.Now()), "precondition: lease must be warm")
+
+	// Next propose loses leadership before completing.
+	eng.proposeErr = raftengine.ErrNotLeader
+	err := c.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs)
+	require.ErrorIs(t, err, raftengine.ErrNotLeader)
+	require.False(t, c.lease.valid(monoclock.Now()),
+		"a leadership-loss propose error must EAGERLY invalidate the warm lease")
+}
+
+// TestCoordinate_ProposeHLCLease_NonLeadershipErrorKeepsLease proves the
+// invalidation is narrow: a non-leadership propose failure (e.g. no
+// quorum) must NOT tear down an already-warm lease, otherwise every
+// subsequent read would be forced onto the slow LinearizableRead path.
+func TestCoordinate_ProposeHLCLease_NonLeadershipErrorKeepsLease(t *testing.T) {
+	t.Parallel()
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	require.NoError(t, c.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs))
+	require.True(t, c.lease.valid(monoclock.Now()), "precondition: lease must be warm")
+
+	eng.proposeErr = errors.New("propose rejected: no quorum")
+	err := c.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs)
+	require.Error(t, err)
+	require.True(t, c.lease.valid(monoclock.Now()),
+		"a non-leadership propose error must NOT invalidate the warm lease")
 }
 
 // TestCoordinate_ProposeHLCLease_LeaderLossDuringProposeDoesNotWarmLease
@@ -139,6 +186,46 @@ func TestShardedCoordinator_RenewHLCLease_FailedProposeDoesNotWarmLease(t *testi
 	require.NoError(t, err)
 	require.Equal(t, int32(1), eng1.linearizableCalls.Load(),
 		"cold default-group lease after a failed renewal must fall through to LinearizableRead")
+}
+
+// TestShardedCoordinator_RenewHLCLease_LeadershipLossErrorInvalidatesLease
+// is the sharded counterpart of the sequential leadership-loss case: if
+// the default group's Propose returns a leadership-loss error, the
+// already-warm group lease must be eagerly invalidated, matching
+// leaseRefreshingTxn's leadership-loss branch on that same group.
+func TestShardedCoordinator_RenewHLCLease_LeadershipLossErrorInvalidatesLease(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	g1 := coord.groups[1]
+
+	coord.renewHLCLease(context.Background(), g1)
+	require.True(t, g1.lease.valid(monoclock.Now()), "precondition: default group lease must be warm")
+
+	eng1.proposeErr = raftengine.ErrNotLeader
+	coord.renewHLCLease(context.Background(), g1)
+	require.False(t, g1.lease.valid(monoclock.Now()),
+		"a leadership-loss propose error must EAGERLY invalidate the default group's warm lease")
+}
+
+// TestShardedCoordinator_RenewHLCLease_NonLeadershipErrorKeepsLease
+// proves the sharded invalidation is narrow: a non-leadership propose
+// failure must NOT tear down the already-warm default group lease.
+func TestShardedCoordinator_RenewHLCLease_NonLeadershipErrorKeepsLease(t *testing.T) {
+	t.Parallel()
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	g1 := coord.groups[1]
+
+	coord.renewHLCLease(context.Background(), g1)
+	require.True(t, g1.lease.valid(monoclock.Now()), "precondition: default group lease must be warm")
+
+	eng1.proposeErr = errors.New("propose rejected: no quorum")
+	coord.renewHLCLease(context.Background(), g1)
+	require.True(t, g1.lease.valid(monoclock.Now()),
+		"a non-leadership propose error must NOT invalidate the default group's warm lease")
 }
 
 // TestShardedCoordinator_RenewHLCLease_LeaderLossDuringProposeDoesNotWarm

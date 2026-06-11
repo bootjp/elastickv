@@ -1953,6 +1953,14 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 // This is the background warm-up that flattens the read-only
 // lease-expiry sawtooth for the default group on idle-write workloads;
 // the lease window/duration semantics are unchanged.
+//
+// On a leadership-loss propose error the group lease is invalidated
+// eagerly, mirroring leaseRefreshingTxn's error branch exactly: when
+// Propose returns the loss before the async RegisterLeaderLossCallback
+// fires, a stale-warm lease must not survive on a non-leader node for
+// the callback latency window. Non-leadership errors (no quorum,
+// validation) are NOT leadership signals and must not tear down a warm
+// lease -- doing so would force every read onto the slow path.
 func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
 	start := monoclock.Now()
@@ -1964,6 +1972,9 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGrou
 	// cleartext and trip the §6.3 strict-> unwrap on every replica's
 	// apply loop (codex P2 round-1).
 	if _, err := group.Proposer().Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
+		if isLeadershipLossError(err) {
+			group.lease.invalidate()
+		}
 		c.logger().WarnContext(ctx, "hlc lease renewal failed",
 			slog.Uint64("group_id", c.defaultGroup),
 			slog.Int64("ceiling_ms", ceilingMs),

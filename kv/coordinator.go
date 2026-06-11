@@ -644,11 +644,22 @@ func (c *Coordinate) Clock() *HLC {
 // stale lease. This is the background warm-up that flattens the
 // read-only lease-expiry sawtooth on idle-write workloads -- no extra
 // goroutine, no change to the lease window/duration semantics.
+//
+// On a leadership-loss propose error the lease is invalidated eagerly,
+// mirroring refreshLeaseAfterDispatch's error branch exactly: when
+// Propose returns the loss before the async RegisterLeaderLossCallback
+// fires, a stale-warm lease must not survive on a non-leader node for
+// the callback latency window. Non-leadership errors (no quorum,
+// validation) are NOT leadership signals and must not tear down a warm
+// lease -- doing so would force every read onto the slow path.
 func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
 	dispatchStart := monoclock.Now()
 	expectedGen := c.lease.generation()
 	_, err := c.engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs))
 	if err != nil {
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
 		return errors.WithStack(err)
 	}
 	c.extendLeaseAfterRenewal(dispatchStart, expectedGen)
