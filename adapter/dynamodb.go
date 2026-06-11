@@ -2241,12 +2241,16 @@ func (d *DynamoDBServer) leaseReadKeyless(w http.ResponseWriter, r *http.Request
 // the range can touch. Returns false after writing an error response;
 // the caller should simply return.
 func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request, in queryInput) bool {
-	leaseKey, ok := d.queryLeaseKey(r.Context(), in)
+	// leaseCtx bounds the entire pre-pass — the schema read that resolves
+	// the lease key and the lease read itself — so a stalled schema read
+	// cannot block the handler past dynamoLeaseReadTimeout before the lease
+	// phase begins. The keyless fallback creates its own bounded context.
+	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
+	defer leaseCancel()
+	leaseKey, ok := d.queryLeaseKey(leaseCtx, in)
 	if !ok {
 		return d.leaseReadKeyless(w, r)
 	}
-	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
-	defer leaseCancel()
 	if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, leaseKey); err != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 		return false
@@ -4371,7 +4375,8 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 // timestamp is sampled by the caller afterwards. Items whose schema or key
 // cannot be resolved here are skipped: they never reach a store read, and
 // buildTransactGetItemsResponses surfaces the identical validation error
-// downstream so error mapping is unchanged.
+// downstream so error mapping is unchanged. When every item is skipped no
+// shard is touched, so the function returns true without a lease read.
 //
 // Keys are first deduplicated by value, then collapsed to one representative key
 // per owning Raft group, so a transaction touching up to transactGetItemsMaxItems
@@ -4381,12 +4386,18 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 // after writing the same InternalServerError getItem produces on lease failure;
 // the caller should simply return.
 func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *http.Request, in transactGetItemsInput) bool {
+	// leaseCtx bounds the entire pre-pass — both the per-item schema reads
+	// that resolve keys and the lease reads themselves — so a stalled
+	// schema read (Pebble backpressure, iterator leak) cannot block the
+	// handler past dynamoLeaseReadTimeout before the lease phase begins.
+	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
+	defer leaseCancel()
 	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
 	schemaCache := make(map[string]*dynamoTableSchema)
 	seenKeys := make(map[string]struct{}, len(in.TransactItems))
 	uniqueKeys := make([][]byte, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
-		itemKey, ok := d.transactGetItemKey(r.Context(), item, schemaCache, tentativeTS)
+		itemKey, ok := d.transactGetItemKey(leaseCtx, item, schemaCache, tentativeTS)
 		if !ok {
 			continue
 		}
@@ -4396,8 +4407,13 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 		seenKeys[string(itemKey)] = struct{}{}
 		uniqueKeys = append(uniqueKeys, itemKey)
 	}
-	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
-	defer leaseCancel()
+	if len(uniqueKeys) == 0 {
+		// Every item is malformed or its schema/key could not be resolved,
+		// so no store read will happen and no shard will be touched; there
+		// is nothing to establish freshness against. buildTransactGetItemsResponses
+		// surfaces the identical validation error downstream.
+		return true
+	}
 	for _, itemKey := range kv.LeaseReadGroupKeys(d.coordinator, uniqueKeys) {
 		if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, itemKey); err != nil {
 			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
