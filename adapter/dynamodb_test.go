@@ -593,6 +593,102 @@ func TestDynamoDB_TransactGetItems_LeaseRead(t *testing.T) {
 	require.Contains(t, respBody, dynamoErrInternal)
 }
 
+// TestDynamoDB_TransactGetItems_LeaseDedupByGroup asserts that a
+// TransactGetItems touching many distinct keys that all resolve to the
+// same Raft group issues a single lease read, not one per key. Before the
+// per-group dedup this loop ran kv.LeaseReadForKeyThrough once per unique
+// key (up to transactGetItemsMaxItems sequential reads), which gemini
+// flagged as an O(N) latency bottleneck on PR #952.
+func TestDynamoDB_TransactGetItems_LeaseDedupByGroup(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	client := newDynamoTestClient(t, nodes[0].dynamoAddress)
+	ctx := context.Background()
+	createSimpleKeyTable(t, ctx, client)
+
+	const itemCount = 10
+	gets := make([]types.TransactGetItem, 0, itemCount)
+	for i := range itemCount {
+		k := "k" + strconv.Itoa(i)
+		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String("t"),
+			Item: map[string]types.AttributeValue{
+				"key":   &types.AttributeValueMemberS{Value: k},
+				"value": &types.AttributeValueMemberS{Value: "v" + strconv.Itoa(i)},
+			},
+		})
+		require.NoError(t, err)
+		gets = append(gets, types.TransactGetItem{
+			Get: &types.Get{TableName: aws.String("t"), Key: map[string]types.AttributeValue{
+				"key": &types.AttributeValueMemberS{Value: k},
+			}},
+		})
+	}
+
+	wrapped := wrapDynamoCoordinator(t, &nodes[0])
+	wrapped.resetLeaseCounters()
+
+	out, err := client.TransactGetItems(ctx, &dynamodb.TransactGetItemsInput{TransactItems: gets})
+	require.NoError(t, err)
+	require.Len(t, out.Responses, itemCount)
+
+	keyless, keyed := wrapped.leaseCallCounts()
+	require.Equal(t, 0, keyless, "TransactGetItems must not use the keyless lease check")
+	// Single-group deployment: every key routes to the same group, so the
+	// per-group dedup collapses all itemCount keys into ONE lease read.
+	require.Equal(t, 1, keyed,
+		"expected one lease read per distinct group, got %d for %d keys", keyed, itemCount)
+}
+
+// TestDynamoDB_Query_LeaseRoutedByKey asserts that a base-table Query is
+// lease-checked by its partition-key prefix (LeaseReadForKey) rather than
+// by the keyless default-group check, so a multi-group deployment confirms
+// the shard that actually owns the queried data (codex P2 on PR #952). A
+// GSI query, which can span the whole table prefix, falls back to keyless.
+func TestDynamoDB_Query_LeaseRoutedByKey(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+
+	client := newDynamoTestClient(t, nodes[0].dynamoAddress)
+	ctx := context.Background()
+	createSimpleKeyTable(t, ctx, client)
+	_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("t"),
+		Item: map[string]types.AttributeValue{
+			"key":   &types.AttributeValueMemberS{Value: "k1"},
+			"value": &types.AttributeValueMemberS{Value: "v1"},
+		},
+	})
+	require.NoError(t, err)
+
+	wrapped := wrapDynamoCoordinator(t, &nodes[0])
+	wrapped.resetLeaseCounters()
+
+	out, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:                aws.String("t"),
+		KeyConditionExpression:   aws.String("#k = :k"),
+		ExpressionAttributeNames: map[string]string{"#k": "key"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":k": &types.AttributeValueMemberS{Value: "k1"},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, out.Items, 1)
+
+	keyless, keyed := wrapped.leaseCallCounts()
+	require.Equal(t, 0, keyless, "base-table Query must route the lease check by the partition key")
+	require.Equal(t, 1, keyed, "base-table Query must issue exactly one key-routed lease check")
+
+	// The routed lease key must be the partition-key prefix the query
+	// actually scans, so it resolves to the owning shard group.
+	recorded := wrapped.recordedLeaseReadKeys()
+	require.Len(t, recorded, 1)
+	require.NotEmpty(t, recorded[0])
+}
+
 func TestDynamoDB_TransactGetItems_ValidationErrors(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)
@@ -1960,9 +2056,54 @@ type testCoordinatorWrapper struct {
 	// errInjectedLeaseRead instead of delegating, simulating quorum loss.
 	failLeaseReads atomic.Bool
 
+	// leaseReadCalls / leaseReadForKeyCalls count keyless vs key-routed
+	// lease checks; leaseReadKeys records the keys passed to
+	// LeaseReadForKey so tests can assert routing and per-group dedup.
+	leaseMu              sync.Mutex
+	leaseReadCalls       int
+	leaseReadForKeyCalls int
+	leaseReadKeys        [][]byte
+
 	blockEntered chan struct{}
 	blockRelease chan struct{}
 	blockOnce    sync.Once
+}
+
+// recordedLeaseReadKeys returns a copy of the keys passed to
+// LeaseReadForKey since the last reset.
+func (w *testCoordinatorWrapper) recordedLeaseReadKeys() [][]byte {
+	w.leaseMu.Lock()
+	defer w.leaseMu.Unlock()
+	out := make([][]byte, len(w.leaseReadKeys))
+	for i, k := range w.leaseReadKeys {
+		out[i] = append([]byte(nil), k...)
+	}
+	return out
+}
+
+// resetLeaseCounters clears the recorded lease-read counters and keys.
+func (w *testCoordinatorWrapper) resetLeaseCounters() {
+	w.leaseMu.Lock()
+	defer w.leaseMu.Unlock()
+	w.leaseReadCalls = 0
+	w.leaseReadForKeyCalls = 0
+	w.leaseReadKeys = nil
+}
+
+// leaseCallCounts returns the keyless and key-routed lease-read counts.
+func (w *testCoordinatorWrapper) leaseCallCounts() (keyless, keyed int) {
+	w.leaseMu.Lock()
+	defer w.leaseMu.Unlock()
+	return w.leaseReadCalls, w.leaseReadForKeyCalls
+}
+
+// EngineGroupIDForKey forwards group resolution so LeaseReadGroupKeys can
+// dedup by group through the wrapper.
+func (w *testCoordinatorWrapper) EngineGroupIDForKey(key []byte) uint64 {
+	if gr, ok := w.inner.(kv.GroupRoutableCoordinator); ok {
+		return gr.EngineGroupIDForKey(key)
+	}
+	return 0
 }
 
 func (w *testCoordinatorWrapper) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -2021,6 +2162,9 @@ func (w *testCoordinatorWrapper) LinearizableRead(ctx context.Context) (uint64, 
 }
 
 func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) {
+	w.leaseMu.Lock()
+	w.leaseReadCalls++
+	w.leaseMu.Unlock()
 	if w.failLeaseReads.Load() {
 		return 0, errInjectedLeaseRead
 	}
@@ -2028,6 +2172,10 @@ func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) 
 }
 
 func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	w.leaseMu.Lock()
+	w.leaseReadForKeyCalls++
+	w.leaseReadKeys = append(w.leaseReadKeys, append([]byte(nil), key...))
+	w.leaseMu.Unlock()
 	if w.failLeaseReads.Load() {
 		return 0, errInjectedLeaseRead
 	}

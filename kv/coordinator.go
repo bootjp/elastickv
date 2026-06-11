@@ -237,6 +237,51 @@ func LeaseReadForKeyThrough(c Coordinator, ctx context.Context, key []byte) (uin
 	return idx, errors.WithStack(err)
 }
 
+// GroupRoutableCoordinator is the optional capability implemented by
+// coordinators that can resolve the owning Raft group of a key without
+// any I/O. Callers that need to lease-check a set of keys use it to
+// deduplicate by group: keys that resolve to the same group share one
+// lease read instead of issuing one per key. Single-group coordinators
+// do not implement it, so callers must fall back to per-key dedup.
+type GroupRoutableCoordinator interface {
+	// EngineGroupIDForKey returns the owning group ID, or 0 when the
+	// key cannot be routed.
+	EngineGroupIDForKey(key []byte) uint64
+}
+
+// LeaseReadGroupKey returns a representative key per distinct owning
+// group for the supplied keys, so callers can issue one lease read per
+// group rather than one per key. The returned slice preserves the order
+// of first appearance. When the coordinator does not implement
+// GroupRoutableCoordinator (single-group deployments) every distinct key
+// is returned unchanged so the caller's per-key dedup still bounds the
+// work. Keys that cannot be routed (group ID 0) are never collapsed —
+// each is kept as its own representative so the lease check still runs
+// and surfaces the routing failure.
+func LeaseReadGroupKeys(c Coordinator, keys [][]byte) [][]byte {
+	router, ok := c.(GroupRoutableCoordinator)
+	if !ok {
+		return keys
+	}
+	reps := make([][]byte, 0, len(keys))
+	seen := make(map[uint64]struct{}, len(keys))
+	for _, key := range keys {
+		gid := router.EngineGroupIDForKey(key)
+		if gid == 0 {
+			// Unroutable: keep it so the lease check runs and fails
+			// closed instead of silently skipping the shard.
+			reps = append(reps, key)
+			continue
+		}
+		if _, dup := seen[gid]; dup {
+			continue
+		}
+		seen[gid] = struct{}{}
+		reps = append(reps, key)
+	}
+	return reps
+}
+
 func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -796,6 +841,19 @@ func engineLeaseAckValid(state raftengine.State, ack, now monoclock.Instant, lea
 
 func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
 	return c.LeaseRead(ctx)
+}
+
+// coordinateSingleGroupID is the synthetic group ID a single-group
+// Coordinate reports for every key. It only needs to be a stable
+// non-zero value so LeaseReadGroupKeys collapses all keys into one lease
+// read; the value is never used to address a real Raft group here.
+const coordinateSingleGroupID = 1
+
+// EngineGroupIDForKey makes Coordinate satisfy GroupRoutableCoordinator.
+// A Coordinate fronts exactly one Raft group, so every key maps to the
+// same group and batched lease checks collapse to a single read.
+func (c *Coordinate) EngineGroupIDForKey(_ []byte) uint64 {
+	return coordinateSingleGroupID
 }
 
 func (c *Coordinate) nextStartTS() (uint64, error) {

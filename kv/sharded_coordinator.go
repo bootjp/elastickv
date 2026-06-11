@@ -1632,6 +1632,15 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 	return gid
 }
 
+// EngineGroupIDForKey reports the Raft group ID that owns key, or 0 when
+// the key cannot be routed. Callers that batch lease checks across many
+// keys use it to collapse keys sharing a group into a single lease read
+// (see GroupRoutableCoordinator). It performs no I/O — only an in-memory
+// router lookup — so it is safe on the read hot path.
+func (c *ShardedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
+	return c.engineGroupIDForKey(key)
+}
+
 // groupReadKeysByShardID groups txn read keys by their owning Raft
 // group. Returns an error when ANY read key cannot be routed —
 // silently skipping unresolvable keys would let a transaction

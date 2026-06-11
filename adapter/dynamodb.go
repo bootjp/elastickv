@@ -2155,14 +2155,16 @@ func (d *DynamoDBServer) query(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	// A Query scans a key range that, in a multi-group deployment, can
-	// span more than one shard, and the owning shard cannot be resolved
-	// here without duplicating prepareReadSchema / resolveQueryCondition.
-	// Use the keyless lease check so the quorum-freshness bound covers
-	// every shard the range can touch BEFORE queryItems samples readTS;
-	// sampling readTS only after the confirmation keeps any commit that
-	// landed before the confirmation visible.
-	if !d.leaseReadKeyless(w, r) {
+	// Lease-check the shard the Query reads BEFORE queryItems samples
+	// readTS, so the quorum-freshness bound is established without
+	// changing read-snapshot semantics (sampling readTS only after the
+	// confirmation keeps any commit that landed before it visible). A
+	// base-table Query on a single partition key reads exactly one
+	// hash-key prefix, which routes to one shard group, so the check is
+	// routed by that prefix in a multi-group deployment. GSI queries and
+	// queries whose prefix cannot be resolved fall back to the keyless
+	// check, which spans every shard the range can touch.
+	if !d.leaseCheckQuery(w, r, in) {
 		return
 	}
 	out, err := d.queryItems(r.Context(), in)
@@ -2226,6 +2228,65 @@ func (d *DynamoDBServer) leaseReadKeyless(w http.ResponseWriter, r *http.Request
 		return false
 	}
 	return true
+}
+
+// leaseCheckQuery lease-checks the shard a Query reads with a bounded
+// timeout, writing the same InternalServerError getItem produces on
+// failure. When the request resolves to a single base-table hash-key
+// prefix (the common case), the check is routed to that prefix's owning
+// group via LeaseReadForKey so a multi-group deployment confirms the
+// shard that actually holds the data — not the default group. GSI
+// queries and any request whose prefix cannot be resolved here fall back
+// to the keyless check, which establishes freshness across every shard
+// the range can touch. Returns false after writing an error response;
+// the caller should simply return.
+func (d *DynamoDBServer) leaseCheckQuery(w http.ResponseWriter, r *http.Request, in queryInput) bool {
+	leaseKey, ok := d.queryLeaseKey(r.Context(), in)
+	if !ok {
+		return d.leaseReadKeyless(w, r)
+	}
+	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
+	defer leaseCancel()
+	if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, leaseKey); err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+		return false
+	}
+	return true
+}
+
+// queryLeaseKey resolves the single hash-key prefix a base-table Query
+// reads, at a tentative timestamp (schema only, no readTS sampling), so
+// the lease check can be routed to the owning shard group. It returns
+// (_, false) — signalling the caller to fall back to a keyless lease
+// check — for GSI queries, requests that read the whole-table prefix, or
+// any case where the schema/condition cannot be resolved without
+// duplicating queryItems error handling. Resolution failures here are
+// not surfaced as errors: the read path re-runs the same resolution and
+// reports the identical validation error, so error mapping is unchanged.
+func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]byte, bool) {
+	if strings.TrimSpace(in.IndexName) != "" {
+		return nil, false
+	}
+	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
+	schema, exists, err := d.loadTableSchemaAt(ctx, in.TableName, tentativeTS)
+	if err != nil || !exists {
+		return nil, false
+	}
+	keySchema, cond, err := resolveQueryCondition(in, schema)
+	if err != nil {
+		return nil, false
+	}
+	// A query whose key schema hash key differs from the primary hash
+	// key reads the whole-table prefix (see queryScanPrefix), which can
+	// span multiple shards; let the keyless check cover them.
+	if keySchema.HashKey != schema.PrimaryKey.HashKey {
+		return nil, false
+	}
+	prefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
+	if err != nil {
+		return nil, false
+	}
+	return prefix, true
 }
 
 func decodeQueryInput(bodyReader io.Reader) (queryInput, error) {
@@ -4303,21 +4364,27 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 }
 
 // leaseCheckTransactGetItems performs a quorum-freshness lease check on every
-// shard the TransactGetItems request will read, deduplicated by item key, with
-// a bounded timeout. Item keys are resolved at a tentative timestamp (schemas
-// change rarely, so a slight pre-lease stale schema is acceptable) used only to
-// route the lease check; the actual snapshot timestamp is sampled by the caller
-// afterwards. Items whose schema or key cannot be resolved here are skipped:
-// they never reach a store read, and buildTransactGetItemsResponses surfaces the
-// identical validation error downstream so error mapping is unchanged. Returns
-// false after writing the same InternalServerError getItem produces on lease
-// failure; the caller should simply return.
+// shard the TransactGetItems request will read, with a bounded timeout, BEFORE
+// the caller resolves the single snapshot timestamp. Item keys are resolved at a
+// tentative timestamp (schemas change rarely, so a slight pre-lease stale schema
+// is acceptable) used only to route the lease check; the actual snapshot
+// timestamp is sampled by the caller afterwards. Items whose schema or key
+// cannot be resolved here are skipped: they never reach a store read, and
+// buildTransactGetItemsResponses surfaces the identical validation error
+// downstream so error mapping is unchanged.
+//
+// Keys are first deduplicated by value, then collapsed to one representative key
+// per owning Raft group, so a transaction touching up to transactGetItemsMaxItems
+// keys that share a group issues a single lease read instead of one per key.
+// Each group maintains its own lease, so checking one key per group still
+// establishes freshness for every shard the transaction reads. Returns false
+// after writing the same InternalServerError getItem produces on lease failure;
+// the caller should simply return.
 func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *http.Request, in transactGetItemsInput) bool {
 	tentativeTS := snapshotTS(d.coordinator.Clock(), d.store)
 	schemaCache := make(map[string]*dynamoTableSchema)
 	seenKeys := make(map[string]struct{}, len(in.TransactItems))
-	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
-	defer leaseCancel()
+	uniqueKeys := make([][]byte, 0, len(in.TransactItems))
 	for _, item := range in.TransactItems {
 		itemKey, ok := d.transactGetItemKey(r.Context(), item, schemaCache, tentativeTS)
 		if !ok {
@@ -4327,6 +4394,11 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 			continue
 		}
 		seenKeys[string(itemKey)] = struct{}{}
+		uniqueKeys = append(uniqueKeys, itemKey)
+	}
+	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
+	defer leaseCancel()
+	for _, itemKey := range kv.LeaseReadGroupKeys(d.coordinator, uniqueKeys) {
 		if _, err := kv.LeaseReadForKeyThrough(d.coordinator, leaseCtx, itemKey); err != nil {
 			writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
 			return false
