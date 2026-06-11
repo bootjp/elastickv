@@ -71,7 +71,18 @@ Building detection on the engine counters would mean re-implementing windowing, 
 - **M3 reads detection input from the keyviz sampler**, not from `Route.Load`.
 - The engine's `RecordAccess` / `splitRange` / `Route.Load` path is **retired** (§3.4). No new call site is added for it.
 
-This means **auto-split requires keyviz sampling to be active**. `--autoSplit` implies the sampler is constructed and flushing (§7.1). We do *not* require the operator to also pass `--keyvizEnabled`; enabling auto-split turns on the minimum sampling auto-split needs (route-granular counts; sub-range buckets and Top-K stay opt-in via the existing keyviz flags and only sharpen split-key selection — see §5.4).
+This means **auto-split requires keyviz sampling to be active**, and not merely at its today-defaults. The bare keyviz defaults are `DefaultKeyBucketsPerRoute = 1` (route-granular, no sub-range buckets — `keyviz/sampler.go:91`) and `HotKeysEnabled = false` (`--keyvizHotKeysEnabled` default false — `main.go:205`). Under *those* defaults the detector has **no intra-route distribution** and §5.4.3 makes it decline every split (it has no split-key evidence). So "turn on `--autoSplit` and nothing else" with the bare keyviz defaults would be a permanent no-op — exactly the gap raised in review.
+
+To close it, **`--autoSplit` implies the split-key evidence source it needs, not just route-granular counts.** When `--autoSplit` is true and the operator has not raised `--keyvizKeyBucketsPerRoute`, auto-split constructs the sampler with `KeyBucketsPerRoute = autoSplitDefaultBuckets` (default 16, well under the `MaxKeyBucketsPerRoute = 256` cap at `keyviz/sampler.go:115`) so the sub-range-p50 split-key path (§5.4.1) has evidence by default. The implied-vs-explicit config is:
+
+| Flag | Bare keyviz default | With `--autoSplit` (no other keyviz flags) | Effect on auto-split |
+|---|---|---|---|
+| sampler constructed | only if `--keyvizEnabled` | **forced on** (`if keyvizEnabled \|\| autoSplit`, §7.1) | required signal exists |
+| `--keyvizStep` | 60s (`sampler.go:84`) | 60s (unchanged) | window/eval cadence |
+| `--keyvizKeyBucketsPerRoute` | 1 (route-granular, `sampler.go:91`) | **raised to `autoSplitDefaultBuckets`=16** when operator left it at 1 | enables §5.4.1 sub-range-p50 split key — without this auto-split always declines |
+| `--keyvizHotKeysEnabled` | false (`main.go:205`) | **stays false** (opt-in) | §5.4.2 single-key isolation is opt-in; absence only loses the single-key path, not all splits |
+
+So the advertised "just `--autoSplit`" mode produces splits out of the box via sub-range p50. An operator who explicitly sets `--keyvizKeyBucketsPerRoute 1` while enabling `--autoSplit` is choosing route-granular-only and gets the §5.4.3 decline (counted as `autosplit_skipped_total{reason="no_split_key"}`) — that is now a deliberate operator choice, not a hidden default trap. Top-K (`--keyvizHotKeysEnabled`) remains opt-in and only adds the §5.4.2 single-key-isolation path; its absence costs only that path, not all splits.
 
 ### 3.2 Where it hooks in (already done; no hot-path change)
 
@@ -127,6 +138,12 @@ These come straight from `MemSampler.Snapshot(from, to)` `[]MatrixColumn` (`keyv
 
 The detector is a pure function of (windowed per-route load, per-route detector state, config) → (split decisions). Keeping it pure makes §8's table-driven tests trivial and makes the leader-local reset (§7.6) a matter of dropping the state map.
 
+### 5.0 Candidacy precondition: only `RouteStateActive` routes
+
+Before any scoring, the detector filters candidates to routes in **`RouteStateActive`** only (`distribution/catalog.go:51-58`). Routes in a transitional state — `RouteStateWriteFenced`, `RouteStateMigratingSource`, `RouteStateMigratingTarget` — are **excluded from candidacy entirely**: they are not scored, not promoted, and never produce a split decision. This is the first gate of every evaluation cycle.
+
+Rationale: a `WRITE_FENCED`/`MIGRATING_*` route is mid-cutover under an M2 `SplitJob` (parent doc §6, §7) or a manual fence. Issuing a `SplitRange` against such a route would race the in-flight migration and corrupt the cutover invariants. The state read comes from the same engine `CatalogSnapshot` the detector already loads each cycle (§4.2, `RouteDescriptor.State`), so the gate costs one field compare per route. This is strictly stronger than, and subsumes, the §6.3 "exclude routes with an in-flight `SplitJob`" rule — a fenced/migrating route is excluded even before the scheduler looks at job state. The exclusion is asserted in the §8.2 unit tests (a route in each non-active state must never be promoted) and the §8.2 rapid invariants.
+
 ### 5.1 Scoring
 
 Per route, per evaluation cycle:
@@ -147,13 +164,17 @@ Down-side hysteresis: the detector tracks a per-route `consecutiveOver` counter 
 
 After a split is *scheduled* for a route (the `SplitRange` call is issued), both child routes enter a **cooldown** of `splitCooldown` (parent doc §6.2 default 10 minutes). During cooldown the detector will not promote either child to a candidate, regardless of score. Cooldown is keyed by route lineage (the child `RouteID`s produced by the split / observed via the next catalog snapshot), tracked in the leader-local state map with a wall-clock expiry that is **diagnostic-only** for logging but enforced via a monotonic deadline (`internal/monoclock`) so a wall-clock step cannot shorten or extend a cooldown (CLAUDE.md: no ordering-sensitive use of wall clock).
 
+**Compound single-key isolation is cooldown-exempt for its own intermediate child.** The §5.4.2 single-key-isolation flow first splits `[A,B) → [A,H) + [H,B)`, then immediately splits the *intermediate* child `[H,B)` again to isolate `{H}`. If the first split's cooldown applied to `[H,B)`, the second `SplitRange` could never fire and the hot key would never be isolated — which is the contradiction review flagged. The detector therefore treats the compound decision as a **single logical split**: cooldown is applied to the **final** children only — `[A,H)`, `{H}` = `[H, H·0x00)`, and `[H·0x00, B)` — and the *transient* intermediate child `[H,B)` is exempt because it exists only between the two calls of the same atomic operation and is consumed by the second call. This exemption is scoped strictly to the compound operation's own intermediate child (matched by lineage during the cycle that issues it); it does **not** weaken cooldown for any independently-scheduled split. The §8.2 tests assert (a) the three final children are all in cooldown after a compound split, and (b) the intermediate child is never separately re-promoted by the detector.
+
 ### 5.4 Split-key selection (not midpoint-only)
 
 Per parent doc §3.1.3 and §6.3, the split key comes from the **observed key distribution**, not a byte midpoint:
 
 1. **Default — sub-range p50.** When `--keyvizKeyBucketsPerRoute > 1`, use the route's sub-range bucket rows to find the bucket boundary nearest the cumulative-load median, and use that boundary key (reconstructed via `MemSampler.SubBucketBoundsFor`, `keyviz/sampler.go:559`) as the split key. This places the boundary where load is actually halved.
-2. **Single-key skew — isolate the hot key.** When Top-K is enabled (`--keyvizHotKeysEnabled`) and one key's share of the route's writes is `>= topKeyShare` (parent doc §6.3 default 0.8), split so the hot key is isolated into its own narrow child (split key = hot key, and a follow-on split at hot key's successor so the child contains only that key). This is the single-hot-key hotspot case the whole feature targets.
-3. **Fallback — coarse boundary.** When neither sub-range buckets nor Top-K are enabled (route-granular sampling only), the detector has no intra-route distribution. Rather than fall back to a blind midpoint (which the parent doc forbids and which can produce an empty child), the detector **declines to split** and emits a metric/log (`autosplit_skipped_no_split_key`) telling the operator to raise `--keyvizKeyBucketsPerRoute`. OQ-3 asks whether a midpoint-of-observed-min/max-key fallback is acceptable here instead of declining.
+2. **Single-key skew — isolate the hot key (compound split).** When Top-K is enabled (`--keyvizHotKeysEnabled`) and one key's share of the route's writes is `>= topKeyShare` (parent doc §6.3 default 0.8), split so the hot key `H` lands in its own single-key child. Isolating `H` from a route `[A, B)` takes **two boundaries** — one at `H` and one at `H`'s successor `H·0x00` — so the middle child is exactly `[H, H·0x00)` = `{H}`. The detector emits this as **one atomic compound decision** carrying both split keys, not two independent decisions across cycles. The scheduler executes it as a back-to-back pair of `SplitRange` calls (first `[A,B) → [A,H) + [H,B)`, then `[H,B) → [H, H·0x00) + [H·0x00, B)`), counted and budgeted as described in §6.4 (compound = 1 budget unit, cooldown exempt for the intermediate child). This is the single-hot-key hotspot case the whole feature targets.
+
+   If Top-K is **not** enabled, single-key isolation is unavailable; the detector falls through to the §5.4.1 sub-range-p50 path (which still relieves a *range* skew but cannot pin a single key), so the operator loses only this path, not all splits.
+3. **Fallback — coarse boundary.** When neither sub-range buckets nor Top-K are enabled (route-granular sampling only), the detector has no intra-route distribution. Rather than fall back to a blind midpoint (which the parent doc forbids and which can produce an empty child), the detector **declines to split** and emits a metric/log (`autosplit_skipped_total{reason="no_split_key"}`) telling the operator to raise `--keyvizKeyBucketsPerRoute`. OQ-3 asks whether a midpoint-of-observed-min/max-key fallback is acceptable here instead of declining.
 4. **Unbounded-tail routes (`End == nil`).** Derive the split key from observed keys (sub-range layout over `[start, MaxUint64]` already supports this, `keyviz/sampler.go:833-848`), never from a synthetic byte.
 
 The selected split key must satisfy `route.Start < split_key < route.End` (or `< +inf`); the detector validates this against the live engine route before emitting a decision and drops the decision (with a metric) if the key no longer falls inside the route (the route may have shifted under a concurrent split).
@@ -161,7 +182,7 @@ The selected split key must satisfy `route.Start < split_key < route.End` (or `<
 ### 5.5 Guardrails
 
 - **Minimum route size** (`minRouteSpan`, OQ-4): a route whose observed key span (distance between min and max observed key, or sub-range extent) is below a floor is not split — splitting a tiny range yields children too small to relieve load and churns the catalog. Because the engine has no per-route key-count, this is approximated from the sub-range/Top-K evidence; when that evidence is absent the guard is conservatively "do not split" (matches §5.4.3).
-- **Max routes** (`maxAutoRoutes`, default e.g. 1024): once the catalog holds `maxAutoRoutes` routes, the detector stops proposing new splits and emits `autosplit_route_cap_reached`. Prevents unbounded catalog growth (and bounds the watcher fan-out and the Composed-1 history-ring pressure noted at `distribution/engine.go:53-58`).
+- **Max routes** (`maxAutoRoutes`, default e.g. 1024): once the catalog holds `maxAutoRoutes` routes, the detector stops proposing new splits and emits `autosplit_skipped_total{reason="route_cap"}`. Prevents unbounded catalog growth (and bounds the watcher fan-out and the Composed-1 history-ring pressure noted at `distribution/engine.go:53-58`).
 - **Per-cycle split budget** (`maxSplitsPerCycle`, default 1): at most this many splits are scheduled per evaluation cycle, so a cluster-wide load spike across many routes cannot trigger a split storm in one tick. Remaining candidates carry their `consecutiveOver` state to the next cycle.
 
 ## 6. Scheduler
@@ -183,12 +204,27 @@ The target-group selection slots **behind the same `SplitRange` interface** — 
 
 The scheduler issues at most `maxSplitsPerCycle` (§5.5) `SplitRange` calls per cycle and waits for each to return (same-group splits are synchronous; cross-group returns a `job_id` immediately per M2 §5.1). A route with an in-flight cross-group `SplitJob` (not yet `DONE`) is excluded from candidacy until the job completes, so the detector cannot stack a second split on a route mid-migration.
 
+### 6.4 Compound single-key isolation execution and budget
+
+The §5.4.2 single-key-isolation decision is one logical operation that the scheduler executes as two back-to-back `SplitRange` calls within the same cycle:
+
+1. `SplitRange([A,B), split_key=H, expected_catalog_version=v0)` → `[A,H) + [H,B)`, returns `v1` and the intermediate child's `RouteID`.
+2. `SplitRange([H,B), split_key=H·0x00, expected_catalog_version=v1)` → `[H, H·0x00) + [H·0x00, B)`.
+
+Budget and cooldown treatment:
+
+- **Budget: the compound counts as 1 unit** against `maxSplitsPerCycle`, not 2. The per-cycle budget exists to bound *distinct hot routes* split per tick (anti-storm); isolating one hot key is a single anti-storm event, so it consumes one unit even though it issues two RPCs. This keeps the default `maxSplitsPerCycle = 1` workable for single-key isolation without forcing operators to raise it to 2.
+- **CAS chaining.** The second call uses the `v1` returned by the first (not the cycle's starting `v0`), so the pair is serialized against the live catalog version. If the first call's CAS fails (a concurrent manual split landed), the scheduler abandons the compound, emits `autosplit_splits_failed_total{reason="cas_conflict"}`, and re-evaluates next cycle — it does **not** issue the second call against a stale version.
+- **Partial-completion safety.** If the first call commits but the second fails (CAS conflict or RPC error), the catalog is left in a valid two-child state `[A,H) + [H,B)` — `[H,B)` is simply a narrower route that the detector re-evaluates next cycle (it is now in cooldown only if the §5.3 rule applied it; per §5.3 the intermediate `[H,B)` is exempt, so it is eligible next cycle and the detector can retry the isolation). No invariant is broken by stopping after the first call; the worst case is the hot key takes one extra cycle to isolate. This is logged `autosplit_compound_partial`.
+- Cooldown applies to the three **final** children only, per §5.3.
+
 ## 7. Safety and Operations
 
 ### 7.1 Default OFF behind a flag
 
-- `--autoSplit` (bool, default `false`). When false, none of the detector/scheduler goroutines start; behavior is identical to today. When true, the default-group leader runs the detector + scheduler loop, and the keyviz sampler is constructed and flushed if it is not already (`--autoSplit` implies the minimum sampling, §3.1).
-- Tuning flags (all with parent-doc-derived defaults): `--autoSplitWriteWeight` (4), `--autoSplitReadWeight` (1), `--autoSplitThreshold` (50000 ops/min), `--autoSplitCandidateWindows` (3), `--autoSplitCooldown` (10m), `--autoSplitMaxRoutes`, `--autoSplitMaxPerCycle` (1), `--autoSplitEvalInterval` (evaluation cycle period, default = `--keyvizStep`).
+- `--autoSplit` (bool, default `false`). When false, none of the detector/scheduler goroutines start; behavior is identical to today. When true, the default-group leader runs the detector + scheduler loop, and the keyviz sampler is constructed and flushed if it is not already.
+- **Sampler-wiring condition.** The sampler is built when `keyvizEnabled || autoSplit` (today it is built only on `keyvizEnabled`; see `main.go:2005` `newKeyvizSampler` and the analogous wiring in `cmd/server/demo.go`). M3-PR3's flag-wiring change touches both `main.go` and `cmd/server/demo.go`. When auto-split forces the sampler on and the operator left `--keyvizKeyBucketsPerRoute` at its default of 1, auto-split raises it to `autoSplitDefaultBuckets` (default 16) so split-key evidence exists by default (§3.1 table). An explicit `--keyvizKeyBucketsPerRoute 1` is honored as-is (operator opts into route-granular-only → §5.4.3 decline).
+- Tuning flags (all with parent-doc-derived defaults): `--autoSplitWriteWeight` (4), `--autoSplitReadWeight` (1), `--autoSplitThreshold` (50000 ops/min), `--autoSplitCandidateWindows` (3), `--autoSplitCooldown` (10m), `--autoSplitMaxRoutes`, `--autoSplitMaxPerCycle` (1), `--autoSplitEvalInterval` (evaluation cycle period, default = `--keyvizStep`), `--autoSplitDefaultBuckets` (sub-range buckets auto-split implies when keyviz bucketing is left at the default, default 16).
 
 ### 7.2 Runtime kill switch
 
@@ -202,7 +238,8 @@ Counters:
 - `autosplit_candidates_promoted_total`
 - `autosplit_splits_scheduled_total`
 - `autosplit_splits_failed_total{reason}` — `reason` ∈ {`cas_conflict`, `rpc_error`, `no_split_key`, `route_cap`, `budget_exhausted`, `target_unavailable`}.
-- `autosplit_skipped_total{reason}` — same fixed reason enum.
+- `autosplit_skipped_total{reason}` — `reason` ∈ {`no_split_key`, `route_cap`, `budget_exhausted`, `non_active_state`, `unsplittable_hot_key`} (fixed enum).
+- `autosplit_compound_partial_total` — a compound single-key isolation (§6.4) committed its first split but not the second; the hot key will be isolated on a later cycle.
 
 Gauges:
 - `autosplit_enabled` (0/1)
@@ -222,17 +259,38 @@ Structured `slog` with stable keys per CLAUDE.md conventions: `route_id`, `group
 - **Split storms** (many routes hot at once): mitigated by `maxSplitsPerCycle` per-cycle budget (§5.5) and `maxAutoRoutes` cap.
 - **Empty/degenerate child** (split key produces a child with no keys): prevented by distribution-based split-key selection (§5.4) — the key sits at the observed load median, never a synthetic byte; plus the `route.Start < split_key < route.End` validation. When no distribution evidence exists, the detector declines (§5.4.3) rather than risk an empty child.
 - **Catalog churn under the scheduler** (route shifted between detection and `SplitRange`): the `expected_catalog_version` CAS fails closed; the scheduler re-evaluates next cycle (§6.1).
-- **Repeated re-split of the same hotspot** that a single split cannot relieve (genuinely un-splittable single-key hotspot, e.g. one key taking all writes): single-key isolation (§5.4.2) splits the key into its own child once; cooldown + the `minRouteSpan` guard then prevent infinitely re-splitting a child that is already a single key (a one-key range cannot be split further — `split_key` validation has no valid interior key, the detector declines and logs `autosplit_unsplittable_hot_key`). This is the limit of split-based mitigation; truly relieving a single-key hotspot is an application/data-model problem, not a sharding one.
+- **Repeated re-split of the same hotspot** that a single split cannot relieve (genuinely un-splittable single-key hotspot, e.g. one key taking all writes): single-key isolation (§5.4.2) splits the key into its own child once; cooldown + the `minRouteSpan` guard then prevent infinitely re-splitting a child that is already a single key (a one-key range cannot be split further — `split_key` validation has no valid interior key, the detector declines and counts `autosplit_skipped_total{reason="unsplittable_hot_key"}`). This is the limit of split-based mitigation; truly relieving a single-key hotspot is an application/data-model problem, not a sharding one.
 
 ### 7.6 Interaction with leader changes
 
 The detector's hysteresis counters and cooldown deadlines live in a **leader-local in-memory state map** — they are **not** replicated through Raft. On a default-group leadership change:
 
-- The deposed leader's detector goroutine stops (it observes the leader-loss callback, the same mechanism the lease invalidation uses).
+- The deposed leader's detector goroutine stops (it observes the leader-loss callback. The concrete mechanism is the same per-group leadership-transition signal the lease layer consumes to invalidate the read lease — `kv/lease_state.go` (lease invalidation on leadership loss) driven from the etcd-raft `SoftState`/leader-change callback surfaced through `kv/raft_engine.go`. M3-PR3 subscribes the detector goroutine's lifecycle to that same signal rather than introducing a new one).
 - The **new** leader starts its detector with an **empty** state map. Consecutive-over counters reset to zero, so a route must re-accumulate `candidateWindows` cycles before it can be promoted again. This is intentionally conservative: after an election, the new leader re-earns confidence before splitting, avoiding a split based on counters it never observed.
-- **Cooldowns are partially lost** across an election (the new leader does not know a route was recently split). To avoid a too-soon re-split, the new leader seeds cooldown from the catalog: any route whose `parent_route_id` lineage (parent doc §5, `RouteDescriptor.parent_route_id`) indicates a recent split, or whose creation is recent per the catalog, starts in cooldown. (OQ-7: is `parent_route_id` + a catalog-recorded split timestamp enough to reconstruct cooldown, or do we need a durable `last_split_at` per route?) In-flight cross-group `SplitJob`s are durable (M2) so the new leader sees them and excludes those routes (§6.3) regardless of detector state.
+- **Cooldowns are reconstructed from a durable timestamp, not guessed from lineage.** See §7.7 — the new leader seeds cooldown deterministically from a new `RouteDescriptor.SplitAtHLC` field. In-flight cross-group `SplitJob`s are durable (M2) so the new leader also sees them and excludes those routes (§6.3) regardless of detector state.
 
 Keeping detector state leader-local (not Raft-replicated) is a deliberate cost/safety trade: replicating per-cycle counters would add Raft traffic for what is a best-effort heuristic, and the worst case of a lost counter is a *delayed* split (safe), never an *erroneous* one. We state this explicitly so a reviewer does not mistake the non-replication for an oversight.
+
+### 7.7 Bounding the leader-local state map and reconstructing cooldown
+
+Two correctness properties of the leader-local state map, both raised in review:
+
+**(a) The state map is bounded — no unbounded growth.** Route IDs are retired when a route is split (the parent `RouteID` disappears from the catalog and is replaced by child `RouteID`s) or merged (future work). If the detector kept a hysteresis/cooldown entry for every `RouteID` it ever saw, the map would grow without bound across the cluster's lifetime even though the live route set is bounded by `maxAutoRoutes` (§5.5). The detector therefore **reconciles the state map against the live catalog at the start of every evaluation cycle**:
+
+- Build the set of live `RouteID`s from the current engine `CatalogSnapshot` (already loaded for scoring, §4.2).
+- Evict any state-map entry whose `RouteID` is not in that set. This GC step is O(map size) per cycle, off the hot path, and runs at `--autoSplitEvalInterval` cadence.
+
+This makes the map size strictly bounded by the live route count (`<= maxAutoRoutes`), and the `autosplit_tracked_routes` gauge (§7.3) reflects the post-GC size so an operator can see it never exceeds the cap. The reconciliation also resolves the **manual-split / disappeared-route** case raised in review: when a route is removed out-of-band (a manual `SplitRange`), its stale entry is dropped at the next cycle instead of the detector wasting work re-evaluating a route the engine no longer knows. The §8.2 tests assert the map shrinks after a split retires a parent `RouteID` and that an evicted route's counters do not survive.
+
+**(b) Cooldown reconstruction needs a durable timestamp — add `RouteDescriptor.SplitAtHLC`.** Review correctly observed that the current `RouteDescriptor` (`distribution/catalog.go:71-78`: `RouteID, Start, End, GroupID, State, ParentRouteID`) carries **no creation/split timestamp**, so "seed cooldown for routes whose creation is recent per the catalog" had no basis in the schema — a new leader could not tell a 1-minute-old child from a 1-hour-old one. The original §7.6 wording was therefore unimplementable; this section replaces it.
+
+M3 adds one durable field to `RouteDescriptor`:
+
+- **`SplitAtHLC uint64`** — the HLC timestamp at which the split that produced this route was applied. Set by the `SplitRange` handler (`adapter/distribution_server.go:136`) when it writes each child `RouteDescriptor`, using the leader-issued HLC (`HLC.Next()`, never the local wall clock — CLAUDE.md). It is encoded/decoded alongside `ParentRouteID` in `EncodeRouteDescriptor`/`DecodeRouteDescriptor` (`distribution/catalog.go:168-217`) under a bumped `catalogRouteCodecVersion` (currently 1 at `catalog.go:24`); the decoder treats a missing field on a v1 record as `SplitAtHLC = 0` (= "unknown / pre-upgrade", never in cooldown), so the change is backward-compatible with existing catalog records.
+
+With `SplitAtHLC` present, the new leader reconstructs cooldown deterministically: for each live route, if `now_hlc − SplitAtHLC < splitCooldown` (compared in HLC physical-ms units, monotonic per §5.3), seed that route's cooldown deadline to `SplitAtHLC + splitCooldown`. This is exact, not heuristic, and uses the durable timestamp rather than `parent_route_id` recency (which only tells you *whether* a route is a child, not *when*).
+
+**Scoping.** This is a catalog schema change, so it lands in **M3-PR1** (which already touches the engine/catalog cleanup, §8.1) — the field, the codec-version bump, the `SplitRange`-handler write, and the round-trip codec test ship together, ahead of the detector that consumes it (M3-PR2/PR3). The §8.1 table and §8.4 acceptance criteria are updated accordingly.
 
 ## 8. Milestone / PR Breakdown, Test Strategy, Open Questions
 
@@ -240,9 +298,9 @@ Keeping detector state leader-local (not Raft-replicated) is a deliberate cost/s
 
 | PR | Scope | Tests | Independently shippable? |
 |---|---|---|---|
-| **M3-PR1** | Retire engine `RecordAccess`/`splitRange`/`Route.Load` threshold path (§3.4); confirm keyviz is the sole signal; add `autosplit_*` metric scaffolding (no detector yet). | `distribution/engine_test.go` updated (dead-code removal); metric registration test. | Yes — pure cleanup + metric names; no behavior change. |
-| **M3-PR2** | Aggregation reader (leader-local consumption of `MemSampler.Snapshot`, §4) + the pure detector: scoring, hysteresis, cooldown, split-key selection, guardrails (§5). No scheduler wiring — detector emits decisions to a sink that is a no-op/log in this PR. | Table-driven unit tests for scoring/hysteresis/cooldown/split-key/guardrails (the detector is a pure function, §5). | Yes — detector runs and logs would-be decisions; nothing splits. Safe to ship "observe-only." |
-| **M3-PR3** | Scheduler wiring to `SplitRange` (§6) + `--autoSplit` flag + runtime kill switch + slog (§7). Same-group target only (cross-group target hook present but disabled). | Integration: detector→`SplitRange` end-to-end in the 3-node demo (`cmd/server/demo.go`); kill-switch + leader-change reset tests. | Yes — completes standalone auto-split. |
+| **M3-PR1** | Retire engine `RecordAccess`/`splitRange`/`Route.Load` threshold path (§3.4); confirm keyviz is the sole signal; **add the durable `RouteDescriptor.SplitAtHLC` field** (codec-version handling, `SplitRange`-handler write, §7.7); add `autosplit_*` metric scaffolding (no detector yet). | `distribution/engine_test.go` updated (dead-code removal); `RouteDescriptor` codec round-trip test incl. the new field + a v1-record back-compat decode test; metric registration test. | Yes — cleanup + additive schema field (back-compat decode) + metric names; no behavior change. |
+| **M3-PR2** | Aggregation reader (leader-local consumption of `MemSampler.Snapshot`, §4) + the pure detector: `RouteStateActive`-only candidacy precondition (§5.0), scoring, hysteresis, cooldown, compound single-key isolation (§5.4.2), split-key selection, guardrails (§5), **state-map GC reconciliation against the live catalog each cycle (§7.7a)**. No scheduler wiring — detector emits decisions to a sink that is a no-op/log in this PR. | Table-driven unit tests for candidacy precondition (non-active states never promote)/scoring/hysteresis/cooldown/compound-split cooldown exemption/split-key/guardrails; state-map shrinks after a parent `RouteID` retires (the detector is a pure function, §5). | Yes — detector runs and logs would-be decisions; nothing splits. Safe to ship "observe-only." |
+| **M3-PR3** | Scheduler wiring to `SplitRange` (§6, incl. compound single-key isolation §6.4) + `--autoSplit` flag + sampler-wiring condition `keyvizEnabled \|\| autoSplit` and `autoSplitDefaultBuckets` implied bucketing in `main.go` and `cmd/server/demo.go` (§7.1) + runtime kill switch + slog + `SplitAtHLC`-seeded cooldown reconstruction on election (§7.7b). Same-group target only (cross-group target hook present but disabled). | Integration: detector→`SplitRange` end-to-end in the 3-node demo (`cmd/server/demo.go`); kill-switch + leader-change reset + seeded-cooldown-from-`SplitAtHLC` tests. | Yes — completes standalone auto-split. |
 | **M3-PR4** (post-M2) | Enable least-loaded `target_group_id` selection on the existing scheduler hook once M2's cross-group `SplitRange` lands (§6.2); exclude in-flight `SplitJob` routes. | Integration: cross-group auto-split against M2 migrator; target-selection unit tests. | Depends on M2; the M3 scheduler interface is unchanged. |
 | **M3-PR5** | Lifecycle: rename `*_proposed_*` → `*_partial_*` after M3-PR1, update parent partial doc's M3 row; → `*_implemented_*` after M3-PR3 (standalone) with M3-PR4 tracked as the cross-group follow-on. | — | Doc-only. |
 
@@ -272,18 +330,20 @@ Each PR carries the five-lens self-review and is gated by its tests + `make lint
 3. A route below threshold, or above for fewer than `candidateWindows` cycles, never splits.
 4. A just-split route does not re-split within `splitCooldown`.
 5. The runtime kill switch stops new splits within one evaluation cycle without a restart.
-6. A default-group leader change resets detector state and re-earns a candidate before re-splitting; seeded cooldown prevents immediate post-election re-split.
+6. A default-group leader change resets detector state and re-earns a candidate before re-splitting; cooldown seeded from `RouteDescriptor.SplitAtHLC` (§7.7b) prevents immediate post-election re-split.
 7. All catalog mutations go through `SplitRange` (no direct engine/catalog writes); the engine's `RecordAccess`/`splitRange` path is gone.
+8. Routes in `RouteStateWriteFenced`/`RouteStateMigratingSource`/`RouteStateMigratingTarget` are never auto-split (§5.0); only `RouteStateActive` routes are candidates.
+9. The leader-local state map is bounded: after a split retires a parent `RouteID`, its entry is evicted within one cycle and `autosplit_tracked_routes` never exceeds the live route count (§7.7a).
 
 ## 9. Open Questions
 
 1. **OQ-1 — `Route.Load` / `Stats` fate.** Fully delete `Route.Load` and `Engine.Stats`, or keep `Stats` (sans `RecordAccess`) for operator diagnostics? (§3.4)
 2. **OQ-2 — Down-side hysteresis shape.** Hold the `consecutiveOver` counter in the `[0.8×threshold, threshold)` band (current proposal), or decay it by one per cycle? (§5.2)
-3. **OQ-3 — No-evidence fallback.** When neither sub-range buckets nor Top-K are enabled, decline to split (current proposal) or allow a midpoint-of-observed-min/max-key split? Declining is safer but means auto-split is a no-op unless the operator raises `--keyvizKeyBucketsPerRoute`. (§5.4.3)
+3. **OQ-3 — No-evidence fallback.** When neither sub-range buckets nor Top-K are enabled, decline to split (current proposal) or allow a midpoint-of-observed-min/max-key split? Declining is safer. This is now only reachable when the operator *explicitly* sets `--keyvizKeyBucketsPerRoute 1` alongside `--autoSplit`, because `--autoSplit` otherwise implies `autoSplitDefaultBuckets` sub-range buckets (§3.1, §7.1) — so the "auto-split is a silent no-op by default" trap is closed; the decline now only fires on a deliberate route-granular-only configuration. (§5.4.3)
 4. **OQ-4 — Minimum route size without per-route key counts.** The engine has no per-route key count. Approximate `minRouteSpan` from sub-range/Top-K evidence (current proposal), or add a cheap per-route key-count estimate to the sampler? (§5.5)
 5. **OQ-5 — Leader-local vs. cluster-wide scoring.** Leader-local is sufficient because the leader serves the load it would split on. Is there a workload (heavy follower-forwarded reads) where cluster fan-out scoring is needed? If so, slot it behind the detector interface later. (§4.1)
 6. **OQ-6 — Cross-group activation gate.** Once M2 lands, enable least-loaded `target_group_id` automatically, or gate behind an explicit `--autoSplitCrossGroup` sub-flag so operators opt into data movement separately from same-group auto-split? (§6.2)
-7. **OQ-7 — Durable cooldown across elections.** Is `parent_route_id` lineage + a catalog-recorded split timestamp enough for the new leader to reconstruct cooldown, or do we need a durable `last_split_at` per `RouteDescriptor`? (§7.6)
+7. **OQ-7 — Durable cooldown across elections. (RESOLVED in this revision.)** Resolved by adding `RouteDescriptor.SplitAtHLC` (§7.7b), set by the `SplitRange` handler and used by the new leader to reconstruct cooldown deterministically. The remaining sub-question for reviewers: is a single `SplitAtHLC` (timestamp of the split that *created* the route) sufficient, or do we also want it refreshed on any subsequent same-route event so a never-re-split-but-recently-promoted route can also be tracked durably? Current proposal: single `SplitAtHLC` is enough, because cooldown is only ever started by a split, and a split always creates new child routes (each with its own fresh `SplitAtHLC`). (§7.7b)
 8. **OQ-8 — Threshold units across `--keyvizStep`.** The `50_000 ops/min` default assumes a normalization to ops/min. Should the threshold be expressed in ops-per-`Step` instead, to avoid a hidden coupling between `--keyvizStep` and detection sensitivity? (§5.1)
 
 ## 10. Lifecycle
