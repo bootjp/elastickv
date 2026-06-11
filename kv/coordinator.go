@@ -633,9 +633,53 @@ func (c *Coordinate) Clock() *HLC {
 // ProposeHLCLease proposes a new physical ceiling to the Raft cluster.
 // Only the current leader should call this; followers silently ignore
 // proposals from non-leaders via Raft's leader-only write guarantee.
+//
+// A successful propose is a quorum-acked Raft commit, exactly the same
+// confirmation Dispatch relies on, so it also warms the leader-local
+// read lease. The lease-extension base (dispatchStart) and the
+// invalidation generation are sampled BEFORE the propose, mirroring
+// refreshLeaseAfterDispatch: the window can only ever be SHORTER than
+// the true safety window, and a leader-loss callback that fires during
+// the propose advances the generation so extend refuses to resurrect a
+// stale lease. This is the background warm-up that flattens the
+// read-only lease-expiry sawtooth on idle-write workloads -- no extra
+// goroutine, no change to the lease window/duration semantics.
+//
+// On a leadership-loss propose error the lease is invalidated eagerly,
+// mirroring refreshLeaseAfterDispatch's error branch exactly: when
+// Propose returns the loss before the async RegisterLeaderLossCallback
+// fires, a stale-warm lease must not survive on a non-leader node for
+// the callback latency window. Non-leadership errors (no quorum,
+// validation) are NOT leadership signals and must not tear down a warm
+// lease -- doing so would force every read onto the slow path.
 func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
+	dispatchStart := monoclock.Now()
+	expectedGen := c.lease.generation()
 	_, err := c.engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs))
-	return errors.WithStack(err)
+	if err != nil {
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
+		return errors.WithStack(err)
+	}
+	c.extendLeaseAfterRenewal(dispatchStart, expectedGen)
+	return nil
+}
+
+// extendLeaseAfterRenewal warms the read lease after a successful HLC
+// ceiling propose. It is the renewal-path counterpart of
+// refreshLeaseAfterDispatch's success branch: the propose was a
+// quorum-acked commit, so the lease can be extended by LeaseDuration
+// measured from dispatchStart (sampled before the propose). extend
+// rejects the refresh if expectedGen no longer matches -- i.e. a
+// leader-loss invalidation raced the propose -- so a node that stopped
+// being leader during the propose cannot widen its lease-read window.
+func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, expectedGen uint64) {
+	lp, ok := c.engine.(raftengine.LeaseProvider)
+	if !ok {
+		return
+	}
+	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()), expectedGen)
 }
 
 // RunHLCLeaseRenewal runs a background loop that periodically proposes a new

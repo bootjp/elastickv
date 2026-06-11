@@ -1929,26 +1929,61 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 		select {
 		case <-timer.C:
 			if group.Engine.State() == raftengine.StateLeader {
-				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-				// Route through the ShardGroup's wrap-aware proposer
-				// chain — NOT a direct group.Engine.Propose — so the
-				// Stage 6E-2c dynamic wrap applies. Without this, an
-				// HLC lease-renewal entry committed post-cutover at
-				// `index > raftEnvelopeCutoverIndex` would land
-				// cleartext and trip the §6.3 strict-> unwrap on
-				// every replica's apply loop (codex P2 round-1).
-				if _, err := group.Proposer().Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
-					c.logger().WarnContext(ctx, "hlc lease renewal failed",
-						slog.Uint64("group_id", c.defaultGroup),
-						slog.Int64("ceiling_ms", ceilingMs),
-						slog.Any("err", err),
-					)
-				}
+				c.renewHLCLease(ctx, group)
 			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// renewHLCLease proposes a fresh physical ceiling on the default shard
+// group and, on a successful (quorum-acked) propose, warms that group's
+// read lease.
+//
+// The lease-extension base (start) and the invalidation generation are
+// sampled BEFORE the propose so the warm-up mirrors leaseRefreshingTxn's
+// success branch exactly: the window can only be SHORTER than the true
+// safety window, and a leader-loss callback that fires during the
+// propose advances the generation so extend refuses to resurrect a
+// stale lease. The propose is the SAME quorum confirmation a client
+// write goes through, so warming on its success cannot widen the
+// lease-read freshness window beyond what a write on this group would.
+// This is the background warm-up that flattens the read-only
+// lease-expiry sawtooth for the default group on idle-write workloads;
+// the lease window/duration semantics are unchanged.
+//
+// On a leadership-loss propose error the group lease is invalidated
+// eagerly, mirroring leaseRefreshingTxn's error branch exactly: when
+// Propose returns the loss before the async RegisterLeaderLossCallback
+// fires, a stale-warm lease must not survive on a non-leader node for
+// the callback latency window. Non-leadership errors (no quorum,
+// validation) are NOT leadership signals and must not tear down a warm
+// lease -- doing so would force every read onto the slow path.
+func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGroup) {
+	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	start := monoclock.Now()
+	expectedGen := group.lease.generation()
+	// Route through the ShardGroup's wrap-aware proposer chain — NOT a
+	// direct group.Engine.Propose — so the Stage 6E-2c dynamic wrap
+	// applies. Without this, an HLC lease-renewal entry committed
+	// post-cutover at `index > raftEnvelopeCutoverIndex` would land
+	// cleartext and trip the §6.3 strict-> unwrap on every replica's
+	// apply loop (codex P2 round-1).
+	if _, err := group.Proposer().Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
+		if isLeadershipLossError(err) {
+			group.lease.invalidate()
+		}
+		c.logger().WarnContext(ctx, "hlc lease renewal failed",
+			slog.Uint64("group_id", c.defaultGroup),
+			slog.Int64("ceiling_ms", ceilingMs),
+			slog.Any("err", err),
+		)
+		return
+	}
+	if lp, ok := group.Engine.(raftengine.LeaseProvider); ok {
+		group.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
 	}
 }
 
