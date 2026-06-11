@@ -2255,7 +2255,7 @@ func (d *DynamoDBServer) leaseCheckScan(w http.ResponseWriter, r *http.Request, 
 	// context for the actual lease read.
 	leaseCtx, leaseCancel := context.WithTimeout(r.Context(), dynamoLeaseReadTimeout)
 	defer leaseCancel()
-	_, plan, err := d.multiShardReadLeasePlan(leaseCtx, in.TableName, in.IndexName, in.Select, in.ProjectionExpression, in.ExpressionAttributeNames, in.ConsistentRead)
+	schema, plan, err := d.multiShardReadLeasePlan(leaseCtx, in.TableName, in.IndexName, in.Select, in.ProjectionExpression, in.ExpressionAttributeNames, in.ConsistentRead)
 	if err != nil {
 		// Transient/internal schema-read failure: fail closed by fencing every
 		// group. leaseReadKeyless writes the same InternalServerError on its
@@ -2269,8 +2269,36 @@ func (d *DynamoDBServer) leaseCheckScan(w http.ResponseWriter, r *http.Request, 
 		// degraded-lease failure cannot mask it with a 500 (codex #952 P2-A).
 		return true
 	}
+	// Malformed ExclusiveStartKey is a deterministic ValidationException the
+	// read path rejects in resolveTableReadBounds / resolveGSIReadBounds —
+	// before the iterator is constructed and before any store read. If we let
+	// the lease run first, a degraded shard's 500 would mask that 4xx
+	// (codex #952 P2 round-3). Pre-validate against the loaded schema and skip
+	// leasing on failure; the read path will surface the identical error.
+	if scanExclusiveStartKeyInvalid(schema, in) {
+		return true
+	}
 	// Valid whole-table read: fence every group (fail closed).
 	return d.leaseReadKeyless(w, r)
+}
+
+// scanExclusiveStartKeyInvalid returns true when in.ExclusiveStartKey cannot be
+// decoded against the table's primary key (Scan with no IndexName) or the named
+// GSI (Scan with IndexName). It mirrors the validation resolveTableReadBounds /
+// resolveGSIReadBounds run in scanItems so the lease pre-pass can route the
+// invalid case to the same skip-lease path as table-not-found etc. A nil schema
+// is treated as "not invalid" because multiShardReadLeasePlan already classified
+// the request as queryLeaseSkip in that case and we never reach here.
+func scanExclusiveStartKeyInvalid(schema *dynamoTableSchema, in scanInput) bool {
+	if schema == nil || len(in.ExclusiveStartKey) == 0 {
+		return false
+	}
+	if strings.TrimSpace(in.IndexName) == "" {
+		_, err := schema.itemKeyFromAttributes(in.ExclusiveStartKey)
+		return err != nil
+	}
+	_, _, err := schema.gsiKeyFromAttributes(in.IndexName, in.ExclusiveStartKey)
+	return err != nil
 }
 
 // multiShardReadLeasePlan cheaply classifies whether a multi-shard read (Scan or
@@ -2433,6 +2461,13 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 		if plan == queryLeaseSkip {
 			return nil, queryLeaseSkip, nil
 		}
+		// Malformed ExclusiveStartKey is a deterministic ValidationException the
+		// read path rejects before the iterator is constructed (codex #952 P2
+		// round-3). Skip leasing on failure so a degraded shard cannot mask
+		// that 4xx with a 500.
+		if queryExclusiveStartKeyInvalid(schema, in) {
+			return nil, queryLeaseSkip, nil
+		}
 		// Schema + GSI options are valid; the KeyConditionExpression is the last
 		// deterministic validation the read path runs before touching data.
 		return nil, gsiQueryLeasePlan(in, schema), nil
@@ -2450,8 +2485,33 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 		// read path produces without touching data; skip the lease.
 		return nil, queryLeaseSkip, nil
 	}
+	// Same ExclusiveStartKey pre-check as the GSI branch above (base table).
+	if queryExclusiveStartKeyInvalid(schema, in) {
+		return nil, queryLeaseSkip, nil
+	}
 	prefix, plan := queryLeasePrefix(in, schema)
 	return prefix, plan, nil
+}
+
+// queryExclusiveStartKeyInvalid mirrors the validation
+// resolveQueryExclusiveStartKey runs inside queryItems' read-bounds resolution
+// (`adapter/dynamodb.go` resolveQueryExclusiveStartKey / resolveTableReadBounds /
+// resolveGSIReadBounds): a malformed ExclusiveStartKey produces a deterministic
+// ValidationException without touching any store. Returning true routes the
+// lease pre-pass to queryLeaseSkip so a degraded-shard 500 cannot mask that 4xx
+// (codex #952 P2 round-3). Mirrors scanExclusiveStartKeyInvalid for the
+// Query path — kept separate because the GSI vs base-table dispatch differs
+// from the Scan input.
+func queryExclusiveStartKeyInvalid(schema *dynamoTableSchema, in queryInput) bool {
+	if schema == nil || len(in.ExclusiveStartKey) == 0 {
+		return false
+	}
+	if strings.TrimSpace(in.IndexName) == "" {
+		_, err := schema.itemKeyFromAttributes(in.ExclusiveStartKey)
+		return err != nil
+	}
+	_, _, err := schema.gsiKeyFromAttributes(in.IndexName, in.ExclusiveStartKey)
+	return err != nil
 }
 
 // queryLeasePrefix resolves the single hash-key prefix a base-table Query

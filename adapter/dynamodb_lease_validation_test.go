@@ -451,3 +451,76 @@ func TestDynamoDB_LeaseCheckScan_TransientSchemaReadFailsClosed(t *testing.T) {
 	require.Contains(t, fenced, multiGroupOtherID,
 		"transient schema read must fail closed by fencing every group")
 }
+
+// TestDynamoDB_LeaseCheckScan_InvalidExclusiveStartKeySkipsLease asserts the
+// regression for codex P2 #952 round-3 (line 2273): a Scan with a malformed
+// ExclusiveStartKey is a deterministic ValidationException — the read path
+// rejects it in resolveTableReadBounds before constructing the iterator. Pre-fix
+// leaseCheckScan only inspected the table/index validity and let the all-groups
+// fence run; in a degraded shard the lease 500 masked the 4xx. Post-fix
+// scanExclusiveStartKeyInvalid routes the case to skip-lease so the read path's
+// 4xx surfaces.
+func TestDynamoDB_LeaseCheckScan_InvalidExclusiveStartKeySkipsLease(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(leaseGSIFixtureSchema())
+
+	coord := newDegradedLeaseCoordinator()
+	server := NewDynamoDBServer(nil, st, coord)
+
+	in := scanInput{
+		TableName: "t",
+		// The schema's primary key is HashKey="pk" but the start key omits "pk"
+		// — itemKeyFromAttributes rejects this as "invalid ExclusiveStartKey".
+		ExclusiveStartKey: map[string]attributeValue{
+			"not_a_real_attr": newStringAttributeValue("x"),
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
+	require.True(t, server.leaseCheckScan(rec, req, in),
+		"a Scan with malformed ExclusiveStartKey must skip the lease fallback so the read path's 4xx is not masked by a 500 (codex P2 #952 round-3)")
+	require.Equal(t, http.StatusOK, rec.Code, "no lease error response should be written for invalid ExclusiveStartKey")
+	require.Equal(t, 0, coord.allGroupsCalls,
+		"invalid ExclusiveStartKey must not trigger the all-groups lease check — the transaction is doomed by validation")
+}
+
+// TestDynamoDB_LeaseCheckQuery_InvalidExclusiveStartKeySkipsLease is the Query
+// counterpart of the above (codex P2 #952 round-3, line 2482): a Query with a
+// valid KeyConditionExpression but malformed ExclusiveStartKey is a deterministic
+// ValidationException. Pre-fix leaseCheckQuery resolved a single-group fence and
+// let it run; in a degraded shard the 500 masked the 4xx. Post-fix
+// queryExclusiveStartKeyInvalid routes the case to queryLeaseSkip.
+func TestDynamoDB_LeaseCheckQuery_InvalidExclusiveStartKeySkipsLease(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	writer.writeSchema(leaseGSIFixtureSchema())
+
+	coord := newDegradedLeaseCoordinator()
+	server := NewDynamoDBServer(nil, st, coord)
+
+	in := queryInput{
+		TableName:              "t",
+		KeyConditionExpression: "pk = :pk",
+		ExpressionAttributeValues: map[string]attributeValue{
+			":pk": newStringAttributeValue("x"),
+		},
+		// Malformed: the primary key is "pk" but the start key omits it.
+		ExclusiveStartKey: map[string]attributeValue{
+			"not_a_real_attr": newStringAttributeValue("x"),
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
+	require.True(t, server.leaseCheckQuery(rec, req, in),
+		"a Query with malformed ExclusiveStartKey must skip the lease so the read path's 4xx is not masked by a 500 (codex P2 #952 round-3)")
+	require.Equal(t, http.StatusOK, rec.Code, "no lease error response should be written for invalid ExclusiveStartKey")
+	require.Equal(t, 0, coord.allGroupsCalls,
+		"invalid ExclusiveStartKey must not trigger the lease check — the transaction is doomed by validation")
+}
