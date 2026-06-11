@@ -111,7 +111,12 @@ catalog snapshot evolution                migrator action
                                            non-overlapping. Coordinator/FSM
                                            reject writes on the fenced route.
         |
-        |  FENCE → DELTA_COPY              Copy (snapshot_ts, fence_ts] from
+        |  FENCE → DELTA_COPY              Migrator waits for source-side
+        |                                  fence ACK (§3.2a) — every source-
+        |                                  group voter has applied the
+        |                                  WriteFenced route — before picking
+        |                                  fence_ts. THEN copies
+        |                                  (snapshot_ts, fence_ts] from
         |                                  source to target shadow space.
         v
 [ source.Active(left)           ]
@@ -149,6 +154,21 @@ catalog snapshot evolution                migrator action
 Key invariant: **catalog snapshots never contain overlapping ranges**. The target shadow keyspace lives outside the catalog (BACKFILL / DELTA_COPY land into private `!dist|migstage|<job_id>|<raw_key>` keys on the target group's MVCC store; CUTOVER **does not** bulk-rename them — promotion is incremental and runs as a target-side background job after CUTOVER, see §6.2.2). This keeps `routesFromCatalog` + `validateRouteOrder` (`distribution/engine.go:496-527`) green throughout the migration — addresses codex P1 on overlapping routes (PR #945 review). RouteState `MigratingSource` / `MigratingTarget` are reserved but unused in M2; they remain available for a future merge / multi-stage migration design.
 
 The Composed-1 gate rejects an apply on the wrong group at the observed catalog version; CUTOVER bumps `catalog_version` so any straggler write from an unaware coordinator fails closed at apply time on either side.
+
+### 3.2a Source-side fence-apply barrier — fence_ts must follow the source's actual write-reject point (closes codex round-6 P1 line 115)
+
+Codex round-6 P1 on PR #945 (line 115): the FENCE catalog write commits on the default group, but the source FSM only learns about the new `WriteFenced` state through the watcher's asynchronous catalog snapshot apply (`distribution/watcher.go:11`, `:87-98`). If the migrator records `fence_ts = source.LastCommitTS()` and starts DELTA_COPY immediately after the FENCE catalog write, the source leader may still accept writes for the moved keys for one watcher-tick worth of time after the catalog commit — those writes get a `commit_ts > fence_ts`, fall outside DELTA_COPY's `(snapshot_ts, fence_ts]` window, and are silently left on the source at CUTOVER. Result: write loss after CUTOVER hands the routing to the target.
+
+M2 fixes this with a two-step gate on the FENCE → DELTA_COPY transition:
+
+1. **Fence-apply ACK from every source-group voter.** After the FENCE catalog write commits, the migrator does **not** immediately pick `fence_ts`. Instead it polls a per-node `GetCatalogVersion` RPC (or piggybacks on the existing distribution heartbeat — same surface as §11.1's capability bit) against every voter of the source group's Raft membership (`engine.Configuration(ctx)` is already read by the migrator for §3.4 routing). The migrator advances the phase only when **every voter reports `catalog_version_applied >= fence_catalog_version`**, where `fence_catalog_version` is the catalog version of the FENCE write recorded in the SplitJob. This guarantees every node that could be the source-group leader at any future moment has the `WriteFenced` route locally applied, so any write that reaches its FSM apply path after this point is rejected by the FENCE pre-gate (§7.1's `verifyRouteNotFenced`).
+2. **`fence_ts` pinned after the ACK.** After step 1 returns, the migrator queries the source group leader for `LastCommitTS()` and pins that as `fence_ts`. Because the WriteFenced route is now applied on every voter, no in-flight write with `commit_ts > fence_ts` can land for the moved range — the apply path rejects them with `ErrRouteWriteFenced` at the FSM gate. DELTA_COPY's `(snapshot_ts, fence_ts]` window therefore captures every committed write whose `commit_ts > snapshot_ts`, completing the BACKFILL+DELTA_COPY semantic.
+
+Timing budget: the migrator's heartbeat-driven loop already runs at one tick per `hlcRenewalInterval` (1s), and `cap_migration_v2` heartbeats carry `catalog_version_applied` already (§11.1 reuses the same field). The fence-apply ACK therefore typically completes in one tick. A non-responsive voter blocks the phase — the migrator logs `last_error = "fence ack pending: nodes [<N1>, <N2>]"` and either (a) the operator intervenes, or (b) Raft removes the unresponsive voter via the existing leader-loss path. **Importantly the migrator does NOT advance phase on a quorum ACK** — every voter must ACK, because any voter could later become the leader and would re-serve writes for the moved range with the pre-FENCE state if its catalog hadn't applied. Quorum is necessary for catalog-write durability; **unanimous voter-ACK is necessary for fence safety**.
+
+Crash safety: the fence-ack-pending state is durable in the SplitJob (`fence_ack_cursor` tracks which voters have ACK'd). A migrator restart resumes from the pending voter list. No data is at risk during this wait — the catalog FENCE state is already durable, so the watcher will catch up on its own; the migrator just doesn't commit DELTA_COPY's `fence_ts` until the wait completes.
+
+CUTOVER is a similar story but is structurally guaranteed by a different mechanism: the catalog write itself bumps `catalog_version`, and the §7.2 read fence's authoritative ownership check guarantees that even a coordinator/source still at the pre-CUTOVER catalog cannot return a stale value. There is no parallel "wait for every voter to apply CUTOVER" gate — readers are the consumers, and §7.2 handles them directly. The fence-apply ACK above is specifically about **writes during DELTA_COPY**, where the data move happens.
 
 ## 4. State Machine and Recovery
 
