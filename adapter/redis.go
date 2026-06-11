@@ -243,24 +243,56 @@ type RedisServer struct {
 	// retryable write error, list-push retries reuse the failed attempt's
 	// write set and carry prev_commit_ts so the FSM can dedup a commit that
 	// landed under leadership churn (see
-	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md). It
-	// MUST stay off until every node runs a probe-aware binary — see R5
-	// (FSM determinism across a rolling upgrade). Default off; enabled via
-	// WithOnePhaseTxnDedup / the ELASTICKV_REDIS_ONEPHASE_DEDUP env var
-	// after a full rollout.
+	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md). The
+	// FSM probe ships on every node in production, satisfying R5 (FSM
+	// determinism across a rolling upgrade), so the gate now defaults on
+	// per docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+	// Set ELASTICKV_REDIS_ONEPHASE_DEDUP=0 (or WithOnePhaseTxnDedup(false))
+	// to opt out — kept as a one-env-var operator rollback.
 	onePhaseTxnDedup bool
+
+	// standaloneSetDedup gates whether the *standalone* SET command (not SET
+	// inside MULTI/EXEC) routes through runTransactionWithDedup. Default off
+	// because the dedup path's applySet does not match the legacy
+	// executeSet/replaceWithStringTxn semantics for SET-over-collection: a
+	// `SET k v` after `RPUSH k x` returns WRONGTYPE on the dedup path but
+	// overwrites correctly on the legacy path (PR #943 round-1 codex P1).
+	// Bringing applySet to parity (collection-deletion + string write inside
+	// the dedup txn) is tracked as a follow-up; until that lands, the
+	// standalone SET path stays on the legacy default-on-flip code path
+	// regardless of onePhaseTxnDedup's value. Enable explicitly via
+	// WithStandaloneSetDedup(true) or ELASTICKV_REDIS_ONEPHASE_DEDUP_SET=1
+	// only when applySet's parity is verified for the workload at hand.
+	standaloneSetDedup bool
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
 }
 
 type RedisServerOption func(*RedisServer)
 
-// WithOnePhaseTxnDedup enables the option-2 one-phase idempotency dedup on
-// list-push retries (see RedisServer.onePhaseTxnDedup). Off by default;
-// enable only after the whole cluster runs a probe-aware binary.
+// WithOnePhaseTxnDedup enables (or disables) the option-2 one-phase
+// idempotency dedup on list-push and MULTI/EXEC retries
+// (see RedisServer.onePhaseTxnDedup). On by default since the rollout
+// recorded in docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md;
+// pass false to opt out from code, or set ELASTICKV_REDIS_ONEPHASE_DEDUP=0
+// to opt out from the environment. The constructor option trumps the env var.
+// Standalone SET requires the separate WithStandaloneSetDedup gate; see
+// RedisServer.standaloneSetDedup.
 func WithOnePhaseTxnDedup(enabled bool) RedisServerOption {
 	return func(r *RedisServer) {
 		r.onePhaseTxnDedup = enabled
+	}
+}
+
+// WithStandaloneSetDedup enables the option-2 dedup path on the *standalone*
+// SET command (not SET inside MULTI/EXEC). Off by default because the dedup
+// path's applySet does not yet match the legacy executeSet semantics for
+// SET-over-collection — see RedisServer.standaloneSetDedup. Enable only
+// after verifying applySet parity for the workload (no SET-over-list /
+// SET-over-hash / SET-over-set / SET-over-zset / SET-over-stream issued).
+func WithStandaloneSetDedup(enabled bool) RedisServerOption {
+	return func(r *RedisServer) {
+		r.standaloneSetDedup = enabled
 	}
 }
 
@@ -495,15 +527,20 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		// getLuaPool, which honors luaPoolMaxIdle the same way.
 		luaPool:       nil,
 		traceCommands: os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
-		// onePhaseTxnDedup honors the documented opt-in env var; the
-		// WithOnePhaseTxnDedup option below can still override either way.
-		// Default off — see R5 in the design doc (the writer must not be
-		// enabled until the whole cluster runs a probe-aware binary).
-		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") == "1",
-		baseCtx:          baseCtx,
-		baseCancel:       baseCancel,
-		streamWaiters:    newKeyWaiterRegistry(),
-		zsetWaiters:      newKeyWaiterRegistry(),
+		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
+		// constraint is discharged (FSM probe shipped on every node months ago,
+		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).
+		// See docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+		// ELASTICKV_REDIS_ONEPHASE_DEDUP=0 opts out; the WithOnePhaseTxnDedup
+		// constructor option still trumps the env var.
+		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") != "0",
+		// standaloneSetDedup defaults off; see field comment for the
+		// applySet-vs-executeSet parity gap that gates this separately.
+		standaloneSetDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP_SET") == "1",
+		baseCtx:            baseCtx,
+		baseCancel:         baseCancel,
+		streamWaiters:      newKeyWaiterRegistry(),
+		zsetWaiters:        newKeyWaiterRegistry(),
 	}
 	r.relay.Bind(r.publishLocal)
 
@@ -1131,7 +1168,13 @@ func (r *RedisServer) set(conn redcon.Conn, cmd redcon.Command) {
 	// SET there is exactly one element with the same redisResult shape as
 	// the standalone reply (resultString OK / resultNil for NX/XX miss /
 	// resultBulk for GET).
-	if r.onePhaseTxnDedup {
+	// Both gates must be on to route standalone SET through the dedup path.
+	// onePhaseTxnDedup covers the MULTI/EXEC and list-push retries that the
+	// parent design's M4 validated; standaloneSetDedup is a separate sub-gate
+	// (default off) because applySet diverges from executeSet on SET-over-
+	// collection — flipping onePhaseTxnDedup default-on without this guard
+	// would change normal Redis overwrite behaviour (PR #943 round-1 codex P1).
+	if r.onePhaseTxnDedup && r.standaloneSetDedup {
 		// Call runTransactionWithDedup directly instead of going through
 		// runTransaction. runTransaction re-checks the same
 		// r.onePhaseTxnDedup gate and routes here anyway; the indirection
