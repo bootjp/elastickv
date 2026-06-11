@@ -106,7 +106,11 @@ catalog snapshot evolution                migrator action
                                            source @ snapshot_ts; idempotent
                                            import into target's shadow space.
         |
-        |  BACKFILL → FENCE                Atomic catalog write: source's
+        |  BACKFILL → FENCE                Precondition: §3.2a step 0
+        |                                  prepared-txn intent-lock
+        |                                  drain on [routeStart, routeEnd)
+        |                                  completes first. THEN atomic
+        |                                  catalog write: source's
         v                                  right child split out as a NEW
 [ source.Active(left)           ]          RouteDescriptor with state =
 [ source.WriteFenced(right)     ]          WriteFenced, raft_group_id =
@@ -242,6 +246,14 @@ message SplitRangeRequest {
   // the M1 same-group split semantic. Non-zero kicks off a cross-group
   // migration job and returns immediately with the job id.
   uint64 target_group_id = 4;
+  // Per-job pacing knobs (§8). Reserved string-map so we can add new
+  // knobs without a proto break. Known keys today:
+  //   "chunk_bytes"           — BACKFILL / DELTA_COPY chunk size (bytes)
+  //   "inter_chunk_pacing_ms" — sleep between chunks (ms)
+  //   "fence_grace_ms"        — readFenceGrace override (ms) for the job
+  // Unknown keys are accepted (forward-compat) and logged at
+  // SplitJob create time, but do not affect behaviour.
+  map<string, string> options = 5;
 }
 
 message SplitRangeResponse {
@@ -262,10 +274,27 @@ message GetSplitJobResponse {
   SplitJob job = 1;
 }
 
-message ListSplitJobsRequest {}
+message ListSplitJobsRequest {
+  // Inclusive lower bound on terminal_at (ms). 0 = no lower bound.
+  // §3.1.1's history retention orders entries by terminal_at_ms_be
+  // so paging through the audit history just bumps this on each call.
+  uint64 since_terminal_at_ms = 1;
+  // Optional phase filter; empty = no filter. Matches a SplitJob's
+  // `phase` field exactly. Supports per-phase audit queries.
+  string phase = 2;
+  // Pagination cursor. Empty = first page; opaque bytes from a prior
+  // response's next_page_cursor for subsequent pages. The default cap
+  // (§3.1.1) is 200 newest entries per response.
+  bytes page_cursor = 3;
+}
 
 message ListSplitJobsResponse {
   repeated SplitJob jobs = 1;
+  // Opaque pagination cursor. Empty = caller has reached the last page;
+  // non-empty = pass back as ListSplitJobsRequest.page_cursor to fetch
+  // the next page. The encoding is internal to the catalog (typically
+  // the terminal_at_ms_be of the last entry returned).
+  bytes next_page_cursor = 2;
 }
 
 message AbandonSplitJobRequest {
@@ -802,7 +831,7 @@ This is independent of the existing rolling-upgrade protocol for unrelated subsy
 3. **Grace period (RESOLVED — `readFenceGrace = 30 s`).** §7.2.4 sets the default at 30 s with the rationale "comfortably exceeds both lease TTL and watcher tick × 2." All cross-references (§4 CLEANUP row) now match this value. Operators on extreme deployments (very long lease TTLs, or watcher polling intervals beyond the defaults) raise it via the existing `readFenceGrace` knob.
 4. **`MVCCVersion.key_family` enum.** Add a strict enum in proto, or stay numeric and document constants in `kv/`? Strict enum costs proto churn for every new internal family; numeric + go-side constant has been the project pattern.
 5. **`AbandonSplitJob` after CUTOVER.** Currently rejected. Worth offering a "reverse migration" RPC in M2, or defer to M3+?
-6. **Backfill source visibility.** Backfill reads at `snapshot_ts`; if `snapshot_ts` is younger than any in-flight prepare, the exported state excludes that prepare's intent. Is that semantic correct, or do we want a stricter "wait until all prepares ≤ snapshot_ts are either committed or aborted" gate before BACKFILL entry?
+6. **Backfill source visibility (RESOLVED — drain at FENCE entry; BACKFILL snapshot exclusion is intentional).** Two questions inside one OQ — resolved as follows. (a) The `Phase_COMMIT` stranding hazard (a prepared txn whose `Phase_COMMIT` arrives after FENCE rejection — flagged codex round-12 P1) is closed by §3.2a step 0's prepared-txn drain at `BACKFILL → FENCE` entry: the migrator waits until `!txn|lock|<encoded>[routeStart, routeEnd)` is empty (bounded by one txn-TTL window via `kv/lock_resolver.go`) so no in-flight prepare survives into FENCE. (b) The BACKFILL-snapshot semantic question — *should the snapshot include intent locks or not?* — is closed in the negative: **excluding intent locks from BACKFILL is intentional and correct**. Any txn whose `commit_ts ≤ snapshot_ts` is captured in BACKFILL as a fully-committed version; any txn whose `commit_ts > snapshot_ts` (including a prepare that commits between BACKFILL and FENCE) is captured by DELTA_COPY's `(snapshot_ts, fence_ts]` window. Intent locks themselves are coordinator-managed state and don't need to migrate with the data — after CUTOVER the target's empty intent-lock space for the moved range is correct, because the FENCE drain guarantees no prepare remains unresolved across the boundary.
 7. **Should `target_group_id == source_group_id` go through the M2 state machine** (for consistent observability) or short-circuit through the M1 fast-path? Lean: short-circuit, but the SplitJob still gets recorded for audit.
 
 ## 13. Acceptance Criteria
