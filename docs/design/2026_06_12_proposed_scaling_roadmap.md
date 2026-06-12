@@ -65,8 +65,8 @@ What bounds a single elastickv deployment today:
 
 5. **Cross-group timestamps via per-group HLC, and not even per-group yet.**
    `ShardedCoordinator.RunHLCLeaseRenewal` proposes the physical-ceiling
-   renewal **only to the default group** (`kv/sharded_coordinator.go:1914-1953`,
-   `group, ok := c.groups[c.defaultGroup]` at `:1915`). A node that leads a
+   renewal **only to the default group** (`kv/sharded_coordinator.go:1960-1985`,
+   `group, ok := c.groups[c.defaultGroup]` at `:1961`). A node that leads a
    non-default group but is not a member of the default group never advances
    its ceiling from that group — exactly the cross-group monotonicity gap the
    centralized-TSO doc §1.1 describes. The doc's "near-term fix" (M1: iterate
@@ -158,12 +158,13 @@ memory each group's private cache/memtable pins.
   `multiraft_runtime.go:246-254` mean every group in a multi-group process is
   single-voter, so there is nothing to transfer a leader *to*. Closing this is
   a prerequisite for write-throughput scaling beyond one node, and a companion
-  proposal is being written in parallel:
-  `2026_06_12_proposed_multinode_multigroup_bootstrap.md` (extend
-  `--raftGroups` / a per-group members flag to accept a multi-node voter set
-  per group, lifting the `len(groups)==1` guard). This roadmap references it
-  by name and treats it as the unblocking dependency for (b), (e), and the
-  region-balance gap in §3.
+  proposal is in review as **PR #955**
+  (`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
+  `design/multinode-multigroup-bootstrap`): extend `--raftGroups` / a per-group
+  members flag to accept a multi-node voter set per group, lifting the
+  `len(groups)==1` guard. Once PR #955 lands it is the authoritative spec for
+  this gap; this roadmap treats it as the unblocking dependency for (b), (e),
+  and the region-balance gap in §3.
 
 ### (c) Read throughput
 
@@ -181,9 +182,14 @@ memory each group's private cache/memtable pins.
   has `add_learner` / `promote_learner` (`cmd/raftadmin/main.go:204-206`), and
   `--raftJoinAsLearner` exists (`main.go:104`). The learner doc itself scopes
   follower-served reads as an explicit non-goal (§2 "Non-goals", §8 OQ-5):
-  learners forward `LinearizableRead` to the leader today. So the read-replica
-  attach primitive exists, but the design that consumes it for off-leader
-  reads **does not** — **follower-read design is missing**. Requirements to
+  a `LinearizableRead` against a learner is **not** forwarded by the engine —
+  `handleRead` returns `ErrNotLeader` for any non-leader state
+  (`internal/raftengine/etcd/engine.go:1583`), and the *caller* must forward to
+  the leader (`docs/raft_learner_operations.md`, "Serve linearizable reads from
+  the learner"). So the read-replica attach primitive exists, but the design
+  that consumes it for off-leader reads **does not** — **follower-read design
+  is missing**, and it must supply the forwarding/proxy or replica-read API the
+  current primitive deliberately omits. Requirements to
   sketch (Gap 3): a leader-issued read-timestamp pipeline so a follower/learner
   serves a snapshot read at a ts the leader has vouched for (CLAUDE.md HLC
   rule: never use the local wall clock or a follower-issued ts for MVCC
@@ -210,7 +216,12 @@ memory each group's private cache/memtable pins.
   leading different groups is still not guaranteed without a shared oracle
   (TSO doc §6 "Guarantee"). Cross-group transactions (`kv/transaction.go`,
   `kv/txn_codec.go`) that span groups led by different nodes need a single
-  ordering source for OCC commit-ts comparability. So: per-group renewal fix
+  ordering source for OCC commit-ts comparability. (The shared-snapshot
+  invariant — every operation in one txn reading at the *same* `startTS` — is
+  already upheld: `nextStartTS` allocates one `startTS` for the whole txn and
+  propagates it via `reqs.StartTS` to every participating group; the gap is the
+  cross-*node* comparability of the per-txn `commitTS`, not the per-txn
+  `startTS`. See OQ-1.) So: per-group renewal fix
   is in-scope-soon and load-bearing; the dedicated TSO group is only justified
   once (i) multi-node multi-group is real and (ii) cross-group transactions
   are common enough that the batch-allocator amortization pays for the extra
@@ -241,7 +252,7 @@ memory each group's private cache/memtable pins.
 ### (f) Operational scaling
 
 - **keyviz** — the per-route load sampler is wired and allocation-free on the
-  hot path (`kv/sharded_coordinator.go:1795-1824`), with proposed extensions
+  hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`), with proposed extensions
   for cluster fan-out (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
   subrange sampling (`2026_05_25_proposed_keyviz_subrange_sampling.md`),
   hot-key top-K (`2026_05_28_proposed_keyviz_hot_key_topk.md`), and per-cell
@@ -281,10 +292,10 @@ dimension. **Rough milestones:** (M1) extend `--raftGroups` / add a per-group
 members flag to accept a multi-node voter set; lift the guard. (M2)
 integration harness that stands up multi-voter groups across processes. (M3)
 Jepsen multi-group multi-node workload. **Depends-on:** nothing (it is the
-root unblocker). *A companion proposal,
-`2026_06_12_proposed_multinode_multigroup_bootstrap.md`, is being written in
-parallel and is the authoritative spec for this gap; this roadmap defers to
-it.*
+root unblocker). *A companion proposal is in review as **PR #955**
+(`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
+`design/multinode-multigroup-bootstrap`); once it lands it is the authoritative
+spec for this gap and this roadmap defers to it.*
 
 ### Gap 2 — Shared Pebble cache / resource pools
 **Problem.** Each group's store allocates a private 256 MiB block cache
@@ -361,7 +372,7 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
    change; closes the cross-group monotonicity gap (§1.5) *before* the
    topology that exposes it exists. Land first so multi-node groups are safe
    on arrival.
-2. **Multi-node multi-group bootstrap** (Gap 1 /
+2. **Multi-node multi-group bootstrap** (Gap 1 / **PR #955**,
    `2026_06_12_proposed_multinode_multigroup_bootstrap.md`). The root
    unblocker for (b), (c), (e), Gap 3, Gap 4. Nothing else multi-node-shaped
    can land until a group can have voters on more than one node.
@@ -386,13 +397,22 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
 9. **Range merge** (Gap 5). After step 4 for cross-group merge.
 10. **Streaming transport** (Gap 6). Any time after step 2 makes inter-node
     Raft traffic significant; pairs with the S3 blob-fetch RPC.
-11. **Dedicated TSO group** (TSO doc M6–M7) — only once cross-group
-    transactions across node-spanning groups are common enough to justify it
-    (§2(d)).
+11. **Dedicated TSO group** (TSO doc M6–M7) — placed last *on the assumption
+    that the per-group renewal fix (step 1) is sufficient until cross-group
+    transactions across node-spanning groups are common enough to amortize the
+    extra Raft group (§2(d))*. **This placement must be revisited the moment
+    step 2 lands** — see OQ-1. The decision is not an amortization tradeoff but
+    a correctness one: the trigger to pull this forward (potentially to
+    step 3) is **the first cross-group transaction whose participating groups
+    are led by different nodes**. The per-group fix gives per-node monotonicity
+    only (TSO doc §6 "Guarantee"); commit-ts comparability across coordinators
+    on different nodes is not covered by it (OQ-1). Treat step 11 as
+    "deferred-pending-OQ-1-resolution", not "settled-last".
 12. **Auto group lifecycle** (Gap 7) — long-term, after 2/4/8/9.
 
-In-flight PRs map cleanly: **#953** is steps 3 (and its PR0 = step 2's intent),
-**#945** is step 4, **#951** is step 5.
+In-flight PRs map cleanly: **#955** is step 2 (Gap 1 bootstrap proposal),
+**#953** is step 3 (and its PR0 = step 2's intent), **#945** is step 4,
+**#951** is step 5.
 
 ---
 
@@ -401,9 +421,58 @@ In-flight PRs map cleanly: **#953** is steps 3 (and its PR0 = step 2's intent),
 1. **Per-group HLC fix vs full TSO ordering.** Is the per-group renewal fix
    (step 1) sufficient for cross-group OCC correctness in the multi-node
    topology, or does the first node-spanning cross-group transaction force the
-   dedicated TSO group earlier than step 11? The answer depends on how
-   `kv/transaction.go` compares commit timestamps issued by different nodes;
-   needs a focused correctness review before step 2 lands.
+   dedicated TSO group earlier than step 11?
+
+   **Where the timestamps come from (grounded in code).** A cross-group txn's
+   coordinator issues *both* of its timestamps from one `*HLC` — `c.clock` on
+   the coordinator's node:
+   - `startTS` via `nextStartTS` (`kv/sharded_coordinator.go:1429`):
+     `Observe(maxLatestCommitTS(keys))` then `c.clock.NextFenced()`. The
+     `maxLatestCommitTS` floor is a per-key read against the store — it pins
+     `startTS` above the latest commit on *the keys this txn touches*, nothing
+     more.
+   - `commitTS` via `resolveTxnCommitTS` → `nextTxnTSAfter`
+     (`kv/sharded_coordinator.go:1102`, `:1376`): `c.clock.NextFenced()`,
+     re-allocated after `Observe(startTS)` if it did not strictly exceed
+     `startTS`. A caller-supplied `commitTS` is fed through `c.clock.Observe`
+     to keep the clock monotonic.
+
+   Both calls go through the same `c.clock`. The apply-time OCC/ownership check
+   then compares these timestamps against stored `CommitTS` values (the
+   Composed-1 guard, `docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md`
+   §4.2(a)/§4.4; FSM `latest > startTS` write-conflict check). OCC
+   serializability depends on those `commitTS` values being **mutually
+   comparable** across all participating groups.
+
+   **Why the per-group fix is necessary but not sufficient.** Today this is
+   safe only because every group shares the *same* process-wide `*HLC`
+   (single-node groups, §1.1/§1.5): one clock issues every timestamp, so all
+   `commitTS` are trivially comparable. The per-group renewal fix (step 1)
+   extends correctness to *one node leading several groups* — but its guarantee
+   is explicitly scoped: "all timestamps issued by a single node are strictly
+   monotonic … monotonicity across nodes that lead *different* groups is not
+   fully guaranteed without a shared TSO" (TSO doc §6 "Guarantee", §1.1). The
+   moment step 2 (multi-node bootstrap) makes it possible for the two groups of
+   a cross-group txn to be coordinated on *different nodes*, two concurrent
+   cross-group txns can draw `commitTS` from two different `*HLC` instances
+   whose ceilings were advanced independently. The `maxLatestCommitTS`/`Observe`
+   floor does not close this: it orders writes only on the specific keys read,
+   not the global commit order two unrelated cross-group txns need to be
+   serializable against each other.
+
+   **Conclusion / trigger.** OQ-1 therefore is *not* a "focused correctness
+   review deferrable until just before step 2 lands" — the per-group fix cannot
+   answer it in the affirmative for the cross-node case. The trigger to pull the
+   dedicated TSO group forward from step 11 is concrete: **the first cross-group
+   transaction whose participating groups are led by different nodes** (i.e. the
+   first real exercise of step 2). Until then the per-group fix + shared-`*HLC`
+   property holds. Open sub-question: whether an interim measure short of the
+   full TSO group — e.g. pinning every cross-group txn's timestamp allocation to
+   a single designated group's leader (the default group's `c.clock`), so all
+   cross-group `commitTS` still come from one clock — can bridge the gap between
+   step 2 and step 11 without the full batch-allocator TSO. That interim option
+   should be evaluated as part of the step-2 design (PR #955) rather than left
+   to step 11.
 2. **Shared cache (Gap 2) vs per-group isolation (workload isolation doc).** A
    single shared block cache trades isolation for density: one hot group can
    evict a latency-sensitive group's working set. How does Gap 2's per-group
@@ -426,3 +495,19 @@ In-flight PRs map cleanly: **#953** is steps 3 (and its PR0 = step 2's intent),
 6. **Auto group lifecycle (Gap 7) trigger.** What signal creates a new group —
    node join, aggregate range count crossing a threshold, or operator action?
    Premature auto-creation interacts badly with merge (create/merge thrash).
+7. **Live cutover / rolling-upgrade strategy for the single-node→multi-node
+   transition (Gap 1).** Moving a deployment from "one process hosts every
+   group, each single-voter" to genuine multi-node multi-group is a topology
+   change, not just a flag flip: a group that bootstrapped single-member must
+   gain voters on other nodes via live `AddVoter` conf-changes (the primitive
+   exists, §2(e)), and the cluster may run mixed binary versions mid-upgrade.
+   What is the supported path — operator-driven `AddVoter` expansion of an
+   existing single-voter group, blue/green with a dual-write proxy
+   (`proxy/`, the existing Redis-migration pattern), or a fresh cluster +
+   data migration? And what version-skew / capability-gating discipline keeps
+   a rolling upgrade safe while only some nodes understand the new per-group
+   members wiring? This is properly the companion bootstrap proposal's (PR #955)
+   to answer; the roadmap flags it here so it is not lost. (Note: the TSO doc
+   §7 already specifies a phased dual-write/shadow-read/feature-flag cutover for
+   the *timestamp* migration; the bootstrap cutover should mirror that
+   structure.)
