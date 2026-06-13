@@ -562,7 +562,7 @@ appears only in `slog` lines, never in metric labels.
 The four subsystems' milestones partial-order by dependency. The
 recommended path:
 
-```
+```text
 Phase 1 (data-plane scale, no new region):
   §6 M1 (per-group HLC ceiling)
     → §3 M1 (delta watcher)
