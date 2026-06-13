@@ -198,8 +198,12 @@ Replace the watcher's "version bump → pull full catalog" with a
   `RouteDescriptor` and version bumps; expose
   `GetCatalogChanges(from_version, to_version) → []RouteDelta`
   with `RouteDelta = {op: ADD|MODIFY|REMOVE, RouteDescriptor}`.
-- Watcher pulls deltas, applies under fine-grained per-route lock
-  (per-route version vector instead of a global slice rebuild).
+- Watcher pulls deltas into a copy-on-write route-version overlay,
+  validates the batch against the previous catalog version, then
+  publishes the new catalog version atomically. Readers never observe
+  a partially-applied delta set; the Composed-1 cross-version-read
+  gate and the M2 history overlay always see a point-in-time
+  `RouteHistorySnapshot`.
 - Falls back to full snapshot pull when `from_version` is older
   than the catalog's retention horizon (analogous to Raft snapshot
   fallback when log is truncated).
@@ -375,9 +379,12 @@ TBD).**
   large per-node shard counts this is a thundering-herd. Switch
   to per-shard ticking with a per-shard random jitter, capped at
   a node-wide concurrency budget.
-- Per-key version cap: from 1 M (`maxSnapshotVersionCount`)
-  down to 100 k AND a compactor cycle that prioritises hot keys
-  (closes the 555 writes/s 30-min hot-key cap regression).
+- Per-key version budget: keep the 30 min retention window as the
+  hard correctness contract. The 100 k target is a soft default for
+  cold / moderate keys, while hot keys dynamically raise the per-key
+  budget to at least `write_rate * retention_window * safety_factor`;
+  the compactor prioritises those keys and emits pressure metrics
+  instead of dropping versions still inside the retention window.
 - Inline tombstone GC for keys with no live history (TTL-expired
   rows) so they do not pile up in L0 between compactor runs —
   reuses the existing TTL helper path.
@@ -428,17 +435,22 @@ The hardest single-point-of-failure today. Concrete steps:
 - Cross-shard ts ordering preserved via the existing monotone-merge
   primitive (§4.2 M2 carries it over the region boundary; M1
   carries it across shards).
-- `ShardedCoordinator.RunHLCLeaseRenewal` becomes a per-group loop
-  (one goroutine per group, each ticking 1 s independently).
+- `ShardedCoordinator.RunHLCLeaseRenewal` becomes a central renewal
+  scheduler: one timer-wheel / bounded-worker service walks the
+  groups led by this node, batches due groups by deadline, and issues
+  per-group ceiling proposals without spawning one goroutine per
+  group.
 - Capability bit `cap_per_group_hlc_v1` gates the wire change
   (same pattern as M2 hotspot-split capability bits).
 
 **M2 — Follower-read path (`*_proposed_*` doc TBD).**
 - Followers serve reads at a bounded staleness, with the staleness
-  guaranteed by the existing lease infrastructure. A follower-read
-  request carries a `max_staleness_ms` from the adapter; the
-  follower returns `(value, served_at_ts)` and the adapter rejects
-  if `served_at_ts < read_ts - max_staleness_ms`.
+  guaranteed by a follower-visible read-index / closed-timestamp
+  mechanism rather than the current leader-local lease fast path.
+  A follower-read request carries a `max_staleness_ms` from the
+  adapter; the follower returns `(value, served_at_ts)` and the
+  adapter rejects if
+  `served_at_ts < read_ts - max_staleness_ms`.
 - Per-shard "follower ready" gate: follower must have applied at
   least up to `max_applied_ts ≥ read_ts - max_staleness_ms`.
 - Adapter integration: DynamoDB's eventually-consistent read
@@ -465,8 +477,11 @@ doc TBD).**
   the group's leader on a 10 s tick, but the scan work is
   delegated to a follower (any voter can do the Pebble scan; the
   result is a Raft-replicated batch).
-- Net: the leader is no longer the single scan point — followers
-  do the scan, leaders just apply the resolved batches.
+- Net: the leader is no longer the single scan point. Followers scan
+  Pebble snapshots, resolve transaction statuses asynchronously
+  outside the Raft apply path, and propose only final commit / abort
+  decisions as resolved batches. Raft apply never performs remote
+  primary-shard lookups.
 
 **M5 — Leader-proxy budget bounded (`*_proposed_*` doc TBD).**
 - Replace 200-retry budget with circuit-breaker: after 3 failed
@@ -478,10 +493,13 @@ doc TBD).**
 
 - M1 depends on `cap_per_group_hlc_v1` capability bit infra
   (already used by hotspot-split M2 `cap_migration_v2`).
-- M2 depends on existing per-shard lease infrastructure.
+- M2 depends on a follower-safe read-index / closed-timestamp
+  mechanism; the existing per-shard leader lease is not sufficient
+  for follower reads.
 - M3 depends on the existing Composed-1 verify path; it is the
   per-shard-prepare → multi-shard-commit generalisation.
-- M4 depends on `cap_per_group_hlc_v1`'s per-group Raft tick.
+- M4 depends on `cap_per_group_hlc_v1`'s per-group Raft tick and an
+  async transaction-status resolver that runs outside Raft apply.
 - M5 is standalone.
 
 ## 7. Cross-cutting concerns
@@ -643,6 +661,20 @@ description.
    for the scan duration, which competes with compaction. Bound
    the scan to a short window or break into smaller resumable
    batches?
+8. **Atomic catalog delta retention (§3 M1/M2).** The watcher can
+   publish deltas atomically only while it can still reconstruct the
+   requested `from_version → to_version` overlay. Define the delta
+   retention horizon and the exact fallback trigger to a full
+   snapshot so every node makes the same choice under lag.
+9. **Hot-key MVCC retention budget (§5 M3).** The 30 min retention
+   window is a hard contract, but dynamic per-key budgets can exceed
+   the nominal 100 k target for hot keys. Define the memory budget,
+   pressure metric, and operator action before implementing the
+   adaptive cap.
+10. **Follower-read evidence (§6 M2).** Pick the proof followers use
+    to serve stale reads safely: Raft ReadIndex on demand, a
+    leader-published closed timestamp, or a hybrid. The choice sets
+    the latency floor and the Jepsen workload's failure model.
 
 ## 11. What this doc is not
 
