@@ -194,10 +194,13 @@ Replace the watcher's "version bump → pull full catalog" with a
 **versioned diff protocol** off the existing
 `distribution/catalog.go` storage:
 
-- Catalog rows already carry a `catalog_version` per
-  `RouteDescriptor` and version bumps; expose
-  `GetCatalogChanges(from_version, to_version) → []RouteDelta`
-  with `RouteDelta = {op: ADD|MODIFY|REMOVE, RouteDescriptor}`.
+- Add an explicit catalog change log to `distribution/catalog.go`:
+  each `CatalogStore.Save` writes the global version bump, changed
+  route rows, and `catalog_change/<version>/<route_id>` records in
+  the same MVCC commit. `RouteDelta = {op: ADD|MODIFY|REMOVE,
+  RouteDescriptor}` is derived from this log, not by diffing full
+  route snapshots. `GetCatalogChanges(from_version, to_version)`
+  scans only the retained change-log range.
 - Watcher pulls deltas into a copy-on-write route-version overlay,
   validates the batch against the previous catalog version, then
   publishes the new catalog version atomically. Readers never observe
@@ -448,11 +451,14 @@ The hardest single-point-of-failure today. Concrete steps:
   guaranteed by a follower-visible read-index / closed-timestamp
   mechanism rather than the current leader-local lease fast path.
   A follower-read request carries a `max_staleness_ms` from the
-  adapter; the follower returns `(value, served_at_ts)` and the
-  adapter rejects if
-  `served_at_ts < read_ts - max_staleness_ms`.
+  adapter; the follower returns `(value, served_at_ts)`. Staleness
+  comparisons operate on decoded HLC physical milliseconds, not on
+  the packed `physical_ms << HLCLogicalBits | logical` value:
+  reject when
+  `physical_ms(served_at_ts) < physical_ms(read_ts) - max_staleness_ms`.
 - Per-shard "follower ready" gate: follower must have applied at
-  least up to `max_applied_ts ≥ read_ts - max_staleness_ms`.
+  least up to
+  `physical_ms(max_applied_ts) ≥ physical_ms(read_ts) - max_staleness_ms`.
 - Adapter integration: DynamoDB's eventually-consistent read
   (`ConsistentRead = false`) and Redis replicaof reads route here.
 - Multi-region (§4.2 M3) regions have an inherent staleness
