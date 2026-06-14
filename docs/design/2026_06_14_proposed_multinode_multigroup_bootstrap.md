@@ -2,8 +2,8 @@
 
 Status: Proposed
 Author: bootjp
-Date: 2026-06-12
-Date source: first add commit `252df5601700821c7bee7b642c9f0d758103f85f` (`git log --follow --diff-filter=A`), authored on 2026-06-12.
+Date: 2026-06-14
+Date source: first add commit introducing this proposal in PR #955's review cycle, aligned with the filename propose date.
 
 Sibling / prerequisite-for:
 - [Leader-balance scheduler design PR #953](https://github.com/bootjp/elastickv/pull/953) §1.1a (PR0) + OQ-9 — this doc **is** that PR0. The leader-balance scheduler's transfer-issuing milestones (PR2/PR3) are blocked on a Raft group whose voter set spans more than one node; that topology cannot be declared at startup today, and OQ-9 resolved "option (a): extend the bootstrap/flag surface." This document is the design for option (a).
@@ -229,4 +229,4 @@ This document begins as `*_proposed_*`. Per CLAUDE.md / `docs/design/README.md`:
 - Rename to `*_partial_*` after PR-B (multi-voter groups deployable at startup), recording which PRs shipped.
 - Rename to `*_implemented_*` after PR-C (in-process integration harness landed), with the Jepsen runner (PR-D) tracked as a follow-on.
 
-Use `git mv` so history follows the rename. The propose date (2026-06-12) and slug stay fixed.
+Use `git mv` so history follows the rename. The propose date (2026-06-14) and slug stay fixed.
