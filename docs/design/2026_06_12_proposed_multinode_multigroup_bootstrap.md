@@ -5,7 +5,7 @@ Author: bootjp
 Date: 2026-06-12
 
 Sibling / prerequisite-for:
-- [2026_06_11_proposed_leader_balance_scheduler.md](2026_06_11_proposed_leader_balance_scheduler.md) §1.1a (PR0) + OQ-9 — this doc **is** that PR0. The leader-balance scheduler's transfer-issuing milestones (PR2/PR3) are blocked on a Raft group whose voter set spans more than one node; that topology cannot be declared at startup today, and OQ-9 resolved "option (a): extend the bootstrap/flag surface." This document is the design for option (a).
+- [Leader-balance scheduler design PR #953](https://github.com/bootjp/elastickv/pull/953) §1.1a (PR0) + OQ-9 — this doc **is** that PR0. The leader-balance scheduler's transfer-issuing milestones (PR2/PR3) are blocked on a Raft group whose voter set spans more than one node; that topology cannot be declared at startup today, and OQ-9 resolved "option (a): extend the bootstrap/flag surface." This document is the design for option (a).
 - [2026_02_18_partial_hotspot_shard_split.md](2026_02_18_partial_hotspot_shard_split.md) Milestone 2 — cross-group range migration testing also needs ≥2 nodes hosting the same group to be meaningful (see §7).
 
 ## 1. Background
