@@ -378,7 +378,11 @@ message ExportRangeVersionsRequest {
   // applies it before adding a row to the chunk. Required on every
   // call; the migrator already has them on its SplitJob.
   bytes route_start = 7;
-  bytes route_end = 8;  // empty == +infinity (open-ended right edge)
+  // Empty == +infinity (open-ended right edge). The internal RPC server
+  // normalizes len(route_end)==0 to nil before building RouteKeyFilter; the
+  // filter also checks len(rangeEnd)>0 defensively (§6.3) so the rightmost
+  // route cannot reject every non-empty routing key by comparing against [].
+  bytes route_end = 8;
   // §6.3.1 scan budget: hard cap on the bytes the server iterator may
   // scan (accepted AND rejected rows both count) before it must return
   // whatever it has accepted plus next_cursor over the last-scanned
@@ -601,17 +605,17 @@ func RouteKeyFilter(rangeStart, rangeEnd []byte) store.KeyFilter {
         rKey := routeKey(rawKey)
         // half-open [rangeStart, rangeEnd) in the routing-key namespace.
         if bytes.Compare(rKey, rangeStart) < 0 { return false }
-        if rangeEnd != nil && bytes.Compare(rKey, rangeEnd) >= 0 { return false }
+        if len(rangeEnd) > 0 && bytes.Compare(rKey, rangeEnd) >= 0 { return false }
         return true
     }
 }
 ```
 
-The closure ensures internal keys (`!txn|...`, `!lst|...`, redis hash/list/etc.) land in the same shard as their logical owner without `store` ever importing `kv`. The importer dispatches by `key_family` into the matching store helper (in a future kv-level `Import` wrapper) to preserve per-family invariants (e.g., list head pointer updates).
+The closure ensures internal keys (`!txn|...`, `!lst|...`, redis hash/list/etc.) land in the same shard as their logical owner without `store` ever importing `kv`. `rangeEnd` uses the wire convention from §5.2: nil or empty means `+infinity`. The `len(rangeEnd) > 0` check is therefore part of the correctness contract, not just a convenience — an empty-but-non-nil slice must not make every non-empty `routeKey(rawKey)` compare `>= rangeEnd` and reject the entire rightmost route. The importer dispatches by `key_family` into the matching store helper (in a future kv-level `Import` wrapper) to preserve per-family invariants (e.g., list head pointer updates).
 
 #### 6.3.1 Internal-family brackets — raw range alone misses internal state (closes codex P1 line 310)
 
-The above closure correctly *rejects* a raw key that does not belong to the moving range, but it cannot *find* internal-family keys that the caller never iterates over in the first place. Codex P1 round-4 on PR #945 (line 310): for a moving user-key interval `[foo, bar)`, an iteration over the raw range `[foo, bar)` never visits `!txn|lock|foo`, `!lst|meta|foo`, `!redis|str|foo`, `!ddb|item|<tbl>|foo`, `!sqs|...`, `!s3|...`, because each of those prefixes sorts **outside** `[foo, bar)` in the raw MVCC key space — the routeKey filter rejects nothing because those bytes were never iterated. Without the fix below, CUTOVER would leave intent locks, list metadata, and adapter-private state behind on the source and the target would serve reads against a half-populated MVCC space — silent data loss.
+The above closure correctly *rejects* a raw key that does not belong to the moving range, but it cannot *find* internal-family keys that the caller never iterates over in the first place. Codex P1 round-4 on PR #945 (line 310): for a moving user-key interval `[foo, bar)`, an iteration over the raw range `[foo, bar)` never visits `!txn|lock|foo`, `!lst|meta|foo`, `!redis|str|foo`, `!ddb|item|<tbl>|foo`, `!ddb|meta|table|<tbl>`, `!ddb|meta|gen|<tbl>`, `!sqs|...`, `!s3|...`, because each of those prefixes sorts **outside** `[foo, bar)` in the raw MVCC key space — the routeKey filter rejects nothing because those bytes were never iterated. Without the fix below, CUTOVER would leave intent locks, list metadata, DynamoDB table schema / generation, and adapter-private state behind on the source and the target would serve reads against a half-populated MVCC space — silent data loss.
 
 M2 therefore runs **multiple parallel exports per migration**, one per relevant raw-key family, each driven by the same `KeyFilter` so `routeKey()` remains the single source of truth for "does this key belong to the moving range?". The migrator computes the bracket list from the moving range's logical scope:
 
@@ -645,6 +649,8 @@ func PlanExportBrackets(routeStart, routeEnd []byte) []ExportBracket {
         {Start: lstMetaPrefix(),  End: lstMetaPrefixEnd(),  Family: familyListMeta},
         {Start: lstItmPrefix(),   End: lstItmPrefixEnd(),   Family: familyListItem},
         {Start: redisPrefix(),    End: redisPrefixEnd(),    Family: familyRedis},
+        {Start: ddbTableMetaPrefix(), End: ddbTableMetaPrefixEnd(), Family: familyDdbTableMeta},
+        {Start: ddbTableGenerationPrefix(), End: ddbTableGenerationPrefixEnd(), Family: familyDdbTableGeneration},
         {Start: ddbItemPrefix(),  End: ddbItemPrefixEnd(),  Family: familyDdbItem},
         {Start: ddbGSIPrefix(),   End: ddbGSIPrefixEnd(),   Family: familyDdbGSI},
         {Start: sqsPrefix(),      End: sqsPrefixEnd(),      Family: familySqs},
@@ -656,9 +662,11 @@ func PlanExportBrackets(routeStart, routeEnd []byte) []ExportBracket {
 }
 ```
 
-`routeKey()` already decodes every internal-family prefix back to the same routing key that the user-key route resolution returns (parent partial doc §9; implementation in `kv/shard_key.go`); the `KeyFilter` therefore correctly accepts an internal-family raw key whose routing key falls inside the moving range and rejects others. So adding the bracket list is the only new machinery needed — the filter stays unchanged.
+`routeKey()` already decodes every internal-family prefix back to the same routing key that the user-key route resolution returns (parent partial doc §9; implementation in `kv/shard_key.go`); the `KeyFilter` therefore correctly accepts an internal-family raw key whose routing key falls inside the moving range and rejects others. So adding the bracket list is the only new machinery needed.
 
-The migrator runs the brackets **in parallel up to `--migrationExportFanout` (default 4)** within a single phase (BACKFILL or DELTA_COPY): each bracket gets its own opaque cursor (the §6.1.1 codec is extended to key on `(family, raw_key, commit_ts)`), so a bracket can be paused/resumed independently and the §9 resumability matrix applies per bracket. The migrator records per-bracket `cursor` and `done` flags on the SplitJob; the phase advances only when **every bracket** reports `done = true`. Cost is at most `fanout`× the gRPC frame budget but is bounded by the total bracket count (~12 today), not by data volume.
+The DynamoDB metadata brackets are mandatory, not an optimization. `routeKey()` maps `!ddb|meta|table|<table>` and `!ddb|meta|gen|<table>` to the same `!ddb|route|table|<table>` route as `!ddb|item|<table>|...` and `!ddb|gsi|<table>|...` (`kv/shard_key.go`). The adapter reads those keys directly in `loadTableSchemaAt` and `loadTableGenerationAt` (`adapter/dynamodb.go`), so copying item/GSI rows without schema/generation leaves the target with data that DynamoDB treats as a missing table or generation 0. A future DynamoDB storage family must therefore add both a `routeKey()` decoder and a bracket in the same PR.
+
+The migrator runs the brackets **in parallel up to `--migrationExportFanout` (default 4)** within a single phase (BACKFILL or DELTA_COPY): each bracket gets its own opaque cursor (the §6.1.1 codec is extended to key on `(family, raw_key, commit_ts)`), so a bracket can be paused/resumed independently and the §9 resumability matrix applies per bracket. The migrator records per-bracket `cursor` and `done` flags on the SplitJob; the phase advances only when **every bracket** reports `done = true`. Cost is at most `fanout`× the gRPC frame budget but is bounded by the total bracket count (~14 today), not by data volume.
 
 **Bounded scan for sparse / out-of-range brackets (closes codex P2 round-5 line 445).** "Returns its first chunk empty and `done=true` immediately" is only true when the iterator can short-circuit; under the §6.1 contract, `accept` rejections do **not** count against `chunkBytes` (so the caller sees deterministic chunk shapes), which would otherwise let a family-wide raw range scan an arbitrarily large prefix to prove `done=true` for a moving range with no intersection. The fix has two layers:
 
@@ -914,6 +922,7 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 - `distribution/migrator_test.go`: state machine — exhaustive phase transitions, abandon paths, CAS contention.
 - `kv/migrator_snapshot_boundary_test.go`: §6.1.0 fence-before-boundary (codex round-15 P1). Assert (a) the provisional `snapshot_ts` opens BACKFILL; (b) the route-faithful prepare scan re-runs each tick and `snapshot_min_prepared_ts` is a monotone-down running minimum across BACKFILL + FENCE-apply — a prepare that lands **after** the pre-BACKFILL scan with a low caller-supplied `commit_ts ≤ snapshot_ts` lowers it on the next tick; (c) `delta_floor = min(snapshot_ts, snapshot_min_prepared_ts - 1)` is finalised **only** after `post_fence_drain_completed = true`, and once `verifyRouteNotFenced` rejects new prepares the running minimum cannot move; (d) DELTA_COPY's window is `(delta_floor, fence_ts]`, so the post-scan low-ts prepare's committed version is `> delta_floor` and is exported; **(e) moved-secondary coverage (codex round-16 P1):** a multi-shard txn whose **primary key is outside** the moving range but whose **secondary key is inside** it, with `commit_ts ≤ snapshot_ts`, lowers `snapshot_min_prepared_ts` — proving the running minimum is keyed on `routeKey(lockedKey)` per key (via the live secondary lock and/or the moving-range committed-version backstop) and NOT only on the txn's primary; a same-tick land-and-resolve variant of that secondary (lock never sampled) is still captured by the moving-range committed-version scan. Red control 1: finalising `delta_floor = snapshot_ts` before the fence (the old single-pre-scan form) drops the late low-ts write — must fail. Red control 2: scoping the running minimum to moved *primaries* only (the pre-round-16 form) drops the moved-secondary's version — must fail. Restart case: a flap between post-fence drain and finalisation recomputes the identical `delta_floor` from durable inputs (§9 row).
 - `kv/migrator_lock_drain_test.go`: route-faithful txn-lock drain (§3.2a.0a). Table-driven over key families. **Must include a DynamoDB-item-lock case**: a lock stored at `!txn|lock|!ddb|item|<table>|<pk>` whose routing key is `!ddb|route|table|<table>` MUST be counted by a drain over the moving range `[!ddb|route|table|<table>, !ddb|route|table|<table>\xff)` — proving the drain scans the `!txn|lock|` family and filters by `routeKey(lockedKey)`, NOT by a raw `[txnLockKey(routeStart), txnLockKey(routeEnd))` bracket (which would sort `!txn|lock|!ddb|item|...` outside the bracket and falsely report the drain empty). Mirror cases for SQS (`!txn|lock|!sqs|...` → `!sqs|route|global`), Redis/list, and a plain user key (raw == routing, the trivial case). Negative cases: a same-table lock for a key whose routing falls outside `[routeStart, routeEnd)` is NOT counted; an unrelated-family lock is NOT counted. The same predicate backs §6.1.0's snapshot prepare scan and §3.2a step 0b's post-fence drain — assert all three call sites share it.
+- `kv/migrator_export_plan_test.go`: `PlanExportBrackets` includes every family whose `routeKey()` maps into the routing namespace. Required cases: DynamoDB table metadata (`!ddb|meta|table|`), DynamoDB generation (`!ddb|meta|gen|`), DynamoDB item/GSI, txn/list/redis/SQS/S3, plus a red control where omitting the metadata brackets makes `loadTableSchemaAt` / `loadTableGenerationAt` fail after CUTOVER. Also assert `RouteKeyFilter(routeStart, nil)` and `RouteKeyFilter(routeStart, []byte{})` both treat the end as unbounded and accept keys in the rightmost route.
 - `distribution/catalog_test.go`: SplitJob codec round-trip + version-1 stability.
 - `store/mvcc_store_export_test.go`: snapshot semantics — exported versions match a reader at `maxCommitTS`; intent locks excluded; cursor monotonic; `maxScannedBytes` budget bounds a sparse-bracket call (returns a partial/empty chunk + advancing cursor at `done=false` instead of scanning the full prefix).
 - `store/mvcc_store_import_test.go`: idempotency under duplicate `(bracket_id, batch_seq)` (a replayed batch at or below the per-bracket high-water mark is a no-op that returns the stored `acked_cursor`; parallel brackets do not clobber each other's ack record); zero-version progress chunk persists `(batch_seq, cursor)` without MVCC writes, `metaLastCommitTS` / HLC advancement, or `max_imported_ts` changes; key_family dispatch.
@@ -961,7 +970,7 @@ Phased into reviewable PRs, each lands behind its own doc-or-test gate:
 | M2-PR1 | SplitJob codec + reserved-key layout + catalog read/write helpers | catalog_test |
 | M2-PR2 | `proto/distribution.proto` + `proto/internal.proto` regen; wire fields plumbed but unused | proto regen; build |
 | M2-PR3 | `store/MVCCStore.ExportVersions` + `ImportVersions` with idempotency, no migrator wiring | store unit + property |
-| M2-PR4 | `distribution/migrator.go` state machine — same-group target (no-op data move) to lock the state shape | migrator unit |
+| M2-PR4 | `distribution/migrator.go` state machine + export bracket planner — same-group target (no-op data move) to lock the state shape | migrator unit + `migrator_export_plan_test` |
 | M2-PR5 | Coordinator + FSM FENCE rejection (`ErrRouteWriteFenced`) + route-faithful txn-lock drain (§3.2a.0a) | fsm + coordinator unit + `migrator_lock_drain_test` |
 | M2-PR6 | Cross-group end-to-end: ExportRangeVersions / ImportRangeVersions server-side handlers + migrator BACKFILL/DELTA_COPY + §7.2.2e source-side cutover read-fence arm | integration + `kv/fsm_cutover_read_fence_test.go` |
 | M2-PR7 | AbandonSplitJob + CLEANUP GC + Jepsen split workload | jepsen suite |
