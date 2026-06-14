@@ -1575,9 +1575,11 @@ func (d *DynamoDBServer) startGSIReadWorkers(
 	cancel context.CancelFunc,
 ) {
 	for range workerCount {
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			d.gsiReadWorker(ctx, readTS, filter, jobs, results, cancel)
-		})
+		}()
 	}
 }
 
