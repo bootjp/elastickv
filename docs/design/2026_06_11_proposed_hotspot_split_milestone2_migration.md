@@ -69,8 +69,8 @@ Key layout:
 | `cutover_read_fence_armed` | bool | True once the source-group Raft log has applied the §7.2.2e pending read-fence barrier for the moving range and the expected `cutover_version`. The migrator sets this before publishing `target.Active`; a restart between the source barrier and the default-group catalog CAS resumes by either completing CUTOVER with the same expected version or clearing the pending fence on abort. |
 | `cursor` | bytes | Opaque (raw_key, commit_ts) export position for BACKFILL / DELTA_COPY resume — addresses an MVCC version, not a raw key, so a hot key with many committed versions can be chunked safely across batches (see §6.1.1). |
 | `max_imported_ts` | uint64 | Monotone HLC ceiling: the largest `commit_ts` ever included in a non-empty ack'd import batch for this job. Empty scan-progress chunks (§6.2) advance bracket cursors but do not change this value because they contain no timestamp. Used by §6.2.1 to advance the target group's HLC at CUTOVER. |
-| `promote_cursor` | bytes | Opaque cursor for the §6.4 incremental staged-to-live promoter. Same encoding as §6.1.1; advances during background promotion after CUTOVER. |
-| `promotion_completed_ts` | uint64 | HLC commit-ts of the apply that cleared `staged_visibility_active` and ended CLEANUP. Diagnostic / audit only. |
+| `target_promotion_done` | bool | Default-group witness that the target group has durably completed §6.4 promotion using its target-local `PromotionState`. This is **not** a cursor; promotion progress is owned by the target Raft group so a default-group crash cannot skip target-local staged rows. |
+| `promotion_completed_ts` | uint64 | HLC commit-ts of the default-group CAS that cleared `staged_visibility_active` after the target reported promotion complete and ended CLEANUP. Diagnostic / audit only. |
 | `fence_catalog_version` | uint64 | Catalog version produced by the FENCE catalog write — the value §3.2a's voter-ACK barrier compares each voter's `catalog_version_applied` against (closes claude round-12 minor on PR #945). Set at FENCE entry. |
 | `fence_ack_cursor` | bytes | Opaque encoding of the per-voter ACK progress for §3.2a's fence-apply barrier (which voter IDs have reported `catalog_version_applied >= fence_catalog_version`). Restart-safe: a migrator restart resumes from the pending voter list rather than re-polling completed voters. |
 | `bracket_progress` | repeated `BracketProgress` | Per-family export bracket state for §6.3.1's parallel exports. Each entry carries `(bracket_id uint64, family uint32, cursor bytes, done bool, scanned_bytes uint64, accepted_rows uint64, last_acked_batch_seq uint64)`. `bracket_id` is stable for the life of the SplitJob and forms part of the §6.1.1 importer idempotency key `(job_id, bracket_id, batch_seq)`. `last_acked_batch_seq` is the highest per-bracket batch the importer has acked; the migrator uses it to detect a retry that crossed bracket boundaries. A leader flap resumes each bracket independently. `phase` advances from BACKFILL/DELTA_COPY only when every entry has `done = true`. |
@@ -78,6 +78,8 @@ Key layout:
 | `started_at`, `updated_at`, `terminal_at` | int64 | Wall-clock ms; **diagnostic only**, must not be read by any ordering-sensitive logic (CLAUDE.md HLC rule). `terminal_at` is set when phase enters DONE/FAILED. |
 
 Encoding mirrors `RouteDescriptor` (a single-byte codec version prefix + protobuf body). Reserve a new codec constant `catalogJobCodecVersion = 1`.
+
+Target-local promotion state is **not** stored in this default-group `SplitJob`. The target group owns a small Raft-applied record under `!migstage|promote|<job_id>` with `(promote_cursor bytes, done bool, promoted_rows uint64, last_error string)`. `PromoteStaged` updates that record in the same target-group apply that copies/deletes staged rows (§6.4). The default group only records the final witness (`target_promotion_done = true`) after the target reports `done=true`.
 
 #### 3.1.1 Job retention (bounded storage)
 
@@ -404,11 +406,16 @@ message MVCCVersion {
   bytes key = 1;        // raw storage key (NOT routeKey-normalized)
   uint64 commit_ts = 2;
   bool tombstone = 3;
-  bytes value = 4;      // omitted when tombstone == true
+  bytes value = 4;      // logical value; omitted when tombstone == true
   // Internal-key family (txn/list/redis) tag, so the importer can
   // dispatch into the matching store helper instead of inferring
   // from the byte prefix.
   uint32 key_family = 5;
+  // Store-level TTL deadline in HLC timestamp units; 0 means no TTL.
+  // Preserved from VersionedValue.ExpireAt / Pebble's value header so
+  // PutWithTTLAt / ExpireAt values keep expiring at the original time.
+  // Tombstones must carry expire_at=0.
+  uint64 expire_at = 6;
 }
 
 message ImportRangeVersionsRequest {
@@ -490,13 +497,14 @@ New method on `MVCCStore`:
 // and pure — the export streams it on the iteration goroutine.
 type KeyFilter func(rawKey []byte) bool
 
-// ExportVersions iterates committed versions in the half-open range
-// [start, end) whose commit_ts is in (minCommitTS, maxCommitTS],
-// resuming from cursor. Returns a slice of versions (capped roughly
+// ExportVersions iterates raw committed MVCC versions in the half-open
+// range [start, end) whose commit_ts is in (minCommitTS, maxCommitTS],
+// resuming from cursor. It includes delete tombstones and versions whose
+// ExpireAt would make them invisible to a reader at maxCommitTS; it does
+// NOT apply read-visible filtering. It excludes only in-flight intent
+// locks (!txn|lock|...) because those are not committed MVCC versions the
+// importer should materialise. Returns a slice of versions (capped roughly
 // at chunkBytes) and the next cursor, plus a sentinel when exhausted.
-// Visibility rules MUST match the read path's snapshot at maxCommitTS;
-// in particular, intent locks (!txn|lock|...) are excluded — those
-// belong to in-flight txns the importer must not observe as commits.
 // The cursor is opaque (see §6.1.1) — it addresses an MVCC version
 // (raw key + commit_ts), not just a raw key, so a single hot key's
 // history is allowed to span batches without losing or duplicating
@@ -517,7 +525,7 @@ ExportVersions(ctx context.Context, start, end []byte, minCommitTS, maxCommitTS 
     cursor []byte, chunkBytes, maxScannedBytes int, accept KeyFilter) ([]MVCCVersion, []byte, bool, error)
 ```
 
-The function uses the existing snapshot read primitive (the same one Composed-1 already trusts for visibility), so MVCC semantics during export are guaranteed to match a reader at `maxCommitTS`. `accept` is consulted before a row is added to the chunk; rejected rows do not advance the chunk-bytes budget so the caller sees deterministic per-call shapes — but they **do** advance the `maxScannedBytes` budget, so a sparse bracket cannot scan an unbounded prefix to prove `done=true` (§6.3.1).
+The function uses the existing MVCC storage order and value decoder, but deliberately **does not** use the read-visible snapshot filter as its row source. A read at `maxCommitTS` hides tombstones and values whose `ExpireAt <= maxCommitTS`; migration must still copy those committed versions so the target preserves deletes, TTL expiry, and historical reads across CUTOVER. `accept` is consulted before a row is added to the chunk; rejected rows do not advance the chunk-bytes budget so the caller sees deterministic per-call shapes — but they **do** advance the `maxScannedBytes` budget, so a sparse bracket cannot scan an unbounded prefix to prove `done=true` (§6.3.1).
 
 #### 6.1.1 Cursor granularity — addresses a scanned MVCC position, not just a raw key (closes codex P2; refined for sparse brackets per coderabbit round-12 Major / codex round-14 P2)
 
@@ -565,19 +573,21 @@ New method:
 // a sparse bracket hits maxScannedBytes before accepting a row; that still
 // advances (bracketID, batchSeq, cursor) but performs no MVCC writes and
 // no HLC/metaLastCommitTS advancement (§6.2.1). Non-empty imports
-// atomically advance metaLastCommitTS AND the node-local HLC ceiling to
-// at least max(commit_ts) of the batch (§6.2.1).
+// apply tombstones via DeleteAt and non-tombstones via PutAt(value,
+// commit_ts, expire_at), then atomically advance metaLastCommitTS AND
+// the node-local HLC ceiling to at least max(commit_ts) of the batch
+// (§6.2.1).
 ImportVersions(ctx context.Context, jobID, bracketID, batchSeq uint64,
     versions []MVCCVersion, cursor []byte) ([]byte, error)
 ```
 
-Idempotency: persist `(jobID, bracketID) → (max_applied_batch_seq, acked_cursor)` under `!migstage|ack|<jobID>|<bracketID>` after each batch's apply (the bracket dimension is required — a single `!migstage|cursor|<jobID>` record would be clobbered by parallel brackets per §6.1.1), and on a duplicate request drop any batch whose `batchSeq` is `≤` the recorded high-water mark while returning the stored `acked_cursor`. The `cursor` is also persisted on the SplitJob's `bracket_progress` entry for exporter resume, separate from the dedup record. Empty batches follow the same ack path; they are not skipped.
+Idempotency: persist `(jobID, bracketID) → (max_applied_batch_seq, acked_cursor)` under `!migstage|ack|<jobID>|<bracketID>` after each batch's apply (the bracket dimension is required — a single `!migstage|cursor|<jobID>` record would be clobbered by parallel brackets per §6.1.1), and on a duplicate request drop any batch whose `batchSeq` is `≤` the recorded high-water mark while returning the stored `acked_cursor`. The `cursor` is also persisted on the SplitJob's `bracket_progress` entry for exporter resume, separate from the dedup record. Empty batches follow the same ack path; they are not skipped. Non-empty batches preserve the complete MVCC value header relevant to visibility: `tombstone` and `expire_at` are part of the imported version, not recomputed on the target.
 
 #### 6.2.1 Target HLC advancement — preventing post-CUTOVER time travel (closes codex P1)
 
 Codex P1 on PR #945: when the source range contains commit timestamps higher than the target group's current `LastCommitTS` / HLC, an import that only writes versions + cursor leaves the target's clock below the staged data. After CUTOVER the target's first new write at `Next() = max(wall, ceiling)` can therefore receive a `commit_ts` **smaller** than imported values — MVCC visibility then resurrects the pre-cutover value on a snapshot read at the new commit_ts, an unambiguous time-travel hazard.
 
-The fix runs inside `ImportVersions` (and the equivalent CUTOVER bulk-rename apply that promotes the staged keyspace into live keys):
+The fix runs inside `ImportVersions`. The later `PromoteStaged` apply only copies already-imported versions from staged keys into live keys with their original `commit_ts`, `tombstone`, and `expire_at` header; it must not mint or observe a new timestamp.
 
 1. **Per-batch advance for non-empty batches.** On every apply of an `ImportVersions` batch with at least one version, the target FSM computes `batchMax = max(versions[i].commit_ts)` and **atomically** (under the same FSM apply lock that mutates the MVCC store):
    - sets `metaLastCommitTS = max(metaLastCommitTS, batchMax)`,
@@ -713,15 +723,15 @@ Codex P2 round-3 on PR #945 (line 147): "staging every imported row under `!dist
 
    Why this matters: without the merge iterator, a post-CUTOVER `Scan(ScanStart, ScanEnd)` on the moved range would walk only the **live** keyspace — empty for any range that hasn't been promoted yet. DynamoDB `Scan`/`Query`, Redis `KEYS`/`SCAN`/range `LRANGE`-equivalent (where the underlying key is range-scanned for the list head's encoded position), and the gRPC `RawScan` API would all return empty or partial results in the window between CUTOVER and the promoter's catch-up — a user-visible data-disappearance bug. The merged iterator closes that window: as long as `staged_visibility_active = true`, range reads see the same union of staged + live versions that point reads do, so the user-observable state is correct from CUTOVER onward. Once the promoter clears the staged prefix and CLEANUP toggles `staged_visibility_active = false` (step 5), the merged iterator falls back to live-only and the route is indistinguishable from any other Active route.
 
-3. **Background incremental promoter on the target group.** Immediately after CUTOVER the target group's FSM starts a **leader-local promoter goroutine** that walks the `!dist|migstage|<job_id>|*` prefix in cursor-resumable chunks (the same `chunkBytes` / pacing knobs §6.1 and the migrator already use), and for each staged version proposes one `PromoteStaged` Raft entry that:
+3. **Background incremental promoter on the target group.** Immediately after CUTOVER the target group's FSM starts a **leader-local promoter goroutine** that walks the `!dist|migstage|<job_id>|*` prefix in cursor-resumable chunks (the same `chunkBytes` / pacing knobs §6.1 and the migrator already use). Promotion progress is target-local Raft state under `!migstage|promote|<job_id>`, never a cursor in the default-group SplitJob. For each staged batch the leader proposes one `PromoteStaged` Raft entry that:
    - copies the staged key into its live position with the original imported `commit_ts` — **always**, regardless of whether a newer live version at a higher `commit_ts` exists. The MVCC store naturally holds both `K@commit_ts=3` (the staged version being promoted) and `K@commit_ts=10` (a later live write) at different commit timestamps; a snapshot read at any `read_ts ∈ [3, 10)` correctly sees the imported `K@3`, and a read at `read_ts ≥ 10` correctly sees `K@10`. The idempotency guard for this copy is "**no-op if a live version at the same `commit_ts` already exists**" — that means this exact staged version was already promoted in a prior batch before a leader flap re-tried it. It is **not** "no-op when a newer live version exists," which would silently drop the imported version from MVCC history and make snapshot reads at older `read_ts` return wrong results (closes claude round-3 P1, 5-round flag). History pruning belongs to `kv/compactor.go`, not the promoter,
    - deletes the staged key,
-   - advances the per-job `promote_cursor` on the SplitJob.
+   - advances the target-local `PromotionState.promote_cursor`.
    Each batch is a small bounded proposal, exactly like BACKFILL — there is no single oversized apply.
 
-4. **Promotion is restart-safe.** The promoter is leader-only; a leader flap restarts from `promote_cursor`. Concurrent reads keep using the staged-fallback path (step 2) for whatever has not yet been promoted, so the user-visible state is correct throughout.
+4. **Promotion is restart-safe.** The promoter is leader-only; a leader flap restarts from the target-local `PromotionState.promote_cursor`. Because the cursor update, live copy, and staged delete happen in the same target-group Raft apply, a crash cannot persist a cursor that skips rows whose promotion did not durably apply. Concurrent reads keep using the staged-fallback path (step 2) for whatever has not yet been promoted, so the user-visible state is correct throughout.
 
-5. **CLEANUP → DONE precondition.** The SplitJob does not advance from CLEANUP to DONE until **all** of the following are true: (a) the read-fence grace window (§7.2.4) has elapsed, (b) the promoter has reported "no staged keys remain" (the prefix scan finds nothing), (c) the target has deleted the per-bracket import-dedup records under `!migstage|ack|<job_id>|*`, and (d) one final apply clears `staged_visibility_active` on the target route. The ack records are only needed while DELTA_COPY/import retries are possible; deleting them in the same bounded target-group apply that clears staged visibility prevents target-local GC debt after DONE. Once cleared, reads no longer pay the staged-fallback cost; the route is indistinguishable from any other Active route. The migrator records the final apply's commit_ts as `promotion_completed_ts` on the SplitJob for audit.
+5. **CLEANUP → DONE precondition.** The target group first completes promotion locally: a bounded target-group Raft apply verifies the staged prefix is empty, deletes the per-bracket import-dedup records under `!migstage|ack|<job_id>|*`, and marks `!migstage|promote|<job_id>.done = true`. Only after the migrator observes that target-local `done=true` report does it issue a default-group CAS that clears `staged_visibility_active` / `migration_job_id` from the target route and advances the SplitJob from CLEANUP to DONE with `target_promotion_done = true` and `promotion_completed_ts`. This ordered two-owner handoff is required: the default group must never clear the merge flag based on a cursor it owns, because a crash between target and default writes could otherwise skip unpromoted staged rows or hide staged rows before the target copy is durable. If the target completion apply lands but the default CAS does not, reads still pay the merge cost over an empty staged prefix until the migrator retries the CAS; correctness is preserved.
 
 6. **Edge cases.**
    - **Hot key with many versions** (codex P2 on cursor granularity, §6.1.1): the promoter iterates the staged prefix in `(raw_key ASC, commit_ts DESC)` order using the same opaque-cursor codec; the staged-fallback read path treats a key with multiple staged versions identically to the MVCC iterator. No version chain is materialised in one apply.
@@ -909,6 +919,8 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 | Leader loss between post-fence drain and `delta_floor` finalisation (§6.1.0 step 3) | `delta_floor` is the deterministic `min(snapshot_ts, snapshot_min_prepared_ts - 1)` of durable inputs, so the new migrator recomputes the identical value; no new prepare can lower the running minimum because the fence already rejects them. | None. |
 | Leader loss after source-side cutover read fence is armed but before default-group CUTOVER CAS | New migrator sees `cutover_read_fence_armed = true`, revalidates the expected catalog version, and either completes the same CUTOVER CAS or clears `ArmCutoverReadFence` on abort. Source returns `ErrRouteCutoverPending`/`ErrRouteMoved` rather than serving stale reads while the fence is armed. | Brief retryable reads; no stale source value. |
 | Leader loss during CUTOVER | The CAS catalog write either landed (new version visible, job → CLEANUP) or not (job stays in DELTA_COPY, redo). Never partial. | None. |
+| Leader loss during target promotion | The target leader resumes from target-local `!migstage|promote|<job_id>.promote_cursor`; cursor advancement, live copy, and staged delete are one target-group Raft apply, so a persisted cursor cannot skip rows whose copy did not land. Default-group SplitJob state is only a witness and never drives the cursor. | None — reads keep using the staged/live merge until promotion finishes. |
+| Target promotion finished but default-group DONE CAS did not land | Target-local `PromotionState.done=true` and empty staged prefix are durable. The new migrator retries the default-group CAS that clears `staged_visibility_active` / `migration_job_id` and records `target_promotion_done=true`. Until then, reads pay the merge cost over an empty staged prefix. | None. |
 | Target group temporarily unreachable | Migrator retries with backoff; phase doesn't advance. | None. |
 | Source group temporarily unreachable | Same. Reads to source continue to fail with whatever transport error the adapter raises (independent of split). | Existing per-RPC retry. |
 | Duplicate ImportRangeVersions RPC | Importer compares the request's `(bracket_id, batch_seq)` to the per-bracket high-water mark under `!migstage|ack|<job_id>|<bracket_id>` (§6.1.1); drops any batch at or below it; returns the stored `acked_cursor`. Empty progress chunks use the same path, so a scan-budget-only chunk advances cursor / batch_seq without MVCC writes or HLC advancement. | None. |
@@ -924,11 +936,12 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 - `kv/migrator_lock_drain_test.go`: route-faithful txn-lock drain (§3.2a.0a). Table-driven over key families. **Must include a DynamoDB-item-lock case**: a lock stored at `!txn|lock|!ddb|item|<table>|<pk>` whose routing key is `!ddb|route|table|<table>` MUST be counted by a drain over the moving range `[!ddb|route|table|<table>, !ddb|route|table|<table>\xff)` — proving the drain scans the `!txn|lock|` family and filters by `routeKey(lockedKey)`, NOT by a raw `[txnLockKey(routeStart), txnLockKey(routeEnd))` bracket (which would sort `!txn|lock|!ddb|item|...` outside the bracket and falsely report the drain empty). Mirror cases for SQS (`!txn|lock|!sqs|...` → `!sqs|route|global`), Redis/list, and a plain user key (raw == routing, the trivial case). Negative cases: a same-table lock for a key whose routing falls outside `[routeStart, routeEnd)` is NOT counted; an unrelated-family lock is NOT counted. The same predicate backs §6.1.0's snapshot prepare scan and §3.2a step 0b's post-fence drain — assert all three call sites share it.
 - `kv/migrator_export_plan_test.go`: `PlanExportBrackets` includes every family whose `routeKey()` maps into the routing namespace. Required cases: DynamoDB table metadata (`!ddb|meta|table|`), DynamoDB generation (`!ddb|meta|gen|`), DynamoDB item/GSI, txn/list/redis/SQS/S3, plus a red control where omitting the metadata brackets makes `loadTableSchemaAt` / `loadTableGenerationAt` fail after CUTOVER. Also assert `RouteKeyFilter(routeStart, nil)` and `RouteKeyFilter(routeStart, []byte{})` both treat the end as unbounded and accept keys in the rightmost route.
 - `distribution/catalog_test.go`: SplitJob codec round-trip + version-1 stability.
-- `store/mvcc_store_export_test.go`: snapshot semantics — exported versions match a reader at `maxCommitTS`; intent locks excluded; cursor monotonic; `maxScannedBytes` budget bounds a sparse-bracket call (returns a partial/empty chunk + advancing cursor at `done=false` instead of scanning the full prefix).
-- `store/mvcc_store_import_test.go`: idempotency under duplicate `(bracket_id, batch_seq)` (a replayed batch at or below the per-bracket high-water mark is a no-op that returns the stored `acked_cursor`; parallel brackets do not clobber each other's ack record); zero-version progress chunk persists `(batch_seq, cursor)` without MVCC writes, `metaLastCommitTS` / HLC advancement, or `max_imported_ts` changes; key_family dispatch.
+- `store/mvcc_store_export_test.go`: raw committed-version semantics — export walks MVCC versions in `(minCommitTS, maxCommitTS]` without the read-visible filter; includes delete tombstones and TTL versions even when `ExpireAt <= maxCommitTS`; preserves `expire_at`; excludes only intent locks; cursor monotonic; `maxScannedBytes` budget bounds a sparse-bracket call (returns a partial/empty chunk + advancing cursor at `done=false` instead of scanning the full prefix). Red control: a reader-visible export loses a DELTA_COPY delete tombstone after BACKFILL copied an older value.
+- `store/mvcc_store_import_test.go`: idempotency under duplicate `(bracket_id, batch_seq)` (a replayed batch at or below the per-bracket high-water mark is a no-op that returns the stored `acked_cursor`; parallel brackets do not clobber each other's ack record); zero-version progress chunk persists `(batch_seq, cursor)` without MVCC writes, `metaLastCommitTS` / HLC advancement, or `max_imported_ts` changes; key_family dispatch; tombstone versions import via `DeleteAt`; non-tombstone TTL versions import via `PutAt(value, commit_ts, expire_at)` and reads after the original expiry hide the value.
 - `kv/txn_codec_test.go`: M2-PR0 `txnLock` value round-trip with `commit_ts` plus backward-compat decode of an old lock value without the field (zero → migrator fallback path).
 - `kv/fsm_route_fenced_test.go`: FENCE rejection at FSM (table-driven over key families, mirroring `fsm_composed1_test.go`).
 - `kv/fsm_cutover_read_fence_test.go`: §7.2.2e pending source read fence and §7.2.2 fail-closed ownership lookup. Assert point reads and scans intersecting the moving range with `read_route_version < expected_cutover_version` never touch source MVCC; before the catalog CAS they return `ErrRouteCutoverPending`, after the CAS they return `ErrRouteMoved`; when `max_cutover_version_seen > source_local_version` and the default-group ownership RPC times out/unreachable, both point reads and scan-interval checks return `ErrRouteOwnershipUnknown` and do not read source MVCC; non-intersecting left-half reads continue; `ClearCutoverReadFence` reopens reads only when the CAS did not commit.
+- `kv/fsm_promote_staged_test.go`: target-local `PromotionState` (§6.4). Assert `PromoteStaged` copies a bounded staged batch, deletes the staged rows, and advances `promote_cursor` in one target-group apply; a replay is idempotent by `(raw_key, commit_ts)`; a leader flap resumes from the target-local cursor; the default-group DONE CAS is attempted only after target-local `done=true`.
 - `kv/sharded_coordinator_route_fenced_test.go`: coordinator-side rejection + retry-after surfacing.
 - Property tests (`pgregory.net/rapid`): replay a sequence of (export-chunks, import-acks, leader-flap) and assert (a) all source keys land on target, (b) no duplicates committed at any commit_ts.
 
@@ -937,9 +950,11 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 - `kv/integration_split_test.go`: same-group split (M1 regression) + cross-group split happy path.
 - Migrator restart mid-phase: cursor recovery, no double-apply.
 - Concurrent writes during BACKFILL (fence is not yet up; writes still serve from source, get exported with their commit_ts ≤ snapshot_ts excluded, delta-copied in (delta_floor, fence_ts]).
+- **DELTA_COPY tombstone and TTL preservation (§6.1 / §6.2).** BACKFILL copies `K@10`, the source deletes `K@20 <= fence_ts`, and DELTA_COPY exports the delete tombstone so the target hides `K@10` after CUTOVER. A parallel TTL case writes `K@10` with `expire_at=30`, migrates before expiry, then asserts reads at `read_ts < 30` see the value and reads at `read_ts >= 30` do not. Controls: reader-visible export drops the tombstone; import without `expire_at` makes the TTL value non-expiring.
 - **Post-scan low-ts prepare (§6.1.0 fence-before-boundary, codex round-15 P1).** A prepare lands between the pre-BACKFILL snapshot scan and the fence with a caller-supplied / lagging-clock `commit_ts ≤ snapshot_ts`, then commits after the BACKFILL iterator passed its key. Assert: (a) the §6.1.0 step-2 running minimum captures the prepare's `commit_ts` on the next migrator tick, (b) `delta_floor` is finalised below it only after step 0b's post-fence drain returns empty, (c) DELTA_COPY's `(delta_floor, fence_ts]` window exports the committed version, (d) it is present on the target after CUTOVER. A control case with the finalisation moved *before* the fence must drop the write (red test guarding the fix's ordering).
 - **Moved-secondary, outside-primary multi-shard prepare (§6.1.0 step 2, codex round-16 P1).** A 2PC txn whose primary key routes to a group **outside** the moving range and whose secondary key routes **into** the moving range, prepared with a low caller-supplied `commit_ts ≤ snapshot_ts`, then committed after BACKFILL passed the secondary key. Assert: (a) the running minimum is lowered by the secondary's `commit_ts` (via the live secondary lock and the moving-range committed-version backstop), (b) DELTA_COPY's `(delta_floor, fence_ts]` window exports the committed secondary version, (c) it is present on the target after CUTOVER. Control: a build that scopes the running minimum to moved primaries (and relies on the primary-keyed `!txn|cmt|` record, which routes outside) must drop the secondary version — red test for this fix.
 - **CUTOVER source-read barrier (§7.2.2e, codex round-17 P1).** Pause the source catalog watcher/heartbeat delivery after the source-side `ArmCutoverReadFence` ACK but before the source applies the CUTOVER snapshot; let another coordinator refresh against the default group and write/read on the target after CUTOVER. A stale coordinator's point read and cross-boundary scan routed to the source must return `ErrRouteMoved`/retry, never the pre-CUTOVER source value. Also inject default-group ownership RPC timeout/unreachable while `max_cutover_version_seen > source_local_version`; the source must return `ErrRouteOwnershipUnknown` for both point and scan requests without touching source MVCC, and the coordinator must retry through `WatcherRefresh`. Control: disabling the arm barrier or treating timeout as source-owned reproduces the stale read.
+- **Promotion ownership handoff (§6.4).** Kill the target leader after a `PromoteStaged` apply, and kill the default leader after target-local `PromotionState.done=true` but before the default-group CAS clears `staged_visibility_active`. Assert no staged rows are skipped, range reads keep using the staged/live merge until the CAS lands, and retrying the CAS reaches DONE without data changes.
 - Cross-shard txn coordinated through `kv/transaction.go` straddling the split key — must serialize correctly across CUTOVER.
 
 ### 10.3 Jepsen
@@ -954,8 +969,8 @@ Throttling: chunk-bytes default 1 MiB, inter-chunk pacing default 5 ms. Both con
 
 | Lens | M2-specific risk |
 |---|---|
-| Data loss | CUTOVER atomicity; ImportRangeVersions idempotency; the BACKFILL/DELTA_COPY commit-ts windows have no gap. |
-| Concurrency | Migrator goroutine vs leadership election; FENCE visibility timing on followers; AbandonJob race with phase advance. |
+| Data loss | CUTOVER atomicity; ImportRangeVersions idempotency; the BACKFILL/DELTA_COPY commit-ts windows have no gap; raw MVCC export preserves tombstones and TTL expiry headers. |
+| Concurrency | Migrator goroutine vs leadership election; FENCE visibility timing on followers; target-local promotion cursor vs default-group visibility CAS; AbandonJob race with phase advance. |
 | Performance | Chunk size vs gRPC frame limit; pacing default vs prod throughput; cursor lookup cost per import. |
 | Data consistency | Composed-1 alignment at CUTOVER; reader at `≤ fence_ts` on source vs reader at `≥ catalog_version+1` on target; internal-key route mapping. |
 | Test coverage | Property tests over chunk-then-restart sequences; FSM unit for FENCE; Jepsen split + nemesis. |
@@ -968,12 +983,12 @@ Phased into reviewable PRs, each lands behind its own doc-or-test gate:
 |---|---|---|
 | M2-PR0 | Add `commit_ts` to the `txnLock` wire value on the Raft-applied lock-write path; decoder backward-compat for existing lock values without the field (zero → migrator fallback to direct commit-record lookup / pending drain) | `kv/txn_codec_test.go` round-trip + backward-compat case |
 | M2-PR1 | SplitJob codec + reserved-key layout + catalog read/write helpers | catalog_test |
-| M2-PR2 | `proto/distribution.proto` + `proto/internal.proto` regen; wire fields plumbed but unused | proto regen; build |
-| M2-PR3 | `store/MVCCStore.ExportVersions` + `ImportVersions` with idempotency, no migrator wiring | store unit + property |
+| M2-PR2 | `proto/distribution.proto` + `proto/internal.proto` regen (`MVCCVersion.expire_at`, bracket/batch identity, scan-budget fields); wire fields plumbed but unused | proto regen; build |
+| M2-PR3 | `store/MVCCStore.ExportVersions` raw committed-version export + `ImportVersions` with idempotency, tombstone/`expire_at` preservation, no migrator wiring | store unit incl. tombstone/TTL cases + property |
 | M2-PR4 | `distribution/migrator.go` state machine + export bracket planner — same-group target (no-op data move) to lock the state shape | migrator unit + `migrator_export_plan_test` |
 | M2-PR5 | Coordinator + FSM FENCE rejection (`ErrRouteWriteFenced`) + route-faithful txn-lock drain (§3.2a.0a) | fsm + coordinator unit + `migrator_lock_drain_test` |
-| M2-PR6 | Cross-group end-to-end: ExportRangeVersions / ImportRangeVersions server-side handlers + migrator BACKFILL/DELTA_COPY + §7.2.2e source-side cutover read-fence arm | integration + `kv/fsm_cutover_read_fence_test.go` |
-| M2-PR7 | AbandonSplitJob + CLEANUP GC + Jepsen split workload | jepsen suite |
+| M2-PR6 | Cross-group end-to-end: ExportRangeVersions / ImportRangeVersions server-side handlers + migrator BACKFILL/DELTA_COPY + §7.2.2e source-side cutover read-fence arm | integration incl. delete/TTL DELTA_COPY cases + `kv/fsm_cutover_read_fence_test.go` |
+| M2-PR7 | Target-local `PromotionState` + background promoter + ordered default-group DONE CAS; AbandonSplitJob + CLEANUP GC + Jepsen split workload | `kv/fsm_promote_staged_test.go` + jepsen suite |
 | M2-PR8 | Rename `*_proposed_*` → `*_partial_*` after PR1 ships; update parent partial doc M2 status; rename to `*_implemented_*` after PR7 |  |
 
 Each PR follows the five-lens self-review and is gated by its tests + `make lint`.
