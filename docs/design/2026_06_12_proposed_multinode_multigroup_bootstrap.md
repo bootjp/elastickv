@@ -68,26 +68,29 @@ Grammar:
 - Each entry is `groupID=member,member,…`.
 - Each `member` is `raftID@host:port` — the `@` separates the node's stable Raft ID (matching `--raftId` semantics) from its listener address for that group. (`raftID` is needed explicitly because etcd's bootstrap requires the same `id→address` mapping on every node, `cmd/server/demo.go:215-219`; the address alone is not the identity.)
 
-Concrete 3-node × 2-group local example (all nodes share the same `--raftGroupPeers`; `--raftGroups` and protocol maps name only that node's local listeners):
+Concrete 3-node × 2-group local example (all nodes share the same `--raftGroupPeers` and full N×M `--raftRedisMap`; `--raftGroups` names only that node's local raft listeners):
 
 ```
+RAFT_GROUP_PEERS="1=n1@127.0.0.1:5051,n2@127.0.0.1:5052,n3@127.0.0.1:5053;2=n1@127.0.0.1:5054,n2@127.0.0.1:5055,n3@127.0.0.1:5056"
+RAFT_REDIS_MAP="127.0.0.1:5051=127.0.0.1:6379,127.0.0.1:5052=127.0.0.1:6380,127.0.0.1:5053=127.0.0.1:6381,127.0.0.1:5054=127.0.0.1:6382,127.0.0.1:5055=127.0.0.1:6383,127.0.0.1:5056=127.0.0.1:6384"
+
 # node n1
 --raftId n1 \
 --raftGroups "1=127.0.0.1:5051,2=127.0.0.1:5054" \
---raftGroupPeers "1=n1@127.0.0.1:5051,n2@127.0.0.1:5052,n3@127.0.0.1:5053;2=n1@127.0.0.1:5054,n2@127.0.0.1:5055,n3@127.0.0.1:5056" \
---raftRedisMap "127.0.0.1:5051=127.0.0.1:6379,127.0.0.1:5054=127.0.0.1:6382"
+--raftGroupPeers "$RAFT_GROUP_PEERS" \
+--raftRedisMap "$RAFT_REDIS_MAP"
 
 # node n2
 --raftId n2 \
 --raftGroups "1=127.0.0.1:5052,2=127.0.0.1:5055" \
---raftGroupPeers "1=n1@127.0.0.1:5051,n2@127.0.0.1:5052,n3@127.0.0.1:5053;2=n1@127.0.0.1:5054,n2@127.0.0.1:5055,n3@127.0.0.1:5056" \
---raftRedisMap "127.0.0.1:5052=127.0.0.1:6380,127.0.0.1:5055=127.0.0.1:6383"
+--raftGroupPeers "$RAFT_GROUP_PEERS" \
+--raftRedisMap "$RAFT_REDIS_MAP"
 
 # node n3
 --raftId n3 \
 --raftGroups "1=127.0.0.1:5053,2=127.0.0.1:5056" \
---raftGroupPeers "1=n1@127.0.0.1:5051,n2@127.0.0.1:5052,n3@127.0.0.1:5053;2=n1@127.0.0.1:5054,n2@127.0.0.1:5055,n3@127.0.0.1:5056" \
---raftRedisMap "127.0.0.1:5053=127.0.0.1:6381,127.0.0.1:5056=127.0.0.1:6384"
+--raftGroupPeers "$RAFT_GROUP_PEERS" \
+--raftRedisMap "$RAFT_REDIS_MAP"
 ```
 
 **Why a new flag rather than extending `--raftGroups` entry syntax.** `--raftGroups` entries are `id=addr` and that `addr` is *this node's own* listener (`groupSpec.address`, used as `LocalAddress`, `multiraft_runtime.go:248`). Overloading it to also carry the full member list would make every node's `--raftGroups` value identical across the cluster *except* that the local-address role would have to be inferred — error-prone. A separate `--raftGroupPeers` keeps "what do I listen on" (`--raftGroups`) cleanly separate from "who are the voters" (`--raftGroupPeers`), and mirrors how single-group already separates `--address`/`--raftGroups` from `--raftBootstrapMembers`.
@@ -150,7 +153,7 @@ With `--raftGroupPeers` empty, `resolveBootstrapServers` runs unchanged (`main.g
 `cmd/server/demo.go` bootstraps one group across 3 nodes via `raftPeers` (`:204-219`); it never reads `--raftGroupPeers`. Unchanged.
 
 ### 4.3 Per-protocol address maps
-`--raftRedisMap` / `--raftDynamoMap` / `--raftS3Map` / `--raftSqsMap` map *Raft listener address → protocol listener address* (`parseRaftAddressMap`, `shard_config.go:327-350`; consumed in `multiraft_runtime.go` group→protocol wiring). They are about *where a group exposes its protocol endpoint*, not *who votes in the group*, so they are orthogonal and unchanged. (In a true multi-node deployment an operator already supplies these per node; the new flag does not alter that.)
+`--raftRedisMap` / `--raftDynamoMap` / `--raftS3Map` / `--raftSqsMap` map *Raft listener address → protocol listener address* (`parseRaftAddressMap`, `shard_config.go:327-350`; consumed in `multiraft_runtime.go` group→protocol wiring). They are about *where a group exposes its protocol endpoint*, not *who votes in the group*, so they are orthogonal and unchanged. In a true multi-node deployment, every node that accepts follower ingress must include entries for every possible leader raft address, not just its local listeners: Redis `leaderClientForKey` indexes the map by `RaftLeaderForKey` (`adapter/redis.go:4282-4288`), and the HTTP leader proxy indexes by `RaftLeader()` (`adapter/leader_http_proxy.go:47-54`). A local-only map works only if clients always connect directly to the current leader.
 
 ### 4.4 Encryption startup ordering
 The encryption writer-registration startup path (`main_encryption_registration.go`) is **leader-relative, not single-node-per-group**, so it already tolerates multi-voter groups. `buildProcessStartRegistrationGate` proposes through the **default group** and, when this node is not the default-group leader, **forwards to the current leader** over `EncryptionAdmin` with bounded retry (`proposeWriterRegistration`, `:472-520`; `IsLeader()`/`RaftLeader()` gating, `:482-511`). It assumes only that a default-group leader exists and is reachable — which is *more* true with a multi-voter default group, not less. The `raft-engine` marker and per-group dirs are already per group (§1.2). No encryption guard assumes a single-node-per-group bootstrap order; nothing here changes. (The five-lens "data consistency" review per PR must still confirm the registration forward path behaves when the default group is mid-election at boot, but that is an existing property, not new.)
