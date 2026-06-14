@@ -661,7 +661,7 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 	}
 
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -680,7 +680,7 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 		return nil, errors.WithStack(err)
 	}
 
-	meta, exists, err := r.resolveListMeta(context.Background(), key, readTS)
+	meta, exists, err := r.resolveListMeta(ctx, key, readTS)
 	if err != nil {
 		return nil, err
 	}
@@ -693,7 +693,7 @@ func (r *RedisServer) rangeList(ctx context.Context, key []byte, startRaw, endRa
 		return nil, err
 	}
 
-	return r.fetchListRange(context.Background(), key, meta, int64(s), int64(e), readTS)
+	return r.fetchListRange(ctx, key, meta, int64(s), int64(e), readTS)
 }
 
 type listPushFunc func(ctx context.Context, key []byte, values [][]byte) (int64, error)
@@ -772,7 +772,7 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
@@ -782,7 +782,7 @@ func (r *RedisServer) ltrim(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeList {
 			return wrongTypeError()
 		}
-		current, err := r.listValuesAt(context.Background(), cmd.Args[1], readTS)
+		current, err := r.listValuesAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}

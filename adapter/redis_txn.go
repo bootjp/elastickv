@@ -31,10 +31,6 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdPExpire: (*txnContext).applyExpireMilliseconds,
 }
 
-// argsLen is derived from redisCommandSpecs in adapter/redis_command_specs.go.
-// See that file for the canonical row list and the rationale for the
-// single source of truth.
-
 // MULTI/EXEC/DISCARD handling
 func (r *RedisServer) multi(conn redcon.Conn, _ redcon.Command) {
 	state := getConnState(conn)
@@ -178,6 +174,13 @@ func (t *txnContext) trackTypeReadKeys(key []byte) {
 	}
 }
 
+func (t *txnContext) ctxOrBackground() context.Context {
+	if t.ctx != nil {
+		return t.ctx
+	}
+	return context.Background()
+}
+
 func (t *txnContext) load(key []byte) (*txnValue, error) {
 	// If the key is already an internal key (e.g., !redis|hash|...,
 	// !lst|..., !txn|..., !ddb|..., !s3|..., !dist|...), use it as-is.
@@ -210,16 +213,7 @@ func (t *txnContext) load(key []byte) (*txnValue, error) {
 		tv.ttl = ttl
 	} else {
 		var err error
-		// Some redis_txn_test.go fixtures build a minimal txnContext
-		// literal without setting ctx; fall back to Background so
-		// readValueAt's coordinator.VerifyLeaderForKey does not panic
-		// when wrapped via context.WithTimeout(nil, …). Same defensive
-		// pattern as streamDeletions / loadListState.
-		ctx := t.ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		val, err = t.server.readValueAt(ctx, storageKey, t.startTS)
+		val, err = t.server.readValueAt(t.ctxOrBackground(), storageKey, t.startTS)
 		if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 			return nil, errors.WithStack(err)
 		}
@@ -235,7 +229,7 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	if st, ok := t.listStates[k]; ok {
 		return st, nil
 	}
-	ctx := context.Background()
+	ctx := t.ctxOrBackground()
 	meta, exists, err := t.server.resolveListMeta(ctx, key, t.startTS)
 	if err != nil {
 		return nil, err
@@ -311,15 +305,16 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	}
 
 	// Detect wide-column storage by probing the !zs|mem| prefix.
+	ctx := t.ctxOrBackground()
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberEnd := store.PrefixScanEnd(memberPrefix)
-	probeKVs, probeErr := t.server.store.ScanAt(context.Background(), memberPrefix, memberEnd, 1, t.startTS)
+	probeKVs, probeErr := t.server.store.ScanAt(ctx, memberPrefix, memberEnd, 1, t.startTS)
 	if probeErr != nil {
 		return nil, errors.WithStack(probeErr)
 	}
 	isWide := len(probeKVs) > 0
 
-	value, exists, err := t.server.loadZSetAt(context.Background(), key, t.startTS)
+	value, exists, err := t.server.loadZSetAt(ctx, key, t.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +339,7 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 	if st, ok := t.ttlStates[k]; ok {
 		return st, nil
 	}
-	value, err := t.server.ttlAt(context.Background(), key, t.startTS)
+	value, err := t.server.ttlAt(t.ctxOrBackground(), key, t.startTS)
 	if err != nil {
 		return nil, err
 	}
@@ -365,7 +360,7 @@ func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 		return typ, nil
 	}
 	t.trackTypeReadKeys(key)
-	return t.server.keyTypeAt(context.Background(), key, t.startTS)
+	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
 }
 
 func (t *txnContext) stagedZSetType(key string) (redisValueType, bool) {
@@ -421,7 +416,7 @@ func (t *txnContext) applyExpireMilliseconds(cmd redcon.Command) (redisResult, e
 }
 
 func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
-	if isList, err := t.server.isListKeyAt(context.Background(), cmd.Args[1], t.startTS); err != nil {
+	if isList, err := t.server.isListKeyAt(t.ctxOrBackground(), cmd.Args[1], t.startTS); err != nil {
 		return redisResult{}, err
 	} else if isList {
 		return redisResult{typ: resultError, err: errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")}, nil
@@ -665,7 +660,7 @@ func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Durati
 	state.value = &expireAt
 	state.dirty = true
 	if typ == redisTypeString {
-		plain, err := t.server.isPlainRedisString(context.Background(), key, t.startTS)
+		plain, err := t.server.isPlainRedisString(t.ctxOrBackground(), key, t.startTS)
 		if err != nil {
 			return redisResult{}, err
 		}
@@ -774,14 +769,15 @@ func parseRangeBounds(startRaw, endRaw []byte, total int) (int, int, error) {
 
 func (t *txnContext) listRangeValues(key []byte, st *listTxnState, s, e int) ([]string, error) {
 	persistedLen := int(st.meta.Len)
+	ctx := t.ctxOrBackground()
 
 	switch {
 	case e < persistedLen:
-		return t.server.fetchListRange(context.Background(), key, st.meta, int64(s), int64(e), t.startTS)
+		return t.server.fetchListRange(ctx, key, st.meta, int64(s), int64(e), t.startTS)
 	case s >= persistedLen:
 		return appendValues(st.appends, s-persistedLen, e-persistedLen), nil
 	default:
-		head, err := t.server.fetchListRange(context.Background(), key, st.meta, int64(s), int64(persistedLen-1), t.startTS)
+		head, err := t.server.fetchListRange(ctx, key, st.meta, int64(s), int64(persistedLen-1), t.startTS)
 		if err != nil {
 			return nil, err
 		}

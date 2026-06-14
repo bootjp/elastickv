@@ -48,7 +48,7 @@ func (r *RedisServer) getdel(conn redcon.Conn, cmd redcon.Command) {
 	var v []byte
 	err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		typ, err := r.keyTypeAt(ctx, key, readTS)
 		if err != nil {
 			return err
 		}

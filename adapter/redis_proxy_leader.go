@@ -352,7 +352,7 @@ func (r *RedisServer) readValueAt(ctx context.Context, key []byte, readTS uint64
 		// that ttlAt would otherwise make.
 		nonStringInternal = !bytes.HasPrefix(key, []byte(redisStrPrefix))
 	}
-	expired, err := r.hasExpired(context.Background(), ttlKey, readTS, nonStringInternal)
+	expired, err := r.hasExpired(ctx, ttlKey, readTS, nonStringInternal)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +368,7 @@ func (r *RedisServer) readValueAt(ctx context.Context, key []byte, readTS uint64
 		if err := r.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
 			return nil, errors.WithStack(err)
 		}
-		v, err := r.store.GetAt(context.Background(), key, readTS)
+		v, err := r.store.GetAt(ctx, key, readTS)
 		return v, errors.WithStack(err)
 	}
 	return r.tryLeaderGetAt(key, readTS)

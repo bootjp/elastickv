@@ -186,7 +186,7 @@ func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context
 		if err := r.validateExactSetKind(kind, key, readTS); err != nil {
 			return err
 		}
-		value, err := r.loadSetAt(context.Background(), kind, key, readTS)
+		value, err := r.loadSetAt(ctx, kind, key, readTS)
 		if err != nil {
 			return err
 		}

@@ -489,7 +489,9 @@ func (r *RedisServer) selectDB(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) quit(conn redcon.Conn, _ redcon.Command) {
 	conn.WriteString("OK")
-	_ = conn.Close()
+	if err := conn.Close(); err != nil {
+		log.Printf("redis quit close failed: %v", err)
+	}
 }
 
 func (r *RedisServer) typeCmd(conn redcon.Conn, cmd redcon.Command) {

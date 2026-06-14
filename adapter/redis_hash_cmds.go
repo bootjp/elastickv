@@ -539,7 +539,7 @@ func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) 
 	// Wide-column path: check if any !hs|fld| keys exist for this key.
 	hashFieldPrefix := store.HashFieldScanPrefix(key)
 	hashFieldEnd := store.PrefixScanEnd(hashFieldPrefix)
-	wideKVs, err := r.store.ScanAt(context.Background(), hashFieldPrefix, hashFieldEnd, 1, readTS)
+	wideKVs, err := r.store.ScanAt(ctx, hashFieldPrefix, hashFieldEnd, 1, readTS)
 	if err != nil {
 		return 0, cockerrors.WithStack(err)
 	}
@@ -548,7 +548,7 @@ func (r *RedisServer) hdelTxn(ctx context.Context, key []byte, fields [][]byte) 
 	}
 
 	// Legacy blob path.
-	value, err := r.loadHashAt(context.Background(), key, readTS)
+	value, err := r.loadHashAt(ctx, key, readTS)
 	if err != nil {
 		return 0, err
 	}
