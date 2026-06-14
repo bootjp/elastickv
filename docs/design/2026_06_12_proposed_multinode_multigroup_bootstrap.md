@@ -72,22 +72,25 @@ Concrete 3-node × 2-group local example (all nodes share the same `--raftGroupP
 
 ```
 RAFT_GROUP_PEERS="1=n1@127.0.0.1:5051,n2@127.0.0.1:5052,n3@127.0.0.1:5053;2=n1@127.0.0.1:5054,n2@127.0.0.1:5055,n3@127.0.0.1:5056"
-RAFT_REDIS_MAP="127.0.0.1:5051=127.0.0.1:6379,127.0.0.1:5052=127.0.0.1:6380,127.0.0.1:5053=127.0.0.1:6381,127.0.0.1:5054=127.0.0.1:6382,127.0.0.1:5055=127.0.0.1:6383,127.0.0.1:5056=127.0.0.1:6384"
+RAFT_REDIS_MAP="127.0.0.1:5051=127.0.0.1:6379,127.0.0.1:5054=127.0.0.1:6379,127.0.0.1:5052=127.0.0.1:6380,127.0.0.1:5055=127.0.0.1:6380,127.0.0.1:5053=127.0.0.1:6381,127.0.0.1:5056=127.0.0.1:6381"
 
 # node n1
 --raftId n1 \
+--redisAddress "127.0.0.1:6379" \
 --raftGroups "1=127.0.0.1:5051,2=127.0.0.1:5054" \
 --raftGroupPeers "$RAFT_GROUP_PEERS" \
 --raftRedisMap "$RAFT_REDIS_MAP"
 
 # node n2
 --raftId n2 \
+--redisAddress "127.0.0.1:6380" \
 --raftGroups "1=127.0.0.1:5052,2=127.0.0.1:5055" \
 --raftGroupPeers "$RAFT_GROUP_PEERS" \
 --raftRedisMap "$RAFT_REDIS_MAP"
 
 # node n3
 --raftId n3 \
+--redisAddress "127.0.0.1:6381" \
 --raftGroups "1=127.0.0.1:5053,2=127.0.0.1:5056" \
 --raftGroupPeers "$RAFT_GROUP_PEERS" \
 --raftRedisMap "$RAFT_REDIS_MAP"
@@ -153,7 +156,7 @@ With `--raftGroupPeers` empty, `resolveBootstrapServers` runs unchanged (`main.g
 `cmd/server/demo.go` bootstraps one group across 3 nodes via `raftPeers` (`:204-219`); it never reads `--raftGroupPeers`. Unchanged.
 
 ### 4.3 Per-protocol address maps
-`--raftRedisMap` / `--raftDynamoMap` / `--raftS3Map` / `--raftSqsMap` map *Raft listener address → protocol listener address* (`parseRaftAddressMap`, `shard_config.go:327-350`; consumed in `multiraft_runtime.go` group→protocol wiring). They are about *where a group exposes its protocol endpoint*, not *who votes in the group*, so they are orthogonal and unchanged. In a true multi-node deployment, every node that accepts follower ingress must include entries for every possible leader raft address, not just its local listeners: Redis `leaderClientForKey` indexes the map by `RaftLeaderForKey` (`adapter/redis.go:4282-4288`), and the HTTP leader proxy indexes by `RaftLeader()` (`adapter/leader_http_proxy.go:47-54`). A local-only map works only if clients always connect directly to the current leader.
+`--raftRedisMap` / `--raftDynamoMap` / `--raftS3Map` / `--raftSqsMap` map *Raft listener address → protocol listener address* (`parseRaftAddressMap`, `shard_config.go:327-350`; consumed in `multiraft_runtime.go` group→protocol wiring). They are about *where a group exposes its protocol endpoint*, not *who votes in the group*, so they are orthogonal and unchanged. In a true multi-node deployment, every node that accepts follower ingress must include entries for every possible leader raft address, not just its local listeners: Redis `leaderClientForKey` indexes the map by `RaftLeaderForKey` (`adapter/redis.go:4282-4288`), and the HTTP leader proxy indexes by `RaftLeader()` (`adapter/leader_http_proxy.go:47-54`). When one process hosts multiple groups, those groups' raft addresses can map to the same per-process protocol listener, such as the single Redis listener from `--redisAddress` (`main.go:85`, `main.go:1647-1655`). A local-only map works only if clients always connect directly to the current leader.
 
 ### 4.4 Encryption startup ordering
 The encryption writer-registration startup path (`main_encryption_registration.go`) is **leader-relative, not single-node-per-group**, so it already tolerates multi-voter groups. `buildProcessStartRegistrationGate` proposes through the **default group** and, when this node is not the default-group leader, **forwards to the current leader** over `EncryptionAdmin` with bounded retry (`proposeWriterRegistration`, `:472-520`; `IsLeader()`/`RaftLeader()` gating, `:482-511`). It assumes only that a default-group leader exists and is reachable — which is *more* true with a multi-voter default group, not less. The `raft-engine` marker and per-group dirs are already per group (§1.2). No encryption guard assumes a single-node-per-group bootstrap order; nothing here changes. (The five-lens "data consistency" review per PR must still confirm the registration forward path behaves when the default group is mid-election at boot, but that is an existing property, not new.)
