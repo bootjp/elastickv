@@ -3,7 +3,7 @@
 Status: Proposed
 Author: bootjp
 Date: 2026-06-12
-<!-- Propose date source: git log --follow --diff-filter=A shows 252df5601700821c7bee7b642c9f0d758103f85f authored on 2026-06-12. -->
+Date source: first add commit `252df5601700821c7bee7b642c9f0d758103f85f` (`git log --follow --diff-filter=A`), authored on 2026-06-12.
 
 Sibling / prerequisite-for:
 - [Leader-balance scheduler design PR #953](https://github.com/bootjp/elastickv/pull/953) §1.1a (PR0) + OQ-9 — this doc **is** that PR0. The leader-balance scheduler's transfer-issuing milestones (PR2/PR3) are blocked on a Raft group whose voter set spans more than one node; that topology cannot be declared at startup today, and OQ-9 resolved "option (a): extend the bootstrap/flag surface." This document is the design for option (a).
