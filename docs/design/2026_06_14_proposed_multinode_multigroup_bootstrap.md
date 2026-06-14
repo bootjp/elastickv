@@ -109,8 +109,9 @@ RAFT_REDIS_MAP="127.0.0.1:5051=127.0.0.1:6379,127.0.0.1:5054=127.0.0.1:6379,127.
 1. Every group ID in `--raftGroupPeers` must appear in `--raftGroups`, and (v1 homogeneous goal) **every** group in `--raftGroups` must appear in `--raftGroupPeers` when the flag is non-empty. A group with no peer list would silently fall back to single-member — a foot-gun we reject.
 2. Each group's member list must **include the local node**: a `member` whose `raftID == --raftId` must be present, and its `host:port` must equal that group's `--raftGroups` local address (`groupSpec.address`). This is the per-group generalization of the existing single-group check `ErrBootstrapMembersLocalAddrMismatch` (`main.go:760-765`).
 3. No duplicate `raftID` within a group (mirrors `parseRaftBootstrapMembers`'s `duplicate id` check, `shard_config.go:373-375`).
-4. v1 homogeneity check: the set of `raftID`s must be **identical across all groups** (every node votes in every group). Violations are rejected with a clear error pointing at the first divergent group. (Relaxing this is OQ-4.)
-5. Each member's address must be non-empty and well-formed `host:port` (reuse existing address parsing).
+4. Each group must contain at least **two distinct voters**. A one-member list such as `1=n1@...;2=n1@...` recreates today's single-voter/no-transfer topology and is rejected; operators who want single-member groups leave `--raftGroupPeers` empty and use the existing path.
+5. v1 homogeneity check: the set of `raftID`s must be **identical across all groups** (every node votes in every group). Violations are rejected with a clear error pointing at the first divergent group. (Relaxing this is OQ-4.)
+6. Each member's address must be non-empty and well-formed `host:port` (reuse existing address parsing).
 
 ### 3.2 Bootstrap semantics
 
@@ -182,7 +183,7 @@ The encryption writer-registration startup path (`main_encryption_registration.g
 ## 6. Rollout / testing
 
 ### 6.1 Unit
-- **Flag parsing** (`shard_config.go`, table-driven, co-located `*_test.go`): `--raftGroupPeers` grammar — multiple groups (`;`-separated), `raftID@host:port` members, whitespace, empty ⇒ nil; every validation rule of §3.1 (unknown group, missing-group-when-non-empty, local-node-absent, local-addr-mismatch, duplicate raftID, homogeneity violation, mutual-exclusion with `--raftBootstrapMembers`). Pure-function determinism: same input ⇒ identical sorted `map[uint64][]Server`.
+- **Flag parsing** (`shard_config.go`, table-driven, co-located `*_test.go`): `--raftGroupPeers` grammar — multiple groups (`;`-separated), `raftID@host:port` members, whitespace, empty ⇒ nil; every validation rule of §3.1 (unknown group, missing-group-when-non-empty, local-node-absent, local-addr-mismatch, duplicate raftID, one-voter group, homogeneity violation, mutual-exclusion with `--raftBootstrapMembers`). Pure-function determinism: same input ⇒ identical sorted `map[uint64][]Server`.
 - **Per-group bootstrap-server resolution**: the new `map[uint64][]raftengine.Server` carries each group's own list; the empty-flag path returns today's behavior unchanged (regression-locks back-compat).
 - **Admin discovery seed** (`main_admin_test.go`): with `--raftGroupPeers`, derive non-self `NodeIdentity` members from the canonical group so `GetClusterOverview` includes remote nodes; empty-flag/single-group bootstrap keeps the existing `adminMembersFromBootstrap` behavior.
 - **Restart idempotency** (engine-level, `internal/raftengine/etcd/`): peers-file v3 round-trips current peers, the stored bootstrap seed, and the bootstrap-era marker; re-open a group dir with the same list ⇒ no re-bootstrap; re-open with a divergent flag-supplied list while the marker is active ⇒ PR-B's explicit bootstrap-seed validation returns `errClusterMismatch`; re-open after an `AddVoter`/`RemoveServer` conf-change flips the marker inactive with the original bootstrap flag still present ⇒ accepts the committed persisted peer set (add the multi-group-dir cases).
