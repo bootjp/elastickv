@@ -57,7 +57,7 @@ The only missing piece is a **flag/parse/wiring path that gives each group its o
 
 ### 3.1 Flag surface — per-group peer lists
 
-**Decision: add a companion flag `--raftGroupPeers`, and lift the `len(groups)==1` guard in `resolveBootstrapServers`.** Keep `--raftGroups` (group→local-address) exactly as is; declare the *cross-node* voter set per group in a new flag.
+**Decision: add a companion flag `--raftGroupPeers` with its own per-group resolver, while keeping `resolveBootstrapServers` and its `len(groups)==1` guard for `--raftBootstrapMembers`.** Keep `--raftGroups` (group→local-address) exactly as is; declare the *cross-node* voter set per group in a new flag.
 
 ```
 --raftGroupPeers "1=n1@host1:5051,n2@host2:5051,n3@host3:5051;2=n1@host1:5054,n2@host2:5054,n3@host3:5054"
@@ -191,7 +191,7 @@ Extend the multi-node story to Jepsen as a **later milestone** (noted, not v1): 
 | PR | Scope | Tests | Shippable alone? |
 |---|---|---|---|
 | **PR-A** | Flag + parse + validation: `--raftGroupPeers`, the §3.1 grammar and all validation rules, mutual-exclusion with `--raftBootstrapMembers`. No wiring change yet (parsed result unused). | Unit (§6.1) flag-parse table tests. | Yes — pure parsing, zero behavior change (result unconsumed). |
-| **PR-B** | Wiring: lift the `len(groups)==1` guard path for the new flag; thread the static per-group peer map through `buildShardGroups`/`buildRuntimeForGroup`; replace the process-wide `bootstrap bool` decision with per-group bootstrap derived from whether that group has a resolved peer list; validate flag-supplied peers against persisted peers before adopting persisted state. Each group now opens multi-voter. | Unit (§6.1) per-group resolution + restart idempotency; smoke that a 2-group config opens 2 transports. | After PR-A — the core capability. |
+| **PR-B** | Wiring: add the `--raftGroupPeers` resolver alongside the existing `resolveBootstrapServers` path, preserving the `--raftBootstrapMembers` single-group guard; thread the static per-group peer map through `buildShardGroups`/`buildRuntimeForGroup`; replace the process-wide `bootstrap bool` decision with per-group bootstrap derived from whether that group has a resolved peer list; validate flag-supplied peers against persisted peers before adopting persisted state. Each group now opens multi-voter. | Unit (§6.1) per-group resolution + restart idempotency; smoke that a 2-group config opens 2 transports. | After PR-A — the core capability. |
 | **PR-C** | In-process 3-node × 2-group integration harness (§6.2) + the leader-transfer-between-nodes smoke. | Integration (§6.2). | After PR-B — the deliverable #953 PR0 / hotspot-M2 need. |
 | **PR-D (later)** | Jepsen: true multi-node multi-group runner (§6.3). | Existing workloads, no-new-anomalies bar. | After PR-C; the "M6+" item. |
 
