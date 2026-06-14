@@ -339,7 +339,11 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 	if st, ok := t.ttlStates[k]; ok {
 		return st, nil
 	}
-	value, err := t.server.ttlAt(t.ctxOrBackground(), key, t.startTS)
+	ctx := t.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	value, err := t.server.ttlAt(ctx, key, t.startTS)
 	if err != nil {
 		return nil, err
 	}
