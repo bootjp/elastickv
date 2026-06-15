@@ -32,6 +32,7 @@ Optional environment:
   SERVER_ENTRYPOINT
   RAFT_ENGINE
   RAFT_PORT
+  RAFT_BOOTSTRAP_MEMBERS
   REDIS_PORT
   DYNAMO_PORT
   RAFT_TO_REDIS_MAP
@@ -140,6 +141,7 @@ Optional environment:
     attribute (for local plaintext development only).
 
 Notes:
+  - RAFT_BOOTSTRAP_MEMBERS is only forwarded when explicitly set.
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
   - If RAFT_TO_S3_MAP is unset, it is derived automatically from NODES,
@@ -243,6 +245,7 @@ LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS="${LEADERSHIP_TRANSFER_RETRY_BACKOFF_S
 NODES="${NODES:-}"
 SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
+RAFT_BOOTSTRAP_MEMBERS="${RAFT_BOOTSTRAP_MEMBERS:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
 RAFT_TO_SQS_MAP="${RAFT_TO_SQS_MAP:-}"
@@ -637,6 +640,7 @@ update_one_node() {
       NODE_HOST="$node_host" \
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
+      RAFT_BOOTSTRAP_MEMBERS="$RAFT_BOOTSTRAP_MEMBERS_Q" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
       RAFT_TO_SQS_MAP="$RAFT_TO_SQS_MAP_Q" \
@@ -1012,6 +1016,11 @@ run_container() {
   local keyviz_flags=()
   build_keyviz_flags keyviz_flags
 
+  local raft_bootstrap_flags=()
+  if [[ -n "${RAFT_BOOTSTRAP_MEMBERS:-}" ]]; then
+    raft_bootstrap_flags=(--raftBootstrapMembers "$RAFT_BOOTSTRAP_MEMBERS")
+  fi
+
   # config-fingerprint label drives the skip check on the next deploy
   # (see DEPLOY_CONFIG_FP_LABEL block above). Empty value here means
   # the deploy script was run on an old layout that didn't compute one
@@ -1039,6 +1048,7 @@ run_container() {
     --dynamoAddress "${NODE_HOST}:${DYNAMO_PORT}" \
     --raftId "$NODE_ID" \
     --raftEngine "$RAFT_ENGINE" \
+    "${raft_bootstrap_flags[@]}" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
     "${s3_flags[@]}" \
@@ -1286,6 +1296,7 @@ config_fp() {
     "$DATA_DIR" \
     "$NODE_HOST" "$NODE_ID" \
     "$RAFT_ENGINE" \
+    "$RAFT_BOOTSTRAP_MEMBERS" \
     "$RAFT_PORT" "$REDIS_PORT" "$DYNAMO_PORT" \
     "$RAFT_TO_REDIS_MAP" \
     "$ENABLE_S3" "$S3_PORT" "$S3_REGION" "$S3_PATH_STYLE_ONLY" \
@@ -1491,6 +1502,7 @@ DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
 SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
 RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
+RAFT_BOOTSTRAP_MEMBERS_Q="$(printf '%q' "$RAFT_BOOTSTRAP_MEMBERS")"
 RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
 RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 RAFT_TO_SQS_MAP_Q="$(printf '%q' "$RAFT_TO_SQS_MAP")"
