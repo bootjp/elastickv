@@ -338,6 +338,33 @@ func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipa
 	return AdminPurgeResult{GenerationBefore: oldGen, GenerationAfter: newGen}, nil
 }
 
+// AdminSetQueueAttributes is the SigV4-bypass counterpart to
+// SetQueueAttributes. It is intentionally generic rather than
+// DLQ-specific so the admin SPA can edit RedrivePolicy and
+// RedriveAllowPolicy through the same validator the public SQS API
+// uses.
+func (s *SQSServer) AdminSetQueueAttributes(ctx context.Context, principal AdminPrincipal, name string, attrs map[string]string) error {
+	if !principal.Role.canWrite() {
+		return ErrAdminForbidden
+	}
+	if !isVerifiedSQSLeader(ctx, s.coordinator) {
+		return ErrAdminNotLeader
+	}
+	if strings.TrimSpace(name) == "" || len(attrs) == 0 {
+		return ErrAdminSQSValidation
+	}
+	if _, err := s.setQueueAttributesWithRetry(ctx, name, attrs); err != nil {
+		if isSQSAdminQueueDoesNotExist(err) {
+			return ErrAdminSQSNotFound
+		}
+		if isSQSAdminValidationError(err) {
+			return ErrAdminSQSValidation
+		}
+		return errors.Wrap(err, "admin set queue attributes")
+	}
+	return nil
+}
+
 // AdminDeleteQueue is the SigV4-bypass counterpart to deleteQueue.
 // Returns the same sentinel errors as AdminCreateTable on the Dynamo
 // side: ErrAdminForbidden on a read-only principal, ErrAdminNotLeader
@@ -397,6 +424,9 @@ func metaAttributesForAdmin(meta *sqsQueueMeta, queueArn string) map[string]stri
 	if meta.RedrivePolicy != "" {
 		out["RedrivePolicy"] = meta.RedrivePolicy
 	}
+	if meta.RedriveAllowPolicy != "" {
+		out["RedriveAllowPolicy"] = meta.RedriveAllowPolicy
+	}
 	return out
 }
 
@@ -421,4 +451,17 @@ func isSQSAdminQueueDoesNotExist(err error) bool {
 		return false
 	}
 	return apiErr.errorType == sqsErrQueueDoesNotExist
+}
+
+func isSQSAdminValidationError(err error) bool {
+	var apiErr *sqsAPIError
+	if !errors.As(err, &apiErr) || apiErr == nil {
+		return false
+	}
+	switch apiErr.errorType {
+	case sqsErrValidation, sqsErrMissingParameter, sqsErrInvalidAttributeName, sqsErrInvalidAttributeValue:
+		return true
+	default:
+		return false
+	}
 }

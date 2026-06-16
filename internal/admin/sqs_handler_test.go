@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,20 +18,24 @@ import (
 // principal that flowed through to the source so tests can assert
 // live-role forwarding.
 type stubQueuesSource struct {
-	queues              []string
-	describeErr         error
-	deleteErr           error
-	peekErr             error
-	peekResult          PeekResult
-	purgeErr            error
-	purgeResult         PurgeResult
-	lastDeleteName      string
-	lastDeletePrincipal AuthPrincipal
-	lastPeekName        string
-	lastPeekPrincipal   AuthPrincipal
-	lastPeekOpts        PeekMessageOptions
-	lastPurgeName       string
-	lastPurgePrincipal  AuthPrincipal
+	queues                []string
+	describeErr           error
+	deleteErr             error
+	setAttrsErr           error
+	peekErr               error
+	peekResult            PeekResult
+	purgeErr              error
+	purgeResult           PurgeResult
+	lastDeleteName        string
+	lastDeletePrincipal   AuthPrincipal
+	lastSetAttrsName      string
+	lastSetAttrsPrincipal AuthPrincipal
+	lastSetAttrs          map[string]string
+	lastPeekName          string
+	lastPeekPrincipal     AuthPrincipal
+	lastPeekOpts          PeekMessageOptions
+	lastPurgeName         string
+	lastPurgePrincipal    AuthPrincipal
 }
 
 func (s *stubQueuesSource) AdminListQueues(_ context.Context) ([]string, error) {
@@ -62,6 +67,16 @@ func (s *stubQueuesSource) AdminDeleteQueue(_ context.Context, principal AuthPri
 		}
 	}
 	return ErrQueuesNotFound
+}
+
+func (s *stubQueuesSource) AdminSetQueueAttributes(_ context.Context, principal AuthPrincipal, name string, attrs map[string]string) error {
+	s.lastSetAttrsName = name
+	s.lastSetAttrsPrincipal = principal
+	s.lastSetAttrs = attrs
+	if s.setAttrsErr != nil {
+		return s.setAttrsErr
+	}
+	return nil
 }
 
 func (s *stubQueuesSource) AdminPeekQueue(_ context.Context, principal AuthPrincipal, name string, opts PeekMessageOptions) (PeekResult, error) {
@@ -184,6 +199,35 @@ func TestSqsHandler_DeleteQueue_NoRoleStore(t *testing.T) {
 		require.Equal(t, http.StatusForbidden, rec.Code)
 		require.Empty(t, src.lastDeleteName)
 	})
+}
+
+func TestSqsHandler_SetQueueAttributes_HappyPath(t *testing.T) {
+	src := &stubQueuesSource{queues: []string{"orders"}}
+	h := NewSqsHandler(src)
+	body := `{"attributes":{"RedrivePolicy":"{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:000000000000:orders-dlq\",\"maxReceiveCount\":5}"}}`
+	req := httptest.NewRequest(http.MethodPut, pathPrefixSqsQueues+"orders/attributes", strings.NewReader(body))
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_FULL", Role: RoleFull}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNoContent, rec.Code, "body=%s", rec.Body.String())
+	require.Equal(t, "orders", src.lastSetAttrsName)
+	require.Equal(t, RoleFull, src.lastSetAttrsPrincipal.Role)
+	require.Equal(t, `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:orders-dlq","maxReceiveCount":5}`, src.lastSetAttrs["RedrivePolicy"])
+}
+
+func TestSqsHandler_SetQueueAttributes_ReadOnlyForbidden(t *testing.T) {
+	src := &stubQueuesSource{queues: []string{"orders"}}
+	h := NewSqsHandler(src)
+	req := httptest.NewRequest(http.MethodPut, pathPrefixSqsQueues+"orders/attributes", strings.NewReader(`{"attributes":{"RedriveAllowPolicy":"{}"}}`))
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_RO", Role: RoleReadOnly}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Empty(t, src.lastSetAttrsName, "read-only principal must not reach the set-attributes source")
 }
 
 // TestSqsHandler_ListQueues_EmptyArrayNotNull pins the nil→[]

@@ -156,6 +156,7 @@ type sqsQueueMetaPublic struct {
 	ReceiveMessageWaitSeconds int64  `json:"receive_message_wait_seconds,omitempty"`
 	MaximumMessageSize        int64  `json:"maximum_message_size,omitempty"`
 	RedrivePolicy             string `json:"redrive_policy,omitempty"`
+	RedriveAllowPolicy        string `json:"redrive_allow_policy,omitempty"`
 	PartitionCount            uint32 `json:"partition_count,omitempty"`
 	FifoThroughputLimit       string `json:"fifo_throughput_limit,omitempty"`
 	DeduplicationScope        string `json:"deduplication_scope,omitempty"`
@@ -714,6 +715,7 @@ func decodeSQSQueueMetaValue(value []byte) (*sqsQueueMetaPublic, error) {
 		ReceiveMessageWaitSeconds int64  `json:"receive_message_wait_seconds"`
 		MaximumMessageSize        int64  `json:"maximum_message_size"`
 		RedrivePolicy             string `json:"redrive_policy"`
+		RedriveAllowPolicy        string `json:"redrive_allow_policy"`
 		// HT-FIFO immutable attributes — see adapter/sqs_catalog.go.
 		PartitionCount      uint32 `json:"partition_count"`
 		FifoThroughputLimit string `json:"fifo_throughput_limit"`
@@ -733,6 +735,7 @@ func decodeSQSQueueMetaValue(value []byte) (*sqsQueueMetaPublic, error) {
 		ReceiveMessageWaitSeconds: live.ReceiveMessageWaitSeconds,
 		MaximumMessageSize:        live.MaximumMessageSize,
 		RedrivePolicy:             live.RedrivePolicy,
+		RedriveAllowPolicy:        live.RedriveAllowPolicy,
 		PartitionCount:            live.PartitionCount,
 		FifoThroughputLimit:       live.FifoThroughputLimit,
 		DeduplicationScope:        live.DeduplicationScope,
