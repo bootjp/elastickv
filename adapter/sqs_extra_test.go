@@ -1739,13 +1739,16 @@ func TestSQSServer_RedrivePolicyStandardDlqRejectsFifoSource(t *testing.T) {
 		t.Fatalf("create FIFO source with Standard-DLQ policy: got %d want 400 (%v)", status, out)
 	}
 
-	_, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
 		"QueueName":  "src-fifo-set.fifo",
 		"Attributes": map[string]string{"FifoQueue": "true"},
 	})
+	if status != http.StatusOK {
+		t.Fatalf("create FIFO source for setattrs path: got %d want 200 (%v)", status, out)
+	}
 	srcURL, _ := out["QueueUrl"].(string)
 	if srcURL == "" {
-		t.Fatalf("FIFO source create failed: %v", out)
+		t.Fatalf("create FIFO source for setattrs path returned empty QueueUrl: %v", out)
 	}
 	status, out = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
 		"QueueUrl":   srcURL,
