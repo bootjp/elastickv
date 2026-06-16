@@ -1744,6 +1744,9 @@ func TestSQSServer_RedrivePolicyStandardDlqRejectsFifoSource(t *testing.T) {
 		"Attributes": map[string]string{"FifoQueue": "true"},
 	})
 	srcURL, _ := out["QueueUrl"].(string)
+	if srcURL == "" {
+		t.Fatalf("FIFO source create failed: %v", out)
+	}
 	status, out = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
 		"QueueUrl":   srcURL,
 		"Attributes": map[string]string{"RedrivePolicy": policy},

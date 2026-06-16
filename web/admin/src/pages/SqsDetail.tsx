@@ -206,7 +206,7 @@ interface ParsedRedrivePolicy {
 
 interface ParsedRedriveAllowPolicy {
   permission: RedrivePermission;
-  sourceNames: string[];
+  sourceQueueArns: string[];
 }
 
 interface DLQSettingsSectionProps {
@@ -241,7 +241,7 @@ function DLQSettingsSection({
     () => allQueues.filter((q) => q !== queue && isFifoQueueName(q) === isFifo),
     [allQueues, isFifo, queue],
   );
-  const parsedAllowSourceText = parsedAllow.sourceNames.join("\n");
+  const parsedAllowSourceText = parsedAllow.sourceQueueArns.join("\n");
 
   const [targetName, setTargetName] = useState(parsedRedrive.targetName);
   const [maxReceiveCount, setMaxReceiveCount] = useState(String(parsedRedrive.maxReceiveCount));
@@ -250,7 +250,7 @@ function DLQSettingsSection({
   const [redriveSaved, setRedriveSaved] = useState<string | null>(null);
 
   const [permission, setPermission] = useState<RedrivePermission>(parsedAllow.permission);
-  const [sourceNamesText, setSourceNamesText] = useState(parsedAllow.sourceNames.join("\n"));
+  const [sourceQueueArnsText, setSourceQueueArnsText] = useState(parsedAllowSourceText);
   const [allowSaving, setAllowSaving] = useState(false);
   const [allowError, setAllowError] = useState<string | null>(null);
   const [allowSaved, setAllowSaved] = useState<string | null>(null);
@@ -268,7 +268,7 @@ function DLQSettingsSection({
 
   useEffect(() => {
     setPermission(parsedAllow.permission);
-    setSourceNamesText(parsedAllowSourceText);
+    setSourceQueueArnsText(parsedAllowSourceText);
     setAllowError(null);
     setAllowSaved(null);
   }, [queue, parsedAllow.permission, parsedAllowSourceText]);
@@ -314,24 +314,24 @@ function DLQSettingsSection({
     event.preventDefault();
     setAllowError(null);
     setAllowSaved(null);
-    if (!arnPrefix) {
-      setAllowError("QueueArn is not available for this queue.");
-      return;
-    }
     const policy: { redrivePermission: RedrivePermission; sourceQueueArns?: string[] } = {
       redrivePermission: permission,
     };
     if (permission === "byQueue") {
-      const names = parseQueueNamesInput(sourceNamesText);
-      if (names.length === 0) {
-        setAllowError("Enter at least one source queue name.");
+      const parsedSources = parseSourceQueueArnInput(sourceQueueArnsText, arnPrefix);
+      if (parsedSources.needsArnPrefix) {
+        setAllowError("QueueArn is not available to expand local queue names. Enter full source queue ARNs.");
         return;
       }
-      if (names.length > 10) {
+      if (parsedSources.sourceQueueArns.length === 0) {
+        setAllowError("Enter at least one source queue ARN or local queue name.");
+        return;
+      }
+      if (parsedSources.sourceQueueArns.length > 10) {
         setAllowError("sourceQueueArns can contain at most 10 queues.");
         return;
       }
-      policy.sourceQueueArns = names.map((name) => queueArnForName(arnPrefix, name));
+      policy.sourceQueueArns = parsedSources.sourceQueueArns;
     }
     setAllowSaving(true);
     try {
@@ -409,14 +409,16 @@ function DLQSettingsSection({
           </div>
           {permission === "byQueue" && (
             <div>
-              <label className="label" htmlFor="redrive-source-queues">Source queue names</label>
+              <label className="label" htmlFor="redrive-source-queues">Source queue ARNs</label>
               <textarea
                 id="redrive-source-queues"
                 className="input font-mono min-h-24"
-                value={sourceNamesText}
-                onChange={(e) => setSourceNamesText(e.target.value)}
+                value={sourceQueueArnsText}
+                onChange={(e) => setSourceQueueArnsText(e.target.value)}
                 disabled={allowSaving}
-                placeholder={candidateQueues.join("\n")}
+                placeholder={candidateQueues
+                  .map((name) => (arnPrefix ? queueArnForName(arnPrefix, name) : name))
+                  .join("\n")}
               />
             </div>
           )}
@@ -455,19 +457,19 @@ function parseRedrivePolicyAttribute(raw?: string): ParsedRedrivePolicy {
 }
 
 function parseRedriveAllowPolicyAttribute(raw?: string): ParsedRedriveAllowPolicy {
-  if (!raw) return { permission: "allowAll", sourceNames: [] };
+  if (!raw) return { permission: "allowAll", sourceQueueArns: [] };
   try {
     const obj = JSON.parse(raw) as Record<string, unknown>;
     const permission = parseRedrivePermission(obj.redrivePermission);
-    const sourceNames = Array.isArray(obj.sourceQueueArns)
+    const sourceQueueArns = Array.isArray(obj.sourceQueueArns)
       ? obj.sourceQueueArns
         .filter((arn): arn is string => typeof arn === "string")
-        .map(queueNameFromArn)
-        .filter((name) => name !== "")
+        .map((arn) => arn.trim())
+        .filter((arn) => arn !== "")
       : [];
-    return { permission, sourceNames };
+    return { permission, sourceQueueArns };
   } catch {
-    return { permission: "allowAll", sourceNames: [] };
+    return { permission: "allowAll", sourceQueueArns: [] };
   }
 }
 
@@ -497,16 +499,23 @@ function isFifoQueueName(name: string): boolean {
   return name.endsWith(".fifo");
 }
 
-function parseQueueNamesInput(value: string): string[] {
+function parseSourceQueueArnInput(value: string, arnPrefix: string): { sourceQueueArns: string[]; needsArnPrefix: boolean } {
   const seen = new Set<string>();
-  const names: string[] = [];
+  const sourceQueueArns: string[] = [];
+  let needsArnPrefix = false;
   for (const part of value.split(/[,\n]/u)) {
-    const name = part.trim();
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    names.push(name);
+    const raw = part.trim();
+    if (!raw) continue;
+    const arn = raw.startsWith("arn:") ? raw : arnPrefix ? queueArnForName(arnPrefix, raw) : "";
+    if (!arn) {
+      needsArnPrefix = true;
+      continue;
+    }
+    if (seen.has(arn)) continue;
+    seen.add(arn);
+    sourceQueueArns.push(arn);
   }
-  return names;
+  return { sourceQueueArns, needsArnPrefix };
 }
 
 interface MessagesSectionProps {
