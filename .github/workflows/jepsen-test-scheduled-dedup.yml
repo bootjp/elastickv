@@ -41,9 +41,13 @@ on:
         required: false
         default: "16"
       max-writes-per-key:
+        # Keep this comfortably above rate * concurrency * time-limit / key-count.
+        # The scheduled default is 10 * 8 * 300 / 16 = 1500 writes/key before
+        # multi-op expansion; 3000 prevents the append generator from exhausting
+        # its value space before the 300s stress window completes.
         description: "Maximum writes per key before exhaustion"
         required: false
-        default: "250"
+        default: "3000"
       max-txn-length:
         description: "Maximum micro-ops per transaction"
         required: false
@@ -187,7 +191,7 @@ jobs:
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
-            --max-writes-per-key ${{ inputs.max-writes-per-key || '250' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '3000' }} \
             --max-txn-length ${{ inputs.max-txn-length || '4' }} \
             --ports 63791,63792,63793 \
             --host 127.0.0.1
@@ -205,7 +209,7 @@ jobs:
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
-            --max-writes-per-key ${{ inputs.max-writes-per-key || '250' }} \
+            --max-writes-per-key ${{ inputs.max-writes-per-key || '3000' }} \
             --max-txn-length ${{ inputs.max-txn-length || '4' }} \
             --dynamo-ports 63801,63802,63803 \
             --host 127.0.0.1
