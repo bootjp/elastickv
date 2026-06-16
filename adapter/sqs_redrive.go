@@ -21,6 +21,11 @@ type parsedRedrivePolicy struct {
 	MaxReceiveCount     int64
 }
 
+type parsedRedriveAllowPolicy struct {
+	RedrivePermission string
+	SourceQueueArns   []string
+}
+
 // rawRedrivePolicy mirrors the AWS JSON shape. maxReceiveCount uses
 // json.Number so we can accept both numeric and string forms without
 // disagreeing with the SDKs.
@@ -29,10 +34,21 @@ type rawRedrivePolicy struct {
 	MaxReceiveCount     json.Number `json:"maxReceiveCount"`
 }
 
+type rawRedriveAllowPolicy struct {
+	RedrivePermission string   `json:"redrivePermission"`
+	SourceQueueArns   []string `json:"sourceQueueArns"`
+}
+
 // AWS SQS allows maxReceiveCount in [1, 1000].
 const (
-	sqsRedriveMaxReceiveCountMax = 1000
-	sqsRedriveMaxReceiveCountMin = 1
+	sqsRedriveDefaultMaxReceiveCount = 10
+	sqsRedriveMaxReceiveCountMax     = 1000
+	sqsRedriveMaxReceiveCountMin     = 1
+
+	sqsRedrivePermissionAllowAll    = "allowAll"
+	sqsRedrivePermissionDenyAll     = "denyAll"
+	sqsRedrivePermissionByQueue     = "byQueue"
+	sqsRedriveAllowPolicyMaxSources = 10
 )
 
 // parseRedrivePolicy validates a RedrivePolicy JSON blob and extracts
@@ -55,10 +71,14 @@ func parseRedrivePolicy(s string) (*parsedRedrivePolicy, error) {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
 			"RedrivePolicy.deadLetterTargetArn is required")
 	}
-	maxReceive, err := raw.MaxReceiveCount.Int64()
-	if err != nil {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"RedrivePolicy.maxReceiveCount must be an integer")
+	maxReceive := int64(sqsRedriveDefaultMaxReceiveCount)
+	if raw.MaxReceiveCount != "" {
+		var err error
+		maxReceive, err = raw.MaxReceiveCount.Int64()
+		if err != nil {
+			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"RedrivePolicy.maxReceiveCount must be an integer")
+		}
 	}
 	if maxReceive < sqsRedriveMaxReceiveCountMin || maxReceive > sqsRedriveMaxReceiveCountMax {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
@@ -74,6 +94,71 @@ func parseRedrivePolicy(s string) (*parsedRedrivePolicy, error) {
 		DLQName:             dlqName,
 		MaxReceiveCount:     maxReceive,
 	}, nil
+}
+
+// parseRedriveAllowPolicy validates the DLQ-side RedriveAllowPolicy
+// JSON blob. AWS defaults an absent redrivePermission to allowAll;
+// the queue meta represents that default by leaving RedriveAllowPolicy
+// empty, but a caller that explicitly sends {} should get the same
+// semantics.
+func parseRedriveAllowPolicy(s string) (*parsedRedriveAllowPolicy, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy must be non-empty JSON")
+	}
+	var raw rawRedriveAllowPolicy
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy is not valid JSON")
+	}
+	permission := strings.TrimSpace(raw.RedrivePermission)
+	if permission == "" {
+		permission = sqsRedrivePermissionAllowAll
+	}
+	if err := validateRawRedriveAllowPolicy(permission, raw.SourceQueueArns); err != nil {
+		return nil, err
+	}
+	return &parsedRedriveAllowPolicy{
+		RedrivePermission: permission,
+		SourceQueueArns:   raw.SourceQueueArns,
+	}, nil
+}
+
+func validateRawRedriveAllowPolicy(permission string, sourceQueueArns []string) error {
+	switch permission {
+	case sqsRedrivePermissionAllowAll, sqsRedrivePermissionDenyAll:
+		if len(sourceQueueArns) > 0 {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"RedriveAllowPolicy.sourceQueueArns is only valid when redrivePermission is byQueue")
+		}
+	case sqsRedrivePermissionByQueue:
+		if err := validateByQueueSourceArns(sourceQueueArns); err != nil {
+			return err
+		}
+	default:
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy.redrivePermission must be allowAll, denyAll, or byQueue")
+	}
+	return nil
+}
+
+func validateByQueueSourceArns(sourceQueueArns []string) error {
+	if len(sourceQueueArns) == 0 {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy.sourceQueueArns is required when redrivePermission is byQueue")
+	}
+	if len(sourceQueueArns) > sqsRedriveAllowPolicyMaxSources {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy.sourceQueueArns can contain at most 10 queue ARNs")
+	}
+	for _, arn := range sourceQueueArns {
+		if dlqNameFromArn(strings.TrimSpace(arn)) == "" {
+			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+				"RedriveAllowPolicy.sourceQueueArns contains a malformed ARN")
+		}
+	}
+	return nil
 }
 
 // dlqNameFromArn returns the queue name segment of an SQS ARN. AWS
@@ -184,40 +269,135 @@ func (s *SQSServer) validateRedriveTargets(
 	policy *parsedRedrivePolicy,
 	readTS uint64,
 ) (*sqsQueueMeta, error) {
-	if policy.DLQName == srcQueueName {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"RedrivePolicy.deadLetterTargetArn must not point at the source queue")
+	if err := s.validateRedrivePolicyReference(srcQueueName, policy); err != nil {
+		return nil, err
 	}
-	dlqMeta, dlqExists, err := s.loadQueueMetaAt(ctx, policy.DLQName, readTS)
+	srcMeta, dlqMeta, err := s.loadRedrivePairMeta(ctx, srcQueueName, policy.DLQName, readTS)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
-	if !dlqExists {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"RedrivePolicy targets non-existent DLQ "+policy.DLQName)
+	if err := validateRedriveQueuePair(srcMeta, dlqMeta); err != nil {
+		return nil, err
 	}
-	srcMeta, srcExists, err := s.loadQueueMetaAt(ctx, srcQueueName, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	if err := s.validateRedriveAllowPolicyForSource(srcQueueName, dlqMeta); err != nil {
+		return nil, err
 	}
-	if !srcExists {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist,
-			"source queue disappeared during redrive")
-	}
-	if srcMeta.IsFIFO != dlqMeta.IsFIFO {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"RedrivePolicy queue-type mismatch: source and DLQ must both be FIFO or both Standard")
-	}
-	if dlqMeta.IsFIFO && srcRec.MessageGroupId == "" {
-		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
-			"FIFO DLQ requires source records to carry MessageGroupId")
+	if err := validateRedriveFIFORecord(srcRec, dlqMeta); err != nil {
+		return nil, err
 	}
 	return dlqMeta, nil
 }
 
-// buildDLQRecord assembles the DLQ-side message record. Reset
-// ReceiveCount and FirstReceiveMillis so the DLQ consumer sees a
-// fresh delivery, not the source's bounce history.
+func (s *SQSServer) validateRedrivePolicyReference(srcQueueName string, policy *parsedRedrivePolicy) error {
+	if policy.DLQName == srcQueueName {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy.deadLetterTargetArn must not point at the source queue")
+	}
+	if policy.DeadLetterTargetArn != s.queueArn(policy.DLQName) {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy.deadLetterTargetArn must target a queue in this SQS account and region")
+	}
+	return nil
+}
+
+func (s *SQSServer) loadRedrivePairMeta(ctx context.Context, srcQueueName, dlqName string, readTS uint64) (*sqsQueueMeta, *sqsQueueMeta, error) {
+	dlqMeta, dlqExists, err := s.loadQueueMetaAt(ctx, dlqName, readTS)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	if !dlqExists {
+		return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy targets non-existent DLQ "+dlqName)
+	}
+	srcMeta, srcExists, err := s.loadQueueMetaAt(ctx, srcQueueName, readTS)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	if !srcExists {
+		return nil, nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist,
+			"source queue disappeared during redrive")
+	}
+	return srcMeta, dlqMeta, nil
+}
+
+func validateRedriveQueuePair(srcMeta, dlqMeta *sqsQueueMeta) error {
+	if srcMeta.IsFIFO != dlqMeta.IsFIFO {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy queue-type mismatch: source and DLQ must both be FIFO or both Standard")
+	}
+	return nil
+}
+
+func validateRedriveFIFORecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta) error {
+	if dlqMeta.IsFIFO && srcRec.MessageGroupId == "" {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"FIFO DLQ requires source records to carry MessageGroupId")
+	}
+	return nil
+}
+
+func (s *SQSServer) validateRedrivePolicyTarget(ctx context.Context, sourceMeta *sqsQueueMeta, readTS uint64) error {
+	if sourceMeta == nil || strings.TrimSpace(sourceMeta.RedrivePolicy) == "" {
+		return nil
+	}
+	policy, err := parseRedrivePolicy(sourceMeta.RedrivePolicy)
+	if err != nil {
+		return err
+	}
+	if err := s.validateRedrivePolicyReference(sourceMeta.Name, policy); err != nil {
+		return err
+	}
+	dlqMeta, dlqExists, err := s.loadQueueMetaAt(ctx, policy.DLQName, readTS)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !dlqExists {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedrivePolicy targets non-existent DLQ "+policy.DLQName)
+	}
+	if err := validateRedriveQueuePair(sourceMeta, dlqMeta); err != nil {
+		return err
+	}
+	return s.validateRedriveAllowPolicyForSource(sourceMeta.Name, dlqMeta)
+}
+
+func (s *SQSServer) validateRedriveAllowPolicyForSource(sourceQueueName string, dlqMeta *sqsQueueMeta) error {
+	if dlqMeta == nil || strings.TrimSpace(dlqMeta.RedriveAllowPolicy) == "" {
+		return nil
+	}
+	allow, err := parseRedriveAllowPolicy(dlqMeta.RedriveAllowPolicy)
+	if err != nil {
+		return err
+	}
+	switch allow.RedrivePermission {
+	case sqsRedrivePermissionAllowAll:
+		return nil
+	case sqsRedrivePermissionDenyAll:
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy denies all source queues for DLQ "+dlqMeta.Name)
+	case sqsRedrivePermissionByQueue:
+		sourceArn := s.queueArn(sourceQueueName)
+		for _, arn := range allow.SourceQueueArns {
+			if strings.TrimSpace(arn) == sourceArn {
+				return nil
+			}
+		}
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy does not allow source queue "+sourceQueueName)
+	default:
+		return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue,
+			"RedriveAllowPolicy.redrivePermission must be allowAll, denyAll, or byQueue")
+	}
+}
+
+// buildDLQRecord assembles the DLQ-side message record. MessageID is
+// preserved across the move. Standard queues keep the original
+// SentTimestamp so DLQ retention is based on the original enqueue
+// time; FIFO queues get a fresh enqueue timestamp and use the
+// original MessageID as the DLQ-side MessageDeduplicationId, matching
+// Amazon SQS's FIFO DLQ behavior. ReceiveCount and FirstReceiveMillis
+// reset so the DLQ consumer sees a fresh delivery, not the source's
+// bounce history.
 //
 // dlqSeq is the SequenceNumber to assign on the DLQ record, computed
 // by the caller as `loadFifoSequence(dlq) + 1` for FIFO DLQs and
@@ -228,23 +408,27 @@ func (s *SQSServer) validateRedriveTargets(
 // and a later FIFO send to the DLQ produces a non-monotonic
 // SequenceNumber.
 func buildDLQRecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta, srcArn string, dlqSeq uint64) (*sqsMessageRecord, []byte, error) {
-	dlqMsgID, err := newMessageIDHex()
-	if err != nil {
-		return nil, nil, errors.WithStack(err)
-	}
 	dlqToken, err := newReceiptToken()
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
 	now := time.Now().UnixMilli()
+	sendTimestamp := now
+	if !dlqMeta.IsFIFO {
+		sendTimestamp = srcRec.SendTimestampMillis
+	}
+	deduplicationID := srcRec.MessageDeduplicationId
+	if dlqMeta.IsFIFO {
+		deduplicationID = srcRec.MessageID
+	}
 	rec := &sqsMessageRecord{
-		MessageID:              dlqMsgID,
+		MessageID:              srcRec.MessageID,
 		Body:                   srcRec.Body,
 		MD5OfBody:              srcRec.MD5OfBody,
 		MD5OfMessageAttributes: srcRec.MD5OfMessageAttributes,
 		MessageAttributes:      srcRec.MessageAttributes,
 		SenderID:               srcRec.SenderID,
-		SendTimestampMillis:    now,
+		SendTimestampMillis:    sendTimestamp,
 		AvailableAtMillis:      now,
 		VisibleAtMillis:        now,
 		ReceiveCount:           0,
@@ -252,7 +436,7 @@ func buildDLQRecord(srcRec *sqsMessageRecord, dlqMeta *sqsQueueMeta, srcArn stri
 		CurrentReceiptToken:    dlqToken,
 		QueueGeneration:        dlqMeta.Generation,
 		MessageGroupId:         srcRec.MessageGroupId,
-		MessageDeduplicationId: srcRec.MessageDeduplicationId,
+		MessageDeduplicationId: deduplicationID,
 		DeadLetterSourceArn:    srcArn,
 		SequenceNumber:         dlqSeq,
 	}
@@ -290,15 +474,16 @@ func (s *SQSServer) buildRedriveOps(
 	readTS uint64,
 ) (*kv.OperationGroup[kv.OP], error) {
 	srcGen := srcMeta.Generation
-	now := dlqRec.SendTimestampMillis
+	visibleAt := dlqRec.VisibleAtMillis
+	sentAt := dlqRec.SendTimestampMillis
 	// DLQ partition for FIFO sources: redrive carries the source's
 	// MessageGroupId forward, so the DLQ partition is the result of
 	// hashing that group through the DLQ's partitionFor. Standard
 	// DLQs (or any DLQ with PartitionCount <= 1) collapse this to 0.
 	dlqPartition := partitionFor(dlqMeta, dlqRec.MessageGroupId)
 	dlqDataKey := sqsMsgDataKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, dlqRec.MessageID)
-	dlqVisKey := sqsMsgVisKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, now, dlqRec.MessageID)
-	dlqByAgeKey := sqsMsgByAgeKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, now, dlqRec.MessageID)
+	dlqVisKey := sqsMsgVisKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, visibleAt, dlqRec.MessageID)
+	dlqByAgeKey := sqsMsgByAgeKeyDispatch(dlqMeta, policy.DLQName, dlqPartition, dlqMeta.Generation, sentAt, dlqRec.MessageID)
 	srcByAgeKey := sqsMsgByAgeKeyDispatch(srcMeta, srcQueueName, cand.partition, srcGen, srcRec.SendTimestampMillis, srcRec.MessageID)
 	readKeys := [][]byte{
 		cand.visKey, srcDataKey,
