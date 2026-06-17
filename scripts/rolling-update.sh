@@ -826,7 +826,7 @@ choose_transfer_candidate() {
 
   leader_addr="${NODE_HOST}:${RAFT_PORT}"
   leader_status="$(raft_status "$leader_addr")" || {
-    echo "unable to read leader raft status from $leader_addr" >&2
+    echo "unable to read leader raft status from $leader_addr: $leader_status" >&2
     return 1
   }
   leader_commit="$(extract_proto_uint "commit_index" "$leader_status")"
@@ -851,9 +851,8 @@ choose_transfer_candidate() {
       echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: gRPC unreachable" >&2
       continue
     fi
-    output="$(raft_status "$addr" || true)"
-    if [[ -z "$output" ]]; then
-      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: status RPC failed" >&2
+    if ! output="$(raft_status "$addr")"; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: status RPC failed: $output" >&2
       continue
     fi
     state="$(extract_proto_enum "state" "$output")"
