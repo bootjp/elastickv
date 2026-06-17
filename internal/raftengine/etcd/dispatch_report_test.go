@@ -85,3 +85,53 @@ func TestPostDispatchReport_AbortsOnClose(t *testing.T) {
 		t.Fatal("postDispatchReport did not abort when closeCh was signalled")
 	}
 }
+
+func TestEnqueueDispatchReportsDroppedSnapshotWhenLaneFull(t *testing.T) {
+	t.Parallel()
+	snapshotCh := make(chan dispatchRequest, 1)
+	snapshotCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgSnap, To: 2}}
+	e := &Engine{
+		transport:              &GRPCTransport{},
+		dispatcherLanesEnabled: true,
+		dispatchReportCh:       make(chan dispatchReport, 1),
+		closeCh:                make(chan struct{}),
+		peerDispatchers: map[uint64]*peerQueues{
+			2: {snapshot: snapshotCh},
+		},
+	}
+
+	require.NoError(t, e.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgSnap, To: 2}))
+
+	require.Equal(t, uint64(1), e.DispatchDropCount())
+	select {
+	case got := <-e.dispatchReportCh:
+		require.Equal(t, dispatchReport{to: 2, msgType: raftpb.MsgSnap}, got)
+	default:
+		t.Fatal("expected dropped MsgSnap to report SnapshotFailure input")
+	}
+}
+
+func TestEnqueueDispatchReportsDroppedRegularMessageWhenLaneFull(t *testing.T) {
+	t.Parallel()
+	replicationCh := make(chan dispatchRequest, 1)
+	replicationCh <- dispatchRequest{msg: raftpb.Message{Type: raftpb.MsgApp, To: 2}}
+	e := &Engine{
+		transport:              &GRPCTransport{},
+		dispatcherLanesEnabled: true,
+		dispatchReportCh:       make(chan dispatchReport, 1),
+		closeCh:                make(chan struct{}),
+		peerDispatchers: map[uint64]*peerQueues{
+			2: {replication: replicationCh},
+		},
+	}
+
+	require.NoError(t, e.enqueueDispatchMessage(raftpb.Message{Type: raftpb.MsgApp, To: 2}))
+
+	require.Equal(t, uint64(1), e.DispatchDropCount())
+	select {
+	case got := <-e.dispatchReportCh:
+		require.Equal(t, dispatchReport{to: 2, msgType: raftpb.MsgApp}, got)
+	default:
+		t.Fatal("expected dropped MsgApp to report unreachable input")
+	}
+}

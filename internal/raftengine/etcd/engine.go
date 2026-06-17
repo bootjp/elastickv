@@ -1534,10 +1534,12 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 }
 
 // postDispatchReport delivers a dispatch failure to the event loop without
-// blocking the worker. If the channel is full (unlikely — the buffer is
-// sized to MaxInflightMsg), the report is dropped and logged; this is
-// acceptable because raft will retry on the next tick and we only need
-// eventual consistency between transport state and Progress state.
+// blocking the caller. Dispatch workers use it for transport failures, and the
+// event loop uses it for local queue drops before transport. If the channel is
+// full (unlikely — the buffer is sized to MaxInflightMsg), the report is
+// dropped and logged; this is acceptable because raft will retry on the next
+// tick and we only need eventual consistency between transport state and
+// Progress state.
 func (e *Engine) postDispatchReport(report dispatchReport) {
 	select {
 	case e.dispatchReportCh <- report:
@@ -4073,6 +4075,14 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 			"drop_count", count,
 		)
 	}
+	e.reportDroppedDispatch(msg)
+}
+
+func (e *Engine) reportDroppedDispatch(msg raftpb.Message) {
+	if e.dispatchReportCh == nil {
+		return
+	}
+	e.postDispatchReport(dispatchReport{to: msg.To, msgType: msg.Type})
 }
 
 // dispatchErrorCodeOf extracts the grpc status code name from err, or
