@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"testing"
@@ -8,17 +9,23 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
+	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
 )
 
-// captureConn is the minimal redcon.Conn surface writeRedisError uses;
-// only WriteError needs a real implementation.
+// captureConn is the minimal redcon.Conn surface these tests inspect.
 type captureConn struct {
 	redcon.Conn
-	lastErr string
+	lastErr    string
+	lastArray  int
+	wroteArray bool
 }
 
 func (c *captureConn) WriteError(msg string) { c.lastErr = msg }
+func (c *captureConn) WriteArray(count int) {
+	c.lastArray = count
+	c.wroteArray = true
+}
 
 func TestIsTransientLeaderRedisError(t *testing.T) {
 	t.Parallel()
@@ -105,6 +112,9 @@ func TestWriteRedisError(t *testing.T) {
 		{"grpc-wrapped leader-not-found gains NOTLEADER prefix",
 			errors.New("rpc error: code = Unknown desc = leader not found"),
 			"NOTLEADER rpc error: code = Unknown desc = leader not found"},
+		{"already NOTLEADER-prefixed error is not double-prefixed",
+			errors.New("NOTLEADER leader not found"),
+			"NOTLEADER leader not found"},
 		// Regression: address-mapping gap errors (raft leader known
 		// but raft→redis address missing in r.leaderRedis) must be
 		// ERR-prefixed at the source so Carmine maps to :prefix :err
@@ -129,6 +139,69 @@ func TestWriteRedisError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandleProxyTxnError(t *testing.T) {
+	t.Parallel()
+	t.Run("transient leader error is top-level NOTLEADER", func(t *testing.T) {
+		t.Parallel()
+		c := &captureConn{}
+		handled := handleProxyTxnError(c, errors.New("rpc error: code = Unknown desc = leader not found"))
+		if !handled {
+			t.Fatal("handleProxyTxnError returned false")
+		}
+		if c.lastErr != "NOTLEADER rpc error: code = Unknown desc = leader not found" {
+			t.Fatalf("last error = %q", c.lastErr)
+		}
+		if c.wroteArray {
+			t.Fatalf("unexpected array reply %d", c.lastArray)
+		}
+	})
+
+	t.Run("redis transaction abort remains null array", func(t *testing.T) {
+		t.Parallel()
+		c := &captureConn{}
+		handled := handleProxyTxnError(c, redis.TxFailedErr)
+		if !handled {
+			t.Fatal("handleProxyTxnError returned false")
+		}
+		if !c.wroteArray || c.lastArray != -1 {
+			t.Fatalf("array reply = (%v, %d), want (-1)", c.wroteArray, c.lastArray)
+		}
+		if c.lastErr != "" {
+			t.Fatalf("unexpected error reply %q", c.lastErr)
+		}
+	})
+}
+
+func TestHandleProxyTxnCommandError(t *testing.T) {
+	t.Parallel()
+	t.Run("transient command error is promoted to top-level NOTLEADER", func(t *testing.T) {
+		t.Parallel()
+		cmd := redis.NewCmd(context.Background(), "LRANGE", "k", 0, -1)
+		cmd.SetErr(errors.New("rpc error: code = FailedPrecondition desc = raft engine: not leader"))
+		c := &captureConn{}
+		handled := handleProxyTxnCommandError(c, []*redis.Cmd{cmd})
+		if !handled {
+			t.Fatal("handleProxyTxnCommandError returned false")
+		}
+		if c.lastErr != "NOTLEADER rpc error: code = FailedPrecondition desc = raft engine: not leader" {
+			t.Fatalf("last error = %q", c.lastErr)
+		}
+	})
+
+	t.Run("ordinary command error stays in EXEC result array", func(t *testing.T) {
+		t.Parallel()
+		cmd := redis.NewCmd(context.Background(), "LRANGE", "k", 0, -1)
+		cmd.SetErr(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
+		c := &captureConn{}
+		if handleProxyTxnCommandError(c, []*redis.Cmd{cmd}) {
+			t.Fatal("ordinary command error was handled as terminal")
+		}
+		if c.lastErr != "" {
+			t.Fatalf("unexpected error reply %q", c.lastErr)
+		}
+	})
 }
 
 // TestHasTransientLeaderSuffix_PinsSentinels closes the gap noted

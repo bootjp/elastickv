@@ -18,6 +18,62 @@
 
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 
+(defn- redis-exception? [x]
+  (instance? Throwable x))
+
+(defn- first-exception [xs]
+  (some (fn [x]
+          (when (redis-exception? x)
+            x))
+        xs))
+
+(defn- mop-result-error [mops]
+  (first-exception (map (fn [[_ _ v]] v) mops)))
+
+(defn- redis-error-label [e]
+  (let [data   (ex-data e)
+        prefix (:prefix data)
+        msg    (or (.getMessage e) "")
+        upper  (str/upper-case msg)]
+    (cond
+      prefix prefix
+      (str/starts-with? upper "NOTLEADER") :notleader
+      (str/starts-with? upper "MOVED")     :moved
+      (str/starts-with? upper "ASK")       :ask
+      (str/starts-with? upper "WRONGTYPE") :wrongtype
+      (str/starts-with? upper "ERR")       :err
+      :else                                :exec-error)))
+
+(defn- exec-array-error-op [op e]
+  (assoc op :type :info
+            :error [:exec-array-error (redis-error-label e)]))
+
+(defn- complete-mops-or-error [conn op mops]
+  (if-let [e (mop-result-error mops)]
+    (exec-array-error-op op e)
+    (->> mops
+         (mapv (partial redis-append/parse-read conn))
+         (assoc op :type :ok, :value))))
+
+(defn- complete-exec-results [conn op exec-results]
+  (if-let [e (first-exception exec-results)]
+    (exec-array-error-op op e)
+    (let [mops (mapv (fn [[f k v] r]
+                       [f k (if (= f :r) r v)])
+                     (:value op)
+                     exec-results)]
+      (complete-mops-or-error conn op mops))))
+
+(defn- apply-multi-op! [conn op]
+  (let [exec-results (rc/with-txn conn
+                       (mapv (partial redis-append/apply-mop! conn) (:value op)))]
+    (complete-exec-results conn op exec-results)))
+
+(defn- apply-single-op! [conn op]
+  (->> (:value op)
+       (mapv (partial redis-append/apply-mop! conn))
+       (complete-mops-or-error conn op)))
+
 (defrecord ElastickvRedisClient [node->port conn]
   client/Client
   (open! [this test node]
@@ -38,17 +94,9 @@
     (let [conn (:conn this)]
       (rc/with-exceptions op #{}
         (rc/with-conn conn
-          (->> (if (< 1 (count (:value op)))
-                 (->> (:value op)
-                      (mapv (partial redis-append/apply-mop! conn))
-                      (rc/with-txn conn)
-                      (mapv (fn [[f k v] r]
-                              [f k (if (= f :r) r v)])
-                            (:value op)))
-                 (->> (:value op)
-                      (mapv (partial redis-append/apply-mop! conn))))
-               (mapv (partial redis-append/parse-read conn))
-               (assoc op :type :ok, :value)))))))
+          (if (< 1 (count (:value op)))
+            (apply-multi-op! conn op)
+            (apply-single-op! conn op)))))))
 
 (defn elastickv-append-workload
   "Append workload that reuses jepsen-io/redis logic but targets elastickv."
