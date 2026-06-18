@@ -187,6 +187,7 @@ func isLoopbackHost(host string) bool {
 
 func readOnlyCommands() map[string]func(context.Context, pb.RaftAdminClient) error {
 	return map[string]func(context.Context, pb.RaftAdminClient) error{
+		"status":        printStatus,
 		"leader":        printLeader,
 		"state":         printState,
 		"configuration": printConfiguration,
@@ -236,6 +237,25 @@ func printState(ctx context.Context, client pb.RaftAdminClient) error {
 		return errors.Wrap(err, "get state")
 	}
 	fmt.Printf("state: %s\n", formatState(resp.State))
+	return nil
+}
+
+func printStatus(ctx context.Context, client pb.RaftAdminClient) error {
+	resp, err := client.Status(ctx, &pb.RaftAdminStatusRequest{})
+	if err != nil {
+		return errors.Wrap(err, "get status")
+	}
+	fmt.Printf("state: %s\n", formatState(resp.State))
+	fmt.Printf("leader_id: %q\n", resp.LeaderId)
+	fmt.Printf("leader_address: %q\n", resp.LeaderAddress)
+	fmt.Printf("term: %d\n", resp.Term)
+	fmt.Printf("commit_index: %d\n", resp.CommitIndex)
+	fmt.Printf("applied_index: %d\n", resp.AppliedIndex)
+	fmt.Printf("last_log_index: %d\n", resp.LastLogIndex)
+	fmt.Printf("last_snapshot_index: %d\n", resp.LastSnapshotIndex)
+	fmt.Printf("fsm_pending: %d\n", resp.FsmPending)
+	fmt.Printf("num_peers: %d\n", resp.NumPeers)
+	fmt.Printf("last_contact_nanos: %d\n", resp.LastContactNanos)
 	return nil
 }
 
@@ -424,11 +444,12 @@ var usageStrings = map[string]string{
 	"add_learner":                   "raftadmin <addr> add_learner <id> <address> [previous_index]",
 	"promote_learner":               "raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index] [skip_min_applied_check]",
 	"remove_server":                 "raftadmin <addr> remove_server <id> [previous_index]",
+	"status":                        "raftadmin <addr> status",
 	"leadership_transfer":           "raftadmin <addr> leadership_transfer",
 	"leadership_transfer_to_server": "raftadmin <addr> leadership_transfer_to_server <id> <address>",
 }
 
-const usageFallback = "raftadmin <addr> <leader|state|configuration|add_voter|add_learner|promote_learner|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
+const usageFallback = "raftadmin <addr> <status|leader|state|configuration|add_voter|add_learner|promote_learner|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
 
 func usage(command string) string {
 	if u, ok := usageStrings[command]; ok {

@@ -53,6 +53,9 @@ func (r *RedisServer) proxyTransactionToLeader(conn redcon.Conn, queue []redcon.
 	if handleProxyTxnError(conn, err) {
 		return
 	}
+	if handleProxyTxnCommandError(conn, cmds) {
+		return
+	}
 	writeProxyCmdsResult(conn, cmds)
 }
 
@@ -103,11 +106,30 @@ func handleProxyTxnError(conn redcon.Conn, err error) bool {
 	// Fatal transport / context error: per-command results are unreliable.
 	if err != nil {
 		var netErr net.Error
-		if errors.Is(err, context.DeadlineExceeded) ||
+		if isTransientLeaderRedisError(err) ||
+			errors.Is(err, context.DeadlineExceeded) ||
 			errors.Is(err, context.Canceled) ||
 			errors.Is(err, io.EOF) ||
 			errors.Is(err, io.ErrUnexpectedEOF) ||
 			errors.As(err, &netErr) {
+			writeRedisError(conn, err)
+			return true
+		}
+	}
+	return false
+}
+
+// handleProxyTxnCommandError promotes transient leadership failures returned
+// by the proxied EXEC target to a top-level EXEC error. go-redis can surface a
+// target's EXEC-level error on the queued command handles; writing those as
+// EXEC array elements makes clients treat leadership churn like command data.
+func handleProxyTxnCommandError(conn redcon.Conn, cmds []*redis.Cmd) bool {
+	for _, cmd := range cmds {
+		err := cmd.Err()
+		if err == nil || errors.Is(err, redis.Nil) {
+			continue
+		}
+		if isTransientLeaderRedisError(err) {
 			writeRedisError(conn, err)
 			return true
 		}

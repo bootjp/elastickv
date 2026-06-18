@@ -68,6 +68,11 @@ type QueuesSource interface {
 	AdminListQueues(ctx context.Context) ([]string, error)
 	AdminDescribeQueue(ctx context.Context, name string) (*QueueSummary, bool, error)
 	AdminDeleteQueue(ctx context.Context, principal AuthPrincipal, name string) error
+	// AdminSetQueueAttributes updates SQS queue attributes through the
+	// same validator as the public SQS SetQueueAttributes path. The
+	// SPA uses this for DLQ configuration (RedrivePolicy and
+	// RedriveAllowPolicy).
+	AdminSetQueueAttributes(ctx context.Context, principal AuthPrincipal, name string, attrs map[string]string) error
 	// AdminPeekQueue returns a non-destructive sample of currently-
 	// visible messages on the queue (read role required). Wired only
 	// when the source supports it; the bridge in main_admin.go
@@ -228,6 +233,7 @@ func (h *SqsHandler) WithRoleStore(r RoleStore) *SqsHandler {
 //	GET    /admin/api/v1/sqs/queues                       — list
 //	GET    /admin/api/v1/sqs/queues/{name}                — describe
 //	DELETE /admin/api/v1/sqs/queues/{name}                — delete
+//	PUT    /admin/api/v1/sqs/queues/{name}/attributes     — set attributes
 //	GET    /admin/api/v1/sqs/queues/{name}/messages       — peek
 //	DELETE /admin/api/v1/sqs/queues/{name}/messages       — purge
 //
@@ -240,6 +246,7 @@ func (h *SqsHandler) WithRoleStore(r RoleStore) *SqsHandler {
 // /queues/{name}/{sub}. Anything else is a 404. Lifted to a constant
 // so the dispatcher and any future routing layer stay aligned.
 const sqsSubResourceMessages = "messages"
+const sqsSubResourceAttributes = "attributes"
 
 // sqsRouteSegmentsQueue / sqsRouteSegmentsMessages are the segment
 // counts the dispatcher recognises after the prefix trim. Named to
@@ -331,12 +338,20 @@ func (h *SqsHandler) dispatchSqsRoute(w http.ResponseWriter, r *http.Request, se
 		h.dispatchQueueResource(w, r, name)
 	case sqsRouteSegmentsMessages:
 		sub, err := decodeSqsPathSegment(segments[1])
-		if err != nil || sub != sqsSubResourceMessages {
+		if err != nil {
 			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
 				"unknown sub-resource on this queue")
 			return
 		}
-		h.dispatchMessagesResource(w, r, name)
+		switch sub {
+		case sqsSubResourceMessages:
+			h.dispatchMessagesResource(w, r, name)
+		case sqsSubResourceAttributes:
+			h.dispatchAttributesResource(w, r, name)
+		default:
+			writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
+				"unknown sub-resource on this queue")
+		}
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown_endpoint",
 			"too many path segments")
@@ -366,6 +381,17 @@ func (h *SqsHandler) dispatchMessagesResource(w http.ResponseWriter, r *http.Req
 		h.handlePurge(w, r, name)
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or DELETE")
+	}
+}
+
+// dispatchAttributesResource handles .../queues/{name}/attributes:
+// PUT = SetQueueAttributes through the admin-auth path.
+func (h *SqsHandler) dispatchAttributesResource(w http.ResponseWriter, r *http.Request, name string) {
+	switch r.Method {
+	case http.MethodPut:
+		h.handleSetAttributes(w, r, name)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only PUT")
 	}
 }
 
@@ -464,6 +490,36 @@ func (h *SqsHandler) handleDelete(w http.ResponseWriter, r *http.Request, name s
 		return
 	}
 	if err := h.source.AdminDeleteQueue(r.Context(), principal, name); err != nil {
+		writeQueuesError(w, err, h.logger, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type setQueueAttributesRequest struct {
+	Attributes map[string]string `json:"attributes"`
+}
+
+func (h *SqsHandler) handleSetAttributes(w http.ResponseWriter, r *http.Request, name string) {
+	principal, ok := h.principalForWrite(w, r, "set queue attributes")
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_queue_name", "queue name is required")
+		return
+	}
+	var req setQueueAttributesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "request body must be JSON")
+		return
+	}
+	if len(req.Attributes) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "attributes is required")
+		return
+	}
+	if err := h.source.AdminSetQueueAttributes(r.Context(), principal, name, req.Attributes); err != nil {
 		writeQueuesError(w, err, h.logger, r)
 		return
 	}

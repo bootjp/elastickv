@@ -383,25 +383,34 @@ func TestSQSServer_SetQueueAttributesRequiresAttributes(t *testing.T) {
 
 func TestSQSServer_CreateQueueValidatesRedrivePolicy(t *testing.T) {
 	t.Parallel()
-	// Now that the receive path implements DLQ redrive, RedrivePolicy
-	// must round-trip; only malformed policies are rejected.
+	// SQS requires the DLQ to exist before a source queue can point
+	// RedrivePolicy at it. maxReceiveCount itself defaults to 10 when
+	// omitted, matching the API reference.
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
 
-	// Missing maxReceiveCount → InvalidAttributeValue.
 	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
-		"QueueName": "bad-redrive",
+		"QueueName": "missing-dlq-redrive",
 		"Attributes": map[string]string{
 			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}`,
 		},
 	})
 	if status != http.StatusBadRequest {
-		t.Fatalf("CreateQueue with malformed RedrivePolicy: got %d want 400 (%v)", status, out)
+		t.Fatalf("CreateQueue with missing DLQ target: got %d want 400 (%v)", status, out)
 	}
 
-	// Well-formed RedrivePolicy succeeds and round-trips.
-	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq","maxReceiveCount":5}`
+	_ = createSQSQueueForTest(t, node, "dlq")
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "wrong-region-redrive",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-west-2:000000000000:dlq","maxReceiveCount":5}`,
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("CreateQueue with wrong-region DLQ ARN: got %d want 400 (%v)", status, out)
+	}
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}`
 	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
 		"QueueName": "with-redrive",
 		"Attributes": map[string]string{
@@ -419,6 +428,74 @@ func TestSQSServer_CreateQueueValidatesRedrivePolicy(t *testing.T) {
 	attrs, _ := out["Attributes"].(map[string]any)
 	if attrs["RedrivePolicy"] != policy {
 		t.Fatalf("RedrivePolicy not echoed back: %v", attrs)
+	}
+}
+
+func TestSQSServer_RedriveAllowPolicyControlsSourceQueues(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	denyAll := `{"redrivePermission":"denyAll"}`
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "dlq-deny-all",
+		"Attributes": map[string]string{
+			"RedriveAllowPolicy": denyAll,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create deny-all DLQ: %d %v", status, out)
+	}
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "deny-all-source",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-deny-all","maxReceiveCount":1}`,
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("source should not attach to denyAll DLQ: got %d want 400 (%v)", status, out)
+	}
+
+	byQueue := `{"redrivePermission":"byQueue","sourceQueueArns":["arn:aws:sqs:us-east-1:000000000000:allowed-source"]}`
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "dlq-by-queue",
+		"Attributes": map[string]string{
+			"RedriveAllowPolicy": byQueue,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create byQueue DLQ: %d %v", status, out)
+	}
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "rejected-source",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-by-queue","maxReceiveCount":1}`,
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("unlisted source should not attach to byQueue DLQ: got %d want 400 (%v)", status, out)
+	}
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "allowed-source",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-by-queue","maxReceiveCount":1}`,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("listed source should attach to byQueue DLQ: got %d (%v)", status, out)
+	}
+	url, _ := out["QueueUrl"].(string)
+	if url == "" {
+		t.Fatalf("allowed source create returned empty QueueUrl: %v", out)
+	}
+	_, out = callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       "http://example.invalid/dlq-by-queue",
+		"AttributeNames": []string{"RedriveAllowPolicy"},
+	})
+	attrs, _ := out["Attributes"].(map[string]any)
+	if attrs["RedriveAllowPolicy"] != byQueue {
+		t.Fatalf("RedriveAllowPolicy not echoed back: %v", attrs)
 	}
 }
 

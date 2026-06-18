@@ -236,6 +236,13 @@ func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.
 	return nil
 }
 
+func (b *sqsQueuesBridge) AdminSetQueueAttributes(ctx context.Context, principal admin.AuthPrincipal, name string, attrs map[string]string) error {
+	if err := b.server.AdminSetQueueAttributes(ctx, convertAdminPrincipal(principal), name, attrs); err != nil {
+		return translateAdminQueuesError(err)
+	}
+	return nil
+}
+
 func (b *sqsQueuesBridge) AdminPeekQueue(ctx context.Context, principal admin.AuthPrincipal, name string, opts admin.PeekMessageOptions) (admin.PeekResult, error) {
 	rows, nextCursor, err := b.server.AdminPeekQueue(ctx, convertAdminPrincipal(principal), name, adapter.AdminPeekMessageOptions{
 		Limit:        opts.Limit,

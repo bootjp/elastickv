@@ -296,22 +296,24 @@ fixed), so the adapter returns the remembered `plan` on a dedup no-op — no
 store re-read. This is the parent doc's R1 invariance, instantiated for the
 item write.
 
-### Gating (R5) — default off, ship the reader before the writer
+### Gating (R5) — default on, rollback switch remains
 
-Emission is gated behind a new DynamoDB flag, mirroring
-`RedisServer.onePhaseTxnDedup`:
+Emission is controlled by a DynamoDB flag, mirroring
+`RedisServer.onePhaseTxnDedup`. The probe-aware FSM reader now ships on every
+node, so the writer side can be the default behavior while retaining an
+operator rollback switch:
 
 - `DynamoDBServer.onePhaseTxnDedup bool`, set from
-  `os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") == "1"` and/or a
+  `os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") != "0"` and/or a
   `WithDynamoOnePhaseTxnDedup(bool)` server option (distinct symbol name to
   avoid colliding with the Redis `WithOnePhaseTxnDedup` in the same `adapter`
   package).
-- **Off** → `retryItemWriteWithGeneration` keeps its current
+- **On (default)** → the dedup loop above.
+- **Off (`ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` or
+  `WithDynamoOnePhaseTxnDedup(false)`)** →
+  `retryItemWriteWithGeneration` keeps its current
   recompute-on-retry behavior byte-for-byte; no `PrevCommitTS` is ever emitted;
-  the FSM probe never fires. No mixed-version divergence window.
-- **On** → the dedup loop above. Enable only after the whole cluster runs a
-  probe-aware binary (the FSM probe code is already everywhere as of the parent
-  doc's M2b, so this is satisfied on current `main`).
+  the FSM probe never fires.
 
 The FSM-determinism argument (R5 in the parent doc) holds unchanged: the probe
 decision depends only on the replicated `PrevCommitTS` and the deterministic
@@ -373,16 +375,16 @@ every replica applying the same log entry.
 
 ## Milestones
 
-### M1 — DynamoDB adapter reuse-dedup (gated)
+### M1 — DynamoDB adapter reuse-dedup (default on)
 
 - Adapter `commit_ts` allocation in the prepare step
   (`d.coordinator.Clock().NextFenced()` → `plan.req.CommitTS`).
 - `reusableItemWrite` struct + `dispatchItemWriteReuse` (mirror
   `reusableListPush` / `dispatchListPushReuse`).
-- `retryItemWriteWithGeneration` gains the gated dedup loop; the gate-off path
-  is unchanged.
+- `retryItemWriteWithGeneration` gains the dedup loop; the explicit opt-out
+  path is unchanged.
 - `DynamoDBServer.onePhaseTxnDedup` + `WithDynamoOnePhaseTxnDedup` + env var;
-  wire the env var in the server constructor.
+  wire the env var in the server constructor with `0` as the rollback value.
 - **Tests (`adapter/dynamodb_*_dedup_test.go`), all three outcomes against the
   real OCC + the real probe, plus the gate-off legacy path:**
   - `LandedPriorAttempt_ReturnsCachedResult` — attempt 1 lands then errors;
@@ -406,20 +408,21 @@ every replica applying the same log entry.
 
 - Local reproduction: 3-node demo under CPU pressure / shortened election
   timeouts (`cmd/server/demo.go`) so leadership flaps during the DynamoDB
-  workload, with `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1`.
+  workload. The default path has DynamoDB dedup enabled; set
+  `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` only to reproduce the legacy path.
 - **CI — LANDED.** The DynamoDB list-append workload is added to the dedup-mode
   workflow (`.github/workflows/jepsen-test-scheduled-dedup.yml`) with
-  `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1` set at the job env (read by
+  `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1` pinned at the job env (read by
   `adapter.NewDynamoDBServer` in the demo cluster), a fail-closed gate
   assertion before the listeners come up (mirroring the Redis assertion), and
   the launch step now also waits on the dynamo listeners (63801-63803). The
-  general workflow (`.github/workflows/jepsen-test-scheduled.yml`) continues to
-  run DynamoDB **gate-off** so the legacy path stays covered until default-on.
+  general workflow (`.github/workflows/jepsen-test-scheduled.yml`) explicitly
+  sets `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` so the legacy path stays covered
+  as a control baseline after default-on.
 - Criterion to default-on: 7 consecutive days without `:duplicate-elements` in
-  the dedup-mode DynamoDB workload, both workflows green. **Default-on is a
-  separate follow-up PR** flipping `DynamoDBServer.onePhaseTxnDedup`'s default
-  (and the env-var sense) only after the 7-day criterion is met — not done in
-  the workflow PR, to keep the ship-reader-before-writer sequencing (R5).
+  the dedup-mode DynamoDB workload, both workflows green. **Satisfied; this PR
+  flips `DynamoDBServer.onePhaseTxnDedup`'s default and the env-var sense to
+  default-on with `0` as the rollback value.**
 
 Scope estimate: M1 is ~120–180 LOC Go in `adapter/dynamodb.go` + tests; no FSM
 change (the probe already exists), no proto change, no new store primitive.
@@ -461,12 +464,17 @@ change (the probe already exists), no proto change, no new store primitive.
     `firstWriteKey`; for list-push the first write key and the min key coincide
     on the seq-addressed layout, but for the item write they need not.)
 - **R5 — FSM determinism across rolling upgrade.** Unchanged from the parent
-  doc: V1-default wire format (no `PrevCommitTS` ⇒ V1 meta), fail-loud
-  unknown-flag rejection, default-off emission. The probe-aware FSM is already
-  on `main`.
+  doc: V1-compatible opt-out wire format (no `PrevCommitTS` ⇒ V1 meta),
+  fail-loud unknown-flag rejection, and default-on emission only after the
+  probe-aware FSM ships on every node.
 
 ## Decision log
 
+- (2026-06-18) Default-on follow-up: `DynamoDBServer.onePhaseTxnDedup` now
+  defaults on because the probe-aware FSM reader is everywhere. Operators can
+  still set `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` or
+  `WithDynamoOnePhaseTxnDedup(false)` for rollback; the general scheduled
+  Jepsen workflow pins that opt-out to keep legacy-path coverage.
 - (2026-06-03, PR #920 round-1) **Leader-only dedup guard added** per codex P1:
   the adapter-local `commitTS` allocation is only safe on the leader, so the
   dedup path is gated on `d.coordinator.IsLeader()` (+ `NextFenced` ceiling
@@ -481,4 +489,4 @@ change (the probe already exists), no proto change, no new store primitive.
   (`2026_05_21_proposed_txn_secondary_idempotency.md`); the DynamoDB
   single-item write recomputes its write set on a self-inflicted
   `WriteConflict` under leadership churn and double-applies. Fix: extend
-  option-2 reuse-dedup to `retryItemWriteWithGeneration`, gated off by default.
+  option-2 reuse-dedup to `retryItemWriteWithGeneration`.
