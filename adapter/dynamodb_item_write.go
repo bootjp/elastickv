@@ -119,11 +119,12 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	exhaustedMessage string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, error) {
-	// Option-2 one-phase dedup (gated, default off): on a retryable write error,
-	// reuse the failed attempt's write set under a fresh commit_ts + prev_commit_ts
-	// so the FSM no-ops a commit that already landed under leadership churn,
-	// instead of re-reading and re-appending (the :duplicate-elements anomaly).
-	// See docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
+	// Option-2 one-phase dedup (default on, with an explicit rollback switch):
+	// on a retryable write error, reuse the failed attempt's write set under a
+	// fresh commit_ts + prev_commit_ts so the FSM no-ops a commit that already
+	// landed under leadership churn, instead of re-reading and re-appending (the
+	// :duplicate-elements anomaly). See
+	// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
 	//
 	// Leader-only (codex P1, PR #920): the dedup path allocates commit_ts from
 	// the LOCAL HLC and carries it as prev_commit_ts, so that timestamp MUST be
@@ -143,7 +144,7 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 
 // retryItemWriteWithGenerationLegacy is the pre-dedup retry loop: it recomputes
 // the write set from a fresh read on every retryable error. It is the active
-// path whenever the dedup gate is off or this node is not the leader, so it
+// path whenever dedup is explicitly off or this node is not the leader, so it
 // stays byte-identical to the pre-feature behavior.
 func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 	ctx context.Context,

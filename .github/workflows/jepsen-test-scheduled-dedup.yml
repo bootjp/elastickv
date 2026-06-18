@@ -1,23 +1,22 @@
 # Jepsen Scheduled Stress Test — Option-2 Dedup Mode
 #
 # Daily run with ELASTICKV_REDIS_ONEPHASE_DEDUP=1 and
-# ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1 so the demo cluster exercises the
-# option-2 idempotency path on both adapters. The criterion for
-# default-on (docs/design/2026_05_21 §M4 and
-# docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md §M2) is 7
-# consecutive days of green runs with no :duplicate-elements /
-# :G-single-item-realtime anomalies in each workload's analysis output.
+# ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1 pinned so the demo cluster exercises the
+# option-2 idempotency path on both adapters, independent of future default
+# changes. This preserves the high-pressure dedup signal for
+# :duplicate-elements / :G-single-item-realtime anomalies in each workload's
+# analysis output.
 #
-# Scope: Redis + DynamoDB workloads. The dedup feature ships behind the
+# Scope: Redis + DynamoDB workloads. The dedup feature is controlled by the
 # Redis adapter's onePhaseTxnDedup flag (RPUSH/LPUSH, MULTI/EXEC,
 # standalone SET) and the DynamoDB adapter's onePhaseTxnDedup flag
-# (single-item UpdateItem/PutItem/DeleteItem via PR #920). S3 / SQS do
+# (single-item UpdateItem/PutItem/DeleteItem). S3 / SQS do
 # not yet route through the dedup loop, so re-running them here would add
 # hours of CI for no signal on the new code path.
 #
 # Cadence: 03:17 UTC daily (off-peak; non-zero minute per ScheduleWakeup
 # guidance). The general 6-hourly scheduled workflow continues to run
-# without the dedup gate so the legacy path also stays covered.
+# with explicit dedup opt-outs so the legacy path also stays covered.
 
 on:
   schedule:
@@ -72,8 +71,8 @@ jobs:
       # state. Anomalies in :duplicate-elements / :G-single-item-realtime
       # under this flag indicate a regression in option-2 plumbing.
       ELASTICKV_REDIS_ONEPHASE_DEDUP: "1"
-      # Enable the DynamoDB adapter option-2 dedup gate (PR #920). demo.go
-      # wires it via adapter.NewDynamoDBServer, which reads this env var;
+      # Pin the DynamoDB adapter option-2 dedup path on. demo.go wires it
+      # via adapter.NewDynamoDBServer, which reads this env var;
       # the single-item write path (UpdateItem/PutItem/DeleteItem) then
       # routes through retryItemWriteWithGenerationDedup on the leader,
       # exercising the same FSM exact-ts probe as the Redis path. The
@@ -156,7 +155,7 @@ jobs:
           # The env vars are set at the JOB level above and inherited by
           # all `run:` steps; nothing in demo.go can intercept or unset
           # them before the adapters read os.Getenv. So if they are "1"
-          # here, the dedup gates ARE active in the cluster. We print
+          # here, the dedup paths ARE active in the cluster. We print
           # them explicitly so a failed run's log makes the configuration
           # unambiguous (vs the general 6-hourly workflow whose runs would
           # have empty values here).
@@ -165,7 +164,7 @@ jobs:
             exit 2
           fi
           if [ "${ELASTICKV_DYNAMODB_ONEPHASE_DEDUP:-}" != "1" ]; then
-            echo "FATAL: ELASTICKV_DYNAMODB_ONEPHASE_DEDUP is not '1' — this workflow runs only with the dedup gate on"
+            echo "FATAL: ELASTICKV_DYNAMODB_ONEPHASE_DEDUP is not '1' — this workflow pins the dedup path on"
             exit 2
           fi
 
@@ -199,7 +198,7 @@ jobs:
         working-directory: jepsen
         timeout-minutes: 10
         # --local connects to the already-running demo cluster's dynamo
-        # ports (gate ON via ELASTICKV_DYNAMODB_ONEPHASE_DEDUP), so the
+        # ports (dedup ON via ELASTICKV_DYNAMODB_ONEPHASE_DEDUP), so the
         # single-item list_append writes exercise the option-2 reuse +
         # exact-ts probe path. A :duplicate-elements anomaly here is the
         # regression this workflow is meant to catch.
