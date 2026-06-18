@@ -265,6 +265,12 @@ func TestItemWriteDedup_OptionOverridesEnv(t *testing.T) {
 	require.True(t, server.onePhaseTxnDedup)
 }
 
+func TestItemWriteDedup_OptionOverridesEnvToDisable(t *testing.T) {
+	t.Setenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP", "1")
+	server := NewDynamoDBServer(nil, store.NewMVCCStore(), newDedupTestCoordinator(store.NewMVCCStore(), 0, false), WithDynamoOnePhaseTxnDedup(false))
+	require.False(t, server.onePhaseTxnDedup)
+}
+
 // TestItemWriteDedup_DisabledKeepsLegacyPath pins that the gate is load-bearing:
 // with onePhaseTxnDedup explicitly OFF, the legacy retry RE-READS and
 // recomputes, so a landed-then-ambiguous attempt 1 is double-applied — the
