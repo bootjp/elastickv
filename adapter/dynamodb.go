@@ -131,10 +131,9 @@ type DynamoDBServer struct {
 	// retryable write error, the retry REUSES the failed attempt's write set
 	// under a fresh commit_ts and carries prev_commit_ts so the FSM no-ops a
 	// commit that already landed under leadership churn (the :duplicate-elements
-	// anomaly). It MUST stay off until every node runs a probe-aware binary —
-	// see R5 in docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md.
-	// Default off; enabled via WithDynamoOnePhaseTxnDedup or the
-	// ELASTICKV_DYNAMODB_ONEPHASE_DEDUP env var.
+	// anomaly). The FSM probe now ships on every node, so this defaults on.
+	// Set ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0 or pass
+	// WithDynamoOnePhaseTxnDedup(false) for an operator rollback.
 	onePhaseTxnDedup bool
 }
 
@@ -163,9 +162,11 @@ func WithDynamoDBLeaderMap(m map[string]string) DynamoDBServerOption {
 	}
 }
 
-// WithDynamoOnePhaseTxnDedup enables the option-2 one-phase idempotency dedup on
-// the single-item write retry path (see DynamoDBServer.onePhaseTxnDedup). Off by
-// default; enable only after the whole cluster runs a probe-aware binary.
+// WithDynamoOnePhaseTxnDedup enables or disables the option-2 one-phase
+// idempotency dedup on the single-item write retry path (see
+// DynamoDBServer.onePhaseTxnDedup). It defaults on; pass false to opt out from
+// code, or set ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0 to opt out from the
+// environment. The constructor option trumps the env var.
 func WithDynamoOnePhaseTxnDedup(enabled bool) DynamoDBServerOption {
 	return func(server *DynamoDBServer) {
 		server.onePhaseTxnDedup = enabled
@@ -259,7 +260,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		listen:           listen,
 		store:            st,
 		coordinator:      coordinate,
-		onePhaseTxnDedup: os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") == "1",
+		onePhaseTxnDedup: os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") != "0",
 	}
 	d.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
 		createTableTarget:        d.createTable,
