@@ -2060,9 +2060,6 @@ func handleProxyTxnError(conn redcon.Conn, err error) bool {
 // EXEC array elements makes clients treat leadership churn like command data.
 func handleProxyTxnCommandError(conn redcon.Conn, cmds []*redis.Cmd) bool {
 	for _, cmd := range cmds {
-		if cmd == nil {
-			continue
-		}
 		err := cmd.Err()
 		if err == nil || errors.Is(err, redis.Nil) {
 			continue
