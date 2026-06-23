@@ -46,17 +46,18 @@ check-tools:
 	fi
 
 breaking: check-tools
-	@baseline=''; \
-	if git -C .. rev-parse --verify main >/dev/null 2>&1; then \
-		baseline='../.git#subdir=proto,branch=main'; \
-	elif git -C .. rev-parse --verify origin/main >/dev/null 2>&1; then \
-		baseline='../.git#subdir=proto,ref=refs/remotes/origin/main'; \
-	else \
-		echo "no breaking baseline found: neither 'main' nor 'origin/main' is reachable"; \
-		echo "fetch main first (git fetch origin main) or override with BREAKING_AGAINST=..."; \
-		exit 1; \
+	@baseline='$(BREAKING_AGAINST)'; \
+	if [ -z "$$baseline" ]; then \
+		if git -C .. rev-parse --verify origin/main >/dev/null 2>&1; then \
+			baseline='../.git#subdir=proto,ref=refs/remotes/origin/main'; \
+		elif git -C .. rev-parse --verify main >/dev/null 2>&1; then \
+			baseline='../.git#subdir=proto,branch=main'; \
+		else \
+			echo "no breaking baseline found: neither 'main' nor 'origin/main' is reachable"; \
+			echo "fetch main first (git fetch origin main) or override with BREAKING_AGAINST=..."; \
+			exit 1; \
+		fi; \
 	fi; \
-	if [ -n "$(BREAKING_AGAINST)" ]; then baseline='$(BREAKING_AGAINST)'; fi; \
 	$(BUF) breaking --against "$$baseline"
 
 gen: check-tools breaking
