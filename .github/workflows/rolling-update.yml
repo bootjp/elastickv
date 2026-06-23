@@ -175,24 +175,19 @@ jobs:
             local all="$1"
             local filter="$2"
             local out=""
-            local e key w
+            local w value
             if [[ -z "$all" ]]; then
               printf '%s' ""
               return 0
             fi
-            IFS=',' read -r -a list_entries <<< "$all"
             IFS=',' read -r -a list_wanted <<< "$filter"
-            for e in "${list_entries[@]}"; do
-              e="${e//[[:space:]]/}"
-              [[ -n "$e" ]] || continue
-              key="${e%%=*}"
-              for w in "${list_wanted[@]}"; do
-                w="${w//[[:space:]]/}"
-                if [[ "$key" == "$w" ]]; then
-                  out+="${out:+,}$e"
-                  break
-                fi
-              done
+            for w in "${list_wanted[@]}"; do
+              w="${w//[[:space:]]/}"
+              [[ -n "$w" ]] || continue
+              value="$(lookup_map "$w" "$all" || true)"
+              if [[ -n "$value" ]]; then
+                out+="${out:+,}${w}=${value}"
+              fi
             done
             printf '%s' "$out"
           }
@@ -243,8 +238,13 @@ jobs:
           fi
           NODES_FILTER="${NODES_FILTER//[[:space:]]/}"
 
+          ROLLING_ORDER="$(known_ids_csv "$NODES_RAFT_MAP")"
           if [[ -n "$NODES_FILTER" ]]; then
-            # Filter NODES_RAFT_MAP and SSH_TARGETS_MAP to the requested subset.
+            # Keep NODES_RAFT_MAP as the full cluster map. rolling-update.sh
+            # derives RAFT_TO_REDIS_MAP / RAFT_TO_S3_MAP and transfer
+            # candidates from NODES, so filtering it for a staged rollout would
+            # start the target node with an incomplete view of the cluster.
+            # The requested subset is passed separately as ROLLING_ORDER.
             # Reject any filter ID that does not appear in the map: silently
             # dropping unknown IDs would let a typo like "n1,n9" proceed as
             # a one-node rollout of n1 alone, which is a staged-deploy
@@ -261,39 +261,44 @@ jobs:
               echo "::error::nodes filter '$NODES_FILTER' references unknown raft IDs: $unknown. Known IDs: $(known_ids_csv "$NODES_RAFT_MAP")"
               exit 1
             fi
-            NODES_RAFT_MAP="$(filter_csv "$NODES_RAFT_MAP" "$NODES_FILTER")"
-            SSH_TARGETS_MAP="$(filter_csv "$SSH_TARGETS_MAP" "$NODES_FILTER")"
-            if [[ -z "$NODES_RAFT_MAP" ]]; then
+            ROLLING_ORDER="$(known_ids_csv "$(filter_csv "$NODES_RAFT_MAP" "$NODES_FILTER")")"
+            if [[ -z "$ROLLING_ORDER" ]]; then
               echo "::error::nodes filter '$NODES_FILTER' matches nothing in NODES_RAFT_MAP"
               exit 1
             fi
           fi
           SSH_TARGETS_MAP="$(materialize_ssh_targets "$NODES_RAFT_MAP" "$SSH_TARGETS_MAP")"
+          ROLLING_SSH_TARGETS="$(filter_csv "$SSH_TARGETS_MAP" "$ROLLING_ORDER")"
           {
             echo "NODES=$NODES_RAFT_MAP"
             echo "SSH_TARGETS=$SSH_TARGETS_MAP"
+            echo "ROLLING_ORDER=$ROLLING_ORDER"
+            echo "ROLLING_SSH_TARGETS=$ROLLING_SSH_TARGETS"
           } >> "$GITHUB_OUTPUT"
           echo "::group::Deploy plan"
           echo "NODES=$NODES_RAFT_MAP"
           echo "SSH_TARGETS=$SSH_TARGETS_MAP"
+          echo "ROLLING_ORDER=$ROLLING_ORDER"
+          echo "ROLLING_SSH_TARGETS=$ROLLING_SSH_TARGETS"
           echo "::endgroup::"
 
-      - name: Tailscale reachability check
+      - name: SSH reachability check
         env:
-          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          SSH_TARGETS: ${{ steps.render.outputs.ROLLING_SSH_TARGETS }}
+          SSH_USER: ${{ vars.SSH_USER }}
         run: |
           set -euo pipefail
           IFS=',' read -r -a entries <<< "$SSH_TARGETS"
           failed=0
           for e in "${entries[@]}"; do
-            host="${e##*=}"
-            host="${host%%:*}"
-            # strip user@ if present
-            host="${host##*@}"
-            if tailscale ping --c 2 --timeout 3s "$host" >/dev/null 2>&1; then
-              echo "  ok   $host"
+            target="${e##*=}"
+            if [[ "$target" != *@* ]]; then
+              target="${SSH_USER:-$(id -un)}@$target"
+            fi
+            if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$target" true; then
+              echo "  ok   $target"
             else
-              echo "::error::$host not reachable over tailnet"
+              echo "::error::$target not reachable by SSH over tailnet"
               failed=1
             fi
           done
@@ -306,6 +311,7 @@ jobs:
         env:
           NODES: ${{ steps.render.outputs.NODES }}
           SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
           IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
           SSH_USER: ${{ vars.SSH_USER }}
           DRY_RUN: "true"
@@ -321,6 +327,7 @@ jobs:
         env:
           NODES: ${{ steps.render.outputs.NODES }}
           SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
           SSH_USER: ${{ vars.SSH_USER }}
           IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
           SSH_STRICT_HOST_KEY_CHECKING: "yes"

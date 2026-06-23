@@ -46,11 +46,24 @@ In the Tailscale admin console, add the deploy rule to the tailnet ACL:
     "src":    ["tag:ci-deploy"],
     "dst":    ["tag:elastickv-node:22"],
   },
+  {
+    "action": "accept",
+    "src":    ["tag:elastickv-node"],
+    "dst":    [
+      "tag:elastickv-node:50051", // Raft / raftadmin
+      "tag:elastickv-node:6379",  // Redis adapter, if enabled
+      "tag:elastickv-node:9000",  // S3 adapter, if enabled
+    ],
+  },
 ],
 ```
 
 `tag:ci-deploy` must NOT have access to any other port on the tailnet. The
-deploy workflow only needs SSH.
+deploy workflow only needs SSH. Node-to-node access is separate: every
+`tag:elastickv-node` must be able to reach the cluster ports advertised in
+`NODES_RAFT_MAP` / derived adapter maps, otherwise a restarted node can come
+back with peer addresses it cannot dial and leader-transfer probes can fail
+mid-roll.
 
 ## 3. Tailscale OAuth client
 
@@ -109,15 +122,16 @@ Regenerate on operator rotation.
 |------|-------|---------|
 | `IMAGE_BASE`      | Container image path (no tag)     | `ghcr.io/bootjp/elastickv` |
 | `SSH_USER`        | SSH login on every node           | `bootjp` |
-| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). Use full MagicDNS FQDNs so every node can resolve the advertised address regardless of local DNS search domains. The workflow renders this into the script's `NODES` env var. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,n3=kv03.<tailnet>.ts.net,n4=kv04.<tailnet>.ts.net,n5=kv05.<tailnet>.ts.net` |
+| `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). Use full MagicDNS FQDNs so every node can resolve the advertised address regardless of local DNS search domains. The workflow always renders the full map into the script's `NODES` env var, even for subset rollouts; the `nodes` input becomes `ROLLING_ORDER` so the script still derives full-cluster peer maps. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,n3=kv03.<tailnet>.ts.net,n4=kv04.<tailnet>.ts.net,n5=kv05.<tailnet>.ts.net` |
 | `SSH_TARGETS_MAP` | Optional comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. If the variable is empty or an ID is omitted, the workflow falls back to that ID's `NODES_RAFT_MAP` host so reachability checks still cover every rollout node. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
 
 **Why two names?** The workflow uses `NODES_RAFT_MAP` / `SSH_TARGETS_MAP`
 in the `production` environment to keep the GitHub-side names
 distinct from the script-side env var names it hands to
 `rolling-update.sh`. If you run the script by hand from a workstation
-you must export `NODES` and `SSH_TARGETS` directly — the workflow-side
-names are only understood by the workflow's render step.
+you must export `NODES` and `SSH_TARGETS` directly, plus `ROLLING_ORDER`
+when you want a subset rollout — the workflow-side names are only
+understood by the workflow's render step.
 
 ## 5. Running a deploy
 
@@ -145,7 +159,15 @@ Recommended first-run sequence:
 ## 6. Rollback
 
 Re-run the workflow with `image_tag` set to the previous-known-good sha. The
+Docker image workflow publishes both `latest` and the immutable commit-SHA tag
+for each main-branch build, so SHA rollback works without a manual retag. The
 `nodes` input can target specific nodes if only some carry the bad image.
+
+For private GHCR packages, each node must already be logged in to `ghcr.io`
+with a deploy-scoped read token, or the remote `docker pull` will fail even
+though the workflow runner's manifest check succeeded. Keep that credential
+rotation outside this workflow for v1; the workflow only verifies that the tag
+exists from the runner side.
 
 ### If a running workflow is cancelled mid-rollout
 
@@ -190,7 +212,7 @@ and only the still-stale one gets recreated.
 
 ## 7. What the workflow does NOT do (yet)
 
-- **No post-deploy health verification beyond tailnet reachability.** The
+- **No post-deploy health verification beyond SSH reachability.** The
   script itself blocks on `raftadmin` leadership transfer and health-gate
   timeouts, but the workflow does not independently probe Prometheus or
   Redis after the roll. Add this when we have a canonical post-deploy
@@ -214,10 +236,11 @@ environment" for the dry-run-approval alternatives (approach 2: add a
 second `production-dry-run` environment without required reviewers)
 if the friction becomes intolerable.
 
-### `tailscale ping` fails for a node
+### SSH reachability fails for a node
 The node may not be running `tailscaled`, not tagged `tag:elastickv-node`, or
-the tailnet ACL may have drifted. `tailscale status` on the node should show
-the tag; the admin console should show the IP in the `tag:elastickv-node`
+the system `sshd` may not be reachable over the tailnet ACL. `tailscale status`
+on the node should show the tag; the admin console should show the IP in the
+`tag:elastickv-node`
 group.
 
 ### `image ... not found on ghcr.io`

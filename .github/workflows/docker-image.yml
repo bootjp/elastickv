@@ -40,6 +40,8 @@ jobs:
           platforms: linux/amd64
 #          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/${{ github.REPOSITORY }}:latest
+          tags: |
+            ghcr.io/${{ github.REPOSITORY }}:latest
+            ghcr.io/${{ github.REPOSITORY }}:${{ github.sha }}
 #          cache-from: type=gha
 #          cache-to: type=gha,mode=max
