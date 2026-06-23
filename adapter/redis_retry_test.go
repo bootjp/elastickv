@@ -217,6 +217,50 @@ func TestRedisExecLuaCompatRetriesWriteConflict(t *testing.T) {
 	require.Equal(t, 1.0, zset.Entries[0].Score)
 }
 
+func TestRedisZRemWideColumnRemovesMemberAndScoreIndex(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newRetryOnceCoordinator(st)
+
+	srv := &RedisServer{
+		store:       st,
+		coordinator: coord,
+		scriptCache: map[string]string{},
+	}
+
+	key := []byte("retry:zrem-wide")
+	addConn := &recordingConn{}
+	srv.zadd(addConn, redcon.Command{Args: [][]byte{
+		[]byte(cmdZAdd), key,
+		[]byte("55"), []byte("m8"),
+		[]byte("-49"), []byte("m6"),
+	}})
+	require.Empty(t, addConn.err)
+	require.Equal(t, int64(2), addConn.int)
+
+	remConn := &recordingConn{}
+	srv.zrem(remConn, redcon.Command{Args: [][]byte{
+		[]byte(cmdZRem), key, []byte("m8"),
+	}})
+	require.Empty(t, remConn.err)
+	require.Equal(t, int64(1), remConn.int)
+
+	readTS := snapshotTS(coord.clock, st)
+	zset, exists, err := srv.loadZSetAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, []redisZSetEntry{{Member: "m6", Score: -49}}, zset.Entries)
+
+	memberExists, err := st.ExistsAt(ctx, store.ZSetMemberKey(key, []byte("m8")), readTS)
+	require.NoError(t, err)
+	require.False(t, memberExists)
+	scoreExists, err := st.ExistsAt(ctx, store.ZSetScoreKey(key, 55, []byte("m8")), readTS)
+	require.NoError(t, err)
+	require.False(t, scoreExists)
+}
+
 func TestRedisEvalRetriesWriteConflict(t *testing.T) {
 	t.Parallel()
 

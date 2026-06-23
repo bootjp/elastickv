@@ -814,6 +814,81 @@
     (is (not (:valid? (run-checker read-3)))
         "expected 3.0 intermediate return value to be rejected")))
 
+(deftest overlapping-base-mutation-is-not-forced-before-tail-candidates
+  ;; The first ZINCRBY completes before the read and before the second
+  ;; increment starts, but it still overlaps the earlier ZADD. It must stay in
+  ;; the same real-time enumeration as that ZADD; forcing it into a fixed base
+  ;; prefix would apply it to the absent state and reject this valid history.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]   :index 0}
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 1]   :index 1}
+                 {:type :ok     :process 1 :f :zincrby :value ["m1" 2.0] :index 2}
+                 {:type :invoke :process 2 :f :zincrby :value ["m1" 1]   :index 3}
+                 {:type :ok     :process 2 :f :zincrby :value ["m1" 3.0] :index 4}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]   :index 5}
+                 {:type :invoke :process 3 :f :zrange-all                :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 3.0]] :index 7}]]
+    (is (:valid? (run-checker history))
+        "expected overlapping base mutation to remain reorderable with the tail")))
+
+(deftest later-read-cannot-switch-overlapping-write-order
+  ;; Once all ambiguous writes completed before the first read, later reads
+  ;; cannot independently choose a different serialization unless another
+  ;; mutation could have taken effect between the reads.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m1" 1] :index 0}
+                 {:type :invoke :process 1 :f :zadd       :value ["m1" 2] :index 1}
+                 {:type :ok     :process 0 :f :zadd       :value ["m1" 1] :index 2}
+                 {:type :ok     :process 1 :f :zadd       :value ["m1" 2] :index 3}
+                 {:type :invoke :process 2 :f :zrange-all                 :index 4}
+                 {:type :ok     :process 2 :f :zrange-all
+                  :value [["m1" 2.0]] :index 5}
+                 {:type :invoke :process 3 :f :zrange-all                 :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 1.0]] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected read order switch to be rejected, got: " result))
+    (is (contains? kinds :unstable-read-without-mutation)
+        (str "expected :unstable-read-without-mutation, got kinds=" kinds))))
+
+(deftest zrange-all-uses-one-prefix-across-members
+  ;; Seeing m1's concurrent ZADD forces the read prefix past any successful
+  ;; mutation that completed before that ZADD was invoked. Omitting m2 would
+  ;; combine two different prefixes in one full snapshot.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m2" 2] :index 0}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 1}
+                 {:type :ok     :process 0 :f :zadd       :value ["m2" 2] :index 2}
+                 {:type :invoke :process 2 :f :zadd       :value ["m1" 1] :index 3}
+                 {:type :ok     :process 2 :f :zadd       :value ["m1" 1] :index 4}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 1.0]] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected fractured full read to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
+
+(deftest zrangebyscore-uses-one-prefix-across-members
+  ;; The same prefix rule applies to range reads when the omitted predecessor
+  ;; is forced to be present inside the requested score bounds.
+  (let [history [{:type :invoke :process 0 :f :zadd         :value ["m2" 2] :index 0}
+                 {:type :invoke :process 1 :f :zrangebyscore
+                  :value [0.0 10.0] :index 1}
+                 {:type :ok     :process 0 :f :zadd         :value ["m2" 2] :index 2}
+                 {:type :invoke :process 2 :f :zadd         :value ["m1" 1] :index 3}
+                 {:type :ok     :process 2 :f :zadd         :value ["m1" 1] :index 4}
+                 {:type :ok     :process 1 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :members [["m1" 1.0]]} :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected fractured range read to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix-range)
+        (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
+
 (deftest info-plus-ok-zincrby-stays-bounded
   ;; A :info ZINCRBY still has a known delta. Once the surrounding state is
   ;; known, it admits the pre-info state or the delta-applied state, not an

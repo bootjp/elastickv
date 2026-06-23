@@ -3467,6 +3467,48 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 		}
 		return r.dispatchElems(ctx, true, readTS, elems)
 	}
+
+	memberPrefix := store.ZSetMemberScanPrefix(key)
+	memberEnd := store.PrefixScanEnd(memberPrefix)
+	probeKVs, probeErr := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+	if probeErr != nil {
+		return cockerrors.WithStack(probeErr)
+	}
+	if len(probeKVs) > 0 {
+		current, _, err := r.loadZSetAt(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+		st := &zsetTxnState{
+			members:     zsetEntriesToMap(entries),
+			origMembers: zsetEntriesToMap(current.Entries),
+			isWide:      true,
+			exists:      true,
+			dirty:       true,
+		}
+		elems, lenDelta := buildZSetWideElems(key, st)
+		if lenDelta != 0 {
+			commitTS := r.coordinator.Clock().Next()
+			deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
+			elems = append(elems, &kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
+				Value: deltaVal,
+			})
+			_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+				IsTxn:    true,
+				StartTS:  normalizeStartTS(readTS),
+				CommitTS: commitTS,
+				Elems:    elems,
+			})
+			return cockerrors.WithStack(dispatchErr)
+		}
+		if len(elems) == 0 {
+			return nil
+		}
+		return r.dispatchElems(ctx, true, readTS, elems)
+	}
+
 	payload, err := marshalZSetValue(redisZSetValue{Entries: entries})
 	if err != nil {
 		return err

@@ -589,6 +589,14 @@
   (and (some? (:complete-idx a))
        (< (:complete-idx a) (:invoke-idx b))))
 
+(defn- unique-mutations
+  [muts]
+  (->> muts
+       (reduce (fn [acc m] (assoc acc (:invoke-idx m) m))
+               (sorted-map))
+       vals
+       vec))
+
 (defn- drop-index
   [v idx]
   (vec (concat (subvec v 0 idx) (subvec v (inc idx)))))
@@ -634,6 +642,44 @@
                     result))))]
       (step initial-states items))))
 
+(defn- possible-states-for-member
+  "Enumerate possible states for one member at a read. `force-required?`
+  can promote otherwise-concurrent successful mutations into the read prefix;
+  this is used by cross-member prefix checks when another visible mutation
+  forces all real-time predecessors into the same read prefix."
+  ([mutations-by-m member read-inv-idx read-cmp-idx]
+   (possible-states-for-member mutations-by-m
+                               member
+                               read-inv-idx
+                               read-cmp-idx
+                               (constantly false)))
+  ([mutations-by-m member read-inv-idx read-cmp-idx force-required?]
+   (let [muts (get mutations-by-m member [])
+         preceding-ok? #(and (= :ok (:type %))
+                             (some? (:complete-idx %))
+                             (< (:complete-idx %) read-inv-idx))
+         required (->> muts
+                       (filter #(or (preceding-ok? %)
+                                    (and (= :ok (:type %))
+                                         (force-required? %))))
+                       unique-mutations)
+         required-ids (set (map :invoke-idx required))
+         required? #(contains? required-ids (:invoke-idx %))
+         pre-read-info (->> muts
+                            (filter #(and (= :info (:type %))
+                                          (some? (:complete-idx %))
+                                          (< (:complete-idx %) read-inv-idx)
+                                          (not (required? %))
+                                          (not (superseded-by-preceding-state-change?
+                                                 required %)))))
+         concurrent (->> (concurrent-mutations-for-member muts
+                                                          read-inv-idx
+                                                          read-cmp-idx)
+                         (remove required?))]
+     (linearized-read-states #{absent-state}
+                             required
+                             (concat pre-read-info concurrent)))))
+
 (defn- allowed-scores-for-member
   "Compute the set of states considered valid for `member` by a read
   whose window is [read-inv-idx, read-cmp-idx].
@@ -645,52 +691,10 @@
   those constraints by enumerating the committed tail plus any optional
   :info/pending/concurrent operations in real-time-consistent orders."
   [mutations-by-m member read-inv-idx read-cmp-idx]
-  (let [muts (get mutations-by-m member [])
-        ;; :ok mutations that completed strictly before the read.
-        preceding (->> muts
-                       (filter #(and (= :ok (:type %))
-                                     (some? (:complete-idx %))
-                                     (< (:complete-idx %) read-inv-idx))))
-        ;; Real-time "last-wins" / chain-tail candidate filter: a
-        ;; preceding mutation m is admissible iff no OTHER preceding
-        ;; mutation m' has m'.invoke-idx > m.complete-idx (i.e. m'
-        ;; strictly follows m in real time). Equivalent:
-        ;; m.complete-idx >= max(invoke-idx) over preceding.
-        ;;
-        ;; Importantly this applies to :zincrby as well: a sequentially
-        ;; committed ZINCRBY chain has a forced linearization (each
-        ;; :ok :zincrby pins the pre-op and post-op states), so only
-        ;; the latest chain tail's return value is a valid final score
-        ;; for a post-chain read. An intermediate ZINCRBY's return
-        ;; value is NOT admissible once another mutation strictly
-        ;; follows it and commits before the read. A ZADD that strictly
-        ;; follows a ZINCRBY likewise resets the chain (the ZADD's
-        ;; absolute score becomes the only candidate).
-        ;;
-        ;; When multiple candidates remain (their invoke/complete
-        ;; windows overlap), they may serialize in any real-time-
-        ;; consistent order and any of their return values is a valid
-        ;; final state.
-        max-inv (reduce max -1 (map :invoke-idx preceding))
-        candidates (filterv #(>= (:complete-idx %) max-inv) preceding)
-        base-preceding (->> preceding
-                            (remove (set candidates))
-                            vec)
-        ;; :info mutations that completed before the read: they may or
-        ;; may not have taken effect server-side.
-        pre-read-info (->> muts
-                           (filter #(and (= :info (:type %))
-                                         (some? (:complete-idx %))
-                                         (< (:complete-idx %) read-inv-idx)
-                                         (not (superseded-by-preceding-state-change?
-                                                preceding %)))))
-        ;; Concurrent mutations: windows overlap the read. Include both
-        ;; :ok and :info since either may have taken effect before the
-        ;; read linearized.
-        concurrent (concurrent-mutations-for-member muts read-inv-idx read-cmp-idx)
-        uncertain (concat pre-read-info concurrent)
-        base-states (linearized-read-states #{absent-state} base-preceding [])
-        possible-states (linearized-read-states base-states candidates uncertain)
+  (let [possible-states (possible-states-for-member mutations-by-m
+                                                    member
+                                                    read-inv-idx
+                                                    read-cmp-idx)
         present-states (filter :present? possible-states)
         scores (set (map :score present-states))
         can-be-present? (boolean (seq present-states))
@@ -716,6 +720,149 @@
        frequencies
        (keep (fn [[m n]] (when (> n 1) m)))
        set))
+
+(defn- without-mutation
+  [mutations-by-m target]
+  (update mutations-by-m
+          (:member target)
+          (fn [muts]
+            (vec (remove #(= (:invoke-idx %) (:invoke-idx target))
+                         muts)))))
+
+(defn- mutation-can-produce-score?
+  [m score]
+  (case (:f m)
+    :zadd
+    (score-eq? (:score m) score)
+
+    :zincrby
+    (and (= :ok (:type m))
+         (score-eq? (:score m) score))
+
+    false))
+
+(defn- observed-score-requires-mutation?
+  [mutations-by-m m member score read-inv-idx read-cmp-idx]
+  (and (not= :fail (:type m))
+       (= member (:member m))
+       (concurrent? m read-inv-idx read-cmp-idx)
+       (mutation-can-produce-score? m score)
+       (let [{:keys [scores can-be-present?]}
+             (allowed-scores-for-member (without-mutation mutations-by-m m)
+                                        member
+                                        read-inv-idx
+                                        read-cmp-idx)]
+         (or (not can-be-present?)
+             (not (contains? scores score))))))
+
+(defn- forced-prefix-visible?
+  [mutations-by-m member read-inv-idx read-cmp-idx anchor bounds]
+  (let [states (possible-states-for-member
+                 mutations-by-m
+                 member
+                 read-inv-idx
+                 read-cmp-idx
+                 #(real-time-before? % anchor))]
+    (and (seq states)
+         (every?
+           (fn [st]
+             (and (:present? st)
+                  (if-let [[lo hi] bounds]
+                    (<= lo (:score st) hi)
+                    true)))
+           states))))
+
+(defn- read-prefix-errors
+  [mutations-by-m entries read-inv-idx read-cmp-idx bounds]
+  (let [observed (into {} entries)
+        all-mutations (mapcat second mutations-by-m)
+        kind (if bounds :fractured-read-prefix-range :fractured-read-prefix)]
+    (->> (for [[member score] entries
+               anchor (get mutations-by-m member)
+               :when (observed-score-requires-mutation? mutations-by-m
+                                                       anchor
+                                                       member
+                                                       score
+                                                       read-inv-idx
+                                                       read-cmp-idx)
+               predecessor all-mutations
+               :when (and (not= member (:member predecessor))
+                          (= :ok (:type predecessor))
+                          (real-time-before? predecessor anchor)
+                          (not (contains? observed (:member predecessor)))
+                          (forced-prefix-visible? mutations-by-m
+                                                  (:member predecessor)
+                                                  read-inv-idx
+                                                  read-cmp-idx
+                                                  anchor
+                                                  bounds))]
+           (cond-> {:kind kind
+                    :index read-cmp-idx
+                    :visible-member member
+                    :visible-score score
+                    :visible-op (:f anchor)
+                    :visible-invoke-idx (:invoke-idx anchor)
+                    :omitted-member (:member predecessor)
+                    :predecessor-op (:f predecessor)
+                    :predecessor-complete-idx (:complete-idx predecessor)}
+             bounds (assoc :bounds bounds)))
+         distinct
+         vec)))
+
+(defn- entry-map
+  [entries]
+  (into {} entries))
+
+(defn- member-state-in-read
+  [entries-by-member member]
+  (if (contains? entries-by-member member)
+    {:present? true :score (get entries-by-member member)}
+    absent-state))
+
+(defn- mutation-could-affect-read-gap?
+  [m first-read-inv-idx second-read-cmp-idx]
+  (and (not= :fail (:type m))
+       (<= (:invoke-idx m) second-read-cmp-idx)
+       (or (nil? (:complete-idx m))
+           (>= (:complete-idx m) first-read-inv-idx))))
+
+(defn- check-zrange-all-read-stability
+  [mutations-by-m read-pairs]
+  (let [full-reads (->> read-pairs
+                        (filter (fn [{:keys [invoke complete]}]
+                                  (and (= :zrange-all (:f invoke))
+                                       (not (:malformed? (:value complete))))))
+                        (sort-by #(-> % :invoke :index))
+                        vec)
+        members (set (concat (keys mutations-by-m)
+                             (mapcat (comp keys entry-map :value :complete)
+                                     full-reads)))]
+    (->> (for [[idx later] (map-indexed vector full-reads)
+               earlier (subvec full-reads 0 idx)
+               :let [first-cmp-idx (-> earlier :complete :index)
+                     second-inv-idx (-> later :invoke :index)]
+               :when (< first-cmp-idx second-inv-idx)
+               :let [first-inv-idx (-> earlier :invoke :index)
+                     second-cmp-idx (-> later :complete :index)
+                     first-entries (entry-map (-> earlier :complete :value))
+                     second-entries (entry-map (-> later :complete :value))]
+               member members
+               :let [first-state (member-state-in-read first-entries member)
+                     second-state (member-state-in-read second-entries member)]
+               :when (and (not= first-state second-state)
+                          (not-any? #(mutation-could-affect-read-gap?
+                                        %
+                                        first-inv-idx
+                                        second-cmp-idx)
+                                    (get mutations-by-m member [])))]
+           {:kind :unstable-read-without-mutation
+            :first-index first-cmp-idx
+            :second-index second-cmp-idx
+            :member member
+            :first-state first-state
+            :second-state second-state})
+         distinct
+         vec)))
 
 (defn- check-zrange-all
   [mutations-by-m {:keys [invoke complete] :as _pair}]
@@ -780,6 +927,11 @@
                   (swap! errors conj {:kind :missing-member
                                       :index cmp-idx
                                       :member member}))))))
+        (swap! errors into (read-prefix-errors mutations-by-m
+                                               entries
+                                               inv-idx
+                                               cmp-idx
+                                               nil))
         @errors))))
 
 (defn- check-zrangebyscore
@@ -863,6 +1015,11 @@
                                       :allowed scores
                                       :expected-score (when (= 1 (count scores))
                                                         (first scores))}))))))
+        (swap! errors into (read-prefix-errors mutations-by-m
+                                               members
+                                               inv-idx
+                                               cmp-idx
+                                               bounds))
         @errors))))
 
 (defn zset-safety-checker
@@ -888,6 +1045,9 @@
                                    :zrangebyscore (check-zrangebyscore mutations-by-m pair))))
                          []
                          read-pairs)
+            all-errors (into all-errors
+                             (check-zrange-all-read-stability mutations-by-m
+                                                              read-pairs))
             by-kind (group-by :kind all-errors)
             ;; Vacuous-pass guard: if the run produced zero
             ;; successful reads, we have no evidence that the system
