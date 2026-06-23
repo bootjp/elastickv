@@ -6,7 +6,7 @@ BUF ?= buf
 # BREAKING_AGAINST lets callers override the auto-detected baseline.
 BREAKING_AGAINST ?=
 
-.PHONY: all gen check-tools breaking
+.PHONY: all gen check-tools breaking clean-generated
 
 all: gen
 
@@ -49,7 +49,8 @@ breaking: check-tools
 	@baseline='$(BREAKING_AGAINST)'; \
 	if [ -z "$$baseline" ]; then \
 		if git -C .. rev-parse --verify origin/main >/dev/null 2>&1; then \
-			baseline='../.git#subdir=proto,ref=refs/remotes/origin/main'; \
+			git -C .. branch --force buf-breaking-base origin/main >/dev/null; \
+			baseline='../.git#subdir=proto,branch=buf-breaking-base'; \
 		elif git -C .. rev-parse --verify main >/dev/null 2>&1; then \
 			baseline='../.git#subdir=proto,branch=main'; \
 		else \
@@ -60,5 +61,9 @@ breaking: check-tools
 	fi; \
 	$(BUF) breaking --against "$$baseline"
 
+clean-generated:
+	find . -maxdepth 1 -type f \( -name '*.pb.go' -o -name '*_grpc.pb.go' \) -delete
+
 gen: check-tools breaking
+	$(MAKE) clean-generated
 	$(BUF) generate

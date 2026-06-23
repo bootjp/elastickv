@@ -24,13 +24,16 @@ jobs:
       PROTOC_GEN_GO_VERSION: v1.36.11
       PROTOC_GEN_GO_GRPC_VERSION: v1.6.1
     steps:
-      - uses: actions/checkout@v6
+      # actions/checkout v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Fetch main for breaking baseline
         if: github.ref != 'refs/heads/main'
-        run: git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
-      - uses: actions/setup-go@v6
+        run: git fetch --no-tags --prune origin +refs/heads/main:refs/heads/buf-breaking-base
+      # actions/setup-go v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
           go-version-file: 'go.mod'
       - name: Install buf
@@ -42,7 +45,9 @@ jobs:
       - name: buf breaking (against main)
         if: github.ref != 'refs/heads/main'
         working-directory: proto
-        run: buf breaking --against '../.git#subdir=proto,ref=refs/remotes/origin/main'
+        run: buf breaking --against '../.git#subdir=proto,branch=buf-breaking-base'
+      - name: Clean generated proto outputs
+        run: find proto -maxdepth 1 -type f \( -name '*.pb.go' -o -name '*_grpc.pb.go' \) -delete
       - name: buf generate
         working-directory: proto
         run: buf generate
