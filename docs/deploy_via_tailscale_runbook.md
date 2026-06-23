@@ -71,13 +71,12 @@ mid-roll.
 Admin console → Settings → OAuth clients → New client:
 
 - Description: `elastickv GitHub Actions deploy`
-- Scopes: `auth_keys` (write). Recent `tailscale/github-action` versions
-  may additionally require `devices:write` (to register and clean up
-  the ephemeral node); enable that if the join step fails with an
-  authorization error. The action's README is the definitive source
-  for current scope requirements. `devices:core` is NOT a valid
-  Tailscale OAuth scope — earlier drafts of this runbook named it and
-  would have produced an auth failure.
+- Scopes: `auth_keys` (write). The pinned `tailscale/github-action`
+  version uses this OAuth client to mint the ephemeral auth key. If the
+  join step fails with a 403 during device registration or cleanup,
+  add the exact Devices scope named by the action README and the
+  Tailscale OAuth UI for that action version; do not guess from older
+  drafts of this runbook.
 - Tags: `tag:ci-deploy`
 
 Copy the client ID and secret; they go into GitHub in the next step.
@@ -196,18 +195,19 @@ hazard that needs manual cleanup.
    container is absent or `Exited`, finish the recreate by hand. The
    `docker run` invocation itself is redirected to `/dev/null` by the
    script, so the workflow log does NOT contain the full argv. To
-   reconstruct it, read the `Roll cluster` step's rendered
-   environment — the workflow exports `IMAGE`, `DATA_DIR`,
-   `RAFT_PORT`, `REDIS_PORT`, `S3_PORT`, `ENABLE_S3`, `NODES`,
-   `SSH_TARGETS`, and the merged `EXTRA_ENV` before invoking the
-   script. Anything not explicitly set (e.g., `RAFT_PORT` in a
-   minimally-overridden deploy) falls back to the script's default
-   (`RAFT_PORT=50051`, `REDIS_PORT=6379`, `S3_PORT=9000`,
-   `ENABLE_S3=true`). GOMEMLIMIT / CONTAINER_MEMORY_LIMIT (PR #617)
-   are propagated via `EXTRA_ENV` once that PR lands. Together the
-   rendered env + the node's `deploy.env` is enough to reconstruct
-   the same `docker run` you would see if you re-ran with the same
-   inputs.
+   reconstruct it, open the `Log rollout configuration` step: it emits
+   the actual `IMAGE`, `CONTAINER_NAME`, `DATA_DIR`, `SERVER_ENTRYPOINT`,
+   `RAFT_ENGINE`, `RAFT_PORT`, `REDIS_PORT`, `DYNAMO_PORT`, `S3_PORT`,
+   `ENABLE_S3`, `S3_REGION`, `S3_CREDENTIALS_FILE`,
+   `S3_PATH_STYLE_ONLY`, `DEFAULT_EXTRA_ENV`, `EXTRA_ENV`,
+   `CONTAINER_MEMORY_LIMIT`, `NODES`, `SSH_TARGETS`, and
+   `ROLLING_ORDER` values used by the following `Roll cluster` step.
+   The workflow sets the same defaults as `scripts/rolling-update.sh`
+   except for `ENABLE_S3`, which defaults to `false` in the workflow
+   unless the `production` environment variable explicitly enables it.
+   Together those logged values plus the node's current Docker state
+   are enough to reconstruct the same `docker run` you would get from
+   re-running the workflow with the same inputs.
 3. **Confirm the new leader via `raftadmin` or metrics** before re-running
    the workflow with `nodes:` scoped to the remaining untouched IDs. Do
    NOT re-run the full rollout if the partial one is still in flight —

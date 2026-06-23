@@ -46,6 +46,22 @@ jobs:
     # protection rules").
     environment: production
     timeout-minutes: 60
+    env:
+      CONTAINER_NAME: ${{ vars.CONTAINER_NAME || 'elastickv' }}
+      DATA_DIR: ${{ vars.DATA_DIR || '/var/lib/elastickv' }}
+      SERVER_ENTRYPOINT: ${{ vars.SERVER_ENTRYPOINT || '/app' }}
+      RAFT_ENGINE: ${{ vars.RAFT_ENGINE || 'etcd' }}
+      RAFT_PORT: ${{ vars.RAFT_PORT || '50051' }}
+      REDIS_PORT: ${{ vars.REDIS_PORT || '6379' }}
+      DYNAMO_PORT: ${{ vars.DYNAMO_PORT || '8000' }}
+      S3_PORT: ${{ vars.S3_PORT || '9000' }}
+      ENABLE_S3: ${{ vars.ENABLE_S3 || 'false' }}
+      S3_REGION: ${{ vars.S3_REGION || 'us-east-1' }}
+      S3_CREDENTIALS_FILE: ${{ vars.S3_CREDENTIALS_FILE }}
+      S3_PATH_STYLE_ONLY: ${{ vars.S3_PATH_STYLE_ONLY || 'true' }}
+      DEFAULT_EXTRA_ENV: ${{ vars.DEFAULT_EXTRA_ENV || 'GOMEMLIMIT=1800MiB' }}
+      EXTRA_ENV: ${{ vars.EXTRA_ENV }}
+      CONTAINER_MEMORY_LIMIT: ${{ vars.CONTAINER_MEMORY_LIMIT || '2500m' }}
 
     steps:
       # The deploy script is executed after the tailnet join and SSH key load.
@@ -58,6 +74,7 @@ jobs:
           REF: ${{ inputs.ref }}
           RUN_REF_NAME: ${{ github.ref_name }}
           RUN_REF_TYPE: ${{ github.ref_type }}
+          RUN_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           default_branch=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
@@ -66,8 +83,9 @@ jobs:
             echo "::error::configure the production environment to allow deployments only from the default branch"
             exit 1
           fi
-          echo "checkout_ref=$default_branch" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$RUN_SHA" >> "$GITHUB_OUTPUT"
           echo "deploy ref/image tag: $REF"
+          echo "trusted workflow sha: $RUN_SHA"
 
       - name: Checkout trusted deploy script
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -321,6 +339,54 @@ jobs:
             exit 1
           fi
 
+      - name: Remote S3 credentials preflight
+        if: ${{ env.ENABLE_S3 == 'true' }}
+        env:
+          SSH_TARGETS: ${{ steps.render.outputs.ROLLING_SSH_TARGETS }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$S3_CREDENTIALS_FILE" ]]; then
+            echo "::error::ENABLE_S3=true requires S3_CREDENTIALS_FILE in the production environment"
+            exit 1
+          fi
+          printf -v remote_path '%q' "$S3_CREDENTIALS_FILE"
+          IFS=',' read -r -a entries <<< "$SSH_TARGETS"
+          failed=0
+          for e in "${entries[@]}"; do
+            target="${e##*=}"
+            if [[ "$target" != *@* ]]; then
+              target="${SSH_USER:-$(id -un)}@$target"
+            fi
+            if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$target" "test -r $remote_path"; then
+              echo "  ok   $target:$S3_CREDENTIALS_FILE"
+            else
+              echo "::error::$target cannot read S3_CREDENTIALS_FILE=$S3_CREDENTIALS_FILE"
+              failed=1
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Log rollout configuration
+        env:
+          NODES: ${{ steps.render.outputs.NODES }}
+          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
+          IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
+        run: |
+          set -euo pipefail
+          echo "::group::Rollout runtime configuration"
+          for name in \
+            IMAGE CONTAINER_NAME DATA_DIR SERVER_ENTRYPOINT RAFT_ENGINE \
+            RAFT_PORT REDIS_PORT DYNAMO_PORT S3_PORT ENABLE_S3 S3_REGION \
+            S3_CREDENTIALS_FILE S3_PATH_STYLE_ONLY DEFAULT_EXTRA_ENV EXTRA_ENV \
+            CONTAINER_MEMORY_LIMIT NODES SSH_TARGETS ROLLING_ORDER; do
+            printf '%s=%s\n' "$name" "${!name-}"
+          done
+          echo "::endgroup::"
+
       - name: Dry-run summary
         if: ${{ inputs.dry_run }}
         env:
@@ -329,8 +395,6 @@ jobs:
           ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
           IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
           SSH_USER: ${{ vars.SSH_USER }}
-          ENABLE_S3: ${{ vars.ENABLE_S3 || 'false' }}
-          S3_CREDENTIALS_FILE: ${{ vars.S3_CREDENTIALS_FILE }}
           DRY_RUN: "true"
           REF: ${{ inputs.ref }}
         run: |
@@ -351,8 +415,6 @@ jobs:
           ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
           SSH_USER: ${{ vars.SSH_USER }}
           IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
-          ENABLE_S3: ${{ vars.ENABLE_S3 || 'false' }}
-          S3_CREDENTIALS_FILE: ${{ vars.S3_CREDENTIALS_FILE }}
           SSH_STRICT_HOST_KEY_CHECKING: "yes"
         run: |
           set -euo pipefail

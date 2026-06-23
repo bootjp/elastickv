@@ -96,12 +96,12 @@ Use OAuth ephemeral nodes (not a long-lived auth key):
 
 - Create an OAuth client in Tailscale admin console with scope
   `auth_keys` (write) on tag `tag:ci-deploy`. (`tailscale/github-action`
-  uses the OAuth client to mint a short-lived auth key on each run;
-  recent action versions may also require `devices:write` so the
-  ephemeral node can register and be cleaned up — consult the action's
-  README for the current scope list. Earlier drafts of this doc named
-  `devices:core`, which is not a supported Tailscale OAuth scope and
-  would fail authentication.)
+  uses the OAuth client to mint a short-lived auth key on each run.)
+  If the pinned action starts returning 403 during device registration
+  or cleanup, add the exact Devices scope named by the action README
+  and the Tailscale OAuth UI for that action version; keep this doc as
+  the rollout contract, not the authority for future Tailscale scope
+  names.
 - Store client ID + secret in GitHub env secrets.
 - `tailscale/github-action@v3` joins the tailnet for the duration of the job
   as an ephemeral tagged node; disconnects automatically on job exit.
