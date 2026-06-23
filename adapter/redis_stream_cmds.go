@@ -212,7 +212,7 @@ func (r *RedisServer) xadd(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	var id string
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -543,7 +543,7 @@ func (r *RedisServer) xtrim(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {

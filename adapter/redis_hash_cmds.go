@@ -72,83 +72,6 @@ func (r *RedisServer) buildHashLegacyMigrationElems(ctx context.Context, key []b
 	return elems, nil
 }
 
-// buildSetLegacyMigrationElems returns ops that atomically migrate a legacy
-// !redis|set| blob to wide-column !st|mem| keys.  Returns nil if no legacy
-// blob exists.
-func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := r.store.GetAt(ctx, redisSetKey(key), readTS)
-	if cockerrors.Is(err, store.ErrKeyNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, cockerrors.WithStack(err)
-	}
-	value, err := unmarshalSetValue(raw)
-	if err != nil {
-		return nil, err
-	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(value.Members)+setWideColOverhead)
-	for _, member := range value.Members {
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.SetMemberKey(key, []byte(member)),
-			Value: []byte{},
-		})
-	}
-	// Delete the legacy blob.
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
-	// Write a base meta so that resolveSetMeta starts from an accurate count.
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.SetMetaKey(key),
-		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
-	})
-	return elems, nil
-}
-
-// buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
-// !redis|zset| blob to wide-column !zs|mem| + !zs|scr| keys. Returns nil if no legacy
-// blob exists.  The base meta key is also written with the migrated count so
-// that resolveZSetMeta works correctly after migration.
-func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
-	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
-	if cockerrors.Is(err, store.ErrKeyNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, cockerrors.WithStack(err)
-	}
-	value, err := unmarshalZSetValue(raw)
-	if err != nil {
-		return nil, err
-	}
-	// Each entry → member key + score index key; plus legacy blob deletion + base meta.
-	elems := make([]*kv.Elem[kv.OP], 0, len(value.Entries)*2+setWideColOverhead) //nolint:mnd // 2 ops per entry (member + score index)
-	for _, entry := range value.Entries {
-		elems = append(elems,
-			&kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   store.ZSetMemberKey(key, []byte(entry.Member)),
-				Value: store.MarshalZSetScore(entry.Score),
-			},
-			&kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   store.ZSetScoreKey(key, entry.Score, []byte(entry.Member)),
-				Value: []byte{},
-			},
-		)
-	}
-	// Delete the legacy blob.
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
-	// Write a base meta so that resolveZSetMeta starts from an accurate count.
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.ZSetMetaKey(key),
-		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(value.Entries))}),
-	})
-	return elems, nil
-}
-
 // addLegacyHashFieldsToMap adds field names from migration Put elems (fields
 // being migrated in the current transaction, not yet visible at readTS) into
 // existsMap so that buildHashFieldElems does not count them as new fields.
@@ -160,24 +83,6 @@ func addLegacyHashFieldsToMap(migrationElems []*kv.Elem[kv.OP], key []byte, exis
 			}
 		}
 	}
-}
-
-// buildLegacySetMemberBase extracts member names from migration Put elems
-// (members being migrated in the current transaction, invisible at readTS)
-// and returns them as a set. Returns nil when no migration is happening.
-func buildLegacySetMemberBase(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]struct{} {
-	var base map[string]struct{}
-	for _, elem := range migrationElems {
-		if elem.Op == kv.Put {
-			if m := store.ExtractSetMemberName(elem.Key, key); m != nil {
-				if base == nil {
-					base = make(map[string]struct{})
-				}
-				base[string(m)] = struct{}{}
-			}
-		}
-	}
-	return base
 }
 
 // buildHashFieldElems iterates over field-value pairs in args, checks each
@@ -847,7 +752,7 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 	var current int64
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+		typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}

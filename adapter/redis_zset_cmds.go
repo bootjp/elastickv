@@ -27,6 +27,50 @@ type bzpopminResult struct {
 	entry redisZSetEntry
 }
 
+const zsetOpsPerEntry = 2
+
+// buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
+// !redis|zset| blob to wide-column !zs|mem| + !zs|scr| keys. Returns nil if no
+// legacy blob exists. The base meta key is also written with the migrated count
+// so that resolveZSetMeta works correctly after migration.
+func (r *RedisServer) buildZSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalZSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Entries)*zsetOpsPerEntry+setWideColOverhead)
+	for _, entry := range value.Entries {
+		elems = append(elems,
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetMemberKey(key, []byte(entry.Member)),
+				Value: store.MarshalZSetScore(entry.Score),
+			},
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.ZSetScoreKey(key, entry.Score, []byte(entry.Member)),
+				Value: []byte{},
+			},
+		)
+	}
+	// Delete the legacy blob.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
+	// Write a base meta so that resolveZSetMeta starts from an accurate count.
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ZSetMetaKey(key),
+		Value: store.MarshalZSetMeta(store.ZSetMeta{Len: int64(len(value.Entries))}),
+	})
+	return elems, nil
+}
+
 // zsetMemberFastScore probes the wide-column score entry for (key,
 // member) directly and reports whether it is present and TTL-alive.
 // Priority-alignment scope mirrors hashFieldFastLookup: only the
@@ -736,13 +780,13 @@ func writeZRangeReply(conn redcon.Conn, entries []redisZSetEntry, withScores boo
 	}
 }
 
-func removeZSetMembers(members map[string]float64, rawMembers [][]byte) int {
-	removed := 0
+func removeZSetMembers(members map[string]float64, rawMembers [][]byte) []redisZSetEntry {
+	removed := make([]redisZSetEntry, 0, len(rawMembers))
 	for _, member := range rawMembers {
 		memberKey := string(member)
-		if _, ok := members[memberKey]; ok {
+		if score, ok := members[memberKey]; ok {
 			delete(members, memberKey)
-			removed++
+			removed = append(removed, redisZSetEntry{Member: memberKey, Score: score})
 		}
 	}
 	return removed
@@ -763,6 +807,50 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
 	})
+}
+
+func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, readTS uint64, removed, remaining []redisZSetEntry) error {
+	if len(remaining) == 0 {
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, readTS, elems)
+	}
+	memberPrefix := store.ZSetMemberScanPrefix(key)
+	memberEnd := store.PrefixScanEnd(memberPrefix)
+	probeKVs, err := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+	if err != nil {
+		return cockerrors.WithStack(err)
+	}
+	if len(probeKVs) == 0 {
+		return r.persistZSetEntriesTxn(ctx, key, readTS, remaining)
+	}
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return cockerrors.Wrap(err, "persistZSetRemovalsTxn: allocate commitTS")
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(removed)*zsetOpsPerEntry+1)
+	for _, entry := range removed {
+		member := []byte(entry.Member)
+		elems = append(elems,
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetMemberKey(key, member)},
+			&kv.Elem[kv.OP]{Op: kv.Del, Key: store.ZSetScoreKey(key, entry.Score, member)},
+		)
+	}
+	deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -int64(len(removed))})
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
+		Value: deltaVal,
+	})
+	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		IsTxn:    true,
+		StartTS:  normalizeStartTS(readTS),
+		CommitTS: commitTS,
+		Elems:    elems,
+	})
+	return cockerrors.WithStack(dispatchErr)
 }
 
 func (r *RedisServer) zrange(conn redcon.Conn, cmd redcon.Command) {
@@ -842,16 +930,17 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
+		value, _, err := r.loadZSetAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
 		members := zsetEntriesToMap(value.Entries)
-		removed = removeZSetMembers(members, cmd.Args[2:])
+		removedEntries := removeZSetMembers(members, cmd.Args[2:])
+		removed = len(removedEntries)
 		if removed == 0 {
 			return nil
 		}
-		return r.persistZSetEntriesTxn(ctx, cmd.Args[1], readTS, zsetMapToEntries(members))
+		return r.persistZSetRemovalsTxn(ctx, cmd.Args[1], readTS, removedEntries, zsetMapToEntries(members))
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
@@ -890,7 +979,7 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(context.Background(), cmd.Args[1], readTS)
+		value, _, err := r.loadZSetAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
@@ -901,8 +990,9 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 		}
 		remaining := append([]redisZSetEntry{}, value.Entries[:s]...)
 		remaining = append(remaining, value.Entries[e+1:]...)
-		removed = e - s + 1
-		return r.persistZSetEntriesTxn(ctx, cmd.Args[1], readTS, remaining)
+		removedEntries := append([]redisZSetEntry(nil), value.Entries[s:e+1]...)
+		removed = len(removedEntries)
+		return r.persistZSetRemovalsTxn(ctx, cmd.Args[1], readTS, removedEntries, remaining)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
@@ -940,7 +1030,7 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(context.Background(), key, readTS)
+		value, _, err := r.loadZSetAt(ctx, key, readTS)
 		if err != nil {
 			return err
 		}

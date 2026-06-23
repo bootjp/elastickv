@@ -711,8 +711,10 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), key, readTS)
+	typ, err := r.keyTypeAt(ctx, key, readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -722,7 +724,6 @@ func (r *RedisServer) listPushCmd(conn redcon.Conn, cmd redcon.Command, pushFn l
 		return
 	}
 
-	ctx := context.Background()
 	length, err := pushFn(ctx, key, cmd.Args[2:])
 
 	if err != nil {
@@ -808,8 +809,10 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
 	readTS := r.readTS()
-	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
+	typ, err := r.keyTypeAt(ctx, cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return
@@ -822,7 +825,7 @@ func (r *RedisServer) lindex(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError(wrongTypeMessage)
 		return
 	}
-	values, err := r.listValuesAt(context.Background(), cmd.Args[1], readTS)
+	values, err := r.listValuesAt(ctx, cmd.Args[1], readTS)
 	if err != nil {
 		writeRedisError(conn, err)
 		return

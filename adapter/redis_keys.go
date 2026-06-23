@@ -11,7 +11,13 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+const keysCommandArgs = 2
+
 func (r *RedisServer) keys(conn redcon.Conn, cmd redcon.Command) {
+	if len(cmd.Args) < keysCommandArgs {
+		conn.WriteError("ERR wrong number of arguments for 'keys' command")
+		return
+	}
 	pattern := cmd.Args[1]
 
 	if r.coordinator.IsLeader() {

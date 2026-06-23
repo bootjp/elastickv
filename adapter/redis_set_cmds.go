@@ -51,6 +51,58 @@ func (r *RedisServer) hllExistsAt(key []byte, readTS uint64) (bool, error) {
 	return exists, nil
 }
 
+// buildSetLegacyMigrationElems returns ops that atomically migrate a legacy
+// !redis|set| blob to wide-column !st|mem| keys. Returns nil if no legacy
+// blob exists.
+func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	raw, err := r.store.GetAt(ctx, redisSetKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(value.Members)+setWideColOverhead)
+	for _, member := range value.Members {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.SetMemberKey(key, []byte(member)),
+			Value: []byte{},
+		})
+	}
+	// Delete the legacy blob.
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
+	// Write a base meta so that resolveSetMeta starts from an accurate count.
+	elems = append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.SetMetaKey(key),
+		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
+	})
+	return elems, nil
+}
+
+// buildLegacySetMemberBase extracts member names from migration Put elems
+// (members being migrated in the current transaction, invisible at readTS)
+// and returns them as a set. Returns nil when no migration is happening.
+func buildLegacySetMemberBase(migrationElems []*kv.Elem[kv.OP], key []byte) map[string]struct{} {
+	var base map[string]struct{}
+	for _, elem := range migrationElems {
+		if elem.Op == kv.Put {
+			if m := store.ExtractSetMemberName(elem.Key, key); m != nil {
+				if base == nil {
+					base = make(map[string]struct{})
+				}
+				base[string(m)] = struct{}{}
+			}
+		}
+	}
+	return base
+}
+
 func (r *RedisServer) validateExactSetType(typ redisValueType, key []byte, readTS uint64) error {
 	if typ == redisTypeSet {
 		return nil
@@ -600,16 +652,18 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
 	readTS := r.readTS()
 	union := map[string]struct{}{}
 	for _, key := range cmd.Args[1:] {
-		typ, err := r.keyTypeAt(context.Background(), key, readTS)
+		typ, err := r.keyTypeAt(ctx, key, readTS)
 		if err != nil {
 			writeRedisError(conn, err)
 			return
 		}
 		if typ != redisTypeNone {
-			hllExists, err := r.store.ExistsAt(context.Background(), redisHLLKey(key), readTS)
+			hllExists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
 			if err != nil {
 				writeRedisError(conn, err)
 				return
@@ -619,7 +673,7 @@ func (r *RedisServer) pfcount(conn redcon.Conn, cmd redcon.Command) {
 				return
 			}
 		}
-		value, err := r.loadSetAt(context.Background(), hllKind, key, readTS)
+		value, err := r.loadSetAt(ctx, hllKind, key, readTS)
 		if err != nil {
 			writeRedisError(conn, err)
 			return
