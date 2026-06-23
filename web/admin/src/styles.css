@@ -1,6 +1,5 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../tailwind.config.js";
 
 @layer base {
   :root {
@@ -40,13 +39,13 @@
     @apply inline-flex items-center justify-center gap-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors;
   }
   .btn-primary {
-    @apply btn bg-accent text-white hover:opacity-90 disabled:opacity-50;
+    @apply inline-flex items-center justify-center gap-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors bg-accent text-white hover:opacity-90 disabled:opacity-50;
   }
   .btn-secondary {
-    @apply btn border border-border bg-surface-2 hover:bg-surface;
+    @apply inline-flex items-center justify-center gap-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors border border-border bg-surface-2 hover:bg-surface;
   }
   .btn-danger {
-    @apply btn border border-danger text-danger hover:bg-danger hover:text-white;
+    @apply inline-flex items-center justify-center gap-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors border border-danger text-danger hover:bg-danger hover:text-white;
   }
   .input {
     @apply w-full rounded-md border border-border bg-surface px-3 py-1.5 text-sm
@@ -71,9 +70,9 @@
     @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
   }
   .pill-accent {
-    @apply pill bg-accent/10 text-accent;
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-accent/10 text-accent;
   }
   .pill-muted {
-    @apply pill bg-surface text-muted border border-border;
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-surface text-muted border border-border;
   }
 }
