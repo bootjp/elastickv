@@ -2736,11 +2736,19 @@ func normalizeLimitConfig(cfg OpenConfig) OpenConfig {
 			"value", cfg.MaxSizePerMsg, "max", maxMaxSizePerMsg, "default", uint64(defaultMaxSizePerMsg))
 		cfg.MaxSizePerMsg = uint64(defaultMaxSizePerMsg)
 	}
+	logLimitConfig(cfg)
+	return cfg
+}
+
+func logLimitConfig(cfg OpenConfig) {
+	if cfg.MaxInflightMsg == defaultMaxInflightMsg && cfg.MaxSizePerMsg == uint64(defaultMaxSizePerMsg) {
+		return
+	}
 	slog.Info("etcd raft engine: message size limits",
+		"local_id", cfg.LocalID,
 		"max_inflight_msgs", cfg.MaxInflightMsg,
 		"max_size_per_msg_bytes", cfg.MaxSizePerMsg,
 	)
-	return cfg
 }
 
 func validateConfig(cfg OpenConfig) error {

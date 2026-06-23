@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -2055,6 +2057,44 @@ func TestNormalizeLimitConfig_DefaultsWhenUnset(t *testing.T) {
 	require.Equal(t, uint64(defaultMaxSizePerMsg), got.MaxSizePerMsg)
 	require.Equal(t, 512, got.MaxInflightMsg)
 	require.Equal(t, uint64(2<<20), got.MaxSizePerMsg)
+}
+
+func TestLogLimitConfigSkipsDefaults(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(old)
+	})
+
+	logLimitConfig(OpenConfig{
+		LocalID:        "n1",
+		MaxInflightMsg: defaultMaxInflightMsg,
+		MaxSizePerMsg:  uint64(defaultMaxSizePerMsg),
+	})
+
+	require.Empty(t, buf.String())
+}
+
+func TestLogLimitConfigIncludesLocalIDForOverrides(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(old)
+	})
+
+	logLimitConfig(OpenConfig{
+		LocalID:        "n2",
+		MaxInflightMsg: 2048,
+		MaxSizePerMsg:  uint64(defaultMaxSizePerMsg),
+	})
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &record))
+	require.Equal(t, "etcd raft engine: message size limits", record["msg"])
+	require.Equal(t, "n2", record["local_id"])
+	require.Equal(t, float64(2048), record["max_inflight_msgs"])
 }
 
 // TestNormalizeLimitConfig_EnvOverridesCaller pins that a valid env var
