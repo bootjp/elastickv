@@ -195,9 +195,14 @@ memory each group's private cache/memtable pins.
   rule: never use the local wall clock or a follower-issued ts for MVCC
   visibility / OCC / lease decisions); a staleness bound and a way for the
   reader to know it has applied past that ts; lease invalidation interaction;
-  and adapter routing so reads can be steered to a replica. The centralized
-  TSO doc §9 Q4 and the learner doc §8 OQ-5 both flag this as the open
-  follow-on.
+  and adapter routing so reads can be steered to a replica. The low-level
+  packages must stay generic: `internal/raftengine` / `store` should expose an
+  optional, nil-safe delegate/interceptor interface for "may serve at this
+  leader-vouched read timestamp?" and "has this replica applied past it?",
+  with nil preserving today's leader-only behavior. `kv` / `distribution`
+  implement the policy above that interface rather than being imported by the
+  engine/store packages. The centralized TSO doc §9 Q4 and the learner doc
+  §8 OQ-5 both flag this as the open follow-on.
 
 ### (d) Cross-group transactions at scale
 
@@ -211,7 +216,9 @@ memory each group's private cache/memtable pins.
   minimum correctness fix the moment a node leads a non-default group it is
   member of, and it should land before multi-node multi-group bootstrap (b)
   makes that topology reachable. The *full* dedicated-TSO component (TSO doc
-  M6–M7) is a larger question: with the per-group fix in place, every node's
+  M6–M7) is a larger component, but the need for a shared ordering source is
+  not a throughput/amortization question once cross-node cross-group
+  transactions are possible: with the per-group fix in place, every node's
   timestamps are self-monotonic, but **global** monotonicity across nodes
   leading different groups is still not guaranteed without a shared oracle
   (TSO doc §6 "Guarantee"). Cross-group transactions (`kv/transaction.go`,
@@ -221,13 +228,13 @@ memory each group's private cache/memtable pins.
   already upheld: `nextStartTS` allocates one `startTS` for the whole txn and
   propagates it via `reqs.StartTS` to every participating group; the gap is the
   cross-*node* comparability of the per-txn `commitTS`, not the per-txn
-  `startTS`. See OQ-1.) So: per-group renewal fix
-  is in-scope-soon and load-bearing; the dedicated TSO group is only justified
-  once (i) multi-node multi-group is real and (ii) cross-group transactions
-  are common enough that the batch-allocator amortization pays for the extra
-  Raft group. Until both hold, the per-group fix plus the shared-`*HLC`
-  property is adequate. The recommendation in §4 sequences the per-group fix
-  early and defers the dedicated TSO group behind real cross-group-txn load.
+  `startTS`. See OQ-1.) So: per-group renewal fix is in-scope-soon and
+  load-bearing for one node leading multiple groups; before enabling the first
+  cross-group transaction whose participating groups are led by different
+  nodes, the roadmap must either pull the dedicated TSO group forward or land a
+  narrower single-oracle bridge that pins cross-group timestamp allocation to
+  one designated leader. Until such txns are enabled, the per-group fix plus
+  the shared-`*HLC` property remains adequate.
 
 ### (e) Cluster size / membership
 
@@ -314,8 +321,10 @@ counts only matter once multi-node groups exist).
 consumer (off-leader reads) has no design. Read throughput cannot scale past
 one node's leader capacity. **Rough milestones:** (M1) leader-issued read-ts
 pipeline + a replica apply-watermark so a follower/learner can serve a
-snapshot read at a leader-vouched timestamp (CLAUDE.md HLC rule). (M2) lease
-invalidation interaction + staleness bound + adapter read routing to replicas.
+snapshot read at a leader-vouched timestamp (CLAUDE.md HLC rule), exposed
+through optional nil-safe low-level delegate interfaces so raftengine/store
+do not import `kv` / `distribution`. (M2) lease invalidation interaction +
+staleness bound + adapter read routing to replicas.
 (M3) Jepsen stale-read bound workload. **Depends-on:** Gap 1 (multi-node
 groups to have a remote replica); the learner primitive (already in-tree).
 
@@ -397,22 +406,49 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
 9. **Range merge** (Gap 5). After step 4 for cross-group merge.
 10. **Streaming transport** (Gap 6). Any time after step 2 makes inter-node
     Raft traffic significant; pairs with the S3 blob-fetch RPC.
-11. **Dedicated TSO group** (TSO doc M6–M7) — placed last *on the assumption
-    that the per-group renewal fix (step 1) is sufficient until cross-group
-    transactions across node-spanning groups are common enough to amortize the
-    extra Raft group (§2(d))*. **This placement must be revisited the moment
-    step 2 lands** — see OQ-1. The decision is not an amortization tradeoff but
-    a correctness one: the trigger to pull this forward (potentially to
-    step 3) is **the first cross-group transaction whose participating groups
-    are led by different nodes**. The per-group fix gives per-node monotonicity
-    only (TSO doc §6 "Guarantee"); commit-ts comparability across coordinators
-    on different nodes is not covered by it (OQ-1). Treat step 11 as
+11. **Dedicated TSO group or single-oracle bridge** (TSO doc M6–M7 / OQ-1) —
+    shown late only because the roadmap must first create node-spanning groups.
+    This placement is not a throughput amortization tradeoff: before enabling
+    the first cross-group transaction whose participating groups are led by
+    different nodes, step 2 must either pull the dedicated TSO group forward or
+    land a narrower bridge that allocates all cross-group `commitTS` values from
+    one designated oracle. The per-group fix gives per-node monotonicity only
+    (TSO doc §6 "Guarantee"); commit-ts comparability across coordinators on
+    different nodes is not covered by it (OQ-1). Treat step 11 as
     "deferred-pending-OQ-1-resolution", not "settled-last".
 12. **Auto group lifecycle** (Gap 7) — long-term, after 2/4/8/9.
 
 In-flight PRs map cleanly: **#955** is step 2 (Gap 1 bootstrap proposal),
 **#953** is step 3 (and its PR0 = step 2's intent), **#945** is step 4,
 **#951** is step 5.
+
+### 4.1 Rolling-upgrade and live-cutover guardrails
+
+This roadmap does not introduce a cluster-version Raft entry as part of the
+first sequencing slice; that broader coordination protocol should be its own
+design if needed. The near-term mitigation is layered:
+
+1. **Capability-gated admin operations.** `raftadmin` / coordinator admin RPCs
+   that enable multi-node bootstrap, leader transfers, follower reads,
+   migration/import, write fences, or a cross-group timestamp bridge must first
+   observe that every target voter advertises the matching capability. Mixed
+   binary clusters run in compatibility mode with these features disabled.
+2. **Operator-driven in-place expansion.** For clusters that can tolerate a
+   controlled maintenance window, upgrade all binaries first, verify capability
+   convergence, then add voters / learners one group at a time with live
+   `AddVoter` / `AddLearner` and keep the old single-voter leader serving until
+   the new voter set catches up. Do not permit a flag-only restart to reinterpret
+   an existing single-voter group as multi-voter.
+3. **Blue/green or bridge/proxy cutover for zero-downtime moves.** Deployments
+   that cannot accept the in-place operational window should use a fresh
+   multi-node cluster plus a temporary bridge/proxy mode: dual-write or
+   write-through to both sides, shadow-read / compare, then flip reads and retire
+   the old cluster. This mirrors the existing Redis migration pattern and the
+   TSO doc's feature-flagged shadow phase, without forcing every bootstrap PR to
+   carry a full migration coordinator.
+4. **Deferred complex protocol.** If the capability checks above are too weak for
+   a later feature, the fix is not to overload this roadmap; write a separate
+   cluster-version / rolling-upgrade design and make that feature depend on it.
 
 ---
 
@@ -504,10 +540,10 @@ In-flight PRs map cleanly: **#955** is step 2 (Gap 1 bootstrap proposal),
    What is the supported path — operator-driven `AddVoter` expansion of an
    existing single-voter group, blue/green with a dual-write proxy
    (`proxy/`, the existing Redis-migration pattern), or a fresh cluster +
-   data migration? And what version-skew / capability-gating discipline keeps
-   a rolling upgrade safe while only some nodes understand the new per-group
-   members wiring? This is properly the companion bootstrap proposal's (PR #955)
-   to answer; the roadmap flags it here so it is not lost. (Note: the TSO doc
-   §7 already specifies a phased dual-write/shadow-read/feature-flag cutover for
-   the *timestamp* migration; the bootstrap cutover should mirror that
-   structure.)
+   data migration? §4.1 defines the interim guardrails — capability-gated admin
+   operations, in-place expansion only after all binaries advertise support,
+   and bridge/proxy cutover for zero-downtime deployments — but PR #955 must
+   choose the supported default path and spell out rollback. (Note: the TSO
+   doc §7 already specifies a phased dual-write/shadow-read/feature-flag
+   cutover for the *timestamp* migration; the bootstrap cutover should mirror
+   that structure.)
