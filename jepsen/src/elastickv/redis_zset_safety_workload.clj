@@ -730,14 +730,23 @@
                          muts)))))
 
 (defn- mutation-can-produce-score?
-  [m score]
+  [mutations-by-m m member score read-inv-idx read-cmp-idx]
   (case (:f m)
     :zadd
     (score-eq? (:score m) score)
 
     :zincrby
-    (and (= :ok (:type m))
-         (score-eq? (:score m) score))
+    (if (and (= :ok (:type m))
+             (some? (:score m)))
+      (score-eq? (:score m) score)
+      (some (fn [st]
+              (some #(and (:present? %)
+                          (score-eq? (:score %) score))
+                    (apply-mutation-possibilities st m)))
+            (possible-states-for-member (without-mutation mutations-by-m m)
+                                        member
+                                        read-inv-idx
+                                        read-cmp-idx)))
 
     false))
 
@@ -746,7 +755,12 @@
   (and (not= :fail (:type m))
        (= member (:member m))
        (concurrent? m read-inv-idx read-cmp-idx)
-       (mutation-can-produce-score? m score)
+       (mutation-can-produce-score? mutations-by-m
+                                    m
+                                    member
+                                    score
+                                    read-inv-idx
+                                    read-cmp-idx)
        (let [{:keys [scores can-be-present?]}
              (allowed-scores-for-member (without-mutation mutations-by-m m)
                                         member
@@ -755,7 +769,14 @@
          (or (not can-be-present?)
              (not (contains? scores score))))))
 
-(defn- forced-prefix-visible?
+(defn- visible-state?
+  [st bounds]
+  (and (:present? st)
+       (if-let [[lo hi] bounds]
+         (<= lo (:score st) hi)
+         true)))
+
+(defn- forced-prefix-states
   [mutations-by-m member read-inv-idx read-cmp-idx anchor bounds]
   (let [states (possible-states-for-member
                  mutations-by-m
@@ -764,47 +785,89 @@
                  read-cmp-idx
                  #(real-time-before? % anchor))]
     (and (seq states)
-         (every?
-           (fn [st]
-             (and (:present? st)
-                  (if-let [[lo hi] bounds]
-                    (<= lo (:score st) hi)
-                    true)))
-           states))))
+         (every? #(visible-state? % bounds) states)
+         states)))
+
+(defn- observed-absence-requires-zrem?
+  [mutations-by-m m member read-inv-idx read-cmp-idx bounds]
+  (and (effective-zrem? m)
+       (not= :fail (:type m))
+       (= member (:member m))
+       (concurrent? m read-inv-idx read-cmp-idx)
+       (let [states (possible-states-for-member (without-mutation mutations-by-m m)
+                                                member
+                                                read-inv-idx
+                                                read-cmp-idx)]
+         (and (seq states)
+              (every? #(visible-state? % bounds) states)))))
+
+(def ^:private missing-observed ::missing-observed)
 
 (defn- read-prefix-errors
   [mutations-by-m entries read-inv-idx read-cmp-idx bounds]
   (let [observed (into {} entries)
         all-mutations (mapcat second mutations-by-m)
-        kind (if bounds :fractured-read-prefix-range :fractured-read-prefix)]
-    (->> (for [[member score] entries
-               anchor (get mutations-by-m member)
-               :when (observed-score-requires-mutation? mutations-by-m
-                                                       anchor
-                                                       member
-                                                       score
-                                                       read-inv-idx
-                                                       read-cmp-idx)
+        kind (if bounds :fractured-read-prefix-range :fractured-read-prefix)
+        score-anchors (for [[member score] entries
+                            anchor (get mutations-by-m member)
+                            :when (observed-score-requires-mutation?
+                                    mutations-by-m
+                                    anchor
+                                    member
+                                    score
+                                    read-inv-idx
+                                    read-cmp-idx)]
+                        {:member member
+                         :score score
+                         :anchor anchor})
+        zrem-anchors (for [[member muts] mutations-by-m
+                           :when (not (contains? observed member))
+                           anchor muts
+                           :when (observed-absence-requires-zrem?
+                                   mutations-by-m
+                                   anchor
+                                   member
+                                   read-inv-idx
+                                   read-cmp-idx
+                                   bounds)]
+                       {:member member
+                        :score nil
+                        :anchor anchor})
+        anchors (concat score-anchors zrem-anchors)]
+    (->> (for [{:keys [member score anchor]} anchors
                predecessor all-mutations
+               :let [forced-states (forced-prefix-states mutations-by-m
+                                                         (:member predecessor)
+                                                         read-inv-idx
+                                                         read-cmp-idx
+                                                         anchor
+                                                         bounds)
+                     observed-score (get observed
+                                         (:member predecessor)
+                                         missing-observed)]
                :when (and (not= member (:member predecessor))
                           (= :ok (:type predecessor))
                           (real-time-before? predecessor anchor)
-                          (not (contains? observed (:member predecessor)))
-                          (forced-prefix-visible? mutations-by-m
-                                                  (:member predecessor)
-                                                  read-inv-idx
-                                                  read-cmp-idx
-                                                  anchor
-                                                  bounds))]
+                          (seq forced-states)
+                          (or (= missing-observed observed-score)
+                              (not (some #(score-eq? (:score %) observed-score)
+                                         forced-states))))]
            (cond-> {:kind kind
                     :index read-cmp-idx
                     :visible-member member
                     :visible-score score
                     :visible-op (:f anchor)
                     :visible-invoke-idx (:invoke-idx anchor)
-                    :omitted-member (:member predecessor)
                     :predecessor-op (:f predecessor)
                     :predecessor-complete-idx (:complete-idx predecessor)}
+             (= missing-observed observed-score)
+             (assoc :omitted-member (:member predecessor))
+
+             (not= missing-observed observed-score)
+             (assoc :stale-member (:member predecessor)
+                    :observed-predecessor-score observed-score
+                    :forced-predecessor-scores (set (map :score forced-states)))
+
              bounds (assoc :bounds bounds)))
          distinct
          vec)))

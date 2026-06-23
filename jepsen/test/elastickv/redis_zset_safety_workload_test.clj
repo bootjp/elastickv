@@ -889,6 +889,68 @@
     (is (contains? kinds :fractured-read-prefix-range)
         (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
 
+(deftest zrem-omission-anchors-prefix-check
+  ;; If m1's absence is only explainable by a concurrent ZREM, that visible
+  ;; deletion still anchors the read prefix. A predecessor completed before
+  ;; the ZREM was invoked must be visible in the same full read.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd       :value ["m1" 1] :index 1}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 2}
+                 {:type :invoke :process 2 :f :zadd       :value ["m2" 2] :index 3}
+                 {:type :ok     :process 2 :f :zadd       :value ["m2" 2] :index 4}
+                 {:type :invoke :process 3 :f :zrem       :value "m1"     :index 5}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [] :index 6}
+                 {:type :ok     :process 3 :f :zrem
+                  :value ["m1" true] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected ZREM-anchored fractured read to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
+
+(deftest info-zincrby-visible-score-anchors-prefix-check
+  ;; A response-lost ZINCRBY has a known delta. If the observed score is
+  ;; reachable only by applying that :info op, it anchors the prefix just like
+  ;; a visible concurrent ZADD.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd       :value ["m1" 1] :index 1}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 2}
+                 {:type :invoke :process 2 :f :zadd       :value ["m2" 2] :index 3}
+                 {:type :ok     :process 2 :f :zadd       :value ["m2" 2] :index 4}
+                 {:type :invoke :process 3 :f :zincrby    :value ["m1" 5] :index 5}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 6.0]] :index 6}
+                 {:type :info   :process 3 :f :zincrby
+                  :value ["m1" 5] :error "conn reset" :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected :info ZINCRBY-anchored fractured read, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
+
+(deftest forced-predecessor-state-is-validated-when-present
+  ;; Seeing m1's concurrent ZADD forces the read prefix past m2's later ZADD.
+  ;; Including m2 at its older score is still fractured; presence alone is not
+  ;; sufficient.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m2" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd       :value ["m2" 1] :index 1}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 2}
+                 {:type :invoke :process 2 :f :zadd       :value ["m2" 2] :index 3}
+                 {:type :ok     :process 2 :f :zadd       :value ["m2" 2] :index 4}
+                 {:type :invoke :process 3 :f :zadd       :value ["m1" 1] :index 5}
+                 {:type :ok     :process 3 :f :zadd       :value ["m1" 1] :index 6}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 1.0] ["m2" 1.0]] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected stale forced predecessor to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
+
 (deftest info-plus-ok-zincrby-stays-bounded
   ;; A :info ZINCRBY still has a known delta. Once the surrounding state is
   ;; known, it admits the pre-info state or the delta-applied state, not an
