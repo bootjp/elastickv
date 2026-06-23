@@ -129,6 +129,24 @@
         result  (run-checker history)]
     (is (:valid? result) (str "expected valid, got: " result))))
 
+(deftest no-op-zrem-does-not-admit-impossible-absence
+  ;; If ZADD and ZREM overlap, a ZREM returning 0 constrains the ZREM to
+  ;; have observed the member absent. With a later-overlapping ZADD that
+  ;; completes before the read, the final state must be present; the
+  ;; no-op ZREM must not count as a possible deletion.
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :invoke :process 1 :f :zrem :value "m1" :index 1}
+                 {:type :ok     :process 1 :f :zrem :value ["m1" false] :index 2}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 3}
+                 {:type :invoke :process 2 :f :zrange-all :index 4}
+                 {:type :ok     :process 2 :f :zrange-all :value [] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected no-op ZREM not to admit absence, got: " result))
+    (is (contains? kinds :missing-member)
+        (str "expected :missing-member, got kinds=" kinds))))
+
 (deftest duplicate-members-are-flagged
   ;; ZRANGE must not return the same member twice.
   ;; With a hypothetical committed + concurrent score for the same
@@ -181,6 +199,41 @@
         result  (run-checker history)]
     (is (:valid? result)
         (str "expected :info-before-read to skip strict score check, got: " result))))
+
+(deftest pre-read-info-zincrby-superseded-by-later-zadd
+  ;; A pre-read :info ZINCRBY is uncertainty only until a later committed
+  ;; state-changing op strictly follows it before the read. The later ZADD
+  ;; overwrites any possible increment outcome, so an arbitrary score must
+  ;; be rejected instead of waved through by :unknown-score?.
+  (let [history [{:type :invoke :process 0 :f :zincrby :value ["m1" 5] :index 0}
+                 {:type :info   :process 0 :f :zincrby :value ["m1" 5] :index 1}
+                 {:type :invoke :process 1 :f :zadd    :value ["m1" 2] :index 2}
+                 {:type :ok     :process 1 :f :zadd    :value ["m1" 2] :index 3}
+                 {:type :invoke :process 2 :f :zrange-all :index 4}
+                 {:type :ok     :process 2 :f :zrange-all
+                  :value [["m1" 42.0]] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected superseded :info ZINCRBY not to relax score, got: " result))
+    (is (contains? kinds :score-mismatch)
+        (str "expected :score-mismatch, got kinds=" kinds))))
+
+(deftest pre-read-info-zrem-superseded-by-later-zadd
+  ;; Same supersession rule for presence: an :info ZREM completed before a
+  ;; later committed ZADD cannot make a post-ZADD read's absence valid.
+  (let [history [{:type :invoke :process 0 :f :zrem :value "m1" :index 0}
+                 {:type :info   :process 0 :f :zrem :value "m1" :index 1}
+                 {:type :invoke :process 1 :f :zadd :value ["m1" 1] :index 2}
+                 {:type :ok     :process 1 :f :zadd :value ["m1" 1] :index 3}
+                 {:type :invoke :process 2 :f :zrange-all :index 4}
+                 {:type :ok     :process 2 :f :zrange-all :value [] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected superseded :info ZREM not to admit absence, got: " result))
+    (is (contains? kinds :missing-member)
+        (str "expected :missing-member, got kinds=" kinds))))
 
 ;; ---------------------------------------------------------------------------
 ;; Stale-read / phantom / superseded-committed checks
@@ -507,10 +560,12 @@
     (is (:valid? result)
         (str "expected chain-tail score to be accepted, got: " result))))
 
-(deftest concurrent-zincrby-both-admissible
-  ;; Two overlapping-in-real-time ZINCRBYs whose returned
-  ;; scores are BOTH candidate final states under some linearization.
-  ;; Read observing either value must be accepted.
+(deftest committed-zincrby-return-values-constrain-final-score
+  ;; Two overlapping-in-real-time ZINCRBYs can both be candidates, but
+  ;; their returned scores still constrain the serialization. Here B
+  ;; returns 4.0 and A returns 6.0; A's result proves B was an
+  ;; intermediate prefix, so a post-completion read of 4.0 is stale while
+  ;; 6.0 is valid.
   ;; Overlap: A=[inv=2, cmp=5], B=[inv=3, cmp=4].
   (let [base [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
               {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
@@ -528,10 +583,10 @@
                  {:type :invoke :process 3 :f :zrange-all :index 6}
                  {:type :ok     :process 3 :f :zrange-all
                   :value [["m1" 6.0]] :index 7})]
-    (is (:valid? (run-checker read-a))
-        "expected B's return value (4.0) admissible under overlap")
+    (is (not (:valid? (run-checker read-a)))
+        "expected B's intermediate return value (4.0) to be rejected")
     (is (:valid? (run-checker read-b))
-        "expected A's return value (6.0) admissible under overlap")))
+        "expected A's final return value (6.0) to be accepted")))
 
 (deftest zadd-resets-zincrby-chain
   ;; A committed ZADD between ZINCRBYs resets the chain --
@@ -594,11 +649,10 @@
     (is (contains? kinds :score-mismatch)
         (str "expected :score-mismatch, got kinds=" kinds))))
 
-(deftest two-ok-concurrent-zincrbys-accept-known-chain-tail
-  ;; Same concurrent :ok ZINCRBY history, but the read
-  ;; observes one of the recorded return values. Both 3.0 (linearization
-  ;; where +3 ran first, then +2) and 6.0 (the other order) must be
-  ;; accepted as valid.
+(deftest two-ok-concurrent-zincrbys-reject-superseded-return
+  ;; Same concurrent :ok ZINCRBY history, but both ops complete before the
+  ;; read. The returned scores identify 3.0 as an intermediate prefix and
+  ;; 6.0 as the chain tail.
   (let [base [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
               {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
               {:type :invoke :process 1 :f :zincrby :value ["m1" 2]    :index 2}
@@ -615,8 +669,8 @@
                   :value [["m1" 3.0]] :index 7})]
     (is (:valid? (run-checker read-6))
         "expected 6.0 (one linearization) to be accepted")
-    (is (:valid? (run-checker read-3))
-        "expected 3.0 (other linearization) to be accepted")))
+    (is (not (:valid? (run-checker read-3)))
+        "expected 3.0 intermediate return value to be rejected")))
 
 (deftest info-plus-ok-concurrent-zincrby-stays-unknown
   ;; When at least one concurrent ZINCRBY is :info (unknown
@@ -715,6 +769,20 @@
         (is (= :ok (:type result))
             (str "expected :ok on numeric reply, got: " result))
         (is (= ["m1" 7.0] (:value result)))))))
+
+(deftest zincrby-invoke-accepts-byte-array-response
+  ;; Carmine may surface Redis bulk-string scores as raw bytes depending
+  ;; on protocol/config. The client must parse them as UTF-8, not via
+  ;; `(str bytes)`, which yields "[B@...".
+  (let [client (workload/->ElastickvRedisZSetSafetyClient
+                 {} {:pool {} :spec {:host "localhost" :port 6379
+                                     :timeout-ms 100}})
+        op     {:type :invoke :f :zincrby :value ["m1" 1.0] :process 0 :index 0}]
+    (with-redefs [workload/zincrby! (fn [& _] (.getBytes "7.5" "UTF-8"))]
+      (let [result (client/invoke! client {} op)]
+        (is (= :ok (:type result))
+            (str "expected :ok on byte-array reply, got: " result))
+        (is (= ["m1" 7.5] (:value result)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Vacuous-pass guard

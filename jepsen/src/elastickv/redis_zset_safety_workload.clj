@@ -74,7 +74,7 @@
   does not accept (it expects \"Infinity\" / \"-Infinity\"). Handle both
   encodings so the checker doesn't throw on infinite ZSET scores."
   [s]
-  (let [raw   (str s)
+  (let [raw   (if (bytes? s) (String. ^bytes s "UTF-8") (str s))
         lower (str/lower-case raw)]
     (cond
       (or (= lower "inf") (= lower "+inf") (= lower "infinity") (= lower "+infinity"))
@@ -107,7 +107,7 @@
     (number? response)
     [:ok (double response)]
 
-    (string? response)
+    (or (string? response) (bytes? response))
     (try
       [:ok (parse-double-safe response)]
       (catch NumberFormatException _
@@ -195,7 +195,7 @@
           host (or (:redis-host test) (name node))]
       (assoc this :conn-spec {:pool {} :spec {:host host
                                               :port port
-                                              :timeout-ms 10000}})))
+                                              :timeout-ms 2000}})))
 
   (close! [this _test] this)
 
@@ -406,12 +406,13 @@
 
             :zincrby
             (let [[m _delta] (:value invoke)
+                  delta (double _delta)
                   ;; ZINCRBY's resulting score is only knowable from the
                   ;; server reply. For :info/:pending we don't have it.
                   ok? (= :ok t)
                   s (when (and ok? (vector? (:value complete)))
                       (second (:value complete)))]
-              {:f :zincrby :member m :score (some-> s double)
+              {:f :zincrby :member m :delta delta :score (some-> s double)
                :unknown-score? (not (and ok? (some? s)))
                :type t :invoke-idx inv-idx :complete-idx cmp-idx})
 
@@ -494,6 +495,52 @@
   [m]
   (#{:zadd :zincrby} (:f m)))
 
+(defn- effective-zrem?
+  "True iff this mutation can actually remove the member.
+  A completed ZREM with removed? false is a confirmed no-op and must not
+  relax required-presence or candidate-absence checks."
+  [m]
+  (and (= :zrem (:f m))
+       (not= false (:removed? m))))
+
+(defn- state-changing-mutation?
+  [m]
+  (or (write-op? m)
+      (effective-zrem? m)))
+
+(defn- strictly-follows?
+  "True iff `later` is ordered after `earlier` by real time."
+  [later earlier]
+  (and (some? (:complete-idx earlier))
+       (> (:invoke-idx later) (:complete-idx earlier))))
+
+(defn- superseded-by-preceding-state-change?
+  "True iff a committed mutation before the read strictly follows m and
+  changes this member's state. Such a later committed write/remove
+  determines the read's base state and makes m's pre-read uncertainty
+  irrelevant for this read."
+  [preceding m]
+  (some #(and (state-changing-mutation? %)
+              (strictly-follows? % m))
+        preceding))
+
+(defn- superseded-zincrby-score?
+  "A committed ZINCRBY return value is not always a possible final read
+  score. If another committed candidate ZINCRBY's returned score equals
+  this score plus that operation's delta, the other return value proves a
+  serialization where this result is an intermediate prefix, not the
+  final state after all completed candidates."
+  [candidates m]
+  (and (= :zincrby (:f m))
+       (some? (:score m))
+       (some (fn [n]
+               (and (not (identical? n m))
+                    (= :zincrby (:f n))
+                    (some? (:score n))
+                    (some? (:delta n))
+                    (= (:score n) (+ (:score m) (:delta n)))))
+             candidates)))
+
 (defn- allowed-scores-for-member
   "Compute the set of scores considered valid for `member` by a read
   whose window is [read-inv-idx, read-cmp-idx], based on committed state
@@ -561,7 +608,9 @@
         pre-read-info (->> muts
                            (filter #(and (= :info (:type %))
                                          (some? (:complete-idx %))
-                                         (< (:complete-idx %) read-inv-idx))))
+                                         (< (:complete-idx %) read-inv-idx)
+                                         (not (superseded-by-preceding-state-change?
+                                                preceding %)))))
         ;; Concurrent mutations: windows overlap the read. Include both
         ;; :ok and :info since either may have taken effect.
         concurrent (concurrent-mutations-for-member muts read-inv-idx read-cmp-idx)
@@ -575,9 +624,13 @@
                        :zincrby (cond-> acc (some? (:score m)) (conj (:score m)))
                        :zrem    acc))
         ;; Admissible scores: candidate committed + pre-read :info +
-        ;; concurrent writes (with a known score).
+        ;; concurrent writes (with a known score). Committed ZINCRBY
+        ;; candidates are further constrained by their returned scores:
+        ;; a return value proven to be an intermediate prefix of another
+        ;; committed candidate is not a valid final post-read score.
+        candidate-scores (remove #(superseded-zincrby-score? candidates %) candidates)
         scores (as-> #{} s
-                 (reduce add-scores s candidates)
+                 (reduce add-scores s candidate-scores)
                  (reduce add-scores s uncertain))
 
         has-unknown-incr? (fn [coll]
@@ -609,9 +662,9 @@
         unknown-score? (has-unknown-incr? uncertain)
 
         any-candidate-write? (some write-op? candidates)
-        any-candidate-zrem? (some #(= :zrem (:f %)) candidates)
+        any-candidate-zrem? (some effective-zrem? candidates)
         any-uncertain-write? (some write-op? uncertain)
-        any-uncertain-zrem? (some #(= :zrem (:f %)) uncertain)
+        any-uncertain-zrem? (some effective-zrem? uncertain)
 
         ;; Some linearization of candidates ends with the member
         ;; present. Because candidates have overlapping windows (they
