@@ -290,16 +290,19 @@ Each gap is a design doc that should be written (`*_proposed_*.md`). Ranked by
 how much further scaling it unlocks. "Depends-on" lists hard prerequisites.
 
 ### Gap 1 — Multi-node multi-group bootstrap (highest leverage)
-**Problem.** No startup wiring produces a Raft group whose voters span more
-than one node (`main.go:746` `len(groups) != 1` guard;
-`multiraft_runtime.go:246-254` single-member bootstrap). This blocks
-write-throughput scaling beyond one node, leader balance (nothing to transfer
-to), follower reads (no remote replica to read from), and every cluster-size
-dimension. **Rough milestones:** (M1) extend `--raftGroups` / add a per-group
-members flag to accept a multi-node voter set; lift the guard. (M2)
-integration harness that stands up multi-voter groups across processes. (M3)
-Jepsen multi-group multi-node workload. **Depends-on:** nothing (it is the
-root unblocker). *A companion proposal is in review as **PR #955**
+**Problem.** Startup wiring can already bootstrap a *single* Raft group with
+multiple voters via `--raftBootstrapMembers`, but it cannot express a
+*multi-group* topology where each group has its own multi-node voter set
+(`main.go:746` rejects `--raftBootstrapMembers` when `len(groups) != 1`, and
+the multi-group path still falls back to single-member group bootstraps). That
+multi-group limitation blocks write-throughput scaling beyond one group, leader
+balance across groups, follower reads for every group, and every cluster-size
+dimension that needs multiple replicated ranges. **Rough milestones:** (M1)
+extend `--raftGroups` / add a per-group members flag to accept per-group
+multi-node voter sets; lift the guard only for the explicitly modeled
+multi-group form. (M2) integration harness that stands up multi-voter groups
+across processes. (M3) Jepsen multi-group multi-node workload. **Depends-on:**
+nothing (it is the root unblocker). *A companion proposal is in review as **PR #955**
 (`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
 `design/multinode-multigroup-bootstrap`); once it lands it is the authoritative
 spec for this gap and this roadmap defers to it.*
@@ -332,13 +335,22 @@ groups to have a remote replica); the learner primitive (already in-tree).
 **Problem.** Leader balance (PR #953) spreads *leaderships*; nothing spreads
 *data* (which node holds which range's replicas). After enough splits, ranges
 pile up unevenly across nodes. This is TiKV's separate balance-region
-scheduler; PR #953 §2.2(3) explicitly excludes replica/data movement.
-**Rough milestones:** (M1) data-balance policy (move a range's replica set from
-an over-full node to an under-full one) reusing the M2 migration plane for the
-actual move. (M2) compose with leader balance so the two schedulers don't
-fight. **Depends-on:** M2 migration plane (PR #945) for the data-movement
-mechanism, **and** Gap 1 (multi-node bootstrap) for somewhere to move replicas
-to. Edge: region balance ⟂ depends on M2 + multi-node bootstrap.
+scheduler; PR #953 §2.2(3) explicitly excludes replica/data movement. The M2
+migration plane can move *range ownership* between Raft groups, but it does not
+by itself move replicas off an over-full node when the source and target groups
+share the same voter set. A real region-balance design therefore needs both a
+target-group placement constraint and, when no suitable group already exists, a
+Raft membership-change / replica-placement step before or during migration.
+**Rough milestones:** (M1) data-balance policy that chooses a target group whose
+replica set actually reduces node skew, then reuses the M2 migration plane for
+the range-ownership move only when that placement predicate holds. (M2) Raft
+membership-change primitive for creating or reshaping groups when no existing
+group has the needed placement. (M3) compose with leader balance so the two
+schedulers don't fight. **Depends-on:** M2 migration plane (PR #945) for
+range-ownership movement, a replica-placement / membership-change design for
+per-node data movement, and Gap 1 (multi-node bootstrap) for somewhere to place
+replicas. Edge: region balance ⟂ depends on M2 + multi-node bootstrap + replica
+placement.
 
 ### Gap 5 — Range merge
 **Problem.** No way to recombine ranges; route count is monotonically
