@@ -104,6 +104,14 @@ workflow inputs. Three ways to handle the dry-run-approval friction:
 v1 ships with approach 1 (single environment, prompt on every run).
 Approach 2 is the recommended upgrade once the friction becomes annoying.
 
+### Deployment branch policy
+
+Restrict the `production` environment to deployments from the repository
+default branch only. The workflow also has an early guard that fails when a
+manual dispatch is started from any other branch, but the environment policy is
+the trust boundary because GitHub executes workflow YAML from the selected
+dispatch ref before checkout.
+
 ### Environment secrets
 
 | Name | Value |
@@ -124,6 +132,8 @@ Regenerate on operator rotation.
 | `SSH_USER`        | SSH login on every node           | `bootjp` |
 | `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). Use full MagicDNS FQDNs so every node can resolve the advertised address regardless of local DNS search domains. The workflow always renders the full map into the script's `NODES` env var, even for subset rollouts; the `nodes` input becomes `ROLLING_ORDER` so the script still derives full-cluster peer maps. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,n3=kv03.<tailnet>.ts.net,n4=kv04.<tailnet>.ts.net,n5=kv05.<tailnet>.ts.net` |
 | `SSH_TARGETS_MAP` | Optional comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. If the variable is empty or an ID is omitted, the workflow falls back to that ID's `NODES_RAFT_MAP` host so reachability checks still cover every rollout node. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
+| `ENABLE_S3`       | `true` to start the S3 adapter, `false` to keep it disabled. The workflow defaults missing values to `false` rather than the script's local default. | `true` |
+| `S3_CREDENTIALS_FILE` | Node-local path to the SigV4 credentials file. Required when `ENABLE_S3=true`; the workflow fails before rollout if it is missing. | `/etc/elastickv/s3-credentials.json` |
 
 **Why two names?** The workflow uses `NODES_RAFT_MAP` / `SSH_TARGETS_MAP`
 in the `production` environment to keep the GitHub-side names
@@ -140,7 +150,7 @@ Actions tab → "Rolling update" → Run workflow.
 Inputs:
 
 - `ref` — the image tag/ref to deploy. The workflow code itself is always
-  checked out from the repository default branch.
+  dispatched and checked out from the repository default branch.
 - `image_tag` — override only for rollbacks (e.g., deploy tag `v1.2.3` of a
   commit that was also `v1.2.3`)
 - `nodes` — subset of raft IDs, e.g., `n1,n2`. Empty rolls all nodes.

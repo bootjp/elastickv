@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Image tag/ref to deploy. Workflow code is always checked out from the repository default branch.
+        description: Image tag/ref to deploy. Start this workflow from the repository default branch.
         required: true
         type: string
       image_tag:
@@ -56,9 +56,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REF: ${{ inputs.ref }}
+          RUN_REF_NAME: ${{ github.ref_name }}
+          RUN_REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
           default_branch=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+          if [[ "$RUN_REF_TYPE" != "branch" || "$RUN_REF_NAME" != "$default_branch" ]]; then
+            echo "::error::rolling-update must be dispatched from the trusted default branch '$default_branch' (got ${RUN_REF_TYPE}:${RUN_REF_NAME})"
+            echo "::error::configure the production environment to allow deployments only from the default branch"
+            exit 1
+          fi
           echo "checkout_ref=$default_branch" >> "$GITHUB_OUTPUT"
           echo "deploy ref/image tag: $REF"
 
@@ -314,10 +321,16 @@ jobs:
           ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
           IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
           SSH_USER: ${{ vars.SSH_USER }}
+          ENABLE_S3: ${{ vars.ENABLE_S3 || 'false' }}
+          S3_CREDENTIALS_FILE: ${{ vars.S3_CREDENTIALS_FILE }}
           DRY_RUN: "true"
           REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
+          if [[ "$ENABLE_S3" == "true" && -z "$S3_CREDENTIALS_FILE" ]]; then
+            echo "::error::ENABLE_S3=true requires S3_CREDENTIALS_FILE in the production environment"
+            exit 1
+          fi
           ./scripts/rolling-update.sh --dry-run
           echo "ref: $REF"
           echo "Re-run with dry_run=false to apply."
@@ -330,7 +343,13 @@ jobs:
           ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
           SSH_USER: ${{ vars.SSH_USER }}
           IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
+          ENABLE_S3: ${{ vars.ENABLE_S3 || 'false' }}
+          S3_CREDENTIALS_FILE: ${{ vars.S3_CREDENTIALS_FILE }}
           SSH_STRICT_HOST_KEY_CHECKING: "yes"
         run: |
           set -euo pipefail
+          if [[ "$ENABLE_S3" == "true" && -z "$S3_CREDENTIALS_FILE" ]]; then
+            echo "::error::ENABLE_S3=true requires S3_CREDENTIALS_FILE in the production environment"
+            exit 1
+          fi
           ./scripts/rolling-update.sh
