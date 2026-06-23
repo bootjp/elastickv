@@ -131,12 +131,17 @@ With `dry_run: true` (the default):
 
 - Everything up to script invocation runs (checkout, tailnet join, SSH agent
   load, `NODES`/`SSH_TARGETS` render).
-- `tailscale ping` is run against each SSH target to confirm reachability.
+- An SSH reachability pre-check (`ssh -o BatchMode=yes -o ConnectTimeout=10
+  <target> true`) is retried against each SSH target. This confirms that
+  network routing, host-key trust, the system sshd, and deploy-key
+  authorization all work, which a network-layer ping cannot prove.
 - The script is invoked as `DRY_RUN=true ./scripts/rolling-update.sh --dry-run`
   with the same rendered env the live rollout would receive. It validates the
   node maps, rollout order, derived service maps, image name, and per-node SSH
   targets, then prints the plan.
-- The actual `docker stop/rm/run` loop does NOT execute.
+- The actual `docker stop/rm/run` loop does NOT execute. Dry-run also skips
+  remote image pulls and any other container side effects; only validation and
+  plan rendering run.
 
 This catches the common failure modes (bad secret, bad env mapping, a node
 unreachable over the tailnet) before touching any live container.

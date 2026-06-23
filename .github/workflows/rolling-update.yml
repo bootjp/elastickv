@@ -70,19 +70,17 @@ jobs:
           echo "deploy ref/image tag: $REF"
 
       - name: Checkout trusted deploy script
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ steps.trusted-ref.outputs.checkout_ref }}
           persist-credentials: false
-
-      - name: Install jq
-        run: sudo apt-get install -y --no-install-recommends jq
 
       - name: Verify image exists on ghcr.io
         env:
           IMAGE_BASE: ${{ vars.IMAGE_BASE }}
           IMAGE_TAG: ${{ inputs.image_tag || inputs.ref }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           if [[ -z "$IMAGE_BASE" ]]; then
@@ -90,14 +88,14 @@ jobs:
             exit 1
           fi
           echo "Checking $IMAGE_BASE:$IMAGE_TAG"
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null
           if ! docker manifest inspect "$IMAGE_BASE:$IMAGE_TAG" >/dev/null; then
             echo "::error::image $IMAGE_BASE:$IMAGE_TAG not found on ghcr.io"
             exit 1
           fi
 
       - name: Join Tailnet (ephemeral)
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -302,9 +300,19 @@ jobs:
             if [[ "$target" != *@* ]]; then
               target="${SSH_USER:-$(id -un)}@$target"
             fi
-            if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$target" true; then
-              echo "  ok   $target"
-            else
+            ok=0
+            for attempt in 1 2 3 4 5 6; do
+              if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$target" true; then
+                echo "  ok   $target"
+                ok=1
+                break
+              fi
+              if [[ "$attempt" -lt 6 ]]; then
+                echo "  wait $target (attempt $attempt failed; retrying)"
+                sleep 10
+              fi
+            done
+            if [[ "$ok" -ne 1 ]]; then
               echo "::error::$target not reachable by SSH over tailnet"
               failed=1
             fi

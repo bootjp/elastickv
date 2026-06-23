@@ -32,6 +32,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Derive image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -41,7 +44,7 @@ jobs:
 #          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/${{ github.REPOSITORY }}:latest
-            ghcr.io/${{ github.REPOSITORY }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
 #          cache-from: type=gha
 #          cache-to: type=gha,mode=max

@@ -9,7 +9,7 @@ runbook is for operators: what to configure on GitHub and Tailscale so the
 Each cluster node must have `tailscale` installed, logged into the tailnet, and
 tagged so the CI runner's ACL can reach it.
 
-```
+```bash
 # on each kv0X node
 sudo tailscale up \
   --ssh=false \
@@ -18,7 +18,7 @@ sudo tailscale up \
 ```
 
 `--ssh=false` disables Tailscale SSH, so the node's regular system
-sshd must be running and authorised to accept connections on the
+sshd must be running and authorized to accept connections on the
 tailnet interface. The workflow uses plain SSH over the tailnet
 (Tailscale is only the network layer); if you rely on Tailscale SSH
 for operator access elsewhere, drop this flag but keep in mind the
@@ -26,7 +26,7 @@ workflow still connects to the system sshd.
 
 Verify the node is reachable by MagicDNS from another tailnet peer:
 
-```
+```bash
 tailscale status | grep kv0X
 ping kv0X.<tailnet>.ts.net
 ```
@@ -52,6 +52,7 @@ In the Tailscale admin console, add the deploy rule to the tailnet ACL:
     "dst":    [
       "tag:elastickv-node:50051", // Raft / raftadmin
       "tag:elastickv-node:6379",  // Redis adapter, if enabled
+      "tag:elastickv-node:8000",  // DynamoDB adapter, if enabled
       "tag:elastickv-node:9000",  // S3 adapter, if enabled
     ],
   },
@@ -119,7 +120,7 @@ dispatch ref before checkout.
 | `TS_OAUTH_CLIENT_ID`        | Tailscale OAuth client ID from step 3 |
 | `TS_OAUTH_SECRET`           | Tailscale OAuth secret from step 3 |
 | `DEPLOY_SSH_PRIVATE_KEY`    | OpenSSH private key, authorized on every node under the deploy user |
-| `DEPLOY_KNOWN_HOSTS`        | `ssh-keyscan -H kv01.<tailnet>.ts.net kv02.<tailnet>.ts.net …` output. Use `-H` to hash hostnames so the secret's contents don't leak the tailnet topology if the runner environment is compromised. |
+| `DEPLOY_KNOWN_HOSTS`        | `ssh-keyscan -H kv01.<tailnet>.ts.net kv02.<tailnet>.ts.net …` output. Use `-H` to hash hostnames so the secret's contents don't leak the tailnet topology if the runner environment is compromised. Regenerate this secret when the node list changes or if SSH reports `Host key verification failed`. |
 
 The SSH key should be ed25519, dedicated to CI (not a reused developer key).
 Regenerate on operator rotation.
@@ -134,6 +135,11 @@ Regenerate on operator rotation.
 | `SSH_TARGETS_MAP` | Optional comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. If the variable is empty or an ID is omitted, the workflow falls back to that ID's `NODES_RAFT_MAP` host so reachability checks still cover every rollout node. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
 | `ENABLE_S3`       | `true` to start the S3 adapter, `false` to keep it disabled. The workflow defaults missing values to `false` rather than the script's local default. | `true` |
 | `S3_CREDENTIALS_FILE` | Node-local path to the SigV4 credentials file. Required when `ENABLE_S3=true`; the workflow fails before rollout if it is missing. | `/etc/elastickv/s3-credentials.json` |
+
+For private GHCR packages, log every node in to `ghcr.io` with a
+deploy-scoped read token before the first rollout. The workflow's manifest check
+proves the runner can see the image tag; it does not install Docker credentials
+on the remote nodes that execute `docker pull`.
 
 **Why two names?** The workflow uses `NODES_RAFT_MAP` / `SSH_TARGETS_MAP`
 in the `production` environment to keep the GitHub-side names
@@ -173,11 +179,9 @@ Docker image workflow publishes both `latest` and the immutable commit-SHA tag
 for each main-branch build, so SHA rollback works without a manual retag. The
 `nodes` input can target specific nodes if only some carry the bad image.
 
-For private GHCR packages, each node must already be logged in to `ghcr.io`
-with a deploy-scoped read token, or the remote `docker pull` will fail even
-though the workflow runner's manifest check succeeded. Keep that credential
-rotation outside this workflow for v1; the workflow only verifies that the tag
-exists from the runner side.
+For private GHCR packages, keep the node-level Docker credential rotation
+outside this workflow for v1; the workflow only verifies that the tag exists
+from the runner side.
 
 ### If a running workflow is cancelled mid-rollout
 
