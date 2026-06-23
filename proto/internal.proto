@@ -35,6 +35,9 @@ enum Phase {
 }
 
 message Request {
+  reserved 6;
+  reserved "observed_route_version";
+
   bool is_txn = 1;
   Phase phase = 2;
   uint64 ts = 3;
@@ -69,7 +72,6 @@ message RelayPublishRequest {
 message RelayPublishResponse {
   int64 subscribers = 1;
 }
-
 
 
 

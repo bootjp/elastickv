@@ -521,13 +521,13 @@ const file_internal_proto_rawDesc = "" +
 	"\bMutation\x12\x13\n" +
 	"\x02op\x18\x01 \x01(\x0e2\x03.OpR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x03 \x01(\fR\x05value\"\x94\x01\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\"\xb2\x01\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
 	"\x02ts\x18\x03 \x01(\x04R\x02ts\x12'\n" +
 	"\tmutations\x18\x04 \x03(\v2\t.MutationR\tmutations\x12\x1b\n" +
-	"\tread_keys\x18\x05 \x03(\fR\breadKeys\"3\n" +
+	"\tread_keys\x18\x05 \x03(\fR\breadKeysJ\x04\b\x06\x10\aR\x16observed_route_version\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +
