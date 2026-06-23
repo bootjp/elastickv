@@ -110,7 +110,7 @@ Regenerate on operator rotation.
 | `IMAGE_BASE`      | Container image path (no tag)     | `ghcr.io/bootjp/elastickv` |
 | `SSH_USER`        | SSH login on every node           | `bootjp` |
 | `NODES_RAFT_MAP`  | Comma-separated `raftId=host` (no port — the script appends `RAFT_PORT`). Use full MagicDNS FQDNs so every node can resolve the advertised address regardless of local DNS search domains. The workflow renders this into the script's `NODES` env var. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,n3=kv03.<tailnet>.ts.net,n4=kv04.<tailnet>.ts.net,n5=kv05.<tailnet>.ts.net` |
-| `SSH_TARGETS_MAP` | Comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
+| `SSH_TARGETS_MAP` | Optional comma-separated `raftId=ssh-host`. The workflow renders this into the script's `SSH_TARGETS` env var. Usually identical to `NODES_RAFT_MAP` unless SSH access uses a different hostname. If the variable is empty or an ID is omitted, the workflow falls back to that ID's `NODES_RAFT_MAP` host so reachability checks still cover every rollout node. | `n1=kv01.<tailnet>.ts.net,n2=kv02.<tailnet>.ts.net,...` |
 
 **Why two names?** The workflow uses `NODES_RAFT_MAP` / `SSH_TARGETS_MAP`
 in the `production` environment to keep the GitHub-side names
@@ -125,12 +125,14 @@ Actions tab → "Rolling update" → Run workflow.
 
 Inputs:
 
-- `ref` — the git tag or sha to deploy (also used as the container image tag)
+- `ref` — the image tag/ref to deploy. The workflow code itself is always
+  checked out from the repository default branch.
 - `image_tag` — override only for rollbacks (e.g., deploy tag `v1.2.3` of a
   commit that was also `v1.2.3`)
 - `nodes` — subset of raft IDs, e.g., `n1,n2`. Empty rolls all nodes.
-- `dry_run` — default `true`. Renders the plan and checks reachability without
-  touching containers.
+- `dry_run` — default `true`. Checks reachability and runs
+  `./scripts/rolling-update.sh --dry-run` with the rendered environment,
+  without touching containers.
 
 Recommended first-run sequence:
 
@@ -152,9 +154,8 @@ hazard that needs manual cleanup.
 
 1. **Look at the last log line from the `Roll cluster` step.** The
    script emits `==> [<raft-id>@<host>] start` at the beginning of
-   each per-node recreate (see `scripts/rolling-update.sh:398`).
-   Whichever `<raft-id>` appears in the last such line is the one in
-   flight when the cancel signal landed.
+   each per-node recreate. Whichever `<raft-id>` appears in the last
+   such line is the one in flight when the cancel signal landed.
 2. **SSH into that node** over Tailscale and run `docker ps`. If the
    container is absent or `Exited`, finish the recreate by hand. The
    `docker run` invocation itself is redirected to `/dev/null` by the

@@ -131,9 +131,11 @@ With `dry_run: true` (the default):
 
 - Everything up to script invocation runs (checkout, tailnet join, SSH agent
   load, `NODES`/`SSH_TARGETS` render).
-- The script is invoked with `--help` + the rendered env is printed as a
-  collapsed log group.
 - `tailscale ping` is run against each SSH target to confirm reachability.
+- The script is invoked as `DRY_RUN=true ./scripts/rolling-update.sh --dry-run`
+  with the same rendered env the live rollout would receive. It validates the
+  node maps, rollout order, derived service maps, image name, and per-node SSH
+  targets, then prints the plan.
 - The actual `docker stop/rm/run` loop does NOT execute.
 
 This catches the common failure modes (bad secret, bad env mapping, a node
@@ -163,10 +165,35 @@ Rolling back uses the same workflow with `image_tag: <previous-sha>`. The
 script already supports the rollout order env var (`ROLLING_ORDER`) so an
 operator can force-roll only the affected nodes.
 
-**Gap:** there is no "stop mid-rollout" control today. If the workflow is
-cancelled via GitHub UI during a roll, the in-flight node may be mid-recreate.
-`rolling-update.sh` is supposed to be idempotent and crash-safe, but this
-should be verified before we call the workflow production-ready.
+The workflow sets `cancel-in-progress: false`, so a newer run cannot
+automatically interrupt an active rollout. A human can still cancel the job in
+the GitHub UI, and cancellation can land while one node is between `docker rm`
+and the replacement container becoming healthy. The runbook therefore treats
+mid-rollout cancellation as a manual recovery case:
+
+- identify the last `==> [<raft-id>@<host>] start` line in the workflow log,
+- inspect that node over Tailscale and restore/finish the container if needed,
+- run a dry-run with the same image tag after the node is healthy,
+- re-run the workflow against the remaining stale node IDs, or against the full
+  cluster once the interrupted node is confirmed healthy.
+
+The script is intentionally idempotent for a re-run: a node already running the
+target image and passing the gRPC health check is skipped instead of being
+stopped again.
+
+### 2.8 Live cutover and zero-downtime posture
+
+v1 is a controlled rolling restart of the existing Raft cluster, not a
+blue-green deploy. It reduces downtime risk by rolling one node at a time,
+transferring leadership before touching a leader when possible, waiting for
+gRPC health after each node, requiring image existence before the roll, and
+keeping dry-run/reachability checks on the same node map used by the live run.
+
+That is enough for compatible container updates where quorum remains available.
+It is not a universal zero-downtime migration mechanism. Changes that need
+dual-write, request shadowing, schema compatibility windows, or traffic
+switching must use a bridge/proxy or blue-green plan outside this workflow
+before production cutover.
 
 ## 3. Open questions
 
@@ -189,8 +216,9 @@ should be verified before we call the workflow production-ready.
 
 - Automatic deploys on merge to main (needs more test coverage before we'd
   trust it).
-- Blue-green or canary strategies (we don't have the traffic-routing layer
-  for it).
+- Blue-green or canary strategies in this workflow. They remain the recommended
+  mitigation for risky incompatible cutovers, but require a traffic-routing
+  layer outside v1.
 - Metrics-based rollback trigger (watch p99, auto-revert if it jumps).
 - Tailscale SSH (option A above).
 - A shared `deploy` user with restricted sudo.
@@ -199,7 +227,7 @@ should be verified before we call the workflow production-ready.
 
 1. Write `.github/workflows/rolling-update.yml` implementing §2.1.
 2. Document the secrets/variables setup in
-   `docs/operations/deploy_runbook.md` (new).
+   `docs/deploy_via_tailscale_runbook.md`.
 3. Run once with `dry_run: true` on a feature branch to validate secrets
    wiring without touching prod.
 4. Run once with `dry_run: false` targeting a single node (via the `nodes`
