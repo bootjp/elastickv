@@ -219,22 +219,25 @@ memory each group's private cache/memtable pins.
   M6–M7) is a larger component, but the need for a shared ordering source is
   not a throughput/amortization question once cross-node cross-group
   transactions are possible: with the per-group fix in place, every node's
-  timestamps are self-monotonic, but **global** monotonicity across nodes
-  leading different groups is still not guaranteed without a shared oracle
-  (TSO doc §6 "Guarantee"). Cross-group transactions (`kv/transaction.go`,
-  `kv/txn_codec.go`) that span groups led by different nodes need a single
-  ordering source for OCC commit-ts comparability. (The shared-snapshot
+  timestamps are self-monotonic, but **global** monotonicity across coordinator
+  nodes is still not guaranteed without a shared oracle (TSO doc §6
+  "Guarantee"). Cross-group transactions (`kv/transaction.go`,
+  `kv/txn_codec.go`) whose timestamps can be allocated by different ingress /
+  coordinator nodes need a single ordering source for OCC commit-ts
+  comparability, regardless of where the participating groups' current leaders
+  live. `LeaderProxy.Commit` / `Internal.Forward` preserve non-zero timestamps,
+  so leader co-location does not prove single-clock allocation. (The shared-snapshot
   invariant — every operation in one txn reading at the *same* `startTS` — is
   already upheld: `nextStartTS` allocates one `startTS` for the whole txn and
   propagates it via `reqs.StartTS` to every participating group; the gap is the
-  cross-*node* comparability of the per-txn `commitTS`, not the per-txn
+  cross-*coordinator* comparability of the per-txn `commitTS`, not the per-txn
   `startTS`. See OQ-1.) So: per-group renewal fix is in-scope-soon and
-  load-bearing for one node leading multiple groups; before enabling the first
-  cross-group transaction whose participating groups are led by different
-  nodes, the roadmap must either pull the dedicated TSO group forward or land a
-  narrower single-oracle bridge that pins cross-group timestamp allocation to
-  one designated leader. Until such txns are enabled, the per-group fix plus
-  the shared-`*HLC` property remains adequate.
+  load-bearing for one node leading multiple groups; before enabling any
+  cross-group transaction mode in which more than one coordinator node can issue
+  `startTS` / `commitTS`, the roadmap must either pull the dedicated TSO group
+  forward or land a narrower single-oracle bridge that pins cross-group
+  timestamp allocation to one designated leader. Until such txns are enabled,
+  the per-group fix plus the shared-`*HLC` property remains adequate.
 
 ### (e) Cluster size / membership
 
@@ -393,8 +396,8 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
    change; closes the cross-group monotonicity gap (§1.5) *before* the
    topology that exposes it exists. Land first so each group remains safe when
    replicas move across nodes, but do not enable cross-group transactions whose
-   participating groups are led by different nodes until step 11 (or its
-   single-oracle bridge) lands.
+   timestamps can be allocated by more than one coordinator node until step 11
+   (or its single-oracle bridge) lands.
 2. **Multi-node multi-group bootstrap** (Gap 1 / **PR #955**,
    `2026_06_12_proposed_multinode_multigroup_bootstrap.md`). The root
    unblocker for (b), (c), (e), Gap 3, Gap 4. Nothing else multi-node-shaped
@@ -423,12 +426,14 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
 11. **Dedicated TSO group or single-oracle bridge** (TSO doc M6–M7 / OQ-1) —
     shown late only because the roadmap must first create node-spanning groups.
     This placement is not a throughput amortization tradeoff: before enabling
-    the first cross-group transaction whose participating groups are led by
-    different nodes, step 2 must either pull the dedicated TSO group forward or
-    land a narrower bridge that allocates all cross-group `commitTS` values from
-    one designated oracle. The per-group fix gives per-node monotonicity only
-    (TSO doc §6 "Guarantee"); commit-ts comparability across coordinators on
-    different nodes is not covered by it (OQ-1). Treat step 11 as
+    any cross-group transaction mode whose `startTS` / `commitTS` can be
+    allocated by more than one coordinator / ingress node, step 2 must either
+    pull the dedicated TSO group forward or land a narrower bridge that
+    allocates all cross-group `commitTS` values from one designated oracle. The
+    per-group fix gives per-node monotonicity only (TSO doc §6 "Guarantee");
+    commit-ts comparability across coordinators on different nodes is not
+    covered by it (OQ-1), even when forwarding preserves timestamps to leaders
+    that happen to be co-located. Treat step 11 as
     "deferred-pending-OQ-1-resolution", not "settled-last".
 12. **Auto group lifecycle** (Gap 7) — long-term, after 2/4/8/9.
 
@@ -505,27 +510,40 @@ design if needed. The near-term mitigation is layered:
    is explicitly scoped: "all timestamps issued by a single node are strictly
    monotonic … monotonicity across nodes that lead *different* groups is not
    fully guaranteed without a shared TSO" (TSO doc §6 "Guarantee", §1.1). The
-   moment step 2 (multi-node bootstrap) makes it possible for the two groups of
-   a cross-group txn to be coordinated on *different nodes*, two concurrent
-   cross-group txns can draw `commitTS` from two different `*HLC` instances
-   whose ceilings were advanced independently. The `maxLatestCommitTS`/`Observe`
-   floor does not close this: it orders writes only on the specific keys read,
-   not the global commit order two unrelated cross-group txns need to be
-   serializable against each other.
+   moment step 2 (multi-node bootstrap) makes it possible for two clients to
+   coordinate cross-group txns on *different nodes*, two concurrent cross-group
+   txns can draw `commitTS` from two different `*HLC` instances whose ceilings
+   were advanced independently. This is true even if the participating groups'
+   leaders are later co-located, because `ShardedCoordinator.Dispatch` and
+   `resolveTxnCommitTS` stamp the requests before `LeaderProxy.Commit` /
+   `Internal.Forward` forwards them. The `maxLatestCommitTS`/`Observe` floor
+   does not close this: it orders writes only on the specific keys read, not the
+   global commit order two unrelated cross-group txns need to be serializable
+   against each other.
+
+   A second guardrail is independent of the timestamp oracle. Cross-group txns
+   with read-only participant shards currently rely on `validateReadOnlyShards`;
+   that path has a documented TOCTOU window between the linearizable barrier and
+   the `LatestCommitTS` check. A dedicated TSO group or single-oracle bridge
+   makes commit timestamps comparable, but it does not by itself close that
+   read-validation gap. The rollout gate must therefore either reject
+   read-only-shard txn shapes until a dedicated read-validate FSM phase lands,
+   or land that phase before enabling those shapes in a multi-node topology.
 
    **Conclusion / trigger.** OQ-1 therefore is *not* a "focused correctness
    review deferrable until just before step 2 lands" — the per-group fix cannot
    answer it in the affirmative for the cross-node case. The trigger to pull the
-   dedicated TSO group forward from step 11 is concrete: **the first cross-group
-   transaction whose participating groups are led by different nodes** (i.e. the
-   first real exercise of step 2). Until then the per-group fix + shared-`*HLC`
-   property holds. Open sub-question: whether an interim measure short of the
-   full TSO group — e.g. pinning every cross-group txn's timestamp allocation to
-   a single designated group's leader (the default group's `c.clock`), so all
-   cross-group `commitTS` still come from one clock — can bridge the gap between
+   dedicated TSO group forward from step 11 is concrete: **the first
+   cross-group transaction mode whose timestamps may be issued by more than one
+   coordinator node**, not merely the first case whose participant leaders sit
+   on different nodes. Until then the per-group fix + shared-`*HLC` property
+   holds. Open sub-question: whether an interim measure short of the full TSO
+   group — e.g. pinning every cross-group txn's timestamp allocation to a single
+   designated group's leader (the default group's `c.clock`), so all cross-group
+   `commitTS` still come from one clock — can bridge the timestamp gap between
    step 2 and step 11 without the full batch-allocator TSO. That interim option
-   should be evaluated as part of the step-2 design (PR #955) rather than left
-   to step 11.
+   must be paired with the read-only-shard validation gate above; it should be
+   evaluated as part of the step-2 design (PR #955) rather than left to step 11.
 2. **Shared cache (Gap 2) vs per-group isolation (workload isolation doc).** A
    single shared block cache trades isolation for density: one hot group can
    evict a latency-sensitive group's working set. How does Gap 2's per-group
