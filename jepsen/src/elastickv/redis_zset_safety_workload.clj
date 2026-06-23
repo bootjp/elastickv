@@ -277,7 +277,14 @@
 
           :zrange-all
           (let [flat (car/wcar cs (car/zrange zset-key 0 -1 "WITHSCORES"))]
-            (assoc op :type :ok :value (parse-withscores flat)))
+            (try
+              (assoc op :type :ok :value (parse-withscores flat))
+              (catch Throwable t
+                (warn t "ZSet safety ZRANGE returned malformed WITHSCORES payload")
+                (assoc op :type :ok
+                          :value {:malformed? true
+                                  :error (or (.getMessage ^Throwable t) (str t))
+                                  :payload flat}))))
 
           :zrangebyscore
           (let [[lo hi] (:value op)
@@ -285,8 +292,16 @@
                                                      (double lo)
                                                      (double hi)
                                                      "WITHSCORES"))]
-            (assoc op :type :ok :value {:bounds [lo hi]
-                                        :members (parse-withscores flat)})))
+            (try
+              (assoc op :type :ok :value {:bounds [lo hi]
+                                          :members (parse-withscores flat)})
+              (catch Throwable t
+                (warn t "ZSet safety ZRANGEBYSCORE returned malformed WITHSCORES payload")
+                (assoc op :type :ok
+                          :value {:bounds [lo hi]
+                                  :malformed? true
+                                  :error (or (.getMessage ^Throwable t) (str t))
+                                  :payload flat})))))
         (catch Throwable t
           (warn t (str "ZSet safety op failed: " (:f op)))
           (assoc op :type :info :error (or (.getMessage ^Throwable t) (str t))))))))
@@ -378,13 +393,11 @@
 
 (defn- completed-mutation-window
   "For each completed mutation, produce
-  {:member m :score s :zrem? bool? :unknown-score? bool? :invoke-idx i
-   :complete-idx j :type t}.
+  {:member m :score s :zrem? bool? :invoke-idx i :complete-idx j :type t}.
   - :zadd: :score is the requested score (always known).
   - :zincrby: when :ok, :score is the server-returned final score. When
-    :info or pending, the resulting score is unknown (depends on which
-    other ops were applied first); :unknown-score? is set so allowed-
-    scores-for-member can short-circuit the strict score check.
+    :info or pending, :score is nil but :delta is still used to enumerate
+    the possible resulting scores from each admissible prior state.
   - :zrem: :removed? is the boolean returned by ZREM (true iff the
     member existed). A no-op ZREM (returns 0) does NOT mutate state, so
     the model must not treat it as a deletion.
@@ -413,7 +426,6 @@
                   s (when (and ok? (vector? (:value complete)))
                       (second (:value complete)))]
               {:f :zincrby :member m :delta delta :score (some-> s double)
-               :unknown-score? (not (and ok? (some? s)))
                :type t :invoke-idx inv-idx :complete-idx cmp-idx})
 
             :zrem
@@ -446,17 +458,65 @@
        (or (nil? (:complete-idx m))
            (>= (:complete-idx m) read-inv-idx))))
 
-(defn- apply-mutation-to-state
-  "Fold one mutation into a per-member state {:present? bool :score s}.
-  A no-op ZREM (member did not exist; :removed? false) leaves state
-  unchanged so the checker doesn't falsely conclude the member is gone."
+(def ^:private absent-state {:present? false :score nil})
+
+(defn- score-eq?
+  [a b]
+  (and (some? a)
+       (some? b)
+       (<= (Math/abs (- (double a) (double b))) 1.0E-9)))
+
+(defn- apply-mutation-possibilities
+  "Apply one mutation to a per-member state, returning every state still
+  compatible with the mutation's reply. Empty means the reply is impossible
+  from this input state; e.g. ZINCRBY returned a score other than
+  previous-score + delta, or ZREM reported a real deletion of an absent
+  member."
   [st m]
-  (case (:f m)
-    :zadd    {:present? true :score (:score m)}
-    :zincrby {:present? true :score (:score m)}
-    :zrem    (if (:removed? m)
-               {:present? false :score nil}
-               st)))
+  (let [st (or st absent-state)]
+    (case (:f m)
+      :zadd
+      #{{:present? true :score (:score m)}}
+
+      :zincrby
+      (let [previous-score (if (:present? st) (:score st) 0.0)
+            next-score (+ previous-score (:delta m))]
+        (if (and (= :ok (:type m)) (some? (:score m)))
+          (if (score-eq? next-score (:score m))
+            #{{:present? true :score (:score m)}}
+            #{})
+          #{{:present? true :score next-score}}))
+
+      :zrem
+      (cond
+        ;; A confirmed no-op ZREM is not deletion evidence and must not
+        ;; supersede a prior write.
+        (and (= :ok (:type m)) (false? (:removed? m)))
+        #{st}
+
+        ;; A confirmed deletion proves the member was present immediately
+        ;; before this ZREM in any admissible linearization.
+        (and (= :ok (:type m)) (true? (:removed? m)))
+        (if (:present? st) #{absent-state} #{})
+
+        ;; :info / pending ZREM may have been skipped, removed a present
+        ;; member, or observed the member absent.
+        :else
+        (if (:present? st) #{st absent-state} #{st})))))
+
+(defn- advance-states
+  [states m]
+  (set (mapcat #(apply-mutation-possibilities % m) states)))
+
+(defn- apply-sequential-mutations
+  [states muts]
+  (reduce
+    (fn [states m]
+      (if (seq states)
+        (advance-states states m)
+        #{}))
+    states
+    muts))
 
 (defn- model-before
   "Construct authoritative per-member state from mutations whose
@@ -471,7 +531,8 @@
                                        (some? (:complete-idx %))
                                        (< (:complete-idx %) read-inv-idx)))
                          (sort-by :complete-idx))
-            state (reduce apply-mutation-to-state nil applied)]
+            states (apply-sequential-mutations #{absent-state} applied)
+            state (first states)]
         (if state
           (assoc model member state)
           model)))
@@ -524,56 +585,66 @@
               (strictly-follows? % m))
         preceding))
 
-(defn- superseded-zincrby-score?
-  "A committed ZINCRBY return value is not always a possible final read
-  score. If another committed candidate ZINCRBY's returned score equals
-  this score plus that operation's delta, the other return value proves a
-  serialization where this result is an intermediate prefix, not the
-  final state after all completed candidates."
-  [candidates m]
-  (and (= :zincrby (:f m))
-       (some? (:score m))
-       (some (fn [n]
-               (and (not (identical? n m))
-                    (= :zincrby (:f n))
-                    (some? (:score n))
-                    (some? (:delta n))
-                    (= (:score n) (+ (:score m) (:delta n)))))
-             candidates)))
+(defn- real-time-before?
+  [a b]
+  (and (some? (:complete-idx a))
+       (< (:complete-idx a) (:invoke-idx b))))
+
+(defn- drop-index
+  [v idx]
+  (vec (concat (subvec v 0 idx) (subvec v (inc idx)))))
+
+(defn- enabled-indexed
+  [remaining]
+  (keep-indexed
+    (fn [idx m]
+      (when-not (some #(and (not (identical? % m))
+                            (real-time-before? % m))
+                      remaining)
+        [idx m]))
+    remaining))
+
+(defn- linearized-read-states
+  "Enumerate possible member states at a read. Required mutations are
+  committed tail candidates and must appear before the read. Optional
+  mutations are :info/pending or concurrent ops and may either be absent
+  from the read's prefix or appear in any real-time-consistent order."
+  [initial-states required optional]
+  (let [items (vec (concat (map #(assoc % ::required? true) required)
+                           (map #(assoc % ::required? false) optional)))
+        memo (atom {})]
+    (letfn [(step [states remaining]
+              (let [k [states remaining]]
+                (if (contains? @memo k)
+                  (get @memo k)
+                  (let [result (if (empty? remaining)
+                                 states
+                                 (reduce
+                                   (fn [acc [idx item]]
+                                     (let [remaining' (drop-index remaining idx)
+                                           applied (advance-states states item)
+                                           acc (if (::required? item)
+                                                 acc
+                                                 (into acc (step states remaining')))]
+                                       (if (seq applied)
+                                         (into acc (step applied remaining'))
+                                         acc)))
+                                   #{}
+                                   (enabled-indexed remaining)))]
+                    (swap! memo assoc k result)
+                    result))))]
+      (step initial-states items))))
 
 (defn- allowed-scores-for-member
-  "Compute the set of scores considered valid for `member` by a read
-  whose window is [read-inv-idx, read-cmp-idx], based on committed state
-  and any concurrent/uncertain mutations.
+  "Compute the set of states considered valid for `member` by a read
+  whose window is [read-inv-idx, read-cmp-idx].
 
-  Linearizability demands a read observes either (a) the latest committed
-  state in real-time order, or (b) the effect of a write still concurrent
-  with the read. We therefore restrict the committed score set to
-  'candidates' — committed mutations NOT strictly followed in real time
-  by another committed mutation (i.e. no other committed op's invoke
-  comes after this op's completion). Scores from strictly superseded
-  committed mutations are NOT admissible.
-
-  When multiple candidates remain (their windows overlap), they can
-  serialize in any real-time-consistent order: the read may legitimately
-  observe the outcome of any of them. Thus presence is required only
-  when EVERY admissible serialization leaves the member present; presence
-  is forbidden only when EVERY admissible serialization leaves it absent.
-
-  Returns:
-    :scores            - set of acceptable scores (from candidate
-                         committed ops + pre-read :info + concurrent
-                         writes with a known score).
-    :unknown-score?    - true iff any concurrent / pre-read :info
-                         ZINCRBY's resulting score is unknown. When set,
-                         the caller MUST skip the strict score-membership
-                         check to stay sound.
-    :can-be-present?   - true iff SOME admissible linearization leaves
-                         the member present.
-    :must-be-present?  - true iff EVERY admissible linearization leaves
-                         the member present (i.e. some candidate is a
-                         write, no candidate is a ZREM, and no uncertain
-                         ZREM could have applied before the read)."
+  ZINCRBY replies are state constraints, not standalone allowed scores:
+  an :ok reply S is valid only if the immediately preceding score plus
+  delta equals S. ZREM true is also ordering evidence: it can only occur
+  after some linearized write made the member present. The checker keeps
+  those constraints by enumerating the committed tail plus any optional
+  :info/pending/concurrent operations in real-time-consistent orders."
   [mutations-by-m member read-inv-idx read-cmp-idx]
   (let [muts (get mutations-by-m member [])
         ;; :ok mutations that completed strictly before the read.
@@ -603,6 +674,9 @@
         ;; final state.
         max-inv (reduce max -1 (map :invoke-idx preceding))
         candidates (filterv #(>= (:complete-idx %) max-inv) preceding)
+        base-preceding (->> preceding
+                            (remove (set candidates))
+                            (sort-by :complete-idx))
         ;; :info mutations that completed before the read: they may or
         ;; may not have taken effect server-side.
         pre-read-info (->> muts
@@ -612,102 +686,27 @@
                                          (not (superseded-by-preceding-state-change?
                                                 preceding %)))))
         ;; Concurrent mutations: windows overlap the read. Include both
-        ;; :ok and :info since either may have taken effect.
+        ;; :ok and :info since either may have taken effect before the
+        ;; read linearized.
         concurrent (concurrent-mutations-for-member muts read-inv-idx read-cmp-idx)
-        ;; Uncertain mutations: anything whose effect on the read is not
-        ;; fully determined by committed real-time order alone.
         uncertain (concat pre-read-info concurrent)
-
-        add-scores (fn [acc m]
-                     (case (:f m)
-                       :zadd    (conj acc (:score m))
-                       :zincrby (cond-> acc (some? (:score m)) (conj (:score m)))
-                       :zrem    acc))
-        ;; Admissible scores: candidate committed + pre-read :info +
-        ;; concurrent writes (with a known score). Committed ZINCRBY
-        ;; candidates are further constrained by their returned scores:
-        ;; a return value proven to be an intermediate prefix of another
-        ;; committed candidate is not a valid final post-read score.
-        candidate-scores (remove #(superseded-zincrby-score? candidates %) candidates)
-        scores (as-> #{} s
-                 (reduce add-scores s candidate-scores)
-                 (reduce add-scores s uncertain))
-
-        has-unknown-incr? (fn [coll]
-                            (some #(and (= :zincrby (:f %))
-                                        (:unknown-score? %))
-                                  coll))
-        ;; Classify uncertain ZINCRBYs by whether their resulting score
-        ;; is known. The resulting score of a read relative to ZINCRBYs
-        ;; depends only on which of them took effect before the read
-        ;; observed state AND whether each such ZINCRBY's return value
-        ;; is recorded.
-        ;;   * Any uncertain ZINCRBY with UNKNOWN score (:info/:pending):
-        ;;     the post-op score is not recoverable from the history, so
-        ;;     we must relax the strict score check -- any numeric score
-        ;;     is admissible.
-        ;;   * All uncertain ZINCRBYs :ok with known return values:
-        ;;     every recorded return pins the ZINCRBY's post-op state
-        ;;     and (because ZINCRBY reads-then-writes atomically) its
-        ;;     pre-op state. Any real-time consistent linearization
-        ;;     therefore ends on one of those known return values (or
-        ;;     on a candidate's score). :scores already contains all
-        ;;     of them via the add-scores reduction over `uncertain`,
-        ;;     so the strict score check is sound. Intermediate
-        ;;     "prefix-sum" values (pre + delta_i for just one of
-        ;;     several concurrent zincrbys) are NOT admissible final
-        ;;     states: the return values constrain the serialization
-        ;;     order, and no legitimate read can observe a partial sum
-        ;;     that doesn't match any recorded post-op score.
-        unknown-score? (has-unknown-incr? uncertain)
-
-        any-candidate-write? (some write-op? candidates)
-        any-candidate-zrem? (some effective-zrem? candidates)
-        any-uncertain-write? (some write-op? uncertain)
-        any-uncertain-zrem? (some effective-zrem? uncertain)
-
-        ;; Some linearization of candidates ends with the member
-        ;; present. Because candidates have overlapping windows (they
-        ;; all share the same max-inv), any of them can serialize last.
-        ;; So presence is allowed iff at least one candidate is a write.
-        candidate-can-be-present? (boolean any-candidate-write?)
-        ;; Some linearization of candidates ends with the member absent.
-        candidate-can-be-absent? (or (empty? candidates)
-                                     (boolean any-candidate-zrem?))
-
-        ;; can-be-present?: at least one admissible linearization
-        ;; (candidates + uncertain) ends with the member present.
-        ;; Presence REQUIRES a write-op (ZADD / ZINCRBY) somewhere in
-        ;; the admissible set -- either a candidate committed write or
-        ;; an uncertain concurrent/pre-read :info write. ZREM never
-        ;; contributes existence evidence: since `setup!` clears the
-        ;; key at test start, an observed member that never had a ZADD
-        ;; or ZINCRBY touch it must be a phantom regardless of any
-        ;; ZREM's :removed? flag (which may be defaulted to true on
-        ;; :info for uncertainty accounting only).
-        can-be-present? (or candidate-can-be-present?
-                            any-uncertain-write?)
-
-        ;; must-be-present?: EVERY admissible linearization ends with
-        ;; the member present. Requires the candidate outcome to be
-        ;; always-present (candidate write, no candidate zrem) AND no
-        ;; uncertain zrem that could reorder last to remove it.
-        must-be-present? (boolean (and any-candidate-write?
-                                       (not candidate-can-be-absent?)
-                                       (not any-uncertain-zrem?)))]
+        base-states (apply-sequential-mutations #{absent-state} base-preceding)
+        possible-states (linearized-read-states base-states candidates uncertain)
+        present-states (filter :present? possible-states)
+        scores (set (map :score present-states))
+        can-be-present? (boolean (seq present-states))
+        must-be-present? (boolean (and (seq possible-states)
+                                       (every? :present? possible-states)))]
     {:scores           scores
-     :unknown-score?   (boolean unknown-score?)
      :can-be-present?  (boolean can-be-present?)
      :must-be-present? must-be-present?}))
 
 (defn- score-definitely-in-range?
   "True iff the member's committed score is definitively in [lo, hi]
   for the purposes of completeness: every candidate score is inside the
-  range AND no uncertain/concurrent mutation could have produced an
-  unknown or out-of-range score. Used by ZRANGEBYSCORE completeness."
-  [scores unknown-score? lo hi]
-  (boolean (and (not unknown-score?)
-                (seq scores)
+  range. Used by ZRANGEBYSCORE completeness."
+  [scores lo hi]
+  (boolean (and (seq scores)
                 (every? #(<= lo % hi) scores))))
 
 (defn- duplicate-members
@@ -725,133 +724,138 @@
         inv-idx (:index invoke)
         cmp-idx (:index complete)
         errors (atom [])]
-    ;; 1. Ordering
-    (when-not (sorted-by-score-then-member? entries)
-      (swap! errors conj {:kind :unsorted
-                          :index cmp-idx
-                          :entries entries}))
-    ;; 1b. No duplicate members: a ZSet read must return each member at
-    ;; most once. A duplicate-member result could otherwise satisfy
-    ;; ordering and score-membership checks while hiding a real bug.
-    (let [dupes (duplicate-members entries)]
-      (when (seq dupes)
-        (swap! errors conj {:kind :duplicate-members
-                            :index cmp-idx
-                            :members dupes})))
-    ;; 2. For each observed (member,score): validate presence + score.
-    ;;    can-be-present? catches both phantoms (member never existed)
-    ;;    and stale reads (member committed-removed before the read
-    ;;    with no concurrent re-add).
-    (doseq [[member score] entries]
-      (let [{:keys [scores can-be-present? unknown-score?]}
-            (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
-        (cond
-          (not can-be-present?)
-          (swap! errors conj {:kind :unexpected-presence
+    (if (:malformed? entries)
+      [{:kind :malformed-read
+        :index cmp-idx
+        :error (:error entries)
+        :payload (:payload entries)}]
+      (do
+        ;; 1. Ordering
+        (when-not (sorted-by-score-then-member? entries)
+          (swap! errors conj {:kind :unsorted
                               :index cmp-idx
-                              :member member
-                              :score score})
-          ;; Skip the strict score check when any concurrent ZINCRBY's
-          ;; resulting score is unknown: the read could legitimately
-          ;; observe any value the in-flight increment produces.
-          unknown-score? nil
-          (not (contains? scores score))
-          (swap! errors conj {:kind :score-mismatch
-                              :index cmp-idx
-                              :member member
-                              :observed score
-                              :allowed scores}))))
-    ;; 3. Completeness: model-required members must appear.
-    ;;    A member is required-present only if every admissible
-    ;;    linearization leaves it present (must-be-present?). This
-    ;;    correctly skips members that an :info or concurrent ZREM
-    ;;    might have removed before the read.
-    (let [model (model-before mutations-by-m inv-idx)
-          observed-members (into #{} (map first) entries)]
-      (doseq [[member _] model]
-        (let [{:keys [must-be-present?]}
-              (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
-          (when (and must-be-present?
-                     (not (contains? observed-members member)))
-            (swap! errors conj {:kind :missing-member
+                              :entries entries}))
+        ;; 1b. No duplicate members: a ZSet read must return each member at
+        ;; most once. A duplicate-member result could otherwise satisfy
+        ;; ordering and score-membership checks while hiding a real bug.
+        (let [dupes (duplicate-members entries)]
+          (when (seq dupes)
+            (swap! errors conj {:kind :duplicate-members
                                 :index cmp-idx
-                                :member member})))))
-    @errors))
+                                :members dupes})))
+        ;; 2. For each observed (member,score): validate presence + score.
+        ;;    can-be-present? catches both phantoms (member never existed)
+        ;;    and stale reads (member committed-removed before the read
+        ;;    with no concurrent re-add).
+        (doseq [[member score] entries]
+          (let [{:keys [scores can-be-present?]}
+                (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+            (cond
+              (not can-be-present?)
+              (swap! errors conj {:kind :unexpected-presence
+                                  :index cmp-idx
+                                  :member member
+                                  :score score})
+              (not (contains? scores score))
+              (swap! errors conj {:kind :score-mismatch
+                                  :index cmp-idx
+                                  :member member
+                                  :observed score
+                                  :allowed scores}))))
+        ;; 3. Completeness: model-required members must appear.
+        ;;    A member is required-present only if every admissible
+        ;;    linearization leaves it present (must-be-present?). This
+        ;;    correctly skips members that an :info or concurrent ZREM
+        ;;    might have removed before the read.
+        (let [model (model-before mutations-by-m inv-idx)
+              observed-members (into #{} (map first) entries)]
+          (doseq [[member _] model]
+            (let [{:keys [must-be-present?]}
+                  (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+              (when (and must-be-present?
+                         (not (contains? observed-members member)))
+                (swap! errors conj {:kind :missing-member
+                                    :index cmp-idx
+                                    :member member})))))
+        @errors))))
 
 (defn- check-zrangebyscore
   [mutations-by-m {:keys [invoke complete] :as _pair}]
-  (let [{:keys [bounds members]} (:value complete)
+  (let [{:keys [bounds members] :as value} (:value complete)
         [lo hi] bounds
         inv-idx (:index invoke)
         cmp-idx (:index complete)
         errors (atom [])]
-    (when-not (sorted-by-score-then-member? members)
-      (swap! errors conj {:kind :unsorted-range
-                          :index cmp-idx
-                          :bounds bounds
-                          :members members}))
-    (let [dupes (duplicate-members members)]
-      (when (seq dupes)
-        (swap! errors conj {:kind :duplicate-members-range
-                            :index cmp-idx
-                            :bounds bounds
-                            :members dupes})))
-    ;; Observed members must be within bounds AND have a known allowed score.
-    (doseq [[member score] members]
-      (when (or (< score lo) (> score hi))
-        (swap! errors conj {:kind :out-of-range
-                            :index cmp-idx
-                            :bounds bounds
-                            :member member
-                            :score score}))
-      (let [{:keys [scores can-be-present? unknown-score?]}
-            (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
-        (cond
-          (not can-be-present?)
-          (swap! errors conj {:kind :unexpected-presence-range
+    (if (:malformed? value)
+      [{:kind :malformed-read-range
+        :index cmp-idx
+        :bounds bounds
+        :error (:error value)
+        :payload (:payload value)}]
+      (do
+        (when-not (sorted-by-score-then-member? members)
+          (swap! errors conj {:kind :unsorted-range
                               :index cmp-idx
-                              :member member
-                              :score score})
-          unknown-score? nil
-          (not (contains? scores score))
-          (swap! errors conj {:kind :score-mismatch-range
-                              :index cmp-idx
-                              :member member
-                              :observed score
-                              :allowed scores}))))
-    ;; Completeness within bounds: a model member must appear only when
-    ;; (a) every admissible linearization leaves it present
-    ;;     (must-be-present?), AND
-    ;; (b) its score is definitively within [lo, hi] across all
-    ;;     admissible linearizations (no uncertain ZINCRBY, every
-    ;;     candidate score inside the bounds).
-    ;; Uncertain scores (concurrent/:info ZINCRBY) must NOT cause
-    ;; completeness failures when the resulting score is unknown.
-    (let [model (model-before mutations-by-m inv-idx)
-          observed-members (into #{} (map first) members)]
-      (doseq [[member _] model]
-        (let [{:keys [must-be-present? scores unknown-score?]}
-              (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
-          (when (and must-be-present?
-                     (score-definitely-in-range? scores unknown-score? lo hi)
-                     (not (contains? observed-members member)))
-            ;; Report the full set of admissible scores (:allowed), not
-            ;; just an arbitrary first element -- picking `(first
-            ;; scores)` on a multi-element set is misleading when
-            ;; concurrent writers leave several linearizations valid.
-            ;; :allowed matches the convention used by the sibling
-            ;; :score-mismatch-range error above. :expected-score is
-            ;; retained (as `(first scores)` for a single-element set,
-            ;; nil otherwise) for backward compatibility with any
-            ;; out-of-tree consumers.
-            (swap! errors conj {:kind :missing-member-range
+                              :bounds bounds
+                              :members members}))
+        (let [dupes (duplicate-members members)]
+          (when (seq dupes)
+            (swap! errors conj {:kind :duplicate-members-range
+                                :index cmp-idx
+                                :bounds bounds
+                                :members dupes})))
+        ;; Observed members must be within bounds AND have a known allowed score.
+        (doseq [[member score] members]
+          (when (or (< score lo) (> score hi))
+            (swap! errors conj {:kind :out-of-range
                                 :index cmp-idx
                                 :bounds bounds
                                 :member member
-                                :allowed scores
-                                :expected-score (when (= 1 (count scores))
-                                                  (first scores))})))))
-    @errors))
+                                :score score}))
+          (let [{:keys [scores can-be-present?]}
+                (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+            (cond
+              (not can-be-present?)
+              (swap! errors conj {:kind :unexpected-presence-range
+                                  :index cmp-idx
+                                  :member member
+                                  :score score})
+              (not (contains? scores score))
+              (swap! errors conj {:kind :score-mismatch-range
+                                  :index cmp-idx
+                                  :member member
+                                  :observed score
+                                  :allowed scores}))))
+        ;; Completeness within bounds: a model member must appear only when
+        ;; (a) every admissible linearization leaves it present
+        ;;     (must-be-present?), AND
+        ;; (b) its score is definitively within [lo, hi] across all
+        ;;     admissible linearizations.
+        (let [model (model-before mutations-by-m inv-idx)
+              observed-members (into #{} (map first) members)]
+          (doseq [[member _] model]
+            (let [{:keys [must-be-present? scores]}
+                  (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+              (when (and must-be-present?
+                         (score-definitely-in-range? scores lo hi)
+                         (not (contains? observed-members member)))
+                ;; Report the full set of admissible scores (:allowed), not
+                ;; just an arbitrary first element -- picking `(first
+                ;; scores)` on a multi-element set is misleading when
+                ;; concurrent writers leave several linearizations valid.
+                ;; :allowed matches the convention used by the sibling
+                ;; :score-mismatch-range error above. :expected-score is
+                ;; retained (as `(first scores)` for a single-element set,
+                ;; nil otherwise) for backward compatibility with any
+                ;; out-of-tree consumers.
+                (swap! errors conj {:kind :missing-member-range
+                                    :index cmp-idx
+                                    :bounds bounds
+                                    :member member
+                                    :allowed scores
+                                    :expected-score (when (= 1 (count scores))
+                                                      (first scores))})))))
+        @errors))))
 
 (defn zset-safety-checker
   "Custom Jepsen checker: validates ZSet safety properties using a

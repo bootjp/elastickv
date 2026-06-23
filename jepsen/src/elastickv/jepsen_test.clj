@@ -20,8 +20,9 @@
 (defn elastickv-s3-test []
   (s3-workload/elastickv-s3-test {}))
 
-(defn elastickv-zset-safety-test []
-  (zset-safety-workload/elastickv-zset-safety-test {}))
+(defn elastickv-zset-safety-test
+  ([] (elastickv-zset-safety-test {}))
+  ([opts] (zset-safety-workload/elastickv-zset-safety-test opts)))
 
 (def ^:private test-fns
   "Map of user-facing test names to their constructor fns. The first

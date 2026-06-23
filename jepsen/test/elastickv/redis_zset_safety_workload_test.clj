@@ -53,10 +53,9 @@
         result  (run-checker history)]
     (is (:valid? result) (str "expected valid, got: " result))))
 
-(deftest info-zincrby-skips-strict-score-check
-  ;; ZINCRBY whose response was lost (:info) leaves the resulting score
-  ;; unknown. A read concurrent with such an op observing some derived
-  ;; score must NOT be flagged as a score mismatch.
+(deftest info-zincrby-allows-derived-score
+  ;; ZINCRBY whose response was lost (:info) still has a known delta. A
+  ;; read concurrent with such an op may observe the derived score.
   (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1] :index 0}
                  {:type :ok     :process 0 :f :zadd    :value ["m1" 1] :index 1}
                  {:type :invoke :process 1 :f :zincrby :value ["m1" 5] :index 2}
@@ -77,12 +76,9 @@
     (is (not (:valid? result)) (str "expected mismatch, got: " result))))
 
 (deftest single-ok-concurrent-zincrby-still-validates-scores
-  ;; :unknown-score? must NOT be set when exactly one concurrent
-  ;; ZINCRBY is :ok (and therefore has a known resulting score). The
-  ;; read may observe either the pre-op score or the post-op score,
-  ;; both of which are in :scores. An arbitrary impossible score
-  ;; (e.g. 999.0) must still be flagged as a :score-mismatch, not
-  ;; waved through by `:unknown-score?`.
+  ;; A single concurrent :ok ZINCRBY has a known return value. The read
+  ;; may observe either the pre-op score or the post-op score, but an
+  ;; arbitrary impossible score must still be flagged.
   (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]   :index 0}
                  {:type :ok     :process 0 :f :zadd    :value ["m1" 1]   :index 1}
                  {:type :invoke :process 1 :f :zincrby :value ["m1" 5]   :index 2}
@@ -99,10 +95,10 @@
     (is (contains? kinds :score-mismatch)
         (str "expected :score-mismatch, got kinds=" kinds))))
 
-(deftest two-concurrent-zincrbys-relax-score-check
+(deftest two-concurrent-zincrbys-accept-reachable-prefix
   ;; Prefix-sum ordering matters: with two concurrent ZINCRBYs, the
-  ;; intermediate score (pre + one delta) is reachable and need not be
-  ;; in :scores. The checker must relax the strict score check.
+  ;; intermediate score (pre + one delta) is reachable and must be in
+  ;; the enumerated score set.
   (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]   :index 0}
                  {:type :ok     :process 0 :f :zadd    :value ["m1" 1]   :index 1}
                  {:type :invoke :process 1 :f :zincrby :value ["m1" 2]   :index 2}
@@ -115,7 +111,7 @@
                  {:type :ok     :process 2 :f :zincrby :value ["m1" 6.0] :index 7}]
         result  (run-checker history)]
     (is (:valid? result)
-        (str "expected relaxation for >=2 concurrent ZINCRBYs, got: " result))))
+        (str "expected reachable prefix for >=2 concurrent ZINCRBYs, got: " result))))
 
 (deftest no-op-zrem-alone-does-not-false-positive
   ;; CI-observed false positive: a member whose only prior ops are no-op
@@ -198,13 +194,13 @@
                   :value [["m1" 6.0]] :index 5}]
         result  (run-checker history)]
     (is (:valid? result)
-        (str "expected :info-before-read to skip strict score check, got: " result))))
+        (str "expected :info-before-read derived score to be valid, got: " result))))
 
 (deftest pre-read-info-zincrby-superseded-by-later-zadd
   ;; A pre-read :info ZINCRBY is uncertainty only until a later committed
   ;; state-changing op strictly follows it before the read. The later ZADD
   ;; overwrites any possible increment outcome, so an arbitrary score must
-  ;; be rejected instead of waved through by :unknown-score?.
+  ;; be rejected.
   (let [history [{:type :invoke :process 0 :f :zincrby :value ["m1" 5] :index 0}
                  {:type :info   :process 0 :f :zincrby :value ["m1" 5] :index 1}
                  {:type :invoke :process 1 :f :zadd    :value ["m1" 2] :index 2}
@@ -215,7 +211,7 @@
         result  (run-checker history)
         kinds   (set (map :kind (:first-errors result)))]
     (is (not (:valid? result))
-        (str "expected superseded :info ZINCRBY not to relax score, got: " result))
+        (str "expected superseded :info ZINCRBY not to admit score, got: " result))
     (is (contains? kinds :score-mismatch)
         (str "expected :score-mismatch, got kinds=" kinds))))
 
@@ -323,11 +319,12 @@
 ;; Linearization of concurrent ops / uncertain mutations
 ;; ---------------------------------------------------------------------------
 
-(deftest concurrent-zadd-zrem-both-completed-accepts-either-outcome
+(deftest true-zrem-constrains-overlapping-zadd-order
   ;; ZADD and ZREM for the same member whose invoke/complete
-  ;; windows overlap (both commit before the read) have ambiguous
-  ;; linearization. A linearizable store may serialize either one last,
-  ;; so the read legitimately observes EITHER [["m1" 1.0]] OR [].
+  ;; windows overlap (both commit before the read) are not enough to admit
+  ;; either final state. ZREM returning true proves it observed the member
+  ;; present, so with an initially absent member it must serialize after
+  ;; the ZADD and the final state must be absent.
   ;; Windows: ZADD=[inv=0, cmp=3], ZREM=[inv=1, cmp=2] — overlap.
   (let [base [{:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
               {:type :invoke :process 1 :f :zrem :value "m1" :index 1}
@@ -341,8 +338,8 @@
                        {:type :invoke :process 2 :f :zrange-all :index 4}
                        {:type :ok     :process 2 :f :zrange-all
                         :value [] :index 5})]
-    (is (:valid? (run-checker hist-present))
-        "expected read observing ZADD's outcome to be accepted")
+    (is (not (:valid? (run-checker hist-present)))
+        "expected read observing ZADD's outcome to be rejected")
     (is (:valid? (run-checker hist-absent))
         "expected read observing ZREM's outcome (absent) to be accepted")))
 
@@ -617,20 +614,91 @@
     (is (not (:valid? (run-checker read-bad)))
         "expected pre-reset intermediate (3.0) to be flagged")))
 
+(deftest overlapping-zadd-and-zincrby-respect-return-value-order
+  ;; ZINCRBY +1 returning 1.0 proves it ran from an absent/zero score. If
+  ;; an overlapping ZADD 10.0 also commits before the read, the only valid
+  ;; order is ZINCRBY then ZADD, so the final readable score is 10.0.
+  (let [base [{:type :invoke :process 0 :f :zincrby :value ["m1" 1]    :index 0}
+              {:type :invoke :process 1 :f :zadd    :value ["m1" 10]   :index 1}
+              {:type :ok     :process 0 :f :zincrby :value ["m1" 1.0]  :index 2}
+              {:type :ok     :process 1 :f :zadd    :value ["m1" 10]   :index 3}]
+        read-zadd (conj base
+                    {:type :invoke :process 2 :f :zrange-all :index 4}
+                    {:type :ok     :process 2 :f :zrange-all
+                     :value [["m1" 10.0]] :index 5})
+        read-incr (conj base
+                    {:type :invoke :process 2 :f :zrange-all :index 4}
+                    {:type :ok     :process 2 :f :zrange-all
+                     :value [["m1" 1.0]] :index 5})]
+    (is (:valid? (run-checker read-zadd))
+        "expected ZADD's final score to be accepted")
+    (is (not (:valid? (run-checker read-incr)))
+        "expected ZINCRBY's pre-ZADD return to be rejected")))
+
+(deftest zincrby-return-value-must-match-prior-state
+  ;; A non-concurrent ZINCRBY's ok reply must equal prior-score + delta.
+  ;; The checker must not trust an impossible reply as the member's state.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]     :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]     :index 1}
+                 {:type :invoke :process 0 :f :zincrby :value ["m1" 5]     :index 2}
+                 {:type :ok     :process 0 :f :zincrby :value ["m1" 999.0] :index 3}
+                 {:type :invoke :process 1 :f :zrange-all                  :index 4}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 999.0]] :index 5}]
+        result  (run-checker history)]
+    (is (not (:valid? result))
+        (str "expected impossible ZINCRBY reply to be rejected, got: " result))))
+
+(deftest negative-zincrby-tail-remains-admissible
+  ;; Negative deltas can make a later valid tail numerically lower than an
+  ;; earlier return. Pairwise score pruning must not discard that final tail.
+  (let [base [{:type :invoke :process 0 :f :zadd    :value ["m1" 5]    :index 0}
+              {:type :ok     :process 0 :f :zadd    :value ["m1" 5]    :index 1}
+              {:type :invoke :process 1 :f :zincrby :value ["m1" -2]   :index 2}
+              {:type :invoke :process 2 :f :zincrby :value ["m1" -3]   :index 3}
+              {:type :ok     :process 1 :f :zincrby :value ["m1" 3.0]  :index 4}
+              {:type :ok     :process 2 :f :zincrby :value ["m1" 0.0]  :index 5}]
+        read-tail (conj base
+                    {:type :invoke :process 3 :f :zrange-all :index 6}
+                    {:type :ok     :process 3 :f :zrange-all
+                     :value [["m1" 0.0]] :index 7})
+        read-prefix (conj base
+                      {:type :invoke :process 3 :f :zrange-all :index 6}
+                      {:type :ok     :process 3 :f :zrange-all
+                       :value [["m1" 3.0]] :index 7})]
+    (is (:valid? (run-checker read-tail))
+        "expected negative-delta final tail to be accepted")
+    (is (not (:valid? (run-checker read-prefix)))
+        "expected intermediate negative-delta return to be rejected")))
+
+(deftest pre-read-info-zincrby-does-not-admit-arbitrary-score
+  ;; A completed-before-read :info ZINCRBY may have happened or not, but
+  ;; its delta still bounds the possible scores when no later uncertainty
+  ;; exists.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]  :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]  :index 1}
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 5]  :index 2}
+                 {:type :info   :process 1 :f :zincrby :value ["m1" 5]  :index 3}
+                 {:type :invoke :process 2 :f :zrange-all               :index 4}
+                 {:type :ok     :process 2 :f :zrange-all
+                  :value [["m1" 42.0]] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected arbitrary pre-read :info ZINCRBY score rejected, got: " result))
+    (is (contains? kinds :score-mismatch)
+        (str "expected :score-mismatch, got kinds=" kinds))))
+
 ;; ---------------------------------------------------------------------------
-;; unknown-score? gate: restricted to :info ZINCRBYs only. Two concurrent
-;; :ok ZINCRBYs with known return values do NOT make the score check
-;; unknown -- their return values pin the linearization and the
-;; admissible score set is constrained by :scores (candidates + uncertain
-;; ok return values).
+;; ZINCRBY return values pin the linearization. Concurrent :ok ZINCRBYs
+;; add only the scores reachable under a real-time-consistent order.
 ;; ---------------------------------------------------------------------------
 
 (deftest two-ok-concurrent-zincrbys-reject-impossible-score
   ;; Two overlapping :ok ZINCRBYs with known return values
   ;; (3 and 6) constrain the admissible post-chain read set to {1,3,6}.
   ;; A read of 999 is impossible under any linearization; the checker
-  ;; must flag it as :score-mismatch (no longer swallowed by the old
-  ;; "2+ uncertain zincrbys -> unknown-score?" shortcut).
+  ;; must flag it as :score-mismatch.
   (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
                  {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
                  ;; Two concurrent ZINCRBYs. Windows overlap the read.
@@ -672,11 +740,10 @@
     (is (not (:valid? (run-checker read-3)))
         "expected 3.0 intermediate return value to be rejected")))
 
-(deftest info-plus-ok-concurrent-zincrby-stays-unknown
-  ;; When at least one concurrent ZINCRBY is :info (unknown
-  ;; post-op score), the strict score check must be relaxed regardless
-  ;; of how many other :ok ZINCRBYs are concurrent. Any numeric score
-  ;; must be accepted for this read.
+(deftest info-plus-ok-zincrby-stays-bounded
+  ;; A :info ZINCRBY still has a known delta. Once the surrounding state is
+  ;; known, it admits the pre-info state or the delta-applied state, not an
+  ;; arbitrary numeric score.
   (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]    :index 0}
                  {:type :ok     :process 0 :f :zadd    :value ["m1" 1]    :index 1}
                  ;; One :info ZINCRBY (unknown outcome).
@@ -686,14 +753,13 @@
                  {:type :ok     :process 2 :f :zincrby :value ["m1" 4.0]  :index 4}
                  {:type :info   :process 1 :f :zincrby :value ["m1" 2]
                   :error "conn reset" :index 5}
-                 ;; Read observes an "arbitrary" score -- admissible
-                 ;; because the :info ZINCRBY could have produced any
-                 ;; post-op state visible to the read.
+                 ;; Read observes an arbitrary score: invalid. The possible
+                 ;; scores are 4.0 (only the :ok ZINCRBY) or 6.0 (both).
                  {:type :invoke :process 3 :f :zrange-all                 :index 6}
                  {:type :ok     :process 3 :f :zrange-all
                   :value [["m1" 42.0]] :index 7}]]
-    (is (:valid? (run-checker history))
-        "expected any score accepted when :info ZINCRBY is concurrent")))
+    (is (not (:valid? (run-checker history)))
+        "expected arbitrary score rejected when :info ZINCRBY is bounded")))
 
 ;; ---------------------------------------------------------------------------
 ;; Infinity score parsing
@@ -824,6 +890,39 @@
         result  (run-checker history)]
     (is (true? (:valid? result))
         (str "expected :valid? true with one :ok read, got: " result))))
+
+(deftest malformed-zrange-read-is-checker-failure
+  ;; A read whose Redis command returned successfully but produced a
+  ;; malformed WITHSCORES payload is safety evidence, not a timeout. The
+  ;; checker must fail it instead of filtering it out as non-:ok.
+  (let [history [{:type :invoke :process 0 :f :zrange-all :index 0}
+                 {:type :ok     :process 0 :f :zrange-all
+                  :value {:malformed? true
+                          :error "WITHSCORES reply has odd element count"
+                          :payload ["m1" "1" "dangling"]}
+                  :index 1}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected malformed ZRANGE read to fail, got: " result))
+    (is (contains? kinds :malformed-read)
+        (str "expected :malformed-read, got kinds=" kinds))))
+
+(deftest malformed-zrangebyscore-read-is-checker-failure
+  (let [history [{:type :invoke :process 0 :f :zrangebyscore
+                  :value [0.0 10.0] :index 0}
+                 {:type :ok     :process 0 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :malformed? true
+                          :error "WITHSCORES reply has odd element count"
+                          :payload ["m1" "1" "dangling"]}
+                  :index 1}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected malformed ZRANGEBYSCORE read to fail, got: " result))
+    (is (contains? kinds :malformed-read-range)
+        (str "expected :malformed-read-range, got kinds=" kinds))))
 
 (deftest zrem-invoke-handles-nil-response
   ;; If car/wcar for ZREM returns nil (protocol edge,
