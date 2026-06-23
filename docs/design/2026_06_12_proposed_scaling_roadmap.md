@@ -391,8 +391,10 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
 
 1. **HLC per-group ceiling renewal fix** (TSO doc §6 / M1). Smallest correct
    change; closes the cross-group monotonicity gap (§1.5) *before* the
-   topology that exposes it exists. Land first so multi-node groups are safe
-   on arrival.
+   topology that exposes it exists. Land first so each group remains safe when
+   replicas move across nodes, but do not enable cross-group transactions whose
+   participating groups are led by different nodes until step 11 (or its
+   single-oracle bridge) lands.
 2. **Multi-node multi-group bootstrap** (Gap 1 / **PR #955**,
    `2026_06_12_proposed_multinode_multigroup_bootstrap.md`). The root
    unblocker for (b), (c), (e), Gap 3, Gap 4. Nothing else multi-node-shaped
@@ -447,10 +449,13 @@ design if needed. The near-term mitigation is layered:
    binary clusters run in compatibility mode with these features disabled.
 2. **Operator-driven in-place expansion.** For clusters that can tolerate a
    controlled maintenance window, upgrade all binaries first, verify capability
-   convergence, then add voters / learners one group at a time with live
-   `AddVoter` / `AddLearner` and keep the old single-voter leader serving until
-   the new voter set catches up. Do not permit a flag-only restart to reinterpret
-   an existing single-voter group as multi-voter.
+   convergence, then expand one group at a time by adding a new replica as a
+   learner (`AddLearner`), waiting for its match/apply watermark to catch up,
+   and promoting it with the learner-promotion path. Keep the old single-voter
+   leader serving until the learner is caught up and promoted; reserve direct
+   `AddVoter` for bootstrap/offline fully-caught-up peers, not live in-place
+   expansion. Do not permit a flag-only restart to reinterpret an existing
+   single-voter group as multi-voter.
 3. **Blue/green or bridge/proxy cutover for zero-downtime moves.** Deployments
    that cannot accept the in-place operational window should use a fresh
    multi-node cluster plus a temporary bridge/proxy mode: dual-write or
