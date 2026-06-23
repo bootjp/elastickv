@@ -2,7 +2,7 @@
 
 Status: Proposed
 Author: bootjp
-Date: 2026-06-12
+Date: 2026-06-23
 
 This is a roadmap / implementation-plan document (the kind `docs/design/README.md`
 explicitly admits under "Concrete implementation plans"). It surveys the
@@ -26,8 +26,8 @@ What bounds a single elastickv deployment today:
 1. **Single-process multi-group only.** Multiple Raft groups run in one
    process (`--raftGroups id=addr,…`, `shard_config.go:61-99`); each group
    gets its own engine and its own gRPC listener at `rt.spec.address`
-   (`main.go:1606-1620`, listener at `:1613`). But a *group whose voter set
-   spans more than one node is not deployable from the startup flags*:
+   (`main.go:1606-1620`, listener at `:1613`). But a *multi-group topology whose
+   per-group voter sets span nodes is not deployable from the startup flags*:
    `resolveBootstrapServers` rejects `--raftBootstrapMembers` whenever
    `len(groups) != 1` (`main.go:746`, `ErrBootstrapMembersRequireSingleGroup`
    at `:736`), and `buildRuntimeForGroup` passes the same `bootstrapServers`
@@ -104,7 +104,12 @@ memory each group's private cache/memtable pins.
   (`docs/design/2026_06_11_proposed_hotspot_split_milestone2_migration.md`,
   branch `docs/hotspot-split-m2-proposal`): a resumable `SplitJob` with
   `PLANNED → BACKFILL → FENCE → DELTA_COPY → CUTOVER → CLEANUP → DONE` phases
-  driven by a migrator on the default-group leader. Auto-detection /
+  driven by a migrator on the default-group leader. M2 is the required
+  ownership-migration mechanism, but it reduces per-node bytes only when the
+  target group has different replica placement; if every group still shares the
+  same local voter set, migration changes ownership but cannot move data off an
+  over-full node. Actual per-node volume relief therefore also depends on Gap 1
+  plus the replica-placement / region-balance work in Gap 4. Auto-detection /
   scheduling is **PR #951**
   (`docs/design/2026_06_11_proposed_hotspot_split_milestone3_automation.md`,
   branch `design/hotspot-split-m3-automation`), which drives detection off the
@@ -262,11 +267,15 @@ memory each group's private cache/memtable pins.
 ### (f) Operational scaling
 
 - **keyviz** — the per-route load sampler is wired and allocation-free on the
-  hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`), with proposed extensions
-  for cluster fan-out (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
+  write hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`),
+  with proposed extensions for cluster fan-out
+  (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
   subrange sampling (`2026_05_25_proposed_keyviz_subrange_sampling.md`),
   hot-key top-K (`2026_05_28_proposed_keyviz_hot_key_topk.md`), and per-cell
-  conflict (implemented). It is the detection signal M3 reuses.
+  conflict (implemented). It is the detection signal M3 reuses. Current
+  adapter-direct Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this
+  coordinator sampler, so read-heavy hotspots remain invisible until read-path
+  sampling or an equivalent adapter read observation path is added.
 - **admin** — admin dashboard / data browser / purge-queue are implemented
   (`2026_04_24_implemented_admin_dashboard.md`,
   `2026_05_22_implemented_admin_data_browser.md`,
@@ -305,7 +314,9 @@ extend `--raftGroups` / add a per-group members flag to accept per-group
 multi-node voter sets; lift the guard only for the explicitly modeled
 multi-group form. (M2) integration harness that stands up multi-voter groups
 across processes. (M3) Jepsen multi-group multi-node workload. **Depends-on:**
-nothing (it is the root unblocker). *A companion proposal is in review as **PR #955**
+none for writing the design; rollout must land the HLC per-group ceiling
+renewal fix first, as sequenced in §4, before enabling the topology that
+exposes stale ceilings. *A companion proposal is in review as **PR #955**
 (`docs/design/2026_06_12_proposed_multinode_multigroup_bootstrap.md`, branch
 `design/multinode-multigroup-bootstrap`); once it lands it is the authoritative
 spec for this gap and this roadmap defers to it.*
@@ -418,8 +429,10 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
    hold many groups; land before pushing high group counts in production.
 7. **Follower / learner reads** (Gap 3). After step 2 (remote replicas exist)
    and the learner primitive (already in-tree).
-8. **Region balance scheduler** (Gap 4). After step 4 (migration plane) and
-   step 2 (multi-node). Complement to step 3's leader balance.
+8. **Region balance scheduler** (Gap 4). After step 4 (migration plane), step 2
+   (multi-node), and a replica-placement / membership-change design that can
+   reshape groups when existing target groups share the same voter set.
+   Complement to step 3's leader balance.
 9. **Range merge** (Gap 5). After step 4 for cross-group merge.
 10. **Streaming transport** (Gap 6). Any time after step 2 makes inter-node
     Raft traffic significant; pairs with the S3 blob-fetch RPC.
@@ -429,7 +442,8 @@ The ordering is driven by unblock-edges, not by perceived value in isolation.
     any cross-group transaction mode whose `startTS` / `commitTS` can be
     allocated by more than one coordinator / ingress node, step 2 must either
     pull the dedicated TSO group forward or land a narrower bridge that
-    allocates all cross-group `commitTS` values from one designated oracle. The
+    allocates all cross-group `startTS` and `commitTS` values from one
+    designated oracle. The
     per-group fix gives per-node monotonicity only (TSO doc §6 "Guarantee");
     commit-ts comparability across coordinators on different nodes is not
     covered by it (OQ-1), even when forwarding preserves timestamps to leaders
@@ -449,8 +463,9 @@ design if needed. The near-term mitigation is layered:
 
 1. **Capability-gated admin operations.** `raftadmin` / coordinator admin RPCs
    that enable multi-node bootstrap, leader transfers, follower reads,
-   migration/import, write fences, or a cross-group timestamp bridge must first
-   observe that every target voter advertises the matching capability. Mixed
+   migration/import, write fences, learner admission/promotion, or a cross-group
+   timestamp bridge must first observe that every current voter and every target
+   learner/voter/server involved advertises the matching capability. Mixed
    binary clusters run in compatibility mode with these features disabled.
 2. **Operator-driven in-place expansion.** For clusters that can tolerate a
    controlled maintenance window, upgrade all binaries first, verify capability
@@ -500,7 +515,8 @@ design if needed. The near-term mitigation is layered:
    Composed-1 guard, `docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md`
    §4.2(a)/§4.4; FSM `latest > startTS` write-conflict check). OCC
    serializability depends on those `commitTS` values being **mutually
-   comparable** across all participating groups.
+   comparable** across all participating groups, and read-only participant shards
+   need the separate validation gate described below.
 
    **Why the per-group fix is necessary but not sufficient.** Today this is
    safe only because every group shares the *same* process-wide `*HLC`
@@ -540,8 +556,8 @@ design if needed. The near-term mitigation is layered:
    holds. Open sub-question: whether an interim measure short of the full TSO
    group — e.g. pinning every cross-group txn's timestamp allocation to a single
    designated group's leader (the default group's `c.clock`), so all cross-group
-   `commitTS` still come from one clock — can bridge the timestamp gap between
-   step 2 and step 11 without the full batch-allocator TSO. That interim option
+   `startTS` and `commitTS` still come from one clock — can bridge the timestamp
+   gap between step 2 and step 11 without the full batch-allocator TSO. That interim option
    must be paired with the read-only-shard validation gate above; it should be
    evaluated as part of the step-2 design (PR #955) rather than left to step 11.
 2. **Shared cache (Gap 2) vs per-group isolation (workload isolation doc).** A
@@ -570,9 +586,11 @@ design if needed. The near-term mitigation is layered:
    transition (Gap 1).** Moving a deployment from "one process hosts every
    group, each single-voter" to genuine multi-node multi-group is a topology
    change, not just a flag flip: a group that bootstrapped single-member must
-   gain voters on other nodes via live `AddVoter` conf-changes (the primitive
-   exists, §2(e)), and the cluster may run mixed binary versions mid-upgrade.
-   What is the supported path — operator-driven `AddVoter` expansion of an
+   add remote replicas as learners, wait for catch-up, and promote them through
+   the learner-promotion path (the primitives exist, §2(e)); direct live
+   `AddVoter` remains reserved for bootstrap/offline fully caught-up peers as
+   in §4.1. The cluster may run mixed binary versions mid-upgrade. What is the
+   supported path — operator-driven learner-add/promote expansion of an
    existing single-voter group, blue/green with a dual-write proxy
    (`proxy/`, the existing Redis-migration pattern), or a fresh cluster +
    data migration? §4.1 defines the interim guardrails — capability-gated admin
