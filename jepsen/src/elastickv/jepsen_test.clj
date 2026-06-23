@@ -7,18 +7,21 @@
             [elastickv.s3-workload :as s3-workload]
             [jepsen.cli :as cli]))
 
-(defn elastickv-test []
-  (redis-workload/elastickv-redis-test {}))
+(defn elastickv-test
+  ([] (elastickv-test {}))
+  ([opts] (redis-workload/elastickv-redis-test opts)))
 
-(defn elastickv-dynamodb-test []
-  (dynamodb-workload/elastickv-dynamodb-test {}))
+(defn elastickv-dynamodb-test
+  ([] (elastickv-dynamodb-test {}))
+  ([opts] (dynamodb-workload/elastickv-dynamodb-test opts)))
 
 (defn elastickv-dynamodb-types-test
   ([] (elastickv-dynamodb-types-test {}))
   ([opts] (dynamodb-types-workload/elastickv-dynamodb-types-test opts)))
 
-(defn elastickv-s3-test []
-  (s3-workload/elastickv-s3-test {}))
+(defn elastickv-s3-test
+  ([] (elastickv-s3-test {}))
+  ([opts] (s3-workload/elastickv-s3-test opts)))
 
 (defn elastickv-zset-safety-test
   ([] (elastickv-zset-safety-test {}))

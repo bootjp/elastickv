@@ -143,6 +143,26 @@
     (is (contains? kinds :missing-member)
         (str "expected :missing-member, got kinds=" kinds))))
 
+(deftest no-op-zrem-after-present-member-is-impossible
+  ;; ZREM returning 0 is only compatible with the member being absent at
+  ;; the ZREM linearization point. If a prior ZADD definitely made the
+  ;; member present before ZREM was invoked, a false ZREM reply is an
+  ;; impossible successful mutation chain, not permission to keep the
+  ;; present state.
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 1}
+                 {:type :invoke :process 0 :f :zrem :value "m1" :index 2}
+                 {:type :ok     :process 0 :f :zrem :value ["m1" false] :index 3}
+                 {:type :invoke :process 1 :f :zrange-all :index 4}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 1.0]] :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected impossible false ZREM to fail, got: " result))
+    (is (contains? kinds :impossible-mutation-chain)
+        (str "expected :impossible-mutation-chain, got kinds=" kinds))))
+
 (deftest duplicate-members-are-flagged
   ;; ZRANGE must not return the same member twice.
   ;; With a hypothetical committed + concurrent score for the same
@@ -176,6 +196,26 @@
     (is (:valid? result)
         (str "expected valid under overlapping-writes relaxation, got: " result))))
 
+(deftest overlapping-base-zadds-are-enumerated-before-tail-zincrby
+  ;; Base mutations before a later tail candidate can still overlap each
+  ;; other. The checker must enumerate their real-time-consistent orders
+  ;; before applying the non-concurrent ZINCRBY tail; sorting the base by
+  ;; completion time alone would fix the base at score 1 and reject the
+  ;; valid final score 3.
+  (let [history [{:type :invoke :process 0 :f :zadd :value ["m1" 1] :index 0}
+                 {:type :invoke :process 1 :f :zadd :value ["m1" 2] :index 1}
+                 {:type :ok     :process 1 :f :zadd :value ["m1" 2] :index 2}
+                 {:type :ok     :process 0 :f :zadd :value ["m1" 1] :index 3}
+                 {:type :invoke :process 2 :f :zincrby :value ["m1" 1] :index 4}
+                 {:type :ok     :process 2 :f :zincrby :value ["m1" 3.0] :index 5}
+                 {:type :invoke :process 3 :f :zrange-all :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [["m1" 3.0]] :index 7}]
+        result  (run-checker history)]
+    (is (:valid? result)
+        (str "expected base ZADD order score 2 -> ZINCRBY +1 to be valid, got: "
+             result))))
+
 (deftest info-before-read-is-considered-uncertain
   ;; An :info mutation that completed before a
   ;; later read may have taken effect. It must be considered a possible
@@ -195,6 +235,22 @@
         result  (run-checker history)]
     (is (:valid? result)
         (str "expected :info-before-read derived score to be valid, got: " result))))
+
+(deftest pre-read-info-zincrby-can-feed-later-ok-zincrby
+  ;; A pre-read :info ZINCRBY that completed before a later :ok ZINCRBY
+  ;; may be required to make the later ok reply consistent. Relative
+  ;; increments do not supersede prior uncertain increments.
+  (let [history [{:type :invoke :process 0 :f :zincrby :value ["m1" 5] :index 0}
+                 {:type :info   :process 0 :f :zincrby :value ["m1" 5] :index 1}
+                 {:type :invoke :process 1 :f :zincrby :value ["m1" 1] :index 2}
+                 {:type :ok     :process 1 :f :zincrby :value ["m1" 6.0] :index 3}
+                 {:type :invoke :process 2 :f :zrange-all :index 4}
+                 {:type :ok     :process 2 :f :zrange-all
+                  :value [["m1" 6.0]] :index 5}]
+        result  (run-checker history)]
+    (is (:valid? result)
+        (str "expected earlier :info increment to remain admissible, got: "
+             result))))
 
 (deftest pre-read-info-zincrby-superseded-by-later-zadd
   ;; A pre-read :info ZINCRBY is uncertainty only until a later committed
@@ -649,6 +705,24 @@
     (is (not (:valid? result))
         (str "expected impossible ZINCRBY reply to be rejected, got: " result))))
 
+(deftest impossible-mutation-chain-fails-even-when-read-is-empty
+  ;; Empty state sets from successful mutation replies are checker
+  ;; failures, not absent members. Otherwise a bad ZINCRBY reply can be
+  ;; dropped from the model and an empty read can falsely pass.
+  (let [history [{:type :invoke :process 0 :f :zadd    :value ["m1" 1]     :index 0}
+                 {:type :ok     :process 0 :f :zadd    :value ["m1" 1]     :index 1}
+                 {:type :invoke :process 0 :f :zincrby :value ["m1" 5]     :index 2}
+                 {:type :ok     :process 0 :f :zincrby :value ["m1" 999.0] :index 3}
+                 {:type :invoke :process 1 :f :zrange-all                  :index 4}
+                 {:type :ok     :process 1 :f :zrange-all :value []        :index 5}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected impossible chain to fail even on empty read, got: "
+             result))
+    (is (contains? kinds :impossible-mutation-chain)
+        (str "expected :impossible-mutation-chain, got kinds=" kinds))))
+
 (deftest negative-zincrby-tail-remains-admissible
   ;; Negative deltas can make a later valid tail numerically lower than an
   ;; earlier return. Pairwise score pruning must not discard that final tail.
@@ -1020,6 +1094,14 @@
             ["m-jvm"  Double/POSITIVE_INFINITY]
             ["m-num"  3.5]]
            parsed))))
+
+(deftest parse-withscores-rejects-nil-payload
+  ;; `count` on nil is 0 in Clojure; nil must still be treated as a
+  ;; malformed successful Redis reply, not as an empty ZSET result.
+  (is (thrown-with-msg?
+        clojure.lang.ExceptionInfo
+        #"WITHSCORES reply is nil"
+        (#'workload/parse-withscores nil))))
 
 (deftest parse-withscores-rejects-odd-length-payload
   ;; A WITHSCORES reply with a dangling member (odd element count) is a

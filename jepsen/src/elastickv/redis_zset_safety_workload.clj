@@ -159,10 +159,13 @@
   ZRANGE WITHSCORES. Convert to a sorted vector of [member (double score)]
   preserving server-returned order (score ascending, then member).
 
-  Throws on odd-length payloads: a WITHSCORES reply with a dangling member
-  is a protocol violation and this workload is meant to surface exactly
-  that kind of anomaly, not silently drop evidence."
+  Throws on nil or odd-length payloads: a nil WITHSCORES reply or a reply
+  with a dangling member is a protocol violation and this workload is meant
+  to surface exactly that kind of anomaly, not silently drop evidence."
   [flat]
+  (when (nil? flat)
+    (throw (ex-info "WITHSCORES reply is nil"
+                    {:payload flat})))
   (when (odd? (count flat))
     (throw (ex-info "WITHSCORES reply has odd element count"
                     {:count (count flat)
@@ -459,6 +462,7 @@
            (>= (:complete-idx m) read-inv-idx))))
 
 (def ^:private absent-state {:present? false :score nil})
+(def ^:private impossible-state {:present? false :score nil :impossible? true})
 
 (defn- score-eq?
   [a b]
@@ -489,10 +493,13 @@
 
       :zrem
       (cond
-        ;; A confirmed no-op ZREM is not deletion evidence and must not
-        ;; supersede a prior write.
+        ;; A confirmed no-op ZREM is only compatible with the member
+        ;; being absent at the ZREM linearization point. It is not
+        ;; deletion evidence, but it is still ordering evidence: if the
+        ;; prior state is definitely present, Redis could not have
+        ;; returned 0.
         (and (= :ok (:type m)) (false? (:removed? m)))
-        #{st}
+        (if (:present? st) #{} #{st})
 
         ;; A confirmed deletion proves the member was present immediately
         ;; before this ZREM in any admissible linearization.
@@ -508,34 +515,32 @@
   [states m]
   (set (mapcat #(apply-mutation-possibilities % m) states)))
 
-(defn- apply-sequential-mutations
-  [states muts]
-  (reduce
-    (fn [states m]
-      (if (seq states)
-        (advance-states states m)
-        #{}))
-    states
-    muts))
+(declare linearized-read-states)
 
 (defn- model-before
   "Construct authoritative per-member state from mutations whose
   completions strictly precede read-inv-idx. Returns
-  {member -> {:present? bool :score s}}. Only :ok mutations contribute;
-  :info / :pending are deferred to the concurrent-window check."
+  {member -> {:present? bool :score s}}. :ok mutations before the read
+  are required; pre-read :info mutations are optional because they may
+  have taken effect server-side and may be necessary to make a later :ok
+  relative mutation reply consistent. Pending operations without a
+  completion are deferred to the concurrent-window check."
   [mutations-by-m read-inv-idx]
   (reduce-kv
     (fn [model member muts]
-      (let [applied (->> muts
-                         (filter #(and (= :ok (:type %))
-                                       (some? (:complete-idx %))
-                                       (< (:complete-idx %) read-inv-idx)))
-                         (sort-by :complete-idx))
-            states (apply-sequential-mutations #{absent-state} applied)
+      (let [before-read? #(and (some? (:complete-idx %))
+                               (< (:complete-idx %) read-inv-idx))
+            required (->> muts
+                          (filter #(and (= :ok (:type %))
+                                        (before-read? %)))
+                          vec)
+            optional (->> muts
+                          (filter #(and (= :info (:type %))
+                                        (before-read? %)))
+                          vec)
+            states (linearized-read-states #{absent-state} required optional)
             state (first states)]
-        (if state
-          (assoc model member state)
-          model)))
+        (assoc model member (or state impossible-state))))
     {}
     mutations-by-m))
 
@@ -550,12 +555,6 @@
                 (concurrent? % read-inv-idx read-cmp-idx))
           muts))
 
-(defn- write-op?
-  "True iff the mutation adds/updates the member's score (i.e. would
-  make the member present). :zrem is NOT a write-op here."
-  [m]
-  (#{:zadd :zincrby} (:f m)))
-
 (defn- effective-zrem?
   "True iff this mutation can actually remove the member.
   A completed ZREM with removed? false is a confirmed no-op and must not
@@ -563,11 +562,6 @@
   [m]
   (and (= :zrem (:f m))
        (not= false (:removed? m))))
-
-(defn- state-changing-mutation?
-  [m]
-  (or (write-op? m)
-      (effective-zrem? m)))
 
 (defn- strictly-follows?
   "True iff `later` is ordered after `earlier` by real time."
@@ -579,9 +573,14 @@
   "True iff a committed mutation before the read strictly follows m and
   changes this member's state. Such a later committed write/remove
   determines the read's base state and makes m's pre-read uncertainty
-  irrelevant for this read."
+  irrelevant for this read.
+
+  Relative increments are not absolute overwrites. Earlier uncertainty
+  may still be required to make a later :ok ZINCRBY reply consistent, so
+  later ZINCRBYs do not supersede pre-read :info operations."
   [preceding m]
-  (some #(and (state-changing-mutation? %)
+  (some #(and (or (= :zadd (:f %))
+                  (effective-zrem? %))
               (strictly-follows? % m))
         preceding))
 
@@ -676,7 +675,7 @@
         candidates (filterv #(>= (:complete-idx %) max-inv) preceding)
         base-preceding (->> preceding
                             (remove (set candidates))
-                            (sort-by :complete-idx))
+                            vec)
         ;; :info mutations that completed before the read: they may or
         ;; may not have taken effect server-side.
         pre-read-info (->> muts
@@ -690,7 +689,7 @@
         ;; read linearized.
         concurrent (concurrent-mutations-for-member muts read-inv-idx read-cmp-idx)
         uncertain (concat pre-read-info concurrent)
-        base-states (apply-sequential-mutations #{absent-state} base-preceding)
+        base-states (linearized-read-states #{absent-state} base-preceding [])
         possible-states (linearized-read-states base-states candidates uncertain)
         present-states (filter :present? possible-states)
         scores (set (map :score present-states))
@@ -769,14 +768,18 @@
         ;;    might have removed before the read.
         (let [model (model-before mutations-by-m inv-idx)
               observed-members (into #{} (map first) entries)]
-          (doseq [[member _] model]
-            (let [{:keys [must-be-present?]}
-                  (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
-              (when (and must-be-present?
-                         (not (contains? observed-members member)))
-                (swap! errors conj {:kind :missing-member
-                                    :index cmp-idx
-                                    :member member})))))
+          (doseq [[member state] model]
+            (if (:impossible? state)
+              (swap! errors conj {:kind :impossible-mutation-chain
+                                  :index cmp-idx
+                                  :member member})
+              (let [{:keys [must-be-present?]}
+                    (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+                (when (and must-be-present?
+                           (not (contains? observed-members member)))
+                  (swap! errors conj {:kind :missing-member
+                                      :index cmp-idx
+                                      :member member}))))))
         @errors))))
 
 (defn- check-zrangebyscore
@@ -833,28 +836,33 @@
         ;;     admissible linearizations.
         (let [model (model-before mutations-by-m inv-idx)
               observed-members (into #{} (map first) members)]
-          (doseq [[member _] model]
-            (let [{:keys [must-be-present? scores]}
-                  (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
-              (when (and must-be-present?
-                         (score-definitely-in-range? scores lo hi)
-                         (not (contains? observed-members member)))
-                ;; Report the full set of admissible scores (:allowed), not
-                ;; just an arbitrary first element -- picking `(first
-                ;; scores)` on a multi-element set is misleading when
-                ;; concurrent writers leave several linearizations valid.
-                ;; :allowed matches the convention used by the sibling
-                ;; :score-mismatch-range error above. :expected-score is
-                ;; retained (as `(first scores)` for a single-element set,
-                ;; nil otherwise) for backward compatibility with any
-                ;; out-of-tree consumers.
-                (swap! errors conj {:kind :missing-member-range
-                                    :index cmp-idx
-                                    :bounds bounds
-                                    :member member
-                                    :allowed scores
-                                    :expected-score (when (= 1 (count scores))
-                                                      (first scores))})))))
+          (doseq [[member state] model]
+            (if (:impossible? state)
+              (swap! errors conj {:kind :impossible-mutation-chain
+                                  :index cmp-idx
+                                  :bounds bounds
+                                  :member member})
+              (let [{:keys [must-be-present? scores]}
+                    (allowed-scores-for-member mutations-by-m member inv-idx cmp-idx)]
+                (when (and must-be-present?
+                           (score-definitely-in-range? scores lo hi)
+                           (not (contains? observed-members member)))
+                  ;; Report the full set of admissible scores (:allowed), not
+                  ;; just an arbitrary first element -- picking `(first
+                  ;; scores)` on a multi-element set is misleading when
+                  ;; concurrent writers leave several linearizations valid.
+                  ;; :allowed matches the convention used by the sibling
+                  ;; :score-mismatch-range error above. :expected-score is
+                  ;; retained (as `(first scores)` for a single-element set,
+                  ;; nil otherwise) for backward compatibility with any
+                  ;; out-of-tree consumers.
+                  (swap! errors conj {:kind :missing-member-range
+                                      :index cmp-idx
+                                      :bounds bounds
+                                      :member member
+                                      :allowed scores
+                                      :expected-score (when (= 1 (count scores))
+                                                        (first scores))}))))))
         @errors))))
 
 (defn zset-safety-checker
