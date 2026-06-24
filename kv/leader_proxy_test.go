@@ -46,6 +46,9 @@ type stubFollowerEngine struct {
 func (s *stubFollowerEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return nil, raftengine.ErrNotLeader
 }
+func (s *stubFollowerEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return s.Propose(ctx, data)
+}
 func (s *stubFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
 func (s *stubFollowerEngine) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "leader", Address: s.leaderAddr}
@@ -161,6 +164,9 @@ func (e *togglingFollowerEngine) setLeader(addr string) {
 
 func (e *togglingFollowerEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return nil, raftengine.ErrNotLeader
+}
+func (e *togglingFollowerEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.Propose(ctx, data)
 }
 func (e *togglingFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
 func (e *togglingFollowerEngine) Leader() raftengine.LeaderInfo {

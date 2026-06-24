@@ -91,6 +91,21 @@ const (
 	DefaultKeyBucketsPerRoute = 1
 )
 
+// Defaults / caps for the per-cell hot-key drill-down knobs (see
+// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md §8). All
+// off-by-default; HotKeysEnabled=false is the binary's existing
+// behaviour — no extra hot-path cost, no real key bytes retained.
+const (
+	DefaultHotKeysPerRoute   = 64
+	MaxHotKeysPerRoute       = 256
+	DefaultHotKeysSampleRate = 16
+	MaxHotKeysSampleRate     = 1024
+	DefaultHotKeysQueueSize  = 8192
+	MaxHotKeysQueueSize      = 65536
+	DefaultHotKeysMaxKeyLen  = 1024
+	MaxHotKeysMaxKeyLen      = 4096
+)
+
 // MaxKeyBucketsPerRoute caps KeyBucketsPerRoute. The cap is an
 // operationally-safe bound, not merely a finite one: per-route memory
 // is K × 4 × 8 bytes, so at the default MaxTrackedRoutes = 10_000 the
@@ -144,6 +159,34 @@ type MemSamplerOptions struct {
 	// [1, MaxKeyBucketsPerRoute] at construction. Virtual aggregate
 	// buckets are never sub-divided regardless of this value.
 	KeyBucketsPerRoute int
+	// HotKeysEnabled opts in to per-route Top-K hot-key tracking that
+	// backs the heatmap drill-down (Phase 2-A++; see
+	// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md). When
+	// false the hot path adds one early-return branch and nothing else
+	// — disabled-case behaviour is byte-identical to today. When true
+	// the sampler retains REAL key bytes in memory and exposes them on
+	// the admin drill-down API (gated behind admin auth + audit).
+	HotKeysEnabled bool
+	// HotKeysPerRoute is the Space-Saving sketch capacity m per route
+	// (default 64, cap 256 — design §8). Larger m tightens the noise
+	// floor (error_bound ≈ N_total / m) at the cost of memory.
+	HotKeysPerRoute int
+	// HotKeysSampleRate is R: the hot path enqueues 1 in R observes.
+	// Default 16, cap 1024. Higher R reduces hot-path cost but raises
+	// the probability that a heavy hitter is missed (Chernoff variance
+	// over the sampled stream).
+	HotKeysSampleRate int
+	// HotKeysQueueSize bounds the channel between the hot path and
+	// the aggregator goroutine. Defaults 8192, cap 65536. Drops past
+	// the queue are counted, not silent (`dropped_samples` →
+	// `degraded`).
+	HotKeysQueueSize int
+	// HotKeysMaxKeyLen caps the key length sampled into the hot-keys
+	// sketch. Default 1024 B, cap 4096 B. Longer keys bump the
+	// node-global `skipped_long_keys` counter and contribute to the
+	// snapshot's `degraded` flag — they are never truncated (truncation
+	// would alias different keys).
+	HotKeysMaxKeyLen int
 	// Now overrides time.Now for tests; nil falls back to time.Now.
 	Now func() time.Time
 }
@@ -191,6 +234,12 @@ type MemSampler struct {
 	// twice in the same column — once as an aggregate row, once as
 	// an individual row — even under register/remove churn.
 	virtualIDCounter atomic.Uint64
+
+	// hotKeys is the per-route Top-K aggregator (design 2026_05_28
+	// _proposed_keyviz_hot_key_topk). nil when HotKeysEnabled is false
+	// — the Observe hot path then skips the feature with one branch.
+	// Read from the hot path; assigned exactly once at construction.
+	hotKeys *hotKeysAggregator
 
 	// groupTermsMu guards groupTerms. SetLeaderTerm and Flush both
 	// touch the map; Observe never does. The lock is fine-grained
@@ -310,10 +359,11 @@ type routeSlot struct {
 	// doc §4.2.
 	//
 	// subSpan == 0 (and len(subBuckets) == 1) marks a slot that is not
-	// sub-divided: K==1, a virtual aggregate, a degenerate window
-	// (subEnd <= subStart), or an unbounded-tail route (End == nil).
-	// subBucketIndex then hard-wires the index to 0, collapsing to
-	// today's route-level behaviour.
+	// sub-divided: K==1, a virtual aggregate, or a degenerate window
+	// (subEnd <= subStart). An unbounded-tail route (End == nil) with
+	// K > 1 DOES sub-divide — over [subStart, MaxUint64] (§3.2) — so it
+	// is not in this list. subBucketIndex hard-wires the index to 0 for
+	// the subSpan == 0 slots, collapsing to today's route-level behaviour.
 	subPrefixLen int
 	subStart     uint64
 	subEnd       uint64
@@ -327,6 +377,15 @@ type routeSlot struct {
 	subLo      []byte
 	subHi      []byte
 	subBuckets []subCounter
+
+	// hotKeysSnap is the most-recently-published per-route Top-K
+	// snapshot (design 2026_05_28_proposed_keyviz_hot_key_topk §4).
+	// nil until the hot-keys aggregator's first publish for this route.
+	// Drill-down handlers load it lock-free; the aggregator is the
+	// single writer (Store) and deep-copies snapshot contents so a
+	// subsequent reset / eviction on the live sketch cannot mutate a
+	// snapshot a reader holds.
+	hotKeysSnap atomic.Pointer[KeyvizHotKeysSnapshot]
 }
 
 // subCounter holds one sub-range bucket's four counter families. A
@@ -437,6 +496,7 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 	if opts.KeyBucketsPerRoute > MaxKeyBucketsPerRoute {
 		opts.KeyBucketsPerRoute = MaxKeyBucketsPerRoute
 	}
+	applyHotKeysDefaults(&opts)
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -448,7 +508,71 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 		groupTerms: map[uint64]uint64{},
 	}
 	s.table.Store(newEmptyRouteTable())
+	if opts.HotKeysEnabled {
+		s.hotKeys = newHotKeysAggregator(s, opts)
+	}
 	return s
+}
+
+// HotKeysSnapshot returns the most-recently-published per-route Top-K
+// snapshot for the given individual route, or nil if hot-keys tracking
+// is disabled, the route is unknown, the route is an aggregate, or no
+// publish has fired yet. Lock-free: an atomic.Pointer.Load (Codex-P1
+// fix from the design's round-4 review — no shared mutable PRNG state,
+// no per-route lock).
+func (s *MemSampler) HotKeysSnapshot(routeID uint64) *KeyvizHotKeysSnapshot {
+	if s == nil {
+		return nil
+	}
+	slot := lookupSlotForRoute(s.table.Load(), routeID)
+	if slot == nil {
+		return nil
+	}
+	return slot.hotKeysSnap.Load()
+}
+
+// HotKeysOptions returns the effective hot-keys configuration after the
+// NewMemSampler clamps. Used by the admin handler so the response can
+// echo the same `sample_rate` / `m` values the sketch was built with,
+// regardless of what an operator passed on the CLI. nil-receiver-safe.
+func (s *MemSampler) HotKeysOptions() (enabled bool, capacity, sampleRate, maxKeyLen int) {
+	if s == nil {
+		return false, 0, 0, 0
+	}
+	return s.opts.HotKeysEnabled, s.opts.HotKeysPerRoute, s.opts.HotKeysSampleRate, s.opts.HotKeysMaxKeyLen
+}
+
+// SubBucketBoundsFor returns the [lo, hi) key bounds of sub-bucket
+// subBucket within the individual route routeID, mirroring what Flush
+// emits as a MatrixRow's Start/End. The admin hot-keys handler uses
+// this to filter the route's top-m snapshot to keys in the
+// drill-down-clicked sub-range (design §5).
+//
+// ok is false when the route doesn't exist, is an aggregate (those are
+// not eligible for hot-keys), or subBucket is out of range
+// [0, len(subBuckets)). For a single-bucket slot (K=1 / unbounded /
+// degenerate), bound calls with subBucket == 0 succeed and return the
+// route's own Start/End. hi == nil means the sub-bucket extends to the
+// route's unbounded tail.
+//
+// nil-receiver-safe.
+func (s *MemSampler) SubBucketBoundsFor(routeID uint64, subBucket int) (lo, hi []byte, ok bool) {
+	if s == nil || subBucket < 0 {
+		return nil, nil, false
+	}
+	slot := lookupSlotForRoute(s.table.Load(), routeID)
+	if slot == nil {
+		return nil, nil, false
+	}
+	if subBucket >= len(slot.subBuckets) {
+		return nil, nil, false
+	}
+	start, end, _, _, _, _ := slot.snapshotMeta()
+	if len(slot.subBuckets) <= 1 {
+		return start, end, true
+	}
+	lo, hi = slot.subBucketBounds(subBucket, start, end)
+	return lo, hi, true
 }
 
 // SetLeaderTerm publishes the current Raft leader term for the given
@@ -544,7 +668,22 @@ func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int) {
 		if byteCount > 0 {
 			sc.writeBytes.Add(byteCount)
 		}
+		s.observeHotKey(routeID, slot, key)
 	}
+}
+
+// observeHotKey is the per-Observe hot-key sampler dispatch, kept out of
+// Observe itself to stay under the cyclop ceiling. v1 tracks WRITES
+// only (design §5 series-picker note); reads follow in v2 once the
+// hot-path cost is measured. The nil check short-circuits in disabled
+// deploys with a single branch — Observe's disabled-case allocation
+// contract is preserved. Aggregates (Aggregate==true) are not tracked
+// (design §2.2); lookupSlotForRoute filters them at publish too.
+func (s *MemSampler) observeHotKey(routeID uint64, slot *routeSlot, key []byte) {
+	if s.hotKeys == nil || slot.Aggregate {
+		return
+	}
+	s.hotKeys.observe(routeID, key)
 }
 
 // subBucketIndex maps key to a sub-range bucket index in
@@ -565,7 +704,11 @@ func (slot *routeSlot) subBucketIndex(key []byte) int {
 	if bytes.Compare(key, slot.subLo) <= 0 {
 		return 0
 	}
-	if bytes.Compare(key, slot.subHi) >= 0 {
+	// subHi == nil is the unbounded-End sentinel (open high end, §3.2):
+	// there is no finite upper bound to clamp against, so rely on the
+	// window math + the w >= subEnd (== MaxUint64) guard below. A finite
+	// route always has a non-nil subHi.
+	if slot.subHi != nil && bytes.Compare(key, slot.subHi) >= 0 {
 		return k - 1
 	}
 	w := windowUint64(key, slot.subPrefixLen)
@@ -611,12 +754,28 @@ func intFromUint64(v uint64) int {
 // fracMul returns floor(a*b/c) with an exact 128-bit intermediate via
 // math/bits, so the multiply cannot overflow uint64. Callers guarantee
 // c > 0 and the quotient < 2^64 (both hold for sub-bucket math: the
-// interior guard bounds a*b below c*2^64 because k is capped well below
-// 2^64). Shared by the forward index path and the Flush bound
-// reconstruction so the two can never diverge.
+// interior guard bounds a*b below c*2^64 because effK <= subSpan).
+// Used by the forward index path (subBucketIndex).
 func fracMul(a, b, c uint64) uint64 {
 	hi, lo := bits.Mul64(a, b)
 	q, _ := bits.Div64(hi, lo, c)
+	return q
+}
+
+// fracMulCeil returns ceil(a*b/c) with the same exact 128-bit
+// intermediate. boundaryAt uses ceil (not floor) so an emitted interior
+// boundary is exactly the forward map's lower edge of bucket i:
+// subBucketIndex puts w in bucket i iff w-subStart in
+// [ceil(i*subSpan/k), ceil((i+1)*subSpan/k)). With floor boundaries a
+// key landing exactly on a boundary value would be counted in the lower
+// bucket yet excluded from its half-open [Start, End) label (Codex P2);
+// ceil keeps the displayed ranges consistent with where keys are counted.
+func fracMulCeil(a, b, c uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	q, r := bits.Div64(hi, lo, c)
+	if r != 0 {
+		q++
+	}
 	return q
 }
 
@@ -642,9 +801,11 @@ func windowUint64(b []byte, off int) uint64 {
 // initSubLayout computes the immutable sub-range layout for an
 // individual route spanning [start, end) and allocates its subBuckets.
 // Called once at slot creation (off the hot path). A route that cannot
-// be sub-divided — K == 1, an unbounded `end`, or a window that
-// captures no difference — gets a single bucket (subSpan 0), which
-// makes subBucketIndex hard-wire to 0 and reproduces today's behaviour.
+// be sub-divided — K == 1, or a window that captures no difference —
+// gets a single bucket (subSpan 0), which makes subBucketIndex
+// hard-wire to 0 and reproduces today's behaviour. An unbounded `end`
+// (End == nil) with K > 1 sub-divides over [subStart, MaxUint64] (§3.2),
+// not a single bucket.
 func (s *MemSampler) initSubLayout(slot *routeSlot, start, end []byte) {
 	prefixLen, subStart, subEnd, subSpan, effK := computeSubLayout(start, end, s.opts.KeyBucketsPerRoute)
 	slot.subPrefixLen = prefixLen
@@ -661,13 +822,29 @@ func (s *MemSampler) initSubLayout(slot *routeSlot, start, end []byte) {
 
 // computeSubLayout derives the sub-range layout for [start, end) divided
 // into k buckets. effK is the effective bucket count: 1 (single bucket,
-// subSpan 0) when the route cannot be sub-divided, otherwise k. See
+// subSpan 0) when the route cannot be sub-divided, otherwise
+// min(k, subSpan) — capping at the span keeps every reconstructed
+// boundary valid when the span is narrower than k (effKForSpan). See
 // design §3.1–§3.2.
 func computeSubLayout(start, end []byte, k int) (prefixLen int, subStart, subEnd, subSpan uint64, effK int) {
-	if k <= 1 || len(end) == 0 {
-		// K == 1, or an unbounded high end (no finite span to divide):
-		// a single bucket until a split gives the route a finite End.
+	if k <= 1 {
 		return 0, 0, 0, 0, 1
+	}
+	if len(end) == 0 {
+		// Unbounded high end (single-route cluster, or any cluster's
+		// tail route). There is no End window to share a prefix with, so
+		// bucket the leading W-byte window of the key across
+		// [subStart, MaxUint64]. MaxUint64 (not 1<<64) keeps subSpan a
+		// valid uint64 — the overflow that sank the original fallback.
+		// See design §3.2.
+		subStart = windowUint64(start, 0)
+		if subStart == math.MaxUint64 {
+			// start's window is already at the top of the space (all-0xFF
+			// leading bytes) — nothing left to divide.
+			return 0, subStart, subStart, 0, 1
+		}
+		subSpan = math.MaxUint64 - subStart
+		return 0, subStart, math.MaxUint64, subSpan, effKForSpan(subSpan, k)
 	}
 	prefixLen = commonPrefixLen(start, end)
 	subStart = windowUint64(start, prefixLen)
@@ -677,7 +854,24 @@ func computeSubLayout(start, end []byte, k int) (prefixLen int, subStart, subEnd
 		// only past prefixLen + W): single bucket.
 		return prefixLen, subStart, subEnd, 0, 1
 	}
-	return prefixLen, subStart, subEnd, subEnd - subStart, k
+	subSpan = subEnd - subStart
+	return prefixLen, subStart, subEnd, subSpan, effKForSpan(subSpan, k)
+}
+
+// effKForSpan caps the effective bucket count at the window span. A span
+// smaller than k cannot be divided into k order-distinct sub-ranges:
+// boundaryAt would round several interior boundaries back to subStart,
+// and since a reconstructed boundary carries no bytes past the window it
+// can sort BEFORE a route start that has suffix bytes — emitting a row
+// with Start > End (Codex P2). Capping at subSpan keeps every emitted
+// boundary strictly increasing in the window, so bounds stay valid and
+// non-overlapping. subSpan is > 0 here (the degenerate subEnd<=subStart
+// and all-0xFF cases return earlier), so effK >= 1.
+func effKForSpan(subSpan uint64, k int) int {
+	if subSpan < u64NonNeg(k) {
+		return intFromUint64(subSpan)
+	}
+	return k
 }
 
 // commonPrefixLen returns the number of leading bytes a and b share.
@@ -697,10 +891,12 @@ func commonPrefixLen(a, b []byte) int {
 // i for a slot divided into len(subBuckets) buckets. Bucket 0 pins to
 // the route's actual start and the last bucket pins to its actual end
 // (the window arithmetic drops bytes past prefixLen + W, so the
-// reconstructed extremes would otherwise fall short); interiors use the
-// same fracMul kernel as the forward path. Together this tiles
-// [routeStart, routeEnd) exactly — each bucket's start equals the
-// previous bucket's end. Caller guarantees len(subBuckets) > 1.
+// reconstructed extremes would otherwise fall short); interiors use
+// boundaryAt's fracMulCeil — the ceil-dual of the forward path's floor
+// fracMul, deliberately different so a boundary-value key lands in the
+// same bucket it is counted in. Together this tiles [routeStart,
+// routeEnd) exactly — each bucket's start equals the previous bucket's
+// end. Caller guarantees len(subBuckets) > 1.
 func (slot *routeSlot) subBucketBounds(i int, routeStart, routeEnd []byte) (start, end []byte) {
 	last := len(slot.subBuckets) - 1
 	if i == 0 {
@@ -716,13 +912,14 @@ func (slot *routeSlot) subBucketBounds(i int, routeStart, routeEnd []byte) (star
 	return start, end
 }
 
-// boundaryAt reconstructs the key at fraction i/k of the route's window:
-// subStart + floor(i*subSpan/k), written big-endian into the W-byte
-// window at subPrefixLen, behind the route's shared prefix. Uses the
-// same math/bits kernel as subBucketIndex so the forward and inverse
-// directions can never disagree.
+// boundaryAt reconstructs bucket i's lower edge in key space:
+// subStart + ceil(i*subSpan/k), written big-endian into the W-byte
+// window at subPrefixLen, behind the route's shared prefix. ceil (via
+// fracMulCeil) makes this exactly the forward map's lower edge of bucket
+// i, so the emitted half-open [Start, End) ranges agree with where
+// subBucketIndex counts boundary-value keys (Codex P2).
 func (slot *routeSlot) boundaryAt(i int, routeStart []byte) []byte {
-	off := slot.subStart + fracMul(u64NonNeg(i), slot.subSpan, u64NonNeg(len(slot.subBuckets)))
+	off := slot.subStart + fracMulCeil(u64NonNeg(i), slot.subSpan, u64NonNeg(len(slot.subBuckets)))
 	out := make([]byte, slot.subPrefixLen+subWindowBytes)
 	copy(out, routeStart[:min(slot.subPrefixLen, len(routeStart))])
 	binary.BigEndian.PutUint64(out[slot.subPrefixLen:], off)

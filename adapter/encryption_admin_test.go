@@ -3,10 +3,14 @@ package adapter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1000,6 +1004,16 @@ func (p *recordingProposer) Propose(_ context.Context, data []byte) (*raftengine
 	return &raftengine.ProposalResult{CommitIndex: p.commitIndex}, nil
 }
 
+// ProposeAdmin records the call into the same slice as Propose so
+// existing assertions on p.calls continue to work after the
+// adapter/encryption_admin.go production callers (which now route
+// every control-plane entry through ProposeAdmin) switched paths.
+// In the current build both methods are operationally identical;
+// the bookkeeping is unified intentionally.
+func (p *recordingProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return p.Propose(ctx, data)
+}
+
 // stubLeaderView reports a fixed leadership state. verifyErr lets
 // a test simulate a partitioned former leader: State() still
 // reports StateLeader but VerifyLeader returns an error because
@@ -1089,6 +1103,18 @@ func (p *applyingProposer) Propose(ctx context.Context, data []byte) (*raftengin
 	return res, nil
 }
 
+// ProposeAdmin redirects to applyingProposer.Propose (not the
+// embedded recordingProposer.Propose) so the applyFn side-effect
+// fires for admin-path proposals as well. Without this explicit
+// override, Go method resolution would dispatch
+// recordingProposer.ProposeAdmin -> recordingProposer.Propose and
+// skip the applyingProposer-level Propose body — silently losing
+// the apply emulation that EnableStorageEnvelope /
+// EnableRaftEnvelope happy-path tests depend on.
+func (p *applyingProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return p.Propose(ctx, data)
+}
+
 // applyCutover is the §6.4 fresh-success apply effect: flip
 // StorageEnvelopeActive to true and stamp the cutover index with
 // the apply's Raft index. Used by the EnableStorageEnvelope happy-
@@ -1102,10 +1128,15 @@ func applyCutover(sc *encryption.Sidecar, raftIdx uint64) {
 	}
 }
 
-// applyStaleDEKIDRace simulates the §2.1 #3 benign-no-op: the
-// applier consumed the entry without flipping
-// StorageEnvelopeActive (because a RotateDEK raced and advanced
-// Active.Storage). Only RaftAppliedIndex advances.
+// applyStaleDEKIDRace simulates the §2.1 #3 / §6E-1a constraint
+// #3 benign-no-op shape shared by the storage and raft variants:
+// the applier consumed the entry without flipping the variant's
+// "cutover active" sentinel (StorageEnvelopeActive for the storage
+// path; the non-zero RaftEnvelopeCutoverIndex for the raft path)
+// because a RotateDEK raced and advanced Active.Storage /
+// Active.Raft respectively. Only RaftAppliedIndex advances. Used
+// by both EnableStorageEnvelope and EnableRaftEnvelope tests to
+// pin the no-cutover branch (claude r3 minor nit on PR933).
 func applyStaleDEKIDRace(sc *encryption.Sidecar, raftIdx uint64) {
 	if raftIdx > sc.RaftAppliedIndex {
 		sc.RaftAppliedIndex = raftIdx
@@ -1890,4 +1921,745 @@ func assertProtoVerdict(t *testing.T, v *pb.CapabilityVerdict, wantNodeID uint64
 		t.Errorf("verdict=%+v, want {FullNodeId:%d BuildSha:%s EncryptionCapable:true SidecarPresent:true}",
 			v, wantNodeID, wantBuildSHA)
 	}
+}
+
+// validEnableRaftEnvelopeRequest is the canonical valid request
+// for the raft-variant tests. Same proposer identity shape as the
+// storage variant — the two requests' Go types are independent
+// but structurally identical (proposer_node_id, proposer_local_epoch).
+func validEnableRaftEnvelopeRequest() *pb.EnableRaftEnvelopeRequest {
+	return &pb.EnableRaftEnvelopeRequest{
+		ProposerNodeId:     11,
+		ProposerLocalEpoch: 7,
+	}
+}
+
+// applyRaftCutover is the §6.4-equivalent fresh-success apply
+// effect for the raft variant: stamp RaftEnvelopeCutoverIndex
+// with the apply's Raft index. Used by the EnableRaftEnvelope
+// happy-path test to drive the post-Propose sidecar re-read into
+// the fresh-success branch.
+func applyRaftCutover(sc *encryption.Sidecar, raftIdx uint64) {
+	sc.RaftEnvelopeCutoverIndex = raftIdx
+	if raftIdx > sc.RaftAppliedIndex {
+		sc.RaftAppliedIndex = raftIdx
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RejectsZeroProposerNodeID
+// pins the §6.1 sentinel rejection at the gRPC boundary.
+func TestEncryptionAdmin_EnableRaftEnvelope_RejectsZeroProposerNodeID(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	req := validEnableRaftEnvelopeRequest()
+	req.ProposerNodeId = 0
+	_, err := srv.EnableRaftEnvelope(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("EnableRaftEnvelope status=%v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RejectsOversizedLocalEpoch
+// pins the §4.1 16-bit bound at the gRPC boundary.
+func TestEncryptionAdmin_EnableRaftEnvelope_RejectsOversizedLocalEpoch(t *testing.T) {
+	t.Parallel()
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(cutoverReadySidecarFixture(t)),
+	)
+	req := validEnableRaftEnvelopeRequest()
+	req.ProposerLocalEpoch = math.MaxUint16 + 1
+	_, err := srv.EnableRaftEnvelope(context.Background(), req)
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("EnableRaftEnvelope status=%v, want InvalidArgument", status.Code(err))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped pins
+// the raft-variant bootstrap gate: Active.Raft == 0 means
+// BootstrapEncryption has not committed yet, so the cutover must
+// refuse.
+func TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active: encryption.ActiveKeys{Storage: 0, Raft: 0},
+		Keys:   map[string]encryption.SidecarKey{},
+	})
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(&recordingProposer{}),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "BootstrapEncryption") {
+		t.Errorf("error %q does not hint at BootstrapEncryption", err)
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry pins the
+// retry path: a duplicate call against a sidecar with
+// RaftEnvelopeCutoverIndex != 0 returns OK with
+// was_already_active=true and applied_index = the original
+// cutover index. No fan-out, no propose. The raft variant has no
+// CutoverIndexUnknown field, so the response is intentionally
+// narrower than the storage variant's idempotent shape.
+func TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry(t *testing.T) {
+	t.Parallel()
+	path := writeSidecarFixture(t, &encryption.Sidecar{
+		Active:                   encryption.ActiveKeys{Storage: 5, Raft: 6},
+		Keys:                     map[string]encryption.SidecarKey{"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0}, "6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0}},
+		RaftEnvelopeCutoverIndex: 777,
+		RaftAppliedIndex:         900,
+	})
+	proposer := &recordingProposer{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(failOnCallCapabilityFanout(t)),
+	)
+	got, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableRaftEnvelope: %v", err)
+	}
+	if !got.WasAlreadyActive {
+		t.Error("WasAlreadyActive=false, want true (idempotent retry)")
+	}
+	if got.AppliedIndex != 777 {
+		t.Errorf("AppliedIndex=%d, want 777 (original RaftEnvelopeCutoverIndex)", got.AppliedIndex)
+	}
+	if len(got.CapabilitySummary) != 0 {
+		t.Errorf("CapabilitySummary len=%d, want 0 (empty on idempotent retries)", len(got.CapabilitySummary))
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (no propose on idempotent retry)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2 pins the
+// fail-closed gate: while raftEnvelopeWrapEnabled is false (i.e.
+// before Stage 6E-2 ships wrap-on-propose / unwrap-on-apply /
+// §7.1 barrier), the RPC MUST refuse fresh cutover proposals
+// with FailedPrecondition rather than recording
+// RaftEnvelopeCutoverIndex=N. Recording N now would let cleartext
+// entries land at indexes > N and the 6E-2 engine apply-hook
+// would treat them as envelopes on upgrade, halting apply
+// cluster-wide.
+//
+// The test wires an `applyingProposer` exactly as a future
+// happy-path test would, then verifies the gate refuses BEFORE
+// any proposal is composed (proposer.calls is empty) and BEFORE
+// any sidecar mutation lands (RaftEnvelopeCutoverIndex stays 0).
+// When 6E-2 lands and flips raftEnvelopeWrapEnabled to true, this
+// test becomes the regression pin for the gate-flip and a
+// HappyPath sibling is added.
+func TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2(t *testing.T) {
+	t.Parallel()
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (gated until 6E-2)", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "6E-2") {
+		t.Errorf("error %q does not hint at the 6E-2 gate", err)
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (gate must refuse before propose)", len(proposer.calls))
+	}
+	// Sidecar must remain untouched: RaftEnvelopeCutoverIndex
+	// still 0 means the cluster has not entered Phase 2 and a
+	// future 6E-2 upgrade is still safe.
+	sc, readErr := encryption.ReadSidecar(path)
+	if readErr != nil {
+		t.Fatalf("ReadSidecar: %v", readErr)
+	}
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		t.Errorf("RaftEnvelopeCutoverIndex=%d, want 0 (gate must refuse before sidecar mutation)", sc.RaftEnvelopeCutoverIndex)
+	}
+}
+
+// recordingCutoverBarrier is a CutoverBarrierController stub that
+// records the call order so the §7.1 6-step state-machine tests can
+// assert Begin → WaitDrained → (propose) → InstallWrap → End. It
+// also tracks call counts so tests can pin "End MUST be called once
+// even on error" without flake risk.
+type recordingCutoverBarrier struct {
+	order []string // appends "Begin", "WaitDrained", "InstallWrap", "End"
+	// waitErr is returned from WaitDrained when non-nil so the test
+	// can exercise the step-2 timeout path. Otherwise WaitDrained
+	// returns nil immediately.
+	waitErr error
+}
+
+func (b *recordingCutoverBarrier) Begin() <-chan struct{} {
+	b.order = append(b.order, "Begin")
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func (b *recordingCutoverBarrier) WaitDrained(_ context.Context) error {
+	b.order = append(b.order, "WaitDrained")
+	return b.waitErr
+}
+
+func (b *recordingCutoverBarrier) InstallWrap() {
+	b.order = append(b.order, "InstallWrap")
+}
+
+func (b *recordingCutoverBarrier) End() {
+	b.order = append(b.order, "End")
+}
+
+// withWrapEnabledForTest flips raftEnvelopeWrapEnabled to true for
+// the duration of t and restores the original value via t.Cleanup.
+// Tests that exercise the §7.1 state machine MUST call this — the
+// production value is still false in 6E-2d so the gated short-
+// circuit would otherwise eat the test before the barrier path
+// runs. Returns no value; t.Cleanup handles teardown so callers
+// don't need to defer.
+//
+// Safe to call from t.Parallel() tests: raftEnvelopeWrapEnabled is
+// an atomic.Bool, so concurrent reads from sibling parallel tests
+// (e.g. GatedUntil6E2) observe a coherent value rather than
+// tripping -race detection (claude finding 3 round-1).
+func withWrapEnabledForTest(t *testing.T) {
+	t.Helper()
+	prev := raftEnvelopeWrapEnabled.Load()
+	raftEnvelopeWrapEnabled.Store(true)
+	t.Cleanup(func() { raftEnvelopeWrapEnabled.Store(prev) })
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier
+// pins the §7.1 wiring gate: even with raftEnvelopeWrapEnabled
+// flipped true (the future 6E-2f production state), the handler
+// MUST refuse with FailedPrecondition when the cutoverBarrier
+// controller is not wired. Silently skipping the barrier would
+// let a fresh USER proposal land at index > proposedIdx mid-
+// cutover and halt apply cluster-wide on the §6.3 strict-`>` hook.
+func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		// Deliberately NO WithEncryptionAdminCutoverBarrier.
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (no barrier wired)", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "cutover barrier") {
+		t.Errorf("error %q does not hint at the missing barrier wiring", err)
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (no barrier MUST refuse before propose)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutAppliedIndex
+// pins the §7.1 step-4 wiring gate: without a wired
+// latestAppliedIndex callback, awaitCutoverApply has no oracle for
+// "the cutover entry has been applied locally". Skipping the wait
+// would let InstallWrap (step 5) run before the cutover entry's
+// FSM apply, potentially wrapping the cutover entry itself if a
+// Propose racing the install observed the freshly-set wrap pointer.
+// Refuse before any side effect.
+func TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutAppliedIndex(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(&recordingCutoverBarrier{}),
+		// Deliberately NO WithEncryptionAdminLatestAppliedIndex.
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (no applied-index wired)", status.Code(err))
+	}
+	if err == nil || !strings.Contains(err.Error(), "latest-applied-index") {
+		t.Errorf("error %q does not hint at the missing applied-index wiring", err)
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence
+// pins the §7.1 6-step state-machine ordering: Begin → WaitDrained
+// → (ProposeAdmin) → (await apply) → InstallWrap → End. A
+// regression that reordered these (e.g. InstallWrap before
+// awaitCutoverApply) would create the same race as skipping the
+// apply wait — install the wrap closure while the engine has not
+// yet seen the cutover entry, letting a Propose-side wrap apply to
+// the cutover marker itself.
+func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	barrier := &recordingCutoverBarrier{}
+	// latestAppliedIndex returns the proposer's commitIndex so the
+	// step-4 wait completes immediately on the first poll. A
+	// production wiring would have the FSM apply path update this.
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 4242 }),
+	)
+	resp, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableRaftEnvelope: %v", err)
+	}
+	if resp == nil || resp.GetAppliedIndex() != 4242 {
+		t.Fatalf("response applied_index=%v, want 4242", resp)
+	}
+	wantOrder := []string{"Begin", "WaitDrained", "InstallWrap", "End"}
+	if !equalStrings(barrier.order, wantOrder) {
+		t.Errorf("barrier call order = %v, want %v (Propose runs between WaitDrained and InstallWrap; the barrier doesn't observe it)", barrier.order, wantOrder)
+	}
+	if len(proposer.calls) != 1 {
+		t.Errorf("proposer.calls len=%d, want 1 (one ProposeAdmin between WaitDrained and InstallWrap)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError
+// pins the codex P1 round-4 ambiguous-propose-outcome invariant on
+// PR933: if proposeRaftCutoverEntry returns an error, the
+// underlying etcd engine cannot retract a rawNode.Propose that has
+// already been submitted to Raft. The handler therefore CANNOT
+// distinguish "marker never reached Raft" from "marker submitted,
+// outcome unknown" and MUST treat every propose-side error as the
+// latter — leaving the barrier OPEN so a marker that subsequently
+// commits cluster-wide cannot brick the §6.3 strict-`>` unwrap
+// hook by letting cleartext user proposals land at
+// `index > cutoverIdx`.
+//
+// Trade-off: a propose error that definitively was rejected before
+// submission (ErrNotLeader transient) leaves this leader's barrier
+// stuck until restart — recoverable by operator action — but the
+// cluster-brick alternative is not.
+func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &recordingProposer{err: errors.New("engine refused")}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 0 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want error from propose-failure, got nil")
+	}
+	for _, op := range barrier.order {
+		if op == "End" {
+			t.Errorf("End was called after propose error; order = %v; this releases the barrier across an ambiguous commit window (codex P1 round-4)", barrier.order)
+		}
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap MUST NOT run on propose error; order = %v", barrier.order)
+		}
+	}
+	// Sequence reached Begin and WaitDrained, then propose
+	// errored. InstallWrap and End must not run.
+	wantPrefix := []string{"Begin", "WaitDrained"}
+	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
+		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout
+// pins step-2's failure path: if WaitDrained returns an error
+// (typically context cancellation or a misbehaving in-flight
+// proposal), the handler MUST still call End() so the barrier
+// closes. Symmetric with the propose-error case above.
+func TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &recordingProposer{}
+	barrier := &recordingCutoverBarrier{waitErr: errors.New("drain timeout")}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 0 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want error from drain timeout, got nil")
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("EnableRaftEnvelope status=%v, want Unavailable for drain timeout", status.Code(err))
+	}
+	wantOrder := []string{"Begin", "WaitDrained", "End"}
+	if !equalStrings(barrier.order, wantOrder) {
+		t.Errorf("barrier call order = %v, want %v (End MUST run on drain timeout)", barrier.order, wantOrder)
+	}
+	if len(proposer.calls) != 0 {
+		t.Errorf("proposer.calls len=%d, want 0 (drain timeout MUST refuse before propose)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout
+// pins the codex P1 round-1 invariant: once
+// proposeRaftCutoverEntry has succeeded, the cutover entry is
+// committed in Raft and will apply on every replica. If the
+// remainder of the sequence fails (apply-wait ctx fires before
+// the local FSM catches up), the handler MUST NOT call End() —
+// releasing the barrier without InstallWrap lets fresh USER
+// proposals on this leader land cleartext at indexes >
+// cutover_index, which the §6.3 strict-`>` apply hook would then
+// halt on cluster-wide.
+//
+// The releaseSafe flag in runRaftEnvelopeCutoverBarrier gates the
+// deferred End() so this test catches a regression that reordered
+// the flag flip back inside the apply-wait error path.
+func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		// Note: applyFn is nil so the sidecar's
+		// RaftEnvelopeCutoverIndex stays 0, simulating local FSM
+		// apply lag (the entry is committed in Raft but not yet
+		// applied locally).
+	}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		// latestAppliedIndex never catches up to 4242 — simulates
+		// permanently-lagging local apply that exhausts the gRPC
+		// deadline.
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 0 }),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := srv.EnableRaftEnvelope(ctx, validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want apply-timeout error, got nil")
+	}
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Errorf("EnableRaftEnvelope status=%v, want DeadlineExceeded for apply-wait ctx fire", status.Code(err))
+	}
+	// Critical assertion: End was NOT called. The barrier stays
+	// open so user proposals on this leader continue to fail with
+	// ErrEnvelopeCutoverInProgress until operator intervention.
+	for _, op := range barrier.order {
+		if op == "End" {
+			t.Errorf("barrier.End() WAS called after propose-success + apply-timeout; order = %v; this opens the cluster-brick window codex P1 round-1 flagged", barrier.order)
+		}
+	}
+	// And the sequence reached propose + drain but not InstallWrap.
+	wantPrefix := []string{"Begin", "WaitDrained"}
+	if len(barrier.order) < len(wantPrefix) || !equalStrings(barrier.order[:len(wantPrefix)], wantPrefix) {
+		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
+	}
+	for _, op := range barrier.order {
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap MUST NOT run when apply-wait fails; order = %v", barrier.order)
+		}
+	}
+	if len(proposer.calls) != 1 {
+		t.Errorf("proposer.calls len=%d, want 1 (cutover entry MUST have been proposed before the apply-wait timeout)", len(proposer.calls))
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace
+// pins the codex P1 round-2 invariant (codex P1 #2 on PR933): if a
+// concurrent RotateDEK advances sidecar.Active.Raft between
+// propose and apply, the applier consumes the cutover marker as a
+// stale-DEK no-op (RaftAppliedIndex advances but
+// RaftEnvelopeCutoverIndex stays 0 — §6E-1a constraint #3 benign
+// no-op). The handler MUST detect this race by re-reading the
+// sidecar after awaitCutoverApply and refuse to InstallWrap.
+// Installing the wrap while the FSM sidecar still reads
+// RaftEnvelopeCutoverIndex == 0 would brick the cluster: the §6.3
+// strict-`>` hook would treat every post-install proposal at
+// index > 0 as a wrapped envelope while pre-install admin entries
+// (RotateDEK from the race, cleartext via ProposeAdmin) still sit
+// in the apply queue at indexes > 0, halting on unwrap-failure.
+//
+// Expected outcome on the race:
+//   - awaitCutoverApply returns success (RaftAppliedIndex advanced).
+//   - Sidecar re-read shows RaftEnvelopeCutoverIndex == 0.
+//   - InstallWrap is NOT called.
+//   - releaseSafe stays true, deferred End() releases the barrier
+//     (no cutover took effect; safe to resume user writes — they
+//     remain in cleartext pre-cutover mode).
+//   - Handler returns a FailedPrecondition error so the operator's
+//     CLI can retry against the now-updated Active.Raft.
+func TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		// applyStaleDEKIDRace advances RaftAppliedIndex but
+		// deliberately does NOT touch RaftEnvelopeCutoverIndex —
+		// the §2.1 #3 benign-no-op shape the applier produces for
+		// a stale-DEK race.
+		applyFn: applyStaleDEKIDRace,
+	}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 4242 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want stale-DEK-race error, got nil")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (cutover marker consumed as no-op)", status.Code(err))
+	}
+	for _, op := range barrier.order {
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap WAS called after stale-DEK race; order = %v; this is the codex P1 #2 cluster-brick window", barrier.order)
+		}
+	}
+	// End MUST have run: releaseSafe stays true because no cutover
+	// took effect, so unblocking user writes is safe (they stay
+	// in pre-cutover cleartext mode, consistent with the FSM state).
+	endCalled := false
+	for _, op := range barrier.order {
+		if op == "End" {
+			endCalled = true
+			break
+		}
+	}
+	if !endCalled {
+		t.Errorf("End MUST run on stale-DEK no-op (no committed cutover, safe to release); order = %v", barrier.order)
+	}
+	// Sidecar still at the pre-cutover state: RaftEnvelopeCutoverIndex == 0.
+	sc, readErr := encryption.ReadSidecar(path)
+	if readErr != nil {
+		t.Fatalf("ReadSidecar: %v", readErr)
+	}
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		t.Errorf("RaftEnvelopeCutoverIndex=%d after stale-DEK race, want 0", sc.RaftEnvelopeCutoverIndex)
+	}
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError
+// pins the new r2 sidecar-I/O-failure branch of
+// runRaftEnvelopeCutoverBarrier (claude r3 finding 1 on PR933).
+// After awaitCutoverApply succeeds, the handler re-reads the
+// sidecar to distinguish fresh-success from stale-DEK no-op. If
+// that re-read fails (corrupted sidecar, filesystem fault, ENOENT
+// after the fact), the handler MUST NOT InstallWrap and MUST NOT
+// release the barrier: the cutover entry IS committed in Raft and
+// the operator cannot determine the outcome without sidecar
+// access. End() stays unreached so user proposals on this leader
+// remain rejected with ErrEnvelopeCutoverInProgress until
+// supervised restart.
+//
+// Construction: applyingProposer writes a valid sidecar with
+// RaftEnvelopeCutoverIndex=4242 (fresh success), then a
+// post-apply hook truncates the sidecar to zero bytes before
+// EnableRaftEnvelope can re-read it. ReadSidecar surfaces a
+// decode error; the handler must propagate that as an error
+// without InstallWrap or End.
+func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn: func(sc *encryption.Sidecar, raftIdx uint64) {
+			// Apply the cutover as fresh-success (mirrors what the
+			// real applier does on the no-race path). The
+			// post-write sidecar corruption is handled by the
+			// postProposeCorruptingProposer wrapper below, not
+			// here — applyFn only sees the sc value pre-write, so
+			// we can't reach the on-disk file from this hook.
+			applyRaftCutover(sc, raftIdx)
+		},
+	}
+	// postProposeCorruptingProposer composes applyingProposer and
+	// truncates the sidecar on disk after applyingProposer.Propose
+	// returns, simulating an I/O fault (or filesystem corruption)
+	// in the narrow window between the cutover apply and the
+	// handler's post-apply sidecar re-read.
+	corruptingProposer := &postProposeCorruptingProposer{
+		inner:       proposer,
+		sidecarPath: path,
+	}
+	barrier := &recordingCutoverBarrier{}
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(corruptingProposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 { return 4242 }),
+	)
+	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err == nil {
+		t.Fatal("EnableRaftEnvelope: want sidecar-read error post-apply, got nil")
+	}
+	for _, op := range barrier.order {
+		if op == "InstallWrap" {
+			t.Errorf("InstallWrap MUST NOT run on sidecar-read failure (cutover outcome unknown); order = %v", barrier.order)
+		}
+		if op == "End" {
+			t.Errorf("End MUST NOT run on sidecar-read failure (releaseSafe stays false; operator must intervene); order = %v", barrier.order)
+		}
+	}
+	// Sequence reached propose + drain but not the post-apply
+	// re-read's successful branch.
+	wantPrefix := []string{"Begin", "WaitDrained"}
+	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
+		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
+	}
+}
+
+// postProposeCorruptingProposer wraps applyingProposer and, after
+// the apply callback writes the fresh-success sidecar, truncates
+// the file to zero bytes so the handler's subsequent re-read
+// surfaces a decode error. Used by the sidecar-read-failure test
+// above. Only Propose / ProposeAdmin go through this wrapper;
+// other methods (Stop, etc.) aren't needed on the test path.
+type postProposeCorruptingProposer struct {
+	inner       *applyingProposer
+	sidecarPath string
+}
+
+func (p *postProposeCorruptingProposer) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	res, err := p.inner.Propose(ctx, data)
+	if err == nil {
+		// Truncate the sidecar so the handler's re-read fails.
+		// os.Truncate to 0 bytes is enough — ReadSidecar's JSON
+		// decode of an empty buffer surfaces an error.
+		if truncErr := truncateFileToZero(p.sidecarPath); truncErr != nil {
+			return nil, truncErr
+		}
+	}
+	return res, err
+}
+
+func (p *postProposeCorruptingProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return p.Propose(ctx, data)
+}
+
+// truncateFileToZero rewrites the file at path to an empty byte
+// sequence, preserving the path so ReadSidecar's open succeeds and
+// the decode is what fails. Used only by the sidecar-read-failure
+// test.
+func truncateFileToZero(path string) error {
+	if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
+		return fmt.Errorf("test: truncate sidecar: %w", err)
+	}
+	return nil
+}
+
+// TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex pins the
+// awaitCutoverApply ticker-poll branch (claude finding 2 round-1):
+// the happy-path test wires latestAppliedIndex to return the
+// proposed index immediately, which short-circuits the poll loop
+// before time.NewTicker fires. A regression that broke the ticker
+// branch (wrong duration, ticker.Stop missed, etc.) would only
+// surface under a lagging-apply scenario like this one.
+//
+// Strategy: have latestAppliedIndex return 0 for the first few
+// calls and proposedIdx after that, forcing the loop to poll
+// through the ticker at least once.
+func TestEncryptionAdmin_EnableRaftEnvelope_PollsApplyIndex(t *testing.T) {
+	withWrapEnabledForTest(t)
+	path := cutoverReadySidecarFixture(t)
+	proposer := &applyingProposer{
+		recordingProposer: recordingProposer{commitIndex: 4242},
+		sidecarPath:       path,
+		applyFn:           applyRaftCutover,
+	}
+	barrier := &recordingCutoverBarrier{}
+	var pollCount atomic.Int32
+	srv := NewEncryptionAdminServer(
+		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+		WithEncryptionAdminSidecarPath(path),
+		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
+		WithEncryptionAdminCutoverBarrier(barrier),
+		WithEncryptionAdminLatestAppliedIndex(func() uint64 {
+			if pollCount.Add(1) < 4 {
+				return 0
+			}
+			return 4242
+		}),
+	)
+	resp, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
+	if err != nil {
+		t.Fatalf("EnableRaftEnvelope: %v", err)
+	}
+	if resp == nil || resp.GetAppliedIndex() != 4242 {
+		t.Fatalf("response applied_index=%v, want 4242", resp)
+	}
+	if got := pollCount.Load(); got < 4 {
+		t.Errorf("pollCount = %d, want >= 4 (ticker poll branch should have fired at least 3 times)", got)
+	}
+	// Full success path: barrier closes after InstallWrap.
+	wantOrder := []string{"Begin", "WaitDrained", "InstallWrap", "End"}
+	if !equalStrings(barrier.order, wantOrder) {
+		t.Errorf("barrier.order = %v, want %v", barrier.order, wantOrder)
+	}
+}
+
+// equalStrings is a thin alias over slices.Equal, kept as a
+// named helper so the existing call sites (Begin / WaitDrained /
+// InstallWrap / End order assertions) read naturally. Claude r2
+// finding C: prefer slices.Equal from stdlib over a hand-rolled
+// loop.
+func equalStrings(a, b []string) bool {
+	return slices.Equal(a, b)
 }

@@ -401,6 +401,9 @@ type noopEngine struct{}
 func (noopEngine) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }
+func (e noopEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.Propose(ctx, data)
+}
 func (noopEngine) State() raftengine.State                            { return raftengine.StateLeader }
 func (noopEngine) Leader() raftengine.LeaderInfo                      { return raftengine.LeaderInfo{} }
 func (noopEngine) VerifyLeader(_ context.Context) error               { return nil }
@@ -574,4 +577,77 @@ func TestShardedCoordinatorDispatchTxn_SingleShardIncludesReadKeysInRaftEntry(t 
 	// eliminating the TOCTOU window that exists between the adapter's
 	// pre-Raft validateReadSet call and FSM application.
 	require.Equal(t, [][]byte{[]byte("rk1"), []byte("rk2")}, g1Txn.requests[0].ReadKeys)
+}
+
+// TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion
+// is the gemini-critical regression from PR #881.  Contract:
+// every PREPARE and COMMIT envelope across the 2PC paths
+// (prewriteTxn / commitPrimaryTxn / commitSecondaryTxns) must
+// carry OperationGroup.ObservedRouteVersion so the M3 gate fires
+// on every cross-shard txn.
+//
+// History: an earlier round in PR #900 (d8487672) attempted to
+// drop the gate on secondary commits to avoid a "fail-closed gate
+// + best-effort swallow" silent partial commit (codex P1 on
+// 6202b964).  codex P1 on d8487672 (PR #900) showed that dropping
+// the gate replaces one silent partial commit with another — the
+// write lands on a stale owner that is no longer reachable by
+// readers on the new owner.  The correct fix is to KEEP the gate
+// active everywhere AND surface secondary Composed-1 errors as a
+// distinct fatal sentinel
+// (ErrTxnSecondaryRouteShiftedAfterPrimaryCommit) rather than
+// either swallowing or dropping the gate.  See
+// TestShardedCoordinator_SurfacesFatalErrorOn2PCSecondaryComposed1
+// for the fatal-error contract.
+//
+// With the fatal-surface fix in place, this test reverts to the
+// original PR #881 contract: every 2PC envelope on every shard
+// carries the pinned version.
+func TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	g1Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 3},
+			{CommitIndex: 11},
+		},
+	}
+	g2Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 5},
+			{CommitIndex: 27},
+		},
+	}
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	const pinnedVer = uint64(42)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:                true,
+		StartTS:              10,
+		ObservedRouteVersion: pinnedVer,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v1")},
+			{Op: Put, Key: []byte("x"), Value: []byte("v2")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, g1Txn.requests, 2, "g1 must see PREPARE + COMMIT")
+	require.Len(t, g2Txn.requests, 2, "g2 must see PREPARE + COMMIT")
+
+	for _, req := range append(g1Txn.requests, g2Txn.requests...) {
+		require.Equal(t, pinnedVer, req.ObservedRouteVersion,
+			"multi-shard 2PC envelope (phase=%s) must carry "+
+				"OperationGroup.ObservedRouteVersion; pre-fix this "+
+				"silently dropped to 0 and bypassed the M3 Composed-1 "+
+				"apply-time gate for every cross-shard txn",
+			req.Phase)
+	}
 }

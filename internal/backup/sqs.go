@@ -156,6 +156,7 @@ type sqsQueueMetaPublic struct {
 	ReceiveMessageWaitSeconds int64  `json:"receive_message_wait_seconds,omitempty"`
 	MaximumMessageSize        int64  `json:"maximum_message_size,omitempty"`
 	RedrivePolicy             string `json:"redrive_policy,omitempty"`
+	RedriveAllowPolicy        string `json:"redrive_allow_policy,omitempty"`
 	PartitionCount            uint32 `json:"partition_count,omitempty"`
 	FifoThroughputLimit       string `json:"fifo_throughput_limit,omitempty"`
 	DeduplicationScope        string `json:"deduplication_scope,omitempty"`
@@ -192,6 +193,39 @@ func (b sqsMessageBody) MarshalJSON() ([]byte, error) {
 	return out, nil
 }
 
+// UnmarshalJSON is the inverse of MarshalJSON: a plain JSON string is the
+// UTF-8 body verbatim, and a {"base64":"..."} envelope is a non-UTF-8
+// payload. Used by the reverse encoder to read messages.jsonl back.
+func (b *sqsMessageBody) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*b = sqsMessageBody(s)
+		return nil
+	}
+	// Non-string: must be the exact {"base64":"..."} envelope. Reject {},
+	// null, and objects with other/extra keys (which would otherwise
+	// silently decode to an empty body) — a base64 pointer distinguishes
+	// "field absent" from "empty" and DisallowUnknownFields rejects stray
+	// keys (coderabbit Major on PR #846).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var envelope struct {
+		Base64 *string `json:"base64"`
+	}
+	if err := dec.Decode(&envelope); err != nil {
+		return errors.WithStack(err)
+	}
+	if envelope.Base64 == nil {
+		return errors.WithStack(errors.New("sqs message body object missing base64 field"))
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(*envelope.Base64)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	*b = sqsMessageBody(raw)
+	return nil
+}
+
 // sqsMessageRecord is the dump-format projection. Mirrors the live
 // adapter/sqs_messages.go:80 record one-to-one — JSON tag names match so
 // a restorer can call SendMessage with each line as the input. Visibility
@@ -215,6 +249,12 @@ type sqsMessageRecord struct {
 	MessageDedupID         string                     `json:"message_deduplication_id,omitempty"`
 	SequenceNumber         uint64                     `json:"sequence_number,omitempty"`
 	DeadLetterSourceArn    string                     `json:"dead_letter_source_arn,omitempty"`
+	// Partition is non-nil only when the message was read from a
+	// partitioned (`!sqs|msg|data|p|`) key. The value is the partition
+	// number recovered from the on-disk key trailer; M5-3 reverse
+	// encoder uses it to reproduce the partitioned key shape on
+	// restore. Pre-M5-3 dumps lack this field — Partition == nil.
+	Partition *uint32 `json:"partition,omitempty"`
 }
 
 // NewSQSEncoder constructs an encoder rooted at <outRoot>/sqs/.
@@ -305,7 +345,7 @@ func (s *SQSEncoder) HandleQueueGen(key, value []byte) error {
 // the per-queue routing key; the message is buffered until Finalize so it
 // can be sorted and emitted in send-order.
 func (s *SQSEncoder) HandleMessageData(key, value []byte) error {
-	encQueue, err := parseSQSMessageDataKey(key)
+	encQueue, partition, isPartitioned, err := parseSQSMessageDataKey(key)
 	if err != nil {
 		return err
 	}
@@ -318,6 +358,14 @@ func (s *SQSEncoder) HandleMessageData(key, value []byte) error {
 		rec.CurrentReceiptToken = nil
 		rec.ReceiveCount = 0
 		rec.FirstReceiveMillis = 0
+	}
+	// M5-3: wire the parsed partition into the record so the reverse
+	// encoder can reproduce the partitioned key shape. Classic-key call
+	// site keeps rec.Partition == nil so legacy dumps round-trip
+	// unchanged (design doc §"Decoder lift").
+	if isPartitioned {
+		p := partition
+		rec.Partition = &p
 	}
 	st := s.queueState(encQueue)
 	st.messages = append(st.messages, rec)
@@ -498,13 +546,17 @@ func stripPrefixSegment(key, prefix []byte) (string, error) {
 //
 // Boundary detection (partitioned): the queue segment is terminated by
 // a literal '|' before the fixed-width partition u32. Codex P1 round 9.
-func parseSQSMessageDataKey(key []byte) (string, error) {
+func parseSQSMessageDataKey(key []byte) (encQueue string, partition uint32, isPartitioned bool, err error) {
 	rest, err := stripPrefixSegment(key, []byte(SQSMsgDataPrefix))
 	if err != nil {
-		return "", err
+		return "", 0, false, err
 	}
 	if isPartitionedRest(rest) {
-		return parseSQSPartitionedQueueAndTrailer(rest, true /*hasMsgID*/, key)
+		enc, part, perr := parseSQSPartitionedQueueAndTrailer(rest, true /*hasMsgID*/, key)
+		if perr != nil {
+			return "", 0, false, perr
+		}
+		return enc, part, true, nil
 	}
 	idx := scanBase64URLBoundary(rest)
 	// idx == 0 -> no queue segment; idx+genBytes >= len(rest) -> no
@@ -512,21 +564,21 @@ func parseSQSMessageDataKey(key []byte) (string, error) {
 	// AWS SQS message IDs are non-empty by construction, so an empty
 	// msg-id segment can never be a legitimate snapshot record.
 	if idx == 0 || idx+genBytes >= len(rest) {
-		return "", errors.Wrapf(ErrSQSMalformedKey,
+		return "", 0, false, errors.Wrapf(ErrSQSMalformedKey,
 			"queue segment or message-id segment not found in %q", key)
 	}
-	encQueue := rest[:idx]
-	if _, err := base64.RawURLEncoding.DecodeString(encQueue); err != nil {
-		return "", errors.Wrap(ErrSQSMalformedKey, err.Error())
+	enc := rest[:idx]
+	if _, err := base64.RawURLEncoding.DecodeString(enc); err != nil {
+		return "", 0, false, errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
 	// Validate the msg-id segment decodes too; if it doesn't, the
 	// boundary detection got it wrong and we surface an error rather
 	// than emit a record under a wrong queue.
 	encMsgID := rest[idx+genBytes:]
 	if _, err := base64.RawURLEncoding.DecodeString(encMsgID); err != nil {
-		return "", errors.Wrap(ErrSQSMalformedKey, err.Error())
+		return "", 0, false, errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
-	return encQueue, nil
+	return enc, 0, false, nil
 }
 
 // parseSQSGenericKey is a coarse parser for the side-record prefixes
@@ -541,7 +593,14 @@ func parseSQSGenericKey(key []byte, prefix string) (string, error) {
 		return "", err
 	}
 	if isPartitionedRest(rest) {
-		return parseSQSPartitionedQueueAndTrailer(rest, false /*hasMsgID*/, key)
+		// Side-record dispatch routes by queue only — the partition
+		// trailer is parsed for validation but the value is discarded
+		// here. M5-3 design doc §"Decoder lift" pins this contract.
+		encQueue, _, perr := parseSQSPartitionedQueueAndTrailer(rest, false /*hasMsgID*/, key)
+		if perr != nil {
+			return "", perr
+		}
+		return encQueue, nil
 	}
 	idx := scanBase64URLBoundary(rest)
 	// All side-record key shapes (vis / byage / dedup / group /
@@ -575,37 +634,39 @@ func isPartitionedRest(rest string) bool {
 //
 // Anything else surfaces ErrSQSMalformedKey rather than emitting
 // records under a wrong queue.
-func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey []byte) (string, error) {
+func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey []byte) (string, uint32, error) {
 	body := rest[len(sqsPartitionedDiscriminator):]
 	terminator := strings.IndexByte(body, '|')
 	if terminator <= 0 {
-		return "", errors.Wrapf(ErrSQSMalformedKey,
+		return "", 0, errors.Wrapf(ErrSQSMalformedKey,
 			"partitioned key missing queue terminator in %q", originalKey)
 	}
 	encQueue := body[:terminator]
 	if _, err := base64.RawURLEncoding.DecodeString(encQueue); err != nil {
-		return "", errors.Wrap(ErrSQSMalformedKey, err.Error())
+		return "", 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
 	trailer := body[terminator+1:]
 	const fixedTrailerBytes = sqsPartitionBytes + genBytes
 	if hasMsgID {
 		// Need partition+gen plus at least 1 byte of msg-id.
 		if len(trailer) <= fixedTrailerBytes {
-			return "", errors.Wrapf(ErrSQSMalformedKey,
+			return "", 0, errors.Wrapf(ErrSQSMalformedKey,
 				"partitioned msg-data key missing message-id in %q", originalKey)
 		}
 		encMsgID := trailer[fixedTrailerBytes:]
 		if _, err := base64.RawURLEncoding.DecodeString(encMsgID); err != nil {
-			return "", errors.Wrap(ErrSQSMalformedKey, err.Error())
+			return "", 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
 		}
-		return encQueue, nil
+		partition := binary.BigEndian.Uint32([]byte(trailer[:sqsPartitionBytes]))
+		return encQueue, partition, nil
 	}
 	// Side records: trailer must carry at least partition+gen.
 	if len(trailer) < fixedTrailerBytes {
-		return "", errors.Wrapf(ErrSQSMalformedKey,
+		return "", 0, errors.Wrapf(ErrSQSMalformedKey,
 			"partitioned side-record key trailer truncated in %q", originalKey)
 	}
-	return encQueue, nil
+	partition := binary.BigEndian.Uint32([]byte(trailer[:sqsPartitionBytes]))
+	return encQueue, partition, nil
 }
 
 // scanBase64URLBoundary returns the index of the first byte in s that is
@@ -654,6 +715,7 @@ func decodeSQSQueueMetaValue(value []byte) (*sqsQueueMetaPublic, error) {
 		ReceiveMessageWaitSeconds int64  `json:"receive_message_wait_seconds"`
 		MaximumMessageSize        int64  `json:"maximum_message_size"`
 		RedrivePolicy             string `json:"redrive_policy"`
+		RedriveAllowPolicy        string `json:"redrive_allow_policy"`
 		// HT-FIFO immutable attributes — see adapter/sqs_catalog.go.
 		PartitionCount      uint32 `json:"partition_count"`
 		FifoThroughputLimit string `json:"fifo_throughput_limit"`
@@ -673,6 +735,7 @@ func decodeSQSQueueMetaValue(value []byte) (*sqsQueueMetaPublic, error) {
 		ReceiveMessageWaitSeconds: live.ReceiveMessageWaitSeconds,
 		MaximumMessageSize:        live.MaximumMessageSize,
 		RedrivePolicy:             live.RedrivePolicy,
+		RedriveAllowPolicy:        live.RedriveAllowPolicy,
 		PartitionCount:            live.PartitionCount,
 		FifoThroughputLimit:       live.FifoThroughputLimit,
 		DeduplicationScope:        live.DeduplicationScope,

@@ -25,12 +25,11 @@ const encryptionDialTimeout = 5 * time.Second
 // with this one — main() picks based on argv[1] before flag.Parse() so
 // the two surfaces do not share a global flag namespace.
 //
-// PR-A wired `status`. PR-B added `rotate-dek` and
-// `register-writer`. PR-C adds `bootstrap`. 6D-2 added the
-// `probe-node-id` collision-mitigation helper. 6D-6b (this PR)
-// adds `enable-storage-envelope`; the §7.1 Phase 2
-// `enable-raft-envelope` lands in Stage 6E. ResyncSidecar is a
-// server-side §5.5 fallback (no CLI surface).
+// Subcommand surface (in shipping order): status, rotate-dek,
+// register-writer, bootstrap, probe-node-id,
+// enable-storage-envelope (6D-6b), enable-raft-envelope (6E-1b;
+// the server method is gated until 6E-2 ships wrap-on-propose).
+// ResyncSidecar is a server-side §5.5 fallback (no CLI surface).
 func encryptionMain(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: elastickv-admin encryption <subcommand> [flags]")
@@ -44,13 +43,13 @@ func encryptionMain(args []string) error {
 		// subcommands; returning nil keeps the exit code at 0
 		// so shell scripts using $? to detect success do not
 		// trip on a help request.
-		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap\n  enable-storage-envelope\n  probe-node-id")
+		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap\n  enable-storage-envelope\n  enable-raft-envelope\n  probe-node-id")
 		if err != nil {
 			return errors.Wrap(err, "write usage")
 		}
 		return nil
 	}
-	return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap, enable-storage-envelope, probe-node-id)", sub)
+	return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap, enable-storage-envelope, enable-raft-envelope, probe-node-id)", sub)
 }
 
 // encryptionSubcommands is the dispatch table for the encryption
@@ -65,6 +64,7 @@ func encryptionSubcommands() map[string]func(args []string, out io.Writer) error
 		"register-writer":         runEncryptionRegisterWriter,
 		"bootstrap":               runEncryptionBootstrap,
 		"enable-storage-envelope": runEncryptionEnableStorageEnvelope,
+		"enable-raft-envelope":    runEncryptionEnableRaftEnvelope,
 		"probe-node-id":           runEncryptionProbeNodeID,
 	}
 }

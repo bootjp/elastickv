@@ -51,10 +51,10 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 		{id: 2, address: "127.0.0.1:15002"},
 	}
 
-	factory, err := newRaftFactory(raftEngineEtcd)
+	factory, err := newRaftFactory(raftEngineEtcd, nil)
 	require.NoError(t, err)
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, nil, factory, nil, clock, nil, nil, "", encryptionWriteWiring{})
+	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, nil, factory, nil, clock, nil, nil, "", encryptionWriteWiring{}, nil)
 	require.NoError(t, err)
 
 	engine := distribution.NewEngine()
@@ -106,9 +106,9 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 
 	sharedClock := kv.NewHLC()
 	openShardStore := func(bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
-		factory, err := newRaftFactory(raftEngineEtcd)
+		factory, err := newRaftFactory(raftEngineEtcd, nil)
 		require.NoError(t, err)
-		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap, nil, factory, nil, sharedClock, nil, nil, "", encryptionWriteWiring{})
+		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap, nil, factory, nil, sharedClock, nil, nil, "", encryptionWriteWiring{}, nil)
 		require.NoError(t, err)
 		shardStore := kv.NewShardStore(engine, shardGroups)
 		return runtimes, shardGroups, shardStore

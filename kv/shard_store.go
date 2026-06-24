@@ -98,6 +98,69 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 	return v != nil, nil
 }
 
+// CommittedVersionAt routes the exact-timestamp existence probe to the
+// owning group's local store, gated on the same lease-aware leader check
+// GetAt uses, so a deposed node that has not yet applied a freshly-
+// committed entry does not silently return false to a client read. The
+// FSM apply path is NOT affected — it holds the per-shard store directly
+// (not ShardStore) and runs the probe on the deterministic local replica
+// it is writing to. The option-2 reuse path (RedisServer.resolveReuseLength)
+// goes through this wrapper, so during leader churn the probe must answer
+// authoritatively or defer to a leader-routed re-read.
+//
+// There is no RawCommittedVersionAt RPC to proxy to; when we are not the
+// linearizable leader for the group we return (false, nil) and let the
+// caller fall back to derived reads (resolveListMeta uses ScanAt/GetAt,
+// which ARE leader-fenced / proxied per group). The fallback returns the
+// leader's current Len — a valid serialization — at the cost of the
+// pending.length fast-path during churn. Mirrors LeaderRoutedStore's fix
+// for codex P1 #796.
+func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	g, ok := s.groupForKey(key)
+	if !ok || g.Store == nil {
+		return false, nil
+	}
+	// engineForGroup may be nil in test fixtures that wire ShardStore
+	// without raft; preserve the existing local-only fallback there.
+	engine := engineForGroup(g)
+	if engine == nil {
+		exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		return exists, nil
+	}
+	if !isLinearizableRaftLeader(ctx, engine) && !tryEngineLinearizableFence(ctx, engine) {
+		// Not the linearizable leader for this group AND the ReadIndex
+		// fence failed (no leader reachable, ctx canceled). Fall back to
+		// (false, nil); the adapter's resolveListMeta path takes over via
+		// the leader-fenced ScanAt/GetAt and returns a valid current-Len
+		// serialization.
+		return false, nil
+	}
+	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return exists, nil
+}
+
+// tryEngineLinearizableFence submits a Raft ReadIndex via the per-group
+// engine and reports whether it succeeded. After a successful ReadIndex
+// the local applied index is caught up to the current leader's commit
+// point, so a subsequent local read sees every committed version. The
+// error from the underlying call is intentionally not surfaced — callers
+// that need the authoritative answer treat a failed fence as "couldn't
+// verify, fall back to the leader-routed slow path." Structured to avoid
+// the nilerr false positive at the call site.
+func tryEngineLinearizableFence(ctx context.Context, engine raftengine.LeaderView) bool {
+	if engine == nil {
+		return false
+	}
+	_, err := engine.LinearizableRead(ctx)
+	return err == nil
+}
+
 // ScanAt scans keys across shards at the given timestamp. Note: when the range
 // spans multiple shards, each shard may have a different Raft apply position.
 // This means the returned view is NOT a globally consistent snapshot — it is
@@ -1144,6 +1207,17 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 	return errors.WithStack(group.Store.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
 }
 
+// ApplyMutationsRaftAt is the raft-entry-index-aware variant. Threads
+// appliedIndex through to the single owning shard so the leaf can
+// bundle metaAppliedIndex with the mutation. See PR #910 design §2.
+func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	group, err := s.resolveSingleShardGroup(mutations)
+	if err != nil || group == nil {
+		return err
+	}
+	return errors.WithStack(group.Store.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
 // resolveSingleShardGroup returns the shard group that owns every
 // mutation in the batch, or an error if the batch is cross-shard or
 // references an unknown group. A nil group with nil error means "empty
@@ -1194,6 +1268,42 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 	return nil
 }
 
+// DeletePrefixAtRaftAt is the raft-entry-index-aware variant. The
+// caller's raft entry index applies only to the local group whose
+// FSM is driving this apply; on a multi-group ShardStore, fanning
+// the SAME index across other groups would corrupt their
+// metaAppliedIndex. The single-group case (the common case for an
+// FSM-local DeletePrefixAtRaft path) gets the correct bundling; the
+// multi-group broadcast case is treated as "passive" — peer groups
+// receive the prefix-delete without a meta-key bump (their own raft
+// applies will catch up the index on the next mutation).
+//
+// In practice the FSM call sites that issue raft-DeletePrefix
+// operate against a single group's store; the multi-group ShardStore
+// is the receiver only when an aggregate (admin / coordinator) path
+// is replaying a global FLUSHALL, which is not raft-applied.
+func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		// Pass appliedIndex through to every group. In the
+		// single-group call-path (the production raft-apply case)
+		// this is correct: appliedIndex IS that group's raft entry
+		// index. In a hypothetical multi-group call, only one group
+		// would see the matching index and the rest would treat it
+		// as a non-monotonic stray write — but the rest of the
+		// raft-apply contract (single FSM per raft log) makes that
+		// case impossible to reach in production. Tests that
+		// exercise ShardStore.DeletePrefixAtRaftAt across multiple
+		// groups MUST pass appliedIndex=0 to opt out.
+		if err := g.Store.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
 func (s *ShardStore) LastCommitTS() uint64 {
 	var max uint64
 	for _, g := range s.groups {
@@ -1205,6 +1315,88 @@ func (s *ShardStore) LastCommitTS() uint64 {
 		}
 	}
 	return max
+}
+
+// LastAppliedIndex aggregates the durable applied-index across every
+// shard group, returning the MIN over all groups that report one.
+//
+// MIN is the right aggregator because the kvFSM is per-shard in
+// production — each shard's FSM independently asks "is MY group's
+// applied index at least as fresh as MY group's snapshot?" — and
+// ShardStore is NEVER used as the FSM's f.store in production today
+// (the FSM holds a *pebbleStore directly; ShardStore is the
+// coordinator-facing fanout wrapper). This method exists as a
+// defensive forward in case a future refactor uses ShardStore from
+// the apply path; reporting MIN guarantees the cold-start skip gate
+// would refuse to skip whenever ANY group lags, matching the
+// conservative "over-restore beats under-restore" rule (PR #910
+// design §4).
+//
+// (0, false, nil) when no group reports a value — strictly-additive
+// fallback per design §4.
+func (s *ShardStore) LastAppliedIndex() (uint64, bool, error) {
+	var (
+		minIdx    uint64
+		anyReport bool
+	)
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		reader, ok := g.Store.(interface {
+			LastAppliedIndex() (uint64, bool, error)
+		})
+		if !ok {
+			continue
+		}
+		idx, present, err := reader.LastAppliedIndex()
+		if err != nil {
+			return 0, false, errors.WithStack(err)
+		}
+		if !present {
+			// One group has no meta key. Conservative: report
+			// missing so the cold-start skip gate falls back.
+			return 0, false, nil
+		}
+		if !anyReport || idx < minIdx {
+			minIdx = idx
+		}
+		anyReport = true
+	}
+	if !anyReport {
+		return 0, false, nil
+	}
+	return minIdx, true, nil
+}
+
+// SetDurableAppliedIndex broadcasts the bump to every group store
+// that exposes the writer seam.
+//
+// This is purely defensive — in production today the FSM holds a
+// *pebbleStore directly; ShardStore is never f.store. Were it ever
+// wired through the FSM apply path, broadcasting the same idx across
+// groups would corrupt their per-group metaAppliedIndex semantics
+// (each group has its own raft log with its own entry numbering).
+// For that hypothetical, the test convention from
+// DeletePrefixAtRaftAt applies: tests MUST pass idx=0 to opt out, or
+// not use ShardStore as the writer at all. Returns the first
+// per-group error.
+func (s *ShardStore) SetDurableAppliedIndex(idx uint64) error {
+	for _, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		writer, ok := g.Store.(interface {
+			SetDurableAppliedIndex(idx uint64) error
+		})
+		if !ok {
+			continue
+		}
+		if err := writer.SetDurableAppliedIndex(idx); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
 }
 
 // WriteConflictCountsByPrefix aggregates OCC conflict counts across

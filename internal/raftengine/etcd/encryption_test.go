@@ -78,6 +78,38 @@ func envelopeEntry(t *testing.T, c *encryption.Cipher, kid uint32, index uint64,
 	return raftpb.Entry{Index: index, Type: raftpb.EntryNormal, Data: encodeProposalEnvelope(7, wrapped)}
 }
 
+// TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure pins
+// the §7.1 barrier's typed error as a separate sentinel from
+// ErrRaftUnwrapFailed. The two have very different operator
+// responses: cutover-in-progress is a retryable transient (the
+// barrier completes in drain-time, then the next attempt
+// succeeds under the new wrapped regime), while unwrap-failed is
+// process-fatal (sidecar / Raft-log divergence or KEK custody
+// problem). A caller that confuses them would either drop
+// retryable cutover-window proposals on the floor or paper over
+// a fatal data-integrity error with a retry loop. errors.Is
+// distinguishes them; this test pins that distinction so future
+// refactors of the error chain do not silently merge the two.
+func TestErrEnvelopeCutoverInProgress_DistinctFromUnwrapFailure(t *testing.T) {
+	t.Parallel()
+	if errors.Is(ErrEnvelopeCutoverInProgress, ErrRaftUnwrapFailed) {
+		t.Error("ErrEnvelopeCutoverInProgress matches ErrRaftUnwrapFailed; the §7.1 barrier sentinel must be a distinct error chain")
+	}
+	if errors.Is(ErrRaftUnwrapFailed, ErrEnvelopeCutoverInProgress) {
+		t.Error("ErrRaftUnwrapFailed matches ErrEnvelopeCutoverInProgress; the process-fatal sentinel must not be misclassified as retryable")
+	}
+	// Pin the chain contract that Stage 6E-2b callers depend
+	// on: an errors.Wrap-wrapped sentinel must still match via
+	// errors.Is. A downstream caller that wraps the sentinel
+	// for diagnostic context would otherwise silently lose its
+	// retryable classification and fall through to a
+	// process-fatal error path.
+	wrapped := errors.Wrap(ErrEnvelopeCutoverInProgress, "cutover barrier open")
+	if !errors.Is(wrapped, ErrEnvelopeCutoverInProgress) {
+		t.Error("ErrEnvelopeCutoverInProgress lost through errors.Wrap; callers using errors.Is on a wrapped error must still match the sentinel")
+	}
+}
+
 // TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed locks down
 // the misconfig case: when the cluster has crossed the raft envelope
 // cutover (an above-cutover entry arrives) but raftCipher is nil —
@@ -101,7 +133,7 @@ func TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed(t *testing.T) {
 		Index: cutover + 1,
 		Data:  encodeProposalEnvelope(99, []byte("would-be wrapped payload")),
 	}
-	_, err := e.applyNormalEntry(entry)
+	_, err := e.applyNormalEntry(entry, false)
 	if !errors.Is(err, ErrRaftUnwrapFailed) {
 		t.Fatalf("expected ErrRaftUnwrapFailed for cutover-active+no-cipher misconfig, got %v", err)
 	}
@@ -119,7 +151,7 @@ func TestApplyNormalEntry_CutoverActive_NoCipher_FailsClosed(t *testing.T) {
 		Index: cutover,
 		Data:  encodeProposalEnvelope(11, []byte("legacy cleartext")),
 	}
-	if _, err := e.applyNormalEntry(belowCutoverEntry); err != nil {
+	if _, err := e.applyNormalEntry(belowCutoverEntry, false); err != nil {
 		t.Fatalf("below-cutover should pass through, got %v", err)
 	}
 	if got := fsm.calls.Load(); got != 1 {
@@ -137,7 +169,7 @@ func TestApplyNormalEntry_NoCipher_PassThrough(t *testing.T) {
 	e := newTestEngine(fsm, nil, nil)
 	plain := []byte("op=put key=k1 v=hello")
 	entry := raftpb.Entry{Type: raftpb.EntryNormal, Data: encodeProposalEnvelope(42, plain)}
-	if _, err := e.applyNormalEntry(entry); err != nil {
+	if _, err := e.applyNormalEntry(entry, false); err != nil {
 		t.Fatalf("applyNormalEntry: %v", err)
 	}
 	if got := fsm.calls.Load(); got != 1 {
@@ -168,7 +200,7 @@ func TestApplyNormalEntry_BelowCutover_PassThrough(t *testing.T) {
 			Index: idx,
 			Data:  encodeProposalEnvelope(11, cleartextPayload),
 		}
-		if _, err := e.applyNormalEntry(entry); err != nil {
+		if _, err := e.applyNormalEntry(entry, false); err != nil {
 			t.Fatalf("idx=%d: applyNormalEntry: %v", idx, err)
 		}
 		if got := fsm.calls.Load(); got != 1 {
@@ -194,7 +226,7 @@ func TestApplyNormalEntry_AboveCutover_Unwraps(t *testing.T) {
 		fsm.calls.Store(0)
 		plaintext := []byte("op=put key=k1 v=secret")
 		entry := envelopeEntry(t, c, kid, idx, plaintext)
-		if _, err := e.applyNormalEntry(entry); err != nil {
+		if _, err := e.applyNormalEntry(entry, false); err != nil {
 			t.Fatalf("idx=%d: applyNormalEntry: %v", idx, err)
 		}
 		if got := fsm.calls.Load(); got != 1 {
@@ -226,7 +258,7 @@ func TestApplyNormalEntry_UnwrapFailure_Halts(t *testing.T) {
 	// last byte.
 	entry.Data[len(entry.Data)-1] ^= 0xff
 
-	_, err := e.applyNormalEntry(entry)
+	_, err := e.applyNormalEntry(entry, false)
 	if !errors.Is(err, ErrRaftUnwrapFailed) {
 		t.Fatalf("expected ErrRaftUnwrapFailed, got %v", err)
 	}
@@ -294,7 +326,7 @@ func TestApplyNormalEntry_BoundaryCutover(t *testing.T) {
 		Index: cutover,
 		Data:  encodeProposalEnvelope(13, cleartext),
 	}
-	if _, err := e.applyNormalEntry(atCutover); err != nil {
+	if _, err := e.applyNormalEntry(atCutover, false); err != nil {
 		t.Fatalf("at-cutover: %v", err)
 	}
 	if string(fsm.last) != string(cleartext) {
@@ -303,7 +335,7 @@ func TestApplyNormalEntry_BoundaryCutover(t *testing.T) {
 
 	// cutover+1: wrapped payload — MUST be unwrapped.
 	above := envelopeEntry(t, c, kid, cutover+1, []byte("first encrypted"))
-	if _, err := e.applyNormalEntry(above); err != nil {
+	if _, err := e.applyNormalEntry(above, false); err != nil {
 		t.Fatalf("above-cutover: %v", err)
 	}
 	if string(fsm.last) != "first encrypted" {
@@ -333,7 +365,7 @@ func TestApplyNormalEntry_ProposalIDStillResolvable(t *testing.T) {
 	}
 	data := encodeProposalEnvelope(wantID, wrapped)
 	entry := raftpb.Entry{Type: raftpb.EntryNormal, Index: cutover + 1, Data: data}
-	if _, err := e.applyNormalEntry(entry); err != nil {
+	if _, err := e.applyNormalEntry(entry, false); err != nil {
 		t.Fatalf("applyNormalEntry: %v", err)
 	}
 	gotID, _, ok := decodeProposalEnvelope(entry.Data)
@@ -364,7 +396,7 @@ func TestApplyNormalEntry_NoCutoverDefault(t *testing.T) {
 			Index: idx,
 			Data:  encodeProposalEnvelope(7, cleartext),
 		}
-		if _, err := e.applyNormalEntry(entry); err != nil {
+		if _, err := e.applyNormalEntry(entry, false); err != nil {
 			t.Fatalf("idx=%d: %v", idx, err)
 		}
 		if string(fsm.last) != string(cleartext) {

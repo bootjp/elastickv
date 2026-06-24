@@ -240,6 +240,46 @@ func TestAdminPurgeQueue_EmptyName(t *testing.T) {
 	}
 }
 
+func TestAdminSetQueueAttributes_InvalidatesThrottleBucket(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	const queueName = "admin-throttle"
+	_ = createSQSQueueForTest(t, node, queueName)
+
+	ctx := context.Background()
+	readTS := node.sqsServer.nextTxnReadTS(ctx)
+	meta, exists, err := node.sqsServer.loadQueueMetaAt(ctx, queueName, readTS)
+	if err != nil {
+		t.Fatalf("loadQueueMetaAt: %v", err)
+	}
+	if !exists {
+		t.Fatalf("queue not found")
+	}
+
+	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
+	if out := node.sqsServer.throttle.charge(cfg, queueName, bucketActionSend, meta.Incarnation, 1); !out.allowed {
+		t.Fatalf("seed throttle bucket: denied with retryAfter=%v", out.retryAfter)
+	}
+	key := bucketKey{queue: queueName, action: bucketActionSend, incarnation: meta.Incarnation}
+	if _, ok := node.sqsServer.throttle.buckets.Load(key); !ok {
+		t.Fatalf("seed throttle bucket missing before admin attribute update")
+	}
+
+	err = node.sqsServer.AdminSetQueueAttributes(ctx, fullAdminPrincipal, queueName, map[string]string{
+		"ThrottleSendCapacity":        "20",
+		"ThrottleSendRefillPerSecond": "1",
+	})
+	if err != nil {
+		t.Fatalf("AdminSetQueueAttributes: %v", err)
+	}
+	if _, ok := node.sqsServer.throttle.buckets.Load(key); ok {
+		t.Fatalf("admin throttle update must invalidate cached throttle bucket")
+	}
+}
+
 // TestPurgeQueueSigV4_PreservesWireShapeAfterTypedErrorChange is the
 // caller-audit pin from the design doc §6.1 ("TestPurgeQueueSigV4_Still
 // Compiles"). It exercises the SigV4 PurgeQueue handler through the

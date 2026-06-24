@@ -224,6 +224,106 @@ func printEnableStorageEnvelopeResult(out io.Writer, resp *pb.EnableStorageEnvel
 	return nil
 }
 
+// runEncryptionEnableRaftEnvelope invokes
+// EncryptionAdmin.EnableRaftEnvelope on the configured endpoint.
+// Structural mirror of runEncryptionEnableStorageEnvelope; the
+// server method (Stage 6E-1b) composes the §3.2 sequence with
+// Purpose=PurposeRaft and SubTag=RotateSubEnableRaftEnvelope, and
+// the response carries only the (was_already_active, applied_index,
+// capability_summary) shape — the storage variant's
+// cutover_index_unknown defensive field is intentionally absent
+// because RaftEnvelopeCutoverIndex != 0 IS the active sentinel.
+//
+// Output discriminates was_already_active so an automation script
+// can tell whether THIS invocation proposed the cutover or hit the
+// idempotent-retry path:
+//
+//	fresh:      "enabled applied_index=N
+//	             capability summary: ..."
+//	already-on: "already-active applied_index=N"
+func runEncryptionEnableRaftEnvelope(args []string, out io.Writer) error {
+	req, endpoint, err := parseEnableRaftEnvelopeArgs(args)
+	if err != nil {
+		return err
+	}
+	if req == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *endpoint.timeout)
+	defer cancel()
+	client, closeFn, err := dialEncryption(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := closeFn(); err != nil {
+			fmt.Fprintf(os.Stderr, "encryption: close connection: %v\n", err)
+		}
+	}()
+	resp, err := client.EnableRaftEnvelope(ctx, req)
+	if err != nil {
+		return errors.Wrap(err, "EnableRaftEnvelope")
+	}
+	return printEnableRaftEnvelopeResult(out, resp)
+}
+
+// parseEnableRaftEnvelopeArgs returns the validated proto request
+// and the shared endpoint flags. A nil request with no error means
+// the caller requested --help; the caller then exits 0.
+func parseEnableRaftEnvelopeArgs(args []string) (*pb.EnableRaftEnvelopeRequest, *encryptionEndpointFlags, error) {
+	fs := flag.NewFlagSet("encryption enable-raft-envelope", flag.ContinueOnError)
+	endpoint := newEncryptionEndpointFlags(fs)
+	proposerNodeID := fs.Uint64("proposer-node-id", 0, "The proposer's 64-bit full_node_id (registered in §4.1 writer registry); MUST be non-zero (0 is the §6.1 not-capable sentinel)")
+	proposerLocalEpoch := fs.Uint("proposer-local-epoch", 0, "The proposer's local_epoch at proposal time (0..0xFFFF)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, endpoint, nil
+		}
+		return nil, nil, errors.Wrap(err, "parse flags")
+	}
+	if *proposerNodeID == 0 {
+		return nil, nil, errors.New("encryption: --proposer-node-id is required and must be non-zero (0 is the §6.1 not-capable sentinel)")
+	}
+	if err := requireUint16Plus1(*proposerLocalEpoch, "proposer-local-epoch"); err != nil {
+		return nil, nil, err
+	}
+	return &pb.EnableRaftEnvelopeRequest{
+		ProposerNodeId:     *proposerNodeID,
+		ProposerLocalEpoch: narrowUint32(*proposerLocalEpoch),
+	}, endpoint, nil
+}
+
+// printEnableRaftEnvelopeResult renders the §3.1 response in a
+// shell-friendly shape. Lines start with a stable prefix
+// (`enabled` / `already-active`) so scripts can `awk` on column 1
+// to discriminate. No cutover_index_unknown warning line — the
+// raft variant does not have that defensive field (see the
+// response message comment in encryption_admin.proto).
+func printEnableRaftEnvelopeResult(out io.Writer, resp *pb.EnableRaftEnvelopeResponse) error {
+	if resp.GetWasAlreadyActive() {
+		if _, err := fmt.Fprintf(out, "already-active applied_index=%d\n", resp.GetAppliedIndex()); err != nil {
+			return errors.Wrap(err, "write result")
+		}
+		return nil
+	}
+	if _, err := fmt.Fprintf(out, "enabled applied_index=%d\n", resp.GetAppliedIndex()); err != nil {
+		return errors.Wrap(err, "write result")
+	}
+	if len(resp.GetCapabilitySummary()) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(out, "capability summary:"); err != nil {
+		return errors.Wrap(err, "write capability summary header")
+	}
+	for _, v := range resp.GetCapabilitySummary() {
+		if _, err := fmt.Fprintf(out, "  full_node_id=%d encryption_capable=%t build_sha=%s sidecar_present=%t\n",
+			v.GetFullNodeId(), v.GetEncryptionCapable(), v.GetBuildSha(), v.GetSidecarPresent()); err != nil {
+			return errors.Wrap(err, "write capability row")
+		}
+	}
+	return nil
+}
+
 // runEncryptionRegisterWriter invokes
 // EncryptionAdmin.RegisterEncryptionWriter for a single
 // (dek_id, full_node_id, local_epoch) triple. Multi-writer

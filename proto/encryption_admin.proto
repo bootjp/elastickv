@@ -50,6 +50,7 @@ service EncryptionAdmin {
   rpc RegisterEncryptionWriter (RegisterEncryptionWriterRequest) returns (RegisterEncryptionWriterResponse) {}
   rpc ResyncSidecar (ResyncSidecarRequest) returns (ResyncSidecarResponse) {}
   rpc EnableStorageEnvelope (EnableStorageEnvelopeRequest) returns (EnableStorageEnvelopeResponse) {}
+  rpc EnableRaftEnvelope (EnableRaftEnvelopeRequest) returns (EnableRaftEnvelopeResponse) {}
 }
 
 message Empty {}
@@ -214,6 +215,57 @@ message EnableStorageEnvelopeResponse {
   repeated CapabilityVerdict capability_summary = 2;
   bool   cutover_index_unknown = 3;
   bool   was_already_active    = 4;
+}
+
+// EnableRaftEnvelopeRequest proposes the Stage 6E Phase 2 cutover
+// from cleartext Raft proposals to §4.2-envelope Raft proposals.
+// Defined in the 6E design doc §3.1; the server composes a
+// RotationPayload with SubTag = RotateSubEnableRaftEnvelope (0x05)
+// and routes it through the default Raft group's leader as a
+// §11.3 0x05 OpRotation entry. Structural mirror of
+// EnableStorageEnvelopeRequest; the difference is the target
+// Purpose (PurposeRaft) and the source DEK slot
+// (sidecar.Active.Raft).
+//
+// proposer_node_id MUST be non-zero (the §6.1 "not-capable"
+// sentinel is rejected at the server boundary, matching the
+// existing RotateDEK / BootstrapEncryption / EnableStorageEnvelope
+// posture).
+//
+// proposer_local_epoch carries the §4.1 16-bit nonce field as
+// uint32 (proto3 has no uint16); values above 0xFFFF are
+// rejected at the server boundary before any Raft proposal is
+// composed. ApplyRotation re-validates at apply time
+// (defense-in-depth).
+message EnableRaftEnvelopeRequest {
+  uint64 proposer_node_id     = 1;
+  uint32 proposer_local_epoch = 2; // MUST be <= 0xFFFF on the wire.
+}
+
+// EnableRaftEnvelopeResponse reports the outcome of a raft-envelope
+// cutover proposal. Structural mirror of
+// EnableStorageEnvelopeResponse with one rename to match the
+// raft variant's sole "Phase-2 active" sentinel:
+//
+//   - was_already_active reflects sidecar.RaftEnvelopeCutoverIndex
+//     != 0 on the precheck (the raft variant has no separate bool
+//     flag — non-zero cutover index IS the active sentinel).
+//
+// On a fresh cutover (was_already_active == false), applied_index
+// is the Raft index of the entry the leader just proposed and
+// waited to apply. On a retried call, applied_index is the
+// recorded sidecar.RaftEnvelopeCutoverIndex from the ORIGINAL
+// cutover — stable across arbitrary subsequent encryption-relevant
+// Raft activity.
+//
+// capability_summary records which (full_node_id) members were
+// probed during the pre-flight gate and what they reported.
+// Empty on idempotent retries; the membership view of the
+// original cutover is not retained.
+message EnableRaftEnvelopeResponse {
+  uint64 applied_index = 1;
+  repeated CapabilityVerdict capability_summary = 2;
+  bool   was_already_active = 3;
 }
 
 // CapabilityVerdict is one row of the §4 fan-out summary the

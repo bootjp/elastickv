@@ -50,15 +50,16 @@ const (
 	etcdMaxInflightMsg    = 256
 )
 
-func newRaftFactory(engineType raftEngineType) (raftengine.Factory, error) {
+func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
 	switch engineType {
 	case raftEngineEtcd:
 		return etcdraftengine.NewFactory(etcdraftengine.FactoryConfig{
-			TickInterval:   etcdTickInterval,
-			HeartbeatTick:  durationToTicks(heartbeatTimeout, etcdTickInterval, etcdHeartbeatMinTicks),
-			ElectionTick:   durationToTicks(electionTimeout, etcdTickInterval, etcdElectionMinTicks),
-			MaxSizePerMsg:  etcdMaxSizePerMsg,
-			MaxInflightMsg: etcdMaxInflightMsg,
+			TickInterval:      etcdTickInterval,
+			HeartbeatTick:     durationToTicks(heartbeatTimeout, etcdTickInterval, etcdHeartbeatMinTicks),
+			ElectionTick:      durationToTicks(electionTimeout, etcdTickInterval, etcdElectionMinTicks),
+			MaxSizePerMsg:     etcdMaxSizePerMsg,
+			MaxInflightMsg:    etcdMaxInflightMsg,
+			ColdStartObserver: coldStartObs,
 		}), nil
 	default:
 		return nil, errors.Wrapf(ErrUnsupportedRaftEngine, "%q", engineType)
@@ -95,7 +96,7 @@ var (
 	pprofAddr             = flag.String("pprofAddress", "localhost:6060", "TCP host+port for pprof debug endpoints; empty to disable")
 	pprofToken            = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 	raftId                = flag.String("raftId", "", "Node id used by Raft")
-	raftEngineName        = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd|hashicorp)")
+	raftEngineName        = flag.String("raftEngine", string(raftEngineEtcd), "Raft engine implementation (etcd)")
 	raftDir               = flag.String("raftDataDir", "data/", "Raft data dir")
 	redisLuaMaxIdleStates = flag.Int("redisLuaMaxIdleStates", adapter.DefaultLuaPoolMaxIdle, "Maximum number of idle *lua.LState instances retained by the Redis Lua VM pool. Each state holds ~200 KiB; lower values reduce steady-state memory at the cost of more allocations under burst, higher values absorb bursts at the cost of memory floor. Non-positive values clamp to the default.")
 	raftBootstrap         = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
@@ -194,6 +195,18 @@ var (
 	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
 	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
 	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route for the hot-key heatmap; 1 disables sub-bucketing (route-granular, today's behaviour). Capped at 256; memory is ~K*32 bytes/route, so K_max ~= memBudget/(32*keyvizMaxTrackedRoutes)")
+
+	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_proposed_keyviz_hot_key_topk).
+	// Off by default — the disabled-case adds one early-return branch
+	// to Observe and retains zero real key bytes. When enabled, the
+	// sampler retains actual hot key bytes in memory and exposes them
+	// via the admin /keyviz/hotkeys drill-down (gated behind admin
+	// auth + audit).
+	keyvizHotKeysEnabled    = flag.Bool("keyvizHotKeysEnabled", false, "Enable per-route Top-K hot-key drill-down (retains actual key bytes; admin auth + keyviz flag both required)")
+	keyvizHotKeysPerRoute   = flag.Int("keyvizHotKeysPerRoute", keyviz.DefaultHotKeysPerRoute, "Space-Saving sketch capacity m per route (default 64, cap 256). Larger m tightens the error bound N_total/m at the cost of memory")
+	keyvizHotKeysSampleRate = flag.Int("keyvizHotKeysSampleRate", keyviz.DefaultHotKeysSampleRate, "Hot-keys hot-path sample rate R: 1-in-R observes are enqueued (default 16, cap 1024). Higher R reduces hot-path cost; raises Chernoff miss probability over the sampled stream")
+	keyvizHotKeysQueueSize  = flag.Int("keyvizHotKeysQueueSize", keyviz.DefaultHotKeysQueueSize, "Bounded channel size between Observe and the hot-keys aggregator. Default 8192, cap 65536. Drops past this are counted (dropped_samples -> degraded)")
+	keyvizHotKeysMaxKeyLen  = flag.Int("keyvizHotKeysMaxKeyLen", keyviz.DefaultHotKeysMaxKeyLen, "Maximum key length sampled into the hot-keys sketch (default 1024 B, cap 4096). Longer keys bump skipped_long_keys -> degraded, never truncated")
 	// Phase 2-C cluster fan-out: comma-separated list of admin
 	// HTTP endpoints (host:port or scheme://host:port). When set,
 	// the admin keyviz handler aggregates the local matrix with
@@ -305,14 +318,20 @@ func run() error {
 		return err
 	}
 
-	factory, err := newRaftFactory(engineType)
-	if err != nil {
-		return err
-	}
-
 	var lc net.ListenConfig
 
 	metricsRegistry := monitoring.NewRegistry(*raftId, *myAddr)
+
+	// Factory needs the cold-start observer from the registry so the
+	// engine's restoreSnapshotState path can emit
+	// elastickv_fsm_cold_start_restore_total / _applied_index_gap
+	// (PR #934 round-1 codex P2 closed this plumbing gap — the
+	// observer was previously unused because Factory.Create did not
+	// carry it through to OpenConfig).
+	factory, err := newRaftFactory(engineType, metricsRegistry.ColdStartObserver())
+	if err != nil {
+		return err
+	}
 
 	// Create the shared HLC before building shard groups so every FSM can update
 	// physicalCeiling when HLC lease entries are applied to the Raft log.
@@ -366,6 +385,7 @@ func run() error {
 		keystore,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
+		cfg.engine,
 	)
 	if err = chainEncryptionStartupGuard(
 		err,
@@ -427,7 +447,7 @@ func run() error {
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed (codex P1 on PR #839).
 	distCatalog, err := setupDistributionAndRegistration(
-		ctx, runCtx, eg, runtimes, cfg.engine,
+		runCtx, eg, runtimes, cfg.engine,
 		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
 	if err != nil {
 		cancel()
@@ -453,7 +473,7 @@ func run() error {
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
 	)
-	startMonitoringCollectors(runCtx, metricsRegistry, runtimes)
+	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(
 		fsmCompactionRuntimes(runtimes),
 		kv.WithFSMCompactorActiveTimestampTracker(readTracker),
@@ -466,13 +486,21 @@ func run() error {
 		return nil
 	})
 
+	// Stage 7c §3.1: build the encryption-aware
+	// MembershipChangeInterceptor here where the concrete
+	// *kv.ShardedCoordinator and *kv.ShardGroup are available. Returns
+	// nil when encryption is not wired (no StateCache or no default
+	// group), in which case raftadmin.Server skips the pre-step.
+	encryptionConfChangeInterceptor := newEncryptionPreRegister(
+		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, etcdraftengine.DeriveNodeID)
 	if err := startServers(serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
-		runtimes: runtimes, bootstrapServers: bootstrapServers,
+		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapServers,
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
-		keyvizSampler: sampler,
+		keyvizSampler:                   sampler,
+		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
 	}); err != nil {
 		return err
 	}
@@ -754,6 +782,7 @@ func buildShardGroups(
 	keystore *encryption.Keystore,
 	sidecarPath string,
 	encWiring encryptionWriteWiring,
+	routeEngine *distribution.Engine,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, error) {
 	// Defend the "cache is always non-nil" contract for callers that
 	// pass a zero-value encryptionWriteWiring{} (the encryption-off
@@ -802,8 +831,15 @@ func buildShardGroups(
 		// Stage 6D-6c-1: WithStateCache threads the process-shared
 		// StateCache so an encryption apply landing on this shard's
 		// FSM updates the atomics every shard's storage layer reads.
+		// Stage 7b' §3.1: WithLocalEpoch threads this process load's
+		// pinned storage write-path w.epoch into the Applier so
+		// applyRotateDEK (PurposeStorage) can write each node's own
+		// highest-emitted local_epoch into Keys[newDEK].LocalEpoch
+		// rather than the proposer's 0. Raft rotations (PurposeRaft)
+		// keep LocalEpoch: 0 — see writeRotationSidecar's switch.
 		applierOpts := append(applierOptionsFor(kekWrapper, keystore, sidecarPath),
-			encryption.WithStateCache(encWiring.cache))
+			encryption.WithStateCache(encWiring.cache),
+			encryption.WithLocalEpoch(encWiring.epoch))
 		applier, err := encryption.NewApplier(reg, applierOpts...)
 		if err != nil {
 			for _, rt := range runtimes {
@@ -812,7 +848,17 @@ func buildShardGroups(
 			_ = st.Close()
 			return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", g.id)
 		}
-		sm := kv.NewKvFSMWithHLC(st, clock, kv.WithEncryption(applier))
+		// Composed-1 M2 plumbing: wire the shared route catalog
+		// engine and this shard's owning group ID so M3's
+		// verifyComposed1 apply-time gate can resolve the
+		// observed-version owner-of-key without further plumbing
+		// work. At M2 the FSM stores both but does not consult them;
+		// see docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+		// §M2.
+		sm := kv.NewKvFSMWithHLC(st, clock,
+			kv.WithEncryption(applier),
+			kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), g.id),
+		)
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {
@@ -822,11 +868,23 @@ func buildShardGroups(
 			return nil, nil, errors.Wrapf(err, "failed to start raft group %d", g.id)
 		}
 		runtimes = append(runtimes, runtime)
-		shardGroups[g.id] = &kv.ShardGroup{
+		// Stage 6E-2c: route every shard group's TransactionManager
+		// through NewLeaderProxyForShardGroup so the proposer chain
+		// consults sg.raftPayloadWrap on every Propose / ProposeAdmin.
+		// The cell is nil at startup (the Stage 3 default — payloads
+		// pass through cleartext); Stage 6E-2d's EnableRaftEnvelope
+		// handler will publish the active wrap closure the instant
+		// the cutover entry commits. Going through this constructor
+		// for every group avoids a future "I forgot to wire wrap on
+		// this code path" regression — if a new shard group bypasses
+		// this helper, the wrap install would silently no-op on
+		// proposals for that group.
+		sg := &kv.ShardGroup{
 			Engine: runtime.engine,
 			Store:  st,
-			Txn:    kv.NewLeaderProxyWithEngine(runtime.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id))),
 		}
+		sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id)))
+		shardGroups[g.id] = sg
 	}
 	return runtimes, shardGroups, nil
 }
@@ -836,6 +894,23 @@ func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) 
 		return nil
 	}
 	return factory(groupID)
+}
+
+// proposerForGroup returns the wrap-aware proposer for rt's shard
+// group, falling back to the raw engine when shardGroups does not
+// have an entry (test fixtures that construct a partial map).
+// Centralises the Stage 6E-2c forwarded-write wiring so the
+// Internal.Forward receive side and any future wrap-aware
+// construction site share the same lookup shape: the leader's
+// local LeaderProxy.Commit path is already wrap-aware via
+// NewLeaderProxyForShardGroup; this helper extends the same
+// guarantee to the Internal.Forward path that follower-forwarded
+// writes ride (codex P1 round-1 r2).
+func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+	if sg, ok := shardGroups[rt.spec.id]; ok && sg != nil {
+		return sg.Proposer()
+	}
+	return rt.engine
 }
 
 // loadKEKAndRunStartupGuards loads the file-backed KEK wrapper and
@@ -993,9 +1068,9 @@ func pebbleMonitorSources(runtimes []*raftGroupRuntime) []monitoring.PebbleSourc
 
 // dispatchMonitorSources extracts the raft engines that expose etcd
 // dispatch counters so monitoring can poll them for the hot-path
-// dashboard. Engines that do not satisfy the interface (hashicorp
-// backend today) are skipped silently; their groups simply won't
-// contribute to elastickv_raft_dispatch_* metrics.
+// dashboard. Engines that do not satisfy the interface are skipped
+// silently; their groups simply won't contribute to
+// elastickv_raft_dispatch_* metrics.
 func dispatchMonitorSources(runtimes []*raftGroupRuntime) []monitoring.DispatchSource {
 	out := make([]monitoring.DispatchSource, 0, len(runtimes))
 	for _, runtime := range runtimes {
@@ -1028,6 +1103,7 @@ type serversInput struct {
 	cancel           context.CancelFunc
 	lc               *net.ListenConfig
 	runtimes         []*raftGroupRuntime
+	shardGroups      map[uint64]*kv.ShardGroup
 	bootstrapServers []raftengine.Server
 	shardStore       *kv.ShardStore
 	coordinate       kv.Coordinator
@@ -1041,6 +1117,13 @@ type serversInput struct {
 	// coordinator already has its own copy from
 	// `WithSampler(...)` higher up in run().
 	keyvizSampler *keyviz.MemSampler
+	// encryptionConfChangeInterceptor is the Stage 7c §3.1
+	// pre-register hook for raftadmin AddVoter/AddLearner.
+	// Constructed in run() where concrete *kv.ShardedCoordinator and
+	// *kv.ShardGroup are still in scope; nil when encryption is not
+	// wired or the cluster is not bootstrapped, in which case
+	// raftadmin.Server skips the pre-step.
+	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 }
 
 // startServers wires up the AdminServer, builds the runtime runner, and
@@ -1091,6 +1174,7 @@ func startServers(in serversInput) error {
 		eg:              in.eg,
 		cancel:          in.cancel,
 		runtimes:        in.runtimes,
+		shardGroups:     in.shardGroups,
 		shardStore:      in.shardStore,
 		coordinate:      in.coordinate,
 		distServer:      in.distServer,
@@ -1123,13 +1207,14 @@ func startServers(in serversInput) error {
 		// sqsPartitionObserver: the metrics registry's HT-FIFO
 		// partition counter observer. nil when --metricsAddress is
 		// empty (the adapter then no-ops the observe call).
-		sqsPartitionObserver: in.metricsRegistry.SQSPartitionObserver(),
-		metricsAddress:       *metricsAddr,
-		metricsToken:         *metricsToken,
-		pprofAddress:         *pprofAddr,
-		pprofToken:           *pprofToken,
-		metricsRegistry:      in.metricsRegistry,
-		roleStore:            roleStore,
+		sqsPartitionObserver:            in.metricsRegistry.SQSPartitionObserver(),
+		metricsAddress:                  *metricsAddr,
+		metricsToken:                    *metricsToken,
+		pprofAddress:                    *pprofAddr,
+		pprofToken:                      *pprofToken,
+		metricsRegistry:                 in.metricsRegistry,
+		roleStore:                       roleStore,
+		encryptionConfChangeInterceptor: in.encryptionConfChangeInterceptor,
 	}
 	if err := runner.start(); err != nil {
 		return err
@@ -1340,7 +1425,7 @@ func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context
 // on top of the running raft runtimes. Kept separate from run() so
 // the latter stays under the cyclop complexity budget and so new
 // collectors can be added without widening run() further.
-func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime) {
+func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime, clock *kv.HLC) {
 	reg.RaftObserver().Start(ctx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
 	if collector := reg.DispatchCollector(); collector != nil {
 		collector.Start(ctx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
@@ -1350,6 +1435,9 @@ func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, ru
 	}
 	if collector := reg.WriteConflictCollector(); collector != nil {
 		collector.Start(ctx, writeConflictMonitorSources(runtimes), raftMetricsObserveInterval)
+	}
+	if obs := reg.HLCObserver(); obs != nil && clock != nil {
+		obs.Start(ctx, clock, raftMetricsObserveInterval)
 	}
 }
 
@@ -1455,6 +1543,7 @@ func startRaftServers(
 	lc *net.ListenConfig,
 	eg *errgroup.Group,
 	runtimes []*raftGroupRuntime,
+	shardGroups map[uint64]*kv.ShardGroup,
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
@@ -1463,6 +1552,7 @@ func startRaftServers(
 	adminServer *adapter.AdminServer,
 	adminGRPCOpts adminGRPCInterceptors,
 	forwardDeps adminForwardServerDeps,
+	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -1487,7 +1577,7 @@ func startRaftServers(
 			opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
 		}
 		gs := grpc.NewServer(opts...)
-		trx := kv.NewTransactionWithProposer(rt.engine, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
+		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
@@ -1514,7 +1604,10 @@ func startRaftServers(
 		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath, enableMutators, rt.engine, encryptionCapabilityFanout)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
-		internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})
+		// Stage 7c §3.1: pass the encryption-aware pre-register hook
+		// (nil when encryption is not wired); raftadmin.Server invokes
+		// it before AddVoter/AddLearner propose the conf-change.
+		internalraftadmin.RegisterOperationalServicesWithInterceptor(ctx, gs, rt.engine, []string{"RawKV"}, confChangeInterceptor)
 		reflection.Register(gs)
 
 		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.address)
@@ -1696,7 +1789,24 @@ func setupDistributionCatalog(
 	if distCatalog == nil {
 		return nil, errors.WithStack(errors.Newf("distribution catalog store is not available for group %d", catalogGroupID))
 	}
-	if _, err := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine); err != nil {
+	// EnsureCatalogSnapshot may Save through the direct (non-raft) write
+	// path. When the §7.1 storage envelope is active and this load's
+	// writer registration has not yet committed, that Save fails closed
+	// with store.ErrWriterNotRegistered (Stage 7a-2). retryUntilRegistered
+	// retries the bootstrap until the registration goroutine — armed
+	// before this call in setupDistributionAndRegistration — commits and
+	// the gate clears. The common cases (populated catalog → no-op Save,
+	// or pre-cutover → cleartext Save) never hit the gate and return on
+	// the first attempt.
+	//
+	// Idempotency requirement: the retry re-invokes EnsureCatalogSnapshot
+	// from scratch on each ErrWriterNotRegistered, so it MUST be
+	// re-entrant — on the populated-catalog path it is a version-unchanged
+	// no-op Save (no mutation, no nonce), so re-running it is safe.
+	if err := retryUntilRegistered(ctx, "distribution catalog bootstrap", func() error {
+		_, e := distribution.EnsureCatalogSnapshot(ctx, distCatalog, engine)
+		return errors.Wrap(e, "ensure catalog snapshot")
+	}); err != nil {
 		return nil, errors.Wrapf(err, "initialize distribution catalog")
 	}
 	return distCatalog, nil
@@ -1736,36 +1846,38 @@ func waitErrgroupAfterStartupFailure(cancel context.CancelFunc, eg *errgroup.Gro
 }
 
 type runtimeServerRunner struct {
-	ctx             context.Context
-	lc              *net.ListenConfig
-	eg              *errgroup.Group
-	cancel          context.CancelFunc
-	runtimes        []*raftGroupRuntime
-	shardStore      *kv.ShardStore
-	coordinate      kv.Coordinator
-	distServer      *adapter.DistributionServer
-	adminServer     *adapter.AdminServer
-	adminGRPCOpts   adminGRPCInterceptors
-	redisAddress    string
-	leaderRedis     map[string]string
-	pubsubRelay     *adapter.RedisPubSubRelay
-	readTracker     *kv.ActiveTimestampTracker
-	dynamoAddress   string
-	leaderDynamo    map[string]string
-	s3Address       string
-	leaderS3        map[string]string
-	s3Region        string
-	s3CredsFile     string
-	s3PathStyleOnly bool
-	sqsAddress      string
-	leaderSQS       map[string]string
-	sqsRegion       string
-	sqsCredsFile    string
-	metricsAddress  string
-	metricsToken    string
-	pprofAddress    string
-	pprofToken      string
-	metricsRegistry *monitoring.Registry
+	ctx                             context.Context
+	lc                              *net.ListenConfig
+	eg                              *errgroup.Group
+	cancel                          context.CancelFunc
+	runtimes                        []*raftGroupRuntime
+	shardGroups                     map[uint64]*kv.ShardGroup
+	shardStore                      *kv.ShardStore
+	coordinate                      kv.Coordinator
+	distServer                      *adapter.DistributionServer
+	adminServer                     *adapter.AdminServer
+	adminGRPCOpts                   adminGRPCInterceptors
+	redisAddress                    string
+	leaderRedis                     map[string]string
+	pubsubRelay                     *adapter.RedisPubSubRelay
+	readTracker                     *kv.ActiveTimestampTracker
+	dynamoAddress                   string
+	leaderDynamo                    map[string]string
+	s3Address                       string
+	leaderS3                        map[string]string
+	s3Region                        string
+	s3CredsFile                     string
+	s3PathStyleOnly                 bool
+	sqsAddress                      string
+	leaderSQS                       map[string]string
+	sqsRegion                       string
+	sqsCredsFile                    string
+	metricsAddress                  string
+	metricsToken                    string
+	pprofAddress                    string
+	pprofToken                      string
+	metricsRegistry                 *monitoring.Registry
+	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 
 	// dynamoServer is populated by start() and made available to
 	// startAdminFromFlags in this package so the admin listener can
@@ -1848,6 +1960,7 @@ func (r *runtimeServerRunner) start() error {
 		r.lc,
 		r.eg,
 		r.runtimes,
+		r.shardGroups,
 		r.shardStore,
 		r.coordinate,
 		r.distServer,
@@ -1858,6 +1971,7 @@ func (r *runtimeServerRunner) start() error {
 		r.adminServer,
 		r.adminGRPCOpts,
 		forwardDeps,
+		r.encryptionConfChangeInterceptor,
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
@@ -1897,6 +2011,11 @@ func buildKeyVizSampler() *keyviz.MemSampler {
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
 		KeyBucketsPerRoute:     *keyvizKeyBucketsPerRoute,
+		HotKeysEnabled:         *keyvizHotKeysEnabled,
+		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
+		HotKeysSampleRate:      *keyvizHotKeysSampleRate,
+		HotKeysQueueSize:       *keyvizHotKeysQueueSize,
+		HotKeysMaxKeyLen:       *keyvizHotKeysMaxKeyLen,
 	})
 }
 
@@ -1940,6 +2059,14 @@ func startKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSa
 	eg.Go(func() error {
 		keyviz.RunFlusher(ctx, s, s.Step())
 		s.Flush()
+		return nil
+	})
+	// Hot-key drill-down aggregator: a separate goroutine on the same
+	// keyvizStep cadence. RunHotKeysAggregator is a no-op block when
+	// HotKeysEnabled is false, so calling it unconditionally is safe
+	// and keeps the startup wiring uniform regardless of the flag.
+	eg.Go(func() error {
+		keyviz.RunHotKeysAggregator(ctx, s)
 		return nil
 	})
 }

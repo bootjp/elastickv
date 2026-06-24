@@ -187,6 +187,12 @@ type OpenConfig struct {
 	// has been observed yet, equivalent to "raft envelope hook
 	// off".
 	RaftCutoverIndex RaftCutoverIndex
+	// ColdStartObserver receives the cold-start snapshot-restore
+	// skip-gate lifecycle events (skipped / executed / fallback).
+	// nil disables metrics; the skip itself still runs. See
+	// docs/design/2026_06_02_idempotent_snapshot_restore.md §9 and
+	// internal/raftengine/cold_start.go for the contract.
+	ColdStartObserver raftengine.ColdStartObserver
 }
 
 type Engine struct {
@@ -549,7 +555,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
 		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
 		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
-		applied:          maxAppliedIndex(prepared.disk.LocalSnap),
+		applied:          coldStartApplied(prepared.disk),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
@@ -564,7 +570,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
-	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.appliedIndex.Store(coldStartApplied(prepared.disk))
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -729,6 +735,34 @@ func (e *Engine) Close() error {
 }
 
 func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.propose(ctx, data)
+}
+
+// ProposeAdmin drives a control-plane proposal that must remain
+// admissible across the §7.1 quiescence barrier — currently the
+// EnableRaftEnvelope cutover entry and ConfChange-time
+// RegisterEncryptionWriter proposals (see raftengine.Proposer's
+// contract for the full exempt set).
+//
+// The barrier exemption is the SOLE divergence from Propose: a
+// higher-layer wrap (kv.wrappedProposer) applies its wrap closure
+// to both methods identically, so admin entries landing above the
+// raft-envelope cutover still carry the AEAD envelope the §6.3
+// strict-`>` apply hook expects. Only the cutover marker itself is
+// cleartext, and it bypasses the wrap layer at the call site
+// (raw engine reference), not at the method level.
+//
+// In the current build ProposeAdmin is operationally identical to
+// Propose; Stage 6E-2d adds the barrier check on Propose only.
+// The two methods are kept distinct from the outset so the
+// migration of call sites (this PR) lands ahead of the behaviour
+// change (6E-2d) — calling Propose from an exempt site today is
+// silently wrong tomorrow.
+func (e *Engine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.propose(ctx, data)
+}
+
+func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -1500,10 +1534,12 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 }
 
 // postDispatchReport delivers a dispatch failure to the event loop without
-// blocking the worker. If the channel is full (unlikely — the buffer is
-// sized to MaxInflightMsg), the report is dropped and logged; this is
-// acceptable because raft will retry on the next tick and we only need
-// eventual consistency between transport state and Progress state.
+// blocking the caller. Dispatch workers use it for transport failures, and the
+// event loop uses it for local queue drops before transport. If the channel is
+// full (unlikely — the buffer is sized to MaxInflightMsg), the report is
+// dropped and logged; this is acceptable because raft will retry on the next
+// tick and we only need eventual consistency between transport state and
+// Progress state.
 func (e *Engine) postDispatchReport(report dispatchReport) {
 	select {
 	case e.dispatchReportCh <- report:
@@ -1998,6 +2034,15 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 		if err != nil {
 			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.Metadata.Index)
 		}
+		// B3/follow-up: also call SetDurableAppliedIndex(tok.Index) here
+		// after Restore so peer-after-InstallSnapshot populates the meta
+		// key. The local-snapshot persist path already bumps the live
+		// store (engine.persistLocalSnapshotPayload), but the receiving
+		// node's restored store inherits the pre-bump value embedded in
+		// the snapshot artifact. Design Non-Goals §
+		// docs/design/2026_06_02_idempotent_snapshot_restore.md:71-74
+		// scopes this out of Branch 2; see PR #915 round-4/5 codex P2 on
+		// engine.go:4077 for the rationale.
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
 			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
 		}
@@ -2138,7 +2183,17 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 // lock-free atomic mirror in a single place. Called exclusively from
 // the Raft run loop, so no synchronization between the two writes is
 // required beyond the single-writer invariant.
+//
+// Advance-only: cold-start with EffectiveApplied > snapshot.Index
+// seeds e.applied with `have`, after which raft still delivers conf-
+// change entries from snapshot.Index+1..have whose applyConfChange*
+// path calls setApplied(entry.Index) with index < have. Allowing the
+// counter to walk backwards would break the e.appliedIndex.Load()
+// contract every other watcher depends on. Codex P1 #934.
 func (e *Engine) setApplied(index uint64) {
+	if index <= e.applied {
+		return
+	}
 	e.applied = index
 	e.appliedIndex.Store(index)
 }
@@ -2171,7 +2226,28 @@ func (e *Engine) setApplied(index uint64) {
 // (today's *fsmApplyResponse, returned by kv batch apply) do NOT
 // implement HaltApply and continue to advance setApplied.
 func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
-	response, err := e.applyNormalEntry(entry)
+	// Cold-start idempotency: when the skip gate fires with the FSM
+	// past snapshot.Metadata.Index (have > tok.Index), e.applied is
+	// seeded with `have`. Raft still delivers entries
+	// snapshot.Metadata.Index+1..commit including the [snap.Index+1,
+	// have] tail, which the FSM has already applied. Re-calling
+	// applyNormalEntry on a KV/MVCC entry would re-execute the
+	// transaction (OCC conflicts; HLC ceiling inversion). Drop the
+	// duplicate without touching the FSM. setApplied is NOT called -
+	// e.applied is already >= entry.Index. Codex P1 #934.
+	//
+	// Codex P1 #934 round 7: volatile-only entries (HLC lease, tag
+	// 0x02) carry effects that live purely in process memory
+	// (HLC.SetPhysicalCeiling). Their post-snapshot effect must be
+	// re-applied on cold start; otherwise ApplySnapshotHeader restores
+	// only the older snapshot-time ceiling and the next leader-issued
+	// timestamp can collide with persisted commit_ts values stamped
+	// under the lost lease. applyNormalEntry routes those duplicates
+	// to fsm.Apply (which is monotonic and idempotent for HLC leases)
+	// and returns (nil, nil) for data-mutating duplicates so we fall
+	// through to the "no setApplied advance, no resolveProposal" arm.
+	duplicate := entry.Index <= e.applied
+	response, err := e.applyNormalEntry(entry, duplicate)
 	if err != nil {
 		return err
 	}
@@ -2182,6 +2258,13 @@ func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
 				slog.Any("err", herr))
 			return errors.Wrap(herr, "raftengine/etcd: FSM-requested apply halt")
 		}
+	}
+	if duplicate {
+		// Volatile-only entries replayed for their in-memory effect
+		// (e.applied already past) or data-mutating duplicates
+		// dropped inside applyNormalEntry — either way the engine's
+		// applied pointer and pending-proposal map stay untouched.
+		return nil
 	}
 	e.setApplied(entry.Index)
 	e.resolveProposal(entry.Index, entry.Data, response)
@@ -2223,7 +2306,26 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	return nil
 }
 
-func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
+// applyNormalEntry decodes the raft envelope, optionally unwraps the
+// cipher payload, and dispatches to fsm.Apply.
+//
+// dropIfNonVolatile is the cold-start idempotency seam. When the skip
+// gate fires the engine still receives WAL committed-tail entries past
+// snapshot.Metadata.Index; data-mutating duplicates must NOT call
+// fsm.Apply (OCC re-validation, ceiling regression, sidecar drift) but
+// volatile-only entries (HLC lease) MUST still call fsm.Apply for
+// their in-memory monotonic effect. The classifier inspects the
+// cleartext payload AFTER raft envelope decode + decryption — the
+// raftEncodeHLCLease tag (0x02) is only visible there in the
+// post-cutover path, so the cleartext-side decision is the only
+// correct one. Codex P1 #934 round 7.
+//
+// dropIfNonVolatile=false preserves the original semantics: every
+// decodable entry is handed to fsm.Apply. dropIfNonVolatile=true
+// gates the fsm.Apply call on VolatileEntryClassifier.IsVolatileOnlyPayload
+// and returns (nil, nil) for data-mutating duplicates so the caller's
+// "no setApplied advance" arm fires unchanged.
+func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (any, error) {
 	if len(entry.Data) == 0 {
 		return nil, nil
 	}
@@ -2289,10 +2391,42 @@ func (e *Engine) applyNormalEntry(entry raftpb.Entry) (any, error) {
 		}
 		payload = plain
 	}
-	if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
-		aware.SetApplyIndex(entry.Index)
+	if dropIfNonVolatile && !e.isVolatilePayload(payload) {
+		return nil, nil
+	}
+	// SetApplyIndex is suppressed on the duplicate-replay path
+	// because pendingApplyIdx is documented as "the entry index the
+	// engine is about to apply". On a volatile replay entry.Index is
+	// BELOW e.applied; writing it would feed a stale index to any
+	// future durability sink (encryption sidecar.RaftAppliedIndex,
+	// ApplyMutationsRaftAt's metaAppliedIndex bundle). Today's only
+	// volatile entry (HLC lease) does not read pendingApplyIdx so
+	// this is a no-op, but it future-proofs the seam against a new
+	// volatile entry type that also persists. Claude #934 round 7
+	// finding R7-F1.
+	if !dropIfNonVolatile {
+		if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
+			aware.SetApplyIndex(entry.Index)
+		}
 	}
 	return e.fsm.Apply(payload), nil
+}
+
+// isVolatilePayload is the cold-start duplicate guard's cleartext
+// classifier. Only volatile-only payloads (HLC lease, tag 0x02) may
+// be re-applied past e.applied; data-mutating entries return false so
+// the caller drops them. The check runs AFTER raft envelope
+// decryption because post-cutover the cleartext payload's leading
+// byte is the only reliable carrier of the entry-kind tag. FSMs that
+// do not implement VolatileEntryClassifier default to false
+// (drop-all), preserving the pre-PR semantics for engines that
+// haven't opted in. Codex P1 #934 round 7.
+func (e *Engine) isVolatilePayload(payload []byte) bool {
+	classifier, ok := e.fsm.(raftengine.VolatileEntryClassifier)
+	if !ok {
+		return false
+	}
+	return classifier.IsVolatileOnlyPayload(payload)
 }
 
 func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) {
@@ -2676,9 +2810,37 @@ func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, 
 	}
 }
 
+// bumpDurableAppliedIndexBeforeSave pins the FSM's durable applied
+// index to `index` BEFORE the engine calls persist.SaveSnap, so a
+// successful snapshot persist always implies LastAppliedIndex >=
+// snap.Metadata.Index — closes the HLC-lease-only / encryption-only
+// fallback (PR #910 design §6).
+//
+// FSMs that do not expose raftengine.AppliedIndexWriter silently
+// no-op; the skip optimisation falls back to full restore for them
+// (legacy test fakes, in-memory backends). pebble.Sync is forced on
+// the writer side regardless of ELASTICKV_FSM_SYNC_MODE — once
+// persist.SaveSnap returns, WAL compaction discards every log entry
+// at or before snap.Metadata.Index, so there is no source to replay
+// the meta key bump from.
+//
+// Used by BOTH snapshot persist sites: persistCreatedSnapshot (this
+// file) and e.persistLocalSnapshotPayload (the steady-state
+// SnapshotCount-triggered hot path).
+func (e *Engine) bumpDurableAppliedIndexBeforeSave(index uint64) error {
+	w, ok := e.fsm.(raftengine.AppliedIndexWriter)
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(w.SetDurableAppliedIndex(index))
+}
+
 func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snap) || e.persist == nil {
 		return nil
+	}
+	if err := e.bumpDurableAppliedIndexBeforeSave(snap.Metadata.Index); err != nil {
+		return err
 	}
 	if err := e.persist.SaveSnap(snap); err != nil {
 		return errors.WithStack(err)
@@ -3913,6 +4075,14 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 			"drop_count", count,
 		)
 	}
+	e.reportDroppedDispatch(msg)
+}
+
+func (e *Engine) reportDroppedDispatch(msg raftpb.Message) {
+	if e.dispatchReportCh == nil {
+		return
+	}
+	e.postDispatchReport(dispatchReport{to: msg.To, msgType: msg.Type})
 }
 
 // dispatchErrorCodeOf extracts the grpc status code name from err, or
@@ -4044,26 +4214,46 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 		return nil
 	}
 
+	if err := e.bumpDurableAppliedIndexBeforeSave(index); err != nil {
+		return err
+	}
+
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
+	return e.handleLocalSnapshotPersistResult(err)
+}
+
+// handleLocalSnapshotPersistResult collapses the post-SaveSnap error
+// switch into a single helper so persistLocalSnapshotPayload stays
+// under the cyclomatic-complexity budget. The three raft-side
+// 'snapshot already moved on' cases (ErrCompacted / ErrUnavailable /
+// ErrSnapOutOfDate) are all treated as no-ops; only the success path
+// runs the disk-side purge.
+func (e *Engine) handleLocalSnapshotPersistResult(err error) error {
 	switch {
 	case err == nil:
-		snapDir := filepath.Join(e.dataDir, snapDirName)
-		if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
-			slog.Warn("failed to purge old snap files", "error", purgeErr)
-		}
-		walDir := filepath.Join(e.dataDir, walDirName)
-		if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
-			slog.Warn("failed to purge old wal files", "error", purgeErr)
-		}
+		e.purgeAfterLocalSnapshot()
 		return nil
-	case errors.Is(err, etcdraft.ErrCompacted):
-		return nil
-	case errors.Is(err, etcdraft.ErrUnavailable):
-		return nil
-	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
+	case errors.Is(err, etcdraft.ErrCompacted),
+		errors.Is(err, etcdraft.ErrUnavailable),
+		errors.Is(err, etcdraft.ErrSnapOutOfDate):
 		return nil
 	default:
 		return err
+	}
+}
+
+// purgeAfterLocalSnapshot runs the disk-side cleanup that follows a
+// successful local-snapshot persist: trim old .snap/.fsm files and
+// rotate ageing WAL segments. Both calls log on error but do not
+// propagate — failing to purge is non-fatal.
+func (e *Engine) purgeAfterLocalSnapshot() {
+	snapDir := filepath.Join(e.dataDir, snapDirName)
+	if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
+		slog.Warn("failed to purge old snap files", "error", purgeErr)
+	}
+	walDir := filepath.Join(e.dataDir, walDirName)
+	if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
+		slog.Warn("failed to purge old wal files", "error", purgeErr)
 	}
 }
 

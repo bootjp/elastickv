@@ -92,7 +92,77 @@ type Applier struct {
 	// constructor installs a private instance so single-applier
 	// callers and tests keep working unchanged.
 	stateCache *StateCache
+	// localEpoch is the §4.1 storage write-path local_epoch this
+	// process load pinned its nonce factory to at startup (the value
+	// `encryptionWriteWiring.epoch` holds). It is read ONLY by the
+	// Stage 7b' rotation-case applyRotateDEK path when writing
+	// `Keys[newDEK].LocalEpoch` for storage rotations — recording the
+	// LOCAL node's highest-emitted local_epoch under the new DEK so the
+	// §9.1 startup guard on next restart sees a monotone advance rather
+	// than the cluster-wide brick scenario described in 7b' §1. Raft
+	// rotations (PurposeRaft) continue to write `LocalEpoch: 0` (until
+	// raft envelope support lands with its own per-purpose epoch
+	// plumbing) per 7b' §3.1.1.
+	//
+	// Zero (the default when WithLocalEpoch is omitted) is correct for:
+	// (a) the pre-bootstrap process load — no writes have been emitted
+	//     under any DEK yet, so the sidecar's `0` accurately records this
+	//     node's highest-emitted local_epoch (7b' §3.1.2);
+	// (b) FSM-internal test harnesses that construct an Applier without
+	//     write-path state — they have no nonce factory and accept the
+	//     zero value as the "preserve today's behavior" fallback.
+	localEpoch uint16
+	// raftCutoverWrapInstaller is the Stage 6E-2e-1 hook that
+	// applyEnableRaftEnvelope invokes on every replica's local FSM
+	// apply of the cutover marker. Production wiring (6E-2e-3:
+	// main.go) supplies a closure that publishes the wrap closure to
+	// every participating kv.ShardGroup via SetRaftPayloadWrap, so a
+	// follower that becomes leader post-cutover already has wrap
+	// active without needing the EnableRaftEnvelope handler to
+	// re-run (closes the BLOCKER (b) leader-failover hazard from
+	// codex P1 round-3 on PR933).
+	//
+	// Called from the fresh-success branch AND the already-active
+	// branch (FSM replay safety: a snapshot that excludes the
+	// cutover entry replays it on restart; idempotent install is
+	// expected). NOT called from the stale-DEKID benign-no-op
+	// branch — that branch leaves RaftEnvelopeCutoverIndex at 0 and
+	// the cutover has not taken effect.
+	//
+	// Errors from the installer halt apply: the sidecar already
+	// records the cutover but the in-process wrap is missing, so a
+	// subsequent USER proposal on this node would land cleartext at
+	// `index > cutoverIdx` and brick the §6.3 strict-`>` unwrap
+	// hook cluster-wide. Halting forces the operator to investigate
+	// (typically a misconfigured cipher) before any further apply
+	// runs.
+	//
+	// nil disables the hook — preserves the pre-6E-2e-1 test
+	// surface (no behavior change for callers that don't opt in).
+	raftCutoverWrapInstaller RaftCutoverWrapInstaller
 }
+
+// RaftCutoverWrapInstaller is the Stage 6E-2e-1 callback the Applier
+// invokes on every replica's local FSM apply of the
+// EnableRaftEnvelope cutover marker to publish the §4.2 raft envelope
+// wrap closure on this node.
+//
+// Contract:
+//   - cutoverIdx is the Raft index recorded in the sidecar
+//     (sc.RaftEnvelopeCutoverIndex). Fresh-success apply passes the
+//     just-stamped value; already-active apply passes the previously-
+//     recorded value (idempotent re-install).
+//   - activeRaftDEKID is the sidecar.Active.Raft value at apply time.
+//     The installer constructs the wrap closure using this DEK so the
+//     §6.3 strict-`>` apply hook on every replica unwraps with the
+//     same key.
+//   - Returns nil on success or an error that halts apply (see the
+//     raftCutoverWrapInstaller field comment for the rationale).
+//
+// The installer MUST be idempotent: replayed FSM apply, snapshot
+// restore, and the explicit EnableRaftEnvelope handler's InstallWrap
+// call all converge on the same wrap closure publication.
+type RaftCutoverWrapInstaller func(cutoverIdx uint64, activeRaftDEKID uint32) error
 
 // StateCache mirrors the sidecar fields the storage hot path needs
 // to consult on every Put. Two requirements drive its existence:
@@ -133,6 +203,20 @@ type StateCache struct {
 	//     §7.1 Phase 1; rotate-dek under the active envelope keeps
 	//     it true).
 	storageEnvelopeActive atomic.Bool
+	// registeredStorageDEKID is the §4.1 writer-registry DEK id this
+	// process has confirmed its own registration for (0 = none). It is
+	// NOT mirrored from the sidecar — it tracks a per-process-load
+	// fact (this load's writer registration committed) rather than
+	// durable cluster state. Stage 7a-2's direct-write gate consults
+	// it via Registered(): a self-originated encrypted write is
+	// refused until this load's registration is confirmed for the
+	// currently-active storage DEK. Set by MarkRegistered from 7a's
+	// registration paths (barrier-close and the already-registered
+	// startup branch). A single uint32 suffices because exactly one
+	// storage DEK is active at a time; 7b's rotate-dek re-points
+	// activeStorageDEKID and re-registers, which Registered()'s
+	// equality check handles without a reset.
+	registeredStorageDEKID atomic.Uint32
 }
 
 // NewStateCache returns a zero-initialised StateCache. The
@@ -185,6 +269,50 @@ func (c *StateCache) StorageEnvelopeActive() bool {
 		return false
 	}
 	return c.storageEnvelopeActive.Load()
+}
+
+// MarkRegistered records that this process load's §4.1 writer
+// registration has committed for storage DEK dekID. Stage 7a's
+// registration paths call it once their barrier closes (or in the
+// already-registered startup branch). Idempotent; a zero dekID is a
+// no-op so a not-bootstrapped caller cannot accidentally mark the
+// "no DEK" sentinel as registered.
+func (c *StateCache) MarkRegistered(dekID uint32) {
+	if c == nil || dekID == 0 {
+		return
+	}
+	c.registeredStorageDEKID.Store(dekID)
+}
+
+// Registered reports whether this process load has confirmed its §4.1
+// writer registration for the currently-active storage DEK. It is the
+// predicate Stage 7a-2's WithStorageRegistrationGate consults on the
+// direct write path: a self-originated encrypted write is refused
+// (ErrWriterNotRegistered) until Registered() is true.
+//
+// It is deliberately per-DEK and fail-closed (design §2.3 forbids any
+// fail-OPEN fallback): a node that has not registered for the active DEK
+// — including a freshly rotated DEK it has not yet re-registered under
+// (7b) — is gated. The runtime cases where a node legitimately needs to
+// (re)register before its first encrypted direct write (Phase-0 boot then
+// runtime EnableStorageEnvelope; non-proposer node after a runtime
+// RotateDEK) are the deferred runtime-registration follow-on; until it
+// lands they fail closed, which is the safe posture. No real runtime
+// direct-write caller exists today — the only direct ApplyMutations path
+// is the startup catalog bootstrap Save, which is covered by
+// retryUntilRegistered + the already-registered MarkRegistered seed.
+//
+// Lock-free: two atomic loads. Returns false when there is no active
+// storage DEK (id == 0) so a pre-bootstrap process never claims to be
+// registered; once a DEK is active, returns true only when this load
+// has marked that exact id (so 7b's rotate-dek to a new id re-arms
+// the gate until the post-rotation registration marks the new id).
+func (c *StateCache) Registered() bool {
+	if c == nil {
+		return false
+	}
+	id := c.activeStorageDEKID.Load()
+	return id != 0 && c.registeredStorageDEKID.Load() == id
 }
 
 // KEKUnwrapper is the abstraction the Applier uses to recover
@@ -256,6 +384,34 @@ func WithNowFunc(now func() time.Time) ApplierOption {
 // and pre-multi-shard callers rely on.
 func WithStateCache(c *StateCache) ApplierOption {
 	return func(a *Applier) { a.stateCache = c }
+}
+
+// WithLocalEpoch installs the §4.1 storage write-path `local_epoch`
+// this process load pinned its nonce factory to. Threaded through
+// from `encryptionWriteWiring.epoch` so Stage 7b' rotation applies
+// can record THIS node's highest-emitted local_epoch under the new
+// DEK (see the `localEpoch` field doc on Applier and 7b' §3.1).
+//
+// A static `uint16` rather than a `func() uint16` provider is
+// deliberate (7b' §3.1): `BumpLocalEpoch` only runs at process start,
+// so there is no runtime epoch-bump path that would require late
+// binding. The option is omitted by FSM-internal test harnesses; the
+// zero value preserves today's `LocalEpoch: 0` behaviour for them.
+func WithLocalEpoch(epoch uint16) ApplierOption {
+	return func(a *Applier) { a.localEpoch = epoch }
+}
+
+// WithRaftCutoverWrapInstaller installs the Stage 6E-2e-1 hook the
+// Applier invokes from applyEnableRaftEnvelope to publish the wrap
+// closure on this node. nil is a no-op (the option is omitted on the
+// test surface and on the pre-6E-2e-1 production posture); a
+// non-nil installer is invoked on both fresh-success and
+// already-active apply paths but NOT on the stale-DEK no-op branch.
+//
+// See the RaftCutoverWrapInstaller type comment for the contract;
+// production wiring lives in main.go (6E-2e-3).
+func WithRaftCutoverWrapInstaller(installer RaftCutoverWrapInstaller) ApplierOption {
+	return func(a *Applier) { a.raftCutoverWrapInstaller = installer }
 }
 
 // NewApplier wires an Applier against the supplied registry store
@@ -733,11 +889,17 @@ func advanceRaftAppliedIndex(sc *Sidecar, raftIdx uint64) {
 //   - RotateSubEnableStorageEnvelope — one-shot storage-layer
 //     cutover (Stage 6D-4). Flips StorageEnvelopeActive and records
 //     StorageEnvelopeCutoverIndex inside a single sidecar fsync.
+//   - RotateSubEnableRaftEnvelope — one-shot raft-layer cutover
+//     (Stage 6E-1). Records RaftEnvelopeCutoverIndex inside a
+//     single sidecar fsync. The engine apply-hook installed by
+//     6E-2 dispatches `entry.Index > sidecar.RaftEnvelopeCutoverIndex`
+//     through the unwrap path; strict `>` makes the cutover entry
+//     itself (at index == cutover) flow through unwrap-free, which
+//     is the chicken/egg bootstrap.
 //
-// Other sub-tags (rewrap-deks, retire-dek, enable-raft-envelope)
-// land in later stages and return ErrEncryptionApply so the
-// HaltApply seam fires on an unrecognised sub-tag rather than
-// silently advancing setApplied.
+// Other sub-tags (rewrap-deks, retire-dek) land in later stages
+// and return ErrEncryptionApply so the HaltApply seam fires on an
+// unrecognised sub-tag rather than silently advancing setApplied.
 //
 // Same WithKEK / WithKeystore / WithSidecarPath trio requirement
 // as ApplyBootstrap; partial wiring returns ErrKEKNotConfigured
@@ -751,6 +913,8 @@ func (a *Applier) ApplyRotation(raftIdx uint64, p fsmwire.RotationPayload) error
 		return a.applyRotateDEK(raftIdx, p)
 	case fsmwire.RotateSubEnableStorageEnvelope:
 		return a.applyEnableStorageEnvelope(raftIdx, p)
+	case fsmwire.RotateSubEnableRaftEnvelope:
+		return a.applyEnableRaftEnvelope(raftIdx, p)
 	default:
 		return errors.Wrapf(ErrEncryptionApply,
 			"applier: rotation sub_tag %#x not recognised", p.SubTag)
@@ -954,6 +1118,212 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	return nil
 }
 
+// validateEnableRaftEnvelopePayload enforces the Stage 6E-1
+// payload-shape constraints that do NOT require sidecar state
+// (purpose, empty-Wrapped, proposer-DEK pinning). The shape
+// mirrors validateEnableStorageEnvelopePayload but targets the
+// raft slot:
+//
+//   - Purpose MUST be PurposeRaft
+//   - Wrapped MUST be empty (length-based check, NOT == nil; the
+//     wire decoder materialises zero-length payloads as
+//     allocated empty slices)
+//   - ProposerRegistration.DEKID MUST equal payload DEKID
+//
+// Sidecar-derived constraints (#3 stale DEKID, #4 idempotency)
+// live in the caller so the no-op vs. fresh-success branches
+// can read the sidecar exactly once.
+func validateEnableRaftEnvelopePayload(p fsmwire.RotationPayload) error {
+	if p.Purpose != fsmwire.PurposeRaft {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-raft-envelope must carry Purpose=PurposeRaft, got %#x", byte(p.Purpose))
+	}
+	if len(p.Wrapped) != 0 {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-raft-envelope must carry empty Wrapped, got %d bytes", len(p.Wrapped))
+	}
+	if p.ProposerRegistration.DEKID != p.DEKID {
+		return errors.Wrapf(ErrEncryptionApply,
+			"applier: enable-raft-envelope proposer_registration.dek_id=%d does not match rotation dek_id=%d",
+			p.ProposerRegistration.DEKID, p.DEKID)
+	}
+	return nil
+}
+
+// applyEnableRaftEnvelope handles the RotateSubEnableRaftEnvelope
+// variant (Stage 6E-1 §3.1): the one-shot raft-layer cutover.
+// Structural mirror of applyEnableStorageEnvelope; the differences
+// from the storage variant are:
+//
+//   - Compares DEKID against sidecar.Active.Raft (not .Storage).
+//   - Records the cutover via sidecar.RaftEnvelopeCutoverIndex (a
+//     uint64 index — non-zero means "Phase-2 active"), as opposed
+//     to a separate bool flag. The same field doubles as the
+//     idempotency token for replay (constraint #4).
+//   - The proposer-registration row registers against the active
+//     raft DEK (PurposeRaft), not the storage DEK. The §4.1
+//     writer-registry layout is per-(DEK_id, NodeID) so storage
+//     and raft registrations are independent rows.
+//
+// Outcomes and FSM-level treatment match the storage variant.
+// The CHECK ORDER differs from the storage variant though
+// (codex P1 round-1 on PR944): the raft path tests
+// RaftEnvelopeCutoverIndex != 0 BEFORE the stale-DEK check so
+// FSM replay of the original cutover marker after a later
+// RotateDEK lands on the already-active branch (which republishes
+// the wrap closure via raftCutoverWrapInstaller) rather than the
+// stale-DEK no-op (which does NOT install). The storage variant
+// has no installer hook so the order swap is unnecessary there.
+//
+//   - Malformed payload — halt-apply via ErrEncryptionApply.
+//   - Already active (duplicate cutover entry, OR FSM replay of
+//     the original marker after RotateDEK advanced Active.Raft) —
+//     idempotent; preserve original RaftEnvelopeCutoverIndex,
+//     advance RaftAppliedIndex only, invoke installer with
+//     sc.Active.Raft so the wrap is keyed to the current DEK on
+//     every replica.
+//   - Stale DEKID (RotateDEK raced between propose and apply AND
+//     RaftEnvelopeCutoverIndex == 0, i.e. cutover never took
+//     effect) — benign no-op, advance RaftAppliedIndex only.
+//     Installer is NOT invoked: no cutover took effect, so
+//     publishing a wrap closure would be incorrect.
+//   - Fresh success — register proposer FIRST, then set
+//     RaftEnvelopeCutoverIndex and advance RaftAppliedIndex
+//     inside one WriteSidecar fsync. The registration-before-
+//     sidecar ordering matches the storage variant's
+//     crash-recovery invariant (§4.1 case 2-idempotent re-runs
+//     are safe; the sidecar flip is the last observable
+//     side-effect). Installer is invoked with sc.Active.Raft
+//     after the sidecar write completes.
+//
+// Stage 6E-1 deliberately does NOT activate the §6.3 engine
+// apply-hook unwrap or the coordinator wrap-on-propose switch
+// — those land atomically in 6E-2. With only 6E-1 deployed, the
+// sidecar cutover advances on apply but no entry is wrapped or
+// unwrapped, so the apply is operator-inert (matches the design
+// doc's "no behavior change" guarantee for 6E-1).
+func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayload) error {
+	// Fail-closed: RaftEnvelopeCutoverIndex != 0 is the sole
+	// "Phase-2 active" sentinel for the raft variant (storage
+	// variant uses a separate bool). A raftIdx of 0 — the "no
+	// index supplied" sentinel from the index-aware apply seam —
+	// would let the fresh-success branch register the proposer
+	// while leaving RaftEnvelopeCutoverIndex at 0, so the cutover
+	// would silently fail to activate AND a replay would re-enter
+	// the fresh-success branch (the already-active short-circuit
+	// only triggers on != 0). Reject before any sidecar mutation.
+	if raftIdx == 0 {
+		return errors.Wrap(ErrEncryptionApply,
+			"applier: enable-raft-envelope requires a non-zero raft index")
+	}
+	if err := validateEnableRaftEnvelopePayload(p); err != nil {
+		return err
+	}
+	sc, err := ReadSidecar(a.sidecarPath)
+	if err != nil {
+		return errors.Wrap(err, "applier: read sidecar for enable-raft-envelope")
+	}
+	// Stage 6E-1 constraint #4 (idempotency) — ordered BEFORE the
+	// stale-DEK check so an FSM replay of the original cutover
+	// marker after a successful cutover + later RotateDEK reaches
+	// the already-active branch and republishes the wrap. With the
+	// reverse order, a replayed payload whose p.DEKID predates the
+	// rotation would be treated as a stale-DEK no-op, the wrap
+	// would never be installed in this process, and a freshly-
+	// elected leader on this node would admit cleartext writes
+	// above the cutover index (codex P1 round-1 on PR944).
+	//
+	// The already-active branch preserves the original
+	// RaftEnvelopeCutoverIndex; only RaftAppliedIndex advances so
+	// the duplicate entry is not replayed again. Non-zero
+	// RaftEnvelopeCutoverIndex IS the "already-active" signal (no
+	// separate bool flag).
+	if sc.RaftEnvelopeCutoverIndex != 0 {
+		advanceRaftAppliedIndex(sc, raftIdx)
+		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+			return errors.Wrap(err, "applier: write sidecar for already-active raft-cutover no-op")
+		}
+		// Installer takes the CURRENT sc.Active.Raft, NOT the
+		// replayed p.DEKID — the wrap closure must key to the
+		// active DEK on this node so the §6.3 strict-`>` hook
+		// unwraps with the same key on every replica (gemini
+		// medium #1 on PR944).
+		return a.invokeRaftCutoverWrapInstaller(sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, "already-active replay")
+	}
+	// Stage 6E-1 constraint #3 — DEKID stale at apply (RotateDEK
+	// raced between propose and apply, AND the cutover never
+	// took effect — RaftEnvelopeCutoverIndex==0 is the gate above
+	// that distinguishes the genuine race from a replay). Benign
+	// no-op: consume the entry without halting and without
+	// flipping the cutover field.
+	if p.DEKID != sc.Active.Raft {
+		advanceRaftAppliedIndex(sc, raftIdx)
+		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+			return errors.Wrap(err, "applier: write sidecar for stale-dekid raft-cutover no-op")
+		}
+		return nil
+	}
+	// Fresh successful apply. Crash-recovery ordering follows
+	// the storage variant: ApplyRegistration runs BEFORE
+	// WriteSidecar so the cutover sidecar write is the last
+	// observable side effect. If the process crashes between the
+	// registration insert and the sidecar write, on restart the
+	// sidecar is still pre-cutover (RaftEnvelopeCutoverIndex ==
+	// 0), FSM replay re-enters this branch, ApplyRegistration
+	// re-runs and hits §4.1 case 2-idempotent (no-op), then
+	// WriteSidecar lands cleanly.
+	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
+		return errors.Wrap(err, "applier: raft-cutover proposer-registration insert")
+	}
+	sc.RaftEnvelopeCutoverIndex = raftIdx
+	advanceRaftAppliedIndex(sc, raftIdx)
+	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
+		return errors.Wrap(err, "applier: write sidecar for raft cutover")
+	}
+	a.stateCache.RefreshFromSidecar(sc)
+	// Stage 6E-2e-1 BLOCKER (b) — publish the wrap closure on every
+	// replica's local FSM apply so a follower that becomes leader
+	// post-cutover already has wrap active without needing the
+	// EnableRaftEnvelope handler to re-run. Without this hook, the
+	// per-leader InstallWrap call in adapter/encryption_admin.go's
+	// runRaftEnvelopeCutoverBarrier is the only path that installs
+	// the wrap — a leader failover between cutover commit and
+	// InstallWrap would let the new leader admit cleartext writes at
+	// indexes > cutoverIdx and brick the §6.3 strict-`>` apply hook
+	// cluster-wide (codex P1 round-3 on PR933).
+	//
+	// Ordered AFTER WriteSidecar so a crash between sidecar fsync
+	// and installer invocation is recoverable: process restart sees
+	// RaftEnvelopeCutoverIndex != 0 in the sidecar, the startup-time
+	// install (6E-2e-3 main.go wiring) republishes the wrap, and
+	// the next apply hits the already-active branch where the
+	// installer is idempotent. The reverse ordering (installer
+	// first) would leave the wrap published but the sidecar
+	// pre-cutover on crash, breaking the equality the §6.3 hook
+	// relies on cluster-wide.
+	// Installer takes sc.Active.Raft (which equals p.DEKID here
+	// because the stale-DEK check above passed) for documentation
+	// clarity and to match the already-active branch's argument
+	// shape (gemini medium #2 on PR944).
+	return a.invokeRaftCutoverWrapInstaller(raftIdx, sc.Active.Raft, "fresh-success apply")
+}
+
+// invokeRaftCutoverWrapInstaller is the Stage 6E-2e-1 dispatch
+// shared between fresh-success and already-active branches of
+// applyEnableRaftEnvelope. nil installer is a no-op (preserves the
+// pre-6E-2e-1 test surface); a non-nil installer's error is wrapped
+// with the branch tag so operator logs distinguish a failure on
+// fresh apply from one on FSM replay.
+func (a *Applier) invokeRaftCutoverWrapInstaller(cutoverIdx uint64, activeRaftDEKID uint32, branchTag string) error {
+	if a.raftCutoverWrapInstaller == nil {
+		return nil
+	}
+	if err := a.raftCutoverWrapInstaller(cutoverIdx, activeRaftDEKID); err != nil {
+		return errors.Wrapf(err, "applier: install raft-cutover wrap on %s", branchTag)
+	}
+	return nil
+}
+
 // writeRotationSidecar mutates the Active slot for the supplied
 // Purpose and inserts the new wrapped DEK into the keys[] map at
 // p.DEKID, then crash-durably writes. Existing keys[] entries are
@@ -971,18 +1341,29 @@ func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload
 	if err != nil {
 		return err
 	}
+	// Stage 7b' §3.1: write THIS node's pinned storage local_epoch
+	// into Keys[newDEK].LocalEpoch for storage rotations so the §9.1
+	// startup guard on next restart sees a monotone advance from
+	// prior.w.epoch → prior.w.epoch+1. Raft rotations continue to
+	// write `LocalEpoch: 0` exactly as before (raft envelope support
+	// isn't implemented yet; cross-applying the storage nonce
+	// factory's epoch to a raft DEK would corrupt the raft counter
+	// before raft envelope ships — 7b' §3.1.1).
+	var keyLocalEpoch uint16
 	switch p.Purpose {
 	case fsmwire.PurposeStorage:
 		sc.Active.Storage = p.DEKID
+		keyLocalEpoch = a.localEpoch
 	case fsmwire.PurposeRaft:
 		sc.Active.Raft = p.DEKID
+		keyLocalEpoch = 0
 	}
 	advanceRaftAppliedIndex(sc, raftIdx)
 	sc.Keys[strconv.FormatUint(uint64(p.DEKID), 10)] = SidecarKey{
 		Purpose:    purpose,
 		Wrapped:    append([]byte(nil), p.Wrapped...),
 		Created:    a.now().UTC().Format(time.RFC3339),
-		LocalEpoch: 0,
+		LocalEpoch: keyLocalEpoch,
 	}
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
 		return errors.Wrap(err, "applier: write sidecar for rotation")

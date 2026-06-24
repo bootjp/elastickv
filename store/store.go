@@ -128,6 +128,18 @@ type MVCCStore interface {
 	// LatestCommitTS returns the commit timestamp of the newest version.
 	// The boolean reports whether the key has any version.
 	LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error)
+	// CommittedVersionAt reports whether a committed version stamped
+	// EXACTLY commitTS exists for key. Unlike GetAt (newest version
+	// <= ts) this is an exact-timestamp existence check, used by the
+	// one-phase transaction idempotency probe to ask "did the previous
+	// attempt — which committed at this exact commit_ts — land?". Because
+	// commit timestamps are issued by the strictly-monotonic, unique HLC
+	// (Clock().Next()), a version at an exact commitTS on a given key can
+	// only have come from the transaction that was assigned that timestamp,
+	// so an exact hit unambiguously identifies that attempt. A tombstone
+	// counts as a landed version (the attempt committed a delete). See
+	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
+	CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error)
 	// ApplyMutations atomically validates and appends the provided mutations.
 	// It must return ErrWriteConflict if any mutation key or any read key has
 	// a newer commit timestamp than startTS. readKeys carries the transaction's
@@ -160,6 +172,15 @@ type MVCCStore interface {
 	// migrations, tests) must use ApplyMutations, which is always
 	// pebble.Sync and therefore safe without raft-log replay.
 	ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error
+	// ApplyMutationsRaftAt is ApplyMutationsRaft with the raft entry
+	// index threaded through. The leaf bundles metaAppliedIndex in the
+	// same pebble.Batch as the data mutation so a successful Apply
+	// implies LastAppliedIndex >= appliedIndex; the cold-start
+	// snapshot-restore skip gate uses this invariant (PR #910 / B2).
+	// appliedIndex==0 is treated as "no index, do not bump the meta
+	// key", matching ApplyMutationsRaft semantics for callers that have
+	// not yet been wired to the raftengine.ApplyIndexAware seam.
+	ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error
 	// DeletePrefixAt atomically deletes all visible (non-tombstone, non-expired)
 	// keys matching prefix at commitTS by writing tombstone versions. An empty
 	// prefix means "all keys". Keys matching excludePrefix are preserved.
@@ -169,6 +190,12 @@ type MVCCStore interface {
 	// DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt with
 	// the same durability contract as ApplyMutationsRaft.
 	DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error
+	// DeletePrefixAtRaftAt is DeletePrefixAtRaft with the raft entry
+	// index threaded through. handleDelPrefix builds an independent
+	// pebble.Batch separate from applyMutationsWithOpts; this overload
+	// bundles metaAppliedIndex in that batch so DEL_PREFIX entries
+	// also advance the meta key. PR #910 design §2 "why both leaves".
+	DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
 	// WriteConflictCountsByPrefix returns a snapshot of the MVCC

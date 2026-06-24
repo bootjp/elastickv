@@ -236,6 +236,13 @@ func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.
 	return nil
 }
 
+func (b *sqsQueuesBridge) AdminSetQueueAttributes(ctx context.Context, principal admin.AuthPrincipal, name string, attrs map[string]string) error {
+	if err := b.server.AdminSetQueueAttributes(ctx, convertAdminPrincipal(principal), name, attrs); err != nil {
+		return translateAdminQueuesError(err)
+	}
+	return nil
+}
+
 func (b *sqsQueuesBridge) AdminPeekQueue(ctx context.Context, principal admin.AuthPrincipal, name string, opts admin.PeekMessageOptions) (admin.PeekResult, error) {
 	rows, nextCursor, err := b.server.AdminPeekQueue(ctx, convertAdminPrincipal(principal), name, adapter.AdminPeekMessageOptions{
 		Limit:        opts.Limit,
@@ -1102,19 +1109,21 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 		return nil, errors.Wrap(err, "open embedded admin SPA")
 	}
 	server, err := admin.NewServer(admin.ServerDeps{
-		Signer:       signer,
-		Verifier:     verifier,
-		Credentials:  admin.MapCredentialStore(creds),
-		Roles:        adminCfg.RoleIndex(),
-		ClusterInfo:  cluster,
-		Tables:       tables,
-		Buckets:      buckets,
-		Queues:       queues,
-		Forwarder:    forwarder,
-		KeyViz:       keyvizSourceFromSampler(keyvizSampler),
-		KeyVizFanout: buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
-		StaticFS:     staticFS,
-		LeaderProbe:  leaderProbe,
+		Signer:              signer,
+		Verifier:            verifier,
+		Credentials:         admin.MapCredentialStore(creds),
+		Roles:               adminCfg.RoleIndex(),
+		ClusterInfo:         cluster,
+		Tables:              tables,
+		Buckets:             buckets,
+		Queues:              queues,
+		Forwarder:           forwarder,
+		KeyViz:              keyvizSourceFromSampler(keyvizSampler),
+		KeyVizFanout:        buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
+		KeyVizHotKeys:       keyvizHotKeysSourceFromSampler(keyvizSampler),
+		KeyVizHotKeysFanout: buildKeyVizHotKeysFanout(adminCfg.Listen, keyvizFanoutCfg),
+		StaticFS:            staticFS,
+		LeaderProbe:         leaderProbe,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
@@ -1253,6 +1262,21 @@ func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
 	return s
 }
 
+// keyvizHotKeysSourceFromSampler is the keyvizSourceFromSampler twin
+// for the per-cell hot-key drill-down handler. Returning an interface-nil
+// (not a typed-nil) when the sampler is disabled is again load-bearing:
+// the hot-keys handler's "keyviz disabled → 503" branch checks for
+// interface-nil, and a typed-nil *MemSampler stored as a non-nil
+// interface would route the request into MemSampler methods that
+// already nil-check internally — correct but masking the explicit
+// "feature off" signal we want the SPA to render.
+func keyvizHotKeysSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizHotKeysSource {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
 // buildKeyVizFanout assembles the Phase 2-C fan-out aggregator from
 // the operator-supplied flag values. selfListen is the local admin
 // listener address (used to filter the local node out of the peer
@@ -1285,6 +1309,33 @@ func buildKeyVizFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizF
 		f = f.WithTimeout(cfg.Timeout)
 	}
 	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.fanout")))
+}
+
+// buildKeyVizHotKeysFanout is the hot-keys companion of
+// buildKeyVizFanout: same peer-list reuse, same self-filter rule.
+// Returns nil when no peers remain after filtering (single-node
+// hot-keys behaviour preserved). Operators get the cluster-wide
+// drill-down for free by leaving --keyvizFanoutNodes set — no
+// separate flag, matching design §6.
+func buildKeyVizHotKeysFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizHotKeysFanout {
+	if len(cfg.Nodes) == 0 {
+		return nil
+	}
+	peers := make([]string, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		if isSelfFanoutNode(selfListen, n) {
+			continue
+		}
+		peers = append(peers, n)
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	f := admin.NewKeyVizHotKeysFanout(selfListen, peers)
+	if cfg.Timeout > 0 {
+		f = f.WithTimeout(cfg.Timeout)
+	}
+	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.hotkeys.fanout")))
 }
 
 // isSelfFanoutNode returns true when n names this node's own admin

@@ -58,7 +58,7 @@ func refuseHardLink(info os.FileInfo, path string) error {
 func openSidecarFile(path string) (*os.File, error) {
 	// Note: NO O_TRUNC here — we truncate after the link-count check.
 	const flag = os.O_WRONLY | os.O_CREATE | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
-	f, err := os.OpenFile(path, flag, 0o600) //nolint:gosec,mnd // path is composed from output-root + fixed file name; 0600 is the standard owner-only mode
+	f, err := os.OpenFile(path, flag, sidecarFileMode) //nolint:gosec // path is composed from output-root + fixed file name; sidecarFileMode is the standard owner-only mode used here and by the post-Truncate Chmod below
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, cockroachdberr.WithStack(cockroachdberr.Wrapf(err,
@@ -98,5 +98,21 @@ func openSidecarFile(path string) (*os.File, error) {
 		_ = f.Close()
 		return nil, cockroachdberr.WithStack(err)
 	}
+	// Enforce 0o600 on the descriptor. The flags-arg mode (0o600
+	// above) is applied by the kernel ONLY on file creation; if
+	// path already existed, its pre-existing perms are kept. An
+	// older encoder writing 0o644 would otherwise leave the
+	// sidecar's source path / cluster ID / SHA256 world-readable
+	// after re-encode (claude / codex P2 v31 observation on PR #904).
+	if err := f.Chmod(sidecarFileMode); err != nil {
+		_ = f.Close()
+		return nil, cockroachdberr.WithStack(err)
+	}
 	return f, nil
 }
+
+// sidecarFileMode is the file mode openSidecarFile enforces — owner
+// read/write only. Pulled into a named const so the truncate-then-
+// chmod step here matches the OpenFile flag-arg mode above; a future
+// edit that widens one must touch both.
+const sidecarFileMode os.FileMode = 0o600

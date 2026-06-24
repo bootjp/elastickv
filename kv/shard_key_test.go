@@ -47,3 +47,37 @@ func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	require.Equal(t, want, routeKey(gsiKey))
 	require.Equal(t, want, routeKey(txnLockKey(itemKey)))
 }
+
+// TestRouteKey_CollapsesDynamoGenerationsToSameTableRoute proves that two
+// DynamoDB item/GSI keys for the SAME table but DIFFERENT generations
+// normalize to the identical route key, so they always resolve to the same
+// shard group. dynamoRouteFromTablePrefixedKey splits at the first '|' after
+// the family prefix — that segment is the table name, and the generation
+// (which comes after it) is routing-invisible. This is the invariant that
+// makes a per-key lease check on the current generation also fence the
+// migration source generation (coderabbit #952 "lease pre-pass ignores
+// migration source generations" rebuttal): both generations live on one group.
+func TestRouteKey_CollapsesDynamoGenerationsToSameTableRoute(t *testing.T) {
+	t.Parallel()
+
+	tableSegment := base64.RawURLEncoding.EncodeToString([]byte("users"))
+	indexSegment := base64.RawURLEncoding.EncodeToString([]byte("status-index"))
+	want := dynamoRouteTableKey([]byte(tableSegment))
+
+	// Generation 7 is the migrating-to (current) generation; generation 6 is
+	// the migration source. The lease pre-pass fences gen 7's key; the read
+	// path also reads gen 6's key during migration.
+	currentItemKey := append([]byte(DynamoItemPrefix+tableSegment+"|7|"), []byte("pk\x00\x01")...)
+	sourceItemKey := append([]byte(DynamoItemPrefix+tableSegment+"|6|"), []byte("pk\x00\x01")...)
+	currentGSIKey := append([]byte(DynamoGSIPrefix+tableSegment+"|7|"+indexSegment+"|"), []byte("idx\x00\x01")...)
+	sourceGSIKey := append([]byte(DynamoGSIPrefix+tableSegment+"|6|"+indexSegment+"|"), []byte("idx\x00\x01")...)
+
+	require.Equal(t, want, routeKey(currentItemKey))
+	require.Equal(t, want, routeKey(sourceItemKey),
+		"migration source generation item key must route to the same table group as the current generation")
+	require.Equal(t, routeKey(currentItemKey), routeKey(sourceItemKey),
+		"current and source generation item keys must collapse to the same route key")
+	require.Equal(t, want, routeKey(currentGSIKey))
+	require.Equal(t, want, routeKey(sourceGSIKey),
+		"migration source generation GSI key must route to the same table group as the current generation")
+}

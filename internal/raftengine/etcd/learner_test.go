@@ -95,8 +95,9 @@ func TestPromoteLearnerSwapsRoleToVoter(t *testing.T) {
 
 	// Drive a write through so the learner has caught up to a known
 	// commit index before promotion.
-	_, err = leader.engine.Propose(context.Background(), []byte("warm"))
+	warmResult, err := leader.engine.Propose(context.Background(), []byte("warm"))
 	require.NoError(t, err)
+	require.NotZero(t, warmResult.CommitIndex)
 	require.Eventually(t, func() bool {
 		return len(nodes[1].fsm.Applied()) == 1
 	}, 5*time.Second, 20*time.Millisecond)
@@ -104,8 +105,19 @@ func TestPromoteLearnerSwapsRoleToVoter(t *testing.T) {
 	// We just propagated "warm" to the learner; use that committed
 	// commit index as the catch-up bar so promotion is gated on the
 	// learner having actually applied something.
-	leaderStatus := leader.engine.Status()
-	promoteIndex, err := leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, leaderStatus.CommitIndex, false)
+	var promoteIndex uint64
+	var promoteErr error
+	require.Eventually(t, func() bool {
+		promoteIndex, promoteErr = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, addIndex, warmResult.CommitIndex, false)
+		if promoteErr == nil {
+			return true
+		}
+		if errors.Is(promoteErr, errPromoteLearnerNotCaughtUp) {
+			return false
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+	err = promoteErr
 	require.NoError(t, err)
 	require.Greater(t, promoteIndex, addIndex)
 

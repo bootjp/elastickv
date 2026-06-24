@@ -299,6 +299,10 @@ export interface SqsQueueList {
   queues: string[];
 }
 
+export interface UpdateQueueAttributesRequest {
+  attributes: Record<string, string>;
+}
+
 // SqsPeekedAttribute mirrors AWS's typed MessageAttribute shape;
 // binary_value arrives base64-encoded.
 export interface SqsPeekedAttribute {
@@ -393,6 +397,48 @@ export interface KeyVizParams {
   from_unix_ms?: number;
   to_unix_ms?: number;
   rows?: number;
+}
+
+// Hot-key drill-down wire shape mirrors
+// internal/admin/keyviz_hotkeys_handler.go::hotKeyResponse. Counts are
+// scaled-to-true estimates; `approximate` and `error_bound` quantify
+// the Space-Saving sketch guarantee. Keys are base64-encoded raw bytes
+// (server preserves them as-is rather than coercing to UTF-8) — the
+// SPA renders them via the same decodePreview() helper the row detail
+// uses so binary keys come through as hex.
+export interface KeyVizHotKey {
+  key_b64: string;
+  count: number;
+}
+
+export interface KeyVizHotKeysResponse {
+  route_id: number;
+  // Omitted by the server when the route was registered with K=1
+  // (no sub-bucket axis); the SPA treats absence as "whole route".
+  sub_bucket?: number;
+  series: KeyVizSeries;
+  keys: KeyVizHotKey[];
+  approximate: boolean;
+  sample_rate: number;
+  sampled_n: number;
+  dropped_samples: number;
+  skipped_long_keys: number;
+  // `dropped > 0` OR `skipped_long_keys > 0` — see design §5. The
+  // server publishes this directly so older clients don't need to
+  // re-derive it (and stay consistent if the rule changes).
+  degraded: boolean;
+  error_bound: number;
+  snapshot_at: string;
+}
+
+export interface KeyVizHotKeysParams {
+  route_id: number;
+  // Sub-key-range bucket WITHIN the route (parallel to the matrix
+  // row's `#<n>` suffix). Omit for K=1 routes; the server validates
+  // the range and returns 400 invalid_query on out-of-range.
+  sub_bucket?: number;
+  series?: KeyVizSeries;
+  top?: number;
 }
 
 export const api = {
@@ -511,6 +557,11 @@ export const api = {
     apiFetch<SqsQueueSummary>(`/sqs/queues/${encodeURIComponent(name)}`, { signal }),
   deleteQueue: (name: string) =>
     apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  updateQueueAttributes: (name: string, req: UpdateQueueAttributesRequest) =>
+    apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}/attributes`, {
+      method: "PUT",
+      body: req as unknown as Json,
+    }),
   // Non-destructive peek of currently-visible messages. Server clamps
   // limit to [1, 100] and body_max_bytes to [256, 262144].
   peekQueue: (name: string, opts?: SqsPeekOptions, signal?: AbortSignal) =>
@@ -533,6 +584,22 @@ export const api = {
         from_unix_ms: params.from_unix_ms,
         to_unix_ms: params.to_unix_ms,
         rows: params.rows,
+      },
+      signal,
+    }),
+  // Per-cell hot-key Top-K drill-down. The matrix cell click in the
+  // SPA maps to (route_id, sub_bucket); the server returns the keys
+  // observed in the latest aggregator window. Historical drill-down
+  // (from_unix_ms / to_unix_ms) is supported by the handler but the
+  // SPA omits the window so the client never has to negotiate the
+  // out_of_snapshot_window 400 — the panel always reflects "now".
+  keyVizHotKeys: (params: KeyVizHotKeysParams, signal?: AbortSignal) =>
+    apiFetch<KeyVizHotKeysResponse>("/keyviz/hotkeys", {
+      query: {
+        route_id: params.route_id,
+        sub_bucket: params.sub_bucket,
+        series: params.series,
+        top: params.top,
       },
       signal,
     }),

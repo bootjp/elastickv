@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"testing"
@@ -28,10 +29,6 @@ import (
 //   - WRONGTYPE propagates as a script error
 
 const luaFastPathTTL = 80 * time.Millisecond
-
-func waitForLuaTTL() {
-	time.Sleep(luaFastPathTTL + 50*time.Millisecond)
-}
 
 func TestLua_HGET_FastPathHit(t *testing.T) {
 	t.Parallel()
@@ -117,13 +114,13 @@ func TestLua_HGET_TTLExpired(t *testing.T) {
 
 	require.NoError(t, rdb.HSet(ctx, "lua:h:ttl", "field", "v").Err())
 	require.NoError(t, rdb.PExpire(ctx, "lua:h:ttl", luaFastPathTTL).Err())
-	waitForLuaTTL()
-
-	_, err := rdb.Eval(ctx,
-		`return redis.call("HGET", KEYS[1], "field")`,
-		[]string{"lua:h:ttl"},
-	).Result()
-	require.ErrorIs(t, err, redis.Nil, "HGET on an expired hash from Lua must surface as nil")
+	eventuallyExpired(t, luaFastPathTTL, func() bool {
+		_, err := rdb.Eval(ctx,
+			`return redis.call("HGET", KEYS[1], "field")`,
+			[]string{"lua:h:ttl"},
+		).Result()
+		return errors.Is(err, redis.Nil)
+	}, "HGET on an expired hash from Lua must surface as nil")
 }
 
 func TestLua_HEXISTS_FastPathHit(t *testing.T) {
@@ -190,14 +187,13 @@ func TestLua_HEXISTS_TTLExpired(t *testing.T) {
 
 	require.NoError(t, rdb.HSet(ctx, "lua:he:ttl", "f", "v").Err())
 	require.NoError(t, rdb.PExpire(ctx, "lua:he:ttl", luaFastPathTTL).Err())
-	waitForLuaTTL()
-
-	got, err := rdb.Eval(ctx,
-		`return redis.call("HEXISTS", KEYS[1], "f")`,
-		[]string{"lua:he:ttl"},
-	).Result()
-	require.NoError(t, err)
-	require.Equal(t, int64(0), got)
+	eventuallyExpired(t, luaFastPathTTL, func() bool {
+		got, err := rdb.Eval(ctx,
+			`return redis.call("HEXISTS", KEYS[1], "f")`,
+			[]string{"lua:he:ttl"},
+		).Result()
+		return err == nil && got == int64(0)
+	}, "HEXISTS on an expired hash from Lua must return 0")
 }
 
 func TestLua_SISMEMBER_FastPathHit(t *testing.T) {
@@ -553,13 +549,13 @@ func TestLua_ZSCORE_TTLExpired(t *testing.T) {
 
 	require.NoError(t, rdb.ZAdd(ctx, "lua:z:ttl", redis.Z{Score: 1, Member: "m"}).Err())
 	require.NoError(t, rdb.PExpire(ctx, "lua:z:ttl", luaFastPathTTL).Err())
-	waitForLuaTTL()
-
-	_, err := rdb.Eval(ctx,
-		`return redis.call("ZSCORE", KEYS[1], "m")`,
-		[]string{"lua:z:ttl"},
-	).Result()
-	require.ErrorIs(t, err, redis.Nil)
+	eventuallyExpired(t, luaFastPathTTL, func() bool {
+		_, err := rdb.Eval(ctx,
+			`return redis.call("ZSCORE", KEYS[1], "m")`,
+			[]string{"lua:z:ttl"},
+		).Result()
+		return errors.Is(err, redis.Nil)
+	}, "ZSCORE on an expired zset from Lua must return nil")
 }
 
 func TestLua_ZSCORE_SetThenZScoreReturnsWrongType(t *testing.T) {
@@ -847,14 +843,14 @@ func TestLua_ZRANGEBYSCORE_TTLExpired(t *testing.T) {
 
 	require.NoError(t, rdb.ZAdd(ctx, "lua:zr:ttl", redis.Z{Score: 1, Member: "m"}).Err())
 	require.NoError(t, rdb.PExpire(ctx, "lua:zr:ttl", luaFastPathTTL).Err())
-	waitForLuaTTL()
-
-	got, err := rdb.Eval(ctx,
-		`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
-		[]string{"lua:zr:ttl"},
-	).Result()
-	require.NoError(t, err)
-	require.Equal(t, []any{}, got)
+	eventuallyExpired(t, luaFastPathTTL, func() bool {
+		got, err := rdb.Eval(ctx,
+			`return redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", "+inf")`,
+			[]string{"lua:zr:ttl"},
+		).Result()
+		gotArr, ok := got.([]any)
+		return err == nil && ok && len(gotArr) == 0
+	}, "ZRANGEBYSCORE on an expired zset from Lua must return an empty array")
 }
 
 // --- Correctness regressions surfaced by PR #570 review ---

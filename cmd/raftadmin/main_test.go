@@ -70,6 +70,14 @@ func TestExecuteCommandLeaderAndStateOutput(t *testing.T) {
 		require.NoError(t, executeCommand(context.Background(), client, "state", nil))
 	})
 	require.Equal(t, "state: LEADER\n", out)
+
+	out = captureStdout(t, func() {
+		require.NoError(t, executeCommand(context.Background(), client, "status", nil))
+	})
+	require.Contains(t, out, "state: LEADER")
+	require.Contains(t, out, "leader_id: \"n1\"")
+	require.Contains(t, out, "leader_address: \"127.0.0.1:50051\"")
+	require.Contains(t, out, "commit_index: 0")
 }
 
 func TestRPCTimeoutHonorsEnvSeconds(t *testing.T) {
@@ -90,11 +98,12 @@ func TestUsageErrorForCommand(t *testing.T) {
 	require.EqualError(t, usageError("add_learner"), "usage: raftadmin <addr> add_learner <id> <address> [previous_index]")
 	require.EqualError(t, usageError("promote_learner"), "usage: raftadmin <addr> promote_learner <id> [previous_index] [min_applied_index] [skip_min_applied_check]")
 	require.EqualError(t, usageError("remove_server"), "usage: raftadmin <addr> remove_server <id> [previous_index]")
+	require.EqualError(t, usageError("status"), "usage: raftadmin <addr> status")
 	require.EqualError(t, usageError("leadership_transfer_to_server"), "usage: raftadmin <addr> leadership_transfer_to_server <id> <address>")
 }
 
 func TestUsageErrorFallback(t *testing.T) {
-	want := "usage: raftadmin <addr> <leader|state|configuration|add_voter|add_learner|promote_learner|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
+	want := "usage: raftadmin <addr> <status|leader|state|configuration|add_voter|add_learner|promote_learner|remove_server|leadership_transfer|leadership_transfer_to_server> [args]"
 	require.EqualError(t, usageError(""), want)
 	require.EqualError(t, usageError("unknown"), want)
 }

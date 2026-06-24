@@ -32,6 +32,7 @@ Optional environment:
   SERVER_ENTRYPOINT
   RAFT_ENGINE
   RAFT_PORT
+  RAFT_BOOTSTRAP_MEMBERS
   REDIS_PORT
   DYNAMO_PORT
   RAFT_TO_REDIS_MAP
@@ -71,6 +72,7 @@ Optional environment:
     partitioned queues route to the default Raft group.
   HEALTH_TIMEOUT_SECONDS
   LEADERSHIP_TRANSFER_TIMEOUT_SECONDS
+  LEADERSHIP_TRANSFER_MAX_LOG_LAG
   LEADER_DISCOVERY_TIMEOUT_SECONDS
   ROLLING_DELAY_SECONDS
   SSH_CONNECT_TIMEOUT_SECONDS
@@ -140,6 +142,7 @@ Optional environment:
     attribute (for local plaintext development only).
 
 Notes:
+  - RAFT_BOOTSTRAP_MEMBERS is only forwarded when explicitly set.
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
   - If RAFT_TO_S3_MAP is unset, it is derived automatically from NODES,
@@ -193,8 +196,36 @@ SQS_CREDENTIALS_FILE="${SQS_CREDENTIALS_FILE:-}"
 # is bypassed (resolver==nil) and partitioned queues land on the
 # default group. Format documented at main.go::buildSQSFifoPartitionMap.
 SQS_FIFO_PARTITION_MAP="${SQS_FIFO_PARTITION_MAP:-}"
-HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-60}"
+# Wall-clock budget wait_for_grpc allows for the restarted container to
+# bind its gRPC port. Sized to cover the worst-case cold-start path:
+#   1. pebble.Open (fsm.db, ~seconds)
+#   2. loadWalState -> restoreSnapshotState -> pebbleStore.Restore
+#      (restorePebbleNativeAtomic + swapInTempDB), which rewrites the
+#      entire FSM into a sibling temp directory before renaming it into
+#      place. For multi-GB FSMs on production hardware this is the
+#      dominant cost — we observed ~46 s on a 4-shard SSD-backed node
+#      with a ~5 M-key FSM; multi-GB datasets scale linearly with disk
+#      throughput.
+#   3. WAL replay of the entries between the persisted snapshot index
+#      and the latest WAL entry (typically thousands, sub-second).
+#   4. Raft follower-ization + gRPC.Serve bind.
+# A 60 s ceiling guaranteed a timeout-induced restart loop on any node
+# whose FSM exceeded ~1 GiB. 300 s comfortably absorbs (1)+(2)+(3)+(4)
+# for the multi-GiB working sets we operate against today and still
+# fails fast on genuine crash-loop bugs (which never finish (1) or (2)).
+# Operators with smaller FSMs can shrink HEALTH_TIMEOUT_SECONDS via env.
+# Root-cause fix (skip restoreSnapshotState when the on-disk FSM is
+# already at >= snapshot.Metadata.Index): see PR #910 and
+# docs/design/2026_06_02_idempotent_snapshot_restore.md. Once that
+# lands and steady-state skip rates are observed in production, this
+# default can be tightened back down.
+HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"
 LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS:-30}"
+# Maximum leader-commit-to-candidate-last-log lag tolerated for a targeted
+# leadership transfer. A target that needs a snapshot, or is farther behind
+# than this, is likely to make etcd/raft abort the transfer before catch-up
+# completes. The default matches the engine's default snapshot cadence.
+LEADERSHIP_TRANSFER_MAX_LOG_LAG="${LEADERSHIP_TRANSFER_MAX_LOG_LAG:-10000}"
 LEADER_DISCOVERY_TIMEOUT_SECONDS="${LEADER_DISCOVERY_TIMEOUT_SECONDS:-30}"
 ROLLING_DELAY_SECONDS="${ROLLING_DELAY_SECONDS:-2}"
 SSH_CONNECT_TIMEOUT_SECONDS="${SSH_CONNECT_TIMEOUT_SECONDS:-10}"
@@ -220,6 +251,7 @@ LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS="${LEADERSHIP_TRANSFER_RETRY_BACKOFF_S
 NODES="${NODES:-}"
 SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
+RAFT_BOOTSTRAP_MEMBERS="${RAFT_BOOTSTRAP_MEMBERS:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
 RAFT_TO_SQS_MAP="${RAFT_TO_SQS_MAP:-}"
@@ -252,6 +284,20 @@ KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
 # hot sub-ranges, including for the unbounded single-route / tail case.
 KEYVIZ_KEY_BUCKETS_PER_ROUTE="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
 
+# KeyViz hot-key Top-K drill-down (Phase 2-A++). Master switch +
+# four tuning knobs. When KEYVIZ_HOT_KEYS_ENABLED != "true" the
+# build_keyviz_flags helper skips every --keyvizHotKeys* flag so
+# existing deploys see no behaviour change. Defaults match the
+# sampler-side constants in keyviz/sampler.go; empty values let
+# the daemon use those same defaults — keep them empty here so
+# bumping the Go-side default in a future release rolls out
+# without a separate env-file update.
+KEYVIZ_HOT_KEYS_ENABLED="${KEYVIZ_HOT_KEYS_ENABLED:-false}"
+KEYVIZ_HOT_KEYS_PER_ROUTE="${KEYVIZ_HOT_KEYS_PER_ROUTE:-}"
+KEYVIZ_HOT_KEYS_SAMPLE_RATE="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
+KEYVIZ_HOT_KEYS_QUEUE_SIZE="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
+KEYVIZ_HOT_KEYS_MAX_KEY_LEN="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
+
 # Validate the three boolean ADMIN_* flags must be the literal "true"
 # or "false" — they are forwarded to the remote shell unquoted (no
 # printf %q) for readability, which is only safe when the value is
@@ -259,7 +305,7 @@ KEYVIZ_KEY_BUCKETS_PER_ROUTE="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
 # who typed "True", "1", or a stray quote sees a script-level error
 # pointing at the variable name instead of an inscrutable failure
 # inside the SSH heredoc.
-for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED ENABLE_S3 ENABLE_SQS; do
+for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED KEYVIZ_HOT_KEYS_ENABLED ENABLE_S3 ENABLE_SQS; do
   case "${!_bool_var}" in
     true|false) ;;
     *)
@@ -607,6 +653,7 @@ update_one_node() {
       SQS_FIFO_PARTITION_MAP="$SQS_FIFO_PARTITION_MAP_Q" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
+      LEADERSHIP_TRANSFER_MAX_LOG_LAG="$LEADERSHIP_TRANSFER_MAX_LOG_LAG" \
       LEADERSHIP_TRANSFER_RETRY_ATTEMPTS="$LEADERSHIP_TRANSFER_RETRY_ATTEMPTS" \
       LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS="$LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS" \
       LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
@@ -616,6 +663,7 @@ update_one_node() {
       NODE_HOST="$node_host" \
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
+      RAFT_BOOTSTRAP_MEMBERS="$RAFT_BOOTSTRAP_MEMBERS_Q" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
       RAFT_TO_SQS_MAP="$RAFT_TO_SQS_MAP_Q" \
@@ -634,6 +682,11 @@ update_one_node() {
       KEYVIZ_ENABLED="$KEYVIZ_ENABLED" \
       KEYVIZ_FANOUT_NODES="$KEYVIZ_FANOUT_NODES_Q" \
       KEYVIZ_KEY_BUCKETS_PER_ROUTE="$KEYVIZ_KEY_BUCKETS_PER_ROUTE_Q" \
+      KEYVIZ_HOT_KEYS_ENABLED="$KEYVIZ_HOT_KEYS_ENABLED" \
+      KEYVIZ_HOT_KEYS_PER_ROUTE="$KEYVIZ_HOT_KEYS_PER_ROUTE_Q" \
+      KEYVIZ_HOT_KEYS_SAMPLE_RATE="$KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q" \
+      KEYVIZ_HOT_KEYS_QUEUE_SIZE="$KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q" \
+      KEYVIZ_HOT_KEYS_MAX_KEY_LEN="$KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -678,6 +731,15 @@ extract_proto_enum() {
     tail -n1
 }
 
+extract_proto_uint() {
+  local field="$1"
+  local payload="$2"
+
+  printf '%s' "$payload" |
+    sed -nE "s/.*${field}:[[:space:]]+\"?([0-9]+)\"?.*/\1/p" |
+    tail -n1
+}
+
 raftadmin_text() {
   local addr="$1"
   shift
@@ -688,6 +750,11 @@ raftadmin_text() {
   fi
 
   "$RAFTADMIN_BIN_PATH" "$addr" "$@" 2>&1
+}
+
+raft_status() {
+  local addr="$1"
+  raftadmin_text "$addr" status
 }
 
 raft_leader_addr() {
@@ -771,19 +838,76 @@ cluster_reachability_summary() {
 }
 
 choose_transfer_candidate() {
-  local i
+  local leader_addr leader_status leader_commit leader_last_log leader_last_snapshot target_index
+  local i addr output state last_log applied lag rows
 
+  leader_addr="${NODE_HOST}:${RAFT_PORT}"
+  leader_status="$(raft_status "$leader_addr")" || {
+    echo "unable to read leader raft status from $leader_addr: $leader_status" >&2
+    return 1
+  }
+  leader_commit="$(extract_proto_uint "commit_index" "$leader_status")"
+  leader_last_log="$(extract_proto_uint "last_log_index" "$leader_status")"
+  leader_last_snapshot="$(extract_proto_uint "last_snapshot_index" "$leader_status")"
+  if [[ -z "$leader_commit" || -z "$leader_last_log" || -z "$leader_last_snapshot" ]]; then
+    echo "unable to parse leader raft indexes from $leader_addr status: $leader_status" >&2
+    return 1
+  fi
+  target_index="$leader_commit"
+  if (( leader_last_log > target_index )); then
+    target_index="$leader_last_log"
+  fi
+
+  rows=()
   for i in "${!ALL_NODE_IDS[@]}"; do
     if [[ "${ALL_NODE_IDS[$i]}" == "$NODE_ID" ]]; then
       continue
     fi
-    if peer_grpc_healthy "${ALL_NODE_HOSTS[$i]}"; then
-      printf '%s %s\n' "${ALL_NODE_IDS[$i]}" "${ALL_NODE_HOSTS[$i]}"
-      return 0
+    addr="${ALL_NODE_HOSTS[$i]}:${RAFT_PORT}"
+    if ! peer_grpc_healthy "${ALL_NODE_HOSTS[$i]}"; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: gRPC unreachable" >&2
+      continue
     fi
+    if ! output="$(raft_status "$addr")"; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: status RPC failed: $output" >&2
+      continue
+    fi
+    state="$(extract_proto_enum "state" "$output")"
+    if [[ "$state" != "FOLLOWER" ]]; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: state=${state:-unknown}" >&2
+      continue
+    fi
+    last_log="$(extract_proto_uint "last_log_index" "$output")"
+    applied="$(extract_proto_uint "applied_index" "$output")"
+    if [[ -z "$last_log" || -z "$applied" ]]; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: unable to parse indexes from status: $output" >&2
+      continue
+    fi
+    if (( last_log < leader_last_snapshot )); then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: last_log_index=${last_log} is behind leader snapshot index ${leader_last_snapshot}" >&2
+      continue
+    fi
+    if (( target_index > last_log )); then
+      lag=$(( target_index - last_log ))
+    else
+      lag=0
+    fi
+    if (( lag > LEADERSHIP_TRANSFER_MAX_LOG_LAG )); then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: log lag ${lag} exceeds LEADERSHIP_TRANSFER_MAX_LOG_LAG=${LEADERSHIP_TRANSFER_MAX_LOG_LAG}" >&2
+      continue
+    fi
+    rows+=("${lag} ${i} ${ALL_NODE_IDS[$i]} ${ALL_NODE_HOSTS[$i]} ${last_log} ${applied}")
   done
 
-  return 1
+  if [[ "${#rows[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "${rows[@]}" |
+    sort -n -k1,1 -k2,2 |
+    while read -r lag _ordinal candidate_id candidate_host last_log applied; do
+      printf '%s %s %s %s %s\n' "$candidate_id" "$candidate_host" "$lag" "$last_log" "$applied"
+    done
 }
 
 wait_for_leader_change() {
@@ -829,40 +953,49 @@ ensure_not_leader_before_restart() {
     return 1
   fi
 
-  if ! read -r candidate_id candidate_host < <(choose_transfer_candidate); then
-    echo "node is leader but no healthy peer is available as transfer target" >&2
+  local transfer_succeeded=false
+  local candidate_rows candidate_lag candidate_last_log candidate_applied
+  candidate_rows="$(choose_transfer_candidate || true)"
+  if [[ -z "$candidate_rows" ]]; then
+    echo "node is leader but no caught-up healthy follower is available as transfer target" >&2
+    echo "cluster reachability: $(cluster_reachability_summary)" >&2
     return 1
   fi
-  candidate_addr="${candidate_host}:${RAFT_PORT}"
 
-  echo "node is leader; transferring leadership to ${candidate_id}@${candidate_addr}"
-  # Retry the targeted transfer up to LEADERSHIP_TRANSFER_RETRY_ATTEMPTS
-  # times. A common failure shape under rolling restarts is etcd raft
-  # rejecting the transfer with "etcd raft leadership transfer aborted"
-  # when the candidate's log has not yet caught up to the leader. The
-  # candidate typically becomes ready within a few seconds, so a brief
-  # backoff between attempts is usually enough. Only when ALL targeted
-  # retries are exhausted do we fall back to the generic transfer.
-  local attempt=1 transfer_succeeded=false
-  while (( attempt <= LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); do
-    if rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer_to_server "${candidate_id}" "${candidate_addr}")"; then
-      transfer_succeeded=true
+  # Retry each eligible targeted transfer up to
+  # LEADERSHIP_TRANSFER_RETRY_ATTEMPTS times. A common failure shape
+  # under rolling restarts is etcd raft rejecting the transfer with
+  # "etcd raft leadership transfer aborted" when the candidate's log
+  # has not caught up. We rank candidates by log lag and try every
+  # non-stale follower before refusing the restart. We intentionally
+  # do not fall back to the generic transfer RPC: the engine's generic
+  # target selection is configuration-order based and can reselect the
+  # exact stale peer this filter skipped.
+  while read -r candidate_id candidate_host candidate_lag candidate_last_log candidate_applied; do
+    [[ -n "$candidate_id" ]] || continue
+    candidate_addr="${candidate_host}:${RAFT_PORT}"
+    echo "node is leader; transferring leadership to ${candidate_id}@${candidate_addr} (lag=${candidate_lag}, last_log=${candidate_last_log}, applied=${candidate_applied})"
+    local attempt=1
+    while (( attempt <= LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); do
+      if rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer_to_server "${candidate_id}" "${candidate_addr}")"; then
+        transfer_succeeded=true
+        break
+      fi
+      echo "targeted leadership transfer to ${candidate_id}@${candidate_addr} attempt ${attempt}/${LEADERSHIP_TRANSFER_RETRY_ATTEMPTS} failed: $rpc_output" >&2
+      if (( attempt < LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); then
+        echo "retrying in ${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}s..." >&2
+        sleep "${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}"
+      fi
+      attempt=$(( attempt + 1 ))
+    done
+    if [[ "$transfer_succeeded" == "true" ]]; then
       break
     fi
-    echo "targeted leadership transfer attempt ${attempt}/${LEADERSHIP_TRANSFER_RETRY_ATTEMPTS} failed: $rpc_output" >&2
-    if (( attempt < LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); then
-      echo "retrying in ${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}s..." >&2
-      sleep "${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}"
-    fi
-    attempt=$(( attempt + 1 ))
-  done
+  done <<< "$candidate_rows"
+
   if [[ "$transfer_succeeded" != "true" ]]; then
-    echo "falling back to generic leadership transfer"
-    rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer)" || {
-      echo "generic leadership transfer RPC failed: $rpc_output" >&2
-      return 1
-    }
-    candidate_addr=""
+    echo "all caught-up targeted leadership transfer attempts failed; refusing generic transfer because it may pick a stale peer" >&2
+    return 1
   fi
 
   if ! wait_for_leader_change "${NODE_HOST}:${RAFT_PORT}" "$candidate_addr"; then
@@ -987,6 +1120,11 @@ run_container() {
   local keyviz_flags=()
   build_keyviz_flags keyviz_flags
 
+  local raft_bootstrap_flags=()
+  if [[ -n "${RAFT_BOOTSTRAP_MEMBERS:-}" ]]; then
+    raft_bootstrap_flags=(--raftBootstrapMembers "$RAFT_BOOTSTRAP_MEMBERS")
+  fi
+
   # config-fingerprint label drives the skip check on the next deploy
   # (see DEPLOY_CONFIG_FP_LABEL block above). Empty value here means
   # the deploy script was run on an old layout that didn't compute one
@@ -1014,6 +1152,7 @@ run_container() {
     --dynamoAddress "${NODE_HOST}:${DYNAMO_PORT}" \
     --raftId "$NODE_ID" \
     --raftEngine "$RAFT_ENGINE" \
+    "${raft_bootstrap_flags[@]}" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
     "${s3_flags[@]}" \
@@ -1043,6 +1182,30 @@ build_keyviz_flags() {
   local key_buckets="${KEYVIZ_KEY_BUCKETS_PER_ROUTE:-}"
   if [[ -n "$key_buckets" ]]; then
     _flags+=(--keyvizKeyBucketsPerRoute "$key_buckets")
+  # Hot-key Top-K drill-down. Only emit the master flag (and its
+  # tuning knobs) when KEYVIZ_HOT_KEYS_ENABLED=true; the four tuning
+  # knobs are optional and only emitted when the operator set a
+  # non-empty value, so the daemon falls back to the sampler-side
+  # defaults (keyviz/sampler.go) when an env var is left empty.
+  local hot_keys_enabled="${KEYVIZ_HOT_KEYS_ENABLED:-false}"
+  if [[ "$hot_keys_enabled" == "true" ]]; then
+    _flags+=(--keyvizHotKeysEnabled)
+    local hot_keys_per_route="${KEYVIZ_HOT_KEYS_PER_ROUTE:-}"
+    if [[ -n "$hot_keys_per_route" ]]; then
+      _flags+=(--keyvizHotKeysPerRoute "$hot_keys_per_route")
+    fi
+    local hot_keys_sample_rate="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
+    if [[ -n "$hot_keys_sample_rate" ]]; then
+      _flags+=(--keyvizHotKeysSampleRate "$hot_keys_sample_rate")
+    fi
+    local hot_keys_queue_size="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
+    if [[ -n "$hot_keys_queue_size" ]]; then
+      _flags+=(--keyvizHotKeysQueueSize "$hot_keys_queue_size")
+    fi
+    local hot_keys_max_key_len="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
+    if [[ -n "$hot_keys_max_key_len" ]]; then
+      _flags+=(--keyvizHotKeysMaxKeyLen "$hot_keys_max_key_len")
+    fi
   fi
 }
 
@@ -1247,6 +1410,7 @@ config_fp() {
     "$DATA_DIR" \
     "$NODE_HOST" "$NODE_ID" \
     "$RAFT_ENGINE" \
+    "$RAFT_BOOTSTRAP_MEMBERS" \
     "$RAFT_PORT" "$REDIS_PORT" "$DYNAMO_PORT" \
     "$RAFT_TO_REDIS_MAP" \
     "$ENABLE_S3" "$S3_PORT" "$S3_REGION" "$S3_PATH_STYLE_ONLY" \
@@ -1260,6 +1424,10 @@ config_fp() {
     "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
     "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
     "$KEYVIZ_ENABLED" "$keyviz_fanout_nodes_fp" "$keyviz_key_buckets_per_route_fp" \
+    "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" \
+    "$KEYVIZ_HOT_KEYS_ENABLED" "$KEYVIZ_HOT_KEYS_PER_ROUTE" \
+    "$KEYVIZ_HOT_KEYS_SAMPLE_RATE" "$KEYVIZ_HOT_KEYS_QUEUE_SIZE" \
+    "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN" \
     | sha256sum | cut -d' ' -f1
 }
 DEPLOY_CONFIG_FP_LABEL="elastickv.deploy.config-fp"
@@ -1449,6 +1617,7 @@ DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
 SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
 RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
+RAFT_BOOTSTRAP_MEMBERS_Q="$(printf '%q' "$RAFT_BOOTSTRAP_MEMBERS")"
 RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
 RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
 RAFT_TO_SQS_MAP_Q="$(printf '%q' "$RAFT_TO_SQS_MAP")"
@@ -1476,6 +1645,17 @@ ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
 # uniform with the ADMIN_* set above.
 KEYVIZ_FANOUT_NODES_Q="$(printf '%q' "$KEYVIZ_FANOUT_NODES")"
 KEYVIZ_KEY_BUCKETS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_KEY_BUCKETS_PER_ROUTE")"
+
+# Hot-key tuning knobs are integers (or empty for sampler default);
+# integers carry no shell metacharacters, but pre-quoting matches the
+# SQS_PORT_Q precedent: anything that is not bool-validated at the top
+# of the script goes through printf '%q' before crossing the SSH
+# boundary. KEYVIZ_HOT_KEYS_ENABLED itself is bool-validated, so it
+# stays unquoted alongside the other booleans.
+KEYVIZ_HOT_KEYS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_PER_ROUTE")"
+KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_SAMPLE_RATE")"
+KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_QUEUE_SIZE")"
+KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do

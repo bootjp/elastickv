@@ -120,6 +120,11 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	for _, opt := range opts {
 		opt(c)
 	}
+	// Resolve the optional LeaseProvider capability once here so the
+	// LeaseRead / refreshLeaseAfterDispatch hot paths test a cached
+	// field instead of repeating the interface type assertion per call.
+	// engine is never reassigned after construction, so the cached value
+	// stays valid for the Coordinate's lifetime.
 	// Register a leader-loss hook so the lease is invalidated the instant
 	// the engine notices a state transition out of the leader role,
 	// rather than waiting for wall-clock expiry of the current lease.
@@ -128,6 +133,7 @@ func NewCoordinatorWithEngine(txm Transactional, engine raftengine.Engine, opts 
 	// one-shot tools) MUST call Close() to avoid leaking a closure
 	// pointing into this Coordinate.
 	if lp, ok := engine.(raftengine.LeaseProvider); ok {
+		c.lp = lp
 		c.deregisterLeaseCb = lp.RegisterLeaderLossCallback(c.lease.invalidate)
 	}
 	return c
@@ -169,10 +175,18 @@ type CoordinateResponse struct {
 type Coordinate struct {
 	transactionManager Transactional
 	engine             raftengine.Engine
-	clock              *HLC
-	connCache          GRPCConnCache
-	log                *slog.Logger
-	lease              leaseState
+	// lp caches the engine's optional LeaseProvider capability so the
+	// LeaseRead hot path (and refreshLeaseAfterDispatch) test a single
+	// field for nil instead of performing an interface type assertion on
+	// every call. It is set once in NewCoordinatorWithEngine and is nil
+	// when the engine does not implement raftengine.LeaseProvider. The
+	// engine field is never reassigned after construction, so this stays
+	// in sync without a lock.
+	lp        raftengine.LeaseProvider
+	clock     *HLC
+	connCache GRPCConnCache
+	log       *slog.Logger
+	lease     leaseState
 	// deregisterLeaseCb removes the leader-loss callback registered
 	// against engine at construction. Long-lived Coordinates don't
 	// need to call it (the engine will be closed after them), but
@@ -235,6 +249,82 @@ func LeaseReadForKeyThrough(c Coordinator, ctx context.Context, key []byte) (uin
 	}
 	idx, err := c.LinearizableRead(ctx)
 	return idx, errors.WithStack(err)
+}
+
+// AllGroupsLeaseReadableCoordinator is the optional capability implemented
+// by coordinators that own more than one Raft group and can establish the
+// lease freshness bound on EVERY group in a single call. Multi-shard read
+// handlers (Scan, GSI/whole-table Query) need this because the underlying
+// scan visits all intersecting routes across all groups, whereas the plain
+// LeaseRead only fences the default group. Single-group coordinators do not
+// implement it: LeaseReadAllGroupsThrough falls back to LeaseRead so they
+// still issue exactly one lease read.
+type AllGroupsLeaseReadableCoordinator interface {
+	// LeaseReadAllGroups establishes the lease freshness bound on every
+	// group the coordinator owns, failing closed on the first group that
+	// cannot confirm its lease. The freshness bound is what a multi-shard
+	// read relies on, so a returned error MUST abort the read.
+	LeaseReadAllGroups(ctx context.Context) error
+}
+
+// LeaseReadAllGroupsThrough establishes the lease freshness bound across
+// every shard group a multi-shard read can touch. When the coordinator owns
+// multiple groups (AllGroupsLeaseReadableCoordinator) it fences all of them;
+// otherwise it falls back to the single-group LeaseRead path so a
+// single-group deployment still issues exactly one lease read. Adapter call
+// sites use this for keyless reads (Scan, whole-table/GSI Query fallback)
+// that the per-key LeaseReadForKey cannot route to one group.
+func LeaseReadAllGroupsThrough(c Coordinator, ctx context.Context) error {
+	if ag, ok := c.(AllGroupsLeaseReadableCoordinator); ok {
+		return errors.WithStack(ag.LeaseReadAllGroups(ctx))
+	}
+	_, err := LeaseReadThrough(c, ctx)
+	return errors.WithStack(err)
+}
+
+// GroupRoutableCoordinator is the optional capability implemented by
+// coordinators that can resolve the owning Raft group of a key without
+// any I/O. Callers that need to lease-check a set of keys use it to
+// deduplicate by group: keys that resolve to the same group share one
+// lease read instead of issuing one per key. Single-group coordinators
+// do not implement it, so callers must fall back to per-key dedup.
+type GroupRoutableCoordinator interface {
+	// EngineGroupIDForKey returns the owning group ID, or 0 when the
+	// key cannot be routed.
+	EngineGroupIDForKey(key []byte) uint64
+}
+
+// LeaseReadGroupKey returns a representative key per distinct owning
+// group for the supplied keys, so callers can issue one lease read per
+// group rather than one per key. The returned slice preserves the order
+// of first appearance. When the coordinator does not implement
+// GroupRoutableCoordinator (single-group deployments) every distinct key
+// is returned unchanged so the caller's per-key dedup still bounds the
+// work. Keys that cannot be routed (group ID 0) are never collapsed —
+// each is kept as its own representative so the lease check still runs
+// and surfaces the routing failure.
+func LeaseReadGroupKeys(c Coordinator, keys [][]byte) [][]byte {
+	router, ok := c.(GroupRoutableCoordinator)
+	if !ok {
+		return keys
+	}
+	reps := make([][]byte, 0, len(keys))
+	seen := make(map[uint64]struct{}, len(keys))
+	for _, key := range keys {
+		gid := router.EngineGroupIDForKey(key)
+		if gid == 0 {
+			// Unroutable: keep it so the lease check runs and fails
+			// closed instead of silently skipping the shard.
+			reps = append(reps, key)
+			continue
+		}
+		if _, dup := seen[gid]; dup {
+			continue
+		}
+		seen[gid] = struct{}{}
+		reps = append(reps, key)
+	}
+	return reps
 }
 
 func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
@@ -441,7 +531,11 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 		// CommitTS so dispatchTxn generates both timestamps consistently.
 		// A caller-supplied CommitTS without a matching StartTS could produce
 		// CommitTS <= StartTS (an invalid transaction).
-		reqs.StartTS = c.nextStartTS()
+		startTS, err := c.nextStartTS()
+		if err != nil {
+			return nil, err
+		}
+		reqs.StartTS = startTS
 		reqs.CommitTS = 0
 	}
 
@@ -462,7 +556,7 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
-		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS)
+		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.ObservedRouteVersion)
 	} else {
 		resp, err = c.dispatchRaw(ctx, reqs.Elems)
 	}
@@ -595,11 +689,10 @@ func (c *Coordinate) refreshLeaseAfterDispatch(resp *CoordinateResponse, err err
 	if resp == nil || resp.CommitIndex == 0 {
 		return
 	}
-	lp, ok := c.engine.(raftengine.LeaseProvider)
-	if !ok {
+	if c.lp == nil {
 		return
 	}
-	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()), expectedGen)
+	c.lease.extend(dispatchStart.Add(c.lp.LeaseDuration()), expectedGen)
 }
 
 func (c *Coordinate) IsLeader() bool {
@@ -629,9 +722,53 @@ func (c *Coordinate) Clock() *HLC {
 // ProposeHLCLease proposes a new physical ceiling to the Raft cluster.
 // Only the current leader should call this; followers silently ignore
 // proposals from non-leaders via Raft's leader-only write guarantee.
+//
+// A successful propose is a quorum-acked Raft commit, exactly the same
+// confirmation Dispatch relies on, so it also warms the leader-local
+// read lease. The lease-extension base (dispatchStart) and the
+// invalidation generation are sampled BEFORE the propose, mirroring
+// refreshLeaseAfterDispatch: the window can only ever be SHORTER than
+// the true safety window, and a leader-loss callback that fires during
+// the propose advances the generation so extend refuses to resurrect a
+// stale lease. This is the background warm-up that flattens the
+// read-only lease-expiry sawtooth on idle-write workloads -- no extra
+// goroutine, no change to the lease window/duration semantics.
+//
+// On a leadership-loss propose error the lease is invalidated eagerly,
+// mirroring refreshLeaseAfterDispatch's error branch exactly: when
+// Propose returns the loss before the async RegisterLeaderLossCallback
+// fires, a stale-warm lease must not survive on a non-leader node for
+// the callback latency window. Non-leadership errors (no quorum,
+// validation) are NOT leadership signals and must not tear down a warm
+// lease -- doing so would force every read onto the slow path.
 func (c *Coordinate) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
+	dispatchStart := monoclock.Now()
+	expectedGen := c.lease.generation()
 	_, err := c.engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs))
-	return errors.WithStack(err)
+	if err != nil {
+		if isLeadershipLossError(err) {
+			c.lease.invalidate()
+		}
+		return errors.WithStack(err)
+	}
+	c.extendLeaseAfterRenewal(dispatchStart, expectedGen)
+	return nil
+}
+
+// extendLeaseAfterRenewal warms the read lease after a successful HLC
+// ceiling propose. It is the renewal-path counterpart of
+// refreshLeaseAfterDispatch's success branch: the propose was a
+// quorum-acked commit, so the lease can be extended by LeaseDuration
+// measured from dispatchStart (sampled before the propose). extend
+// rejects the refresh if expectedGen no longer matches -- i.e. a
+// leader-loss invalidation raced the propose -- so a node that stopped
+// being leader during the propose cannot widen its lease-read window.
+func (c *Coordinate) extendLeaseAfterRenewal(dispatchStart monoclock.Instant, expectedGen uint64) {
+	lp, ok := c.engine.(raftengine.LeaseProvider)
+	if !ok {
+		return
+	}
+	c.lease.extend(dispatchStart.Add(lp.LeaseDuration()), expectedGen)
 }
 
 // RunHLCLeaseRenewal runs a background loop that periodically proposes a new
@@ -712,8 +849,8 @@ func (c *Coordinate) LinearizableReadForKey(ctx context.Context, _ []byte) (uint
 // Callers that resolve timestamps via store.LastCommitTS may discard
 // the value.
 func (c *Coordinate) LeaseRead(ctx context.Context) (uint64, error) {
-	lp, ok := c.engine.(raftengine.LeaseProvider)
-	if !ok {
+	lp := c.lp
+	if lp == nil {
 		return c.LinearizableRead(ctx)
 	}
 	leaseDur := lp.LeaseDuration()
@@ -794,11 +931,54 @@ func (c *Coordinate) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, err
 	return c.LeaseRead(ctx)
 }
 
-func (c *Coordinate) nextStartTS() uint64 {
-	return c.clock.Next()
+// coordinateSingleGroupID is the synthetic group ID a single-group
+// Coordinate reports for every key. It only needs to be a stable
+// non-zero value so LeaseReadGroupKeys collapses all keys into one lease
+// read; the value is never used to address a real Raft group here.
+const coordinateSingleGroupID = 1
+
+// EngineGroupIDForKey makes Coordinate satisfy GroupRoutableCoordinator.
+// A Coordinate fronts exactly one Raft group, so every key maps to the
+// same group and batched lease checks collapse to a single read.
+func (c *Coordinate) EngineGroupIDForKey(_ []byte) uint64 {
+	return coordinateSingleGroupID
 }
 
-func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) nextStartTS() (uint64, error) {
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate startTS")
+	}
+	return ts, nil
+}
+
+// resolveDispatchCommitTS centralises the commit-ts allocation for
+// dispatchTxn so the function stays under the nestif cyclomatic
+// budget. When commitTS == 0 it allocates a fresh ts via NextFenced
+// (with an Observe-and-retry path when the first allocation is not
+// strictly above startTS); otherwise it Observes the caller-supplied
+// ts to keep HLC monotonic.
+func (c *Coordinate) resolveDispatchCommitTS(commitTS, startTS uint64) (uint64, error) {
+	if commitTS != 0 {
+		c.clock.Observe(commitTS)
+		return commitTS, nil
+	}
+	next, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate commitTS")
+	}
+	if next > startTS {
+		return next, nil
+	}
+	c.clock.Observe(startTS)
+	retry, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "re-allocate commitTS after Observe")
+	}
+	return retry, nil
+}
+
+func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64, prevCommitTS uint64, observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -807,17 +987,11 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	if commitTS == 0 {
-		commitTS = c.clock.Next()
-		if commitTS <= startTS {
-			c.clock.Observe(startTS)
-			commitTS = c.clock.Next()
-		}
-	} else {
-		// Observe the caller-provided commitTS so the HLC never issues
-		// a smaller timestamp in subsequent calls, preserving monotonicity.
-		c.clock.Observe(commitTS)
+	resolvedCommitTS, err := c.resolveDispatchCommitTS(commitTS, startTS)
+	if err != nil {
+		return nil, err
 	}
+	commitTS = resolvedCommitTS
 	if commitTS <= startTS {
 		return nil, errors.WithStack(ErrTxnCommitTSRequired)
 	}
@@ -827,9 +1001,11 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	// window that exists between the adapter's pre-Raft validateReadSet call
 	// and FSM application. The adapter's validateReadSet is kept as a fast
 	// path to fail early without a Raft round-trip, but the FSM check is
-	// the authoritative, serializable validation.
+	// the authoritative, serializable validation. prevCommitTS, when set,
+	// carries the option-2 one-phase dedup probe key for a retry that reuses
+	// a failed attempt's write set.
 	r, err := c.transactionManager.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primary, reqs, readKeys),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primary, reqs, readKeys, observedRouteVersion),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -846,10 +1022,14 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 		muts = append(muts, elemToMutation(elem))
 	}
 
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return nil, errors.Wrap(err, "allocate raw dispatch ts")
+	}
 	logs := []*pb.Request{{
 		IsTxn:     false,
 		Phase:     pb.Phase_NONE,
-		Ts:        c.clock.Next(),
+		Ts:        ts,
 		Mutations: muts,
 	}}
 
@@ -862,13 +1042,32 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 	}, nil
 }
 
+// toRawRequest builds a forwarded raw Request for the redirect path
+// (follower → leader Internal.Forward). The leader stamps Ts on
+// arrival via adapter.Internal.stampRawTimestamps, so the follower
+// MUST leave Ts == 0 here.
+//
+// Two reasons this is the right contract:
+//  1. HLC invariant — persistence timestamps are issued exclusively
+//     by the Raft leader (see CLAUDE.md "Timestamp Oracle"). Calling
+//     NextFenced on the follower's clock both violates that invariant
+//     and produces a ts the leader's HLC has not observed.
+//  2. HLC-4 (iii) fence — a follower whose physicalCeiling is stale
+//     (lease entry not yet applied / wall has caught up locally)
+//     would return ErrCeilingExpired here even when the actual
+//     leader has already renewed its ceiling, spuriously failing
+//     follower-routed raw writes during follower lag or
+//     re-election. Regression: TestToRawRequestLeavesTsForLeaderStamping.
+//
+// The returned Request is structurally identical to the pre-stamping
+// shape the leader's stampRawTimestamps already handles for Ts == 0
+// (see adapter/internal.go).
 func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 	switch req.Op {
 	case Put:
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
 			Mutations: []*pb.Mutation{
 				{
 					Op:    pb.Op_PUT,
@@ -882,7 +1081,6 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL,
@@ -895,7 +1093,6 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 		return &pb.Request{
 			IsTxn: false,
 			Phase: pb.Phase_NONE,
-			Ts:    c.clock.Next(),
 			Mutations: []*pb.Mutation{
 				{
 					Op:  pb.Op_DEL_PREFIX,
@@ -973,12 +1170,16 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 	// so the leader assigns both timestamps consistently. A caller-provided
 	// CommitTS without a StartTS would produce an invalid txn where
 	// CommitTS <= StartTS (because StartTS=0 at the forwarding site).
+	// PrevCommitTS is the immutable identity of the prior attempt — it is
+	// allocated by the originating adapter, not by the leader — so it is
+	// forwarded unconditionally so the leader's one-phase apply can run the
+	// option-2 dedup probe.
 	commitTS := reqs.CommitTS
 	if reqs.StartTS == 0 {
 		commitTS = 0
 	}
 	return []*pb.Request{
-		onePhaseTxnRequest(reqs.StartTS, commitTS, primary, reqs.Elems, reqs.ReadKeys),
+		onePhaseTxnRequestWithPrevCommit(reqs.StartTS, commitTS, reqs.PrevCommitTS, primary, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion),
 	}, nil
 }
 
@@ -1018,19 +1219,48 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 	panic("unreachable")
 }
 
-func onePhaseTxnRequest(startTS, commitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte) *pb.Request {
+// onePhaseTxnRequestWithPrevCommit builds a single-shard one-phase request,
+// optionally carrying prevCommitTS — the commit timestamp of a failed prior
+// attempt of the same transaction. When prevCommitTS is non-zero the FSM
+// (handleOnePhaseTxnRequest) probes whether that attempt already landed and
+// no-ops the apply if so (option 2 dedup). When it is zero the encoded meta
+// is byte-identical to the pre-feature V1 form, so non-retry callers are
+// unaffected. See docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
+//
+// observedRouteVersion is the durable catalog version the txn's read set
+// was captured at — flows into pb.Request.ObservedRouteVersion so the M3
+// Composed-1 FSM apply-time gate can re-validate ownership against the
+// route catalog snapshot at txn-begin (M1 plumbing, see
+// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md).
+// Zero is the legacy "unpinned" sentinel.
+func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)
-	muts = append(muts, txnMetaMutation(primaryKey, 0, commitTS))
+	muts = append(muts, &pb.Mutation{
+		Op:    pb.Op_PUT,
+		Key:   []byte(txnMetaPrefix),
+		Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: commitTS, PrevCommitTS: prevCommitTS}),
+	})
 	for _, req := range reqs {
 		muts = append(muts, elemToMutation(req))
 	}
 	return &pb.Request{
-		IsTxn:     true,
-		Phase:     pb.Phase_NONE,
-		Ts:        startTS,
-		Mutations: muts,
-		ReadKeys:  readKeys,
+		IsTxn:                true,
+		Phase:                pb.Phase_NONE,
+		Ts:                   startTS,
+		Mutations:            muts,
+		ReadKeys:             readKeys,
+		ObservedRouteVersion: observedRouteVersion,
 	}
+}
+
+// PrimaryKeyForElems returns the primary key the coordinator derives for a
+// single-shard one-phase txn over elems — the lexicographically smallest write
+// key. Adapters that implement option-2 one-phase dedup must probe this exact
+// key (it becomes the FSM's meta.PrimaryKey) so the adapter-side
+// self-inflicted-conflict guard agrees with dedupProbeOnePhase. See
+// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md (R4).
+func PrimaryKeyForElems(reqs []*Elem[OP]) []byte {
+	return primaryKeyForElems(reqs)
 }
 
 func primaryKeyForElems(reqs []*Elem[OP]) []byte {

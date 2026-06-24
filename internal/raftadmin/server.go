@@ -13,15 +13,31 @@ import (
 type Server struct {
 	engine raftengine.Engine
 	admin  raftengine.Admin
+	// interceptor is invoked from AddVoter/AddLearner before the
+	// underlying Raft engine proposes the conf-change. nil = no
+	// pre-step (the pre-7c posture). Stage 7c wires the encryption-
+	// aware adapter via NewServerWithInterceptor; encryption-unaware
+	// builds keep this nil.
+	interceptor MembershipChangeInterceptor
 
 	pb.UnimplementedRaftAdminServer
 }
 
 func NewServer(engine raftengine.Engine) *Server {
+	return NewServerWithInterceptor(engine, nil)
+}
+
+// NewServerWithInterceptor constructs a Server with an optional
+// pre-step that runs before AddVoter/AddLearner propose the
+// conf-change. See [MembershipChangeInterceptor]. Passing nil is
+// equivalent to [NewServer] — the pre-step is skipped and the
+// conf-change runs exactly as the pre-7c posture.
+func NewServerWithInterceptor(engine raftengine.Engine, interceptor MembershipChangeInterceptor) *Server {
 	admin, _ := any(engine).(raftengine.Admin)
 	return &Server{
-		engine: engine,
-		admin:  admin,
+		engine:      engine,
+		admin:       admin,
+		interceptor: interceptor,
 	}
 }
 
@@ -73,6 +89,15 @@ func (s *Server) AddVoter(ctx context.Context, req *pb.RaftAdminAddVoterRequest)
 	if req == nil || req.Id == "" || req.Address == "" {
 		return nil, grpcStatus(codes.InvalidArgument, "id and address are required")
 	}
+	// Stage 7c §3.1 pre-step: run the encryption-aware adapter (if any)
+	// before the conf-change proposal so the new node's writer-registry
+	// row exists at apply time and any §6.1 uint16 collision halts here
+	// rather than after the conf-change is durable.
+	if s.interceptor != nil {
+		if err := s.interceptor.PreAddMember(ctx, req.Id); err != nil {
+			return nil, adminError(err)
+		}
+	}
 	index, err := s.admin.AddVoter(ctx, req.Id, req.Address, req.PreviousIndex)
 	if err != nil {
 		return nil, adminError(err)
@@ -86,6 +111,11 @@ func (s *Server) AddLearner(ctx context.Context, req *pb.RaftAdminAddLearnerRequ
 	}
 	if req == nil || req.Id == "" || req.Address == "" {
 		return nil, grpcStatus(codes.InvalidArgument, "id and address are required")
+	}
+	if s.interceptor != nil {
+		if err := s.interceptor.PreAddMember(ctx, req.Id); err != nil {
+			return nil, adminError(err)
+		}
 	}
 	index, err := s.admin.AddLearner(ctx, req.Id, req.Address, req.PreviousIndex)
 	if err != nil {
