@@ -1234,6 +1234,13 @@ running_status="$(docker inspect --format "{{.State.Status}}" "$CONTAINER_NAME" 
 # spoof the boundary). All inputs are always-present env vars so an
 # unset deploy knob hashes as the empty string consistently.
 config_fp() {
+  local keyviz_fanout_nodes_fp=""
+  local keyviz_key_buckets_per_route_fp=""
+  if [[ "$KEYVIZ_ENABLED" == "true" ]]; then
+    keyviz_fanout_nodes_fp="$KEYVIZ_FANOUT_NODES"
+    keyviz_key_buckets_per_route_fp="$KEYVIZ_KEY_BUCKETS_PER_ROUTE"
+  fi
+
   printf '%s\0' \
     "$IMAGE" \
     "$SERVER_ENTRYPOINT" \
@@ -1252,7 +1259,7 @@ config_fp() {
     "$ADMIN_SESSION_SIGNING_KEY_FILE" "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" \
     "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
     "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
-    "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" \
+    "$KEYVIZ_ENABLED" "$keyviz_fanout_nodes_fp" "$keyviz_key_buckets_per_route_fp" \
     | sha256sum | cut -d' ' -f1
 }
 DEPLOY_CONFIG_FP_LABEL="elastickv.deploy.config-fp"
