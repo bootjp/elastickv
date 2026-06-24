@@ -270,11 +270,13 @@ for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_IN
 done
 unset _bool_var
 
-# KeyViz sub-range buckets: empty (omit the flag) or 1..256.
-# Validate before it reaches the SSH heredoc / the binary's flag parser
-# so an operator typo fails here with a clear message rather than as a
-# container crash-loop on an unparseable --keyvizKeyBucketsPerRoute.
-if [[ -n "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" && ! "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" =~ ^([1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-6])$ ]]; then
+# KeyViz sub-range buckets: empty (omit the flag) or 1..256. Validate
+# only when KeyViz is enabled, matching build_keyviz_flags: stale or
+# placeholder bucket values remain inert when the sampler is disabled.
+# When enabled, fail before the value reaches the SSH heredoc / the
+# binary's flag parser so an operator typo gets a clear script-level
+# error instead of a container crash-loop.
+if [[ "$KEYVIZ_ENABLED" == "true" && -n "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" && ! "$KEYVIZ_KEY_BUCKETS_PER_ROUTE" =~ ^([1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-6])$ ]]; then
   echo "rolling-update: KEYVIZ_KEY_BUCKETS_PER_ROUTE must be empty or an integer between 1 and 256, got '$KEYVIZ_KEY_BUCKETS_PER_ROUTE'" >&2
   exit 1
 fi
