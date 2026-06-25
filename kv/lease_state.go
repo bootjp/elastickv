@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
@@ -30,55 +31,56 @@ func isLeadershipLossError(err error) bool {
 		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
 }
 
-// leaseSlot is the immutable payload stored behind leaseState.current.
-// Each successful extend installs a freshly-allocated *leaseSlot, so
-// pointer identity alone disambiguates two extenders that happened to
-// compute the same expiry value (clock-granularity tie). A rollback
-// CAS that compares against the extender's own *leaseSlot therefore
-// cannot clobber a newer lease installed by a concurrent winner, even
-// if the newer lease carries an equal expiryNanos.
-//
-// expiryNanos == 0 is the sentinel for "no lease"; the zero-valued
-// *leaseSlot (returned on startup before any extend) carries gen 0.
-type leaseSlot struct {
-	// expiryNanos is monoclock.Instant.Nanos(); 0 means "no lease".
-	expiryNanos int64
-	// gen is the monotonic invalidation counter. Each invalidate
-	// installs a new slot with gen+1; each extend observes it via
-	// generation() BEFORE the quorum operation and refuses to install
-	// a slot whose gen no longer matches. This preserves the
-	// leader-loss guard: a Dispatch that returned just before an
-	// invalidate fires must not resurrect the lease.
-	gen uint64
-}
-
 // leaseState tracks the monotonic-raw expiry of a leader-local read
-// lease. The hot-path read (valid) remains lock-free via a single
-// atomic pointer load; writes go through CAS on the pointer so
-// pointer identity gates the extender-vs-rollback race.
+// lease.
 //
-// expiryNanos == 0 in the current slot means the lease has never been
-// issued or has been invalidated. A non-zero value is the
-// monotonic-raw instant after which the lease is considered expired;
-// a caller comparing monoclock.Now() against the loaded value can
-// decide whether to skip a quorum confirmation. The monotonic-raw
-// clock is immune to NTP rate adjustment and wall-clock steps (see
-// internal/monoclock).
+// Storage layout. The expiry is held as a single atomic int64 of
+// monotonic-raw nanoseconds and the invalidation generation as a single
+// atomic uint64. Neither write path allocates: the previous
+// pointer-swap design heap-allocated a slot on every successful extend,
+// which is 1:1 with Dispatch throughput and a measurable GC source at
+// tens of thousands of writes per second. Two plain atomics remove that
+// allocation entirely.
+//
+// Clock source. expiryNanos stores monoclock.Instant.Nanos(), i.e. a
+// reading of CLOCK_MONOTONIC_RAW (see internal/monoclock). It is NOT
+// wall-clock nanoseconds. valid() compares it against a caller-supplied
+// monoclock.Now(), so the lease-vs-safety-window comparison is immune to
+// NTP rate adjustment and wall-clock step events: a backward or forward
+// wall-clock step cannot prematurely expire the lease or, worse, extend
+// it past its true safety window. Both the stored expiry and the now
+// passed to valid() MUST originate from monoclock so they share that
+// arbitrary zero point; mixing in time.Now()-derived nanoseconds here
+// would reintroduce the NTP-step hazard this clock source exists to
+// avoid.
+//
+// expiryNanos == 0 means the lease has never been issued or has been
+// invalidated; valid() returns false for it unconditionally. A non-zero
+// value is the monotonic-raw instant after which the lease is expired.
+//
+// Concurrency. valid() is the hot path (one per read) and stays
+// lock-free: a single atomic load of expiryNanos. The write paths
+// (extend / invalidate) run once per Dispatch / leadership change, not
+// per read, and serialize on writeMu so an extend and an invalidate can
+// never interleave their (gen, expiry) updates. Serializing only the
+// writers keeps the pair update atomic without a 128-bit CAS and without
+// the post-write rollback dance a lock-free two-atomic scheme would
+// otherwise need, while leaving the read path uncontended.
 type leaseState struct {
-	// current is the live *leaseSlot. A nil pointer means "never
-	// extended"; valid() treats it identically to an explicit
-	// zero-expiry slot.
-	current atomic.Pointer[leaseSlot]
-}
-
-// slotOrZero returns the current slot, substituting a synthetic zero
-// slot when the pointer has never been stored. Keeps callers free of
-// nil checks.
-func slotOrZero(p *leaseSlot) *leaseSlot {
-	if p == nil {
-		return &leaseSlot{}
-	}
-	return p
+	// writeMu serializes extend and invalidate so their two-field
+	// updates appear atomic to each other. Readers never take it.
+	writeMu sync.Mutex
+	// expiryNanos is monoclock.Instant.Nanos(); 0 means "no lease".
+	// Read lock-free by valid(); written only under writeMu.
+	expiryNanos atomic.Int64
+	// gen is the monotonic invalidation counter. Each invalidate
+	// increments it; each extend observes it via generation() BEFORE
+	// the quorum operation and refuses to install an expiry whose
+	// generation no longer matches. This preserves the leader-loss
+	// guard: a Dispatch that returned just before an invalidate fires
+	// must not resurrect the lease. Read lock-free by generation();
+	// written only under writeMu.
+	gen atomic.Uint64
 }
 
 // valid reports whether the lease is unexpired at now.
@@ -93,11 +95,11 @@ func (s *leaseState) valid(now monoclock.Instant) bool {
 	if s == nil || now.IsZero() {
 		return false
 	}
-	slot := s.current.Load()
-	if slot == nil || slot.expiryNanos == 0 {
+	expiry := s.expiryNanos.Load()
+	if expiry == 0 {
 		return false
 	}
-	return now.Before(monoclock.FromNanos(slot.expiryNanos))
+	return now.Before(monoclock.FromNanos(expiry))
 }
 
 // generation returns the current invalidation counter. Callers MUST
@@ -110,7 +112,7 @@ func (s *leaseState) generation() uint64 {
 	if s == nil {
 		return 0
 	}
-	return slotOrZero(s.current.Load()).gen
+	return s.gen.Load()
 }
 
 // extend sets the lease expiry to until iff (a) until is strictly
@@ -118,12 +120,13 @@ func (s *leaseState) generation() uint64 {
 // (b) no invalidate has happened since the caller captured
 // expectedGen via generation() BEFORE the quorum operation.
 //
-// Pointer-identity CAS guards the rollback: after a racing
-// invalidate fires, the rollback clears ONLY the exact *leaseSlot
-// this extender installed, so a concurrent extender that captured
-// the post-invalidate generation and computed the same expiry value
-// (clock-granularity tie) cannot be clobbered -- its slot is a
-// distinct allocation with a distinct pointer.
+// The generation recheck under writeMu is the leader-loss guard: an
+// invalidate that fired DURING the quorum operation has bumped gen, so
+// the captured expectedGen no longer matches and the extend is dropped
+// before it can resurrect a lease the leadership-loss callback just
+// cleared. Because extend and invalidate are mutually exclusive on
+// writeMu, no post-write rollback is needed: an invalidate cannot land
+// between the generation recheck and the expiry store.
 func (s *leaseState) extend(until monoclock.Instant, expectedGen uint64) {
 	if s == nil {
 		return
@@ -131,59 +134,71 @@ func (s *leaseState) extend(until monoclock.Instant, expectedGen uint64) {
 	target := until.Nanos()
 	if target == 0 {
 		// Refuse to store 0 -- that value is the sentinel for "no
-		// lease" and would race with invalidate's zero-store.
+		// lease" and would be indistinguishable from invalidate's
+		// zero-store.
 		return
 	}
-	for {
-		// Load the live pointer once per iteration; all decisions
-		// below are based on THIS observation. The CAS old-value
-		// must match this exact pointer.
-		stored := s.current.Load()
-		old := slotOrZero(stored)
-		// Pre-CAS gate: if invalidate already advanced the generation
-		// past expectedGen, skip the CAS entirely.
-		if old.gen != expectedGen {
-			return
-		}
-		if old.expiryNanos != 0 && target <= old.expiryNanos {
-			return
-		}
-		next := &leaseSlot{expiryNanos: target, gen: expectedGen}
-		if !s.current.CompareAndSwap(stored, next) {
-			continue
-		}
-		// CAS landed. If invalidate raced in between the pre-CAS
-		// gate and the CAS itself, the current gen now exceeds
-		// expectedGen; undo our write via a pointer-identity CAS on
-		// `next`. A later writer (concurrent extender, concurrent
-		// invalidate) that already replaced `next` with its own
-		// allocation owns the state; its pointer differs from
-		// `next`, our CAS fails, and we leave its value intact --
-		// EVEN IF its expiryNanos equals our target.
-		if observed := slotOrZero(s.current.Load()); observed.gen != expectedGen {
-			rb := &leaseSlot{expiryNanos: 0, gen: observed.gen}
-			s.current.CompareAndSwap(next, rb)
-		}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	// Generation guard: an invalidate since expectedGen was captured
+	// means a leader-loss callback fired during the quorum op; refuse
+	// to resurrect the lease.
+	if s.gen.Load() != expectedGen {
 		return
 	}
+	// Monotonicity: never regress a lease. An out-of-order writer that
+	// sampled monoclock.Now() earlier must not shorten a freshly
+	// extended lease and force callers onto the slow path while the
+	// leader is still confirmed.
+	cur := s.expiryNanos.Load()
+	if cur != 0 && target <= cur {
+		return
+	}
+	s.expiryNanos.Store(target)
 }
 
-// invalidate clears the lease so the next read takes the slow path.
-// Each call installs a fresh zero-expiry slot whose gen is one more
-// than the current slot's, via CAS retry. A concurrent extender that
-// captured the pre-invalidate generation will see the advanced gen
-// on its post-CAS recheck and roll back its own slot via pointer-
-// identity CAS.
+// invalidate clears the lease so the next read takes the slow path and
+// bumps the generation so a concurrent extender that captured the
+// pre-invalidate generation cannot resurrect the lease. The store of
+// the zero sentinel is unconditional, even when the current expiry is
+// in the future: otherwise leadership-loss callbacks would be powerless
+// once a lease is in place.
+//
+// Store order matters for the lock-free reader. valid() reads only
+// expiryNanos; generation() reads only gen. Clearing the expiry BEFORE
+// bumping the generation guarantees that the fast-path guard (valid())
+// fails closed at least as early as the generation bump becomes visible.
+// If the generation were bumped first, a reader that loaded gen and then
+// loaded expiryNanos in the window before the zero-store landed could
+// observe "new generation, old (still valid) expiry" and serve a
+// fast-path read after leadership loss was already detected. With the
+// expiry cleared first, once any reader can observe the post-invalidate
+// generation it can also observe the cleared expiry, so the fast path is
+// never served past the point invalidation began.
+//
+// extend serializes on writeMu so the two never interleave: an extend
+// either runs fully before this invalidate (and is then cleared here) or
+// fully after (and observes the bumped generation via its guard and is
+// dropped). The intra-invalidate store order is invisible to a
+// mutex-serialized extend, so reordering does not weaken the extend
+// generation guard.
 func (s *leaseState) invalidate() {
 	if s == nil {
 		return
 	}
-	for {
-		stored := s.current.Load()
-		old := slotOrZero(stored)
-		next := &leaseSlot{expiryNanos: 0, gen: old.gen + 1}
-		if s.current.CompareAndSwap(stored, next) {
-			return
-		}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.expiryNanos.Store(0)
+	if onInvalidateBetweenStores != nil {
+		onInvalidateBetweenStores()
 	}
+	s.gen.Add(1)
 }
+
+// onInvalidateBetweenStores is a test-only hook invoked inside
+// invalidate() after the expiry has been cleared but before the
+// generation is bumped. It exists to make the intra-invalidate store
+// ordering deterministically observable so the fail-closed invariant can
+// be regression-tested; it is nil in production and adds a single
+// predictable-branch nil check to the once-per-leadership-change path.
+var onInvalidateBetweenStores func()

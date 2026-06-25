@@ -104,6 +104,7 @@ type sqsStoredQueueMeta struct {
 	ReceiveMessageWaitSeconds int64  `json:"receive_message_wait_seconds"`
 	MaximumMessageSize        int64  `json:"maximum_message_size"`
 	RedrivePolicy             string `json:"redrive_policy,omitempty"`
+	RedriveAllowPolicy        string `json:"redrive_allow_policy,omitempty"`
 	PartitionCount            uint32 `json:"partition_count,omitempty"`
 	FifoThroughputLimit       string `json:"fifo_throughput_limit,omitempty"`
 	DeduplicationScope        string `json:"deduplication_scope,omitempty"`
@@ -209,6 +210,7 @@ func (e *SQSRecordEncoder) addQueueMeta(b *snapshotBuilder, pub sqsQueueMetaPubl
 		ReceiveMessageWaitSeconds: pub.ReceiveMessageWaitSeconds,
 		MaximumMessageSize:        pub.MaximumMessageSize,
 		RedrivePolicy:             pub.RedrivePolicy,
+		RedriveAllowPolicy:        pub.RedriveAllowPolicy,
 		PartitionCount:            pub.PartitionCount,
 		FifoThroughputLimit:       pub.FifoThroughputLimit,
 		DeduplicationScope:        pub.DeduplicationScope,

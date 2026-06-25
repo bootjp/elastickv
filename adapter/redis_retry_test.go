@@ -457,3 +457,39 @@ func TestZSetDeltaCommitOnExistingWideColumn(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bExists, "new member 'b' must be written by delta commit")
 }
+
+func TestZRemDeletesWideColumnRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("wide:zrem")
+	require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey(key, []byte("a")), store.MarshalZSetScore(1.0), 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetScoreKey(key, 1.0, []byte("a")), []byte{}, 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetMemberKey(key, []byte("b")), store.MarshalZSetScore(2.0), 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetScoreKey(key, 2.0, []byte("b")), []byte{}, 1, 0))
+	require.NoError(t, st.PutAt(ctx, store.ZSetMetaKey(key), store.MarshalZSetMeta(store.ZSetMeta{Len: 2}), 1, 0))
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock.Observe(1)
+	srv := NewRedisServer(nil, "", st, coord, nil, nil)
+	conn := &recordingConn{}
+
+	srv.zrem(conn, redcon.Command{Args: [][]byte{[]byte("ZREM"), key, []byte("a")}})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(1), conn.int)
+
+	readTS := snapshotTS(coord.clock, st)
+	aMemberExists, err := st.ExistsAt(ctx, store.ZSetMemberKey(key, []byte("a")), readTS)
+	require.NoError(t, err)
+	require.False(t, aMemberExists, "ZREM must delete the wide-column member row")
+	aScoreExists, err := st.ExistsAt(ctx, store.ZSetScoreKey(key, 1.0, []byte("a")), readTS)
+	require.NoError(t, err)
+	require.False(t, aScoreExists, "ZREM must delete the wide-column score index row")
+
+	zset, exists, err := srv.loadZSetAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, []redisZSetEntry{{Member: "b", Score: 2.0}}, zset.Entries)
+}

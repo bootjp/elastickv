@@ -74,11 +74,7 @@ func readListValues(t *testing.T, server *DynamoDBServer, schema *dynamoTableSch
 }
 
 func newDedupItemWriteServer(st store.MVCCStore, coord kv.Coordinator, dedup bool) (*dynamoTableSchema, *DynamoDBServer) {
-	var opts []DynamoDBServerOption
-	if dedup {
-		opts = append(opts, WithDynamoOnePhaseTxnDedup(true))
-	}
-	server := NewDynamoDBServer(nil, st, coord, opts...)
+	server := NewDynamoDBServer(nil, st, coord, WithDynamoOnePhaseTxnDedup(dedup))
 	return dedupItemTable(), server
 }
 
@@ -251,8 +247,32 @@ func TestItemWriteDedup_NonLeaderFallsBackToLegacy(t *testing.T) {
 		"non-leader falls back to the legacy recompute path (leader allocates commit_ts via redirect)")
 }
 
+func TestItemWriteDedup_DefaultOn(t *testing.T) {
+	t.Setenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP", "")
+	server := NewDynamoDBServer(nil, store.NewMVCCStore(), newDedupTestCoordinator(store.NewMVCCStore(), 0, false))
+	require.True(t, server.onePhaseTxnDedup)
+}
+
+func TestItemWriteDedup_EnvOptOut(t *testing.T) {
+	t.Setenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP", "0")
+	server := NewDynamoDBServer(nil, store.NewMVCCStore(), newDedupTestCoordinator(store.NewMVCCStore(), 0, false))
+	require.False(t, server.onePhaseTxnDedup)
+}
+
+func TestItemWriteDedup_OptionOverridesEnv(t *testing.T) {
+	t.Setenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP", "0")
+	server := NewDynamoDBServer(nil, store.NewMVCCStore(), newDedupTestCoordinator(store.NewMVCCStore(), 0, false), WithDynamoOnePhaseTxnDedup(true))
+	require.True(t, server.onePhaseTxnDedup)
+}
+
+func TestItemWriteDedup_OptionOverridesEnvToDisable(t *testing.T) {
+	t.Setenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP", "1")
+	server := NewDynamoDBServer(nil, store.NewMVCCStore(), newDedupTestCoordinator(store.NewMVCCStore(), 0, false), WithDynamoOnePhaseTxnDedup(false))
+	require.False(t, server.onePhaseTxnDedup)
+}
+
 // TestItemWriteDedup_DisabledKeepsLegacyPath pins that the gate is load-bearing:
-// with onePhaseTxnDedup OFF (the default), the legacy retry RE-READS and
+// with onePhaseTxnDedup explicitly OFF, the legacy retry RE-READS and
 // recomputes, so a landed-then-ambiguous attempt 1 is double-applied — the
 // :duplicate-elements bug. This characterizes the pre-fix behavior the gate
 // closes; flipping the gate on (the headline test) eliminates the duplicate.

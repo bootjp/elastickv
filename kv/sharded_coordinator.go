@@ -1547,6 +1547,27 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
+// LeaseReadAllGroups establishes the lease freshness bound on every shard
+// group this coordinator owns. Multi-shard reads (Scan, GSI/whole-table
+// Query) visit all intersecting routes across all groups (see
+// ShardStore.ScanAt), so fencing only the default group would let those
+// reads sample a snapshot on a non-default group without the freshness
+// bound. It fails closed on the first group that cannot confirm its lease,
+// since a partially-fenced read is exactly the stale read this guards
+// against. Group iteration order is unspecified; correctness does not
+// depend on it because every group must succeed.
+func (c *ShardedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
+	if len(c.groups) == 0 {
+		return errors.WithStack(ErrLeaderNotFound)
+	}
+	for _, g := range c.groups {
+		if _, err := groupLeaseRead(ctx, g, c.leaseObserver); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
 // observeLeaseRead forwards a hit / miss signal to observer when it
 // is non-nil. Kept as a package-level helper so both ShardedCoordinator
 // and any future sharded caller share one nil-safe entrypoint.
@@ -1646,6 +1667,15 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 		return 0
 	}
 	return gid
+}
+
+// EngineGroupIDForKey reports the Raft group ID that owns key, or 0 when
+// the key cannot be routed. Callers that batch lease checks across many
+// keys use it to collapse keys sharing a group into a single lease read
+// (see GroupRoutableCoordinator). It performs no I/O — only an in-memory
+// router lookup — so it is safe on the read hot path.
+func (c *ShardedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
+	return c.engineGroupIDForKey(key)
 }
 
 // groupReadKeysByShardID groups txn read keys by their owning Raft

@@ -299,6 +299,10 @@ export interface SqsQueueList {
   queues: string[];
 }
 
+export interface UpdateQueueAttributesRequest {
+  attributes: Record<string, string>;
+}
+
 // SqsPeekedAttribute mirrors AWS's typed MessageAttribute shape;
 // binary_value arrives base64-encoded.
 export interface SqsPeekedAttribute {
@@ -553,6 +557,11 @@ export const api = {
     apiFetch<SqsQueueSummary>(`/sqs/queues/${encodeURIComponent(name)}`, { signal }),
   deleteQueue: (name: string) =>
     apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  updateQueueAttributes: (name: string, req: UpdateQueueAttributesRequest) =>
+    apiFetch<void>(`/sqs/queues/${encodeURIComponent(name)}/attributes`, {
+      method: "PUT",
+      body: req as unknown as Json,
+    }),
   // Non-destructive peek of currently-visible messages. Server clamps
   // limit to [1, 100] and body_max_bytes to [256, 262144].
   peekQueue: (name: string, opts?: SqsPeekOptions, signal?: AbortSignal) =>

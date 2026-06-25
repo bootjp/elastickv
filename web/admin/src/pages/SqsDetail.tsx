@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   api,
@@ -26,6 +26,7 @@ const kPeekBodyMaxBytes = 262144;
 export function SqsDetailPage() {
   const { name = "" } = useParams<{ name: string }>();
   const detail = useApiQuery((signal) => api.describeQueue(name, signal), [name]);
+  const queues = useApiQuery((signal) => api.listQueues(signal), []);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -126,6 +127,18 @@ export function SqsDetailPage() {
         </section>
       )}
 
+      {detail.data && (
+        <DLQSettingsSection
+          queue={name}
+          isFifo={detail.data.is_fifo}
+          attributes={detail.data.attributes ?? {}}
+          allQueues={queues.data?.queues ?? []}
+          queuesLoading={queues.loading}
+          queuesError={queues.error ? formatApiError(queues.error) : null}
+          onSaved={() => detail.reload()}
+        />
+      )}
+
       {detail.data?.attributes && Object.keys(detail.data.attributes).length > 0 && (
         <section className="card">
           <h2 className="text-sm font-semibold mb-3">Configuration</h2>
@@ -133,7 +146,7 @@ export function SqsDetailPage() {
             {Object.entries(detail.data.attributes).map(([k, v]) => (
               <div key={k} className="contents">
                 <dt className="text-muted font-mono text-xs">{k}</dt>
-                <dd className="font-mono">{v}</dd>
+                <dd className="font-mono break-all">{v}</dd>
               </div>
             ))}
           </dl>
@@ -182,6 +195,327 @@ export function SqsDetailPage() {
       </Modal>
     </div>
   );
+}
+
+type RedrivePermission = "allowAll" | "denyAll" | "byQueue";
+
+interface ParsedRedrivePolicy {
+  targetName: string;
+  maxReceiveCount: number;
+}
+
+interface ParsedRedriveAllowPolicy {
+  permission: RedrivePermission;
+  sourceQueueArns: string[];
+}
+
+interface DLQSettingsSectionProps {
+  queue: string;
+  isFifo: boolean;
+  attributes: Record<string, string>;
+  allQueues: string[];
+  queuesLoading: boolean;
+  queuesError: string | null;
+  onSaved: () => void;
+}
+
+function DLQSettingsSection({
+  queue,
+  isFifo,
+  attributes,
+  allQueues,
+  queuesLoading,
+  queuesError,
+  onSaved,
+}: DLQSettingsSectionProps) {
+  const arnPrefix = queueArnPrefix(attributes.QueueArn);
+  const parsedRedrive = useMemo(
+    () => parseRedrivePolicyAttribute(attributes.RedrivePolicy),
+    [attributes.RedrivePolicy],
+  );
+  const parsedAllow = useMemo(
+    () => parseRedriveAllowPolicyAttribute(attributes.RedriveAllowPolicy),
+    [attributes.RedriveAllowPolicy],
+  );
+  const candidateQueues = useMemo(
+    () => allQueues.filter((q) => q !== queue && isFifoQueueName(q) === isFifo),
+    [allQueues, isFifo, queue],
+  );
+  const parsedAllowSourceText = parsedAllow.sourceQueueArns.join("\n");
+
+  const [targetName, setTargetName] = useState(parsedRedrive.targetName);
+  const [maxReceiveCount, setMaxReceiveCount] = useState(String(parsedRedrive.maxReceiveCount));
+  const [redriveSaving, setRedriveSaving] = useState(false);
+  const [redriveError, setRedriveError] = useState<string | null>(null);
+  const [redriveSaved, setRedriveSaved] = useState<string | null>(null);
+
+  const [permission, setPermission] = useState<RedrivePermission>(parsedAllow.permission);
+  const [sourceQueueArnsText, setSourceQueueArnsText] = useState(parsedAllowSourceText);
+  const [allowSaving, setAllowSaving] = useState(false);
+  const [allowError, setAllowError] = useState<string | null>(null);
+  const [allowSaved, setAllowSaved] = useState<string | null>(null);
+  const redriveChoices = useMemo(() => {
+    if (!targetName || candidateQueues.includes(targetName)) return candidateQueues;
+    return [targetName, ...candidateQueues];
+  }, [candidateQueues, targetName]);
+
+  useEffect(() => {
+    setTargetName(parsedRedrive.targetName);
+    setMaxReceiveCount(String(parsedRedrive.maxReceiveCount));
+    setRedriveError(null);
+    setRedriveSaved(null);
+  }, [queue, parsedRedrive.maxReceiveCount, parsedRedrive.targetName]);
+
+  useEffect(() => {
+    setPermission(parsedAllow.permission);
+    setSourceQueueArnsText(parsedAllowSourceText);
+    setAllowError(null);
+    setAllowSaved(null);
+  }, [queue, parsedAllow.permission, parsedAllowSourceText]);
+
+  const onSaveRedrive = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setRedriveError(null);
+    setRedriveSaved(null);
+    const dlq = targetName.trim();
+    const maxReceive = Number(maxReceiveCount);
+    if (!arnPrefix) {
+      setRedriveError("QueueArn is not available for this queue.");
+      return;
+    }
+    if (!dlq) {
+      setRedriveError("Select a dead-letter queue.");
+      return;
+    }
+    if (!Number.isInteger(maxReceive) || maxReceive < 1 || maxReceive > 1000) {
+      setRedriveError("maxReceiveCount must be an integer from 1 to 1000.");
+      return;
+    }
+    setRedriveSaving(true);
+    try {
+      await api.updateQueueAttributes(queue, {
+        attributes: {
+          RedrivePolicy: JSON.stringify({
+            deadLetterTargetArn: queueArnForName(arnPrefix, dlq),
+            maxReceiveCount: maxReceive,
+          }),
+        },
+      });
+      setRedriveSaved("Saved");
+      onSaved();
+    } catch (err) {
+      setRedriveError(formatApiError(err));
+    } finally {
+      setRedriveSaving(false);
+    }
+  };
+
+  const onSaveAllowPolicy = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAllowError(null);
+    setAllowSaved(null);
+    const policy: { redrivePermission: RedrivePermission; sourceQueueArns?: string[] } = {
+      redrivePermission: permission,
+    };
+    if (permission === "byQueue") {
+      const parsedSources = parseSourceQueueArnInput(sourceQueueArnsText, arnPrefix);
+      if (parsedSources.needsArnPrefix) {
+        setAllowError("QueueArn is not available to expand local queue names. Enter full source queue ARNs.");
+        return;
+      }
+      if (parsedSources.sourceQueueArns.length === 0) {
+        setAllowError("Enter at least one source queue ARN or local queue name.");
+        return;
+      }
+      if (parsedSources.sourceQueueArns.length > 10) {
+        setAllowError("sourceQueueArns can contain at most 10 queues.");
+        return;
+      }
+      policy.sourceQueueArns = parsedSources.sourceQueueArns;
+    }
+    setAllowSaving(true);
+    try {
+      await api.updateQueueAttributes(queue, {
+        attributes: { RedriveAllowPolicy: JSON.stringify(policy) },
+      });
+      setAllowSaved("Saved");
+      onSaved();
+    } catch (err) {
+      setAllowError(formatApiError(err));
+    } finally {
+      setAllowSaving(false);
+    }
+  };
+
+  return (
+    <section className="card">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-semibold">DLQ settings</h2>
+        {queuesLoading && <span className="text-xs text-muted">Loading queues…</span>}
+      </div>
+      {queuesError && <div className="text-sm text-danger mb-3">{queuesError}</div>}
+      <div className="grid gap-4 lg:grid-cols-2">
+        <form className="space-y-3" onSubmit={(event) => void onSaveRedrive(event)}>
+          <div>
+            <label className="label" htmlFor="redrive-dlq">Dead-letter queue</label>
+            <select
+              id="redrive-dlq"
+              className="input font-mono"
+              value={targetName}
+              onChange={(e) => setTargetName(e.target.value)}
+              disabled={redriveSaving}
+            >
+              <option value="">None selected</option>
+              {redriveChoices.map((q) => (
+                <option key={q} value={q}>{q}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="label" htmlFor="redrive-max-receive">maxReceiveCount</label>
+            <input
+              id="redrive-max-receive"
+              type="number"
+              min={1}
+              max={1000}
+              step={1}
+              className="input font-mono"
+              value={maxReceiveCount}
+              onChange={(e) => setMaxReceiveCount(e.target.value)}
+              disabled={redriveSaving}
+            />
+          </div>
+          {redriveError && <div className="text-sm text-danger">{redriveError}</div>}
+          {redriveSaved && <div className="text-xs text-muted">{redriveSaved}</div>}
+          <button type="submit" className="btn-primary" disabled={redriveSaving}>
+            {redriveSaving ? "Saving…" : "Save redrive policy"}
+          </button>
+        </form>
+
+        <form className="space-y-3" onSubmit={(event) => void onSaveAllowPolicy(event)}>
+          <div>
+            <label className="label" htmlFor="redrive-allow-permission">Redrive permission</label>
+            <select
+              id="redrive-allow-permission"
+              className="input"
+              value={permission}
+              onChange={(e) => setPermission(e.target.value as RedrivePermission)}
+              disabled={allowSaving}
+            >
+              <option value="allowAll">allowAll</option>
+              <option value="denyAll">denyAll</option>
+              <option value="byQueue">byQueue</option>
+            </select>
+          </div>
+          {permission === "byQueue" && (
+            <div>
+              <label className="label" htmlFor="redrive-source-queues">Source queue ARNs</label>
+              <textarea
+                id="redrive-source-queues"
+                className="input font-mono min-h-24"
+                value={sourceQueueArnsText}
+                onChange={(e) => setSourceQueueArnsText(e.target.value)}
+                disabled={allowSaving}
+                placeholder={candidateQueues
+                  .map((name) => (arnPrefix ? queueArnForName(arnPrefix, name) : name))
+                  .join("\n")}
+              />
+            </div>
+          )}
+          {allowError && <div className="text-sm text-danger">{allowError}</div>}
+          {allowSaved && <div className="text-xs text-muted">{allowSaved}</div>}
+          <button type="submit" className="btn-primary" disabled={allowSaving}>
+            {allowSaving ? "Saving…" : "Save access policy"}
+          </button>
+        </form>
+      </div>
+    </section>
+  );
+}
+
+function parseRedrivePolicyAttribute(raw?: string): ParsedRedrivePolicy {
+  const fallback = { targetName: "", maxReceiveCount: 10 };
+  if (!raw) return fallback;
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    const targetArn = typeof obj.deadLetterTargetArn === "string" ? obj.deadLetterTargetArn : "";
+    const rawMax = obj.maxReceiveCount;
+    let maxReceiveCount = fallback.maxReceiveCount;
+    if (typeof rawMax === "number" && Number.isFinite(rawMax)) {
+      maxReceiveCount = Math.trunc(rawMax);
+    } else if (typeof rawMax === "string" && rawMax.trim() !== "") {
+      const parsed = Number(rawMax);
+      if (Number.isFinite(parsed)) maxReceiveCount = Math.trunc(parsed);
+    }
+    return {
+      targetName: queueNameFromArn(targetArn),
+      maxReceiveCount,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function parseRedriveAllowPolicyAttribute(raw?: string): ParsedRedriveAllowPolicy {
+  if (!raw) return { permission: "allowAll", sourceQueueArns: [] };
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    const permission = parseRedrivePermission(obj.redrivePermission);
+    const sourceQueueArns = Array.isArray(obj.sourceQueueArns)
+      ? obj.sourceQueueArns
+        .filter((arn): arn is string => typeof arn === "string")
+        .map((arn) => arn.trim())
+        .filter((arn) => arn !== "")
+      : [];
+    return { permission, sourceQueueArns };
+  } catch {
+    return { permission: "allowAll", sourceQueueArns: [] };
+  }
+}
+
+function parseRedrivePermission(value: unknown): RedrivePermission {
+  if (value === "denyAll" || value === "byQueue") return value;
+  return "allowAll";
+}
+
+function queueNameFromArn(arn: string): string {
+  const idx = arn.lastIndexOf(":");
+  if (idx < 0 || idx === arn.length - 1) return "";
+  return arn.slice(idx + 1);
+}
+
+function queueArnPrefix(arn?: string): string {
+  if (!arn) return "";
+  const idx = arn.lastIndexOf(":");
+  if (idx < 0) return "";
+  return arn.slice(0, idx + 1);
+}
+
+function queueArnForName(prefix: string, name: string): string {
+  return prefix + name;
+}
+
+function isFifoQueueName(name: string): boolean {
+  return name.endsWith(".fifo");
+}
+
+function parseSourceQueueArnInput(value: string, arnPrefix: string): { sourceQueueArns: string[]; needsArnPrefix: boolean } {
+  const seen = new Set<string>();
+  const sourceQueueArns: string[] = [];
+  let needsArnPrefix = false;
+  for (const part of value.split(/[,\n]/u)) {
+    const raw = part.trim();
+    if (!raw) continue;
+    const arn = raw.startsWith("arn:") ? raw : arnPrefix ? queueArnForName(arnPrefix, raw) : "";
+    if (!arn) {
+      needsArnPrefix = true;
+      continue;
+    }
+    if (seen.has(arn)) continue;
+    seen.add(arn);
+    sourceQueueArns.push(arn);
+  }
+  return { sourceQueueArns, needsArnPrefix };
 }
 
 interface MessagesSectionProps {

@@ -97,6 +97,7 @@ type sqsQueueMeta struct {
 	ReceiveMessageWaitSeconds int64             `json:"receive_message_wait_seconds"`
 	MaximumMessageSize        int64             `json:"maximum_message_size"`
 	RedrivePolicy             string            `json:"redrive_policy,omitempty"`
+	RedriveAllowPolicy        string            `json:"redrive_allow_policy,omitempty"`
 	Tags                      map[string]string `json:"tags,omitempty"`
 	// LastPurgedAtMillis is the wall-clock time of the last successful
 	// PurgeQueue. AWS rate-limits PurgeQueue to once per 60 seconds per
@@ -565,6 +566,13 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 		m.RedrivePolicy = v
 		return nil
 	},
+	"RedriveAllowPolicy": func(m *sqsQueueMeta, v string) error {
+		if _, err := parseRedriveAllowPolicy(v); err != nil {
+			return err
+		}
+		m.RedriveAllowPolicy = v
+		return nil
+	},
 }
 
 // applyAttributes writes every entry in attrs into meta, returning a typed
@@ -784,7 +792,8 @@ func baseAttributesEqual(a, b *sqsQueueMeta) bool {
 		a.DelaySeconds == b.DelaySeconds &&
 		a.ReceiveMessageWaitSeconds == b.ReceiveMessageWaitSeconds &&
 		a.MaximumMessageSize == b.MaximumMessageSize &&
-		a.RedrivePolicy == b.RedrivePolicy
+		a.RedrivePolicy == b.RedrivePolicy &&
+		a.RedriveAllowPolicy == b.RedriveAllowPolicy
 }
 
 // throttleConfigEqual compares two Throttle configs for the
@@ -985,6 +994,9 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// #734) and BEFORE the dispatch (so a rejected create does not
 	// burn an OCC commit).
 	if err := s.validateHTFIFOCapability(ctx, requested); err != nil {
+		return false, err
+	}
+	if err := s.validateRedrivePolicyTarget(ctx, requested, readTS); err != nil {
 		return false, err
 	}
 	lastGen, err := s.loadQueueGenerationAt(ctx, requested.Name, readTS)
@@ -1446,9 +1458,7 @@ func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection, 
 		all["ApproximateNumberOfMessagesNotVisible"] = strconv.FormatInt(counters.NotVisible, 10)
 		all["ApproximateNumberOfMessagesDelayed"] = strconv.FormatInt(counters.Delayed, 10)
 	}
-	if meta.RedrivePolicy != "" {
-		all["RedrivePolicy"] = meta.RedrivePolicy
-	}
+	addRedriveAttributes(all, meta)
 	// Throttle* are non-AWS extensions. Surfacing them in
 	// GetQueueAttributes lets operators read back what they set; SDKs
 	// that strictly validate the attribute set will ignore unknown
@@ -1469,6 +1479,15 @@ func queueMetaToAttributes(meta *sqsQueueMeta, selection sqsAttributeSelection, 
 		}
 	}
 	return out
+}
+
+func addRedriveAttributes(out map[string]string, meta *sqsQueueMeta) {
+	if meta.RedrivePolicy != "" {
+		out["RedrivePolicy"] = meta.RedrivePolicy
+	}
+	if meta.RedriveAllowPolicy != "" {
+		out["RedriveAllowPolicy"] = meta.RedriveAllowPolicy
+	}
 }
 
 func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
@@ -1597,6 +1616,9 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 	// floats wrapped in a struct).
 	preThrottle := snapshotThrottle(meta.Throttle)
 	if err := applyAndValidateSetAttributes(meta, attrs); err != nil {
+		return false, false, err
+	}
+	if err := s.validateRedrivePolicyTarget(ctx, meta, readTS); err != nil {
 		return false, false, err
 	}
 	throttleChanged := !throttleConfigEqual(preThrottle, meta.Throttle)
