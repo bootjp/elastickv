@@ -117,3 +117,22 @@ func TestZSetRangeByScoreFastAppliesBoundedWindowForUniqueScores(t *testing.T) {
 		{Member: "m6", Score: 3},
 	}, got)
 }
+
+func TestZSetFastPathTruncatedFallsBackWhenRequestedWindowExceedsScanCap(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, zsetFastPathTruncated(
+		maxWideScanLimit,
+		maxWideScanLimit,
+		maxWideScanLimit,
+		maxWideScanLimit-10,
+		20,
+	))
+	require.False(t, zsetFastPathTruncated(
+		maxWideScanLimit-1,
+		maxWideScanLimit,
+		maxWideScanLimit-1,
+		maxWideScanLimit-10,
+		20,
+	))
+}

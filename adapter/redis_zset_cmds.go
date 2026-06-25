@@ -233,7 +233,7 @@ func zsetFastPathTruncated(scannedRows, scanLimit, matchingEntries, offset, limi
 	}
 	needed := offset + limit
 	if needed < offset || needed > maxWideScanLimit {
-		needed = maxWideScanLimit
+		return true
 	}
 	return matchingEntries < needed
 }
