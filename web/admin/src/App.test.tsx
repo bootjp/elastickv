@@ -125,7 +125,7 @@ describe("LoginPage", () => {
     );
 
     await user.type(screen.getByLabelText("Access key"), "  AKIA_TEST  ");
-    await user.type(screen.getByLabelText("Secret key"), "  SECRET_TEST\n");
+    await user.type(screen.getByLabelText("Secret key"), "  SECRET_TEST  ");
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByText("KeyViz target")).toBeInTheDocument();
