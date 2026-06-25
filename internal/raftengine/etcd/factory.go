@@ -16,6 +16,14 @@ type FactoryConfig struct {
 	ElectionTick   int
 	MaxSizePerMsg  uint64
 	MaxInflightMsg int
+	// ColdStartObserver receives cold-start snapshot-restore
+	// lifecycle events for the Branch 3 skip gate
+	// (raftengine.ColdStartObserver). The Factory threads it into
+	// every OpenConfig it builds; nil disables metrics emission
+	// (the skip itself still runs). Wire via main.go from
+	// monitoring.Registry.ColdStartObserver(). See PR #934 round-1
+	// codex P2 for the plumbing rationale.
+	ColdStartObserver raftengine.ColdStartObserver
 }
 
 // Factory creates etcd raft engine instances.
@@ -44,18 +52,20 @@ func (f *Factory) Create(cfg raftengine.FactoryConfig) (*raftengine.FactoryResul
 	}
 
 	engine, err := Open(context.Background(), OpenConfig{
-		LocalID:        cfg.LocalID,
-		LocalAddress:   cfg.LocalAddress,
-		DataDir:        cfg.DataDir,
-		Peers:          peers,
-		Bootstrap:      cfg.Bootstrap,
-		Transport:      transport,
-		StateMachine:   cfg.StateMachine,
-		TickInterval:   f.cfg.TickInterval,
-		HeartbeatTick:  f.cfg.HeartbeatTick,
-		ElectionTick:   f.cfg.ElectionTick,
-		MaxSizePerMsg:  f.cfg.MaxSizePerMsg,
-		MaxInflightMsg: f.cfg.MaxInflightMsg,
+		LocalID:           cfg.LocalID,
+		LocalAddress:      cfg.LocalAddress,
+		DataDir:           cfg.DataDir,
+		Peers:             peers,
+		Bootstrap:         cfg.Bootstrap,
+		JoinAsLearner:     cfg.JoinAsLearner,
+		Transport:         transport,
+		StateMachine:      cfg.StateMachine,
+		TickInterval:      f.cfg.TickInterval,
+		HeartbeatTick:     f.cfg.HeartbeatTick,
+		ElectionTick:      f.cfg.ElectionTick,
+		MaxSizePerMsg:     f.cfg.MaxSizePerMsg,
+		MaxInflightMsg:    f.cfg.MaxInflightMsg,
+		ColdStartObserver: f.cfg.ColdStartObserver,
 	})
 	if err != nil {
 		var closeErr error

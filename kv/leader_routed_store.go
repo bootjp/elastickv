@@ -53,7 +53,7 @@ func (s *LeaderRoutedStore) leaderFenceTS(ctx context.Context, key []byte) (bool
 	if !s.coordinator.IsLeaderForKey(key) {
 		return false, 0
 	}
-	return s.coordinator.VerifyLeaderForKey(key) == nil, 0
+	return s.coordinator.VerifyLeaderForKey(ctx, key) == nil, 0
 }
 
 // leaderOKForKey returns whether the local store is authoritative for key.
@@ -188,6 +188,63 @@ func (s *LeaderRoutedStore) ExistsAt(ctx context.Context, key []byte, ts uint64)
 	return err == nil, errors.WithStack(err)
 }
 
+// CommittedVersionAt gates the exact-timestamp existence probe so client
+// reads through this wrapper get a fresh authoritative answer even on a
+// deposed leader. The FSM apply path is NOT affected — it holds the raw
+// local store (not a LeaderRoutedStore), so its deterministic probe never
+// goes through this method. The option-2 reuse path
+// (RedisServer.resolveReuseLength) DOES call this and needs the
+// authoritative answer to preserve the pending.length fast-path
+// (returning the per-our-commit length rather than the leader's current
+// Len) when our prior attempt actually committed.
+//
+// Two-path strategy, mirroring how LatestCommitTS uses a lease fast-path
+// and a proxy slow-path:
+//
+//   - We are the leader with a valid lease (leaderOKForKey is true): the
+//     local replica is up-to-date by the lease invariant; read local.
+//   - Not leader (deposed or never): there is no RawCommittedVersionAt
+//     RPC to proxy to, so use the coordinator's LinearizableRead to
+//     submit a Raft ReadIndex — that protocol forwards to the current
+//     leader and waits until our local applied index has caught up to
+//     the leader's commit point. After that, a local probe sees every
+//     committed version of this key (including any landed at commitTS).
+//     If the read-index fails (no leader reachable, ctx canceled), fall
+//     back to (false, nil); the adapter's resolveReuseLength then re-reads
+//     via the already-leader-fenced ScanAt/GetAt, returning the leader's
+//     current Len — a valid serialization, just not the per-our-commit
+//     value.
+func (s *LeaderRoutedStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	if s == nil || s.local == nil {
+		return false, nil
+	}
+	if !s.leaderOKForKey(ctx, key) && !s.tryLinearizableFence(ctx) {
+		// Not leader and ReadIndex failed (no coordinator wired, no leader
+		// reachable, ctx canceled). Report (false, nil) so the adapter's
+		// resolveReuseLength falls through to the leader-fenced ScanAt/GetAt
+		// path, which returns a valid current-Len serialization.
+		return false, nil
+	}
+	exists, err := s.local.CommittedVersionAt(ctx, key, commitTS)
+	return exists, errors.WithStack(err)
+}
+
+// tryLinearizableFence submits a Raft ReadIndex via the coordinator and
+// reports whether it succeeded. After a successful ReadIndex the local
+// applied index is caught up to the current leader's commit point, so a
+// subsequent local read sees every committed version. The error from the
+// underlying call is intentionally not surfaced — callers that need the
+// authoritative answer treat a failed fence as "couldn't verify, fall back
+// to the leader-routed slow path." Structured to avoid the nilerr
+// false positive at the call site.
+func (s *LeaderRoutedStore) tryLinearizableFence(ctx context.Context) bool {
+	if s == nil || s.coordinator == nil {
+		return false
+	}
+	_, err := s.coordinator.LinearizableRead(ctx)
+	return err == nil
+}
+
 func (s *LeaderRoutedStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	if s == nil || s.local == nil {
 		return []*store.KVPair{}, nil
@@ -273,6 +330,16 @@ func (s *LeaderRoutedStore) ApplyMutationsRaft(ctx context.Context, mutations []
 	return errors.WithStack(s.local.ApplyMutationsRaft(ctx, mutations, readKeys, startTS, commitTS))
 }
 
+// ApplyMutationsRaftAt forwards to the local store's raft-entry-index-
+// aware variant so the underlying pebbleStore can bundle
+// metaAppliedIndex with the mutation. See PR #910 design §2.
+func (s *LeaderRoutedStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
 func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)
@@ -286,6 +353,64 @@ func (s *LeaderRoutedStore) DeletePrefixAtRaft(ctx context.Context, prefix []byt
 		return errors.WithStack(store.ErrNotSupported)
 	}
 	return errors.WithStack(s.local.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS))
+}
+
+// DeletePrefixAtRaftAt forwards to the local store's raft-entry-
+// index-aware variant. See PR #910 design §2 "why both leaves".
+func (s *LeaderRoutedStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex))
+}
+
+// LastAppliedIndex forwards to the local store when it implements
+// raftengine.AppliedIndexReader. Defensive: in production today the
+// kvFSM holds a *pebbleStore directly (not a LeaderRoutedStore — that
+// wrapper is used by adapter/server code for read routing, not by
+// the FSM apply path); so this forward is currently dead code for
+// the cold-start skip optimisation. We add it anyway because future
+// refactors might wrap the FSM's store, and a silent no-op there
+// would degrade the optimisation to full-restore-always with no
+// failure signal.
+//
+// (0, false, nil) returns are the strictly-additive fallback —
+// either the wrapper has no local, the local does not implement
+// the reader, or the local reports missing/truncated. The caller in
+// internal/raftengine/etcd/wal_store.go (Branch 3) treats all of
+// these as "fall back to full restore", which is correct.
+func (s *LeaderRoutedStore) LastAppliedIndex() (uint64, bool, error) {
+	if s == nil || s.local == nil {
+		return 0, false, nil
+	}
+	reader, ok := s.local.(interface {
+		LastAppliedIndex() (uint64, bool, error)
+	})
+	if !ok {
+		return 0, false, nil
+	}
+	idx, present, err := reader.LastAppliedIndex()
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return idx, present, nil
+}
+
+// SetDurableAppliedIndex forwards to the local store when it
+// implements raftengine.AppliedIndexWriter. Symmetric defensive
+// no-op when the local store does not expose the writer seam — see
+// LastAppliedIndex doc-comment.
+func (s *LeaderRoutedStore) SetDurableAppliedIndex(idx uint64) error {
+	if s == nil || s.local == nil {
+		return nil
+	}
+	writer, ok := s.local.(interface {
+		SetDurableAppliedIndex(idx uint64) error
+	})
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(writer.SetDurableAppliedIndex(idx))
 }
 
 func (s *LeaderRoutedStore) LastCommitTS() uint64 {

@@ -51,7 +51,7 @@ services:
       - redis-proxy-ha
 
   nginx:
-    image: nginx:1.30-alpine
+    image: nginx:1.31-alpine
     container_name: redis-proxy-nginx
     restart: unless-stopped
     depends_on:

@@ -46,6 +46,9 @@ type stubFollowerEngine struct {
 func (s *stubFollowerEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return nil, raftengine.ErrNotLeader
 }
+func (s *stubFollowerEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return s.Propose(ctx, data)
+}
 func (s *stubFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
 func (s *stubFollowerEngine) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "leader", Address: s.leaderAddr}
@@ -81,7 +84,7 @@ func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 			},
 		},
 	}
-	resp, err := p.Commit(reqs)
+	resp, err := p.Commit(context.Background(), reqs)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.Greater(t, resp.CommitIndex, uint64(0))
@@ -135,7 +138,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		},
 	}
 
-	resp, err := p.Commit(reqs)
+	resp, err := p.Commit(context.Background(), reqs)
 	require.NoError(t, err)
 	require.Equal(t, uint64(123), resp.CommitIndex)
 
@@ -161,6 +164,9 @@ func (e *togglingFollowerEngine) setLeader(addr string) {
 
 func (e *togglingFollowerEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return nil, raftengine.ErrNotLeader
+}
+func (e *togglingFollowerEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.Propose(ctx, data)
 }
 func (e *togglingFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
 func (e *togglingFollowerEngine) Leader() raftengine.LeaderInfo {
@@ -245,7 +251,7 @@ func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 		eng.setLeader(lis.Addr().String())
 	}()
 
-	resp, err := p.Commit(reqs)
+	resp, err := p.Commit(context.Background(), reqs)
 	elapsed := time.Since(start)
 	require.NoError(t, err)
 	require.Equal(t, uint64(42), resp.CommitIndex)
@@ -289,7 +295,7 @@ func TestLeaderProxy_FailsAfterLeaderBudgetElapses(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err := p.Commit(reqs)
+	_, err := p.Commit(context.Background(), reqs)
 	elapsed := time.Since(start)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrLeaderNotFound)

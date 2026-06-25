@@ -105,7 +105,7 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	startTS := uint64(1)
 	key := []byte("k")
 
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, key, []byte("v"), key)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, key, []byte("v"), key)})
 	require.NoError(t, err)
 
 	_, err = shardStore.GetAt(ctx, key, ^uint64(0))
@@ -125,9 +125,9 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingCrossShardTxn(t *testing.T) {
 	primaryKey := []byte("b")
 	secondaryKey := []byte("x")
 
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
 	require.NoError(t, err)
-	_, err = groups[2].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
+	_, err = groups[2].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
 	require.NoError(t, err)
 
 	_, err = shardStore.GetAt(ctx, primaryKey, ^uint64(0))
@@ -153,9 +153,9 @@ func TestShardStoreGetAt_ResolvesCommittedSecondaryLock(t *testing.T) {
 	primaryKey := []byte("b") // group 1
 	secondaryKey := []byte("x")
 
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
 	require.NoError(t, err)
-	_, err = groups[2].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
+	_, err = groups[2].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
 	require.NoError(t, err)
 
 	commitPrimary := &pb.Request{
@@ -167,7 +167,7 @@ func TestShardStoreGetAt_ResolvesCommittedSecondaryLock(t *testing.T) {
 			{Op: pb.Op_PUT, Key: primaryKey},
 		},
 	}
-	_, err = groups[1].Txn.Commit([]*pb.Request{commitPrimary})
+	_, err = groups[1].Txn.Commit(context.Background(), []*pb.Request{commitPrimary})
 	require.NoError(t, err)
 
 	// Reading the secondary key should resolve it based on the primary commit record.
@@ -189,9 +189,9 @@ func TestShardStoreScanAt_ResolvesCommittedCrossShardTxn(t *testing.T) {
 	primaryKey := []byte("b")
 	secondaryKey := []byte("x")
 
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
 	require.NoError(t, err)
-	_, err = groups[2].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
+	_, err = groups[2].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
 	require.NoError(t, err)
 
 	commitPrimary := &pb.Request{
@@ -203,7 +203,7 @@ func TestShardStoreScanAt_ResolvesCommittedCrossShardTxn(t *testing.T) {
 			{Op: pb.Op_PUT, Key: primaryKey},
 		},
 	}
-	_, err = groups[1].Txn.Commit([]*pb.Request{commitPrimary})
+	_, err = groups[1].Txn.Commit(context.Background(), []*pb.Request{commitPrimary})
 	require.NoError(t, err)
 
 	kvs, err := shardStore.ScanAt(ctx, []byte("a"), []byte("z"), 100, commitTS)
@@ -243,7 +243,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLock(t *testing.T) {
 	require.NoError(t, st1.PutAt(ctx, key, []byte("old"), 1, 0))
 
 	startTS := uint64(2)
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, key, []byte("v"), key)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, key, []byte("v"), key)})
 	require.NoError(t, err)
 
 	_, err = shardStore.ScanAt(ctx, []byte(""), nil, 100, ^uint64(0))
@@ -271,7 +271,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedForPendingLockWithoutCommittedValue(t 
 
 	key := []byte("k")
 	startTS := uint64(1)
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, key, []byte("v"), key)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, key, []byte("v"), key)})
 	require.NoError(t, err)
 
 	// User-key range does not include raw !txn|lock|... keys, so lock-only
@@ -316,7 +316,7 @@ func TestShardStoreScanAt_ReturnsTxnLockedWhenPendingLockExceedsUserLimit(t *tes
 			{Op: pb.Op_PUT, Key: committedSecondary, Value: []byte("va")},
 		},
 	}
-	_, err := groups[1].Txn.Commit([]*pb.Request{prepareCommitted})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{prepareCommitted})
 	require.NoError(t, err)
 	commitCommittedPrimary := &pb.Request{
 		IsTxn: true,
@@ -327,13 +327,13 @@ func TestShardStoreScanAt_ReturnsTxnLockedWhenPendingLockExceedsUserLimit(t *tes
 			{Op: pb.Op_PUT, Key: committedPrimary},
 		},
 	}
-	_, err = groups[1].Txn.Commit([]*pb.Request{commitCommittedPrimary})
+	_, err = groups[1].Txn.Commit(context.Background(), []*pb.Request{commitCommittedPrimary})
 	require.NoError(t, err)
 
 	// Create a later pending lock-only write that must block the scan.
 	pendingPrimary := []byte("b")
 	pendingStartTS := uint64(4)
-	_, err = groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(pendingStartTS, pendingPrimary, []byte("vb"), pendingPrimary)})
+	_, err = groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(pendingStartTS, pendingPrimary, []byte("vb"), pendingPrimary)})
 	require.NoError(t, err)
 
 	// limit=1 should not hide pending locks after one resolved lock.
@@ -359,7 +359,7 @@ func TestShardStoreScanAt_ResolvesCommittedSecondaryLocks(t *testing.T) {
 	require.NoError(t, groups[2].Store.PutAt(ctx, secondaryKey1, []byte("old2"), 1, 0))
 	require.NoError(t, groups[2].Store.PutAt(ctx, secondaryKey2, []byte("old3"), 1, 0))
 
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
 	require.NoError(t, err)
 
 	prepareMeta := &pb.Mutation{
@@ -377,7 +377,7 @@ func TestShardStoreScanAt_ResolvesCommittedSecondaryLocks(t *testing.T) {
 			{Op: pb.Op_PUT, Key: secondaryKey2, Value: []byte("v3")},
 		},
 	}
-	_, err = groups[2].Txn.Commit([]*pb.Request{prepareSecondary})
+	_, err = groups[2].Txn.Commit(context.Background(), []*pb.Request{prepareSecondary})
 	require.NoError(t, err)
 
 	commitPrimary := &pb.Request{
@@ -389,7 +389,7 @@ func TestShardStoreScanAt_ResolvesCommittedSecondaryLocks(t *testing.T) {
 			{Op: pb.Op_PUT, Key: primaryKey},
 		},
 	}
-	_, err = groups[1].Txn.Commit([]*pb.Request{commitPrimary})
+	_, err = groups[1].Txn.Commit(context.Background(), []*pb.Request{commitPrimary})
 	require.NoError(t, err)
 
 	kvs, err := shardStore.ScanAt(ctx, []byte("w"), nil, 100, commitTS)
@@ -417,9 +417,9 @@ func TestShardStoreScanAt_ResolvesCommittedSecondaryLockWithoutCommittedValue(t 
 	primaryKey := []byte("b")
 	secondaryKey := []byte("x")
 
-	_, err := groups[1].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, primaryKey, []byte("v1"), primaryKey)})
 	require.NoError(t, err)
-	_, err = groups[2].Txn.Commit([]*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
+	_, err = groups[2].Txn.Commit(context.Background(), []*pb.Request{makePrepareRequest(startTS, secondaryKey, []byte("v2"), primaryKey)})
 	require.NoError(t, err)
 
 	commitPrimary := &pb.Request{
@@ -431,7 +431,7 @@ func TestShardStoreScanAt_ResolvesCommittedSecondaryLockWithoutCommittedValue(t 
 			{Op: pb.Op_PUT, Key: primaryKey},
 		},
 	}
-	_, err = groups[1].Txn.Commit([]*pb.Request{commitPrimary})
+	_, err = groups[1].Txn.Commit(context.Background(), []*pb.Request{commitPrimary})
 	require.NoError(t, err)
 
 	kvs, err := shardStore.ScanAt(ctx, []byte("x"), []byte("z"), 100, commitTS)

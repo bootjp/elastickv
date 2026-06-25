@@ -23,6 +23,20 @@ var (
 	// ErrLeadershipTransferInProgress indicates a leadership transfer
 	// is under way and proposals are being held back.
 	ErrLeadershipTransferInProgress = errors.New("raft engine: leadership transfer in progress")
+	// ErrEnvelopeCutoverInProgress indicates the §7.1 raft-envelope
+	// cutover barrier is open on this leader and rejecting fresh
+	// USER proposals on the Propose path. The error is the step-1
+	// gate-rejection surface for coordinator clients while the
+	// EnableRaftEnvelope handler runs the 6-step barrier sequence
+	// (block intake → drain → propose cutover via ProposeAdmin →
+	// wait apply → flip wrap → unblock). Callers should treat it
+	// as a transient back-off: a healthy cluster spends single-
+	// digit milliseconds inside the barrier. ProposeAdmin is the
+	// design's barrier exemption (admin entries that MUST remain
+	// admissible across the barrier — the cutover marker itself,
+	// ConfChange-time RegisterEncryptionWriter) and never observes
+	// this error.
+	ErrEnvelopeCutoverInProgress = errors.New("raft engine: envelope cutover in progress")
 )
 
 type State string
@@ -73,8 +87,45 @@ type ProposalResult struct {
 	Response    any
 }
 
+// Proposer drives a Raft proposal through the engine and returns
+// once it has been committed (or the context/engine cancels first).
+//
+// Two semantically distinct entry points, differing ONLY in the
+// §7.1 quiescence-barrier check Stage 6E-2d installs on Propose:
+//
+//   - Propose carries ordinary user-data and control-plane traffic
+//     that may be paused during a raft-envelope cutover. 6E-2d will
+//     reject these with ErrEnvelopeCutoverInProgress while the
+//     barrier is open so the leader cannot admit a fresh entry at
+//     `index > raftEnvelopeCutoverIndex` mid-installation.
+//   - ProposeAdmin carries proposals that MUST remain admissible
+//     across the barrier — the EnableRaftEnvelope cutover entry
+//     itself (without this exemption the barrier would deadlock on
+//     its own cutover proposal) and ConfChange-time
+//     RegisterEncryptionWriter proposals (Stage 7c §3.1, so a new
+//     member joining mid-barrier can still register its
+//     writer-registry entry).
+//
+// ProposeAdmin is NOT a wrap-exemption: a payload-wrap layer
+// configured above the engine (kv.wrappedProposer) applies its
+// wrap closure to both methods identically. Admin entries that
+// land at `index > raftEnvelopeCutoverIndex` (a leader-restart
+// registration, a post-cutover RotateDEK, etc.) must carry the
+// AEAD envelope the §6.3 strict-`>` apply hook expects; a cleartext
+// admin entry above cutover would halt the apply loop on
+// unwrap-failure. The lone exception is the EnableRaftEnvelope
+// cutover marker (sits at `index == cutover`, strict-`>` leaves it
+// alone), which is proposed via a raw engine reference and never
+// flows through the wrap layer in the first place.
+//
+// In the current build the two methods are operationally
+// equivalent (the barrier is still 6E-2d work); the distinction at
+// the call site is the migration the future barrier requires —
+// sites still on Propose would fail closed the moment 6E-2d
+// activates the barrier.
 type Proposer interface {
 	Propose(ctx context.Context, data []byte) (*ProposalResult, error)
+	ProposeAdmin(ctx context.Context, data []byte) (*ProposalResult, error)
 }
 
 type LeaderView interface {
@@ -172,9 +223,52 @@ type Admin interface {
 	StatusReader
 	ConfigReader
 	AddVoter(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
+	// AddLearner attaches a non-voting replica that receives MsgApp /
+	// MsgSnap and applies log entries locally but does not contribute
+	// to the voter quorum. Use this instead of AddVoter when joining
+	// a fresh node so the cluster's effective fault tolerance is not
+	// reduced during catch-up. Promote with PromoteLearner once the
+	// learner has caught up. See
+	// docs/design/2026_04_26_proposed_raft_learner.md.
+	AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
+	// PromoteLearner promotes an existing learner to voter. The
+	// minAppliedIndex precondition is enforced against the leader's
+	// Progress[nodeID].Match before the conf change is proposed: if
+	// the learner has not yet caught up to that index, the call
+	// returns FailedPrecondition.
+	//
+	// minAppliedIndex == 0 is REJECTED unless skipMinAppliedCheck is
+	// also true, so an operator running a copy-pasted script that
+	// omits the catch-up check gets a clean FailedPrecondition
+	// instead of a silent quorum stall. Set skipMinAppliedCheck only
+	// when the catch-up has been confirmed out-of-band.
+	PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error)
 	RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 	TransferLeadership(ctx context.Context) error
 	TransferLeadershipToServer(ctx context.Context, id string, address string) error
+	// RegisterLeaderAcquiredCallback registers fn to fire every
+	// time the local node's Raft state transitions INTO leader
+	// (initial election, re-election, transfer target completion).
+	// Callbacks fire on the previous!=Leader → status==Leader edge
+	// AFTER the engine has published isLeader, so a callback that
+	// calls engine.State() observes StateLeader.
+	//
+	// Use case: per-shard policy hooks that need to audit a
+	// freshly-acquired leadership ("am I still allowed to be
+	// leader of this group?"). The SQS HT-FIFO leadership-refusal
+	// hook (§8 of the split-queue FIFO design) hangs off this to
+	// TransferLeadership when the binary lacks the htfifo
+	// capability but a partitioned queue is mapped to this Raft
+	// group.
+	//
+	// Same non-blocking + panic-contained contract as
+	// LeaseProvider.RegisterLeaderLossCallback. A callback that
+	// needs to do real work (enumerate the catalog, call
+	// TransferLeadership) MUST offload to a goroutine.
+	//
+	// The returned function deregisters this specific registration
+	// and is safe to call multiple times.
+	RegisterLeaderAcquiredCallback(fn func()) (deregister func())
 }
 
 type Engine interface {

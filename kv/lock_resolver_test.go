@@ -44,7 +44,7 @@ func setupLockResolverEnv(t *testing.T) (*LockResolver, *ShardStore, map[uint64]
 // prepareLock writes a PREPARE request (which creates a lock) for a key.
 func prepareLock(t *testing.T, g *ShardGroup, startTS uint64, key, primaryKey, value []byte, lockTTLms uint64) {
 	t.Helper()
-	_, err := g.Txn.Commit([]*pb.Request{{
+	_, err := g.Txn.Commit(context.Background(), []*pb.Request{{
 		IsTxn: true,
 		Phase: pb.Phase_PREPARE,
 		Ts:    startTS,
@@ -63,7 +63,7 @@ func prepareLock(t *testing.T, g *ShardGroup, startTS uint64, key, primaryKey, v
 // commitPrimary writes a COMMIT record for a transaction's primary key.
 func commitPrimary(t *testing.T, g *ShardGroup, startTS, commitTS uint64, primaryKey []byte) {
 	t.Helper()
-	_, err := g.Txn.Commit([]*pb.Request{{
+	_, err := g.Txn.Commit(context.Background(), []*pb.Request{{
 		IsTxn: true,
 		Phase: pb.Phase_COMMIT,
 		Ts:    startTS,
@@ -156,7 +156,7 @@ func TestLockResolver_ResolvesExpiredRolledBackLock(t *testing.T) {
 	prepareLock(t, groups[2], startTS, secondaryKey, primaryKey, []byte("v2"), 0)
 
 	// Abort the primary.
-	_, err := groups[1].Txn.Commit([]*pb.Request{{
+	_, err := groups[1].Txn.Commit(context.Background(), []*pb.Request{{
 		IsTxn: true,
 		Phase: pb.Phase_ABORT,
 		Ts:    startTS,

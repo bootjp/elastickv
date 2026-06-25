@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -10,8 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -62,11 +66,30 @@ type adminListenerConfig struct {
 // up the admin listener. It owns the flag → config translation and the
 // credentials loading so run() does not inherit that complexity.
 //
+// keyVizFanoutConfig bundles the operator-supplied fan-out flags.
+// Empty Nodes leaves the keyviz handler in single-node mode.
+type keyVizFanoutConfig struct {
+	Nodes   []string
+	Timeout time.Duration
+}
+
 // When admin is disabled (the default) the function returns immediately
 // without touching --s3CredentialsFile: pulling the admin feature into
 // a hard dependency on that file would break deployments that never
 // intended to use it.
-func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, runtimes []*raftGroupRuntime) error {
+func startAdminFromFlags(
+	ctx context.Context,
+	lc *net.ListenConfig,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	dynamoServer *adapter.DynamoDBServer,
+	s3Server *adapter.S3Server,
+	sqsServer *adapter.SQSServer,
+	coordinate kv.Coordinator,
+	connCache *kv.GRPCConnCache,
+	keyvizSampler *keyviz.MemSampler,
+	keyvizFanoutCfg keyVizFanoutConfig,
+) error {
 	if !*adminEnabled {
 		return nil
 	}
@@ -106,8 +129,878 @@ func startAdminFromFlags(ctx context.Context, lc *net.ListenConfig, eg *errgroup
 		fullAccessKeys:            parseCSV(*adminFullAccessKeys),
 	}
 	clusterSrc := newClusterInfoSource(*raftId, buildVersion(), runtimes)
-	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, buildVersion())
+	tablesSrc := newDynamoTablesSource(dynamoServer)
+	bucketsSrc := newBucketsSource(s3Server)
+	queuesSrc := newSqsQueuesSource(sqsServer)
+	forwarder, err := buildAdminLeaderForwarder(coordinate, connCache, *raftId)
+	if err != nil {
+		return errors.Wrap(err, "build admin leader forwarder")
+	}
+	leaderProbe := newAdminLeaderProbe(coordinate)
+	_, err = startAdminServer(ctx, lc, eg, cfg, staticCreds, clusterSrc, tablesSrc, bucketsSrc, queuesSrc, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg, buildVersion())
 	return err
+}
+
+// newAdminLeaderProbe builds the LeaderProbe consumed by
+// /admin/healthz/leader. It mirrors the verified-leader pattern S3 and
+// DynamoDB use on their own /healthz/leader endpoints
+// (adapter/s3.go:isVerifiedS3Leader,
+// adapter/dynamodb.go:isVerifiedDynamoLeader): a cheap IsLeader check
+// short-circuits non-leaders, and only nodes claiming leadership pay
+// the ReadIndex round-trip that confirms the claim is still valid.
+//
+// Crucially the probe is scoped to the **default Raft group** (via
+// coordinate.IsLeader / coordinate.VerifyLeader) — the same group the
+// admin write paths key off (kv/sharded_coordinator.go), which the
+// AdminForward proxy and the SQS admin write path
+// (adapter/sqs_admin.go) both treat as authoritative. An earlier
+// design returned true on any local-group leadership; in a multi-group
+// deployment that could surface 200 on a node leading only a non-
+// default group while admin writes there still 503'd or forwarded.
+// Codex P1 on PR #689 caught this; using the coordinator keeps the
+// healthz contract aligned with the actual admin-write leader.
+//
+// Returns nil when no coordinator is wired so the router answers
+// /admin/healthz/leader with the standard JSON 404 (matches the
+// "feature off" pattern Tables / Buckets / Queues already use).
+func newAdminLeaderProbe(coordinate kv.Coordinator) admin.LeaderProbe {
+	if coordinate == nil {
+		return nil
+	}
+	return admin.LeaderProbeFunc(func(ctx context.Context) bool {
+		if !coordinate.IsLeader() {
+			return false
+		}
+		// VerifyLeader receives the request ctx (PR #748): a Caddy probe
+		// or browser preflight that sets its own deadline now bounds the
+		// ReadIndex round-trip, instead of falling back to
+		// verifyLeaderEngine's no-arg 5s safety net (#745). The 5s bound
+		// remains as defense-in-depth for callers without an upstream
+		// ctx (lock resolver, HLC lease tick).
+		return coordinate.VerifyLeader(ctx) == nil
+	})
+}
+
+// newSqsQueuesSource adapts *adapter.SQSServer to admin.QueuesSource.
+// Same architectural reasoning as newDynamoTablesSource and
+// newBucketsSource: the bridge stays in this file (rather than
+// internal/admin) so the admin package stays free of the heavy
+// adapter-package dependency tree.
+//
+// Production always passes a non-nil *SQSServer now that
+// startSQSServer constructs a listenless server when sqsAddress is
+// empty (admin endpoints don't need the public SigV4 listener).
+// The nil guard below exists only for tests that build an admin
+// server without a SQS adapter wired in; an unreachable-in-prod
+// nil here would otherwise crash the admin handler chain instead
+// of cleanly omitting /admin/api/v1/sqs/* from the wire.
+func newSqsQueuesSource(sqsServer *adapter.SQSServer) admin.QueuesSource {
+	if sqsServer == nil {
+		return nil
+	}
+	return &sqsQueuesBridge{server: sqsServer}
+}
+
+// sqsQueuesBridge re-shapes adapter.AdminQueueSummary into
+// admin.QueueSummary. The two structs are deliberately isomorphic so
+// this translation does no allocation more than necessary; if a
+// future field is added on one side, the build breaks here, which
+// is the drift signal we want.
+type sqsQueuesBridge struct {
+	server *adapter.SQSServer
+}
+
+func (b *sqsQueuesBridge) AdminListQueues(ctx context.Context) ([]string, error) {
+	return b.server.AdminListQueues(ctx) //nolint:wrapcheck // pure pass-through; adapter owns the error context.
+}
+
+func (b *sqsQueuesBridge) AdminDescribeQueue(ctx context.Context, name string) (*admin.QueueSummary, bool, error) {
+	// Phase 4 wires IsDLQ / DLQSources: the SPA's Messages tab and
+	// Purge button need this flag to switch their framing, so the
+	// bridge opts into the catalog reverse-scan that Phase 2 gated
+	// behind AdminDescribeQueueOptions{IncludeDLQSources}.
+	summary, exists, err := b.server.AdminDescribeQueue(ctx, name, adapter.AdminDescribeQueueOptions{IncludeDLQSources: true})
+	if err != nil {
+		return nil, false, translateAdminQueuesError(err)
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	return convertAdminQueueSummary(summary), true, nil
+}
+
+func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteQueue(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminQueuesError(err)
+	}
+	return nil
+}
+
+func (b *sqsQueuesBridge) AdminSetQueueAttributes(ctx context.Context, principal admin.AuthPrincipal, name string, attrs map[string]string) error {
+	if err := b.server.AdminSetQueueAttributes(ctx, convertAdminPrincipal(principal), name, attrs); err != nil {
+		return translateAdminQueuesError(err)
+	}
+	return nil
+}
+
+func (b *sqsQueuesBridge) AdminPeekQueue(ctx context.Context, principal admin.AuthPrincipal, name string, opts admin.PeekMessageOptions) (admin.PeekResult, error) {
+	rows, nextCursor, err := b.server.AdminPeekQueue(ctx, convertAdminPrincipal(principal), name, adapter.AdminPeekMessageOptions{
+		Limit:        opts.Limit,
+		Cursor:       opts.Cursor,
+		BodyMaxBytes: opts.BodyMaxBytes,
+	})
+	if err != nil {
+		return admin.PeekResult{}, translateAdminQueuesError(err)
+	}
+	return admin.PeekResult{
+		Messages:   convertPeekedMessages(rows),
+		NextCursor: nextCursor,
+	}, nil
+}
+
+func (b *sqsQueuesBridge) AdminPurgeQueue(ctx context.Context, principal admin.AuthPrincipal, name string) (admin.PurgeResult, error) {
+	res, err := b.server.AdminPurgeQueue(ctx, convertAdminPrincipal(principal), name)
+	if err != nil {
+		return admin.PurgeResult{}, translateAdminQueuesError(err)
+	}
+	return admin.PurgeResult{
+		GenerationBefore: res.GenerationBefore,
+		GenerationAfter:  res.GenerationAfter,
+	}, nil
+}
+
+// convertPeekedMessages re-shapes the adapter's []AdminPeekedMessage
+// into the admin package's []PeekedMessage. The two structs are
+// deliberately isomorphic so this translation is a per-field copy;
+// if either side grows a field, the build breaks here, which is the
+// drift signal we want.
+func convertPeekedMessages(in []adapter.AdminPeekedMessage) []admin.PeekedMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]admin.PeekedMessage, len(in))
+	for i, m := range in {
+		out[i] = admin.PeekedMessage{
+			MessageID:        m.MessageID,
+			Body:             m.Body,
+			BodyTruncated:    m.BodyTruncated,
+			BodyOriginalSize: m.BodyOriginalSize,
+			SentTimestamp:    m.SentTimestamp,
+			ReceiveCount:     m.ReceiveCount,
+			GroupID:          m.GroupID,
+			DeduplicationID:  m.DeduplicationID,
+			Attributes:       convertPeekedAttributes(m.Attributes),
+		}
+	}
+	return out
+}
+
+// convertPeekedAttributes re-shapes the typed attribute map; both
+// structs share the same field layout so a direct type conversion
+// would suffice if the JSON tags matched, but they differ (adapter
+// vs admin packages) so an explicit copy keeps the wire shape stable
+// per package.
+func convertPeekedAttributes(in map[string]adapter.AdminPeekedAttribute) map[string]admin.PeekedAttribute {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]admin.PeekedAttribute, len(in))
+	for k, v := range in {
+		out[k] = admin.PeekedAttribute{
+			DataType:    v.DataType,
+			StringValue: v.StringValue,
+			BinaryValue: v.BinaryValue,
+		}
+	}
+	return out
+}
+
+// convertAdminQueueSummary mirrors adapter.AdminQueueSummary into
+// admin.QueueSummary. Counter fields are int64 on both sides; if
+// either side grows a field, this function should be extended in the
+// same commit so a compile error catches the drift.
+//
+// CreatedAt collapses a zero time.Time on the adapter side (queues
+// stored before CreatedAtMillis was populated, or never populated)
+// to a nil pointer on the admin side so omitempty actually drops the
+// field at the wire layer. Without this collapse the SPA would see
+// "0001-01-01T00:00:00Z" and render an ancient date.
+func convertAdminQueueSummary(in *adapter.AdminQueueSummary) *admin.QueueSummary {
+	if in == nil {
+		return nil
+	}
+	var createdAt *time.Time
+	if !in.CreatedAt.IsZero() {
+		t := in.CreatedAt
+		createdAt = &t
+	}
+	return &admin.QueueSummary{
+		Name:       in.Name,
+		IsFIFO:     in.IsFIFO,
+		Generation: in.Generation,
+		CreatedAt:  createdAt,
+		Attributes: in.Attributes,
+		Counters: admin.QueueCounters{
+			Visible:    in.Counters.Visible,
+			NotVisible: in.Counters.NotVisible,
+			Delayed:    in.Counters.Delayed,
+		},
+		IsDLQ:      in.IsDLQ,
+		DLQSources: in.DLQSources,
+	}
+}
+
+// translateAdminQueuesError maps the adapter's SQS error vocabulary
+// onto the admin-package sentinels the SQS handler matches against.
+// Anything not recognised is forwarded as-is and answered with 500
+// + a sanitised body, matching the dynamo / s3 bridges' behaviour.
+func translateAdminQueuesError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrQueuesForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrQueuesNotLeader
+	case errors.Is(err, adapter.ErrAdminSQSNotFound):
+		return admin.ErrQueuesNotFound
+	case errors.Is(err, adapter.ErrAdminSQSValidation):
+		return admin.ErrQueuesValidation
+	case errors.Is(err, adapter.ErrAdminSQSPurgeInProgress):
+		// Pull the typed RetryAfter duration from the adapter's
+		// *PurgeInProgressError and rewrap as admin's typed error.
+		// Both errors.Is(err, ErrQueuesPurgeInProgress) and
+		// errors.As(err, &*admin.PurgeInProgressError) match on the
+		// admin side, so the handler can branch on the sentinel
+		// while still extracting RetryAfter for the Retry-After
+		// header.
+		var adapterErr *adapter.PurgeInProgressError
+		if errors.As(err, &adapterErr) {
+			return &admin.PurgeInProgressError{RetryAfter: adapterErr.RetryAfter}
+		}
+		return &admin.PurgeInProgressError{}
+	case isLeaderChurnError(err):
+		// Leadership can be lost between AdminDeleteQueue's upfront
+		// isVerifiedSQSLeader check and the coordinator dispatch
+		// inside deleteQueueWithRetry. The kv coordinator surfaces
+		// that as ErrLeaderNotFound / ErrNotLeader (or a wrapped
+		// "not leader" / "leader not found" suffix), and the
+		// retry loop's isRetryableTransactWriteError does not catch
+		// them. Without this arm the error falls to default and the
+		// admin handler renders a generic 500. Mirrors the same arm
+		// in translateAdminTablesError on the Dynamo side.
+		return admin.ErrQueuesNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
+// buildAdminLeaderForwarder constructs the production LeaderForwarder
+// for the dynamo HTTP handler when the wiring is complete enough to
+// reach a remote leader. The bridge tolerates a nil connCache (and a
+// nil coordinate) so single-node / leader-only builds — where the
+// dashboard always hits a leader — can ship without paying the
+// forwarder's wiring cost. tablesSrc itself can be nil for cluster-
+// only builds; that's handled higher up by ServerDeps.Tables == nil.
+func buildAdminLeaderForwarder(coordinate kv.Coordinator, connCache *kv.GRPCConnCache, nodeID string) (admin.LeaderForwarder, error) {
+	if coordinate == nil || connCache == nil {
+		// Returning (nil, nil) is the explicit "no forwarder" signal
+		// — the handler falls back to 503 + Retry-After:1 on
+		// ErrTablesNotLeader. The function-level doc comment above
+		// describes this contract; the nilnil linter is not enabled
+		// in .golangci.yaml so no suppression directive is needed
+		// (Claude review on #648).
+		return nil, nil
+	}
+	if nodeID == "" {
+		// admin.NewGRPCForwardClient enforces this too; surfacing
+		// it here keeps the misconfiguration message in the wiring
+		// layer rather than buried under a Wrap chain.
+		return nil, errors.New("admin forward bridge: --raftId is required")
+	}
+	return buildLeaderForwarder(coordinate, connCache, nodeID)
+}
+
+// newDynamoTablesSource adapts *adapter.DynamoDBServer to the
+// admin.TablesSource interface. The bridge stays in this file (rather
+// than internal/admin) so the admin package stays free of the heavy
+// adapter-package dependency tree (gRPC, Raft, store).
+//
+// Returns nil when dynamoServer is nil; admin.NewServer handles a nil
+// Tables field by leaving the dynamo paths off the wire entirely,
+// which is the right behaviour for builds that ship without the
+// Dynamo adapter.
+func newDynamoTablesSource(dynamoServer *adapter.DynamoDBServer) admin.TablesSource {
+	if dynamoServer == nil {
+		return nil
+	}
+	return &dynamoTablesBridge{server: dynamoServer}
+}
+
+// newBucketsSource is the S3 counterpart of newDynamoTablesSource.
+// Returns nil when s3Server is nil so a build that ships without the
+// S3 adapter (--s3Address empty) silently disables the
+// /admin/api/v1/s3/buckets routes.
+func newBucketsSource(s3Server *adapter.S3Server) admin.BucketsSource {
+	if s3Server == nil {
+		return nil
+	}
+	return &bucketsBridge{server: s3Server}
+}
+
+// bucketsBridge re-shapes the adapter's AdminBucketSummary DTO into
+// the admin package's BucketSummary, threading through the
+// (result, present, error) tuple semantics for the describe path.
+// CreatedAtHLC is formatted into the SPA's expected ISO-8601 string
+// here rather than in the adapter — formatting is a UI concern, not
+// a storage one.
+type bucketsBridge struct {
+	server *adapter.S3Server
+}
+
+func (b *bucketsBridge) AdminListBuckets(ctx context.Context) ([]admin.BucketSummary, error) {
+	rows, err := b.server.AdminListBuckets(ctx)
+	if err != nil {
+		// Wrap with the bridge frame so an operator debugging a 500
+		// from /admin/api/v1/s3/buckets sees the bridge in the error
+		// chain (Claude Issue 5 on PR #658). cockroachdb/errors
+		// already preserves the adapter's stack trace; this just
+		// adds the call-site context.
+		return nil, errors.Wrap(err, "admin buckets bridge: list")
+	}
+	out := make([]admin.BucketSummary, len(rows))
+	for i, r := range rows {
+		out[i] = bucketSummaryFromAdapter(r)
+	}
+	return out, nil
+}
+
+func (b *bucketsBridge) AdminDescribeBucket(ctx context.Context, name string) (*admin.BucketSummary, bool, error) {
+	row, exists, err := b.server.AdminDescribeBucket(ctx, name)
+	if err != nil {
+		return nil, false, errors.Wrapf(err, "admin buckets bridge: describe %q", name)
+	}
+	if !exists || row == nil {
+		return nil, false, nil
+	}
+	summary := bucketSummaryFromAdapter(*row)
+	return &summary, true, nil
+}
+
+func (b *bucketsBridge) AdminCreateBucket(ctx context.Context, principal admin.AuthPrincipal, in admin.CreateBucketRequest) (*admin.BucketSummary, error) {
+	row, err := b.server.AdminCreateBucket(ctx, convertAdminPrincipal(principal), in.BucketName, in.ACL)
+	if err != nil {
+		return nil, translateAdminBucketsError(err)
+	}
+	if row == nil {
+		// AdminCreateBucket guarantees a non-nil summary on success;
+		// nil here would be an adapter regression. Surface as a typed
+		// error so the handler logs it as 500 rather than panicking
+		// on the de-reference at the call site.
+		return nil, errors.New("admin buckets bridge: adapter returned nil summary on create success")
+	}
+	summary := bucketSummaryFromAdapter(*row)
+	return &summary, nil
+}
+
+func (b *bucketsBridge) AdminPutBucketAcl(ctx context.Context, principal admin.AuthPrincipal, name, acl string) error {
+	if err := b.server.AdminPutBucketAcl(ctx, convertAdminPrincipal(principal), name, acl); err != nil {
+		return translateAdminBucketsError(err)
+	}
+	return nil
+}
+
+func (b *bucketsBridge) AdminDeleteBucket(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteBucket(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminBucketsError(err)
+	}
+	return nil
+}
+
+// ---------- Phase 3b object-level bridge ----------
+
+func (b *bucketsBridge) AdminListObjects(ctx context.Context, principal admin.AuthPrincipal, bucket string, opts admin.AdminListObjectsOptions) (admin.AdminObjectListing, error) {
+	out, err := b.server.AdminListObjects(ctx, convertAdminPrincipal(principal), bucket, adapter.AdminListObjectsOptions{
+		Prefix:            opts.Prefix,
+		Delimiter:         opts.Delimiter,
+		ContinuationToken: opts.ContinuationToken,
+		MaxKeys:           opts.MaxKeys,
+	})
+	if err != nil {
+		return admin.AdminObjectListing{}, translateAdminObjectsError(err)
+	}
+	return adminObjectListingFromAdapter(out), nil
+}
+
+func (b *bucketsBridge) AdminGetObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string) (io.ReadCloser, admin.AdminObject, error) {
+	body, meta, err := b.server.AdminGetObject(ctx, convertAdminPrincipal(principal), bucket, key)
+	if err != nil {
+		return nil, admin.AdminObject{}, translateAdminObjectsError(err)
+	}
+	return body, adminObjectFromAdapter(meta), nil
+}
+
+func (b *bucketsBridge) AdminPutObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string, body io.Reader, contentType string) error {
+	if err := b.server.AdminPutObject(ctx, convertAdminPrincipal(principal), bucket, key, body, contentType); err != nil {
+		return translateAdminObjectsError(err)
+	}
+	return nil
+}
+
+func (b *bucketsBridge) AdminDeleteObject(ctx context.Context, principal admin.AuthPrincipal, bucket, key string) error {
+	if err := b.server.AdminDeleteObject(ctx, convertAdminPrincipal(principal), bucket, key); err != nil {
+		return translateAdminObjectsError(err)
+	}
+	return nil
+}
+
+// adminObjectFromAdapter / adminObjectListingFromAdapter translate
+// the adapter's wire shape into the admin package's. The two are
+// field-for-field isomorphic so the build breaks here on drift.
+func adminObjectFromAdapter(in adapter.AdminObject) admin.AdminObject {
+	return admin.AdminObject{
+		Key:          in.Key,
+		Size:         in.Size,
+		ContentType:  in.ContentType,
+		ETag:         in.ETag,
+		LastModified: in.LastModified,
+		StorageClass: in.StorageClass,
+	}
+}
+
+func adminObjectListingFromAdapter(in adapter.AdminObjectListing) admin.AdminObjectListing {
+	out := admin.AdminObjectListing{
+		CommonPrefixes:        in.CommonPrefixes,
+		NextContinuationToken: in.NextContinuationToken,
+	}
+	if in.Objects != nil {
+		out.Objects = make([]admin.AdminObject, len(in.Objects))
+		for i, o := range in.Objects {
+			out.Objects[i] = adminObjectFromAdapter(o)
+		}
+	}
+	return out
+}
+
+// translateAdminObjectsError maps the adapter's object-tier admin
+// error vocabulary onto the admin-package sentinels the handler
+// matches against. Mirrors translateAdminBucketsError but covers the
+// object-only sentinels (UploadTooLarge, InvalidObjectKey,
+// ObjectNotFound) that the bucket-tier path never sees.
+func translateAdminObjectsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrObjectsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrObjectsNotLeader
+	case errors.Is(err, adapter.ErrAdminBucketNotFound):
+		return admin.ErrObjectsBucketNotFound
+	case errors.Is(err, adapter.ErrAdminObjectNotFound):
+		return admin.ErrObjectsNotFound
+	case errors.Is(err, adapter.ErrAdminUploadTooLarge):
+		return admin.ErrObjectsUploadTooLarge
+	case errors.Is(err, adapter.ErrAdminInvalidBucketName),
+		errors.Is(err, adapter.ErrAdminInvalidObjectKey),
+		errors.Is(err, adapter.ErrAdminInvalidContinuationToken):
+		// Wrap the adapter's text so the handler's ErrObjectsValidation
+		// branch surfaces a useful message rather than the bare
+		// sentinel string. Same pattern translateAdminBucketsError
+		// uses for ErrAdminInvalidBucketName via *ValidationError.
+		return errors.Wrap(admin.ErrObjectsValidation, err.Error())
+	case isLeaderChurnError(err):
+		return admin.ErrObjectsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
+func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary {
+	return admin.BucketSummary{
+		Name:       in.Name,
+		ACL:        in.ACL,
+		CreatedAt:  admin.FormatBucketCreatedAt(in.CreatedAtHLC),
+		Generation: in.Generation,
+		Region:     in.Region,
+		Owner:      in.Owner,
+	}
+}
+
+// translateAdminBucketsError maps the adapter's S3 admin error
+// vocabulary onto the admin-package sentinels the HTTP handler
+// matches against. Mirrors translateAdminTablesError on the Dynamo
+// side: structured failures (forbidden, not-leader, validation,
+// already-exists, etc.) become typed sentinels; everything else
+// is forwarded as-is and answered with 500 + a sanitised body.
+func translateAdminBucketsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrBucketsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrBucketsNotLeader
+	case errors.Is(err, adapter.ErrAdminBucketAlreadyExists):
+		return admin.ErrBucketsAlreadyExists
+	case errors.Is(err, adapter.ErrAdminBucketNotFound):
+		return admin.ErrBucketsNotFound
+	case errors.Is(err, adapter.ErrAdminBucketNotEmpty):
+		return admin.ErrBucketsNotEmpty
+	case errors.Is(err, adapter.ErrAdminInvalidBucketName),
+		errors.Is(err, adapter.ErrAdminInvalidACL):
+		// Surface the adapter's wrapped message via *ValidationError
+		// so the HTTP handler emits 400 invalid_request with a
+		// useful explanation instead of leaking raw err.Error().
+		return &admin.ValidationError{Message: err.Error()}
+	case isLeaderChurnError(err):
+		// Mid-dispatch leadership churn looks like an internal error
+		// from the kv coordinator; mapping it to the Bucket-side
+		// not-leader sentinel keeps the SPA's retry contract intact.
+		return admin.ErrBucketsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
+// dynamoTablesBridge is the thin adapter that re-shapes the adapter's
+// AdminTableSummary DTO into the admin package's DynamoTableSummary.
+// The two structs are deliberately isomorphic so this translation
+// does no allocation more than necessary; if a future GSI field is
+// added on one side, the build breaks here, which is exactly the
+// drift signal we want.
+type dynamoTablesBridge struct {
+	server *adapter.DynamoDBServer
+}
+
+func (b *dynamoTablesBridge) AdminListTables(ctx context.Context) ([]string, error) {
+	return b.server.AdminListTables(ctx) //nolint:wrapcheck // pure pass-through; the adapter owns the error context.
+}
+
+func (b *dynamoTablesBridge) AdminDescribeTable(ctx context.Context, name string) (*admin.DynamoTableSummary, bool, error) {
+	summary, exists, err := b.server.AdminDescribeTable(ctx, name)
+	if err != nil {
+		return nil, false, err //nolint:wrapcheck // adapter wraps internally.
+	}
+	if !exists {
+		return nil, false, nil
+	}
+	return convertAdminTableSummary(summary), true, nil
+}
+
+func (b *dynamoTablesBridge) AdminCreateTable(ctx context.Context, principal admin.AuthPrincipal, in admin.CreateTableRequest) (*admin.DynamoTableSummary, error) {
+	summary, err := b.server.AdminCreateTable(ctx, convertAdminPrincipal(principal), convertCreateTableInput(in))
+	if err != nil {
+		return nil, translateAdminTablesError(err)
+	}
+	return convertAdminTableSummary(summary), nil
+}
+
+func (b *dynamoTablesBridge) AdminDeleteTable(ctx context.Context, principal admin.AuthPrincipal, name string) error {
+	if err := b.server.AdminDeleteTable(ctx, convertAdminPrincipal(principal), name); err != nil {
+		return translateAdminTablesError(err)
+	}
+	return nil
+}
+
+// Phase 3a — item-level bridge methods. Each one converts the
+// admin-package wire types into the adapter's parallel struct
+// graph, dispatches to the adapter, and translates the adapter's
+// error vocabulary onto the admin-package sentinels.
+
+func (b *dynamoTablesBridge) AdminScanItems(ctx context.Context, principal admin.AuthPrincipal, table string, opts admin.AdminScanItemsOptions) (admin.AdminScanItemsResult, error) {
+	adapterOpts := adapter.AdminScanOptions{
+		Limit:          opts.Limit,
+		ExclusiveStart: adminToAdapterAttributeMap(opts.ExclusiveStart),
+	}
+	out, err := b.server.AdminScanTable(ctx, convertAdminPrincipal(principal), table, adapterOpts)
+	if err != nil {
+		return admin.AdminScanItemsResult{}, translateAdminItemsError(err)
+	}
+	res := admin.AdminScanItemsResult{
+		Items:            make([]admin.AdminItem, len(out.Items)),
+		LastEvaluatedKey: adapterToAdminAttributeMap(out.LastEvaluatedKey),
+	}
+	for i, item := range out.Items {
+		res.Items[i] = admin.AdminItem{Attributes: adapterToAdminAttributeMap(item.Attributes)}
+	}
+	return res, nil
+}
+
+func (b *dynamoTablesBridge) AdminGetItem(ctx context.Context, principal admin.AuthPrincipal, table string, key map[string]admin.AdminAttributeValue) (*admin.AdminItem, bool, error) {
+	item, found, err := b.server.AdminGetItem(ctx, convertAdminPrincipal(principal), table, adminToAdapterAttributeMap(key))
+	if err != nil {
+		return nil, false, translateAdminItemsError(err)
+	}
+	if !found || item == nil {
+		return nil, false, nil
+	}
+	return &admin.AdminItem{Attributes: adapterToAdminAttributeMap(item.Attributes)}, true, nil
+}
+
+func (b *dynamoTablesBridge) AdminPutItem(ctx context.Context, principal admin.AuthPrincipal, table string, item admin.AdminItem) error {
+	adapterItem := adapter.AdminItem{Attributes: adminToAdapterAttributeMap(item.Attributes)}
+	if err := b.server.AdminPutItem(ctx, convertAdminPrincipal(principal), table, adapterItem); err != nil {
+		return translateAdminItemsError(err)
+	}
+	return nil
+}
+
+func (b *dynamoTablesBridge) AdminDeleteItem(ctx context.Context, principal admin.AuthPrincipal, table string, key map[string]admin.AdminAttributeValue) error {
+	if err := b.server.AdminDeleteItem(ctx, convertAdminPrincipal(principal), table, adminToAdapterAttributeMap(key)); err != nil {
+		return translateAdminItemsError(err)
+	}
+	return nil
+}
+
+// adminToAdapterAttributeValue / map functions translate the
+// admin package's wire type into the adapter package's parallel
+// struct. The two are isomorphic field-for-field; any drift here
+// is a build break, which is the right signal.
+func adminToAdapterAttributeValue(v admin.AdminAttributeValue) adapter.AdminAttributeValue {
+	out := adapter.AdminAttributeValue{
+		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
+		SS: v.SS, NS: v.NS, BS: v.BS,
+	}
+	if v.L != nil {
+		out.L = make([]adapter.AdminAttributeValue, len(v.L))
+		for i, e := range v.L {
+			out.L[i] = adminToAdapterAttributeValue(e)
+		}
+	}
+	if v.M != nil {
+		out.M = make(map[string]adapter.AdminAttributeValue, len(v.M))
+		for k, e := range v.M {
+			out.M[k] = adminToAdapterAttributeValue(e)
+		}
+	}
+	return out
+}
+
+func adapterToAdminAttributeValue(v adapter.AdminAttributeValue) admin.AdminAttributeValue {
+	out := admin.AdminAttributeValue{
+		S: v.S, N: v.N, B: v.B, BOOL: v.BOOL, NULL: v.NULL,
+		SS: v.SS, NS: v.NS, BS: v.BS,
+	}
+	if v.L != nil {
+		out.L = make([]admin.AdminAttributeValue, len(v.L))
+		for i, e := range v.L {
+			out.L[i] = adapterToAdminAttributeValue(e)
+		}
+	}
+	if v.M != nil {
+		out.M = make(map[string]admin.AdminAttributeValue, len(v.M))
+		for k, e := range v.M {
+			out.M[k] = adapterToAdminAttributeValue(e)
+		}
+	}
+	return out
+}
+
+func adminToAdapterAttributeMap(in map[string]admin.AdminAttributeValue) map[string]adapter.AdminAttributeValue {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]adapter.AdminAttributeValue, len(in))
+	for k, v := range in {
+		out[k] = adminToAdapterAttributeValue(v)
+	}
+	return out
+}
+
+func adapterToAdminAttributeMap(in map[string]adapter.AdminAttributeValue) map[string]admin.AdminAttributeValue {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]admin.AdminAttributeValue, len(in))
+	for k, v := range in {
+		out[k] = adapterToAdminAttributeValue(v)
+	}
+	return out
+}
+
+// translateAdminItemsError maps the adapter's item-level error
+// vocabulary onto the admin-package sentinels. Mirrors
+// translateAdminTablesError's shape but uses the Items
+// sentinels — kept separate so a future per-resource
+// classification change (e.g., a new "rate limited" sentinel
+// for the item path but not the table path) lands in one place.
+func translateAdminItemsError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrItemsForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrItemsNotLeader
+	case errors.Is(err, adapter.ErrAdminDynamoNotFound):
+		return admin.ErrItemsTableNotFound
+	case errors.Is(err, adapter.ErrAdminDynamoValidation):
+		// Wrap rather than replace so the adapter's specific
+		// validation message ("table_name is required", legacy-
+		// migration hint at adapter/dynamodb_admin_items.go, etc.)
+		// reaches the HTTP 400 body via writeItemsError's
+		// err.Error() emission. Bare sentinel return dropped the
+		// operator-facing reason at the bridge boundary (Claude
+		// review on PR #813 r3). errors.Is(out, ErrItemsValidation)
+		// still returns true so the handler's match arm still
+		// fires.
+		return errors.Wrap(admin.ErrItemsValidation, err.Error())
+	case isLeaderChurnError(err):
+		// Mid-dispatch leadership churn looks like an internal error
+		// from the kv coordinator (election finishes between the
+		// adapter's isVerifiedDynamoLeader check and the actual
+		// Raft propose). Map to the Items not-leader sentinel so the
+		// handler returns 503 + Retry-After: 1 and the SPA's retry
+		// contract stays intact (Codex P2 on PR #813 — the table-side
+		// translator already does this; the item-side translator
+		// initially shipped without the parallel branch).
+		return admin.ErrItemsNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
+// convertAdminPrincipal mirrors admin.AuthPrincipal onto the
+// adapter's parallel struct. Both packages keep the principal type
+// independent so the adapter stays free of internal/admin
+// dependencies, but the role / access-key fields are deliberately
+// 1:1 — any drift is a wiring bug, not a feature.
+func convertAdminPrincipal(p admin.AuthPrincipal) adapter.AdminPrincipal {
+	role := adapter.AdminRoleReadOnly
+	if p.Role.AllowsWrite() {
+		role = adapter.AdminRoleFull
+	}
+	return adapter.AdminPrincipal{AccessKey: p.AccessKey, Role: role}
+}
+
+// convertCreateTableInput translates the admin-handler request DTO
+// into the adapter's parallel input struct. We do this here — not
+// in the admin package — to keep `internal/admin` free of any
+// adapter import.
+func convertCreateTableInput(in admin.CreateTableRequest) adapter.AdminCreateTableInput {
+	out := adapter.AdminCreateTableInput{
+		TableName:    in.TableName,
+		PartitionKey: adapter.AdminAttribute{Name: in.PartitionKey.Name, Type: in.PartitionKey.Type},
+	}
+	if in.SortKey != nil {
+		out.SortKey = &adapter.AdminAttribute{Name: in.SortKey.Name, Type: in.SortKey.Type}
+	}
+	if len(in.GSI) == 0 {
+		return out
+	}
+	out.GSI = make([]adapter.AdminCreateGSI, len(in.GSI))
+	for i, g := range in.GSI {
+		gsi := adapter.AdminCreateGSI{
+			Name:             g.Name,
+			PartitionKey:     adapter.AdminAttribute{Name: g.PartitionKey.Name, Type: g.PartitionKey.Type},
+			ProjectionType:   g.Projection.Type,
+			NonKeyAttributes: append([]string(nil), g.Projection.NonKeyAttributes...),
+		}
+		if g.SortKey != nil {
+			gsi.SortKey = &adapter.AdminAttribute{Name: g.SortKey.Name, Type: g.SortKey.Type}
+		}
+		out.GSI[i] = gsi
+	}
+	return out
+}
+
+// translateAdminTablesError maps the adapter's error vocabulary
+// onto the admin-package sentinels the HTTP handler matches against.
+// Anything not recognised is forwarded as-is and answered with 500
+// + a sanitised body, so a future adapter error mode does not leak
+// raw text to clients while we are still adding the translation.
+func translateAdminTablesError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, adapter.ErrAdminForbidden):
+		return admin.ErrTablesForbidden
+	case errors.Is(err, adapter.ErrAdminNotLeader):
+		return admin.ErrTablesNotLeader
+	// Check structured adapter errors BEFORE the leader-churn
+	// matcher: a ValidationException whose message contains
+	// "not leader" (e.g., a user-supplied attribute name like
+	// `not leader` triggering the conflicting-attribute-type
+	// validator) must be classified as 400 invalid_request, not
+	// 503 leader_unavailable. The kv-internal sentinel checks
+	// in isLeaderChurnError still catch real leadership churn
+	// because they are typed-sentinel matches, not substring.
+	case adapter.IsAdminTableAlreadyExists(err):
+		return admin.ErrTablesAlreadyExists
+	case adapter.IsAdminTableNotFound(err):
+		return admin.ErrTablesNotFound
+	case adapter.IsAdminValidation(err):
+		msg := adapter.AdminErrorMessage(err)
+		if msg == "" {
+			msg = "validation failed"
+		}
+		return &admin.ValidationError{Message: msg}
+	case isLeaderChurnError(err):
+		// Cover leader-churn that surfaces between the up-front
+		// isVerifiedDynamoLeader check and createTableWithRetry's
+		// dispatch — the kv coordinator can drop leadership in
+		// that window and the resulting transient error should
+		// surface as 503 leader_unavailable + Retry-After: 1
+		// rather than a generic 500. Codex P2 on PR #634.
+		return admin.ErrTablesNotLeader
+	default:
+		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
+	}
+}
+
+// isLeaderChurnError reports whether err looks like one of the
+// transient leader sentinels the kv coordinator and adapter
+// internals emit during a leadership change. The set mirrors the
+// closed list in kv.leaderErrorPhrases — keep them in sync if a
+// new sentinel is added on the kv side.
+//
+// Phrase matching uses HasSuffix (not Contains) on the standard
+// canonical strings because every kv-internal sentinel emits the
+// phrase at the END of its error chain (e.g.,
+// "raft engine: not leader", "dispatch failed: leader not found").
+// A user-supplied string that happens to contain a leader phrase
+// in the MIDDLE of an unrelated error message therefore does not
+// false-positive — Codex P2 on PR #634 flagged the original
+// strings.Contains form for misclassifying validation messages
+// like "conflicting attribute type for <user-name>" when the
+// name itself was "not leader".
+func isLeaderChurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kv.ErrLeaderNotFound) ||
+		errors.Is(err, adapter.ErrNotLeader) ||
+		errors.Is(err, adapter.ErrLeaderNotFound) {
+		return true
+	}
+	msg := err.Error()
+	return strings.HasSuffix(msg, "not leader") ||
+		strings.HasSuffix(msg, "leader not found") ||
+		strings.HasSuffix(msg, "leadership lost") ||
+		strings.HasSuffix(msg, "leadership transfer in progress")
+}
+
+func convertAdminTableSummary(in *adapter.AdminTableSummary) *admin.DynamoTableSummary {
+	out := &admin.DynamoTableSummary{
+		Name:         in.Name,
+		PartitionKey: in.PartitionKey,
+		SortKey:      in.SortKey,
+		Generation:   in.Generation,
+	}
+	if len(in.GlobalSecondaryIndexes) == 0 {
+		return out
+	}
+	out.GlobalSecondaryIndexes = make([]admin.DynamoGSISummary, len(in.GlobalSecondaryIndexes))
+	for i, g := range in.GlobalSecondaryIndexes {
+		out.GlobalSecondaryIndexes[i] = admin.DynamoGSISummary{
+			Name:           g.Name,
+			PartitionKey:   g.PartitionKey,
+			SortKey:        g.SortKey,
+			ProjectionType: g.ProjectionType,
+		}
+	}
+	return out
 }
 
 // buildAdminConfig translates flag values into an admin.Config.
@@ -144,6 +1037,13 @@ func startAdminServer(
 	cfg adminListenerConfig,
 	creds map[string]string,
 	cluster admin.ClusterInfoSource,
+	tables admin.TablesSource,
+	buckets admin.BucketsSource,
+	queues admin.QueuesSource,
+	forwarder admin.LeaderForwarder,
+	leaderProbe admin.LeaderProbe,
+	keyvizSampler *keyviz.MemSampler,
+	keyvizFanoutCfg keyVizFanoutConfig,
 	version string,
 ) (string, error) {
 	adminCfg := buildAdminConfig(cfg)
@@ -151,7 +1051,7 @@ func startAdminServer(
 	if err != nil || !enabled {
 		return "", err
 	}
-	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster)
+	server, err := buildAdminHTTPServer(&adminCfg, creds, cluster, tables, buckets, queues, forwarder, leaderProbe, keyvizSampler, keyvizFanoutCfg)
 	if err != nil {
 		return "", err
 	}
@@ -191,7 +1091,7 @@ func checkAdminConfig(adminCfg *admin.Config, cluster admin.ClusterInfoSource) (
 	return true, nil
 }
 
-func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource) (*admin.Server, error) {
+func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, cluster admin.ClusterInfoSource, tables admin.TablesSource, buckets admin.BucketsSource, queues admin.QueuesSource, forwarder admin.LeaderForwarder, leaderProbe admin.LeaderProbe, keyvizSampler *keyviz.MemSampler, keyvizFanoutCfg keyVizFanoutConfig) (*admin.Server, error) {
 	primaryKeys, err := adminCfg.DecodedSigningKeys()
 	if err != nil {
 		return nil, errors.Wrap(err, "decode admin signing keys")
@@ -204,13 +1104,26 @@ func buildAdminHTTPServer(adminCfg *admin.Config, creds map[string]string, clust
 	if err != nil {
 		return nil, errors.Wrap(err, "build admin verifier")
 	}
+	staticFS, err := admin.StaticFS()
+	if err != nil {
+		return nil, errors.Wrap(err, "open embedded admin SPA")
+	}
 	server, err := admin.NewServer(admin.ServerDeps{
-		Signer:      signer,
-		Verifier:    verifier,
-		Credentials: admin.MapCredentialStore(creds),
-		Roles:       adminCfg.RoleIndex(),
-		ClusterInfo: cluster,
-		StaticFS:    nil,
+		Signer:              signer,
+		Verifier:            verifier,
+		Credentials:         admin.MapCredentialStore(creds),
+		Roles:               adminCfg.RoleIndex(),
+		ClusterInfo:         cluster,
+		Tables:              tables,
+		Buckets:             buckets,
+		Queues:              queues,
+		Forwarder:           forwarder,
+		KeyViz:              keyvizSourceFromSampler(keyvizSampler),
+		KeyVizFanout:        buildKeyVizFanout(adminCfg.Listen, keyvizFanoutCfg),
+		KeyVizHotKeys:       keyvizHotKeysSourceFromSampler(keyvizSampler),
+		KeyVizHotKeysFanout: buildKeyVizHotKeysFanout(adminCfg.Listen, keyvizFanoutCfg),
+		StaticFS:            staticFS,
+		LeaderProbe:         leaderProbe,
 		AuthOpts: admin.AuthServiceOpts{
 			InsecureCookie: adminCfg.AllowInsecureDevCookie,
 		},
@@ -279,16 +1192,22 @@ func newClusterInfoSource(nodeID, version string, runtimes []*raftGroupRuntime) 
 	return admin.ClusterInfoFunc(func(ctx context.Context) (admin.ClusterInfo, error) {
 		groups := make([]admin.GroupInfo, 0, len(runtimes))
 		for _, rt := range runtimes {
-			if rt == nil || rt.engine == nil {
+			// snapshotEngine takes engineMu.RLock so this
+			// HTTP/gRPC handler running on its own goroutine
+			// cannot race rt.Close() clearing the field on
+			// shutdown. Same race class as the keyviz
+			// leader-term publisher (Codex P2 on PR #720).
+			engine := rt.snapshotEngine()
+			if engine == nil {
 				continue
 			}
-			status := rt.engine.Status()
+			status := engine.Status()
 			// Seed as an empty-but-non-nil slice so a
 			// Configuration() failure still JSON-encodes as `[]`
 			// rather than `null`; API consumers that treat
 			// members as an always-array field rely on this.
 			members := []string{}
-			if cfg, err := rt.engine.Configuration(ctx); err == nil {
+			if cfg, err := engine.Configuration(ctx); err == nil {
 				members = make([]string, 0, len(cfg.Servers))
 				for _, srv := range cfg.Servers {
 					members = append(members, srv.ID)
@@ -327,6 +1246,136 @@ func resolveSigningKey(flagValue, filePath, envVar string) (string, error) {
 		return v, nil
 	}
 	return strings.TrimSpace(flagValue), nil
+}
+
+// keyvizSourceFromSampler boxes a *keyviz.MemSampler into the
+// admin.KeyVizSource interface understood by ServerDeps. Returning a
+// nil interface (not a typed-nil) when the sampler is disabled is
+// load-bearing: the admin handler's "keyviz disabled → 503" branch
+// only fires on an interface-nil; a typed-nil *MemSampler stored as
+// a non-nil interface would silently return an empty matrix instead
+// of the explicit "feature off" signal the SPA expects.
+func keyvizSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizSource {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
+// keyvizHotKeysSourceFromSampler is the keyvizSourceFromSampler twin
+// for the per-cell hot-key drill-down handler. Returning an interface-nil
+// (not a typed-nil) when the sampler is disabled is again load-bearing:
+// the hot-keys handler's "keyviz disabled → 503" branch checks for
+// interface-nil, and a typed-nil *MemSampler stored as a non-nil
+// interface would route the request into MemSampler methods that
+// already nil-check internally — correct but masking the explicit
+// "feature off" signal we want the SPA to render.
+func keyvizHotKeysSourceFromSampler(s *keyviz.MemSampler) admin.KeyVizHotKeysSource {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
+// buildKeyVizFanout assembles the Phase 2-C fan-out aggregator from
+// the operator-supplied flag values. selfListen is the local admin
+// listener address (used to filter the local node out of the peer
+// list so symmetric `--keyvizFanoutNodes=node1,node2,node3` configs
+// stamped onto every host do not loop back over HTTP). Returns nil
+// when no peers remain after filtering, leaving the keyviz handler
+// in single-node mode.
+//
+// The matching rule is conservative: a peer is treated as "self"
+// when its host:port equals selfListen literally OR when it equals
+// selfListen with the host normalised to 127.0.0.1 (operators
+// commonly bind admin to 0.0.0.0 but list 127.0.0.1 as the
+// per-host fan-out entry). Anything else is treated as a peer.
+func buildKeyVizFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizFanout {
+	if len(cfg.Nodes) == 0 {
+		return nil
+	}
+	peers := make([]string, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		if isSelfFanoutNode(selfListen, n) {
+			continue
+		}
+		peers = append(peers, n)
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	f := admin.NewKeyVizFanout(selfListen, peers)
+	if cfg.Timeout > 0 {
+		f = f.WithTimeout(cfg.Timeout)
+	}
+	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.fanout")))
+}
+
+// buildKeyVizHotKeysFanout is the hot-keys companion of
+// buildKeyVizFanout: same peer-list reuse, same self-filter rule.
+// Returns nil when no peers remain after filtering (single-node
+// hot-keys behaviour preserved). Operators get the cluster-wide
+// drill-down for free by leaving --keyvizFanoutNodes set — no
+// separate flag, matching design §6.
+func buildKeyVizHotKeysFanout(selfListen string, cfg keyVizFanoutConfig) *admin.KeyVizHotKeysFanout {
+	if len(cfg.Nodes) == 0 {
+		return nil
+	}
+	peers := make([]string, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		if isSelfFanoutNode(selfListen, n) {
+			continue
+		}
+		peers = append(peers, n)
+	}
+	if len(peers) == 0 {
+		return nil
+	}
+	f := admin.NewKeyVizHotKeysFanout(selfListen, peers)
+	if cfg.Timeout > 0 {
+		f = f.WithTimeout(cfg.Timeout)
+	}
+	return f.WithLogger(slog.Default().With(slog.String("component", "admin.keyviz.hotkeys.fanout")))
+}
+
+// isSelfFanoutNode returns true when n names this node's own admin
+// listener. A relaxed match handles the common bind-vs-advertise
+// asymmetry: bind on 0.0.0.0:8080 but advertise (and list) as
+// 127.0.0.1:8080.
+func isSelfFanoutNode(selfListen, n string) bool {
+	n = strings.TrimSpace(n)
+	if n == "" {
+		return true
+	}
+	stripped := stripScheme(n)
+	if stripped == selfListen {
+		return true
+	}
+	host, port, err := net.SplitHostPort(stripped)
+	if err != nil {
+		return false
+	}
+	selfHost, selfPort, err := net.SplitHostPort(selfListen)
+	if err != nil || port != selfPort {
+		return false
+	}
+	if isWildcardHost(selfHost) {
+		return isLoopbackHost(host)
+	}
+	return host == selfHost
+}
+
+func isWildcardHost(h string) bool { return h == "0.0.0.0" || h == "::" || h == "" }
+
+func isLoopbackHost(h string) bool {
+	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+func stripScheme(raw string) string {
+	if i := strings.Index(raw, "://"); i >= 0 {
+		return raw[i+3:]
+	}
+	return raw
 }
 
 // parseCSV splits a flag value like "a,b,c" into a slice with empty and

@@ -19,7 +19,6 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -46,10 +45,12 @@ const (
 	testEngineMaxSizePerMsg = 1 << 20
 	testEngineMaxInflight   = 256
 
-	// leaderChurnRetryTimeout bounds how long doEventually keeps retrying a
-	// write that fails with a transient leader-unavailable error. It covers
-	// both startup churn right after createNode returns and mid-test churn
-	// when the leader briefly steps down under CI load.
+	// leaderChurnRetryTimeout bounds how long retryNotLeader keeps
+	// retrying a write that fails with a transient leader-unavailable
+	// error. Used by tests that issue writes inside long mid-test
+	// loops where leadership can briefly step down under CI load.
+	// Startup churn (createNode → first write) is closed at the
+	// readiness layer by waitForWriteableLeader (PR #898), not here.
 	leaderChurnRetryTimeout = 5 * time.Second
 	// leaderChurnRetryInterval is the poll interval between retries.
 	leaderChurnRetryInterval = 50 * time.Millisecond
@@ -312,6 +313,120 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// transient "not leader" errors. A stability window catches the
 	// flip and loops until the leader actually holds.
 	waitForStableLeader(t, nodes, peers, waitTimeout)
+
+	// Prove the leader can actually COMMIT by driving one no-op
+	// entry through full Raft quorum before we hand the cluster
+	// to the test body. The 300 ms stability window above only
+	// proves leadership *appears* held; a leader can still step
+	// down on the first real heartbeat-quorum miss after that.
+	// The per-test retry wrappers in this file have been absorbing
+	// that post-readiness churn site-by-site; this commits-one-entry
+	// probe closes the window at the readiness layer instead, so any
+	// subsequent write inherits a leader that has already held
+	// quorum through one apply.
+	//
+	// `peers` and `waitInterval` are passed through so the probe loop
+	// can re-nudge leadership back to nodes[0] when a real re-election
+	// elects a different node mid-probe — without that, the loop
+	// would keep proposing through a follower engine until the budget
+	// expires and spuriously fail the readiness gate.
+	waitForWriteableLeader(t, nodes, peers, waitTimeout, waitInterval)
+}
+
+// raftReadinessProbePayload is the 9-byte Raft entry waitForWriteableLeader
+// proposes. The FSM dispatches on data[0]: 0x02 (raftEncodeHLCLease) selects
+// applyHLCLease, which reads `data[1:]` as a big-endian uint64 physical
+// ceiling. With ceiling=0 the function's `if ceilingMs > 0` guard skips the
+// HLC update and returns nil — a true no-op at the state-machine layer,
+// while the entry still goes through full Raft quorum so a successful
+// Propose proves the leader holds. See kv/fsm.go applyHLCLease + the
+// raftEncodeHLCLease comment.
+var raftReadinessProbePayload = []byte{
+	0x02,                                           // raftEncodeHLCLease
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BE uint64 ceiling = 0 (no-op)
+}
+
+// waitForWriteableLeader commits one no-op Raft entry through nodes[0]'s
+// engine to prove the leader is not just *named* but actually able to
+// drive quorum. Retries on transient leader-unavailable errors up to
+// timeout — a re-election that races the probe is what this helper is
+// designed to ride out.
+//
+// Without this step, waitForRaftReadiness would return after a 300 ms
+// stability window during which leadership only *looks* stable; a
+// leader that steps down on its first real heartbeat-quorum miss can
+// surface as "etcd raft engine is not leader" on the test's first
+// write — the failure mode the per-test retry wrappers in this file
+// have been working around. See the PR description for the full
+// flake-fix history this readiness gate is meant to obsolete.
+func waitForWriteableLeader(t *testing.T, nodes []Node, peers []raftengine.Server, timeout, waitInterval time.Duration) {
+	t.Helper()
+	if len(nodes) == 0 || nodes[0].engine == nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
+		}
+		err := proposeReadinessOnce(nodes[0].engine, remaining)
+		if err == nil {
+			return
+		}
+		lastErr = err
+		if !isReadinessProbeRetryable(err) {
+			t.Fatalf("readiness probe failed with non-transient error: %v", err)
+		}
+		// If the per-attempt error was specifically "not leader" (vs
+		// a ctx timeout), a real re-election has elected a different
+		// node since waitForStableLeader returned. Keep aiming the
+		// probe at nodes[0] by re-running ensureNodeZeroIsLeader
+		// before the next attempt; otherwise the loop would spin on
+		// a follower engine until the budget expires and spuriously
+		// fail the readiness gate even though the cluster has
+		// recovered with a different leader. ensureNodeZeroIsLeader
+		// is idempotent in the steady state, so this costs nothing
+		// when leadership has not actually moved.
+		if isTransientNotLeaderErr(err) && len(peers) > 0 {
+			ensureNodeZeroIsLeader(t, nodes, peers, time.Until(deadline), waitInterval)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
+		}
+		time.Sleep(leaderChurnRetryInterval)
+	}
+}
+
+// proposeReadinessOnce drives one no-op probe through the engine's
+// Propose, bounded by min(perProposeTimeout, remaining) so the
+// per-attempt ctx cannot block past the outer deadline when the
+// overall budget is nearly exhausted. Extracted from
+// waitForWriteableLeader to keep the outer loop under the cyclop
+// budget; the retry/timeout rationale lives at the call site.
+func proposeReadinessOnce(engine raftengine.Engine, remaining time.Duration) error {
+	const perProposeTimeout = 2 * time.Second
+	currTimeout := perProposeTimeout
+	if remaining < currTimeout {
+		currTimeout = remaining
+	}
+	proposeCtx, cancel := context.WithTimeout(context.Background(), currTimeout)
+	defer cancel()
+	_, err := engine.Propose(proposeCtx, raftReadinessProbePayload)
+	return err
+}
+
+// isReadinessProbeRetryable widens isTransientNotLeaderErr for the
+// readiness-probe loop: a per-propose ctx timeout under heavy CI
+// load returns context.DeadlineExceeded, which the base classifier
+// does NOT treat as transient. Without this widening the probe
+// would t.Fatalf on a slow runner instead of retrying within its
+// outer budget. context.Canceled is treated symmetrically.
+func isReadinessProbeRetryable(err error) bool {
+	return isTransientNotLeaderErr(err) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
 }
 
 // waitForStableLeader polls the cluster until nodes[0] has been the leader
@@ -593,23 +708,60 @@ func isTransientNotLeaderErr(err error) bool {
 	return strings.Contains(s, "not leader") || strings.Contains(s, "leader not found")
 }
 
-// doEventually retries do() while it returns a transient "not leader" error,
-// giving the cluster a few seconds to re-settle leadership after startup.
-// Non-"not leader" errors fail the test immediately.
+// === TTL-expiry deadline-multiplier helper =============================
 //
-// MUST be called from the main test goroutine only. The final require.NoError
-// calls t.FailNow() on failure; invoking FailNow from a worker goroutine is
-// a testing.T contract violation. For parallel-worker use, call
-// retryNotLeader directly and report errors back via a channel.
-func doEventually(t *testing.T, do func() error) {
+// Redis TTL tests that "set a short TTL, sleep past it, assert the key is
+// gone" race their own wall clock under -race on slow CI runners. The
+// inter-call pause (typically 50–150 ms above the TTL) does not absorb
+// scheduler jitter that can push the post-sleep read past the TTL window
+// itself, so the read sometimes observes a refilled/un-expired view and
+// the test fails with "expected redis.Nil, got <value>". PR #818
+// (TestRedis_ExpiredKey_BecomesInvisible) fixed one instance by switching
+// to require.Eventually with a TTL-derived deadline. eventuallyExpired
+// generalises that pattern for any TTL-expiry condition.
+//
+// Use this helper in any new test of the form:
+//
+//	require.NoError(t, rdb.PExpire(ctx, key, ttl).Err())
+//	eventuallyExpired(t, ttl, func() bool {
+//	    _, err := rdb.<Op>(ctx, key, ...).Result()
+//	    return errors.Is(err, redis.Nil)
+//	}, "key must be gone after TTL")
+//
+// instead of `time.Sleep(ttl + N*time.Millisecond)` followed by a single
+// assertion. The deadline = ttl + 3 s gives generous CI headroom; the
+// 25 ms poll cadence matches waitForStableLeader so flake patterns stay
+// uniform across the file.
+func eventuallyExpired(t *testing.T, ttl time.Duration, condition func() bool, msg string) {
 	t.Helper()
-	require.NoError(t, retryNotLeader(context.Background(), do))
+	const (
+		ttlExpiryHeadroom = 3 * time.Second
+		ttlExpiryPoll     = 25 * time.Millisecond
+	)
+	// Sleep past the TTL before the first poll. require.Eventually
+	// runs the condition once IMMEDIATELY before the first tick, so
+	// without this gate a regression that deletes/hides the key at
+	// PExpire time would satisfy the first poll and the test would
+	// never exercise the actual expired-after-deadline state — see
+	// codex P2 on PR #903. The post-sleep require.Eventually then
+	// has ttlExpiryHeadroom (3 s) of CI-jitter slack to observe the
+	// expired state, with a 25 ms poll cadence that matches
+	// waitForStableLeader's sampler so flake patterns stay uniform.
+	time.Sleep(ttl)
+	require.Eventually(t, condition, ttlExpiryHeadroom, ttlExpiryPoll, msg)
 }
 
 // retryNotLeader calls do() repeatedly while it returns a transient
 // leader-unavailable error, capped at leaderChurnRetryTimeout. It returns
 // the final error (or nil on success) without touching testing.T, making
 // it safe to call from worker goroutines in parallel tests.
+//
+// Use cases: mid-test leader churn under CI load (e.g. grpc_test.go's
+// 9999-iteration consistency loops). The startup window — leader-churn
+// between createNode returning and the first write — is closed at the
+// readiness layer instead (waitForWriteableLeader, PR #898), so first-
+// write callers should NOT wrap in retryNotLeader; direct calls suffice
+// and are clearer.
 func retryNotLeader(ctx context.Context, do func() error) error {
 	deadline := time.Now().Add(leaderChurnRetryTimeout)
 	var lastErr error
@@ -627,22 +779,4 @@ func retryNotLeader(ctx context.Context, do func() error) error {
 		case <-time.After(leaderChurnRetryInterval):
 		}
 	}
-}
-
-// rpushEventually wraps RPUSH in doEventually so transient leader churn
-// immediately after createNode doesn't fail the test.
-func rpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key string, vals ...any) {
-	t.Helper()
-	doEventually(t, func() error {
-		return rdb.RPush(ctx, key, vals...).Err()
-	})
-}
-
-// lpushEventually wraps LPUSH in doEventually so transient leader churn
-// immediately after createNode doesn't fail the test.
-func lpushEventually(t *testing.T, ctx context.Context, rdb *redis.Client, key string, vals ...any) {
-	t.Helper()
-	doEventually(t, func() error {
-		return rdb.LPush(ctx, key, vals...).Err()
-	})
 }

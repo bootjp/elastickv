@@ -484,13 +484,21 @@ func (c *DeltaCompactor) buildBatchElems(ctx context.Context, h collectionDeltaH
 	return allElems
 }
 
-// dispatchCompaction commits elems as an OCC transaction.
+// dispatchCompaction commits elems as an OCC transaction. The commit
+// timestamp is drawn via NextFenced even though compaction is
+// idempotent in outcome: an unfenced ts inside a stale leader's
+// window can still produce post-compaction OCC ordering surprises
+// against subsequent client writes, so fail-closed is the right
+// default here too (claude-bot review on PR #871 Phase 2b).
 func (c *DeltaCompactor) dispatchCompaction(ctx context.Context, readTS uint64, elems []*kv.Elem[kv.OP]) error {
 	if len(elems) == 0 {
 		return nil
 	}
-	commitTS := c.coord.Clock().Next()
-	_, err := c.coord.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	commitTS, err := c.coord.Clock().NextFenced()
+	if err != nil {
+		return errors.Wrap(err, "dispatchCompaction: allocate commitTS")
+	}
+	_, err = c.coord.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,

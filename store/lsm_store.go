@@ -16,21 +16,39 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 const (
-	timestampSize            = 8
-	valueHeaderSize          = 9 // 1 byte tombstone + 8 bytes expireAt
-	snapshotBatchCountLimit  = 1000
-	snapshotBatchByteLimit   = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
-	dirPerms                 = 0755
-	metaLastCommitTS         = "_meta_last_commit_ts"
-	metaMinRetainedTS        = "_meta_min_retained_ts"
-	metaPendingMinRetainedTS = "_meta_pending_min_retained_ts"
-	spoolBufSize             = 32 * 1024 // buffer size for streaming I/O during restore
+	timestampSize   = 8
+	valueHeaderSize = 9 // 1 byte flags + 8 bytes expireAt
+	// First-byte (flags) layout per design §4.1:
+	//   bit 0      tombstone
+	//   bits 1-2   encryption_state (0b00 cleartext, 0b01 encrypted, 0b10/0b11 reserved)
+	//   bits 3-7   reserved (must be zero)
+	encStateMask             byte = 0b0000_0110
+	encStateShift                 = 1
+	tombstoneMask            byte = 0b0000_0001
+	encStateCleartext        byte = 0b00
+	encStateEncrypted        byte = 0b01
+	encStateReservedMask     byte = 0b1111_1000 // bits 3-7 must stay zero
+	snapshotBatchCountLimit       = 1000
+	snapshotBatchByteLimit        = 8 << 20 // 8 MiB; balances restore write amplification vs peak memory usage
+	dirPerms                      = 0755
+	metaLastCommitTS              = "_meta_last_commit_ts"
+	metaMinRetainedTS             = "_meta_min_retained_ts"
+	metaPendingMinRetainedTS      = "_meta_pending_min_retained_ts"
+	// metaAppliedIndex is the durable raft-applied index meta key.
+	// Bundled atomically with each raft-Apply pebble.Batch (see
+	// applyMutationsRaftAt / deletePrefixAtRaftAt) and pinned to
+	// snap.Metadata.Index by SetDurableAppliedIndex at every snapshot
+	// persist site. See
+	// docs/design/2026_06_02_idempotent_snapshot_restore.md §3.
+	metaAppliedIndex = "_meta_applied_index"
+	spoolBufSize     = 32 * 1024 // buffer size for streaming I/O during restore
 
 	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
 	// which are the user key concatenated with the 8-byte inverted timestamp.
@@ -145,6 +163,7 @@ func resolvePebbleCacheBytes(envVal string) int64 {
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
 var metaMinRetainedTSBytes = []byte(metaMinRetainedTS)
 var metaPendingMinRetainedTSBytes = []byte(metaPendingMinRetainedTS)
+var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 
 // pebbleStore implements MVCCStore using CockroachDB's Pebble LSM tree.
 //
@@ -154,7 +173,13 @@ var metaPendingMinRetainedTSBytes = []byte(metaPendingMinRetainedTS)
 //  2. dbMu          – guards the s.db pointer; held as a write-lock while the
 //     DB is being swapped (Restore/Close), and as a read-lock by every
 //     operation that accesses s.db.
-//  3. mtx           – guards the in-memory metadata fields
+//  3. applyMu       – serialises raft-apply conflict-check → batch-commit so
+//     concurrent ApplyMutationsRaft/At cannot both pass checkConflicts and
+//     then both commit. Also held by deletePrefixAtWithOpts and by
+//     SetDurableAppliedIndex's read-modify-write monotonic guard
+//     (PR #915 round-3) so the snapshot-persist checkpoint cannot rewind
+//     metaAppliedIndex below a concurrent per-Apply value.
+//  4. mtx           – guards the in-memory metadata fields
 //     (lastCommitTS, minRetainedTS, pendingMinRetainedTS).
 type pebbleStore struct {
 	db                   *pebble.DB
@@ -186,6 +211,34 @@ type pebbleStore struct {
 	// write-options pointer so monitoring (elastickv_fsm_apply_sync_mode)
 	// and log lines stay in sync with the resolved mode.
 	fsmApplySyncModeLabel string
+	// cipher / nonceFactory / activeStorageKeyID drive the §4.1
+	// storage envelope. nil cipher = cleartext-only legacy behaviour;
+	// see WithEncryption. Once wired, cipher and nonceFactory MUST
+	// outlive the store (the keystore behind cipher is itself
+	// copy-on-write so rotation does not break this invariant).
+	cipher             *encryption.Cipher
+	nonceFactory       NonceFactory
+	activeStorageKeyID ActiveStorageKeyID
+	// storageEnvelopeActive is the Stage 6D-5 cutover gate (design
+	// doc §6.2). When wired, every write path that would otherwise
+	// emit a §4.1 envelope first consults this closure and falls
+	// back to cleartext when it returns false. A nil closure
+	// preserves the pre-6D-5 behaviour where activeStorageKeyID
+	// alone decides the encrypt/cleartext split — the legacy test
+	// fixtures depend on that posture and the 6D-6 production wiring
+	// in main.go is what flips the gate on.
+	storageEnvelopeActive StorageEnvelopeActive
+	// storageRegistered is the Stage 7a-2 §4.1 registration gate. When
+	// wired, the DIRECT write path (PutAt / ExpireAt / ApplyMutations)
+	// refuses to emit an encrypted envelope — returning
+	// ErrWriterNotRegistered — until this process load's writer
+	// registration has committed for the active storage DEK. The
+	// FSM-apply path (ApplyMutationsRaft) never consults it: replicated
+	// apply must stay deterministic and may legitimately run before this
+	// node's own registration entry commits (design §1). A nil closure
+	// preserves the pre-7a-2 posture (no direct-path gating); the
+	// production main.go wiring threads cache.Registered in.
+	storageRegistered StorageRegistered
 }
 
 // Ensure pebbleStore implements MVCCStore and RetentionController.
@@ -360,17 +413,36 @@ func decodeKeyView(k []byte) ([]byte, uint64) {
 	return k[:keyLen], ^invTs
 }
 
-// Value encoding: fixed binary header [Tombstone(1)][ExpireAt(8)] followed by raw value bytes; key and timestamp are encoded in the SST key.
+// Value encoding: fixed binary header
+//
+//	byte 0: bit 0 tombstone | bits 1-2 encryption_state | bits 3-7 reserved
+//	bytes 1-8: ExpireAt (LittleEndian uint64)
+//	bytes 9..: body — either raw plaintext (encState=0b00) or the §4.1
+//	           authenticated envelope bytes (encState=0b01). Reserved
+//	           encryption_state values (0b10, 0b11) are rejected at decode
+//	           per design §7.1.
+//
+// The Pebble key (`encodeKey(user_key, commit_ts)`) is signed into the
+// envelope's AAD so a cut-and-paste / version-substitution attack
+// rejects on Decrypt; see §4.1 case 2/3.
 type storedValue struct {
 	Value     []byte
 	Tombstone bool
+	EncState  byte // 0b00 cleartext, 0b01 encrypted; reserved values rejected at decode
 	ExpireAt  uint64
 }
 
-func encodeValue(val []byte, tombstone bool, expireAt uint64) []byte {
-	// Format: [Tombstone(1)] [ExpireAt(8)] [Value(...)]
+// ErrEncryptedValueReservedState indicates decodeValue saw an
+// encryption_state value (0b10 or 0b11) that the current build does
+// not know how to interpret. Per design §7.1, this is a fail-closed
+// trip-wire so an old binary cannot silently treat a future-version
+// encrypted entry as cleartext bytes.
+var ErrEncryptedValueReservedState = errors.New("store: value header carries reserved encryption_state; binary too old to read this entry")
+
+func encodeValue(val []byte, tombstone bool, expireAt uint64, encState byte) []byte {
+	// Format: [flags(1)] [ExpireAt(8)] [Body(...)]
 	buf := make([]byte, encodedValueLen(len(val)))
-	fillEncodedValue(buf, val, tombstone, expireAt)
+	fillEncodedValue(buf, val, tombstone, expireAt, encState)
 	return buf
 }
 
@@ -378,21 +450,43 @@ func encodedValueLen(valueLen int) int {
 	return valueHeaderSize + valueLen
 }
 
-func fillEncodedValue(dst []byte, val []byte, tombstone bool, expireAt uint64) {
-	if tombstone {
-		dst[0] = 1
-	} else {
-		dst[0] = 0
-	}
-	binary.LittleEndian.PutUint64(dst[1:], expireAt)
+func fillEncodedValue(dst []byte, val []byte, tombstone bool, expireAt uint64, encState byte) {
+	writeValueHeaderBytes(dst, tombstone, expireAt, encState)
 	copy(dst[valueHeaderSize:], val)
+}
+
+// writeValueHeaderBytes writes only the 9-byte value-header (flags +
+// expireAt) into dst[0:valueHeaderSize]. Extracted from fillEncodedValue
+// so the encryption path (encryption_glue.go) can reproduce the
+// header bytes for AAD without having a body slice in hand: the AAD
+// must bind tombstone, encryption_state, and expireAt so a disk
+// attacker cannot flip those fields to force a silent
+// ErrKeyNotFound / expired read on an encrypted record.
+func writeValueHeaderBytes(dst []byte, tombstone bool, expireAt uint64, encState byte) {
+	var flags byte
+	if tombstone {
+		flags |= tombstoneMask
+	}
+	flags |= (encState << encStateShift) & encStateMask
+	dst[0] = flags
+	binary.LittleEndian.PutUint64(dst[1:], expireAt)
 }
 
 func decodeValue(data []byte) (storedValue, error) {
 	if len(data) < valueHeaderSize {
 		return storedValue{}, errors.New("invalid value length")
 	}
-	tombstone := data[0] != 0
+	flags := data[0]
+	if flags&encStateReservedMask != 0 {
+		return storedValue{}, errors.Wrapf(ErrEncryptedValueReservedState,
+			"value header byte = %#08b", flags)
+	}
+	encState := (flags & encStateMask) >> encStateShift
+	if encState != encStateCleartext && encState != encStateEncrypted {
+		return storedValue{}, errors.Wrapf(ErrEncryptedValueReservedState,
+			"encryption_state=%#x is reserved", encState)
+	}
+	tombstone := (flags & tombstoneMask) != 0
 	expireAt := binary.LittleEndian.Uint64(data[1:])
 	val := make([]byte, len(data)-valueHeaderSize)
 	copy(val, data[valueHeaderSize:])
@@ -400,6 +494,7 @@ func decodeValue(data []byte) (storedValue, error) {
 	return storedValue{
 		Value:     val,
 		Tombstone: tombstone,
+		EncState:  encState,
 		ExpireAt:  expireAt,
 	}, nil
 }
@@ -453,7 +548,8 @@ func writeTempDBMetadata(db *pebble.DB, lastCommitTS, minRetainedTS uint64) erro
 func isPebbleMetaKey(rawKey []byte) bool {
 	return bytes.Equal(rawKey, metaLastCommitTSBytes) ||
 		bytes.Equal(rawKey, metaMinRetainedTSBytes) ||
-		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes)
+		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes) ||
+		bytes.Equal(rawKey, metaAppliedIndexBytes)
 }
 
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
@@ -470,6 +566,122 @@ func (s *pebbleStore) findPendingMinRetainedTS() (uint64, error) {
 
 func (s *pebbleStore) saveLastCommitTS(ts uint64) error {
 	return writePebbleUint64(s.db, metaLastCommitTSBytes, ts, pebble.NoSync)
+}
+
+// LastAppliedIndex implements raftengine.AppliedIndexReader. Returns
+// the largest Raft entry index whose Apply produced a durable
+// mutation on this store (via applyMutationsRaftAt /
+// deletePrefixAtRaftAt — same WriteBatch as the data — or via
+// SetDurableAppliedIndex at a snapshot persist).
+//
+// (0, false, nil) means the meta key is absent — either a pre-upgrade
+// fsm.db that has not yet bumped through a raft-Apply, or a freshly
+// restored store. Callers MUST treat this as "missing" and fall back
+// to the full restore path; see
+// docs/design/2026_06_02_idempotent_snapshot_restore.md §4 fallback
+// policy. Any other error propagates.
+//
+// dbMu.RLock matches the rest of the read path
+// (lsm_store.go:153 / :675); without it a concurrent swapInTempDB
+// could replace s.db between db.Get and the closer.Close()/value
+// access, racing the snapshot install path.
+func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	val, closer, err := s.db.Get(metaAppliedIndexBytes)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, errors.WithStack(err)
+	}
+	defer func() { _ = closer.Close() }()
+	if len(val) < timestampSize {
+		// Truncated meta key — treat as missing for strictly-additive
+		// safety. The caller will fall back to full restore, which
+		// produces a fresh well-formed value via the next Apply or
+		// snapshot persist.
+		return 0, false, nil
+	}
+	return binary.LittleEndian.Uint64(val), true, nil
+}
+
+// SetDurableAppliedIndex implements raftengine.AppliedIndexWriter.
+// Used at snapshot persist time to pin metaAppliedIndex to
+// snap.Metadata.Index BEFORE persist.SaveSnap, so a successful
+// snapshot persist always implies LastAppliedIndex >=
+// snap.Metadata.Index — closing the HLC-lease-only / encryption-only
+// fallback (see design doc §6).
+//
+// The write is single-key and goes through a fresh pebble.Batch with
+// pebble.Sync UNCONDITIONALLY — independent of
+// ELASTICKV_FSM_SYNC_MODE. The reason is durability boundary: WAL
+// compaction following SaveSnap discards every log entry at or
+// before snap.Metadata.Index, so there is no source to replay the
+// meta key bump from. If we honoured nosync mode here, a crash
+// between Pebble's deferred flush and SaveSnap's internal fsync
+// would leave snapshot pointer at X but metaAppliedIndex at Y < X
+// forever. The +1 fsync per snapshot persist (rare; default
+// SnapshotCount=10000) is negligible vs that risk.
+//
+// Monotonicity (round-2 P2 fix for PR #915): when persistLocalSnapshot
+// runs in a background worker, raft apply can continue and the per-
+// entry ApplyMutationsRaftAt path can advance metaAppliedIndex past
+// `idx` before this method runs. An unconditional write would rewind
+// the meta key — defeating the soak/verification invariant and
+// causing the future skip gate to fall back unnecessarily. The
+// applyMu lock serialises with applyMutationsWithOpts /
+// deletePrefixAtWithOpts (both hold it across their batch commit),
+// and the read-modify-write keeps the meta key strictly monotonic.
+//
+// Lock order: dbMu.RLock before applyMu.Lock matches the existing
+// discipline in applyMutationsWithOpts (lsm_store.go around :1438 /
+// :1444). No deadlock.
+func (s *pebbleStore) SetDurableAppliedIndex(idx uint64) error {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
+	existing, present, err := s.readAppliedIndexLocked()
+	if err != nil {
+		return err
+	}
+	if present && existing >= idx {
+		// Concurrent apply already advanced the meta key past `idx`;
+		// no work needed. The skip-invariant still holds because the
+		// snapshot's claim (LastAppliedIndex >= snap.Metadata.Index)
+		// is satisfied by existing >= idx >= snap.Metadata.Index.
+		return nil
+	}
+
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, idx); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(pebble.Sync))
+}
+
+// readAppliedIndexLocked decodes the metaAppliedIndex key. Caller
+// MUST hold s.dbMu.RLock (so s.db is stable) AND s.applyMu.Lock (so
+// the value reflects a consistent snapshot vs concurrent batch
+// commits in applyMutationsWithOpts). The body is shared with the
+// unlocked LastAppliedIndex() reader; same (0, false, nil) semantics
+// for absent / truncated meta keys.
+func (s *pebbleStore) readAppliedIndexLocked() (uint64, bool, error) {
+	val, closer, err := s.db.Get(metaAppliedIndexBytes)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, errors.WithStack(err)
+	}
+	defer func() { _ = closer.Close() }()
+	if len(val) < timestampSize {
+		return 0, false, nil
+	}
+	return binary.LittleEndian.Uint64(val), true, nil
 }
 
 func (s *pebbleStore) saveMinRetainedTS(ts uint64) error {
@@ -642,33 +854,45 @@ func (s *pebbleStore) getAt(_ context.Context, key []byte, ts uint64) ([]byte, e
 	}
 	defer iter.Close()
 
-	if iter.SeekGE(seekKey) {
-		k := iter.Key()
-		userKey, _ := decodeKeyView(k)
-
-		if !bytes.Equal(userKey, key) {
-			// Moved to next user key
-			return nil, ErrKeyNotFound
-		}
-
-		// Found a version. Check if valid.
-		valBytes := iter.Value()
-		sv, err := decodeValue(valBytes)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-
-		if sv.Tombstone {
-			return nil, ErrKeyNotFound
-		}
-		if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
-			return nil, ErrKeyNotFound
-		}
-
-		return sv.Value, nil
+	if !iter.SeekGE(seekKey) {
+		return nil, ErrKeyNotFound
 	}
+	return s.readVisibleVersion(iter, key, ts)
+}
 
-	return nil, ErrKeyNotFound
+// readVisibleVersion examines the iterator's current entry and
+// returns the live plaintext value at ts, or ErrKeyNotFound if the
+// entry is a different user key, a tombstone, or expired.
+//
+// For encrypted entries the decrypt step runs BEFORE the
+// tombstone/expireAt visibility checks. The AAD passed to Decrypt
+// includes the on-disk value-header (tombstone bit + encryption_state
+// + expireAt), so a disk attacker cannot flip those fields to force
+// a silent ErrKeyNotFound/expired branch — any tamper either fails
+// GCM (returns ErrEncryptedReadIntegrity) or matches the original
+// values, in which case the visibility checks below are operating
+// on authenticated bytes.
+func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts uint64) ([]byte, error) {
+	k := iter.Key()
+	userKey, _ := decodeKeyView(k)
+	if !bytes.Equal(userKey, key) {
+		return nil, ErrKeyNotFound
+	}
+	sv, err := decodeValue(iter.Value())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	plain, err := s.decryptForKey(k, sv, sv.Value)
+	if err != nil {
+		return nil, err
+	}
+	if sv.Tombstone {
+		return nil, ErrKeyNotFound
+	}
+	if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
+		return nil, ErrKeyNotFound
+	}
+	return plain, nil
 }
 
 func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -692,6 +916,42 @@ func (s *pebbleStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool
 	return val != nil, nil
 }
 
+// CommittedVersionAt reports whether a version stamped EXACTLY commitTS
+// exists for key. It is a single point lookup on the MVCC-encoded key
+// (userKey + inverted commitTS), not a <=ts scan: only the exact version
+// matters for the one-phase idempotency probe. A tombstone version counts
+// as present — the previous attempt landed even if it committed a delete —
+// so the raw key existence is the answer and the value is not decoded.
+//
+// Unlike GetAt/ExistsAt, this probe does NOT enforce the retention watermark
+// (codex P1 round-11): branching FSM apply on the per-replica minRetainedTS
+// is non-deterministic across raft replicas (compaction is driven by local
+// wall clock, not by the replicated log), and a fail-closed retention check
+// here would produce split-brain — some replicas surface ErrReadTSCompacted
+// and skip the apply while others see the version and no-op. Returning the
+// raw pebble.Get answer makes the probe deterministic for the option-2
+// dedup use case, where each per-element key has at most one MVCC version
+// so physical pebble compaction does not remove it. The invariant the
+// caller depends on is: retention window > max adapter retry latency, so a
+// live retry's PrevCommitTS never falls below pebble's compacted floor on
+// any replica. The earlier round-10 retention guard was reverted with this
+// rationale; see design doc §race-freedom.
+func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS uint64) (bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	_, closer, err := s.db.Get(encodeKey(key, commitTS))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	if err := closer.Close(); err != nil {
+		return false, errors.WithStack(err)
+	}
+	return true, nil
+}
+
 func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, ts uint64) (*KVPair, error) {
 	valBytes := iter.Value()
 	sv, err := decodeValue(valBytes)
@@ -699,10 +959,19 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 		return nil, err
 	}
 
+	// Decrypt before the tombstone/expireAt visibility checks so the
+	// per-value AAD authenticates the header bits we are about to
+	// branch on. See readVisibleVersion for the matching rationale:
+	// a flipped tombstone or lowered expireAt would otherwise force
+	// a silent skip on an encrypted entry.
+	plain, err := s.decryptForKey(iter.Key(), sv, sv.Value)
+	if err != nil {
+		return nil, err
+	}
 	if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
 		return &KVPair{
 			Key:   userKey,
-			Value: sv.Value,
+			Value: plain,
 		}, nil
 	}
 	return nil, nil
@@ -937,7 +1206,12 @@ func (s *pebbleStore) PutAt(ctx context.Context, key []byte, value []byte, commi
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	v := encodeValue(value, false, expireAt)
+	// gateRegistration=true: PutAt is a direct (non-raft) write path.
+	body, encState, err := s.encryptForKey(k, value, expireAt, true)
+	if err != nil {
+		return err
+	}
+	v := encodeValue(body, false, expireAt, encState)
 
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil { //nolint:wrapcheck
 		return errors.WithStack(err)
@@ -952,7 +1226,7 @@ func (s *pebbleStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64)
 	commitTS = s.alignCommitTS(commitTS)
 
 	k := encodeKey(key, commitTS)
-	v := encodeValue(nil, true, 0)
+	v := encodeValue(nil, true, 0, encStateCleartext)
 
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
@@ -978,7 +1252,13 @@ func (s *pebbleStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64,
 
 	commitTS = s.alignCommitTS(commitTS)
 	k := encodeKey(key, commitTS)
-	v := encodeValue(val, false, expireAt)
+	// gateRegistration=true: ExpireAt is a direct (non-raft) write path
+	// that calls encryptForKey directly (it does not delegate to PutAt).
+	body, encState, err := s.encryptForKey(k, val, expireAt, true)
+	if err != nil {
+		return err
+	}
+	v := encodeValue(body, false, expireAt, encState)
 	if err := s.db.Set(k, v, pebble.NoSync); err != nil {
 		return errors.WithStack(err)
 	}
@@ -1065,7 +1345,7 @@ func (s *pebbleStore) WriteConflictCount() uint64 {
 	return s.writeConflicts.total()
 }
 
-func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64) error {
+func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64, gateRegistration bool) error {
 	for _, mut := range mutations {
 		k := encodeKey(mut.Key, commitTS)
 		var v []byte
@@ -1075,9 +1355,13 @@ func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMu
 			if err := validateValueSize(mut.Value); err != nil {
 				return err
 			}
-			v = encodeValue(mut.Value, false, mut.ExpireAt)
+			body, encState, encErr := s.encryptForKey(k, mut.Value, mut.ExpireAt, gateRegistration)
+			if encErr != nil {
+				return encErr
+			}
+			v = encodeValue(body, false, mut.ExpireAt, encState)
 		case OpTypeDelete:
-			v = encodeValue(nil, true, 0)
+			v = encodeValue(nil, true, 0, encStateCleartext)
 		default:
 			return ErrUnknownOp
 		}
@@ -1110,7 +1394,13 @@ func (s *pebbleStore) raftApplyWriteOpts() *pebble.WriteOptions {
 // backstop (catalog bootstrap, admin snapshots, migrations, tests) are never
 // affected by ELASTICKV_FSM_SYNC_MODE=nosync.
 func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts())
+	// gateRegistration=true: the direct path is self-originated (catalog
+	// bootstrap Save, admin snapshot, migration). Stage 7a-2 refuses to
+	// emit an encrypted envelope here before this load's writer
+	// registration commits.
+	// appliedIndex=0: direct path has no raft index; the leaf treats 0 as
+	// "do not write metaAppliedIndex" so the meta key stays unchanged.
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0)
 }
 
 // ApplyMutationsRaft is the raft-apply commit path. Durability is governed
@@ -1123,11 +1413,38 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 // Must only be called from inside the FSM apply loop. All other call sites
 // must use ApplyMutations so a nosync opt-in cannot silently drop
 // acknowledged writes that have no raft backstop.
+//
+// Callers that have a raft entry index in hand (the kvFSM data-Apply
+// path via the raftengine.ApplyIndexAware seam) SHOULD prefer
+// ApplyMutationsRaftAt so the metaAppliedIndex meta key is bundled
+// atomically with the data mutation — see PR #910 / B2.
 func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts())
+	// gateRegistration=false: the FSM-apply path replays committed Raft
+	// entries and must stay deterministic. It may legitimately encrypt
+	// before this node's own registration entry commits (design §1);
+	// fail-closing here would halt the apply loop and could deadlock a
+	// node whose storage entry is ordered before its registration entry.
+	// appliedIndex=0: callers that have not yet been wired to the
+	// raftengine.ApplyIndexAware seam (test fakes, legacy FSM impls)
+	// land here; their LastAppliedIndex() will stay behind the snapshot
+	// pointer and the skip optimisation will fall back to full restore
+	// for them. Preferred path is ApplyMutationsRaftAt.
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0)
 }
 
-func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions) error {
+// ApplyMutationsRaftAt is ApplyMutationsRaft with the raft entry
+// index threaded through so the leaf can bundle metaAppliedIndex in
+// the same pebble.Batch as the data mutation. See PR #910 design §2.
+//
+// appliedIndex==0 is treated as "no index" — the leaf will not write
+// metaAppliedIndex, preserving the ApplyMutationsRaft semantics.
+// Production callers (kvFSM.applyXxx with f.pendingApplyIdx) SHOULD
+// pass the entry.Index value the engine delivered via SetApplyIndex.
+func (s *pebbleStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex)
+}
+
+func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1146,7 +1463,7 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 		return err
 	}
 
-	if err := s.applyMutationsBatch(b, mutations, commitTS); err != nil {
+	if err := s.applyMutationsBatch(b, mutations, commitTS, gateRegistration); err != nil {
 		return err
 	}
 
@@ -1162,6 +1479,16 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
 		s.mtx.Unlock()
 		return err
+	}
+	// Bundle metaAppliedIndex in the same batch as the data + commitTS
+	// meta key so a crash either commits all three atomically or none.
+	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
+	// or ApplyMutationsRaft); they leave the key unchanged.
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
+			s.mtx.Unlock()
+			return err
+		}
 	}
 	if err := b.Commit(writeOpts); err != nil {
 		s.mtx.Unlock()
@@ -1183,17 +1510,32 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 // ELASTICKV_FSM_SYNC_MODE=nosync. Raft-apply callers must use
 // DeletePrefixAtRaft instead.
 func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.directApplyWriteOpts())
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.directApplyWriteOpts(), 0)
 }
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt. Durability
 // is governed by s.fsmApplyWriteOpts (ELASTICKV_FSM_SYNC_MODE). See
 // ApplyMutationsRaft for the full durability argument.
+//
+// Callers that have a raft entry index in hand SHOULD prefer
+// DeletePrefixAtRaftAt to bundle metaAppliedIndex atomically — see
+// PR #910 design §2 "why both leaves".
 func (s *pebbleStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts())
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), 0)
 }
 
-func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64, writeOpts *pebble.WriteOptions) error {
+// DeletePrefixAtRaftAt is DeletePrefixAtRaft with the raft entry
+// index threaded through. handleDelPrefix builds an independent
+// pebble.Batch separate from applyMutationsWithOpts, so the meta
+// key bundle must happen here too — otherwise DEL_PREFIX entries
+// would land without bumping metaAppliedIndex and silently leave
+// LastAppliedIndex behind the true applied count for any workload
+// that uses DEL_PREFIX. PR #910 design §2.
+func (s *pebbleStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), appliedIndex)
+}
+
+func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -1231,6 +1573,15 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 	if err := setPebbleUint64InBatch(batch, metaLastCommitTSBytes, newLastTS); err != nil {
 		return err
 	}
+	// Bundle metaAppliedIndex atomically with the tombstones + commitTS
+	// — same rationale as applyMutationsWithOpts. appliedIndex==0 means
+	// the legacy / non-raft caller path (DeletePrefixAt or
+	// DeletePrefixAtRaft); leave the meta key unchanged.
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
+	}
 	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
@@ -1240,7 +1591,7 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 }
 
 func (s *pebbleStore) scanDeletePrefix(iter *pebble.Iterator, batch *pebble.Batch, prefix, excludePrefix []byte, commitTS uint64) error {
-	tombstoneVal := encodeValue(nil, true, 0)
+	tombstoneVal := encodeValue(nil, true, 0, encStateCleartext)
 
 	for iter.SeekGE(encodeKey(prefix, math.MaxUint64)); iter.Valid(); {
 		userKey, version, ok := nextScannableUserKey(iter)
@@ -1295,6 +1646,17 @@ func (s *pebbleStore) classifyDeletePrefixKey(userKey, prefix, excludePrefix []b
 
 // isVisibleLiveKey checks whether the key has a visible, non-tombstone,
 // non-expired version at commitTS. It advances the iterator as a side effect.
+//
+// Sole caller is scanDeletePrefix, which uses the bool to decide
+// whether DeletePrefixAt needs to write a fresh tombstone for the
+// observed live key. The read path's value-header tamper guard
+// (rounds 3–5 of PR #742) is therefore reproduced here: for encrypted
+// entries we run cipher.Decrypt over (header bytes ‖ pebble key) AAD
+// before branching on the unauthenticated tombstone / expireAt fields.
+// Without this, a disk attacker who flips the tombstone bit on an
+// encrypted entry would cause DeletePrefixAt to skip writing the
+// deletion tombstone — the key survives the prefix delete silently
+// (a write-side integrity bypass, not just a transient wrong return).
 func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, version, commitTS uint64) (bool, error) {
 	if !s.seekToVisibleVersion(iter, userKey, version, commitTS) {
 		return false, nil
@@ -1302,6 +1664,14 @@ func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, ve
 	sv, err := decodeValue(iter.Value())
 	if err != nil {
 		return false, errors.WithStack(err)
+	}
+	// decryptForKey authenticates the value-header bytes when the
+	// entry is encrypted (cleartext entries no-op except for the
+	// rebadge guard). We discard the plaintext — we only need the
+	// authentication side-effect; tombstone / expireAt visibility
+	// is then decided on now-trusted bytes.
+	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+		return false, err
 	}
 	if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {
 		return false, nil
@@ -1568,7 +1938,15 @@ func readRestoreEntry(r io.Reader, keyBuf *[]byte) (kLen, vLen int, eof bool, er
 	if _, err = io.ReadFull(r, (*keyBuf)[:kLen]); err != nil {
 		return 0, 0, false, errors.WithStack(err)
 	}
-	vLen, err = readRestoreFieldLen(r, "snapshot value", maxSnapshotValueSize+valueHeaderSize)
+	// Native Pebble snapshots ship raw on-disk bytes, which for an
+	// encrypted row is value-header(9B) + envelope-overhead(34B) +
+	// ciphertext. The cap must accommodate envelope overhead so a
+	// plaintext written at maxSnapshotValueSize round-trips through
+	// snapshot restore — without it, validateValueSize accepts the
+	// plaintext but restore rejects the encrypted body with
+	// ErrValueTooLarge.
+	vLen, err = readRestoreFieldLen(r, "snapshot value",
+		maxSnapshotValueSize+valueHeaderSize+encryption.EnvelopeOverhead)
 	if err != nil {
 		return 0, 0, false, err
 	}
@@ -1625,7 +2003,14 @@ func flushSnapshotBatch(db *pebble.DB, batch **pebble.Batch, opts *pebble.WriteO
 func setEncodedVersionInBatch(batch *pebble.Batch, key []byte, version VersionedValue) error {
 	deferred := batch.SetDeferred(encodedKeyLen(key), encodedValueLen(len(version.Value)))
 	fillEncodedKey(deferred.Key, key, version.TS)
-	fillEncodedValue(deferred.Value, version.Value, version.Tombstone, version.ExpireAt)
+	// MVCC snapshot format v2 does not carry encryption_state — Stage 8 of
+	// the encryption rollout (per docs/design/2026_04_29_proposed...) bumps
+	// the format to v3 to round-trip encrypted entries through this path.
+	// Until then, restored versions are written as cleartext and any node
+	// snapshotting/restoring an encrypted dataset must use the native
+	// Pebble snapshot path (snapshot_pebble.go), which ships raw bytes
+	// and thus preserves the on-disk envelope verbatim.
+	fillEncodedValue(deferred.Value, version.Value, version.Tombstone, version.ExpireAt, encStateCleartext)
 	return errors.WithStack(deferred.Finish())
 }
 

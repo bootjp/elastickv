@@ -340,7 +340,7 @@ func startBootstrapE2ENode(
 	bootstrapMembers string,
 	engineType raftEngineType,
 ) (*bootstrapE2ENode, error) {
-	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "", "", "")
+	cfg, err := parseRuntimeConfig(ep.raftAddr, ep.redisAddr, "", "", "", "", "", "", "", "", "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -351,12 +351,12 @@ func startBootstrapE2ENode(
 	}
 	bootstrap = bootstrap || len(bootstrapServers) > 0
 
-	factory, err := newRaftFactory(engineType)
+	factory, err := newRaftFactory(engineType, nil)
 	if err != nil {
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, factory, nil, clock)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapServers, factory, nil, clock, nil, nil, "", encryptionWriteWiring{}, cfg.engine)
 	if err != nil {
 		return nil, err
 	}

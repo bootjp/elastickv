@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/store"
@@ -15,12 +16,12 @@ func TestCoordinateVerifyLeader_LeaderReturnsNil(t *testing.T) {
 	t.Cleanup(stop)
 
 	c := NewCoordinatorWithEngine(&stubTransactional{}, r)
-	require.NoError(t, c.VerifyLeader())
+	require.NoError(t, c.VerifyLeader(context.Background()))
 }
 
 func TestCoordinateVerifyLeader_NilRaftReturnsLeaderNotFound(t *testing.T) {
 	t.Parallel()
 
 	c := &Coordinate{}
-	require.ErrorIs(t, c.VerifyLeader(), ErrLeaderNotFound)
+	require.ErrorIs(t, c.VerifyLeader(context.Background()), ErrLeaderNotFound)
 }
