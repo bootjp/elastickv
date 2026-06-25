@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  NODES="n1=raft-1.internal,n2=raft-2.internal,n3=raft-3.internal" ./scripts/rolling-update.sh
+  NODES="n1=raft-1.internal,n2=raft-2.internal,n3=raft-3.internal" ./scripts/rolling-update.sh [--dry-run]
 
 Required environment:
   NODES
@@ -16,6 +16,11 @@ Required environment:
 Optional environment:
   ROLLING_UPDATE_ENV_FILE
     Shell env file to source before evaluating the rest of the settings.
+
+  DRY_RUN
+    Set to true, or pass --dry-run, to validate and print the rollout plan
+    without building helpers, copying files, SSHing to nodes, or touching
+    containers.
 
   SSH_TARGETS
     Comma-separated SSH target map when SSH hosts differ from advertised hosts:
@@ -153,10 +158,24 @@ Notes:
 EOF
 }
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  usage
-  exit 0
-fi
+DRY_RUN_ARG=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN_ARG=true
+      shift
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [[ -n "${ROLLING_UPDATE_ENV_FILE:-}" ]]; then
   if [[ ! -f "$ROLLING_UPDATE_ENV_FILE" ]]; then
@@ -293,6 +312,11 @@ KEYVIZ_HOT_KEYS_SAMPLE_RATE="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
 KEYVIZ_HOT_KEYS_QUEUE_SIZE="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
 KEYVIZ_HOT_KEYS_MAX_KEY_LEN="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
 
+DRY_RUN="${DRY_RUN:-false}"
+if [[ "$DRY_RUN_ARG" == "true" ]]; then
+  DRY_RUN=true
+fi
+
 # Validate the three boolean ADMIN_* flags must be the literal "true"
 # or "false" — they are forwarded to the remote shell unquoted (no
 # printf %q) for readability, which is only safe when the value is
@@ -314,6 +338,11 @@ unset _bool_var
 # Container OOM defenses. See usage() for rationale. Empty string disables.
 DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
 CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
+
+if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
+  echo "DRY_RUN must be true or false" >&2
+  exit 1
+fi
 
 if [[ -z "$NODES" ]]; then
   echo "NODES is required" >&2
@@ -507,6 +536,28 @@ derive_raft_to_sqs_map() {
     IFS=,
     printf '%s\n' "${parts[*]}"
   )
+}
+
+print_dry_run_plan() {
+  local node_id node_host ssh_target
+
+  echo "[rolling-update] dry run: no remote commands will be executed"
+  echo "[rolling-update] target image: $IMAGE"
+  echo "[rolling-update] container: $CONTAINER_NAME"
+  echo "[rolling-update] raft engine: $RAFT_ENGINE"
+  echo "[rolling-update] nodes:"
+  for node_id in "${ROLLING_NODE_IDS[@]}"; do
+    node_host="$(node_host_by_id "$node_id")"
+    ssh_target="$(ssh_target_by_id "$node_id")"
+    echo "  - raft_id=$node_id host=$node_host ssh_target=$ssh_target"
+  done
+  echo "[rolling-update] RAFT_TO_REDIS_MAP=$RAFT_TO_REDIS_MAP"
+  if [[ "${ENABLE_S3}" == "true" ]]; then
+    echo "[rolling-update] RAFT_TO_S3_MAP=$RAFT_TO_S3_MAP"
+  fi
+  if [[ "${ENABLE_SQS}" == "true" ]]; then
+    echo "[rolling-update] RAFT_TO_SQS_MAP=$RAFT_TO_SQS_MAP"
+  fi
 }
 
 ensure_local_raftadmin() {
@@ -1470,6 +1521,11 @@ fi
 
 if [[ "${ENABLE_SQS}" == "true" && -z "$RAFT_TO_SQS_MAP" ]]; then
   RAFT_TO_SQS_MAP="$(derive_raft_to_sqs_map)"
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  print_dry_run_plan
+  exit 0
 fi
 
 ensure_local_raftadmin

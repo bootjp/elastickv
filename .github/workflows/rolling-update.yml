@@ -1,0 +1,425 @@
+name: Rolling update
+
+# Manually-triggered production rollout. Joins the Tailnet, SSHes over
+# MagicDNS into each node, and invokes scripts/rolling-update.sh.
+# See docs/design/2026_04_24_proposed_deploy_via_tailscale.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Image tag/ref to deploy. Start this workflow from the repository default branch.
+        required: true
+        type: string
+      image_tag:
+        description: Override the image tag (default = ref). Used for rollbacks.
+        required: false
+        type: string
+        default: ""
+      nodes:
+        description: Comma-separated raft IDs to roll (e.g. "n1,n2"). Empty = all nodes in NODES_RAFT_MAP.
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: Render the plan and run a reachability check only; do NOT touch containers.
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write   # required by tailscale/github-action OIDC flow
+  packages: read    # required by `docker manifest inspect` on ghcr.io private images
+
+concurrency:
+  group: rolling-update
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Approval gate — see GitHub environment settings for required reviewers.
+    # Dry-runs also use this environment so the secret wiring is identical;
+    # the environment's approval rule should be configured to auto-approve
+    # dry-runs if that distinction is desired (GitHub UI: "Deployment
+    # protection rules").
+    environment: production
+    timeout-minutes: 60
+    env:
+      CONTAINER_NAME: ${{ vars.CONTAINER_NAME || 'elastickv' }}
+      DATA_DIR: ${{ vars.DATA_DIR || '/var/lib/elastickv' }}
+      SERVER_ENTRYPOINT: ${{ vars.SERVER_ENTRYPOINT || '/app' }}
+      RAFT_ENGINE: ${{ vars.RAFT_ENGINE || 'etcd' }}
+      RAFT_PORT: ${{ vars.RAFT_PORT || '50051' }}
+      REDIS_PORT: ${{ vars.REDIS_PORT || '6379' }}
+      DYNAMO_PORT: ${{ vars.DYNAMO_PORT || '8000' }}
+      S3_PORT: ${{ vars.S3_PORT || '9000' }}
+      ENABLE_S3: ${{ vars.ENABLE_S3 || 'false' }}
+      S3_REGION: ${{ vars.S3_REGION || 'us-east-1' }}
+      S3_CREDENTIALS_FILE: ${{ vars.S3_CREDENTIALS_FILE }}
+      S3_PATH_STYLE_ONLY: ${{ vars.S3_PATH_STYLE_ONLY || 'true' }}
+      DEFAULT_EXTRA_ENV: ${{ vars.DEFAULT_EXTRA_ENV || 'GOMEMLIMIT=1800MiB' }}
+      EXTRA_ENV: ${{ vars.EXTRA_ENV }}
+      CONTAINER_MEMORY_LIMIT: ${{ vars.CONTAINER_MEMORY_LIMIT || '2500m' }}
+
+    steps:
+      # The deploy script is executed after the tailnet join and SSH key load.
+      # Always take that script from the review-gated default branch; the
+      # workflow input only selects the image tag/ref to deploy.
+      - name: Resolve trusted checkout ref
+        id: trusted-ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ inputs.ref }}
+          RUN_REF_NAME: ${{ github.ref_name }}
+          RUN_REF_TYPE: ${{ github.ref_type }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          default_branch=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+          if [[ "$RUN_REF_TYPE" != "branch" || "$RUN_REF_NAME" != "$default_branch" ]]; then
+            echo "::error::rolling-update must be dispatched from the trusted default branch '$default_branch' (got ${RUN_REF_TYPE}:${RUN_REF_NAME})"
+            echo "::error::configure the production environment to allow deployments only from the default branch"
+            exit 1
+          fi
+          echo "checkout_ref=$RUN_SHA" >> "$GITHUB_OUTPUT"
+          echo "deploy ref/image tag: $REF"
+          echo "trusted workflow sha: $RUN_SHA"
+
+      - name: Checkout trusted deploy script
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ steps.trusted-ref.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Verify image exists on ghcr.io
+        env:
+          IMAGE_BASE: ${{ vars.IMAGE_BASE }}
+          IMAGE_TAG: ${{ inputs.image_tag || inputs.ref }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$IMAGE_BASE" ]]; then
+            echo "::error::IMAGE_BASE repository variable is not set"
+            exit 1
+          fi
+          echo "Checking $IMAGE_BASE:$IMAGE_TAG"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin >/dev/null
+          if ! docker manifest inspect "$IMAGE_BASE:$IMAGE_TAG" >/dev/null; then
+            echo "::error::image $IMAGE_BASE:$IMAGE_TAG not found on ghcr.io"
+            exit 1
+          fi
+
+      - name: Join Tailnet (ephemeral)
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-deploy
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          # Sanity: no stray CRLF in the key, no empty file.
+          test -s ~/.ssh/id_ed25519 || { echo "::error::DEPLOY_SSH_PRIVATE_KEY is empty"; exit 1; }
+          ssh-keygen -lf ~/.ssh/id_ed25519 >/dev/null
+
+      - name: Render NODES and SSH_TARGETS
+        id: render
+        env:
+          NODES_RAFT_MAP: ${{ vars.NODES_RAFT_MAP }}
+          SSH_TARGETS_MAP: ${{ vars.SSH_TARGETS_MAP }}
+          NODES_FILTER: ${{ inputs.nodes }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$NODES_RAFT_MAP" ]]; then
+            echo "::error::NODES_RAFT_MAP is not set in the production environment variables"
+            exit 1
+          fi
+
+          normalize_csv_map() {
+            local all="$1"
+            local out=""
+            local e key value
+            if [[ -z "$all" ]]; then
+              printf '%s' ""
+              return 0
+            fi
+            IFS=',' read -r -a entries <<< "$all"
+            for e in "${entries[@]}"; do
+              e="${e//[[:space:]]/}"
+              [[ -n "$e" ]] || continue
+              if [[ "$e" != *=* ]]; then
+                echo "::error::invalid map entry '$e' (expected raftId=value)"
+                exit 1
+              fi
+              key="${e%%=*}"
+              value="${e#*=}"
+              if [[ -z "$key" || -z "$value" ]]; then
+                echo "::error::invalid map entry '$e' (empty raft ID or value)"
+                exit 1
+              fi
+              out+="${out:+,}${key}=${value}"
+            done
+            printf '%s' "$out"
+          }
+
+          lookup_map() {
+            local key="$1"
+            local all="$2"
+            local e entry_key entry_value
+            [[ -n "$all" ]] || return 1
+            IFS=',' read -r -a entries <<< "$all"
+            for e in "${entries[@]}"; do
+              e="${e//[[:space:]]/}"
+              [[ -n "$e" ]] || continue
+              entry_key="${e%%=*}"
+              entry_value="${e#*=}"
+              if [[ "$entry_key" == "$key" ]]; then
+                printf '%s' "$entry_value"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          filter_csv() {
+            local all="$1"
+            local filter="$2"
+            local out=""
+            local w value
+            if [[ -z "$all" ]]; then
+              printf '%s' ""
+              return 0
+            fi
+            IFS=',' read -r -a list_wanted <<< "$filter"
+            for w in "${list_wanted[@]}"; do
+              w="${w//[[:space:]]/}"
+              [[ -n "$w" ]] || continue
+              value="$(lookup_map "$w" "$all" || true)"
+              if [[ -n "$value" ]]; then
+                out+="${out:+,}${w}=${value}"
+              fi
+            done
+            printf '%s' "$out"
+          }
+
+          known_ids_csv() {
+            local all="$1"
+            local out=""
+            local e key
+            IFS=',' read -r -a entries <<< "$all"
+            for e in "${entries[@]}"; do
+              e="${e//[[:space:]]/}"
+              [[ -n "$e" ]] || continue
+              key="${e%%=*}"
+              out+="${out:+,}$key"
+            done
+            printf '%s' "$out"
+          }
+
+          materialize_ssh_targets() {
+            local nodes="$1"
+            local ssh_targets="$2"
+            local out=""
+            local e key host target
+            if [[ -z "$nodes" ]]; then
+              printf '%s' ""
+              return 0
+            fi
+            IFS=',' read -r -a entries <<< "$nodes"
+            for e in "${entries[@]}"; do
+              e="${e//[[:space:]]/}"
+              [[ -n "$e" ]] || continue
+              key="${e%%=*}"
+              host="${e#*=}"
+              target="$(lookup_map "$key" "$ssh_targets" || true)"
+              if [[ -z "$target" ]]; then
+                target="$host"
+              fi
+              out+="${out:+,}${key}=${target}"
+            done
+            printf '%s' "$out"
+          }
+
+          NODES_RAFT_MAP="$(normalize_csv_map "$NODES_RAFT_MAP")"
+          SSH_TARGETS_MAP="$(normalize_csv_map "$SSH_TARGETS_MAP")"
+          if [[ -z "$NODES_RAFT_MAP" ]]; then
+            echo "::error::NODES_RAFT_MAP did not contain any nodes"
+            exit 1
+          fi
+          NODES_FILTER="${NODES_FILTER//[[:space:]]/}"
+
+          ROLLING_ORDER="$(known_ids_csv "$NODES_RAFT_MAP")"
+          if [[ -n "$NODES_FILTER" ]]; then
+            # Keep NODES_RAFT_MAP as the full cluster map. rolling-update.sh
+            # derives RAFT_TO_REDIS_MAP / RAFT_TO_S3_MAP and transfer
+            # candidates from NODES, so filtering it for a staged rollout would
+            # start the target node with an incomplete view of the cluster.
+            # The requested subset is passed separately as ROLLING_ORDER.
+            # Reject any filter ID that does not appear in the map: silently
+            # dropping unknown IDs would let a typo like "n1,n9" proceed as
+            # a one-node rollout of n1 alone, which is a staged-deploy
+            # footgun.
+            unknown=""
+            IFS=',' read -r -a wanted <<< "$NODES_FILTER"
+            for w in "${wanted[@]}"; do
+              [[ -n "$w" ]] || continue
+              if ! lookup_map "$w" "$NODES_RAFT_MAP" >/dev/null; then
+                unknown+="${unknown:+, }$w"
+              fi
+            done
+            if [[ -n "$unknown" ]]; then
+              echo "::error::nodes filter '$NODES_FILTER' references unknown raft IDs: $unknown. Known IDs: $(known_ids_csv "$NODES_RAFT_MAP")"
+              exit 1
+            fi
+            ROLLING_ORDER="$(known_ids_csv "$(filter_csv "$NODES_RAFT_MAP" "$NODES_FILTER")")"
+            if [[ -z "$ROLLING_ORDER" ]]; then
+              echo "::error::nodes filter '$NODES_FILTER' matches nothing in NODES_RAFT_MAP"
+              exit 1
+            fi
+          fi
+          SSH_TARGETS_MAP="$(materialize_ssh_targets "$NODES_RAFT_MAP" "$SSH_TARGETS_MAP")"
+          ROLLING_SSH_TARGETS="$(filter_csv "$SSH_TARGETS_MAP" "$ROLLING_ORDER")"
+          {
+            echo "NODES=$NODES_RAFT_MAP"
+            echo "SSH_TARGETS=$SSH_TARGETS_MAP"
+            echo "ROLLING_ORDER=$ROLLING_ORDER"
+            echo "ROLLING_SSH_TARGETS=$ROLLING_SSH_TARGETS"
+          } >> "$GITHUB_OUTPUT"
+          echo "::group::Deploy plan"
+          echo "NODES=$NODES_RAFT_MAP"
+          echo "SSH_TARGETS=$SSH_TARGETS_MAP"
+          echo "ROLLING_ORDER=$ROLLING_ORDER"
+          echo "ROLLING_SSH_TARGETS=$ROLLING_SSH_TARGETS"
+          echo "::endgroup::"
+
+      - name: SSH reachability check
+        env:
+          SSH_TARGETS: ${{ steps.render.outputs.ROLLING_SSH_TARGETS }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a entries <<< "$SSH_TARGETS"
+          failed=0
+          for e in "${entries[@]}"; do
+            target="${e##*=}"
+            if [[ "$target" != *@* ]]; then
+              target="${SSH_USER:-$(id -un)}@$target"
+            fi
+            ok=0
+            for attempt in 1 2 3 4 5 6; do
+              if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$target" true; then
+                echo "  ok   $target"
+                ok=1
+                break
+              fi
+              if [[ "$attempt" -lt 6 ]]; then
+                echo "  wait $target (attempt $attempt failed; retrying)"
+                sleep 10
+              fi
+            done
+            if [[ "$ok" -ne 1 ]]; then
+              echo "::error::$target not reachable by SSH over tailnet"
+              failed=1
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Remote S3 credentials preflight
+        if: ${{ env.ENABLE_S3 == 'true' }}
+        env:
+          SSH_TARGETS: ${{ steps.render.outputs.ROLLING_SSH_TARGETS }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$S3_CREDENTIALS_FILE" ]]; then
+            echo "::error::ENABLE_S3=true requires S3_CREDENTIALS_FILE in the production environment"
+            exit 1
+          fi
+          printf -v remote_path '%q' "$S3_CREDENTIALS_FILE"
+          IFS=',' read -r -a entries <<< "$SSH_TARGETS"
+          failed=0
+          for e in "${entries[@]}"; do
+            target="${e##*=}"
+            if [[ "$target" != *@* ]]; then
+              target="${SSH_USER:-$(id -un)}@$target"
+            fi
+            if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes "$target" "test -r $remote_path"; then
+              echo "  ok   $target:$S3_CREDENTIALS_FILE"
+            else
+              echo "::error::$target cannot read S3_CREDENTIALS_FILE=$S3_CREDENTIALS_FILE"
+              failed=1
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Log rollout configuration
+        env:
+          NODES: ${{ steps.render.outputs.NODES }}
+          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
+          IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
+        run: |
+          set -euo pipefail
+          echo "::group::Rollout runtime configuration"
+          for name in \
+            IMAGE CONTAINER_NAME DATA_DIR SERVER_ENTRYPOINT RAFT_ENGINE \
+            RAFT_PORT REDIS_PORT DYNAMO_PORT S3_PORT ENABLE_S3 S3_REGION \
+            S3_CREDENTIALS_FILE S3_PATH_STYLE_ONLY DEFAULT_EXTRA_ENV EXTRA_ENV \
+            CONTAINER_MEMORY_LIMIT NODES SSH_TARGETS ROLLING_ORDER; do
+            printf '%s=%s\n' "$name" "${!name-}"
+          done
+          echo "::endgroup::"
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          NODES: ${{ steps.render.outputs.NODES }}
+          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
+          IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          DRY_RUN: "true"
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$ENABLE_S3" == "true" && -z "$S3_CREDENTIALS_FILE" ]]; then
+            echo "::error::ENABLE_S3=true requires S3_CREDENTIALS_FILE in the production environment"
+            exit 1
+          fi
+          ./scripts/rolling-update.sh --dry-run
+          echo "ref: $REF"
+          echo "Re-run with dry_run=false to apply."
+
+      - name: Roll cluster
+        if: ${{ !inputs.dry_run }}
+        env:
+          NODES: ${{ steps.render.outputs.NODES }}
+          SSH_TARGETS: ${{ steps.render.outputs.SSH_TARGETS }}
+          ROLLING_ORDER: ${{ steps.render.outputs.ROLLING_ORDER }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          IMAGE: ${{ vars.IMAGE_BASE }}:${{ inputs.image_tag || inputs.ref }}
+          SSH_STRICT_HOST_KEY_CHECKING: "yes"
+        run: |
+          set -euo pipefail
+          if [[ "$ENABLE_S3" == "true" && -z "$S3_CREDENTIALS_FILE" ]]; then
+            echo "::error::ENABLE_S3=true requires S3_CREDENTIALS_FILE in the production environment"
+            exit 1
+          fi
+          ./scripts/rolling-update.sh
