@@ -151,11 +151,12 @@ func (r *RedisServer) zsetRangeByScoreFast(
 		hit, reason, err := r.zsetRangeEmptyFastResult(ctx, key, readTS)
 		return nil, hit, reason, err
 	}
+	scanLimit = zsetFastScanLimitWithTieSentinel(scanLimit, limit)
 	kvs, err := r.zsetScoreScan(ctx, startKey, endKey, scanLimit, reverse, readTS)
 	if err != nil {
 		return nil, false, monitoring.LuaFastPathFallbackOther, err
 	}
-	return r.finalizeZSetFastRange(ctx, key, kvs, offset, limit, scanLimit, scoreFilter, readTS)
+	return r.finalizeZSetFastRange(ctx, key, kvs, reverse, offset, limit, scanLimit, scoreFilter, readTS)
 }
 
 // finalizeZSetFastRange runs the post-scan priority guard, decodes
@@ -165,12 +166,16 @@ func (r *RedisServer) zsetRangeByScoreFast(
 //
 // Takes scanLimit so we can detect a saturated scan: if the scanner
 // returned exactly scanLimit rows AND the caller's request is not
-// satisfied (unbounded limit, or collected fewer entries than limit),
-// there MAY be more entries beyond the scan window. In that case we
-// return hit=false so the slow path can produce the authoritative
-// answer -- the fast path MUST NOT silently truncate.
+// satisfied (unbounded limit, or fewer than offset+limit matching
+// entries), there MAY be more entries beyond the scan window. In
+// that case we return hit=false so the slow path can produce the
+// authoritative answer -- the fast path MUST NOT silently truncate.
+// Bounded ranges with duplicate scores also fall back: the MVCC
+// timestamp suffix can disturb physical ordering among equal-score
+// member keys, so the slow full-load path owns exact LIMIT semantics
+// for those ties.
 func (r *RedisServer) finalizeZSetFastRange(
-	ctx context.Context, key []byte, kvs []*store.KVPair,
+	ctx context.Context, key []byte, kvs []*store.KVPair, reverse bool,
 	offset, limit, scanLimit int, scoreFilter func(float64) bool, readTS uint64,
 ) ([]redisZSetEntry, bool, monitoring.LuaFastPathFallbackReason, error) {
 	// Priority guard runs after a candidate hit (mirrors post-PR #565
@@ -183,13 +188,21 @@ func (r *RedisServer) finalizeZSetFastRange(
 			return nil, false, monitoring.LuaFastPathFallbackWrongType, nil
 		}
 	}
-	entries := decodeZSetScoreRange(key, kvs, offset, limit, scoreFilter)
+	entries := decodeZSetScoreRange(key, kvs, scoreFilter)
 	// Truncation guard: the raw scanner hit its cap AND the caller did
 	// not get a satisfied result. Entries beyond the window may
 	// exist; defer to the slow path for correctness.
-	if zsetFastPathTruncated(len(kvs), scanLimit, len(entries), limit) {
+	if zsetFastPathTruncated(len(kvs), scanLimit, len(entries), offset, limit) {
 		return nil, false, monitoring.LuaFastPathFallbackTruncated, nil
 	}
+	if zsetFastPathNeedsTieFallback(entries, limit) {
+		return nil, false, monitoring.LuaFastPathFallbackTruncated, nil
+	}
+	sortZSetEntries(entries)
+	if reverse {
+		reverseZSetEntries(entries)
+	}
+	entries = applyZRangeLimit(entries, offset, limit)
 	if len(entries) == 0 {
 		hit, reason, err := r.zsetRangeEmptyFastResult(ctx, key, readTS)
 		return nil, hit, reason, err
@@ -208,17 +221,21 @@ func (r *RedisServer) finalizeZSetFastRange(
 // may have dropped entries that the caller's request would otherwise
 // include. Returns true when the scanner returned the full quota
 // (scannedRows == scanLimit) AND the caller's request is still
-// unsatisfied (unbounded limit or collectedEntries < limit). In that
-// case the caller must fall back to the slow full-load path to get
-// the authoritative result.
-func zsetFastPathTruncated(scannedRows, scanLimit, collectedEntries, limit int) bool {
+// unsatisfied (unbounded limit or fewer than offset+limit matching
+// entries). In that case the caller must fall back to the slow
+// full-load path to get the authoritative result.
+func zsetFastPathTruncated(scannedRows, scanLimit, matchingEntries, offset, limit int) bool {
 	if scannedRows < scanLimit {
 		return false
 	}
 	if limit < 0 {
 		return true
 	}
-	return collectedEntries < limit
+	needed := offset + limit
+	if needed < offset || needed > maxWideScanLimit {
+		needed = maxWideScanLimit
+	}
+	return matchingEntries < needed
 }
 
 // zsetFastPathEligible returns false (without error) when a legacy-
@@ -263,6 +280,13 @@ func zsetFastScanLimit(offset, limit int) int {
 	return offset + limit
 }
 
+func zsetFastScanLimitWithTieSentinel(scanLimit, limit int) int {
+	if limit <= 0 || scanLimit >= maxWideScanLimit {
+		return scanLimit
+	}
+	return scanLimit + 1
+}
+
 // zsetScoreScan picks Forward / Reverse ScanAt based on direction.
 func (r *RedisServer) zsetScoreScan(
 	ctx context.Context, startKey, endKey []byte, scanLimit int, reverse bool, readTS uint64,
@@ -275,32 +299,14 @@ func (r *RedisServer) zsetScoreScan(
 	return kvs, cockerrors.WithStack(err)
 }
 
-// zsetDecodeAllocSize returns a tight upper bound on the collected
-// entry count for decodeZSetScoreRange: (kvLen - offset) capped by
-// limit, never negative. Avoiding a make([]...len(kvs)) saves up to
-// maxWideScanLimit entries of wasted slice capacity when the caller
-// asked for a small window at a large offset.
-func zsetDecodeAllocSize(kvLen, offset, limit int) int {
-	allocSize := kvLen - offset
-	if allocSize < 0 {
-		return 0
-	}
-	if limit >= 0 && limit < allocSize {
-		return limit
-	}
-	return allocSize
-}
-
 // decodeZSetScoreRange decodes score-index scan results into
-// redisZSetEntry, applying the post-scan score filter (exclusive
-// bound edges) and the offset / limit pagination. Entries that fail
-// to decode are silently dropped -- they can only appear under data
-// corruption.
+// redisZSetEntry, applying the post-scan score filter for exclusive
+// bound edges. Entries that fail to decode are silently dropped --
+// they can only appear under data corruption.
 func decodeZSetScoreRange(
-	key []byte, kvs []*store.KVPair, offset, limit int, scoreFilter func(float64) bool,
+	key []byte, kvs []*store.KVPair, scoreFilter func(float64) bool,
 ) []redisZSetEntry {
-	entries := make([]redisZSetEntry, 0, zsetDecodeAllocSize(len(kvs), offset, limit))
-	skipped := 0
+	entries := make([]redisZSetEntry, 0, len(kvs))
 	for _, kv := range kvs {
 		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
 		if !ok {
@@ -309,21 +315,27 @@ func decodeZSetScoreRange(
 		if scoreFilter != nil && !scoreFilter(score) {
 			continue
 		}
-		// Check limit saturation BEFORE the offset skip so a small
-		// limit with a large offset exits immediately instead of
-		// burning offset iterations on the skip branch. Correct for
-		// any (offset, limit): once len(entries) >= limit we are done
-		// regardless of remaining skip budget.
-		if limit >= 0 && len(entries) >= limit {
-			break
-		}
-		if skipped < offset {
-			skipped++
-			continue
-		}
 		entries = append(entries, redisZSetEntry{Member: string(member), Score: score})
 	}
 	return entries
+}
+
+func zsetFastPathNeedsTieFallback(entries []redisZSetEntry, limit int) bool {
+	if limit < 0 {
+		return false
+	}
+	seen := make(map[uint64]struct{}, len(entries))
+	for _, entry := range entries {
+		bits := math.Float64bits(entry.Score)
+		if entry.Score == 0 {
+			bits = math.Float64bits(0)
+		}
+		if _, ok := seen[bits]; ok {
+			return true
+		}
+		seen[bits] = struct{}{}
+	}
+	return false
 }
 
 // zsetRangeEmptyFastResult is the empty-result tail: either the
