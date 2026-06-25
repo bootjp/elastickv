@@ -3,6 +3,7 @@ package store
 import (
 	"testing"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -87,4 +88,94 @@ func TestDefaultPebbleOptionsCarriesCache(t *testing.T) {
 	require.Same(t, cache, opts.Cache)
 	require.Equal(t, int64(16)<<20, cache.MaxSize())
 	cache.Unref()
+}
+
+// newPebbleStoreWithFSMApplyWriteOptsForTest constructs a pebbleStore
+// (not the MVCCStore interface) with an explicit *pebble.WriteOptions
+// and sync-mode label for the FSM commit path, bypassing the
+// ELASTICKV_FSM_SYNC_MODE env resolution. Tests use this to exercise
+// both sync and nosync modes deterministically without mutating
+// os.Environ (which would leak into parallel test binaries).
+//
+// The store is created via NewPebbleStore and then the relevant
+// fields are overridden; this keeps the full init path (cache,
+// metadata scans, etc.) identical to production while only swapping
+// the write-options that govern commit-time durability.
+func newPebbleStoreWithFSMApplyWriteOptsForTest(t *testing.T, dir string, opts *pebble.WriteOptions, label string) *pebbleStore {
+	t.Helper()
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	ps, ok := s.(*pebbleStore)
+	require.True(t, ok, "NewPebbleStore returned non-*pebbleStore type")
+	ps.fsmApplyWriteOpts = opts
+	ps.fsmApplySyncModeLabel = label
+	return ps
+}
+
+// TestFSMApplySyncModeEnvOverride covers the ELASTICKV_FSM_SYNC_MODE
+// parsing contract directly against resolveFSMApplyWriteOpts, which is
+// what NewPebbleStore calls. Mirrors the approach taken for
+// ELASTICKV_PEBBLE_CACHE_MB to avoid mutating os.Environ at runtime.
+func TestFSMApplySyncModeEnvOverride(t *testing.T) {
+	t.Run("empty string uses sync default", func(t *testing.T) {
+		opts, label := resolveFSMApplyWriteOpts("")
+		require.Same(t, pebble.Sync, opts)
+		require.Equal(t, fsmSyncModeSync, label)
+	})
+
+	t.Run("explicit sync is accepted", func(t *testing.T) {
+		opts, label := resolveFSMApplyWriteOpts("sync")
+		require.Same(t, pebble.Sync, opts)
+		require.Equal(t, fsmSyncModeSync, label)
+	})
+
+	t.Run("explicit nosync is accepted", func(t *testing.T) {
+		opts, label := resolveFSMApplyWriteOpts("nosync")
+		require.Same(t, pebble.NoSync, opts)
+		require.Equal(t, fsmSyncModeNoSync, label)
+	})
+
+	t.Run("mixed-case nosync is accepted", func(t *testing.T) {
+		opts, label := resolveFSMApplyWriteOpts("NoSync")
+		require.Same(t, pebble.NoSync, opts)
+		require.Equal(t, fsmSyncModeNoSync, label)
+	})
+
+	t.Run("whitespace is trimmed", func(t *testing.T) {
+		opts, label := resolveFSMApplyWriteOpts("  nosync\n")
+		require.Same(t, pebble.NoSync, opts)
+		require.Equal(t, fsmSyncModeNoSync, label)
+	})
+
+	t.Run("unknown value falls back to sync", func(t *testing.T) {
+		// "batch" was considered in the design discussion but never
+		// implemented; the resolver must not crash or silently enable
+		// NoSync if an operator sets an unsupported value.
+		opts, label := resolveFSMApplyWriteOpts("batch")
+		require.Same(t, pebble.Sync, opts)
+		require.Equal(t, fsmSyncModeSync, label)
+	})
+
+	t.Run("garbage falls back to sync", func(t *testing.T) {
+		opts, label := resolveFSMApplyWriteOpts("garbage")
+		require.Same(t, pebble.Sync, opts)
+		require.Equal(t, fsmSyncModeSync, label)
+	})
+}
+
+// TestFSMApplySyncModeLabelAccessor verifies that a constructed
+// pebbleStore exposes its resolved sync-mode label via the per-instance
+// accessor, so monitoring can read the mode off a concrete store
+// instead of a package global.
+func TestFSMApplySyncModeLabelAccessor(t *testing.T) {
+	t.Run("nosync", func(t *testing.T) {
+		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.NoSync, fsmSyncModeNoSync)
+		defer ps.Close()
+		require.Equal(t, fsmSyncModeNoSync, ps.FSMApplySyncModeLabel())
+	})
+	t.Run("sync", func(t *testing.T) {
+		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.Sync, fsmSyncModeSync)
+		defer ps.Close()
+		require.Equal(t, fsmSyncModeSync, ps.FSMApplySyncModeLabel())
+	})
 }

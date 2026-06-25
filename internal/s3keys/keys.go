@@ -190,8 +190,46 @@ func RouteKey(bucket string, generation uint64, object string) []byte {
 }
 
 func ObjectManifestPrefixForBucket(bucket string, generation uint64) []byte {
-	out := make([]byte, 0, len(ObjectManifestPrefix)+len(bucket)+u64Bytes+segmentEscapeOverhead)
-	out = append(out, objectManifestPrefixBytes...)
+	return bucketScopedPrefix(objectManifestPrefixBytes, bucket, generation)
+}
+
+// UploadMetaPrefixForBucket / UploadPartPrefixForBucket /
+// BlobPrefixForBucket / GCUploadPrefixForBucket / RoutePrefixForBucket
+// each isolate to a single bucket+generation tuple. Used by
+// AdminDeleteBucket's DEL_PREFIX safety net (design doc
+// 2026_04_28_proposed_admin_delete_bucket_safety_net.md): the bucket-
+// must-be-empty empty-probe is racy against concurrent PutObject, so
+// the delete commit also DEL_PREFIXes every per-bucket key family to
+// sweep anything that snuck in during the readTS → commitTS window.
+//
+// Each prefix encodes the bucket segment then the generation u64 in
+// the same shape as the per-key constructors that build entries
+// under each family. Re-creating the bucket bumps generation so old
+// orphans under the old generation prefix stay isolated from the
+// new bucket.
+func UploadMetaPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(uploadMetaPrefixBytes, bucket, generation)
+}
+
+func UploadPartPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(uploadPartPrefixBytes, bucket, generation)
+}
+
+func BlobPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(blobPrefixBytes, bucket, generation)
+}
+
+func GCUploadPrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(gcUploadPrefixBytes, bucket, generation)
+}
+
+func RoutePrefixForBucket(bucket string, generation uint64) []byte {
+	return bucketScopedPrefix(routePrefixBytes, bucket, generation)
+}
+
+func bucketScopedPrefix(prefix []byte, bucket string, generation uint64) []byte {
+	out := make([]byte, 0, len(prefix)+len(bucket)+u64Bytes+segmentEscapeOverhead)
+	out = append(out, prefix...)
 	out = append(out, EncodeSegment([]byte(bucket))...)
 	out = appendU64(out, generation)
 	return out
@@ -201,6 +239,88 @@ func ObjectManifestScanStart(bucket string, generation uint64, objectPrefix stri
 	out := ObjectManifestPrefixForBucket(bucket, generation)
 	out = append(out, EncodeSegmentPrefix([]byte(objectPrefix))...)
 	return out
+}
+
+// ParseBlobKey decodes a !s3|blob| key into its components. Both the
+// 6-component form produced by BlobKey and the 7-component form
+// produced by VersionedBlobKey (with partVersion != 0) are supported;
+// partVersion is reported as zero for the un-versioned form.
+//
+// Returns ok=false on any parse failure (truncated key, malformed
+// segment, junk trailer). Used by the offline backup decoder
+// (internal/backup) to route blob chunks to their assembled object,
+// and by future readers that need to walk the blob keyspace without
+// holding a live cluster.
+func ParseBlobKey(key []byte) (bucket string, generation uint64, object string, uploadID string, partNo uint64, chunkNo uint64, partVersion uint64, ok bool) {
+	if !bytes.HasPrefix(key, blobPrefixBytes) {
+		return "", 0, "", "", 0, 0, 0, false
+	}
+	parts, ok := parseBlobKeyHead(key)
+	if !ok {
+		return "", 0, "", "", 0, 0, 0, false
+	}
+	partVersion, ok = parseOptionalPartVersion(key, parts.next)
+	if !ok {
+		return "", 0, "", "", 0, 0, 0, false
+	}
+	return parts.bucket, parts.generation, parts.object, parts.uploadID, parts.partNo, parts.chunkNo, partVersion, true
+}
+
+// parsedBlobHead is the 6-component head of a blob key. The optional
+// partVersion trailer is parsed separately so cyclomatic complexity
+// stays under the package cap.
+type parsedBlobHead struct {
+	bucket     string
+	generation uint64
+	object     string
+	uploadID   string
+	partNo     uint64
+	chunkNo    uint64
+	next       int
+}
+
+func parseBlobKeyHead(key []byte) (parsedBlobHead, bool) {
+	var p parsedBlobHead
+	bucketRaw, next, ok := decodeSegment(key, len(blobPrefixBytes))
+	if !ok {
+		return p, false
+	}
+	if p.generation, next, ok = readU64(key, next); !ok {
+		return p, false
+	}
+	objectRaw, next, ok := decodeSegment(key, next)
+	if !ok {
+		return p, false
+	}
+	uploadIDRaw, next, ok := decodeSegment(key, next)
+	if !ok {
+		return p, false
+	}
+	if p.partNo, next, ok = readU64(key, next); !ok {
+		return p, false
+	}
+	if p.chunkNo, next, ok = readU64(key, next); !ok {
+		return p, false
+	}
+	p.bucket = string(bucketRaw)
+	p.object = string(objectRaw)
+	p.uploadID = string(uploadIDRaw)
+	p.next = next
+	return p, true
+}
+
+func parseOptionalPartVersion(key []byte, offset int) (uint64, bool) {
+	switch {
+	case offset == len(key):
+		return 0, true
+	case len(key)-offset == u64Bytes:
+		v, next, ok := readU64(key, offset)
+		if !ok || next != len(key) {
+			return 0, false
+		}
+		return v, true
+	}
+	return 0, false
 }
 
 func ParseObjectManifestKey(key []byte) (bucket string, generation uint64, object string, ok bool) {

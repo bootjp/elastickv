@@ -21,6 +21,12 @@ type Registry struct {
 	hotPath       *HotPathMetrics
 	pebble        *PebbleMetrics
 	writeConflict *WriteConflictMetrics
+	sqs           *SQSMetrics
+	sqsObserver   *SQSObserver
+	hlc           *HLCMetrics
+	hlcObserver   *HLCObserver
+	coldStart     *ColdStartMetrics
+	coldStartObs  *ColdStartObserver
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -43,7 +49,24 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.hotPath = newHotPathMetrics(registerer)
 	r.pebble = newPebbleMetrics(registerer)
 	r.writeConflict = newWriteConflictMetrics(registerer)
+	r.sqs = newSQSMetrics(registerer)
+	r.sqsObserver = newSQSObserver(r.sqs)
+	r.hlc = newHLCMetrics(registerer)
+	r.hlcObserver = newHLCObserver(r.hlc)
+	r.coldStart = newColdStartMetrics(registerer)
+	r.coldStartObs = newColdStartObserver(r.coldStart)
 	return r
+}
+
+// ColdStartObserver returns the cold-start snapshot-restore observer
+// backed by this registry. The engine receives it through
+// raftengine/etcd.OpenConfig.ColdStartObserver and calls it on each
+// skip-gate outcome (PR #910 design §9).
+func (r *Registry) ColdStartObserver() *ColdStartObserver {
+	if r == nil {
+		return nil
+	}
+	return r.coldStartObs
 }
 
 // Handler returns an HTTP handler that exposes the Prometheus scrape endpoint.
@@ -60,6 +83,20 @@ func (r *Registry) Gatherer() prometheus.Gatherer {
 		return nil
 	}
 	return r.gatherer
+}
+
+// Registerer exposes the label-wrapped registerer for callers that
+// own a metric source whose lifecycle does not fit the
+// newXxxMetrics(registerer) pattern in NewRegistry — currently the
+// Redis adapter's Lua VM pool, which materializes inside
+// NewRedisServer and registers via CounterFunc / GaugeFunc at that
+// point. Returns nil if r is nil so callers can dereference safely
+// in test fixtures.
+func (r *Registry) Registerer() prometheus.Registerer {
+	if r == nil {
+		return nil
+	}
+	return r.registerer
 }
 
 // DynamoDBObserver returns the DynamoDB request observer backed by this registry.
@@ -148,6 +185,39 @@ func (r *Registry) PebbleCollector() *PebbleCollector {
 	return newPebbleCollector(r.pebble)
 }
 
+// SetFSMApplySyncMode forwards the resolved ELASTICKV_FSM_SYNC_MODE
+// label to the PebbleMetrics gauge so operators can observe the active
+// durability posture on this node. Safe to call with a nil registry.
+func (r *Registry) SetFSMApplySyncMode(activeLabel string) {
+	if r == nil || r.pebble == nil {
+		return
+	}
+	r.pebble.SetFSMApplySyncMode(activeLabel)
+}
+
+// SQSPartitionObserver returns the HT-FIFO partition-messages
+// observer backed by this registry. Returns nil when the registry
+// itself is nil so adapter call sites can pass the result through
+// without checking; SQSMetrics.ObservePartitionMessage is also
+// nil-receiver safe.
+func (r *Registry) SQSPartitionObserver() SQSPartitionObserver {
+	if r == nil {
+		return nil
+	}
+	return r.sqs
+}
+
+// SQSObserver returns the queue-depth gauge observer backed by
+// this registry. Same shape as RaftObserver / RedisObserver: callers
+// pull it via the registry, then drive Start(ctx, source, interval)
+// from main.go's startMonitoringCollectors.
+func (r *Registry) SQSObserver() *SQSObserver {
+	if r == nil {
+		return nil
+	}
+	return r.sqsObserver
+}
+
 // WriteConflictCollector returns a collector that polls each MVCC
 // store's per-(kind, key_prefix) OCC conflict counters and mirrors
 // them into the elastickv_store_write_conflict_total Prometheus
@@ -158,4 +228,20 @@ func (r *Registry) WriteConflictCollector() *WriteConflictCollector {
 		return nil
 	}
 	return newWriteConflictCollector(r.writeConflict)
+}
+
+// HLCObserver returns the HLC physical-ceiling + fence-rejection
+// observer backed by this registry. Same shape as SQSObserver: a
+// single observer is constructed inside NewRegistry and returned by
+// reference here, so callers that pull it more than once observe
+// the same lastRejections delta state (returning a fresh observer
+// each call would reset lastRejections and risk double-counting
+// rejections against the cumulative Prometheus counter — claude
+// review on PR #879). Returns nil if r is nil so test fixtures
+// can drop the observer without conditional wiring.
+func (r *Registry) HLCObserver() *HLCObserver {
+	if r == nil || r.hlcObserver == nil {
+		return nil
+	}
+	return r.hlcObserver
 }

@@ -4,10 +4,41 @@ import (
 	"math"
 	"sync/atomic"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
+
+// ErrCeilingExpired is returned by HLC.NextFenced() when the
+// Raft-agreed physical ceiling has expired — i.e. the wall clock has
+// caught up to or passed the ceiling, meaning RunHLCLeaseRenewal has
+// not applied a fresh ceiling within `hlcPhysicalWindowMs` of the
+// current wall time. Callers MUST refuse to commit and propagate this
+// to the client.
+//
+// This implements HLC-4 precondition (iii) from
+// docs/design/2026_05_28_partial_tla_safety_spec.md §5.1: every
+// persistence-grade ts allocation is gated on `wall_now <
+// physicalCeiling`. The TLA+ MCHLC_gap.cfg counterexample at depth 5
+// demonstrates the safety property this enforces.
+//
+// Pre-bootstrap (ceiling == 0) is intentionally NOT fenced: there is
+// no prior leader to protect against and tests / demo clusters need
+// to issue ts before the first RunHLCLeaseRenewal cycle.  Strict
+// bootstrap fencing is a follow-up consideration; the current
+// semantics match the spec wherever the prior-leader hazard is real.
+var ErrCeilingExpired = errors.New("hlc: physical ceiling expired (wall_now >= physicalCeiling); refusing to issue persistence timestamp")
 
 const hlcLogicalBits = 16
 const hlcLogicalMask uint64 = (1 << hlcLogicalBits) - 1
+
+// HLCLogicalBits is the number of low bits in an HLC timestamp
+// reserved for the in-memory logical counter (vs the upper bits
+// which encode the Raft-agreed wall-clock millis). Exported so
+// downstream tools — admin dashboard ISO-8601 formatting being the
+// motivating case — can recover the physical half without
+// hard-coding a magic number that silently drifts when the layout
+// changes (Claude Issue 4 on PR #658).
+const HLCLogicalBits = hlcLogicalBits
 
 // HLC implements a hybrid logical clock where the physical part is agreed upon
 // via Raft consensus and the logical counter is managed purely in memory.
@@ -40,6 +71,14 @@ type HLC struct {
 	// Next() uses max(now, physicalCeiling) so that a new leader always starts
 	// issuing timestamps above the previous leader's committed window.
 	physicalCeiling atomic.Int64
+	// nextFencedRejections counts the number of NextFenced() calls that
+	// returned ErrCeilingExpired (HLC-4 (iii) fence fired). Exposed via
+	// NextFencedRejections() so the monitoring layer can export it as a
+	// Prometheus counter without coupling the kv package to a metric type.
+	// A non-zero value here means the leader's lease renewal stopped long
+	// enough for wall_now to catch up to physicalCeiling — operators should
+	// alert on its rate.
+	nextFencedRejections atomic.Uint64
 }
 
 func nonNegativeUint64(v int64) uint64 {
@@ -68,7 +107,16 @@ func NewHLC() *HLC {
 	return &HLC{}
 }
 
-// Next returns the next hybrid logical timestamp.
+// Next returns the next hybrid logical timestamp, ignoring the
+// HLC-4 physical-ceiling fence.  Kept for non-persistence callers
+// (diagnostics, identifiers, retry IDs, tests, demo wiring) and for
+// adapter sites whose fail-closed migration is not yet completed.
+//
+// NEW persistence-grade allocations (everything that ends up as a
+// startTS / commitTS, an MVCC write timestamp, or a lease/expiry
+// boundary) MUST go through NextFenced instead — Next bypasses the
+// HLC-4 (iii) ceiling fence and can therefore issue a timestamp inside
+// a stale leader window after lease renewal stops.
 //
 // Physical part (upper 48 bits): derived from the wall clock, but never less
 // than the Raft-agreed physicalCeiling so that a newly elected leader cannot
@@ -78,6 +126,29 @@ func NewHLC() *HLC {
 // without any Raft round-trip. It resets to 0 whenever the physical millisecond
 // advances and overflows by bumping the physical millisecond by one.
 func (h *HLC) Next() uint64 {
+	ts, _ := h.nextLocked(false)
+	return ts
+}
+
+// NextFenced returns the next hybrid logical timestamp with the
+// HLC-4 (iii) physical-ceiling fence enforced.  ALL persistence-grade
+// allocations (startTS, commitTS, MVCC write ts, lease/expiry bounds)
+// MUST go through this entry point so that an expired-ceiling
+// allocation fails closed instead of silently issuing a ts that could
+// collide with a subsequent leader's window after renewal catches up.
+//
+// Fence semantics:
+//   - ceiling == 0 (pre-bootstrap, no prior leader): no fence, identical to Next.
+//   - ceiling > 0 AND wall_now >= ceiling: returns (0, ErrCeilingExpired).
+//   - ceiling > 0 AND wall_now < ceiling: floor wall at ceiling, then proceed.
+//
+// The TLA+ proof for this lives in tla/hlc/MCHLC_gap.cfg (HLC-4
+// counterexample, depth 5) — see docs/design/2026_05_28_partial_tla_safety_spec.md §5.1.
+func (h *HLC) NextFenced() (uint64, error) {
+	return h.nextLocked(true)
+}
+
+func (h *HLC) nextLocked(fence bool) (uint64, error) {
 	for {
 		prev := h.last.Load()
 		wallPart := prev >> hlcLogicalBits
@@ -86,10 +157,24 @@ func (h *HLC) Next() uint64 {
 		prevLogical := clampUint64ToUint16(logicalPart)
 
 		nowMs := time.Now().UnixMilli()
-		// Physical part: floor at the Raft-agreed ceiling so a new leader always
-		// starts above the previous leader's issued window.
-		if ceiling := h.physicalCeiling.Load(); ceiling > 0 && nowMs < ceiling {
-			nowMs = ceiling
+		ceiling := h.physicalCeiling.Load()
+		if ceiling > 0 {
+			if fence && nowMs >= ceiling {
+				// HLC-4 precondition (iii): ceiling has expired.  Fail
+				// closed rather than issue a timestamp that could collide
+				// with a subsequent leader's window after renewal catches
+				// up.  Increment the counter so the monitoring layer can
+				// alert on the rate (see NextFencedRejections).
+				h.nextFencedRejections.Add(1)
+				return 0, errors.WithStack(ErrCeilingExpired)
+			}
+			if nowMs < ceiling {
+				// Physical part: floor at the Raft-agreed ceiling so a
+				// new leader always starts above the previous leader's
+				// issued window.
+				nowMs = ceiling
+			}
+			// Non-fenced path with nowMs >= ceiling: keep nowMs as-is.
 		}
 
 		newWall := nowMs
@@ -106,7 +191,7 @@ func (h *HLC) Next() uint64 {
 
 		next := (nonNegativeUint64(newWall) << hlcLogicalBits) | uint64(newLogical)
 		if h.last.CompareAndSwap(prev, next) {
-			return next
+			return next, nil
 		}
 	}
 }
@@ -150,4 +235,20 @@ func (h *HLC) SetPhysicalCeiling(ms int64) {
 // milliseconds. Returns 0 if no ceiling has been established yet.
 func (h *HLC) PhysicalCeiling() int64 {
 	return h.physicalCeiling.Load()
+}
+
+// NextFencedRejections returns the cumulative count of NextFenced() calls
+// that returned ErrCeilingExpired since process start.  The monitoring
+// layer reads this on a fixed interval and exports it as a Prometheus
+// counter so operators can alert on the rate.
+//
+// A non-zero value here means the HLC-4 (i) bounded-skew assumption
+// (`MaxClockSkewMs < HlcPhysicalWindowMs` — see
+// docs/design/2026_05_28_partial_tla_safety_spec.md §5.1) has at some
+// point been violated by enough margin that wall_now caught up to
+// physicalCeiling and the fence fired — typically because the leader's
+// lease renewal stopped (network partition, GC pause, …) for longer than
+// `hlcPhysicalWindowMs`.
+func (h *HLC) NextFencedRejections() uint64 {
+	return h.nextFencedRejections.Load()
 }

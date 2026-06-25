@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,11 +26,34 @@ import (
 )
 
 const (
-	testEngineTickInterval  = 10 * time.Millisecond
-	testEngineHeartbeatTick = 1
-	testEngineElectionTick  = 10
+	testEngineTickInterval = 10 * time.Millisecond
+	// testEngineHeartbeatTick / testEngineElectionTick preserve etcd/raft's
+	// recommended 10x ratio (ElectionTick = 10 × HeartbeatTick). Previous
+	// values (1 / 10 → 100 ms election timeout) were too tight for `-race`
+	// on CI: CheckQuorum only holds ~100 ms of heartbeat-response history,
+	// so any scheduler pause on a loaded runner drops the leader's view of
+	// quorum, and it steps down with "quorum is not active", bouncing
+	// writes to "etcd raft engine is not leader" / "leader not found" in
+	// the middle of tests like Test_consistency_satisfy_write_after_read_sequence.
+	// 5 / 50 gives a 500 ms election timeout (500-1000 ms randomised) and
+	// a 50 ms heartbeat, absorbing goroutine-scheduler jitter while still
+	// keeping tests fast. Combined with leaseSafetyMargin = 300 ms, this
+	// also yields a non-zero 200 ms LeaseDuration so the lease-read fast
+	// path gets exercised instead of always falling through to ReadIndex.
+	testEngineHeartbeatTick = 5
+	testEngineElectionTick  = 50
 	testEngineMaxSizePerMsg = 1 << 20
 	testEngineMaxInflight   = 256
+
+	// leaderChurnRetryTimeout bounds how long retryNotLeader keeps
+	// retrying a write that fails with a transient leader-unavailable
+	// error. Used by tests that issue writes inside long mid-test
+	// loops where leadership can briefly step down under CI load.
+	// Startup churn (createNode → first write) is closed at the
+	// readiness layer by waitForWriteableLeader (PR #898), not here.
+	leaderChurnRetryTimeout = 5 * time.Second
+	// leaderChurnRetryInterval is the poll interval between retries.
+	leaderChurnRetryInterval = 50 * time.Millisecond
 )
 
 func newTestFactory() raftengine.Factory {
@@ -44,28 +68,35 @@ func newTestFactory() raftengine.Factory {
 
 func shutdown(nodes []Node) {
 	for _, n := range nodes {
-		if n.opsCancel != nil {
-			n.opsCancel()
+		shutdownNode(n)
+	}
+}
+
+func shutdownNode(n Node) {
+	if n.opsCancel != nil {
+		n.opsCancel()
+	}
+	n.grpcServer.Stop()
+	if n.grpcService != nil {
+		if err := n.grpcService.Close(); err != nil {
+			log.Printf("grpc service close: %v", err)
 		}
-		n.grpcServer.Stop()
-		if n.grpcService != nil {
-			if err := n.grpcService.Close(); err != nil {
-				log.Printf("grpc service close: %v", err)
-			}
+	}
+	n.redisServer.Stop()
+	if n.dynamoServer != nil {
+		n.dynamoServer.Stop()
+	}
+	if n.sqsServer != nil {
+		n.sqsServer.Stop()
+	}
+	if n.engine != nil {
+		if err := n.engine.Close(); err != nil {
+			log.Printf("engine close: %v", err)
 		}
-		n.redisServer.Stop()
-		if n.dynamoServer != nil {
-			n.dynamoServer.Stop()
-		}
-		if n.engine != nil {
-			if err := n.engine.Close(); err != nil {
-				log.Printf("engine close: %v", err)
-			}
-		}
-		if n.closeFactory != nil {
-			if err := n.closeFactory(); err != nil {
-				log.Printf("factory close: %v", err)
-			}
+	}
+	if n.closeFactory != nil {
+		if err := n.closeFactory(); err != nil {
+			log.Printf("factory close: %v", err)
 		}
 	}
 }
@@ -75,10 +106,12 @@ type portsAdress struct {
 	raft          int
 	redis         int
 	dynamo        int
+	sqs           int
 	grpcAddress   string
 	raftAddress   string
 	redisAddress  string
 	dynamoAddress string
+	sqsAddress    string
 }
 
 const (
@@ -87,6 +120,7 @@ const (
 	raftPort   = 50000
 	redisPort  = 63790
 	dynamoPort = 28000
+	sqsPort    = 29000
 )
 
 var mu sync.Mutex
@@ -94,12 +128,14 @@ var portGrpc atomic.Int32
 var portRaft atomic.Int32
 var portRedis atomic.Int32
 var portDynamo atomic.Int32
+var portSQS atomic.Int32
 
 func init() {
 	portGrpc.Store(raftPort)
 	portRaft.Store(grpcPort)
 	portRedis.Store(redisPort)
 	portDynamo.Store(dynamoPort)
+	portSQS.Store(sqsPort)
 }
 
 func portAssigner() portsAdress {
@@ -109,15 +145,18 @@ func portAssigner() portsAdress {
 	rp := portRaft.Add(1)
 	rd := portRedis.Add(1)
 	dn := portDynamo.Add(1)
+	sq := portSQS.Add(1)
 	return portsAdress{
 		grpc:          int(gp),
 		raft:          int(rp),
 		redis:         int(rd),
 		dynamo:        int(dn),
+		sqs:           int(sq),
 		grpcAddress:   net.JoinHostPort("localhost", strconv.Itoa(int(gp))),
 		raftAddress:   net.JoinHostPort("localhost", strconv.Itoa(int(rp))),
 		redisAddress:  net.JoinHostPort("localhost", strconv.Itoa(int(rd))),
 		dynamoAddress: net.JoinHostPort("localhost", strconv.Itoa(int(dn))),
+		sqsAddress:    net.JoinHostPort("localhost", strconv.Itoa(int(sq))),
 	}
 }
 
@@ -126,25 +165,29 @@ type Node struct {
 	raftAddress   string
 	redisAddress  string
 	dynamoAddress string
+	sqsAddress    string
 	grpcServer    *grpc.Server
 	grpcService   *GRPCServer
 	redisServer   *RedisServer
 	dynamoServer  *DynamoDBServer
+	sqsServer     *SQSServer
 	opsCancel     context.CancelFunc
 	engine        raftengine.Engine
 	closeFactory  func() error
 }
 
-func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, engine raftengine.Engine, closeFactory func() error, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer, opsCancel context.CancelFunc) Node {
+func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress, sqsAddress string, engine raftengine.Engine, closeFactory func() error, grpcs *grpc.Server, grpcService *GRPCServer, rd *RedisServer, ds *DynamoDBServer, sq *SQSServer, opsCancel context.CancelFunc) Node {
 	return Node{
 		grpcAddress:   grpcAddress,
 		raftAddress:   raftAddress,
 		redisAddress:  redisAddress,
 		dynamoAddress: dynamoAddress,
+		sqsAddress:    sqsAddress,
 		grpcServer:    grpcs,
 		grpcService:   grpcService,
 		redisServer:   rd,
 		dynamoServer:  ds,
+		sqsServer:     sq,
 		opsCancel:     opsCancel,
 		engine:        engine,
 		closeFactory:  closeFactory,
@@ -154,8 +197,15 @@ func newNode(grpcAddress, raftAddress, redisAddress, dynamoAddress string, engin
 //nolint:unparam
 func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	const (
-		waitTimeout  = 5 * time.Second
-		waitInterval = 100 * time.Millisecond
+		// listenerWaitTimeout bounds the per-socket Dial loop; a few seconds
+		// is plenty since the listeners are already Listen()ing by the time
+		// we poll.
+		listenerWaitTimeout = 5 * time.Second
+		waitInterval        = 100 * time.Millisecond
+		// raftReadyTimeout is the overall budget for leader election +
+		// 300ms stability window. 10s gives room for re-elections on
+		// slow CI runners under -race.
+		raftReadyTimeout = 10 * time.Second
 	)
 
 	t.Helper()
@@ -165,8 +215,8 @@ func createNode(t *testing.T, n int) ([]Node, []string, []string) {
 	ports := assignPorts(n)
 	nodes, grpcAdders, redisAdders, peers := setupNodes(t, ctx, n, ports)
 
-	waitForNodeListeners(t, ctx, nodes, waitTimeout, waitInterval)
-	waitForRaftReadiness(t, nodes, peers, waitTimeout, waitInterval)
+	waitForNodeListeners(t, ctx, nodes, listenerWaitTimeout, waitInterval)
+	waitForRaftReadiness(t, nodes, peers, raftReadyTimeout, waitInterval)
 
 	return nodes, grpcAdders, redisAdders
 }
@@ -175,6 +225,7 @@ type listeners struct {
 	grpc   net.Listener
 	redis  net.Listener
 	dynamo net.Listener
+	sqs    net.Listener
 }
 
 func bindListeners(ctx context.Context, lc *net.ListenConfig, port portsAdress) (portsAdress, listeners, bool, error) {
@@ -205,10 +256,22 @@ func bindListeners(ctx context.Context, lc *net.ListenConfig, port portsAdress) 
 		return port, listeners{}, false, errors.WithStack(err)
 	}
 
+	sqsSock, err := lc.Listen(ctx, "tcp", port.sqsAddress)
+	if err != nil {
+		_ = grpcSock.Close()
+		_ = redisSock.Close()
+		_ = dynamoSock.Close()
+		if errors.Is(err, unix.EADDRINUSE) {
+			return port, listeners{}, true, nil
+		}
+		return port, listeners{}, false, errors.WithStack(err)
+	}
+
 	return port, listeners{
 		grpc:   grpcSock,
 		redis:  redisSock,
 		dynamo: dynamoSock,
+		sqs:    sqsSock,
 	}, false, nil
 }
 
@@ -242,27 +305,202 @@ func waitForRaftReadiness(t *testing.T, nodes []Node, peers []raftengine.Server,
 	// Nudge leadership onto node 0 if a different node won.
 	ensureNodeZeroIsLeader(t, nodes, peers, waitTimeout, waitInterval)
 
-	require.Eventually(t, func() bool {
-		var leaderAddr string
-		for _, n := range nodes {
-			leader := n.engine.Leader().Address
-			if leader == "" {
-				return false
-			}
-			if leaderAddr == "" {
-				leaderAddr = leader
-			} else if leader != leaderAddr {
-				return false
-			}
+	// Require the leader to remain stable for a short window before we
+	// declare the cluster ready. etcd/raft can briefly publish a leader
+	// and then step down if the freshly-elected leader fails its first
+	// heartbeat quorum check — callers that issue writes immediately
+	// after this helper returns would race into that window and see
+	// transient "not leader" errors. A stability window catches the
+	// flip and loops until the leader actually holds.
+	waitForStableLeader(t, nodes, peers, waitTimeout)
+
+	// Prove the leader can actually COMMIT by driving one no-op
+	// entry through full Raft quorum before we hand the cluster
+	// to the test body. The 300 ms stability window above only
+	// proves leadership *appears* held; a leader can still step
+	// down on the first real heartbeat-quorum miss after that.
+	// The per-test retry wrappers in this file have been absorbing
+	// that post-readiness churn site-by-site; this commits-one-entry
+	// probe closes the window at the readiness layer instead, so any
+	// subsequent write inherits a leader that has already held
+	// quorum through one apply.
+	//
+	// `peers` and `waitInterval` are passed through so the probe loop
+	// can re-nudge leadership back to nodes[0] when a real re-election
+	// elects a different node mid-probe — without that, the loop
+	// would keep proposing through a follower engine until the budget
+	// expires and spuriously fail the readiness gate.
+	waitForWriteableLeader(t, nodes, peers, waitTimeout, waitInterval)
+}
+
+// raftReadinessProbePayload is the 9-byte Raft entry waitForWriteableLeader
+// proposes. The FSM dispatches on data[0]: 0x02 (raftEncodeHLCLease) selects
+// applyHLCLease, which reads `data[1:]` as a big-endian uint64 physical
+// ceiling. With ceiling=0 the function's `if ceilingMs > 0` guard skips the
+// HLC update and returns nil — a true no-op at the state-machine layer,
+// while the entry still goes through full Raft quorum so a successful
+// Propose proves the leader holds. See kv/fsm.go applyHLCLease + the
+// raftEncodeHLCLease comment.
+var raftReadinessProbePayload = []byte{
+	0x02,                                           // raftEncodeHLCLease
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BE uint64 ceiling = 0 (no-op)
+}
+
+// waitForWriteableLeader commits one no-op Raft entry through nodes[0]'s
+// engine to prove the leader is not just *named* but actually able to
+// drive quorum. Retries on transient leader-unavailable errors up to
+// timeout — a re-election that races the probe is what this helper is
+// designed to ride out.
+//
+// Without this step, waitForRaftReadiness would return after a 300 ms
+// stability window during which leadership only *looks* stable; a
+// leader that steps down on its first real heartbeat-quorum miss can
+// surface as "etcd raft engine is not leader" on the test's first
+// write — the failure mode the per-test retry wrappers in this file
+// have been working around. See the PR description for the full
+// flake-fix history this readiness gate is meant to obsolete.
+func waitForWriteableLeader(t *testing.T, nodes []Node, peers []raftengine.Server, timeout, waitInterval time.Duration) {
+	t.Helper()
+	if len(nodes) == 0 || nodes[0].engine == nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
 		}
-		// Confirm the leader address belongs to the configured peers.
-		for _, p := range peers {
-			if p.Address == leaderAddr {
-				return true
-			}
+		err := proposeReadinessOnce(nodes[0].engine, remaining)
+		if err == nil {
+			return
 		}
+		lastErr = err
+		if !isReadinessProbeRetryable(err) {
+			t.Fatalf("readiness probe failed with non-transient error: %v", err)
+		}
+		// If the per-attempt error was specifically "not leader" (vs
+		// a ctx timeout), a real re-election has elected a different
+		// node since waitForStableLeader returned. Keep aiming the
+		// probe at nodes[0] by re-running ensureNodeZeroIsLeader
+		// before the next attempt; otherwise the loop would spin on
+		// a follower engine until the budget expires and spuriously
+		// fail the readiness gate even though the cluster has
+		// recovered with a different leader. ensureNodeZeroIsLeader
+		// is idempotent in the steady state, so this costs nothing
+		// when leadership has not actually moved.
+		if isTransientNotLeaderErr(err) && len(peers) > 0 {
+			ensureNodeZeroIsLeader(t, nodes, peers, time.Until(deadline), waitInterval)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("readiness probe never committed within %s (last err: %v)", timeout, lastErr)
+		}
+		time.Sleep(leaderChurnRetryInterval)
+	}
+}
+
+// proposeReadinessOnce drives one no-op probe through the engine's
+// Propose, bounded by min(perProposeTimeout, remaining) so the
+// per-attempt ctx cannot block past the outer deadline when the
+// overall budget is nearly exhausted. Extracted from
+// waitForWriteableLeader to keep the outer loop under the cyclop
+// budget; the retry/timeout rationale lives at the call site.
+func proposeReadinessOnce(engine raftengine.Engine, remaining time.Duration) error {
+	const perProposeTimeout = 2 * time.Second
+	currTimeout := perProposeTimeout
+	if remaining < currTimeout {
+		currTimeout = remaining
+	}
+	proposeCtx, cancel := context.WithTimeout(context.Background(), currTimeout)
+	defer cancel()
+	_, err := engine.Propose(proposeCtx, raftReadinessProbePayload)
+	return err
+}
+
+// isReadinessProbeRetryable widens isTransientNotLeaderErr for the
+// readiness-probe loop: a per-propose ctx timeout under heavy CI
+// load returns context.DeadlineExceeded, which the base classifier
+// does NOT treat as transient. Without this widening the probe
+// would t.Fatalf on a slow runner instead of retrying within its
+// outer budget. context.Canceled is treated symmetrically.
+func isReadinessProbeRetryable(err error) bool {
+	return isTransientNotLeaderErr(err) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
+}
+
+// waitForStableLeader polls the cluster until nodes[0] has been the leader
+// (and all other nodes agree on it as the leader address) for a continuous
+// stability window. If leadership flips during the window, the loop restarts.
+//
+// Design notes:
+//   - The etcd/raft engine exposes no "leader gained" event channel;
+//     raftengine.LeaseProvider offers only RegisterLeaderLossCallback
+//     (leader -> non-leader), which is the wrong direction for a readiness
+//     check. So this helper uses pure polling: a tight inner sample loop
+//     checks that every node reports leader == peers[0].Address for 12
+//     consecutive samples (25ms × 12 = 300ms). Any miss restarts the
+//     outer loop.
+//   - The overall deadline is the caller-supplied waitTimeout (10s at the
+//     current createNode call site), which bounds how long we re-try
+//     re-elections.
+func waitForStableLeader(t *testing.T, nodes []Node, peers []raftengine.Server, timeout time.Duration) {
+	t.Helper()
+
+	const (
+		stabilityWindow = 300 * time.Millisecond
+		pollInterval    = 25 * time.Millisecond
+	)
+
+	if len(nodes) == 0 || len(peers) == 0 {
+		return
+	}
+	targetAddr := peers[0].Address
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !leaderLooksReady(nodes, targetAddr) {
+			time.Sleep(pollInterval)
+			continue
+		}
+		if leaderStableFor(nodes, targetAddr, stabilityWindow, pollInterval) {
+			return
+		}
+		// Leader flipped during the window — fall through and retry.
+	}
+	t.Fatalf("leader never stabilised on %s within %s", targetAddr, timeout)
+}
+
+// leaderLooksReady returns true when nodes[0] reports itself as leader and
+// every node's Leader().Address matches the expected target. This is the
+// single-sample precondition used by waitForStableLeader; the stability
+// window then requires this to stay true for N consecutive samples.
+func leaderLooksReady(nodes []Node, targetAddr string) bool {
+	if nodes[0].engine.State() != raftengine.StateLeader {
 		return false
-	}, waitTimeout, waitInterval)
+	}
+	for _, n := range nodes {
+		if n.engine.Leader().Address != targetAddr {
+			return false
+		}
+	}
+	return true
+}
+
+// leaderStableFor samples leaderLooksReady every pollInterval for the full
+// window and returns true iff every sample reports ready. A single negative
+// sample returns false immediately so the outer loop can re-check.
+func leaderStableFor(nodes []Node, targetAddr string, window, pollInterval time.Duration) bool {
+	end := time.Now().Add(window)
+	for {
+		if !leaderLooksReady(nodes, targetAddr) {
+			return false
+		}
+		if !time.Now().Before(end) {
+			return true
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 // ensureNodeZeroIsLeader waits for any node to become leader, then (if
@@ -378,6 +616,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		grpcSock := lis[i].grpc
 		redisSock := lis[i].redis
 		dynamoSock := lis[i].dynamo
+		sqsSock := lis[i].sqs
 
 		result, err := factory.Create(raftengine.FactoryConfig{
 			LocalID:      strconv.Itoa(i),
@@ -425,20 +664,119 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 			assert.NoError(t, ds.Run())
 		}()
 
+		sq := NewSQSServer(sqsSock, routedStore, coordinator)
+		go func() {
+			assert.NoError(t, sq.Run())
+		}()
+
 		nodes = append(nodes, newNode(
 			port.grpcAddress,
 			port.raftAddress,
 			port.redisAddress,
 			port.dynamoAddress,
+			port.sqsAddress,
 			result.Engine,
 			result.Close,
 			s,
 			gs,
 			rd,
 			ds,
+			sq,
 			opsCancel,
 		))
 	}
 
 	return nodes, grpcAdders, redisAdders, peers
+}
+
+// isTransientNotLeaderErr reports whether err is a transient
+// leader-unavailable error that can happen right after createNode returns
+// (freshly-elected leader briefly steps down due to a missed heartbeat
+// quorum) or in the middle of a long-running test when CI load causes the
+// leader to miss quorum momentarily.
+//
+// Both "not leader" (ErrNotLeader, etcd/raft step errors) and
+// "leader not found" (ErrLeaderNotFound, emitted while the cluster is
+// re-electing) are treated as retryable. The match is case-insensitive
+// because Redis protocol error bodies and other layers may capitalise the
+// phrase differently (e.g. "ERR Not Leader").
+func isTransientNotLeaderErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not leader") || strings.Contains(s, "leader not found")
+}
+
+// === TTL-expiry deadline-multiplier helper =============================
+//
+// Redis TTL tests that "set a short TTL, sleep past it, assert the key is
+// gone" race their own wall clock under -race on slow CI runners. The
+// inter-call pause (typically 50–150 ms above the TTL) does not absorb
+// scheduler jitter that can push the post-sleep read past the TTL window
+// itself, so the read sometimes observes a refilled/un-expired view and
+// the test fails with "expected redis.Nil, got <value>". PR #818
+// (TestRedis_ExpiredKey_BecomesInvisible) fixed one instance by switching
+// to require.Eventually with a TTL-derived deadline. eventuallyExpired
+// generalises that pattern for any TTL-expiry condition.
+//
+// Use this helper in any new test of the form:
+//
+//	require.NoError(t, rdb.PExpire(ctx, key, ttl).Err())
+//	eventuallyExpired(t, ttl, func() bool {
+//	    _, err := rdb.<Op>(ctx, key, ...).Result()
+//	    return errors.Is(err, redis.Nil)
+//	}, "key must be gone after TTL")
+//
+// instead of `time.Sleep(ttl + N*time.Millisecond)` followed by a single
+// assertion. The deadline = ttl + 3 s gives generous CI headroom; the
+// 25 ms poll cadence matches waitForStableLeader so flake patterns stay
+// uniform across the file.
+func eventuallyExpired(t *testing.T, ttl time.Duration, condition func() bool, msg string) {
+	t.Helper()
+	const (
+		ttlExpiryHeadroom = 3 * time.Second
+		ttlExpiryPoll     = 25 * time.Millisecond
+	)
+	// Sleep past the TTL before the first poll. require.Eventually
+	// runs the condition once IMMEDIATELY before the first tick, so
+	// without this gate a regression that deletes/hides the key at
+	// PExpire time would satisfy the first poll and the test would
+	// never exercise the actual expired-after-deadline state — see
+	// codex P2 on PR #903. The post-sleep require.Eventually then
+	// has ttlExpiryHeadroom (3 s) of CI-jitter slack to observe the
+	// expired state, with a 25 ms poll cadence that matches
+	// waitForStableLeader's sampler so flake patterns stay uniform.
+	time.Sleep(ttl)
+	require.Eventually(t, condition, ttlExpiryHeadroom, ttlExpiryPoll, msg)
+}
+
+// retryNotLeader calls do() repeatedly while it returns a transient
+// leader-unavailable error, capped at leaderChurnRetryTimeout. It returns
+// the final error (or nil on success) without touching testing.T, making
+// it safe to call from worker goroutines in parallel tests.
+//
+// Use cases: mid-test leader churn under CI load (e.g. grpc_test.go's
+// 9999-iteration consistency loops). The startup window — leader-churn
+// between createNode returning and the first write — is closed at the
+// readiness layer instead (waitForWriteableLeader, PR #898), so first-
+// write callers should NOT wrap in retryNotLeader; direct calls suffice
+// and are clearer.
+func retryNotLeader(ctx context.Context, do func() error) error {
+	deadline := time.Now().Add(leaderChurnRetryTimeout)
+	var lastErr error
+	for {
+		lastErr = do()
+		if lastErr == nil || !isTransientNotLeaderErr(lastErr) {
+			return lastErr
+		}
+		if !time.Now().Before(deadline) {
+			return lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(leaderChurnRetryInterval):
+		}
+	}
 }

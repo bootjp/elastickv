@@ -21,10 +21,26 @@ var (
 
 const peerSpecParts = 2
 
+// Suffrage values match the strings emitted by configurationFromConfState
+// and surfaced by raftengine.Server.Suffrage / pb.RaftAdminMember.suffrage.
+const (
+	SuffrageVoter   = "voter"
+	SuffrageLearner = "learner"
+)
+
 type Peer struct {
 	NodeID  uint64
 	ID      string
 	Address string
+	// Suffrage is a v2-peers-file artifact only. It is NOT consulted by
+	// confStateForPeers (cold bootstrap is voter-only), and it is NOT
+	// consulted by configurationFromConfState (hot path reads
+	// ConfState.Voters / ConfState.Learners directly). Its sole role is
+	// to round-trip the v2 peers file across restarts so the operator
+	// view of the peers file is consistent with the eventual ConfState
+	// view after WAL replay. The empty string and SuffrageVoter are
+	// equivalent. See docs/design/2026_04_26_proposed_raft_learner.md §4.3.
+	Suffrage string
 }
 
 func DeriveNodeID(id string) uint64 {

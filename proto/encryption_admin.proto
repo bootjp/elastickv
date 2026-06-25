@@ -1,0 +1,282 @@
+syntax = "proto3";
+
+option go_package = "github.com/bootjp/elastickv/proto";
+
+// EncryptionAdmin is the operator-facing control plane for the
+// data-at-rest encryption feature described in
+// docs/design/2026_04_29_partial_data_at_rest_encryption.md. The
+// service is split into two groups:
+//
+//   1. Read-only, leaderless probes (GetCapability,
+//      GetSidecarState, ResyncSidecar). Safe to call on any
+//      member including learners; each returns the responding
+//      node's local view. The §5.6 / §7.1 cutover paths fan
+//      GetCapability out across every member of every Raft group
+//      to drive the pre-flight capability check and to collect
+//      the (full_node_id, local_epoch) batch that goes into the
+//      bootstrap-encryption Raft entry. GetSidecarState and
+//      ResyncSidecar share the §5.5 sidecar-recovery role: a
+//      follower whose sidecar fell behind a Raft-log compaction
+//      window calls either RPC against the leader and rewrites
+//      its local keys.json from the response. ResyncSidecar is
+//      addressed at the leader because the recovery flow only
+//      consults the leader's record; GetSidecarState answers from
+//      any node and is the broader observability surface.
+//
+//   2. Mutating RPCs that propose FSM-internal entries through
+//      the default Raft group's leader (BootstrapEncryption,
+//      RotateDEK, RegisterEncryptionWriter). They route to the
+//      leader; followers return FailedPrecondition with the
+//      currently-known leader so the operator's CLI can retry
+//      against the right node.
+//
+// Wire-format notes:
+//   - local_epoch is the §4.1 16-bit nonce field carried as
+//     uint32 (proto3 has no uint16). Every decode site MUST
+//     validate value <= 0xFFFF; values above 0xFFFF return
+//     ErrLocalEpochOutOfRange. The mutating RPCs that accept a
+//     writer-registry batch (BootstrapEncryption) MUST apply the
+//     same check at the server boundary before the batch is
+//     forwarded into the Raft proposal.
+//   - wrapped_dek payloads are sidecar-format bytes (DEK wrapped
+//     under the current KEK) and are leakage-safe: an RPC
+//     response that exposes them is no worse than reading the
+//     on-disk sidecar.
+service EncryptionAdmin {
+  rpc GetCapability (Empty) returns (CapabilityReport) {}
+  rpc GetSidecarState (Empty) returns (SidecarStateReport) {}
+  rpc BootstrapEncryption (BootstrapEncryptionRequest) returns (BootstrapEncryptionResponse) {}
+  rpc RotateDEK (RotateDEKRequest) returns (RotateDEKResponse) {}
+  rpc RegisterEncryptionWriter (RegisterEncryptionWriterRequest) returns (RegisterEncryptionWriterResponse) {}
+  rpc ResyncSidecar (ResyncSidecarRequest) returns (ResyncSidecarResponse) {}
+  rpc EnableStorageEnvelope (EnableStorageEnvelopeRequest) returns (EnableStorageEnvelopeResponse) {}
+  rpc EnableRaftEnvelope (EnableRaftEnvelopeRequest) returns (EnableRaftEnvelopeResponse) {}
+}
+
+message Empty {}
+
+// CapabilityReport mirrors §6.1 admin.go's CapabilityReport. Served
+// on every node regardless of leadership state. A node that has
+// never run with --encryption-enabled returns encryption_capable=false
+// with local_epoch=0 and full_node_id=0, and the cutover command
+// refuses with ErrCapabilityCheckFailed so the empty epoch never
+// reaches the writer registry.
+message CapabilityReport {
+  bool   encryption_capable = 1;
+  string build_sha          = 2;
+  bool   sidecar_present    = 3;
+  uint64 full_node_id       = 4;
+  uint32 local_epoch        = 5; // MUST be <= 0xFFFF on the wire.
+}
+
+// SidecarStateReport is the §5.5 compaction-fallback RPC. Served on
+// every node but the cutover-recovery flow only consults the
+// leader's response. wrapped_deks_by_id covers every unretired DEK.
+message SidecarStateReport {
+  map<uint32, bytes>  wrapped_deks_by_id           = 1;
+  uint32              active_storage_id            = 2;
+  uint32              active_raft_id               = 3;
+  bool                storage_envelope_active      = 4;
+  uint64              raft_envelope_cutover_index  = 5;
+  uint64              latest_applied_index         = 6;
+  map<uint32, uint32> writer_registry_for_caller   = 7; // values MUST be <= 0xFFFF.
+}
+
+// WriterRegistryEntry is the per-member input the leader collects
+// during the §5.6 step 1a batch. The two uint32 fields cover the
+// 64-bit full_node_id and the 16-bit local_epoch (carried as
+// uint32; <= 0xFFFF validated at the server boundary).
+message WriterRegistryEntry {
+  uint64 full_node_id = 1;
+  uint32 local_epoch  = 2; // MUST be <= 0xFFFF on the wire.
+}
+
+// BootstrapEncryptionRequest carries the freshly-generated wrapped
+// DEKs and the writer-registry batch the leader gathered from
+// every member's GetCapability response. The server validates each
+// local_epoch is in range before composing the §11.3 0x04
+// OpBootstrap body.
+message BootstrapEncryptionRequest {
+  bytes                        wrapped_storage_dek = 1;
+  bytes                        wrapped_raft_dek    = 2;
+  uint32                       storage_dek_id      = 3;
+  uint32                       raft_dek_id         = 4;
+  repeated WriterRegistryEntry writer_batch        = 5;
+}
+
+message BootstrapEncryptionResponse {
+  uint64 applied_index = 1;
+}
+
+// RotateDEKRequest proposes a §5.2 rotation as a §11.3 0x05
+// OpRotation entry. purpose distinguishes the two key purposes;
+// the storage rotation appends a new storage DEK and shifts
+// active_storage_id, and the raft rotation does the same for raft.
+message RotateDEKRequest {
+  enum Purpose {
+    PURPOSE_UNSPECIFIED = 0;
+    PURPOSE_STORAGE     = 1;
+    PURPOSE_RAFT        = 2;
+  }
+  Purpose purpose         = 1;
+  bytes   wrapped_new_dek = 2;
+  uint32  new_dek_id      = 3;
+  uint64  proposer_node_id = 4; // proposer registration payload, §5.2
+  uint32  proposer_local_epoch = 5; // MUST be <= 0xFFFF on the wire.
+}
+
+message RotateDEKResponse {
+  uint64 applied_index = 1;
+}
+
+// RegisterEncryptionWriterRequest proposes a §11.3 0x03
+// OpRegistration entry for the calling node. Used by nodes that
+// joined the cluster after bootstrap (§5.6 step 4).
+message RegisterEncryptionWriterRequest {
+  uint32                       dek_id  = 1;
+  repeated WriterRegistryEntry writers = 2;
+}
+
+message RegisterEncryptionWriterResponse {
+  uint64 applied_index = 1;
+}
+
+// ResyncSidecarRequest is the §5.5 follower-repair RPC. The caller
+// asks the leader to ship its current wrapped DEK set so the
+// follower can rewrite its sidecar. Read-only on the leader (no
+// Raft proposal is involved).
+message ResyncSidecarRequest {
+  uint64 caller_full_node_id = 1;
+}
+
+message ResyncSidecarResponse {
+  map<uint32, bytes> wrapped_deks_by_id          = 1;
+  uint32             active_storage_id           = 2;
+  uint32             active_raft_id              = 3;
+  uint64             leader_latest_applied_index = 4;
+
+  // writer_registry_for_caller carries the leader's recorded
+  // (dek_id, last_seen_local_epoch) for the calling node so the
+  // follower can re-derive its §4.1 local_epoch monotonically.
+  // Values MUST be <= 0xFFFF and the decode site MUST enforce
+  // that bound. Empty until Stage 7 wires the registry; the
+  // §5.5 recovery flow tolerates an empty map because a node
+  // recovering before any DEK exists has nothing to re-derive.
+  map<uint32, uint32> writer_registry_for_caller = 5;
+}
+
+// EnableStorageEnvelopeRequest proposes the §7.1 Phase 1 cutover
+// that flips the cluster from cleartext storage writes to §4.1
+// envelope writes. Defined in the 6D design doc §3.1; the server
+// composes a RotationPayload with SubTag =
+// RotateSubEnableStorageEnvelope (0x04) and routes it through the
+// default Raft group's leader as a §11.3 0x05 OpRotation entry.
+//
+// proposer_node_id MUST be non-zero (the §6.1 "not-capable"
+// sentinel is rejected at the server boundary, matching the
+// existing RotateDEK / BootstrapEncryption posture).
+//
+// proposer_local_epoch carries the §4.1 16-bit nonce field as
+// uint32 (proto3 has no uint16); values above 0xFFFF are
+// rejected at the server boundary before any Raft proposal is
+// composed. ApplyRotation re-validates at apply time
+// (defense-in-depth).
+message EnableStorageEnvelopeRequest {
+  uint64 proposer_node_id     = 1;
+  uint32 proposer_local_epoch = 2; // MUST be <= 0xFFFF on the wire.
+}
+
+// EnableStorageEnvelopeResponse reports the outcome of a cutover
+// proposal. The §6.4 idempotency contract is encoded as an OK
+// status with `was_already_active = true` (NOT AlreadyExists,
+// since unary gRPC drops the response body on non-OK status; the
+// applied_index must be reachable on the success path).
+//
+// On a fresh cutover (was_already_active == false), applied_index
+// is the Raft index of the entry the leader just proposed and
+// waited to apply. On a retried call, applied_index is the
+// recorded sidecar.StorageEnvelopeCutoverIndex from the ORIGINAL
+// cutover (§6.4) — stable across arbitrary subsequent
+// encryption-relevant Raft activity.
+//
+// capability_summary records which (full_node_id) members were
+// probed during the pre-flight gate and what they reported.
+// Empty on idempotent retries (was_already_active=true); the
+// membership view of the original cutover is not retained.
+//
+// cutover_index_unknown is the §6.4 defensive fallback: it only
+// fires if a sidecar reports StorageEnvelopeActive=true with
+// StorageEnvelopeCutoverIndex=0 (operationally impossible under
+// normal apply, but hedged against future schema rollback). On
+// healthy clusters this stays false. The field is only
+// meaningful when was_already_active=true.
+message EnableStorageEnvelopeResponse {
+  uint64 applied_index = 1;
+  repeated CapabilityVerdict capability_summary = 2;
+  bool   cutover_index_unknown = 3;
+  bool   was_already_active    = 4;
+}
+
+// EnableRaftEnvelopeRequest proposes the Stage 6E Phase 2 cutover
+// from cleartext Raft proposals to §4.2-envelope Raft proposals.
+// Defined in the 6E design doc §3.1; the server composes a
+// RotationPayload with SubTag = RotateSubEnableRaftEnvelope (0x05)
+// and routes it through the default Raft group's leader as a
+// §11.3 0x05 OpRotation entry. Structural mirror of
+// EnableStorageEnvelopeRequest; the difference is the target
+// Purpose (PurposeRaft) and the source DEK slot
+// (sidecar.Active.Raft).
+//
+// proposer_node_id MUST be non-zero (the §6.1 "not-capable"
+// sentinel is rejected at the server boundary, matching the
+// existing RotateDEK / BootstrapEncryption / EnableStorageEnvelope
+// posture).
+//
+// proposer_local_epoch carries the §4.1 16-bit nonce field as
+// uint32 (proto3 has no uint16); values above 0xFFFF are
+// rejected at the server boundary before any Raft proposal is
+// composed. ApplyRotation re-validates at apply time
+// (defense-in-depth).
+message EnableRaftEnvelopeRequest {
+  uint64 proposer_node_id     = 1;
+  uint32 proposer_local_epoch = 2; // MUST be <= 0xFFFF on the wire.
+}
+
+// EnableRaftEnvelopeResponse reports the outcome of a raft-envelope
+// cutover proposal. Structural mirror of
+// EnableStorageEnvelopeResponse with one rename to match the
+// raft variant's sole "Phase-2 active" sentinel:
+//
+//   - was_already_active reflects sidecar.RaftEnvelopeCutoverIndex
+//     != 0 on the precheck (the raft variant has no separate bool
+//     flag — non-zero cutover index IS the active sentinel).
+//
+// On a fresh cutover (was_already_active == false), applied_index
+// is the Raft index of the entry the leader just proposed and
+// waited to apply. On a retried call, applied_index is the
+// recorded sidecar.RaftEnvelopeCutoverIndex from the ORIGINAL
+// cutover — stable across arbitrary subsequent encryption-relevant
+// Raft activity.
+//
+// capability_summary records which (full_node_id) members were
+// probed during the pre-flight gate and what they reported.
+// Empty on idempotent retries; the membership view of the
+// original cutover is not retained.
+message EnableRaftEnvelopeResponse {
+  uint64 applied_index = 1;
+  repeated CapabilityVerdict capability_summary = 2;
+  bool   was_already_active = 3;
+}
+
+// CapabilityVerdict is one row of the §4 fan-out summary the
+// cutover RPC returns. full_node_id is the route member the leader
+// probed; the remaining fields mirror the corresponding member's
+// CapabilityReport. A cluster where any verdict has
+// encryption_capable=false MUST NOT reach the propose step; the
+// summary in the response is the post-hoc record for operators.
+message CapabilityVerdict {
+  uint64 full_node_id       = 1;
+  bool   encryption_capable = 2;
+  string build_sha          = 3;
+  bool   sidecar_present    = 4;
+}

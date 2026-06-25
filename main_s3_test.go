@@ -13,14 +13,16 @@ import (
 
 func TestStartS3ServerRejectsVirtualHostedStyleConfig(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
-	err := startS3Server(ctx, &net.ListenConfig{}, eg, "localhost:9000", nil, nil, nil, "us-east-1", "", false, nil)
+	srv, err := startS3Server(ctx, &net.ListenConfig{}, eg, "localhost:9000", nil, nil, nil, "us-east-1", "", false, nil)
 	require.ErrorContains(t, err, "virtual-hosted style S3 requests are not implemented")
+	require.Nil(t, srv)
 }
 
 func TestStartS3ServerAllowsEmptyAddress(t *testing.T) {
 	eg, ctx := errgroup.WithContext(context.Background())
-	err := startS3Server(ctx, &net.ListenConfig{}, eg, "", nil, nil, nil, "us-east-1", "", false, nil)
+	srv, err := startS3Server(ctx, &net.ListenConfig{}, eg, "", nil, nil, nil, "us-east-1", "", false, nil)
 	require.NoError(t, err)
+	require.Nil(t, srv)
 }
 
 func TestLoadS3StaticCredentials(t *testing.T) {

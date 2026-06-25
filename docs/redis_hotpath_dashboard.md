@@ -1,9 +1,11 @@
 # Redis Hot Path Dashboard (PR #560 verification)
 
-`monitoring/grafana/dashboards/elastickv-redis-hotpath.json` is the
+The "Hot Path (legacy PR #560)" collapsed row at the bottom of
+`monitoring/grafana/dashboards/elastickv-redis-summary.json` is the
 operator view for the Redis GET hot path. It was added to confirm that
 PR #560 (`a45ca291` "perf(redis): fast-path GET to avoid ~17-seek type
-probe") landed cleanly in production.
+probe") landed cleanly in production. Expand the row to see the
+panels described below.
 
 ## How to confirm #560 worked
 

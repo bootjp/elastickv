@@ -696,7 +696,7 @@ func (c *followerS3Coordinator) IsLeader() bool {
 	return false
 }
 
-func (c *followerS3Coordinator) VerifyLeader() error {
+func (c *followerS3Coordinator) VerifyLeader(context.Context) error {
 	return kv.ErrLeaderNotFound
 }
 
@@ -729,7 +729,7 @@ func (c *routeAwareS3Coordinator) IsLeaderForKey(key []byte) bool {
 	return c.localForKey(key)
 }
 
-func (c *routeAwareS3Coordinator) VerifyLeaderForKey(key []byte) error {
+func (c *routeAwareS3Coordinator) VerifyLeaderForKey(_ context.Context, key []byte) error {
 	if c.IsLeaderForKey(key) {
 		return nil
 	}
@@ -874,7 +874,7 @@ func newSignedS3Request(
 		signingTime,
 	)
 	require.NoError(t, err)
-	expectedAuth, err := buildS3AuthorizationHeader(req, testS3AccessKey, testS3SecretKey, testS3Region, signingTime, payloadHash)
+	expectedAuth, err := buildSigV4AuthorizationHeader(req, testS3AccessKey, testS3SecretKey, "s3", testS3Region, signingTime, payloadHash)
 	require.NoError(t, err)
 	require.Equal(t, strings.TrimSpace(req.Header.Get("Authorization")), expectedAuth)
 	return req

@@ -32,6 +32,7 @@ Optional environment:
   SERVER_ENTRYPOINT
   RAFT_ENGINE
   RAFT_PORT
+  RAFT_BOOTSTRAP_MEMBERS
   REDIS_PORT
   DYNAMO_PORT
   RAFT_TO_REDIS_MAP
@@ -44,8 +45,34 @@ Optional environment:
     exist and be readable on every remote node; it will be bind-mounted into
     the container at the same path.
   S3_PATH_STYLE_ONLY
+
+  SQS adapter (opt-in; ENABLE_SQS=true turns the listener on)
+  ENABLE_SQS
+    Master switch (default false). When true, the script forwards
+    --sqsAddress, --sqsRegion, and --raftSqsMap (plus optional
+    --sqsCredentialsFile / --sqsFifoPartitionMap) to docker run.
+    Required for the admin /admin/api/v1/sqs/* endpoints to mount —
+    main.go gates registration on r.sqsServer != nil, which only
+    happens when --sqsAddress is non-empty.
+  SQS_PORT
+    SQS HTTP listener port on each node (default 9324, the conventional
+    SQS-compatible-server port). Mirrors S3_PORT.
+  SQS_REGION
+    SigV4 region the adapter signs against (default us-east-1).
+  SQS_CREDENTIALS_FILE
+    Optional path to a JSON credentials file on each target host
+    (same shape as S3_CREDENTIALS_FILE). Empty value runs the adapter
+    as an open endpoint — clients may sign with any credentials.
+  RAFT_TO_SQS_MAP
+    Optional override; auto-derived from NODES + RAFT_PORT + SQS_PORT
+    when ENABLE_SQS=true and the variable is empty.
+  SQS_FIFO_PARTITION_MAP
+    Optional HT-FIFO partition routing map (queue.fifo:N=group_0,...).
+    Empty value disables the capability gate's coverage check;
+    partitioned queues route to the default Raft group.
   HEALTH_TIMEOUT_SECONDS
   LEADERSHIP_TRANSFER_TIMEOUT_SECONDS
+  LEADERSHIP_TRANSFER_MAX_LOG_LAG
   LEADER_DISCOVERY_TIMEOUT_SECONDS
   ROLLING_DELAY_SECONDS
   SSH_CONNECT_TIMEOUT_SECONDS
@@ -54,6 +81,8 @@ Optional environment:
   RAFTADMIN_REMOTE_BIN
   RAFTADMIN_RPC_TIMEOUT_SECONDS
   RAFTADMIN_ALLOW_INSECURE
+  LEADERSHIP_TRANSFER_RETRY_ATTEMPTS
+  LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS
 
   EXTRA_ENV
     Whitespace-separated list of additional container environment variables to
@@ -62,11 +91,64 @@ Optional environment:
     Each pair must be KEY=VALUE with a non-empty KEY; pairs themselves must not
     contain whitespace.
 
+    DEFAULT_EXTRA_ENV defaults to "GOMEMLIMIT=1800MiB" (Go runtime soft memory
+    ceiling; GC works harder before approaching the hard --memory limit so the
+    kernel OOM killer is not triggered). Merged with EXTRA_ENV before forwarding;
+    if a user-supplied EXTRA_ENV entry sets the same KEY, the user value wins.
+    Set DEFAULT_EXTRA_ENV="" to disable the default.
+
+  CONTAINER_MEMORY_LIMIT
+    docker run --memory value (default: 2500m). Hard container-scoped memory
+    ceiling; any OOM kill is contained to the elastickv container rather than
+    cascading to host processes (e.g. qemu-guest-agent, systemd). Paired with
+    GOMEMLIMIT=1800MiB so Go GC preempts the kill. Set to "" to disable.
+
+  Admin dashboard (opt-in; ADMIN_ENABLED=true turns the listener on)
+  ADMIN_ENABLED
+    Master switch (default false). When true, the listener is configured
+    using the rest of the ADMIN_* variables and the script bind-mounts the
+    referenced files (signing key, optional previous key, TLS pair) into
+    the container read-only. Required when enabled:
+    ADMIN_SESSION_SIGNING_KEY_FILE plus at least one of ADMIN_FULL_ACCESS_KEYS
+    / ADMIN_READ_ONLY_ACCESS_KEYS.
+  ADMIN_ADDRESS
+    host:port for the admin listener (default: daemon-internal 127.0.0.1:8080).
+    Set to a reachable bind only with ADMIN_TLS_CERT_FILE/_KEY_FILE.
+  ADMIN_FULL_ACCESS_KEYS, ADMIN_READ_ONLY_ACCESS_KEYS
+    Comma-separated allow-lists. Same key must NOT appear in both. Sessions
+    re-validate against this list on every state-changing request, so
+    revoking a key takes effect on the next admin write rather than
+    waiting for the JWT to expire.
+  ADMIN_SESSION_SIGNING_KEY_FILE
+    Required. Path on the remote host to the base64-encoded HS256 key
+    (exactly 64 raw bytes — 88 base64 chars with standard padding, or 86
+    with RawURLEncoding). Bind-mounted read-only at the same path inside
+    the container. Must be identical on every node.
+  ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE
+    Optional. Path to the previous HS256 key, used only for verification
+    during a rotation window. New tokens always sign with the primary key.
+  ADMIN_TLS_CERT_FILE, ADMIN_TLS_KEY_FILE
+    Optional PEM cert + key for the admin listener. Both must be set
+    together. Required when ADMIN_ADDRESS is non-loopback unless
+    ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK=true.
+  ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK
+    Default false. When true, allows the admin listener on a non-loopback
+    bind without TLS. Strongly discouraged. See docs/admin.md for the
+    interaction with ADMIN_ALLOW_INSECURE_DEV_COOKIE — without the
+    latter, the dashboard mints Secure cookies the browser will refuse
+    to send over plaintext, breaking sessions end-to-end.
+  ADMIN_ALLOW_INSECURE_DEV_COOKIE
+    Default false. When true, mints session cookies without the Secure
+    attribute (for local plaintext development only).
+
 Notes:
+  - RAFT_BOOTSTRAP_MEMBERS is only forwarded when explicitly set.
   - If RAFT_TO_REDIS_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and REDIS_PORT.
   - If RAFT_TO_S3_MAP is unset, it is derived automatically from NODES,
     RAFT_PORT, and S3_PORT.
+  - If RAFT_TO_SQS_MAP is unset and ENABLE_SQS=true, it is derived
+    automatically from NODES, RAFT_PORT, and SQS_PORT.
   - If RAFTADMIN_BIN is set, it must already be executable on the local control host.
 EOF
 }
@@ -99,20 +181,139 @@ ENABLE_S3="${ENABLE_S3:-true}"
 S3_REGION="${S3_REGION:-us-east-1}"
 S3_CREDENTIALS_FILE="${S3_CREDENTIALS_FILE:-}"
 S3_PATH_STYLE_ONLY="${S3_PATH_STYLE_ONLY:-true}"
-HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-60}"
+# SQS adapter knobs (mirror the S3 shape). ENABLE_SQS is the master
+# switch; when false, no SQS-related flags are passed to the
+# container and admin SQS endpoints stay 404 because sqsServer is
+# nil. Set ENABLE_SQS=true and the script forwards
+# --sqsAddress / --sqsRegion / --raftSqsMap (and optionally
+# --sqsCredentialsFile and --sqsFifoPartitionMap) to docker run.
+ENABLE_SQS="${ENABLE_SQS:-false}"
+SQS_PORT="${SQS_PORT:-9324}"
+SQS_REGION="${SQS_REGION:-us-east-1}"
+SQS_CREDENTIALS_FILE="${SQS_CREDENTIALS_FILE:-}"
+# HT-FIFO partition routing map. Empty means "single-shard / no
+# partitioned-FIFO routing"; the capability gate's coverage check
+# is bypassed (resolver==nil) and partitioned queues land on the
+# default group. Format documented at main.go::buildSQSFifoPartitionMap.
+SQS_FIFO_PARTITION_MAP="${SQS_FIFO_PARTITION_MAP:-}"
+# Wall-clock budget wait_for_grpc allows for the restarted container to
+# bind its gRPC port. Sized to cover the worst-case cold-start path:
+#   1. pebble.Open (fsm.db, ~seconds)
+#   2. loadWalState -> restoreSnapshotState -> pebbleStore.Restore
+#      (restorePebbleNativeAtomic + swapInTempDB), which rewrites the
+#      entire FSM into a sibling temp directory before renaming it into
+#      place. For multi-GB FSMs on production hardware this is the
+#      dominant cost — we observed ~46 s on a 4-shard SSD-backed node
+#      with a ~5 M-key FSM; multi-GB datasets scale linearly with disk
+#      throughput.
+#   3. WAL replay of the entries between the persisted snapshot index
+#      and the latest WAL entry (typically thousands, sub-second).
+#   4. Raft follower-ization + gRPC.Serve bind.
+# A 60 s ceiling guaranteed a timeout-induced restart loop on any node
+# whose FSM exceeded ~1 GiB. 300 s comfortably absorbs (1)+(2)+(3)+(4)
+# for the multi-GiB working sets we operate against today and still
+# fails fast on genuine crash-loop bugs (which never finish (1) or (2)).
+# Operators with smaller FSMs can shrink HEALTH_TIMEOUT_SECONDS via env.
+# Root-cause fix (skip restoreSnapshotState when the on-disk FSM is
+# already at >= snapshot.Metadata.Index): see PR #910 and
+# docs/design/2026_06_02_idempotent_snapshot_restore.md. Once that
+# lands and steady-state skip rates are observed in production, this
+# default can be tightened back down.
+HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"
 LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS:-30}"
+# Maximum leader-commit-to-candidate-last-log lag tolerated for a targeted
+# leadership transfer. A target that needs a snapshot, or is farther behind
+# than this, is likely to make etcd/raft abort the transfer before catch-up
+# completes. The default matches the engine's default snapshot cadence.
+LEADERSHIP_TRANSFER_MAX_LOG_LAG="${LEADERSHIP_TRANSFER_MAX_LOG_LAG:-10000}"
 LEADER_DISCOVERY_TIMEOUT_SECONDS="${LEADER_DISCOVERY_TIMEOUT_SECONDS:-30}"
 ROLLING_DELAY_SECONDS="${ROLLING_DELAY_SECONDS:-2}"
 SSH_CONNECT_TIMEOUT_SECONDS="${SSH_CONNECT_TIMEOUT_SECONDS:-10}"
 SSH_STRICT_HOST_KEY_CHECKING="${SSH_STRICT_HOST_KEY_CHECKING:-accept-new}"
 RAFTADMIN_REMOTE_BIN="${RAFTADMIN_REMOTE_BIN:-/tmp/elastickv-raftadmin}"
-RAFTADMIN_RPC_TIMEOUT_SECONDS="${RAFTADMIN_RPC_TIMEOUT_SECONDS:-5}"
+# Default raised from 5 s to 15 s after the 2026-05-21 reproduction
+# (https://github.com/bootjp/elastickv/actions/runs/26198185540) where
+# the previous node's restart left raft in a transient pre-stable state
+# for the next leadership-transfer RPC. 5 s gave the RPC no headroom
+# over a brief raft-internal abort and the script bailed out. 15 s is
+# still small enough that a truly stuck call surfaces quickly.
+RAFTADMIN_RPC_TIMEOUT_SECONDS="${RAFTADMIN_RPC_TIMEOUT_SECONDS:-15}"
 RAFTADMIN_ALLOW_INSECURE="${RAFTADMIN_ALLOW_INSECURE:-true}"
+# LEADERSHIP_TRANSFER_RETRY_ATTEMPTS bounds how many times we re-issue
+# a leadership_transfer_to_server RPC when raft returns
+# FailedPrecondition (e.g. "etcd raft leadership transfer aborted")
+# because the candidate's log has not yet caught up or an in-flight
+# conf change is blocking the transfer. The first attempt counts
+# toward the budget; ATTEMPTS=1 means "no retry". Default 3 covers
+# the ~10 s catch-up window that follows a peer's rolling restart.
+LEADERSHIP_TRANSFER_RETRY_ATTEMPTS="${LEADERSHIP_TRANSFER_RETRY_ATTEMPTS:-3}"
+LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS="${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS:-5}"
 NODES="${NODES:-}"
 SSH_TARGETS="${SSH_TARGETS:-}"
 ROLLING_ORDER="${ROLLING_ORDER:-}"
+RAFT_BOOTSTRAP_MEMBERS="${RAFT_BOOTSTRAP_MEMBERS:-}"
 RAFT_TO_REDIS_MAP="${RAFT_TO_REDIS_MAP:-}"
 RAFT_TO_S3_MAP="${RAFT_TO_S3_MAP:-}"
+RAFT_TO_SQS_MAP="${RAFT_TO_SQS_MAP:-}"
+
+# Admin dashboard knobs. ADMIN_ENABLED is the master switch; the
+# remaining variables only take effect when ADMIN_ENABLED=true.
+# Required when enabled: ADMIN_SESSION_SIGNING_KEY_FILE plus at
+# least one of ADMIN_FULL_ACCESS_KEYS / ADMIN_READ_ONLY_ACCESS_KEYS.
+# See docs/admin.md and docs/admin_deployment.md for the contract.
+ADMIN_ENABLED="${ADMIN_ENABLED:-false}"
+ADMIN_ADDRESS="${ADMIN_ADDRESS:-}"
+ADMIN_FULL_ACCESS_KEYS="${ADMIN_FULL_ACCESS_KEYS:-}"
+ADMIN_READ_ONLY_ACCESS_KEYS="${ADMIN_READ_ONLY_ACCESS_KEYS:-}"
+ADMIN_SESSION_SIGNING_KEY_FILE="${ADMIN_SESSION_SIGNING_KEY_FILE:-}"
+ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE="${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE:-}"
+ADMIN_TLS_CERT_FILE="${ADMIN_TLS_CERT_FILE:-}"
+ADMIN_TLS_KEY_FILE="${ADMIN_TLS_KEY_FILE:-}"
+ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
+ADMIN_ALLOW_INSECURE_DEV_COOKIE="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
+
+# KeyViz heatmap sampler. KEYVIZ_ENABLED is the master switch; the
+# remaining variables only take effect when KEYVIZ_ENABLED=true. The
+# sampler is ungated when admin is disabled (it's read-only in-memory
+# state); it just produces no callers without --adminEnabled.
+KEYVIZ_ENABLED="${KEYVIZ_ENABLED:-false}"
+KEYVIZ_FANOUT_NODES="${KEYVIZ_FANOUT_NODES:-}"
+
+# KeyViz hot-key Top-K drill-down (Phase 2-A++). Master switch +
+# four tuning knobs. When KEYVIZ_HOT_KEYS_ENABLED != "true" the
+# build_keyviz_flags helper skips every --keyvizHotKeys* flag so
+# existing deploys see no behaviour change. Defaults match the
+# sampler-side constants in keyviz/sampler.go; empty values let
+# the daemon use those same defaults — keep them empty here so
+# bumping the Go-side default in a future release rolls out
+# without a separate env-file update.
+KEYVIZ_HOT_KEYS_ENABLED="${KEYVIZ_HOT_KEYS_ENABLED:-false}"
+KEYVIZ_HOT_KEYS_PER_ROUTE="${KEYVIZ_HOT_KEYS_PER_ROUTE:-}"
+KEYVIZ_HOT_KEYS_SAMPLE_RATE="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
+KEYVIZ_HOT_KEYS_QUEUE_SIZE="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
+KEYVIZ_HOT_KEYS_MAX_KEY_LEN="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
+
+# Validate the three boolean ADMIN_* flags must be the literal "true"
+# or "false" — they are forwarded to the remote shell unquoted (no
+# printf %q) for readability, which is only safe when the value is
+# already metacharacter-free. Reject anything else here so an operator
+# who typed "True", "1", or a stray quote sees a script-level error
+# pointing at the variable name instead of an inscrutable failure
+# inside the SSH heredoc.
+for _bool_var in ADMIN_ENABLED ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK ADMIN_ALLOW_INSECURE_DEV_COOKIE KEYVIZ_ENABLED KEYVIZ_HOT_KEYS_ENABLED ENABLE_S3 ENABLE_SQS; do
+  case "${!_bool_var}" in
+    true|false) ;;
+    *)
+      echo "rolling-update: ${_bool_var} must be 'true' or 'false', got '${!_bool_var}'" >&2
+      exit 1
+      ;;
+  esac
+done
+unset _bool_var
+
+# Container OOM defenses. See usage() for rationale. Empty string disables.
+DEFAULT_EXTRA_ENV="${DEFAULT_EXTRA_ENV-GOMEMLIMIT=1800MiB}"
+CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT-2500m}"
 
 if [[ -z "$NODES" ]]; then
   echo "NODES is required" >&2
@@ -294,6 +495,20 @@ derive_raft_to_s3_map() {
   )
 }
 
+derive_raft_to_sqs_map() {
+  local parts=()
+  local i
+
+  for i in "${!NODE_IDS[@]}"; do
+    parts+=("${NODE_HOSTS[$i]}:${RAFT_PORT}=${NODE_HOSTS[$i]}:${SQS_PORT}")
+  done
+
+  (
+    IFS=,
+    printf '%s\n' "${parts[*]}"
+  )
+}
+
 ensure_local_raftadmin() {
   if [[ -n "$RAFTADMIN_LOCAL_BIN" ]]; then
     if [[ ! -x "$RAFTADMIN_LOCAL_BIN" ]]; then
@@ -415,8 +630,16 @@ update_one_node() {
       S3_REGION="$S3_REGION" \
       S3_CREDENTIALS_FILE="$S3_CREDENTIALS_FILE_Q" \
       S3_PATH_STYLE_ONLY="$S3_PATH_STYLE_ONLY" \
+      ENABLE_SQS="$ENABLE_SQS" \
+      SQS_PORT="$SQS_PORT_Q" \
+      SQS_REGION="$SQS_REGION_Q" \
+      SQS_CREDENTIALS_FILE="$SQS_CREDENTIALS_FILE_Q" \
+      SQS_FIFO_PARTITION_MAP="$SQS_FIFO_PARTITION_MAP_Q" \
       HEALTH_TIMEOUT_SECONDS="$HEALTH_TIMEOUT_SECONDS" \
       LEADERSHIP_TRANSFER_TIMEOUT_SECONDS="$LEADERSHIP_TRANSFER_TIMEOUT_SECONDS" \
+      LEADERSHIP_TRANSFER_MAX_LOG_LAG="$LEADERSHIP_TRANSFER_MAX_LOG_LAG" \
+      LEADERSHIP_TRANSFER_RETRY_ATTEMPTS="$LEADERSHIP_TRANSFER_RETRY_ATTEMPTS" \
+      LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS="$LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS" \
       LEADER_DISCOVERY_TIMEOUT_SECONDS="$LEADER_DISCOVERY_TIMEOUT_SECONDS" \
       RAFTADMIN_RPC_TIMEOUT_SECONDS="$RAFTADMIN_RPC_TIMEOUT_SECONDS" \
       RAFTADMIN_ALLOW_INSECURE="$RAFTADMIN_ALLOW_INSECURE" \
@@ -424,9 +647,29 @@ update_one_node() {
       NODE_HOST="$node_host" \
       ALL_NODE_IDS_CSV="$all_node_ids_csv" \
       ALL_NODE_HOSTS_CSV="$all_node_hosts_csv" \
+      RAFT_BOOTSTRAP_MEMBERS="$RAFT_BOOTSTRAP_MEMBERS_Q" \
       RAFT_TO_REDIS_MAP="$RAFT_TO_REDIS_MAP_Q" \
       RAFT_TO_S3_MAP="$RAFT_TO_S3_MAP_Q" \
+      RAFT_TO_SQS_MAP="$RAFT_TO_SQS_MAP_Q" \
       EXTRA_ENV="$EXTRA_ENV_Q" \
+      CONTAINER_MEMORY_LIMIT="$CONTAINER_MEMORY_LIMIT_Q" \
+      ADMIN_ENABLED="$ADMIN_ENABLED" \
+      ADMIN_ADDRESS="$ADMIN_ADDRESS_Q" \
+      ADMIN_FULL_ACCESS_KEYS="$ADMIN_FULL_ACCESS_KEYS_Q" \
+      ADMIN_READ_ONLY_ACCESS_KEYS="$ADMIN_READ_ONLY_ACCESS_KEYS_Q" \
+      ADMIN_SESSION_SIGNING_KEY_FILE="$ADMIN_SESSION_SIGNING_KEY_FILE_Q" \
+      ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE="$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE_Q" \
+      ADMIN_TLS_CERT_FILE="$ADMIN_TLS_CERT_FILE_Q" \
+      ADMIN_TLS_KEY_FILE="$ADMIN_TLS_KEY_FILE_Q" \
+      ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK="$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" \
+      ADMIN_ALLOW_INSECURE_DEV_COOKIE="$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
+      KEYVIZ_ENABLED="$KEYVIZ_ENABLED" \
+      KEYVIZ_FANOUT_NODES="$KEYVIZ_FANOUT_NODES_Q" \
+      KEYVIZ_HOT_KEYS_ENABLED="$KEYVIZ_HOT_KEYS_ENABLED" \
+      KEYVIZ_HOT_KEYS_PER_ROUTE="$KEYVIZ_HOT_KEYS_PER_ROUTE_Q" \
+      KEYVIZ_HOT_KEYS_SAMPLE_RATE="$KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q" \
+      KEYVIZ_HOT_KEYS_QUEUE_SIZE="$KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q" \
+      KEYVIZ_HOT_KEYS_MAX_KEY_LEN="$KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q" \
       bash -s <<'REMOTE'
 set -euo pipefail
 
@@ -471,6 +714,15 @@ extract_proto_enum() {
     tail -n1
 }
 
+extract_proto_uint() {
+  local field="$1"
+  local payload="$2"
+
+  printf '%s' "$payload" |
+    sed -nE "s/.*${field}:[[:space:]]+\"?([0-9]+)\"?.*/\1/p" |
+    tail -n1
+}
+
 raftadmin_text() {
   local addr="$1"
   shift
@@ -481,6 +733,11 @@ raftadmin_text() {
   fi
 
   "$RAFTADMIN_BIN_PATH" "$addr" "$@" 2>&1
+}
+
+raft_status() {
+  local addr="$1"
+  raftadmin_text "$addr" status
 }
 
 raft_leader_addr() {
@@ -564,19 +821,76 @@ cluster_reachability_summary() {
 }
 
 choose_transfer_candidate() {
-  local i
+  local leader_addr leader_status leader_commit leader_last_log leader_last_snapshot target_index
+  local i addr output state last_log applied lag rows
 
+  leader_addr="${NODE_HOST}:${RAFT_PORT}"
+  leader_status="$(raft_status "$leader_addr")" || {
+    echo "unable to read leader raft status from $leader_addr: $leader_status" >&2
+    return 1
+  }
+  leader_commit="$(extract_proto_uint "commit_index" "$leader_status")"
+  leader_last_log="$(extract_proto_uint "last_log_index" "$leader_status")"
+  leader_last_snapshot="$(extract_proto_uint "last_snapshot_index" "$leader_status")"
+  if [[ -z "$leader_commit" || -z "$leader_last_log" || -z "$leader_last_snapshot" ]]; then
+    echo "unable to parse leader raft indexes from $leader_addr status: $leader_status" >&2
+    return 1
+  fi
+  target_index="$leader_commit"
+  if (( leader_last_log > target_index )); then
+    target_index="$leader_last_log"
+  fi
+
+  rows=()
   for i in "${!ALL_NODE_IDS[@]}"; do
     if [[ "${ALL_NODE_IDS[$i]}" == "$NODE_ID" ]]; then
       continue
     fi
-    if peer_grpc_healthy "${ALL_NODE_HOSTS[$i]}"; then
-      printf '%s %s\n' "${ALL_NODE_IDS[$i]}" "${ALL_NODE_HOSTS[$i]}"
-      return 0
+    addr="${ALL_NODE_HOSTS[$i]}:${RAFT_PORT}"
+    if ! peer_grpc_healthy "${ALL_NODE_HOSTS[$i]}"; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: gRPC unreachable" >&2
+      continue
     fi
+    if ! output="$(raft_status "$addr")"; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: status RPC failed: $output" >&2
+      continue
+    fi
+    state="$(extract_proto_enum "state" "$output")"
+    if [[ "$state" != "FOLLOWER" ]]; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: state=${state:-unknown}" >&2
+      continue
+    fi
+    last_log="$(extract_proto_uint "last_log_index" "$output")"
+    applied="$(extract_proto_uint "applied_index" "$output")"
+    if [[ -z "$last_log" || -z "$applied" ]]; then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: unable to parse indexes from status: $output" >&2
+      continue
+    fi
+    if (( last_log < leader_last_snapshot )); then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: last_log_index=${last_log} is behind leader snapshot index ${leader_last_snapshot}" >&2
+      continue
+    fi
+    if (( target_index > last_log )); then
+      lag=$(( target_index - last_log ))
+    else
+      lag=0
+    fi
+    if (( lag > LEADERSHIP_TRANSFER_MAX_LOG_LAG )); then
+      echo "skip transfer target ${ALL_NODE_IDS[$i]}@${addr}: log lag ${lag} exceeds LEADERSHIP_TRANSFER_MAX_LOG_LAG=${LEADERSHIP_TRANSFER_MAX_LOG_LAG}" >&2
+      continue
+    fi
+    rows+=("${lag} ${i} ${ALL_NODE_IDS[$i]} ${ALL_NODE_HOSTS[$i]} ${last_log} ${applied}")
   done
 
-  return 1
+  if [[ "${#rows[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "${rows[@]}" |
+    sort -n -k1,1 -k2,2 |
+    while read -r lag _ordinal candidate_id candidate_host last_log applied; do
+      printf '%s %s %s %s %s\n' "$candidate_id" "$candidate_host" "$lag" "$last_log" "$applied"
+    done
 }
 
 wait_for_leader_change() {
@@ -622,22 +936,50 @@ ensure_not_leader_before_restart() {
     return 1
   fi
 
-  if ! read -r candidate_id candidate_host < <(choose_transfer_candidate); then
-    echo "node is leader but no healthy peer is available as transfer target" >&2
+  local transfer_succeeded=false
+  local candidate_rows candidate_lag candidate_last_log candidate_applied
+  candidate_rows="$(choose_transfer_candidate || true)"
+  if [[ -z "$candidate_rows" ]]; then
+    echo "node is leader but no caught-up healthy follower is available as transfer target" >&2
+    echo "cluster reachability: $(cluster_reachability_summary)" >&2
     return 1
   fi
-  candidate_addr="${candidate_host}:${RAFT_PORT}"
 
-  echo "node is leader; transferring leadership to ${candidate_id}@${candidate_addr}"
-  rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer_to_server "${candidate_id}" "${candidate_addr}")" || {
-    echo "targeted leadership transfer RPC failed: $rpc_output" >&2
-    echo "falling back to generic leadership transfer"
-    rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer)" || {
-      echo "generic leadership transfer RPC failed: $rpc_output" >&2
-      return 1
-    }
-    candidate_addr=""
-  }
+  # Retry each eligible targeted transfer up to
+  # LEADERSHIP_TRANSFER_RETRY_ATTEMPTS times. A common failure shape
+  # under rolling restarts is etcd raft rejecting the transfer with
+  # "etcd raft leadership transfer aborted" when the candidate's log
+  # has not caught up. We rank candidates by log lag and try every
+  # non-stale follower before refusing the restart. We intentionally
+  # do not fall back to the generic transfer RPC: the engine's generic
+  # target selection is configuration-order based and can reselect the
+  # exact stale peer this filter skipped.
+  while read -r candidate_id candidate_host candidate_lag candidate_last_log candidate_applied; do
+    [[ -n "$candidate_id" ]] || continue
+    candidate_addr="${candidate_host}:${RAFT_PORT}"
+    echo "node is leader; transferring leadership to ${candidate_id}@${candidate_addr} (lag=${candidate_lag}, last_log=${candidate_last_log}, applied=${candidate_applied})"
+    local attempt=1
+    while (( attempt <= LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); do
+      if rpc_output="$(raftadmin_text "${NODE_HOST}:${RAFT_PORT}" leadership_transfer_to_server "${candidate_id}" "${candidate_addr}")"; then
+        transfer_succeeded=true
+        break
+      fi
+      echo "targeted leadership transfer to ${candidate_id}@${candidate_addr} attempt ${attempt}/${LEADERSHIP_TRANSFER_RETRY_ATTEMPTS} failed: $rpc_output" >&2
+      if (( attempt < LEADERSHIP_TRANSFER_RETRY_ATTEMPTS )); then
+        echo "retrying in ${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}s..." >&2
+        sleep "${LEADERSHIP_TRANSFER_RETRY_BACKOFF_SECONDS}"
+      fi
+      attempt=$(( attempt + 1 ))
+    done
+    if [[ "$transfer_succeeded" == "true" ]]; then
+      break
+    fi
+  done <<< "$candidate_rows"
+
+  if [[ "$transfer_succeeded" != "true" ]]; then
+    echo "all caught-up targeted leadership transfer attempts failed; refusing generic transfer because it may pick a stale peer" >&2
+    return 1
+  fi
 
   if ! wait_for_leader_change "${NODE_HOST}:${RAFT_PORT}" "$candidate_addr"; then
     echo "leadership did not move away from ${NODE_HOST}:${RAFT_PORT} within ${LEADERSHIP_TRANSFER_TIMEOUT_SECONDS}s" >&2
@@ -671,6 +1013,33 @@ run_container() {
       --raftS3Map "$RAFT_TO_S3_MAP"
       "${s3_creds_flag[@]}"
     )
+  fi
+
+  # SQS adapter wiring mirrors S3: optional credentials file gets
+  # bind-mounted ro at the same host path; the rest of the SQS knobs
+  # are passed verbatim. ENABLE_SQS=false leaves all arrays empty so
+  # the docker run is byte-identical to a non-SQS deploy.
+  local sqs_creds_volume=()
+  local sqs_creds_flag=()
+  local sqs_flags=()
+  if [[ "${ENABLE_SQS}" == "true" && -n "${SQS_CREDENTIALS_FILE:-}" ]]; then
+    if [[ ! -f "$SQS_CREDENTIALS_FILE" || ! -r "$SQS_CREDENTIALS_FILE" ]]; then
+      echo "SQS_CREDENTIALS_FILE is set to '$SQS_CREDENTIALS_FILE' but the file is missing or not readable; aborting docker run" >&2
+      exit 1
+    fi
+    sqs_creds_volume=(-v "${SQS_CREDENTIALS_FILE}:${SQS_CREDENTIALS_FILE}:ro")
+    sqs_creds_flag=(--sqsCredentialsFile "$SQS_CREDENTIALS_FILE")
+  fi
+  if [[ "${ENABLE_SQS}" == "true" ]]; then
+    sqs_flags=(
+      --sqsAddress "${NODE_HOST}:${SQS_PORT}"
+      --sqsRegion "$SQS_REGION"
+      --raftSqsMap "$RAFT_TO_SQS_MAP"
+      "${sqs_creds_flag[@]}"
+    )
+    if [[ -n "${SQS_FIFO_PARTITION_MAP:-}" ]]; then
+      sqs_flags+=(--sqsFifoPartitionMap "$SQS_FIFO_PARTITION_MAP")
+    fi
   fi
 
   # Pass through additional container environment variables from EXTRA_ENV.
@@ -707,12 +1076,58 @@ run_container() {
     done
   fi
 
+  # Optional hard container-scoped memory limit. Keeps any OOM kill contained
+  # to the elastickv container rather than cascading to host processes
+  # (e.g. qemu-guest-agent, systemd). Pair with GOMEMLIMIT via EXTRA_ENV so
+  # the Go runtime GCs before the kernel kills the container.
+  local memory_flags=()
+  if [[ -n "${CONTAINER_MEMORY_LIMIT:-}" ]]; then
+    memory_flags=(--memory "$CONTAINER_MEMORY_LIMIT")
+  fi
+
+  # Admin dashboard plumbing. The admin listener is opt-in; when
+  # ADMIN_ENABLED=false the build_admin_flags helper produces no
+  # arguments and no extra bind-mounts, so existing deployments keep
+  # behaving identically. When enabled, the helper also validates that
+  # every referenced file exists on the remote host (signing key,
+  # optional previous key, optional TLS pair) before docker run, so a
+  # missing path fails fast on this node instead of silently leaving a
+  # node with auth disabled.
+  local admin_flags=()
+  local admin_volumes=()
+  build_admin_flags admin_flags admin_volumes
+
+  # KeyViz heatmap sampler. Same opt-in shape as admin: a false
+  # KEYVIZ_ENABLED leaves keyviz_flags empty so existing deploys are
+  # unchanged.
+  local keyviz_flags=()
+  build_keyviz_flags keyviz_flags
+
+  local raft_bootstrap_flags=()
+  if [[ -n "${RAFT_BOOTSTRAP_MEMBERS:-}" ]]; then
+    raft_bootstrap_flags=(--raftBootstrapMembers "$RAFT_BOOTSTRAP_MEMBERS")
+  fi
+
+  # config-fingerprint label drives the skip check on the next deploy
+  # (see DEPLOY_CONFIG_FP_LABEL block above). Empty value here means
+  # the deploy script was run on an old layout that didn't compute one
+  # — the next pass will recompute and inject one regardless, so the
+  # missing label only "costs" one extra recreate during the upgrade.
+  local config_fp_label_flags=()
+  if [[ -n "${DEPLOY_CONFIG_FP:-}" && -n "${DEPLOY_CONFIG_FP_LABEL:-}" ]]; then
+    config_fp_label_flags=(--label "${DEPLOY_CONFIG_FP_LABEL}=${DEPLOY_CONFIG_FP}")
+  fi
+
   docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network host \
+    "${memory_flags[@]}" \
+    "${config_fp_label_flags[@]}" \
     -v "$DATA_DIR:$DATA_DIR" \
     "${s3_creds_volume[@]}" \
+    "${sqs_creds_volume[@]}" \
+    "${admin_volumes[@]}" \
     "${extra_env_flags[@]}" \
     "$IMAGE" "$SERVER_ENTRYPOINT" \
     --address "${NODE_HOST}:${RAFT_PORT}" \
@@ -720,9 +1135,168 @@ run_container() {
     --dynamoAddress "${NODE_HOST}:${DYNAMO_PORT}" \
     --raftId "$NODE_ID" \
     --raftEngine "$RAFT_ENGINE" \
+    "${raft_bootstrap_flags[@]}" \
     --raftDataDir "$DATA_DIR" \
     --raftRedisMap "$RAFT_TO_REDIS_MAP" \
-    "${s3_flags[@]}" >/dev/null
+    "${s3_flags[@]}" \
+    "${sqs_flags[@]}" \
+    "${admin_flags[@]}" \
+    "${keyviz_flags[@]}" >/dev/null
+}
+
+# build_keyviz_flags emits the --keyviz* flag list. Mirrors
+# build_admin_flags' nameref pattern so additional knobs (Step,
+# HistoryColumns, etc.) can drop in without touching run_container.
+# When KEYVIZ_ENABLED != "true" the array is left empty and the helper
+# returns silently — existing deploys see no behaviour change.
+build_keyviz_flags() {
+  local -n _flags="$1"
+  local enabled="${KEYVIZ_ENABLED:-false}"
+  if [[ "$enabled" != "true" ]]; then
+    return 0
+  fi
+
+  local fanout_nodes="${KEYVIZ_FANOUT_NODES:-}"
+  _flags+=(--keyvizEnabled)
+  if [[ -n "$fanout_nodes" ]]; then
+    _flags+=(--keyvizFanoutNodes "$fanout_nodes")
+  fi
+
+  # Hot-key Top-K drill-down. Only emit the master flag (and its
+  # tuning knobs) when KEYVIZ_HOT_KEYS_ENABLED=true; the four tuning
+  # knobs are optional and only emitted when the operator set a
+  # non-empty value, so the daemon falls back to the sampler-side
+  # defaults (keyviz/sampler.go) when an env var is left empty.
+  local hot_keys_enabled="${KEYVIZ_HOT_KEYS_ENABLED:-false}"
+  if [[ "$hot_keys_enabled" == "true" ]]; then
+    _flags+=(--keyvizHotKeysEnabled)
+    local hot_keys_per_route="${KEYVIZ_HOT_KEYS_PER_ROUTE:-}"
+    if [[ -n "$hot_keys_per_route" ]]; then
+      _flags+=(--keyvizHotKeysPerRoute "$hot_keys_per_route")
+    fi
+    local hot_keys_sample_rate="${KEYVIZ_HOT_KEYS_SAMPLE_RATE:-}"
+    if [[ -n "$hot_keys_sample_rate" ]]; then
+      _flags+=(--keyvizHotKeysSampleRate "$hot_keys_sample_rate")
+    fi
+    local hot_keys_queue_size="${KEYVIZ_HOT_KEYS_QUEUE_SIZE:-}"
+    if [[ -n "$hot_keys_queue_size" ]]; then
+      _flags+=(--keyvizHotKeysQueueSize "$hot_keys_queue_size")
+    fi
+    local hot_keys_max_key_len="${KEYVIZ_HOT_KEYS_MAX_KEY_LEN:-}"
+    if [[ -n "$hot_keys_max_key_len" ]]; then
+      _flags+=(--keyvizHotKeysMaxKeyLen "$hot_keys_max_key_len")
+    fi
+  fi
+}
+
+# build_admin_flags emits the --admin* flag list and bind-mount list
+# the docker run needs to expose the admin dashboard listener. Both
+# output arrays are populated by-reference (bash 4.3+ namerefs) so
+# run_container can compose them with the rest of the docker
+# arguments without globals leaking between rollout iterations. When
+# ADMIN_ENABLED is anything other than the literal string "true",
+# both arrays are left empty and the function returns silently — the
+# admin listener stays off, matching the daemon's hard default.
+#
+# The validation pass is intentional: a missing signing-key file or
+# missing TLS pair on a remote host is the kind of misconfiguration
+# that would otherwise hard-error the daemon at startup AFTER the
+# previous container was already stopped, leaving the node
+# unhealthy. Failing here aborts before stop_container fires.
+build_admin_flags() {
+  local -n _flags="$1"
+  local -n _volumes="$2"
+
+  # `:-` defaults are defense-in-depth: build_admin_flags runs inside
+  # the remote SSH heredoc with `set -u` active, and every ADMIN_*
+  # variable is forwarded explicitly via the env block in
+  # update_one_node. If a future refactor ever drops one of the
+  # forwarded variables, the operator gets the targeted "ADMIN_*
+  # required" error below instead of an opaque "unbound variable"
+  # crash with no hint at which variable. All nine ADMIN_* values
+  # are read into locals once at the top so the rest of the helper
+  # cannot accidentally re-fetch a global and bypass the safety net
+  # (gemini medium on PR #678 caught the original three-boolean gap).
+  local enabled="${ADMIN_ENABLED:-false}"
+  if [[ "$enabled" != "true" ]]; then
+    return 0
+  fi
+
+  local signing_key="${ADMIN_SESSION_SIGNING_KEY_FILE:-}"
+  local full_keys="${ADMIN_FULL_ACCESS_KEYS:-}"
+  local read_only_keys="${ADMIN_READ_ONLY_ACCESS_KEYS:-}"
+  local previous_key="${ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE:-}"
+  local admin_listen="${ADMIN_ADDRESS:-}"
+  local tls_cert="${ADMIN_TLS_CERT_FILE:-}"
+  local tls_key="${ADMIN_TLS_KEY_FILE:-}"
+  local allow_plaintext="${ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK:-false}"
+  local insecure_cookie="${ADMIN_ALLOW_INSECURE_DEV_COOKIE:-false}"
+
+  if [[ -z "$signing_key" ]]; then
+    echo "ADMIN_ENABLED=true requires ADMIN_SESSION_SIGNING_KEY_FILE; aborting" >&2
+    exit 1
+  fi
+  if [[ -z "$full_keys" && -z "$read_only_keys" ]]; then
+    echo "ADMIN_ENABLED=true requires at least one of ADMIN_FULL_ACCESS_KEYS / ADMIN_READ_ONLY_ACCESS_KEYS; aborting" >&2
+    exit 1
+  fi
+  if [[ ! -f "$signing_key" || ! -r "$signing_key" ]]; then
+    echo "ADMIN_SESSION_SIGNING_KEY_FILE='$signing_key' is missing or unreadable on this host; aborting" >&2
+    exit 1
+  fi
+
+  _flags+=(--adminEnabled)
+  _flags+=(--adminSessionSigningKeyFile "$signing_key")
+  _volumes+=(-v "${signing_key}:${signing_key}:ro")
+
+  if [[ -n "$admin_listen" ]]; then
+    _flags+=(--adminListen "$admin_listen")
+  fi
+  if [[ -n "$full_keys" ]]; then
+    _flags+=(--adminFullAccessKeys "$full_keys")
+  fi
+  if [[ -n "$read_only_keys" ]]; then
+    _flags+=(--adminReadOnlyAccessKeys "$read_only_keys")
+  fi
+
+  if [[ -n "$previous_key" ]]; then
+    if [[ ! -f "$previous_key" || ! -r "$previous_key" ]]; then
+      echo "ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE='$previous_key' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    _flags+=(--adminSessionSigningKeyPreviousFile "$previous_key")
+    _volumes+=(-v "${previous_key}:${previous_key}:ro")
+  fi
+
+  # TLS pair must be set together. The daemon already rejects partial
+  # configs at startup, but failing earlier here gives the operator a
+  # script-level error pointing at the variable name, instead of the
+  # daemon's "exactly one of cert/key" message after the container is
+  # already running.
+  if [[ -n "$tls_cert" || -n "$tls_key" ]]; then
+    if [[ -z "$tls_cert" || -z "$tls_key" ]]; then
+      echo "ADMIN_TLS_CERT_FILE and ADMIN_TLS_KEY_FILE must be set together; aborting" >&2
+      exit 1
+    fi
+    if [[ ! -f "$tls_cert" || ! -r "$tls_cert" ]]; then
+      echo "ADMIN_TLS_CERT_FILE='$tls_cert' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    if [[ ! -f "$tls_key" || ! -r "$tls_key" ]]; then
+      echo "ADMIN_TLS_KEY_FILE='$tls_key' is missing or unreadable; aborting" >&2
+      exit 1
+    fi
+    _flags+=(--adminTLSCertFile "$tls_cert" --adminTLSKeyFile "$tls_key")
+    _volumes+=(-v "${tls_cert}:${tls_cert}:ro")
+    _volumes+=(-v "${tls_key}:${tls_key}:ro")
+  fi
+
+  if [[ "$allow_plaintext" == "true" ]]; then
+    _flags+=(--adminAllowPlaintextNonLoopback)
+  fi
+  if [[ "$insecure_cookie" == "true" ]]; then
+    _flags+=(--adminAllowInsecureDevCookie)
+  fi
 }
 
 require_passwordless_sudo() {
@@ -791,12 +1365,59 @@ new_image_id="$(docker image inspect "$IMAGE" --format "{{.Id}}")"
 running_image_id="$(docker inspect --format "{{.Image}}" "$CONTAINER_NAME" 2>/dev/null || true)"
 running_status="$(docker inspect --format "{{.State.Status}}" "$CONTAINER_NAME" 2>/dev/null || echo missing)"
 
-if [[ "$new_image_id" == "$running_image_id" && "$running_status" == "running" ]]; then
+# Config fingerprint: hash every variable that influences either the
+# docker run argv or the in-container elastickv flags. Pair it with a
+# matching --label on docker run; on the next deploy compare the label
+# against a freshly recomputed hash and recreate when they differ.
+# Without this, deploy.env changes that flip flags (e.g. ENABLE_SQS,
+# ADMIN_*, EXTRA_ENV) without bumping the image hash were silently
+# skipped because the previous skip check only looked at image+status.
+#
+# NUL separator + sha256sum keeps the hash injective (no value can
+# spoof the boundary). All inputs are always-present env vars so an
+# unset deploy knob hashes as the empty string consistently.
+config_fp() {
+  printf '%s\0' \
+    "$IMAGE" \
+    "$SERVER_ENTRYPOINT" \
+    "$DATA_DIR" \
+    "$NODE_HOST" "$NODE_ID" \
+    "$RAFT_ENGINE" \
+    "$RAFT_BOOTSTRAP_MEMBERS" \
+    "$RAFT_PORT" "$REDIS_PORT" "$DYNAMO_PORT" \
+    "$RAFT_TO_REDIS_MAP" \
+    "$ENABLE_S3" "$S3_PORT" "$S3_REGION" "$S3_PATH_STYLE_ONLY" \
+    "$S3_CREDENTIALS_FILE" "$RAFT_TO_S3_MAP" \
+    "$ENABLE_SQS" "$SQS_PORT" "$SQS_REGION" \
+    "$SQS_CREDENTIALS_FILE" "$RAFT_TO_SQS_MAP" "$SQS_FIFO_PARTITION_MAP" \
+    "$EXTRA_ENV" "$CONTAINER_MEMORY_LIMIT" \
+    "$ADMIN_ENABLED" "$ADMIN_ADDRESS" \
+    "$ADMIN_FULL_ACCESS_KEYS" "$ADMIN_READ_ONLY_ACCESS_KEYS" \
+    "$ADMIN_SESSION_SIGNING_KEY_FILE" "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE" \
+    "$ADMIN_TLS_CERT_FILE" "$ADMIN_TLS_KEY_FILE" \
+    "$ADMIN_ALLOW_PLAINTEXT_NON_LOOPBACK" "$ADMIN_ALLOW_INSECURE_DEV_COOKIE" \
+    "$KEYVIZ_ENABLED" "$KEYVIZ_FANOUT_NODES" \
+    "$KEYVIZ_HOT_KEYS_ENABLED" "$KEYVIZ_HOT_KEYS_PER_ROUTE" \
+    "$KEYVIZ_HOT_KEYS_SAMPLE_RATE" "$KEYVIZ_HOT_KEYS_QUEUE_SIZE" \
+    "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN" \
+    | sha256sum | cut -d' ' -f1
+}
+DEPLOY_CONFIG_FP_LABEL="elastickv.deploy.config-fp"
+new_config_fp="$(config_fp)"
+running_config_fp="$(docker inspect --format "{{ index .Config.Labels \"${DEPLOY_CONFIG_FP_LABEL}\" }}" "$CONTAINER_NAME" 2>/dev/null || true)"
+export DEPLOY_CONFIG_FP="$new_config_fp"
+export DEPLOY_CONFIG_FP_LABEL
+
+if [[ "$new_image_id" == "$running_image_id" && "$running_status" == "running" \
+      && "$new_config_fp" == "$running_config_fp" ]]; then
   if grpc_healthy; then
-    echo "image unchanged and gRPC healthy; skip"
+    echo "image and config unchanged and gRPC healthy; skip"
     exit 0
   fi
   echo "container is running but gRPC is not reachable; recreating"
+fi
+if [[ -n "$running_config_fp" && "$new_config_fp" != "$running_config_fp" ]]; then
+  echo "deploy config fingerprint changed (was=${running_config_fp:0:12}, now=${new_config_fp:0:12}); recreating"
 fi
 
 require_passwordless_sudo
@@ -847,6 +1468,10 @@ if [[ "${ENABLE_S3}" == "true" && -z "$RAFT_TO_S3_MAP" ]]; then
   RAFT_TO_S3_MAP="$(derive_raft_to_s3_map)"
 fi
 
+if [[ "${ENABLE_SQS}" == "true" && -z "$RAFT_TO_SQS_MAP" ]]; then
+  RAFT_TO_SQS_MAP="$(derive_raft_to_sqs_map)"
+fi
+
 ensure_local_raftadmin
 ensure_remote_raftadmin_binaries
 
@@ -868,17 +1493,140 @@ ensure_remote_raftadmin_binaries
 # CR handling additionally covers deploy.env files edited on Windows.
 # `${EXTRA_ENV:-}` is required because `set -u` is active and EXTRA_ENV
 # may be unset (the variable is optional in deploy.env).
-EXTRA_ENV_NORMALISED="${EXTRA_ENV:-}"
-EXTRA_ENV_NORMALISED="${EXTRA_ENV_NORMALISED//[$'\t\r\n']/ }"
+# Merge DEFAULT_EXTRA_ENV (operator-safety defaults like GOMEMLIMIT) with any
+# user-supplied EXTRA_ENV. User-supplied KEYs win over defaults for the same
+# KEY; the remote parser forwards pairs via `-e KEY=VALUE` so docker evaluates
+# the last occurrence, which means pre-pending defaults is correct: later user
+# entries override earlier defaults. We still de-duplicate here so the printed
+# command line stays clean.
+EXTRA_ENV_USER_NORMALISED="${EXTRA_ENV:-}"
+EXTRA_ENV_USER_NORMALISED="${EXTRA_ENV_USER_NORMALISED//[$'\t\r\n']/ }"
+EXTRA_ENV_DEFAULT_NORMALISED="${DEFAULT_EXTRA_ENV:-}"
+EXTRA_ENV_DEFAULT_NORMALISED="${EXTRA_ENV_DEFAULT_NORMALISED//[$'\t\r\n']/ }"
+
+merge_extra_env() {
+  local defaults="$1"
+  local user="$2"
+  # Portable across Bash 3.2 (macOS default) which lacks associative
+  # arrays: concatenate user KEYs into a space-padded string and match
+  # with " KEY " to test set membership. The EXTRA_ENV list is typically
+  # a handful of entries, so the linear check is negligible.
+  local -a user_pairs=()
+  local -a default_pairs=()
+  local pair key seen=" " merged=""
+
+  # Guard the here-strings: on Bash 3.2 (macOS default) `read` on an
+  # empty here-string returns non-zero, which trips `set -e`. Skip the
+  # read when the source string is empty — the empty array is the
+  # intended result either way.
+  # IFS is explicitly set per-read so a caller's surrounding IFS
+  # doesn't change how DEFAULT_EXTRA_ENV / EXTRA_ENV are split.
+  if [[ -n "$user" ]]; then
+    IFS=$' \t\n' read -r -a user_pairs <<< "$user"
+  fi
+  for pair in "${user_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    seen+="${key} "
+  done
+
+  if [[ -n "$defaults" ]]; then
+    IFS=$' \t\n' read -r -a default_pairs <<< "$defaults"
+    # Unlike EXTRA_ENV (user-supplied, forgivable typos), DEFAULT_EXTRA_ENV
+    # is baked into deploy.env — a malformed token there means a
+    # safeguard we installed deliberately is silently ignored. Fail
+    # loudly instead of dropping it.
+    # Three failure modes to catch early:
+    #   - no `=` at all (e.g. GOMEMLIMIT)           -> malformed
+    #   - empty key before `=` (e.g. =1800MiB)     -> malformed
+    #     (the `*=*` pattern match alone accepts this)
+    #   - empty pair (covered by the continue above)
+    for pair in "${default_pairs[@]}"; do
+      [[ -n "$pair" ]] || continue
+      if [[ "$pair" != *=* ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (expected KEY=VALUE)" >&2
+        return 1
+      fi
+      if [[ "${pair%%=*}" == "" ]]; then
+        echo "rolling-update: malformed DEFAULT_EXTRA_ENV entry '$pair' (empty key)" >&2
+        return 1
+      fi
+    done
+  fi
+  for pair in "${default_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    [[ "$pair" == *=* ]] || continue
+    key="${pair%%=*}"
+    if [[ "$seen" != *" ${key} "* ]]; then
+      merged+="${merged:+ }$pair"
+    fi
+  done
+  for pair in "${user_pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    merged+="${merged:+ }$pair"
+  done
+  printf '%s' "$merged"
+}
+
+EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_ENV_USER_NORMALISED")"
 EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
+CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
+SQS_CREDENTIALS_FILE_Q="$(printf '%q' "${SQS_CREDENTIALS_FILE:-}")"
+SQS_FIFO_PARTITION_MAP_Q="$(printf '%q' "${SQS_FIFO_PARTITION_MAP:-}")"
+# Scalar SQS knobs are not bool-validated (port can be any uint16,
+# region can be any AWS-style region string), so they go through
+# printf '%q' before crossing the SSH boundary. ENABLE_SQS itself
+# is bool-validated at the top of the script, so it stays unquoted
+# alongside ADMIN_ENABLED / KEYVIZ_ENABLED for readability — same
+# rule the validation comment documents. Closes Gemini security-
+# high finding on PR #741.
+SQS_PORT_Q="$(printf '%q' "$SQS_PORT")"
+SQS_REGION_Q="$(printf '%q' "$SQS_REGION")"
 IMAGE_Q="$(printf '%q' "$IMAGE")"
 DATA_DIR_Q="$(printf '%q' "$DATA_DIR")"
 SERVER_ENTRYPOINT_Q="$(printf '%q' "$SERVER_ENTRYPOINT")"
 RAFTADMIN_REMOTE_BIN_Q="$(printf '%q' "$RAFTADMIN_REMOTE_BIN")"
 CONTAINER_NAME_Q="$(printf '%q' "$CONTAINER_NAME")"
+RAFT_BOOTSTRAP_MEMBERS_Q="$(printf '%q' "$RAFT_BOOTSTRAP_MEMBERS")"
 RAFT_TO_REDIS_MAP_Q="$(printf '%q' "$RAFT_TO_REDIS_MAP")"
 RAFT_TO_S3_MAP_Q="$(printf '%q' "$RAFT_TO_S3_MAP")"
+RAFT_TO_SQS_MAP_Q="$(printf '%q' "$RAFT_TO_SQS_MAP")"
+
+# ADMIN_* values may contain commas (allow-lists), spaces (paths with
+# spaces, though discouraged), or other shell metacharacters. The
+# remote bash -s reparses the whole `env KEY=value … bash` line through
+# the login shell once, so every value the operator might set has to
+# survive that pass intact. printf %q is the same hardening every
+# other forwarded path-like variable above gets.
+# The boolean flags (ADMIN_ENABLED, ADMIN_ALLOW_*, KEYVIZ_ENABLED)
+# are validated at the top of the local script to be the literal
+# "true" or "false", so they need no extra escaping — kept unquoted
+# at the env site for readability.
+ADMIN_ADDRESS_Q="$(printf '%q' "$ADMIN_ADDRESS")"
+ADMIN_FULL_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_FULL_ACCESS_KEYS")"
+ADMIN_READ_ONLY_ACCESS_KEYS_Q="$(printf '%q' "$ADMIN_READ_ONLY_ACCESS_KEYS")"
+ADMIN_SESSION_SIGNING_KEY_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_FILE")"
+ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE_Q="$(printf '%q' "$ADMIN_SESSION_SIGNING_KEY_PREVIOUS_FILE")"
+ADMIN_TLS_CERT_FILE_Q="$(printf '%q' "$ADMIN_TLS_CERT_FILE")"
+ADMIN_TLS_KEY_FILE_Q="$(printf '%q' "$ADMIN_TLS_KEY_FILE")"
+
+# KEYVIZ_FANOUT_NODES is a comma-separated host:port list; commas
+# survive an unquoted env pass but pre-quoting keeps the pattern
+# uniform with the ADMIN_* set above.
+KEYVIZ_FANOUT_NODES_Q="$(printf '%q' "$KEYVIZ_FANOUT_NODES")"
+
+# Hot-key tuning knobs are integers (or empty for sampler default);
+# integers carry no shell metacharacters, but pre-quoting matches the
+# SQS_PORT_Q precedent: anything that is not bool-validated at the top
+# of the script goes through printf '%q' before crossing the SSH
+# boundary. KEYVIZ_HOT_KEYS_ENABLED itself is bool-validated, so it
+# stays unquoted alongside the other booleans.
+KEYVIZ_HOT_KEYS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_PER_ROUTE")"
+KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_SAMPLE_RATE")"
+KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_QUEUE_SIZE")"
+KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN")"
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do

@@ -2,9 +2,12 @@ package etcd
 
 import (
 	"bytes"
+	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
@@ -24,6 +27,14 @@ type diskState struct {
 	Storage   *etcdraft.MemoryStorage
 	Persist   etcdstorage.Storage
 	LocalSnap raftpb.Snapshot
+	// EffectiveApplied is the FSM's durable applied index when the
+	// cold-start skip gate fires (i.e., max(snap.Metadata.Index,
+	// have)). Engine.Open uses this to seed e.applied and the atomic
+	// mirror so the apply loop does not re-deliver WAL entries
+	// already represented in the FSM. Zero when no override applies
+	// (legacy path / execute-restore path); the engine then falls
+	// back to maxAppliedIndex(LocalSnap). Codex P1 #934.
+	EffectiveApplied uint64
 }
 
 func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
@@ -37,7 +48,7 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	}
 
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine)
+		return loadWalState(logger, walDir, snapDir, fsmSnapDir, cfg.StateMachine, cfg.ColdStartObserver)
 	}
 
 	legacy, legacyErr := loadLegacyOrSplitState(cfg.DataDir)
@@ -60,6 +71,14 @@ func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
 	}
 	if err := cleanupStaleSnapshotSpools(dataDir); err != nil {
 		return errors.Wrap(err, "cleanup stale snapshot spools")
+	}
+	// receiveSnapshotStream places its in-flight spool file inside
+	// fsmSnapDir (not dataDir) to keep the FinalizeAsFSMFile rename
+	// intra-filesystem, so a crash mid-receive can leak an
+	// elastickv-etcd-snapshot-* into fsmSnapDir. Sweep that dir on
+	// startup the same way we sweep dataDir.
+	if err := cleanupStaleSnapshotSpools(fsmSnapDir); err != nil {
+		return errors.Wrap(err, "cleanup stale snapshot spools (fsm-snap dir)")
 	}
 	// Startup CRC verification is disabled by default: for GiB-scale snapshots
 	// reading the entire file to compute a checksum can add seconds to recovery
@@ -105,25 +124,47 @@ func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, f
 	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, boot)
 }
 
-func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine) (*diskState, error) {
+func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver) (*diskState, error) {
+	// Scope the repair retry tightly to WAL-only reads: both
+	// loadPersistedSnapshot (scans WAL via wal.ValidSnapshotEntries)
+	// and openAndReadWAL's ReadAll can surface io.ErrUnexpectedEOF
+	// when the kernel OOM-killer SIGKILLed the process mid-WAL-write.
+	// wal.Repair truncates the partial trailing record once and is
+	// idempotent. FSM snapshot restore is kept out of this retry —
+	// a truncated .fsm payload surfacing ErrUnexpectedEOF is a
+	// different failure mode (the FSM snapshotter has its own
+	// on-disk CRC footer) and wal.Repair does not address it;
+	// running repair in that case would dirty a perfectly-good WAL.
 	snapshotter := snap.New(logger, snapDir)
-	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
+	snapshot, err := loadPersistedSnapshotWithRepair(logger, walDir, snapshotter)
 	if err != nil {
 		return nil, err
 	}
-	if err := restoreSnapshotState(fsm, snapshot, fsmSnapDir); err != nil {
+
+	// Codex P1 #934: open the WAL BEFORE the skip-gate decision so we
+	// know the post-snapshot entry tail. The skip path is only safe
+	// when the FSM is at least as advanced as the last WAL entry; if
+	// the FSM is past `tok.Index` but the WAL still carries entries
+	// `tok.Index+1 .. have` (the normal interval between snapshots,
+	// since metaAppliedIndex advances on each Apply), those entries
+	// would re-apply onto a Pebble store that already contains them,
+	// hitting OCC conflicts and leaving the HLC below timestamps
+	// already on disk. Compute the WAL tail's last index and gate
+	// the skip on `have >= lastWalIndex`.
+	w, hardState, entries, err := openAndReadWALWithRepair(logger, walDir, walSnapshotFor(snapshot))
+	if err != nil {
 		return nil, err
 	}
-
-	w, err := wal.Open(logger, walDir, walSnapshotFor(snapshot))
+	lastCommittedIndex := coldStartSkipThreshold(snapshot, hardState)
+	effectiveApplied, err := restoreSnapshotState(fsm, snapshot, lastCommittedIndex, fsmSnapDir, obs, logger)
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	_, hardState, entries, err := w.ReadAll()
-	if err != nil {
-		_ = w.Close()
-		return nil, errors.WithStack(err)
+		if closeErr := w.Close(); closeErr != nil {
+			logger.Warn("WAL close failed after restoreSnapshotState error",
+				zap.String("dir", walDir),
+				zap.Error(closeErr),
+			)
+		}
+		return nil, err
 	}
 
 	storage, err := newMemoryStorage(persistedState{
@@ -132,15 +173,158 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		Entries:   entries,
 	})
 	if err != nil {
-		_ = w.Close()
+		if closeErr := w.Close(); closeErr != nil {
+			logger.Warn("WAL close failed after storage init error",
+				zap.String("dir", walDir),
+				zap.Error(closeErr),
+			)
+		}
 		return nil, err
 	}
 
 	return &diskState{
-		Storage:   storage,
-		Persist:   etcdstorage.NewStorage(logger, w, snapshotter),
-		LocalSnap: snapshot,
+		Storage:          storage,
+		Persist:          etcdstorage.NewStorage(logger, w, snapshotter),
+		LocalSnap:        snapshot,
+		EffectiveApplied: effectiveApplied,
 	}, nil
+}
+
+// reportColdStartExecute emits the executed-arm of the cold-start
+// outcome (callback + structured log). Split out of reportColdStart
+// so the parent stays under the cyclop limit; the absolute-value
+// gap calculation pushes the inline arm over the threshold.
+func reportColdStartExecute(obs raftengine.ColdStartObserver, logger *zap.Logger, snapIndex, target, have uint64) {
+	if obs != nil {
+		obs.RestoreExecuted(snapIndex, have)
+	}
+	if logger == nil {
+		return
+	}
+	// gap_to_snapshot uses absolute value because the gate now
+	// permits have > snapIndex (FSM ahead of snapshot but behind
+	// committed tail). gap_behind_committed is target-have; can be
+	// 0 when have==target.
+	var gapToSnapshot uint64
+	if have >= snapIndex {
+		gapToSnapshot = have - snapIndex
+	} else {
+		gapToSnapshot = snapIndex - have
+	}
+	logger.Info("restoreSnapshotState executed (FSM behind WAL committed tail)",
+		zap.Uint64("fsm_applied", have),
+		zap.Uint64("snapshot_index", snapIndex),
+		zap.Uint64("last_committed_index", target),
+		zap.Uint64("gap_to_snapshot", gapToSnapshot),
+		zap.Uint64("gap_behind_committed", target-have),
+	)
+}
+
+// coldStartSkipThreshold returns the maximum log index the cold-
+// start replay can deliver via Ready.CommittedEntries on this
+// node: max(snapshot.Metadata.Index, hardState.Commit). The skip
+// gate compares the FSM's durable applied index against this
+// value; skip is only safe when the FSM is at least this fresh.
+//
+// Followers can carry an UNCOMMITTED WAL suffix
+// (entries[n-1].Index > hardState.Commit). Raft does NOT surface
+// those entries in CommittedEntries until the leader confirms
+// them. The previous gate used the WAL tail (entries[n-1].Index)
+// which forced a multi-GiB restore on every restart of any
+// follower with an uncommitted suffix, defeating the cold-start
+// optimization. Codex P2 #934 round 3.
+//
+// The lower bound stays at the snapshot pointer because an empty
+// WAL still requires the FSM to be at least at the snapshot
+// index. Raft's invariant guarantees hardState.Commit >= 0; we do
+// not need to bound from below explicitly beyond snap.Index.
+func coldStartSkipThreshold(snapshot raftpb.Snapshot, hardState raftpb.HardState) uint64 {
+	threshold := snapshot.Metadata.Index
+	if hardState.Commit > threshold {
+		threshold = hardState.Commit
+	}
+	return threshold
+}
+
+// coldStartApplied returns the engine's initial applied counter on
+// Open: max(maxAppliedIndex(LocalSnap), EffectiveApplied). When the
+// skip gate fires with the FSM at `have > snapshot.Metadata.Index`,
+// EffectiveApplied carries `have`; without this seed the engine
+// would deliver entries snapshot.Index+1..have to applyCommitted
+// and re-apply them onto a Pebble store already containing them
+// (codex P1 #934 root cause).
+func coldStartApplied(disk *diskState) uint64 {
+	base := maxAppliedIndex(disk.LocalSnap)
+	if disk.EffectiveApplied > base {
+		return disk.EffectiveApplied
+	}
+	return base
+}
+
+// loadPersistedSnapshotWithRepair wraps loadPersistedSnapshot with one
+// wal.Repair attempt on io.ErrUnexpectedEOF. The caller passes in a
+// shared snapshotter so loadWalState does not instantiate snap.New
+// twice per open.
+func loadPersistedSnapshotWithRepair(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {
+	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		return snapshot, err
+	}
+	logger.Warn("WAL tail truncated during snapshot scan, repairing",
+		zap.String("dir", walDir),
+		zap.Error(err),
+	)
+	if !wal.Repair(logger, walDir) {
+		return raftpb.Snapshot{}, errors.Wrap(err, "WAL unrepairable")
+	}
+	snapshot, err = loadPersistedSnapshot(logger, walDir, snapshotter)
+	if err != nil {
+		return raftpb.Snapshot{}, errors.Wrap(err, "WAL unrepairable after repair")
+	}
+	return snapshot, nil
+}
+
+// openAndReadWALWithRepair wraps openAndReadWAL with one wal.Repair
+// attempt on io.ErrUnexpectedEOF.
+func openAndReadWALWithRepair(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
+	w, hs, ents, err := openAndReadWAL(logger, walDir, walSnap)
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		return w, hs, ents, err
+	}
+	logger.Warn("WAL tail truncated during ReadAll, repairing",
+		zap.String("dir", walDir),
+		zap.Error(err),
+	)
+	if !wal.Repair(logger, walDir) {
+		return nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL unrepairable")
+	}
+	w, hs, ents, err = openAndReadWAL(logger, walDir, walSnap)
+	if err != nil {
+		return nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL unrepairable after repair")
+	}
+	return w, hs, ents, nil
+}
+
+// openAndReadWAL opens the WAL at walDir and runs ReadAll. io.ErrUnexpectedEOF
+// and other errors propagate upward; the retry/repair is handled once at
+// loadWalState so ValidSnapshotEntries and ReadAll share a single repair
+// pass and the "WAL tail truncated" log is emitted at most once.
+func openAndReadWAL(logger *zap.Logger, walDir string, walSnap walpb.Snapshot) (*wal.WAL, raftpb.HardState, []raftpb.Entry, error) {
+	w, err := wal.Open(logger, walDir, walSnap)
+	if err != nil {
+		return nil, raftpb.HardState{}, nil, errors.WithStack(err)
+	}
+	_, hardState, entries, err := w.ReadAll()
+	if err != nil {
+		if closeErr := w.Close(); closeErr != nil {
+			logger.Warn("WAL close failed after ReadAll error",
+				zap.String("dir", walDir),
+				zap.Error(closeErr),
+			)
+		}
+		return nil, raftpb.HardState{}, nil, errors.WithStack(err)
+	}
+	return w, hardState, entries, nil
 }
 
 func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {
@@ -159,19 +343,279 @@ func loadPersistedSnapshot(logger *zap.Logger, walDir string, snapshotter *snap.
 	}
 }
 
-func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, fsmSnapDir string) error {
+// restoreSnapshotState restores or skip-gates the FSM cold start and
+// returns the effective applied index that the engine MUST seed its
+// apply counter with. Zero means "no override" (legacy path, empty
+// snapshot, or nil FSM); the engine falls back to
+// maxAppliedIndex(LocalSnap) in those cases.
+//
+// The non-zero return is the gate's load-bearing escape hatch from
+// double-apply (codex P1 #934): on the skip path the FSM is already
+// at `have`, so the engine must NOT replay WAL entries with Index
+// <= have or the Pebble store would observe them twice (OCC
+// conflicts; HLC ceiling inversion). The execute path returns
+// snapshot.Metadata.Index to leave engine behaviour unchanged.
+func restoreSnapshotState(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
 	if etcdraft.IsEmptySnap(snapshot) || len(snapshot.Data) == 0 || fsm == nil {
-		return nil
+		return 0, nil
 	}
 	if isSnapshotToken(snapshot.Data) {
-		tok, err := decodeSnapshotToken(snapshot.Data)
-		if err != nil {
-			return err
-		}
-		return openAndRestoreFSMSnapshot(fsm, fsmSnapPath(fsmSnapDir, tok.Index), tok.CRC32C)
+		return restoreSnapshotStateFromToken(fsm, snapshot, lastWalIndex, fsmSnapDir, obs, logger)
 	}
 	// Legacy format: full FSM payload embedded in snapshot.Data.
-	return errors.WithStack(fsm.Restore(bytes.NewReader(snapshot.Data)))
+	if err := fsm.Restore(bytes.NewReader(snapshot.Data)); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return snapshot.Metadata.Index, nil
+}
+
+// restoreSnapshotStateFromToken handles the EKVT-token Phase-2 branch
+// (PR #910). Split out of restoreSnapshotState so the parent stays
+// under the nestif limit. Returns the effective applied index:
+//   - skip path: `have` (FSM is already past snapshot.Metadata.Index)
+//   - execute path: snapshot.Metadata.Index (restored from snapshot)
+//
+// The skip threshold is lastWalIndex (NOT tok.Index): the FSM must be
+// at least as fresh as the last WAL entry the cold-start replay would
+// deliver, otherwise entries between tok.Index and have would re-apply
+// onto a Pebble store that already contains them. Codex P1 #934.
+//
+// Metrics + log fire AFTER the restore-side work succeeds (coderabbit
+// Major #934): a header/CRC failure must not register a "successful"
+// outcome in the soak metrics.
+func restoreSnapshotStateFromToken(fsm StateMachine, snapshot raftpb.Snapshot, lastWalIndex uint64, fsmSnapDir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, error) {
+	tok, err := decodeSnapshotToken(snapshot.Data)
+	if err != nil {
+		return 0, err
+	}
+	decision, have := decideSkipOutcome(fsm, lastWalIndex)
+	snapPath := fsmSnapPath(fsmSnapDir, tok.Index)
+	if decision == coldStartSkip {
+		if err := applyHeaderStateOnSkip(fsm, snapPath, tok.CRC32C); err != nil {
+			return 0, err
+		}
+		reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
+		return have, nil
+	}
+	if err := openAndRestoreFSMSnapshot(fsm, snapPath, tok.CRC32C); err != nil {
+		return 0, err
+	}
+	reportColdStart(obs, logger, decision, tok.Index, lastWalIndex, have)
+	return snapshot.Metadata.Index, nil
+}
+
+// coldStartDecision enumerates the three outcomes the skip gate
+// distinguishes. Used together with ColdStartObserver labels to
+// keep the metrics + log emitter centralised.
+type coldStartDecision int
+
+const (
+	coldStartSkip coldStartDecision = iota
+	coldStartExecute
+	coldStartFallbackNotReader
+	coldStartFallbackMissingMeta
+	coldStartFallbackReadErr
+)
+
+func (d coldStartDecision) fallbackReason() string {
+	switch d { //nolint:exhaustive // skip / execute return "" via default
+	case coldStartFallbackNotReader:
+		return "not_reader"
+	case coldStartFallbackMissingMeta:
+		return "missing_meta"
+	case coldStartFallbackReadErr:
+		return "read_err"
+	default:
+		return ""
+	}
+}
+
+// decideSkipOutcome reads the FSM's durable applied index and
+// classifies into one of the five outcomes. Returns (decision,
+// haveIndex). haveIndex is meaningful only for skip / execute
+// outcomes; the three fallback outcomes leave it at 0 because the
+// store could not authoritatively report a value.
+func decideSkipOutcome(fsm StateMachine, want uint64) (coldStartDecision, uint64) {
+	r, ok := fsm.(raftengine.AppliedIndexReader)
+	if !ok {
+		return coldStartFallbackNotReader, 0
+	}
+	have, present, err := r.LastAppliedIndex()
+	switch {
+	case err != nil:
+		return coldStartFallbackReadErr, 0
+	case !present:
+		return coldStartFallbackMissingMeta, 0
+	case have < want:
+		return coldStartExecute, have
+	default:
+		return coldStartSkip, have
+	}
+}
+
+// reportColdStart dispatches the outcome to the observer + the
+// engine logger. nil observer / nil logger no-op individually.
+func reportColdStart(obs raftengine.ColdStartObserver, logger *zap.Logger, d coldStartDecision, snapIndex, target, have uint64) {
+	switch d { //nolint:exhaustive // default groups the three fallback variants
+	case coldStartSkip:
+		// Observer contract (cold_start.go + monitoring/cold_start.go
+		// Prometheus impl): args are (snapshotIndex, haveAppliedIndex);
+		// gauges compute have-snapIndex. Codex P2 + coderabbit Major
+		// #934: do NOT pass target/lastWalIndex here or the exported
+		// gauge measures the wrong baseline.
+		if obs != nil {
+			obs.RestoreSkipped(snapIndex, have)
+		}
+		if logger != nil {
+			// Two named gap fields so an operator correlating the
+			// log against the Prometheus gauge sees consistent
+			// magnitudes (claude #934 round 5):
+			// - gap_ahead_snapshot mirrors monitoring.ColdStartObserver
+			//   (have - snapIndex), the metric baseline.
+			// - gap_ahead_committed measures how far past the WAL
+			//   committed tail (target) the FSM is.
+			logger.Info("restoreSnapshotState skipped",
+				zap.Uint64("fsm_applied", have),
+				zap.Uint64("snapshot_index", snapIndex),
+				zap.Uint64("last_committed_index", target),
+				zap.Uint64("gap_ahead_snapshot", have-snapIndex),
+				zap.Uint64("gap_ahead_committed", have-target),
+			)
+		}
+	case coldStartExecute:
+		reportColdStartExecute(obs, logger, snapIndex, target, have)
+	default:
+		// Fallback variants: the strictly-additive policy. We could
+		// not even attempt the skip; the full restore runs.
+		reason := d.fallbackReason()
+		if obs != nil {
+			obs.RestoreFallback(snapIndex, reason)
+		}
+		if logger != nil {
+			logger.Info("restoreSnapshotState fallback to full restore",
+				zap.Uint64("snapshot_index", snapIndex),
+				zap.String("reason", reason),
+			)
+		}
+	}
+}
+
+// applyHeaderStateOnSkip mirrors openAndRestoreFSMSnapshot's safety
+// contract (size + footer-vs-tokenCRC + full-body-CRC) but applies
+// only the header side-effects (HLC ceiling + Stage 8a cutover)
+// instead of running the body restore. The body bytes are read for
+// CRC coverage but discarded -- fsm.db already holds equivalent
+// state, which is precisely the reason we're skipping the restore.
+//
+// FSMs that do not implement raftengine.SnapshotHeaderApplier
+// silently no-op the apply phase -- the FSM has no header state to
+// carry forward, and the CRC verification still runs (with no
+// observable side-effect on success). On any verification failure
+// the typed error propagates and FSM state stays untouched.
+//
+// See PR #910 design §5 round-7 (two-phase seam) + round-6
+// (three-step CRC mirroring openAndRestoreFSMSnapshot).
+func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) error {
+	file, err := os.Open(snapPath)
+	if err != nil {
+		return statFSMFileError(err)
+	}
+	defer func() { _ = file.Close() }()
+
+	info, err := file.Stat()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	footer, err := verifyFSMSnapshotPrefix(file, info.Size(), snapPath, tokenCRC)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: full-body CRC. Wrap the payload in a crc32 TeeReader
+	// and hand it to the FSM's ParseSnapshotHeader for header parse
+	// + drain. Every payload byte flows through h, matching
+	// restoreAndComputeCRC's boundary in openAndRestoreFSMSnapshot.
+	//
+	// Error-ordering contract (claude #934 R1-F1): header parse
+	// errors surface BEFORE the body-CRC compare runs, so callers
+	// (the skip-gate fallback in restoreSnapshotState) may observe
+	// either an ErrSnapshotHeaderUnknownMagic / InvalidLength chain or
+	// an ErrFSMSnapshotFileCRC chain depending on which check fails
+	// first. This is the same ordering openAndRestoreFSMSnapshot has
+	// — both errors are equally fatal for the skip path (they signal
+	// snapshot file corruption) and both must propagate without ever
+	// calling ApplySnapshotHeader. The CRC check stays AFTER the
+	// header parse so the TeeReader has actually been drained before
+	// we read h.Sum32(); inverting the order would let a CRC mismatch
+	// surface on a truncated body even when the header was valid,
+	// muddying the operator-facing diagnostic.
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return errors.WithStack(err)
+	}
+	payloadSize := info.Size() - fsmFooterSize
+	h := crc32.New(crc32cTable)
+	tee := io.TeeReader(io.LimitReader(file, payloadSize), h)
+
+	setter, hasSetter := fsm.(raftengine.SnapshotHeaderApplier)
+	ceiling, cutover, err := readSnapshotHeaderOrDrain(setter, hasSetter, tee)
+	if err != nil {
+		return err
+	}
+
+	if h.Sum32() != footer {
+		return errors.Wrapf(ErrFSMSnapshotFileCRC,
+			"path=%s footer=%08x computed=%08x", snapPath, footer, h.Sum32())
+	}
+
+	// All three checks passed; apply side-effects (pure assignment
+	// in the FSM). Skipped silently when the FSM does not expose
+	// the seam.
+	if hasSetter {
+		setter.ApplySnapshotHeader(ceiling, cutover)
+	}
+	return nil
+}
+
+// verifyFSMSnapshotPrefix runs the first two cheap checks of
+// openAndRestoreFSMSnapshot's three-step contract: size and
+// footer-vs-tokenCRC. Returns the on-disk footer value (caller
+// reuses it for the step-3 full-body CRC compare). Typed errors
+// surface unchanged.
+func verifyFSMSnapshotPrefix(file *os.File, fileSize int64, snapPath string, tokenCRC uint32) (uint32, error) {
+	if fileSize < fsmMinFileSize {
+		return 0, errors.Wrapf(ErrFSMSnapshotTooSmall,
+			"file too small: %d bytes (minimum %d)", fileSize, fsmMinFileSize)
+	}
+	footer, err := readFSMFooter(file, fileSize)
+	if err != nil {
+		return 0, err
+	}
+	if footer != tokenCRC {
+		return 0, errors.Wrapf(ErrFSMSnapshotTokenCRC,
+			"path=%s footer=%08x token=%08x", snapPath, footer, tokenCRC)
+	}
+	return footer, nil
+}
+
+// readSnapshotHeaderOrDrain branches on whether the FSM exposes the
+// SnapshotHeaderApplier seam: when present, delegate to
+// ParseSnapshotHeader (which parses the header AND drains the rest);
+// otherwise drain the entire payload through the tee'd reader so the
+// CRC pass covers every byte. The (ceiling, cutover) tuple is zero
+// in the no-seam case -- the caller's ApplySnapshotHeader branch
+// short-circuits on hasSetter, so the zero values are inert.
+func readSnapshotHeaderOrDrain(setter raftengine.SnapshotHeaderApplier, hasSetter bool, tee io.Reader) (uint64, uint64, error) {
+	if hasSetter {
+		ceiling, cutover, err := setter.ParseSnapshotHeader(tee)
+		if err != nil {
+			return 0, 0, errors.WithStack(err)
+		}
+		return ceiling, cutover, nil
+	}
+	if _, err := io.Copy(io.Discard, tee); err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	return 0, 0, nil
 }
 
 func walSnapshotFor(snapshot raftpb.Snapshot) walpb.Snapshot {
@@ -226,7 +670,12 @@ func persistBootState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fs
 		return nil, err
 	}
 	if wal.Exist(walDir) {
-		return loadWalState(logger, walDir, snapDir, fsmSnapDir, fsm)
+		// Recursive load after bootstrap-style setup: no observer
+		// needed because the engine has not handed one to us
+		// (bootstrap path runs before OpenConfig wiring reaches
+		// this point) and a fresh-bootstrap restore will be a no-op
+		// anyway (the WAL was just created).
+		return loadWalState(logger, walDir, snapDir, fsmSnapDir, fsm, nil)
 	}
 
 	w, err := wal.Create(logger, walDir, nil)
@@ -331,19 +780,71 @@ func validateConfState(conf raftpb.ConfState, peers []Peer) error {
 	if len(peers) == 0 {
 		return nil
 	}
-	expected := confStateForPeers(peers)
-	if len(conf.Voters) != len(expected.Voters) {
-		return errors.Wrapf(errClusterMismatch, "expected %d voters got %d", len(expected.Voters), len(conf.Voters))
-	}
-	for i, voter := range conf.Voters {
-		if voter != expected.Voters[i] {
-			return errors.Wrapf(errClusterMismatch, "voter[%d]=%d expected %d", i, voter, expected.Voters[i])
-		}
-	}
-	if len(conf.VotersOutgoing) > 0 || len(conf.Learners) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
+	// Joint consensus markers are still rejected: learner add/promote
+	// uses the simple V1 single-step ConfChange path which never sets
+	// these. See docs/design/2026_04_26_proposed_raft_learner.md §4.2.
+	if len(conf.VotersOutgoing) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
 		return errors.Wrap(errClusterMismatch, "joint consensus state is not supported")
 	}
+	expectedVoters, learnerSet := splitPeersBySuffrage(peers)
+	if err := validateConfStateVoters(conf, expectedVoters); err != nil {
+		return err
+	}
+	return validateConfStateLearners(conf, learnerSet)
+}
+
+// validateConfStateVoters checks that conf.Voters matches the voter
+// peers element-wise. The element-wise comparison relies on the
+// well-established voter ordering invariant: persistConfigState
+// writes voters in ConfState.Voters order and normalizePeers
+// preserves it.
+func validateConfStateVoters(conf raftpb.ConfState, expectedVoters []uint64) error {
+	if len(conf.Voters) != len(expectedVoters) {
+		return errors.Wrapf(errClusterMismatch, "expected %d voters got %d", len(expectedVoters), len(conf.Voters))
+	}
+	for i, voter := range conf.Voters {
+		if voter != expectedVoters[i] {
+			return errors.Wrapf(errClusterMismatch, "voter[%d]=%d expected %d", i, voter, expectedVoters[i])
+		}
+	}
 	return nil
+}
+
+// validateConfStateLearners is set-based, not element-wise. There is
+// no prior writer-side ordering invariant for learners, so we do not
+// pin one in the reader. A set comparison rejects both
+// same-count-member-divergence and conf-learner-not-in-peers cases —
+// see docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 3.
+func validateConfStateLearners(conf raftpb.ConfState, expected map[uint64]struct{}) error {
+	if len(conf.Learners) != len(expected) {
+		return errors.Wrapf(errClusterMismatch, "expected %d learners got %d", len(expected), len(conf.Learners))
+	}
+	for _, nodeID := range conf.Learners {
+		if _, ok := expected[nodeID]; !ok {
+			return errors.Wrapf(errClusterMismatch, "learner %d not present in peers", nodeID)
+		}
+	}
+	return nil
+}
+
+// splitPeersBySuffrage partitions a peers list into the ordered voter
+// node-ID slice (preserving input order, which encodes the
+// well-established voter ordering invariant) and a learner set
+// (unordered).
+func splitPeersBySuffrage(peers []Peer) ([]uint64, map[uint64]struct{}) {
+	voters := make([]uint64, 0, len(peers))
+	var learners map[uint64]struct{}
+	for _, peer := range peers {
+		if peer.Suffrage == SuffrageLearner {
+			if learners == nil {
+				learners = make(map[uint64]struct{})
+			}
+			learners[peer.NodeID] = struct{}{}
+			continue
+		}
+		voters = append(voters, peer.NodeID)
+	}
+	return voters, learners
 }
 
 func loadLegacyOrSplitState(dataDir string) (persistedState, error) {

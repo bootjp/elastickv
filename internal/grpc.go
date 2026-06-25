@@ -27,3 +27,16 @@ func GRPCDialOptions() []grpc.DialOption {
 		),
 	}
 }
+
+// GRPCCallOptions returns the per-call message-size cap dial option used by
+// callers that supply their own transport credentials (e.g. the admin
+// binary's TLS-aware fanout). Without this, gRPC-Go's default ~4 MiB recv
+// cap would silently fail RPCs once aggregated cluster-overview / matrix
+// admin payloads exceed 4 MiB even though node servers (GRPCServerOptions)
+// are configured for 64 MiB.
+func GRPCCallOptions() grpc.DialOption {
+	return grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(GRPCMaxMessageBytes),
+		grpc.MaxCallSendMsgSize(GRPCMaxMessageBytes),
+	)
+}

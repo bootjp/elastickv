@@ -1,0 +1,328 @@
+package backup
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/cockroachdb/errors"
+)
+
+type keymapCase struct {
+	encoded  string
+	original []byte
+	kind     string
+}
+
+func keymapRoundTripCases() []keymapCase {
+	return []keymapCase{
+		{"abcdef0123456789abcdef0123456789__hello", []byte("hello-but-much-longer-than-fits"), KindSHAFallback},
+		{"path%2Fto.elastickv-leaf-data", []byte("path/to"), KindS3LeafData},
+		{"foo.elastickv-meta.json.user-data", []byte("foo.elastickv-meta.json"), KindMetaCollision},
+		{"binary-key", []byte{0x00, 0xff, 0x01, 0xfe}, KindSHAFallback},
+		{"empty-original", []byte{}, KindSHAFallback},
+	}
+}
+
+func writeKeymapCases(t *testing.T, w *KeymapWriter, cases []keymapCase) {
+	t.Helper()
+	for _, c := range cases {
+		if err := w.WriteOriginal(c.encoded, c.original, c.kind); err != nil {
+			t.Fatalf("Write(%q): %v", c.encoded, err)
+		}
+	}
+}
+
+func assertKeymapRecord(t *testing.T, got map[string]KeymapRecord, c keymapCase) {
+	t.Helper()
+	rec, ok := got[c.encoded]
+	if !ok {
+		t.Fatalf("missing record for %q", c.encoded)
+	}
+	if rec.Kind != c.kind {
+		t.Fatalf("%q kind = %q, want %q", c.encoded, rec.Kind, c.kind)
+	}
+	orig, err := rec.Original()
+	if err != nil {
+		t.Fatalf("%q Original: %v", c.encoded, err)
+	}
+	if !bytes.Equal(orig, c.original) {
+		t.Fatalf("%q original = %x, want %x", c.encoded, orig, c.original)
+	}
+}
+
+func TestKeymapWriter_RoundTrip(t *testing.T) {
+	t.Parallel()
+	cases := keymapRoundTripCases()
+	var buf bytes.Buffer
+	w := NewKeymapWriter(&buf)
+	writeKeymapCases(t, w, cases)
+	if w.Count() != len(cases) {
+		t.Fatalf("Count = %d, want %d", w.Count(), len(cases))
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := LoadKeymap(&buf)
+	if err != nil {
+		t.Fatalf("LoadKeymap: %v", err)
+	}
+	if len(got) != len(cases) {
+		t.Fatalf("loaded len = %d, want %d", len(got), len(cases))
+	}
+	for _, c := range cases {
+		assertKeymapRecord(t, got, c)
+	}
+}
+
+func TestKeymapWriter_RejectsEmptyEncoded(t *testing.T) {
+	t.Parallel()
+	w := NewKeymapWriter(&bytes.Buffer{})
+	if err := w.Write(KeymapRecord{Encoded: "", Kind: KindSHAFallback}); err == nil {
+		t.Fatalf("expected error for empty encoded, got nil")
+	}
+	if err := w.Write(KeymapRecord{Encoded: "x", Kind: ""}); err == nil {
+		t.Fatalf("expected error for empty kind, got nil")
+	}
+}
+
+func TestKeymapWriter_DoesNotEscapeHTML(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	w := NewKeymapWriter(&buf)
+	// json.Encoder escapes `<`, `>`, `&` by default; we disable that so
+	// keys containing these bytes encode/decode without surprise.
+	if err := w.WriteOriginal("a%3Cb%3Ec", []byte("a<b>c&d"), KindSHAFallback); err != nil {
+		t.Fatalf("WriteOriginal: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, `<`) || strings.Contains(out, `>`) || strings.Contains(out, `&`) {
+		t.Fatalf("unwanted HTML escape in output: %q", out)
+	}
+	// And the base64 of "a<b>c&d" appears intact:
+	if !strings.Contains(out, "YTxiPmMmZA") {
+		t.Fatalf("missing base64 of original in output: %q", out)
+	}
+}
+
+func TestKeymapWriter_OmitEmpty(t *testing.T) {
+	t.Parallel()
+	// The "omit when empty" decision is the caller's; the writer just
+	// reports whether any records were written.
+	var buf bytes.Buffer
+	w := NewKeymapWriter(&buf)
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if w.Count() != 0 {
+		t.Fatalf("Count = %d, want 0", w.Count())
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("empty writer produced output: %q", buf.String())
+	}
+}
+
+func TestKeymapReader_RejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+	r := NewKeymapReader(strings.NewReader("not-json\n"))
+	_, _, err := r.Next()
+	if !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+	}
+	// Sticky: subsequent calls return the same wrapped error class.
+	_, _, err2 := r.Next()
+	if !errors.Is(err2, ErrInvalidKeymapRecord) {
+		t.Fatalf("non-sticky error: %v", err2)
+	}
+}
+
+func TestKeymapReader_RejectsRecordWithoutEncodedOrKind(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`{"original":"AA"}`,
+		`{"encoded":"","kind":"sha-fallback"}`,
+		`{"encoded":"x"}`,
+		`{"encoded":"x","kind":""}`,
+	}
+	for _, line := range cases {
+		r := NewKeymapReader(strings.NewReader(line + "\n"))
+		_, _, err := r.Next()
+		if !errors.Is(err, ErrInvalidKeymapRecord) {
+			t.Fatalf("input %q: err = %v, want ErrInvalidKeymapRecord", line, err)
+		}
+	}
+}
+
+func TestKeymapReader_RejectsBlankLines(t *testing.T) {
+	t.Parallel()
+	// bufio.Scanner skips trailing newline but emits an empty line when one
+	// is in the middle of the stream. We require strict JSONL — every
+	// non-empty line must be a record. An empty line in the middle must
+	// surface as ErrInvalidKeymapRecord rather than be silently skipped,
+	// so truncated dumps are recognised.
+	input := `{"encoded":"x","original":"AA","kind":"sha-fallback"}` + "\n\n" +
+		`{"encoded":"y","original":"AA","kind":"sha-fallback"}` + "\n"
+	r := NewKeymapReader(strings.NewReader(input))
+	if _, ok, err := r.Next(); !ok || err != nil {
+		t.Fatalf("first record: ok=%v err=%v", ok, err)
+	}
+	if _, _, err := r.Next(); !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("blank line: err=%v want ErrInvalidKeymapRecord", err)
+	}
+}
+
+func TestLoadKeymap_LastRecordWins(t *testing.T) {
+	t.Parallel()
+	input := `{"encoded":"x","original":"YQ","kind":"sha-fallback"}` + "\n" +
+		`{"encoded":"x","original":"Yg","kind":"sha-fallback"}` + "\n"
+	got, err := LoadKeymap(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("LoadKeymap: %v", err)
+	}
+	rec, ok := got["x"]
+	if !ok {
+		t.Fatalf("missing record")
+	}
+	orig, err := rec.Original()
+	if err != nil {
+		t.Fatalf("Original: %v", err)
+	}
+	if string(orig) != "b" {
+		t.Fatalf("last-wins broken: got %q want %q", orig, "b")
+	}
+}
+
+func TestKeymapRecord_OriginalRejectsBadBase64(t *testing.T) {
+	t.Parallel()
+	rec := KeymapRecord{Encoded: "x", OriginalB64: "!!!", Kind: KindSHAFallback}
+	if _, err := rec.Original(); !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("err = %v, want ErrInvalidKeymapRecord", err)
+	}
+}
+
+func TestKeymapReader_RejectsMalformedBase64AtParseTime(t *testing.T) {
+	t.Parallel()
+	// JSON parses fine; the structural fields are present; only the
+	// `original` base64 is malformed. The reader must catch this on
+	// the first Next() rather than defer it to a later Original()
+	// call — Codex P1 #179.
+	input := `{"encoded":"x","original":"!!!","kind":"sha-fallback"}` + "\n"
+	r := NewKeymapReader(strings.NewReader(input))
+	_, _, err := r.Next()
+	if !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("err=%v want ErrInvalidKeymapRecord on parse-time base64 validation", err)
+	}
+}
+
+// TestKeymapReader_RejectsExplicitNullField is the regression for
+// Codex P1 round 7-follow-up: `"original": null` round-trips through
+// json.Unmarshal into rec.OriginalB64 == "", which base64.DecodeString
+// then accepts as empty bytes — silently rewriting the mapping. The
+// presence-aware decode must also reject the JSON `null` literal for
+// each required field.
+func TestKeymapReader_RejectsExplicitNullField(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"null original", `{"encoded":"x","original":null,"kind":"sha-fallback"}`},
+		{"null encoded", `{"encoded":null,"original":"AA","kind":"sha-fallback"}`},
+		{"null kind", `{"encoded":"x","original":"AA","kind":null}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := NewKeymapReader(strings.NewReader(tc.body + "\n"))
+			_, _, err := r.Next()
+			if !errors.Is(err, ErrInvalidKeymapRecord) {
+				t.Fatalf("err=%v want ErrInvalidKeymapRecord on null field", err)
+			}
+		})
+	}
+}
+
+// TestKeymapReader_RejectsMissingOriginalField exercises Codex P2 round 5:
+// a record that omits `original` entirely must not be accepted as if the
+// original key were empty bytes, because base64.DecodeString("") succeeds
+// silently. A truncated dump that drops `original` would otherwise rewrite
+// the encoded->original mapping to empty bytes and break exact key recovery
+// for SHA-fallback or collision-renamed entries.
+func TestKeymapReader_RejectsMissingOriginalField(t *testing.T) {
+	t.Parallel()
+	// All structural keys present except `original`. Without the
+	// presence check this passes, because rec.OriginalB64 defaults to
+	// "" and base64 decode of "" succeeds.
+	input := `{"encoded":"x","kind":"sha-fallback"}` + "\n"
+	r := NewKeymapReader(strings.NewReader(input))
+	_, _, err := r.Next()
+	if !errors.Is(err, ErrInvalidKeymapRecord) {
+		t.Fatalf("err=%v want ErrInvalidKeymapRecord on missing `original` field", err)
+	}
+	// Sticky: a subsequent Next must keep returning the same error class.
+	_, _, err2 := r.Next()
+	if !errors.Is(err2, ErrInvalidKeymapRecord) {
+		t.Fatalf("non-sticky error: %v", err2)
+	}
+}
+
+// TestKeymapReader_AcceptsMaxSizedOriginal is the regression for Codex
+// P1 round 6: a record whose `original` is the source store's maximum
+// allowed key (1 MiB, per store/mvcc_store.go maxSnapshotKeySize) must
+// round-trip cleanly. Before the bump the scanner cap was 1 MiB, but
+// base64url expands the value to ~1.33 MiB; KeymapReader.Next failed
+// with `bufio.Scanner: token too long` and the dump could not be
+// loaded back. Test reads the largest legitimate KEYMAP line we will
+// ever produce.
+func TestKeymapReader_AcceptsMaxSizedOriginal(t *testing.T) {
+	t.Parallel()
+	const maxSnapshotKeyBytes = 1 << 20
+	original := make([]byte, maxSnapshotKeyBytes)
+	for i := range original {
+		original[i] = byte(i % 251) //nolint:mnd // arbitrary byte spread
+	}
+	var buf bytes.Buffer
+	w := NewKeymapWriter(&buf)
+	if err := w.WriteOriginal("encoded-x", original, KindSHAFallback); err != nil {
+		t.Fatalf("WriteOriginal: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	rd := NewKeymapReader(&buf)
+	rec, ok, err := rd.Next()
+	if err != nil || !ok {
+		t.Fatalf("Next: ok=%v err=%v", ok, err)
+	}
+	got, err := rec.Original()
+	if err != nil {
+		t.Fatalf("Original: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("Original round-trip lost data: len got=%d want=%d", len(got), len(original))
+	}
+}
+
+// TestKeymapReader_AcceptsExplicitEmptyOriginal sanity-checks that an
+// explicitly-empty `original` (the field is present, value is "") still
+// parses. The contract is that absence is rejected, not emptiness.
+func TestKeymapReader_AcceptsExplicitEmptyOriginal(t *testing.T) {
+	t.Parallel()
+	input := `{"encoded":"x","original":"","kind":"sha-fallback"}` + "\n"
+	r := NewKeymapReader(strings.NewReader(input))
+	rec, ok, err := r.Next()
+	if err != nil || !ok {
+		t.Fatalf("err=%v ok=%v want a record", err, ok)
+	}
+	got, err := rec.Original()
+	if err != nil {
+		t.Fatalf("Original(): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Original = %q, want empty", got)
+	}
+}

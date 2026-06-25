@@ -121,13 +121,13 @@ func TestTransactionManagerBatchesConcurrentRawCommits(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		resp, err := tm.Commit(req1)
+		resp, err := tm.Commit(context.Background(), req1)
 		results <- result{resp: resp, err: err}
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		resp, err := tm.Commit(req2)
+		resp, err := tm.Commit(context.Background(), req2)
 		results <- result{resp: resp, err: err}
 	}()
 	close(start)
@@ -167,7 +167,7 @@ func TestApplyRequestsCountsProposalFailureOnRaftApplyError(t *testing.T) {
 		},
 	}}
 
-	_, _, err := applyRequests(r, reqs, observer)
+	_, _, err := applyRequests(context.Background(), r, reqs, observer)
 	require.Error(t, err)
 	require.Equal(t, 1, observer.FailureCount())
 }
@@ -186,7 +186,7 @@ func TestApplyRequestsDoesNotCountBusinessErrorAsProposalFailure(t *testing.T) {
 		},
 	}}
 
-	_, results, err := applyRequests(r, reqs, observer)
+	_, results, err := applyRequests(context.Background(), r, reqs, observer)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0], ErrInvalidRequest)
@@ -217,7 +217,7 @@ func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
 		},
 	}}
 
-	commitIndex, results, err := applyRequests(engine, goodReqs, observer)
+	commitIndex, results, err := applyRequests(context.Background(), engine, goodReqs, observer)
 	require.NoError(t, err)
 	require.NotZero(t, commitIndex)
 	require.Len(t, results, 1)
@@ -235,7 +235,7 @@ func TestApplyRequestsWithEtcdEngineKeepsKVCommandSemantics(t *testing.T) {
 		},
 	}}
 
-	_, results, err = applyRequests(engine, badReqs, observer)
+	_, results, err = applyRequests(context.Background(), engine, badReqs, observer)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0], ErrInvalidRequest)

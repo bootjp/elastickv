@@ -126,6 +126,144 @@ services:
       - "6380"
 ```
 
+### High-availability redis-proxy (nginx TCP LB + 2 replicas)
+
+The single-container deploy above causes a brief connection blip when the
+container restarts (image upgrade, config change, etc.). For operator-driven
+redeploys without dropping clients, put nginx's stream module in front of two
+redis-proxy replicas and drain them one at a time.
+
+Assets live under `deploy/redis-proxy/`:
+
+- `deploy/redis-proxy/nginx.conf` -- stream-module TCP LB config.
+- `deploy/redis-proxy/docker-compose.ha.yml` -- two redis-proxy replicas
+  (`redis-proxy-a`, `redis-proxy-b`) plus an `nginx:1.27-alpine` frontend.
+
+#### Architecture
+
+```
+           client (redis-cli, app)
+                     |
+                     v  :6379 (stable)
+              +---------------+
+              |     nginx     |   stream {} -- hash $remote_addr consistent
+              |  (stream TCP) |   passive health: max_fails=3 fail_timeout=10s
+              +-------+-------+
+                      |
+           +----------+----------+
+           v                     v
+   redis-proxy-a:6379    redis-proxy-b:6379
+           |                     |
+           +----------+----------+
+                      |
+                      v
+                elastickv cluster
+                  (+ Redis, in
+                  dual-write modes)
+```
+
+Nginx only exposes the client-facing port; the redis-proxy replicas are
+reachable only from within the compose network by service name.
+
+#### Session affinity
+
+The upstream uses `hash $remote_addr consistent`. This pins a given client's
+**new** connections to the same backend so that per-connection state
+(MULTI/EXEC, WATCH, SUBSCRIBE, Lua `SELECT`, etc.) lands on one replica that
+can actually observe it. Consistent hashing also minimises reshuffles when a
+backend is drained.
+
+nginx retries the connection against the next upstream **only** when the TCP
+handshake fails (`proxy_next_upstream on` + `proxy_next_upstream_tries 2`).
+Once bytes have been exchanged, nginx does **not** replay the command on
+another backend -- double-executing non-idempotent Redis commands would be
+worse than a reconnect.
+
+Trade-off: a client whose backend is taken offline sees its **existing**
+connection broken and must reconnect. Only new TCP sessions are steered
+away. This is the correct behaviour vs. silently double-sending an
+in-flight command.
+
+#### Bring up
+
+```bash
+cd deploy/redis-proxy
+# Build + start both backends and nginx.
+docker compose -f docker-compose.ha.yml up -d --build
+
+# Point the client at the nginx endpoint.
+redis-cli -p 6379 PING
+# PONG
+```
+
+Override backend wiring via env vars before `docker compose up`:
+
+```bash
+REDIS_PROXY_PRIMARY=redis.prod.internal:6379 \
+REDIS_PROXY_SECONDARY=elastickv-1.prod.internal:6380,elastickv-2.prod.internal:6380,elastickv-3.prod.internal:6380 \
+REDIS_PROXY_MODE=dual-write-shadow \
+  docker compose -f docker-compose.ha.yml up -d
+```
+
+#### Rolling redeploy procedure
+
+Do one backend at a time; wait for nginx passive health to mark it down
+before restarting, and wait for it to come back up before touching the
+other replica.
+
+```bash
+cd deploy/redis-proxy
+
+# 1. Pull the new image into the compose project.
+docker compose -f docker-compose.ha.yml pull redis-proxy-a
+
+# 2. Stop backend a. Passive health on nginx will observe max_fails
+#    within ~10s (fail_timeout) on the first few failed new-connection
+#    attempts and will stop sending traffic to redis-proxy-a.
+#    Existing nginx->a TCP sessions terminate; clients must reconnect
+#    and will land on redis-proxy-b.
+docker compose -f docker-compose.ha.yml stop redis-proxy-a
+
+# 3. Recreate with the new image.
+docker compose -f docker-compose.ha.yml up -d redis-proxy-a
+
+# 4. Verify it is serving before touching the other replica.
+docker compose -f docker-compose.ha.yml exec redis-proxy-a \
+    /redis-proxy --help >/dev/null    # smoke
+# Or, from a host with network access to the compose network:
+# redis-cli -h <redis-proxy-a-ip> -p 6379 PING
+
+# 5. Repeat for redis-proxy-b.
+docker compose -f docker-compose.ha.yml pull redis-proxy-b
+docker compose -f docker-compose.ha.yml stop redis-proxy-b
+docker compose -f docker-compose.ha.yml up -d redis-proxy-b
+```
+
+The existing `scripts/rolling-update.sh` is for the elastickv raft
+cluster, not the redis-proxy front-end; it is not involved in this
+sequence.
+
+#### Observability
+
+nginx writes one line per client session to
+`/var/log/nginx/redis-proxy-access.log` with this format (defined in
+`nginx.conf`):
+
+```
+$remote_addr [$time_local] $protocol $status $bytes_sent $bytes_received upstream=$upstream_addr session_time=$session_time
+```
+
+Tail it while redeploying to confirm traffic has shifted:
+
+```bash
+docker compose -f docker-compose.ha.yml exec nginx \
+    tail -f /var/log/nginx/redis-proxy-access.log
+```
+
+Per-backend redis-proxy metrics remain on `:9191` of each replica as
+before; scrape them individually (see the Prometheus Metrics section
+below).
+
 ### Kubernetes
 
 ```yaml

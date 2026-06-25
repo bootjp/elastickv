@@ -33,9 +33,10 @@ The test will:
 - start the cluster (bootstrap on `n1`, join others),
 - run the Redis append workload with the Jepsen combined nemesis (partitions + process kills by default).
 
-Use `--raft-engine hashicorp` to exercise the legacy backend instead. Switching an
-existing data directory between engines is intentionally rejected; migrate to a
-fresh etcd data dir first when testing `etcd/raft`.
+`etcd/raft` is the only supported backend; the legacy HashiCorp backend was
+removed in commit `a35245a` and `--raft-engine` accepts no other value. A node
+refuses to start on a data directory that still holds legacy HashiCorp artifacts,
+so migrate any such directory to a fresh etcd data dir first.
 
 The Jepsen bootstrap path uses `RAFTADMIN_ALLOW_INSECURE=true` because the lab gRPC admin channel is plaintext-only.
 

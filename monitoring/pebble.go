@@ -51,6 +51,13 @@ type PebbleMetrics struct {
 	blockCacheCapacityBytes *prometheus.GaugeVec
 	blockCacheHitsTotal     *prometheus.CounterVec
 	blockCacheMissesTotal   *prometheus.CounterVec
+
+	// FSM apply sync mode. Resolved once from ELASTICKV_FSM_SYNC_MODE at
+	// process start (see store/lsm_store.go). The label-scoped gauge is
+	// set to 1 for the active mode (either "sync" or "nosync") and 0 for
+	// the other, so dashboards can alert on unexpected posture changes
+	// (e.g. a rolling deploy that accidentally drops durability).
+	fsmApplySyncMode *prometheus.GaugeVec
 }
 
 func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
@@ -139,6 +146,13 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 			},
 			[]string{"group"},
 		),
+		fsmApplySyncMode: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_fsm_apply_sync_mode",
+				Help: "Active ELASTICKV_FSM_SYNC_MODE on this node. Gauge is 1 for the active mode and 0 for the other. \"sync\" means every FSM apply issues a Pebble fsync; \"nosync\" relies on raft-log replay for crash recovery of the FSM state.",
+			},
+			[]string{"mode"},
+		),
 	}
 
 	registerer.MustRegister(
@@ -154,8 +168,37 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 		m.blockCacheCapacityBytes,
 		m.blockCacheHitsTotal,
 		m.blockCacheMissesTotal,
+		m.fsmApplySyncMode,
 	)
 	return m
+}
+
+// SetFSMApplySyncMode records which ELASTICKV_FSM_SYNC_MODE is active.
+// activeLabel must be "sync" or "nosync"; any other value is coerced to
+// "sync" to match the store resolver's fallback behaviour for unknown
+// ELASTICKV_FSM_SYNC_MODE values (see store.resolveFSMApplyWriteOpts).
+// This keeps the gauge's two-row shape stable: exactly one of
+// {"sync","nosync"} is 1 at any time and the other is 0.
+//
+// Call this once at startup after the store package has resolved the
+// env var. Invoking again is safe and idempotent: the new label goes to
+// 1 and the other known label goes to 0.
+func (m *PebbleMetrics) SetFSMApplySyncMode(activeLabel string) {
+	if m == nil || m.fsmApplySyncMode == nil {
+		return
+	}
+	// Coerce unknown labels to "sync" so the gauge never leaks a third
+	// row and so a prior stale label cannot stay pinned at 1. This
+	// mirrors store.resolveFSMApplyWriteOpts, which also falls back to
+	// sync on unrecognised input.
+	if activeLabel != "sync" && activeLabel != "nosync" {
+		activeLabel = "sync"
+	}
+	// Zero both known labels before setting the active one so the gauge
+	// has a stable two-row shape regardless of call ordering.
+	m.fsmApplySyncMode.WithLabelValues("sync").Set(0)
+	m.fsmApplySyncMode.WithLabelValues("nosync").Set(0)
+	m.fsmApplySyncMode.WithLabelValues(activeLabel).Set(1)
 }
 
 // PebbleMetricsSource abstracts the per-group access to a Pebble DB's

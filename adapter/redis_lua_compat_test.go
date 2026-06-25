@@ -121,6 +121,13 @@ func TestRedis_LuaRPopLPushBullMQLikeLists(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
 	defer func() { _ = rdb.Close() }()
 
+	// Direct first writes: waitForRaftReadiness (called by createNode)
+	// now drives one no-op Raft entry through full quorum before
+	// returning, so any subsequent write is guaranteed to land on a
+	// leader that has already held quorum through one apply. The
+	// post-readiness leader-churn window the prior rpushEventually /
+	// lpushEventually wrappers absorbed is closed at the readiness
+	// layer instead — see PR #898.
 	require.NoError(t, rdb.RPush(ctx, "bull:test:wait", "job-1", "job-2", "job-3").Err())
 	require.NoError(t, rdb.LPush(ctx, "bull:test:active", "job-0").Err())
 

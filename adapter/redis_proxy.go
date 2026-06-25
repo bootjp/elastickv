@@ -14,7 +14,7 @@ func (r *RedisServer) proxyDBSize() (int, error) {
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return 0, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
@@ -39,7 +39,7 @@ func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
 		}
 		addr, ok := r.leaderRedis[leader]
 		if !ok || addr == "" {
-			return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+			return 0, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 		}
 		byAddr[addr] = append(byAddr[addr], string(k))
 	}
@@ -66,7 +66,7 @@ func (r *RedisServer) proxyFlushDatabase(all bool) error {
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)
@@ -90,7 +90,7 @@ func (r *RedisServer) proxyFlushLegacy() (int, error) {
 	}
 	leaderAddr, ok := r.leaderRedis[leader]
 	if !ok || leaderAddr == "" {
-		return 0, errors.WithStack(errors.Newf("leader redis address unknown for %s", leader))
+		return 0, errors.WithStack(errors.Newf("ERR leader redis address unknown for %s", leader))
 	}
 
 	cli := r.getOrCreateLeaderClient(leaderAddr)

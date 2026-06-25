@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Raft control-plane status for elastickv: leader, membership, node state, index drift, backlog, and leader contact.",
+  "description": "Raft control-plane status for elastickv: leader, membership, node state, index drift, backlog, leader contact, and HLC lease (physical-ceiling fence health).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -1068,6 +1068,293 @@
       ],
       "title": "Failed Proposals (15m)",
       "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Worst wall_now - physicalCeiling across nodes. Negative is healthy (ceiling sits in the future). Alert on > -0.5s for HLC-4 (i) approaching violation, > 0s for the (iii) fence having tripped on at least one node.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": -0.5
+              },
+              {
+                "color": "red",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      },
+      "id": 16,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max(elastickv_hlc_wall_skew_seconds{job=\"elastickv\",node_id=~\"$node_id\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Worst Wall Skew",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Cumulative HLC.NextFenced() rejections in the last 24h, summed across nodes. Any non-zero value means the HLC-4 (iii) fence actually fired and refused a persistence ts allocation — operators should investigate the leader's lease renewer.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      },
+      "id": 17,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "sum(increase(elastickv_hlc_next_fenced_rejections_total{job=\"elastickv\",node_id=~\"$node_id\"}[24h]))",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "NextFenced Rejections (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "Maximum age (now - physicalCeiling) across nodes after the first HLC lease has landed. Stagnant value ⇒ the leader's lease renewer has stopped landing entries; once it crosses 0 the fence trips on every node that observed it. Pre-bootstrap nodes (ceiling=0) are excluded.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      },
+      "id": 18,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "max(time() - elastickv_hlc_physical_ceiling_seconds{job=\"elastickv\",node_id=~\"$node_id\"} and elastickv_hlc_physical_ceiling_seconds{job=\"elastickv\",node_id=~\"$node_id\"} > 0)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Worst Ceiling Age",
+      "type": "stat"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "wall_now minus physicalCeiling per node. Negative = healthy (ceiling sits in the future). Zero or positive = the (iii) fence rejection boundary has been reached. Pre-bootstrap (ceiling=0) is held at 0 by the observer to avoid a spurious ~55-year skew on cold start.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": -0.5
+              },
+              {
+                "color": "red",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "elastickv_hlc_wall_skew_seconds{job=\"elastickv\",node_id=~\"$node_id\"}",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Wall Skew by Node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "$datasource",
+      "description": "rate(NextFenced ErrCeilingExpired) per node over a 5-minute window. Non-zero rate = HLC-4 (iii) fence actively rejecting persistence ts allocations on that node.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "auto"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "$datasource",
+          "editorMode": "code",
+          "expr": "rate(elastickv_hlc_next_fenced_rejections_total{job=\"elastickv\",node_id=~\"$node_id\"}[5m])",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "NextFenced Rejection Rate by Node",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -1075,7 +1362,8 @@
   "tags": [
     "elastickv",
     "raft",
-    "control-plane"
+    "control-plane",
+    "hlc"
   ],
   "templating": {
     "list": [
@@ -1154,5 +1442,5 @@
   "timezone": "browser",
   "title": "Elastickv Raft Status",
   "uid": "elastickv-raft-status",
-  "version": 2
+  "version": 3
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"time"
+
+	"github.com/bootjp/elastickv/internal/monoclock"
 )
 
 // Shared sentinel errors that both engine implementations should wrap
@@ -21,6 +23,20 @@ var (
 	// ErrLeadershipTransferInProgress indicates a leadership transfer
 	// is under way and proposals are being held back.
 	ErrLeadershipTransferInProgress = errors.New("raft engine: leadership transfer in progress")
+	// ErrEnvelopeCutoverInProgress indicates the §7.1 raft-envelope
+	// cutover barrier is open on this leader and rejecting fresh
+	// USER proposals on the Propose path. The error is the step-1
+	// gate-rejection surface for coordinator clients while the
+	// EnableRaftEnvelope handler runs the 6-step barrier sequence
+	// (block intake → drain → propose cutover via ProposeAdmin →
+	// wait apply → flip wrap → unblock). Callers should treat it
+	// as a transient back-off: a healthy cluster spends single-
+	// digit milliseconds inside the barrier. ProposeAdmin is the
+	// design's barrier exemption (admin entries that MUST remain
+	// admissible across the barrier — the cutover marker itself,
+	// ConfChange-time RegisterEncryptionWriter) and never observes
+	// this error.
+	ErrEnvelopeCutoverInProgress = errors.New("raft engine: envelope cutover in progress")
 )
 
 type State string
@@ -71,8 +87,45 @@ type ProposalResult struct {
 	Response    any
 }
 
+// Proposer drives a Raft proposal through the engine and returns
+// once it has been committed (or the context/engine cancels first).
+//
+// Two semantically distinct entry points, differing ONLY in the
+// §7.1 quiescence-barrier check Stage 6E-2d installs on Propose:
+//
+//   - Propose carries ordinary user-data and control-plane traffic
+//     that may be paused during a raft-envelope cutover. 6E-2d will
+//     reject these with ErrEnvelopeCutoverInProgress while the
+//     barrier is open so the leader cannot admit a fresh entry at
+//     `index > raftEnvelopeCutoverIndex` mid-installation.
+//   - ProposeAdmin carries proposals that MUST remain admissible
+//     across the barrier — the EnableRaftEnvelope cutover entry
+//     itself (without this exemption the barrier would deadlock on
+//     its own cutover proposal) and ConfChange-time
+//     RegisterEncryptionWriter proposals (Stage 7c §3.1, so a new
+//     member joining mid-barrier can still register its
+//     writer-registry entry).
+//
+// ProposeAdmin is NOT a wrap-exemption: a payload-wrap layer
+// configured above the engine (kv.wrappedProposer) applies its
+// wrap closure to both methods identically. Admin entries that
+// land at `index > raftEnvelopeCutoverIndex` (a leader-restart
+// registration, a post-cutover RotateDEK, etc.) must carry the
+// AEAD envelope the §6.3 strict-`>` apply hook expects; a cleartext
+// admin entry above cutover would halt the apply loop on
+// unwrap-failure. The lone exception is the EnableRaftEnvelope
+// cutover marker (sits at `index == cutover`, strict-`>` leaves it
+// alone), which is proposed via a raw engine reference and never
+// flows through the wrap layer in the first place.
+//
+// In the current build the two methods are operationally
+// equivalent (the barrier is still 6E-2d work); the distinction at
+// the call site is the migration the future barrier requires —
+// sites still on Propose would fail closed the moment 6E-2d
+// activates the barrier.
 type Proposer interface {
 	Propose(ctx context.Context, data []byte) (*ProposalResult, error)
+	ProposeAdmin(ctx context.Context, data []byte) (*ProposalResult, error)
 }
 
 type LeaderView interface {
@@ -94,31 +147,42 @@ type LeaseProvider interface {
 	LeaseDuration() time.Duration
 	// AppliedIndex returns the highest log index applied to the local FSM.
 	AppliedIndex() uint64
-	// LastQuorumAck returns the instant at which the engine most recently
-	// observed majority liveness on the leader -- i.e. the wall-clock time
-	// by which a quorum of follower Progress entries had responded. The
-	// engine maintains this in the background from MsgHeartbeatResp /
-	// MsgAppResp traffic on the leader, so a fast-path lease read does
-	// not need to issue its own ReadIndex to "warm" the lease.
+	// LastQuorumAck returns the monotonic-raw instant at which the
+	// engine most recently observed majority liveness on the leader
+	// -- i.e. the CLOCK_MONOTONIC_RAW reading at which a quorum of
+	// follower Progress entries had responded. The engine maintains
+	// this in the background from MsgHeartbeatResp / MsgAppResp traffic
+	// on the leader, so a fast-path lease read does not need to issue
+	// its own ReadIndex to "warm" the lease.
 	//
 	// Safety: callers must verify the lease against a single
-	// `now := time.Now()` sample:
+	// `now := monoclock.Now()` sample:
 	//   state == raftengine.StateLeader &&
-	//   !ack.IsZero() && !ack.After(now) && now.Sub(ack) < LeaseDuration()
+	//   !now.IsZero() && !ack.IsZero() && !ack.After(now) &&
+	//   now.Sub(ack) < LeaseDuration()
 	//
-	// The !ack.After(now) guard matters because LastQuorumAck() may be
-	// reconstructed from UnixNano (no monotonic component): a backwards
-	// wall-clock adjustment would otherwise make now.Sub(ack) negative
-	// and pass the duration check against a stale ack. The LeaseDuration
-	// is bounded by electionTimeout - safety_margin, which guarantees
-	// that any new leader candidate cannot yet accept writes during
+	// The !now.IsZero() guard fails closed when the caller's
+	// clock_gettime read errored (e.g. seccomp denies it) and
+	// monoclock.Now() returned the zero Instant; without it, a
+	// persistent clock failure could keep a once-warmed lease valid
+	// forever. See kv.engineLeaseAckValid.
+	//
+	// The monotonic-raw clock (CLOCK_MONOTONIC_RAW on Linux / Darwin;
+	// runtime-monotonic fallback on FreeBSD / Windows / others, see
+	// internal/monoclock) is immune to NTP rate adjustment and
+	// wall-clock step events on the raw-clock platforms, so the
+	// comparison stays safe even if the system's time daemon slews
+	// or steps the wall clock. The !ack.After(now) guard remains as
+	// a defensive fail-closed for a zero / bogus ack reading.
+	// LeaseDuration is bounded by electionTimeout - safety_margin,
+	// guaranteeing no successor leader has accepted writes within
 	// that window.
 	//
-	// Returns the zero time when no quorum has been confirmed yet or
-	// when the local node is not the leader. Single-node LEADERS may
-	// return a recent time.Now() since self is the quorum; non-leader
-	// single-node replicas still return the zero time.
-	LastQuorumAck() time.Time
+	// Returns the zero Instant when no quorum has been confirmed yet
+	// or when the local node is not the leader. Single-node LEADERS
+	// may return a recent monoclock.Now() since self is the quorum;
+	// non-leader single-node replicas still return the zero Instant.
+	LastQuorumAck() monoclock.Instant
 	// RegisterLeaderLossCallback registers fn to be invoked whenever the
 	// local node leaves the leader role (graceful transfer, partition
 	// step-down, or shutdown). Callers use this to invalidate any
@@ -159,9 +223,52 @@ type Admin interface {
 	StatusReader
 	ConfigReader
 	AddVoter(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
+	// AddLearner attaches a non-voting replica that receives MsgApp /
+	// MsgSnap and applies log entries locally but does not contribute
+	// to the voter quorum. Use this instead of AddVoter when joining
+	// a fresh node so the cluster's effective fault tolerance is not
+	// reduced during catch-up. Promote with PromoteLearner once the
+	// learner has caught up. See
+	// docs/design/2026_04_26_proposed_raft_learner.md.
+	AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
+	// PromoteLearner promotes an existing learner to voter. The
+	// minAppliedIndex precondition is enforced against the leader's
+	// Progress[nodeID].Match before the conf change is proposed: if
+	// the learner has not yet caught up to that index, the call
+	// returns FailedPrecondition.
+	//
+	// minAppliedIndex == 0 is REJECTED unless skipMinAppliedCheck is
+	// also true, so an operator running a copy-pasted script that
+	// omits the catch-up check gets a clean FailedPrecondition
+	// instead of a silent quorum stall. Set skipMinAppliedCheck only
+	// when the catch-up has been confirmed out-of-band.
+	PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error)
 	RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error)
 	TransferLeadership(ctx context.Context) error
 	TransferLeadershipToServer(ctx context.Context, id string, address string) error
+	// RegisterLeaderAcquiredCallback registers fn to fire every
+	// time the local node's Raft state transitions INTO leader
+	// (initial election, re-election, transfer target completion).
+	// Callbacks fire on the previous!=Leader → status==Leader edge
+	// AFTER the engine has published isLeader, so a callback that
+	// calls engine.State() observes StateLeader.
+	//
+	// Use case: per-shard policy hooks that need to audit a
+	// freshly-acquired leadership ("am I still allowed to be
+	// leader of this group?"). The SQS HT-FIFO leadership-refusal
+	// hook (§8 of the split-queue FIFO design) hangs off this to
+	// TransferLeadership when the binary lacks the htfifo
+	// capability but a partitioned queue is mapped to this Raft
+	// group.
+	//
+	// Same non-blocking + panic-contained contract as
+	// LeaseProvider.RegisterLeaderLossCallback. A callback that
+	// needs to do real work (enumerate the catalog, call
+	// TransferLeadership) MUST offload to a goroutine.
+	//
+	// The returned function deregisters this specific registration
+	// and is safe to call multiple times.
+	RegisterLeaderAcquiredCallback(fn func()) (deregister func())
 }
 
 type Engine interface {

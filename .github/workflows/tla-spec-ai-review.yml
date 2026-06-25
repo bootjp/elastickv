@@ -1,0 +1,155 @@
+name: TLA+ spec divergence — AI review
+
+# Whenever a PR touches a file that the TLA+ safety specification has an
+# anchor on (per docs/design/2026_05_28_partial_tla_safety_spec.md §3),
+# automatically post a comment that pings the AI reviewers so a focused
+# spec-divergence review always runs.
+#
+# Chain:
+#   anchored files change
+#     -> this workflow fires
+#       -> posts a PR comment containing "@claude review" and "@codex review"
+#         -> claude.yml fires on the `@claude` mention and runs Claude Code
+#         -> the chatgpt-codex-connector bot fires on the `@codex review`
+#            mention and runs a Codex review
+#
+# tla-check.yml (which runs the TLC model check itself) and this workflow
+# share the same path filter, so the two are complementary:
+#   - tla-check: catches *spec* bugs (the spec passes / surfaces the gap)
+#   - this workflow: catches *implementation* bugs that drift from the spec
+#
+# The path filter is the **implementation-anchored subset** of
+# tla-check.yml's paths.  tla/**, Makefile, and the workflow
+# self-references are intentionally omitted: spec-only changes do not
+# need an AI implementation-divergence review (tla-check.yml's TLC run
+# is sufficient).  A change to any anchored file therefore triggers
+# both the TLC run AND the AI review request.
+
+on:
+  # NOTE on trigger types vs tla-check.yml: this workflow includes
+  # `ready_for_review` (draft → ready) because requesting an AI review is
+  # cheap and a draft-to-ready transition is exactly when a human starts
+  # paying attention.  tla-check.yml omits `ready_for_review` because the
+  # TLC run already happened on the prior `opened` or `synchronize`
+  # event — re-running it would be redundant compute.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      # Implementation anchors only — see the file-header comment for
+      # the rationale.  Keep this list in sync with the three other
+      # sync points (see the §7.3 enumeration in the design doc).
+      - 'kv/hlc*.go'
+      - 'kv/coordinator.go'
+      - 'kv/sharded_coordinator.go'
+      - 'kv/transaction.go'
+      - 'kv/fsm.go'
+      - 'kv/lock_resolver.go'
+      - 'store/mvcc_store.go'
+      - 'distribution/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-tla-ai-review
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  request-ai-review:
+    name: Request Claude + Codex spec-divergence review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out (needed for diff)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # No git operations are pushed from this job — the
+          # github-token step below uses ${{ secrets.GITHUB_TOKEN }}
+          # explicitly via the github-script action.  Drop the
+          # persisted credential so a compromised subsequent step
+          # cannot reuse it (zizmor `artipacked`).
+          persist-credentials: false
+
+      - name: List spec-anchored files changed in this PR
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # The set of anchored paths must stay in sync with **four**
+          # places (see §7.3 of the design doc):
+          #   1. the `paths:` filter above (this workflow)
+          #   2. the `paths:` filter in tla-check.yml
+          #   3. this ANCHORS regex
+          #   4. the enumeration in §7.3 of the design doc
+          # Keep all four identical when expanding for M2..M5.
+          ANCHORS='^(kv/hlc[^/]*\.go|kv/coordinator\.go|kv/sharded_coordinator\.go|kv/transaction\.go|kv/fsm\.go|kv/lock_resolver\.go|store/mvcc_store\.go|distribution/.*)$'
+          git diff --name-only "$BASE_SHA...$HEAD_SHA" \
+            | grep -E "$ANCHORS" \
+            > anchored_changed.txt || true
+          echo "count=$(wc -l < anchored_changed.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          echo "Anchored files changed:"
+          cat anchored_changed.txt || true
+
+      - name: Post AI-review request comment
+        if: steps.changed.outputs.count != '0'
+        uses: actions/github-script@v9
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const anchored = fs.readFileSync('anchored_changed.txt', 'utf8')
+              .split('\n').filter(Boolean);
+            const list = anchored.map(f => `- \`${f}\``).join('\n');
+            const marker = '<!-- tla-spec-ai-review-marker -->';
+            const body = [
+              marker,
+              `## TLA+ spec divergence review (auto-triggered)`,
+              ``,
+              `This PR touches files that the TLA+ safety spec has an anchor on (per`,
+              `[\`docs/design/2026_05_28_partial_tla_safety_spec.md\`](../blob/main/docs/design/2026_05_28_partial_tla_safety_spec.md) §3),`,
+              `so an AI review is requested below to verify the implementation has not drifted`,
+              `from the model.`,
+              ``,
+              `**Anchored files changed in this PR head (${process.env.HEAD_SHA.slice(0,10)}):**`,
+              list,
+              ``,
+              `**What to check, by subsystem:**`,
+              ``,
+              `- **\`kv/hlc*.go\`** — \`Next()\` must respect the HLC-4 preconditions (i)/(ii)/(iii) from the design doc: bounded skew, logical-counter handoff on leader change (strategy (c) Observe(MaxAppliedHLC)), and the commit-time ceiling fence (fail-closed when \`wall_now >= physicalCeiling\`). Any change to the bit layout (48/16), the CAS loop, or the ceiling getter/setter is in scope.`,
+              `- **\`kv/coordinator.go\`, \`kv/sharded_coordinator.go\`** — \`RunHLCLeaseRenewal\`, \`hlcRenewalInterval\`, \`hlcPhysicalWindowMs\` constants, and the new-term detection that calls \`Observe(fsm.MaxAppliedHLC())\` (strategy (c)). Any change to renewal cadence, group selection, or fail-closed behaviour is in scope.`,
+              `- **\`kv/transaction.go\`, \`kv/lock_resolver.go\`** — OCC commit-ts assignment, lock-map encoding \`(key, lock_ts) -> start_ts\`, and the LockResolver action OCC-3 depends on. (M2 spec will land OCC-1..OCC-5; until then the spec doc §5.2 is the contract.)`,
+              `- **\`kv/fsm.go\`** — FSM apply of HLC lease entries (\`SetPhysicalCeiling\`), and any future \`MaxAppliedHLC()\` accessor that strategy (c) needs.`,
+              `- **\`store/mvcc_store.go\`** — version visibility, snapshot install, and the MVCC-1..MVCC-4 invariants (M3 scope).`,
+              `- **\`distribution/**\`** — route catalog versioning, \`SplitRange\` atomicity, and \`CatalogWatcher\` async fan-out (M4 scope).`,
+              ``,
+              `If the change is correct but requires a spec update, edit \`tla/hlc/HLC.tla\` (or the corresponding M2..M5 module once landed) and the design doc in the same PR. The \`tla-check\` workflow runs the TLC model check on the same paths.`,
+              ``,
+              `---`,
+              ``,
+              `@claude review please verify TLA+ spec divergence per the checklist above.`,
+              ``,
+              `@codex review please verify TLA+ spec divergence per the checklist above.`,
+            ].join('\n');
+
+            // ALWAYS createComment (not update an existing one).  The
+            // upstream claude.yml workflow listens on `issue_comment` type
+            // `created` only — an edit would not re-trigger Claude on
+            // subsequent pushes.  Codex behaves the same way.  Creating a
+            // fresh comment per anchored-files push is the only reliable
+            // way to guarantee both bots fire on every diff.  Older
+            // marker comments stay in the thread; downstream tooling can
+            // collapse them via the embedded marker string above.
+            const { data } = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body,
+            });
+            core.info(`Created AI-review request comment ${data.id}`);
