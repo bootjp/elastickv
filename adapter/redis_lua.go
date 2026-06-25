@@ -111,7 +111,7 @@ func (r *RedisServer) lookupScript(sha string) (string, bool) {
 func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][]byte) {
 	keys, argv, err := parseRedisEvalArgs(evalArgs)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -185,7 +185,7 @@ func (r *RedisServer) runLuaScript(conn redcon.Conn, script string, evalArgs [][
 			"sha", luaScriptSHA(script),
 			"elapsed", elapsed, "attempts", attempts,
 			"redis_call_count", totalRedisCallCount, "err", err)
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	writeLuaReply(conn, reply)
@@ -854,7 +854,7 @@ func (r *RedisServer) execLuaCompat(conn redcon.Conn, command string, args [][]b
 		return nil
 	})
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	writeLuaReply(conn, reply)
@@ -915,7 +915,7 @@ func (r *RedisServer) execListPop(conn redcon.Conn, cmd redcon.Command, left boo
 
 	values, err := r.listPopClaim(ctx, cmd.Args[1], count, left)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 
@@ -976,7 +976,7 @@ func (r *RedisServer) collectionCardinal(
 	readTS := r.readTS()
 	typ, err := r.keyTypeAt(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if typ == redisTypeNone {
@@ -989,7 +989,7 @@ func (r *RedisServer) collectionCardinal(
 	}
 	count, exists, err := resolveMeta(context.Background(), cmd.Args[1], readTS)
 	if err != nil {
-		conn.WriteError(err.Error())
+		writeRedisError(conn, err)
 		return
 	}
 	if exists {

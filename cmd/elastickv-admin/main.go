@@ -93,6 +93,12 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "encryption" {
+		if err := encryptionMain(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	flag.Parse()
 	if err := run(); err != nil {
 		log.Fatal(err)

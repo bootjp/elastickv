@@ -136,6 +136,29 @@ func TestSQSServer_CatalogCreateIsIdempotent(t *testing.T) {
 	if got, _ := out3["__type"].(string); got != sqsErrQueueNameExists {
 		t.Fatalf("differing-attrs error type: got %q want %q", got, sqsErrQueueNameExists)
 	}
+
+	// Fourth call: same name, same non-throttle attrs as the original
+	// create, but different Throttle* values. The original create had
+	// no Throttle config; this one adds one. throttleConfigEqual must
+	// notice the diff and the call must reject as QueueNameExists.
+	// Without this case a bug in throttleConfigEqual (e.g. always
+	// returning true) would slip past the existing VisibilityTimeout-
+	// only test.
+	withThrottle := map[string]any{
+		"QueueName": "idempotent",
+		"Attributes": map[string]string{
+			"VisibilityTimeout":           "60",
+			"ThrottleSendCapacity":        "10",
+			"ThrottleSendRefillPerSecond": "1",
+		},
+	}
+	status4, out4 := callSQS(t, node, sqsCreateQueueTarget, withThrottle)
+	if status4 != http.StatusBadRequest {
+		t.Fatalf("re-create with added Throttle*: got %d want 400; body %v", status4, out4)
+	}
+	if got, _ := out4["__type"].(string); got != sqsErrQueueNameExists {
+		t.Fatalf("Throttle*-diff error type: got %q want %q", got, sqsErrQueueNameExists)
+	}
 }
 
 func TestSQSServer_CatalogGetAndSetAttributes(t *testing.T) {
@@ -358,41 +381,121 @@ func TestSQSServer_SetQueueAttributesRequiresAttributes(t *testing.T) {
 	}
 }
 
-func TestSQSServer_CreateQueueRejectsRedrivePolicy(t *testing.T) {
+func TestSQSServer_CreateQueueValidatesRedrivePolicy(t *testing.T) {
 	t.Parallel()
-	// Milestone 1 does not enforce DLQ redrive on the receive path, so
-	// accepting RedrivePolicy would silently advertise a feature the
-	// adapter can't deliver — poison messages would redeliver
-	// indefinitely instead of moving to the DLQ. Until the Milestone-2
-	// receive-side DLQ move lands, reject the attribute loudly.
+	// SQS requires the DLQ to exist before a source queue can point
+	// RedrivePolicy at it. maxReceiveCount itself defaults to 10 when
+	// omitted, matching the API reference.
 	nodes, _, _ := createNode(t, 1)
 	defer shutdown(nodes)
 	node := sqsLeaderNode(t, nodes)
 
 	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
-		"QueueName": "with-redrive",
+		"QueueName": "missing-dlq-redrive",
 		"Attributes": map[string]string{
-			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq","maxReceiveCount":"5"}`,
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}`,
 		},
 	})
-	if status != http.StatusNotImplemented {
-		t.Fatalf("CreateQueue with RedrivePolicy: got %d want 501 (%v)", status, out)
-	}
-	if got, _ := out["__type"].(string); got != sqsErrNotImplemented {
-		t.Fatalf("error type: %q want %q", got, sqsErrNotImplemented)
+	if status != http.StatusBadRequest {
+		t.Fatalf("CreateQueue with missing DLQ target: got %d want 400 (%v)", status, out)
 	}
 
-	// SetQueueAttributes rejects the same attribute on an existing
-	// queue.
-	url := createSQSQueueForTest(t, node, "no-redrive")
-	status, out = callSQS(t, node, sqsSetQueueAttributesTarget, map[string]any{
-		"QueueUrl": url,
+	_ = createSQSQueueForTest(t, node, "dlq")
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "wrong-region-redrive",
 		"Attributes": map[string]string{
-			"RedrivePolicy": `{"maxReceiveCount":"3"}`,
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-west-2:000000000000:dlq","maxReceiveCount":5}`,
 		},
 	})
-	if status != http.StatusNotImplemented {
-		t.Fatalf("SetQueueAttributes with RedrivePolicy: got %d want 501 (%v)", status, out)
+	if status != http.StatusBadRequest {
+		t.Fatalf("CreateQueue with wrong-region DLQ ARN: got %d want 400 (%v)", status, out)
+	}
+	policy := `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq"}`
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "with-redrive",
+		"Attributes": map[string]string{
+			"RedrivePolicy": policy,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("CreateQueue with valid RedrivePolicy: got %d (%v)", status, out)
+	}
+	url, _ := out["QueueUrl"].(string)
+	_, out = callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       url,
+		"AttributeNames": []string{"RedrivePolicy"},
+	})
+	attrs, _ := out["Attributes"].(map[string]any)
+	if attrs["RedrivePolicy"] != policy {
+		t.Fatalf("RedrivePolicy not echoed back: %v", attrs)
+	}
+}
+
+func TestSQSServer_RedriveAllowPolicyControlsSourceQueues(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	denyAll := `{"redrivePermission":"denyAll"}`
+	status, out := callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "dlq-deny-all",
+		"Attributes": map[string]string{
+			"RedriveAllowPolicy": denyAll,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create deny-all DLQ: %d %v", status, out)
+	}
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "deny-all-source",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-deny-all","maxReceiveCount":1}`,
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("source should not attach to denyAll DLQ: got %d want 400 (%v)", status, out)
+	}
+
+	byQueue := `{"redrivePermission":"byQueue","sourceQueueArns":["arn:aws:sqs:us-east-1:000000000000:allowed-source"]}`
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "dlq-by-queue",
+		"Attributes": map[string]string{
+			"RedriveAllowPolicy": byQueue,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("create byQueue DLQ: %d %v", status, out)
+	}
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "rejected-source",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-by-queue","maxReceiveCount":1}`,
+		},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("unlisted source should not attach to byQueue DLQ: got %d want 400 (%v)", status, out)
+	}
+	status, out = callSQS(t, node, sqsCreateQueueTarget, map[string]any{
+		"QueueName": "allowed-source",
+		"Attributes": map[string]string{
+			"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq-by-queue","maxReceiveCount":1}`,
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("listed source should attach to byQueue DLQ: got %d (%v)", status, out)
+	}
+	url, _ := out["QueueUrl"].(string)
+	if url == "" {
+		t.Fatalf("allowed source create returned empty QueueUrl: %v", out)
+	}
+	_, out = callSQS(t, node, sqsGetQueueAttributesTarget, map[string]any{
+		"QueueUrl":       "http://example.invalid/dlq-by-queue",
+		"AttributeNames": []string{"RedriveAllowPolicy"},
+	})
+	attrs, _ := out["Attributes"].(map[string]any)
+	if attrs["RedriveAllowPolicy"] != byQueue {
+		t.Fatalf("RedriveAllowPolicy not echoed back: %v", attrs)
 	}
 }
 

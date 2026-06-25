@@ -15,7 +15,7 @@ const (
 )
 
 // Config captures everything the admin listener needs at startup. It mirrors
-// the Section 7.1 table in docs/design/2026_04_24_proposed_admin_dashboard.md
+// the Section 7.1 table in docs/design/2026_04_24_implemented_admin_dashboard.md
 // and intentionally uses plain Go fields rather than a config library so the
 // existing flag-based wiring in main.go can hand values over without a new
 // dependency.

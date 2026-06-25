@@ -1,0 +1,21 @@
+# Host-only artefacts that must not leak into the build context.
+#
+# web/admin/node_modules: the SPA build stage runs `npm ci` to install
+# Linux-correct deps; if a developer ran `npm install` locally
+# (macOS/Windows), the host node_modules would otherwise overwrite the
+# in-container deps when web/admin/ is COPY'd, silently mixing host
+# binaries (Rollup native extensions etc.) into the Linux image.
+web/admin/node_modules
+
+# Build output: regenerated inside the SPA stage; including it would
+# bloat the build context with stale assets.
+web/admin/dist
+
+# Go test caches / local build artefacts.
+.cache
+.golangci-cache
+
+# Local control-plane artefacts that have no business in any image.
+.claude
+.git
+**/.DS_Store

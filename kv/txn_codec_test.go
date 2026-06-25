@@ -75,6 +75,40 @@ func TestDecodeTxnMetaV1Compatibility(t *testing.T) {
 	require.Equal(t, meta, decoded)
 }
 
+func TestEncodeTxnMetaEmitsV2OnlyWhenPrevCommitTSSet(t *testing.T) {
+	t.Parallel()
+
+	// Without PrevCommitTS, even with a CommitTS set, the default wire format
+	// stays V1 — preserving rolling-upgrade safety for every non-retry caller.
+	v1 := EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("pk"), CommitTS: 42})
+	require.Equal(t, txnMetaVersionV1, v1[0])
+
+	// With PrevCommitTS, EncodeTxnMeta upgrades to V2 so the field can ride.
+	v2 := EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("pk"), CommitTS: 42, PrevCommitTS: 41})
+	require.Equal(t, txnMetaVersionV2, v2[0])
+	require.Equal(t, txnMetaFlagCommitTS|txnMetaFlagPrevCommitTS, v2[1])
+}
+
+func TestTxnMetaPrevCommitTSRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	meta := TxnMeta{
+		PrimaryKey:   []byte("primary"),
+		LockTTLms:    7,
+		CommitTS:     200,
+		PrevCommitTS: 100,
+	}
+	decoded, err := DecodeTxnMeta(EncodeTxnMeta(meta))
+	require.NoError(t, err)
+	require.Equal(t, meta, decoded)
+
+	// PrevCommitTS alone (no lock TTL, no commit TS) must also survive.
+	prevOnly := TxnMeta{PrimaryKey: []byte("pk"), PrevCommitTS: 99}
+	decodedPrev, err := DecodeTxnMeta(EncodeTxnMeta(prevOnly))
+	require.NoError(t, err)
+	require.Equal(t, prevOnly, decodedPrev)
+}
+
 func TestDecodeTxnMetaV2RejectsUnknownFlags(t *testing.T) {
 	t.Parallel()
 

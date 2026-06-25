@@ -49,7 +49,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		}, errors.WithStack(err)
 	}
 
-	r, err := i.transactionManager.Commit(req.Requests)
+	r, err := i.transactionManager.Commit(ctx, req.Requests)
 	if err != nil {
 		return &pb.ForwardResponse{
 			Success:     false,
@@ -80,11 +80,10 @@ func (i *Internal) stampTimestamps(req *pb.ForwardRequest) error {
 		return i.stampTxnTimestamps(req.Requests)
 	}
 
-	i.stampRawTimestamps(req.Requests)
-	return nil
+	return i.stampRawTimestamps(req.Requests)
 }
 
-func (i *Internal) stampRawTimestamps(reqs []*pb.Request) {
+func (i *Internal) stampRawTimestamps(reqs []*pb.Request) error {
 	for _, r := range reqs {
 		if r == nil {
 			continue
@@ -96,8 +95,13 @@ func (i *Internal) stampRawTimestamps(reqs []*pb.Request) {
 			r.Ts = 1
 			continue
 		}
-		r.Ts = i.clock.Next()
+		ts, err := i.clock.NextFenced()
+		if err != nil {
+			return errors.Wrap(err, "stampRawTimestamps")
+		}
+		r.Ts = ts
 	}
+	return nil
 }
 
 func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) error {
@@ -106,7 +110,11 @@ func (i *Internal) stampTxnTimestamps(reqs []*pb.Request) error {
 		if i.clock == nil {
 			startTS = 1
 		} else {
-			startTS = i.clock.Next()
+			ts, err := i.clock.NextFenced()
+			if err != nil {
+				return errors.Wrap(err, "stampTxnTimestamps startTS")
+			}
+			startTS = ts
 		}
 	}
 	if startTS == ^uint64(0) {
@@ -174,18 +182,9 @@ func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) 
 		return nil
 	}
 
-	commitTS := startTS + 1
-	if commitTS == 0 {
-		// Overflow: can't choose a commit timestamp strictly greater than startTS.
-		return errors.WithStack(ErrTxnTimestampOverflow)
-	}
-	if i.clock != nil {
-		i.clock.Observe(startTS)
-		commitTS = i.clock.Next()
-	}
-	if commitTS <= startTS {
-		// Defensive: avoid writing an invalid CommitTS.
-		return errors.WithStack(ErrTxnTimestampOverflow)
+	commitTS, err := i.forwardedTxnCommitTS(startTS)
+	if err != nil {
+		return err
 	}
 
 	for _, item := range metaMutations {
@@ -193,4 +192,28 @@ func (i *Internal) fillForwardedTxnCommitTS(reqs []*pb.Request, startTS uint64) 
 		item.m.Value = kv.EncodeTxnMeta(item.meta)
 	}
 	return nil
+}
+
+// forwardedTxnCommitTS allocates a commit timestamp for a forwarded
+// transaction, strictly greater than startTS. Pulled out of
+// fillForwardedTxnCommitTS so that function stays under cyclop.
+func (i *Internal) forwardedTxnCommitTS(startTS uint64) (uint64, error) {
+	commitTS := startTS + 1
+	if commitTS == 0 {
+		// Overflow: can't choose a commit timestamp strictly greater than startTS.
+		return 0, errors.WithStack(ErrTxnTimestampOverflow)
+	}
+	if i.clock != nil {
+		i.clock.Observe(startTS)
+		ts, err := i.clock.NextFenced()
+		if err != nil {
+			return 0, errors.Wrap(err, "fillForwardedTxnCommitTS")
+		}
+		commitTS = ts
+	}
+	if commitTS <= startTS {
+		// Defensive: avoid writing an invalid CommitTS.
+		return 0, errors.WithStack(ErrTxnTimestampOverflow)
+	}
+	return commitTS, nil
 }

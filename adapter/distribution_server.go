@@ -139,7 +139,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.verifyCatalogLeader(); err != nil {
+	if err := s.verifyCatalogLeader(ctx); err != nil {
 		return nil, err
 	}
 
@@ -191,7 +191,7 @@ func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	return s.readTracker.Pin(ts)
 }
 
-func (s *DistributionServer) verifyCatalogLeader() error {
+func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {
 	if s.coordinator == nil {
 		return grpcStatusError(codes.FailedPrecondition, errDistributionCoordinatorRequired.Error())
 	}
@@ -199,7 +199,7 @@ func (s *DistributionServer) verifyCatalogLeader() error {
 	if !s.coordinator.IsLeaderForKey(key) {
 		return grpcStatusError(codes.FailedPrecondition, errDistributionNotLeader.Error())
 	}
-	if err := s.coordinator.VerifyLeaderForKey(key); err != nil {
+	if err := s.coordinator.VerifyLeaderForKey(ctx, key); err != nil {
 		return grpcStatusErrorf(codes.FailedPrecondition, "verify catalog leader: %v", err)
 	}
 	return nil

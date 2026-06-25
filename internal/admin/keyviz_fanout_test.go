@@ -1,0 +1,880 @@
+package admin
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/goccy/go-json"
+	"github.com/stretchr/testify/require"
+)
+
+// TestMergeKeyVizMatricesReadsSum pins the §4.1 rule: read counters
+// from distinct nodes are independent local serves and add. The
+// merged matrix has one column entry per timestamp seen anywhere
+// and the row's Values for that column equal the sum of all node
+// inputs at that column.
+func TestMergeKeyVizMatricesReadsSum(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{10}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{25}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesReads)
+	require.Equal(t, []int64{1_700_000_000_000}, merged.ColumnUnixMs)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{35}, merged.Rows[0].Values)
+	require.False(t, merged.Rows[0].Conflict, "reads must never raise conflict")
+}
+
+// TestMergeKeyVizMatricesWritesMaxStableLeader pins the §4.2 happy
+// path: under stable leadership exactly one node reports non-zero
+// writes. The merge picks the non-zero value without raising
+// conflict.
+func TestMergeKeyVizMatricesWritesMaxStableLeader(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	leader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:7", Values: []uint64{42, 17}},
+		},
+	}
+	follower := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:7", Values: []uint64{0, 0}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{follower, leader}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{42, 17}, merged.Rows[0].Values)
+	require.False(t, merged.Rows[0].Conflict, "stable-leader merge must not raise conflict")
+}
+
+// TestMergeKeyVizMatricesPreservesRaftIdentity pins the Phase 2-C+
+// per-cell wire extension on the fan-out merge path: mergeRowInto
+// stamps the destination row's per-cell (RaftGroupIDs[idx],
+// LeaderTerms[idx]) from whichever source contributed the value
+// kept at that cell. Both sources reporting the same identity
+// for a writes-max merge is the steady-state shape — merged
+// identity matches regardless of source order. (Gemini HIGH on
+// PR #720 resolved by going per-cell; row-level scalars would
+// only capture the first column's identity and break the per-cell
+// dedupe goal.)
+func TestMergeKeyVizMatricesPreservesRaftIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{0}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{7}, merged.Rows[0].RaftGroupIDs, "RaftGroupIDs must survive mergeRowInto")
+	require.Equal(t, []uint64{42}, merged.Rows[0].LeaderTerms, "LeaderTerms must survive mergeRowInto")
+}
+
+// TestMergeKeyVizMatricesLegacyPeerWinnerResetsIdentity pins the
+// fail-closed semantic for mixed-version clusters (Codex P2
+// round-2): when a legacy peer that does not emit raft_group_ids /
+// leader_terms (empty slices) wins a cell, dst.RaftGroupIDs[idx]
+// and dst.LeaderTerms[idx] must be RESET to 0 (the documented
+// "term not tracked" sentinel) — leaving stale identity from a
+// previous higher-versioned source would mislabel an unknown-term
+// winning cell as a known term and break the per-cell
+// dedupe/summing in PR-3c.
+func TestMergeKeyVizMatricesLegacyPeerWinnerResetsIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	// Source 1 (modern): reports 30 with identity (group=7, term=42).
+	modern := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	// Source 2 (legacy): reports 50 with NO arrays (older server
+	// build). Wins maxMerge but cannot identify its term.
+	legacy := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{50}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{modern, legacy}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50}, merged.Rows[0].Values, "legacy peer's value wins maxMerge")
+	require.Equal(t, []uint64{0}, merged.Rows[0].RaftGroupIDs,
+		"legacy winner without metadata must reset dst identity to 0 sentinel — not inherit modern's 7")
+	require.Equal(t, []uint64{0}, merged.Rows[0].LeaderTerms,
+		"legacy winner without metadata must reset dst term to 0 sentinel — not inherit modern's 42")
+}
+
+// TestMergeKeyVizMatricesGroupTermSumAcrossTerms pins the Phase 2-C+
+// PR-3c canonical §9.1 algorithm: when two sources report non-zero
+// writes for the SAME (bucket, column) but DIFFERENT terms within
+// the same group, the merged cell SUMS the two values (each leader
+// only observes its own term's writes). Compare to PR-3b's §4.2
+// max-merge, which would have returned 50 and lost the ex-leader's
+// pre-transfer 30 → an undercount of the true window total.
+func TestMergeKeyVizMatricesGroupTermSumAcrossTerms(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	exLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	newLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{43}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{exLeader, newLeader}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{80}, merged.Rows[0].Values,
+		"§9.1: distinct (group, term) entries for the same cell must SUM, not max — ex-leader's 30 + new-leader's 50 = 80, recovering the pre-transfer slice the §4.2 max-merge would have lost")
+	require.False(t, merged.Rows[0].Conflict,
+		"distinct (group, term) entries are not a conflict — each leader is reporting its own term's writes")
+	// Identity: the larger term's value wins the per-cell identity slot.
+	require.Equal(t, []uint64{7}, merged.Rows[0].RaftGroupIDs)
+	require.Equal(t, []uint64{43}, merged.Rows[0].LeaderTerms, "new-leader (term=43, value=50) wins the identity slot because 50 > 30")
+}
+
+// TestMergeKeyVizMatricesGroupTermConflictWithinSameTerm pins the
+// §9.1 conflict predicate: two sources reporting DIFFERENT non-zero
+// values for the SAME (bucket, group, term, column) tuple is a Raft
+// invariant violation (at most one leader per term per group). The
+// merger keeps the larger value AND surfaces conflict=true.
+func TestMergeKeyVizMatricesGroupTermConflictWithinSameTerm(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{55}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{55}, merged.Rows[0].Values, "within-term disagreement keeps the larger value")
+	require.True(t, merged.Rows[0].Conflict,
+		"§9.1: within-(group, term) disagreement must raise the conflict flag — Raft invariant says one leader per term per group, so disagreement signals a real divergence operators need to see")
+	require.Equal(t, []bool{true}, merged.Rows[0].Conflicts,
+		"the per-cell slice must flag the single conflicting column, not just the row-level OR")
+}
+
+// TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm pins the
+// fail-closed fallback to §4.2 max-merge when ANY source contributes
+// an unknown identity (group=0 or term=0). A modern source reporting
+// 30 with (group=7, term=42) and a legacy source reporting 50 with
+// no metadata must NOT sum to 80 — the legacy source's term might
+// overlap with the modern source's term, so summing would
+// over-count. The fallback returns max=50.
+func TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	modern := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	legacy := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50}}, // no arrays — pre-PR-3b peer
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{modern, legacy}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50}, merged.Rows[0].Values,
+		"unknown-term fallback returns max-merge (50), not sum (80) — summing across an unknown term risks double-counting overlapping windows")
+	require.True(t, merged.Rows[0].Conflict, "fallback path raises conflict when ≥2 distinct non-zero values were seen")
+	require.Equal(t, []bool{true}, merged.Rows[0].Conflicts,
+		"the per-cell slice must flag the conflicting column under the fallback path too")
+}
+
+// TestMergeKeyVizMatricesFallbackPreservesKnownTermWinnerIdentity
+// pins the Gemini HIGH / Codex P2 fix on PR #822: when the
+// fallback path is triggered by an unknown-term contribution but
+// the KNOWN-term source supplies the winning max value, the
+// merged identity must reflect that known-term contributor —
+// NOT fall back to (0, 0). Mirror image of
+// TestMergeKeyVizMatricesGroupTermFallbackOnUnknownTerm where the
+// legacy peer wins; this test pins the case the prior PR-3c diff
+// regressed (identity was always 0 under fallback regardless of
+// who won).
+func TestMergeKeyVizMatricesFallbackPreservesKnownTermWinnerIdentity(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	// Modern source wins with 100.
+	modern := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{100}, RaftGroupIDs: []uint64{7}, LeaderTerms: []uint64{42}},
+		},
+	}
+	// Legacy peer reports 50 with no arrays — triggers fallback but
+	// loses the max.
+	legacy := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{modern, legacy}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{100}, merged.Rows[0].Values, "fallback max-merge keeps the larger value")
+	require.Equal(t, []uint64{7}, merged.Rows[0].RaftGroupIDs,
+		"identity must reflect the known-term contributor that supplied the winning max — not (0, 0)")
+	require.Equal(t, []uint64{42}, merged.Rows[0].LeaderTerms,
+		"same: known-term contributor's term wins because its value won the fallback max")
+	require.True(t, merged.Rows[0].Conflict, "100 != 50 disagreement raises the conflict flag under fallback")
+}
+
+// TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner pins the
+// Gemini MEDIUM fix: when maxMerge picks a value from one source,
+// the identity at that cell must come from the SAME source — not
+// from whoever happened to be processed first. Drives a leadership
+// flip across two consecutive columns with each leader winning
+// one cell.
+func TestMergeKeyVizMatricesPerCellIdentityMatchesValueOwner(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	exLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{50, 0}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	newLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{0, 80}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{43, 43}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{exLeader, newLeader}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{50, 80}, merged.Rows[0].Values, "writes max-merge picks the larger per cell")
+	require.Equal(t, []uint64{7, 7}, merged.Rows[0].RaftGroupIDs, "groupID stays 7 across both cells")
+	require.Equal(t, []uint64{42, 43}, merged.Rows[0].LeaderTerms,
+		"col0's identity comes from exLeader (term 42, won 50 vs 0); col1's identity comes from newLeader (term 43, won 80 vs 0)")
+}
+
+// TestMergeKeyVizMatricesPerCellConflictMarksOnlyAffectedColumn pins
+// PR-3d: per-cell Conflicts[] must flag ONLY the column that saw a
+// within-term disagreement, not the whole row. col0 disagrees
+// (30 vs 55 for the same group/term), col1 agrees (10 == 10), so
+// Conflicts must be [true, false] while the row-level OR Conflict
+// stays true for older clients.
+func TestMergeKeyVizMatricesPerCellConflictMarksOnlyAffectedColumn(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30, 10}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{55, 10}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{55, 10}, merged.Rows[0].Values, "within-term disagreement keeps the larger value per cell")
+	require.Equal(t, []bool{true, false}, merged.Rows[0].Conflicts,
+		"only col0 disagreed (30 vs 55); col1 agreed (10 == 10) so it must not be hatched")
+	require.True(t, merged.Rows[0].Conflict,
+		"row-level Conflict stays the OR of Conflicts[] so an older SPA still hatches the row")
+}
+
+// TestMergeKeyVizMatricesWritesWithoutConflictLeaveConflictsNil pins
+// the lazy-allocation contract: a write merge with no within-term
+// disagreement (stable leader, one source non-zero) must leave
+// Conflicts nil so json:"conflicts,omitempty" omits it. Allocating a
+// full [false,...] array per clean row would balloon the wire payload.
+func TestMergeKeyVizMatricesWritesWithoutConflictLeaveConflictsNil(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000, 1_700_000_001_000}
+	leader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30, 40}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	follower := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{0, 0}, RaftGroupIDs: []uint64{7, 7}, LeaderTerms: []uint64{42, 42}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{leader, follower}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{30, 40}, merged.Rows[0].Values)
+	require.Nil(t, merged.Rows[0].Conflicts, "a cleanly merged write row must leave Conflicts nil for omitempty")
+	require.False(t, merged.Rows[0].Conflict)
+}
+
+// TestMergeKeyVizMatricesReadsLeaveConflictsNil pins that the read
+// merge path never allocates Conflicts — reads are independent local
+// serves that sum and can never conflict, so the per-cell slice stays
+// nil and is omitted from the wire.
+func TestMergeKeyVizMatricesReadsLeaveConflictsNil(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	a := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesReads,
+		Rows:         []KeyVizRow{{BucketID: "route:1", Values: []uint64{10}}},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesReads,
+		Rows:         []KeyVizRow{{BucketID: "route:1", Values: []uint64{25}}},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesReads)
+	require.Len(t, merged.Rows, 1)
+	require.Nil(t, merged.Rows[0].Conflicts, "reads never conflict — Conflicts stays nil")
+	require.False(t, merged.Rows[0].Conflict)
+}
+
+// TestMergeKeyVizMatricesWritesMaxLeadershipFlip pins §4.2 under a
+// mid-window flip: two nodes report non-zero, disagreeing values
+// for the same cell. The merge keeps the larger value and raises
+// the row-level conflict flag so the SPA can hatch the row.
+func TestMergeKeyVizMatricesWritesMaxLeadershipFlip(t *testing.T) {
+	t.Parallel()
+	col := []int64{1_700_000_000_000}
+	exLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{30}},
+		},
+	}
+	newLeader := KeyVizMatrix{
+		ColumnUnixMs: col,
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{55}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{exLeader, newLeader}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{55}, merged.Rows[0].Values, "max-merge must keep the larger value")
+	require.True(t, merged.Rows[0].Conflict, "leadership flip must raise the row conflict flag")
+}
+
+// TestMergeKeyVizMatricesUnionColumns pins the §4.5 rule: a column
+// present in only some nodes still gets a slot in the merged matrix;
+// missing values fill in as zero.
+func TestMergeKeyVizMatricesUnionColumns(t *testing.T) {
+	t.Parallel()
+	a := KeyVizMatrix{
+		ColumnUnixMs: []int64{100, 200},
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{1, 2}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: []int64{200, 300},
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{10, 20}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesReads)
+	require.Equal(t, []int64{100, 200, 300}, merged.ColumnUnixMs)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, []uint64{1, 12, 20}, merged.Rows[0].Values,
+		"missing columns must read as zero on the side that does not have them")
+}
+
+// TestMergeKeyVizMatricesDistinctRowsPreserveOrder pins the §4.4
+// row-identity rule: rows with distinct BucketIDs land in the
+// merged matrix in first-seen-order, preserving the per-node row
+// order so a single-node fan-out is byte-identical to the local
+// matrix.
+func TestMergeKeyVizMatricesDistinctRowsPreserveOrder(t *testing.T) {
+	t.Parallel()
+	a := KeyVizMatrix{
+		ColumnUnixMs: []int64{100},
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:5", Values: []uint64{1}},
+			{BucketID: "route:1", Values: []uint64{2}},
+		},
+	}
+	b := KeyVizMatrix{
+		ColumnUnixMs: []int64{100},
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:9", Values: []uint64{4}},
+			{BucketID: "route:5", Values: []uint64{8}},
+		},
+	}
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{a, b}, keyVizSeriesReads)
+	require.Len(t, merged.Rows, 3)
+	require.Equal(t, "route:5", merged.Rows[0].BucketID)
+	require.Equal(t, "route:1", merged.Rows[1].BucketID)
+	require.Equal(t, "route:9", merged.Rows[2].BucketID)
+}
+
+// TestKeyVizFanoutRunForwardsCookies pins the auth bug fix that
+// brought all peers up from 401 to 200: the inbound user's session
+// cookies are forwarded on every peer request so the receiving
+// node's SessionAuth middleware sees a valid principal. Without
+// this, peers reject every fan-out call with 401 missing-session-
+// cookie and the cluster heatmap collapses to "1 of N nodes
+// responded".
+//
+// Pins both halves of the cookie contract:
+//   - admin_session and admin_csrf are forwarded with their values
+//     verbatim.
+//   - Unrelated cookies present on the inbound request are
+//     **dropped** rather than leaked to peer nodes (Gemini
+//     security-medium on PR #692).
+//   - The peer call carries the X-Admin-Fanout-Peer header so the
+//     receiving handler can short-circuit its own fan-out (Claude
+//     bot P1 on PR #692; the receiving check is in
+//     KeyVizHandler.ServeHTTP and is exercised by
+//     TestKeyVizHandlerSkipsFanoutForPeerCall in
+//     keyviz_handler_test.go).
+func TestKeyVizFanoutRunForwardsCookies(t *testing.T) {
+	t.Parallel()
+	var seenRequests []*http.Request
+	var seenMu sync.Mutex
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/admin/api/v1/keyviz/matrix") {
+			http.NotFound(w, r)
+			return
+		}
+		seenMu.Lock()
+		seenRequests = append(seenRequests, r.Clone(context.Background()))
+		seenMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(KeyVizMatrix{Series: keyVizSeriesReads})
+	}))
+	defer peer.Close()
+
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).WithHTTPClient(peer.Client())
+	cookies := []*http.Cookie{
+		{Name: "admin_session", Value: "session-token-abc"},
+		{Name: "admin_csrf", Value: "csrf-token-def"},
+		{Name: "unrelated_app_session", Value: "should-not-leak"},
+	}
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads}, cookies)
+	require.NotNil(t, merged.Fanout, "fan-out result must be present")
+	require.Len(t, merged.Fanout.Nodes, 2, "self + 1 peer = 2 nodes (Claude bot P2 on PR #692)")
+	require.True(t, merged.Fanout.Nodes[1].OK)
+
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	require.Len(t, seenRequests, 1)
+	got := seenRequests[0].Cookies()
+	names := make(map[string]string, len(got))
+	for _, c := range got {
+		names[c.Name] = c.Value
+	}
+	require.Equal(t, "session-token-abc", names["admin_session"], "session cookie must be forwarded verbatim")
+	require.Equal(t, "csrf-token-def", names["admin_csrf"], "csrf cookie forwarded; harmless on a GET but kept for parity")
+	require.NotContains(t, names, "unrelated_app_session",
+		"unrelated cookies must be dropped; only admin_session/admin_csrf are whitelisted")
+	require.Equal(t, "1", seenRequests[0].Header.Get(keyVizFanoutPeerHeader),
+		"peer marker header must be set so the receiver short-circuits its own fan-out")
+}
+
+// TestKeyVizFanoutRunSinglePeerOK exercises the end-to-end happy
+// path: one peer responds with a parseable matrix; the aggregator
+// merges it with the local view and reports both nodes ok.
+func TestKeyVizFanoutRunSinglePeerOK(t *testing.T) {
+	t.Parallel()
+	peerMatrix := KeyVizMatrix{
+		ColumnUnixMs: []int64{1_700_000_000_000},
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{7}},
+		},
+	}
+	peer := newKeyVizPeerStub(t, peerMatrix)
+	defer peer.Close()
+
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).WithHTTPClient(peer.Client())
+	local := KeyVizMatrix{
+		ColumnUnixMs: []int64{1_700_000_000_000},
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{3}},
+		},
+	}
+
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, local, nil)
+	require.Equal(t, []uint64{10}, merged.Rows[0].Values, "reads must sum across local + peer")
+	require.NotNil(t, merged.Fanout)
+	require.Equal(t, 2, merged.Fanout.Expected)
+	require.Equal(t, 2, merged.Fanout.Responded)
+	require.Len(t, merged.Fanout.Nodes, 2)
+	require.Equal(t, "self:8080", merged.Fanout.Nodes[0].Node)
+	require.True(t, merged.Fanout.Nodes[0].OK)
+	require.Equal(t, peer.URL, merged.Fanout.Nodes[1].Node)
+	require.True(t, merged.Fanout.Nodes[1].OK)
+}
+
+// TestKeyVizFanoutRunPeerHTTPError pins the §2.1 degraded-mode
+// contract: a peer that returns 5xx contributes ok=false with the
+// status surfaced; the local matrix still ships and Responded
+// reflects the partial success.
+func TestKeyVizFanoutRunPeerHTTPError(t *testing.T) {
+	t.Parallel()
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "boom")
+	}))
+	defer peer.Close()
+
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).WithHTTPClient(peer.Client())
+	local := KeyVizMatrix{
+		ColumnUnixMs: []int64{1_700_000_000_000},
+		Series:       keyVizSeriesReads,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{3}},
+		},
+	}
+
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, local, nil)
+	require.Equal(t, []uint64{3}, merged.Rows[0].Values, "5xx peer must not perturb local counts")
+	require.NotNil(t, merged.Fanout)
+	require.Equal(t, 2, merged.Fanout.Expected)
+	require.Equal(t, 1, merged.Fanout.Responded)
+	require.False(t, merged.Fanout.Nodes[1].OK)
+	require.Contains(t, merged.Fanout.Nodes[1].Error, "500")
+}
+
+// TestKeyVizFanoutRunPeerTimeout pins the design 9 timeout: a
+// peer that hangs past the per-call ceiling contributes ok=false
+// and the request still completes promptly.
+func TestKeyVizFanoutRunPeerTimeout(t *testing.T) {
+	t.Parallel()
+	hang := make(chan struct{})
+	peer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-hang:
+		}
+	}))
+	defer peer.Close()
+	defer close(hang)
+
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithTimeout(50 * time.Millisecond)
+
+	start := time.Now()
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads}, nil)
+	require.Less(t, time.Since(start), 1*time.Second, "fan-out must not wait beyond its per-peer timeout")
+	require.NotNil(t, merged.Fanout)
+	require.Equal(t, 1, merged.Fanout.Responded)
+	require.False(t, merged.Fanout.Nodes[1].OK)
+}
+
+// TestKeyVizFanoutRunNoPeers exercises the single-node fallback:
+// when peers is empty, Run returns the local matrix with a Fanout
+// block reporting Expected=1, Responded=1.
+func TestKeyVizFanoutRunNoPeers(t *testing.T) {
+	t.Parallel()
+	f := NewKeyVizFanout("self:8080", nil)
+	local := KeyVizMatrix{
+		ColumnUnixMs: []int64{1_700_000_000_000},
+		Series:       keyVizSeriesWrites,
+		Rows: []KeyVizRow{
+			{BucketID: "route:1", Values: []uint64{99}},
+		},
+	}
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesWrites, rows: 1024}, local, nil)
+	require.Equal(t, []uint64{99}, merged.Rows[0].Values)
+	require.Equal(t, 1, merged.Fanout.Expected)
+	require.Equal(t, 1, merged.Fanout.Responded)
+	require.Equal(t, "self:8080", merged.Fanout.Nodes[0].Node)
+}
+
+// TestBuildKeyVizPeerURLForwardsParams pins the §6 contract that
+// the per-peer URL is rebuilt from the parsed parameters, so the
+// peer always gets a deterministic query string regardless of the
+// upstream client's encoding quirks.
+func TestBuildKeyVizPeerURLForwardsParams(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		peer   string
+		params keyVizParams
+		want   string
+	}{
+		{
+			name:   "with scheme",
+			peer:   "http://10.0.0.2:8080",
+			params: keyVizParams{series: keyVizSeriesWrites, rows: 256},
+			want:   "http://10.0.0.2:8080/admin/api/v1/keyviz/matrix?rows=256&series=writes",
+		},
+		{
+			name:   "host only (no scheme)",
+			peer:   "10.0.0.2:8080",
+			params: keyVizParams{series: keyVizSeriesReads, rows: 1024},
+			want:   "http://10.0.0.2:8080/admin/api/v1/keyviz/matrix?rows=1024&series=reads",
+		},
+		{
+			name: "with time bounds",
+			peer: "http://node-a",
+			params: keyVizParams{
+				series: keyVizSeriesReads,
+				rows:   8,
+				from:   time.UnixMilli(1_700_000_000_000),
+				to:     time.UnixMilli(1_700_000_900_000),
+			},
+			want: "http://node-a/admin/api/v1/keyviz/matrix?from_unix_ms=1700000000000&rows=8&series=reads&to_unix_ms=1700000900000",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := buildKeyVizPeerURL(tc.peer, tc.params)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestKeyVizFanoutRunPeerOrder pins that the per-node status array
+// follows the operator-supplied peer order. Self is always first.
+func TestKeyVizFanoutRunPeerOrder(t *testing.T) {
+	t.Parallel()
+	matrix := KeyVizMatrix{Series: keyVizSeriesReads}
+	first := newKeyVizPeerStub(t, matrix)
+	defer first.Close()
+	second := newKeyVizPeerStub(t, matrix)
+	defer second.Close()
+
+	f := NewKeyVizFanout("self:8080", []string{first.URL, second.URL}).WithHTTPClient(first.Client())
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, matrix, nil)
+	require.Equal(t, []FanoutNodeStatus{
+		{Node: "self:8080", OK: true},
+		{Node: first.URL, OK: true},
+		{Node: second.URL, OK: true},
+	}, merged.Fanout.Nodes)
+}
+
+// TestKeyVizFanoutRunPeerExceedsBodyLimit pins the over-cap path
+// (Claude bot round-2 on PR #686). Lowering the per-peer limit to a
+// small test value lets us drive the path without serving 64 MiB.
+// The peer streams a body deliberately larger than the cap; the
+// aggregator's countingReader must:
+//   - Bound how many bytes are pulled off the wire (the LimitReader
+//     enforces the security property).
+//   - Detect the overshoot reliably even when the json.Decoder
+//     buffers the trailing bytes internally.
+//
+// What we assert: the call returns within the test timeout (no hang),
+// the per-node status surfaces, and the response carries the
+// expected number of node entries. The warning log is best-effort
+// and not asserted directly — the reliability of the byte-counting
+// is the load-bearing invariant.
+func TestKeyVizFanoutRunPeerExceedsBodyLimit(t *testing.T) {
+	t.Parallel()
+	bigRow := KeyVizRow{
+		BucketID: "route:overshoot",
+		Values:   []uint64{1, 2, 3, 4},
+	}
+	rows := make([]KeyVizRow, 256)
+	for i := range rows {
+		rows[i] = bigRow
+	}
+	body := KeyVizMatrix{
+		ColumnUnixMs: []int64{1_700_000_000_000, 1_700_000_001_000, 1_700_000_002_000, 1_700_000_003_000},
+		Rows:         rows,
+		Series:       keyVizSeriesReads,
+	}
+	peer := newKeyVizPeerStub(t, body)
+	defer peer.Close()
+
+	const testCap int64 = 1024
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithResponseBodyLimit(testCap)
+
+	start := time.Now()
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads}, nil)
+	require.Less(t, time.Since(start), 5*time.Second, "decode must respect the size cap and complete promptly")
+	require.NotNil(t, merged.Fanout)
+	require.Equal(t, 2, merged.Fanout.Expected)
+	require.Len(t, merged.Fanout.Nodes, 2)
+	require.Equal(t, "self:8080", merged.Fanout.Nodes[0].Node)
+	require.True(t, merged.Fanout.Nodes[0].OK, "self always reports ok")
+	// Peer status: decode either errored on the truncated body
+	// (ok=false) or succeeded on a partial matrix (ok=true). Either
+	// is fine — what we are pinning is the bound, not the outcome.
+}
+
+// TestKeyVizFanoutRunPeerNearCapSucceedsWithWarning pins the
+// warning-fires path Claude bot round-2 flagged on PR #686. A body
+// whose JSON ends within the cap but whose total length (with
+// trailing whitespace) overruns the cap exercises the case where
+// the decoder returns success but countingReader.n > cap. The
+// peer entry surfaces ok=true; the warning log is emitted by the
+// aggregator (best-effort, not asserted from the test).
+//
+// Construction: minimal JSON envelope (~30 B) + 256 B of trailing
+// whitespace, against a 100 B cap. json.Decoder reads in bufio
+// chunks, so the LimitReader hands it cap+1 = 101 bytes; the
+// decoder sees the complete object and returns nil, leaving
+// cr.n == 101 > 100 → the warning condition is true.
+func TestKeyVizFanoutRunPeerNearCapSucceedsWithWarning(t *testing.T) {
+	t.Parallel()
+	tiny := KeyVizMatrix{Series: keyVizSeriesReads}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/admin/api/v1/keyviz/matrix") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(tiny); err != nil {
+			t.Fatalf("encode tiny: %v", err)
+		}
+		_, _ = io.WriteString(w, strings.Repeat(" ", 256))
+	}))
+	defer peer.Close()
+
+	const testCap int64 = 100
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).
+		WithHTTPClient(peer.Client()).
+		WithResponseBodyLimit(testCap)
+
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads}, nil)
+	require.NotNil(t, merged.Fanout)
+	require.Len(t, merged.Fanout.Nodes, 2)
+	require.True(t, merged.Fanout.Nodes[0].OK, "self always reports ok")
+	require.True(t, merged.Fanout.Nodes[1].OK,
+		"near-cap success path: small JSON with trailing whitespace must decode despite the cap; got error %q",
+		merged.Fanout.Nodes[1].Error)
+}
+
+// TestKeyVizFanoutRunPeerOverlargeBody pins the security-high
+// review item on PR #686: a peer that streams more than
+// keyVizPeerResponseBodyLimit bytes must not pin a goroutine on the
+// JSON decoder or balloon memory. The aggregator caps the decode at
+// the configured limit and surfaces a warning log rather than
+// silently accepting a truncated matrix.
+func TestKeyVizFanoutRunPeerOverlargeBody(t *testing.T) {
+	t.Parallel()
+	// Build a JSON payload whose `rows` array is enormous: many
+	// rows of 4096 zeroed values. We do not actually need to exceed
+	// the production cap (64 MiB) — we just need to assert that the
+	// decode completes promptly and that the peer call ends up
+	// reporting OK with a row count that matches what was on the wire
+	// up to the cap.
+	hugeRow := KeyVizRow{
+		BucketID: "route:big",
+		Values:   make([]uint64, 4096),
+	}
+	rows := make([]KeyVizRow, 64)
+	for i := range rows {
+		rows[i] = hugeRow
+	}
+	body := KeyVizMatrix{
+		ColumnUnixMs: make([]int64, 4096),
+		Rows:         rows,
+		Series:       keyVizSeriesReads,
+	}
+	peer := newKeyVizPeerStub(t, body)
+	defer peer.Close()
+
+	f := NewKeyVizFanout("self:8080", []string{peer.URL}).WithHTTPClient(peer.Client())
+
+	start := time.Now()
+	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads}, nil)
+	require.Less(t, time.Since(start), 5*time.Second, "decode must respect the size cap and complete promptly")
+	require.NotNil(t, merged.Fanout)
+	require.True(t, merged.Fanout.Nodes[1].OK, "in-cap response must succeed; cap is 64 MiB and the synthetic body is well under that")
+}
+
+// newKeyVizPeerStub spins up an httptest.Server that answers
+// /admin/api/v1/keyviz/matrix with a fixed 200 JSON body. Anything
+// else returns 404 — which surfaces as "peer status 404" in the
+// aggregator and lets a future test assert the path verbatim.
+//
+// Tests that need a non-200 response build their handler inline
+// (see TestKeyVizFanoutRunPeerHTTPError); this helper covers the
+// common happy-path stub.
+func newKeyVizPeerStub(t *testing.T, body KeyVizMatrix) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/admin/api/v1/keyviz/matrix") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(body); err != nil {
+			t.Logf("encode peer body: %v", err)
+		}
+	}))
+	return srv
+}

@@ -385,6 +385,18 @@ func readU32(r io.Reader) (uint32, error) {
 	return v, nil
 }
 
+func writeU8(w io.Writer, v uint8) error {
+	return errors.WithStack(binary.Write(w, binary.BigEndian, v))
+}
+
+func readU8(r io.Reader) (uint8, error) {
+	var v uint8
+	if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return v, nil
+}
+
 func readU64(r io.Reader) (uint64, error) {
 	var v uint64
 	if err := binary.Read(r, binary.BigEndian, &v); err != nil {

@@ -3152,7 +3152,10 @@ func (c *luaScriptContext) commit() error {
 	sort.Strings(keys)
 
 	// Pre-allocate a commitTS so Delta key bytes can embed it before dispatch.
-	commitTS := c.server.coordinator.Clock().Next()
+	commitTS, err := c.server.coordinator.Clock().NextFenced()
+	if err != nil {
+		return errors.Wrap(err, "luaScriptContext.commit: allocate commitTS")
+	}
 
 	elems := make([]*kv.Elem[kv.OP], 0, len(keys)*redisPairWidth)
 	ctx := context.Background()

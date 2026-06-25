@@ -563,7 +563,10 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 	}
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(readTS)
+		if err != nil {
+			return errors.Wrap(err, "s3: allocate startTS for mutation")
+		}
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -636,9 +639,13 @@ func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket str
 }
 
 func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	var deletedGeneration uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(readTS)
+		if err != nil {
+			return errors.Wrap(err, "s3: allocate startTS for mutation")
+		}
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -669,19 +676,32 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 			}
 		}
 
+		// Phase 1: Del BucketMetaKey in a txn (OCC-protected
+		// against concurrent createBucket racing this delete).
+		// Phase 2 (DEL_PREFIX safety net) runs outside the txn
+		// because the production coordinator rejects DEL_PREFIX
+		// inside transactions and rejects mixed Del+DelPrefix
+		// groups (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast).
+		// See AdminDeleteBucket's doc comment for the full
+		// rationale.
 		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)},
-			},
+			Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)}},
 		})
-		return errors.WithStack(err)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		deletedGeneration = meta.Generation
+		return nil
 	})
 	if err != nil {
 		writeS3MutationError(w, err, bucket, "")
 		return
 	}
+	// Phase 2: best-effort DEL_PREFIX safety net. See
+	// AdminDeleteBucket / runBucketDeleteSafetyNet for the contract.
+	s.runBucketDeleteSafetyNet(r.Context(), bucket, deletedGeneration)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -770,7 +790,10 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(readTS)
+		if err != nil {
+			return errors.Wrap(err, "s3: allocate startTS for mutation")
+		}
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -811,7 +834,11 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 //nolint:cyclop,gocognit,gocyclo,nestif // The S3 PUT flow is intentionally linear and maps directly to protocol steps.
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
 	readTS := s.readTS()
-	startTS := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -1192,7 +1219,10 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(readTS)
+		if err != nil {
+			return errors.Wrap(err, "s3: allocate startTS for mutation")
+		}
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -1259,7 +1289,11 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 	}
 
 	uploadID := newS3UploadID(s.clock())
-	startTS := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	commitTS, err := s.nextTxnCommitTS(startTS)
 	if err != nil {
 		writeS3InternalError(w, err)
@@ -1354,7 +1388,11 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	// different keys, leaving the chunk data referenced by an in-progress
 	// CompleteMultipartUpload untouched.
 	partReadTS := s.readTS()
-	partStartTS := s.txnStartTS(partReadTS)
+	partStartTS, err := s.txnStartTS(partReadTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
 	partCommitTS, err := s.nextTxnCommitTS(partStartTS)
 	if err != nil {
 		writeS3InternalError(w, err)
@@ -1633,7 +1671,10 @@ func (s *S3Server) completeMultipartUpload(w http.ResponseWriter, r *http.Reques
 
 	err = s.retryS3Mutation(r.Context(), func() error {
 		retryReadTS := s.readTS()
-		startTS := s.txnStartTS(retryReadTS)
+		startTS, err := s.txnStartTS(retryReadTS)
+		if err != nil {
+			return errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
+		}
 		retryPin := s.pinReadTS(retryReadTS)
 		defer retryPin.Release()
 
@@ -1742,7 +1783,10 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS := s.txnStartTS(readTS)
+		startTS, err := s.txnStartTS(readTS)
+		if err != nil {
+			return errors.Wrap(err, "s3: allocate startTS for mutation")
+		}
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -2283,12 +2327,12 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 	}
 	var leader string
 	if len(key) > 0 {
-		if s.coordinator.IsLeaderForKey(key) && s.coordinator.VerifyLeaderForKey(key) == nil {
+		if s.coordinator.IsLeaderForKey(key) && s.coordinator.VerifyLeaderForKey(r.Context(), key) == nil {
 			return false
 		}
 		leader = s.coordinator.RaftLeaderForKey(key)
 	} else {
-		if s.coordinator.IsLeader() && s.coordinator.VerifyLeader() == nil {
+		if s.coordinator.IsLeader() && s.coordinator.VerifyLeader(r.Context()) == nil {
 			return false
 		}
 		leader = s.coordinator.RaftLeader()
@@ -2406,7 +2450,7 @@ func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) 
 		return true
 	}
 	status, body := http.StatusOK, "ok"
-	if !s.isVerifiedS3Leader() {
+	if !s.isVerifiedS3Leader(r.Context()) {
 		status, body = http.StatusServiceUnavailable, "not leader"
 	}
 	w.WriteHeader(status)
@@ -2416,11 +2460,11 @@ func (s *S3Server) serveS3LeaderHealthz(w http.ResponseWriter, r *http.Request) 
 	return true
 }
 
-func (s *S3Server) isVerifiedS3Leader() bool {
+func (s *S3Server) isVerifiedS3Leader(ctx context.Context) bool {
 	if s.coordinator == nil || !s.coordinator.IsLeader() {
 		return false
 	}
-	return s.coordinator.VerifyLeader() == nil
+	return s.coordinator.VerifyLeader(ctx) == nil
 }
 
 // prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When
@@ -2798,16 +2842,36 @@ func (s *S3Server) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	return s.readTracker.Pin(ts)
 }
 
-func (s *S3Server) txnStartTS(readTS uint64) uint64 {
-	if readTS == ^uint64(0) {
-		if clock := s.clock(); clock != nil {
-			return clock.Next()
-		}
-		return 1
+// txnStartTS returns the read/start timestamp for an S3 transaction.
+// When the caller passes the sentinel ^uint64(0) ("server, please
+// allocate"), the timestamp is drawn from the HLC via NextFenced —
+// the HLC-4 (iii) physical-ceiling fence applies here because the
+// returned value is persistence-grade (it pins MVCC reads and is the
+// startTS half of a 2PC commit). Returning ErrCeilingExpired here lets
+// the SigV4 handler surface the failure as an S3 5xx instead of
+// silently issuing a stale-leader timestamp.
+func (s *S3Server) txnStartTS(readTS uint64) (uint64, error) {
+	if readTS != ^uint64(0) {
+		return readTS, nil
 	}
-	return readTS
+	clock := s.clock()
+	if clock == nil {
+		return 1, nil
+	}
+	ts, err := clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "s3: allocate txn startTS")
+	}
+	return ts, nil
 }
 
+// newS3UploadID generates an upload identifier for multipart uploads.
+// This is NOT a persistence timestamp — it is an opaque identifier
+// returned to the client and is only used as a lookup key for
+// in-progress parts. The HLC fallback exists purely to keep IDs
+// distinct when /dev/urandom is unavailable; it does not feed MVCC
+// visibility, OCC validation, lease/expiry, or anything else that
+// would require the HLC-4 (iii) fence. Plain Next() is correct here.
 func newS3UploadID(clock *kv.HLC) string {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err == nil {
@@ -2835,7 +2899,10 @@ func (s *S3Server) nextTxnCommitTS(startTS uint64) (uint64, error) {
 		return startTS + 1, nil
 	}
 	clock.Observe(startTS)
-	commitTS := clock.Next()
+	commitTS, err := clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "s3: allocate txn commitTS")
+	}
 	if commitTS <= startTS {
 		return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
 	}

@@ -2,11 +2,29 @@ package kv
 
 import (
 	"context"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
+
+// verifyLeaderTimeout caps how long the no-context verifyLeaderEngine path
+// is willing to wait for a ReadIndex round-trip. Without this bound,
+// callers that hold context.Background() (LeaderProxy.Commit/Abort,
+// Coordinate.VerifyLeader, ShardedCoordinator.VerifyLeader[ForKey], and
+// the S3/SQS/admin /healthz/leader handlers) blocked indefinitely whenever
+// ReadIndex completion stalled, and a single transient stall accumulated
+// callers permanently — Engine.run's Ready loop walks pendingReads O(N)
+// per tick, so the queue feeds back on itself once it grows.
+//
+// 5s matches leaderForwardTimeout: a verify that takes longer than a
+// single forward RPC is useless as a freshness check, and the proxy's
+// verify-then-forward path stays within its 5s retry budget.
+//
+// See PR #745 / incident 2026-05-08 for the goroutine-pile production
+// failure this prevents.
+const verifyLeaderTimeout = 5 * time.Second
 
 func engineForGroup(g *ShardGroup) raftengine.Engine {
 	if g == nil {
@@ -37,11 +55,27 @@ func verifyLeaderEngineCtx(ctx context.Context, engine raftengine.LeaderView) er
 	if engine == nil {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
+	// Defense-in-depth: if the caller's context carries no deadline (the
+	// Redis server's long-lived handlerContext, gemini-flagged background
+	// loops, or any future caller that passes context.Background), wrap
+	// with verifyLeaderTimeout so a stalled ReadIndex still surfaces
+	// fail-fast — same bound the no-arg verifyLeaderEngine wrapper has
+	// provided since #745. Callers that already set a tighter deadline
+	// (Redis dispatch ctx with redisDispatchTimeout, healthz
+	// r.Context()) keep theirs: context.WithTimeout picks the earlier of
+	// the two expirations.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, verifyLeaderTimeout)
+		defer cancel()
+	}
 	return errors.WithStack(engine.VerifyLeader(ctx))
 }
 
 func verifyLeaderEngine(engine raftengine.LeaderView) error {
-	return verifyLeaderEngineCtx(context.Background(), engine)
+	ctx, cancel := context.WithTimeout(context.Background(), verifyLeaderTimeout)
+	defer cancel()
+	return verifyLeaderEngineCtx(ctx, engine)
 }
 
 func linearizableReadEngineCtx(ctx context.Context, engine raftengine.LeaderView) (uint64, error) {

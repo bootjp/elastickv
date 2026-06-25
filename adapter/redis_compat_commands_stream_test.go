@@ -26,6 +26,89 @@ import (
 // the `iterTimeout <= 0` early-return path. This test covers the
 // distinct mid-call path where iterTimeout starts > 0 but the iter ctx
 // then expires inside xreadOnce.
+// TestRedis_StreamXReadBlockWakesOnXAdd verifies the event-driven wake
+// path: an in-process XADD on the leader's redis adapter must wake an
+// XREAD BLOCK waiter on the same node so the reader returns the new
+// entry before its BLOCK deadline. The wake comes through
+// keyWaiterRegistry's signal channel — the prior 10 ms time.Sleep
+// busy-poll loop would have exhibited the same end-to-end behaviour, so
+// this is an end-to-end sanity test rather than a wall-clock latency
+// gate (the latency gate is impractical under -race + parallel CI load,
+// where xreadOnce's Pebble seek alone can exceed any tight budget).
+//
+// Both client connections target the same node so they share the same
+// keyWaiterRegistry — the signal path is intentionally in-process
+// only (Lua and follower-side applies fall through to the fallback
+// timer; see xreadBusyPoll).
+func TestRedis_StreamXReadBlockWakesOnXAdd(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdbReader := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbReader.Close() }()
+	rdbWriter := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdbWriter.Close() }()
+	ctx := context.Background()
+
+	// Seed one entry so the stream meta exists; XREAD with afterID="$"
+	// will resolve to the seeded ID and then BLOCK for any strictly-newer
+	// entry. This isolates the wake path from the cold-stream branch.
+	_, err := rdbWriter.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-wake",
+		ID:     "1-0",
+		Values: []string{"k", "v0"},
+	}).Result()
+	require.NoError(t, err)
+
+	type readResult struct {
+		streams []redis.XStream
+		err     error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		streams, err := rdbReader.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{"stream-wake", "$"},
+			Block:   5 * time.Second,
+		}).Result()
+		resultCh <- readResult{streams: streams, err: err}
+	}()
+
+	// Give the reader a moment to enter xreadBusyPoll and register a
+	// waiter on keyWaiterRegistry before XADD. If XADD landed first
+	// the entry would already be visible by the time the reader runs
+	// xreadOnce, so the registration race is benign — but waiting also
+	// gates out a different source of flake where the goroutine has not
+	// yet dialed redis.
+	//
+	// TODO: replace the time.Sleep with explicit synchronization (e.g.
+	// poll keyWaiterRegistry until the test's stream key shows up,
+	// or expose a hook from RedisServer that fires when registration
+	// completes). Under -race on a slow CI runner the 50 ms pause may
+	// be insufficient — the test then exercises the
+	// "entry-already-visible" slow path instead of the signal-driven
+	// wake path. The end-to-end assertion still passes either way, so
+	// this is a coverage-quality issue, not a flake.
+	time.Sleep(50 * time.Millisecond)
+
+	_, err = rdbWriter.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-wake",
+		ID:     "2-0",
+		Values: []string{"k", "v1"},
+	}).Result()
+	require.NoError(t, err)
+
+	select {
+	case res := <-resultCh:
+		require.NoError(t, res.err)
+		require.Len(t, res.streams, 1)
+		require.Len(t, res.streams[0].Messages, 1)
+		require.Equal(t, "2-0", res.streams[0].Messages[0].ID)
+	case <-time.After(6 * time.Second):
+		t.Fatal("XREAD BLOCK did not return after XADD signal")
+	}
+}
+
 func TestRedis_StreamXReadIterCtxDeadlineReturnsNull(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
@@ -99,6 +182,55 @@ func TestRedis_StreamXReadShortBlockReturnsNullNotError(t *testing.T) {
 	if !errors.Is(err, redis.Nil) {
 		t.Fatalf("short BLOCK must return redis.Nil (timeout), got err=%v streams=%v", err, streams)
 	}
+}
+
+// TestRedis_StreamCommandsRejectWrongType locks down the wrongType
+// detection on the stream fast path: keyTypeAtExpect short-circuits to
+// the slow path when the expected (stream) prefixes return empty, so
+// the actual key type is reported and XADD/XREAD/XLEN/XRANGE all
+// surface WRONGTYPE rather than treating the key as missing.
+func TestRedis_StreamCommandsRejectWrongType(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	// Seed the key as a plain string.
+	require.NoError(t, rdb.Set(ctx, "stream-wrongtype", "I am a string", 0).Err())
+
+	// XADD must reject with WRONGTYPE — the fast-path stream probe
+	// returns empty (the key has no stream-meta or legacy-stream
+	// row), so we fall through to the full keyTypeAt slow path which
+	// detects the string and the caller raises WRONGTYPE.
+	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "stream-wrongtype",
+		ID:     "1-0",
+		Values: []string{"k", "v"},
+	}).Result()
+	require.Error(t, err, "XADD on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
+
+	// XLEN: same fall-through path — string key surfaces WRONGTYPE.
+	_, err = rdb.XLen(ctx, "stream-wrongtype").Result()
+	require.Error(t, err, "XLEN on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
+
+	// XRANGE: same expectation.
+	_, err = rdb.XRange(ctx, "stream-wrongtype", "-", "+").Result()
+	require.Error(t, err, "XRANGE on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
+
+	// XREAD with a missing stream returns nil (the legacy "no rows"
+	// path). XREAD with a wrongType key, however, must surface the
+	// error so the BLOCK loop does not spin forever on a string.
+	_, err = rdb.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{"stream-wrongtype", "0"},
+	}).Result()
+	require.Error(t, err, "XREAD on a string key must return WRONGTYPE")
+	require.Contains(t, err.Error(), "WRONGTYPE")
 }
 
 func TestRedis_StreamXAddXReadRoundTrip(t *testing.T) {
@@ -785,7 +917,7 @@ func TestRedis_StreamXReadShutdownShortCircuits(t *testing.T) {
 	// pre-fix this would happily run for the full 5 s after Close()
 	// because iterCtx was rooted in context.Background(). Post-fix the
 	// handlerCtx.Err() guard at the top of each loop iteration kicks
-	// in within ~one redisBusyPollBackoff (10 ms) and we reply null.
+	// in within ~one redisBlockWaitFallback (100 ms) and we reply null.
 	_, err := rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: "stream-shutdown",
 		ID:     "1-0",
