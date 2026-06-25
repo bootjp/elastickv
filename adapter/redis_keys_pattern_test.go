@@ -8,6 +8,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/redcon"
 )
 
 type stubAdapterCoordinator struct {
@@ -107,6 +108,15 @@ func TestPatternScanBounds(t *testing.T) {
 	start, end = patternScanBounds([]byte("ab*cd"))
 	require.Equal(t, []byte("ab"), start)
 	require.Equal(t, prefixScanEnd([]byte("ab")), end)
+}
+
+func TestKeysRejectsMissingPattern(t *testing.T) {
+	t.Parallel()
+
+	conn := &recordingConn{}
+	(&RedisServer{}).keys(conn, redcon.Command{Args: [][]byte{[]byte("KEYS")}})
+
+	require.Contains(t, conn.err, "wrong number of arguments")
 }
 
 func TestListPatternScanBounds(t *testing.T) {
