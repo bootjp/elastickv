@@ -35,22 +35,21 @@ The parent design landed an FSM-side dedup probe and an adapter-side
 write-set reuse path keyed on a stale `commit_ts` ridden through
 `OperationGroup.PrevCommitTS` into a V2 `TxnMeta`. The probe is always
 present; emission of `prev_commit_ts != 0` is gated by
-`RedisServer.onePhaseTxnDedup` (constructor: `WithOnePhaseTxnDedup`, env:
-`ELASTICKV_REDIS_ONEPHASE_DEDUP=1`). The gate stays default-off until
-the cluster has uniformly upgraded — the parent's R5 "ship the reader
-before the writer" sequencing.
+`RedisServer.onePhaseTxnDedup` (constructor: `WithOnePhaseTxnDedup`, env
+rollback: `ELASTICKV_REDIS_ONEPHASE_DEDUP=0`). The gate now defaults on
+because the cluster has uniformly upgraded — the parent's R5 "ship the reader
+before the writer" sequencing is satisfied.
 
-Two Jepsen workflows run the same stress profile (`--time-limit 150
---rate 10 --concurrency 8 --key-count 16 --max-writes-per-key 250
---max-txn-length 4`) every day against `main`:
+During rollout, two Jepsen workflows ran the same stress profile
+(`--time-limit 150 --rate 10 --concurrency 8 --key-count 16
+--max-writes-per-key 250 --max-txn-length 4`) every day against `main`:
 
 | Workflow | Env | Purpose |
 |---|---|---|
-| [`jepsen-test-scheduled.yml`][off] | `ELASTICKV_REDIS_ONEPHASE_DEDUP` unset (off) | Legacy-path baseline — expected to surface the parent's anomaly class until default-on lands. |
-| [`jepsen-test-scheduled-dedup.yml`][on]  | `ELASTICKV_REDIS_ONEPHASE_DEDUP=1` (on) | M4 validation — must stay green to authorize default-on. |
+| [`jepsen-test-scheduled.yml`][scheduled] | `ELASTICKV_REDIS_ONEPHASE_DEDUP=0` during the temporary control window | Legacy-path baseline after the default flip. Retired on 2026-06-26. |
+| `jepsen-test-scheduled-dedup.yml` | `ELASTICKV_REDIS_ONEPHASE_DEDUP=1` (on) | M4 validation to authorize default-on. Deleted on 2026-06-26 after dedup-on became the standard scheduled path. |
 
-[off]: ../../.github/workflows/jepsen-test-scheduled.yml
-[on]: ../../.github/workflows/jepsen-test-scheduled-dedup.yml
+[scheduled]: ../../.github/workflows/jepsen-test-scheduled.yml
 
 ## M4 evidence
 
@@ -58,7 +57,8 @@ The parent design's `M4` criterion is *"7 consecutive days without
 `:duplicate-elements` / `:G-single-item-realtime` in the dedup-mode
 workflow."*
 
-Dedup-mode (`jepsen-test-scheduled-dedup.yml`) run history on `main`:
+Dedup-mode run history on `main` from the retired
+`jepsen-test-scheduled-dedup.yml` workflow:
 
 | Date (UTC) | Run | Conclusion |
 |---|---|---|
@@ -145,7 +145,7 @@ subsequent `GET` returns `v` — it fails on the pre-fix build
 ### M2 — Control workflow disposition
 
 After default-on, `jepsen-test-scheduled.yml` would silently exercise
-the same path as `jepsen-test-scheduled-dedup.yml` (unset env → true),
+the same path as `jepsen-test-scheduled-dedup.yml` (unset env -> true),
 so the two workflows would collapse to the same coverage. Two options:
 
 | Option | Effect | Recommendation |
@@ -157,6 +157,10 @@ This PR picks **A**: add explicit `ELASTICKV_REDIS_ONEPHASE_DEDUP: "0"`
 to `jepsen-test-scheduled.yml`'s top-level `env:` so the control retains
 its meaning across the default flip. The 30-day retirement decision
 becomes a follow-up issue.
+
+Post-flip cleanup on 2026-06-26 retires that temporary control: the
+`ELASTICKV_REDIS_ONEPHASE_DEDUP=0` opt-out was removed from
+`jepsen-test-scheduled.yml`, and the dedicated dedup-mode workflow was deleted.
 
 ### M3 — Issue #937 closure
 
@@ -245,5 +249,7 @@ One PR, two commits:
 After merge: monitor the next 2–3 daily runs of both scheduled
 workflows. The dedup-mode workflow must stay green; the control
 workflow may or may not surface anomalies — both outcomes are
-informative. Roll back via env var (no binary revert) if anything
+informative. After the post-flip soak period, the control workflow was
+retired and the standard scheduled workflow now covers the dedup-on path.
+Roll back via env var (no binary revert) if anything
 unexpected appears.

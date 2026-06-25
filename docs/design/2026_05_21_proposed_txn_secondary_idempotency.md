@@ -542,11 +542,10 @@ preserves availability and adds correctness.
   `cmd/server/demo.go` with `ELASTICKV_REDIS_ONEPHASE_DEDUP=1`.
 - **Scheduled Jepsen run criterion.** 7 consecutive days without
   `:duplicate-elements` / `:G-single-item-realtime` in the dedup-mode
-  workflow (`.github/workflows/jepsen-test-scheduled-dedup.yml`,
-  daily at 03:17 UTC). The general scheduled workflow
-  (`.github/workflows/jepsen-test-scheduled.yml`, every 6 h) continues to run *without*
-  the gate so the legacy path stays covered — both must stay green
-  for option-2 to be safe to default-on.
+  workflow. During rollout this was a dedicated daily workflow; after the
+  default-on soak period, the dedicated workflow was retired and the general
+  scheduled workflow (`.github/workflows/jepsen-test-scheduled.yml`, every 6 h)
+  now covers the default dedup-on path.
 - **Workflow scope rationale.** The dedup-mode workflow exercises only
   the Redis workload. The dedup feature ships behind the Redis
   adapter's `onePhaseTxnDedup` flag (RPUSH/LPUSH via

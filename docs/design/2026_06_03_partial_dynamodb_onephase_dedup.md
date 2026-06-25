@@ -410,15 +410,11 @@ every replica applying the same log entry.
   timeouts (`cmd/server/demo.go`) so leadership flaps during the DynamoDB
   workload. The default path has DynamoDB dedup enabled; set
   `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` only to reproduce the legacy path.
-- **CI — LANDED.** The DynamoDB list-append workload is added to the dedup-mode
-  workflow (`.github/workflows/jepsen-test-scheduled-dedup.yml`) with
-  `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=1` pinned at the job env (read by
-  `adapter.NewDynamoDBServer` in the demo cluster), a fail-closed gate
-  assertion before the listeners come up (mirroring the Redis assertion), and
-  the launch step now also waits on the dynamo listeners (63801-63803). The
-  general workflow (`.github/workflows/jepsen-test-scheduled.yml`) explicitly
-  sets `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` so the legacy path stays covered
-  as a control baseline after default-on.
+- **CI — LANDED.** The DynamoDB list-append workload was added to the
+  dedup-mode workflow during rollout. After the default-on soak period, the
+  dedicated dedup workflow was retired; the general scheduled workflow
+  (`.github/workflows/jepsen-test-scheduled.yml`) now runs the default
+  `DynamoDBServer.onePhaseTxnDedup` path without an env-var opt-out.
 - Criterion to default-on: 7 consecutive days without `:duplicate-elements` in
   the dedup-mode DynamoDB workload, both workflows green. **Satisfied; this PR
   flips `DynamoDBServer.onePhaseTxnDedup`'s default and the env-var sense to
@@ -473,8 +469,10 @@ change (the probe already exists), no proto change, no new store primitive.
 - (2026-06-18) Default-on follow-up: `DynamoDBServer.onePhaseTxnDedup` now
   defaults on because the probe-aware FSM reader is everywhere. Operators can
   still set `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` or
-  `WithDynamoOnePhaseTxnDedup(false)` for rollback; the general scheduled
-  Jepsen workflow pins that opt-out to keep legacy-path coverage.
+  `WithDynamoOnePhaseTxnDedup(false)` for rollback.
+- (2026-06-26) Post-flip CI cleanup: retired the legacy-path scheduled control
+  by removing the `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` opt-out from the general
+  scheduled Jepsen workflow and deleting the dedicated dedup-mode workflow.
 - (2026-06-03, PR #920 round-1) **Leader-only dedup guard added** per codex P1:
   the adapter-local `commitTS` allocation is only safe on the leader, so the
   dedup path is gated on `d.coordinator.IsLeader()` (+ `NextFenced` ceiling
