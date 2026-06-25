@@ -1669,7 +1669,32 @@ merge_extra_env() {
   printf '%s' "$merged"
 }
 
+validate_extra_env_pairs() {
+  local value="$1"
+  local -a pairs=()
+  local pair key
+
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+
+  IFS=$' \t\n' read -r -a pairs <<< "$value"
+  for pair in "${pairs[@]}"; do
+    [[ -n "$pair" ]] || continue
+    if [[ "$pair" != *=* || "$pair" == =* ]]; then
+      echo "rolling-update: invalid EXTRA_ENV entry '$pair'; expected KEY=VALUE" >&2
+      return 1
+    fi
+    key="${pair%%=*}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "rolling-update: invalid EXTRA_ENV key '$key' in entry '$pair'; key must match [A-Za-z_][A-Za-z0-9_]*" >&2
+      return 1
+    fi
+  done
+}
+
 EXTRA_ENV_NORMALISED="$(merge_extra_env "$EXTRA_ENV_DEFAULT_NORMALISED" "$EXTRA_ENV_USER_NORMALISED")"
+validate_extra_env_pairs "$EXTRA_ENV_NORMALISED"
 EXTRA_ENV_Q="$(printf '%q' "$EXTRA_ENV_NORMALISED")"
 CONTAINER_MEMORY_LIMIT_Q="$(printf '%q' "${CONTAINER_MEMORY_LIMIT:-}")"
 S3_CREDENTIALS_FILE_Q="$(printf '%q' "${S3_CREDENTIALS_FILE:-}")"
