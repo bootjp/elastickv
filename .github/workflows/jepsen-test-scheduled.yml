@@ -39,6 +39,16 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOCACHE: /tmp/go-build
+      # Explicit dedup-OFF control baseline. The Redis and DynamoDB adapter
+      # onePhaseTxnDedup flags are default-on, so this workflow is preserved
+      # as legacy-path coverage. Pair with the dedup-ON workflow
+      # (.github/workflows/jepsen-test-scheduled-dedup.yml) which pins both
+      # env vars to 1. Retirement of this workflow is a follow-up after 30
+      # days of post-flip data; until then, do NOT remove these env vars —
+      # without them the two workflows would exercise the same path under
+      # the new defaults.
+      ELASTICKV_REDIS_ONEPHASE_DEDUP: "0"
+      ELASTICKV_DYNAMODB_ONEPHASE_DEDUP: "0"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -57,12 +67,48 @@ jobs:
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
           chmod +x ~/lein
           ~/lein version
+      # Cache Maven artifacts across runs. Maven Central (repo1.maven.org)
+      # serves intermittent 429s during dependency download, which
+      # uncached scheduled runs trip frequently — the lein project pulls
+      # ~100 jars at first launch. Keying on project.clj invalidates the
+      # cache only when dependencies actually change.
+      - name: Cache Maven and Leiningen artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
       - name: Pre-fetch Go modules
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
           GOPATH=$(go env GOPATH)
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
+      # Warm the Maven cache up front so unit tests / workloads start
+      # against a populated ~/.m2. `lein deps` is wrapped with a retry
+      # loop because Maven Central transiently returns 429 during peak
+      # hours, and the default lein behaviour is to fail the build on
+      # the first checksum miss. Three attempts with linear backoff is
+      # enough to ride out a typical rate-limit window.
+      - name: Warm Leiningen Maven cache
+        working-directory: jepsen
+        run: |
+          set -uo pipefail
+          n=0
+          max=3
+          until ~/lein deps; do
+            n=$((n + 1))
+            if [ "$n" -ge "$max" ]; then
+              echo "lein deps failed after $n attempts" >&2
+              exit 1
+            fi
+            sleep_secs=$((n * 30))
+            echo "lein deps failed (attempt $n/$max), retrying in ${sleep_secs}s..." >&2
+            sleep "$sleep_secs"
+          done
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
@@ -114,6 +160,70 @@ jobs:
             --max-txn-length ${{ inputs.max-txn-length || '4' }} \
             --dynamo-ports 63801,63802,63803 \
             --host 127.0.0.1
+      - name: Run DynamoDB per-type Jepsen workloads against elastickv
+        working-directory: jepsen
+        # The per-type sweep is a coverage check across all 10 attribute
+        # types, not the deep stress run — it uses its own shorter
+        # time-limit so the 10-type loop fits comfortably inside the job
+        # timeout regardless of the workflow_dispatch time-limit input.
+        # The per-invocation `timeout` is derived from TYPE_TL + buffer
+        # so bumping TYPE_TL never races against the outer timeout.
+        timeout-minutes: 30
+        env:
+          # Per-type sweep is a coverage check, not the deep stress run, so
+          # it uses its own shorter runtime and smaller history density than
+          # the parent dynamodb-workload step.  Keeping per-key ops modest
+          # also keeps Knossos's linearizability analysis inside its
+          # time budget (dense histories cause :valid? :unknown verdicts).
+          TYPE_TL: "60"
+          TYPE_CONCURRENCY: "4"
+          TYPE_KEY_COUNT: "8"
+          TYPE_MAX_WRITES: "80"
+        run: |
+          # Run every type independently: one failure does not stop
+          # the sweep so the final summary shows which specific types
+          # passed/failed.  The step still fails if any type failed.
+          PER_TYPE_TIMEOUT=$((TYPE_TL + 180))
+          declare -A RESULT
+          FAILED=()
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            echo "::group::value-type=${t}"
+            set +e
+            timeout "${PER_TYPE_TIMEOUT}" ~/lein run -m elastickv.dynamodb-types-workload --local \
+              --time-limit "${TYPE_TL}" \
+              --rate ${{ inputs.rate || '5' }} \
+              --concurrency "${TYPE_CONCURRENCY}" \
+              --key-count "${TYPE_KEY_COUNT}" \
+              --max-writes-per-key "${TYPE_MAX_WRITES}" \
+              --value-type "${t}" \
+              --dynamo-ports 63801,63802,63803 \
+              --host 127.0.0.1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              RESULT[$t]="pass"
+            else
+              RESULT[$t]="fail(${rc})"
+              FAILED+=("$t")
+            fi
+            echo "::endgroup::"
+          done
+          echo
+          echo "=== per-type jepsen summary ==="
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            printf '  %-12s %s\n' "$t" "${RESULT[$t]}"
+          done
+          if [ ${#FAILED[@]} -ne 0 ]; then
+            echo "FAILED types: ${FAILED[*]}"
+            exit 1
+          fi
+      - name: Upload Jepsen store on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-store-types
+          path: jepsen/store
+          retention-days: 7
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 10
@@ -129,7 +239,28 @@ jobs:
             --host 127.0.0.1
       - name: Dump demo cluster log on failure
         if: failure()
-        run: tail -n 500 /tmp/elastickv-demo.log || true
+        # The previous `tail -n 500` truncated a 3-minute workload's
+        # log down to startup-only lines, making it impossible to
+        # correlate a Jepsen anomaly with the server-side state
+        # (start_ts, commit_ts, raft term, write conflicts, lock-
+        # resolver events). Print head + tail inline so the GH UI
+        # still shows the most recent activity at-a-glance, then
+        # upload the full log as an artifact for offline analysis.
+        run: |
+          echo "=== first 200 lines (startup) ==="
+          head -n 200 /tmp/elastickv-demo.log || true
+          echo "=== last 1000 lines (most recent activity) ==="
+          tail -n 1000 /tmp/elastickv-demo.log || true
+          echo "=== full log line count ==="
+          wc -l /tmp/elastickv-demo.log || true
+      - name: Upload demo cluster log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: elastickv-demo-log
+          path: /tmp/elastickv-demo.log
+          retention-days: 14
+          if-no-files-found: warn
       - name: Stop demo cluster
         if: always()
         run: |

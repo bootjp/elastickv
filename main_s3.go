@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net"
-	"os"
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
@@ -14,15 +11,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type s3CredentialFile struct {
-	Credentials []s3CredentialEntry `json:"credentials"`
-}
-
-type s3CredentialEntry struct {
-	AccessKeyID     string `json:"access_key_id"`
-	SecretAccessKey string `json:"secret_access_key"`
-}
-
+// startS3Server stands up the S3-compatible HTTP listener on s3Addr
+// and returns the constructed *adapter.S3Server. Callers that need a
+// reference to the running server (e.g. the admin HTTP listener,
+// which calls SigV4-bypass admin entrypoints on it) hold the
+// returned value; callers that don't can ignore it.
+//
+// Returns (nil, nil) when s3Addr is empty — that is the well-known
+// "S3 disabled" state, not a configuration error. Other failures
+// surface as a non-nil error and a nil server.
 func startS3Server(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -35,22 +32,26 @@ func startS3Server(
 	credentialsFile string,
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
-) error {
+) (*adapter.S3Server, error) {
 	s3Addr = strings.TrimSpace(s3Addr)
 	if s3Addr == "" {
-		return nil
+		// (nil, nil) is the explicit "S3 disabled" signal — the empty
+		// flag value is a valid configuration, not an error. The
+		// nilnil linter is not enabled in .golangci.yaml so no
+		// suppression directive is needed.
+		return nil, nil
 	}
 	if !pathStyleOnly {
-		return errors.New("virtual-hosted style S3 requests are not implemented")
+		return nil, errors.New("virtual-hosted style S3 requests are not implemented")
 	}
 	s3L, err := lc.Listen(ctx, "tcp", s3Addr)
 	if err != nil {
-		return errors.Wrapf(err, "failed to listen on %s", s3Addr)
+		return nil, errors.Wrapf(err, "failed to listen on %s", s3Addr)
 	}
 	staticCreds, err := loadS3StaticCredentials(credentialsFile)
 	if err != nil {
 		_ = s3L.Close()
-		return err
+		return nil, err
 	}
 	s3Server := adapter.NewS3Server(
 		s3L,
@@ -79,34 +80,9 @@ func startS3Server(
 		}
 		return errors.WithStack(err)
 	})
-	return nil
+	return s3Server, nil
 }
 
 func loadS3StaticCredentials(path string) (map[string]string, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil, nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	defer f.Close()
-	file := s3CredentialFile{}
-	if err := json.NewDecoder(f).Decode(&file); err != nil {
-		return nil, errors.WithStack(err)
-	}
-	out := make(map[string]string, len(file.Credentials))
-	for _, cred := range file.Credentials {
-		accessKeyID := strings.TrimSpace(cred.AccessKeyID)
-		secretAccessKey := strings.TrimSpace(cred.SecretAccessKey)
-		if accessKeyID == "" || secretAccessKey == "" {
-			return nil, errors.New("s3 credentials file contains an empty access key or secret key")
-		}
-		if _, exists := out[accessKeyID]; exists {
-			return nil, errors.WithStack(fmt.Errorf("s3 credentials file contains duplicate access key ID: %q", accessKeyID))
-		}
-		out[accessKeyID] = secretAccessKey
-	}
-	return out, nil
+	return loadSigV4StaticCredentialsFile(path, "s3")
 }

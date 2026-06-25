@@ -31,6 +31,18 @@ jobs:
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
           chmod +x ~/lein
           ~/lein version
+      # See jepsen-test-scheduled.yml for the rationale: Maven Central
+      # 429s during peak hours have been knocking the scheduled stress
+      # run out, and the per-push run uses the same dependency set.
+      - name: Cache Maven and Leiningen artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein
+          key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
       - name: Pre-fetch Go modules and build binary
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
@@ -38,6 +50,22 @@ jobs:
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
           go build -o /tmp/elastickv-bin .
+      - name: Warm Leiningen Maven cache
+        working-directory: jepsen
+        run: |
+          set -uo pipefail
+          n=0
+          max=3
+          until ~/lein deps; do
+            n=$((n + 1))
+            if [ "$n" -ge "$max" ]; then
+              echo "lein deps failed after $n attempts" >&2
+              exit 1
+            fi
+            sleep_secs=$((n * 30))
+            echo "lein deps failed (attempt $n/$max), retrying in ${sleep_secs}s..." >&2
+            sleep "$sleep_secs"
+          done
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
@@ -49,6 +77,7 @@ jobs:
           RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
           RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
           RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802,127.0.0.1:50053=127.0.0.1:63803"
+          RAFT_SQS_MAP="127.0.0.1:50051=127.0.0.1:63501,127.0.0.1:50052=127.0.0.1:63502,127.0.0.1:50053=127.0.0.1:63503"
 
           : > /tmp/elastickv-demo.pid
           for node in 1 2 3; do
@@ -57,6 +86,7 @@ jobs:
               --redisAddress "127.0.0.1:6379${node}" \
               --dynamoAddress "127.0.0.1:6380${node}" \
               --s3Address "127.0.0.1:6390${node}" \
+              --sqsAddress "127.0.0.1:6350${node}" \
               --metricsAddress "" \
               --pprofAddress "" \
               --raftId "n${node}" \
@@ -65,15 +95,17 @@ jobs:
               --raftRedisMap "$RAFT_REDIS_MAP" \
               --raftS3Map "$RAFT_S3_MAP" \
               --raftDynamoMap "$RAFT_DYNAMO_MAP" \
+              --raftSqsMap "$RAFT_SQS_MAP" \
               > "/tmp/elastickv-demo-n${node}.log" 2>&1 &
             echo $! >> /tmp/elastickv-demo.pid
           done
 
-          echo "Waiting for redis (63791-63793), dynamo (63801-63803), and s3 (63901-63903) listeners..."
+          echo "Waiting for redis (63791-63793), dynamo (63801-63803), s3 (63901-63903), and sqs (63501-63503) listeners..."
           for i in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
               && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
-              && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903; then
+              && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903 \
+              && nc -z 127.0.0.1 63501 && nc -z 127.0.0.1 63502 && nc -z 127.0.0.1 63503; then
               echo "Cluster is up"
               exit 0
             fi
@@ -95,11 +127,100 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.dynamodb-workload --local --time-limit 5 --rate 5 --concurrency 5 --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+      - name: Run DynamoDB per-type Jepsen workloads against elastickv
+        working-directory: jepsen
+        timeout-minutes: 10
+        run: |
+          # Run every type even if one fails, so the log shows which
+          # specific attribute types pass and which fail.  The step
+          # still fails at the end if any single type failed.
+          declare -A RESULT
+          FAILED=()
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            echo "::group::value-type=${t}"
+            set +e
+            timeout 120 ~/lein run -m elastickv.dynamodb-types-workload --local \
+              --time-limit 5 --rate 5 --concurrency 4 \
+              --value-type "${t}" \
+              --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              RESULT[$t]="pass"
+            else
+              RESULT[$t]="fail(${rc})"
+              FAILED+=("$t")
+            fi
+            echo "::endgroup::"
+          done
+          echo
+          echo "=== per-type jepsen summary ==="
+          for t in string number binary bool null string-set number-set binary-set list map; do
+            printf '  %-12s %s\n' "$t" "${RESULT[$t]}"
+          done
+          if [ ${#FAILED[@]} -ne 0 ]; then
+            echo "FAILED types: ${FAILED[*]}"
+            exit 1
+          fi
+      - name: Upload Jepsen store on per-type failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-store-types
+          path: jepsen/store
+          retention-days: 7
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 10 --concurrency 10 --s3-ports 63901,63902,63903 --host 127.0.0.1
+      - name: Run SQS HT-FIFO Jepsen workload against elastickv
+        working-directory: jepsen
+        # The HT-FIFO workload runs sends and receives across a 4-partition
+        # FIFO queue with content-based deduplication. The custom checker
+        # validates within-group ordering, no loss, and no duplicates.
+        # See jepsen/src/elastickv/sqs_htfifo_workload.clj.
+        #
+        # --drain-time 15: in --local mode the nemesis is a no-op, so no
+        # message can become invisible due to partition/kill — the 40s
+        # default drain (which protects against fault-induced
+        # visibility-timeout races) is overkill here. 15s leaves ample
+        # headroom under the 120s shell timeout against JVM startup and
+        # the 5s main phase.
+        timeout-minutes: 3
+        run: |
+          timeout 120 ~/lein run -m elastickv.sqs-htfifo-workload --local \
+            --time-limit 5 --rate 5 --concurrency 5 \
+            --partition-count 4 --group-count 6 \
+            --drain-time 15 \
+            --sqs-ports 63501,63502,63503 --host 127.0.0.1
+      - name: Dump demo cluster logs on failure
+        if: failure()
+        # Same rationale as jepsen-test-scheduled.yml: inline summary
+        # for the GH UI + full per-node logs uploaded as artifact so
+        # any Jepsen anomaly can be traced to the server-side ts/raft
+        # state without re-running the workflow.
+        run: |
+          for node in n1 n2 n3; do
+            log=/tmp/elastickv-demo-${node}.log
+            echo "=== ${node}: first 200 lines (startup) ==="
+            head -n 200 "$log" || true
+            echo "=== ${node}: last 500 lines (most recent activity) ==="
+            tail -n 500 "$log" || true
+            echo "=== ${node}: full log line count ==="
+            wc -l "$log" || true
+          done
+      - name: Upload demo cluster logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: elastickv-demo-logs
+          path: |
+            /tmp/elastickv-demo-n1.log
+            /tmp/elastickv-demo-n2.log
+            /tmp/elastickv-demo-n3.log
+          retention-days: 14
+          if-no-files-found: warn
       - name: Stop demo cluster
         if: always()
         run: |

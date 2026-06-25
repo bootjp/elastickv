@@ -21,6 +21,22 @@ const (
 )
 
 func RegisterOperationalServices(ctx context.Context, gs *grpc.Server, engine raftengine.Engine, serviceNames []string) {
+	RegisterOperationalServicesWithInterceptor(ctx, gs, engine, serviceNames, nil)
+}
+
+// RegisterOperationalServicesWithInterceptor is the Stage 7c variant
+// of RegisterOperationalServices that installs an optional
+// [MembershipChangeInterceptor] on the underlying [Server] so
+// AddVoter/AddLearner run an encryption-aware pre-step before the
+// conf-change proposal. Passing nil is equivalent to
+// [RegisterOperationalServices].
+func RegisterOperationalServicesWithInterceptor(
+	ctx context.Context,
+	gs *grpc.Server,
+	engine raftengine.Engine,
+	serviceNames []string,
+	interceptor MembershipChangeInterceptor,
+) {
 	if gs == nil {
 		return
 	}
@@ -28,7 +44,7 @@ func RegisterOperationalServices(ctx context.Context, gs *grpc.Server, engine ra
 		panic("raftadmin: RegisterOperationalServices requires non-nil context")
 	}
 
-	pb.RegisterRaftAdminServer(gs, NewServer(engine))
+	pb.RegisterRaftAdminServer(gs, NewServerWithInterceptor(engine, interceptor))
 
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(gs, healthSrv)

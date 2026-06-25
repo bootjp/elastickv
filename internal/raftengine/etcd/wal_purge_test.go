@@ -32,7 +32,7 @@ func listWALFiles(t *testing.T, dir string) []string {
 	require.NoError(t, err)
 	var out []string
 	for _, e := range entries {
-		if !e.IsDir() && filepath.Ext(e.Name()) == ".wal" {
+		if !e.IsDir() && filepath.Ext(e.Name()) == walFileExt {
 			out = append(out, e.Name())
 		}
 	}

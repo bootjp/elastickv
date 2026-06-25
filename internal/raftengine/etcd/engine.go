@@ -9,13 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
@@ -32,7 +33,7 @@ const (
 	// duration of a leader-local read lease. It absorbs goroutine scheduling
 	// delay between heartbeat ack and lease refresh, GC pauses on the leader,
 	// and bounded wall-clock skew between the leader and a partition's new
-	// leader candidate. See docs/lease_read_design.md for the safety argument.
+	// leader candidate. See docs/design/2026_04_20_implemented_lease_read.md for the safety argument.
 	leaseSafetyMargin = 300 * time.Millisecond
 	// defaultMaxInflightMsg controls how many in-flight MsgApp messages Raft
 	// allows per peer before waiting for an ACK. It also sizes the inbound
@@ -122,7 +123,26 @@ var (
 	errLeadershipTransferNotLeader  = errors.Mark(errors.New("etcd raft leadership transfer requires the local node to be leader"), raftengine.ErrNotLeader)
 	errLeadershipTransferInProgress = errors.Mark(errors.New("etcd raft leadership transfer is in progress"), raftengine.ErrLeadershipTransferInProgress)
 	errTooManyPendingConfigs        = errors.New("etcd raft engine has too many pending config changes")
+	errPromoteLearnerNotLearner     = errors.New("etcd raft promote-learner target is not a learner")
+	errPromoteLearnerNoProgress     = errors.New("etcd raft promote-learner target has no leader-side progress entry")
+	errPromoteLearnerNotCaughtUp    = errors.New("etcd raft promote-learner target has not caught up to min_applied_index")
+	errPromoteLearnerMinAppliedZero = errors.New("etcd raft promote-learner requires min_applied_index>0 unless skip_min_applied_check is set")
 )
+
+// joinRoleViolationCount counts the number of times the join-as-learner
+// alarm has fired across all engine instances in this process. Surfaced
+// via JoinRoleViolationCount() so callers (monitoring) can read it
+// without holding any engine lock; the latch on Engine.joinAlarmFired
+// keeps each individual engine from contributing more than once per
+// process lifetime.
+var joinRoleViolationCount atomic.Uint64
+
+// JoinRoleViolationCount returns the cumulative count of
+// --raftJoinAsLearner alarms that have fired since process start. See
+// docs/design/2026_04_26_proposed_raft_learner.md §4.5.
+func JoinRoleViolationCount() uint64 {
+	return joinRoleViolationCount.Load()
+}
 
 // Snapshot is an alias for the shared raftengine.Snapshot interface.
 type Snapshot = raftengine.Snapshot
@@ -131,12 +151,18 @@ type Snapshot = raftengine.Snapshot
 type StateMachine = raftengine.StateMachine
 
 type OpenConfig struct {
-	NodeID        uint64
-	LocalID       string
-	LocalAddress  string
-	DataDir       string
-	Peers         []Peer
-	Bootstrap     bool
+	NodeID       uint64
+	LocalID      string
+	LocalAddress string
+	DataDir      string
+	Peers        []Peer
+	Bootstrap    bool
+	// JoinAsLearner mirrors raftengine.FactoryConfig.JoinAsLearner. The
+	// engine watches every post-apply ConfState and emits an
+	// ERROR-level alarm whenever the local node is in Voters while
+	// JoinAsLearner is true. The check is post-apply only; the node
+	// continues running.
+	JoinAsLearner bool
 	Transport     *GRPCTransport
 	TickInterval  time.Duration
 	ElectionTick  int
@@ -150,6 +176,23 @@ type OpenConfig struct {
 	// Default: 256. Increase for deeper pipelining on high-bandwidth links;
 	// lower in memory-constrained clusters.
 	MaxInflightMsg int
+	// RaftCipher carries the AES-GCM Cipher used by the §4.2 raft
+	// envelope pre-apply hook. nil disables the hook (Stage 3
+	// default — production wiring lands once Stage 6's cluster
+	// flag flow is in place).
+	RaftCipher *encryption.Cipher
+	// RaftCutoverIndex returns the §7.1 Phase 2 raft envelope
+	// cutover index. Only entries whose Raft log index is strictly
+	// greater than this value go through Unwrap. nil ⇒ no cutover
+	// has been observed yet, equivalent to "raft envelope hook
+	// off".
+	RaftCutoverIndex RaftCutoverIndex
+	// ColdStartObserver receives the cold-start snapshot-restore
+	// skip-gate lifecycle events (skipped / executed / fallback).
+	// nil disables metrics; the skip itself still runs. See
+	// docs/design/2026_06_02_idempotent_snapshot_restore.md §9 and
+	// internal/raftengine/cold_start.go for the contract.
+	ColdStartObserver raftengine.ColdStartObserver
 }
 
 type Engine struct {
@@ -160,6 +203,16 @@ type Engine struct {
 	fsmSnapDir   string
 	tickInterval time.Duration
 	electionTick int
+	// joinAsLearner is captured from OpenConfig; consulted by
+	// alarmIfJoinedAsVoter on every post-apply ConfState. See §4.5 of
+	// the learner design doc.
+	joinAsLearner bool
+	// joinAlarmFired latches the join-as-learner alarm so the
+	// structured ERROR log fires once per process lifetime. Without
+	// the latch, every conf change after the misbehaving join would
+	// re-emit the log even though the operator has already been
+	// alerted by the metric counter. Stored as int32 for atomic CAS.
+	joinAlarmFired atomic.Bool
 
 	storage   *etcdraft.MemoryStorage
 	rawNode   *etcdraft.RawNode
@@ -167,6 +220,16 @@ type Engine struct {
 	fsm       StateMachine
 	peers     map[uint64]Peer
 	transport *GRPCTransport
+
+	// raftCipher and raftCutoverIndex implement the §4.2 / §6.3
+	// pre-apply unwrap hook. raftCipher is nil unless the
+	// OpenConfig wiring is provided; raftCutoverIndex is set to a
+	// permanent-no-op default by Open so applyNormalEntry never
+	// branches on a nil callback. Both are read-only after Open
+	// (single-writer discipline matches the rest of the apply-loop
+	// state).
+	raftCipher       *encryption.Cipher
+	raftCutoverIndex RaftCutoverIndex
 
 	nextRequestID atomic.Uint64
 
@@ -218,6 +281,19 @@ type Engine struct {
 	runErr  error
 	closed  bool
 	applied uint64
+	// voterCount is the count of nodes in the latest applied
+	// ConfState.Voters (including self if voter). isLearnerNode is the
+	// matching set membership lookup keyed by node ID. Both are written
+	// only from the apply loop after rawNode.ApplyConfChange returns
+	// the new ConfState; both are read under e.mu on the lease-read /
+	// quorum-ack hot path. The cache exists to keep
+	// followerQuorumForClusterSize and the singleNodeLeaderAckMonoNs
+	// fast path from inflating the denominator with learners. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6. Rebuilt
+	// from scratch on each conf change — never patched — so promotion
+	// of a learner cannot leak a stale isLearnerNode[id]==true entry.
+	voterCount    int
+	isLearnerNode map[uint64]bool
 	// appliedIndex mirrors the current applied-entry index for
 	// lock-free readers on the lease-read fast path. Writers inside
 	// the Raft run loop update both `applied` (protected by the run
@@ -254,18 +330,21 @@ type Engine struct {
 	stepQueueFullCount atomic.Uint64
 
 	// ackTracker records per-peer last-response times on the leader and
-	// publishes the majority-ack instant via quorumAckUnixNano. It is
+	// publishes the majority-ack instant via quorumAckMonoNs. It is
 	// read lock-free from LastQuorumAck() on the hot lease-read path
 	// and updated inside the single event-loop goroutine from
 	// handleStep when a follower response arrives.
 	ackTracker quorumAckTracker
-	// singleNodeLeaderAckUnixNano short-circuits LastQuorumAck on the
+	// singleNodeLeaderAckMonoNs short-circuits LastQuorumAck on the
 	// single-node leader path: self IS the quorum, so there are no
 	// follower responses to observe. refreshStatus keeps this value
-	// current (set to time.Now().UnixNano() each tick while leader and
-	// cluster size is 1; cleared otherwise) so the lease-read hot path
-	// never has to acquire e.mu to check peer count or leader state.
-	singleNodeLeaderAckUnixNano atomic.Int64
+	// current (set to monoclock.Now().Nanos() each tick while leader
+	// and cluster size is 1; cleared otherwise) so the lease-read hot
+	// path never has to acquire e.mu to check peer count or leader
+	// state. Stored as int64 nanoseconds on the CLOCK_MONOTONIC_RAW
+	// scale so the lease comparison is immune to NTP rate adjustment
+	// and wall-clock steps (see internal/monoclock).
+	singleNodeLeaderAckMonoNs atomic.Int64
 	// isLeader mirrors status.State == StateLeader for lock-free reads
 	// on the hot path. refreshStatus writes it on every tick;
 	// recordQuorumAck reads it before admitting a follower response
@@ -288,6 +367,24 @@ type Engine struct {
 	leaderLossCbsMu sync.Mutex
 	leaderLossCbs   []leaderLossSlot
 
+	// leaderAcquiredCbsMu guards the slice of callbacks invoked when
+	// the node transitions INTO the leader role. Callbacks fire
+	// synchronously from refreshStatus on the previous!=Leader →
+	// status==Leader edge. The MUST-be-non-blocking contract is the
+	// same as leaderLossCbs — a slow callback would stall every
+	// other holder of the same engine. See
+	// RegisterLeaderAcquiredCallback for the full contract.
+	//
+	// The acquired-side mirror exists so per-shard policy hooks
+	// (SQS HT-FIFO leadership-refusal in §8 of the split-queue FIFO
+	// design) can audit "we just became leader, are we still
+	// allowed to be?" without polling. Pairing the slot with a
+	// sentinel pointer mirrors the leader-loss design and lets
+	// deregister identify THIS registration when the same fn is
+	// registered multiple times.
+	leaderAcquiredCbsMu sync.Mutex
+	leaderAcquiredCbs   []leaderAcquiredSlot
+
 	pendingProposals map[uint64]proposalRequest
 	pendingReads     map[uint64]readRequest
 	pendingConfigs   map[uint64]adminRequest
@@ -301,15 +398,26 @@ const (
 	adminActionAddVoter adminAction = iota + 1
 	adminActionRemoveServer
 	adminActionTransferLeadership
+	adminActionAddLearner
+	adminActionPromoteLearner
 )
 
 type adminRequest struct {
-	ctx       context.Context
-	id        uint64
-	action    adminAction
-	peer      Peer
-	prevIndex uint64
-	done      chan adminResult
+	ctx context.Context
+	id  uint64
+	// minAppliedIndex is the PromoteLearner precondition: the learner's
+	// Progress.Match on the leader must reach this index before the
+	// promotion proposal is submitted.
+	minAppliedIndex uint64
+	// skipMinAppliedCheck explicitly opts out of the precondition.
+	// Required when minAppliedIndex == 0; otherwise the engine
+	// rejects the request with errPromoteLearnerMinAppliedZero so a
+	// missing argument cannot silently disable the safety check.
+	skipMinAppliedCheck bool
+	action              adminAction
+	peer                Peer
+	prevIndex           uint64
+	done                chan adminResult
 }
 
 type adminResult struct {
@@ -426,12 +534,15 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		fsmSnapDir:       filepath.Join(prepared.cfg.DataDir, fsmSnapDirName),
 		tickInterval:     prepared.cfg.TickInterval,
 		electionTick:     prepared.cfg.ElectionTick,
+		joinAsLearner:    prepared.cfg.JoinAsLearner,
 		storage:          prepared.disk.Storage,
 		rawNode:          rawNode,
 		persist:          prepared.disk.Persist,
 		fsm:              prepared.cfg.StateMachine,
 		peers:            peerMap,
 		transport:        prepared.cfg.Transport,
+		raftCipher:       prepared.cfg.RaftCipher,
+		raftCutoverIndex: orInertCutover(prepared.cfg.RaftCutoverIndex),
 		proposeCh:        make(chan proposalRequest),
 		readCh:           make(chan readRequest),
 		adminCh:          make(chan adminRequest),
@@ -442,7 +553,9 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		startedCh:        make(chan struct{}),
 		leaderReady:      make(chan struct{}),
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
-		applied:          maxAppliedIndex(prepared.disk.LocalSnap),
+		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
+		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
+		applied:          coldStartApplied(prepared.disk),
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
@@ -457,10 +570,21 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
-	engine.appliedIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
+	engine.appliedIndex.Store(coldStartApplied(prepared.disk))
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
+	// Fire the join-as-learner alarm against the persisted snapshot's
+	// ConfState. Without this, a node that mis-joined as voter and is
+	// then restarted with --raftJoinAsLearner=true would never emit
+	// the alarm: applyConfigChange / applyConfigChangeV2 /
+	// applyReadySnapshot are the only other call sites and a clean
+	// open path bypasses all three (the snapshot is loaded from disk,
+	// not replayed). The alarm latch
+	// (joinAlarmFired.CompareAndSwap) guarantees it fires at most
+	// once per process even if a later snapshot or conf change
+	// reapplies the same role assignment. See learner design doc §4.5.
+	engine.alarmIfJoinedAsVoter(prepared.disk.LocalSnap.Metadata.ConfState)
 	// Surface a misconfiguration where the tick settings produce a
 	// non-positive lease window: lease reads would never hit the fast
 	// path. Don't fail Open -- the engine is still functional via the
@@ -509,6 +633,13 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
 	}
+	// Annotate suffrage from the persisted snapshot's ConfState before
+	// saving the peers file. The operator-supplied peer list has no
+	// suffrage info; without this, savePersistedPeers would write
+	// every peer as a voter, then a learner's restart would land on
+	// a peers file that contradicts the snapshot's ConfState.Learners
+	// and validateConfState would reject the cluster on next open.
+	annotatePeerSuffrageInSlice(peers, disk.LocalSnap.Metadata.ConfState)
 	if err := savePersistedPeers(cfg.DataDir, maxUint64(maxAppliedIndex(disk.LocalSnap), persistedPeers.Index), peers); err != nil {
 		_ = closePersist(disk.Persist)
 		return preparedOpenState{}, err
@@ -604,6 +735,34 @@ func (e *Engine) Close() error {
 }
 
 func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.propose(ctx, data)
+}
+
+// ProposeAdmin drives a control-plane proposal that must remain
+// admissible across the §7.1 quiescence barrier — currently the
+// EnableRaftEnvelope cutover entry and ConfChange-time
+// RegisterEncryptionWriter proposals (see raftengine.Proposer's
+// contract for the full exempt set).
+//
+// The barrier exemption is the SOLE divergence from Propose: a
+// higher-layer wrap (kv.wrappedProposer) applies its wrap closure
+// to both methods identically, so admin entries landing above the
+// raft-envelope cutover still carry the AEAD envelope the §6.3
+// strict-`>` apply hook expects. Only the cutover marker itself is
+// cleartext, and it bypasses the wrap layer at the call site
+// (raw engine reference), not at the method level.
+//
+// In the current build ProposeAdmin is operationally identical to
+// Propose; Stage 6E-2d adds the barrier check on Propose only.
+// The two methods are kept distinct from the outset so the
+// migration of call sites (this PR) lands ahead of the behaviour
+// change (6E-2d) — calling Propose from an exempt site today is
+// silently wrong tomorrow.
+func (e *Engine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
+	return e.propose(ctx, data)
+}
+
+func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -718,29 +877,31 @@ func (e *Engine) AppliedIndex() uint64 {
 	return e.appliedIndex.Load()
 }
 
-// LastQuorumAck returns the wall-clock instant by which a majority of
-// followers most recently responded to the leader, or the zero time
-// when no such observation exists (follower / candidate / startup).
+// LastQuorumAck returns the monotonic-raw instant by which a majority
+// of followers most recently responded to the leader, or the zero
+// Instant when no such observation exists (follower / candidate /
+// startup).
 //
 // Lock-free: reads atomic.Int64 values published by recordQuorumAck
 // (multi-node cluster) or refreshStatus (single-node cluster keeps
-// singleNodeLeaderAckUnixNano alive with time.Now() while leader, so
-// the hot lease-read path performs zero lock work). See
-// raftengine.LeaseProvider for the lease-read correctness contract.
-func (e *Engine) LastQuorumAck() time.Time {
+// singleNodeLeaderAckMonoNs alive with monoclock.Now() while leader,
+// so the hot lease-read path performs zero lock work). The monotonic-
+// raw source keeps the lease safe against NTP-slew / wall-clock-step
+// events; see raftengine.LeaseProvider for the correctness contract.
+func (e *Engine) LastQuorumAck() monoclock.Instant {
 	if e == nil {
-		return time.Time{}
+		return monoclock.Zero
 	}
 	// Honor the LeaseProvider contract that non-leaders always return
-	// the zero time. Without this guard a late MsgAppResp that sneaks
-	// past recordQuorumAck (or a tracker entry that survived a brief
-	// step-down/step-up window) could leak stale liveness into the
-	// caller's fast-path validation.
+	// the zero Instant. Without this guard a late MsgAppResp that
+	// sneaks past recordQuorumAck (or a tracker entry that survived a
+	// brief step-down/step-up window) could leak stale liveness into
+	// the caller's fast-path validation.
 	if !e.isLeader.Load() {
-		return time.Time{}
+		return monoclock.Zero
 	}
-	if ns := e.singleNodeLeaderAckUnixNano.Load(); ns != 0 {
-		return time.Unix(0, ns)
+	if ns := e.singleNodeLeaderAckMonoNs.Load(); ns != 0 {
+		return monoclock.FromNanos(ns)
 	}
 	return e.ackTracker.load()
 }
@@ -750,7 +911,7 @@ func (e *Engine) LastQuorumAck() time.Time {
 // heartbeat channel was full. Monotonic across the life of the engine.
 // Surfaced to Prometheus via the monitoring package so the hot-path
 // dashboard can graph stepCh saturation alongside LinearizableRead
-// rate (see monitoring/grafana/dashboards/elastickv-redis-hotpath.json).
+// rate (see the "Hot Path" row in monitoring/grafana/dashboards/elastickv-redis-summary.json).
 func (e *Engine) DispatchDropCount() uint64 {
 	if e == nil {
 		return 0
@@ -846,44 +1007,15 @@ func (e *Engine) RegisterLeaderLossCallback(fn func()) (deregister func()) {
 	if e == nil || fn == nil {
 		return func() {}
 	}
-	// Allocate a unique sentinel pointer so the deregister closure can
-	// identify THIS specific registration even if the same fn is
-	// registered multiple times.
-	slot := &struct{ fn func() }{fn: fn}
-	e.leaderLossCbsMu.Lock()
-	e.leaderLossCbs = append(e.leaderLossCbs, leaderLossSlot{id: slot, fn: fn})
-	e.leaderLossCbsMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			e.leaderLossCbsMu.Lock()
-			defer e.leaderLossCbsMu.Unlock()
-			for i, c := range e.leaderLossCbs {
-				if c.id != slot {
-					continue
-				}
-				// Remove without leaving a dangling reference at the
-				// tail of the underlying array. The removed slot's fn
-				// typically captures a *Coordinate; a plain
-				// `append(cbs[:i], cbs[i+1:]...)` would keep the old
-				// backing cell alive and prevent GC of the associated
-				// Coordinate until the engine itself is dropped.
-				last := len(e.leaderLossCbs) - 1
-				copy(e.leaderLossCbs[i:], e.leaderLossCbs[i+1:])
-				e.leaderLossCbs[last] = leaderLossSlot{}
-				e.leaderLossCbs = e.leaderLossCbs[:last]
-				return
-			}
-		})
-	}
+	return registerLeaderCallback(&e.leaderLossCbsMu, &e.leaderLossCbs, fn)
 }
 
 // leaderLossSlot pairs a registered callback with an id-only sentinel
-// pointer so deregister can distinguish identical fn values.
-type leaderLossSlot struct {
-	id *struct{ fn func() }
-	fn func()
-}
+// pointer so deregister can distinguish identical fn values. Aliased
+// to leaderCallbackSlot so the leader-loss and leader-acquired slices
+// share the same in-memory shape — the register / fire helpers are
+// generic over this single slot type.
+type leaderLossSlot = leaderCallbackSlot
 
 // fireLeaderLossCallbacks invokes all registered callbacks
 // synchronously. The registered-callback contract requires each fn
@@ -896,15 +1028,146 @@ type leaderLossSlot struct {
 // invokeLeaderLossCallback) so a bug in one holder cannot break
 // subsequent callbacks or crash the process.
 func (e *Engine) fireLeaderLossCallbacks() {
-	e.leaderLossCbsMu.Lock()
-	cbs := make([]func(), len(e.leaderLossCbs))
-	for i, c := range e.leaderLossCbs {
-		cbs[i] = c.fn
-	}
-	e.leaderLossCbsMu.Unlock()
-	for _, fn := range cbs {
+	for _, fn := range gatherLeaderCallbacks(&e.leaderLossCbsMu, &e.leaderLossCbs) {
 		e.invokeLeaderLossCallback(fn)
 	}
+}
+
+// leaderCallbackSlot is the shared on-disk shape for leader-loss
+// and leader-acquired callback registrations. The id pointer is a
+// per-registration sentinel so deregister can target THIS specific
+// entry even when the same fn is registered multiple times.
+type leaderCallbackSlot struct {
+	id *struct{ fn func() }
+	fn func()
+}
+
+// registerLeaderCallback installs fn into the (mu, cbs) callback
+// slice and returns a deregister closure. Shared by leader-loss
+// and leader-acquired registration so the slot-management /
+// dangling-reference / sync.Once-deregister logic lives in one
+// place. The two callback families differ only in which (mu, slice)
+// pair they target — the firing semantics, the sentinel-pointer
+// disambiguation, and the GC-safe slice truncation are identical.
+func registerLeaderCallback(mu *sync.Mutex, cbs *[]leaderCallbackSlot, fn func()) (deregister func()) {
+	// Allocate a unique sentinel pointer so the deregister closure
+	// can identify THIS specific registration even if the same fn
+	// is registered multiple times.
+	slot := &struct{ fn func() }{fn: fn}
+	mu.Lock()
+	*cbs = append(*cbs, leaderCallbackSlot{id: slot, fn: fn})
+	mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for i, c := range *cbs {
+				if c.id != slot {
+					continue
+				}
+				// Remove without leaving a dangling reference at
+				// the tail of the underlying array. The removed
+				// slot's fn typically captures a *Coordinate; a
+				// plain `append(cbs[:i], cbs[i+1:]...)` would keep
+				// the old backing cell alive and prevent GC of the
+				// associated Coordinate until the engine itself is
+				// dropped.
+				last := len(*cbs) - 1
+				copy((*cbs)[i:], (*cbs)[i+1:])
+				(*cbs)[last] = leaderCallbackSlot{}
+				*cbs = (*cbs)[:last]
+				return
+			}
+		})
+	}
+}
+
+// gatherLeaderCallbacks copies the live fn list out from under the
+// mutex so callers can fire them without holding the lock.
+// Mirrors the snapshot-then-fire pattern used by the per-callback
+// invoke helpers.
+//
+// Takes a *pointer* to the slice (not the slice itself) so the
+// header (pointer, length, capacity) is read INSIDE the locked
+// section. Passing the slice by value would dereference the
+// header at the call site — i.e. before mu.Lock() — racing with
+// any concurrent registerLeaderCallback. The pointer parameter
+// closes that race (codex P1 / gemini high on PR #723).
+func gatherLeaderCallbacks(mu *sync.Mutex, cbs *[]leaderCallbackSlot) []func() {
+	mu.Lock()
+	defer mu.Unlock()
+	out := make([]func(), len(*cbs))
+	for i, c := range *cbs {
+		out[i] = c.fn
+	}
+	return out
+}
+
+// RegisterLeaderAcquiredCallback registers fn to fire every time
+// the local node's Raft state transitions INTO leader (initial
+// election win, re-election after partition heal, leadership
+// transfer target completion). Callbacks fire on the
+// previous!=Leader → status==Leader edge in refreshStatus, after
+// e.isLeader has been published, so a callback that reads
+// engine.State() observes StateLeader.
+//
+// Use case: per-shard policy that needs to audit a freshly-acquired
+// leadership ("am I still allowed to be leader of this group?").
+// SQS HT-FIFO leadership-refusal (§8 of the split-queue FIFO
+// design) hangs off this hook to TransferLeadership when the
+// binary lacks the htfifo capability but a partitioned queue is
+// mapped to this Raft group.
+//
+// Callbacks run synchronously from refreshStatus and MUST be
+// non-blocking — same contract as RegisterLeaderLossCallback. A
+// callback wanting to do real work (e.g. enumerate the catalog,
+// call TransferLeadership) MUST offload to a goroutine.
+//
+// A panic inside a callback is contained and logged so a bug in
+// one holder cannot crash the engine or break other callbacks.
+//
+// The returned deregister function removes this specific
+// registration and is safe to call multiple times.
+func (e *Engine) RegisterLeaderAcquiredCallback(fn func()) (deregister func()) {
+	if e == nil || fn == nil {
+		return func() {}
+	}
+	return registerLeaderCallback(&e.leaderAcquiredCbsMu, &e.leaderAcquiredCbs, fn)
+}
+
+// leaderAcquiredSlot is the leader-acquired companion to
+// leaderLossSlot — both alias the shared leaderCallbackSlot so a
+// single set of register / fire helpers serves both transitions.
+type leaderAcquiredSlot = leaderCallbackSlot
+
+// fireLeaderAcquiredCallbacks invokes all registered callbacks
+// synchronously. Same panic-containment + non-blocking contract
+// as fireLeaderLossCallbacks.
+func (e *Engine) fireLeaderAcquiredCallbacks() {
+	for _, fn := range gatherLeaderCallbacks(&e.leaderAcquiredCbsMu, &e.leaderAcquiredCbs) {
+		e.invokeLeaderAcquiredCallback(fn)
+	}
+}
+
+func (e *Engine) invokeLeaderAcquiredCallback(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Mirror the leader-loss panic log shape so operator
+			// triage of either family produces the same fields.
+			// Without node identity and the stack, an SQS
+			// leadership-refusal hook panicking in production
+			// would leave only the recovered value to grep on
+			// (gemini medium / claude finding 1 on PR #723).
+			slog.Error("etcd raft engine: leader-acquired callback panicked",
+				slog.String("node_id", e.localID),
+				slog.Uint64("raft_node_id", e.nodeID),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+	fn()
 }
 
 func (e *Engine) invokeLeaderLossCallback(fn func()) {
@@ -998,6 +1261,51 @@ func (e *Engine) AddVoter(ctx context.Context, id string, address string, prevIn
 	return result.index, nil
 }
 
+// AddLearner attaches a non-voting replica. The learner is added via
+// V1 ConfChangeAddLearnerNode and starts receiving log entries
+// immediately, but does not contribute to the voter quorum until
+// promoted with PromoteLearner.
+func (e *Engine) AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error) {
+	peer, err := e.resolveAdminPeer(id, address)
+	if err != nil {
+		return 0, err
+	}
+	result, err := e.submitAdmin(ctx, adminActionAddLearner, peer, prevIndex)
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
+// PromoteLearner promotes an existing learner to voter via V1
+// ConfChangeAddNode. The minAppliedIndex precondition rejects the
+// call if the learner's leader-side Progress.Match has not reached
+// that index yet, so an operator who promotes too eagerly gets a
+// clean FailedPrecondition error instead of a silent quorum stall.
+//
+// minAppliedIndex == 0 is rejected unless skipMinAppliedCheck is
+// also true. Set skipMinAppliedCheck only when the catch-up has
+// been confirmed out-of-band.
+func (e *Engine) PromoteLearner(ctx context.Context, id string, prevIndex uint64, minAppliedIndex uint64, skipMinAppliedCheck bool) (uint64, error) {
+	if id == "" {
+		return 0, errors.WithStack(errPeerIDRequired)
+	}
+	if minAppliedIndex == 0 && !skipMinAppliedCheck {
+		return 0, errors.WithStack(errPromoteLearnerMinAppliedZero)
+	}
+	result, err := e.submitAdminEx(ctx, adminRequest{
+		action:              adminActionPromoteLearner,
+		peer:                Peer{ID: id},
+		prevIndex:           prevIndex,
+		minAppliedIndex:     minAppliedIndex,
+		skipMinAppliedCheck: skipMinAppliedCheck,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return result.index, nil
+}
+
 func (e *Engine) RemoveServer(ctx context.Context, id string, prevIndex uint64) (uint64, error) {
 	result, err := e.submitAdmin(ctx, adminActionRemoveServer, Peer{ID: id}, prevIndex)
 	if err != nil {
@@ -1023,20 +1331,28 @@ func (e *Engine) TransferLeadershipToServer(ctx context.Context, id string, addr
 }
 
 func (e *Engine) submitAdmin(ctx context.Context, action adminAction, peer Peer, prevIndex uint64) (adminResult, error) {
+	return e.submitAdminEx(ctx, adminRequest{
+		action:    action,
+		peer:      peer,
+		prevIndex: prevIndex,
+	})
+}
+
+// submitAdminEx is the underlying admin submit path. The caller
+// populates action, peer, prevIndex, and (for PromoteLearner)
+// minAppliedIndex; ctx, id, and done are filled in here so the
+// request integrates with the engine event loop the same way the
+// existing AddVoter / RemoveServer paths do.
+func (e *Engine) submitAdminEx(ctx context.Context, req adminRequest) (adminResult, error) {
 	if err := contextErr(ctx); err != nil {
 		return adminResult{}, err
 	}
 	if e == nil {
 		return adminResult{}, errors.WithStack(errNilEngine)
 	}
-	req := adminRequest{
-		ctx:       ctx,
-		id:        e.nextID(),
-		action:    action,
-		peer:      peer,
-		prevIndex: prevIndex,
-		done:      make(chan adminResult, 1),
-	}
+	req.ctx = ctx
+	req.id = e.nextID()
+	req.done = make(chan adminResult, 1)
 
 	select {
 	case <-ctx.Done():
@@ -1218,10 +1534,12 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 }
 
 // postDispatchReport delivers a dispatch failure to the event loop without
-// blocking the worker. If the channel is full (unlikely — the buffer is
-// sized to MaxInflightMsg), the report is dropped and logged; this is
-// acceptable because raft will retry on the next tick and we only need
-// eventual consistency between transport state and Progress state.
+// blocking the caller. Dispatch workers use it for transport failures, and the
+// event loop uses it for local queue drops before transport. If the channel is
+// full (unlikely — the buffer is sized to MaxInflightMsg), the report is
+// dropped and logged; this is acceptable because raft will retry on the next
+// tick and we only need eventual consistency between transport state and
+// Progress state.
 func (e *Engine) postDispatchReport(report dispatchReport) {
 	select {
 	case e.dispatchReportCh <- report:
@@ -1297,9 +1615,17 @@ func (e *Engine) handleAdmin(req adminRequest) {
 		return
 	}
 
+	e.dispatchAdminAction(req)
+}
+
+func (e *Engine) dispatchAdminAction(req adminRequest) {
 	switch req.action {
 	case adminActionAddVoter:
 		e.handleAddVoter(req)
+	case adminActionAddLearner:
+		e.handleAddLearner(req)
+	case adminActionPromoteLearner:
+		e.handlePromoteLearner(req)
 	case adminActionRemoveServer:
 		e.handleRemoveServer(req)
 	case adminActionTransferLeadership:
@@ -1310,14 +1636,74 @@ func (e *Engine) handleAdmin(req adminRequest) {
 }
 
 func (e *Engine) handleAddVoter(req adminRequest) {
-	contextBytes, err := encodeConfChangeContext(req.id, req.peer)
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddNode, req.peer)
+}
+
+// handleAddLearner submits a ConfChangeAddLearnerNode for a fresh
+// non-voting peer. It runs on the single-threaded admin loop.
+func (e *Engine) handleAddLearner(req adminRequest) {
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddLearnerNode, req.peer)
+}
+
+// handlePromoteLearner promotes an existing learner to voter via
+// ConfChangeAddNode. The two preconditions both run synchronously
+// here, before the propose, so a failed precondition does not enter
+// the log:
+//  1. the peer must currently be a learner (in ConfState.Learners,
+//     not in ConfState.Voters);
+//  2. when minAppliedIndex is non-zero, the leader-side
+//     Progress[nodeID].Match must already be >= minAppliedIndex.
+func (e *Engine) handlePromoteLearner(req adminRequest) {
+	peer, ok := e.peerForID(req.peer.ID)
+	if !ok {
+		req.done <- adminResult{err: errors.Wrapf(errTransportPeerUnknown, "id=%q", req.peer.ID)}
+		return
+	}
+	e.mu.RLock()
+	isLearner := e.isLearnerNode[peer.NodeID]
+	e.mu.RUnlock()
+	if !isLearner {
+		req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNotLearner, "id=%q", req.peer.ID)}
+		return
+	}
+	// PromoteLearner gates on a minAppliedIndex catch-up check by
+	// default; only an explicit skipMinAppliedCheck disables it. The
+	// engine-side guard in PromoteLearner already rejects
+	// minAppliedIndex == 0 without skipMinAppliedCheck, so by the
+	// time we reach the apply-loop handler one of these is true:
+	//   * minAppliedIndex > 0  -> verify against Progress.Match
+	//   * skipMinAppliedCheck  -> caller has confirmed out-of-band
+	if !req.skipMinAppliedCheck {
+		// rawNode.Status() is safe here: handlePromoteLearner runs on
+		// the same goroutine that owns rawNode, so no clone or lock
+		// is required.
+		status := e.rawNode.Status()
+		progress, ok := status.Progress[peer.NodeID]
+		if !ok {
+			req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNoProgress, "id=%q node=%d", peer.ID, peer.NodeID)}
+			return
+		}
+		if progress.Match < req.minAppliedIndex {
+			req.done <- adminResult{err: errors.Wrapf(errPromoteLearnerNotCaughtUp, "id=%q match=%d want>=%d", peer.ID, progress.Match, req.minAppliedIndex)}
+			return
+		}
+	}
+	e.proposeMembershipChange(req, raftpb.ConfChangeAddNode, peer)
+}
+
+// proposeMembershipChange wraps the encode + storePendingConfig +
+// ProposeConfChange dance shared by AddVoter / AddLearner /
+// PromoteLearner. The caller has already validated the leader and
+// prevIndex preconditions in handleAdmin.
+func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.ConfChangeType, peer Peer) {
+	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {
 		req.done <- adminResult{err: err}
 		return
 	}
 	cc := raftpb.ConfChange{
-		Type:    raftpb.ConfChangeAddNode,
-		NodeID:  req.peer.NodeID,
+		Type:    changeType,
+		NodeID:  peer.NodeID,
 		Context: contextBytes,
 	}
 	if err := e.storePendingConfig(req); err != nil {
@@ -1481,11 +1867,21 @@ func (e *Engine) recordQuorumAck(msg raftpb.Message) {
 	if _, ok := e.peers[msg.From]; !ok {
 		return
 	}
-	clusterSize := len(e.peers)
-	if clusterSize <= 1 {
+	// Reject acks from learners. A learner does not vote and must not
+	// contribute to the voter-majority denominator on the lease-read
+	// fast path. See docs/design/2026_04_26_proposed_raft_learner.md
+	// §4.6. Both e.peers and e.isLearnerNode are written from the
+	// apply loop (single writer for both), so reading here under the
+	// run-loop goroutine is race-free for the same reason as e.peers
+	// above.
+	if e.isLearnerNode[msg.From] {
 		return
 	}
-	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(clusterSize))
+	voterCount := e.voterCount
+	if voterCount <= 1 {
+		return
+	}
+	e.ackTracker.recordAck(msg.From, followerQuorumForClusterSize(voterCount))
 }
 
 // followerQuorumForClusterSize returns the number of non-self peer
@@ -1638,6 +2034,15 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 		if err != nil {
 			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.Metadata.Index)
 		}
+		// B3/follow-up: also call SetDurableAppliedIndex(tok.Index) here
+		// after Restore so peer-after-InstallSnapshot populates the meta
+		// key. The local-snapshot persist path already bumps the live
+		// store (engine.persistLocalSnapshotPayload), but the receiving
+		// node's restored store inherits the pre-bump value embedded in
+		// the snapshot artifact. Design Non-Goals §
+		// docs/design/2026_06_02_idempotent_snapshot_restore.md:71-74
+		// scopes this out of Branch 2; see PR #915 round-4/5 codex P2 on
+		// engine.go:4077 for the rationale.
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
 			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
 		}
@@ -1654,7 +2059,42 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	}
 	e.applied = snapshot.Metadata.Index
 	e.appliedIndex.Store(snapshot.Metadata.Index)
+	// Refresh the voter-cache from the snapshot's ConfState so
+	// downstream apply-loop reads (recordQuorumAck, refreshStatus,
+	// removePeer) see the post-snapshot voter set even before any
+	// further conf-change entries arrive. Mirrors the apply-loop
+	// sequence in applyConfigChange. The order matches §4.6:
+	// voterCache first, then config.Servers.
+	e.refreshVoterCache(snapshot.Metadata.ConfState)
 	e.setConfigurationFromConfState(snapshot.Metadata.ConfState, snapshot.Metadata.Index)
+	// Persist the post-snapshot peers file with suffrage drawn from
+	// the snapshot's ConfState so a learner that received catch-up
+	// state via snapshot (the common case for fresh joiners) writes
+	// a peers file that round-trips correctly across restart. The
+	// snapshot path bypasses the apply-loop's nextPeersAfterConfigChange
+	// hook, so without this the joiner's peers file would carry the
+	// pre-AddLearner suffrage forever. See learner design doc §4.3.
+	if err := e.savePeersFileForSnapshot(snapshot); err != nil {
+		return err
+	}
+	e.alarmIfJoinedAsVoter(snapshot.Metadata.ConfState)
+	return nil
+}
+
+// savePeersFileForSnapshot writes the v2 peers file with suffrage
+// drawn from the snapshot's ConfState. Idempotent: savePersistedPeers
+// short-circuits when the on-disk index already covers `index`.
+func (e *Engine) savePeersFileForSnapshot(snapshot raftpb.Snapshot) error {
+	e.mu.RLock()
+	peers := sortedPeerList(e.peers)
+	e.mu.RUnlock()
+	if len(peers) == 0 {
+		return nil
+	}
+	annotatePeerSuffrageInSlice(peers, snapshot.Metadata.ConfState)
+	if err := savePersistedPeers(e.dataDir, snapshot.Metadata.Index, peers); err != nil {
+		return errors.Wrapf(err, "save peers file from snapshot index=%d", snapshot.Metadata.Index)
+	}
 	return nil
 }
 
@@ -1721,37 +2161,19 @@ func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
 
 func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 	for _, entry := range entries {
+		var err error
 		switch entry.Type {
 		case raftpb.EntryNormal:
-			response := e.applyNormalEntry(entry)
-			e.setApplied(entry.Index)
-			e.resolveProposal(entry.Index, entry.Data, response)
+			err = e.applyNormalCommitted(entry)
 		case raftpb.EntryConfChange:
-			var cc raftpb.ConfChange
-			if err := cc.Unmarshal(entry.Data); err != nil {
-				return errors.WithStack(err)
-			}
-			confState := e.rawNode.ApplyConfChange(cc)
-			nextPeers := e.nextPeersAfterConfigChange(cc.Type, cc.NodeID, cc.Context, *confState)
-			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
-				return err
-			}
-			e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index)
-			e.setApplied(entry.Index)
+			err = e.applyConfChangeCommitted(entry)
 		case raftpb.EntryConfChangeV2:
-			var cc raftpb.ConfChangeV2
-			if err := cc.Unmarshal(entry.Data); err != nil {
-				return errors.WithStack(err)
-			}
-			confState := e.rawNode.ApplyConfChange(cc)
-			nextPeers := e.nextPeersAfterConfigChangeV2(cc, *confState)
-			if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
-				return err
-			}
-			e.applyConfigChangeV2(cc, entry.Index)
-			e.setApplied(entry.Index)
+			err = e.applyConfChangeV2Committed(entry)
 		default:
 			e.setApplied(entry.Index)
+		}
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1761,20 +2183,250 @@ func (e *Engine) applyCommitted(entries []raftpb.Entry) error {
 // lock-free atomic mirror in a single place. Called exclusively from
 // the Raft run loop, so no synchronization between the two writes is
 // required beyond the single-writer invariant.
+//
+// Advance-only: cold-start with EffectiveApplied > snapshot.Index
+// seeds e.applied with `have`, after which raft still delivers conf-
+// change entries from snapshot.Index+1..have whose applyConfChange*
+// path calls setApplied(entry.Index) with index < have. Allowing the
+// counter to walk backwards would break the e.appliedIndex.Load()
+// contract every other watcher depends on. Codex P1 #934.
 func (e *Engine) setApplied(index uint64) {
+	if index <= e.applied {
+		return
+	}
 	e.applied = index
 	e.appliedIndex.Store(index)
 }
 
-func (e *Engine) applyNormalEntry(entry raftpb.Entry) any {
-	if len(entry.Data) == 0 {
+// applyNormalCommitted is the EntryNormal arm of applyCommitted.
+// Extracted so applyCommitted stays under the cyclomatic-complexity
+// budget while preserving the load-bearing fail-closed semantics:
+// if applyNormalEntry surfaces an error, setApplied is NOT called
+// and the error propagates so runLoop's existing fatal-error path
+// can halt the process. Silent skip is never an option — the
+// integrity tag was added to detect divergence and skipping past
+// it would defeat that property (design §6.3).
+//
+// On the error path resolveProposal is intentionally NOT called: the
+// originating coordinator's done channel for this proposal is left
+// dangling. That is correct under the §6.3 process-fatal contract —
+// runLoop halts and the OS reaps the goroutine plus its channel as
+// part of process exit. A graceful resolveProposal on the error path
+// would deliver a nil/error response that the coordinator might mis-
+// interpret as a committed-but-failed apply (rather than the actual
+// "halting; please restart and retry" semantics).
+//
+// HaltApply seam: the StateMachine.Apply contract returns `any`
+// (no error), so an FSM that needs to signal "halt the apply loop"
+// (the §6.3 fatal-encryption-apply path) packs an error inside a
+// value implementing the HaltApply interface below. The applier
+// inspects the returned response for that interface and propagates
+// the error before setApplied — same fail-closed shape as the raft
+// envelope unwrap hook in applyNormalEntry. Non-fatal Apply errors
+// (today's *fsmApplyResponse, returned by kv batch apply) do NOT
+// implement HaltApply and continue to advance setApplied.
+func (e *Engine) applyNormalCommitted(entry raftpb.Entry) error {
+	// Cold-start idempotency: when the skip gate fires with the FSM
+	// past snapshot.Metadata.Index (have > tok.Index), e.applied is
+	// seeded with `have`. Raft still delivers entries
+	// snapshot.Metadata.Index+1..commit including the [snap.Index+1,
+	// have] tail, which the FSM has already applied. Re-calling
+	// applyNormalEntry on a KV/MVCC entry would re-execute the
+	// transaction (OCC conflicts; HLC ceiling inversion). Drop the
+	// duplicate without touching the FSM. setApplied is NOT called -
+	// e.applied is already >= entry.Index. Codex P1 #934.
+	//
+	// Codex P1 #934 round 7: volatile-only entries (HLC lease, tag
+	// 0x02) carry effects that live purely in process memory
+	// (HLC.SetPhysicalCeiling). Their post-snapshot effect must be
+	// re-applied on cold start; otherwise ApplySnapshotHeader restores
+	// only the older snapshot-time ceiling and the next leader-issued
+	// timestamp can collide with persisted commit_ts values stamped
+	// under the lost lease. applyNormalEntry routes those duplicates
+	// to fsm.Apply (which is monotonic and idempotent for HLC leases)
+	// and returns (nil, nil) for data-mutating duplicates so we fall
+	// through to the "no setApplied advance, no resolveProposal" arm.
+	duplicate := entry.Index <= e.applied
+	response, err := e.applyNormalEntry(entry, duplicate)
+	if err != nil {
+		return err
+	}
+	if h, ok := response.(interface{ HaltApply() error }); ok {
+		if herr := h.HaltApply(); herr != nil {
+			slog.Error("encryption FSM apply requested halt; not advancing setApplied",
+				slog.Uint64("entry_index", entry.Index),
+				slog.Any("err", herr))
+			return errors.Wrap(herr, "raftengine/etcd: FSM-requested apply halt")
+		}
+	}
+	if duplicate {
+		// Volatile-only entries replayed for their in-memory effect
+		// (e.applied already past) or data-mutating duplicates
+		// dropped inside applyNormalEntry — either way the engine's
+		// applied pointer and pending-proposal map stay untouched.
 		return nil
+	}
+	e.setApplied(entry.Index)
+	e.resolveProposal(entry.Index, entry.Data, response)
+	return nil
+}
+
+// applyConfChangeCommitted is the EntryConfChange arm of
+// applyCommitted (extracted for cyclomatic-budget hygiene; see
+// applyNormalCommitted).
+func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
+	var cc raftpb.ConfChange
+	if err := cc.Unmarshal(entry.Data); err != nil {
+		return errors.WithStack(err)
+	}
+	confState := e.rawNode.ApplyConfChange(cc)
+	nextPeers := e.nextPeersAfterConfigChange(cc.Type, cc.NodeID, cc.Context, *confState)
+	if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
+		return err
+	}
+	e.applyConfigChange(cc.Type, cc.NodeID, cc.Context, entry.Index, *confState)
+	e.setApplied(entry.Index)
+	return nil
+}
+
+// applyConfChangeV2Committed is the EntryConfChangeV2 arm of
+// applyCommitted.
+func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
+	var cc raftpb.ConfChangeV2
+	if err := cc.Unmarshal(entry.Data); err != nil {
+		return errors.WithStack(err)
+	}
+	confState := e.rawNode.ApplyConfChange(cc)
+	nextPeers := e.nextPeersAfterConfigChangeV2(cc, *confState)
+	if err := e.persistConfigState(entry.Index, *confState, nextPeers); err != nil {
+		return err
+	}
+	e.applyConfigChangeV2(cc, entry.Index, *confState)
+	e.setApplied(entry.Index)
+	return nil
+}
+
+// applyNormalEntry decodes the raft envelope, optionally unwraps the
+// cipher payload, and dispatches to fsm.Apply.
+//
+// dropIfNonVolatile is the cold-start idempotency seam. When the skip
+// gate fires the engine still receives WAL committed-tail entries past
+// snapshot.Metadata.Index; data-mutating duplicates must NOT call
+// fsm.Apply (OCC re-validation, ceiling regression, sidecar drift) but
+// volatile-only entries (HLC lease) MUST still call fsm.Apply for
+// their in-memory monotonic effect. The classifier inspects the
+// cleartext payload AFTER raft envelope decode + decryption — the
+// raftEncodeHLCLease tag (0x02) is only visible there in the
+// post-cutover path, so the cleartext-side decision is the only
+// correct one. Codex P1 #934 round 7.
+//
+// dropIfNonVolatile=false preserves the original semantics: every
+// decodable entry is handed to fsm.Apply. dropIfNonVolatile=true
+// gates the fsm.Apply call on VolatileEntryClassifier.IsVolatileOnlyPayload
+// and returns (nil, nil) for data-mutating duplicates so the caller's
+// "no setApplied advance" arm fires unchanged.
+func (e *Engine) applyNormalEntry(entry raftpb.Entry, dropIfNonVolatile bool) (any, error) {
+	if len(entry.Data) == 0 {
+		return nil, nil
 	}
 	_, payload, ok := decodeProposalEnvelope(entry.Data)
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	return e.fsm.Apply(payload)
+	// §6.3 raft envelope pre-apply hook. The order is load-bearing:
+	//   1. decodeProposalEnvelope already ran above to recover
+	//      (id, payload). This is what keeps resolveProposal's
+	//      proposal-ID lookup working — entry.Data still starts
+	//      with 0x01 proposalEnvelopeVersion.
+	//   2. If entry.Index is past the cluster-wide cutover, the
+	//      inner fsm payload is a raft envelope and MUST be
+	//      unwrapped via the raft DEK. Strict greater-than:
+	//      entry.Index == cutover is itself the enable-raft-
+	//      envelope flag entry and is NOT raft-DEK-wrapped
+	//      (§7.1). If the cipher is missing while cutover is
+	//      active, fail closed with ErrRaftUnwrapFailed —
+	//      handing wrapped envelope bytes to fsm.Apply would
+	//      diverge this node from peers that successfully
+	//      unwrapped, exactly the safety property the integrity
+	//      tag was added to detect.
+	//   3. Hand the (now cleartext) payload to fsm.Apply. The
+	//      FSM contract is unchanged at Apply(data []byte) any —
+	//      the FSM never sees a raft envelope. If the FSM also
+	//      implements raftengine.ApplyIndexAware, the engine
+	//      delivers entry.Index via SetApplyIndex immediately
+	//      before Apply (same goroutine, serial under applyMu) so
+	//      apply handlers that need to persist the entry index
+	//      atomically with their other side-effects (e.g. the
+	//      encryption applier's sidecar.RaftAppliedIndex write for
+	//      the §9.1 ErrSidecarBehindRaftLog guard) can read it
+	//      without changing the StateMachine signature.
+	//
+	// FSM payload aliasing: when the cipher path is OFF, payload
+	// is a slice into entry.Data's backing array (DecodeProposalEnvelope
+	// returns a sub-slice). When the cipher path is ON, payload is
+	// a fresh allocation from cipher.Decrypt. FSM implementations
+	// MUST NOT retain `data` past Apply's return without copying,
+	// or the cipher / no-cipher paths will diverge in ownership.
+	// Stage 6 plans a defensive copy at the apply boundary so the
+	// contract becomes uniform regardless of cipher state.
+	if entry.Index > e.raftCutoverIndex() {
+		if e.raftCipher == nil {
+			// Cutover is active (a non-default cutover index has
+			// elected this entry as wrapped) but the cipher is
+			// missing — sidecar/init race or operator misconfig.
+			// Refuse to apply: a silent skip would diverge state
+			// permanently from peers that DID unwrap.
+			slog.Error("raft envelope cutover active but no cipher configured; halting apply",
+				slog.Uint64("entry_index", entry.Index),
+				slog.Uint64("cutover_index", e.raftCutoverIndex()))
+			return nil, errors.Wrap(ErrRaftUnwrapFailed,
+				"raftengine/etcd: entry past raft envelope cutover but no raft cipher wired")
+		}
+		plain, err := unwrapRaftPayload(e.raftCipher, payload)
+		if err != nil {
+			slog.Error("raft envelope unwrap failed; halting apply",
+				slog.Uint64("entry_index", entry.Index),
+				slog.Any("err", err))
+			return nil, err
+		}
+		payload = plain
+	}
+	if dropIfNonVolatile && !e.isVolatilePayload(payload) {
+		return nil, nil
+	}
+	// SetApplyIndex is suppressed on the duplicate-replay path
+	// because pendingApplyIdx is documented as "the entry index the
+	// engine is about to apply". On a volatile replay entry.Index is
+	// BELOW e.applied; writing it would feed a stale index to any
+	// future durability sink (encryption sidecar.RaftAppliedIndex,
+	// ApplyMutationsRaftAt's metaAppliedIndex bundle). Today's only
+	// volatile entry (HLC lease) does not read pendingApplyIdx so
+	// this is a no-op, but it future-proofs the seam against a new
+	// volatile entry type that also persists. Claude #934 round 7
+	// finding R7-F1.
+	if !dropIfNonVolatile {
+		if aware, ok := e.fsm.(raftengine.ApplyIndexAware); ok {
+			aware.SetApplyIndex(entry.Index)
+		}
+	}
+	return e.fsm.Apply(payload), nil
+}
+
+// isVolatilePayload is the cold-start duplicate guard's cleartext
+// classifier. Only volatile-only payloads (HLC lease, tag 0x02) may
+// be re-applied past e.applied; data-mutating entries return false so
+// the caller drops them. The check runs AFTER raft envelope
+// decryption because post-cutover the cleartext payload's leading
+// byte is the only reliable carrier of the entry-kind tag. FSMs that
+// do not implement VolatileEntryClassifier default to false
+// (drop-all), preserving the pre-PR semantics for engines that
+// haven't opted in. Codex P1 #934 round 7.
+func (e *Engine) isVolatilePayload(payload []byte) bool {
+	classifier, ok := e.fsm.(raftengine.VolatileEntryClassifier)
+	if !ok {
+		return false
+	}
+	return classifier.IsVolatileOnlyPayload(payload)
 }
 
 func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) {
@@ -1794,33 +2446,114 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 	}
 }
 
-func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64) {
+// applyConfigChange runs the four-step apply-loop sequence from
+// docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 4:
+//  1. recompute e.voterCount, e.isLearnerNode from confState
+//  2. upsertPeer / removePeer (mutates e.peers; may read e.voterCount)
+//  3. rebuild e.config.Servers via configurationFromConfState(e.peers, confState)
+//  4. configIndex / pending-config bookkeeping
+//
+// All four steps run on the single-threaded apply loop, so no extra
+// synchronization is needed.
+func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64, confState raftpb.ConfState) {
+	e.refreshVoterCache(confState)
 	e.applyConfigPeerChange(changeType, nodeID, context)
+	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, context)
+	e.alarmIfJoinedAsVoter(confState)
 }
 
-func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64) {
+func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
+	e.refreshVoterCache(confState)
 	for _, change := range cc.Changes {
 		e.applyConfigPeerChange(change.Type, change.NodeID, cc.Context)
 	}
+	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
 	e.resolveConfigChange(index, cc.Context)
+	e.alarmIfJoinedAsVoter(confState)
+}
+
+// alarmIfJoinedAsVoter implements the operator-alarm semantics from
+// docs/design/2026_04_26_proposed_raft_learner.md §4.5: when the
+// operator passed --raftJoinAsLearner but a post-apply ConfState
+// lists this node as a voter, surface a one-shot ERROR-level
+// structured log and bump a metric. The node continues running --
+// shutting down would shrink the cluster's effective fault tolerance
+// since by the time the conf change has applied, the local node
+// already counts toward the voter quorum.
+func (e *Engine) alarmIfJoinedAsVoter(confState raftpb.ConfState) {
+	if !e.joinAsLearner {
+		return
+	}
+	if !nodeInVoters(confState, e.nodeID) {
+		return
+	}
+	if !e.joinAlarmFired.CompareAndSwap(false, true) {
+		return
+	}
+	joinRoleViolationCount.Add(1)
+	slog.Error("etcd raft join-as-learner alarm: local node was added as voter, expected learner",
+		slog.String("local_id", e.localID),
+		slog.Uint64("node_id", e.nodeID),
+		slog.Any("voters", confState.Voters),
+		slog.Any("learners", confState.Learners),
+	)
+}
+
+func nodeInVoters(confState raftpb.ConfState, nodeID uint64) bool {
+	for _, id := range confState.Voters {
+		if id == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshVoterCache rebuilds the voterCount / isLearnerNode cache
+// from the post-change ConfState. Called from the apply loop only.
+// The map is rebuilt from scratch — never patched — so promotion of a
+// learner cannot leak a stale isLearnerNode[id]==true entry. See
+// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+func (e *Engine) refreshVoterCache(confState raftpb.ConfState) {
+	e.mu.Lock()
+	e.voterCount = len(confState.Voters)
+	e.isLearnerNode = learnerSetFromConfState(confState)
+	e.mu.Unlock()
+}
+
+// refreshConfigServers rebuilds e.config.Servers from the post-change
+// ConfState and the current address-cache map. Called after the
+// per-peer cleanup helpers (upsertPeer / removePeer) so that
+// configurationFromConfState observes the post-cleanup e.peers map.
+func (e *Engine) refreshConfigServers(confState raftpb.ConfState) {
+	e.mu.Lock()
+	e.config = configurationFromConfState(e.peers, confState)
+	e.mu.Unlock()
 }
 
 func (e *Engine) applyConfigPeerChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte) {
 	peer, ok := decodeConfChangePeerContext(nodeID, context)
 	switch changeType {
 	case raftpb.ConfChangeAddNode:
+		// Promotion of an existing learner also lands here as
+		// ConfChangeAddNode for a node already in e.peers; the upsert
+		// is idempotent on (nodeID -> addr) so it is safe to take
+		// the same path. The voter / learner role swap is reflected
+		// in the post-change ConfState, which the apply loop has
+		// already used to refresh the voter cache and which it will
+		// use to rebuild e.config.Servers.
 		e.applyAddedPeer(nodeID, peer, ok)
 	case raftpb.ConfChangeRemoveNode:
 		e.applyRemovedPeer(nodeID, peer, ok)
 	case raftpb.ConfChangeUpdateNode:
 		e.applyUpdatedPeer(peer, ok)
 	case raftpb.ConfChangeAddLearnerNode:
-		// Phase 3 only exposes voter membership changes. Ignore learner metadata
-		// if it appears in a replayed log; startup validation still rejects joint
-		// consensus snapshots and learner-only cluster states for now.
+		// A learner joins the address cache the same way a voter does;
+		// suffrage is an attribute of ConfState, not of e.peers. See
+		// docs/design/2026_04_26_proposed_raft_learner.md §4.2.
+		e.applyAddedPeer(nodeID, peer, ok)
 	}
 }
 
@@ -2077,9 +2810,37 @@ func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, 
 	}
 }
 
+// bumpDurableAppliedIndexBeforeSave pins the FSM's durable applied
+// index to `index` BEFORE the engine calls persist.SaveSnap, so a
+// successful snapshot persist always implies LastAppliedIndex >=
+// snap.Metadata.Index — closes the HLC-lease-only / encryption-only
+// fallback (PR #910 design §6).
+//
+// FSMs that do not expose raftengine.AppliedIndexWriter silently
+// no-op; the skip optimisation falls back to full restore for them
+// (legacy test fakes, in-memory backends). pebble.Sync is forced on
+// the writer side regardless of ELASTICKV_FSM_SYNC_MODE — once
+// persist.SaveSnap returns, WAL compaction discards every log entry
+// at or before snap.Metadata.Index, so there is no source to replay
+// the meta key bump from.
+//
+// Used by BOTH snapshot persist sites: persistCreatedSnapshot (this
+// file) and e.persistLocalSnapshotPayload (the steady-state
+// SnapshotCount-triggered hot path).
+func (e *Engine) bumpDurableAppliedIndexBeforeSave(index uint64) error {
+	w, ok := e.fsm.(raftengine.AppliedIndexWriter)
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(w.SetDurableAppliedIndex(index))
+}
+
 func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snap) || e.persist == nil {
 		return nil
+	}
+	if err := e.bumpDurableAppliedIndexBeforeSave(snap.Metadata.Index); err != nil {
+		return err
 	}
 	if err := e.persist.SaveSnap(snap); err != nil {
 		return errors.WithStack(err)
@@ -2154,7 +2915,11 @@ func (e *Engine) refreshStatus() {
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
 	}
-	clusterSize := len(e.peers)
+	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
+	// cluster correctly hits the leader-of-1 fast path: a learner does
+	// not vote and is not part of the lease-read denominator. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	voterCount := e.voterCount
 	e.mu.Unlock()
 
 	// Keep the lock-free single-node fast path in sync with the current
@@ -2167,14 +2932,22 @@ func (e *Engine) refreshStatus() {
 	// could publish a ack instant while isLeader is still false.
 	e.isLeader.Store(status.State == raftengine.StateLeader)
 
-	if status.State == raftengine.StateLeader && clusterSize <= 1 {
-		e.singleNodeLeaderAckUnixNano.Store(time.Now().UnixNano())
+	if status.State == raftengine.StateLeader && voterCount <= 1 {
+		e.singleNodeLeaderAckMonoNs.Store(monoclock.Now().Nanos())
 	} else {
-		e.singleNodeLeaderAckUnixNano.Store(0)
+		e.singleNodeLeaderAckMonoNs.Store(0)
 	}
 
 	if status.State == raftengine.StateLeader {
 		e.leaderOnce.Do(func() { close(e.leaderReady) })
+	}
+	if previous != raftengine.StateLeader && status.State == raftengine.StateLeader {
+		// Edge: the node has just acquired leadership. Fire the
+		// leader-acquired callbacks so per-shard policy hooks
+		// (SQS HT-FIFO leadership-refusal §8) can audit the
+		// transition before any client request lands. Same
+		// non-blocking contract as fireLeaderLossCallbacks.
+		e.fireLeaderAcquiredCallbacks()
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
 		e.failPending(errors.WithStack(errNotLeader))
@@ -2459,8 +3232,25 @@ func (e *Engine) currentConfigIndex() uint64 {
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {
+	// Count VOTERS in the current configuration, not all servers --
+	// a learner does not vote and must not block the single-voter
+	// fast-path Campaign(). After learner support landed,
+	// len(cfg.Servers) includes learners, so the previous check
+	// would skip Campaign() in a 1-voter + N-learner cluster on
+	// restart and incur a full electionTimeout latency for no
+	// reason. See docs/design/2026_04_26_proposed_raft_learner.md
+	// §4.6 / §3.3 (the audit of len(e.peers) overloads).
 	cfg := e.currentConfiguration()
-	return len(cfg.Servers) == 1 && cfg.Servers[0].ID == e.localID
+	var soleVoter raftengine.Server
+	voterCount := 0
+	for _, s := range cfg.Servers {
+		if s.Suffrage != SuffrageVoter {
+			continue
+		}
+		voterCount++
+		soleVoter = s
+	}
+	return voterCount == 1 && soleVoter.ID == e.localID
 }
 
 func (e *Engine) resolveAdminPeer(id string, address string) (Peer, error) {
@@ -2636,28 +3426,47 @@ func maxUint64(left uint64, right uint64) uint64 {
 }
 
 func configurationFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) raftengine.Configuration {
-	if len(conf.Voters) == 0 {
+	if len(conf.Voters) == 0 && len(conf.Learners) == 0 {
 		return raftengine.Configuration{}
 	}
 
-	servers := make([]raftengine.Server, 0, len(conf.Voters))
+	servers := make([]raftengine.Server, 0, len(conf.Voters)+len(conf.Learners))
 	for _, nodeID := range conf.Voters {
-		peer, ok := peers[nodeID]
-		if ok {
-			servers = append(servers, raftengine.Server{
-				ID:       peer.ID,
-				Address:  peer.Address,
-				Suffrage: "voter",
-			})
-			continue
-		}
-		servers = append(servers, raftengine.Server{
-			ID:       strconv.FormatUint(nodeID, 10),
-			Address:  "",
-			Suffrage: "voter",
-		})
+		servers = append(servers, configServerForNode(peers, nodeID, SuffrageVoter))
+	}
+	for _, nodeID := range conf.Learners {
+		servers = append(servers, configServerForNode(peers, nodeID, SuffrageLearner))
 	}
 	return raftengine.Configuration{Servers: servers}
+}
+
+func configServerForNode(peers map[uint64]Peer, nodeID uint64, suffrage string) raftengine.Server {
+	if peer, ok := peers[nodeID]; ok {
+		return raftengine.Server{
+			ID:       peer.ID,
+			Address:  peer.Address,
+			Suffrage: suffrage,
+		}
+	}
+	return raftengine.Server{
+		ID:       strconv.FormatUint(nodeID, 10),
+		Address:  "",
+		Suffrage: suffrage,
+	}
+}
+
+// learnerSetFromConfState builds the apply-loop-owned isLearnerNode
+// cache from a ConfState. Returns nil for an empty / voter-only conf
+// state (callers treat nil as "no learners").
+func learnerSetFromConfState(conf raftpb.ConfState) map[uint64]bool {
+	if len(conf.Learners) == 0 {
+		return nil
+	}
+	out := make(map[uint64]bool, len(conf.Learners))
+	for _, nodeID := range conf.Learners {
+		out[nodeID] = true
+	}
+	return out
 }
 
 func numRemoteServers(servers []raftengine.Server, localID string) uint64 {
@@ -3071,6 +3880,13 @@ func (e *Engine) namedTransferTargetLocked(target Peer) (Peer, error) {
 	return Peer{}, errors.Wrapf(errTransportPeerUnknown, "address=%q", target.Address)
 }
 
+// upsertPeer updates the address cache for a peer. It deliberately
+// does NOT touch e.config.Servers — suffrage is determined by the
+// post-change ConfState which the apply loop threads through
+// refreshConfigServers. Today's call sites are the apply-loop helpers
+// applyAddedPeer / applyUpdatedPeer (both reached from
+// applyConfigPeerChange) which run before refreshConfigServers within
+// the same apply iteration.
 func (e *Engine) upsertPeer(peer Peer) {
 	if peer.NodeID == 0 {
 		peer.NodeID = DeriveNodeID(peer.ID)
@@ -3084,11 +3900,6 @@ func (e *Engine) upsertPeer(peer Peer) {
 		e.peers = make(map[uint64]Peer)
 	}
 	e.peers[peer.NodeID] = peer
-	e.config.Servers = upsertConfigServer(e.peers, e.config.Servers, raftengine.Server{
-		ID:       peer.ID,
-		Address:  peer.Address,
-		Suffrage: "voter",
-	})
 	e.mu.Unlock()
 
 	if e.transport != nil {
@@ -3099,22 +3910,90 @@ func (e *Engine) upsertPeer(peer Peer) {
 	}
 }
 
-func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, _ raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, confState raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	applyConfigPeerChangeToMap(next, changeType, nodeID, context)
+	annotatePeerSuffrageFromConfState(next, confState)
 	return sortedPeerList(next)
 }
 
-func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, _ raftpb.ConfState) []Peer {
+func (e *Engine) nextPeersAfterConfigChangeV2(cc raftpb.ConfChangeV2, confState raftpb.ConfState) []Peer {
 	e.mu.RLock()
 	next := clonePeerMap(e.peers)
 	e.mu.RUnlock()
 	for _, change := range cc.Changes {
 		applyConfigPeerChangeToMap(next, change.Type, change.NodeID, cc.Context)
 	}
+	annotatePeerSuffrageFromConfState(next, confState)
 	return sortedPeerList(next)
+}
+
+// annotatePeerSuffrageInSlice is the slice form of
+// annotatePeerSuffrageFromConfState used at bootstrap-time, where
+// `peers` is a sorted operator-provided slice rather than the apply
+// loop's clone of e.peers.
+func annotatePeerSuffrageInSlice(peers []Peer, conf raftpb.ConfState) {
+	if len(peers) == 0 {
+		return
+	}
+	learners := make(map[uint64]bool, len(conf.Learners))
+	for _, id := range conf.Learners {
+		learners[id] = true
+	}
+	voters := make(map[uint64]bool, len(conf.Voters))
+	for _, id := range conf.Voters {
+		voters[id] = true
+	}
+	for i := range peers {
+		switch {
+		case learners[peers[i].NodeID]:
+			peers[i].Suffrage = SuffrageLearner
+		case voters[peers[i].NodeID]:
+			peers[i].Suffrage = SuffrageVoter
+		}
+	}
+}
+
+// annotatePeerSuffrageFromConfState stamps each peer's Suffrage from
+// the post-change ConfState so the v2 peers file written by
+// persistConfigState round-trips suffrage across restarts. Without
+// this, every Peer in the persist path carries Suffrage="" (the
+// ConfChange context bytes do not encode suffrage; e.peers
+// deliberately stores only nodeID/ID/address), and
+// persistedSuffrageByte("") writes voter — which on restart causes
+// validateConfState to see a learner-as-voter peer list and reject
+// startup with errClusterMismatch. See learner design doc §4.3
+// "Authoritative source of suffrage during recovery".
+//
+// The map is mutated in place. Peers not present in either
+// confState.Voters or confState.Learners (transient state during a
+// removal) keep whatever Suffrage they had — they will fall out of
+// the persisted peers list on the next conf change anyway.
+func annotatePeerSuffrageFromConfState(peers map[uint64]Peer, conf raftpb.ConfState) {
+	if len(peers) == 0 {
+		return
+	}
+	learners := make(map[uint64]bool, len(conf.Learners))
+	for _, id := range conf.Learners {
+		learners[id] = true
+	}
+	voters := make(map[uint64]bool, len(conf.Voters))
+	for _, id := range conf.Voters {
+		voters[id] = true
+	}
+	for id, peer := range peers {
+		switch {
+		case learners[id]:
+			peer.Suffrage = SuffrageLearner
+		case voters[id]:
+			peer.Suffrage = SuffrageVoter
+		default:
+			continue
+		}
+		peers[id] = peer
+	}
 }
 
 func (e *Engine) removePeer(nodeID uint64) {
@@ -3123,26 +4002,29 @@ func (e *Engine) removePeer(nodeID uint64) {
 	}
 
 	e.mu.Lock()
-	peer, ok := e.peers[nodeID]
-	if ok {
-		delete(e.peers, nodeID)
-	}
-	e.config.Servers = removeConfigServer(e.peers, e.config.Servers, nodeID, peer.ID)
-	postRemovalClusterSize := len(e.peers)
+	delete(e.peers, nodeID)
+	// e.voterCount has already been refreshed for the post-change
+	// ConfState by refreshVoterCache earlier in the apply iteration
+	// (see applyConfigChange / applyConfigChangeV2). The ack tracker
+	// quorum threshold below uses the voter count, not the address
+	// cache size, because a learner ack must not contribute to the
+	// voter-majority denominator. See
+	// docs/design/2026_04_26_proposed_raft_learner.md §4.6.
+	postRemovalVoterCount := e.voterCount
 	e.mu.Unlock()
 
 	// Drop the peer's recorded ack so a reconfiguration cannot leave a
 	// stale entry that falsely satisfies the new cluster's majority.
-	// followerQuorum is computed against the POST-removal cluster; a
+	// followerQuorum is computed against the POST-removal voter count; a
 	// shrink to <=1 would otherwise pass 0 here, which
 	// quorumAckTracker.removePeer treats as "keep the current instant"
 	// and would surface stale liveness to LastQuorumAck if the cluster
 	// subsequently grew back. Clear the tracker explicitly in that
 	// case so any future multi-node membership starts fresh.
-	if postRemovalClusterSize <= 1 {
+	if postRemovalVoterCount <= 1 {
 		e.ackTracker.reset()
 	} else {
-		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalClusterSize))
+		e.ackTracker.removePeer(nodeID, followerQuorumForClusterSize(postRemovalVoterCount))
 	}
 
 	if e.transport != nil {
@@ -3193,6 +4075,14 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 			"drop_count", count,
 		)
 	}
+	e.reportDroppedDispatch(msg)
+}
+
+func (e *Engine) reportDroppedDispatch(msg raftpb.Message) {
+	if e.dispatchReportCh == nil {
+		return
+	}
+	e.postDispatchReport(dispatchReport{to: msg.To, msgType: msg.Type})
 }
 
 // dispatchErrorCodeOf extracts the grpc status code name from err, or
@@ -3324,26 +4214,46 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 		return nil
 	}
 
+	if err := e.bumpDurableAppliedIndexBeforeSave(index); err != nil {
+		return err
+	}
+
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
+	return e.handleLocalSnapshotPersistResult(err)
+}
+
+// handleLocalSnapshotPersistResult collapses the post-SaveSnap error
+// switch into a single helper so persistLocalSnapshotPayload stays
+// under the cyclomatic-complexity budget. The three raft-side
+// 'snapshot already moved on' cases (ErrCompacted / ErrUnavailable /
+// ErrSnapOutOfDate) are all treated as no-ops; only the success path
+// runs the disk-side purge.
+func (e *Engine) handleLocalSnapshotPersistResult(err error) error {
 	switch {
 	case err == nil:
-		snapDir := filepath.Join(e.dataDir, snapDirName)
-		if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
-			slog.Warn("failed to purge old snap files", "error", purgeErr)
-		}
-		walDir := filepath.Join(e.dataDir, walDirName)
-		if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
-			slog.Warn("failed to purge old wal files", "error", purgeErr)
-		}
+		e.purgeAfterLocalSnapshot()
 		return nil
-	case errors.Is(err, etcdraft.ErrCompacted):
-		return nil
-	case errors.Is(err, etcdraft.ErrUnavailable):
-		return nil
-	case errors.Is(err, etcdraft.ErrSnapOutOfDate):
+	case errors.Is(err, etcdraft.ErrCompacted),
+		errors.Is(err, etcdraft.ErrUnavailable),
+		errors.Is(err, etcdraft.ErrSnapOutOfDate):
 		return nil
 	default:
 		return err
+	}
+}
+
+// purgeAfterLocalSnapshot runs the disk-side cleanup that follows a
+// successful local-snapshot persist: trim old .snap/.fsm files and
+// rotate ageing WAL segments. Both calls log on error but do not
+// propagate — failing to purge is non-fatal.
+func (e *Engine) purgeAfterLocalSnapshot() {
+	snapDir := filepath.Join(e.dataDir, snapDirName)
+	if purgeErr := purgeOldSnapshotFiles(snapDir, e.fsmSnapDir); purgeErr != nil {
+		slog.Warn("failed to purge old snap files", "error", purgeErr)
+	}
+	walDir := filepath.Join(e.dataDir, walDirName)
+	if purgeErr := purgeOldWALFiles(walDir, e.walRetention()); purgeErr != nil {
+		slog.Warn("failed to purge old wal files", "error", purgeErr)
 	}
 }
 
@@ -3427,57 +4337,6 @@ func peerFromServer(peers map[uint64]Peer, server raftengine.Server) Peer {
 		ID:      server.ID,
 		Address: server.Address,
 	}
-}
-
-func upsertConfigServer(peers map[uint64]Peer, servers []raftengine.Server, server raftengine.Server) []raftengine.Server {
-	out := append([]raftengine.Server(nil), servers...)
-	for i := range out {
-		if out[i].ID != server.ID {
-			continue
-		}
-		out[i] = server
-		sortConfigServers(peers, out)
-		return out
-	}
-	out = append(out, server)
-	sortConfigServers(peers, out)
-	return out
-}
-
-func removeConfigServer(peers map[uint64]Peer, servers []raftengine.Server, nodeID uint64, serverID string) []raftengine.Server {
-	if len(servers) == 0 {
-		return nil
-	}
-	out := make([]raftengine.Server, 0, len(servers))
-	for _, server := range servers {
-		if serverID != "" && server.ID == serverID {
-			continue
-		}
-		if nodeID != 0 && serverNodeID(peers, server) == nodeID {
-			continue
-		}
-		out = append(out, server)
-	}
-	sortConfigServers(peers, out)
-	return out
-}
-
-func sortConfigServers(peers map[uint64]Peer, servers []raftengine.Server) {
-	sort.Slice(servers, func(i, j int) bool {
-		left := serverNodeID(peers, servers[i])
-		right := serverNodeID(peers, servers[j])
-		if left == right {
-			return servers[i].ID < servers[j].ID
-		}
-		return left < right
-	})
-}
-
-func serverNodeID(peers map[uint64]Peer, server raftengine.Server) uint64 {
-	if nodeID, ok := configServerNodeID(peers, server); ok {
-		return nodeID
-	}
-	return DeriveNodeID(server.ID)
 }
 
 func configServerNodeID(peers map[uint64]Peer, server raftengine.Server) (uint64, bool) {

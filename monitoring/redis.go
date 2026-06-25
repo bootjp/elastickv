@@ -50,6 +50,7 @@ const (
 var redisCommandSet = map[string]struct{}{
 	"BZPOPMIN":         {},
 	"CLIENT":           {},
+	"COMMAND":          {},
 	"DBSIZE":           {},
 	"DEL":              {},
 	"DISCARD":          {},
@@ -63,6 +64,7 @@ var redisCommandSet = map[string]struct{}{
 	"GET":              {},
 	"GETDEL":           {},
 	"HDEL":             {},
+	"HELLO":            {},
 	"HEXISTS":          {},
 	"HGET":             {},
 	"HGETALL":          {},

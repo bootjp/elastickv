@@ -1,13 +1,23 @@
 # etcd/raft Migration Operations
 
+> **Status: historical.** The one-time migration from the legacy HashiCorp Raft
+> backend to `etcd/raft` is complete. The HashiCorp backend and its offline
+> migrator (`cmd/etcd-raft-migrate`) were removed from the tree in commit
+> `a35245a`. `etcd` is now the only supported engine; `--raftEngine` rejects any
+> other value. The migration steps below are preserved as the historical record
+> — they require the deleted migrator, which can be retrieved from git history at
+> the commit before `a35245a` (see "Retrieving the removed migrator" below) if a
+> never-migrated HashiCorp store ever resurfaces.
+
 ## Scope
 
-This runbook covers the supported migration path from the legacy HashiCorp Raft
-runtime to the default `etcd/raft` runtime.
+This runbook covers the (now-completed) migration path from the legacy HashiCorp
+Raft runtime to the default `etcd/raft` runtime.
 
 Use it when:
 
-1. migrating an existing cluster that already has HashiCorp-backed data dirs
+1. migrating an old cluster that still has HashiCorp-backed data dirs (requires
+   the migrator retrieved from git history)
 2. validating a fresh etcd-backed deployment before production cutover
 3. rolling out nodes with the repo's default runtime and operational scripts
 
@@ -18,12 +28,34 @@ entirely on one runtime at a time.
 
 As of the etcd rollout:
 
-1. `go run .` starts with `--raftEngine=etcd` by default
+1. `go run .` starts with `--raftEngine=etcd` by default; no other engine value
+   is accepted
 2. Jepsen workloads default to `--raft-engine etcd`
 3. `scripts/rolling-update.sh` defaults `RAFT_ENGINE=etcd`
 
-If you still operate a legacy HashiCorp cluster, set the engine explicitly and
-keep using the original data dirs until the offline migration below is complete.
+A node refuses to start on a data dir that still holds legacy HashiCorp Raft
+artifacts (`raft.db`); such a dir must be migrated to a fresh etcd dir before it
+can be used.
+
+## Retrieving the removed migrator
+
+`cmd/etcd-raft-migrate` (and `cmd/etcd-raft-rollback`) were deleted in commit
+`a35245a`, along with the `go.mod` entries for the HashiCorp backend packages the
+migrator links against. Extracting a single `main.go` is not enough — the
+migrator only builds inside the contemporaneous module tree. To run the
+historical migration steps below, check out the whole repository at `a35245a^`
+(the commit before the removal) in a scratch directory and run the migrator from
+there:
+
+```bash
+git clone https://github.com/bootjp/elastickv.git /tmp/elastickv-migration
+cd /tmp/elastickv-migration
+git checkout a35245a^
+go build ./cmd/etcd-raft-migrate   # verify it builds against the pinned tree
+```
+
+The `go run ./cmd/etcd-raft-migrate` invocations in the steps below assume you run
+them from inside this pinned checkout, not the current tree.
 
 ## Preconditions
 
@@ -59,7 +91,11 @@ go run . \
 Start one process per node with the same `--raftBootstrapMembers` set and a
 node-local `--raftDataDir`.
 
-## Offline Migration from HashiCorp Raft
+## Offline Migration from HashiCorp Raft (historical)
+
+> These steps require the deleted `cmd/etcd-raft-migrate` migrator; restore it
+> from git history first (see "Retrieving the removed migrator"). They are kept
+> only as the as-built record of the completed one-time migration.
 
 ### Single-group cluster
 
@@ -150,7 +186,8 @@ After a cluster is already on etcd:
 
 1. `scripts/rolling-update.sh` defaults to `RAFT_ENGINE=etcd`
 2. `cmd/raftadmin` can be used for `add_voter`, `remove_server`, and leadership transfer
-3. Keep `RAFT_ENGINE=hashicorp` only for legacy nodes that have not migrated yet
+3. `RAFT_ENGINE` only accepts `etcd`; the removed HashiCorp backend can no
+   longer be selected at runtime
 
 ## Rollback
 

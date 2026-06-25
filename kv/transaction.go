@@ -93,9 +93,17 @@ func (t *TransactionManager) Close() {
 	})
 }
 
+// Transactional is the kv-internal interface that fronts the raft propose
+// path. Implementations (TransactionManager, LeaderProxy, ShardRouter,
+// leaseRefreshingTxn) thread the caller's context end-to-end so a Redis /
+// gRPC / S3 / SQS handler's deadline reaches Propose / VerifyLeader without
+// being silently dropped to context.Background. See PR #748 / design doc
+// 2026_05_10_proposed_kv_ctx_plumbing.md for the rationale; the prior
+// signatures lived behind `verifyLeaderEngine`'s 5 s safety bound (#745),
+// which is preserved as the no-ctx defense-in-depth fallback.
 type Transactional interface {
-	Commit(reqs []*pb.Request) (*TransactionResponse, error)
-	Abort(reqs []*pb.Request) (*TransactionResponse, error)
+	Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error)
+	Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error)
 }
 
 type TransactionResponse struct {
@@ -138,7 +146,7 @@ func prependByte(prefix byte, data []byte) []byte {
 // HashiCorp Raft delivers FSM responses via ApplyFuture.Response(), not Error(),
 // so we must inspect the response to avoid silently treating failed writes as
 // successes.
-func applyRequests(proposer raftengine.Proposer, reqs []*pb.Request, proposalObserver ProposalObserver) (uint64, []error, error) {
+func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, proposalObserver ProposalObserver) (uint64, []error, error) {
 	b, err := marshalRaftCommand(reqs)
 	if err != nil {
 		return 0, nil, errors.WithStack(err)
@@ -149,7 +157,7 @@ func applyRequests(proposer raftengine.Proposer, reqs []*pb.Request, proposalObs
 		return 0, nil, errors.WithStack(ErrLeaderNotFound)
 	}
 
-	result, err := proposer.Propose(context.Background(), b)
+	result, err := proposer.Propose(ctx, b)
 	if err != nil {
 		recordProposalFailure(proposalObserver)
 		return 0, nil, errors.WithStack(err)
@@ -190,14 +198,14 @@ func recordProposalFailure(observer ProposalObserver) {
 	}
 }
 
-func (t *TransactionManager) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
+func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
 	if hasTxnRequests(reqs) {
-		return t.commitSequential(reqs)
+		return t.commitSequential(ctx, reqs)
 	}
-	return t.commitRaw(reqs)
+	return t.commitRaw(ctx, reqs)
 }
 
 func hasTxnRequests(reqs []*pb.Request) bool {
@@ -209,11 +217,11 @@ func hasTxnRequests(reqs []*pb.Request) bool {
 	return false
 }
 
-func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionResponse, error) {
+func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	commitIndex, err := func() (uint64, error) {
 		commitIndex := uint64(0)
 		for _, req := range reqs {
-			idx, results, err := applyRequests(t.proposer, []*pb.Request{req}, t.proposalObserver)
+			idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver)
 			if err != nil {
 				return 0, err
 			}
@@ -232,7 +240,17 @@ func (t *TransactionManager) commitSequential(reqs []*pb.Request) (*TransactionR
 		// transactional requests do not leave intents behind, so they do not need
 		// abort cleanup on failure.
 		if needsTxnCleanup(reqs) {
-			_, _err := t.Abort(reqs)
+			// Use a cleanup ctx that survives the original ctx's
+			// cancellation: the upstream commit very likely failed
+			// because ctx was cancelled / hit its deadline, and Abort
+			// MUST still go through to release intents — otherwise
+			// locks linger until LockResolver picks them up at a
+			// future tick. context.WithoutCancel detaches deadline
+			// and cancellation; we re-bound with verifyLeaderTimeout
+			// so a hung Abort cannot leak the cleanup goroutine.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+			_, _err := t.Abort(cleanupCtx, reqs)
+			cancel()
 			if _err != nil {
 				return nil, errors.WithStack(errors.CombineErrors(err, _err))
 			}
@@ -265,7 +283,7 @@ func needsTxnCleanup(reqs []*pb.Request) bool {
 	return false
 }
 
-func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse, error) {
+func (t *TransactionManager) commitRaw(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	item := &rawCommitItem{
 		reqs: reqs,
 		done: make(chan rawCommitResult, 1),
@@ -294,11 +312,23 @@ func (t *TransactionManager) commitRaw(reqs []*pb.Request) (*TransactionResponse
 		go t.flushRawPending()
 	}
 
-	res := <-item.done
-	if res.err != nil {
-		return nil, res.err
+	// Wait under the caller's ctx so a deadline expiring while batched
+	// commits are pending lets the caller exit without blocking on a
+	// busy queue. The proposal itself is driven by flushRawPending in
+	// a separate goroutine using context.Background — that is the
+	// intentional batched-commit model: many callers' ctxs map to one
+	// batch propose, so no single ctx can bound it. Caller cancellation
+	// here only abandons the wait; the propose still completes and
+	// other waiters in the same batch get their results normally.
+	select {
+	case res := <-item.done:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return &TransactionResponse{CommitIndex: res.commitIndex}, nil
+	case <-ctx.Done():
+		return nil, errors.WithStack(ctx.Err())
 	}
-	return &TransactionResponse{CommitIndex: res.commitIndex}, nil
 }
 
 func (t *TransactionManager) flushRawPending() {
@@ -374,7 +404,11 @@ func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
 	}
 	offsets = append(offsets, len(reqs))
 
-	idx, results, err := applyRequests(t.proposer, reqs, t.proposalObserver)
+	// Batched-commit goroutine cannot inherit any single caller's ctx —
+	// see the commitRaw comment. Use Background here; per-caller
+	// cancellation is honoured at the wait site in commitRaw via select
+	// on item.done vs ctx.Done.
+	idx, results, err := applyRequests(context.Background(), t.proposer, reqs, t.proposalObserver)
 	if err != nil {
 		for _, item := range batch {
 			item.done <- rawCommitResult{err: err}
@@ -403,7 +437,7 @@ func combineApplyErrors(errs []error) error {
 	return errors.WithStack(combined)
 }
 
-func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
+func (t *TransactionManager) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	var abortReqs []*pb.Request
 	for _, req := range reqs {
 		if abortReq := abortRequestFor(req); abortReq != nil {
@@ -413,7 +447,7 @@ func (t *TransactionManager) Abort(reqs []*pb.Request) (*TransactionResponse, er
 
 	var commitIndex uint64
 	for _, req := range abortReqs {
-		idx, results, err := applyRequests(t.proposer, []*pb.Request{req}, t.proposalObserver)
+		idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver)
 		if err != nil {
 			return nil, err
 		}

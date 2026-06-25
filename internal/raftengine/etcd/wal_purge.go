@@ -12,6 +12,11 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/fileutil"
 )
 
+// walFileExt is the file extension etcd writes for every WAL segment.
+// Centralising the literal keeps the WAL discovery/purge code and its
+// tests from drifting apart and silences goconst's 3-occurrence rule.
+const walFileExt = ".wal"
+
 // defaultMaxWALFiles is the number of .wal segment files to retain after a
 // successful snapshot. etcd's wal package allocates segments of 64 MiB each;
 // keeping the most recent N segments bounds WAL disk usage at ~N * 64 MiB.
@@ -137,7 +142,7 @@ func collectWALNames(entries []os.DirEntry) []string {
 		if e.IsDir() {
 			continue
 		}
-		if filepath.Ext(e.Name()) != ".wal" {
+		if filepath.Ext(e.Name()) != walFileExt {
 			continue
 		}
 		names = append(names, e.Name())

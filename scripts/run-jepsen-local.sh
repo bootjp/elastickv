@@ -87,9 +87,12 @@ if ! $NO_CLUSTER; then
   done
 fi
 
-# ---- run Jepsen DynamoDB workload ----
-echo "[jepsen] running DynamoDB workload..."
+# ---- run Jepsen DynamoDB workloads ----
 cd "$REPO_ROOT/jepsen"
+
+EXIT_CODE=0
+
+echo "[jepsen] running DynamoDB list-append workload..."
 set +e
 lein run -m elastickv.dynamodb-workload \
   --local \
@@ -98,8 +101,44 @@ lein run -m elastickv.dynamodb-workload \
   --concurrency 5 \
   --dynamo-ports 63801,63802,63803 \
   --host 127.0.0.1
-EXIT_CODE=$?
+APPEND_EXIT=$?
 set -e
+if [ $APPEND_EXIT -ne 0 ]; then
+  echo "[jepsen] list-append FAILED (exit $APPEND_EXIT)"
+  EXIT_CODE=$APPEND_EXIT
+fi
+
+# All DynamoDB attribute types currently supported by elastickv.
+# Each runs as its own register/linearizable test.
+TYPES=(string number binary bool null string-set number-set binary-set list map)
+declare -A TYPE_RESULT
+for t in "${TYPES[@]}"; do
+  echo "[jepsen] running DynamoDB types workload: ${t}..."
+  set +e
+  lein run -m elastickv.dynamodb-types-workload \
+    --local \
+    --time-limit 20 \
+    --rate 5 \
+    --concurrency 4 \
+    --value-type "$t" \
+    --dynamo-ports 63801,63802,63803 \
+    --host 127.0.0.1
+  TYPE_EXIT=$?
+  set -e
+  if [ $TYPE_EXIT -ne 0 ]; then
+    echo "[jepsen] type=${t} FAILED (exit $TYPE_EXIT)"
+    EXIT_CODE=$TYPE_EXIT
+    TYPE_RESULT[$t]="fail(${TYPE_EXIT})"
+  else
+    TYPE_RESULT[$t]="pass"
+  fi
+done
+
+echo
+echo "[jepsen] per-type summary:"
+for t in "${TYPES[@]}"; do
+  printf '  %-12s %s\n' "$t" "${TYPE_RESULT[$t]}"
+done
 
 if [ $EXIT_CODE -eq 0 ]; then
   echo "[jepsen] PASSED"

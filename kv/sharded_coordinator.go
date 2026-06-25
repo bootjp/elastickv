@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -22,6 +24,192 @@ type ShardGroup struct {
 	Store  store.MVCCStore
 	Txn    Transactional
 	lease  leaseState
+	// lp caches the Engine's optional LeaseProvider capability so the
+	// groupLeaseRead / maybeRefresh hot paths test a single field for
+	// nil instead of performing an interface type assertion per call.
+	// NewShardedCoordinator resolves it once for every group it owns; it
+	// is nil when the Engine does not implement raftengine.LeaseProvider.
+	// Engine is not reassigned after the coordinator is constructed, so
+	// the cached value stays valid.
+	lp raftengine.LeaseProvider
+	// raftPayloadWrap is the Stage 6E-2c hot-swap point for the raft
+	// envelope wrap closure. A nil load means the wrap is inactive
+	// and proposals pass through cleartext (the Stage 3 default).
+	// A non-nil load applies the closure to every payload before it
+	// reaches the engine — Propose and ProposeAdmin alike, by
+	// design (see kv/raft_payload_wrapper.go for the rationale).
+	//
+	// The cell is read on every proposal via dynamicWrappedProposer,
+	// installed in the TransactionManager's proposer chain AND on
+	// the cached proposer below when the ShardGroup is constructed
+	// via NewLeaderProxyForShardGroup. SetRaftPayloadWrap publishes
+	// a fresh closure atomically so EnableRaftEnvelope (Stage
+	// 6E-2d) can activate the wrap the instant the cutover entry
+	// commits, without rebuilding the TransactionManager or
+	// stalling in-flight proposals.
+	raftPayloadWrap atomic.Pointer[RaftPayloadWrapper]
+	// proposer is the wrap-aware proposer chain for this shard
+	// group. Set by NewLeaderProxyForShardGroup so direct shard
+	// proposals (HLC lease renewal — see RunHLCLeaseRenewal —
+	// and any future direct-engine.Propose call site) route
+	// through the same dynamicWrappedProposer the
+	// TransactionManager uses. The Proposer() accessor falls back
+	// to Engine when this is nil (the legacy / test-fixture path
+	// that constructs ShardGroup via struct literal without
+	// NewLeaderProxyForShardGroup), so the no-wrap default keeps
+	// working.
+	proposer raftengine.Proposer
+}
+
+// Proposer returns the wrap-aware proposer chain installed by
+// NewLeaderProxyForShardGroup, or the raw Engine when the
+// constructor was bypassed (legacy / test fixtures that build
+// ShardGroup via struct literal). Direct shard proposals
+// (HLC lease renewal, future cipher rotations, etc.) MUST go
+// through this getter rather than g.Engine.Propose so the
+// Stage 6E-2c dynamic wrap path applies — a direct g.Engine
+// Propose call would bypass the wrap pointer and let post-cutover
+// writes land cleartext above the raft-envelope cutover, halting
+// the apply loop on §6.3 strict-> unwrap (codex P2 round-1).
+func (g *ShardGroup) Proposer() raftengine.Proposer {
+	if g.proposer != nil {
+		return g.proposer
+	}
+	return g.Engine
+}
+
+// SetRaftPayloadWrap publishes wrap as the active raft envelope
+// closure for this shard group. Passing nil clears the wrap (the
+// proposer reverts to cleartext pass-through). Safe to call from
+// any goroutine; the next Propose / ProposeAdmin observes the new
+// state via the proposer's atomic.Pointer.Load.
+//
+// This is the sole supported way to install or rotate the wrap
+// closure on a running coordinator. Stage 6E-2d's
+// EnableRaftEnvelope handler will call this on every leader when
+// the cutover entry commits.
+func (g *ShardGroup) SetRaftPayloadWrap(wrap RaftPayloadWrapper) {
+	if wrap == nil {
+		g.raftPayloadWrap.Store(nil)
+		return
+	}
+	g.raftPayloadWrap.Store(&wrap)
+}
+
+// RaftPayloadWrap returns the currently-installed wrap closure, or
+// nil if the wrap is inactive. Primarily intended for tests and
+// diagnostics; production proposers consult the underlying
+// atomic.Pointer directly (see dynamicWrappedProposer).
+func (g *ShardGroup) RaftPayloadWrap() RaftPayloadWrapper {
+	if p := g.raftPayloadWrap.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// cutoverBarrierProposer is the optional interface a Proposer can
+// satisfy to participate in the §7.1 quiescence barrier. Production
+// proposers built via NewLeaderProxyForShardGroup (i.e.,
+// *dynamicWrappedProposer) implement it; test fixtures that wire a
+// bare engine into ShardGroup.Engine do not. The ShardGroup
+// forwarders below type-assert on this interface so the barrier
+// control degrades gracefully (immediate-success drain, no-op
+// Begin/End) when the proposer can't participate.
+type cutoverBarrierProposer interface {
+	raftengine.Proposer
+	BeginCutoverBarrier() <-chan struct{}
+	WaitInflightDrained(ctx context.Context) error
+	EndCutoverBarrier()
+}
+
+// BeginCutoverBarrier opens the §7.1 step-1 quiescence barrier on
+// this shard group's proposer chain. Returns a channel that closes
+// when all in-flight user Propose calls drain; the typical caller
+// uses WaitInflightDrained which composes context cancellation.
+//
+// Forwards to *dynamicWrappedProposer when present. When the
+// proposer is the bare engine (raw Engine fallback in test
+// fixtures), returns a pre-closed channel so callers that don't
+// distinguish barrier-capable from -incapable proposers can drive
+// the same state-machine shape against either.
+//
+// 6E-2d wiring: every leader's EnableRaftEnvelope handler calls this
+// on each ShardGroup that participates in the cutover before
+// proposing the cutover entry. After return, the proposer's
+// dynamicWrappedProposer.Propose rejects fresh user calls with
+// raftengine.ErrEnvelopeCutoverInProgress.
+func (g *ShardGroup) BeginCutoverBarrier() <-chan struct{} {
+	if cbp, ok := g.Proposer().(cutoverBarrierProposer); ok {
+		return cbp.BeginCutoverBarrier()
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// WaitInflightDrained blocks until the in-flight Propose counter
+// drops to 0 after BeginCutoverBarrier ran on this ShardGroup, or
+// ctx fires. Returns nil on drain or when the proposer is barrier-
+// incapable (degraded fast-path so test fixtures don't deadlock
+// the handler). Wraps ctx.Err() on cancellation.
+func (g *ShardGroup) WaitInflightDrained(ctx context.Context) error {
+	if cbp, ok := g.Proposer().(cutoverBarrierProposer); ok {
+		// dynamicWrappedProposer.WaitInflightDrained returns raw
+		// ctx.Err() so this single wrap is the canonical operator-
+		// log entry (claude r2 finding B: avoid the redundant
+		// "kv: ... kv: ..." chain a doubled wrap would produce).
+		if err := cbp.WaitInflightDrained(ctx); err != nil {
+			return errors.Wrap(err, "kv: shard group wait inflight drained")
+		}
+		return nil
+	}
+	return nil
+}
+
+// EndCutoverBarrier closes the §7.1 step-6 barrier on this shard
+// group's proposer chain. Idempotent against barrier-incapable
+// proposers (no-op). Callers MUST pair each BeginCutoverBarrier
+// with exactly one EndCutoverBarrier (the EnableRaftEnvelope
+// handler uses defer).
+func (g *ShardGroup) EndCutoverBarrier() {
+	if cbp, ok := g.Proposer().(cutoverBarrierProposer); ok {
+		cbp.EndCutoverBarrier()
+	}
+}
+
+// NewLeaderProxyForShardGroup wires a LeaderProxy whose proposer
+// consults g.raftPayloadWrap on every call, so SetRaftPayloadWrap
+// becomes the hot-swap surface for the raft envelope cutover.
+//
+// Use this in preference to NewLeaderProxyWithEngine(g.Engine, ...)
+// for any ShardGroup that participates in the encryption cutover
+// pipeline — without the dynamic wrap, post-cutover writes would
+// land cleartext at index > cutoverIndex and halt the apply loop on
+// strict-> unwrap. The non-wrap-aware constructor remains as a
+// convenience for shard groups that opt out of encryption (test
+// fixtures, transient groups).
+//
+// Contract: g MUST be non-nil. The constructor takes the address
+// of g.raftPayloadWrap so a nil receiver is an immediate nil deref
+// — caller bug, not silently swallowed. Returning nil here would
+// only defer the panic to the first sg.Txn.Commit call site (see
+// main.go's buildShardGroups), with worse diagnostics; CLAUDE.md's
+// "don't validate for scenarios that can't happen at internal
+// boundaries" applies.
+func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *LeaderProxy {
+	// Build a single dynamicWrappedProposer for this shard group and
+	// cache it on g.proposer so direct shard proposals (HLC lease
+	// renewal in RunHLCLeaseRenewal, future cipher rotations) and
+	// the TransactionManager.Commit / Abort path share the same
+	// wrap pointer and the same Propose / ProposeAdmin call shape.
+	// A direct g.Engine.Propose call would bypass the wrap pointer
+	// (codex P2 round-1); routing both paths through the same
+	// proposer closes that hole.
+	g.proposer = newDynamicWrappedProposer(g.Engine, &g.raftPayloadWrap)
+	return &LeaderProxy{
+		engine: g.Engine,
+		tm:     NewTransactionWithProposer(g.proposer, opts...),
+	}
 }
 
 // leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
@@ -38,12 +226,29 @@ type ShardGroup struct {
 type leaseRefreshingTxn struct {
 	inner Transactional
 	g     *ShardGroup
+	// coord back-references the owning coordinator so Commit can
+	// consult the Stage 7a registration barrier. Every self-originated
+	// write — client writes via router.Commit AND internal
+	// lock-resolution via ShardStore's direct g.Txn.Commit — funnels
+	// through this wrapper, so gating here (in addition to the
+	// Dispatch-level gate for client groups) closes the lock-resolution
+	// path codex P1 flagged. nil in tests that construct the wrapper
+	// directly; awaitRegistrationBarrier is nil-receiver-safe.
+	coord *ShardedCoordinator
 }
 
-func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, error) {
-	start := time.Now()
+func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	// Stage 7a §4.1: every Commit is a self-originated write, so gate it
+	// on this node's writer registration. This is the universal
+	// chokepoint (router.Commit and ShardStore lock-resolution both land
+	// here), closing the lock-resolution path the Dispatch-level gate
+	// alone misses (codex P1 on PR #839).
+	if err := t.coord.awaitRegistrationBarrier(ctx); err != nil {
+		return nil, err
+	}
+	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
-	resp, err := t.inner.Commit(reqs)
+	resp, err := t.inner.Commit(ctx, reqs)
 	if err != nil {
 		// Only invalidate on errors that actually signal a leadership
 		// change. Write-conflicts, validation errors, and deadline
@@ -63,10 +268,10 @@ func (t *leaseRefreshingTxn) Commit(reqs []*pb.Request) (*TransactionResponse, e
 	return resp, nil
 }
 
-func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, error) {
-	start := time.Now()
+func (t *leaseRefreshingTxn) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
-	resp, err := t.inner.Abort(reqs)
+	resp, err := t.inner.Abort(ctx, reqs)
 	if err != nil {
 		if isLeadershipLossError(err) {
 			t.g.lease.invalidate()
@@ -82,15 +287,14 @@ func (t *leaseRefreshingTxn) Abort(reqs []*pb.Request) (*TransactionResponse, er
 // underlying Commit/Abort so an invalidation that fires during that
 // call observes a generation mismatch inside extend and the refresh
 // is rejected. See the struct doc comment for why.
-func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start time.Time, expectedGen uint64) {
+func (t *leaseRefreshingTxn) maybeRefresh(resp *TransactionResponse, start monoclock.Instant, expectedGen uint64) {
 	if resp == nil || resp.CommitIndex == 0 {
 		return
 	}
-	lp, ok := t.g.Engine.(raftengine.LeaseProvider)
-	if !ok {
+	if t.g.lp == nil {
 		return
 	}
-	t.g.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
+	t.g.lease.extend(start.Add(t.g.lp.LeaseDuration()), expectedGen)
 }
 
 // Close forwards to the wrapped Transactional if it implements
@@ -115,6 +319,16 @@ const (
 
 	txnSecondaryCommitRetryAttempts = 3
 	txnSecondaryCommitRetryBackoff  = 20 * time.Millisecond
+
+	// composed1RetryAttempts bounds how many times Dispatch re-issues a
+	// txn after the FSM's M3 verifyComposed1 gate returned
+	// ErrComposed1Violation / ErrComposed1VersionGCd.  Per design doc
+	// §M4: "retries it once" — so the total attempt count is 1 (initial)
+	// + composed1RetryAttempts = 2.  Beyond one retry the sentinel
+	// surfaces unchanged so the client (or a wrapping retry harness in
+	// the adapter) sees the failure rather than the coordinator spinning
+	// on a persistent route shift.
+	composed1RetryAttempts = 1
 )
 
 // ShardedCoordinator routes operations to shard-specific raft groups.
@@ -134,6 +348,163 @@ type ShardedCoordinator struct {
 	// leaseObserver records lease-read hit/miss for every shard the
 	// coordinator owns. Nil-safe; see Coordinate.leaseObserver.
 	leaseObserver LeaseReadObserver
+	// sampler counts requests per RouteID for the key visualizer
+	// heatmap. Nil-safe at the call site; the implementation
+	// (keyviz.MemSampler) also tolerates a typed-nil receiver, so a
+	// disabled keyviz wires through to a no-op without branching on
+	// the hot path.
+	sampler keyviz.Sampler
+	// registrationGate is the Stage 7a §4.1 first-write barrier: when
+	// set, self-originated mutating writes that would land as §4.1
+	// storage envelopes block until this node's writer registration
+	// commits. nil when encryption is off / no registration is pending
+	// (the common case — ungated). See RegistrationGate.
+	registrationGate *RegistrationGate
+}
+
+// RegistrationGate carries the Stage 7a §4.1 registration-before-
+// first-write barrier into the coordinator. main.go owns the
+// encryption StateCache and the registration goroutine and supplies
+// this; kv stays decoupled from internal/encryption by taking a plain
+// channel + predicate closures rather than the StateCache type.
+//
+// Barrier three-state (per the 7a design §3.2):
+//   - nil           → no registration pending (Phase 0 / skip / off) → ungated
+//   - open (non-nil, not closed) → registration in flight → mutating
+//     encrypted writes block on it
+//   - closed        → registration committed → ungated (fast path)
+type RegistrationGate struct {
+	// Barrier is the open-or-closed channel described above. A nil
+	// Barrier (the zero value, or an explicitly nil field) means
+	// "never armed" → ungated; awaitRegistration checks for nil first
+	// so a nil channel is never received on (which would block forever).
+	Barrier <-chan struct{}
+	// StorageEnvelopeActive and ActiveStorageKeyID read the process-wide
+	// encryption StateCache. A write is gated only when the §7.1 cutover
+	// has fired AND a storage DEK is active — i.e. the write would land
+	// encrypted and thus emit a nonce under this node's identity.
+	StorageEnvelopeActive func() bool
+	ActiveStorageKeyID    func() (uint32, bool)
+}
+
+// WithRegistrationGate wires the Stage 7a first-write barrier onto the
+// coordinator. Applied after construction for the same reason as the
+// other With* options. A nil gate (or a gate with a nil Barrier)
+// leaves every write ungated — the encryption-off / no-pending-
+// registration posture.
+func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedCoordinator {
+	c.registrationGate = g
+	return c
+}
+
+// awaitRegistration implements the §4.1 first-write barrier (7a §3.2).
+// It returns nil (ungated) unless a registration is genuinely pending
+// AND this request is a mutating write that would land encrypted, in
+// which case it blocks until the registration commits or ctx ends.
+// Fail-closed: a write that cannot register within its ctx returns the
+// ctx error rather than proceeding to emit an unregistered nonce.
+func (c *ShardedCoordinator) awaitRegistration(ctx context.Context, reqs *OperationGroup[OP]) error {
+	g := c.registrationGate
+	if g == nil || g.Barrier == nil {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil // registration committed — fast path
+	default:
+	}
+	// Registration is in flight. Gate only mutating writes that would
+	// land encrypted; reads never reach Dispatch, and cleartext writes
+	// (pre-cutover / no active DEK) emit no nonce.
+	if !c.writeWouldEncrypt(reqs) {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "encryption: write blocked on pending §4.1 writer registration")
+	}
+}
+
+// writeWouldEncrypt reports whether reqs is a mutating write that would
+// land as a §4.1 storage envelope under the current gate state — i.e.
+// the cutover has fired AND a storage DEK is active. Only such writes
+// are gated by awaitRegistration; reads and cleartext writes are not.
+func (c *ShardedCoordinator) writeWouldEncrypt(reqs *OperationGroup[OP]) bool {
+	if c.registrationGate == nil {
+		return false
+	}
+	return hasMutatingElems(reqs) && c.encryptionWriteActive()
+}
+
+// awaitRegistrationBarrier is the write-layer (Transactional.Commit)
+// half of the §4.1 first-write gate. Unlike awaitRegistration it takes
+// no OperationGroup: every Commit is a write, so the gate fires
+// whenever a registration is pending AND the write would land
+// encrypted (cutover fired + active DEK). nil-receiver-safe (tests
+// construct leaseRefreshingTxn without a coordinator).
+func (c *ShardedCoordinator) awaitRegistrationBarrier(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	g := c.registrationGate
+	if g == nil || g.Barrier == nil {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil // committed — fast path
+	default:
+	}
+	if !c.encryptionWriteActive() {
+		return nil
+	}
+	select {
+	case <-g.Barrier:
+		return nil
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "encryption: commit blocked on pending §4.1 writer registration")
+	}
+}
+
+// encryptionWriteActive reports whether a write would currently land as
+// a §4.1 storage envelope: the cutover has fired AND a storage DEK is
+// active. Shared by writeWouldEncrypt (Dispatch gate) and
+// awaitRegistrationBarrier (Commit gate). Assumes c.registrationGate
+// is non-nil (both callers check that first).
+func (c *ShardedCoordinator) encryptionWriteActive() bool {
+	g := c.registrationGate
+	if g.StorageEnvelopeActive == nil || !g.StorageEnvelopeActive() {
+		return false
+	}
+	if g.ActiveStorageKeyID == nil {
+		return false
+	}
+	_, ok := g.ActiveStorageKeyID()
+	return ok
+}
+
+// hasMutatingElems reports whether the group carries at least one
+// mutating operation. Every OP in OperationGroup (Put / Del /
+// DelPrefix) mutates — reads use separate Coordinator methods that
+// never reach Dispatch — so a read-only transaction reaches here with
+// only ReadKeys set and an empty Elems slice, and must stay ungated.
+func hasMutatingElems(reqs *OperationGroup[OP]) bool {
+	if reqs == nil {
+		return false
+	}
+	// The per-Elem nil check is defensive: validateOperationGroup runs
+	// before this and rejects groups with nil elements, so a non-empty
+	// Elems is effectively all-non-nil in practice. The guard keeps
+	// hasMutatingElems correct even if a future caller bypasses that
+	// validation.
+	for _, e := range reqs.Elems {
+		if e != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // WithLeaseReadObserver wires a LeaseReadObserver onto a
@@ -147,38 +518,85 @@ func (c *ShardedCoordinator) WithLeaseReadObserver(observer LeaseReadObserver) *
 	return c
 }
 
+// WithSampler wires a keyviz.Sampler onto a ShardedCoordinator. The
+// coordinator calls sampler.Observe at dispatch entry — once per
+// resolved (RouteID, mutation key) pair — to feed the key visualizer
+// heatmap (design doc §5.1). Applied after construction for the same
+// reason as WithLeaseReadObserver: NewShardedCoordinator is already
+// heavily overloaded.
+//
+// Passing a nil interface value is supported and disables sampling
+// (the call site guards against it). Passing a typed-nil
+// *keyviz.MemSampler also works because Observe is nil-safe by
+// contract.
+func (c *ShardedCoordinator) WithSampler(s keyviz.Sampler) *ShardedCoordinator {
+	c.sampler = s
+	return c
+}
+
+// WithPartitionResolver wires a PartitionResolver onto the
+// coordinator's underlying ShardRouter. The resolver runs before
+// the byte-range engine on every dispatch, so partition-keyspace
+// schemes (e.g. SQS HT-FIFO) can override the default shard layout
+// without breaking the engine's non-overlapping-cover invariant.
+//
+// Applied after construction for the same reason as the other
+// With* options on this type — NewShardedCoordinator is already
+// heavily overloaded. Passing a nil resolver clears any previously-
+// installed resolver.
+func (c *ShardedCoordinator) WithPartitionResolver(r PartitionResolver) *ShardedCoordinator {
+	c.router.WithPartitionResolver(r)
+	return c
+}
+
 // NewShardedCoordinator builds a coordinator for the provided shard groups.
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
+	// Construct the coordinator before wrapping the per-shard
+	// Transactionals so each leaseRefreshingTxn can back-reference it
+	// for the §4.1 registration barrier (the gate is installed later
+	// via WithRegistrationGate and read at Commit time).
+	c := &ShardedCoordinator{
+		engine:       engine,
+		router:       router,
+		groups:       groups,
+		defaultGroup: defaultGroup,
+		clock:        clock,
+		store:        st,
+		log:          slog.Default(),
+	}
 	var deregisters []func()
 	for gid, g := range groups {
 		// Wrap Txn so every successful Commit/Abort refreshes the
 		// per-shard lease. Leave nil transactions unchanged, and skip
 		// if already wrapped so repeat calls don't stack wrappers.
 		if g.Txn != nil {
-			if _, already := g.Txn.(*leaseRefreshingTxn); !already {
-				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g}
+			if existing, already := g.Txn.(*leaseRefreshingTxn); already {
+				// Re-binding over the same ShardGroup (this function
+				// supports repeat construction by not stacking
+				// wrappers): point the existing wrapper at the NEW
+				// coordinator so Commit consults the freshly-installed
+				// registration gate, not a stale one (codex P2).
+				existing.coord = c
+			} else {
+				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}
 			}
 		}
 		router.Register(gid, g.Txn, g.Store)
+		// Resolve the optional LeaseProvider capability once so
+		// groupLeaseRead / maybeRefresh test g.lp for nil instead of
+		// re-asserting the interface per call.
 		// Per-shard leader-loss hook: when this group's engine notices
 		// a state transition out of leader, drop the lease so the next
 		// LeaseReadForKey on that shard takes the slow path.
 		if lp, ok := g.Engine.(raftengine.LeaseProvider); ok {
+			g.lp = lp
 			deregisters = append(deregisters, lp.RegisterLeaderLossCallback(g.lease.invalidate))
 		}
 	}
-	return &ShardedCoordinator{
-		engine:             engine,
-		router:             router,
-		groups:             groups,
-		defaultGroup:       defaultGroup,
-		clock:              clock,
-		store:              st,
-		log:                slog.Default(),
-		deregisterLeaseCbs: deregisters,
-	}
+	c.deregisterLeaseCbs = deregisters
+	return c
 }
 
 // Close releases per-shard engine-side registrations. Idempotent.
@@ -203,12 +621,36 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
+	// Stage 7a §4.1: block self-originated mutating encrypted writes
+	// until this node's writer registration commits. Ungated fast path
+	// (no gate / committed / cleartext) returns immediately.
+	if err := c.awaitRegistration(ctx, reqs); err != nil {
+		return nil, err
+	}
+
 	// DEL_PREFIX cannot be routed to a single shard because the prefix may
 	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
 	// operation to every shard group so each FSM scans locally.
 	if hasDelPrefixElem(reqs.Elems) {
-		return c.dispatchDelPrefixBroadcast(reqs.IsTxn, reqs.Elems)
+		return c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
 	}
+
+	// Capture whether the caller supplied a non-zero StartTS BEFORE
+	// the coordinator-allocates-on-zero branch below mutates the
+	// field.  A caller-supplied StartTS names a specific snapshot
+	// the caller already read against (e.g. adapter/s3.go:573
+	// reads bucket metadata at readTS and dispatches with
+	// StartTS=readTS; adapter/sqs_messages.go and adapter/dynamodb.go
+	// follow the same readTS-then-mutate pattern across dozens of
+	// sites).  The pre-Dispatch read is invisible to the
+	// coordinator — it is NOT surfaced as a ReadKeys entry — so
+	// the only signal that the snapshot is owned by the caller is
+	// reqs.StartTS being non-zero on entry.  The M4 retry path
+	// uses this to gate the StartTS bump: bumping a caller-owned
+	// timestamp would let any commit landed in (originalStartTS,
+	// newStartTS) bypass the FSM's latest>startTS write-conflict
+	// check (codex P1 on 57da8886, PR #900).
+	callerSuppliedStartTS := reqs.IsTxn && reqs.StartTS != 0
 
 	if reqs.IsTxn && reqs.StartTS == 0 {
 		startTS, err := c.nextStartTS(ctx, reqs.Elems)
@@ -224,15 +666,246 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
-		return c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.Elems, reqs.ReadKeys)
+		return c.dispatchTxnWithComposed1Retry(ctx, reqs, callerSuppliedStartTS)
 	}
 
+	return c.dispatchNonTxn(ctx, reqs)
+}
+
+// dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
+// (design doc
+// docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
+// §M4).  Pins reqs.ObservedRouteVersion to the engine's current
+// catalog version on the FIRST attempt when the caller left it at the
+// zero sentinel — every txn that flows through ShardedCoordinator
+// gets gate-eligible by default so the M3 verifyComposed1 check has
+// teeth without each adapter rediscovering the contract.  On
+// ErrComposed1Violation or ErrComposed1VersionGCd, re-reads the
+// catalog version, re-stamps observed+commit on the OperationGroup,
+// and re-issues dispatchTxn ONCE.  Beyond one retry the sentinel
+// surfaces unchanged.
+//
+// The retry is bounded at composed1RetryAttempts = 1 because both
+// sentinels are "route shifted, retry on the fresh catalog" signals
+// — a persistent failure across two attempts means the catalog is
+// churning faster than this dispatch can keep up, and surfacing the
+// error lets a wrapping adapter retry harness (or the client) decide
+// whether to keep trying.
+// maybeAutoPinObservedRouteVersion stamps reqs.ObservedRouteVersion
+// with the engine's current catalog version at Dispatch entry, but
+// ONLY when (a) the txn has no read keys AND (b) the caller did not
+// supply StartTS AND (c) no element's key is claimed by a partition
+// resolver.  Per design doc §4.1 the version must be pinned at
+// BeginTxn (read-set capture time); the auto-pin is a best-effort
+// backfill for callers that have not yet migrated to pin
+// themselves.  Three cases skip the auto-pin:
+//
+//   - len(ReadKeys) != 0 — the caller already performed reads at
+//     some earlier moment (Redis MULTI/EXEC's txnContext.commit
+//     builds an OperationGroup with StartTS from MULTI and
+//     ReadKeys from the GETs inside the txn body).  Stamping the
+//     catalog version at this Dispatch call would associate
+//     post-shift routes with pre-shift reads (codex P1 on
+//     10123c5a, PR #900).
+//
+//   - callerSuppliedStartTS — the caller supplied StartTS,
+//     meaning a read at the adapter layer happened against that
+//     snapshot before Dispatch even though it is not surfaced as
+//     a ReadKeys entry.  The 13+ S3/SQS/DynamoDB adapter sites
+//     identified in the M4-StartTS-gate audit (adapter/s3.go:573
+//     etc.) fall in this bucket.  Stamping the catalog version
+//     at Dispatch time would mask any route shift between the
+//     adapter-layer read and Dispatch entry — verifyComposed1
+//     would find no mismatch at apply time and the shift becomes
+//     INVISIBLE.  That is strictly worse than ObservedRouteVersion=0
+//     (gate short-circuits, no false claim made): the spurious
+//     auto-pin gives false confidence (codex P1 on 144ec0ca,
+//     PR #900).
+//
+//   - any element's key is resolver-claimed — when a
+//     PartitionResolver is wired (SQS HT-FIFO partition keys
+//     etc.), ShardRouter routes via the resolver but
+//     verifyComposed1 calls route-history OwnerOf on the raw
+//     mutation key against the BYTE-RANGE engine snapshot.  The
+//     engine has no knowledge of the resolver's mapping, so the
+//     gate spuriously rejects resolver-routed commits even when
+//     the resolver picked the correct gid.  Skip the auto-pin
+//     for any resolver-recognised key; the request flows with
+//     ObservedRouteVersion=0 and the M3 gate short-circuits —
+//     restoring the pre-auto-pin behaviour for resolver-routed
+//     txns.  Resolver-aware M3 is M5+ work (codex P1 on
+//     6a458a28, PR #900).
+//
+// The non-auto-pin case (request flows with ObservedRouteVersion=0,
+// M3 gate short-circuits) is the safe non-regressing posture for
+// non-migrated callers — the gate cannot retroactively pin reads
+// it was not present for.  Adapters that want M3 protection must
+// migrate to pin at BeginTxn per §4.1.
+//
+// Extracted from dispatchTxnWithComposed1Retry to keep its
+// cyclomatic complexity in the cyclop budget.
+func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGroup[OP], callerSuppliedStartTS bool) {
+	if c.engine == nil || reqs.ObservedRouteVersion != 0 || len(reqs.ReadKeys) != 0 || callerSuppliedStartTS {
+		return
+	}
+	if c.anyResolverClaimedKey(reqs.Elems) {
+		return
+	}
+	reqs.ObservedRouteVersion = c.engine.Version()
+}
+
+// anyResolverClaimedKey reports whether any element's key is
+// claimed by the partition resolver.  Returns false when the
+// router has no resolver installed (the most common case) so the
+// auto-pin path stays inexpensive in the byte-range-only deployment.
+// Extracted from maybeAutoPinObservedRouteVersion to keep the
+// auto-pin's cyclomatic complexity in the cyclop budget.
+func (c *ShardedCoordinator) anyResolverClaimedKey(elems []*Elem[OP]) bool {
+	if c.router == nil || c.router.partitionResolver == nil {
+		return false
+	}
+	for _, e := range elems {
+		if e == nil || len(e.Key) == 0 {
+			continue
+		}
+		if c.router.partitionResolver.RecognisesPartitionedKey(e.Key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
+	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
+
+	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
+		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion)
+		if err == nil {
+			return resp, nil
+		}
+		if !isComposed1RetryableError(err) {
+			return resp, err
+		}
+		// Read-write txns (ReadKeys non-empty) MUST surface the
+		// sentinel without retry.  The client already performed
+		// the reads at the original StartTS; transparently bumping
+		// StartTS on retry would let any concurrent write that
+		// committed between the old and new timestamps go
+		// undetected by the FSM's OCC check (which only rejects
+		// versions with `latest > startTS`), letting the retry
+		// commit decisions based on stale reads — a strict-
+		// serialisability violation (gemini CRITICAL / codex P1
+		// on PR #900).
+		//
+		// The caller / adapter is responsible for re-executing the
+		// entire txn (including re-reading the keys at a fresh
+		// timestamp) when this sentinel surfaces.  Write-only
+		// txns (no reads to invalidate) remain safe to retry.
+		if len(reqs.ReadKeys) > 0 {
+			return resp, err
+		}
+		// Caller-supplied StartTS (ReadKeys-empty case) MUST also
+		// surface — the caller's pre-Dispatch read at this snapshot
+		// is invisible to the coordinator, so we cannot prove the
+		// retry's bumped StartTS would still preserve OCC against
+		// commits landed in (originalStartTS, newStartTS).  This
+		// catches dozens of adapter sites that supply
+		// StartTS=readTS without populating ReadKeys: S3
+		// createBucket / admin object writes, SQS messages /
+		// FIFO / purge / tags, DynamoDB metadata writes, etc.
+		// Only coordinator-allocated StartTS (caller passed 0
+		// at Dispatch entry, the coordinator allocated it from
+		// nextStartTS, and no read has happened at it) is safe
+		// to bump on retry (codex P1 on 57da8886, PR #900).
+		if callerSuppliedStartTS {
+			return resp, err
+		}
+		if attempt == composed1RetryAttempts {
+			return resp, err
+		}
+		// Re-route by re-reading the engine's current catalog
+		// version and stamping it on the txn.  groupMutations on
+		// the next dispatchTxn pass re-runs router.ResolveGroup,
+		// so a key whose owning group changed since the last
+		// attempt naturally lands on the new group's FSM.
+		if c.engine != nil {
+			reqs.ObservedRouteVersion = c.engine.Version()
+		}
+		// Clear the timestamps so the next attempt allocates a
+		// fresh pair against the post-shift HLC.  The OCC
+		// invariants require commitTS > startTS computed under the
+		// same HLC observation; reusing the stale pair would risk
+		// a startTS that no longer dominates the new shard's
+		// applied commitTS.
+		//
+		// Allocate StartTS unconditionally — nextStartTS already
+		// handles the nil-clock case (falls back to
+		// maxTS+1 internally).  Gating on c.clock!=nil would leave
+		// reqs.StartTS at 0 in the nil-clock test fixture, and
+		// dispatchTxn does NOT re-allocate when StartTS is zero,
+		// so the retry would run with StartTS=0 — violating MVCC
+		// invariants (gemini HIGH on PR #900).
+		reqs.CommitTS = 0
+		// IMPORTANT — do NOT clear reqs.PrevCommitTS here.  An earlier
+		// round of this PR did (taking claude[bot]'s reasoning at face
+		// value: "M3 fired at apply time, so the original attempt never
+		// committed → probe is stale").  That reasoning conflates two
+		// different "original attempts" and is wrong (codex P1 on
+		// 43c55dfe, PR #900):
+		//
+		//   * Within M4: attempt 1's M3 rejection does prove attempt 1
+		//     did not write anything (the FSM rejects before any state
+		//     change).
+		//   * Across adapter retries: PrevCommitTS names the
+		//     ADAPTER'S prior attempt (e.g. adapter/redis.go:3209,
+		//     :3615 send PrevCommitTS = pending.commitTS as the
+		//     option-2 ambiguous-outcome probe).  That earlier
+		//     attempt may have actually landed at the named commitTS
+		//     before the route shift that triggered our M3 sentinel.
+		//
+		// Dropping the probe in the retry would let the FSM re-apply
+		// the writes against the post-shift route, double-writing the
+		// caller's at-most-once-payload if the named prior attempt did
+		// land.  Preserving it has the cost that
+		// dispatchMultiShardTxn:749 surfaces
+		// ErrTxnDedupRequiresSingleShard when the post-shift route now
+		// spans multiple groups — which IS the faithful signal: the
+		// adapter's at-most-once retry contract cannot be transparently
+		// honoured across a shard split, and the caller must reckon
+		// with the ambiguity at a higher level (re-read, re-execute,
+		// abort).  Surfacing that error is strictly safer than silently
+		// losing dedup.
+		startTS, allocErr := c.nextStartTS(ctx, reqs.Elems)
+		if allocErr != nil {
+			// resp here is the failed first attempt's response (always
+			// nil for the Composed-1 sentinels) — return nil
+			// explicitly so the contract "non-nil response on success
+			// only" is unambiguous (claude[bot] nit on PR #900).
+			return nil, allocErr
+		}
+		reqs.StartTS = startTS
+	}
+	// Unreachable — the loop body always returns on each iteration.
+	// Kept here so the function has an unambiguous return shape.
+	return nil, errors.WithStack(ErrInvalidRequest)
+}
+
+// isComposed1RetryableError reports whether err is one of the M3 gate
+// sentinels that M4 retries.  Both surface as wrapped errors from the
+// underlying transactional Commit; errors.Is unwraps them correctly.
+func isComposed1RetryableError(err error) bool {
+	return errors.Is(err, ErrComposed1Violation) || errors.Is(err, ErrComposed1VersionGCd)
+}
+
+// dispatchNonTxn routes a non-transactional operation group through the
+// shard router. Extracted from Dispatch to keep that method's branch
+// count within the cyclop budget after the 7a registration gate landed.
+func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	logs, err := c.requestLogs(reqs)
 	if err != nil {
 		return nil, err
 	}
-
-	r, err := c.router.Commit(logs)
+	r, err := c.router.Commit(ctx, logs)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -265,7 +938,7 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 // to every shard group. Each element becomes a separate pb.Request (the FSM's
 // extractDelPrefix processes only the first DEL_PREFIX mutation per request).
 // All requests are batched into a single Commit call per shard group.
-func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
 	}
@@ -273,7 +946,10 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Ele
 		return nil, err
 	}
 
-	ts := c.clock.Next()
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return nil, errors.Wrap(err, "allocate DEL_PREFIX broadcast ts")
+	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
 		requests = append(requests, &pb.Request{
@@ -284,12 +960,12 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(isTxn bool, elems []*Ele
 		})
 	}
 
-	return c.broadcastToAllGroups(requests)
+	return c.broadcastToAllGroups(ctx, requests)
 }
 
 // broadcastToAllGroups sends the same set of requests to every shard group in
 // parallel and returns the maximum commit index.
-func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests []*pb.Request) (*CoordinateResponse, error) {
 	var (
 		maxIndex atomic.Uint64
 		firstErr error
@@ -300,7 +976,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*Coor
 		wg.Add(1)
 		go func(g *ShardGroup) {
 			defer wg.Done()
-			r, err := g.Txn.Commit(requests)
+			r, err := g.Txn.Commit(ctx, requests)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -327,7 +1003,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(requests []*pb.Request) (*Coor
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, prevCommitTS uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -351,30 +1027,85 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		// If any read key belongs to a different shard the 2PC path is required
 		// so that validateReadOnlyShards can issue a linearizable read barrier,
 		// preserving SSI.
-		return c.dispatchSingleShardTxn(startTS, commitTS, primaryKey, gids[0], elems, readKeys)
+		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion)
+	}
+	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion)
+}
+
+// dispatchMultiShardTxn runs the 2PC path. Extracted from dispatchTxn to keep
+// that function under the cyclop budget after the prevCommitTS reject (codex
+// P2 round-10) was added; the multi-shard branch already carries five linear
+// error checks (groupReadKeys, prewrite, commitPrimary, abortCleanup,
+// commitSecondaries) that pushed the parent over the 10-edge limit.
+func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
+	// Fail-closed when a retry carries the option-2 dedup probe key but its
+	// write set / read set spans shards (codex P2 round-10 "reject retries
+	// that leave the one-phase path"). The 2PC log builders only encode
+	// CommitTS and would silently drop PrevCommitTS — a landed ambiguous
+	// attempt would then look like an ordinary write conflict, the adapter
+	// would drop pending and recompute, and the duplicate this feature is
+	// meant to prevent would reappear. Surface the constraint explicitly so
+	// the caller (or a future multi-shard dedup design) knows the request
+	// shape is unsupported.
+	if prevCommitTS != 0 {
+		return nil, errors.WithStack(ErrTxnDedupRequiresSingleShard)
 	}
 
-	// Multi-shard path: group read keys by shard now. The result is passed
-	// directly to prewriteTxn to avoid a second iteration inside that function.
-	groupedReadKeys := c.groupReadKeysByShardID(readKeys)
-	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys)
+	// Group read keys by shard now. The result is passed directly to
+	// prewriteTxn to avoid a second iteration inside that function. A
+	// routing failure here aborts the transaction before any prewrite —
+	// silently dropping unresolvable read keys would let OCC validation
+	// run with an incomplete read set and break SSI.
+	groupedReadKeys, err := c.groupReadKeysByShardID(readKeys)
+	if err != nil {
+		return nil, err
+	}
+	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion)
 	if err != nil {
 		return nil, err
 	}
 
-	primaryGid, maxIndex, err := c.commitPrimaryTxn(startTS, primaryKey, grouped, commitTS)
+	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, commitTS, observedRouteVersion)
 	if err != nil {
-		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		// abortPreparedTxn must run even when ctx was the reason
+		// commitPrimaryTxn failed — otherwise prewrite intents on
+		// every prepared shard linger until LockResolver picks them
+		// up at a future tick (lease window of expensive
+		// keyspace-scan work). Detach cancellation but cap with
+		// verifyLeaderTimeout so a hung Abort cannot leak.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		cancel()
 		return nil, errors.WithStack(err)
 	}
 
-	maxIndex = c.commitSecondaryTxns(startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex)
+	// commitSecondaryTxns propagates ObservedRouteVersion to per-
+	// secondary commits so the M3 gate fires on route shifts between
+	// primary-COMMIT and secondary-COMMIT.  Such a sentinel surfaces
+	// as ErrTxnSecondaryRouteShiftedAfterPrimaryCommit (NOT
+	// ErrComposed1Violation — the M4 retry must not loop here; the
+	// primary is already durable and re-prewriting would conflict
+	// with the existing locks).  d8487672 originally tried to avoid
+	// the silent-partial-commit hazard by dropping the gate; codex
+	// P1 (20:30:35) correctly showed that the dropped-gate posture
+	// silently lands writes on stale owners that are no longer
+	// reachable by readers on the new owner.  Both directions are
+	// silent partial commits; surfacing the error is the only honest
+	// posture (codex P1 on d8487672 + 6202b964, PR #900).
+	maxIndex, err = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
 func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint64, error) {
 	if commitTS == 0 {
-		commitTS = c.nextTxnTSAfter(startTS)
+		next, err := c.nextTxnTSAfter(startTS)
+		if err != nil {
+			return 0, err
+		}
+		commitTS = next
 	} else {
 		// Observe caller-provided commitTS to keep the HLC monotonic; without
 		// this the clock could later issue timestamps smaller than commitTS.
@@ -398,15 +1129,17 @@ func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) b
 	return true
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(startTS, commitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
 	}
 	// ReadKeys are included in the Raft log entry so the FSM validates
-	// read-write conflicts atomically under applyMu.
-	resp, err := g.Txn.Commit([]*pb.Request{
-		onePhaseTxnRequest(startTS, commitTS, primaryKey, elems, readKeys),
+	// read-write conflicts atomically under applyMu. prevCommitTS, when set,
+	// carries the one-phase dedup probe key for a retry that reuses a failed
+	// attempt's write set.
+	resp, err := g.Txn.Commit(ctx, []*pb.Request{
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -422,7 +1155,7 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte) ([]preparedGroup, error) {
+func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64) ([]preparedGroup, error) {
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
 
@@ -432,14 +1165,23 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			return nil, err
 		}
 		req := &pb.Request{
-			IsTxn:     true,
-			Phase:     pb.Phase_PREPARE,
-			Ts:        startTS,
-			Mutations: append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
-			ReadKeys:  groupedReadKeys[gid],
+			IsTxn:                true,
+			Phase:                pb.Phase_PREPARE,
+			Ts:                   startTS,
+			Mutations:            append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
+			ReadKeys:             groupedReadKeys[gid],
+			ObservedRouteVersion: observedRouteVersion,
 		}
-		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
-			c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
+			// Same WithoutCancel pattern as dispatchTxn's
+			// commitPrimaryTxn-failure cleanup: a cancelled ctx is
+			// the most likely cause of Commit failing here, and the
+			// abort MUST still go through to release the intents we
+			// already wrote on prior shards. Otherwise LockResolver
+			// holds the bag.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+			cancel()
 			return nil, errors.WithStack(err)
 		}
 		prepared = append(prepared, preparedGroup{gid: gid, keys: keyMutations(grouped[gid])})
@@ -449,14 +1191,20 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 	// but no mutations in this transaction). Without this, a concurrent
 	// write to a read-only shard would go undetected.
 	if err := c.validateReadOnlyShards(ctx, groupedReadKeys, gids, startTS); err != nil {
-		c.abortPreparedTxn(startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		// Same reasoning as the prepare-loop cleanup above: the
+		// validate read fence may have failed because ctx
+		// expired, so the abort needs detached cancellation to
+		// avoid stranding intents.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		cancel()
 		return nil, err
 	}
 
 	return prepared, nil
 }
 
-func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64) (uint64, uint64, error) {
+func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64, observedRouteVersion uint64) (uint64, uint64, error) {
 	primaryGid := c.engineGroupIDForKey(primaryKey)
 	if primaryGid == 0 {
 		return 0, 0, errors.WithStack(ErrInvalidRequest)
@@ -470,13 +1218,14 @@ func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte,
 	meta := txnMetaMutation(primaryKey, 0, commitTS)
 	keys := keyMutations(grouped[primaryGid])
 	req := &pb.Request{
-		IsTxn:     true,
-		Phase:     pb.Phase_COMMIT,
-		Ts:        startTS,
-		Mutations: append([]*pb.Mutation{meta}, keys...),
+		IsTxn:                true,
+		Phase:                pb.Phase_COMMIT,
+		Ts:                   startTS,
+		Mutations:            append([]*pb.Mutation{meta}, keys...),
+		ObservedRouteVersion: observedRouteVersion,
 	}
 
-	r, err := g.Txn.Commit([]*pb.Request{req})
+	r, err := g.Txn.Commit(ctx, []*pb.Request{req})
 	if err != nil {
 		return primaryGid, 0, errors.WithStack(err)
 	}
@@ -486,11 +1235,28 @@ func (c *ShardedCoordinator) commitPrimaryTxn(startTS uint64, primaryKey []byte,
 	return primaryGid, r.CommitIndex, nil
 }
 
-func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64) uint64 {
-	// Secondary commits are best-effort. If a shard is unavailable after the
-	// primary commits, read-time lock resolution will commit the remaining
-	// secondaries based on the primary commit record. Retry a few times to
-	// absorb short leader-election windows and reduce lock lag.
+func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) (uint64, error) {
+	// Secondary commits are best-effort for non-Composed-1 errors:
+	// if a shard is unavailable after the primary commits, read-time
+	// lock resolution will commit the remaining secondaries based on
+	// the primary commit record.  Retry a few times to absorb short
+	// leader-election windows and reduce lock lag.
+	//
+	// Composed-1 errors are an exception (codex P1 on d8487672 +
+	// 6202b964, PR #900).  When the M3 gate fires on a secondary
+	// commit, the route catalog has moved between primary-COMMIT and
+	// this secondary-COMMIT — the prepared lock lives at the old
+	// gid, the new owner per the catalog has no commit record.  We
+	// CANNOT silently land the write on the stale owner (codex 20:30:35
+	// — that's invisible to readers on the new owner) and we CANNOT
+	// silently swallow the error (codex 20:10:32 — uncommitted
+	// secondary, silent partial commit on the missing direction).
+	// The only honest posture is to surface
+	// ErrTxnSecondaryRouteShiftedAfterPrimaryCommit so the caller
+	// knows the txn state is uncertain and can do application-level
+	// recovery.  This sentinel is distinct from ErrComposed1Violation
+	// so the M4 retry path does not loop here (the primary is durable
+	// and re-prewriting would conflict with the existing locks).
 	meta := txnMetaMutation(primaryKey, 0, commitTS)
 	for _, gid := range gids {
 		if gid == primaryGid {
@@ -501,13 +1267,28 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 			continue
 		}
 		req := &pb.Request{
-			IsTxn:     true,
-			Phase:     pb.Phase_COMMIT,
-			Ts:        startTS,
-			Mutations: append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
+			IsTxn:                true,
+			Phase:                pb.Phase_COMMIT,
+			Ts:                   startTS,
+			Mutations:            append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
+			ObservedRouteVersion: observedRouteVersion,
 		}
-		r, err := commitSecondaryWithRetry(g, req)
+		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
+			if isComposed1RetryableError(err) {
+				// Fatal: surface the new sentinel so the caller is
+				// informed that the secondary's write is missing and
+				// the txn state is half-committed.  M4 retry won't
+				// match this sentinel, so it doesn't loop.
+				c.logger().Warn("txn secondary commit failed Composed-1 — surfacing as fatal",
+					slog.Uint64("gid", gid),
+					slog.String("primary_key", string(primaryKey)),
+					slog.Uint64("start_ts", startTS),
+					slog.Uint64("commit_ts", commitTS),
+					slog.Any("err", err),
+				)
+				return maxIndex, errors.WithStack(ErrTxnSecondaryRouteShiftedAfterPrimaryCommit)
+			}
 			c.logger().Warn("txn secondary commit failed",
 				slog.Uint64("gid", gid),
 				slog.String("primary_key", string(primaryKey)),
@@ -521,16 +1302,16 @@ func (c *ShardedCoordinator) commitSecondaryTxns(startTS uint64, primaryGid uint
 			maxIndex = r.CommitIndex
 		}
 	}
-	return maxIndex
+	return maxIndex, nil
 }
 
-func commitSecondaryWithRetry(g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {
+func commitSecondaryWithRetry(ctx context.Context, g *ShardGroup, req *pb.Request) (*TransactionResponse, error) {
 	if g == nil || g.Txn == nil || req == nil {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 	var lastErr error
 	for attempt := range txnSecondaryCommitRetryAttempts {
-		resp, err := g.Txn.Commit([]*pb.Request{req})
+		resp, err := g.Txn.Commit(ctx, []*pb.Request{req})
 		if err == nil {
 			return resp, nil
 		}
@@ -549,7 +1330,7 @@ func (c *ShardedCoordinator) logger() *slog.Logger {
 	return slog.Default()
 }
 
-func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) {
+func (c *ShardedCoordinator) abortPreparedTxn(ctx context.Context, startTS uint64, primaryKey []byte, prepared []preparedGroup, abortTS uint64) {
 	if len(prepared) == 0 {
 		return
 	}
@@ -569,7 +1350,7 @@ func (c *ShardedCoordinator) abortPreparedTxn(startTS uint64, primaryKey []byte,
 			Ts:        startTS,
 			Mutations: append([]*pb.Mutation{meta}, pg.keys...),
 		}
-		if _, err := g.Txn.Commit([]*pb.Request{req}); err != nil {
+		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
 			if errors.Is(err, ErrTxnAlreadyCommitted) {
 				continue
 			}
@@ -592,23 +1373,29 @@ func (c *ShardedCoordinator) txnGroupForID(gid uint64) (*ShardGroup, error) {
 	return g, nil
 }
 
-func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) uint64 {
+func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) (uint64, error) {
 	if c.clock == nil {
 		nextTS := startTS + 1
 		if nextTS == 0 {
-			return 0
+			return 0, nil
 		}
-		return nextTS
+		return nextTS, nil
 	}
-	ts := c.clock.Next()
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate txn commit ts")
+	}
 	if ts <= startTS {
 		c.clock.Observe(startTS)
-		ts = c.clock.Next()
+		ts, err = c.clock.NextFenced()
+		if err != nil {
+			return 0, errors.Wrap(err, "re-allocate txn commit ts after Observe")
+		}
 	}
 	if ts <= startTS {
-		return 0
+		return 0, nil
 	}
-	return ts
+	return ts, nil
 }
 
 func abortTSFrom(startTS, commitTS uint64) uint64 {
@@ -650,7 +1437,11 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 	if c.clock == nil {
 		return maxTS + 1, nil
 	}
-	return c.clock.Next(), nil
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, "allocate sharded startTS")
+	}
+	return ts, nil
 }
 
 func (c *ShardedCoordinator) maxLatestCommitTS(ctx context.Context, elems []*Elem[OP]) (uint64, error) {
@@ -677,12 +1468,12 @@ func (c *ShardedCoordinator) IsLeader() bool {
 	return isLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) VerifyLeader() error {
+func (c *ShardedCoordinator) VerifyLeader(ctx context.Context) error {
 	g, ok := c.groups[c.defaultGroup]
 	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return verifyLeaderEngine(engineForGroup(g))
+	return verifyLeaderEngineCtx(ctx, engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) RaftLeader() string {
@@ -709,12 +1500,12 @@ func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
 	return isLeaderEngine(engineForGroup(g))
 }
 
-func (c *ShardedCoordinator) VerifyLeaderForKey(key []byte) error {
+func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
 	g, ok := c.groupForKey(key)
 	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
-	return verifyLeaderEngine(engineForGroup(g))
+	return verifyLeaderEngineCtx(ctx, engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
@@ -726,10 +1517,11 @@ func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
 }
 
 func (c *ShardedCoordinator) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	g, ok := c.groupForKey(key)
+	routeID, g, ok := c.routeAndGroupForKey(key)
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
+	c.observeRead(routeID, key)
 	return linearizableReadEngineCtx(ctx, engineForGroup(g))
 }
 
@@ -747,11 +1539,33 @@ func (c *ShardedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 // Each group maintains its own lease since each group has independent
 // leadership and term.
 func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	g, ok := c.groupForKey(key)
+	routeID, g, ok := c.routeAndGroupForKey(key)
 	if !ok {
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
+	c.observeRead(routeID, key)
 	return groupLeaseRead(ctx, g, c.leaseObserver)
+}
+
+// LeaseReadAllGroups establishes the lease freshness bound on every shard
+// group this coordinator owns. Multi-shard reads (Scan, GSI/whole-table
+// Query) visit all intersecting routes across all groups (see
+// ShardStore.ScanAt), so fencing only the default group would let those
+// reads sample a snapshot on a non-default group without the freshness
+// bound. It fails closed on the first group that cannot confirm its lease,
+// since a partially-fenced read is exactly the stale read this guards
+// against. Group iteration order is unspecified; correctness does not
+// depend on it because every group must succeed.
+func (c *ShardedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
+	if len(c.groups) == 0 {
+		return errors.WithStack(ErrLeaderNotFound)
+	}
+	for _, g := range c.groups {
+		if _, err := groupLeaseRead(ctx, g, c.leaseObserver); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
 }
 
 // observeLeaseRead forwards a hit / miss signal to observer when it
@@ -765,18 +1579,23 @@ func observeLeaseRead(observer LeaseReadObserver, hit bool) {
 
 func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
 	engine := engineForGroup(g)
-	lp, ok := engine.(raftengine.LeaseProvider)
-	if !ok {
+	// g.lp caches the LeaseProvider assertion done once at construction
+	// (NewShardedCoordinator); a nil group or an engine without the
+	// capability falls through to the linearizable slow path. The nil-g
+	// guard preserves engineForGroup's nil-safety since g.lp would panic
+	// on a nil receiver.
+	if g == nil || g.lp == nil {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
+	lp := g.lp
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
 		return linearizableReadEngineCtx(ctx, engine)
 	}
-	// Single time.Now() sample so primary/secondary/extension all see
-	// the same instant. Clock-skew safety delegated to
-	// engineLeaseAckValid (see Coordinate.LeaseRead).
-	now := time.Now()
+	// Single monoclock.Now() sample so primary/secondary/extension
+	// all see the same monotonic-raw instant. Clock-skew safety
+	// delegated to engineLeaseAckValid (see Coordinate.LeaseRead).
+	now := monoclock.Now()
 	state := engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
 		observeLeaseRead(observer, true)
@@ -804,35 +1623,93 @@ func (c *ShardedCoordinator) Clock() *HLC {
 }
 
 func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return nil, false
 	}
-	g, ok := c.groups[route.GroupID]
+	g, ok := c.groups[gid]
 	return g, ok
 }
 
+// routeAndGroupForKey is groupForKey + the resolved RouteID. Read
+// entry points that observe into keyviz call this so the GetRoute
+// lookup runs once instead of twice (Gemini round-1 nit on PR #661).
+// Leadership-only callers (IsLeaderForKey / VerifyLeaderForKey /
+// RaftLeaderForKey) keep using groupForKey because they don't need
+// the route ID.
+//
+// The gid comes from the partition-aware router (resolver-first,
+// engine-fallback) so partitioned-FIFO traffic lands on the
+// operator-chosen group. RouteID is read from the engine on the
+// normalized key; the resolver does not have a notion of catalog
+// RouteID, so partition-resolved keys observe under the engine's
+// catalog RouteID for !sqs|route|global. Partition-aware keyviz
+// is a Phase 3.D follow-up.
+func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGroup, bool) {
+	gid, ok := c.router.ResolveGroup(key)
+	if !ok {
+		return 0, nil, false
+	}
+	g, ok := c.groups[gid]
+	if !ok {
+		return 0, nil, false
+	}
+	var routeID uint64
+	if route, found := c.engine.GetRoute(routeKey(key)); found {
+		routeID = route.RouteID
+	}
+	return routeID, g, true
+}
+
 func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
-	route, ok := c.engine.GetRoute(routeKey(key))
+	gid, ok := c.router.ResolveGroup(key)
 	if !ok {
 		return 0
 	}
-	return route.GroupID
+	return gid
 }
 
-func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) map[uint64][][]byte {
+// EngineGroupIDForKey reports the Raft group ID that owns key, or 0 when
+// the key cannot be routed. Callers that batch lease checks across many
+// keys use it to collapse keys sharing a group into a single lease read
+// (see GroupRoutableCoordinator). It performs no I/O — only an in-memory
+// router lookup — so it is safe on the read hot path.
+func (c *ShardedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
+	return c.engineGroupIDForKey(key)
+}
+
+// groupReadKeysByShardID groups txn read keys by their owning Raft
+// group. Returns an error when ANY read key cannot be routed —
+// silently skipping unresolvable keys would let a transaction
+// commit with an incomplete OCC read-set, which breaks SSI under
+// the §5 ShardRouter resolver-first dispatch (codex round-2 P1 on
+// PR #715).
+//
+// The fail-closed semantic the resolver gained in PR 4-B-2 makes
+// this path matter: a partitioned-shape read key whose queue is
+// missing from --sqsFifoPartitionMap (drift / partial rollout)
+// returns gid=0 from c.router.ResolveGroup. If we silently dropped
+// those keys, the prewrite Raft entry would carry an empty
+// ReadKeys slice for that key, the FSM's read-write conflict
+// validation would never see it, and a concurrent write could
+// commit alongside a stale read. Surface the routing failure as
+// an error so the transaction aborts before any FSM apply.
+func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint64][][]byte, error) {
 	if len(readKeys) == 0 {
-		return nil
+		return nil, nil
 	}
 	grouped := make(map[uint64][][]byte)
 	for _, key := range readKeys {
-		gid := c.engineGroupIDForKey(key)
-		if gid == 0 {
-			continue
+		gid, ok := c.router.ResolveGroup(key)
+		if !ok || gid == 0 {
+			return nil, errors.Wrapf(ErrInvalidRequest,
+				"no route for txn read key %q — recognised-but-"+
+					"unresolved partition keys must fail closed to "+
+					"preserve OCC read-set integrity", key)
 		}
 		grouped[gid] = append(grouped[gid], key)
 	}
-	return grouped
+	return grouped, nil
 }
 
 // validateReadOnlyShards checks read-write conflicts on shards that have
@@ -924,10 +1801,14 @@ func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 
 	logs := make([]*pb.Request, 0, len(gids))
 	for _, gid := range gids {
+		ts, err := c.clock.NextFenced()
+		if err != nil {
+			return nil, errors.Wrap(err, "allocate sharded raw log ts")
+		}
 		logs = append(logs, &pb.Request{
 			IsTxn:     false,
 			Phase:     pb.Phase_NONE,
-			Ts:        c.clock.Next(),
+			Ts:        ts,
 			Mutations: grouped[gid],
 		})
 	}
@@ -948,7 +1829,44 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if err != nil {
 		return nil, err
 	}
-	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids)
+	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion)
+}
+
+// observeMutation: counted pre-commit, so a mutation that subsequently
+// fails its Raft proposal is still recorded — the heatmap reflects
+// offered load, not just committed writes (intentional for traffic
+// visualisation). The early return keeps the disabled-keyviz hot
+// path allocation-free. Reads have their own observeReadKey helper
+// (LinearizableReadForKey / LeaseReadForKey).
+func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation) {
+	if c.sampler == nil {
+		return
+	}
+	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value))
+}
+
+// observeRead records a single linearizable / lease read against the
+// route. The full key is passed (not just its length) so the sampler
+// can bucket the read into the key's sub-range for the hot-key heatmap;
+// the read's valueLen is 0 — the consistency check at this layer
+// doesn't fetch data; the actual GetAt on the store happens further
+// down the stack and isn't observed yet.
+//
+// Callers MUST pass an already-resolved routeID (via
+// routeAndGroupForKey) so the GetRoute lookup runs once across the
+// dispatch path — repeating it here just to compute routeID would
+// double the per-read overhead when sampling is enabled
+// (Gemini round-1 nit on PR #661).
+//
+// Adapter-direct read paths (Redis / DynamoDB / S3 hitting
+// MVCCStore.GetAt without going through the coordinator) still
+// bypass keyviz; sampling those is task B in the design's Phase 2
+// follow-up.
+func (c *ShardedCoordinator) observeRead(routeID uint64, key []byte) {
+	if c.sampler == nil {
+		return
+	}
+	c.sampler.Observe(routeID, key, keyviz.OpRead, 0)
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.Mutation, []uint64, error) {
@@ -958,11 +1876,19 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 			return nil, nil, ErrInvalidRequest
 		}
 		mut := elemToMutation(req)
-		route, ok := c.engine.GetRoute(routeKey(mut.Key))
+		gid, ok := c.router.ResolveGroup(mut.Key)
 		if !ok {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 		}
-		grouped[route.GroupID] = append(grouped[route.GroupID], mut)
+		// Engine RouteID for keyviz observation; partition-resolved
+		// keys observe under the !sqs|route|global RouteID until
+		// partition-aware keyviz lands.
+		var routeID uint64
+		if route, found := c.engine.GetRoute(routeKey(mut.Key)); found {
+			routeID = route.RouteID
+		}
+		c.observeMutation(routeID, mut)
+		grouped[gid] = append(grouped[gid], mut)
 	}
 	gids := make([]uint64, 0, len(grouped))
 	for gid := range grouped {
@@ -972,7 +1898,7 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP]) (map[uint64][]*pb.
 	return grouped, gids, nil
 }
 
-func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64) ([]*pb.Request, error) {
+func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64, observedRouteVersion uint64) ([]*pb.Request, error) {
 	logs := make([]*pb.Request, 0, len(gids)*txnPhaseCount)
 	for _, gid := range gids {
 		muts := grouped[gid]
@@ -988,6 +1914,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 				Mutations: append([]*pb.Mutation{
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: 0})},
 				}, muts...),
+				ObservedRouteVersion: observedRouteVersion,
 			},
 			&pb.Request{
 				IsTxn: true,
@@ -996,6 +1923,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 				Mutations: append([]*pb.Mutation{
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
 				}, keys...),
+				ObservedRouteVersion: observedRouteVersion,
 			},
 		)
 	}
@@ -1047,19 +1975,61 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 		select {
 		case <-timer.C:
 			if group.Engine.State() == raftengine.StateLeader {
-				ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
-				if _, err := group.Engine.Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
-					c.logger().WarnContext(ctx, "hlc lease renewal failed",
-						slog.Uint64("group_id", c.defaultGroup),
-						slog.Int64("ceiling_ms", ceilingMs),
-						slog.Any("err", err),
-					)
-				}
+				c.renewHLCLease(ctx, group)
 			}
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// renewHLCLease proposes a fresh physical ceiling on the default shard
+// group and, on a successful (quorum-acked) propose, warms that group's
+// read lease.
+//
+// The lease-extension base (start) and the invalidation generation are
+// sampled BEFORE the propose so the warm-up mirrors leaseRefreshingTxn's
+// success branch exactly: the window can only be SHORTER than the true
+// safety window, and a leader-loss callback that fires during the
+// propose advances the generation so extend refuses to resurrect a
+// stale lease. The propose is the SAME quorum confirmation a client
+// write goes through, so warming on its success cannot widen the
+// lease-read freshness window beyond what a write on this group would.
+// This is the background warm-up that flattens the read-only
+// lease-expiry sawtooth for the default group on idle-write workloads;
+// the lease window/duration semantics are unchanged.
+//
+// On a leadership-loss propose error the group lease is invalidated
+// eagerly, mirroring leaseRefreshingTxn's error branch exactly: when
+// Propose returns the loss before the async RegisterLeaderLossCallback
+// fires, a stale-warm lease must not survive on a non-leader node for
+// the callback latency window. Non-leadership errors (no quorum,
+// validation) are NOT leadership signals and must not tear down a warm
+// lease -- doing so would force every read onto the slow path.
+func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGroup) {
+	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	start := monoclock.Now()
+	expectedGen := group.lease.generation()
+	// Route through the ShardGroup's wrap-aware proposer chain — NOT a
+	// direct group.Engine.Propose — so the Stage 6E-2c dynamic wrap
+	// applies. Without this, an HLC lease-renewal entry committed
+	// post-cutover at `index > raftEnvelopeCutoverIndex` would land
+	// cleartext and trip the §6.3 strict-> unwrap on every replica's
+	// apply loop (codex P2 round-1).
+	if _, err := group.Proposer().Propose(ctx, marshalHLCLeaseRenew(ceilingMs)); err != nil {
+		if isLeadershipLossError(err) {
+			group.lease.invalidate()
+		}
+		c.logger().WarnContext(ctx, "hlc lease renewal failed",
+			slog.Uint64("group_id", c.defaultGroup),
+			slog.Int64("ceiling_ms", ceilingMs),
+			slog.Any("err", err),
+		)
+		return
+	}
+	if lp, ok := group.Engine.(raftengine.LeaseProvider); ok {
+		group.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
 	}
 }
 

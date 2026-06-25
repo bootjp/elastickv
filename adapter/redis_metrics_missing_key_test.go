@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/monitoring"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -41,15 +41,19 @@ func TestRedisMetrics_MissingKeyNotCountedAsError(t *testing.T) {
 
 	ctx := context.Background()
 	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-	defer func() { _ = rdb.Close() }()
+	defer func() {
+		if err := rdb.Close(); err != nil {
+			t.Logf("failed to close redis client: %v", err)
+		}
+	}()
 
 	t.Run("missing-key commands report outcome=success", func(t *testing.T) {
 		// Warm the client so that any connection-setup traffic
 		// go-redis issues (HELLO, CLIENT ID, CLIENT SETINFO, ...)
-		// lands BEFORE the baseline snapshot below. elastickv answers
-		// some of those with an ERR reply (HELLO is unimplemented,
-		// CLIENT ID is unsupported), and those errors are unrelated
-		// to the missing-key semantics being exercised here.
+		// lands BEFORE the baseline snapshot below. Even though HELLO
+		// and CLIENT ID / SETINFO are now supported and reply
+		// successfully, any stray observations must still not
+		// contaminate the missing-key-specific counters below.
 		require.NoError(t, rdb.Ping(ctx).Err())
 
 		errorsBefore := countErrorMetrics(t, registry)
@@ -168,10 +172,14 @@ func TestRedisMetrics_MissingKeyNotCountedAsError(t *testing.T) {
 		// None of the missing-key commands above must count as errors.
 		// Compare against the pre-traffic baseline so unrelated
 		// connection-setup errors (CLIENT ID / HELLO / ...) don't
-		// bleed into this assertion.
-		require.Equal(t, errorsBefore, countErrorMetrics(t, registry),
-			"missing-key commands must not increment elastickv_redis_errors_total; details=%s",
-			dumpErrorMetrics(t, registry))
+		// bleed into this assertion. Only call dumpErrorMetrics on
+		// failure so the happy path does not pay for an extra Gather().
+		currentErrors := countErrorMetrics(t, registry)
+		if currentErrors != errorsBefore {
+			require.Equal(t, errorsBefore, currentErrors,
+				"missing-key commands must not increment elastickv_redis_errors_total; details=%s",
+				dumpErrorMetrics(t, registry))
+		}
 
 		// Sanity check: the success counter for GET went up by the
 		// expected amount (1). If this assertion fires, the handler
@@ -215,6 +223,18 @@ func TestRedisMetrics_MissingKeyNotCountedAsError(t *testing.T) {
 	})
 }
 
+// metricFamily returns the MetricFamily with the given name, or nil if the
+// registry has not yet observed any samples for it. Callers that iterate
+// the result tolerate a nil return by producing zero-valued output.
+func metricFamily(mfs []*dto.MetricFamily, name string) *dto.MetricFamily {
+	for _, mf := range mfs {
+		if mf.GetName() == name {
+			return mf
+		}
+	}
+	return nil
+}
+
 // dumpErrorMetrics renders the per-command error-counter breakdown so that
 // a failing "no errors" assertion can point at exactly which command
 // regressed. Only non-zero samples are emitted, keeping the diagnostic
@@ -223,21 +243,20 @@ func dumpErrorMetrics(t *testing.T, registry *monitoring.Registry) string {
 	t.Helper()
 	mfs, err := registry.Gatherer().Gather()
 	require.NoError(t, err)
+	mf := metricFamily(mfs, "elastickv_redis_errors_total")
+	if mf == nil {
+		return ""
+	}
 	out := ""
-	for _, mf := range mfs {
-		if mf.GetName() != "elastickv_redis_errors_total" {
+	for _, m := range mf.GetMetric() {
+		if m.GetCounter().GetValue() == 0 {
 			continue
 		}
-		for _, m := range mf.GetMetric() {
-			if m.GetCounter().GetValue() == 0 {
-				continue
-			}
-			labels := ""
-			for _, lp := range m.GetLabel() {
-				labels += lp.GetName() + "=" + lp.GetValue() + ","
-			}
-			out += labels + "value=" + strconv.FormatFloat(m.GetCounter().GetValue(), 'f', -1, 64) + "\n"
+		labels := ""
+		for _, lp := range m.GetLabel() {
+			labels += lp.GetName() + "=" + lp.GetValue() + ","
 		}
+		out += labels + "value=" + strconv.FormatFloat(m.GetCounter().GetValue(), 'f', -1, 64) + "\n"
 	}
 	return out
 }
@@ -251,24 +270,23 @@ func requestCountForOutcome(t *testing.T, registry *monitoring.Registry, command
 	t.Helper()
 	mfs, err := registry.Gatherer().Gather()
 	require.NoError(t, err)
+	mf := metricFamily(mfs, "elastickv_redis_requests_total")
+	if mf == nil {
+		return 0
+	}
 	var total float64
-	for _, mf := range mfs {
-		if mf.GetName() != "elastickv_redis_requests_total" {
-			continue
+	for _, m := range mf.GetMetric() {
+		var cmd, out string
+		for _, lp := range m.GetLabel() {
+			switch lp.GetName() {
+			case "command":
+				cmd = lp.GetValue()
+			case "outcome":
+				out = lp.GetValue()
+			}
 		}
-		for _, m := range mf.GetMetric() {
-			var cmd, out string
-			for _, lp := range m.GetLabel() {
-				switch lp.GetName() {
-				case "command":
-					cmd = lp.GetValue()
-				case "outcome":
-					out = lp.GetValue()
-				}
-			}
-			if cmd == command && out == outcome {
-				total += m.GetCounter().GetValue()
-			}
+		if cmd == command && out == outcome {
+			total += m.GetCounter().GetValue()
 		}
 	}
 	return total
@@ -276,26 +294,19 @@ func requestCountForOutcome(t *testing.T, registry *monitoring.Registry, command
 
 // countErrorMetrics returns the sum of all samples for
 // elastickv_redis_errors_total. It lets a subtest assert that previously-
-// observed errors are the only ones that count.
+// observed errors are the only ones that count. A missing family yields
+// zero without a second Gather call.
 func countErrorMetrics(t *testing.T, registry *monitoring.Registry) float64 {
 	t.Helper()
-	got, err := testutil.GatherAndCount(registry.Gatherer(), "elastickv_redis_errors_total")
-	require.NoError(t, err)
-	if got == 0 {
-		return 0
-	}
-	// GatherAndCount returns the number of distinct label combinations.
-	// We want the sum of the counter values; iterate manually.
 	mfs, err := registry.Gatherer().Gather()
 	require.NoError(t, err)
+	mf := metricFamily(mfs, "elastickv_redis_errors_total")
+	if mf == nil {
+		return 0
+	}
 	var total float64
-	for _, mf := range mfs {
-		if mf.GetName() != "elastickv_redis_errors_total" {
-			continue
-		}
-		for _, m := range mf.GetMetric() {
-			total += m.GetCounter().GetValue()
-		}
+	for _, m := range mf.GetMetric() {
+		total += m.GetCounter().GetValue()
 	}
 	return total
 }

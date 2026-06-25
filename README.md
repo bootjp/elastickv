@@ -37,7 +37,7 @@ Deployment/runbook documents:
 
 Design documents:
 
-- `docs/s3_compatible_adapter_design.md` (S3-compatible object storage adapter design, data model, routing, and rollout plan)
+- `docs/design/2026_03_22_implemented_s3_compatible_adapter.md` (S3-compatible object storage adapter design, data model, routing, and rollout plan)
 
 ## Metrics and Grafana
 
@@ -52,16 +52,20 @@ Provisioned monitoring assets live under:
 
 - `monitoring/prometheus/prometheus.yml`
 - `monitoring/grafana/dashboards/elastickv-cluster-overview.json`
-- `monitoring/grafana/dashboards/elastickv-cluster-summary.json`
+- `monitoring/grafana/dashboards/elastickv-dynamodb.json`
 - `monitoring/grafana/dashboards/elastickv-raft-status.json`
+- `monitoring/grafana/dashboards/elastickv-redis-summary.json`
+- `monitoring/grafana/dashboards/elastickv-pebble-internals.json`
 - `monitoring/grafana/provisioning/`
 - `monitoring/docker-compose.yml`
 
 The provisioned dashboards are organized by operator task:
 
-- `Elastickv Cluster Overview` is the landing page for leader identity, cluster-wide latency/error posture, and per-node Raft health
-- `Elastickv Request Health` is the DynamoDB/API drilldown for slow operations, noisy nodes, and hot/erroring tables
+- `Elastickv Cluster` is the landing page for leader identity, cluster-wide latency/error posture, and per-node Raft health
+- `Elastickv DynamoDB` is the DynamoDB-compatible API drilldown for slow operations, noisy nodes, and hot/erroring tables
 - `Elastickv Raft Status` is the control-plane drilldown for membership, leader changes, failed proposals, node state, index drift, backlog, and leader contact
+- `Elastickv Redis` is the Redis-compatible API drilldown for per-command throughput/latency/errors, with a collapsible `Hot Path` row for GET fast-path (PR #560) verification
+- `Elastickv Pebble Internals` is the storage-engine drilldown for block cache, L0 pressure, compactions, memtables, and store write conflicts
 
 If you bind `--metricsAddress` to a non-loopback address, `--metricsToken` is required. Prometheus must send the same bearer token, for example:
 
@@ -83,6 +87,29 @@ docker compose up -d
 ```
 
 `monitoring/prometheus/prometheus.yml` assumes the demo token `demo-metrics-token`. If you override `--metricsToken` when running `go run ./cmd/server/demo.go`, update `authorization.credentials` in that file to match.
+
+
+## Admin Dashboard
+
+Elastickv ships an optional admin dashboard — a React SPA plus JSON API served from a separate HTTP listener (default `127.0.0.1:8080`). It is **disabled by default**; enable it with `--adminEnabled`. The dashboard inspects cluster/Raft state and manages DynamoDB tables, SQS queues, and S3 buckets without hand-rolling SigV4 requests. Any node with `--adminEnabled` can serve it: writes against a follower are transparently forwarded to the leader. See [`docs/admin.md`](docs/admin.md) for the operator guide and [`docs/design/2026_04_24_implemented_admin_dashboard.md`](docs/design/2026_04_24_implemented_admin_dashboard.md) for the design rationale.
+
+**Cluster overview** — leader identity, Raft group membership/local role, and resource counts.
+
+![Admin dashboard cluster overview](docs/images/admin/admin-overview.png)
+
+**DynamoDB tables** — list, create, and inspect tables backed by the existing `CreateTable` / `ListTables` handlers.
+
+![Admin dashboard DynamoDB tables](docs/images/admin/admin-dynamodb.png)
+
+**SQS queues** — list, describe, and delete queues; detail pages surface approximate visible / in-flight / delayed message counts and queue configuration.
+
+![Admin dashboard SQS queues](docs/images/admin/admin-sqs.png)
+
+![Admin dashboard SQS queue detail](docs/images/admin/admin-sqs-detail.png)
+
+**S3 buckets** — list and create buckets, with ACL and creation metadata.
+
+![Admin dashboard S3 buckets](docs/images/admin/admin-s3.png)
 
 
 ## Example Usage
@@ -123,22 +150,19 @@ go run . \
   --raftId "n1"
 ```
 
+`etcd` is the only supported engine; `--raftEngine` accepts no other value.
 Elastickv writes a `raft-engine` marker into each Raft data directory and refuses
-to reopen a directory with a different backend. Do not point the default etcd
-runtime at an existing HashiCorp Raft directory, or vice versa. Use
-`--raftEngine hashicorp` only for legacy clusters that have not migrated yet.
+to reopen a directory with a different backend. A node also refuses to start on a
+directory that still holds legacy HashiCorp Raft artifacts (`raft.db`).
 
-For existing stores, seed a fresh etcd data dir with the offline migrator:
-
-```bash
-go run ./cmd/etcd-raft-migrate \
-  --fsm-store /var/lib/elastickv/n1/fsm.db \
-  --dest /var/lib/elastickv-etcd/n1 \
-  --peers n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053
-```
-
-The full cutover procedure, validation, and rollback constraints are documented
-in `docs/etcd_raft_migration_operations.md`.
+The legacy HashiCorp Raft backend and its offline migrator
+(`cmd/etcd-raft-migrate`) were removed in commit `a35245a` once the one-time
+migration to `etcd/raft` was complete. If you still need to migrate an old
+HashiCorp-backed store, run the migrator by checking out the whole repository at
+the commit before `a35245a` (`a35245a^`) — extracting a single file will not
+build, because the migrator links against module dependencies that were dropped
+along with it. See `docs/etcd_raft_migration_operations.md` for the historical
+procedure.
 
 ### Starting the Client
 
@@ -233,7 +257,7 @@ aws --endpoint-url http://localhost:9000 s3api put-bucket-acl \
 
 Public buckets allow unauthenticated `GetObject`, `HeadObject`, `HeadBucket`, and `ListObjectsV2`. Write operations (`PutObject`, `DeleteObject`, multipart uploads) always require authentication. `ListBuckets` and ACL management also always require authentication.
 
-See `docs/s3_compatible_adapter_design.md` for the full data model, consistency guarantees, multipart upload design, and rollout plan. See `docs/s3_public_bucket_design.md` for the public bucket ACL design.
+See `docs/design/2026_03_22_implemented_s3_compatible_adapter.md` for the full data model, consistency guarantees, multipart upload design, and rollout plan. See `docs/design/2026_04_01_implemented_s3_public_bucket.md` for the public bucket ACL design.
 
 ### Connecting to a Follower Node
 To connect to a follower node:

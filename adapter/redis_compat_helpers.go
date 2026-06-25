@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -279,7 +280,9 @@ func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint
 }
 
 // probeLegacyCollectionTypes checks for single-blob hash/set/zset/stream
-// encodings left by pre-wide-column code paths.
+// encodings left by pre-wide-column code paths. For streams, both the new
+// entry-per-key meta and the legacy single-blob key are probed here so
+// type-detection is unaffected by the migration state.
 func (r *RedisServer) probeLegacyCollectionTypes(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
 	checks := []struct {
 		typ redisValueType
@@ -288,6 +291,7 @@ func (r *RedisServer) probeLegacyCollectionTypes(ctx context.Context, key []byte
 		{typ: redisTypeHash, key: redisHashKey(key)},
 		{typ: redisTypeSet, key: redisSetKey(key)},
 		{typ: redisTypeZSet, key: redisZSetKey(key)},
+		{typ: redisTypeStream, key: store.StreamMetaKey(key)},
 		{typ: redisTypeStream, key: redisStreamKey(key)},
 	}
 	for _, check := range checks {
@@ -308,6 +312,160 @@ func (r *RedisServer) keyTypeAt(ctx context.Context, key []byte, readTS uint64) 
 		return typ, err
 	}
 	return r.applyTTLFilter(ctx, key, readTS, typ)
+}
+
+// requireKeyTypeOrEmpty returns nil iff the key either has the expected
+// type at readTS or is absent at readTS.  wrongTypeError() is returned
+// when the key exists with a different type.
+//
+// Used by the wide-column command implementations (HSET / ZADD /
+// HINCRBY / ZINCRBY etc.) to collapse the keyTypeAtExpect +
+// wrong-type-rejection pair into a single branch at the call site —
+// this is what keeps those functions under the cyclop ceiling after
+// the HLC-4 (iii) ceiling fence added a NextFenced error branch
+// (PR #867 Phase 2b).
+func (r *RedisServer) requireKeyTypeOrEmpty(ctx context.Context, key []byte, readTS uint64, expected redisValueType) error {
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, expected)
+	if err != nil {
+		return err
+	}
+	if typ != redisTypeNone && typ != expected {
+		return wrongTypeError()
+	}
+	return nil
+}
+
+// keyTypeAtExpect is a fast-path replacement for keyTypeAt callers that
+// know the type they expect to find. The slow path probes ~19 Pebble
+// seeks across every collection family before returning. The fast path:
+//
+//  1. Probe only the prefixes for `expected` (typically 2-3 seeks).
+//  2. On hit, run the same string-priority guard the wide-column
+//     fast-path callers use (hashFieldFastLookup, zsetMemberFastScore,
+//     setMemberFastExists, hashFieldFastExists). When a redisStrKey
+//     row also exists at the same user key, fall back to the slow
+//     path so the rawKeyTypeAt "string wins" tiebreaker fires and
+//     the caller gets WRONGTYPE / nil instead of the
+//     collection-specific answer. The guard is the narrow form (see
+//     hasHigherPriorityStringEncoding's doc comment): only redisStrKey
+//     is checked, the rarer HLL / legacy-bare-key dual-encoding cases
+//     remain a known residual risk shared with the other fast-path
+//     callers.
+//  3. On miss, fall back to the full keyTypeAt slow path so that
+//     wrongType collisions (the key exists under a different type)
+//     still surface as the correct redisValueType.
+//
+// Steady-state production: most XADD/XREAD/HSET/etc. calls are on a key
+// of the expected type, so step 1 hits and the slow-path 19 seeks shrink
+// to 2-3 (plus the priority-guard ExistsAt). The slow path stays in
+// place for first-write and wrongType cases, which keep their existing
+// semantics — wrongTypeError detection is preserved by the
+// fall-through.
+func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (redisValueType, error) {
+	if expected == redisTypeNone {
+		return r.keyTypeAt(ctx, key, readTS)
+	}
+	found, err := r.probeExpectedType(ctx, key, readTS, expected)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	if !found {
+		return r.keyTypeAt(ctx, key, readTS)
+	}
+	if expected != redisTypeString {
+		higher, hErr := r.hasHigherPriorityStringEncoding(ctx, key, readTS)
+		if hErr != nil {
+			return redisTypeNone, hErr
+		}
+		if higher {
+			return r.keyTypeAt(ctx, key, readTS)
+		}
+	}
+	return r.applyTTLFilter(ctx, key, readTS, expected)
+}
+
+// keyTypeAtExpectFast is the signal-driven-wake variant of
+// keyTypeAtExpect. On a fast-probe miss it returns redisTypeNone
+// directly (no rawKeyTypeAt slow-path fallback, no
+// hasHigherPriorityStringEncoding guard). Callers MUST have an
+// invariant that the only mutation since the last full check could
+// have produced a row visible to probeExpectedType — typically a
+// blocking-command wait loop after a Signal-driven wake, where the
+// only writes that fire keyWaiterRegistry.Signal are
+// expected-type-creating writes (ZADD/ZINCRBY for zsets,
+// XADD-and-friends for streams). A wrongType-introducing write
+// (HSET, SET, etc.) does NOT signal, so a non-zset key that
+// appeared between iterations is invisible to this fast path; the
+// blocking command's fallback-timer wake (which uses the slow
+// keyTypeAtExpect) is the safety net that detects it within
+// ~redisBlockWaitFallback (100ms).
+//
+// Compared to keyTypeAtExpect on the empty-key case
+// (probeExpectedType -> false -> rawKeyTypeAt slow path = ~19
+// seeks), the fast variant returns after the 3-seek probe. For a
+// BZPOPMIN waiting on an empty zset and being woken by Signal at
+// the ZADD rate, this turns each wake from "19 seeks just to
+// confirm still-empty" into "0 seeks because the probe found the
+// new ZADD's row" or "3 seeks to confirm the ZADD raced and the
+// queue is empty again".
+func (r *RedisServer) keyTypeAtExpectFast(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (redisValueType, error) {
+	if expected == redisTypeNone {
+		return redisTypeNone, nil
+	}
+	found, err := r.probeExpectedType(ctx, key, readTS, expected)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	if !found {
+		return redisTypeNone, nil
+	}
+	return r.applyTTLFilter(ctx, key, readTS, expected)
+}
+
+// probeExpectedType issues only the prefix probes for the given type.
+// It is intentionally conservative: returning false here means "no row
+// of the expected type was visible at readTS", not "the key does not
+// exist". Callers that need strict "does any value type exist for this
+// key" semantics must take the keyTypeAt slow path; keyTypeAtExpect
+// composes both.
+func (r *RedisServer) probeExpectedType(ctx context.Context, key []byte, readTS uint64, expected redisValueType) (bool, error) {
+	switch expected {
+	case redisTypeString:
+		_, found, err := r.probeStringTypes(ctx, key, readTS)
+		return found, err
+	case redisTypeList:
+		_, found, err := r.probeListType(ctx, key, readTS)
+		return found, err
+	case redisTypeHash:
+		return r.wideColumnTypeExists(ctx, key, readTS, store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix)
+	case redisTypeSet:
+		return r.wideColumnTypeExists(ctx, key, readTS, store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix)
+	case redisTypeZSet:
+		return r.wideColumnTypeExists(ctx, key, readTS, store.ZSetMemberScanPrefix, store.ZSetMetaKey, store.ZSetMetaDeltaScanPrefix)
+	case redisTypeStream:
+		return r.probeStreamExists(ctx, key, readTS)
+	case redisTypeNone:
+		// Caller already short-circuited.
+		return false, nil
+	}
+	return false, nil
+}
+
+// probeStreamExists checks whether a stream is present at readTS in
+// either the new entry-per-key meta layout or the legacy single-blob
+// encoding. Two ExistsAt seeks worst-case; one when the new layout is
+// present (the common case post-#620 migration).
+func (r *RedisServer) probeStreamExists(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	if exists, err := r.store.ExistsAt(ctx, store.StreamMetaKey(key), readTS); err != nil {
+		return false, errors.WithStack(err)
+	} else if exists {
+		return true, nil
+	}
+	exists, err := r.store.ExistsAt(ctx, redisStreamKey(key), readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return exists, nil
 }
 
 // applyTTLFilter takes a raw (TTL-unaware) type and returns the
@@ -494,16 +652,101 @@ func (r *RedisServer) loadZSetAt(ctx context.Context, key []byte, readTS uint64)
 	return val, true, err
 }
 
+// loadStreamAt reads the entire stream as a redisStreamValue from the
+// entry-per-key layout. Per the PR #620 operator directive, any legacy
+// single-blob data is explicitly discarded: if the new meta key is absent
+// we return an empty stream, even when a legacy blob still exists on disk.
+// The legacy blob is actively deleted by the next write (see
+// streamWriteBase) and by any DEL via deleteStreamWideColumnElems.
 func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint64) (redisStreamValue, error) {
-	raw, err := r.store.GetAt(ctx, redisStreamKey(key), readTS)
+	meta, metaFound, err := r.loadStreamMetaAt(ctx, key, readTS)
+	if err != nil {
+		return redisStreamValue{}, err
+	}
+	if !metaFound {
+		return redisStreamValue{}, nil
+	}
+	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
+	if err != nil {
+		return redisStreamValue{}, err
+	}
+	return redisStreamValue{Entries: entries}, nil
+}
+
+// loadStreamMetaAt returns the current StreamMeta for key, or (_, false, nil)
+// when the meta key does not exist.
+func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS uint64) (store.StreamMeta, bool, error) {
+	raw, err := r.store.GetAt(ctx, store.StreamMetaKey(key), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
-			return redisStreamValue{}, nil
+			return store.StreamMeta{}, false, nil
 		}
-		return redisStreamValue{}, errors.WithStack(err)
+		return store.StreamMeta{}, false, errors.WithStack(err)
 	}
-	val, err := unmarshalStreamValue(raw)
-	return val, err
+	meta, err := store.UnmarshalStreamMeta(raw)
+	if err != nil {
+		return store.StreamMeta{}, false, errors.WithStack(err)
+	}
+	return meta, true, nil
+}
+
+// scanStreamEntriesAt returns all entries for key in ascending ID order.
+// This path exists to reconstruct the full stream for callers — the Lua
+// stream bridge (streamState) and the legacy compatibility surface — that
+// previously loaded the entire stream as a single blob.
+//
+// User-bounded scans (XREAD/XRANGE/XREVRANGE) use
+// scanStreamEntriesAfter / rangeStreamNewLayout. For the
+// materialise-everything path, expectedLen <= 0 represents an empty or
+// uninitialized stream (meta.Length == 0) and intentionally yields an
+// empty slice — this is the correct state for a newly-created or empty
+// stream; callers need not distinguish it from a missing stream.
+// When expectedLen > 0 we cap the scan at meta.Length plus slack,
+// matching existing store ScanAt semantics for non-positive limits.
+func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
+	prefix := store.StreamEntryScanPrefix(key)
+	end := store.PrefixScanEnd(prefix)
+	limit := scanStreamEntriesLimit(expectedLen)
+	if limit == 0 && expectedLen <= 0 {
+		return []redisStreamEntry{}, nil
+	}
+	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	entries := make([]redisStreamEntry, 0, len(kvs))
+	for _, pair := range kvs {
+		entry, err := unmarshalStreamEntry(pair.Value)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// scanStreamEntriesLimit derives the ScanAt limit for scanStreamEntriesAt.
+// Arithmetic is performed in int64 and the result is clamped to math.MaxInt
+// before narrowing; this keeps the helper correct on 32-bit targets and
+// when expectedLen is corrupted into a value that would otherwise overflow
+// int on addition with the slack. A negative or zero expectedLen falls
+// through to the ScanAt "limit==0 means no limit" convention.
+func scanStreamEntriesLimit(expectedLen int64) int {
+	const concurrentWriteSlack = int64(64)
+	if expectedLen <= 0 {
+		return 0
+	}
+	want := expectedLen + concurrentWriteSlack
+	// Overflow guard: expectedLen is a corrupted meta away from anything;
+	// if the sum wraps, fall back to "no limit" (ScanAt stores its own
+	// hard caps downstream) rather than pass a negative value.
+	if want < expectedLen {
+		return 0
+	}
+	if want > int64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(want)
 }
 
 func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uint64, elems []*kv.Elem[kv.OP]) error {
@@ -638,7 +881,7 @@ func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, e
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
 		if verify {
-			if err := r.coordinator.VerifyLeaderForKey(routingKey); err != nil {
+			if err := r.coordinator.VerifyLeaderForKey(r.handlerContext(), routingKey); err != nil {
 				return nil, errors.WithStack(err)
 			}
 		}
@@ -848,7 +1091,47 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 	}
 	elems = append(elems, zsetElems...)
 
+	// Wide-column stream cleanup: delete the meta key and every entry key.
+	streamElems, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, streamElems...)
+
 	return elems, existed, nil
+}
+
+// deleteStreamWideColumnElems returns delete operations for all stream
+// wide-column keys: the meta key (if it exists) and every entry under the
+// entry scan prefix. Total results are capped at maxWideColumnItems to
+// prevent unbounded memory growth; DEL/EXPIRE 0/MULTI-EXEC DEL on a stream
+// that exceeds the cap returns ErrCollectionTooLarge, consistent with other
+// wide-column types (Hash, Set, ZSet). Streams are also capped at
+// maxWideColumnItems via xaddEnforceMaxWideColumn in XADD, so a stream that
+// migrated from a legacy blob larger than the cap will require a XTRIM before
+// it can be deleted.
+func (r *RedisServer) deleteStreamWideColumnElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	// Delete any legacy single-blob remnant in the same commit so DEL
+	// leaves no stale data on disk even when the stream was never
+	// migrated. ExistsAt is cheap; the Del is a no-op on the storage
+	// side when the key is already absent.
+	legacyCleanup, err := r.legacyStreamCleanupElems(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	elems = append(elems, legacyCleanup...)
+	metaKey := store.StreamMetaKey(key)
+	if exists, err := r.store.ExistsAt(ctx, metaKey, readTS); err != nil {
+		return nil, errors.WithStack(err)
+	} else if exists {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey})
+	}
+	entryElems, err := r.scanAllDeltaElems(ctx, store.StreamEntryScanPrefix(key), readTS)
+	if err != nil {
+		return nil, err
+	}
+	return append(elems, entryElems...), nil
 }
 
 // deleteZSetWideColumnElems returns delete operations for all ZSet wide-column keys:
@@ -892,7 +1175,10 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 	for _, value := range values {
 		rawValues = append(rawValues, []byte(value))
 	}
-	commitTS := r.coordinator.Clock().Next()
+	commitTS, err := r.coordinator.Clock().NextFenced()
+	if err != nil {
+		return errors.Wrap(err, "rewriteListTxn: allocate commitTS")
+	}
 	ops, _, err := r.buildRPushOps(store.ListMeta{}, key, rawValues, commitTS, 0)
 	if err != nil {
 		return err
