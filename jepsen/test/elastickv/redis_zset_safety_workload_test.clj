@@ -889,6 +889,21 @@
     (is (contains? kinds :fractured-read-prefix-range)
         (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
 
+(deftest zrangebyscore-prefix-check-ignores-predecessor-outside-bounds
+  ;; A visible concurrent write still anchors the read prefix, but a
+  ;; predecessor whose forced state is outside the requested score bounds
+  ;; does not have to appear in the range result.
+  (let [history [{:type :invoke :process 0 :f :zadd         :value ["m2" -100] :index 0}
+                 {:type :invoke :process 1 :f :zrangebyscore
+                  :value [0.0 10.0] :index 1}
+                 {:type :ok     :process 0 :f :zadd         :value ["m2" -100] :index 2}
+                 {:type :invoke :process 2 :f :zadd         :value ["m1" 1] :index 3}
+                 {:type :ok     :process 2 :f :zadd         :value ["m1" 1] :index 4}
+                 {:type :ok     :process 1 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :members [["m1" 1.0]]} :index 5}]]
+    (is (:valid? (run-checker history)))))
+
 (deftest zrem-omission-anchors-prefix-check
   ;; If m1's absence is only explainable by a concurrent ZREM, that visible
   ;; deletion still anchors the read prefix. A predecessor completed before

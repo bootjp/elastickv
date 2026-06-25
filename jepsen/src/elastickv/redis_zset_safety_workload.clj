@@ -784,9 +784,9 @@
                  read-inv-idx
                  read-cmp-idx
                  #(real-time-before? % anchor))]
-    (and (seq states)
-         (every? #(visible-state? % bounds) states)
-         states)))
+    (when (and (seq states)
+               (every? #(visible-state? % bounds) states))
+      states)))
 
 (defn- observed-absence-requires-zrem?
   [mutations-by-m m member read-inv-idx read-cmp-idx bounds]
