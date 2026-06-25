@@ -568,6 +568,12 @@ print_dry_run_plan() {
   if [[ "$ENABLE_SQS" == "true" ]]; then
     echo "[rolling-update] RAFT_TO_SQS_MAP=$RAFT_TO_SQS_MAP"
   fi
+  if [[ -n "${EXTRA_ENV_NORMALISED:-}" ]]; then
+    echo "[rolling-update] EXTRA_ENV=$EXTRA_ENV_NORMALISED"
+  fi
+  if [[ -n "${CONTAINER_MEMORY_LIMIT:-}" ]]; then
+    echo "[rolling-update] CONTAINER_MEMORY_LIMIT=$CONTAINER_MEMORY_LIMIT"
+  fi
   if [[ "$KEYVIZ_ENABLED" == "true" ]]; then
     echo "[rolling-update] KEYVIZ_FANOUT_NODES=$KEYVIZ_FANOUT_NODES"
     echo "[rolling-update] KEYVIZ_KEY_BUCKETS_PER_ROUTE=$KEYVIZ_KEY_BUCKETS_PER_ROUTE"
@@ -1569,14 +1575,6 @@ if [[ "${ENABLE_SQS}" == "true" && -z "$RAFT_TO_SQS_MAP" ]]; then
   RAFT_TO_SQS_MAP="$(derive_raft_to_sqs_map)"
 fi
 
-if [[ "$DRY_RUN" == "true" ]]; then
-  print_dry_run_plan
-  exit 0
-fi
-
-ensure_local_raftadmin
-ensure_remote_raftadmin_binaries
-
 # ssh joins remaining arguments into a single command string which the remote
 # login shell re-parses before `bash -s` is exec'd, so values containing
 # whitespace or shell metacharacters must be escaped before transport.
@@ -1730,6 +1728,14 @@ KEYVIZ_HOT_KEYS_PER_ROUTE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_PER_ROUTE")"
 KEYVIZ_HOT_KEYS_SAMPLE_RATE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_SAMPLE_RATE")"
 KEYVIZ_HOT_KEYS_QUEUE_SIZE_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_QUEUE_SIZE")"
 KEYVIZ_HOT_KEYS_MAX_KEY_LEN_Q="$(printf '%q' "$KEYVIZ_HOT_KEYS_MAX_KEY_LEN")"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  print_dry_run_plan
+  exit 0
+fi
+
+ensure_local_raftadmin
+ensure_remote_raftadmin_binaries
 
 echo "[rolling-update] target image: $IMAGE"
 for node_id in "${ROLLING_NODE_IDS[@]}"; do
