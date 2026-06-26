@@ -2623,7 +2623,10 @@ func (c *luaScriptContext) cmdZRangeByScoreSlow(key []byte, options luaZRangeByS
 // the whole offset+limit budget on those filtered-out rows and miss
 // the real matches at score > value.
 //
-// The score index is lex-sorted by (userKey, sortableScore, member).
+// The score index is grouped by (userKey, sortableScore). Member bytes
+// follow the score, but the MVCC timestamp suffix means equal-score
+// member ordering is normalized by zsetRangeByScoreFast rather than
+// trusted directly from physical scan order.
 // Conventions:
 //
 //	minBound = -Inf              -> startKey = ZSetScoreScanPrefix(key)

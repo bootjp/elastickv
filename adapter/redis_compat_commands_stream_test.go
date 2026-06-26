@@ -284,20 +284,21 @@ func TestRedis_StreamXReadLatencyIsConstant(t *testing.T) {
 		total  = 10_000
 		probes = 100
 	)
+	lastID := ""
 	for i := range total {
-		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		id, err := rdb.XAdd(ctx, &redis.XAddArgs{
 			Stream: "stream-lat",
-			ID:     fmt.Sprintf("%d-0", 1_000_000+i),
+			ID:     "*",
 			Values: []string{"i", fmt.Sprint(i)},
 		}).Result()
 		require.NoError(t, err)
+		lastID = id
 	}
 
-	afterID := fmt.Sprintf("%d-0", 1_000_000+total-1)
 	measure := func() time.Duration {
 		start := time.Now()
 		streams, err := rdb.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{"stream-lat", afterID},
+			Streams: []string{"stream-lat", lastID},
 			Count:   10,
 			Block:   10 * time.Millisecond,
 		}).Result()
