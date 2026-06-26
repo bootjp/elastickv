@@ -39,16 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOCACHE: /tmp/go-build
-      # Explicit dedup-OFF control baseline. The Redis and DynamoDB adapter
-      # onePhaseTxnDedup flags are default-on, so this workflow is preserved
-      # as legacy-path coverage. Pair with the dedup-ON workflow
-      # (.github/workflows/jepsen-test-scheduled-dedup.yml) which pins both
-      # env vars to 1. Retirement of this workflow is a follow-up after 30
-      # days of post-flip data; until then, do NOT remove these env vars —
-      # without them the two workflows would exercise the same path under
-      # the new defaults.
-      ELASTICKV_REDIS_ONEPHASE_DEDUP: "0"
-      ELASTICKV_DYNAMODB_ONEPHASE_DEDUP: "0"
     steps:
       - uses: actions/checkout@v6
         with:
