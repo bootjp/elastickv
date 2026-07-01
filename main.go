@@ -441,6 +441,7 @@ func run() error {
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
 	eg, runCtx := errgroup.WithContext(ctx)
+	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
 	// setupDistributionCatalog + the Stage 7a process-start registration
 	// gate are bundled so run() has a single startup-fault path: a
 	// registry-read / behind-epoch failure fails the process
@@ -509,6 +510,41 @@ func run() error {
 		return errors.Wrapf(err, "failed to serve")
 	}
 	return nil
+}
+
+func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {
+	for _, runtime := range runtimes {
+
+		if runtime == nil {
+			continue
+		}
+		engine := runtime.snapshotEngine()
+		lifecycle, ok := engine.(raftengine.Lifecycle)
+		if !ok {
+			continue
+		}
+		done := lifecycle.Done()
+		if done == nil {
+			continue
+		}
+		groupID := runtime.spec.id
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-done:
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+				}
+				if err := lifecycle.Err(); err != nil {
+					return errors.Wrapf(err, "raft group %d engine stopped", groupID)
+				}
+				return errors.Errorf("raft group %d engine stopped", groupID)
+			}
+		})
+	}
 }
 
 func resolveRuntimeInputs() (runtimeConfig, raftEngineType, []raftengine.Server, bool, error) {
