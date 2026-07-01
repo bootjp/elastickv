@@ -51,6 +51,7 @@ type GRPCTransport struct {
 	snapshotChunkSize int
 	spoolDir          string
 	fsmSnapDir        string
+	prepareFSMWrite   func(index uint64) error
 	// readFSMPayload is the fallback bridge callback that materialises the full
 	// FSM payload into memory. Used only when openFSMPayload is not set.
 	readFSMPayload func(index uint64) ([]byte, error)
@@ -119,6 +120,15 @@ func (t *GRPCTransport) SetFSMSnapDir(dir string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.fsmSnapDir = dir
+}
+
+func (t *GRPCTransport) SetFSMSnapshotPrepare(fn func(index uint64) error) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.prepareFSMWrite = fn
 }
 
 func (t *GRPCTransport) SetFSMPayloadReader(fn func(index uint64) ([]byte, error)) {
@@ -727,25 +737,26 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 	return errors.WithStack(handler(ctx, msg))
 }
 
-// snapshotSpoolPlacement returns (spoolDir, fsmSnapDir) under the transport
-// lock. When fsmSnapDir is wired, the spool itself is placed inside it so
+// snapshotSpoolPlacement returns the snapshot receive paths/callback under the
+// transport lock. When fsmSnapDir is wired, the spool itself is placed inside it so
 // FinalizeAsFSMFile's rename stays intra-filesystem and cannot fail with
 // EXDEV. Standard engine wiring puts both under cfg.DataDir, but the
 // receive code should not assume that. The legacy fallback path
 // (fsmSnapDir == "") keeps the spool in spoolDir because it never renames
 // — Bytes() materializes the payload in place.
-func (t *GRPCTransport) snapshotSpoolPlacement() (placement, fsmSnapDir string) {
+func (t *GRPCTransport) snapshotSpoolPlacement() (placement, fsmSnapDir string, prepareFn func(uint64) error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	fsmSnapDir = t.fsmSnapDir
+	prepareFn = t.prepareFSMWrite
 	if fsmSnapDir != "" {
-		return fsmSnapDir, fsmSnapDir
+		return fsmSnapDir, fsmSnapDir, prepareFn
 	}
-	return t.spoolDir, ""
+	return t.spoolDir, "", prepareFn
 }
 
 func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
-	spoolPlacement, fsmSnapDir := t.snapshotSpoolPlacement()
+	spoolPlacement, fsmSnapDir, prepareFn := t.snapshotSpoolPlacement()
 	spool, err := newSnapshotSpool(spoolPlacement)
 	if err != nil {
 		return raftpb.Message{}, err
@@ -764,7 +775,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		}
 	}()
 
-	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir)
+	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn)
 	if err != nil {
 		return raftpb.Message{}, err
 	}
@@ -792,6 +803,7 @@ func drainSnapshotChunks(
 	stream pb.EtcdRaft_SendSnapshotServer,
 	spool *snapshotSpool,
 	fsmSnapDir string,
+	prepareFn func(uint64) error,
 ) (raftpb.Message, int64, error) {
 	var metadata raftpb.Message
 	seenMetadata := false
@@ -819,7 +831,7 @@ func drainSnapshotChunks(
 		}
 		seenMetadata = seen
 		if chunk.Final {
-			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, seenMetadata)
+			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, prepareFn, seenMetadata)
 			if err != nil {
 				return raftpb.Message{}, 0, err
 			}
@@ -842,6 +854,7 @@ func finalizeReceivedSnapshot(
 	spool *snapshotSpool,
 	crc32c uint32,
 	fsmSnapDir string,
+	prepareFn func(uint64) error,
 	seenMetadata bool,
 ) (raftpb.Message, error) {
 	if !seenMetadata || metadata.Snapshot == nil {
@@ -849,6 +862,7 @@ func finalizeReceivedSnapshot(
 	}
 	index := metadata.Snapshot.Metadata.Index
 	if fsmSnapDir != "" && index > 0 {
+		prepareReceivedFSMSnapshotWrite(fsmSnapDir, index, prepareFn)
 		if err := spool.FinalizeAsFSMFile(fsmSnapDir, index, crc32c); err != nil {
 			return raftpb.Message{}, err
 		}
@@ -859,6 +873,21 @@ func finalizeReceivedSnapshot(
 	// fsmSnapDir and by the index=0 edge case (no canonical filename to
 	// rename to).
 	return buildSnapshotMessage(metadata, spool, seenMetadata)
+}
+
+func prepareReceivedFSMSnapshotWrite(fsmSnapDir string, index uint64, prepareFn func(uint64) error) {
+	var err error
+	if prepareFn != nil {
+		err = prepareFn(index)
+	} else {
+		err = prepareFSMSnapshotWrite("", fsmSnapDir, index)
+	}
+	if err != nil {
+		slog.Warn("failed to prepare received fsm snapshot write",
+			"index", index,
+			"error", err,
+		)
+	}
 }
 
 // snapshotDataFormatLabel exists purely for the structured log line on the

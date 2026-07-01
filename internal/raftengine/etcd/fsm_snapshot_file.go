@@ -22,6 +22,7 @@ const (
 	snapFileExt          = ".snap"
 	snapshotTokenSize    = 17 // 4 (magic) + 1 (version) + 8 (index) + 4 (crc32c)
 	snapshotTokenVersion = byte(0x01)
+	prewriteSnapKeep     = 1
 
 	// fsmFooterSize is the size of the CRC32C footer appended to each .fsm file.
 	fsmFooterSize = 4
@@ -521,6 +522,112 @@ func cleanupStaleFSMSnaps(snapDir, fsmSnapDir string, disableStartupCRCCheck boo
 	}
 
 	return removeStaleFSMFiles(fsmSnapDir, liveIndexes, disableStartupCRCCheck)
+}
+
+// prepareFSMSnapshotWrite frees space before writing a new large .fsm payload.
+// It keeps the newest prior snap/fsm pair so a failed write still leaves a
+// restartable snapshot, then removes older pairs and stale pre-next-index FSM
+// files. Success-path purgeOldSnapshotFiles runs after raft publishes the new
+// token; this prewrite pass prevents ENOSPC before that success path can run.
+func prepareFSMSnapshotWrite(snapDir, fsmSnapDir string, nextIndex uint64) error {
+	if fsmSnapDir == "" || nextIndex == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(fsmSnapDir, defaultDirPerm); err != nil {
+		return errors.WithStack(err)
+	}
+
+	var combined error
+	combined = errors.CombineErrors(combined, removeFSMTmpOrphans(fsmSnapDir))
+	if snapDir == "" {
+		combined = errors.CombineErrors(combined, syncDirIfExists(fsmSnapDir))
+		return errors.WithStack(combined)
+	}
+	combined = errors.CombineErrors(combined, purgeOlderSnapshotPairsBeforeWrite(snapDir, fsmSnapDir, nextIndex))
+
+	liveIndexes, err := collectLiveSnapIndexes(snapDir)
+	if err != nil {
+		combined = errors.CombineErrors(combined, err)
+	} else if liveIndexes != nil {
+		combined = errors.CombineErrors(combined, removeStaleFSMFilesBeforeIndex(fsmSnapDir, liveIndexes, nextIndex))
+	}
+	combined = errors.CombineErrors(combined, syncDirIfExists(snapDir))
+	combined = errors.CombineErrors(combined, syncDirIfExists(fsmSnapDir))
+	return errors.WithStack(combined)
+}
+
+type snapFileCandidate struct {
+	name  string
+	index uint64
+}
+
+func purgeOlderSnapshotPairsBeforeWrite(snapDir, fsmSnapDir string, nextIndex uint64) error {
+	if snapDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+
+	candidates := collectPrewriteSnapCandidates(entries, nextIndex)
+	if len(candidates) <= prewriteSnapKeep {
+		return nil
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].index == candidates[j].index {
+			return candidates[i].name < candidates[j].name
+		}
+		return candidates[i].index < candidates[j].index
+	})
+
+	var combined error
+	for _, candidate := range candidates[:len(candidates)-prewriteSnapKeep] {
+		if err := purgeSnapPair(snapDir, fsmSnapDir, candidate.name); err != nil {
+			combined = errors.CombineErrors(combined, err)
+		}
+	}
+	return errors.WithStack(combined)
+}
+
+func collectPrewriteSnapCandidates(entries []os.DirEntry, nextIndex uint64) []snapFileCandidate {
+	candidates := make([]snapFileCandidate, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != snapFileExt {
+			continue
+		}
+		index := parseSnapFileIndex(e.Name())
+		if index == 0 || index >= nextIndex {
+			continue
+		}
+		candidates = append(candidates, snapFileCandidate{name: e.Name(), index: index})
+	}
+	return candidates
+}
+
+func removeStaleFSMFilesBeforeIndex(fsmSnapDir string, liveIndexes map[uint64]bool, nextIndex uint64) error {
+	fsmEntries, err := os.ReadDir(fsmSnapDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	for _, e := range fsmEntries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".fsm" {
+			continue
+		}
+		idx, err := strconv.ParseUint(strings.TrimSuffix(e.Name(), ".fsm"), 16, 64)
+		if err != nil || idx >= nextIndex || liveIndexes[idx] {
+			continue
+		}
+		removeWithWarn(filepath.Join(fsmSnapDir, e.Name()), "orphan fsm snapshot")
+	}
+	return nil
 }
 
 func removeFSMTmpOrphans(fsmSnapDir string) error {

@@ -666,6 +666,7 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.dispatchStopCh = make(chan struct{})
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
+	e.transport.SetFSMSnapshotPrepare(e.prepareFSMSnapshotWriteLocked)
 	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
 	e.transport.SetFSMPayloadOpener(e.openFSMPayloadLocked)
 	e.transport.SetHandler(e.handleTransportMessage)
@@ -732,6 +733,22 @@ func (e *Engine) Close() error {
 		return err
 	}
 	return nil
+}
+
+func (e *Engine) Done() <-chan struct{} {
+	if e == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return e.doneCh
+}
+
+func (e *Engine) Err() error {
+	if e == nil {
+		return nil
+	}
+	return e.currentError()
 }
 
 func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
@@ -2749,6 +2766,17 @@ func (e *Engine) openFSMPayloadLocked(index uint64) (io.ReadCloser, error) {
 	return openFSMPayloadFromFD(f)
 }
 
+func (e *Engine) prepareFSMSnapshotWriteLocked(index uint64) error {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	return e.prepareFSMSnapshotWrite(index)
+}
+
+func (e *Engine) prepareFSMSnapshotWrite(index uint64) error {
+	snapDir := filepath.Join(e.dataDir, snapDirName)
+	return prepareFSMSnapshotWrite(snapDir, e.fsmSnapDir, index)
+}
+
 // snapshotPayload takes a FSM snapshot for the given index, writes it to the
 // .fsm file on disk, and returns the 17-byte token for raftpb.Snapshot.Data.
 // If fsmSnapDir is not set (e.g., engines created directly in unit tests),
@@ -2764,6 +2792,12 @@ func (e *Engine) snapshotPayload(index uint64) ([]byte, error) {
 	snapshot, err := e.fsm.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if err := e.prepareFSMSnapshotWrite(index); err != nil {
+		slog.Warn("failed to prepare fsm snapshot write",
+			"index", index,
+			"error", err,
+		)
 	}
 	crc32c, writeErr := writeFSMSnapshotFile(snapshot, e.fsmSnapDir, index)
 	closeErr := snapshot.Close()
@@ -4186,6 +4220,12 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 			return err
 		}
 		return e.persistLocalSnapshotPayload(req.index, payload)
+	}
+	if err := e.prepareFSMSnapshotWriteLocked(req.index); err != nil {
+		slog.Warn("failed to prepare fsm snapshot write",
+			"index", req.index,
+			"error", err,
+		)
 	}
 	crc32c, writeErr := writeFSMSnapshotFile(req.snapshot, e.fsmSnapDir, req.index)
 	closeErr := req.snapshot.Close()
