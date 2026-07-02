@@ -52,6 +52,8 @@ type GRPCTransport struct {
 	spoolDir          string
 	fsmSnapDir        string
 	prepareFSMWrite   func(index uint64) error
+	protectFSMWrite   func(index uint64)
+	unprotectFSMWrite func(index uint64)
 	// readFSMPayload is the fallback bridge callback that materialises the full
 	// FSM payload into memory. Used only when openFSMPayload is not set.
 	readFSMPayload func(index uint64) ([]byte, error)
@@ -129,6 +131,16 @@ func (t *GRPCTransport) SetFSMSnapshotPrepare(fn func(index uint64) error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.prepareFSMWrite = fn
+}
+
+func (t *GRPCTransport) SetFSMSnapshotProtection(protectFn, unprotectFn func(index uint64)) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.protectFSMWrite = protectFn
+	t.unprotectFSMWrite = unprotectFn
 }
 
 func (t *GRPCTransport) SetFSMPayloadReader(fn func(index uint64) ([]byte, error)) {
@@ -390,12 +402,12 @@ func (t *GRPCTransport) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) erro
 	}
 	if err := t.handle(stream.Context(), msg); err != nil {
 		// If receive finalized the snapshot as a .fsm file (token in
-		// Snapshot.Data), the engine refused to apply it — likely a
-		// transient context cancel or raft error. Remove the on-disk
-		// file so retries at later indexes don't leak orphan .fsm
-		// payloads into fsmSnapDir until the next startup runs
-		// cleanupStaleFSMSnaps. Same-index retries are already safe
-		// because os.Rename atomically replaces the prior file.
+		// Snapshot.Data), the engine refused to accept it into raft —
+		// likely a transient context cancel or closed engine. Remove the
+		// on-disk file so retries at later indexes don't leak orphan .fsm
+		// payloads into fsmSnapDir until the next startup runs cleanup.
+		// Same-index retries are already safe because os.Rename atomically
+		// replaces the prior file.
 		t.removeOrphanedFSMSnapshot(msg)
 		return err
 	}
@@ -404,10 +416,9 @@ func (t *GRPCTransport) SendSnapshot(stream pb.EtcdRaft_SendSnapshotServer) erro
 
 // removeOrphanedFSMSnapshot deletes the .fsm file that
 // receiveSnapshotStream finalized for `msg`, if any. Used by
-// SendSnapshot when the engine apply (`t.handle`) fails after the
-// receive succeeded — the engine has NOT applied the snapshot (apply is
-// synchronous to t.handle, so a non-nil return means applied_index was
-// not advanced), so the file is unreferenced and safe to remove.
+// SendSnapshot when the engine handler (`t.handle`) fails after the
+// receive succeeded. A non-nil return means the snapshot was not accepted into
+// raft, so the file is unreferenced and safe to remove.
 //
 // Best-effort: a cleanup failure here is logged but not returned because
 // the original apply error is the actionable signal; orphans get swept
@@ -423,7 +434,11 @@ func (t *GRPCTransport) removeOrphanedFSMSnapshot(msg raftpb.Message) {
 	}
 	t.mu.RLock()
 	fsmSnapDir := t.fsmSnapDir
+	unprotectFn := t.unprotectFSMWrite
 	t.mu.RUnlock()
+	if unprotectFn != nil {
+		defer unprotectFn(tok.Index)
+	}
 	if fsmSnapDir == "" {
 		return
 	}
@@ -744,19 +759,25 @@ func (t *GRPCTransport) handle(ctx context.Context, msg raftpb.Message) error {
 // receive code should not assume that. The legacy fallback path
 // (fsmSnapDir == "") keeps the spool in spoolDir because it never renames
 // — Bytes() materializes the payload in place.
-func (t *GRPCTransport) snapshotSpoolPlacement() (placement, fsmSnapDir string, prepareFn func(uint64) error) {
+func (t *GRPCTransport) snapshotSpoolPlacement() (
+	placement string,
+	fsmSnapDir string,
+	prepareFn func(uint64) error,
+	protectFn func(uint64),
+) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	fsmSnapDir = t.fsmSnapDir
 	prepareFn = t.prepareFSMWrite
+	protectFn = t.protectFSMWrite
 	if fsmSnapDir != "" {
-		return fsmSnapDir, fsmSnapDir, prepareFn
+		return fsmSnapDir, fsmSnapDir, prepareFn, protectFn
 	}
-	return t.spoolDir, "", prepareFn
+	return t.spoolDir, "", prepareFn, protectFn
 }
 
 func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
-	spoolPlacement, fsmSnapDir, prepareFn := t.snapshotSpoolPlacement()
+	spoolPlacement, fsmSnapDir, prepareFn, protectFn := t.snapshotSpoolPlacement()
 	spool, err := newSnapshotSpool(spoolPlacement)
 	if err != nil {
 		return raftpb.Message{}, err
@@ -775,7 +796,7 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		}
 	}()
 
-	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn)
+	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, protectFn)
 	if err != nil {
 		return raftpb.Message{}, err
 	}
@@ -804,6 +825,7 @@ func drainSnapshotChunks(
 	spool *snapshotSpool,
 	fsmSnapDir string,
 	prepareFn func(uint64) error,
+	protectFn func(uint64),
 ) (raftpb.Message, int64, error) {
 	var metadata raftpb.Message
 	seenMetadata := false
@@ -838,7 +860,7 @@ func drainSnapshotChunks(
 		}
 		payloadBytes += int64(len(chunk.Chunk))
 		if chunk.Final {
-			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, seenMetadata)
+			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, protectFn, seenMetadata)
 			if err != nil {
 				return raftpb.Message{}, 0, err
 			}
@@ -872,6 +894,7 @@ func finalizeReceivedSnapshot(
 	spool *snapshotSpool,
 	crc32c uint32,
 	fsmSnapDir string,
+	protectFn func(uint64),
 	seenMetadata bool,
 ) (raftpb.Message, error) {
 	if !seenMetadata || metadata.Snapshot == nil {
@@ -883,6 +906,9 @@ func finalizeReceivedSnapshot(
 			return raftpb.Message{}, err
 		}
 		metadata.Snapshot.Data = encodeSnapshotToken(index, crc32c)
+		if protectFn != nil {
+			protectFn(index)
+		}
 		return metadata, nil
 	}
 	// Legacy fallback: full materialization. Used by tests that don't wire an

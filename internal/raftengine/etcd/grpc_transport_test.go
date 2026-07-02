@@ -222,6 +222,58 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied())
 }
 
+func TestSendSnapshotProtectsFinalizedFSMFileUntilEngineRelease(t *testing.T) {
+	const index = uint64(91)
+
+	senderFSM := &testStateMachine{}
+	senderFSM.Apply([]byte("entry-for-protection-test"))
+	snap, err := senderFSM.Snapshot()
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+	require.NoError(t, snap.Close())
+
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	fsmSnapDir := t.TempDir()
+	var protected []uint64
+	var unprotected []uint64
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(t.TempDir())
+	transport.SetFSMSnapDir(fsmSnapDir)
+	transport.SetFSMSnapshotProtection(
+		func(index uint64) { protected = append(protected, index) },
+		func(index uint64) { unprotected = append(unprotected, index) },
+	)
+	transport.SetHandler(func(_ context.Context, msg raftpb.Message) error {
+		require.NotNil(t, msg.Snapshot)
+		require.True(t, isSnapshotToken(msg.Snapshot.Data))
+		return nil
+	})
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{
+			{Metadata: raw},
+			{Chunk: buf.Bytes(), Final: true},
+		},
+	}
+
+	require.NoError(t, transport.SendSnapshot(stream))
+	require.Equal(t, []uint64{index}, protected)
+	require.Empty(t, unprotected)
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, index))
+}
+
 func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
 	const index = uint64(124)
 	payload := []byte("payload written after prepare")
@@ -260,7 +312,7 @@ func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
 		}},
 	}
 
-	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn)
+	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(payload)), payloadBytes)
 	require.Equal(t, 1, prepareCalls)
@@ -290,7 +342,7 @@ func TestDrainSnapshotChunksRejectsPayloadBeforeMetadata(t *testing.T) {
 		}},
 	}
 
-	_, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn)
+	_, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, nil)
 	require.ErrorIs(t, err, errSnapshotMetadataNil)
 	require.Zero(t, payloadBytes)
 	require.Zero(t, prepareCalls)
@@ -363,8 +415,8 @@ func TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir(t *testing.T) {
 // TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile pins the
 // orphan-cleanup behaviour from PR #747 round-4 (Codex P2): when the
 // receive path successfully finalizes the snapshot as
-// fsmSnapDir/<index>.fsm but the engine's apply (t.handle) then fails
-// — transient context cancel, raft error, etc. — the finalized .fsm
+// fsmSnapDir/<index>.fsm but the engine handler (t.handle) then fails
+// — transient context cancel, closed engine, etc. — the finalized .fsm
 // file MUST be removed. Otherwise retries at later snapshot indexes
 // accumulate orphan .fsm payloads in fsmSnapDir until startup runs
 // cleanupStaleFSMSnaps. Same-index retries are already safe via
@@ -401,6 +453,12 @@ func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
 	transport := NewGRPCTransport(nil)
 	transport.SetSpoolDir(t.TempDir())
 	transport.SetFSMSnapDir(fsmSnapDir)
+	var protected []uint64
+	var unprotected []uint64
+	transport.SetFSMSnapshotProtection(
+		func(index uint64) { protected = append(protected, index) },
+		func(index uint64) { unprotected = append(unprotected, index) },
+	)
 
 	// Wire a handler that always fails so SendSnapshot exercises the
 	// orphan-cleanup branch.
@@ -419,6 +477,8 @@ func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
 	err = transport.SendSnapshot(stream)
 	require.Error(t, err)
 	require.ErrorIs(t, err, applyErr, "SendSnapshot must surface the apply failure")
+	require.Equal(t, []uint64{index}, protected)
+	require.Equal(t, []uint64{index}, unprotected)
 
 	// THE point: the .fsm file at the canonical path MUST have been
 	// removed. Without the cleanup, leader retries at later indexes

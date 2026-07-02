@@ -366,6 +366,27 @@ func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 	require.FileExists(t, filepath.Join(fsmSnapDir, "leftover.fsm.tmp"))
 }
 
+func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+	payload := []byte("payload")
+
+	createSnapFile(t, snapDir, 200)
+	writeFSMFileForTest(t, fsmSnapDir, 200, payload)
+	writeFSMFileForTest(t, fsmSnapDir, 250, payload)
+	writeFSMFileForTest(t, fsmSnapDir, 300, payload)
+
+	protected := map[uint64]bool{300: true}
+	require.NoError(t, prepareFSMSnapshotWriteProtected(snapDir, fsmSnapDir, 400, protected))
+
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 200))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 250))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 300))
+
+	require.NoError(t, prepareFSMSnapshotWriteProtected(snapDir, fsmSnapDir, 400, nil))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 300))
+}
+
 // --- writeFSMSnapshotFile integration ---
 
 func TestWriteFSMSnapshotFileRoundTrip(t *testing.T) {

@@ -535,6 +535,15 @@ func cleanupStaleFSMSnaps(snapDir, fsmSnapDir string, disableStartupCRCCheck boo
 // raft publishes the new token; this prewrite pass prevents ENOSPC before that
 // success path can run.
 func prepareFSMSnapshotWrite(snapDir, fsmSnapDir string, nextIndex uint64) error {
+	return prepareFSMSnapshotWriteProtected(snapDir, fsmSnapDir, nextIndex, nil)
+}
+
+func prepareFSMSnapshotWriteProtected(
+	snapDir string,
+	fsmSnapDir string,
+	nextIndex uint64,
+	protectedIndexes map[uint64]bool,
+) error {
 	if fsmSnapDir == "" || nextIndex == 0 {
 		return nil
 	}
@@ -547,7 +556,7 @@ func prepareFSMSnapshotWrite(snapDir, fsmSnapDir string, nextIndex uint64) error
 		combined = errors.CombineErrors(combined, syncDirIfExists(fsmSnapDir))
 		return errors.WithStack(combined)
 	}
-	combined = errors.CombineErrors(combined, purgeOlderSnapshotPairsBeforeWrite(snapDir, fsmSnapDir, nextIndex))
+	combined = errors.CombineErrors(combined, purgeOlderSnapshotPairsBeforeWrite(snapDir, fsmSnapDir, nextIndex, protectedIndexes))
 	combined = errors.CombineErrors(combined, syncDirIfExists(snapDir))
 	combined = errors.CombineErrors(combined, syncDirIfExists(fsmSnapDir))
 	return errors.WithStack(combined)
@@ -564,7 +573,12 @@ type prewriteSnapshotRetention struct {
 	restorableFloor uint64
 }
 
-func purgeOlderSnapshotPairsBeforeWrite(snapDir, fsmSnapDir string, nextIndex uint64) error {
+func purgeOlderSnapshotPairsBeforeWrite(
+	snapDir string,
+	fsmSnapDir string,
+	nextIndex uint64,
+	protectedIndexes map[uint64]bool,
+) error {
 	if snapDir == "" {
 		return nil
 	}
@@ -587,7 +601,13 @@ func purgeOlderSnapshotPairsBeforeWrite(snapDir, fsmSnapDir string, nextIndex ui
 	retention := keepRestorablePrewriteSnapshots(candidates)
 	var combined error
 	combined = errors.CombineErrors(combined, purgeUnretainedPrewriteSnapshots(snapDir, fsmSnapDir, candidates, retention))
-	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBeforeIndex(snapDir, fsmSnapDir, retention, nextIndex))
+	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBeforeIndex(
+		snapDir,
+		fsmSnapDir,
+		retention,
+		protectedIndexes,
+		nextIndex,
+	))
 	return errors.WithStack(combined)
 }
 
@@ -615,6 +635,7 @@ func removePrewriteFSMOrphansBeforeIndex(
 	snapDir string,
 	fsmSnapDir string,
 	retention prewriteSnapshotRetention,
+	protectedIndexes map[uint64]bool,
 	nextIndex uint64,
 ) error {
 	if retention.restorableFloor > 0 {
@@ -622,7 +643,7 @@ func removePrewriteFSMOrphansBeforeIndex(
 		if err != nil {
 			return errors.WithStack(err)
 		} else if liveIndexes != nil {
-			return removeStaleFSMFilesBelowIndex(fsmSnapDir, liveIndexes, nextIndex)
+			return removeStaleFSMFilesBelowIndex(fsmSnapDir, liveIndexes, protectedIndexes, nextIndex)
 		}
 	}
 	return nil
@@ -672,7 +693,12 @@ func fsmSnapshotFileRestorable(fsmSnapDir string, index uint64) bool {
 	return verifyFSMSnapshotFile(fsmSnapPath(fsmSnapDir, index), 0) == nil
 }
 
-func removeStaleFSMFilesBelowIndex(fsmSnapDir string, liveIndexes map[uint64]bool, maxIndex uint64) error {
+func removeStaleFSMFilesBelowIndex(
+	fsmSnapDir string,
+	liveIndexes map[uint64]bool,
+	protectedIndexes map[uint64]bool,
+	maxIndex uint64,
+) error {
 	if maxIndex == 0 {
 		return nil
 	}
@@ -684,16 +710,25 @@ func removeStaleFSMFilesBelowIndex(fsmSnapDir string, liveIndexes map[uint64]boo
 		return errors.WithStack(err)
 	}
 	for _, e := range fsmEntries {
-		if e.IsDir() || filepath.Ext(e.Name()) != fsmFileExt {
-			continue
-		}
-		idx, err := strconv.ParseUint(strings.TrimSuffix(e.Name(), fsmFileExt), 16, 64)
-		if err != nil || idx >= maxIndex || liveIndexes[idx] {
+		if !shouldRemoveStaleFSMBelowIndex(e, liveIndexes, protectedIndexes, maxIndex) {
 			continue
 		}
 		removeWithWarn(filepath.Join(fsmSnapDir, e.Name()), "old orphan fsm snapshot")
 	}
 	return nil
+}
+
+func shouldRemoveStaleFSMBelowIndex(
+	entry os.DirEntry,
+	liveIndexes map[uint64]bool,
+	protectedIndexes map[uint64]bool,
+	maxIndex uint64,
+) bool {
+	if entry.IsDir() || filepath.Ext(entry.Name()) != fsmFileExt {
+		return false
+	}
+	idx, err := strconv.ParseUint(strings.TrimSuffix(entry.Name(), fsmFileExt), 16, 64)
+	return err == nil && idx < maxIndex && !liveIndexes[idx] && !protectedIndexes[idx]
 }
 
 func removeFSMTmpOrphans(fsmSnapDir string) error {

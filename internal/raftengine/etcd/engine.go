@@ -310,7 +310,8 @@ type Engine struct {
 
 	// Restore swaps the underlying store state and must not race with the short
 	// critical section that publishes a newly persisted local snapshot.
-	snapshotMu sync.Mutex
+	snapshotMu                sync.Mutex
+	protectedReceivedFSMSnaps map[uint64]int
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
@@ -667,6 +668,7 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
 	e.transport.SetFSMSnapshotPrepare(e.prepareFSMSnapshotWriteLocked)
+	e.transport.SetFSMSnapshotProtection(e.protectReceivedFSMSnapshot, e.unprotectReceivedFSMSnapshot)
 	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
 	e.transport.SetFSMPayloadOpener(e.openFSMPayloadLocked)
 	e.transport.SetHandler(e.handleTransportMessage)
@@ -1837,9 +1839,14 @@ func (e *Engine) persistReadyWithSnapshotLocked(rd etcdraft.Ready) error {
 		return err
 	}
 	if e.persist == nil {
+		e.releaseProtectedReceivedFSMSnapshotsUpToLocked(rd.Snapshot.Metadata.Index)
 		return nil
 	}
-	return persistReadyToWAL(e.persist, rd)
+	if err := persistReadyToWAL(e.persist, rd); err != nil {
+		return err
+	}
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(rd.Snapshot.Metadata.Index)
+	return nil
 }
 
 func (e *Engine) applyReady(rd etcdraft.Ready) error {
@@ -2771,6 +2778,7 @@ func (e *Engine) persistConfigSnapshotPayloadLocked(index uint64, confState raft
 	if err := e.persistCreatedSnapshot(snap); err != nil {
 		return err
 	}
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
 	return nil
 }
 
@@ -2806,7 +2814,62 @@ func (e *Engine) prepareFSMSnapshotWriteLocked(index uint64) error {
 
 func (e *Engine) prepareFSMSnapshotWrite(index uint64) error {
 	snapDir := filepath.Join(e.dataDir, snapDirName)
-	return prepareFSMSnapshotWrite(snapDir, e.fsmSnapDir, index)
+	return prepareFSMSnapshotWriteProtected(snapDir, e.fsmSnapDir, index, e.protectedReceivedFSMSnapshotIndexesLocked())
+}
+
+func (e *Engine) protectReceivedFSMSnapshot(index uint64) {
+	if index == 0 || index <= e.appliedIndex.Load() {
+		return
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	if e.protectedReceivedFSMSnaps == nil {
+		e.protectedReceivedFSMSnaps = make(map[uint64]int, 1)
+	}
+	e.protectedReceivedFSMSnaps[index]++
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshot(index uint64) {
+	if index == 0 {
+		return
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	e.unprotectReceivedFSMSnapshotLocked(index)
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotLocked(index uint64) {
+	if e.protectedReceivedFSMSnaps == nil {
+		return
+	}
+	count := e.protectedReceivedFSMSnaps[index]
+	if count <= 1 {
+		delete(e.protectedReceivedFSMSnaps, index)
+		return
+	}
+	e.protectedReceivedFSMSnaps[index] = count - 1
+}
+
+func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpToLocked(index uint64) {
+	if e.protectedReceivedFSMSnaps == nil {
+		return
+	}
+	for protectedIndex := range e.protectedReceivedFSMSnaps {
+		if protectedIndex <= index {
+			delete(e.protectedReceivedFSMSnaps, protectedIndex)
+		}
+	}
+}
+
+func (e *Engine) protectedReceivedFSMSnapshotIndexesLocked() map[uint64]bool {
+	if len(e.protectedReceivedFSMSnaps) == 0 {
+		return nil
+	}
+	indexes := make(map[uint64]bool, len(e.protectedReceivedFSMSnaps))
+	for index := range e.protectedReceivedFSMSnaps {
+		indexes[index] = true
+	}
+	return indexes
 }
 
 // snapshotPayloadLocked takes a FSM snapshot for the given index, writes it to the
@@ -4300,7 +4363,11 @@ func (e *Engine) persistLocalSnapshotPayloadLocked(index uint64, payload []byte)
 	}
 
 	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
-	return e.handleLocalSnapshotPersistResult(err)
+	if err := e.handleLocalSnapshotPersistResult(err); err != nil {
+		return err
+	}
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+	return nil
 }
 
 // handleLocalSnapshotPersistResult collapses the post-SaveSnap error

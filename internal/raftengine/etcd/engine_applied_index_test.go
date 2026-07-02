@@ -103,6 +103,7 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 		dataDir:    t.TempDir(),
 		fsmSnapDir: t.TempDir(),
 	}
+	e.protectReceivedFSMSnapshot(7)
 	rd := etcdraft.Ready{
 		Snapshot: raftpb.Snapshot{
 			Data: []byte("payload"),
@@ -150,6 +151,7 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("snapshot prepare did not finish after SaveSnap was released")
 	}
+	require.Empty(t, e.protectedReceivedFSMSnaps)
 }
 
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
