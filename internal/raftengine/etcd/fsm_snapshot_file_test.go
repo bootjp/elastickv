@@ -3,7 +3,6 @@ package etcd
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
@@ -12,6 +11,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	etcdsnap "go.etcd.io/etcd/server/v3/etcdserver/api/snap"
+	raftpb "go.etcd.io/raft/v3/raftpb"
+	"go.uber.org/zap"
 )
 
 // --- Token encode/decode tests ---
@@ -339,12 +341,12 @@ func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 	payload := []byte("payload")
 
 	for _, index := range []uint64{100, 200} {
-		createSnapFile(t, snapDir, index)
-		writeFSMFileForTest(t, fsmSnapDir, index, payload)
+		crc, _ := writeFSMFileForTest(t, fsmSnapDir, index, payload)
+		createTokenSnapFileWithTerm(t, snapDir, 1, index, crc)
 	}
-	createSnapFile(t, snapDir, 300)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 300, 0x12345678)
 	require.NoError(t, os.WriteFile(fsmSnapPath(fsmSnapDir, 300), []byte{0x01, 0x02}, 0o600))
-	createSnapFile(t, snapDir, 350)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 350, 0x87654321)
 	writeFSMFileForTest(t, fsmSnapDir, 150, payload)
 	writeFSMFileForTest(t, fsmSnapDir, 250, payload)
 	writeFSMFileForTest(t, fsmSnapDir, 500, payload)
@@ -372,10 +374,10 @@ func TestPrepareFSMSnapshotWriteKeepsWALValidFallbackPair(t *testing.T) {
 	fsmSnapDir := t.TempDir()
 	payload := []byte("payload")
 
-	createSnapFile(t, snapDir, 100)
-	writeFSMFileForTest(t, fsmSnapDir, 100, payload)
-	createSnapFile(t, snapDir, 200)
-	writeFSMFileForTest(t, fsmSnapDir, 200, payload)
+	crc100, _ := writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 100, crc100)
+	crc200, _ := writeFSMFileForTest(t, fsmSnapDir, 200, payload)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 200, crc200)
 
 	oldPrewriteWALSnapshotIndexes := prewriteWALSnapshotIndexes
 	prewriteWALSnapshotIndexes = func(string) (map[walSnapshotKey]bool, error) {
@@ -398,13 +400,40 @@ func TestPrepareFSMSnapshotWriteKeepsWALTermMatchingFallbackPair(t *testing.T) {
 	fsmSnapDir := t.TempDir()
 	payload := []byte("payload")
 
-	createSnapFileWithTerm(t, snapDir, 1, 100)
-	createSnapFileWithTerm(t, snapDir, 2, 100)
-	writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	crc, _ := writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 100, crc)
+	createTokenSnapFileWithTerm(t, snapDir, 2, 100, crc)
 
 	oldPrewriteWALSnapshotIndexes := prewriteWALSnapshotIndexes
 	prewriteWALSnapshotIndexes = func(string) (map[walSnapshotKey]bool, error) {
 		return map[walSnapshotKey]bool{{term: 1, index: 100}: true}, nil
+	}
+	t.Cleanup(func() {
+		prewriteWALSnapshotIndexes = oldPrewriteWALSnapshotIndexes
+	})
+
+	require.NoError(t, prepareFSMSnapshotWrite(snapDir, fsmSnapDir, 200))
+
+	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000002-0000000000000064.snap"))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
+}
+
+func TestPrepareFSMSnapshotWriteKeepsTokenMatchingFallbackPair(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+	payload := []byte("payload")
+
+	crc, _ := writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 100, crc)
+	createTokenSnapFileWithTerm(t, snapDir, 2, 100, crc^0xffffffff)
+
+	oldPrewriteWALSnapshotIndexes := prewriteWALSnapshotIndexes
+	prewriteWALSnapshotIndexes = func(string) (map[walSnapshotKey]bool, error) {
+		return map[walSnapshotKey]bool{
+			{term: 1, index: 100}: true,
+			{term: 2, index: 100}: true,
+		}, nil
 	}
 	t.Cleanup(func() {
 		prewriteWALSnapshotIndexes = oldPrewriteWALSnapshotIndexes
@@ -432,11 +461,13 @@ func TestPrepareFSMSnapshotWriteRemovesOrphansWithoutRetainedSnapshot(t *testing
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 200))
 }
 
-func createSnapFileWithTerm(t *testing.T, dir string, term uint64, index uint64) {
+func createTokenSnapFileWithTerm(t *testing.T, dir string, term uint64, index uint64, crc32c uint32) {
 	t.Helper()
-	name := fmt.Sprintf("%016x-%016x.snap", term, index)
-	path := filepath.Join(dir, name)
-	require.NoError(t, os.WriteFile(path, []byte("fake"), 0o600))
+	snapshot := raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{Term: term, Index: index},
+		Data:     encodeSnapshotToken(index, crc32c),
+	}
+	require.NoError(t, etcdsnap.New(zap.NewNop(), dir).SaveSnap(snapshot))
 }
 
 func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	etcdsnap "go.etcd.io/etcd/server/v3/etcdserver/api/snap"
 	"go.etcd.io/etcd/server/v3/storage/wal"
 	"go.uber.org/zap"
 )
@@ -354,6 +355,10 @@ func restoreAndComputeCRC(f *os.File, fileSize int64, fsm StateMachine) (uint32,
 // verifyFSMSnapshotFile performs a read-only CRC check without restoring the FSM.
 // Used for startup orphan detection. Pass tokenCRC=0 to skip the token comparison.
 func verifyFSMSnapshotFile(path string, tokenCRC uint32) error {
+	return verifyFSMSnapshotFileWithToken(path, tokenCRC, tokenCRC != 0)
+}
+
+func verifyFSMSnapshotFileWithToken(path string, tokenCRC uint32, checkToken bool) error {
 	// Open before stat to eliminate the TOCTOU window between path lookup
 	// and file open (consistent with openAndRestoreFSMSnapshot).
 	f, err := os.Open(path)
@@ -386,7 +391,7 @@ func verifyFSMSnapshotFile(path string, tokenCRC uint32) error {
 		return errors.Wrapf(ErrFSMSnapshotFileCRC,
 			"path=%s footer=%08x computed=%08x", path, footer, computed)
 	}
-	if tokenCRC != 0 && computed != tokenCRC {
+	if checkToken && computed != tokenCRC {
 		return errors.Wrapf(ErrFSMSnapshotTokenCRC,
 			"path=%s footer=%08x token=%08x", path, footer, tokenCRC)
 	}
@@ -606,7 +611,7 @@ func purgeOlderSnapshotPairsBeforeWrite(
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	candidates := collectPrewriteSnapCandidates(entries, fsmSnapDir, nextIndex, walValidIndexes)
+	candidates := collectPrewriteSnapCandidates(entries, snapDir, fsmSnapDir, nextIndex, walValidIndexes)
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].index == candidates[j].index {
 			return candidates[i].name < candidates[j].name
@@ -732,6 +737,7 @@ type walSnapshotKey struct {
 
 func collectPrewriteSnapCandidates(
 	entries []os.DirEntry,
+	snapDir string,
 	fsmSnapDir string,
 	nextIndex uint64,
 	walValidIndexes map[walSnapshotKey]bool,
@@ -748,18 +754,37 @@ func collectPrewriteSnapCandidates(
 		candidates = append(candidates, snapFileCandidate{
 			name:       e.Name(),
 			index:      index,
-			restorable: fsmSnapshotFileRestorable(fsmSnapDir, index),
+			restorable: fsmSnapshotPairRestorable(snapDir, fsmSnapDir, e.Name(), term, index),
 			walValid:   walValidIndexes == nil || walValidIndexes[walSnapshotKey{term: term, index: index}],
 		})
 	}
 	return candidates
 }
 
-func fsmSnapshotFileRestorable(fsmSnapDir string, index uint64) bool {
+func fsmSnapshotPairRestorable(snapDir, fsmSnapDir, snapName string, term, index uint64) bool {
 	if fsmSnapDir == "" {
 		return false
 	}
-	return verifyFSMSnapshotFile(fsmSnapPath(fsmSnapDir, index), 0) == nil
+	tok, ok := snapshotTokenFromSnapFile(snapDir, snapName, term, index)
+	if !ok {
+		return false
+	}
+	return verifyFSMSnapshotFileWithToken(fsmSnapPath(fsmSnapDir, index), tok.CRC32C, true) == nil
+}
+
+func snapshotTokenFromSnapFile(snapDir, snapName string, term, index uint64) (snapshotToken, bool) {
+	snapshot, err := etcdsnap.Read(zap.NewNop(), filepath.Join(snapDir, snapName))
+	if err != nil {
+		return snapshotToken{}, false
+	}
+	if snapshot.Metadata.Term != term || snapshot.Metadata.Index != index || !isSnapshotToken(snapshot.Data) {
+		return snapshotToken{}, false
+	}
+	tok, err := decodeSnapshotToken(snapshot.Data)
+	if err != nil || tok.Index != index {
+		return snapshotToken{}, false
+	}
+	return tok, true
 }
 
 func removeStaleFSMFilesBelowIndex(
