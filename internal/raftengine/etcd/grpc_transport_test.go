@@ -270,6 +270,35 @@ func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
 	require.Equal(t, payload, got)
 }
 
+func TestDrainSnapshotChunksRejectsPayloadBeforeMetadata(t *testing.T) {
+	fsmSnapDir := t.TempDir()
+	spool, err := newSnapshotSpool(fsmSnapDir)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, spool.Close())
+	})
+
+	prepareCalls := 0
+	prepareFn := func(uint64) error {
+		prepareCalls++
+		return nil
+	}
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{{
+			Chunk: []byte("payload before metadata"),
+			Final: true,
+		}},
+	}
+
+	_, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn)
+	require.ErrorIs(t, err, errSnapshotMetadataNil)
+	require.Zero(t, payloadBytes)
+	require.Zero(t, prepareCalls)
+	info, statErr := os.Stat(spool.path)
+	require.NoError(t, statErr)
+	require.Zero(t, info.Size())
+}
+
 // TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir pins the EXDEV-avoidance
 // fix from PR #747 round-3 (Codex P1): when fsmSnapDir is wired, the spool
 // file MUST be created inside fsmSnapDir (not spoolDir), so that the

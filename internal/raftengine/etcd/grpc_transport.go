@@ -936,6 +936,9 @@ func appendSnapshotChunkMetadata(metadata *raftpb.Message, chunk *pb.EtcdRaftSna
 		}
 		seenMetadata = true
 	}
+	if !seenMetadata && len(chunk.Chunk) > 0 {
+		return false, errors.WithStack(errSnapshotMetadataNil)
+	}
 	return seenMetadata, nil
 }
 

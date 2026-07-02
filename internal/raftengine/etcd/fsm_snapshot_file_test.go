@@ -342,6 +342,8 @@ func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 		writeFSMFileForTest(t, fsmSnapDir, index, payload)
 	}
 	createSnapFile(t, snapDir, 300)
+	require.NoError(t, os.WriteFile(fsmSnapPath(fsmSnapDir, 300), []byte{0x01, 0x02}, 0o600))
+	createSnapFile(t, snapDir, 350)
 	writeFSMFileForTest(t, fsmSnapDir, 150, payload)
 	writeFSMFileForTest(t, fsmSnapDir, 500, payload)
 	require.NoError(t, os.WriteFile(filepath.Join(fsmSnapDir, "leftover.fsm.tmp"), []byte("tmp"), 0o600))
@@ -351,11 +353,13 @@ func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
 	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
 	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-000000000000012c.snap"))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-000000000000015e.snap"))
 
 	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 100))
-	require.FileExists(t, fsmSnapPath(fsmSnapDir, 150))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 150))
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 200))
 	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 300))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 350))
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 500))
 	require.FileExists(t, filepath.Join(fsmSnapDir, "leftover.fsm.tmp"))
 }
