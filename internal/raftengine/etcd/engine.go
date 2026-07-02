@@ -1817,7 +1817,23 @@ func (e *Engine) persistReady(rd etcdraft.Ready) error {
 	if !readyNeedsPersistence(rd) {
 		return nil
 	}
+	if !etcdraft.IsEmptySnap(rd.Snapshot) {
+		return e.persistReadyWithSnapshotLocked(rd)
+	}
 	if err := e.applyReady(rd); err != nil {
+		return err
+	}
+	if e.persist == nil {
+		return nil
+	}
+	return persistReadyToWAL(e.persist, rd)
+}
+
+func (e *Engine) persistReadyWithSnapshotLocked(rd etcdraft.Ready) error {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	if err := e.applyReadyLocked(rd); err != nil {
 		return err
 	}
 	if e.persist == nil {
@@ -1828,6 +1844,16 @@ func (e *Engine) persistReady(rd etcdraft.Ready) error {
 
 func (e *Engine) applyReady(rd etcdraft.Ready) error {
 	if err := e.applyReadySnapshot(rd.Snapshot); err != nil {
+		return err
+	}
+	if err := e.applyReadyEntries(rd.Entries); err != nil {
+		return err
+	}
+	return e.applyReadyHardState(rd.HardState)
+}
+
+func (e *Engine) applyReadyLocked(rd etcdraft.Ready) error {
+	if err := e.applyReadySnapshotLocked(rd.Snapshot); err != nil {
 		return err
 	}
 	if err := e.applyReadyEntries(rd.Entries); err != nil {
@@ -2034,6 +2060,15 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	if etcdraft.IsEmptySnap(snapshot) {
 		return nil
 	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	return e.applyReadySnapshotLocked(snapshot)
+}
+
+func (e *Engine) applyReadySnapshotLocked(snapshot raftpb.Snapshot) error {
+	if etcdraft.IsEmptySnap(snapshot) {
+		return nil
+	}
 	// etcdraft.IsEmptySnap only validates the raft metadata. This backend also
 	// requires FSM payload bytes so it can restore local state before applying
 	// the metadata snapshot to MemoryStorage.
@@ -2043,9 +2078,6 @@ func (e *Engine) applyReadySnapshot(snapshot raftpb.Snapshot) error {
 	// Snapshot application is intentionally synchronous with the raft loop: the
 	// local FSM must reflect the incoming raft snapshot before Ready can advance
 	// and later committed entries can be applied safely.
-	e.snapshotMu.Lock()
-	defer e.snapshotMu.Unlock()
-
 	if isSnapshotToken(snapshot.Data) {
 		tok, err := decodeSnapshotToken(snapshot.Data)
 		if err != nil {
@@ -2678,7 +2710,7 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
-	payload, err := e.snapshotPayload(index)
+	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
 		return err
 	}
@@ -2714,7 +2746,7 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 		return nil
 	}
 
-	payload, err := e.snapshotPayload(index)
+	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
 		return err
 	}
@@ -2777,11 +2809,13 @@ func (e *Engine) prepareFSMSnapshotWrite(index uint64) error {
 	return prepareFSMSnapshotWrite(snapDir, e.fsmSnapDir, index)
 }
 
-// snapshotPayload takes a FSM snapshot for the given index, writes it to the
+// snapshotPayloadLocked takes a FSM snapshot for the given index, writes it to the
 // .fsm file on disk, and returns the 17-byte token for raftpb.Snapshot.Data.
+// Caller must hold snapshotMu when fsmSnapDir is set: prewrite cleanup may
+// delete orphaned .fsm files below index.
 // If fsmSnapDir is not set (e.g., engines created directly in unit tests),
 // falls back to the legacy in-memory []byte path.
-func (e *Engine) snapshotPayload(index uint64) ([]byte, error) {
+func (e *Engine) snapshotPayloadLocked(index uint64) ([]byte, error) {
 	if e.fsmSnapDir == "" {
 		snapshot, err := e.fsm.Snapshot()
 		if err != nil {
@@ -4221,7 +4255,10 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 		}
 		return e.persistLocalSnapshotPayload(req.index, payload)
 	}
-	if err := e.prepareFSMSnapshotWriteLocked(req.index); err != nil {
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+
+	if err := e.prepareFSMSnapshotWrite(req.index); err != nil {
 		slog.Warn("failed to prepare fsm snapshot write",
 			"index", req.index,
 			"error", err,
@@ -4236,7 +4273,7 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 		return errors.WithStack(closeErr)
 	}
 	token := encodeSnapshotToken(req.index, crc32c)
-	return e.persistLocalSnapshotPayload(req.index, token)
+	return e.persistLocalSnapshotPayloadLocked(req.index, token)
 }
 
 func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error {
@@ -4246,6 +4283,10 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
+	return e.persistLocalSnapshotPayloadLocked(index, payload)
+}
+
+func (e *Engine) persistLocalSnapshotPayloadLocked(index uint64, payload []byte) error {
 	current, err := e.storage.Snapshot()
 	if err != nil {
 		return errors.WithStack(err)

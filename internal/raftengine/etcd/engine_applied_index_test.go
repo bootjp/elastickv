@@ -4,6 +4,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/coreos/go-semver/semver"
@@ -67,11 +68,22 @@ func (f *recordingAppliedIndexFSM) SetDurableAppliedIndex(idx uint64) error {
 // that records SaveSnap calls into the shared recorder. The hook
 // only calls SaveSnap + Release; the rest are stubs.
 type recordingPersistStorage struct {
-	rec *applyIndexOrderRecorder
+	rec             *applyIndexOrderRecorder
+	saveStarted     chan struct{}
+	saveStartedOnce sync.Once
+	saveRelease     <-chan struct{}
 }
 
 func (p *recordingPersistStorage) SaveSnap(snap raftpb.Snapshot) error {
-	p.rec.record("save", snap.Metadata.Index)
+	if p.saveStarted != nil {
+		p.saveStartedOnce.Do(func() { close(p.saveStarted) })
+	}
+	if p.saveRelease != nil {
+		<-p.saveRelease
+	}
+	if p.rec != nil {
+		p.rec.record("save", snap.Metadata.Index)
+	}
 	return nil
 }
 
@@ -80,6 +92,65 @@ func (p *recordingPersistStorage) Release(_ raftpb.Snapshot) error              
 func (p *recordingPersistStorage) Sync() error                                     { return nil }
 func (p *recordingPersistStorage) Close() error                                    { return nil }
 func (p *recordingPersistStorage) MinimalEtcdVersion() *semver.Version             { return nil }
+
+func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	e := &Engine{
+		storage:    etcdraft.NewMemoryStorage(),
+		fsm:        &recordingAppliedIndexFSM{},
+		persist:    &recordingPersistStorage{saveStarted: saveStarted, saveRelease: releaseSave},
+		dataDir:    t.TempDir(),
+		fsmSnapDir: t.TempDir(),
+	}
+	rd := etcdraft.Ready{
+		Snapshot: raftpb.Snapshot{
+			Data: []byte("payload"),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1}},
+				Index:     7,
+				Term:      1,
+			},
+		},
+	}
+
+	persistDone := make(chan error, 1)
+	go func() {
+		persistDone <- e.persistReady(rd)
+	}()
+
+	select {
+	case <-saveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("SaveSnap did not start")
+	}
+
+	prepareDone := make(chan error, 1)
+	go func() {
+		prepareDone <- e.prepareFSMSnapshotWriteLocked(8)
+	}()
+
+	select {
+	case err := <-prepareDone:
+		t.Fatalf("snapshot prepare finished before SaveSnap released snapshotMu: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseSave)
+
+	select {
+	case err := <-persistDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("persistReady did not finish after SaveSnap was released")
+	}
+	select {
+	case err := <-prepareDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("snapshot prepare did not finish after SaveSnap was released")
+	}
+}
 
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
 // adjacent assertion: the recording FSM MUST satisfy the writer

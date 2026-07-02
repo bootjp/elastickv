@@ -587,7 +587,7 @@ func purgeOlderSnapshotPairsBeforeWrite(snapDir, fsmSnapDir string, nextIndex ui
 	retention := keepRestorablePrewriteSnapshots(candidates)
 	var combined error
 	combined = errors.CombineErrors(combined, purgeUnretainedPrewriteSnapshots(snapDir, fsmSnapDir, candidates, retention))
-	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBelowRetention(snapDir, fsmSnapDir, retention))
+	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBeforeIndex(snapDir, fsmSnapDir, retention, nextIndex))
 	return errors.WithStack(combined)
 }
 
@@ -611,17 +611,18 @@ func purgeUnretainedPrewriteSnapshots(
 	return errors.WithStack(combined)
 }
 
-func removePrewriteFSMOrphansBelowRetention(
+func removePrewriteFSMOrphansBeforeIndex(
 	snapDir string,
 	fsmSnapDir string,
 	retention prewriteSnapshotRetention,
+	nextIndex uint64,
 ) error {
 	if retention.restorableFloor > 0 {
 		liveIndexes, err := collectLiveSnapIndexes(snapDir)
 		if err != nil {
 			return errors.WithStack(err)
 		} else if liveIndexes != nil {
-			return removeStaleFSMFilesBelowIndex(fsmSnapDir, liveIndexes, retention.restorableFloor)
+			return removeStaleFSMFilesBelowIndex(fsmSnapDir, liveIndexes, nextIndex)
 		}
 	}
 	return nil
@@ -849,7 +850,7 @@ func syncDirIfExists(dir string) error {
 	if dir == "" {
 		return nil
 	}
-	if err := syncDir(dir); err != nil && !os.IsNotExist(err) {
+	if err := syncDir(dir); err != nil && !os.IsNotExist(errors.UnwrapAll(err)) {
 		return err
 	}
 	return nil
