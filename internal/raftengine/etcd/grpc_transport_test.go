@@ -295,7 +295,10 @@ func TestSendSnapshotProtectsFinalizedFSMFileUntilEngineRelease(t *testing.T) {
 	transport.SetSpoolDir(t.TempDir())
 	transport.SetFSMSnapDir(fsmSnapDir)
 	transport.SetFSMSnapshotProtection(
-		func(index uint64) { protected = append(protected, index) },
+		func(index uint64) bool {
+			protected = append(protected, index)
+			return true
+		},
 		func(index uint64) { unprotected = append(unprotected, index) },
 	)
 	transport.SetHandler(func(_ context.Context, msg raftpb.Message) error {
@@ -338,10 +341,11 @@ func TestDrainSnapshotChunksProtectsBeforePublishingFSMFile(t *testing.T) {
 		require.NoError(t, spool.Close())
 	})
 	var protected []uint64
-	protectFn := func(got uint64) {
+	protectFn := func(got uint64) bool {
 		protected = append(protected, got)
 		_, statErr := os.Stat(fsmSnapPath(fsmSnapDir, got))
 		require.True(t, os.IsNotExist(statErr), "protection must be registered before the final .fsm path is visible")
+		return true
 	}
 	stream := &testSendSnapshotServer{
 		chunks: []*pb.EtcdRaftSnapshotChunk{{
@@ -357,6 +361,55 @@ func TestDrainSnapshotChunksProtectsBeforePublishingFSMFile(t *testing.T) {
 	require.Equal(t, []uint64{index}, protected)
 	require.True(t, isSnapshotToken(msg.Snapshot.Data))
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, index))
+}
+
+func TestDrainSnapshotChunksRejectsStaleFSMProtection(t *testing.T) {
+	const index = uint64(127)
+	payload := []byte("stale payload must not be published")
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	fsmSnapDir := t.TempDir()
+	spool, err := newSnapshotSpool(fsmSnapDir)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, spool.Close())
+	})
+	var protected []uint64
+	var unprotected []uint64
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{{
+			Metadata: raw,
+			Chunk:    payload,
+			Final:    true,
+		}},
+	}
+
+	_, payloadBytes, err := drainSnapshotChunks(
+		stream,
+		spool,
+		fsmSnapDir,
+		func(uint64) error { return nil },
+		func(got uint64) bool {
+			protected = append(protected, got)
+			return false
+		},
+		func(got uint64) { unprotected = append(unprotected, got) },
+	)
+	require.Error(t, err)
+	require.ErrorIs(t, err, errReceivedFSMSnapshotStale)
+	require.Zero(t, payloadBytes)
+	require.Equal(t, []uint64{index}, protected)
+	require.Empty(t, unprotected)
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, index))
 }
 
 func TestDrainSnapshotChunksUnprotectsWhenFinalizeFails(t *testing.T) {
@@ -400,7 +453,10 @@ func TestDrainSnapshotChunksUnprotectsWhenFinalizeFails(t *testing.T) {
 		spool,
 		fsmSnapDir,
 		func(uint64) error { return nil },
-		func(got uint64) { protected = append(protected, got) },
+		func(got uint64) bool {
+			protected = append(protected, got)
+			return true
+		},
 		func(got uint64) { unprotected = append(unprotected, got) },
 	)
 	require.Error(t, err)
@@ -591,7 +647,10 @@ func TestSendSnapshot_ApplyFailureRemovesFinalizedFSMFile(t *testing.T) {
 	var protected []uint64
 	var unprotected []uint64
 	transport.SetFSMSnapshotProtection(
-		func(index uint64) { protected = append(protected, index) },
+		func(index uint64) bool {
+			protected = append(protected, index)
+			return true
+		},
 		func(index uint64) { unprotected = append(unprotected, index) },
 	)
 

@@ -157,10 +157,9 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {
 	e := &Engine{}
 	e.snapshotMu.Lock()
-	done := make(chan struct{})
+	accepted := make(chan bool, 1)
 	go func() {
-		defer close(done)
-		e.protectReceivedFSMSnapshot(9)
+		accepted <- e.protectReceivedFSMSnapshot(9)
 	}()
 
 	time.Sleep(10 * time.Millisecond)
@@ -168,7 +167,34 @@ func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {
 	e.snapshotMu.Unlock()
 
 	select {
-	case <-done:
+	case got := <-accepted:
+		require.False(t, got)
+	case <-time.After(time.Second):
+		t.Fatal("protectReceivedFSMSnapshot did not return")
+	}
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+}
+
+func TestProtectReceivedFSMSnapshotWaitsOnSnapshotMuForAlreadyAppliedIndex(t *testing.T) {
+	e := &Engine{}
+	e.appliedIndex.Store(9)
+	e.snapshotMu.Lock()
+	accepted := make(chan bool, 1)
+	go func() {
+		accepted <- e.protectReceivedFSMSnapshot(9)
+	}()
+
+	select {
+	case got := <-accepted:
+		t.Fatalf("protectReceivedFSMSnapshot returned before snapshotMu was released: %v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	e.snapshotMu.Unlock()
+
+	select {
+	case got := <-accepted:
+		require.False(t, got)
 	case <-time.After(time.Second):
 		t.Fatal("protectReceivedFSMSnapshot did not return")
 	}

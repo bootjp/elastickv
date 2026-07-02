@@ -2832,19 +2832,20 @@ func (e *Engine) prepareFSMSnapshotWrite(index uint64) error {
 	return prepareFSMSnapshotWriteProtected(snapDir, e.fsmSnapDir, index, e.protectedReceivedFSMSnapshotIndexesLocked())
 }
 
-func (e *Engine) protectReceivedFSMSnapshot(index uint64) {
-	if index == 0 || index <= e.appliedIndex.Load() {
-		return
+func (e *Engine) protectReceivedFSMSnapshot(index uint64) bool {
+	if index == 0 {
+		return false
 	}
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 	if index <= e.appliedIndex.Load() {
-		return
+		return false
 	}
 	if e.protectedReceivedFSMSnaps == nil {
 		e.protectedReceivedFSMSnaps = make(map[uint64]int, 1)
 	}
 	e.protectedReceivedFSMSnaps[index]++
+	return true
 }
 
 func (e *Engine) unprotectReceivedFSMSnapshot(index uint64) {
