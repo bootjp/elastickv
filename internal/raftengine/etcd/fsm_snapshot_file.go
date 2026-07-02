@@ -687,11 +687,20 @@ func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSna
 		keep: make(map[string]bool, prewriteSnapKeep),
 	}
 	walFiltered := prewriteCandidatesHaveWALFilter(candidates)
-	keepNewestMatchingPrewriteSnapshots(candidates, &retention, func(candidate snapFileCandidate) bool {
-		return candidate.restorable && (!walFiltered || candidate.walValid)
-	})
-	if len(retention.keep) == 0 {
-		keepNewestMatchingPrewriteSnapshots(candidates, &retention, func(candidate snapFileCandidate) bool {
+	if walFiltered {
+		keepNewestMatchingPrewriteSnapshots(candidates, &retention, prewriteSnapKeep, func(candidate snapFileCandidate) bool {
+			return candidate.restorable && candidate.walValid
+		})
+		if len(retention.keep) == 0 {
+			keepNewestMatchingPrewriteSnapshots(candidates, &retention, prewriteSnapKeep, func(candidate snapFileCandidate) bool {
+				return candidate.walValid
+			})
+			keepNewestMatchingPrewriteSnapshots(candidates, &retention, prewriteSnapKeep+1, func(candidate snapFileCandidate) bool {
+				return candidate.restorable
+			})
+		}
+	} else {
+		keepNewestMatchingPrewriteSnapshots(candidates, &retention, prewriteSnapKeep, func(candidate snapFileCandidate) bool {
 			return candidate.restorable
 		})
 	}
@@ -704,10 +713,11 @@ func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSna
 func keepNewestMatchingPrewriteSnapshots(
 	candidates []snapFileCandidate,
 	retention *prewriteSnapshotRetention,
+	maxKeep int,
 	match func(snapFileCandidate) bool,
 ) {
-	for i := len(candidates) - 1; i >= 0 && len(retention.keep) < prewriteSnapKeep; i-- {
-		if !match(candidates[i]) {
+	for i := len(candidates) - 1; i >= 0 && len(retention.keep) < maxKeep; i-- {
+		if retention.keep[candidates[i].name] || !match(candidates[i]) {
 			continue
 		}
 		retention.keep[candidates[i].name] = true
