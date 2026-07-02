@@ -222,6 +222,54 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied())
 }
 
+func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
+	const index = uint64(124)
+	payload := []byte("payload written after prepare")
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	fsmSnapDir := t.TempDir()
+	spool, err := newSnapshotSpool(fsmSnapDir)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, spool.Close())
+	})
+
+	prepareCalls := 0
+	prepareFn := func(got uint64) error {
+		prepareCalls++
+		require.Equal(t, index, got)
+		info, statErr := os.Stat(spool.path)
+		require.NoError(t, statErr)
+		require.Zero(t, info.Size(), "prepare must run before the first payload byte is spooled")
+		return nil
+	}
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{{
+			Metadata: raw,
+			Chunk:    payload,
+			Final:    true,
+		}},
+	}
+
+	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(payload)), payloadBytes)
+	require.Equal(t, 1, prepareCalls)
+	require.True(t, isSnapshotToken(msg.Snapshot.Data))
+	got, err := readFSMSnapshotPayload(fsmSnapPath(fsmSnapDir, index))
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
 // TestReceiveSnapshotStream_SpoolPlacedInFSMSnapDir pins the EXDEV-avoidance
 // fix from PR #747 round-3 (Codex P1): when fsmSnapDir is wired, the spool
 // file MUST be created inside fsmSnapDir (not spoolDir), so that the

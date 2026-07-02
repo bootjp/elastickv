@@ -513,12 +513,11 @@ func run() error {
 }
 
 func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {
-	for _, runtime := range runtimes {
-
-		if runtime == nil {
+	for _, rt := range runtimes {
+		if rt == nil {
 			continue
 		}
-		engine := runtime.snapshotEngine()
+		engine := rt.snapshotEngine()
 		lifecycle, ok := engine.(raftengine.Lifecycle)
 		if !ok {
 			continue
@@ -527,7 +526,7 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 		if done == nil {
 			continue
 		}
-		groupID := runtime.spec.id
+		groupID := rt.spec.id
 		eg.Go(func() error {
 			select {
 			case <-ctx.Done():

@@ -816,6 +816,7 @@ func drainSnapshotChunks(
 	crcWriter := newCRC32CWriter(spool)
 
 	var payloadBytes int64
+	preparedFSMWrite := false
 	for {
 		chunk, err := stream.Recv()
 		if err != nil {
@@ -824,14 +825,20 @@ func drainSnapshotChunks(
 			}
 			return raftpb.Message{}, 0, errors.WithStack(err)
 		}
-		payloadBytes += int64(len(chunk.Chunk))
-		seen, err := appendSnapshotChunk(&metadata, crcWriter, chunk, seenMetadata)
+		seen, err := appendSnapshotChunkMetadata(&metadata, chunk, seenMetadata)
 		if err != nil {
 			return raftpb.Message{}, 0, err
 		}
 		seenMetadata = seen
+		if !preparedFSMWrite {
+			preparedFSMWrite = maybePrepareReceivedFSMSnapshotWrite(metadata, fsmSnapDir, prepareFn, seenMetadata)
+		}
+		if err := writeSnapshotChunkPayload(crcWriter, chunk); err != nil {
+			return raftpb.Message{}, 0, err
+		}
+		payloadBytes += int64(len(chunk.Chunk))
 		if chunk.Final {
-			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, prepareFn, seenMetadata)
+			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, seenMetadata)
 			if err != nil {
 				return raftpb.Message{}, 0, err
 			}
@@ -854,7 +861,6 @@ func finalizeReceivedSnapshot(
 	spool *snapshotSpool,
 	crc32c uint32,
 	fsmSnapDir string,
-	prepareFn func(uint64) error,
 	seenMetadata bool,
 ) (raftpb.Message, error) {
 	if !seenMetadata || metadata.Snapshot == nil {
@@ -862,7 +868,6 @@ func finalizeReceivedSnapshot(
 	}
 	index := metadata.Snapshot.Metadata.Index
 	if fsmSnapDir != "" && index > 0 {
-		prepareReceivedFSMSnapshotWrite(fsmSnapDir, index, prepareFn)
 		if err := spool.FinalizeAsFSMFile(fsmSnapDir, index, crc32c); err != nil {
 			return raftpb.Message{}, err
 		}
@@ -873,6 +878,23 @@ func finalizeReceivedSnapshot(
 	// fsmSnapDir and by the index=0 edge case (no canonical filename to
 	// rename to).
 	return buildSnapshotMessage(metadata, spool, seenMetadata)
+}
+
+func maybePrepareReceivedFSMSnapshotWrite(
+	metadata raftpb.Message,
+	fsmSnapDir string,
+	prepareFn func(uint64) error,
+	seenMetadata bool,
+) bool {
+	if fsmSnapDir == "" || !seenMetadata || metadata.Snapshot == nil {
+		return false
+	}
+	index := metadata.Snapshot.Metadata.Index
+	if index == 0 {
+		return false
+	}
+	prepareReceivedFSMSnapshotWrite(fsmSnapDir, index, prepareFn)
+	return true
 }
 
 func prepareReceivedFSMSnapshotWrite(fsmSnapDir string, index uint64, prepareFn func(uint64) error) {
@@ -904,7 +926,7 @@ func snapshotDataFormatLabel(snap *raftpb.Snapshot) string {
 	return "inline"
 }
 
-func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.EtcdRaftSnapshotChunk, seenMetadata bool) (bool, error) {
+func appendSnapshotChunkMetadata(metadata *raftpb.Message, chunk *pb.EtcdRaftSnapshotChunk, seenMetadata bool) (bool, error) {
 	if len(chunk.Metadata) > 0 {
 		if seenMetadata {
 			return false, errors.WithStack(errSnapshotMetadataDuplicate)
@@ -914,12 +936,16 @@ func appendSnapshotChunk(metadata *raftpb.Message, payload io.Writer, chunk *pb.
 		}
 		seenMetadata = true
 	}
+	return seenMetadata, nil
+}
+
+func writeSnapshotChunkPayload(payload io.Writer, chunk *pb.EtcdRaftSnapshotChunk) error {
 	if len(chunk.Chunk) > 0 {
 		if _, err := payload.Write(chunk.Chunk); err != nil {
-			return false, errors.WithStack(err)
+			return errors.WithStack(err)
 		}
 	}
-	return seenMetadata, nil
+	return nil
 }
 
 func buildSnapshotMessage(metadata raftpb.Message, spool *snapshotSpool, seenMetadata bool) (raftpb.Message, error) {

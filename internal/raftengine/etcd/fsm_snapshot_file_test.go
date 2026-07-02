@@ -332,15 +332,16 @@ func TestPurgeOldSnapshotFilesOrdering(t *testing.T) {
 	require.Len(t, fsms, 3)
 }
 
-func TestPrepareFSMSnapshotWritePrunesOldPairsAndOrphans(t *testing.T) {
+func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()
 	payload := []byte("payload")
 
-	for _, index := range []uint64{100, 200, 300} {
+	for _, index := range []uint64{100, 200} {
 		createSnapFile(t, snapDir, index)
 		writeFSMFileForTest(t, fsmSnapDir, index, payload)
 	}
+	createSnapFile(t, snapDir, 300)
 	writeFSMFileForTest(t, fsmSnapDir, 150, payload)
 	writeFSMFileForTest(t, fsmSnapDir, 500, payload)
 	require.NoError(t, os.WriteFile(filepath.Join(fsmSnapDir, "leftover.fsm.tmp"), []byte("tmp"), 0o600))
@@ -348,15 +349,15 @@ func TestPrepareFSMSnapshotWritePrunesOldPairsAndOrphans(t *testing.T) {
 	require.NoError(t, prepareFSMSnapshotWrite(snapDir, fsmSnapDir, 400))
 
 	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
-	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
-	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-000000000000012c.snap"))
+	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-000000000000012c.snap"))
 
 	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 100))
-	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 150))
-	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 200))
-	require.FileExists(t, fsmSnapPath(fsmSnapDir, 300))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 150))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 200))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 300))
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 500))
-	require.NoFileExists(t, filepath.Join(fsmSnapDir, "leftover.fsm.tmp"))
+	require.FileExists(t, filepath.Join(fsmSnapDir, "leftover.fsm.tmp"))
 }
 
 // --- writeFSMSnapshotFile integration ---
