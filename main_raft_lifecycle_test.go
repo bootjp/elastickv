@@ -34,6 +34,18 @@ func TestStartRaftEngineLifecycleWatchersReportsEngineFailure(t *testing.T) {
 	require.Contains(t, err.Error(), "raft group 7 engine stopped")
 }
 
+func TestStartRaftEngineLifecycleWatchersIgnoresCleanEngineStop(t *testing.T) {
+	t.Parallel()
+	engine := &lifecycleEngineStub{done: make(chan struct{})}
+	runtimes := []*raftGroupRuntime{{spec: groupSpec{id: 9}, engine: engine}}
+
+	eg, ctx := errgroup.WithContext(context.Background())
+	startRaftEngineLifecycleWatchers(ctx, eg, runtimes)
+	close(engine.done)
+
+	require.NoError(t, eg.Wait())
+}
+
 func TestStartRaftEngineLifecycleWatchersIgnoresContextCancellation(t *testing.T) {
 	t.Parallel()
 	engine := &lifecycleEngineStub{done: make(chan struct{})}

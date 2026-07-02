@@ -209,6 +209,36 @@ func TestUnprotectReceivedFSMSnapshotTokenIfAppliedKeepsFutureSnapshot(t *testin
 	require.Equal(t, map[uint64]int{10: 1}, e.protectedReceivedFSMSnaps)
 }
 
+func TestReleaseIgnoredReceivedFSMSnapshotStepsUnprotectsNonSnapshotReady(t *testing.T) {
+	e := &Engine{
+		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
+		pendingReceivedFSMSnapshotStep: map[uint64]int{
+			10: 1,
+		},
+	}
+
+	e.releaseIgnoredReceivedFSMSnapshotSteps(etcdraft.Ready{})
+
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
+}
+
+func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *testing.T) {
+	e := &Engine{
+		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
+		pendingReceivedFSMSnapshotStep: map[uint64]int{
+			10: 1,
+		},
+	}
+
+	e.releaseIgnoredReceivedFSMSnapshotSteps(etcdraft.Ready{
+		Snapshot: raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 10, Term: 1}},
+	})
+
+	require.Equal(t, map[uint64]int{10: 1}, e.protectedReceivedFSMSnaps)
+	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
+}
+
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
 // adjacent assertion: the recording FSM MUST satisfy the writer
 // seam so the engine hook actually fires for it.

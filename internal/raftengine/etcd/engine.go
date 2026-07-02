@@ -310,8 +310,9 @@ type Engine struct {
 
 	// Restore swaps the underlying store state and must not race with the short
 	// critical section that publishes a newly persisted local snapshot.
-	snapshotMu                sync.Mutex
-	protectedReceivedFSMSnaps map[uint64]int
+	snapshotMu                     sync.Mutex
+	protectedReceivedFSMSnaps      map[uint64]int
+	pendingReceivedFSMSnapshotStep map[uint64]int
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
@@ -1797,6 +1798,7 @@ func (e *Engine) drainReady() error {
 		if err := e.persistReady(rd); err != nil {
 			return err
 		}
+		e.releaseIgnoredReceivedFSMSnapshotSteps(rd)
 		if err := e.sendMessages(rd.Messages); err != nil {
 			return err
 		}
@@ -1892,6 +1894,7 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		e.unprotectReceivedFSMSnapshotToken(msg)
 		return
 	}
+	e.trackReceivedFSMSnapshotStep(msg)
 	e.unprotectReceivedFSMSnapshotTokenIfApplied(msg)
 }
 
@@ -2900,6 +2903,36 @@ func (e *Engine) unprotectReceivedFSMSnapshotTokenIfCommitted(msg raftpb.Message
 	}
 	e.unprotectReceivedFSMSnapshot(index)
 	return true
+}
+
+func (e *Engine) trackReceivedFSMSnapshotStep(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok || index <= e.appliedIndex.Load() {
+		return
+	}
+	if e.pendingReceivedFSMSnapshotStep == nil {
+		e.pendingReceivedFSMSnapshotStep = make(map[uint64]int, 1)
+	}
+	e.pendingReceivedFSMSnapshotStep[index]++
+}
+
+func (e *Engine) releaseIgnoredReceivedFSMSnapshotSteps(rd etcdraft.Ready) {
+	if len(e.pendingReceivedFSMSnapshotStep) == 0 {
+		return
+	}
+	snapshotIndex := uint64(0)
+	if !etcdraft.IsEmptySnap(rd.Snapshot) {
+		snapshotIndex = rd.Snapshot.Metadata.Index
+	}
+	for index, count := range e.pendingReceivedFSMSnapshotStep {
+		delete(e.pendingReceivedFSMSnapshotStep, index)
+		if index == snapshotIndex {
+			continue
+		}
+		for i := 0; i < count; i++ {
+			e.unprotectReceivedFSMSnapshot(index)
+		}
+	}
 }
 
 func (e *Engine) unprotectReceivedFSMSnapshotToken(msg raftpb.Message) {

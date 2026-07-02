@@ -540,7 +540,7 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 				if err := lifecycle.Err(); err != nil {
 					return errors.Wrapf(err, "raft group %d engine stopped", groupID)
 				}
-				return errors.Errorf("raft group %d engine stopped", groupID)
+				return nil
 			}
 		})
 	}

@@ -141,16 +141,25 @@ func fsmSnapPath(fsmSnapDir string, index uint64) string {
 // Snap files are named "{term:016x}-{index:016x}.snap".
 // Returns 0 on parse failure.
 func parseSnapFileIndex(name string) uint64 {
+	_, index := parseSnapFileTermIndex(name)
+	return index
+}
+
+func parseSnapFileTermIndex(name string) (uint64, uint64) {
 	base := strings.TrimSuffix(name, snapFileExt)
 	idx := strings.LastIndex(base, "-")
 	if idx < 0 {
-		return 0
+		return 0, 0
+	}
+	term, err := strconv.ParseUint(base[:idx], 16, 64)
+	if err != nil {
+		return 0, 0
 	}
 	index, err := strconv.ParseUint(base[idx+1:], 16, 64)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
-	return index
+	return term, index
 }
 
 // crc32CWriter wraps an io.Writer and accumulates a CRC32C checksum over all
@@ -629,12 +638,27 @@ func purgeUnretainedPrewriteSnapshots(
 			if retention.keep[candidate.name] {
 				continue
 			}
-			if err := purgeSnapPair(snapDir, fsmSnapDir, candidate.name); err != nil {
+			var err error
+			if retainedPrewriteSnapshotIndex(candidates, retention, candidate.index) {
+				err = purgeSnapFile(snapDir, candidate.name)
+			} else {
+				err = purgeSnapPair(snapDir, fsmSnapDir, candidate.name)
+			}
+			if err != nil {
 				combined = errors.CombineErrors(combined, err)
 			}
 		}
 	}
 	return errors.WithStack(combined)
+}
+
+func retainedPrewriteSnapshotIndex(candidates []snapFileCandidate, retention prewriteSnapshotRetention, index uint64) bool {
+	for _, candidate := range candidates {
+		if candidate.index == index && retention.keep[candidate.name] {
+			return true
+		}
+	}
+	return false
 }
 
 func removePrewriteFSMOrphansBeforeIndex(
@@ -683,7 +707,7 @@ func prewriteCandidatesHaveWALFilter(candidates []snapFileCandidate) bool {
 
 var prewriteWALSnapshotIndexes = loadPrewriteWALSnapshotIndexes
 
-func loadPrewriteWALSnapshotIndexes(snapDir string) (map[uint64]bool, error) {
+func loadPrewriteWALSnapshotIndexes(snapDir string) (map[walSnapshotKey]bool, error) {
 	walDir := filepath.Join(filepath.Dir(snapDir), walDirName)
 	if !wal.Exist(walDir) {
 		return nil, nil
@@ -692,27 +716,32 @@ func loadPrewriteWALSnapshotIndexes(snapDir string) (map[uint64]bool, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	indexes := make(map[uint64]bool, len(walSnaps))
+	indexes := make(map[walSnapshotKey]bool, len(walSnaps))
 	for _, snap := range walSnaps {
 		if snap.Index > 0 {
-			indexes[snap.Index] = true
+			indexes[walSnapshotKey{term: snap.Term, index: snap.Index}] = true
 		}
 	}
 	return indexes, nil
+}
+
+type walSnapshotKey struct {
+	term  uint64
+	index uint64
 }
 
 func collectPrewriteSnapCandidates(
 	entries []os.DirEntry,
 	fsmSnapDir string,
 	nextIndex uint64,
-	walValidIndexes map[uint64]bool,
+	walValidIndexes map[walSnapshotKey]bool,
 ) []snapFileCandidate {
 	candidates := make([]snapFileCandidate, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != snapFileExt {
 			continue
 		}
-		index := parseSnapFileIndex(e.Name())
+		term, index := parseSnapFileTermIndex(e.Name())
 		if index == 0 || index >= nextIndex {
 			continue
 		}
@@ -720,7 +749,7 @@ func collectPrewriteSnapCandidates(
 			name:       e.Name(),
 			index:      index,
 			restorable: fsmSnapshotFileRestorable(fsmSnapDir, index),
-			walValid:   walValidIndexes == nil || walValidIndexes[index],
+			walValid:   walValidIndexes == nil || walValidIndexes[walSnapshotKey{term: term, index: index}],
 		})
 	}
 	return candidates
@@ -904,9 +933,8 @@ func purgeSnapPair(snapDir, fsmSnapDir, snapName string) error {
 	idx := parseSnapFileIndex(snapName)
 
 	// Remove the .snap file first; skip .fsm removal if snap removal fails.
-	snapPath := filepath.Join(snapDir, snapName)
-	if removeErr := os.Remove(snapPath); removeErr != nil && !os.IsNotExist(removeErr) {
-		return errors.WithStack(removeErr)
+	if err := purgeSnapFile(snapDir, snapName); err != nil {
+		return err
 	}
 
 	// Remove the corresponding .fsm file second.
@@ -917,6 +945,14 @@ func purgeSnapPair(snapDir, fsmSnapDir, snapName string) error {
 		if removeErr := os.Remove(fsmPath); removeErr != nil && !os.IsNotExist(removeErr) {
 			return errors.WithStack(removeErr)
 		}
+	}
+	return nil
+}
+
+func purgeSnapFile(snapDir, snapName string) error {
+	snapPath := filepath.Join(snapDir, snapName)
+	if removeErr := os.Remove(snapPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		return errors.WithStack(removeErr)
 	}
 	return nil
 }

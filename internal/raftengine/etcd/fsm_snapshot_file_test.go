@@ -3,6 +3,7 @@ package etcd
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
@@ -377,8 +378,8 @@ func TestPrepareFSMSnapshotWriteKeepsWALValidFallbackPair(t *testing.T) {
 	writeFSMFileForTest(t, fsmSnapDir, 200, payload)
 
 	oldPrewriteWALSnapshotIndexes := prewriteWALSnapshotIndexes
-	prewriteWALSnapshotIndexes = func(string) (map[uint64]bool, error) {
-		return map[uint64]bool{100: true}, nil
+	prewriteWALSnapshotIndexes = func(string) (map[walSnapshotKey]bool, error) {
+		return map[walSnapshotKey]bool{{term: 1, index: 100}: true}, nil
 	}
 	t.Cleanup(func() {
 		prewriteWALSnapshotIndexes = oldPrewriteWALSnapshotIndexes
@@ -390,6 +391,30 @@ func TestPrepareFSMSnapshotWriteKeepsWALValidFallbackPair(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
 	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 200))
+}
+
+func TestPrepareFSMSnapshotWriteKeepsWALTermMatchingFallbackPair(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+	payload := []byte("payload")
+
+	createSnapFileWithTerm(t, snapDir, 1, 100)
+	createSnapFileWithTerm(t, snapDir, 2, 100)
+	writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+
+	oldPrewriteWALSnapshotIndexes := prewriteWALSnapshotIndexes
+	prewriteWALSnapshotIndexes = func(string) (map[walSnapshotKey]bool, error) {
+		return map[walSnapshotKey]bool{{term: 1, index: 100}: true}, nil
+	}
+	t.Cleanup(func() {
+		prewriteWALSnapshotIndexes = oldPrewriteWALSnapshotIndexes
+	})
+
+	require.NoError(t, prepareFSMSnapshotWrite(snapDir, fsmSnapDir, 200))
+
+	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000002-0000000000000064.snap"))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
 }
 
 func TestPrepareFSMSnapshotWriteRemovesOrphansWithoutRetainedSnapshot(t *testing.T) {
@@ -405,6 +430,13 @@ func TestPrepareFSMSnapshotWriteRemovesOrphansWithoutRetainedSnapshot(t *testing
 
 	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 100))
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 200))
+}
+
+func createSnapFileWithTerm(t *testing.T, dir string, term uint64, index uint64) {
+	t.Helper()
+	name := fmt.Sprintf("%016x-%016x.snap", term, index)
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, []byte("fake"), 0o600))
 }
 
 func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {
