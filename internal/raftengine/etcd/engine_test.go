@@ -592,6 +592,42 @@ func TestHandleStepUnprotectsSnapshotTokenWhenCommittedAlreadyCoversIt(t *testin
 	require.Empty(t, engine.protectedReceivedFSMSnaps)
 }
 
+func TestHandleStepKeepsAcceptedSnapshotTokenProtectedUntilReady(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     10,
+			Term:      1,
+		},
+	}))
+	engine := &Engine{
+		rawNode: mustRawNode(t, storage, 1),
+		protectedReceivedFSMSnaps: map[uint64]int{
+			11: 1,
+		},
+	}
+	require.False(t, engine.rawNode.HasReady())
+
+	engine.handleStep(raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 2,
+		To:   1,
+		Snapshot: &raftpb.Snapshot{
+			Data: encodeSnapshotToken(11, 0),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1}},
+				Index:     11,
+				Term:      2,
+			},
+		},
+	})
+
+	require.NoError(t, engine.currentError())
+	require.True(t, engine.rawNode.HasReady())
+	require.Equal(t, map[uint64]int{11: 1}, engine.protectedReceivedFSMSnaps)
+}
+
 func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	engine := &Engine{
 		storage: etcdraft.NewMemoryStorage(),

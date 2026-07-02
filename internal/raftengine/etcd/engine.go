@@ -1876,6 +1876,7 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	}
 	e.recordLeaderContact(msg)
 	e.recordQuorumAck(msg)
+	commitBeforeStep := e.rawNode.Status().Commit
 	if err := e.rawNode.Step(msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
 			e.unprotectReceivedFSMSnapshotToken(msg)
@@ -1884,7 +1885,7 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		e.fail(errors.WithStack(err))
 		return
 	}
-	if e.unprotectReceivedFSMSnapshotTokenIfCommitted(msg) {
+	if e.unprotectReceivedFSMSnapshotTokenIfCommitted(msg, commitBeforeStep) {
 		return
 	}
 	if !e.rawNode.HasReady() {
@@ -2892,9 +2893,9 @@ func (e *Engine) unprotectReceivedFSMSnapshotTokenIfApplied(msg raftpb.Message) 
 	e.unprotectReceivedFSMSnapshot(index)
 }
 
-func (e *Engine) unprotectReceivedFSMSnapshotTokenIfCommitted(msg raftpb.Message) bool {
+func (e *Engine) unprotectReceivedFSMSnapshotTokenIfCommitted(msg raftpb.Message, committedIndex uint64) bool {
 	index, ok := receivedFSMSnapshotTokenIndex(msg)
-	if !ok || e.rawNode == nil || index > e.rawNode.Status().Commit {
+	if !ok || index > committedIndex {
 		return false
 	}
 	e.unprotectReceivedFSMSnapshot(index)

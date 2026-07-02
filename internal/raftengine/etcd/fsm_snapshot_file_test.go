@@ -392,6 +392,21 @@ func TestPrepareFSMSnapshotWriteKeepsWALValidFallbackPair(t *testing.T) {
 	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 200))
 }
 
+func TestPrepareFSMSnapshotWriteRemovesOrphansWithoutRetainedSnapshot(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+	payload := []byte("payload")
+
+	writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	writeFSMFileForTest(t, fsmSnapDir, 200, payload)
+
+	protected := map[uint64]bool{200: true}
+	require.NoError(t, prepareFSMSnapshotWriteProtected(snapDir, fsmSnapDir, 300, protected))
+
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 100))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 200))
+}
+
 func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()

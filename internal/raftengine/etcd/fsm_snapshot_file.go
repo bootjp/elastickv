@@ -611,7 +611,6 @@ func purgeOlderSnapshotPairsBeforeWrite(
 	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBeforeIndex(
 		snapDir,
 		fsmSnapDir,
-		retention,
 		protectedIndexes,
 		nextIndex,
 	))
@@ -641,19 +640,17 @@ func purgeUnretainedPrewriteSnapshots(
 func removePrewriteFSMOrphansBeforeIndex(
 	snapDir string,
 	fsmSnapDir string,
-	retention prewriteSnapshotRetention,
 	protectedIndexes map[uint64]bool,
 	nextIndex uint64,
 ) error {
-	if retention.restorableFloor > 0 {
-		liveIndexes, err := collectLiveSnapIndexes(snapDir)
-		if err != nil {
-			return errors.WithStack(err)
-		} else if liveIndexes != nil {
-			return removeStaleFSMFilesBelowIndex(fsmSnapDir, liveIndexes, protectedIndexes, nextIndex)
-		}
+	liveIndexes, err := collectLiveSnapIndexes(snapDir)
+	if err != nil {
+		return errors.WithStack(err)
 	}
-	return nil
+	if liveIndexes == nil {
+		return nil
+	}
+	return removeStaleFSMFilesBelowIndex(fsmSnapDir, liveIndexes, protectedIndexes, nextIndex)
 }
 
 func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSnapshotRetention {
