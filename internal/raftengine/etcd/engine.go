@@ -1803,6 +1803,7 @@ func (e *Engine) drainReady() error {
 		if err := e.applyCommitted(rd.CommittedEntries); err != nil {
 			return err
 		}
+		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())
 		e.handleReadStates(rd.ReadStates)
 		e.rawNode.Advance(rd)
 		if err := e.maybePersistLocalSnapshot(); err != nil {
@@ -1877,10 +1878,13 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	e.recordQuorumAck(msg)
 	if err := e.rawNode.Step(msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
+			e.unprotectReceivedFSMSnapshotToken(msg)
 			return
 		}
 		e.fail(errors.WithStack(err))
+		return
 	}
+	e.unprotectReceivedFSMSnapshotTokenIfApplied(msg)
 }
 
 // recordQuorumAck updates the per-peer last-response time when msg is
@@ -2823,6 +2827,9 @@ func (e *Engine) protectReceivedFSMSnapshot(index uint64) {
 	}
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
+	if index <= e.appliedIndex.Load() {
+		return
+	}
 	if e.protectedReceivedFSMSnaps == nil {
 		e.protectedReceivedFSMSnaps = make(map[uint64]int, 1)
 	}
@@ -2859,6 +2866,42 @@ func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpToLocked(index uint64) {
 			delete(e.protectedReceivedFSMSnaps, protectedIndex)
 		}
 	}
+}
+
+func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpTo(index uint64) {
+	if index == 0 {
+		return
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotTokenIfApplied(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok || index > e.appliedIndex.Load() {
+		return
+	}
+	e.unprotectReceivedFSMSnapshot(index)
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotToken(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok {
+		return
+	}
+	e.unprotectReceivedFSMSnapshot(index)
+}
+
+func receivedFSMSnapshotTokenIndex(msg raftpb.Message) (uint64, bool) {
+	if msg.Type != raftpb.MsgSnap || msg.Snapshot == nil || !isSnapshotToken(msg.Snapshot.Data) {
+		return 0, false
+	}
+	tok, err := decodeSnapshotToken(msg.Snapshot.Data)
+	if err != nil || tok.Index == 0 {
+		return 0, false
+	}
+	return tok.Index, true
 }
 
 func (e *Engine) protectedReceivedFSMSnapshotIndexesLocked() map[uint64]bool {

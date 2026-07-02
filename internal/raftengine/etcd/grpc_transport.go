@@ -764,20 +764,26 @@ func (t *GRPCTransport) snapshotSpoolPlacement() (
 	fsmSnapDir string,
 	prepareFn func(uint64) error,
 	protectFn func(uint64),
+	unprotectFn func(uint64),
 ) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	fsmSnapDir = t.fsmSnapDir
 	prepareFn = t.prepareFSMWrite
 	protectFn = t.protectFSMWrite
+	unprotectFn = t.unprotectFSMWrite
 	if fsmSnapDir != "" {
-		return fsmSnapDir, fsmSnapDir, prepareFn, protectFn
+		return fsmSnapDir, fsmSnapDir, prepareFn, protectFn, unprotectFn
 	}
-	return t.spoolDir, "", prepareFn, protectFn
+	return t.spoolDir, "", prepareFn, protectFn, unprotectFn
 }
 
 func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotServer) (raftpb.Message, error) {
-	spoolPlacement, fsmSnapDir, prepareFn, protectFn := t.snapshotSpoolPlacement()
+	spoolPlacement, fsmSnapDir, prepareFn, protectFn, unprotectFn := t.snapshotSpoolPlacement()
+	metadata, firstPayloadChunk, preparedFSMWrite, err := receiveSnapshotMetadata(stream, fsmSnapDir, prepareFn)
+	if err != nil {
+		return raftpb.Message{}, err
+	}
 	spool, err := newSnapshotSpool(spoolPlacement)
 	if err != nil {
 		return raftpb.Message{}, err
@@ -796,7 +802,17 @@ func (t *GRPCTransport) receiveSnapshotStream(stream pb.EtcdRaft_SendSnapshotSer
 		}
 	}()
 
-	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, protectFn)
+	msg, payloadBytes, err := drainSnapshotChunksFrom(
+		stream,
+		spool,
+		fsmSnapDir,
+		prepareFn,
+		protectFn,
+		unprotectFn,
+		metadata,
+		firstPayloadChunk,
+		preparedFSMWrite,
+	)
 	if err != nil {
 		return raftpb.Message{}, err
 	}
@@ -826,9 +842,24 @@ func drainSnapshotChunks(
 	fsmSnapDir string,
 	prepareFn func(uint64) error,
 	protectFn func(uint64),
+	unprotectFn func(uint64),
 ) (raftpb.Message, int64, error) {
 	var metadata raftpb.Message
-	seenMetadata := false
+	return drainSnapshotChunksFrom(stream, spool, fsmSnapDir, prepareFn, protectFn, unprotectFn, metadata, nil, false)
+}
+
+func drainSnapshotChunksFrom(
+	stream pb.EtcdRaft_SendSnapshotServer,
+	spool *snapshotSpool,
+	fsmSnapDir string,
+	prepareFn func(uint64) error,
+	protectFn func(uint64),
+	unprotectFn func(uint64),
+	metadata raftpb.Message,
+	firstPayloadChunk *pb.EtcdRaftSnapshotChunk,
+	preparedFSMWrite bool,
+) (raftpb.Message, int64, error) {
+	seenMetadata := metadata.Snapshot != nil
 	// Wrap spool with crc32CWriter so the CRC accumulates as bytes hit
 	// disk. The CRC is only meaningful when we have an fsmSnapDir to
 	// finalize into; the legacy fallback path discards it. Cost is
@@ -838,9 +869,8 @@ func drainSnapshotChunks(
 	crcWriter := newCRC32CWriter(spool)
 
 	var payloadBytes int64
-	preparedFSMWrite := false
 	for {
-		chunk, err := recvSnapshotChunk(stream)
+		chunk, err := nextSnapshotChunk(stream, &firstPayloadChunk)
 		if err != nil {
 			return raftpb.Message{}, 0, err
 		}
@@ -860,11 +890,57 @@ func drainSnapshotChunks(
 		}
 		payloadBytes += int64(len(chunk.Chunk))
 		if chunk.Final {
-			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, protectFn, seenMetadata)
+			msg, err := finalizeReceivedSnapshot(metadata, spool, crcWriter.Sum32(), fsmSnapDir, protectFn, unprotectFn, seenMetadata)
 			if err != nil {
 				return raftpb.Message{}, 0, err
 			}
 			return msg, payloadBytes, nil
+		}
+	}
+}
+
+func nextSnapshotChunk(
+	stream pb.EtcdRaft_SendSnapshotServer,
+	firstPayloadChunk **pb.EtcdRaftSnapshotChunk,
+) (*pb.EtcdRaftSnapshotChunk, error) {
+	if *firstPayloadChunk != nil {
+		chunk := *firstPayloadChunk
+		*firstPayloadChunk = nil
+		return chunk, nil
+	}
+	return recvSnapshotChunk(stream)
+}
+
+func receiveSnapshotMetadata(
+	stream pb.EtcdRaft_SendSnapshotServer,
+	fsmSnapDir string,
+	prepareFn func(uint64) error,
+) (raftpb.Message, *pb.EtcdRaftSnapshotChunk, bool, error) {
+	var metadata raftpb.Message
+	seenMetadata := false
+	for {
+		chunk, err := recvSnapshotChunk(stream)
+		if err != nil {
+			return raftpb.Message{}, nil, false, err
+		}
+		seen, err := appendSnapshotChunkMetadata(&metadata, chunk, seenMetadata)
+		if err != nil {
+			return raftpb.Message{}, nil, false, err
+		}
+		seenMetadata = seen
+		if !seenMetadata && len(chunk.Chunk) > 0 {
+			return raftpb.Message{}, nil, false, errors.WithStack(errSnapshotMetadataNil)
+		}
+		if seenMetadata {
+			prepared := maybePrepareReceivedFSMSnapshotWrite(metadata, fsmSnapDir, prepareFn, true)
+			firstPayloadChunk := &pb.EtcdRaftSnapshotChunk{
+				Chunk: chunk.Chunk,
+				Final: chunk.Final,
+			}
+			return metadata, firstPayloadChunk, prepared, nil
+		}
+		if chunk.Final {
+			return raftpb.Message{}, nil, false, errors.WithStack(errSnapshotMetadataNil)
 		}
 	}
 }
@@ -895,6 +971,7 @@ func finalizeReceivedSnapshot(
 	crc32c uint32,
 	fsmSnapDir string,
 	protectFn func(uint64),
+	unprotectFn func(uint64),
 	seenMetadata bool,
 ) (raftpb.Message, error) {
 	if !seenMetadata || metadata.Snapshot == nil {
@@ -902,13 +979,18 @@ func finalizeReceivedSnapshot(
 	}
 	index := metadata.Snapshot.Metadata.Index
 	if fsmSnapDir != "" && index > 0 {
+		protected := false
+		if protectFn != nil {
+			protectFn(index)
+			protected = true
+		}
 		if err := spool.FinalizeAsFSMFile(fsmSnapDir, index, crc32c); err != nil {
+			if protected && unprotectFn != nil {
+				unprotectFn(index)
+			}
 			return raftpb.Message{}, err
 		}
 		metadata.Snapshot.Data = encodeSnapshotToken(index, crc32c)
-		if protectFn != nil {
-			protectFn(index)
-		}
 		return metadata, nil
 	}
 	// Legacy fallback: full materialization. Used by tests that don't wire an

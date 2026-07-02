@@ -222,6 +222,49 @@ func TestReceiveSnapshotStream_StreamingTokenWhenFSMSnapDirSet(t *testing.T) {
 	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied())
 }
 
+func TestReceiveSnapshotStreamPreparesBeforeSpoolCreation(t *testing.T) {
+	const index = uint64(124)
+	payload := []byte("payload written after cleanup")
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	fsmSnapDir := t.TempDir()
+	transport := NewGRPCTransport(nil)
+	transport.SetSpoolDir(t.TempDir())
+	transport.SetFSMSnapDir(fsmSnapDir)
+	prepareCalls := 0
+	transport.SetFSMSnapshotPrepare(func(got uint64) error {
+		prepareCalls++
+		require.Equal(t, index, got)
+		matches, globErr := filepath.Glob(filepath.Join(fsmSnapDir, snapshotSpoolPattern))
+		require.NoError(t, globErr)
+		require.Empty(t, matches, "prewrite cleanup must run before creating the receive spool")
+		return nil
+	})
+
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{{
+			Metadata: raw,
+			Chunk:    payload,
+			Final:    true,
+		}},
+	}
+
+	msg, err := transport.receiveSnapshotStream(stream)
+	require.NoError(t, err)
+	require.Equal(t, 1, prepareCalls)
+	require.True(t, isSnapshotToken(msg.Snapshot.Data))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, index))
+}
+
 func TestSendSnapshotProtectsFinalizedFSMFileUntilEngineRelease(t *testing.T) {
 	const index = uint64(91)
 
@@ -274,6 +317,98 @@ func TestSendSnapshotProtectsFinalizedFSMFileUntilEngineRelease(t *testing.T) {
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, index))
 }
 
+func TestDrainSnapshotChunksProtectsBeforePublishingFSMFile(t *testing.T) {
+	const index = uint64(125)
+	payload := []byte("payload protected before final rename")
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	fsmSnapDir := t.TempDir()
+	spool, err := newSnapshotSpool(fsmSnapDir)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, spool.Close())
+	})
+	var protected []uint64
+	protectFn := func(got uint64) {
+		protected = append(protected, got)
+		_, statErr := os.Stat(fsmSnapPath(fsmSnapDir, got))
+		require.True(t, os.IsNotExist(statErr), "protection must be registered before the final .fsm path is visible")
+	}
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{{
+			Metadata: raw,
+			Chunk:    payload,
+			Final:    true,
+		}},
+	}
+
+	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, func(uint64) error { return nil }, protectFn, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(payload)), payloadBytes)
+	require.Equal(t, []uint64{index}, protected)
+	require.True(t, isSnapshotToken(msg.Snapshot.Data))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, index))
+}
+
+func TestDrainSnapshotChunksUnprotectsWhenFinalizeFails(t *testing.T) {
+	const index = uint64(126)
+	payload := []byte("payload whose final rename fails")
+	metadata := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 1,
+		To:   2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: index, Term: 1},
+		},
+	}
+	raw, err := metadata.Marshal()
+	require.NoError(t, err)
+
+	spool, err := newSnapshotSpool(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, spool.Close())
+	})
+	fsmSnapDir := t.TempDir()
+	var protected []uint64
+	var unprotected []uint64
+	syncErr := errors.New("simulated directory sync failure")
+	oldSnapshotSyncDir := snapshotSyncDir
+	snapshotSyncDir = func(string) error { return syncErr }
+	t.Cleanup(func() {
+		snapshotSyncDir = oldSnapshotSyncDir
+	})
+	stream := &testSendSnapshotServer{
+		chunks: []*pb.EtcdRaftSnapshotChunk{{
+			Metadata: raw,
+			Chunk:    payload,
+			Final:    true,
+		}},
+	}
+
+	_, _, err = drainSnapshotChunks(
+		stream,
+		spool,
+		fsmSnapDir,
+		func(uint64) error { return nil },
+		func(got uint64) { protected = append(protected, got) },
+		func(got uint64) { unprotected = append(unprotected, got) },
+	)
+	require.Error(t, err)
+	require.ErrorIs(t, err, syncErr)
+	require.Equal(t, []uint64{index}, protected)
+	require.Equal(t, []uint64{index}, unprotected)
+}
+
 func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
 	const index = uint64(124)
 	payload := []byte("payload written after prepare")
@@ -312,7 +447,7 @@ func TestDrainSnapshotChunksPreparesBeforePayloadWrite(t *testing.T) {
 		}},
 	}
 
-	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, nil)
+	msg, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(payload)), payloadBytes)
 	require.Equal(t, 1, prepareCalls)
@@ -342,7 +477,7 @@ func TestDrainSnapshotChunksRejectsPayloadBeforeMetadata(t *testing.T) {
 		}},
 	}
 
-	_, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, nil)
+	_, payloadBytes, err := drainSnapshotChunks(stream, spool, fsmSnapDir, prepareFn, nil, nil)
 	require.ErrorIs(t, err, errSnapshotMetadataNil)
 	require.Zero(t, payloadBytes)
 	require.Zero(t, prepareCalls)

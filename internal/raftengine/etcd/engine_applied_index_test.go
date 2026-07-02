@@ -154,6 +154,61 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 	require.Empty(t, e.protectedReceivedFSMSnaps)
 }
 
+func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {
+	e := &Engine{}
+	e.snapshotMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.protectReceivedFSMSnapshot(9)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	e.appliedIndex.Store(9)
+	e.snapshotMu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("protectReceivedFSMSnapshot did not return")
+	}
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+}
+
+func TestUnprotectReceivedFSMSnapshotTokenIfApplied(t *testing.T) {
+	e := &Engine{
+		protectedReceivedFSMSnaps: map[uint64]int{9: 1},
+	}
+	e.appliedIndex.Store(9)
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		Snapshot: &raftpb.Snapshot{
+			Data: encodeSnapshotToken(9, 0),
+		},
+	}
+
+	e.unprotectReceivedFSMSnapshotTokenIfApplied(msg)
+
+	require.Empty(t, e.protectedReceivedFSMSnaps)
+}
+
+func TestUnprotectReceivedFSMSnapshotTokenIfAppliedKeepsFutureSnapshot(t *testing.T) {
+	e := &Engine{
+		protectedReceivedFSMSnaps: map[uint64]int{10: 1},
+	}
+	e.appliedIndex.Store(9)
+	msg := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		Snapshot: &raftpb.Snapshot{
+			Data: encodeSnapshotToken(10, 0),
+		},
+	}
+
+	e.unprotectReceivedFSMSnapshotTokenIfApplied(msg)
+
+	require.Equal(t, map[uint64]int{10: 1}, e.protectedReceivedFSMSnaps)
+}
+
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
 // adjacent assertion: the recording FSM MUST satisfy the writer
 // seam so the engine hook actually fires for it.
