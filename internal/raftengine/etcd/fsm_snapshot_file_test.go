@@ -446,6 +446,30 @@ func TestPrepareFSMSnapshotWriteKeepsTokenMatchingFallbackPair(t *testing.T) {
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
 }
 
+func TestPrepareFSMSnapshotWriteKeepsRestorablePairWhenWALValidCandidateIsBroken(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+	payload := []byte("payload")
+
+	crc, _ := writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 100, crc)
+	createTokenSnapFileWithTerm(t, snapDir, 1, 200, 0x12345678)
+
+	oldPrewriteWALSnapshotIndexes := prewriteWALSnapshotIndexes
+	prewriteWALSnapshotIndexes = func(string) (map[walSnapshotKey]bool, error) {
+		return map[walSnapshotKey]bool{{term: 1, index: 200}: true}, nil
+	}
+	t.Cleanup(func() {
+		prewriteWALSnapshotIndexes = oldPrewriteWALSnapshotIndexes
+	})
+
+	require.NoError(t, prepareFSMSnapshotWrite(snapDir, fsmSnapDir, 300))
+
+	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
+}
+
 func TestPrepareFSMSnapshotWriteRemovesOrphansWithoutRetainedSnapshot(t *testing.T) {
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()

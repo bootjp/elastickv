@@ -687,18 +687,34 @@ func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSna
 		keep: make(map[string]bool, prewriteSnapKeep),
 	}
 	walFiltered := prewriteCandidatesHaveWALFilter(candidates)
-	for i := len(candidates) - 1; i >= 0 && len(retention.keep) < prewriteSnapKeep; i-- {
-		if candidates[i].restorable && (!walFiltered || candidates[i].walValid) {
-			retention.keep[candidates[i].name] = true
-			if retention.restorableFloor == 0 || candidates[i].index < retention.restorableFloor {
-				retention.restorableFloor = candidates[i].index
-			}
-		}
+	keepNewestMatchingPrewriteSnapshots(candidates, &retention, func(candidate snapFileCandidate) bool {
+		return candidate.restorable && (!walFiltered || candidate.walValid)
+	})
+	if len(retention.keep) == 0 {
+		keepNewestMatchingPrewriteSnapshots(candidates, &retention, func(candidate snapFileCandidate) bool {
+			return candidate.restorable
+		})
 	}
 	if len(retention.keep) == 0 && len(candidates) > 0 {
 		retention.keep[candidates[len(candidates)-1].name] = true
 	}
 	return retention
+}
+
+func keepNewestMatchingPrewriteSnapshots(
+	candidates []snapFileCandidate,
+	retention *prewriteSnapshotRetention,
+	match func(snapFileCandidate) bool,
+) {
+	for i := len(candidates) - 1; i >= 0 && len(retention.keep) < prewriteSnapKeep; i-- {
+		if !match(candidates[i]) {
+			continue
+		}
+		retention.keep[candidates[i].name] = true
+		if retention.restorableFloor == 0 || candidates[i].index < retention.restorableFloor {
+			retention.restorableFloor = candidates[i].index
+		}
+	}
 }
 
 func prewriteCandidatesHaveWALFilter(candidates []snapFileCandidate) bool {
