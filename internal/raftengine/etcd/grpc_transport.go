@@ -818,18 +818,18 @@ func drainSnapshotChunks(
 	var payloadBytes int64
 	preparedFSMWrite := false
 	for {
-		chunk, err := stream.Recv()
+		chunk, err := recvSnapshotChunk(stream)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return raftpb.Message{}, 0, errors.WithStack(errSnapshotStreamShort)
-			}
-			return raftpb.Message{}, 0, errors.WithStack(err)
+			return raftpb.Message{}, 0, err
 		}
 		seen, err := appendSnapshotChunkMetadata(&metadata, chunk, seenMetadata)
 		if err != nil {
 			return raftpb.Message{}, 0, err
 		}
 		seenMetadata = seen
+		if !seenMetadata && len(chunk.Chunk) > 0 {
+			return raftpb.Message{}, 0, errors.WithStack(errSnapshotMetadataNil)
+		}
 		if !preparedFSMWrite {
 			preparedFSMWrite = maybePrepareReceivedFSMSnapshotWrite(metadata, fsmSnapDir, prepareFn, seenMetadata)
 		}
@@ -845,6 +845,17 @@ func drainSnapshotChunks(
 			return msg, payloadBytes, nil
 		}
 	}
+}
+
+func recvSnapshotChunk(stream pb.EtcdRaft_SendSnapshotServer) (*pb.EtcdRaftSnapshotChunk, error) {
+	chunk, err := stream.Recv()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, errors.WithStack(errSnapshotStreamShort)
+		}
+		return nil, errors.WithStack(err)
+	}
+	return chunk, nil
 }
 
 // finalizeReceivedSnapshot picks between the streaming-token path (when an
@@ -935,9 +946,6 @@ func appendSnapshotChunkMetadata(metadata *raftpb.Message, chunk *pb.EtcdRaftSna
 			return false, errors.WithStack(err)
 		}
 		seenMetadata = true
-	}
-	if !seenMetadata && len(chunk.Chunk) > 0 {
-		return false, errors.WithStack(errSnapshotMetadataNil)
 	}
 	return seenMetadata, nil
 }
