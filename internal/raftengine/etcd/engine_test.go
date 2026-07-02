@@ -557,6 +557,41 @@ func TestHandleStepIgnoresPeerNotFoundResponses(t *testing.T) {
 	require.NoError(t, engine.currentError())
 }
 
+func TestHandleStepUnprotectsSnapshotTokenWhenCommittedAlreadyCoversIt(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     10,
+			Term:      1,
+		},
+	}))
+	engine := &Engine{
+		rawNode: mustRawNode(t, storage, 1),
+		protectedReceivedFSMSnaps: map[uint64]int{
+			9: 1,
+		},
+	}
+	require.False(t, engine.rawNode.HasReady())
+
+	engine.handleStep(raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: 2,
+		To:   1,
+		Snapshot: &raftpb.Snapshot{
+			Data: encodeSnapshotToken(9, 0),
+			Metadata: raftpb.SnapshotMetadata{
+				ConfState: raftpb.ConfState{Voters: []uint64{1}},
+				Index:     9,
+				Term:      1,
+			},
+		},
+	})
+
+	require.NoError(t, engine.currentError())
+	require.Empty(t, engine.protectedReceivedFSMSnaps)
+}
+
 func TestApplyReadySnapshotAdvancesAppliedIndex(t *testing.T) {
 	engine := &Engine{
 		storage: etcdraft.NewMemoryStorage(),

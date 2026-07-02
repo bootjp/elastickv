@@ -366,6 +366,32 @@ func TestPrepareFSMSnapshotWriteKeepsNewestRestorablePair(t *testing.T) {
 	require.FileExists(t, filepath.Join(fsmSnapDir, "leftover.fsm.tmp"))
 }
 
+func TestPrepareFSMSnapshotWriteKeepsWALValidFallbackPair(t *testing.T) {
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+	payload := []byte("payload")
+
+	createSnapFile(t, snapDir, 100)
+	writeFSMFileForTest(t, fsmSnapDir, 100, payload)
+	createSnapFile(t, snapDir, 200)
+	writeFSMFileForTest(t, fsmSnapDir, 200, payload)
+
+	oldPrewriteWALSnapshotIndexes := prewriteWALSnapshotIndexes
+	prewriteWALSnapshotIndexes = func(string) (map[uint64]bool, error) {
+		return map[uint64]bool{100: true}, nil
+	}
+	t.Cleanup(func() {
+		prewriteWALSnapshotIndexes = oldPrewriteWALSnapshotIndexes
+	})
+
+	require.NoError(t, prepareFSMSnapshotWrite(snapDir, fsmSnapDir, 300))
+
+	require.FileExists(t, filepath.Join(snapDir, "0000000000000001-0000000000000064.snap"))
+	require.NoFileExists(t, filepath.Join(snapDir, "0000000000000001-00000000000000c8.snap"))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 100))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 200))
+}
+
 func TestPrepareFSMSnapshotWritePreservesProtectedReceivedFSM(t *testing.T) {
 	snapDir := t.TempDir()
 	fsmSnapDir := t.TempDir()

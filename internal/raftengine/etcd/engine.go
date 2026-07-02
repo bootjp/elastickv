@@ -1884,6 +1884,13 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		e.fail(errors.WithStack(err))
 		return
 	}
+	if e.unprotectReceivedFSMSnapshotTokenIfCommitted(msg) {
+		return
+	}
+	if !e.rawNode.HasReady() {
+		e.unprotectReceivedFSMSnapshotToken(msg)
+		return
+	}
 	e.unprotectReceivedFSMSnapshotTokenIfApplied(msg)
 }
 
@@ -2883,6 +2890,15 @@ func (e *Engine) unprotectReceivedFSMSnapshotTokenIfApplied(msg raftpb.Message) 
 		return
 	}
 	e.unprotectReceivedFSMSnapshot(index)
+}
+
+func (e *Engine) unprotectReceivedFSMSnapshotTokenIfCommitted(msg raftpb.Message) bool {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok || e.rawNode == nil || index > e.rawNode.Status().Commit {
+		return false
+	}
+	e.unprotectReceivedFSMSnapshot(index)
+	return true
 }
 
 func (e *Engine) unprotectReceivedFSMSnapshotToken(msg raftpb.Message) {

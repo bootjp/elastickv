@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	"go.etcd.io/etcd/server/v3/storage/wal"
+	"go.uber.org/zap"
 )
 
 const (
@@ -566,6 +568,7 @@ type snapFileCandidate struct {
 	name       string
 	index      uint64
 	restorable bool
+	walValid   bool
 }
 
 type prewriteSnapshotRetention struct {
@@ -590,7 +593,11 @@ func purgeOlderSnapshotPairsBeforeWrite(
 		return errors.WithStack(err)
 	}
 
-	candidates := collectPrewriteSnapCandidates(entries, fsmSnapDir, nextIndex)
+	walValidIndexes, err := prewriteWALSnapshotIndexes(snapDir)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	candidates := collectPrewriteSnapCandidates(entries, fsmSnapDir, nextIndex, walValidIndexes)
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].index == candidates[j].index {
 			return candidates[i].name < candidates[j].name
@@ -653,8 +660,9 @@ func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSna
 	retention := prewriteSnapshotRetention{
 		keep: make(map[string]bool, prewriteSnapKeep),
 	}
+	walFiltered := prewriteCandidatesHaveWALFilter(candidates)
 	for i := len(candidates) - 1; i >= 0 && len(retention.keep) < prewriteSnapKeep; i-- {
-		if candidates[i].restorable {
+		if candidates[i].restorable && (!walFiltered || candidates[i].walValid) {
 			retention.keep[candidates[i].name] = true
 			if retention.restorableFloor == 0 || candidates[i].index < retention.restorableFloor {
 				retention.restorableFloor = candidates[i].index
@@ -667,7 +675,41 @@ func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSna
 	return retention
 }
 
-func collectPrewriteSnapCandidates(entries []os.DirEntry, fsmSnapDir string, nextIndex uint64) []snapFileCandidate {
+func prewriteCandidatesHaveWALFilter(candidates []snapFileCandidate) bool {
+	for _, candidate := range candidates {
+		if candidate.walValid {
+			return true
+		}
+	}
+	return false
+}
+
+var prewriteWALSnapshotIndexes = loadPrewriteWALSnapshotIndexes
+
+func loadPrewriteWALSnapshotIndexes(snapDir string) (map[uint64]bool, error) {
+	walDir := filepath.Join(filepath.Dir(snapDir), walDirName)
+	if !wal.Exist(walDir) {
+		return nil, nil
+	}
+	walSnaps, err := wal.ValidSnapshotEntries(zap.NewNop(), walDir)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	indexes := make(map[uint64]bool, len(walSnaps))
+	for _, snap := range walSnaps {
+		if snap.Index > 0 {
+			indexes[snap.Index] = true
+		}
+	}
+	return indexes, nil
+}
+
+func collectPrewriteSnapCandidates(
+	entries []os.DirEntry,
+	fsmSnapDir string,
+	nextIndex uint64,
+	walValidIndexes map[uint64]bool,
+) []snapFileCandidate {
 	candidates := make([]snapFileCandidate, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != snapFileExt {
@@ -681,6 +723,7 @@ func collectPrewriteSnapCandidates(entries []os.DirEntry, fsmSnapDir string, nex
 			name:       e.Name(),
 			index:      index,
 			restorable: fsmSnapshotFileRestorable(fsmSnapDir, index),
+			walValid:   walValidIndexes == nil || walValidIndexes[index],
 		})
 	}
 	return candidates
