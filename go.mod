@@ -1,6 +1,6 @@
 module github.com/bootjp/elastickv
 
-go 1.25.0
+go 1.26
 
 toolchain go1.26.4
 
@@ -28,7 +28,7 @@ require (
 	github.com/yuin/gopher-lua v1.1.2
 	go.etcd.io/etcd/client/pkg/v3 v3.6.12
 	go.etcd.io/etcd/server/v3 v3.6.12
-	go.etcd.io/raft/v3 v3.6.0
+	go.etcd.io/raft/v3 v3.7.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.46.0
