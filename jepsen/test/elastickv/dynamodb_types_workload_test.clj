@@ -48,3 +48,21 @@
                     workload/value-type-keys)]
     (is (= (count tables) (count (set tables)))
         "every type uses a distinct table name")))
+
+(deftest setup-retryable-classifies-transient-server-errors
+  (is (@#'workload/setup-retryable?
+        (ex-info "DynamoDB InternalServerError: no raft leader currently available"
+                 {:type "InternalServerError"})))
+  (is (not (@#'workload/setup-retryable?
+             (ex-info "DynamoDB ValidationException: bad request"
+                      {:type "ValidationException"})))))
+
+(deftest setup-retry-retries-transient-server-errors
+  (let [calls (atom 0)]
+    (is (= :ok
+           (@#'workload/with-setup-retry!
+             #(if (= 1 (swap! calls inc))
+                (throw (ex-info "DynamoDB InternalServerError: no raft leader"
+                                {:type "InternalServerError"}))
+                :ok))))
+    (is (= 2 @calls))))
