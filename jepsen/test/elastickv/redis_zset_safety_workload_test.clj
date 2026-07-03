@@ -876,6 +876,32 @@
     (is (contains? kinds :unstable-read-without-mutation)
         (str "expected :unstable-read-without-mutation, got kinds=" kinds))))
 
+(deftest range-read-stability-detects-first-only-member-omission
+  ;; A later range read with the same bounds cannot drop a member observed by
+  ;; an earlier non-overlapping range read unless a mutation could affect that
+  ;; member between the reads.
+  (let [history [{:type :invoke :process 0 :f :zadd         :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd         :value ["m1" 1] :index 1}
+                 {:type :invoke :process 1 :f :zrem         :value "m1"     :index 2}
+                 {:type :info   :process 1 :f :zrem
+                  :value "m1" :error "conn reset" :index 3}
+                 {:type :invoke :process 2 :f :zrangebyscore
+                  :value [0.0 10.0] :index 4}
+                 {:type :ok     :process 2 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :members [["m1" 1.0]]} :index 5}
+                 {:type :invoke :process 3 :f :zrangebyscore
+                  :value [0.0 10.0] :index 6}
+                 {:type :ok     :process 3 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :members []} :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected first-only range member omission rejected, got: " result))
+    (is (contains? kinds :unstable-read-without-mutation)
+        (str "expected :unstable-read-without-mutation, got kinds=" kinds))))
+
 (deftest zrange-all-uses-one-prefix-across-members
   ;; Seeing m1's concurrent ZADD forces the read prefix past any successful
   ;; mutation that completed before that ZADD was invoked. Omitting m2 would
@@ -992,6 +1018,31 @@
     (is (contains? kinds :fractured-read-prefix-range)
         (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
 
+(deftest interchangeable-score-changes-anchor-absence-prefix-check
+  ;; If either of two score changes can explain a range omission, neither
+  ;; mutation is individually required. The group is still required, so common
+  ;; real-time predecessors must share the same read prefix.
+  (let [history [{:type :invoke :process 0 :f :zadd         :value ["m1" 5] :index 0}
+                 {:type :ok     :process 0 :f :zadd         :value ["m1" 5] :index 1}
+                 {:type :invoke :process 1 :f :zrangebyscore
+                  :value [0.0 10.0] :index 2}
+                 {:type :invoke :process 2 :f :zadd         :value ["m2" 2] :index 3}
+                 {:type :ok     :process 2 :f :zadd         :value ["m2" 2] :index 4}
+                 {:type :invoke :process 3 :f :zadd         :value ["m1" 50] :index 5}
+                 {:type :invoke :process 4 :f :zadd         :value ["m1" 60] :index 6}
+                 {:type :ok     :process 3 :f :zadd         :value ["m1" 50] :index 7}
+                 {:type :ok     :process 4 :f :zadd         :value ["m1" 60] :index 8}
+                 {:type :ok     :process 1 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :members []} :index 9}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected interchangeable score-change prefix violation, got: "
+             result))
+    (is (contains? kinds :fractured-read-prefix-range)
+        (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
+
 (deftest zrem-omission-anchors-prefix-check
   ;; If m1's absence is only explainable by a concurrent ZREM, that visible
   ;; deletion still anchors the read prefix. A predecessor completed before
@@ -1010,6 +1061,30 @@
         kinds   (set (map :kind (:first-errors result)))]
     (is (not (:valid? result))
         (str "expected ZREM-anchored fractured read to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
+
+(deftest interchangeable-zrems-anchor-absence-prefix-check
+  ;; If either of two concurrent ZREMs can explain an omitted member, neither
+  ;; delete is individually required. Their common real-time predecessors still
+  ;; have to appear in the same read prefix.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd       :value ["m1" 1] :index 1}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 2}
+                 {:type :invoke :process 2 :f :zadd       :value ["m2" 2] :index 3}
+                 {:type :ok     :process 2 :f :zadd       :value ["m2" 2] :index 4}
+                 {:type :invoke :process 3 :f :zrem       :value "m1"     :index 5}
+                 {:type :invoke :process 4 :f :zrem       :value "m1"     :index 6}
+                 {:type :ok     :process 3 :f :zrem
+                  :value ["m1" true] :index 7}
+                 {:type :ok     :process 4 :f :zrem
+                  :value ["m1" true] :index 8}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [] :index 9}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected interchangeable ZREM prefix violation, got: " result))
     (is (contains? kinds :fractured-read-prefix)
         (str "expected :fractured-read-prefix, got kinds=" kinds))))
 

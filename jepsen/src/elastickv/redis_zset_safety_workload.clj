@@ -845,6 +845,23 @@
               (every? #(visible-state? % bounds) before-states)
               (some #(not (visible-state? % bounds)) after-states)))))
 
+(defn- score-change-can-hide-range-member-candidate?
+  [mutations-by-m m member read-inv-idx read-cmp-idx bounds]
+  (and bounds
+       (#{:zadd :zincrby} (:f m))
+       (not= :fail (:type m))
+       (= member (:member m))
+       (read-visible-mutation? m read-inv-idx read-cmp-idx)
+       (let [before-states (possible-states-for-member
+                             (without-mutation mutations-by-m m)
+                             member
+                             read-inv-idx
+                             read-cmp-idx)
+             after-states (set (mapcat #(apply-mutation-possibilities % m)
+                                       before-states))]
+         (and (some #(visible-state? % bounds) before-states)
+              (some #(not (visible-state? % bounds)) after-states)))))
+
 (defn- score-anchor-groups
   [mutations-by-m member score read-inv-idx read-cmp-idx]
   (let [producers (->> (get mutations-by-m member)
@@ -887,6 +904,83 @@
           :force-required? (fn [m]
                              (every? #(real-time-before? m %) producers))}]))))
 
+(defn- absence-anchor-candidate?
+  [mutations-by-m m member read-inv-idx read-cmp-idx bounds]
+  (and (not= :fail (:type m))
+       (= member (:member m))
+       (read-visible-mutation? m read-inv-idx read-cmp-idx)
+       (or (effective-zrem? m)
+           (score-change-can-hide-range-member-candidate?
+             mutations-by-m
+             m
+             member
+             read-inv-idx
+             read-cmp-idx
+             bounds))))
+
+(defn- absence-anchor-required?
+  [mutations-by-m m member read-inv-idx read-cmp-idx bounds]
+  (or (observed-absence-requires-zrem?
+        mutations-by-m
+        m
+        member
+        read-inv-idx
+        read-cmp-idx
+        bounds)
+      (score-change-can-hide-range-member?
+        mutations-by-m
+        m
+        member
+        read-inv-idx
+        read-cmp-idx
+        bounds)))
+
+(defn- absence-anchor
+  [member anchor]
+  {:member member
+   :score nil
+   :visible-op (:f anchor)
+   :visible-invoke-idx (:invoke-idx anchor)
+   :force-required? #(real-time-before? % anchor)})
+
+(defn- absence-anchor-groups
+  [mutations-by-m member muts read-inv-idx read-cmp-idx bounds]
+  (let [candidates (filterv #(absence-anchor-candidate?
+                                mutations-by-m
+                                %
+                                member
+                                read-inv-idx
+                                read-cmp-idx
+                                bounds)
+                            muts)
+        required-candidates (filterv #(absence-anchor-required?
+                                         mutations-by-m
+                                         %
+                                         member
+                                         read-inv-idx
+                                         read-cmp-idx
+                                         bounds)
+                                      candidates)
+        group-required? (and (> (count candidates) 1)
+                             (let [states (possible-states-for-member
+                                            (without-mutations mutations-by-m
+                                                               candidates)
+                                            member
+                                            read-inv-idx
+                                            read-cmp-idx)]
+                               (and (seq states)
+                                    (every? #(visible-state? % bounds)
+                                            states))))]
+    (concat
+      (map #(absence-anchor member %) required-candidates)
+      (when group-required?
+        [{:member member
+          :score nil
+          :visible-ops (set (map :f candidates))
+          :visible-invoke-idxs (set (map :invoke-idx candidates))
+          :force-required? (fn [m]
+                             (every? #(real-time-before? m %) candidates))}]))))
+
 (def ^:private missing-observed ::missing-observed)
 
 (defn- read-prefix-errors
@@ -901,28 +995,15 @@
                                                      read-inv-idx
                                                      read-cmp-idx))
                               entries)
-        absence-anchors (for [[member muts] mutations-by-m
-                              :when (not (contains? observed member))
-                              anchor muts
-                              :when (or (observed-absence-requires-zrem?
-                                          mutations-by-m
-                                          anchor
-                                          member
-                                          read-inv-idx
-                                          read-cmp-idx
-                                          bounds)
-                                        (score-change-can-hide-range-member?
-                                          mutations-by-m
-                                          anchor
-                                          member
-                                          read-inv-idx
-                                          read-cmp-idx
-                                          bounds))]
-                          {:member member
-                           :score nil
-                           :visible-op (:f anchor)
-                           :visible-invoke-idx (:invoke-idx anchor)
-                           :force-required? #(real-time-before? % anchor)})
+        absence-anchors (mapcat (fn [[member muts]]
+                                  (when-not (contains? observed member)
+                                    (absence-anchor-groups mutations-by-m
+                                                           member
+                                                           muts
+                                                           read-inv-idx
+                                                           read-cmp-idx
+                                                           bounds)))
+                                mutations-by-m)
         anchors (concat score-anchors absence-anchors)]
     (->> (for [{:keys [member score force-required? visible-op
                        visible-invoke-idx visible-ops
@@ -995,6 +1076,17 @@
   [{:keys [invoke]}]
   (= :zrange-all (:f invoke)))
 
+(defn- read-bounds
+  [{:keys [invoke complete]}]
+  (when (= :zrangebyscore (:f invoke))
+    (-> complete :value :bounds)))
+
+(defn- read-covers-score?
+  [read score]
+  (if-let [[lo hi] (read-bounds read)]
+    (<= lo score hi)
+    true))
+
 (defn- mutation-could-affect-read-gap?
   [m first-read-inv-idx second-read-cmp-idx]
   (and (not= :fail (:type m))
@@ -1008,8 +1100,28 @@
     (set (concat (keys mutations-by-m)
                  (keys first-entries)
                  (keys second-entries)))
-    (let [second-members (set (keys second-entries))]
-      (set (filter second-members (keys first-entries))))))
+    (let [second-members (set (keys second-entries))
+          first-members (set (keys first-entries))
+          present-in-both (filter second-members (keys first-entries))
+          first-only-in-second-scope (keep (fn [[member score]]
+                                             (when (and (not (contains? second-members
+                                                                        member))
+                                                        (read-covers-score?
+                                                          second-read
+                                                          score))
+                                               member))
+                                           first-entries)
+          second-only-in-first-scope (keep (fn [[member score]]
+                                             (when (and (not (contains? first-members
+                                                                        member))
+                                                        (read-covers-score?
+                                                          first-read
+                                                          score))
+                                               member))
+                                           second-entries)]
+      (set (concat present-in-both
+                   first-only-in-second-scope
+                   second-only-in-first-scope)))))
 
 (defn- check-read-stability
   [mutations-by-m read-pairs]
