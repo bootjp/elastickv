@@ -131,13 +131,11 @@
 
   Returns a non-negative long count. Unparseable or unexpected values
   are treated as 0 (i.e. \"nothing removed\") so the op still resolves
-  as :ok -- matching the existing nil-guard behaviour.
+  as :ok. Nil replies are classified by invoke! before this helper is
+  called because a missing reply means the remove may have reached Redis.
   "
   [response]
   (cond
-    (nil? response)
-    0
-
     (number? response)
     (long response)
 
@@ -274,9 +272,13 @@
                 ;; would NPE on nil and ClassCastException on
                 ;; string/bytes, falling through to the general
                 ;; Exception handler and masking the real signal.
-                removed (zrem! cs zset-key member)
-                n       (coerce-zrem-count removed)]
-            (assoc op :type :ok :value [member (pos? n)]))
+                removed (zrem! cs zset-key member)]
+            (if (nil? removed)
+              (do (warn (str "ZSet safety ZREM returned nil for " member))
+                  (assoc op :type :info
+                            :error :nil-response))
+              (let [n (coerce-zrem-count removed)]
+                (assoc op :type :ok :value [member (pos? n)]))))
 
           :zrange-all
           (let [flat (car/wcar cs (car/zrange zset-key 0 -1 "WITHSCORES"))]
@@ -460,6 +462,16 @@
   (and (<= (:invoke-idx m) read-cmp-idx)
        (or (nil? (:complete-idx m))
            (>= (:complete-idx m) read-inv-idx))))
+
+(defn- pre-read-info?
+  "True when an indeterminate operation completed before a read began.
+  Such a mutation may have taken effect server-side; when an observed
+  value requires it, it anchors the read prefix even though it is no
+  longer concurrent with the read window."
+  [m read-inv-idx]
+  (and (= :info (:type m))
+       (some? (:complete-idx m))
+       (< (:complete-idx m) read-inv-idx)))
 
 (def ^:private absent-state {:present? false :score nil})
 (def ^:private impossible-state {:present? false :score nil :impossible? true})
@@ -754,7 +766,8 @@
   [mutations-by-m m member score read-inv-idx read-cmp-idx]
   (and (not= :fail (:type m))
        (= member (:member m))
-       (concurrent? m read-inv-idx read-cmp-idx)
+       (or (concurrent? m read-inv-idx read-cmp-idx)
+           (pre-read-info? m read-inv-idx))
        (mutation-can-produce-score? mutations-by-m
                                     m
                                     member
@@ -784,8 +797,7 @@
                  read-inv-idx
                  read-cmp-idx
                  #(real-time-before? % anchor))]
-    (when (and (seq states)
-               (every? #(visible-state? % bounds) states))
+    (when (seq states)
       states)))
 
 (defn- observed-absence-requires-zrem?
@@ -842,6 +854,8 @@
                                                          read-cmp-idx
                                                          anchor
                                                          bounds)
+                     forced-visible-states (filter #(visible-state? % bounds)
+                                                   forced-states)
                      observed-score (get observed
                                          (:member predecessor)
                                          missing-observed)]
@@ -849,9 +863,10 @@
                           (= :ok (:type predecessor))
                           (real-time-before? predecessor anchor)
                           (seq forced-states)
-                          (or (= missing-observed observed-score)
-                              (not (some #(score-eq? (:score %) observed-score)
-                                         forced-states))))]
+                          (if (= missing-observed observed-score)
+                            (every? #(visible-state? % bounds) forced-states)
+                            (not (some #(score-eq? (:score %) observed-score)
+                                       forced-visible-states))))]
            (cond-> {:kind kind
                     :index read-cmp-idx
                     :visible-member member
@@ -866,7 +881,7 @@
              (not= missing-observed observed-score)
              (assoc :stale-member (:member predecessor)
                     :observed-predecessor-score observed-score
-                    :forced-predecessor-scores (set (map :score forced-states)))
+                    :forced-predecessor-scores (set (map :score forced-visible-states)))
 
              bounds (assoc :bounds bounds)))
          distinct

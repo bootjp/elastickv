@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/bootjp/elastickv/monitoring"
@@ -135,4 +136,25 @@ func TestZSetFastPathTruncatedFallsBackWhenRequestedWindowExceedsScanCap(t *test
 		maxWideScanLimit-10,
 		20,
 	))
+}
+
+func TestScoreInRangeHonorsInfinityBounds(t *testing.T) {
+	t.Parallel()
+
+	negInf := zScoreBound{kind: zBoundNegInf, inclusive: true}
+	posInf := zScoreBound{kind: zBoundPosInf, inclusive: true}
+	all := []redisZSetEntry{
+		{Member: "finite", Score: 1},
+		{Member: "neg-inf", Score: math.Inf(-1)},
+		{Member: "pos-inf", Score: math.Inf(+1)},
+	}
+
+	require.Equal(t, []redisZSetEntry{
+		{Member: "pos-inf", Score: math.Inf(+1)},
+	}, filterZRangeByScore(all, posInf, posInf))
+	require.Equal(t, []redisZSetEntry{
+		{Member: "neg-inf", Score: math.Inf(-1)},
+	}, filterZRangeByScore(all, negInf, negInf))
+	require.False(t, scoreInRange(1, posInf, posInf))
+	require.False(t, scoreInRange(1, negInf, negInf))
 }

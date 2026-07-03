@@ -904,6 +904,28 @@
                           :members [["m1" 1.0]]} :index 5}]]
     (is (:valid? (run-checker history)))))
 
+(deftest zrangebyscore-prefix-check-detects-stale-in-range-predecessor
+  ;; A predecessor may be optional for omission because its forced state is
+  ;; outside the requested bounds, but if the read returns that predecessor at
+  ;; an older in-range score it is still a fractured snapshot.
+  (let [history [{:type :invoke :process 0 :f :zadd         :value ["m2" 5] :index 0}
+                 {:type :invoke :process 1 :f :zrangebyscore
+                  :value [0.0 10.0] :index 1}
+                 {:type :ok     :process 0 :f :zadd         :value ["m2" 5] :index 2}
+                 {:type :invoke :process 2 :f :zadd         :value ["m2" 50] :index 3}
+                 {:type :ok     :process 2 :f :zadd         :value ["m2" 50] :index 4}
+                 {:type :invoke :process 3 :f :zadd         :value ["m1" 1] :index 5}
+                 {:type :ok     :process 3 :f :zadd         :value ["m1" 1] :index 6}
+                 {:type :ok     :process 1 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :members [["m1" 1.0] ["m2" 5.0]]} :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected stale in-range predecessor to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix-range)
+        (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
+
 (deftest zrem-omission-anchors-prefix-check
   ;; If m1's absence is only explainable by a concurrent ZREM, that visible
   ;; deletion still anchors the read prefix. A predecessor completed before
@@ -922,6 +944,27 @@
         kinds   (set (map :kind (:first-errors result)))]
     (is (not (:valid? result))
         (str "expected ZREM-anchored fractured read to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
+
+(deftest forced-prefix-detects-stale-member-after-zrem
+  ;; If a visible concurrent anchor real-time follows a successful ZREM of a
+  ;; predecessor, the forced predecessor state is absent. Returning that
+  ;; predecessor at its old score is fractured even though omission would be OK.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m2" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd       :value ["m2" 1] :index 1}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 2}
+                 {:type :invoke :process 2 :f :zrem       :value "m2"     :index 3}
+                 {:type :ok     :process 2 :f :zrem
+                  :value ["m2" true] :index 4}
+                 {:type :invoke :process 3 :f :zadd       :value ["m1" 1] :index 5}
+                 {:type :ok     :process 3 :f :zadd       :value ["m1" 1] :index 6}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 1.0] ["m2" 1.0]] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected stale predecessor after forced ZREM, got: " result))
     (is (contains? kinds :fractured-read-prefix)
         (str "expected :fractured-read-prefix, got kinds=" kinds))))
 
@@ -1152,20 +1195,18 @@
 
 (deftest zrem-invoke-handles-nil-response
   ;; If car/wcar for ZREM returns nil (protocol edge,
-  ;; closed connection, etc.), `(long nil)` would throw NPE and the
-  ;; op would be logged as a generic failure via the general Exception
-  ;; handler. Guard with `(or removed 0)` so the op resolves cleanly
-  ;; as :ok [member false].
+  ;; closed connection, etc.), the command may have reached Redis. Treat the
+  ;; outcome as indeterminate instead of committing a false no-op ZREM.
   (let [client (workload/->ElastickvRedisZSetSafetyClient
                  {} {:pool {} :spec {:host "localhost" :port 6379
                                      :timeout-ms 100}})
         op     {:type :invoke :f :zrem :value "ghost" :process 0 :index 0}]
     (with-redefs [workload/zrem! (fn [& _] nil)]
       (let [result (client/invoke! client {} op)]
-        (is (= :ok (:type result))
-            (str "expected :ok on nil ZREM reply, got: " result))
-        (is (= ["ghost" false] (:value result))
-            (str "expected removed? false on nil reply, got: " result))))))
+        (is (= :info (:type result))
+            (str "expected :info on nil ZREM reply, got: " result))
+        (is (= :nil-response (:error result))
+            (str "expected nil-response marker, got: " result))))))
 
 (deftest zrem-invoke-handles-numeric-response
   ;; Sanity: ZREM's normal reply is an integer count.

@@ -3741,26 +3741,37 @@ func parseZScoreBound(raw string) (zScoreBound, error) {
 	return zScoreBound{kind: zBoundValue, score: score, inclusive: inclusive}, nil
 }
 
+func scoreSatisfiesMinBound(score float64, bound zScoreBound) bool {
+	switch bound.kind {
+	case zBoundValue:
+		if bound.inclusive {
+			return score >= bound.score
+		}
+		return score > bound.score
+	case zBoundPosInf:
+		return math.IsInf(score, +1)
+	default:
+		return true
+	}
+}
+
+func scoreSatisfiesMaxBound(score float64, bound zScoreBound) bool {
+	switch bound.kind {
+	case zBoundNegInf:
+		return math.IsInf(score, -1)
+	case zBoundValue:
+		if bound.inclusive {
+			return score <= bound.score
+		}
+		return score < bound.score
+	default:
+		return true
+	}
+}
+
 func scoreInRange(score float64, minBound zScoreBound, maxBound zScoreBound) bool {
-	if minBound.kind == zBoundValue {
-		if minBound.inclusive {
-			if score < minBound.score {
-				return false
-			}
-		} else if score <= minBound.score {
-			return false
-		}
-	}
-	if maxBound.kind == zBoundValue {
-		if maxBound.inclusive {
-			if score > maxBound.score {
-				return false
-			}
-		} else if score >= maxBound.score {
-			return false
-		}
-	}
-	return true
+	return scoreSatisfiesMinBound(score, minBound) &&
+		scoreSatisfiesMaxBound(score, maxBound)
 }
 
 func cloneSetMembers(in map[string]struct{}) map[string]struct{} {
