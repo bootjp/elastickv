@@ -852,6 +852,30 @@
     (is (contains? kinds :unstable-read-without-mutation)
         (str "expected :unstable-read-without-mutation, got kinds=" kinds))))
 
+(deftest range-reads-cannot-switch-overlapping-write-order
+  ;; Stability is not just a full-read property. Two non-overlapping bounded
+  ;; reads cannot pick different serializations of the same completed writes.
+  (let [history [{:type :invoke :process 0 :f :zadd         :value ["m1" 1] :index 0}
+                 {:type :invoke :process 1 :f :zadd         :value ["m1" 2] :index 1}
+                 {:type :ok     :process 0 :f :zadd         :value ["m1" 1] :index 2}
+                 {:type :ok     :process 1 :f :zadd         :value ["m1" 2] :index 3}
+                 {:type :invoke :process 2 :f :zrangebyscore
+                  :value [2.0 2.0] :index 4}
+                 {:type :ok     :process 2 :f :zrangebyscore
+                  :value {:bounds [2.0 2.0]
+                          :members [["m1" 2.0]]} :index 5}
+                 {:type :invoke :process 3 :f :zrangebyscore
+                  :value [1.0 1.0] :index 6}
+                 {:type :ok     :process 3 :f :zrangebyscore
+                  :value {:bounds [1.0 1.0]
+                          :members [["m1" 1.0]]} :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected range read order switch to be rejected, got: " result))
+    (is (contains? kinds :unstable-read-without-mutation)
+        (str "expected :unstable-read-without-mutation, got kinds=" kinds))))
+
 (deftest zrange-all-uses-one-prefix-across-members
   ;; Seeing m1's concurrent ZADD forces the read prefix past any successful
   ;; mutation that completed before that ZADD was invoked. Omitting m2 would
@@ -888,6 +912,26 @@
         (str "expected fractured range read to be rejected, got: " result))
     (is (contains? kinds :fractured-read-prefix-range)
         (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
+
+(deftest interchangeable-writers-anchor-common-predecessor
+  ;; The observed score can be produced by either of two overlapping writers,
+  ;; so neither writer is individually required. Since every possible writer
+  ;; real-time follows m2, observing m1 still forces m2 into the same prefix.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m2" 2] :index 0}
+                 {:type :invoke :process 1 :f :zrange-all                 :index 1}
+                 {:type :ok     :process 0 :f :zadd       :value ["m2" 2] :index 2}
+                 {:type :invoke :process 2 :f :zadd       :value ["m1" 1] :index 3}
+                 {:type :invoke :process 3 :f :zadd       :value ["m1" 1] :index 4}
+                 {:type :ok     :process 2 :f :zadd       :value ["m1" 1] :index 5}
+                 {:type :ok     :process 3 :f :zadd       :value ["m1" 1] :index 6}
+                 {:type :ok     :process 1 :f :zrange-all
+                  :value [["m1" 1.0]] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected interchangeable-writer prefix violation, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
 
 (deftest zrangebyscore-prefix-check-ignores-predecessor-outside-bounds
   ;; A visible concurrent write still anchors the read prefix, but a
@@ -926,6 +970,28 @@
     (is (contains? kinds :fractured-read-prefix-range)
         (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
 
+(deftest zrangebyscore-score-change-omission-anchors-prefix-check
+  ;; A range read can omit a member because a concurrent score change moved it
+  ;; out of bounds. Seeing that omission forces real-time predecessors of the
+  ;; score change into the same range prefix.
+  (let [history [{:type :invoke :process 0 :f :zadd         :value ["m1" 5] :index 0}
+                 {:type :ok     :process 0 :f :zadd         :value ["m1" 5] :index 1}
+                 {:type :invoke :process 1 :f :zrangebyscore
+                  :value [0.0 10.0] :index 2}
+                 {:type :invoke :process 2 :f :zadd         :value ["m2" 2] :index 3}
+                 {:type :ok     :process 2 :f :zadd         :value ["m2" 2] :index 4}
+                 {:type :invoke :process 3 :f :zadd         :value ["m1" 50] :index 5}
+                 {:type :ok     :process 3 :f :zadd         :value ["m1" 50] :index 6}
+                 {:type :ok     :process 1 :f :zrangebyscore
+                  :value {:bounds [0.0 10.0]
+                          :members []} :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected score-change omission prefix violation, got: " result))
+    (is (contains? kinds :fractured-read-prefix-range)
+        (str "expected :fractured-read-prefix-range, got kinds=" kinds))))
+
 (deftest zrem-omission-anchors-prefix-check
   ;; If m1's absence is only explainable by a concurrent ZREM, that visible
   ;; deletion still anchors the read prefix. A predecessor completed before
@@ -944,6 +1010,27 @@
         kinds   (set (map :kind (:first-errors result)))]
     (is (not (:valid? result))
         (str "expected ZREM-anchored fractured read to be rejected, got: " result))
+    (is (contains? kinds :fractured-read-prefix)
+        (str "expected :fractured-read-prefix, got kinds=" kinds))))
+
+(deftest pre-read-info-zrem-omission-anchors-prefix-check
+  ;; A response-lost ZREM that completed before the read can still be the
+  ;; visible reason m1 is absent. Its real-time predecessors must share the
+  ;; same read prefix even though the ZREM is no longer concurrent.
+  (let [history [{:type :invoke :process 0 :f :zadd       :value ["m1" 1] :index 0}
+                 {:type :ok     :process 0 :f :zadd       :value ["m1" 1] :index 1}
+                 {:type :invoke :process 1 :f :zadd       :value ["m2" 2] :index 2}
+                 {:type :ok     :process 1 :f :zadd       :value ["m2" 2] :index 3}
+                 {:type :invoke :process 2 :f :zrem       :value "m1"     :index 4}
+                 {:type :info   :process 2 :f :zrem
+                  :value "m1" :error "conn reset" :index 5}
+                 {:type :invoke :process 3 :f :zrange-all                 :index 6}
+                 {:type :ok     :process 3 :f :zrange-all
+                  :value [] :index 7}]
+        result  (run-checker history)
+        kinds   (set (map :kind (:first-errors result)))]
+    (is (not (:valid? result))
+        (str "expected pre-read info ZREM anchored violation, got: " result))
     (is (contains? kinds :fractured-read-prefix)
         (str "expected :fractured-read-prefix, got kinds=" kinds))))
 
