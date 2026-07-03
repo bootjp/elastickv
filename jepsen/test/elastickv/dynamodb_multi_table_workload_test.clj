@@ -24,6 +24,24 @@
         opened   (client/open! c test-map "n1")]
     (is (some? (:ddb opened)))))
 
+(deftest transaction-canceled-is-indeterminate
+  (let [c  (workload/->DynamoDBMultiTableClient {} ::ddb)
+        op {:type :invoke
+            :process 0
+            :f :txn
+            :value [[:append 1 7]
+                    [:append 2 8]]}]
+    (with-redefs [workload/dynamo-transact-get!   (fn [_ ks]
+                                                    (zipmap ks (repeat nil)))
+                  workload/dynamo-transact-write! (fn [& _]
+                                                    (throw
+                                                      (ex-info "DynamoDB TransactionCanceledException"
+                                                               {:type "TransactionCanceledException"})))]
+      (let [result (client/invoke! c {} op)]
+        (is (= :info (:type result)))
+        (is (= "TransactionCanceledException" (:error result)))
+        (is (= (:value op) (:value result)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Key routing — the load-bearing M5a invariant
 ;; ---------------------------------------------------------------------------
