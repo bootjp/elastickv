@@ -62,7 +62,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out (needed for diff)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # No git operations are pushed from this job — the
