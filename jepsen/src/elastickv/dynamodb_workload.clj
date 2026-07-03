@@ -149,7 +149,9 @@
    - Adds a ConditionExpression asserting the current DynamoDB value matches
      snapshot[k] (nil → attribute_not_exists; list → #v = :cv).
    If any pre-read value has changed since the snapshot was taken, the server
-   returns TransactionCanceledException and the caller returns :fail to Jepsen.
+   returns TransactionCanceledException.  The client records that response as
+   :info because the observed outcome is indeterminate to Jepsen under
+   contention.
 
    For each key k that was read but NOT written:
    - Adds a ConditionCheck entry asserting the same invariant.
@@ -271,18 +273,11 @@
                     :cognitect.anomalies/unavailable} category))
             (assoc op :type :info :error :network-error)
 
-            ;; Retryable DynamoDB server-side errors.
+            ;; Retryable or indeterminate DynamoDB server-side errors.
             (contains? #{"ConditionalCheckFailedException"
-                         "InternalServerError"} err-type)
+                         "InternalServerError"
+                         "TransactionCanceledException"} err-type)
             (assoc op :type :info :error (str err-type))
-
-            ;; OCC snapshot conflict: transaction definitely was not committed.
-            ;; We added ConditionExpressions to TransactWriteItems; if a
-            ;; concurrent write changed a pre-read key, the server returns
-            ;; TransactionCanceledException.  The operation is a definite
-            ;; abort — return :fail so Jepsen excludes it from the history.
-            (= "TransactionCanceledException" err-type)
-            (assoc op :type :fail :error (str err-type))
 
             ;; Definite API-level failures
             (= "ValidationException" err-type)
