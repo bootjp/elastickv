@@ -1767,6 +1767,127 @@ func mustRawNode(t *testing.T, storage *etcdraft.MemoryStorage, nodeID uint64) *
 	return rawNode
 }
 
+func rawNodeTestConfig() OpenConfig {
+	return OpenConfig{
+		NodeID:         1,
+		ElectionTick:   defaultElectionTick,
+		HeartbeatTick:  defaultHeartbeatTick,
+		MaxSizePerMsg:  defaultMaxSizePerMsg,
+		MaxInflightMsg: defaultMaxInflightMsg,
+	}
+}
+
+func committedTailStorage(t *testing.T, snapIndex, commit uint64) *etcdraft.MemoryStorage {
+	t.Helper()
+	return committedTailStorageWithEntries(t, snapIndex, commit, nil)
+}
+
+func committedTailStorageWithEntries(t *testing.T, snapIndex, commit uint64, overrides map[uint64]raftpb.Entry) *etcdraft.MemoryStorage {
+	t.Helper()
+	storage := etcdraft.NewMemoryStorage()
+	require.NoError(t, storage.ApplySnapshot(raftpb.Snapshot{
+		Metadata: raftpb.SnapshotMetadata{
+			ConfState: raftpb.ConfState{Voters: []uint64{1}},
+			Index:     snapIndex,
+			Term:      1,
+		},
+	}))
+	entries := make([]raftpb.Entry, 0, commit-snapIndex)
+	for index := snapIndex + 1; index <= commit; index++ {
+		entry := raftpb.Entry{
+			Index: index,
+			Term:  1,
+			Type:  raftpb.EntryNormal,
+			Data:  []byte("already-applied"),
+		}
+		if override, ok := overrides[index]; ok {
+			entry = override
+			entry.Index = index
+			if entry.Term == 0 {
+				entry.Term = 1
+			}
+		}
+		entries = append(entries, entry)
+	}
+	require.NoError(t, storage.Append(entries))
+	require.NoError(t, storage.SetHardState(raftpb.HardState{
+		Term:   1,
+		Commit: commit,
+	}))
+	return storage
+}
+
+func TestNewRawNodeSeedsAppliedFromColdStart(t *testing.T) {
+	storage := committedTailStorage(t, 100, 150)
+	rawApplied, err := rawNodeAppliedForOpen(storage, 150, rawNodeTestConfig())
+	require.NoError(t, err)
+	require.Equal(t, uint64(150), rawApplied)
+
+	rawNode, err := newRawNode(rawNodeTestConfig(), storage, rawApplied)
+	require.NoError(t, err)
+	require.False(t, rawNode.HasReady(),
+		"restarting from an already-applied committed tail must not redeliver it through Ready")
+}
+
+func TestNewRawNodeWithoutAppliedRedeliversCommittedTail(t *testing.T) {
+	storage := committedTailStorage(t, 100, 150)
+
+	rawNode, err := newRawNode(rawNodeTestConfig(), storage, 0)
+	require.NoError(t, err)
+	require.True(t, rawNode.HasReady())
+	ready := rawNode.Ready()
+	require.Len(t, ready.CommittedEntries, 50)
+	require.Equal(t, uint64(101), ready.CommittedEntries[0].Index)
+	require.Equal(t, uint64(150), ready.CommittedEntries[len(ready.CommittedEntries)-1].Index)
+}
+
+func TestRawNodeAppliedForOpenClipsToCommitted(t *testing.T) {
+	storage := committedTailStorage(t, 100, 150)
+
+	rawApplied, err := rawNodeAppliedForOpen(storage, 200, rawNodeTestConfig())
+	require.NoError(t, err)
+	require.Equal(t, uint64(150), rawApplied,
+		"etcd/raft Config.Applied cannot exceed the local committed index")
+}
+
+func TestRawNodeAppliedForOpenPreservesVolatileReplay(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		125: {
+			Type: raftpb.EntryNormal,
+			Data: encodeProposalEnvelope(1, []byte{0x02, 0xaa}),
+		},
+	})
+	cfg := rawNodeTestConfig()
+	cfg.StateMachine = &volatileTagFakeFSM{}
+
+	rawApplied, err := rawNodeAppliedForOpen(storage, 150, cfg)
+	require.NoError(t, err)
+	require.Equal(t, uint64(124), rawApplied,
+		"RawNode must still deliver volatile duplicate entries for in-memory replay")
+
+	rawNode, err := newRawNode(cfg, storage, rawApplied)
+	require.NoError(t, err)
+	require.True(t, rawNode.HasReady())
+	ready := rawNode.Ready()
+	require.NotEmpty(t, ready.CommittedEntries)
+	require.Equal(t, uint64(125), ready.CommittedEntries[0].Index)
+}
+
+func TestRawNodeAppliedForOpenPreservesConfChangeReplay(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: raftpb.EntryConfChange,
+			Data: []byte("conf"),
+		},
+	})
+	cfg := rawNodeTestConfig()
+
+	rawApplied, err := rawNodeAppliedForOpen(storage, 150, cfg)
+	require.NoError(t, err)
+	require.Equal(t, uint64(129), rawApplied,
+		"RawNode must deliver committed config changes so ApplyConfChange rebuilds membership")
+}
+
 // TestErrNotLeaderMatchesRaftEngineSentinel pins the invariant that the
 // etcd engine's internal leadership-loss errors are marked against the
 // shared raftengine sentinels. The lease-read fast path in package kv

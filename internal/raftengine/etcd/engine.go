@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -505,7 +506,14 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		return nil, err
 	}
 
-	rawNode, err := newRawNode(prepared.cfg, prepared.disk.Storage)
+	initialApplied := coldStartApplied(prepared.disk)
+	rawNodeApplied, err := rawNodeAppliedForOpen(prepared.disk.Storage, initialApplied, prepared.cfg)
+	if err != nil {
+		_ = closePersist(prepared.disk.Persist)
+		return nil, err
+	}
+
+	rawNode, err := newRawNode(prepared.cfg, prepared.disk.Storage, rawNodeApplied)
 	if err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
@@ -557,7 +565,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		config:           configurationFromConfState(peerMap, prepared.disk.LocalSnap.Metadata.ConfState),
 		voterCount:       len(prepared.disk.LocalSnap.Metadata.ConfState.Voters),
 		isLearnerNode:    learnerSetFromConfState(prepared.disk.LocalSnap.Metadata.ConfState),
-		applied:          coldStartApplied(prepared.disk),
+		applied:          initialApplied,
 		dispatchCtx:      dispatchCtx,
 		dispatchCancel:   dispatchCancel,
 		pendingProposals: map[uint64]proposalRequest{},
@@ -572,7 +580,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		maxWALFiles:   maxWALFilesFromEnv(),
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
-	engine.appliedIndex.Store(coldStartApplied(prepared.disk))
+	engine.appliedIndex.Store(initialApplied)
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -689,12 +697,95 @@ func (e *Engine) initSnapshotWorker() {
 	e.startSnapshotWorker()
 }
 
-func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage) (*etcdraft.RawNode, error) {
+func rawNodeAppliedForOpen(storage *etcdraft.MemoryStorage, applied uint64, cfg OpenConfig) (uint64, error) {
+	if applied == 0 {
+		return 0, nil
+	}
+	baseApplied, applied, err := rawNodeAppliedBounds(storage, applied)
+	if err != nil {
+		return 0, err
+	}
+	if applied <= baseApplied {
+		return applied, nil
+	}
+	return trimRawNodeAppliedForReplay(storage, baseApplied, applied, cfg), nil
+}
+
+func rawNodeAppliedBounds(storage *etcdraft.MemoryStorage, applied uint64) (uint64, uint64, error) {
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	baseApplied := uint64(0)
+	if firstIndex > 0 {
+		baseApplied = firstIndex - 1
+	}
+	committed := baseApplied
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		return 0, 0, errors.WithStack(err)
+	}
+	if !etcdraft.IsEmptyHardState(hardState) && hardState.Commit > committed {
+		committed = hardState.Commit
+	}
+	if applied > committed {
+		applied = committed
+	}
+	return baseApplied, applied, nil
+}
+
+func trimRawNodeAppliedForReplay(storage *etcdraft.MemoryStorage, baseApplied, applied uint64, cfg OpenConfig) uint64 {
+	entries, entriesErr := storage.Entries(baseApplied+1, applied+1, math.MaxUint64)
+	if entriesErr != nil {
+		return applied
+	}
+	for _, entry := range entries {
+		if coldStartEntryRequiresReplay(entry, cfg) {
+			return entry.Index - 1
+		}
+	}
+	return applied
+}
+
+func coldStartEntryRequiresReplay(entry raftpb.Entry, cfg OpenConfig) bool {
+	switch entry.Type {
+	case raftpb.EntryConfChange, raftpb.EntryConfChangeV2:
+		return true
+	case raftpb.EntryNormal:
+	default:
+		return false
+	}
+	if len(entry.Data) == 0 {
+		return false
+	}
+	_, payload, ok := decodeProposalEnvelope(entry.Data)
+	if !ok {
+		return false
+	}
+	if entry.Index > orInertCutover(cfg.RaftCutoverIndex)() {
+		if cfg.RaftCipher == nil {
+			return true
+		}
+		plain, err := unwrapRaftPayload(cfg.RaftCipher, payload)
+		if err != nil {
+			return true
+		}
+		payload = plain
+	}
+	classifier, ok := cfg.StateMachine.(raftengine.VolatileEntryClassifier)
+	if !ok {
+		return false
+	}
+	return classifier.IsVolatileOnlyPayload(payload)
+}
+
+func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64) (*etcdraft.RawNode, error) {
 	rawNode, err := etcdraft.NewRawNode(&etcdraft.Config{
 		ID:                        cfg.NodeID,
 		ElectionTick:              cfg.ElectionTick,
 		HeartbeatTick:             cfg.HeartbeatTick,
 		Storage:                   storage,
+		Applied:                   applied,
 		MaxSizePerMsg:             cfg.MaxSizePerMsg,
 		MaxCommittedSizePerReady:  cfg.MaxSizePerMsg,
 		MaxInflightMsgs:           cfg.MaxInflightMsg,
