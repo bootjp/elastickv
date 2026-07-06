@@ -2,10 +2,11 @@
 
 | Field | Value |
 |---|---|
-| Status | partial |
+| Status | implemented |
 | Date | 2026-05-25 |
+| Implemented | 2026-07-07 status audit; Stage 7 gate is now shipped |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 nonce, §5.1 sidecar, §7.1 rollout), [`2026_05_18_implemented_6d_enable_storage_envelope.md`](2026_05_18_implemented_6d_enable_storage_envelope.md) (6D-6c milestone breakdown) |
-| Pulls forward | The deterministic-nonce core of Stage 7 (§4.1 `write_count` / `local_epoch` lifecycle). The full Raft-replicated writer-registry **registration-before-first-write** gate stays in Stage 7. |
+| Pulls forward | The deterministic-nonce core of Stage 7 (§4.1 `write_count` / `local_epoch` lifecycle). The full Raft-replicated writer-registry **registration-before-first-write** gate is now shipped by the Stage 7 docs. |
 
 ## Lifecycle status
 
@@ -15,15 +16,13 @@ sidecar, the `local_epoch` bump-and-fsync lifecycle, the production
 `StateCache` wiring. A single-node cluster can now Bootstrap →
 EnableStorageEnvelope → Put (encrypted at rest) → read back.
 
-**Remaining (Stage 7, §1 "out of scope"):** the Raft-replicated
+**Stage 7 follow-up now shipped:** the Raft-replicated
 registration-before-first-write coordinator gate (the §5.2
-process-start and §4.1 ConfChange-time paths) that makes multi-node
-membership churn nonce-safe beyond the existing startup guards
-(`ErrNodeIDCollision`, `ErrLocalEpochRollback`). Until that lands the
-write path is `partial`: production-correct for single-node and
-stable-membership clusters, with the documented cross-node-churn gap
-covered only by the startup guards. The doc flips to
-`*_implemented_*` when the Stage 7 gate ships.
+process-start and §4.1 ConfChange-time paths) now makes multi-node
+membership churn nonce-safe beyond the startup guards
+(`ErrNodeIDCollision`, `ErrLocalEpochRollback`). This closes the
+partial-status caveat that previously kept this doc from being marked
+implemented.
 
 ## 0. Why this doc exists
 
@@ -91,7 +90,7 @@ the scope boundary against the remaining Stage 7 work.
   `WithStorageEnvelopeGate` (reading `cache.ActiveStorageKeyID` /
   `cache.StorageEnvelopeActive`) into every shard's `PebbleStore`.
 
-### Out of scope (stays in Stage 7)
+### Out of scope for 6D-6c-2 (implemented later by Stage 7)
 
 - **Registration-before-first-write coordinator gate** (§5.2
   process-start path, §4.1 ConfChange-time path). A node bumping its
@@ -103,7 +102,10 @@ the scope boundary against the remaining Stage 7 work.
   existing startup membership pre-check (`ErrNodeIDCollision`) and the
   registry-apply-time collision check shipped in 6A; the
   propose-before-write *gate* (block the coordinator's first encrypted
-  write until registration commits) is deferred.
+  write until registration commits) is implemented by
+  [`2026_05_26_implemented_7a_process_start_registration.md`](2026_05_26_implemented_7a_process_start_registration.md),
+  [`2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md`](2026_05_26_implemented_7a2_storage_layer_registration_enforcement.md),
+  and [`2026_05_29_implemented_7c_confchange_time_registration.md`](2026_05_29_implemented_7c_confchange_time_registration.md).
 - KMS providers, compression, DEK retirement/rewrite (Stages 9).
 - The capability fan-out closure + multi-node e2e — that is 6D-6c-3.
 

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | implemented — all milestones shipped: 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand), 6D-6c-1 (Applier in-memory accessors), 6D-6c-2 (main.go cipher + gate wiring), 6D-6c-3a (capability fan-out closure wiring), 6D-6c-3b (end-to-end Bootstrap→cutover→Put→read-back test). Note: the multi-node-churn registration-before-first-write nonce gate is tracked separately as a Stage 7 deferral in [`2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md) — not a 6D milestone. |
+| Status | implemented — all milestones shipped: 6D-1 (doc), 6D-2 (startup guards), 6D-3 (capability fan-out helper), 6D-4 (cutover wire + apply dispatch), 6D-5 (storage-layer toggle), 6D-6a (EnableStorageEnvelope server method), 6D-6b (CLI subcommand), 6D-6c-1 (Applier in-memory accessors), 6D-6c-2 (main.go cipher + gate wiring), 6D-6c-3a (capability fan-out closure wiring), 6D-6c-3b (end-to-end Bootstrap→cutover→Put→read-back test). Note: the multi-node-churn registration-before-first-write nonce gate was tracked separately as a Stage 7 deferral in [`2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md) and is now shipped by Stage 7 — not a 6D milestone. |
 | Date | 2026-05-18 |
 | Parent design | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) |
 | Blockers (now satisfied) | 6B (KEK plumbing), 6C-1 / 6C-2 (startup guards), 6C-2d (`ErrSidecarBehindRaftLog` wiring) |
@@ -105,7 +105,7 @@
   each shard's PebbleStore. Pulled forward the deterministic-nonce
   core of Stage 7 (keystore hydration, local_epoch bump,
   DeterministicNonceFactory) — see
-  [`2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_partial_6d6c2_production_storage_envelope_wiring.md).
+  [`2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md`](2026_05_25_implemented_6d6c2_production_storage_envelope_wiring.md).
 - **6D-6c-3a** — main.go CapabilityFanout closure bound to the live
   Raft membership view (`engine.Configuration` route snapshot across
   all groups + a `DialFunc` over a dedicated `kv.GRPCConnCache`),
