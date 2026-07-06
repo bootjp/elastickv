@@ -2,10 +2,19 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented |
 | Date | 2026-05-29 |
-| Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 RotateDEK apply), [`2026_05_26_proposed_7a_process_start_registration.md`](2026_05_26_proposed_7a_process_start_registration.md) (§4 forward-looking 7c sketch), [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md), [`2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md`](2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md) |
+| Implemented | 2026-07-07 status audit; code landed before this doc promotion |
+| Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 RotateDEK apply), [`2026_05_26_implemented_7a_process_start_registration.md`](2026_05_26_implemented_7a_process_start_registration.md) (§4 forward-looking 7c sketch), [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md), [`2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md`](2026_05_28_implemented_7b_prime_runtime_reregistration_rotation.md) |
 | Builds on | 7a (process-start propose path), 7a-2 (storage-layer `Registered()` gate), 7b/7b' (runtime watcher) |
+
+## Implementation audit
+
+Implemented by `internal/raftadmin.MembershipChangeInterceptor`,
+`main_encryption_confchange.go`, and `main.go` wiring into raft-admin
+servers.
+Tests live in `internal/raftadmin/server_test.go` and
+`main_encryption_confchange_test.go`.
 
 ## 0. Why this slice exists
 

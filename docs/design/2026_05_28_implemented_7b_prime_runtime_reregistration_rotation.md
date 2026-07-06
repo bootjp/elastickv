@@ -2,10 +2,19 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented |
 | Date | 2026-05-28 |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.1 writer registry, §5.2 RotateDEK apply), [`2026_05_28_implemented_7b_runtime_reregistration.md`](2026_05_28_implemented_7b_runtime_reregistration.md) (cutover case + §6 deferred-rotation analysis) |
 | Builds on | 7a (process-start propose path), 7a-2 (storage-layer `Registered()` gate), 7b (runtime watcher for the cutover case) |
+| Implemented | 2026-07-07 status audit; code landed before this doc promotion |
+
+## Implementation audit
+
+Implemented by `internal/encryption.Applier.WithLocalEpoch`,
+`writeRotationSidecar`, `main_encryption_registration.go`'s runtime
+registration watcher, and the per-DEK `StateCache.Registered` gate.
+Tests cover rotation-local-epoch sidecar writes and runtime rotation
+registration scope/verify paths.
 
 ## 0. Why this slice exists
 

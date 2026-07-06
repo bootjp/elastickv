@@ -25,7 +25,7 @@ import (
 //     no §4.1 case-4 halt apply on a durable conf-change entry
 //     (guarantee 2: collision-safe membership change).
 //
-// See docs/design/2026_05_29_proposed_7c_confchange_time_registration.md.
+// See docs/design/2026_05_29_implemented_7c_confchange_time_registration.md.
 type encryptionPreRegister struct {
 	coordinate   *kv.ShardedCoordinator
 	defaultGroup *kv.ShardGroup
