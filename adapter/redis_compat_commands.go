@@ -15,8 +15,8 @@ const (
 	// arrives. The signal path covers all in-process XADD / ZADD /
 	// ZINCRBY on the same node; the fallback covers paths that bypass
 	// Signal (Lua flush, follower-applied entries — both addressed by
-	// the FSM ApplyObserver follow-up tracked in
-	// docs/design/2026_04_26_proposed_fsm_apply_observer.md).
+	// the FSM ApplyObserver tracked in
+	// docs/design/2026_04_26_implemented_fsm_apply_observer.md).
 	// 100 ms keeps the fallback CPU at roughly 1/10th of the prior
 	// busy-poll, while bounding stale-poll latency to a value clients
 	// already tolerate from network round-trips.

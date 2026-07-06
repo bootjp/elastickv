@@ -36,6 +36,7 @@ func buildShardGroupsWithEncryptionWiring(
 	sidecarPath string,
 	encryptionEnabled bool,
 	routeEngine *distribution.Engine,
+	applyObserver kv.ApplyObserver,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
 	// Stage 6E-2c: refuse startup BEFORE buildEncryptionWriteWiring
 	// runs (which calls prepareStorageNonceEpoch → BumpLocalEpoch
@@ -72,7 +73,7 @@ func buildShardGroupsWithEncryptionWiring(
 		return nil, nil, encryptionWriteWiring{}, err
 	}
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
-		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)
+		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine, applyObserver)
 	// Return the wiring (cache + bumped epoch) so run() can drive the
 	// Stage 7a process-start registration after the shard stores open.
 	return runtimes, shardGroups, encWiring, err
