@@ -227,6 +227,11 @@ func newSQSAPIError(status int, errorType string, message string) error {
 }
 
 func writeSQSErrorFromErr(w http.ResponseWriter, err error) {
+	var throttled *sqsThrottlingError
+	if errors.As(err, &throttled) {
+		writeSQSThrottlingError(w, throttled.queue, throttled.action, throttled.retryAfter)
+		return
+	}
 	var apiErr *sqsAPIError
 	if errors.As(err, &apiErr) {
 		writeSQSError(w, apiErr.status, apiErr.errorType, apiErr.message)

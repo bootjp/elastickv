@@ -387,6 +387,202 @@ func TestSQSServer_QueryProtocol_ControlPlaneRoundTrip(t *testing.T) {
 	assertJSONQueueDeleted(t, node, "query-control")
 }
 
+func TestSQSServer_QueryProtocol_MessageLifecycleRoundTrip(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	queueURL := queryCreateQueueURL(t, node, "query-message")
+	_, sendBody := queryOK(t, node, "SendMessage", url.Values{
+		"QueueUrl":                             []string{queueURL},
+		"MessageBody":                          []string{"hello-query"},
+		"MessageAttribute.1.Name":              []string{"City"},
+		"MessageAttribute.1.Value.DataType":    []string{"String"},
+		"MessageAttribute.1.Value.StringValue": []string{"Tokyo"},
+	})
+	var sendResp struct {
+		Result struct {
+			MessageId              string `xml:"MessageId"`
+			MD5OfMessageBody       string `xml:"MD5OfMessageBody"`
+			MD5OfMessageAttributes string `xml:"MD5OfMessageAttributes"`
+		} `xml:"SendMessageResult"`
+	}
+	if err := xml.Unmarshal(bytes.TrimSpace(sendBody), &sendResp); err != nil {
+		t.Fatalf("decode send: %v\nbody=%s", err, sendBody)
+	}
+	if sendResp.Result.MessageId == "" || sendResp.Result.MD5OfMessageBody == "" || sendResp.Result.MD5OfMessageAttributes == "" {
+		t.Fatalf("incomplete SendMessage result: %+v body=%s", sendResp.Result, sendBody)
+	}
+
+	_, recvBody := queryOK(t, node, "ReceiveMessage", url.Values{
+		"QueueUrl":               []string{queueURL},
+		"MaxNumberOfMessages":    []string{"1"},
+		"VisibilityTimeout":      []string{"60"},
+		"MessageAttributeName.1": []string{"All"},
+	})
+	recvResp := decodeQueryReceiveResponse(t, recvBody)
+	if len(recvResp.Result.Messages) != 1 {
+		t.Fatalf("ReceiveMessage returned %d messages, want 1; body=%s", len(recvResp.Result.Messages), recvBody)
+	}
+	msg := recvResp.Result.Messages[0]
+	if msg.MessageId != sendResp.Result.MessageId || msg.Body != "hello-query" {
+		t.Fatalf("received message mismatch: %+v send=%+v", msg, sendResp.Result)
+	}
+	if msg.MessageAttributes["City"].Value.StringValue != "Tokyo" {
+		t.Fatalf("message attributes = %+v, want City=Tokyo; body=%s", msg.MessageAttributes, recvBody)
+	}
+
+	queryOK(t, node, "ChangeMessageVisibility", url.Values{
+		"QueueUrl":          []string{queueURL},
+		"ReceiptHandle":     []string{msg.ReceiptHandle},
+		"VisibilityTimeout": []string{"120"},
+	})
+	queryOK(t, node, "DeleteMessage", url.Values{
+		"QueueUrl":      []string{queueURL},
+		"ReceiptHandle": []string{msg.ReceiptHandle},
+	})
+	_, emptyBody := queryOK(t, node, "ReceiveMessage", url.Values{
+		"QueueUrl":            []string{queueURL},
+		"MaxNumberOfMessages": []string{"1"},
+		"WaitTimeSeconds":     []string{"0"},
+	})
+	emptyResp := decodeQueryReceiveResponse(t, emptyBody)
+	if len(emptyResp.Result.Messages) != 0 {
+		t.Fatalf("message should be deleted; got %d messages body=%s", len(emptyResp.Result.Messages), emptyBody)
+	}
+}
+
+func TestSQSServer_QueryProtocol_BatchRoundTrip(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	queueURL := queryCreateQueueURL(t, node, "query-batch")
+	_, sendBody := queryOK(t, node, "SendMessageBatch", url.Values{
+		"QueueUrl":                                   []string{queueURL},
+		"SendMessageBatchRequestEntry.1.Id":          []string{"a"},
+		"SendMessageBatchRequestEntry.1.MessageBody": []string{"alpha"},
+		"SendMessageBatchRequestEntry.2.Id":          []string{"b"},
+		"SendMessageBatchRequestEntry.2.MessageBody": []string{"beta"},
+	})
+	var sendResp struct {
+		Result struct {
+			Successful []struct {
+				Id        string `xml:"Id"`
+				MessageId string `xml:"MessageId"`
+			} `xml:"SendMessageBatchResultEntry"`
+			Failed []struct {
+				Id string `xml:"Id"`
+			} `xml:"BatchResultErrorEntry"`
+		} `xml:"SendMessageBatchResult"`
+	}
+	if err := xml.Unmarshal(bytes.TrimSpace(sendBody), &sendResp); err != nil {
+		t.Fatalf("decode batch send: %v\nbody=%s", err, sendBody)
+	}
+	if len(sendResp.Result.Successful) != 2 || len(sendResp.Result.Failed) != 0 {
+		t.Fatalf("SendMessageBatch result = %+v body=%s", sendResp.Result, sendBody)
+	}
+
+	_, recvBody := queryOK(t, node, "ReceiveMessage", url.Values{
+		"QueueUrl":            []string{queueURL},
+		"MaxNumberOfMessages": []string{"2"},
+		"VisibilityTimeout":   []string{"60"},
+	})
+	recvResp := decodeQueryReceiveResponse(t, recvBody)
+	if len(recvResp.Result.Messages) != 2 {
+		t.Fatalf("ReceiveMessage returned %d messages, want 2; body=%s", len(recvResp.Result.Messages), recvBody)
+	}
+	changeForm := url.Values{"QueueUrl": []string{queueURL}}
+	deleteForm := url.Values{"QueueUrl": []string{queueURL}}
+	for i, msg := range recvResp.Result.Messages {
+		idx := strconv.Itoa(i + 1)
+		changePrefix := "ChangeMessageVisibilityBatchRequestEntry." + idx
+		changeForm.Set(changePrefix+".Id", "c"+idx)
+		changeForm.Set(changePrefix+".ReceiptHandle", msg.ReceiptHandle)
+		changeForm.Set(changePrefix+".VisibilityTimeout", "90")
+		deletePrefix := "DeleteMessageBatchRequestEntry." + idx
+		deleteForm.Set(deletePrefix+".Id", "d"+idx)
+		deleteForm.Set(deletePrefix+".ReceiptHandle", msg.ReceiptHandle)
+	}
+	queryOK(t, node, "ChangeMessageVisibilityBatch", changeForm)
+	_, deleteBody := queryOK(t, node, "DeleteMessageBatch", deleteForm)
+	var deleteResp struct {
+		Result struct {
+			Successful []struct {
+				Id string `xml:"Id"`
+			} `xml:"DeleteMessageBatchResultEntry"`
+			Failed []struct {
+				Id string `xml:"Id"`
+			} `xml:"BatchResultErrorEntry"`
+		} `xml:"DeleteMessageBatchResult"`
+	}
+	if err := xml.Unmarshal(bytes.TrimSpace(deleteBody), &deleteResp); err != nil {
+		t.Fatalf("decode batch delete: %v\nbody=%s", err, deleteBody)
+	}
+	if len(deleteResp.Result.Successful) != 2 || len(deleteResp.Result.Failed) != 0 {
+		t.Fatalf("DeleteMessageBatch result = %+v body=%s", deleteResp.Result, deleteBody)
+	}
+}
+
+type queryReceiveTestResponse struct {
+	Result struct {
+		Messages []struct {
+			MessageId     string `xml:"MessageId"`
+			ReceiptHandle string `xml:"ReceiptHandle"`
+			Body          string `xml:"Body"`
+			Attributes    []struct {
+				Name  string `xml:"Name"`
+				Value string `xml:"Value"`
+			} `xml:"Attribute"`
+			MessageAttributes map[string]struct {
+				Value struct {
+					DataType    string `xml:"DataType"`
+					StringValue string `xml:"StringValue"`
+					BinaryValue string `xml:"BinaryValue"`
+				} `xml:"Value"`
+			}
+			RawMessageAttributes []struct {
+				Name  string `xml:"Name"`
+				Value struct {
+					DataType    string `xml:"DataType"`
+					StringValue string `xml:"StringValue"`
+					BinaryValue string `xml:"BinaryValue"`
+				} `xml:"Value"`
+			} `xml:"MessageAttribute"`
+		} `xml:"Message"`
+	} `xml:"ReceiveMessageResult"`
+}
+
+func decodeQueryReceiveResponse(t *testing.T, body []byte) queryReceiveTestResponse {
+	t.Helper()
+	var resp queryReceiveTestResponse
+	if err := xml.Unmarshal(bytes.TrimSpace(body), &resp); err != nil {
+		t.Fatalf("decode receive: %v\nbody=%s", err, body)
+	}
+	for i := range resp.Result.Messages {
+		attrs := make(map[string]struct {
+			Value struct {
+				DataType    string `xml:"DataType"`
+				StringValue string `xml:"StringValue"`
+				BinaryValue string `xml:"BinaryValue"`
+			} `xml:"Value"`
+		}, len(resp.Result.Messages[i].RawMessageAttributes))
+		for _, attr := range resp.Result.Messages[i].RawMessageAttributes {
+			attrs[attr.Name] = struct {
+				Value struct {
+					DataType    string `xml:"DataType"`
+					StringValue string `xml:"StringValue"`
+					BinaryValue string `xml:"BinaryValue"`
+				} `xml:"Value"`
+			}{Value: attr.Value}
+		}
+		resp.Result.Messages[i].MessageAttributes = attrs
+	}
+	return resp
+}
+
 func queryCreateQueueURL(t *testing.T, node Node, name string) string {
 	t.Helper()
 	_, body := queryOK(t, node, "CreateQueue", url.Values{"QueueName": []string{name}})

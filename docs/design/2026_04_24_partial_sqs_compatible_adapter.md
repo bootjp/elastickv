@@ -1,9 +1,9 @@
 # SQS-Compatible Adapter Design for Elastickv
 
 Status: Partial — core JSON SQS APIs, FIFO/batch/DLQ/tag APIs, admin UI,
-per-queue throttling, HT-FIFO partitioning, and query-protocol control-plane
-verbs have shipped. Query-protocol message lifecycle/batch XML, split-queue
-FIFO completion, and broader scaling roadmap items remain open.
+per-queue throttling, HT-FIFO partitioning, and query-protocol XML coverage
+for the supported public verbs have shipped. Split-queue FIFO completion and
+broader scaling roadmap items remain open.
 Author: bootjp
 Date: 2026-04-24
 
@@ -688,7 +688,7 @@ Structured logs include `route`, `queue`, `action`, `remote_ip`, `token_hash_pre
 
 ### Phase 3
 
-1. Query-protocol XML support for older SDKs. Control-plane verbs are wired; message lifecycle and batch XML remain TODO.
+1. Query-protocol XML support for older SDKs is wired for the supported public verbs; see [`2026_04_26_implemented_sqs_query_protocol.md`](2026_04_26_implemented_sqs_query_protocol.md).
 2. `ApproximateNumberOfMessagesDelayed` / `NotVisible` accuracy.
 3. Per-queue throttling and fairness across tenants.
 4. Split-queue FIFO for very hot queues.
