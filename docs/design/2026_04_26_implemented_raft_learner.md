@@ -1,12 +1,12 @@
 # Raft Learner support
 
-> **Status: Proposed**
+> **Status: Implemented**
 > Author: bootjp
 > Date: 2026-04-26
 >
 > Builds on the etcd/raft migration (`2026_04_05_implemented_etcd_raft_migration.md`).
 > Phase 3 of that doc deliberately deferred learner / non-voter membership;
-> this proposal closes that gap. It is independent of — but compatible with —
+> this implementation closes that gap. It is independent of — but compatible with —
 > the future follower-served-read effort, which would consume learners as a
 > read replica primitive.
 
@@ -864,10 +864,10 @@ single-process 3-node demo cluster, attaches a learner via
 - Decision gate for follower-served reads: write a separate proposal,
   do not extend this one.
 
-After Milestone 3, rename
-`docs/design/2026_04_26_proposed_raft_learner.md` →
-`docs/design/2026_04_26_implemented_raft_learner.md` (or
-`*_partial_*` if Milestone 3 slips behind Milestone 2 shipping).
+Milestones 1–3 have shipped. The codebase includes the engine API,
+etcd backend learner handling, v2 peers-file suffrage persistence, admin
+RPC/CLI surface, join-as-learner alarm, monitoring suffrage labels, and the
+operator runbook (`docs/raft_learner_operations.md`).
 
 ## 7. Risks
 

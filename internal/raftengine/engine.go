@@ -234,7 +234,7 @@ type Admin interface {
 	// a fresh node so the cluster's effective fault tolerance is not
 	// reduced during catch-up. Promote with PromoteLearner once the
 	// learner has caught up. See
-	// docs/design/2026_04_26_proposed_raft_learner.md.
+	// docs/design/2026_04_26_implemented_raft_learner.md.
 	AddLearner(ctx context.Context, id string, address string, prevIndex uint64) (uint64, error)
 	// PromoteLearner promotes an existing learner to voter. The
 	// minAppliedIndex precondition is enforced against the leader's

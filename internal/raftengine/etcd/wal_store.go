@@ -782,7 +782,7 @@ func validateConfState(conf raftpb.ConfState, peers []Peer) error {
 	}
 	// Joint consensus markers are still rejected: learner add/promote
 	// uses the simple V1 single-step ConfChange path which never sets
-	// these. See docs/design/2026_04_26_proposed_raft_learner.md §4.2.
+	// these. See docs/design/2026_04_26_implemented_raft_learner.md §4.2.
 	if len(conf.VotersOutgoing) > 0 || len(conf.LearnersNext) > 0 || conf.AutoLeave {
 		return errors.Wrap(errClusterMismatch, "joint consensus state is not supported")
 	}
@@ -814,7 +814,7 @@ func validateConfStateVoters(conf raftpb.ConfState, expectedVoters []uint64) err
 // no prior writer-side ordering invariant for learners, so we do not
 // pin one in the reader. A set comparison rejects both
 // same-count-member-divergence and conf-learner-not-in-peers cases —
-// see docs/design/2026_04_26_proposed_raft_learner.md §4.2 edit 3.
+// see docs/design/2026_04_26_implemented_raft_learner.md §4.2 edit 3.
 func validateConfStateLearners(conf raftpb.ConfState, expected map[uint64]struct{}) error {
 	if len(conf.Learners) != len(expected) {
 		return errors.Wrapf(errClusterMismatch, "expected %d learners got %d", len(expected), len(conf.Learners))
