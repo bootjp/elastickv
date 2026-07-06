@@ -2,11 +2,20 @@
 
 | Field | Value |
 |---|---|
-| Status | proposed |
+| Status | implemented |
 | Date | 2026-05-29 |
+| Implemented | 2026-07-07 status audit; code landed before this doc promotion |
 | Parent designs | [`2026_04_29_partial_data_at_rest_encryption.md`](2026_04_29_partial_data_at_rest_encryption.md) (§4.4 snapshot envelope, §7.1 Phase-2 cutover) |
 | Builds on | Stage 5 (sidecar `raft_envelope_cutover_index` field), forthcoming Stage 6E (`enable-raft-envelope` admin RPC populates the index) |
-| Sibling slice | Stage 8b — WAL coverage (no §4.x yet; see §1 Out-of-Scope). Deferred to a separate design and PR. |
+| Sibling slice | Stage 8b — WAL coverage closure; implemented as a no-code analysis in [`2026_06_01_implemented_8b_wal_coverage_closure.md`](2026_06_01_implemented_8b_wal_coverage_closure.md). |
+
+## Implementation audit
+
+The implementation is present in `kv/snapshot.go`, `kv/fsm.go`,
+`kv/fsm_applied_index_iface_check.go`, and the raft snapshot skip
+path in `internal/raftengine/etcd/wal_store.go`.
+The test coverage called out in §5 is present in `kv/snapshot_test.go`
+and `internal/raftengine/etcd/wal_store_skip_gate_test.go`.
 
 ## 0. Why this slice exists
 
@@ -68,13 +77,13 @@ format spec; this slice is the implementation cut.
 
 ### Out of scope
 
-- **WAL / Raft log encryption on disk.** A sibling Stage 8b design
-  will own this. (The parent doc's Stage 8 table row labels both
+- **WAL / Raft log encryption on disk.** The sibling Stage 8b closure
+  owns this analysis. (The parent doc's Stage 8 table row originally labeled both
   slices as "Snapshot header v2 + WAL coverage (§4.4, §4.5)", but
   §4.5 in the parent is actually "Distribution catalog and HLC
-  ceiling entries"; WAL-file encryption is a separate concern not
-  yet detailed in any §4.x — 8b will introduce a §4.x section if
-  needed.) Not blocked on 8a; conceptually independent.
+  ceiling entries"; WAL-file encryption is a separate concern that
+  8b formally closes as a no-code decision.) Not blocked on 8a;
+  conceptually independent.
 - **Snapshot stream encryption**. Per parent §4.4, the FSM snapshot
   stream IS ciphertext by construction once §4.1 envelopes are in
   use; the header is the only thing that needs wrapping.
@@ -397,9 +406,9 @@ to carry the cutover through a snapshot restore.
 
 ## 7. After 8a
 
-- **Stage 8b** — WAL coverage (Raft log encryption on disk; no §4.x
-  in the parent yet — see §1 Out-of-Scope). A separate design and
-  PR; not blocked on 8a.
+- **Stage 8b** — WAL coverage closure (Raft log encryption on disk;
+  see §1 Out-of-Scope). Implemented as a no-code closure analysis in
+  [`2026_06_01_implemented_8b_wal_coverage_closure.md`](2026_06_01_implemented_8b_wal_coverage_closure.md).
 - **Stage 6E** — `enable-raft-envelope` admin RPC + cutover apply.
   Depends on 8a's reader being deployed first so a node restoring
   from a snapshot taken after cutover can resume correctly.
