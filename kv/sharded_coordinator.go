@@ -1951,32 +1951,31 @@ func primaryKeyAndKeyMutations(muts []*pb.Mutation) ([]byte, []*pb.Mutation) {
 	return primary, keys
 }
 
-// RunHLCLeaseRenewal periodically proposes a new physical ceiling to the
-// default shard group's Raft cluster while this node is the leader of that
-// group. This mirrors the single-shard Coordinate.RunHLCLeaseRenewal behaviour,
-// ensuring the shared HLC ceiling is maintained in multi-shard deployments.
+// RunHLCLeaseRenewal periodically proposes a new physical ceiling to every
+// shard group's Raft cluster while this node is that group's leader. This
+// mirrors the single-shard Coordinate.RunHLCLeaseRenewal behaviour while
+// avoiding the multi-shard gap where a non-default group leader could issue
+// timestamps without renewing the shared HLC's Raft-backed ceiling.
 //
 // RunHLCLeaseRenewal blocks until ctx is cancelled; call it in a goroutine.
 func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
-	group, ok := c.groups[c.defaultGroup]
-	if !ok || group.Engine == nil {
-		c.logger().WarnContext(ctx, "hlc lease renewal: default shard group not found or has no engine",
-			slog.Uint64("default_group", c.defaultGroup),
-		)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(c.groups) == 0 {
+		c.logger().WarnContext(ctx, "hlc lease renewal: no shard groups configured")
 		return
 	}
 	// Use a Timer rather than a Ticker so the next renewal is scheduled
-	// relative to the completion of the previous one. This prevents a burst
-	// of back-to-back proposals if Propose stalls (e.g. waiting for Raft
-	// quorum during a slow leader election).
+	// relative to launching the previous round. Each per-group proposal has
+	// its own timeout and goroutine, so a slow Raft group cannot delay
+	// renewal for other groups.
 	timer := time.NewTimer(hlcRenewalInterval)
 	defer timer.Stop()
 	for {
 		select {
 		case <-timer.C:
-			if group.Engine.State() == raftengine.StateLeader {
-				c.renewHLCLease(ctx, group)
-			}
+			c.renewHLCLeases(ctx)
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
@@ -1984,7 +1983,39 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	}
 }
 
-// renewHLCLease proposes a fresh physical ceiling on the default shard
+// renewHLCLeases starts one renewal proposal for every shard group this node
+// currently leads. It does not wait for those proposals before returning; the
+// returned channel closes when the launched proposals finish and exists for
+// tests/diagnostics only.
+func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for gid, group := range c.groups {
+		if group == nil || group.Engine == nil {
+			continue
+		}
+		if group.Engine.State() != raftengine.StateLeader {
+			continue
+		}
+		wg.Add(1)
+		go func(gid uint64, group *ShardGroup) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
+			defer cancel()
+			c.renewHLCLease(pctx, gid, group)
+		}(gid, group)
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// renewHLCLease proposes a fresh physical ceiling on one shard
 // group and, on a successful (quorum-acked) propose, warms that group's
 // read lease.
 //
@@ -2007,7 +2038,7 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 // the callback latency window. Non-leadership errors (no quorum,
 // validation) are NOT leadership signals and must not tear down a warm
 // lease -- doing so would force every read onto the slow path.
-func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGroup) {
+func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
 	start := monoclock.Now()
 	expectedGen := group.lease.generation()
@@ -2022,7 +2053,7 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, group *ShardGrou
 			group.lease.invalidate()
 		}
 		c.logger().WarnContext(ctx, "hlc lease renewal failed",
-			slog.Uint64("group_id", c.defaultGroup),
+			slog.Uint64("group_id", gid),
 			slog.Int64("ceiling_ms", ceilingMs),
 			slog.Any("err", err),
 		)

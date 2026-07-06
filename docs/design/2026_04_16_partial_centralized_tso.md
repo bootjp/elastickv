@@ -1,18 +1,19 @@
 # Centralized Timestamp Oracle (TSO) Design
 
-**Status:** Proposed  
-**Author:** bootjp  
-**Date:** 2026-04-16
+- Status: Partial — M1 all-led-group HLC renewal implemented; dedicated TSO group and batch allocator remain open
+- Author: bootjp
+- Date: 2026-04-16
+- Updated: 2026-07-07
 
 ---
 
 ## 1. Background and Motivation
 
-### 1.1 Current Limitation
+### 1.1 Original Limitation
 
-`ShardedCoordinator.RunHLCLeaseRenewal` currently proposes HLC lease renewals
+Before M1, `ShardedCoordinator.RunHLCLeaseRenewal` proposed HLC lease renewals
 only to the `defaultGroup` Raft group. In a sharded deployment where shard
-groups are distributed across different nodes, this creates a correctness gap:
+groups are distributed across different nodes, this created a correctness gap:
 
 ```
 Node A: leader of Group-1 (defaultGroup) + member of Group-2
@@ -24,8 +25,10 @@ Node B: not in defaultGroup → ceiling never updated ❌
          → may collide with the previous leader's committed window
 ```
 
-As a result, **global timestamp monotonicity is not guaranteed when shard
-groups span different nodes**.
+M1 fixes that per-node renewal gap by proposing to every group this node
+currently leads. **Global timestamp monotonicity is still not guaranteed when
+different coordinators on different nodes allocate timestamps for cross-group
+work**; that is the dedicated TSO / single-oracle work left open by M2-M7.
 
 ### 1.2 Near-Term Workaround
 
@@ -431,7 +434,7 @@ New TSO leader elected via Raft
 | Aspect | Current implementation | Proposed TSO |
 |--------|----------------------|--------------|
 | Ceiling management | Each shard leader proposes to its own group | Dedicated TSO Raft group manages ceiling centrally |
-| Cross-shard monotonicity | Only `defaultGroup` updated → **not guaranteed** | TSO group updates all nodes → **guaranteed** |
+| Cross-shard monotonicity | Every led group renews its local shared HLC ceiling, but no single global oracle yet | TSO group updates all nodes → **guaranteed** |
 | Timestamp issuance | `ShardedCoordinator` (per shard leader) | `TSOAllocator` (TSO leader only) |
 | Latency (with batch) | 0 Raft RTT (ceiling floor only) | ~0 (served from local batch window) |
 | Latency (without batch) | 0 Raft RTT | 1 Raft RTT per `NextBatch()` call |
@@ -442,7 +445,7 @@ New TSO leader elected via Raft
 
 ## 6. Near-Term Fix (addresses Gemini review finding)
 
-Before the full TSO is introduced, fix `RunHLCLeaseRenewal` to iterate over
+Before the full TSO is introduced, `RunHLCLeaseRenewal` iterates over
 **all** shard groups rather than only `defaultGroup`. Because all FSMs on a
 node share the same `*HLC` instance, a ceiling committed to any group advances
 the node-wide clock floor and protects timestamps issued by that node.
@@ -479,13 +482,13 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
                 if group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
                     continue
                 }
-                go func(gid uint64, eng raftengine.Engine) {
+                go func(gid uint64, group *ShardGroup) {
                     // Bound each proposal to one renewal interval so that
                     // goroutines from slow or partitioned groups do not
                     // accumulate indefinitely and exhaust resources.
                     pctx, cancel := context.WithTimeout(ctx, hlcRenewalInterval)
                     defer cancel()
-                    if _, err := eng.Propose(pctx, payload); err != nil &&
+                    if _, err := group.Proposer().Propose(pctx, payload); err != nil &&
                         !errors.Is(err, context.Canceled) &&
                         !errors.Is(err, context.DeadlineExceeded) {
                         // Suppress context-cancellation noise: these are
@@ -497,7 +500,7 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
                             slog.Any("err", err),
                         )
                     }
-                }(gid, group.Engine)
+                }(gid, group)
             }
             timer.Reset(hlcRenewalInterval)
         case <-ctx.Done():
@@ -581,7 +584,7 @@ least as large as the maximum shard ceiling.
 
 | Phase | Scope | Priority |
 |-------|-------|----------|
-| M1 — immediate | Extend `RunHLCLeaseRenewal` to all shard groups with parallel proposals (Section 6) | High |
+| M1 — shipped | Extend `RunHLCLeaseRenewal` to all shard groups with parallel proposals (Section 6) | High |
 | M2 | Phase A dual-write bridge: also propose ceiling to TSO group (Section 7.1) | Medium |
 | M3 | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |

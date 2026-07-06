@@ -141,11 +141,11 @@ txn re-allocates `StartTS` via `Clock().NextFenced()`. `IsLeader`,
 `VerifyLeader`, `LinearizableRead`, and `LeaseRead` (non-keyed) all
 pin to `c.groups[c.defaultGroup]`.
 
-HLC ceiling renewal is leader-only on default group → **every
-persistence-grade ts allocation across all shards depends on
-default-group default leader staying healthy**. A 3 s outage on
-default-group default leader stops cluster-wide ts issuance after
-the ceiling window expires.
+HLC ceiling renewal is now per led group, so a non-default group
+leader renews the shared local HLC through that group's Raft log.
+This removes the default-group-only ceiling-renewal chokepoint, but
+it is still not a global TSO: cross-node cross-group timestamp
+comparability remains a separate design point.
 
 `kv/lease_state.go`: per-shard lease, monotonic-raw nanos. Fast
 path single atomic load; extend mutex-serialized once per Dispatch.
@@ -163,8 +163,9 @@ across nodes.
 
 Coordinator breakage:
 
-- Default-group leader is the **HLC ceiling single point of
-  failure**. Multi-region only makes this worse.
+- The cluster still lacks a **global TSO / single oracle** for
+  cross-node cross-group timestamp allocation. Multi-region only
+  makes this more important.
 - No follower-read path; per-shard read ceiling = each shard's
   leader CPU.
 - Cross-shard txn is unsupported — adapters needing multi-key
