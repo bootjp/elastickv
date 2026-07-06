@@ -11,7 +11,7 @@ import (
 )
 
 // Per-queue throttling — token-bucket store that hangs off *SQSServer.
-// See docs/design/2026_04_26_proposed_sqs_per_queue_throttling.md for
+// See docs/design/2026_04_26_implemented_sqs_per_queue_throttling.md for
 // the full design and rollout context. This file implements §3.1 (bucket
 // store + token bucket), §3.3 (charging model), §3.4 (Throttling
 // envelope helpers) and the cache-invalidation primitives §3.1 calls

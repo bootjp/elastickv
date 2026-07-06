@@ -1,10 +1,10 @@
-# SQS partitioned-FIFO reverse encoder (Phase 0b M5-3) — proposed
+# SQS partitioned-FIFO reverse encoder (Phase 0b M5-3) — implemented
 
-**Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_partial_snapshot_logical_encoder.md`](2026_05_25_partial_snapshot_logical_encoder.md) — this lifts the §"SQS" decision gate that M5-1 (`PR #849`) and M5-2 (`PR #892`) deferred for `partition_count > 1`.
-**Predecessor on disk:** M5-1 emits `!sqs|queue|meta|`, `!sqs|queue|gen|`, `!sqs|queue|seq|`, `!sqs|msg|data|` for classic queues. M5-2 adds `!sqs|msg|vis|`, `!sqs|msg|byage|`, `!sqs|msg|dedup|`. Both reject `PartitionCount > 1` via `ErrSQSEncodeUnsupportedPartitioned` (`internal/backup/encode_sqs.go:162`); the M5-2 doc explicitly defers partitioned-FIFO support to "M5-3."
+**Status:** Implemented.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this lifts the §"SQS" decision gate that M5-1 (`PR #849`) and M5-2 (`PR #892`) deferred for `partition_count > 1`.
+**Predecessor on disk:** M5-1 emits `!sqs|queue|meta|`, `!sqs|queue|gen|`, `!sqs|queue|seq|`, `!sqs|msg|data|` for classic queues. M5-2 adds `!sqs|msg|vis|`, `!sqs|msg|byage|`, `!sqs|msg|dedup|`. The M5-3 implementation removes the earlier `PartitionCount > 1` rejection and emits the partitioned key families below.
 
-## What needs to land
+## Implemented behavior
 
 For every queue with `partition_count > 1` in `_queue.json`, the encoder must read each message's partition assignment from the dump and emit the **partitioned** key family instead of the classic family:
 
@@ -159,8 +159,8 @@ The slice ships as a single PR — the decoder format change and encoder partiti
 
 ## References
 
-- Parent: `2026_05_25_partial_snapshot_logical_encoder.md` §"SQS"
-- M5-2 doc (decision gate template, classic side records): `2026_05_30_proposed_sqs_side_record_derivation.md`
+- Parent: `2026_05_25_implemented_snapshot_logical_encoder.md` §"SQS"
+- M5-2 doc (decision gate template, classic side records): `2026_05_30_implemented_sqs_side_record_derivation.md`
 - M5-1 PR: #849
 - M5-2 PR: #892
 - Live partitioned constructors: `adapter/sqs_keys.go:337+` (`sqsPartitionedMsgDataKey` and siblings)

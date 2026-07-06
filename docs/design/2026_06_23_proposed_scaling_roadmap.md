@@ -269,9 +269,9 @@ memory each group's private cache/memtable pins.
 - **keyviz** — the per-route load sampler is wired and allocation-free on the
   write hot path (`observeMutation`, `kv/sharded_coordinator.go:1841-1846`),
   with proposed extensions for cluster fan-out
-  (`2026_04_27_proposed_keyviz_cluster_fanout.md`),
-  subrange sampling (`2026_05_25_proposed_keyviz_subrange_sampling.md`),
-  hot-key top-K (`2026_05_28_proposed_keyviz_hot_key_topk.md`), and per-cell
+  (`2026_04_27_implemented_keyviz_cluster_fanout.md`),
+  subrange sampling (`2026_05_25_implemented_keyviz_subrange_sampling.md`),
+  hot-key top-K (`2026_05_28_implemented_keyviz_hot_key_topk.md`), and per-cell
   conflict (implemented). It is the detection signal M3 reuses. Current
   adapter-direct Redis/DynamoDB/S3 reads that hit `MVCCStore.GetAt` bypass this
   coordinator sampler, so read-heavy hotspots remain invisible until read-path
@@ -289,7 +289,7 @@ memory each group's private cache/memtable pins.
   command worker pool, optional Raft-thread pinning, per-client admission,
   XREAD O(N)→O(new)), S3 PUT admission control
   (`2026_04_25_proposed_s3_admission_control.md`), SQS per-queue throttling
-  (`2026_04_26_proposed_sqs_per_queue_throttling.md`). These bound *one
+  (`2026_04_26_implemented_sqs_per_queue_throttling.md`). These bound *one
   workload's* impact so it cannot starve the shared runtime / Raft control
   plane; they scale a deployment by making it predictable under adversarial or
   unbalanced load rather than by raising raw capacity.

@@ -71,7 +71,7 @@ const (
 type Sampler interface {
 	// Observe records a single request against a route. Op identifies
 	// the counter family. The key drives sub-range bucketing (the hot
-	// key/sub-range heatmap, see docs/design/2026_05_25_proposed_keyviz_subrange_sampling.md);
+	// key/sub-range heatmap, see docs/design/2026_05_25_implemented_keyviz_subrange_sampling.md);
 	// len(key) and valueLen are summed into the matching *Bytes
 	// counter; pass valueLen 0 for read-only ops where the response
 	// size is irrelevant. Implementations must no-op (not panic) when
@@ -92,7 +92,7 @@ const (
 )
 
 // Defaults / caps for the per-cell hot-key drill-down knobs (see
-// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md §8). All
+// docs/design/2026_05_28_implemented_keyviz_hot_key_topk.md §8). All
 // off-by-default; HotKeysEnabled=false is the binary's existing
 // behaviour — no extra hot-path cost, no real key bytes retained.
 const (
@@ -161,7 +161,7 @@ type MemSamplerOptions struct {
 	KeyBucketsPerRoute int
 	// HotKeysEnabled opts in to per-route Top-K hot-key tracking that
 	// backs the heatmap drill-down (Phase 2-A++; see
-	// docs/design/2026_05_28_proposed_keyviz_hot_key_topk.md). When
+	// docs/design/2026_05_28_implemented_keyviz_hot_key_topk.md). When
 	// false the hot path adds one early-return branch and nothing else
 	// — disabled-case behaviour is byte-identical to today. When true
 	// the sampler retains REAL key bytes in memory and exposes them on
@@ -236,7 +236,7 @@ type MemSampler struct {
 	virtualIDCounter atomic.Uint64
 
 	// hotKeys is the per-route Top-K aggregator (design 2026_05_28
-	// _proposed_keyviz_hot_key_topk). nil when HotKeysEnabled is false
+	// _implemented_keyviz_hot_key_topk). nil when HotKeysEnabled is false
 	// — the Observe hot path then skips the feature with one branch.
 	// Read from the hot path; assigned exactly once at construction.
 	hotKeys *hotKeysAggregator
@@ -379,7 +379,7 @@ type routeSlot struct {
 	subBuckets []subCounter
 
 	// hotKeysSnap is the most-recently-published per-route Top-K
-	// snapshot (design 2026_05_28_proposed_keyviz_hot_key_topk §4).
+	// snapshot (design 2026_05_28_implemented_keyviz_hot_key_topk §4).
 	// nil until the hot-keys aggregator's first publish for this route.
 	// Drill-down handlers load it lock-free; the aggregator is the
 	// single writer (Store) and deep-copies snapshot contents so a

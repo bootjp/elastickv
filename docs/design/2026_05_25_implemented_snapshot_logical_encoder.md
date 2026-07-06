@@ -1,8 +1,8 @@
 # Snapshot Logical Encoder (Phase 0b)
 
-Status: Partial (M1–M5 merged via PRs #807 / #841 / #847 / #849 / #864 / #846 / #892; M6 CLI in review at PR #896)
+Status: Implemented (M1-M6 merged; external-sort remains a future optimization)
 Author: bootjp
-Date: 2026-05-25 (promoted proposed → partial 2026-06-01 in PR #896)
+Date: 2026-05-25
 
 ## Background
 
@@ -22,9 +22,9 @@ specifics the parent doc left at sketch level (parent §"Encoder:
 The parent doc is the format owner and remains authoritative for the
 directory-tree shape, filename encoding, and `MANIFEST.json`. This
 doc owns the **reverse-direction wire-format reconstruction** and the
-decisions that only arise on the encode side. On landing this
-proposal, the parent doc is promoted `proposed` → `partial` (Phase 0a
-shipped) via `git mv`.
+decisions that only arise on the encode side. The Phase 0b v1 encoder
+is implemented through the CLI milestone; the external-sort path
+remains a future optimization outside the implemented v1 surface.
 
 ## Why a separate design doc
 
@@ -266,14 +266,11 @@ covered by a cross-check test that asserts the encoder's derived index
 rows are byte-identical to the live adapter's output for a shared
 fixture.
 
-> **Scope note / open question.** GSI and SQS-side-record derivation
-> are the heaviest pieces. If the cross-check tests show the live
-> builders are impractical to mirror offline within Phase 0b, the
-> fallback is to emit only the user records + cheap indexes (TTL,
-> generation) and document that GSI/SQS-side-state rebuild lazily on
-> first adapter access after restart. The recommended path is full
-> reconstruction; the fallback is called out in §"Milestones" as a
-> per-adapter decision gate.
+> **Scope note.** GSI and SQS-side-record derivation were the heaviest
+> pieces. The implemented path follows the full-reconstruction option:
+> derived GSI and SQS side rows are emitted offline and pinned by
+> cross-check tests against the live key builders. The lazy-rebuild
+> fallback below was not chosen for Phase 0b v1.
 >
 > **The fallback is not zero-cost transparency.** A missing GSI row
 > makes a DynamoDB GSI query return empty *silently* (no error); a
@@ -399,9 +396,8 @@ output file, so a node never receives an unloadable `.fsm`.
 
 ## Milestones (per-adapter PRs, mirroring Phase 0a)
 
-Doc-first: this proposal lands as its own PR before any code. Then,
-in order (each its own PR, each with the cross-check + round-trip
-tests for that adapter):
+Phase 0b v1 landed in the following order (each with cross-check and
+round-trip coverage for the adapter slice):
 
 1. **Encoder core** — `encode.go`: MANIFEST read/validate, MVCC
    re-encoding, in-memory sort, EKVPBBL1 writer, in-process round-trip

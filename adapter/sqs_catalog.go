@@ -533,7 +533,7 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 			"DeduplicationScope must be 'messageGroup' or 'queue'")
 	},
 	// Throttle* are non-AWS extensions for per-queue rate limiting,
-	// see docs/design/2026_04_26_proposed_sqs_per_queue_throttling.md.
+	// see docs/design/2026_04_26_implemented_sqs_per_queue_throttling.md.
 	// Each accepts a non-negative float64; the cross-attribute
 	// validation that enforces both-zero-or-both-positive on each
 	// (capacity, refill) pair, capacity ≥ refill, hard ceiling, and

@@ -1,9 +1,9 @@
-# `cmd/elastickv-snapshot-encode` CLI (Phase 0b M6) — proposed
+# `cmd/elastickv-snapshot-encode` CLI (Phase 0b M6) — implemented
 
-**Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_partial_snapshot_logical_encoder.md`](2026_05_25_partial_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1–M5 are merged (#807/#841/#847/#849/#864/#846/#892); the parent doc was promoted `proposed` → `partial` in v6 (#896); the CLI is the capstone that exposes them.
+**Status:** Implemented.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1-M5 are merged (#807/#841/#847/#849/#864/#846/#892); the CLI is the capstone that exposes them.
 
-## What needs to land
+## Implemented surface
 
 A single binary `cmd/elastickv-snapshot-encode` that:
 
@@ -174,7 +174,7 @@ cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (exit codes, w
 
 **P1 cluster-boot test deferred.** Parent doc's P1 test table includes `TestEncoderProducesLoadableSnapshot` — an end-to-end test that boots a single-node cluster from the encoded `.fsm` and reads back every adapter's data. That test is deferred from M6 because: (a) it requires the production server entrypoint + Pebble engine, not the encoder package; (b) `TestEncodeSnapshotLibraryRoundTrip` above already exercises the encoder → decoder library round-trip exactly, and the `TestCLIRoundTripSelfTestAllAdapters` integration test exercises the full CLI; (c) the cluster-boot path is owned by `store/lsm_store.go`'s native restore code, which has its own coverage. M6 tracks the cluster-boot test as a follow-up task in the M6 PR description, not in this design.
 
-## Self-review (5 passes) — proposed
+## Self-review (5 passes)
 
 1. **Data loss.** The CLI is a wrapper over already-merged + tested encoder slices. The only new write paths are the `.fsm` output and `ENCODE_INFO.json`; both use the WriteManifest-style fsync-then-close discipline (gemini r1 medium on #810). The self-test gate is a defense-in-depth check that catches encoder regressions before a restore operator does.
 2. **Concurrency / distributed failures.** Pure offline. No Raft, no HLC issuance, no cluster contact. The output `.fsm` is loaded by a STOPPED node via stop-replace-restart (parent §"Restore via stop-replace-restart"); concurrency surfaces only on the receiving cluster's restart path, which is owned by the node's existing snapshot loader.

@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-A+
 parent_design: docs/admin_ui_key_visualizer_design.md
 author: bootjp

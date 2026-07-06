@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-C
 parent_design: docs/admin_ui_key_visualizer_design.md
 date: 2026-04-27

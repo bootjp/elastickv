@@ -1,10 +1,10 @@
-# SQS side-record derivation (Phase 0b M5-2) — proposed
+# SQS side-record derivation (Phase 0b M5-2) — implemented
 
-**Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_proposed_snapshot_logical_encoder.md`](2026_05_25_proposed_snapshot_logical_encoder.md) — this resolves the §"Per-adapter reverse encoders / SQS per-message side records" decision gate that M5-1 (`PR #846`) explicitly deferred.
+**Status:** Implemented.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves the §"Per-adapter reverse encoders / SQS per-message side records" decision gate that M5-1 (`PR #846`) explicitly deferred.
 **Predecessor on disk:** M5-1 emits `!sqs|queue|meta|`, `!sqs|queue|gen|`, `!sqs|queue|seq|`, `!sqs|msg|data|` for every queue + message in the dump. The **side records** below (vis / byage / dedup; group is intentionally not emitted — see table) are not produced by M5-1; restoring without the emitted three silently breaks FIFO dedup, the by-age reaper scan, and visibility resumption.
 
-## What needs to land
+## Implemented behavior
 
 For every `!sqs|msg|data|...` record M5-1 already writes, the encoder must also write the **derived** side records the live adapter would have written:
 
@@ -59,7 +59,7 @@ The parent doc (§"Re-derivable indexes" → scope note) allows a per-adapter fa
 
 ## Deferred (partitioned-FIFO)
 
-M5-2 inherits M5-1's `ErrSQSEncodeUnsupportedPartitioned` gate — any queue with `PartitionCount > 1` is rejected by `encodeQueue` before `encodeQueueMessages` is reached, so the side-record walk is never invoked for partitioned queues. Lifting that gate requires coordinated changes to BOTH M5-1 (decoder dump format + encoder iteration over partitions) AND M5-2 (partitioned-key constructors for vis/byage/dedup); the project hasn't sequenced that work yet.
+M5-2 inherited M5-1's `ErrSQSEncodeUnsupportedPartitioned` gate at the time this slice was written. The coordinated decoder+encoder lift for partitioned FIFO queues later landed in [`2026_06_03_implemented_sqs_partitioned_fifo_encoder.md`](2026_06_03_implemented_sqs_partitioned_fifo_encoder.md).
 
 When the partitioned slice (provisionally M5-3) lands, it should add these key shapes — sourced from `SqsPartitionedMsg{Vis,ByAge,Dedup}Prefix` + `sqsPartitionedMsg{...}Key` in `adapter/sqs_keys.go`:
 
@@ -94,7 +94,7 @@ Wire into `encode_sqs.go`'s existing `encodeQueueMessages` walk: after `addMessa
 
 `TestSQSEncodeSideRecordsCrossCheckClassic` is the §"Encoder cross-check" pattern the parent doc §"Per-adapter reverse encoders" mandates. The two restore round-trip tests pin the end-to-end correctness rationale for choosing full reconstruction over lazy.
 
-## Self-review (5 passes) — proposed
+## Self-review (5 passes)
 
 1. **Data loss.** Full reconstruction (not fallback) eliminates the silent-redeliver + invisible-message classes called out above. Restore-time state matches what the live writer would have produced for the same send sequence.
 2. **Concurrency / distributed failures.** Pure offline derivation; no Raft, no lock ordering. The restored cluster's first sends/receives go through the normal OCC path against the restored state.

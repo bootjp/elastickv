@@ -197,7 +197,7 @@ func ObjectManifestPrefixForBucket(bucket string, generation uint64) []byte {
 // BlobPrefixForBucket / GCUploadPrefixForBucket / RoutePrefixForBucket
 // each isolate to a single bucket+generation tuple. Used by
 // AdminDeleteBucket's DEL_PREFIX safety net (design doc
-// 2026_04_28_proposed_admin_delete_bucket_safety_net.md): the bucket-
+// 2026_04_28_implemented_admin_delete_bucket_safety_net.md): the bucket-
 // must-be-empty empty-probe is racy against concurrent PutObject, so
 // the delete commit also DEL_PREFIXes every per-bucket key family to
 // sweep anything that snuck in during the readTS → commitTS window.

@@ -1,6 +1,6 @@
 # Per-Queue Throttling and Tenant Fairness for the SQS Adapter
 
-**Status:** Proposed
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-04-26
 
@@ -8,7 +8,7 @@
 
 ## 1. Background and Motivation
 
-elastickv's SQS adapter currently has **no per-queue rate limiting**. A single tenant's runaway producer can:
+Before this work, elastickv's SQS adapter had **no per-queue rate limiting**. A single tenant's runaway producer could:
 
 1. Saturate the leader's Raft proposal pipeline (one OCC dispatch per `SendMessage`), pushing latency on every other queue's writes through the same shard.
 2. Exhaust the receive-path's visibility-index scan budget (`sqsVisScanPageLimit = 1024`), causing other tenants' `ReceiveMessage` calls to time out empty.
@@ -16,7 +16,7 @@ elastickv's SQS adapter currently has **no per-queue rate limiting**. A single t
 
 Phase 3.C in [`docs/design/2026_04_24_partial_sqs_compatible_adapter.md`](2026_04_24_partial_sqs_compatible_adapter.md) §16.5 marks this as TODO. AWS itself enforces per-account / per-API limits ("standard request throttle of 3000 RPS per region per AWS account" plus per-API limits like 300 TPS for batch APIs); operators running elastickv as a multi-tenant SQS facade need an equivalent control plane. Without it, the only knobs are (a) shard-level capacity (too coarse — adding a shard requires a Raft membership change) and (b) external load-balancer rate limiting (no visibility into per-queue cost).
 
-This document proposes per-queue token-bucket throttling, configured per-queue in queue meta, evaluated at the SQS-adapter layer on the leader, and surfaced as the same `Throttling.Sender` error AWS uses (so existing SDK retry/backoff logic engages naturally).
+This document describes per-queue token-bucket throttling, configured per-queue in queue meta, evaluated at the SQS-adapter layer on the leader, and surfaced as the same `Throttling.Sender` error AWS uses (so existing SDK retry/backoff logic engages naturally).
 
 ---
 
