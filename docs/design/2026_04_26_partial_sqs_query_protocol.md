@@ -1,6 +1,10 @@
 # SQS Query-Protocol Wire Format Support
 
-**Status:** Proposed
+**Status:** Partial — dispatch, XML success/error envelopes, form parsing,
+and control-plane verbs (`CreateQueue`, `DeleteQueue`, `ListQueues`,
+`GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes`, `PurgeQueue`,
+`TagQueue`, `UntagQueue`, `ListQueueTags`) have shipped. Message lifecycle
+and batch XML remain open.
 **Author:** bootjp
 **Date:** 2026-04-26
 
@@ -8,11 +12,11 @@
 
 ## 1. Background and Motivation
 
-The elastickv SQS adapter currently speaks only the **AWS JSON 1.0 protocol**: `Content-Type: application/x-www-form-urlencoded` is rejected, the request must carry `X-Amz-Target: AmazonSQS.<Action>`, and the body is JSON. This matches what the modern AWS SDK v2 family (`aws-sdk-go-v2`, `boto3 ≥ 1.34`, `aws-sdk-java-v2`) emits.
+The elastickv SQS adapter originally spoke only the **AWS JSON 1.0 protocol**: `Content-Type: application/x-www-form-urlencoded` was rejected, the request had to carry `X-Amz-Target: AmazonSQS.<Action>`, and the body was JSON. This matches what the modern AWS SDK v2 family (`aws-sdk-go-v2`, `boto3 ≥ 1.34`, `aws-sdk-java-v2`) emits.
 
-A long tail of clients still emits the older **query protocol** (form-encoded request, XML response) — `aws-sdk-java` v1, older `boto`/`boto3 < 1.34`, every CLI tool that builds requests by hand, and the AWS CLI itself when used against a region that defaults to query. Today these clients fail with `400 MalformedRequest` or `415 UnsupportedMediaType` on the very first request, even though the underlying SQS feature is fully implemented.
+A long tail of clients still emits the older **query protocol** (form-encoded request, XML response) — `aws-sdk-java` v1, older `boto`/`boto3 < 1.34`, every CLI tool that builds requests by hand, and the AWS CLI itself when used against a region that defaults to query. Before the staged query-protocol work, these clients failed with `400 MalformedRequest` or `415 UnsupportedMediaType` on the very first request, even when the underlying SQS feature was already implemented on the JSON path.
 
-Adding query-protocol support is the last piece needed to claim "drop-in SQS compatibility" for v1-era SDKs. Phase 3.B in [`docs/design/2026_04_24_partial_sqs_compatible_adapter.md`](2026_04_24_partial_sqs_compatible_adapter.md) §16.4 marked this as TODO; this document is the proposal that unblocks the implementation.
+Completing query-protocol support is the last piece needed to claim "drop-in SQS compatibility" for v1-era SDKs. Phase 3.B in [`docs/design/2026_04_24_partial_sqs_compatible_adapter.md`](2026_04_24_partial_sqs_compatible_adapter.md) §16.4 marked this as TODO; this document tracks the staged implementation.
 
 ---
 
@@ -24,7 +28,7 @@ Adding query-protocol support is the last piece needed to claim "drop-in SQS com
 2. Reuse every existing handler. The wire codec is the only new code; no SQS business logic moves or duplicates.
 3. Emit XML responses that AWS SDK v1 / older boto unmarshal without modification.
 4. Preserve the existing JSON-protocol behaviour bit-for-bit. No regression test on the JSON path may change.
-5. Keep the doc-driven coverage explicit: the first PR ships a subset of verbs; later PRs widen it without further design work.
+5. Keep the doc-driven coverage explicit: each PR ships a named subset of verbs; later PRs widen it without further design work.
 
 ### 2.2 Non-Goals
 
@@ -120,24 +124,29 @@ func (s *SQSServer) handleQuerySendMessage(w http.ResponseWriter, r *http.Reques
 
 This refactor is mechanical and trivially reviewable: the JSON wrapper before the change is identical to the JSON wrapper after the change, except `decodeSQSJSONInput` and the in-place body have been split. Existing tests cover every verb's JSON path and pass unchanged.
 
-### 4.1 Verb coverage in the first PR
+### 4.1 Verb coverage in the current implementation
 
-The first PR is **architectural proof** — it ships dispatch, decoding, encoding, error envelope, and the refactor pattern, with **three verbs** wired end-to-end as concrete proof. The pattern then extends mechanically to every other verb in follow-up PRs (each follow-up adds a parser + response struct + one line in the dispatch table).
+The shipped implementation provides dispatch, decoding, encoding, error envelope, and the refactor pattern, with the catalog/control-plane verbs wired end-to-end. The pattern then extends mechanically to the remaining message lifecycle and batch verbs (each follow-up adds a parser + response struct + one line in the dispatch table).
 
-| Verb | Why it's in the proof set |
+| Verb | Coverage |
 |---|---|
-| `CreateQueue` | Simplest write verb: takes `QueueName` + optional `Attribute.N`, returns `QueueUrl`. Exercises the indexed-collection parser for `Attribute.N.Name`/`Attribute.N.Value`. |
-| `ListQueues` | Read-only verb. Exercises the repeated-element XML shape (`<QueueUrl>...</QueueUrl>` repeated under `<ListQueuesResult>`) which is harder than the typical leaf-element response. |
-| `GetQueueUrl` | Trivial round-trip verb. Pins that single-leaf XML response shape (`<GetQueueUrlResult><QueueUrl>...</QueueUrl></GetQueueUrlResult>`) and the `QueueDoesNotExist` error envelope path. |
+| `CreateQueue` | Takes `QueueName`, optional `Attribute.N.Name`/`Attribute.N.Value`, and optional `Tag.N.Key`/`Tag.N.Value`; returns `QueueUrl`. |
+| `DeleteQueue` | Takes `QueueUrl`; shares the JSON path's tombstone, throttle invalidation, and receive-fanout cleanup logic. |
+| `ListQueues` | Supports `QueueNamePrefix`, `MaxResults`, and `NextToken`; emits repeated `<QueueUrl>` elements and optional `NextToken`. |
+| `GetQueueUrl` | Pins the single-leaf XML response shape and the `QueueDoesNotExist` error envelope path. |
+| `GetQueueAttributes` | Supports indexed `AttributeName.N` selection and emits repeated `<Attribute><Name>…</Name><Value>…</Value></Attribute>` pairs in stable name order. |
+| `SetQueueAttributes` | Supports indexed `Attribute.N.Name` / `Attribute.N.Value` pairs and reuses the JSON path's validation, retry, and throttle-invalidation rules. |
+| `PurgeQueue` | Reuses the JSON path's generation bump and 60-second purge limiter. |
+| `TagQueue` / `UntagQueue` / `ListQueueTags` | Supports `Tag.N.Key` / `Tag.N.Value`, `TagKey.N`, and repeated `<Tag>` XML output. |
 
-`SendMessage` / `ReceiveMessage` / `DeleteMessage` are the highest-priority follow-ups; they need the `*Core` refactor to also reach into the FIFO send loop (`sqs_messages.go: sendMessageFifoLoop`), which is mechanical but bigger than this proof PR should swallow.
+`SendMessage` / `ReceiveMessage` / `DeleteMessage` are the highest-priority follow-ups; they need the `*Core` refactor to also reach into the FIFO send loop (`sqs_messages.go: sendMessageFifoLoop`) and the in-flight lifecycle, which is mechanical but larger than the control-plane codec.
 
-Verbs **not** in the first round (recorded as TODO in the PR description and in §16.4 of the partial doc):
+Verbs **not** yet wired (recorded as TODO in the PR description and in §16.4 of the partial doc):
 
-- `DeleteQueue`, `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes`, `PurgeQueue` — single-call extensions; each is one parser + one response shape.
 - `ReceiveMessage` / `DeleteMessage` / `ChangeMessageVisibility` — the in-flight message lifecycle. Each non-trivial because of `Attribute.N` plumbing on responses.
 - `SendMessageBatch` / `DeleteMessageBatch` / `ChangeMessageVisibilityBatch` — query-protocol batch encoding has its own quirks (`SendMessageBatchRequestEntry.1.MessageBody=...`); deserves its own focused PR.
-- `TagQueue`, `UntagQueue`, `ListQueueTags`, DLQ redrive control-plane verbs — small additions, easy to land incrementally.
+- `SendMessage` — simple standard-queue sends are straightforward, but FIFO/dedup attributes must share the same core path as JSON before the XML surface can be marked complete.
+- DLQ redrive control-plane verbs — small additions if those public AWS APIs are enabled in the adapter.
 
 The `pickSqsAction` switch returns a **501 `NotImplementedYet`** for any query-protocol Action that has not been wired yet, with an XML envelope that names the missing action. Operators see the gap explicitly rather than silently falling through to JSON-style errors. As verbs land, their entries move from the "TODO" branch to the live dispatch table — no other code changes per added verb.
 
@@ -242,10 +251,11 @@ Deployments that *want* to refuse query-protocol traffic (e.g. lock down to v2-S
 
 Rollout sequence:
 
-1. This PR — implementation + tests for the first verb subset (§4.1).
-2. Follow-up PR — batch verbs + tag verbs.
-3. Follow-up PR — DLQ redrive admin / FIFO administrative verbs.
-4. Eventually, when the `_partial_` doc's TODO list is empty, the SQS design doc transitions to `_implemented_`.
+1. Landed — implementation + tests for the catalog/control-plane verb subset (§4.1).
+2. Follow-up PR — message lifecycle verbs (`SendMessage`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`).
+3. Follow-up PR — batch verbs.
+4. Follow-up PR — DLQ redrive admin / FIFO administrative verbs if exposed publicly.
+5. Eventually, when the `_partial_` doc's TODO list is empty, the SQS design doc transitions to `_implemented_`.
 
 ---
 

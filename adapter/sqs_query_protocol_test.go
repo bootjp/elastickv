@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -144,6 +146,27 @@ func TestCollectIndexedKVPairs_Empty(t *testing.T) {
 	}
 	if got := collectIndexedKVPairs(url.Values{"Other.1.Name": []string{"x"}, "Other.1.Value": []string{"y"}}, "Attribute", "Name"); got != nil {
 		t.Fatalf("unrelated form: got %v, want nil", got)
+	}
+}
+
+func TestCollectIndexedValues(t *testing.T) {
+	t.Parallel()
+	form := url.Values{
+		"AttributeName":   []string{"All"},
+		"AttributeName.3": []string{"DelaySeconds"},
+		"AttributeName.1": []string{"VisibilityTimeout"},
+		"AttributeName.x": []string{"ignored"},
+		"TagKey.1":        []string{"not-an-attribute"},
+	}
+	got := collectIndexedValues(form, "AttributeName")
+	want := []string{"All", "VisibilityTimeout", "DelaySeconds"}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("value %d = %q, want %q (all=%v)", i, got[i], want[i], got)
+		}
 	}
 }
 
@@ -328,6 +351,156 @@ func TestSQSServer_QueryProtocol_GetQueueUrlNotFoundError(t *testing.T) {
 	}
 	if !strings.Contains(bodyStr, "<Code>"+sqsErrQueueDoesNotExist+"</Code>") {
 		t.Fatalf("expected QueueDoesNotExist code; body=%s", bodyStr)
+	}
+}
+
+func TestSQSServer_QueryProtocol_ControlPlaneRoundTrip(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	queueURL := queryCreateQueueURL(t, node, "query-control")
+	querySetVisibilityTimeout(t, node, queueURL, "12")
+	attrs := queryAttributes(t, node, queueURL, []string{"VisibilityTimeout", "QueueArn"})
+	if got := attrs["VisibilityTimeout"]; got != "12" {
+		t.Fatalf("VisibilityTimeout = %q, want 12; attrs=%v", got, attrs)
+	}
+	if got := attrs["QueueArn"]; !strings.HasSuffix(got, ":query-control") {
+		t.Fatalf("QueueArn = %q, want suffix :query-control; attrs=%v", got, attrs)
+	}
+
+	queryTagQueue(t, node, queueURL, map[string]string{"env": "prod", "team": "storage"})
+	tags := queryTags(t, node, queueURL)
+	if tags["env"] != "prod" || tags["team"] != "storage" {
+		t.Fatalf("tags = %v, want env/prod and team/storage", tags)
+	}
+
+	queryUntagQueue(t, node, queueURL, []string{"env"})
+	tags = queryTags(t, node, queueURL)
+	if _, ok := tags["env"]; ok || tags["team"] != "storage" {
+		t.Fatalf("tags after untag = %v, want only team/storage", tags)
+	}
+
+	queryOK(t, node, "PurgeQueue", url.Values{"QueueUrl": []string{queueURL}})
+	queryOK(t, node, "DeleteQueue", url.Values{"QueueUrl": []string{queueURL}})
+	assertJSONQueueDeleted(t, node, "query-control")
+}
+
+func queryCreateQueueURL(t *testing.T, node Node, name string) string {
+	t.Helper()
+	_, body := queryOK(t, node, "CreateQueue", url.Values{"QueueName": []string{name}})
+	var createResp struct {
+		Result struct {
+			QueueUrl string `xml:"QueueUrl"`
+		} `xml:"CreateQueueResult"`
+	}
+	if err := xml.Unmarshal(bytes.TrimSpace(body), &createResp); err != nil {
+		t.Fatalf("decode create: %v\nbody=%s", err, body)
+	}
+	queueURL := createResp.Result.QueueUrl
+	if queueURL == "" {
+		t.Fatalf("missing QueueUrl in create response: %s", body)
+	}
+	return queueURL
+}
+
+func querySetVisibilityTimeout(t *testing.T, node Node, queueURL, value string) {
+	t.Helper()
+	queryOK(t, node, "SetQueueAttributes", url.Values{
+		"QueueUrl":          []string{queueURL},
+		"Attribute.1.Name":  []string{"VisibilityTimeout"},
+		"Attribute.1.Value": []string{value},
+	})
+}
+
+func queryAttributes(t *testing.T, node Node, queueURL string, names []string) map[string]string {
+	t.Helper()
+	form := url.Values{"QueueUrl": []string{queueURL}}
+	for i, name := range names {
+		form.Set("AttributeName."+strconv.Itoa(i+1), name)
+	}
+	_, body := queryOK(t, node, "GetQueueAttributes", form)
+	var attrsResp struct {
+		Result struct {
+			Attributes []struct {
+				Name  string `xml:"Name"`
+				Value string `xml:"Value"`
+			} `xml:"Attribute"`
+		} `xml:"GetQueueAttributesResult"`
+	}
+	if err := xml.Unmarshal(bytes.TrimSpace(body), &attrsResp); err != nil {
+		t.Fatalf("decode attrs: %v\nbody=%s", err, body)
+	}
+	attrs := map[string]string{}
+	for _, a := range attrsResp.Result.Attributes {
+		attrs[a.Name] = a.Value
+	}
+	return attrs
+}
+
+func queryTagQueue(t *testing.T, node Node, queueURL string, tags map[string]string) {
+	t.Helper()
+	form := url.Values{"QueueUrl": []string{queueURL}}
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		prefix := "Tag." + strconv.Itoa(i+1)
+		form.Set(prefix+".Key", k)
+		form.Set(prefix+".Value", tags[k])
+	}
+	queryOK(t, node, "TagQueue", form)
+}
+
+func queryTags(t *testing.T, node Node, queueURL string) map[string]string {
+	t.Helper()
+	_, body := queryOK(t, node, "ListQueueTags", url.Values{"QueueUrl": []string{queueURL}})
+	var tagsResp struct {
+		Result struct {
+			Tags []struct {
+				Key   string `xml:"Key"`
+				Value string `xml:"Value"`
+			} `xml:"Tag"`
+		} `xml:"ListQueueTagsResult"`
+	}
+	if err := xml.Unmarshal(bytes.TrimSpace(body), &tagsResp); err != nil {
+		t.Fatalf("decode tags: %v\nbody=%s", err, body)
+	}
+	tags := map[string]string{}
+	for _, tag := range tagsResp.Result.Tags {
+		tags[tag.Key] = tag.Value
+	}
+	return tags
+}
+
+func queryUntagQueue(t *testing.T, node Node, queueURL string, tagKeys []string) {
+	t.Helper()
+	form := url.Values{"QueueUrl": []string{queueURL}}
+	for i, k := range tagKeys {
+		form.Set("TagKey."+strconv.Itoa(i+1), k)
+	}
+	queryOK(t, node, "UntagQueue", form)
+}
+
+func queryOK(t *testing.T, node Node, action string, form url.Values) (int, []byte) {
+	t.Helper()
+	status, body := queryRoundTrip(t, node, action, form)
+	if status != http.StatusOK {
+		t.Fatalf("%s: status %d body %s", action, status, body)
+	}
+	return status, body
+}
+
+func assertJSONQueueDeleted(t *testing.T, node Node, name string) {
+	t.Helper()
+	jStatus, jOut := callSQS(t, node, sqsGetQueueUrlTarget, map[string]any{
+		"QueueName": name,
+	})
+	if jStatus != http.StatusBadRequest || jOut["__type"] != sqsErrQueueDoesNotExist {
+		t.Fatalf("JSON GetQueueUrl after query DeleteQueue: status=%d body=%v", jStatus, jOut)
 	}
 }
 

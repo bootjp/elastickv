@@ -34,7 +34,7 @@ YYYY_MM_DD_<status>_<name>.md
 2026_04_20_implemented_lease_read.md
 2026_04_18_proposed_raft_grpc_streaming_transport.md
 2026_02_18_partial_hotspot_shard_split.md
-2026_04_24_proposed_sqs_compatible_adapter.md
+2026_04_24_partial_sqs_compatible_adapter.md
 ```
 
 ## Document header

@@ -1070,9 +1070,17 @@ func (s *SQSServer) deleteQueue(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if err := s.deleteQueueWithRetry(r.Context(), name); err != nil {
+	if err := s.deleteQueueCore(r.Context(), name); err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
+	}
+	// SQS DeleteQueue returns 200 with an empty body.
+	writeSQSJSON(w, map[string]any{})
+}
+
+func (s *SQSServer) deleteQueueCore(ctx context.Context, name string) error {
+	if err := s.deleteQueueWithRetry(ctx, name); err != nil {
+		return err
 	}
 	// Drop in-memory throttle buckets belonging to this queue so a
 	// same-name CreateQueue immediately after this delete starts with
@@ -1085,11 +1093,9 @@ func (s *SQSServer) deleteQueue(w http.ResponseWriter, r *http.Request) {
 	// Drop the per-queue fanout-rotation counter as well. Without
 	// this, repeated DeleteQueue of unique queue names retains one
 	// receiveFanoutCounters entry per name for the process lifetime
-	// — a leak in multi-tenant / high-churn deployments. Codex P2,
-	// PR #732 round 5.
+	// — a leak in multi-tenant / high-churn deployments.
 	s.dropReceiveFanoutCounter(name)
-	// SQS DeleteQueue returns 200 with an empty body.
-	writeSQSJSON(w, map[string]any{})
+	return nil
 }
 
 func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) error {
@@ -1330,32 +1336,37 @@ func (s *SQSServer) getQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	readTS := s.nextTxnReadTS(r.Context())
-	meta, exists, err := s.loadQueueMetaAt(r.Context(), name, readTS)
+	attrs, err := s.getQueueAttributesCore(r.Context(), name, in.AttributeNames)
 	if err != nil {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
-	if !exists {
-		writeSQSError(w, http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
-		return
+	writeSQSJSON(w, map[string]any{"Attributes": attrs})
+}
+
+func (s *SQSServer) getQueueAttributesCore(ctx context.Context, name string, attributeNames []string) (map[string]string, error) {
+	readTS := s.nextTxnReadTS(ctx)
+	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
+	if err != nil {
+		return nil, err
 	}
-	selection := selectedAttributeNames(in.AttributeNames)
+	if !exists {
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
+	}
+	selection := selectedAttributeNames(attributeNames)
 	// Counter computation is the only path that touches per-message
 	// state, so skip the scan when the caller did not ask for any of
 	// the Approximate* attributes. AWS itself documents these as
 	// approximate; a snapshot read is correct enough.
 	var counters *sqsApproxCounters
 	if selectionWantsApproxCounters(selection) {
-		c, scanErr := s.scanApproxCounters(r.Context(), name, meta.Generation, readTS)
+		c, scanErr := s.scanApproxCounters(ctx, name, meta.Generation, readTS)
 		if scanErr != nil {
-			writeSQSErrorFromErr(w, scanErr)
-			return
+			return nil, scanErr
 		}
 		counters = &c
 	}
-	attrs := queueMetaToAttributes(meta, selection, counters, s.queueArn(name))
-	writeSQSJSON(w, map[string]any{"Attributes": attrs})
+	return queueMetaToAttributes(meta, selection, counters, s.queueArn(name)), nil
 }
 
 // queueArn synthesises the AWS-shaped ARN clients expect to find on
@@ -1501,18 +1512,24 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 		writeSQSErrorFromErr(w, err)
 		return
 	}
+	if err := s.setQueueAttributesCore(r.Context(), name, in.Attributes); err != nil {
+		writeSQSErrorFromErr(w, err)
+		return
+	}
+	writeSQSJSON(w, map[string]any{})
+}
+
+func (s *SQSServer) setQueueAttributesCore(ctx context.Context, name string, attrs map[string]string) error {
 	// AWS marks Attributes as a required parameter on SetQueueAttributes.
 	// Without this check, a client that forgets (or mis-serializes) the
 	// field gets a 200 success and no change — a silent failure that hides
 	// automation bugs. Reject omission with MissingParameter.
-	if len(in.Attributes) == 0 {
-		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Attributes is required")
-		return
+	if len(attrs) == 0 {
+		return newSQSAPIError(http.StatusBadRequest, sqsErrMissingParameter, "Attributes is required")
 	}
-	throttleChanged, err := s.setQueueAttributesWithRetry(r.Context(), name, in.Attributes)
+	throttleChanged, err := s.setQueueAttributesWithRetry(ctx, name, attrs)
 	if err != nil {
-		writeSQSErrorFromErr(w, err)
-		return
+		return err
 	}
 	// Drop the in-memory bucket entries belonging to this queue *after*
 	// the Raft commit so the next request rebuilds from the freshly
@@ -1535,7 +1552,7 @@ func (s *SQSServer) setQueueAttributes(w http.ResponseWriter, r *http.Request) {
 	if throttleChanged {
 		s.throttle.invalidateQueue(name)
 	}
-	writeSQSJSON(w, map[string]any{})
+	return nil
 }
 
 func (s *SQSServer) setQueueAttributesWithRetry(ctx context.Context, queueName string, attrs map[string]string) (bool, error) {

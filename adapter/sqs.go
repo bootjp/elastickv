@@ -369,7 +369,7 @@ func (s *SQSServer) handle(w http.ResponseWriter, r *http.Request) {
 	// pickSqsProtocol decides between the JSON path (X-Amz-Target +
 	// JSON body, the existing default) and the query path (form-
 	// encoded body, XML response) on a per-request basis. See
-	// docs/design/2026_04_26_proposed_sqs_query_protocol.md for the
+	// docs/design/2026_04_26_partial_sqs_query_protocol.md for the
 	// detection rules.
 	if pickSqsProtocol(r) == sqsProtocolQuery {
 		s.handleQueryProtocol(w, r)

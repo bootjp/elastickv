@@ -15,7 +15,7 @@ import (
 )
 
 // SQS query-protocol (form-encoded request, XML response) support per
-// docs/design/2026_04_26_proposed_sqs_query_protocol.md. Detection
+// docs/design/2026_04_26_partial_sqs_query_protocol.md. Detection
 // runs on every inbound SQS request alongside the existing JSON path
 // — no separate listener, no flag. The implementation deliberately
 // touches as little of the JSON path as possible: the SQS handlers
@@ -67,6 +67,21 @@ const (
 	sqsProtocolUnknown
 )
 
+type sqsQueryHandler func(*SQSServer, http.ResponseWriter, *http.Request, url.Values)
+
+var sqsQueryHandlers = map[string]sqsQueryHandler{
+	"CreateQueue":        (*SQSServer).handleQueryCreateQueue,
+	"DeleteQueue":        (*SQSServer).handleQueryDeleteQueue,
+	"ListQueues":         (*SQSServer).handleQueryListQueues,
+	"GetQueueUrl":        (*SQSServer).handleQueryGetQueueUrl,
+	"GetQueueAttributes": (*SQSServer).handleQueryGetQueueAttributes,
+	"SetQueueAttributes": (*SQSServer).handleQuerySetQueueAttributes,
+	"PurgeQueue":         (*SQSServer).handleQueryPurgeQueue,
+	"TagQueue":           (*SQSServer).handleQueryTagQueue,
+	"UntagQueue":         (*SQSServer).handleQueryUntagQueue,
+	"ListQueueTags":      (*SQSServer).handleQueryListQueueTags,
+}
+
 // pickSqsProtocol decides which wire format a request is using. The
 // rules are documented in §3 of the design doc:
 //
@@ -117,24 +132,19 @@ func (s *SQSServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Action is required")
 		return
 	}
-	switch action {
-	case "CreateQueue":
-		s.handleQueryCreateQueue(w, r, form)
-	case "ListQueues":
-		s.handleQueryListQueues(w, r, form)
-	case "GetQueueUrl":
-		s.handleQueryGetQueueUrl(w, r, form)
-	default:
-		// Per design §4.1: every wired verb appears here; everything
-		// else returns 501 NotImplementedYet so operators see the
-		// gap explicitly rather than the request silently failing
-		// against the JSON dispatch table.
-		writeSQSQueryError(w, newSQSAPIError(
-			http.StatusNotImplemented,
-			"NotImplementedYet",
-			"query-protocol Action "+action+" is not yet wired in elastickv (Phase 3.B follow-up)",
-		))
+	if h := sqsQueryHandlers[action]; h != nil {
+		h(s, w, r, form)
+		return
 	}
+	// Per design §4.1: every wired verb appears in sqsQueryHandlers;
+	// everything else returns 501 NotImplementedYet so operators see
+	// the gap explicitly rather than the request silently failing
+	// against the JSON dispatch table.
+	writeSQSQueryError(w, newSQSAPIError(
+		http.StatusNotImplemented,
+		"NotImplementedYet",
+		"query-protocol Action "+action+" is not yet wired in elastickv (Phase 3.B follow-up)",
+	))
 }
 
 // readQueryForm extracts the form values from either the request
@@ -189,6 +199,20 @@ func (s *SQSServer) handleQueryCreateQueue(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *SQSServer) handleQueryDeleteQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryDeleteQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.deleteQueueCore(r.Context(), queueName); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "DeleteQueue", queryEmptyResult{XMLName: xml.Name{Local: "DeleteQueueResult"}})
+}
+
 func (s *SQSServer) handleQueryListQueues(w http.ResponseWriter, r *http.Request, form url.Values) {
 	in := parseQueryListQueues(form)
 	page, nextToken, err := s.listQueuesCore(r.Context(), in)
@@ -218,6 +242,96 @@ func (s *SQSServer) handleQueryGetQueueUrl(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *SQSServer) handleQueryGetQueueAttributes(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryGetQueueAttributes(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	attrs, err := s.getQueueAttributesCore(r.Context(), queueName, in.AttributeNames)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "GetQueueAttributes", queryGetQueueAttributesResult{
+		Attributes: queryAttributePairs(attrs),
+	})
+}
+
+func (s *SQSServer) handleQuerySetQueueAttributes(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQuerySetQueueAttributes(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.setQueueAttributesCore(r.Context(), queueName, in.Attributes); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "SetQueueAttributes", queryEmptyResult{XMLName: xml.Name{Local: "SetQueueAttributesResult"}})
+}
+
+func (s *SQSServer) handleQueryPurgeQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryPurgeQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.purgeQueueCore(r.Context(), queueName); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "PurgeQueue", queryEmptyResult{XMLName: xml.Name{Local: "PurgeQueueResult"}})
+}
+
+func (s *SQSServer) handleQueryTagQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryTagQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.tagQueueCore(r.Context(), queueName, in.Tags); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "TagQueue", queryEmptyResult{XMLName: xml.Name{Local: "TagQueueResult"}})
+}
+
+func (s *SQSServer) handleQueryUntagQueue(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryUntagQueue(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	if err := s.untagQueueCore(r.Context(), queueName, in.TagKeys); err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "UntagQueue", queryEmptyResult{XMLName: xml.Name{Local: "UntagQueueResult"}})
+}
+
+func (s *SQSServer) handleQueryListQueueTags(w http.ResponseWriter, r *http.Request, form url.Values) {
+	in := parseQueryListQueueTags(form)
+	queueName, err := queueNameFromURL(in.QueueUrl)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	tags, err := s.listQueueTagsCore(r.Context(), queueName)
+	if err != nil {
+		writeSQSQueryError(w, err)
+		return
+	}
+	writeSQSQueryResponse(w, "ListQueueTags", queryListQueueTagsResult{
+		Tags: queryTagPairs(tags),
+	})
+}
+
 // ----------- form parsers -----------
 
 func parseQueryCreateQueue(form url.Values) (*sqsCreateQueueInput, error) {
@@ -235,6 +349,12 @@ func parseQueryCreateQueue(form url.Values) (*sqsCreateQueueInput, error) {
 	// vocabulary for that resource.
 	in.Tags = collectIndexedKVPairs(form, "Tag", "Key")
 	return in, nil
+}
+
+func parseQueryDeleteQueue(form url.Values) *sqsDeleteQueueInput {
+	return &sqsDeleteQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+	}
 }
 
 func parseQueryListQueues(form url.Values) *sqsListQueuesInput {
@@ -258,6 +378,92 @@ func parseQueryGetQueueUrl(form url.Values) *sqsGetQueueUrlInput {
 	return &sqsGetQueueUrlInput{
 		QueueName: strings.TrimSpace(form.Get("QueueName")),
 	}
+}
+
+func parseQueryGetQueueAttributes(form url.Values) *sqsGetQueueAttributesInput {
+	return &sqsGetQueueAttributesInput{
+		QueueUrl:       strings.TrimSpace(form.Get("QueueUrl")),
+		AttributeNames: collectIndexedValues(form, "AttributeName"),
+	}
+}
+
+func parseQuerySetQueueAttributes(form url.Values) *sqsSetQueueAttributesInput {
+	return &sqsSetQueueAttributesInput{
+		QueueUrl:   strings.TrimSpace(form.Get("QueueUrl")),
+		Attributes: collectIndexedKVPairs(form, "Attribute", "Name"),
+	}
+}
+
+func parseQueryPurgeQueue(form url.Values) *sqsPurgeQueueInput {
+	return &sqsPurgeQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+	}
+}
+
+func parseQueryTagQueue(form url.Values) *sqsTagQueueInput {
+	return &sqsTagQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+		Tags:     collectIndexedKVPairs(form, "Tag", "Key"),
+	}
+}
+
+func parseQueryUntagQueue(form url.Values) *sqsUntagQueueInput {
+	return &sqsUntagQueueInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+		TagKeys:  collectIndexedValues(form, "TagKey"),
+	}
+}
+
+func parseQueryListQueueTags(form url.Values) *sqsListQueueTagsInput {
+	return &sqsListQueueTagsInput{
+		QueueUrl: strings.TrimSpace(form.Get("QueueUrl")),
+	}
+}
+
+// collectIndexedValues reads AWS-style indexed values of the form
+// "<prefix>.1=value1&<prefix>.2=value2". A repeated unindexed
+// "<prefix>=value" is accepted first as a compatibility courtesy for
+// hand-rolled clients; SDK-generated query requests use indexed keys.
+func collectIndexedValues(form url.Values, prefix string) []string {
+	if len(form) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(form[prefix]))
+	for _, v := range form[prefix] {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	indexed := gatherIndexedValues(form, prefix)
+	for _, item := range indexed {
+		out = append(out, item.val)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+type indexedValue struct {
+	idx int
+	val string
+}
+
+func gatherIndexedValues(form url.Values, prefix string) []indexedValue {
+	var indexed []indexedValue
+	wantPrefix := prefix + "."
+	for k, vs := range form {
+		if !strings.HasPrefix(k, wantPrefix) {
+			continue
+		}
+		idx, err := strconv.Atoi(strings.TrimPrefix(k, wantPrefix))
+		if err != nil || len(vs) == 0 || vs[0] == "" {
+			continue
+		}
+		indexed = append(indexed, indexedValue{idx: idx, val: vs[0]})
+	}
+	sort.Slice(indexed, func(i, j int) bool { return indexed[i].idx < indexed[j].idx })
+	return indexed
 }
 
 // collectIndexedKVPairs reads AWS-style indexed pairs of the form
@@ -368,6 +574,10 @@ type queryCreateQueueResult struct {
 	QueueUrl string   `xml:"QueueUrl"`
 }
 
+type queryEmptyResult struct {
+	XMLName xml.Name
+}
+
 type queryListQueuesResult struct {
 	XMLName   xml.Name `xml:"ListQueuesResult"`
 	QueueUrl  []string `xml:"QueueUrl"`
@@ -377,6 +587,58 @@ type queryListQueuesResult struct {
 type queryGetQueueUrlResult struct {
 	XMLName  xml.Name `xml:"GetQueueUrlResult"`
 	QueueUrl string   `xml:"QueueUrl"`
+}
+
+type queryGetQueueAttributesResult struct {
+	XMLName    xml.Name             `xml:"GetQueueAttributesResult"`
+	Attributes []queryAttributePair `xml:"Attribute,omitempty"`
+}
+
+type queryAttributePair struct {
+	Name  string `xml:"Name"`
+	Value string `xml:"Value"`
+}
+
+func queryAttributePairs(attrs map[string]string) []queryAttributePair {
+	if len(attrs) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(attrs))
+	for k := range attrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]queryAttributePair, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, queryAttributePair{Name: k, Value: attrs[k]})
+	}
+	return out
+}
+
+type queryListQueueTagsResult struct {
+	XMLName xml.Name       `xml:"ListQueueTagsResult"`
+	Tags    []queryTagPair `xml:"Tag,omitempty"`
+}
+
+type queryTagPair struct {
+	Key   string `xml:"Key"`
+	Value string `xml:"Value"`
+}
+
+func queryTagPairs(tags map[string]string) []queryTagPair {
+	if len(tags) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]queryTagPair, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, queryTagPair{Key: k, Value: tags[k]})
+	}
+	return out
 }
 
 // queryResponseEnvelope wraps the per-verb result in the AWS
