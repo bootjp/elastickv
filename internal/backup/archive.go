@@ -20,6 +20,7 @@ const (
 
 	archiveDefaultDirPerm   fs.FileMode = 0o755
 	archiveDefaultFilePerm  fs.FileMode = 0o600
+	archiveWritableDirPerm  fs.FileMode = 0o700
 	archiveMaxUnpackEntries             = 1_000_000
 	archiveMaxUnpackBytes   int64       = 1 << 40
 )
@@ -39,6 +40,10 @@ var (
 func PackDumpTree(root string, out io.Writer, compression string) error {
 	if out == nil {
 		return errors.New("backup archive: output writer is nil")
+	}
+	root, err := resolveArchiveDumpRoot(root)
+	if err != nil {
+		return err
 	}
 	if err := verifyDumpRoot(root); err != nil {
 		return err
@@ -97,6 +102,18 @@ func UnpackDumpTree(in io.Reader, outputRoot string, compression string) error {
 		return err
 	}
 	return nil
+}
+
+func resolveArchiveDumpRoot(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	return filepath.Clean(resolved), nil
 }
 
 func verifyDumpRoot(root string) error {
@@ -229,24 +246,25 @@ func writeTarPath(tw *tar.Writer, root, path string) error {
 }
 
 func readTarTree(tr *tar.Reader, outputRoot string, budget *archiveUnpackBudget) error {
+	dirModes := make(map[string]fs.FileMode)
 	for {
 		hdr, err := tr.Next()
 		switch {
 		case errors.Is(err, io.EOF):
-			return nil
+			return applyArchiveDirModes(dirModes)
 		case err != nil:
 			return errors.WithStack(err)
 		}
 		if err := budget.reserveEntry(hdr.Name); err != nil {
 			return err
 		}
-		if err := extractTarEntry(tr, outputRoot, hdr, budget); err != nil {
+		if err := extractTarEntry(tr, outputRoot, hdr, budget, dirModes); err != nil {
 			return err
 		}
 	}
 }
 
-func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header, budget *archiveUnpackBudget) error {
+func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header, budget *archiveUnpackBudget, dirModes map[string]fs.FileMode) error {
 	rel, err := cleanArchiveRelPath(hdr.Name)
 	if err != nil {
 		return err
@@ -260,7 +278,14 @@ func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header, budget 
 	target := filepath.Join(outputRoot, rel)
 	switch hdr.Typeflag {
 	case tar.TypeDir:
-		return errors.WithStack(os.MkdirAll(target, archiveMode(hdr.FileInfo().Mode().Perm(), archiveDefaultDirPerm)))
+		mode := archiveMode(hdr.FileInfo().Mode().Perm(), archiveDefaultDirPerm)
+		if err := os.MkdirAll(target, writableArchiveDirMode(mode)); err != nil {
+			return errors.WithStack(err)
+		}
+		if dirModes != nil {
+			dirModes[target] = mode
+		}
+		return nil
 	case tar.TypeReg, 0:
 		return extractRegularTarEntry(tr, target, hdr, budget)
 	default:
@@ -309,6 +334,29 @@ func archiveMode(mode fs.FileMode, fallback fs.FileMode) fs.FileMode {
 		return fallback
 	}
 	return mode
+}
+
+func writableArchiveDirMode(mode fs.FileMode) fs.FileMode {
+	return archiveMode(mode, archiveDefaultDirPerm) | archiveWritableDirPerm
+}
+
+func applyArchiveDirModes(modes map[string]fs.FileMode) error {
+	dirs := make([]string, 0, len(modes))
+	for dir := range modes {
+		dirs = append(dirs, dir)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		if len(dirs[i]) == len(dirs[j]) {
+			return dirs[i] > dirs[j]
+		}
+		return len(dirs[i]) > len(dirs[j])
+	})
+	for _, dir := range dirs {
+		if err := os.Chmod(dir, modes[dir]); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
 }
 
 type archiveUnpackBudget struct {

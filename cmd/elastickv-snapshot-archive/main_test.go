@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -70,6 +71,19 @@ func TestArchiveCLIRejectsSymlinkedOutputInsideInputTree(t *testing.T) {
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.ErrorIs(t, err, errArchiveOutputInsideInput)
 	require.Equal(t, exitUserErr, code)
+}
+
+func TestCloseArchiveOutputRemovesFailedArtifact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.tar")
+	require.NoError(t, os.WriteFile(path, []byte("partial"), 0o600))
+
+	err := closeArchiveOutput(path, func() error {
+		return errors.New("delayed writeback failed")
+	})
+
+	require.ErrorContains(t, err, "delayed writeback failed")
+	_, statErr := os.Stat(path)
+	require.True(t, os.IsNotExist(statErr))
 }
 
 func writeCLIDumpFixture(t *testing.T) string {

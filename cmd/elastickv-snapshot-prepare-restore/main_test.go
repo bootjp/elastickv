@@ -96,6 +96,23 @@ func TestRunPrepareRestoreFailureCases(t *testing.T) {
 	}
 }
 
+func TestRunPrepareRestoreClassifiesTruncatedHeaderAsDataErr(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "encoded.fsm")
+	require.NoError(t, os.WriteFile(input, nil, 0o600))
+	writeEncodeInfo(t, input, "cluster-a", true, true)
+
+	code, err := run([]string{
+		"--input", input,
+		"--data-dir", filepath.Join(dir, "raft"),
+		"--index", "5",
+		"--peers", "n1=127.0.0.1:12001",
+		"--target-cluster-id", "cluster-a",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.ErrorIs(t, err, backup.ErrSnapshotTruncated)
+	require.Equal(t, exitDataErr, code)
+}
+
 func TestRunPrepareRestoreAcceptedFlagCombinations(t *testing.T) {
 	testCases := []struct {
 		name            string

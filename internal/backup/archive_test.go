@@ -24,6 +24,36 @@ func TestPackUnpackDumpTreeZstdRoundTrip(t *testing.T) {
 	require.FileExists(t, filepath.Join(out, "redis", "db_0", "strings", "key.bin"))
 }
 
+func TestPackDumpTreeFollowsSymlinkedRoot(t *testing.T) {
+	root := writeArchiveFixture(t)
+	link := filepath.Join(t.TempDir(), "current")
+	require.NoError(t, os.Symlink(root, link))
+
+	var buf bytes.Buffer
+	require.NoError(t, PackDumpTree(link, &buf, ArchiveCompressionNone))
+
+	out := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone))
+	require.FileExists(t, filepath.Join(out, "redis", "db_0", "strings", "key.bin"))
+}
+
+func TestUnpackDumpTreeRestoresReadOnlyDirectoryModesAfterChildren(t *testing.T) {
+	root := writeArchiveFixture(t)
+	require.NoError(t, os.Chmod(filepath.Join(root, "redis"), 0o555))
+	t.Cleanup(func() { makeArchiveTreeWritable(root) })
+
+	var buf bytes.Buffer
+	require.NoError(t, PackDumpTree(root, &buf, ArchiveCompressionNone))
+
+	out := filepath.Join(t.TempDir(), "out")
+	t.Cleanup(func() { makeArchiveTreeWritable(out) })
+	require.NoError(t, UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone))
+	require.FileExists(t, filepath.Join(out, "redis", "db_0", "strings", "key.bin"))
+	info, err := os.Stat(filepath.Join(out, "redis"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o555), info.Mode().Perm())
+}
+
 func TestUnpackDumpTreeRejectsTraversal(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -138,4 +168,13 @@ func writeArchiveFixture(t *testing.T) string {
 	require.NoError(t, f.Close())
 	require.NoError(t, WriteChecksums(root))
 	return root
+}
+
+func makeArchiveTreeWritable(root string) {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(path, 0o755)
+		}
+		return nil
+	})
 }

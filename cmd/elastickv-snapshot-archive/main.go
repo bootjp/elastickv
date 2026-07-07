@@ -123,7 +123,7 @@ func runPack(cfg *config, logger *slog.Logger) error {
 		removeFailedArchiveOutput(cfg.outputPath)
 		return errors.Wrap(err, "pack snapshot dump tree")
 	}
-	if err := closeFn(); err != nil {
+	if err := closeArchiveOutput(cfg.outputPath, closeFn); err != nil {
 		return err
 	}
 	logger.Info("snapshot dump archive written", "input", cfg.inputPath, "output", cfg.outputPath, "compression", cfg.compression)
@@ -170,6 +170,14 @@ func removeFailedArchiveOutput(path string) {
 		return
 	}
 	_ = os.Remove(path)
+}
+
+func closeArchiveOutput(path string, closeFn func() error) error {
+	if err := closeFn(); err != nil {
+		removeFailedArchiveOutput(path)
+		return err
+	}
+	return nil
 }
 
 func runUnpack(cfg *config, logger *slog.Logger) error {

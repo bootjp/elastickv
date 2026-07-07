@@ -189,6 +189,9 @@ func readEncodeInfo(path string) (backup.EncodeInfo, error) {
 }
 
 func validatePayload(path string) (backup.SnapshotHeader, string, error) {
+	if err := requireRegularRestoreInput(path); err != nil {
+		return backup.SnapshotHeader{}, "", err
+	}
 	f, err := os.Open(path) //nolint:gosec // operator-supplied restore artifact path
 	if err != nil {
 		return backup.SnapshotHeader{}, "", errors.WithStack(err)
@@ -199,9 +202,23 @@ func validatePayload(path string) (backup.SnapshotHeader, string, error) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return backup.SnapshotHeader{}, "", errors.Wrap(backup.ErrSnapshotTruncated, err.Error())
+		}
 		return backup.SnapshotHeader{}, "", errors.Wrap(err, "read encoded snapshot payload")
 	}
 	return header, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func requireRegularRestoreInput(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s is not a regular file", path)
+	}
+	return nil
 }
 
 func validateEncodeInfo(info backup.EncodeInfo, gotSHA string, cfg *config) error {
