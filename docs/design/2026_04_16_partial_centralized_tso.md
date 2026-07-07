@@ -1,6 +1,6 @@
 # Centralized Timestamp Oracle (TSO) Design
 
-- Status: Partial — M1 all-led-group HLC renewal implemented; dedicated TSO group and batch allocator remain open
+- Status: Partial — M1 all-led-group HLC renewal and allocator/batch-window code implemented; dedicated TSO Raft group wiring remains open
 - Author: bootjp
 - Date: 2026-04-16
 - Updated: 2026-07-07
@@ -8,6 +8,22 @@
 ---
 
 ## 1. Background and Motivation
+
+### 1.0 Implementation Status
+
+Implemented:
+
+1. `ShardedCoordinator.RunHLCLeaseRenewal` renews every led shard group.
+2. `HLC.NextBatchFenced` atomically reserves consecutive timestamp windows while enforcing the physical-ceiling fence.
+3. `LocalTSOAllocator` implements `TSOAllocator` on top of a leader coordinator and its shared `HLC`.
+4. `BatchAllocator` caches immutable timestamp windows and uses lock-free atomic slot claims on the hot path.
+
+Remaining:
+
+1. Reserve and bootstrap a dedicated TSO Raft group.
+2. Route production coordinator timestamp issuance through the TSO allocator instead of direct local HLC allocation.
+3. Add follower redirect/admin exposure for the dedicated TSO leader.
+4. Wire deployment/bootstrap config and mixed-version safety around the extra group.
 
 ### 1.1 Original Limitation
 
