@@ -1603,6 +1603,37 @@ func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
 	require.False(t, engine.hasPendingConfChange())
 }
 
+func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: raftpb.EntryConfChange,
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(129)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage())
+	require.True(t, engine.hasPendingConfChange())
+
+	engine.clearPendingConfChange(130)
+	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestRestorePendingConfChangeFenceFromStorageIgnoresAppliedConfig(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 100, 150, map[uint64]raftpb.Entry{
+		130: {
+			Type: raftpb.EntryConfChange,
+			Data: []byte("conf"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(130)
+
+	require.NoError(t, engine.restorePendingConfChangeFenceFromStorage())
+	require.False(t, engine.hasPendingConfChange())
+}
+
 func newTransportTestNodes(t *testing.T, count int) ([]*transportTestNode, []Peer) {
 	t.Helper()
 

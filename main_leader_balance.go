@@ -152,7 +152,7 @@ func (c *leaderBalanceConfig) normalize() {
 			c.startupGrace = c.globalCooldown
 		}
 	}
-	if c.imbalanceThreshold <= 0 {
+	if c.imbalanceThreshold < defaultLeaderBalanceImbalanceThreshold {
 		c.imbalanceThreshold = defaultLeaderBalanceImbalanceThreshold
 	}
 }
@@ -235,7 +235,16 @@ func (l *leaderBalanceLoop) killSwitchActive() bool {
 		return false
 	}
 	_, err := os.Stat(l.cfg.killSwitchFile)
-	return err == nil
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	l.cfg.logger.Warn("leader-balance: kill switch stat failed; skipping transfers",
+		"path", l.cfg.killSwitchFile,
+		"err", err)
+	return true
 }
 
 func (l *leaderBalanceLoop) executeMove(ctx context.Context, move leaderBalanceMove) error {

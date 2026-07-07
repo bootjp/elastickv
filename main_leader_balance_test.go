@@ -2,6 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +92,33 @@ func TestChooseLeaderBalanceMove_PrioritizesMostOverloadedSource(t *testing.T) {
 	require.Equal(t, uint64(3), decision.move.groupID)
 	require.Equal(t, "n1", decision.move.sourceID)
 	require.Equal(t, "n3", decision.move.chosenTarget.ID)
+}
+
+func TestLeaderBalanceConfigNormalizeClampsOneCountThreshold(t *testing.T) {
+	cfg := leaderBalanceConfig{imbalanceThreshold: 1}
+	cfg.normalize()
+	require.Equal(t, defaultLeaderBalanceImbalanceThreshold, cfg.imbalanceThreshold)
+}
+
+func TestLeaderBalanceTargetCandidatesRequireObjectiveImprovement(t *testing.T) {
+	group := balanceGroupForLeader(2, "n1", "127.0.0.1:5001", "n1", "n2")
+	candidates := leaderBalanceTargetCandidates(group, map[string]int{"n1": 1, "n2": 0}, defaultLeaderBalanceImbalanceThreshold)
+	require.Empty(t, candidates)
+}
+
+func TestLeaderBalanceKillSwitchFailsClosedOnAmbiguousStatError(t *testing.T) {
+	badPath := filepath.Join(t.TempDir(), "kill-switch"+strings.Repeat("\x00", 1))
+	loop := &leaderBalanceLoop{cfg: leaderBalanceConfig{
+		killSwitchFile: badPath,
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}}
+	require.True(t, loop.killSwitchActive())
+
+	missingFile := filepath.Join(t.TempDir(), "kill-switch")
+	loop.cfg.killSwitchFile = missingFile
+	require.False(t, loop.killSwitchActive())
+	require.NoError(t, os.WriteFile(missingFile, []byte("stop"), 0o600))
+	require.True(t, loop.killSwitchActive())
 }
 
 func TestBuildLeaderBalanceTransferRequestFailsClosedForOldServers(t *testing.T) {

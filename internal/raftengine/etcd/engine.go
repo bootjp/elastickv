@@ -591,6 +591,10 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.appliedIndex.Store(initialApplied)
+	if err := engine.restorePendingConfChangeFenceFromStorage(); err != nil {
+		_ = closePersist(prepared.disk.Persist)
+		return nil, err
+	}
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()
@@ -609,14 +613,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	// non-positive lease window: lease reads would never hit the fast
 	// path. Don't fail Open -- the engine is still functional via the
 	// slow LinearizableRead path -- but make the degradation visible.
-	if lease := engine.LeaseDuration(); lease <= 0 {
-		slog.Warn("etcd raft engine: lease read disabled (non-positive LeaseDuration)",
-			slog.Duration("tick_interval", engine.tickInterval),
-			slog.Int("election_tick", engine.electionTick),
-			slog.Duration("lease_safety_margin", leaseSafetyMargin),
-			slog.Duration("computed_lease", lease),
-		)
-	}
+	engine.warnIfLeaseReadDisabled()
 
 	go engine.run()
 
@@ -626,6 +623,17 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	opened = true
 	return openedEngine, nil
+}
+
+func (e *Engine) warnIfLeaseReadDisabled() {
+	if lease := e.LeaseDuration(); lease <= 0 {
+		slog.Warn("etcd raft engine: lease read disabled (non-positive LeaseDuration)",
+			slog.Duration("tick_interval", e.tickInterval),
+			slog.Int("election_tick", e.electionTick),
+			slog.Duration("lease_safety_margin", leaseSafetyMargin),
+			slog.Duration("computed_lease", lease),
+		)
+	}
 }
 
 func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
@@ -2355,6 +2363,56 @@ func (e *Engine) applyReadyEntries(entries []raftpb.Entry) error {
 		}
 	}
 	return errors.WithStack(e.storage.Append(entries))
+}
+
+func (e *Engine) restorePendingConfChangeFenceFromStorage() error {
+	if e.storage == nil {
+		return nil
+	}
+	entries, err := e.pendingConfChangeRestoreEntries()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		e.restorePendingConfChangeFenceFromEntry(entry)
+	}
+	return nil
+}
+
+func (e *Engine) pendingConfChangeRestoreEntries() ([]raftpb.Entry, error) {
+	applied := e.appliedIndex.Load()
+	if applied == math.MaxUint64 {
+		return nil, nil
+	}
+	firstIndex, err := e.storage.FirstIndex()
+	if err != nil {
+		return nil, errors.Wrap(err, "restore pending conf-change fence: first index")
+	}
+	lastIndex, err := e.storage.LastIndex()
+	if err != nil {
+		return nil, errors.Wrap(err, "restore pending conf-change fence: last index")
+	}
+	if lastIndex <= applied || lastIndex < firstIndex {
+		return nil, nil
+	}
+	if lastIndex == math.MaxUint64 {
+		return nil, errors.New("restore pending conf-change fence: last index overflows half-open range")
+	}
+	lo := applied + 1
+	if lo < firstIndex {
+		lo = firstIndex
+	}
+	entries, err := e.storage.Entries(lo, lastIndex+1, math.MaxUint64)
+	if err != nil {
+		return nil, errors.Wrapf(err, "restore pending conf-change fence: entries %d..%d", lo, lastIndex)
+	}
+	return entries, nil
+}
+
+func (e *Engine) restorePendingConfChangeFenceFromEntry(entry raftpb.Entry) {
+	if entry.Type == raftpb.EntryConfChange || entry.Type == raftpb.EntryConfChangeV2 {
+		e.markPendingConfChange(entry.Index)
+	}
 }
 
 func (e *Engine) applyReadyHardState(hardState raftpb.HardState) error {
