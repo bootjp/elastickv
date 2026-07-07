@@ -137,6 +137,98 @@ func TestRedis_MultiExecAtomic(t *testing.T) {
 	require.Equal(t, "v2", got2)
 }
 
+func TestRedis_MultiExec_IncrRuntimeErrorDoesNotAbortTransaction(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	require.NoError(t, rdb.Set(ctx, "txn:bad-int", "not-int", 0).Err())
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "txn:before", "committed").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "INCR", "txn:bad-int").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "txn:after", "committed").Val())
+
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]any)
+	require.True(t, ok, "EXEC result should be []interface{}")
+	require.Len(t, vals, 3)
+	require.Equal(t, "OK", vals[0])
+	errItem, ok := vals[1].(error)
+	require.True(t, ok, "INCR result should be an EXEC item error, got %T", vals[1])
+	require.Contains(t, errItem.Error(), "value is not an integer or out of range")
+	require.Equal(t, "OK", vals[2])
+
+	got, err := rdb.Get(ctx, "txn:bad-int").Result()
+	require.NoError(t, err)
+	require.Equal(t, "not-int", got)
+	require.Equal(t, "committed", rdb.Get(ctx, "txn:before").Val())
+	require.Equal(t, "committed", rdb.Get(ctx, "txn:after").Val())
+}
+
+func TestRedis_MultiExec_IncrOverflowIsResultError(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	const maxInt64String = "9223372036854775807"
+	require.NoError(t, rdb.Set(ctx, "txn:overflow", maxInt64String, 0).Err())
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "INCR", "txn:overflow").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "txn:overflow-neighbor", "ok").Val())
+
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]any)
+	require.True(t, ok, "EXEC result should be []interface{}")
+	require.Len(t, vals, 2)
+	errItem, ok := vals[0].(error)
+	require.True(t, ok, "INCR overflow should be an EXEC item error, got %T", vals[0])
+	require.Contains(t, errItem.Error(), "overflow")
+	require.Equal(t, "OK", vals[1])
+
+	require.Equal(t, maxInt64String, rdb.Get(ctx, "txn:overflow").Val())
+	require.Equal(t, "ok", rdb.Get(ctx, "txn:overflow-neighbor").Val())
+}
+
+func TestRedis_MultiExec_IncrDoesNotOverwriteHLL(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	require.NoError(t, rdb.Do(ctx, "PFADD", "txn:hll", "a").Err())
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "INCR", "txn:hll").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "txn:hll-neighbor", "ok").Val())
+
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]any)
+	require.True(t, ok, "EXEC result should be []interface{}")
+	require.Len(t, vals, 2)
+	errItem, ok := vals[0].(error)
+	require.True(t, ok, "HLL INCR should be an EXEC item error, got %T", vals[0])
+	require.Contains(t, errItem.Error(), "value is not an integer or out of range")
+	require.Equal(t, "OK", vals[1])
+
+	count, err := rdb.Do(ctx, "PFCOUNT", "txn:hll").Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+	require.Equal(t, "ok", rdb.Get(ctx, "txn:hll-neighbor").Val())
+}
+
 func TestRedis_RPushLRange(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)

@@ -307,25 +307,56 @@ func (t *txnContext) loadHashState(key []byte) (*hashTxnState, error) {
 		t.hashStates = map[string]*hashTxnState{}
 	}
 	if st, ok := t.hashStates[k]; ok {
-		if st.deleted {
-			st.fields = map[string][]byte{}
-			st.origFields = map[string][]byte{}
-			st.legacy = false
-			st.deleted = false
-			st.dirty = true
-		}
-		return st, nil
+		return reviveDeletedHashState(st), nil
 	}
 	if _, deleted := t.deletedKeys[k]; deleted {
-		st := &hashTxnState{
-			fields:     map[string][]byte{},
-			origFields: map[string][]byte{},
-			dirty:      true,
-		}
-		t.hashStates[k] = st
-		return st, nil
+		return t.storeEmptyHashState(k), nil
 	}
+	if st, err := t.loadExpiredHashAsEmpty(key, k); err != nil || st != nil {
+		return st, err
+	}
+	return t.loadExistingHashState(key, k)
+}
 
+func reviveDeletedHashState(st *hashTxnState) *hashTxnState {
+	if st.deleted {
+		st.fields = map[string][]byte{}
+		st.origFields = map[string][]byte{}
+		st.legacy = false
+		st.deleted = false
+		st.dirty = true
+	}
+	return st
+}
+
+func (t *txnContext) storeEmptyHashState(key string) *hashTxnState {
+	st := &hashTxnState{
+		fields:     map[string][]byte{},
+		origFields: map[string][]byte{},
+		dirty:      true,
+	}
+	t.hashStates[key] = st
+	return st
+}
+
+func (t *txnContext) loadExpiredHashAsEmpty(key []byte, keyString string) (*hashTxnState, error) {
+	ttlSt, err := t.loadTTLState(key)
+	if err != nil {
+		return nil, err
+	}
+	if ttlSt.value == nil || ttlSt.value.After(time.Now()) {
+		return nil, nil
+	}
+	ttlSt.value = nil
+	ttlSt.dirty = true
+	if t.hashDeletes == nil {
+		t.hashDeletes = map[string][]byte{}
+	}
+	t.hashDeletes[keyString] = bytes.Clone(key)
+	return t.storeEmptyHashState(keyString), nil
+}
+
+func (t *txnContext) loadExistingHashState(key []byte, keyString string) (*hashTxnState, error) {
 	ctx := t.ctxOrBackground()
 	value, err := t.server.loadHashAt(ctx, key, t.startTS)
 	if err != nil {
@@ -347,7 +378,7 @@ func (t *txnContext) loadHashState(key []byte) (*hashTxnState, error) {
 		origFields: origFields,
 		legacy:     legacy,
 	}
-	t.hashStates[k] = st
+	t.hashStates[keyString] = st
 	return st, nil
 }
 
@@ -587,6 +618,15 @@ func (t *txnContext) stageStringReplacement(key, value []byte, ttl *time.Time) {
 	delete(t.deletedKeys, k)
 }
 
+func (t *txnContext) updateStringReplacementTTL(key []byte, ttl *time.Time) bool {
+	repl, ok := t.replacers[string(key)]
+	if !ok {
+		return false
+	}
+	repl.ttl = cloneTimePtr(ttl)
+	return true
+}
+
 func (t *txnContext) currentStringValue(key []byte) ([]byte, *time.Time, bool, error) {
 	if repl, ok := t.replacers[string(key)]; ok {
 		return bytes.Clone(repl.value), cloneTimePtr(repl.ttl), true, nil
@@ -628,26 +668,66 @@ func (t *txnContext) applyIncr(cmd redcon.Command) (redisResult, error) {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
 
-	var current int64
-	var ttl *time.Time
-	if typ == redisTypeString {
-		raw, existingTTL, ok, err := t.currentStringValue(cmd.Args[1])
-		if err != nil {
-			return redisResult{}, err
-		}
-		ttl = existingTTL
-		if ok {
-			current, err = strconv.ParseInt(string(raw), 10, 64)
-			if err != nil {
-				return redisResult{}, errors.New("ERR value is not an integer or out of range")
-			}
-		}
+	current, ttl, res, handled, err := t.incrBaseValue(cmd.Args[1], typ)
+	if err != nil || handled {
+		return res, err
+	}
+	if current == math.MaxInt64 {
+		return incrOverflowResult(), nil
 	}
 	current++
 	if err := t.stageStringValue(cmd.Args[1], []byte(strconv.FormatInt(current, 10)), ttl); err != nil {
 		return redisResult{}, err
 	}
 	return redisResult{typ: resultInt, integer: current}, nil
+}
+
+func (t *txnContext) incrBaseValue(key []byte, typ redisValueType) (int64, *time.Time, redisResult, bool, error) {
+	if typ != redisTypeString {
+		return 0, nil, redisResult{}, false, nil
+	}
+	if res, handled, err := t.rejectNonPlainIncrString(key); err != nil || handled {
+		return 0, nil, res, handled, err
+	}
+	raw, ttl, ok, err := t.currentStringValue(key)
+	if err != nil {
+		return 0, nil, redisResult{}, false, err
+	}
+	if !ok {
+		return 0, ttl, redisResult{}, false, nil
+	}
+	current, ok := parseRedisIncrValue(raw)
+	if !ok {
+		return 0, nil, integerValueErrorResult(), true, nil
+	}
+	return current, ttl, redisResult{}, false, nil
+}
+
+func (t *txnContext) rejectNonPlainIncrString(key []byte) (redisResult, bool, error) {
+	if t.hasReplacement(key) {
+		return redisResult{}, false, nil
+	}
+	plain, err := t.server.isPlainRedisString(t.ctxOrBackground(), key, t.startTS)
+	if err != nil {
+		return redisResult{}, false, err
+	}
+	if plain {
+		return redisResult{}, false, nil
+	}
+	return integerValueErrorResult(), true, nil
+}
+
+func parseRedisIncrValue(raw []byte) (int64, bool) {
+	current, err := strconv.ParseInt(string(raw), 10, 64)
+	return current, err == nil
+}
+
+func integerValueErrorResult() redisResult {
+	return redisResult{typ: resultError, err: errors.New("ERR value is not an integer or out of range")}
+}
+
+func incrOverflowResult() redisResult {
+	return redisResult{typ: resultError, err: errors.New("ERR increment or decrement would overflow")}
 }
 
 func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
@@ -842,6 +922,9 @@ func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Durati
 	state.value = &expireAt
 	state.dirty = true
 	if typ == redisTypeString {
+		if t.updateStringReplacementTTL(key, &expireAt) {
+			return redisResult{typ: resultInt, integer: 1}, nil
+		}
 		plain, err := t.server.isPlainRedisString(t.ctxOrBackground(), key, t.startTS)
 		if err != nil {
 			return redisResult{}, err

@@ -173,6 +173,63 @@ func TestRedis_MultiExec_SetEXStoresTTL(t *testing.T) {
 	require.Greater(t, ttl, time.Duration(0))
 }
 
+func TestRedis_MultiExec_SetThenExpireStoresReplacementTTL(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "SET", "multi:set-expire", "hello").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "EXPIRE", "multi:set-expire", "30").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"OK", int64(1)}, execRes)
+
+	val, err := rdb.Get(ctx, "multi:set-expire").Result()
+	require.NoError(t, err)
+	require.Equal(t, "hello", val)
+
+	ttl, err := rdb.TTL(ctx, "multi:set-expire").Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+	require.LessOrEqual(t, ttl, 30*time.Second)
+}
+
+func TestRedis_MultiExec_HSetRecreatesExpiredHash(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+
+	require.NoError(t, rdb.HSet(ctx, "multi:expired-hash", "stale", "old").Err())
+	require.NoError(t, rdb.PExpire(ctx, "multi:expired-hash", time.Millisecond).Err())
+	require.Eventually(t, func() bool {
+		exists, err := rdb.Exists(ctx, "multi:expired-hash").Result()
+		return err == nil && exists == 0
+	}, time.Second, 10*time.Millisecond)
+
+	require.NoError(t, rdb.Do(ctx, "MULTI").Err())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "HSET", "multi:expired-hash", "fresh", "new").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{int64(1)}, execRes)
+
+	got, err := rdb.HGetAll(ctx, "multi:expired-hash").Result()
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"fresh": "new"}, got)
+
+	ttl, err := rdb.TTL(ctx, "multi:expired-hash").Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttl)
+}
+
 // ────────────────────────────────────────────────────────────────
 // Key expiration — expired keys must become invisible
 // ────────────────────────────────────────────────────────────────
