@@ -48,6 +48,7 @@ const (
 	etcdElectionMinTicks  = 2
 	etcdMaxSizePerMsg     = 1 << 20
 	etcdMaxInflightMsg    = 256
+	defaultTSOBatchSize   = 256
 )
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
@@ -102,6 +103,8 @@ var (
 	raftBootstrap         = flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	raftBootstrapMembers  = flag.String("raftBootstrapMembers", "", "Comma-separated bootstrap raft members (raftID=host:port,...)")
 	raftJoinAsLearner     = flag.Bool("raftJoinAsLearner", false, "Local node expects to join an existing cluster as a learner; if a post-apply ConfState lists this node as a voter instead, an ERROR-level alarm fires (the node keeps running -- the flag is an operator alarm, not a consensus veto). See docs/design/2026_04_26_proposed_raft_learner.md §4.5.")
+	tsoEnabled            = flag.Bool("tsoEnabled", false, "Issue coordinator-owned persistence timestamps through the local TSO batch allocator instead of direct HLC calls")
+	tsoBatchSize          = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used when --tsoEnabled is true")
 	raftGroups            = flag.String("raftGroups", "", "Comma-separated raft groups (groupID=host:port,...)")
 	shardRanges           = flag.String("shardRanges", "", "Comma-separated shard ranges (start:end=groupID,...)")
 	raftRedisMap          = flag.String("raftRedisMap", "", "Map of Raft address to Redis address (raftAddr=redisAddr,...)")
@@ -402,9 +405,7 @@ func run() error {
 	// The label is resolved per-pebbleStore from ELASTICKV_FSM_SYNC_MODE
 	// in NewPebbleStore; read it off the first constructed store (all
 	// shards share the same env and therefore the same label).
-	if label := fsmApplySyncModeLabelFromRuntimes(runtimes); label != "" {
-		metricsRegistry.SetFSMApplySyncMode(label)
-	}
+	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
@@ -426,6 +427,9 @@ func run() error {
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
+	if err := configureCoordinatorTSO(coordinate); err != nil {
+		return err
+	}
 
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
@@ -1076,6 +1080,12 @@ func fsmApplySyncModeLabelFromRuntimes(runtimes []*raftGroupRuntime) string {
 	return ""
 }
 
+func recordFSMApplySyncMode(reg *monitoring.Registry, runtimes []*raftGroupRuntime) {
+	if label := fsmApplySyncModeLabelFromRuntimes(runtimes); label != "" {
+		reg.SetFSMApplySyncMode(label)
+	}
+}
+
 // pebbleMonitorSources extracts the MVCC stores that expose
 // *pebble.DB.Metrics() so monitoring can poll LSM internals (L0
 // sublevels, compaction debt, memtable, block cache) for the
@@ -1273,6 +1283,22 @@ func startServers(in serversInput) error {
 	if err := startAdminFromFlags(in.ctx, in.lc, in.eg, in.runtimes, runner.dynamoServer, runner.s3Server, runner.sqsServer, in.coordinate, connCache, in.keyvizSampler, fanoutCfg); err != nil {
 		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
 	}
+	return nil
+}
+
+func configureCoordinatorTSO(coordinate *kv.ShardedCoordinator) error {
+	if !*tsoEnabled {
+		return nil
+	}
+	tso, err := kv.NewLocalTSOAllocator(coordinate)
+	if err != nil {
+		return errors.Wrap(err, "configure tso allocator")
+	}
+	batch, err := kv.NewBatchAllocator(tso, *tsoBatchSize)
+	if err != nil {
+		return errors.Wrap(err, "configure tso batch allocator")
+	}
+	coordinate.WithTSOAllocator(batch)
 	return nil
 }
 
@@ -1616,7 +1642,13 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
-		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
+		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
+			trx,
+			rt.engine,
+			coordinate.Clock(),
+			relay,
+			internalTimestampOptions(coordinate)...,
+		))
 		pb.RegisterDistributionServer(gs, distServer)
 		if adminServer != nil {
 			pb.RegisterAdminServer(gs, adminServer)
@@ -1675,6 +1707,13 @@ func startRaftServers(
 			}
 			return errors.WithStack(err)
 		})
+	}
+	return nil
+}
+
+func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {
+	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
+		return []adapter.InternalOption{adapter.WithInternalTimestampAllocator(alloc)}
 	}
 	return nil
 }

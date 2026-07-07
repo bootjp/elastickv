@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -78,6 +79,75 @@ func TestLocalTSOAllocatorWaitsForLeadership(t *testing.T) {
 	got, err := alloc.Next(context.Background())
 	require.NoError(t, err)
 	require.NotZero(t, got)
+}
+
+func TestCoordinateUsesTSOAllocatorForIssuedTimestamps(t *testing.T) {
+	t.Parallel()
+
+	staleClock := NewHLC()
+	staleClock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	coord := &Coordinate{
+		clock:       staleClock,
+		tsAllocator: &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true},
+	}
+
+	startTS, err := coord.nextStartTS(context.Background())
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase, startTS)
+
+	commitTS, err := coord.resolveDispatchCommitTS(context.Background(), 0, startTS)
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+1, commitTS)
+}
+
+func TestShardedCoordinatorUsesTSOAllocatorForRawTxnAndDelPrefix(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	g1Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 3},
+			{CommitIndex: 7},
+			{CommitIndex: 11},
+		},
+	}
+	g2Txn := &recordingTransactional{
+		responses: []*TransactionResponse{
+			{CommitIndex: 5},
+		},
+	}
+	staleClock := NewHLC()
+	staleClock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, staleClock, nil).WithTSOAllocator(&fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true})
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("raw")}},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase, g1Txn.requests[0].Ts)
+
+	_, err = coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: DelPrefix, Key: []byte("prefix")}},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, testTSOInitialBase+1, g1Txn.requests[1].Ts)
+	require.EqualValues(t, testTSOInitialBase+1, g2Txn.requests[0].Ts)
+
+	_, err = coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true,
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("txn")}},
+	})
+	require.NoError(t, err)
+	txnReq := g1Txn.requests[2]
+	require.EqualValues(t, testTSOInitialBase+2, txnReq.Ts)
+	require.EqualValues(t, testTSOInitialBase+3, requestTxnMeta(t, txnReq).CommitTS)
 }
 
 type fakeTSOAllocator struct {

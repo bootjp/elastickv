@@ -116,7 +116,7 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 // silent-no-op semantics and AWS S3.
 func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string) (*s3ObjectManifest, uint64, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(ctx, readTS)
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "s3 admin: allocate startTS for adminDeleteObjectTxn")
 	}
@@ -215,7 +215,7 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 //nolint:cyclop,gocognit,nestif // see comment above
 func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string, body io.Reader, contentType string) (*s3ObjectManifest, uint64, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(readTS)
+	startTS, err := s.txnStartTS(ctx, readTS)
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "s3 admin: allocate startTS for adminPutObjectStream")
 	}
@@ -314,7 +314,7 @@ func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string,
 	part.ETag = etag
 	part.SizeBytes = sizeBytes
 	part.ChunkCount = uint64(len(part.ChunkSizes))
-	commitTS, err := s.nextTxnCommitTS(startTS)
+	commitTS, err := s.nextTxnCommitTS(ctx, startTS)
 	if err != nil {
 		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
 		return nil, 0, errors.WithStack(err)

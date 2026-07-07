@@ -27,6 +27,64 @@ type TSOAllocator interface {
 	RunLeaseRenewal(ctx context.Context)
 }
 
+// TimestampAllocator is the minimal timestamp source the coordinators need.
+// TSOAllocator and BatchAllocator both satisfy it; keeping this interface
+// narrow lets production use a batched TSO while tests can inject a tiny fake.
+type TimestampAllocator interface {
+	Next(ctx context.Context) (uint64, error)
+}
+
+// NextTimestampThrough allocates a persistence-grade timestamp through coord's
+// optional TSO allocator when available, falling back to the legacy HLC clock
+// for older Coordinator implementations and tests.
+func NextTimestampThrough(ctx context.Context, coord Coordinator, label string) (uint64, error) {
+	if alloc, ok := coord.(TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		if err != nil {
+			return 0, errors.Wrap(err, label)
+		}
+		return ts, nil
+	}
+	if coord == nil || coord.Clock() == nil {
+		return 1, nil
+	}
+	ts, err := coord.Clock().NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+// NextTimestampAfterThrough allocates a timestamp strictly greater than
+// startTS. It observes startTS into legacy HLC clocks before allocation so the
+// fallback path preserves the previous OCC ordering contract.
+func NextTimestampAfterThrough(ctx context.Context, coord Coordinator, startTS uint64, label string) (uint64, error) {
+	if startTS == ^uint64(0) {
+		return 0, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+	if coord != nil && coord.Clock() != nil {
+		coord.Clock().Observe(startTS)
+	}
+	ts, err := NextTimestampThrough(ctx, coord, label)
+	if err != nil {
+		return 0, err
+	}
+	if ts > startTS {
+		return ts, nil
+	}
+	if coord != nil && coord.Clock() != nil {
+		coord.Clock().Observe(startTS)
+	}
+	retry, err := NextTimestampThrough(ctx, coord, "re-"+label)
+	if err != nil {
+		return 0, err
+	}
+	if retry <= startTS {
+		return 0, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+	return retry, nil
+}
+
 type tsoCoordinator interface {
 	IsLeader() bool
 	Clock() *HLC

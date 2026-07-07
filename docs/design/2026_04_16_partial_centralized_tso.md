@@ -1,6 +1,8 @@
 # Centralized Timestamp Oracle (TSO) Design
 
-- Status: Partial — M1 all-led-group HLC renewal and allocator/batch-window code implemented; dedicated TSO Raft group wiring remains open
+- Status: Partial — M1 all-led-group HLC renewal and the M3-M5 default-group
+  TSO allocator/batch cutover are implemented; dedicated TSO Raft group wiring
+  remains open
 - Author: bootjp
 - Date: 2026-04-16
 - Updated: 2026-07-07
@@ -17,13 +19,26 @@ Implemented:
 2. `HLC.NextBatchFenced` atomically reserves consecutive timestamp windows while enforcing the physical-ceiling fence.
 3. `LocalTSOAllocator` implements `TSOAllocator` on top of a leader coordinator and its shared `HLC`.
 4. `BatchAllocator` caches immutable timestamp windows and uses lock-free atomic slot claims on the hot path.
+5. `Coordinate` and `ShardedCoordinator` can route every coordinator-owned
+   persistence timestamp through a `TimestampAllocator`, covering raw writes,
+   transaction `startTS`/`commitTS`, sharded raw writes, and `DEL_PREFIX`
+   broadcasts.
+6. Adapter-side persistence timestamp helpers (`NextTimestampThrough` /
+   `NextTimestampAfterThrough`) route DynamoDB item-write retries, S3
+   transaction timestamps, Redis delta compaction commits, and internal
+   forwarded request stamping through the same optional coordinator allocator
+   while preserving the legacy `Clock().NextFenced()` fallback for older test
+   coordinators.
+7. `main.go` exposes the default-off `--tsoEnabled` / `--tsoBatchSize` bridge,
+   wiring a `LocalTSOAllocator` through `BatchAllocator` so production
+   coordinators can cut over to the default-group-backed TSO path without
+   changing the legacy HLC default.
 
 Remaining:
 
 1. Reserve and bootstrap a dedicated TSO Raft group.
-2. Route production coordinator timestamp issuance through the TSO allocator instead of direct local HLC allocation.
-3. Add follower redirect/admin exposure for the dedicated TSO leader.
-4. Wire deployment/bootstrap config and mixed-version safety around the extra group.
+2. Add follower redirect/admin exposure for the dedicated TSO leader.
+3. Wire deployment/bootstrap config and mixed-version safety around the extra group.
 
 ### 1.1 Original Limitation
 
@@ -601,10 +616,10 @@ least as large as the maximum shard ceiling.
 | Phase | Scope | Priority |
 |-------|-------|----------|
 | M1 — shipped | Extend `RunHLCLeaseRenewal` to all shard groups with parallel proposals (Section 6) | High |
-| M2 | Phase A dual-write bridge: also propose ceiling to TSO group (Section 7.1) | Medium |
-| M3 | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
-| M4 | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
-| M5 | Phase B shadow read validation + Phase C feature-flag cutover (Section 7.2–7.3) | Medium |
+| M2 | Phase A dual-write bridge: also propose ceiling to TSO group (Section 7.1) | Deferred until dedicated group |
+| M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
+| M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
+| M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
 | M6 | Dedicated TSO Raft group (`groupID = 0`) with `TSOStateMachine` | Low |
 | M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 

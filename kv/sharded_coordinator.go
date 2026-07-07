@@ -339,8 +339,12 @@ type ShardedCoordinator struct {
 	groups       map[uint64]*ShardGroup
 	defaultGroup uint64
 	clock        *HLC
-	store        store.MVCCStore
-	log          *slog.Logger
+	// tsAllocator is an optional TSO-backed timestamp source used for every
+	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
+	// HLC path.
+	tsAllocator TimestampAllocator
+	store       store.MVCCStore
+	log         *slog.Logger
 	// deregisterLeaseCbs removes the per-shard leader-loss callbacks
 	// registered at construction. See Coordinate.Close for the
 	// rationale.
@@ -394,6 +398,14 @@ type RegistrationGate struct {
 // registration posture.
 func (c *ShardedCoordinator) WithRegistrationGate(g *RegistrationGate) *ShardedCoordinator {
 	c.registrationGate = g
+	return c
+}
+
+// WithTSOAllocator routes sharded-coordinator timestamp issuance through a
+// TSO-compatible allocator. Existing deployments keep the legacy shared-HLC
+// path unless this is wired explicitly.
+func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *ShardedCoordinator {
+	c.tsAllocator = alloc
 	return c
 }
 
@@ -901,7 +913,7 @@ func isComposed1RetryableError(err error) bool {
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
 func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
-	logs, err := c.requestLogs(reqs)
+	logs, err := c.requestLogs(ctx, reqs)
 	if err != nil {
 		return nil, err
 	}
@@ -946,9 +958,9 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 		return nil, err
 	}
 
-	ts, err := c.clock.NextFenced()
+	ts, err := c.allocateTimestamp(ctx, "allocate DEL_PREFIX broadcast ts")
 	if err != nil {
-		return nil, errors.Wrap(err, "allocate DEL_PREFIX broadcast ts")
+		return nil, err
 	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
@@ -1016,7 +1028,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
 
-	commitTS, err = c.resolveTxnCommitTS(startTS, commitTS)
+	commitTS, err = c.resolveTxnCommitTS(ctx, startTS, commitTS)
 	if err != nil {
 		return nil, err
 	}
@@ -1099,14 +1111,14 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
-func (c *ShardedCoordinator) resolveTxnCommitTS(startTS, commitTS uint64) (uint64, error) {
+func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, commitTS uint64) (uint64, error) {
 	if commitTS == 0 {
-		next, err := c.nextTxnTSAfter(startTS)
+		next, err := c.nextTxnTSAfter(ctx, startTS)
 		if err != nil {
 			return 0, err
 		}
 		commitTS = next
-	} else {
+	} else if c.clock != nil {
 		// Observe caller-provided commitTS to keep the HLC monotonic; without
 		// this the clock could later issue timestamps smaller than commitTS.
 		c.clock.Observe(commitTS)
@@ -1373,23 +1385,49 @@ func (c *ShardedCoordinator) txnGroupForID(gid uint64) (*ShardGroup, error) {
 	return g, nil
 }
 
-func (c *ShardedCoordinator) nextTxnTSAfter(startTS uint64) (uint64, error) {
+func (c *ShardedCoordinator) allocateTimestamp(ctx context.Context, label string) (uint64, error) {
+	if c.tsAllocator != nil {
+		ts, err := c.tsAllocator.Next(ctx)
+		if err != nil {
+			return 0, errors.Wrap(err, label)
+		}
+		return ts, nil
+	}
 	if c.clock == nil {
+		return 0, errors.Wrap(ErrTSOClockNil, label)
+	}
+	ts, err := c.clock.NextFenced()
+	if err != nil {
+		return 0, errors.Wrap(err, label)
+	}
+	return ts, nil
+}
+
+// Next makes ShardedCoordinator usable as a TimestampAllocator for adapter
+// helpers that need to allocate persistence-grade timestamps outside Dispatch.
+func (c *ShardedCoordinator) Next(ctx context.Context) (uint64, error) {
+	return c.allocateTimestamp(ctx, "allocate sharded timestamp")
+}
+
+func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64) (uint64, error) {
+	if c.clock == nil && c.tsAllocator == nil {
 		nextTS := startTS + 1
 		if nextTS == 0 {
 			return 0, nil
 		}
 		return nextTS, nil
 	}
-	ts, err := c.clock.NextFenced()
+	ts, err := c.allocateTimestamp(ctx, "allocate txn commit ts")
 	if err != nil {
-		return 0, errors.Wrap(err, "allocate txn commit ts")
+		return 0, err
 	}
 	if ts <= startTS {
-		c.clock.Observe(startTS)
-		ts, err = c.clock.NextFenced()
+		if c.clock != nil {
+			c.clock.Observe(startTS)
+		}
+		ts, err = c.allocateTimestamp(ctx, "re-allocate txn commit ts after Observe")
 		if err != nil {
-			return 0, errors.Wrap(err, "re-allocate txn commit ts after Observe")
+			return 0, err
 		}
 	}
 	if ts <= startTS {
@@ -1434,12 +1472,12 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 	if c.clock != nil && maxTS > 0 {
 		c.clock.Observe(maxTS)
 	}
-	if c.clock == nil {
+	if c.clock == nil && c.tsAllocator == nil {
 		return maxTS + 1, nil
 	}
-	ts, err := c.clock.NextFenced()
+	ts, err := c.allocateTimestamp(ctx, "allocate sharded startTS")
 	if err != nil {
-		return 0, errors.Wrap(err, "allocate sharded startTS")
+		return 0, err
 	}
 	return ts, nil
 }
@@ -1786,14 +1824,14 @@ func validateOperationGroup(reqs *OperationGroup[OP]) error {
 	return nil
 }
 
-func (c *ShardedCoordinator) requestLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+func (c *ShardedCoordinator) requestLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	if reqs.IsTxn {
-		return c.txnLogs(reqs)
+		return c.txnLogs(ctx, reqs)
 	}
-	return c.rawLogs(reqs)
+	return c.rawLogs(ctx, reqs)
 }
 
-func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	grouped, gids, err := c.groupMutations(reqs.Elems)
 	if err != nil {
 		return nil, err
@@ -1801,9 +1839,9 @@ func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 
 	logs := make([]*pb.Request, 0, len(gids))
 	for _, gid := range gids {
-		ts, err := c.clock.NextFenced()
+		ts, err := c.allocateTimestamp(ctx, "allocate sharded raw log ts")
 		if err != nil {
-			return nil, errors.Wrap(err, "allocate sharded raw log ts")
+			return nil, err
 		}
 		logs = append(logs, &pb.Request{
 			IsTxn:     false,
@@ -1815,7 +1853,7 @@ func (c *ShardedCoordinator) rawLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	return logs, nil
 }
 
-func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	// NOTE: ShardedCoordinator implements distributed transactions directly in
 	// Dispatch. txnLogs is retained for compatibility and single-shard helpers.
 	grouped, gids, err := c.groupMutations(reqs.Elems)
@@ -1825,7 +1863,7 @@ func (c *ShardedCoordinator) txnLogs(reqs *OperationGroup[OP]) ([]*pb.Request, e
 	if len(gids) != 1 {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	commitTS, err := c.resolveTxnCommitTS(reqs.StartTS, reqs.CommitTS)
+	commitTS, err := c.resolveTxnCommitTS(ctx, reqs.StartTS, reqs.CommitTS)
 	if err != nil {
 		return nil, err
 	}
