@@ -442,7 +442,7 @@ P1:
 
 | Test | Verifies |
 |---|---|
-| `TestEncoderProducesLoadableSnapshot` | Output placed under a fresh node's `fsm-snap/` + `snap/` loads on `Open`; every adapter serves the original data |
+| `TestEncoderProducesLoadableSnapshot` | Output sealed through `cmd/elastickv-snap-token` and placed under a fresh node's `fsm-snap/`, `snap/`, and `wal/` loads on `Open`; every adapter serves the original data |
 | `TestEncoderClusterIDProvenance` | `ENCODE_INFO.json` carries `cluster_id` + key-format version; mismatch is detectable by the runbook step |
 
 P2:
@@ -459,7 +459,8 @@ P2:
 - `2026_04_29_proposed_logical_backup.md` — Phase 1 (live PIT
   extraction); produces the same directory format this encoder reads.
 - `2026_04_14_implemented_etcd_snapshot_disk_offload.md` — the `.fsm`
-  / `.snap` EKVT token format the restore runbook seeds.
+  / `.snap` EKVT token and WAL snapshot-pointer format the restore
+  runbook seeds.
 - `store/snapshot_pebble.go` (`WriteTo`),
   `internal/backup/snapshot_reader.go` (`ReadSnapshot`) — the
   authoritative native `.fsm` format this encoder must reproduce.

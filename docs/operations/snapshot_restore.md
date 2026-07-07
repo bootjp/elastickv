@@ -17,7 +17,8 @@ restore path; it is not a live import RPC.
 The encoder output is a native EKVPBBL1 payload stream without the
 disk-offload CRC32C footer. Do not copy it directly into
 `fsm-snap/`. Always run `elastickv-snap-token` to produce the
-footer-sealed `.fsm` and the matching `.snap` token metadata.
+footer-sealed `.fsm`, the matching `.snap` token metadata, and the
+WAL snapshot pointer that makes startup consume that token.
 
 ## Single-Node Fresh Restore
 
@@ -55,6 +56,7 @@ footer-sealed `.fsm` and the matching `.snap` token metadata.
    ```text
    /var/lib/elastickv/group-1/fsm-snap/0000000000000001.fsm
    /var/lib/elastickv/group-1/snap/0000000000000001-0000000000000001.snap
+   /var/lib/elastickv/group-1/wal/
    ```
 
 5. Start the node with the same raft ID and raft data directory.
@@ -81,10 +83,10 @@ elastickv-snap-token \
   --voters n1,n2,n3
 ```
 
-If a target `.fsm` or `.snap` already exists, the helper refuses to
-overwrite it. Use `--force` only after moving the old artifacts out of
-the data directory or after confirming this is an intentional retry of
-the same restore operation.
+If a target `.fsm`, `.snap`, or `wal/` already exists, the helper
+refuses to overwrite it. `--force` stages the replacement set first
+and only then swaps it into place, but keep an external backup until
+the restored node has been verified.
 
 ## Multi-Group Restore
 
@@ -99,7 +101,8 @@ For each group:
 2. Run `elastickv-snap-token` with that group's `--data-dir`,
    `--index`, `--term`, and voter set.
 3. Start only after every group directory has a matching
-   `fsm-snap/<index>.fsm` and `snap/<term>-<index>.snap` pair.
+   `fsm-snap/<index>.fsm`, `snap/<term>-<index>.snap`, and `wal/`
+   snapshot pointer.
 
 ## Safety Checks
 
