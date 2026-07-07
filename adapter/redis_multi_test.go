@@ -229,6 +229,63 @@ func TestRedis_MultiExec_IncrDoesNotOverwriteHLL(t *testing.T) {
 	require.Equal(t, "ok", rdb.Get(ctx, "txn:hll-neighbor").Val())
 }
 
+func TestRedis_MultiExec_IncrCreatedStringCanBeIncrementedAgain(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "INCR", "txn:double-incr").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "INCR", "txn:double-incr").Val())
+
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{int64(1), int64(2)}, execRes)
+	require.Equal(t, "2", rdb.Get(ctx, "txn:double-incr").Val())
+}
+
+func TestRedis_MultiExec_ListOpsRejectStagedHashAndString(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "HSET", "txn:hash-before-list", "f", "v").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "RPUSH", "txn:hash-before-list", "x").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]any)
+	require.True(t, ok)
+	require.Len(t, vals, 2)
+	require.Equal(t, int64(1), vals[0])
+	hashErr, ok := vals[1].(error)
+	require.True(t, ok, "RPUSH after HSET should be an EXEC item error, got %T", vals[1])
+	require.Contains(t, hashErr.Error(), "WRONGTYPE")
+	require.Equal(t, map[string]string{"f": "v"}, rdb.HGetAll(ctx, "txn:hash-before-list").Val())
+
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "INCR", "txn:string-before-list").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "RPUSH", "txn:string-before-list", "x").Val())
+	execRes, err = rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok = execRes.([]any)
+	require.True(t, ok)
+	require.Len(t, vals, 2)
+	require.Equal(t, int64(1), vals[0])
+	stringErr, ok := vals[1].(error)
+	require.True(t, ok, "RPUSH after INCR should be an EXEC item error, got %T", vals[1])
+	require.Contains(t, stringErr.Error(), "WRONGTYPE")
+	require.Equal(t, "1", rdb.Get(ctx, "txn:string-before-list").Val())
+}
+
 func TestRedis_RPushLRange(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)
