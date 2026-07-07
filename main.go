@@ -211,7 +211,7 @@ var (
 	// HTTP endpoints (host:port or scheme://host:port). When set,
 	// the admin keyviz handler aggregates the local matrix with
 	// peer responses; when empty, behaviour is unchanged
-	// (single-node view). See docs/design/2026_04_27_proposed_keyviz_cluster_fanout.md.
+	// (single-node view). See docs/design/2026_04_27_implemented_keyviz_cluster_fanout.md.
 	keyvizFanoutNodes   = flag.String("keyvizFanoutNodes", "", "Comma-separated peer admin endpoints (host:port) for keyviz cluster-wide fan-out; empty disables")
 	keyvizFanoutTimeout = flag.Duration("keyvizFanoutTimeout", keyvizFanoutDefaultTimeout, "Per-peer timeout for keyviz fan-out HTTP calls")
 )

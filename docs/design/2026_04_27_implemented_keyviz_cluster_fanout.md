@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-C
 parent_design: docs/admin_ui_key_visualizer_design.md
 date: 2026-04-27
@@ -22,7 +22,7 @@ fans out to every node, merges responses with rules that respect
 Raft leadership, and renders one combined heatmap with degraded-node
 status surfaced inline.
 
-**Rollout notes** (Gemini round-1 PR #685 asked for explicit
+**Rollout notes** (a round-1 review finding on PR #685 asked for explicit
 rolling-upgrade and zero-downtime cutover plans). This change is
 **off by default** (`--keyvizFanoutNodes` empty) and lives entirely
 on the admin path — no data-plane impact, no schema migration, no
@@ -42,7 +42,7 @@ rollout are correct by construction:
   state to migrate; the worst-case partial deploy is "node X
   reports `ok=false`", not data loss.
 
-This proposal scopes a **minimum-viable Phase 2-C** that ships the
+This design scopes a **minimum-viable Phase 2-C** that ships the
 operator-visible value (cluster-wide
 heatmap, degraded-node banner) without requiring the full proto
 extension §9.1 calls for.
@@ -141,13 +141,13 @@ elastickv \
   Unrelated cookies the browser may carry (analytics, feature
   flags, other-app sessions on the same domain) are dropped at the
   fan-out boundary so they are not leaked across the internal
-  network (Gemini security-medium on PR #692).
+  network (security-medium review finding on PR #692).
 - **Recursion guard**: peer requests carry an `X-Admin-Fanout-Peer`
   header. The receiving handler short-circuits its own fan-out
   when this header is set; without the guard, a symmetric
   configuration (every node lists every other node) would generate
   O(N²) HTTP calls per browser poll as each peer recursively
-  fanned out. (Claude bot P1 on PR #692.)
+  fanned out. (P1 review finding on PR #692.)
   - The earlier draft of this paragraph said "anonymous on a
     private network" — that was wrong: the receiving side enforces
     session auth, so anonymous calls are rejected with 401 and the
@@ -268,7 +268,7 @@ Specifics:
 - Drift larger than `keyvizStep / 2` between nodes is still an
   operator problem (the heatmap should not paper over NTP issues
   that big), but routine sub-step jitter no longer causes column
-  fragmentation. (Gemini round-1 PR #685.)
+  fragmentation. (Round-1 review finding on PR #685.)
 
 ## 5. Wire format
 
@@ -309,7 +309,7 @@ Today the only emitter is `catalog_divergence` (§4.4 — `Start`/`End`
 disagree across nodes for the same `BucketID`). Adding a new
 warning code is a wire-format extension, not a breaking change:
 old SPAs render the entry as a generic warning until they teach
-themselves the new code. (Codex round-1 PR #685.)
+themselves the new code. (Round-1 review finding on PR #685.)
 
 `conflict` is per row — a coarser signal than parent §9.1's
 per-cell flag. The cell-level flag will land with the
@@ -343,7 +343,7 @@ renders correctly (it just ignores the new fields).
 
 ## 7. Implementation plan
 
-PR 1 (this proposal + a small slice):
+PR 1 (this design + a small slice):
 
 - Land this design doc.
 - Wire `--keyvizFanoutNodes` flag plumbing through `main.go` →
@@ -404,7 +404,7 @@ PR 3 (Phase 2-C+):
    that node's status entry plus a `WARN`-level server log. No
    partial data is accepted. Operators who actually want >64 MiB
    peer responses should override via a future flag; for now the
-   conservative default is the correct trade. (Gemini PR #685.)
+   conservative default is the correct trade. (Review finding on PR #685.)
 4. **Data consistency** — Merge rules are conservative under
    leadership transitions (under-count + conflict flag, never
    over-count). Reads are exact in steady state and during
@@ -430,7 +430,7 @@ PR 3 (Phase 2-C+):
    the per-call deadline. Operators on networks with flaky DNS
    should colocate a caching resolver (the standard fix for any
    short-lived HTTP client, not specific to this feature).
-   (Gemini round-1 PR #685.)
+   (Round-1 review finding on PR #685.)
 2. **Resolved**: per-node call budget is a fixed 2 s default with
    `--keyvizFanoutTimeout` operator override. Tying the timeout to
    `keyvizStep` would let a 60-second-step config hold the request
