@@ -16,6 +16,10 @@ const (
 	SQSPartitionActionReceive = "receive"
 	SQSPartitionActionDelete  = "delete"
 
+	SQSThrottleActionSend    = "send"
+	SQSThrottleActionReceive = "receive"
+	SQSThrottleActionDefault = "default"
+
 	// sqsMaxTrackedQueues caps the number of distinct queue names
 	// the metrics layer will emit a per-(queue, partition, action)
 	// series for. Any queue beyond this cap collapses to the
@@ -43,6 +47,13 @@ type SQSPartitionObserver interface {
 	// is silently dropped so a typo at a future call site cannot
 	// crash the process.
 	ObservePartitionMessage(queue string, partition uint32, action string)
+}
+
+// SQSThrottleObserver records per-queue throttle decisions. The SQS
+// adapter calls it after a configured token-bucket charge so operators
+// can observe both rejected requests and the live token balance.
+type SQSThrottleObserver interface {
+	ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool)
 }
 
 // SQSDepthSource is the contract a per-tick queue-depth source must
@@ -120,10 +131,13 @@ type SQSQueueDepth struct {
 type SQSMetrics struct {
 	partitionMessages *prometheus.CounterVec
 	queueDepth        *prometheus.GaugeVec
+	throttledRequests *prometheus.CounterVec
+	throttleTokens    *prometheus.GaugeVec
 
-	mu                   sync.Mutex
-	trackedCounterQueues map[string]struct{}
-	trackedDepthQueues   map[string]struct{}
+	mu                         sync.Mutex
+	trackedCounterQueues       map[string]struct{}
+	trackedDepthQueues         map[string]struct{}
+	trackedThrottleGaugeQueues map[string]struct{}
 	// overflowDepthQueues is the set of queue names whose depth
 	// gauge is currently collapsed onto the shared sqsQueueOverflow
 	// label. Tracked separately from trackedDepthQueues (which
@@ -138,7 +152,8 @@ type SQSMetrics struct {
 	// produce phantom data — it correctly reflects the cumulative
 	// count of all overflow operations, even from queues that no
 	// longer exist.
-	overflowDepthQueues map[string]struct{}
+	overflowDepthQueues         map[string]struct{}
+	overflowThrottleGaugeQueues map[string]struct{}
 }
 
 // SQS depth gauge state-label values. Stable so dashboards / alerts
@@ -165,12 +180,30 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 			},
 			[]string{"queue", "state"},
 		),
-		trackedCounterQueues: map[string]struct{}{},
-		trackedDepthQueues:   map[string]struct{}{},
-		overflowDepthQueues:  map[string]struct{}{},
+		throttledRequests: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_sqs_throttled_requests_total",
+				Help: "Total SQS requests rejected by per-queue throttling, labelled by queue and effective throttle bucket action.",
+			},
+			[]string{"queue", "action"},
+		),
+		throttleTokens: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "elastickv_sqs_throttle_tokens_remaining",
+				Help: "Remaining tokens after the most recent SQS per-queue throttle decision, labelled by queue and effective throttle bucket action.",
+			},
+			[]string{"queue", "action"},
+		),
+		trackedCounterQueues:        map[string]struct{}{},
+		trackedDepthQueues:          map[string]struct{}{},
+		trackedThrottleGaugeQueues:  map[string]struct{}{},
+		overflowDepthQueues:         map[string]struct{}{},
+		overflowThrottleGaugeQueues: map[string]struct{}{},
 	}
 	registerer.MustRegister(m.partitionMessages)
 	registerer.MustRegister(m.queueDepth)
+	registerer.MustRegister(m.throttledRequests)
+	registerer.MustRegister(m.throttleTokens)
 	return m
 }
 
@@ -218,6 +251,27 @@ func (m *SQSMetrics) ObserveQueueDepth(queue string, visible, notVisible, delaye
 	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateVisible).Set(float64(max(int64(0), visible)))
 	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateNotVisible).Set(float64(max(int64(0), notVisible)))
 	m.queueDepth.WithLabelValues(queueLabel, sqsQueueStateDelayed).Set(float64(max(int64(0), delayed)))
+}
+
+// ObserveThrottleDecision implements SQSThrottleObserver. It updates
+// the current token-balance gauge for every configured bucket decision
+// and increments the rejected-request counter only when throttled=true.
+func (m *SQSMetrics) ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool) {
+	if m == nil || queue == "" {
+		return
+	}
+	if !sqsValidThrottleAction(action) {
+		return
+	}
+	if tokensRemaining < 0 {
+		tokensRemaining = 0
+	}
+	queueCounterLabel := m.admitForCounterBudget(queue)
+	if throttled {
+		m.throttledRequests.WithLabelValues(queueCounterLabel, action).Inc()
+	}
+	queueGaugeLabel := m.admitForThrottleGaugeBudget(queue)
+	m.throttleTokens.WithLabelValues(queueGaugeLabel, action).Set(tokensRemaining)
 }
 
 // ForgetQueue drops the three gauge series for a queue and frees
@@ -270,6 +324,19 @@ func (m *SQSMetrics) ForgetQueue(queue string) {
 		return
 	}
 	m.mu.Lock()
+	depthForget := m.forgetDepthQueueLocked(queue)
+	throttleForget := m.forgetThrottleQueueLocked(queue)
+	m.mu.Unlock()
+	m.dropForgottenDepthQueue(queue, depthForget)
+	m.dropForgottenThrottleQueue(queue, throttleForget)
+}
+
+type sqsGaugeForget struct {
+	tracked          bool
+	overflowSetEmpty bool
+}
+
+func (m *SQSMetrics) forgetDepthQueueLocked(queue string) sqsGaugeForget {
 	_, tracked := m.trackedDepthQueues[queue]
 	if tracked {
 		delete(m.trackedDepthQueues, queue)
@@ -282,18 +349,41 @@ func (m *SQSMetrics) ForgetQueue(queue string) {
 	if overflow {
 		delete(m.overflowDepthQueues, queue)
 	}
-	overflowSetEmpty := overflow && len(m.overflowDepthQueues) == 0
-	m.mu.Unlock()
-	if tracked {
+	return sqsGaugeForget{tracked: tracked, overflowSetEmpty: overflow && len(m.overflowDepthQueues) == 0}
+}
+
+func (m *SQSMetrics) forgetThrottleQueueLocked(queue string) sqsGaugeForget {
+	_, throttleTracked := m.trackedThrottleGaugeQueues[queue]
+	if throttleTracked {
+		delete(m.trackedThrottleGaugeQueues, queue)
+	}
+	_, throttleOverflow := m.overflowThrottleGaugeQueues[queue]
+	if throttleOverflow {
+		delete(m.overflowThrottleGaugeQueues, queue)
+	}
+	return sqsGaugeForget{tracked: throttleTracked, overflowSetEmpty: throttleOverflow && len(m.overflowThrottleGaugeQueues) == 0}
+}
+
+func (m *SQSMetrics) dropForgottenDepthQueue(queue string, forget sqsGaugeForget) {
+	if forget.tracked {
 		m.dropGaugeStatesFor(queue)
 	}
-	if overflowSetEmpty {
+	if forget.overflowSetEmpty {
 		// Last overflow queue forgotten — drop the shared _other
 		// series so dashboards stop showing phantom backlog for
 		// queues that no longer exist. Safe because no remaining
 		// queue is mapped to this label; any future overflow
 		// queue will re-create the series via ObserveQueueDepth.
 		m.dropGaugeStatesFor(sqsQueueOverflow)
+	}
+}
+
+func (m *SQSMetrics) dropForgottenThrottleQueue(queue string, forget sqsGaugeForget) {
+	if forget.tracked {
+		m.dropThrottleGaugeActionsFor(queue)
+	}
+	if forget.overflowSetEmpty {
+		m.dropThrottleGaugeActionsFor(sqsQueueOverflow)
 	}
 }
 
@@ -360,6 +450,34 @@ func (m *SQSMetrics) admitForDepthBudget(queue string) string {
 	return queue
 }
 
+// admitForThrottleGaugeBudget mirrors admitForDepthBudget for the
+// event-driven throttle-token gauge. It is separate from queue depth
+// because a queue can emit throttle decisions without being present in
+// the next depth scrape yet.
+func (m *SQSMetrics) admitForThrottleGaugeBudget(queue string) string {
+	m.mu.Lock()
+	if _, ok := m.trackedThrottleGaugeQueues[queue]; ok {
+		m.mu.Unlock()
+		return queue
+	}
+	if len(m.trackedThrottleGaugeQueues) >= sqsMaxTrackedQueues {
+		m.overflowThrottleGaugeQueues[queue] = struct{}{}
+		m.mu.Unlock()
+		return sqsQueueOverflow
+	}
+	m.trackedThrottleGaugeQueues[queue] = struct{}{}
+	_, wasOverflow := m.overflowThrottleGaugeQueues[queue]
+	if wasOverflow {
+		delete(m.overflowThrottleGaugeQueues, queue)
+	}
+	overflowSetEmpty := wasOverflow && len(m.overflowThrottleGaugeQueues) == 0
+	m.mu.Unlock()
+	if overflowSetEmpty {
+		m.dropThrottleGaugeActionsFor(sqsQueueOverflow)
+	}
+	return queue
+}
+
 // dropGaugeStatesFor removes the three state-labelled series for
 // label (a real queue name or sqsQueueOverflow) from the depth
 // gauge. Single-line caller-readability wrapper — prometheus
@@ -371,12 +489,26 @@ func (m *SQSMetrics) dropGaugeStatesFor(label string) {
 	m.queueDepth.DeleteLabelValues(label, sqsQueueStateDelayed)
 }
 
+func (m *SQSMetrics) dropThrottleGaugeActionsFor(label string) {
+	m.throttleTokens.DeleteLabelValues(label, SQSThrottleActionSend)
+	m.throttleTokens.DeleteLabelValues(label, SQSThrottleActionReceive)
+	m.throttleTokens.DeleteLabelValues(label, SQSThrottleActionDefault)
+}
+
 // sqsValidPartitionAction returns true iff action is one of the
 // stable label values. Keeps a typo at the call site (e.g.
 // "Send" vs "send") from polluting the metric.
 func sqsValidPartitionAction(action string) bool {
 	switch action {
 	case SQSPartitionActionSend, SQSPartitionActionReceive, SQSPartitionActionDelete:
+		return true
+	}
+	return false
+}
+
+func sqsValidThrottleAction(action string) bool {
+	switch action {
+	case SQSThrottleActionSend, SQSThrottleActionReceive, SQSThrottleActionDefault:
 		return true
 	}
 	return false

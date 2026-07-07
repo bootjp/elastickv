@@ -167,6 +167,7 @@ type chargeOutcome struct {
 	retryAfter    time.Duration
 	tokensAfter   float64
 	bucketPresent bool
+	action        string
 }
 
 // charge takes count tokens from the bucket identified by (queue,
@@ -212,6 +213,7 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarn
 		bucket := b.loadOrInit(queue, resolvedAction, incarnation, capacity, refill)
 		outcome, retry := chargeBucket(bucket, b.clock(), count)
 		if !retry {
+			outcome.action = resolvedAction
 			return outcome
 		}
 	}
@@ -230,6 +232,7 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarn
 		allowed:       false,
 		retryAfter:    time.Second,
 		bucketPresent: false,
+		action:        resolvedAction,
 	}
 }
 
@@ -498,6 +501,19 @@ func resolveActionConfig(cfg *sqsQueueThrottle, action string) (string, float64,
 	return action, 0, 0
 }
 
+func sqsThrottleMetricAction(action string) string {
+	switch action {
+	case bucketActionSend:
+		return "send"
+	case bucketActionReceive:
+		return "receive"
+	case bucketActionAny:
+		return "default"
+	default:
+		return "default"
+	}
+}
+
 // throttleRetryAfterCap bounds the Retry-After value the client sees.
 // Without a cap, a tiny refillRate plus
 // a large requested count would compute a multi-day wait — and
@@ -617,6 +633,7 @@ func (s *SQSServer) chargeQueueWithThrottle(w http.ResponseWriter, queueName, ac
 		return true
 	}
 	outcome := s.throttle.charge(throttle, queueName, action, incarnation, count)
+	s.observeThrottleDecision(queueName, outcome)
 	if outcome.allowed {
 		return true
 	}

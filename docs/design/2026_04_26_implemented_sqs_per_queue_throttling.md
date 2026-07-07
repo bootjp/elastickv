@@ -29,7 +29,7 @@ This document describes per-queue token-bucket throttling, configured per-queue 
 3. **AWS-shape errors**: throttled JSON-path requests return HTTP `400` with the `Throttling` error code (`{"__type":"Throttling", ...}`) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code. Query/XML message verbs are not claimed by this lifecycle update until the query dispatcher wires those verbs into the same throttled handlers.
 4. **Default-off**. Queues created before this feature, and queues created without explicit limits, are not throttled. Operators opt in per queue.
 5. **No coordination per request**. Token replenishment is local to whichever node owns the bucket (the leader for the queue's shard); there is no Raft round-trip on the throttling check.
-6. **Client-visible throttling outcome**: throttled requests use the AWS-shaped `Throttling` error and `Retry-After` header so clients can observe and back off from the limit immediately. Server-side Prometheus counters/gauges remain a follow-up and are not part of this lifecycle update.
+6. **Observable throttling outcome**: throttled requests use the AWS-shaped `Throttling` error and `Retry-After` header so clients can observe and back off from the limit immediately. The server also emits `elastickv_sqs_throttled_requests_total{queue, action}` and `elastickv_sqs_throttle_tokens_remaining{queue, action}` so operators can alert on rejects and inspect the current bucket balance.
 
 ### 2.2 Non-Goals
 
@@ -215,10 +215,10 @@ The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1
 |---|---|
 | `adapter/sqs_throttle.go` (new) | `bucketStore`, `tokenBucket`, charging helper. ~250 lines. |
 | `adapter/sqs_catalog.go` | Add `Throttle` field to `sqsQueueMeta`. Extend `applyAttributes` with the new `Throttle*` attribute names. Render the four Throttle fields in `queueMetaToAttributes` so `GetQueueAttributes("All")` surfaces them. |
-| `adapter/sqs.go` | After `authorizeSQSRequest`, call `bucketStore.charge(queueName, action, count)`. On reject, write the `Throttling` envelope and return. |
+| `adapter/sqs.go` | After `authorizeSQSRequest`, call `bucketStore.charge(queueName, action, count)`. On reject, write the `Throttling` envelope and return. Also forwards each configured bucket decision to the SQS throttle metrics observer. |
 | `adapter/sqs_throttle_test.go` (new) | Unit tests for bucket math (edge cases: idle drift, burst, partial refill, batch over-charge, default-off). ~300 lines. |
 | `adapter/sqs_throttle_integration_test.go` (new) | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. ~150 lines. |
-| `monitoring/registry.go` | No throttle-specific Prometheus collector is registered by this lifecycle update. The existing SQS monitoring surface continues to expose partition activity and queue depth; throttle counters/gauges remain future work. |
+| `monitoring/sqs.go`, `monitoring/registry.go` | Register the `elastickv_sqs_throttled_requests_total{queue, action}` counter and `elastickv_sqs_throttle_tokens_remaining{queue, action}` gauge. Queue-label cardinality uses the same capped `_other` fallback as the existing SQS metrics. |
 | `docs/design/2026_04_24_proposed_sqs_compatible_adapter.md` §14 | Phase 3 per-queue throttling item marked landed with a link to this design. |
 
 ### 4.2 OCC interaction
@@ -284,7 +284,12 @@ Strict-validation SDKs that reject unknown attribute names will reject `Throttle
 
 No new flags. Limits are per-queue, set via `SetQueueAttributes`. Defaults are zero (disabled).
 
-No throttle-specific Prometheus instruments or server-side throttle access logs ship in this lifecycle update. The shipped signal is the HTTP `Throttling` response and `Retry-After` header returned to the caller. A follow-up monitoring change should add a per-queue/action throttled-request counter and a token-remaining gauge; the token budget must be a gauge because it goes both up and down over time.
+Throttle outcomes are visible in two places:
+
+1. The HTTP response: rejected JSON-path message requests return `Throttling` with `Retry-After`.
+2. Prometheus: `elastickv_sqs_throttled_requests_total{queue, action}` increments for rejected requests, and `elastickv_sqs_throttle_tokens_remaining{queue, action}` records the remaining token balance after each configured bucket decision. `action` is the effective bucket action: `send`, `receive`, or `default`.
+
+No server-side throttle access log is required for this lifecycle; deployments that need request-level forensic logs can add an HTTP access/audit layer independently of the rate-limit correctness surface.
 
 ---
 

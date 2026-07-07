@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -8,6 +10,26 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+type throttleObserveReport struct {
+	queue           string
+	action          string
+	tokensRemaining float64
+	throttled       bool
+}
+
+type recordingSQSThrottleObserver struct {
+	reports []throttleObserveReport
+}
+
+func (r *recordingSQSThrottleObserver) ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool) {
+	r.reports = append(r.reports, throttleObserveReport{
+		queue:           queue,
+		action:          action,
+		tokensRemaining: tokensRemaining,
+		throttled:       throttled,
+	})
+}
 
 // TestBucketStore_DefaultOff_ShortCircuit pins the contract that a
 // nil throttle config never allocates a bucket and never rejects.
@@ -22,6 +44,28 @@ func TestBucketStore_DefaultOff_ShortCircuit(t *testing.T) {
 		require.True(t, out.allowed)
 		require.False(t, out.bucketPresent, "nil cfg must not allocate a bucket")
 	}
+}
+
+func TestSQSServer_ChargeQueueWithThrottleObservesMetrics(t *testing.T) {
+	t.Parallel()
+	observer := &recordingSQSThrottleObserver{}
+	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
+	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
+
+	for range 10 {
+		rec := httptest.NewRecorder()
+		require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
+	}
+	rec := httptest.NewRecorder()
+	require.False(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+
+	require.Len(t, observer.reports, 11)
+	last := observer.reports[len(observer.reports)-1]
+	require.Equal(t, "orders.fifo", last.queue)
+	require.Equal(t, "send", last.action)
+	require.True(t, last.throttled)
+	require.InDelta(t, 0.0, last.tokensRemaining, 0.001)
 }
 
 // TestBucketStore_Empty_ShortCircuit covers the post-validator

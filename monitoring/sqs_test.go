@@ -83,6 +83,7 @@ func TestSQSMetrics_NilReceiverIsSafe(t *testing.T) {
 	var m *SQSMetrics
 	require.NotPanics(t, func() {
 		m.ObservePartitionMessage("q.fifo", 0, SQSPartitionActionSend)
+		m.ObserveThrottleDecision("q.fifo", SQSThrottleActionSend, 1, true)
 	})
 }
 
@@ -127,19 +128,66 @@ func TestSQSMetrics_RegistryWiring(t *testing.T) {
 	require.NotNil(t, obs)
 
 	obs.ObservePartitionMessage("q.fifo", 3, SQSPartitionActionReceive)
+	throttleObs, ok := obs.(SQSThrottleObserver)
+	require.True(t, ok)
+	throttleObs.ObserveThrottleDecision("q.fifo", SQSThrottleActionSend, 4, true)
 
 	mfs, err := r.Gatherer().Gather()
 	require.NoError(t, err)
-	var found bool
+	var foundPartition bool
+	var foundThrottleCounter bool
+	var foundThrottleGauge bool
 	for _, mf := range mfs {
-		if !strings.HasPrefix(mf.GetName(), "elastickv_sqs_partition_messages_total") {
+		switch {
+		case strings.HasPrefix(mf.GetName(), "elastickv_sqs_partition_messages_total"):
+			foundPartition = true
+			require.Len(t, mf.GetMetric(), 1)
+		case strings.HasPrefix(mf.GetName(), "elastickv_sqs_throttled_requests_total"):
+			foundThrottleCounter = true
+			require.Len(t, mf.GetMetric(), 1)
+		case strings.HasPrefix(mf.GetName(), "elastickv_sqs_throttle_tokens_remaining"):
+			foundThrottleGauge = true
+			require.Len(t, mf.GetMetric(), 1)
+		default:
 			continue
 		}
-		found = true
-		require.Len(t, mf.GetMetric(), 1)
 	}
-	require.True(t, found,
+	require.True(t, foundPartition,
 		"elastickv_sqs_partition_messages_total must be registered on the public Registry")
+	require.True(t, foundThrottleCounter,
+		"elastickv_sqs_throttled_requests_total must be registered on the public Registry")
+	require.True(t, foundThrottleGauge,
+		"elastickv_sqs_throttle_tokens_remaining must be registered on the public Registry")
+}
+
+func TestSQSMetrics_ObserveThrottleDecision_EmitsCounterAndGauge(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 9, false)
+	require.InDelta(t, 9.0, testutil.ToFloat64(m.throttleTokens.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001)
+	require.InDelta(t, 0.0, testutil.ToFloat64(m.throttledRequests.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001)
+
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 0, true)
+	require.InDelta(t, 0.0, testutil.ToFloat64(m.throttleTokens.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001)
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.throttledRequests.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001)
+}
+
+func TestSQSMetrics_ObserveThrottleDecision_DropsInvalidLabels(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	m.ObserveThrottleDecision("", SQSThrottleActionSend, 1, true)
+	m.ObserveThrottleDecision("orders.fifo", "Send", 1, true)
+
+	counterCount, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttled_requests_total")
+	require.NoError(t, err)
+	require.Equal(t, 0, counterCount)
+	gaugeCount, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, gaugeCount)
 }
 
 // TestSQSMetrics_ObserveQueueDepth_EmitsThreeStates pins that one
@@ -201,8 +249,10 @@ func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 	m := newSQSMetrics(reg)
 
 	m.ObserveQueueDepth("orders.fifo", 3, 0, 0)
+	m.ObserveThrottleDecision("orders.fifo", SQSThrottleActionSend, 4, true)
 	m.ObservePartitionMessage("orders.fifo", 0, SQSPartitionActionSend)
 	require.Len(t, m.trackedDepthQueues, 1, "queue must have been admitted to the depth budget on ObserveQueueDepth")
+	require.Len(t, m.trackedThrottleGaugeQueues, 1, "queue must have been admitted to the throttle gauge budget on ObserveThrottleDecision")
 	require.Len(t, m.trackedCounterQueues, 1, "queue must have been admitted to the counter budget on ObservePartitionMessage")
 
 	m.ForgetQueue("orders.fifo")
@@ -210,10 +260,16 @@ func TestSQSMetrics_ForgetQueue_DropsThreeSeries(t *testing.T) {
 	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "ForgetQueue must drop every state series for the queue")
+	throttleGaugeCount, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, throttleGaugeCount, "ForgetQueue must drop every throttle-token gauge for the queue")
 	require.Empty(t, m.trackedDepthQueues, "ForgetQueue must free the depth-side cardinality slot")
+	require.Empty(t, m.trackedThrottleGaugeQueues, "ForgetQueue must free the throttle-gauge cardinality slot")
 	require.Len(t, m.trackedCounterQueues, 1, "ForgetQueue must NOT free the counter-side slot (counters are cumulative)")
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.partitionMessages.WithLabelValues("orders.fifo", "0", SQSPartitionActionSend)), 0.001,
 		"counter must survive ForgetQueue (cumulative metric)")
+	require.InDelta(t, 1.0, testutil.ToFloat64(m.throttledRequests.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001,
+		"throttled-request counter must survive ForgetQueue (cumulative metric)")
 
 	// Observe again post-forget: the new series must be keyed on
 	// the real name (slot was freed), NOT on the _other overflow

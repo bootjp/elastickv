@@ -460,10 +460,12 @@ New metrics (prefixed `sqs_`):
 5. `sqs_messages_received_total{queue, is_fifo}`
 6. `sqs_messages_deleted_total{queue}`
 7. `sqs_messages_in_flight{queue}`
-8. `sqs_longpoll_waiters{queue}`
-9. `sqs_longpoll_wake_latency_seconds`
-10. `sqs_dlq_redrive_total{queue}`
-11. `sqs_proxy_to_leader_total{op}`
+8. `sqs_throttled_requests_total{queue, action}`
+9. `sqs_throttle_tokens_remaining{queue, action}`
+10. `sqs_longpoll_waiters{queue}`
+11. `sqs_longpoll_wake_latency_seconds`
+12. `sqs_dlq_redrive_total{queue}`
+13. `sqs_proxy_to_leader_total{op}`
 
 Structured log fields match the rest of the project: `queue`, `message_id`, `receipt_token_prefix`, `group_id`, `dedup_id`, `commit_ts`, `leader`.
 

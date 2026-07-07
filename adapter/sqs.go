@@ -208,6 +208,11 @@ type SQSServer struct {
 	// Increment call sites use a nil-receiver-safe call so the
 	// metrics path costs nothing when unwired.
 	partitionObserver SQSPartitionObserver
+	// throttleObserver records configured per-queue throttle
+	// outcomes: rejected-request counters and remaining-token gauges.
+	// nil on non-monitored fixtures; observeThrottleDecision is
+	// nil-safe so the request path pays one branch when unwired.
+	throttleObserver SQSThrottleObserver
 }
 
 // SQSPartitionObserver is the metrics-package interface
@@ -216,6 +221,13 @@ type SQSServer struct {
 // matches the existing observer pattern for DynamoDB / Redis.
 type SQSPartitionObserver interface {
 	ObservePartitionMessage(queue string, partition uint32, action string)
+}
+
+// SQSThrottleObserver is the metrics-package interface
+// (monitoring.SQSThrottleObserver) re-declared here so the adapter
+// does not import monitoring at the package boundary.
+type SQSThrottleObserver interface {
+	ObserveThrottleDecision(queue string, action string, tokensRemaining float64, throttled bool)
 }
 
 // SQSPartitionAction* mirror the action label values from
@@ -253,6 +265,14 @@ func WithSQSPartitionObserver(o SQSPartitionObserver) SQSServerOption {
 	return func(s *SQSServer) { s.partitionObserver = o }
 }
 
+// WithSQSThrottleObserver installs the
+// elastickv_sqs_throttled_requests_total and
+// elastickv_sqs_throttle_tokens_remaining observer on the SQS
+// server. Pass nil (the default) on non-monitored fixtures.
+func WithSQSThrottleObserver(o SQSThrottleObserver) SQSServerOption {
+	return func(s *SQSServer) { s.throttleObserver = o }
+}
+
 // observePartitionMessage is a nil-receiver-safe wrapper around
 // the configured observer. Pulled into a helper so the call
 // sites in send / receive / delete each cost one branch instead
@@ -262,6 +282,21 @@ func (s *SQSServer) observePartitionMessage(queue string, partition uint32, acti
 		return
 	}
 	s.partitionObserver.ObservePartitionMessage(queue, partition, action)
+}
+
+func (s *SQSServer) observeThrottleDecision(queue string, outcome chargeOutcome) {
+	if s == nil || s.throttleObserver == nil {
+		return
+	}
+	if !outcome.bucketPresent && outcome.allowed {
+		return
+	}
+	s.throttleObserver.ObserveThrottleDecision(
+		queue,
+		sqsThrottleMetricAction(outcome.action),
+		outcome.tokensAfter,
+		!outcome.allowed,
+	)
 }
 
 // WithSQSPartitionResolver installs the cluster's partition

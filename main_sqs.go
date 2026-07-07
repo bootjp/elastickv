@@ -46,6 +46,10 @@ func startSQSServer(
 		closeSQSListenerOnError(sqsL, sqsAddr)
 		return nil, err
 	}
+	var throttleObserver adapter.SQSThrottleObserver
+	if o, ok := partitionObserver.(adapter.SQSThrottleObserver); ok {
+		throttleObserver = o
+	}
 	sqsServer := adapter.NewSQSServer(
 		sqsL,
 		shardStore,
@@ -55,6 +59,7 @@ func startSQSServer(
 		adapter.WithSQSStaticCredentials(staticCreds),
 		adapter.WithSQSPartitionResolver(partitionResolver),
 		adapter.WithSQSPartitionObserver(partitionObserver),
+		adapter.WithSQSThrottleObserver(throttleObserver),
 	)
 	// Two-goroutine shutdown pattern mirrors startS3Server: one goroutine waits
 	// on either ctx.Done() or Run completion to call Stop, the other runs the
