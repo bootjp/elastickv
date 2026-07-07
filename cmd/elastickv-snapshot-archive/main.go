@@ -61,7 +61,8 @@ func classifyError(err error) int {
 		errors.Is(err, backup.ErrChecksumsSymlinkEscape),
 		errors.Is(err, backup.ErrArchivePathUnsafe),
 		errors.Is(err, backup.ErrArchiveNonRegular),
-		errors.Is(err, backup.ErrArchiveUnchecksummedFile):
+		errors.Is(err, backup.ErrArchiveUnchecksummedFile),
+		errors.Is(err, backup.ErrArchiveBudgetExceeded):
 		return exitDataErr
 	default:
 		return exitUserErr

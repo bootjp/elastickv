@@ -18,8 +18,10 @@ const (
 	ArchiveCompressionNone = "none"
 	ArchiveCompressionZstd = "zstd"
 
-	archiveDefaultDirPerm  fs.FileMode = 0o755
-	archiveDefaultFilePerm fs.FileMode = 0o600
+	archiveDefaultDirPerm   fs.FileMode = 0o755
+	archiveDefaultFilePerm  fs.FileMode = 0o600
+	archiveMaxUnpackEntries             = 1_000_000
+	archiveMaxUnpackBytes   int64       = 1 << 40
 )
 
 var (
@@ -28,6 +30,7 @@ var (
 	ErrArchiveNonRegular             = errors.New("backup archive: non-regular file")
 	ErrArchiveDestinationExists      = errors.New("backup archive: destination exists")
 	ErrArchiveUnchecksummedFile      = errors.New("backup archive: file is not listed in CHECKSUMS")
+	ErrArchiveBudgetExceeded         = errors.New("backup archive: unpack budget exceeded")
 )
 
 // PackDumpTree writes root as a tar stream, optionally wrapped in zstd.
@@ -80,7 +83,7 @@ func UnpackDumpTree(in io.Reader, outputRoot string, compression string) error {
 		_ = closeFn()
 		return errors.WithStack(err)
 	}
-	if err := readTarTree(tar.NewReader(r), outputRoot); err != nil {
+	if err := readTarTree(tar.NewReader(r), outputRoot, newArchiveUnpackBudget()); err != nil {
 		_ = closeFn()
 		_ = os.RemoveAll(outputRoot)
 		return err
@@ -225,7 +228,7 @@ func writeTarPath(tw *tar.Writer, root, path string) error {
 	return errors.WithStack(err)
 }
 
-func readTarTree(tr *tar.Reader, outputRoot string) error {
+func readTarTree(tr *tar.Reader, outputRoot string, budget *archiveUnpackBudget) error {
 	for {
 		hdr, err := tr.Next()
 		switch {
@@ -234,13 +237,16 @@ func readTarTree(tr *tar.Reader, outputRoot string) error {
 		case err != nil:
 			return errors.WithStack(err)
 		}
-		if err := extractTarEntry(tr, outputRoot, hdr); err != nil {
+		if err := budget.reserveEntry(hdr.Name); err != nil {
+			return err
+		}
+		if err := extractTarEntry(tr, outputRoot, hdr, budget); err != nil {
 			return err
 		}
 	}
 }
 
-func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header) error {
+func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header, budget *archiveUnpackBudget) error {
 	rel, err := cleanArchiveRelPath(hdr.Name)
 	if err != nil {
 		return err
@@ -253,13 +259,16 @@ func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header) error {
 	case tar.TypeDir:
 		return errors.WithStack(os.MkdirAll(target, archiveMode(hdr.FileInfo().Mode().Perm(), archiveDefaultDirPerm)))
 	case tar.TypeReg, 0:
-		return extractRegularTarEntry(tr, target, hdr)
+		return extractRegularTarEntry(tr, target, hdr, budget)
 	default:
 		return errors.Wrapf(ErrArchiveNonRegular, "%s type %c", hdr.Name, hdr.Typeflag)
 	}
 }
 
-func extractRegularTarEntry(tr *tar.Reader, target string, hdr *tar.Header) error {
+func extractRegularTarEntry(tr *tar.Reader, target string, hdr *tar.Header, budget *archiveUnpackBudget) error {
+	if err := budget.reserveBytes(hdr.Name, hdr.Size); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(target), archiveDefaultDirPerm); err != nil {
 		return errors.WithStack(err)
 	}
@@ -297,6 +306,43 @@ func archiveMode(mode fs.FileMode, fallback fs.FileMode) fs.FileMode {
 		return fallback
 	}
 	return mode
+}
+
+type archiveUnpackBudget struct {
+	entriesLeft int
+	bytesLeft   int64
+}
+
+func newArchiveUnpackBudget() *archiveUnpackBudget {
+	return &archiveUnpackBudget{
+		entriesLeft: archiveMaxUnpackEntries,
+		bytesLeft:   archiveMaxUnpackBytes,
+	}
+}
+
+func (b *archiveUnpackBudget) reserveEntry(name string) error {
+	if b == nil {
+		return nil
+	}
+	if b.entriesLeft <= 0 {
+		return errors.Wrapf(ErrArchiveBudgetExceeded, "too many entries before %q", name)
+	}
+	b.entriesLeft--
+	return nil
+}
+
+func (b *archiveUnpackBudget) reserveBytes(name string, size int64) error {
+	if size < 0 {
+		return errors.Wrapf(ErrArchiveBudgetExceeded, "%q has negative size %d", name, size)
+	}
+	if b == nil {
+		return nil
+	}
+	if size > b.bytesLeft {
+		return errors.Wrapf(ErrArchiveBudgetExceeded, "%q needs %d bytes, %d bytes left", name, size, b.bytesLeft)
+	}
+	b.bytesLeft -= size
+	return nil
 }
 
 func requireArchiveRegularPath(root string, rel string) error {

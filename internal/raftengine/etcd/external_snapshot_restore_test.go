@@ -69,49 +69,69 @@ func TestPrepareExternalSnapshotRestoreSeedsRuntimeFiles(t *testing.T) {
 	}, peers)
 }
 
-func TestPrepareExternalSnapshotRestoreRefusesExistingDestination(t *testing.T) {
-	root := t.TempDir()
-	input := filepath.Join(root, "encoded.fsm")
-	require.NoError(t, os.WriteFile(input, []byte("payload"), 0o600))
-	dataDir := filepath.Join(root, "raft")
-	require.NoError(t, os.Mkdir(dataDir, 0o755))
+func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {
+	testCases := []struct {
+		name              string
+		mutate            func(t *testing.T, dataDir string, opts *ExternalSnapshotRestoreOptions)
+		wantErr           error
+		wantDataDirAbsent bool
+	}{
+		{
+			name: "existing destination",
+			mutate: func(t *testing.T, dataDir string, _ *ExternalSnapshotRestoreOptions) {
+				t.Helper()
+				require.NoError(t, os.Mkdir(dataDir, 0o755))
+			},
+			wantErr: ErrExternalSnapshotRestoreExists,
+		},
+		{
+			name: "zero peer node id",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers = []Peer{{ID: "n1", Address: "127.0.0.1:12001"}}
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
+			name: "duplicate peer node id",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.Peers = []Peer{
+					{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"},
+					{NodeID: 1, ID: "n2", Address: "127.0.0.1:12002"},
+				}
+			},
+			wantErr: ErrExternalSnapshotRestoreInvalid,
+		},
+		{
+			name: "copied payload sha mismatch",
+			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
+				opts.ExpectedPayloadSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+			},
+			wantErr:           ErrExternalSnapshotRestoreSHA256,
+			wantDataDirAbsent: true,
+		},
+	}
 
-	_, err := PrepareExternalSnapshotRestore(ExternalSnapshotRestoreOptions{
-		InputFSMPath: input,
-		DataDir:      dataDir,
-		Index:        1,
-		Term:         1,
-		Peers:        []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"}},
-	})
-	require.ErrorIs(t, err, ErrExternalSnapshotRestoreExists)
-}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			input := filepath.Join(root, "encoded.fsm")
+			require.NoError(t, os.WriteFile(input, []byte("payload"), 0o600))
+			dataDir := filepath.Join(root, "raft")
+			opts := ExternalSnapshotRestoreOptions{
+				InputFSMPath: input,
+				DataDir:      dataDir,
+				Index:        1,
+				Term:         1,
+				Peers:        []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"}},
+			}
+			tc.mutate(t, dataDir, &opts)
 
-func TestPrepareExternalSnapshotRestoreRequiresPeerNodeIDs(t *testing.T) {
-	_, err := PrepareExternalSnapshotRestore(ExternalSnapshotRestoreOptions{
-		InputFSMPath: "encoded.fsm",
-		DataDir:      "raft",
-		Index:        1,
-		Term:         1,
-		Peers:        []Peer{{ID: "n1", Address: "127.0.0.1:12001"}},
-	})
-	require.ErrorIs(t, err, ErrExternalSnapshotRestoreInvalid)
-}
-
-func TestPrepareExternalSnapshotRestoreRejectsCopiedPayloadSHA256Mismatch(t *testing.T) {
-	root := t.TempDir()
-	input := filepath.Join(root, "encoded.fsm")
-	require.NoError(t, os.WriteFile(input, []byte("payload"), 0o600))
-	dataDir := filepath.Join(root, "raft")
-
-	_, err := PrepareExternalSnapshotRestore(ExternalSnapshotRestoreOptions{
-		InputFSMPath:          input,
-		DataDir:               dataDir,
-		Index:                 1,
-		Term:                  1,
-		Peers:                 []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"}},
-		ExpectedPayloadSHA256: "0000000000000000000000000000000000000000000000000000000000000000",
-	})
-	require.ErrorIs(t, err, ErrExternalSnapshotRestoreSHA256)
-	_, statErr := os.Stat(dataDir)
-	require.True(t, os.IsNotExist(statErr))
+			_, err := PrepareExternalSnapshotRestore(opts)
+			require.ErrorIs(t, err, tc.wantErr)
+			if tc.wantDataDirAbsent {
+				_, statErr := os.Stat(dataDir)
+				require.True(t, os.IsNotExist(statErr))
+			}
+		})
+	}
 }

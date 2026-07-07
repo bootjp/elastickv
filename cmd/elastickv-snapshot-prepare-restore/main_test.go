@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/backup"
+	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,52 +40,143 @@ func TestRunPrepareRestoreSuccess(t *testing.T) {
 	require.Equal(t, uint64(1), binary.BigEndian.Uint64(fsmBytes[8:16]))
 }
 
-func TestRunPrepareRestoreRejectsClusterMismatch(t *testing.T) {
-	dir := t.TempDir()
-	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
-	writeEncodeInfo(t, input, "cluster-a", true, true)
+func TestRunPrepareRestoreFailureCases(t *testing.T) {
+	testCases := []struct {
+		name      string
+		writeInfo func(t *testing.T, input string)
+		extraArgs []string
+		wantErr   error
+	}{
+		{
+			name: "cluster mismatch",
+			writeInfo: func(t *testing.T, input string) {
+				t.Helper()
+				writeEncodeInfo(t, input, "cluster-a", true, true)
+			},
+			extraArgs: []string{"--target-cluster-id", "cluster-b"},
+			wantErr:   errRestoreClusterIDMismatch,
+		},
+		{
+			name: "self test missing",
+			writeInfo: func(t *testing.T, input string) {
+				t.Helper()
+				writeEncodeInfo(t, input, "cluster-a", false, false)
+			},
+			extraArgs: []string{"--target-cluster-id", "cluster-a"},
+			wantErr:   errRestoreSelfTestMissing,
+		},
+		{
+			name: "sidecar sha missing",
+			writeInfo: func(t *testing.T, input string) {
+				t.Helper()
+				writeEncodeInfoWithSHA(t, input, "cluster-a", true, true, "")
+			},
+			extraArgs: []string{"--target-cluster-id", "cluster-a"},
+			wantErr:   errRestoreSHA256Missing,
+		},
+	}
 
-	code, err := run([]string{
-		"--input", input,
-		"--data-dir", filepath.Join(dir, "raft"),
-		"--index", "5",
-		"--peers", "n1=127.0.0.1:12001",
-		"--target-cluster-id", "cluster-b",
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	require.ErrorIs(t, err, errRestoreClusterIDMismatch)
-	require.Equal(t, exitDataErr, code)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
+			tc.writeInfo(t, input)
+			args := []string{
+				"--input", input,
+				"--data-dir", filepath.Join(dir, "raft"),
+				"--index", "5",
+				"--peers", "n1=127.0.0.1:12001",
+			}
+			args = append(args, tc.extraArgs...)
+
+			code, err := run(args, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, exitDataErr, code)
+		})
+	}
 }
 
-func TestRunPrepareRestoreRequiresSelfTestByDefault(t *testing.T) {
-	dir := t.TempDir()
-	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
-	writeEncodeInfo(t, input, "cluster-a", false, false)
+func TestRunPrepareRestoreAcceptedFlagCombinations(t *testing.T) {
+	testCases := []struct {
+		name            string
+		clusterID       string
+		selfTestRan     bool
+		selfTestMatched bool
+		extraArgs       []string
+	}{
+		{
+			name:            "fresh cluster",
+			clusterID:       "cluster-a",
+			selfTestRan:     true,
+			selfTestMatched: true,
+			extraArgs:       []string{"--fresh-cluster"},
+		},
+		{
+			name:            "missing cluster id allowed",
+			selfTestRan:     true,
+			selfTestMatched: true,
+			extraArgs:       []string{"--allow-missing-cluster-id"},
+		},
+		{
+			name:            "unverified self test allowed",
+			clusterID:       "cluster-a",
+			selfTestRan:     false,
+			selfTestMatched: false,
+			extraArgs:       []string{"--target-cluster-id", "cluster-a", "--allow-unverified-self-test=true"},
+		},
+	}
 
-	code, err := run([]string{
-		"--input", input,
-		"--data-dir", filepath.Join(dir, "raft"),
-		"--index", "5",
-		"--peers", "n1=127.0.0.1:12001",
-		"--target-cluster-id", "cluster-a",
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	require.ErrorIs(t, err, errRestoreSelfTestMissing)
-	require.Equal(t, exitDataErr, code)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
+			writeEncodeInfo(t, input, tc.clusterID, tc.selfTestRan, tc.selfTestMatched)
+			dataDir := filepath.Join(dir, "raft")
+			args := []string{
+				"--input", input,
+				"--data-dir", dataDir,
+				"--index", "5",
+				"--peers", "n1=127.0.0.1:12001",
+			}
+			args = append(args, tc.extraArgs...)
+
+			code, err := run(args, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			require.NoError(t, err)
+			require.Equal(t, exitSuccess, code)
+			require.FileExists(t, filepath.Join(dataDir, "fsm-snap", "0000000000000005.fsm"))
+		})
+	}
 }
 
-func TestRunPrepareRestoreRequiresSidecarSHA256(t *testing.T) {
-	dir := t.TempDir()
-	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
-	writeEncodeInfoWithSHA(t, input, "cluster-a", true, true, "")
-
+func TestRunPrepareRestoreRejectsFreshClusterWithTargetClusterID(t *testing.T) {
 	code, err := run([]string{
-		"--input", input,
-		"--data-dir", filepath.Join(dir, "raft"),
+		"--input", "encoded.fsm",
+		"--data-dir", filepath.Join(t.TempDir(), "raft"),
 		"--index", "5",
 		"--peers", "n1=127.0.0.1:12001",
+		"--fresh-cluster",
 		"--target-cluster-id", "cluster-a",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	require.ErrorIs(t, err, errRestoreSHA256Missing)
-	require.Equal(t, exitDataErr, code)
+	require.ErrorContains(t, err, "mutually exclusive")
+	require.Equal(t, exitUserErr, code)
+}
+
+func TestParsePeersNormalizesDerivedNodeIDs(t *testing.T) {
+	peers, err := parsePeers("n2=127.0.0.1:12002,n1=127.0.0.1:12001")
+	require.NoError(t, err)
+	require.Len(t, peers, 2)
+	byID := make(map[string]etcd.Peer, len(peers))
+	for _, peer := range peers {
+		byID[peer.ID] = peer
+	}
+	require.Equal(t, etcd.DeriveNodeID("n1"), byID["n1"].NodeID)
+	require.Equal(t, etcd.DeriveNodeID("n2"), byID["n2"].NodeID)
+	require.Less(t, peers[0].NodeID, peers[1].NodeID)
+}
+
+func TestParsePeersRejectsDuplicateDerivedNodeIDs(t *testing.T) {
+	_, err := parsePeers("n1=127.0.0.1:12001,n1=127.0.0.1:12002")
+	require.ErrorContains(t, err, "duplicate peer node id")
 }
 
 func TestHLCCeilingMsAfterLastCommitTS(t *testing.T) {

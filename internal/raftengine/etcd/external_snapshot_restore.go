@@ -111,6 +111,13 @@ func validateExternalSnapshotRestoreOptions(opts ExternalSnapshotRestoreOptions)
 			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has zero node id", i)
 		}
 	}
+	seenNodeIDs := make(map[uint64]struct{}, len(opts.Peers))
+	for i, peer := range opts.Peers {
+		if _, ok := seenNodeIDs[peer.NodeID]; ok {
+			return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "peer[%d] has duplicate node id %d", i, peer.NodeID)
+		}
+		seenNodeIDs[peer.NodeID] = struct{}{}
+	}
 	return nil
 }
 

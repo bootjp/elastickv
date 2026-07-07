@@ -43,6 +43,42 @@ func TestUnpackDumpTreeRejectsTraversal(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr))
 }
 
+func TestReadTarTreeRejectsEntryBudgetExceeded(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "dir",
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+	}))
+	require.NoError(t, tw.Close())
+
+	err := readTarTree(tar.NewReader(bytes.NewReader(buf.Bytes())), t.TempDir(), &archiveUnpackBudget{
+		entriesLeft: 0,
+		bytesLeft:   archiveMaxUnpackBytes,
+	})
+	require.ErrorIs(t, err, ErrArchiveBudgetExceeded)
+}
+
+func TestExtractRegularTarEntryRejectsByteBudgetExceeded(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "file.bin",
+		Mode: 0o600,
+		Size: 1,
+	}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	err = readTarTree(tar.NewReader(bytes.NewReader(buf.Bytes())), t.TempDir(), &archiveUnpackBudget{
+		entriesLeft: 1,
+		bytesLeft:   0,
+	})
+	require.ErrorIs(t, err, ErrArchiveBudgetExceeded)
+}
+
 func TestPackDumpTreeRejectsSymlink(t *testing.T) {
 	root := writeArchiveFixture(t)
 	require.NoError(t, os.Symlink("MANIFEST.json", filepath.Join(root, "link")))
