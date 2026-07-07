@@ -663,18 +663,38 @@ func (t *txnContext) applyPositiveExpire(key []byte, ttl int64, unit time.Durati
 	expireAt := time.Now().Add(time.Duration(ttl) * unit)
 	state.value = &expireAt
 	state.dirty = true
-	if typ == redisTypeString {
-		plain, err := t.server.isPlainRedisString(t.ctxOrBackground(), key, t.startTS)
-		if err != nil {
-			return redisResult{}, err
-		}
-		if plain {
-			return t.markStringDirty(key)
-		}
-		// HLL is reported as redisTypeString but stores its payload under
-		// !redis|hll|<key>; keep TTL in the legacy scan index via buildTTLElems.
+	if typ != redisTypeString {
+		return redisResult{typ: resultInt, integer: 1}, nil
+	}
+	plain, err := t.server.isPlainRedisString(t.ctxOrBackground(), key, t.startTS)
+	if err != nil {
+		return redisResult{}, err
+	}
+	if plain {
+		return t.markStringDirty(key)
+	}
+	if err := t.markHLLDirty(key, state.value); err != nil {
+		return redisResult{}, err
 	}
 	return redisResult{typ: resultInt, integer: 1}, nil
+}
+
+func (t *txnContext) markHLLDirty(key []byte, ttl *time.Time) error {
+	hllValue, err := t.load(redisHLLKey(key))
+	if err != nil {
+		return err
+	}
+	value, _, _, err := decodeRedisHLL(hllValue.raw)
+	if err != nil {
+		return err
+	}
+	encoded, err := encodeRedisHLL(value, ttl)
+	if err != nil {
+		return err
+	}
+	hllValue.raw = encoded
+	hllValue.dirty = true
+	return nil
 }
 
 // markStringDirty loads the string value into the working set so that
@@ -848,8 +868,9 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	if err != nil {
 		return preparedTxnDispatch{cancel: func() {}}, err
 	}
-	// TTL elements: string keys have TTL embedded in value (buildKeyElems handles that),
-	// non-string keys get a !redis|ttl| element written in the same transaction.
+	// TTL elements: plain string keys have TTL embedded in value
+	// (buildKeyElems handles that). Collection keys and HLL scan indexes are
+	// written in the same transaction.
 	ttlElems := t.buildTTLElems()
 
 	// Derive a single redisDispatchTimeout-bounded context covering both
@@ -958,6 +979,10 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 			// the inline-TTL path owns them.
 			if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
 				userKey := storageKey[len(redisStrPrefix):]
+				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
+			}
+			if bytes.HasPrefix(storageKey, []byte(redisHLLPrefix)) {
+				userKey := storageKey[len(redisHLLPrefix):]
 				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
 			}
 			continue
@@ -1163,8 +1188,9 @@ func (t *txnContext) buildStreamDeletionElems(ctx context.Context) ([]*kv.Elem[k
 	return elems, nil
 }
 
-// buildTTLElems returns !redis|ttl| Raft elements for non-string keys with dirty TTL state.
-// String keys have TTL embedded in the value; they are handled by buildKeyElems.
+// buildTTLElems returns !redis|ttl| Raft elements for keys with dirty TTL
+// state that still need a secondary scan-index mutation. Plain strings embed
+// TTL in the value and are handled by buildKeyElems.
 func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 	var elems []*kv.Elem[kv.OP]
 	for k, st := range t.ttlStates {

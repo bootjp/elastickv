@@ -552,7 +552,7 @@ func (r *RedisServer) loadHashAt(ctx context.Context, key []byte, readTS uint64)
 }
 
 // loadSetMembersAt scans all wide-column !st|mem| keys and returns them as a
-// redisSetValue.  Only used for kind=="set" (HLL stays as a legacy blob).
+// redisSetValue. Only used for kind=="set".
 func (r *RedisServer) loadSetMembersAt(ctx context.Context, key []byte, readTS uint64) (redisSetValue, error) {
 	prefix := store.SetMemberScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
@@ -587,7 +587,8 @@ func (r *RedisServer) loadSetAt(ctx context.Context, kind string, key []byte, re
 			return r.loadSetMembersAt(ctx, key, readTS)
 		}
 	}
-	// Legacy blob fallback (also the only path for HLL).
+	// Legacy blob fallback for sets; HLL uses this anchor with a versioned TTL
+	// envelope while still accepting the old bare set payload during migration.
 	storageKey := redisExactSetStorageKey(kind, key)
 	raw, err := r.store.GetAt(ctx, storageKey, readTS)
 	if err != nil {
@@ -596,8 +597,28 @@ func (r *RedisServer) loadSetAt(ctx context.Context, kind string, key []byte, re
 		}
 		return redisSetValue{}, errors.WithStack(err)
 	}
+	if kind == hllKind {
+		return r.decodeHLLSetValueAt(ctx, key, readTS, raw)
+	}
 	val, err := unmarshalSetValue(raw)
 	return val, err
+}
+
+func (r *RedisServer) decodeHLLSetValueAt(ctx context.Context, key []byte, readTS uint64, raw []byte) (redisSetValue, error) {
+	val, ttl, embedded, err := decodeRedisHLL(raw)
+	if err != nil {
+		return redisSetValue{}, err
+	}
+	if !embedded {
+		ttl, err = r.legacyIndexTTLAt(ctx, key, readTS)
+		if err != nil {
+			return redisSetValue{}, err
+		}
+	}
+	if ttl != nil && !ttl.After(time.Now()) {
+		return redisSetValue{}, nil
+	}
+	return val, nil
 }
 
 // loadZSetMembersAt scans all wide-column !zs|mem| keys and returns them as a redisZSetValue

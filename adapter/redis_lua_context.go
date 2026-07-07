@@ -3168,8 +3168,9 @@ func (c *luaScriptContext) commit() error {
 			return err
 		}
 		elems = append(elems, plan.elems...)
-		// For non-string keys with dirty TTL: include !redis|ttl| in the same txn.
-		// String keys already have TTL embedded in the value via stringCommitElems.
+		// For collection keys with dirty TTL: include !redis|ttl| in the same txn.
+		// Plain strings and HLL anchors handle their TTL/index mutations in
+		// their value commit helpers.
 		if isNonStringCollectionType(plan.finalType) {
 			ttlElems, err := c.nonStringTTLElems(key, plan.preserveExisting)
 			if err != nil {
@@ -3252,8 +3253,7 @@ func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType,
 	case redisTypeNone:
 		return luaCommitPlan{}, nil
 	case redisTypeString:
-		elems, err := c.stringCommitElems(key)
-		return luaCommitPlan{elems: elems}, err
+		return c.stringLikeCommitPlan(key)
 	case redisTypeList:
 		return c.listCommitPlan(key, commitTS)
 	case redisTypeHash:
@@ -3270,6 +3270,30 @@ func (c *luaScriptContext) valueCommitPlan(key string, finalType redisValueType,
 	default:
 		return luaCommitPlan{}, errors.New("ERR unsupported final redis type")
 	}
+}
+
+func (c *luaScriptContext) stringLikeCommitPlan(key string) (luaCommitPlan, error) {
+	isHLL, err := c.shouldCommitAsHLL(key)
+	if err != nil {
+		return luaCommitPlan{}, err
+	}
+	if isHLL {
+		elems, err := c.hllCommitElems(key)
+		return luaCommitPlan{preserveExisting: true, elems: elems}, err
+	}
+	elems, err := c.stringCommitElems(key)
+	return luaCommitPlan{elems: elems}, err
+}
+
+func (c *luaScriptContext) shouldCommitAsHLL(key string) (bool, error) {
+	if st := c.strings[key]; st != nil && st.loaded && st.exists {
+		return false, nil
+	}
+	plain, err := c.server.isPlainRedisString(c.scriptCtx(), []byte(key), c.startTS)
+	if err != nil {
+		return false, err
+	}
+	return !plain, nil
 }
 
 func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
@@ -3289,6 +3313,36 @@ func (c *luaScriptContext) stringCommitElems(key string) ([]*kv.Elem[kv.OP], err
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey([]byte(key)), Value: encodeRedisTTL(*ttl)})
 	} else {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey([]byte(key))})
+	}
+	return elems, nil
+}
+
+func (c *luaScriptContext) hllCommitElems(key string) ([]*kv.Elem[kv.OP], error) {
+	keyBytes := []byte(key)
+	raw, err := c.server.snapshotGetAt(redisHLLKey(keyBytes), c.startTS)
+	if err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	value, _, _, err := decodeRedisHLL(raw)
+	if err != nil {
+		return nil, err
+	}
+	ttl, err := c.finalTTL(keyBytes)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := encodeRedisHLL(value, ttl)
+	if err != nil {
+		return nil, err
+	}
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisHLLKey(keyBytes), Value: encoded}}
+	if ttl != nil {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(keyBytes), Value: encodeRedisTTL(*ttl)})
+	} else {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(keyBytes)})
 	}
 	return elems, nil
 }

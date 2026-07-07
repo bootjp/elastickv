@@ -283,8 +283,8 @@ func (r *RedisServer) dispatchExpireForType(
 ) (bool, error) {
 	if typ == redisTypeString {
 		// rawKeyTypeAt also reports HLL as redisTypeString; HLL payloads live
-		// under !redis|hll|<key> and don't carry an inline TTL, so fall back
-		// to the legacy scan-index path for them.
+		// under !redis|hll|<key>, so distinguish them from plain strings
+		// before rewriting the TTL-bearing anchor.
 		plain, err := r.isPlainRedisString(ctx, key, readTS)
 		if err != nil {
 			return false, err
@@ -292,6 +292,7 @@ func (r *RedisServer) dispatchExpireForType(
 		if plain {
 			return r.dispatchStringExpire(ctx, key, readTS, expireAt)
 		}
+		return r.dispatchHLLExpire(ctx, key, readTS, expireAt)
 	}
 	if isNonStringCollectionType(typ) {
 		return r.dispatchCollectionExpire(ctx, key, readTS, typ, expireAt)
@@ -353,6 +354,29 @@ func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, read
 	encoded := encodeRedisStr(userValue, &expireAt)
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
+		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
+	}
+	return true, r.dispatchElems(ctx, true, readTS, elems)
+}
+
+func (r *RedisServer) dispatchHLLExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) (bool, error) {
+	raw, err := r.store.GetAt(ctx, redisHLLKey(key), readTS)
+	if err != nil {
+		if cockerrors.Is(err, store.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, cockerrors.WithStack(err)
+	}
+	value, _, _, err := decodeRedisHLL(raw)
+	if err != nil {
+		return false, err
+	}
+	encoded, err := encodeRedisHLL(value, &expireAt)
+	if err != nil {
+		return false, err
+	}
+	elems := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: redisHLLKey(key), Value: encoded},
 		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
 	}
 	return true, r.dispatchElems(ctx, true, readTS, elems)

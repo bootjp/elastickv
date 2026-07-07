@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -44,11 +45,19 @@ func (r *RedisServer) validateExactSetKind(kind string, key []byte, readTS uint6
 }
 
 func (r *RedisServer) hllExistsAt(key []byte, readTS uint64) (bool, error) {
-	exists, err := r.store.ExistsAt(context.Background(), redisHLLKey(key), readTS)
+	ctx := context.Background()
+	exists, err := r.store.ExistsAt(ctx, redisHLLKey(key), readTS)
 	if err != nil {
 		return false, fmt.Errorf("exists hll: %w", err)
 	}
-	return exists, nil
+	if !exists {
+		return false, nil
+	}
+	expired, err := r.hasExpired(ctx, key, readTS, false)
+	if err != nil {
+		return false, err
+	}
+	return !expired, nil
 }
 
 // buildSetLegacyMigrationElems returns ops that atomically migrate a legacy
@@ -176,21 +185,7 @@ func sortedExactSetMembers(existing map[string]struct{}) []string {
 
 func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string, key []byte, readTS uint64, members map[string]struct{}) error {
 	if kind != setKind {
-		// HLL and other non-set kinds keep using the legacy blob format.
-		if len(members) == 0 {
-			elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-			if err != nil {
-				return err
-			}
-			return r.dispatchElems(ctx, true, readTS, elems)
-		}
-		payload, err := marshalSetValue(redisSetValue{Members: sortedExactSetMembers(members)})
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: redisExactSetStorageKey(kind, key), Value: payload},
-		})
+		return r.persistHLLMembersTxn(ctx, key, readTS, members)
 	}
 	// Wide-column set: full rewrite (used when the whole state is available).
 	if len(members) == 0 {
@@ -218,6 +213,38 @@ func (r *RedisServer) persistExactSetMembersTxn(ctx context.Context, kind string
 	return r.dispatchElems(ctx, true, readTS, elems)
 }
 
+func (r *RedisServer) persistHLLMembersTxn(ctx context.Context, key []byte, readTS uint64, members map[string]struct{}) error {
+	// HLL keeps a single anchor payload, now wrapped in an inline-TTL envelope
+	// while preserving legacy payload reads during migration.
+	if len(members) == 0 {
+		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
+		if err != nil {
+			return err
+		}
+		return r.dispatchElems(ctx, true, readTS, elems)
+	}
+	ttl, err := r.ttlAt(ctx, key, readTS)
+	if err != nil {
+		return err
+	}
+	if ttl != nil && !ttl.After(time.Now()) {
+		ttl = nil
+	}
+	payload, err := encodeRedisHLL(redisSetValue{Members: sortedExactSetMembers(members)}, ttl)
+	if err != nil {
+		return err
+	}
+	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisHLLKey(key), Value: payload}}
+	return r.dispatchElems(ctx, true, readTS, appendHLLScanIndexElem(elems, key, ttl))
+}
+
+func appendHLLScanIndexElem(elems []*kv.Elem[kv.OP], key []byte, ttl *time.Time) []*kv.Elem[kv.OP] {
+	if ttl != nil {
+		return append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(*ttl)})
+	}
+	return append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(key)})
+}
+
 // applySetMemberMutation emits a Put or Del for one set member and returns the
 // change count (1) and the signed length delta (+1 or -1), or (0, 0) if no change.
 func applySetMemberMutation(elems []*kv.Elem[kv.OP], memberKey []byte, exists, add bool) ([]*kv.Elem[kv.OP], int, int64) {
@@ -230,7 +257,8 @@ func applySetMemberMutation(elems []*kv.Elem[kv.OP], memberKey []byte, exists, a
 	return elems, 0, 0
 }
 
-// mutateExactSetLegacy handles SADD/SREM for non-set kinds (e.g. HLL) via the legacy blob path.
+// mutateExactSetLegacy handles SADD/SREM for non-set kinds (e.g. HLL) via a
+// single anchor payload.
 func (r *RedisServer) mutateExactSetLegacy(conn redcon.Conn, ctx context.Context, kind string, key []byte, members [][]byte, add bool) {
 	var changed int
 	if err := r.retryRedisWrite(ctx, func() error {
@@ -626,7 +654,7 @@ func (r *RedisServer) pfadd(conn redcon.Conn, cmd redcon.Command) {
 			return err
 		}
 
-		value, err := r.loadSetAt(context.Background(), hllKind, cmd.Args[1], readTS)
+		value, err := r.loadSetAt(ctx, hllKind, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
