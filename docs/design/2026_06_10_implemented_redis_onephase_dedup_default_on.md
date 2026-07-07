@@ -220,7 +220,7 @@ just run in production by default.
 ## Out of scope
 
 - **DynamoDB default-on.** Parallel work tracked by
-  [`2026_06_03_implemented_dynamodb_onephase_dedup.md`][dyn-doc]'s `M2`.
+  [`2026_06_03_partial_dynamodb_onephase_dedup.md`][dyn-doc]'s `M2`.
   The DynamoDB dedup-mode workflow has its own 7-day criterion that
   this proposal does not certify. A separate proposal will land the
   DynamoDB flip once its own M2 is met.
@@ -231,7 +231,7 @@ just run in production by default.
   fast operator rollback. A future cleanup may remove it once
   operational confidence is high; not in this PR.
 
-[dyn-doc]: 2026_06_03_implemented_dynamodb_onephase_dedup.md
+[dyn-doc]: 2026_06_03_partial_dynamodb_onephase_dedup.md
 
 ## Rollout
 
