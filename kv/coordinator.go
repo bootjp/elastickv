@@ -1258,7 +1258,7 @@ func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, pr
 // key. Adapters that implement option-2 one-phase dedup must probe this exact
 // key (it becomes the FSM's meta.PrimaryKey) so the adapter-side
 // self-inflicted-conflict guard agrees with dedupProbeOnePhase. See
-// docs/design/2026_06_03_partial_dynamodb_onephase_dedup.md (R4).
+// docs/design/2026_06_03_implemented_dynamodb_onephase_dedup.md (R4).
 func PrimaryKeyForElems(reqs []*Elem[OP]) []byte {
 	return primaryKeyForElems(reqs)
 }

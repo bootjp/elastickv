@@ -1,5 +1,12 @@
 # Hotspot Split Milestone 1 PR Plan
 
+Status: Implemented.
+
+This milestone is implemented by the durable catalog and watcher in
+`distribution/`, the distribution admin service in
+`adapter/distribution_server.go`, the route helper CLIs under
+`cmd/elastickv-*`, and the operator documentation in `README.md`.
+
 ## Objective
 
 Milestone 1 delivers the control plane only:
