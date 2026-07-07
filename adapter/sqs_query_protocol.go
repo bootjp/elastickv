@@ -674,12 +674,20 @@ func parseQueryChangeMessageVisibilityBatch(form url.Values) (*sqsChangeVisBatch
 }
 
 func parseOptionalQueryInt(form url.Values, name string) (*int, error) {
-	v, err := parseOptionalQueryInt64(form, name)
-	if err != nil || v == nil {
-		return nil, err
+	raw := strings.TrimSpace(form.Get(name))
+	if raw == "" {
+		return nil, nil
 	}
-	n := int(*v)
-	if int64(n) != *v {
+	parsed, err := strconv.ParseInt(raw, 10, strconv.IntSize)
+	if err != nil {
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) && errors.Is(numErr.Err, strconv.ErrRange) {
+			return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, name+" is out of range")
+		}
+		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, name+" must be an integer")
+	}
+	n := int(parsed)
+	if int64(n) != parsed {
 		return nil, newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, name+" is out of range")
 	}
 	return &n, nil
@@ -1275,7 +1283,7 @@ func writeSQSQueryResponse(w http.ResponseWriter, action string, result any) {
 // HTTP status, so keeping them aligned across protocols means a
 // retry policy that works for the JSON client also works for the
 // query client.
-func writeSQSQueryError(w http.ResponseWriter, err error) {
+func sqsQueryErrorDetails(err error) (int, string, string, int) {
 	status := http.StatusInternalServerError
 	code := sqsErrInternalFailure
 	message := "internal error"
@@ -1287,6 +1295,12 @@ func writeSQSQueryError(w http.ResponseWriter, err error) {
 		message = throttled.Error()
 		retryAfter = throttled.retryAfterSeconds()
 	}
+	var rateLimit *purgeRateLimitedError
+	if retryAfter == 0 && errors.As(err, &rateLimit) {
+		status = http.StatusBadRequest
+		code = sqsErrPurgeInProgress
+		message = rateLimit.Error()
+	}
 	var apiErr *sqsAPIError
 	if retryAfter == 0 && errors.As(err, &apiErr) {
 		status = apiErr.status
@@ -1297,6 +1311,11 @@ func writeSQSQueryError(w http.ResponseWriter, err error) {
 			message = apiErr.message
 		}
 	}
+	return status, code, message, retryAfter
+}
+
+func writeSQSQueryError(w http.ResponseWriter, err error) {
+	status, code, message, retryAfter := sqsQueryErrorDetails(err)
 	env := queryErrorEnvelope{
 		XMLName:   xml.Name{Local: "ErrorResponse"},
 		XMLNS:     sqsQueryNamespace,

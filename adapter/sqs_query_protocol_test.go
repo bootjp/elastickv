@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -219,6 +220,42 @@ func TestWriteSQSQueryError_5xxIsReceiver(t *testing.T) {
 	writeSQSQueryError(rec, newSQSAPIError(http.StatusInternalServerError, sqsErrInternalFailure, "boom"))
 	if !strings.Contains(rec.Body.String(), "<Type>Receiver</Type>") {
 		t.Fatalf("expected <Type>Receiver</Type> for 5xx; body=%s", rec.Body.String())
+	}
+}
+
+func TestWriteSQSQueryError_PurgeRateLimit(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	writeSQSQueryError(rec, &purgeRateLimitedError{remaining: 60})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if got := rec.Header().Get("x-amzn-ErrorType"); got != sqsErrPurgeInProgress {
+		t.Fatalf("x-amzn-ErrorType = %q, want %q", got, sqsErrPurgeInProgress)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "<Code>"+sqsErrPurgeInProgress+"</Code>") {
+		t.Fatalf("missing purge-in-progress code; body=%s", body)
+	}
+}
+
+func TestParseOptionalQueryIntRejectsOutOfRange(t *testing.T) {
+	t.Parallel()
+	_, err := parseOptionalQueryInt(url.Values{
+		"MaxNumberOfMessages": []string{"9223372036854775808"},
+	}, "MaxNumberOfMessages")
+	if err == nil {
+		t.Fatal("expected range error")
+	}
+	apiErr := &sqsAPIError{}
+	ok := errors.As(err, &apiErr)
+	if !ok {
+		t.Fatalf("error type = %T, want *sqsAPIError", err)
+	}
+	if apiErr.status != http.StatusBadRequest || apiErr.errorType != sqsErrInvalidAttributeValue {
+		t.Fatalf("api error = status %d type %q, want 400 %q", apiErr.status, apiErr.errorType, sqsErrInvalidAttributeValue)
+	}
+	if !strings.Contains(apiErr.message, "out of range") {
+		t.Fatalf("message = %q, want out of range", apiErr.message)
 	}
 }
 
