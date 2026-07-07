@@ -1,10 +1,10 @@
-# SQS partitioned-FIFO reverse encoder (Phase 0b M5-3) — proposed
+# SQS partitioned-FIFO reverse encoder (Phase 0b M5-3) — implemented
 
-**Status:** Proposed (no implementation yet).
+**Status:** Implemented.
 **Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this lifts the §"SQS" decision gate that M5-1 (`PR #849`) and M5-2 (`PR #892`) deferred for `partition_count > 1`.
-**Predecessor on disk:** M5-1 emits `!sqs|queue|meta|`, `!sqs|queue|gen|`, `!sqs|queue|seq|`, `!sqs|msg|data|` for classic queues. M5-2 adds `!sqs|msg|vis|`, `!sqs|msg|byage|`, `!sqs|msg|dedup|`. Both reject `PartitionCount > 1` via `ErrSQSEncodeUnsupportedPartitioned` (`internal/backup/encode_sqs.go:162`); the M5-2 doc explicitly defers partitioned-FIFO support to "M5-3."
+**Predecessor on disk:** M5-1 emits `!sqs|queue|meta|`, `!sqs|queue|gen|`, `!sqs|queue|seq|`, `!sqs|msg|data|` for classic queues. M5-2 adds `!sqs|msg|vis|`, `!sqs|msg|byage|`, `!sqs|msg|dedup|`. M5-3 removes the former partitioned-FIFO gate and emits the partitioned data/vis/byage/dedup key families.
 
-## What needs to land
+## Implemented behavior
 
 For every queue with `partition_count > 1` in `_queue.json`, the encoder must read each message's partition assignment from the dump and emit the **partitioned** key family instead of the classic family:
 
@@ -142,7 +142,7 @@ internal/backup/sqs_test.go                  # decoder round-trip with partition
 
 ## Milestones (within M5-3)
 
-The slice ships as a single PR — the decoder format change and encoder partition branch are tightly coupled (a partial landing would either reject all M5-3 dumps at the new encoder or break old encoders against new dumps).
+The slice landed as a single implementation unit: the decoder format change and encoder partition branch are tightly coupled. A partial landing would either reject all M5-3 dumps at the new encoder or break old encoders against new dumps.
 
 ## Test plan
 
@@ -160,9 +160,9 @@ The slice ships as a single PR — the decoder format change and encoder partiti
 ## References
 
 - Parent: `2026_05_25_implemented_snapshot_logical_encoder.md` §"SQS"
-- M5-2 doc (decision gate template, classic side records): `2026_05_30_proposed_sqs_side_record_derivation.md`
+- M5-2 doc (decision gate template, classic side records): `2026_05_30_implemented_sqs_side_record_derivation.md`
 - M5-1 PR: #849
 - M5-2 PR: #892
 - Live partitioned constructors: `adapter/sqs_keys.go:337+` (`sqsPartitionedMsgDataKey` and siblings)
 - Existing partitioned dispatch (cross-classic-partitioned routing): `adapter/sqs_keys_dispatch.go`
-- Existing gate in encoder: `internal/backup/encode_sqs.go:162` (`ErrSQSEncodeUnsupportedPartitioned`)
+- Former gate removed by M5-3: `ErrSQSEncodeUnsupportedPartitioned`

@@ -29,7 +29,7 @@ type EncodeInfoSelfTest struct {
 }
 
 // EncodeInfo is the on-disk shape of <output>.encode_info.json. Schema
-// pinned by docs/design/2026_06_01_proposed_snapshot_encode_cli.md
+// pinned by docs/design/2026_06_01_implemented_snapshot_encode_cli.md
 // §"ENCODE_INFO.json". Restore operators rely on this for "encoded for
 // the right cluster, by the right encoder version, against this exact
 // file" confirmation; tag changes are a breaking schema bump.

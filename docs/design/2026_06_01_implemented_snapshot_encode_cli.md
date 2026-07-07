@@ -1,19 +1,19 @@
-# `cmd/elastickv-snapshot-encode` CLI (Phase 0b M6) — proposed
+# `cmd/elastickv-snapshot-encode` CLI (Phase 0b M6) — implemented
 
-**Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1–M5 are merged (#807/#841/#847/#849/#864/#846/#892); the parent doc was promoted `proposed` → `partial` in v6 (#896); the CLI is the capstone that exposes them.
+**Status:** Implemented.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1–M5 are merged (#807/#841/#847/#849/#864/#846/#892); the CLI is the capstone that exposes them.
 
-## What needs to land
+## Implemented surface
 
-A single binary `cmd/elastickv-snapshot-encode` that:
+The shipped binary `cmd/elastickv-snapshot-encode`:
 
 1. Reads `MANIFEST.json` from `--input` (a directory tree produced by `elastickv-snapshot-decode` or by a future Phase 1 live extractor).
-2. Calls `backup.EncodeSnapshot(EncodeOptions)` (new) which internally constructs the `snapshotBuilder` (unexported), invokes each enabled adapter encoder in deterministic order (redis → dynamodb → s3 → sqs; the same order `ENCODE_INFO.json` `adapters_enabled` reflects), runs the optional self-test against the in-memory bytes, and returns an `EncodeResult`. The `.fsm` bytes are written to the caller-supplied `io.Writer`; they are not returned.
+2. Calls `backup.EncodeSnapshot(EncodeOptions)` which internally constructs the `snapshotBuilder` (unexported), invokes each enabled adapter encoder in deterministic order (redis → dynamodb → s3 → sqs; the same order `ENCODE_INFO.json` `adapters_enabled` reflects), runs the optional self-test through the scratch temp file, and returns an `EncodeResult`. The `.fsm` bytes are written to the caller-supplied `io.Writer`; they are not returned.
 3. **Write-then-rename atomic publish:** the `.fsm` bytes are written to `<output>.tmp-<random>`, fsynced + closed, and ONLY after a successful self-test (when `--self-test` is set) renamed atomically to `<output>`. A self-test failure leaves nothing at the restore-visible path — the temp file is `os.RemoveAll`'d in the failure path (codex P2 v2 #896). When `--self-test` is not set, the rename happens immediately after fsync; behavior matches the decoder's atomic-publish discipline.
 4. Emits `<output>.encode_info.json` next to the renamed `.fsm` (provenance + integrity anchor; see §"`ENCODE_INFO.json`" for the path-derivation rule).
 5. On `--self-test` failure: exit 2 with `<output>.mismatch.txt` (next to where the `.fsm` would have been) and no `.fsm` at the publish path.
 
-**New library entrypoint (`backup.EncodeSnapshot`).** Codex P2 v2 #896 correctly flagged that `snapshotBuilder` / `newSnapshotBuilder` are unexported and the adapter `Encode` methods take `*snapshotBuilder`, so an external `main` package cannot directly wire them. M6 lands a high-level wrapper in `internal/backup/encode.go` mirroring the decoder's `DecodeSnapshot`:
+**Library entrypoint (`backup.EncodeSnapshot`).** `snapshotBuilder` / `newSnapshotBuilder` are unexported and the adapter `Encode` methods take `*snapshotBuilder`, so an external `main` package cannot directly wire them. M6 adds a high-level wrapper in `internal/backup/encode_snapshot.go` mirroring the decoder's `DecodeSnapshot`:
 
 ```go
 type EncodeOptions struct {
@@ -38,7 +38,7 @@ func EncodeSnapshot(opts EncodeOptions, out io.Writer) (EncodeResult, error)
 
 The CLI's responsibility is reduced to: read MANIFEST → call `EncodeSnapshot(opts, tempFile)` → on success rename + write sidecar → on `!SelfTestMatched` write `mismatch.txt` and exit 2. This keeps the builder unexported, matches the decoder's API shape, and unblocks future callers (Phase 1 live extractor, integration tests) that want encoder access without going through the CLI.
 
-**Internal buffering model for self-test.** `out io.Writer` is write-only, so the self-test cannot read back the bytes that were just written. When `opts.SelfTest=true`, `EncodeSnapshot` writes the FSM into an internal `*bytes.Buffer` first, decodes from that buffer for the self-test, then copies the buffer to `out` only if the self-test matched. The memory cost is one extra FSM-sized allocation on top of the existing key-sort working set — the same memory bound the parent doc §"Encoder memory" already accepts. When `opts.SelfTest=false` the FSM streams straight to `out` with no extra buffering.
+**Self-test buffering model.** `out io.Writer` is write-only, so the self-test cannot read back bytes from the final destination. When `opts.SelfTest=true`, `EncodeSnapshot` writes the FSM into an on-disk temp file under the scratch root, rewinds that file for `DecodeSnapshot`, and copies it to `out` only if the self-test matched. This keeps self-test memory bounded to the streaming compare buffer on top of the existing key-sort working set. When `opts.SelfTest=false` the FSM streams straight to `out` with no self-test temp file.
 
 **Parameter order** matches the decoder's `DecodeSnapshot(r io.Reader, opts DecodeOptions)` shape by inversion: encoder writes (so `io.Writer` is the back), decoder reads (so `io.Reader` is the front). The asymmetry is deliberate so each function's I/O argument sits adjacent to the direction it travels.
 
@@ -172,9 +172,9 @@ cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (exit codes, w
 | `TestCLISelfTestPreservesRenameS3Collisions` | A `--input` tree produced with `--rename-collisions` (so the manifest carries `Exclusions.RenameS3Collisions=true`) is re-encoded with `--self-test`; the test asserts the scratch decode reads the manifest field, threads it back, and produces a matching renamed-collision tree. Pins codex P2 v4 #896 — the new `Exclusions.RenameS3Collisions` field is in the round-trip. |
 | `TestExclusionsLegacyManifestOmitsRenameS3Collisions` | An older MANIFEST.json without `rename_s3_collisions` field decodes with the zero value (`false`), matching decoder default — no fail-on-missing. Forward-compat regression pin. |
 
-**P1 cluster-boot test deferred.** Parent doc's P1 test table includes `TestEncoderProducesLoadableSnapshot` — an end-to-end test that boots a single-node cluster from the encoded `.fsm` and reads back every adapter's data. That test is deferred from M6 because: (a) it requires the production server entrypoint + Pebble engine, not the encoder package; (b) `TestEncodeSnapshotLibraryRoundTrip` above already exercises the encoder → decoder library round-trip exactly, and the `TestCLIRoundTripSelfTestAllAdapters` integration test exercises the full CLI; (c) the cluster-boot path is owned by `store/lsm_store.go`'s native restore code, which has its own coverage. M6 tracks the cluster-boot test as a follow-up task in the M6 PR description, not in this design.
+**P1 cluster-boot test deferred.** Parent doc's P1 test table includes `TestEncoderProducesLoadableSnapshot` — an end-to-end test that boots a single-node cluster from the encoded `.fsm` and reads back every adapter's data. That test is not part of the shipped M6 evidence because: (a) it requires the production server entrypoint + Pebble engine, not the encoder package; (b) `TestEncodeSnapshotLibraryRoundTrip` above already exercises the encoder → decoder library round-trip exactly, and the `TestCLIRoundTripSelfTestAllAdapters` integration test exercises the full CLI; (c) the cluster-boot path is owned by `store/lsm_store.go`'s native restore code, which has its own coverage. The cluster-boot test remains a P1 follow-up.
 
-## Self-review (5 passes) — proposed
+## Self-review (5 passes) — implemented
 
 1. **Data loss.** The CLI is a wrapper over already-merged + tested encoder slices. The only new write paths are the `.fsm` output and `ENCODE_INFO.json`; both use the WriteManifest-style fsync-then-close discipline (gemini r1 medium on #810). The self-test gate is a defense-in-depth check that catches encoder regressions before a restore operator does.
 2. **Concurrency / distributed failures.** Pure offline. No Raft, no HLC issuance, no cluster contact. The output `.fsm` is loaded by a STOPPED node via stop-replace-restart (parent §"Restore via stop-replace-restart"); concurrency surfaces only on the receiving cluster's restart path, which is owned by the node's existing snapshot loader.
@@ -184,13 +184,11 @@ cmd/elastickv-snapshot-encode/main_test.go      # CLI-level tests (exit codes, w
 
 ## Decoder cleanup folded in (parent doc §"Decoder cleanup")
 
-The parent doc flags `internal/backup/manifest.go` `Source.FSMCRC32C` as dead (native `.fsm` has no CRC32C footer). M6 either removes it or repurposes it as a whole-file SHA-256. **Recommended: repurpose.** The CLI already computes `output_fsm_sha256` for `ENCODE_INFO.json`; populating `Source.FSMCRC32C` (or a renamed `FSMSHA256` field) with the same value gives the manifest a per-file integrity anchor without needing the sidecar. M6 lands this rename in the same PR; the field is JSON-tagged so existing decoder consumers reading `fsm_crc32c` continue to work until a deprecation window closes.
-
-If the rename grows into a larger schema migration, M6 falls back to **removing** the dead field; the sidecar's SHA-256 is sufficient. Decision deferred to implementation review.
+The parent doc flags `internal/backup/manifest.go` `Source.FSMCRC32C` as dead (native `.fsm` has no CRC32C footer). M6 keeps manifest compatibility unchanged and uses `ENCODE_INFO.json` as the encoder-side integrity anchor: the CLI computes `output_fsm_sha256` after `EncodeSnapshot` returns and records it in the sidecar. A future manifest-schema cleanup can remove or rename `Source.FSMCRC32C` separately without changing the M6 CLI contract.
 
 ## Milestones / sequencing
 
-M6 lands as a **single PR** (this doc + implementation + tests). No further splits — the wiring is small and the self-test is integral to the CLI's value proposition; splitting it out would mean shipping an untested CLI first.
+M6 landed as a **single implementation slice** (doc + implementation + tests). The self-test is integral to the CLI's value proposition; the implemented CLI is not split from the validation path.
 
 ## Open questions
 
