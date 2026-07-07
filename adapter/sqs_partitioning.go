@@ -7,7 +7,7 @@ import (
 
 // HT-FIFO (Phase 3.D split-queue FIFO) configuration vocabulary and
 // the routing primitive partitionFor. See the design doc at
-// docs/design/2026_04_26_partial_sqs_split_queue_fifo.md.
+// docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md.
 //
 // PR 2 of the §11 rollout introduces the schema fields plus the
 // validation surface — including the temporary dormancy gate that
