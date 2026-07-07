@@ -267,24 +267,37 @@ func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, ex
 	if err != nil {
 		return 0, err
 	}
+	applied, err := r.dispatchExpireForType(ctx, key, readTS, typ, expireAt)
+	if err != nil || !applied {
+		return 0, err
+	}
+	return 1, nil
+}
+
+func (r *RedisServer) dispatchExpireForType(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	typ redisValueType,
+	expireAt time.Time,
+) (bool, error) {
 	if typ == redisTypeString {
 		// rawKeyTypeAt also reports HLL as redisTypeString; HLL payloads live
 		// under !redis|hll|<key> and don't carry an inline TTL, so fall back
 		// to the legacy scan-index path for them.
 		plain, err := r.isPlainRedisString(ctx, key, readTS)
 		if err != nil {
-			return 0, err
+			return false, err
 		}
 		if plain {
-			applied, err := r.dispatchStringExpire(ctx, key, readTS, expireAt)
-			if err != nil || !applied {
-				return 0, err
-			}
-			return 1, nil
+			return r.dispatchStringExpire(ctx, key, readTS, expireAt)
 		}
 	}
+	if isNonStringCollectionType(typ) {
+		return r.dispatchCollectionExpire(ctx, key, readTS, typ, expireAt)
+	}
 	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)}}
-	return 1, r.dispatchElems(ctx, true, readTS, elems)
+	return true, r.dispatchElems(ctx, true, readTS, elems)
 }
 
 // isPlainRedisString distinguishes a plain Redis string (stored under

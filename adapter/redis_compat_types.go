@@ -341,6 +341,9 @@ func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) 
 		return nil, errors.WithStack(err)
 	}
 
+	if ttl, found, collErr := r.collectionTTLAt(ctx, userKey, readTS); collErr != nil || found {
+		return ttl, collErr
+	}
 	return r.legacyIndexTTLAt(ctx, userKey, readTS)
 }
 
@@ -361,16 +364,20 @@ func (r *RedisServer) legacyIndexTTLAt(ctx context.Context, userKey []byte, read
 	return &ttl, nil
 }
 
-// hasExpired checks TTL expiry. When nonStringOnly is true, the embedded-TTL
-// probe is skipped and only the !redis|ttl| index is consulted, avoiding a
-// wasted GetAt on !redis|str|<key> for non-string types.
+// hasExpired checks TTL expiry. When nonStringOnly is true, the string probe is
+// skipped; collection metadata is checked first, then the legacy !redis|ttl|
+// index is used for HLL/old collection metadata during the migration window.
 func (r *RedisServer) hasExpired(ctx context.Context, userKey []byte, readTS uint64, nonStringOnly bool) (bool, error) {
 	var (
 		ttl *time.Time
 		err error
 	)
 	if nonStringOnly {
-		ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
+		var found bool
+		ttl, found, err = r.collectionTTLAt(ctx, userKey, readTS)
+		if err == nil && !found {
+			ttl, err = r.legacyIndexTTLAt(ctx, userKey, readTS)
+		}
 	} else {
 		ttl, err = r.ttlAt(ctx, userKey, readTS)
 	}

@@ -18,7 +18,8 @@ import (
 // Three on-disk key families share the `!lst|` namespace; only two
 // carry restorable state:
 //
-//   - !lst|meta|<userKey>             -> 24-byte (Head, Tail, Len) blob
+//   - !lst|meta|<userKey>             -> 24-byte (Head, Tail, Len) blob,
+//     optionally followed by 8-byte expireAtMs
 //   - !lst|itm|<userKey><seq(8)>      -> raw item bytes (Redis lists
 //     are binary-safe)
 //   - !lst|claim|...                  -> POP tombstone for OCC
@@ -48,11 +49,10 @@ const (
 	ListMetaDeltaPrefix = "!lst|meta|d|"
 	ListClaimPrefix     = "!lst|claim|"
 
-	// listMetaBinarySize mirrors store/list_helpers.go (24 bytes:
-	// Head(8) + Tail(8) + Len(8)). Re-declared here rather than
-	// imported because the backup package is intentionally adapter-
-	// and store-independent.
+	// listMetaBinarySize is the legacy Head(8) + Tail(8) + Len(8) shape.
 	listMetaBinarySize = 24
+	// listMetaInlineTTLSize is the current shape with trailing ExpireAtMs(8).
+	listMetaInlineTTLSize = 32
 
 	// listSeqBytes is the fixed width of the trailing sortable-int64
 	// sequence number in an !lst|itm| key.
@@ -60,7 +60,7 @@ const (
 )
 
 // ErrRedisInvalidListMeta is returned when an !lst|meta| value is not
-// the expected 24-byte (Head, Tail, Len) layout.
+// the expected (Head, Tail, Len[, ExpireAtMs]) layout.
 var ErrRedisInvalidListMeta = cockroachdberr.New("backup: invalid !lst|meta| value")
 
 // ErrRedisInvalidListKey is returned when an !lst| key cannot be parsed
@@ -80,10 +80,10 @@ type redisListState struct {
 }
 
 // HandleListMeta processes one !lst|meta|<userKey> record. The value is
-// the 24-byte (Head, Tail, Len) layout. We park the declared length so
-// flushLists can warn on a mismatch with the observed item count and
-// register the user key so a later !redis|ttl|<userKey> record routes
-// back to this list state.
+// the 24-byte (Head, Tail, Len) layout, optionally followed by inline
+// expireAtMs. We park the declared length so flushLists can warn on a
+// mismatch with the observed item count and register the user key so a
+// later !redis|ttl|<userKey> record routes back to this list state.
 //
 // !lst|meta|d|<userKey>... delta keys share the !lst|meta| string
 // prefix, so a snapshot dispatcher that routes by "starts with
@@ -100,9 +100,9 @@ func (r *RedisDB) HandleListMeta(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidListKey, "meta key: %q", key)
 	}
-	if len(value) != listMetaBinarySize {
+	if len(value) != listMetaBinarySize && len(value) != listMetaInlineTTLSize {
 		return cockroachdberr.Wrapf(ErrRedisInvalidListMeta,
-			"length %d != %d", len(value), listMetaBinarySize)
+			"length %d not in {%d,%d}", len(value), listMetaBinarySize, listMetaInlineTTLSize)
 	}
 	// Length is the only field needed at backup time. Head/Tail are
 	// recomputable from the observed seqs and the live store's
@@ -116,6 +116,12 @@ func (r *RedisDB) HandleListMeta(key, value []byte) error {
 	st := r.listState(userKey)
 	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
 	st.metaSeen = true
+	if len(value) == listMetaInlineTTLSize {
+		if expireAtMs := binary.BigEndian.Uint64(value[24:32]); expireAtMs != 0 {
+			st.expireAtMs = expireAtMs
+			st.hasTTL = true
+		}
+	}
 	return nil
 }
 

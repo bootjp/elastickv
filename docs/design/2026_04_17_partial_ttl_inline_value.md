@@ -1,5 +1,11 @@
 # Design: TTL Embedded in Data Values
 
+Status: Partial — Redis strings and the list/hash/set/zset/stream metadata
+anchors now carry inline TTL, and `EXPIRE` updates those anchors in the same
+Raft transaction as the secondary scan-index row. HLL TTL, full legacy
+`!redis|ttl|` read-path removal, background migration, and TTL-buffer removal
+remain open.
+
 ## 1. Background and motivation
 
 ### Current architecture
@@ -146,13 +152,17 @@ follows:
   should be run to rewrite every legacy value with the new envelope before
   Phase 2 (legacy-read removal) begins.
 
-### 3.3 Collection metadata encoding (future work)
+### 3.3 Collection metadata encoding
 
-> **Status in this PR:** only *string* values carry inline TTL today. Collection
-> anchors (`ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta`, stream, HLL) still
-> store TTL in the secondary `!redis|ttl|` index. The sections below describe
-> the intended Phase 4 design; they are not yet implemented and the adapter
-> deliberately keeps the legacy index in use for non-string types.
+`ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta`, and `StreamMeta` now carry an
+`ExpireAt uint64` field in milliseconds since epoch. The secondary
+`!redis|ttl|<key>` row is still written as the scan index and as a migration
+fallback for old-format metadata; it is no longer the only source of truth for
+these collection anchors.
+
+HLL still stores TTL only in `!redis|ttl|<key>`. HLL's serialized payload format
+is intentionally left unchanged until a separate compatibility pass handles the
+probabilistic payload envelope.
 
 `ListMeta`, `HashMeta`, `SetMeta`, `ZSetMeta` are fixed-width binary structs.
 Each gains an `ExpireAt uint64` field (0 = no TTL):
@@ -173,13 +183,14 @@ type ListMeta struct {
 }
 ```
 
-The on-disk format gains 8 bytes; the existing 24-byte format is distinguished
-from the new 32-byte format by length during decode (backward-compatible read).
+The on-disk format gains 8 bytes; the existing 8-byte simple metadata and
+24-byte list/stream metadata formats are distinguished from the new 16-byte and
+32-byte formats by length during decode (backward-compatible read).
 
-For HLL and stream types the TTL is appended to the serialised value using the
-same flags+expireAt header described in §3.2.
+Stream metadata follows the same 32-byte metadata shape. HLL remains on the
+legacy secondary-index path.
 
-### 3.4 Read path (after migration)
+### 3.4 Read path (target after migration)
 
 ```
 keyTypeAt(key, readTS)
@@ -188,7 +199,10 @@ keyTypeAt(key, readTS)
   → returns (type, isExpired) in one call
 ```
 
-No secondary `!redis|ttl|<key>` lookup on the hot read path.
+Today the read path checks inline string and collection metadata first, then
+falls back to `!redis|ttl|<key>` for legacy metadata and HLL. The target after
+the migration phases is no secondary `!redis|ttl|<key>` lookup on the hot read
+path.
 
 ### 3.5 Write path
 
@@ -206,7 +220,10 @@ goroutine are no longer needed for correctness; they can be removed.
 #### `EXPIRE key 30` (after-the-fact TTL on an existing key)
 
 For **string** keys: read-modify-write the anchor value to update `expireAt`.
-For **collection** keys: read-modify-write the metadata key to update `ExpireAt`.
+For **collection** keys: read-modify-write the metadata key to update
+`ExpireAt`. When the collection has uncompacted length deltas, `EXPIRE` first
+folds the deltas into the base metadata key in the same transaction so the new
+metadata value is authoritative and does not double-count future reads.
 
 This is a `IsTxn=true` transaction (OCC read-modify-write on the anchor key),
 which is the existing pattern for all other in-place updates.
@@ -228,8 +245,9 @@ Background scanner (future work):
     → for each entry where expireAt < now: schedule lazy deletion
 ```
 
-On reads the TTL key is **never consulted**.  It is written in the same Raft
-entry as the data to keep it consistent, but it is not the authoritative source.
+For strings and new-format collection metadata, reads consult the anchor first.
+During the migration window, `!redis|ttl|<key>` is still consulted when the
+anchor is old-format or when the key is an HLL.
 
 ---
 
@@ -258,18 +276,27 @@ is absent it falls back to the legacy raw-byte format and reads
 
 This allows a rolling upgrade with no downtime.
 
-### Phase 1 — Background migration
+### Phase 1 — Collection metadata inline TTL (implemented for non-HLL)
+
+The live write path now emits the expanded metadata formats for list, hash, set,
+zset, and stream. `EXPIRE` on those types updates the anchor metadata and the
+secondary scan index together. Delta compaction preserves existing `ExpireAt`
+when it folds length deltas into base metadata. The logical backup decoder
+accepts both old and new metadata lengths and exports inline metadata TTL as
+`expire_at_ms`.
+
+### Phase 2 — Background migration
 
 A one-time background job rewrites each string key to the new encoding and each
 collection metadata key to the new format.  During migration the dual-read
 fallback remains active.
 
-### Phase 2 — Remove legacy TTL read path
+### Phase 3 — Remove legacy TTL read path
 
 Once all nodes have migrated (cluster-level flag or store version check), the
 `!redis|ttl|<key>` lookup in `ttlAt()` is removed.
 
-### Phase 3 — Remove TTL buffer
+### Phase 4 — Remove TTL buffer
 
 The `TTLBuffer`, `runTTLFlusher`, and `flushTTLBuffer` can be removed.  TTL
 writes are back in the same `IsTxn=true` transaction as data writes, so no
@@ -320,16 +347,18 @@ store/
   hash_helpers.go       HashMeta: add ExpireAt field
   set_helpers.go        SetMeta: add ExpireAt field
   zset_helpers.go       ZSetMeta: add ExpireAt field
+  stream_helpers.go     StreamMeta: add ExpireAt field
 
 adapter/
   redis_compat_types.go  encodeRedisStr / decodeRedisStr (new with TTL header)
-                         ttlAt(): read from decoded anchor, not !redis|ttl| key
-                         hasExpiredTTLAt(): inline TTL check from anchor
-  redis_compat_helpers.go  keyTypeAt(): single anchor read
-  redis_compat_commands.go  setExpire(): anchor read-modify-write
+                         ttlAt(): read from decoded anchor before fallback
+                         hasExpired(): inline TTL check from anchor
+  redis_collection_ttl.go collection metadata TTL helpers
+  redis_expire_cmds.go   setExpire(): anchor read-modify-write
+  redis_delta_compactor.go  preserve ExpireAt during metadata compaction
   redis.go               remove TTLBuffer field, runTTLFlusher, flushTTLBuffer
                          remove WithTTLFlushInterval option
-  redis_ttl_buffer.go    delete (Phase 3)
+  redis_ttl_buffer.go    delete (Phase 4)
   redis_lua_context.go   commit(): TTL back in data Raft entry; remove
                          flushTTLForKeyToBuffer / flushTTLToBuffer
 ```
@@ -341,6 +370,7 @@ adapter/
 | Phase | Description | Risk |
 |---|---|---|
 | 0 | Add dual-read fallback; new writes use new encoding | Low — reads always fall back |
-| 1 | Background migration of existing keys | Medium — requires careful compaction |
-| 2 | Remove legacy `!redis\|ttl\|` read path | Low — only after full migration |
-| 3 | Remove TTL buffer | Low — no longer needed post-migration |
+| 1 | Add inline TTL to list/hash/set/zset/stream metadata | Medium — delta compaction must preserve TTL |
+| 2 | Background migration of existing keys | Medium — requires careful compaction |
+| 3 | Remove legacy `!redis\|ttl\|` read path | Low — only after full migration |
+| 4 | Remove TTL buffer | Low — no longer needed post-migration |

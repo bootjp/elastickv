@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"math"
 	"path/filepath"
 	"sort"
 	"unicode/utf8"
@@ -23,7 +22,7 @@ const (
 )
 
 // ErrRedisInvalidHashMeta is returned when the !hs|meta| value is not
-// the expected 8-byte big-endian field count.
+// the expected big-endian field count, optionally followed by inline TTL.
 var ErrRedisInvalidHashMeta = cockroachdberr.New("backup: invalid !hs|meta| value")
 
 // ErrRedisInvalidHashKey is returned when an !hs| key cannot be parsed
@@ -44,9 +43,9 @@ type redisHashState struct {
 }
 
 // HandleHashMeta processes one !hs|meta|<userKey> record. The value is
-// the 8-byte BE field count. We park the state for finalize-time flush
-// and register the user key so a later !redis|ttl|<userKey> record
-// routes back to this hash state.
+// the 8-byte BE field count, optionally followed by an inline expireAtMs.
+// We park the state for finalize-time flush and register the user key so
+// a later !redis|ttl|<userKey> record routes back to this hash state.
 //
 // Delta keys (!hs|meta|d|...) share the !hs|meta| string prefix, so a
 // snapshot dispatcher that routes by "starts with RedisHashMetaPrefix"
@@ -63,10 +62,6 @@ func (r *RedisDB) HandleHashMeta(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidHashKey, "meta key: %q", key)
 	}
-	if len(value) != redisUint64Bytes {
-		return cockroachdberr.Wrapf(ErrRedisInvalidHashMeta,
-			"length %d != %d", len(value), redisUint64Bytes)
-	}
 	// Bounds-check the uint64 field count before narrowing to int64.
 	// Without this, a corrupted store value with the high bit set
 	// would wrap to a negative declaredLen and fire spurious
@@ -75,14 +70,17 @@ func (r *RedisDB) HandleHashMeta(key, value []byte) error {
 	// wide-column encoders fail closed on the same shape of
 	// corruption. Round-2 review on PR #755 — backported from list
 	// encoder for cross-encoder consistency.
-	rawLen := binary.BigEndian.Uint64(value)
-	if rawLen > math.MaxInt64 {
-		return cockroachdberr.Wrapf(ErrRedisInvalidHashMeta,
-			"declared len %d overflows int64", rawLen)
+	declaredLen, expireAtMs, hasTTL, err := decodeRedisCountMeta(value, ErrRedisInvalidHashMeta)
+	if err != nil {
+		return err
 	}
 	st := r.hashState(userKey)
-	st.declaredLen = int64(rawLen) //nolint:gosec // bounds-checked above
+	st.declaredLen = declaredLen
 	st.metaSeen = true
+	if hasTTL {
+		st.expireAtMs = expireAtMs
+		st.hasTTL = true
+	}
 	return nil
 }
 

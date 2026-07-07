@@ -559,8 +559,9 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	}
 
 	newMeta := store.ListMeta{
-		Head: baseMeta.Head + headDelta,
-		Len:  baseMeta.Len + lenDelta,
+		Head:     baseMeta.Head + headDelta,
+		Len:      baseMeta.Len + lenDelta,
+		ExpireAt: baseMeta.ExpireAt,
 	}
 	if newMeta.Len < 0 {
 		c.logger.WarnContext(ctx, "delta compactor: clamping negative list length to 0",
@@ -649,9 +650,9 @@ type simpleLenHandlerParams struct {
 	extractUserKey   func(key []byte) []byte
 	deltaKeyPrefixFn func(userKey []byte) []byte
 	metaKeyFn        func(userKey []byte) []byte
-	unmarshalBase    func([]byte) (int64, error)
+	unmarshalBase    func([]byte) (int64, uint64, error)
 	unmarshalDelta   func([]byte) (int64, error)
-	marshalBase      func(int64) []byte
+	marshalBase      func(int64, uint64) []byte
 }
 
 func (c *DeltaCompactor) makeSimpleLenHandler(p simpleLenHandlerParams) collectionDeltaHandler {
@@ -678,15 +679,17 @@ func (c *DeltaCompactor) hashHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractHashUserKeyFromDelta,
 		deltaKeyPrefixFn: store.HashMetaDeltaScanPrefix,
 		metaKeyFn:        store.HashMetaKey,
-		unmarshalBase: func(b []byte) (int64, error) {
+		unmarshalBase: func(b []byte) (int64, uint64, error) {
 			m, err := store.UnmarshalHashMeta(b)
-			return m.Len, errors.WithStack(err)
+			return m.Len, m.ExpireAt, errors.WithStack(err)
 		},
 		unmarshalDelta: func(b []byte) (int64, error) {
 			d, err := store.UnmarshalHashMetaDelta(b)
 			return d.LenDelta, errors.WithStack(err)
 		},
-		marshalBase: func(n int64) []byte { return store.MarshalHashMeta(store.HashMeta{Len: n}) },
+		marshalBase: func(n int64, expireAt uint64) []byte {
+			return store.MarshalHashMeta(store.HashMeta{Len: n, ExpireAt: expireAt})
+		},
 	})
 }
 
@@ -697,15 +700,17 @@ func (c *DeltaCompactor) setHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractSetUserKeyFromDelta,
 		deltaKeyPrefixFn: store.SetMetaDeltaScanPrefix,
 		metaKeyFn:        store.SetMetaKey,
-		unmarshalBase: func(b []byte) (int64, error) {
+		unmarshalBase: func(b []byte) (int64, uint64, error) {
 			m, err := store.UnmarshalSetMeta(b)
-			return m.Len, errors.WithStack(err)
+			return m.Len, m.ExpireAt, errors.WithStack(err)
 		},
 		unmarshalDelta: func(b []byte) (int64, error) {
 			d, err := store.UnmarshalSetMetaDelta(b)
 			return d.LenDelta, errors.WithStack(err)
 		},
-		marshalBase: func(n int64) []byte { return store.MarshalSetMeta(store.SetMeta{Len: n}) },
+		marshalBase: func(n int64, expireAt uint64) []byte {
+			return store.MarshalSetMeta(store.SetMeta{Len: n, ExpireAt: expireAt})
+		},
 	})
 }
 
@@ -716,15 +721,17 @@ func (c *DeltaCompactor) zsetHandler() collectionDeltaHandler {
 		extractUserKey:   store.ExtractZSetUserKeyFromDelta,
 		deltaKeyPrefixFn: store.ZSetMetaDeltaScanPrefix,
 		metaKeyFn:        store.ZSetMetaKey,
-		unmarshalBase: func(b []byte) (int64, error) {
+		unmarshalBase: func(b []byte) (int64, uint64, error) {
 			m, err := store.UnmarshalZSetMeta(b)
-			return m.Len, errors.WithStack(err)
+			return m.Len, m.ExpireAt, errors.WithStack(err)
 		},
 		unmarshalDelta: func(b []byte) (int64, error) {
 			d, err := store.UnmarshalZSetMetaDelta(b)
 			return d.LenDelta, errors.WithStack(err)
 		},
-		marshalBase: func(n int64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n}) },
+		marshalBase: func(n int64, expireAt uint64) []byte {
+			return store.MarshalZSetMeta(store.ZSetMeta{Len: n, ExpireAt: expireAt})
+		},
 	})
 }
 
@@ -735,9 +742,10 @@ func foldSimpleLenDeltas(
 	deltaKVs []*store.KVPair,
 	additionalDelta int64,
 	baseLen int64,
+	expireAt uint64,
 	metaKey []byte,
 	unmarshalDelta func([]byte) (int64, error),
-	marshalBase func(int64) []byte,
+	marshalBase func(int64, uint64) []byte,
 ) ([]*kv.Elem[kv.OP], error) {
 	var deltaSum int64
 	for _, d := range deltaKVs {
@@ -751,7 +759,7 @@ func foldSimpleLenDeltas(
 	if newLen < 0 {
 		newLen = 0
 	}
-	metaElem := simpleMetaElemForLen(metaKey, newLen, marshalBase)
+	metaElem := simpleMetaElemForLen(metaKey, newLen, expireAt, marshalBase)
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
 	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
@@ -768,22 +776,23 @@ func (c *DeltaCompactor) buildSimpleCompactElems(
 	deltaKVs []*store.KVPair,
 	readTS uint64,
 	metaKey []byte,
-	unmarshalBase func([]byte) (int64, error),
+	unmarshalBase func([]byte) (int64, uint64, error),
 	unmarshalDelta func([]byte) (int64, error),
-	marshalBase func(int64) []byte,
+	marshalBase func(int64, uint64) []byte,
 ) ([]*kv.Elem[kv.OP], error) {
 	raw, err := c.st.GetAt(ctx, metaKey, readTS)
 	var baseLen int64
+	var expireAt uint64
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, errors.WithStack(err)
 	}
 	if err == nil {
-		baseLen, err = unmarshalBase(raw)
+		baseLen, expireAt, err = unmarshalBase(raw)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}
-	return foldSimpleLenDeltas(deltaKVs, 0, baseLen, metaKey, unmarshalDelta, marshalBase)
+	return foldSimpleLenDeltas(deltaKVs, 0, baseLen, expireAt, metaKey, unmarshalDelta, marshalBase)
 }
 
 // zsetInlineMetaCompactionThreshold is the number of existing ZSetMetaDeltaKey
@@ -811,6 +820,7 @@ func (r *RedisServer) zsetInlineMetaCompactionElems(
 	}
 	raw, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
 	var baseLen int64
+	var expireAt uint64
 	if err != nil && !errors.Is(err, store.ErrKeyNotFound) {
 		return nil, false, errors.WithStack(err)
 	}
@@ -820,24 +830,25 @@ func (r *RedisServer) zsetInlineMetaCompactionElems(
 			return nil, false, errors.WithStack(unmarshalErr)
 		}
 		baseLen = m.Len
+		expireAt = m.ExpireAt
 	}
 	elems, err := foldSimpleLenDeltas(
-		deltaKVs, additionalDelta, baseLen,
+		deltaKVs, additionalDelta, baseLen, expireAt,
 		store.ZSetMetaKey(key),
 		func(b []byte) (int64, error) {
 			d, unmarshalErr := store.UnmarshalZSetMetaDelta(b)
 			return d.LenDelta, errors.WithStack(unmarshalErr)
 		},
-		func(n int64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n}) },
+		func(n int64, ttl uint64) []byte { return store.MarshalZSetMeta(store.ZSetMeta{Len: n, ExpireAt: ttl}) },
 	)
 	return elems, true, err
 }
 
 // simpleMetaElemForLen returns a Put or Del elem for a Hash/Set/ZSet metadata key.
 // When newLen==0 a Del is returned to match Redis semantics (empty collection = non-existent).
-func simpleMetaElemForLen(metaKey []byte, newLen int64, marshalBase func(int64) []byte) *kv.Elem[kv.OP] {
+func simpleMetaElemForLen(metaKey []byte, newLen int64, expireAt uint64, marshalBase func(int64, uint64) []byte) *kv.Elem[kv.OP] {
 	if newLen == 0 {
 		return &kv.Elem[kv.OP]{Op: kv.Del, Key: metaKey}
 	}
-	return &kv.Elem[kv.OP]{Op: kv.Put, Key: metaKey, Value: marshalBase(newLen)}
+	return &kv.Elem[kv.OP]{Op: kv.Put, Key: metaKey, Value: marshalBase(newLen, expireAt)}
 }
