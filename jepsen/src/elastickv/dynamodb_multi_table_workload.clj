@@ -2,7 +2,7 @@
   "Composed-1 M5a multi-table variant of the DynamoDB list-append workload.
 
    Why a separate workload exists (see
-   docs/design/2026_06_02_partial_composed1_m5_jepsen_route_shuffle.md §3.3):
+   docs/design/2026_06_02_implemented_composed1_m5_jepsen_route_shuffle.md §3.3):
    the single-table elastickv.dynamodb-workload cannot exercise the 2PC
    path because kv/shard_key.go normalises every DynamoDB table-meta,
    item, and GSI key for one table to a single per-table route key
@@ -37,6 +37,7 @@
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
+            [elastickv.composed1-nemesis :as composed1]
             [elastickv.db :as ekdb]
             [jepsen [client :as client]
                     [generator :as gen]
@@ -165,7 +166,7 @@
    them up as snapshot values, the txn's :r mops report those values
    to Jepsen, and Elle sees a history that contains writes it never
    generated — leading to spurious G-single / G1c false positives
-   (claude[bot] medium on PR #916).  Cleaning up here keeps each run's
+   (review feedback on PR #916).  Cleaning up here keeps each run's
    history closed under the writes Elle actually generated."
   [ddb]
   (doseq [t table-names]
@@ -220,8 +221,8 @@
     ;; DynamoDB guarantees :Responses is positionally aligned with the
     ;; :TransactItems we sent.  Assert it so a future cognitect SDK
     ;; that ever normalises / re-orders the response surfaces loudly
-    ;; rather than silently corrupting the snapshot map (claude[bot]
-    ;; low on PR #916).
+    ;; rather than silently corrupting the snapshot map (review feedback
+    ;; on PR #916).
     (assert (= (count ks-vec) (count (:Responses resp)))
             "TransactGetItems :Responses must be positionally aligned with the requested items")
     (into {}
@@ -301,7 +302,7 @@
    test does NOT pass an explicit :grpc-host-port.  Resolves to the
    first node's hostname + default port — works in both local mode
    (first node is typically 127.0.0.1 or 'n1') and distributed Jepsen
-   runs where database nodes live on separate hosts (gemini medium
+   runs where database nodes live on separate hosts (review feedback
    on PR #925).  Falls back to 127.0.0.1:50051 only when :nodes is
    missing entirely."
   [test]
@@ -339,7 +340,7 @@
      :grpc-host-port  — --address arg to the CLI; defaults to the
                         first node's hostname + 50051 so distributed
                         Jepsen runs work without flag plumbing
-                        (gemini medium on PR #925)."
+                        (review feedback on PR #925)."
   [test]
   (let [bin    (or (:list-routes-bin test) default-list-routes-bin)
         addr   (or (:grpc-host-port test)  (default-grpc-host-port-for test))
@@ -395,13 +396,13 @@
     ;; queryable as soon as create-one-table! returns.  Real DynamoDB's
     ;; CreateTable is async and would need a poll; if this workload is
     ;; ever pointed at a real DynamoDB endpoint, add a DescribeTable
-    ;; loop here (claude[bot] design note on PR #916 c46b2b5e).
+    ;; loop here (review note on PR #916 c46b2b5e).
     (create-all-tables! ddb))
 
   (teardown! [_this _test]
     ;; Delete every table this workload created so the next run starts
     ;; with empty Items.  See delete-all-tables! for the Elle-history
-    ;; rationale (claude[bot] medium on PR #916).
+    ;; rationale (review feedback on PR #916).
     (delete-all-tables! ddb))
 
   (close! [this _test]
@@ -483,7 +484,7 @@
    Refuses to build when (:key-count opts) is not a multiple of
    num-tables: an uneven split silently gives some tables fewer
    keys (so 1-key txns on those tables never trigger multi-group
-   dispatch — claude[bot] low on PR #916).  The default 12 satisfies
+   dispatch — review feedback on PR #916).  The default 12 satisfies
    this; tunable via --key-count from the CLI."
   [opts]
   (let [key-count (or (:key-count opts) 12)]
@@ -525,10 +526,16 @@
          faults       (if local?
                         []
                         (cli/normalize-faults (or (:faults opts) [:partition :kill])))
-         nemesis-p    (when-not local?
-                        (combined/nemesis-package {:db       db
-                                                   :faults   faults
-                                                   :interval (or (:fault-interval opts) 40)}))
+         nemesis-packages
+         (cond-> []
+           (not local?)
+           (conj (combined/nemesis-package {:db       db
+                                            :faults   faults
+                                            :interval (or (:fault-interval opts) 40)}))
+
+           (:composed1-route-shuffle opts)
+           (conj (composed1/route-shuffle-package opts)))
+         nemesis-p    (combined/compose-packages nemesis-packages)
          nemesis-gen  (if nemesis-p
                         (:generator nemesis-p)
                         (gen/once {:type :info :f :noop}))
@@ -545,6 +552,7 @@
              ;; --list-routes-bin and --grpc-host-port CLI flags
              ;; defined in dynamo-cli-opts below.
              :list-routes-bin (:list-routes-bin opts)
+             :split-bin       (:split-bin opts)
              :grpc-host-port  (:grpc-host-port opts)
              :dynamo-host     (:dynamo-host opts)
              :os              (if local? os/noop debian/os)
@@ -555,7 +563,7 @@
                                      (when local? {:dummy true})
                                      (:ssh opts))
              :remote          control/ssh
-             :nemesis         (if nemesis-p (:nemesis nemesis-p) nemesis/noop)
+             :nemesis         (:nemesis nemesis-p)
              :final-generator nil
              :concurrency     (or (:concurrency opts) 5)
              :generator       (->> (:generator workload)
@@ -588,8 +596,15 @@
     :parse-fn #(Integer/parseInt %)]
    [nil "--list-routes-bin PATH" "Path to the cmd/elastickv-list-routes Go helper used by the workload's setup-hook verification.  Defaults to bare-name 'elastickv-list-routes' (assumes PATH lookup); pass an absolute path when invoking from a launch script that builds the binary into a tmp dir."
     :default nil]
+   [nil "--split-bin PATH" "Path to the cmd/elastickv-split Go helper used by the route-shuffle nemesis.  Defaults to bare-name 'elastickv-split' (assumes PATH lookup); pass an absolute path when invoking from a launch script that builds the binary into a tmp dir."
+    :default nil]
    [nil "--grpc-host-port HOST:PORT" "gRPC --address argument passed to elastickv-list-routes by the setup-hook verification.  Default 127.0.0.1:50051 matches scripts/run-jepsen-m5-local.sh's PROC_ADDR."
-    :default nil]])
+    :default nil]
+   [nil "--composed1-route-shuffle" "Enable the Composed-1 M5b route-shuffle nemesis."
+    :default false]
+   [nil "--route-shuffle-interval SECONDS" "Seconds between route-shuffle nemesis operations."
+    :default 30
+    :parse-fn #(Double/parseDouble %)]])
 
 (defn- prepare-dynamo-opts
   "Transform parsed CLI options into the map expected by

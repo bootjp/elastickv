@@ -512,7 +512,7 @@ design if needed. The near-term mitigation is layered:
 
    Both calls go through the same `c.clock`. The apply-time OCC/ownership check
    then compares these timestamps against stored `CommitTS` values (the
-   Composed-1 guard, `docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md`
+   Composed-1 guard, `docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md`
    §4.2(a)/§4.4; FSM `latest > startTS` write-conflict check). OCC
    serializability depends on those `commitTS` values being **mutually
    comparable** across all participating groups, and read-only participant shards
