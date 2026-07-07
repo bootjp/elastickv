@@ -49,7 +49,7 @@ func (o *RedisApplyObserver) OnApply(op pb.Op, key []byte) {
 		return
 	}
 	if userKey := zsetApplyUserKey(key); userKey != nil {
-		zsetWaiters.Signal(userKey)
+		zsetWaiters.SignalFull(userKey)
 	}
 }
 

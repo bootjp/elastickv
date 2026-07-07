@@ -1,6 +1,9 @@
 package adapter
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // keyWaiterRegistry is a multi-key channel-based wakeup primitive for
 // blocking Redis commands. It tracks goroutines blocked inside a wait
@@ -38,8 +41,9 @@ type keyWaiterRegistry struct {
 }
 
 type keyWaiter struct {
-	C    chan struct{}
-	keys []string
+	C         chan struct{}
+	keys      []string
+	forceFull atomic.Bool
 }
 
 func newKeyWaiterRegistry() *keyWaiterRegistry {
@@ -98,13 +102,24 @@ func (reg *keyWaiterRegistry) unregister(w *keyWaiter) {
 	reg.mu.Unlock()
 }
 
-// Signal wakes every waiter registered for key. Caller is the local
-// write command (ZADD / ZINCRBY) after coordinator.Dispatch returns;
-// by that point the FSM has applied the entry and a re-running
-// "try" helper on the leader is guaranteed to see it. Nil-safe:
-// test stubs that construct a RedisServer literal directly may
-// leave the registry unset, in which case Signal is a no-op.
+// Signal wakes every waiter registered for key. Caller is a fast-safe local
+// write command (for BZPOPMIN, ZADD / ZINCRBY) after coordinator.Dispatch
+// returns; by that point the FSM has applied the entry and a re-running "try"
+// helper on the leader is guaranteed to see it. Nil-safe: test stubs that
+// construct a RedisServer literal directly may leave the registry unset, in
+// which case Signal is a no-op.
 func (reg *keyWaiterRegistry) Signal(key []byte) {
+	reg.signal(key, false)
+}
+
+// SignalFull wakes waiters and requires the next re-check to use the full path.
+// Use this for broad FSM apply notifications where the signal does not prove
+// that only a command-domain-safe mutation occurred.
+func (reg *keyWaiterRegistry) SignalFull(key []byte) {
+	reg.signal(key, true)
+}
+
+func (reg *keyWaiterRegistry) signal(key []byte, forceFull bool) {
 	if reg == nil {
 		return
 	}
@@ -123,11 +138,21 @@ func (reg *keyWaiterRegistry) Signal(key []byte) {
 	}
 	reg.mu.Unlock()
 	for _, w := range waiters {
+		if forceFull {
+			w.forceFull.Store(true)
+		}
 		select {
 		case w.C <- struct{}{}:
 		default:
 		}
 	}
+}
+
+func (w *keyWaiter) fastSignalAllowed() bool {
+	if w == nil {
+		return false
+	}
+	return !w.forceFull.Swap(false)
 }
 
 // dedupKeyWaiterKeys returns a new slice of stringified keys with

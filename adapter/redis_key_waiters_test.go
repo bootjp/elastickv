@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -97,6 +98,21 @@ func TestKeyWaiterRegistry_CoalescesPreDrainSignals(t *testing.T) {
 	case <-w.C:
 		t.Fatal("burst was not coalesced — waiter saw a second wake")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestKeyWaiterRegistry_SignalFullDowngradesCoalescedFastSignal(t *testing.T) {
+	t.Parallel()
+	reg := newKeyWaiterRegistry()
+	w, release := reg.Register([][]byte{[]byte("k")})
+	defer release()
+
+	reg.Signal([]byte("k"))
+	reg.SignalFull([]byte("k"))
+
+	fast := waitForBlockedCommandUpdate(context.Background(), w, time.Now().Add(time.Second))
+	if fast {
+		t.Fatal("SignalFull must force the next wake to use the full re-check")
 	}
 }
 

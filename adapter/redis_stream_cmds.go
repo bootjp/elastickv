@@ -1131,7 +1131,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 			conn.WriteNull()
 			return
 		}
-		waitForBlockedCommandUpdate(handlerCtx, w.C, deadline)
+		waitForBlockedCommandUpdate(handlerCtx, w, deadline)
 	}
 }
 
