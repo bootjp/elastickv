@@ -285,14 +285,12 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 // runs. ProposeAdmin is unaffected (the cutover marker proposes
 // through it).
 //
-// HAZARDS — per-leader scope of the barrier (codex P1 round-2 and
-// round-3 on PR933): the barrier is an in-memory data structure
-// owned by THIS leader's dynamicWrappedProposer. It does not
-// coordinate across the cluster, and it does not survive leadership
-// transfer. Two related future-state failure modes follow from
-// that scope and MUST be closed by 6E-2e before 6E-2f flips the
-// gate; 6E-2d ships them inert by leaving raftEnvelopeWrapEnabled
-// false so production never opens the cutover window.
+// HISTORICAL HAZARDS — per-leader scope of the barrier: the barrier
+// is an in-memory data structure owned by THIS leader's
+// dynamicWrappedProposer. It does not coordinate across the cluster,
+// and it does not survive leadership transfer. The two failure modes
+// below are the ones 6E-2e had to close before 6E-2f opened the
+// production gate.
 //
 //	(a) Wrap-gap admin RPCs:
 //	    Other admin RPCs that route through ProposeAdmin (RotateDEK,
@@ -304,7 +302,7 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 //	    non-cutover admin entry uses the same dynamic wrapper as
 //	    user proposals.
 //
-//	(b) Leader failover mid-cutover (codex P1 round-3):
+//	(b) Leader failover mid-cutover:
 //	    If leadership transfers from L1 to L2 between the cutover
 //	    marker's commit and L1's InstallWrap call, L2 has its own
 //	    barrierOpen=false and a nil wrap pointer. L2 admits a fresh
@@ -313,30 +311,12 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 //	    L2 (or any follower) applies the cutover marker the §6.3
 //	    strict-`>` hook treats every subsequent cleartext proposal
 //	    as a wrapped envelope and halts.
-//
-//	    Remediation options for 6E-2e:
-//	      Option A (preferred): auto-install the wrap on every
-//	                            replica's FSM-apply of the cutover
-//	                            marker so L2's
-//	                            dynamicWrappedProposer publishes the
-//	                            same wrap closure independently of
-//	                            leadership state. The handler's
-//	                            InstallWrap call then becomes a
-//	                            redundant convenience (matches the
-//	                            state every follower will reach via
-//	                            the apply path).
-//	      Option B: make dynamicWrappedProposer.Propose consult the
-//	                sidecar's RaftEnvelopeCutoverIndex on every call
-//	                and refuse when the wrap pointer is nil but the
-//	                sidecar already reflects a cutover. Trades a
-//	                sidecar load per propose for a closed gap.
-//
-// The remaining leader-failover hazard has the same shape:
-// post-cutover cleartext entries land in Raft at indexes that the
-// §6.3 apply hook treats as wrapped. The production gate
-// (`raftEnvelopeWrapEnabled = false`) stays closed until the
-// apply-time wrap installer / startup-time wrap install are wired
-// as well.
+//	    Production wiring closes this by invoking
+//	    WithRaftCutoverWrapInstaller from every replica's FSM apply
+//	    of the cutover marker and by installing the wrap at startup
+//	    whenever the sidecar already carries a non-zero cutover
+//	    index. The handler's InstallWrap call is therefore a
+//	    redundant convergence step, not the only publication path.
 //
 // Idempotent against double-Begin: a second call freshens drainSig
 // and leaves barrierOpen true. CALLER SAFETY: a goroutine that was

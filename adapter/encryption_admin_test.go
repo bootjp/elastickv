@@ -2098,59 +2098,6 @@ func TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry(t *testing.T) {
 	}
 }
 
-// TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2 pins the
-// fail-closed gate: while raftEnvelopeWrapEnabled is false (i.e.
-// before Stage 6E-2 ships wrap-on-propose / unwrap-on-apply /
-// §7.1 barrier), the RPC MUST refuse fresh cutover proposals
-// with FailedPrecondition rather than recording
-// RaftEnvelopeCutoverIndex=N. Recording N now would let cleartext
-// entries land at indexes > N and the 6E-2 engine apply-hook
-// would treat them as envelopes on upgrade, halting apply
-// cluster-wide.
-//
-// The test wires an `applyingProposer` exactly as a future
-// happy-path test would, then verifies the gate refuses BEFORE
-// any proposal is composed (proposer.calls is empty) and BEFORE
-// any sidecar mutation lands (RaftEnvelopeCutoverIndex stays 0).
-// When 6E-2 lands and flips raftEnvelopeWrapEnabled to true, this
-// test becomes the regression pin for the gate-flip and a
-// HappyPath sibling is added.
-func TestEncryptionAdmin_EnableRaftEnvelope_GatedUntil6E2(t *testing.T) {
-	t.Parallel()
-	path := cutoverReadySidecarFixture(t)
-	proposer := &applyingProposer{
-		recordingProposer: recordingProposer{commitIndex: 4242},
-		sidecarPath:       path,
-		applyFn:           applyRaftCutover,
-	}
-	srv := NewEncryptionAdminServer(
-		WithEncryptionAdminProposer(proposer),
-		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
-		WithEncryptionAdminSidecarPath(path),
-		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
-	)
-	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition (gated until 6E-2)", status.Code(err))
-	}
-	if err == nil || !strings.Contains(err.Error(), "6E-2") {
-		t.Errorf("error %q does not hint at the 6E-2 gate", err)
-	}
-	if len(proposer.calls) != 0 {
-		t.Errorf("proposer.calls len=%d, want 0 (gate must refuse before propose)", len(proposer.calls))
-	}
-	// Sidecar must remain untouched: RaftEnvelopeCutoverIndex
-	// still 0 means the cluster has not entered Phase 2 and a
-	// future 6E-2 upgrade is still safe.
-	sc, readErr := encryption.ReadSidecar(path)
-	if readErr != nil {
-		t.Fatalf("ReadSidecar: %v", readErr)
-	}
-	if sc.RaftEnvelopeCutoverIndex != 0 {
-		t.Errorf("RaftEnvelopeCutoverIndex=%d, want 0 (gate must refuse before sidecar mutation)", sc.RaftEnvelopeCutoverIndex)
-	}
-}
-
 // recordingCutoverBarrier is a CutoverBarrierController stub that
 // records the call order so the §7.1 6-step state-machine tests can
 // assert Begin → WaitDrained → (propose) → InstallWrap → End. It
@@ -2186,16 +2133,14 @@ func (b *recordingCutoverBarrier) End() {
 
 // withWrapEnabledForTest flips raftEnvelopeWrapEnabled to true for
 // the duration of t and restores the original value via t.Cleanup.
-// Tests that exercise the §7.1 state machine MUST call this — the
-// production value is still false in 6E-2d so the gated short-
-// circuit would otherwise eat the test before the barrier path
-// runs. Returns no value; t.Cleanup handles teardown so callers
-// don't need to defer.
+// The production default is true after 6E-2f, so this helper is now
+// mostly a local guard against future tests that temporarily flip the
+// gate. Returns no value; t.Cleanup handles teardown so callers don't
+// need to defer.
 //
 // Safe to call from t.Parallel() tests: raftEnvelopeWrapEnabled is
 // an atomic.Bool, so concurrent reads from sibling parallel tests
-// (e.g. GatedUntil6E2) observe a coherent value rather than
-// tripping -race detection (claude finding 3 round-1).
+// observe a coherent value rather than tripping -race detection.
 func withWrapEnabledForTest(t *testing.T) {
 	t.Helper()
 	prev := raftEnvelopeWrapEnabled.Load()

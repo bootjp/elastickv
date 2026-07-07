@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"log/slog"
+	"sync/atomic"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -37,40 +38,11 @@ func buildShardGroupsWithEncryptionWiring(
 	encryptionEnabled bool,
 	routeEngine *distribution.Engine,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
-	// Stage 6E-2c: refuse startup BEFORE buildEncryptionWriteWiring
-	// runs (which calls prepareStorageNonceEpoch → BumpLocalEpoch
-	// → durable sidecar write). If we ran the refusal after the
-	// epoch bump, an orchestrator restart loop on a sidecar with
-	// non-zero RaftEnvelopeCutoverIndex would consume one
-	// local_epoch per boot and could hit ErrLocalEpochExhausted
-	// before the operator notices (codex P2 round-1 r3). Running
-	// it first keeps the sidecar untouched on the refusal path.
-	//
-	// This binary does not (yet) ship the cipher-aware wrap
-	// closure factory (that lands in Stage 6E-2e/2f). With a
-	// cutover recorded but no wrap installed, every fresh
-	// proposal would land cleartext above the cutover index and
-	// halt the apply loop on §6.3 strict-`>` unwrap — a
-	// node-wide crash loop is worse than refusing to serve.
-	// Fail-closed so the operator sees the refusal at boot,
-	// before any traffic is admitted and before any sidecar
-	// mutation (codex P1 round-1).
-	//
-	// In a healthy 6E-2c-only deployment this never fires:
-	// raftEnvelopeWrapEnabled is still false in
-	// adapter/encryption_admin.go (see Stage 6E-1b), so
-	// EnableRaftEnvelope refuses to record a cutover index. The
-	// refusal fires only on a sidecar restored from a future
-	// deployment where 6E-2f flipped the gate, or hand-edited —
-	// both cases the operator must intervene before serving
-	// traffic.
-	if cutoverErr := refuseStartupOnActiveRaftCutover(sidecarPath); cutoverErr != nil {
-		return nil, nil, encryptionWriteWiring{}, cutoverErr
-	}
 	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore)
 	if err != nil {
 		return nil, nil, encryptionWriteWiring{}, err
 	}
+	configureRaftEnvelopeFactory(factory, encWiring)
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)
 	// Return the wiring (cache + bumped epoch) so run() can drive the
@@ -78,50 +50,37 @@ func buildShardGroupsWithEncryptionWiring(
 	return runtimes, shardGroups, encWiring, err
 }
 
-// refuseStartupOnActiveRaftCutover reads the sidecar at process
-// start and returns a fail-closed error if RaftEnvelopeCutoverIndex
-// is non-zero. Stage 6E-2c installs the dynamic wrap proposer
-// chain on every shard group but leaves the wrap closure pointer
-// nil — the cipher-aware factory ships in Stage 6E-2e/2f. Without
-// the closure, a post-cutover write proposed under this binary
-// would land cleartext above the cutover; the strict-`>` apply
-// hook would then halt on unwrap failure across the cluster.
-//
-// Missing or unreadable sidecars are not this helper's concern —
-// the Stage 6C-1 startup guard already refuses to boot when the
-// sidecar is malformed or the KEK does not unwrap the recorded
-// DEKs. A clean ReadSidecar with a zero RaftEnvelopeCutoverIndex
-// is the Stage 3 default and returns nil.
-//
-// The error message names the recovery path explicitly so the
-// operator log line is enough to act on without grepping source.
-func refuseStartupOnActiveRaftCutover(sidecarPath string) error {
-	if sidecarPath == "" {
-		return nil
+type raftEnvelopeConfigurableFactory interface {
+	SetRaftEnvelope(*encryption.Cipher, etcdraftengine.RaftCutoverIndex)
+}
+
+func configureRaftEnvelopeFactory(factory raftengine.Factory, w encryptionWriteWiring) {
+	if factory == nil || w.raftEnvelope == nil {
+		return
 	}
-	sc, err := encryption.ReadSidecar(sidecarPath)
-	if err != nil {
-		// Missing sidecar is the pre-bootstrap state — there is no
-		// raft envelope cutover to refuse on. Other read failures
-		// (malformed / KEK-mismatched) propagate so the caller's
-		// startup chain sees them; mirroring the prepareStorageNonceEpoch
-		// shape that lets the Stage 6C-1 startup guard surface the
-		// same error through a different code path keeps the
-		// failure mode consistent.
-		if encryption.IsNotExist(err) {
-			return nil
-		}
-		return pkgerrors.Wrap(err, "encryption: refuse startup on active raft cutover (read sidecar)")
+	configurable, ok := factory.(raftEnvelopeConfigurableFactory)
+	if !ok {
+		return
 	}
-	if sc.RaftEnvelopeCutoverIndex == 0 {
-		return nil
+	configurable.SetRaftEnvelope(w.cipher, w.raftEnvelope.engineCutoverIndex)
+}
+
+func encryptionApplierOptionsFor(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, sidecarPath string, w encryptionWriteWiring) []encryption.ApplierOption {
+	opts := append(applierOptionsFor(kekWrapper, keystore, sidecarPath),
+		encryption.WithStateCache(w.cache),
+		encryption.WithLocalEpoch(w.epoch),
+		encryption.WithRaftLocalEpoch(w.raftEpoch))
+	if w.raftEnvelope != nil {
+		opts = append(opts, encryption.WithRaftCutoverWrapInstaller(w.raftEnvelope.installFromApply))
 	}
-	slog.Error("encryption: refusing to start — sidecar reports raft envelope cutover active but this binary does not install the wrap closure on shard groups; Stage 6E-2e/2f wires the cipher. Restore a sidecar with RaftEnvelopeCutoverIndex=0 (cutover not yet installed) or upgrade to a binary that ships the cipher factory.",
-		slog.Uint64("cutover_index", sc.RaftEnvelopeCutoverIndex),
-		slog.String("sidecar_path", sidecarPath))
-	return pkgerrors.Errorf(
-		"encryption: sidecar reports raft envelope cutover active at index %d but this binary does not install the wrap closure on shard groups; Stage 6E-2e/2f wires the cipher — restore a sidecar with RaftEnvelopeCutoverIndex=0 or upgrade",
-		sc.RaftEnvelopeCutoverIndex)
+	return opts
+}
+
+func (w encryptionWriteWiring) attachRaftEnvelopeGroup(groupID uint64, sg *kv.ShardGroup) {
+	if w.raftEnvelope == nil {
+		return
+	}
+	w.raftEnvelope.attachGroup(groupID, sg)
 }
 
 // encryptionWriteWiring bundles the Stage 6D-6c storage-envelope
@@ -150,6 +109,21 @@ type encryptionWriteWiring struct {
 	// registry's last_seen advances in lockstep with the nonces this
 	// load emits. Zero when encryption is off or pre-bootstrap.
 	epoch uint16
+	// raftEpoch is the §4.2 local_epoch this process load pins into
+	// the raft-envelope nonce factory. It is independent from epoch
+	// because storage and raft envelopes use separate DEKs and
+	// write_count streams.
+	raftEpoch uint16
+	// raftNonceFactory emits §4.2 raft-envelope nonces. nil means
+	// raft envelope wrapping is not configured for this process.
+	raftNonceFactory store.NonceFactory
+	// raftCutoverIndex is the process-shared source for the etcd
+	// pre-apply unwrap hook. A zero value means inactive; the
+	// callback exposed to etcd maps it to the inert max-uint sentinel.
+	raftCutoverIndex *atomic.Uint64
+	// raftEnvelope coordinates wrap publication across shard groups
+	// and supplies the applier installer hook.
+	raftEnvelope *raftEnvelopeRuntime
 }
 
 // withDefaultedCache returns a copy of w with a non-nil StateCache.
@@ -230,11 +204,64 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	if err != nil {
 		return w, err
 	}
+	raftEpoch, err := prepareRaftNonceEpoch(sidecarPath, kekWrapper, keystore)
+	if err != nil {
+		return w, err
+	}
+	nodeID := encryption.NodeID16(etcdraftengine.DeriveNodeID(raftID))
 	w.cipher = cipher
 	w.epoch = epoch
-	w.nonceFactory = encryption.NewDeterministicNonceFactory(
-		encryption.NodeID16(etcdraftengine.DeriveNodeID(raftID)), epoch)
+	w.raftEpoch = raftEpoch
+	w.nonceFactory = encryption.NewDeterministicNonceFactory(nodeID, epoch)
+	w.raftNonceFactory = encryption.NewDeterministicNonceFactory(nodeID, raftEpoch)
+	cutoverIdx, activeRaftDEKID, err := readRaftEnvelopeStartupState(sidecarPath)
+	if err != nil {
+		return w, err
+	}
+	w.raftCutoverIndex = &atomic.Uint64{}
+	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex)
+	if err != nil {
+		return w, err
+	}
+	w.raftEnvelope = runtime
 	return w, nil
+}
+
+func readRaftEnvelopeStartupState(sidecarPath string) (cutoverIdx uint64, activeRaftDEKID uint32, err error) {
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		if encryption.IsNotExist(err) {
+			return 0, 0, nil
+		}
+		return 0, 0, pkgerrors.Wrap(err, "read raft envelope startup state")
+	}
+	return sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, nil
+}
+
+func prepareRaftNonceEpoch(sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore) (uint16, error) {
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		if encryption.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, pkgerrors.Wrap(err, "prepare raft nonce epoch: read sidecar")
+	}
+	if sc.Active.Raft == 0 {
+		return 0, nil
+	}
+	if err := encryption.HydrateKeystoreFromSidecar(keystore, kekWrapper, sc); err != nil {
+		return 0, pkgerrors.Wrap(err, "prepare raft nonce epoch: hydrate keystore")
+	}
+	epoch, err := encryption.BumpLocalEpoch(sidecarPath, sc.Active.Raft)
+	if err != nil {
+		if errors.Is(err, encryption.ErrLocalEpochExhausted) {
+			slog.Error("encryption write-path wiring refused: raft DEK local_epoch exhausted; rotate-dek required",
+				slog.String("sidecar_path", sidecarPath),
+				slog.Uint64("active_raft_dek", uint64(sc.Active.Raft)))
+		}
+		return 0, pkgerrors.Wrap(err, "prepare raft nonce epoch: bump local_epoch")
+	}
+	return epoch, nil
 }
 
 // prepareStorageNonceEpoch returns the §4.1 local_epoch the nonce

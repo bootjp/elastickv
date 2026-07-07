@@ -84,13 +84,10 @@ type EncryptionAdminServer struct {
 	// FailedPrecondition before composing any proposal (matches the
 	// proposer / leaderView posture for the other mutator RPCs).
 	//
-	// Production wiring (6E-2e: main.go) fans this out over every
-	// ShardGroup that participates in the cutover so the barrier
-	// engages all leaders for the few-ms cutover window. The
-	// raftEnvelopeWrapEnabled production gate (still false in 6E-2d)
-	// short-circuits EnableRaftEnvelope before reaching the barrier;
-	// tests that exercise the state machine flip the gate via the
-	// test-only override and inject a stub controller.
+	// Production wiring fans this out over every ShardGroup that
+	// participates in the cutover so the barrier engages all leaders
+	// for the few-ms cutover window. A nil controller still fails
+	// closed before any proposal is composed.
 	cutoverBarrier CutoverBarrierController
 	pb.UnimplementedEncryptionAdminServer
 }
@@ -1148,35 +1145,21 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 	}
 }
 
-// raftEnvelopeWrapEnabled gates the EnableRaftEnvelope RPC until
-// the Stage 6E-2 wrap-on-propose / unwrap-on-apply / §7.1
-// proposal-quiescence-barrier triple ships. With only 6E-1
-// (admin RPC + FSM-apply machinery) deployed, accepting a cutover
-// proposal records RaftEnvelopeCutoverIndex=N in the sidecar, but
-// no entry between N and the eventual 6E-2 upgrade is wrapped —
-// they all remain cleartext. The future engine apply-hook
-// (designed in §6.3) dispatches `entry.Index > cutover` through
-// the unwrap path, so a 6E-2 upgrade against a sidecar where N
-// was recorded under a 6E-1-only build would treat every
-// pre-upgrade cleartext entry above N as an envelope and halt
-// apply cluster-wide. Gate fails closed until 6E-2 atomically
-// flips this to true alongside the wrap/unwrap/barrier wiring.
-// raftEnvelopeWrapEnabled is an atomic.Bool, not a const, so the
-// unit tests in encryption_admin_test.go can flip it to true (with
-// t.Cleanup-based restore) to exercise the §7.1 6-step state
-// machine that ships in 6E-2d. The production value is false until
-// 6E-2f flips it; releasing 6E-2d alone with the gate still false
-// keeps the handler's barrier path unreachable from operators while
-// the wrap closure source wires through in 6E-2e.
+// raftEnvelopeWrapEnabled gates fresh EnableRaftEnvelope cutovers.
+// Stage 6E-2f flips the production default to true only after the
+// wrap-on-propose, unwrap-on-apply, cutover barrier, applier
+// installer, startup install, and post-cutover admin proposer wiring
+// are all present. The remaining per-request fail-closed checks
+// (barrier, latest-applied-index, fan-out) still run before any
+// proposal is composed.
 //
-// Why atomic.Bool over a plain bool var: tests that exercise the
-// gate flip it via the withWrapEnabledForTest helper, while sibling
-// tests (e.g. GatedUntil6E2) read it under t.Parallel(). A plain
-// var would race under -race detection even though Go's test
-// runner schedules the parallel siblings AFTER the sequential
-// writers complete — atomic.Bool removes the implicit ordering
-// dependency and makes the gate self-enforcing (claude finding 3).
+// Kept as atomic.Bool rather than a const so tests can override the
+// gate without racing sibling t.Parallel cases.
 var raftEnvelopeWrapEnabled atomic.Bool
+
+func init() {
+	raftEnvelopeWrapEnabled.Store(true)
+}
 
 // EnableRaftEnvelope is the Stage 6E Phase 2 cutover — flips Raft
 // proposals from cleartext to §4.2-envelope. Structural mirror of
@@ -1196,12 +1179,13 @@ var raftEnvelopeWrapEnabled atomic.Bool
 // sequence, and error mapping match the storage variant verbatim;
 // see EnableStorageEnvelope for the full design rationale.
 //
-// **Gated**: refuses with FailedPrecondition until 6E-2 ships the
-// wrap-on-propose / unwrap-on-apply / §7.1 barrier (see
-// raftEnvelopeWrapEnabled for the rationale). The pre-gate
-// validation surface (leader, semaphore acquire, request shape)
-// still fires so operators get fast feedback on wiring problems,
-// but no Raft proposal is composed and no sidecar mutation occurs.
+// **Gate posture**: raftEnvelopeWrapEnabled existed to hold fresh
+// cutovers closed while only the 6E-1 operator surface existed.
+// Production now defaults it open after 6E-2 wiring, while tests can
+// still force the fail-closed branch. If closed, the pre-gate
+// validation surface (leader, semaphore acquire, request shape) still
+// fires, but no Raft proposal is composed and no sidecar mutation
+// occurs.
 func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.EnableRaftEnvelopeRequest) (*pb.EnableRaftEnvelopeResponse, error) {
 	if err := s.acquireCutoverSemaphore(ctx); err != nil {
 		return nil, err
@@ -1215,22 +1199,22 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 		return earlyResp, nil
 	}
 	if !raftEnvelopeWrapEnabled.Load() {
-		// Without 6E-2 wrap-on-propose, recording the cutover
-		// index here would let cleartext entries land at indexes
-		// > N. A 6E-2 upgrade would then treat those cleartext
-		// entries as envelopes and halt apply. Refuse before the
-		// fan-out and propose so no sidecar state changes.
+		// Test/fail-closed posture: recording a cutover index
+		// without the paired wrap-on-propose path would let
+		// cleartext entries land at indexes > N and later be
+		// interpreted as envelopes. Refuse before the fan-out and
+		// propose so no sidecar state changes.
 		return nil, grpcStatusError(codes.FailedPrecondition,
-			"encryption: enable-raft-envelope is gated until Stage 6E-2 ships wrap-on-propose / unwrap-on-apply / §7.1 proposal-quiescence-barrier; accepting the cutover now would brick the cluster on the next upgrade")
+			"encryption: enable-raft-envelope is administratively gated; accepting the cutover without wrap-on-propose / unwrap-on-apply / §7.1 proposal-quiescence-barrier would make the cluster unsafe")
 	}
 	if s.cutoverBarrier == nil {
-		// Production wiring (6E-2e: main.go) injects the barrier
-		// controller. Without it the handler cannot drive the §7.1
-		// 6-step sequence — refuse before any side effect rather
-		// than silently skip the barrier and let a fresh USER
-		// proposal land at index > proposedIdx mid-cutover.
+		// Production wiring injects the barrier controller. Without
+		// it the handler cannot drive the §7.1 6-step sequence —
+		// refuse before any side effect rather than silently skip
+		// the barrier and let a fresh USER proposal land at index >
+		// proposedIdx mid-cutover.
 		return nil, grpcStatusError(codes.FailedPrecondition,
-			"encryption: cutover barrier controller is not wired — wire WithEncryptionAdminCutoverBarrier before flipping raftEnvelopeWrapEnabled")
+			"encryption: cutover barrier controller is not wired — wire WithEncryptionAdminCutoverBarrier before enabling the raft envelope cutover")
 	}
 	if s.latestAppliedIndex == nil {
 		// Pre-flight check: awaitCutoverApply (§7.1 step-4) consults
@@ -1240,10 +1224,9 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 		// releasing the barrier from that state lets post-cutover
 		// USER proposals land cleartext at indexes > cutover_index,
 		// which the §6.3 strict-`>` apply hook then halts on. The
-		// check belongs here, before any side effect (codex P1
-		// round-1: don't unblock after a committed cutover).
+		// check belongs here, before any side effect.
 		return nil, grpcStatusError(codes.FailedPrecondition,
-			"encryption: latest-applied-index callback is not wired — wire WithEncryptionAdminLatestAppliedIndex before flipping raftEnvelopeWrapEnabled")
+			"encryption: latest-applied-index callback is not wired — wire WithEncryptionAdminLatestAppliedIndex before enabling the raft envelope cutover")
 	}
 	fanoutResult, err := s.runCutoverFanout(ctx)
 	if err != nil {
@@ -1283,9 +1266,9 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 //
 // Returns the cutover entry's commit_index on success.
 //
-// Critical barrier-safety invariant (codex P1 rounds 1+4): once a
-// cutover marker MAY have entered Raft, the handler MUST NOT
-// release the barrier without first installing the wrap closure.
+// Critical barrier-safety invariant: once a cutover marker MAY have
+// entered Raft, the handler MUST NOT release the barrier without
+// first installing the wrap closure.
 // Doing so lets fresh USER proposals on this leader land cleartext
 // at indexes > cutover_index, which the §6.3 strict-`>` apply hook
 // then halts on cluster-wide. The releaseSafe flag gates the End()
@@ -1293,14 +1276,13 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 //
 //   - Pre-propose failures (drain timeout) release safely; no
 //     cutover entry exists in Raft to brick the cluster.
-//   - Propose errors (codex P1 round-4): the etcd engine cannot
-//     distinguish a ctx-cancel that fired before rawNode.Propose
-//     from one that fired after — both surface as a ProposeAdmin
-//     error, but only the latter leaves the marker submitted to
-//     Raft. Treat ALL propose errors as ambiguous and leave the
-//     barrier OPEN. releaseSafe is flipped to false BEFORE the
-//     propose call so the deferred End() does not race the ctx
-//     window.
+//   - Propose errors: the etcd engine cannot distinguish a
+//     ctx-cancel that fired before rawNode.Propose from one that
+//     fired after — both surface as a ProposeAdmin error, but only
+//     the latter leaves the marker submitted to Raft. Treat ALL
+//     propose errors as ambiguous and leave the barrier OPEN.
+//     releaseSafe is flipped to false BEFORE the propose call so
+//     the deferred End() does not race the ctx window.
 //   - Post-propose failures (apply-wait timeout, stale-DEK no-op
 //     branch, post-apply sidecar I/O fault) leave the barrier
 //     OPEN; operator intervention (this leader's restart, or a
@@ -1328,9 +1310,9 @@ func (s *EncryptionAdminServer) runRaftEnvelopeCutoverBarrier(ctx context.Contex
 		return 0, classifyCutoverCtxErr(err, "encryption: §7.1 step-2 drain wait", codes.Unavailable)
 	}
 
-	// Codex P1 round-4 on PR933 — keep the barrier closed across
-	// ambiguous propose outcomes. proposeRaftCutoverEntry calls
-	// raftengine.Proposer.ProposeAdmin, which submits to
+	// Keep the barrier closed across ambiguous propose outcomes.
+	// proposeRaftCutoverEntry calls raftengine.Proposer.ProposeAdmin,
+	// which submits to
 	// rawNode.Propose and then waits on a pending response. If ctx
 	// fires AFTER the engine submitted the marker to Raft but
 	// BEFORE the local apply resolves it, ProposeAdmin returns an
@@ -1361,12 +1343,12 @@ func (s *EncryptionAdminServer) runRaftEnvelopeCutoverBarrier(ctx context.Contex
 		return 0, err
 	}
 
-	// Codex P1 #2 round-2 — verify the cutover applied as a
-	// fresh-success (not a §6E-1a constraint #3 stale-DEK benign
-	// no-op). Re-read the sidecar: if RaftEnvelopeCutoverIndex is
-	// still 0, a concurrent RotateDEK changed Active.Raft between
-	// propose and apply and the applier consumed the marker as a
-	// no-op without flipping the cutover field.
+	// Verify the cutover applied as a fresh-success (not a §6E-1a
+	// constraint #3 stale-DEK benign no-op). Re-read the sidecar: if
+	// RaftEnvelopeCutoverIndex is still 0, a concurrent RotateDEK
+	// changed Active.Raft between propose and apply and the applier
+	// consumed the marker as a no-op without flipping the cutover
+	// field.
 	//
 	// In that race we MUST NOT install the wrap closure: the §6.3
 	// strict-`>` hook compares against the (still-zero)
@@ -1444,8 +1426,7 @@ func classifyCutoverCtxErr(err error, msg string, fallbackCode codes.Code) error
 // cutover entry stranded in Raft.
 //
 // Returns an error classified via classifyCutoverCtxErr on ctx
-// fire (Canceled vs DeadlineExceeded, codex P1 round-1 / claude
-// finding 1).
+// fire (Canceled vs DeadlineExceeded).
 func (s *EncryptionAdminServer) awaitCutoverApply(ctx context.Context, proposedIdx uint64) error {
 	if s.latestAppliedIndex() >= proposedIdx {
 		return nil

@@ -500,6 +500,7 @@ func run() error {
 		shardStore: shardStore, coordinate: coordinate,
 		distServer: distServer, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
+		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
 	}); err != nil {
@@ -870,11 +871,10 @@ func buildShardGroups(
 		// pinned storage write-path w.epoch into the Applier so
 		// applyRotateDEK (PurposeStorage) can write each node's own
 		// highest-emitted local_epoch into Keys[newDEK].LocalEpoch
-		// rather than the proposer's 0. Raft rotations (PurposeRaft)
-		// keep LocalEpoch: 0 — see writeRotationSidecar's switch.
-		applierOpts := append(applierOptionsFor(kekWrapper, keystore, sidecarPath),
-			encryption.WithStateCache(encWiring.cache),
-			encryption.WithLocalEpoch(encWiring.epoch))
+		// rather than the proposer's 0. Stage 6E does the same for
+		// raft rotations through WithRaftLocalEpoch using the raft
+		// DEK's separate per-process epoch.
+		applierOpts := encryptionApplierOptionsFor(kekWrapper, keystore, sidecarPath, encWiring)
 		applier, err := encryption.NewApplier(reg, applierOpts...)
 		if err != nil {
 			for _, rt := range runtimes {
@@ -920,6 +920,7 @@ func buildShardGroups(
 		}
 		sg.Txn = kv.NewLeaderProxyForShardGroup(sg, kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, g.id)))
 		shardGroups[g.id] = sg
+		encWiring.attachRaftEnvelopeGroup(g.id, sg)
 	}
 	return runtimes, shardGroups, nil
 }
@@ -1146,6 +1147,7 @@ type serversInput struct {
 	readTracker      *kv.ActiveTimestampTracker
 	metricsRegistry  *monitoring.Registry
 	cfg              runtimeConfig
+	encWiring        encryptionWriteWiring
 	// keyvizSampler is the in-memory key visualizer sampler, or nil
 	// when --keyvizEnabled is false. Threaded into setupAdminService
 	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
@@ -1219,6 +1221,7 @@ func startServers(in serversInput) error {
 		leaderRedis:     in.cfg.leaderRedis,
 		pubsubRelay:     adapter.NewRedisPubSubRelay(),
 		readTracker:     in.readTracker,
+		encWiring:       in.encWiring,
 		dynamoAddress:   *dynamoAddr,
 		leaderDynamo:    in.cfg.leaderDynamo,
 		s3Address:       *s3Addr,
@@ -1588,6 +1591,7 @@ func startRaftServers(
 	adminGRPCOpts adminGRPCInterceptors,
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
+	encWiring encryptionWriteWiring,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
 	// extraOptsCap reserves slots for the unary + stream admin interceptor
@@ -1645,6 +1649,7 @@ func startRaftServers(
 			rt.engine,
 			encryptionCapabilityFanout,
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
+			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 		)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
@@ -1905,6 +1910,7 @@ type runtimeServerRunner struct {
 	leaderRedis                     map[string]string
 	pubsubRelay                     *adapter.RedisPubSubRelay
 	readTracker                     *kv.ActiveTimestampTracker
+	encWiring                       encryptionWriteWiring
 	dynamoAddress                   string
 	leaderDynamo                    map[string]string
 	s3Address                       string
@@ -2016,6 +2022,7 @@ func (r *runtimeServerRunner) start() error {
 		r.adminGRPCOpts,
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
+		r.encWiring,
 	); err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}

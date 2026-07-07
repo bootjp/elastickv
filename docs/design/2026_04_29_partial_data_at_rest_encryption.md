@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–5 shipped (5E deferred), Stages 6–9 open
+Status: Partial — Stages 0–5 shipped (5E deferred); Stage 6 partially shipped; Stages 7–9 open
 Author: bootjp
 Date: 2026-04-29
 
@@ -28,7 +28,7 @@ Date: 2026-04-29
 | 6C-3 | Cluster-wide §9.1 guards that require the Voters ∪ Learners membership view: `ErrNodeIDCollision` (two members hash to the same 16-bit `node_id`), `ErrLocalEpochRollback` (sidecar `local_epoch` ≤ writer-registry record). Naturally bundles with the Stage 6D capability fan-out which already needs that membership view. | open | — |
 | 6C-4 | Phase-2-specific §9.1 guards: `ErrEnvelopeCutoverDivergence` (sidecar `raft_envelope_cutover_index` disagrees with snapshot header), `ErrEncryptionNotBootstrapped` (`enable-raft-envelope` before bootstrap), `ErrLocalEpochOutOfRange` on the wire side of `GetCapability` / `GetSidecarState`. Bundles with Stage 6E (`enable-raft-envelope` admin RPC + Phase-2 cutover). | open | — |
 | 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring AND 6C-1+6C-2 for §9.1 startup-refusal guards; bundles 6C-3 for the membership-view-dependent collision check — see rationale) | open | — |
-| 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself). Depends on 6B for mutator wiring AND 6C-1/6C-2 for §9.1 startup-refusal guards; bundles 6C-4 for the Phase-2-specific guards. | open | — |
+| 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself) + production runtime wiring for startup/apply-time wrap install and post-cutover admin proposals. Phase-2 cutover mechanics are shipped through 6E-2; 6C-4 remains as 6E-3. | partial | 2026_05_31_partial_6e_enable_raft_envelope.md |
 | 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal | open | — |
 | 7 | Writer registry + deterministic nonce (§4.1) | open | — |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |
