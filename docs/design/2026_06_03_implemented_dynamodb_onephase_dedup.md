@@ -1,12 +1,12 @@
 # DynamoDB item-write one-phase idempotency dedup
 
-Status: Partial
+Status: Implemented
 Author: bootjp
 Date: 2026-06-03
 
-> **Status: partial — M1 (adapter dedup, gated off) ships in PR #920; M2
-> (validation: add DynamoDB to the dedup-mode Jepsen workflow + 7-day green
-> criterion) is open, and S3/SQS remain separate follow-ups.** Extends the
+> **Status: implemented — M1 adapter reuse-dedup is default-on, M2 validation
+> landed, and the rollback switch remains `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0`.**
+> Extends the
 > option-2 one-phase dedup (write-set reuse + exact-`commit_ts` probe) from the
 > Redis adapter to the DynamoDB adapter's single-item write path
 > (`UpdateItem` / `PutItem` / `DeleteItem`). The FSM-side probe
@@ -114,7 +114,7 @@ folded back in and re-appended. The discriminator the adapter is missing is
 "was the conflict caused by *my own* prior attempt?" — the self-inflicted
 conflict the parent doc's outcome 1 handles.
 
-### Why the existing dedup does not cover this today
+### Why the existing dedup did not cover this before M1
 
 The parent design landed the FSM-side probe and the request plumbing, but
 gated **emission** behind the Redis adapter only:
@@ -125,10 +125,10 @@ gated **emission** behind the Redis adapter only:
 - The FSM probe `dedupProbeOnePhase` (`kv/fsm.go`) fires only when
   `meta.PrevCommitTS != 0`; it no-ops the apply when
   `store.CommittedVersionAt(meta.PrimaryKey, meta.PrevCommitTS)` hits.
-- **But the DynamoDB adapter never sets `PrevCommitTS`.** Every
-  `buildItemWriteRequestWithSource` returns an `OperationGroup` with
-  `PrevCommitTS` at its zero value, so the probe is always skipped. The parent
-  doc's M4 "Workflow scope rationale" states this explicitly: *"DynamoDB / S3
+- **Before M1 the DynamoDB adapter never set `PrevCommitTS`.** Every
+  `buildItemWriteRequestWithSource` returned an `OperationGroup` with
+  `PrevCommitTS` at its zero value, so the probe was always skipped. The parent
+  doc's M4 "Workflow scope rationale" stated this explicitly: *"DynamoDB / S3
   / SQS do not route through the dedup loop."*
 
 So the FSM is ready; the DynamoDB adapter is the only missing piece.
@@ -139,8 +139,8 @@ The Redis list-push write set is **seq-addressed**: each element lands at
 `listItemKey(key, seq)` where `seq = Tail + Len` at attempt time, plus a
 `commitTS`-stamped meta-delta. The retry duplicates precisely because a fresh
 meta read advances `seq` (230 → 231), so the re-append lands at a *new index*.
-Reuse there must pin `seq` AND a boundary `readKeys` fence (the codex P1
-shrink-race).
+Reuse there must pin `seq` AND a boundary `readKeys` fence (the shrink-race
+review finding).
 
 The DynamoDB item write is **whole-item content-addressed**: the write set is a
 single `Put(itemKey, encode(nextItem))` (plus GSI delta puts/dels keyed by GSI
@@ -164,7 +164,7 @@ probe; Raft log order makes the probe race-free — E1 applies before E2 or
 never) carries over **unchanged** from the parent doc §"Correctness" and
 §"Open questions / Race-freedom linchpin". This doc does not re-derive it.
 
-## Proposed design — option 2 for the DynamoDB item-write loop
+## Implemented design — option 2 for the DynamoDB item-write loop
 
 Mirror `listPushCoreWithDedup` / `dispatchListPushReuse` at the
 `retryItemWriteWithGeneration` granularity.
@@ -188,7 +188,7 @@ stale-leader window cannot mint a colliding timestamp (HLC-4). `NextFenced`'s
 `ErrCeilingExpired` must be classified **non-retryable** by the adapter loop
 (surface to the client), matching the Redis call sites.
 
-**Leader-only allocation (codex P1, PR #920).** This local allocation moves
+**Leader-only allocation.** This local allocation moves
 timestamp issuance from the coordinator (which has the *leader* assign it on
 the non-dedup path) into the adapter, so it is only safe **on the leader** —
 otherwise two follower frontends could mint the same `commitTS` in one
@@ -254,7 +254,7 @@ dispatchItemWriteReuse(ctx, pending) -> (plan, drop, err):
     if err == nil:
         return pending.plan, false, nil                // reuse applied (or FSM no-op'd)
     if errors.Is(err, store.ErrWriteConflict):
-        // Self-inflicted-conflict guard (parent doc codex P1): the apply may
+        // Self-inflicted-conflict guard: the apply may
         // have landed at THIS commitTS but bubbled up as WriteConflict under
         // churn. Probe the store directly.
         landed, perr := d.store.CommittedVersionAt(ctx, pending.probeKey, commitTS)
@@ -361,8 +361,8 @@ every replica applying the same log entry.
     the keys become content-stable, so re-applying is a plain idempotent
     overwrite. The identity also pins `AvailableAtMillis` (vis-key input) and the
     per-entry validation re-runs against the current meta on every attempt, so a
-    mid-retry `SetQueueAttributes` neither shifts the vis key (codex P2 round-1)
-    nor lets a now-too-large body through (codex P2 round-2). Tests:
+    mid-retry `SetQueueAttributes` neither shifts the vis key nor lets a
+    now-too-large body through. Tests:
     `adapter/sqs_batch_send_dedup_test.go`.
     - **Residual edge (within at-least-once, no action):** if attempt 1
       *commits* (committed-but-conflicted) and a concurrent `SetQueueAttributes`
@@ -416,12 +416,14 @@ every replica applying the same log entry.
   (`.github/workflows/jepsen-test-scheduled.yml`) now runs the default
   `DynamoDBServer.onePhaseTxnDedup` path without an env-var opt-out.
 - Criterion to default-on: 7 consecutive days without `:duplicate-elements` in
-  the dedup-mode DynamoDB workload, both workflows green. **Satisfied; this PR
-  flips `DynamoDBServer.onePhaseTxnDedup`'s default and the env-var sense to
-  default-on with `0` as the rollback value.**
+  the dedup-mode DynamoDB workload, both workflows green. **Satisfied; the
+  rollout flipped `DynamoDBServer.onePhaseTxnDedup`'s default and the env-var
+  sense to default-on with `0` as the rollback value.**
 
-Scope estimate: M1 is ~120–180 LOC Go in `adapter/dynamodb.go` + tests; no FSM
-change (the probe already exists), no proto change, no new store primitive.
+Implementation footprint: M1 lives in `adapter/dynamodb.go`,
+`adapter/dynamodb_item_write.go`, and `adapter/dynamodb_onephase_dedup_test.go`;
+no FSM change, proto change, or new store primitive was needed because the
+probe already existed.
 
 ## Risks
 
@@ -473,13 +475,14 @@ change (the probe already exists), no proto change, no new store primitive.
 - (2026-06-26) Post-flip CI cleanup: retired the legacy-path scheduled control
   by removing the `ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0` opt-out from the general
   scheduled Jepsen workflow and deleting the dedicated dedup-mode workflow.
-- (2026-06-03, PR #920 round-1) **Leader-only dedup guard added** per codex P1:
+- (2026-06-03, PR #920 round-1) **Leader-only dedup guard added** per review
+  feedback:
   the adapter-local `commitTS` allocation is only safe on the leader, so the
   dedup path is gated on `d.coordinator.IsLeader()` (+ `NextFenced` ceiling
   fence for the cross-leader case); non-leaders fall back to the legacy path
   where the leader allocates. Covered by
-  `TestItemWriteDedup_NonLeaderFallsBackToLegacy`. Also addressed gemini's
-  redundant-`errors.WithStack` findings (the attempt helpers return the
+  `TestItemWriteDedup_NonLeaderFallsBackToLegacy`. Also addressed redundant
+  `errors.WithStack` findings (the attempt helpers return the
   already-wrapped dispatch error raw; the outer loop wraps once).
 - (2026-06-03) Initial proposal, triggered by Jepsen run 26856696842
   (`:duplicate-elements` on the DynamoDB list-append workload). Open for
