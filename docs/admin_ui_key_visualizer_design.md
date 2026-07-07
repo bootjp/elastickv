@@ -325,7 +325,7 @@ Because writes are recorded by Raft leaders and follower-local reads are recorde
 | 3 | Drill-down, split/merge continuity, namespace-isolated persistence of compacted columns distributed **per owning Raft group**, lineage recovery, and retention GC. | Heatmap remains continuous across a live `SplitRange`; restart preserves last 7 days; expired data and stale lineage records are collected; no single Raft group sees more than its share of KeyViz writes. |
 | 4 (deferred) | Mutating admin operations (`SplitRange` from UI), browser login, RBAC, and identity-provider integration. Out of scope for this design; a follow-up design will cover it. | — |
 
-Phases 0–2 (A/B/C) together are the minimum operationally useful product; Phase 3 is the "ship-quality" target. As of 2026-07-07, Phase 2-A is shipped (PRs #639/#645/#646/#647/#651/#660/#661/#672), Phase 2-B is shipped, and Phase 2-C is tracked by the implemented cluster fan-out design. Bytes series, originally listed under Phase 3, was rolled forward into 2-A and is already on the wire.
+Phases 0–2 (A/B/C) together are the minimum operationally useful product; Phase 3 is the "ship-quality" target. As of the Phase 2-C implementation update, Phase 2-A is shipped (PRs #639/#645/#646/#647/#651/#660/#661/#672), Phase 2-B is shipped, and Phase 2-C is shipped via the cluster fan-out design. Bytes series, originally listed under Phase 3, was rolled forward into 2-A and is already on the wire.
 
 ## 13. Open Questions
 
