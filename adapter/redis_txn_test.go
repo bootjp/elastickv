@@ -266,6 +266,131 @@ func TestRedisTxnWideFenceKeysUseRedisRoutePrefix(t *testing.T) {
 	require.Len(t, redisTxnWideCollectionFenceKeys(key), 4)
 }
 
+func TestRedisTxnMissingKeyCreatorsReadAllWideFences(t *testing.T) {
+	t.Parallel()
+
+	server, _ := newRedisStorageMigrationTestServer(t)
+	cases := []struct {
+		name  string
+		apply func(*testing.T, *txnContext, []byte)
+	}{
+		{
+			name: "incr",
+			apply: func(t *testing.T, txn *txnContext, key []byte) {
+				t.Helper()
+				res, err := txn.applyIncr(redcon.Command{Args: [][]byte{[]byte(cmdIncr), key}})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res.integer)
+			},
+		},
+		{
+			name: "hset",
+			apply: func(t *testing.T, txn *txnContext, key []byte) {
+				t.Helper()
+				res, err := txn.applyHSet(redcon.Command{Args: [][]byte{[]byte(cmdHSet), key, []byte("field"), []byte("value")}})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res.integer)
+			},
+		},
+		{
+			name: "rpush",
+			apply: func(t *testing.T, txn *txnContext, key []byte) {
+				t.Helper()
+				res, err := txn.applyRPush(redcon.Command{Args: [][]byte{[]byte(cmdRPush), key, []byte("value")}})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res.integer)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			txn := newRedisTxnTestContext(server)
+			key := []byte("missing:" + tc.name)
+			tc.apply(t, txn, key)
+			requireTxnReadKeysContainWideFences(t, txn, key)
+		})
+	}
+}
+
+func requireTxnReadKeysContainWideFences(t *testing.T, txn *txnContext, key []byte) {
+	t.Helper()
+	for _, fenceKey := range redisTxnWideCollectionFenceKeys(key) {
+		require.Contains(t, txn.readKeys, string(fenceKey))
+	}
+}
+
+func TestRedisTxnMissingKeyCreatorsConflictWithConcurrentWideCreator(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		apply      func(*testing.T, *txnContext, []byte)
+		concurrent func(*testing.T, context.Context, *RedisServer, []byte)
+	}{
+		{
+			name: "incr_vs_hash",
+			apply: func(t *testing.T, txn *txnContext, key []byte) {
+				t.Helper()
+				_, err := txn.applyIncr(redcon.Command{Args: [][]byte{[]byte(cmdIncr), key}})
+				require.NoError(t, err)
+			},
+			concurrent: func(t *testing.T, _ context.Context, server *RedisServer, key []byte) {
+				t.Helper()
+				added, err := server.applyHashFieldPairs(key, [][]byte{[]byte("field"), []byte("value")})
+				require.NoError(t, err)
+				require.Equal(t, 1, added)
+			},
+		},
+		{
+			name: "hset_vs_list",
+			apply: func(t *testing.T, txn *txnContext, key []byte) {
+				t.Helper()
+				_, err := txn.applyHSet(redcon.Command{Args: [][]byte{[]byte(cmdHSet), key, []byte("field"), []byte("value")}})
+				require.NoError(t, err)
+			},
+			concurrent: func(t *testing.T, ctx context.Context, server *RedisServer, key []byte) {
+				t.Helper()
+				length, err := server.listRPush(ctx, key, [][]byte{[]byte("value")})
+				require.NoError(t, err)
+				require.Equal(t, int64(1), length)
+			},
+		},
+		{
+			name: "rpush_vs_zset",
+			apply: func(t *testing.T, txn *txnContext, key []byte) {
+				t.Helper()
+				_, err := txn.applyRPush(redcon.Command{Args: [][]byte{[]byte(cmdRPush), key, []byte("value")}})
+				require.NoError(t, err)
+			},
+			concurrent: func(t *testing.T, ctx context.Context, server *RedisServer, key []byte) {
+				t.Helper()
+				score, err := server.zincrbyTxn(ctx, key, "member", 1)
+				require.NoError(t, err)
+				require.Equal(t, float64(1), score)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := store.NewMVCCStore()
+			coord := newOCCAdapterCoordinator(st)
+			server := NewRedisServer(nil, "", st, coord, nil, nil)
+			coord.Clock().Observe(redisTxnTestStartTS)
+			key := []byte("missing-conflict:" + tc.name)
+
+			txn := newRedisTxnTestContext(server)
+			tc.apply(t, txn, key)
+			tc.concurrent(t, ctx, server, key)
+
+			err := txn.validateReadSet(ctx)
+			require.ErrorIs(t, err, store.ErrWriteConflict)
+		})
+	}
+}
+
 func TestRedisTxnBuildZSetWideElemsWritesFence(t *testing.T) {
 	t.Parallel()
 

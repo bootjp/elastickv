@@ -761,6 +761,12 @@ func (t *txnContext) stageExpiredKeyCleanupForRecreate(key []byte) (bool, error)
 	return true, nil
 }
 
+func (t *txnContext) trackMissingKeyCreatorFenceReads(key []byte, typ redisValueType) {
+	if typ == redisTypeNone {
+		t.trackWideCollectionFenceReads(key)
+	}
+}
+
 func (t *txnContext) applyIncr(cmd redcon.Command) (redisResult, error) {
 	typ, err := t.stagedKeyType(cmd.Args[1])
 	if err != nil {
@@ -769,6 +775,7 @@ func (t *txnContext) applyIncr(cmd redcon.Command) (redisResult, error) {
 	if typ != redisTypeNone && typ != redisTypeString {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
+	t.trackMissingKeyCreatorFenceReads(cmd.Args[1], typ)
 
 	current, ttl, res, handled, err := t.incrBaseValue(cmd.Args[1], typ)
 	if err != nil || handled {
@@ -853,6 +860,7 @@ func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
 	if typ != redisTypeNone && typ != redisTypeHash {
 		return redisResult{typ: resultError, err: wrongTypeError()}, nil
 	}
+	t.trackMissingKeyCreatorFenceReads(cmd.Args[1], typ)
 	st, err := t.loadHashState(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
@@ -963,6 +971,7 @@ func (t *txnContext) prepareListWrite(key []byte) (redisResult, bool, error) {
 	if typ != redisTypeNone {
 		return redisResult{}, false, nil
 	}
+	t.trackMissingKeyCreatorFenceReads(key, typ)
 	expired, err := t.stageExpiredKeyCleanupForRecreate(key)
 	if err != nil {
 		return redisResult{}, false, err
