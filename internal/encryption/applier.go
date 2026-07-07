@@ -123,7 +123,8 @@ type Applier struct {
 	raftLocalEpoch uint16
 	// raftCutoverWrapInstaller is the Stage 6E-2e-1 hook that
 	// applyEnableRaftEnvelope invokes on every replica's local FSM
-	// apply of the cutover marker. Production wiring (6E-2e-3:
+	// apply of the cutover marker, and applyRotateDEK invokes after
+	// post-cutover raft DEK rotations. Production wiring (6E-2e-3:
 	// main.go) supplies a closure that publishes the wrap closure to
 	// every participating kv.ShardGroup via SetRaftPayloadWrap, so a
 	// follower that becomes leader post-cutover already has wrap
@@ -153,8 +154,9 @@ type Applier struct {
 
 // RaftCutoverWrapInstaller is the Stage 6E-2e-1 callback the Applier
 // invokes on every replica's local FSM apply of the
-// EnableRaftEnvelope cutover marker to publish the §4.2 raft envelope
-// wrap closure on this node.
+// EnableRaftEnvelope cutover marker, and after post-cutover raft
+// RotateDEK applies, to publish the §4.2 raft envelope wrap closure
+// on this node.
 //
 // Contract:
 //   - cutoverIdx is the Raft index recorded in the sidecar
@@ -419,10 +421,11 @@ func WithRaftLocalEpoch(epoch uint16) ApplierOption {
 }
 
 // WithRaftCutoverWrapInstaller installs the Stage 6E-2e-1 hook the
-// Applier invokes from applyEnableRaftEnvelope to publish the wrap
-// closure on this node. nil is a no-op (the option is omitted on the
-// test surface and on the pre-6E-2e-1 production posture); a
-// non-nil installer is invoked on both fresh-success and
+// Applier invokes from applyEnableRaftEnvelope and post-cutover raft
+// RotateDEK applies to publish the wrap closure on this node. nil is
+// a no-op (the option is omitted on the test surface and on the
+// pre-6E-2e-1 production posture); a non-nil installer is invoked on
+// both fresh-success and
 // already-active apply paths but NOT on the stale-DEK no-op branch.
 //
 // See the RaftCutoverWrapInstaller type comment for the contract;
@@ -968,11 +971,15 @@ func (a *Applier) applyRotateDEK(raftIdx uint64, p fsmwire.RotationPayload) erro
 	if err := a.keystore.Set(p.DEKID, dek); err != nil {
 		return errors.Wrap(err, "applier: keystore set rotation DEK")
 	}
-	if err := a.writeRotationSidecar(raftIdx, p); err != nil {
+	sc, err := a.writeRotationSidecar(raftIdx, p)
+	if err != nil {
 		return err
 	}
 	if err := a.ApplyRegistration(p.ProposerRegistration); err != nil {
 		return errors.Wrap(err, "applier: rotation proposer-registration insert")
+	}
+	if p.Purpose == fsmwire.PurposeRaft && sc.RaftEnvelopeCutoverIndex != 0 {
+		return a.invokeRaftCutoverWrapInstaller(sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, "rotate-dek apply")
 	}
 	return nil
 }
@@ -1325,12 +1332,11 @@ func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayl
 	return a.invokeRaftCutoverWrapInstaller(raftIdx, sc.Active.Raft, "fresh-success apply")
 }
 
-// invokeRaftCutoverWrapInstaller is the Stage 6E-2e-1 dispatch
-// shared between fresh-success and already-active branches of
-// applyEnableRaftEnvelope. nil installer is a no-op (preserves the
-// pre-6E-2e-1 test surface); a non-nil installer's error is wrapped
-// with the branch tag so operator logs distinguish a failure on
-// fresh apply from one on FSM replay.
+// invokeRaftCutoverWrapInstaller is the Stage 6E-2e-1 dispatch shared
+// by raft cutover applies and post-cutover raft DEK rotations. nil
+// installer is a no-op (preserves the pre-6E-2e-1 test surface); a
+// non-nil installer's error is wrapped with the branch tag so operator
+// logs distinguish the failing apply path.
 func (a *Applier) invokeRaftCutoverWrapInstaller(cutoverIdx uint64, activeRaftDEKID uint32, branchTag string) error {
 	if a.raftCutoverWrapInstaller == nil {
 		return nil
@@ -1346,17 +1352,17 @@ func (a *Applier) invokeRaftCutoverWrapInstaller(cutoverIdx uint64, activeRaftDE
 // p.DEKID, then crash-durably writes. Existing keys[] entries are
 // preserved (rotation does not retire old DEKs — that is a
 // separate sub-tag in Stage 6E).
-func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload) error {
+func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload) (*Sidecar, error) {
 	sc, err := ReadSidecar(a.sidecarPath)
 	if err != nil {
-		return errors.Wrap(err, "applier: read sidecar for rotation")
+		return nil, errors.Wrap(err, "applier: read sidecar for rotation")
 	}
 	if sc.Keys == nil {
 		sc.Keys = map[string]SidecarKey{}
 	}
 	purpose, err := sidecarPurposeFor(p.Purpose)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Stage 7b' §3.1 and Stage 6E: write THIS node's pinned
 	// per-purpose local_epoch into Keys[newDEK].LocalEpoch so the
@@ -1381,10 +1387,10 @@ func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload
 		LocalEpoch: keyLocalEpoch,
 	}
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-		return errors.Wrap(err, "applier: write sidecar for rotation")
+		return nil, errors.Wrap(err, "applier: write sidecar for rotation")
 	}
 	a.stateCache.RefreshFromSidecar(sc)
-	return nil
+	return sc, nil
 }
 
 // sidecarPurposeFor maps the fsmwire.Purpose enum to the

@@ -35,12 +35,12 @@ type encryptionRotateOnStartupTask struct {
 	sidecarPath  string
 	kekWrapper   kek.Wrapper
 	raftEnvelope *raftEnvelopeRuntime
+	readFence    func(context.Context) (uint64, error)
 	fullNodeID   uint64
 	storageEpoch uint16
 	raftEpoch    uint16
 
 	mu          sync.Mutex
-	nextReady   bool
 	nextKeyID   uint32
 	storageDone bool
 	raftDone    bool
@@ -94,6 +94,7 @@ func installEncryptionRotateOnStartup(
 		sidecarPath:  sidecarPath,
 		kekWrapper:   kekWrapper,
 		raftEnvelope: raftEnvelope,
+		readFence:    controller.LinearizableRead,
 		fullNodeID:   fullNodeID,
 		storageEpoch: storageEpoch,
 		raftEpoch:    raftEpoch,
@@ -175,6 +176,9 @@ func (t *encryptionRotateOnStartupTask) Done() bool {
 }
 
 func (t *encryptionRotateOnStartupTask) Run(ctx context.Context) error {
+	if err := t.fenceSidecarRead(ctx); err != nil {
+		return err
+	}
 	sc, err := encryption.ReadSidecar(t.sidecarPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || encryption.IsNotExist(err) {
@@ -206,6 +210,16 @@ func (t *encryptionRotateOnStartupTask) Run(ctx context.Context) error {
 	return nil
 }
 
+func (t *encryptionRotateOnStartupTask) fenceSidecarRead(ctx context.Context) error {
+	if t.readFence == nil {
+		return nil
+	}
+	if _, err := t.readFence(ctx); err != nil {
+		return errors.Wrap(err, "encryption rotate-on-startup: sidecar read fence")
+	}
+	return nil
+}
+
 func (t *encryptionRotateOnStartupTask) markAllDone() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -214,15 +228,11 @@ func (t *encryptionRotateOnStartupTask) markAllDone() {
 }
 
 func (t *encryptionRotateOnStartupTask) prepareNextKeyIDLocked(sc *encryption.Sidecar) error {
-	if t.nextReady {
-		return nil
-	}
 	next, err := nextEncryptionRotateOnStartupKeyID(sc)
 	if err != nil {
 		return err
 	}
 	t.nextKeyID = next
-	t.nextReady = true
 	return nil
 }
 
@@ -264,9 +274,6 @@ func (t *encryptionRotateOnStartupTask) rotateLocked(ctx context.Context, purpos
 		ProposerLocalEpoch: uint32(localEpoch),
 	})
 	if err != nil {
-		if retryableEncryptionRotateOnStartupError(err) {
-			t.advanceNextKeyIDLocked(keyID)
-		}
 		return errors.Wrap(err, "encryption rotate-on-startup: RotateDEK")
 	}
 	t.advanceNextKeyIDLocked(keyID)

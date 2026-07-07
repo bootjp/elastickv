@@ -208,7 +208,46 @@ func TestEncryptionRotateOnStartupTask_RunRotatesStorageAndRaft(t *testing.T) {
 	assertRotateProposal(t, rec.proposals[1], pb.RotateDEKRequest_PURPOSE_RAFT, 10, 12)
 }
 
-func TestEncryptionRotateOnStartupTask_RetryableRotateErrorSkipsUncertainKeyID(t *testing.T) {
+func TestEncryptionRotateOnStartupTask_RunFencesBeforeSidecarRead(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:          encryption.SidecarVersion,
+		RaftAppliedIndex: 10,
+		Active:           encryption.ActiveKeys{Storage: 7},
+		Keys: map[string]encryption.SidecarKey{
+			"7": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage"), Created: "2026-07-07T00:00:00Z"},
+		},
+	}
+	rec := &recordingRotateProposer{}
+	var fenced atomic.Bool
+	task := &encryptionRotateOnStartupTask{
+		server:      adapterServerForRotateStartup(t, sidecarPath, rec),
+		sidecarPath: sidecarPath,
+		kekWrapper:  fakeStartupKEK{},
+		fullNodeID:  0xCAFE,
+		readFence: func(context.Context) (uint64, error) {
+			fenced.Store(true)
+			if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+				return 0, err
+			}
+			return sc.RaftAppliedIndex, nil
+		},
+	}
+	if err := task.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !fenced.Load() {
+		t.Fatal("read fence was not called")
+	}
+	if got := len(rec.proposals); got != 1 {
+		t.Fatalf("proposals=%d, want 1 after fenced sidecar read", got)
+	}
+	assertRotateProposal(t, rec.proposals[0], pb.RotateDEKRequest_PURPOSE_STORAGE, 8, 0)
+}
+
+func TestEncryptionRotateOnStartupTask_RetryRereadsSidecarKeyID(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
@@ -233,8 +272,14 @@ func TestEncryptionRotateOnStartupTask_RetryableRotateErrorSkipsUncertainKeyID(t
 	if err := task.Run(context.Background()); err == nil {
 		t.Fatal("Run returned nil, want retryable rotate error")
 	}
-	if got := task.nextKeyID; got != 9 {
-		t.Fatalf("nextKeyID=%d, want 9 after treating key 8 as uncertain/committed", got)
+	sc.Active.Storage = 8
+	sc.Keys["8"] = encryption.SidecarKey{
+		Purpose: encryption.SidecarPurposeStorage,
+		Wrapped: []byte("storage-v2"),
+		Created: "2026-07-07T00:00:01Z",
+	}
+	if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+		t.Fatalf("WriteSidecar retry fixture: %v", err)
 	}
 	rec.err = nil
 	if err := task.Run(context.Background()); err != nil {
