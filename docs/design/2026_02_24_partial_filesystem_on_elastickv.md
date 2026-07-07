@@ -1,9 +1,10 @@
 # Filesystem on Elastickv Design
 
 Status: Partial - FS Core API, filesystem chunk routing, manual split boundary
-snapping, open-handle lease/orphan GC, and capacity-aware `StatFS` are
-implemented; FUSE adapter, whole-file migration, FILE_PINNED metrics, intent
-recovery, and placement/operator metrics remain open.
+snapping, open-handle lease/orphan GC, capacity-aware `StatFS`, and the thin
+FUSE errno/session adapter are implemented; whole-file migration,
+FILE_PINNED metrics, intent recovery, placement/operator metrics, and the
+actual FUSE mount/server binding remain open.
 Author: bootjp
 Date: 2026-02-24
 Updated: 2026-07-07
@@ -40,10 +41,15 @@ Implemented:
 8. `StatFS` reports visible inode count, configured file capacity/free files,
    configured byte capacity, and free bytes based on visible chunk payload
    bytes.
+9. `internal/filesystem/fuseadapter` provides the FUSE-facing session adapter
+   and maps typed `internal/filesystem` errors to stable `syscall.Errno`
+   results for lookup/getattr/setattr/open/read/write/flush/fsync/release,
+   create/mkdir/unlink/rmdir/rename/readdir/statfs, and explicit unsupported
+   operations.
 
 Remaining:
 
-1. Thin FUSE adapter and errno mapping tests.
+1. Actual FUSE mount/server binding against a chosen Go FUSE library.
 2. Whole-file `MoveFile` migration jobs, epoch-fenced stale-home retry, and migration recovery.
 3. `FILE_PINNED_HOTSPOT` metrics/alerts for auto-split planner skips.
 4. Restart recovery for unfinished create/delete/move intents.
