@@ -14,7 +14,7 @@ elastickv's SQS adapter currently has **no per-queue rate limiting**. A single t
 2. Exhaust the receive-path's visibility-index scan budget (`sqsVisScanPageLimit = 1024`), causing other tenants' `ReceiveMessage` calls to time out empty.
 3. Fill the message keyspace fast enough that the retention reaper cannot keep up — the keyspace grows unbounded until the next manual purge.
 
-Phase 3.C in [`docs/design/2026_04_24_partial_sqs_compatible_adapter.md`](2026_04_24_partial_sqs_compatible_adapter.md) §16.5 marks this as TODO. AWS itself enforces per-account / per-API limits ("standard request throttle of 3000 RPS per region per AWS account" plus per-API limits like 300 TPS for batch APIs); operators running elastickv as a multi-tenant SQS facade need an equivalent control plane. Without it, the only knobs are (a) shard-level capacity (too coarse — adding a shard requires a Raft membership change) and (b) external load-balancer rate limiting (no visibility into per-queue cost).
+Phase 3.C in [`docs/design/2026_04_24_implemented_sqs_compatible_adapter.md`](2026_04_24_implemented_sqs_compatible_adapter.md) §16.5 marks this as TODO. AWS itself enforces per-account / per-API limits ("standard request throttle of 3000 RPS per region per AWS account" plus per-API limits like 300 TPS for batch APIs); operators running elastickv as a multi-tenant SQS facade need an equivalent control plane. Without it, the only knobs are (a) shard-level capacity (too coarse — adding a shard requires a Raft membership change) and (b) external load-balancer rate limiting (no visibility into per-queue cost).
 
 This document proposes per-queue token-bucket throttling, configured per-queue in queue meta, evaluated at the SQS-adapter layer on the leader, and surfaced as the same `Throttling.Sender` error AWS uses (so existing SDK retry/backoff logic engages naturally).
 
@@ -219,7 +219,7 @@ The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1
 | `adapter/sqs_throttle_test.go` (new) | Unit tests for bucket math (edge cases: idle drift, burst, partial refill, batch over-charge, default-off). ~300 lines. |
 | `adapter/sqs_throttle_integration_test.go` (new) | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. ~150 lines. |
 | `monitoring/registry.go` | New counter `sqs_throttled_requests_total{queue, action}` and new **gauge** `sqs_throttle_tokens_remaining{queue, action}`. (Codex P2 on PR #664: tokens go up *and* down so a counter is the wrong instrument.) |
-| `docs/design/2026_04_24_partial_sqs_compatible_adapter.md` §16.5 | Status update once this lands: TODO → Landed. |
+| `docs/design/2026_04_24_implemented_sqs_compatible_adapter.md` §16.5 | Status update once this lands: TODO → Landed. |
 
 ### 4.2 OCC interaction
 

@@ -12,7 +12,7 @@ The elastickv SQS adapter currently speaks only the **AWS JSON 1.0 protocol**: `
 
 A long tail of clients still emits the older **query protocol** (form-encoded request, XML response) — `aws-sdk-java` v1, older `boto`/`boto3 < 1.34`, every CLI tool that builds requests by hand, and the AWS CLI itself when used against a region that defaults to query. Today these clients fail with `400 MalformedRequest` or `415 UnsupportedMediaType` on the very first request, even though the underlying SQS feature is fully implemented.
 
-Adding query-protocol support is the last piece needed to claim "drop-in SQS compatibility" for v1-era SDKs. Phase 3.B in [`docs/design/2026_04_24_partial_sqs_compatible_adapter.md`](2026_04_24_partial_sqs_compatible_adapter.md) §16.4 marked this as TODO; this document is the proposal that unblocks the implementation.
+Adding query-protocol support is the last piece needed to claim "drop-in SQS compatibility" for v1-era SDKs. Phase 3.B in [`docs/design/2026_04_24_implemented_sqs_compatible_adapter.md`](2026_04_24_implemented_sqs_compatible_adapter.md) §16.4 marked this as TODO; this document is the proposal that unblocks the implementation.
 
 ---
 

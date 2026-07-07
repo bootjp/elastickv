@@ -1,6 +1,6 @@
 # Split-Queue FIFO for the SQS Adapter
 
-**Status:** Partial
+**Status:** Implemented
 **Author:** bootjp
 **Date:** 2026-04-26
 
@@ -12,9 +12,9 @@ elastickv's SQS adapter implements FIFO queues with **single-partition** semanti
 
 This matches AWS's Standard FIFO contract for *modest* throughput — but AWS's **High Throughput FIFO** (HT-FIFO) feature lifts the per-FIFO-queue ceiling from 300 transactions per second (TPS) per API per region to 70,000+ TPS per region by **partitioning** the queue across multiple data planes, with ordering preserved *within* each `MessageGroupId`. AWS exposes this as the `DeduplicationScope` and `FifoThroughputLimit` queue attributes.
 
-The Phase 1+2 of `docs/design/2026_04_24_partial_sqs_compatible_adapter.md` deliberately deferred this — the design doc §16.6 marks it as TODO and notes "**the** large item in Phase 3" because it touches replication topology, routing, FIFO group-lock semantics, the reaper, the metrics surface, and the migration path for queues that already exist.
+The Phase 1+2 of `docs/design/2026_04_24_implemented_sqs_compatible_adapter.md` deliberately deferred this — the design doc §16.6 marked it as the large item in Phase 3 because it touches replication topology, routing, FIFO group-lock semantics, the reaper, the metrics surface, and the migration path for queues that already exist.
 
-This document is the proposal that unblocks the implementation. It is **not the implementation**: the work splits naturally into multiple PRs, and any one of them is too big to land without prior agreement on the partition assignment scheme, the migration story, and the rollback story. Concretely, this proposal is **gate-of-no-return** material — once a partitioned FIFO queue exists in production, the data layout cannot change without a full migration.
+This document records the implemented HT-FIFO design. The work landed across the PRs in §11; the remaining ideas in §10 / §12 are future extensions, not prerequisites for the implemented split-queue FIFO surface. Concretely, this feature is **gate-of-no-return** material — once a partitioned FIFO queue exists in production, the data layout cannot change without a full migration.
 
 ---
 
@@ -387,7 +387,7 @@ This is out of scope here.
 
 ## 11. Rollout Plan (Multi-PR)
 
-**Status as of 2026-05-04**: PRs 1–7 are merged on `main`. The doc is being moved from `proposed` to `partial` in PR 8 (this rename) because every milestone in the rollout plan that produces shippable code has landed. The "partial" classification rather than "implemented" leaves room for future work tracked in §10 / §12 (e.g. operator-configurable hash, online resharding, cross-partition transactional admin) — none of which are in this proposal's scope but each of which would be an extension to the same surface.
+**Status as of 2026-07-07**: PRs 1–7 are merged on `main`, and every milestone in the rollout plan that produces shippable code has landed. The future work tracked in §10 / §12 (for example, operator-configurable hash, online resharding, and cross-partition transactional admin) is outside this proposal's scope and would be an extension to the implemented surface.
 
 | PR | Content | Reviewable in isolation? | Status |
 |---|---|---|---|
@@ -398,7 +398,7 @@ This is out of scope here.
 | 5 | Send / Receive partition fanout. Receipt-handle v2 codec. **Removes the PR 2 `PartitionCount > 1` rejection** in the same commit that wires the data-plane fanout — the gate and its lift land atomically so a half-deployed cluster can never accept a partitioned queue without the data plane to serve it. | Yes (data-plane) | ✅ Merged across 5a / 5b-1 / 5b-2 / 5b-3 (#724, #731, #732, #734) |
 | 6 | PurgeQueue / DeleteQueue partition iteration. Tombstone schema update. Reaper update. | Yes (control-plane) | ✅ Merged across 6a / 6b (#735, #736) |
 | 7 | Jepsen HT-FIFO workload. Metrics. | Yes (testing) | ✅ Merged across 7a / 7b (#737, #738) |
-| 8 | Partial-doc lifecycle bump: rename `proposed` → `partial`, annotate §11 with shipped PR anchors, update in-tree source references that point at the proposed-stage filename. | Yes (docs) | 🟡 In flight (this PR) |
+| 8 | Implemented-doc lifecycle bump: rename `partial` → `implemented`, annotate §11 with shipped PR anchors, update in-tree source references that point at the partial-stage filename. | Yes (docs) | ✅ Landed |
 
 **Why the temporary gate** (Codex P1 on PR #664 tenth-round Codex review): without it, a cluster running PR 2–4 would accept a `CreateQueue` with `PartitionCount = 4` (the schema is in place, the validator only checks per-attribute validity) and then dispatch every subsequent `SendMessage` against the **legacy single-partition keyspace** with `partitionIndex = 0` — silently writing all messages under `!sqs|msg|data|<queue>|…` regardless of `PartitionCount`. When PR 5 lands and the new fanout reader looks for messages under the partitioned prefix `!sqs|msg|data|p|<queue>|<partition>|…`, every message written during the PR 2–4 window is invisible to it and to the partition-aware reaper scan. The gate-and-lift pattern (PR 2 rejects, PR 5 lifts in the same commit as the data-plane fanout) makes it impossible to land data under the wrong layout: any cluster that accepts `PartitionCount > 1` is, by construction, also running the partition-aware send path.
 

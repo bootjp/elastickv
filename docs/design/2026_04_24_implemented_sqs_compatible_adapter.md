@@ -1,6 +1,9 @@
 # SQS-Compatible Adapter Design for Elastickv
 
-Status: Proposed
+Status: Implemented — core JSON SQS APIs, FIFO/batch/DLQ/tag APIs, admin UI,
+per-queue throttling, HT-FIFO partitioning, and query-protocol XML coverage
+for the supported public verbs have shipped. Broader cluster-scaling work is
+tracked by the scaling roadmap docs rather than this adapter design.
 Author: bootjp
 Date: 2026-04-24
 
