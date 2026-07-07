@@ -78,6 +78,9 @@ func PrepareExternalSnapshotRestore(opts ExternalSnapshotRestoreOptions) (*Exter
 		return nil, err
 	}
 	if err := finalizeMigrationDir(tempDir, destDataDir); err != nil {
+		if errors.Is(err, errMigrationDestinationExists) {
+			return nil, errors.Wrapf(ErrExternalSnapshotRestoreExists, "destination exists: %s", destDataDir)
+		}
 		return nil, err
 	}
 	committed = true
@@ -127,10 +130,20 @@ func prepareExternalSnapshotRestoreDest(destDataDir string) (string, string, err
 		return "", "", err
 	}
 	tempDir := destDataDir + ".restore-prep"
-	if err := ensureExternalRestorePathAbsent(tempDir, "temporary destination"); err != nil {
+	if err := createExternalRestoreTempDir(tempDir); err != nil {
 		return "", "", err
 	}
 	return destDataDir, tempDir, nil
+}
+
+func createExternalRestoreTempDir(tempDir string) error {
+	if err := os.Mkdir(tempDir, defaultDirPerm); err != nil {
+		if os.IsExist(err) {
+			return errors.Wrapf(ErrExternalSnapshotRestoreExists, "temporary destination exists: %s", tempDir)
+		}
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func ensureExternalRestorePathAbsent(path string, kind string) error {

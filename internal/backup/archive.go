@@ -256,6 +256,19 @@ func writeTarPath(tw *tar.Writer, root, path string) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	var f *os.File
+	if info.Mode().IsRegular() {
+		opened, openedInfo, err := openArchiveRegularForRead(path)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = opened.Close() }()
+		if !os.SameFile(info, openedInfo) {
+			return errors.Wrapf(ErrArchiveNonRegular, "%s changed while archive was being packed", path)
+		}
+		info = openedInfo
+		f = opened
+	}
 	hdr, err := tar.FileInfoHeader(info, "")
 	if err != nil {
 		return errors.WithStack(err)
@@ -267,11 +280,6 @@ func writeTarPath(tw *tar.Writer, root, path string) error {
 	if !info.Mode().IsRegular() {
 		return nil
 	}
-	f, err := os.Open(path) //nolint:gosec // path came from WalkDir under root
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer func() { _ = f.Close() }()
 	_, err = io.Copy(tw, f)
 	return errors.WithStack(err)
 }

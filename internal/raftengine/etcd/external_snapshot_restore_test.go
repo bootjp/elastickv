@@ -85,6 +85,14 @@ func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {
 			wantErr: ErrExternalSnapshotRestoreExists,
 		},
 		{
+			name: "existing temporary destination",
+			mutate: func(t *testing.T, dataDir string, _ *ExternalSnapshotRestoreOptions) {
+				t.Helper()
+				require.NoError(t, os.Mkdir(dataDir+".restore-prep", 0o755))
+			},
+			wantErr: ErrExternalSnapshotRestoreExists,
+		},
+		{
 			name: "zero peer node id",
 			mutate: func(_ *testing.T, _ string, opts *ExternalSnapshotRestoreOptions) {
 				opts.Peers = []Peer{{ID: "n1", Address: "127.0.0.1:12001"}}
@@ -134,4 +142,33 @@ func TestPrepareExternalSnapshotRestoreFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrepareExternalSnapshotRestoreCreatesTempRootAtomically(t *testing.T) {
+	root := t.TempDir()
+	dest := filepath.Join(root, "raft")
+	gotDest, tempDir, err := prepareExternalSnapshotRestoreDest(dest)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(tempDir) })
+	require.Equal(t, dest, gotDest)
+	require.DirExists(t, tempDir)
+
+	_, _, err = prepareExternalSnapshotRestoreDest(dest)
+	require.ErrorIs(t, err, ErrExternalSnapshotRestoreExists)
+}
+
+func TestFinalizeMigrationDirRefusesExistingDestination(t *testing.T) {
+	root := t.TempDir()
+	tempDir := filepath.Join(root, "temp")
+	destDir := filepath.Join(root, "dest")
+	require.NoError(t, os.Mkdir(tempDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tempDir, "marker"), []byte("temp"), 0o600))
+	require.NoError(t, os.Mkdir(destDir, 0o755))
+
+	err := finalizeMigrationDir(tempDir, destDir)
+	require.ErrorIs(t, err, errMigrationDestinationExists)
+	require.DirExists(t, destDir)
+	require.NoFileExists(t, filepath.Join(destDir, "marker"))
+	_, statErr := os.Stat(tempDir)
+	require.True(t, os.IsNotExist(statErr))
 }

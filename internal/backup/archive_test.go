@@ -194,6 +194,22 @@ func TestPackDumpTreeRejectsSymlink(t *testing.T) {
 	require.ErrorIs(t, err, ErrArchiveNonRegular)
 }
 
+func TestOpenArchiveRegularForReadRejectsSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	require.NoError(t, os.WriteFile(target, []byte("payload"), 0o600))
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	f, _, err := openArchiveRegularForRead(link)
+	if f != nil {
+		_ = f.Close()
+	}
+	require.ErrorIs(t, err, ErrArchiveNonRegular)
+}
+
 func TestPackDumpTreeRejectsUnchecksummedFile(t *testing.T) {
 	root := writeArchiveFixture(t)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "extra.bin"), []byte("extra"), 0o600))
