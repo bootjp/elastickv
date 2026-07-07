@@ -6,9 +6,13 @@ Date: 2026-04-29
 
 > **Lifecycle (2026-05-25):** Phase 0a (decoder) has fully shipped —
 > `internal/backup/` + `cmd/elastickv-snapshot-decode` (PRs #790,
-> #791, #792, #806, #810). Phase 0b (encoder) is specified in detail
-> in `2026_05_25_proposed_snapshot_logical_encoder.md` and is not yet
-> implemented. Phase 0c (operator integration) is open. This doc
+> #791, #792, #806, #810). Phase 0b (encoder) has shipped and is
+> specified in detail in
+> `2026_05_25_implemented_snapshot_logical_encoder.md`. Phase 0c
+> (operator integration) has shipped via
+> `cmd/elastickv-snapshot-prepare-restore`,
+> `cmd/elastickv-snapshot-archive`, and
+> `docs/operations/snapshot_restore.md`. This doc
 > remains the format owner; the encoder doc owns the reverse-direction
 > wire-format reconstruction.
 
@@ -30,7 +34,7 @@ terminates on a clean EOF at the start of a key-length field
 `ReadSnapshot`). A CRC32C footer exists only on the *MVCC streaming
 restore* path (`store/lsm_store.go` `readStreamingMVCCRestoreHeader`),
 which is a different framing the decoder/encoder do not touch. See
-`2026_05_25_proposed_snapshot_logical_encoder.md` §"Why a separate
+`2026_05_25_implemented_snapshot_logical_encoder.md` §"Why a separate
 design doc" item 3.
 
 Snapshots are taken automatically every `defaultSnapshotEvery = 10000`
@@ -541,13 +545,15 @@ non-trivial (would need pause/resume Apply, install snapshot at the
 right index, etc.). Operators restore by:
 
 1. Stop the target node.
-2. Generate the matching `.snap` token file (see
-   `2026_04_14_implemented_etcd_snapshot_disk_offload.md` for the
-   17-byte EKVT format) using a small `cmd/elastickv-snap-token`
-   helper that takes the `.fsm` path and emits the token file.
-3. Place the new `.fsm` in `{dataDir}/fsm-snap/<index>.fsm` and the
-   token in `{dataDir}/snap/<index>.snap` (atomic rename of both,
-   then `syncDir` of both directories).
+2. Run `cmd/elastickv-snapshot-prepare-restore` against the encoded
+   `.fsm` payload and its `<output>.encode_info.json` sidecar. The
+   helper checks SHA-256, `encoder_key_format_version`, self-test
+   status, and `cluster_id`, then creates a fresh raft data directory.
+3. The helper writes the payload plus the runtime CRC32C footer to
+   `{dataDir}/fsm-snap/<index>.fsm`, writes the matching EKVT token
+   snapshot to `{dataDir}/snap/<term>-<index>.snap`, and persists the
+   bootstrap WAL + peers file. The destination data dir must not
+   already exist.
 4. Start the node. It loads the snapshot at startup as if it had
    just installed it from a leader.
 
@@ -561,8 +567,7 @@ opens to it as its initial state. This is the cleanest restore
 path.
 
 The runbook for both is documented in
-`docs/operations/snapshot_restore.md` (separate PR after this
-design lands).
+`docs/operations/snapshot_restore.md`.
 
 ### External tools
 
@@ -640,7 +645,7 @@ bespoke parser, the format has failed its goal.
 | Encoder produces a `.fsm` the running cluster cannot load | Encoder runs `cmd/elastickv-snapshot-decode` on its own output and asserts a byte-identical round-trip before emitting the final `.fsm` |
 | Format drift between Phase 0 dumps from different elastickv versions | `format_version` major-version gate on `MANIFEST.json`; decoder refuses unknown major versions; minor-version drift handled through optional fields |
 | In-flight S3 multipart uploads referenced by the snapshot but not committed | Excluded by default; `--include-incomplete-uploads` opts in and emits them under a clearly-marked `_incomplete_uploads/` subtree |
-| Restoring an encoded `.fsm` onto a node with mismatched cluster_id | Encoder emits `cluster_id` in `MANIFEST.json`; the restore-runbook step checks it matches the target node before placing the file |
+| Restoring an encoded `.fsm` onto a node with mismatched cluster_id | Decoder emits `cluster_id` in `MANIFEST.json`; encoder carries it into `ENCODE_INFO.json`; `elastickv-snapshot-prepare-restore` checks it before creating the target data dir |
 
 ## Implementation Phases
 
@@ -660,10 +665,11 @@ bespoke parser, the format has failed its goal.
   - `internal/backup/sqs.go` — `_queue.json` + `messages.jsonl`.
 - Filename encoding lives in `internal/backup/filename.go` with
   shared unit tests for round-trip safety.
-- `cmd/elastickv-snap-token` helper for synthesizing the matching
-  `.snap` EKVT token file from a `.fsm`.
-- Documentation: `docs/operations/snapshot_restore.md` runbook
-  (separate PR after this design lands).
+- `cmd/elastickv-snapshot-prepare-restore` helper for validating an
+  encoded `.fsm` + `ENCODE_INFO.json`, appending the runtime CRC32C
+  footer, and seeding a fresh raft data dir with the matching `.snap`
+  EKVT token.
+- Documentation: `docs/operations/snapshot_restore.md` runbook.
 
 ### Phase 0b — Encoder
 
@@ -679,10 +685,11 @@ bespoke parser, the format has failed its goal.
 
 ### Phase 0c — Operator integration
 
-- Stop-replace-restart runbook in `docs/operations/`.
-- Cluster-id and version-compatibility guards.
+- Stop-replace-restart runbook in `docs/operations/snapshot_restore.md`.
+- Cluster-id and version-compatibility guards in
+  `cmd/elastickv-snapshot-prepare-restore`.
 - Tar / tar+zstd helpers for shipping decoded directory trees off
-  the host.
+  the host in `cmd/elastickv-snapshot-archive`.
 
 ## Required Tests
 
@@ -710,7 +717,7 @@ bespoke parser, the format has failed its goal.
 | `TestEncoderProducesLoadableSnapshot` | Encoder output placed under a fresh node's `fsm-snap/` + `snap/` is loaded successfully on `Open`; the resulting cluster serves the original data via every adapter |
 | `TestLongKeySHA256Fallback` | A 1 KiB key encodes to `<sha256-prefix-32>__<truncated>`; `KEYMAP.jsonl` records the original; encoder reverses correctly |
 | `TestExternalToolReplay` | Generated `aws s3 sync` / `aws dynamodb put-item` / `redis-cli --pipe` scripts (run in CI against MinIO / a local DynamoDB / a real Redis) reproduce the decoded state on a non-elastickv target |
-| `TestEncoderClusterIDGuard` | Encoder writes `cluster_id` in `MANIFEST.json`; the restore runbook step refuses to place the file if the target node's `cluster_id` differs |
+| `TestEncoderClusterIDGuard` | Encoder carries `cluster_id` into `ENCODE_INFO.json`; the restore prepare helper refuses to create the data dir if the target node's `cluster_id` differs |
 | `TestPhaseFieldDistinguishesPhase0And1` | A Phase 1 dump and a Phase 0 dump containing the same logical state both pass the decoder's structural validation but `MANIFEST.phase` distinguishes them |
 
 ### P2
