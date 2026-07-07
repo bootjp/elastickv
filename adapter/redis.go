@@ -204,7 +204,7 @@ type RedisServer struct {
 	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md). The
 	// FSM probe ships on every node in production, satisfying R5 (FSM
 	// determinism across a rolling upgrade), so the gate now defaults on
-	// per docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+	// per docs/design/2026_06_10_implemented_redis_onephase_dedup_default_on.md.
 	// Set ELASTICKV_REDIS_ONEPHASE_DEDUP=0 (or WithOnePhaseTxnDedup(false))
 	// to opt out — kept as a one-env-var operator rollback.
 	onePhaseTxnDedup bool
@@ -231,7 +231,7 @@ type RedisServerOption func(*RedisServer)
 // WithOnePhaseTxnDedup enables (or disables) the option-2 one-phase
 // idempotency dedup on list-push and MULTI/EXEC retries
 // (see RedisServer.onePhaseTxnDedup). On by default since the rollout
-// recorded in docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md;
+// recorded in docs/design/2026_06_10_implemented_redis_onephase_dedup_default_on.md;
 // pass false to opt out from code, or set ELASTICKV_REDIS_ONEPHASE_DEDUP=0
 // to opt out from the environment. The constructor option trumps the env var.
 // Standalone SET requires the separate WithStandaloneSetDedup gate; see
@@ -493,7 +493,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
 		// constraint is discharged (FSM probe shipped on every node months ago,
 		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).
-		// See docs/design/2026_06_10_proposed_redis_onephase_dedup_default_on.md.
+		// See docs/design/2026_06_10_implemented_redis_onephase_dedup_default_on.md.
 		// ELASTICKV_REDIS_ONEPHASE_DEDUP=0 opts out; the WithOnePhaseTxnDedup
 		// constructor option still trumps the env var.
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") != "0",
