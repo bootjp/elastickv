@@ -42,6 +42,9 @@ func buildShardGroupsWithEncryptionWiring(
 	if err != nil {
 		return nil, nil, encryptionWriteWiring{}, err
 	}
+	if err := validateRaftEnvelopeStartupScope(encWiring, groups); err != nil {
+		return nil, nil, encryptionWriteWiring{}, err
+	}
 	configureRaftEnvelopeFactory(factory, encWiring)
 	runtimes, shardGroups, err := buildShardGroups(raftID, raftDir, groups, multi, bootstrap, bootstrapServers,
 		factory, proposalObserverForGroup, clock, kekWrapper, keystore, sidecarPath, encWiring, routeEngine)
@@ -63,6 +66,18 @@ func configureRaftEnvelopeFactory(factory raftengine.Factory, w encryptionWriteW
 		return
 	}
 	configurable.SetRaftEnvelope(w.cipher, w.raftEnvelope.engineCutoverIndex)
+}
+
+func validateRaftEnvelopeStartupScope(w encryptionWriteWiring, groups []groupSpec) error {
+	if w.raftEnvelope == nil || w.raftEnvelope.RaftEnvelopeCutoverIndex() == 0 {
+		return nil
+	}
+	if len(groups) == 1 {
+		return nil
+	}
+	return pkgerrors.Errorf(
+		"encryption: active raft envelope sidecar requires exactly one shard group until per-group raft cutover indexes are implemented (got %d)",
+		len(groups))
 }
 
 func encryptionApplierOptionsFor(kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, sidecarPath string, w encryptionWriteWiring) []encryption.ApplierOption {
@@ -114,10 +129,6 @@ type encryptionWriteWiring struct {
 	// because storage and raft envelopes use separate DEKs and
 	// write_count streams.
 	raftEpoch uint16
-	// activeRaftDEKID is the sidecar.Active.Raft value read while
-	// constructing the raft-envelope runtime. It is non-zero once the
-	// cluster has bootstrapped raft DEKs.
-	activeRaftDEKID uint32
 	// raftNonceFactory emits §4.2 raft-envelope nonces. nil means
 	// raft envelope wrapping is not configured for this process.
 	raftNonceFactory store.NonceFactory
@@ -128,6 +139,9 @@ type encryptionWriteWiring struct {
 	// raftEnvelope coordinates wrap publication across shard groups
 	// and supplies the applier installer hook.
 	raftEnvelope *raftEnvelopeRuntime
+	// raftRegistration gates raft-envelope wrapping until this load has
+	// committed a writer-registry row for (active raft DEK, raftEpoch).
+	raftRegistration *raftRegistrationGate
 }
 
 // withDefaultedCache returns a copy of w with a non-nil StateCache.
@@ -222,9 +236,9 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	if err != nil {
 		return w, err
 	}
-	w.activeRaftDEKID = activeRaftDEKID
 	w.raftCutoverIndex = &atomic.Uint64{}
-	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex)
+	w.raftRegistration = &raftRegistrationGate{}
+	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex, w.raftEpoch, w.raftRegistration)
 	if err != nil {
 		return w, err
 	}

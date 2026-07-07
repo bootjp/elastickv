@@ -7,6 +7,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -17,6 +18,8 @@ const inertRaftEnvelopeCutoverIndex = ^uint64(0)
 type raftEnvelopeRuntime struct {
 	cipher       *encryption.Cipher
 	nonceFactory store.NonceFactory
+	raftEpoch    uint16
+	registration *raftRegistrationGate
 
 	mu         sync.Mutex
 	groups     map[uint64]*kv.ShardGroup
@@ -25,13 +28,37 @@ type raftEnvelopeRuntime struct {
 	cutoverIndex *atomic.Uint64
 }
 
-func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceFactory, initialCutover uint64, activeRaftDEKID uint32, cell *atomic.Uint64) (*raftEnvelopeRuntime, error) {
+type raftRegistrationGate struct {
+	registered atomic.Uint64
+}
+
+func (g *raftRegistrationGate) MarkRegistered(dekID uint32, epoch uint16) {
+	if g == nil || dekID == 0 {
+		return
+	}
+	g.registered.Store(packRaftRegistration(dekID, epoch))
+}
+
+func (g *raftRegistrationGate) Registered(dekID uint32, epoch uint16) bool {
+	if g == nil || dekID == 0 {
+		return false
+	}
+	return g.registered.Load() == packRaftRegistration(dekID, epoch)
+}
+
+func packRaftRegistration(dekID uint32, epoch uint16) uint64 {
+	return uint64(dekID)<<16 | uint64(epoch)
+}
+
+func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceFactory, initialCutover uint64, activeRaftDEKID uint32, cell *atomic.Uint64, raftEpoch uint16, registration *raftRegistrationGate) (*raftEnvelopeRuntime, error) {
 	if cell == nil {
 		return nil, errors.New("raft envelope runtime: nil cutover cell")
 	}
 	r := &raftEnvelopeRuntime{
 		cipher:       cipher,
 		nonceFactory: nonceFactory,
+		raftEpoch:    raftEpoch,
+		registration: registration,
 		groups:       map[uint64]*kv.ShardGroup{},
 		cutoverIndex: cell,
 	}
@@ -58,6 +85,13 @@ func (r *raftEnvelopeRuntime) engineCutoverIndex() uint64 {
 	return idx
 }
 
+func (r *raftEnvelopeRuntime) RaftEnvelopeCutoverIndex() uint64 {
+	if r == nil || r.cutoverIndex == nil {
+		return 0
+	}
+	return r.cutoverIndex.Load()
+}
+
 func (r *raftEnvelopeRuntime) attachGroup(groupID uint64, g *kv.ShardGroup) {
 	r.mu.Lock()
 	r.groups[groupID] = g
@@ -79,13 +113,13 @@ func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKI
 	if err != nil {
 		return err
 	}
+	r.cutoverIndex.Store(cutoverIdx)
 	r.mu.Lock()
 	r.activeWrap = wrap
 	for _, g := range r.groups {
 		g.SetRaftPayloadWrap(wrap)
 	}
 	r.mu.Unlock()
-	r.cutoverIndex.Store(cutoverIdx)
 	return nil
 }
 
@@ -108,12 +142,21 @@ func (r *raftEnvelopeRuntime) wrapFor(activeRaftDEKID uint32) (kv.RaftPayloadWra
 		return nil, errors.New("raft envelope runtime: raft nonce factory is not configured")
 	}
 	return func(payload []byte) ([]byte, error) {
+		if r.registration != nil && !r.registration.Registered(activeRaftDEKID, r.raftEpoch) && !isRaftWriterRegistrationPayload(payload) {
+			return nil, errors.Wrapf(store.ErrWriterNotRegistered,
+				"raft envelope runtime: writer registration not committed for raft dek_id %d local_epoch %d",
+				activeRaftDEKID, r.raftEpoch)
+		}
 		nonce, err := r.nonceFactory.Next()
 		if err != nil {
 			return nil, errors.Wrap(err, "raft envelope runtime: next nonce")
 		}
 		return encryption.WrapRaftPayload(r.cipher, activeRaftDEKID, nonce[:], payload)
 	}, nil
+}
+
+func isRaftWriterRegistrationPayload(payload []byte) bool {
+	return len(payload) > 0 && payload[0] == fsmwire.OpRegistration
 }
 
 func (r *raftEnvelopeRuntime) barrier() adapter.CutoverBarrierController {

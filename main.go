@@ -446,10 +446,10 @@ func run() error {
 	// gate are bundled so run() has a single startup-fault path: a
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
-	// run with no registration gate installed (codex P1 on PR #839).
+	// run with no registration gate installed.
 	distCatalog, err := setupDistributionAndRegistration(
 		runCtx, eg, runtimes, cfg.engine,
-		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId)
+		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId, *encryptionSidecarPath)
 	if err != nil {
 		cancel()
 		return err
@@ -493,7 +493,7 @@ func run() error {
 	// nil when encryption is not wired (no StateCache or no default
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
-		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, etcdraftengine.DeriveNodeID)
+		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
 	if err := startServers(serversInput{
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapServers,
@@ -890,10 +890,7 @@ func buildShardGroups(
 		// work. At M2 the FSM stores both but does not consult them;
 		// see docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 		// §M2.
-		sm := kv.NewKvFSMWithHLC(st, clock,
-			kv.WithEncryption(applier),
-			kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), g.id),
-		)
+		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring)...)
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {
@@ -923,6 +920,17 @@ func buildShardGroups(
 		encWiring.attachRaftEnvelopeGroup(g.id, sg)
 	}
 	return runtimes, shardGroups, nil
+}
+
+func fsmOptionsForGroup(applier *encryption.Applier, routeEngine *distribution.Engine, groupID uint64, encWiring encryptionWriteWiring) []kv.FSMOption {
+	opts := []kv.FSMOption{
+		kv.WithEncryption(applier),
+		kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), groupID),
+	}
+	if encWiring.raftEnvelope != nil {
+		opts = append(opts, kv.WithCutoverSource(encWiring.raftEnvelope))
+	}
+	return opts
 }
 
 func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) kv.ProposalObserver {

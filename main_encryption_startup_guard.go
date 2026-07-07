@@ -242,7 +242,7 @@ func checkEnvelopeCutoverDivergenceBeforeNonceBump(
 		return nil
 	}
 	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
-	if err != nil || sc == nil || sc.RaftEnvelopeCutoverIndex == 0 {
+	if err != nil || sc == nil {
 		return err
 	}
 	dir := groupDataDir(raftDir, raftID, defaultGroup, multi)

@@ -1740,6 +1740,50 @@ func TestEncryptionAdmin_EnableStorageEnvelope_HonorsCtxDeadlineWaitingOnMutator
 	}
 }
 
+func TestEncryptionAdmin_AdminMutatorsHonorCtxDeadlineWaitingOnCutover(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		call func(*EncryptionAdminServer, context.Context) error
+	}{
+		{
+			name: "RotateDEK",
+			call: func(s *EncryptionAdminServer, ctx context.Context) error {
+				_, err := s.RotateDEK(ctx, validRotateDEKRequest())
+				return err
+			},
+		},
+		{
+			name: "RegisterEncryptionWriter",
+			call: func(s *EncryptionAdminServer, ctx context.Context) error {
+				_, err := s.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest())
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			proposer := &recordingProposer{commitIndex: 42}
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(proposer),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+			)
+			srv.cutoverSem <- struct{}{}
+			t.Cleanup(func() { <-srv.cutoverSem })
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+			defer cancel()
+			err := tc.call(srv, ctx)
+			if status.Code(err) != codes.DeadlineExceeded {
+				t.Fatalf("%s status=%v, want DeadlineExceeded", tc.name, status.Code(err))
+			}
+			if len(proposer.calls) != 0 {
+				t.Fatalf("%s proposed %d entries while cutover semaphore was held, want 0", tc.name, len(proposer.calls))
+			}
+		})
+	}
+}
+
 // TestEncryptionAdmin_EnableStorageEnvelope_PreservesContextCancellationOnFanoutNotOK
 // pins codex P2 round-2 on PR812: the production fan-out helper
 // can synthesize Reachable=false verdicts and return (result, nil)

@@ -67,17 +67,13 @@ type EncryptionAdminServer struct {
 	// acquisition can honor ctx cancellation: an admin RPC with
 	// a short deadline whose mutator lock is held by an in-flight
 	// fan-out + propose call surfaces Canceled / DeadlineExceeded
-	// at the gRPC boundary rather than blocking indefinitely
-	// (codex P2 round-3 on PR812).
+	// at the gRPC boundary rather than blocking indefinitely.
 	//
-	// The design also calls for a shared lock with RotateDEK so
-	// a RotateDEK cannot interleave between a cutover's propose
-	// and apply; that piece is left to a follow-up because
-	// RotateDEK has no existing serialization and extending it
-	// would change a hot-path mutator's semantics — see the
-	// §2.1 #3 stale-DEKID benign no-op for the FALLBACK that
-	// handles the un-serialized RotateDEK/cutover interleave
-	// today.
+	// The same semaphore also serializes RotateDEK and
+	// RegisterEncryptionWriter around their proposal step. Before the
+	// raft-envelope wrap is installed, barrier-exempt admin proposals
+	// must not slip in at indexes greater than the raft cutover marker
+	// while the wrap-aware proposer still has nil wrap.
 	cutoverSem chan struct{}
 	// cutoverBarrier drives the §7.1 6-step quiescence barrier that
 	// EnableRaftEnvelope wraps around its cutover proposal. nil means
@@ -800,7 +796,7 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 		},
 	}
 	body := fsmwire.EncodeRotation(payload)
-	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpRotation, body)
+	idx, err := s.proposeSerializedEncryptionEntry(ctx, fsmwire.OpRotation, body)
 	if err != nil {
 		return nil, err
 	}
@@ -904,8 +900,7 @@ func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *
 // semaphore frees, the wait returns immediately with a gRPC
 // status matching the ctx error — Canceled or DeadlineExceeded.
 // A plain sync.Mutex would block past the caller's deadline,
-// breaking RPC cancellation semantics (codex P2 round-3 on
-// PR812).
+// breaking RPC cancellation semantics.
 //
 // The explicit ctx.Err() check before the select is load-bearing:
 // Go's select picks uniformly at random among ready cases (it
@@ -914,8 +909,11 @@ func (s *EncryptionAdminServer) EnableStorageEnvelope(ctx context.Context, req *
 // the slot (and running precheck / fan-out / propose against an
 // aborted caller) and the cancellation return. Checking
 // ctx.Err() first turns the cancellation into a deterministic
-// short-circuit (codex P1 round-4 on PR812).
+// short-circuit.
 func (s *EncryptionAdminServer) acquireCutoverSemaphore(ctx context.Context) error {
+	if s.cutoverSem == nil {
+		return grpcStatusError(codes.FailedPrecondition, "encryption: cutover semaphore is not configured on this node")
+	}
 	if err := ctx.Err(); err != nil {
 		return cutoverSemaphoreErrorToStatus(err)
 	}
@@ -1739,11 +1737,19 @@ func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, re
 		LocalEpoch: uint32ToLocalEpoch(w.GetLocalEpoch()),
 	}
 	body := fsmwire.EncodeRegistration(payload)
-	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpRegistration, body)
+	idx, err := s.proposeSerializedEncryptionEntry(ctx, fsmwire.OpRegistration, body)
 	if err != nil {
 		return nil, err
 	}
 	return &pb.RegisterEncryptionWriterResponse{AppliedIndex: idx}, nil
+}
+
+func (s *EncryptionAdminServer) proposeSerializedEncryptionEntry(ctx context.Context, opcode byte, body []byte) (uint64, error) {
+	if err := s.acquireCutoverSemaphore(ctx); err != nil {
+		return 0, err
+	}
+	defer s.releaseCutoverSemaphore()
+	return s.proposeEncryptionEntry(ctx, opcode, body)
 }
 
 // proposeEncryptionEntry prepends the §11.3 opcode tag to a

@@ -73,6 +73,14 @@ func snapshotPayloadWithCutover(t *testing.T, cutover uint64) []byte {
 	return buf.Bytes()
 }
 
+func TestCheckEnvelopeCutoverDivergenceSnapshotPayload_SidecarZeroRefusesSnapshotCutover(t *testing.T) {
+	payload := snapshotPayloadWithCutover(t, 99)
+	err := checkEnvelopeCutoverDivergenceSnapshotPayload(bytes.NewReader(payload), 0, 1)
+	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
+		t.Fatalf("checkEnvelopeCutoverDivergenceSnapshotPayload error = %v, want ErrEnvelopeCutoverDivergence", err)
+	}
+}
+
 // writeMinimalSidecar writes a valid §5.1 sidecar with the
 // supplied RaftAppliedIndex into a freshly created temp dir, and
 // returns the sidecar path.
