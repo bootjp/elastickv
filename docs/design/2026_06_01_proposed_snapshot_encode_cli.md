@@ -1,7 +1,7 @@
 # `cmd/elastickv-snapshot-encode` CLI (Phase 0b M6) — proposed
 
 **Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_partial_snapshot_logical_encoder.md`](2026_05_25_partial_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1–M5 are merged (#807/#841/#847/#849/#864/#846/#892); the parent doc was promoted `proposed` → `partial` in v6 (#896); the CLI is the capstone that exposes them.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves the §"Encoder: `cmd/elastickv-snapshot-encode`" + §"Round-trip self-test" milestone (M6) the parent doc left at sketch level. Adapter slices M1–M5 are merged (#807/#841/#847/#849/#864/#846/#892); the parent doc was promoted `proposed` → `partial` in v6 (#896); the CLI is the capstone that exposes them.
 
 ## What needs to land
 

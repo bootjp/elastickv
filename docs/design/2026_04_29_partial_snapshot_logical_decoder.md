@@ -6,9 +6,10 @@ Date: 2026-04-29
 
 > **Lifecycle (2026-05-25):** Phase 0a (decoder) has fully shipped —
 > `internal/backup/` + `cmd/elastickv-snapshot-decode` (PRs #790,
-> #791, #792, #806, #810). Phase 0b (encoder) is specified in detail
-> in `2026_05_25_proposed_snapshot_logical_encoder.md` and is not yet
-> implemented. Phase 0c (operator integration) is open. This doc
+> #791, #792, #806, #810). Phase 0b (encoder) has shipped and is
+> specified in detail in
+> `2026_05_25_implemented_snapshot_logical_encoder.md`. Phase 0c
+> (operator integration) is open. This doc
 > remains the format owner; the encoder doc owns the reverse-direction
 > wire-format reconstruction.
 
@@ -30,7 +31,7 @@ terminates on a clean EOF at the start of a key-length field
 `ReadSnapshot`). A CRC32C footer exists only on the *MVCC streaming
 restore* path (`store/lsm_store.go` `readStreamingMVCCRestoreHeader`),
 which is a different framing the decoder/encoder do not touch. See
-`2026_05_25_proposed_snapshot_logical_encoder.md` §"Why a separate
+`2026_05_25_implemented_snapshot_logical_encoder.md` §"Why a separate
 design doc" item 3.
 
 Snapshots are taken automatically every `defaultSnapshotEvery = 10000`
