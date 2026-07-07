@@ -101,7 +101,7 @@ func (e *encryptionPreRegister) activeRaftDEKForPreRegister() (uint32, bool, err
 		}
 		return 0, false, errors.Wrap(err, "7c pre-register: read sidecar for raft DEK")
 	}
-	if sc.RaftEnvelopeCutoverIndex == 0 || sc.Active.Raft == 0 {
+	if sc.Active.Raft == 0 {
 		return 0, false, nil
 	}
 	return sc.Active.Raft, true, nil
@@ -186,5 +186,5 @@ func (e *encryptionPreRegister) preRegisterDEK(ctx context.Context, activeDEK ui
 	// collision TOCTOU — different FullNodeID at the same NodeID16
 	// — is the genuine case-4 halt-apply residual; see §3.3 of the
 	// design doc.)
-	return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Proposer(), connCache, entry, req)
+	return proposeWriterRegistrationBlockingOnCutover(ctx, e.coordinate, e.defaultGroup.Proposer(), connCache, entry, req)
 }

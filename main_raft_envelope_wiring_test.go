@@ -151,6 +151,38 @@ func TestRaftEnvelopeRuntime_WrapRequiresRaftWriterRegistration(t *testing.T) {
 	}
 }
 
+func TestRaftEnvelopeRuntime_InstallFromApplySeedsCommittedRegistration(t *testing.T) {
+	t.Parallel()
+	const keyID uint32 = 4
+	const raftEpoch uint16 = 9
+	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
+	var cutover atomic.Uint64
+	gate := &raftRegistrationGate{}
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 0, 0, &cutover, raftEpoch, gate)
+	if err != nil {
+		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
+	}
+	runtime.setRegistrationVerifier(func(dekID uint32, epoch uint16) bool {
+		return dekID == keyID && epoch == raftEpoch
+	})
+	sg := &kv.ShardGroup{}
+	runtime.attachGroup(7, sg)
+	if err := runtime.installFromApply(5678, keyID); err != nil {
+		t.Fatalf("installFromApply: %v", err)
+	}
+	wrap := sg.RaftPayloadWrap()
+	if wrap == nil {
+		t.Fatal("installFromApply did not publish wrap")
+	}
+	wrapped, err := wrap([]byte("raft payload"))
+	if err != nil {
+		t.Fatalf("wrap after verifier-seeded registration: %v", err)
+	}
+	if _, err := encryption.UnwrapRaftPayload(cipher, wrapped); err != nil {
+		t.Fatalf("UnwrapRaftPayload: %v", err)
+	}
+}
+
 func TestValidateRaftEnvelopeStartupScopeRefusesActiveMultiGroup(t *testing.T) {
 	t.Parallel()
 	err := validateRaftEnvelopeStartupScope(99, []groupSpec{{id: 1}, {id: 2}})

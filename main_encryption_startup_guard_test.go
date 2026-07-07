@@ -99,7 +99,7 @@ func writeMinimalSidecar(t *testing.T, raftAppliedIdx uint64) string {
 	return path
 }
 
-func writeRaftCutoverSidecarForStartup(t *testing.T, activeStorage, activeRaft uint32, localEpoch uint16, cutover uint64) string {
+func writeRaftCutoverSidecarForStartup(t *testing.T, activeRaft uint32, localEpoch uint16, cutover uint64) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, encryption.SidecarFilename)
@@ -108,9 +108,9 @@ func writeRaftCutoverSidecarForStartup(t *testing.T, activeStorage, activeRaft u
 		RaftAppliedIndex:         cutover,
 		StorageEnvelopeActive:    true,
 		RaftEnvelopeCutoverIndex: cutover,
-		Active:                   encryption.ActiveKeys{Storage: activeStorage, Raft: activeRaft},
+		Active:                   encryption.ActiveKeys{Storage: testRegDEKID, Raft: activeRaft},
 		Keys: map[string]encryption.SidecarKey{
-			strconv.FormatUint(uint64(activeStorage), 10): {
+			strconv.FormatUint(uint64(testRegDEKID), 10): {
 				Purpose:    encryption.SidecarPurposeStorage,
 				Wrapped:    []byte("wrapped-storage"),
 				Created:    "2026-07-07T00:00:00Z",
@@ -318,7 +318,7 @@ func TestChainEncryptionStartupGuard_NilPrevRunsGuard(t *testing.T) {
 
 func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 	t.Parallel()
-	sidecarPath := writeRaftCutoverSidecarForStartup(t, testRegDEKID, 8, 3, 100)
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
 		spec:         groupSpec{id: 1},
 		stateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
@@ -331,7 +331,7 @@ func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
 
 func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
 	t.Parallel()
-	sidecarPath := writeRaftCutoverSidecarForStartup(t, testRegDEKID, 8, 3, 100)
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, 8, 3, 100)
 	rt := &raftGroupRuntime{
 		spec:         groupSpec{id: 1},
 		stateMachine: &stubRestoredCutoverStateMachine{cutover: 100},

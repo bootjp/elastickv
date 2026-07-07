@@ -20,6 +20,7 @@ type raftEnvelopeRuntime struct {
 	nonceFactory store.NonceFactory
 	raftEpoch    uint16
 	registration *raftRegistrationGate
+	registered   func(dekID uint32, epoch uint16) bool
 
 	mu         sync.Mutex
 	groups     map[uint64]*kv.ShardGroup
@@ -77,6 +78,12 @@ func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceF
 	return r, nil
 }
 
+func (r *raftEnvelopeRuntime) setRegistrationVerifier(registered func(dekID uint32, epoch uint16) bool) {
+	r.mu.Lock()
+	r.registered = registered
+	r.mu.Unlock()
+}
+
 func (r *raftEnvelopeRuntime) engineCutoverIndex() uint64 {
 	idx := r.cutoverIndex.Load()
 	if idx == 0 {
@@ -112,6 +119,12 @@ func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKI
 	wrap, err := r.wrapFor(activeRaftDEKID)
 	if err != nil {
 		return err
+	}
+	r.mu.Lock()
+	registered := r.registered
+	r.mu.Unlock()
+	if r.registration != nil && registered != nil && registered(activeRaftDEKID, r.raftEpoch) {
+		r.registration.MarkRegistered(activeRaftDEKID, r.raftEpoch)
 	}
 	r.mu.Lock()
 	r.activeWrap = wrap

@@ -137,6 +137,7 @@ func setupDistributionAndRegistration(
 	if err := installProcessStartRegistrationGate(runCtx, eg, coordinate, defaultGroup, w, raftID); err != nil {
 		return nil, err
 	}
+	installRaftRegistrationVerifier(defaultGroup, w, raftID)
 	installRuntimeRaftRegistrationWatcher(runCtx, eg, coordinate, defaultGroup, w, raftID, sidecarPath)
 	// Stage 7b/7b': arm the runtime watcher. Handles all three runtime
 	// registration triggers — cutover (Phase-0 → EnableStorageEnvelope),
@@ -154,6 +155,28 @@ func setupDistributionAndRegistration(
 		return nil, err
 	}
 	return distCatalog, nil
+}
+
+func installRaftRegistrationVerifier(defaultGroup *kv.ShardGroup, w encryptionWriteWiring, raftID string) {
+	if defaultGroup == nil || defaultGroup.Store == nil || w.raftEnvelope == nil || w.raftRegistration == nil {
+		return
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
+	w.raftEnvelope.setRegistrationVerifier(func(activeRaftDEKID uint32, raftEpoch uint16) bool {
+		reg, err := store.WriterRegistryFor(defaultGroup.Store)
+		if err != nil {
+			slog.Warn("encryption: raft writer registration verifier failed to obtain writer registry handle",
+				slog.String("error", err.Error()))
+			return false
+		}
+		registered, err := registrationCommittedAtEpoch(reg, activeRaftDEKID, fullNodeID, raftEpoch)
+		if err != nil {
+			slog.Warn("encryption: raft writer registration verifier failed to verify registry row",
+				slog.String("error", err.Error()))
+			return false
+		}
+		return registered
+	})
 }
 
 func installRuntimeRaftRegistrationWatcher(
@@ -626,7 +649,7 @@ func runWriterRegistration(
 // the forwarded RPC would inherit the deadline-less run-context and —
 // because GRPCConnCache dials WaitForReady(true) — could block forever
 // on a stale/unreachable leader address, leaving the barrier open and
-// encrypted writes stuck even after leadership moves (codex P1 #5).
+// encrypted writes stuck even after leadership moves.
 func proposeWriterRegistration(
 	ctx context.Context,
 	coordinate *kv.ShardedCoordinator,
@@ -657,6 +680,34 @@ func proposeWriterRegistration(
 		}
 		return nil
 	}
+	return forwardWriterRegistrationToLeader(attemptCtx, coordinate, connCache, req)
+}
+
+func proposeWriterRegistrationBlockingOnCutover(
+	ctx context.Context,
+	coordinate *kv.ShardedCoordinator,
+	defaultProposer raftengine.Proposer,
+	connCache *kv.GRPCConnCache,
+	entry []byte,
+	req *pb.RegisterEncryptionWriterRequest,
+) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, registrationAttemptTimeout)
+	defer cancel()
+	if coordinate.IsLeader() {
+		if _, err := defaultProposer.Propose(attemptCtx, entry); err != nil {
+			return errors.Wrap(err, "writer registration: local propose")
+		}
+		return nil
+	}
+	return forwardWriterRegistrationToLeader(attemptCtx, coordinate, connCache, req)
+}
+
+func forwardWriterRegistrationToLeader(
+	attemptCtx context.Context,
+	coordinate *kv.ShardedCoordinator,
+	connCache *kv.GRPCConnCache,
+	req *pb.RegisterEncryptionWriterRequest,
+) error {
 	addr := coordinate.RaftLeader()
 	if addr == "" {
 		return errors.New("writer registration: no default-group leader known yet")
