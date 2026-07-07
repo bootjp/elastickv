@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-A++
 parent_design: docs/admin_ui_key_visualizer_design.md
 related_design: docs/design/2026_05_25_implemented_keyviz_subrange_sampling.md
