@@ -2204,10 +2204,9 @@ func (b *recordingCutoverBarrier) End() {
 
 // withWrapEnabledForTest flips raftEnvelopeWrapEnabled to true for
 // the duration of t and restores the original value via t.Cleanup.
-// The production default is true after 6E-2f, so this helper is now
-// mostly a local guard against future tests that temporarily flip the
-// gate. Returns no value; t.Cleanup handles teardown so callers don't
-// need to defer.
+// The production default stays closed until capability fan-out can
+// prove every member is raft-envelope aware. Returns no value;
+// t.Cleanup handles teardown so callers don't need to defer.
 //
 // Safe to call from t.Parallel() tests: raftEnvelopeWrapEnabled is
 // an atomic.Bool, so concurrent reads from sibling parallel tests
@@ -2382,6 +2381,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnProposeError(t *te
 	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
 		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
 	}
+	assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t, srv, func() int {
+		return len(proposer.calls)
+	})
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_EndCalledOnDrainTimeout
@@ -2485,6 +2487,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnApplyTimeout(t *te
 	if len(proposer.calls) != 1 {
 		t.Errorf("proposer.calls len=%d, want 1 (cutover entry MUST have been proposed before the apply-wait timeout)", len(proposer.calls))
 	}
+	assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t, srv, func() int {
+		return len(proposer.calls)
+	})
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_RefusesOnStaleDEKApplyRace
@@ -2637,6 +2642,52 @@ func TestEncryptionAdmin_EnableRaftEnvelope_BarrierStaysOpenOnSidecarReadError(t
 	wantPrefix := []string{"Begin", "WaitDrained"}
 	if len(barrier.order) < len(wantPrefix) || !slices.Equal(barrier.order[:len(wantPrefix)], wantPrefix) {
 		t.Errorf("barrier.order prefix = %v, want prefix %v", barrier.order, wantPrefix)
+	}
+	assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t, srv, func() int {
+		return len(proposer.calls)
+	})
+}
+
+func assertNonCutoverAdminProposalsBlockedAfterUnsafeRaftCutover(t *testing.T, srv *EncryptionAdminServer, proposalCalls func() int) {
+	t.Helper()
+	cases := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{
+			name: "BootstrapEncryption",
+			call: func(ctx context.Context) error {
+				_, err := srv.BootstrapEncryption(ctx, validBootstrapEncryptionRequest())
+				return err
+			},
+		},
+		{
+			name: "RotateDEK",
+			call: func(ctx context.Context) error {
+				_, err := srv.RotateDEK(ctx, validRotateDEKRequest())
+				return err
+			},
+		},
+		{
+			name: "RegisterEncryptionWriter",
+			call: func(ctx context.Context) error {
+				_, err := srv.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest())
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		before := proposalCalls()
+		err := tc.call(context.Background())
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("%s status=%v, want FailedPrecondition after unsafe raft cutover", tc.name, status.Code(err))
+		}
+		if err == nil || !strings.Contains(err.Error(), "cutover outcome is unsafe") {
+			t.Fatalf("%s error %q does not explain the unsafe cutover latch", tc.name, err)
+		}
+		if after := proposalCalls(); after != before {
+			t.Fatalf("%s proposed after unsafe raft cutover: calls before=%d after=%d", tc.name, before, after)
+		}
 	}
 }
 

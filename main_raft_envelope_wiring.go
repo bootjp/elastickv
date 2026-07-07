@@ -22,9 +22,10 @@ type raftEnvelopeRuntime struct {
 	registration *raftRegistrationGate
 	registered   func(dekID uint32, epoch uint16) bool
 
-	mu         sync.Mutex
-	groups     map[uint64]*kv.ShardGroup
-	activeWrap kv.RaftPayloadWrapper
+	mu              sync.Mutex
+	groups          map[uint64]*kv.ShardGroup
+	activeWrap      kv.RaftPayloadWrapper
+	activeRaftDEKID uint32
 
 	cutoverIndex *atomic.Uint64
 }
@@ -74,6 +75,7 @@ func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceF
 		return nil, err
 	}
 	r.activeWrap = wrap
+	r.activeRaftDEKID = activeRaftDEKID
 	r.cutoverIndex.Store(initialCutover)
 	return r, nil
 }
@@ -128,12 +130,24 @@ func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKI
 	}
 	r.mu.Lock()
 	r.activeWrap = wrap
+	r.activeRaftDEKID = activeRaftDEKID
 	for _, g := range r.groups {
 		g.SetRaftPayloadWrap(wrap)
 	}
 	r.mu.Unlock()
 	r.cutoverIndex.Store(cutoverIdx)
 	return nil
+}
+
+func (r *raftEnvelopeRuntime) wrapInstalledFor(activeRaftDEKID uint32) bool {
+	if r == nil || activeRaftDEKID == 0 || r.cutoverIndex == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.activeWrap != nil &&
+		r.activeRaftDEKID == activeRaftDEKID &&
+		r.cutoverIndex.Load() != 0
 }
 
 func (r *raftEnvelopeRuntime) reinstallActiveWrap() {

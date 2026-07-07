@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -247,6 +248,35 @@ func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	// Cache must reflect the on-disk active DEK + cutover gate.
 	if id, ok := w.cache.ActiveStorageKeyID(); !ok || id != 3 {
 		t.Errorf("cache ActiveStorageKeyID = (%d, %v), want (3, true)", id, ok)
+	}
+}
+
+func TestBuildEncryptionWriteWiring_ActiveCutoverWithoutRaftDEKRefusesBeforeStorageBump(t *testing.T) {
+	t.Parallel()
+	path := writeActiveStorageSidecar(t, 2)
+	sc, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	sc.RaftEnvelopeCutoverIndex = 55
+	sc.Active.Raft = 0
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+
+	_, err = buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}})
+	if err == nil {
+		t.Fatal("buildEncryptionWriteWiring succeeded with active raft cutover but no active raft DEK")
+	}
+	if !strings.Contains(err.Error(), "active raft DEK") {
+		t.Fatalf("error %q does not explain the active raft DEK invariant", err)
+	}
+	after, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar after failure: %v", err)
+	}
+	if got := after.Keys["3"].LocalEpoch; got != 2 {
+		t.Fatalf("storage local_epoch = %d, want unchanged 2 after pre-bump refusal", got)
 	}
 }
 

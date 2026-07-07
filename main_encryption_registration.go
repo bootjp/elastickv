@@ -231,6 +231,9 @@ func runtimeRaftRegistrationTick(
 	if !ok {
 		return
 	}
+	if !w.raftEnvelope.wrapInstalledFor(activeRaftDEKID) {
+		return
+	}
 	reg, ok := writerRegistryForRaftRegistration(defaultGroup)
 	if !ok {
 		return

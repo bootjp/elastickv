@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -686,6 +687,75 @@ func preSeedRegistryRow(t *testing.T, st store.MVCCStore, dekID uint32, fullNode
 	})
 	if err := reg.SetRegistryRow(encryption.RegistryKey(dekID, encryption.NodeID16(fullNodeID)), val); err != nil {
 		t.Fatalf("SetRegistryRow(dek=%d, epoch=%d): %v", dekID, epoch, err)
+	}
+}
+
+func TestRuntimeRaftRegistrationTick_WaitsForInstalledWrap(t *testing.T) {
+	t.Parallel()
+	path := t.TempDir() + "/keys.json"
+	const raftDEKID uint32 = 4
+	const raftEpoch uint16 = 7
+	if err := encryption.WriteSidecar(path, &encryption.Sidecar{
+		Version:                  encryption.SidecarVersion,
+		RaftEnvelopeCutoverIndex: 99,
+		Active:                   encryption.ActiveKeys{Raft: raftDEKID},
+		Keys: map[string]encryption.SidecarKey{
+			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft-wrapped-key")},
+		},
+	}); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+
+	var cutover atomic.Uint64
+	gate := &raftRegistrationGate{}
+	w := encryptionWriteWiring{
+		raftEpoch:        raftEpoch,
+		raftRegistration: gate,
+		raftEnvelope: &raftEnvelopeRuntime{
+			groups:       map[uint64]*kv.ShardGroup{},
+			cutoverIndex: &cutover,
+		},
+	}
+	runtimeRaftRegistrationTick(context.Background(), nil, nil, w, etcdraftengine.DeriveNodeID("n1"), path)
+	if gate.Registered(raftDEKID, raftEpoch) {
+		t.Fatal("raft registration was marked before the in-process wrap was installed")
+	}
+}
+
+func TestRuntimeRaftRegistrationTick_MarksCommittedRegistrationAfterWrapInstall(t *testing.T) {
+	t.Parallel()
+	path := t.TempDir() + "/keys.json"
+	const raftDEKID uint32 = 4
+	const raftEpoch uint16 = 7
+	if err := encryption.WriteSidecar(path, &encryption.Sidecar{
+		Version:                  encryption.SidecarVersion,
+		RaftEnvelopeCutoverIndex: 99,
+		Active:                   encryption.ActiveKeys{Raft: raftDEKID},
+		Keys: map[string]encryption.SidecarKey{
+			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft-wrapped-key")},
+		},
+	}); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	st := newRegistrationTestStore(t)
+	preSeedRegistryRow(t, st, raftDEKID, fullNodeID, raftEpoch)
+
+	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
+	var cutover atomic.Uint64
+	gate := &raftRegistrationGate{}
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, gate)
+	if err != nil {
+		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
+	}
+	w := encryptionWriteWiring{
+		raftEpoch:        raftEpoch,
+		raftRegistration: gate,
+		raftEnvelope:     runtime,
+	}
+	runtimeRaftRegistrationTick(context.Background(), &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, w, fullNodeID, path)
+	if !gate.Registered(raftDEKID, raftEpoch) {
+		t.Fatal("committed raft registration was not marked after the wrap was installed")
 	}
 }
 

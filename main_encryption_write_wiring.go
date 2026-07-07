@@ -221,7 +221,7 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	if err != nil {
 		return w, err
 	}
-	if err := validateRaftEnvelopeStartupScope(cutoverIdx, groups); err != nil {
+	if err := validateRaftEnvelopeStartupState(cutoverIdx, activeRaftDEKID, groups); err != nil {
 		return w, err
 	}
 	epoch, err := prepareStorageNonceEpoch(sidecarPath, kekWrapper, keystore, w.cache)
@@ -259,6 +259,16 @@ func readRaftEnvelopeStartupState(sidecarPath string) (cutoverIdx uint64, active
 	return sc.RaftEnvelopeCutoverIndex, sc.Active.Raft, nil
 }
 
+func validateRaftEnvelopeStartupState(cutoverIdx uint64, activeRaftDEKID uint32, groups []groupSpec) error {
+	if cutoverIdx == 0 {
+		return nil
+	}
+	if activeRaftDEKID == 0 {
+		return pkgerrors.New("encryption: active raft envelope sidecar requires active raft DEK")
+	}
+	return validateRaftEnvelopeStartupScope(cutoverIdx, groups)
+}
+
 func prepareRaftNonceEpoch(sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, cutoverIdx uint64) (uint16, error) {
 	if cutoverIdx == 0 {
 		return 0, nil
@@ -271,7 +281,7 @@ func prepareRaftNonceEpoch(sidecarPath string, kekWrapper encryption.KEKUnwrappe
 		return 0, pkgerrors.Wrap(err, "prepare raft nonce epoch: read sidecar")
 	}
 	if sc.Active.Raft == 0 {
-		return 0, nil
+		return 0, pkgerrors.New("prepare raft nonce epoch: active cutover requires active raft DEK")
 	}
 	if err := encryption.HydrateKeystoreFromSidecar(keystore, kekWrapper, sc); err != nil {
 		return 0, pkgerrors.Wrap(err, "prepare raft nonce epoch: hydrate keystore")
