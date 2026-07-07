@@ -54,6 +54,63 @@ func TestUnpackDumpTreeRestoresReadOnlyDirectoryModesAfterChildren(t *testing.T)
 	require.Equal(t, os.FileMode(0o555), info.Mode().Perm())
 }
 
+func TestUnpackDumpTreeCleansReadOnlyTreeOnVerifyFailure(t *testing.T) {
+	var manifest bytes.Buffer
+	m := NewPhase0SnapshotManifest(time.Unix(0, 0))
+	m.ElastickvVersion = "test"
+	m.ClusterID = "cluster-a"
+	m.LastCommitTS = 1
+	m.Source = &Source{FSMPath: "source.fsm"}
+	require.NoError(t, WriteManifest(&manifest, m))
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "readonly",
+		Typeflag: tar.TypeDir,
+		Mode:     0o555,
+	}))
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "readonly/file.bin",
+		Mode: 0o600,
+		Size: 1,
+	}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "MANIFEST.json",
+		Mode: 0o600,
+		Size: int64(manifest.Len()),
+	}))
+	_, err = tw.Write(manifest.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	out := filepath.Join(t.TempDir(), "out")
+	err = UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone)
+	require.Error(t, err)
+	_, statErr := os.Stat(out)
+	require.True(t, os.IsNotExist(statErr))
+}
+
+func TestUnpackDumpTreeRejectsSymlinkOutputRoot(t *testing.T) {
+	root := writeArchiveFixture(t)
+	var buf bytes.Buffer
+	require.NoError(t, PackDumpTree(root, &buf, ArchiveCompressionNone))
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	require.NoError(t, os.Mkdir(target, 0o755))
+	out := filepath.Join(dir, "out")
+	if err := os.Symlink(target, out); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	err := UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchiveDestinationExists)
+	require.NoFileExists(t, filepath.Join(target, "MANIFEST.json"))
+}
+
 func TestUnpackDumpTreeRejectsTraversal(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)

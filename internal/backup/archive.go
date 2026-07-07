@@ -75,33 +75,64 @@ func UnpackDumpTree(in io.Reader, outputRoot string, compression string) error {
 	if outputRoot == "" {
 		return errors.New("backup archive: output root is required")
 	}
-	if _, err := os.Stat(outputRoot); err == nil {
-		return errors.Wrapf(ErrArchiveDestinationExists, "%s", outputRoot)
-	} else if !os.IsNotExist(err) {
-		return errors.WithStack(err)
-	}
+	outputRoot = filepath.Clean(outputRoot)
 	r, closeFn, err := archiveReader(in, compression)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(outputRoot, archiveDefaultDirPerm); err != nil {
+	if err := createArchiveOutputRoot(outputRoot); err != nil {
 		_ = closeFn()
-		return errors.WithStack(err)
+		return err
 	}
 	if err := readTarTree(tar.NewReader(r), outputRoot, newArchiveUnpackBudget()); err != nil {
 		_ = closeFn()
-		_ = os.RemoveAll(outputRoot)
+		removeArchiveOutputRoot(outputRoot)
 		return err
 	}
 	if err := closeFn(); err != nil {
-		_ = os.RemoveAll(outputRoot)
+		removeArchiveOutputRoot(outputRoot)
 		return err
 	}
 	if err := verifyDumpRoot(outputRoot); err != nil {
-		_ = os.RemoveAll(outputRoot)
+		removeArchiveOutputRoot(outputRoot)
 		return err
 	}
 	return nil
+}
+
+func createArchiveOutputRoot(outputRoot string) error {
+	parent := filepath.Dir(outputRoot)
+	if parent != "." && parent != outputRoot {
+		if err := os.MkdirAll(parent, archiveDefaultDirPerm); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	if err := os.Mkdir(outputRoot, archiveDefaultDirPerm); err != nil {
+		if os.IsExist(err) {
+			return errors.Wrapf(ErrArchiveDestinationExists, "%s", outputRoot)
+		}
+		return errors.WithStack(err)
+	}
+	info, err := os.Lstat(outputRoot)
+	if err != nil {
+		removeArchiveOutputRoot(outputRoot)
+		return errors.WithStack(err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		removeArchiveOutputRoot(outputRoot)
+		return errors.Wrapf(ErrArchiveDestinationExists, "%s", outputRoot)
+	}
+	return nil
+}
+
+func removeArchiveOutputRoot(outputRoot string) {
+	_ = filepath.WalkDir(outputRoot, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(path, archiveDefaultDirPerm|archiveWritableDirPerm)
+		}
+		return nil
+	})
+	_ = os.RemoveAll(outputRoot)
 }
 
 func resolveArchiveDumpRoot(root string) (string, error) {

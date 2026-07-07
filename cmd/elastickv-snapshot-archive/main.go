@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/bootjp/elastickv/internal/backup"
 	"github.com/cockroachdb/errors"
@@ -228,7 +227,7 @@ func openArchiveInput(path string) (io.Reader, func() error, error) {
 func openRegularArchiveInput(path string) (*os.File, error) {
 	f, err := openNoFollowNonblocking(path)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
+		if isNoFollowSymlink(err) {
 			return nil, errors.Wrapf(backup.ErrArchiveNonRegular, "%s is a symlink archive input", path)
 		}
 		return nil, err
@@ -243,12 +242,4 @@ func openRegularArchiveInput(path string) (*os.File, error) {
 		return nil, errors.Wrapf(backup.ErrArchiveNonRegular, "%s is not a regular archive input", path)
 	}
 	return f, nil
-}
-
-func openNoFollowNonblocking(path string) (*os.File, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) //nolint:gosec // operator-supplied input path
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return os.NewFile(uintptr(fd), path), nil
 }

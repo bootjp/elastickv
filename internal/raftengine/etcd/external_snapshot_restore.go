@@ -184,11 +184,11 @@ func writeExternalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, ce
 }
 
 func openRegularExternalFSMInput(inputPath string) (*os.File, error) {
-	if err := requireRegularPath(inputPath); err != nil {
-		return nil, err
-	}
-	in, err := os.Open(inputPath) //nolint:gosec // operator-supplied restore artifact path
+	in, err := openExternalSnapshotInput(inputPath)
 	if err != nil {
+		if isExternalSnapshotInputSymlink(err) {
+			return nil, errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "%s is a symlink", inputPath)
+		}
 		return nil, errors.WithStack(err)
 	}
 	if err := requireRegularFile(in, inputPath); err != nil {
@@ -196,17 +196,6 @@ func openRegularExternalFSMInput(inputPath string) (*os.File, error) {
 		return nil, err
 	}
 	return in, nil
-}
-
-func requireRegularPath(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if !info.Mode().IsRegular() {
-		return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "%s is not a regular file", path)
-	}
-	return nil
 }
 
 func requireRegularFile(f *os.File, path string) error {

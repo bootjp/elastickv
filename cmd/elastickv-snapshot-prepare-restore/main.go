@@ -14,7 +14,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/bootjp/elastickv/internal/backup"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -249,7 +248,7 @@ func validatePayload(path string) (backup.SnapshotHeader, string, error) {
 func openRegularRestoreFile(path string, kind string) (*os.File, error) {
 	f, err := openNoFollowNonblocking(path)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
+		if isNoFollowSymlink(err) {
 			return nil, errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s %s is a symlink", kind, path)
 		}
 		return nil, err
@@ -264,14 +263,6 @@ func openRegularRestoreFile(path string, kind string) (*os.File, error) {
 		return nil, errors.Wrapf(etcd.ErrExternalSnapshotRestoreInvalid, "%s %s is not a regular file", kind, path)
 	}
 	return f, nil
-}
-
-func openNoFollowNonblocking(path string) (*os.File, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) //nolint:gosec // operator-supplied restore artifact path
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	return os.NewFile(uintptr(fd), path), nil
 }
 
 func validateEncodeInfo(info backup.EncodeInfo, gotSHA string, cfg *config) error {
