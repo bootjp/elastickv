@@ -1922,6 +1922,9 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 			continue
 		}
 		if _, ok := t.replacers[k]; ok {
+			// A staged string replacement owns both the inline TTL and the
+			// scan-index TTL. applyPositiveExpire updates the replacement TTL
+			// directly so EXPIRE after SET is emitted by buildReplacementElems.
 			continue
 		}
 		// String keys encode TTL inside the value in buildKeyElems; skip them here.
