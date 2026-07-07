@@ -43,6 +43,26 @@ func TestUnpackDumpTreeRejectsTraversal(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr))
 }
 
+func TestUnpackDumpTreeRejectsNonDirectoryRootEntry(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     ".",
+		Typeflag: tar.TypeReg,
+		Mode:     0o600,
+		Size:     1,
+	}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	out := filepath.Join(t.TempDir(), "out")
+	err = UnpackDumpTree(bytes.NewReader(buf.Bytes()), out, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchiveNonRegular)
+	_, statErr := os.Stat(out)
+	require.True(t, os.IsNotExist(statErr))
+}
+
 func TestReadTarTreeRejectsEntryBudgetExceeded(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)

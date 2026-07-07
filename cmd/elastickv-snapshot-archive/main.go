@@ -120,6 +120,7 @@ func runPack(cfg *config, logger *slog.Logger) error {
 	}
 	if err := backup.PackDumpTree(cfg.inputPath, out, cfg.compression); err != nil {
 		_ = closeFn()
+		removeFailedArchiveOutput(cfg.outputPath)
 		return errors.Wrap(err, "pack snapshot dump tree")
 	}
 	if err := closeFn(); err != nil {
@@ -133,14 +134,15 @@ func rejectArchiveOutputInsideInput(inputPath string, outputPath string) error {
 	if outputPath == "-" {
 		return nil
 	}
-	inputAbs, err := filepath.Abs(inputPath)
+	inputAbs, err := canonicalArchiveExistingPath(inputPath)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
-	outputAbs, err := filepath.Abs(outputPath)
+	outputParentAbs, err := canonicalArchiveExistingPath(filepath.Dir(outputPath))
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
+	outputAbs := filepath.Join(outputParentAbs, filepath.Base(outputPath))
 	rel, err := filepath.Rel(inputAbs, outputAbs)
 	if err != nil {
 		return errors.WithStack(err)
@@ -149,6 +151,25 @@ func rejectArchiveOutputInsideInput(inputPath string, outputPath string) error {
 		return errors.Wrapf(errArchiveOutputInsideInput, "%s under %s", outputPath, inputPath)
 	}
 	return nil
+}
+
+func canonicalArchiveExistingPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func removeFailedArchiveOutput(path string) {
+	if path == "-" {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 func runUnpack(cfg *config, logger *slog.Logger) error {

@@ -32,15 +32,18 @@ func TestArchiveCLICompressesAndExtractsDump(t *testing.T) {
 func TestArchiveCLIRejectsCorruptChecksums(t *testing.T) {
 	root := writeCLIDumpFixture(t)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "redis", "db_0", "strings", "key.bin"), []byte("tampered"), 0o600))
+	archivePath := filepath.Join(t.TempDir(), "dump.tar")
 
 	code, err := run([]string{
 		"pack",
 		"--input", root,
-		"--output", filepath.Join(t.TempDir(), "dump.tar"),
+		"--output", archivePath,
 		"--compression", "none",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.ErrorIs(t, err, backup.ErrChecksumMismatch)
 	require.Equal(t, exitDataErr, code)
+	_, statErr := os.Stat(archivePath)
+	require.True(t, os.IsNotExist(statErr))
 }
 
 func TestArchiveCLIRejectsOutputInsideInputTree(t *testing.T) {
@@ -50,6 +53,20 @@ func TestArchiveCLIRejectsOutputInsideInputTree(t *testing.T) {
 		"pack",
 		"--input", root,
 		"--output", filepath.Join(root, "dump.tar.zst"),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.ErrorIs(t, err, errArchiveOutputInsideInput)
+	require.Equal(t, exitUserErr, code)
+}
+
+func TestArchiveCLIRejectsSymlinkedOutputInsideInputTree(t *testing.T) {
+	root := writeCLIDumpFixture(t)
+	linkParent := filepath.Join(t.TempDir(), "archive-out")
+	require.NoError(t, os.Symlink(filepath.Join(root, "redis"), linkParent))
+
+	code, err := run([]string{
+		"pack",
+		"--input", root,
+		"--output", filepath.Join(linkParent, "dump.tar.zst"),
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.ErrorIs(t, err, errArchiveOutputInsideInput)
 	require.Equal(t, exitUserErr, code)

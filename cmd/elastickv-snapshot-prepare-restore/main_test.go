@@ -179,6 +179,19 @@ func TestParsePeersRejectsDuplicateDerivedNodeIDs(t *testing.T) {
 	require.ErrorContains(t, err, "duplicate peer node id")
 }
 
+func TestClassifyErrorTreatsMalformedSnapshotEntriesAsDataErr(t *testing.T) {
+	for _, err := range []error{
+		backup.ErrSnapshotEncryptedEntry,
+		backup.ErrSnapshotEncryptedReserved,
+		backup.ErrSnapshotKeyTooLarge,
+		backup.ErrSnapshotShortKey,
+		backup.ErrSnapshotShortValue,
+		backup.ErrSnapshotValueTooLarge,
+	} {
+		require.Equal(t, exitDataErr, classifyError(err))
+	}
+}
+
 func TestHLCCeilingMsAfterLastCommitTS(t *testing.T) {
 	require.Equal(t, uint64(0), hlcCeilingMsAfterLastCommitTS(0))
 	require.Equal(t, uint64(124), hlcCeilingMsAfterLastCommitTS((123<<hlcLogicalBits)|42))

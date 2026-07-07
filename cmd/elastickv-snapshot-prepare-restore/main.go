@@ -73,6 +73,12 @@ func classifyError(err error) int {
 	switch {
 	case errors.Is(err, backup.ErrSnapshotBadMagic),
 		errors.Is(err, backup.ErrSnapshotTruncated),
+		errors.Is(err, backup.ErrSnapshotEncryptedEntry),
+		errors.Is(err, backup.ErrSnapshotEncryptedReserved),
+		errors.Is(err, backup.ErrSnapshotKeyTooLarge),
+		errors.Is(err, backup.ErrSnapshotShortKey),
+		errors.Is(err, backup.ErrSnapshotShortValue),
+		errors.Is(err, backup.ErrSnapshotValueTooLarge),
 		errors.Is(err, backup.ErrUnsupportedEncodeInfoFormatVersion),
 		errors.Is(err, errRestoreClusterIDMismatch),
 		errors.Is(err, errRestoreClusterIDMissing),

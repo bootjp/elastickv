@@ -146,14 +146,11 @@ func writeExternalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, ce
 	if err := os.MkdirAll(fsmSnapDir, defaultDirPerm); err != nil {
 		return 0, 0, "", errors.WithStack(err)
 	}
-	in, err := os.Open(inputPath) //nolint:gosec // operator-supplied restore artifact path
+	in, err := openRegularExternalFSMInput(inputPath)
 	if err != nil {
-		return 0, 0, "", errors.WithStack(err)
-	}
-	defer func() { _ = in.Close() }()
-	if err := requireRegularFile(in, inputPath); err != nil {
 		return 0, 0, "", err
 	}
+	defer func() { _ = in.Close() }()
 
 	tmpFile, err := os.CreateTemp(fsmSnapDir, "*.fsm.tmp")
 	if err != nil {
@@ -184,6 +181,32 @@ func writeExternalFSMSnapshotFile(inputPath, fsmSnapDir string, index uint64, ce
 		return 0, 0, "", errors.WithStack(err)
 	}
 	return crc, bytesWritten, payloadSHA, nil
+}
+
+func openRegularExternalFSMInput(inputPath string) (*os.File, error) {
+	if err := requireRegularPath(inputPath); err != nil {
+		return nil, err
+	}
+	in, err := os.Open(inputPath) //nolint:gosec // operator-supplied restore artifact path
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := requireRegularFile(in, inputPath); err != nil {
+		_ = in.Close()
+		return nil, err
+	}
+	return in, nil
+}
+
+func requireRegularPath(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Wrapf(ErrExternalSnapshotRestoreInvalid, "%s is not a regular file", path)
+	}
+	return nil
 }
 
 func requireRegularFile(f *os.File, path string) error {

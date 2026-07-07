@@ -252,7 +252,10 @@ func extractTarEntry(tr *tar.Reader, outputRoot string, hdr *tar.Header, budget 
 		return err
 	}
 	if rel == "." {
-		return nil
+		if hdr.Typeflag == tar.TypeDir {
+			return nil
+		}
+		return errors.Wrapf(ErrArchiveNonRegular, "%s type %c", hdr.Name, hdr.Typeflag)
 	}
 	target := filepath.Join(outputRoot, rel)
 	switch hdr.Typeflag {
