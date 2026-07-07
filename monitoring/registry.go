@@ -224,7 +224,7 @@ func (r *Registry) SQSObserver() *SQSObserver {
 // by this registry. The adapter owns admission decisions and calls this small
 // interface directly from the hot path.
 func (r *Registry) S3PutAdmissionObserver() S3PutAdmissionObserver {
-	if r == nil {
+	if r == nil || r.s3 == nil {
 		return nil
 	}
 	return r.s3

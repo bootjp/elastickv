@@ -45,3 +45,10 @@ func TestRegistryReturnsS3PutAdmissionObserver(t *testing.T) {
 	registry := NewRegistry("n1", "127.0.0.1:0")
 	require.NotNil(t, registry.S3PutAdmissionObserver())
 }
+
+func TestRegistryS3PutAdmissionObserverNilWhenMetricsMissing(t *testing.T) {
+	t.Parallel()
+
+	registry := &Registry{}
+	require.Nil(t, registry.S3PutAdmissionObserver())
+}

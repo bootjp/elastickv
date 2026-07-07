@@ -23,19 +23,18 @@ type S3PutAdmissionObserver interface {
 }
 
 type S3Metrics struct {
-	putAdmissionInflightBytes *prometheus.GaugeVec
+	putAdmissionInflightBytes prometheus.Gauge
 	putAdmissionRejections    *prometheus.CounterVec
 	putAdmissionWait          *prometheus.HistogramVec
 }
 
 func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 	m := &S3Metrics{
-		putAdmissionInflightBytes: prometheus.NewGaugeVec(
+		putAdmissionInflightBytes: prometheus.NewGauge(
 			prometheus.GaugeOpts{
 				Name: "elastickv_s3_put_admission_inflight_bytes",
 				Help: "Current S3 PUT body bytes admitted by this node and not yet released after Raft dispatch.",
 			},
-			nil,
 		),
 		putAdmissionRejections: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -65,7 +64,7 @@ func (m *S3Metrics) ObserveS3PutAdmissionInflight(bytes int64) {
 	if m == nil {
 		return
 	}
-	m.putAdmissionInflightBytes.WithLabelValues().Set(float64(max(int64(0), bytes)))
+	m.putAdmissionInflightBytes.Set(float64(max(int64(0), bytes)))
 }
 
 func (m *S3Metrics) ObserveS3PutAdmissionRejection(stage, protocol string) {

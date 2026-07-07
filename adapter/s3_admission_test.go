@@ -57,6 +57,17 @@ func TestS3PutAdmissionAcquireReleaseAndHeadroom(t *testing.T) {
 	require.NoError(t, admission.peekHeadroom(2*s3ChunkSize))
 }
 
+func TestS3PutAdmissionAcquireRejectsMultiUnitRequest(t *testing.T) {
+	t.Parallel()
+
+	admission := newS3PutAdmission(2*s3ChunkSize, time.Second)
+	release, err := admission.acquire(context.Background(), 2*s3ChunkSize)
+	require.ErrorIs(t, err, errS3PutAdmissionExhausted)
+	require.Nil(t, release)
+	require.Zero(t, admission.inflight.Load())
+	require.NoError(t, admission.peekHeadroom(2*s3ChunkSize))
+}
+
 func TestS3PutAdmissionAcquireTimeoutKeepsExistingLease(t *testing.T) {
 	t.Parallel()
 

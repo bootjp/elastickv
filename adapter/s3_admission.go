@@ -154,21 +154,16 @@ func (a *s3PutAdmission) acquire(ctx context.Context, bytes int64) (func(), erro
 		return func() {}, nil
 	}
 	units, ok := a.unitsFor(bytes)
-	if !ok {
+	if !ok || units > 1 {
 		return nil, errS3PutAdmissionExhausted
 	}
-	acquired := 0
-	for acquired < units {
-		select {
-		case a.sem <- struct{}{}:
-			acquired++
-			a.inflight.Add(s3ChunkSize)
-		case <-ctx.Done():
-			a.releaseUnits(acquired)
-			return nil, errS3PutAdmissionExhausted
-		}
+	select {
+	case a.sem <- struct{}{}:
+		a.inflight.Add(s3ChunkSize)
+		return func() { a.releaseUnits(1) }, nil
+	case <-ctx.Done():
+		return nil, errS3PutAdmissionExhausted
 	}
-	return func() { a.releaseUnits(acquired) }, nil
 }
 
 func (a *s3PutAdmission) acquireWithTimeout(ctx context.Context, bytes int64) (func(), error) {
