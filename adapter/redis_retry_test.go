@@ -330,7 +330,8 @@ func TestNormalizeRetryableRedisTxnErrWideFenceKey(t *testing.T) {
 
 	require.ErrorIs(t, normalized, store.ErrWriteConflict)
 	require.ErrorContains(t, normalized, "key: retry:hash")
-	require.NotContains(t, normalized.Error(), string(redisTxnWideFencePrefix))
+	require.NotContains(t, normalized.Error(), string(redisTxnWideHashFencePrefix))
+	require.NotContains(t, normalized.Error(), "!redis|")
 }
 
 func TestNormalizeRetryableRedisTxnErrPreservesTxnLockedDetail(t *testing.T) {

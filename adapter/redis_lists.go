@@ -19,6 +19,8 @@ func listItemKey(userKey []byte, seq int64) []byte {
 	return store.ListItemKey(userKey, seq)
 }
 
+const listPushFenceAndDeltaElems = 2
+
 func clampRange(start, end, length int) (int, int) {
 	if start < 0 {
 		start = length + start
@@ -63,7 +65,7 @@ func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]
 		return nil, meta, nil
 	}
 
-	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(values)+listPushFenceAndDeltaElems)
 	seq := meta.Head + meta.Len
 	for _, v := range values {
 		vCopy := bytes.Clone(v)
@@ -73,7 +75,10 @@ func (r *RedisServer) buildRPushOps(meta store.ListMeta, key []byte, values [][]
 
 	// Emit a Delta key instead of writing the base meta key.
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: int64(len(values))})
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaDeltaKey(key, commitTS, seqInTxn), Value: delta})
+	elems = append(elems,
+		redisTxnWideListFenceElem(key),
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaDeltaKey(key, commitTS, seqInTxn), Value: delta},
+	)
 
 	meta.Len += int64(len(values))
 	meta.Tail = meta.Head + meta.Len
@@ -419,7 +424,7 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 	if meta.Head < math.MinInt64+n {
 		return nil, meta, errors.WithStack(errors.New("LPUSH would underflow list Head sequence number"))
 	}
-	elems := make([]*kv.Elem[kv.OP], 0, len(values)+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(values)+listPushFenceAndDeltaElems)
 	// LPUSH reverses args, so last arg gets the lowest sequence number.
 	newHead := meta.Head - n
 	for i, v := range values {
@@ -431,7 +436,10 @@ func (r *RedisServer) buildLPushOps(meta store.ListMeta, key []byte, values [][]
 
 	// Emit a Delta key instead of writing the base meta key.
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -n, LenDelta: n})
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaDeltaKey(key, commitTS, seqInTxn), Value: delta})
+	elems = append(elems,
+		redisTxnWideListFenceElem(key),
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ListMetaDeltaKey(key, commitTS, seqInTxn), Value: delta},
+	)
 
 	meta.Head = newHead
 	meta.Len += n
@@ -587,11 +595,14 @@ func (r *RedisServer) commitListPop(ctx context.Context, key []byte, elems []*kv
 		headDelta = n // head advances by n positions for LPOP
 	}
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: headDelta, LenDelta: -n})
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.ListMetaDeltaKey(key, commitTS, 0),
-		Value: delta,
-	})
+	elems = append(elems,
+		redisTxnWideListFenceElem(key),
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ListMetaDeltaKey(key, commitTS, 0),
+			Value: delta,
+		},
+	)
 
 	if _, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,

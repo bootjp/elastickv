@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -17,7 +18,9 @@ func newRedisStorageMigrationTestServer(t *testing.T) (*RedisServer, store.MVCCS
 	return server, st
 }
 
-func newRedisTxnTestContext(server *RedisServer, startTS uint64) *txnContext {
+const redisTxnTestStartTS = 10
+
+func newRedisTxnTestContext(server *RedisServer) *txnContext {
 	return &txnContext{
 		server:          server,
 		working:         map[string]*txnValue{},
@@ -32,7 +35,7 @@ func newRedisTxnTestContext(server *RedisServer, startTS uint64) *txnContext {
 		hashDeletes:     map[string][]byte{},
 		setDeletes:      map[string][]byte{},
 		streamDeletions: map[string][]byte{},
-		startTS:         startTS,
+		startTS:         redisTxnTestStartTS,
 	}
 }
 
@@ -197,7 +200,7 @@ func TestRedisTxnWideHashDeleteConflictsWithConcurrentNewField(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), 10, 0))
 	coord.Clock().Observe(10)
 
-	txn := newRedisTxnTestContext(server, 10)
+	txn := newRedisTxnTestContext(server)
 	res, err := txn.stageKeyDeletion(key)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), res.integer)
@@ -224,7 +227,7 @@ func TestRedisTxnWideSetDeleteConflictsWithConcurrentNewMember(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, store.SetMetaKey(key), store.MarshalSetMeta(store.SetMeta{Len: 1}), 10, 0))
 	coord.Clock().Observe(10)
 
-	txn := newRedisTxnTestContext(server, 10)
+	txn := newRedisTxnTestContext(server)
 	res, err := txn.stageKeyDeletion(key)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), res.integer)
@@ -237,6 +240,104 @@ func TestRedisTxnWideSetDeleteConflictsWithConcurrentNewMember(t *testing.T) {
 	err = txn.validateReadSet(ctx)
 	require.ErrorIs(t, err, store.ErrWriteConflict,
 		"wide set DEL in MULTI must conflict with concurrent SADD of a new member")
+}
+
+func TestRedisTxnWideFenceKeysUseRedisRoutePrefix(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("user:key")
+	require.Equal(t, []byte("!redis|txn-wide-hash|user:key"), redisTxnWideHashFenceKey(key))
+	require.Equal(t, key, redisTxnWideFenceUserKey(redisTxnWideHashFenceKey(key)))
+	require.Equal(t, []byte("!redis|txn-wide-set|user:key"), redisTxnWideSetFenceKey(key))
+	require.Equal(t, key, redisTxnWideFenceUserKey(redisTxnWideSetFenceKey(key)))
+	require.Equal(t, []byte("!redis|txn-wide-list|user:key"), redisTxnWideListFenceKey(key))
+	require.Equal(t, key, redisTxnWideFenceUserKey(redisTxnWideListFenceKey(key)))
+}
+
+func TestRedisTxnSetReplacementConflictsWithConcurrentWideHashWrite(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newOCCAdapterCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	key := []byte("hash:set-replace-conflict")
+
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("old")), []byte("v"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), 10, 0))
+	coord.Clock().Observe(10)
+
+	txn := newRedisTxnTestContext(server)
+	res, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("string")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", res.str)
+	_, err = txn.buildReplacementElems(ctx)
+	require.NoError(t, err)
+
+	added, err := server.applyHashFieldPairs(key, [][]byte{[]byte("new"), []byte("v")})
+	require.NoError(t, err)
+	require.Equal(t, 1, added)
+
+	err = txn.validateReadSet(ctx)
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"SET replacement in MULTI must conflict with concurrent HSET of a new field")
+}
+
+func TestRedisTxnSetReplacementConflictsWithConcurrentListPush(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newOCCAdapterCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	key := []byte("list:set-replace-conflict")
+
+	metaBytes, err := store.MarshalListMeta(store.ListMeta{Len: 1})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), metaBytes, 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 0), []byte("old"), 10, 0))
+	coord.Clock().Observe(10)
+
+	txn := newRedisTxnTestContext(server)
+	res, err := txn.applySet(redcon.Command{Args: [][]byte{[]byte(cmdSet), key, []byte("string")}})
+	require.NoError(t, err)
+	require.Equal(t, "OK", res.str)
+	_, err = txn.buildReplacementElems(ctx)
+	require.NoError(t, err)
+
+	newLen, err := server.listRPush(ctx, key, [][]byte{[]byte("new")})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), newLen)
+
+	err = txn.validateReadSet(ctx)
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"SET replacement in MULTI must conflict with concurrent RPUSH on the same key")
+}
+
+func TestRedisTxnExpiredRecreateConflictsWithConcurrentCollectionWrite(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newOCCAdapterCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	key := []byte("expired:recreate-conflict")
+
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), 10, 0))
+	coord.Clock().Observe(10)
+
+	txn := newRedisTxnTestContext(server)
+	res, err := txn.applyRPush(redcon.Command{Args: [][]byte{[]byte(cmdRPush), key, []byte("list-value")}})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res.integer)
+
+	added, err := server.applyHashFieldPairs(key, [][]byte{[]byte("field"), []byte("hash-value")})
+	require.NoError(t, err)
+	require.Equal(t, 1, added)
+
+	err = txn.validateReadSet(ctx)
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"expired-key recreate in MULTI must conflict with a concurrent collection recreate")
 }
 
 // TestRedisTxnMULTIEXECRetriesOnCoordinatorConflict verifies that runTransaction

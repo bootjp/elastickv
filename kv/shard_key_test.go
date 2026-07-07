@@ -29,6 +29,19 @@ func TestRouteKey_NormalizesTxnWrappedS3Key(t *testing.T) {
 	require.Equal(t, s3keys.RouteKey("bucket-a", 7, "path/to/object"), routeKey(txnLockKey(embedded)))
 }
 
+func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		[]byte("!redis|txn-wide-hash|user:key"),
+		[]byte("!redis|txn-wide-set|user:key"),
+		[]byte("!redis|txn-wide-list|user:key"),
+	} {
+		require.Equal(t, userKey, routeKey(raw))
+	}
+}
+
 func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	t.Parallel()
 

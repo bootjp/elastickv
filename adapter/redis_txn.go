@@ -16,7 +16,9 @@ import (
 )
 
 var redisTxnKeyPrefix = []byte("!txn|")
-var redisTxnWideFencePrefix = []byte("!txn|redis-wide|")
+var redisTxnWideHashFencePrefix = []byte("!redis|txn-wide-hash|")
+var redisTxnWideSetFencePrefix = []byte("!redis|txn-wide-set|")
+var redisTxnWideListFencePrefix = []byte("!redis|txn-wide-list|")
 
 type txnCommandHandler func(*txnContext, redcon.Command) (redisResult, error)
 
@@ -172,17 +174,22 @@ func stageListDelete(st *listTxnState) {
 }
 
 func redisTxnWideHashFenceKey(userKey []byte) []byte {
-	return redisTxnWideFenceKey([]byte("hash|"), userKey)
+	return redisTxnWideFenceKey(redisTxnWideHashFencePrefix, userKey)
 }
 
 func redisTxnWideSetFenceKey(userKey []byte) []byte {
-	return redisTxnWideFenceKey([]byte("set|"), userKey)
+	return redisTxnWideFenceKey(redisTxnWideSetFencePrefix, userKey)
+}
+
+func redisTxnWideListFenceKey(userKey []byte) []byte {
+	return redisTxnWideFenceKey(redisTxnWideListFencePrefix, userKey)
 }
 
 func redisTxnWideFenceUserKey(key []byte) []byte {
 	for _, prefix := range [][]byte{
-		redisTxnWideFenceKey([]byte("hash|"), nil),
-		redisTxnWideFenceKey([]byte("set|"), nil),
+		redisTxnWideHashFencePrefix,
+		redisTxnWideSetFencePrefix,
+		redisTxnWideListFencePrefix,
 	} {
 		if bytes.HasPrefix(key, prefix) {
 			return key[len(prefix):]
@@ -191,10 +198,9 @@ func redisTxnWideFenceUserKey(key []byte) []byte {
 	return nil
 }
 
-func redisTxnWideFenceKey(kind, userKey []byte) []byte {
-	buf := make([]byte, 0, len(redisTxnWideFencePrefix)+len(kind)+len(userKey))
-	buf = append(buf, redisTxnWideFencePrefix...)
-	buf = append(buf, kind...)
+func redisTxnWideFenceKey(prefix, userKey []byte) []byte {
+	buf := make([]byte, 0, len(prefix)+len(userKey))
+	buf = append(buf, prefix...)
 	buf = append(buf, userKey...)
 	return buf
 }
@@ -205,6 +211,10 @@ func redisTxnWideHashFenceElem(userKey []byte) *kv.Elem[kv.OP] {
 
 func redisTxnWideSetFenceElem(userKey []byte) *kv.Elem[kv.OP] {
 	return redisTxnWideFenceElem(redisTxnWideSetFenceKey(userKey))
+}
+
+func redisTxnWideListFenceElem(userKey []byte) *kv.Elem[kv.OP] {
+	return redisTxnWideFenceElem(redisTxnWideListFenceKey(userKey))
 }
 
 func redisTxnWideFenceElem(key []byte) *kv.Elem[kv.OP] {
@@ -716,6 +726,7 @@ func (t *txnContext) stageExpiredKeyCleanupForRecreate(key []byte) (bool, error)
 		t.logicalDeletes = map[string][]byte{}
 	}
 	t.logicalDeletes[string(key)] = bytes.Clone(key)
+	t.trackWideCollectionFenceReads(key)
 	return true, nil
 }
 
@@ -1098,12 +1109,17 @@ func (t *txnContext) markLogicalDeletion(key []byte, k string) {
 	}
 	t.hashDeletes[k] = bytes.Clone(key)
 	t.setDeletes[k] = bytes.Clone(key)
-	t.trackReadKey(redisTxnWideHashFenceKey(key))
-	t.trackReadKey(redisTxnWideSetFenceKey(key))
+	t.trackWideCollectionFenceReads(key)
 	if st, ok := t.hashStates[k]; ok {
 		st.deleted = true
 		st.dirty = false
 	}
+}
+
+func (t *txnContext) trackWideCollectionFenceReads(key []byte) {
+	t.trackReadKey(redisTxnWideHashFenceKey(key))
+	t.trackReadKey(redisTxnWideSetFenceKey(key))
+	t.trackReadKey(redisTxnWideListFenceKey(key))
 }
 
 func (t *txnContext) stageCollectionStateDeletion(key []byte) error {
@@ -1409,6 +1425,7 @@ func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.O
 	var elems []*kv.Elem[kv.OP]
 	for _, k := range keys {
 		repl := t.replacers[k]
+		t.trackWideCollectionFenceReads(repl.key)
 		deleteElems, _, err := t.server.deleteLogicalKeyElems(ctx, repl.key, t.startTS)
 		if err != nil {
 			return nil, err
@@ -1629,11 +1646,14 @@ func appendListAppendElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnS
 
 func appendListDeltaElem(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnState, commitTS uint64, seqInTxn uint32) []*kv.Elem[kv.OP] {
 	deltaVal := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: int64(len(st.appends))})
-	return append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.ListMetaDeltaKey(userKey, commitTS, seqInTxn),
-		Value: deltaVal,
-	})
+	return append(elems,
+		redisTxnWideListFenceElem(userKey),
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.ListMetaDeltaKey(userKey, commitTS, seqInTxn),
+			Value: deltaVal,
+		},
+	)
 }
 
 func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) {
