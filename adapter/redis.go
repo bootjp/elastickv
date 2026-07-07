@@ -163,6 +163,8 @@ type RedisServer struct {
 	// expensive path cannot occupy every scheduler P and starve Raft.
 	// nil preserves the historical unbounded path for narrow test fixtures.
 	heavyCommandLimiter *redisHeavyCommandLimiter
+	// peerLimiter bounds concurrent Redis connections per remote peer IP.
+	peerLimiter *redisPeerLimiter
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -325,6 +327,14 @@ func WithRedisHeavyCommandSlots(n int) RedisServerOption {
 	}
 }
 
+// WithRedisPerPeerConnectionLimit overrides the per-peer Redis connection cap.
+// n <= 0 disables the cap.
+func WithRedisPerPeerConnectionLimit(n int) RedisServerOption {
+	return func(r *RedisServer) {
+		r.peerLimiter = newRedisPeerLimiter(n)
+	}
+}
+
 // luaFastPathCmdZRangeByScore is the shared label for ZRANGEBYSCORE
 // and ZREVRANGEBYSCORE fast-path outcomes. Both directions take the
 // same branch through zsetRangeByScoreFast so sharing one label
@@ -458,7 +468,9 @@ type connState struct {
 	// clientName is the name set via HELLO SETNAME or CLIENT SETNAME,
 	// returned by CLIENT GETNAME. Empty string means no name set, which
 	// CLIENT GETNAME must report as a null bulk string.
-	clientName string
+	clientName  string
+	peerKey     string
+	peerCounted bool
 }
 
 type resultType int
@@ -504,6 +516,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		luaPool:             nil,
 		traceCommands:       os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
 		heavyCommandLimiter: newDefaultRedisHeavyCommandLimiter(),
+		peerLimiter:         newDefaultRedisPeerLimiter(),
 		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
 		// constraint is discharged (FSM probe shipped on every node months ago,
 		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).
@@ -552,6 +565,32 @@ func getConnState(conn redcon.Conn) *connState {
 	st := &connState{}
 	conn.SetContext(st)
 	return st
+}
+
+func (r *RedisServer) acceptConn(conn redcon.Conn) bool {
+	if r == nil || r.peerLimiter == nil {
+		return true
+	}
+	peer, ok := r.peerLimiter.accept(conn.RemoteAddr())
+	st := getConnState(conn)
+	st.peerKey = peer
+	st.peerCounted = ok
+	if !ok {
+		conn.WriteError(redisPeerLimitError)
+	}
+	return ok
+}
+
+func (r *RedisServer) closeConn(conn redcon.Conn) {
+	if r == nil || r.peerLimiter == nil {
+		return
+	}
+	st, ok := conn.Context().(*connState)
+	if !ok || !st.peerCounted {
+		return
+	}
+	r.peerLimiter.release(st.peerKey)
+	st.peerCounted = false
 }
 
 // ensureConnID assigns and returns a per-connection numeric ID for the
@@ -736,13 +775,12 @@ func (r *RedisServer) Run() error {
 			r.dispatchCommand(conn, name, handler, cmd, start)
 		},
 		func(conn redcon.Conn) bool {
-			// Use this function to accept or deny the connection.
-			// log.Printf("accept: %s", conn.RemoteAddr())
-			return true
+			return r.acceptConn(conn)
 		},
 		func(conn redcon.Conn, err error) {
 			// This is called when the connection has been closed.
 			// PubSub connections clean up their own subscriptions via bgrunner.
+			r.closeConn(conn)
 		})
 
 	return errors.WithStack(err)

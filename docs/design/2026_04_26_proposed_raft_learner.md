@@ -34,7 +34,7 @@ mutations exposed by the engine are `AddVoter` and `RemoveServer`
 
 3. **The roadmap requires it.** Hotspot shard split
    (`2026_02_18_partial_hotspot_shard_split.md`), workload isolation
-   (`2026_04_24_partial_workload_isolation.md`), and any future
+   (`2026_04_24_implemented_workload_isolation.md`), and any future
    follower-served read mode all need a way to attach a *non-voting* replica
    that pulls log entries without joining the quorum. Hand-rolling that
    per-feature is the wrong shape.

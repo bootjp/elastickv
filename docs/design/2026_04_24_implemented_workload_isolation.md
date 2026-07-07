@@ -1,6 +1,6 @@
 # Workload-class isolation after 2026-04-24 XREAD starvation
 
-> **Status: Partial**
+> **Status: Implemented**
 > Follow-up to the 2026-04-24 incident review and a companion to
 > `docs/design/2026_04_24_proposed_resilience_roadmap.md` (items 5–7).
 > That doc is about keeping memory pressure from building; this doc is
@@ -18,8 +18,18 @@ Implementation status:
 - Shipped: Lua execution derives its timeout from `RedisServer.handlerContext`
   instead of `context.Background`, preserving request cancellation for the
   gated `EVAL`/`EVALSHA` path.
-- Remaining: Layer 3 per-peer admission control and Layer 4 stream per-entry
-  layout. Layer 2 locked raft threads remains measurement-gated per §4.
+- Shipped: Layer 3 per-peer Redis connection admission in
+  `adapter/redis_peer_limiter.go`, wired through `RedisServer.Run` accept and
+  close hooks. Default cap is 8 per peer IP and is configurable via
+  `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` /
+  `WithRedisPerPeerConnectionLimit`.
+- Shipped: Layer 4 stream entry-per-key layout in `store/stream_helpers.go`,
+  `adapter/redis_stream_cmds.go`, and `adapter/redis_compat_helpers.go`.
+  XREAD now range-scans `!stream|entry|...` after the requested ID instead of
+  unmarshalling the legacy single blob.
+- Intentionally deferred: Layer 2 locked raft threads remains
+  measurement-gated per §4; this doc's v1 recommendation is to do nothing
+  unless Layer 1 + Layer 4 still leave `step_queue_full` elevated.
 
 ---
 
