@@ -14,7 +14,7 @@ Before this work, elastickv's SQS adapter had **no per-queue rate limiting**. A 
 2. Exhaust the receive-path's visibility-index scan budget (`sqsVisScanPageLimit = 1024`), causing other tenants' `ReceiveMessage` calls to time out empty.
 3. Fill the message keyspace fast enough that the retention reaper cannot keep up — the keyspace grows unbounded until the next manual purge.
 
-Phase 3.C in [`docs/design/2026_04_24_partial_sqs_compatible_adapter.md`](2026_04_24_partial_sqs_compatible_adapter.md) §16.5 marks this as TODO. AWS itself enforces per-account / per-API limits ("standard request throttle of 3000 RPS per region per AWS account" plus per-API limits like 300 TPS for batch APIs); operators running elastickv as a multi-tenant SQS facade need an equivalent control plane. Without it, the only knobs are (a) shard-level capacity (too coarse — adding a shard requires a Raft membership change) and (b) external load-balancer rate limiting (no visibility into per-queue cost).
+Phase 3.C in [`docs/design/2026_04_24_proposed_sqs_compatible_adapter.md`](2026_04_24_proposed_sqs_compatible_adapter.md) §14 originally listed this as future work. AWS itself enforces per-account / per-API limits ("standard request throttle of 3000 RPS per region per AWS account" plus per-API limits like 300 TPS for batch APIs); operators running elastickv as a multi-tenant SQS facade need an equivalent control plane. Without it, the only knobs are (a) shard-level capacity (too coarse — adding a shard requires a Raft membership change) and (b) external load-balancer rate limiting (no visibility into per-queue cost).
 
 This document describes per-queue token-bucket throttling, configured per-queue in queue meta, evaluated at the SQS-adapter layer on the leader, and surfaced as the same `Throttling.Sender` error AWS uses (so existing SDK retry/backoff logic engages naturally).
 
@@ -29,7 +29,7 @@ This document describes per-queue token-bucket throttling, configured per-queue 
 3. **AWS-shape errors**: throttled JSON-path requests return HTTP `400` with the `Throttling` error code (`{"__type":"Throttling", ...}`) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code. Query/XML message verbs are not claimed by this lifecycle update until the query dispatcher wires those verbs into the same throttled handlers.
 4. **Default-off**. Queues created before this feature, and queues created without explicit limits, are not throttled. Operators opt in per queue.
 5. **No coordination per request**. Token replenishment is local to whichever node owns the bucket (the leader for the queue's shard); there is no Raft round-trip on the throttling check.
-6. **Observable at the response boundary**: throttled requests use the AWS-shaped `Throttling` error and `Retry-After` header so clients and request logs expose the limit immediately. Prometheus throttle counters/gauges are a follow-up and are not part of this lifecycle update.
+6. **Client-visible throttling outcome**: throttled requests use the AWS-shaped `Throttling` error and `Retry-After` header so clients can observe and back off from the limit immediately. Server-side Prometheus counters/gauges remain a follow-up and are not part of this lifecycle update.
 
 ### 2.2 Non-Goals
 
@@ -219,7 +219,7 @@ The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1
 | `adapter/sqs_throttle_test.go` (new) | Unit tests for bucket math (edge cases: idle drift, burst, partial refill, batch over-charge, default-off). ~300 lines. |
 | `adapter/sqs_throttle_integration_test.go` (new) | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. ~150 lines. |
 | `monitoring/registry.go` | No throttle-specific Prometheus collector is registered by this lifecycle update. The existing SQS monitoring surface continues to expose partition activity and queue depth; throttle counters/gauges remain future work. |
-| `docs/design/2026_04_24_partial_sqs_compatible_adapter.md` §16.5 | Status update once this lands: TODO → Landed. |
+| `docs/design/2026_04_24_proposed_sqs_compatible_adapter.md` §14 | Phase 3 per-queue throttling item marked landed with a link to this design. |
 
 ### 4.2 OCC interaction
 
@@ -284,7 +284,7 @@ Strict-validation SDKs that reject unknown attribute names will reject `Throttle
 
 No new flags. Limits are per-queue, set via `SetQueueAttributes`. Defaults are zero (disabled).
 
-No throttle-specific Prometheus instruments ship in this lifecycle update. Operators can observe throttling through the HTTP `Throttling` response, the `Retry-After` header, and request logs. A follow-up monitoring change should add a per-queue/action throttled-request counter and a token-remaining gauge; the token budget must be a gauge because it goes both up and down over time.
+No throttle-specific Prometheus instruments or server-side throttle access logs ship in this lifecycle update. The shipped signal is the HTTP `Throttling` response and `Retry-After` header returned to the caller. A follow-up monitoring change should add a per-queue/action throttled-request counter and a token-remaining gauge; the token budget must be a gauge because it goes both up and down over time.
 
 ---
 
@@ -322,8 +322,8 @@ Every `charge` proposes a bucket update through the FSM. **Rejected**: an extra 
 |---|---|
 | 1 | Doc lands (this PR). No code yet. Operators have time to comment. |
 | 2 | Implementation PR per §4.1. Default-off; existing queues unaffected. |
-| 3 | Operators opt in per queue via `SetQueueAttributes`. Watch `Throttling` responses and request logs for false positives. |
-| 4 | Once stable, the partial doc's TODO list moves 3.C from TODO to Landed. |
+| 3 | Operators opt in per queue via `SetQueueAttributes`. Watch caller-visible `Throttling` responses for false positives. |
+| 4 | Parent SQS adapter roadmap marks Phase 3.C as landed with a link to this design. |
 
 ---
 
