@@ -29,7 +29,7 @@ Date: 2026-04-29
 | 6C-4 | Phase-2-specific §9.1 guards: `ErrEnvelopeCutoverDivergence` (sidecar `raft_envelope_cutover_index` disagrees with snapshot header), `ErrEncryptionNotBootstrapped` (`enable-raft-envelope` before bootstrap), `ErrLocalEpochOutOfRange` on wire-side `local_epoch` decode boundaries. Bundles with Stage 6E (`enable-raft-envelope` admin RPC + Phase-2 cutover). | shipped | this PR |
 | 6D | §6.6 `enable-storage-envelope` admin RPC + §7.1 Phase-1 storage cutover (§6.2 toggle ON) + Voters ∪ Learners capability gate (depends on 6B for mutator wiring AND 6C-1+6C-2 for §9.1 startup-refusal guards; bundles 6C-3 for the membership-view-dependent collision check — see rationale) | open | — |
 | 6E | §6.6 `enable-raft-envelope` admin RPC + §7.1 Phase-2 raft cutover + `raft_envelope_cutover_index` sidecar record + `internal/raftengine/etcd/engine.go` `applyNormalEntry` unwrap hook activation + `ErrRaftUnwrapFailed` HaltApply path + `kv/coordinator.go` / `kv/sharded_coordinator.go` wrap-on-propose switch (Phase-2 leader-side §6.3 proposal-payload wrap) + §7.1 steps 1–6 proposal quiescence barrier (block new user proposal intake, drain in-flight queue, source-tag exemption for the cutover entry itself) + production runtime wiring for startup/apply-time wrap install and post-cutover admin proposals + 6C-4 fail-closed guards. | shipped | 2026_05_31_implemented_6e_enable_raft_envelope.md |
-| 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal | open | — |
+| 6F | §6.5 `--encryption-rotate-on-startup` request flag + leader-elected rotation proposal on the default encryption Raft group. The leader rotates every active DEK purpose once before listeners open; followers keep an in-memory pending request and fire only if they acquire leadership in the same process uptime. | shipped | this PR |
 | 7 | Writer registry + deterministic nonce (§4.1) | open | — |
 | 8 | Snapshot header v2 + WAL coverage (§4.4, §4.5) | open | — |
 | 9 | KMS-backed wrappers, compression, rotation/retire/rewrite, Jepsen (§5.2, §5.4, §6.4, §8) | open | — |
@@ -299,8 +299,8 @@ production-safe state, and unblocks the next one.
 - **6F is optional ergonomics.** `--encryption-rotate-on-startup`
   is documented in §6.5 as a request, not a guarantee, and the
   operator can always run `elastickv-admin encryption rotate-dek`
-  out-of-band. 6F lands the convenience flag after the five
-  load-bearing PRs (6A–6E) are in.
+  out-of-band. 6F ships the convenience flag after the five
+  load-bearing stages (6A–6E) are in.
 
 ---
 

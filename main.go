@@ -175,6 +175,13 @@ var (
 	// not yet committed to encryption are unaffected.
 	encryptionEnabled = flag.Bool("encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires --kekFile to be set; without that, mutators still refuse with FailedPrecondition. Default off.")
 
+	// Stage 6F: operator-requested DEK rotation at boot. The flag is
+	// intentionally a request, not a guarantee: only the leader of the
+	// default encryption Raft group proposes the rotation; followers
+	// keep the request in memory and fire it only if they acquire
+	// leadership during this process uptime.
+	encryptionRotateOnStartup = flag.Bool("encryption-rotate-on-startup", false, "§6.5 request a one-shot DEK rotation after this node becomes leader of the default Raft group. Safe for rolling restarts: followers keep the request in memory and only fire if they acquire leadership during this process uptime.")
+
 	// Stage 6B-2: KEK source. The KEK never appears in elastickv's
 	// data dir; it is held externally and exercised only at process
 	// boot and at DEK bootstrap/rotation per §5.1. Stage 6B-2 ships
@@ -440,6 +447,19 @@ func run() error {
 		ctx, runtimes, cfg.sqsFifoPartitionMap,
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
+	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
+	cleanup.Add(installEncryptionRotateOnStartup(
+		ctx,
+		*encryptionRotateOnStartup,
+		defaultRuntime,
+		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
+		*encryptionSidecarPath,
+		kekWrapper,
+		etcdraftengine.DeriveNodeID(*raftId),
+		encWiring.epoch,
+		encWiring.raftEpoch,
+		slog.Default(),
+	))
 	eg, runCtx := errgroup.WithContext(ctx)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
 	// setupDistributionCatalog + the Stage 7a process-start registration
@@ -947,6 +967,13 @@ func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGrou
 		return sg.Proposer()
 	}
 	return rt.engine
+}
+
+func postCutoverProposerForRuntime(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup) raftengine.Proposer {
+	if rt == nil {
+		return nil
+	}
+	return proposerForGroup(rt, shardGroups)
 }
 
 // loadKEKAndRunStartupGuards loads the file-backed KEK wrapper and
