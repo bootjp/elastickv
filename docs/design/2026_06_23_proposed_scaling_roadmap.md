@@ -288,7 +288,7 @@ memory each group's private cache/memtable pins.
 - **workload isolation** — `2026_04_24_proposed_workload_isolation.md` (heavy
   command worker pool, optional Raft-thread pinning, per-client admission,
   XREAD O(N)→O(new)), S3 PUT admission control
-  (`2026_04_25_proposed_s3_admission_control.md`), SQS per-queue throttling
+  (`2026_04_25_implemented_s3_admission_control.md`), SQS per-queue throttling
   (`2026_04_26_proposed_sqs_per_queue_throttling.md`). These bound *one
   workload's* impact so it cannot starve the shared runtime / Raft control
   plane; they scale a deployment by making it predictable under adversarial or

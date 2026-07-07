@@ -6,8 +6,8 @@
 >
 > Companion to PR #636 (`s3ChunkBatchOps = 4`, Raft entry size aligned
 > with `MaxSizePerMsg = 4 MiB` per PR #593) and to the S3 PUT
-> admission-control proposal
-> (`docs/design/2026_04_25_proposed_s3_admission_control.md`).
+> admission-control implementation
+> (`docs/design/2026_04_25_implemented_s3_admission_control.md`).
 >
 > PR #636 caps the *per-entry* size; admission control caps the
 > *aggregate in-flight* memory; this doc removes large blob payloads

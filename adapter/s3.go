@@ -98,16 +98,18 @@ const (
 )
 
 type S3Server struct {
-	listen      net.Listener
-	s3Addr      string
-	region      string
-	store       store.MVCCStore
-	coordinator kv.Coordinator
-	leaderS3    map[string]string
-	staticCreds map[string]string
-	readTracker *kv.ActiveTimestampTracker
-	httpServer  *http.Server
-	cleanupSem  chan struct{}
+	listen               net.Listener
+	s3Addr               string
+	region               string
+	store                store.MVCCStore
+	coordinator          kv.Coordinator
+	leaderS3             map[string]string
+	staticCreds          map[string]string
+	readTracker          *kv.ActiveTimestampTracker
+	httpServer           *http.Server
+	cleanupSem           chan struct{}
+	putAdmission         *s3PutAdmission
+	putAdmissionObserver S3PutAdmissionObserver
 }
 
 type s3BucketMeta struct {
@@ -314,13 +316,14 @@ type s3ListPartEntry struct {
 
 func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordinate kv.Coordinator, leaderS3 map[string]string, opts ...S3ServerOption) *S3Server {
 	s := &S3Server{
-		listen:      listen,
-		s3Addr:      s3Addr,
-		region:      s3DefaultRegion,
-		store:       st,
-		coordinator: coordinate,
-		leaderS3:    cloneLeaderAddrMap(leaderS3),
-		cleanupSem:  make(chan struct{}, s3ManifestCleanupWorkers),
+		listen:       listen,
+		s3Addr:       s3Addr,
+		region:       s3DefaultRegion,
+		store:        st,
+		coordinator:  coordinate,
+		leaderS3:     cloneLeaderAddrMap(leaderS3),
+		cleanupSem:   make(chan struct{}, s3ManifestCleanupWorkers),
+		putAdmission: newS3PutAdmissionFromEnv(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -868,6 +871,10 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	sha256Hasher := sha256.New()
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
+	admissionProtocol := s3PutAdmissionProtocolForPayload(expectedPayloadSHA)
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes) {
+		return
+	}
 	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
@@ -879,6 +886,14 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	buf := make([]byte, s3ChunkSize)
 	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
 	pendingChunkSizes := make([]uint64, 0, s3ChunkBatchOps)
+	pendingAdmission := make([]func(), 0, s3ChunkBatchOps)
+	releasePendingAdmission := func() {
+		for _, release := range pendingAdmission {
+			release()
+		}
+		pendingAdmission = pendingAdmission[:0]
+	}
+	defer releasePendingAdmission()
 	uploadedManifest := func() *s3ObjectManifest {
 		if len(part.ChunkSizes) == 0 {
 			return &s3ObjectManifest{UploadID: uploadID}
@@ -896,6 +911,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 			return nil
 		}
 		_, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{Elems: pendingBatch})
+		releasePendingAdmission()
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -906,8 +922,18 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		return nil
 	}
 	for {
-		n, readErr := r.Body.Read(buf)
+		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), s3ChunkSize, admissionProtocol)
+		if admissionErr != nil {
+			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
+			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+			return
+		}
+		n, readErr := readS3PutChunk(r.Body, buf)
+		if n == 0 {
+			releaseAdmission()
+		}
 		if n > 0 {
+			pendingAdmission = append(pendingAdmission, releaseAdmission)
 			chunk := append([]byte(nil), buf[:n]...)
 			if _, err := hasher.Write(chunk); err != nil {
 				writeS3InternalError(w, err)
@@ -1374,6 +1400,10 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
+	admissionProtocol := s3PutAdmissionProtocolForPayload(partPayloadSHA)
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes) {
+		return
+	}
 	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA, "part exceeds maximum allowed size")
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
@@ -1405,6 +1435,14 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	buf := make([]byte, s3ChunkSize)
 	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
 	chunkSizes := make([]uint64, 0, s3ChunkBatchOps)
+	pendingAdmission := make([]func(), 0, s3ChunkBatchOps)
+	releasePendingAdmission := func() {
+		for _, release := range pendingAdmission {
+			release()
+		}
+		pendingAdmission = pendingAdmission[:0]
+	}
+	defer releasePendingAdmission()
 	partCommitted := false
 	defer func() {
 		if !partCommitted && chunkNo > 0 {
@@ -1417,6 +1455,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			return nil
 		}
 		_, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{Elems: pendingBatch})
+		releasePendingAdmission()
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -1425,7 +1464,15 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	for {
-		n, readErr := r.Body.Read(buf)
+		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), s3ChunkSize, admissionProtocol)
+		if admissionErr != nil {
+			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+			return
+		}
+		n, readErr := readS3PutChunk(r.Body, buf)
+		if n == 0 {
+			releaseAdmission()
+		}
 		if n == 0 {
 			if errors.Is(readErr, io.EOF) {
 				break
@@ -1440,6 +1487,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			}
 			continue
 		}
+		pendingAdmission = append(pendingAdmission, releaseAdmission)
 		chunk := append([]byte(nil), buf[:n]...)
 		if _, err := hasher.Write(chunk); err != nil {
 			writeS3InternalError(w, err)
@@ -2465,6 +2513,17 @@ func (s *S3Server) isVerifiedS3Leader(ctx context.Context) bool {
 		return false
 	}
 	return s.coordinator.VerifyLeader(ctx) == nil
+}
+
+func readS3PutChunk(r io.Reader, buf []byte) (int, error) {
+	n, err := io.ReadFull(r, buf)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return n, io.EOF
+	}
+	if err != nil {
+		return n, errors.WithStack(err)
+	}
+	return n, nil
 }
 
 // prepareStreamingPutBody wraps r.Body for aws-chunked framed uploads. When

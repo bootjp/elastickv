@@ -32,6 +32,7 @@ func startS3Server(
 	credentialsFile string,
 	pathStyleOnly bool,
 	readTracker *kv.ActiveTimestampTracker,
+	putAdmissionObserver adapter.S3PutAdmissionObserver,
 ) (*adapter.S3Server, error) {
 	s3Addr = strings.TrimSpace(s3Addr)
 	if s3Addr == "" {
@@ -62,6 +63,7 @@ func startS3Server(
 		adapter.WithS3Region(region),
 		adapter.WithS3StaticCredentials(staticCreds),
 		adapter.WithS3ActiveTimestampTracker(readTracker),
+		adapter.WithS3PutAdmissionObserver(putAdmissionObserver),
 	)
 	runDoneCtx, runDoneCancel := context.WithCancel(context.Background())
 	eg.Go(func() error {

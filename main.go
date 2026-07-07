@@ -1980,7 +1980,11 @@ func (r *runtimeServerRunner) start() error {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
 	r.dynamoServer = dynamoServer
-	s3Server, err := startS3Server(r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly, r.readTracker)
+	s3Server, err := startS3Server(
+		r.ctx, r.lc, r.eg, r.s3Address, r.shardStore, r.coordinate,
+		r.leaderS3, r.s3Region, r.s3CredsFile, r.s3PathStyleOnly,
+		r.readTracker, r.metricsRegistry.S3PutAdmissionObserver(),
+	)
 	if err != nil {
 		return waitErrgroupAfterStartupFailure(r.cancel, r.eg, err)
 	}
