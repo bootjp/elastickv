@@ -366,8 +366,9 @@ dependency on the live key-format version (parent §"Costs"). Guards:
   restore operator can confirm the encoder matched the target
   cluster's key-format version.
 - `cluster_id` from `MANIFEST.json` is surfaced in `ENCODE_INFO.json`;
-  the restore runbook step refuses to place a file whose `cluster_id`
-  differs from the target node (parent §"Risks").
+  `cmd/elastickv-snapshot-prepare-restore` refuses to seed a target
+  data dir whose `cluster_id` differs from the sidecar unless the
+  operator explicitly declares a fresh cluster (parent §"Risks").
 
 > **Decoder cleanup folded into M1.** `internal/backup/manifest.go`'s
 > `Source.FSMCRC32C` field is dead — `emitManifest` only sets
@@ -448,7 +449,7 @@ P1:
 | Test | Verifies |
 |---|---|
 | `TestEncoderProducesLoadableSnapshot` | Output placed under a fresh node's `fsm-snap/` + `snap/` loads on `Open`; every adapter serves the original data |
-| `TestEncoderClusterIDProvenance` | `ENCODE_INFO.json` carries `cluster_id` + key-format version; mismatch is detectable by the runbook step |
+| `TestEncoderClusterIDProvenance` | `ENCODE_INFO.json` carries `cluster_id` + key-format version; `elastickv-snapshot-prepare-restore` detects mismatch before creating the raft data dir |
 
 P2:
 
