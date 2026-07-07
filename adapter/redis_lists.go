@@ -53,11 +53,6 @@ func (r *RedisServer) loadListMetaAt(ctx context.Context, key []byte, readTS uin
 	return meta, true, nil
 }
 
-func (r *RedisServer) isListKeyAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
-	_, exists, err := r.loadListMetaAt(ctx, key, readTS)
-	return exists, err
-}
-
 // buildRPushOps creates operations to append values to the tail of a list using
 // the Delta pattern. Instead of writing to the base metadata key (causing OCC
 // conflicts), it emits a single ListMetaDelta key with LenDelta = len(values).

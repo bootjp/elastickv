@@ -18,6 +18,9 @@ func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	if r.runStandaloneDedup(conn, cmd) {
+		return
+	}
 	added, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:])
 	if err != nil {
 		writeRedisError(conn, err)
@@ -28,6 +31,9 @@ func (r *RedisServer) hset(conn redcon.Conn, cmd redcon.Command) {
 
 func (r *RedisServer) hmset(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
+		return
+	}
+	if r.runStandaloneDedup(conn, cmd) {
 		return
 	}
 	if _, err := r.applyHashFieldPairs(cmd.Args[1], cmd.Args[2:]); err != nil {
@@ -747,6 +753,13 @@ func (r *RedisServer) incr(conn redcon.Conn, cmd redcon.Command) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
+	if r.runStandaloneDedup(conn, cmd) {
+		return
+	}
+	r.incrLegacy(conn, cmd)
+}
+
+func (r *RedisServer) incrLegacy(conn redcon.Conn, cmd redcon.Command) {
 	ctx, cancel := context.WithTimeout(context.Background(), redisDispatchTimeout)
 	defer cancel()
 	var current int64

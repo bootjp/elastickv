@@ -24,6 +24,9 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdDel:     (*txnContext).applyDel,
 	cmdGet:     (*txnContext).applyGet,
 	cmdExists:  (*txnContext).applyExists,
+	cmdIncr:    (*txnContext).applyIncr,
+	cmdHSet:    (*txnContext).applyHSet,
+	cmdHMSet:   (*txnContext).applyHSet,
 	cmdRPush:   (*txnContext).applyRPush,
 	cmdLRange:  (*txnContext).applyLRange,
 	cmdZIncrBy: (*txnContext).applyZIncrBy,
@@ -90,6 +93,12 @@ type txnValue struct {
 	loaded  bool
 }
 
+type stringReplacement struct {
+	key   []byte
+	value []byte
+	ttl   *time.Time
+}
+
 type txnContext struct {
 	server *RedisServer
 	// ctx is the per-EXEC dispatch context (redisDispatchTimeout-bounded
@@ -97,12 +106,17 @@ type txnContext struct {
 	// inside the EXEC such as load() → readValueAt() respect the
 	// caller's deadline rather than falling back to handlerContext +
 	// the verifyLeaderEngineCtx safety net.
-	ctx        context.Context //nolint:containedctx // EXEC is a long-lived value type that wraps a single client command, ctx must travel with it.
-	working    map[string]*txnValue
-	listStates map[string]*listTxnState
-	zsetStates map[string]*zsetTxnState
-	ttlStates  map[string]*ttlTxnState
-	readKeys   map[string][]byte
+	ctx         context.Context //nolint:containedctx // EXEC is a long-lived value type that wraps a single client command, ctx must travel with it.
+	working     map[string]*txnValue
+	replacers   map[string]*stringReplacement
+	listStates  map[string]*listTxnState
+	hashStates  map[string]*hashTxnState
+	zsetStates  map[string]*zsetTxnState
+	ttlStates   map[string]*ttlTxnState
+	readKeys    map[string][]byte
+	deletedKeys map[string]struct{}
+	hashDeletes map[string][]byte
+	setDeletes  map[string][]byte
 	// streamDeletions tracks user keys whose stream wide-column layout must
 	// be tombstoned on commit: the !stream|meta|<key> record plus every
 	// !stream|entry|<key><ID> row. stageKeyDeletion seeds this (MULTI/EXEC
@@ -120,6 +134,14 @@ type listTxnState struct {
 	purge          bool
 	purgeMeta      store.ListMeta
 	existingDeltas [][]byte // delta key bytes present at load time; deleted on purge/delete
+}
+
+type hashTxnState struct {
+	fields     map[string][]byte
+	origFields map[string][]byte
+	legacy     bool
+	deleted    bool
+	dirty      bool
 }
 
 type zsetTxnState struct {
@@ -279,6 +301,56 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	return st, nil
 }
 
+func (t *txnContext) loadHashState(key []byte) (*hashTxnState, error) {
+	k := string(key)
+	if t.hashStates == nil {
+		t.hashStates = map[string]*hashTxnState{}
+	}
+	if st, ok := t.hashStates[k]; ok {
+		if st.deleted {
+			st.fields = map[string][]byte{}
+			st.origFields = map[string][]byte{}
+			st.legacy = false
+			st.deleted = false
+			st.dirty = true
+		}
+		return st, nil
+	}
+	if _, deleted := t.deletedKeys[k]; deleted {
+		st := &hashTxnState{
+			fields:     map[string][]byte{},
+			origFields: map[string][]byte{},
+			dirty:      true,
+		}
+		t.hashStates[k] = st
+		return st, nil
+	}
+
+	ctx := t.ctxOrBackground()
+	value, err := t.server.loadHashAt(ctx, key, t.startTS)
+	if err != nil {
+		return nil, err
+	}
+	fields := make(map[string][]byte, len(value))
+	origFields := make(map[string][]byte, len(value))
+	for field, value := range value {
+		raw := []byte(value)
+		fields[field] = bytes.Clone(raw)
+		origFields[field] = bytes.Clone(raw)
+	}
+	legacy, err := t.server.store.ExistsAt(ctx, redisHashKey(key), t.startTS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	st := &hashTxnState{
+		fields:     fields,
+		origFields: origFields,
+		legacy:     legacy,
+	}
+	t.hashStates[k] = st
+	return st, nil
+}
+
 func (t *txnContext) listLength(st *listTxnState) int64 {
 	return st.meta.Len + int64(len(st.appends))
 }
@@ -354,6 +426,12 @@ func (t *txnContext) loadTTLState(key []byte) (*ttlTxnState, error) {
 
 func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 	k := string(key)
+	if _, ok := t.replacers[k]; ok {
+		return redisTypeString, nil
+	}
+	if typ, ok := t.stagedHashType(k); ok {
+		return typ, nil
+	}
 	if typ, ok := t.stagedZSetType(k); ok {
 		return typ, nil
 	}
@@ -363,8 +441,25 @@ func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 	if typ, ok := t.stagedStringType(k); ok {
 		return typ, nil
 	}
+	if _, ok := t.deletedKeys[k]; ok {
+		return redisTypeNone, nil
+	}
 	t.trackTypeReadKeys(key)
 	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
+}
+
+func (t *txnContext) stagedHashType(key string) (redisValueType, bool) {
+	st, ok := t.hashStates[key]
+	if !ok {
+		return redisTypeNone, false
+	}
+	if st.deleted {
+		return redisTypeNone, true
+	}
+	if len(st.fields) == 0 {
+		return redisTypeNone, true
+	}
+	return redisTypeHash, true
 }
 
 func (t *txnContext) stagedZSetType(key string) (redisValueType, bool) {
@@ -420,77 +515,44 @@ func (t *txnContext) applyExpireMilliseconds(cmd redcon.Command) (redisResult, e
 }
 
 func (t *txnContext) applySet(cmd redcon.Command) (redisResult, error) {
-	if isList, err := t.server.isListKeyAt(t.ctxOrBackground(), cmd.Args[1], t.startTS); err != nil {
-		return redisResult{}, err
-	} else if isList {
-		return redisResult{typ: resultError, err: errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")}, nil
-	}
-
 	opts, err := parseRedisSetOptions(cmd.Args[3:], time.Now())
+	if err != nil {
+		return redisResult{}, err
+	}
+	typ, err := t.stagedKeyType(cmd.Args[1])
 	if err != nil {
 		return redisResult{}, err
 	}
 
 	// NX/XX: skip the write if the key-existence condition is not met.
-	blocked, res, err := t.applySetCondition(cmd.Args[1], opts)
+	exists := typ != redisTypeNone
+	if !opts.allows(exists) {
+		return redisResult{typ: resultNil}, nil
+	}
+	if opts.returnOld && exists && typ != redisTypeString {
+		return redisResult{typ: resultError, err: wrongTypeError()}, nil
+	}
+
+	oldValue, err := t.oldStringValueForSet(cmd.Args[1], opts.returnOld, typ)
 	if err != nil {
 		return redisResult{}, err
 	}
-	if blocked {
-		return res, nil
-	}
-
-	tv, err := t.load(cmd.Args[1])
-	if err != nil {
-		return redisResult{}, err
-	}
-
-	var oldValue []byte
-	if opts.returnOld && !tv.deleted {
-		oldValue = tv.raw
-	}
-
-	tv.raw = cmd.Args[2]
-	tv.deleted = false
-	tv.dirty = true
-
-	// Always update TTL state: EX/PX sets a new expiry; a plain SET clears it
-	// (opts.ttl == nil → nil stored → PERSIST semantics, matching Redis behaviour).
-	if err := t.applySetTTL(cmd.Args[1], opts.ttl); err != nil {
-		return redisResult{}, err
-	}
-
+	t.stageStringReplacement(cmd.Args[1], cmd.Args[2], opts.ttl)
 	return applySetResult(opts, oldValue), nil
 }
 
-// applySetCondition checks NX/XX conditions.  Returns (blocked, result, err).
-// blocked=true means the condition prevented the write; callers should return result.
-// Returns (false, _, nil) immediately when no condition is set.
-func (t *txnContext) applySetCondition(key []byte, opts redisSetOptions) (bool, redisResult, error) {
-	if !opts.existsCond && !opts.missingCond {
-		return false, redisResult{}, nil
+func (t *txnContext) oldStringValueForSet(key []byte, returnOld bool, typ redisValueType) ([]byte, error) {
+	if !returnOld || typ != redisTypeString {
+		return nil, nil
 	}
-	typ, err := t.stagedKeyType(key)
+	raw, _, ok, err := t.currentStringValue(key)
 	if err != nil {
-		return false, redisResult{}, err
+		return nil, err
 	}
-	exists := typ != redisTypeNone
-	if (opts.missingCond && exists) || (opts.existsCond && !exists) {
-		return true, redisResult{typ: resultNil}, nil
+	if !ok {
+		return nil, nil
 	}
-	return false, redisResult{}, nil
-}
-
-// applySetTTL stores the expiry in ttlStates so flushTTLToBuffer sends it to
-// the TTLBuffer after a successful commit.
-func (t *txnContext) applySetTTL(key []byte, expireAt *time.Time) error {
-	ttlSt, err := t.loadTTLState(key)
-	if err != nil {
-		return err
-	}
-	ttlSt.value = expireAt
-	ttlSt.dirty = true
-	return nil
+	return raw, nil
 }
 
 // applySetResult returns the appropriate redisResult for a completed SET.
@@ -502,6 +564,122 @@ func applySetResult(opts redisSetOptions, oldValue []byte) redisResult {
 		return redisResult{typ: resultNil}
 	}
 	return redisResult{typ: resultBulk, bulk: oldValue}
+}
+
+func cloneTimePtr(in *time.Time) *time.Time {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func (t *txnContext) stageStringReplacement(key, value []byte, ttl *time.Time) {
+	if t.replacers == nil {
+		t.replacers = map[string]*stringReplacement{}
+	}
+	k := string(key)
+	t.replacers[k] = &stringReplacement{
+		key:   bytes.Clone(key),
+		value: bytes.Clone(value),
+		ttl:   cloneTimePtr(ttl),
+	}
+	delete(t.deletedKeys, k)
+}
+
+func (t *txnContext) currentStringValue(key []byte) ([]byte, *time.Time, bool, error) {
+	if repl, ok := t.replacers[string(key)]; ok {
+		return bytes.Clone(repl.value), cloneTimePtr(repl.ttl), true, nil
+	}
+	tv, err := t.load(key)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if tv.deleted || tv.raw == nil {
+		return nil, nil, false, nil
+	}
+	return bytes.Clone(tv.raw), cloneTimePtr(tv.ttl), true, nil
+}
+
+func (t *txnContext) stageStringValue(key, value []byte, ttl *time.Time) error {
+	if repl, ok := t.replacers[string(key)]; ok {
+		repl.value = bytes.Clone(value)
+		repl.ttl = cloneTimePtr(ttl)
+		return nil
+	}
+	tv, err := t.load(key)
+	if err != nil {
+		return err
+	}
+	tv.raw = bytes.Clone(value)
+	tv.ttl = cloneTimePtr(ttl)
+	tv.deleted = false
+	tv.dirty = true
+	delete(t.deletedKeys, string(key))
+	return nil
+}
+
+func (t *txnContext) applyIncr(cmd redcon.Command) (redisResult, error) {
+	typ, err := t.stagedKeyType(cmd.Args[1])
+	if err != nil {
+		return redisResult{}, err
+	}
+	if typ != redisTypeNone && typ != redisTypeString {
+		return redisResult{typ: resultError, err: wrongTypeError()}, nil
+	}
+
+	var current int64
+	var ttl *time.Time
+	if typ == redisTypeString {
+		raw, existingTTL, ok, err := t.currentStringValue(cmd.Args[1])
+		if err != nil {
+			return redisResult{}, err
+		}
+		ttl = existingTTL
+		if ok {
+			current, err = strconv.ParseInt(string(raw), 10, 64)
+			if err != nil {
+				return redisResult{}, errors.New("ERR value is not an integer or out of range")
+			}
+		}
+	}
+	current++
+	if err := t.stageStringValue(cmd.Args[1], []byte(strconv.FormatInt(current, 10)), ttl); err != nil {
+		return redisResult{}, err
+	}
+	return redisResult{typ: resultInt, integer: current}, nil
+}
+
+func (t *txnContext) applyHSet(cmd redcon.Command) (redisResult, error) {
+	if len(cmd.Args[2:]) == 0 || len(cmd.Args[2:])%redisPairWidth != 0 {
+		return redisResult{}, errors.New("ERR wrong number of arguments for hash command")
+	}
+	typ, err := t.stagedKeyType(cmd.Args[1])
+	if err != nil {
+		return redisResult{}, err
+	}
+	if typ != redisTypeNone && typ != redisTypeHash {
+		return redisResult{typ: resultError, err: wrongTypeError()}, nil
+	}
+	st, err := t.loadHashState(cmd.Args[1])
+	if err != nil {
+		return redisResult{}, err
+	}
+	added := int64(0)
+	for i := 2; i < len(cmd.Args); i += redisPairWidth {
+		field := string(cmd.Args[i])
+		if _, exists := st.fields[field]; !exists {
+			added++
+		}
+		st.fields[field] = bytes.Clone(cmd.Args[i+1])
+	}
+	st.deleted = false
+	st.dirty = true
+	delete(t.deletedKeys, string(cmd.Args[1]))
+	if strings.EqualFold(string(cmd.Args[0]), cmdHMSet) {
+		return redisResult{typ: resultString, str: "OK"}, nil
+	}
+	return redisResult{typ: resultInt, integer: added}, nil
 }
 
 func (t *txnContext) applyDel(cmd redcon.Command) (redisResult, error) {
@@ -689,23 +867,57 @@ func (t *txnContext) markStringDirty(key []byte) (redisResult, error) {
 }
 
 func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
+	k := string(key)
+	t.markLogicalDeletion(key, k)
+	if err := t.stageCollectionStateDeletion(key); err != nil {
+		return redisResult{}, err
+	}
+	if err := t.stageLegacyInternalDeletion(key); err != nil {
+		return redisResult{}, err
+	}
+	t.stageStreamWideDeletion(key, k)
+	t.stageBareStringDeletion(key, k)
+	return redisResult{typ: resultInt, integer: 1}, nil
+}
+
+func (t *txnContext) markLogicalDeletion(key []byte, k string) {
+	if t.deletedKeys == nil {
+		t.deletedKeys = map[string]struct{}{}
+	}
+	t.deletedKeys[k] = struct{}{}
+	delete(t.replacers, k)
+	if t.hashDeletes == nil {
+		t.hashDeletes = map[string][]byte{}
+	}
+	if t.setDeletes == nil {
+		t.setDeletes = map[string][]byte{}
+	}
+	t.hashDeletes[k] = bytes.Clone(key)
+	t.setDeletes[k] = bytes.Clone(key)
+	if st, ok := t.hashStates[k]; ok {
+		st.deleted = true
+		st.dirty = false
+	}
+}
+
+func (t *txnContext) stageCollectionStateDeletion(key []byte) error {
 	// Mark the list for deletion.
 	st, err := t.loadListState(key)
 	if err != nil {
-		return redisResult{}, err
+		return err
 	}
 	stageListDelete(st)
 	// Mark the string/main value for deletion.
 	tv, err := t.load(key)
 	if err != nil {
-		return redisResult{}, err
+		return err
 	}
 	tv.deleted = true
 	tv.dirty = true
 	// Mark TTL for deletion.
 	ttlState, err := t.loadTTLState(key)
 	if err != nil {
-		return redisResult{}, err
+		return err
 	}
 	ttlState.value = nil
 	ttlState.dirty = true
@@ -713,11 +925,15 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 	// writes (e.g. ZINCRBY) in the same transaction can safely insert.
 	zs, err := t.loadZSetState(key)
 	if err != nil {
-		return redisResult{}, err
+		return err
 	}
 	zs.members = map[string]float64{}
 	zs.exists = false
 	zs.dirty = true
+	return nil
+}
+
+func (t *txnContext) stageLegacyInternalDeletion(key []byte) error {
 	// Mark hash, set, stream (legacy blob), and HLL internal keys for deletion.
 	for _, internalKey := range [][]byte{
 		redisHashKey(key),
@@ -727,11 +943,15 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 	} {
 		iv, err := t.load(internalKey)
 		if err != nil {
-			return redisResult{}, err
+			return err
 		}
 		iv.deleted = true
 		iv.dirty = true
 	}
+	return nil
+}
+
+func (t *txnContext) stageStreamWideDeletion(key []byte, k string) {
 	// Stage the wide-column stream cleanup: the !stream|meta| record and
 	// every !stream|entry| row must also be tombstoned when the user deletes
 	// a migrated stream via MULTI/EXEC DEL or EXPIRE 0. Without this step
@@ -743,19 +963,20 @@ func (t *txnContext) stageKeyDeletion(key []byte) (redisResult, error) {
 	if t.streamDeletions == nil {
 		t.streamDeletions = map[string][]byte{}
 	}
-	t.streamDeletions[string(key)] = bytes.Clone(key)
+	t.streamDeletions[k] = bytes.Clone(key)
 	t.trackReadKey(store.StreamMetaKey(key))
+}
+
+func (t *txnContext) stageBareStringDeletion(key []byte, k string) {
 	// Mark legacy bare string key for deletion. We bypass load() here
 	// because load() auto-prefixes bare keys to !redis|str|.
 	// Track the bare key in the read set for conflict detection.
 	t.trackReadKey(key)
-	bareK := string(key)
-	if _, ok := t.working[bareK]; !ok {
-		t.working[bareK] = &txnValue{}
+	if _, ok := t.working[k]; !ok {
+		t.working[k] = &txnValue{}
 	}
-	t.working[bareK].deleted = true
-	t.working[bareK].dirty = true
-	return redisResult{typ: resultInt, integer: 1}, nil
+	t.working[k].deleted = true
+	t.working[k].dirty = true
 }
 
 func parseRangeBounds(startRaw, endRaw []byte, total int) (int, int, error) {
@@ -835,23 +1056,12 @@ type preparedTxnDispatch struct {
 // a prepared value with empty `elems` and a no-op cancel — callers can
 // check len(prepared.elems)==0 and skip the dispatch.
 func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
-	elems := t.buildKeyElems()
-
 	// Pre-allocate commitTS so Delta keys can embed it in their bytes before
 	// the coordinator assigns it during Dispatch.
 	commitTS, err := t.server.coordinator.Clock().NextFenced()
 	if err != nil {
 		return preparedTxnDispatch{cancel: func() {}}, errors.Wrap(err, "redis txn commit: allocate commitTS")
 	}
-	listElems := t.buildListElems(commitTS)
-	zsetElems, err := t.buildZSetElems(commitTS)
-	if err != nil {
-		return preparedTxnDispatch{cancel: func() {}}, err
-	}
-	// TTL elements: string keys have TTL embedded in value (buildKeyElems handles that),
-	// non-string keys get a !redis|ttl| element written in the same transaction.
-	ttlElems := t.buildTTLElems()
-
 	// Derive a single redisDispatchTimeout-bounded context covering both
 	// the stream-deletion scans (paginated ScanAt/ExistsAt over
 	// StreamEntryScanPrefix) and the final Dispatch. The parent is the
@@ -868,6 +1078,37 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, redisDispatchTimeout)
 
+	replacementElems, err := t.buildReplacementElems(ctx)
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	hashDeleteElems, err := t.buildHashDeletionElems(ctx)
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	setDeleteElems, err := t.buildSetDeletionElems(ctx)
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(replacementElems)+len(hashDeleteElems)+len(setDeleteElems))
+	elems = append(elems, replacementElems...)
+	elems = append(elems, hashDeleteElems...)
+	elems = append(elems, setDeleteElems...)
+	elems = append(elems, t.buildKeyElems()...)
+	listElems := t.buildListElems(commitTS)
+	zsetElems, err := t.buildZSetElems(commitTS)
+	if err != nil {
+		cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	hashElems := t.buildHashElems(commitTS)
+	// TTL elements: string keys have TTL embedded in value (buildKeyElems handles that),
+	// non-string keys get a !redis|ttl| element written in the same transaction.
+	ttlElems := t.buildTTLElems()
+
 	streamElems, err := t.buildStreamDeletionElems(ctx)
 	if err != nil {
 		cancel()
@@ -876,6 +1117,7 @@ func (t *txnContext) prepareDispatch() (preparedTxnDispatch, error) {
 
 	elems = append(elems, listElems...)
 	elems = append(elems, zsetElems...)
+	elems = append(elems, hashElems...)
 	elems = append(elems, ttlElems...)
 	elems = append(elems, streamElems...)
 
@@ -937,6 +1179,85 @@ func (t *txnContext) stringValueAndTTLElem(userKey []byte, tv *txnValue) ([]byte
 	return value, nil
 }
 
+func (t *txnContext) hasReplacement(key []byte) bool {
+	_, ok := t.replacers[string(key)]
+	return ok
+}
+
+func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	if len(t.replacers) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(t.replacers))
+	for k := range t.replacers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var elems []*kv.Elem[kv.OP]
+	for _, k := range keys {
+		repl := t.replacers[k]
+		deleteElems, _, err := t.server.deleteLogicalKeyElems(ctx, repl.key, t.startTS)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, deleteElems...)
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   redisStrKey(repl.key),
+			Value: encodeRedisStr(repl.value, repl.ttl),
+		})
+		if repl.ttl == nil {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(repl.key)})
+			continue
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(repl.key), Value: encodeRedisTTL(*repl.ttl)})
+	}
+	return elems, nil
+}
+
+func (t *txnContext) buildHashDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	return t.buildWideDeletionElems(ctx, t.hashDeletes,
+		store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix)
+}
+
+func (t *txnContext) buildSetDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
+	return t.buildWideDeletionElems(ctx, t.setDeletes,
+		store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix)
+}
+
+func (t *txnContext) buildWideDeletionElems(
+	ctx context.Context,
+	deletes map[string][]byte,
+	fieldPrefix func([]byte) []byte,
+	metaKey func([]byte) []byte,
+	deltaPrefix func([]byte) []byte,
+) ([]*kv.Elem[kv.OP], error) {
+	if len(deletes) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(deletes))
+	for k := range deletes {
+		if t.hasReplacement([]byte(k)) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var elems []*kv.Elem[kv.OP]
+	for _, k := range keys {
+		key := deletes[k]
+		next, err := t.server.deleteWideColumnElems(ctx, t.startTS,
+			fieldPrefix(key), metaKey(key), deltaPrefix(key))
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, next...)
+	}
+	return elems, nil
+}
+
 func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 	keys := make([]string, 0, len(t.working))
 	for k := range t.working {
@@ -951,29 +1272,44 @@ func (t *txnContext) buildKeyElems() []*kv.Elem[kv.OP] {
 			continue
 		}
 		storageKey := []byte(k)
-		if tv.deleted {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: storageKey})
-			// Deleting a string anchor must also drop any stale !redis|ttl|
-			// scan-index entry; buildTTLElems skips strings because it assumes
-			// the inline-TTL path owns them.
-			if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
-				userKey := storageKey[len(redisStrPrefix):]
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
-			}
+		if t.skipWorkingKeyForReplacement(storageKey) {
 			continue
 		}
-		value := tv.raw
-		if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
-			userKey := storageKey[len(redisStrPrefix):]
-			var extra *kv.Elem[kv.OP]
-			value, extra = t.stringValueAndTTLElem(userKey, tv)
-			if extra != nil {
-				elems = append(elems, extra)
-			}
-		}
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: storageKey, Value: value})
+		elems = t.appendWorkingKeyElems(elems, storageKey, tv)
 	}
 	return elems
+}
+
+func (t *txnContext) skipWorkingKeyForReplacement(storageKey []byte) bool {
+	if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
+		userKey := storageKey[len(redisStrPrefix):]
+		return t.hasReplacement(userKey)
+	}
+	return t.hasReplacement(storageKey)
+}
+
+func (t *txnContext) appendWorkingKeyElems(elems []*kv.Elem[kv.OP], storageKey []byte, tv *txnValue) []*kv.Elem[kv.OP] {
+	if tv.deleted {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: storageKey})
+		// Deleting a string anchor must also drop any stale !redis|ttl|
+		// scan-index entry; buildTTLElems skips strings because it assumes
+		// the inline-TTL path owns them.
+		if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
+			userKey := storageKey[len(redisStrPrefix):]
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisTTLKey(userKey)})
+		}
+		return elems
+	}
+	value := tv.raw
+	if bytes.HasPrefix(storageKey, []byte(redisStrPrefix)) {
+		userKey := storageKey[len(redisStrPrefix):]
+		var extra *kv.Elem[kv.OP]
+		value, extra = t.stringValueAndTTLElem(userKey, tv)
+		if extra != nil {
+			elems = append(elems, extra)
+		}
+	}
+	return append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: storageKey, Value: value})
 }
 
 func listDeleteMeta(st *listTxnState) (store.ListMeta, bool) {
@@ -1004,51 +1340,62 @@ func (t *txnContext) buildListElems(commitTS uint64) []*kv.Elem[kv.OP] {
 	var elems []*kv.Elem[kv.OP]
 	var seqInTxn uint32
 	for _, k := range listKeys {
-		st := t.listStates[k]
-		userKey := []byte(k)
-
-		if st.deleted {
-			if meta, ok := listDeleteMeta(st); ok {
-				elems = appendListDeleteOps(elems, userKey, meta)
-			}
-			// Delete existing delta keys so they don't survive the logical delete.
-			for _, dk := range st.existingDeltas {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-			}
-			continue
+		var emitted bool
+		elems, emitted = t.appendListStateElems(elems, []byte(k), t.listStates[k], commitTS, seqInTxn)
+		if emitted {
+			seqInTxn++
 		}
-		if len(st.appends) == 0 {
-			continue
-		}
-		if st.purge {
-			elems = appendListDeleteOps(elems, userKey, st.purgeMeta)
-			// Delete existing delta keys so they don't accumulate after DEL+RPUSH.
-			for _, dk := range st.existingDeltas {
-				elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
-			}
-		}
-
-		startSeq := st.meta.Head + st.meta.Len
-		for i, v := range st.appends {
-			elems = append(elems, &kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   listItemKey(userKey, startSeq+int64(i)),
-				Value: v,
-			})
-		}
-
-		// Emit a Delta key instead of updating the base metadata key.
-		// Each list key in this transaction gets a unique seqInTxn.
-		n := int64(len(st.appends))
-		deltaVal := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: n})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.ListMetaDeltaKey(userKey, commitTS, seqInTxn),
-			Value: deltaVal,
-		})
-		seqInTxn++
 	}
 	return elems
+}
+
+func (t *txnContext) appendListStateElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnState, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], bool) {
+	if t.hasReplacement(userKey) {
+		return elems, false
+	}
+	if st.deleted {
+		return appendListDeletionElems(elems, userKey, st), false
+	}
+	if len(st.appends) == 0 {
+		return elems, false
+	}
+	if st.purge {
+		elems = appendListDeletionElems(elems, userKey, st)
+	}
+	elems = appendListAppendElems(elems, userKey, st)
+	return appendListDeltaElem(elems, userKey, st, commitTS, seqInTxn), true
+}
+
+func appendListDeletionElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnState) []*kv.Elem[kv.OP] {
+	if meta, ok := listDeleteMeta(st); ok {
+		elems = appendListDeleteOps(elems, userKey, meta)
+	}
+	// Delete existing delta keys so they do not survive logical delete/purge.
+	for _, dk := range st.existingDeltas {
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
+	}
+	return elems
+}
+
+func appendListAppendElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnState) []*kv.Elem[kv.OP] {
+	startSeq := st.meta.Head + st.meta.Len
+	for i, v := range st.appends {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   listItemKey(userKey, startSeq+int64(i)),
+			Value: v,
+		})
+	}
+	return elems
+}
+
+func appendListDeltaElem(elems []*kv.Elem[kv.OP], userKey []byte, st *listTxnState, commitTS uint64, seqInTxn uint32) []*kv.Elem[kv.OP] {
+	deltaVal := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: int64(len(st.appends))})
+	return append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.ListMetaDeltaKey(userKey, commitTS, seqInTxn),
+		Value: deltaVal,
+	})
 }
 
 func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) {
@@ -1062,6 +1409,9 @@ func (t *txnContext) buildZSetElems(commitTS uint64) ([]*kv.Elem[kv.OP], error) 
 	seqInTxn := uint32(0)
 	for _, k := range keys {
 		st := t.zsetStates[k]
+		if t.hasReplacement([]byte(k)) {
+			continue
+		}
 		if !st.dirty {
 			continue
 		}
@@ -1130,6 +1480,100 @@ func buildZSetWideElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], int64)
 	return elems, lenDelta
 }
 
+func (t *txnContext) buildHashElems(commitTS uint64) []*kv.Elem[kv.OP] {
+	keys := make([]string, 0, len(t.hashStates))
+	for k := range t.hashStates {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var elems []*kv.Elem[kv.OP]
+	var seqInTxn uint32
+	for _, k := range keys {
+		var emitted bool
+		elems, emitted = t.appendHashStateElems(elems, []byte(k), t.hashStates[k], commitTS, seqInTxn)
+		if emitted {
+			seqInTxn++
+		}
+	}
+	return elems
+}
+
+func (t *txnContext) appendHashStateElems(elems []*kv.Elem[kv.OP], key []byte, st *hashTxnState, commitTS uint64, seqInTxn uint32) ([]*kv.Elem[kv.OP], bool) {
+	if !st.dirty || st.deleted || t.hasReplacement(key) {
+		return elems, false
+	}
+	if st.legacy {
+		return append(elems, buildHashLegacyRewriteElems(key, st.fields)...), false
+	}
+	next, newFields := appendHashChangedFieldElems(elems, key, st)
+	if newFields == 0 {
+		return next, false
+	}
+	return appendHashDeltaElem(next, key, newFields, commitTS, seqInTxn), true
+}
+
+func appendHashChangedFieldElems(elems []*kv.Elem[kv.OP], key []byte, st *hashTxnState) ([]*kv.Elem[kv.OP], int64) {
+	var newFields int64
+	for _, field := range sortedHashFieldNames(st.fields) {
+		value := st.fields[field]
+		old, existed := st.origFields[field]
+		if existed && bytes.Equal(old, value) {
+			continue
+		}
+		if !existed {
+			newFields++
+		}
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashFieldKey(key, []byte(field)),
+			Value: bytes.Clone(value),
+		})
+	}
+	return elems, newFields
+}
+
+func appendHashDeltaElem(elems []*kv.Elem[kv.OP], key []byte, newFields int64, commitTS uint64, seqInTxn uint32) []*kv.Elem[kv.OP] {
+	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: newFields})
+	return append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.HashMetaDeltaKey(key, commitTS, seqInTxn),
+		Value: deltaVal,
+	})
+}
+
+const hashLegacyRewriteOverhead = 2
+
+func buildHashLegacyRewriteElems(key []byte, fields map[string][]byte) []*kv.Elem[kv.OP] {
+	fieldNames := sortedHashFieldNames(fields)
+	elems := make([]*kv.Elem[kv.OP], 0, len(fieldNames)+hashLegacyRewriteOverhead)
+	for _, field := range fieldNames {
+		elems = append(elems, &kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashFieldKey(key, []byte(field)),
+			Value: bytes.Clone(fields[field]),
+		})
+	}
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)},
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaKey(key),
+			Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(fieldNames))}),
+		},
+	)
+	return elems
+}
+
+func sortedHashFieldNames(fields map[string][]byte) []string {
+	names := make([]string, 0, len(fields))
+	for field := range fields {
+		names = append(names, field)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // buildStreamDeletionElems expands every user key queued in streamDeletions
 // into the Del operations that actually tombstone a migrated stream:
 // !stream|meta|<key> and every !stream|entry|<key><ID> row. Called from
@@ -1171,6 +1615,9 @@ func (t *txnContext) buildTTLElems() []*kv.Elem[kv.OP] {
 		if !st.dirty {
 			continue
 		}
+		if t.hasReplacement([]byte(k)) {
+			continue
+		}
 		// String keys encode TTL inside the value in buildKeyElems; skip them here.
 		if _, isString := t.working[string(redisStrKey([]byte(k)))]; isString {
 			continue
@@ -1202,10 +1649,15 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 			server:          r,
 			ctx:             dispatchCtx,
 			working:         map[string]*txnValue{},
+			replacers:       map[string]*stringReplacement{},
 			listStates:      map[string]*listTxnState{},
+			hashStates:      map[string]*hashTxnState{},
 			zsetStates:      map[string]*zsetTxnState{},
 			ttlStates:       map[string]*ttlTxnState{},
 			readKeys:        map[string][]byte{},
+			deletedKeys:     map[string]struct{}{},
+			hashDeletes:     map[string][]byte{},
+			setDeletes:      map[string][]byte{},
 			streamDeletions: map[string][]byte{},
 			startTS:         startTS,
 		}
@@ -1403,10 +1855,15 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 		server:          r,
 		ctx:             dispatchCtx,
 		working:         map[string]*txnValue{},
+		replacers:       map[string]*stringReplacement{},
 		listStates:      map[string]*listTxnState{},
+		hashStates:      map[string]*hashTxnState{},
 		zsetStates:      map[string]*zsetTxnState{},
 		ttlStates:       map[string]*ttlTxnState{},
 		readKeys:        map[string][]byte{},
+		deletedKeys:     map[string]struct{}{},
+		hashDeletes:     map[string][]byte{},
+		setDeletes:      map[string][]byte{},
 		streamDeletions: map[string][]byte{},
 		startTS:         startTS,
 	}
