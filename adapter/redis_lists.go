@@ -124,6 +124,7 @@ func (r *RedisServer) listPushCore(ctx context.Context, key []byte, values [][]b
 			IsTxn:    true,
 			StartTS:  normalizeStartTS(readTS),
 			CommitTS: commitTS,
+			ReadKeys: listPushBoundaryReadKeys(key, meta),
 			Elems:    ops,
 		})
 		if dispErr != nil {
@@ -309,21 +310,25 @@ func firstWriteKey(ops []*kv.Elem[kv.OP]) []byte {
 	return nil
 }
 
-// listPushBoundaryReadKeys returns the boundary positions of the list as
-// read keys for OCC. Including these in the dispatched OperationGroup makes
+// listPushBoundaryReadKeys returns the collection fence plus the boundary
+// positions of the list as read keys for OCC. Including these in the
+// dispatched OperationGroup makes
 // FSM apply atomically reject the retry when any pop/trim has touched the
 // boundary between attempts (codex P1 fix: prevents a reused seq from
-// landing past a shrunk Tail). The keys are deduped: a single-element list
-// has Head == Tail-1, so we emit it once.
+// landing past a shrunk Tail). The wide fence also catches SET/DEL
+// replacements that commit before this append. The keys are deduped: a
+// single-element list has Head == Tail-1, so we emit it once.
 func listPushBoundaryReadKeys(key []byte, meta store.ListMeta) [][]byte {
+	fence := redisTxnWideListFenceKey(key)
 	if meta.Len <= 0 {
-		return nil
+		return [][]byte{fence}
 	}
 	tailIdx := meta.Tail - 1
 	if tailIdx == meta.Head {
-		return [][]byte{listItemKey(key, meta.Head)}
+		return [][]byte{fence, listItemKey(key, meta.Head)}
 	}
 	return [][]byte{
+		fence,
 		listItemKey(key, meta.Head),
 		listItemKey(key, tailIdx),
 	}

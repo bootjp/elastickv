@@ -301,6 +301,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			IsTxn:    true,
 			StartTS:  normalizeStartTS(readTS),
 			CommitTS: commitTS,
+			ReadKeys: [][]byte{redisTxnWideSetFenceKey(key)},
 			Elems:    elems,
 		})
 		return cockerrors.WithStack(dispatchErr)
@@ -315,9 +316,7 @@ func appendSetDeltaElems(elems []*kv.Elem[kv.OP], key []byte, lenDelta int64, co
 	if lenDelta == 0 {
 		return elems
 	}
-	if lenDelta > 0 {
-		elems = append(elems, redisTxnWideSetFenceElem(key))
-	}
+	elems = append(elems, redisTxnWideSetFenceElem(key))
 	deltaVal := store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: lenDelta})
 	return append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,

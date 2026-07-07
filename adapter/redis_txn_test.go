@@ -39,6 +39,15 @@ func newRedisTxnTestContext(server *RedisServer) *txnContext {
 	}
 }
 
+func elemKeysContain(elems []*kv.Elem[kv.OP], want []byte) bool {
+	for _, elem := range elems {
+		if elem != nil && string(elem.Key) == string(want) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict verifies that a
 // concurrent RPUSH to a list triggers an OCC read-write conflict for a MULTI
 // transaction that read the list via LRANGE.  Without the boundary key tracking
@@ -252,6 +261,37 @@ func TestRedisTxnWideFenceKeysUseRedisRoutePrefix(t *testing.T) {
 	require.Equal(t, key, redisTxnWideFenceUserKey(redisTxnWideSetFenceKey(key)))
 	require.Equal(t, []byte("!redis|txn-wide-list|user:key"), redisTxnWideListFenceKey(key))
 	require.Equal(t, key, redisTxnWideFenceUserKey(redisTxnWideListFenceKey(key)))
+	require.Equal(t, []byte("!redis|txn-wide-zset|user:key"), redisTxnWideZSetFenceKey(key))
+	require.Equal(t, key, redisTxnWideFenceUserKey(redisTxnWideZSetFenceKey(key)))
+	require.Len(t, redisTxnWideCollectionFenceKeys(key), 4)
+}
+
+func TestRedisTxnBuildZSetWideElemsWritesFence(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("zset:wide-fence")
+	elems, lenDelta := buildZSetWideElems(key, &zsetTxnState{
+		members:     map[string]float64{"new": 1},
+		origMembers: map[string]float64{},
+		isWide:      true,
+		exists:      true,
+		dirty:       true,
+	})
+
+	require.Equal(t, int64(1), lenDelta)
+	require.True(t, elemKeysContain(elems, redisTxnWideZSetFenceKey(key)),
+		"wide zset writers must update the replacement/delete fence")
+}
+
+func TestLuaWideFenceReadKeysForPlan(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("lua:fence")
+	require.Equal(t, redisTxnWideCollectionFenceKeys(key),
+		luaWideFenceReadKeysForPlan(key, redisTypeString, false))
+	require.Equal(t, [][]byte{redisTxnWideZSetFenceKey(key)},
+		luaWideFenceReadKeysForPlan(key, redisTypeZSet, true))
+	require.Nil(t, luaWideFenceReadKeysForPlan(key, redisTypeString, true))
 }
 
 func TestRedisTxnSetReplacementConflictsWithConcurrentWideHashWrite(t *testing.T) {

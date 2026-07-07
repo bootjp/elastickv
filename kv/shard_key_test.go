@@ -37,6 +37,7 @@ func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
 		[]byte("!redis|txn-wide-hash|user:key"),
 		[]byte("!redis|txn-wide-set|user:key"),
 		[]byte("!redis|txn-wide-list|user:key"),
+		[]byte("!redis|txn-wide-zset|user:key"),
 	} {
 		require.Equal(t, userKey, routeKey(raw))
 	}

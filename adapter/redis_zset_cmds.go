@@ -638,6 +638,7 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		return 0, nil
 	}
 
+	elems = append(elems, redisTxnWideZSetFenceElem(key))
 	if lenDelta != 0 {
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: lenDelta})
 		elems = append(elems, &kv.Elem[kv.OP]{
@@ -668,6 +669,7 @@ func (r *RedisServer) dispatchAndSignalZSet(
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
+		ReadKeys: [][]byte{redisTxnWideZSetFenceKey(zsetKey)},
 		Elems:    elems,
 	})
 	if err != nil {
@@ -716,6 +718,7 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 	elems = append(elems,
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: memberKey, Value: store.MarshalZSetScore(newScore)},
 		&kv.Elem[kv.OP]{Op: kv.Put, Key: store.ZSetScoreKey(key, newScore, []byte(member)), Value: []byte{}},
+		redisTxnWideZSetFenceElem(key),
 	)
 	if !memberExists {
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1})
@@ -847,6 +850,7 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 				IsTxn:    true,
 				StartTS:  normalizeStartTS(readTS),
 				CommitTS: commitTS,
+				ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 				Elems:    elems,
 			})
 			return cockerrors.WithStack(dispatchErr)
@@ -898,10 +902,12 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 		Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
 		Value: deltaVal,
 	})
+	elems = append(elems, redisTxnWideZSetFenceElem(key))
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
+		ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 		Elems:    elems,
 	})
 	return cockerrors.WithStack(dispatchErr)
@@ -1132,11 +1138,13 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(popped.Member))},
 			{Op: kv.Del, Key: store.ZSetScoreKey(key, popped.Score, []byte(popped.Member))},
 			{Op: kv.Put, Key: store.ZSetMetaDeltaKey(key, commitTS, 0), Value: deltaVal},
+			redisTxnWideZSetFenceElem(key),
 		}
 		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  normalizeStartTS(readTS),
 			CommitTS: commitTS,
+			ReadKeys: [][]byte{redisTxnWideZSetFenceKey(key)},
 			Elems:    elems,
 		})
 		return cockerrors.WithStack(dispatchErr)

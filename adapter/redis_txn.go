@@ -19,6 +19,7 @@ var redisTxnKeyPrefix = []byte("!txn|")
 var redisTxnWideHashFencePrefix = []byte("!redis|txn-wide-hash|")
 var redisTxnWideSetFencePrefix = []byte("!redis|txn-wide-set|")
 var redisTxnWideListFencePrefix = []byte("!redis|txn-wide-list|")
+var redisTxnWideZSetFencePrefix = []byte("!redis|txn-wide-zset|")
 
 type txnCommandHandler func(*txnContext, redcon.Command) (redisResult, error)
 
@@ -185,11 +186,16 @@ func redisTxnWideListFenceKey(userKey []byte) []byte {
 	return redisTxnWideFenceKey(redisTxnWideListFencePrefix, userKey)
 }
 
+func redisTxnWideZSetFenceKey(userKey []byte) []byte {
+	return redisTxnWideFenceKey(redisTxnWideZSetFencePrefix, userKey)
+}
+
 func redisTxnWideFenceUserKey(key []byte) []byte {
 	for _, prefix := range [][]byte{
 		redisTxnWideHashFencePrefix,
 		redisTxnWideSetFencePrefix,
 		redisTxnWideListFencePrefix,
+		redisTxnWideZSetFencePrefix,
 	} {
 		if bytes.HasPrefix(key, prefix) {
 			return key[len(prefix):]
@@ -215,6 +221,28 @@ func redisTxnWideSetFenceElem(userKey []byte) *kv.Elem[kv.OP] {
 
 func redisTxnWideListFenceElem(userKey []byte) *kv.Elem[kv.OP] {
 	return redisTxnWideFenceElem(redisTxnWideListFenceKey(userKey))
+}
+
+func redisTxnWideZSetFenceElem(userKey []byte) *kv.Elem[kv.OP] {
+	return redisTxnWideFenceElem(redisTxnWideZSetFenceKey(userKey))
+}
+
+func redisTxnWideCollectionFenceKeys(userKey []byte) [][]byte {
+	return [][]byte{
+		redisTxnWideHashFenceKey(userKey),
+		redisTxnWideSetFenceKey(userKey),
+		redisTxnWideListFenceKey(userKey),
+		redisTxnWideZSetFenceKey(userKey),
+	}
+}
+
+func redisTxnWideCollectionFenceElems(userKey []byte) []*kv.Elem[kv.OP] {
+	keys := redisTxnWideCollectionFenceKeys(userKey)
+	elems := make([]*kv.Elem[kv.OP], 0, len(keys))
+	for _, key := range keys {
+		elems = append(elems, redisTxnWideFenceElem(key))
+	}
+	return elems
 }
 
 func redisTxnWideFenceElem(key []byte) *kv.Elem[kv.OP] {
@@ -303,6 +331,7 @@ func (t *txnContext) loadListState(key []byte) (*listTxnState, error) {
 	if st, ok := t.listStates[k]; ok {
 		return st, nil
 	}
+	t.trackReadKey(redisTxnWideListFenceKey(key))
 	ctx := t.ctxOrBackground()
 	meta, exists, err := t.server.resolveListMeta(ctx, key, t.startTS)
 	if err != nil {
@@ -401,6 +430,7 @@ func (t *txnContext) loadExpiredHashAsEmpty(key []byte, keyString string) (*hash
 
 func (t *txnContext) loadExistingHashState(key []byte, keyString string) (*hashTxnState, error) {
 	ctx := t.ctxOrBackground()
+	t.trackReadKey(redisTxnWideHashFenceKey(key))
 	value, err := t.server.loadHashAt(ctx, key, t.startTS)
 	if err != nil {
 		return nil, err
@@ -434,6 +464,7 @@ func (t *txnContext) loadZSetState(key []byte) (*zsetTxnState, error) {
 	if st, ok := t.zsetStates[k]; ok {
 		return st, nil
 	}
+	t.trackReadKey(redisTxnWideZSetFenceKey(key))
 	t.trackReadKey(redisZSetKey(key))
 	// Check TTL: treat expired keys as non-existent.
 	ttlSt, err := t.loadTTLState(key)
@@ -1117,9 +1148,9 @@ func (t *txnContext) markLogicalDeletion(key []byte, k string) {
 }
 
 func (t *txnContext) trackWideCollectionFenceReads(key []byte) {
-	t.trackReadKey(redisTxnWideHashFenceKey(key))
-	t.trackReadKey(redisTxnWideSetFenceKey(key))
-	t.trackReadKey(redisTxnWideListFenceKey(key))
+	for _, fenceKey := range redisTxnWideCollectionFenceKeys(key) {
+		t.trackReadKey(fenceKey)
+	}
 }
 
 func (t *txnContext) stageCollectionStateDeletion(key []byte) error {
@@ -1431,6 +1462,7 @@ func (t *txnContext) buildReplacementElems(ctx context.Context) ([]*kv.Elem[kv.O
 			return nil, err
 		}
 		elems = append(elems, deleteElems...)
+		elems = append(elems, redisTxnWideCollectionFenceElems(repl.key)...)
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
 			Key:   redisStrKey(repl.key),
@@ -1465,6 +1497,7 @@ func (t *txnContext) buildLogicalDeletionElems(ctx context.Context) ([]*kv.Elem[
 			return nil, err
 		}
 		elems = append(elems, next...)
+		elems = append(elems, redisTxnWideCollectionFenceElems(t.logicalDeletes[k])...)
 	}
 	return elems, nil
 }
@@ -1734,6 +1767,9 @@ func buildZSetWideElems(key []byte, st *zsetTxnState) ([]*kv.Elem[kv.OP], int64)
 		if !wasOrig {
 			lenDelta++
 		}
+	}
+	if len(elems) != 0 {
+		elems = append(elems, redisTxnWideZSetFenceElem(key))
 	}
 	return elems, lenDelta
 }
