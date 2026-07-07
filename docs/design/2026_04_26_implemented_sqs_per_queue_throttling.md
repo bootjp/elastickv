@@ -29,7 +29,7 @@ This document describes per-queue token-bucket throttling, configured per-queue 
 3. **AWS-shape errors**: throttled JSON-path requests return HTTP `400` with the `Throttling` error code (`{"__type":"Throttling", ...}`) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code. Query/XML message verbs are not claimed by this lifecycle update until the query dispatcher wires those verbs into the same throttled handlers.
 4. **Default-off**. Queues created before this feature, and queues created without explicit limits, are not throttled. Operators opt in per queue.
 5. **No coordination per request**. Token replenishment is local to whichever node owns the bucket (the leader for the queue's shard); there is no Raft round-trip on the throttling check.
-6. **Observable**: per-queue throttle counters are exposed via the existing Prometheus registry so dashboards can spot throttling before users do.
+6. **Observable at the response boundary**: throttled requests use the AWS-shaped `Throttling` error and `Retry-After` header so clients and request logs expose the limit immediately. Prometheus throttle counters/gauges are a follow-up and are not part of this lifecycle update.
 
 ### 2.2 Non-Goals
 
@@ -218,7 +218,7 @@ The minimum-1 floor matches `Retry-After`'s integer-second granularity (HTTP/1.1
 | `adapter/sqs.go` | After `authorizeSQSRequest`, call `bucketStore.charge(queueName, action, count)`. On reject, write the `Throttling` envelope and return. |
 | `adapter/sqs_throttle_test.go` (new) | Unit tests for bucket math (edge cases: idle drift, burst, partial refill, batch over-charge, default-off). ~300 lines. |
 | `adapter/sqs_throttle_integration_test.go` (new) | End-to-end: configure a queue with low limits, send N messages back-to-back, confirm the (N+1)th gets `Throttling` with `Retry-After`. ~150 lines. |
-| `monitoring/registry.go` | New counter `sqs_throttled_requests_total{queue, action}` and new **gauge** `sqs_throttle_tokens_remaining{queue, action}`. (P2 review finding on PR #664: tokens go up *and* down so a counter is the wrong instrument.) |
+| `monitoring/registry.go` | No throttle-specific Prometheus collector is registered by this lifecycle update. The existing SQS monitoring surface continues to expose partition activity and queue depth; throttle counters/gauges remain future work. |
 | `docs/design/2026_04_24_partial_sqs_compatible_adapter.md` §16.5 | Status update once this lands: TODO → Landed. |
 
 ### 4.2 OCC interaction
@@ -229,9 +229,9 @@ Throttling sits *outside* the OCC transaction — a rejected request never touch
 
 Each queue is owned by exactly one shard (queue-per-shard routing in `kv/shard_router.go`). The leader of that shard owns the bucket. A request that lands on a follower is forwarded by `proxyToLeader` *before* the bucket check, so the bucket is always evaluated by the leader that is also doing the OCC dispatch — no risk of a follower checking against a stale bucket and the leader committing without checking.
 
-Once Phase 3.D (split-queue FIFO) lands, a single queue may span multiple shards. At that point each *partition* gets its own bucket, **keyed by `(queueName, partitionID)`** — not by `MessageGroupId`. `MessageGroupId` is the *input* to `partitionFor`; using it directly as the bucket key would create one bucket per unique group value (unbounded, attacker-amplifiable map size, and hot groups would never share a budget). `partitionID` is bounded by `PartitionCount` so the worst-case bucket count per queue is tiny. The throttle design is forward-compatible: the bucket lookup key changes from `queueName` to `(queueName, partitionID)`, and the `bucketKey` struct in §3.1 grows a `partition uint32` field. Documented in §11. (P1 review finding on PR #664 caught the misnomer.)
+Split-queue FIFO has landed, but the throttle implementation still uses one aggregate bucket per `(queueName, action, incarnation)`. Partitioned queues therefore share the configured `SendCapacity` / `RecvCapacity` / `DefaultCapacity` across the logical queue; the effective queue throughput is the configured capacity, not `PartitionCount` times that value. This matches the current dispatch path: `SendMessage` charges the queue-level bucket after loading queue metadata and before partition-specific routing.
 
-**Budget semantics per partition:** each partition's bucket gets the *full* configured `SendCapacity` / `RecvCapacity` / `DefaultCapacity`. The effective aggregate throughput of an N-partition queue is therefore N × the configured per-partition limit. This is intentional and analogous to how AWS High Throughput FIFO multiplies throughput by partition count; operators sizing the throttle should treat `SendCapacity` as the *per-partition* budget. A shared queue-level budget (divided across partitions) would require cross-shard coordination on every `SendMessage` — an extra Raft round-trip per call, defeating the point of partitioning. If per-queue aggregate throttling is needed after Phase 3.D lands, a new `SendCapacityTotal` attribute could be added that gets divided by `PartitionCount` at config time and stored as the per-partition capacity; that design is out of scope for this proposal.
+Per-partition buckets remain future work. That change must move the charge point to a path that already knows `partitionFor(meta, MessageGroupId)`, extend `bucketKey` with a bounded `partition uint32` field, and audit the send/receive/batch callers so every throttled action uses the same bucket semantics. `MessageGroupId` itself must never be used as the bucket key because it is unbounded and caller-controlled.
 
 ---
 
@@ -284,10 +284,7 @@ Strict-validation SDKs that reject unknown attribute names will reject `Throttle
 
 No new flags. Limits are per-queue, set via `SetQueueAttributes`. Defaults are zero (disabled).
 
-Two new Prometheus instruments (Section 4.1) expose the throttling activity:
-
-- `sqs_throttled_requests_total{queue, action}` — **counter**. Use `rate(...)` per queue in Grafana to spot the noisy tenant.
-- `sqs_throttle_tokens_remaining{queue, action}` — **gauge** (P2 review finding on PR #664: token budgets go up *and* down over time, so a counter would mask the depletion that operators most need to see). Sample directly; trending toward zero is the early warning sign.
+No throttle-specific Prometheus instruments ship in this lifecycle update. Operators can observe throttling through the HTTP `Throttling` response, the `Retry-After` header, and request logs. A follow-up monitoring change should add a per-queue/action throttled-request counter and a token-remaining gauge; the token budget must be a gauge because it goes both up and down over time.
 
 ---
 
@@ -325,7 +322,7 @@ Every `charge` proposes a bucket update through the FSM. **Rejected**: an extra 
 |---|---|
 | 1 | Doc lands (this PR). No code yet. Operators have time to comment. |
 | 2 | Implementation PR per §4.1. Default-off; existing queues unaffected. |
-| 3 | Operators opt in per queue via `SetQueueAttributes`. Monitor `sqs_throttled_requests_total` for false positives. |
+| 3 | Operators opt in per queue via `SetQueueAttributes`. Watch `Throttling` responses and request logs for false positives. |
 | 4 | Once stable, the partial doc's TODO list moves 3.C from TODO to Landed. |
 
 ---
