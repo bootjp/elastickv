@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -318,7 +319,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		s3Addr:      s3Addr,
 		region:      s3DefaultRegion,
 		store:       st,
-		coordinator: coordinate,
+		coordinator: kv.WithKeyVizLabel(coordinate, keyviz.LabelS3),
 		leaderS3:    cloneLeaderAddrMap(leaderS3),
 		cleanupSem:  make(chan struct{}, s3ManifestCleanupWorkers),
 	}

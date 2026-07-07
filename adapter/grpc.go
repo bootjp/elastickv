@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -47,7 +48,7 @@ func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator, opts ...GRP
 			Level: slog.LevelWarn,
 		})),
 		grpcTranscoder: newGrpcGrpcTranscoder(),
-		coordinator:    coordinate,
+		coordinator:    kv.WithKeyVizLabel(coordinate, keyviz.LabelRawKV),
 		store:          store,
 	}
 	for _, opt := range opts {
