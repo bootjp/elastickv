@@ -159,6 +159,10 @@ type RedisServer struct {
 	// WithLuaFastPathObserver so the hot path does not pay for
 	// CounterVec.WithLabelValues on every redis.call().
 	luaFastPathZRange monitoring.LuaFastPathCmd
+	// heavyCommandLimiter bounds CPU-heavy Redis command families so one
+	// expensive path cannot occupy every scheduler P and starve Raft.
+	// nil preserves the historical unbounded path for narrow test fixtures.
+	heavyCommandLimiter *redisHeavyCommandLimiter
 	// baseCtx is the parent context for per-request handlers.
 	// NewRedisServer creates a cancelable context here; Stop() cancels
 	// it so in-flight handlers abort promptly instead of running
@@ -309,6 +313,15 @@ func WithLuaFastPathObserver(observer monitoring.LuaFastPathObserver) RedisServe
 func WithLuaPoolMaxIdle(n int) RedisServerOption {
 	return func(r *RedisServer) {
 		r.luaPoolMaxIdle = n
+	}
+}
+
+// WithRedisHeavyCommandSlots overrides the heavy-command limiter size.
+// n <= 0 disables the limiter. Omit the option to use the environment/default
+// selected by newDefaultRedisHeavyCommandLimiter.
+func WithRedisHeavyCommandSlots(n int) RedisServerOption {
+	return func(r *RedisServer) {
+		r.heavyCommandLimiter = newRedisHeavyCommandLimiter(n)
 	}
 }
 
@@ -488,8 +501,9 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		// WithLuaPoolMaxIdle can influence its sizing. Test fixtures
 		// that bypass NewRedisServer construct the pool lazily via
 		// getLuaPool, which honors luaPoolMaxIdle the same way.
-		luaPool:       nil,
-		traceCommands: os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		luaPool:             nil,
+		traceCommands:       os.Getenv("ELASTICKV_REDIS_TRACE") == "1",
+		heavyCommandLimiter: newDefaultRedisHeavyCommandLimiter(),
 		// onePhaseTxnDedup defaults on — the parent design's R5 rolling-upgrade
 		// constraint is discharged (FSM probe shipped on every node months ago,
 		// 12 consecutive green dedup-mode Jepsen runs 2026-05-31 → 2026-06-10).
@@ -577,6 +591,18 @@ func (r *RedisServer) triggerUrgentCompaction(typeName string, key []byte) {
 }
 
 func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
+	if r.shouldLimitHeavyCommand(name) {
+		if ok := r.heavyCommandLimiter.submit(func() {
+			r.dispatchCommandDirect(conn, name, handler, cmd, start)
+		}); !ok {
+			r.rejectHeavyCommand(conn, name, cmd, start)
+		}
+		return
+	}
+	r.dispatchCommandDirect(conn, name, handler, cmd, start)
+}
+
+func (r *RedisServer) dispatchCommandDirect(conn redcon.Conn, name string, handler func(redcon.Conn, redcon.Command), cmd redcon.Command, start time.Time) {
 	switch {
 	case r.requestObserver != nil:
 		metricsConn, _ := redisMetricsConnPool.Get().(*redisMetricsConn)
@@ -605,6 +631,16 @@ func (r *RedisServer) dispatchCommand(conn redcon.Conn, name string, handler fun
 	default:
 		handler(conn, cmd)
 	}
+}
+
+func (r *RedisServer) shouldLimitHeavyCommand(name string) bool {
+	return r != nil && r.heavyCommandLimiter != nil && isRedisHeavyCommand(name)
+}
+
+func (r *RedisServer) rejectHeavyCommand(conn redcon.Conn, name string, cmd redcon.Command, start time.Time) {
+	r.traceCommandError(conn, name, cmd.Args[1:], "heavy command pool full")
+	conn.WriteError("BUSY server overloaded")
+	r.observeRedisError(name, time.Since(start))
 }
 
 // handlerContext returns the base context for a request handler.

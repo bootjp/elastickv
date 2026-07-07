@@ -1,12 +1,25 @@
 # Workload-class isolation after 2026-04-24 XREAD starvation
 
-> **Status: Proposed**
+> **Status: Partial**
 > Follow-up to the 2026-04-24 incident review and a companion to
 > `docs/design/2026_04_24_proposed_resilience_roadmap.md` (items 5–7).
 > That doc is about keeping memory pressure from building; this doc is
 > about keeping one expensive command path from starving every other
 > path that shares the same Go runtime. Read that first for the items-6
 > admission-control shape; this doc extends and reconciles with it.
+
+Implementation status:
+
+- Shipped: Layer 1's heavy-command concurrency limiter in
+  `adapter/redis_workpool.go`, wired through `RedisServer.dispatchCommand`.
+  It gates the static heavy-command set, returns `BUSY server overloaded` when
+  full, defaults to `2 * GOMAXPROCS`, and is configurable via
+  `ELASTICKV_REDIS_HEAVY_COMMAND_SLOTS` / `WithRedisHeavyCommandSlots`.
+- Shipped: Lua execution derives its timeout from `RedisServer.handlerContext`
+  instead of `context.Background`, preserving request cancellation for the
+  gated `EVAL`/`EVALSHA` path.
+- Remaining: Layer 3 per-peer admission control and Layer 4 stream per-entry
+  layout. Layer 2 locked raft threads remains measurement-gated per §4.
 
 ---
 
@@ -198,11 +211,14 @@ Lua inside the pool will self-deadlock under steady load.
 
 ### Recommended v1 shape
 
-Package-level pool in `adapter/` with a `Submit(command, fn)` entry
-point, sized `2 × runtime.GOMAXPROCS(0)` (env-overridable). Gated
-commands in `dispatchCommand` call `Submit`; ungated stay
-synchronous. Static list lives next to `dispatchCommand`. Pool-full →
-`-BUSY server overloaded`. Lua follows option (A).
+Package-level limiter in `adapter/` with a `submit(fn)` entry point,
+sized `2 × runtime.GOMAXPROCS(0)` (env-overridable). Gated commands in
+`dispatchCommand` call `submit`; ungated commands stay synchronous.
+Static list lives next to `dispatchCommand`. Pool-full →
+`-BUSY server overloaded`. Lua follows option (A). The implementation uses a
+non-queue slot limiter rather than a worker goroutine handoff so redcon reply
+ordering and `Conn` access remain on the request goroutine while still bounding
+concurrent heavy CPU work.
 
 **Container-aware sizing.** Go 1.25+ (which this repo uses) derives
 the default `GOMAXPROCS` from the cgroup v2 CPU quota on Linux

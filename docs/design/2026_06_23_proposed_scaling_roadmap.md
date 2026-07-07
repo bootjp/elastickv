@@ -285,7 +285,7 @@ memory each group's private cache/memtable pins.
   top-N sketch, keyviz `MaxTrackedRoutes` coarsening). Any new per-route /
   per-queue / per-peer metric must carry a cardinality bound; this is a
   cross-cutting operational-scaling rule, not a single design.
-- **workload isolation** — `2026_04_24_proposed_workload_isolation.md` (heavy
+- **workload isolation** — `2026_04_24_partial_workload_isolation.md` (heavy
   command worker pool, optional Raft-thread pinning, per-client admission,
   XREAD O(N)→O(new)), S3 PUT admission control
   (`2026_04_25_proposed_s3_admission_control.md`), SQS per-queue throttling
