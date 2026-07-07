@@ -660,6 +660,68 @@ func TestRedisTxnExistingWideWritersReadReplacementFences(t *testing.T) {
 	}
 }
 
+func TestRedisTxnWideDeletionElemsWriteFences(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	hashKey := []byte("delete-fence:hash")
+	setKey := []byte("delete-fence:set")
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(hashKey, []byte("old")), []byte("v"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(hashKey), store.MarshalHashMeta(store.HashMeta{Len: 1}), 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.SetMemberKey(setKey, []byte("old")), []byte{}, 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.SetMetaKey(setKey), store.MarshalSetMeta(store.SetMeta{Len: 1}), 10, 0))
+
+	txn := newRedisTxnTestContext(server)
+	txn.hashDeletes[string(hashKey)] = hashKey
+	txn.setDeletes[string(setKey)] = setKey
+
+	hashElems, err := txn.buildHashDeletionElems(ctx)
+	require.NoError(t, err)
+	require.True(t, elemKeysContain(hashElems, redisTxnWideHashFenceKey(hashKey)))
+
+	setElems, err := txn.buildSetDeletionElems(ctx)
+	require.NoError(t, err)
+	require.True(t, elemKeysContain(setElems, redisTxnWideSetFenceKey(setKey)))
+}
+
+func TestRedisTxnListDeletionElemsWriteFence(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("delete-fence:list")
+	elems := appendListDeletionElems(nil, key, &listTxnState{
+		meta:       store.ListMeta{Len: 1, Tail: 1},
+		metaExists: true,
+		deleted:    true,
+	})
+	require.True(t, elemKeysContain(elems, redisTxnWideListFenceKey(key)))
+}
+
+func TestRedisTxnHashLegacyRewriteWritesFence(t *testing.T) {
+	t.Parallel()
+
+	key := []byte("legacy-rewrite:hash")
+	elems := buildHashLegacyRewriteElems(key, map[string][]byte{"field": []byte("value")})
+	require.True(t, elemKeysContain(elems, redisTxnWideHashFenceKey(key)))
+}
+
+func TestRedisSetLegacyMigrationWritesFenceWithoutLenDelta(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	server := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	key := []byte("legacy-migration:set")
+	raw, err := marshalSetValue(redisSetValue{Members: []string{"member"}})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisSetKey(key), raw, 10, 0))
+
+	elems, err := server.buildSetLegacyMigrationElems(ctx, key, 10)
+	require.NoError(t, err)
+	require.True(t, elemKeysContain(elems, redisTxnWideSetFenceKey(key)))
+}
+
 func TestRedisTxnExpiredRecreateConflictsWithConcurrentCollectionWrite(t *testing.T) {
 	t.Parallel()
 

@@ -82,6 +82,7 @@ func (r *RedisServer) buildSetLegacyMigrationElems(ctx context.Context, key []by
 		Key:   store.SetMetaKey(key),
 		Value: store.MarshalSetMeta(store.SetMeta{Len: int64(len(value.Members))}),
 	})
+	elems = append(elems, redisTxnWideSetFenceElem(key))
 	return elems, nil
 }
 

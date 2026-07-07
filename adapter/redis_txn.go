@@ -1551,6 +1551,7 @@ func (t *txnContext) buildWideDeletionElems(
 			return nil, err
 		}
 		elems = append(elems, next...)
+		elems = append(elems, redisTxnWideFenceElem(fenceKey(key)))
 	}
 	return elems, nil
 }
@@ -1671,6 +1672,7 @@ func appendListDeletionElems(elems []*kv.Elem[kv.OP], userKey []byte, st *listTx
 	for _, dk := range st.existingDeltas {
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: dk})
 	}
+	elems = append(elems, redisTxnWideListFenceElem(userKey))
 	return elems
 }
 
@@ -1852,7 +1854,7 @@ const hashLegacyRewriteOverhead = 2
 
 func buildHashLegacyRewriteElems(key []byte, fields map[string][]byte) []*kv.Elem[kv.OP] {
 	fieldNames := sortedHashFieldNames(fields)
-	elems := make([]*kv.Elem[kv.OP], 0, len(fieldNames)+hashLegacyRewriteOverhead)
+	elems := make([]*kv.Elem[kv.OP], 0, len(fieldNames)+hashLegacyRewriteOverhead+1)
 	for _, field := range fieldNames {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -1867,6 +1869,7 @@ func buildHashLegacyRewriteElems(key []byte, fields map[string][]byte) []*kv.Ele
 			Key:   store.HashMetaKey(key),
 			Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(fieldNames))}),
 		},
+		redisTxnWideHashFenceElem(key),
 	)
 	return elems
 }
