@@ -1,7 +1,7 @@
 # SQS side-record derivation (Phase 0b M5-2) — proposed
 
 **Status:** Proposed (no implementation yet).
-**Parent:** [`2026_05_25_proposed_snapshot_logical_encoder.md`](2026_05_25_proposed_snapshot_logical_encoder.md) — this resolves the §"Per-adapter reverse encoders / SQS per-message side records" decision gate that M5-1 (`PR #846`) explicitly deferred.
+**Parent:** [`2026_05_25_implemented_snapshot_logical_encoder.md`](2026_05_25_implemented_snapshot_logical_encoder.md) — this resolves the §"Per-adapter reverse encoders / SQS per-message side records" decision gate that M5-1 (`PR #846`) explicitly deferred.
 **Predecessor on disk:** M5-1 emits `!sqs|queue|meta|`, `!sqs|queue|gen|`, `!sqs|queue|seq|`, `!sqs|msg|data|` for every queue + message in the dump. The **side records** below (vis / byage / dedup; group is intentionally not emitted — see table) are not produced by M5-1; restoring without the emitted three silently breaks FIFO dedup, the by-age reaper scan, and visibility resumption.
 
 ## What needs to land

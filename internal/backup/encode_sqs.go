@@ -15,7 +15,7 @@ import (
 // encode_sqs.go is the Phase 0b SQS reverse encoder — the inverse of the
 // SQS decoder in sqs.go (type SQSEncoder, which turns internal !sqs|*
 // records into an sqs/<queue>/ dump tree). Design:
-// docs/design/2026_05_25_proposed_snapshot_logical_encoder.md §"SQS".
+// docs/design/2026_05_25_implemented_snapshot_logical_encoder.md §"SQS".
 //
 // This slice (M5-1) covers the QUEUE config and the MESSAGE data records,
 // plus the generation and (FIFO) sequence counters:
