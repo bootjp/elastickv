@@ -393,6 +393,7 @@ func run() error {
 		cfg.defaultGroup,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
+		*raftId,
 	); err != nil {
 		return err
 	}
@@ -963,13 +964,11 @@ func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGrou
 // unreachable mutator paths unreachable, the startup gate keeps
 // misconfigured nodes from booting at all.
 //
-// Scope of the guards covered in this PR is documented in
+// Scope of this pre-engine guard layer is documented in
 // internal/encryption/startup.go's CheckStartupGuards godoc and in
-// docs/design/2026_04_29_partial_data_at_rest_encryption.md (Stage 6C
-// sub-decomposition; 6C-1 is flag + sidecar-state guards only).
-// Later 6C-2 / 6D / 6E PRs add the guards that depend on raftengine
-// integration, the cluster-wide membership view, and the Phase-2
-// cutover record.
+// docs/design/2026_04_29_partial_data_at_rest_encryption.md. Guards
+// that need opened engines, the default-group registry store, or the
+// raft membership view run later in chainEncryptionStartupGuard.
 func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
 	kekWrapper, err := loadKEKWrapperFromFlag()
 	if err != nil {

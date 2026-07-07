@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 )
 
 // stubGapEngine satisfies encryptionGapEngine for the
@@ -33,6 +36,33 @@ func (s *stubScanner) HasEncryptionRelevantEntryInRange(_, _ uint64) (bool, erro
 	return s.hit, s.err
 }
 
+type stubStartupEngine struct {
+	cfg    raftengine.Configuration
+	cfgErr error
+}
+
+func (s *stubStartupEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, nil
+}
+
+func (s *stubStartupEngine) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, nil
+}
+
+func (s *stubStartupEngine) State() raftengine.State { return raftengine.StateFollower }
+func (s *stubStartupEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{}
+}
+func (s *stubStartupEngine) VerifyLeader(context.Context) error { return nil }
+func (s *stubStartupEngine) LinearizableRead(context.Context) (uint64, error) {
+	return 0, nil
+}
+func (s *stubStartupEngine) Status() raftengine.Status { return raftengine.Status{} }
+func (s *stubStartupEngine) Configuration(context.Context) (raftengine.Configuration, error) {
+	return s.cfg, s.cfgErr
+}
+func (s *stubStartupEngine) Close() error { return nil }
+
 // writeMinimalSidecar writes a valid §5.1 sidecar with the
 // supplied RaftAppliedIndex into a freshly created temp dir, and
 // returns the sidecar path.
@@ -44,6 +74,30 @@ func writeMinimalSidecar(t *testing.T, raftAppliedIdx uint64) string {
 		Version:          encryption.SidecarVersion,
 		RaftAppliedIndex: raftAppliedIdx,
 		Keys:             map[string]encryption.SidecarKey{},
+	}
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	return path
+}
+
+func writeActiveStorageSidecarForStartup(t *testing.T, activeDEK uint32, localEpoch uint16) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:               encryption.SidecarVersion,
+		RaftAppliedIndex:      1,
+		StorageEnvelopeActive: true,
+		Active:                encryption.ActiveKeys{Storage: activeDEK},
+		Keys: map[string]encryption.SidecarKey{
+			"7": {
+				Purpose:    encryption.SidecarPurposeStorage,
+				Wrapped:    []byte("wrapped"),
+				Created:    "2026-07-07T00:00:00Z",
+				LocalEpoch: localEpoch,
+			},
+		},
 	}
 	if err := encryption.WriteSidecar(path, sc); err != nil {
 		t.Fatalf("WriteSidecar: %v", err)
@@ -223,7 +277,7 @@ func TestRunSidecarBehindRaftLogGuard_ScannerError(t *testing.T) {
 // nil" downstream of the chain helper.
 func TestChainEncryptionStartupGuard_PropagatesPrevError(t *testing.T) {
 	prev := errors.New("build failed")
-	got := chainEncryptionStartupGuard(prev, nil, 0, "", false)
+	got := chainEncryptionStartupGuard(prev, nil, 0, "", false, "n1")
 	if !errors.Is(got, prev) {
 		t.Fatalf("chain must propagate prev error verbatim; got %v", got)
 	}
@@ -232,8 +286,61 @@ func TestChainEncryptionStartupGuard_PropagatesPrevError(t *testing.T) {
 // TestChainEncryptionStartupGuard_NilPrevRunsGuard verifies
 // the other half: nil prevErr forwards to checkSidecarBehindRaftLog.
 func TestChainEncryptionStartupGuard_NilPrevRunsGuard(t *testing.T) {
-	got := chainEncryptionStartupGuard(nil, nil, 0, "", false)
+	got := chainEncryptionStartupGuard(nil, nil, 0, "", false, "n1")
 	if got != nil {
 		t.Fatalf("chain with nil prev and skipped guard must return nil; got %v", got)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuards_NodeIDCollision(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, testRegDEKID, 3)
+	rt := &raftGroupRuntime{
+		spec: groupSpec{id: 1},
+		engine: &stubStartupEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+			{ID: "n498"},
+			{ID: "n784"},
+		}}},
+	}
+	if gotA, gotB := etcdraftengine.DeriveNodeID("n498")&0xffff, etcdraftengine.DeriveNodeID("n784")&0xffff; gotA != gotB {
+		t.Fatalf("test fixture no longer collides: n498=%#x n784=%#x", gotA, gotB)
+	}
+	err := checkEncryptionMembershipStartupGuards([]*raftGroupRuntime{rt}, 1, sidecarPath, true, "n1")
+	if !errors.Is(err, encryption.ErrNodeIDCollision) {
+		t.Fatalf("membership guard must fire ErrNodeIDCollision, got %v", err)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuards_LocalEpochRollback(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeActiveStorageSidecarForStartup(t, testRegDEKID, 2)
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	writeRegistryRow(t, st, fullNodeID, 2)
+	rt := &raftGroupRuntime{
+		spec:  groupSpec{id: 1},
+		store: st,
+		engine: &stubStartupEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+			{ID: "n1"},
+		}}},
+	}
+	err := checkEncryptionMembershipStartupGuards([]*raftGroupRuntime{rt}, 1, sidecarPath, true, "n1")
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("membership guard must fire ErrLocalEpochRollback, got %v", err)
+	}
+}
+
+func TestCheckEncryptionMembershipStartupGuards_PreBootstrapSkips(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeMinimalSidecar(t, 1)
+	rt := &raftGroupRuntime{
+		spec: groupSpec{id: 1},
+		engine: &stubStartupEngine{cfg: raftengine.Configuration{Servers: []raftengine.Server{
+			{ID: "n498"},
+			{ID: "n784"},
+		}}},
+	}
+	if err := checkEncryptionMembershipStartupGuards([]*raftGroupRuntime{rt}, 1, sidecarPath, true, "n1"); err != nil {
+		t.Fatalf("pre-bootstrap sidecar must skip 6C-3 membership guards, got %v", err)
 	}
 }
