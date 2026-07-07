@@ -12,8 +12,7 @@ import (
 )
 
 const (
-	sqsLeadershipRefusalRetryDelay    = 50 * time.Millisecond
-	sqsLeadershipRefusalRetryDeadline = 5 * time.Second
+	sqsLeadershipRefusalRetryDelay = 50 * time.Millisecond
 )
 
 // sqsLeadershipController is the subset of raftengine.Admin the
@@ -128,8 +127,6 @@ func refuseSQSLeadershipWithRetry(ctx context.Context, admin sqsLeadershipContro
 	if logger == nil {
 		logger = slog.Default()
 	}
-	deadline := time.NewTimer(sqsLeadershipRefusalRetryDeadline)
-	defer deadline.Stop()
 	for attempt := 1; ; attempt++ {
 		if admin.State() != raftengine.StateLeader {
 			return
@@ -149,11 +146,6 @@ func refuseSQSLeadershipWithRetry(ctx context.Context, admin sqsLeadershipContro
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return
-		case <-deadline.C:
-			timer.Stop()
-			logger.Warn("sqs: TransferLeadership retry deadline expired",
-				"group", gid, "attempt", attempt, "err", err)
 			return
 		case <-timer.C:
 		}

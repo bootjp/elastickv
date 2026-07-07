@@ -261,24 +261,34 @@ func (l *leaderBalanceLoop) executeMove(ctx context.Context, move leaderBalanceM
 	if err != nil {
 		return errors.Wrap(err, "leader-balance: connect to remote source")
 	}
-	req := &pb.RaftAdminTransferLeadershipRequest{
-		TargetId:         move.candidates[0].ID,
-		TargetAddress:    move.candidates[0].Address,
-		Gated:            true,
-		MaxLag:           l.cfg.maxTargetLag,
-		TargetCandidates: make([]*pb.TransferTarget, 0, len(move.candidates)),
-	}
-	for _, candidate := range move.candidates {
-		req.TargetCandidates = append(req.TargetCandidates, &pb.TransferTarget{
-			TargetId:      candidate.ID,
-			TargetAddress: candidate.Address,
-		})
-	}
+	req := buildLeaderBalanceTransferRequest(move.candidates, l.cfg.maxTargetLag)
 	_, err = pb.NewRaftAdminClient(conn).TransferLeadership(execCtx, req)
 	if err != nil {
 		return errors.Wrap(err, "leader-balance: transfer remote leadership")
 	}
 	return nil
+}
+
+func buildLeaderBalanceTransferRequest(candidates []raftengine.TransferTarget, maxLag uint64) *pb.RaftAdminTransferLeadershipRequest {
+	req := &pb.RaftAdminTransferLeadershipRequest{
+		Gated:            true,
+		MaxLag:           maxLag,
+		TargetCandidates: make([]*pb.TransferTarget, 0, len(candidates)),
+	}
+	if len(candidates) > 0 {
+		// Rolling-upgrade guard: old RaftAdmin servers ignore Gated and
+		// TargetCandidates, but they still understand the legacy target fields.
+		// Supplying only target_address makes those older handlers reject the
+		// request as an incomplete ungated transfer instead of executing it.
+		req.TargetAddress = candidates[0].Address
+	}
+	for _, candidate := range candidates {
+		req.TargetCandidates = append(req.TargetCandidates, &pb.TransferTarget{
+			TargetId:      candidate.ID,
+			TargetAddress: candidate.Address,
+		})
+	}
+	return req
 }
 
 func observeLeaderBalance(ctx context.Context, runtimes []*raftGroupRuntime, localNodeID string) leaderBalanceObservation {
@@ -371,6 +381,8 @@ func chooseLeaderBalanceMovePass(
 	now time.Time,
 	includeDefault bool,
 ) (leaderBalanceMove, bool) {
+	var best leaderBalanceMove
+	var found bool
 	for _, group := range sortedLeaderBalanceGroups(obs.groups, cfg.defaultGroupID) {
 		if !leaderBalanceGroupEligible(group, cfg, groupCooldownUntil, now, includeDefault) {
 			continue
@@ -379,7 +391,7 @@ func chooseLeaderBalanceMovePass(
 		if len(candidates) == 0 {
 			continue
 		}
-		return leaderBalanceMove{
+		move := leaderBalanceMove{
 			groupID:      group.groupID,
 			sourceID:     group.leader.ID,
 			sourceAddr:   group.leader.Address,
@@ -387,9 +399,27 @@ func chooseLeaderBalanceMovePass(
 			engine:       group.engine,
 			candidates:   candidates,
 			chosenTarget: candidates[0],
-		}, true
+		}
+		if !found || leaderBalanceMovePreferred(move, best, obs.counts) {
+			best = move
+			found = true
+		}
 	}
-	return leaderBalanceMove{}, false
+	return best, found
+}
+
+func leaderBalanceMovePreferred(next, current leaderBalanceMove, counts map[string]int) bool {
+	nextSourceCount := counts[next.sourceID]
+	currentSourceCount := counts[current.sourceID]
+	if nextSourceCount != currentSourceCount {
+		return nextSourceCount > currentSourceCount
+	}
+	nextTargetCount := counts[next.chosenTarget.ID]
+	currentTargetCount := counts[current.chosenTarget.ID]
+	if nextTargetCount != currentTargetCount {
+		return nextTargetCount < currentTargetCount
+	}
+	return next.groupID < current.groupID
 }
 
 func sortedLeaderBalanceGroups(groups []leaderBalanceGroupSnapshot, defaultGroupID uint64) []leaderBalanceGroupSnapshot {

@@ -54,6 +54,7 @@ type fakeLeadershipController struct {
 	transferCalls      atomic.Int32
 	transferErr        error
 	transferErrs       []error
+	followerAfterCalls int32
 	registeredCb       func()
 	deregisterCalls    atomic.Int32
 	registerCalls      atomic.Int32
@@ -67,12 +68,15 @@ func (f *fakeLeadershipController) State() raftengine.State {
 }
 
 func (f *fakeLeadershipController) TransferLeadership(_ context.Context) error {
-	f.transferCalls.Add(1)
+	call := f.transferCalls.Add(1)
 	if f.transferRecvCancel != nil {
 		close(f.transferRecvCancel)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.followerAfterCalls > 0 && call >= f.followerAfterCalls {
+		f.state = raftengine.StateFollower
+	}
 	if len(f.transferErrs) > 0 {
 		err := f.transferErrs[0]
 		f.transferErrs = f.transferErrs[1:]
@@ -275,6 +279,34 @@ func TestInstallSQSLeadershipRefusal_RetriesTransientTransferGuard(t *testing.T)
 	require.Eventually(t, func() bool {
 		return admin.transferCalls.Load() >= 3
 	}, time.Second, 5*time.Millisecond)
+}
+
+func TestRefuseSQSLeadershipWithRetryContinuesUntilLeadershipLost(t *testing.T) {
+	t.Parallel()
+	admin := &fakeLeadershipController{
+		state:              raftengine.StateLeader,
+		followerAfterCalls: 4,
+		transferErrs: []error{
+			raftengine.ErrLeadershipTransferConfChangePending,
+			raftengine.ErrLeadershipTransferInProgress,
+			raftengine.ErrLeadershipTransferConfChangePending,
+			raftengine.ErrLeadershipTransferInProgress,
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		refuseSQSLeadershipWithRetry(context.Background(), admin, 7, slog.Default())
+		close(done)
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 5*time.Millisecond)
+	require.GreaterOrEqual(t, admin.transferCalls.Load(), int32(4))
 }
 
 // TestInstallSQSLeadershipRefusal_NilAdminIsSafe pins the typed-

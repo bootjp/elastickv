@@ -11,8 +11,10 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -294,6 +296,24 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 		},
 		maxLag: 0,
 	}}, engine.gatedTransferCalls)
+}
+
+func TestTransferLeadershipPartialLegacyTargetRejected(t *testing.T) {
+	t.Parallel()
+	engine := &fakeEngine{status: raftengine.Status{State: raftengine.StateLeader}}
+	server := NewServer(engine)
+
+	_, err := server.TransferLeadership(context.Background(), &pb.RaftAdminTransferLeadershipRequest{
+		TargetAddress: "127.0.0.1:50052",
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	require.Zero(t, engine.transferCalls)
+	require.Empty(t, engine.targetTransferCalls)
+	require.Empty(t, engine.gatedTransferCalls)
 }
 
 func TestRegisterOperationalServicesPublishesLeaderHealth(t *testing.T) {
