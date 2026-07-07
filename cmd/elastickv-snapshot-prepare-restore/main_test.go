@@ -17,7 +17,7 @@ import (
 
 func TestRunPrepareRestoreSuccess(t *testing.T) {
 	dir := t.TempDir()
-	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"), 1234)
+	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
 	writeEncodeInfo(t, input, "cluster-a", true, true)
 	dataDir := filepath.Join(dir, "raft")
 
@@ -33,11 +33,15 @@ func TestRunPrepareRestoreSuccess(t *testing.T) {
 	require.Equal(t, exitSuccess, code)
 	require.FileExists(t, filepath.Join(dataDir, "fsm-snap", "0000000000000005.fsm"))
 	require.FileExists(t, filepath.Join(dataDir, "snap", "0000000000000002-0000000000000005.snap"))
+	fsmBytes, err := os.ReadFile(filepath.Join(dataDir, "fsm-snap", "0000000000000005.fsm"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("EKVTHLC1"), fsmBytes[:8])
+	require.Equal(t, uint64(1), binary.BigEndian.Uint64(fsmBytes[8:16]))
 }
 
 func TestRunPrepareRestoreRejectsClusterMismatch(t *testing.T) {
 	dir := t.TempDir()
-	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"), 1234)
+	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
 	writeEncodeInfo(t, input, "cluster-a", true, true)
 
 	code, err := run([]string{
@@ -53,7 +57,7 @@ func TestRunPrepareRestoreRejectsClusterMismatch(t *testing.T) {
 
 func TestRunPrepareRestoreRequiresSelfTestByDefault(t *testing.T) {
 	dir := t.TempDir()
-	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"), 1234)
+	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
 	writeEncodeInfo(t, input, "cluster-a", false, false)
 
 	code, err := run([]string{
@@ -67,13 +71,34 @@ func TestRunPrepareRestoreRequiresSelfTestByDefault(t *testing.T) {
 	require.Equal(t, exitDataErr, code)
 }
 
-func writeHeaderOnlyFSM(t *testing.T, path string, lastCommitTS uint64) string {
+func TestRunPrepareRestoreRequiresSidecarSHA256(t *testing.T) {
+	dir := t.TempDir()
+	input := writeHeaderOnlyFSM(t, filepath.Join(dir, "encoded.fsm"))
+	writeEncodeInfoWithSHA(t, input, "cluster-a", true, true, "")
+
+	code, err := run([]string{
+		"--input", input,
+		"--data-dir", filepath.Join(dir, "raft"),
+		"--index", "5",
+		"--peers", "n1=127.0.0.1:12001",
+		"--target-cluster-id", "cluster-a",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.ErrorIs(t, err, errRestoreSHA256Missing)
+	require.Equal(t, exitDataErr, code)
+}
+
+func TestHLCCeilingMsAfterLastCommitTS(t *testing.T) {
+	require.Equal(t, uint64(0), hlcCeilingMsAfterLastCommitTS(0))
+	require.Equal(t, uint64(124), hlcCeilingMsAfterLastCommitTS((123<<hlcLogicalBits)|42))
+}
+
+func writeHeaderOnlyFSM(t *testing.T, path string) string {
 	t.Helper()
 	f, err := os.Create(path)
 	require.NoError(t, err)
 	_, err = f.WriteString(backup.PebbleSnapshotMagic)
 	require.NoError(t, err)
-	require.NoError(t, binary.Write(f, binary.LittleEndian, lastCommitTS))
+	require.NoError(t, binary.Write(f, binary.LittleEndian, uint64(1234)))
 	require.NoError(t, f.Close())
 	return path
 }
@@ -83,11 +108,16 @@ func writeEncodeInfo(t *testing.T, input, clusterID string, selfTestRan, selfTes
 	body, err := os.ReadFile(input)
 	require.NoError(t, err)
 	sum := sha256.Sum256(body)
+	writeEncodeInfoWithSHA(t, input, clusterID, selfTestRan, selfTestMatched, hex.EncodeToString(sum[:]))
+}
+
+func writeEncodeInfoWithSHA(t *testing.T, input, clusterID string, selfTestRan, selfTestMatched bool, shaHex string) {
+	t.Helper()
 	info := backup.NewEncodeInfo(time.Unix(0, 0))
 	info.EncoderVersion = "test"
 	info.InputRoot = "dump"
 	info.OutputFSMPath = input
-	info.OutputFSMSHA256 = hex.EncodeToString(sum[:])
+	info.OutputFSMSHA256 = shaHex
 	info.LastCommitTS = 1234
 	info.ManifestLastCommitTS = 1234
 	info.ManifestClusterID = clusterID

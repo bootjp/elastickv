@@ -30,8 +30,11 @@ var (
 	errRestoreClusterIDMissing  = errors.New("snapshot restore: cluster_id missing")
 	errRestoreKeyFormatMismatch = errors.New("snapshot restore: encoder key-format version mismatch")
 	errRestoreSHA256Mismatch    = errors.New("snapshot restore: encoded FSM SHA-256 mismatch")
+	errRestoreSHA256Missing     = errors.New("snapshot restore: encoded FSM SHA-256 missing")
 	errRestoreSelfTestMissing   = errors.New("snapshot restore: encoder self-test did not pass")
 )
+
+const hlcLogicalBits = 16
 
 type config struct {
 	inputPath               string
@@ -75,6 +78,8 @@ func classifyError(err error) int {
 		errors.Is(err, errRestoreClusterIDMissing),
 		errors.Is(err, errRestoreKeyFormatMismatch),
 		errors.Is(err, errRestoreSHA256Mismatch),
+		errors.Is(err, errRestoreSHA256Missing),
+		errors.Is(err, etcd.ErrExternalSnapshotRestoreSHA256),
 		errors.Is(err, errRestoreSelfTestMissing):
 		return exitDataErr
 	default:
@@ -140,11 +145,13 @@ func prepare(cfg *config, logger *slog.Logger) error {
 		return err
 	}
 	result, err := etcd.PrepareExternalSnapshotRestore(etcd.ExternalSnapshotRestoreOptions{
-		InputFSMPath: cfg.inputPath,
-		DataDir:      cfg.dataDir,
-		Index:        cfg.index,
-		Term:         cfg.term,
-		Peers:        peers,
+		InputFSMPath:          cfg.inputPath,
+		DataDir:               cfg.dataDir,
+		Index:                 cfg.index,
+		Term:                  cfg.term,
+		Peers:                 peers,
+		SnapshotCeilingMs:     hlcCeilingMsAfterLastCommitTS(header.LastCommitTS),
+		ExpectedPayloadSHA256: info.OutputFSMSHA256,
 	})
 	if err != nil {
 		return errors.Wrap(err, "prepare external snapshot restore")
@@ -154,6 +161,7 @@ func prepare(cfg *config, logger *slog.Logger) error {
 		"fsm", result.FSMPath,
 		"snap", result.SnapPath,
 		"crc32c", fmt.Sprintf("%08x", result.CRC32C),
+		"payload_sha256", result.PayloadSHA256,
 		"payload_bytes", result.PayloadBytes,
 		"last_commit_ts", header.LastCommitTS,
 		"peers", result.Peers,
@@ -191,7 +199,10 @@ func validatePayload(path string) (backup.SnapshotHeader, string, error) {
 }
 
 func validateEncodeInfo(info backup.EncodeInfo, gotSHA string, cfg *config) error {
-	if info.OutputFSMSHA256 != "" && !strings.EqualFold(info.OutputFSMSHA256, gotSHA) {
+	if info.OutputFSMSHA256 == "" {
+		return errors.Wrap(errRestoreSHA256Missing, "ENCODE_INFO output_fsm_sha256 is empty")
+	}
+	if !strings.EqualFold(info.OutputFSMSHA256, gotSHA) {
 		return errors.Wrapf(errRestoreSHA256Mismatch, "input %s has %s, sidecar records %s",
 			cfg.inputPath, gotSHA, info.OutputFSMSHA256)
 	}
@@ -247,4 +258,11 @@ func parsePeers(raw string) ([]etcd.Peer, error) {
 		return peers[i].NodeID < peers[j].NodeID
 	})
 	return peers, nil
+}
+
+func hlcCeilingMsAfterLastCommitTS(ts uint64) uint64 {
+	if ts == 0 {
+		return 0
+	}
+	return (ts >> hlcLogicalBits) + 1
 }

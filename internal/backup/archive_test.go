@@ -51,6 +51,20 @@ func TestPackDumpTreeRejectsSymlink(t *testing.T) {
 	require.ErrorIs(t, err, ErrArchiveNonRegular)
 }
 
+func TestPackDumpTreeRejectsUnchecksummedFile(t *testing.T) {
+	root := writeArchiveFixture(t)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "extra.bin"), []byte("extra"), 0o600))
+	var buf bytes.Buffer
+	err := PackDumpTree(root, &buf, ArchiveCompressionNone)
+	require.ErrorIs(t, err, ErrArchiveUnchecksummedFile)
+}
+
+func TestCleanArchiveRelPathAllowsRootDotSlash(t *testing.T) {
+	rel, err := cleanArchiveRelPath("./")
+	require.NoError(t, err)
+	require.Equal(t, ".", rel)
+}
+
 func writeArchiveFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

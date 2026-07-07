@@ -2,6 +2,7 @@ package backup
 
 import (
 	"archive/tar"
+	"bufio"
 	"io"
 	"io/fs"
 	"os"
@@ -26,6 +27,7 @@ var (
 	ErrArchivePathUnsafe             = errors.New("backup archive: unsafe path")
 	ErrArchiveNonRegular             = errors.New("backup archive: non-regular file")
 	ErrArchiveDestinationExists      = errors.New("backup archive: destination exists")
+	ErrArchiveUnchecksummedFile      = errors.New("backup archive: file is not listed in CHECKSUMS")
 )
 
 // PackDumpTree writes root as a tar stream, optionally wrapped in zstd.
@@ -95,6 +97,13 @@ func UnpackDumpTree(in io.Reader, outputRoot string, compression string) error {
 }
 
 func verifyDumpRoot(root string) error {
+	if err := requireArchiveRegularPath(root, "MANIFEST.json"); err != nil {
+		return err
+	}
+	if err := requireArchiveRegularPath(root, CHECKSUMSFilename); err != nil {
+		return err
+	}
+
 	f, err := os.Open(filepath.Join(root, "MANIFEST.json")) //nolint:gosec // operator-supplied dump root
 	if err != nil {
 		return errors.WithStack(err)
@@ -107,7 +116,10 @@ func verifyDumpRoot(root string) error {
 	if closeErr != nil {
 		return errors.WithStack(closeErr)
 	}
-	return VerifyChecksums(root)
+	if err := VerifyChecksums(root); err != nil {
+		return err
+	}
+	return verifyArchiveHasNoUnchecksummedFiles(root)
 }
 
 func archiveWriter(out io.Writer, compression string) (io.Writer, func() error, error) {
@@ -168,6 +180,11 @@ func collectArchivePaths(root string) ([]string, error) {
 		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return errors.Wrapf(ErrArchiveNonRegular, "%s", path)
+		}
+		if info.Mode().IsRegular() {
+			if err := refuseArchiveHardLink(info, path); err != nil {
+				return err
+			}
 		}
 		paths = append(paths, path)
 		return nil
@@ -262,8 +279,8 @@ func extractRegularTarEntry(tr *tar.Reader, target string, hdr *tar.Header) erro
 
 func cleanArchiveRelPath(name string) (string, error) {
 	name = strings.TrimPrefix(name, "./")
-	if name == "" {
-		return "", errors.Wrap(ErrArchivePathUnsafe, "empty path")
+	if name == "" || name == "." {
+		return ".", nil
 	}
 	if !filepath.IsLocal(name) {
 		return "", errors.Wrapf(ErrArchivePathUnsafe, "%q", name)
@@ -280,4 +297,91 @@ func archiveMode(mode fs.FileMode, fallback fs.FileMode) fs.FileMode {
 		return fallback
 	}
 	return mode
+}
+
+func requireArchiveRegularPath(root string, rel string) error {
+	path := filepath.Join(root, rel)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Wrapf(ErrArchiveNonRegular, "%s", path)
+	}
+	return refuseArchiveHardLink(info, path)
+}
+
+func refuseArchiveHardLink(info os.FileInfo, path string) error {
+	if err := refuseHardLink(info, path); err != nil {
+		return errors.Wrapf(ErrArchiveNonRegular, "hard-linked file %s: %v", path, err)
+	}
+	return nil
+}
+
+func verifyArchiveHasNoUnchecksummedFiles(root string) error {
+	expected, err := readChecksumManifestPaths(root)
+	if err != nil {
+		return err
+	}
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if path == root || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == CHECKSUMSFilename {
+			return nil
+		}
+		if _, ok := expected[rel]; !ok {
+			return errors.Wrapf(ErrArchiveUnchecksummedFile, "%s", rel)
+		}
+		return nil
+	})
+	return errors.WithStack(err)
+}
+
+func readChecksumManifestPaths(root string) (map[string]struct{}, error) {
+	f, err := os.Open(filepath.Join(root, CHECKSUMSFilename)) //nolint:gosec // operator-supplied dump root
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	paths := make(map[string]struct{})
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, maxChecksumLineLen), maxChecksumLineLen)
+	lineNum := 0
+	for sc.Scan() {
+		lineNum++
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		_, rel, ok := splitChecksumLine(line)
+		if !ok {
+			return nil, errors.Wrapf(ErrChecksumsMalformedLine, "line %d: %q", lineNum, line)
+		}
+		cleaned, err := validateChecksumRelPath(rel)
+		if err != nil {
+			return nil, errors.Wrapf(err, "line %d", lineNum)
+		}
+		paths[filepath.ToSlash(cleaned)] = struct{}{}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return paths, nil
 }

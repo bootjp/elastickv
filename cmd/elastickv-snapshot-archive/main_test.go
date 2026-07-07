@@ -43,6 +43,18 @@ func TestArchiveCLIRejectsCorruptChecksums(t *testing.T) {
 	require.Equal(t, exitDataErr, code)
 }
 
+func TestArchiveCLIRejectsOutputInsideInputTree(t *testing.T) {
+	root := writeCLIDumpFixture(t)
+
+	code, err := run([]string{
+		"pack",
+		"--input", root,
+		"--output", filepath.Join(root, "dump.tar.zst"),
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.ErrorIs(t, err, errArchiveOutputInsideInput)
+	require.Equal(t, exitUserErr, code)
+}
+
 func writeCLIDumpFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

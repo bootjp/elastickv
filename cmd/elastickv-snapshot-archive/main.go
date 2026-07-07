@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bootjp/elastickv/internal/backup"
 	"github.com/cockroachdb/errors"
@@ -18,6 +20,8 @@ const (
 	exitDataErr           = 2
 	archiveOutputFilePerm = 0o600
 )
+
+var errArchiveOutputInsideInput = errors.New("snapshot archive: output path is inside input tree")
 
 type config struct {
 	mode        string
@@ -56,7 +60,8 @@ func classifyError(err error) int {
 		errors.Is(err, backup.ErrChecksumsPathTraversal),
 		errors.Is(err, backup.ErrChecksumsSymlinkEscape),
 		errors.Is(err, backup.ErrArchivePathUnsafe),
-		errors.Is(err, backup.ErrArchiveNonRegular):
+		errors.Is(err, backup.ErrArchiveNonRegular),
+		errors.Is(err, backup.ErrArchiveUnchecksummedFile):
 		return exitDataErr
 	default:
 		return exitUserErr
@@ -105,6 +110,9 @@ func runArchive(cfg *config, logger *slog.Logger) error {
 }
 
 func runPack(cfg *config, logger *slog.Logger) error {
+	if err := rejectArchiveOutputInsideInput(cfg.inputPath, cfg.outputPath); err != nil {
+		return err
+	}
 	out, closeFn, err := openArchiveOutput(cfg.outputPath)
 	if err != nil {
 		return err
@@ -117,6 +125,28 @@ func runPack(cfg *config, logger *slog.Logger) error {
 		return err
 	}
 	logger.Info("snapshot dump archive written", "input", cfg.inputPath, "output", cfg.outputPath, "compression", cfg.compression)
+	return nil
+}
+
+func rejectArchiveOutputInsideInput(inputPath string, outputPath string) error {
+	if outputPath == "-" {
+		return nil
+	}
+	inputAbs, err := filepath.Abs(inputPath)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	outputAbs, err := filepath.Abs(outputPath)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	rel, err := filepath.Rel(inputAbs, outputAbs)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)) {
+		return errors.Wrapf(errArchiveOutputInsideInput, "%s under %s", outputPath, inputPath)
+	}
 	return nil
 }
 
