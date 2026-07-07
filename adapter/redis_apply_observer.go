@@ -1,6 +1,9 @@
 package adapter
 
 import (
+	"bytes"
+	"sync"
+
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -9,6 +12,7 @@ import (
 // RedisApplyObserver wakes blocking Redis waiters from the FSM apply path.
 // It is safe to share one instance between the FSM wiring and RedisServer.
 type RedisApplyObserver struct {
+	initOnce      sync.Once
 	streamWaiters *keyWaiterRegistry
 	zsetWaiters   *keyWaiterRegistry
 }
@@ -29,9 +33,9 @@ func WithRedisApplyObserver(observer *RedisApplyObserver) RedisServerOption {
 		if observer == nil {
 			return
 		}
-		observer.ensureRegistries()
-		r.streamWaiters = observer.streamWaiters
-		r.zsetWaiters = observer.zsetWaiters
+		streamWaiters, zsetWaiters := observer.registries()
+		r.streamWaiters = streamWaiters
+		r.zsetWaiters = zsetWaiters
 	}
 }
 
@@ -39,23 +43,26 @@ func (o *RedisApplyObserver) OnApply(op pb.Op, key []byte) {
 	if o == nil || op != pb.Op_PUT {
 		return
 	}
-	o.ensureRegistries()
+	streamWaiters, zsetWaiters := o.registries()
 	if userKey := streamApplyUserKey(key); userKey != nil {
-		o.streamWaiters.Signal(userKey)
+		streamWaiters.Signal(userKey)
 		return
 	}
 	if userKey := zsetApplyUserKey(key); userKey != nil {
-		o.zsetWaiters.Signal(userKey)
+		zsetWaiters.Signal(userKey)
 	}
 }
 
-func (o *RedisApplyObserver) ensureRegistries() {
-	if o.streamWaiters == nil {
-		o.streamWaiters = newKeyWaiterRegistry()
-	}
-	if o.zsetWaiters == nil {
-		o.zsetWaiters = newKeyWaiterRegistry()
-	}
+func (o *RedisApplyObserver) registries() (*keyWaiterRegistry, *keyWaiterRegistry) {
+	o.initOnce.Do(func() {
+		if o.streamWaiters == nil {
+			o.streamWaiters = newKeyWaiterRegistry()
+		}
+		if o.zsetWaiters == nil {
+			o.zsetWaiters = newKeyWaiterRegistry()
+		}
+	})
+	return o.streamWaiters, o.zsetWaiters
 }
 
 func streamApplyUserKey(key []byte) []byte {
@@ -67,6 +74,8 @@ func streamApplyUserKey(key []byte) []byte {
 
 func zsetApplyUserKey(key []byte) []byte {
 	switch {
+	case bytes.HasPrefix(key, []byte(redisZSetPrefix)):
+		return key[len(redisZSetPrefix):]
 	case store.IsZSetMemberKey(key):
 		return store.ExtractZSetUserKeyFromMember(key)
 	case store.IsZSetScoreKey(key):

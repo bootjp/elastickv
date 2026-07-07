@@ -37,13 +37,15 @@ func (f *kvFSM) notifyApplyObserver(op pb.Op, key []byte) {
 		if observer == nil {
 			continue
 		}
-		func() {
-			defer func() {
-				if r := recover(); r != nil && f.log != nil {
-					f.log.Warn("apply observer panic", "panic", r)
-				}
-			}()
-			observer.OnApply(op, key)
-		}()
+		f.notifyApplyObserverSafely(observer, op, key)
 	}
+}
+
+func (f *kvFSM) notifyApplyObserverSafely(observer ApplyObserver, op pb.Op, key []byte) {
+	defer func() {
+		if r := recover(); r != nil && f.log != nil {
+			f.log.Warn("apply observer panic", "panic", r)
+		}
+	}()
+	observer.OnApply(op, key)
 }

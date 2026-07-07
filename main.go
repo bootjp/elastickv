@@ -831,7 +831,6 @@ func buildShardGroups(
 	encWiring = encWiring.withDefaultedCache()
 	runtimes := make([]*raftGroupRuntime, 0, len(groups))
 	shardGroups := make(map[uint64]*kv.ShardGroup, len(groups))
-	applyObserver := firstApplyObserver(applyObservers)
 	for _, g := range groups {
 		dir := groupDataDir(raftDir, raftID, g.id, multi)
 		if err := os.MkdirAll(dir, dirPerm); err != nil {
@@ -895,11 +894,11 @@ func buildShardGroups(
 		// work. At M2 the FSM stores both but does not consult them;
 		// see docs/design/2026_05_29_partial_composed1_cross_group_commit_guard.md
 		// §M2.
-		sm := kv.NewKvFSMWithHLC(st, clock,
+		fsmOpts := appendApplyObserverOptions([]kv.FSMOption{
 			kv.WithEncryption(applier),
 			kv.WithRouteHistory(kv.WrapDistributionEngine(routeEngine), g.id),
-			kv.WithApplyObserver(applyObserver),
-		)
+		}, applyObservers)
+		sm := kv.NewKvFSMWithHLC(st, clock, fsmOpts...)
 		runtime, err := buildRuntimeForGroup(raftID, g, raftDir, multi, bootstrap, bootstrapServers, st, sm, factory, *raftJoinAsLearner)
 		if err != nil {
 			for _, rt := range runtimes {
@@ -930,11 +929,11 @@ func buildShardGroups(
 	return runtimes, shardGroups, nil
 }
 
-func firstApplyObserver(observers []kv.ApplyObserver) kv.ApplyObserver {
-	if len(observers) == 0 {
-		return nil
+func appendApplyObserverOptions(opts []kv.FSMOption, observers []kv.ApplyObserver) []kv.FSMOption {
+	for _, observer := range observers {
+		opts = append(opts, kv.WithApplyObserver(observer))
 	}
-	return observers[0]
+	return opts
 }
 
 func observerForGroup(factory func(uint64) kv.ProposalObserver, groupID uint64) kv.ProposalObserver {

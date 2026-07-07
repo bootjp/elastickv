@@ -65,6 +65,26 @@ func TestRedisApplyObserverSignalsZSetMemberWaiters(t *testing.T) {
 	requireWaiterSignaled(t, waiter2.C)
 }
 
+func TestRedisApplyObserverSignalsLegacyZSetWaiters(t *testing.T) {
+	observer := NewRedisApplyObserver()
+	key := []byte("legacy-zset-key")
+	waiter, release := observer.zsetWaiters.Register([][]byte{key})
+	defer release()
+
+	observer.OnApply(pb.Op_PUT, redisZSetKey(key))
+	requireWaiterSignaled(t, waiter.C)
+}
+
+func TestRedisApplyObserverZeroValueSharesInitializedRegistries(t *testing.T) {
+	observer := &RedisApplyObserver{}
+	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisApplyObserver(observer))
+
+	require.NotNil(t, server.streamWaiters)
+	require.NotNil(t, server.zsetWaiters)
+	require.Same(t, observer.streamWaiters, server.streamWaiters)
+	require.Same(t, observer.zsetWaiters, server.zsetWaiters)
+}
+
 func TestWithRedisApplyObserverSharesRegistries(t *testing.T) {
 	observer := NewRedisApplyObserver()
 	server := NewRedisServer(nil, "", nil, nil, nil, nil, WithRedisApplyObserver(observer))

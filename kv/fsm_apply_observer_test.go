@@ -69,6 +69,27 @@ func TestFSMApplyObserverRawMutationsAfterSuccess(t *testing.T) {
 	require.Len(t, observer.calls, 2)
 }
 
+func TestFSMApplyObserverNotifiesEveryObserver(t *testing.T) {
+	st := store.NewMVCCStore()
+	observerA := &recordingApplyObserver{}
+	observerB := &recordingApplyObserver{}
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC(),
+		WithApplyObserver(observerA),
+		WithApplyObserver(observerB),
+	).(*kvFSM)
+	require.True(t, ok)
+
+	req := &pb.Request{
+		Ts:        100,
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("put-key"), Value: []byte("v")}},
+	}
+	require.NoError(t, applyObserverTestRequest(t, fsm, req))
+
+	want := []recordedApply{{op: pb.Op_PUT, key: "put-key"}}
+	require.Equal(t, want, observerA.calls)
+	require.Equal(t, want, observerB.calls)
+}
+
 func TestFSMApplyObserverTxnVisibleMutationsOnly(t *testing.T) {
 	st := store.NewMVCCStore()
 	observer := &recordingApplyObserver{}
