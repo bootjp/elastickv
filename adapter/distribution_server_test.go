@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -191,6 +192,75 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	rightRoute, ok := engine.GetRoute([]byte("h"))
 	require.True(t, ok)
 	require.Equal(t, uint64(4), rightRoute.RouteID)
+}
+
+func TestDistributionServerSplitRange_SnapsFilesystemChunkKeyToFileBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   []byte("!fs|route|chk|"),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
+	wantBoundary := fskeys.ChunkRouteKey(11, 22)
+
+	resp, err := s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               fskeys.ChunkKey(11, 22, 99),
+	})
+	require.NoError(t, err)
+	require.Equal(t, wantBoundary, resp.Left.End)
+	require.Equal(t, wantBoundary, resp.Right.Start)
+}
+
+func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	routeStart := fskeys.ChunkRouteKey(11, 22)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     fskeys.ChunkRouteKey(11, 23),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+	)
+	insideSameFile := append(append([]byte(nil), routeStart...), 0x01)
+
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               insideSameFile,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
 }
 
 func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {

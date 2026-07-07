@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -169,6 +171,92 @@ func TestServiceUnlinkOpenFileKeepsInodeReadable(t *testing.T) {
 	require.Equal(t, []byte("payload"), got)
 }
 
+func TestServiceReleaseLastOpenHandleGcsOrphan(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, file.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+	require.NoError(t, svc.Release(ctx, file.Inode, file.FH, []byte("client-a")))
+
+	_, err = svc.GetAttr(ctx, file.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = svc.store.GetAt(ctx, fskeys.ChunkKey(file.Inode, file.Inode, 0), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestServiceReapsExpiredOpenHandleAndGcsOrphan(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	svc := newTestServiceWithOptions(t, []uint64{2, 3},
+		WithClock(func() time.Time { return now }),
+		WithOpenHandleLeaseTTL(time.Second),
+	)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, file.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+
+	now = now.Add(2 * time.Second)
+	stats, err := svc.ReapExpiredOpenHandleLeases(ctx, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.ExpiredRefs)
+	require.EqualValues(t, 1, stats.OrphanedInodesGCed)
+	_, err = svc.GetAttr(ctx, file.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestServiceRefreshOpenHandleLeasePreventsExpiry(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0)
+	svc := newTestServiceWithOptions(t, []uint64{2, 3},
+		WithClock(func() time.Time { return now }),
+		WithOpenHandleLeaseTTL(time.Second),
+	)
+
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("open"), CreateOptions{
+		Mode:     testFileMode,
+		ClientID: []byte("client-a"),
+	})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, file.Inode, file.FH, 0, []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, svc.Unlink(ctx, RootInode, []byte("open")))
+
+	now = now.Add(900 * time.Millisecond)
+	require.NoError(t, svc.RefreshOpenHandleLease(ctx, file.Inode, file.FH, []byte("client-a")))
+	now = now.Add(500 * time.Millisecond)
+	stats, err := svc.ReapExpiredOpenHandleLeases(ctx, 10)
+	require.NoError(t, err)
+	require.Zero(t, stats.ExpiredRefs)
+	got, err := svc.Read(ctx, file.Inode, file.FH, 0, 16)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), got)
+
+	now = now.Add(2 * time.Second)
+	stats, err = svc.ReapExpiredOpenHandleLeases(ctx, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.ExpiredRefs)
+	require.EqualValues(t, 1, stats.OrphanedInodesGCed)
+	_, err = svc.GetAttr(ctx, file.Inode)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3, 4)
@@ -185,14 +273,20 @@ func TestServiceCrossParentRenameReturnsEXDEV(t *testing.T) {
 
 func newTestService(t *testing.T, ids ...uint64) *Service {
 	t.Helper()
+	return newTestServiceWithOptions(t, ids)
+}
 
+func newTestServiceWithOptions(t *testing.T, ids []uint64, opts ...Option) *Service {
+	t.Helper()
 	st := store.NewMVCCStore()
 	coord := &testCoordinator{st: st}
 	nextID := sequenceIDAllocator(ids...)
-	svc, err := NewService(st, coord,
+	serviceOpts := []Option{
 		WithChunkSize(testChunkSize),
 		WithIDAllocator(nextID),
-	)
+	}
+	serviceOpts = append(serviceOpts, opts...)
+	svc, err := NewService(st, coord, serviceOpts...)
 	require.NoError(t, err)
 	return svc
 }

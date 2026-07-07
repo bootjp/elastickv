@@ -20,6 +20,8 @@ const (
 	moveJobPrefix = "!fs|job|move|"
 
 	chunkRoutePrefix = "!fs|route|chk|"
+
+	chunkRouteKeyBytes = len(chunkRoutePrefix) + 2*u64Bytes
 )
 
 var (
@@ -114,6 +116,21 @@ func ExtractRouteKey(key []byte) []byte {
 	return out
 }
 
+// NormalizeSplitBoundary snaps filesystem chunk-domain split candidates to the
+// file boundary used by routeKey. This prevents a split key from bisecting one
+// file's chunk-domain route.
+func NormalizeSplitBoundary(key []byte) []byte {
+	if routeKey := ExtractRouteKey(key); routeKey != nil {
+		return routeKey
+	}
+	if !bytes.HasPrefix(key, chunkRoutePrefixBytes) || len(key) <= chunkRouteKeyBytes {
+		return key
+	}
+	out := make([]byte, chunkRouteKeyBytes)
+	copy(out, key[:chunkRouteKeyBytes])
+	return out
+}
+
 // RefKey returns an open-handle lease key.
 func RefKey(inode uint64, clientID []byte, fhID uint64) []byte {
 	out := make([]byte, 0, len(refPrefix)+2*u64Bytes+len(clientID)+orderedTerminatorBytes)
@@ -127,6 +144,11 @@ func RefKey(inode uint64, clientID []byte, fhID uint64) []byte {
 // RefPrefix returns the scan prefix for open-handle leases on an inode.
 func RefPrefix(inode uint64) []byte {
 	return appendU64Key([]byte(refPrefix), inode)
+}
+
+// RefAllPrefix returns the scan prefix for every open-handle lease.
+func RefAllPrefix() []byte {
+	return []byte(refPrefix)
 }
 
 // IntentKey returns a crash-recovery intent key.

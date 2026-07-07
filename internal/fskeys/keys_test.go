@@ -44,3 +44,14 @@ func TestExtractRouteKeyNormalizesChunkIndex(t *testing.T) {
 	require.NotEqual(t, ExtractRouteKey(k1), ExtractRouteKey(ChunkKey(12, 22, 1)))
 	require.Nil(t, ExtractRouteKey(InodeKey(22)))
 }
+
+func TestNormalizeSplitBoundarySnapsFilesystemChunkKeys(t *testing.T) {
+	rawChunk := ChunkKey(11, 22, 99)
+	routeKey := ChunkRouteKey(11, 22)
+	insideRouteKey := append(append([]byte(nil), routeKey...), 0xff)
+
+	require.Equal(t, routeKey, NormalizeSplitBoundary(rawChunk))
+	require.Equal(t, routeKey, NormalizeSplitBoundary(insideRouteKey))
+	require.Equal(t, routeKey, NormalizeSplitBoundary(routeKey))
+	require.Equal(t, InodeKey(22), NormalizeSplitBoundary(InodeKey(22)))
+}

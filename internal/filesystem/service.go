@@ -19,18 +19,20 @@ import (
 const (
 	RootInode uint64 = 1
 
-	bytesPerMiB           uint64 = 1 << 20
-	DefaultChunkSize             = 4 * bytesPerMiB
-	defaultGeneration     uint64 = 1
-	initialEpoch          uint64 = 1
-	directoryInitialNlink uint32 = 2
-	fileInitialNlink      uint32 = 1
-	rootParentInode       uint64 = RootInode
-	randomRetryLimit             = 16
-	randomUint64Bytes            = 8
-	keyValuePairArity            = 2
-	maxReadSize                  = 64 * bytesPerMiB
-	maxScanPageSize              = 1024
+	bytesPerMiB               uint64 = 1 << 20
+	DefaultChunkSize                 = 4 * bytesPerMiB
+	defaultGeneration         uint64 = 1
+	initialEpoch              uint64 = 1
+	directoryInitialNlink     uint32 = 2
+	fileInitialNlink          uint32 = 1
+	rootParentInode           uint64 = RootInode
+	randomRetryLimit                 = 16
+	randomUint64Bytes                = 8
+	keyValuePairArity                = 2
+	maxReadSize                      = 64 * bytesPerMiB
+	maxScanPageSize                  = 1024
+	defaultOpenHandleLeaseTTL        = 5 * time.Minute
+	defaultLeaseReaperLimit          = 256
 )
 
 var (
@@ -163,13 +165,27 @@ type StatFS struct {
 	Free      uint64
 }
 
+type OpenHandleLease struct {
+	Inode       uint64 `json:"inode"`
+	ClientID    []byte `json:"client_id"`
+	FH          uint64 `json:"fh"`
+	CreatedNsec int64  `json:"created_nsec"`
+	ExpiresNsec int64  `json:"expires_nsec,omitempty"`
+}
+
+type LeaseReapStats struct {
+	ExpiredRefs        uint64
+	OrphanedInodesGCed uint64
+}
+
 type Service struct {
-	store     store.MVCCStore
-	dispatch  Dispatcher
-	chunkSize uint64
-	now       func() time.Time
-	allocID   func() (uint64, error)
-	homeSlot  func(uint64) uint64
+	store        store.MVCCStore
+	dispatch     Dispatcher
+	chunkSize    uint64
+	openLeaseTTL time.Duration
+	now          func() time.Time
+	allocID      func() (uint64, error)
+	homeSlot     func(uint64) uint64
 }
 
 type Option func(*Service)
@@ -206,6 +222,14 @@ func WithHomeSlotAllocator(homeSlot func(uint64) uint64) Option {
 	}
 }
 
+func WithOpenHandleLeaseTTL(ttl time.Duration) Option {
+	return func(s *Service) {
+		if ttl >= 0 {
+			s.openLeaseTTL = ttl
+		}
+	}
+}
+
 func NewService(st store.MVCCStore, dispatch Dispatcher, opts ...Option) (*Service, error) {
 	if st == nil {
 		return nil, ErrStoreRequired
@@ -214,11 +238,12 @@ func NewService(st store.MVCCStore, dispatch Dispatcher, opts ...Option) (*Servi
 		return nil, ErrDispatcherRequired
 	}
 	s := &Service{
-		store:     st,
-		dispatch:  dispatch,
-		chunkSize: DefaultChunkSize,
-		now:       time.Now,
-		allocID:   randomNonZeroUint64,
+		store:        st,
+		dispatch:     dispatch,
+		chunkSize:    DefaultChunkSize,
+		openLeaseTTL: defaultOpenHandleLeaseTTL,
+		now:          time.Now,
+		allocID:      randomNonZeroUint64,
 		homeSlot: func(inode uint64) uint64 {
 			return inode
 		},
@@ -696,11 +721,99 @@ func (s *Service) Release(ctx context.Context, inode uint64, fh uint64, clientID
 	err = s.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: fskeys.RefKey(inode, clientID, fh)},
 	}, [][]byte{fskeys.RefKey(inode, clientID, fh)})
+	if err != nil {
+		return err
+	}
+	_, err = s.gcOrphanIfUnreferenced(ctx, inode)
 	return err
 }
 
 func (s *Service) StatFS(context.Context, uint64) (StatFS, error) {
 	return StatFS{ChunkSize: s.chunkSize, FreeFiles: math.MaxUint64}, nil
+}
+
+func (s *Service) RefreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := s.inodeAt(ctx, inode, ts); err != nil {
+		return err
+	}
+	refKey := fskeys.RefKey(inode, clientID, fh)
+	if _, err := s.store.GetAt(ctx, refKey, ts); err != nil {
+		if errors.Is(err, store.ErrKeyNotFound) {
+			return ErrNotFound
+		}
+		return errors.Wrap(err, "filesystem read open handle lease")
+	}
+	elem, err := s.refPutElem(inode, clientID, fh)
+	if err != nil {
+		return err
+	}
+	return s.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{elem}, [][]byte{fskeys.InodeKey(inode), refKey})
+}
+
+func (s *Service) ReapExpiredOpenHandleLeases(ctx context.Context, limit int) (LeaseReapStats, error) {
+	if limit <= 0 {
+		limit = defaultLeaseReaperLimit
+	}
+	readTS, err := s.readTS(ctx)
+	if err != nil {
+		return LeaseReapStats{}, err
+	}
+	prefix := fskeys.RefAllPrefix()
+	pairs, err := s.store.ScanAt(ctx, prefix, prefixEnd(prefix), limit, readTS)
+	if err != nil {
+		return LeaseReapStats{}, errors.Wrap(err, "filesystem scan open handle leases")
+	}
+	var stats LeaseReapStats
+	nowNsec := s.now().UnixNano()
+	for _, pair := range pairs {
+		reaped, gcd, err := s.reapExpiredOpenHandleLease(ctx, pair, nowNsec)
+		if err != nil {
+			return stats, err
+		}
+		if reaped {
+			stats.ExpiredRefs++
+		}
+		if gcd {
+			stats.OrphanedInodesGCed++
+		}
+	}
+	return stats, nil
+}
+
+func (s *Service) reapExpiredOpenHandleLease(
+	ctx context.Context,
+	pair *store.KVPair,
+	nowNsec int64,
+) (bool, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, false, errors.WithStack(err)
+	}
+	lease, err := decodeJSON[OpenHandleLease](pair.Value)
+	if err != nil {
+		return false, false, err
+	}
+	if !lease.expired(nowNsec) {
+		return false, false, nil
+	}
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	if err := s.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{
+		{Op: kv.Del, Key: pair.Key},
+	}, [][]byte{pair.Key}); err != nil {
+		return false, false, err
+	}
+	gcd, err := s.gcOrphanIfUnreferenced(ctx, lease.Inode)
+	return true, gcd, err
+}
+
+func (l OpenHandleLease) expired(nowNsec int64) bool {
+	return l.ExpiresNsec != 0 && l.ExpiresNsec <= nowNsec
 }
 
 func (m InodeMeta) Stat() Stat {
@@ -940,6 +1053,28 @@ func (s *Service) gcFileElems(meta *InodeMeta) ([]*kv.Elem[kv.OP], [][]byte) {
 	return elems, readKeys
 }
 
+func (s *Service) gcOrphanIfUnreferenced(ctx context.Context, inode uint64) (bool, error) {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return false, err
+	}
+	meta, err := s.inodeAt(ctx, inode, ts)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !meta.Orphaned || meta.Nlink != 0 || s.hasOpenRefs(ctx, inode, ts) {
+		return false, nil
+	}
+	elems, readKeys := s.gcFileElems(meta)
+	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Service) appendDirectoryEntries(
 	ctx context.Context,
 	inode uint64,
@@ -1066,18 +1201,22 @@ func (s *Service) allocateInode(ctx context.Context, ts uint64) (uint64, error) 
 }
 
 func (s *Service) refPutElem(inode uint64, clientID []byte, fh uint64) (*kv.Elem[kv.OP], error) {
-	value := struct {
-		Inode       uint64 `json:"inode"`
-		ClientID    []byte `json:"client_id"`
-		FH          uint64 `json:"fh"`
-		CreatedNsec int64  `json:"created_nsec"`
-	}{
+	now := s.now()
+	value := OpenHandleLease{
 		Inode:       inode,
 		ClientID:    append([]byte(nil), clientID...),
 		FH:          fh,
-		CreatedNsec: s.now().UnixNano(),
+		CreatedNsec: now.UnixNano(),
+		ExpiresNsec: s.openHandleExpiresNsec(now),
 	}
 	return putElem(fskeys.RefKey(inode, clientID, fh), value)
+}
+
+func (s *Service) openHandleExpiresNsec(now time.Time) int64 {
+	if s.openLeaseTTL == 0 {
+		return 0
+	}
+	return now.Add(s.openLeaseTTL).UnixNano()
 }
 
 func (s *Service) readTS(ctx context.Context) (uint64, error) {

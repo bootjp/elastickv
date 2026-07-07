@@ -1,8 +1,9 @@
 # Filesystem on Elastickv Design
 
-Status: Partial - FS Core API and filesystem chunk routing are implemented;
-FUSE adapter, whole-file migration, split planner guardrails, and lease reaper
-hardening remain open.
+Status: Partial - FS Core API, filesystem chunk routing, manual split boundary
+snapping, and open-handle lease/orphan GC are implemented; FUSE adapter,
+whole-file migration, FILE_PINNED metrics, intent recovery, and capacity
+metrics remain open.
 Author: bootjp
 Date: 2026-02-24
 Updated: 2026-07-07
@@ -26,15 +27,24 @@ Implemented:
 3. `kv.routeKey` normalizes `!fs|chk|<home_slot>|<inode>|<chunk_index>` to one route domain per `(home_slot, inode)`, including transaction-wrapped variants.
 4. `internal/filesystem.Service` implements the protocol-neutral core operations: `InitializeRoot`, `Resolve`, `GetAttr`, `SetAttr`, `Open`, `Read`, `Write`, `Flush`, `Fsync`, `Release`, `Create`, `Mkdir`, `Unlink`, `Rmdir`, `Rename`, `Readdir`, and `StatFS`.
 5. Fixed-size chunk read/write/truncate, sparse reads, same-directory rename, same-file chunk placement, and remove-while-open by inode are covered by unit tests.
+6. Manual `Distribution.SplitRange` snaps raw filesystem chunk keys and
+   over-specific `!fs|route|chk|<home>|<inode>|...` candidates to the
+   `(home_slot, inode_id)` file boundary before catalog mutation; a range that
+   already starts at that boundary fails with the existing split-boundary error
+   instead of bisecting one file's chunk route.
+7. Open-handle refs now carry an expiry timestamp, active clients can refresh
+   the lease with `RefreshOpenHandleLease`, `Release` performs final GC when it
+   drops the last reference to an orphaned file, and
+   `ReapExpiredOpenHandleLeases` removes expired refs before checking orphan
+   inodes for physical chunk cleanup.
 
 Remaining:
 
 1. Thin FUSE adapter and errno mapping tests.
 2. Whole-file `MoveFile` migration jobs, epoch-fenced stale-home retry, and migration recovery.
-3. Split planner boundary snapping plus `FILE_PINNED_HOTSPOT` metrics/alerts.
-4. TTL-backed open-handle lease reaper and final orphan chunk GC after release.
-5. Restart recovery for unfinished create/delete/move intents.
-6. Capacity-aware `StatFS` and placement/operator metrics.
+3. `FILE_PINNED_HOTSPOT` metrics/alerts for auto-split planner skips.
+4. Restart recovery for unfinished create/delete/move intents.
+5. Capacity-aware `StatFS` and placement/operator metrics.
 
 ## 2. Goals and Non-goals
 

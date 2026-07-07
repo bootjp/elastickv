@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
@@ -158,7 +159,7 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
 	}
 
-	splitKey := distribution.CloneBytes(req.GetSplitKey())
+	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(req.GetSplitKey()))
 	if err := validateSplitKey(parent, splitKey); err != nil {
 		return nil, err
 	}
