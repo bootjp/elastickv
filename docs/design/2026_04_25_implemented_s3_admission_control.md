@@ -437,7 +437,7 @@ generous enough that even single-node M1 traffic falls below the
 threshold under typical load, so the rollout signature is
 "503 SlowDown rate goes from 0 to negligible" rather than a step
 function. Operators can pin
-`ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES=$((1<<63))` to
+`ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES=9223372036854775807` to
 disable the cap on M1 nodes during the burn-in window if desired.
 
 The aws-chunked progress-callback path is the only behaviour

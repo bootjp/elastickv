@@ -16,6 +16,7 @@ import (
 const (
 	s3PutAdmissionDefaultMaxInflightBytes = 256 << 20
 	s3PutAdmissionDefaultTimeout          = 30 * time.Second
+	s3PutAdmissionDisableMaxInflightBytes = int64(1<<63 - 1)
 
 	s3PutAdmissionMaxInflightEnv = "ELASTICKV_S3_PUT_ADMISSION_MAX_INFLIGHT_BYTES"
 	s3PutAdmissionTimeoutEnv     = "ELASTICKV_S3_DISPATCH_ADMISSION_TIMEOUT"
@@ -27,7 +28,10 @@ const (
 	s3PutAdmissionProtocolChunked = "chunked"
 )
 
-var errS3PutAdmissionExhausted = errors.New("s3 put admission budget exhausted")
+var (
+	errS3PutAdmissionExhausted      = errors.New("s3 put admission budget exhausted")
+	errS3PutAdmissionEntityTooLarge = errors.New("s3 put body exceeds maximum allowed size")
+)
 
 type S3PutAdmissionObserver interface {
 	ObserveS3PutAdmissionInflight(bytes int64)
@@ -55,20 +59,26 @@ func newS3PutAdmission(maxBytes int64, timeout time.Duration) *s3PutAdmission {
 }
 
 func newS3PutAdmissionWithChunked(maxBytes int64, timeout time.Duration, chunked bool) *s3PutAdmission {
-	if maxBytes <= 0 {
+	if maxBytes <= 0 || maxBytes == s3PutAdmissionDisableMaxInflightBytes {
 		return nil
 	}
-	units := int((maxBytes + s3ChunkSize - 1) / s3ChunkSize)
-	if units < 1 {
-		units = 1
+	units64 := 1 + (maxBytes-1)/s3ChunkSize
+	maxInt := int64(int(^uint(0) >> 1))
+	if units64 > maxInt {
+		return nil
 	}
+	units := int(units64)
 	if timeout <= 0 {
 		timeout = s3PutAdmissionDefaultTimeout
+	}
+	roundedMaxBytes := units64 * s3ChunkSize
+	if roundedMaxBytes < 0 || roundedMaxBytes < maxBytes {
+		roundedMaxBytes = s3PutAdmissionDisableMaxInflightBytes
 	}
 	return &s3PutAdmission{
 		sem:      make(chan struct{}, units),
 		timeout:  timeout,
-		maxBytes: int64(units) * s3ChunkSize,
+		maxBytes: roundedMaxBytes,
 		chunked:  chunked,
 	}
 }
@@ -191,23 +201,29 @@ func (a *s3PutAdmission) unitsFor(bytes int64) (int, bool) {
 	if a == nil || bytes <= 0 {
 		return 0, true
 	}
-	units := int((bytes + s3ChunkSize - 1) / s3ChunkSize)
-	if units < 1 {
-		units = 1
+	units64 := 1 + (bytes-1)/s3ChunkSize
+	maxInt := int64(int(^uint(0) >> 1))
+	if units64 > maxInt {
+		return 0, false
 	}
+	units := int(units64)
 	if units > cap(a.sem) {
 		return 0, false
 	}
 	return units, true
 }
 
-func (s *S3Server) admitS3PutRequest(w http.ResponseWriter, r *http.Request, bucket, objectKey string, maxDecoded int64) bool {
+func (s *S3Server) admitS3PutRequest(w http.ResponseWriter, r *http.Request, bucket, objectKey string, maxDecoded int64, tooLargeMessage string) bool {
 	if s == nil || s.putAdmission == nil {
 		return true
 	}
 	bytes, protocol, err := s.s3PutAdmissionProbeBytes(r, maxDecoded)
 	if err != nil {
 		s.observeS3PutAdmissionRejection(s3PutAdmissionStagePrereserve, protocol)
+		if errors.Is(err, errS3PutAdmissionEntityTooLarge) {
+			writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", tooLargeMessage, bucket, objectKey)
+			return false
+		}
 		writeS3Error(w, http.StatusLengthRequired, "MissingContentLength", err.Error(), bucket, objectKey)
 		return false
 	}
@@ -230,6 +246,9 @@ func (s *S3Server) s3PutAdmissionProbeBytes(r *http.Request, maxDecoded int64) (
 	}
 	if r.ContentLength < 0 {
 		return 0, protocol, errors.New("Content-Length is required for non-streaming S3 PUT admission")
+	}
+	if maxDecoded > 0 && r.ContentLength > maxDecoded {
+		return 0, protocol, errS3PutAdmissionEntityTooLarge
 	}
 	return r.ContentLength, protocol, nil
 }

@@ -872,7 +872,7 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	validatePayloadSHA := expectedPayloadSHA != "" && !isS3PayloadMarker(expectedPayloadSHA)
 	admissionProtocol := s3PutAdmissionProtocolForPayload(expectedPayloadSHA)
-	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes) {
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, "object exceeds maximum allowed size") {
 		return
 	}
 	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
@@ -894,6 +894,9 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		pendingAdmission = pendingAdmission[:0]
 	}
 	defer releasePendingAdmission()
+	nextReadBuffer := func() ([]byte, bool) {
+		return nextS3PutReadBuffer(buf, admissionProtocol, r.ContentLength, sizeBytes)
+	}
 	uploadedManifest := func() *s3ObjectManifest {
 		if len(part.ChunkSizes) == 0 {
 			return &s3ObjectManifest{UploadID: uploadID}
@@ -922,19 +925,23 @@ func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket stri
 		return nil
 	}
 	for {
-		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), s3ChunkSize, admissionProtocol)
+		readBuf, exactLength := nextReadBuffer()
+		if len(readBuf) == 0 {
+			break
+		}
+		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(len(readBuf)), admissionProtocol)
 		if admissionErr != nil {
 			s.cleanupManifestBlobs(r.Context(), bucket, meta.Generation, objectKey, uploadedManifest())
 			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
 			return
 		}
-		n, readErr := readS3PutChunk(r.Body, buf)
+		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
 		if n == 0 {
 			releaseAdmission()
 		}
 		if n > 0 {
 			pendingAdmission = append(pendingAdmission, releaseAdmission)
-			chunk := append([]byte(nil), buf[:n]...)
+			chunk := append([]byte(nil), readBuf[:n]...)
 			if _, err := hasher.Write(chunk); err != nil {
 				writeS3InternalError(w, err)
 				return
@@ -1401,7 +1408,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 
 	partPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
 	admissionProtocol := s3PutAdmissionProtocolForPayload(partPayloadSHA)
-	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes) {
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes, "part exceeds maximum allowed size") {
 		return
 	}
 	partStreamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxPartSizeBytes, partPayloadSHA, "part exceeds maximum allowed size")
@@ -1443,6 +1450,9 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 		pendingAdmission = pendingAdmission[:0]
 	}
 	defer releasePendingAdmission()
+	nextReadBuffer := func() ([]byte, bool) {
+		return nextS3PutReadBuffer(buf, admissionProtocol, r.ContentLength, sizeBytes)
+	}
 	partCommitted := false
 	defer func() {
 		if !partCommitted && chunkNo > 0 {
@@ -1464,12 +1474,16 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	}
 
 	for {
-		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), s3ChunkSize, admissionProtocol)
+		readBuf, exactLength := nextReadBuffer()
+		if len(readBuf) == 0 {
+			break
+		}
+		releaseAdmission, admissionErr := s.acquireS3PutAdmission(r.Context(), int64(len(readBuf)), admissionProtocol)
 		if admissionErr != nil {
 			writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
 			return
 		}
-		n, readErr := readS3PutChunk(r.Body, buf)
+		n, readErr := readS3PutChunk(r.Body, readBuf, !exactLength)
 		if n == 0 {
 			releaseAdmission()
 		}
@@ -1488,7 +1502,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 			continue
 		}
 		pendingAdmission = append(pendingAdmission, releaseAdmission)
-		chunk := append([]byte(nil), buf[:n]...)
+		chunk := append([]byte(nil), readBuf[:n]...)
 		if _, err := hasher.Write(chunk); err != nil {
 			writeS3InternalError(w, err)
 			return
@@ -2515,10 +2529,32 @@ func (s *S3Server) isVerifiedS3Leader(ctx context.Context) bool {
 	return s.coordinator.VerifyLeader(ctx) == nil
 }
 
-func readS3PutChunk(r io.Reader, buf []byte) (int, error) {
+var errS3PutIncompleteBody = errors.New("request body shorter than Content-Length")
+
+func nextS3PutReadBuffer(buf []byte, protocol string, contentLength int64, readBytes int64) ([]byte, bool) {
+	if protocol != s3PutAdmissionProtocolFixed || contentLength < 0 {
+		return buf, false
+	}
+	remaining := contentLength - readBytes
+	if remaining <= 0 {
+		return nil, true
+	}
+	if remaining < int64(len(buf)) {
+		return buf[:int(remaining)], true
+	}
+	return buf, true
+}
+
+func readS3PutChunk(r io.Reader, buf []byte, allowFinalPartial bool) (int, error) {
 	n, err := io.ReadFull(r, buf)
 	if errors.Is(err, io.ErrUnexpectedEOF) {
+		if !allowFinalPartial {
+			return n, errS3PutIncompleteBody
+		}
 		return n, io.EOF
+	}
+	if errors.Is(err, io.EOF) && !allowFinalPartial && len(buf) > 0 {
+		return n, errS3PutIncompleteBody
 	}
 	if err != nil {
 		return n, errors.WithStack(err)
@@ -2664,6 +2700,9 @@ func classifyS3BodyReadErr(err error, tooLargeMessage string) (*s3PutBodyError, 
 	var chunkedErr *awsChunkedError
 	if errors.As(err, &chunkedErr) {
 		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: chunkedErr.Error()}, true
+	}
+	if errors.Is(err, errS3PutIncompleteBody) {
+		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "IncompleteBody", Message: errS3PutIncompleteBody.Error()}, true
 	}
 	return nil, false
 }

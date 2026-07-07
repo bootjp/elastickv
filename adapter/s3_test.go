@@ -993,6 +993,33 @@ func TestS3Server_MultipartUploadHappyPath(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "<Key>large-file.bin</Key>")
 }
 
+func TestS3Server_UploadPartRejectsTruncatedFixedLengthBody(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-mp-truncated", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPost, "/bucket-mp-truncated/obj?uploads=", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var initResult s3InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rec.Body.Bytes(), &initResult))
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut,
+		fmt.Sprintf("/bucket-mp-truncated/obj?uploadId=%s&partNumber=1", initResult.UploadId),
+		strings.NewReader("short"))
+	req.ContentLength = int64(len("short") + 1)
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "<Code>IncompleteBody</Code>")
+}
+
 func TestS3Server_AbortMultipartUpload(t *testing.T) {
 	t.Parallel()
 
