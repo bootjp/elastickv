@@ -23,6 +23,7 @@ type Registry struct {
 	writeConflict *WriteConflictMetrics
 	sqs           *SQSMetrics
 	sqsObserver   *SQSObserver
+	fs            *FileSystemMetrics
 	hlc           *HLCMetrics
 	hlcObserver   *HLCObserver
 	coldStart     *ColdStartMetrics
@@ -51,6 +52,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.writeConflict = newWriteConflictMetrics(registerer)
 	r.sqs = newSQSMetrics(registerer)
 	r.sqsObserver = newSQSObserver(r.sqs)
+	r.fs = newFileSystemMetrics(registerer)
 	r.hlc = newHLCMetrics(registerer)
 	r.hlcObserver = newHLCObserver(r.hlc)
 	r.coldStart = newColdStartMetrics(registerer)
@@ -216,6 +218,15 @@ func (r *Registry) SQSObserver() *SQSObserver {
 		return nil
 	}
 	return r.sqsObserver
+}
+
+// FileSystemObserver returns the filesystem operational metrics observer backed
+// by this registry.
+func (r *Registry) FileSystemObserver() FileSystemObserver {
+	if r == nil {
+		return nil
+	}
+	return r.fs
 }
 
 // WriteConflictCollector returns a collector that polls each MVCC

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ type DistributionServer struct {
 	catalog     *distribution.CatalogStore
 	coordinator kv.Coordinator
 	readTracker *kv.ActiveTimestampTracker
+	fsObserver  DistributionFilesystemObserver
 	reloadRetry struct {
 		attempts int
 		interval time.Duration
@@ -32,6 +34,12 @@ type DistributionServer struct {
 
 // DistributionServerOption configures DistributionServer behavior.
 type DistributionServerOption func(*DistributionServer)
+
+type DistributionFilesystemObserver interface {
+	ObserveFilePinnedHotspot(reason string)
+}
+
+const DistributionFilePinnedHotspotSplitBoundary = "split_boundary"
 
 // WithDistributionCoordinator configures the coordinator used for Raft-backed
 // catalog mutations in SplitRange.
@@ -44,6 +52,12 @@ func WithDistributionCoordinator(coordinator kv.Coordinator) DistributionServerO
 func WithDistributionActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.readTracker = tracker
+	}
+}
+
+func WithDistributionFilesystemObserver(observer DistributionFilesystemObserver) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.fsObserver = observer
 	}
 }
 
@@ -159,8 +173,10 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 		return nil, grpcStatusError(codes.NotFound, errDistributionUnknownRoute.Error())
 	}
 
-	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(req.GetSplitKey()))
+	rawSplitKey := req.GetSplitKey()
+	splitKey := distribution.CloneBytes(fskeys.NormalizeSplitBoundary(rawSplitKey))
 	if err := validateSplitKey(parent, splitKey); err != nil {
+		s.observeFilePinnedHotspotIfNeeded(rawSplitKey, splitKey, err)
 		return nil, err
 	}
 
@@ -190,6 +206,18 @@ func (s *DistributionServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 		return nil
 	}
 	return s.readTracker.Pin(ts)
+}
+
+func (s *DistributionServer) observeFilePinnedHotspotIfNeeded(rawSplitKey []byte, splitKey []byte, err error) {
+	if s == nil || s.fsObserver == nil || bytes.Equal(rawSplitKey, splitKey) || !isSplitBoundaryError(err) {
+		return
+	}
+	s.fsObserver.ObserveFilePinnedHotspot(DistributionFilePinnedHotspotSplitBoundary)
+}
+
+func isSplitBoundaryError(err error) bool {
+	return status.Code(err) == codes.InvalidArgument &&
+		strings.Contains(err.Error(), errDistributionSplitKeyAtBoundary.Error())
 }
 
 func (s *DistributionServer) verifyCatalogLeader(ctx context.Context) error {

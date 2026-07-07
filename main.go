@@ -473,6 +473,7 @@ func run() error {
 		distCatalog,
 		adapter.WithDistributionCoordinator(coordinate),
 		adapter.WithDistributionActiveTimestampTracker(readTracker),
+		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
 	)
 	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
 	compactor := kv.NewFSMCompactor(

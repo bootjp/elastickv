@@ -1,10 +1,11 @@
 # Filesystem on Elastickv Design
 
 Status: Partial - FS Core API, filesystem chunk routing, manual split boundary
-snapping, open-handle lease/orphan GC, capacity-aware `StatFS`, and the thin
-FUSE errno/session adapter are implemented; whole-file migration,
-FILE_PINNED metrics, intent recovery, placement/operator metrics, and the
-actual FUSE mount/server binding remain open.
+snapping, open-handle lease/orphan GC, capacity-aware `StatFS`, the thin
+FUSE errno/session adapter, and the file-pinned hotspot skip metric are
+implemented; whole-file migration, FILE_PINNED alert rules, intent recovery,
+placement/operator metrics, and the actual FUSE mount/server binding remain
+open.
 Author: bootjp
 Date: 2026-02-24
 Updated: 2026-07-07
@@ -46,12 +47,17 @@ Implemented:
    results for lookup/getattr/setattr/open/read/write/flush/fsync/release,
    create/mkdir/unlink/rmdir/rename/readdir/statfs, and explicit unsupported
    operations.
+10. `DistributionServer.SplitRange` records
+    `elastickv_fs_file_pinned_hotspot_total{reason="split_boundary"}` when a
+    filesystem chunk split candidate is normalized back to the same file route
+    boundary and rejected, exposing auto-split planner skips caused by
+    same-file pinning.
 
 Remaining:
 
 1. Actual FUSE mount/server binding against a chosen Go FUSE library.
 2. Whole-file `MoveFile` migration jobs, epoch-fenced stale-home retry, and migration recovery.
-3. `FILE_PINNED_HOTSPOT` metrics/alerts for auto-split planner skips.
+3. `FILE_PINNED_HOTSPOT` alert rules/dashboards for auto-split planner skips.
 4. Restart recovery for unfinished create/delete/move intents.
 5. Placement/operator metrics.
 

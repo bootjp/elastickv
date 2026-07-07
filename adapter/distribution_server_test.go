@@ -246,10 +246,12 @@ func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *
 	})
 	require.NoError(t, err)
 
+	observer := &recordingDistributionFilesystemObserver{}
 	s := NewDistributionServer(
 		distribution.NewEngine(),
 		catalog,
 		WithDistributionCoordinator(newDistributionCoordinatorStub(baseStore, true)),
+		WithDistributionFilesystemObserver(observer),
 	)
 	insideSameFile := append(append([]byte(nil), routeStart...), 0x01)
 
@@ -261,6 +263,7 @@ func TestDistributionServerSplitRange_RejectsFilesystemPinnedHotspotBoundary(t *
 	require.Error(t, err)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.ErrorContains(t, err, errDistributionSplitKeyAtBoundary.Error())
+	require.Equal(t, []string{DistributionFilePinnedHotspotSplitBoundary}, observer.reasons)
 }
 
 func TestDistributionServerSplitRange_RequiresCoordinator(t *testing.T) {
@@ -823,4 +826,12 @@ func (s *distributionCoordinatorStub) LeaseRead(ctx context.Context) (uint64, er
 
 func (s *distributionCoordinatorStub) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
 	return s.LinearizableRead(ctx)
+}
+
+type recordingDistributionFilesystemObserver struct {
+	reasons []string
+}
+
+func (o *recordingDistributionFilesystemObserver) ObserveFilePinnedHotspot(reason string) {
+	o.reasons = append(o.reasons, reason)
 }
