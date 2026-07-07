@@ -462,7 +462,7 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 	// HLC.Next() for a persistence ts, hlc.last >= every commit_ts ever
 	// committed.  This closes the HLC-4 logical-handoff gap surfaced by
 	// the tla-check gap configuration on PR #856.
-	// See docs/design/2026_05_28_partial_tla_safety_spec.md §5.1 HLC-4
+	// See docs/design/2026_05_28_implemented_tla_safety_spec.md §5.1 HLC-4
 	// precondition (ii) (strategy (c)) and HLC.tla BecomeLeader_HLC.
 	if f.hlc != nil && commitTS > 0 {
 		f.hlc.Observe(commitTS)
