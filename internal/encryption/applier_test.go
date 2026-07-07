@@ -2764,6 +2764,42 @@ func TestApplyRotation_EnableRaftEnvelope_AlreadyActive_StaleDEKReplay_InvokesIn
 	}
 }
 
+func TestApplyRotation_RaftDEKRotationAfterCutover_ReinstallsWrapper(t *testing.T) {
+	t.Parallel()
+	_, sidecarPath := bootstrappedDir(t)
+	app, rec := newCutoverApplierWithInstaller(t, sidecarPath)
+	const cutoverIdx uint64 = 500
+	if err := app.ApplyRotation(cutoverIdx, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubEnableRaftEnvelope,
+		DEKID:                cutoverBootstrapRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte{},
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: cutoverBootstrapRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 1},
+	}); err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+	const newRaftDEKID uint32 = 99
+	if err := app.ApplyRotation(600, fsmwire.RotationPayload{
+		SubTag:               fsmwire.RotateSubRotateDEK,
+		DEKID:                newRaftDEKID,
+		Purpose:              fsmwire.PurposeRaft,
+		Wrapped:              []byte("new-raft-dek"),
+		ProposerRegistration: fsmwire.RegistrationPayload{DEKID: newRaftDEKID, FullNodeID: 0xBBBB, LocalEpoch: 2},
+	}); err != nil {
+		t.Fatalf("RotateDEK: %v", err)
+	}
+	if got, want := len(rec.calls), 2; got != want {
+		t.Fatalf("installer calls = %d, want %d (cutover + raft DEK rotation)", got, want)
+	}
+	last := rec.calls[len(rec.calls)-1]
+	if last.cutoverIdx != cutoverIdx {
+		t.Errorf("rotation reinstall cutoverIdx = %d, want %d", last.cutoverIdx, cutoverIdx)
+	}
+	if last.activeRaftDEKID != newRaftDEKID {
+		t.Errorf("rotation reinstall activeRaftDEKID = %d, want %d", last.activeRaftDEKID, newRaftDEKID)
+	}
+}
+
 // TestApplyRotation_EnableRaftEnvelope_StaleDEKID_SkipsInstaller
 // pins the constraint #3 contract: a stale-DEK race produces a
 // benign no-op apply that advances RaftAppliedIndex but does NOT

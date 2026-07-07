@@ -355,7 +355,7 @@ func run() error {
 	// are only attached to the applier when --kekFile is non-empty
 	// (else the applier stays in the Stage 6A posture where
 	// ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured).
-	kekWrapper, err := loadKEKAndRunStartupGuards()
+	kekWrapper, err := loadKEKAfterPreNonceStartupGuards(cfg)
 	if err != nil {
 		return err
 	}
@@ -947,6 +947,29 @@ func proposerForGroup(rt *raftGroupRuntime, shardGroups map[uint64]*kv.ShardGrou
 		return sg.Proposer()
 	}
 	return rt.engine
+}
+
+func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
+	applied, ok := engine.(interface{ AppliedIndex() uint64 })
+	if !ok {
+		return nil
+	}
+	return applied.AppliedIndex
+}
+
+func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
+	if err := checkEnvelopeCutoverDivergenceBeforeNonceBump(
+		*raftId,
+		*raftDir,
+		cfg.groups,
+		cfg.defaultGroup,
+		cfg.multi,
+		*encryptionSidecarPath,
+		*encryptionEnabled,
+	); err != nil {
+		return nil, err
+	}
+	return loadKEKAndRunStartupGuards()
 }
 
 // loadKEKAndRunStartupGuards loads the file-backed KEK wrapper and
@@ -1648,6 +1671,7 @@ func startRaftServers(
 			enableMutators,
 			rt.engine,
 			encryptionCapabilityFanout,
+			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
 			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
 			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
 		)

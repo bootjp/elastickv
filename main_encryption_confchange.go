@@ -152,5 +152,5 @@ func (e *encryptionPreRegister) PreAddMember(ctx context.Context, raftID string)
 	// collision TOCTOU — different FullNodeID at the same NodeID16
 	// — is the genuine case-4 halt-apply residual; see §3.3 of the
 	// design doc.)
-	return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Engine, connCache, entry, req)
+	return proposeWriterRegistration(ctx, e.coordinate, e.defaultGroup.Proposer(), connCache, entry, req)
 }

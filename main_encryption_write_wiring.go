@@ -114,6 +114,10 @@ type encryptionWriteWiring struct {
 	// because storage and raft envelopes use separate DEKs and
 	// write_count streams.
 	raftEpoch uint16
+	// activeRaftDEKID is the sidecar.Active.Raft value read while
+	// constructing the raft-envelope runtime. It is non-zero once the
+	// cluster has bootstrapped raft DEKs.
+	activeRaftDEKID uint32
 	// raftNonceFactory emits §4.2 raft-envelope nonces. nil means
 	// raft envelope wrapping is not configured for this process.
 	raftNonceFactory store.NonceFactory
@@ -218,6 +222,7 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	if err != nil {
 		return w, err
 	}
+	w.activeRaftDEKID = activeRaftDEKID
 	w.raftCutoverIndex = &atomic.Uint64{}
 	runtime, err := newRaftEnvelopeRuntime(cipher, w.raftNonceFactory, cutoverIdx, activeRaftDEKID, w.raftCutoverIndex)
 	if err != nil {

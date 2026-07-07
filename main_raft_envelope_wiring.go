@@ -174,6 +174,16 @@ func (b *raftEnvelopeCutoverBarrier) WaitDrained(ctx context.Context) error {
 	return nil
 }
 
+func (b *raftEnvelopeCutoverBarrier) ValidateCutoverScope() error {
+	groups := b.runtime.snapshotGroups()
+	if len(groups) == 1 {
+		return nil
+	}
+	return errors.Errorf(
+		"encryption: raft envelope cutover requires exactly one shard group until per-group raft cutover indexes are implemented (got %d)",
+		len(groups))
+}
+
 func (b *raftEnvelopeCutoverBarrier) InstallWrap() {
 	b.runtime.reinstallActiveWrap()
 }

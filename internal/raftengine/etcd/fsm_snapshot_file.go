@@ -2,6 +2,7 @@ package etcd
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -396,6 +397,41 @@ func verifyFSMSnapshotFileWithToken(path string, tokenCRC uint32, checkToken boo
 			"path=%s footer=%08x token=%08x", path, footer, tokenCRC)
 	}
 	return nil
+}
+
+// OpenNewestFSMSnapshotPayload opens the FSM payload referenced by the
+// newest persisted Raft snapshot under dataDir. It performs no WAL repair
+// and mutates no files; callers use it for read-only startup preflight checks
+// that must run before the engine's normal open path.
+func OpenNewestFSMSnapshotPayload(dataDir string) (io.ReadCloser, bool, error) {
+	walDir := filepath.Join(dataDir, walDirName)
+	if !wal.Exist(walDir) {
+		return nil, false, nil
+	}
+	snapshotter := etcdsnap.New(zap.NewNop(), filepath.Join(dataDir, snapDirName))
+	snapshot, err := loadPersistedSnapshot(zap.NewNop(), walDir, snapshotter)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(snapshot.Data) == 0 {
+		return nil, false, nil
+	}
+	if !isSnapshotToken(snapshot.Data) {
+		return io.NopCloser(bytes.NewReader(snapshot.Data)), true, nil
+	}
+	tok, err := decodeSnapshotToken(snapshot.Data)
+	if err != nil {
+		return nil, false, err
+	}
+	path := fsmSnapPath(filepath.Join(dataDir, fsmSnapDirName), tok.Index)
+	if err := verifyFSMSnapshotFileWithToken(path, tok.CRC32C, true); err != nil {
+		return nil, false, err
+	}
+	r, err := openFSMSnapshotPayloadReader(path)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, true, nil
 }
 
 // limitedReadCloser pairs an io.Reader (typically a LimitReader over a file)

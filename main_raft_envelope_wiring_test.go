@@ -126,3 +126,16 @@ func TestRaftEnvelopeCutoverBarrier_BeginTreatsNilGroupChannelAsDrained(t *testi
 		t.Fatal("Begin blocked on nil group cutover channel")
 	}
 }
+
+func TestRaftEnvelopeCutoverBarrier_ValidateCutoverScopeRefusesMultipleGroups(t *testing.T) {
+	t.Parallel()
+	runtime := &raftEnvelopeRuntime{
+		groups: map[uint64]*kv.ShardGroup{
+			7: {},
+			8: {},
+		},
+	}
+	if err := (&raftEnvelopeCutoverBarrier{runtime: runtime}).ValidateCutoverScope(); err == nil {
+		t.Fatal("ValidateCutoverScope returned nil for multiple shard groups, want fail-closed error")
+	}
+}

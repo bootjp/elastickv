@@ -142,6 +142,10 @@ type CutoverBarrierController interface {
 	End()
 }
 
+type cutoverBarrierScopeValidator interface {
+	ValidateCutoverScope() error
+}
+
 // CapabilityFanoutFn is the closure the server invokes to run the
 // §4 Voters ∪ Learners pre-flight before the cutover proposal.
 // Production wiring composes it from
@@ -1269,6 +1273,9 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 		return nil, grpcStatusError(codes.FailedPrecondition,
 			"encryption: latest-applied-index callback is not wired — wire WithEncryptionAdminLatestAppliedIndex before enabling the raft envelope cutover")
 	}
+	if err := s.validateCutoverBarrierScope(); err != nil {
+		return nil, err
+	}
 	fanoutResult, err := s.runCutoverFanout(ctx)
 	if err != nil {
 		return nil, err
@@ -1285,6 +1292,17 @@ func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.
 		return nil, err
 	}
 	return s.raftCutoverPostcheck(proposedIdx, fanoutResult)
+}
+
+func (s *EncryptionAdminServer) validateCutoverBarrierScope() error {
+	validator, ok := s.cutoverBarrier.(cutoverBarrierScopeValidator)
+	if !ok {
+		return nil
+	}
+	if err := validator.ValidateCutoverScope(); err != nil {
+		return grpcStatusError(codes.FailedPrecondition, err.Error())
+	}
+	return nil
 }
 
 // runRaftEnvelopeCutoverBarrier executes the §7.1 step-1..6
