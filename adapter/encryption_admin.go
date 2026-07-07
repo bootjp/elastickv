@@ -275,8 +275,7 @@ func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServe
 // barrier controller used by EnableRaftEnvelope. A nil argument is
 // a no-op (the server stays in the cutover-disabled posture);
 // EnableRaftEnvelope refuses with FailedPrecondition until both
-// raftEnvelopeWrapEnabled flips to true AND this controller is
-// wired.
+// raftEnvelopeWrapEnabled is open AND this controller is wired.
 //
 // Production wiring (6E-2e: main.go) fans the controller over every
 // ShardGroup that participates in the cutover. Tests pass a stub
@@ -1195,17 +1194,16 @@ func freshCutoverResponse(sc *encryption.Sidecar, proposedIdx uint64, fanoutResu
 }
 
 // raftEnvelopeWrapEnabled gates fresh EnableRaftEnvelope cutovers.
-// Keep the production default closed until the fan-out can prove
-// every voter and learner runs a build with the raft-envelope
-// wrap/unwrap/cutover wiring. Tests open it explicitly around cases
-// that exercise the fresh cutover state machine.
+// The production default is open now that the wrap-on-propose,
+// unwrap-on-apply, and cutover barrier wiring ship. Keep the atomic gate
+// as an emergency/test kill switch around the fresh cutover state machine.
 //
 // Kept as atomic.Bool rather than a const so tests can override the
 // gate without racing sibling t.Parallel cases.
 var raftEnvelopeWrapEnabled atomic.Bool
 
 func init() {
-	raftEnvelopeWrapEnabled.Store(false)
+	raftEnvelopeWrapEnabled.Store(true)
 }
 
 // EnableRaftEnvelope is the Stage 6E Phase 2 cutover — flips Raft
@@ -1226,11 +1224,10 @@ func init() {
 // sequence, and error mapping match the storage variant verbatim;
 // see EnableStorageEnvelope for the full design rationale.
 //
-// **Gate posture**: raftEnvelopeWrapEnabled holds fresh cutovers
-// closed until the capability fan-out can verify a raft-envelope-aware
-// build on every participant. If closed, the pre-gate validation
-// surface (leader, semaphore acquire, request shape) still fires, but
-// no Raft proposal is composed and no sidecar mutation occurs.
+// **Gate posture**: raftEnvelopeWrapEnabled remains a test/emergency kill
+// switch. If closed, the pre-gate validation surface (leader, semaphore
+// acquire, request shape) still fires, but no Raft proposal is composed and
+// no sidecar mutation occurs.
 func (s *EncryptionAdminServer) EnableRaftEnvelope(ctx context.Context, req *pb.EnableRaftEnvelopeRequest) (*pb.EnableRaftEnvelopeResponse, error) {
 	if err := s.acquireCutoverSemaphore(ctx); err != nil {
 		return nil, err

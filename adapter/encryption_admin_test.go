@@ -2202,10 +2202,9 @@ func (b *recordingCutoverBarrier) End() {
 	b.order = append(b.order, "End")
 }
 
-// withWrapEnabledForTest flips raftEnvelopeWrapEnabled to true for
-// the duration of t and restores the original value via t.Cleanup.
-// The production default stays closed until capability fan-out can
-// prove every member is raft-envelope aware. Returns no value;
+// withWrapEnabledForTest keeps raftEnvelopeWrapEnabled open for the
+// duration of t and restores the original value via t.Cleanup. The gate
+// remains mutable as an emergency/test kill switch. Returns no value;
 // t.Cleanup handles teardown so callers don't need to defer.
 //
 // Safe to call from t.Parallel() tests: raftEnvelopeWrapEnabled is
@@ -2220,8 +2219,7 @@ func withWrapEnabledForTest(t *testing.T) {
 
 // TestEncryptionAdmin_EnableRaftEnvelope_RefusesWithoutBarrier
 // pins the §7.1 wiring gate: even with raftEnvelopeWrapEnabled
-// flipped true (the future 6E-2f production state), the handler
-// MUST refuse with FailedPrecondition when the cutoverBarrier
+// open, the handler MUST refuse with FailedPrecondition when the cutoverBarrier
 // controller is not wired. Silently skipping the barrier would
 // let a fresh USER proposal land at index > proposedIdx mid-
 // cutover and halt apply cluster-wide on the §6.3 strict-`>` hook.

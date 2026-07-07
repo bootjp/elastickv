@@ -378,15 +378,18 @@ func (p *dynamicWrappedProposer) EndCutoverBarrier() {
 	p.barrierMu.Lock()
 	defer p.barrierMu.Unlock()
 	p.barrierOpen = false
-	// Drop the drainSig reference so a stale WaitInflightDrained
-	// caller that reads the channel after EndCutoverBarrier sees
-	// nil (immediate-success degraded path) rather than blocking
-	// on a closed channel from a previous cycle. Whether the
-	// channel was closed or not at this point depends on whether
-	// in-flight drained; both shapes are acceptable transient
-	// states because no new BeginCutoverBarrier has run yet to
-	// allocate a fresh channel.
-	p.drainSig = nil
+	if p.drainSig != nil {
+		select {
+		case <-p.drainSig:
+		default:
+			close(p.drainSig)
+		}
+		// Drop the drainSig reference so a WaitInflightDrained caller
+		// that starts after EndCutoverBarrier sees nil (the
+		// immediate-success degraded path), while callers already
+		// blocked on the old channel are released above.
+		p.drainSig = nil
+	}
 }
 
 // ProposeAdmin mirrors Propose's wrap-applies semantics. See

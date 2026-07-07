@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -756,6 +757,80 @@ func TestRuntimeRaftRegistrationTick_MarksCommittedRegistrationAfterWrapInstall(
 	runtimeRaftRegistrationTick(context.Background(), &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, w, fullNodeID, path)
 	if !gate.Registered(raftDEKID, raftEpoch) {
 		t.Fatal("committed raft registration was not marked after the wrap was installed")
+	}
+}
+
+func TestRuntimeRaftRegistrationTick_LeaderUsesBarrieredPropose(t *testing.T) {
+	t.Parallel()
+	const raftDEKID uint32 = 4
+	const raftEpoch uint16 = 7
+	path := writeRaftCutoverSidecarForStartup(t, raftDEKID, 0, 99)
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+
+	cipher, nonceFactory := newTestRaftEnvelopeRuntimeDeps(t)
+	var cutover atomic.Uint64
+	gate := &raftRegistrationGate{}
+	runtime, err := newRaftEnvelopeRuntime(cipher, nonceFactory, 99, raftDEKID, &cutover, raftEpoch, gate)
+	if err != nil {
+		t.Fatalf("newRaftEnvelopeRuntime: %v", err)
+	}
+	w := encryptionWriteWiring{
+		raftEpoch:        raftEpoch,
+		raftRegistration: gate,
+		raftEnvelope:     runtime,
+	}
+	proposer := &recordingMembershipProposer{}
+	group := &kv.ShardGroup{Store: st, Engine: proposer}
+	coord := kv.NewShardedCoordinator(distribution.NewEngine(), map[uint64]*kv.ShardGroup{1: group}, 1, kv.NewHLC(), nil)
+
+	runtimeRaftRegistrationTick(context.Background(), coord, group, w, fullNodeID, path)
+
+	if proposer.proposeCalls != 1 {
+		t.Fatalf("Propose calls = %d, want 1", proposer.proposeCalls)
+	}
+	if proposer.proposeAdminCalls != 0 {
+		t.Fatalf("ProposeAdmin calls = %d, want 0", proposer.proposeAdminCalls)
+	}
+	if !gate.Registered(raftDEKID, raftEpoch) {
+		t.Fatal("successful raft registration propose did not mark the raft registration gate")
+	}
+}
+
+func TestValidateRaftRegistrationStartupEpochRejectsEqualRegistryRow(t *testing.T) {
+	t.Parallel()
+	const raftDEKID uint32 = 4
+	const raftEpoch uint16 = 7
+	path := writeRaftCutoverSidecarForStartup(t, raftDEKID, 0, 99)
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	preSeedRegistryRow(t, st, raftDEKID, fullNodeID, raftEpoch)
+
+	w := encryptionWriteWiring{
+		raftEpoch:    raftEpoch,
+		raftEnvelope: &raftEnvelopeRuntime{},
+	}
+	err := validateRaftRegistrationStartupEpoch(&kv.ShardGroup{Store: st}, w, "n1", path)
+	if !errors.Is(err, encryption.ErrLocalEpochRollback) {
+		t.Fatalf("validateRaftRegistrationStartupEpoch: want ErrLocalEpochRollback, got %v", err)
+	}
+}
+
+func TestValidateRaftRegistrationStartupEpochAllowsStrictlyAhead(t *testing.T) {
+	t.Parallel()
+	const raftDEKID uint32 = 4
+	const raftEpoch uint16 = 7
+	path := writeRaftCutoverSidecarForStartup(t, raftDEKID, 0, 99)
+	st := newRegistrationTestStore(t)
+	fullNodeID := etcdraftengine.DeriveNodeID("n1")
+	preSeedRegistryRow(t, st, raftDEKID, fullNodeID, raftEpoch-1)
+
+	w := encryptionWriteWiring{
+		raftEpoch:    raftEpoch,
+		raftEnvelope: &raftEnvelopeRuntime{},
+	}
+	if err := validateRaftRegistrationStartupEpoch(&kv.ShardGroup{Store: st}, w, "n1", path); err != nil {
+		t.Fatalf("validateRaftRegistrationStartupEpoch: %v", err)
 	}
 }
 
