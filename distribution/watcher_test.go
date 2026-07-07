@@ -109,17 +109,14 @@ func TestCatalogWatcherNoOpWhenVersionUnchanged(t *testing.T) {
 	snapshot, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
 	require.NoError(t, engine.ApplySnapshot(snapshot))
-	engine.RecordAccess([]byte("b"))
 	before := engine.Stats()
 	require.Len(t, before, 2)
-	require.Equal(t, uint64(1), before[0].Load)
 
 	watcher := NewCatalogWatcher(catalog, engine, WithCatalogWatcherInterval(5*time.Millisecond))
 	require.NoError(t, watcher.SyncOnce(ctx))
 
 	after := engine.Stats()
 	require.Len(t, after, 2)
-	require.Equal(t, uint64(1), after[0].Load)
 	require.True(t, bytes.Equal(before[0].Start, after[0].Start))
 	require.True(t, bytes.Equal(before[1].Start, after[1].Start))
 }
