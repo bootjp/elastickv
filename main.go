@@ -455,6 +455,7 @@ func run() error {
 		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
 		*encryptionSidecarPath,
 		kekWrapper,
+		encWiring.raftEnvelope,
 		etcdraftengine.DeriveNodeID(*raftId),
 		encWiring.epoch,
 		encWiring.raftEpoch,

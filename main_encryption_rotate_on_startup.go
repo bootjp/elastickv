@@ -34,6 +34,7 @@ type encryptionRotateOnStartupTask struct {
 	server       *adapter.EncryptionAdminServer
 	sidecarPath  string
 	kekWrapper   kek.Wrapper
+	raftEnvelope *raftEnvelopeRuntime
 	fullNodeID   uint64
 	storageEpoch uint16
 	raftEpoch    uint16
@@ -52,6 +53,7 @@ func installEncryptionRotateOnStartup(
 	postCutoverProposer raftengine.Proposer,
 	sidecarPath string,
 	kekWrapper kek.Wrapper,
+	raftEnvelope *raftEnvelopeRuntime,
 	fullNodeID uint64,
 	storageEpoch uint16,
 	raftEpoch uint16,
@@ -91,6 +93,7 @@ func installEncryptionRotateOnStartup(
 		server:       server,
 		sidecarPath:  sidecarPath,
 		kekWrapper:   kekWrapper,
+		raftEnvelope: raftEnvelope,
 		fullNodeID:   fullNodeID,
 		storageEpoch: storageEpoch,
 		raftEpoch:    raftEpoch,
@@ -121,7 +124,7 @@ func installEncryptionRotateOnStartupRequest(
 	deregister := controller.RegisterLeaderAcquiredCallback(func() {
 		fire(false)
 	})
-	if !wasLeaderBefore && controller.State() == raftengine.StateLeader {
+	if controller.State() == raftengine.StateLeader && !task.Done() {
 		fire(false)
 	}
 	return deregister
@@ -261,14 +264,26 @@ func (t *encryptionRotateOnStartupTask) rotateLocked(ctx context.Context, purpos
 		ProposerLocalEpoch: uint32(localEpoch),
 	})
 	if err != nil {
+		if retryableEncryptionRotateOnStartupError(err) {
+			t.advanceNextKeyIDLocked(keyID)
+		}
 		return errors.Wrap(err, "encryption rotate-on-startup: RotateDEK")
 	}
+	t.advanceNextKeyIDLocked(keyID)
+	if purpose == pb.RotateDEKRequest_PURPOSE_RAFT && t.raftEnvelope != nil {
+		if err := t.raftEnvelope.installRotatedRaftDEK(keyID); err != nil {
+			return errors.Wrap(err, "encryption rotate-on-startup: install rotated raft envelope wrapper")
+		}
+	}
+	return nil
+}
+
+func (t *encryptionRotateOnStartupTask) advanceNextKeyIDLocked(keyID uint32) {
 	if keyID == math.MaxUint32 {
 		t.nextKeyID = encryption.ReservedKeyID
 	} else {
 		t.nextKeyID = keyID + 1
 	}
-	return nil
 }
 
 func nextEncryptionRotateOnStartupKeyID(sc *encryption.Sidecar) (uint32, error) {
@@ -319,7 +334,7 @@ func retryableEncryptionRotateOnStartupError(err error) bool {
 	case errors.Is(err, context.Canceled):
 		return false
 	}
-	code := status.Code(err)
+	code := status.Code(errors.Cause(err))
 	return code == codes.FailedPrecondition ||
 		code == codes.Unavailable ||
 		code == codes.DeadlineExceeded

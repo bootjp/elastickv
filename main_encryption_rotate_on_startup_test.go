@@ -14,6 +14,9 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
+	crdberrors "github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeRotateStartupController struct {
@@ -108,6 +111,21 @@ func TestInstallEncryptionRotateOnStartupRequest_FollowerFiresOnLeadership(t *te
 	}
 }
 
+func TestInstallEncryptionRotateOnStartupRequest_RechecksLeaderAfterRegister(t *testing.T) {
+	t.Parallel()
+	controller := &fakeRotateStartupController{state: raftengine.StateLeader}
+	runner := &fakeRotateStartupRunner{err: raftengine.ErrLeadershipLost}
+	deregister := installEncryptionRotateOnStartupRequest(context.Background(), controller, runner, nil)
+	defer deregister()
+	deadline := time.Now().Add(2 * time.Second)
+	for runner.runs.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := runner.runs.Load(); got < 2 {
+		t.Fatalf("leader recheck after callback registration did not retry pending rotation; runs=%d", got)
+	}
+}
+
 type fakeStartupKEK struct{}
 
 func (fakeStartupKEK) Wrap(dek []byte) ([]byte, error) {
@@ -188,6 +206,52 @@ func TestEncryptionRotateOnStartupTask_RunRotatesStorageAndRaft(t *testing.T) {
 	}
 	assertRotateProposal(t, rec.proposals[0], pb.RotateDEKRequest_PURPOSE_STORAGE, 9, 11)
 	assertRotateProposal(t, rec.proposals[1], pb.RotateDEKRequest_PURPOSE_RAFT, 10, 12)
+}
+
+func TestEncryptionRotateOnStartupTask_RetryableRotateErrorSkipsUncertainKeyID(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sidecarPath := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:          encryption.SidecarVersion,
+		RaftAppliedIndex: 1,
+		Active:           encryption.ActiveKeys{Storage: 7},
+		Keys: map[string]encryption.SidecarKey{
+			"7": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("storage"), Created: "2026-07-07T00:00:00Z"},
+		},
+	}
+	if err := encryption.WriteSidecar(sidecarPath, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	rec := &recordingRotateProposer{err: status.Error(codes.Unavailable, "commit result uncertain")}
+	task := &encryptionRotateOnStartupTask{
+		server:      adapterServerForRotateStartup(t, sidecarPath, rec),
+		sidecarPath: sidecarPath,
+		kekWrapper:  fakeStartupKEK{},
+		fullNodeID:  0xCAFE,
+	}
+	if err := task.Run(context.Background()); err == nil {
+		t.Fatal("Run returned nil, want retryable rotate error")
+	}
+	if got := task.nextKeyID; got != 9 {
+		t.Fatalf("nextKeyID=%d, want 9 after treating key 8 as uncertain/committed", got)
+	}
+	rec.err = nil
+	if err := task.Run(context.Background()); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if got := len(rec.proposals); got != 1 {
+		t.Fatalf("successful proposals=%d, want 1", got)
+	}
+	assertRotateProposal(t, rec.proposals[0], pb.RotateDEKRequest_PURPOSE_STORAGE, 9, 0)
+}
+
+func TestRetryableEncryptionRotateOnStartupError_UnwrapsStatus(t *testing.T) {
+	t.Parallel()
+	err := crdberrors.Wrap(status.Error(codes.Unavailable, "try later"), "wrapped")
+	if !retryableEncryptionRotateOnStartupError(err) {
+		t.Fatal("wrapped Unavailable status must be retryable")
+	}
 }
 
 func adapterServerForRotateStartup(t *testing.T, sidecarPath string, rec *recordingRotateProposer) *adapter.EncryptionAdminServer {

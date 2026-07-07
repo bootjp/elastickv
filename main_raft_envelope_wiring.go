@@ -98,6 +98,32 @@ func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKI
 	return nil
 }
 
+func (r *raftEnvelopeRuntime) installRotatedRaftDEK(activeRaftDEKID uint32) error {
+	if r == nil {
+		return nil
+	}
+	if r.cutoverIndex == nil {
+		return errors.New("raft envelope runtime: nil cutover cell")
+	}
+	if r.cutoverIndex.Load() == 0 {
+		return nil
+	}
+	if activeRaftDEKID == 0 {
+		return errors.New("raft envelope runtime: active raft DEK must be non-zero")
+	}
+	wrap, err := r.wrapFor(activeRaftDEKID)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.activeWrap = wrap
+	for _, g := range r.groups {
+		g.SetRaftPayloadWrap(wrap)
+	}
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *raftEnvelopeRuntime) reinstallActiveWrap() {
 	if r == nil {
 		return
