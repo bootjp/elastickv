@@ -291,14 +291,7 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 			return nil
 		}
 
-		if lenDelta != 0 {
-			deltaVal := store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: lenDelta})
-			elems = append(elems, &kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   store.SetMetaDeltaKey(key, commitTS, 0),
-				Value: deltaVal,
-			})
-		}
+		elems = appendSetDeltaElems(elems, key, lenDelta, commitTS)
 
 		if len(elems) == 0 {
 			return nil
@@ -316,6 +309,21 @@ func (r *RedisServer) mutateExactSetWide(conn redcon.Conn, ctx context.Context, 
 		return
 	}
 	conn.WriteInt(changed)
+}
+
+func appendSetDeltaElems(elems []*kv.Elem[kv.OP], key []byte, lenDelta int64, commitTS uint64) []*kv.Elem[kv.OP] {
+	if lenDelta == 0 {
+		return elems
+	}
+	if lenDelta > 0 {
+		elems = append(elems, redisTxnWideSetFenceElem(key))
+	}
+	deltaVal := store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: lenDelta})
+	return append(elems, &kv.Elem[kv.OP]{
+		Op:    kv.Put,
+		Key:   store.SetMetaDeltaKey(key, commitTS, 0),
+		Value: deltaVal,
+	})
 }
 
 // scanSetMemberExistsMap does a paginated prefix scan of all member keys for

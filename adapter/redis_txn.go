@@ -16,6 +16,7 @@ import (
 )
 
 var redisTxnKeyPrefix = []byte("!txn|")
+var redisTxnWideFencePrefix = []byte("!txn|redis-wide|")
 
 type txnCommandHandler func(*txnContext, redcon.Command) (redisResult, error)
 
@@ -168,6 +169,46 @@ func stageListDelete(st *listTxnState) {
 	}
 	st.deleted = true
 	st.appends = nil
+}
+
+func redisTxnWideHashFenceKey(userKey []byte) []byte {
+	return redisTxnWideFenceKey([]byte("hash|"), userKey)
+}
+
+func redisTxnWideSetFenceKey(userKey []byte) []byte {
+	return redisTxnWideFenceKey([]byte("set|"), userKey)
+}
+
+func redisTxnWideFenceUserKey(key []byte) []byte {
+	for _, prefix := range [][]byte{
+		redisTxnWideFenceKey([]byte("hash|"), nil),
+		redisTxnWideFenceKey([]byte("set|"), nil),
+	} {
+		if bytes.HasPrefix(key, prefix) {
+			return key[len(prefix):]
+		}
+	}
+	return nil
+}
+
+func redisTxnWideFenceKey(kind, userKey []byte) []byte {
+	buf := make([]byte, 0, len(redisTxnWideFencePrefix)+len(kind)+len(userKey))
+	buf = append(buf, redisTxnWideFencePrefix...)
+	buf = append(buf, kind...)
+	buf = append(buf, userKey...)
+	return buf
+}
+
+func redisTxnWideHashFenceElem(userKey []byte) *kv.Elem[kv.OP] {
+	return redisTxnWideFenceElem(redisTxnWideHashFenceKey(userKey))
+}
+
+func redisTxnWideSetFenceElem(userKey []byte) *kv.Elem[kv.OP] {
+	return redisTxnWideFenceElem(redisTxnWideSetFenceKey(userKey))
+}
+
+func redisTxnWideFenceElem(key []byte) *kv.Elem[kv.OP] {
+	return &kv.Elem[kv.OP]{Op: kv.Put, Key: key, Value: []byte{}}
 }
 
 func (t *txnContext) trackReadKey(key []byte) {
@@ -452,73 +493,83 @@ func (t *txnContext) stagedKeyType(key []byte) (redisValueType, error) {
 	if _, ok := t.replacers[k]; ok {
 		return redisTypeString, nil
 	}
-	if typ, ok := t.stagedHashType(k); ok {
+	if typ, ok := t.stagedPositiveKeyType(k); ok {
 		return typ, nil
 	}
-	if typ, ok := t.stagedZSetType(k); ok {
-		return typ, nil
-	}
-	if typ, ok := t.stagedListType(k); ok {
-		return typ, nil
-	}
-	if typ, ok := t.stagedStringType(k); ok {
-		return typ, nil
-	}
-	if _, ok := t.deletedKeys[k]; ok {
+	if t.hasStagedTypeDeletion(k) {
 		return redisTypeNone, nil
 	}
 	t.trackTypeReadKeys(key)
 	return t.server.keyTypeAt(t.ctxOrBackground(), key, t.startTS)
 }
 
-func (t *txnContext) stagedHashType(key string) (redisValueType, bool) {
-	st, ok := t.hashStates[key]
-	if !ok {
-		return redisTypeNone, false
+func (t *txnContext) stagedPositiveKeyType(key string) (redisValueType, bool) {
+	if t.hasPositiveHashState(key) {
+		return redisTypeHash, true
 	}
-	if st.deleted {
-		return redisTypeNone, true
+	if t.hasPositiveZSetState(key) {
+		return redisTypeZSet, true
 	}
-	if len(st.fields) == 0 {
-		return redisTypeNone, true
-	}
-	return redisTypeHash, true
-}
-
-func (t *txnContext) stagedZSetType(key string) (redisValueType, bool) {
-	st, ok := t.zsetStates[key]
-	if !ok || (!st.dirty && !st.exists) {
-		return redisTypeNone, false
-	}
-	if len(st.members) == 0 {
-		return redisTypeNone, true
-	}
-	return redisTypeZSet, true
-}
-
-func (t *txnContext) stagedListType(key string) (redisValueType, bool) {
-	st, ok := t.listStates[key]
-	if !ok {
-		return redisTypeNone, false
-	}
-	if st.deleted {
-		return redisTypeNone, true
-	}
-	if st.metaExists || len(st.appends) > 0 {
+	if t.hasPositiveListState(key) {
 		return redisTypeList, true
+	}
+	if t.hasPositiveStringState(key) {
+		return redisTypeString, true
 	}
 	return redisTypeNone, false
 }
 
-func (t *txnContext) stagedStringType(key string) (redisValueType, bool) {
+func (t *txnContext) hasStagedTypeDeletion(key string) bool {
+	return t.hasDeletedHashState(key) ||
+		t.hasDeletedZSetState(key) ||
+		t.hasDeletedListState(key) ||
+		t.hasDeletedStringState(key) ||
+		t.isLogicallyDeleted(key)
+}
+
+func (t *txnContext) hasPositiveHashState(key string) bool {
+	st, ok := t.hashStates[key]
+	return ok && !st.deleted && len(st.fields) > 0
+}
+
+func (t *txnContext) hasPositiveZSetState(key string) bool {
+	st, ok := t.zsetStates[key]
+	return ok && len(st.members) > 0
+}
+
+func (t *txnContext) hasPositiveListState(key string) bool {
+	st, ok := t.listStates[key]
+	return ok && !st.deleted && (st.metaExists || len(st.appends) > 0)
+}
+
+func (t *txnContext) hasPositiveStringState(key string) bool {
 	tv, ok := t.working[string(redisStrKey([]byte(key)))]
-	if !ok {
-		return redisTypeNone, false
-	}
-	if tv.deleted || tv.raw == nil {
-		return redisTypeNone, true
-	}
-	return redisTypeString, true
+	return ok && !tv.deleted && tv.raw != nil
+}
+
+func (t *txnContext) hasDeletedHashState(key string) bool {
+	st, ok := t.hashStates[key]
+	return ok && (st.deleted || len(st.fields) == 0)
+}
+
+func (t *txnContext) hasDeletedZSetState(key string) bool {
+	st, ok := t.zsetStates[key]
+	return ok && (st.dirty || st.exists) && len(st.members) == 0
+}
+
+func (t *txnContext) hasDeletedListState(key string) bool {
+	st, ok := t.listStates[key]
+	return ok && st.deleted
+}
+
+func (t *txnContext) hasDeletedStringState(key string) bool {
+	tv, ok := t.working[string(redisStrKey([]byte(key)))]
+	return ok && (tv.deleted || tv.raw == nil)
+}
+
+func (t *txnContext) isLogicallyDeleted(key string) bool {
+	_, ok := t.deletedKeys[key]
+	return ok
 }
 
 func (t *txnContext) apply(cmd redcon.Command) (redisResult, error) {
@@ -1047,6 +1098,8 @@ func (t *txnContext) markLogicalDeletion(key []byte, k string) {
 	}
 	t.hashDeletes[k] = bytes.Clone(key)
 	t.setDeletes[k] = bytes.Clone(key)
+	t.trackReadKey(redisTxnWideHashFenceKey(key))
+	t.trackReadKey(redisTxnWideSetFenceKey(key))
 	if st, ok := t.hashStates[k]; ok {
 		st.deleted = true
 		st.dirty = false
@@ -1401,12 +1454,12 @@ func (t *txnContext) buildLogicalDeletionElems(ctx context.Context) ([]*kv.Elem[
 
 func (t *txnContext) buildHashDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
 	return t.buildWideDeletionElems(ctx, t.hashDeletes,
-		store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix)
+		store.HashFieldScanPrefix, store.HashMetaKey, store.HashMetaDeltaScanPrefix, redisTxnWideHashFenceKey)
 }
 
 func (t *txnContext) buildSetDeletionElems(ctx context.Context) ([]*kv.Elem[kv.OP], error) {
 	return t.buildWideDeletionElems(ctx, t.setDeletes,
-		store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix)
+		store.SetMemberScanPrefix, store.SetMetaKey, store.SetMetaDeltaScanPrefix, redisTxnWideSetFenceKey)
 }
 
 func (t *txnContext) buildWideDeletionElems(
@@ -1415,6 +1468,7 @@ func (t *txnContext) buildWideDeletionElems(
 	fieldPrefix func([]byte) []byte,
 	metaKey func([]byte) []byte,
 	deltaPrefix func([]byte) []byte,
+	fenceKey func([]byte) []byte,
 ) ([]*kv.Elem[kv.OP], error) {
 	if len(deletes) == 0 {
 		return nil, nil
@@ -1431,6 +1485,7 @@ func (t *txnContext) buildWideDeletionElems(
 	var elems []*kv.Elem[kv.OP]
 	for _, k := range keys {
 		key := deletes[k]
+		t.trackReadKey(fenceKey(key))
 		next, err := t.server.deleteWideColumnElems(ctx, t.startTS,
 			fieldPrefix(key), metaKey(key), deltaPrefix(key))
 		if err != nil {
@@ -1718,11 +1773,14 @@ func appendHashChangedFieldElems(elems []*kv.Elem[kv.OP], key []byte, st *hashTx
 
 func appendHashDeltaElem(elems []*kv.Elem[kv.OP], key []byte, newFields int64, commitTS uint64, seqInTxn uint32) []*kv.Elem[kv.OP] {
 	deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: newFields})
-	return append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.HashMetaDeltaKey(key, commitTS, seqInTxn),
-		Value: deltaVal,
-	})
+	return append(elems,
+		redisTxnWideHashFenceElem(key),
+		&kv.Elem[kv.OP]{
+			Op:    kv.Put,
+			Key:   store.HashMetaDeltaKey(key, commitTS, seqInTxn),
+			Value: deltaVal,
+		},
+	)
 }
 
 const hashLegacyRewriteOverhead = 2

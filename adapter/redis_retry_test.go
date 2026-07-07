@@ -321,6 +321,18 @@ func TestNormalizeRetryableRedisTxnErrTxnTTLKey(t *testing.T) {
 	require.NotContains(t, normalized.Error(), redisTTLPrefix)
 }
 
+func TestNormalizeRetryableRedisTxnErrWideFenceKey(t *testing.T) {
+	t.Parallel()
+
+	err := store.NewWriteConflictError(redisTxnWideHashFenceKey([]byte("retry:hash")))
+
+	normalized := normalizeRetryableRedisTxnErr(err)
+
+	require.ErrorIs(t, normalized, store.ErrWriteConflict)
+	require.ErrorContains(t, normalized, "key: retry:hash")
+	require.NotContains(t, normalized.Error(), string(redisTxnWideFencePrefix))
+}
+
 func TestNormalizeRetryableRedisTxnErrPreservesTxnLockedDetail(t *testing.T) {
 	t.Parallel()
 

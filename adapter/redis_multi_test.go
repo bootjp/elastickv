@@ -286,6 +286,53 @@ func TestRedis_MultiExec_ListOpsRejectStagedHashAndString(t *testing.T) {
 	require.Equal(t, "1", rdb.Get(ctx, "txn:string-before-list").Val())
 }
 
+func TestRedis_MultiExec_StagedTypeAfterDeleteWinsOverDeletionOnlyState(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+
+	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
+	defer func() { _ = rdb.Close() }()
+	ctx := context.Background()
+
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "HSET", "txn:hash-del-list-hash", "f", "v").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "DEL", "txn:hash-del-list-hash").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "RPUSH", "txn:hash-del-list-hash", "x").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "HSET", "txn:hash-del-list-hash", "g", "w").Val())
+	execRes, err := rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok := execRes.([]any)
+	require.True(t, ok)
+	require.Len(t, vals, 4)
+	require.Equal(t, int64(1), vals[0])
+	require.Equal(t, int64(1), vals[1])
+	require.Equal(t, int64(1), vals[2])
+	hashErr, ok := vals[3].(error)
+	require.True(t, ok, "HSET after recreated list should be an EXEC item error, got %T", vals[3])
+	require.Contains(t, hashErr.Error(), "WRONGTYPE")
+	rangeRes, err := rdb.Do(ctx, "LRANGE", "txn:hash-del-list-hash", 0, -1).Result()
+	require.NoError(t, err)
+	require.Equal(t, []any{"x"}, rangeRes)
+
+	require.NoError(t, rdb.Set(ctx, "txn:str-del-incr-rpush", "old", 0).Err())
+	require.Equal(t, "OK", rdb.Do(ctx, "MULTI").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "DEL", "txn:str-del-incr-rpush").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "INCR", "txn:str-del-incr-rpush").Val())
+	require.Equal(t, "QUEUED", rdb.Do(ctx, "RPUSH", "txn:str-del-incr-rpush", "x").Val())
+	execRes, err = rdb.Do(ctx, "EXEC").Result()
+	require.NoError(t, err)
+	vals, ok = execRes.([]any)
+	require.True(t, ok)
+	require.Len(t, vals, 3)
+	require.Equal(t, int64(1), vals[0])
+	require.Equal(t, int64(1), vals[1])
+	listErr, ok := vals[2].(error)
+	require.True(t, ok, "RPUSH after recreated string should be an EXEC item error, got %T", vals[2])
+	require.Contains(t, listErr.Error(), "WRONGTYPE")
+	require.Equal(t, "1", rdb.Get(ctx, "txn:str-del-incr-rpush").Val())
+}
+
 func TestRedis_RPushLRange(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 3)

@@ -162,11 +162,14 @@ func (r *RedisServer) applyHashFieldPairs(key []byte, args [][]byte) (int, error
 		// Emit a single delta key for all newly-added fields.
 		if newFields != 0 {
 			deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: int64(newFields)})
-			elems = append(elems, &kv.Elem[kv.OP]{
-				Op:    kv.Put,
-				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-				Value: deltaVal,
-			})
+			elems = append(elems,
+				redisTxnWideHashFenceElem(key),
+				&kv.Elem[kv.OP]{
+					Op:    kv.Put,
+					Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+					Value: deltaVal,
+				},
+			)
 		}
 
 		if len(elems) == 0 {
@@ -691,11 +694,14 @@ func (r *RedisServer) hincrbyWithMigration(ctx context.Context, key, fieldKey []
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-			Value: deltaVal,
-		})
+		elems = append(elems,
+			redisTxnWideHashFenceElem(key),
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+				Value: deltaVal,
+			},
+		)
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
@@ -734,11 +740,14 @@ func (r *RedisServer) hincrbyTxn(ctx context.Context, key, field []byte, increme
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: fieldKey, Value: []byte(newVal)})
 	if isNewField {
 		deltaVal := store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1})
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.HashMetaDeltaKey(key, commitTS, 0),
-			Value: deltaVal,
-		})
+		elems = append(elems,
+			redisTxnWideHashFenceElem(key),
+			&kv.Elem[kv.OP]{
+				Op:    kv.Put,
+				Key:   store.HashMetaDeltaKey(key, commitTS, 0),
+				Value: deltaVal,
+			},
+		)
 	}
 	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,

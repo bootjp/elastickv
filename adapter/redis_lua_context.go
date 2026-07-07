@@ -3423,7 +3423,7 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 	}
 	// Wide-column: write per-field keys and a base meta key with the final count.
 	// deleteLogicalKeyElems (called by the Lua commit flow) clears any old keys.
-	elems := make([]*kv.Elem[kv.OP], 0, len(st.value)+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.value)+setWideColOverhead)
 	for field, val := range st.value {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -3431,6 +3431,7 @@ func (c *luaScriptContext) hashCommitElems(key string) ([]*kv.Elem[kv.OP], error
 			Value: []byte(val),
 		})
 	}
+	elems = append(elems, redisTxnWideHashFenceElem([]byte(key)))
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.HashMetaKey([]byte(key)),
@@ -3449,7 +3450,7 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 		return nil, nil
 	}
 	// Wide-column: write per-member keys and a base meta key with the final count.
-	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)+1)
+	elems := make([]*kv.Elem[kv.OP], 0, len(st.members)+setWideColOverhead)
 	for member := range st.members {
 		elems = append(elems, &kv.Elem[kv.OP]{
 			Op:    kv.Put,
@@ -3457,6 +3458,7 @@ func (c *luaScriptContext) setCommitElems(key string) ([]*kv.Elem[kv.OP], error)
 			Value: []byte{},
 		})
 	}
+	elems = append(elems, redisTxnWideSetFenceElem([]byte(key)))
 	elems = append(elems, &kv.Elem[kv.OP]{
 		Op:    kv.Put,
 		Key:   store.SetMetaKey([]byte(key)),

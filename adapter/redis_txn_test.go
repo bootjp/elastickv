@@ -17,6 +17,25 @@ func newRedisStorageMigrationTestServer(t *testing.T) (*RedisServer, store.MVCCS
 	return server, st
 }
 
+func newRedisTxnTestContext(server *RedisServer, startTS uint64) *txnContext {
+	return &txnContext{
+		server:          server,
+		working:         map[string]*txnValue{},
+		replacers:       map[string]*stringReplacement{},
+		listStates:      map[string]*listTxnState{},
+		hashStates:      map[string]*hashTxnState{},
+		zsetStates:      map[string]*zsetTxnState{},
+		ttlStates:       map[string]*ttlTxnState{},
+		readKeys:        map[string][]byte{},
+		deletedKeys:     map[string]struct{}{},
+		logicalDeletes:  map[string][]byte{},
+		hashDeletes:     map[string][]byte{},
+		setDeletes:      map[string][]byte{},
+		streamDeletions: map[string][]byte{},
+		startTS:         startTS,
+	}
+}
+
 // TestRedisTxnValidateReadSet_ConcurrentRPushTriggersConflict verifies that a
 // concurrent RPUSH to a list triggers an OCC read-write conflict for a MULTI
 // transaction that read the list via LRANGE.  Without the boundary key tracking
@@ -163,6 +182,61 @@ func TestRedisTxnValidateReadSet_TTLUpdateNoConflict(t *testing.T) {
 
 	err = txn.validateReadSet(context.Background())
 	require.NoError(t, err)
+}
+
+func TestRedisTxnWideHashDeleteConflictsWithConcurrentNewField(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newOCCAdapterCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	key := []byte("hash:wide-delete-conflict")
+
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, []byte("old")), []byte("v"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), 10, 0))
+	coord.Clock().Observe(10)
+
+	txn := newRedisTxnTestContext(server, 10)
+	res, err := txn.stageKeyDeletion(key)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res.integer)
+
+	added, err := server.applyHashFieldPairs(key, [][]byte{[]byte("new"), []byte("v")})
+	require.NoError(t, err)
+	require.Equal(t, 1, added)
+
+	err = txn.validateReadSet(ctx)
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"wide hash DEL in MULTI must conflict with concurrent HSET of a new field")
+}
+
+func TestRedisTxnWideSetDeleteConflictsWithConcurrentNewMember(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newOCCAdapterCoordinator(st)
+	server := NewRedisServer(nil, "", st, coord, nil, nil)
+	key := []byte("set:wide-delete-conflict")
+
+	require.NoError(t, st.PutAt(ctx, store.SetMemberKey(key, []byte("old")), []byte{}, 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.SetMetaKey(key), store.MarshalSetMeta(store.SetMeta{Len: 1}), 10, 0))
+	coord.Clock().Observe(10)
+
+	txn := newRedisTxnTestContext(server, 10)
+	res, err := txn.stageKeyDeletion(key)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res.integer)
+
+	conn := &recordingConn{}
+	server.mutateExactSetWide(conn, ctx, key, [][]byte{[]byte("new")}, true)
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(1), conn.int)
+
+	err = txn.validateReadSet(ctx)
+	require.ErrorIs(t, err, store.ErrWriteConflict,
+		"wide set DEL in MULTI must conflict with concurrent SADD of a new member")
 }
 
 // TestRedisTxnMULTIEXECRetriesOnCoordinatorConflict verifies that runTransaction
