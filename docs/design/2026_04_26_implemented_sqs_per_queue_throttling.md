@@ -26,7 +26,7 @@ This document describes per-queue token-bucket throttling, configured per-queue 
 
 1. **Per-queue rate limits** that an operator can set via `SetQueueAttributes` and read back via `GetQueueAttributes`. Limits are persisted on the queue meta record (one Raft commit, no separate keyspace).
 2. **Per-action granularity** — `SendMessage` and `ReceiveMessage` have independent buckets so a slow consumer cannot pin the producer or vice versa. Batch verbs charge by entry count, not by call count.
-3. **AWS-shape errors**: throttled requests return HTTP `400` with the `Throttling` error code in whichever envelope the request protocol uses (`{"__type":"Throttling", ...}` for the JSON path, `<Code>Throttling</Code>` for the query/XML path — see §3.4 for the exact wire shape per protocol) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code.
+3. **AWS-shape errors**: throttled JSON-path requests return HTTP `400` with the `Throttling` error code (`{"__type":"Throttling", ...}`) and a `Retry-After` header. SDKs already special-case this code with exponential backoff; we do not invent a new code. Query/XML message verbs are not claimed by this lifecycle update until the query dispatcher wires those verbs into the same throttled handlers.
 4. **Default-off**. Queues created before this feature, and queues created without explicit limits, are not throttled. Operators opt in per queue.
 5. **No coordination per request**. Token replenishment is local to whichever node owns the bucket (the leader for the queue's shard); there is no Raft round-trip on the throttling check.
 6. **Observable**: per-queue throttle counters are exposed via the existing Prometheus registry so dashboards can spot throttling before users do.
@@ -66,7 +66,7 @@ The check sits **between SigV4 authorisation and the existing handler dispatch**
 
 - the queue name (parsed from the request body's `QueueUrl` / `QueueName`);
 - this node is the verified leader for the queue's shard (`isVerifiedSQSLeader`); any non-leader has been forwarded by `proxyToLeader` and re-evaluates the limit on landing;
-- the action (`X-Amz-Target` for JSON, `Action` form parameter for query).
+- the action (`X-Amz-Target` for the implemented JSON path; future query/XML message-verb wiring will use the `Action` form parameter).
 
 ### 3.1 Where the bucket lives
 
@@ -191,7 +191,7 @@ On rejection:
 | Protocol | Response |
 |---|---|
 | JSON | HTTP 400, body `{"__type":"Throttling","message":"Rate exceeded for queue '<name>' action '<action>'"}`, header `x-amzn-ErrorType: Throttling`, header `Retry-After: <seconds>` (computed per below) |
-| Query | HTTP 400, body `<ErrorResponse><Error><Type>Sender</Type><Code>Throttling</Code><Message>...</Message></Error><RequestId>...</RequestId></ErrorResponse>`, headers as above |
+| Query | Not implemented for throttled message verbs in this lifecycle update. The current query dispatcher wires catalog verbs only and returns `NotImplementedYet` for message actions; when query message handlers land, they should mirror the JSON throttling code with `<Code>Throttling</Code>` in the XML error body. |
 
 `Retry-After` is computed from the *actual* refill rate AND the *requested* token count so neither slow refill nor large batches cause a busy-loop of premature retries (two consecutive review findings on PR #664 caught both: first the `Retry-After: 1` constant lying for sub-1-RPS refill — `SendRefillPerSecond = 0.1` needs 10 s for the next token; then the formula's hardcoded numerator `1.0` lying for batch verbs that charge >1 token — a `SendMessageBatch` of 10 against `refillRate = 1.0` and 0 tokens needs 10 s, not 1):
 
@@ -272,7 +272,7 @@ Strict-validation SDKs that reject unknown attribute names will reject `Throttle
 
 4. **Configuration round-trip**: `SetQueueAttributes` with throttle config → `GetQueueAttributes` returns the same values; an unknown `Throttle*` attribute name is rejected with 400 `InvalidAttributeName` (matching AWS behaviour for unrecognised attributes).
 
-5. **Cross-protocol parity**: throttled JSON and Query requests both surface `Throttling` (different envelope, same code).
+5. **JSON protocol coverage**: throttled JSON requests surface `Throttling` with `Retry-After`. Query/XML parity is a follow-up gated on wiring the query message handlers to the same throttle path.
 
 6. **Failover behaviour** (3-node cluster): kill the current leader after 3 messages, confirm the next leader starts the bucket fresh and accepts up to capacity again. Log line records the failover so operators can correlate.
 
