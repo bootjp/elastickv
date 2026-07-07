@@ -153,12 +153,7 @@ func TestRaftEnvelopeRuntime_WrapRequiresRaftWriterRegistration(t *testing.T) {
 
 func TestValidateRaftEnvelopeStartupScopeRefusesActiveMultiGroup(t *testing.T) {
 	t.Parallel()
-	var cutover atomic.Uint64
-	cutover.Store(99)
-	err := validateRaftEnvelopeStartupScope(
-		encryptionWriteWiring{raftEnvelope: &raftEnvelopeRuntime{cutoverIndex: &cutover}},
-		[]groupSpec{{id: 1}, {id: 2}},
-	)
+	err := validateRaftEnvelopeStartupScope(99, []groupSpec{{id: 1}, {id: 2}})
 	if err == nil {
 		t.Fatal("validateRaftEnvelopeStartupScope returned nil for active cutover with multiple groups")
 	}

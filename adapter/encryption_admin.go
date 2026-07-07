@@ -594,7 +594,7 @@ func (s *EncryptionAdminServer) BootstrapEncryption(ctx context.Context, req *pb
 		BatchRegistry:  batch,
 	}
 	body := fsmwire.EncodeBootstrap(payload)
-	idx, err := s.proposeEncryptionEntry(ctx, fsmwire.OpBootstrap, body)
+	idx, err := s.proposeSerializedEncryptionEntry(ctx, fsmwire.OpBootstrap, body)
 	if err != nil {
 		return nil, err
 	}

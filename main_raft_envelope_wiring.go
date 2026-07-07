@@ -113,13 +113,13 @@ func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKI
 	if err != nil {
 		return err
 	}
-	r.cutoverIndex.Store(cutoverIdx)
 	r.mu.Lock()
 	r.activeWrap = wrap
 	for _, g := range r.groups {
 		g.SetRaftPayloadWrap(wrap)
 	}
 	r.mu.Unlock()
+	r.cutoverIndex.Store(cutoverIdx)
 	return nil
 }
 

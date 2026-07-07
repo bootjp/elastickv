@@ -37,6 +37,18 @@ func writeActiveStorageSidecar(t *testing.T, storageEpoch uint16) string {
 	return path
 }
 
+func markRaftEnvelopeCutoverInSidecar(t *testing.T, path string, cutover uint64) {
+	t.Helper()
+	sc, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	sc.RaftEnvelopeCutoverIndex = cutover
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+}
+
 func TestEncryptionWriteWiring_PebbleOptions_CleartextWhenNoCipher(t *testing.T) {
 	t.Parallel()
 	if opts := (encryptionWriteWiring{}).pebbleOptions(); opts != nil {
@@ -137,8 +149,9 @@ func TestPrepareStorageNonceEpoch_ActiveDEK_HydratesAndBumps(t *testing.T) {
 func TestPrepareRaftNonceEpoch_ActiveDEK_HydratesAndBumps(t *testing.T) {
 	t.Parallel()
 	path := writeActiveStorageSidecar(t, 2)
+	markRaftEnvelopeCutoverInSidecar(t, path, 55)
 	ks := encryption.NewKeystore()
-	epoch, err := prepareRaftNonceEpoch(path, wiringFakeKEK{}, ks)
+	epoch, err := prepareRaftNonceEpoch(path, wiringFakeKEK{}, ks, 55)
 	if err != nil {
 		t.Fatalf("prepareRaftNonceEpoch: %v", err)
 	}
@@ -159,6 +172,25 @@ func TestPrepareRaftNonceEpoch_ActiveDEK_HydratesAndBumps(t *testing.T) {
 	}
 }
 
+func TestPrepareRaftNonceEpoch_InactiveCutoverDoesNotBump(t *testing.T) {
+	t.Parallel()
+	path := writeActiveStorageSidecar(t, 2)
+	epoch, err := prepareRaftNonceEpoch(path, wiringFakeKEK{}, encryption.NewKeystore(), 0)
+	if err != nil {
+		t.Fatalf("prepareRaftNonceEpoch: %v", err)
+	}
+	if epoch != 0 {
+		t.Errorf("raft epoch = %d, want 0 while raft envelope cutover is inactive", epoch)
+	}
+	sc, err := encryption.ReadSidecar(path)
+	if err != nil {
+		t.Fatalf("ReadSidecar: %v", err)
+	}
+	if sc.Keys["4"].LocalEpoch != 0 {
+		t.Errorf("persisted raft epoch = %d, want unchanged 0", sc.Keys["4"].LocalEpoch)
+	}
+}
+
 func TestBuildEncryptionWriteWiring_DisabledOrUnconfigured_Cleartext(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -173,7 +205,7 @@ func TestBuildEncryptionWriteWiring_DisabledOrUnconfigured_Cleartext(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			w, err := buildEncryptionWriteWiring(tc.enabled, "n1", tc.sidecarPath, tc.kek, encryption.NewKeystore())
+			w, err := buildEncryptionWriteWiring(tc.enabled, "n1", tc.sidecarPath, tc.kek, encryption.NewKeystore(), nil)
 			if err != nil {
 				t.Fatalf("buildEncryptionWriteWiring: %v", err)
 			}
@@ -193,7 +225,8 @@ func TestBuildEncryptionWriteWiring_DisabledOrUnconfigured_Cleartext(t *testing.
 func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	t.Parallel()
 	path := writeActiveStorageSidecar(t, 2)
-	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore())
+	markRaftEnvelopeCutoverInSidecar(t, path, 55)
+	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}})
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}

@@ -1747,6 +1747,13 @@ func TestEncryptionAdmin_AdminMutatorsHonorCtxDeadlineWaitingOnCutover(t *testin
 		call func(*EncryptionAdminServer, context.Context) error
 	}{
 		{
+			name: "BootstrapEncryption",
+			call: func(s *EncryptionAdminServer, ctx context.Context) error {
+				_, err := s.BootstrapEncryption(ctx, validBootstrapEncryptionRequest())
+				return err
+			},
+		},
+		{
 			name: "RotateDEK",
 			call: func(s *EncryptionAdminServer, ctx context.Context) error {
 				_, err := s.RotateDEK(ctx, validRotateDEKRequest())

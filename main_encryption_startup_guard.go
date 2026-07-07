@@ -242,8 +242,12 @@ func checkEnvelopeCutoverDivergenceBeforeNonceBump(
 		return nil
 	}
 	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
-	if err != nil || sc == nil {
+	if err != nil {
 		return err
+	}
+	sidecarCutover := uint64(0)
+	if sc != nil {
+		sidecarCutover = sc.RaftEnvelopeCutoverIndex
 	}
 	dir := groupDataDir(raftDir, raftID, defaultGroup, multi)
 	if !hasGroup(defaultGroup, groups) {
@@ -254,7 +258,7 @@ func checkEnvelopeCutoverDivergenceBeforeNonceBump(
 		return pkgerrors.Wrap(err, "encryption startup guard: open newest FSM snapshot payload")
 	}
 	defer payload.Close()
-	return checkEnvelopeCutoverDivergenceSnapshotPayload(payload, sc.RaftEnvelopeCutoverIndex, defaultGroup)
+	return checkEnvelopeCutoverDivergenceSnapshotPayload(payload, sidecarCutover, defaultGroup)
 }
 
 func checkEnvelopeCutoverDivergenceSnapshotPayload(payload io.Reader, sidecarCutover, defaultGroup uint64) error {
