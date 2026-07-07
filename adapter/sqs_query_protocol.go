@@ -140,6 +140,7 @@ func (s *SQSServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeSQSError(w, http.StatusBadRequest, sqsErrMissingParameter, "Action is required")
 		return
 	}
+	s.fillQueryQueueURLFromPath(r, form)
 	if h := sqsQueryHandlers[action]; h != nil {
 		h(s, w, r, form)
 		return
@@ -153,6 +154,29 @@ func (s *SQSServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		"NotImplementedYet",
 		"query-protocol Action "+action+" is not yet wired in elastickv (Phase 3.B follow-up)",
 	))
+}
+
+func (s *SQSServer) fillQueryQueueURLFromPath(r *http.Request, form url.Values) {
+	if strings.TrimSpace(form.Get("QueueUrl")) != "" {
+		return
+	}
+	queueName := queryQueueNameFromRequestPath(r)
+	if queueName == "" {
+		return
+	}
+	form.Set("QueueUrl", s.queueURL(r, queueName))
+}
+
+func queryQueueNameFromRequestPath(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	path := strings.Trim(r.URL.Path, "/")
+	if path == "" {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	return strings.TrimSpace(parts[len(parts)-1])
 }
 
 // readQueryForm extracts the form values from either the request
@@ -657,7 +681,7 @@ func parseQueryChangeMessageVisibilityBatch(form url.Values) (*sqsChangeVisBatch
 	entries := make([]sqsChangeVisBatchEntryInput, 0)
 	for _, idx := range collectQueryEntryIndices(form, "ChangeMessageVisibilityBatchRequestEntry") {
 		prefix := "ChangeMessageVisibilityBatchRequestEntry." + strconv.Itoa(idx)
-		timeout, err := parseRequiredQueryInt64At(form, prefix+".VisibilityTimeout")
+		timeout, err := parseOptionalQueryInt64At(form, prefix+".VisibilityTimeout")
 		if err != nil {
 			return nil, err
 		}
@@ -864,6 +888,7 @@ func collectIndexedKVPairs(form url.Values, prefix, keyField string) map[string]
 		return nil
 	}
 	pairs := gatherIndexedKVPairs(form, prefix+".", "."+keyField)
+	pairs = append(pairs, gatherUnindexedKVPair(form, prefix, keyField)...)
 	if len(pairs) == 0 {
 		return nil
 	}
@@ -881,6 +906,15 @@ func collectIndexedKVPairs(form url.Values, prefix, keyField string) map[string]
 		return nil
 	}
 	return out
+}
+
+func gatherUnindexedKVPair(form url.Values, prefix, keyField string) []indexedKVPair {
+	key := form.Get(prefix + "." + keyField)
+	value := form.Get(prefix + ".Value")
+	if key == "" || value == "" {
+		return nil
+	}
+	return []indexedKVPair{{idx: 0, mapKey: key, mapVal: value}}
 }
 
 // indexedKVPair is an intermediate (idx, key, value) triple used to

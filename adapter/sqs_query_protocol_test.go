@@ -115,6 +115,24 @@ func TestCollectIndexedKVPairs_TagSuffix(t *testing.T) {
 	}
 }
 
+func TestCollectIndexedKVPairs_UnindexedSinglePair(t *testing.T) {
+	t.Parallel()
+	form := url.Values{
+		"Attribute.Name":  []string{"VisibilityTimeout"},
+		"Attribute.Value": []string{"60"},
+		"Tag.Key":         []string{"env"},
+		"Tag.Value":       []string{"prod"},
+	}
+	attrs := collectIndexedKVPairs(form, "Attribute", "Name")
+	if attrs["VisibilityTimeout"] != "60" {
+		t.Fatalf("unindexed attribute map = %v, want VisibilityTimeout=60", attrs)
+	}
+	tags := collectIndexedKVPairs(form, "Tag", "Key")
+	if tags["env"] != "prod" {
+		t.Fatalf("unindexed tag map = %v, want env=prod", tags)
+	}
+}
+
 // TestCollectIndexedKVPairs_DeterministicOnDuplicates pins that two
 // entries resolving to the same logical key resolve deterministically
 // (lower index wins). CodexP2 flagged the previous map iteration as
@@ -265,9 +283,14 @@ func TestParseOptionalQueryIntRejectsOutOfRange(t *testing.T) {
 // in-process listener and returns the decoded response envelope.
 func queryRoundTrip(t *testing.T, node Node, action string, form url.Values) (int, []byte) {
 	t.Helper()
+	return queryRoundTripPath(t, node, "/", action, form)
+}
+
+func queryRoundTripPath(t *testing.T, node Node, requestPath, action string, form url.Values) (int, []byte) {
+	t.Helper()
 	form.Set("Action", action)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		"http://"+node.sqsAddress+"/", strings.NewReader(form.Encode()))
+		"http://"+node.sqsAddress+requestPath, strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -279,6 +302,21 @@ func queryRoundTrip(t *testing.T, node Node, action string, form url.Values) (in
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, body
+}
+
+func TestSQSServer_QueryProtocol_QueueURLFromPath(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	queueURL := queryCreateQueueURL(t, node, "query-path")
+	status, body := queryRoundTripPath(t, node, "/123456789012/query-path", "SendMessage", url.Values{
+		"MessageBody": []string{"path-routed"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("SendMessage path QueueUrl fallback: status %d body %s queueURL=%s", status, body, queueURL)
+	}
 }
 
 func TestSQSServer_QueryProtocol_CreateQueueRoundTrip(t *testing.T) {
@@ -560,6 +598,41 @@ func TestSQSServer_QueryProtocol_BatchRoundTrip(t *testing.T) {
 	}
 	if len(deleteResp.Result.Successful) != 2 || len(deleteResp.Result.Failed) != 0 {
 		t.Fatalf("DeleteMessageBatch result = %+v body=%s", deleteResp.Result, deleteBody)
+	}
+}
+
+func TestSQSServer_QueryProtocol_ChangeVisibilityBatchMissingTimeoutIsEntryFailure(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	node := sqsLeaderNode(t, nodes)
+
+	queueURL := queryCreateQueueURL(t, node, "query-change-missing-timeout")
+	_, body := queryOK(t, node, "ChangeMessageVisibilityBatch", url.Values{
+		"QueueUrl": []string{queueURL},
+		"ChangeMessageVisibilityBatchRequestEntry.1.Id":            []string{"missing-timeout"},
+		"ChangeMessageVisibilityBatchRequestEntry.1.ReceiptHandle": []string{"not-used"},
+	})
+	var resp struct {
+		Result struct {
+			Successful []struct {
+				Id string `xml:"Id"`
+			} `xml:"ChangeMessageVisibilityBatchResultEntry"`
+			Failed []struct {
+				Id      string `xml:"Id"`
+				Code    string `xml:"Code"`
+				Message string `xml:"Message"`
+			} `xml:"BatchResultErrorEntry"`
+		} `xml:"ChangeMessageVisibilityBatchResult"`
+	}
+	if err := xml.Unmarshal(bytes.TrimSpace(body), &resp); err != nil {
+		t.Fatalf("decode change visibility batch: %v\nbody=%s", err, body)
+	}
+	if len(resp.Result.Successful) != 0 || len(resp.Result.Failed) != 1 {
+		t.Fatalf("result = %+v body=%s", resp.Result, body)
+	}
+	if got := resp.Result.Failed[0]; got.Id != "missing-timeout" || got.Code != sqsErrMissingParameter {
+		t.Fatalf("failed entry = %+v, want id missing-timeout code %s", got, sqsErrMissingParameter)
 	}
 }
 
