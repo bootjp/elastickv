@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: implemented
 phase: 2-B
 parent_design: docs/admin_ui_key_visualizer_design.md
 date: 2026-04-27
@@ -23,7 +23,7 @@ landed the **server side** end-to-end:
 
 The remaining piece is the **frontend** — the admin SPA at `web/admin/`
 already serves Overview / DynamoDB / SQS / S3, but has no KeyViz page.
-This doc proposes Phase 2-B: integrate the heatmap into the existing
+This doc describes Phase 2-B: integrating the heatmap into the existing
 SPA rather than building a separate dashboard.
 
 ## 2. Why integrate, not build separately
@@ -125,7 +125,7 @@ mutation route is needed for Phase 2-B.
 - `web/admin/src/components/Layout.tsx`: add `{ to: "/keyviz", label: "Key Visualizer" }`
   to `navItems`.
 
-### 3.4 What this proposal does NOT do
+### 3.4 What this design does NOT do
 
 - **No charting library.** Pure `<canvas>` + a fixed colour ramp. The
   full matrix is at most 1024 rows × a few hundred columns; that fits
@@ -138,7 +138,7 @@ mutation route is needed for Phase 2-B.
   hot-key preview labels). Out of scope.
 - **No multi-node fan-out.** The handler is currently node-local (it
   only sees the local sampler). A separate Phase 2-A item will add a
-  fan-out admin RPC; this proposal renders whatever the handler
+  fan-out admin RPC; this design renders whatever the handler
   returns, and will pick up fan-out for free once that ships.
 
 ## 4. Heatmap rendering specifics
@@ -216,11 +216,11 @@ Phase 2-B is a pure-frontend change. The Go test suite is unchanged.
 
 - **Lint and unit tests for backend**: unchanged from existing CI
   (`make lint`, `go test ./...`). No backend code changes in this
-  proposal.
+  design.
 
 ## 6. Five-lens review checklist
 
-Per `CLAUDE.md`, recorded for completeness even on a frontend change:
+Per the repository review checklist, recorded for completeness even on a frontend change:
 
 1. **Data loss** — n/a; SPA is read-only against an existing handler.
 2. **Concurrency / distributed failures** — n/a; a single browser tab
@@ -239,12 +239,9 @@ Per `CLAUDE.md`, recorded for completeness even on a frontend change:
 
 ## 7. Lifecycle
 
-- Land this doc and the implementation in the same PR (doc commit
-  first, then implementation).
-- On merge: rename `docs/admin_ui_key_visualizer_design.md`'s phase
-  table from "Phase 2 KeyViz MVP" to mark 2-B (SPA) as shipped, and
-  rename this doc from `*_proposed_*` to `*_implemented_*` once the
-  parent design's Phase 2 fan-out item also ships.
+- This doc and the implementation landed together.
+- The parent phase table now points at the implemented lifecycle
+  filename for Phase 2-B.
 
 ## 8. Open questions
 
