@@ -179,7 +179,7 @@ memory each group's private cache/memtable pins.
   is wired in at `main.go:426`). This scales leader read throughput but keeps
   all reads on the leader.
 - **Learner reads → follower/learner reads.** The learner *primitive* is
-  effectively implemented despite the doc filename still reading
+  implemented in
   `2026_04_26_implemented_raft_learner.md`: `AddLearner` / `PromoteLearner` are
   on the engine `Admin` interface (`internal/raftengine/engine.go:233`, `:245`)
   and implemented in the etcd backend (`internal/raftengine/etcd/engine.go:1268`,
