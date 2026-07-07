@@ -18,6 +18,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // EncryptionAdminServer implements proto.EncryptionAdmin. Wires
@@ -509,6 +510,44 @@ func statusFromSidecarErr(err error) error {
 	}
 }
 
+type typedStatusError struct {
+	err      error
+	sentinel error
+}
+
+func (e *typedStatusError) Error() string {
+	return e.err.Error()
+}
+
+func (e *typedStatusError) Unwrap() error {
+	return e.err
+}
+
+func (e *typedStatusError) Is(target error) bool {
+	return target == e.sentinel || errors.Is(e.err, target)
+}
+
+func (e *typedStatusError) GRPCStatus() *status.Status {
+	st, _ := status.FromError(e.err)
+	return st
+}
+
+func markStatusError(err error, sentinel error) error {
+	return &typedStatusError{err: err, sentinel: sentinel}
+}
+
+func localEpochOutOfRangeStatusf(format string, args ...any) error {
+	return markStatusError(
+		grpcStatusErrorf(codes.InvalidArgument, format, args...),
+		encryption.ErrLocalEpochOutOfRange)
+}
+
+func encryptionNotBootstrappedStatus(msg string) error {
+	return markStatusError(
+		grpcStatusError(codes.FailedPrecondition, msg),
+		encryption.ErrEncryptionNotBootstrapped)
+}
+
 // BootstrapEncryption proposes the §5.6 0x04 OpBootstrap entry
 // that installs the initial wrapped DEK pair AND the cluster-wide
 // writer-registry batch in a single Raft transaction. The server
@@ -587,20 +626,22 @@ func buildBootstrapBatch(writers []*pb.WriterRegistryEntry, storageDEKID, raftDE
 	// run before we allocate the output slice — a near-cap batch
 	// with a collision at the end is rejected without building
 	// thousands of throwaway registry rows.
+	validated := make([]fsmwire.RegistrationPayload, len(writers))
 	for i, w := range writers {
-		if _, err := validateBootstrapWriter(i, w); err != nil {
+		row, err := validateBootstrapWriter(i, w)
+		if err != nil {
 			return nil, err
 		}
+		validated[i] = row
 	}
 	if err := validateWriterBatchUniqueness(writers); err != nil {
 		return nil, err
 	}
 	out := make([]fsmwire.RegistrationPayload, 0, totalRows)
-	for _, w := range writers {
-		epoch := uint32ToLocalEpoch(w.GetLocalEpoch())
+	for _, w := range validated {
 		out = append(out,
-			fsmwire.RegistrationPayload{DEKID: storageDEKID, FullNodeID: w.GetFullNodeId(), LocalEpoch: epoch},
-			fsmwire.RegistrationPayload{DEKID: raftDEKID, FullNodeID: w.GetFullNodeId(), LocalEpoch: epoch},
+			fsmwire.RegistrationPayload{DEKID: storageDEKID, FullNodeID: w.FullNodeID, LocalEpoch: w.LocalEpoch},
+			fsmwire.RegistrationPayload{DEKID: raftDEKID, FullNodeID: w.FullNodeID, LocalEpoch: w.LocalEpoch},
 		)
 	}
 	return out, nil
@@ -621,7 +662,7 @@ func validateBootstrapWriter(i int, w *pb.WriterRegistryEntry) (fsmwire.Registra
 			"encryption: writer_batch[%d].full_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)", i)
 	}
 	if w.GetLocalEpoch() > math.MaxUint16 {
-		return fsmwire.RegistrationPayload{}, grpcStatusErrorf(codes.InvalidArgument,
+		return fsmwire.RegistrationPayload{}, localEpochOutOfRangeStatusf(
 			"encryption: writer_batch[%d].local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
 			i, w.GetLocalEpoch())
 	}
@@ -731,7 +772,7 @@ func (s *EncryptionAdminServer) RotateDEK(ctx context.Context, req *pb.RotateDEK
 		return nil, err
 	}
 	if req.GetProposerLocalEpoch() > math.MaxUint16 {
-		return nil, grpcStatusErrorf(codes.InvalidArgument,
+		return nil, localEpochOutOfRangeStatusf(
 			"encryption: proposer_local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
 			req.GetProposerLocalEpoch())
 	}
@@ -938,7 +979,7 @@ func (s *EncryptionAdminServer) cutoverPrecheck(ctx context.Context, req *pb.Ena
 		return nil, nil, statusFromSidecarErr(err)
 	}
 	if preSidecar.Active.Storage == 0 {
-		return nil, nil, grpcStatusError(codes.FailedPrecondition,
+		return nil, nil, encryptionNotBootstrappedStatus(
 			"encryption: cluster not bootstrapped (Active.Storage == 0) — call BootstrapEncryption first")
 	}
 	if preSidecar.StorageEnvelopeActive {
@@ -1072,7 +1113,7 @@ func validateEnableStorageEnvelopeRequest(req *pb.EnableStorageEnvelopeRequest) 
 			"encryption: proposer_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
 	}
 	if req.GetProposerLocalEpoch() > math.MaxUint16 {
-		return grpcStatusErrorf(codes.InvalidArgument,
+		return localEpochOutOfRangeStatusf(
 			"encryption: proposer_local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
 			req.GetProposerLocalEpoch())
 	}
@@ -1484,7 +1525,7 @@ func (s *EncryptionAdminServer) raftCutoverPrecheck(ctx context.Context, req *pb
 		return nil, nil, statusFromSidecarErr(err)
 	}
 	if preSidecar.Active.Raft == 0 {
-		return nil, nil, grpcStatusError(codes.FailedPrecondition,
+		return nil, nil, encryptionNotBootstrappedStatus(
 			"encryption: cluster not bootstrapped (Active.Raft == 0) — call BootstrapEncryption first")
 	}
 	if preSidecar.RaftEnvelopeCutoverIndex != 0 {
@@ -1552,7 +1593,7 @@ func validateEnableRaftEnvelopeRequest(req *pb.EnableRaftEnvelopeRequest) error 
 			"encryption: proposer_node_id must be non-zero (0 is reserved as the §6.1 not-capable sentinel)")
 	}
 	if req.GetProposerLocalEpoch() > math.MaxUint16 {
-		return grpcStatusErrorf(codes.InvalidArgument,
+		return localEpochOutOfRangeStatusf(
 			"encryption: proposer_local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
 			req.GetProposerLocalEpoch())
 	}
@@ -1665,7 +1706,7 @@ func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, re
 	}
 	w := writers[0]
 	if w.GetLocalEpoch() > math.MaxUint16 {
-		return nil, grpcStatusErrorf(codes.InvalidArgument,
+		return nil, localEpochOutOfRangeStatusf(
 			"encryption: writers[0].local_epoch=%d exceeds the §4.1 16-bit bound (max 0xFFFF)",
 			w.GetLocalEpoch())
 	}

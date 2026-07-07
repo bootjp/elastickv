@@ -2,11 +2,14 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/raftengine"
 )
 
 // stubGapEngine satisfies encryptionGapEngine for the
@@ -33,6 +36,19 @@ func (s *stubScanner) HasEncryptionRelevantEntryInRange(_, _ uint64) (bool, erro
 	return s.hit, s.err
 }
 
+type stubRestoredCutoverStateMachine struct {
+	cutover uint64
+}
+
+func (s *stubRestoredCutoverStateMachine) Apply([]byte) any { return nil }
+func (s *stubRestoredCutoverStateMachine) Snapshot() (raftengine.Snapshot, error) {
+	return nil, nil
+}
+func (s *stubRestoredCutoverStateMachine) Restore(io.Reader) error { return nil }
+func (s *stubRestoredCutoverStateMachine) RestoredCutover() uint64 {
+	return s.cutover
+}
+
 // writeMinimalSidecar writes a valid §5.1 sidecar with the
 // supplied RaftAppliedIndex into a freshly created temp dir, and
 // returns the sidecar path.
@@ -44,6 +60,36 @@ func writeMinimalSidecar(t *testing.T, raftAppliedIdx uint64) string {
 		Version:          encryption.SidecarVersion,
 		RaftAppliedIndex: raftAppliedIdx,
 		Keys:             map[string]encryption.SidecarKey{},
+	}
+	if err := encryption.WriteSidecar(path, sc); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	return path
+}
+
+func writeRaftCutoverSidecarForStartup(t *testing.T, activeStorage, activeRaft uint32, localEpoch uint16, cutover uint64) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, encryption.SidecarFilename)
+	sc := &encryption.Sidecar{
+		Version:                  encryption.SidecarVersion,
+		RaftAppliedIndex:         cutover,
+		StorageEnvelopeActive:    true,
+		RaftEnvelopeCutoverIndex: cutover,
+		Active:                   encryption.ActiveKeys{Storage: activeStorage, Raft: activeRaft},
+		Keys: map[string]encryption.SidecarKey{
+			strconv.FormatUint(uint64(activeStorage), 10): {
+				Purpose:    encryption.SidecarPurposeStorage,
+				Wrapped:    []byte("wrapped-storage"),
+				Created:    "2026-07-07T00:00:00Z",
+				LocalEpoch: localEpoch,
+			},
+			strconv.FormatUint(uint64(activeRaft), 10): {
+				Purpose: encryption.SidecarPurposeRaft,
+				Wrapped: []byte("wrapped-raft"),
+				Created: "2026-07-07T00:00:00Z",
+			},
+		},
 	}
 	if err := encryption.WriteSidecar(path, sc); err != nil {
 		t.Fatalf("WriteSidecar: %v", err)
@@ -235,5 +281,42 @@ func TestChainEncryptionStartupGuard_NilPrevRunsGuard(t *testing.T) {
 	got := chainEncryptionStartupGuard(nil, nil, 0, "", false)
 	if got != nil {
 		t.Fatalf("chain with nil prev and skipped guard must return nil; got %v", got)
+	}
+}
+
+func TestCheckEnvelopeCutoverDivergenceStartupGuard_Fires(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, testRegDEKID, 8, 3, 100)
+	rt := &raftGroupRuntime{
+		spec:         groupSpec{id: 1},
+		stateMachine: &stubRestoredCutoverStateMachine{cutover: 200},
+	}
+	err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true)
+	if !errors.Is(err, encryption.ErrEnvelopeCutoverDivergence) {
+		t.Fatalf("cutover guard must fire ErrEnvelopeCutoverDivergence, got %v", err)
+	}
+}
+
+func TestCheckEnvelopeCutoverDivergenceStartupGuard_Match(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeRaftCutoverSidecarForStartup(t, testRegDEKID, 8, 3, 100)
+	rt := &raftGroupRuntime{
+		spec:         groupSpec{id: 1},
+		stateMachine: &stubRestoredCutoverStateMachine{cutover: 100},
+	}
+	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
+		t.Fatalf("matching snapshot/sidecar cutover must pass, got %v", err)
+	}
+}
+
+func TestCheckEnvelopeCutoverDivergenceStartupGuard_PreBootstrapSkips(t *testing.T) {
+	t.Parallel()
+	sidecarPath := writeMinimalSidecar(t, 1)
+	rt := &raftGroupRuntime{
+		spec:         groupSpec{id: 1},
+		stateMachine: &stubRestoredCutoverStateMachine{cutover: 0},
+	}
+	if err := checkEnvelopeCutoverDivergenceStartupGuard([]*raftGroupRuntime{rt}, 1, sidecarPath, true); err != nil {
+		t.Fatalf("pre-bootstrap sidecar must skip cutover divergence guard, got %v", err)
 	}
 }

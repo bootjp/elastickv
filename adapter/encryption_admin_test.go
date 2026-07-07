@@ -521,6 +521,20 @@ func TestEncryptionAdmin_BootstrapEncryption_RejectsBadInputs(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdmin_BootstrapWriter_LocalEpochOutOfRangeSentinel(t *testing.T) {
+	t.Parallel()
+	_, err := validateBootstrapWriter(0, &pb.WriterRegistryEntry{
+		FullNodeId: 1,
+		LocalEpoch: math.MaxUint16 + 1,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("validateBootstrapWriter status=%v, want InvalidArgument", status.Code(err))
+	}
+	if !errors.Is(err, encryption.ErrLocalEpochOutOfRange) {
+		t.Fatalf("validateBootstrapWriter must mark ErrLocalEpochOutOfRange, got %v", err)
+	}
+}
+
 // TestEncryptionAdmin_BootstrapEncryption_RejectsDuplicateFullNodeID
 // pins the cluster-safety invariant: a writer batch that names
 // the same full_node_id twice would, after FSM apply, attempt to
@@ -2032,6 +2046,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RejectsOversizedLocalEpoch(t *testin
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("EnableRaftEnvelope status=%v, want InvalidArgument", status.Code(err))
 	}
+	if !errors.Is(err, encryption.ErrLocalEpochOutOfRange) {
+		t.Errorf("EnableRaftEnvelope must mark ErrLocalEpochOutOfRange, got %v", err)
+	}
 }
 
 // TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped pins
@@ -2052,6 +2069,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped(t *testing.T)
 	_, err := srv.EnableRaftEnvelope(context.Background(), validEnableRaftEnvelopeRequest())
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("EnableRaftEnvelope status=%v, want FailedPrecondition", status.Code(err))
+	}
+	if !errors.Is(err, encryption.ErrEncryptionNotBootstrapped) {
+		t.Errorf("EnableRaftEnvelope must mark ErrEncryptionNotBootstrapped, got %v", err)
 	}
 	if err == nil || !strings.Contains(err.Error(), "BootstrapEncryption") {
 		t.Errorf("error %q does not hint at BootstrapEncryption", err)

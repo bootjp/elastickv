@@ -22,14 +22,13 @@
 | 6E-2e-2 — Admin RPCs (RotateDEK, RegisterEncryptionWriter) routed through the wrap-aware proposer so post-cutover admin entries are wrapped. Closes BLOCKER (a): the raw-engine ProposeAdmin path leaves cleartext admin entries at `index > cutoverIdx` and §6.3 halts the cluster. The cutover marker itself remains on a separate raw-engine reference held by EnableRaftEnvelope. | shipped | this PR |
 | 6E-2e-3 — `main.go` wiring: `OpenConfig.RaftCipher` + `RaftCutoverIndex` → `CutoverBarrierController` implementation fanning out over participating `ShardGroup`s + concrete `RaftCutoverWrapInstaller` closure that publishes the §4.2 wrap to every ShardGroup + startup-time install when `sidecar.RaftEnvelopeCutoverIndex != 0`. | shipped | this PR |
 | 6E-2f — atomic flip of `raftEnvelopeWrapEnabled` to `true` (the §3.3 6E-1b gate release) | shipped | this PR |
-| 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | not started | — |
+| 6E-3 — §6C-4 fail-closed guards (`ErrEnvelopeCutoverDivergence`, `ErrEncryptionNotBootstrapped`, `ErrLocalEpochOutOfRange`) | shipped | this PR |
 
-With 6E-2 complete, the operator can initiate the Phase-2 raft
+With 6E-3 complete, the operator can initiate the Phase-2 raft
 envelope cutover once the normal leader, bootstrap, capability,
-barrier, and latest-applied pre-checks pass. The remaining work in
-this slice is 6E-3: the Phase-2-specific fail-closed startup/API
-guards that catch divergent snapshot/sidecar state and out-of-range
-epochs.
+barrier, and latest-applied pre-checks pass. The Phase-2-specific
+startup/API guards now catch divergent snapshot/sidecar state,
+out-of-range local epochs, and pre-bootstrap raft cutover attempts.
 
 ### 3.3 The 6E-1b gate
 
@@ -324,10 +323,10 @@ flip in a controlled sequence on a single goroutine.
 - `ErrEncryptionNotBootstrapped` — `EnableRaftEnvelope` returns
   this if `active.raft == 0` (no DEK pair yet). Pairs with
   the §7.1 step-4 sequencing rule.
-- `ErrLocalEpochOutOfRange` on the wire side of `GetCapability`
-  and `GetSidecarState` — pairs with Stage 7's writer-registry
-  out-of-range check (catches a binary that has rotated past
-  the cluster's expected epoch window).
+- `ErrLocalEpochOutOfRange` on wire-side `local_epoch` decode
+  boundaries — pairs with Stage 7's writer-registry out-of-range
+  check (catches a binary that has rotated past the cluster's
+  expected epoch window).
 
 **Why guards ship after 6E-2**: 6C-4 only matters once a node
 can actually be in Phase 2. Without 6E-2, the guards never
@@ -477,7 +476,7 @@ dispatch boundary from the snapshot header.
 | 8a | shipped | Snapshot header v2 cutover carriage |
 | **6E-1** | shipped | Admin RPC + sidecar plumbing |
 | **6E-2** | shipped | Engine unwrap + coord wrap + barrier + production runtime wiring |
-| **6E-3** | this slice — milestone 3 | 6C-4 fail-closed guards |
+| **6E-3** | shipped | 6C-4 fail-closed guards |
 | 8b | independent sibling | WAL coverage |
 | 9 | future | KMS + compress + rotation/retire/rewrite + Jepsen |
 

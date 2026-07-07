@@ -26,6 +26,10 @@ type encryptionGapEngine interface {
 	EncryptionScanner() encryption.EncryptionRelevantScanner
 }
 
+type restoredCutoverReader interface {
+	RestoredCutover() uint64
+}
+
 // checkSidecarBehindRaftLog implements the §9.1 ErrSidecarBehindRaftLog
 // startup-guard phase (Stage 6C-2d). It runs AFTER buildShardGroups
 // has opened each shard's engine and BEFORE any gRPC server starts
@@ -199,7 +203,78 @@ func chainEncryptionStartupGuard(
 	if prevErr != nil {
 		return prevErr
 	}
-	return checkSidecarBehindRaftLog(runtimes, defaultGroup, sidecarPath, encryptionEnabled)
+	if err := checkSidecarBehindRaftLog(runtimes, defaultGroup, sidecarPath, encryptionEnabled); err != nil {
+		return err
+	}
+	return checkEnvelopeCutoverDivergenceStartupGuard(runtimes, defaultGroup, sidecarPath, encryptionEnabled)
+}
+
+func checkEnvelopeCutoverDivergenceStartupGuard(
+	runtimes []*raftGroupRuntime,
+	defaultGroup uint64,
+	sidecarPath string,
+	encryptionEnabled bool,
+) error {
+	if !encryptionEnabled || sidecarPath == "" {
+		return nil
+	}
+	sc, err := readExistingSidecarForStartupGuard(sidecarPath)
+	if err != nil || sc == nil {
+		return err
+	}
+	return checkEnvelopeCutoverDivergenceForRuntime(runtimes, defaultGroup, sc)
+}
+
+func readExistingSidecarForStartupGuard(sidecarPath string) (*encryption.Sidecar, error) {
+	if _, err := os.Stat(sidecarPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, pkgerrors.Wrapf(err, "encryption startup guard: stat sidecar %q", sidecarPath)
+	}
+	sc, err := encryption.ReadSidecar(sidecarPath)
+	if err != nil {
+		return nil, pkgerrors.Wrapf(err, "encryption startup guard: read sidecar %q", sidecarPath)
+	}
+	return sc, nil
+}
+
+func checkEnvelopeCutoverDivergenceForRuntime(
+	runtimes []*raftGroupRuntime,
+	defaultGroup uint64,
+	sc *encryption.Sidecar,
+) error {
+	rt := findDefaultGroupRuntime(runtimes, defaultGroup)
+	if rt == nil {
+		return nil
+	}
+	if rt.stateMachine == nil {
+		if sc.RaftEnvelopeCutoverIndex == 0 {
+			return nil
+		}
+		return pkgerrors.Errorf(
+			"encryption startup guard: state machine for default group %d is nil (cannot compare restored raft envelope cutover)",
+			defaultGroup)
+	}
+	source, ok := rt.stateMachine.(restoredCutoverReader)
+	if !ok {
+		if sc.RaftEnvelopeCutoverIndex == 0 {
+			return nil
+		}
+		return pkgerrors.Errorf(
+			"encryption startup guard: state machine for default group %d cannot expose restored raft envelope cutover",
+			defaultGroup)
+	}
+	snapshotCutover := source.RestoredCutover()
+	if snapshotCutover == 0 {
+		return nil
+	}
+	if snapshotCutover != sc.RaftEnvelopeCutoverIndex {
+		return pkgerrors.Wrapf(encryption.ErrEnvelopeCutoverDivergence,
+			"encryption startup guard: restored_snapshot_cutover=%d sidecar_raft_envelope_cutover=%d default_group=%d",
+			snapshotCutover, sc.RaftEnvelopeCutoverIndex, defaultGroup)
+	}
+	return nil
 }
 
 // findDefaultGroupRuntime returns the runtime whose spec.id
