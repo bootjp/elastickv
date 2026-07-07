@@ -358,6 +358,60 @@ func TestEncryptionAdmin_Validate_OKWithBothWired(t *testing.T) {
 	}
 }
 
+func TestEncryptionAdmin_NonCutoverAdminEntriesUsePostCutoverProposer(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		call       func(context.Context, *EncryptionAdminServer) (uint64, error)
+		wantOpcode byte
+	}{
+		{
+			name: "RotateDEK",
+			call: func(ctx context.Context, srv *EncryptionAdminServer) (uint64, error) {
+				resp, err := srv.RotateDEK(ctx, validRotateDEKRequest())
+				if resp == nil {
+					return 0, err
+				}
+				return resp.AppliedIndex, err
+			},
+			wantOpcode: fsmwire.OpRotation,
+		},
+		{
+			name: "RegisterEncryptionWriter",
+			call: func(ctx context.Context, srv *EncryptionAdminServer) (uint64, error) {
+				resp, err := srv.RegisterEncryptionWriter(ctx, validRegisterEncryptionWriterRequest())
+				if resp == nil {
+					return 0, err
+				}
+				return resp.AppliedIndex, err
+			},
+			wantOpcode: fsmwire.OpRegistration,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := &recordingProposer{commitIndex: 17}
+			postCutover := &recordingProposer{commitIndex: 99}
+			srv := NewEncryptionAdminServer(
+				WithEncryptionAdminProposer(raw),
+				WithEncryptionAdminPostCutoverProposer(postCutover),
+				WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
+			)
+			gotIdx, err := tc.call(context.Background(), srv)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if gotIdx != 99 {
+				t.Errorf("AppliedIndex=%d, want 99 from post-cutover proposer", gotIdx)
+			}
+			if len(raw.calls) != 0 {
+				t.Fatalf("raw proposer calls=%d, want 0 for non-cutover admin entry", len(raw.calls))
+			}
+			assertSingleProposalOpcode(t, postCutover.calls, tc.wantOpcode)
+		})
+	}
+}
+
 // TestEncryptionAdmin_BootstrapEncryption_HappyPath verifies the
 // byte layout of the proposed §5.6 0x04 Raft entry by
 // round-tripping through fsmwire.DecodeBootstrap. Each writer in
@@ -2232,12 +2286,14 @@ func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) 
 		sidecarPath:       path,
 		applyFn:           applyRaftCutover,
 	}
+	postCutover := &recordingProposer{commitIndex: 9999}
 	barrier := &recordingCutoverBarrier{}
 	// latestAppliedIndex returns the proposer's commitIndex so the
 	// step-4 wait completes immediately on the first poll. A
 	// production wiring would have the FSM apply path update this.
 	srv := NewEncryptionAdminServer(
 		WithEncryptionAdminProposer(proposer),
+		WithEncryptionAdminPostCutoverProposer(postCutover),
 		WithEncryptionAdminLeaderView(stubLeaderView{state: raftengine.StateLeader}),
 		WithEncryptionAdminSidecarPath(path),
 		WithEncryptionAdminCapabilityFanout(fixedCapabilityFanout(allOKFanoutResult(), nil)),
@@ -2257,6 +2313,9 @@ func TestEncryptionAdmin_EnableRaftEnvelope_DrivesBarrierSequence(t *testing.T) 
 	}
 	if len(proposer.calls) != 1 {
 		t.Errorf("proposer.calls len=%d, want 1 (one ProposeAdmin between WaitDrained and InstallWrap)", len(proposer.calls))
+	}
+	if len(postCutover.calls) != 0 {
+		t.Errorf("post-cutover proposer calls=%d, want 0 for the cutover marker itself", len(postCutover.calls))
 	}
 }
 

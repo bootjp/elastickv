@@ -1633,10 +1633,19 @@ func startRaftServers(
 		// (etcd.DeriveNodeID), so every node in the cluster reports
 		// a stable, distinct value. Codex r1 P1 on PR #760.
 		// Stage 6B-2 mutator gate is resolved once above the
-		// per-shard loop. Each shard's own engine is the
-		// Proposer + LeaderView so the mutator proposes through
-		// the correct Raft group.
-		registerEncryptionAdminServer(gs, etcdraftengine.DeriveNodeID(*raftId), *encryptionSidecarPath, enableMutators, rt.engine, encryptionCapabilityFanout)
+		// per-shard loop. Each shard's own engine remains the raw
+		// Proposer + LeaderView for the cutover marker, while
+		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
+		// path for normal admin entries.
+		registerEncryptionAdminServer(
+			gs,
+			etcdraftengine.DeriveNodeID(*raftId),
+			*encryptionSidecarPath,
+			enableMutators,
+			rt.engine,
+			encryptionCapabilityFanout,
+			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
+		)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook

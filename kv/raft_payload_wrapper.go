@@ -294,31 +294,15 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 // gate; 6E-2d ships them inert by leaving raftEnvelopeWrapEnabled
 // false so production never opens the cutover window.
 //
-//	(a) Wrap-gap admin RPCs (codex P1 #1 round-2):
+//	(a) Wrap-gap admin RPCs:
 //	    Other admin RPCs that route through ProposeAdmin (RotateDEK,
-//	    RegisterEncryptionWriter) are barrier-exempt and currently
-//	    reach the engine via the raw-engine s.proposer in
-//	    adapter/encryption_admin.go. Between the cutover marker's
-//	    commit and the handler's InstallWrap call, an admin RPC
-//	    that lands at `index > raftEnvelopeCutoverIndex` would be
-//	    cleartext, and the §6.3 strict-`>` apply hook on every
-//	    follower would treat it as a wrapped envelope and halt
-//	    apply cluster-wide.
-//
-//	    Remediation options for 6E-2e:
-//	      Option A (preferred): route RotateDEK /
-//	                            RegisterEncryptionWriter through the
-//	                            wrap-aware proposer so post-cutover
-//	                            admin entries are wrapped. The
-//	                            cutover marker itself remains on a
-//	                            separate raw-engine reference held
-//	                            by the EnableRaftEnvelope handler.
-//	      Option B: extend cutoverSem to serialize RotateDEK and
-//	                RegisterEncryptionWriter against the
-//	                EnableRaftEnvelope handler so no admin RPC can
-//	                race the barrier window.
-//	    See main_encryption_registration.go's call-site comment for
-//	    the 7c §3.1 wiring that Option A would extend.
+//	    RegisterEncryptionWriter) are barrier-exempt but must not
+//	    bypass the wrap layer after the cutover. Production wiring
+//	    closes this by passing ShardGroup.Proposer() into
+//	    WithEncryptionAdminPostCutoverProposer: the cutover marker
+//	    itself still uses the raw engine reference, while every
+//	    non-cutover admin entry uses the same dynamic wrapper as
+//	    user proposals.
 //
 //	(b) Leader failover mid-cutover (codex P1 round-3):
 //	    If leadership transfers from L1 to L2 between the cutover
@@ -347,10 +331,12 @@ func (p *dynamicWrappedProposer) endUserPropose() {
 //	                sidecar already reflects a cutover. Trades a
 //	                sidecar load per propose for a closed gap.
 //
-// Both hazards (a) and (b) share a single shape: post-cutover
-// cleartext entries land in Raft at indexes that the §6.3 apply
-// hook treats as wrapped. The gate (`raftEnvelopeWrapEnabled =
-// false`) is the only thing keeping either from triggering today.
+// The remaining leader-failover hazard has the same shape:
+// post-cutover cleartext entries land in Raft at indexes that the
+// §6.3 apply hook treats as wrapped. The production gate
+// (`raftEnvelopeWrapEnabled = false`) stays closed until the
+// apply-time wrap installer / startup-time wrap install are wired
+// as well.
 //
 // Idempotent against double-Begin: a second call freshens drainSig
 // and leaves barrierOpen true. CALLER SAFETY: a goroutine that was

@@ -32,8 +32,19 @@ type EncryptionAdminServer struct {
 	fullNodeID         uint64
 	buildSHA           string
 	latestAppliedIndex func() uint64
-	proposer           raftengine.Proposer
-	leaderView         raftengine.LeaderView
+	// proposer is the raw raft proposer used for cleartext-only
+	// control entries. The EnableRaftEnvelope cutover marker MUST
+	// use this path so the marker at index == cutover remains
+	// cleartext for the strict-`>` unwrap hook.
+	proposer raftengine.Proposer
+	// postCutoverProposer is the wrap-aware admin proposal path for
+	// all non-cutover-marker control-plane entries. It defaults to
+	// proposer for backward compatibility; production wiring replaces
+	// it with the ShardGroup.Proposer() chain so RotateDEK /
+	// RegisterEncryptionWriter entries after the raft cutover carry
+	// the raft envelope.
+	postCutoverProposer raftengine.Proposer
+	leaderView          raftengine.LeaderView
 	// capabilityFanout, when wired, runs the §4 Voters ∪ Learners
 	// fan-out before the §7.1 Phase 1 cutover entry is proposed.
 	// A nil value short-circuits EnableStorageEnvelope with
@@ -213,6 +224,20 @@ func WithEncryptionAdminProposer(p raftengine.Proposer) EncryptionAdminServerOpt
 	}
 }
 
+// WithEncryptionAdminPostCutoverProposer registers the wrap-aware
+// proposer used for non-cutover-marker admin entries. A nil argument
+// is a no-op, and NewEncryptionAdminServer falls back to the raw
+// proposer when this option is not supplied, preserving the Stage 6B
+// mutator wiring contract.
+func WithEncryptionAdminPostCutoverProposer(p raftengine.Proposer) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		if p == nil {
+			return
+		}
+		s.postCutoverProposer = p
+	}
+}
+
 // WithEncryptionAdminCapabilityFanout wires the §4 Voters ∪
 // Learners pre-flight that the §7.1 Phase 1 cutover RPC
 // (EnableStorageEnvelope) runs before composing the
@@ -285,6 +310,9 @@ func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAd
 	if s.buildSHA == "" {
 		s.buildSHA = autoBuildSHA()
 	}
+	if s.postCutoverProposer == nil {
+		s.postCutoverProposer = s.proposer
+	}
 	return s
 }
 
@@ -297,6 +325,9 @@ func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAd
 func (s *EncryptionAdminServer) Validate() error {
 	if s.proposer != nil && s.leaderView == nil {
 		return errors.New("encryption: proposer wired without leaderView — followers must not mutate state; call WithEncryptionAdminLeaderView")
+	}
+	if s.postCutoverProposer != nil && s.proposer == nil {
+		return errors.New("encryption: post-cutover proposer wired without raw proposer — call WithEncryptionAdminProposer")
 	}
 	return nil
 }
@@ -1500,7 +1531,7 @@ func (s *EncryptionAdminServer) proposeRaftCutoverEntry(ctx context.Context, pre
 			LocalEpoch: uint32ToLocalEpoch(req.GetProposerLocalEpoch()),
 		},
 	}
-	return s.proposeEncryptionEntry(ctx, fsmwire.OpRotation, fsmwire.EncodeRotation(payload))
+	return s.proposeEncryptionEntryWith(ctx, s.proposer, fsmwire.OpRotation, fsmwire.EncodeRotation(payload))
 }
 
 // raftCutoverPostcheck re-reads the sidecar after the Raft propose
@@ -1682,6 +1713,20 @@ func (s *EncryptionAdminServer) RegisterEncryptionWriter(ctx context.Context, re
 // helper is just the byte-level glue between the server-side
 // encoder and raftengine.Proposer.
 func (s *EncryptionAdminServer) proposeEncryptionEntry(ctx context.Context, opcode byte, body []byte) (uint64, error) {
+	return s.proposeEncryptionEntryWith(ctx, s.nonCutoverAdminProposer(), opcode, body)
+}
+
+func (s *EncryptionAdminServer) nonCutoverAdminProposer() raftengine.Proposer {
+	if s.postCutoverProposer != nil {
+		return s.postCutoverProposer
+	}
+	return s.proposer
+}
+
+func (s *EncryptionAdminServer) proposeEncryptionEntryWith(ctx context.Context, proposer raftengine.Proposer, opcode byte, body []byte) (uint64, error) {
+	if proposer == nil {
+		return 0, grpcStatusError(codes.FailedPrecondition, "encryption: proposer is not configured on this node")
+	}
 	entry := make([]byte, 0, 1+len(body))
 	entry = append(entry, opcode)
 	entry = append(entry, body...)
@@ -1699,13 +1744,11 @@ func (s *EncryptionAdminServer) proposeEncryptionEntry(ctx context.Context, opco
 	// applies its wrap closure to ProposeAdmin payloads, so a
 	// post-cutover RotateDEK or RegisterEncryptionWriter
 	// committed at `index > raftEnvelopeCutoverIndex` carries the
-	// AEAD envelope the §6.3 strict-`>` apply hook expects. The
-	// EnableRaftEnvelope cutover marker (at `index == cutover`)
-	// must remain cleartext for strict-`>` to leave it alone;
-	// today s.proposer is wired to the raw engine (see
-	// main_encryption_admin.go), so the marker reaches Raft
-	// without the wrap layer in the path at all.
-	res, err := s.proposer.ProposeAdmin(ctx, entry)
+	// AEAD envelope the §6.3 strict-`>` apply hook expects.
+	// EnableRaftEnvelope's cutover marker (at `index == cutover`)
+	// bypasses this wrapper-aware helper and calls it with the raw
+	// proposer, so strict-`>` leaves the marker itself cleartext.
+	res, err := proposer.ProposeAdmin(ctx, entry)
 	if err != nil {
 		return 0, proposeErrorToStatus(err, opcode)
 	}
