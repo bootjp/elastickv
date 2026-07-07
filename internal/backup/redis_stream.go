@@ -16,7 +16,7 @@ import (
 
 // Redis stream encoder. Translates raw !stream|... snapshot records
 // into the per-stream `streams/<key>.jsonl` shape defined by Phase 0
-// (docs/design/2026_04_29_proposed_snapshot_logical_decoder.md, lines
+// (docs/design/2026_04_29_implemented_snapshot_logical_decoder.md, lines
 // 336-344).
 //
 // Wire format mirrors store/stream_helpers.go and
@@ -311,7 +311,7 @@ func (r *RedisDB) writeStreamJSONL(dir string, userKey []byte, st *redisStreamSt
 // names within one entry — e.g. `XADD s * f v1 f v2` records BOTH
 // (f, v1) and (f, v2) as distinct interleaved entries in the
 // stored protobuf's Fields slice. The design example at
-// docs/design/2026_04_29_proposed_snapshot_logical_decoder.md:338
+// docs/design/2026_04_29_implemented_snapshot_logical_decoder.md:338
 // showed an object shape, but that representation silently drops
 // duplicates and a restore would not reproduce the original
 // stream entry. Codex P1 (PR #791) — switched to a name/value

@@ -1,5 +1,5 @@
 // Package backup implements the per-adapter logical-backup format defined in
-// docs/design/2026_04_29_proposed_snapshot_logical_decoder.md (Phase 0) and
+// docs/design/2026_04_29_implemented_snapshot_logical_decoder.md (Phase 0) and
 // reused by docs/design/2026_04_29_proposed_logical_backup.md (Phase 1).
 //
 // This file owns the filename encoding rules for non-S3 segments. S3 object

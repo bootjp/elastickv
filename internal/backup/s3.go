@@ -108,7 +108,7 @@ func verifyChunkCompleteness(chunks []s3ChunkKey, declaredParts map[s3PartKey]s3
 
 // S3Encoder emits per-bucket _bucket.json + assembled object bodies +
 // .elastickv-meta.json sidecars + KEYMAP.jsonl, per the Phase 0
-// design (docs/design/2026_04_29_proposed_snapshot_logical_decoder.md).
+// design (docs/design/2026_04_29_implemented_snapshot_logical_decoder.md).
 //
 // Lifecycle: Handle* per record, Finalize once. Records arrive in
 // snapshot lex order:

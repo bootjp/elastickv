@@ -1,16 +1,18 @@
 # Snapshot ↔ Logical-Format Decoder (Phase 0)
 
-Status: Partial
+Status: Implemented
 Author: bootjp
 Date: 2026-04-29
 
-> **Lifecycle (2026-05-25):** Phase 0a (decoder) has fully shipped —
+> **Lifecycle (2026-07-07):** Phase 0a (decoder) has fully shipped —
 > `internal/backup/` + `cmd/elastickv-snapshot-decode` (PRs #790,
-> #791, #792, #806, #810). Phase 0b (encoder) is specified in detail
-> in `2026_05_25_proposed_snapshot_logical_encoder.md` and is not yet
-> implemented. Phase 0c (operator integration) is open. This doc
-> remains the format owner; the encoder doc owns the reverse-direction
-> wire-format reconstruction.
+> #791, #792, #806, #810). Phase 0b (encoder) has shipped and is
+> specified in detail in
+> `2026_05_25_implemented_snapshot_logical_encoder.md`. Phase 0c
+> (operator integration) is now shipped via `cmd/elastickv-snap-token`
+> and `docs/operations/snapshot_restore.md`. This doc remains the
+> format owner; the encoder doc owns the reverse-direction wire-format
+> reconstruction.
 
 ## Background
 
@@ -541,13 +543,16 @@ non-trivial (would need pause/resume Apply, install snapshot at the
 right index, etc.). Operators restore by:
 
 1. Stop the target node.
-2. Generate the matching `.snap` token file (see
-   `2026_04_14_implemented_etcd_snapshot_disk_offload.md` for the
-   17-byte EKVT format) using a small `cmd/elastickv-snap-token`
-   helper that takes the `.fsm` path and emits the token file.
-3. Place the new `.fsm` in `{dataDir}/fsm-snap/<index>.fsm` and the
-   token in `{dataDir}/snap/<index>.snap` (atomic rename of both,
-   then `syncDir` of both directories).
+2. Run `cmd/elastickv-snap-token` against the encoder output. The
+   encoder writes the native EKVPBBL1 payload stream (no footer);
+   `elastickv-snap-token` copies that payload into
+   `{dataDir}/fsm-snap/<index>.fsm`, appends the disk-offload CRC32C
+   footer, and writes the matching `{term}-{index}.snap` file whose
+   `raftpb.Snapshot.Data` is the 17-byte EKVT token described in
+   `2026_04_14_implemented_etcd_snapshot_disk_offload.md`.
+3. Confirm the generated `ENCODE_INFO.json`, `MANIFEST.json`,
+   target `cluster_id`, `term`, `index`, and voter set match the
+   target restore plan before starting the node.
 4. Start the node. It loads the snapshot at startup as if it had
    just installed it from a leader.
 
@@ -555,14 +560,14 @@ For multi-node clusters: do this on one node first, then re-add the
 others as fresh members so they snapshot-install from the seeded
 node.
 
-For a *fresh cluster* (zero state, just-bootstrapped), the encoder
-output can be placed directly under `fsm-snap/` and the cluster
-opens to it as its initial state. This is the cleanest restore
-path.
+For a *fresh cluster* (zero state, just-bootstrapped), use
+`elastickv-snap-token --term 1` with the intended initial voter set.
+The helper still writes the footer-sealed `.fsm` plus `.snap` pair;
+placing the raw encoder output directly under `fsm-snap/` is not a
+valid disk-offload artifact.
 
 The runbook for both is documented in
-`docs/operations/snapshot_restore.md` (separate PR after this
-design lands).
+`docs/operations/snapshot_restore.md`.
 
 ### External tools
 
@@ -660,10 +665,6 @@ bespoke parser, the format has failed its goal.
   - `internal/backup/sqs.go` — `_queue.json` + `messages.jsonl`.
 - Filename encoding lives in `internal/backup/filename.go` with
   shared unit tests for round-trip safety.
-- `cmd/elastickv-snap-token` helper for synthesizing the matching
-  `.snap` EKVT token file from a `.fsm`.
-- Documentation: `docs/operations/snapshot_restore.md` runbook
-  (separate PR after this design lands).
 
 ### Phase 0b — Encoder
 
@@ -679,10 +680,21 @@ bespoke parser, the format has failed its goal.
 
 ### Phase 0c — Operator integration
 
-- Stop-replace-restart runbook in `docs/operations/`.
-- Cluster-id and version-compatibility guards.
-- Tar / tar+zstd helpers for shipping decoded directory trees off
-  the host.
+- New binary `cmd/elastickv-snap-token/`.
+- The helper copies an encoder-produced EKVPBBL1 payload into the
+  disk-offload `{dataDir}/fsm-snap/<index>.fsm` shape, appends the
+  CRC32C footer, and writes the matching `.snap` EKVT token metadata
+  through etcd's `Snapshotter`.
+- The helper fails closed on existing target artifacts unless
+  `--force` is supplied, requires `--term`, `--index`, and `--voters`,
+  and supports `node:<uint64>` for explicit raft node IDs.
+- Stop-replace-restart runbook in `docs/operations/snapshot_restore.md`.
+- Cluster-id and version-compatibility guards are documented in the
+  runbook and enforced by operator verification of `MANIFEST.json` and
+  `ENCODE_INFO.json`; live cluster-id discovery remains out of scope
+  for offline Phase 0.
+- Tar / tar+zstd shipping helpers remain a convenience script layer,
+  not part of the core recovery contract.
 
 ## Required Tests
 
@@ -711,6 +723,7 @@ bespoke parser, the format has failed its goal.
 | `TestLongKeySHA256Fallback` | A 1 KiB key encodes to `<sha256-prefix-32>__<truncated>`; `KEYMAP.jsonl` records the original; encoder reverses correctly |
 | `TestExternalToolReplay` | Generated `aws s3 sync` / `aws dynamodb put-item` / `redis-cli --pipe` scripts (run in CI against MinIO / a local DynamoDB / a real Redis) reproduce the decoded state on a non-elastickv target |
 | `TestEncoderClusterIDGuard` | Encoder writes `cluster_id` in `MANIFEST.json`; the restore runbook step refuses to place the file if the target node's `cluster_id` differs |
+| `TestSnapTokenWritesRestorePair` | `cmd/elastickv-snap-token` writes a footer-sealed `fsm-snap/<index>.fsm`, a matching EKVT `.snap`, and the requested ConfState voter/learner sets |
 | `TestPhaseFieldDistinguishesPhase0And1` | A Phase 1 dump and a Phase 0 dump containing the same logical state both pass the decoder's structural validation but `MANIFEST.phase` distinguishes them |
 
 ### P2

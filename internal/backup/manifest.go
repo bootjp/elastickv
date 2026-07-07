@@ -139,7 +139,7 @@ type Exclusions struct {
 }
 
 // Manifest is the on-disk MANIFEST.json structure. Field tags match the
-// spec in docs/design/2026_04_29_proposed_snapshot_logical_decoder.md.
+// spec in docs/design/2026_04_29_implemented_snapshot_logical_decoder.md.
 type Manifest struct {
 	FormatVersion    uint32  `json:"format_version"`
 	Phase            string  `json:"phase"`

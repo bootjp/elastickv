@@ -12,7 +12,7 @@ import (
 // decode.go orchestrates the per-prefix dispatch from a raw `.fsm`
 // stream into the four adapter encoders (DynamoDB, S3, Redis, SQS).
 // It is the Phase 0a glue documented in §"Pipeline" of
-// docs/design/2026_04_29_proposed_snapshot_logical_decoder.md.
+// docs/design/2026_04_29_implemented_snapshot_logical_decoder.md.
 //
 // The dispatcher is intentionally thin: every per-record decision
 // (manifest reassembly, TTL inlining, side-record exclusion, ...) is

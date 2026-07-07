@@ -77,7 +77,7 @@ var ErrSQSInvalidMessage = errors.New("backup: invalid !sqs|msg|data value")
 var ErrSQSMalformedKey = errors.New("backup: malformed SQS key")
 
 // SQSEncoder encodes the SQS prefix family into the per-queue layout
-// described in docs/design/2026_04_29_proposed_snapshot_logical_decoder.md
+// described in docs/design/2026_04_29_implemented_snapshot_logical_decoder.md
 // (Phase 0): one `_queue.json` per queue and one ordered `messages.jsonl`.
 //
 // Lifecycle: per-snapshot pass calls Handle* for each record, then exactly

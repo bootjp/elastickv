@@ -17,7 +17,7 @@ import (
 
 // Redis simple-type encoders translate raw snapshot key/value records into
 // the per-adapter directory tree defined by Phase 0
-// (docs/design/2026_04_29_proposed_snapshot_logical_decoder.md). This file
+// (docs/design/2026_04_29_implemented_snapshot_logical_decoder.md). This file
 // covers the three "simple" Redis prefixes — strings, HLLs, and TTL scan
 // index entries — that always map to ONE snapshot record per user key and
 // therefore need no cross-record assembly.

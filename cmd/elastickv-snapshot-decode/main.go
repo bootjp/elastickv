@@ -1,6 +1,6 @@
 // Command elastickv-snapshot-decode is the Phase 0a snapshot
 // decoder described in
-// docs/design/2026_04_29_proposed_snapshot_logical_decoder.md.
+// docs/design/2026_04_29_implemented_snapshot_logical_decoder.md.
 //
 // It reads a Pebble snapshot (`.fsm`) emitted by the live FSM
 // (store/lsm_store.go) and writes a vendor-independent per-adapter

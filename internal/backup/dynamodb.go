@@ -44,7 +44,7 @@ var (
 )
 
 // DDBEncoder encodes the DynamoDB prefix family into the per-table layout
-// described in docs/design/2026_04_29_proposed_snapshot_logical_decoder.md
+// described in docs/design/2026_04_29_implemented_snapshot_logical_decoder.md
 // (Phase 0): one `_schema.json` per table and one
 // `items/<pk>/<sk>.json` per item (default per-item layout).
 //

@@ -13,7 +13,7 @@ import (
 
 // Redis list encoder. Translates raw !lst|... snapshot records into the
 // per-list `lists/<key>.json` shape defined by Phase 0
-// (docs/design/2026_04_29_proposed_snapshot_logical_decoder.md).
+// (docs/design/2026_04_29_implemented_snapshot_logical_decoder.md).
 //
 // Three on-disk key families share the `!lst|` namespace; only two
 // carry restorable state:

@@ -15,7 +15,7 @@ import (
 
 // Redis zset encoder. Translates raw !zs|... snapshot records into the
 // per-zset `zsets/<key>.json` shape defined by Phase 0
-// (docs/design/2026_04_29_proposed_snapshot_logical_decoder.md).
+// (docs/design/2026_04_29_implemented_snapshot_logical_decoder.md).
 //
 // Wire format mirrors store/zset_helpers.go:
 //   - !zs|meta|<userKeyLen(4)><userKey>                              → 8-byte BE Len

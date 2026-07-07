@@ -13,7 +13,7 @@ import (
 
 // Redis set encoder. Translates raw !st|... snapshot records into the
 // per-set `sets/<key>.json` shape defined by Phase 0
-// (docs/design/2026_04_29_proposed_snapshot_logical_decoder.md).
+// (docs/design/2026_04_29_implemented_snapshot_logical_decoder.md).
 //
 // Wire format mirrors store/set_helpers.go:
 //   - !st|meta|<userKeyLen(4)><userKey>          → 8-byte BE Len
