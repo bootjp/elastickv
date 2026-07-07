@@ -302,6 +302,9 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}
+	if err := c.migrateTTLInlineOnce(tickCtx, readTS); err != nil && !errors.Is(err, context.Canceled) {
+		combined = errors.CombineErrors(combined, err)
+	}
 	return errors.WithStack(combined)
 }
 

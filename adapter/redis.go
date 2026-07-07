@@ -181,6 +181,11 @@ type RedisServer struct {
 	// reads on hot keys faster than the regular compaction interval.
 	compactor *DeltaCompactor
 
+	// disableLegacyTTLReadFallback removes !redis|ttl| from the authoritative
+	// read path after the inline TTL migrator has rewritten all anchors. The
+	// default keeps the fallback enabled for rolling upgrades.
+	disableLegacyTTLReadFallback bool
+
 	// connIDSeq hands out monotonically increasing per-connection
 	// identifiers. The zero value is never returned (atomic.AddUint64
 	// returns 1 on first call) so clients can treat 0 as "unset".
@@ -265,6 +270,16 @@ func WithRedisActiveTimestampTracker(tracker *kv.ActiveTimestampTracker) RedisSe
 func WithRedisCompactor(c *DeltaCompactor) RedisServerOption {
 	return func(r *RedisServer) {
 		r.compactor = c
+	}
+}
+
+// WithRedisLegacyTTLReadFallback controls whether pre-inline !redis|ttl|
+// entries are still consulted after the anchor-specific TTL probes miss.
+// Leave this enabled during rolling upgrades; disable it only after the
+// background inline TTL migrator has completed for the cluster.
+func WithRedisLegacyTTLReadFallback(enabled bool) RedisServerOption {
+	return func(r *RedisServer) {
+		r.disableLegacyTTLReadFallback = !enabled
 	}
 }
 

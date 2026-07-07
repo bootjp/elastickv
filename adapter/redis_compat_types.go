@@ -406,6 +406,9 @@ func (r *RedisServer) ttlAt(ctx context.Context, userKey []byte, readTS uint64) 
 	if ttl, found, hllErr := r.hllTTLAt(ctx, userKey, readTS); hllErr != nil || found {
 		return ttl, hllErr
 	}
+	if r.disableLegacyTTLReadFallback {
+		return nil, nil
+	}
 	return r.legacyIndexTTLAt(ctx, userKey, readTS)
 }
 

@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -18,6 +19,98 @@ func newDeltaCompactorTestFixture(t *testing.T) (store.MVCCStore, *DeltaCompacto
 	coord := newLocalAdapterCoordinator(st)
 	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
 	return st, c
+}
+
+func TestDeltaCompactor_TTLInlineMigratesLegacyString(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	key := []byte("ttl:migrate:string")
+	expireAt := time.Now().Add(time.Hour)
+	require.NoError(t, st.PutAt(ctx, redisStrKey(key), []byte("value"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, redisStrKey(key), readTS)
+	require.NoError(t, err)
+	value, ttl, err := decodeRedisStr(raw)
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
+	require.NotNil(t, ttl)
+	require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(*ttl))
+}
+
+func TestDeltaCompactor_TTLInlineMigratesLegacyHLL(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	key := []byte("ttl:migrate:hll")
+	expireAt := time.Now().Add(time.Hour)
+	legacy, err := marshalSetValue(redisSetValue{Members: []string{"b", "a"}})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), legacy, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, redisHLLKey(key), readTS)
+	require.NoError(t, err)
+	value, ttl, embedded, err := decodeRedisHLL(raw)
+	require.NoError(t, err)
+	require.True(t, embedded)
+	require.Equal(t, redisSetValue{Members: []string{"a", "b"}}, value)
+	require.NotNil(t, ttl)
+	require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(*ttl))
+}
+
+func TestDeltaCompactor_TTLInlineMigratesLegacyHashMeta(t *testing.T) {
+	t.Parallel()
+
+	st, c := newDeltaCompactorTestFixture(t)
+	ctx := context.Background()
+	key := []byte("ttl:migrate:hash")
+	expireAt := time.Now().Add(time.Hour)
+	legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta, 3)
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	raw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
+	require.NoError(t, err)
+	require.Len(t, raw, redisSimpleMetaInlineSizeBytes)
+	meta, err := store.UnmarshalHashMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), meta.Len)
+	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
+func TestRedisTTLAt_LegacyFallbackCanBeDisabled(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("ttl:fallback:disabled")
+	expireAt := time.Now().Add(time.Hour)
+	require.NoError(t, st.PutAt(ctx, redisStrKey(key), []byte("legacy"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	withFallback := &RedisServer{store: st}
+	got, err := withFallback.ttlAt(ctx, key, 2)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	withoutFallback := &RedisServer{store: st, disableLegacyTTLReadFallback: true}
+	got, err = withoutFallback.ttlAt(ctx, key, 2)
+	require.NoError(t, err)
+	require.Nil(t, got)
 }
 
 func TestDeltaCompactor_ListDeltaFoldedIntoBaseMeta(t *testing.T) {

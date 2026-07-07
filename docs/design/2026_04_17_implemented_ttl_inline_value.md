@@ -1,9 +1,11 @@
 # Design: TTL Embedded in Data Values
 
-Status: Partial — Redis strings, HLL, and the list/hash/set/zset/stream
-metadata anchors now carry inline TTL, and `EXPIRE` updates those anchors in
-the same Raft transaction as the secondary scan-index row. Full legacy
-`!redis|ttl|` read-path removal and background migration remain open. The TTL
+Status: Implemented — Redis strings, HLL, and the list/hash/set/zset/stream
+metadata anchors carry inline TTL, and `EXPIRE` updates those anchors in the
+same Raft transaction as the secondary scan-index row. A leader-only background
+migrator rewrites legacy anchors into inline form. The legacy `!redis|ttl|`
+read fallback remains enabled by default for rolling upgrades, but can be
+disabled after migration with `WithRedisLegacyTTLReadFallback(false)`. The TTL
 buffer has been removed.
 
 ## 1. Background and motivation
@@ -150,7 +152,7 @@ follows:
   the key as expired rather than silently alive).
 - For deployments that need a stronger guarantee, the migration compactor
   should be run to rewrite every legacy value with the new envelope before
-  Phase 2 (legacy-read removal) begins.
+  Phase 3 disables the legacy `!redis|ttl|` fallback.
 
 ### 3.3 Collection metadata encoding
 
@@ -294,14 +296,20 @@ readable and are upgraded on the next HLL write.
 
 ### Phase 2 — Background migration
 
-A one-time background job rewrites each string key to the new encoding and each
-collection metadata key to the new format.  During migration the dual-read
+`DeltaCompactor` now runs a bounded leader-only TTL inline migration pass on
+each tick. It scans the `!redis|str|`, `!redis|hll|`,
+`!lst|meta|`, `!hs|meta|`, `!st|meta|`, `!zs|meta|`, and
+`!stream|meta|` anchors with per-prefix cursors and rewrites old-format values
+into the inline format using OCC transactions. During migration the dual-read
 fallback remains active.
 
 ### Phase 3 — Remove legacy TTL read path
 
-Once all nodes have migrated (cluster-level flag or store version check), the
-`!redis|ttl|<key>` lookup in `ttlAt()` is removed.
+Once all nodes have migrated, operators can start Redis with
+`WithRedisLegacyTTLReadFallback(false)` to remove the `!redis|ttl|<key>` lookup
+from `ttlAt()` after the anchor-specific probes miss. The default remains
+fallback-enabled so rolling upgrades and not-yet-migrated stores preserve
+behavior.
 
 ### Phase 4 — Remove TTL buffer
 
@@ -364,7 +372,9 @@ adapter/
   redis_collection_ttl.go collection metadata TTL helpers
   redis_expire_cmds.go   setExpire(): anchor read-modify-write
   redis_delta_compactor.go  preserve ExpireAt during metadata compaction
+                         run bounded TTL inline migration passes
   redis.go               remove TTLBuffer field, runTTLFlusher, flushTTLBuffer
+                         WithRedisLegacyTTLReadFallback gate
                          remove WithTTLFlushInterval option
   redis_ttl_buffer.go    delete (Phase 4)
   redis_lua_context.go   commit(): TTL back in data Raft entry; remove
@@ -379,6 +389,6 @@ adapter/
 |---|---|---|
 | 0 | Add dual-read fallback; new writes use new encoding | Low — reads always fall back |
 | 1 | Add inline TTL to list/hash/set/zset/stream metadata and HLL payloads | Medium — delta compaction must preserve TTL |
-| 2 | Background migration of existing keys | Medium — requires careful compaction |
-| 3 | Remove legacy `!redis\|ttl\|` read path | Low — only after full migration |
+| 2 | Background migration of existing keys | Medium — shipped as bounded compactor pass |
+| 3 | Remove legacy `!redis\|ttl\|` read path | Low — shipped as post-migration fallback gate |
 | 4 | Remove TTL buffer | Low — shipped |
