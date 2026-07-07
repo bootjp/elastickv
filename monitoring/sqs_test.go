@@ -174,6 +174,23 @@ func TestSQSMetrics_ObserveThrottleDecision_EmitsCounterAndGauge(t *testing.T) {
 	require.InDelta(t, 1.0, testutil.ToFloat64(m.throttledRequests.WithLabelValues("orders.fifo", SQSThrottleActionSend)), 0.001)
 }
 
+func TestSQSMetrics_ObserveThrottleDecision_AllowedDoesNotConsumeCounterBudget(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+
+	for i := 0; i < sqsMaxTrackedQueues; i++ {
+		m.ObserveThrottleDecision("allow-"+strconv.Itoa(i)+".fifo", SQSThrottleActionSend, 1, false)
+	}
+	require.Empty(t, m.trackedCounterQueues, "allowed-only throttle decisions must not consume counter label budget")
+
+	m.ObserveThrottleDecision("blocked.fifo", SQSThrottleActionSend, 0, true)
+	require.InDelta(t, 1.0,
+		testutil.ToFloat64(m.throttledRequests.WithLabelValues("blocked.fifo", SQSThrottleActionSend)),
+		0.001,
+		"first actual reject must keep its real queue label instead of overflowing after allowed-only decisions")
+}
+
 func TestSQSMetrics_ObserveThrottleDecision_DropsInvalidLabels(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
@@ -659,6 +676,27 @@ func TestSQSObserver_ObserveOnce_LeaderStepDownClearsAll(t *testing.T) {
 	count, err = testutil.GatherAndCount(reg, "elastickv_sqs_queue_messages")
 	require.NoError(t, err)
 	require.Equal(t, 0, count, "tick 2 (leader step-down): all gauges cleared")
+}
+
+func TestSQSObserver_ObserveOnce_ForgetsThrottleOnlyQueues(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := newSQSMetrics(reg)
+	obs := newSQSObserver(m)
+
+	m.ObserveThrottleDecision("short-lived.fifo", SQSThrottleActionSend, 4, false)
+	count, err := testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 1, count, "sanity: throttle-only queue emitted a token gauge before the depth tick")
+
+	obs.ObserveOnce(&fakeDepthSource{
+		ticks: []fakeDepthTick{{snaps: nil, ok: true}},
+	})
+
+	count, err = testutil.GatherAndCount(reg, "elastickv_sqs_throttle_tokens_remaining")
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "successful depth tick must clear throttle-only queues absent from the snapshot")
+	require.Empty(t, m.trackedThrottleGaugeQueues, "throttle gauge budget slot must be reclaimed for the short-lived queue")
 }
 
 // TestSQSObserver_ObserveOnce_TransientScanErrorPreservesGauges

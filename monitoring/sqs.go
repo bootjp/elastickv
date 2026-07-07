@@ -266,8 +266,8 @@ func (m *SQSMetrics) ObserveThrottleDecision(queue string, action string, tokens
 	if tokensRemaining < 0 {
 		tokensRemaining = 0
 	}
-	queueCounterLabel := m.admitForCounterBudget(queue)
 	if throttled {
+		queueCounterLabel := m.admitForCounterBudget(queue)
 		m.throttledRequests.WithLabelValues(queueCounterLabel, action).Inc()
 	}
 	queueGaugeLabel := m.admitForThrottleGaugeBudget(queue)
@@ -478,6 +478,22 @@ func (m *SQSMetrics) admitForThrottleGaugeBudget(queue string) string {
 	return queue
 }
 
+func (m *SQSMetrics) snapshotThrottleGaugeQueues() []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	queues := make([]string, 0, len(m.trackedThrottleGaugeQueues)+len(m.overflowThrottleGaugeQueues))
+	for queue := range m.trackedThrottleGaugeQueues {
+		queues = append(queues, queue)
+	}
+	for queue := range m.overflowThrottleGaugeQueues {
+		queues = append(queues, queue)
+	}
+	return queues
+}
+
 // dropGaugeStatesFor removes the three state-labelled series for
 // label (a real queue name or sqsQueueOverflow) from the depth
 // gauge. Single-line caller-readability wrapper — prometheus
@@ -612,11 +628,7 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	// tick. Reclaiming first lets phase 2's admissions reuse the
 	// freed slots immediately.
 	o.mu.Lock()
-	for prev := range o.lastSeen {
-		if _, ok := current[prev]; !ok {
-			o.metrics.ForgetQueue(prev)
-		}
-	}
+	o.forgetMissingQueuesLocked(current)
 	o.lastSeen = current
 	o.mu.Unlock()
 	// Phase 2: emit gauges for the current tick. Slots freed in
@@ -626,5 +638,18 @@ func (o *SQSObserver) observeOnce(ctx context.Context, source SQSDepthSource) {
 	// the freed slot's real label rather than overflow.
 	for _, snap := range snaps {
 		o.metrics.ObserveQueueDepth(snap.Queue, snap.Visible, snap.NotVisible, snap.Delayed)
+	}
+}
+
+func (o *SQSObserver) forgetMissingQueuesLocked(current map[string]struct{}) {
+	for prev := range o.lastSeen {
+		if _, ok := current[prev]; !ok {
+			o.metrics.ForgetQueue(prev)
+		}
+	}
+	for _, prev := range o.metrics.snapshotThrottleGaugeQueues() {
+		if _, ok := current[prev]; !ok {
+			o.metrics.ForgetQueue(prev)
+		}
 	}
 }
