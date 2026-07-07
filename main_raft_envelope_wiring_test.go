@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 )
 
@@ -92,5 +95,34 @@ func TestRaftEnvelopeRuntime_InstallFromApplyPublishesWrap(t *testing.T) {
 	}
 	if wrap := sg.RaftPayloadWrap(); wrap == nil {
 		t.Fatal("installFromApply did not publish wrap to attached group")
+	}
+}
+
+type nilChannelCutoverEngine struct {
+	raftengine.Engine
+}
+
+func (nilChannelCutoverEngine) BeginCutoverBarrier() <-chan struct{} {
+	return nil
+}
+
+func (nilChannelCutoverEngine) WaitInflightDrained(context.Context) error {
+	return nil
+}
+
+func (nilChannelCutoverEngine) EndCutoverBarrier() {}
+
+func TestRaftEnvelopeCutoverBarrier_BeginTreatsNilGroupChannelAsDrained(t *testing.T) {
+	t.Parallel()
+	runtime := &raftEnvelopeRuntime{
+		groups: map[uint64]*kv.ShardGroup{
+			7: {Engine: nilChannelCutoverEngine{}},
+		},
+	}
+	done := (&raftEnvelopeCutoverBarrier{runtime: runtime}).Begin()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Begin blocked on nil group cutover channel")
 	}
 }

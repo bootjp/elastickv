@@ -51,9 +51,6 @@ func newRaftEnvelopeRuntime(cipher *encryption.Cipher, nonceFactory store.NonceF
 }
 
 func (r *raftEnvelopeRuntime) engineCutoverIndex() uint64 {
-	if r == nil || r.cutoverIndex == nil {
-		return inertRaftEnvelopeCutoverIndex
-	}
 	idx := r.cutoverIndex.Load()
 	if idx == 0 {
 		return inertRaftEnvelopeCutoverIndex
@@ -62,9 +59,6 @@ func (r *raftEnvelopeRuntime) engineCutoverIndex() uint64 {
 }
 
 func (r *raftEnvelopeRuntime) attachGroup(groupID uint64, g *kv.ShardGroup) {
-	if r == nil || g == nil {
-		return
-	}
 	r.mu.Lock()
 	r.groups[groupID] = g
 	wrap := r.activeWrap
@@ -75,9 +69,6 @@ func (r *raftEnvelopeRuntime) attachGroup(groupID uint64, g *kv.ShardGroup) {
 }
 
 func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKID uint32) error {
-	if r == nil {
-		return errors.New("raft envelope runtime: installer is not configured")
-	}
 	if cutoverIdx == 0 {
 		return errors.New("raft envelope runtime: cutover index must be non-zero")
 	}
@@ -99,9 +90,6 @@ func (r *raftEnvelopeRuntime) installFromApply(cutoverIdx uint64, activeRaftDEKI
 }
 
 func (r *raftEnvelopeRuntime) reinstallActiveWrap() {
-	if r == nil {
-		return
-	}
 	r.mu.Lock()
 	wrap := r.activeWrap
 	for _, g := range r.groups {
@@ -136,9 +124,6 @@ func (r *raftEnvelopeRuntime) barrier() adapter.CutoverBarrierController {
 }
 
 func (r *raftEnvelopeRuntime) snapshotGroups() []*kv.ShardGroup {
-	if r == nil {
-		return nil
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	groups := make([]*kv.ShardGroup, 0, len(r.groups))
@@ -168,7 +153,9 @@ func (b *raftEnvelopeCutoverBarrier) Begin() <-chan struct{} {
 		ch := g.BeginCutoverBarrier()
 		go func(ch <-chan struct{}) {
 			defer wg.Done()
-			<-ch
+			if ch != nil {
+				<-ch
+			}
 		}(ch)
 	}
 	go func() {
